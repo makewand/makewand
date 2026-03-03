@@ -5,32 +5,40 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
-const geminiModel = "gemini-2.5-flash"
+const geminiDefaultModel = "gemini-2.5-flash"
 
 // Gemini implements the Provider interface for Google's Gemini API.
 type Gemini struct {
-	apiKey string
-	client *http.Client
+	apiKey       string
+	model        string
+	chatClient   *http.Client
+	streamClient *http.Client
 }
 
 // NewGemini creates a new Gemini provider.
-func NewGemini(apiKey string) *Gemini {
+func NewGemini(apiKey, model string) *Gemini {
+	if model == "" {
+		model = geminiDefaultModel
+	}
 	return &Gemini{
-		apiKey: apiKey,
-		client: &http.Client{},
+		apiKey:       apiKey,
+		model:        model,
+		chatClient:   newAPIClient(),
+		streamClient: newStreamClient(),
 	}
 }
 
-func (g *Gemini) Name() string     { return "gemini" }
+func (g *Gemini) Name() string      { return "gemini" }
 func (g *Gemini) IsAvailable() bool { return g.apiKey != "" }
 
 type geminiRequest struct {
-	Contents         []geminiContent        `json:"contents"`
-	SystemInstruction *geminiContent        `json:"systemInstruction,omitempty"`
+	Contents          []geminiContent         `json:"contents"`
+	SystemInstruction *geminiContent          `json:"systemInstruction,omitempty"`
 	GenerationConfig  *geminiGenerationConfig `json:"generationConfig,omitempty"`
 }
 
@@ -62,10 +70,10 @@ type geminiResponse struct {
 	} `json:"usageMetadata"`
 }
 
-func (g *Gemini) Chat(ctx context.Context, messages []Message, system string) (string, Usage, error) {
+func (g *Gemini) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	apiURL := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
-		geminiModel, g.apiKey,
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent",
+		url.PathEscape(g.model),
 	)
 
 	var contents []geminiContent
@@ -89,7 +97,7 @@ func (g *Gemini) Chat(ctx context.Context, messages []Message, system string) (s
 	reqBody := geminiRequest{
 		Contents: contents,
 		GenerationConfig: &geminiGenerationConfig{
-			MaxOutputTokens: 8192,
+			MaxOutputTokens: maxTokens,
 		},
 	}
 	if system != "" {
@@ -108,14 +116,15 @@ func (g *Gemini) Chat(ctx context.Context, messages []Message, system string) (s
 		return "", Usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", g.apiKey)
 
-	resp, err := g.client.Do(req)
+	resp, err := g.chatClient.Do(req)
 	if err != nil {
 		return "", Usage{}, fmt.Errorf("gemini API request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := limitedReadAll(resp.Body, maxResponseBytes)
 	if err != nil {
 		return "", Usage{}, fmt.Errorf("read response: %w", err)
 	}
@@ -129,29 +138,28 @@ func (g *Gemini) Chat(ctx context.Context, messages []Message, system string) (s
 		return "", Usage{}, fmt.Errorf("parse response: %w", err)
 	}
 
-	var text string
+	var b strings.Builder
 	if len(result.Candidates) > 0 {
 		for _, p := range result.Candidates[0].Content.Parts {
-			text += p.Text
+			b.WriteString(p.Text)
 		}
 	}
 
 	usage := Usage{
 		InputTokens:  result.UsageMetadata.PromptTokenCount,
 		OutputTokens: result.UsageMetadata.CandidatesTokenCount,
-		Cost:         0, // Gemini Flash is free tier
-		Model:        geminiModel,
+		Cost:         EstimateCost(g.model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount),
+		Model:        g.model,
 		Provider:     "gemini",
 	}
 
-	return text, usage, nil
+	return b.String(), usage, nil
 }
 
-func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system string) (<-chan StreamChunk, error) {
-	// Gemini streaming uses streamGenerateContent
+func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	apiURL := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s",
-		geminiModel, g.apiKey,
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse",
+		url.PathEscape(g.model),
 	)
 
 	var contents []geminiContent
@@ -175,7 +183,7 @@ func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system stri
 	reqBody := geminiRequest{
 		Contents: contents,
 		GenerationConfig: &geminiGenerationConfig{
-			MaxOutputTokens: 8192,
+			MaxOutputTokens: maxTokens,
 		},
 	}
 	if system != "" {
@@ -194,14 +202,15 @@ func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system stri
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", g.apiKey)
 
-	resp, err := g.client.Do(req)
+	resp, err := g.streamClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("gemini API stream request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := limitedReadAll(resp.Body, maxResponseBytes)
 		resp.Body.Close()
 		return nil, fmt.Errorf("gemini API error (%d): %s", resp.StatusCode, string(respBody))
 	}
@@ -211,24 +220,43 @@ func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system stri
 		defer close(ch)
 		defer resp.Body.Close()
 
-		decoder := json.NewDecoder(resp.Body)
-		for decoder.More() {
-			var result geminiResponse
-			if err := decoder.Decode(&result); err != nil {
-				if err != io.EOF {
-					ch <- StreamChunk{Error: err}
+		dataCh := make(chan string, 64)
+		errCh := make(chan error, 1)
+		go func() {
+			defer close(dataCh)
+			errCh <- readSSE(ctx, resp.Body, dataCh)
+			close(errCh)
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err, ok := <-errCh:
+				if !ok {
+					errCh = nil
+					continue
 				}
-				break
-			}
-			if len(result.Candidates) > 0 {
-				for _, p := range result.Candidates[0].Content.Parts {
-					if p.Text != "" {
-						ch <- StreamChunk{Content: p.Text}
+				errCh = nil
+				if err != nil {
+					ch <- StreamChunk{Error: err}
+					return
+				}
+			case data, ok := <-dataCh:
+				if !ok {
+					ch <- StreamChunk{Done: true}
+					return
+				}
+				var result geminiResponse
+				if json.Unmarshal([]byte(data), &result) == nil && len(result.Candidates) > 0 {
+					for _, p := range result.Candidates[0].Content.Parts {
+						if p.Text != "" {
+							ch <- StreamChunk{Content: p.Text}
+						}
 					}
 				}
 			}
 		}
-		ch <- StreamChunk{Done: true}
 	}()
 
 	return ch, nil

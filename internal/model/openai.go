@@ -5,35 +5,41 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 )
 
 const openaiAPIURL = "https://api.openai.com/v1/chat/completions"
-const openaiModel = "gpt-4o"
+const openaiDefaultModel = "gpt-4o"
 
 // OpenAI implements the Provider interface for OpenAI's API.
 type OpenAI struct {
-	apiKey string
-	client *http.Client
+	apiKey       string
+	model        string
+	chatClient   *http.Client
+	streamClient *http.Client
 }
 
 // NewOpenAI creates a new OpenAI provider.
-func NewOpenAI(apiKey string) *OpenAI {
+func NewOpenAI(apiKey, model string) *OpenAI {
+	if model == "" {
+		model = openaiDefaultModel
+	}
 	return &OpenAI{
-		apiKey: apiKey,
-		client: &http.Client{},
+		apiKey:       apiKey,
+		model:        model,
+		chatClient:   newAPIClient(),
+		streamClient: newStreamClient(),
 	}
 }
 
-func (o *OpenAI) Name() string     { return "openai" }
+func (o *OpenAI) Name() string      { return "openai" }
 func (o *OpenAI) IsAvailable() bool { return o.apiKey != "" }
 
 type openaiRequest struct {
-	Model    string          `json:"model"`
-	Messages []openaiMessage `json:"messages"`
-	Stream   bool            `json:"stream,omitempty"`
+	Model     string          `json:"model"`
+	Messages  []openaiMessage `json:"messages"`
+	MaxTokens int             `json:"max_tokens,omitempty"`
+	Stream    bool            `json:"stream,omitempty"`
 }
 
 type openaiMessage struct {
@@ -53,18 +59,30 @@ type openaiResponse struct {
 	} `json:"usage"`
 }
 
-func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string) (string, Usage, error) {
+type openaiStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})
 	}
 	for _, m := range messages {
+		if m.Role == "system" {
+			continue
+		}
 		msgs = append(msgs, openaiMessage{Role: m.Role, Content: m.Content})
 	}
 
 	reqBody := openaiRequest{
-		Model:    openaiModel,
-		Messages: msgs,
+		Model:     o.model,
+		Messages:  msgs,
+		MaxTokens: maxTokens,
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -79,13 +97,13 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string) (s
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 
-	resp, err := o.client.Do(req)
+	resp, err := o.chatClient.Do(req)
 	if err != nil {
 		return "", Usage{}, fmt.Errorf("openai API request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := limitedReadAll(resp.Body, maxResponseBytes)
 	if err != nil {
 		return "", Usage{}, fmt.Errorf("read response: %w", err)
 	}
@@ -107,27 +125,31 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string) (s
 	usage := Usage{
 		InputTokens:  result.Usage.PromptTokens,
 		OutputTokens: result.Usage.CompletionTokens,
-		Cost:         estimateOpenAICost(result.Usage.PromptTokens, result.Usage.CompletionTokens),
-		Model:        openaiModel,
+		Cost:         EstimateCost(o.model, result.Usage.PromptTokens, result.Usage.CompletionTokens),
+		Model:        o.model,
 		Provider:     "openai",
 	}
 
 	return text, usage, nil
 }
 
-func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system string) (<-chan StreamChunk, error) {
+func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})
 	}
 	for _, m := range messages {
+		if m.Role == "system" {
+			continue
+		}
 		msgs = append(msgs, openaiMessage{Role: m.Role, Content: m.Content})
 	}
 
 	reqBody := openaiRequest{
-		Model:    openaiModel,
-		Messages: msgs,
-		Stream:   true,
+		Model:     o.model,
+		Messages:  msgs,
+		MaxTokens: maxTokens,
+		Stream:    true,
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -142,13 +164,13 @@ func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system stri
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 
-	resp, err := o.client.Do(req)
+	resp, err := o.streamClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("openai API stream request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := limitedReadAll(resp.Body, maxResponseBytes)
 		resp.Body.Close()
 		return nil, fmt.Errorf("openai API error (%d): %s", resp.StatusCode, string(respBody))
 	}
@@ -158,59 +180,42 @@ func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system stri
 		defer close(ch)
 		defer resp.Body.Close()
 
-		buf := make([]byte, 4096)
-		var accumulated string
+		dataCh := make(chan string, 64)
+		errCh := make(chan error, 1)
+		go func() {
+			defer close(dataCh)
+			errCh <- readSSE(ctx, resp.Body, dataCh)
+			close(errCh)
+		}()
 
 		for {
-			n, err := resp.Body.Read(buf)
-			if n > 0 {
-				accumulated += string(buf[:n])
-				for {
-					idx := strings.Index(accumulated, "\n\n")
-					if idx == -1 {
-						break
-					}
-					event := accumulated[:idx]
-					accumulated = accumulated[idx+2:]
-
-					for _, line := range strings.Split(event, "\n") {
-						if strings.HasPrefix(line, "data: ") {
-							data := strings.TrimPrefix(line, "data: ")
-							if data == "[DONE]" {
-								ch <- StreamChunk{Done: true}
-								return
-							}
-							var chunk struct {
-								Choices []struct {
-									Delta struct {
-										Content string `json:"content"`
-									} `json:"delta"`
-								} `json:"choices"`
-							}
-							if json.Unmarshal([]byte(data), &chunk) == nil && len(chunk.Choices) > 0 {
-								if content := chunk.Choices[0].Delta.Content; content != "" {
-									ch <- StreamChunk{Content: content}
-								}
-							}
-						}
-					}
-				}
-			}
-			if err != nil {
-				if err != io.EOF {
-					ch <- StreamChunk{Error: err}
-				}
-				ch <- StreamChunk{Done: true}
+			select {
+			case <-ctx.Done():
 				return
+			case err, ok := <-errCh:
+				if !ok {
+					errCh = nil
+					continue
+				}
+				errCh = nil
+				if err != nil {
+					ch <- StreamChunk{Error: err}
+					return
+				}
+			case data, ok := <-dataCh:
+				if !ok {
+					ch <- StreamChunk{Done: true}
+					return
+				}
+				var chunk openaiStreamChunk
+				if json.Unmarshal([]byte(data), &chunk) == nil && len(chunk.Choices) > 0 {
+					if content := chunk.Choices[0].Delta.Content; content != "" {
+						ch <- StreamChunk{Content: content}
+					}
+				}
 			}
 		}
 	}()
 
 	return ch, nil
-}
-
-// estimateOpenAICost estimates cost in USD for GPT-4o.
-// GPT-4o: $2.50/MTok input, $10/MTok output
-func estimateOpenAICost(input, output int) float64 {
-	return float64(input)/1_000_000*2.5 + float64(output)/1_000_000*10.0
 }

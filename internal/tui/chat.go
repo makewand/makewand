@@ -8,8 +8,13 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
+	"github.com/mattn/go-runewidth"
 )
+
+// maxChatHistory is the maximum number of messages to send to the model.
+const maxChatHistory = 20
 
 // ChatMessage represents a message in the chat panel.
 type ChatMessage struct {
@@ -21,20 +26,28 @@ type ChatMessage struct {
 
 // ChatPanel is the main chat interaction panel.
 type ChatPanel struct {
-	messages []ChatMessage
-	viewport viewport.Model
-	textarea textarea.Model
-	width    int
-	height   int
-	ready    bool
+	messages  []ChatMessage
+	viewport  viewport.Model
+	textarea  textarea.Model
+	width     int
+	height    int
+	ready     bool
 	streaming bool
-	streamBuf string
+	streamBuf *strings.Builder
 }
+
+const (
+	minPanelWidth     = 1
+	minPanelHeight    = 1
+	minViewportWidth  = 1
+	minViewportHeight = 1
+	minInputWidth     = 1
+)
 
 // NewChatPanel creates a new chat panel.
 func NewChatPanel() ChatPanel {
 	ta := textarea.New()
-	ta.Placeholder = "Type your message... (Enter to send, Ctrl+D for multiline)"
+	ta.Placeholder = i18n.Msg().ChatPlaceholder
 	ta.Focus()
 	ta.CharLimit = 4096
 	ta.SetHeight(3)
@@ -42,8 +55,9 @@ func NewChatPanel() ChatPanel {
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 
 	return ChatPanel{
-		textarea: ta,
-		messages: []ChatMessage{},
+		textarea:  ta,
+		messages:  []ChatMessage{},
+		streamBuf: &strings.Builder{},
 	}
 }
 
@@ -57,32 +71,33 @@ func (c *ChatPanel) AddMessage(msg ChatMessage) {
 func (c *ChatPanel) SetStreaming(streaming bool) {
 	c.streaming = streaming
 	if streaming {
-		c.streamBuf = ""
+		c.streamBuf.Reset()
 	}
 }
 
 // AppendStream appends text to the current streaming response.
 func (c *ChatPanel) AppendStream(text string) {
-	c.streamBuf += text
+	c.streamBuf.WriteString(text)
 	c.updateViewport()
 }
 
 // FinishStream finishes the current stream and adds it as a message.
 func (c *ChatPanel) FinishStream(provider string, cost float64) {
-	if c.streamBuf != "" {
+	if c.streamBuf.Len() > 0 {
 		c.messages = append(c.messages, ChatMessage{
 			Role:     "assistant",
-			Content:  c.streamBuf,
+			Content:  c.streamBuf.String(),
 			Provider: provider,
 			Cost:     cost,
 		})
-		c.streamBuf = ""
+		c.streamBuf.Reset()
 	}
 	c.streaming = false
 	c.updateViewport()
 }
 
 // ToModelMessages converts chat messages to model API messages.
+// Implements a sliding window: only the last maxChatHistory messages are sent.
 func (c *ChatPanel) ToModelMessages() []model.Message {
 	var msgs []model.Message
 	for _, m := range c.messages {
@@ -93,11 +108,19 @@ func (c *ChatPanel) ToModelMessages() []model.Message {
 			})
 		}
 	}
+
+	if len(msgs) > maxChatHistory {
+		msgs = msgs[len(msgs)-maxChatHistory:]
+	}
+
 	return msgs
 }
 
 func (c *ChatPanel) updateViewport() {
 	if !c.ready {
+		return
+	}
+	if c.viewport.Width < minViewportWidth || c.viewport.Height < minViewportHeight {
 		return
 	}
 	c.viewport.SetContent(c.renderMessages())
@@ -121,22 +144,23 @@ func (c *ChatPanel) renderMessages() string {
 			b.WriteString(aiMsgStyle.Render(label) + "\n")
 			b.WriteString(wrapText(msg.Content, maxWidth) + "\n")
 			if msg.Cost > 0 {
-				b.WriteString(mutedStyle.Render(fmt.Sprintf("  💰 $%.4f", msg.Cost)) + "\n")
+				b.WriteString(mutedStyle.Render(fmt.Sprintf("  $%.4f", msg.Cost)) + "\n")
 			}
 			b.WriteString("\n")
 		case "system":
-			b.WriteString(mutedStyle.Render("─── "+msg.Content+" ───") + "\n\n")
+			b.WriteString(mutedStyle.Render("--- "+msg.Content+" ---") + "\n\n")
 		case "status":
-			b.WriteString(warningStyle.Render("⚡ "+msg.Content) + "\n\n")
+			b.WriteString(warningStyle.Render("* "+msg.Content) + "\n\n")
 		}
 	}
 
 	// Show streaming content
-	if c.streaming && c.streamBuf != "" {
-		b.WriteString(aiMsgStyle.Render("AI") + " " + spinnerStyle.Render("●") + "\n")
-		b.WriteString(wrapText(c.streamBuf, maxWidth) + "\n")
+	streamStr := c.streamBuf.String()
+	if c.streaming && streamStr != "" {
+		b.WriteString(aiMsgStyle.Render("AI") + " " + spinnerStyle.Render("*") + "\n")
+		b.WriteString(wrapText(streamStr, maxWidth) + "\n")
 	} else if c.streaming {
-		b.WriteString(spinnerStyle.Render("● Thinking...") + "\n")
+		b.WriteString(spinnerStyle.Render("* "+i18n.Msg().ChatThinkingAnim) + "\n")
 	}
 
 	return b.String()
@@ -153,31 +177,31 @@ func (c ChatPanel) Update(msg tea.Msg) (ChatPanel, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		c.width = msg.Width
-		c.height = msg.Height
+		c.width = maxInt(msg.Width, minPanelWidth)
+		c.height = maxInt(msg.Height, minPanelHeight)
 
 		headerHeight := 1
 		inputHeight := 5
-		vpHeight := c.height - headerHeight - inputHeight
+		vpWidth := maxInt(c.width-2, minViewportWidth)
+		vpHeight := maxInt(c.height-headerHeight-inputHeight, minViewportHeight)
+		inputWidth := maxInt(c.width-2, minInputWidth)
 
 		if !c.ready {
-			c.viewport = viewport.New(c.width-2, vpHeight)
+			c.viewport = viewport.New(vpWidth, vpHeight)
 			c.viewport.SetContent(c.renderMessages())
 			c.ready = true
 		} else {
-			c.viewport.Width = c.width - 2
+			c.viewport.Width = vpWidth
 			c.viewport.Height = vpHeight
 		}
 
-		c.textarea.SetWidth(c.width - 2)
+		c.textarea.SetWidth(inputWidth)
 	}
 
-	// Update viewport
 	var vpCmd tea.Cmd
 	c.viewport, vpCmd = c.viewport.Update(msg)
 	cmds = append(cmds, vpCmd)
 
-	// Update textarea
 	var taCmd tea.Cmd
 	c.textarea, taCmd = c.textarea.Update(msg)
 	cmds = append(cmds, taCmd)
@@ -213,6 +237,21 @@ func (c *ChatPanel) Focus() {
 	c.textarea.Focus()
 }
 
+// LastAssistantContent returns the content of the most recent assistant message.
+func (c *ChatPanel) LastAssistantContent() string {
+	for i := len(c.messages) - 1; i >= 0; i-- {
+		if c.messages[i].Role == "assistant" {
+			return c.messages[i].Content
+		}
+	}
+	return ""
+}
+
+// UpdatePlaceholder refreshes the textarea placeholder from i18n.
+func (c *ChatPanel) UpdatePlaceholder() {
+	c.textarea.Placeholder = i18n.Msg().ChatPlaceholder
+}
+
 func wrapText(text string, width int) string {
 	if width <= 0 {
 		return text
@@ -220,21 +259,25 @@ func wrapText(text string, width int) string {
 
 	var result strings.Builder
 	for _, line := range strings.Split(text, "\n") {
-		if len(line) <= width {
+		if runewidth.StringWidth(line) <= width {
 			result.WriteString(line + "\n")
 			continue
 		}
-		// Simple word wrap
 		words := strings.Fields(line)
 		current := ""
+		currentW := 0
 		for _, word := range words {
+			wordW := runewidth.StringWidth(word)
 			if current == "" {
 				current = word
-			} else if len(current)+1+len(word) <= width {
+				currentW = wordW
+			} else if currentW+1+wordW <= width {
 				current += " " + word
+				currentW += 1 + wordW
 			} else {
 				result.WriteString(current + "\n")
 				current = word
+				currentW = wordW
 			}
 		}
 		if current != "" {
@@ -242,4 +285,11 @@ func wrapText(text string, width int) string {
 		}
 	}
 	return strings.TrimRight(result.String(), "\n")
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

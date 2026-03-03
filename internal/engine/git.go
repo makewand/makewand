@@ -16,7 +16,6 @@ func (p *Project) GitInit(ctx context.Context) error {
 		return fmt.Errorf("git init failed: %s", result.Stderr)
 	}
 
-	// Create .gitignore
 	gitignore := `node_modules/
 __pycache__/
 .venv/
@@ -27,6 +26,11 @@ venv/
 dist/
 build/
 *.log
+credentials.json
+service-account*.json
+.npmrc
+*.pem
+*.key
 `
 	if err := p.WriteFile(".gitignore", gitignore); err != nil {
 		return fmt.Errorf("write .gitignore: %w", err)
@@ -37,8 +41,12 @@ build/
 
 // GitCommit stages all changes and creates a commit.
 func (p *Project) GitCommit(ctx context.Context, message string) error {
-	if _, err := p.Exec(ctx, "git", "add", "-A"); err != nil {
+	addResult, err := p.Exec(ctx, "git", "add", "-A")
+	if err != nil {
 		return fmt.Errorf("git add: %w", err)
+	}
+	if addResult.ExitCode != 0 {
+		return fmt.Errorf("git add failed: %s", addResult.Stderr)
 	}
 
 	result, err := p.Exec(ctx, "git", "commit", "-m", message)
