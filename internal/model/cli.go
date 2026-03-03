@@ -82,6 +82,38 @@ func NewCodexCLI(binPath string) *CLIProvider {
 	return p
 }
 
+// NewCommandCLI creates a provider backed by an arbitrary CLI command.
+// Prompt injection behavior:
+//   - if any argument contains "{{prompt}}", that token is replaced in-place
+//   - otherwise, the prompt is appended as the final argument
+func NewCommandCLI(providerName, command string, args []string) *CLIProvider {
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
+	command = strings.TrimSpace(command)
+	templateArgs := append([]string(nil), args...)
+
+	p := &CLIProvider{
+		name:     providerName + "-custom-cli",
+		binPath:  command,
+		provider: providerName,
+	}
+	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		finalArgs := make([]string, 0, len(templateArgs)+1)
+		replaced := false
+		for _, a := range templateArgs {
+			if strings.Contains(a, "{{prompt}}") {
+				a = strings.ReplaceAll(a, "{{prompt}}", prompt)
+				replaced = true
+			}
+			finalArgs = append(finalArgs, a)
+		}
+		if !replaced {
+			finalArgs = append(finalArgs, prompt)
+		}
+		return exec.CommandContext(ctx, command, finalArgs...)
+	}
+	return p
+}
+
 // Provider interface implementation
 
 func (c *CLIProvider) Name() string { return c.provider }

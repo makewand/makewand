@@ -180,6 +180,14 @@ func setupCmd() *cobra.Command {
 				}
 				fmt.Println()
 			}
+			if len(cfg.CustomProviders) > 0 {
+				fmt.Println("Custom providers (config-defined):")
+				for _, cp := range cfg.CustomProviders {
+					access := accessDisplay(cp.Access, "subscription")
+					fmt.Printf("  [x] %s -> %s (access: %s)\n", cp.Name, cp.Command, access)
+				}
+				fmt.Println()
+			}
 
 			// Show API key status
 			fmt.Println("API keys:")

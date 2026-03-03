@@ -157,6 +157,26 @@ func NewRouter(cfg *config.Config) *Router {
 		r.providers["ollama"] = NewOllama(cfg.OllamaURL, cfg.OllamaModel)
 	}
 
+	// Register config-defined custom command providers.
+	for _, cp := range cfg.CustomProviders {
+		name := strings.ToLower(strings.TrimSpace(cp.Name))
+		command := strings.TrimSpace(cp.Command)
+		if name == "" || command == "" {
+			continue
+		}
+		if _, exists := r.providers[name]; exists {
+			// Built-ins win when names collide to avoid surprising overrides.
+			continue
+		}
+		r.providers[name] = NewCommandCLI(name, command, cp.Args)
+
+		access := strings.TrimSpace(cp.Access)
+		if access == "" {
+			access = "subscription"
+		}
+		r.accessTypes[name] = parseAccessType(access, name)
+	}
+
 	// Parse usage mode
 	if cfg.UsageMode != "" {
 		if mode, ok := ParseUsageMode(cfg.UsageMode); ok {
