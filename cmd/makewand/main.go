@@ -229,10 +229,16 @@ func setupCmd() *cobra.Command {
 				fmt.Println("  export OPENAI_API_KEY=sk-...")
 			}
 			fmt.Println()
-			fmt.Println("Config file: ~/.config/makewand/config.json")
+			configPath, pathErr := config.ConfigPath()
+			if pathErr != nil {
+				fmt.Printf("Config file: <unavailable: %v>\n", pathErr)
+			} else {
+				fmt.Printf("Config file: %s\n", configPath)
+			}
 
 			if err := config.Save(cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: could not save config: %v\n", err)
+				fmt.Fprintln(os.Stderr, "Tip: set MAKEWAND_CONFIG_DIR to a writable directory.")
 			}
 
 			return nil
