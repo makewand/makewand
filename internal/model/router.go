@@ -98,6 +98,8 @@ type Router struct {
 
 	// Per-provider request count for load balancing
 	usage *sessionUsage
+	// Per-provider circuit breaker for transient/outage isolation.
+	breaker *providerCircuitBreaker
 
 	// Usage mode (guarded by modeMu)
 	modeMu  sync.RWMutex
@@ -123,6 +125,7 @@ func NewRouter(cfg *config.Config) *Router {
 		providerCache: make(map[providerKey]Provider),
 		accessTypes:   make(map[string]AccessType),
 		usage:         newSessionUsage(),
+		breaker:       newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
 	}
 
 	// Register CLI-based providers first (subscription — preferred)
@@ -251,6 +254,34 @@ func (r *Router) emitTrace(event TraceEvent) {
 	sink.Trace(event)
 }
 
+func (r *Router) isCircuitOpen(provider string) (bool, time.Duration) {
+	if r.breaker == nil {
+		return false, 0
+	}
+	return r.breaker.PeekOpen(provider)
+}
+
+func (r *Router) beforeProviderAttempt(provider string) (bool, time.Duration) {
+	if r.breaker == nil {
+		return true, 0
+	}
+	return r.breaker.BeforeAttempt(provider)
+}
+
+func (r *Router) recordProviderSuccess(provider string) {
+	if r.breaker == nil {
+		return
+	}
+	r.breaker.RecordSuccess(provider)
+}
+
+func (r *Router) recordProviderFailure(provider string) (bool, time.Time) {
+	if r.breaker == nil {
+		return false, time.Time{}
+	}
+	return r.breaker.RecordFailure(provider)
+}
+
 // EmitTrace allows non-router components (for example TUI pipeline steps)
 // to write into the same debug trace stream.
 func (r *Router) EmitTrace(event TraceEvent) {
@@ -288,17 +319,27 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 
 	// Try the preferred model
 	if p, ok := r.providers[modelName]; ok && p.IsAvailable() {
-		r.emitTrace(TraceEvent{
-			Event:     "route_selected",
-			Task:      taskTypeName(task),
-			Requested: modelName,
-			Selected:  modelName,
-		})
-		return RouteResult{
-			Provider:  p,
-			Requested: modelName,
-			Actual:    modelName,
-		}, nil
+		if blocked, remaining := r.isCircuitOpen(modelName); blocked {
+			r.emitTrace(TraceEvent{
+				Event:     "route_candidate_skipped",
+				Task:      taskTypeName(task),
+				Requested: modelName,
+				Selected:  modelName,
+				Detail:    circuitOpenDetail(modelName, remaining),
+			})
+		} else {
+			r.emitTrace(TraceEvent{
+				Event:     "route_selected",
+				Task:      taskTypeName(task),
+				Requested: modelName,
+				Selected:  modelName,
+			})
+			return RouteResult{
+				Provider:  p,
+				Requested: modelName,
+				Actual:    modelName,
+			}, nil
+		}
 	}
 
 	// Deterministic fallback: try providers in defined order
@@ -307,6 +348,17 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 			continue
 		}
 		if p, ok := r.providers[name]; ok && p.IsAvailable() {
+			if blocked, remaining := r.isCircuitOpen(name); blocked {
+				r.emitTrace(TraceEvent{
+					Event:      "route_candidate_skipped",
+					Task:       taskTypeName(task),
+					Requested:  modelName,
+					Selected:   name,
+					IsFallback: true,
+					Detail:     circuitOpenDetail(name, remaining),
+				})
+				continue
+			}
 			r.emitTrace(TraceEvent{
 				Event:      "route_selected",
 				Task:       taskTypeName(task),
@@ -357,6 +409,20 @@ func (r *Router) routeByMode(task TaskType) (RouteResult, error) {
 
 	// Try each candidate
 	for _, c := range candidates {
+		if blocked, remaining := r.isCircuitOpen(c.name); blocked {
+			r.emitTrace(TraceEvent{
+				Event:      "route_candidate_skipped",
+				Task:       taskTypeName(task),
+				Phase:      buildPhaseName(phase),
+				Requested:  requested,
+				Selected:   c.name,
+				ModelID:    c.modelID,
+				IsFallback: c.name != requested,
+				Detail:     circuitOpenDetail(c.name, remaining),
+			})
+			continue
+		}
+
 		p, err := r.resolveProvider(c.name, c.modelID)
 		if err != nil {
 			r.emitTrace(TraceEvent{
@@ -476,6 +542,7 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 // resolveProvider returns a provider instance for the given (name, modelID) pair.
 // It caches instances so the same (provider, model) combination reuses the same instance.
 func (r *Router) resolveProvider(providerName, modelID string) (Provider, error) {
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
 	key := providerKey{name: providerName, modelID: modelID}
 
 	r.providerMu.Lock()
@@ -494,47 +561,13 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 		}
 	}
 
-	var p Provider
-	switch providerName {
-	case "claude":
-		if cli := r.cfg.GetCLI("claude"); cli != nil {
-			p = NewClaudeCLI(cli.BinPath)
-		} else if r.cfg.ClaudeAPIKey != "" {
-			p = NewClaude(r.cfg.ClaudeAPIKey, modelID)
-		} else {
-			return nil, fmt.Errorf("claude not configured (no CLI or API key)")
-		}
-	case "codex":
-		if cli := r.cfg.GetCLI("codex"); cli != nil {
-			p = NewCodexCLI(cli.BinPath)
-		} else if r.cfg.OpenAIAPIKey != "" {
-			p = NewOpenAI(r.cfg.OpenAIAPIKey, modelID)
-		} else {
-			return nil, fmt.Errorf("codex not configured (no CLI or API key)")
-		}
-	case "openai":
-		if r.cfg.OpenAIAPIKey != "" {
-			p = NewOpenAI(r.cfg.OpenAIAPIKey, modelID)
-		} else if cli := r.cfg.GetCLI("codex"); cli != nil {
-			p = NewCodexCLI(cli.BinPath)
-		} else {
-			return nil, fmt.Errorf("openai not configured")
-		}
-	case "gemini":
-		if cli := r.cfg.GetCLI("gemini"); cli != nil {
-			p = NewGeminiCLI(cli.BinPath)
-		} else if r.cfg.GeminiAPIKey != "" {
-			p = NewGemini(r.cfg.GeminiAPIKey, modelID)
-		} else {
-			return nil, fmt.Errorf("gemini not configured (no CLI or API key)")
-		}
-	case "ollama":
-		if r.cfg.OllamaURL == "" {
-			return nil, fmt.Errorf("ollama URL not configured")
-		}
-		p = NewOllama(r.cfg.OllamaURL, modelID)
-	default:
+	resolver, ok := getProviderResolver(providerName)
+	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
+	}
+	p, err := resolver(r.cfg, modelID)
+	if err != nil {
+		return nil, err
 	}
 
 	r.providerCache[key] = p
@@ -553,6 +586,34 @@ func (r *Router) Get(name string) (Provider, error) {
 	return p, nil
 }
 
+// RegisterProvider injects a provider instance at runtime.
+// This is useful for private/custom providers without editing router internals.
+func (r *Router) RegisterProvider(name string, provider Provider, access AccessType) error {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return fmt.Errorf("provider name is empty")
+	}
+	if provider == nil {
+		return fmt.Errorf("provider is nil")
+	}
+
+	r.providerMu.Lock()
+	r.providers[name] = provider
+	for k := range r.providerCache {
+		if k.name == name {
+			delete(r.providerCache, k)
+		}
+	}
+	r.providerCache[providerKey{name: name, modelID: ""}] = provider
+	r.providerMu.Unlock()
+
+	r.mu.Lock()
+	r.accessTypes[name] = access
+	r.cachedAvailAt = time.Time{}
+	r.mu.Unlock()
+	return nil
+}
+
 // Available returns all available provider names, filtered by the effective mode.
 // In ModeFree, API-only providers are excluded to match the routing strategy.
 // Results are cached to avoid repeated health checks (e.g. Ollama) on every render cycle.
@@ -569,6 +630,9 @@ func (r *Router) Available() []string {
 	for name, p := range r.providers {
 		if p.IsAvailable() {
 			if mode == ModeFree && r.accessTypes[name] == AccessAPI {
+				continue
+			}
+			if blocked, _ := r.isCircuitOpen(name); blocked {
 				continue
 			}
 			names = append(names, name)
@@ -596,40 +660,76 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		return "", Usage{}, RouteResult{}, err
 	}
 	maxTokens := MaxTokensForTask(task)
-	primaryStart := time.Now()
-	content, usage, err := result.Provider.Chat(ctx, messages, system, maxTokens)
-	if err == nil {
-		r.usage.Increment(result.Actual)
+	firstErr := error(nil)
+
+	if allow, remaining := r.beforeProviderAttempt(result.Actual); !allow {
+		firstErr = fmt.Errorf("%s", circuitOpenDetail(result.Actual, remaining))
 		r.emitTrace(TraceEvent{
-			Event:      "chat_attempt_success",
+			Event:      "chat_fallback_skipped",
+			Task:       taskTypeName(task),
+			Requested:  result.Requested,
+			Selected:   result.Actual,
+			ModelID:    result.ModelID,
+			IsFallback: result.IsFallback,
+			Detail:     firstErr.Error(),
+		})
+	} else {
+		primaryStart := time.Now()
+		content, usage, chatErr := result.Provider.Chat(ctx, messages, system, maxTokens)
+		if chatErr == nil {
+			r.usage.Increment(result.Actual)
+			r.recordProviderSuccess(result.Actual)
+			r.emitTrace(TraceEvent{
+				Event:      "chat_attempt_success",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   result.Actual,
+				ModelID:    result.ModelID,
+				IsFallback: result.IsFallback,
+				DurationMS: time.Since(primaryStart).Milliseconds(),
+			})
+			return content, usage, result, nil
+		}
+		r.emitTrace(TraceEvent{
+			Event:      "chat_attempt_error",
 			Task:       taskTypeName(task),
 			Requested:  result.Requested,
 			Selected:   result.Actual,
 			ModelID:    result.ModelID,
 			IsFallback: result.IsFallback,
 			DurationMS: time.Since(primaryStart).Milliseconds(),
+			Error:      chatErr.Error(),
 		})
-		return content, usage, result, nil
-	}
-	r.emitTrace(TraceEvent{
-		Event:      "chat_attempt_error",
-		Task:       taskTypeName(task),
-		Requested:  result.Requested,
-		Selected:   result.Actual,
-		ModelID:    result.ModelID,
-		IsFallback: result.IsFallback,
-		DurationMS: time.Since(primaryStart).Milliseconds(),
-		Error:      err.Error(),
-	})
 
-	// Primary failed — try fallback providers
-	r.usage.RecordFailure(result.Actual)
-	firstErr := err
+		r.usage.RecordFailure(result.Actual)
+		if opened, until := r.recordProviderFailure(result.Actual); opened {
+			r.emitTrace(TraceEvent{
+				Event:    "circuit_opened",
+				Task:     taskTypeName(task),
+				Selected: result.Actual,
+				Detail:   circuitOpenDetail(result.Actual, time.Until(until)),
+			})
+		}
+		firstErr = chatErr
+	}
+
 	if r.ModeSet() {
 		entry, modeErr := r.modeEntry(task)
 		if modeErr == nil {
 			excluded := map[string]bool{result.Actual: true}
 			for _, c := range r.modeCandidates(entry, excluded, taskToBuildPhase(task)) {
+				if blocked, remaining := r.isCircuitOpen(c.name); blocked {
+					r.emitTrace(TraceEvent{
+						Event:      "chat_fallback_skipped",
+						Task:       taskTypeName(task),
+						Requested:  result.Requested,
+						Selected:   c.name,
+						ModelID:    c.modelID,
+						IsFallback: true,
+						Detail:     circuitOpenDetail(c.name, remaining),
+					})
+					continue
+				}
 				p, resolveErr := r.resolveProvider(c.name, c.modelID)
 				if resolveErr != nil {
 					r.emitTrace(TraceEvent{
@@ -653,10 +753,23 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 					})
 					continue
 				}
+				if allow, remaining := r.beforeProviderAttempt(c.name); !allow {
+					r.emitTrace(TraceEvent{
+						Event:      "chat_fallback_skipped",
+						Task:       taskTypeName(task),
+						Requested:  result.Requested,
+						Selected:   c.name,
+						ModelID:    c.modelID,
+						IsFallback: true,
+						Detail:     circuitOpenDetail(c.name, remaining),
+					})
+					continue
+				}
 				start := time.Now()
 				content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
 				if retryErr == nil {
 					r.usage.Increment(c.name)
+					r.recordProviderSuccess(c.name)
 					r.emitTrace(TraceEvent{
 						Event:      "chat_attempt_success",
 						Task:       taskTypeName(task),
@@ -685,8 +798,26 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 					Error:      retryErr.Error(),
 				})
 				r.usage.RecordFailure(c.name)
+				if opened, until := r.recordProviderFailure(c.name); opened {
+					r.emitTrace(TraceEvent{
+						Event:    "circuit_opened",
+						Task:     taskTypeName(task),
+						Selected: c.name,
+						ModelID:  c.modelID,
+						Detail:   circuitOpenDetail(c.name, time.Until(until)),
+					})
+				}
+				if firstErr == nil {
+					firstErr = retryErr
+				}
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("all providers skipped by circuit breaker")
 			}
 			return "", Usage{}, result, firstErr
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("route mode resolution failed")
 		}
 		return "", Usage{}, result, firstErr
 	}
@@ -695,14 +826,37 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		if name == result.Actual {
 			continue
 		}
+		if blocked, remaining := r.isCircuitOpen(name); blocked {
+			r.emitTrace(TraceEvent{
+				Event:      "chat_fallback_skipped",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   name,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(name, remaining),
+			})
+			continue
+		}
 		p, ok := r.providers[name]
 		if !ok || !p.IsAvailable() {
+			continue
+		}
+		if allow, remaining := r.beforeProviderAttempt(name); !allow {
+			r.emitTrace(TraceEvent{
+				Event:      "chat_fallback_skipped",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   name,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(name, remaining),
+			})
 			continue
 		}
 		start := time.Now()
 		content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
 		if retryErr == nil {
 			r.usage.Increment(name)
+			r.recordProviderSuccess(name)
 			r.emitTrace(TraceEvent{
 				Event:      "chat_attempt_success",
 				Task:       taskTypeName(task),
@@ -727,6 +881,21 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 			DurationMS: time.Since(start).Milliseconds(),
 			Error:      retryErr.Error(),
 		})
+		r.usage.RecordFailure(name)
+		if opened, until := r.recordProviderFailure(name); opened {
+			r.emitTrace(TraceEvent{
+				Event:    "circuit_opened",
+				Task:     taskTypeName(task),
+				Selected: name,
+				Detail:   circuitOpenDetail(name, time.Until(until)),
+			})
+		}
+		if firstErr == nil {
+			firstErr = retryErr
+		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no provider attempt was possible")
 	}
 	r.emitTrace(TraceEvent{
 		Event:     "chat_failed_all",
@@ -777,6 +946,9 @@ func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
 	var traceCandidates []TraceCandidate
 	for i, name := range all {
 		if _, ok := r.providers[name]; !ok {
+			continue
+		}
+		if blocked, _ := r.isCircuitOpen(name); blocked {
 			continue
 		}
 		priorBias := math.Max(0.0, float64(2-i))
@@ -854,26 +1026,47 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 
 	// Try the requested provider first (unless excluded)
 	if !excluded[name] {
-		if p, modelID, err := r.tryBuildProvider(name, bs.Tier); err == nil && p.IsAvailable() {
+		if blocked, remaining := r.isCircuitOpen(name); blocked {
 			r.emitTrace(TraceEvent{
-				Event:     "build_route_selected",
+				Event:     "build_route_candidate_skipped",
 				Phase:     buildPhaseName(phase),
 				Requested: name,
 				Selected:  name,
-				ModelID:   modelID,
+				Detail:    circuitOpenDetail(name, remaining),
 			})
-			return RouteResult{
-				Provider:  p,
-				ModelID:   modelID,
-				Requested: name,
-				Actual:    name,
-			}, nil
+		} else {
+			if p, modelID, err := r.tryBuildProvider(name, bs.Tier); err == nil && p.IsAvailable() {
+				r.emitTrace(TraceEvent{
+					Event:     "build_route_selected",
+					Phase:     buildPhaseName(phase),
+					Requested: name,
+					Selected:  name,
+					ModelID:   modelID,
+				})
+				return RouteResult{
+					Provider:  p,
+					ModelID:   modelID,
+					Requested: name,
+					Actual:    name,
+				}, nil
+			}
 		}
 	}
 
 	// Fallback through the phase's list, skipping excluded providers
 	for _, fb := range bs.Fallbacks {
 		if fb == name || excluded[fb] {
+			continue
+		}
+		if blocked, remaining := r.isCircuitOpen(fb); blocked {
+			r.emitTrace(TraceEvent{
+				Event:      "build_route_candidate_skipped",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(fb, remaining),
+			})
 			continue
 		}
 		if p, modelID, err := r.tryBuildProvider(fb, bs.Tier); err == nil && p.IsAvailable() {
@@ -943,31 +1136,59 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 	}
 
 	maxTokens := maxTokensForPhase(phase)
-	primaryStart := time.Now()
-	content, usage, err := result.Provider.Chat(ctx, messages, system, maxTokens)
-	if err == nil {
-		r.usage.Increment(result.Actual)
+	firstErr := error(nil)
+
+	if allow, remaining := r.beforeProviderAttempt(result.Actual); !allow {
+		firstErr = fmt.Errorf("%s", circuitOpenDetail(result.Actual, remaining))
 		r.emitTrace(TraceEvent{
-			Event:      "build_chat_attempt_success",
+			Event:      "build_chat_fallback_skipped",
+			Phase:      buildPhaseName(phase),
+			Requested:  name,
+			Selected:   result.Actual,
+			ModelID:    result.ModelID,
+			IsFallback: result.IsFallback,
+			Detail:     firstErr.Error(),
+		})
+	} else {
+		primaryStart := time.Now()
+		content, usage, chatErr := result.Provider.Chat(ctx, messages, system, maxTokens)
+		if chatErr == nil {
+			r.usage.Increment(result.Actual)
+			r.recordProviderSuccess(result.Actual)
+			r.emitTrace(TraceEvent{
+				Event:      "build_chat_attempt_success",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   result.Actual,
+				ModelID:    result.ModelID,
+				IsFallback: result.IsFallback,
+				DurationMS: time.Since(primaryStart).Milliseconds(),
+			})
+			return content, usage, result, nil
+		}
+		r.emitTrace(TraceEvent{
+			Event:      "build_chat_attempt_error",
 			Phase:      buildPhaseName(phase),
 			Requested:  name,
 			Selected:   result.Actual,
 			ModelID:    result.ModelID,
 			IsFallback: result.IsFallback,
 			DurationMS: time.Since(primaryStart).Milliseconds(),
+			Error:      chatErr.Error(),
 		})
-		return content, usage, result, nil
+
+		r.usage.RecordFailure(result.Actual)
+		if opened, until := r.recordProviderFailure(result.Actual); opened {
+			r.emitTrace(TraceEvent{
+				Event:    "circuit_opened",
+				Phase:    buildPhaseName(phase),
+				Selected: result.Actual,
+				ModelID:  result.ModelID,
+				Detail:   circuitOpenDetail(result.Actual, time.Until(until)),
+			})
+		}
+		firstErr = chatErr
 	}
-	r.emitTrace(TraceEvent{
-		Event:      "build_chat_attempt_error",
-		Phase:      buildPhaseName(phase),
-		Requested:  name,
-		Selected:   result.Actual,
-		ModelID:    result.ModelID,
-		IsFallback: result.IsFallback,
-		DurationMS: time.Since(primaryStart).Milliseconds(),
-		Error:      err.Error(),
-	})
 
 	// Primary failed — try remaining fallbacks, respecting exclude list
 	excluded := make(map[string]bool, len(exclude))
@@ -975,12 +1196,21 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 		excluded[e] = true
 	}
 
-	r.usage.RecordFailure(result.Actual)
-	firstErr := err
 	modeStrategies := buildStrategyTable[r.effectiveMode()]
 	bs := modeStrategies[phase]
 	for _, fb := range bs.Fallbacks {
 		if fb == result.Actual || excluded[fb] {
+			continue
+		}
+		if blocked, remaining := r.isCircuitOpen(fb); blocked {
+			r.emitTrace(TraceEvent{
+				Event:      "build_chat_fallback_skipped",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(fb, remaining),
+			})
 			continue
 		}
 		p, _, resolveErr := r.tryBuildProvider(fb, bs.Tier)
@@ -1004,10 +1234,22 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 			})
 			continue
 		}
+		if allow, remaining := r.beforeProviderAttempt(fb); !allow {
+			r.emitTrace(TraceEvent{
+				Event:      "build_chat_fallback_skipped",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(fb, remaining),
+			})
+			continue
+		}
 		start := time.Now()
 		content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
 		if retryErr == nil {
 			r.usage.Increment(fb)
+			r.recordProviderSuccess(fb)
 			_, modelID, _ := r.tryBuildProvider(fb, bs.Tier)
 			r.emitTrace(TraceEvent{
 				Event:      "build_chat_attempt_success",
@@ -1036,6 +1278,20 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 			Error:      retryErr.Error(),
 		})
 		r.usage.RecordFailure(fb)
+		if opened, until := r.recordProviderFailure(fb); opened {
+			r.emitTrace(TraceEvent{
+				Event:    "circuit_opened",
+				Phase:    buildPhaseName(phase),
+				Selected: fb,
+				Detail:   circuitOpenDetail(fb, time.Until(until)),
+			})
+		}
+		if firstErr == nil {
+			firstErr = retryErr
+		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no provider attempt was possible")
 	}
 
 	r.emitTrace(TraceEvent{
@@ -1056,41 +1312,75 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 		return nil, RouteResult{}, err
 	}
 	maxTokens := MaxTokensForTask(task)
-	primaryStart := time.Now()
-	ch, err := result.Provider.ChatStream(ctx, messages, system, maxTokens)
-	if err == nil {
-		r.usage.Increment(result.Actual)
+	firstErr := error(nil)
+
+	if allow, remaining := r.beforeProviderAttempt(result.Actual); !allow {
+		firstErr = fmt.Errorf("%s", circuitOpenDetail(result.Actual, remaining))
 		r.emitTrace(TraceEvent{
-			Event:      "chat_stream_start_success",
+			Event:      "chat_stream_fallback_skipped",
+			Task:       taskTypeName(task),
+			Requested:  result.Requested,
+			Selected:   result.Actual,
+			ModelID:    result.ModelID,
+			IsFallback: result.IsFallback,
+			Detail:     firstErr.Error(),
+		})
+	} else {
+		primaryStart := time.Now()
+		ch, streamErr := result.Provider.ChatStream(ctx, messages, system, maxTokens)
+		if streamErr == nil {
+			r.usage.Increment(result.Actual)
+			r.recordProviderSuccess(result.Actual)
+			r.emitTrace(TraceEvent{
+				Event:      "chat_stream_start_success",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   result.Actual,
+				ModelID:    result.ModelID,
+				IsFallback: result.IsFallback,
+				DurationMS: time.Since(primaryStart).Milliseconds(),
+			})
+			return ch, result, nil
+		}
+		r.emitTrace(TraceEvent{
+			Event:      "chat_stream_start_error",
 			Task:       taskTypeName(task),
 			Requested:  result.Requested,
 			Selected:   result.Actual,
 			ModelID:    result.ModelID,
 			IsFallback: result.IsFallback,
 			DurationMS: time.Since(primaryStart).Milliseconds(),
+			Error:      streamErr.Error(),
 		})
-		return ch, result, nil
+		r.usage.RecordFailure(result.Actual)
+		if opened, until := r.recordProviderFailure(result.Actual); opened {
+			r.emitTrace(TraceEvent{
+				Event:    "circuit_opened",
+				Task:     taskTypeName(task),
+				Selected: result.Actual,
+				Detail:   circuitOpenDetail(result.Actual, time.Until(until)),
+			})
+		}
+		firstErr = streamErr
 	}
-	r.emitTrace(TraceEvent{
-		Event:      "chat_stream_start_error",
-		Task:       taskTypeName(task),
-		Requested:  result.Requested,
-		Selected:   result.Actual,
-		ModelID:    result.ModelID,
-		IsFallback: result.IsFallback,
-		DurationMS: time.Since(primaryStart).Milliseconds(),
-		Error:      err.Error(),
-	})
-
-	// Primary stream start failed — try fallbacks.
-	r.usage.RecordFailure(result.Actual)
-	firstErr := err
 
 	if r.ModeSet() {
 		entry, modeErr := r.modeEntry(task)
 		if modeErr == nil {
 			excluded := map[string]bool{result.Actual: true}
 			for _, c := range r.modeCandidates(entry, excluded, taskToBuildPhase(task)) {
+				if blocked, remaining := r.isCircuitOpen(c.name); blocked {
+					r.emitTrace(TraceEvent{
+						Event:      "chat_stream_fallback_skipped",
+						Task:       taskTypeName(task),
+						Requested:  result.Requested,
+						Selected:   c.name,
+						ModelID:    c.modelID,
+						IsFallback: true,
+						Detail:     circuitOpenDetail(c.name, remaining),
+					})
+					continue
+				}
 				p, resolveErr := r.resolveProvider(c.name, c.modelID)
 				if resolveErr != nil {
 					r.emitTrace(TraceEvent{
@@ -1114,10 +1404,23 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 					})
 					continue
 				}
+				if allow, remaining := r.beforeProviderAttempt(c.name); !allow {
+					r.emitTrace(TraceEvent{
+						Event:      "chat_stream_fallback_skipped",
+						Task:       taskTypeName(task),
+						Requested:  result.Requested,
+						Selected:   c.name,
+						ModelID:    c.modelID,
+						IsFallback: true,
+						Detail:     circuitOpenDetail(c.name, remaining),
+					})
+					continue
+				}
 				start := time.Now()
 				ch, retryErr := p.ChatStream(ctx, messages, system, maxTokens)
 				if retryErr == nil {
 					r.usage.Increment(c.name)
+					r.recordProviderSuccess(c.name)
 					r.emitTrace(TraceEvent{
 						Event:      "chat_stream_start_success",
 						Task:       taskTypeName(task),
@@ -1146,8 +1449,26 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 					Error:      retryErr.Error(),
 				})
 				r.usage.RecordFailure(c.name)
+				if opened, until := r.recordProviderFailure(c.name); opened {
+					r.emitTrace(TraceEvent{
+						Event:    "circuit_opened",
+						Task:     taskTypeName(task),
+						Selected: c.name,
+						ModelID:  c.modelID,
+						Detail:   circuitOpenDetail(c.name, time.Until(until)),
+					})
+				}
+				if firstErr == nil {
+					firstErr = retryErr
+				}
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("all providers skipped by circuit breaker")
 			}
 			return nil, result, firstErr
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("route mode resolution failed")
 		}
 		return nil, result, firstErr
 	}
@@ -1156,14 +1477,37 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 		if name == result.Actual {
 			continue
 		}
+		if blocked, remaining := r.isCircuitOpen(name); blocked {
+			r.emitTrace(TraceEvent{
+				Event:      "chat_stream_fallback_skipped",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   name,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(name, remaining),
+			})
+			continue
+		}
 		p, ok := r.providers[name]
 		if !ok || !p.IsAvailable() {
+			continue
+		}
+		if allow, remaining := r.beforeProviderAttempt(name); !allow {
+			r.emitTrace(TraceEvent{
+				Event:      "chat_stream_fallback_skipped",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   name,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(name, remaining),
+			})
 			continue
 		}
 		start := time.Now()
 		ch, retryErr := p.ChatStream(ctx, messages, system, maxTokens)
 		if retryErr == nil {
 			r.usage.Increment(name)
+			r.recordProviderSuccess(name)
 			r.emitTrace(TraceEvent{
 				Event:      "chat_stream_start_success",
 				Task:       taskTypeName(task),
@@ -1189,6 +1533,20 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 			Error:      retryErr.Error(),
 		})
 		r.usage.RecordFailure(name)
+		if opened, until := r.recordProviderFailure(name); opened {
+			r.emitTrace(TraceEvent{
+				Event:    "circuit_opened",
+				Task:     taskTypeName(task),
+				Selected: name,
+				Detail:   circuitOpenDetail(name, time.Until(until)),
+			})
+		}
+		if firstErr == nil {
+			firstErr = retryErr
+		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no provider attempt was possible")
 	}
 
 	r.emitTrace(TraceEvent{
@@ -1237,6 +1595,15 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 		if excluded[name] {
 			continue
 		}
+		if blocked, remaining := r.isCircuitOpen(name); blocked {
+			r.emitTrace(TraceEvent{
+				Event:    "ensemble_generator_skipped",
+				Phase:    buildPhaseName(phase),
+				Selected: name,
+				Detail:   circuitOpenDetail(name, remaining),
+			})
+			continue
+		}
 		p, modelID, err := r.tryBuildProvider(name, TierPremium)
 		if err != nil || !p.IsAvailable() {
 			continue
@@ -1264,10 +1631,29 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 		wg.Add(1)
 		go func(idx int, sl slot) {
 			defer wg.Done()
+			if allow, remaining := r.beforeProviderAttempt(sl.name); !allow {
+				r.emitTrace(TraceEvent{
+					Event:    "ensemble_generator_skipped",
+					Phase:    buildPhaseName(phase),
+					Selected: sl.name,
+					ModelID:  sl.modelID,
+					Detail:   circuitOpenDetail(sl.name, remaining),
+				})
+				return
+			}
 			start := time.Now()
 			content, usage, err := sl.p.Chat(ctx, messages, system, maxTokens)
 			if err != nil {
 				r.usage.RecordFailure(sl.name)
+				if opened, until := r.recordProviderFailure(sl.name); opened {
+					r.emitTrace(TraceEvent{
+						Event:    "circuit_opened",
+						Phase:    buildPhaseName(phase),
+						Selected: sl.name,
+						ModelID:  sl.modelID,
+						Detail:   circuitOpenDetail(sl.name, time.Until(until)),
+					})
+				}
 				r.emitTrace(TraceEvent{
 					Event:      "ensemble_generator_error",
 					Phase:      buildPhaseName(phase),
@@ -1279,6 +1665,7 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 				return
 			}
 			r.usage.Increment(sl.name)
+			r.recordProviderSuccess(sl.name)
 			r.emitTrace(TraceEvent{
 				Event:      "ensemble_generator_success",
 				Phase:      buildPhaseName(phase),
@@ -1345,6 +1732,24 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 		})
 		return results[0]
 	}
+	if blocked, remaining := r.isCircuitOpen(pe.Judge); blocked {
+		r.emitTrace(TraceEvent{
+			Event:    "judge_skipped_unavailable",
+			Phase:    buildPhaseName(phase),
+			Selected: pe.Judge,
+			Detail:   circuitOpenDetail(pe.Judge, remaining),
+		})
+		return results[0]
+	}
+	if allow, remaining := r.beforeProviderAttempt(pe.Judge); !allow {
+		r.emitTrace(TraceEvent{
+			Event:    "judge_skipped_unavailable",
+			Phase:    buildPhaseName(phase),
+			Selected: pe.Judge,
+			Detail:   circuitOpenDetail(pe.Judge, remaining),
+		})
+		return results[0]
+	}
 
 	var prompt strings.Builder
 	for i, res := range results {
@@ -1361,6 +1766,16 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 	judgeStart := time.Now()
 	content, usage, err := judgeP.Chat(ctx, judgeMessages, judgeSystemFor(phase), maxTokensForPhase(phase))
 	if err != nil {
+		r.usage.RecordFailure(pe.Judge)
+		if opened, until := r.recordProviderFailure(pe.Judge); opened {
+			r.emitTrace(TraceEvent{
+				Event:    "circuit_opened",
+				Phase:    buildPhaseName(phase),
+				Selected: pe.Judge,
+				ModelID:  judgeModelID,
+				Detail:   circuitOpenDetail(pe.Judge, time.Until(until)),
+			})
+		}
 		r.emitTrace(TraceEvent{
 			Event:      "judge_error",
 			Phase:      buildPhaseName(phase),
@@ -1371,6 +1786,7 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 		})
 		return results[0]
 	}
+	r.recordProviderSuccess(pe.Judge)
 	r.emitTrace(TraceEvent{
 		Event:      "judge_success",
 		Phase:      buildPhaseName(phase),
