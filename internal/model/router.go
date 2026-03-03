@@ -259,7 +259,7 @@ func (r *Router) EmitTrace(event TraceEvent) {
 
 // Route selects the best provider for a given task type.
 func (r *Router) Route(task TaskType) (RouteResult, error) {
-	if r.modeSet {
+	if r.ModeSet() {
 		return r.routeByMode(task)
 	}
 	return r.routeLegacy(task)
@@ -625,7 +625,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 	// Primary failed — try fallback providers
 	r.usage.RecordFailure(result.Actual)
 	firstErr := err
-	if r.modeSet {
+	if r.ModeSet() {
 		entry, modeErr := r.modeEntry(task)
 		if modeErr == nil {
 			excluded := map[string]bool{result.Actual: true}
@@ -1086,7 +1086,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 	r.usage.RecordFailure(result.Actual)
 	firstErr := err
 
-	if r.modeSet {
+	if r.ModeSet() {
 		entry, modeErr := r.modeEntry(task)
 		if modeErr == nil {
 			excluded := map[string]bool{result.Actual: true}
