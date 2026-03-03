@@ -87,3 +87,30 @@ func TestSave_StripsEnvSourcedKeys(t *testing.T) {
 		t.Fatal("config file should not persist env-sourced OPENAI_API_KEY")
 	}
 }
+
+func TestConfigDir_UsesEnvOverride(t *testing.T) {
+	home := t.TempDir()
+	custom := filepath.Join(t.TempDir(), "custom-makewand-config")
+	t.Setenv("HOME", home)
+	t.Setenv("MAKEWAND_CONFIG_DIR", custom)
+
+	dir, err := ConfigDir()
+	if err != nil {
+		t.Fatalf("ConfigDir() error: %v", err)
+	}
+	if dir != custom {
+		t.Fatalf("ConfigDir() = %q, want %q", dir, custom)
+	}
+	if _, err := os.Stat(custom); err != nil {
+		t.Fatalf("Stat(%s): %v", custom, err)
+	}
+
+	path, err := ConfigPath()
+	if err != nil {
+		t.Fatalf("ConfigPath() error: %v", err)
+	}
+	wantPath := filepath.Join(custom, "config.json")
+	if path != wantPath {
+		t.Fatalf("ConfigPath() = %q, want %q", path, wantPath)
+	}
+}

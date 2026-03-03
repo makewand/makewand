@@ -75,15 +75,21 @@ func DefaultConfig() *Config {
 	}
 }
 
-// ConfigDir returns the path to the config directory (~/.config/makewand/).
+// ConfigDir returns the path to the config directory.
+// Priority:
+//  1. MAKEWAND_CONFIG_DIR (if set)
+//  2. ~/.config/makewand
 func ConfigDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	dir := strings.TrimSpace(os.Getenv("MAKEWAND_CONFIG_DIR"))
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(home, ".config", "makewand")
 	}
-	dir := filepath.Join(home, ".config", "makewand")
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
+		return "", fmt.Errorf("create config dir %s: %w", dir, err)
 	}
 	return dir, nil
 }

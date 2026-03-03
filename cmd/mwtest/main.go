@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -41,7 +42,11 @@ var tests = []testCase{
 	},
 }
 
+var requestTimeout = flag.Duration("timeout", 45*time.Second, "per-request timeout for live provider calls")
+
 func main() {
+	flag.Parse()
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config load error: %v\n", err)
@@ -64,6 +69,7 @@ func main() {
 	fmt.Println("=" + strings.Repeat("=", 79))
 	fmt.Println("makewand Provider & Mode Evaluation")
 	fmt.Printf("CLIs detected: %d\n", len(cfg.CLIs))
+	fmt.Printf("Request timeout: %s\n", requestTimeout.String())
 	for _, cli := range cfg.CLIs {
 		fmt.Printf("  %s (%s)\n", cli.Name, cli.Version)
 	}
@@ -80,7 +86,7 @@ func main() {
 		router.SetMode(m.mode)
 
 		for _, tc := range tests {
-			runTest(router, tc, "")
+			runTest(router, tc, *requestTimeout)
 		}
 	}
 
@@ -101,7 +107,7 @@ func main() {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), *requestTimeout)
 		start := time.Now()
 		content, usage, err := p.Chat(ctx, []model.Message{
 			{Role: "user", Content: codeTest.prompt},
@@ -121,10 +127,10 @@ func main() {
 	fmt.Println("Evaluation complete.")
 }
 
-func runTest(router *model.Router, tc testCase, forceProvider string) {
+func runTest(router *model.Router, tc testCase, timeout time.Duration) {
 	fmt.Printf("\n  Task: %s\n", tc.name)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	start := time.Now()

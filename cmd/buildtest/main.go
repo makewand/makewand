@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -15,7 +16,11 @@ import (
 // Headless test of the multi-model build pipeline:
 //   Plan (gemini) → Code (claude) → Review (gemini) → Fix (codex)
 
+var requestTimeout = flag.Duration("timeout", 60*time.Second, "per-step timeout for live provider calls")
+
 func main() {
+	flag.Parse()
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config load: %v\n", err)
@@ -33,12 +38,17 @@ func main() {
 	fmt.Println("║          makewand 多模型协作管道测试 (buildtest)                ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
 	fmt.Println()
+	fmt.Printf("Request timeout: %s\n\n", requestTimeout.String())
 
 	// Show available providers
 	router := model.NewRouter(cfg)
 	fmt.Println("▸ Available providers:")
-	for _, name := range router.Available() {
+	availableProviders := router.Available()
+	for _, name := range availableProviders {
 		fmt.Printf("  ✓ %s\n", name)
+	}
+	if len(availableProviders) == 0 {
+		fmt.Println("  (none)")
 	}
 	fmt.Println()
 
@@ -72,7 +82,7 @@ func main() {
 			primary := r.BuildProviderFor(p.phase)
 			result, err := r.RouteProvider(primary, p.phase)
 			if err != nil {
-				row += fmt.Sprintf("│ %-18s", "✗ "+err.Error()[:14])
+				row += fmt.Sprintf("│ %-18s", "✗ "+truncate(err.Error(), 14))
 			} else {
 				cell := result.Actual
 				if result.IsFallback {
@@ -122,13 +132,12 @@ func main() {
 
 	cfg.UsageMode = "balanced"
 	router = model.NewRouter(cfg)
-	ctx := context.Background()
 
 	// Step 1: Plan
 	fmt.Print("  [1/4] Plan... ")
 	planProvider := router.BuildProviderFor(model.PhasePlan)
 	start := time.Now()
-	planContent, planUsage, planResult, err := router.ChatWith(ctx, planProvider, model.PhasePlan,
+	planContent, planUsage, planResult, err := callChatWith(router, *requestTimeout, planProvider, model.PhasePlan,
 		[]model.Message{{Role: "user", Content: "I want to create a simple calculator web app with HTML/CSS/JS. Provide a brief plan with file structure. Keep it very short."}},
 		"You are a friendly project planner. Be very concise.")
 	elapsed := time.Since(start)
@@ -143,7 +152,7 @@ func main() {
 	fmt.Print("  [2/4] Code... ")
 	codeProvider := router.BuildProviderFor(model.PhaseCode)
 	start = time.Now()
-	codeContent, codeUsage, codeResult, err := router.ChatWith(ctx, codeProvider, model.PhaseCode,
+	codeContent, codeUsage, codeResult, err := callChatWith(router, *requestTimeout, codeProvider, model.PhaseCode,
 		[]model.Message{{Role: "user", Content: "Create a simple calculator web app. Output 2-3 files max. Use this format:\n\n--- FILE: path/to/file ---\n```\ncontent\n```\n\nKeep it minimal."}},
 		"You are an expert programmer. Generate working code. Be concise.")
 	elapsed = time.Since(start)
@@ -182,12 +191,12 @@ func main() {
 		codeContent)
 
 	start = time.Now()
-	reviewContent, reviewUsage, reviewResult, err := router.ChatWith(ctx, reviewProvider, model.PhaseReview,
+	reviewContent, reviewUsage, reviewResult, reviewErr := callChatWith(router, *requestTimeout, reviewProvider, model.PhaseReview,
 		[]model.Message{{Role: "user", Content: reviewPrompt}},
 		"You are an expert code reviewer. Be concise.")
 	elapsed = time.Since(start)
-	if err != nil {
-		fmt.Printf("✗ %v\n", err)
+	if reviewErr != nil {
+		fmt.Printf("✗ %v\n", reviewErr)
 		fmt.Println("         (review error is non-fatal, continuing)")
 	} else {
 		hasIssues := !isLGTMResponse(reviewContent)
@@ -212,12 +221,12 @@ func main() {
 	}
 
 	start = time.Now()
-	_, fixUsage, fixResult, err := router.ChatWith(ctx, fixProvider, model.PhaseFix,
+	_, fixUsage, fixResult, fixErr := callChatWith(router, *requestTimeout, fixProvider, model.PhaseFix,
 		[]model.Message{{Role: "user", Content: "The following test error occurred:\n\n```\nReferenceError: calculate is not defined\n```\n\nFix the code. Output corrected file using:\n--- FILE: path ---\n```\ncontent\n```"}},
 		"You are an expert programmer fixing errors. Be concise.")
 	elapsed = time.Since(start)
-	if err != nil {
-		fmt.Printf("✗ %v\n", err)
+	if fixErr != nil {
+		fmt.Printf("✗ %v\n", fixErr)
 	} else {
 		fmt.Printf("✓ %s (%.1fs, %d tokens)\n", fixResult.Actual, elapsed.Seconds(), fixUsage.InputTokens+fixUsage.OutputTokens)
 	}
@@ -228,8 +237,10 @@ func main() {
 	fmt.Println()
 	fmt.Printf("  Plan:   %s\n", planResult.Actual)
 	fmt.Printf("  Code:   %s\n", codeResult.Actual)
-	if err == nil {
+	if reviewErr == nil {
 		fmt.Printf("  Review: %s (cross-model: %v)\n", reviewResult.Actual, reviewResult.Actual != codeResult.Actual)
+	}
+	if fixErr == nil {
 		fmt.Printf("  Fix:    %s (cross-model: %v)\n", fixResult.Actual, fixResult.Actual != codeResult.Actual)
 	}
 
@@ -241,6 +252,27 @@ func main() {
 	}
 	fmt.Println()
 	fmt.Println("═══ Done ═══")
+}
+
+func callChatWith(
+	router *model.Router,
+	timeout time.Duration,
+	name string,
+	phase model.BuildPhase,
+	messages []model.Message,
+	system string,
+	exclude ...string,
+) (string, model.Usage, model.RouteResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return router.ChatWith(ctx, name, phase, messages, system, exclude...)
+}
+
+func truncate(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max]
 }
 
 func printTruncated(content string, maxLines int) {
