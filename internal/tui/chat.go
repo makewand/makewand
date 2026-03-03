@@ -15,6 +15,9 @@ import (
 
 // maxChatHistory is the maximum number of messages to send to the model.
 const maxChatHistory = 20
+const summaryKeepRecent = 19 // keep 19 + 1 summary system message
+const summaryMaxLines = 10
+const summaryPerLineMaxChars = 180
 
 // ChatMessage represents a message in the chat panel.
 type ChatMessage struct {
@@ -97,7 +100,9 @@ func (c *ChatPanel) FinishStream(provider string, cost float64) {
 }
 
 // ToModelMessages converts chat messages to model API messages.
-// Implements a sliding window: only the last maxChatHistory messages are sent.
+// Uses a summary+window strategy:
+//   - Keep recent messages verbatim.
+//   - Compress older messages into one system summary entry.
 func (c *ChatPanel) ToModelMessages() []model.Message {
 	var msgs []model.Message
 	for _, m := range c.messages {
@@ -109,11 +114,73 @@ func (c *ChatPanel) ToModelMessages() []model.Message {
 		}
 	}
 
-	if len(msgs) > maxChatHistory {
-		msgs = msgs[len(msgs)-maxChatHistory:]
+	if len(msgs) <= maxChatHistory {
+		return msgs
 	}
 
-	return msgs
+	keep := summaryKeepRecent
+	if keep >= maxChatHistory {
+		keep = maxChatHistory - 1
+	}
+	if keep < 1 {
+		keep = 1
+	}
+	if keep > len(msgs) {
+		keep = len(msgs)
+	}
+
+	older := msgs[:len(msgs)-keep]
+	recent := msgs[len(msgs)-keep:]
+	summary := model.Message{
+		Role:    "system",
+		Content: buildHistorySummary(older),
+	}
+	out := make([]model.Message, 0, 1+len(recent))
+	out = append(out, summary)
+	out = append(out, recent...)
+	return out
+}
+
+func buildHistorySummary(msgs []model.Message) string {
+	var b strings.Builder
+	b.WriteString("Conversation summary of earlier context:\n")
+
+	render := func(m model.Message) string {
+		role := "User"
+		if m.Role == "assistant" {
+			role = "Assistant"
+		}
+		content := strings.TrimSpace(strings.ReplaceAll(m.Content, "\n", " "))
+		content = strings.Join(strings.Fields(content), " ")
+		if content == "" {
+			content = "(empty)"
+		}
+		if len(content) > summaryPerLineMaxChars {
+			content = content[:summaryPerLineMaxChars] + "..."
+		}
+		return fmt.Sprintf("- %s: %s", role, content)
+	}
+
+	if len(msgs) <= summaryMaxLines {
+		for _, m := range msgs {
+			b.WriteString(render(m))
+			b.WriteString("\n")
+		}
+		return b.String()
+	}
+
+	headCount := summaryMaxLines / 2
+	tailCount := summaryMaxLines - headCount
+	for _, m := range msgs[:headCount] {
+		b.WriteString(render(m))
+		b.WriteString("\n")
+	}
+	b.WriteString(fmt.Sprintf("- ... %d earlier turns omitted ...\n", len(msgs)-summaryMaxLines))
+	for _, m := range msgs[len(msgs)-tailCount:] {
+		b.WriteString(render(m))
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (c *ChatPanel) updateViewport() {
