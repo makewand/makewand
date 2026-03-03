@@ -117,7 +117,9 @@ func chatCmd() *cobra.Command {
 }
 
 func previewCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowProjectScripts bool
+
+	cmd := &cobra.Command{
 		Use:   "preview [path]",
 		Short: "Start a preview server for your project",
 		Long:  "Automatically detect your project type and start a development server.",
@@ -138,7 +140,7 @@ func previewCmd() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer stop()
 
-			server, err := proj.StartPreview(ctx)
+			server, err := proj.StartPreview(ctx, allowProjectScripts)
 			if err != nil {
 				return fmt.Errorf("could not start preview: %w", err)
 			}
@@ -151,6 +153,9 @@ func previewCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&allowProjectScripts, "allow-project-scripts", false, "allow executing project-defined scripts for preview (unsafe)")
+	return cmd
 }
 
 func setupCmd() *cobra.Command {
@@ -209,7 +214,7 @@ func setupCmd() *cobra.Command {
 			fmt.Println("Provider access types:")
 			fmt.Printf("  Claude: %s\n", accessDisplay(cfg.ClaudeAccess, "api"))
 			fmt.Printf("  Gemini: %s\n", accessDisplay(cfg.GeminiAccess, "free"))
-			fmt.Printf("  Codex:  %s\n", accessDisplay(cfg.OpenAIAccess, "api"))
+			fmt.Printf("  Codex:  %s\n", accessDisplay(cfg.CodexAccess, "api"))
 			fmt.Printf("  Ollama: %s\n", accessDisplay(cfg.OllamaAccess, "local"))
 
 			if len(cfg.CLIs) > 0 {
