@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -155,8 +156,8 @@ func buildHistorySummary(msgs []model.Message) string {
 		if content == "" {
 			content = "(empty)"
 		}
-		if len(content) > summaryPerLineMaxChars {
-			content = content[:summaryPerLineMaxChars] + "..."
+		if utf8.RuneCountInString(content) > summaryPerLineMaxChars {
+			content = truncateRunes(content, summaryPerLineMaxChars) + "..."
 		}
 		return fmt.Sprintf("- %s: %s", role, content)
 	}
@@ -181,6 +182,17 @@ func buildHistorySummary(msgs []model.Message) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes])
 }
 
 func (c *ChatPanel) updateViewport() {
