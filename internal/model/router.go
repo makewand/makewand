@@ -491,24 +491,65 @@ func (r *Router) modeEntry(task TaskType) (strategyEntry, error) {
 	return entry, nil
 }
 
+func (r *Router) registeredProviderNames() []string {
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+
+	names := make([]string, 0, len(r.providers))
+	for name := range r.providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func expandProviderPreference(preferred []string, registered []string, excluded map[string]bool) []string {
+	out := make([]string, 0, len(preferred)+len(registered))
+	seen := make(map[string]bool, len(preferred)+len(registered))
+	registeredSet := make(map[string]struct{}, len(registered))
+	for _, name := range registered {
+		registeredSet[name] = struct{}{}
+	}
+
+	for _, name := range preferred {
+		if name == "" || seen[name] {
+			continue
+		}
+		if excluded != nil && excluded[name] {
+			continue
+		}
+		if _, ok := registeredSet[name]; !ok {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	for _, name := range registered {
+		if seen[name] {
+			continue
+		}
+		if excluded != nil && excluded[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
 func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, phase BuildPhase) []candidate {
 	var candidates []candidate
-	for i, provName := range entry.Providers {
-		if excluded != nil && excluded[provName] {
-			continue
-		}
+	orderedProviders := expandProviderPreference(entry.Providers, r.registeredProviderNames(), excluded)
+	staticOrder := make(map[string]int, len(entry.Providers))
+	for i, name := range entry.Providers {
+		staticOrder[name] = i
+	}
 
-		// Check if provider is configured.
-		if _, exists := r.providers[provName]; !exists {
-			continue
+	for i, provName := range orderedProviders {
+		modelID := ""
+		if models, ok := modelTable[provName]; ok {
+			modelID = models[entry.Tier]
 		}
-
-		// Determine model ID from tier.
-		models, ok := modelTable[provName]
-		if !ok {
-			continue
-		}
-		modelID := models[entry.Tier]
 
 		access := r.accessTypes[provName]
 
@@ -521,7 +562,10 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 		// position 0 (primary) → bias 2.0, position 1 → 1.0, position 2+ → 0.0.
 		// This seeds the Beta distribution so observed quality can gradually override
 		// the static order rather than starting from a blank slate.
-		priorBias := math.Max(0.0, float64(2-i))
+		priorBias := 0.0
+		if pos, ok := staticOrder[provName]; ok {
+			priorBias = math.Max(0.0, float64(2-pos))
+		}
 
 		candidates = append(candidates, candidate{
 			name:          provName,
@@ -936,7 +980,7 @@ func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
 		return r.BuildProviderFor(phase)
 	}
 
-	all := append([]string{bs.Primary}, bs.Fallbacks...)
+	all := expandProviderPreference(append([]string{bs.Primary}, bs.Fallbacks...), r.registeredProviderNames(), nil)
 
 	type scored struct {
 		name  string
@@ -944,14 +988,20 @@ func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
 	}
 	var candidates []scored
 	var traceCandidates []TraceCandidate
+	staticOrder := make(map[string]int, 1+len(bs.Fallbacks))
+	staticOrder[bs.Primary] = 0
+	for i, name := range bs.Fallbacks {
+		staticOrder[name] = i + 1
+	}
+
 	for i, name := range all {
-		if _, ok := r.providers[name]; !ok {
-			continue
-		}
 		if blocked, _ := r.isCircuitOpen(name); blocked {
 			continue
 		}
-		priorBias := math.Max(0.0, float64(2-i))
+		priorBias := 0.0
+		if pos, ok := staticOrder[name]; ok {
+			priorBias = math.Max(0.0, float64(2-pos))
+		}
 		score := r.usage.ThompsonSample(phase, name, priorBias)
 		candidates = append(candidates, scored{name, score})
 		traceCandidates = append(traceCandidates, TraceCandidate{
@@ -1053,8 +1103,9 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 		}
 	}
 
-	// Fallback through the phase's list, skipping excluded providers
-	for _, fb := range bs.Fallbacks {
+	// Fallback through the phase's list (plus dynamically registered providers),
+	// skipping excluded providers.
+	for _, fb := range expandProviderPreference(bs.Fallbacks, r.registeredProviderNames(), excluded) {
 		if fb == name || excluded[fb] {
 			continue
 		}
@@ -1102,7 +1153,12 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 func (r *Router) tryBuildProvider(name string, tier ModelTier) (Provider, string, error) {
 	models, ok := modelTable[name]
 	if !ok {
-		return nil, "", fmt.Errorf("no model table entry for %s", name)
+		// Dynamically registered providers may not have a modelTable entry.
+		p, err := r.resolveProvider(name, "")
+		if err != nil {
+			return nil, "", fmt.Errorf("no model table entry for %s and dynamic resolution failed: %w", name, err)
+		}
+		return p, "", nil
 	}
 	modelID := models[tier]
 	p, err := r.resolveProvider(name, modelID)

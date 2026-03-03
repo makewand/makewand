@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestToModelMessages_SummarizesOlderContext(t *testing.T) {
@@ -42,5 +43,21 @@ func TestToModelMessages_NoSummaryForShortHistory(t *testing.T) {
 	}
 	if msgs[0].Role != "user" {
 		t.Fatalf("first message role=%q, want %q", msgs[0].Role, "user")
+	}
+}
+
+func TestToModelMessages_SummaryPreservesUTF8(t *testing.T) {
+	chat := NewChatPanel()
+	longChinese := strings.Repeat("你好世界", 120)
+	for i := 0; i < 22; i++ {
+		chat.AddMessage(ChatMessage{Role: "user", Content: longChinese})
+	}
+
+	msgs := chat.ToModelMessages()
+	if len(msgs) == 0 || msgs[0].Role != "system" {
+		t.Fatalf("expected system summary at index 0, got %+v", msgs)
+	}
+	if !utf8.ValidString(msgs[0].Content) {
+		t.Fatal("summary content should remain valid UTF-8")
 	}
 }

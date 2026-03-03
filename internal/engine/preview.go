@@ -78,20 +78,38 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		cancel:  cancel,
 	}
 
-	var cmd *exec.Cmd
+	var command string
+	var args []string
 	switch kind {
 	case previewNodeDev:
-		cmd = exec.CommandContext(ctx, "npm", "run", "dev", "--", "--port", fmt.Sprintf("%d", port))
+		command = "npm"
+		args = []string{"run", "dev", "--", "--port", fmt.Sprintf("%d", port)}
 	case previewNodeStart:
-		cmd = exec.CommandContext(ctx, "npm", "start", "--", "--port", fmt.Sprintf("%d", port))
+		command = "npm"
+		args = []string{"start", "--", "--port", fmt.Sprintf("%d", port)}
 	case previewDjango:
-		cmd = exec.CommandContext(ctx, "python", "manage.py", "runserver", fmt.Sprintf("127.0.0.1:%d", port))
+		command = "python"
+		args = []string{"manage.py", "runserver", fmt.Sprintf("127.0.0.1:%d", port)}
 	case previewPythonMain:
-		cmd = exec.CommandContext(ctx, "python", "main.py")
+		command = "python"
+		args = []string{"main.py"}
 	default:
 		// Fallback: simple Python HTTP server for static sites.
-		cmd = exec.CommandContext(ctx, "python3", "-m", "http.server", "--bind", "127.0.0.1", fmt.Sprintf("%d", port))
+		command = "python3"
+		args = []string{"-m", "http.server", "--bind", "127.0.0.1", fmt.Sprintf("%d", port)}
 	}
+
+	// Project-defined scripts execute inside an isolation wrapper by default.
+	if kind != previewStatic {
+		wrappedCommand, wrappedArgs, wrapErr := wrapPreviewProjectCommand(p.Path, command, args)
+		if wrapErr != nil {
+			cancel()
+			return nil, wrapErr
+		}
+		command = wrappedCommand
+		args = wrappedArgs
+	}
+	cmd := exec.CommandContext(ctx, command, args...)
 
 	cmd.Dir = p.Path
 	cmd.Env = append(sanitizeExecEnv(cmd.Environ()),

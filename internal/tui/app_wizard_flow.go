@@ -19,6 +19,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 		tpl := a.wizard.SelectedTemplate()
 		if tpl != nil {
 			a.wizard.SetPhase(WizardPhasePlan)
+			a = a.applyBudgetRoutingPolicy()
 
 			ctx, cancel := context.WithCancel(context.Background())
 			a.cancelAI = cancel
@@ -72,6 +73,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 	case WizardPhaseConfirm:
 		a.wizard.SetPhase(WizardPhaseBuild)
 		a.mode = ModeChat
+		a = a.applyBudgetRoutingPolicy()
 
 		cwd, err := os.Getwd()
 		if err != nil {

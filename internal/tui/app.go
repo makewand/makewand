@@ -89,6 +89,9 @@ type App struct {
 	height   int
 	quitting bool
 	err      error
+
+	// Last budget warning level that has been surfaced to the user.
+	lastBudgetNoticeLevel BudgetLevel
 }
 
 // --- Bubble Tea message types ---
@@ -585,7 +588,9 @@ func Run(mode Mode, cfg *config.Config, projectPath string, debug bool) error {
 
 	// Load cross-session routing quality statistics.
 	if dir, err := config.ConfigDir(); err == nil {
-		_ = app.router.LoadStats(dir)
+		if err := app.router.LoadStats(dir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not load routing stats: %v\n", err)
+		}
 	}
 
 	p := tea.NewProgram(app, tea.WithAltScreen())
@@ -594,7 +599,9 @@ func Run(mode Mode, cfg *config.Config, projectPath string, debug bool) error {
 	// Save routing quality statistics so the next session inherits learned preferences.
 	if dir, dirErr := config.ConfigDir(); dirErr == nil {
 		if finalApp, ok := finalModel.(App); ok {
-			_ = finalApp.router.SaveStats(dir)
+			if err := finalApp.router.SaveStats(dir); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not save routing stats: %v\n", err)
+			}
 		}
 	}
 
