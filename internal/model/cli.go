@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -27,6 +28,8 @@ type CLIProvider struct {
 }
 
 const cliAvailCacheTTL = 60 * time.Second
+const cliRequestTimeout = 5 * time.Minute
+const cliStreamTimeout = 10 * time.Minute
 
 // --- Claude CLI ---
 
@@ -100,24 +103,37 @@ func (c *CLIProvider) IsAvailable() bool {
 func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	prompt := buildCLIPrompt(messages, system)
 
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, cliRequestTimeout)
 	defer cancel()
 
 	cmd := c.buildCmd(ctx, prompt)
+	setCLIProcessGroup(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	start := time.Now()
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return "", Usage{}, fmt.Errorf("%s CLI start error: %w", c.provider, err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		killCLIProcess(cmd)
+		err = <-done
+	}
+
 	duration := time.Since(start)
 
 	if err != nil {
-		errMsg := stderr.String()
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		return "", Usage{}, fmt.Errorf("%s CLI error: %s", c.provider, errMsg)
+		return "", Usage{}, formatCLIExecutionError(c.provider, stderr.String(), err, ctx.Err(), duration)
 	}
 
 	content := strings.TrimSpace(stdout.String())
@@ -140,9 +156,10 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	prompt := buildCLIPrompt(messages, system)
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, cliStreamTimeout)
 
 	cmd := c.buildCmd(ctx, prompt)
+	setCLIProcessGroup(cmd)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -163,6 +180,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 	go func() {
 		defer cancel()
 		defer close(ch)
+		start := time.Now()
 
 		var stderr bytes.Buffer
 		stderrDone := make(chan struct{})
@@ -173,10 +191,12 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 
 		scanner := bufio.NewScanner(stdoutPipe)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	streamLoop:
 		for scanner.Scan() {
 			select {
 			case <-ctx.Done():
-				return
+				killCLIProcess(cmd)
+				break streamLoop
 			default:
 			}
 			line := stripANSI(scanner.Text())
@@ -184,23 +204,32 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 				select {
 				case ch <- StreamChunk{Content: line + "\n"}:
 				case <-ctx.Done():
-					return
+					killCLIProcess(cmd)
+					break streamLoop
 				}
 			}
 		}
 
-		if err := scanner.Err(); err != nil && ctx.Err() == nil {
-			ch <- StreamChunk{Error: fmt.Errorf("%s CLI stream error: %w", c.provider, err)}
+		scanErr := scanner.Err()
+
+		<-stderrDone
+		waitErr := cmd.Wait()
+		duration := time.Since(start)
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if shouldSurfaceContextError(ctxErr) {
+				ch <- StreamChunk{Error: formatCLIContextError(c.provider, ctxErr, duration)}
+			}
 			return
 		}
 
-		<-stderrDone
-		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-			errMsg := strings.TrimSpace(stderr.String())
-			if errMsg == "" {
-				errMsg = err.Error()
-			}
-			ch <- StreamChunk{Error: fmt.Errorf("%s CLI error: %s", c.provider, errMsg)}
+		if scanErr != nil {
+			ch <- StreamChunk{Error: fmt.Errorf("%s CLI stream error: %w", c.provider, scanErr)}
+			return
+		}
+
+		if waitErr != nil {
+			ch <- StreamChunk{Error: formatCLIExecutionError(c.provider, stderr.String(), waitErr, nil, duration)}
 			return
 		}
 
@@ -211,6 +240,38 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 }
 
 // --- Helpers ---
+
+func shouldSurfaceContextError(ctxErr error) bool {
+	return errors.Is(ctxErr, context.DeadlineExceeded)
+}
+
+func formatCLIContextError(provider string, ctxErr error, duration time.Duration) error {
+	rounded := duration.Round(time.Second)
+	if rounded <= 0 {
+		rounded = time.Second
+	}
+
+	switch {
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		return fmt.Errorf("%s CLI timeout after %s", provider, rounded)
+	case errors.Is(ctxErr, context.Canceled):
+		return fmt.Errorf("%s CLI canceled after %s", provider, rounded)
+	default:
+		return fmt.Errorf("%s CLI context error after %s: %v", provider, rounded, ctxErr)
+	}
+}
+
+func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+	if ctxErr != nil {
+		return formatCLIContextError(provider, ctxErr, duration)
+	}
+
+	errMsg := strings.TrimSpace(stderr)
+	if errMsg == "" {
+		errMsg = runErr.Error()
+	}
+	return fmt.Errorf("%s CLI error: %s", provider, errMsg)
+}
 
 // buildCLIPrompt converts the message history + system prompt into a single
 // text prompt for CLI tools that accept a single prompt string.

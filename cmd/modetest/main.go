@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -39,7 +40,11 @@ var taskNames = map[model.TaskType]string{
 	model.TaskReview:  "Review",
 }
 
+var requestTimeout = flag.Duration("timeout", 45*time.Second, "per-request timeout for live provider calls")
+
 func main() {
+	flag.Parse()
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -51,11 +56,16 @@ func main() {
 	fmt.Println("║              makewand 四种模式路由对比测试                              ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════════════╝")
 	fmt.Println()
+	fmt.Printf("Request timeout: %s\n\n", requestTimeout.String())
 
 	fmt.Println("▸ 可用 Provider:")
 	tmpRouter := model.NewRouter(cfg)
-	for _, name := range tmpRouter.Available() {
+	availableProviders := tmpRouter.Available()
+	for _, name := range availableProviders {
 		fmt.Printf("  ✓ %s\n", name)
+	}
+	if len(availableProviders) == 0 {
+		fmt.Println("  (none)")
 	}
 	fmt.Println()
 
@@ -77,7 +87,7 @@ func main() {
 		for _, t := range tasks {
 			result, err := router.Route(t)
 			if err != nil {
-				row += fmt.Sprintf("│ %-28s", "✗ "+err.Error()[:20])
+				row += fmt.Sprintf("│ %-28s", "✗ "+truncate(err.Error(), 20))
 			} else {
 				cell := result.Actual
 				if result.ModelID != "" {
@@ -121,14 +131,16 @@ func main() {
 		mn := modeNames[mode]
 		fmt.Printf("  ▸ 测试模式: %s ...", mn)
 
+		ctx, cancel := context.WithTimeout(context.Background(), *requestTimeout)
 		start := time.Now()
 		content, usage, rr, err := router.Chat(
-			context.Background(),
+			ctx,
 			model.TaskCode,
 			messages,
 			"You are a Go programming expert. Be concise.",
 		)
 		elapsed := time.Since(start)
+		cancel()
 
 		r := result{
 			mode:    mn,
@@ -198,6 +210,13 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("═══ 测试完成 ═══")
+}
+
+func truncate(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max]
 }
 
 func shortModel(id string) string {
