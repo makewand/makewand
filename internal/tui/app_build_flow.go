@@ -219,6 +219,8 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 	}
 
 	if a.pendingPhase == pendingPhaseBuild {
+		a = a.applyBudgetRoutingPolicy()
+
 		// Update progress: generate code → done
 		a.progress.SetStepStatus(stepCode, StepDone)
 		a.progress.SetStepDetail(stepCode, fmt.Sprintf(m.ProgressFilesWritten, msg.written))
@@ -643,6 +645,7 @@ func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 
 func (a App) handleAutoFix(msg autoFixMsg) (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
+	a = a.applyBudgetRoutingPolicy()
 
 	if msg.attempt > maxAutoFixRetries {
 		a.chat.AddMessage(ChatMessage{

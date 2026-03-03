@@ -32,14 +32,7 @@ func (a App) handleChatEnter() (tea.Model, tea.Cmd) {
 	a.chat.AddMessage(ChatMessage{Role: "user", Content: input})
 	a.chat.ClearInput()
 	a.chat.SetStreaming(true)
-
-	// Budget warning (non-blocking)
-	if warning := a.cost.CheckBudget(a.cfg.MonthlyBudget); warning != "" {
-		a.chat.AddMessage(ChatMessage{
-			Role:    "system",
-			Content: warning,
-		})
-	}
+	a = a.applyBudgetRoutingPolicy()
 
 	messages := a.chat.ToModelMessages()
 	systemPrompt := buildSystemPrompt(a.project)

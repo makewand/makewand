@@ -151,3 +151,39 @@ func TestRegisterProvider_RuntimeInjection(t *testing.T) {
 		t.Fatalf("Route(TaskCode) actual=%q, want %q", res.Actual, "private")
 	}
 }
+
+func TestRouteByMode_UsesDynamicallyRegisteredProvider(t *testing.T) {
+	r := NewRouter(config.DefaultConfig())
+	r.SetMode(ModeBalanced)
+
+	privateProv := &stubProvider{name: "private", available: true}
+	if err := r.RegisterProvider("private", privateProv, AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+
+	res, err := r.Route(TaskCode)
+	if err != nil {
+		t.Fatalf("Route(TaskCode): %v", err)
+	}
+	if res.Actual != "private" {
+		t.Fatalf("Route(TaskCode) actual=%q, want %q", res.Actual, "private")
+	}
+}
+
+func TestRouteProvider_FallsBackToDynamicProvider(t *testing.T) {
+	r := NewRouter(config.DefaultConfig())
+	r.SetMode(ModeBalanced)
+
+	privateProv := &stubProvider{name: "private", available: true}
+	if err := r.RegisterProvider("private", privateProv, AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+
+	res, err := r.RouteProvider("claude", PhaseCode)
+	if err != nil {
+		t.Fatalf("RouteProvider: %v", err)
+	}
+	if res.Actual != "private" || !res.IsFallback {
+		t.Fatalf("RouteProvider result=%+v, want fallback to private", res)
+	}
+}

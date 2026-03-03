@@ -12,6 +12,23 @@ type CostTracker struct {
 	entries []costEntry
 }
 
+// BudgetLevel describes current spend pressure against the configured budget.
+type BudgetLevel int
+
+const (
+	BudgetOK BudgetLevel = iota
+	BudgetWarning
+	BudgetExceeded
+)
+
+// BudgetStatus summarizes current budget utilization.
+type BudgetStatus struct {
+	Level   BudgetLevel
+	Total   float64
+	Budget  float64
+	Percent float64
+}
+
 type costEntry struct {
 	provider       string
 	cost           float64
@@ -95,18 +112,46 @@ func (c *CostTracker) IsSubscription(provider string) bool {
 // CheckBudget returns a warning string if the session total approaches or exceeds the budget.
 // Returns empty string if budget is zero (disabled) or spending is below 80%.
 func (c *CostTracker) CheckBudget(budget float64) string {
-	if budget <= 0 {
+	status := c.BudgetStatus(budget)
+	switch status.Level {
+	case BudgetExceeded:
+		return fmt.Sprintf("Budget exceeded: $%.2f / $%.2f (%.0f%%)", status.Total, status.Budget, status.Percent)
+	case BudgetWarning:
+		return fmt.Sprintf("Budget warning: $%.2f / $%.2f (%.0f%%)", status.Total, status.Budget, status.Percent)
+	default:
 		return ""
+	}
+}
+
+// BudgetStatus returns a structured spend status for routing and UI policies.
+func (c *CostTracker) BudgetStatus(budget float64) BudgetStatus {
+	if budget <= 0 {
+		return BudgetStatus{Level: BudgetOK}
 	}
 	total := c.SessionTotal()
 	pct := total / budget * 100
 	if pct >= 100 {
-		return fmt.Sprintf("Budget exceeded: $%.2f / $%.2f (%.0f%%)", total, budget, pct)
+		return BudgetStatus{
+			Level:   BudgetExceeded,
+			Total:   total,
+			Budget:  budget,
+			Percent: pct,
+		}
 	}
 	if pct >= 80 {
-		return fmt.Sprintf("Budget warning: $%.2f / $%.2f (%.0f%%)", total, budget, pct)
+		return BudgetStatus{
+			Level:   BudgetWarning,
+			Total:   total,
+			Budget:  budget,
+			Percent: pct,
+		}
 	}
-	return ""
+	return BudgetStatus{
+		Level:   BudgetOK,
+		Total:   total,
+		Budget:  budget,
+		Percent: pct,
+	}
 }
 
 func formatTokenCount(tokens int) string {
