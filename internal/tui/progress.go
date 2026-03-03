@@ -6,13 +6,14 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/makewand/makewand/internal/i18n"
 )
 
 // ProgressStep represents a step in the build process.
 type ProgressStep struct {
-	Label    string
-	Detail   string
-	Status   StepStatus
+	Label  string
+	Detail string
+	Status StepStatus
 }
 
 // StepStatus represents the state of a progress step.
@@ -56,6 +57,13 @@ func (p *ProgressPanel) SetStepStatus(index int, status StepStatus) {
 	}
 }
 
+// SetStepDetail updates a step's detail text.
+func (p *ProgressPanel) SetStepDetail(index int, detail string) {
+	if index >= 0 && index < len(p.steps) {
+		p.steps[index].Detail = detail
+	}
+}
+
 // AddStep adds a new step.
 func (p *ProgressPanel) AddStep(label, detail string) {
 	p.steps = append(p.steps, ProgressStep{
@@ -90,7 +98,7 @@ func (p ProgressPanel) View() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("📋 Progress") + "\n")
+	b.WriteString(titleStyle.Render("📋 "+i18n.Msg().ProgressTitle) + "\n")
 
 	for _, step := range p.steps {
 		var icon string
