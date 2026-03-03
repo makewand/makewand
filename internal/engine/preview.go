@@ -17,21 +17,17 @@ type PreviewServer struct {
 }
 
 // StartPreview starts a development server for the project.
-func (p *Project) StartPreview(ctx context.Context) (*PreviewServer, error) {
-	port, err := findFreePort()
-	if err != nil {
-		return nil, fmt.Errorf("find free port: %w", err)
-	}
+func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*PreviewServer, error) {
+	type previewCommandKind int
+	const (
+		previewStatic previewCommandKind = iota
+		previewNodeDev
+		previewNodeStart
+		previewDjango
+		previewPythonMain
+	)
 
-	ctx, cancel := context.WithCancel(ctx)
-
-	server := &PreviewServer{
-		project: p,
-		port:    port,
-		cancel:  cancel,
-	}
-
-	var cmd *exec.Cmd
+	kind := previewStatic
 
 	if content, err := p.ReadFile("package.json"); err == nil {
 		var pkg struct {
@@ -39,27 +35,61 @@ func (p *Project) StartPreview(ctx context.Context) (*PreviewServer, error) {
 		}
 		if json.Unmarshal([]byte(content), &pkg) == nil {
 			if _, ok := pkg.Scripts["dev"]; ok {
-				cmd = exec.CommandContext(ctx, "npm", "run", "dev", "--", "--port", fmt.Sprintf("%d", port))
+				if !allowProjectScripts {
+					return nil, fmt.Errorf("refusing to run project script %q without --allow-project-scripts", "npm run dev")
+				}
+				kind = previewNodeDev
 			} else if _, ok := pkg.Scripts["start"]; ok {
-				cmd = exec.CommandContext(ctx, "npm", "start", "--", "--port", fmt.Sprintf("%d", port))
+				if !allowProjectScripts {
+					return nil, fmt.Errorf("refusing to run project script %q without --allow-project-scripts", "npm start")
+				}
+				kind = previewNodeStart
 			}
 		}
 	}
 
-	if cmd == nil {
+	if kind == previewStatic {
 		if _, err := p.ReadFile("manage.py"); err == nil {
-			cmd = exec.CommandContext(ctx, "python", "manage.py", "runserver", fmt.Sprintf("127.0.0.1:%d", port))
+			if !allowProjectScripts {
+				return nil, fmt.Errorf("refusing to run project script %q without --allow-project-scripts", "python manage.py runserver")
+			}
+			kind = previewDjango
 		}
 	}
 
-	if cmd == nil {
+	if kind == previewStatic {
 		if _, err := p.ReadFile("main.py"); err == nil {
-			cmd = exec.CommandContext(ctx, "python", "main.py")
+			if !allowProjectScripts {
+				return nil, fmt.Errorf("refusing to run project script %q without --allow-project-scripts", "python main.py")
+			}
+			kind = previewPythonMain
 		}
 	}
 
-	// Fallback: simple Python HTTP server for static sites
-	if cmd == nil {
+	port, err := findFreePort()
+	if err != nil {
+		return nil, fmt.Errorf("find free port: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	server := &PreviewServer{
+		project: p,
+		port:    port,
+		cancel:  cancel,
+	}
+
+	var cmd *exec.Cmd
+	switch kind {
+	case previewNodeDev:
+		cmd = exec.CommandContext(ctx, "npm", "run", "dev", "--", "--port", fmt.Sprintf("%d", port))
+	case previewNodeStart:
+		cmd = exec.CommandContext(ctx, "npm", "start", "--", "--port", fmt.Sprintf("%d", port))
+	case previewDjango:
+		cmd = exec.CommandContext(ctx, "python", "manage.py", "runserver", fmt.Sprintf("127.0.0.1:%d", port))
+	case previewPythonMain:
+		cmd = exec.CommandContext(ctx, "python", "main.py")
+	default:
+		// Fallback: simple Python HTTP server for static sites.
 		cmd = exec.CommandContext(ctx, "python3", "-m", "http.server", "--bind", "127.0.0.1", fmt.Sprintf("%d", port))
 	}
 
