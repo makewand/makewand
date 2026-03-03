@@ -19,6 +19,9 @@ const maxChatHistory = 20
 const summaryKeepRecent = 19 // keep 19 + 1 summary system message
 const summaryMaxLines = 10
 const summaryPerLineMaxChars = 180
+const chatContextTokenBudget = 6000
+const chatMinRecentMessages = 4
+const contextTruncatedNotice = "\n- ... truncated to fit context budget ..."
 
 // ChatMessage represents a message in the chat panel.
 type ChatMessage struct {
@@ -115,6 +118,19 @@ func (c *ChatPanel) ToModelMessages() []model.Message {
 		}
 	}
 
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	if len(msgs) > maxChatHistory {
+		msgs = summarizeHistoryWindow(msgs)
+	}
+
+	msgs = trimToTokenBudget(msgs, chatContextTokenBudget)
+	return msgs
+}
+
+func summarizeHistoryWindow(msgs []model.Message) []model.Message {
 	if len(msgs) <= maxChatHistory {
 		return msgs
 	}
@@ -140,6 +156,95 @@ func (c *ChatPanel) ToModelMessages() []model.Message {
 	out = append(out, summary)
 	out = append(out, recent...)
 	return out
+}
+
+func trimToTokenBudget(msgs []model.Message, budget int) []model.Message {
+	if budget <= 0 || len(msgs) == 0 {
+		return msgs
+	}
+
+	out := append([]model.Message(nil), msgs...)
+	for estimateModelMessagesTokens(out) > budget {
+		dropIdx := 0
+		minLen := chatMinRecentMessages
+		if out[0].Role == "system" {
+			dropIdx = 1
+			minLen = chatMinRecentMessages + 1 // summary + at least recent turns
+		}
+		if len(out) <= minLen || dropIdx >= len(out)-1 {
+			break
+		}
+		out = append(out[:dropIdx], out[dropIdx+1:]...)
+	}
+
+	// If the context is still too large, truncate only the summary/oldest message.
+	if estimateModelMessagesTokens(out) > budget {
+		for pass := 0; pass < 8 && estimateModelMessagesTokens(out) > budget; pass++ {
+			changed := false
+			// Prefer shrinking older context first.
+			for i := 0; i < len(out)-1 && estimateModelMessagesTokens(out) > budget; i++ {
+				overflow := estimateModelMessagesTokens(out) - budget
+				if shrinkMessageForBudget(&out[i], overflow, 96) {
+					changed = true
+				}
+			}
+			// As a last resort, shrink the newest message too.
+			if estimateModelMessagesTokens(out) > budget {
+				overflow := estimateModelMessagesTokens(out) - budget
+				if shrinkMessageForBudget(&out[len(out)-1], overflow, 128) {
+					changed = true
+				}
+			}
+			if !changed {
+				break
+			}
+		}
+	}
+
+	return out
+}
+
+func shrinkMessageForBudget(msg *model.Message, overflowTokens, minRunes int) bool {
+	base := strings.TrimSuffix(msg.Content, contextTruncatedNotice)
+	runes := []rune(base)
+	if len(runes) <= minRunes {
+		return false
+	}
+
+	cut := overflowTokens*4 + 32
+	maxCut := len(runes) - minRunes
+	if cut > maxCut {
+		cut = maxCut
+	}
+	if cut <= 0 {
+		return false
+	}
+	keep := len(runes) - cut
+	if keep < minRunes {
+		keep = minRunes
+	}
+	if keep >= len(runes) {
+		return false
+	}
+	msg.Content = string(runes[:keep]) + contextTruncatedNotice
+	return true
+}
+
+func estimateModelMessagesTokens(msgs []model.Message) int {
+	total := 2 // assistant priming tokens
+	for _, m := range msgs {
+		total += 4 // per-message framing overhead
+		total += estimateTextTokens(m.Content)
+	}
+	return total
+}
+
+func estimateTextTokens(text string) int {
+	runes := utf8.RuneCountInString(text)
+	if runes <= 0 {
+		return 0
+	}
+	return (runes + 3) / 4
 }
 
 func buildHistorySummary(msgs []model.Message) string {
