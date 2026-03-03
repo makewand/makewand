@@ -184,7 +184,11 @@ func setupCmd() *cobra.Command {
 				fmt.Println("Custom providers (config-defined):")
 				for _, cp := range cfg.CustomProviders {
 					access := accessDisplay(cp.Access, "subscription")
-					fmt.Printf("  [x] %s -> %s (access: %s)\n", cp.Name, cp.Command, access)
+					if config.IsCustomProviderUsable(cp) {
+						fmt.Printf("  [x] %s -> %s (access: %s)\n", cp.Name, cp.Command, access)
+					} else {
+						fmt.Printf("  [!] %s -> %s (access: %s, unavailable)\n", cp.Name, cp.Command, access)
+					}
 				}
 				fmt.Println()
 			}

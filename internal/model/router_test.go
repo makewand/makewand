@@ -304,3 +304,24 @@ func TestRouteByMode_CustomProviderAccessAPIExcludedInFreeMode(t *testing.T) {
 		t.Fatalf("Route(TaskCode) error = %q, want mode routing failure", err.Error())
 	}
 }
+
+func TestNewRouter_SkipsUnusableCustomProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CLIs = nil
+	cfg.ClaudeAPIKey = ""
+	cfg.GeminiAPIKey = ""
+	cfg.OpenAIAPIKey = ""
+	cfg.OllamaURL = ""
+	cfg.CustomProviders = []config.CustomProvider{
+		{
+			Name:    "broken-private",
+			Command: "/definitely/not/a/real/provider",
+			Access:  "subscription",
+		},
+	}
+
+	r := NewRouter(cfg)
+	if _, ok := r.providers["broken-private"]; ok {
+		t.Fatal("unusable custom provider should not be registered")
+	}
+}

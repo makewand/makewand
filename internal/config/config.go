@@ -209,7 +209,40 @@ func Save(cfg *Config) error {
 
 // HasAnyModel returns true if at least one model is configured (API key or CLI tool).
 func (c *Config) HasAnyModel() bool {
-	return c.ClaudeAPIKey != "" || c.GeminiAPIKey != "" || c.OpenAIAPIKey != "" || len(c.CLIs) > 0 || len(c.CustomProviders) > 0
+	if c.ClaudeAPIKey != "" || c.GeminiAPIKey != "" || c.OpenAIAPIKey != "" || len(c.CLIs) > 0 {
+		return true
+	}
+	for _, cp := range c.CustomProviders {
+		if IsCustomProviderUsable(cp) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsCustomProviderUsable returns true when the custom provider has a non-empty
+// name and command, and the command can be executed on this machine.
+func IsCustomProviderUsable(cp CustomProvider) bool {
+	if strings.TrimSpace(cp.Name) == "" {
+		return false
+	}
+	command := strings.TrimSpace(cp.Command)
+	if command == "" {
+		return false
+	}
+
+	// Explicit path (absolute/relative) must exist and be executable.
+	if strings.ContainsAny(command, `/\`) {
+		info, err := os.Stat(command)
+		if err != nil || info.IsDir() {
+			return false
+		}
+		return info.Mode()&0o111 != 0
+	}
+
+	// Bare executable name must resolve from PATH.
+	_, err := exec.LookPath(command)
+	return err == nil
 }
 
 // HasCLI returns true if a specific CLI tool was detected.

@@ -92,6 +92,9 @@ type App struct {
 
 	// Last budget warning level that has been surfaced to the user.
 	lastBudgetNoticeLevel BudgetLevel
+
+	// Debug route diagnostics (enabled by --debug).
+	debugRoute *routeDebugState
 }
 
 // --- Bubble Tea message types ---
@@ -548,6 +551,14 @@ func (a App) viewSidePanel(width int) string {
 	if progView != "" {
 		sections = append(sections, progView)
 	}
+	if a.debugRoute != nil {
+		if routeSummary := strings.TrimSpace(a.debugRoute.Summary()); routeSummary != "" {
+			debugView := statusBorderStyle.
+				Width(width - 2).
+				Render("Debug Route\n" + wrapText(routeSummary, maxInt(width-6, 12)))
+			sections = append(sections, debugView)
+		}
+	}
 
 	return strings.Join(sections, "\n")
 }
@@ -561,27 +572,35 @@ func Run(mode Mode, cfg *config.Config, projectPath string, debug bool) error {
 	app := NewApp(mode, cfg, projectPath)
 
 	if debug {
+		routeState := newRouteDebugState()
+		app.debugRoute = routeState
+
 		var candidates []string
 		if dir, err := config.ConfigDir(); err == nil {
 			candidates = append(candidates, filepath.Join(dir, "trace.jsonl"))
 		}
 		candidates = append(candidates, filepath.Join(os.TempDir(), "makewand-trace.jsonl"))
 
-		var sink *jsonlTraceSink
+		var fileSink *jsonlTraceSink
 		var tracePath string
 		var sinkErr error
 		for _, path := range candidates {
-			sink, sinkErr = newJSONLTraceSink(path)
+			fileSink, sinkErr = newJSONLTraceSink(path)
 			if sinkErr == nil {
 				tracePath = path
 				break
 			}
 		}
-		if sink == nil {
+		traceSink := &debugTraceSink{
+			file:  fileSink,
+			route: routeState,
+		}
+		app.router.SetTraceSink(traceSink)
+		defer traceSink.Close()
+
+		if fileSink == nil {
 			fmt.Fprintf(os.Stderr, "Warning: debug trace disabled: %v\n", sinkErr)
 		} else {
-			app.router.SetTraceSink(sink)
-			defer sink.Close()
 			fmt.Fprintf(os.Stderr, "Debug trace enabled: %s\n", tracePath)
 		}
 	}

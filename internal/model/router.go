@@ -159,6 +159,9 @@ func NewRouter(cfg *config.Config) *Router {
 
 	// Register config-defined custom command providers.
 	for _, cp := range cfg.CustomProviders {
+		if !config.IsCustomProviderUsable(cp) {
+			continue
+		}
 		name := strings.ToLower(strings.TrimSpace(cp.Name))
 		command := strings.TrimSpace(cp.Command)
 		if name == "" || command == "" {
