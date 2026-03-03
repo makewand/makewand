@@ -3,6 +3,9 @@ package model
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/makewand/makewand/internal/config"
@@ -219,5 +222,85 @@ func TestChatStream_FallbackOnStartError(t *testing.T) {
 	}
 	if result.Actual != "gemini" || !result.IsFallback {
 		t.Fatalf("ChatStream() route = %+v, want fallback to gemini", result)
+	}
+}
+
+func TestNewRouter_LoadsCustomProviderFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "echo-custom.sh")
+	body := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"  printf '%s\\n' \"$arg\"\n" +
+		"done\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.CLIs = nil
+	cfg.ClaudeAPIKey = ""
+	cfg.GeminiAPIKey = ""
+	cfg.OpenAIAPIKey = ""
+	cfg.OllamaURL = ""
+	cfg.DefaultModel = "private"
+	cfg.CodingModel = "private"
+	cfg.CustomProviders = []config.CustomProvider{
+		{
+			Name:    "private",
+			Command: script,
+			Args:    []string{"--prompt", "{{prompt}}"},
+			Access:  "subscription",
+		},
+	}
+
+	r := NewRouter(cfg)
+	if got := r.accessTypes["private"]; got != AccessSubscription {
+		t.Fatalf("custom provider access = %v, want %v", got, AccessSubscription)
+	}
+
+	route, err := r.Route(TaskCode)
+	if err != nil {
+		t.Fatalf("Route(TaskCode) error = %v", err)
+	}
+	if route.Actual != "private" {
+		t.Fatalf("Route(TaskCode).Actual = %q, want %q", route.Actual, "private")
+	}
+
+	content, _, result, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "hello-private"}}, "")
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if result.Actual != "private" {
+		t.Fatalf("Chat() provider = %q, want %q", result.Actual, "private")
+	}
+	if !strings.Contains(content, "hello-private") {
+		t.Fatalf("Chat() content = %q, want echoed prompt", content)
+	}
+}
+
+func TestRouteByMode_CustomProviderAccessAPIExcludedInFreeMode(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CLIs = nil
+	cfg.ClaudeAPIKey = ""
+	cfg.GeminiAPIKey = ""
+	cfg.OpenAIAPIKey = ""
+	cfg.OllamaURL = ""
+	cfg.UsageMode = "free"
+	cfg.CustomProviders = []config.CustomProvider{
+		{
+			Name:    "private-api",
+			Command: "/bin/sh",
+			Args:    []string{"-c", "echo ok", "{{prompt}}"},
+			Access:  "api",
+		},
+	}
+
+	r := NewRouter(cfg)
+	_, err := r.Route(TaskCode)
+	if err == nil {
+		t.Fatal("Route(TaskCode) error = nil, want no provider available in free mode")
+	}
+	if !strings.Contains(err.Error(), "no AI model available for mode") {
+		t.Fatalf("Route(TaskCode) error = %q, want mode routing failure", err.Error())
 	}
 }

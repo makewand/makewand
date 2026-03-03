@@ -114,3 +114,18 @@ func TestConfigDir_UsesEnvOverride(t *testing.T) {
 		t.Fatalf("ConfigPath() = %q, want %q", path, wantPath)
 	}
 }
+
+func TestHasAnyModel_WithCustomProvider(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ClaudeAPIKey = ""
+	cfg.GeminiAPIKey = ""
+	cfg.OpenAIAPIKey = ""
+	cfg.CLIs = nil
+	cfg.CustomProviders = []CustomProvider{
+		{Name: "private-llm", Command: "/usr/bin/private-llm"},
+	}
+
+	if !cfg.HasAnyModel() {
+		t.Fatal("HasAnyModel() = false, want true when custom providers are configured")
+	}
+}
