@@ -103,3 +103,57 @@ func TestCLIProvider_ChatStream_EmitsTimeoutErrorOnDeadline(t *testing.T) {
 		}
 	}
 }
+
+func TestNewCommandCLI_PromptPlaceholderReplacement(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "echo-args.sh")
+	body := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"  printf '%s\\n' \"$arg\"\n" +
+		"done\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewCommandCLI("private", script, []string{"--prompt", "{{prompt}}"})
+	content, usage, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello custom provider"}}, "", 256)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if !strings.Contains(content, "--prompt") {
+		t.Fatalf("Chat() content = %q, want args echoed", content)
+	}
+	if !strings.Contains(content, "hello custom provider") {
+		t.Fatalf("Chat() content = %q, want replaced prompt", content)
+	}
+	if strings.Contains(content, "{{prompt}}") {
+		t.Fatalf("Chat() content = %q, should not contain placeholder token", content)
+	}
+	if usage.Provider != "private" {
+		t.Fatalf("usage.Provider = %q, want %q", usage.Provider, "private")
+	}
+}
+
+func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "echo-last.sh")
+	body := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"  printf '%s\\n' \"$arg\"\n" +
+		"done\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewCommandCLI("private", script, []string{"--flag"})
+	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello appended prompt"}}, "", 256)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if !strings.Contains(content, "--flag") {
+		t.Fatalf("Chat() content = %q, want fixed arg", content)
+	}
+	if !strings.Contains(content, "hello appended prompt") {
+		t.Fatalf("Chat() content = %q, want prompt appended as arg", content)
+	}
+}

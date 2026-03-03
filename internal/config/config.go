@@ -50,6 +50,10 @@ type Config struct {
 	// Detected CLI tools (not persisted, populated at load time)
 	CLIs []CLITool `json:"-"`
 
+	// CustomProviders allows users to add private/custom model providers via
+	// command-line adapters without changing makewand source code.
+	CustomProviders []CustomProvider `json:"custom_providers,omitempty"`
+
 	// envSourcedKeys tracks which API keys came from environment variables
 	// so they are not persisted to disk.
 	envSourcedKeys map[string]bool
@@ -60,6 +64,17 @@ type CLITool struct {
 	Name    string // "claude", "gemini", "codex"
 	BinPath string // absolute path
 	Version string // version string
+}
+
+// CustomProvider describes one command-based external provider.
+// The command receives the user prompt either by:
+//   - replacing "{{prompt}}" in Args entries; or
+//   - appending prompt as the final argument when no placeholder is present.
+type CustomProvider struct {
+	Name    string   `json:"name"`
+	Command string   `json:"command"`
+	Args    []string `json:"args,omitempty"`
+	Access  string   `json:"access,omitempty"` // "free","local","subscription","api"
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -194,7 +209,7 @@ func Save(cfg *Config) error {
 
 // HasAnyModel returns true if at least one model is configured (API key or CLI tool).
 func (c *Config) HasAnyModel() bool {
-	return c.ClaudeAPIKey != "" || c.GeminiAPIKey != "" || c.OpenAIAPIKey != "" || len(c.CLIs) > 0
+	return c.ClaudeAPIKey != "" || c.GeminiAPIKey != "" || c.OpenAIAPIKey != "" || len(c.CLIs) > 0 || len(c.CustomProviders) > 0
 }
 
 // HasCLI returns true if a specific CLI tool was detected.
