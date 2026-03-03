@@ -18,77 +18,98 @@ var (
 // Styles
 var (
 	titleStyle = lipgloss.NewStyle().
-		Foreground(colorPrimary).
-		Bold(true).
-		Padding(0, 1)
+			Foreground(colorPrimary).
+			Bold(true).
+			Padding(0, 1)
 
 	subtitleStyle = lipgloss.NewStyle().
-		Foreground(colorSecondary).
-		Italic(true)
+			Foreground(colorSecondary).
+			Italic(true)
 
 	borderStyle = lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorBorder).
-		Padding(0, 1)
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorBorder).
+			Padding(0, 1)
 
 	chatBorderStyle = lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorPrimary).
-		Padding(0, 1)
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorPrimary).
+			Padding(0, 1)
 
 	fileBorderStyle = lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorSecondary).
-		Padding(0, 1)
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorSecondary).
+			Padding(0, 1)
 
 	statusBorderStyle = lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorMuted).
-		Padding(0, 1)
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorMuted).
+				Padding(0, 1)
 
 	userMsgStyle = lipgloss.NewStyle().
-		Foreground(colorSecondary).
-		Bold(true)
+			Foreground(colorSecondary).
+			Bold(true)
 
 	aiMsgStyle = lipgloss.NewStyle().
-		Foreground(colorText)
+			Foreground(colorText)
 
 	errorStyle = lipgloss.NewStyle().
-		Foreground(colorError).
-		Bold(true)
+			Foreground(colorError).
+			Bold(true)
 
 	successStyle = lipgloss.NewStyle().
-		Foreground(colorSuccess).
-		Bold(true)
+			Foreground(colorSuccess).
+			Bold(true)
 
 	warningStyle = lipgloss.NewStyle().
-		Foreground(colorWarning)
+			Foreground(colorWarning)
 
 	mutedStyle = lipgloss.NewStyle().
-		Foreground(colorMuted)
+			Foreground(colorMuted)
 
 	costStyle = lipgloss.NewStyle().
-		Foreground(colorWarning).
-		Bold(true)
+			Foreground(colorWarning).
+			Bold(true)
 
 	spinnerStyle = lipgloss.NewStyle().
-		Foreground(colorPrimary)
+			Foreground(colorPrimary)
 
 	selectedStyle = lipgloss.NewStyle().
-		Foreground(colorPrimary).
-		Bold(true)
+			Foreground(colorPrimary).
+			Bold(true)
 
 	helpStyle = lipgloss.NewStyle().
-		Foreground(colorMuted).
-		Italic(true)
+			Foreground(colorMuted).
+			Italic(true)
 
 	logoStyle = lipgloss.NewStyle().
-		Foreground(colorPrimary).
-		Bold(true)
+			Foreground(colorPrimary).
+			Bold(true)
 
-	promptStyle = lipgloss.NewStyle().
-		Foreground(colorPrimary).
-		Bold(true)
+	// Mode badge styles (background color + white text)
+	modeBadgeFreeStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(colorSuccess).
+				Bold(true).
+				Padding(0, 1)
+
+	modeBadgeEconomyStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(colorSecondary).
+				Bold(true).
+				Padding(0, 1)
+
+	modeBadgeBalancedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(colorPrimary).
+				Bold(true).
+				Padding(0, 1)
+
+	modeBadgePowerStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(colorWarning).
+				Bold(true).
+				Padding(0, 1)
 )
 
 const logo = `

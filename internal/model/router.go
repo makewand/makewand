@@ -3,6 +3,12 @@ package model
 import (
 	"context"
 	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 )
@@ -11,16 +17,16 @@ import (
 type TaskType int
 
 const (
-	TaskAnalyze  TaskType = iota // requirements analysis, planning
-	TaskCode                     // code generation, implementation
-	TaskReview                   // code review, bug finding
-	TaskExplain                  // explanation for non-programmers
-	TaskFix                      // error diagnosis and fixing
+	TaskAnalyze TaskType = iota // requirements analysis, planning
+	TaskCode                    // code generation, implementation
+	TaskReview                  // code review, bug finding
+	TaskExplain                 // explanation for non-programmers
+	TaskFix                     // error diagnosis and fixing
 )
 
 // Message represents a chat message.
 type Message struct {
-	Role    string `json:"role"`    // "user", "assistant", "system"
+	Role    string `json:"role"` // "user", "assistant", "system"
 	Content string `json:"content"`
 }
 
@@ -40,46 +46,227 @@ type Usage struct {
 	Provider     string
 }
 
+// RouteResult describes which provider was selected and whether a fallback occurred.
+type RouteResult struct {
+	Provider   Provider
+	ModelID    string
+	Requested  string
+	Actual     string
+	IsFallback bool
+}
+
 // Provider defines the interface all model providers must implement.
 type Provider interface {
 	Name() string
 	IsAvailable() bool
-	Chat(ctx context.Context, messages []Message, system string) (string, Usage, error)
-	ChatStream(ctx context.Context, messages []Message, system string) (<-chan StreamChunk, error)
+	Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error)
+	ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error)
+}
+
+// fallbackOrder defines the deterministic order for provider fallback.
+var fallbackOrder = []string{"claude", "codex", "openai", "gemini", "ollama"}
+
+// MaxTokensForTask returns the appropriate max tokens for the given task type.
+func MaxTokensForTask(task TaskType) int {
+	switch task {
+	case TaskAnalyze, TaskExplain, TaskReview:
+		return 4096
+	case TaskCode, TaskFix:
+		return 8192
+	default:
+		return 8192
+	}
+}
+
+// providerKey is used to cache provider instances by (name, modelID).
+type providerKey struct {
+	name    string
+	modelID string
 }
 
 // Router selects the best model provider for a given task.
 type Router struct {
 	cfg       *config.Config
 	providers map[string]Provider
+
+	// Provider cache for mode-based routing (provider+model → instance)
+	providerCache map[providerKey]Provider
+	providerMu    sync.Mutex
+
+	// Access types for each provider
+	accessTypes map[string]AccessType
+
+	// Per-provider request count for load balancing
+	usage *sessionUsage
+
+	// Usage mode (guarded by modeMu)
+	modeMu  sync.RWMutex
+	mode    UsageMode
+	modeSet bool // true = use mode-based routing
+
+	// Cached available providers list
+	mu            sync.Mutex
+	cachedAvail   []string
+	cachedAvailAt time.Time
+
+	traceMu   sync.RWMutex
+	traceSink TraceSink
 }
+
+const availCacheTTL = 10 * time.Second
 
 // NewRouter creates a new model router with configured providers.
 func NewRouter(cfg *config.Config) *Router {
 	r := &Router{
-		cfg:       cfg,
-		providers: make(map[string]Provider),
+		cfg:           cfg,
+		providers:     make(map[string]Provider),
+		providerCache: make(map[providerKey]Provider),
+		accessTypes:   make(map[string]AccessType),
+		usage:         newSessionUsage(),
 	}
 
-	// Register available providers
-	if cfg.ClaudeAPIKey != "" {
-		r.providers["claude"] = NewClaude(cfg.ClaudeAPIKey)
+	// Register CLI-based providers first (subscription — preferred)
+	for _, cli := range cfg.CLIs {
+		switch cli.Name {
+		case "claude":
+			r.providers["claude"] = NewClaudeCLI(cli.BinPath)
+			r.accessTypes["claude"] = AccessSubscription
+		case "gemini":
+			r.providers["gemini"] = NewGeminiCLI(cli.BinPath)
+			r.accessTypes["gemini"] = AccessSubscription
+		case "codex":
+			r.providers["codex"] = NewCodexCLI(cli.BinPath)
+			r.accessTypes["codex"] = AccessSubscription
+		}
 	}
-	if cfg.GeminiAPIKey != "" {
-		r.providers["gemini"] = NewGemini(cfg.GeminiAPIKey)
+
+	// Register API-based providers (only if CLI not already registered for that provider)
+	if cfg.ClaudeAPIKey != "" && r.providers["claude"] == nil {
+		r.providers["claude"] = NewClaude(cfg.ClaudeAPIKey, cfg.ClaudeModel)
 	}
-	if cfg.OpenAIAPIKey != "" {
-		r.providers["openai"] = NewOpenAI(cfg.OpenAIAPIKey)
+	if cfg.GeminiAPIKey != "" && r.providers["gemini"] == nil {
+		r.providers["gemini"] = NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel)
+	}
+	if cfg.OpenAIAPIKey != "" && r.providers["openai"] == nil {
+		r.providers["openai"] = NewOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIModel)
 	}
 	if cfg.OllamaURL != "" {
-		r.providers["ollama"] = NewOllama(cfg.OllamaURL)
+		r.providers["ollama"] = NewOllama(cfg.OllamaURL, cfg.OllamaModel)
+	}
+
+	// Parse usage mode
+	if cfg.UsageMode != "" {
+		if mode, ok := ParseUsageMode(cfg.UsageMode); ok {
+			r.mode = mode
+			r.modeSet = true
+		}
+	}
+
+	// Parse access types
+	if cfg.ClaudeAccess != "" {
+		r.accessTypes["claude"] = parseAccessType(cfg.ClaudeAccess, "claude")
+	} else if _, ok := r.accessTypes["claude"]; !ok {
+		r.accessTypes["claude"] = parseAccessType("", "claude")
+	}
+	if cfg.GeminiAccess != "" {
+		r.accessTypes["gemini"] = parseAccessType(cfg.GeminiAccess, "gemini")
+	} else if _, ok := r.accessTypes["gemini"]; !ok {
+		r.accessTypes["gemini"] = parseAccessType("", "gemini")
+	}
+	if cfg.OpenAIAccess != "" {
+		r.accessTypes["openai"] = parseAccessType(cfg.OpenAIAccess, "openai")
+	} else if _, ok := r.accessTypes["openai"]; !ok {
+		r.accessTypes["openai"] = parseAccessType("", "openai")
+	}
+	if cfg.CodexAccess != "" {
+		r.accessTypes["codex"] = parseAccessType(cfg.CodexAccess, "codex")
+	} else if _, ok := r.accessTypes["codex"]; !ok {
+		r.accessTypes["codex"] = parseAccessType("", "codex")
+	}
+	if cfg.OllamaAccess != "" {
+		r.accessTypes["ollama"] = parseAccessType(cfg.OllamaAccess, "ollama")
+	} else if _, ok := r.accessTypes["ollama"]; !ok {
+		r.accessTypes["ollama"] = parseAccessType("", "ollama")
 	}
 
 	return r
 }
 
+// SetMode sets the usage mode and enables mode-based routing.
+func (r *Router) SetMode(m UsageMode) {
+	r.modeMu.Lock()
+	r.mode = m
+	r.modeSet = true
+	r.modeMu.Unlock()
+}
+
+// SetTraceSink enables or disables structured router trace events.
+// Pass nil to disable tracing.
+func (r *Router) SetTraceSink(sink TraceSink) {
+	r.traceMu.Lock()
+	r.traceSink = sink
+	r.traceMu.Unlock()
+}
+
+// Mode returns the current usage mode.
+func (r *Router) Mode() UsageMode {
+	r.modeMu.RLock()
+	defer r.modeMu.RUnlock()
+	return r.mode
+}
+
+// ModeSet returns whether mode-based routing is enabled.
+func (r *Router) ModeSet() bool {
+	r.modeMu.RLock()
+	defer r.modeMu.RUnlock()
+	return r.modeSet
+}
+
+// effectiveMode returns the routing mode to use.
+// When the mode has not been explicitly set it defaults to ModeBalanced,
+// ensuring BuildProviderFor / RouteProvider / ChatWith never silently fall back
+// to ModeFree (the zero value) when the user has not chosen a mode.
+func (r *Router) effectiveMode() UsageMode {
+	r.modeMu.RLock()
+	defer r.modeMu.RUnlock()
+	if r.modeSet {
+		return r.mode
+	}
+	return ModeBalanced
+}
+
+func (r *Router) emitTrace(event TraceEvent) {
+	r.traceMu.RLock()
+	sink := r.traceSink
+	r.traceMu.RUnlock()
+	if sink == nil {
+		return
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now().UTC()
+	}
+	if event.Mode == "" {
+		event.Mode = r.effectiveMode().String()
+	}
+	sink.Trace(event)
+}
+
+// EmitTrace allows non-router components (for example TUI pipeline steps)
+// to write into the same debug trace stream.
+func (r *Router) EmitTrace(event TraceEvent) {
+	r.emitTrace(event)
+}
+
 // Route selects the best provider for a given task type.
-func (r *Router) Route(task TaskType) (Provider, error) {
+func (r *Router) Route(task TaskType) (RouteResult, error) {
+	if r.modeSet {
+		return r.routeByMode(task)
+	}
+	return r.routeLegacy(task)
+}
+
+// routeLegacy is the original routing logic (config-based model assignment).
+func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 	var modelName string
 
 	switch task {
@@ -93,19 +280,265 @@ func (r *Router) Route(task TaskType) (Provider, error) {
 		modelName = r.cfg.DefaultModel
 	}
 
+	r.emitTrace(TraceEvent{
+		Event:     "route_legacy_start",
+		Task:      taskTypeName(task),
+		Requested: modelName,
+	})
+
 	// Try the preferred model
 	if p, ok := r.providers[modelName]; ok && p.IsAvailable() {
-		return p, nil
+		r.emitTrace(TraceEvent{
+			Event:     "route_selected",
+			Task:      taskTypeName(task),
+			Requested: modelName,
+			Selected:  modelName,
+		})
+		return RouteResult{
+			Provider:  p,
+			Requested: modelName,
+			Actual:    modelName,
+		}, nil
 	}
 
-	// Fallback: try any available provider
-	for _, p := range r.providers {
-		if p.IsAvailable() {
-			return p, nil
+	// Deterministic fallback: try providers in defined order
+	for _, name := range fallbackOrder {
+		if name == modelName {
+			continue
+		}
+		if p, ok := r.providers[name]; ok && p.IsAvailable() {
+			r.emitTrace(TraceEvent{
+				Event:      "route_selected",
+				Task:       taskTypeName(task),
+				Requested:  modelName,
+				Selected:   name,
+				IsFallback: true,
+			})
+			return RouteResult{
+				Provider:   p,
+				Requested:  modelName,
+				Actual:     name,
+				IsFallback: true,
+			}, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no AI model available; configure one with 'makewand setup'")
+	r.emitTrace(TraceEvent{
+		Event:     "route_failed",
+		Task:      taskTypeName(task),
+		Requested: modelName,
+		Error:     "no AI model available",
+	})
+
+	return RouteResult{}, fmt.Errorf("no AI model available; configure one with 'makewand setup'")
+}
+
+// routeByMode selects a provider using the strategy table and access-type sorting.
+func (r *Router) routeByMode(task TaskType) (RouteResult, error) {
+	entry, err := r.modeEntry(task)
+	if err != nil {
+		return RouteResult{}, err
+	}
+
+	phase := taskToBuildPhase(task)
+	candidates := r.modeCandidates(entry, nil, phase)
+	requested := ""
+	if len(entry.Providers) > 0 {
+		requested = entry.Providers[0]
+	}
+
+	r.emitTrace(TraceEvent{
+		Event:      "route_mode_candidates",
+		Task:       taskTypeName(task),
+		Phase:      buildPhaseName(phase),
+		Requested:  requested,
+		Candidates: toTraceCandidates(candidates),
+	})
+
+	// Try each candidate
+	for _, c := range candidates {
+		p, err := r.resolveProvider(c.name, c.modelID)
+		if err != nil {
+			r.emitTrace(TraceEvent{
+				Event:     "route_candidate_skipped",
+				Task:      taskTypeName(task),
+				Phase:     buildPhaseName(phase),
+				Requested: requested,
+				Selected:  c.name,
+				ModelID:   c.modelID,
+				Error:     err.Error(),
+			})
+			continue
+		}
+		if !p.IsAvailable() {
+			r.emitTrace(TraceEvent{
+				Event:     "route_candidate_skipped",
+				Task:      taskTypeName(task),
+				Phase:     buildPhaseName(phase),
+				Requested: requested,
+				Selected:  c.name,
+				ModelID:   c.modelID,
+				Detail:    "provider unavailable",
+			})
+			continue
+		}
+
+		r.emitTrace(TraceEvent{
+			Event:      "route_selected",
+			Task:       taskTypeName(task),
+			Phase:      buildPhaseName(phase),
+			Requested:  requested,
+			Selected:   c.name,
+			ModelID:    c.modelID,
+			IsFallback: c.name != requested,
+		})
+		return RouteResult{
+			Provider:   p,
+			ModelID:    c.modelID,
+			Requested:  requested,
+			Actual:     c.name,
+			IsFallback: c.name != requested,
+		}, nil
+	}
+
+	r.emitTrace(TraceEvent{
+		Event:     "route_failed",
+		Task:      taskTypeName(task),
+		Phase:     buildPhaseName(phase),
+		Requested: requested,
+		Error:     "no AI model available for mode",
+	})
+
+	return RouteResult{}, fmt.Errorf("no AI model available for mode %q; configure one with 'makewand setup'", r.effectiveMode())
+}
+
+func (r *Router) modeEntry(task TaskType) (strategyEntry, error) {
+	taskStrategies, ok := strategyTable[r.effectiveMode()]
+	if !ok {
+		return strategyEntry{}, fmt.Errorf("unknown usage mode: %d", r.effectiveMode())
+	}
+
+	entry, ok := taskStrategies[task]
+	if !ok {
+		entry = taskStrategies[TaskCode]
+	}
+	return entry, nil
+}
+
+func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, phase BuildPhase) []candidate {
+	var candidates []candidate
+	for i, provName := range entry.Providers {
+		if excluded != nil && excluded[provName] {
+			continue
+		}
+
+		// Check if provider is configured.
+		if _, exists := r.providers[provName]; !exists {
+			continue
+		}
+
+		// Determine model ID from tier.
+		models, ok := modelTable[provName]
+		if !ok {
+			continue
+		}
+		modelID := models[entry.Tier]
+
+		access := r.accessTypes[provName]
+
+		// Free mode: never use API-only providers, even for fallback.
+		if r.effectiveMode() == ModeFree && access == AccessAPI {
+			continue
+		}
+
+		// Prior bias encodes static table preference:
+		// position 0 (primary) → bias 2.0, position 1 → 1.0, position 2+ → 0.0.
+		// This seeds the Beta distribution so observed quality can gradually override
+		// the static order rather than starting from a blank slate.
+		priorBias := math.Max(0.0, float64(2-i))
+
+		candidates = append(candidates, candidate{
+			name:          provName,
+			modelID:       modelID,
+			access:        access,
+			order:         i,
+			useCount:      r.usage.Count(provName),
+			failureRate:   r.usage.FailureRate(provName),
+			requests:      r.usage.Count(provName) + r.usage.FailureCount(provName),
+			thompsonScore: r.usage.ThompsonSample(phase, provName, priorBias),
+		})
+	}
+
+	sortCandidates(candidates)
+	return candidates
+}
+
+// resolveProvider returns a provider instance for the given (name, modelID) pair.
+// It caches instances so the same (provider, model) combination reuses the same instance.
+func (r *Router) resolveProvider(providerName, modelID string) (Provider, error) {
+	key := providerKey{name: providerName, modelID: modelID}
+
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+
+	if p, ok := r.providerCache[key]; ok {
+		return p, nil
+	}
+
+	// If a CLI provider is already registered for this provider name, use it
+	// (CLI providers ignore modelID — they use subscription defaults)
+	if existing, ok := r.providers[providerName]; ok {
+		if _, isCLI := existing.(*CLIProvider); isCLI {
+			r.providerCache[key] = existing
+			return existing, nil
+		}
+	}
+
+	var p Provider
+	switch providerName {
+	case "claude":
+		if cli := r.cfg.GetCLI("claude"); cli != nil {
+			p = NewClaudeCLI(cli.BinPath)
+		} else if r.cfg.ClaudeAPIKey != "" {
+			p = NewClaude(r.cfg.ClaudeAPIKey, modelID)
+		} else {
+			return nil, fmt.Errorf("claude not configured (no CLI or API key)")
+		}
+	case "codex":
+		if cli := r.cfg.GetCLI("codex"); cli != nil {
+			p = NewCodexCLI(cli.BinPath)
+		} else if r.cfg.OpenAIAPIKey != "" {
+			p = NewOpenAI(r.cfg.OpenAIAPIKey, modelID)
+		} else {
+			return nil, fmt.Errorf("codex not configured (no CLI or API key)")
+		}
+	case "openai":
+		if r.cfg.OpenAIAPIKey != "" {
+			p = NewOpenAI(r.cfg.OpenAIAPIKey, modelID)
+		} else if cli := r.cfg.GetCLI("codex"); cli != nil {
+			p = NewCodexCLI(cli.BinPath)
+		} else {
+			return nil, fmt.Errorf("openai not configured")
+		}
+	case "gemini":
+		if cli := r.cfg.GetCLI("gemini"); cli != nil {
+			p = NewGeminiCLI(cli.BinPath)
+		} else if r.cfg.GeminiAPIKey != "" {
+			p = NewGemini(r.cfg.GeminiAPIKey, modelID)
+		} else {
+			return nil, fmt.Errorf("gemini not configured (no CLI or API key)")
+		}
+	case "ollama":
+		if r.cfg.OllamaURL == "" {
+			return nil, fmt.Errorf("ollama URL not configured")
+		}
+		p = NewOllama(r.cfg.OllamaURL, modelID)
+	default:
+		return nil, fmt.Errorf("unknown provider: %s", providerName)
+	}
+
+	r.providerCache[key] = p
+	return p, nil
 }
 
 // Get returns a specific provider by name.
@@ -120,32 +553,941 @@ func (r *Router) Get(name string) (Provider, error) {
 	return p, nil
 }
 
-// Available returns all available provider names.
+// Available returns all available provider names, filtered by the effective mode.
+// In ModeFree, API-only providers are excluded to match the routing strategy.
+// Results are cached to avoid repeated health checks (e.g. Ollama) on every render cycle.
 func (r *Router) Available() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if time.Since(r.cachedAvailAt) < availCacheTTL {
+		return r.cachedAvail
+	}
+
+	mode := r.effectiveMode()
 	var names []string
 	for name, p := range r.providers {
 		if p.IsAvailable() {
+			if mode == ModeFree && r.accessTypes[name] == AccessAPI {
+				continue
+			}
 			names = append(names, name)
 		}
 	}
+	sort.Strings(names)
+
+	r.cachedAvail = names
+	r.cachedAvailAt = time.Now()
 	return names
 }
 
-// Chat sends a message using the best provider for the given task type.
-func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, system string) (string, Usage, error) {
-	p, err := r.Route(task)
-	if err != nil {
-		return "", Usage{}, err
-	}
-	return p.Chat(ctx, messages, system)
+// IsSubscription returns true if the named provider uses subscription access.
+func (r *Router) IsSubscription(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.accessTypes[name] == AccessSubscription
 }
 
-// ChatStream sends a message and streams the response.
-func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Message, system string) (<-chan StreamChunk, string, error) {
-	p, err := r.Route(task)
+// Chat sends a message using the best provider for the given task type.
+// If the primary provider fails, it tries the next available provider.
+func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, system string) (string, Usage, RouteResult, error) {
+	result, err := r.Route(task)
+	if err != nil {
+		return "", Usage{}, RouteResult{}, err
+	}
+	maxTokens := MaxTokensForTask(task)
+	primaryStart := time.Now()
+	content, usage, err := result.Provider.Chat(ctx, messages, system, maxTokens)
+	if err == nil {
+		r.usage.Increment(result.Actual)
+		r.emitTrace(TraceEvent{
+			Event:      "chat_attempt_success",
+			Task:       taskTypeName(task),
+			Requested:  result.Requested,
+			Selected:   result.Actual,
+			ModelID:    result.ModelID,
+			IsFallback: result.IsFallback,
+			DurationMS: time.Since(primaryStart).Milliseconds(),
+		})
+		return content, usage, result, nil
+	}
+	r.emitTrace(TraceEvent{
+		Event:      "chat_attempt_error",
+		Task:       taskTypeName(task),
+		Requested:  result.Requested,
+		Selected:   result.Actual,
+		ModelID:    result.ModelID,
+		IsFallback: result.IsFallback,
+		DurationMS: time.Since(primaryStart).Milliseconds(),
+		Error:      err.Error(),
+	})
+
+	// Primary failed — try fallback providers
+	r.usage.RecordFailure(result.Actual)
+	firstErr := err
+	if r.modeSet {
+		entry, modeErr := r.modeEntry(task)
+		if modeErr == nil {
+			excluded := map[string]bool{result.Actual: true}
+			for _, c := range r.modeCandidates(entry, excluded, taskToBuildPhase(task)) {
+				p, resolveErr := r.resolveProvider(c.name, c.modelID)
+				if resolveErr != nil {
+					r.emitTrace(TraceEvent{
+						Event:     "chat_fallback_skipped",
+						Task:      taskTypeName(task),
+						Requested: result.Requested,
+						Selected:  c.name,
+						ModelID:   c.modelID,
+						Error:     resolveErr.Error(),
+					})
+					continue
+				}
+				if !p.IsAvailable() {
+					r.emitTrace(TraceEvent{
+						Event:     "chat_fallback_skipped",
+						Task:      taskTypeName(task),
+						Requested: result.Requested,
+						Selected:  c.name,
+						ModelID:   c.modelID,
+						Detail:    "provider unavailable",
+					})
+					continue
+				}
+				start := time.Now()
+				content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+				if retryErr == nil {
+					r.usage.Increment(c.name)
+					r.emitTrace(TraceEvent{
+						Event:      "chat_attempt_success",
+						Task:       taskTypeName(task),
+						Requested:  result.Requested,
+						Selected:   c.name,
+						ModelID:    c.modelID,
+						IsFallback: true,
+						DurationMS: time.Since(start).Milliseconds(),
+					})
+					return content, usage, RouteResult{
+						Provider:   p,
+						ModelID:    c.modelID,
+						Requested:  result.Requested,
+						Actual:     c.name,
+						IsFallback: true,
+					}, nil
+				}
+				r.emitTrace(TraceEvent{
+					Event:      "chat_attempt_error",
+					Task:       taskTypeName(task),
+					Requested:  result.Requested,
+					Selected:   c.name,
+					ModelID:    c.modelID,
+					IsFallback: true,
+					DurationMS: time.Since(start).Milliseconds(),
+					Error:      retryErr.Error(),
+				})
+				r.usage.RecordFailure(c.name)
+			}
+			return "", Usage{}, result, firstErr
+		}
+		return "", Usage{}, result, firstErr
+	}
+
+	for _, name := range fallbackOrder {
+		if name == result.Actual {
+			continue
+		}
+		p, ok := r.providers[name]
+		if !ok || !p.IsAvailable() {
+			continue
+		}
+		start := time.Now()
+		content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+		if retryErr == nil {
+			r.usage.Increment(name)
+			r.emitTrace(TraceEvent{
+				Event:      "chat_attempt_success",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   name,
+				IsFallback: true,
+				DurationMS: time.Since(start).Milliseconds(),
+			})
+			return content, usage, RouteResult{
+				Provider:   p,
+				Requested:  result.Requested,
+				Actual:     name,
+				IsFallback: true,
+			}, nil
+		}
+		r.emitTrace(TraceEvent{
+			Event:      "chat_attempt_error",
+			Task:       taskTypeName(task),
+			Requested:  result.Requested,
+			Selected:   name,
+			IsFallback: true,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      retryErr.Error(),
+		})
+	}
+	r.emitTrace(TraceEvent{
+		Event:     "chat_failed_all",
+		Task:      taskTypeName(task),
+		Requested: result.Requested,
+		Selected:  result.Actual,
+		Error:     firstErr.Error(),
+	})
+	return "", Usage{}, result, firstErr
+}
+
+// BuildProviderFor returns the primary provider name for a build phase under the current mode.
+func (r *Router) BuildProviderFor(phase BuildPhase) string {
+	modeStrategies, ok := buildStrategyTable[r.effectiveMode()]
+	if !ok {
+		return ""
+	}
+	bs, ok := modeStrategies[phase]
+	if !ok {
+		return ""
+	}
+	return bs.Primary
+}
+
+// BuildProviderForAdaptive returns the best available provider for a build phase,
+// using Thompson Sampling to adaptively re-order the candidates from buildStrategyTable.
+// Configured providers that appear in the phase's (primary + fallbacks) list are
+// scored with ThompsonSample; the highest-scoring available provider wins.
+// Falls back to BuildProviderFor when no candidates are available.
+func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
+	mode := r.effectiveMode()
+	modeStrategies, ok := buildStrategyTable[mode]
+	if !ok {
+		return r.BuildProviderFor(phase)
+	}
+	bs, ok := modeStrategies[phase]
+	if !ok {
+		return r.BuildProviderFor(phase)
+	}
+
+	all := append([]string{bs.Primary}, bs.Fallbacks...)
+
+	type scored struct {
+		name  string
+		score float64
+	}
+	var candidates []scored
+	var traceCandidates []TraceCandidate
+	for i, name := range all {
+		if _, ok := r.providers[name]; !ok {
+			continue
+		}
+		priorBias := math.Max(0.0, float64(2-i))
+		score := r.usage.ThompsonSample(phase, name, priorBias)
+		candidates = append(candidates, scored{name, score})
+		traceCandidates = append(traceCandidates, TraceCandidate{
+			Name:          name,
+			Order:         i,
+			UseCount:      r.usage.Count(name),
+			FailureRate:   r.usage.FailureRate(name),
+			Requests:      r.usage.Count(name) + r.usage.FailureCount(name),
+			ThompsonScore: score,
+		})
+	}
+	if len(candidates) == 0 {
+		r.emitTrace(TraceEvent{
+			Event:     "build_adaptive_no_candidates",
+			Phase:     buildPhaseName(phase),
+			Requested: bs.Primary,
+		})
+		return bs.Primary
+	}
+
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.score > best.score {
+			best = c
+		}
+	}
+	r.emitTrace(TraceEvent{
+		Event:      "build_adaptive_selected",
+		Phase:      buildPhaseName(phase),
+		Requested:  bs.Primary,
+		Selected:   best.name,
+		IsFallback: best.name != bs.Primary,
+		Candidates: traceCandidates,
+	})
+	return best.name
+}
+
+// LoadStats loads cross-session routing quality statistics from configDir.
+func (r *Router) LoadStats(configDir string) error {
+	return r.usage.Load(configDir)
+}
+
+// SaveStats persists the current session's routing quality statistics to configDir.
+func (r *Router) SaveStats(configDir string) error {
+	return r.usage.Save(configDir)
+}
+
+// RouteProvider resolves a specific provider by name for a build phase.
+// If the named provider is unavailable, it falls back through the phase's Fallbacks list.
+// Providers in the exclude list are skipped (used to enforce cross-model constraints).
+func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string) (RouteResult, error) {
+	mode := r.effectiveMode()
+	modeStrategies, ok := buildStrategyTable[mode]
+	if !ok {
+		return RouteResult{}, fmt.Errorf("unknown usage mode: %d", mode)
+	}
+	bs, ok := modeStrategies[phase]
+	if !ok {
+		return RouteResult{}, fmt.Errorf("unknown build phase: %d", phase)
+	}
+
+	excluded := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excluded[e] = true
+	}
+	r.emitTrace(TraceEvent{
+		Event:     "build_route_start",
+		Phase:     buildPhaseName(phase),
+		Requested: name,
+		Detail:    "exclude=" + strings.Join(exclude, ","),
+	})
+
+	// Try the requested provider first (unless excluded)
+	if !excluded[name] {
+		if p, modelID, err := r.tryBuildProvider(name, bs.Tier); err == nil && p.IsAvailable() {
+			r.emitTrace(TraceEvent{
+				Event:     "build_route_selected",
+				Phase:     buildPhaseName(phase),
+				Requested: name,
+				Selected:  name,
+				ModelID:   modelID,
+			})
+			return RouteResult{
+				Provider:  p,
+				ModelID:   modelID,
+				Requested: name,
+				Actual:    name,
+			}, nil
+		}
+	}
+
+	// Fallback through the phase's list, skipping excluded providers
+	for _, fb := range bs.Fallbacks {
+		if fb == name || excluded[fb] {
+			continue
+		}
+		if p, modelID, err := r.tryBuildProvider(fb, bs.Tier); err == nil && p.IsAvailable() {
+			r.emitTrace(TraceEvent{
+				Event:      "build_route_selected",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				ModelID:    modelID,
+				IsFallback: true,
+			})
+			return RouteResult{
+				Provider:   p,
+				ModelID:    modelID,
+				Requested:  name,
+				Actual:     fb,
+				IsFallback: true,
+			}, nil
+		}
+	}
+
+	r.emitTrace(TraceEvent{
+		Event:     "build_route_failed",
+		Phase:     buildPhaseName(phase),
+		Requested: name,
+		Error:     "no provider available for build phase",
+	})
+
+	return RouteResult{}, fmt.Errorf("no provider available for build phase (requested %s)", name)
+}
+
+// tryBuildProvider resolves a provider instance for the given name and tier.
+func (r *Router) tryBuildProvider(name string, tier ModelTier) (Provider, string, error) {
+	models, ok := modelTable[name]
+	if !ok {
+		return nil, "", fmt.Errorf("no model table entry for %s", name)
+	}
+	modelID := models[tier]
+	p, err := r.resolveProvider(name, modelID)
 	if err != nil {
 		return nil, "", err
 	}
-	ch, err := p.ChatStream(ctx, messages, system)
-	return ch, p.Name(), err
+	return p, modelID, nil
+}
+
+// maxTokensForPhase returns the max output tokens for a build phase.
+func maxTokensForPhase(phase BuildPhase) int {
+	switch phase {
+	case PhaseCode:
+		return 16384 // full project generation needs more than TaskCode's 8192
+	case PhaseFix:
+		return 8192
+	case PhasePlan, PhaseReview:
+		return 4096
+	default:
+		return 8192
+	}
+}
+
+// ChatWith sends a message to a specific provider for a build phase.
+// It resolves the provider by name, falls back if unavailable, and tracks usage.
+// Providers in the exclude list are never used (enforces cross-model constraints).
+func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, messages []Message, system string, exclude ...string) (string, Usage, RouteResult, error) {
+	result, err := r.RouteProvider(name, phase, exclude...)
+	if err != nil {
+		return "", Usage{}, RouteResult{}, err
+	}
+
+	maxTokens := maxTokensForPhase(phase)
+	primaryStart := time.Now()
+	content, usage, err := result.Provider.Chat(ctx, messages, system, maxTokens)
+	if err == nil {
+		r.usage.Increment(result.Actual)
+		r.emitTrace(TraceEvent{
+			Event:      "build_chat_attempt_success",
+			Phase:      buildPhaseName(phase),
+			Requested:  name,
+			Selected:   result.Actual,
+			ModelID:    result.ModelID,
+			IsFallback: result.IsFallback,
+			DurationMS: time.Since(primaryStart).Milliseconds(),
+		})
+		return content, usage, result, nil
+	}
+	r.emitTrace(TraceEvent{
+		Event:      "build_chat_attempt_error",
+		Phase:      buildPhaseName(phase),
+		Requested:  name,
+		Selected:   result.Actual,
+		ModelID:    result.ModelID,
+		IsFallback: result.IsFallback,
+		DurationMS: time.Since(primaryStart).Milliseconds(),
+		Error:      err.Error(),
+	})
+
+	// Primary failed — try remaining fallbacks, respecting exclude list
+	excluded := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excluded[e] = true
+	}
+
+	r.usage.RecordFailure(result.Actual)
+	firstErr := err
+	modeStrategies := buildStrategyTable[r.effectiveMode()]
+	bs := modeStrategies[phase]
+	for _, fb := range bs.Fallbacks {
+		if fb == result.Actual || excluded[fb] {
+			continue
+		}
+		p, _, resolveErr := r.tryBuildProvider(fb, bs.Tier)
+		if resolveErr != nil {
+			r.emitTrace(TraceEvent{
+				Event:     "build_chat_fallback_skipped",
+				Phase:     buildPhaseName(phase),
+				Requested: name,
+				Selected:  fb,
+				Error:     resolveErr.Error(),
+			})
+			continue
+		}
+		if !p.IsAvailable() {
+			r.emitTrace(TraceEvent{
+				Event:     "build_chat_fallback_skipped",
+				Phase:     buildPhaseName(phase),
+				Requested: name,
+				Selected:  fb,
+				Detail:    "provider unavailable",
+			})
+			continue
+		}
+		start := time.Now()
+		content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+		if retryErr == nil {
+			r.usage.Increment(fb)
+			_, modelID, _ := r.tryBuildProvider(fb, bs.Tier)
+			r.emitTrace(TraceEvent{
+				Event:      "build_chat_attempt_success",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				ModelID:    modelID,
+				IsFallback: true,
+				DurationMS: time.Since(start).Milliseconds(),
+			})
+			return content, usage, RouteResult{
+				Provider:   p,
+				ModelID:    modelID,
+				Requested:  name,
+				Actual:     fb,
+				IsFallback: true,
+			}, nil
+		}
+		r.emitTrace(TraceEvent{
+			Event:      "build_chat_attempt_error",
+			Phase:      buildPhaseName(phase),
+			Requested:  name,
+			Selected:   fb,
+			IsFallback: true,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      retryErr.Error(),
+		})
+		r.usage.RecordFailure(fb)
+	}
+
+	r.emitTrace(TraceEvent{
+		Event:     "build_chat_failed_all",
+		Phase:     buildPhaseName(phase),
+		Requested: name,
+		Selected:  result.Actual,
+		Error:     firstErr.Error(),
+	})
+
+	return "", Usage{}, result, firstErr
+}
+
+// ChatStream sends a message and streams the response.
+func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Message, system string) (<-chan StreamChunk, RouteResult, error) {
+	result, err := r.Route(task)
+	if err != nil {
+		return nil, RouteResult{}, err
+	}
+	maxTokens := MaxTokensForTask(task)
+	primaryStart := time.Now()
+	ch, err := result.Provider.ChatStream(ctx, messages, system, maxTokens)
+	if err == nil {
+		r.usage.Increment(result.Actual)
+		r.emitTrace(TraceEvent{
+			Event:      "chat_stream_start_success",
+			Task:       taskTypeName(task),
+			Requested:  result.Requested,
+			Selected:   result.Actual,
+			ModelID:    result.ModelID,
+			IsFallback: result.IsFallback,
+			DurationMS: time.Since(primaryStart).Milliseconds(),
+		})
+		return ch, result, nil
+	}
+	r.emitTrace(TraceEvent{
+		Event:      "chat_stream_start_error",
+		Task:       taskTypeName(task),
+		Requested:  result.Requested,
+		Selected:   result.Actual,
+		ModelID:    result.ModelID,
+		IsFallback: result.IsFallback,
+		DurationMS: time.Since(primaryStart).Milliseconds(),
+		Error:      err.Error(),
+	})
+
+	// Primary stream start failed — try fallbacks.
+	r.usage.RecordFailure(result.Actual)
+	firstErr := err
+
+	if r.modeSet {
+		entry, modeErr := r.modeEntry(task)
+		if modeErr == nil {
+			excluded := map[string]bool{result.Actual: true}
+			for _, c := range r.modeCandidates(entry, excluded, taskToBuildPhase(task)) {
+				p, resolveErr := r.resolveProvider(c.name, c.modelID)
+				if resolveErr != nil {
+					r.emitTrace(TraceEvent{
+						Event:     "chat_stream_fallback_skipped",
+						Task:      taskTypeName(task),
+						Requested: result.Requested,
+						Selected:  c.name,
+						ModelID:   c.modelID,
+						Error:     resolveErr.Error(),
+					})
+					continue
+				}
+				if !p.IsAvailable() {
+					r.emitTrace(TraceEvent{
+						Event:     "chat_stream_fallback_skipped",
+						Task:      taskTypeName(task),
+						Requested: result.Requested,
+						Selected:  c.name,
+						ModelID:   c.modelID,
+						Detail:    "provider unavailable",
+					})
+					continue
+				}
+				start := time.Now()
+				ch, retryErr := p.ChatStream(ctx, messages, system, maxTokens)
+				if retryErr == nil {
+					r.usage.Increment(c.name)
+					r.emitTrace(TraceEvent{
+						Event:      "chat_stream_start_success",
+						Task:       taskTypeName(task),
+						Requested:  result.Requested,
+						Selected:   c.name,
+						ModelID:    c.modelID,
+						IsFallback: true,
+						DurationMS: time.Since(start).Milliseconds(),
+					})
+					return ch, RouteResult{
+						Provider:   p,
+						ModelID:    c.modelID,
+						Requested:  result.Requested,
+						Actual:     c.name,
+						IsFallback: true,
+					}, nil
+				}
+				r.emitTrace(TraceEvent{
+					Event:      "chat_stream_start_error",
+					Task:       taskTypeName(task),
+					Requested:  result.Requested,
+					Selected:   c.name,
+					ModelID:    c.modelID,
+					IsFallback: true,
+					DurationMS: time.Since(start).Milliseconds(),
+					Error:      retryErr.Error(),
+				})
+				r.usage.RecordFailure(c.name)
+			}
+			return nil, result, firstErr
+		}
+		return nil, result, firstErr
+	}
+
+	for _, name := range fallbackOrder {
+		if name == result.Actual {
+			continue
+		}
+		p, ok := r.providers[name]
+		if !ok || !p.IsAvailable() {
+			continue
+		}
+		start := time.Now()
+		ch, retryErr := p.ChatStream(ctx, messages, system, maxTokens)
+		if retryErr == nil {
+			r.usage.Increment(name)
+			r.emitTrace(TraceEvent{
+				Event:      "chat_stream_start_success",
+				Task:       taskTypeName(task),
+				Requested:  result.Requested,
+				Selected:   name,
+				IsFallback: true,
+				DurationMS: time.Since(start).Milliseconds(),
+			})
+			return ch, RouteResult{
+				Provider:   p,
+				Requested:  result.Requested,
+				Actual:     name,
+				IsFallback: true,
+			}, nil
+		}
+		r.emitTrace(TraceEvent{
+			Event:      "chat_stream_start_error",
+			Task:       taskTypeName(task),
+			Requested:  result.Requested,
+			Selected:   name,
+			IsFallback: true,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      retryErr.Error(),
+		})
+		r.usage.RecordFailure(name)
+	}
+
+	r.emitTrace(TraceEvent{
+		Event:     "chat_stream_failed_all",
+		Task:      taskTypeName(task),
+		Requested: result.Requested,
+		Selected:  result.Actual,
+		Error:     firstErr.Error(),
+	})
+
+	return nil, result, firstErr
+}
+
+// --- Power Mode Ensemble ---
+
+// EnsembleResult holds one provider's response in a parallel ensemble run.
+type EnsembleResult struct {
+	Provider string
+	ModelID  string
+	Content  string
+	Usage    Usage
+}
+
+// Ensemble runs the generator providers for a Power-mode phase in parallel.
+// Excluded providers are skipped (e.g. code provider must not review its own output).
+// Returns all successful results; the caller selects the winner.
+func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) []EnsembleResult {
+	pe, ok := powerEnsembleTable[phase]
+	if !ok {
+		return nil
+	}
+
+	excluded := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excluded[e] = true
+	}
+
+	// Collect available generator slots
+	type slot struct {
+		name    string
+		modelID string
+		p       Provider
+	}
+	var slots []slot
+	for _, name := range pe.Generators {
+		if excluded[name] {
+			continue
+		}
+		p, modelID, err := r.tryBuildProvider(name, TierPremium)
+		if err != nil || !p.IsAvailable() {
+			continue
+		}
+		slots = append(slots, slot{name, modelID, p})
+	}
+	if len(slots) == 0 {
+		r.emitTrace(TraceEvent{
+			Event:  "ensemble_no_generators",
+			Phase:  buildPhaseName(phase),
+			Detail: "no available generator provider",
+		})
+		return nil
+	}
+	r.emitTrace(TraceEvent{
+		Event:  "ensemble_start",
+		Phase:  buildPhaseName(phase),
+		Detail: "judge=" + pe.Judge,
+	})
+
+	maxTokens := maxTokensForPhase(phase)
+	results := make([]EnsembleResult, len(slots))
+	var wg sync.WaitGroup
+	for i, s := range slots {
+		wg.Add(1)
+		go func(idx int, sl slot) {
+			defer wg.Done()
+			start := time.Now()
+			content, usage, err := sl.p.Chat(ctx, messages, system, maxTokens)
+			if err != nil {
+				r.usage.RecordFailure(sl.name)
+				r.emitTrace(TraceEvent{
+					Event:      "ensemble_generator_error",
+					Phase:      buildPhaseName(phase),
+					Selected:   sl.name,
+					ModelID:    sl.modelID,
+					DurationMS: time.Since(start).Milliseconds(),
+					Error:      err.Error(),
+				})
+				return
+			}
+			r.usage.Increment(sl.name)
+			r.emitTrace(TraceEvent{
+				Event:      "ensemble_generator_success",
+				Phase:      buildPhaseName(phase),
+				Selected:   sl.name,
+				ModelID:    sl.modelID,
+				DurationMS: time.Since(start).Milliseconds(),
+			})
+			results[idx] = EnsembleResult{sl.name, sl.modelID, content, usage}
+		}(i, s)
+	}
+	wg.Wait()
+
+	var out []EnsembleResult
+	for _, res := range results {
+		if res.Content != "" {
+			out = append(out, res)
+		}
+	}
+	r.emitTrace(TraceEvent{
+		Event:  "ensemble_complete",
+		Phase:  buildPhaseName(phase),
+		Detail: fmt.Sprintf("success=%d/%d", len(out), len(slots)),
+	})
+	return out
+}
+
+// judgeSelect asks the designated judge provider to pick the best result from an ensemble.
+// The judge is asked to declare the winner on the first line as "WINNER: N", making
+// attribution reliable and independent of the content. Records quality outcomes:
+// the winning generator gets a success signal. Falls back to first result on error.
+func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []EnsembleResult) EnsembleResult {
+	if len(results) == 1 {
+		// Single result — treat it as a success (no competition needed).
+		r.usage.RecordQualityOutcome(phase, results[0].Provider, true)
+		r.emitTrace(TraceEvent{
+			Event:    "judge_skipped_single_result",
+			Phase:    buildPhaseName(phase),
+			Selected: results[0].Provider,
+		})
+		return results[0]
+	}
+
+	pe, ok := powerEnsembleTable[phase]
+	if !ok {
+		r.emitTrace(TraceEvent{
+			Event:  "judge_skipped_missing_config",
+			Phase:  buildPhaseName(phase),
+			Detail: "power ensemble config missing",
+		})
+		return results[0]
+	}
+
+	judgeP, judgeModelID, err := r.tryBuildProvider(pe.Judge, TierPremium)
+	if err != nil || !judgeP.IsAvailable() {
+		reason := "judge unavailable"
+		if err != nil {
+			reason = err.Error()
+		}
+		r.emitTrace(TraceEvent{
+			Event:    "judge_skipped_unavailable",
+			Phase:    buildPhaseName(phase),
+			Selected: pe.Judge,
+			Error:    reason,
+		})
+		return results[0]
+	}
+
+	var prompt strings.Builder
+	for i, res := range results {
+		prompt.WriteString(fmt.Sprintf("=== Option %d ===\n%s\n\n", i+1, res.Content))
+	}
+	// Ask judge to declare which option won on the very first line so attribution
+	// is unambiguous regardless of the content (which might mention provider names).
+	prompt.WriteString(fmt.Sprintf(
+		"First line must be exactly \"WINNER: <N>\" where N is 1–%d.\nThen output the complete chosen option, completely unchanged:",
+		len(results),
+	))
+
+	judgeMessages := []Message{{Role: "user", Content: prompt.String()}}
+	judgeStart := time.Now()
+	content, usage, err := judgeP.Chat(ctx, judgeMessages, judgeSystemFor(phase), maxTokensForPhase(phase))
+	if err != nil {
+		r.emitTrace(TraceEvent{
+			Event:      "judge_error",
+			Phase:      buildPhaseName(phase),
+			Selected:   pe.Judge,
+			ModelID:    judgeModelID,
+			DurationMS: time.Since(judgeStart).Milliseconds(),
+			Error:      err.Error(),
+		})
+		return results[0]
+	}
+	r.emitTrace(TraceEvent{
+		Event:      "judge_success",
+		Phase:      buildPhaseName(phase),
+		Selected:   pe.Judge,
+		ModelID:    judgeModelID,
+		DurationMS: time.Since(judgeStart).Milliseconds(),
+	})
+
+	r.usage.Increment(pe.Judge)
+
+	// Parse "WINNER: N" from first line for reliable winner attribution.
+	// If parsing fails, default to the first result.
+	winner := results[0]
+	if idx := strings.IndexByte(content, '\n'); idx >= 0 {
+		firstLine := strings.TrimSpace(content[:idx])
+		if strings.HasPrefix(firstLine, "WINNER:") {
+			numStr := strings.TrimSpace(strings.TrimPrefix(firstLine, "WINNER:"))
+			if n, parseErr := strconv.Atoi(numStr); parseErr == nil && n >= 1 && n <= len(results) {
+				winner = results[n-1]
+			}
+		}
+	}
+	r.emitTrace(TraceEvent{
+		Event:    "judge_winner_selected",
+		Phase:    buildPhaseName(phase),
+		Selected: winner.Provider,
+		ModelID:  winner.ModelID,
+	})
+	r.usage.RecordQualityOutcome(phase, winner.Provider, true)
+
+	// Return the winning generator's original content for correctness.
+	// The judge's model ID and usage are recorded for cost tracking.
+	return EnsembleResult{
+		Provider: winner.Provider, // attribution: generator that was selected
+		ModelID:  judgeModelID,    // judge's model (for cost/display)
+		Content:  winner.Content,  // original generator output, not judge's reproduction
+		Usage:    usage,
+	}
+}
+
+// RecordQualityOutcome exposes the quality feedback mechanism to the app layer.
+// Call with success=true when a provider's output passes validation (tests pass, LGTM review).
+// Call with success=false when the output fails validation (auto-fix triggered, test failure).
+func (r *Router) RecordQualityOutcome(phase BuildPhase, provider string, success bool) {
+	r.usage.RecordQualityOutcome(phase, provider, success)
+}
+
+// judgeSystemFor returns a phase-specific system prompt for the judge.
+func judgeSystemFor(phase BuildPhase) string {
+	switch phase {
+	case PhaseCode:
+		return "You are an expert code evaluator. Given multiple implementations of the same task, select the most complete, correct, and well-structured one. Output ONLY the chosen implementation, completely unchanged, preserving all --- FILE: --- markers."
+	case PhaseReview:
+		return "You are an expert code reviewer. Given multiple code reviews, select or synthesize the most thorough and actionable one. Output ONLY the best review, completely unchanged."
+	case PhasePlan:
+		return "You are an expert software architect. Given multiple project plans, select the most detailed and feasible one. Output ONLY the chosen plan, completely unchanged."
+	case PhaseFix:
+		return "You are an expert debugger. Given multiple fixes for the same error, select the most correct and minimal fix. Output ONLY the chosen fix, completely unchanged, preserving all --- FILE: --- markers."
+	default:
+		return "You are an expert evaluator. Given multiple responses to the same request, select the best one. Output ONLY the chosen response, completely unchanged."
+	}
+}
+
+// ChatBest selects the best provider response for a build phase.
+//   - Power mode: runs all ensemble generators in parallel, then uses a cross-model
+//     judge to select the winner.
+//   - Other modes: uses Thompson Sampling to adaptively select the primary provider
+//     from the buildStrategyTable candidates, then delegates to ChatWith.
+func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) (string, Usage, RouteResult, error) {
+	if r.effectiveMode() != ModePower {
+		return r.ChatWith(ctx, r.BuildProviderForAdaptive(phase), phase, messages, system, exclude...)
+	}
+
+	r.emitTrace(TraceEvent{
+		Event:  "chat_best_power_start",
+		Phase:  buildPhaseName(phase),
+		Detail: "mode=power",
+	})
+
+	results := r.Ensemble(ctx, phase, messages, system, exclude...)
+	if len(results) == 0 {
+		// Ensemble had no available generators — fall back to adaptive routing
+		r.emitTrace(TraceEvent{
+			Event:  "chat_best_power_fallback_adaptive",
+			Phase:  buildPhaseName(phase),
+			Detail: "ensemble returned zero results",
+		})
+		return r.ChatWith(ctx, r.BuildProviderForAdaptive(phase), phase, messages, system, exclude...)
+	}
+
+	best := r.judgeSelect(ctx, phase, results)
+
+	// Accumulate usage across all ensemble calls: generators + judge.
+	var total Usage
+	for _, res := range results {
+		total.InputTokens += res.Usage.InputTokens
+		total.OutputTokens += res.Usage.OutputTokens
+		total.Cost += res.Usage.Cost
+	}
+	// Add judge's usage (previously missing).
+	total.InputTokens += best.Usage.InputTokens
+	total.OutputTokens += best.Usage.OutputTokens
+	total.Cost += best.Usage.Cost
+	total.Provider = best.Provider // winning generator
+	total.Model = best.ModelID
+
+	r.emitTrace(TraceEvent{
+		Event:    "chat_best_power_selected",
+		Phase:    buildPhaseName(phase),
+		Selected: best.Provider,
+		ModelID:  best.ModelID,
+		Detail:   fmt.Sprintf("candidates=%d", len(results)),
+	})
+
+	return best.Content, total, RouteResult{
+		Actual:    best.Provider,
+		ModelID:   best.ModelID,
+		Requested: "ensemble",
+	}, nil
 }
