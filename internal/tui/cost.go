@@ -13,8 +13,11 @@ type CostTracker struct {
 }
 
 type costEntry struct {
-	provider string
-	cost     float64
+	provider       string
+	cost           float64
+	isSubscription bool
+	inputTokens    int
+	outputTokens   int
 }
 
 // NewCostTracker creates a new cost tracker.
@@ -22,9 +25,20 @@ func NewCostTracker() *CostTracker {
 	return &CostTracker{}
 }
 
-// Add records a cost entry.
+// Add records a cost entry (backward compatible).
 func (c *CostTracker) Add(provider string, cost float64) {
 	c.entries = append(c.entries, costEntry{provider: provider, cost: cost})
+}
+
+// AddWithTokens records a cost entry with token details and subscription info.
+func (c *CostTracker) AddWithTokens(provider string, cost float64, inputTokens, outputTokens int, isSubscription bool) {
+	c.entries = append(c.entries, costEntry{
+		provider:       provider,
+		cost:           cost,
+		isSubscription: isSubscription,
+		inputTokens:    inputTokens,
+		outputTokens:   outputTokens,
+	})
 }
 
 // SessionTotal returns the total cost for the current session.
@@ -45,6 +59,63 @@ func (c *CostTracker) ByProvider() map[string]float64 {
 	return m
 }
 
+// RequestCount returns the number of requests for a provider.
+func (c *CostTracker) RequestCount(provider string) int {
+	count := 0
+	for _, e := range c.entries {
+		if e.provider == provider {
+			count++
+		}
+	}
+	return count
+}
+
+// TokensByProvider returns total input+output tokens for a provider.
+func (c *CostTracker) TokensByProvider(provider string) (int, int) {
+	var input, output int
+	for _, e := range c.entries {
+		if e.provider == provider {
+			input += e.inputTokens
+			output += e.outputTokens
+		}
+	}
+	return input, output
+}
+
+// IsSubscription returns true if any entry for the provider is subscription-based.
+func (c *CostTracker) IsSubscription(provider string) bool {
+	for _, e := range c.entries {
+		if e.provider == provider && e.isSubscription {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckBudget returns a warning string if the session total approaches or exceeds the budget.
+// Returns empty string if budget is zero (disabled) or spending is below 80%.
+func (c *CostTracker) CheckBudget(budget float64) string {
+	if budget <= 0 {
+		return ""
+	}
+	total := c.SessionTotal()
+	pct := total / budget * 100
+	if pct >= 100 {
+		return fmt.Sprintf("Budget exceeded: $%.2f / $%.2f (%.0f%%)", total, budget, pct)
+	}
+	if pct >= 80 {
+		return fmt.Sprintf("Budget warning: $%.2f / $%.2f (%.0f%%)", total, budget, pct)
+	}
+	return ""
+}
+
+func formatTokenCount(tokens int) string {
+	if tokens >= 1000 {
+		return fmt.Sprintf("%dK", tokens/1000)
+	}
+	return fmt.Sprintf("%d", tokens)
+}
+
 // View renders the cost panel.
 func (c *CostTracker) View(width int) string {
 	msg := i18n.Msg()
@@ -61,6 +132,7 @@ func (c *CostTracker) View(width int) string {
 		{"gemini", "Gemini"},
 		{"claude", "Claude"},
 		{"openai", "OpenAI"},
+		{"codex", "Codex"},
 		{"ollama", "Ollama"},
 	}
 
@@ -69,8 +141,15 @@ func (c *CostTracker) View(width int) string {
 		if !ok {
 			continue
 		}
+
 		var costStr string
-		if cost == 0 {
+		if c.IsSubscription(p.name) {
+			// Subscription: show request count and token estimate
+			reqCount := c.RequestCount(p.name)
+			inTok, outTok := c.TokensByProvider(p.name)
+			totalTok := inTok + outTok
+			costStr = fmt.Sprintf(msg.CostRequests, reqCount, formatTokenCount(totalTok))
+		} else if cost == 0 {
 			if p.name == "ollama" {
 				costStr = msg.CostLocal
 			} else {
@@ -79,7 +158,7 @@ func (c *CostTracker) View(width int) string {
 		} else {
 			costStr = fmt.Sprintf("$%.2f", cost)
 		}
-		b.WriteString(fmt.Sprintf("│ %-8s %8s\n", p.label+":", costStr))
+		b.WriteString(fmt.Sprintf("│ %-8s %s\n", p.label+":", costStr))
 	}
 
 	total := c.SessionTotal()

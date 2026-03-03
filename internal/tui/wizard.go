@@ -23,13 +23,13 @@ const (
 
 // WizardPanel guides non-programmers through project creation.
 type WizardPanel struct {
-	phase     WizardPhase
-	templates []template.Template
-	selected  int
+	phase      WizardPhase
+	templates  []template.Template
+	selected   int
 	customDesc string
 	plan       string
-	width     int
-	height    int
+	width      int
+	height     int
 }
 
 // NewWizardPanel creates a new wizard panel.
@@ -155,7 +155,7 @@ func (w WizardPanel) viewTemplateSelect(msg *i18n.Messages) string {
 	}
 	b.WriteString(cursor + label + "\n")
 
-	b.WriteString("\n" + helpStyle.Render("↑↓ navigate • Enter select • q quit") + "\n")
+	b.WriteString("\n" + helpStyle.Render(msg.WizardNavHint) + "\n")
 
 	return b.String()
 }
@@ -163,7 +163,7 @@ func (w WizardPanel) viewTemplateSelect(msg *i18n.Messages) string {
 func (w WizardPanel) viewDescribe(msg *i18n.Messages) string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("🪄 "+msg.WizardPrompt) + "\n\n")
-	b.WriteString(helpStyle.Render("Type your project description below:") + "\n")
+	b.WriteString(helpStyle.Render(msg.WizardDescribeHint) + "\n")
 	return b.String()
 }
 
@@ -184,7 +184,7 @@ func (w WizardPanel) viewConfirm(msg *i18n.Messages) string {
 	if w.plan != "" {
 		b.WriteString(w.plan + "\n\n")
 	}
-	b.WriteString(helpStyle.Render("Enter/Y confirm • N cancel") + "\n")
+	b.WriteString(helpStyle.Render(msg.WizardConfirmHint) + "\n")
 	return b.String()
 }
 

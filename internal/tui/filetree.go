@@ -35,18 +35,17 @@ func (f *FileTreePanel) SetSize(width, height int) {
 // View renders the file tree.
 func (f FileTreePanel) View() string {
 	msg := i18n.Msg()
-	title := titleStyle.Render("📁 " + msg.FileTreeTitle)
+	title := titleStyle.Render(msg.FileTreeTitle)
 
 	if len(f.files) == 0 {
 		return fileBorderStyle.Width(f.width - 2).Render(
-			title + "\n" + mutedStyle.Render("  (no files yet)"),
+			title + "\n" + mutedStyle.Render("  "+msg.FileTreeEmpty),
 		)
 	}
 
 	var b strings.Builder
 	b.WriteString(title + "\n")
 
-	// Build tree structure
 	maxLines := f.height - 4
 	if maxLines < 3 {
 		maxLines = 3
@@ -59,7 +58,7 @@ func (f FileTreePanel) View() string {
 		}
 		if count >= maxLines {
 			remaining := len(f.files) - count
-			b.WriteString(mutedStyle.Render(fmt.Sprintf("  ... +%d more files", remaining)))
+			b.WriteString(mutedStyle.Render(fmt.Sprintf("  ... "+msg.FileTreeMore, remaining)))
 			break
 		}
 
@@ -87,38 +86,47 @@ func (f FileTreePanel) View() string {
 
 func fileIcon(name string, isDir bool) string {
 	if isDir {
-		return "📂"
+		return ">"
+	}
+
+	// Check full filename first for dotfiles and special files
+	lowerName := strings.ToLower(name)
+	switch lowerName {
+	case ".gitignore":
+		return "~"
+	case "makefile":
+		return "#"
+	case "dockerfile":
+		return "#"
 	}
 
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
 	case ".go":
-		return "🔵"
+		return "*"
 	case ".py":
-		return "🐍"
+		return "*"
 	case ".js", ".jsx", ".ts", ".tsx":
-		return "🟨"
+		return "*"
 	case ".html":
-		return "🌐"
+		return "*"
 	case ".css", ".scss":
-		return "🎨"
+		return "*"
 	case ".json":
-		return "📋"
+		return "*"
 	case ".yaml", ".yml":
-		return "⚙️"
+		return "*"
 	case ".md":
-		return "📝"
+		return "*"
 	case ".sql":
-		return "🗄️"
+		return "*"
 	case ".sh", ".bash":
-		return "🐚"
+		return "*"
 	case ".toml":
-		return "⚙️"
+		return "*"
 	case ".mod", ".sum":
-		return "📦"
-	case ".gitignore":
-		return "🙈"
+		return "*"
 	default:
-		return "📄"
+		return "-"
 	}
 }
