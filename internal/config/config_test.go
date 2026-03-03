@@ -116,16 +116,47 @@ func TestConfigDir_UsesEnvOverride(t *testing.T) {
 }
 
 func TestHasAnyModel_WithCustomProvider(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "private-llm.sh")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", bin, err)
+	}
+
 	cfg := DefaultConfig()
 	cfg.ClaudeAPIKey = ""
 	cfg.GeminiAPIKey = ""
 	cfg.OpenAIAPIKey = ""
 	cfg.CLIs = nil
 	cfg.CustomProviders = []CustomProvider{
-		{Name: "private-llm", Command: "/usr/bin/private-llm"},
+		{Name: "private-llm", Command: bin},
 	}
 
 	if !cfg.HasAnyModel() {
 		t.Fatal("HasAnyModel() = false, want true when custom providers are configured")
+	}
+}
+
+func TestHasAnyModel_InvalidCustomProviderNotCounted(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ClaudeAPIKey = ""
+	cfg.GeminiAPIKey = ""
+	cfg.OpenAIAPIKey = ""
+	cfg.CLIs = nil
+	cfg.CustomProviders = []CustomProvider{
+		{Name: "broken-private-llm", Command: "/path/does/not/exist"},
+	}
+
+	if cfg.HasAnyModel() {
+		t.Fatal("HasAnyModel() = true, want false when all custom providers are unusable")
+	}
+}
+
+func TestIsCustomProviderUsable_WithExecutablePath(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "provider.sh")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", bin, err)
+	}
+
+	if !IsCustomProviderUsable(CustomProvider{Name: "private", Command: bin}) {
+		t.Fatal("IsCustomProviderUsable() = false, want true for executable file")
 	}
 }

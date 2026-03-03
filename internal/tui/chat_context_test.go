@@ -61,3 +61,28 @@ func TestToModelMessages_SummaryPreservesUTF8(t *testing.T) {
 		t.Fatal("summary content should remain valid UTF-8")
 	}
 }
+
+func TestToModelMessages_TrimsToBudgetForVeryLongHistory(t *testing.T) {
+	chat := NewChatPanel()
+	longChunk := strings.Repeat("long-context-", 800)
+	for i := 0; i < 30; i++ {
+		chat.AddMessage(ChatMessage{
+			Role:    "user",
+			Content: fmt.Sprintf("turn-%02d %s", i, longChunk),
+		})
+	}
+
+	msgs := chat.ToModelMessages()
+	if len(msgs) == 0 {
+		t.Fatal("ToModelMessages returned empty context")
+	}
+	if len(msgs) > maxChatHistory {
+		t.Fatalf("ToModelMessages len=%d, want <= %d", len(msgs), maxChatHistory)
+	}
+	if estimateModelMessagesTokens(msgs) > chatContextTokenBudget {
+		t.Fatalf("estimated tokens=%d, want <= %d", estimateModelMessagesTokens(msgs), chatContextTokenBudget)
+	}
+	if msgs[len(msgs)-1].Content == "" || !strings.Contains(msgs[len(msgs)-1].Content, "turn-29") {
+		t.Fatalf("latest context missing from tail message: %q", msgs[len(msgs)-1].Content)
+	}
+}

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 )
@@ -72,15 +73,26 @@ func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
 	oldGOOS := previewGOOS
 	oldUnsafe := previewUnsafe
 	oldLookPath := previewLookPath
+	oldUserHome := previewUserHome
+	oldGetenv := previewGetenv
 	t.Cleanup(func() {
 		previewGOOS = oldGOOS
 		previewUnsafe = oldUnsafe
 		previewLookPath = oldLookPath
+		previewUserHome = oldUserHome
+		previewGetenv = oldGetenv
 	})
 
 	previewGOOS = "linux"
 	previewUnsafe = func() bool { return false }
 	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
+	previewUserHome = func() (string, error) { return "/home/alice", nil }
+	previewGetenv = func(key string) string {
+		if key == "PATH" {
+			return "/usr/bin:/bin"
+		}
+		return ""
+	}
 
 	cmd, args, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
 	if err != nil {
@@ -92,4 +104,86 @@ func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
 	if len(args) == 0 || args[len(args)-3] != "npm" {
 		t.Fatalf("wrapped args should contain original command; got %v", args)
 	}
+	if !containsArg(args, "--clearenv") {
+		t.Fatalf("wrapped args should clear inherited environment; got %v", args)
+	}
+	if !containsArgPair(args, "PATH", "/usr/bin:/bin") {
+		t.Fatalf("wrapped args should set PATH; got %v", args)
+	}
+	if !containsArgPair(args, "HOME", "/tmp") {
+		t.Fatalf("wrapped args should set HOME=/tmp; got %v", args)
+	}
+	if !containsArgPair(args, "--tmpfs", "/home/alice") {
+		t.Fatalf("wrapped args should mask host HOME; got %v", args)
+	}
+}
+
+func TestWrapPreviewProjectCommand_MasksSensitiveHomeSubpathsWhenProjectInsideHome(t *testing.T) {
+	oldGOOS := previewGOOS
+	oldUnsafe := previewUnsafe
+	oldLookPath := previewLookPath
+	oldUserHome := previewUserHome
+	oldGetenv := previewGetenv
+	t.Cleanup(func() {
+		previewGOOS = oldGOOS
+		previewUnsafe = oldUnsafe
+		previewLookPath = oldLookPath
+		previewUserHome = oldUserHome
+		previewGetenv = oldGetenv
+	})
+
+	previewGOOS = "linux"
+	previewUnsafe = func() bool { return false }
+	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
+	previewUserHome = func() (string, error) { return "/home/alice", nil }
+	previewGetenv = func(key string) string {
+		if key == "PATH" {
+			return "/usr/bin:/bin"
+		}
+		return ""
+	}
+
+	projectPath := "/home/alice/work/demo"
+	_, args, err := wrapPreviewProjectCommand(projectPath, "npm", []string{"run", "dev"})
+	if err != nil {
+		t.Fatalf("wrapPreviewProjectCommand: %v", err)
+	}
+	if containsArgPair(args, "--tmpfs", "/home/alice") {
+		t.Fatalf("project under HOME should not mask entire HOME; got %v", args)
+	}
+	if !containsArgPair(args, "--tmpfs", "/home/alice/.ssh") {
+		t.Fatalf("expected sensitive HOME path mask for .ssh; got %v", args)
+	}
+}
+
+func TestPathWithin(t *testing.T) {
+	base := t.TempDir()
+	child := base + string(os.PathSeparator) + "child"
+	if !pathWithin(base, base) {
+		t.Fatalf("pathWithin(%q, %q)=false, want true", base, base)
+	}
+	if !pathWithin(base, child) {
+		t.Fatalf("pathWithin(%q, %q)=false, want true", base, child)
+	}
+	if pathWithin(base, "/tmp") {
+		t.Fatalf("pathWithin(%q, %q)=true, want false", base, "/tmp")
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsArgPair(args []string, left, right string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == left && args[i+1] == right {
+			return true
+		}
+	}
+	return false
 }
