@@ -30,6 +30,18 @@ type CLIProvider struct {
 const cliAvailCacheTTL = 60 * time.Second
 const cliRequestTimeout = 5 * time.Minute
 const cliStreamTimeout = 10 * time.Minute
+const cliMaxAttempts = 2
+const cliRetryBaseDelay = 300 * time.Millisecond
+
+var transientCLIErrorHints = []string{
+	"stream closed unexpectedly",
+	"premature close",
+	"transport error",
+	"connection reset",
+	"broken pipe",
+	"unexpected eof",
+	"tls handshake timeout",
+}
 
 // --- Claude CLI ---
 
@@ -138,51 +150,40 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 	ctx, cancel := context.WithTimeout(ctx, cliRequestTimeout)
 	defer cancel()
 
-	cmd := c.buildCmd(ctx, prompt)
-	setCLIProcessGroup(cmd)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	attempts := 0
+	for {
+		attempts++
+		content, err := c.chatAttempt(ctx, prompt)
+		if err == nil {
+			usage := Usage{
+				InputTokens:  estimateTokens(prompt),
+				OutputTokens: estimateTokens(content),
+				Cost:         0, // Subscription — no per-token cost
+				Model:        c.provider + "-cli",
+				Provider:     c.provider,
+			}
+			return content, usage, nil
+		}
 
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		return "", Usage{}, fmt.Errorf("%s CLI start error: %w", c.provider, err)
+		if attempts >= cliMaxAttempts || !isTransientCLIError(err) || ctx.Err() != nil {
+			if attempts > 1 {
+				return "", Usage{}, fmt.Errorf("%s (after %d attempts)", err.Error(), attempts)
+			}
+			return "", Usage{}, err
+		}
+
+		delay := cliRetryDelay(attempts)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if attempts > 1 {
+				return "", Usage{}, fmt.Errorf("%s (after %d attempts)", err.Error(), attempts)
+			}
+			return "", Usage{}, err
+		case <-timer.C:
+		}
 	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	var err error
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		killCLIProcess(cmd)
-		err = <-done
-	}
-
-	duration := time.Since(start)
-
-	if err != nil {
-		return "", Usage{}, formatCLIExecutionError(c.provider, stderr.String(), err, ctx.Err(), duration)
-	}
-
-	content := strings.TrimSpace(stdout.String())
-
-	// Strip ANSI escape sequences from CLI output
-	content = stripANSI(content)
-
-	usage := Usage{
-		InputTokens:  estimateTokens(prompt),
-		OutputTokens: estimateTokens(content),
-		Cost:         0, // Subscription — no per-token cost
-		Model:        c.provider + "-cli",
-		Provider:     c.provider,
-	}
-
-	_ = duration // available for future metrics
-	return content, usage, nil
 }
 
 func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
@@ -275,6 +276,64 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 
 func shouldSurfaceContextError(ctxErr error) bool {
 	return errors.Is(ctxErr, context.DeadlineExceeded)
+}
+
+func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, error) {
+	cmd := c.buildCmd(ctx, prompt)
+	setCLIProcessGroup(cmd)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("%s CLI start error: %w", c.provider, err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-ctx.Done():
+		killCLIProcess(cmd)
+		runErr = <-done
+	}
+
+	duration := time.Since(start)
+	if runErr != nil {
+		return "", formatCLIExecutionError(c.provider, stderr.String(), runErr, ctx.Err(), duration)
+	}
+
+	content := strings.TrimSpace(stdout.String())
+	return stripANSI(content), nil
+}
+
+func isTransientCLIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, hint := range transientCLIErrorHints {
+		if strings.Contains(msg, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func cliRetryDelay(attempt int) time.Duration {
+	if attempt <= 0 {
+		attempt = 1
+	}
+	return time.Duration(attempt) * cliRetryBaseDelay
 }
 
 func formatCLIContextError(provider string, ctxErr error, duration time.Duration) error {

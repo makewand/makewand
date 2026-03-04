@@ -247,6 +247,27 @@ func parseBestEffortFencedFiles(text string) ParseResult {
 			continue
 		}
 		content := strings.Join(lines[start:end], "\n")
+
+		// Some models wrap a complete multi-file answer inside one outer code
+		// fence. Reuse strict parsing on the inner content before heuristics.
+		inner := ParseFiles(content)
+		if len(inner.Files) > 0 {
+			for _, f := range inner.Files {
+				p, ok := normalizeLikelyPath(f.Path)
+				if !ok {
+					continue
+				}
+				p = uniquifyPath(p, pathUseCount)
+				files = append(files, ExtractedFile{
+					Path:    p,
+					Content: f.Content,
+				})
+			}
+			// Continue after closing fence.
+			i = end
+			continue
+		}
+
 		path := ""
 		if p, ok := normalizeLikelyPath(inlineHint); ok {
 			path = p

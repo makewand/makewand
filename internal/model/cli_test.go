@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -155,5 +156,90 @@ func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
 	}
 	if !strings.Contains(content, "hello appended prompt") {
 		t.Fatalf("Chat() content = %q, want prompt appended as arg", content)
+	}
+}
+
+func TestCLIProvider_Chat_RetriesTransientExecutionError(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "attempts.txt")
+	script := filepath.Join(dir, "flaky-cli.sh")
+	body := "#!/bin/sh\n" +
+		"state_file=\"$1\"\n" +
+		"if [ -f \"$state_file\" ]; then\n" +
+		"  n=$(cat \"$state_file\")\n" +
+		"else\n" +
+		"  n=0\n" +
+		"fi\n" +
+		"n=$((n+1))\n" +
+		"echo \"$n\" > \"$state_file\"\n" +
+		"if [ \"$n\" -eq 1 ]; then\n" +
+		"  echo \"stream closed unexpectedly: Transport error (1007)\" 1>&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"echo \"ok after retry\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewCommandCLI("private", script, []string{stateFile})
+	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
+	if err != nil {
+		t.Fatalf("Chat() error = %v, want retry success", err)
+	}
+	if !strings.Contains(content, "ok after retry") {
+		t.Fatalf("Chat() content = %q, want retry success output", content)
+	}
+
+	attemptsData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile(stateFile): %v", err)
+	}
+	attempts, convErr := strconv.Atoi(strings.TrimSpace(string(attemptsData)))
+	if convErr != nil {
+		t.Fatalf("Atoi(attempts): %v", convErr)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2 (one retry)", attempts)
+	}
+}
+
+func TestCLIProvider_Chat_DoesNotRetryNonTransientError(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "attempts.txt")
+	script := filepath.Join(dir, "fail-permanent-cli.sh")
+	body := "#!/bin/sh\n" +
+		"state_file=\"$1\"\n" +
+		"if [ -f \"$state_file\" ]; then\n" +
+		"  n=$(cat \"$state_file\")\n" +
+		"else\n" +
+		"  n=0\n" +
+		"fi\n" +
+		"n=$((n+1))\n" +
+		"echo \"$n\" > \"$state_file\"\n" +
+		"echo \"invalid_api_key\" 1>&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewCommandCLI("private", script, []string{stateFile})
+	_, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
+	if err == nil {
+		t.Fatal("Chat() error = nil, want permanent failure")
+	}
+	if !strings.Contains(err.Error(), "invalid_api_key") {
+		t.Fatalf("Chat() error = %q, want surfaced stderr", err.Error())
+	}
+
+	attemptsData, readErr := os.ReadFile(stateFile)
+	if readErr != nil {
+		t.Fatalf("ReadFile(stateFile): %v", readErr)
+	}
+	attempts, convErr := strconv.Atoi(strings.TrimSpace(string(attemptsData)))
+	if convErr != nil {
+		t.Fatalf("Atoi(attempts): %v", convErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (no retry for permanent error)", attempts)
 	}
 }

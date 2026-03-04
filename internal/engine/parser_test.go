@@ -241,6 +241,33 @@ func TestParseFilesBestEffort_DoesNotInferSingleGenericFence(t *testing.T) {
 	}
 }
 
+func TestParseFilesBestEffort_ParsesNestedFileBlocksInsideOuterFence(t *testing.T) {
+	input := "```markdown\n" +
+		"--- FILE: index.html ---\n" +
+		"```html\n" +
+		"<!doctype html><html><body>Nested</body></html>\n" +
+		"```\n\n" +
+		"--- FILE: style.css ---\n" +
+		"```css\n" +
+		"body { color: #222; }\n" +
+		"```\n" +
+		"```\n"
+
+	result := ParseFilesBestEffort(input)
+	if len(result.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(result.Files))
+	}
+	if result.Files[0].Path != "index.html" {
+		t.Fatalf("file 0 path=%q, want index.html", result.Files[0].Path)
+	}
+	if result.Files[1].Path != "style.css" {
+		t.Fatalf("file 1 path=%q, want style.css", result.Files[1].Path)
+	}
+	if !contains(result.Files[0].Content, "Nested") {
+		t.Fatalf("file 0 content not parsed from nested block: %q", result.Files[0].Content)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }
