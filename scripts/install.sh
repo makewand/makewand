@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${MAKEWAND_REPO:-bnumsn/makewand}"
+REPO="${MAKEWAND_REPO:-makewand/makewand}"
 VERSION="${MAKEWAND_VERSION:-latest}"
 INSTALL_DIR="${MAKEWAND_INSTALL_DIR:-$HOME/.local/bin}"
 
