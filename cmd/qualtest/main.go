@@ -57,6 +57,7 @@ type modeResult struct {
 	cost           float64
 	files          []engine.ExtractedFile
 	rawOutput      string
+	rawPath        string
 	reviewScore    string
 	reviewVerdict  string
 	reviewProvider string
@@ -133,6 +134,12 @@ func main() {
 		r.tokens = usage.InputTokens + usage.OutputTokens
 		r.cost = usage.Cost
 		r.rawOutput = content
+		if tmp, createErr := os.CreateTemp("", fmt.Sprintf("qualtest-%s-*.txt", strings.ToLower(m.name))); createErr == nil {
+			if _, writeErr := tmp.WriteString(content); writeErr == nil {
+				r.rawPath = tmp.Name()
+			}
+			_ = tmp.Close()
+		}
 
 		parsed := engine.ParseFilesBestEffort(content)
 		r.files = parsed.Files
@@ -152,6 +159,9 @@ func main() {
 			fmt.Printf("%s (%d lines)", f.Path, lines)
 		}
 		fmt.Println()
+		if len(r.files) == 0 && r.rawPath != "" {
+			fmt.Printf("  Raw output saved: %s\n", r.rawPath)
+		}
 
 		// Cross-model review — use a DIFFERENT provider than the one that wrote code
 		reviewProvider := router.BuildProviderFor(model.PhaseReview)

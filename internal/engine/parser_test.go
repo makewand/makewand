@@ -268,6 +268,38 @@ func TestParseFilesBestEffort_ParsesNestedFileBlocksInsideOuterFence(t *testing.
 	}
 }
 
+func TestParseFilesBestEffort_UnclosedFenceStillExtractsFile(t *testing.T) {
+	input := "```html\n" +
+		"<!doctype html>\n" +
+		"<html><body>partial</body></html>\n"
+
+	result := ParseFilesBestEffort(input)
+	if len(result.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(result.Files))
+	}
+	if result.Files[0].Path != "index.html" {
+		t.Fatalf("file path=%q, want index.html", result.Files[0].Path)
+	}
+	if !contains(result.Files[0].Content, "partial") {
+		t.Fatalf("file content should keep unclosed fence payload: %q", result.Files[0].Content)
+	}
+}
+
+func TestParseFilesBestEffort_DoesNotInferShellCommandAsFile(t *testing.T) {
+	input := "The app is ready:\n\n" +
+		"```bash\n" +
+		"open password-strength-checker/index.html\n" +
+		"```\n\n" +
+		"```text\n" +
+		"password-strength-checker/\\nindex.html\\nstyle.css\\nscript.js\n" +
+		"```\n"
+
+	result := ParseFilesBestEffort(input)
+	if len(result.Files) != 0 {
+		t.Fatalf("expected 0 files for command-only response, got %d: %+v", len(result.Files), result.Files)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

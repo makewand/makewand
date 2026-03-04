@@ -242,9 +242,10 @@ func parseBestEffortFencedFiles(text string) ParseResult {
 		for end < len(lines) && !fenceCloseRe.MatchString(strings.TrimSpace(lines[end])) {
 			end++
 		}
+		hasClosingFence := end < len(lines)
 		if end >= len(lines) {
-			// Unclosed fence: treat as non-file content.
-			continue
+			// Unclosed fence: treat the rest of the text as block content.
+			end = len(lines)
 		}
 		content := strings.Join(lines[start:end], "\n")
 
@@ -288,8 +289,11 @@ func parseBestEffortFencedFiles(text string) ParseResult {
 			})
 		}
 
-		// Continue after closing fence.
+		// Continue after closing fence (or EOF for unclosed fence).
 		i = end
+		if !hasClosingFence {
+			break
+		}
 	}
 
 	return ParseResult{Files: files, Explanation: strings.TrimSpace(text)}
@@ -384,8 +388,6 @@ func inferPathFromFenceLanguage(lang string, totalFences int) string {
 		return "config.yaml"
 	case "sql":
 		return "query.sql"
-	case "bash", "sh", "shell":
-		return "script.sh"
 	case "md", "markdown":
 		return "README.md"
 	default:
