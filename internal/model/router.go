@@ -987,55 +987,92 @@ func (r *Router) BuildProviderFor(phase BuildPhase) string {
 	return bs.Primary
 }
 
+func (r *Router) buildStrategyForPhase(phase BuildPhase) (BuildStrategy, error) {
+	modeStrategies, ok := buildStrategyTable[r.effectiveMode()]
+	if !ok {
+		return BuildStrategy{}, fmt.Errorf("unknown usage mode: %d", r.effectiveMode())
+	}
+	bs, ok := modeStrategies[phase]
+	if !ok {
+		return BuildStrategy{}, fmt.Errorf("unknown build phase: %d", phase)
+	}
+	return bs, nil
+}
+
+func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool) (BuildStrategy, []candidate, error) {
+	bs, err := r.buildStrategyForPhase(phase)
+	if err != nil {
+		return BuildStrategy{}, nil, err
+	}
+
+	preferred := append([]string{bs.Primary}, bs.Fallbacks...)
+	orderedProviders := expandProviderPreference(preferred, r.registeredProviderNames(), excluded)
+	staticOrder := make(map[string]int, len(preferred))
+	for i, name := range preferred {
+		if _, exists := staticOrder[name]; !exists {
+			staticOrder[name] = i
+		}
+	}
+
+	mode := r.effectiveMode()
+	candidates := make([]candidate, 0, len(orderedProviders))
+	for i, provName := range orderedProviders {
+		access := r.accessTypes[provName]
+		// Free mode: hard-filter API providers for all build phases.
+		if mode == ModeFree && access == AccessAPI {
+			continue
+		}
+
+		modelID := ""
+		if models, ok := modelTable[provName]; ok {
+			modelID = models[bs.Tier]
+		}
+
+		priorBias := 0.0
+		if pos, ok := staticOrder[provName]; ok {
+			priorBias = math.Max(0.0, float64(2-pos))
+		}
+
+		candidates = append(candidates, candidate{
+			name:          provName,
+			modelID:       modelID,
+			access:        access,
+			order:         i,
+			useCount:      r.usage.Count(provName),
+			failureRate:   r.usage.FailureRate(provName),
+			requests:      r.usage.Count(provName) + r.usage.FailureCount(provName),
+			thompsonScore: r.usage.ThompsonSample(phase, provName, priorBias),
+		})
+	}
+
+	sortCandidates(candidates)
+	return bs, candidates, nil
+}
+
+func (r *Router) isBuildProviderAvailable(name, modelID string) bool {
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+
+	if p, ok := r.providerCache[providerKey{name: name, modelID: modelID}]; ok {
+		return p.IsAvailable()
+	}
+	if p, ok := r.providers[name]; ok {
+		return p.IsAvailable()
+	}
+	return false
+}
+
 // BuildProviderForAdaptive returns the best available provider for a build phase,
 // using Thompson Sampling to adaptively re-order the candidates from buildStrategyTable.
 // Configured providers that appear in the phase's (primary + fallbacks) list are
 // scored with ThompsonSample; the highest-scoring available provider wins.
 // Falls back to BuildProviderFor when no candidates are available.
 func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
-	mode := r.effectiveMode()
-	modeStrategies, ok := buildStrategyTable[mode]
-	if !ok {
-		return r.BuildProviderFor(phase)
-	}
-	bs, ok := modeStrategies[phase]
-	if !ok {
+	bs, candidates, err := r.buildPhaseCandidates(phase, nil)
+	if err != nil {
 		return r.BuildProviderFor(phase)
 	}
 
-	all := expandProviderPreference(append([]string{bs.Primary}, bs.Fallbacks...), r.registeredProviderNames(), nil)
-
-	type scored struct {
-		name  string
-		score float64
-	}
-	var candidates []scored
-	var traceCandidates []TraceCandidate
-	staticOrder := make(map[string]int, 1+len(bs.Fallbacks))
-	staticOrder[bs.Primary] = 0
-	for i, name := range bs.Fallbacks {
-		staticOrder[name] = i + 1
-	}
-
-	for i, name := range all {
-		if blocked, _ := r.isCircuitOpen(name); blocked {
-			continue
-		}
-		priorBias := 0.0
-		if pos, ok := staticOrder[name]; ok {
-			priorBias = math.Max(0.0, float64(2-pos))
-		}
-		score := r.usage.ThompsonSample(phase, name, priorBias)
-		candidates = append(candidates, scored{name, score})
-		traceCandidates = append(traceCandidates, TraceCandidate{
-			Name:          name,
-			Order:         i,
-			UseCount:      r.usage.Count(name),
-			FailureRate:   r.usage.FailureRate(name),
-			Requests:      r.usage.Count(name) + r.usage.FailureCount(name),
-			ThompsonScore: score,
-		})
-	}
 	if len(candidates) == 0 {
 		r.emitTrace(TraceEvent{
 			Event:     "build_adaptive_no_candidates",
@@ -1045,21 +1082,33 @@ func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
 		return bs.Primary
 	}
 
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		if c.score > best.score {
-			best = c
+	for _, c := range candidates {
+		if blocked, _ := r.isCircuitOpen(c.name); blocked {
+			continue
 		}
+		if !r.isBuildProviderAvailable(c.name, c.modelID) {
+			continue
+		}
+
+		r.emitTrace(TraceEvent{
+			Event:      "build_adaptive_selected",
+			Phase:      buildPhaseName(phase),
+			Requested:  bs.Primary,
+			Selected:   c.name,
+			ModelID:    c.modelID,
+			IsFallback: c.name != bs.Primary,
+			Candidates: toTraceCandidates(candidates),
+		})
+		return c.name
 	}
+
 	r.emitTrace(TraceEvent{
-		Event:      "build_adaptive_selected",
-		Phase:      buildPhaseName(phase),
-		Requested:  bs.Primary,
-		Selected:   best.name,
-		IsFallback: best.name != bs.Primary,
-		Candidates: traceCandidates,
+		Event:     "build_adaptive_no_candidates",
+		Phase:     buildPhaseName(phase),
+		Requested: bs.Primary,
+		Detail:    "all candidates unavailable",
 	})
-	return best.name
+	return bs.Primary
 }
 
 // LoadStats loads cross-session routing quality statistics from configDir.
@@ -1076,30 +1125,34 @@ func (r *Router) SaveStats(configDir string) error {
 // If the named provider is unavailable, it falls back through the phase's Fallbacks list.
 // Providers in the exclude list are skipped (used to enforce cross-model constraints).
 func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string) (RouteResult, error) {
-	mode := r.effectiveMode()
-	modeStrategies, ok := buildStrategyTable[mode]
-	if !ok {
-		return RouteResult{}, fmt.Errorf("unknown usage mode: %d", mode)
-	}
-	bs, ok := modeStrategies[phase]
-	if !ok {
-		return RouteResult{}, fmt.Errorf("unknown build phase: %d", phase)
-	}
-
 	excluded := make(map[string]bool, len(exclude))
 	for _, e := range exclude {
 		excluded[e] = true
 	}
+	bs, candidates, err := r.buildPhaseCandidates(phase, excluded)
+	if err != nil {
+		return RouteResult{}, err
+	}
+
 	r.emitTrace(TraceEvent{
-		Event:     "build_route_start",
-		Phase:     buildPhaseName(phase),
-		Requested: name,
-		Detail:    "exclude=" + strings.Join(exclude, ","),
+		Event:      "build_route_start",
+		Phase:      buildPhaseName(phase),
+		Requested:  name,
+		Detail:     "exclude=" + strings.Join(exclude, ","),
+		Candidates: toTraceCandidates(candidates),
 	})
 
 	// Try the requested provider first (unless excluded)
 	if !excluded[name] {
-		if blocked, remaining := r.isCircuitOpen(name); blocked {
+		if r.effectiveMode() == ModeFree && r.accessTypes[name] == AccessAPI {
+			r.emitTrace(TraceEvent{
+				Event:     "build_route_candidate_skipped",
+				Phase:     buildPhaseName(phase),
+				Requested: name,
+				Selected:  name,
+				Detail:    "api provider blocked in free mode",
+			})
+		} else if blocked, remaining := r.isCircuitOpen(name); blocked {
 			r.emitTrace(TraceEvent{
 				Event:     "build_route_candidate_skipped",
 				Phase:     buildPhaseName(phase),
@@ -1108,7 +1161,7 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 				Detail:    circuitOpenDetail(name, remaining),
 			})
 		} else {
-			if p, modelID, err := r.tryBuildProvider(name, bs.Tier); err == nil && p.IsAvailable() {
+			if p, modelID, resolveErr := r.tryBuildProvider(name, bs.Tier); resolveErr == nil && p.IsAvailable() {
 				r.emitTrace(TraceEvent{
 					Event:     "build_route_selected",
 					Phase:     buildPhaseName(phase),
@@ -1122,13 +1175,29 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 					Requested: name,
 					Actual:    name,
 				}, nil
+			} else if resolveErr != nil {
+				r.emitTrace(TraceEvent{
+					Event:     "build_route_candidate_skipped",
+					Phase:     buildPhaseName(phase),
+					Requested: name,
+					Selected:  name,
+					Error:     resolveErr.Error(),
+				})
+			} else {
+				r.emitTrace(TraceEvent{
+					Event:     "build_route_candidate_skipped",
+					Phase:     buildPhaseName(phase),
+					Requested: name,
+					Selected:  name,
+					Detail:    "provider unavailable",
+				})
 			}
 		}
 	}
 
-	// Fallback through the phase's list (plus dynamically registered providers),
-	// skipping excluded providers.
-	for _, fb := range expandProviderPreference(bs.Fallbacks, r.registeredProviderNames(), excluded) {
+	// Fallback through adaptive candidate ranking.
+	for _, c := range candidates {
+		fb := c.name
 		if fb == name || excluded[fb] {
 			continue
 		}
@@ -1143,7 +1212,30 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 			})
 			continue
 		}
-		if p, modelID, err := r.tryBuildProvider(fb, bs.Tier); err == nil && p.IsAvailable() {
+		p, modelID, resolveErr := r.tryBuildProvider(fb, bs.Tier)
+		if resolveErr != nil {
+			r.emitTrace(TraceEvent{
+				Event:      "build_route_candidate_skipped",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				IsFallback: true,
+				Error:      resolveErr.Error(),
+			})
+			continue
+		}
+		if !p.IsAvailable() {
+			r.emitTrace(TraceEvent{
+				Event:      "build_route_candidate_skipped",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				IsFallback: true,
+				Detail:     "provider unavailable",
+			})
+			continue
+		}
+		if p.IsAvailable() {
 			r.emitTrace(TraceEvent{
 				Event:      "build_route_selected",
 				Phase:      buildPhaseName(phase),
@@ -1274,10 +1366,25 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 	for _, e := range exclude {
 		excluded[e] = true
 	}
+	excluded[result.Actual] = true
 
-	modeStrategies := buildStrategyTable[r.effectiveMode()]
-	bs := modeStrategies[phase]
-	for _, fb := range bs.Fallbacks {
+	bs, candidates, candErr := r.buildPhaseCandidates(phase, excluded)
+	if candErr != nil {
+		if firstErr == nil {
+			firstErr = candErr
+		}
+		r.emitTrace(TraceEvent{
+			Event:     "build_chat_failed_all",
+			Phase:     buildPhaseName(phase),
+			Requested: name,
+			Selected:  result.Actual,
+			Error:     firstErr.Error(),
+		})
+		return "", Usage{}, result, firstErr
+	}
+
+	for _, c := range candidates {
+		fb := c.name
 		if fb == result.Actual || excluded[fb] {
 			continue
 		}
@@ -1292,7 +1399,7 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 			})
 			continue
 		}
-		p, _, resolveErr := r.tryBuildProvider(fb, bs.Tier)
+		p, modelID, resolveErr := r.tryBuildProvider(fb, bs.Tier)
 		if resolveErr != nil {
 			r.emitTrace(TraceEvent{
 				Event:     "build_chat_fallback_skipped",
@@ -1329,7 +1436,6 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 		if retryErr == nil {
 			r.usage.Increment(fb)
 			r.recordProviderSuccess(fb)
-			_, modelID, _ := r.tryBuildProvider(fb, bs.Tier)
 			r.emitTrace(TraceEvent{
 				Event:      "build_chat_attempt_success",
 				Phase:      buildPhaseName(phase),
