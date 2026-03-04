@@ -7,14 +7,14 @@ AI coding assistant CLI (Go).
 ### Linux / macOS (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bnumsn/makewand/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/makewand/makewand/master/scripts/install.sh | bash
 ```
 
 Optional variables:
 
 - `MAKEWAND_VERSION=v0.1.0` (default: latest)
 - `MAKEWAND_INSTALL_DIR=$HOME/.local/bin`
-- `MAKEWAND_REPO=bnumsn/makewand`
+- `MAKEWAND_REPO=makewand/makewand`
 
 ### From source
 
