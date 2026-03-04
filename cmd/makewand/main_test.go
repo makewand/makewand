@@ -1,7 +1,11 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/internal/model"
 )
@@ -88,5 +92,53 @@ func TestPromptTaskToBuildPhase(t *testing.T) {
 		if got := promptTaskToBuildPhase(tt.task); got != tt.want {
 			t.Fatalf("promptTaskToBuildPhase(%v) = %v, want %v", tt.task, got, tt.want)
 		}
+	}
+}
+
+func TestNewHeadlessTraceSinkUsesConfigDir(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("MAKEWAND_CONFIG_DIR", cfgDir)
+
+	sink, path, err := newHeadlessTraceSink()
+	if err != nil {
+		t.Fatalf("newHeadlessTraceSink() error: %v", err)
+	}
+	defer sink.Close()
+
+	want := filepath.Join(cfgDir, "trace.jsonl")
+	if path != want {
+		t.Fatalf("newHeadlessTraceSink() path = %q, want %q", path, want)
+	}
+}
+
+func TestHeadlessTraceSinkWritesEvent(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("MAKEWAND_CONFIG_DIR", cfgDir)
+
+	sink, path, err := newHeadlessTraceSink()
+	if err != nil {
+		t.Fatalf("newHeadlessTraceSink() error: %v", err)
+	}
+
+	event := model.TraceEvent{
+		Timestamp: time.Now().UTC(),
+		Event:     "test_event",
+		Selected:  "gemini",
+	}
+	sink.Trace(event)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("sink.Close() error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error: %v", path, err)
+	}
+	line := strings.TrimSpace(string(data))
+	if line == "" {
+		t.Fatal("trace file is empty")
+	}
+	if !strings.Contains(line, "\"event\":\"test_event\"") {
+		t.Fatalf("trace line missing event field: %s", line)
 	}
 }

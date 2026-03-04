@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
@@ -55,7 +58,7 @@ build, modify, and deploy software through natural language conversation.
 
 			initialPrompt := strings.TrimSpace(strings.Join(args, " "))
 			if shouldUseHeadless(initialPrompt, rootPrintFlag, isInteractiveTerminal()) {
-				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag)
+				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag, debugFlag)
 			}
 			if initialPrompt == "" && !isInteractiveTerminal() {
 				return fmt.Errorf("interactive TTY not detected; provide a prompt or use --print")
@@ -328,13 +331,23 @@ func isCharDevice(f *os.File) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration) error {
+func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, debug bool) error {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return fmt.Errorf("prompt is empty")
 	}
 
 	router := model.NewRouter(cfg)
+	if debug {
+		traceSink, tracePath, traceErr := newHeadlessTraceSink()
+		if traceErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: debug trace disabled: %v\n", traceErr)
+		} else {
+			router.SetTraceSink(traceSink)
+			defer traceSink.Close()
+			fmt.Fprintf(os.Stderr, "Debug trace enabled: %s\n", tracePath)
+		}
+	}
 	configDir, dirErr := config.ConfigDir()
 	if dirErr == nil {
 		_ = router.LoadStats(configDir)
@@ -386,6 +399,57 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration) e
 
 	fmt.Println(strings.TrimSpace(content))
 	return nil
+}
+
+type jsonlTraceSink struct {
+	mu sync.Mutex
+	f  *os.File
+}
+
+func newJSONLTraceSink(path string) (*jsonlTraceSink, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return nil, err
+	}
+	return &jsonlTraceSink{f: f}, nil
+}
+
+func (s *jsonlTraceSink) Trace(event model.TraceEvent) {
+	b, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.f.Write(b)
+	_, _ = s.f.Write([]byte("\n"))
+}
+
+func (s *jsonlTraceSink) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.f.Close()
+}
+
+func newHeadlessTraceSink() (*jsonlTraceSink, string, error) {
+	var candidates []string
+	if dir, err := config.ConfigDir(); err == nil {
+		candidates = append(candidates, filepath.Join(dir, "trace.jsonl"))
+	}
+	candidates = append(candidates, filepath.Join(os.TempDir(), "makewand-trace.jsonl"))
+
+	var lastErr error
+	for _, path := range candidates {
+		sink, err := newJSONLTraceSink(path)
+		if err == nil {
+			return sink, path, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no trace path candidates available")
+	}
+	return nil, "", lastErr
 }
 
 func classifyPromptTask(input string) model.TaskType {
