@@ -266,6 +266,79 @@ func TestModeRouting_CrossModelExclusionInRouteProvider(t *testing.T) {
 	}
 }
 
+func TestModeRouting_BuildProviderForAdaptiveSkipsUnavailable(t *testing.T) {
+	r := makeRouter(t, ModeBalanced, map[string]*stubProvider{
+		"claude": {name: "claude", available: false}, // static primary for PhaseCode
+		"codex":  {name: "codex", available: true},
+		"gemini": {name: "gemini", available: true},
+	})
+	r.accessTypes["claude"] = AccessSubscription
+	r.accessTypes["codex"] = AccessSubscription
+	r.accessTypes["gemini"] = AccessSubscription
+
+	for i := 0; i < 40; i++ {
+		if got := r.BuildProviderForAdaptive(PhaseCode); got == "claude" {
+			t.Fatalf("BuildProviderForAdaptive selected unavailable provider %q", got)
+		}
+	}
+}
+
+func TestModeRouting_RouteProviderFreeModeBlocksAPIRequested(t *testing.T) {
+	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+		"gemini": {name: "gemini", available: true},
+		"claude": {name: "claude", available: true},
+	})
+	r.accessTypes["claude"] = AccessAPI
+
+	result, err := r.RouteProvider("claude", PhaseCode)
+	if err != nil {
+		t.Fatalf("RouteProvider error = %v", err)
+	}
+	if result.Actual == "claude" {
+		t.Fatalf("RouteProvider selected API provider in free mode: %q", result.Actual)
+	}
+}
+
+func TestModeRouting_ChatWithAdaptiveFallbackUsesQualitySignal(t *testing.T) {
+	const runs = 40
+	geminiWins := 0
+
+	for i := 0; i < runs; i++ {
+		r := makeRouter(t, ModeBalanced, map[string]*stubProvider{
+			"codex":  {name: "codex", available: true, failChat: true}, // requested provider fails
+			"claude": {name: "claude", available: true},
+			"gemini": {name: "gemini", available: true},
+		})
+		r.accessTypes["codex"] = AccessSubscription
+		r.accessTypes["claude"] = AccessSubscription
+		r.accessTypes["gemini"] = AccessSubscription
+
+		// PhaseFix static fallback order prefers claude before gemini.
+		// Strong quality data should make adaptive fallback pick gemini most of the time.
+		for j := 0; j < 30; j++ {
+			r.usage.RecordQualityOutcome(PhaseFix, "gemini", true)
+		}
+		for j := 0; j < 20; j++ {
+			r.usage.RecordQualityOutcome(PhaseFix, "claude", false)
+		}
+
+		_, _, route, err := r.ChatWith(context.Background(), "codex", PhaseFix,
+			[]Message{{Role: "user", Content: "fix failing go test"}},
+			"You are a fixer.")
+		if err != nil {
+			t.Fatalf("ChatWith error = %v", err)
+		}
+		if route.Actual == "gemini" {
+			geminiWins++
+		}
+	}
+
+	if geminiWins < runs*7/10 {
+		t.Fatalf("adaptive fallback chose gemini %d/%d times; want >= %d",
+			geminiWins, runs, runs*7/10)
+	}
+}
+
 // --- Thompson Sampling convergence test ---
 
 func TestModeRouting_ThompsonSamplingConvergesWithQualityData(t *testing.T) {
