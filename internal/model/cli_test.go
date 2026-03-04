@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -241,5 +242,86 @@ func TestCLIProvider_Chat_DoesNotRetryNonTransientError(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Fatalf("attempts = %d, want 1 (no retry for permanent error)", attempts)
+	}
+}
+
+func TestCLIProvider_IsAvailable_UsesHealthProbe(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "probe-ok.sh")
+	body := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then\n" +
+		"  echo ok\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewClaudeCLI(script)
+	if !p.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true for healthy probe")
+	}
+}
+
+func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "probe-hang.sh")
+	body := "#!/bin/sh\n" +
+		"sleep 10\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := &CLIProvider{
+		name:     "hang-cli",
+		binPath:  script,
+		provider: "hang",
+		checkCmd: func(ctx context.Context) *exec.Cmd {
+			return exec.CommandContext(ctx, script)
+		},
+	}
+
+	start := time.Now()
+	if p.IsAvailable() {
+		t.Fatal("IsAvailable() = true, want false when probe hangs")
+	}
+	elapsed := time.Since(start)
+	if elapsed > cliAvailProbeTimeout+2*time.Second {
+		t.Fatalf("IsAvailable() took too long: %s", elapsed)
+	}
+}
+
+func TestApplyGeminiProxyPolicy_DefaultRespectsConfiguredProxy(t *testing.T) {
+	t.Setenv("MAKEWAND_GEMINI_USE_PROXY", "")
+	t.Setenv("MAKEWAND_GEMINI_BYPASS_PROXY", "")
+
+	env := []string{"HTTP_PROXY=http://127.0.0.1:7890"}
+	got := applyGeminiProxyPolicy(env)
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, "NO_PROXY=googleapis.com") || strings.Contains(joined, "no_proxy=googleapis.com") {
+		t.Fatalf("applyGeminiProxyPolicy() should not force NO_PROXY when proxy is configured; got %q", joined)
+	}
+}
+
+func TestApplyGeminiProxyPolicy_DefaultBypassesWhenNoProxyConfigured(t *testing.T) {
+	t.Setenv("MAKEWAND_GEMINI_USE_PROXY", "")
+	t.Setenv("MAKEWAND_GEMINI_BYPASS_PROXY", "")
+
+	got := applyGeminiProxyPolicy([]string{"PATH=/usr/bin"})
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "NO_PROXY=googleapis.com") && !strings.Contains(joined, "no_proxy=googleapis.com") {
+		t.Fatalf("applyGeminiProxyPolicy() should append NO_PROXY when no proxy is configured; got %q", joined)
+	}
+}
+
+func TestApplyGeminiProxyPolicy_ExplicitBypassOverridesProxy(t *testing.T) {
+	t.Setenv("MAKEWAND_GEMINI_USE_PROXY", "")
+	t.Setenv("MAKEWAND_GEMINI_BYPASS_PROXY", "1")
+
+	got := applyGeminiProxyPolicy([]string{"HTTP_PROXY=http://127.0.0.1:7890"})
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "NO_PROXY=googleapis.com") && !strings.Contains(joined, "no_proxy=googleapis.com") {
+		t.Fatalf("applyGeminiProxyPolicy() should force NO_PROXY when bypass is set; got %q", joined)
 	}
 }
