@@ -13,8 +13,7 @@ import (
 	"github.com/makewand/makewand/internal/model"
 )
 
-// Headless test of the multi-model build pipeline:
-//   Plan (gemini) → Code (claude) → Review (gemini) → Fix (codex)
+// Headless test of the multi-model build pipeline using adaptive routing.
 
 var requestTimeout = flag.Duration("timeout", 60*time.Second, "per-step timeout for live provider calls")
 
@@ -52,8 +51,8 @@ func main() {
 	}
 	fmt.Println()
 
-	// Phase 1: Route decision table for build phases
-	fmt.Println("═══ 1. Build Phase Route Table ═══")
+	// Phase 1: Adaptive route decision table for build phases
+	fmt.Println("═══ 1. Adaptive Route Table ═══")
 	fmt.Println()
 
 	phases := []struct {
@@ -79,8 +78,8 @@ func main() {
 
 		row := fmt.Sprintf("  %-16s", mode.String())
 		for _, p := range phases {
-			primary := r.BuildProviderFor(p.phase)
-			result, err := r.RouteProvider(primary, p.phase)
+			requested := r.BuildProviderForAdaptive(p.phase)
+			result, err := r.RouteProvider(requested, p.phase)
 			if err != nil {
 				row += fmt.Sprintf("│ %-18s", "✗ "+truncate(err.Error(), 14))
 			} else {
@@ -95,23 +94,35 @@ func main() {
 	}
 	fmt.Println()
 
-	// Phase 2: Cross-model verification (ensure Review ≠ Code, Fix ≠ Code)
-	fmt.Println("═══ 2. Cross-model Verification ═══")
+	// Phase 2: Cross-model verification in adaptive routing
+	fmt.Println("═══ 2. Cross-model Verification (Adaptive) ═══")
 	fmt.Println()
 	allOK := true
 	for _, mode := range modes {
 		cfg.UsageMode = mode.String()
 		r := model.NewRouter(cfg)
 
-		codeProv := r.BuildProviderFor(model.PhaseCode)
-		reviewProv := r.BuildProviderFor(model.PhaseReview)
-		fixProv := r.BuildProviderFor(model.PhaseFix)
+		codeProv := r.BuildProviderForAdaptive(model.PhaseCode)
+		reviewReq := r.BuildProviderForAdaptive(model.PhaseReview)
+		fixReq := r.BuildProviderForAdaptive(model.PhaseFix)
+
+		reviewRes, reviewErr := r.RouteProvider(reviewReq, model.PhaseReview, codeProv)
+		reviewProv := reviewReq
+		if reviewErr == nil {
+			reviewProv = reviewRes.Actual
+		}
+
+		fixRes, fixErr := r.RouteProvider(fixReq, model.PhaseFix, codeProv)
+		fixProv := fixReq
+		if fixErr == nil {
+			fixProv = fixRes.Actual
+		}
 
 		crossReview := codeProv != reviewProv
 		crossFix := codeProv != fixProv
 
 		status := "✓"
-		if !crossReview || !crossFix {
+		if !crossReview || !crossFix || reviewErr != nil || fixErr != nil {
 			status = "✗"
 			allOK = false
 		}
@@ -133,11 +144,10 @@ func main() {
 	cfg.UsageMode = "balanced"
 	router = model.NewRouter(cfg)
 
-	// Step 1: Plan
+	// Step 1: Plan (adaptive)
 	fmt.Print("  [1/4] Plan... ")
-	planProvider := router.BuildProviderFor(model.PhasePlan)
 	start := time.Now()
-	planContent, planUsage, planResult, err := callChatWith(router, *requestTimeout, planProvider, model.PhasePlan,
+	planContent, planUsage, planResult, err := callChatBest(router, *requestTimeout, model.PhasePlan,
 		[]model.Message{{Role: "user", Content: "I want to create a simple calculator web app with HTML/CSS/JS. Provide a brief plan with file structure. Keep it very short."}},
 		"You are a friendly project planner. Be very concise.")
 	elapsed := time.Since(start)
@@ -148,11 +158,10 @@ func main() {
 	fmt.Printf("✓ %s (%.1fs, %d tokens)\n", planResult.Actual, elapsed.Seconds(), planUsage.InputTokens+planUsage.OutputTokens)
 	printTruncated(planContent, 3)
 
-	// Step 2: Code Gen
+	// Step 2: Code Gen (adaptive)
 	fmt.Print("  [2/4] Code... ")
-	codeProvider := router.BuildProviderFor(model.PhaseCode)
 	start = time.Now()
-	codeContent, codeUsage, codeResult, err := callChatWith(router, *requestTimeout, codeProvider, model.PhaseCode,
+	codeContent, codeUsage, codeResult, err := callChatBest(router, *requestTimeout, model.PhaseCode,
 		[]model.Message{{Role: "user", Content: "Create a simple calculator web app. Output 2-3 files max. Use this format:\n\n--- FILE: path/to/file ---\n```\ncontent\n```\n\nKeep it minimal."}},
 		"You are an expert programmer. Generate working code. Be concise.")
 	elapsed = time.Since(start)
@@ -173,27 +182,18 @@ func main() {
 	}
 	fmt.Println()
 
-	// Step 3: Review
+	// Step 3: Review (adaptive, forced cross-model via exclude)
 	fmt.Print("  [3/4] Review... ")
-	reviewProvider := router.BuildProviderFor(model.PhaseReview)
-	if reviewProvider == codeResult.Actual {
-		// Force different provider
-		for _, fb := range []string{"gemini", "codex", "ollama", "claude"} {
-			if fb != codeResult.Actual {
-				reviewProvider = fb
-				break
-			}
-		}
-	}
 
 	reviewPrompt := fmt.Sprintf(
 		"Review the following code for bugs and issues. If code is fine, respond with: LGTM\n\nIf issues exist, output corrected files using:\n--- FILE: path ---\n```\ncontent\n```\n\n%s",
 		codeContent)
 
 	start = time.Now()
-	reviewContent, reviewUsage, reviewResult, reviewErr := callChatWith(router, *requestTimeout, reviewProvider, model.PhaseReview,
+	reviewContent, reviewUsage, reviewResult, reviewErr := callChatBest(router, *requestTimeout, model.PhaseReview,
 		[]model.Message{{Role: "user", Content: reviewPrompt}},
-		"You are an expert code reviewer. Be concise.")
+		"You are an expert code reviewer. Be concise.",
+		codeResult.Actual)
 	elapsed = time.Since(start)
 	if reviewErr != nil {
 		fmt.Printf("✗ %v\n", reviewErr)
@@ -208,22 +208,14 @@ func main() {
 		fmt.Printf("✓ %s → %s (%.1fs, %d tokens)\n", reviewResult.Actual, status, elapsed.Seconds(), reviewUsage.InputTokens+reviewUsage.OutputTokens)
 	}
 
-	// Step 4: Fix (simulate with a fake error)
+	// Step 4: Fix (adaptive, forced cross-model via exclude)
 	fmt.Print("  [4/4] Fix (dry run)... ")
-	fixProvider := router.BuildProviderFor(model.PhaseFix)
-	if fixProvider == codeResult.Actual {
-		for _, fb := range []string{"codex", "gemini", "ollama", "claude"} {
-			if fb != codeResult.Actual {
-				fixProvider = fb
-				break
-			}
-		}
-	}
 
 	start = time.Now()
-	_, fixUsage, fixResult, fixErr := callChatWith(router, *requestTimeout, fixProvider, model.PhaseFix,
+	_, fixUsage, fixResult, fixErr := callChatBest(router, *requestTimeout, model.PhaseFix,
 		[]model.Message{{Role: "user", Content: "The following test error occurred:\n\n```\nReferenceError: calculate is not defined\n```\n\nFix the code. Output corrected file using:\n--- FILE: path ---\n```\ncontent\n```"}},
-		"You are an expert programmer fixing errors. Be concise.")
+		"You are an expert programmer fixing errors. Be concise.",
+		codeResult.Actual)
 	elapsed = time.Since(start)
 	if fixErr != nil {
 		fmt.Printf("✗ %v\n", fixErr)
@@ -254,10 +246,9 @@ func main() {
 	fmt.Println("═══ Done ═══")
 }
 
-func callChatWith(
+func callChatBest(
 	router *model.Router,
 	timeout time.Duration,
-	name string,
 	phase model.BuildPhase,
 	messages []model.Message,
 	system string,
@@ -265,7 +256,7 @@ func callChatWith(
 ) (string, model.Usage, model.RouteResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return router.ChatWith(ctx, name, phase, messages, system, exclude...)
+	return router.ChatBest(ctx, phase, messages, system, exclude...)
 }
 
 func truncate(s string, max int) string {

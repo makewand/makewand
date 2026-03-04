@@ -109,7 +109,7 @@ func main() {
 		router := model.NewRouter(cfg)
 		ctx := context.Background()
 
-		codeProvider := router.BuildProviderFor(model.PhaseCode)
+		codeProvider := router.BuildProviderForAdaptive(model.PhaseCode)
 		fmt.Printf("  Code provider: %s\n", codeProvider)
 
 		r := modeResult{mode: m.name, tier: m.tier}
@@ -117,7 +117,7 @@ func main() {
 		// Generate
 		fmt.Print("  Generating... ")
 		start := time.Now()
-		content, usage, result, err := router.ChatWith(ctx, codeProvider, model.PhaseCode,
+		content, usage, result, err := callChatBestWithTimeout(ctx, router, 3*time.Minute, model.PhaseCode,
 			[]model.Message{{Role: "user", Content: codePrompt}}, codeSystem)
 		r.elapsed = time.Since(start)
 
@@ -135,7 +135,7 @@ func main() {
 		if len(parsed.Files) == 0 {
 			fmt.Print("  No files parsed, retrying with strict format... ")
 			retryStart := time.Now()
-			retryContent, retryUsage, retryResult, retryErr := retryCodeOutputForFiles(ctx, router, result.Actual, codePrompt, content)
+			retryContent, retryUsage, retryResult, retryErr := retryCodeOutputForFiles(ctx, router, codePrompt, content)
 			retryElapsed := time.Since(retryStart)
 			r.elapsed += retryElapsed
 			if retryErr != nil {
@@ -189,22 +189,14 @@ func main() {
 		}
 
 		// Cross-model review — use a DIFFERENT provider than the one that wrote code
-		reviewProvider := router.BuildProviderFor(model.PhaseReview)
-		if reviewProvider == finalResult.Actual {
-			for _, fb := range []string{"gemini", "claude", "codex", "ollama"} {
-				if fb != finalResult.Actual {
-					reviewProvider = fb
-					break
-				}
-			}
-		}
-
+		reviewProvider := router.BuildProviderForAdaptive(model.PhaseReview)
 		fmt.Printf("  Reviewing (%s → %s)... ", finalResult.Actual, reviewProvider)
 		rPrompt := fmt.Sprintf(reviewPrompt, content)
 		start = time.Now()
-		reviewContent, _, reviewResult, rerr := router.ChatWith(ctx, reviewProvider, model.PhaseReview,
+		reviewContent, _, reviewResult, rerr := callChatBestWithTimeout(ctx, router, 3*time.Minute, model.PhaseReview,
 			[]model.Message{{Role: "user", Content: rPrompt}},
-			"You are a senior code reviewer. Be honest and concise. Rate strictly.")
+			"You are a senior code reviewer. Be honest and concise. Rate strictly.",
+			finalResult.Actual)
 		r.reviewElapsed = time.Since(start)
 
 		if rerr != nil {
@@ -320,7 +312,6 @@ func main() {
 func retryCodeOutputForFiles(
 	ctx context.Context,
 	router *model.Router,
-	provider string,
 	originalPrompt string,
 	previousOutput string,
 ) (string, model.Usage, model.RouteResult, error) {
@@ -335,13 +326,28 @@ func retryCodeOutputForFiles(
 		trimForRetryPrompt(previousOutput, 3000),
 	)
 
-	return router.ChatWith(
+	return callChatBestWithTimeout(
 		ctx,
-		provider,
+		router,
+		3*time.Minute,
 		model.PhaseCode,
 		[]model.Message{{Role: "user", Content: retryPrompt}},
 		codeSystem,
 	)
+}
+
+func callChatBestWithTimeout(
+	baseCtx context.Context,
+	router *model.Router,
+	timeout time.Duration,
+	phase model.BuildPhase,
+	messages []model.Message,
+	system string,
+	exclude ...string,
+) (string, model.Usage, model.RouteResult, error) {
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
+	defer cancel()
+	return router.ChatBest(ctx, phase, messages, system, exclude...)
 }
 
 func trimForRetryPrompt(s string, max int) string {

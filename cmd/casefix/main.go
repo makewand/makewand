@@ -130,8 +130,6 @@ func fixMode(cfg *config.Config, root, caseID string, mode model.UsageMode) mode
 	cfgCopy := *cfg
 	cfgCopy.UsageMode = mode.String()
 	router := model.NewRouter(&cfgCopy)
-	provider := router.BuildProviderFor(model.PhaseCode)
-	rep.Provider = provider
 
 	projectContext := collectProjectFiles(projectDir, 64*1024)
 	prompt := buildModeFixPrompt(mode, beforeOut, projectContext)
@@ -139,7 +137,7 @@ func fixMode(cfg *config.Config, root, caseID string, mode model.UsageMode) mode
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	content, _, _, chatErr := router.ChatWith(ctx, provider, model.PhaseFix,
+	content, usage, result, chatErr := router.ChatBest(ctx, model.PhaseFix,
 		[]model.Message{{Role: "user", Content: prompt}}, goFixSystemPrompt)
 	rep.AttemptedFix = true
 	if chatErr != nil {
@@ -147,6 +145,11 @@ func fixMode(cfg *config.Config, root, caseID string, mode model.UsageMode) mode
 		rep.AfterTestOutput = beforeOut
 		rep.AfterPassed = false
 		return rep
+	}
+	if result.Actual != "" {
+		rep.Provider = result.Actual
+	} else {
+		rep.Provider = usage.Provider
 	}
 
 	parsed := engine.ParseFilesBestEffort(content)
