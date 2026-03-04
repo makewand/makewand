@@ -53,6 +53,8 @@ type App struct {
 	cfg     *config.Config
 	router  *model.Router
 	project *engine.Project
+	// initialPrompt is optionally auto-submitted when chat mode starts.
+	initialPrompt string
 
 	// UI components
 	chat     ChatPanel
@@ -201,6 +203,11 @@ type progressUpdateMsg struct {
 // resumeTestsPhaseMsg asks the app to enter test phase after auto-fix/deps stages.
 type resumeTestsPhaseMsg struct{}
 
+// startPromptMsg submits an initial chat input at startup.
+type startPromptMsg struct {
+	input string
+}
+
 // NewApp creates a new App.
 func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 	router := model.NewRouter(cfg)
@@ -235,10 +242,18 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 
 // Init implements tea.Model.
 func (a App) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		a.spinner.Tick,
 		tea.WindowSize(),
-	)
+	}
+	if a.mode == ModeChat {
+		if prompt := strings.TrimSpace(a.initialPrompt); prompt != "" {
+			cmds = append(cmds, func() tea.Msg {
+				return startPromptMsg{input: prompt}
+			})
+		}
+	}
+	return tea.Batch(cmds...)
 }
 
 // Update implements tea.Model.
@@ -317,6 +332,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case aiResponseMsg:
 		return a.handleAIResponse(msg)
+
+	case startPromptMsg:
+		return a.submitChatInput(msg.input)
 
 	case aiStreamStartMsg:
 		a.streamCh = msg.ch
@@ -569,7 +587,13 @@ func isLGTMResponse(content string) bool {
 
 // Run starts the Bubble Tea program.
 func Run(mode Mode, cfg *config.Config, projectPath string, debug bool) error {
+	return RunWithPrompt(mode, cfg, projectPath, "", debug)
+}
+
+// RunWithPrompt starts the Bubble Tea program with an optional initial chat prompt.
+func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt string, debug bool) error {
 	app := NewApp(mode, cfg, projectPath)
+	app.initialPrompt = strings.TrimSpace(initialPrompt)
 
 	if debug {
 		routeState := newRouteDebugState()

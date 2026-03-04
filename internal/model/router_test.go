@@ -300,8 +300,9 @@ func TestRouteByMode_CustomProviderAccessAPIExcludedInFreeMode(t *testing.T) {
 	if err == nil {
 		t.Fatal("Route(TaskCode) error = nil, want no provider available in free mode")
 	}
-	if !strings.Contains(err.Error(), "no AI model available for mode") {
-		t.Fatalf("Route(TaskCode) error = %q, want mode routing failure", err.Error())
+	if !strings.Contains(err.Error(), "free mode requires at least one free/local provider") &&
+		!strings.Contains(err.Error(), "no AI model available for mode") {
+		t.Fatalf("Route(TaskCode) error = %q, want strict-free routing failure", err.Error())
 	}
 }
 

@@ -22,15 +22,25 @@ func (a App) handleChatEnter() (tea.Model, tea.Cmd) {
 	if input == "" {
 		return a, nil
 	}
+	a.chat.ClearInput()
+	return a.submitChatInput(input)
+}
 
-	// Handle /mode command locally (don't send to AI)
+func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
+	if a.streamCh != nil || a.chat.streaming {
+		return a, nil
+	}
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return a, nil
+	}
+
+	// Handle /mode command locally (don't send to AI).
 	if strings.HasPrefix(strings.ToLower(input), "/mode") {
-		a.chat.ClearInput()
 		return a.handleModeCommand(input)
 	}
 
 	a.chat.AddMessage(ChatMessage{Role: "user", Content: input})
-	a.chat.ClearInput()
 	a.chat.SetStreaming(true)
 	a = a.applyBudgetRoutingPolicy()
 
@@ -40,6 +50,31 @@ func (a App) handleChatEnter() (tea.Model, tea.Cmd) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), chatStreamTimeout)
 	a.cancelAI = cancel
+
+	// In power mode, chat uses multi-model ensemble + judge (ChatBest).
+	// Other modes keep low-latency stream-first behavior.
+	if a.router.ModeSet() && a.router.Mode() == model.ModePower {
+		phase := chatTaskToBuildPhase(task)
+		cmd := func() tea.Msg {
+			defer cancel()
+			content, usage, result, err := a.router.ChatBest(ctx, phase, messages, systemPrompt)
+			if err != nil {
+				return aiResponseMsg{err: err}
+			}
+			provider := result.Actual
+			if provider == "" {
+				provider = usage.Provider
+			}
+			return aiResponseMsg{
+				content:      content,
+				provider:     provider,
+				cost:         usage.Cost,
+				inputTokens:  usage.InputTokens,
+				outputTokens: usage.OutputTokens,
+			}
+		}
+		return a, cmd
+	}
 
 	cmd := func() tea.Msg {
 		defer cancel()
@@ -159,4 +194,17 @@ func classifyTask(input string) model.TaskType {
 	}
 
 	return model.TaskCode
+}
+
+func chatTaskToBuildPhase(task model.TaskType) model.BuildPhase {
+	switch task {
+	case model.TaskCode:
+		return model.PhaseCode
+	case model.TaskReview:
+		return model.PhaseReview
+	case model.TaskFix:
+		return model.PhaseFix
+	default:
+		return model.PhasePlan
+	}
 }

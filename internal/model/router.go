@@ -429,6 +429,20 @@ func (r *Router) routeByMode(task TaskType) (RouteResult, error) {
 		Requested:  requested,
 		Candidates: toTraceCandidates(candidates),
 	})
+	if len(candidates) == 0 {
+		msg := fmt.Sprintf("no AI model available for mode %q; configure one with 'makewand setup'", r.effectiveMode())
+		if r.effectiveMode() == ModeFree {
+			msg = "free mode requires at least one free/local provider (e.g. Gemini free API or Ollama local model)"
+		}
+		r.emitTrace(TraceEvent{
+			Event:     "route_failed",
+			Task:      taskTypeName(task),
+			Phase:     buildPhaseName(phase),
+			Requested: requested,
+			Error:     msg,
+		})
+		return RouteResult{}, fmt.Errorf("%s", msg)
+	}
 
 	// Try each candidate
 	for _, c := range candidates {
@@ -576,8 +590,8 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 
 		access := r.accessTypes[provName]
 
-		// Free mode: never use API-only providers, even for fallback.
-		if r.effectiveMode() == ModeFree && access == AccessAPI {
+		// Free mode (strict): only free/local providers are allowed.
+		if r.effectiveMode() == ModeFree && access != AccessFree && access != AccessLocal {
 			continue
 		}
 
@@ -682,7 +696,7 @@ func (r *Router) RegisterProvider(name string, provider Provider, access AccessT
 }
 
 // Available returns all available provider names, filtered by the effective mode.
-// In ModeFree, API-only providers are excluded to match the routing strategy.
+// In ModeFree, only free/local providers are returned to match strict free routing.
 // Results are cached to avoid repeated health checks (e.g. Ollama) on every render cycle.
 func (r *Router) Available() []string {
 	r.mu.Lock()
@@ -696,7 +710,7 @@ func (r *Router) Available() []string {
 	var names []string
 	for name, p := range r.providers {
 		if p.IsAvailable() {
-			if mode == ModeFree && r.accessTypes[name] == AccessAPI {
+			if mode == ModeFree && r.accessTypes[name] != AccessFree && r.accessTypes[name] != AccessLocal {
 				continue
 			}
 			if blocked, _ := r.isCircuitOpen(name); blocked {
@@ -1018,8 +1032,8 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 	candidates := make([]candidate, 0, len(orderedProviders))
 	for i, provName := range orderedProviders {
 		access := r.accessTypes[provName]
-		// Free mode: hard-filter API providers for all build phases.
-		if mode == ModeFree && access == AccessAPI {
+		// Free mode (strict): only free/local providers are allowed.
+		if mode == ModeFree && access != AccessFree && access != AccessLocal {
 			continue
 		}
 
@@ -1144,13 +1158,13 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 
 	// Try the requested provider first (unless excluded)
 	if !excluded[name] {
-		if r.effectiveMode() == ModeFree && r.accessTypes[name] == AccessAPI {
+		if r.effectiveMode() == ModeFree && r.accessTypes[name] != AccessFree && r.accessTypes[name] != AccessLocal {
 			r.emitTrace(TraceEvent{
 				Event:     "build_route_candidate_skipped",
 				Phase:     buildPhaseName(phase),
 				Requested: name,
 				Selected:  name,
-				Detail:    "api provider blocked in free mode",
+				Detail:    "non-free provider blocked in free mode",
 			})
 		} else if blocked, remaining := r.isCircuitOpen(name); blocked {
 			r.emitTrace(TraceEvent{

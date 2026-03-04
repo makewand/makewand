@@ -1,6 +1,11 @@
 package tui
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/model"
+)
 
 func TestIsLGTMResponse(t *testing.T) {
 	tests := []struct {
@@ -20,5 +25,20 @@ func TestIsLGTMResponse(t *testing.T) {
 				t.Fatalf("isLGTMResponse(%q) = %v, want %v", tt.input, got, tt.isLGTM)
 			}
 		})
+	}
+}
+
+func TestStartPromptMsg_SubmitsModeCommand(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.router.SetMode(model.ModeBalanced)
+
+	nextModel, _ := app.Update(startPromptMsg{input: "/mode power"})
+	next, ok := nextModel.(App)
+	if !ok {
+		t.Fatalf("Update() returned unexpected model type: %T", nextModel)
+	}
+	if got := next.router.Mode(); got != model.ModePower {
+		t.Fatalf("router mode = %v, want %v", got, model.ModePower)
 	}
 }
