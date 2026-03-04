@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/engine"
@@ -12,21 +13,43 @@ import (
 )
 
 var (
-	version   = "0.1.0"
-	debugFlag bool
+	version      = "0.1.0"
+	debugFlag    bool
+	rootModeFlag string
 )
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "makewand",
+		Use:   "makewand [prompt]",
 		Short: "AI coding assistant for everyone",
 		Long: `makewand is a terminal AI coding assistant that lets anyone
 build, modify, and deploy software through natural language conversation.
 
+  makewand         - Start interactive chat in current directory
+  makewand "..."   - Start chat and send an initial prompt
   makewand new     - Create a new project with guided wizard
   makewand chat    - Chat with AI about your project
   makewand preview - Start a preview server
   makewand setup   - Configure AI models and preferences`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
+			}
+
+			if !cfg.HasAnyModel() {
+				fmt.Println("No AI models configured. Run 'makewand setup' first.")
+				return nil
+			}
+
+			if rootModeFlag != "" {
+				cfg.UsageMode = rootModeFlag
+			}
+
+			initialPrompt := strings.TrimSpace(strings.Join(args, " "))
+			return tui.RunWithPrompt(tui.ModeChat, cfg, ".", initialPrompt, debugFlag)
+		},
 		Version: version,
 	}
 
@@ -35,6 +58,7 @@ build, modify, and deploy software through natural language conversation.
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
+	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: free, economy, balanced, power")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
