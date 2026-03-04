@@ -63,6 +63,19 @@ func TestModeRouting_FreeModeOnlyUsesNonAPIProviders(t *testing.T) {
 	}
 }
 
+func TestModeRouting_FreeModeBlocksSubscriptionProviders(t *testing.T) {
+	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+		"gemini": {name: "gemini", available: true, failChat: true},
+		"claude": {name: "claude", available: true, failChat: false},
+	})
+	r.accessTypes["claude"] = AccessSubscription
+
+	_, _, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
+	if err == nil {
+		t.Fatal("Chat() should fail: strict free mode must not use subscription provider claude")
+	}
+}
+
 func TestModeRouting_FreeModeAllowsLocalProviders(t *testing.T) {
 	r := makeRouter(t, ModeFree, map[string]*stubProvider{
 		"gemini": {name: "gemini", available: true, failChat: true},
@@ -296,6 +309,40 @@ func TestModeRouting_RouteProviderFreeModeBlocksAPIRequested(t *testing.T) {
 	}
 	if result.Actual == "claude" {
 		t.Fatalf("RouteProvider selected API provider in free mode: %q", result.Actual)
+	}
+}
+
+func TestModeRouting_RouteProviderFreeModeBlocksSubscriptionRequested(t *testing.T) {
+	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+		"gemini": {name: "gemini", available: true},
+		"claude": {name: "claude", available: true},
+	})
+	r.accessTypes["claude"] = AccessSubscription
+
+	result, err := r.RouteProvider("claude", PhaseCode)
+	if err != nil {
+		t.Fatalf("RouteProvider error = %v", err)
+	}
+	if result.Actual == "claude" {
+		t.Fatalf("RouteProvider selected subscription provider in strict free mode: %q", result.Actual)
+	}
+}
+
+func TestModeRouting_AvailableFreeModeOnlyFreeAndLocal(t *testing.T) {
+	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+		"gemini": {name: "gemini", available: true},
+		"ollama": {name: "ollama", available: true},
+		"claude": {name: "claude", available: true},
+	})
+	r.accessTypes["gemini"] = AccessFree
+	r.accessTypes["ollama"] = AccessLocal
+	r.accessTypes["claude"] = AccessSubscription
+
+	avail := r.Available()
+	for _, name := range avail {
+		if name == "claude" {
+			t.Fatalf("Available() included subscription provider in strict free mode: %v", avail)
+		}
 	}
 }
 
