@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/makewand/makewand/internal/engine"
@@ -142,6 +143,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 				if err != nil {
 					return aiResponseMsg{err: err}
 				}
+				content, usage = retryWizardBuildForMissingFiles(ctx, router, prompt, content, usage)
 				return aiResponseMsg{
 					content:      content,
 					provider:     usage.Provider,
@@ -155,6 +157,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			if err != nil {
 				return aiResponseMsg{err: err}
 			}
+			content, usage = retryWizardBuildForMissingFiles(ctx, router, prompt, content, usage)
 
 			return aiResponseMsg{
 				content:      content,
@@ -167,4 +170,60 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 	}
 
 	return a, nil
+}
+
+// retryWizardBuildForMissingFiles performs one strict-format retry when the
+// code-generation response contains no writable file blocks.
+func retryWizardBuildForMissingFiles(
+	ctx context.Context,
+	router *model.Router,
+	originalPrompt string,
+	content string,
+	usage model.Usage,
+) (string, model.Usage) {
+	if router == nil {
+		return content, usage
+	}
+	if len(engine.ParseFilesBestEffort(content).Files) > 0 {
+		return content, usage
+	}
+
+	retryPrompt := buildWizardCodeFormatRetryPrompt(originalPrompt, content)
+	retryMessages := []model.Message{{Role: "user", Content: retryPrompt}}
+	retrySystem := wizardBuildSystemPrompt + "\n\n" + wizardBuildRetryRules
+
+	var (
+		retryContent string
+		retryUsage   model.Usage
+		err          error
+	)
+
+	// Prefer retrying with the same provider that produced the non-file response.
+	if router.ModeSet() {
+		preferred := strings.TrimSpace(usage.Provider)
+		if preferred != "" {
+			retryContent, retryUsage, _, err = router.ChatWith(ctx, preferred, model.PhaseCode, retryMessages, retrySystem)
+		}
+		if preferred == "" || err != nil {
+			retryContent, retryUsage, _, err = router.ChatBest(ctx, model.PhaseCode, retryMessages, retrySystem)
+		}
+	} else {
+		retryContent, retryUsage, _, err = router.Chat(ctx, model.TaskCode, retryMessages, retrySystem)
+	}
+	if err != nil || len(engine.ParseFilesBestEffort(retryContent).Files) == 0 {
+		return content, usage
+	}
+
+	total := usage
+	total.InputTokens += retryUsage.InputTokens
+	total.OutputTokens += retryUsage.OutputTokens
+	total.Cost += retryUsage.Cost
+	if retryUsage.Provider != "" {
+		total.Provider = retryUsage.Provider
+	}
+	if retryUsage.Model != "" {
+		total.Model = retryUsage.Model
+	}
+
+	return retryContent, total
 }
