@@ -70,6 +70,7 @@ build, modify, and deploy software through natural language conversation.
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())
+	rootCmd.AddCommand(doctorCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: free, economy, balanced, power")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
@@ -334,6 +335,10 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration) e
 	}
 
 	router := model.NewRouter(cfg)
+	configDir, dirErr := config.ConfigDir()
+	if dirErr == nil {
+		_ = router.LoadStats(configDir)
+	}
 	task := classifyPromptTask(prompt)
 	messages := []model.Message{{Role: "user", Content: prompt}}
 	systemPrompt := "You are makewand, an expert software engineering assistant. Provide direct, actionable answers."
@@ -358,6 +363,9 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration) e
 	}
 	if err != nil {
 		return err
+	}
+	if dirErr == nil {
+		_ = router.SaveStats(configDir)
 	}
 
 	provider := strings.TrimSpace(route.Actual)

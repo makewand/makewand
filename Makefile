@@ -3,7 +3,7 @@ VERSION=0.1.0
 BUILD_DIR=build
 MAIN_PKG=./cmd/makewand
 
-.PHONY: all build run clean test install
+.PHONY: all build run clean test install prelaunch
 
 all: build
 
@@ -51,3 +51,6 @@ vet:
 	go vet ./...
 
 lint: fmt vet
+
+prelaunch:
+	./scripts/prelaunch_gate.sh
