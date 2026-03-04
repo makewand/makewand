@@ -1,21 +1,26 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/engine"
+	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/tui"
 	"github.com/spf13/cobra"
 )
 
 var (
-	version      = "0.1.0"
-	debugFlag    bool
-	rootModeFlag string
+	version         = "0.1.0"
+	debugFlag       bool
+	rootModeFlag    string
+	rootPrintFlag   bool
+	rootTimeoutFlag time.Duration
 )
 
 func main() {
@@ -27,6 +32,7 @@ build, modify, and deploy software through natural language conversation.
 
   makewand         - Start interactive chat in current directory
   makewand "..."   - Start chat and send an initial prompt
+  makewand --print "..." - Run one prompt and print the result (CI/headless)
   makewand new     - Create a new project with guided wizard
   makewand chat    - Chat with AI about your project
   makewand preview - Start a preview server
@@ -48,6 +54,13 @@ build, modify, and deploy software through natural language conversation.
 			}
 
 			initialPrompt := strings.TrimSpace(strings.Join(args, " "))
+			if shouldUseHeadless(initialPrompt, rootPrintFlag, isInteractiveTerminal()) {
+				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag)
+			}
+			if initialPrompt == "" && !isInteractiveTerminal() {
+				return fmt.Errorf("interactive TTY not detected; provide a prompt or use --print")
+			}
+
 			return tui.RunWithPrompt(tui.ModeChat, cfg, ".", initialPrompt, debugFlag)
 		},
 		Version: version,
@@ -59,6 +72,8 @@ build, modify, and deploy software through natural language conversation.
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: free, economy, balanced, power")
+	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
+	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 2*time.Minute, "timeout for --print one-shot execution")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -287,4 +302,137 @@ func accessDisplay(configured, defaultValue string) string {
 		return configured
 	}
 	return defaultValue + " (default)"
+}
+
+func shouldUseHeadless(prompt string, printFlag bool, interactiveTTY bool) bool {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return false
+	}
+	return printFlag || !interactiveTTY
+}
+
+func isInteractiveTerminal() bool {
+	return isCharDevice(os.Stdin) && isCharDevice(os.Stdout)
+}
+
+func isCharDevice(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration) error {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return fmt.Errorf("prompt is empty")
+	}
+
+	router := model.NewRouter(cfg)
+	task := classifyPromptTask(prompt)
+	messages := []model.Message{{Role: "user", Content: prompt}}
+	systemPrompt := "You are makewand, an expert software engineering assistant. Provide direct, actionable answers."
+
+	ctx := context.Background()
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+
+	var (
+		content string
+		usage   model.Usage
+		route   model.RouteResult
+		err     error
+	)
+	if router.ModeSet() && router.Mode() == model.ModePower {
+		content, usage, route, err = router.ChatBest(ctx, promptTaskToBuildPhase(task), messages, systemPrompt)
+	} else {
+		content, usage, route, err = router.Chat(ctx, task, messages, systemPrompt)
+	}
+	if err != nil {
+		return err
+	}
+
+	provider := strings.TrimSpace(route.Actual)
+	if provider == "" {
+		provider = strings.TrimSpace(usage.Provider)
+	}
+	modelID := strings.TrimSpace(route.ModelID)
+	if modelID == "" {
+		modelID = strings.TrimSpace(usage.Model)
+	}
+	if provider != "" {
+		if modelID != "" {
+			fmt.Fprintf(os.Stderr, "[makewand] provider=%s model=%s\n", provider, modelID)
+		} else {
+			fmt.Fprintf(os.Stderr, "[makewand] provider=%s\n", provider)
+		}
+	}
+
+	fmt.Println(strings.TrimSpace(content))
+	return nil
+}
+
+func classifyPromptTask(input string) model.TaskType {
+	lower := strings.ToLower(input)
+
+	if strings.HasPrefix(lower, "/review") {
+		return model.TaskReview
+	}
+	if strings.HasPrefix(lower, "/fix") {
+		return model.TaskFix
+	}
+	if strings.HasPrefix(lower, "/ask") || strings.HasPrefix(lower, "/explain") {
+		return model.TaskExplain
+	}
+	if strings.HasPrefix(lower, "/plan") {
+		return model.TaskAnalyze
+	}
+
+	reviewKeywords := []string{"review", "check", "audit"}
+	for _, kw := range reviewKeywords {
+		if strings.Contains(lower, kw) {
+			return model.TaskReview
+		}
+	}
+	fixKeywords := []string{"fix", "bug", "error"}
+	for _, kw := range fixKeywords {
+		if strings.Contains(lower, kw) {
+			return model.TaskFix
+		}
+	}
+	explainKeywords := []string{"explain", "why", "how does"}
+	for _, kw := range explainKeywords {
+		if strings.Contains(lower, kw) {
+			return model.TaskExplain
+		}
+	}
+	analyzeKeywords := []string{"plan", "analyze", "design"}
+	for _, kw := range analyzeKeywords {
+		if strings.Contains(lower, kw) {
+			return model.TaskAnalyze
+		}
+	}
+
+	return model.TaskCode
+}
+
+func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {
+	switch task {
+	case model.TaskCode:
+		return model.PhaseCode
+	case model.TaskReview:
+		return model.PhaseReview
+	case model.TaskFix:
+		return model.PhaseFix
+	default:
+		return model.PhasePlan
+	}
 }
