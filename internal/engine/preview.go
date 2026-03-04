@@ -6,6 +6,15 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"time"
+)
+
+var (
+	previewCommandContext = exec.CommandContext
+	previewFindFreePort   = findFreePort
+	previewWaitForPort    = waitForPreviewPort
+	previewDialTimeout    = net.DialTimeout
+	previewReadyTimeout   = 12 * time.Second
 )
 
 // PreviewServer manages a development preview server.
@@ -66,7 +75,7 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		}
 	}
 
-	port, err := findFreePort()
+	port, err := previewFindFreePort()
 	if err != nil {
 		return nil, fmt.Errorf("find free port: %w", err)
 	}
@@ -109,7 +118,7 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		command = wrappedCommand
 		args = wrappedArgs
 	}
-	cmd := exec.CommandContext(ctx, command, args...)
+	cmd := previewCommandContext(ctx, command, args...)
 
 	cmd.Dir = p.Path
 	cmd.Env = append(sanitizeExecEnv(cmd.Environ()),
@@ -122,6 +131,12 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start preview server: %w", err)
+	}
+	if err := previewWaitForPort(ctx, port, previewReadyTimeout); err != nil {
+		cancel()
+		killProcessGroup(cmd)
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("preview server did not become ready on 127.0.0.1:%d: %w", port, err)
 	}
 
 	return server, nil
@@ -155,4 +170,35 @@ func findFreePort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func waitForPreviewPort(ctx context.Context, port int, timeout time.Duration) error {
+	if port <= 0 {
+		return fmt.Errorf("invalid preview port %d", port)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	lastErr := error(nil)
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		conn, err := previewDialTimeout("tcp", addr, 250*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+
+		select {
+		case <-waitCtx.Done():
+			if lastErr == nil {
+				lastErr = waitCtx.Err()
+			}
+			return fmt.Errorf("timed out after %s: %w", timeout, lastErr)
+		case <-ticker.C:
+		}
+	}
 }
