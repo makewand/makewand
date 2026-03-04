@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ type CLIProvider struct {
 	binPath  string // absolute path to the binary
 	provider string // display name: "claude", "gemini", "codex"
 	buildCmd func(ctx context.Context, prompt string) *exec.Cmd
+	checkCmd func(ctx context.Context) *exec.Cmd
 
 	mu            sync.Mutex
 	cachedAvail   bool
@@ -28,6 +30,7 @@ type CLIProvider struct {
 }
 
 const cliAvailCacheTTL = 60 * time.Second
+const cliAvailProbeTimeout = 4 * time.Second
 const cliRequestTimeout = 5 * time.Minute
 const cliStreamTimeout = 10 * time.Minute
 const cliMaxAttempts = 2
@@ -58,6 +61,11 @@ func NewClaudeCLI(binPath string) *CLIProvider {
 		cmd.Env = filterEnv(cmd.Environ(), "CLAUDECODE")
 		return cmd
 	}
+	p.checkCmd = func(ctx context.Context) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, binPath, "--version")
+		cmd.Env = filterEnv(cmd.Environ(), "CLAUDECODE")
+		return cmd
+	}
 	return p
 }
 
@@ -72,8 +80,12 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, binPath, "-p", prompt, "--sandbox", "false")
-		// Ensure Google API calls bypass local proxy
-		cmd.Env = ensureNoProxy(cmd.Environ())
+		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
+		return cmd
+	}
+	p.checkCmd = func(ctx context.Context) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, binPath, "--version")
+		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
 		return cmd
 	}
 	return p
@@ -90,6 +102,9 @@ func NewCodexCLI(binPath string) *CLIProvider {
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
 		return exec.CommandContext(ctx, binPath, "exec", "--skip-git-repo-check", prompt)
+	}
+	p.checkCmd = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, binPath, "--version")
 	}
 	return p
 }
@@ -138,10 +153,49 @@ func (c *CLIProvider) IsAvailable() bool {
 		return c.cachedAvail
 	}
 
-	_, err := exec.LookPath(c.binPath)
-	c.cachedAvail = err == nil
+	c.cachedAvail = c.healthCheck()
 	c.cachedAvailAt = time.Now()
 	return c.cachedAvail
+}
+
+func (c *CLIProvider) healthCheck() bool {
+	if _, err := exec.LookPath(c.binPath); err != nil {
+		return false
+	}
+
+	// Custom command providers may not have a safe version/health command;
+	// for them, PATH lookup is the availability signal.
+	if c.checkCmd == nil {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cliAvailProbeTimeout)
+	defer cancel()
+
+	cmd := c.checkCmd(ctx)
+	if cmd == nil {
+		return false
+	}
+	setCLIProcessGroup(cmd)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return false
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		return err == nil
+	case <-ctx.Done():
+		killCLIProcess(cmd)
+		<-done
+		return false
+	}
 }
 
 func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
@@ -425,8 +479,7 @@ func stripANSI(s string) string {
 	return result.String()
 }
 
-// ensureNoProxy ensures NO_PROXY includes Google API hosts, preventing
-// proxy-related TLS failures when a local HTTP proxy is configured.
+// ensureNoProxy ensures NO_PROXY includes Google API hosts.
 func ensureNoProxy(env []string) []string {
 	const googleHosts = "googleapis.com,google.com,cloudcode-pa.googleapis.com"
 
@@ -441,6 +494,57 @@ func ensureNoProxy(env []string) []string {
 	}
 	// No NO_PROXY set — add it
 	return append(env, "NO_PROXY="+googleHosts, "no_proxy="+googleHosts)
+}
+
+// applyGeminiProxyPolicy decides whether Gemini CLI should bypass proxy.
+// Default behavior:
+//   - if any proxy env var is configured, respect it
+//   - otherwise, bypass proxy for Google hosts (historical behavior)
+//
+// Explicit overrides:
+//   - MAKEWAND_GEMINI_USE_PROXY=1   => always keep proxy env untouched
+//   - MAKEWAND_GEMINI_BYPASS_PROXY=1 => always append NO_PROXY Google hosts
+func applyGeminiProxyPolicy(env []string) []string {
+	if envFlagTrue("MAKEWAND_GEMINI_USE_PROXY") {
+		return env
+	}
+	if envFlagTrue("MAKEWAND_GEMINI_BYPASS_PROXY") {
+		return ensureNoProxy(env)
+	}
+	if hasProxyEnv(env) {
+		return env
+	}
+	return ensureNoProxy(env)
+}
+
+func envFlagTrue(key string) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasProxyEnv(env []string) bool {
+	for _, e := range env {
+		switch {
+		case strings.HasPrefix(e, "HTTP_PROXY="):
+			return true
+		case strings.HasPrefix(e, "HTTPS_PROXY="):
+			return true
+		case strings.HasPrefix(e, "ALL_PROXY="):
+			return true
+		case strings.HasPrefix(e, "http_proxy="):
+			return true
+		case strings.HasPrefix(e, "https_proxy="):
+			return true
+		case strings.HasPrefix(e, "all_proxy="):
+			return true
+		}
+	}
+	return false
 }
 
 // filterEnv removes a given env var from the environment list.
