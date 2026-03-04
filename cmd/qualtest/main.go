@@ -134,7 +134,7 @@ func main() {
 		r.cost = usage.Cost
 		r.rawOutput = content
 
-		parsed := engine.ParseFiles(content)
+		parsed := engine.ParseFilesBestEffort(content)
 		r.files = parsed.Files
 
 		fmt.Printf("✓ %.1fs, %d tokens", r.elapsed.Seconds(), r.tokens)

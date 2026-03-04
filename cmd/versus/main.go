@@ -295,7 +295,7 @@ func runCLI(name, bin string, args []string) result {
 	}
 
 	r.output = stripANSI(stdout.String())
-	parsed := engine.ParseFiles(r.output)
+	parsed := engine.ParseFilesBestEffort(r.output)
 	r.files = parsed.Files
 
 	for _, f := range r.files {
@@ -364,7 +364,7 @@ func runMakewand() result {
 	} else {
 		hasIssues := !isLGTMResponse(reviewContent)
 		if hasIssues {
-			reviewParsed := engine.ParseFiles(reviewContent)
+			reviewParsed := engine.ParseFilesBestEffort(reviewContent)
 			if len(reviewParsed.Files) > 0 {
 				// Merge review fixes into code output
 				r.output = reviewContent
@@ -381,7 +381,7 @@ func runMakewand() result {
 
 	r.elapsed = time.Since(start)
 
-	parsed := engine.ParseFiles(r.output)
+	parsed := engine.ParseFilesBestEffort(r.output)
 	r.files = parsed.Files
 	for _, f := range r.files {
 		r.totalLines += strings.Count(f.Content, "\n") + 1

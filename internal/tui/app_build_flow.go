@@ -47,13 +47,18 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 		a.buildCodeProvider = msg.provider
 	}
 
-	// Check for files in non-streaming responses (build phase uses Chat, not ChatStream)
-	if a.project != nil && engine.ContainsFiles(msg.content) {
+	// Check for files in non-streaming responses (build phase uses Chat, not ChatStream).
+	if a.project != nil {
 		phase := pendingPhaseChat
 		if a.wizard.Phase() == WizardPhaseBuild {
 			phase = pendingPhaseBuild
 		}
-		result := engine.ParseFiles(msg.content)
+		var result engine.ParseResult
+		if phase == pendingPhaseBuild {
+			result = engine.ParseFilesBestEffort(msg.content)
+		} else if engine.ContainsFiles(msg.content) {
+			result = engine.ParseFiles(msg.content)
+		}
 		if len(result.Files) > 0 {
 			return a, func() tea.Msg {
 				return filesExtractedMsg{files: result.Files, phase: phase}
@@ -351,7 +356,7 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 		Cost:     msg.cost,
 	})
 
-	result := engine.ParseFiles(msg.content)
+	result := engine.ParseFilesBestEffort(msg.content)
 	if len(result.Files) == 0 {
 		// Review had comments but no file fixes — treat as LGTM
 		a.progress.SetStepStatus(stepReview, StepDone)
@@ -725,7 +730,7 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 	})
 
 	// Parse fix files
-	result := engine.ParseFiles(msg.content)
+	result := engine.ParseFilesBestEffort(msg.content)
 	if len(result.Files) == 0 {
 		a.progress.SetStepStatus(fixStepIdx, StepFailed)
 		a.chat.AddMessage(ChatMessage{

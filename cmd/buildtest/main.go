@@ -163,7 +163,7 @@ func main() {
 	fmt.Printf("✓ %s (%.1fs, %d tokens)\n", codeResult.Actual, elapsed.Seconds(), codeUsage.InputTokens+codeUsage.OutputTokens)
 
 	// Parse files from code output
-	parsed := engine.ParseFiles(codeContent)
+	parsed := engine.ParseFilesBestEffort(codeContent)
 	fmt.Printf("         Parsed %d files: ", len(parsed.Files))
 	for i, f := range parsed.Files {
 		if i > 0 {
@@ -202,7 +202,7 @@ func main() {
 		hasIssues := !isLGTMResponse(reviewContent)
 		status := "LGTM"
 		if hasIssues {
-			reviewParsed := engine.ParseFiles(reviewContent)
+			reviewParsed := engine.ParseFilesBestEffort(reviewContent)
 			status = fmt.Sprintf("%d fixes", len(reviewParsed.Files))
 		}
 		fmt.Printf("✓ %s → %s (%.1fs, %d tokens)\n", reviewResult.Actual, status, elapsed.Seconds(), reviewUsage.InputTokens+reviewUsage.OutputTokens)
