@@ -19,6 +19,15 @@ const wizardBuildSystemPrompt = "You are an expert programmer. Generate a comple
 	"--- FILE: path/to/file ---\n```\nfile content here\n```\n\n" +
 	"Generate ALL files needed for a working project."
 
+const wizardBuildRetryRules = "Important output rules:\n" +
+	"1. Output ONLY file blocks in this exact format:\n" +
+	"   --- FILE: path/to/file ---\n" +
+	"   ```\n" +
+	"   file content here\n" +
+	"   ```\n" +
+	"2. Do NOT include explanations, bullet lists, or shell commands.\n" +
+	"3. Include all files required to run the project."
+
 // buildSystemPrompt constructs the system prompt for chat mode, including the current
 // project's file tree when available.
 func buildSystemPrompt(project *engine.Project) string {
@@ -96,4 +105,30 @@ func buildWizardPlanUserPrompt(tplName, tplPrompt string) string {
 			"Keep it concise and non-technical.",
 		tplName, tplPrompt,
 	)
+}
+
+// buildWizardCodeFormatRetryPrompt asks the model to regenerate project output
+// strictly as file blocks when the previous response did not include writable
+// files.
+func buildWizardCodeFormatRetryPrompt(originalPrompt, previousOutput string) string {
+	return fmt.Sprintf(
+		"The previous response did not provide writable files.\n\n"+
+			"Original project request:\n%s\n\n"+
+			"Previous response (for context):\n%s\n\n"+
+			"Regenerate the full project now.\n\n%s",
+		trimPromptContext(originalPrompt, 4000),
+		trimPromptContext(previousOutput, 3000),
+		wizardBuildRetryRules,
+	)
+}
+
+func trimPromptContext(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	if max <= 32 {
+		return s[:max]
+	}
+	return s[:max-16] + "\n...[truncated]"
 }

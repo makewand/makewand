@@ -129,10 +129,37 @@ func main() {
 			continue
 		}
 
-		r.provider = result.Actual
-		r.modelID = result.ModelID
-		r.tokens = usage.InputTokens + usage.OutputTokens
-		r.cost = usage.Cost
+		totalUsage := usage
+		finalResult := result
+		parsed := engine.ParseFilesBestEffort(content)
+		if len(parsed.Files) == 0 {
+			fmt.Print("  No files parsed, retrying with strict format... ")
+			retryStart := time.Now()
+			retryContent, retryUsage, retryResult, retryErr := retryCodeOutputForFiles(ctx, router, result.Actual, codePrompt, content)
+			retryElapsed := time.Since(retryStart)
+			r.elapsed += retryElapsed
+			if retryErr != nil {
+				fmt.Printf("✗ %v\n", retryErr)
+			} else {
+				retryParsed := engine.ParseFilesBestEffort(retryContent)
+				if len(retryParsed.Files) > 0 {
+					content = retryContent
+					parsed = retryParsed
+					finalResult = retryResult
+					totalUsage.InputTokens += retryUsage.InputTokens
+					totalUsage.OutputTokens += retryUsage.OutputTokens
+					totalUsage.Cost += retryUsage.Cost
+					fmt.Printf("✓ recovered %d files (%.1fs)\n", len(retryParsed.Files), retryElapsed.Seconds())
+				} else {
+					fmt.Printf("✗ still no files (%.1fs)\n", retryElapsed.Seconds())
+				}
+			}
+		}
+
+		r.provider = finalResult.Actual
+		r.modelID = finalResult.ModelID
+		r.tokens = totalUsage.InputTokens + totalUsage.OutputTokens
+		r.cost = totalUsage.Cost
 		r.rawOutput = content
 		if tmp, createErr := os.CreateTemp("", fmt.Sprintf("qualtest-%s-*.txt", strings.ToLower(m.name))); createErr == nil {
 			if _, writeErr := tmp.WriteString(content); writeErr == nil {
@@ -140,8 +167,6 @@ func main() {
 			}
 			_ = tmp.Close()
 		}
-
-		parsed := engine.ParseFilesBestEffort(content)
 		r.files = parsed.Files
 
 		fmt.Printf("✓ %.1fs, %d tokens", r.elapsed.Seconds(), r.tokens)
@@ -165,16 +190,16 @@ func main() {
 
 		// Cross-model review — use a DIFFERENT provider than the one that wrote code
 		reviewProvider := router.BuildProviderFor(model.PhaseReview)
-		if reviewProvider == result.Actual {
+		if reviewProvider == finalResult.Actual {
 			for _, fb := range []string{"gemini", "claude", "codex", "ollama"} {
-				if fb != result.Actual {
+				if fb != finalResult.Actual {
 					reviewProvider = fb
 					break
 				}
 			}
 		}
 
-		fmt.Printf("  Reviewing (%s → %s)... ", result.Actual, reviewProvider)
+		fmt.Printf("  Reviewing (%s → %s)... ", finalResult.Actual, reviewProvider)
 		rPrompt := fmt.Sprintf(reviewPrompt, content)
 		start = time.Now()
 		reviewContent, _, reviewResult, rerr := router.ChatWith(ctx, reviewProvider, model.PhaseReview,
@@ -290,4 +315,42 @@ func main() {
 	}
 	fmt.Println()
 	fmt.Println("═══ 测试完成 ═══")
+}
+
+func retryCodeOutputForFiles(
+	ctx context.Context,
+	router *model.Router,
+	provider string,
+	originalPrompt string,
+	previousOutput string,
+) (string, model.Usage, model.RouteResult, error) {
+	retryPrompt := fmt.Sprintf(
+		"The previous response did not provide writable files.\n\n"+
+			"Original request:\n%s\n\n"+
+			"Previous response:\n%s\n\n"+
+			"Regenerate the complete project now and output ONLY files using this exact format:\n"+
+			"--- FILE: path/to/file ---\n```\nfile content here\n```\n\n"+
+			"Do NOT include shell commands or narrative text.",
+		trimForRetryPrompt(originalPrompt, 4000),
+		trimForRetryPrompt(previousOutput, 3000),
+	)
+
+	return router.ChatWith(
+		ctx,
+		provider,
+		model.PhaseCode,
+		[]model.Message{{Role: "user", Content: retryPrompt}},
+		codeSystem,
+	)
+}
+
+func trimForRetryPrompt(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	if max <= 32 {
+		return s[:max]
+	}
+	return s[:max-16] + "\n...[truncated]"
 }
