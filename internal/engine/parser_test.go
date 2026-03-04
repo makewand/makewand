@@ -176,6 +176,71 @@ func TestContainsFiles(t *testing.T) {
 	}
 }
 
+func TestParseFilesBestEffort_PathHintBeforeFence(t *testing.T) {
+	input := "index.html\n" +
+		"```html\n" +
+		"<!doctype html><html><body>Hello</body></html>\n" +
+		"```\n\n" +
+		"style.css\n" +
+		"```css\n" +
+		"body { color: red; }\n" +
+		"```\n"
+
+	result := ParseFilesBestEffort(input)
+	if len(result.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(result.Files))
+	}
+	if result.Files[0].Path != "index.html" {
+		t.Fatalf("file 0 path=%q, want index.html", result.Files[0].Path)
+	}
+	if result.Files[1].Path != "style.css" {
+		t.Fatalf("file 1 path=%q, want style.css", result.Files[1].Path)
+	}
+}
+
+func TestParseFilesBestEffort_LanguageOnlyMultipleFences(t *testing.T) {
+	input := "Here are the files:\n\n" +
+		"```html\n" +
+		"<h1>Demo</h1>\n" +
+		"```\n\n" +
+		"```css\n" +
+		"h1 { color: blue; }\n" +
+		"```\n\n" +
+		"```javascript\n" +
+		"console.log('ok')\n" +
+		"```\n"
+
+	result := ParseFilesBestEffort(input)
+	if len(result.Files) != 3 {
+		t.Fatalf("expected 3 files, got %d", len(result.Files))
+	}
+	if result.Files[0].Path != "index.html" || result.Files[1].Path != "style.css" || result.Files[2].Path != "script.js" {
+		t.Fatalf("unexpected inferred paths: %+v", result.Files)
+	}
+}
+
+func TestParseFilesBestEffort_InlinePathInFence(t *testing.T) {
+	input := "```python src/app.py\n" +
+		"print('hello')\n" +
+		"```\n"
+
+	result := ParseFilesBestEffort(input)
+	if len(result.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(result.Files))
+	}
+	if result.Files[0].Path != "src/app.py" {
+		t.Fatalf("file path=%q, want src/app.py", result.Files[0].Path)
+	}
+}
+
+func TestParseFilesBestEffort_DoesNotInferSingleGenericFence(t *testing.T) {
+	input := "Example snippet:\n```python\nprint('example only')\n```\n"
+	result := ParseFilesBestEffort(input)
+	if len(result.Files) != 0 {
+		t.Fatalf("expected 0 files for single generic fence, got %d", len(result.Files))
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }
