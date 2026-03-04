@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test ./...
+
+  release:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          VERSION_NO_V="${VERSION#v}"
+          mkdir -p dist
+
+          build_one() {
+            local goos="$1"
+            local goarch="$2"
+            local ext=""
+            if [ "$goos" = "windows" ]; then
+              ext=".exe"
+            fi
+
+            local bin="makewand${ext}"
+            local base="makewand_${VERSION}_${goos}_${goarch}"
+            local outdir="dist/${base}"
+            mkdir -p "${outdir}"
+
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION_NO_V}" \
+              -o "${outdir}/${bin}" ./cmd/makewand
+
+            if [ "$goos" = "windows" ]; then
+              (cd dist && zip -q -r "${base}.zip" "${base}")
+            else
+              (cd dist && tar -czf "${base}.tar.gz" "${base}")
+            fi
+          }
+
+          build_one linux amd64
+          build_one darwin arm64
+          build_one windows amd64
+
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
