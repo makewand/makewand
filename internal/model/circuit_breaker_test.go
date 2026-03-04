@@ -46,6 +46,23 @@ func TestProviderCircuitBreaker_StateTransitions(t *testing.T) {
 	}
 }
 
+func TestProviderCircuitBreaker_RecordFailureWeighted_TripsImmediately(t *testing.T) {
+	now := time.Date(2026, 3, 3, 12, 0, 0, 0, time.UTC)
+	cb := newProviderCircuitBreaker(3, 30*time.Second)
+	cb.now = func() time.Time { return now }
+
+	opened, until := cb.RecordFailureWeighted("gemini", 3)
+	if !opened {
+		t.Fatal("weighted failure should trip the circuit immediately")
+	}
+	if !until.After(now) {
+		t.Fatal("open-until timestamp should be in the future")
+	}
+	if allow, _ := cb.BeforeAttempt("gemini"); allow {
+		t.Fatal("BeforeAttempt should block while weighted-open circuit is active")
+	}
+}
+
 func TestRoute_SkipsProviderWithOpenCircuit(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.CodingModel = "claude"

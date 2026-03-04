@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -299,10 +300,39 @@ func (r *Router) recordProviderSuccess(provider string) {
 }
 
 func (r *Router) recordProviderFailure(provider string) (bool, time.Time) {
+	return r.recordProviderFailureForErr(provider, nil)
+}
+
+func (r *Router) recordProviderFailureForErr(provider string, callErr error) (bool, time.Time) {
 	if r.breaker == nil {
 		return false, time.Time{}
 	}
+	// Timeouts are usually transient provider saturation/outage signals.
+	// Trip the breaker immediately so subsequent requests route elsewhere.
+	if isTimeoutErr(callErr) {
+		return r.breaker.RecordFailureWeighted(provider, defaultCircuitFailureThreshold)
+	}
 	return r.breaker.RecordFailure(provider)
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	type timeoutErr interface {
+		Timeout() bool
+	}
+	var te timeoutErr
+	if errors.As(err, &te) && te.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "timed out") ||
+		strings.Contains(msg, "deadline exceeded")
 }
 
 // EmitTrace allows non-router components (for example TUI pipeline steps)
@@ -783,7 +813,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		})
 
 		r.usage.RecordFailure(result.Actual)
-		if opened, until := r.recordProviderFailure(result.Actual); opened {
+		if opened, until := r.recordProviderFailureForErr(result.Actual, chatErr); opened {
 			r.emitTrace(TraceEvent{
 				Event:    "circuit_opened",
 				Task:     taskTypeName(task),
@@ -879,7 +909,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 					Error:      retryErr.Error(),
 				})
 				r.usage.RecordFailure(c.name)
-				if opened, until := r.recordProviderFailure(c.name); opened {
+				if opened, until := r.recordProviderFailureForErr(c.name, retryErr); opened {
 					r.emitTrace(TraceEvent{
 						Event:    "circuit_opened",
 						Task:     taskTypeName(task),
@@ -963,7 +993,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 			Error:      retryErr.Error(),
 		})
 		r.usage.RecordFailure(name)
-		if opened, until := r.recordProviderFailure(name); opened {
+		if opened, until := r.recordProviderFailureForErr(name, retryErr); opened {
 			r.emitTrace(TraceEvent{
 				Event:    "circuit_opened",
 				Task:     taskTypeName(task),
@@ -1311,6 +1341,34 @@ func maxTokensForPhase(phase BuildPhase) int {
 	}
 }
 
+func buildPhaseAttemptTimeout(phase BuildPhase) time.Duration {
+	switch phase {
+	case PhasePlan:
+		return 90 * time.Second
+	case PhaseCode:
+		return 150 * time.Second
+	case PhaseReview:
+		return 45 * time.Second
+	case PhaseFix:
+		return 60 * time.Second
+	default:
+		return 90 * time.Second
+	}
+}
+
+func withProviderAttemptTimeout(ctx context.Context, phase BuildPhase) (context.Context, context.CancelFunc) {
+	maxDur := buildPhaseAttemptTimeout(phase)
+	if maxDur <= 0 {
+		return ctx, func() {}
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if time.Until(deadline) <= maxDur {
+			return ctx, func() {}
+		}
+	}
+	return context.WithTimeout(ctx, maxDur)
+}
+
 // ChatWith sends a message to a specific provider for a build phase.
 // It resolves the provider by name, falls back if unavailable, and tracks usage.
 // Providers in the exclude list are never used (enforces cross-model constraints).
@@ -1363,7 +1421,7 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 		})
 
 		r.usage.RecordFailure(result.Actual)
-		if opened, until := r.recordProviderFailure(result.Actual); opened {
+		if opened, until := r.recordProviderFailureForErr(result.Actual, chatErr); opened {
 			r.emitTrace(TraceEvent{
 				Event:    "circuit_opened",
 				Phase:    buildPhaseName(phase),
@@ -1446,7 +1504,9 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 			continue
 		}
 		start := time.Now()
-		content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, phase)
+		content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
+		attemptCancel()
 		if retryErr == nil {
 			r.usage.Increment(fb)
 			r.recordProviderSuccess(fb)
@@ -1477,7 +1537,7 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 			Error:      retryErr.Error(),
 		})
 		r.usage.RecordFailure(fb)
-		if opened, until := r.recordProviderFailure(fb); opened {
+		if opened, until := r.recordProviderFailureForErr(fb, retryErr); opened {
 			r.emitTrace(TraceEvent{
 				Event:    "circuit_opened",
 				Phase:    buildPhaseName(phase),
@@ -1552,7 +1612,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 			Error:      streamErr.Error(),
 		})
 		r.usage.RecordFailure(result.Actual)
-		if opened, until := r.recordProviderFailure(result.Actual); opened {
+		if opened, until := r.recordProviderFailureForErr(result.Actual, streamErr); opened {
 			r.emitTrace(TraceEvent{
 				Event:    "circuit_opened",
 				Task:     taskTypeName(task),
@@ -1648,7 +1708,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 					Error:      retryErr.Error(),
 				})
 				r.usage.RecordFailure(c.name)
-				if opened, until := r.recordProviderFailure(c.name); opened {
+				if opened, until := r.recordProviderFailureForErr(c.name, retryErr); opened {
 					r.emitTrace(TraceEvent{
 						Event:    "circuit_opened",
 						Task:     taskTypeName(task),
@@ -1732,7 +1792,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 			Error:      retryErr.Error(),
 		})
 		r.usage.RecordFailure(name)
-		if opened, until := r.recordProviderFailure(name); opened {
+		if opened, until := r.recordProviderFailureForErr(name, retryErr); opened {
 			r.emitTrace(TraceEvent{
 				Event:    "circuit_opened",
 				Task:     taskTypeName(task),
@@ -1841,10 +1901,12 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 				return
 			}
 			start := time.Now()
-			content, usage, err := sl.p.Chat(ctx, messages, system, maxTokens)
+			attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, phase)
+			content, usage, err := sl.p.Chat(attemptCtx, messages, system, maxTokens)
+			attemptCancel()
 			if err != nil {
 				r.usage.RecordFailure(sl.name)
-				if opened, until := r.recordProviderFailure(sl.name); opened {
+				if opened, until := r.recordProviderFailureForErr(sl.name, err); opened {
 					r.emitTrace(TraceEvent{
 						Event:    "circuit_opened",
 						Phase:    buildPhaseName(phase),
@@ -1963,10 +2025,12 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 
 	judgeMessages := []Message{{Role: "user", Content: prompt.String()}}
 	judgeStart := time.Now()
-	content, usage, err := judgeP.Chat(ctx, judgeMessages, judgeSystemFor(phase), maxTokensForPhase(phase))
+	attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, phase)
+	content, usage, err := judgeP.Chat(attemptCtx, judgeMessages, judgeSystemFor(phase), maxTokensForPhase(phase))
+	attemptCancel()
 	if err != nil {
 		r.usage.RecordFailure(pe.Judge)
-		if opened, until := r.recordProviderFailure(pe.Judge); opened {
+		if opened, until := r.recordProviderFailureForErr(pe.Judge, err); opened {
 			r.emitTrace(TraceEvent{
 				Event:    "circuit_opened",
 				Phase:    buildPhaseName(phase),

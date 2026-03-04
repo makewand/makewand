@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 )
@@ -65,6 +66,55 @@ func TestChat_ModeFreeDoesNotFallbackToAPI(t *testing.T) {
 	_, _, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
 	if err == nil {
 		t.Fatal("Chat() error = nil, want failure (free mode must not fallback to API providers)")
+	}
+}
+
+func TestRecordProviderFailureForErr_TimeoutTripsCircuitImmediately(t *testing.T) {
+	r := &Router{
+		breaker: newProviderCircuitBreaker(3, time.Minute),
+	}
+
+	opened, _ := r.recordProviderFailureForErr("claude", context.DeadlineExceeded)
+	if !opened {
+		t.Fatal("timeout failure should trip circuit immediately")
+	}
+	if blocked, _ := r.isCircuitOpen("claude"); !blocked {
+		t.Fatal("circuit should be open after timeout-triggered failure")
+	}
+}
+
+func TestWithProviderAttemptTimeout_ReviewUsesBoundedTimeout(t *testing.T) {
+	ctx := context.Background()
+	attemptCtx, cancel := withProviderAttemptTimeout(ctx, PhaseReview)
+	defer cancel()
+
+	deadline, ok := attemptCtx.Deadline()
+	if !ok {
+		t.Fatal("expected review attempt context to have a deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		t.Fatalf("remaining timeout must be > 0, got %s", remaining)
+	}
+	if remaining > 50*time.Second {
+		t.Fatalf("review timeout too large: %s", remaining)
+	}
+}
+
+func TestWithProviderAttemptTimeout_RespectsCallerShorterDeadline(t *testing.T) {
+	parentCtx, parentCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer parentCancel()
+
+	attemptCtx, cancel := withProviderAttemptTimeout(parentCtx, PhaseReview)
+	defer cancel()
+
+	parentDeadline, _ := parentCtx.Deadline()
+	attemptDeadline, ok := attemptCtx.Deadline()
+	if !ok {
+		t.Fatal("attempt context should preserve parent deadline")
+	}
+	if !attemptDeadline.Equal(parentDeadline) {
+		t.Fatalf("attempt deadline = %s, want parent deadline %s", attemptDeadline, parentDeadline)
 	}
 }
 

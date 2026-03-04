@@ -80,8 +80,16 @@ func (cb *providerCircuitBreaker) RecordSuccess(provider string) {
 }
 
 func (cb *providerCircuitBreaker) RecordFailure(provider string) (opened bool, until time.Time) {
+	return cb.RecordFailureWeighted(provider, 1)
+}
+
+func (cb *providerCircuitBreaker) RecordFailureWeighted(provider string, weight int) (opened bool, until time.Time) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+
+	if weight <= 0 {
+		weight = 1
+	}
 
 	state := cb.stateLocked(provider)
 	now := cb.now()
@@ -92,7 +100,7 @@ func (cb *providerCircuitBreaker) RecordFailure(provider string) (opened bool, u
 		return true, state.openUntil
 	}
 
-	state.consecutiveFailures++
+	state.consecutiveFailures += weight
 	if state.consecutiveFailures >= cb.failureThreshold {
 		state.consecutiveFailures = 0
 		state.openUntil = now.Add(cb.cooldown)
