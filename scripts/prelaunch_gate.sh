@@ -26,8 +26,9 @@ build/makewand doctor --strict --modes "${MODES}"
 
 if [[ "${MAKEWAND_LIVE_SMOKE:-0}" == "1" ]]; then
   PROBE_TIMEOUT="${MAKEWAND_PROBE_TIMEOUT:-45s}"
-  echo "[prelaunch] doctor live probe (modes=${MODES}, timeout=${PROBE_TIMEOUT})"
-  build/makewand doctor --strict --probe --modes "${MODES}" --probe-timeout "${PROBE_TIMEOUT}"
+  PROBE_RETRIES="${MAKEWAND_PROBE_RETRIES:-1}"
+  echo "[prelaunch] doctor live probe (modes=${MODES}, timeout=${PROBE_TIMEOUT}, retries=${PROBE_RETRIES})"
+  build/makewand doctor --strict --probe --modes "${MODES}" --probe-timeout "${PROBE_TIMEOUT}" --probe-retries "${PROBE_RETRIES}"
 else
   echo "[prelaunch] live probe skipped (set MAKEWAND_LIVE_SMOKE=1 to enable)"
 fi
