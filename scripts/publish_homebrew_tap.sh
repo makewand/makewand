@@ -37,7 +37,7 @@ cp "${FORMULA_PATH}" "${tmp_dir}/Formula/makewand.rb"
 git -C "${tmp_dir}" config user.name "github-actions[bot]"
 git -C "${tmp_dir}" config user.email "github-actions[bot]@users.noreply.github.com"
 
-if git -C "${tmp_dir}" diff --quiet -- Formula/makewand.rb; then
+if [[ -z "$(git -C "${tmp_dir}" status --porcelain -- Formula/makewand.rb)" ]]; then
   echo "Homebrew formula unchanged; skipping commit."
   exit 0
 fi
