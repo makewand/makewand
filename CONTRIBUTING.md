@@ -45,4 +45,4 @@ PR checklist:
 ## Security issues
 
 Do not report security vulnerabilities in public issues.
-Use the process in [SECURITY.md](/mnt/data/makewand/SECURITY.md).
+Use the process in [SECURITY.md](SECURITY.md).
