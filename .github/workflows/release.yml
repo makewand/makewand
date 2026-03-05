@@ -31,6 +31,9 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: test
+    env:
+      HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+      SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,6 +84,12 @@ jobs:
           build_one windows amd64
 
           (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+
+      - name: Generate Homebrew/Scoop manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/gen_package_manifests.sh "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}" dist/checksums.txt dist
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -155,5 +164,27 @@ jobs:
             dist/checksums.txt
             dist/checksums.txt.sig
             dist/checksums.txt.pem
+            dist/homebrew/Formula/makewand.rb
+            dist/scoop/makewand.json
           body_path: dist/release-notes.md
           fail_on_unmatched_files: true
+
+      - name: Publish Homebrew tap (optional)
+        if: ${{ secrets.PACKAGE_REPO_TOKEN != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          tap_repo="${HOMEBREW_TAP_REPO:-makewand/homebrew-makewand}"
+          ./scripts/publish_homebrew_tap.sh "${tap_repo}" dist/homebrew/Formula/makewand.rb "${GITHUB_REF_NAME}"
+
+      - name: Publish Scoop bucket (optional)
+        if: ${{ secrets.PACKAGE_REPO_TOKEN != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          bucket_repo="${SCOOP_BUCKET_REPO:-makewand/scoop-makewand}"
+          ./scripts/publish_scoop_bucket.sh "${bucket_repo}" dist/scoop/makewand.json "${GITHUB_REF_NAME}"
