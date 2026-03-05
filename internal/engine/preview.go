@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -13,9 +14,12 @@ var (
 	previewCommandContext = exec.CommandContext
 	previewFindFreePort   = findFreePort
 	previewWaitForPort    = waitForPreviewPort
+	previewWrapProjectCmd = wrapPreviewProjectCommand
 	previewDialTimeout    = net.DialTimeout
 	previewReadyTimeout   = 12 * time.Second
 )
+
+const previewStartupStderrLimit = 8 << 10
 
 // PreviewServer manages a development preview server.
 type PreviewServer struct {
@@ -110,7 +114,7 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 
 	// Project-defined scripts execute inside an isolation wrapper by default.
 	if kind != previewStatic {
-		wrappedCommand, wrappedArgs, wrapErr := wrapPreviewProjectCommand(p.Path, command, args)
+		wrappedCommand, wrappedArgs, wrapErr := previewWrapProjectCmd(p.Path, command, args)
 		if wrapErr != nil {
 			cancel()
 			return nil, wrapErr
@@ -125,6 +129,8 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		fmt.Sprintf("PORT=%d", port),
 		"HOST=127.0.0.1",
 	)
+	startupStderr := &limitedWriter{limit: previewStartupStderrLimit}
+	cmd.Stderr = startupStderr
 	setProcessGroup(cmd)
 	server.cmd = cmd
 
@@ -136,6 +142,11 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		cancel()
 		killProcessGroup(cmd)
 		_ = cmd.Wait()
+		stderrMsg := strings.TrimSpace(startupStderr.String())
+		if stderrMsg != "" {
+			stderrMsg = strings.Join(strings.Fields(stderrMsg), " ")
+			return nil, fmt.Errorf("preview server did not become ready on 127.0.0.1:%d: %w; startup stderr: %s", port, err, stderrMsg)
+		}
 		return nil, fmt.Errorf("preview server did not become ready on 127.0.0.1:%d: %w", port, err)
 	}
 
