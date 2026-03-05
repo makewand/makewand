@@ -127,6 +127,53 @@ func TestStartPreview_ReturnsErrorWhenPortNeverBecomesReady(t *testing.T) {
 	}
 }
 
+func TestStartPreview_IncludesStartupStderrOnReadinessFailure(t *testing.T) {
+	oldCmd := previewCommandContext
+	oldFindPort := previewFindFreePort
+	oldWaitPort := previewWaitForPort
+	oldWrap := previewWrapProjectCmd
+	t.Cleanup(func() {
+		previewCommandContext = oldCmd
+		previewFindFreePort = oldFindPort
+		previewWaitForPort = oldWaitPort
+		previewWrapProjectCmd = oldWrap
+	})
+
+	proj, err := NewProject("preview-stderr-hint", t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+	if err := proj.WriteFile("package.json", `{"name":"x","scripts":{"dev":"node dev.js"}}`); err != nil {
+		t.Fatalf("WriteFile(package.json): %v", err)
+	}
+
+	previewFindFreePort = func() (int, error) { return 45678, nil }
+	previewWaitForPort = func(ctx context.Context, port int, timeout time.Duration) error {
+		time.Sleep(50 * time.Millisecond)
+		return fmt.Errorf("timed out after %s: connection refused", timeout)
+	}
+	previewWrapProjectCmd = func(projectPath, command string, args []string) (string, []string, error) {
+		return "sh", []string{"-c", "echo uid map denied >&2; sleep 5"}, nil
+	}
+	previewCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, name, args...)
+	}
+
+	server, err := proj.StartPreview(context.Background(), true)
+	if err == nil {
+		t.Fatal("StartPreview() error = nil, want readiness failure")
+	}
+	if server != nil {
+		t.Fatal("StartPreview() server != nil on readiness failure")
+	}
+	if !strings.Contains(err.Error(), "startup stderr") {
+		t.Fatalf("StartPreview() error = %q, want startup stderr detail", err.Error())
+	}
+	if !strings.Contains(err.Error(), "uid map denied") {
+		t.Fatalf("StartPreview() error = %q, want startup stderr content", err.Error())
+	}
+}
+
 type stubConn struct{}
 
 func (stubConn) Read(b []byte) (int, error)         { return 0, nil }
