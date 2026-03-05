@@ -23,19 +23,21 @@
 ## Implemented in this repository
 
 - PR/push CI gate:
-  - [ci.yml](/mnt/data/makewand/.github/workflows/ci.yml)
+  - [ci.yml](../.github/workflows/ci.yml)
 - Tag-triggered GitHub release workflow:
-  - [release.yml](/mnt/data/makewand/.github/workflows/release.yml)
+  - [release.yml](../.github/workflows/release.yml)
 - Dependency update automation:
-  - [dependabot.yml](/mnt/data/makewand/.github/dependabot.yml)
+  - [dependabot.yml](../.github/dependabot.yml)
 - Installer script:
-  - [install.sh](/mnt/data/makewand/scripts/install.sh)
+  - [install.sh](../scripts/install.sh)
 - Security policy:
-  - [SECURITY.md](/mnt/data/makewand/SECURITY.md)
+  - [SECURITY.md](../SECURITY.md)
 - Support policy:
-  - [SUPPORT.md](/mnt/data/makewand/SUPPORT.md)
+  - [SUPPORT.md](../SUPPORT.md)
 - Pre-launch quality gate:
-  - [prelaunch_gate.sh](/mnt/data/makewand/scripts/prelaunch_gate.sh)
+  - [prelaunch_gate.sh](../scripts/prelaunch_gate.sh)
+- GitHub hardening baseline:
+  - [GITHUB_HARDENING.md](GITHUB_HARDENING.md)
 
 ## Release operator checklist
 

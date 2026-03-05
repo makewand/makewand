@@ -22,6 +22,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Reject local absolute doc links
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t markdown_files < <(find README.md docs .github -type f \( -name '*.md' -o -name '*.markdown' \))
+          if [ "${#markdown_files[@]}" -eq 0 ]; then
+            exit 0
+          fi
+          if grep --line-number --fixed-strings '/mnt/data/makewand' "${markdown_files[@]}"; then
+            echo "found local absolute links; use repository-relative markdown links instead" >&2
+            exit 1
+          fi
+
+      - name: Check shell script syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in scripts/*.sh; do
+            bash -n "${f}"
+          done
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
