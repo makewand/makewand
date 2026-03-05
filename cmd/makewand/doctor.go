@@ -21,6 +21,20 @@ const (
 	doctorFail doctorStatus = "fail"
 )
 
+const (
+	defaultDoctorProbeRetries = 1
+	maxDoctorProbeErrorLen    = 220
+)
+
+type doctorProbeClassification string
+
+const (
+	probeClassHealthy       doctorProbeClassification = "healthy"
+	probeClassEnvironment   doctorProbeClassification = "environment"
+	probeClassConfiguration doctorProbeClassification = "configuration"
+	probeClassProvider      doctorProbeClassification = "provider"
+)
+
 type doctorCheck struct {
 	Name    string       `json:"name"`
 	Status  doctorStatus `json:"status"`
@@ -41,12 +55,14 @@ type doctorModeReport struct {
 }
 
 type doctorProbeReport struct {
-	Mode       string       `json:"mode"`
-	Status     doctorStatus `json:"status"`
-	Provider   string       `json:"provider,omitempty"`
-	ModelID    string       `json:"model_id,omitempty"`
-	DurationMS int64        `json:"duration_ms"`
-	Error      string       `json:"error,omitempty"`
+	Mode           string                    `json:"mode"`
+	Status         doctorStatus              `json:"status"`
+	Classification doctorProbeClassification `json:"classification,omitempty"`
+	Provider       string                    `json:"provider,omitempty"`
+	ModelID        string                    `json:"model_id,omitempty"`
+	Attempts       int                       `json:"attempts,omitempty"`
+	DurationMS     int64                     `json:"duration_ms"`
+	Error          string                    `json:"error,omitempty"`
 }
 
 type doctorReport struct {
@@ -59,12 +75,14 @@ type doctorReport struct {
 	Strict              bool                `json:"strict"`
 	ProbeEnabled        bool                `json:"probe_enabled"`
 	ProbeTimeoutSeconds int                 `json:"probe_timeout_seconds"`
+	ProbeRetries        int                 `json:"probe_retries"`
 }
 
 type doctorOptions struct {
 	modes        []model.UsageMode
 	probe        bool
 	probeTimeout time.Duration
+	probeRetries int
 	strict       bool
 	jsonOutput   bool
 }
@@ -74,6 +92,7 @@ func doctorCmd() *cobra.Command {
 		modesFlag        string
 		probeFlag        bool
 		probeTimeoutFlag time.Duration
+		probeRetriesFlag int
 		strictFlag       bool
 		jsonFlag         bool
 	)
@@ -95,12 +114,16 @@ Examples:
 			if probeTimeoutFlag <= 0 {
 				return fmt.Errorf("probe timeout must be positive")
 			}
+			if probeRetriesFlag < 0 {
+				return fmt.Errorf("probe retries must be >= 0")
+			}
 
 			cfg, loadErr := config.Load()
 			report, failCount, warnCount := runDoctor(cfg, loadErr, doctorOptions{
 				modes:        modes,
 				probe:        probeFlag,
 				probeTimeout: probeTimeoutFlag,
+				probeRetries: probeRetriesFlag,
 				strict:       strictFlag,
 				jsonOutput:   jsonFlag,
 			})
@@ -128,6 +151,7 @@ Examples:
 	cmd.Flags().StringVar(&modesFlag, "modes", "all", "modes to verify: all or comma list (free,economy,balanced,power)")
 	cmd.Flags().BoolVar(&probeFlag, "probe", false, "run live provider probe requests (network/API/CLI)")
 	cmd.Flags().DurationVar(&probeTimeoutFlag, "probe-timeout", 45*time.Second, "timeout per live probe request")
+	cmd.Flags().IntVar(&probeRetriesFlag, "probe-retries", defaultDoctorProbeRetries, "retry count per provider during live probe")
 	cmd.Flags().BoolVar(&strictFlag, "strict", false, "treat warnings as failures")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "output report as JSON")
 	return cmd
@@ -176,6 +200,7 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 		Strict:              opts.strict,
 		ProbeEnabled:        opts.probe,
 		ProbeTimeoutSeconds: int(opts.probeTimeout.Seconds()),
+		ProbeRetries:        opts.probeRetries,
 	}
 
 	if p, err := config.ConfigPath(); err == nil {
@@ -262,52 +287,77 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 		}
 
 		probeResult := doctorProbeReport{
-			Mode:   modeName,
-			Status: doctorPass,
+			Mode:           modeName,
+			Status:         doctorPass,
+			Classification: probeClassHealthy,
 		}
 		start := time.Now()
 		prompt := []model.Message{{Role: "user", Content: "Reply with one short sentence: service healthy."}}
 		system := "You are a health probe. Reply with one short sentence only."
 
-		var lastErr error
 		candidates := uniqueProbeProviders(modeResult.Routes)
 		if len(candidates) == 0 {
 			probeResult.Status = doctorFail
+			probeResult.Classification = probeClassConfiguration
 			probeResult.Error = "no probe candidate provider found"
 			probeResult.DurationMS = time.Since(start).Milliseconds()
 			report.LiveProbe = append(report.LiveProbe, probeResult)
 			continue
 		}
 
+		attemptCount := 0
+		failures := make([]doctorProbeFailure, 0, len(candidates)*(opts.probeRetries+1))
+		success := false
+
+	probeProvidersLoop:
 		for _, providerName := range candidates {
 			prov, err := router.Get(providerName)
 			if err != nil {
-				lastErr = err
+				attemptCount++
+				failures = append(failures, doctorProbeFailure{
+					provider: providerName,
+					attempt:  attemptCount,
+					class:    classifyProbeError(err),
+					err:      err,
+				})
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), opts.probeTimeout)
-			content, usage, err := prov.Chat(ctx, prompt, system, model.MaxTokensForTask(model.TaskExplain))
-			cancel()
-			if err != nil {
-				lastErr = err
-				continue
+			for try := 0; try <= opts.probeRetries; try++ {
+				attemptCount++
+				ctx, cancel := context.WithTimeout(context.Background(), opts.probeTimeout)
+				content, usage, err := prov.Chat(ctx, prompt, system, model.MaxTokensForTask(model.TaskExplain))
+				cancel()
+				if err == nil && strings.TrimSpace(content) != "" {
+					probeResult.Provider = providerName
+					probeResult.ModelID = strings.TrimSpace(usage.Model)
+					probeResult.Attempts = attemptCount
+					success = true
+					break probeProvidersLoop
+				}
+				if err == nil {
+					err = fmt.Errorf("%s returned empty probe response", providerName)
+				}
+				class := classifyProbeError(err)
+				failures = append(failures, doctorProbeFailure{
+					provider: providerName,
+					attempt:  attemptCount,
+					class:    class,
+					err:      err,
+				})
+				// Invalid config/auth/binary errors are non-retryable for this provider.
+				if class == probeClassConfiguration {
+					break
+				}
 			}
-			if strings.TrimSpace(content) == "" {
-				lastErr = fmt.Errorf("%s returned empty probe response", providerName)
-				continue
-			}
-
-			probeResult.Provider = providerName
-			probeResult.ModelID = strings.TrimSpace(usage.Model)
-			probeResult.DurationMS = time.Since(start).Milliseconds()
-			lastErr = nil
-			break
 		}
 
-		if lastErr != nil {
-			probeResult.Status = doctorFail
-			probeResult.Error = lastErr.Error()
+		if !success {
+			status, class, summary := evaluateProbeFailures(failures)
+			probeResult.Status = status
+			probeResult.Classification = class
+			probeResult.Attempts = attemptCount
+			probeResult.Error = summary
 		}
 		probeResult.DurationMS = time.Since(start).Milliseconds()
 		report.LiveProbe = append(report.LiveProbe, probeResult)
@@ -421,6 +471,12 @@ func printDoctorReport(report doctorReport) {
 		fmt.Println("Live probe:")
 		for _, p := range report.LiveProbe {
 			fmt.Printf("  [%s] %s (%dms)", strings.ToUpper(string(p.Status)), p.Mode, p.DurationMS)
+			if p.Classification != "" && p.Classification != probeClassHealthy {
+				fmt.Printf(" [%s]", p.Classification)
+			}
+			if p.Attempts > 0 {
+				fmt.Printf(" attempts=%d", p.Attempts)
+			}
 			if p.Provider != "" {
 				if p.ModelID != "" {
 					fmt.Printf(" - %s (%s)", p.Provider, p.ModelID)
@@ -493,4 +549,164 @@ func uniqueProbeProviders(routes []doctorTaskRoute) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+type doctorProbeFailure struct {
+	provider string
+	attempt  int
+	class    doctorProbeClassification
+	err      error
+}
+
+func classifyProbeError(err error) doctorProbeClassification {
+	if err == nil {
+		return probeClassHealthy
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+
+	switch {
+	case strings.Contains(msg, "deadline exceeded"),
+		strings.Contains(msg, "timed out"),
+		strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "proxyconnect"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "network is unreachable"),
+		strings.Contains(msg, "temporary failure in name resolution"),
+		strings.Contains(msg, "no such host"),
+		strings.Contains(msg, "tls handshake timeout"),
+		strings.Contains(msg, "stream disconnected"),
+		strings.Contains(msg, "transport channel closed"),
+		strings.Contains(msg, "operation not permitted"),
+		strings.Contains(msg, "permission denied"),
+		strings.Contains(msg, "rate limit"),
+		strings.Contains(msg, "quota"):
+		return probeClassEnvironment
+	case strings.Contains(msg, "not configured"),
+		strings.Contains(msg, "is not available"),
+		strings.Contains(msg, "api key"),
+		strings.Contains(msg, "unauthorized"),
+		strings.Contains(msg, "forbidden"),
+		strings.Contains(msg, "authentication"),
+		strings.Contains(msg, "command not found"),
+		strings.Contains(msg, "no such file or directory"):
+		return probeClassConfiguration
+	default:
+		return probeClassProvider
+	}
+}
+
+func evaluateProbeFailures(failures []doctorProbeFailure) (doctorStatus, doctorProbeClassification, string) {
+	if len(failures) == 0 {
+		return doctorFail, probeClassProvider, "probe failed with unknown error"
+	}
+
+	hasProvider := false
+	hasConfig := false
+	for _, f := range failures {
+		if f.class == probeClassProvider {
+			hasProvider = true
+		}
+		if f.class == probeClassConfiguration {
+			hasConfig = true
+		}
+	}
+
+	if hasProvider {
+		return doctorFail, probeClassProvider, summarizeProbeFailures(failures, probeClassProvider)
+	}
+	if hasConfig {
+		return doctorWarn, probeClassConfiguration, summarizeProbeFailures(failures, probeClassConfiguration)
+	}
+	return doctorWarn, probeClassEnvironment, summarizeProbeFailures(failures, probeClassEnvironment)
+}
+
+func summarizeProbeFailures(failures []doctorProbeFailure, class doctorProbeClassification) string {
+	providerSet := make(map[string]bool)
+	providers := make([]string, 0, len(failures))
+	causeSet := make(map[string]bool)
+	causes := make([]string, 0, 3)
+	for _, f := range failures {
+		name := strings.TrimSpace(f.provider)
+		if name != "" && !providerSet[name] {
+			providerSet[name] = true
+			providers = append(providers, name)
+		}
+
+		cause := compactProbeError(f.err)
+		if cause == "" || causeSet[cause] {
+			continue
+		}
+		causeSet[cause] = true
+		causes = append(causes, cause)
+		if len(causes) >= 3 {
+			break
+		}
+	}
+	sort.Strings(providers)
+
+	classText := "provider"
+	if class == probeClassEnvironment {
+		classText = "environment"
+	} else if class == probeClassConfiguration {
+		classText = "configuration"
+	}
+
+	summary := fmt.Sprintf("%s issue across %d attempt(s)", classText, len(failures))
+	if len(providers) > 0 {
+		summary += fmt.Sprintf(" on %s", strings.Join(providers, ","))
+	}
+	if len(causes) > 0 {
+		summary += fmt.Sprintf(": %s", strings.Join(causes, "; "))
+	}
+	return summary
+}
+
+func compactProbeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return ""
+	}
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "operation not permitted"):
+		return "operation not permitted"
+	case strings.Contains(lower, "permission denied"):
+		return "permission denied"
+	case strings.Contains(lower, "proxyconnect"):
+		return "proxy connect failure"
+	case strings.Contains(lower, "deadline exceeded"):
+		return "deadline exceeded"
+	case strings.Contains(lower, "timed out"):
+		return "timed out"
+	case strings.Contains(lower, "timeout"):
+		return "timeout"
+	case strings.Contains(lower, "no such host"):
+		return "no such host"
+	case strings.Contains(lower, "network is unreachable"):
+		return "network is unreachable"
+	case strings.Contains(lower, "connection refused"):
+		return "connection refused"
+	case strings.Contains(lower, "stream disconnected"):
+		return "stream disconnected"
+	}
+
+	lines := strings.Split(strings.ReplaceAll(msg, "\r\n", "\n"), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > maxDoctorProbeErrorLen {
+			return line[:maxDoctorProbeErrorLen-3] + "..."
+		}
+		return line
+	}
+	if len(msg) > maxDoctorProbeErrorLen {
+		return msg[:maxDoctorProbeErrorLen-3] + "..."
+	}
+	return msg
 }
