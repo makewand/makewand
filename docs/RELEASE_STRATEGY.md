@@ -16,7 +16,7 @@
 
 ## Recommended rollout
 
-1. **Now**: GitHub Release artifacts + checksums + one-line installer.
+1. **Now**: GitHub Release artifacts + checksums + signature/provenance + one-line installer.
 2. **Next**: Homebrew tap (if macOS demand is high).
 3. **Then**: Optional npm wrapper package for discovery (not primary install path).
 
@@ -26,6 +26,8 @@
   - [release.yml](/mnt/data/makewand/.github/workflows/release.yml)
 - Installer script:
   - [install.sh](/mnt/data/makewand/scripts/install.sh)
+- Security policy:
+  - [SECURITY.md](/mnt/data/makewand/SECURITY.md)
 - Pre-launch quality gate:
   - [prelaunch_gate.sh](/mnt/data/makewand/scripts/prelaunch_gate.sh)
 
@@ -34,4 +36,4 @@
 1. Run `make prelaunch`.
 2. (Recommended) run live probe: `MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch`.
 3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-4. Verify GitHub release assets and checksums.
+4. Verify GitHub release assets, checksums, signatures, and provenance attestation.
