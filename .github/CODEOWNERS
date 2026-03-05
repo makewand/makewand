@@ -1,0 +1,7 @@
+# Default owners for the whole repository.
+* @bnumsn
+
+# Critical release and governance paths.
+/.github/ @bnumsn
+/scripts/ @bnumsn
+/docs/ @bnumsn

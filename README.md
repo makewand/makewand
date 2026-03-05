@@ -45,13 +45,13 @@ Each GitHub release includes:
 
 ## Security
 
-- Vulnerability reporting policy: [SECURITY.md](/path/to/workspace/makewand/SECURITY.md)
-- Version support policy: [SUPPORT.md](/path/to/workspace/makewand/SUPPORT.md)
+- Vulnerability reporting policy: [SECURITY.md](SECURITY.md)
+- Version support policy: [SUPPORT.md](SUPPORT.md)
 
 ## Contributing
 
-- Contribution guide: [CONTRIBUTING.md](/path/to/workspace/makewand/CONTRIBUTING.md)
-- Code of Conduct: [CODE_OF_CONDUCT.md](/path/to/workspace/makewand/CODE_OF_CONDUCT.md)
+- Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Code of Conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ## First run
 
@@ -62,10 +62,12 @@ makewand doctor --strict --modes balanced,power
 
 ## Release
 
-- strategy: [docs/RELEASE_STRATEGY.md](/path/to/workspace/makewand/docs/RELEASE_STRATEGY.md)
-- prelaunch checklist: [docs/PRELAUNCH.md](/path/to/workspace/makewand/docs/PRELAUNCH.md)
-- CI workflow: [.github/workflows/ci.yml](/path/to/workspace/makewand/.github/workflows/ci.yml)
+- strategy: [docs/RELEASE_STRATEGY.md](docs/RELEASE_STRATEGY.md)
+- prelaunch checklist: [docs/PRELAUNCH.md](docs/PRELAUNCH.md)
+- GitHub hardening baseline: [docs/GITHUB_HARDENING.md](docs/GITHUB_HARDENING.md)
+- hardening script: [scripts/github_hardening.sh](scripts/github_hardening.sh)
+- CI workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml)
 
 ## License
 
-MIT. See [LICENSE](/path/to/workspace/makewand/LICENSE).
+MIT. See [LICENSE](LICENSE).
