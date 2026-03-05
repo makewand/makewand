@@ -10,11 +10,30 @@ import (
 )
 
 var (
-	previewLookPath = exec.LookPath
-	previewGOOS     = runtime.GOOS
-	previewUserHome = os.UserHomeDir
-	previewGetenv   = os.Getenv
-	previewUnsafe   = func() bool {
+	previewLookPath      = exec.LookPath
+	previewGOOS          = runtime.GOOS
+	previewUserHome      = os.UserHomeDir
+	previewGetenv        = os.Getenv
+	previewBwrapSelfTest = func(bwrapPath string) error {
+		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "true")
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+
+		detail := strings.TrimSpace(string(output))
+		if detail == "" {
+			detail = strings.TrimSpace(err.Error())
+		}
+		if detail == "" {
+			detail = "unknown bubblewrap startup failure"
+		}
+		if len(detail) > 240 {
+			detail = detail[:240] + "..."
+		}
+		return fmt.Errorf("project script preview sandbox is unavailable (%s); set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)", detail)
+	}
+	previewUnsafe = func() bool {
 		return os.Getenv("MAKEWAND_UNSAFE_HOST_EXEC") == "1"
 	}
 )
@@ -44,6 +63,13 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string) (stri
 	bwrapPath, err := previewLookPath("bwrap")
 	if err != nil {
 		return "", nil, fmt.Errorf("project script preview requires bubblewrap (bwrap); install bwrap or set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)")
+	}
+	if err := previewBwrapSelfTest(bwrapPath); err != nil {
+		msg := strings.TrimSpace(err.Error())
+		if !strings.Contains(msg, "MAKEWAND_UNSAFE_HOST_EXEC=1") {
+			msg = msg + "; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)"
+		}
+		return "", nil, fmt.Errorf("%s", msg)
 	}
 	projectPath = filepath.Clean(projectPath)
 	pathEnv := strings.TrimSpace(previewGetenv("PATH"))
