@@ -34,6 +34,7 @@ jobs:
     env:
       HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
       SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
+      PACKAGE_REPO_TOKEN: ${{ secrets.PACKAGE_REPO_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -170,20 +171,20 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Publish Homebrew tap (optional)
-        if: ${{ secrets.PACKAGE_REPO_TOKEN != '' }}
+        if: ${{ env.PACKAGE_REPO_TOKEN != '' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PACKAGE_REPO_TOKEN }}
+          GH_TOKEN: ${{ env.PACKAGE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           tap_repo="${HOMEBREW_TAP_REPO:-makewand/homebrew-makewand}"
           ./scripts/publish_homebrew_tap.sh "${tap_repo}" dist/homebrew/Formula/makewand.rb "${GITHUB_REF_NAME}"
 
       - name: Publish Scoop bucket (optional)
-        if: ${{ secrets.PACKAGE_REPO_TOKEN != '' }}
+        if: ${{ env.PACKAGE_REPO_TOKEN != '' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PACKAGE_REPO_TOKEN }}
+          GH_TOKEN: ${{ env.PACKAGE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           bucket_repo="${SCOOP_BUCKET_REPO:-makewand/scoop-makewand}"
