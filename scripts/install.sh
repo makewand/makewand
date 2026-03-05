@@ -63,11 +63,43 @@ fi
 
 ASSET="makewand_${TAG}_${OS}_${ARCH}.${EXT}"
 URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${TAG}/checksums.txt"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo "Downloading ${URL}"
 curl -fL "$URL" -o "${TMP_DIR}/${ASSET}"
+
+echo "Downloading ${CHECKSUMS_URL}"
+curl -fL "${CHECKSUMS_URL}" -o "${TMP_DIR}/checksums.txt"
+
+verify_asset_checksum() {
+  local expected actual
+  expected="$(awk -v f="${ASSET}" '$2 == f {print $1}' "${TMP_DIR}/checksums.txt" | head -n 1)"
+  if [ -z "${expected}" ]; then
+    echo "checksum entry not found for ${ASSET}" >&2
+    exit 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "${TMP_DIR}/${ASSET}" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "${TMP_DIR}/${ASSET}" | awk '{print $1}')"
+  else
+    echo "missing required command: sha256sum (or shasum)" >&2
+    exit 1
+  fi
+
+  if [ "${actual}" != "${expected}" ]; then
+    echo "checksum verification failed for ${ASSET}" >&2
+    echo "expected: ${expected}" >&2
+    echo "actual:   ${actual}" >&2
+    exit 1
+  fi
+  echo "Checksum verified: ${ASSET}"
+}
+
+verify_asset_checksum
 
 mkdir -p "$INSTALL_DIR"
 

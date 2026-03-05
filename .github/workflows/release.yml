@@ -23,6 +23,9 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Run vet
+        run: go vet ./...
+
   release:
     runs-on: ubuntu-latest
     needs: test
@@ -68,6 +71,8 @@ jobs:
           }
 
           build_one linux amd64
+          build_one linux arm64
+          build_one darwin amd64
           build_one darwin arm64
           build_one windows amd64
 
