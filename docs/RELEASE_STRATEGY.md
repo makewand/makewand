@@ -24,6 +24,8 @@
 
 - PR/push CI gate:
   - [ci.yml](../.github/workflows/ci.yml)
+- Security static analysis:
+  - [codeql.yml](../.github/workflows/codeql.yml)
 - Tag-triggered GitHub release workflow:
   - [release.yml](../.github/workflows/release.yml)
 - Dependency update automation:
