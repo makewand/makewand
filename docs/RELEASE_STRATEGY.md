@@ -6,7 +6,7 @@
 | --- | --- | --- | --- | --- |
 | GitHub Release + install script | `curl .../install.sh \| bash` | Native Go binary, fastest startup, simple support | Need GitHub release discipline | **Yes** |
 | npm package as primary channel | `npx makewand` / `npm i -g` | Familiar JS developer UX | Wraps native binary, extra package/release complexity | Not yet |
-| Homebrew tap | `brew install ...` | Great for macOS users | Ongoing tap maintenance | Later |
+| Homebrew + Scoop (auto-generated manifests) | `brew install ...` / `scoop install ...` | Better native package manager UX | Requires tap/bucket repo maintenance | **Optional now** |
 
 ## Why not npm as primary now
 
@@ -17,8 +17,8 @@
 ## Recommended rollout
 
 1. **Now**: GitHub Release artifacts + checksums + signature/provenance + one-line installer.
-2. **Next**: Homebrew tap (if macOS demand is high).
-3. **Then**: Optional npm wrapper package for discovery (not primary install path).
+2. **Now (optional)**: Homebrew/Scoop manifest auto-generation and optional push to tap/bucket repos.
+3. **Later**: Optional npm wrapper package for discovery (not primary install path).
 
 ## Implemented in this repository
 
@@ -38,6 +38,8 @@
   - [prelaunch_gate.sh](../scripts/prelaunch_gate.sh)
 - GitHub hardening baseline:
   - [GITHUB_HARDENING.md](GITHUB_HARDENING.md)
+- Package distribution:
+  - [PACKAGE_DISTRIBUTION.md](PACKAGE_DISTRIBUTION.md)
 
 ## Release operator checklist
 

@@ -34,6 +34,15 @@ Optional variables:
 go build -trimpath -o build/makewand ./cmd/makewand
 ```
 
+### Homebrew / Scoop (auto-published, optional)
+
+When package distribution repos are configured, each tag release auto-updates:
+
+- Homebrew tap formula (`makewand/homebrew-makewand`)
+- Scoop bucket manifest (`makewand/scoop-makewand`)
+
+See [docs/PACKAGE_DISTRIBUTION.md](docs/PACKAGE_DISTRIBUTION.md) for setup.
+
 ## Release integrity
 
 Each GitHub release includes:
@@ -64,6 +73,7 @@ makewand doctor --strict --modes balanced,power
 
 - strategy: [docs/RELEASE_STRATEGY.md](docs/RELEASE_STRATEGY.md)
 - prelaunch checklist: [docs/PRELAUNCH.md](docs/PRELAUNCH.md)
+- package distribution: [docs/PACKAGE_DISTRIBUTION.md](docs/PACKAGE_DISTRIBUTION.md)
 - GitHub hardening baseline: [docs/GITHUB_HARDENING.md](docs/GITHUB_HARDENING.md)
 - hardening script: [scripts/github_hardening.sh](scripts/github_hardening.sh)
 - CI workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml)

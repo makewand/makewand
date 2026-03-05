@@ -44,6 +44,24 @@ detect_default_branch() {
 need_cmd gh
 need_cmd git
 
+PROFILE="${MAKEWAND_HARDENING_PROFILE:-team}"
+APPROVAL_COUNT=1
+CODEOWNER_REVIEWS=true
+case "${PROFILE}" in
+  team)
+    APPROVAL_COUNT=1
+    CODEOWNER_REVIEWS=true
+    ;;
+  solo)
+    APPROVAL_COUNT=0
+    CODEOWNER_REVIEWS=false
+    ;;
+  *)
+    echo "invalid MAKEWAND_HARDENING_PROFILE: ${PROFILE} (expected: team or solo)" >&2
+    exit 1
+    ;;
+esac
+
 REPO="${1:-}"
 if [[ -z "${REPO}" ]]; then
   REPO="$(detect_repo || true)"
@@ -63,6 +81,7 @@ fi
 
 echo "[hardening] repo: ${REPO}"
 echo "[hardening] branch: ${BRANCH}"
+echo "[hardening] profile: ${PROFILE} (approvals=${APPROVAL_COUNT}, codeowners=${CODEOWNER_REVIEWS})"
 
 echo "[hardening] applying repository baseline settings"
 gh api --method PATCH "repos/${REPO}" \
@@ -80,7 +99,7 @@ gh api --method PUT "repos/${REPO}/vulnerability-alerts" \
 
 payload="$(mktemp)"
 trap 'rm -f "${payload}"' EXIT
-cat >"${payload}" <<'JSON'
+cat >"${payload}" <<JSON
 {
   "required_status_checks": {
     "strict": true,
@@ -91,8 +110,8 @@ cat >"${payload}" <<'JSON'
   "enforce_admins": true,
   "required_pull_request_reviews": {
     "dismiss_stale_reviews": true,
-    "require_code_owner_reviews": false,
-    "required_approving_review_count": 0
+    "require_code_owner_reviews": ${CODEOWNER_REVIEWS},
+    "required_approving_review_count": ${APPROVAL_COUNT}
   },
   "restrictions": null,
   "required_linear_history": true,
