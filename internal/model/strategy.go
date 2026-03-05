@@ -29,7 +29,7 @@ type AccessType int
 const (
 	AccessFree         AccessType = iota // Free tier (e.g. Gemini Flash)
 	AccessLocal                          // Local model (e.g. Ollama)
-	AccessSubscription                   // Paid subscription (e.g. ChatGPT Plus)
+	AccessSubscription                   // Paid subscription tier
 	AccessAPI                            // Pay-per-token API
 )
 
