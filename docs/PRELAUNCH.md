@@ -24,7 +24,11 @@ MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch
 Optional tuning:
 
 - `MAKEWAND_PROBE_TIMEOUT=60s`
+- `MAKEWAND_PROBE_RETRIES=2`
 - `MAKEWAND_DOCTOR_MODES=all` (includes `free` mode)
+- `makewand doctor --probe` now classifies probe failures as `environment`, `configuration`, or `provider`.
+  - `environment` / `configuration` probe failures are downgraded to `WARN` (to avoid mislabeling host/VPN/permission issues as product defects).
+  - `provider` probe failures remain `FAIL`.
 
 ## 3) Proxy / VPN environments
 
