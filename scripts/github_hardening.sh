@@ -140,7 +140,8 @@ cat >"${payload}" <<JSON
   "required_status_checks": {
     "strict": true,
     "contexts": [
-      "verify"
+      "verify",
+      "Analyze (Go)"
     ]
   },
   "enforce_admins": true,
