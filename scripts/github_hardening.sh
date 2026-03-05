@@ -44,24 +44,6 @@ detect_default_branch() {
 need_cmd gh
 need_cmd git
 
-PROFILE="${MAKEWAND_HARDENING_PROFILE:-team}"
-APPROVAL_COUNT=1
-CODEOWNER_REVIEWS=true
-case "${PROFILE}" in
-  team)
-    APPROVAL_COUNT=1
-    CODEOWNER_REVIEWS=true
-    ;;
-  solo)
-    APPROVAL_COUNT=0
-    CODEOWNER_REVIEWS=false
-    ;;
-  *)
-    echo "invalid MAKEWAND_HARDENING_PROFILE: ${PROFILE} (expected: team or solo)" >&2
-    exit 1
-    ;;
-esac
-
 REPO="${1:-}"
 if [[ -z "${REPO}" ]]; then
   REPO="$(detect_repo || true)"
@@ -79,9 +61,63 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
+PROFILE="${MAKEWAND_HARDENING_PROFILE:-auto}"
+APPROVAL_COUNT=1
+CODEOWNER_REVIEWS=true
+MAINTAINER_COUNT="unknown"
+
+resolve_auto_profile() {
+  local count
+  count="$(gh api "repos/${REPO}/collaborators?per_page=100" \
+    --jq '[.[] | select((.permissions.admin == true) or (.permissions.maintain == true) or (.permissions.push == true))] | length' \
+    2>/dev/null || true)"
+  if [[ "${count}" =~ ^[0-9]+$ ]]; then
+    MAINTAINER_COUNT="${count}"
+    if (( count <= 1 )); then
+      PROFILE="solo"
+      return
+    fi
+    PROFILE="team"
+    return
+  fi
+
+  count="$(gh api "repos/${REPO}/contributors?per_page=100" --jq 'length' 2>/dev/null || true)"
+  if [[ "${count}" =~ ^[0-9]+$ ]]; then
+    MAINTAINER_COUNT="${count}"
+    if (( count <= 1 )); then
+      PROFILE="solo"
+      return
+    fi
+    PROFILE="team"
+    return
+  fi
+
+  PROFILE="team"
+}
+
+if [[ "${PROFILE}" == "auto" ]]; then
+  resolve_auto_profile
+fi
+
+case "${PROFILE}" in
+  team)
+    APPROVAL_COUNT=1
+    CODEOWNER_REVIEWS=true
+    ;;
+  solo)
+    APPROVAL_COUNT=0
+    CODEOWNER_REVIEWS=false
+    ;;
+  *)
+    echo "invalid MAKEWAND_HARDENING_PROFILE: ${PROFILE} (expected: auto, team, or solo)" >&2
+    exit 1
+    ;;
+esac
+
 echo "[hardening] repo: ${REPO}"
 echo "[hardening] branch: ${BRANCH}"
 echo "[hardening] profile: ${PROFILE} (approvals=${APPROVAL_COUNT}, codeowners=${CODEOWNER_REVIEWS})"
+echo "[hardening] maintainers detected: ${MAINTAINER_COUNT}"
 
 echo "[hardening] applying repository baseline settings"
 gh api --method PATCH "repos/${REPO}" \
