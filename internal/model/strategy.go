@@ -234,7 +234,7 @@ type providerQuality struct {
 type sessionUsage struct {
 	mu       sync.Mutex
 	counts   map[string]int
-	failures map[string]int          // provider errors / timeouts
+	failures map[string]int                  // provider errors / timeouts
 	quality  map[qualityKey]*providerQuality // Beta(α,β) per (phase, provider)
 }
 
@@ -565,9 +565,9 @@ const statsFile = "routing_stats.json"
 
 // persistedStats is the JSON schema for routing_stats.json.
 type persistedStats struct {
-	Version  int                        `json:"version"`
-	Counts   map[string]int             `json:"counts"`
-	Failures map[string]int             `json:"failures"`
+	Version  int                         `json:"version"`
+	Counts   map[string]int              `json:"counts"`
+	Failures map[string]int              `json:"failures"`
 	Quality  map[string]*providerQuality `json:"quality"` // key: "<phase>:<provider>"
 }
 
