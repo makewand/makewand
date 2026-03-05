@@ -1,0 +1,19 @@
+# Build artifacts
+/build/
+/buildtest
+/modetest
+/mwtest
+/qualtest
+/versus
+/makewand
+/makewand.exe
+
+# Local test/work directories
+/benchmarks/
+/blog-project/
+/notes-api/
+/password-strength-checker/
+/top_three_project/
+
+# OS/editor noise
+.DS_Store
