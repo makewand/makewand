@@ -2,6 +2,7 @@
 
 [![Release](https://img.shields.io/github/v/release/makewand/makewand)](https://github.com/makewand/makewand/releases)
 [![CI](https://github.com/makewand/makewand/actions/workflows/ci.yml/badge.svg)](https://github.com/makewand/makewand/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/makewand/makewand/actions/workflows/codeql.yml/badge.svg)](https://github.com/makewand/makewand/actions/workflows/codeql.yml)
 [![Release Workflow](https://github.com/makewand/makewand/actions/workflows/release.yml/badge.svg)](https://github.com/makewand/makewand/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/makewand/makewand/blob/master/LICENSE)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-blue)](https://github.com/makewand/makewand/blob/master/SECURITY.md)
@@ -77,6 +78,7 @@ makewand doctor --strict --modes balanced,power
 - GitHub hardening baseline: [docs/GITHUB_HARDENING.md](docs/GITHUB_HARDENING.md)
 - hardening script: [scripts/github_hardening.sh](scripts/github_hardening.sh)
 - CI workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml)
+- CodeQL workflow: [.github/workflows/codeql.yml](.github/workflows/codeql.yml)
 
 ## License
 
