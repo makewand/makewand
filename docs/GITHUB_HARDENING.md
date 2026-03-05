@@ -12,7 +12,7 @@ This repository includes an automation script to apply a practical release basel
 2. Security:
    - enable Dependabot vulnerability alerts
 3. Default branch protection:
-   - require status check `verify`
+   - require status checks `verify` and `Analyze (Go)` (CodeQL)
    - require pull request before merge
    - auto-select profile based on maintainer count:
      - `team`: require 1 approval + CODEOWNERS review
@@ -46,7 +46,7 @@ Prerequisites:
 
 ## Notes
 
-- The status check context is set to `verify` (from `.github/workflows/ci.yml`).
+- The status check contexts are `verify` (CI) and `Analyze (Go)` (CodeQL).
 - If CI job names change, update `scripts/github_hardening.sh` accordingly.
 - `CODEOWNERS` is defined at `.github/CODEOWNERS`.
 - Default profile is `auto`.
