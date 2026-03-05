@@ -10,6 +10,8 @@ AI coding assistant CLI (Go).
 curl -fsSL https://raw.githubusercontent.com/makewand/makewand/master/scripts/install.sh | bash
 ```
 
+The installer verifies downloaded binaries against release `checksums.txt` before installing.
+
 Optional variables:
 
 - `MAKEWAND_VERSION=v0.1.0` (default: latest)
