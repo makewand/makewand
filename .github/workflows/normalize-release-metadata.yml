@@ -1,0 +1,74 @@
+name: Normalize Release Metadata
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/normalize-release-metadata.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  normalize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Normalize release notes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const semver = /^v(\d+)\.(\d+)\.(\d+)$/;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+
+            const stable = releases
+              .filter((r) => !r.draft && !r.prerelease && semver.test(r.tag_name))
+              .map((r) => {
+                const m = r.tag_name.match(semver);
+                return {
+                  release: r,
+                  major: Number(m[1]),
+                  minor: Number(m[2]),
+                  patch: Number(m[3]),
+                };
+              })
+              .sort((a, b) => {
+                if (a.major !== b.major) return a.major - b.major;
+                if (a.minor !== b.minor) return a.minor - b.minor;
+                return a.patch - b.patch;
+              });
+
+            if (stable.length === 0) {
+              core.info("No stable semver releases found.");
+              return;
+            }
+
+            for (let i = 0; i < stable.length; i++) {
+              const cur = stable[i].release;
+              const prev = i > 0 ? stable[i - 1].release : null;
+              const expectedBody = prev
+                ? `**Full Changelog**: https://github.com/${owner}/${repo}/compare/${prev.tag_name}...${cur.tag_name}`
+                : `**Full Changelog**: https://github.com/${owner}/${repo}/commits/${cur.tag_name}`;
+
+              const currentBody = (cur.body || "").trim();
+              if (currentBody === expectedBody) {
+                core.info(`No change: ${cur.tag_name}`);
+                continue;
+              }
+
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: cur.id,
+                body: expectedBody,
+              });
+              core.info(`Updated: ${cur.tag_name}`);
+            }
