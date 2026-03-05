@@ -14,13 +14,12 @@ This repository includes an automation script to apply a practical release basel
 3. Default branch protection:
    - require status check `verify`
    - require pull request before merge
-   - require 1 approval
-   - require CODEOWNERS review
    - dismiss stale approvals on new commits
    - require conversation resolution
    - require linear history
    - block force-push and deletion
    - enforce for admins
+   - no mandatory approval count (solo-maintainer friendly default)
 
 ## Run
 
@@ -42,3 +41,5 @@ Prerequisites:
 - The status check context is set to `verify` (from `.github/workflows/ci.yml`).
 - If CI job names change, update `scripts/github_hardening.sh` accordingly.
 - `CODEOWNERS` is defined at `.github/CODEOWNERS`.
+- If your team has multiple maintainers, increase `required_approving_review_count`
+  and enable `require_code_owner_reviews` in `scripts/github_hardening.sh`.
