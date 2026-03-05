@@ -36,7 +36,7 @@ cp "${MANIFEST_PATH}" "${tmp_dir}/makewand.json"
 git -C "${tmp_dir}" config user.name "github-actions[bot]"
 git -C "${tmp_dir}" config user.email "github-actions[bot]@users.noreply.github.com"
 
-if git -C "${tmp_dir}" diff --quiet -- makewand.json; then
+if [[ -z "$(git -C "${tmp_dir}" status --porcelain -- makewand.json)" ]]; then
   echo "Scoop manifest unchanged; skipping commit."
   exit 0
 fi
