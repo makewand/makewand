@@ -26,7 +26,7 @@ type scriptedProvider struct {
 	failChat bool
 }
 
-func (p *scriptedProvider) Name() string { return p.provName }
+func (p *scriptedProvider) Name() string      { return p.provName }
 func (p *scriptedProvider) IsAvailable() bool { return true }
 func (p *scriptedProvider) ChatStream(_ context.Context, _ []Message, _ string, _ int) (<-chan StreamChunk, error) {
 	ch := make(chan StreamChunk, 1)
@@ -148,7 +148,7 @@ func TestJudgeSelect_FallsBackToFirstOnNoWinnerLine(t *testing.T) {
 func TestChatBest_PowerMode_IncludesJudgeCost(t *testing.T) {
 	// generators cost 1.0 each; judge costs 3.0 → expected total = 5.0
 	claude := &scriptedProvider{provName: "claude", content: "claude code", cost: 1.0}
-	codex := &scriptedProvider{provName: "codex", content: "WINNER: 1\njudge selected claude", cost: 3.0}  // judge
+	codex := &scriptedProvider{provName: "codex", content: "WINNER: 1\njudge selected claude", cost: 3.0} // judge
 	gemini := &scriptedProvider{provName: "gemini", content: "gemini gen", cost: 1.0}
 
 	// powerEnsembleTable[PhaseReview] = {Generators: [gemini, claude], Judge: codex}
