@@ -10,13 +10,16 @@ import (
 func TestWrapPreviewProjectCommand_RequiresLinuxSandbox(t *testing.T) {
 	oldGOOS := previewGOOS
 	oldUnsafe := previewUnsafe
+	oldSelfTest := previewBwrapSelfTest
 	t.Cleanup(func() {
 		previewGOOS = oldGOOS
 		previewUnsafe = oldUnsafe
+		previewBwrapSelfTest = oldSelfTest
 	})
 
 	previewGOOS = "darwin"
 	previewUnsafe = func() bool { return false }
+	previewBwrapSelfTest = func(string) error { return nil }
 
 	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
 	if err == nil {
@@ -31,15 +34,18 @@ func TestWrapPreviewProjectCommand_RequiresBwrapOnLinux(t *testing.T) {
 	oldGOOS := previewGOOS
 	oldUnsafe := previewUnsafe
 	oldLookPath := previewLookPath
+	oldSelfTest := previewBwrapSelfTest
 	t.Cleanup(func() {
 		previewGOOS = oldGOOS
 		previewUnsafe = oldUnsafe
 		previewLookPath = oldLookPath
+		previewBwrapSelfTest = oldSelfTest
 	})
 
 	previewGOOS = "linux"
 	previewUnsafe = func() bool { return false }
 	previewLookPath = func(string) (string, error) { return "", errors.New("missing") }
+	previewBwrapSelfTest = func(string) error { return nil }
 
 	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
 	if err == nil {
@@ -52,10 +58,13 @@ func TestWrapPreviewProjectCommand_RequiresBwrapOnLinux(t *testing.T) {
 
 func TestWrapPreviewProjectCommand_UnsafeBypass(t *testing.T) {
 	oldUnsafe := previewUnsafe
+	oldSelfTest := previewBwrapSelfTest
 	t.Cleanup(func() {
 		previewUnsafe = oldUnsafe
+		previewBwrapSelfTest = oldSelfTest
 	})
 	previewUnsafe = func() bool { return true }
+	previewBwrapSelfTest = func(string) error { return nil }
 
 	cmd, args, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
 	if err != nil {
@@ -75,18 +84,21 @@ func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
 	oldLookPath := previewLookPath
 	oldUserHome := previewUserHome
 	oldGetenv := previewGetenv
+	oldSelfTest := previewBwrapSelfTest
 	t.Cleanup(func() {
 		previewGOOS = oldGOOS
 		previewUnsafe = oldUnsafe
 		previewLookPath = oldLookPath
 		previewUserHome = oldUserHome
 		previewGetenv = oldGetenv
+		previewBwrapSelfTest = oldSelfTest
 	})
 
 	previewGOOS = "linux"
 	previewUnsafe = func() bool { return false }
 	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
 	previewUserHome = func() (string, error) { return "/home/alice", nil }
+	previewBwrapSelfTest = func(string) error { return nil }
 	previewGetenv = func(key string) string {
 		if key == "PATH" {
 			return "/usr/bin:/bin"
@@ -124,18 +136,21 @@ func TestWrapPreviewProjectCommand_MasksSensitiveHomeSubpathsWhenProjectInsideHo
 	oldLookPath := previewLookPath
 	oldUserHome := previewUserHome
 	oldGetenv := previewGetenv
+	oldSelfTest := previewBwrapSelfTest
 	t.Cleanup(func() {
 		previewGOOS = oldGOOS
 		previewUnsafe = oldUnsafe
 		previewLookPath = oldLookPath
 		previewUserHome = oldUserHome
 		previewGetenv = oldGetenv
+		previewBwrapSelfTest = oldSelfTest
 	})
 
 	previewGOOS = "linux"
 	previewUnsafe = func() bool { return false }
 	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
 	previewUserHome = func() (string, error) { return "/home/alice", nil }
+	previewBwrapSelfTest = func(string) error { return nil }
 	previewGetenv = func(key string) string {
 		if key == "PATH" {
 			return "/usr/bin:/bin"
@@ -167,6 +182,35 @@ func TestPathWithin(t *testing.T) {
 	}
 	if pathWithin(base, "/tmp") {
 		t.Fatalf("pathWithin(%q, %q)=true, want false", base, "/tmp")
+	}
+}
+
+func TestWrapPreviewProjectCommand_BwrapSelfTestFailure(t *testing.T) {
+	oldGOOS := previewGOOS
+	oldUnsafe := previewUnsafe
+	oldLookPath := previewLookPath
+	oldSelfTest := previewBwrapSelfTest
+	t.Cleanup(func() {
+		previewGOOS = oldGOOS
+		previewUnsafe = oldUnsafe
+		previewLookPath = oldLookPath
+		previewBwrapSelfTest = oldSelfTest
+	})
+
+	previewGOOS = "linux"
+	previewUnsafe = func() bool { return false }
+	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
+	previewBwrapSelfTest = func(string) error { return errors.New("setting up uid map: Permission denied") }
+
+	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
+	if err == nil {
+		t.Fatal("expected bwrap self-test error")
+	}
+	if !strings.Contains(err.Error(), "uid map") {
+		t.Fatalf("error=%q, want uid map detail", err.Error())
+	}
+	if !strings.Contains(err.Error(), "MAKEWAND_UNSAFE_HOST_EXEC=1") {
+		t.Fatalf("error=%q, want unsafe bypass hint", err.Error())
 	}
 }
 
