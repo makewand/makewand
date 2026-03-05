@@ -24,6 +24,19 @@ Optional variables:
 go build -trimpath -o build/makewand ./cmd/makewand
 ```
 
+## Release integrity
+
+Each GitHub release includes:
+
+- platform binaries
+- `checksums.txt`
+- `checksums.txt.sig` (keyless cosign signature)
+- `checksums.txt.pem` (signing certificate)
+
+## Security
+
+- Vulnerability reporting policy: [SECURITY.md](/path/to/workspace/makewand/SECURITY.md)
+
 ## First run
 
 ```bash
@@ -35,3 +48,7 @@ makewand doctor --strict --modes balanced,power
 
 - strategy: [docs/RELEASE_STRATEGY.md](/path/to/workspace/makewand/docs/RELEASE_STRATEGY.md)
 - prelaunch checklist: [docs/PRELAUNCH.md](/path/to/workspace/makewand/docs/PRELAUNCH.md)
+
+## License
+
+MIT. See [LICENSE](/path/to/workspace/makewand/LICENSE).

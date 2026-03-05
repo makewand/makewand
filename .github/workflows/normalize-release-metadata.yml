@@ -54,12 +54,39 @@ jobs:
             for (let i = 0; i < stable.length; i++) {
               const cur = stable[i].release;
               const prev = i > 0 ? stable[i - 1].release : null;
-              const expectedBody = prev
+              const expectedChangelogLine = prev
                 ? `**Full Changelog**: https://github.com/${owner}/${repo}/compare/${prev.tag_name}...${cur.tag_name}`
                 : `**Full Changelog**: https://github.com/${owner}/${repo}/commits/${cur.tag_name}`;
 
               const currentBody = (cur.body || "").trim();
-              if (currentBody === expectedBody) {
+              const fixedOwnerBody = currentBody.replaceAll(
+                "https://github.com/bnumsn/makewand",
+                `https://github.com/${owner}/${repo}`
+              );
+
+              const seen = new Set();
+              const dedupedLines = [];
+              for (const line of fixedOwnerBody.split("\n")) {
+                const key = line.trim();
+                if (key === "") {
+                  dedupedLines.push(line);
+                  continue;
+                }
+                if (seen.has(key)) {
+                  continue;
+                }
+                seen.add(key);
+                dedupedLines.push(line);
+              }
+
+              let normalizedBody = dedupedLines.join("\n").trim();
+              if (!normalizedBody.includes("**Full Changelog**:")) {
+                normalizedBody = normalizedBody
+                  ? `${normalizedBody}\n\n${expectedChangelogLine}`
+                  : expectedChangelogLine;
+              }
+
+              if (normalizedBody === currentBody) {
                 core.info(`No change: ${cur.tag_name}`);
                 continue;
               }
@@ -68,7 +95,7 @@ jobs:
                 owner,
                 repo,
                 release_id: cur.id,
-                body: expectedBody,
+                body: normalizedBody,
               });
               core.info(`Updated: ${cur.tag_name}`);
             }

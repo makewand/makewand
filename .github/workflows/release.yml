@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   test:
@@ -32,6 +34,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -78,6 +82,70 @@ jobs:
 
           (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums (keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign-blob \
+            --yes \
+            --output-signature dist/checksums.txt.sig \
+            --output-certificate dist/checksums.txt.pem \
+            dist/checksums.txt
+
+      - name: Build release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          REPO="${GITHUB_REPOSITORY}"
+          PREV_TAG="$(git tag --sort=-version:refname | grep '^v' | grep -Fxv "${VERSION}" | head -n 1 || true)"
+
+          {
+            echo "## Highlights"
+            if [ -n "${PREV_TAG}" ]; then
+              git log --pretty='- %s (%h)' "${PREV_TAG}..${VERSION}" | sed -n '1,40p'
+            else
+              git log --pretty='- %s (%h)' -n 20 | sed -n '1,40p'
+            fi
+            echo
+            echo "## Install"
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${REPO}/master/scripts/install.sh | bash"
+            echo '```'
+            echo
+            echo "## Verify download integrity"
+            echo '```bash'
+            echo 'sha256sum -c checksums.txt'
+            echo '```'
+            echo
+            echo "## Verify checksum signature (cosign keyless)"
+            echo '```bash'
+            echo "cosign verify-blob \\"
+            echo "  --certificate checksums.txt.pem \\"
+            echo "  --signature checksums.txt.sig \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+' \\"
+            echo "  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \\"
+            echo "  checksums.txt"
+            echo '```'
+            echo
+            if [ -n "${PREV_TAG}" ]; then
+              echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG}...${VERSION}"
+            else
+              echo "**Full Changelog**: https://github.com/${REPO}/commits/${VERSION}"
+            fi
+          } > dist/release-notes.md
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -85,4 +153,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/checksums.txt
-          generate_release_notes: true
+            dist/checksums.txt.sig
+            dist/checksums.txt.pem
+          body_path: dist/release-notes.md
+          fail_on_unmatched_files: true
