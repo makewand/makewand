@@ -1,6 +1,15 @@
 # makewand
 
+[![Release](https://img.shields.io/github/v/release/makewand/makewand)](https://github.com/makewand/makewand/releases)
+[![Release Workflow](https://github.com/makewand/makewand/actions/workflows/release.yml/badge.svg)](https://github.com/makewand/makewand/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/makewand/makewand/blob/master/LICENSE)
+[![Security Policy](https://img.shields.io/badge/Security-Policy-blue)](https://github.com/makewand/makewand/blob/master/SECURITY.md)
+
 AI coding assistant CLI (Go).
+
+An adaptive multi-provider coding assistant for CLI workflows, with
+mode-based routing (`free/economy/balanced/power`) and production-style release
+integrity checks.
 
 ## Install
 
@@ -36,6 +45,11 @@ Each GitHub release includes:
 ## Security
 
 - Vulnerability reporting policy: [SECURITY.md](/mnt/data/makewand/SECURITY.md)
+
+## Contributing
+
+- Contribution guide: [CONTRIBUTING.md](/mnt/data/makewand/CONTRIBUTING.md)
+- Code of Conduct: [CODE_OF_CONDUCT.md](/mnt/data/makewand/CODE_OF_CONDUCT.md)
 
 ## First run
 
