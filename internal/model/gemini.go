@@ -1,7 +1,6 @@
 package model
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -106,36 +105,25 @@ func (g *Gemini) Chat(ctx context.Context, messages []Message, system string, ma
 		}
 	}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", Usage{}, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
+	body, err := marshalProviderJSON("gemini", reqBody)
 	if err != nil {
 		return "", Usage{}, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", g.apiKey)
-
-	resp, err := g.chatClient.Do(req)
+	req, err := newProviderJSONRequest(ctx, "gemini", http.MethodPost, apiURL, body, map[string]string{
+		"Content-Type":   "application/json",
+		"x-goog-api-key": g.apiKey,
+	})
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("gemini API request: %w", err)
+		return "", Usage{}, err
 	}
-	defer resp.Body.Close()
-
-	respBody, err := limitedReadAll(resp.Body, maxResponseBytes)
+	respBody, err := doProviderJSONRequest(g.chatClient, req, "gemini", "API request")
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", Usage{}, fmt.Errorf("gemini API error (%d): %s", resp.StatusCode, string(respBody))
+		return "", Usage{}, err
 	}
 
 	var result geminiResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", Usage{}, fmt.Errorf("parse response: %w", err)
+	if err := decodeProviderJSON("gemini", "parse response", respBody, &result); err != nil {
+		return "", Usage{}, err
 	}
 
 	var b strings.Builder
@@ -192,72 +180,35 @@ func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system stri
 		}
 	}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
+	body, err := marshalProviderJSON("gemini", reqBody)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", g.apiKey)
-
-	resp, err := g.streamClient.Do(req)
+	req, err := newProviderJSONRequest(ctx, "gemini", http.MethodPost, apiURL, body, map[string]string{
+		"Content-Type":   "application/json",
+		"x-goog-api-key": g.apiKey,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("gemini API stream request: %w", err)
+		return nil, err
+	}
+	resp, err := openProviderStream(g.streamClient, req, "gemini", "API stream request")
+	if err != nil {
+		return nil, err
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := limitedReadAll(resp.Body, maxResponseBytes)
-		resp.Body.Close()
-		return nil, fmt.Errorf("gemini API error (%d): %s", resp.StatusCode, string(respBody))
-	}
-
-	ch := make(chan StreamChunk, 64)
-	go func() {
-		defer close(ch)
-		defer resp.Body.Close()
-
-		dataCh := make(chan string, 64)
-		errCh := make(chan error, 1)
-		go func() {
-			defer close(dataCh)
-			errCh <- readSSE(ctx, resp.Body, dataCh)
-			close(errCh)
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case err, ok := <-errCh:
-				if !ok {
-					errCh = nil
-					continue
-				}
-				errCh = nil
-				if err != nil {
-					ch <- StreamChunk{Error: err}
-					return
-				}
-			case data, ok := <-dataCh:
-				if !ok {
-					ch <- StreamChunk{Done: true}
-					return
-				}
-				var result geminiResponse
-				if json.Unmarshal([]byte(data), &result) == nil && len(result.Candidates) > 0 {
-					for _, p := range result.Candidates[0].Content.Parts {
-						if p.Text != "" {
-							ch <- StreamChunk{Content: p.Text}
-						}
-					}
-				}
+	ch := streamSSE(ctx, resp.Body, func(data string) []StreamChunk {
+		var result geminiResponse
+		if json.Unmarshal([]byte(data), &result) != nil || len(result.Candidates) == 0 {
+			return nil
+		}
+		var chunks []StreamChunk
+		for _, p := range result.Candidates[0].Content.Parts {
+			if p.Text != "" {
+				chunks = append(chunks, StreamChunk{Content: p.Text})
 			}
 		}
-	}()
+		return chunks
+	}, func() { resp.Body.Close() })
 
 	return ch, nil
 }

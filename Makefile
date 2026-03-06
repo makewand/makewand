@@ -1,5 +1,5 @@
 BINARY_NAME=makewand
-VERSION=0.1.0
+VERSION=0.1.10
 BUILD_DIR=build
 MAIN_PKG=./cmd/makewand
 

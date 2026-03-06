@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -195,21 +194,12 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 	}
 
 	// Refresh file tree synchronously so downstream review sees the latest files.
-	if a.project != nil {
-		if err := a.project.ScanFiles(); err != nil {
-			log.Printf("scan files: %v", err)
-		} else {
-			a.fileTree.SetFiles(a.project.Files)
-		}
-	}
+	a.refreshProjectFiles()
 
 	if a.pendingPhase == pendingPhaseReview {
 		// Review fix files written — continue to deps phase
 		a.progress.SetStepStatus(stepReview, StepDone)
 		a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressReviewApplied, msg.written, a.buildReviewProvider))
-		cmds = append(cmds, func() tea.Msg {
-			return filesUpdatedMsg{}
-		})
 		depsModel, depsCmd := a.startDepsPhase()
 		a = depsModel.(App)
 		if depsCmd != nil {
@@ -764,10 +754,6 @@ func (a App) handleAutoFixFileWriteComplete() (tea.Model, tea.Cmd) {
 	depsApproved := a.depsInstallApproved
 	testsApproved := a.testsRunApproved
 	var cmds []tea.Cmd
-
-	cmds = append(cmds, func() tea.Msg {
-		return filesUpdatedMsg{}
-	})
 
 	// Retry: re-run deps + tests
 	cmds = append(cmds, func() tea.Msg {

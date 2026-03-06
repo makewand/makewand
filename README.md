@@ -78,6 +78,32 @@ makewand setup
 makewand doctor --strict --modes balanced,power
 ```
 
+## Ollama / Ollama
+
+Remote Ollama endpoints are blocked by default. To allow a non-localhost Ollama
+host, set:
+默认只允许本机 Ollama。若要连接非 localhost 的 Ollama，请设置：
+
+```bash
+export MAKEWAND_OLLAMA_ALLOW_REMOTE=1
+```
+
+## Custom Providers / 自定义 Provider
+
+Custom command providers support three prompt delivery modes:
+自定义命令 Provider 支持三种 prompt 传递方式：
+
+- `prompt_mode: "stdin"`: recommended and safer
+- `prompt_mode: "arg"`: pass prompt as the last argv
+- empty / omitted: legacy `{{prompt}}` or argv append behavior
+
+If you wrap a provider with `sh -c`, `bash -c`, `cmd /c`, or similar shell
+adapters, prefer `prompt_mode: "stdin"`. `makewand setup` and `makewand doctor`
+will warn on legacy or shell-based adapters.
+如果用 `sh -c`、`bash -c`、`cmd /c` 之类的 shell 适配层包装 Provider，建议使用
+`prompt_mode: "stdin"`。`makewand setup` 和 `makewand doctor` 会对 legacy 或
+shell 适配器给出警告。
+
 ## Release / 发布
 
 - strategy: [docs/RELEASE_STRATEGY.md](docs/RELEASE_STRATEGY.md)

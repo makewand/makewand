@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
@@ -423,12 +423,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.startTestsPhase()
 
 	case filesUpdatedMsg:
-		if a.project != nil {
-			if err := a.project.ScanFiles(); err != nil {
-				log.Printf("scan files: %v", err)
-			}
-			a.fileTree.SetFiles(a.project.Files)
-		}
+		a.refreshProjectFiles()
 
 	case spinner.TickMsg:
 		var spinCmd tea.Cmd
@@ -471,6 +466,20 @@ func (a App) buildComplete() (tea.Model, tea.Cmd) {
 	return a, func() tea.Msg {
 		return filesUpdatedMsg{}
 	}
+}
+
+func (a *App) refreshProjectFiles() {
+	if a.project == nil {
+		return
+	}
+	if err := a.project.ScanFiles(); err != nil {
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf(i18n.Msg().ErrFileRefresh, err),
+		})
+		return
+	}
+	a.fileTree.SetFiles(a.project.Files)
 }
 
 // View implements tea.Model.
@@ -605,16 +614,7 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 		}
 		candidates = append(candidates, filepath.Join(os.TempDir(), "makewand-trace.jsonl"))
 
-		var fileSink *jsonlTraceSink
-		var tracePath string
-		var sinkErr error
-		for _, path := range candidates {
-			fileSink, sinkErr = newJSONLTraceSink(path)
-			if sinkErr == nil {
-				tracePath = path
-				break
-			}
-		}
+		fileSink, tracePath, sinkErr := diag.OpenFirstJSONLTraceSink(candidates)
 		traceSink := &debugTraceSink{
 			file:  fileSink,
 			route: routeState,
@@ -623,16 +623,16 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 		defer traceSink.Close()
 
 		if fileSink == nil {
-			fmt.Fprintf(os.Stderr, "Warning: debug trace disabled: %v\n", sinkErr)
+			diag.Stderr().WarnErr("debug trace disabled", sinkErr)
 		} else {
-			fmt.Fprintf(os.Stderr, "Debug trace enabled: %s\n", tracePath)
+			diag.Stderr().InfoPath("Debug trace enabled", tracePath)
 		}
 	}
 
 	// Load cross-session routing quality statistics.
 	if dir, err := config.ConfigDir(); err == nil {
 		if err := app.router.LoadStats(dir); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not load routing stats: %v\n", err)
+			diag.Stderr().WarnErr("could not load routing stats", err)
 		}
 	}
 
@@ -643,7 +643,7 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 	if dir, dirErr := config.ConfigDir(); dirErr == nil {
 		if finalApp, ok := finalModel.(App); ok {
 			if err := finalApp.router.SaveStats(dir); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not save routing stats: %v\n", err)
+				diag.Stderr().WarnErr("could not save routing stats", err)
 			}
 		}
 	}

@@ -46,6 +46,18 @@ Gemini CLI proxy behavior:
 - `MAKEWAND_GEMINI_USE_PROXY=1`: always respect proxy env
 - `MAKEWAND_GEMINI_BYPASS_PROXY=1`: force `NO_PROXY` for Google hosts
 
+Remote Ollama behavior:
+
+- default: only localhost / 127.0.0.1 / ::1 are allowed
+- `MAKEWAND_OLLAMA_ALLOW_REMOTE=1`: allow remote Ollama hosts explicitly
+
+Custom provider prompt delivery:
+
+- `prompt_mode: "stdin"` is the preferred safe path
+- `prompt_mode: "arg"` still works, but `doctor` warns because argv-based prompt delivery is easier to misuse
+- empty `prompt_mode` keeps legacy `{{prompt}}` / argv-append behavior for backward compatibility
+- shell adapters such as `sh -c` / `bash -c` / `cmd /c` are allowed, but `setup` and `doctor` warn unless prompt delivery is moved to stdin
+
 ## 4) CI-friendly command
 
 ```bash

@@ -296,10 +296,11 @@ func TestNewRouter_LoadsCustomProviderFromConfig(t *testing.T) {
 	cfg.CodingModel = "private"
 	cfg.CustomProviders = []config.CustomProvider{
 		{
-			Name:    "private",
-			Command: script,
-			Args:    []string{"--prompt", "{{prompt}}"},
-			Access:  "subscription",
+			Name:       "private",
+			Command:    script,
+			Args:       []string{"--prompt", "{{prompt}}"},
+			Access:     "subscription",
+			PromptMode: config.CustomPromptModeLegacy,
 		},
 	}
 
@@ -338,10 +339,11 @@ func TestRouteByMode_CustomProviderAccessAPIExcludedInFreeMode(t *testing.T) {
 	cfg.UsageMode = "free"
 	cfg.CustomProviders = []config.CustomProvider{
 		{
-			Name:    "private-api",
-			Command: "/bin/sh",
-			Args:    []string{"-c", "echo ok", "{{prompt}}"},
-			Access:  "api",
+			Name:       "private-api",
+			Command:    "/bin/sh",
+			Args:       []string{"-c", "echo ok", "{{prompt}}"},
+			Access:     "api",
+			PromptMode: config.CustomPromptModeLegacy,
 		},
 	}
 
@@ -365,9 +367,10 @@ func TestNewRouter_SkipsUnusableCustomProvider(t *testing.T) {
 	cfg.OllamaURL = ""
 	cfg.CustomProviders = []config.CustomProvider{
 		{
-			Name:    "broken-private",
-			Command: "/definitely/not/a/real/provider",
-			Access:  "subscription",
+			Name:       "broken-private",
+			Command:    "/definitely/not/a/real/provider",
+			Access:     "subscription",
+			PromptMode: config.CustomPromptModeStdin,
 		},
 	}
 

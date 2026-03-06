@@ -1,14 +1,14 @@
 package model
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,7 +32,7 @@ type Ollama struct {
 const ollamaAvailCacheTTL = 30 * time.Second
 
 // validateOllamaURL checks that the base URL is a valid http/https URL.
-// Returns an error for invalid schemes or empty hosts.
+// Non-localhost hosts are blocked unless MAKEWAND_OLLAMA_ALLOW_REMOTE=1 is set.
 func validateOllamaURL(baseURL string) error {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -46,9 +46,16 @@ func validateOllamaURL(baseURL string) error {
 	}
 	host := u.Hostname()
 	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-		log.Printf("warning: ollama URL host %q is not localhost — ensure this is intentional", host)
+		if !ollamaAllowRemote() {
+			return fmt.Errorf("ollama URL host %q is not localhost — set MAKEWAND_OLLAMA_ALLOW_REMOTE=1 to allow remote hosts", host)
+		}
 	}
 	return nil
+}
+
+func ollamaAllowRemote() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("MAKEWAND_OLLAMA_ALLOW_REMOTE")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 // NewOllama creates a new Ollama provider.
@@ -57,7 +64,6 @@ func NewOllama(baseURL, model string) *Ollama {
 		model = ollamaDefaultModel
 	}
 	if err := validateOllamaURL(baseURL); err != nil {
-		log.Printf("ollama: %v — provider disabled", err)
 		baseURL = "" // disable provider
 	}
 	return &Ollama{
@@ -140,35 +146,24 @@ func (o *Ollama) Chat(ctx context.Context, messages []Message, system string, ma
 		Options:  &ollamaOptions{NumPredict: maxTokens},
 	}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", Usage{}, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", o.baseURL+"/api/chat", bytes.NewReader(body))
+	body, err := marshalProviderJSON("ollama", reqBody)
 	if err != nil {
 		return "", Usage{}, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := o.chatClient.Do(req)
+	req, err := newProviderJSONRequest(ctx, "ollama", http.MethodPost, o.baseURL+"/api/chat", body, map[string]string{
+		"Content-Type": "application/json",
+	})
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("ollama API request: %w", err)
+		return "", Usage{}, err
 	}
-	defer resp.Body.Close()
-
-	respBody, err := limitedReadAll(resp.Body, maxResponseBytes)
+	respBody, err := doProviderJSONRequest(o.chatClient, req, "ollama", "API request")
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", Usage{}, fmt.Errorf("ollama API error (%d): %s", resp.StatusCode, string(respBody))
+		return "", Usage{}, err
 	}
 
 	var result ollamaResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", Usage{}, fmt.Errorf("parse response: %w", err)
+	if err := decodeProviderJSON("ollama", "parse response", respBody, &result); err != nil {
+		return "", Usage{}, err
 	}
 
 	usage := Usage{
@@ -201,26 +196,19 @@ func (o *Ollama) ChatStream(ctx context.Context, messages []Message, system stri
 		Options:  &ollamaOptions{NumPredict: maxTokens},
 	}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", o.baseURL+"/api/chat", bytes.NewReader(body))
+	body, err := marshalProviderJSON("ollama", reqBody)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := o.streamClient.Do(req)
+	req, err := newProviderJSONRequest(ctx, "ollama", http.MethodPost, o.baseURL+"/api/chat", body, map[string]string{
+		"Content-Type": "application/json",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("ollama API stream request: %w", err)
+		return nil, err
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := limitedReadAll(resp.Body, maxResponseBytes)
-		resp.Body.Close()
-		return nil, fmt.Errorf("ollama API error (%d): %s", resp.StatusCode, string(respBody))
+	resp, err := openProviderStream(o.streamClient, req, "ollama", "API stream request")
+	if err != nil {
+		return nil, err
 	}
 
 	ch := make(chan StreamChunk, 64)
@@ -239,7 +227,7 @@ func (o *Ollama) ChatStream(ctx context.Context, messages []Message, system stri
 			var result ollamaResponse
 			if err := decoder.Decode(&result); err != nil {
 				if err != io.EOF {
-					ch <- StreamChunk{Error: err}
+					ch <- StreamChunk{Error: wrapResponseReadError("ollama", "stream decode", err)}
 				}
 				break
 			}

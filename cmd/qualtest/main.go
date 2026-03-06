@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 )
@@ -69,7 +70,7 @@ type modeResult struct {
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		diag.Stderr().ErrorErr("config load failed", err)
 		os.Exit(1)
 	}
 
