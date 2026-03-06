@@ -284,6 +284,9 @@ func TestE2ENewWizardBuildsProject(t *testing.T) {
 
 	transcript, err := runExpectWizardFlow(t, bin, cfgDir, runDir, toolDir)
 	if err != nil {
+		if isPTYUnavailable(transcript) {
+			t.Skipf("skipping wizard E2E: no PTY available\n%s", transcript)
+		}
 		t.Fatalf("runExpectWizardFlow() error = %v\ntranscript:\n%s", err, transcript)
 	}
 
@@ -483,6 +486,10 @@ func stripANSIForTest(s string) string {
 		b.WriteByte(ch)
 	}
 	return b.String()
+}
+
+func isPTYUnavailable(s string) bool {
+	return strings.Contains(strings.ToLower(s), "no more ptys")
 }
 
 type doctorJSONReport struct {
