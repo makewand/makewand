@@ -172,7 +172,7 @@ func NewRouter(cfg *config.Config) *Router {
 			// Built-ins win when names collide to avoid surprising overrides.
 			continue
 		}
-		r.providers[name] = NewCommandCLI(name, command, cp.Args)
+		r.providers[name] = NewCommandCLI(name, command, cp.Args, config.EffectiveCustomProviderPromptMode(cp))
 
 		access := strings.TrimSpace(cp.Access)
 		if access == "" {
@@ -319,7 +319,7 @@ func isTimeoutErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if ErrorKindOf(err) == ErrorKindTimeout {
 		return true
 	}
 	type timeoutErr interface {
@@ -689,10 +689,10 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 func (r *Router) Get(name string) (Provider, error) {
 	p, ok := r.providers[name]
 	if !ok {
-		return nil, fmt.Errorf("model provider %q not configured", name)
+		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q not configured", name), nil)
 	}
 	if !p.IsAvailable() {
-		return nil, fmt.Errorf("model provider %q is not available", name)
+		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q is not available", name), nil)
 	}
 	return p, nil
 }

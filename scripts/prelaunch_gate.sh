@@ -9,8 +9,8 @@ if [[ -z "${GOCACHE:-}" ]]; then
 fi
 mkdir -p "$GOCACHE"
 
-echo "[prelaunch] go test ./..."
-go test ./...
+echo "[prelaunch] test gate"
+bash ./scripts/test_gate.sh
 
 echo "[prelaunch] go vet ./..."
 go vet ./...

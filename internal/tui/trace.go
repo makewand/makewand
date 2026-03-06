@@ -1,50 +1,23 @@
 package tui
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 )
 
-type jsonlTraceSink struct {
-	mu sync.Mutex
-	f  *os.File
-}
-
-func newJSONLTraceSink(path string) (*jsonlTraceSink, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return nil, err
-	}
-	return &jsonlTraceSink{f: f}, nil
-}
-
-func (s *jsonlTraceSink) Trace(event model.TraceEvent) {
-	b, err := json.Marshal(event)
-	if err != nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, _ = s.f.Write(b)
-	_, _ = s.f.Write([]byte("\n"))
-}
-
-func (s *jsonlTraceSink) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.f.Close()
-}
-
 type debugTraceSink struct {
-	file  *jsonlTraceSink
+	file  *diag.JSONLTraceSink
 	route *routeDebugState
+}
+
+func newJSONLTraceSink(path string) (*diag.JSONLTraceSink, error) {
+	return diag.NewJSONLTraceSink(path)
 }
 
 func (s *debugTraceSink) Trace(event model.TraceEvent) {

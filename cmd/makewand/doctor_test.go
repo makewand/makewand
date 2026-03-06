@@ -66,6 +66,16 @@ func TestDetectConfiguredProviders(t *testing.T) {
 	assertContains(t, got, "ollama")
 }
 
+func TestDetectConfiguredProviders_RemoteOllamaMarkedBlocked(t *testing.T) {
+	t.Setenv("MAKEWAND_OLLAMA_ALLOW_REMOTE", "")
+
+	cfg := config.DefaultConfig()
+	cfg.OllamaURL = "http://10.0.0.2:11434"
+
+	got := detectConfiguredProviders(cfg)
+	assertContains(t, got, "ollama (blocked)")
+}
+
 func TestUniqueProbeProviders(t *testing.T) {
 	routes := []doctorTaskRoute{
 		{Task: "analyze", Provider: "claude"},
@@ -110,6 +120,25 @@ func TestClassifyProbeError(t *testing.T) {
 			name: "provider internal",
 			err:  errors.New("internal server error"),
 			want: probeClassProvider,
+		},
+		{
+			name: "structured rate limit",
+			err: &model.ProviderError{
+				Provider:  "openai",
+				Kind:      model.ErrorKindRateLimit,
+				Retryable: true,
+				Message:   "rate limit exceeded",
+			},
+			want: probeClassEnvironment,
+		},
+		{
+			name: "structured auth",
+			err: &model.ProviderError{
+				Provider: "claude",
+				Kind:     model.ErrorKindAuth,
+				Message:  "unauthorized",
+			},
+			want: probeClassConfiguration,
 		},
 	}
 
