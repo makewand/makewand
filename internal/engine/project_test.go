@@ -64,3 +64,18 @@ func TestReadFile_RejectsSymlinkEscape(t *testing.T) {
 		t.Fatal("ReadFile should reject symlink escape, got nil error")
 	}
 }
+
+func TestScanFiles_ReturnsRootError(t *testing.T) {
+	proj, err := NewProject("scan-root-error", t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+
+	if err := os.RemoveAll(proj.Path); err != nil {
+		t.Fatalf("RemoveAll(project): %v", err)
+	}
+
+	if err := proj.ScanFiles(); err == nil {
+		t.Fatal("ScanFiles should return an error when the project root is missing")
+	}
+}

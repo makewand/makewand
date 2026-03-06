@@ -13,6 +13,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/makewand/makewand/internal/config"
 )
 
 // CLIProvider wraps a subscription CLI tool (claude, gemini, codex) as a Provider.
@@ -35,6 +38,25 @@ const cliRequestTimeout = 5 * time.Minute
 const cliStreamTimeout = 10 * time.Minute
 const cliMaxAttempts = 2
 const cliRetryBaseDelay = 300 * time.Millisecond
+
+// TransientCLIError wraps a CLI execution error that is safe to retry.
+type TransientCLIError struct {
+	Err *ProviderError
+}
+
+func (e *TransientCLIError) Error() string {
+	if e == nil || e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func (e *TransientCLIError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 var transientCLIErrorHints = []string{
 	"stream closed unexpectedly",
@@ -110,13 +132,16 @@ func NewCodexCLI(binPath string) *CLIProvider {
 }
 
 // NewCommandCLI creates a provider backed by an arbitrary CLI command.
-// Prompt injection behavior:
-//   - if any argument contains "{{prompt}}", that token is replaced in-place
-//   - otherwise, the prompt is appended as the final argument
-func NewCommandCLI(providerName, command string, args []string) *CLIProvider {
+// Prompt delivery modes:
+//   - stdin: prompt is written to process stdin
+//   - arg: prompt is appended as the final argument
+//   - legacy: if any arg contains "{{prompt}}" replace it; otherwise append the
+//     prompt as the final argument (kept for backward compatibility)
+func NewCommandCLI(providerName, command string, args []string, promptMode string) *CLIProvider {
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
 	command = strings.TrimSpace(command)
 	templateArgs := append([]string(nil), args...)
+	promptMode = strings.ToLower(strings.TrimSpace(promptMode))
 
 	p := &CLIProvider{
 		name:     providerName + "-custom-cli",
@@ -124,7 +149,20 @@ func NewCommandCLI(providerName, command string, args []string) *CLIProvider {
 		provider: providerName,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		if promptMode == config.CustomPromptModeStdin {
+			cmd := exec.CommandContext(ctx, command, templateArgs...)
+			cmd.Stdin = strings.NewReader(prompt)
+			return cmd
+		}
+
 		finalArgs := make([]string, 0, len(templateArgs)+1)
+		if promptMode == config.CustomPromptModeArg {
+			finalArgs = append(finalArgs, templateArgs...)
+			finalArgs = append(finalArgs, prompt)
+			return exec.CommandContext(ctx, command, finalArgs...)
+		}
+
+		finalArgs = make([]string, 0, len(templateArgs)+1)
 		replaced := false
 		for _, a := range templateArgs {
 			if strings.Contains(a, "{{prompt}}") {
@@ -250,17 +288,17 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("%s CLI pipe: %w", c.provider, err)
+		return nil, newProviderError(c.provider, "CLI pipe", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("%s CLI stderr pipe: %w", c.provider, err)
+		return nil, newProviderError(c.provider, "CLI stderr pipe", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		cancel()
-		return nil, fmt.Errorf("%s CLI start: %w", c.provider, err)
+		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
 	ch := make(chan StreamChunk, 64)
@@ -311,7 +349,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 		}
 
 		if scanErr != nil {
-			ch <- StreamChunk{Error: fmt.Errorf("%s CLI stream error: %w", c.provider, scanErr)}
+			ch <- StreamChunk{Error: newProviderError(c.provider, "CLI stream", ErrorKindProvider, false, 0, scanErr.Error(), scanErr)}
 			return
 		}
 
@@ -342,7 +380,7 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, e
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("%s CLI start error: %w", c.provider, err)
+		return "", newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
 	done := make(chan error, 1)
@@ -374,6 +412,13 @@ func isTransientCLIError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	var transient *TransientCLIError
+	if errors.As(err, &transient) {
+		return true
+	}
+	if IsRetryableProviderError(err) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	for _, hint := range transientCLIErrorHints {
 		if strings.Contains(msg, hint) {
@@ -398,11 +443,11 @@ func formatCLIContextError(provider string, ctxErr error, duration time.Duration
 
 	switch {
 	case errors.Is(ctxErr, context.DeadlineExceeded):
-		return fmt.Errorf("%s CLI timeout after %s", provider, rounded)
+		return newProviderError(provider, "CLI", ErrorKindTimeout, true, 0, fmt.Sprintf("timeout after %s", rounded), ctxErr)
 	case errors.Is(ctxErr, context.Canceled):
-		return fmt.Errorf("%s CLI canceled after %s", provider, rounded)
+		return newProviderError(provider, "CLI", ErrorKindCanceled, false, 0, fmt.Sprintf("canceled after %s", rounded), ctxErr)
 	default:
-		return fmt.Errorf("%s CLI context error after %s: %v", provider, rounded, ctxErr)
+		return newProviderError(provider, "CLI", ErrorKindProvider, false, 0, fmt.Sprintf("context error after %s: %v", rounded, ctxErr), ctxErr)
 	}
 }
 
@@ -415,7 +460,22 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 	if errMsg == "" {
 		errMsg = runErr.Error()
 	}
-	return fmt.Errorf("%s CLI error: %s", provider, errMsg)
+	base := newProviderError(provider, "CLI", ErrorKindProvider, false, 0, errMsg, runErr)
+	if looksTransient(errMsg) {
+		return &TransientCLIError{Err: newProviderError(provider, "CLI", ErrorKindNetwork, true, 0, errMsg, runErr)}
+	}
+	return base
+}
+
+// looksTransient checks if an error message matches known transient patterns.
+func looksTransient(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, hint := range transientCLIErrorHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildCLIPrompt converts the message history + system prompt into a single
@@ -449,9 +509,21 @@ func buildCLIPrompt(messages []Message, system string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// estimateTokens provides a rough token count (~4 chars per token).
+// estimateTokens provides a rough token count using a word/rune hybrid.
+// It prefers word count for natural-language English and rune count for
+// languages/scripts where byte length would significantly overestimate usage.
 func estimateTokens(text string) int {
-	return len(text) / 4
+	if len(text) == 0 {
+		return 0
+	}
+	words := len(strings.Fields(text))
+	byWords := int(float64(words) * 1.3)
+	runes := utf8.RuneCountInString(text)
+	byRunes := int(float64(runes) / 3.5)
+	if byWords > byRunes {
+		return byWords
+	}
+	return byRunes
 }
 
 // stripANSI removes ANSI escape sequences from text.

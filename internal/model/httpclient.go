@@ -1,7 +1,10 @@
 package model
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -82,4 +85,63 @@ func limitedReadAll(r io.Reader, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("response body exceeds %d bytes limit", maxBytes)
 	}
 	return data, nil
+}
+
+func marshalProviderJSON(provider string, payload any) ([]byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, newProviderError(provider, "marshal request", ErrorKindConfig, false, 0, err.Error(), err)
+	}
+	return body, nil
+}
+
+func newProviderJSONRequest(ctx context.Context, provider, method, url string, body []byte, headers map[string]string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, newProviderError(provider, "build request", ErrorKindConfig, false, 0, err.Error(), err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return req, nil
+}
+
+func doProviderJSONRequest(client *http.Client, req *http.Request, provider, op string) ([]byte, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, wrapTransportError(provider, op, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := limitedReadAll(resp.Body, maxResponseBytes)
+	if err != nil {
+		return nil, wrapResponseReadError(provider, "read response", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, newProviderStatusError(provider, op, resp.StatusCode, respBody)
+	}
+	return respBody, nil
+}
+
+func openProviderStream(client *http.Client, req *http.Request, provider, op string) (*http.Response, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, wrapTransportError(provider, op, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		respBody, readErr := limitedReadAll(resp.Body, maxResponseBytes)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, wrapResponseReadError(provider, "read response", readErr)
+		}
+		return nil, newProviderStatusError(provider, op, resp.StatusCode, respBody)
+	}
+	return resp, nil
+}
+
+func decodeProviderJSON(provider, op string, body []byte, out any) error {
+	if err := json.Unmarshal(body, out); err != nil {
+		return newProviderError(provider, op, ErrorKindProvider, false, 0, err.Error(), err)
+	}
+	return nil
 }

@@ -2,16 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/tui"
@@ -19,7 +18,7 @@ import (
 )
 
 var (
-	version         = "0.1.0"
+	version         = "0.1.10"
 	debugFlag       bool
 	rootModeFlag    string
 	rootPrintFlag   bool
@@ -42,10 +41,7 @@ build, modify, and deploy software through natural language conversation.
   makewand setup   - Configure AI models and preferences`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-			}
+			cfg := loadConfigWithWarning()
 
 			if !cfg.HasAnyModel() {
 				fmt.Println("No AI models configured. Run 'makewand setup' first.")
@@ -92,10 +88,7 @@ func newCmd() *cobra.Command {
 		Short: "Create a new project with guided wizard",
 		Long:  "Start the interactive wizard to create a new project from templates or your own description.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-			}
+			cfg := loadConfigWithWarning()
 
 			if !cfg.HasAnyModel() {
 				fmt.Println("Welcome to makewand!")
@@ -132,10 +125,7 @@ func chatCmd() *cobra.Command {
 		Long:  "Open an interactive chat to modify and improve your project using natural language.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-			}
+			cfg := loadConfigWithWarning()
 
 			if !cfg.HasAnyModel() {
 				fmt.Println("No AI models configured. Run 'makewand setup' first.")
@@ -207,10 +197,7 @@ func setupCmd() *cobra.Command {
 		Short: "Configure AI models and preferences",
 		Long:  "Interactive setup wizard for configuring API keys, default models, and language preferences.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				cfg = config.DefaultConfig()
-			}
+			cfg := loadConfigWithWarning()
 
 			fmt.Println("makewand setup")
 			fmt.Println()
@@ -227,10 +214,14 @@ func setupCmd() *cobra.Command {
 				fmt.Println("Custom providers (config-defined):")
 				for _, cp := range cfg.CustomProviders {
 					access := accessDisplay(cp.Access, "subscription")
+					prompt := customProviderPromptLabel(cp)
 					if config.IsCustomProviderUsable(cp) {
-						fmt.Printf("  [x] %s -> %s (access: %s)\n", cp.Name, cp.Command, access)
+						fmt.Printf("  [x] %s -> %s (access: %s, prompt: %s)\n", cp.Name, cp.Command, access, prompt)
 					} else {
-						fmt.Printf("  [!] %s -> %s (access: %s, unavailable)\n", cp.Name, cp.Command, access)
+						fmt.Printf("  [!] %s -> %s (access: %s, prompt: %s, unavailable)\n", cp.Name, cp.Command, access, prompt)
+					}
+					if warning := customProviderSafetyWarning(cp); warning != "" {
+						fmt.Printf("      warning: %s\n", warning)
 					}
 				}
 				fmt.Println()
@@ -255,6 +246,7 @@ func setupCmd() *cobra.Command {
 			}
 			if cfg.OllamaURL != "" {
 				fmt.Printf("  Ollama URL: %s\n", cfg.OllamaURL)
+				fmt.Printf("  Ollama note: %s\n", ollamaSetupNotice(cfg.OllamaURL))
 			}
 			fmt.Println()
 
@@ -271,6 +263,7 @@ func setupCmd() *cobra.Command {
 			fmt.Printf("  Gemini: %s\n", accessDisplay(cfg.GeminiAccess, "free"))
 			fmt.Printf("  Codex:  %s\n", accessDisplay(cfg.CodexAccess, "api"))
 			fmt.Printf("  Ollama: %s\n", accessDisplay(cfg.OllamaAccess, "local"))
+			fmt.Println("  Ollama note: remote hosts require MAKEWAND_OLLAMA_ALLOW_REMOTE=1")
 
 			if len(cfg.CLIs) > 0 {
 				fmt.Println()
@@ -292,7 +285,7 @@ func setupCmd() *cobra.Command {
 			}
 
 			if err := config.Save(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not save config: %v\n", err)
+				diag.Stderr().WarnErr("could not save config", err)
 				fmt.Fprintln(os.Stderr, "Tip: set MAKEWAND_CONFIG_DIR to a writable directory.")
 			}
 
@@ -306,6 +299,14 @@ func accessDisplay(configured, defaultValue string) string {
 		return configured
 	}
 	return defaultValue + " (default)"
+}
+
+func loadConfigWithWarning() *config.Config {
+	cfg, err := config.Load()
+	if err != nil {
+		diag.Stderr().WarnErr("could not load config", err)
+	}
+	return cfg
 }
 
 func shouldUseHeadless(prompt string, printFlag bool, interactiveTTY bool) bool {
@@ -341,11 +342,11 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	if debug {
 		traceSink, tracePath, traceErr := newHeadlessTraceSink()
 		if traceErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: debug trace disabled: %v\n", traceErr)
+			diag.Stderr().WarnErr("debug trace disabled", traceErr)
 		} else {
 			router.SetTraceSink(traceSink)
 			defer traceSink.Close()
-			fmt.Fprintf(os.Stderr, "Debug trace enabled: %s\n", tracePath)
+			diag.Stderr().InfoPath("Debug trace enabled", tracePath)
 		}
 	}
 	configDir, dirErr := config.ConfigDir()
@@ -401,99 +402,17 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	return nil
 }
 
-type jsonlTraceSink struct {
-	mu sync.Mutex
-	f  *os.File
-}
-
-func newJSONLTraceSink(path string) (*jsonlTraceSink, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return nil, err
-	}
-	return &jsonlTraceSink{f: f}, nil
-}
-
-func (s *jsonlTraceSink) Trace(event model.TraceEvent) {
-	b, err := json.Marshal(event)
-	if err != nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, _ = s.f.Write(b)
-	_, _ = s.f.Write([]byte("\n"))
-}
-
-func (s *jsonlTraceSink) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.f.Close()
-}
-
-func newHeadlessTraceSink() (*jsonlTraceSink, string, error) {
+func newHeadlessTraceSink() (*diag.JSONLTraceSink, string, error) {
 	var candidates []string
 	if dir, err := config.ConfigDir(); err == nil {
 		candidates = append(candidates, filepath.Join(dir, "trace.jsonl"))
 	}
 	candidates = append(candidates, filepath.Join(os.TempDir(), "makewand-trace.jsonl"))
-
-	var lastErr error
-	for _, path := range candidates {
-		sink, err := newJSONLTraceSink(path)
-		if err == nil {
-			return sink, path, nil
-		}
-		lastErr = err
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no trace path candidates available")
-	}
-	return nil, "", lastErr
+	return diag.OpenFirstJSONLTraceSink(candidates)
 }
 
 func classifyPromptTask(input string) model.TaskType {
-	lower := strings.ToLower(input)
-
-	if strings.HasPrefix(lower, "/review") {
-		return model.TaskReview
-	}
-	if strings.HasPrefix(lower, "/fix") {
-		return model.TaskFix
-	}
-	if strings.HasPrefix(lower, "/ask") || strings.HasPrefix(lower, "/explain") {
-		return model.TaskExplain
-	}
-	if strings.HasPrefix(lower, "/plan") {
-		return model.TaskAnalyze
-	}
-
-	reviewKeywords := []string{"review", "check", "audit"}
-	for _, kw := range reviewKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskReview
-		}
-	}
-	fixKeywords := []string{"fix", "bug", "error"}
-	for _, kw := range fixKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskFix
-		}
-	}
-	explainKeywords := []string{"explain", "why", "how does"}
-	for _, kw := range explainKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskExplain
-		}
-	}
-	analyzeKeywords := []string{"plan", "analyze", "design"}
-	for _, kw := range analyzeKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskAnalyze
-		}
-	}
-
-	return model.TaskCode
+	return model.ClassifyTask(input)
 }
 
 func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {

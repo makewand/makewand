@@ -49,6 +49,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install E2E dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y expect
+
       - name: Check formatting (gofmt)
         shell: bash
         run: |
@@ -65,7 +72,10 @@ jobs:
           fi
 
       - name: Run tests
-        run: go test ./...
+        run: bash ./scripts/test_gate.sh
+
+      - name: Run race tests
+        run: go test -race ./cmd/makewand ./internal/config ./internal/engine ./internal/model ./internal/tui
 
       - name: Run vet
         run: go vet ./...

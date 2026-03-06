@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -77,6 +78,7 @@ func TestClaude_Chat_HTTP429(t *testing.T) {
 	if !strings.Contains(err.Error(), "429") {
 		t.Fatalf("Chat() error = %q, want it to mention 429", err.Error())
 	}
+	assertProviderErrorKind(t, err, ErrorKindRateLimit, http.StatusTooManyRequests)
 }
 
 func TestClaude_Chat_NetworkError(t *testing.T) {
@@ -93,6 +95,7 @@ func TestClaude_Chat_NetworkError(t *testing.T) {
 	if err == nil {
 		t.Fatal("Chat() error = nil, want error for 500 response")
 	}
+	assertProviderErrorKind(t, err, ErrorKindUnavailable, http.StatusInternalServerError)
 }
 
 func TestClaude_IsAvailable(t *testing.T) {
@@ -161,6 +164,7 @@ func TestOpenAI_Chat_HTTP429(t *testing.T) {
 	if !strings.Contains(err.Error(), "429") {
 		t.Fatalf("Chat() error = %q, want it to mention 429", err.Error())
 	}
+	assertProviderErrorKind(t, err, ErrorKindRateLimit, http.StatusTooManyRequests)
 }
 
 func TestOpenAI_IsAvailable(t *testing.T) {
@@ -169,5 +173,20 @@ func TestOpenAI_IsAvailable(t *testing.T) {
 	}
 	if !NewOpenAI("key", "").IsAvailable() {
 		t.Fatal("IsAvailable() = false for non-empty API key, want true")
+	}
+}
+
+func assertProviderErrorKind(t *testing.T, err error, wantKind ErrorKind, wantStatus int) {
+	t.Helper()
+
+	var perr *ProviderError
+	if !errors.As(err, &perr) {
+		t.Fatalf("expected ProviderError, got %T: %v", err, err)
+	}
+	if perr.Kind != wantKind {
+		t.Fatalf("ProviderError.Kind = %q, want %q", perr.Kind, wantKind)
+	}
+	if perr.StatusCode != wantStatus {
+		t.Fatalf("ProviderError.StatusCode = %d, want %d", perr.StatusCode, wantStatus)
 	}
 }
