@@ -40,6 +40,29 @@ func (s *stubProvider) ChatStream(ctx context.Context, messages []Message, syste
 	return ch, nil
 }
 
+type deadlineCaptureProvider struct {
+	name      string
+	available bool
+	remaining time.Duration
+}
+
+func (s *deadlineCaptureProvider) Name() string { return s.name }
+
+func (s *deadlineCaptureProvider) IsAvailable() bool { return s.available }
+
+func (s *deadlineCaptureProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		s.remaining = time.Until(deadline)
+	} else {
+		s.remaining = -1
+	}
+	return "", Usage{}, fmt.Errorf("%s forced failure", s.name)
+}
+
+func (s *deadlineCaptureProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	return nil, fmt.Errorf("%s stream unsupported", s.name)
+}
+
 func TestChat_ModeFreeDoesNotFallbackToAPI(t *testing.T) {
 	gemini := &stubProvider{name: "gemini", available: true, failChat: true}
 	openai := &stubProvider{name: "openai", available: true, failChat: false}
@@ -115,6 +138,47 @@ func TestWithProviderAttemptTimeout_RespectsCallerShorterDeadline(t *testing.T) 
 	}
 	if !attemptDeadline.Equal(parentDeadline) {
 		t.Fatalf("attempt deadline = %s, want parent deadline %s", attemptDeadline, parentDeadline)
+	}
+}
+
+func TestChat_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CodingModel = "claude"
+	cfg.DefaultModel = "claude"
+
+	primary := &deadlineCaptureProvider{name: "claude", available: true}
+	fallback := &stubProvider{name: "gemini", available: true}
+
+	r := &Router{
+		cfg: cfg,
+		providers: map[string]Provider{
+			"claude": primary,
+			"gemini": fallback,
+		},
+		providerCache: make(map[providerKey]Provider),
+		accessTypes: map[string]AccessType{
+			"claude": AccessSubscription,
+			"gemini": AccessFree,
+		},
+		usage:   newSessionUsage(),
+		modeSet: false, // legacy routing path
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	_, _, result, err := r.Chat(ctx, TaskCode, []Message{{Role: "user", Content: "test"}}, "")
+	if err != nil {
+		t.Fatalf("Chat() error = %v, want nil (fallback should succeed)", err)
+	}
+	if result.Actual != "gemini" || !result.IsFallback {
+		t.Fatalf("Chat() route = %+v, want fallback to gemini", result)
+	}
+	if primary.remaining <= 0 {
+		t.Fatalf("primary attempt should receive bounded deadline, got remaining=%s", primary.remaining)
+	}
+	if primary.remaining > 170*time.Second {
+		t.Fatalf("primary attempt deadline too long: %s, want bounded near phase timeout", primary.remaining)
 	}
 }
 
