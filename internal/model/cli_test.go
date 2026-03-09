@@ -349,6 +349,34 @@ func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
 	}
 }
 
+func TestCLIProvider_IsAvailable_SoftPassesTimeoutForGemini(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "probe-hang-gemini.sh")
+	body := "#!/bin/sh\n" +
+		"sleep 10\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := &CLIProvider{
+		name:     "gemini-cli",
+		binPath:  script,
+		provider: "gemini",
+		checkCmd: func(ctx context.Context) *exec.Cmd {
+			return exec.CommandContext(ctx, script)
+		},
+	}
+
+	start := time.Now()
+	if !p.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true for gemini probe timeout soft-pass")
+	}
+	elapsed := time.Since(start)
+	if elapsed > cliAvailProbeTimeout+2*time.Second {
+		t.Fatalf("IsAvailable() took too long: %s", elapsed)
+	}
+}
+
 func TestTransientCLIError_IsDetectedByIsTransient(t *testing.T) {
 	base := newProviderError("test", "CLI", ErrorKindNetwork, true, 0, "some error", fmt.Errorf("some error"))
 	transient := &TransientCLIError{Err: base}

@@ -76,6 +76,10 @@ func TestClassifyPromptTask(t *testing.T) {
 		{prompt: "how does this work", want: model.TaskExplain},
 		{prompt: "there is an error here", want: model.TaskFix},
 		{prompt: "handle errors gracefully", want: model.TaskCode},
+		{
+			prompt: "Implement RetryHTTP in retry.go and return only the complete content of retry.go. retry on client.Do error.",
+			want:   model.TaskCode,
+		},
 	}
 
 	for _, tt := range tests {
