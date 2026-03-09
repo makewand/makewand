@@ -96,6 +96,9 @@ func (p *Project) ScanFiles() error {
 
 	return filepath.WalkDir(p.Path, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if path == p.Path {
+				return err
+			}
 			return nil // skip errors
 		}
 

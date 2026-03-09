@@ -172,7 +172,7 @@ func NewRouter(cfg *config.Config) *Router {
 			// Built-ins win when names collide to avoid surprising overrides.
 			continue
 		}
-		r.providers[name] = NewCommandCLI(name, command, cp.Args)
+		r.providers[name] = NewCommandCLI(name, command, cp.Args, config.EffectiveCustomProviderPromptMode(cp))
 
 		access := strings.TrimSpace(cp.Access)
 		if access == "" {
@@ -319,7 +319,7 @@ func isTimeoutErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if ErrorKindOf(err) == ErrorKindTimeout {
 		return true
 	}
 	type timeoutErr interface {
@@ -689,10 +689,10 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 func (r *Router) Get(name string) (Provider, error) {
 	p, ok := r.providers[name]
 	if !ok {
-		return nil, fmt.Errorf("model provider %q not configured", name)
+		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q not configured", name), nil)
 	}
 	if !p.IsAvailable() {
-		return nil, fmt.Errorf("model provider %q is not available", name)
+		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q is not available", name), nil)
 	}
 	return p, nil
 }
@@ -771,6 +771,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		return "", Usage{}, RouteResult{}, err
 	}
 	maxTokens := MaxTokensForTask(task)
+	attemptPhase := taskToBuildPhase(task)
 	firstErr := error(nil)
 
 	if allow, remaining := r.beforeProviderAttempt(result.Actual); !allow {
@@ -786,7 +787,9 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		})
 	} else {
 		primaryStart := time.Now()
-		content, usage, chatErr := result.Provider.Chat(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+		content, usage, chatErr := result.Provider.Chat(attemptCtx, messages, system, maxTokens)
+		attemptCancel()
 		if chatErr == nil {
 			r.usage.Increment(result.Actual)
 			r.recordProviderSuccess(result.Actual)
@@ -877,7 +880,9 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 					continue
 				}
 				start := time.Now()
-				content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+				attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+				content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
+				attemptCancel()
 				if retryErr == nil {
 					r.usage.Increment(c.name)
 					r.recordProviderSuccess(c.name)
@@ -964,7 +969,9 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 			continue
 		}
 		start := time.Now()
-		content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+		content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
+		attemptCancel()
 		if retryErr == nil {
 			r.usage.Increment(name)
 			r.recordProviderSuccess(name)

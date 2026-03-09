@@ -64,10 +64,18 @@ func TestClassifyPromptTask(t *testing.T) {
 		want   model.TaskType
 	}{
 		{prompt: "/review this", want: model.TaskReview},
+		{prompt: "please review.", want: model.TaskReview},
 		{prompt: "please fix this bug", want: model.TaskFix},
+		{prompt: "fix, please", want: model.TaskFix},
+		{prompt: "bug?", want: model.TaskFix},
 		{prompt: "explain rest api", want: model.TaskExplain},
 		{prompt: "plan this feature", want: model.TaskAnalyze},
 		{prompt: "write code", want: model.TaskCode},
+		{prompt: "checkout the repo", want: model.TaskCode},
+		{prompt: "design the api", want: model.TaskAnalyze},
+		{prompt: "how does this work", want: model.TaskExplain},
+		{prompt: "there is an error here", want: model.TaskFix},
+		{prompt: "handle errors gracefully", want: model.TaskCode},
 	}
 
 	for _, tt := range tests {

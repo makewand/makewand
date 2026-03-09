@@ -67,15 +67,23 @@ type CLITool struct {
 }
 
 // CustomProvider describes one command-based external provider.
-// The command receives the user prompt either by:
-//   - replacing "{{prompt}}" in Args entries; or
-//   - appending prompt as the final argument when no placeholder is present.
+// PromptMode controls how the prompt is delivered:
+//   - "stdin": write prompt to process stdin (recommended)
+//   - "arg": append prompt as final argument
+//   - empty: keep legacy "{{prompt}}" replacement / argv append behavior
 type CustomProvider struct {
-	Name    string   `json:"name"`
-	Command string   `json:"command"`
-	Args    []string `json:"args,omitempty"`
-	Access  string   `json:"access,omitempty"` // "free","local","subscription","api"
+	Name       string   `json:"name"`
+	Command    string   `json:"command"`
+	Args       []string `json:"args,omitempty"`
+	Access     string   `json:"access,omitempty"`      // "free","local","subscription","api"
+	PromptMode string   `json:"prompt_mode,omitempty"` // "stdin","arg"; empty keeps legacy argv/{{prompt}} delivery
 }
+
+const (
+	CustomPromptModeLegacy = "legacy"
+	CustomPromptModeArg    = "arg"
+	CustomPromptModeStdin  = "stdin"
+)
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
@@ -243,6 +251,40 @@ func IsCustomProviderUsable(cp CustomProvider) bool {
 	// Bare executable name must resolve from PATH.
 	_, err := exec.LookPath(command)
 	return err == nil
+}
+
+// EffectiveCustomProviderPromptMode normalizes prompt delivery mode.
+// Empty values keep legacy behavior for backward compatibility.
+func EffectiveCustomProviderPromptMode(cp CustomProvider) string {
+	switch strings.ToLower(strings.TrimSpace(cp.PromptMode)) {
+	case CustomPromptModeStdin:
+		return CustomPromptModeStdin
+	case CustomPromptModeArg:
+		return CustomPromptModeArg
+	default:
+		return CustomPromptModeLegacy
+	}
+}
+
+// CustomProviderUsesShellAdapter returns true for commands that invoke a shell
+// interpreter with an inline command string (for example sh -c, bash -lc, cmd /c).
+func CustomProviderUsesShellAdapter(cp CustomProvider) bool {
+	command := strings.ToLower(filepath.Base(strings.TrimSpace(cp.Command)))
+	if command == "" || len(cp.Args) == 0 {
+		return false
+	}
+
+	firstArg := strings.ToLower(strings.TrimSpace(cp.Args[0]))
+	switch command {
+	case "sh", "bash", "zsh", "dash", "ksh", "fish":
+		return firstArg == "-c" || firstArg == "-lc" || firstArg == "-ic"
+	case "cmd", "cmd.exe":
+		return firstArg == "/c"
+	case "powershell", "powershell.exe", "pwsh", "pwsh.exe":
+		return firstArg == "-command" || firstArg == "-c"
+	default:
+		return false
+	}
 }
 
 // HasCLI returns true if a specific CLI tool was detected.

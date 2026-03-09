@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -489,4 +490,44 @@ func TestMode_SwitchCommand_NoPanicNarrowWindow(t *testing.T) {
 	}()
 
 	_, _ = app.handleModeCommand("/mode power")
+}
+
+func TestMode_FileWriteRefreshFailureSurfacesSystemMessage(t *testing.T) {
+	app := newBuildAppWithMode(t, model.ModeBalanced)
+	app.pendingPhase = pendingPhaseBuild
+
+	if err := os.RemoveAll(app.project.Path); err != nil {
+		t.Fatalf("RemoveAll(project.Path): %v", err)
+	}
+
+	m, _ := app.handleFileWriteComplete(fileWriteCompleteMsg{written: 1})
+	app = m.(App)
+
+	if !chatContains(app.chat.messages, "Failed to refresh project files:") {
+		t.Fatalf("expected refresh failure message, got %#v", app.chat.messages)
+	}
+}
+
+func TestMode_FilesUpdatedRefreshFailureSurfacesSystemMessage(t *testing.T) {
+	app := newBuildAppWithMode(t, model.ModeBalanced)
+
+	if err := os.RemoveAll(app.project.Path); err != nil {
+		t.Fatalf("RemoveAll(project.Path): %v", err)
+	}
+
+	m, _ := app.Update(filesUpdatedMsg{})
+	app = m.(App)
+
+	if !chatContains(app.chat.messages, "Failed to refresh project files:") {
+		t.Fatalf("expected refresh failure message, got %#v", app.chat.messages)
+	}
+}
+
+func chatContains(messages []ChatMessage, needle string) bool {
+	for _, msg := range messages {
+		if strings.Contains(msg.Content, needle) {
+			return true
+		}
+	}
+	return false
 }

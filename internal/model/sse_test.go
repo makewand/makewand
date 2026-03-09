@@ -46,3 +46,69 @@ func (r errReader) Read(p []byte) (int, error) {
 }
 
 var _ io.Reader = errReader{}
+
+func TestStreamSSE_RoutesEventsViaHandler(t *testing.T) {
+	payload := "data: {\"text\":\"hello\"}\n\ndata: {\"text\":\"world\"}\n\ndata: [DONE]\n\n"
+
+	ch := streamSSE(context.Background(), strings.NewReader(payload), func(data string) []StreamChunk {
+		if data == "[DONE]" {
+			return []StreamChunk{{Done: true}}
+		}
+		return []StreamChunk{{Content: data}}
+	}, nil)
+
+	var got []StreamChunk
+	for chunk := range ch {
+		got = append(got, chunk)
+	}
+
+	if len(got) < 2 {
+		t.Fatalf("got %d chunks, want at least 2", len(got))
+	}
+	if got[0].Content != `{"text":"hello"}` {
+		t.Fatalf("chunk[0].Content = %q, want hello event", got[0].Content)
+	}
+}
+
+func TestStreamSSE_CallsCleanup(t *testing.T) {
+	payload := "data: hi\n\n"
+	cleaned := false
+
+	ch := streamSSE(context.Background(), strings.NewReader(payload), func(data string) []StreamChunk {
+		return []StreamChunk{{Content: data}}
+	}, func() { cleaned = true })
+
+	for range ch {
+	}
+
+	if !cleaned {
+		t.Fatal("cleanup function was not called")
+	}
+}
+
+func TestStreamSSE_HandlerDoneStopsStream(t *testing.T) {
+	payload := "data: first\n\ndata: second\n\ndata: third\n\n"
+
+	ch := streamSSE(context.Background(), strings.NewReader(payload), func(data string) []StreamChunk {
+		if data == "second" {
+			return []StreamChunk{{Done: true}}
+		}
+		return []StreamChunk{{Content: data}}
+	}, nil)
+
+	var got []StreamChunk
+	for chunk := range ch {
+		got = append(got, chunk)
+	}
+
+	// Should have "first" content + "second" done, not "third"
+	if len(got) != 2 {
+		t.Fatalf("got %d chunks, want 2 (content + done)", len(got))
+	}
+	if got[0].Content != "first" {
+		t.Fatalf("chunk[0].Content = %q, want first", got[0].Content)
+	}
+	if !got[1].Done {
+		t.Fatal("chunk[1].Done = false, want true")
+	}
+}

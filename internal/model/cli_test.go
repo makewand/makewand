@@ -2,6 +2,8 @@ package model
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/makewand/makewand/internal/config"
 )
 
 func TestCLIProvider_ChatStream_ReturnsErrorOnExitFailure(t *testing.T) {
@@ -117,7 +121,7 @@ func TestNewCommandCLI_PromptPlaceholderReplacement(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{"--prompt", "{{prompt}}"})
+	p := NewCommandCLI("private", script, []string{"--prompt", "{{prompt}}"}, config.CustomPromptModeLegacy)
 	content, usage, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello custom provider"}}, "", 256)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -147,7 +151,7 @@ func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{"--flag"})
+	p := NewCommandCLI("private", script, []string{"--flag"}, config.CustomPromptModeLegacy)
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello appended prompt"}}, "", 256)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -157,6 +161,29 @@ func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
 	}
 	if !strings.Contains(content, "hello appended prompt") {
 		t.Fatalf("Chat() content = %q, want prompt appended as arg", content)
+	}
+}
+
+func TestNewCommandCLI_WritesPromptToStdinWhenConfigured(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "echo-stdin.sh")
+	body := "#!/bin/sh\n" +
+		"printf 'mode:%s\\n' \"$1\"\n" +
+		"cat\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewCommandCLI("private", script, []string{"stdin"}, config.CustomPromptModeStdin)
+	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello via stdin"}}, "", 256)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if !strings.Contains(content, "mode:stdin") {
+		t.Fatalf("Chat() content = %q, want fixed arg echoed", content)
+	}
+	if !strings.Contains(content, "hello via stdin") {
+		t.Fatalf("Chat() content = %q, want prompt from stdin", content)
 	}
 }
 
@@ -182,7 +209,7 @@ func TestCLIProvider_Chat_RetriesTransientExecutionError(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{stateFile})
+	p := NewCommandCLI("private", script, []string{stateFile}, config.CustomPromptModeLegacy)
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
 	if err != nil {
 		t.Fatalf("Chat() error = %v, want retry success", err)
@@ -223,7 +250,7 @@ func TestCLIProvider_Chat_DoesNotRetryNonTransientError(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{stateFile})
+	p := NewCommandCLI("private", script, []string{stateFile}, config.CustomPromptModeLegacy)
 	_, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
 	if err == nil {
 		t.Fatal("Chat() error = nil, want permanent failure")
@@ -289,6 +316,83 @@ func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
 	elapsed := time.Since(start)
 	if elapsed > cliAvailProbeTimeout+2*time.Second {
 		t.Fatalf("IsAvailable() took too long: %s", elapsed)
+	}
+}
+
+func TestTransientCLIError_IsDetectedByIsTransient(t *testing.T) {
+	base := newProviderError("test", "CLI", ErrorKindNetwork, true, 0, "some error", fmt.Errorf("some error"))
+	transient := &TransientCLIError{Err: base}
+	wrapped := fmt.Errorf("wrapped: %w", transient)
+
+	if !isTransientCLIError(transient) {
+		t.Fatal("isTransientCLIError(TransientCLIError) = false, want true")
+	}
+	if !isTransientCLIError(wrapped) {
+		t.Fatal("isTransientCLIError(wrapped TransientCLIError) = false, want true")
+	}
+}
+
+func TestTransientCLIError_ContextErrorsAreNotTransient(t *testing.T) {
+	if isTransientCLIError(context.Canceled) {
+		t.Fatal("context.Canceled should not be transient")
+	}
+	if isTransientCLIError(context.DeadlineExceeded) {
+		t.Fatal("context.DeadlineExceeded should not be transient")
+	}
+}
+
+func TestEstimateTokens_HandlesMultipleScripts(t *testing.T) {
+	// English text: ~1.3 tokens/word
+	english := "The quick brown fox jumps over the lazy dog"
+	got := estimateTokens(english)
+	if got < 9 || got > 20 {
+		t.Fatalf("estimateTokens(english) = %d, want 9-20", got)
+	}
+
+	// CJK text should use rune count rather than UTF-8 byte length.
+	cjk := "这是一个简单的测试文本用来验证中文分词估算"
+	got = estimateTokens(cjk)
+	oldByteBased := int(float64(len(cjk)) / 3.5)
+	if got >= oldByteBased {
+		t.Fatalf("estimateTokens(cjk) = %d, want less than old byte-based estimate %d", got, oldByteBased)
+	}
+	if got < 5 || got > 10 {
+		t.Fatalf("estimateTokens(cjk) = %d, want 5-10 with rune-based estimate", got)
+	}
+
+	// Empty
+	if estimateTokens("") != 0 {
+		t.Fatal("estimateTokens('') should be 0")
+	}
+}
+
+func TestFormatCLIExecutionError_MarksTransientErrors(t *testing.T) {
+	err := formatCLIExecutionError("test", "stream closed unexpectedly", fmt.Errorf("exit 1"), nil, time.Second)
+	var transient *TransientCLIError
+	if !errors.As(err, &transient) {
+		t.Fatalf("expected TransientCLIError for transient stderr, got %T: %v", err, err)
+	}
+	var perr *ProviderError
+	if !errors.As(err, &perr) {
+		t.Fatalf("expected ProviderError for transient stderr, got %T: %v", err, err)
+	}
+	if perr.Kind != ErrorKindNetwork || !perr.Retryable {
+		t.Fatalf("ProviderError = %+v, want Kind=network Retryable=true", perr)
+	}
+}
+
+func TestFormatCLIExecutionError_NonTransientStaysPlain(t *testing.T) {
+	err := formatCLIExecutionError("test", "invalid_api_key", fmt.Errorf("exit 1"), nil, time.Second)
+	var transient *TransientCLIError
+	if errors.As(err, &transient) {
+		t.Fatalf("expected plain error for non-transient stderr, got TransientCLIError: %v", err)
+	}
+	var perr *ProviderError
+	if !errors.As(err, &perr) {
+		t.Fatalf("expected ProviderError for non-transient stderr, got %T: %v", err, err)
+	}
+	if perr.Kind != ErrorKindProvider || perr.Retryable {
+		t.Fatalf("ProviderError = %+v, want Kind=provider Retryable=false", perr)
 	}
 }
 

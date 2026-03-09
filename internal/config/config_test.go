@@ -160,3 +160,31 @@ func TestIsCustomProviderUsable_WithExecutablePath(t *testing.T) {
 		t.Fatal("IsCustomProviderUsable() = false, want true for executable file")
 	}
 }
+
+func TestEffectiveCustomProviderPromptMode(t *testing.T) {
+	tests := []struct {
+		name string
+		cp   CustomProvider
+		want string
+	}{
+		{name: "empty keeps legacy", cp: CustomProvider{}, want: CustomPromptModeLegacy},
+		{name: "stdin", cp: CustomProvider{PromptMode: "stdin"}, want: CustomPromptModeStdin},
+		{name: "arg", cp: CustomProvider{PromptMode: "arg"}, want: CustomPromptModeArg},
+		{name: "unknown falls back to legacy", cp: CustomProvider{PromptMode: "weird"}, want: CustomPromptModeLegacy},
+	}
+
+	for _, tt := range tests {
+		if got := EffectiveCustomProviderPromptMode(tt.cp); got != tt.want {
+			t.Fatalf("%s: EffectiveCustomProviderPromptMode() = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestCustomProviderUsesShellAdapter(t *testing.T) {
+	if !CustomProviderUsesShellAdapter(CustomProvider{Command: "/bin/sh", Args: []string{"-c", "echo ok"}}) {
+		t.Fatal("CustomProviderUsesShellAdapter(sh -c) = false, want true")
+	}
+	if CustomProviderUsesShellAdapter(CustomProvider{Command: "/usr/local/bin/private-llm", Args: []string{"--mode", "fast"}}) {
+		t.Fatal("CustomProviderUsesShellAdapter(normal binary) = true, want false")
+	}
+}

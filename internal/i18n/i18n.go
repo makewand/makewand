@@ -37,6 +37,10 @@ type Messages struct {
 	WizardDescribeHint string
 	WizardConfirmHint  string
 	WizardNavHint      string
+	WizardErrWorkdir   string
+	WizardErrProject   string
+	WizardWarnGitInit  string
+	WizardProjectMade  string
 
 	// Templates
 	TplBlog      string
@@ -90,14 +94,15 @@ type Messages struct {
 	ProgressCrossModel     string
 
 	// Errors
-	ErrNoModel    string
-	ErrNoAPIKey   string
-	ErrBuildFail  string
-	ErrTestFail   string
-	ErrAutofix    string
-	ErrFileWrite  string
-	ErrMaxRetries string
-	ErrCancelled  string
+	ErrNoModel     string
+	ErrNoAPIKey    string
+	ErrBuildFail   string
+	ErrTestFail    string
+	ErrAutofix     string
+	ErrFileWrite   string
+	ErrFileRefresh string
+	ErrMaxRetries  string
+	ErrCancelled   string
 
 	// File tree
 	FileTreeTitle string
@@ -132,7 +137,7 @@ type Messages struct {
 var en = Messages{
 	AppName:     "makewand",
 	AppTagline:  "AI coding assistant for everyone",
-	Version:     "v0.1.0",
+	Version:     "v0.1.10",
 	Yes:         "Yes",
 	No:          "No",
 	Confirm:     "Confirm",
@@ -156,6 +161,10 @@ var en = Messages{
 	WizardDescribeHint: "Type your project description below:",
 	WizardConfirmHint:  "Enter/Y confirm • N cancel",
 	WizardNavHint:      "↑↓ navigate • Enter select • q quit",
+	WizardErrWorkdir:   "Error getting working directory: %s",
+	WizardErrProject:   "Error creating project: %s",
+	WizardWarnGitInit:  "Warning: git init failed: %s",
+	WizardProjectMade:  "Created project: %s",
 
 	TplBlog:      "Personal Blog / Portfolio",
 	TplEcommerce: "E-commerce Store",
@@ -204,14 +213,15 @@ var en = Messages{
 	ProgressReviewApplied:  "Applied %d fixes from %s review",
 	ProgressCrossModel:     "%s wrote code, %s reviewing",
 
-	ErrNoModel:    "No AI model configured. Run 'makewand setup' first.",
-	ErrNoAPIKey:   "API key not set for %s. Set it with 'makewand setup' or the environment variable.",
-	ErrBuildFail:  "Build failed",
-	ErrTestFail:   "Tests failed",
-	ErrAutofix:    "Don't worry! Let me analyze and fix this...",
-	ErrFileWrite:  "Failed to write %s: %s",
-	ErrMaxRetries: "Auto-fix failed after %d attempts. Please fix manually.",
-	ErrCancelled:  "Operation cancelled",
+	ErrNoModel:     "No AI model configured. Run 'makewand setup' first.",
+	ErrNoAPIKey:    "API key not set for %s. Set it with 'makewand setup' or the environment variable.",
+	ErrBuildFail:   "Build failed",
+	ErrTestFail:    "Tests failed",
+	ErrAutofix:     "Don't worry! Let me analyze and fix this...",
+	ErrFileWrite:   "Failed to write %s: %s",
+	ErrFileRefresh: "Failed to refresh project files: %s",
+	ErrMaxRetries:  "Auto-fix failed after %d attempts. Please fix manually.",
+	ErrCancelled:   "Operation cancelled",
 
 	FileTreeTitle: "Project Files",
 	FileTreeEmpty: "(no files yet)",
@@ -241,7 +251,7 @@ var en = Messages{
 var zh = Messages{
 	AppName:     "makewand",
 	AppTagline:  "人人都能用的 AI 编程助手",
-	Version:     "v0.1.0",
+	Version:     "v0.1.10",
 	Yes:         "是",
 	No:          "否",
 	Confirm:     "确认",
@@ -265,6 +275,10 @@ var zh = Messages{
 	WizardDescribeHint: "在下方输入你的项目描述：",
 	WizardConfirmHint:  "Enter/Y 确认 • N 取消",
 	WizardNavHint:      "↑↓ 导航 • Enter 选择 • q 退出",
+	WizardErrWorkdir:   "获取工作目录失败：%s",
+	WizardErrProject:   "创建项目失败：%s",
+	WizardWarnGitInit:  "警告：git 初始化失败：%s",
+	WizardProjectMade:  "已创建项目：%s",
 
 	TplBlog:      "个人博客 / 作品集",
 	TplEcommerce: "电商网站",
@@ -313,14 +327,15 @@ var zh = Messages{
 	ProgressReviewApplied:  "应用了 %d 个来自 %s 审查的修复",
 	ProgressCrossModel:     "%s 生成代码，%s 审查",
 
-	ErrNoModel:    "未配置 AI 模型。请先运行 'makewand setup'。",
-	ErrNoAPIKey:   "未设置 %s 的 API 密钥。用 'makewand setup' 或环境变量设置。",
-	ErrBuildFail:  "构建失败",
-	ErrTestFail:   "测试失败",
-	ErrAutofix:    "不要慌！让我来分析和修复...",
-	ErrFileWrite:  "写入 %s 失败: %s",
-	ErrMaxRetries: "自动修复在 %d 次尝试后失败，请手动修复。",
-	ErrCancelled:  "操作已取消",
+	ErrNoModel:     "未配置 AI 模型。请先运行 'makewand setup'。",
+	ErrNoAPIKey:    "未设置 %s 的 API 密钥。用 'makewand setup' 或环境变量设置。",
+	ErrBuildFail:   "构建失败",
+	ErrTestFail:    "测试失败",
+	ErrAutofix:     "不要慌！让我来分析和修复...",
+	ErrFileWrite:   "写入 %s 失败: %s",
+	ErrFileRefresh: "刷新项目文件失败: %s",
+	ErrMaxRetries:  "自动修复在 %d 次尝试后失败，请手动修复。",
+	ErrCancelled:   "操作已取消",
 
 	FileTreeTitle: "项目文件",
 	FileTreeEmpty: "（暂无文件）",

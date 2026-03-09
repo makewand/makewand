@@ -231,6 +231,12 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 	}
 
 	report.DetectedProviders = detectConfiguredProviders(cfg)
+	if check, ok := ollamaDoctorCheck(cfg.OllamaURL); ok {
+		report.Checks = append(report.Checks, check)
+	}
+	if check, ok := customProviderDoctorCheck(cfg); ok {
+		report.Checks = append(report.Checks, check)
+	}
 	if !cfg.HasAnyModel() {
 		report.Checks = append(report.Checks, doctorCheck{
 			Name:    "model configuration",
@@ -412,7 +418,11 @@ func detectConfiguredProviders(cfg *config.Config) []string {
 		set["openai (api)"] = true
 	}
 	if cfg.OllamaURL != "" {
-		set["ollama"] = true
+		if check, ok := ollamaDoctorCheck(cfg.OllamaURL); ok && check.Status == doctorPass {
+			set["ollama"] = true
+		} else {
+			set["ollama (blocked)"] = true
+		}
 	}
 	for _, cp := range cfg.CustomProviders {
 		if config.IsCustomProviderUsable(cp) {
@@ -562,6 +572,18 @@ func classifyProbeError(err error) doctorProbeClassification {
 	if err == nil {
 		return probeClassHealthy
 	}
+
+	switch model.ErrorKindOf(err) {
+	case model.ErrorKindTimeout, model.ErrorKindNetwork, model.ErrorKindRateLimit:
+		return probeClassEnvironment
+	case model.ErrorKindAuth, model.ErrorKindConfig:
+		return probeClassConfiguration
+	case model.ErrorKindUnavailable:
+		return probeClassProvider
+	case model.ErrorKindProvider:
+		return probeClassProvider
+	}
+
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 
 	switch {
