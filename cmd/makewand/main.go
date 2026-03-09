@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -401,6 +402,7 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	}
 
 	content = sanitizeHeadlessContent(prompt, task, content)
+	content = preserveGoPackageFromWorkspace(prompt, content)
 	if headlessCodeOnlyRequested(task, prompt) && strings.TrimSpace(content) == "" {
 		return fmt.Errorf("provider returned no usable code output in headless mode")
 	}
@@ -485,6 +487,78 @@ func sanitizeHeadlessContent(prompt string, task model.TaskType, content string)
 
 	trimmed := stripLeadingNonCode(content)
 	return strings.TrimSpace(trimmed)
+}
+
+var goFileRefPattern = regexp.MustCompile(`(?i)\b([A-Za-z0-9_./-]+\.go)\b`)
+
+func preserveGoPackageFromWorkspace(prompt, content string) string {
+	if strings.TrimSpace(content) == "" {
+		return content
+	}
+	lowerPrompt := strings.ToLower(prompt)
+	if !strings.Contains(lowerPrompt, "do not change package") &&
+		!strings.Contains(lowerPrompt, "don't change package") &&
+		!strings.Contains(lowerPrompt, "keep package name") {
+		return content
+	}
+
+	m := goFileRefPattern.FindStringSubmatch(prompt)
+	if len(m) < 2 {
+		return content
+	}
+	targetPath := strings.TrimSpace(m[1])
+	if targetPath == "" {
+		return content
+	}
+
+	expectedPkg, ok := readGoPackageFromFile(targetPath)
+	if !ok {
+		return content
+	}
+	actualPkg, lineIdx, ok := parseGoPackageLine(content)
+	if !ok || lineIdx < 0 {
+		return content
+	}
+	if actualPkg == expectedPkg {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	lines[lineIdx] = "package " + expectedPkg
+	return strings.Join(lines, "\n")
+}
+
+func readGoPackageFromFile(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	pkg, _, ok := parseGoPackageLine(string(data))
+	return pkg, ok
+}
+
+func parseGoPackageLine(content string) (pkg string, lineIdx int, ok bool) {
+	lines := strings.Split(content, "\n")
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "//") {
+			continue
+		}
+		if strings.HasPrefix(line, "package ") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "package "))
+			if name == "" {
+				return "", -1, false
+			}
+			name = strings.Fields(name)[0]
+			return name, i, true
+		}
+		// First non-empty, non-comment line is not a package line.
+		return "", -1, false
+	}
+	return "", -1, false
 }
 
 func extractFirstFileBlock(content string) (string, bool) {
