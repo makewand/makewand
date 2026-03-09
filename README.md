@@ -78,6 +78,22 @@ makewand setup
 makewand doctor --strict --modes balanced,power
 ```
 
+## Daily usage / 日常使用
+
+Start directly (Codex/Claude Code style):
+直接启动（类似 Codex/Claude Code 交互）：
+
+```bash
+makewand
+```
+
+In-session commands:
+会话内命令：
+
+- `/mode free|economy|balanced|power`
+- `/help`
+- `/exit` (or `Ctrl+C`)
+
 ## Ollama / Ollama
 
 Remote Ollama endpoints are blocked by default. To allow a non-localhost Ollama

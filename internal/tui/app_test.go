@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/makewand/makewand/internal/config"
@@ -40,5 +41,21 @@ func TestStartPromptMsg_SubmitsModeCommand(t *testing.T) {
 	}
 	if got := next.router.Mode(); got != model.ModePower {
 		t.Fatalf("router mode = %v, want %v", got, model.ModePower)
+	}
+}
+
+func TestNewApp_ModeChatAddsWelcomeHint(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := NewApp(ModeChat, cfg, "")
+
+	if len(app.chat.messages) == 0 {
+		t.Fatal("chat welcome message missing")
+	}
+	first := app.chat.messages[0]
+	if first.Role != "system" {
+		t.Fatalf("first message role = %q, want system", first.Role)
+	}
+	if !strings.Contains(first.Content, "/help") || !strings.Contains(first.Content, "/mode") {
+		t.Fatalf("welcome hint missing slash commands: %q", first.Content)
 	}
 }

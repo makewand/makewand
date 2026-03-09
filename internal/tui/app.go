@@ -237,6 +237,18 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 		}
 	}
 
+	if mode == ModeChat {
+		msg := i18n.Msg()
+		app.chat.AddMessage(ChatMessage{
+			Role: "system",
+			Content: fmt.Sprintf("%s\n%s\n%s",
+				msg.ChatWelcome,
+				msg.ChatPrompt,
+				msg.ChatCommandHint,
+			),
+		})
+	}
+
 	return app
 }
 
