@@ -18,6 +18,10 @@ func (a App) handleChatEnter() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
+	if a.chat.HasSlashSuggestions() && a.chat.ApplySelectedSlashSuggestion() {
+		return a, nil
+	}
+
 	input := strings.TrimSpace(a.chat.InputValue())
 	if input == "" {
 		return a, nil
@@ -39,10 +43,26 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 	if len(parts) > 0 {
 		// Handle slash commands locally (don't send to AI).
 		switch parts[0] {
-		case "/mode":
+		case "/mode", "/model":
 			return a.handleModeCommand(input)
 		case "/help":
 			return a.handleHelpCommand()
+		case "/clear":
+			return a.handleClearCommand()
+		case "/compact":
+			return a.handleCompactCommand()
+		case "/memory":
+			return a.handleMemoryCommand()
+		case "/status", "/doctor":
+			return a.handleStatusCommand()
+		case "/cost":
+			return a.handleCostCommand()
+		case "/approve":
+			return a.handleApproveCommand()
+		case "/deny":
+			return a.handleDenyCommand()
+		case "/resume":
+			return a.handleResumeCommand()
 		case "/exit", "/quit":
 			if a.cancelAI != nil {
 				a.cancelAI()
@@ -58,8 +78,8 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 	a = a.applyBudgetRoutingPolicy()
 
 	messages := a.chat.ToModelMessages()
-	systemPrompt := buildSystemPrompt(a.project)
 	task := classifyTask(input)
+	systemPrompt := buildSystemPrompt(a.project, task)
 
 	ctx, cancel := context.WithTimeout(context.Background(), chatStreamTimeout)
 	a.cancelAI = cancel
@@ -71,6 +91,30 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		cmd := func() tea.Msg {
 			defer cancel()
 			content, usage, result, err := a.router.ChatBest(ctx, phase, messages, systemPrompt)
+			if err != nil {
+				return aiResponseMsg{err: err}
+			}
+			provider := result.Actual
+			if provider == "" {
+				provider = usage.Provider
+			}
+			return aiResponseMsg{
+				content:      content,
+				provider:     provider,
+				cost:         usage.Cost,
+				inputTokens:  usage.InputTokens,
+				outputTokens: usage.OutputTokens,
+			}
+		}
+		return a, cmd
+	}
+
+	// Explain/analyze prompts are short and often hit local fallbacks such as Ollama.
+	// Using unary chat here avoids getting stuck waiting for an unreliable stream.
+	if shouldUseUnaryChat(task) {
+		cmd := func() tea.Msg {
+			defer cancel()
+			content, usage, result, err := a.router.Chat(ctx, task, messages, systemPrompt)
 			if err != nil {
 				return aiResponseMsg{err: err}
 			}
@@ -108,11 +152,83 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 }
 
 func (a App) handleHelpCommand() (tea.Model, tea.Cmd) {
-	msg := i18n.Msg()
 	a.chat.AddMessage(ChatMessage{
 		Role:    "system",
-		Content: msg.ChatCommandHint,
+		Content: a.chatHelpText(),
 	})
+	return a, nil
+}
+
+func (a App) handleClearCommand() (tea.Model, tea.Cmd) {
+	a.chat.ResetMessages([]ChatMessage{a.chatWelcomeMessage()})
+	a.cost = NewCostTracker()
+	a.pendingFiles = nil
+	a.pendingDepsPlan = nil
+	a.pendingTestsPlan = nil
+	a.confirmingFiles = false
+	a.confirmingDeps = false
+	a.confirmingTests = false
+	a.clearPendingApproval()
+	a.restoredSession = false
+	a.restoredMessageCount = 0
+	return a, tea.ClearScreen
+}
+
+func (a App) handleCompactCommand() (tea.Model, tea.Cmd) {
+	if a.chat.CompactHistory() {
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: "Conversation compacted.",
+		})
+		return a, nil
+	}
+	a.chat.AddMessage(ChatMessage{
+		Role:    "system",
+		Content: "Nothing to compact yet.",
+	})
+	return a, nil
+}
+
+func (a App) handleMemoryCommand() (tea.Model, tea.Cmd) {
+	a.chat.AddMessage(ChatMessage{
+		Role:    "system",
+		Content: a.memorySummary(),
+	})
+	return a, nil
+}
+
+func (a App) handleStatusCommand() (tea.Model, tea.Cmd) {
+	a.chat.AddMessage(ChatMessage{
+		Role:    "system",
+		Content: a.statusSummary(),
+	})
+	return a, nil
+}
+
+func (a App) handleCostCommand() (tea.Model, tea.Cmd) {
+	a.chat.AddMessage(ChatMessage{
+		Role:    "system",
+		Content: a.costSummary(),
+	})
+	return a, nil
+}
+
+func (a App) handleResumeCommand() (tea.Model, tea.Cmd) {
+	restored, err := a.restoreChatSession()
+	if err != nil {
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf("Could not restore session: %s", err),
+		})
+		return a, nil
+	}
+	if !restored {
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: "No saved session found for this project.",
+		})
+		return a, nil
+	}
 	return a, nil
 }
 
@@ -122,15 +238,9 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 
 	if len(parts) == 1 {
 		// /mode with no argument: show current mode and help
-		var current string
-		if a.router.ModeSet() {
-			current = a.router.Mode().String()
-		} else {
-			current = "not set (legacy routing)"
-		}
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("%s: %s\n%s", msg.ModeLabel, current, msg.ModeHelp),
+			Content: fmt.Sprintf("%s: %s\n/model [free|economy|balanced|power]", msg.ModeLabel, a.currentModeLabel()),
 		})
 		return a, nil
 	}
@@ -163,13 +273,101 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 
 	a.chat.AddMessage(ChatMessage{
 		Role:    "system",
-		Content: fmt.Sprintf(msg.ModeChanged, displayName),
+		Content: fmt.Sprintf("Model profile: %s", displayName),
 	})
 	return a, nil
 }
 
+func (a App) currentModeLabel() string {
+	if a.router.ModeSet() {
+		return a.router.Mode().String()
+	}
+	return "not set (legacy routing)"
+}
+
+func (a App) chatHelpText() string {
+	return strings.Join([]string{
+		"Available commands:",
+		"/help - Show command help",
+		"/clear - Clear the current conversation",
+		"/compact - Compact older chat history",
+		"/memory - Show compacted session memory",
+		"/status - Show current session status",
+		"/cost - Show current session cost",
+		"/approve - Approve the pending action",
+		"/deny - Deny the pending action",
+		"/resume - Restore the last saved session",
+		"/model [free|economy|balanced|power] - Switch routing profile",
+		"/exit - Quit makewand",
+	}, "\n")
+}
+
+func (a App) statusSummary() string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Model profile: %s", a.currentModeLabel()))
+
+	available := a.router.Available()
+	if len(available) == 0 {
+		lines = append(lines, "Available providers: none")
+	} else {
+		lines = append(lines, "Available providers: "+strings.Join(available, ", "))
+	}
+
+	if a.project != nil {
+		lines = append(lines, fmt.Sprintf("Project: %s", a.project.Path))
+		lines = append(lines, fmt.Sprintf("Project entries: %d", len(a.project.Files)))
+	}
+
+	if summary := a.pendingApprovalSummary(); summary != "" {
+		lines = append(lines, "Pending approval:")
+		lines = append(lines, summary)
+	}
+
+	if a.sessionFile != "" {
+		lines = append(lines, fmt.Sprintf("Session file: %s", a.sessionFile))
+	}
+	if a.lastSessionSavedAt != "" {
+		lines = append(lines, fmt.Sprintf("Last saved: %s", sessionTimeLabel(a.lastSessionSavedAt)))
+	}
+	lines = append(lines, fmt.Sprintf("Session cost: $%.2f", a.cost.SessionTotal()))
+	return strings.Join(lines, "\n")
+}
+
+func (a App) costSummary() string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Session total: $%.2f", a.cost.SessionTotal()))
+
+	providers := a.cost.ByProvider()
+	if len(providers) == 0 {
+		lines = append(lines, "No requests yet.")
+		return strings.Join(lines, "\n")
+	}
+
+	order := []string{"claude", "codex", "gemini", "openai", "ollama"}
+	for _, provider := range order {
+		cost, ok := providers[provider]
+		if !ok {
+			continue
+		}
+		requests := a.cost.RequestCount(provider)
+		inTok, outTok := a.cost.TokensByProvider(provider)
+		lines = append(lines, fmt.Sprintf("%s: $%.2f, %d requests, %d in / %d out tokens", provider, cost, requests, inTok, outTok))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func classifyTask(input string) model.TaskType {
 	return model.ClassifyTask(input)
+}
+
+func shouldUseUnaryChat(task model.TaskType) bool {
+	switch task {
+	case model.TaskExplain, model.TaskAnalyze:
+		return true
+	default:
+		return false
+	}
 }
 
 func chatTaskToBuildPhase(task model.TaskType) model.BuildPhase {

@@ -21,6 +21,21 @@ func ClassifyTask(input string) TaskType {
 		return TaskAnalyze
 	}
 
+	// Basic CJK intent hints for common Chinese prompts.
+	// Keep this lightweight and deterministic (no heavy NLP dependency).
+	switch {
+	case containsAny(lower, "修复", "报错", "错误", "异常", "故障"):
+		return TaskFix
+	case containsAny(lower, "审查", "评审", "review"):
+		return TaskReview
+	case containsAny(lower, "规划", "方案", "设计", "架构"):
+		return TaskAnalyze
+	case containsAny(lower, "实现", "编写", "生成代码", "写代码"):
+		return TaskCode
+	case containsAny(lower, "解释", "说明", "为什么", "为何", "怎么", "如何", "谁", "什么"):
+		return TaskExplain
+	}
+
 	words := classifyWords(lower)
 	wordSet := make(map[string]bool, len(words))
 	for _, word := range words {
@@ -57,6 +72,15 @@ func ClassifyTask(input string) TaskType {
 	}
 
 	return TaskCode
+}
+
+func containsAny(input string, keywords ...string) bool {
+	for _, kw := range keywords {
+		if kw != "" && strings.Contains(input, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasAnyClassifyWord(wordSet map[string]bool, keywords ...string) bool {

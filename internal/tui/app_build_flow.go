@@ -85,9 +85,14 @@ func (a App) handleFilesExtracted(msg filesExtractedMsg) (tea.Model, tea.Cmd) {
 
 	// Review, fix, and chat phases: ask for confirmation
 	a.confirmingFiles = true
+	a.setPendingApproval(
+		approvalFileWrite,
+		fmt.Sprintf(m.FileConfirmWrite, len(msg.files)),
+		fmt.Sprintf("Pending write: %d files", len(msg.files)),
+	)
 	a.chat.AddMessage(ChatMessage{
 		Role:    "system",
-		Content: fmt.Sprintf(m.FileConfirmWrite, len(msg.files)),
+		Content: approvalPrompt(fmt.Sprintf(m.FileConfirmWrite, len(msg.files)), fmt.Sprintf("Pending write: %d files", len(msg.files))),
 	})
 	return a, nil
 }
@@ -99,11 +104,13 @@ func (a App) handleFileConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "y", "enter":
 		a.confirmingFiles = false
+		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmFileWriteMsg{confirmed: true}
 		}
 	case "n", "esc":
 		a.confirmingFiles = false
+		a.clearPendingApproval()
 		a.pendingFiles = nil
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
@@ -119,11 +126,13 @@ func (a App) handleDepsConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "y", "enter":
 		a.confirmingDeps = false
+		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmDepsInstallMsg{confirmed: true}
 		}
 	case "n", "esc":
 		a.confirmingDeps = false
+		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmDepsInstallMsg{confirmed: false}
 		}
@@ -136,11 +145,13 @@ func (a App) handleTestsConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "y", "enter":
 		a.confirmingTests = false
+		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmTestsRunMsg{confirmed: true}
 		}
 	case "n", "esc":
 		a.confirmingTests = false
+		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmTestsRunMsg{confirmed: false}
 		}
@@ -393,10 +404,15 @@ func (a App) startDepsPhase() (tea.Model, tea.Cmd) {
 
 	if !a.depsInstallApproved {
 		a.confirmingDeps = true
+		a.setPendingApproval(
+			approvalDeps,
+			depsInstallConfirmPrompt,
+			fmt.Sprintf("Planned command: %s", plan.DisplayCommand()),
+		)
 		emitExecTrace(a.router, "pipeline.exec.confirm_requested", "deps", plan, nil, nil, nil, "waiting for dependency install confirmation")
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("%s\nPlanned command: %s", depsInstallConfirmPrompt, plan.DisplayCommand()),
+			Content: approvalPrompt(depsInstallConfirmPrompt, fmt.Sprintf("Planned command: %s", plan.DisplayCommand())),
 		})
 		return a, nil
 	}
@@ -408,9 +424,14 @@ func (a App) runDepsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	if a.project == nil || plan == nil {
 		return a, nil
 	}
+	a.clearPendingApproval()
 	proj := a.project
 	planValue := *plan
 	emitExecTrace(a.router, "pipeline.exec.started", "deps", &planValue, nil, nil, nil, "running dependency install plan")
+	a.chat.AddMessage(ChatMessage{
+		Role:    "status",
+		Content: execStartedMessage("dependency install", fmt.Sprintf("Command: %s", planValue.DisplayCommand())),
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	a.cancelAI = cancel
 	return a, func() tea.Msg {
@@ -452,10 +473,15 @@ func (a App) startTestsPhase() (tea.Model, tea.Cmd) {
 
 	if !a.testsRunApproved {
 		a.confirmingTests = true
+		a.setPendingApproval(
+			approvalTests,
+			"Run project tests now?",
+			fmt.Sprintf("Planned command: %s", plan.DisplayCommand()),
+		)
 		emitExecTrace(a.router, "pipeline.exec.confirm_requested", "tests", plan, nil, nil, nil, "waiting for test execution confirmation")
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("Run project tests now? (Y/n)\nPlanned command: %s", plan.DisplayCommand()),
+			Content: approvalPrompt("Run project tests now?", fmt.Sprintf("Planned command: %s", plan.DisplayCommand())),
 		})
 		return a, nil
 	}
@@ -467,9 +493,14 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	if a.project == nil || plan == nil {
 		return a, nil
 	}
+	a.clearPendingApproval()
 	proj := a.project
 	planValue := *plan
 	emitExecTrace(a.router, "pipeline.exec.started", "tests", &planValue, nil, nil, nil, "running test execution plan")
+	a.chat.AddMessage(ChatMessage{
+		Role:    "status",
+		Content: execStartedMessage("tests", fmt.Sprintf("Command: %s", planValue.DisplayCommand())),
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	a.cancelAI = cancel
 	return a, func() tea.Msg {
@@ -482,6 +513,7 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 // --- Dependency installation ---
 
 func (a App) handleDepsInstallConfirm(msg confirmDepsInstallMsg) (tea.Model, tea.Cmd) {
+	a.clearPendingApproval()
 	if !msg.confirmed {
 		emitExecTrace(a.router, "pipeline.exec.declined", "deps", a.pendingDepsPlan, boolPtr(false), nil, nil, "dependency install declined by user")
 		emitExecTrace(a.router, "pipeline.exec.skipped", "tests", a.pendingTestsPlan, nil, nil, nil, testsSkippedDetail)
@@ -509,6 +541,10 @@ func (a App) handleDepsInstallConfirm(msg confirmDepsInstallMsg) (tea.Model, tea
 func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
 	plan := a.pendingDepsPlan
+	commandDetails := ""
+	if plan != nil {
+		commandDetails = fmt.Sprintf("Command: %s", plan.DisplayCommand())
+	}
 
 	if msg.err != nil {
 		emitExecTrace(a.router, "pipeline.exec.error", "deps", plan, nil, msg.result, msg.err, "dependency install execution failed")
@@ -517,6 +553,10 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
 			Content: fmt.Sprintf("Error installing dependencies: %s", msg.err),
+		})
+		a.chat.AddMessage(ChatMessage{
+			Role:    "status",
+			Content: execFinishedMessage("dependency install", commandDetails, execResultSummary(msg.result)),
 		})
 		// Still try tests
 	} else if msg.result != nil && msg.result.ExitCode != 0 {
@@ -530,6 +570,10 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
 			Content: fmt.Sprintf("Dependency install failed:\n%s", stderr),
+		})
+		a.chat.AddMessage(ChatMessage{
+			Role:    "status",
+			Content: execFinishedMessage("dependency install", commandDetails, execResultSummary(msg.result)),
 		})
 		// Deps failure means the code was broken → quality penalty for code provider.
 		if a.buildCodeProvider != "" {
@@ -547,6 +591,10 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 		emitExecTrace(a.router, "pipeline.exec.succeeded", "deps", plan, nil, msg.result, nil, "dependency install completed")
 		a.progress.SetStepStatus(stepDeps, StepDone)
 		a.progress.SetStepDetail(stepDeps, m.ProgressDepsInstalled)
+		a.chat.AddMessage(ChatMessage{
+			Role:    "status",
+			Content: execFinishedMessage("dependency install", commandDetails, execResultSummary(msg.result)),
+		})
 	}
 	a.pendingDepsPlan = nil
 
@@ -555,6 +603,7 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a App) handleTestsRunConfirm(msg confirmTestsRunMsg) (tea.Model, tea.Cmd) {
+	a.clearPendingApproval()
 	if !msg.confirmed {
 		emitExecTrace(a.router, "pipeline.exec.declined", "tests", a.pendingTestsPlan, boolPtr(false), nil, nil, "test execution declined by user")
 		a.progress.SetStepStatus(stepTests, StepDone)
@@ -580,6 +629,10 @@ func (a App) handleTestsRunConfirm(msg confirmTestsRunMsg) (tea.Model, tea.Cmd) 
 func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
 	plan := a.pendingTestsPlan
+	commandDetails := ""
+	if plan != nil {
+		commandDetails = fmt.Sprintf("Command: %s", plan.DisplayCommand())
+	}
 	if !msg.noTest && msg.result != nil && strings.Contains(msg.result.Stdout, "No test framework") {
 		msg.noTest = true
 	}
@@ -596,6 +649,10 @@ func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 		emitExecTrace(a.router, "pipeline.exec.error", "tests", plan, nil, msg.result, msg.err, "test execution failed")
 		a.progress.SetStepStatus(stepTests, StepFailed)
 		a.progress.SetStepDetail(stepTests, msg.err.Error())
+		a.chat.AddMessage(ChatMessage{
+			Role:    "status",
+			Content: execFinishedMessage("tests", commandDetails, execResultSummary(msg.result)),
+		})
 		a.pendingTestsPlan = nil
 		return a.buildComplete()
 	}
@@ -613,6 +670,10 @@ func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 			Role:    "system",
 			Content: fmt.Sprintf("%s:\n%s", m.ErrTestFail, stderr),
 		})
+		a.chat.AddMessage(ChatMessage{
+			Role:    "status",
+			Content: execFinishedMessage("tests", commandDetails, execResultSummary(msg.result)),
+		})
 		// Test failure → code was broken; penalise the code provider.
 		if a.buildCodeProvider != "" {
 			a.router.RecordQualityOutcome(model.PhaseCode, a.buildCodeProvider, false)
@@ -627,6 +688,10 @@ func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 	emitExecTrace(a.router, "pipeline.exec.succeeded", "tests", plan, nil, msg.result, nil, "test execution completed")
 	a.progress.SetStepStatus(stepTests, StepDone)
 	a.progress.SetStepDetail(stepTests, m.ProgressTestsPassed)
+	a.chat.AddMessage(ChatMessage{
+		Role:    "status",
+		Content: execFinishedMessage("tests", commandDetails, execResultSummary(msg.result)),
+	})
 	// Only reward the code provider if no auto-fix was needed.
 	// If auto-fix ran, credit goes to the fix provider (below), not the original generator.
 	if a.buildCodeProvider != "" && a.autoFixAttempt == 0 {

@@ -63,6 +63,29 @@ func (s *deadlineCaptureProvider) ChatStream(ctx context.Context, messages []Mes
 	return nil, fmt.Errorf("%s stream unsupported", s.name)
 }
 
+type streamDeadlineCaptureProvider struct {
+	name            string
+	available       bool
+	streamRemaining time.Duration
+}
+
+func (s *streamDeadlineCaptureProvider) Name() string { return s.name }
+
+func (s *streamDeadlineCaptureProvider) IsAvailable() bool { return s.available }
+
+func (s *streamDeadlineCaptureProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	return "", Usage{}, fmt.Errorf("%s chat unsupported", s.name)
+}
+
+func (s *streamDeadlineCaptureProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		s.streamRemaining = time.Until(deadline)
+	} else {
+		s.streamRemaining = -1
+	}
+	return nil, fmt.Errorf("%s stream forced failure", s.name)
+}
+
 func TestChat_ModeFreeDoesNotFallbackToAPI(t *testing.T) {
 	gemini := &stubProvider{name: "gemini", available: true, failChat: true}
 	openai := &stubProvider{name: "openai", available: true, failChat: false}
@@ -200,6 +223,50 @@ func TestChat_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
 	}
 	if primary.remaining > 200*time.Second {
 		t.Fatalf("primary attempt deadline too long: %s, want bounded near phase timeout", primary.remaining)
+	}
+}
+
+func TestChatStream_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CodingModel = "claude"
+	cfg.DefaultModel = "claude"
+
+	primary := &streamDeadlineCaptureProvider{name: "claude", available: true}
+	fallback := &stubProvider{name: "gemini", available: true}
+
+	r := &Router{
+		cfg: cfg,
+		providers: map[string]Provider{
+			"claude": primary,
+			"gemini": fallback,
+		},
+		providerCache: make(map[providerKey]Provider),
+		accessTypes: map[string]AccessType{
+			"claude": AccessSubscription,
+			"gemini": AccessFree,
+		},
+		usage:   newSessionUsage(),
+		modeSet: false, // legacy routing path
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	ch, result, err := r.ChatStream(ctx, TaskCode, []Message{{Role: "user", Content: "test"}}, "")
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v, want nil (fallback should succeed)", err)
+	}
+	if ch == nil {
+		t.Fatal("ChatStream() channel is nil")
+	}
+	if result.Actual != "gemini" || !result.IsFallback {
+		t.Fatalf("ChatStream() route = %+v, want fallback to gemini", result)
+	}
+	if primary.streamRemaining <= 0 {
+		t.Fatalf("primary stream attempt should receive bounded deadline, got remaining=%s", primary.streamRemaining)
+	}
+	if primary.streamRemaining > 200*time.Second {
+		t.Fatalf("primary stream attempt deadline too long: %s, want bounded near phase timeout", primary.streamRemaining)
 	}
 }
 

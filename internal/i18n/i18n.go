@@ -176,10 +176,10 @@ var en = Messages{
 
 	ChatWelcome:      "Welcome! I'm here to help you build and modify your project.",
 	ChatPrompt:       "What would you like to do?",
-	ChatCommandHint:  "Commands: /mode [free|economy|balanced|power] | /help | /exit (or Ctrl+C)",
+	ChatCommandHint:  "Commands: /model [free|economy|balanced|power] | /clear | /status | /cost | /exit (or Ctrl+D)",
 	ChatThinking:     "Thinking...",
 	ChatWorking:      "Working on it...",
-	ChatPlaceholder:  "Type your message... (Enter to send, Ctrl+D for multiline)",
+	ChatPlaceholder:  "Type your message... (Enter to send, / for commands)",
 	ChatThinkingAnim: "Thinking...",
 
 	CostSession:      "Session Cost",
@@ -241,7 +241,7 @@ var en = Messages{
 	ModePower:    "Power",
 	ModeLabel:    "Mode",
 	ModeChanged:  "Mode: %s",
-	ModeHelp:     "/mode [free|economy|balanced|power]",
+	ModeHelp:     "/model [free|economy|balanced|power]",
 
 	SetupWelcome:  "Welcome to makewand! Let's set up your AI models.",
 	SetupAPIKey:   "Enter your %s API key (or press Enter to skip):",
@@ -291,10 +291,10 @@ var zh = Messages{
 
 	ChatWelcome:      "欢迎！我来帮你构建和修改项目。",
 	ChatPrompt:       "你想做什么？",
-	ChatCommandHint:  "命令：/mode [free|economy|balanced|power] | /help | /exit（或 Ctrl+C）",
+	ChatCommandHint:  "命令：/model [free|economy|balanced|power] | /clear | /status | /cost | /exit（或 Ctrl+D）",
 	ChatThinking:     "正在思考...",
 	ChatWorking:      "正在处理...",
-	ChatPlaceholder:  "输入消息... (Enter 发送, Ctrl+D 多行)",
+	ChatPlaceholder:  "输入消息... (Enter 发送, / 查看命令)",
 	ChatThinkingAnim: "正在思考...",
 
 	CostSession:      "本次费用",
@@ -356,7 +356,7 @@ var zh = Messages{
 	ModePower:    "强劲",
 	ModeLabel:    "模式",
 	ModeChanged:  "模式：%s",
-	ModeHelp:     "/mode [free|economy|balanced|power]",
+	ModeHelp:     "/model [free|economy|balanced|power]",
 
 	SetupWelcome:  "欢迎使用 makewand！让我们配置 AI 模型。",
 	SetupAPIKey:   "输入你的 %s API 密钥（按回车跳过）：",
