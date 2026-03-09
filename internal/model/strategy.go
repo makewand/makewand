@@ -294,10 +294,14 @@ type candidate struct {
 	thompsonScore float64 // sampled from Beta(α,β); higher → higher priority
 }
 
-// minSamplesForExclusion is the minimum number of total requests (success + error)
-// required before the hard >50% error-failure-rate exclusion rule applies.
-// This prevents a single transient API error from permanently blacklisting a provider.
+// minSamplesForExclusion is the default minimum number of total requests
+// (success + error) required before the hard >50% error-failure-rate exclusion
+// rule applies.
 const minSamplesForExclusion = 5
+
+// minSamplesForFastDegrade is used by economy/power mode to react faster to
+// unstable providers (for example repeated CLI auth/timeout failures).
+const minSamplesForFastDegrade = 2
 
 // sortCandidates sorts candidates by:
 //  1. Access type priority (Free/Subscription < Local < API)
@@ -306,6 +310,21 @@ const minSamplesForExclusion = 5
 //  4. Session use count (load balance among equal-score candidates)
 //  5. Original strategy table order as a stable tiebreaker
 func sortCandidates(candidates []candidate) {
+	sortCandidatesWithMinSamples(candidates, minSamplesForExclusion)
+}
+
+func sortCandidatesForMode(candidates []candidate, mode UsageMode) {
+	minSamples := minSamplesForExclusion
+	if mode == ModeEconomy || mode == ModePower {
+		minSamples = minSamplesForFastDegrade
+	}
+	sortCandidatesWithMinSamples(candidates, minSamples)
+}
+
+func sortCandidatesWithMinSamples(candidates []candidate, minSamples int) {
+	if minSamples <= 0 {
+		minSamples = 1
+	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		pi, pj := accessPriority(candidates[i].access), accessPriority(candidates[j].access)
 		if pi != pj {
@@ -313,8 +332,8 @@ func sortCandidates(candidates []candidate) {
 		}
 		// Hard-exclude providers with >50% error-failure rate, but only after
 		// enough samples to avoid false-positives from transient errors.
-		hi := candidates[i].failureRate > 0.5 && candidates[i].requests >= minSamplesForExclusion
-		hj := candidates[j].failureRate > 0.5 && candidates[j].requests >= minSamplesForExclusion
+		hi := candidates[i].failureRate > 0.5 && candidates[i].requests >= minSamples
+		hj := candidates[j].failureRate > 0.5 && candidates[j].requests >= minSamples
 		if hi != hj {
 			return !hi
 		}
