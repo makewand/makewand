@@ -85,6 +85,7 @@ type App struct {
 	autoFixRetryAttempt int                    // attempt number for retry after file write
 	buildCodeProvider   string                 // provider that generated code
 	buildReviewProvider string                 // provider that reviewed code
+	pendingApproval     *approvalRequest       // current approval request, if any
 
 	// State
 	width    int
@@ -97,6 +98,12 @@ type App struct {
 
 	// Debug route diagnostics (enabled by --debug).
 	debugRoute *routeDebugState
+
+	// Chat session metadata.
+	sessionFile          string
+	lastSessionSavedAt   string
+	restoredSession      bool
+	restoredMessageCount int
 }
 
 // --- Bubble Tea message types ---
@@ -238,18 +245,27 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 	}
 
 	if mode == ModeChat {
-		msg := i18n.Msg()
-		app.chat.AddMessage(ChatMessage{
-			Role: "system",
-			Content: fmt.Sprintf("%s\n%s\n%s",
-				msg.ChatWelcome,
-				msg.ChatPrompt,
-				msg.ChatCommandHint,
-			),
-		})
+		app.chat.ResetMessages([]ChatMessage{app.chatWelcomeMessage()})
+		if app.project != nil {
+			if sessionFile, err := chatSessionFilePath(app.project.Path); err == nil {
+				app.sessionFile = sessionFile
+			}
+		}
 	}
 
 	return app
+}
+
+func (a App) chatWelcomeMessage() ChatMessage {
+	msg := i18n.Msg()
+	return ChatMessage{
+		Role: "system",
+		Content: fmt.Sprintf("%s\n%s\n%s",
+			msg.ChatWelcome,
+			msg.ChatPrompt,
+			msg.ChatCommandHint,
+		),
+	}
 }
 
 // Init implements tea.Model.
@@ -309,13 +325,16 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
-		case "ctrl+c":
+		case "ctrl+c", "ctrl+d":
 			if a.cancelAI != nil {
 				a.cancelAI()
 				a.cancelAI = nil
 			}
 			a.quitting = true
 			return a, tea.Quit
+
+		case "ctrl+l":
+			return a, tea.ClearScreen
 
 		case "enter":
 			if a.mode == ModeNew {
@@ -585,6 +604,9 @@ func (a App) viewSidePanel(width int) string {
 
 	sections = append(sections, a.fileTree.View())
 	sections = append(sections, a.cost.View(width))
+	if approvalView := a.viewPendingApproval(width); approvalView != "" {
+		sections = append(sections, approvalView)
+	}
 
 	progView := a.progress.View()
 	if progView != "" {
@@ -647,6 +669,11 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 			diag.Stderr().WarnErr("could not load routing stats", err)
 		}
 	}
+	if mode == ModeChat {
+		if _, err := app.restoreChatSession(); err != nil {
+			diag.Stderr().WarnErr("could not restore chat session", err)
+		}
+	}
 
 	p := tea.NewProgram(app, tea.WithAltScreen())
 	finalModel, err := p.Run()
@@ -656,6 +683,9 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 		if finalApp, ok := finalModel.(App); ok {
 			if err := finalApp.router.SaveStats(dir); err != nil {
 				diag.Stderr().WarnErr("could not save routing stats", err)
+			}
+			if err := finalApp.saveChatSession(); err != nil {
+				diag.Stderr().WarnErr("could not save chat session", err)
 			}
 		}
 	}

@@ -58,6 +58,14 @@ func (c *CostTracker) AddWithTokens(provider string, cost float64, inputTokens, 
 	})
 }
 
+func (c *CostTracker) Snapshot() []costEntry {
+	return append([]costEntry(nil), c.entries...)
+}
+
+func (c *CostTracker) Restore(entries []costEntry) {
+	c.entries = append([]costEntry(nil), entries...)
+}
+
 // SessionTotal returns the total cost for the current session.
 func (c *CostTracker) SessionTotal() float64 {
 	var total float64

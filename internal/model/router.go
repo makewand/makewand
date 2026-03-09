@@ -1406,6 +1406,26 @@ func withProviderAttemptTimeout(ctx context.Context, phase BuildPhase) (context.
 	return withProviderAttemptTimeoutFor(ctx, ModeBalanced, phase, "")
 }
 
+func withStreamAttemptCancel(ch <-chan StreamChunk, cancel context.CancelFunc) <-chan StreamChunk {
+	if ch == nil || cancel == nil {
+		return ch
+	}
+
+	out := make(chan StreamChunk)
+	go func() {
+		defer close(out)
+		defer cancel()
+		for chunk := range ch {
+			out <- chunk
+			if chunk.Done || chunk.Error != nil {
+				return
+			}
+		}
+	}()
+
+	return out
+}
+
 // ChatWith sends a message to a specific provider for a build phase.
 // It resolves the provider by name, falls back if unavailable, and tracks usage.
 // Providers in the exclude list are never used (enforces cross-model constraints).
@@ -1610,6 +1630,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 		return nil, RouteResult{}, err
 	}
 	maxTokens := MaxTokensForTask(task)
+	attemptPhase := taskToBuildPhase(task)
 	firstErr := error(nil)
 
 	if allow, remaining := r.beforeProviderAttempt(result.Actual); !allow {
@@ -1625,7 +1646,8 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 		})
 	} else {
 		primaryStart := time.Now()
-		ch, streamErr := result.Provider.ChatStream(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), attemptPhase, result.Actual)
+		ch, streamErr := result.Provider.ChatStream(attemptCtx, messages, system, maxTokens)
 		if streamErr == nil {
 			r.usage.Increment(result.Actual)
 			r.recordProviderSuccess(result.Actual)
@@ -1638,8 +1660,9 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 				IsFallback: result.IsFallback,
 				DurationMS: time.Since(primaryStart).Milliseconds(),
 			})
-			return ch, result, nil
+			return withStreamAttemptCancel(ch, attemptCancel), result, nil
 		}
+		attemptCancel()
 		r.emitTrace(TraceEvent{
 			Event:      "chat_stream_start_error",
 			Task:       taskTypeName(task),
@@ -1715,7 +1738,8 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 					continue
 				}
 				start := time.Now()
-				ch, retryErr := p.ChatStream(ctx, messages, system, maxTokens)
+				attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), attemptPhase, c.name)
+				ch, retryErr := p.ChatStream(attemptCtx, messages, system, maxTokens)
 				if retryErr == nil {
 					r.usage.Increment(c.name)
 					r.recordProviderSuccess(c.name)
@@ -1728,7 +1752,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 						IsFallback: true,
 						DurationMS: time.Since(start).Milliseconds(),
 					})
-					return ch, RouteResult{
+					return withStreamAttemptCancel(ch, attemptCancel), RouteResult{
 						Provider:   p,
 						ModelID:    c.modelID,
 						Requested:  result.Requested,
@@ -1736,6 +1760,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 						IsFallback: true,
 					}, nil
 				}
+				attemptCancel()
 				r.emitTrace(TraceEvent{
 					Event:      "chat_stream_start_error",
 					Task:       taskTypeName(task),
@@ -1802,7 +1827,8 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 			continue
 		}
 		start := time.Now()
-		ch, retryErr := p.ChatStream(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), attemptPhase, name)
+		ch, retryErr := p.ChatStream(attemptCtx, messages, system, maxTokens)
 		if retryErr == nil {
 			r.usage.Increment(name)
 			r.recordProviderSuccess(name)
@@ -1814,13 +1840,14 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 				IsFallback: true,
 				DurationMS: time.Since(start).Milliseconds(),
 			})
-			return ch, RouteResult{
+			return withStreamAttemptCancel(ch, attemptCancel), RouteResult{
 				Provider:   p,
 				Requested:  result.Requested,
 				Actual:     name,
 				IsFallback: true,
 			}, nil
 		}
+		attemptCancel()
 		r.emitTrace(TraceEvent{
 			Event:      "chat_stream_start_error",
 			Task:       taskTypeName(task),

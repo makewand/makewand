@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
 )
@@ -55,7 +56,21 @@ func TestNewApp_ModeChatAddsWelcomeHint(t *testing.T) {
 	if first.Role != "system" {
 		t.Fatalf("first message role = %q, want system", first.Role)
 	}
-	if !strings.Contains(first.Content, "/help") || !strings.Contains(first.Content, "/mode") {
+	if !strings.Contains(first.Content, "/model") || !strings.Contains(first.Content, "/clear") {
 		t.Fatalf("welcome hint missing slash commands: %q", first.Content)
+	}
+}
+
+func TestCtrlDQuitsChat(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	nextModel, cmd := app.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	next := nextModel.(App)
+	if !next.quitting {
+		t.Fatal("ctrl+d should set quitting state")
+	}
+	if cmd == nil {
+		t.Fatal("ctrl+d should return tea.Quit")
 	}
 }
