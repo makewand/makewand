@@ -74,9 +74,7 @@ type App struct {
 	// Build pipeline state
 	pendingFiles        []engine.ExtractedFile // files waiting to be written
 	pendingPhase        pendingPhaseType       // which phase triggered the pending files
-	confirmingFiles     bool                   // waiting for user Y/N
-	confirmingDeps      bool                   // waiting for dependency install confirmation
-	confirmingTests     bool                   // waiting for test execution confirmation
+	state               AppState               // current interaction state
 	depsInstallApproved bool                   // user approved dependency installation
 	testsRunApproved    bool                   // user approved running tests
 	pendingDepsPlan     *engine.ExecPlan       // detected dependency install command
@@ -88,10 +86,9 @@ type App struct {
 	pendingApproval     *approvalRequest       // current approval request, if any
 
 	// State
-	width    int
-	height   int
-	quitting bool
-	err      error
+	width  int
+	height int
+	err    error
 
 	// Last budget warning level that has been surfaced to the user.
 	lastBudgetNoticeLevel BudgetLevel
@@ -312,15 +309,15 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		// Handle file write confirmation
-		if a.confirmingFiles {
+		if a.state == StateConfirmFiles {
 			return a.handleFileConfirmKey(msg)
 		}
 		// Handle dependency install confirmation
-		if a.confirmingDeps {
+		if a.state == StateConfirmDeps {
 			return a.handleDepsConfirmKey(msg)
 		}
 		// Handle test execution confirmation
-		if a.confirmingTests {
+		if a.state == StateConfirmTests {
 			return a.handleTestsConfirmKey(msg)
 		}
 
@@ -330,7 +327,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.cancelAI()
 				a.cancelAI = nil
 			}
-			a.quitting = true
+			a.state = StateQuitting
 			return a, tea.Quit
 
 		case "ctrl+l":
@@ -344,7 +341,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "q":
 			if a.mode == ModeNew && a.wizard.Phase() == WizardPhaseTemplate {
-				a.quitting = true
+				a.state = StateQuitting
 				return a, tea.Quit
 			}
 
@@ -515,7 +512,7 @@ func (a *App) refreshProjectFiles() {
 
 // View implements tea.Model.
 func (a App) View() string {
-	if a.quitting {
+	if a.state == StateQuitting {
 		return mutedStyle.Render("Goodbye!") + "\n"
 	}
 

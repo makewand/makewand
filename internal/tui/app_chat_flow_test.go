@@ -238,7 +238,7 @@ func TestSubmitChatInput_ExitCommandQuits(t *testing.T) {
 	m, cmd := app.submitChatInput("/exit")
 	app = m.(App)
 
-	if !app.quitting {
+	if app.state != StateQuitting {
 		t.Fatal("app should enter quitting state on /exit")
 	}
 	if cmd == nil {
@@ -343,7 +343,7 @@ func TestHandleChatEnter_AppliesSelectedSlashSuggestionBeforeExecuting(t *testin
 func TestSubmitChatInput_ApproveCommandHandlesPendingTests(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
-	app.confirmingTests = true
+	app.state = StateConfirmTests
 	app.setPendingApproval(approvalTests, "Run project tests now?", "Command: go test ./...")
 
 	m, cmd := app.submitChatInput("/approve")
@@ -352,8 +352,8 @@ func TestSubmitChatInput_ApproveCommandHandlesPendingTests(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("/approve should return a confirmation command when approval is pending")
 	}
-	if app.confirmingTests {
-		t.Fatal("confirmingTests should be cleared after /approve")
+	if app.state == StateConfirmTests {
+		t.Fatal("state should not be StateConfirmTests after /approve")
 	}
 	msg := cmd()
 	if _, ok := msg.(confirmTestsRunMsg); !ok {
@@ -364,7 +364,7 @@ func TestSubmitChatInput_ApproveCommandHandlesPendingTests(t *testing.T) {
 func TestSubmitChatInput_DenyCommandCancelsPendingFileWrite(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
-	app.confirmingFiles = true
+	app.state = StateConfirmFiles
 	app.pendingFiles = []engine.ExtractedFile{{Path: "main.go", Content: "package main"}}
 	app.setPendingApproval(approvalFileWrite, "Write 1 file?", "Pending write: 1 files")
 
@@ -374,8 +374,8 @@ func TestSubmitChatInput_DenyCommandCancelsPendingFileWrite(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("/deny for file write should complete locally")
 	}
-	if app.confirmingFiles {
-		t.Fatal("confirmingFiles should be cleared after /deny")
+	if app.state == StateConfirmFiles {
+		t.Fatal("state should not be StateConfirmFiles after /deny")
 	}
 	if len(app.pendingFiles) != 0 {
 		t.Fatal("pendingFiles should be cleared after /deny")

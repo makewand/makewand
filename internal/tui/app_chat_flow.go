@@ -68,7 +68,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 				a.cancelAI()
 				a.cancelAI = nil
 			}
-			a.quitting = true
+			a.state = StateQuitting
 			return a, tea.Quit
 		}
 	}
@@ -165,9 +165,7 @@ func (a App) handleClearCommand() (tea.Model, tea.Cmd) {
 	a.pendingFiles = nil
 	a.pendingDepsPlan = nil
 	a.pendingTestsPlan = nil
-	a.confirmingFiles = false
-	a.confirmingDeps = false
-	a.confirmingTests = false
+	a.state = StateIdle
 	a.clearPendingApproval()
 	a.restoredSession = false
 	a.restoredMessageCount = 0

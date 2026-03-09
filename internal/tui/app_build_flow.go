@@ -84,7 +84,7 @@ func (a App) handleFilesExtracted(msg filesExtractedMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Review, fix, and chat phases: ask for confirmation
-	a.confirmingFiles = true
+	a.state = StateConfirmFiles
 	a.setPendingApproval(
 		approvalFileWrite,
 		fmt.Sprintf(m.FileConfirmWrite, len(msg.files)),
@@ -103,13 +103,13 @@ func (a App) handleFileConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "y", "enter":
-		a.confirmingFiles = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmFileWriteMsg{confirmed: true}
 		}
 	case "n", "esc":
-		a.confirmingFiles = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		a.pendingFiles = nil
 		a.chat.AddMessage(ChatMessage{
@@ -125,13 +125,13 @@ func (a App) handleDepsConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := strings.ToLower(msg.String())
 	switch key {
 	case "y", "enter":
-		a.confirmingDeps = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmDepsInstallMsg{confirmed: true}
 		}
 	case "n", "esc":
-		a.confirmingDeps = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmDepsInstallMsg{confirmed: false}
@@ -144,13 +144,13 @@ func (a App) handleTestsConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := strings.ToLower(msg.String())
 	switch key {
 	case "y", "enter":
-		a.confirmingTests = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmTestsRunMsg{confirmed: true}
 		}
 	case "n", "esc":
-		a.confirmingTests = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmTestsRunMsg{confirmed: false}
@@ -403,7 +403,7 @@ func (a App) startDepsPhase() (tea.Model, tea.Cmd) {
 	emitExecTrace(a.router, "pipeline.exec.plan_detected", "deps", plan, nil, nil, nil, "detected dependency install plan")
 
 	if !a.depsInstallApproved {
-		a.confirmingDeps = true
+		a.state = StateConfirmDeps
 		a.setPendingApproval(
 			approvalDeps,
 			depsInstallConfirmPrompt,
@@ -472,7 +472,7 @@ func (a App) startTestsPhase() (tea.Model, tea.Cmd) {
 	emitExecTrace(a.router, "pipeline.exec.plan_detected", "tests", plan, nil, nil, nil, "detected test execution plan")
 
 	if !a.testsRunApproved {
-		a.confirmingTests = true
+		a.state = StateConfirmTests
 		a.setPendingApproval(
 			approvalTests,
 			"Run project tests now?",

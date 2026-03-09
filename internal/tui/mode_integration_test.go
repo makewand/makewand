@@ -182,16 +182,16 @@ func TestMode_BalancedBuild_ReviewFixDeclined(t *testing.T) {
 		phase: pendingPhaseReview,
 	})
 
-	if !app.confirmingFiles {
-		t.Fatal("expected confirmingFiles=true for review fix")
+	if app.state != StateConfirmFiles {
+		t.Fatal("expected state=StateConfirmFiles for review fix")
 	}
 
 	// User declines.
 	m, _ := app.handleFileConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	app = m.(App)
 
-	if app.confirmingFiles {
-		t.Error("confirmingFiles should be false after decline")
+	if app.state == StateConfirmFiles {
+		t.Error("state should not be StateConfirmFiles after decline")
 	}
 }
 
@@ -264,8 +264,8 @@ func TestMode_AutoFixCycle_FixFilesRequireConfirmation(t *testing.T) {
 		phase: pendingPhaseFix,
 	})
 
-	if !app.confirmingFiles {
-		t.Error("confirmingFiles should be true for auto-fix files")
+	if app.state != StateConfirmFiles {
+		t.Error("state should be StateConfirmFiles for auto-fix files")
 	}
 	if app.pendingPhase != pendingPhaseFix {
 		t.Errorf("pendingPhase = %v, want pendingPhaseFix", app.pendingPhase)

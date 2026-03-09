@@ -29,11 +29,12 @@ var (
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "makewand [prompt]",
-		Short: "AI coding assistant for everyone",
+		Short: "Multi-provider coding router for terminal makers",
 		// Provider/runtime errors are already specific; avoid noisy global usage spam.
 		SilenceUsage: true,
-		Long: `makewand is a terminal AI coding assistant that lets anyone
-build, modify, and deploy software through natural language conversation.
+		Long: `makewand is a multi-provider coding router that orchestrates
+Claude, Gemini, OpenAI, and Ollama through adaptive mode-based routing
+(free/economy/balanced/power) for terminal-based coding workflows.
 
   makewand         - Start interactive chat in current directory (type /help in chat)
   makewand "..."   - Start chat and send an initial prompt
@@ -41,7 +42,7 @@ build, modify, and deploy software through natural language conversation.
   makewand new     - Create a new project with guided wizard
   makewand chat    - Chat with AI about your project
   makewand preview - Start a preview server
-  makewand setup   - Configure AI models and preferences`,
+  makewand setup   - Configure AI providers and routing preferences`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
@@ -438,7 +439,7 @@ func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {
 }
 
 func buildHeadlessSystemPrompt(task model.TaskType, prompt string) string {
-	base := "You are makewand, an expert software engineering assistant. Provide direct, actionable answers."
+	base := "You are makewand, a multi-provider coding router. Provide direct, actionable answers."
 	headlessRules := "Headless mode rules: do not ask for permissions, do not claim to write files, and do not ask follow-up questions. Return the final answer directly."
 	if headlessCodeOnlyRequested(task, prompt) {
 		return base + " " + headlessRules + " For code/file requests, output only the final code content. No markdown fences. No summaries."

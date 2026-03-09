@@ -48,8 +48,8 @@ func TestDepsConfirm_DeclinePath(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("startDepsPhase should not return command before user confirmation")
 	}
-	if !app.confirmingDeps {
-		t.Fatal("confirmingDeps should be true after entering deps phase")
+	if app.state != StateConfirmDeps {
+		t.Fatal("state should be StateConfirmDeps after entering deps phase")
 	}
 	last := app.chat.messages[len(app.chat.messages)-1].Content
 	if !strings.Contains(last, depsInstallConfirmPrompt) {
@@ -111,8 +111,8 @@ func TestDepsAndTestsConfirm_AcceptPath(t *testing.T) {
 	if testsPhaseCmd != nil {
 		t.Fatal("startTestsPhase should wait for test confirmation before returning a command")
 	}
-	if !app.confirmingTests {
-		t.Fatal("confirmingTests should be true after deps success")
+	if app.state != StateConfirmTests {
+		t.Fatal("state should be StateConfirmTests after deps success")
 	}
 	last := app.chat.messages[len(app.chat.messages)-1].Content
 	if !strings.Contains(last, "Run project tests now?") {
@@ -158,8 +158,8 @@ func TestTestsConfirm_DeclinePath(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("startTestsPhase should wait for user confirmation")
 	}
-	if !app.confirmingTests {
-		t.Fatal("confirmingTests should be true")
+	if app.state != StateConfirmTests {
+		t.Fatal("state should be StateConfirmTests")
 	}
 
 	model, cmd = app.handleTestsConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})

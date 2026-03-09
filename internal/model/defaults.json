@@ -1,0 +1,105 @@
+{
+  "models": {
+    "claude": {
+      "cheap": "claude-haiku-4-5-20251001",
+      "mid": "claude-sonnet-4-20250514",
+      "premium": "claude-opus-4-20250514"
+    },
+    "codex": {
+      "cheap": "codex-cli",
+      "mid": "codex-cli",
+      "premium": "codex-cli"
+    },
+    "openai": {
+      "cheap": "gpt-4o-mini",
+      "mid": "gpt-4o",
+      "premium": "gpt-4o"
+    },
+    "gemini": {
+      "cheap": "gemini-2.5-flash",
+      "mid": "gemini-2.5-flash",
+      "premium": "gemini-2.5-pro"
+    },
+    "ollama": {
+      "cheap": "gemma3:4b",
+      "mid": "gemma3:27b",
+      "premium": "llama4:16x17b"
+    }
+  },
+  "costs": {
+    "claude-haiku-4-5-20251001": { "input": 0.25, "output": 1.25 },
+    "claude-sonnet-4-20250514":  { "input": 3.0,  "output": 15.0 },
+    "claude-opus-4-20250514":    { "input": 15.0, "output": 75.0 },
+    "gpt-4o-mini":               { "input": 0.15, "output": 0.60 },
+    "gpt-4o":                    { "input": 2.50, "output": 10.0 },
+    "gemini-2.5-flash":          { "input": 0,    "output": 0 },
+    "gemini-2.5-pro":            { "input": 1.25, "output": 10.0 },
+    "codex-cli":                 { "input": 0,    "output": 0 },
+    "llama3.2":                  { "input": 0,    "output": 0 },
+    "gemma3:4b":                 { "input": 0,    "output": 0 },
+    "gemma3:27b":                { "input": 0,    "output": 0 },
+    "llama4:16x17b":             { "input": 0,    "output": 0 }
+  },
+  "strategies": {
+    "free": {
+      "analyze": { "tier": "cheap", "providers": ["gemini", "ollama"] },
+      "explain": { "tier": "cheap", "providers": ["gemini", "ollama"] },
+      "code":    { "tier": "cheap", "providers": ["gemini", "ollama"] },
+      "fix":     { "tier": "cheap", "providers": ["gemini", "ollama"] },
+      "review":  { "tier": "cheap", "providers": ["gemini", "ollama"] }
+    },
+    "economy": {
+      "analyze": { "tier": "cheap", "providers": ["gemini", "ollama", "claude", "codex", "openai"] },
+      "explain": { "tier": "cheap", "providers": ["gemini", "ollama", "claude", "codex", "openai"] },
+      "code":    { "tier": "cheap", "providers": ["gemini", "claude", "codex", "openai", "ollama"] },
+      "fix":     { "tier": "cheap", "providers": ["codex", "claude", "gemini", "openai", "ollama"] },
+      "review":  { "tier": "cheap", "providers": ["gemini", "ollama", "claude", "codex", "openai"] }
+    },
+    "balanced": {
+      "analyze": { "tier": "mid", "providers": ["gemini", "claude", "codex", "openai", "ollama"] },
+      "explain": { "tier": "mid", "providers": ["gemini", "claude", "codex", "openai", "ollama"] },
+      "code":    { "tier": "mid", "providers": ["claude", "codex", "openai", "gemini", "ollama"] },
+      "fix":     { "tier": "mid", "providers": ["codex", "claude", "openai", "gemini", "ollama"] },
+      "review":  { "tier": "mid", "providers": ["gemini", "claude", "codex", "openai", "ollama"] }
+    },
+    "power": {
+      "analyze": { "tier": "premium", "providers": ["claude", "codex", "openai", "gemini", "ollama"] },
+      "explain": { "tier": "premium", "providers": ["claude", "codex", "openai", "gemini", "ollama"] },
+      "code":    { "tier": "premium", "providers": ["claude", "codex", "openai", "gemini", "ollama"] },
+      "fix":     { "tier": "premium", "providers": ["claude", "codex", "openai", "gemini", "ollama"] },
+      "review":  { "tier": "premium", "providers": ["claude", "codex", "openai", "gemini", "ollama"] }
+    }
+  },
+  "build_strategies": {
+    "free": {
+      "plan":   { "tier": "cheap",   "primary": "gemini", "fallbacks": ["ollama"] },
+      "code":   { "tier": "cheap",   "primary": "gemini", "fallbacks": ["ollama"] },
+      "review": { "tier": "cheap",   "primary": "ollama", "fallbacks": ["gemini"] },
+      "fix":    { "tier": "cheap",   "primary": "ollama", "fallbacks": ["gemini"] }
+    },
+    "economy": {
+      "plan":   { "tier": "cheap",   "primary": "gemini", "fallbacks": ["ollama", "claude", "codex"] },
+      "code":   { "tier": "cheap",   "primary": "gemini", "fallbacks": ["claude", "codex", "ollama"] },
+      "review": { "tier": "cheap",   "primary": "claude", "fallbacks": ["ollama", "gemini", "codex"] },
+      "fix":    { "tier": "cheap",   "primary": "codex",  "fallbacks": ["claude", "gemini", "ollama"] }
+    },
+    "balanced": {
+      "plan":   { "tier": "mid",     "primary": "gemini", "fallbacks": ["claude", "codex", "ollama"] },
+      "code":   { "tier": "mid",     "primary": "claude", "fallbacks": ["codex", "gemini", "ollama"] },
+      "review": { "tier": "mid",     "primary": "gemini", "fallbacks": ["codex", "ollama", "claude"] },
+      "fix":    { "tier": "mid",     "primary": "codex",  "fallbacks": ["claude", "gemini", "ollama"] }
+    },
+    "power": {
+      "plan":   { "tier": "premium", "primary": "gemini", "fallbacks": ["claude", "codex", "ollama"] },
+      "code":   { "tier": "premium", "primary": "claude", "fallbacks": ["codex", "gemini", "ollama"] },
+      "review": { "tier": "premium", "primary": "gemini", "fallbacks": ["codex", "ollama", "claude"] },
+      "fix":    { "tier": "premium", "primary": "codex",  "fallbacks": ["claude", "gemini", "ollama"] }
+    }
+  },
+  "power_ensemble": {
+    "plan":   { "generators": ["gemini", "claude"], "judge": "codex" },
+    "code":   { "generators": ["claude", "codex"],  "judge": "gemini" },
+    "review": { "generators": ["gemini", "claude"], "judge": "codex" },
+    "fix":    { "generators": ["codex", "claude"],  "judge": "gemini" }
+  }
+}

@@ -67,7 +67,7 @@ func TestCtrlDQuitsChat(t *testing.T) {
 
 	nextModel, cmd := app.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 	next := nextModel.(App)
-	if !next.quitting {
+	if next.state != StateQuitting {
 		t.Fatal("ctrl+d should set quitting state")
 	}
 	if cmd == nil {

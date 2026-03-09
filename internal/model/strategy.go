@@ -2,7 +2,6 @@ package model
 
 import (
 	"encoding/json"
-	"fmt"
 	"math"
 	"math/rand"
 	"os"
@@ -368,98 +367,6 @@ func sortCandidatesWithMinSamples(candidates []candidate, minSamples int) {
 		}
 		return candidates[i].order < candidates[j].order
 	})
-}
-
-// powerEnsemble defines which providers run in parallel (generators) and which
-// single provider evaluates the outputs and picks the best one (judge) in Power mode.
-// Each phase has distinct generators and an independent judge.
-type powerEnsemble struct {
-	Generators []string // called concurrently; best ≥ 1 must succeed
-	Judge      string   // selects the winner; must differ from Generators
-}
-
-// powerEnsembleTable maps BuildPhase → ensemble setup for Power mode.
-// Design rule: Judge ∉ Generators so evaluation is always cross-model.
-var powerEnsembleTable = map[BuildPhase]powerEnsemble{
-	PhasePlan:   {[]string{"gemini", "claude"}, "codex"},
-	PhaseCode:   {[]string{"claude", "codex"}, "gemini"},
-	PhaseReview: {[]string{"gemini", "claude"}, "codex"},
-	PhaseFix:    {[]string{"codex", "claude"}, "gemini"},
-}
-
-// init validates the strategy tables at startup so misconfiguration is caught early.
-func init() {
-	if err := validateStrategyTables(); err != nil {
-		panic("strategy table validation: " + err.Error())
-	}
-}
-
-// validateStrategyTables checks internal consistency of the strategy and cost tables.
-func validateStrategyTables() error {
-	// 1. Every provider in strategyTable must have a modelTable entry.
-	for mode, tasks := range strategyTable {
-		for task, entry := range tasks {
-			for _, prov := range entry.Providers {
-				if _, ok := modelTable[prov]; !ok {
-					return fmt.Errorf("strategyTable[%d][%d]: provider %q not in modelTable", mode, task, prov)
-				}
-			}
-		}
-	}
-
-	// 2. Every provider in buildStrategyTable must have a modelTable entry.
-	for mode, phases := range buildStrategyTable {
-		for phase, bs := range phases {
-			if _, ok := modelTable[bs.Primary]; !ok {
-				return fmt.Errorf("buildStrategyTable[%d][%d].Primary %q not in modelTable", mode, phase, bs.Primary)
-			}
-			for _, fb := range bs.Fallbacks {
-				if _, ok := modelTable[fb]; !ok {
-					return fmt.Errorf("buildStrategyTable[%d][%d] fallback %q not in modelTable", mode, phase, fb)
-				}
-			}
-		}
-	}
-
-	// 3. Every model ID in modelTable must have a costTable entry.
-	for prov, tiers := range modelTable {
-		for tier, modelID := range tiers {
-			if modelID == "" {
-				continue
-			}
-			if _, ok := costTable[modelID]; !ok {
-				return fmt.Errorf("modelTable[%s][%d]: model %q not in costTable", prov, tier, modelID)
-			}
-		}
-	}
-
-	// 4. buildStrategyTable Primary must not appear in its own Fallbacks list.
-	for mode, phases := range buildStrategyTable {
-		for phase, bs := range phases {
-			for _, fb := range bs.Fallbacks {
-				if fb == bs.Primary {
-					return fmt.Errorf("buildStrategyTable[%d][%d]: Primary %q appears in Fallbacks", mode, phase, bs.Primary)
-				}
-			}
-		}
-	}
-
-	// 5. powerEnsembleTable: all providers must exist in modelTable; Judge ∉ Generators.
-	for phase, pe := range powerEnsembleTable {
-		for _, g := range pe.Generators {
-			if _, ok := modelTable[g]; !ok {
-				return fmt.Errorf("powerEnsembleTable[%d] generator %q not in modelTable", phase, g)
-			}
-			if g == pe.Judge {
-				return fmt.Errorf("powerEnsembleTable[%d]: Judge %q must not appear in Generators", phase, g)
-			}
-		}
-		if _, ok := modelTable[pe.Judge]; !ok {
-			return fmt.Errorf("powerEnsembleTable[%d] judge %q not in modelTable", phase, pe.Judge)
-		}
-	}
-
-	return nil
 }
 
 // statsFile is the filename for cross-session routing quality statistics.
