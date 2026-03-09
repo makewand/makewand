@@ -14,7 +14,7 @@ const codeReviewSystemPrompt = "You are an expert code reviewer. Be concise. Onl
 
 const autoFixSystemPrompt = "You are an expert programmer fixing build/test errors. Be concise. Only output files that need changes."
 
-const wizardPlanSystemPrompt = "You are a friendly project planner. Explain things simply for non-programmers."
+const wizardPlanSystemPrompt = "You are an expert project planner. Provide a clear, actionable technical plan."
 
 const wizardBuildSystemPrompt = "You are an expert programmer. Generate a complete, working project. " +
 	"Output each file with its path and content in this format:\n\n" +
@@ -36,18 +36,18 @@ const maxSystemPromptFileTreeChars = 10000
 // buildSystemPrompt constructs the system prompt for chat mode, including the current
 // project's file tree when available.
 func buildSystemPrompt(project *engine.Project, task model.TaskType) string {
-	prompt := `You are makewand, a friendly AI coding assistant for non-programmers.
+	prompt := `You are makewand, a multi-provider coding assistant for terminal-based development workflows.
 
 Guidelines:
-- Explain everything in simple, non-technical language
+- Be direct and technically precise
 - When creating or modifying files, use this format:
   --- FILE: path/to/file ---
   ` + "```" + `
   file content here
   ` + "```" + `
-- When something goes wrong, explain what happened and fix it
+- When something goes wrong, explain the root cause and fix it
 - Always confirm before making major changes
-- Be encouraging and supportive`
+- Provide actionable code and clear reasoning`
 
 	if project != nil {
 		prompt += fmt.Sprintf("\n\nCurrent project: %s\n", project.Name)
@@ -57,6 +57,13 @@ Guidelines:
 			}
 		} else {
 			prompt += fmt.Sprintf("\nProject entries: %d (full tree omitted for this request type)\n", projectEntryCount(project.Files))
+		}
+
+		// Append repo context (rules, symbols, file hints) when available.
+		if rc, err := engine.LoadRepoContext(project.Path, project.Files); err == nil {
+			if ctx := rc.ForPrompt(3000); ctx != "" {
+				prompt += ctx
+			}
 		}
 	}
 
@@ -178,7 +185,7 @@ func buildWizardPlanUserPrompt(tplName, tplPrompt string) string {
 			"2. Main features\n"+
 			"3. File structure\n"+
 			"4. Estimated cost\n\n"+
-			"Keep it concise and non-technical.",
+			"Keep it concise and actionable.",
 		tplName, tplPrompt,
 	)
 }

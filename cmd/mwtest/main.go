@@ -137,7 +137,7 @@ func runTest(router *model.Router, tc testCase, timeout time.Duration) {
 	start := time.Now()
 	content, usage, result, err := router.Chat(ctx, tc.task, []model.Message{
 		{Role: "user", Content: tc.prompt},
-	}, "You are a helpful assistant for non-programmers.")
+	}, "You are a helpful coding assistant.")
 	elapsed := time.Since(start)
 
 	if err != nil {

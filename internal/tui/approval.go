@@ -41,12 +41,12 @@ func (a App) activeApprovalKind() approvalKind {
 	if a.pendingApproval != nil && a.pendingApproval.Kind != approvalNone {
 		return a.pendingApproval.Kind
 	}
-	switch {
-	case a.confirmingFiles:
+	switch a.state {
+	case StateConfirmFiles:
 		return approvalFileWrite
-	case a.confirmingDeps:
+	case StateConfirmDeps:
 		return approvalDeps
-	case a.confirmingTests:
+	case StateConfirmTests:
 		return approvalTests
 	default:
 		return approvalNone
@@ -93,19 +93,19 @@ func (a App) viewPendingApproval(width int) string {
 func (a App) handleApproveCommand() (tea.Model, tea.Cmd) {
 	switch a.activeApprovalKind() {
 	case approvalFileWrite:
-		a.confirmingFiles = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmFileWriteMsg{confirmed: true}
 		}
 	case approvalDeps:
-		a.confirmingDeps = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmDepsInstallMsg{confirmed: true}
 		}
 	case approvalTests:
-		a.confirmingTests = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmTestsRunMsg{confirmed: true}
@@ -122,7 +122,7 @@ func (a App) handleApproveCommand() (tea.Model, tea.Cmd) {
 func (a App) handleDenyCommand() (tea.Model, tea.Cmd) {
 	switch a.activeApprovalKind() {
 	case approvalFileWrite:
-		a.confirmingFiles = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		a.pendingFiles = nil
 		a.chat.AddMessage(ChatMessage{
@@ -131,13 +131,13 @@ func (a App) handleDenyCommand() (tea.Model, tea.Cmd) {
 		})
 		return a, nil
 	case approvalDeps:
-		a.confirmingDeps = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmDepsInstallMsg{confirmed: false}
 		}
 	case approvalTests:
-		a.confirmingTests = false
+		a.state = StateIdle
 		a.clearPendingApproval()
 		return a, func() tea.Msg {
 			return confirmTestsRunMsg{confirmed: false}

@@ -21,7 +21,7 @@ const (
 	WizardPhaseDone
 )
 
-// WizardPanel guides non-programmers through project creation.
+// WizardPanel guides users through project creation.
 type WizardPanel struct {
 	phase      WizardPhase
 	templates  []template.Template

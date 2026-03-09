@@ -1,0 +1,156 @@
+// health.go — Circuit breaker wrappers and timeout management.
+package model
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+)
+
+func (r *Router) isCircuitOpen(provider string) (bool, time.Duration) {
+	if r.breaker == nil {
+		return false, 0
+	}
+	return r.breaker.PeekOpen(provider)
+}
+
+func (r *Router) beforeProviderAttempt(provider string) (bool, time.Duration) {
+	if r.breaker == nil {
+		return true, 0
+	}
+	return r.breaker.BeforeAttempt(provider)
+}
+
+func (r *Router) recordProviderSuccess(provider string) {
+	if r.breaker == nil {
+		return
+	}
+	r.breaker.RecordSuccess(provider)
+}
+
+func (r *Router) recordProviderFailure(provider string) (bool, time.Time) {
+	return r.recordProviderFailureForErr(provider, nil)
+}
+
+func (r *Router) recordProviderFailureForErr(provider string, callErr error) (bool, time.Time) {
+	if r.breaker == nil {
+		return false, time.Time{}
+	}
+	// Timeouts are usually transient provider saturation/outage signals.
+	// Trip the breaker immediately so subsequent requests route elsewhere.
+	if isTimeoutErr(callErr) {
+		return r.breaker.RecordFailureWeighted(provider, defaultCircuitFailureThreshold)
+	}
+	return r.breaker.RecordFailure(provider)
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ErrorKindOf(err) == ErrorKindTimeout {
+		return true
+	}
+	type timeoutErr interface {
+		Timeout() bool
+	}
+	var te timeoutErr
+	if errors.As(err, &te) && te.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "timed out") ||
+		strings.Contains(msg, "deadline exceeded")
+}
+
+// maxTokensForPhase returns the max output tokens for a build phase.
+func maxTokensForPhase(phase BuildPhase) int {
+	switch phase {
+	case PhaseCode:
+		return 16384 // full project generation needs more than TaskCode's 8192
+	case PhaseFix:
+		return 8192
+	case PhasePlan, PhaseReview:
+		return 4096
+	default:
+		return 8192
+	}
+}
+
+func buildPhaseAttemptTimeout(phase BuildPhase) time.Duration {
+	switch phase {
+	case PhasePlan:
+		return 90 * time.Second
+	case PhaseCode:
+		return 180 * time.Second
+	case PhaseReview:
+		return 45 * time.Second
+	case PhaseFix:
+		return 60 * time.Second
+	default:
+		return 90 * time.Second
+	}
+}
+
+func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) time.Duration {
+	maxDur := buildPhaseAttemptTimeout(phase)
+	provider = strings.ToLower(strings.TrimSpace(provider))
+
+	// Economy mode keeps conservative caps for slower providers to preserve
+	// fallback budget, but allows longer code-generation windows than review/fix.
+	if mode == ModeEconomy {
+		switch provider {
+		case "gemini":
+			if phase == PhaseCode && maxDur > 120*time.Second {
+				maxDur = 120 * time.Second
+			}
+		case "ollama":
+			if phase == PhaseCode && maxDur > 90*time.Second {
+				maxDur = 90 * time.Second
+			} else if phase != PhaseCode && maxDur > 45*time.Second {
+				maxDur = 45 * time.Second
+			}
+		}
+	}
+	return maxDur
+}
+
+func withProviderAttemptTimeoutFor(ctx context.Context, mode UsageMode, phase BuildPhase, provider string) (context.Context, context.CancelFunc) {
+	maxDur := providerAttemptTimeout(mode, phase, provider)
+	if maxDur <= 0 {
+		return ctx, func() {}
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if time.Until(deadline) <= maxDur {
+			return ctx, func() {}
+		}
+	}
+	return context.WithTimeout(ctx, maxDur)
+}
+
+func withProviderAttemptTimeout(ctx context.Context, phase BuildPhase) (context.Context, context.CancelFunc) {
+	// Backward-compatible helper for tests/default paths.
+	return withProviderAttemptTimeoutFor(ctx, ModeBalanced, phase, "")
+}
+
+func withStreamAttemptCancel(ch <-chan StreamChunk, cancel context.CancelFunc) <-chan StreamChunk {
+	if ch == nil || cancel == nil {
+		return ch
+	}
+
+	out := make(chan StreamChunk)
+	go func() {
+		defer close(out)
+		defer cancel()
+		for chunk := range ch {
+			out <- chunk
+			if chunk.Done || chunk.Error != nil {
+				return
+			}
+		}
+	}()
+
+	return out
+}

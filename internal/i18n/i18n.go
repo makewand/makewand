@@ -137,7 +137,7 @@ type Messages struct {
 
 var en = Messages{
 	AppName:     "makewand",
-	AppTagline:  "AI coding assistant for everyone",
+	AppTagline:  "Multi-provider coding router for terminal makers",
 	Version:     "v0.1.10",
 	Yes:         "Yes",
 	No:          "No",
@@ -252,7 +252,7 @@ var en = Messages{
 
 var zh = Messages{
 	AppName:     "makewand",
-	AppTagline:  "人人都能用的 AI 编程助手",
+	AppTagline:  "面向终端开发者的多模型编码路由器",
 	Version:     "v0.1.10",
 	Yes:         "是",
 	No:          "否",

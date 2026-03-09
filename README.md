@@ -7,14 +7,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/makewand/makewand/blob/master/LICENSE)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-blue)](https://github.com/makewand/makewand/blob/master/SECURITY.md)
 
-AI coding assistant CLI (Go).  
-AI 编码助手命令行工具（Go）。
+Multi-provider coding router for terminal makers (Go).
+面向终端开发者的多模型编码路由器（Go）。
 
-An adaptive multi-provider coding assistant for CLI workflows, with
-mode-based routing (`free/economy/balanced/power`) and release integrity checks
-(checksums, cosign signatures, and provenance).  
-面向 CLI 工作流的自适应多提供商编码助手，支持模式路由（`free/economy/balanced/power`）和发布完整性校验
-（校验和、cosign 签名与 provenance 证明）。
+Orchestrates Claude, Gemini, OpenAI, and Ollama through adaptive
+mode-based routing (`free/economy/balanced/power`) with Thompson Sampling,
+circuit breakers, and cost-aware provider selection.
+通过 Thompson Sampling、熔断器和成本感知的 Provider 选择，编排 Claude、Gemini、OpenAI
+和 Ollama，支持自适应模式路由（`free/economy/balanced/power`）。
 
 ## Install / 安装
 

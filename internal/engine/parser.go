@@ -16,7 +16,9 @@ type ExtractedFile struct {
 // ParseResult holds the result of parsing AI output for file blocks.
 type ParseResult struct {
 	Files       []ExtractedFile
-	Explanation string // non-file text
+	Edits       []EditBlock // search/replace edit blocks
+	Diffs       []DiffBlock // unified diff blocks
+	Explanation string      // non-file text
 }
 
 // fileHeaderRe matches "--- FILE: path/to/file ---" (Format A).
@@ -92,6 +94,12 @@ var plainPathLineRe = regexp.MustCompile(`^\s*(?:[-*]\s+)?` + "`?" + `([A-Za-z0-
 //	content
 //	```
 func ParseFiles(text string) ParseResult {
+	// Extract EDIT and DIFF blocks first, removing them from the text
+	// so they don't appear in explanation or confuse file parsing.
+	var edits []EditBlock
+	var diffs []DiffBlock
+	text, edits, diffs = extractEditDiffBlocks(text)
+
 	lines := strings.Split(text, "\n")
 
 	var files []ExtractedFile
@@ -200,6 +208,8 @@ func ParseFiles(text string) ParseResult {
 
 	return ParseResult{
 		Files:       files,
+		Edits:       edits,
+		Diffs:       diffs,
 		Explanation: strings.TrimRight(explanation.String(), "\n"),
 	}
 }
@@ -449,4 +459,71 @@ func ContainsFiles(text string) bool {
 		boldFileReMulti.MatchString(text) ||
 		mdHeaderFileReMulti.MatchString(text) ||
 		colonFileReMulti.MatchString(text)
+}
+
+// extractEditDiffBlocks removes EDIT and DIFF blocks from text, returning
+// the cleaned text and the extracted blocks.
+func extractEditDiffBlocks(text string) (string, []EditBlock, []DiffBlock) {
+	if !ContainsEdits(text) {
+		return text, nil, nil
+	}
+
+	edits := ParseEdits(text)
+	diffs := ParseDiffs(text)
+
+	if len(edits) == 0 && len(diffs) == 0 {
+		return text, nil, nil
+	}
+
+	// Remove EDIT blocks from text.
+	lines := strings.Split(text, "\n")
+	var cleaned []string
+	i := 0
+	for i < len(lines) {
+		trimmed := strings.TrimSpace(lines[i])
+
+		// Skip EDIT blocks.
+		if editHeaderRe.MatchString(trimmed) {
+			i++
+			// Skip all search/replace pairs under this header.
+			for i < len(lines) {
+				// Skip blank lines.
+				for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+					i++
+				}
+				if i >= len(lines) {
+					break
+				}
+				if strings.TrimSpace(lines[i]) != "<<<< SEARCH" {
+					break
+				}
+				// Skip to >>>> REPLACE.
+				for i < len(lines) && strings.TrimSpace(lines[i]) != ">>>> REPLACE" {
+					i++
+				}
+				if i < len(lines) {
+					i++ // skip >>>> REPLACE
+				}
+			}
+			continue
+		}
+
+		// Skip DIFF blocks.
+		if diffHeaderRe.MatchString(trimmed) {
+			i++
+			for i < len(lines) {
+				t := strings.TrimSpace(lines[i])
+				if diffHeaderRe.MatchString(t) || editHeaderRe.MatchString(t) || fileHeaderRe.MatchString(t) {
+					break
+				}
+				i++
+			}
+			continue
+		}
+
+		cleaned = append(cleaned, lines[i])
+		i++
+	}
+
+	return strings.Join(cleaned, "\n"), edits, diffs
 }
