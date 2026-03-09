@@ -635,14 +635,15 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 		}
 
 		candidates = append(candidates, candidate{
-			name:          provName,
-			modelID:       modelID,
-			access:        access,
-			order:         i,
-			useCount:      r.usage.Count(provName),
-			failureRate:   r.usage.FailureRate(provName),
-			requests:      r.usage.Count(provName) + r.usage.FailureCount(provName),
-			thompsonScore: r.usage.ThompsonSample(phase, provName, priorBias),
+			name:           provName,
+			modelID:        modelID,
+			access:         access,
+			order:          i,
+			useCount:       r.usage.Count(provName),
+			failureRate:    r.usage.FailureRate(provName),
+			requests:       r.usage.Count(provName) + r.usage.FailureCount(provName),
+			qualitySamples: r.usage.QualitySampleCount(phase, provName),
+			thompsonScore:  r.usage.ThompsonSample(phase, provName, priorBias),
 		})
 	}
 
@@ -1085,14 +1086,15 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 		}
 
 		candidates = append(candidates, candidate{
-			name:          provName,
-			modelID:       modelID,
-			access:        access,
-			order:         i,
-			useCount:      r.usage.Count(provName),
-			failureRate:   r.usage.FailureRate(provName),
-			requests:      r.usage.Count(provName) + r.usage.FailureCount(provName),
-			thompsonScore: r.usage.ThompsonSample(phase, provName, priorBias),
+			name:           provName,
+			modelID:        modelID,
+			access:         access,
+			order:          i,
+			useCount:       r.usage.Count(provName),
+			failureRate:    r.usage.FailureRate(provName),
+			requests:       r.usage.Count(provName) + r.usage.FailureCount(provName),
+			qualitySamples: r.usage.QualitySampleCount(phase, provName),
+			thompsonScore:  r.usage.ThompsonSample(phase, provName, priorBias),
 		})
 	}
 
@@ -1353,7 +1355,7 @@ func buildPhaseAttemptTimeout(phase BuildPhase) time.Duration {
 	case PhasePlan:
 		return 90 * time.Second
 	case PhaseCode:
-		return 150 * time.Second
+		return 180 * time.Second
 	case PhaseReview:
 		return 45 * time.Second
 	case PhaseFix:
@@ -1367,16 +1369,18 @@ func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) t
 	maxDur := buildPhaseAttemptTimeout(phase)
 	provider = strings.ToLower(strings.TrimSpace(provider))
 
-	// In economy/power mode we aggressively cap historically fragile providers
-	// so fallback can happen within a single headless request.
-	if mode == ModeEconomy || mode == ModePower {
+	// Economy mode keeps conservative caps for slower providers to preserve
+	// fallback budget, but allows longer code-generation windows than review/fix.
+	if mode == ModeEconomy {
 		switch provider {
 		case "gemini":
-			if maxDur > 60*time.Second {
-				maxDur = 60 * time.Second
+			if phase == PhaseCode && maxDur > 120*time.Second {
+				maxDur = 120 * time.Second
 			}
 		case "ollama":
-			if maxDur > 45*time.Second {
+			if phase == PhaseCode && maxDur > 90*time.Second {
+				maxDur = 90 * time.Second
+			} else if phase != PhaseCode && maxDur > 45*time.Second {
 				maxDur = 45 * time.Second
 			}
 		}

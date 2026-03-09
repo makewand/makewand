@@ -232,6 +232,20 @@ func (c *CLIProvider) healthCheck() bool {
 	case <-ctx.Done():
 		killCLIProcess(cmd)
 		<-done
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) && c.softPassProbeTimeout() {
+			// Some subscription CLIs can stall on --version probes when network/auth is slow.
+			// Treat timeout as "unknown but likely available" and let request-time retries decide.
+			return true
+		}
+		return false
+	}
+}
+
+func (c *CLIProvider) softPassProbeTimeout() bool {
+	switch c.provider {
+	case "gemini", "claude", "codex":
+		return true
+	default:
 		return false
 	}
 }

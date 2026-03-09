@@ -20,6 +20,14 @@ func TestClassifyTask(t *testing.T) {
 		{prompt: "write code", want: TaskCode},
 		{prompt: "checkout the repo", want: TaskCode},
 		{prompt: "handle errors gracefully", want: TaskCode},
+		{
+			prompt: "You are fixing production HTTP reliability code in Go. Task: Implement RetryHTTP and return only the complete content of retry.go. retry on client.Do error.",
+			want:   TaskCode,
+		},
+		{
+			prompt: "implement function verifyWebhookSignature and return only the complete content of solution.js. no explanations. reject malformed signature errors.",
+			want:   TaskCode,
+		},
 	}
 
 	for _, tt := range tests {

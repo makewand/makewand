@@ -192,6 +192,19 @@ func (s *sessionUsage) FailureRate(provider string) float64 {
 	return float64(s.failures[provider]) / float64(total)
 }
 
+// QualitySampleCount returns the number of recorded quality outcomes for
+// (phase, provider), i.e. successes + failures in the Beta posterior.
+func (s *sessionUsage) QualitySampleCount(phase BuildPhase, provider string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := qualityKey{phase: phase, provider: provider}
+	q := s.quality[key]
+	if q == nil {
+		return 0
+	}
+	return int(q.Successes + q.Failures)
+}
+
 // RecordQualityOutcome records a quality signal for (phase, provider).
 //   - success=true:  provider was selected by a cross-model judge, or its code passed tests.
 //   - success=false: provider's code required an auto-fix, or it lost a judge comparison.
@@ -284,14 +297,15 @@ func taskToBuildPhase(t TaskType) BuildPhase {
 
 // candidate is a provider candidate for mode-based routing.
 type candidate struct {
-	name          string
-	modelID       string
-	access        AccessType
-	order         int     // original position in strategy table
-	useCount      int     // session success count
-	failureRate   float64 // fraction of requests that errored this session
-	requests      int     // total requests (counts + failures) for min-sample gate
-	thompsonScore float64 // sampled from Beta(α,β); higher → higher priority
+	name           string
+	modelID        string
+	access         AccessType
+	order          int     // original position in strategy table
+	useCount       int     // session success count
+	failureRate    float64 // fraction of requests that errored this session
+	requests       int     // total requests (counts + failures) for min-sample gate
+	qualitySamples int     // total quality outcomes (success + failure) for this phase
+	thompsonScore  float64 // sampled from Beta(α,β); higher → higher priority
 }
 
 // minSamplesForExclusion is the default minimum number of total requests
@@ -336,6 +350,12 @@ func sortCandidatesWithMinSamples(candidates []candidate, minSamples int) {
 		hj := candidates[j].failureRate > 0.5 && candidates[j].requests >= minSamples
 		if hi != hj {
 			return !hi
+		}
+		// Cold-start stability: when neither candidate has requests or quality
+		// outcomes, prefer static strategy order over random Thompson variance.
+		if candidates[i].requests == 0 && candidates[j].requests == 0 &&
+			candidates[i].qualitySamples == 0 && candidates[j].qualitySamples == 0 {
+			return candidates[i].order < candidates[j].order
 		}
 		// Thompson score is the primary quality signal.
 		si, sj := candidates[i].thompsonScore, candidates[j].thompsonScore

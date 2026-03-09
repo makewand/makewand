@@ -141,17 +141,24 @@ func TestWithProviderAttemptTimeout_RespectsCallerShorterDeadline(t *testing.T) 
 	}
 }
 
-func TestProviderAttemptTimeout_EconomyGeminiCapped(t *testing.T) {
+func TestProviderAttemptTimeout_EconomyGeminiCodeCap(t *testing.T) {
 	got := providerAttemptTimeout(ModeEconomy, PhaseCode, "gemini")
-	if got > 60*time.Second {
-		t.Fatalf("providerAttemptTimeout(economy, code, gemini) = %s, want <= 60s", got)
+	if got != 120*time.Second {
+		t.Fatalf("providerAttemptTimeout(economy, code, gemini) = %s, want 120s", got)
 	}
 }
 
 func TestProviderAttemptTimeout_BalancedKeepsPhaseDefault(t *testing.T) {
 	got := providerAttemptTimeout(ModeBalanced, PhaseCode, "gemini")
-	if got != 150*time.Second {
-		t.Fatalf("providerAttemptTimeout(balanced, code, gemini) = %s, want 150s default", got)
+	if got != 180*time.Second {
+		t.Fatalf("providerAttemptTimeout(balanced, code, gemini) = %s, want 180s default", got)
+	}
+}
+
+func TestProviderAttemptTimeout_PowerGeminiKeepsPhaseDefault(t *testing.T) {
+	got := providerAttemptTimeout(ModePower, PhaseCode, "gemini")
+	if got != 180*time.Second {
+		t.Fatalf("providerAttemptTimeout(power, code, gemini) = %s, want 180s default", got)
 	}
 }
 
@@ -191,7 +198,7 @@ func TestChat_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
 	if primary.remaining <= 0 {
 		t.Fatalf("primary attempt should receive bounded deadline, got remaining=%s", primary.remaining)
 	}
-	if primary.remaining > 170*time.Second {
+	if primary.remaining > 200*time.Second {
 		t.Fatalf("primary attempt deadline too long: %s, want bounded near phase timeout", primary.remaining)
 	}
 }

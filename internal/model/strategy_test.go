@@ -71,3 +71,15 @@ func TestSortCandidatesForMode_BalancedKeepsDefaultSampleThreshold(t *testing.T)
 		t.Fatalf("balanced first candidate = %q, want %q (default threshold still 5)", candidates[0].name, "unstable")
 	}
 }
+
+func TestSortCandidatesForMode_ColdStartPrefersStaticOrder(t *testing.T) {
+	candidates := []candidate{
+		{name: "preferred", access: AccessSubscription, order: 0, requests: 0, thompsonScore: 0.30},
+		{name: "random-high", access: AccessSubscription, order: 1, requests: 0, thompsonScore: 0.95},
+	}
+
+	sortCandidatesForMode(candidates, ModeEconomy)
+	if candidates[0].name != "preferred" {
+		t.Fatalf("economy cold-start first candidate = %q, want %q (static order)", candidates[0].name, "preferred")
+	}
+}

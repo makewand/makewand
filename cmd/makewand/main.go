@@ -29,6 +29,8 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "makewand [prompt]",
 		Short: "AI coding assistant for everyone",
+		// Provider/runtime errors are already specific; avoid noisy global usage spam.
+		SilenceUsage: true,
 		Long: `makewand is a terminal AI coding assistant that lets anyone
 build, modify, and deploy software through natural language conversation.
 
