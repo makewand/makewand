@@ -47,3 +47,27 @@ func TestValidateStrategyTables_PrimaryInFallbacks(t *testing.T) {
 		t.Fatal("validateStrategyTables() = nil, want error when Primary appears in Fallbacks")
 	}
 }
+
+func TestSortCandidatesForMode_EconomyFastDegradesUnstableProvider(t *testing.T) {
+	candidates := []candidate{
+		{name: "unstable", access: AccessFree, order: 0, failureRate: 1.0, requests: 2, thompsonScore: 0.99},
+		{name: "stable", access: AccessFree, order: 1, failureRate: 0.0, requests: 0, thompsonScore: 0.10},
+	}
+
+	sortCandidatesForMode(candidates, ModeEconomy)
+	if candidates[0].name != "stable" {
+		t.Fatalf("economy first candidate = %q, want %q (fast degrade threshold=2)", candidates[0].name, "stable")
+	}
+}
+
+func TestSortCandidatesForMode_BalancedKeepsDefaultSampleThreshold(t *testing.T) {
+	candidates := []candidate{
+		{name: "unstable", access: AccessFree, order: 0, failureRate: 1.0, requests: 2, thompsonScore: 0.99},
+		{name: "stable", access: AccessFree, order: 1, failureRate: 0.0, requests: 0, thompsonScore: 0.10},
+	}
+
+	sortCandidatesForMode(candidates, ModeBalanced)
+	if candidates[0].name != "unstable" {
+		t.Fatalf("balanced first candidate = %q, want %q (default threshold still 5)", candidates[0].name, "unstable")
+	}
+}

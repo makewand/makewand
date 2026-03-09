@@ -646,7 +646,7 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 		})
 	}
 
-	sortCandidates(candidates)
+	sortCandidatesForMode(candidates, r.effectiveMode())
 	return candidates
 }
 
@@ -787,7 +787,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		})
 	} else {
 		primaryStart := time.Now()
-		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+		attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), attemptPhase, result.Actual)
 		content, usage, chatErr := result.Provider.Chat(attemptCtx, messages, system, maxTokens)
 		attemptCancel()
 		if chatErr == nil {
@@ -880,7 +880,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 					continue
 				}
 				start := time.Now()
-				attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+				attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), attemptPhase, c.name)
 				content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
 				attemptCancel()
 				if retryErr == nil {
@@ -969,7 +969,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 			continue
 		}
 		start := time.Now()
-		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+		attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), attemptPhase, name)
 		content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
 		attemptCancel()
 		if retryErr == nil {
@@ -1096,7 +1096,7 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 		})
 	}
 
-	sortCandidates(candidates)
+	sortCandidatesForMode(candidates, mode)
 	return bs, candidates, nil
 }
 
@@ -1363,8 +1363,29 @@ func buildPhaseAttemptTimeout(phase BuildPhase) time.Duration {
 	}
 }
 
-func withProviderAttemptTimeout(ctx context.Context, phase BuildPhase) (context.Context, context.CancelFunc) {
+func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) time.Duration {
 	maxDur := buildPhaseAttemptTimeout(phase)
+	provider = strings.ToLower(strings.TrimSpace(provider))
+
+	// In economy/power mode we aggressively cap historically fragile providers
+	// so fallback can happen within a single headless request.
+	if mode == ModeEconomy || mode == ModePower {
+		switch provider {
+		case "gemini":
+			if maxDur > 60*time.Second {
+				maxDur = 60 * time.Second
+			}
+		case "ollama":
+			if maxDur > 45*time.Second {
+				maxDur = 45 * time.Second
+			}
+		}
+	}
+	return maxDur
+}
+
+func withProviderAttemptTimeoutFor(ctx context.Context, mode UsageMode, phase BuildPhase, provider string) (context.Context, context.CancelFunc) {
+	maxDur := providerAttemptTimeout(mode, phase, provider)
 	if maxDur <= 0 {
 		return ctx, func() {}
 	}
@@ -1374,6 +1395,11 @@ func withProviderAttemptTimeout(ctx context.Context, phase BuildPhase) (context.
 		}
 	}
 	return context.WithTimeout(ctx, maxDur)
+}
+
+func withProviderAttemptTimeout(ctx context.Context, phase BuildPhase) (context.Context, context.CancelFunc) {
+	// Backward-compatible helper for tests/default paths.
+	return withProviderAttemptTimeoutFor(ctx, ModeBalanced, phase, "")
 }
 
 // ChatWith sends a message to a specific provider for a build phase.
@@ -1401,7 +1427,9 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 		})
 	} else {
 		primaryStart := time.Now()
-		content, usage, chatErr := result.Provider.Chat(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), phase, result.Actual)
+		content, usage, chatErr := result.Provider.Chat(attemptCtx, messages, system, maxTokens)
+		attemptCancel()
 		if chatErr == nil {
 			r.usage.Increment(result.Actual)
 			r.recordProviderSuccess(result.Actual)
@@ -1511,7 +1539,7 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 			continue
 		}
 		start := time.Now()
-		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, phase)
+		attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), phase, fb)
 		content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
 		attemptCancel()
 		if retryErr == nil {
@@ -1908,7 +1936,7 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 				return
 			}
 			start := time.Now()
-			attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, phase)
+			attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), phase, sl.name)
 			content, usage, err := sl.p.Chat(attemptCtx, messages, system, maxTokens)
 			attemptCancel()
 			if err != nil {
@@ -2032,7 +2060,7 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 
 	judgeMessages := []Message{{Role: "user", Content: prompt.String()}}
 	judgeStart := time.Now()
-	attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, phase)
+	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ctx, r.effectiveMode(), phase, pe.Judge)
 	content, usage, err := judgeP.Chat(attemptCtx, judgeMessages, judgeSystemFor(phase), maxTokensForPhase(phase))
 	attemptCancel()
 	if err != nil {

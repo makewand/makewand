@@ -402,7 +402,116 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, e
 	}
 
 	content := strings.TrimSpace(stdout.String())
-	return stripANSI(content), nil
+	content = stripANSI(content)
+	if reject, reason := shouldRejectCLIOutput(prompt, content); reject {
+		return "", newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
+	}
+	return content, nil
+}
+
+func shouldRejectCLIOutput(prompt, content string) (bool, string) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return true, "empty response from CLI provider"
+	}
+
+	lower := strings.ToLower(trimmed)
+	if looksLikeCLIAuthPrompt(lower) {
+		return true, "provider returned interactive authentication prompt in headless mode"
+	}
+
+	if looksLikeCodeOnlyPrompt(prompt) {
+		if looksLikePermissionMetaResponse(lower) {
+			return true, "provider returned permission/meta response instead of final code output"
+		}
+		if !containsLikelyCode(trimmed) {
+			return true, "provider returned non-code text for code-only request"
+		}
+	}
+	return false, ""
+}
+
+func looksLikeCLIAuthPrompt(lower string) bool {
+	return strings.Contains(lower, "opening authentication page in your browser") ||
+		strings.Contains(lower, "do you want to continue? [y/n]") ||
+		strings.Contains(lower, "do you want to continue? [y/n]:") ||
+		strings.Contains(lower, "please login") ||
+		strings.Contains(lower, "sign in to continue")
+}
+
+func looksLikePermissionMetaResponse(lower string) bool {
+	return strings.Contains(lower, "could you grant write permission") ||
+		strings.Contains(lower, "approve the write permission") ||
+		strings.Contains(lower, "file write permission is being denied") ||
+		strings.Contains(lower, "the file has been written to") ||
+		strings.Contains(lower, "here's a summary of the implementation") ||
+		strings.Contains(lower, "it seems write permissions are being blocked") ||
+		strings.Contains(lower, "cannot write files in this environment")
+}
+
+func looksLikeCodeOnlyPrompt(prompt string) bool {
+	lower := strings.ToLower(prompt)
+	if strings.Contains(lower, "--- file:") {
+		return true
+	}
+	if strings.Contains(lower, "complete content of") {
+		return true
+	}
+	fileHints := []string{
+		".go", ".js", ".ts", ".tsx", ".py", ".java", ".rs", ".c", ".cpp", ".cs", ".rb", ".php",
+	}
+	for _, h := range fileHints {
+		if strings.Contains(lower, h) {
+			// Require at least one strict formatting hint to avoid false positives.
+			if strings.Contains(lower, "do not output markdown") ||
+				strings.Contains(lower, "no markdown") ||
+				strings.Contains(lower, "no explanations") ||
+				strings.Contains(lower, "only the complete content") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsLikelyCode(content string) bool {
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "```") || strings.Contains(lower, "--- file:") {
+		return true
+	}
+
+	for _, line := range strings.Split(content, "\n") {
+		l := strings.TrimSpace(strings.ToLower(line))
+		if l == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(l, "package "),
+			strings.HasPrefix(l, "import "),
+			strings.HasPrefix(l, "func "),
+			strings.HasPrefix(l, "type "),
+			strings.HasPrefix(l, "var "),
+			strings.HasPrefix(l, "const "),
+			strings.HasPrefix(l, "class "),
+			strings.HasPrefix(l, "function "),
+			strings.HasPrefix(l, "def "),
+			strings.HasPrefix(l, "from "),
+			strings.HasPrefix(l, "export "),
+			strings.HasPrefix(l, "module.exports"),
+			strings.HasPrefix(l, "#!/"),
+			strings.HasPrefix(l, "if "),
+			strings.HasPrefix(l, "for "),
+			strings.HasPrefix(l, "while "),
+			strings.HasPrefix(l, "return "),
+			strings.HasPrefix(l, "{"),
+			strings.HasPrefix(l, "}"):
+			return true
+		}
+		if strings.Contains(l, "=>") || strings.Contains(l, ";") || strings.Contains(l, "{") || strings.Contains(l, "}") {
+			return true
+		}
+	}
+	return false
 }
 
 func isTransientCLIError(err error) bool {

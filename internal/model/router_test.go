@@ -141,6 +141,20 @@ func TestWithProviderAttemptTimeout_RespectsCallerShorterDeadline(t *testing.T) 
 	}
 }
 
+func TestProviderAttemptTimeout_EconomyGeminiCapped(t *testing.T) {
+	got := providerAttemptTimeout(ModeEconomy, PhaseCode, "gemini")
+	if got > 60*time.Second {
+		t.Fatalf("providerAttemptTimeout(economy, code, gemini) = %s, want <= 60s", got)
+	}
+}
+
+func TestProviderAttemptTimeout_BalancedKeepsPhaseDefault(t *testing.T) {
+	got := providerAttemptTimeout(ModeBalanced, PhaseCode, "gemini")
+	if got != 150*time.Second {
+		t.Fatalf("providerAttemptTimeout(balanced, code, gemini) = %s, want 150s default", got)
+	}
+}
+
 func TestChat_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.CodingModel = "claude"
