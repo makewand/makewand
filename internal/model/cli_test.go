@@ -73,6 +73,36 @@ func TestCLIProvider_Chat_TimeoutErrorIsReadable(t *testing.T) {
 	}
 }
 
+func TestShouldRejectCLIOutput_AuthPrompt(t *testing.T) {
+	reject, reason := shouldRejectCLIOutput("return only final answer", "Opening authentication page in your browser. Do you want to continue? [Y/n]:")
+	if !reject {
+		t.Fatal("shouldRejectCLIOutput() = false, want true for auth prompt")
+	}
+	if !strings.Contains(strings.ToLower(reason), "authentication") {
+		t.Fatalf("reason = %q, want auth-related message", reason)
+	}
+}
+
+func TestShouldRejectCLIOutput_CodeOnlyRejectsMetaResponse(t *testing.T) {
+	prompt := "Return only the complete content of solution.js. Do not output markdown. No explanations."
+	content := "The file has been written to `solution.js`. Here's a summary of the implementation."
+
+	reject, _ := shouldRejectCLIOutput(prompt, content)
+	if !reject {
+		t.Fatal("shouldRejectCLIOutput() = false, want true for code-only meta response")
+	}
+}
+
+func TestShouldRejectCLIOutput_CodeOnlyAcceptsCode(t *testing.T) {
+	prompt := "Return only the complete content of retry.go. Do not output markdown. No explanations."
+	content := "package retrycase\n\nfunc RetryHTTP() {}\n"
+
+	reject, _ := shouldRejectCLIOutput(prompt, content)
+	if reject {
+		t.Fatal("shouldRejectCLIOutput() = true, want false for valid code output")
+	}
+}
+
 func TestCLIProvider_ChatStream_EmitsTimeoutErrorOnDeadline(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "sleep-stream-cli.sh")
