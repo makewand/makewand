@@ -355,7 +355,7 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	}
 	task := classifyPromptTask(prompt)
 	messages := []model.Message{{Role: "user", Content: prompt}}
-	systemPrompt := "You are makewand, an expert software engineering assistant. Provide direct, actionable answers."
+	systemPrompt := buildHeadlessSystemPrompt(task, prompt)
 
 	ctx := context.Background()
 	cancel := func() {}
@@ -398,6 +398,11 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 		}
 	}
 
+	content = sanitizeHeadlessContent(prompt, task, content)
+	if headlessCodeOnlyRequested(task, prompt) && strings.TrimSpace(content) == "" {
+		return fmt.Errorf("provider returned no usable code output in headless mode")
+	}
+
 	fmt.Println(strings.TrimSpace(content))
 	return nil
 }
@@ -426,4 +431,159 @@ func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {
 	default:
 		return model.PhasePlan
 	}
+}
+
+func buildHeadlessSystemPrompt(task model.TaskType, prompt string) string {
+	base := "You are makewand, an expert software engineering assistant. Provide direct, actionable answers."
+	headlessRules := "Headless mode rules: do not ask for permissions, do not claim to write files, and do not ask follow-up questions. Return the final answer directly."
+	if headlessCodeOnlyRequested(task, prompt) {
+		return base + " " + headlessRules + " For code/file requests, output only the final code content. No markdown fences. No summaries."
+	}
+	return base + " " + headlessRules
+}
+
+func headlessCodeOnlyRequested(task model.TaskType, prompt string) bool {
+	if task == model.TaskCode || task == model.TaskFix {
+		return true
+	}
+	lower := strings.ToLower(prompt)
+	hints := []string{
+		"return only",
+		"output only",
+		"complete content",
+		"do not output markdown",
+		"no markdown",
+		"no explanations",
+		"--- file:",
+	}
+	score := 0
+	for _, h := range hints {
+		if strings.Contains(lower, h) {
+			score++
+		}
+	}
+	return score >= 2
+}
+
+func sanitizeHeadlessContent(prompt string, task model.TaskType, content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return content
+	}
+	if !headlessCodeOnlyRequested(task, prompt) {
+		return content
+	}
+
+	if extracted, ok := extractFirstFileBlock(content); ok {
+		return strings.TrimSpace(extracted)
+	}
+	if extracted, ok := extractFirstCodeFence(content); ok {
+		return strings.TrimSpace(extracted)
+	}
+
+	trimmed := stripLeadingNonCode(content)
+	return strings.TrimSpace(trimmed)
+}
+
+func extractFirstFileBlock(content string) (string, bool) {
+	lines := strings.Split(content, "\n")
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "--- FILE:") {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 || start >= len(lines) {
+		return "", false
+	}
+
+	inFence := false
+	var out []string
+	for _, line := range lines[start:] {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--- FILE:") {
+			break
+		}
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if !inFence && strings.TrimSpace(line) == "" {
+			if len(out) == 0 {
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	if len(out) == 0 {
+		return "", false
+	}
+	return strings.Join(out, "\n"), true
+}
+
+func extractFirstCodeFence(content string) (string, bool) {
+	lines := strings.Split(content, "\n")
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+
+	var out []string
+	for _, line := range lines[start:] {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			break
+		}
+		out = append(out, line)
+	}
+	if len(out) == 0 {
+		return "", false
+	}
+	return strings.Join(out, "\n"), true
+}
+
+func stripLeadingNonCode(content string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if looksLikeCodeLine(line) {
+			return strings.Join(lines[i:], "\n")
+		}
+	}
+	return content
+}
+
+func looksLikeCodeLine(line string) bool {
+	l := strings.TrimSpace(strings.ToLower(line))
+	if l == "" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(l, "package "),
+		strings.HasPrefix(l, "import "),
+		strings.HasPrefix(l, "func "),
+		strings.HasPrefix(l, "type "),
+		strings.HasPrefix(l, "var "),
+		strings.HasPrefix(l, "const "),
+		strings.HasPrefix(l, "class "),
+		strings.HasPrefix(l, "function "),
+		strings.HasPrefix(l, "def "),
+		strings.HasPrefix(l, "from "),
+		strings.HasPrefix(l, "export "),
+		strings.HasPrefix(l, "module.exports"),
+		strings.HasPrefix(l, "#!/"),
+		strings.HasPrefix(l, "if "),
+		strings.HasPrefix(l, "for "),
+		strings.HasPrefix(l, "while "),
+		strings.HasPrefix(l, "return "),
+		strings.HasPrefix(l, "{"),
+		strings.HasPrefix(l, "}"):
+		return true
+	}
+	return strings.Contains(l, "=>") || strings.Contains(l, ";") || strings.Contains(l, "{") || strings.Contains(l, "}")
 }
