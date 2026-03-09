@@ -1,10 +1,8 @@
 package model
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 )
@@ -93,37 +91,26 @@ func (c *Claude) Chat(ctx context.Context, messages []Message, system string, ma
 		Messages:  msgs,
 	}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", Usage{}, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", claudeAPIURL, bytes.NewReader(body))
+	body, err := marshalProviderJSON("claude", reqBody)
 	if err != nil {
 		return "", Usage{}, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := c.chatClient.Do(req)
+	req, err := newProviderJSONRequest(ctx, "claude", http.MethodPost, claudeAPIURL, body, map[string]string{
+		"Content-Type":      "application/json",
+		"x-api-key":         c.apiKey,
+		"anthropic-version": "2023-06-01",
+	})
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("claude API request: %w", err)
+		return "", Usage{}, err
 	}
-	defer resp.Body.Close()
-
-	respBody, err := limitedReadAll(resp.Body, maxResponseBytes)
+	respBody, err := doProviderJSONRequest(c.chatClient, req, "claude", "API request")
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", Usage{}, fmt.Errorf("claude API error (%d): %s", resp.StatusCode, string(respBody))
+		return "", Usage{}, err
 	}
 
 	var result claudeResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", Usage{}, fmt.Errorf("parse response: %w", err)
+	if err := decodeProviderJSON("claude", "parse response", respBody, &result); err != nil {
+		return "", Usage{}, err
 	}
 
 	var b strings.Builder
@@ -162,75 +149,36 @@ func (c *Claude) ChatStream(ctx context.Context, messages []Message, system stri
 		Stream:    true,
 	}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", claudeAPIURL, bytes.NewReader(body))
+	body, err := marshalProviderJSON("claude", reqBody)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := c.streamClient.Do(req)
+	req, err := newProviderJSONRequest(ctx, "claude", http.MethodPost, claudeAPIURL, body, map[string]string{
+		"Content-Type":      "application/json",
+		"x-api-key":         c.apiKey,
+		"anthropic-version": "2023-06-01",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("claude API stream request: %w", err)
+		return nil, err
+	}
+	resp, err := openProviderStream(c.streamClient, req, "claude", "API stream request")
+	if err != nil {
+		return nil, err
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := limitedReadAll(resp.Body, maxResponseBytes)
-		resp.Body.Close()
-		return nil, fmt.Errorf("claude API error (%d): %s", resp.StatusCode, string(respBody))
-	}
-
-	ch := make(chan StreamChunk, 64)
-	go func() {
-		defer close(ch)
-		defer resp.Body.Close()
-
-		dataCh := make(chan string, 64)
-		errCh := make(chan error, 1)
-		go func() {
-			defer close(dataCh)
-			errCh <- readSSE(ctx, resp.Body, dataCh)
-			close(errCh)
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case err, ok := <-errCh:
-				if !ok {
-					errCh = nil
-					continue
-				}
-				errCh = nil
-				if err != nil {
-					ch <- StreamChunk{Error: err}
-					return
-				}
-			case data, ok := <-dataCh:
-				if !ok {
-					ch <- StreamChunk{Done: true}
-					return
-				}
-				var event claudeStreamEvent
-				if json.Unmarshal([]byte(data), &event) == nil {
-					if event.Type == "content_block_delta" && event.Delta.Text != "" {
-						ch <- StreamChunk{Content: event.Delta.Text}
-					}
-					if event.Type == "message_stop" {
-						ch <- StreamChunk{Done: true}
-						return
-					}
-				}
-			}
+	ch := streamSSE(ctx, resp.Body, func(data string) []StreamChunk {
+		var event claudeStreamEvent
+		if json.Unmarshal([]byte(data), &event) != nil {
+			return nil
 		}
-	}()
+		if event.Type == "message_stop" {
+			return []StreamChunk{{Done: true}}
+		}
+		if event.Type == "content_block_delta" && event.Delta.Text != "" {
+			return []StreamChunk{{Content: event.Delta.Text}}
+		}
+		return nil
+	}, func() { resp.Body.Close() })
 
 	return ch, nil
 }

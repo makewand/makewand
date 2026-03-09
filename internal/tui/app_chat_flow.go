@@ -146,54 +146,8 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// classifyTask determines the TaskType from user input using prefix commands and keyword heuristics.
 func classifyTask(input string) model.TaskType {
-	lower := strings.ToLower(input)
-
-	// Prefix commands
-	if strings.HasPrefix(lower, "/review") {
-		return model.TaskReview
-	}
-	if strings.HasPrefix(lower, "/fix") {
-		return model.TaskFix
-	}
-	if strings.HasPrefix(lower, "/ask") || strings.HasPrefix(lower, "/explain") {
-		return model.TaskExplain
-	}
-	if strings.HasPrefix(lower, "/plan") {
-		return model.TaskAnalyze
-	}
-
-	// Keyword heuristics
-	reviewKeywords := []string{"review", "check", "audit"}
-	for _, kw := range reviewKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskReview
-		}
-	}
-
-	fixKeywords := []string{"fix", "bug", "error"}
-	for _, kw := range fixKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskFix
-		}
-	}
-
-	explainKeywords := []string{"explain", "why", "how does"}
-	for _, kw := range explainKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskExplain
-		}
-	}
-
-	analyzeKeywords := []string{"plan", "analyze", "design"}
-	for _, kw := range analyzeKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskAnalyze
-		}
-	}
-
-	return model.TaskCode
+	return model.ClassifyTask(input)
 }
 
 func chatTaskToBuildPhase(task model.TaskType) model.BuildPhase {

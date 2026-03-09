@@ -143,3 +143,22 @@ func TestSubmitChatInput_NonPowerUsesStreamPath(t *testing.T) {
 		t.Fatalf("Chat calls = %d, want 0", stub.chatCalls)
 	}
 }
+
+func TestClassifyTask_UsesSharedClassifier(t *testing.T) {
+	prompts := []string{
+		"please review.",
+		"fix, please",
+		"bug?",
+		"checkout the repo",
+		"how does this work",
+		"plan this feature",
+	}
+
+	for _, prompt := range prompts {
+		got := classifyTask(prompt)
+		want := model.ClassifyTask(prompt)
+		if got != want {
+			t.Fatalf("classifyTask(%q) = %v, want shared classifier result %v", prompt, got, want)
+		}
+	}
+}
