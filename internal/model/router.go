@@ -771,6 +771,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		return "", Usage{}, RouteResult{}, err
 	}
 	maxTokens := MaxTokensForTask(task)
+	attemptPhase := taskToBuildPhase(task)
 	firstErr := error(nil)
 
 	if allow, remaining := r.beforeProviderAttempt(result.Actual); !allow {
@@ -786,7 +787,9 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 		})
 	} else {
 		primaryStart := time.Now()
-		content, usage, chatErr := result.Provider.Chat(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+		content, usage, chatErr := result.Provider.Chat(attemptCtx, messages, system, maxTokens)
+		attemptCancel()
 		if chatErr == nil {
 			r.usage.Increment(result.Actual)
 			r.recordProviderSuccess(result.Actual)
@@ -877,7 +880,9 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 					continue
 				}
 				start := time.Now()
-				content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+				attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+				content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
+				attemptCancel()
 				if retryErr == nil {
 					r.usage.Increment(c.name)
 					r.recordProviderSuccess(c.name)
@@ -964,7 +969,9 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 			continue
 		}
 		start := time.Now()
-		content, usage, retryErr := p.Chat(ctx, messages, system, maxTokens)
+		attemptCtx, attemptCancel := withProviderAttemptTimeout(ctx, attemptPhase)
+		content, usage, retryErr := p.Chat(attemptCtx, messages, system, maxTokens)
+		attemptCancel()
 		if retryErr == nil {
 			r.usage.Increment(name)
 			r.recordProviderSuccess(name)
