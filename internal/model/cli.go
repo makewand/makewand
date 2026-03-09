@@ -516,12 +516,12 @@ func containsLikelyCode(content string) bool {
 			strings.HasPrefix(l, "if "),
 			strings.HasPrefix(l, "for "),
 			strings.HasPrefix(l, "while "),
-			strings.HasPrefix(l, "return "),
-			strings.HasPrefix(l, "{"),
-			strings.HasPrefix(l, "}"):
+			strings.HasPrefix(l, "return "):
 			return true
 		}
-		if strings.Contains(l, "=>") || strings.Contains(l, ";") || strings.Contains(l, "{") || strings.Contains(l, "}") {
+		// Keep this secondary heuristic strict; bullet summaries often contain
+		// braces for examples (for example "{429,503}") but are not code.
+		if strings.Contains(l, "=>") || strings.Contains(l, ";") {
 			return true
 		}
 	}

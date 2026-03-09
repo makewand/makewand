@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -57,3 +59,54 @@ func TestSanitizeHeadlessContent_NonCodePromptUnchanged(t *testing.T) {
 	}
 }
 
+func TestPreserveGoPackageFromWorkspace_RewritesPackageWhenConstrained(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "retry.go")
+	if err := os.WriteFile(target, []byte("package retrycase\n\nfunc RetryHTTP() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(retry.go): %v", err)
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd(): %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("Chdir(tmp): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWD)
+	})
+
+	prompt := "Implement RetryHTTP in retry.go. Do not change package name. Return only complete content."
+	raw := "package model\n\nfunc RetryHTTP() {}\n"
+	got := preserveGoPackageFromWorkspace(prompt, raw)
+	if !strings.HasPrefix(strings.TrimSpace(got), "package retrycase") {
+		t.Fatalf("preserveGoPackageFromWorkspace() = %q, want package retrycase", got)
+	}
+}
+
+func TestPreserveGoPackageFromWorkspace_NoConstraintNoRewrite(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "retry.go")
+	if err := os.WriteFile(target, []byte("package retrycase\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(retry.go): %v", err)
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd(): %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("Chdir(tmp): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWD)
+	})
+
+	prompt := "Implement RetryHTTP in retry.go and return complete content."
+	raw := "package model\n\nfunc RetryHTTP() {}\n"
+	got := preserveGoPackageFromWorkspace(prompt, raw)
+	if !strings.HasPrefix(strings.TrimSpace(got), "package model") {
+		t.Fatalf("preserveGoPackageFromWorkspace() unexpectedly rewrote package: %q", got)
+	}
+}
