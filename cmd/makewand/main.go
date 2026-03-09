@@ -76,7 +76,7 @@ build, modify, and deploy software through natural language conversation.
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: free, economy, balanced, power")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
-	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 2*time.Minute, "timeout for --print one-shot execution")
+	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 4*time.Minute, "timeout for --print one-shot execution")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
