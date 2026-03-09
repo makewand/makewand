@@ -53,6 +53,7 @@ type Messages struct {
 	// Chat
 	ChatWelcome      string
 	ChatPrompt       string
+	ChatCommandHint  string
 	ChatThinking     string
 	ChatWorking      string
 	ChatPlaceholder  string
@@ -175,6 +176,7 @@ var en = Messages{
 
 	ChatWelcome:      "Welcome! I'm here to help you build and modify your project.",
 	ChatPrompt:       "What would you like to do?",
+	ChatCommandHint:  "Commands: /mode [free|economy|balanced|power] | /help | /exit (or Ctrl+C)",
 	ChatThinking:     "Thinking...",
 	ChatWorking:      "Working on it...",
 	ChatPlaceholder:  "Type your message... (Enter to send, Ctrl+D for multiline)",
@@ -289,6 +291,7 @@ var zh = Messages{
 
 	ChatWelcome:      "欢迎！我来帮你构建和修改项目。",
 	ChatPrompt:       "你想做什么？",
+	ChatCommandHint:  "命令：/mode [free|economy|balanced|power] | /help | /exit（或 Ctrl+C）",
 	ChatThinking:     "正在思考...",
 	ChatWorking:      "正在处理...",
 	ChatPlaceholder:  "输入消息... (Enter 发送, Ctrl+D 多行)",

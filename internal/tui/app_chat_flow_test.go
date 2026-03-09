@@ -3,8 +3,10 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
 )
@@ -160,5 +162,48 @@ func TestClassifyTask_UsesSharedClassifier(t *testing.T) {
 		if got != want {
 			t.Fatalf("classifyTask(%q) = %v, want shared classifier result %v", prompt, got, want)
 		}
+	}
+}
+
+func TestSubmitChatInput_HelpCommandHandledLocally(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	before := len(app.chat.messages)
+	m, cmd := app.submitChatInput("/help")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("/help should not trigger async AI command")
+	}
+	if len(app.chat.messages) != before+1 {
+		t.Fatalf("chat message count = %d, want %d", len(app.chat.messages), before+1)
+	}
+
+	last := app.chat.messages[len(app.chat.messages)-1]
+	if last.Role != "system" {
+		t.Fatalf("last message role = %q, want system", last.Role)
+	}
+	if !strings.Contains(last.Content, "/mode") || !strings.Contains(last.Content, "/exit") {
+		t.Fatalf("help message = %q, want slash command hint", last.Content)
+	}
+}
+
+func TestSubmitChatInput_ExitCommandQuits(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	m, cmd := app.submitChatInput("/exit")
+	app = m.(App)
+
+	if !app.quitting {
+		t.Fatal("app should enter quitting state on /exit")
+	}
+	if cmd == nil {
+		t.Fatal("/exit should return tea.Quit command")
+	}
+	quitMsg := cmd()
+	if _, ok := quitMsg.(tea.QuitMsg); !ok {
+		t.Fatalf("/exit cmd() should return tea.QuitMsg, got %T", quitMsg)
 	}
 }

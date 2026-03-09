@@ -35,9 +35,22 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Handle /mode command locally (don't send to AI).
-	if strings.HasPrefix(strings.ToLower(input), "/mode") {
-		return a.handleModeCommand(input)
+	parts := strings.Fields(strings.ToLower(input))
+	if len(parts) > 0 {
+		// Handle slash commands locally (don't send to AI).
+		switch parts[0] {
+		case "/mode":
+			return a.handleModeCommand(input)
+		case "/help":
+			return a.handleHelpCommand()
+		case "/exit", "/quit":
+			if a.cancelAI != nil {
+				a.cancelAI()
+				a.cancelAI = nil
+			}
+			a.quitting = true
+			return a, tea.Quit
+		}
 	}
 
 	a.chat.AddMessage(ChatMessage{Role: "user", Content: input})
@@ -92,6 +105,15 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 	}
 
 	return a, cmd
+}
+
+func (a App) handleHelpCommand() (tea.Model, tea.Cmd) {
+	msg := i18n.Msg()
+	a.chat.AddMessage(ChatMessage{
+		Role:    "system",
+		Content: msg.ChatCommandHint,
+	})
+	return a, nil
 }
 
 func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {

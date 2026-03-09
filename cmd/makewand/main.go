@@ -35,7 +35,7 @@ func main() {
 		Long: `makewand is a terminal AI coding assistant that lets anyone
 build, modify, and deploy software through natural language conversation.
 
-  makewand         - Start interactive chat in current directory
+  makewand         - Start interactive chat in current directory (type /help in chat)
   makewand "..."   - Start chat and send an initial prompt
   makewand --print "..." - Run one prompt and print the result (CI/headless)
   makewand new     - Create a new project with guided wizard
