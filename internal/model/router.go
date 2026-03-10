@@ -61,7 +61,7 @@ type Provider interface {
 }
 
 // fallbackOrder defines the deterministic order for provider fallback.
-var fallbackOrder = []string{"claude", "codex", "openai", "gemini", "ollama"}
+var fallbackOrder = []string{"claude", "codex", "gemini"}
 
 // MaxTokensForTask returns the appropriate max tokens for the given task type.
 func MaxTokensForTask(task TaskType) int {
@@ -156,9 +156,6 @@ func NewRouter(cfg *config.Config) *Router {
 	if cfg.OpenAIAPIKey != "" && r.providers["openai"] == nil {
 		r.providers["openai"] = NewOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIModel)
 	}
-	if cfg.OllamaURL != "" {
-		r.providers["ollama"] = NewOllama(cfg.OllamaURL, cfg.OllamaModel)
-	}
 
 	// Register config-defined custom command providers.
 	for _, cp := range cfg.CustomProviders {
@@ -212,11 +209,6 @@ func NewRouter(cfg *config.Config) *Router {
 	} else if _, ok := r.accessTypes["codex"]; !ok {
 		r.accessTypes["codex"] = parseAccessType("", "codex")
 	}
-	if cfg.OllamaAccess != "" {
-		r.accessTypes["ollama"] = parseAccessType(cfg.OllamaAccess, "ollama")
-	} else if _, ok := r.accessTypes["ollama"]; !ok {
-		r.accessTypes["ollama"] = parseAccessType("", "ollama")
-	}
 
 	return r
 }
@@ -254,7 +246,7 @@ func (r *Router) ModeSet() bool {
 // effectiveMode returns the routing mode to use.
 // When the mode has not been explicitly set it defaults to ModeBalanced,
 // ensuring BuildProviderFor / RouteProvider / ChatWith never silently fall back
-// to ModeFree (the zero value) when the user has not chosen a mode.
+// to ModeFast (the zero value) when the user has not chosen a mode.
 func (r *Router) effectiveMode() UsageMode {
 	r.modeMu.RLock()
 	defer r.modeMu.RUnlock()
@@ -406,8 +398,8 @@ func (r *Router) routeByMode(task TaskType) (RouteResult, error) {
 	})
 	if len(candidates) == 0 {
 		msg := fmt.Sprintf("no AI model available for mode %q; configure one with 'makewand setup'", r.effectiveMode())
-		if r.effectiveMode() == ModeFree {
-			msg = "free mode requires at least one free/local provider (e.g. Gemini free API or Ollama local model)"
+		if r.effectiveMode() == ModeFast {
+			msg = "fast mode requires at least one provider; install a CLI or set an API key"
 		}
 		r.emitTrace(TraceEvent{
 			Event:     "route_failed",
@@ -785,15 +777,7 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 
 	// Try the requested provider first (unless excluded)
 	if !excluded[name] {
-		if r.effectiveMode() == ModeFree && r.accessTypes[name] != AccessFree && r.accessTypes[name] != AccessLocal {
-			r.emitTrace(TraceEvent{
-				Event:     "build_route_candidate_skipped",
-				Phase:     buildPhaseName(phase),
-				Requested: name,
-				Selected:  name,
-				Detail:    "non-free provider blocked in free mode",
-			})
-		} else if blocked, remaining := r.isCircuitOpen(name); blocked {
+		if blocked, remaining := r.isCircuitOpen(name); blocked {
 			r.emitTrace(TraceEvent{
 				Event:     "build_route_candidate_skipped",
 				Phase:     buildPhaseName(phase),

@@ -16,8 +16,8 @@ import (
 type UsageMode int
 
 const (
-	ModeFree     UsageMode = iota // Free: only free/local/subscription providers
-	ModeEconomy                   // Economy: cheap tier, prefer free providers
+	ModeFast     UsageMode = iota // Fast: cheap tier, prefer free/subscription providers
+	_                             // reserved (was ModeEconomy)
 	ModeBalanced                  // Balanced: mid tier, good quality/cost ratio
 	ModePower                     // Power: premium tier, best quality
 )
@@ -27,7 +27,7 @@ type AccessType int
 
 const (
 	AccessFree         AccessType = iota // Free tier (e.g. Gemini Flash)
-	AccessLocal                          // Local model (e.g. Ollama)
+	AccessLocal                          // Local model
 	AccessSubscription                   // Paid subscription tier
 	AccessAPI                            // Pay-per-token API
 )
@@ -53,10 +53,8 @@ func EstimateCost(modelID string, inputTokens, outputTokens int) float64 {
 // ParseUsageMode converts a string to UsageMode.
 func ParseUsageMode(s string) (UsageMode, bool) {
 	switch strings.ToLower(s) {
-	case "free":
-		return ModeFree, true
-	case "economy":
-		return ModeEconomy, true
+	case "fast":
+		return ModeFast, true
 	case "balanced":
 		return ModeBalanced, true
 	case "power":
@@ -69,10 +67,8 @@ func ParseUsageMode(s string) (UsageMode, bool) {
 // String returns the display name for the mode.
 func (m UsageMode) String() string {
 	switch m {
-	case ModeFree:
-		return "free"
-	case ModeEconomy:
-		return "economy"
+	case ModeFast:
+		return "fast"
 	case ModeBalanced:
 		return "balanced"
 	case ModePower:
@@ -83,7 +79,7 @@ func (m UsageMode) String() string {
 }
 
 // parseAccessType determines the AccessType from a config value and provider name.
-// Defaults: gemini→Free, ollama→Local, others→API.
+// Defaults: gemini→Free, others→API.
 func parseAccessType(configValue, providerName string) AccessType {
 	switch strings.ToLower(configValue) {
 	case "free":
@@ -99,8 +95,6 @@ func parseAccessType(configValue, providerName string) AccessType {
 	switch providerName {
 	case "gemini":
 		return AccessFree
-	case "ollama":
-		return AccessLocal
 	default:
 		return AccessAPI
 	}
@@ -312,7 +306,7 @@ type candidate struct {
 // rule applies.
 const minSamplesForExclusion = 5
 
-// minSamplesForFastDegrade is used by economy/power mode to react faster to
+// minSamplesForFastDegrade is used by fast/power mode to react faster to
 // unstable providers (for example repeated CLI auth/timeout failures).
 const minSamplesForFastDegrade = 2
 
@@ -328,7 +322,7 @@ func sortCandidates(candidates []candidate) {
 
 func sortCandidatesForMode(candidates []candidate, mode UsageMode) {
 	minSamples := minSamplesForExclusion
-	if mode == ModeEconomy || mode == ModePower {
+	if mode == ModeFast || mode == ModePower {
 		minSamples = minSamplesForFastDegrade
 	}
 	sortCandidatesWithMinSamples(candidates, minSamples)

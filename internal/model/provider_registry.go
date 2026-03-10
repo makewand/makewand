@@ -59,12 +59,6 @@ func registerBuiltinProviderResolvers() {
 		}
 		return nil, fmt.Errorf("gemini not configured (no CLI or API key)")
 	})
-	_ = RegisterProviderResolver("ollama", func(cfg *config.Config, modelID string) (Provider, error) {
-		if cfg.OllamaURL == "" {
-			return nil, fmt.Errorf("ollama URL not configured")
-		}
-		return NewOllama(cfg.OllamaURL, modelID), nil
-	})
 }
 
 // RegisterProviderResolver registers or overrides a provider resolver.

@@ -148,7 +148,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&modesFlag, "modes", "all", "modes to verify: all or comma list (free,economy,balanced,power)")
+	cmd.Flags().StringVar(&modesFlag, "modes", "all", "modes to verify: all or comma list (fast,balanced,power)")
 	cmd.Flags().BoolVar(&probeFlag, "probe", false, "run live provider probe requests (network/API/CLI)")
 	cmd.Flags().DurationVar(&probeTimeoutFlag, "probe-timeout", 45*time.Second, "timeout per live probe request")
 	cmd.Flags().IntVar(&probeRetriesFlag, "probe-retries", defaultDoctorProbeRetries, "retry count per provider during live probe")
@@ -161,8 +161,7 @@ func parseDoctorModes(raw string) ([]model.UsageMode, error) {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	if raw == "" || raw == "all" {
 		return []model.UsageMode{
-			model.ModeFree,
-			model.ModeEconomy,
+			model.ModeFast,
 			model.ModeBalanced,
 			model.ModePower,
 		}, nil
@@ -177,7 +176,7 @@ func parseDoctorModes(raw string) ([]model.UsageMode, error) {
 		}
 		m, ok := model.ParseUsageMode(token)
 		if !ok {
-			return nil, fmt.Errorf("invalid mode %q (expected free,economy,balanced,power)", token)
+			return nil, fmt.Errorf("invalid mode %q (expected fast,balanced,power)", token)
 		}
 		if seen[m] {
 			continue
@@ -231,9 +230,6 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 	}
 
 	report.DetectedProviders = detectConfiguredProviders(cfg)
-	if check, ok := ollamaDoctorCheck(cfg.OllamaURL); ok {
-		report.Checks = append(report.Checks, check)
-	}
 	if check, ok := customProviderDoctorCheck(cfg); ok {
 		report.Checks = append(report.Checks, check)
 	}
@@ -416,13 +412,6 @@ func detectConfiguredProviders(cfg *config.Config) []string {
 	}
 	if cfg.OpenAIAPIKey != "" {
 		set["openai (api)"] = true
-	}
-	if cfg.OllamaURL != "" {
-		if check, ok := ollamaDoctorCheck(cfg.OllamaURL); ok && check.Status == doctorPass {
-			set["ollama"] = true
-		} else {
-			set["ollama (blocked)"] = true
-		}
 	}
 	for _, cp := range cfg.CustomProviders {
 		if config.IsCustomProviderUsable(cp) {

@@ -86,7 +86,7 @@ func (s *streamDeadlineCaptureProvider) ChatStream(ctx context.Context, messages
 	return nil, fmt.Errorf("%s stream forced failure", s.name)
 }
 
-func TestChat_ModeFreeDoesNotFallbackToAPI(t *testing.T) {
+func TestChat_ModeFastFallsBackToAPI(t *testing.T) {
 	gemini := &stubProvider{name: "gemini", available: true, failChat: true}
 	openai := &stubProvider{name: "openai", available: true, failChat: false}
 
@@ -104,14 +104,14 @@ func TestChat_ModeFreeDoesNotFallbackToAPI(t *testing.T) {
 			"openai": AccessAPI,
 		},
 		usage:   newSessionUsage(),
-		mode:    ModeFree,
+		mode:    ModeFast,
 		modeSet: true,
 		cfg:     config.DefaultConfig(),
 	}
 
 	_, _, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
-	if err == nil {
-		t.Fatal("Chat() error = nil, want failure (free mode must not fallback to API providers)")
+	if err != nil {
+		t.Fatalf("Chat() error = %v, want nil (fast mode should fallback to API providers)", err)
 	}
 }
 
@@ -164,10 +164,10 @@ func TestWithProviderAttemptTimeout_RespectsCallerShorterDeadline(t *testing.T) 
 	}
 }
 
-func TestProviderAttemptTimeout_EconomyGeminiCodeCap(t *testing.T) {
-	got := providerAttemptTimeout(ModeEconomy, PhaseCode, "gemini")
+func TestProviderAttemptTimeout_FastGeminiCodeCap(t *testing.T) {
+	got := providerAttemptTimeout(ModeFast, PhaseCode, "gemini")
 	if got != 120*time.Second {
-		t.Fatalf("providerAttemptTimeout(economy, code, gemini) = %s, want 120s", got)
+		t.Fatalf("providerAttemptTimeout(fast, code, gemini) = %s, want 120s", got)
 	}
 }
 
@@ -275,7 +275,7 @@ func TestChatStream_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
 func TestEffectiveMode_DefaultsToBalancedWhenNotSet(t *testing.T) {
 	r := &Router{
 		modeSet: false,
-		mode:    ModeFree, // zero value — must NOT be used
+		mode:    ModeFast, // zero value — must NOT be used
 	}
 	if got := r.effectiveMode(); got != ModeBalanced {
 		t.Fatalf("effectiveMode() = %v, want ModeBalanced", got)
@@ -295,7 +295,7 @@ func TestEffectiveMode_ReturnsSetMode(t *testing.T) {
 func TestBuildProviderFor_DefaultsToBalancedWhenModeNotSet(t *testing.T) {
 	r := &Router{
 		modeSet: false,
-		mode:    ModeFree, // zero value; effectiveMode() must return ModeBalanced instead
+		mode:    ModeFast, // zero value; effectiveMode() must return ModeBalanced instead
 	}
 	// ModeBalanced + PhaseCode → "claude"
 	got := r.BuildProviderFor(PhaseCode)
@@ -443,7 +443,6 @@ func TestNewRouter_LoadsCustomProviderFromConfig(t *testing.T) {
 	cfg.ClaudeAPIKey = ""
 	cfg.GeminiAPIKey = ""
 	cfg.OpenAIAPIKey = ""
-	cfg.OllamaURL = ""
 	cfg.DefaultModel = "private"
 	cfg.CodingModel = "private"
 	cfg.CustomProviders = []config.CustomProvider{
@@ -481,14 +480,13 @@ func TestNewRouter_LoadsCustomProviderFromConfig(t *testing.T) {
 	}
 }
 
-func TestRouteByMode_CustomProviderAccessAPIExcludedInFreeMode(t *testing.T) {
+func TestRouteByMode_CustomProviderAccessAPIAllowedInFastMode(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.CLIs = nil
 	cfg.ClaudeAPIKey = ""
 	cfg.GeminiAPIKey = ""
 	cfg.OpenAIAPIKey = ""
-	cfg.OllamaURL = ""
-	cfg.UsageMode = "free"
+	cfg.UsageMode = "fast"
 	cfg.CustomProviders = []config.CustomProvider{
 		{
 			Name:       "private-api",
@@ -500,13 +498,12 @@ func TestRouteByMode_CustomProviderAccessAPIExcludedInFreeMode(t *testing.T) {
 	}
 
 	r := NewRouter(cfg)
-	_, err := r.Route(TaskCode)
-	if err == nil {
-		t.Fatal("Route(TaskCode) error = nil, want no provider available in free mode")
+	result, err := r.Route(TaskCode)
+	if err != nil {
+		t.Fatalf("Route(TaskCode) error = %v, want nil (fast mode allows API providers)", err)
 	}
-	if !strings.Contains(err.Error(), "free mode requires at least one free/local provider") &&
-		!strings.Contains(err.Error(), "no AI model available for mode") {
-		t.Fatalf("Route(TaskCode) error = %q, want strict-free routing failure", err.Error())
+	if result.Actual != "private-api" {
+		t.Errorf("Route(TaskCode) actual = %q, want %q", result.Actual, "private-api")
 	}
 }
 
@@ -516,7 +513,6 @@ func TestNewRouter_SkipsUnusableCustomProvider(t *testing.T) {
 	cfg.ClaudeAPIKey = ""
 	cfg.GeminiAPIKey = ""
 	cfg.OpenAIAPIKey = ""
-	cfg.OllamaURL = ""
 	cfg.CustomProviders = []config.CustomProvider{
 		{
 			Name:       "broken-private",

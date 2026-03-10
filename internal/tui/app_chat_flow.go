@@ -109,7 +109,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		return a, cmd
 	}
 
-	// Explain/analyze prompts are short and often hit local fallbacks such as Ollama.
+	// Explain/analyze prompts are short and benefit from unary chat.
 	// Using unary chat here avoids getting stuck waiting for an unreliable stream.
 	if shouldUseUnaryChat(task) {
 		cmd := func() tea.Msg {
@@ -238,7 +238,7 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 		// /mode with no argument: show current mode and help
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("%s: %s\n/model [free|economy|balanced|power]", msg.ModeLabel, a.currentModeLabel()),
+			Content: fmt.Sprintf("%s: %s\n/model [fast|balanced|power]", msg.ModeLabel, a.currentModeLabel()),
 		})
 		return a, nil
 	}
@@ -259,10 +259,8 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 	// Translate mode name for display
 	var displayName string
 	switch mode {
-	case model.ModeFree:
-		displayName = msg.ModeFree
-	case model.ModeEconomy:
-		displayName = msg.ModeEconomy
+	case model.ModeFast:
+		displayName = msg.ModeFast
 	case model.ModeBalanced:
 		displayName = msg.ModeBalanced
 	case model.ModePower:
@@ -295,7 +293,7 @@ func (a App) chatHelpText() string {
 		"/approve - Approve the pending action",
 		"/deny - Deny the pending action",
 		"/resume - Restore the last saved session",
-		"/model [free|economy|balanced|power] - Switch routing profile",
+		"/model [fast|balanced|power] - Switch routing profile",
 		"/exit - Quit makewand",
 	}, "\n")
 }
@@ -341,7 +339,7 @@ func (a App) costSummary() string {
 		return strings.Join(lines, "\n")
 	}
 
-	order := []string{"claude", "codex", "gemini", "openai", "ollama"}
+	order := []string{"claude", "codex", "gemini"}
 	for _, provider := range order {
 		cost, ok := providers[provider]
 		if !ok {

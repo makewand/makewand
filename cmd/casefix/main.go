@@ -67,13 +67,13 @@ func main() {
 		Verify:    map[string]modeReport{},
 	}
 
-	fixModes := []model.UsageMode{model.ModeFree, model.ModeEconomy}
+	fixModes := []model.UsageMode{model.ModeFast}
 	for _, m := range fixModes {
 		rep := fixMode(cfg, *root, *caseID, m)
 		report.FixReports = append(report.FixReports, rep)
 	}
 
-	verifyModes := []model.UsageMode{model.ModeFree, model.ModeEconomy, model.ModeBalanced, model.ModePower}
+	verifyModes := []model.UsageMode{model.ModeFast, model.ModeBalanced, model.ModePower}
 	allPass := true
 	for _, m := range verifyModes {
 		rep := verifyMode(*root, *caseID, m)
@@ -96,7 +96,7 @@ func main() {
 	}
 	fmt.Println()
 	fmt.Println("=== Verify Summary ===")
-	for _, mode := range []string{"free", "economy", "balanced", "power"} {
+	for _, mode := range []string{"fast", "balanced", "power"} {
 		r := report.Verify[mode]
 		status := "FAIL"
 		if r.AfterPassed {
@@ -289,17 +289,12 @@ func buildModeFixPrompt(mode model.UsageMode, testOutput, projectContext string)
 	)
 
 	switch mode {
-	case model.ModeFree:
-		return common + "\nFree mode template:\n" +
-			"- Do not rely on downloading new dependencies.\n" +
-			"- Remove third-party dependency usage (especially github.com/google/uuid).\n" +
-			"- Use standard library only for ID generation.\n" +
-			"- Ensure go.mod is consistent with actual imports."
-	case model.ModeEconomy:
-		return common + "\nEconomy mode template:\n" +
+	case model.ModeFast:
+		return common + "\nFast mode template:\n" +
 			"- Keep architecture unchanged, patch only what is necessary.\n" +
-			"- Resolve missing module/import issues in go.mod and code.\n" +
+			"- Do not rely on downloading new dependencies.\n" +
 			"- Prefer standard library replacements when possible.\n" +
+			"- Ensure go.mod is consistent with actual imports.\n" +
 			"- Ensure `go test ./...` passes."
 	default:
 		return common

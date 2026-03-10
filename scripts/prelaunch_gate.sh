@@ -19,7 +19,7 @@ echo "[prelaunch] go build ./cmd/makewand"
 mkdir -p build
 go build -trimpath -o build/makewand ./cmd/makewand
 
-MODES="${MAKEWAND_DOCTOR_MODES:-economy,balanced,power}"
+MODES="${MAKEWAND_DOCTOR_MODES:-fast,balanced,power}"
 
 echo "[prelaunch] doctor static checks"
 build/makewand doctor --strict --modes "${MODES}"

@@ -98,19 +98,12 @@ func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) t
 	maxDur := buildPhaseAttemptTimeout(phase)
 	provider = strings.ToLower(strings.TrimSpace(provider))
 
-	// Economy mode keeps conservative caps for slower providers to preserve
+	// Fast mode keeps conservative caps for slower providers to preserve
 	// fallback budget, but allows longer code-generation windows than review/fix.
-	if mode == ModeEconomy {
-		switch provider {
-		case "gemini":
+	if mode == ModeFast {
+		if provider == "gemini" {
 			if phase == PhaseCode && maxDur > 120*time.Second {
 				maxDur = 120 * time.Second
-			}
-		case "ollama":
-			if phase == PhaseCode && maxDur > 90*time.Second {
-				maxDur = 90 * time.Second
-			} else if phase != PhaseCode && maxDur > 45*time.Second {
-				maxDur = 45 * time.Second
 			}
 		}
 	}

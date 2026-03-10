@@ -32,7 +32,7 @@ type Config struct {
 	OllamaModel string `json:"ollama_model,omitempty"`
 
 	// Usage mode and provider access types
-	UsageMode    string `json:"usage_mode,omitempty"`    // "free","economy","balanced","power"
+	UsageMode    string `json:"usage_mode,omitempty"`    // "fast","balanced","power"
 	ClaudeAccess string `json:"claude_access,omitempty"` // "subscription" or "api"
 	GeminiAccess string `json:"gemini_access,omitempty"` // "free","subscription","api"
 	OpenAIAccess string `json:"openai_access,omitempty"` // "subscription" or "api"

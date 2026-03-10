@@ -577,12 +577,9 @@ func (a App) renderModeBadge(msg *i18n.Messages) string {
 	var style lipgloss.Style
 
 	switch mode {
-	case model.ModeFree:
-		label = msg.ModeFree
-		style = modeBadgeFreeStyle
-	case model.ModeEconomy:
-		label = msg.ModeEconomy
-		style = modeBadgeEconomyStyle
+	case model.ModeFast:
+		label = msg.ModeFast
+		style = modeBadgeFastStyle
 	case model.ModeBalanced:
 		label = msg.ModeBalanced
 		style = modeBadgeBalancedStyle

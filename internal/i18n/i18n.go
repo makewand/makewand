@@ -119,8 +119,7 @@ type Messages struct {
 	FallbackNotice string
 
 	// Mode
-	ModeFree     string
-	ModeEconomy  string
+	ModeFast     string
 	ModeBalanced string
 	ModePower    string
 	ModeLabel    string
@@ -176,7 +175,7 @@ var en = Messages{
 
 	ChatWelcome:      "Welcome! I'm here to help you build and modify your project.",
 	ChatPrompt:       "What would you like to do?",
-	ChatCommandHint:  "Commands: /model [free|economy|balanced|power] | /clear | /status | /cost | /exit (or Ctrl+D)",
+	ChatCommandHint:  "Commands: /model [fast|balanced|power] | /clear | /status | /cost | /exit (or Ctrl+D)",
 	ChatThinking:     "Thinking...",
 	ChatWorking:      "Working on it...",
 	ChatPlaceholder:  "Type your message... (Enter to send, / for commands)",
@@ -235,13 +234,12 @@ var en = Messages{
 
 	FallbackNotice: "%s unavailable, using %s instead",
 
-	ModeFree:     "Free",
-	ModeEconomy:  "Economy",
+	ModeFast:     "Fast",
 	ModeBalanced: "Balanced",
 	ModePower:    "Power",
 	ModeLabel:    "Mode",
 	ModeChanged:  "Mode: %s",
-	ModeHelp:     "/model [free|economy|balanced|power]",
+	ModeHelp:     "/model [fast|balanced|power]",
 
 	SetupWelcome:  "Welcome to makewand! Let's set up your AI models.",
 	SetupAPIKey:   "Enter your %s API key (or press Enter to skip):",
@@ -291,7 +289,7 @@ var zh = Messages{
 
 	ChatWelcome:      "欢迎！我来帮你构建和修改项目。",
 	ChatPrompt:       "你想做什么？",
-	ChatCommandHint:  "命令：/model [free|economy|balanced|power] | /clear | /status | /cost | /exit（或 Ctrl+D）",
+	ChatCommandHint:  "命令：/model [fast|balanced|power] | /clear | /status | /cost | /exit（或 Ctrl+D）",
 	ChatThinking:     "正在思考...",
 	ChatWorking:      "正在处理...",
 	ChatPlaceholder:  "输入消息... (Enter 发送, / 查看命令)",
@@ -350,13 +348,12 @@ var zh = Messages{
 
 	FallbackNotice: "%s 不可用，已切换到 %s",
 
-	ModeFree:     "免费",
-	ModeEconomy:  "经济",
+	ModeFast:     "快速",
 	ModeBalanced: "平衡",
 	ModePower:    "强劲",
 	ModeLabel:    "模式",
 	ModeChanged:  "模式：%s",
-	ModeHelp:     "/model [free|economy|balanced|power]",
+	ModeHelp:     "/model [fast|balanced|power]",
 
 	SetupWelcome:  "欢迎使用 makewand！让我们配置 AI 模型。",
 	SetupAPIKey:   "输入你的 %s API 密钥（按回车跳过）：",

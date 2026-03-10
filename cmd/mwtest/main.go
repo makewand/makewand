@@ -59,7 +59,7 @@ func main() {
 		name string
 		mode model.UsageMode
 	}{
-		{"free", model.ModeFree},
+		{"fast", model.ModeFast},
 		{"balanced", model.ModeBalanced},
 		{"power", model.ModePower},
 	}

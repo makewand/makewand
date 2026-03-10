@@ -14,7 +14,7 @@ func TestParseDoctorModes_All(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDoctorModes(all) error = %v", err)
 	}
-	want := []model.UsageMode{model.ModeFree, model.ModeEconomy, model.ModeBalanced, model.ModePower}
+	want := []model.UsageMode{model.ModeFast, model.ModeBalanced, model.ModePower}
 	if len(got) != len(want) {
 		t.Fatalf("len(modes) = %d, want %d", len(got), len(want))
 	}
@@ -54,7 +54,6 @@ func TestDetectConfiguredProviders(t *testing.T) {
 		{Name: "codex"},
 	}
 	cfg.GeminiAPIKey = "test-key"
-	cfg.OllamaURL = "http://localhost:11434"
 
 	got := detectConfiguredProviders(cfg)
 	if len(got) == 0 {
@@ -63,17 +62,6 @@ func TestDetectConfiguredProviders(t *testing.T) {
 	assertContains(t, got, "claude (cli)")
 	assertContains(t, got, "codex (cli)")
 	assertContains(t, got, "gemini (api)")
-	assertContains(t, got, "ollama")
-}
-
-func TestDetectConfiguredProviders_RemoteOllamaMarkedBlocked(t *testing.T) {
-	t.Setenv("MAKEWAND_OLLAMA_ALLOW_REMOTE", "")
-
-	cfg := config.DefaultConfig()
-	cfg.OllamaURL = "http://10.0.0.2:11434"
-
-	got := detectConfiguredProviders(cfg)
-	assertContains(t, got, "ollama (blocked)")
 }
 
 func TestUniqueProbeProviders(t *testing.T) {
