@@ -79,7 +79,7 @@ func (m UsageMode) String() string {
 }
 
 // parseAccessType determines the AccessType from a config value and provider name.
-// Defaults: gemini→Free, others→API.
+// Defaults: all built-in providers default to Subscription (CLI tools preferred).
 func parseAccessType(configValue, providerName string) AccessType {
 	switch strings.ToLower(configValue) {
 	case "free":
@@ -91,13 +91,8 @@ func parseAccessType(configValue, providerName string) AccessType {
 	case "api":
 		return AccessAPI
 	}
-	// Default inference based on provider
-	switch providerName {
-	case "gemini":
-		return AccessFree
-	default:
-		return AccessAPI
-	}
+	// Default: subscription (CLI tools are the primary access method).
+	return AccessSubscription
 }
 
 // accessPriority returns the sort weight for access types.

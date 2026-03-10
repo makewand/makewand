@@ -188,26 +188,30 @@ func NewRouter(cfg *config.Config) *Router {
 		}
 	}
 
-	// Parse access types
+	// Parse explicit access type overrides from config.
+	// Only apply when explicitly configured; CLI-registered providers
+	// already have AccessSubscription set above and should not be
+	// downgraded to AccessAPI by default inference.
 	if cfg.ClaudeAccess != "" {
 		r.accessTypes["claude"] = parseAccessType(cfg.ClaudeAccess, "claude")
-	} else if _, ok := r.accessTypes["claude"]; !ok {
-		r.accessTypes["claude"] = parseAccessType("", "claude")
 	}
 	if cfg.GeminiAccess != "" {
 		r.accessTypes["gemini"] = parseAccessType(cfg.GeminiAccess, "gemini")
-	} else if _, ok := r.accessTypes["gemini"]; !ok {
-		r.accessTypes["gemini"] = parseAccessType("", "gemini")
 	}
 	if cfg.OpenAIAccess != "" {
 		r.accessTypes["openai"] = parseAccessType(cfg.OpenAIAccess, "openai")
-	} else if _, ok := r.accessTypes["openai"]; !ok {
-		r.accessTypes["openai"] = parseAccessType("", "openai")
 	}
 	if cfg.CodexAccess != "" {
 		r.accessTypes["codex"] = parseAccessType(cfg.CodexAccess, "codex")
-	} else if _, ok := r.accessTypes["codex"]; !ok {
-		r.accessTypes["codex"] = parseAccessType("", "codex")
+	}
+
+	// For API-only providers (no CLI registered), ensure they have an access type.
+	for _, name := range []string{"claude", "gemini", "openai", "codex"} {
+		if _, ok := r.accessTypes[name]; !ok {
+			if r.providers[name] != nil {
+				r.accessTypes[name] = AccessAPI
+			}
+		}
 	}
 
 	return r
