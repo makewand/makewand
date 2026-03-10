@@ -42,8 +42,8 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 	a.chat.SetStreaming(false)
 
 	// Record the code provider for cross-model review
-	if a.wizard.Phase() == WizardPhaseBuild && a.buildCodeProvider == "" {
-		a.buildCodeProvider = msg.provider
+	if a.wizard.Phase() == WizardPhaseBuild && a.pipeline.CodeProvider() == "" {
+		a.pipeline.SetCodeProvider(msg.provider)
 	}
 
 	// Check for files in non-streaming responses (build phase uses Chat, not ChatStream).
@@ -210,7 +210,8 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 	if a.pendingPhase == pendingPhaseReview {
 		// Review fix files written — continue to deps phase
 		a.progress.SetStepStatus(stepReview, StepDone)
-		a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressReviewApplied, msg.written, a.buildReviewProvider))
+		a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressReviewApplied, msg.written, a.pipeline.ReviewProvider()))
+		a.pipeline.OnReviewFixesWritten()
 		depsModel, depsCmd := a.startDepsPhase()
 		a = depsModel.(App)
 		if depsCmd != nil {
@@ -231,13 +232,14 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 		a.progress.SetStepStatus(stepCode, StepDone)
 		a.progress.SetStepDetail(stepCode, fmt.Sprintf(m.ProgressFilesWritten, msg.written))
 
-		// Next step: code review (cross-model)
-		// Skip review if only one provider is available — reviewing your own code is pointless
-		codeProvider := a.buildCodeProvider
-		availableProviders := a.router.Available()
-		if len(availableProviders) <= 1 {
+		// Ask the pipeline whether to review or skip.
+		codeProvider := a.pipeline.CodeProvider()
+		a.pipeline.SetAvailableProviders(len(a.router.Available()))
+		action := a.pipeline.OnCodeWritten()
+
+		if action.Kind == engine.ActionSkipReview {
 			a.progress.SetStepStatus(stepReview, StepDone)
-			a.progress.SetStepDetail(stepReview, "skipped (single provider)")
+			a.progress.SetStepDetail(stepReview, fmt.Sprintf("skipped (%s)", action.SkipReason))
 			depsModel, depsCmd := a.startDepsPhase()
 			a = depsModel.(App)
 			if depsCmd != nil {
@@ -260,7 +262,7 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 					reviewProvider = result.Actual
 				}
 			}
-			a.buildReviewProvider = reviewProvider
+			a.pipeline.SetReviewProvider(reviewProvider)
 			a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressCrossModel, codeProvider, reviewProvider))
 		}
 
@@ -329,6 +331,7 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 			Role:    "system",
 			Content: fmt.Sprintf("Review skipped: %s", msg.err),
 		})
+		a.pipeline.OnReviewComplete(engine.ReviewError)
 		return a.startDepsPhase()
 	}
 
@@ -346,6 +349,7 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 			Provider: msg.provider,
 			Cost:     msg.cost,
 		})
+		a.pipeline.OnReviewComplete(engine.ReviewLGTM)
 		return a.startDepsPhase()
 	}
 
@@ -362,9 +366,11 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 		// Review had comments but no file fixes — treat as LGTM
 		a.progress.SetStepStatus(stepReview, StepDone)
 		a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressReviewDone, msg.provider))
+		a.pipeline.OnReviewComplete(engine.ReviewNoFixFiles)
 		return a.startDepsPhase()
 	}
 
+	a.pipeline.OnReviewComplete(engine.ReviewHasIssues)
 	a.progress.SetStepDetail(stepReview, m.ProgressReviewFixing)
 	return a, func() tea.Msg {
 		return filesExtractedMsg{files: result.Files, phase: pendingPhaseReview}
@@ -402,7 +408,7 @@ func (a App) startDepsPhase() (tea.Model, tea.Cmd) {
 	}
 	emitExecTrace(a.router, "pipeline.exec.plan_detected", "deps", plan, nil, nil, nil, "detected dependency install plan")
 
-	if !a.depsInstallApproved {
+	if !a.pipeline.DepsApproved() {
 		a.state = StateConfirmDeps
 		a.setPendingApproval(
 			approvalDeps,
@@ -471,7 +477,7 @@ func (a App) startTestsPhase() (tea.Model, tea.Cmd) {
 	}
 	emitExecTrace(a.router, "pipeline.exec.plan_detected", "tests", plan, nil, nil, nil, "detected test execution plan")
 
-	if !a.testsRunApproved {
+	if !a.pipeline.TestsApproved() {
 		a.state = StateConfirmTests
 		a.setPendingApproval(
 			approvalTests,
@@ -527,11 +533,12 @@ func (a App) handleDepsInstallConfirm(msg confirmDepsInstallMsg) (tea.Model, tea
 		})
 		a.pendingDepsPlan = nil
 		a.pendingTestsPlan = nil
+		a.pipeline.OnDepsDeclined()
 		return a.buildComplete()
 	}
 
 	emitExecTrace(a.router, "pipeline.exec.confirmed", "deps", a.pendingDepsPlan, boolPtr(true), nil, nil, "dependency install approved by user")
-	a.depsInstallApproved = true
+	a.pipeline.SetDepsApproved(true)
 	if a.pendingDepsPlan == nil {
 		return a.startTestsPhase()
 	}
@@ -576,12 +583,13 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 			Content: execFinishedMessage("dependency install", commandDetails, execResultSummary(msg.result)),
 		})
 		// Deps failure means the code was broken → quality penalty for code provider.
-		if a.buildCodeProvider != "" {
-			a.router.RecordQualityOutcome(model.PhaseCode, a.buildCodeProvider, false)
+		if a.pipeline.CodeProvider() != "" {
+			a.router.RecordQualityOutcome(model.PhaseCode, a.pipeline.CodeProvider(), false)
 		}
-		// Trigger auto-fix for dependency issues
+		// Ask pipeline whether to auto-fix
+		action := a.pipeline.OnDepsComplete(true, stderr)
 		return a, func() tea.Msg {
-			return autoFixMsg{errOutput: stderr, attempt: 1}
+			return autoFixMsg{errOutput: stderr, attempt: action.AutoFixAttempt}
 		}
 	} else if msg.result != nil && strings.Contains(msg.result.Stdout, "No package manager") {
 		emitExecTrace(a.router, "pipeline.exec.not_detected", "deps", plan, nil, msg.result, nil, "no dependency install command detected")
@@ -617,7 +625,7 @@ func (a App) handleTestsRunConfirm(msg confirmTestsRunMsg) (tea.Model, tea.Cmd) 
 	}
 
 	emitExecTrace(a.router, "pipeline.exec.confirmed", "tests", a.pendingTestsPlan, boolPtr(true), nil, nil, "test execution approved by user")
-	a.testsRunApproved = true
+	a.pipeline.SetTestsApproved(true)
 	if a.pendingTestsPlan == nil {
 		return a.buildComplete()
 	}
@@ -675,13 +683,14 @@ func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 			Content: execFinishedMessage("tests", commandDetails, execResultSummary(msg.result)),
 		})
 		// Test failure → code was broken; penalise the code provider.
-		if a.buildCodeProvider != "" {
-			a.router.RecordQualityOutcome(model.PhaseCode, a.buildCodeProvider, false)
+		if a.pipeline.CodeProvider() != "" {
+			a.router.RecordQualityOutcome(model.PhaseCode, a.pipeline.CodeProvider(), false)
 		}
 
-		// Trigger auto-fix
+		// Ask pipeline whether to auto-fix
+		action := a.pipeline.OnTestsComplete(true, stderr)
 		return a, func() tea.Msg {
-			return autoFixMsg{errOutput: stderr, attempt: 1}
+			return autoFixMsg{errOutput: stderr, attempt: action.AutoFixAttempt}
 		}
 	}
 
@@ -694,9 +703,10 @@ func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 	})
 	// Only reward the code provider if no auto-fix was needed.
 	// If auto-fix ran, credit goes to the fix provider (below), not the original generator.
-	if a.buildCodeProvider != "" && a.autoFixAttempt == 0 {
-		a.router.RecordQualityOutcome(model.PhaseCode, a.buildCodeProvider, true)
+	if a.pipeline.ShouldRecordCodeQuality() {
+		a.router.RecordQualityOutcome(model.PhaseCode, a.pipeline.CodeProvider(), true)
 	}
+	a.pipeline.OnTestsComplete(false, "")
 	a.pendingTestsPlan = nil
 	return a.buildComplete()
 }
@@ -707,15 +717,14 @@ func (a App) handleAutoFix(msg autoFixMsg) (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
 	a = a.applyBudgetRoutingPolicy()
 
-	if msg.attempt > maxAutoFixRetries {
+	action := a.pipeline.OnAutoFixAttempt(msg.attempt)
+	if action.Kind == engine.ActionMaxRetriesReached {
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
 			Content: fmt.Sprintf(m.ErrMaxRetries, maxAutoFixRetries),
 		})
 		return a.buildComplete()
 	}
-
-	a.autoFixAttempt = msg.attempt
 
 	// Add auto-fix step to progress
 	stepLabel := fmt.Sprintf(m.ProgressAutoFix, msg.attempt, maxAutoFixRetries)
@@ -732,7 +741,7 @@ func (a App) handleAutoFix(msg autoFixMsg) (tea.Model, tea.Cmd) {
 	router := a.router
 	errOutput := msg.errOutput
 	attempt := msg.attempt
-	codeProvider := a.buildCodeProvider
+	codeProvider := a.pipeline.CodeProvider()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	a.cancelAI = cancel
@@ -786,7 +795,8 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 
 	// Parse fix files
 	result := engine.ParseFilesBestEffort(msg.content)
-	if len(result.Files) == 0 {
+	pipelineAction := a.pipeline.OnAutoFixResponse(len(result.Files) > 0, msg.attempt)
+	if pipelineAction.Kind == engine.ActionMaxRetriesReached {
 		a.progress.SetStepStatus(fixStepIdx, StepFailed)
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
@@ -802,9 +812,6 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 		a.router.RecordQualityOutcome(model.PhaseFix, msg.provider, true)
 	}
 
-	// Save retry state for after file write confirmation
-	a.autoFixRetryAttempt = msg.attempt
-
 	// Ask for confirmation before writing fix files
 	return a, func() tea.Msg {
 		return filesExtractedMsg{files: result.Files, phase: pendingPhaseFix}
@@ -813,11 +820,12 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 
 // handleAutoFixFileWriteComplete continues the auto-fix retry after files have been written.
 func (a App) handleAutoFixFileWriteComplete() (tea.Model, tea.Cmd) {
+	a.pipeline.OnAutoFixFilesWritten()
 	proj := a.project
 	router := a.router
-	attempt := a.autoFixRetryAttempt
-	depsApproved := a.depsInstallApproved
-	testsApproved := a.testsRunApproved
+	attempt := a.pipeline.AutoFixRetryAttempt()
+	depsApproved := a.pipeline.DepsApproved()
+	testsApproved := a.pipeline.TestsApproved()
 	var cmds []tea.Cmd
 
 	// Retry: re-run deps + tests

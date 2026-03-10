@@ -98,7 +98,7 @@ func TestDepsAndTestsConfirm_AcceptPath(t *testing.T) {
 	confirmMsg := cmd()
 	model, depsCmd := app.Update(confirmMsg)
 	app = model.(App)
-	if !app.depsInstallApproved {
+	if !app.pipeline.DepsApproved() {
 		t.Fatal("depsInstallApproved should be true after accepting install")
 	}
 	if depsCmd == nil {
@@ -131,7 +131,7 @@ func TestDepsAndTestsConfirm_AcceptPath(t *testing.T) {
 	testsConfirmMsg := cmd()
 	model, testsCmd := app.Update(testsConfirmMsg)
 	app = model.(App)
-	if !app.testsRunApproved {
+	if !app.pipeline.TestsApproved() {
 		t.Fatal("testsRunApproved should be true after accepting test run")
 	}
 	if testsCmd == nil {
@@ -151,7 +151,7 @@ func TestDepsAndTestsConfirm_AcceptPath(t *testing.T) {
 
 func TestTestsConfirm_DeclinePath(t *testing.T) {
 	app := newBuildAppForDepsTest(t)
-	app.depsInstallApproved = true
+	app.pipeline.SetDepsApproved(true)
 
 	model, cmd := app.startTestsPhase()
 	app = model.(App)
