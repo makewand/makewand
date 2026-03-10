@@ -20,7 +20,7 @@ func TestChatPanel_ViewShowsSlashSuggestions(t *testing.T) {
 	if !strings.Contains(view, "/model") || !strings.Contains(view, "/help") || !strings.Contains(view, "/clear") {
 		t.Fatalf("view missing expected slash suggestions: %q", view)
 	}
-	if strings.Contains(view, "/model free") {
+	if strings.Contains(view, "/model fast") {
 		t.Fatalf("root command menu should not show model subcommands: %q", view)
 	}
 }
@@ -53,7 +53,7 @@ func TestChatPanel_ModelMenuShowsProfiles(t *testing.T) {
 	chat.textarea.SetValue("/model")
 
 	view := chat.View()
-	if !strings.Contains(view, "/model free") || !strings.Contains(view, "/model power") {
+	if !strings.Contains(view, "/model fast") || !strings.Contains(view, "/model power") {
 		t.Fatalf("model menu missing expected profile suggestions: %q", view)
 	}
 	if strings.Contains(view, "/clear") {

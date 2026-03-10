@@ -99,8 +99,8 @@ func (r *Router) RegisterProvider(name string, provider Provider, access AccessT
 }
 
 // Available returns all available provider names, filtered by the effective mode.
-// In ModeFree, only free/local providers are returned to match strict free routing.
-// Results are cached to avoid repeated health checks (e.g. Ollama) on every render cycle.
+// Results are filtered by circuit breaker state.
+// Results are cached to avoid repeated health checks on every render cycle.
 func (r *Router) Available() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -109,13 +109,9 @@ func (r *Router) Available() []string {
 		return r.cachedAvail
 	}
 
-	mode := r.effectiveMode()
 	var names []string
 	for name, p := range r.providers {
 		if p.IsAvailable() {
-			if mode == ModeFree && r.accessTypes[name] != AccessFree && r.accessTypes[name] != AccessLocal {
-				continue
-			}
 			if blocked, _ := r.isCircuitOpen(name); blocked {
 				continue
 			}

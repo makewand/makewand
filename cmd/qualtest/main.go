@@ -79,8 +79,7 @@ func main() {
 		name string
 		tier string
 	}{
-		{model.ModeFree, "Free", "Cheap (free models)"},
-		{model.ModeEconomy, "Economy", "Cheap (prefer free)"},
+		{model.ModeFast, "Fast", "Cheap (fast routing)"},
 		{model.ModeBalanced, "Balanced", "Mid (quality/cost)"},
 		{model.ModePower, "Power", "Premium (best)"},
 	}

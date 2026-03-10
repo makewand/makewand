@@ -10,11 +10,11 @@
 Multi-provider coding router for terminal makers (Go).
 面向终端开发者的多模型编码路由器（Go）。
 
-Orchestrates Claude, Gemini, OpenAI, and Ollama through adaptive
-mode-based routing (`free/economy/balanced/power`) with Thompson Sampling,
+Orchestrates Claude, Gemini, and Codex through adaptive
+mode-based routing (`fast/balanced/power`) with Thompson Sampling,
 circuit breakers, and cost-aware provider selection.
-通过 Thompson Sampling、熔断器和成本感知的 Provider 选择，编排 Claude、Gemini、OpenAI
-和 Ollama，支持自适应模式路由（`free/economy/balanced/power`）。
+通过 Thompson Sampling、熔断器和成本感知的 Provider 选择，编排 Claude、Gemini
+和 Codex，支持自适应模式路由（`fast/balanced/power`）。
 
 ## Install / 安装
 
@@ -90,19 +90,9 @@ makewand
 In-session commands:
 会话内命令：
 
-- `/mode free|economy|balanced|power`
+- `/mode fast|balanced|power`
 - `/help`
 - `/exit` (or `Ctrl+C`)
-
-## Ollama / Ollama
-
-Remote Ollama endpoints are blocked by default. To allow a non-localhost Ollama
-host, set:
-默认只允许本机 Ollama。若要连接非 localhost 的 Ollama，请设置：
-
-```bash
-export MAKEWAND_OLLAMA_ALLOW_REMOTE=1
-```
 
 ## Custom Providers / 自定义 Provider
 

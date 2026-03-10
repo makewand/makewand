@@ -33,8 +33,8 @@ func main() {
 		// Provider/runtime errors are already specific; avoid noisy global usage spam.
 		SilenceUsage: true,
 		Long: `makewand is a multi-provider coding router that orchestrates
-Claude, Gemini, OpenAI, and Ollama through adaptive mode-based routing
-(free/economy/balanced/power) for terminal-based coding workflows.
+Claude, Gemini, and Codex through adaptive mode-based routing
+(fast/balanced/power) for terminal-based coding workflows.
 
   makewand         - Start interactive chat in current directory (type /help in chat)
   makewand "..."   - Start chat and send an initial prompt
@@ -75,7 +75,7 @@ Claude, Gemini, OpenAI, and Ollama through adaptive mode-based routing
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
-	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: free, economy, balanced, power")
+	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
 	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 4*time.Minute, "timeout for --print one-shot execution")
 
@@ -116,7 +116,7 @@ func newCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: free, economy, balanced, power")
+	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: fast, balanced, power")
 	return cmd
 }
 
@@ -149,7 +149,7 @@ func chatCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: free, economy, balanced, power")
+	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: fast, balanced, power")
 	return cmd
 }
 
@@ -248,10 +248,6 @@ func setupCmd() *cobra.Command {
 			} else if !cfg.HasCLI("codex") {
 				fmt.Println("  [ ] OpenAI: not configured")
 			}
-			if cfg.OllamaURL != "" {
-				fmt.Printf("  Ollama URL: %s\n", cfg.OllamaURL)
-				fmt.Printf("  Ollama note: %s\n", ollamaSetupNotice(cfg.OllamaURL))
-			}
 			fmt.Println()
 
 			fmt.Printf("  Language: %s\n", cfg.Language)
@@ -263,11 +259,9 @@ func setupCmd() *cobra.Command {
 			}
 			fmt.Println()
 			fmt.Println("Provider access types:")
-			fmt.Printf("  Claude: %s\n", accessDisplay(cfg.ClaudeAccess, "api"))
-			fmt.Printf("  Gemini: %s\n", accessDisplay(cfg.GeminiAccess, "free"))
-			fmt.Printf("  Codex:  %s\n", accessDisplay(cfg.CodexAccess, "api"))
-			fmt.Printf("  Ollama: %s\n", accessDisplay(cfg.OllamaAccess, "local"))
-			fmt.Println("  Ollama note: remote hosts require MAKEWAND_OLLAMA_ALLOW_REMOTE=1")
+			fmt.Printf("  Claude: %s\n", accessDisplay(cfg.ClaudeAccess, "subscription"))
+			fmt.Printf("  Gemini: %s\n", accessDisplay(cfg.GeminiAccess, "subscription"))
+			fmt.Printf("  Codex:  %s\n", accessDisplay(cfg.CodexAccess, "subscription"))
 
 			if len(cfg.CLIs) > 0 {
 				fmt.Println()

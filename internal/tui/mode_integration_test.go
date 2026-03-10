@@ -100,7 +100,7 @@ func driveMessages(t *testing.T, app App, msgs ...tea.Msg) App {
 // ---------------------------------------------------------------------------
 
 func TestMode_FreeBuild_UsesGemini(t *testing.T) {
-	app := newBuildAppWithMode(t, model.ModeFree)
+	app := newBuildAppWithMode(t, model.ModeFast)
 
 	// Simulate AI code generation response from gemini.
 	resp := buildAIResponseWithFiles("gemini", "index.js")
@@ -112,7 +112,7 @@ func TestMode_FreeBuild_UsesGemini(t *testing.T) {
 }
 
 func TestMode_FreeBuild_NoAPIFallbackOnError(t *testing.T) {
-	app := newBuildAppWithMode(t, model.ModeFree)
+	app := newBuildAppWithMode(t, model.ModeFast)
 
 	// Simulate AI error.
 	errResp := aiResponseMsg{err: fmt.Errorf("gemini rate limited")}
@@ -126,7 +126,7 @@ func TestMode_FreeBuild_NoAPIFallbackOnError(t *testing.T) {
 }
 
 func TestMode_EconomyBuild_ReviewLGTM(t *testing.T) {
-	app := newBuildAppWithMode(t, model.ModeEconomy)
+	app := newBuildAppWithMode(t, model.ModeFast)
 	app.buildCodeProvider = "gemini"
 
 	// Code step already done; simulate review returning LGTM.
@@ -436,7 +436,7 @@ func TestMode_ChatConversationSummary(t *testing.T) {
 
 func TestMode_SwitchCommand_FreeToBalanced(t *testing.T) {
 	app := *NewApp(ModeChat, config.DefaultConfig(), "")
-	app.router.SetMode(model.ModeFree)
+	app.router.SetMode(model.ModeFast)
 
 	m, _ := app.handleModeCommand("/mode balanced")
 	app = m.(App)
@@ -448,13 +448,13 @@ func TestMode_SwitchCommand_FreeToBalanced(t *testing.T) {
 
 func TestMode_SwitchCommand_ShowCurrent(t *testing.T) {
 	app := *NewApp(ModeChat, config.DefaultConfig(), "")
-	app.router.SetMode(model.ModeEconomy)
+	app.router.SetMode(model.ModeFast)
 
 	m, _ := app.handleModeCommand("/mode")
 	app = m.(App)
 
 	lastMsg := app.chat.messages[len(app.chat.messages)-1]
-	if !strings.Contains(lastMsg.Content, "economy") {
+	if !strings.Contains(lastMsg.Content, "fast") {
 		t.Errorf("expected current mode in message, got %q", lastMsg.Content)
 	}
 }
@@ -473,7 +473,7 @@ func TestMode_SwitchCommand_InvalidMode(t *testing.T) {
 
 	// Should show help text.
 	lastMsg := app.chat.messages[len(app.chat.messages)-1]
-	if !strings.Contains(lastMsg.Content, "free|economy|balanced|power") {
+	if !strings.Contains(lastMsg.Content, "fast|balanced|power") {
 		t.Errorf("expected help text in message, got %q", lastMsg.Content)
 	}
 }

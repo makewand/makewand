@@ -16,15 +16,13 @@ import (
 const testPrompt = "Write a Go function that reverses a string. Only output the code, no explanation."
 
 var modes = []model.UsageMode{
-	model.ModeFree,
-	model.ModeEconomy,
+	model.ModeFast,
 	model.ModeBalanced,
 	model.ModePower,
 }
 
 var modeNames = map[model.UsageMode]string{
-	model.ModeFree:     "Free    (免费)",
-	model.ModeEconomy:  "Economy (经济)",
+	model.ModeFast:     "Fast    (快速)",
 	model.ModeBalanced: "Balanced(平衡)",
 	model.ModePower:    "Power   (强劲)",
 }

@@ -56,11 +56,6 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 
 		access := r.accessTypes[provName]
 
-		// Free mode (strict): only free/local providers are allowed.
-		if r.effectiveMode() == ModeFree && access != AccessFree && access != AccessLocal {
-			continue
-		}
-
 		// Prior bias encodes static table preference:
 		// position 0 (primary) → bias 2.0, position 1 → 1.0, position 2+ → 0.0.
 		// This seeds the Beta distribution so observed quality can gradually override
@@ -106,11 +101,6 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 	candidates := make([]candidate, 0, len(orderedProviders))
 	for i, provName := range orderedProviders {
 		access := r.accessTypes[provName]
-		// Free mode (strict): only free/local providers are allowed.
-		if mode == ModeFree && access != AccessFree && access != AccessLocal {
-			continue
-		}
-
 		modelID := ""
 		if models, ok := modelTable[provName]; ok {
 			modelID = models[bs.Tier]

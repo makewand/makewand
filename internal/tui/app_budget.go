@@ -28,20 +28,20 @@ func (a App) applyBudgetRoutingPolicy() App {
 		currentMode = a.router.Mode()
 	}
 
-	if status.Level == BudgetExceeded && currentMode != model.ModeFree {
-		a.router.SetMode(model.ModeFree)
+	if status.Level == BudgetExceeded && currentMode != model.ModeFast {
+		a.router.SetMode(model.ModeFast)
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("Budget exceeded. Auto-switched mode: %s -> %s", currentMode.String(), model.ModeFree.String()),
+			Content: fmt.Sprintf("Budget exceeded. Auto-switched mode: %s -> %s", currentMode.String(), model.ModeFast.String()),
 		})
 		return a
 	}
 
 	if status.Level == BudgetWarning && (currentMode == model.ModePower || currentMode == model.ModeBalanced) {
-		a.router.SetMode(model.ModeEconomy)
+		a.router.SetMode(model.ModeFast)
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("Budget warning. Auto-switched mode: %s -> %s", currentMode.String(), model.ModeEconomy.String()),
+			Content: fmt.Sprintf("Budget warning. Auto-switched mode: %s -> %s", currentMode.String(), model.ModeFast.String()),
 		})
 	}
 

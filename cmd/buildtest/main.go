@@ -28,8 +28,7 @@ func main() {
 	}
 
 	modes := []model.UsageMode{
-		model.ModeFree,
-		model.ModeEconomy,
+		model.ModeFast,
 		model.ModeBalanced,
 		model.ModePower,
 	}

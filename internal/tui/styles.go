@@ -87,15 +87,9 @@ var (
 			Bold(true)
 
 	// Mode badge styles (background color + white text)
-	modeBadgeFreeStyle = lipgloss.NewStyle().
+	modeBadgeFastStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#FFFFFF")).
 				Background(colorSuccess).
-				Bold(true).
-				Padding(0, 1)
-
-	modeBadgeEconomyStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FFFFFF")).
-				Background(colorSecondary).
 				Bold(true).
 				Padding(0, 1)
 

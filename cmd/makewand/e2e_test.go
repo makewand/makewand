@@ -65,68 +65,6 @@ func TestE2EPrintRoutesByClassifier(t *testing.T) {
 	}
 }
 
-func TestE2ESetupShowsRemoteOllamaNotice(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping E2E test in short mode")
-	}
-	if runtime.GOOS == "windows" {
-		t.Skip("shell-based E2E fixtures are Unix-only")
-	}
-
-	bin := buildMakewandBinary(t)
-	cfgDir := t.TempDir()
-	script := writeProviderScript(t)
-
-	cfg := config.DefaultConfig()
-	cfg.OllamaURL = "http://10.0.0.2:11434"
-	cfg.CustomProviders = []config.CustomProvider{
-		{Name: "custom", Command: script, Args: []string{"custom"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
-	}
-	writeTestConfig(t, cfgDir, cfg)
-
-	stdout, stderr, err := runMakewand(t, bin, cfgDir, "setup")
-	if err != nil {
-		t.Fatalf("runMakewand(setup) error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "Ollama URL: http://10.0.0.2:11434") {
-		t.Fatalf("setup stdout missing Ollama URL:\n%s", stdout)
-	}
-	wantNotice := `Ollama note: Remote Ollama host "10.0.0.2" is currently blocked. Set MAKEWAND_OLLAMA_ALLOW_REMOTE=1 to allow it.`
-	if !strings.Contains(stdout, wantNotice) {
-		t.Fatalf("setup stdout missing remote Ollama notice:\n%s", stdout)
-	}
-}
-
-func TestE2EDoctorShowsBlockedRemoteOllama(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping E2E test in short mode")
-	}
-	if runtime.GOOS == "windows" {
-		t.Skip("shell-based E2E fixtures are Unix-only")
-	}
-
-	bin := buildMakewandBinary(t)
-	cfgDir := t.TempDir()
-	script := writeProviderScript(t)
-
-	cfg := config.DefaultConfig()
-	cfg.OllamaURL = "http://10.0.0.2:11434"
-	cfg.CustomProviders = []config.CustomProvider{
-		{Name: "custom", Command: script, Args: []string{"custom"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
-	}
-	writeTestConfig(t, cfgDir, cfg)
-
-	stdout, stderr, err := runMakewand(t, bin, cfgDir, "doctor", "--modes", "balanced")
-	if err != nil {
-		t.Fatalf("runMakewand(doctor) error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "Detected providers: custom (custom), ollama (blocked)") {
-		t.Fatalf("doctor stdout missing detected providers summary:\n%s", stdout)
-	}
-	if !strings.Contains(stdout, `[WARN] ollama endpoint policy - remote host "10.0.0.2" is blocked by default; set MAKEWAND_OLLAMA_ALLOW_REMOTE=1 to allow it`) {
-		t.Fatalf("doctor stdout missing ollama policy warning:\n%s", stdout)
-	}
-}
 
 func TestE2EDoctorJSONIncludesPolicyChecks(t *testing.T) {
 	if testing.Short() {
@@ -141,7 +79,6 @@ func TestE2EDoctorJSONIncludesPolicyChecks(t *testing.T) {
 	script := writeProviderScript(t)
 
 	cfg := config.DefaultConfig()
-	cfg.OllamaURL = "http://10.0.0.2:11434"
 	cfg.CustomProviders = []config.CustomProvider{
 		{Name: "custom", Command: script, Args: []string{"custom"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
 	}
@@ -154,15 +91,6 @@ func TestE2EDoctorJSONIncludesPolicyChecks(t *testing.T) {
 
 	report := mustParseDoctorJSON(t, stdout)
 	assertContains(t, report.DetectedProviders, "custom (custom)")
-	assertContains(t, report.DetectedProviders, "ollama (blocked)")
-
-	ollamaCheck := requireDoctorCheck(t, report, "ollama endpoint policy")
-	if ollamaCheck.Status != string(doctorWarn) {
-		t.Fatalf("ollama endpoint policy status = %q, want %q", ollamaCheck.Status, doctorWarn)
-	}
-	if !strings.Contains(ollamaCheck.Details, "MAKEWAND_OLLAMA_ALLOW_REMOTE=1") {
-		t.Fatalf("ollama endpoint policy details = %q, want remote override guidance", ollamaCheck.Details)
-	}
 
 	customCheck := requireDoctorCheck(t, report, "custom provider prompt safety")
 	if customCheck.Status != string(doctorPass) {
@@ -522,4 +450,13 @@ func requireDoctorCheck(t *testing.T, report doctorJSONReport, name string) doct
 	}
 	t.Fatalf("doctor report checks %+v do not contain %q", report.Checks, name)
 	return doctorJSONCheck{}
+}
+
+func containsAllStrings(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if !strings.Contains(s, sub) {
+			return false
+		}
+	}
+	return true
 }

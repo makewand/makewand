@@ -10,12 +10,12 @@ func TestValidateStrategyTables_Valid(t *testing.T) {
 
 func TestValidateStrategyTables_MissingModelTableEntry(t *testing.T) {
 	// Temporarily inject an unknown provider into strategyTable.
-	orig := strategyTable[ModeFree][TaskCode]
-	strategyTable[ModeFree][TaskCode] = strategyEntry{
+	orig := strategyTable[ModeFast][TaskCode]
+	strategyTable[ModeFast][TaskCode] = strategyEntry{
 		Tier:      TierCheap,
 		Providers: []string{"gemini", "unknown-provider"},
 	}
-	defer func() { strategyTable[ModeFree][TaskCode] = orig }()
+	defer func() { strategyTable[ModeFast][TaskCode] = orig }()
 
 	if err := validateStrategyTables(); err == nil {
 		t.Fatal("validateStrategyTables() = nil, want error for unknown provider")
@@ -24,9 +24,9 @@ func TestValidateStrategyTables_MissingModelTableEntry(t *testing.T) {
 
 func TestValidateStrategyTables_MissingCostTableEntry(t *testing.T) {
 	// Temporarily inject a model ID that has no cost table entry.
-	orig := modelTable["ollama"][TierPremium]
-	modelTable["ollama"][TierPremium] = "nonexistent-model-xyz"
-	defer func() { modelTable["ollama"][TierPremium] = orig }()
+	orig := modelTable["gemini"][TierPremium]
+	modelTable["gemini"][TierPremium] = "nonexistent-model-xyz"
+	defer func() { modelTable["gemini"][TierPremium] = orig }()
 
 	if err := validateStrategyTables(); err == nil {
 		t.Fatal("validateStrategyTables() = nil, want error for missing cost entry")
@@ -54,7 +54,7 @@ func TestSortCandidatesForMode_EconomyFastDegradesUnstableProvider(t *testing.T)
 		{name: "stable", access: AccessFree, order: 1, failureRate: 0.0, requests: 0, thompsonScore: 0.10},
 	}
 
-	sortCandidatesForMode(candidates, ModeEconomy)
+	sortCandidatesForMode(candidates, ModeFast)
 	if candidates[0].name != "stable" {
 		t.Fatalf("economy first candidate = %q, want %q (fast degrade threshold=2)", candidates[0].name, "stable")
 	}
@@ -78,7 +78,7 @@ func TestSortCandidatesForMode_ColdStartPrefersStaticOrder(t *testing.T) {
 		{name: "random-high", access: AccessSubscription, order: 1, requests: 0, thompsonScore: 0.95},
 	}
 
-	sortCandidatesForMode(candidates, ModeEconomy)
+	sortCandidatesForMode(candidates, ModeFast)
 	if candidates[0].name != "preferred" {
 		t.Fatalf("economy cold-start first candidate = %q, want %q (static order)", candidates[0].name, "preferred")
 	}

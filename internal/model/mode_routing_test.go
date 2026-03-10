@@ -30,8 +30,6 @@ func makeRouter(t *testing.T, mode UsageMode, provs map[string]*stubProvider) *R
 		switch name {
 		case "gemini":
 			access[name] = AccessFree
-		case "ollama":
-			access[name] = AccessLocal
 		default:
 			access[name] = AccessAPI
 		}
@@ -49,57 +47,10 @@ func makeRouter(t *testing.T, mode UsageMode, provs map[string]*stubProvider) *R
 	}
 }
 
-// --- Free mode tests ---
+// --- Fast mode tests ---
 
-func TestModeRouting_FreeModeOnlyUsesNonAPIProviders(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
-		"gemini": {name: "gemini", available: true, failChat: true},
-		"claude": {name: "claude", available: true, failChat: false},
-	})
-
-	_, _, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
-	if err == nil {
-		t.Fatal("Chat() should fail: free mode must not fall back to API provider claude")
-	}
-}
-
-func TestModeRouting_FreeModeBlocksSubscriptionProviders(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
-		"gemini": {name: "gemini", available: true, failChat: true},
-		"claude": {name: "claude", available: true, failChat: false},
-	})
-	r.accessTypes["claude"] = AccessSubscription
-
-	_, _, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
-	if err == nil {
-		t.Fatal("Chat() should fail: strict free mode must not use subscription provider claude")
-	}
-}
-
-func TestModeRouting_FreeModeAllowsLocalProviders(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
-		"gemini": {name: "gemini", available: true, failChat: true},
-		"ollama": {name: "ollama", available: true, failChat: false},
-		"claude": {name: "claude", available: true, failChat: false},
-	})
-	r.accessTypes["ollama"] = AccessLocal
-
-	content, _, route, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
-	if err != nil {
-		t.Fatalf("Chat() error = %v, want nil (ollama should handle it)", err)
-	}
-	if route.Actual != "ollama" {
-		t.Errorf("route.Actual = %q, want %q", route.Actual, "ollama")
-	}
-	if content != "ok" {
-		t.Errorf("content = %q, want %q", content, "ok")
-	}
-}
-
-// --- Economy mode tests ---
-
-func TestModeRouting_EconomyModePrefersFreeBeforeAPI(t *testing.T) {
-	r := makeRouter(t, ModeEconomy, map[string]*stubProvider{
+func TestModeRouting_FastModePrefersFreeBeforeAPI(t *testing.T) {
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
 		"gemini": {name: "gemini", available: true},
 		"claude": {name: "claude", available: true},
 	})
@@ -108,14 +59,14 @@ func TestModeRouting_EconomyModePrefersFreeBeforeAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
 	}
-	// Economy/TaskCode strategy: ["gemini", "claude", ...] with gemini=Free sorting first.
+	// Fast/TaskCode strategy: ["gemini", "claude", ...] with gemini=Free sorting first.
 	if route.Actual != "gemini" {
-		t.Errorf("route.Actual = %q, want %q (free provider preferred in economy)", route.Actual, "gemini")
+		t.Errorf("route.Actual = %q, want %q (free provider preferred in fast mode)", route.Actual, "gemini")
 	}
 }
 
-func TestModeRouting_EconomyFallsBackToAPIWhenFreeDown(t *testing.T) {
-	r := makeRouter(t, ModeEconomy, map[string]*stubProvider{
+func TestModeRouting_FastModeFallsBackToAPIWhenFreeDown(t *testing.T) {
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
 		"gemini": {name: "gemini", available: true, failChat: true},
 		"claude": {name: "claude", available: true},
 	})
@@ -125,10 +76,29 @@ func TestModeRouting_EconomyFallsBackToAPIWhenFreeDown(t *testing.T) {
 		t.Fatalf("Chat() error = %v", err)
 	}
 	if route.Actual != "claude" {
-		t.Errorf("route.Actual = %q, want %q (fallback to API)", route.Actual, "claude")
+		t.Errorf("route.Actual = %q, want %q (fallback to API in fast mode)", route.Actual, "claude")
 	}
 	if !route.IsFallback {
 		t.Error("IsFallback = false, want true")
+	}
+}
+
+func TestModeRouting_FastModeAllowsAllSubscriptionProviders(t *testing.T) {
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
+		"gemini": {name: "gemini", available: true, failChat: true},
+		"claude": {name: "claude", available: true, failChat: false},
+		"codex":  {name: "codex", available: true, failChat: false},
+	})
+	r.accessTypes["claude"] = AccessSubscription
+	r.accessTypes["codex"] = AccessSubscription
+
+	_, _, route, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
+	if err != nil {
+		t.Fatalf("Chat() error = %v, want nil", err)
+	}
+	// gemini failed, so claude or codex should be used as fallback
+	if route.Actual == "gemini" {
+		t.Error("route.Actual should not be gemini (it failed)")
 	}
 }
 
@@ -222,8 +192,8 @@ func TestModeRouting_AllCircuitsOpenReturnsError(t *testing.T) {
 	}
 }
 
-func TestModeRouting_FreeModeCircuitOpenBlocksAPIFallback(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+func TestModeRouting_FastModeCircuitOpenFallsBackToAPI(t *testing.T) {
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
 		"gemini": {name: "gemini", available: true, failChat: true},
 		"claude": {name: "claude", available: true},
 	})
@@ -233,17 +203,20 @@ func TestModeRouting_FreeModeCircuitOpenBlocksAPIFallback(t *testing.T) {
 		r.breaker.RecordFailure("gemini")
 	}
 
-	// Free mode: gemini circuit open, claude is API → should error, not use claude.
-	_, _, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
-	if err == nil {
-		t.Fatal("Chat() should fail: free mode must not fall back to API even with circuit open primary")
+	// Fast mode: gemini circuit open → should fall back to claude.
+	_, _, route, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
+	if err != nil {
+		t.Fatalf("Chat() error = %v, want nil (fast mode should fallback to API)", err)
+	}
+	if route.Actual != "claude" {
+		t.Errorf("route.Actual = %q, want %q", route.Actual, "claude")
 	}
 }
 
 // --- Default mode test ---
 
 func TestModeRouting_DefaultsToBalancedWhenUnset(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
 		"claude": {name: "claude", available: true},
 	})
 	r.modeSet = false // Override: mode not set
@@ -296,8 +269,8 @@ func TestModeRouting_BuildProviderForAdaptiveSkipsUnavailable(t *testing.T) {
 	}
 }
 
-func TestModeRouting_RouteProviderFreeModeBlocksAPIRequested(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+func TestModeRouting_FastModeAllowsAPIInRouteProvider(t *testing.T) {
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
 		"gemini": {name: "gemini", available: true},
 		"claude": {name: "claude", available: true},
 	})
@@ -307,13 +280,13 @@ func TestModeRouting_RouteProviderFreeModeBlocksAPIRequested(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RouteProvider error = %v", err)
 	}
-	if result.Actual == "claude" {
-		t.Fatalf("RouteProvider selected API provider in free mode: %q", result.Actual)
+	if result.Actual != "claude" {
+		t.Errorf("RouteProvider should allow API provider in fast mode, got %q", result.Actual)
 	}
 }
 
-func TestModeRouting_RouteProviderFreeModeBlocksSubscriptionRequested(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+func TestModeRouting_FastModeAllowsSubscriptionInRouteProvider(t *testing.T) {
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
 		"gemini": {name: "gemini", available: true},
 		"claude": {name: "claude", available: true},
 	})
@@ -323,26 +296,24 @@ func TestModeRouting_RouteProviderFreeModeBlocksSubscriptionRequested(t *testing
 	if err != nil {
 		t.Fatalf("RouteProvider error = %v", err)
 	}
-	if result.Actual == "claude" {
-		t.Fatalf("RouteProvider selected subscription provider in strict free mode: %q", result.Actual)
+	if result.Actual != "claude" {
+		t.Errorf("RouteProvider should allow subscription provider in fast mode, got %q", result.Actual)
 	}
 }
 
-func TestModeRouting_AvailableFreeModeOnlyFreeAndLocal(t *testing.T) {
-	r := makeRouter(t, ModeFree, map[string]*stubProvider{
+func TestModeRouting_FastModeAvailableIncludesAllProviders(t *testing.T) {
+	r := makeRouter(t, ModeFast, map[string]*stubProvider{
 		"gemini": {name: "gemini", available: true},
-		"ollama": {name: "ollama", available: true},
 		"claude": {name: "claude", available: true},
+		"codex":  {name: "codex", available: true},
 	})
-	r.accessTypes["gemini"] = AccessFree
-	r.accessTypes["ollama"] = AccessLocal
+	r.accessTypes["gemini"] = AccessSubscription
 	r.accessTypes["claude"] = AccessSubscription
+	r.accessTypes["codex"] = AccessSubscription
 
 	avail := r.Available()
-	for _, name := range avail {
-		if name == "claude" {
-			t.Fatalf("Available() included subscription provider in strict free mode: %v", avail)
-		}
+	if len(avail) != 3 {
+		t.Fatalf("Available() returned %d providers, want 3: %v", len(avail), avail)
 	}
 }
 

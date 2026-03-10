@@ -44,8 +44,7 @@ var rootSlashCommandSuggestions = []slashCommandSuggestion{
 }
 
 var modelSlashCommandSuggestions = []slashCommandSuggestion{
-	{Command: "/model free", Description: "Free/local only"},
-	{Command: "/model economy", Description: "Lowest cost routing"},
+	{Command: "/model fast", Description: "Fastest/cheapest routing"},
 	{Command: "/model balanced", Description: "Default mode"},
 	{Command: "/model power", Description: "Highest quality routing"},
 }
