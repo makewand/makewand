@@ -44,6 +44,7 @@ func ClassifyTask(input string) TaskType {
 	codeIntent := hasAnyClassifyWord(
 		wordSet,
 		"implement", "create", "build", "write", "generate", "code", "function", "module", "class", "refactor",
+		"add", "remove", "delete", "update", "change", "modify", "move", "rename", "handle", "checkout", "setup", "install", "configure",
 	) ||
 		containsClassifyPhrase(words, "complete function") ||
 		containsClassifyPhrase(words, "complete content") ||
@@ -70,8 +71,11 @@ func ClassifyTask(input string) TaskType {
 	if hasAnyClassifyWord(wordSet, "plan", "analyze", "design", "architect") {
 		return TaskAnalyze
 	}
+	if codeIntent {
+		return TaskCode
+	}
 
-	return TaskCode
+	return TaskExplain
 }
 
 func containsAny(input string, keywords ...string) bool {
