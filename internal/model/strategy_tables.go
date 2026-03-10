@@ -63,12 +63,19 @@ type powerEnsemble struct {
 // Design rule: Judge ∉ Generators so evaluation is always cross-model.
 var powerEnsembleTable map[BuildPhase]powerEnsemble
 
+// contextBudgetTable maps (provider, tier) → context budget in chars for repo context.
+var contextBudgetTable map[string]map[ModelTier]int
+
+// DefaultContextBudget is the fallback when no budget is configured.
+const DefaultContextBudget = 3000
+
 // rawDefaults is the JSON schema for defaults.json and user overrides.
 type rawDefaults struct {
 	Models          map[string]map[string]string     `json:"models"`
 	Costs           map[string]costEntry             `json:"costs"`
 	Strategies      map[string]map[string]rawStrategy `json:"strategies"`
 	BuildStrategies map[string]map[string]rawBuild   `json:"build_strategies"`
+	ContextBudgets  map[string]map[string]int        `json:"context_budgets"`
 	PowerEnsemble   map[string]rawEnsemble           `json:"power_ensemble"`
 }
 
@@ -171,6 +178,18 @@ func loadDefaults(data []byte) error {
 				}
 			}
 			buildStrategyTable[mode] = m
+		}
+	}
+
+	// Context budgets
+	if raw.ContextBudgets != nil {
+		contextBudgetTable = make(map[string]map[ModelTier]int, len(raw.ContextBudgets))
+		for prov, tiers := range raw.ContextBudgets {
+			m := make(map[ModelTier]int, len(tiers))
+			for tierName, budget := range tiers {
+				m[parseTier(tierName)] = budget
+			}
+			contextBudgetTable[prov] = m
 		}
 	}
 
@@ -300,4 +319,29 @@ func validateStrategyTables() error {
 	}
 
 	return nil
+}
+
+// ContextBudgetForProvider returns the context budget (in chars) for a given
+// provider and tier. Returns defaultContextBudget when no entry is configured.
+func ContextBudgetForProvider(provider string, tier ModelTier) int {
+	if tiers, ok := contextBudgetTable[provider]; ok {
+		if budget, ok := tiers[tier]; ok {
+			return budget
+		}
+	}
+	return DefaultContextBudget
+}
+
+// ContextBudgetForMode returns the context budget (in chars) for the first
+// provider in the strategy table entry for the given (mode, task) combination.
+// Returns defaultContextBudget when no matching strategy entry exists.
+func ContextBudgetForMode(mode UsageMode, task TaskType) int {
+	if tasks, ok := strategyTable[mode]; ok {
+		if entry, ok := tasks[task]; ok {
+			if len(entry.Providers) > 0 {
+				return ContextBudgetForProvider(entry.Providers[0], entry.Tier)
+			}
+		}
+	}
+	return DefaultContextBudget
 }

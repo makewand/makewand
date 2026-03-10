@@ -27,6 +27,11 @@ type CLIProvider struct {
 	buildCmd func(ctx context.Context, prompt string) *exec.Cmd
 	checkCmd func(ctx context.Context) *exec.Cmd
 
+	// jsonOutput indicates the CLI is invoked with a JSON output flag.
+	// When true, chatAttempt tries parseJSONResponse before falling back to text.
+	jsonOutput       bool
+	parseJSONResponse func(raw []byte) (content string, usage *Usage, err error)
+
 	mu            sync.Mutex
 	cachedAvail   bool
 	cachedAvailAt time.Time
@@ -73,12 +78,14 @@ var transientCLIErrorHints = []string{
 // NewClaudeCLI creates a provider that uses `claude -p` (Claude Code CLI).
 func NewClaudeCLI(binPath string) *CLIProvider {
 	p := &CLIProvider{
-		name:     "claude-cli",
-		binPath:  binPath,
-		provider: "claude",
+		name:              "claude-cli",
+		binPath:           binPath,
+		provider:          "claude",
+		jsonOutput:        true,
+		parseJSONResponse: parseClaudeCLIJSON,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, binPath, "-p", prompt)
+		cmd := exec.CommandContext(ctx, binPath, "-p", prompt, "--output-format", "json")
 		// Unset CLAUDECODE to allow nested invocation from within Claude Code
 		cmd.Env = filterEnv(cmd.Environ(), "CLAUDECODE")
 		return cmd
@@ -96,12 +103,14 @@ func NewClaudeCLI(binPath string) *CLIProvider {
 // NewGeminiCLI creates a provider that uses `gemini -p` (Gemini CLI).
 func NewGeminiCLI(binPath string) *CLIProvider {
 	p := &CLIProvider{
-		name:     "gemini-cli",
-		binPath:  binPath,
-		provider: "gemini",
+		name:              "gemini-cli",
+		binPath:           binPath,
+		provider:          "gemini",
+		jsonOutput:        true,
+		parseJSONResponse: parseGeminiCLIJSON,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, binPath, "-p", prompt, "--sandbox", "false")
+		cmd := exec.CommandContext(ctx, binPath, "-p", prompt, "--sandbox", "false", "--output-format", "json")
 		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
 		return cmd
 	}
@@ -259,14 +268,28 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 	attempts := 0
 	for {
 		attempts++
-		content, err := c.chatAttempt(ctx, prompt)
+		content, jsonUsage, err := c.chatAttempt(ctx, prompt)
 		if err == nil {
-			usage := Usage{
-				InputTokens:  estimateTokens(prompt),
-				OutputTokens: estimateTokens(content),
-				Cost:         0, // Subscription — no per-token cost
-				Model:        c.provider + "-cli",
-				Provider:     c.provider,
+			var usage Usage
+			if jsonUsage != nil {
+				// Use real usage from structured JSON output.
+				usage = *jsonUsage
+				// Ensure provider fields are set even if the parser omitted them.
+				if usage.Provider == "" {
+					usage.Provider = c.provider
+				}
+				if usage.Model == "" {
+					usage.Model = c.provider + "-cli"
+				}
+			} else {
+				// Fallback to heuristic estimation (codex, or JSON parse failure).
+				usage = Usage{
+					InputTokens:  estimateTokens(prompt),
+					OutputTokens: estimateTokens(content),
+					Cost:         0, // Subscription — no per-token cost
+					Model:        c.provider + "-cli",
+					Provider:     c.provider,
+				}
 			}
 			return content, usage, nil
 		}
@@ -378,13 +401,112 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 	return ch, nil
 }
 
+// --- JSON Output Parsing ---
+
+// claudeCLIJSON represents the structured JSON output from `claude -p --output-format json`.
+type claudeCLIJSON struct {
+	Result       string  `json:"result"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	Usage        struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+	// modelUsage maps model name to per-model stats; we pick the first entry.
+	ModelUsage map[string]struct {
+		InputTokens  int     `json:"inputTokens"`
+		OutputTokens int     `json:"outputTokens"`
+		CostUSD      float64 `json:"costUSD"`
+	} `json:"modelUsage"`
+}
+
+// parseClaudeCLIJSON extracts the response text and real usage from Claude CLI JSON output.
+func parseClaudeCLIJSON(raw []byte) (string, *Usage, error) {
+	var resp claudeCLIJSON
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", nil, err
+	}
+	content := strings.TrimSpace(resp.Result)
+	if content == "" {
+		return "", nil, fmt.Errorf("empty result in claude JSON response")
+	}
+
+	usage := &Usage{
+		InputTokens:  resp.Usage.InputTokens,
+		OutputTokens: resp.Usage.OutputTokens,
+		Cost:         resp.TotalCostUSD,
+		Provider:     "claude",
+	}
+
+	// Extract model name and per-model cost from modelUsage if available.
+	for modelName, mu := range resp.ModelUsage {
+		usage.Model = modelName
+		if mu.InputTokens > 0 {
+			usage.InputTokens = mu.InputTokens
+		}
+		if mu.OutputTokens > 0 {
+			usage.OutputTokens = mu.OutputTokens
+		}
+		if mu.CostUSD > 0 {
+			usage.Cost = mu.CostUSD
+		}
+		break // Take the first (usually only) model entry.
+	}
+
+	return content, usage, nil
+}
+
+// geminiCLIJSON represents the structured JSON output from `gemini -p --output-format json`.
+type geminiCLIJSON struct {
+	Response string `json:"response"`
+	Stats    struct {
+		Models map[string]struct {
+			Tokens struct {
+				Input      int `json:"input"`
+				Candidates int `json:"candidates"`
+				Total      int `json:"total"`
+			} `json:"tokens"`
+		} `json:"models"`
+	} `json:"stats"`
+}
+
+// parseGeminiCLIJSON extracts the response text and real usage from Gemini CLI JSON output.
+func parseGeminiCLIJSON(raw []byte) (string, *Usage, error) {
+	var resp geminiCLIJSON
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", nil, err
+	}
+	content := strings.TrimSpace(resp.Response)
+	if content == "" {
+		return "", nil, fmt.Errorf("empty response in gemini JSON response")
+	}
+
+	usage := &Usage{
+		Provider: "gemini",
+		Cost:     0, // Gemini CLI is free-tier; no per-token cost.
+	}
+
+	// Aggregate token counts across all models used in the session.
+	var totalInput, totalOutput int
+	var modelName string
+	for name, m := range resp.Stats.Models {
+		totalInput += m.Tokens.Input
+		totalOutput += m.Tokens.Candidates
+		modelName = name // Keep last model name as representative.
+	}
+	usage.InputTokens = totalInput
+	usage.OutputTokens = totalOutput
+	usage.Model = modelName
+
+	return content, usage, nil
+}
+
 // --- Helpers ---
 
 func shouldSurfaceContextError(ctxErr error) bool {
 	return errors.Is(ctxErr, context.DeadlineExceeded)
 }
 
-func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, error) {
+func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, *Usage, error) {
 	cmd := c.buildCmd(ctx, prompt)
 	setCLIProcessGroup(cmd)
 
@@ -394,7 +516,7 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, e
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		return "", newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
+		return "", nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
 	done := make(chan error, 1)
@@ -412,15 +534,29 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, e
 
 	duration := time.Since(start)
 	if runErr != nil {
-		return "", formatCLIExecutionError(c.provider, stderr.String(), runErr, ctx.Err(), duration)
+		return "", nil, formatCLIExecutionError(c.provider, stderr.String(), runErr, ctx.Err(), duration)
 	}
 
-	content := strings.TrimSpace(stdout.String())
+	raw := stdout.Bytes()
+
+	// Try structured JSON parsing when the CLI was invoked with a JSON output flag.
+	if c.jsonOutput && c.parseJSONResponse != nil {
+		content, usage, err := c.parseJSONResponse(raw)
+		if err == nil && content != "" {
+			if reject, reason := shouldRejectCLIOutput(prompt, content); reject {
+				return "", nil, newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
+			}
+			return content, usage, nil
+		}
+		// JSON parse failed — fall back to text mode below.
+	}
+
+	content := strings.TrimSpace(string(raw))
 	content = stripANSI(content)
 	if reject, reason := shouldRejectCLIOutput(prompt, content); reject {
-		return "", newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
+		return "", nil, newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
 	}
-	return content, nil
+	return content, nil, nil
 }
 
 func shouldRejectCLIOutput(prompt, content string) (bool, string) {

@@ -79,7 +79,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 
 	messages := a.chat.ToModelMessages()
 	task := classifyTask(input)
-	systemPrompt := buildSystemPrompt(a.project, task)
+	systemPrompt := buildSystemPrompt(a.project, task, a.router.Mode())
 
 	ctx, cancel := context.WithTimeout(context.Background(), chatStreamTimeout)
 	a.cancelAI = cancel

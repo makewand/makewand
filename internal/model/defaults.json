@@ -67,6 +67,11 @@
       "fix":    { "tier": "premium", "primary": "codex",  "fallbacks": ["claude", "gemini"] }
     }
   },
+  "context_budgets": {
+    "claude": { "cheap": 4000, "mid": 10000, "premium": 15000 },
+    "codex":  { "cheap": 4000, "mid": 6000, "premium": 8000 },
+    "gemini": { "cheap": 20000, "mid": 30000, "premium": 50000 }
+  },
   "power_ensemble": {
     "plan":   { "generators": ["gemini", "claude"], "judge": "codex" },
     "code":   { "generators": ["claude", "codex"],  "judge": "gemini" },
