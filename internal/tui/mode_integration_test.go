@@ -106,8 +106,8 @@ func TestMode_FreeBuild_UsesGemini(t *testing.T) {
 	resp := buildAIResponseWithFiles("gemini", "index.js")
 	app = driveMessages(t, app, resp)
 
-	if app.buildCodeProvider != "gemini" {
-		t.Errorf("buildCodeProvider = %q, want %q", app.buildCodeProvider, "gemini")
+	if app.pipeline.CodeProvider() != "gemini" {
+		t.Errorf("buildCodeProvider = %q, want %q", app.pipeline.CodeProvider(), "gemini")
 	}
 }
 
@@ -127,7 +127,7 @@ func TestMode_FreeBuild_NoAPIFallbackOnError(t *testing.T) {
 
 func TestMode_EconomyBuild_ReviewLGTM(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModeFast)
-	app.buildCodeProvider = "gemini"
+	app.pipeline.SetCodeProvider("gemini")
 
 	// Code step already done; simulate review returning LGTM.
 	review := codeReviewMsg{
@@ -144,7 +144,7 @@ func TestMode_EconomyBuild_ReviewLGTM(t *testing.T) {
 
 func TestMode_BalancedBuild_ReviewFindsIssues(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModeBalanced)
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Review returns fix files.
 	fixContent := "Found issues:\n--- FILE: index.js ---\n```\nconsole.log('fixed');\n```\n"
@@ -174,7 +174,7 @@ func TestMode_BalancedBuild_ReviewFindsIssues(t *testing.T) {
 
 func TestMode_BalancedBuild_ReviewFixDeclined(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModeBalanced)
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Simulate review fix files arriving.
 	app = driveMessages(t, app, filesExtractedMsg{
@@ -201,7 +201,7 @@ func TestMode_PowerBuild_SingleProviderSkipsReview(t *testing.T) {
 	// NewRouter with default config has no providers → Available() returns empty.
 	// We keep the default router which has no providers.
 	app.router = model.NewRouter(config.DefaultConfig())
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Simulate file write complete in build phase.
 	app.pendingPhase = pendingPhaseBuild
@@ -223,10 +223,10 @@ func TestMode_PowerBuild_SingleProviderSkipsReview(t *testing.T) {
 
 func TestMode_AutoFixCycle_SuccessAfterOneRetry(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModeBalanced)
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Simulate auto-fix attempt 1 triggering.
-	app.autoFixAttempt = 1
+	app.pipeline.OnAutoFixAttempt(1)
 
 	// Auto-fix response with fix files.
 	fixContent := "--- FILE: index.js ---\n```\nconsole.log('auto-fixed');\n```\n"
@@ -239,8 +239,8 @@ func TestMode_AutoFixCycle_SuccessAfterOneRetry(t *testing.T) {
 	m, cmd := app.Update(fixResp)
 	app = m.(App)
 
-	if app.autoFixRetryAttempt != 1 {
-		t.Errorf("autoFixRetryAttempt = %d, want 1", app.autoFixRetryAttempt)
+	if app.pipeline.AutoFixRetryAttempt() != 1 {
+		t.Errorf("autoFixRetryAttempt = %d, want 1", app.pipeline.AutoFixRetryAttempt())
 	}
 	if cmd == nil {
 		t.Fatal("expected filesExtractedMsg command for fix files")

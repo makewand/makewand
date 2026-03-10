@@ -17,7 +17,9 @@ import (
 	"github.com/makewand/makewand/internal/model"
 )
 
-const maxAutoFixRetries = 3
+// maxAutoFixRetries is a local alias for the pipeline constant, used in i18n
+// messages and progress labels that reference the retry limit.
+var maxAutoFixRetries = engine.MaxAutoFixRetries
 
 // Build pipeline step indices (5-step progress).
 const (
@@ -71,19 +73,16 @@ type App struct {
 	// Cancellable AI context
 	cancelAI context.CancelFunc
 
-	// Build pipeline state
-	pendingFiles        []engine.ExtractedFile // files waiting to be written
-	pendingPhase        pendingPhaseType       // which phase triggered the pending files
-	state               AppState               // current interaction state
-	depsInstallApproved bool                   // user approved dependency installation
-	testsRunApproved    bool                   // user approved running tests
-	pendingDepsPlan     *engine.ExecPlan       // detected dependency install command
-	pendingTestsPlan    *engine.ExecPlan       // detected test execution command
-	autoFixAttempt      int                    // current auto-fix attempt
-	autoFixRetryAttempt int                    // attempt number for retry after file write
-	buildCodeProvider   string                 // provider that generated code
-	buildReviewProvider string                 // provider that reviewed code
-	pendingApproval     *approvalRequest       // current approval request, if any
+	// Build pipeline domain logic (phase transitions, retry counting, provider tracking).
+	pipeline *engine.BuildPipeline
+
+	// Build pipeline TUI state (files, plans, approvals — owned by TUI layer).
+	pendingFiles     []engine.ExtractedFile // files waiting to be written
+	pendingPhase     pendingPhaseType       // which phase triggered the pending files
+	state            AppState               // current interaction state
+	pendingDepsPlan  *engine.ExecPlan       // detected dependency install command
+	pendingTestsPlan *engine.ExecPlan       // detected test execution command
+	pendingApproval  *approvalRequest       // current approval request, if any
 
 	// State
 	width  int
@@ -225,6 +224,7 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 		mode:     mode,
 		cfg:      cfg,
 		router:   router,
+		pipeline: engine.NewBuildPipeline(),
 		chat:     NewChatPanel(),
 		fileTree: NewFileTreePanel(),
 		progress: NewProgressPanel(),
