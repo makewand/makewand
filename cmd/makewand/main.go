@@ -53,6 +53,9 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 			}
 
 			if rootModeFlag != "" {
+				if _, ok := model.ParseUsageMode(rootModeFlag); !ok {
+					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", rootModeFlag)
+				}
 				cfg.UsageMode = rootModeFlag
 			}
 
@@ -109,6 +112,9 @@ func newCmd() *cobra.Command {
 			}
 
 			if modeFlag != "" {
+				if _, ok := model.ParseUsageMode(modeFlag); !ok {
+					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
+				}
 				cfg.UsageMode = modeFlag
 			}
 
@@ -137,6 +143,9 @@ func chatCmd() *cobra.Command {
 			}
 
 			if modeFlag != "" {
+				if _, ok := model.ParseUsageMode(modeFlag); !ok {
+					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
+				}
 				cfg.UsageMode = modeFlag
 			}
 
