@@ -30,12 +30,13 @@ const wizardBuildRetryRules = "Important output rules:\n" +
 	"2. Do NOT include explanations, bullet lists, or shell commands.\n" +
 	"3. Include all files required to run the project."
 
-const maxSystemPromptFileTreeLines = 220
-const maxSystemPromptFileTreeChars = 10000
+const defaultMaxSystemPromptFileTreeLines = 220
+const defaultMaxSystemPromptFileTreeChars = 10000
 
 // buildSystemPrompt constructs the system prompt for chat mode, including the current
-// project's file tree when available.
-func buildSystemPrompt(project *engine.Project, task model.TaskType) string {
+// project's file tree when available. The mode parameter controls the context budget
+// allocated to repo context based on the target provider's context window.
+func buildSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode) string {
 	prompt := `You are makewand, a multi-provider coding assistant for terminal-based development workflows.
 
 Guidelines:
@@ -50,9 +51,22 @@ Guidelines:
 - Provide actionable code and clear reasoning`
 
 	if project != nil {
+		budget := model.ContextBudgetForMode(mode, task)
+
+		// Scale file tree limits proportionally to context budget.
+		scale := float64(budget) / float64(model.DefaultContextBudget)
+		maxTreeLines := int(float64(defaultMaxSystemPromptFileTreeLines) * scale)
+		maxTreeChars := int(float64(defaultMaxSystemPromptFileTreeChars) * scale)
+		if maxTreeLines < defaultMaxSystemPromptFileTreeLines {
+			maxTreeLines = defaultMaxSystemPromptFileTreeLines
+		}
+		if maxTreeChars < defaultMaxSystemPromptFileTreeChars {
+			maxTreeChars = defaultMaxSystemPromptFileTreeChars
+		}
+
 		prompt += fmt.Sprintf("\n\nCurrent project: %s\n", project.Name)
 		if includeProjectTreeForTask(task) {
-			if tree := compactProjectTreeForPrompt(project.Files, maxSystemPromptFileTreeLines, maxSystemPromptFileTreeChars); tree != "" {
+			if tree := compactProjectTreeForPrompt(project.Files, maxTreeLines, maxTreeChars); tree != "" {
 				prompt += "\nProject files:\n" + tree
 			}
 		} else {
@@ -61,7 +75,7 @@ Guidelines:
 
 		// Append repo context (rules, symbols, file hints) when available.
 		if rc, err := engine.LoadRepoContext(project.Path, project.Files); err == nil {
-			if ctx := rc.ForPrompt(3000); ctx != "" {
+			if ctx := rc.ForPrompt(budget); ctx != "" {
 				prompt += ctx
 			}
 		}

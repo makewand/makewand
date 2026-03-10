@@ -487,3 +487,254 @@ func TestApplyGeminiProxyPolicy_ExplicitBypassOverridesProxy(t *testing.T) {
 		t.Fatalf("applyGeminiProxyPolicy() should force NO_PROXY when bypass is set; got %q", joined)
 	}
 }
+
+// --- JSON Output Parsing Tests ---
+
+func TestParseClaudeCLIJSON_ValidResponse(t *testing.T) {
+	raw := []byte(`{
+		"type": "result",
+		"subtype": "success",
+		"result": "Hello! How can I help you today?",
+		"total_cost_usd": 0.10739,
+		"usage": {
+			"input_tokens": 3,
+			"output_tokens": 12
+		},
+		"modelUsage": {
+			"claude-opus-4-6": {
+				"inputTokens": 3,
+				"outputTokens": 12,
+				"costUSD": 0.10739
+			}
+		}
+	}`)
+
+	content, usage, err := parseClaudeCLIJSON(raw)
+	if err != nil {
+		t.Fatalf("parseClaudeCLIJSON() error = %v", err)
+	}
+	if content != "Hello! How can I help you today?" {
+		t.Fatalf("content = %q, want greeting", content)
+	}
+	if usage == nil {
+		t.Fatal("usage = nil, want non-nil")
+	}
+	if usage.InputTokens != 3 {
+		t.Fatalf("InputTokens = %d, want 3", usage.InputTokens)
+	}
+	if usage.OutputTokens != 12 {
+		t.Fatalf("OutputTokens = %d, want 12", usage.OutputTokens)
+	}
+	if usage.Cost < 0.10 {
+		t.Fatalf("Cost = %f, want >= 0.10", usage.Cost)
+	}
+	if usage.Model != "claude-opus-4-6" {
+		t.Fatalf("Model = %q, want claude-opus-4-6", usage.Model)
+	}
+	if usage.Provider != "claude" {
+		t.Fatalf("Provider = %q, want claude", usage.Provider)
+	}
+}
+
+func TestParseClaudeCLIJSON_MinimalResponse(t *testing.T) {
+	raw := []byte(`{"result": "Hi", "total_cost_usd": 0.001, "usage": {"input_tokens": 1, "output_tokens": 2}}`)
+	content, usage, err := parseClaudeCLIJSON(raw)
+	if err != nil {
+		t.Fatalf("parseClaudeCLIJSON() error = %v", err)
+	}
+	if content != "Hi" {
+		t.Fatalf("content = %q, want Hi", content)
+	}
+	if usage.InputTokens != 1 || usage.OutputTokens != 2 {
+		t.Fatalf("usage tokens = %d/%d, want 1/2", usage.InputTokens, usage.OutputTokens)
+	}
+	if usage.Cost != 0.001 {
+		t.Fatalf("Cost = %f, want 0.001", usage.Cost)
+	}
+}
+
+func TestParseClaudeCLIJSON_EmptyResult(t *testing.T) {
+	raw := []byte(`{"result": "", "usage": {"input_tokens": 1, "output_tokens": 0}}`)
+	_, _, err := parseClaudeCLIJSON(raw)
+	if err == nil {
+		t.Fatal("parseClaudeCLIJSON() error = nil, want error for empty result")
+	}
+}
+
+func TestParseClaudeCLIJSON_InvalidJSON(t *testing.T) {
+	_, _, err := parseClaudeCLIJSON([]byte(`not json at all`))
+	if err == nil {
+		t.Fatal("parseClaudeCLIJSON() error = nil, want error for invalid JSON")
+	}
+}
+
+func TestParseGeminiCLIJSON_ValidResponse(t *testing.T) {
+	raw := []byte(`{
+		"session_id": "abc123",
+		"response": "Hello. I am ready to assist.",
+		"stats": {
+			"models": {
+				"gemini-2.5-flash-lite": {
+					"tokens": {
+						"input": 3280,
+						"candidates": 27,
+						"total": 3442
+					}
+				},
+				"gemini-3-flash-preview": {
+					"tokens": {
+						"input": 7346,
+						"candidates": 13,
+						"total": 7853
+					}
+				}
+			}
+		}
+	}`)
+
+	content, usage, err := parseGeminiCLIJSON(raw)
+	if err != nil {
+		t.Fatalf("parseGeminiCLIJSON() error = %v", err)
+	}
+	if content != "Hello. I am ready to assist." {
+		t.Fatalf("content = %q, want greeting", content)
+	}
+	if usage == nil {
+		t.Fatal("usage = nil, want non-nil")
+	}
+	// Aggregated across both models: 3280 + 7346 = 10626
+	if usage.InputTokens != 10626 {
+		t.Fatalf("InputTokens = %d, want 10626", usage.InputTokens)
+	}
+	// Aggregated output: 27 + 13 = 40
+	if usage.OutputTokens != 40 {
+		t.Fatalf("OutputTokens = %d, want 40", usage.OutputTokens)
+	}
+	if usage.Cost != 0 {
+		t.Fatalf("Cost = %f, want 0 (free tier)", usage.Cost)
+	}
+	if usage.Provider != "gemini" {
+		t.Fatalf("Provider = %q, want gemini", usage.Provider)
+	}
+}
+
+func TestParseGeminiCLIJSON_SingleModel(t *testing.T) {
+	raw := []byte(`{
+		"response": "Done.",
+		"stats": {
+			"models": {
+				"gemini-2.5-pro": {
+					"tokens": {"input": 500, "candidates": 100, "total": 600}
+				}
+			}
+		}
+	}`)
+
+	content, usage, err := parseGeminiCLIJSON(raw)
+	if err != nil {
+		t.Fatalf("parseGeminiCLIJSON() error = %v", err)
+	}
+	if content != "Done." {
+		t.Fatalf("content = %q, want Done.", content)
+	}
+	if usage.InputTokens != 500 || usage.OutputTokens != 100 {
+		t.Fatalf("usage tokens = %d/%d, want 500/100", usage.InputTokens, usage.OutputTokens)
+	}
+	if usage.Model != "gemini-2.5-pro" {
+		t.Fatalf("Model = %q, want gemini-2.5-pro", usage.Model)
+	}
+}
+
+func TestParseGeminiCLIJSON_EmptyResponse(t *testing.T) {
+	raw := []byte(`{"response": "", "stats": {"models": {}}}`)
+	_, _, err := parseGeminiCLIJSON(raw)
+	if err == nil {
+		t.Fatal("parseGeminiCLIJSON() error = nil, want error for empty response")
+	}
+}
+
+func TestParseGeminiCLIJSON_InvalidJSON(t *testing.T) {
+	_, _, err := parseGeminiCLIJSON([]byte(`{broken`))
+	if err == nil {
+		t.Fatal("parseGeminiCLIJSON() error = nil, want error for invalid JSON")
+	}
+}
+
+func TestCLIProvider_Chat_JSONFallbackToText(t *testing.T) {
+	// Simulate a CLI that returns plain text even though jsonOutput is enabled.
+	// The provider should fall back to text parsing gracefully.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "plain-text-cli.sh")
+	body := "#!/bin/sh\n" +
+		"echo 'Hello from plain text'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := &CLIProvider{
+		name:              "test-json-fallback",
+		binPath:           script,
+		provider:          "testprov",
+		jsonOutput:        true,
+		parseJSONResponse: parseClaudeCLIJSON, // Will fail on plain text
+	}
+	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		return exec.CommandContext(ctx, script)
+	}
+
+	content, usage, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
+	if err != nil {
+		t.Fatalf("Chat() error = %v, want fallback success", err)
+	}
+	if !strings.Contains(content, "Hello from plain text") {
+		t.Fatalf("content = %q, want plain text output", content)
+	}
+	// Fallback should use estimated tokens, not JSON usage.
+	if usage.InputTokens == 0 {
+		t.Fatal("usage.InputTokens = 0, want estimated tokens from fallback")
+	}
+	if usage.Provider != "testprov" {
+		t.Fatalf("usage.Provider = %q, want testprov", usage.Provider)
+	}
+}
+
+func TestCLIProvider_Chat_JSONUsageUsedWhenAvailable(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "json-cli.sh")
+	body := "#!/bin/sh\n" +
+		`printf '{"result":"JSON hello","total_cost_usd":0.05,"usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"test-model":{"inputTokens":10,"outputTokens":5,"costUSD":0.05}}}'` + "\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := &CLIProvider{
+		name:              "test-json-cli",
+		binPath:           script,
+		provider:          "claude",
+		jsonOutput:        true,
+		parseJSONResponse: parseClaudeCLIJSON,
+	}
+	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		return exec.CommandContext(ctx, script)
+	}
+
+	content, usage, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if content != "JSON hello" {
+		t.Fatalf("content = %q, want JSON hello", content)
+	}
+	if usage.InputTokens != 10 {
+		t.Fatalf("InputTokens = %d, want 10 (from JSON)", usage.InputTokens)
+	}
+	if usage.OutputTokens != 5 {
+		t.Fatalf("OutputTokens = %d, want 5 (from JSON)", usage.OutputTokens)
+	}
+	if usage.Cost != 0.05 {
+		t.Fatalf("Cost = %f, want 0.05 (from JSON)", usage.Cost)
+	}
+	if usage.Model != "test-model" {
+		t.Fatalf("Model = %q, want test-model", usage.Model)
+	}
+}
