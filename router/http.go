@@ -63,6 +63,14 @@ type httpErrorBody struct {
 	Code    string `json:"code"`
 }
 
+// HTTPHandlerOptions configures the HTTP facade behavior.
+type HTTPHandlerOptions struct {
+	// BearerToken enables authentication when non-empty.
+	// Requests must include "Authorization: Bearer <token>" to proceed.
+	// The /health endpoint is always unauthenticated.
+	BearerToken string
+}
+
 // HTTPHandler returns an http.Handler that serves an OpenAI-compatible
 // /v1/chat/completions endpoint backed by this Router.
 //
@@ -71,15 +79,37 @@ type httpErrorBody struct {
 //   - Automatic task classification from message content
 //   - Provider routing via the Router's strategy tables
 //   - GET /v1/models lists available providers
-func (r *Router) HTTPHandler() http.Handler {
+//   - Optional Bearer token authentication
+func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
+	var opt HTTPHandlerOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", r.handleChatCompletions)
-	mux.HandleFunc("/v1/models", r.handleListModels)
+	mux.HandleFunc("/v1/chat/completions", r.requireAuth(opt.BearerToken, r.handleChatCompletions))
+	mux.HandleFunc("/v1/models", r.requireAuth(opt.BearerToken, r.handleListModels))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 	return mux
+}
+
+// requireAuth wraps a handler with Bearer token authentication.
+// When token is empty, the handler is returned as-is (no auth required).
+func (r *Router) requireAuth(token string, next http.HandlerFunc) http.HandlerFunc {
+	if token == "" {
+		return next
+	}
+	expected := "Bearer " + token
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != expected {
+			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing Bearer token")
+			return
+		}
+		next(w, req)
+	}
 }
 
 func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request) {

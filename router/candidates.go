@@ -51,7 +51,7 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 	for i, provName := range orderedProviders {
 		modelID := getModelID(provName, entry.Tier)
 
-		access := r.accessTypes[provName]
+		access := r.getAccessType(provName)
 
 		// Prior bias encodes static table preference:
 		// position 0 (primary) → bias 2.0, position 1 → 1.0, position 2+ → 0.0.
@@ -97,7 +97,7 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 	mode := r.effectiveMode()
 	candidates := make([]candidate, 0, len(orderedProviders))
 	for i, provName := range orderedProviders {
-		access := r.accessTypes[provName]
+		access := r.getAccessType(provName)
 		modelID := getModelID(provName, bs.Tier)
 
 		priorBias := 0.0
