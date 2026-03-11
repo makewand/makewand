@@ -10,6 +10,50 @@ import (
 	"github.com/makewand/makewand/internal/config"
 )
 
+// --- Task context propagation ---
+// These helpers let CLI providers adapt behavior per-task (e.g. codex review vs exec).
+
+type taskContextKey struct{}
+
+// ContextWithTask returns a new context carrying the given TaskType.
+func ContextWithTask(ctx context.Context, task TaskType) context.Context {
+	return context.WithValue(ctx, taskContextKey{}, task)
+}
+
+// TaskFromContext retrieves the TaskType from context, if present.
+func TaskFromContext(ctx context.Context) (TaskType, bool) {
+	t, ok := ctx.Value(taskContextKey{}).(TaskType)
+	return t, ok
+}
+
+type systemContextKey struct{}
+
+// ContextWithSystem returns a new context carrying the system prompt.
+// Used by CLI providers that support a dedicated system prompt flag.
+func ContextWithSystem(ctx context.Context, system string) context.Context {
+	return context.WithValue(ctx, systemContextKey{}, system)
+}
+
+// SystemFromContext retrieves the system prompt from context, if present.
+func SystemFromContext(ctx context.Context) (string, bool) {
+	s, ok := ctx.Value(systemContextKey{}).(string)
+	return s, ok && s != ""
+}
+
+type modelContextKey struct{}
+
+// ContextWithModel returns a new context carrying the target model ID.
+// CLI providers that support --model use this for per-call model selection.
+func ContextWithModel(ctx context.Context, modelID string) context.Context {
+	return context.WithValue(ctx, modelContextKey{}, modelID)
+}
+
+// ModelFromContext retrieves the model ID from context, if present and non-empty.
+func ModelFromContext(ctx context.Context) (string, bool) {
+	m, ok := ctx.Value(modelContextKey{}).(string)
+	return m, ok && m != ""
+}
+
 // TaskType categorizes what kind of AI task is being performed.
 type TaskType int
 
@@ -495,7 +539,7 @@ func (r *Router) Chat(ctx context.Context, task TaskType, messages []Message, sy
 	}
 
 	ac := &attemptContext{
-		ctx:       ctx,
+		ctx:       ContextWithTask(ctx, task),
 		messages:  messages,
 		system:    system,
 		maxTokens: MaxTokensForTask(task),
@@ -681,8 +725,19 @@ func (r *Router) ChatWith(ctx context.Context, name string, phase BuildPhase, me
 
 	fallbacks, tier := r.chatWithFallbackCandidates(phase, result.Actual, exclude)
 
+	// Map build phase to task type for provider-specific behavior.
+	taskForPhase := TaskCode
+	switch phase {
+	case PhaseReview:
+		taskForPhase = TaskReview
+	case PhasePlan:
+		taskForPhase = TaskAnalyze
+	case PhaseFix:
+		taskForPhase = TaskFix
+	}
+
 	ac := &attemptContext{
-		ctx:        ctx,
+		ctx:        ContextWithTask(ctx, taskForPhase),
 		messages:   messages,
 		system:     system,
 		maxTokens:  maxTokensForPhase(phase),
@@ -709,7 +764,7 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 	}
 
 	ac := &attemptContext{
-		ctx:       ctx,
+		ctx:       ContextWithTask(ctx, task),
 		messages:  messages,
 		system:    system,
 		maxTokens: MaxTokensForTask(task),
