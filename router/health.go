@@ -95,19 +95,37 @@ func buildPhaseAttemptTimeout(phase BuildPhase) time.Duration {
 }
 
 func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) time.Duration {
-	maxDur := buildPhaseAttemptTimeout(phase)
 	provider = strings.ToLower(strings.TrimSpace(provider))
 
-	// Fast mode keeps conservative caps for slower providers to preserve
-	// fallback budget, but allows longer code-generation windows than review/fix.
+	// Fast mode: tight per-attempt budgets to fail fast and preserve fallback room.
 	if mode == ModeFast {
-		if provider == "gemini" {
-			if phase == PhaseCode && maxDur > 120*time.Second {
-				maxDur = 120 * time.Second
-			}
+		switch phase {
+		case PhaseCode:
+			return 45 * time.Second
+		case PhaseReview:
+			return 35 * time.Second
+		default:
+			return 30 * time.Second
 		}
 	}
-	return maxDur
+
+	// Balanced mode: moderate budgets — shorter than default for review/plan.
+	if mode == ModeBalanced {
+		switch phase {
+		case PhaseCode:
+			return 90 * time.Second
+		case PhaseReview:
+			return 40 * time.Second
+		case PhaseFix:
+			return 45 * time.Second
+		default:
+			return 60 * time.Second
+		}
+	}
+
+	// Power mode: generous budgets — ensemble calls are parallel so total wall
+	// time is bounded by the slowest provider, not the sum.
+	return buildPhaseAttemptTimeout(phase)
 }
 
 func withProviderAttemptTimeoutFor(ctx context.Context, mode UsageMode, phase BuildPhase, provider string) (context.Context, context.CancelFunc) {
