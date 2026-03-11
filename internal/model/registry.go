@@ -45,11 +45,11 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 		}
 	}
 
-	resolver, ok := getProviderResolver(providerName)
+	factory, ok := getProviderFactory(providerName)
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
 	}
-	p, err := resolver(r.cfg, modelID)
+	p, err := factory(modelID)
 	if err != nil {
 		return nil, err
 	}

@@ -119,6 +119,33 @@ func MaxTokensForTask(task TaskType) int {
 	}
 }
 
+// ProviderEntry describes a pre-constructed provider with its access type.
+type ProviderEntry struct {
+	Provider Provider
+	Access   AccessType
+}
+
+// RouterConfig provides configuration for creating a Router without depending
+// on the config package. Library consumers use this directly.
+type RouterConfig struct {
+	// Providers maps provider names to pre-constructed provider instances.
+	Providers map[string]ProviderEntry
+
+	// Legacy model assignment (for routeLegacy when mode is not set).
+	DefaultModel  string
+	AnalysisModel string
+	CodingModel   string
+	ReviewModel   string
+
+	// UsageMode is the initial mode ("fast", "balanced", "power").
+	// Empty string means legacy routing (no mode).
+	UsageMode string
+
+	// ConfigDir is the directory for routing.json overrides and stats persistence.
+	// Empty string disables file-based overrides.
+	ConfigDir string
+}
+
 // providerKey is used to cache provider instances by (name, modelID).
 type providerKey struct {
 	name    string
@@ -127,7 +154,14 @@ type providerKey struct {
 
 // Router selects the best model provider for a given task.
 type Router struct {
-	cfg       *config.Config
+	// legacyModels stores model names for legacy (non-mode) routing.
+	legacyModels struct {
+		defaultModel  string
+		analysisModel string
+		codingModel   string
+		reviewModel   string
+	}
+
 	providers map[string]Provider
 
 	// Provider cache for mode-based routing (provider+model → instance)
@@ -158,16 +192,14 @@ type Router struct {
 
 const availCacheTTL = 10 * time.Second
 
-// NewRouter creates a new model router with configured providers.
-// It loads user routing overrides from configDir/routing.json if present.
-func NewRouter(cfg *config.Config) *Router {
-	// Load user routing overrides (best-effort; errors are silently ignored).
-	if dir, err := config.ConfigDir(); err == nil {
-		_ = LoadUserOverrides(dir)
+// NewRouterFromConfig creates a Router from a config-free RouterConfig.
+// This is the primary constructor for library consumers.
+func NewRouterFromConfig(rc RouterConfig) *Router {
+	if rc.ConfigDir != "" {
+		_ = LoadUserOverrides(rc.ConfigDir)
 	}
 
 	r := &Router{
-		cfg:           cfg,
 		providers:     make(map[string]Provider),
 		providerCache: make(map[providerKey]Provider),
 		accessTypes:   make(map[string]AccessType),
@@ -175,33 +207,74 @@ func NewRouter(cfg *config.Config) *Router {
 		breaker:       newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
 	}
 
+	r.legacyModels.defaultModel = rc.DefaultModel
+	r.legacyModels.analysisModel = rc.AnalysisModel
+	r.legacyModels.codingModel = rc.CodingModel
+	r.legacyModels.reviewModel = rc.ReviewModel
+
+	for name, entry := range rc.Providers {
+		r.providers[name] = entry.Provider
+		r.accessTypes[name] = entry.Access
+	}
+
+	if rc.UsageMode != "" {
+		if mode, ok := ParseUsageMode(rc.UsageMode); ok {
+			r.mode = mode
+			r.modeSet = true
+		}
+	}
+
+	return r
+}
+
+// NewRouter creates a Router from a config.Config (CLI adapter).
+// Library consumers should use NewRouterFromConfig instead.
+func NewRouter(cfg *config.Config) *Router {
+	rc := RouterConfig{}
+
+	// Load user routing overrides.
+	if dir, err := config.ConfigDir(); err == nil {
+		rc.ConfigDir = dir
+	}
+
+	rc.DefaultModel = cfg.DefaultModel
+	rc.AnalysisModel = cfg.AnalysisModel
+	rc.CodingModel = cfg.CodingModel
+	rc.ReviewModel = cfg.ReviewModel
+	rc.UsageMode = cfg.UsageMode
+
+	rc.Providers = make(map[string]ProviderEntry)
+
 	// Register CLI-based providers first (subscription — preferred)
 	for _, cli := range cfg.CLIs {
 		switch cli.Name {
 		case "claude":
-			r.providers["claude"] = NewClaudeCLI(cli.BinPath)
-			r.accessTypes["claude"] = AccessSubscription
+			rc.Providers["claude"] = ProviderEntry{NewClaudeCLI(cli.BinPath), AccessSubscription}
 		case "gemini":
-			r.providers["gemini"] = NewGeminiCLI(cli.BinPath)
-			r.accessTypes["gemini"] = AccessSubscription
+			rc.Providers["gemini"] = ProviderEntry{NewGeminiCLI(cli.BinPath), AccessSubscription}
 		case "codex":
-			r.providers["codex"] = NewCodexCLI(cli.BinPath)
-			r.accessTypes["codex"] = AccessSubscription
+			rc.Providers["codex"] = ProviderEntry{NewCodexCLI(cli.BinPath), AccessSubscription}
 		}
 	}
 
-	// Register API-based providers (only if CLI not already registered for that provider)
-	if cfg.ClaudeAPIKey != "" && r.providers["claude"] == nil {
-		r.providers["claude"] = NewClaude(cfg.ClaudeAPIKey, cfg.ClaudeModel)
+	// Register API-based providers (only if CLI not already registered)
+	if cfg.ClaudeAPIKey != "" {
+		if _, exists := rc.Providers["claude"]; !exists {
+			rc.Providers["claude"] = ProviderEntry{NewClaude(cfg.ClaudeAPIKey, cfg.ClaudeModel), AccessAPI}
+		}
 	}
-	if cfg.GeminiAPIKey != "" && r.providers["gemini"] == nil {
-		r.providers["gemini"] = NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel)
+	if cfg.GeminiAPIKey != "" {
+		if _, exists := rc.Providers["gemini"]; !exists {
+			rc.Providers["gemini"] = ProviderEntry{NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel), AccessAPI}
+		}
 	}
-	if cfg.OpenAIAPIKey != "" && r.providers["openai"] == nil {
-		r.providers["openai"] = NewOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIModel)
+	if cfg.OpenAIAPIKey != "" {
+		if _, exists := rc.Providers["openai"]; !exists {
+			rc.Providers["openai"] = ProviderEntry{NewOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIModel), AccessAPI}
+		}
 	}
 
-	// Register config-defined custom command providers.
+	// Register custom command providers.
 	for _, cp := range cfg.CustomProviders {
 		if !config.IsCustomProviderUsable(cp) {
 			continue
@@ -211,31 +284,22 @@ func NewRouter(cfg *config.Config) *Router {
 		if name == "" || command == "" {
 			continue
 		}
-		if _, exists := r.providers[name]; exists {
-			// Built-ins win when names collide to avoid surprising overrides.
+		if _, exists := rc.Providers[name]; exists {
 			continue
 		}
-		r.providers[name] = NewCommandCLI(name, command, cp.Args, config.EffectiveCustomProviderPromptMode(cp))
-
 		access := strings.TrimSpace(cp.Access)
 		if access == "" {
 			access = "subscription"
 		}
-		r.accessTypes[name] = parseAccessType(access, name)
-	}
-
-	// Parse usage mode
-	if cfg.UsageMode != "" {
-		if mode, ok := ParseUsageMode(cfg.UsageMode); ok {
-			r.mode = mode
-			r.modeSet = true
+		rc.Providers[name] = ProviderEntry{
+			Provider: NewCommandCLI(name, command, cp.Args, config.EffectiveCustomProviderPromptMode(cp)),
+			Access:   parseAccessType(access, name),
 		}
 	}
 
-	// Parse explicit access type overrides from config.
-	// Only apply when explicitly configured; CLI-registered providers
-	// already have AccessSubscription set above and should not be
-	// downgraded to AccessAPI by default inference.
+	r := NewRouterFromConfig(rc)
+
+	// Apply explicit access type overrides from config (may override subscription defaults).
 	if cfg.ClaudeAccess != "" {
 		r.accessTypes["claude"] = parseAccessType(cfg.ClaudeAccess, "claude")
 	}
@@ -249,14 +313,34 @@ func NewRouter(cfg *config.Config) *Router {
 		r.accessTypes["codex"] = parseAccessType(cfg.CodexAccess, "codex")
 	}
 
-	// For API-only providers (no CLI registered), ensure they have an access type.
-	for _, name := range []string{"claude", "gemini", "openai", "codex"} {
-		if _, ok := r.accessTypes[name]; !ok {
-			if r.providers[name] != nil {
-				r.accessTypes[name] = AccessAPI
-			}
+	// Register factories for dynamic resolution in mode-based routing.
+	_ = RegisterProviderFactory("claude", func(modelID string) (Provider, error) {
+		if cli := cfg.GetCLI("claude"); cli != nil {
+			return NewClaudeCLI(cli.BinPath), nil
 		}
-	}
+		if cfg.ClaudeAPIKey != "" {
+			return NewClaude(cfg.ClaudeAPIKey, modelID), nil
+		}
+		return nil, fmt.Errorf("claude not configured")
+	})
+	_ = RegisterProviderFactory("codex", func(modelID string) (Provider, error) {
+		if cli := cfg.GetCLI("codex"); cli != nil {
+			return NewCodexCLI(cli.BinPath), nil
+		}
+		if cfg.OpenAIAPIKey != "" {
+			return NewOpenAI(cfg.OpenAIAPIKey, modelID), nil
+		}
+		return nil, fmt.Errorf("codex not configured")
+	})
+	_ = RegisterProviderFactory("gemini", func(modelID string) (Provider, error) {
+		if cli := cfg.GetCLI("gemini"); cli != nil {
+			return NewGeminiCLI(cli.BinPath), nil
+		}
+		if cfg.GeminiAPIKey != "" {
+			return NewGemini(cfg.GeminiAPIKey, modelID), nil
+		}
+		return nil, fmt.Errorf("gemini not configured")
+	})
 
 	return r
 }
@@ -340,13 +424,13 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 
 	switch task {
 	case TaskAnalyze, TaskExplain:
-		modelName = r.cfg.AnalysisModel
+		modelName = r.legacyModels.analysisModel
 	case TaskCode, TaskFix:
-		modelName = r.cfg.CodingModel
+		modelName = r.legacyModels.codingModel
 	case TaskReview:
-		modelName = r.cfg.ReviewModel
+		modelName = r.legacyModels.reviewModel
 	default:
-		modelName = r.cfg.DefaultModel
+		modelName = r.legacyModels.defaultModel
 	}
 
 	r.emitTrace(TraceEvent{

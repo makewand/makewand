@@ -64,15 +64,10 @@ func TestProviderCircuitBreaker_RecordFailureWeighted_TripsImmediately(t *testin
 }
 
 func TestRoute_SkipsProviderWithOpenCircuit(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.CodingModel = "claude"
-	cfg.DefaultModel = "claude"
-
 	claude := &stubProvider{name: "claude", available: true}
 	gemini := &stubProvider{name: "gemini", available: true}
 
 	r := &Router{
-		cfg: cfg,
 		providers: map[string]Provider{
 			"claude": claude,
 			"gemini": gemini,
@@ -85,6 +80,8 @@ func TestRoute_SkipsProviderWithOpenCircuit(t *testing.T) {
 		usage:         newSessionUsage(),
 		breaker:       newProviderCircuitBreaker(1, time.Hour),
 	}
+	r.legacyModels.defaultModel = "claude"
+	r.legacyModels.codingModel = "claude"
 
 	r.breaker.RecordFailure("claude") // threshold=1 -> opens immediately
 
@@ -98,15 +95,10 @@ func TestRoute_SkipsProviderWithOpenCircuit(t *testing.T) {
 }
 
 func TestChat_FallbackWhenPrimaryCircuitOpen(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.CodingModel = "claude"
-	cfg.DefaultModel = "claude"
-
 	claude := &stubProvider{name: "claude", available: true}
 	gemini := &stubProvider{name: "gemini", available: true}
 
 	r := &Router{
-		cfg: cfg,
 		providers: map[string]Provider{
 			"claude": claude,
 			"gemini": gemini,
@@ -119,6 +111,8 @@ func TestChat_FallbackWhenPrimaryCircuitOpen(t *testing.T) {
 		usage:         newSessionUsage(),
 		breaker:       newProviderCircuitBreaker(1, time.Hour),
 	}
+	r.legacyModels.defaultModel = "claude"
+	r.legacyModels.codingModel = "claude"
 
 	r.breaker.RecordFailure("claude")
 
@@ -131,12 +125,12 @@ func TestChat_FallbackWhenPrimaryCircuitOpen(t *testing.T) {
 	}
 }
 
-func TestRegisterProviderResolver_ResolveCustomProvider(t *testing.T) {
+func TestRegisterProviderFactory_ResolveCustomProvider(t *testing.T) {
 	const customName = "custom-resolver-test"
-	if err := RegisterProviderResolver(customName, func(cfg *config.Config, modelID string) (Provider, error) {
+	if err := RegisterProviderFactory(customName, func(modelID string) (Provider, error) {
 		return &stubProvider{name: customName, available: true}, nil
 	}); err != nil {
-		t.Fatalf("RegisterProviderResolver: %v", err)
+		t.Fatalf("RegisterProviderFactory: %v", err)
 	}
 
 	r := NewRouter(config.DefaultConfig())

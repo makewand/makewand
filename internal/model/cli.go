@@ -14,8 +14,14 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+)
 
-	"github.com/makewand/makewand/internal/config"
+// Prompt delivery modes for custom command providers.
+// These match PromptModeStdin and PromptModeArg
+// but are inlined here to keep the model package free of config dependencies.
+const (
+	PromptModeStdin = "stdin" // pass prompt via stdin
+	PromptModeArg   = "arg"  // pass prompt as trailing CLI argument
 )
 
 // CLIProvider wraps a subscription CLI tool (claude, gemini, codex) as a Provider.
@@ -189,14 +195,14 @@ func NewCommandCLI(providerName, command string, args []string, promptMode strin
 		provider: providerName,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		if promptMode == config.CustomPromptModeStdin {
+		if promptMode == PromptModeStdin {
 			cmd := exec.CommandContext(ctx, command, templateArgs...)
 			cmd.Stdin = strings.NewReader(prompt)
 			return cmd
 		}
 
 		finalArgs := make([]string, 0, len(templateArgs)+1)
-		if promptMode == config.CustomPromptModeArg {
+		if promptMode == PromptModeArg {
 			finalArgs = append(finalArgs, templateArgs...)
 			finalArgs = append(finalArgs, prompt)
 			return exec.CommandContext(ctx, command, finalArgs...)

@@ -106,7 +106,6 @@ func TestChat_ModeFastFallsBackToAPI(t *testing.T) {
 		usage:   newSessionUsage(),
 		mode:    ModeFast,
 		modeSet: true,
-		cfg:     config.DefaultConfig(),
 	}
 
 	_, _, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
@@ -186,15 +185,10 @@ func TestProviderAttemptTimeout_PowerGeminiKeepsPhaseDefault(t *testing.T) {
 }
 
 func TestChat_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.CodingModel = "claude"
-	cfg.DefaultModel = "claude"
-
 	primary := &deadlineCaptureProvider{name: "claude", available: true}
 	fallback := &stubProvider{name: "gemini", available: true}
 
 	r := &Router{
-		cfg: cfg,
 		providers: map[string]Provider{
 			"claude": primary,
 			"gemini": fallback,
@@ -207,6 +201,8 @@ func TestChat_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
 		usage:   newSessionUsage(),
 		modeSet: false, // legacy routing path
 	}
+	r.legacyModels.defaultModel = "claude"
+	r.legacyModels.codingModel = "claude"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -227,15 +223,10 @@ func TestChat_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
 }
 
 func TestChatStream_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.CodingModel = "claude"
-	cfg.DefaultModel = "claude"
-
 	primary := &streamDeadlineCaptureProvider{name: "claude", available: true}
 	fallback := &stubProvider{name: "gemini", available: true}
 
 	r := &Router{
-		cfg: cfg,
 		providers: map[string]Provider{
 			"claude": primary,
 			"gemini": fallback,
@@ -248,6 +239,8 @@ func TestChatStream_AppliesPerAttemptTimeoutForPrimaryProvider(t *testing.T) {
 		usage:   newSessionUsage(),
 		modeSet: false, // legacy routing path
 	}
+	r.legacyModels.defaultModel = "claude"
+	r.legacyModels.codingModel = "claude"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -393,15 +386,10 @@ func TestNewRouter_CLIAccessDefaultsToSubscription(t *testing.T) {
 }
 
 func TestChatStream_FallbackOnStartError(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.CodingModel = "claude"
-	cfg.DefaultModel = "claude"
-
 	claude := &stubProvider{name: "claude", available: true, failStream: true}
 	gemini := &stubProvider{name: "gemini", available: true}
 
 	r := &Router{
-		cfg: cfg,
 		providers: map[string]Provider{
 			"claude": claude,
 			"gemini": gemini,
@@ -414,6 +402,8 @@ func TestChatStream_FallbackOnStartError(t *testing.T) {
 		usage:   newSessionUsage(),
 		modeSet: false, // legacy routing path
 	}
+	r.legacyModels.defaultModel = "claude"
+	r.legacyModels.codingModel = "claude"
 
 	ch, result, err := r.ChatStream(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
 	if err != nil {
