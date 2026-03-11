@@ -133,6 +133,7 @@ type sessionUsage struct {
 	counts   map[string]int
 	failures map[string]int                  // provider errors / timeouts
 	quality  map[qualityKey]*providerQuality // Beta(α,β) per (phase, provider)
+	rng      *rand.Rand                      // injectable random source for deterministic tests
 }
 
 func newSessionUsage() *sessionUsage {
@@ -140,6 +141,7 @@ func newSessionUsage() *sessionUsage {
 		counts:   make(map[string]int),
 		failures: make(map[string]int),
 		quality:  make(map[qualityKey]*providerQuality),
+		rng:      rand.New(rand.NewSource(rand.Int63())),
 	}
 }
 
@@ -227,38 +229,39 @@ func (s *sessionUsage) ThompsonSample(phase BuildPhase, provider string, priorBi
 		alpha = priorBias + 1.0
 		beta = 1.0
 	}
+	rng := s.rng
 	s.mu.Unlock()
-	return betaSample(alpha, beta)
+	return betaSample(rng, alpha, beta)
 }
 
 // betaSample draws a random variate from Beta(alpha, beta) via the Gamma relationship.
-func betaSample(alpha, beta float64) float64 {
-	x := gammaSample(alpha)
-	y := gammaSample(beta)
+func betaSample(rng *rand.Rand, alpha, beta float64) float64 {
+	x := gammaSample(rng, alpha)
+	y := gammaSample(rng, beta)
 	if x+y == 0 {
 		return 0.5
 	}
 	return x / (x + y)
 }
 
-// gammaSample draws from Gamma(alpha, 1) using Marsaglia-Tsang's method (Go math/rand).
-func gammaSample(alpha float64) float64 {
+// gammaSample draws from Gamma(alpha, 1) using Marsaglia-Tsang's method.
+func gammaSample(rng *rand.Rand, alpha float64) float64 {
 	if alpha < 1.0 {
-		return gammaSample(1.0+alpha) * math.Pow(rand.Float64(), 1.0/alpha)
+		return gammaSample(rng, 1.0+alpha) * math.Pow(rng.Float64(), 1.0/alpha)
 	}
 	d := alpha - 1.0/3.0
 	c := 1.0 / math.Sqrt(9.0*d)
 	for {
 		var x, v float64
 		for {
-			x = rand.NormFloat64()
+			x = rng.NormFloat64()
 			v = 1.0 + c*x
 			if v > 0 {
 				break
 			}
 		}
 		v = v * v * v
-		u := rand.Float64()
+		u := rng.Float64()
 		x2 := x * x
 		if u < 1.0-0.0331*(x2*x2) {
 			return d * v

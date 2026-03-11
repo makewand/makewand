@@ -685,23 +685,21 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 			})
 			continue
 		}
-		if p.IsAvailable() {
-			r.emitTrace(TraceEvent{
-				Event:      "build_route_selected",
-				Phase:      buildPhaseName(phase),
-				Requested:  name,
-				Selected:   fb,
-				ModelID:    modelID,
-				IsFallback: true,
-			})
-			return RouteResult{
-				Provider:   p,
-				ModelID:    modelID,
-				Requested:  name,
-				Actual:     fb,
-				IsFallback: true,
-			}, nil
-		}
+		r.emitTrace(TraceEvent{
+			Event:      "build_route_selected",
+			Phase:      buildPhaseName(phase),
+			Requested:  name,
+			Selected:   fb,
+			ModelID:    modelID,
+			IsFallback: true,
+		})
+		return RouteResult{
+			Provider:   p,
+			ModelID:    modelID,
+			Requested:  name,
+			Actual:     fb,
+			IsFallback: true,
+		}, nil
 	}
 
 	r.emitTrace(TraceEvent{
