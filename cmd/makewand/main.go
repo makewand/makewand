@@ -80,7 +80,7 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
-	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 4*time.Minute, "timeout for --print one-shot execution")
+	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 0, "timeout for --print (default: auto per mode)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -364,11 +364,11 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	messages := []model.Message{{Role: "user", Content: prompt}}
 	systemPrompt := buildHeadlessSystemPrompt(task, prompt)
 
-	ctx := context.Background()
-	cancel := func() {}
-	if timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, timeout)
+	// Auto-select timeout based on mode when user didn't set --timeout explicitly.
+	if timeout <= 0 {
+		timeout = headlessTimeoutForMode(router.Mode())
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	var (
@@ -422,6 +422,19 @@ func newHeadlessTraceSink() (*diag.JSONLTraceSink, string, error) {
 	}
 	candidates = append(candidates, filepath.Join(os.TempDir(), "makewand-trace.jsonl"))
 	return diag.OpenFirstJSONLTraceSink(candidates)
+}
+
+// headlessTimeoutForMode returns a sensible default --print timeout per mode.
+// Fast mode gets a tight budget so total wall time stays short even with fallbacks.
+func headlessTimeoutForMode(mode model.UsageMode) time.Duration {
+	switch mode {
+	case model.ModeFast:
+		return 90 * time.Second
+	case model.ModeBalanced:
+		return 3 * time.Minute
+	default: // power — ensemble needs more room
+		return 5 * time.Minute
+	}
 }
 
 func classifyPromptTask(input string) model.TaskType {

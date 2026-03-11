@@ -274,21 +274,28 @@ func TestWithProviderAttemptTimeout_RespectsCallerShorterDeadline(t *testing.T) 
 	}
 }
 
-func TestProviderAttemptTimeout_FastGeminiCodeCap(t *testing.T) {
+func TestProviderAttemptTimeout_FastCodeTight(t *testing.T) {
 	got := providerAttemptTimeout(ModeFast, PhaseCode, "gemini")
-	if got != 120*time.Second {
-		t.Fatalf("providerAttemptTimeout(fast, code, gemini) = %s, want 120s", got)
+	if got != 45*time.Second {
+		t.Fatalf("providerAttemptTimeout(fast, code, gemini) = %s, want 45s", got)
 	}
 }
 
-func TestProviderAttemptTimeout_BalancedKeepsPhaseDefault(t *testing.T) {
+func TestProviderAttemptTimeout_FastReviewTight(t *testing.T) {
+	got := providerAttemptTimeout(ModeFast, PhaseReview, "claude")
+	if got != 35*time.Second {
+		t.Fatalf("providerAttemptTimeout(fast, review, claude) = %s, want 35s", got)
+	}
+}
+
+func TestProviderAttemptTimeout_BalancedCodeModerate(t *testing.T) {
 	got := providerAttemptTimeout(ModeBalanced, PhaseCode, "gemini")
-	if got != 180*time.Second {
-		t.Fatalf("providerAttemptTimeout(balanced, code, gemini) = %s, want 180s default", got)
+	if got != 90*time.Second {
+		t.Fatalf("providerAttemptTimeout(balanced, code, gemini) = %s, want 90s", got)
 	}
 }
 
-func TestProviderAttemptTimeout_PowerGeminiKeepsPhaseDefault(t *testing.T) {
+func TestProviderAttemptTimeout_PowerKeepsPhaseDefault(t *testing.T) {
 	got := providerAttemptTimeout(ModePower, PhaseCode, "gemini")
 	if got != 180*time.Second {
 		t.Fatalf("providerAttemptTimeout(power, code, gemini) = %s, want 180s default", got)

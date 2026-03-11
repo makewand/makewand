@@ -306,8 +306,12 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 		prompt = buildCLIPrompt(messages, system)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, cliRequestTimeout)
-	defer cancel()
+	// Only add CLI-level timeout if the caller hasn't set a tighter deadline.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cliCancel context.CancelFunc
+		ctx, cliCancel = context.WithTimeout(ctx, cliRequestTimeout)
+		defer cliCancel()
+	}
 
 	attempts := 0
 	for {
@@ -368,7 +372,13 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 		prompt = buildCLIPrompt(messages, system)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, cliStreamTimeout)
+	// Only add CLI-level stream timeout if the caller hasn't set a tighter deadline.
+	var cancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		ctx, cancel = context.WithTimeout(ctx, cliStreamTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
 
 	cmd := c.buildCmd(ctx, prompt)
 	setCLIProcessGroup(cmd)
