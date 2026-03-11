@@ -151,12 +151,17 @@ func withStreamAttemptCancel(ch <-chan StreamChunk, cancel context.CancelFunc) <
 		return ch
 	}
 
-	out := make(chan StreamChunk)
+	out := make(chan StreamChunk, 1)
 	go func() {
 		defer close(out)
 		defer cancel()
 		for chunk := range ch {
-			out <- chunk
+			select {
+			case out <- chunk:
+			case <-time.After(30 * time.Second):
+				// Consumer stopped reading — abandon to avoid goroutine leak.
+				return
+			}
 			if chunk.Done || chunk.Error != nil {
 				return
 			}

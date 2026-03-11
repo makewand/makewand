@@ -102,6 +102,51 @@ func TestHTTPHandler_Health(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_BearerAuth_Rejects(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{BearerToken: "secret123"})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestHTTPHandler_BearerAuth_Accepts(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{BearerToken: "secret123"})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret123")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestHTTPHandler_BearerAuth_HealthBypassesAuth(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{BearerToken: "secret123"})
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health should bypass auth, got status %d", rec.Code)
+	}
+}
+
 func TestHTTPHandler_MethodNotAllowed(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 
