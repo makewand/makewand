@@ -738,3 +738,204 @@ func TestCLIProvider_Chat_JSONUsageUsedWhenAvailable(t *testing.T) {
 		t.Fatalf("Model = %q, want test-model", usage.Model)
 	}
 }
+
+func TestParseCodexCLIJSONL_ValidResponse(t *testing.T) {
+	// Real JSONL output format from `codex exec --json --skip-git-repo-check`
+	jsonl := `{"type":"thread.started","thread_id":"019cd704-eb4e-7420-b45e-3f546e2456e0"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello from Codex!"}}
+{"type":"turn.completed","usage":{"input_tokens":42,"cached_input_tokens":10,"output_tokens":15}}
+`
+	content, usage, err := parseCodexCLIJSONL([]byte(jsonl))
+	if err != nil {
+		t.Fatalf("parseCodexCLIJSONL() error = %v", err)
+	}
+	if content != "Hello from Codex!" {
+		t.Fatalf("content = %q, want %q", content, "Hello from Codex!")
+	}
+	if usage == nil {
+		t.Fatal("usage is nil")
+	}
+	if usage.InputTokens != 42 {
+		t.Fatalf("InputTokens = %d, want 42", usage.InputTokens)
+	}
+	if usage.OutputTokens != 15 {
+		t.Fatalf("OutputTokens = %d, want 15", usage.OutputTokens)
+	}
+	if usage.Provider != "codex" {
+		t.Fatalf("Provider = %q, want codex", usage.Provider)
+	}
+}
+
+func TestParseCodexCLIJSONL_NoAgentMessages(t *testing.T) {
+	jsonl := `{"type":"thread.started","thread_id":"abc"}
+{"type":"turn.started"}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}
+`
+	_, _, err := parseCodexCLIJSONL([]byte(jsonl))
+	if err == nil {
+		t.Fatal("expected error for missing agent_message items")
+	}
+}
+
+func TestParseCodexCLIJSONL_PlainTextFallback(t *testing.T) {
+	// Plain text (e.g. from codex review) should fail JSONL parsing,
+	// triggering the text fallback in chatAttempt.
+	plain := "Code review: looks good, no issues found."
+	_, _, err := parseCodexCLIJSONL([]byte(plain))
+	if err == nil {
+		t.Fatal("expected error for plain text input")
+	}
+}
+
+func TestParseCodexCLIJSONL_MultipleAgentMessages(t *testing.T) {
+	jsonl := `{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Part 1"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"echo hi","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Part 2"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":20}}
+`
+	content, usage, err := parseCodexCLIJSONL([]byte(jsonl))
+	if err != nil {
+		t.Fatalf("parseCodexCLIJSONL() error = %v", err)
+	}
+	if content != "Part 1\nPart 2" {
+		t.Fatalf("content = %q, want %q", content, "Part 1\nPart 2")
+	}
+	if usage.InputTokens != 10 || usage.OutputTokens != 20 {
+		t.Fatalf("usage = %+v, want input=10 output=20", usage)
+	}
+}
+
+func TestContextWithTask_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	if _, ok := TaskFromContext(ctx); ok {
+		t.Fatal("expected no task in bare context")
+	}
+
+	ctx = ContextWithTask(ctx, TaskReview)
+	task, ok := TaskFromContext(ctx)
+	if !ok {
+		t.Fatal("expected task in context")
+	}
+	if task != TaskReview {
+		t.Fatalf("task = %d, want TaskReview (%d)", task, TaskReview)
+	}
+}
+
+func TestNewCodexCLI_ReviewTaskUsesReviewCmd(t *testing.T) {
+	p := NewCodexCLI("/usr/bin/codex")
+	// Review task → should build "codex review --uncommitted"
+	ctx := ContextWithTask(context.Background(), TaskReview)
+	cmd := p.buildCmd(ctx, "review this code")
+	args := cmd.Args
+	if len(args) < 3 || args[1] != "review" || args[2] != "--uncommitted" {
+		t.Fatalf("review task: args = %v, want [codex review --uncommitted]", args)
+	}
+
+	// Code task → should build "codex exec --json ..."
+	ctx = ContextWithTask(context.Background(), TaskCode)
+	cmd = p.buildCmd(ctx, "write hello world")
+	args = cmd.Args
+	if len(args) < 3 || args[1] != "exec" || args[2] != "--json" {
+		t.Fatalf("code task: args = %v, want [codex exec --json ...]", args)
+	}
+}
+
+func TestNewClaudeCLI_ModelSelection(t *testing.T) {
+	p := NewClaudeCLI("/usr/bin/claude")
+	// With model in context → should add --model
+	ctx := ContextWithModel(context.Background(), "claude-haiku-4-5-20251001")
+	cmd := p.buildCmd(ctx, "hello")
+	found := false
+	for i, arg := range cmd.Args {
+		if arg == "--model" && i+1 < len(cmd.Args) && cmd.Args[i+1] == "claude-haiku-4-5-20251001" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected --model claude-haiku-4-5-20251001 in args: %v", cmd.Args)
+	}
+
+	// Without model in context → no --model
+	ctx = context.Background()
+	cmd = p.buildCmd(ctx, "hello")
+	for _, arg := range cmd.Args {
+		if arg == "--model" {
+			t.Fatalf("unexpected --model in args without context: %v", cmd.Args)
+		}
+	}
+
+	// With -cli suffix model → should NOT add --model (placeholder)
+	ctx = ContextWithModel(context.Background(), "codex-cli")
+	cmd = p.buildCmd(ctx, "hello")
+	for _, arg := range cmd.Args {
+		if arg == "--model" {
+			t.Fatalf("unexpected --model for -cli suffix: %v", cmd.Args)
+		}
+	}
+}
+
+func TestNewGeminiCLI_ModelSelection(t *testing.T) {
+	p := NewGeminiCLI("/usr/bin/gemini")
+	ctx := ContextWithModel(context.Background(), "gemini-2.5-pro")
+	cmd := p.buildCmd(ctx, "hello")
+	found := false
+	for i, arg := range cmd.Args {
+		if arg == "--model" && i+1 < len(cmd.Args) && cmd.Args[i+1] == "gemini-2.5-pro" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected --model gemini-2.5-pro in args: %v", cmd.Args)
+	}
+}
+
+func TestNewClaudeCLI_SystemPromptFlag(t *testing.T) {
+	p := NewClaudeCLI("/usr/bin/claude")
+	ctx := ContextWithSystem(context.Background(), "You are a helpful assistant")
+	cmd := p.buildCmd(ctx, "hello")
+	found := false
+	for i, arg := range cmd.Args {
+		if arg == "--append-system-prompt" && i+1 < len(cmd.Args) && cmd.Args[i+1] == "You are a helpful assistant" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected --append-system-prompt in args: %v", cmd.Args)
+	}
+}
+
+func TestClaudeCLI_Chat_SystemPromptSeparation(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "claude-sys.sh")
+	// Script that echoes all args so we can verify --append-system-prompt is present
+	body := "#!/bin/sh\necho \"$@\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	p := NewClaudeCLI(script)
+	content, _, err := p.Chat(context.Background(),
+		[]Message{{Role: "user", Content: "test prompt"}},
+		"system instructions here",
+		256,
+	)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	// The output should contain --append-system-prompt and the system text
+	if !strings.Contains(content, "--append-system-prompt") {
+		t.Fatalf("expected --append-system-prompt in CLI args output: %q", content)
+	}
+	if !strings.Contains(content, "system instructions here") {
+		t.Fatalf("expected system prompt in CLI args output: %q", content)
+	}
+	// The prompt itself should NOT contain the system instructions
+	// (they're passed via the flag, not concatenated)
+	if strings.Contains(content, "system instructions here\n\ntest prompt") {
+		t.Fatal("system should not be concatenated into prompt when systemFlag is set")
+	}
+}

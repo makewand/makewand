@@ -269,13 +269,13 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 	})
 	r.usage.RecordQualityOutcome(phase, winner.Provider, true)
 
-	// Return the winning generator's original content for correctness.
-	// The judge's model ID and usage are recorded for cost tracking.
+	// Return the winning generator's original content and model for correctness.
+	// Judge usage is returned separately so ChatBest can accumulate it.
 	return EnsembleResult{
 		Provider: winner.Provider, // attribution: generator that was selected
-		ModelID:  judgeModelID,    // judge's model (for cost/display)
+		ModelID:  winner.ModelID,  // winning generator's model (for display)
 		Content:  winner.Content,  // original generator output, not judge's reproduction
-		Usage:    usage,
+		Usage:    usage,           // judge's usage (for cost tracking)
 	}
 }
 

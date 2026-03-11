@@ -73,6 +73,10 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
+	// Inject model ID into context so CLI providers can use --model for per-call selection.
+	if id.modelID != "" {
+		attemptCtx = ContextWithModel(attemptCtx, id.modelID)
+	}
 	content, usage, chatErr := id.provider.Chat(attemptCtx, ac.messages, ac.system, ac.maxTokens)
 	attemptCancel()
 
@@ -282,6 +286,10 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
+	// Inject model ID into context so CLI providers can use --model for per-call selection.
+	if id.modelID != "" {
+		attemptCtx = ContextWithModel(attemptCtx, id.modelID)
+	}
 	ch, streamErr := id.provider.ChatStream(attemptCtx, ac.messages, ac.system, ac.maxTokens)
 
 	if streamErr == nil {

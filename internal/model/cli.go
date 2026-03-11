@@ -29,8 +29,13 @@ type CLIProvider struct {
 
 	// jsonOutput indicates the CLI is invoked with a JSON output flag.
 	// When true, chatAttempt tries parseJSONResponse before falling back to text.
-	jsonOutput       bool
+	jsonOutput        bool
 	parseJSONResponse func(raw []byte) (content string, usage *Usage, err error)
+
+	// systemFlag, if non-empty, is the CLI flag for passing system prompts
+	// separately (e.g. "--append-system-prompt" for Claude CLI).
+	// When set, Chat passes system via this flag and only user messages in -p.
+	systemFlag string
 
 	mu            sync.Mutex
 	cachedAvail   bool
@@ -83,9 +88,20 @@ func NewClaudeCLI(binPath string) *CLIProvider {
 		provider:          "claude",
 		jsonOutput:        true,
 		parseJSONResponse: parseClaudeCLIJSON,
+		systemFlag:        "--append-system-prompt",
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, binPath, "-p", prompt, "--output-format", "json")
+		args := []string{"-p", prompt, "--output-format", "json"}
+		// Per-call model selection: use --model to select tier-specific models
+		// (e.g. haiku for fast, sonnet for balanced, opus for power).
+		if modelID, ok := ModelFromContext(ctx); ok && !strings.HasSuffix(modelID, "-cli") {
+			args = append(args, "--model", modelID)
+		}
+		// System prompt via dedicated flag (proper system role, not user message).
+		if sys, ok := SystemFromContext(ctx); ok {
+			args = append(args, "--append-system-prompt", sys)
+		}
+		cmd := exec.CommandContext(ctx, binPath, args...)
 		// Unset CLAUDECODE to allow nested invocation from within Claude Code
 		cmd.Env = filterEnv(cmd.Environ(), "CLAUDECODE")
 		return cmd
@@ -110,7 +126,13 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 		parseJSONResponse: parseGeminiCLIJSON,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, binPath, "-p", prompt, "--sandbox", "false", "--output-format", "json")
+		args := []string{"-p", prompt, "--sandbox", "false", "--output-format", "json"}
+		// Per-call model selection: use --model to select tier-specific models
+		// (e.g. flash for fast/balanced, pro for power).
+		if modelID, ok := ModelFromContext(ctx); ok && !strings.HasSuffix(modelID, "-cli") {
+			args = append(args, "--model", modelID)
+		}
+		cmd := exec.CommandContext(ctx, binPath, args...)
 		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
 		return cmd
 	}
@@ -125,14 +147,23 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 // --- Codex CLI ---
 
 // NewCodexCLI creates a provider that uses `codex exec` (Codex CLI).
+// Task-aware: uses `codex review --uncommitted` for review tasks,
+// `codex exec --json` for code/analysis tasks (provides structured usage data).
 func NewCodexCLI(binPath string) *CLIProvider {
 	p := &CLIProvider{
-		name:     "codex-cli",
-		binPath:  binPath,
-		provider: "codex",
+		name:              "codex-cli",
+		binPath:           binPath,
+		provider:          "codex",
+		jsonOutput:        true,
+		parseJSONResponse: parseCodexCLIJSONL,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		return exec.CommandContext(ctx, binPath, "exec", "--skip-git-repo-check", prompt)
+		// Use dedicated review subcommand for review tasks.
+		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+			return exec.CommandContext(ctx, binPath, "review", "--uncommitted")
+		}
+		// Default: exec with JSON output for structured usage data.
+		return exec.CommandContext(ctx, binPath, "exec", "--json", "--skip-git-repo-check", prompt)
 	}
 	p.checkCmd = func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, binPath, "--version")
@@ -260,7 +291,14 @@ func (c *CLIProvider) softPassProbeTimeout() bool {
 }
 
 func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
-	prompt := buildCLIPrompt(messages, system)
+	var prompt string
+	if c.systemFlag != "" && system != "" {
+		// Pass system prompt via dedicated CLI flag (proper system role).
+		prompt = buildCLIPrompt(messages, "")
+		ctx = ContextWithSystem(ctx, system)
+	} else {
+		prompt = buildCLIPrompt(messages, system)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, cliRequestTimeout)
 	defer cancel()
@@ -316,7 +354,13 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 }
 
 func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
-	prompt := buildCLIPrompt(messages, system)
+	var prompt string
+	if c.systemFlag != "" && system != "" {
+		prompt = buildCLIPrompt(messages, "")
+		ctx = ContextWithSystem(ctx, system)
+	} else {
+		prompt = buildCLIPrompt(messages, system)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, cliStreamTimeout)
 
@@ -498,6 +542,75 @@ func parseGeminiCLIJSON(raw []byte) (string, *Usage, error) {
 	usage.Model = modelName
 
 	return content, usage, nil
+}
+
+// --- Codex CLI JSONL Parsing ---
+
+// codexJSONLEvent represents a single line in Codex CLI `exec --json` JSONL output.
+// Actual format (codex exec --json --skip-git-repo-check):
+//
+//	{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"..."}}
+//	{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"...","aggregated_output":"...","exit_code":0,"status":"completed"}}
+//	{"type":"turn.completed","usage":{"input_tokens":25629,"cached_input_tokens":16384,"output_tokens":341}}
+type codexJSONLEvent struct {
+	Type string `json:"type"`
+	Item struct {
+		Type            string `json:"type"`
+		Text            string `json:"text"`             // agent_message text
+		AggregatedOutput string `json:"aggregated_output"` // command_execution output
+		Status          string `json:"status"`
+	} `json:"item"`
+	Usage struct {
+		InputTokens       int `json:"input_tokens"`
+		CachedInputTokens int `json:"cached_input_tokens"`
+		OutputTokens      int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// parseCodexCLIJSONL extracts the response text and real usage from Codex CLI
+// `exec --json` JSONL output. It collects text from `item.completed` agent_message
+// events and usage from the `turn.completed` event.
+func parseCodexCLIJSONL(raw []byte) (string, *Usage, error) {
+	lines := bytes.Split(raw, []byte("\n"))
+
+	var textParts []string
+	var bestUsage *Usage
+
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		var event codexJSONLEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			continue // skip non-JSON lines
+		}
+
+		switch event.Type {
+		case "item.completed":
+			// Collect text from agent_message items (the actual AI response).
+			if event.Item.Type == "agent_message" && event.Item.Text != "" {
+				textParts = append(textParts, event.Item.Text)
+			}
+		case "turn.completed":
+			// Extract real token usage from the turn summary.
+			if event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0 {
+				bestUsage = &Usage{
+					InputTokens:  event.Usage.InputTokens,
+					OutputTokens: event.Usage.OutputTokens,
+					Cost:         0, // Codex CLI uses subscription; no per-token cost.
+					Provider:     "codex",
+				}
+			}
+		}
+	}
+
+	if len(textParts) == 0 {
+		return "", nil, fmt.Errorf("no agent_message items found in codex JSONL output")
+	}
+
+	return strings.TrimSpace(strings.Join(textParts, "\n")), bestUsage, nil
 }
 
 // --- Helpers ---
