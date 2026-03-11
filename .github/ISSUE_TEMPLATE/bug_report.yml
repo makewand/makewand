@@ -39,8 +39,7 @@ body:
       label: Mode
       description: Which usage mode were you using?
       options:
-        - free
-        - economy
+        - fast
         - balanced
         - power
         - unknown

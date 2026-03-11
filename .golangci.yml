@@ -1,0 +1,20 @@
+run:
+  timeout: 3m
+
+linters:
+  enable:
+    - errcheck
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+issues:
+  exclude-dirs:
+    - benchmarks
+    - notes-api
+    - password-strength-checker
+    - top_three_project
+    - blog-project
