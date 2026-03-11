@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/makewand/makewand/internal/config"
 )
 
 // makeRouter creates a Router struct literal with stub providers wired for the given mode.
@@ -36,7 +34,6 @@ func makeRouter(t *testing.T, mode UsageMode, provs map[string]*stubProvider) *R
 	}
 
 	return &Router{
-		cfg:           config.DefaultConfig(),
 		providers:     providers,
 		providerCache: cache,
 		accessTypes:   access,
@@ -393,12 +390,7 @@ func TestModeRouting_ThompsonSamplingConvergesWithQualityData(t *testing.T) {
 // --- RegisterProvider test ---
 
 func TestModeRouting_RegisterProviderAndRoute(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.DefaultModel = "custom"
-	cfg.CodingModel = "custom"
-
 	r := &Router{
-		cfg:           cfg,
 		providers:     make(map[string]Provider),
 		providerCache: make(map[providerKey]Provider),
 		accessTypes:   make(map[string]AccessType),
@@ -406,6 +398,8 @@ func TestModeRouting_RegisterProviderAndRoute(t *testing.T) {
 		breaker:       newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
 		modeSet:       false, // legacy routing path
 	}
+	r.legacyModels.defaultModel = "custom"
+	r.legacyModels.codingModel = "custom"
 
 	custom := &stubProvider{name: "custom", available: true}
 	if err := r.RegisterProvider("custom", custom, AccessAPI); err != nil {
