@@ -1,4 +1,4 @@
-package model
+package router
 
 import (
 	"context"
@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/makewand/makewand/internal/config"
 )
 
 func TestCLIProvider_ChatStream_ReturnsErrorOnExitFailure(t *testing.T) {
@@ -151,7 +150,7 @@ func TestNewCommandCLI_PromptPlaceholderReplacement(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{"--prompt", "{{prompt}}"}, config.CustomPromptModeLegacy)
+	p := NewCommandCLI("private", script, []string{"--prompt", "{{prompt}}"}, "legacy")
 	content, usage, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello custom provider"}}, "", 256)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -181,7 +180,7 @@ func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{"--flag"}, config.CustomPromptModeLegacy)
+	p := NewCommandCLI("private", script, []string{"--flag"}, "legacy")
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello appended prompt"}}, "", 256)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -204,7 +203,7 @@ func TestNewCommandCLI_WritesPromptToStdinWhenConfigured(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{"stdin"}, config.CustomPromptModeStdin)
+	p := NewCommandCLI("private", script, []string{"stdin"}, "stdin")
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello via stdin"}}, "", 256)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -239,7 +238,7 @@ func TestCLIProvider_Chat_RetriesTransientExecutionError(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{stateFile}, config.CustomPromptModeLegacy)
+	p := NewCommandCLI("private", script, []string{stateFile}, "legacy")
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
 	if err != nil {
 		t.Fatalf("Chat() error = %v, want retry success", err)
@@ -280,7 +279,7 @@ func TestCLIProvider_Chat_DoesNotRetryNonTransientError(t *testing.T) {
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	p := NewCommandCLI("private", script, []string{stateFile}, config.CustomPromptModeLegacy)
+	p := NewCommandCLI("private", script, []string{stateFile}, "legacy")
 	_, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
 	if err == nil {
 		t.Fatal("Chat() error = nil, want permanent failure")

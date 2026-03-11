@@ -1,11 +1,9 @@
-package model
+package router
 
 import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/makewand/makewand/internal/config"
 )
 
 func TestProviderCircuitBreaker_StateTransitions(t *testing.T) {
@@ -133,7 +131,7 @@ func TestRegisterProviderFactory_ResolveCustomProvider(t *testing.T) {
 		t.Fatalf("RegisterProviderFactory: %v", err)
 	}
 
-	r := NewRouter(config.DefaultConfig())
+	r := NewRouterFromConfig(RouterConfig{})
 	p, err := r.resolveProvider(customName, "custom-model")
 	if err != nil {
 		t.Fatalf("resolveProvider(custom): %v", err)
@@ -144,10 +142,10 @@ func TestRegisterProviderFactory_ResolveCustomProvider(t *testing.T) {
 }
 
 func TestRegisterProvider_RuntimeInjection(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.CodingModel = "private"
-	cfg.DefaultModel = "private"
-	r := NewRouter(cfg)
+	r := NewRouterFromConfig(RouterConfig{
+		DefaultModel: "private",
+		CodingModel:  "private",
+	})
 
 	privateProv := &stubProvider{name: "private", available: true}
 	if err := r.RegisterProvider("private", privateProv, AccessAPI); err != nil {
@@ -164,8 +162,9 @@ func TestRegisterProvider_RuntimeInjection(t *testing.T) {
 }
 
 func TestRouteByMode_UsesDynamicallyRegisteredProvider(t *testing.T) {
-	r := NewRouter(config.DefaultConfig())
-	r.SetMode(ModeBalanced)
+	r := NewRouterFromConfig(RouterConfig{
+		UsageMode: "balanced",
+	})
 
 	privateProv := &stubProvider{name: "private", available: true}
 	if err := r.RegisterProvider("private", privateProv, AccessSubscription); err != nil {
@@ -182,8 +181,9 @@ func TestRouteByMode_UsesDynamicallyRegisteredProvider(t *testing.T) {
 }
 
 func TestRouteProvider_FallsBackToDynamicProvider(t *testing.T) {
-	r := NewRouter(config.DefaultConfig())
-	r.SetMode(ModeBalanced)
+	r := NewRouterFromConfig(RouterConfig{
+		UsageMode: "balanced",
+	})
 
 	privateProv := &stubProvider{name: "private", available: true}
 	if err := r.RegisterProvider("private", privateProv, AccessSubscription); err != nil {

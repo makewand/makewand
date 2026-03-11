@@ -1,4 +1,4 @@
-package model
+package router
 
 import "testing"
 

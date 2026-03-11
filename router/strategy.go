@@ -78,9 +78,9 @@ func (m UsageMode) String() string {
 	}
 }
 
-// parseAccessType determines the AccessType from a config value and provider name.
+// ParseAccessType determines the AccessType from a config value and provider name.
 // Defaults: all built-in providers default to Subscription (CLI tools preferred).
-func parseAccessType(configValue, providerName string) AccessType {
+func ParseAccessType(configValue, providerName string) AccessType {
 	switch strings.ToLower(configValue) {
 	case "free":
 		return AccessFree
