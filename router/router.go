@@ -233,6 +233,12 @@ func (r *Router) SetMode(m UsageMode) {
 	r.modeMu.Unlock()
 }
 
+// SetAccessType sets the access type for a named provider.
+// This is used by the CLI adapter to apply explicit access overrides from config.
+func (r *Router) SetAccessType(name string, access AccessType) {
+	r.accessTypes[name] = access
+}
+
 // SetTraceSink enables or disables structured router trace events.
 // Pass nil to disable tracing.
 func (r *Router) SetTraceSink(sink TraceSink) {

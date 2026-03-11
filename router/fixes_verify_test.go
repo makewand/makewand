@@ -1,4 +1,4 @@
-package model
+package router
 
 // fixes_verify_test.go: regression tests that directly verify each fix made in this session.
 //
