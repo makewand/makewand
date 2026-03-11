@@ -42,6 +42,12 @@ type TraceCandidate struct {
 	ThompsonScore float64 `json:"thompson_score"`
 }
 
+// TraceSinkFunc is an adapter that allows using an ordinary function as a TraceSink.
+type TraceSinkFunc func(event TraceEvent)
+
+// Trace implements TraceSink.
+func (f TraceSinkFunc) Trace(event TraceEvent) { f(event) }
+
 func taskTypeName(task TaskType) string {
 	switch task {
 	case TaskAnalyze:
