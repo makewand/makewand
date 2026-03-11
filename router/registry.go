@@ -147,7 +147,7 @@ func (r *Router) isBuildProviderAvailable(name, modelID string) bool {
 
 // tryBuildProvider resolves a provider instance for the given name and tier.
 func (r *Router) tryBuildProvider(name string, tier ModelTier) (Provider, string, error) {
-	models, ok := modelTable[name]
+	models, ok := getModelTable(name)
 	if !ok {
 		// Dynamically registered providers may not have a modelTable entry.
 		p, err := r.resolveProvider(name, "")

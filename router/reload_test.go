@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -18,10 +19,13 @@ func TestWatchOverrides_ReloadsOnChange(t *testing.T) {
 		UsageMode: "balanced",
 	})
 
-	// Record trace events
+	// Record trace events with synchronization
+	var mu sync.Mutex
 	var traces []TraceEvent
 	r.SetTraceSink(TraceSinkFunc(func(e TraceEvent) {
+		mu.Lock()
 		traces = append(traces, e)
+		mu.Unlock()
 	}))
 
 	// Start watcher with fast polling
@@ -58,6 +62,7 @@ func TestWatchOverrides_ReloadsOnChange(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Verify trace event was emitted
+	mu.Lock()
 	found := false
 	for _, e := range traces {
 		if e.Event == "reload_success" {
@@ -65,6 +70,7 @@ func TestWatchOverrides_ReloadsOnChange(t *testing.T) {
 			break
 		}
 	}
+	mu.Unlock()
 	if !found {
 		t.Fatal("expected reload_success trace event")
 	}
@@ -88,9 +94,12 @@ func TestWatchOverrides_IgnoresBadJSON(t *testing.T) {
 
 	r := NewRouterFromConfig(RouterConfig{})
 
+	var mu sync.Mutex
 	var traces []TraceEvent
 	r.SetTraceSink(TraceSinkFunc(func(e TraceEvent) {
+		mu.Lock()
 		traces = append(traces, e)
+		mu.Unlock()
 	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -106,6 +115,7 @@ func TestWatchOverrides_IgnoresBadJSON(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Should have a reload_error trace
+	mu.Lock()
 	found := false
 	for _, e := range traces {
 		if e.Event == "reload_error" {
@@ -113,6 +123,7 @@ func TestWatchOverrides_IgnoresBadJSON(t *testing.T) {
 			break
 		}
 	}
+	mu.Unlock()
 	if !found {
 		t.Fatal("expected reload_error trace event for bad JSON")
 	}

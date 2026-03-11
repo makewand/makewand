@@ -22,7 +22,7 @@ type EnsembleResult struct {
 // Excluded providers are skipped (e.g. code provider must not review its own output).
 // Returns all successful results; the caller selects the winner.
 func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) []EnsembleResult {
-	pe, ok := powerEnsembleTable[phase]
+	pe, ok := getPowerEnsemble(phase)
 	if !ok {
 		return nil
 	}
@@ -158,7 +158,7 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 		return results[0]
 	}
 
-	pe, ok := powerEnsembleTable[phase]
+	pe, ok := getPowerEnsemble(phase)
 	if !ok {
 		r.emitTrace(TraceEvent{
 			Event:  "judge_skipped_missing_config",

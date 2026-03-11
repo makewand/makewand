@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 //go:embed defaults.json
@@ -65,6 +66,10 @@ var powerEnsembleTable map[BuildPhase]powerEnsemble
 
 // contextBudgetTable maps (provider, tier) → context budget in chars for repo context.
 var contextBudgetTable map[string]map[ModelTier]int
+
+// tablesMu protects all package-level strategy tables from concurrent read/write.
+// loadDefaults acquires a write lock; all readers must acquire a read lock.
+var tablesMu sync.RWMutex
 
 // DefaultContextBudget is the fallback when no budget is configured.
 const DefaultContextBudget = 3000
@@ -127,6 +132,9 @@ func loadDefaults(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+
+	tablesMu.Lock()
+	defer tablesMu.Unlock()
 
 	// Models
 	if raw.Models != nil {
@@ -207,6 +215,64 @@ func loadDefaults(data []byte) error {
 	return nil
 }
 
+// Table accessor helpers — acquire tablesMu.RLock for safe concurrent reads.
+
+func getModelID(provider string, tier ModelTier) string {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+	if models, ok := modelTable[provider]; ok {
+		return models[tier]
+	}
+	return ""
+}
+
+func getStrategyEntry(mode UsageMode, task TaskType) (strategyEntry, bool) {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+	tasks, ok := strategyTable[mode]
+	if !ok {
+		return strategyEntry{}, false
+	}
+	entry, ok := tasks[task]
+	if !ok {
+		// Fall back to TaskCode within the lock.
+		entry, ok = tasks[TaskCode]
+	}
+	return entry, ok
+}
+
+func getBuildStrategy(mode UsageMode, phase BuildPhase) (BuildStrategy, bool) {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+	phases, ok := buildStrategyTable[mode]
+	if !ok {
+		return BuildStrategy{}, false
+	}
+	bs, ok := phases[phase]
+	return bs, ok
+}
+
+func getPowerEnsemble(phase BuildPhase) (powerEnsemble, bool) {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+	pe, ok := powerEnsembleTable[phase]
+	return pe, ok
+}
+
+func getCostEntry(modelID string) (costEntry, bool) {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+	e, ok := costTable[modelID]
+	return e, ok
+}
+
+func getModelTable(provider string) (map[ModelTier]string, bool) {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+	m, ok := modelTable[provider]
+	return m, ok
+}
+
 func parseTier(s string) ModelTier {
 	switch s {
 	case "mid":
@@ -255,6 +321,8 @@ func parsePhase(s string) BuildPhase {
 
 // validateStrategyTables checks internal consistency of the strategy and cost tables.
 func validateStrategyTables() error {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
 	// 1. Every provider in strategyTable must have a modelTable entry.
 	for mode, tasks := range strategyTable {
 		for task, entry := range tasks {
@@ -324,6 +392,12 @@ func validateStrategyTables() error {
 // ContextBudgetForProvider returns the context budget (in chars) for a given
 // provider and tier. Returns defaultContextBudget when no entry is configured.
 func ContextBudgetForProvider(provider string, tier ModelTier) int {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+	return contextBudgetForProviderLocked(provider, tier)
+}
+
+func contextBudgetForProviderLocked(provider string, tier ModelTier) int {
 	if tiers, ok := contextBudgetTable[provider]; ok {
 		if budget, ok := tiers[tier]; ok {
 			return budget
@@ -336,10 +410,12 @@ func ContextBudgetForProvider(provider string, tier ModelTier) int {
 // provider in the strategy table entry for the given (mode, task) combination.
 // Returns defaultContextBudget when no matching strategy entry exists.
 func ContextBudgetForMode(mode UsageMode, task TaskType) int {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
 	if tasks, ok := strategyTable[mode]; ok {
 		if entry, ok := tasks[task]; ok {
 			if len(entry.Providers) > 0 {
-				return ContextBudgetForProvider(entry.Providers[0], entry.Tier)
+				return contextBudgetForProviderLocked(entry.Providers[0], entry.Tier)
 			}
 		}
 	}

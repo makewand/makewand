@@ -49,10 +49,7 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 	}
 
 	for i, provName := range orderedProviders {
-		modelID := ""
-		if models, ok := modelTable[provName]; ok {
-			modelID = models[entry.Tier]
-		}
+		modelID := getModelID(provName, entry.Tier)
 
 		access := r.accessTypes[provName]
 
@@ -101,10 +98,7 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 	candidates := make([]candidate, 0, len(orderedProviders))
 	for i, provName := range orderedProviders {
 		access := r.accessTypes[provName]
-		modelID := ""
-		if models, ok := modelTable[provName]; ok {
-			modelID = models[bs.Tier]
-		}
+		modelID := getModelID(provName, bs.Tier)
 
 		priorBias := 0.0
 		if pos, ok := staticOrder[provName]; ok {
@@ -129,11 +123,7 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 }
 
 func (r *Router) BuildProviderFor(phase BuildPhase) string {
-	modeStrategies, ok := buildStrategyTable[r.effectiveMode()]
-	if !ok {
-		return ""
-	}
-	bs, ok := modeStrategies[phase]
+	bs, ok := getBuildStrategy(r.effectiveMode(), phase)
 	if !ok {
 		return ""
 	}
@@ -141,13 +131,9 @@ func (r *Router) BuildProviderFor(phase BuildPhase) string {
 }
 
 func (r *Router) buildStrategyForPhase(phase BuildPhase) (BuildStrategy, error) {
-	modeStrategies, ok := buildStrategyTable[r.effectiveMode()]
+	bs, ok := getBuildStrategy(r.effectiveMode(), phase)
 	if !ok {
-		return BuildStrategy{}, fmt.Errorf("unknown usage mode: %d", r.effectiveMode())
-	}
-	bs, ok := modeStrategies[phase]
-	if !ok {
-		return BuildStrategy{}, fmt.Errorf("unknown build phase: %d", phase)
+		return BuildStrategy{}, fmt.Errorf("unknown build strategy for mode %d phase %d", r.effectiveMode(), phase)
 	}
 	return bs, nil
 }
@@ -202,14 +188,9 @@ func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
 }
 
 func (r *Router) modeEntry(task TaskType) (strategyEntry, error) {
-	taskStrategies, ok := strategyTable[r.effectiveMode()]
+	entry, ok := getStrategyEntry(r.effectiveMode(), task)
 	if !ok {
 		return strategyEntry{}, fmt.Errorf("unknown usage mode: %d", r.effectiveMode())
-	}
-
-	entry, ok := taskStrategies[task]
-	if !ok {
-		entry = taskStrategies[TaskCode]
 	}
 	return entry, nil
 }
