@@ -43,7 +43,7 @@ const (
 
 // EstimateCost returns the estimated cost in USD for the given model and token counts.
 func EstimateCost(modelID string, inputTokens, outputTokens int) float64 {
-	entry, ok := costTable[modelID]
+	entry, ok := getCostEntry(modelID)
 	if !ok {
 		return 0
 	}
@@ -219,6 +219,7 @@ func (s *sessionUsage) RecordQualityOutcome(phase BuildPhase, provider string, s
 // so the static table acts as a Bayesian prior that gets overridden by observed quality.
 func (s *sessionUsage) ThompsonSample(phase BuildPhase, provider string, priorBias float64) float64 {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	key := qualityKey{phase, provider}
 	q := s.quality[key]
 	var alpha, beta float64
@@ -229,9 +230,7 @@ func (s *sessionUsage) ThompsonSample(phase BuildPhase, provider string, priorBi
 		alpha = priorBias + 1.0
 		beta = 1.0
 	}
-	rng := s.rng
-	s.mu.Unlock()
-	return betaSample(rng, alpha, beta)
+	return betaSample(s.rng, alpha, beta)
 }
 
 // betaSample draws a random variate from Beta(alpha, beta) via the Gamma relationship.
@@ -431,6 +430,9 @@ func (s *sessionUsage) Load(configDir string) error {
 		s.failures[k] += v
 	}
 	for k, v := range data.Quality {
+		if v == nil {
+			continue
+		}
 		parts := strings.SplitN(k, ":", 2)
 		if len(parts) != 2 {
 			continue
