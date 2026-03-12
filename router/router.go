@@ -335,7 +335,7 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 	})
 
 	// Try the preferred model
-	if p, ok := r.providers[modelName]; ok && p.IsAvailable() {
+	if p, ok := r.getProvider(modelName); ok && p.IsAvailable() {
 		if blocked, remaining := r.isCircuitOpen(modelName); blocked {
 			r.emitTrace(TraceEvent{
 				Event:     "route_candidate_skipped",
@@ -364,7 +364,7 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 		if name == modelName {
 			continue
 		}
-		if p, ok := r.providers[name]; ok && p.IsAvailable() {
+		if p, ok := r.getProvider(name); ok && p.IsAvailable() {
 			if blocked, remaining := r.isCircuitOpen(name); blocked {
 				r.emitTrace(TraceEvent{
 					Event:      "route_candidate_skipped",
