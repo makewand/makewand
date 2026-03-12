@@ -60,7 +60,9 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 
 // Get returns a specific provider by name.
 func (r *Router) Get(name string) (Provider, error) {
+	r.providerMu.Lock()
 	p, ok := r.providers[name]
+	r.providerMu.Unlock()
 	if !ok {
 		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q not configured", name), nil)
 	}
@@ -109,6 +111,7 @@ func (r *Router) Available() []string {
 		return r.cachedAvail
 	}
 
+	r.providerMu.Lock()
 	var names []string
 	for name, p := range r.providers {
 		if p.IsAvailable() {
@@ -118,11 +121,20 @@ func (r *Router) Available() []string {
 			names = append(names, name)
 		}
 	}
+	r.providerMu.Unlock()
 	sort.Strings(names)
 
 	r.cachedAvail = names
 	r.cachedAvailAt = time.Now()
 	return names
+}
+
+// getProvider returns a provider by name (thread-safe).
+func (r *Router) getProvider(name string) (Provider, bool) {
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+	p, ok := r.providers[name]
+	return p, ok
 }
 
 // IsSubscription returns true if the named provider uses subscription access.

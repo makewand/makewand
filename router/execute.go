@@ -459,7 +459,7 @@ func (r *Router) chatFallbackCandidates(task TaskType, primaryName string) []fal
 		}
 		// For legacy path, check provider existence and availability inline
 		// (the resolver will also check, but we skip early for non-existent providers)
-		if p, ok := r.providers[name]; ok && p.IsAvailable() {
+		if p, ok := r.getProvider(name); ok && p.IsAvailable() {
 			out = append(out, fallbackCandidate{name: name})
 		}
 	}
@@ -470,7 +470,7 @@ func (r *Router) chatFallbackCandidates(task TaskType, primaryName string) []fal
 // It looks up providers from the registered providers map directly.
 func (r *Router) legacyResolver() candidateResolver {
 	return func(name, _ string) (Provider, string, error) {
-		if p, ok := r.providers[name]; ok {
+		if p, ok := r.getProvider(name); ok {
 			return p, "", nil
 		}
 		return nil, "", fmt.Errorf("provider %s not found", name)
