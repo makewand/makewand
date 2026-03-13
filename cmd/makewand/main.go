@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -60,10 +62,23 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 			}
 
 			initialPrompt := strings.TrimSpace(strings.Join(args, " "))
-			if shouldUseHeadless(initialPrompt, rootPrintFlag, isInteractiveTerminal()) {
+			isTTY := isInteractiveTerminal()
+
+			// Read prompt from stdin when piped and no args provided.
+			if initialPrompt == "" && !isTTY {
+				stdinPrompt, stdinErr := readStdinPrompt()
+				if stdinErr == nil && stdinPrompt != "" {
+					initialPrompt = stdinPrompt
+				}
+			}
+
+			if shouldUseHeadless(initialPrompt, rootPrintFlag, isTTY) {
 				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag, debugFlag)
 			}
-			if initialPrompt == "" && !isInteractiveTerminal() {
+			if rootPrintFlag && initialPrompt == "" {
+				return fmt.Errorf("--print requires a non-empty prompt (via argument or piped stdin)")
+			}
+			if initialPrompt == "" && !isTTY {
 				return fmt.Errorf("interactive TTY not detected; provide a prompt or use --print")
 			}
 
@@ -337,6 +352,30 @@ func isCharDevice(f *os.File) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// readStdinPrompt reads a prompt from piped stdin.
+// It only reads when stdin is a pipe or regular file (not a device or socket).
+// Reads up to 64KB to prevent unbounded memory usage.
+func readStdinPrompt() (string, error) {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return "", err
+	}
+	// Only read if stdin is a pipe or regular file (i.e., has data).
+	if info.Mode()&(os.ModeNamedPipe|os.ModeCharDevice) == 0 && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("stdin is not a pipe or file")
+	}
+	if info.Mode()&os.ModeCharDevice != 0 {
+		return "", fmt.Errorf("stdin is a terminal")
+	}
+	const maxBytes = 64 * 1024
+	reader := bufio.NewReader(io.LimitReader(os.Stdin, maxBytes))
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, debug bool) error {
