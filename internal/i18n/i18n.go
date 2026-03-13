@@ -51,13 +51,30 @@ type Messages struct {
 	TplScript    string
 
 	// Chat
-	ChatWelcome      string
-	ChatPrompt       string
-	ChatCommandHint  string
-	ChatThinking     string
-	ChatWorking      string
-	ChatPlaceholder  string
-	ChatThinkingAnim string
+	ChatWelcome                   string
+	ChatPrompt                    string
+	ChatCommandHint               string
+	ChatThinking                  string
+	ChatWorking                   string
+	ChatPlaceholder               string
+	ChatThinkingAnim              string
+	ActivityTitle                 string
+	ActivityLabel                 string
+	ChatActivityPreparing         string
+	ChatActivityContext           string
+	ChatActivitySelectingProvider string
+	ChatActivitySelectingGeneric  string
+	ChatActivityWaitingProvider   string
+	ChatActivityWaitingGeneric    string
+	ChatActivityStreamingProvider string
+	ChatActivityStreamingGeneric  string
+	ChatActivityWorking           string
+	ChatActivityMultiModel        string
+	ChatActivityElapsed           string
+	ChatActivityFallback          string
+	ChatActivityChunkOne          string
+	ChatActivityChunkMany         string
+	ChatActivityChars             string
 
 	// Cost
 	CostSession      string
@@ -173,13 +190,30 @@ var en = Messages{
 	TplMiniApp:   "Mobile App",
 	TplScript:    "Automation Script",
 
-	ChatWelcome:      "Welcome! I'm here to help you build and modify your project.",
-	ChatPrompt:       "What would you like to do?",
-	ChatCommandHint:  "Commands: /model [fast|balanced|power] | /clear | /status | /cost | /exit (or Ctrl+D)",
-	ChatThinking:     "Thinking...",
-	ChatWorking:      "Working on it...",
-	ChatPlaceholder:  "Type your message... (Enter to send, / for commands)",
-	ChatThinkingAnim: "Thinking...",
+	ChatWelcome:                   "Welcome! I'm here to help you build and modify your project.",
+	ChatPrompt:                    "What would you like to do?",
+	ChatCommandHint:               "Commands: /model [fast|balanced|power] | /clear | /status | /cost | /exit (or Ctrl+D)",
+	ChatThinking:                  "Thinking...",
+	ChatWorking:                   "Working on it...",
+	ChatPlaceholder:               "Type your message... (Enter to send, / for commands)",
+	ChatThinkingAnim:              "Thinking...",
+	ActivityTitle:                 "Activity",
+	ActivityLabel:                 "Activity",
+	ChatActivityPreparing:         "Preparing request context",
+	ChatActivityContext:           "Collecting project context",
+	ChatActivitySelectingProvider: "Selecting %s",
+	ChatActivitySelectingGeneric:  "Selecting provider",
+	ChatActivityWaitingProvider:   "Waiting for %s to start responding",
+	ChatActivityWaitingGeneric:    "Waiting for model response",
+	ChatActivityStreamingProvider: "Receiving response from %s",
+	ChatActivityStreamingGeneric:  "Receiving response",
+	ChatActivityWorking:           "Working on your request",
+	ChatActivityMultiModel:        "Running multi-model evaluation",
+	ChatActivityElapsed:           "elapsed %s",
+	ChatActivityFallback:          "fallback from %s",
+	ChatActivityChunkOne:          "%d chunk",
+	ChatActivityChunkMany:         "%d chunks",
+	ChatActivityChars:             "%d chars",
 
 	CostSession:      "Session Cost",
 	CostMonth:        "Monthly Total",
@@ -287,13 +321,30 @@ var zh = Messages{
 	TplMiniApp:   "小程序 / 移动端",
 	TplScript:    "自动化脚本",
 
-	ChatWelcome:      "欢迎！我来帮你构建和修改项目。",
-	ChatPrompt:       "你想做什么？",
-	ChatCommandHint:  "命令：/model [fast|balanced|power] | /clear | /status | /cost | /exit（或 Ctrl+D）",
-	ChatThinking:     "正在思考...",
-	ChatWorking:      "正在处理...",
-	ChatPlaceholder:  "输入消息... (Enter 发送, / 查看命令)",
-	ChatThinkingAnim: "正在思考...",
+	ChatWelcome:                   "欢迎！我来帮你构建和修改项目。",
+	ChatPrompt:                    "你想做什么？",
+	ChatCommandHint:               "命令：/model [fast|balanced|power] | /clear | /status | /cost | /exit（或 Ctrl+D）",
+	ChatThinking:                  "正在思考...",
+	ChatWorking:                   "正在处理...",
+	ChatPlaceholder:               "输入消息... (Enter 发送, / 查看命令)",
+	ChatThinkingAnim:              "正在思考...",
+	ActivityTitle:                 "当前活动",
+	ActivityLabel:                 "当前活动",
+	ChatActivityPreparing:         "正在准备请求",
+	ChatActivityContext:           "正在收集项目上下文",
+	ChatActivitySelectingProvider: "正在选择 %s",
+	ChatActivitySelectingGeneric:  "正在选择模型",
+	ChatActivityWaitingProvider:   "正在等待 %s 开始响应",
+	ChatActivityWaitingGeneric:    "正在等待模型响应",
+	ChatActivityStreamingProvider: "正在接收 %s 的输出",
+	ChatActivityStreamingGeneric:  "正在接收输出",
+	ChatActivityWorking:           "正在处理请求",
+	ChatActivityMultiModel:        "正在运行多模型评估",
+	ChatActivityElapsed:           "已耗时 %s",
+	ChatActivityFallback:          "从 %s 回退",
+	ChatActivityChunkOne:          "%d 个片段",
+	ChatActivityChunkMany:         "%d 个片段",
+	ChatActivityChars:             "%d 字符",
 
 	CostSession:      "本次费用",
 	CostMonth:        "本月累计",
