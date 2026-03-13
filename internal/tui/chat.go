@@ -59,14 +59,16 @@ type ChatMessage struct {
 
 // ChatPanel is the main chat interaction panel.
 type ChatPanel struct {
-	messages  []ChatMessage
-	viewport  viewport.Model
-	textarea  textarea.Model
-	width     int
-	height    int
-	ready     bool
-	streaming bool
-	streamBuf *strings.Builder
+	messages       []ChatMessage
+	viewport       viewport.Model
+	textarea       textarea.Model
+	width          int
+	height         int
+	ready          bool
+	streaming      bool
+	streamBuf      *strings.Builder
+	streamProvider string
+	streamStatus   string
 
 	slashSelection int
 }
@@ -107,6 +109,8 @@ func (c *ChatPanel) ResetMessages(messages []ChatMessage) {
 	c.messages = append([]ChatMessage(nil), messages...)
 	c.streamBuf.Reset()
 	c.streaming = false
+	c.streamProvider = ""
+	c.streamStatus = ""
 	c.updateViewport()
 }
 
@@ -168,10 +172,36 @@ func (c *ChatPanel) relayout() {
 
 // SetStreaming sets whether the AI is currently streaming a response.
 func (c *ChatPanel) SetStreaming(streaming bool) {
+	if c.streaming == streaming && c.streamProvider == "" && c.streamStatus == "" && !streaming {
+		return
+	}
 	c.streaming = streaming
 	if streaming {
 		c.streamBuf.Reset()
 	}
+	c.streamProvider = ""
+	c.streamStatus = ""
+	c.updateViewport()
+}
+
+// SetStreamProvider updates the provider label shown for the active stream.
+func (c *ChatPanel) SetStreamProvider(provider string) {
+	provider = strings.TrimSpace(provider)
+	if c.streamProvider == provider {
+		return
+	}
+	c.streamProvider = provider
+	c.updateViewport()
+}
+
+// SetStreamStatus updates the live status shown for the active stream.
+func (c *ChatPanel) SetStreamStatus(status string) {
+	status = strings.TrimSpace(status)
+	if c.streamStatus == status {
+		return
+	}
+	c.streamStatus = status
+	c.updateViewport()
 }
 
 // AppendStream appends text to the current streaming response.
@@ -192,6 +222,8 @@ func (c *ChatPanel) FinishStream(provider string, cost float64) {
 		c.streamBuf.Reset()
 	}
 	c.streaming = false
+	c.streamProvider = ""
+	c.streamStatus = ""
 	c.updateViewport()
 }
 
@@ -432,11 +464,29 @@ func (c *ChatPanel) renderMessages() string {
 
 	// Show streaming content
 	streamStr := c.streamBuf.String()
+	streamLabel := "AI"
+	if c.streamProvider != "" {
+		streamLabel = fmt.Sprintf("AI (%s)", c.streamProvider)
+	}
 	if c.streaming && streamStr != "" {
-		b.WriteString(aiMsgStyle.Render("AI") + " " + spinnerStyle.Render("*") + "\n")
+		b.WriteString(aiMsgStyle.Render(streamLabel) + " " + spinnerStyle.Render("*") + "\n")
 		b.WriteString(wrapText(streamStr, maxWidth) + "\n")
+		if c.streamStatus != "" {
+			b.WriteString(mutedStyle.Render(wrapText(c.streamStatus, maxWidth)) + "\n")
+		}
 	} else if c.streaming {
-		b.WriteString(spinnerStyle.Render("* "+i18n.Msg().ChatThinkingAnim) + "\n")
+		if c.streamProvider != "" {
+			b.WriteString(aiMsgStyle.Render(streamLabel) + " " + spinnerStyle.Render("*") + "\n")
+			if c.streamStatus != "" {
+				b.WriteString(mutedStyle.Render(wrapText(c.streamStatus, maxWidth)) + "\n")
+			} else {
+				b.WriteString(mutedStyle.Render(i18n.Msg().ChatThinkingAnim) + "\n")
+			}
+		} else if c.streamStatus != "" {
+			b.WriteString(spinnerStyle.Render("* "+wrapText(c.streamStatus, maxWidth)) + "\n")
+		} else {
+			b.WriteString(spinnerStyle.Render("* "+i18n.Msg().ChatThinkingAnim) + "\n")
+		}
 	}
 
 	return b.String()

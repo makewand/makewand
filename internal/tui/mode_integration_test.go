@@ -367,6 +367,51 @@ func TestMode_ChatStreaming_FallbackNotice(t *testing.T) {
 	}
 }
 
+func TestMode_ChatStreaming_UpdatesLiveActivityStatus(t *testing.T) {
+	app := *NewApp(ModeChat, config.DefaultConfig(), "")
+	app.chat.SetStreaming(true)
+	app.activity.Start()
+	app.syncChatActivity()
+
+	start := aiStreamStartMsg{
+		ch:       make(chan model.StreamChunk),
+		provider: "gemini",
+	}
+	app = driveMessages(t, app, start)
+
+	if app.state != StateStreaming {
+		t.Fatalf("state = %v, want %v", app.state, StateStreaming)
+	}
+	if app.chat.streamProvider != "gemini" {
+		t.Fatalf("streamProvider = %q, want %q", app.chat.streamProvider, "gemini")
+	}
+	if !strings.Contains(app.chat.streamStatus, "Waiting for gemini") {
+		t.Fatalf("streamStatus = %q, want waiting status", app.chat.streamStatus)
+	}
+
+	app = driveMessages(t, app, aiStreamMsg{
+		chunk:    model.StreamChunk{Content: "repo summary"},
+		provider: "gemini",
+	})
+	if !strings.Contains(app.chat.streamStatus, "Receiving response from gemini") {
+		t.Fatalf("streamStatus = %q, want receiving status", app.chat.streamStatus)
+	}
+	if !strings.Contains(app.chat.streamStatus, "1 chunk") {
+		t.Fatalf("streamStatus = %q, want chunk count", app.chat.streamStatus)
+	}
+
+	app = driveMessages(t, app, aiStreamMsg{
+		chunk:    model.StreamChunk{Done: true},
+		provider: "gemini",
+	})
+	if app.state != StateIdle {
+		t.Fatalf("state = %v, want %v", app.state, StateIdle)
+	}
+	if app.activity.Snapshot().Active {
+		t.Fatal("activity should be cleared after stream completion")
+	}
+}
+
 func TestMode_ChatStreaming_ErrorMidStream(t *testing.T) {
 	app := *NewApp(ModeChat, config.DefaultConfig(), "")
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
@@ -161,4 +162,29 @@ func emitExecTrace(
 
 func boolPtr(v bool) *bool {
 	return &v
+}
+
+func emitChatStreamTrace(router *model.Router, provider string, chunk model.StreamChunk) {
+	if router == nil {
+		return
+	}
+
+	event := model.TraceEvent{
+		Timestamp: time.Now().UTC(),
+		Selected:  provider,
+	}
+
+	switch {
+	case chunk.Error != nil:
+		event.Event = "chat_stream_runtime_error"
+		event.Error = chunk.Error.Error()
+	case chunk.Done:
+		event.Event = "chat_stream_done"
+	default:
+		event.Event = "chat_stream_chunk"
+		size := utf8.RuneCountInString(chunk.Content)
+		event.Detail = fmt.Sprintf("content_runes=%d", size)
+	}
+
+	router.EmitTrace(event)
 }

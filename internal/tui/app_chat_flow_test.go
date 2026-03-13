@@ -3,6 +3,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -20,6 +22,7 @@ type chatFlowStubProvider struct {
 	chatErr     error
 
 	streamErr error
+	streamCtx context.Context
 
 	chatCalls   int
 	streamCalls int
@@ -41,8 +44,13 @@ func (p *chatFlowStubProvider) Chat(context.Context, []model.Message, string, in
 	return p.chatContent, usage, nil
 }
 
-func (p *chatFlowStubProvider) ChatStream(context.Context, []model.Message, string, int) (<-chan model.StreamChunk, error) {
+func (p *chatFlowStubProvider) ChatStream(ctx context.Context, _ []model.Message, _ string, _ int) (<-chan model.StreamChunk, error) {
+	return p.chatStreamWithContext(ctx)
+}
+
+func (p *chatFlowStubProvider) chatStreamWithContext(ctx context.Context) (<-chan model.StreamChunk, error) {
 	p.streamCalls++
+	p.streamCtx = ctx
 	if p.streamErr != nil {
 		return nil, p.streamErr
 	}
@@ -147,6 +155,67 @@ func TestSubmitChatInput_NonPowerUsesStreamPath(t *testing.T) {
 	}
 }
 
+func TestSubmitChatInput_ShowsPreparingActivityImmediately(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	m, cmd := app.submitChatInput("write a tiny function")
+	app = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+	if app.state != StateStreaming {
+		t.Fatalf("state = %v, want %v", app.state, StateStreaming)
+	}
+	if !app.chat.streaming {
+		t.Fatal("chat.streaming should be true after submit")
+	}
+
+	snapshot := app.activity.Snapshot()
+	if !snapshot.Active {
+		t.Fatal("activity should be active after submit")
+	}
+	if snapshot.Phase != chatActivityPreparing {
+		t.Fatalf("activity phase = %q, want %q", snapshot.Phase, chatActivityPreparing)
+	}
+	if !strings.Contains(app.chat.streamStatus, "Preparing request context") {
+		t.Fatalf("streamStatus = %q, want preparing status", app.chat.streamStatus)
+	}
+}
+
+func TestSubmitChatInput_StreamPathKeepsContextAliveAfterStart(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	router := model.NewRouter(cfg)
+	router.SetMode(model.ModeBalanced)
+	stub := &chatFlowStubProvider{name: "private"}
+	if err := router.RegisterProvider("private", stub, model.AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+	app.router = router
+
+	m, cmd := app.submitChatInput("write a tiny function")
+	_ = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+
+	msg := cmd()
+	if _, ok := msg.(aiStreamStartMsg); !ok {
+		t.Fatalf("cmd() returned %T, want aiStreamStartMsg", msg)
+	}
+	if stub.streamCtx == nil {
+		t.Fatal("stream context was not captured")
+	}
+
+	select {
+	case <-stub.streamCtx.Done():
+		t.Fatal("stream context canceled immediately after start")
+	default:
+	}
+}
+
 func TestSubmitChatInput_ExplainUsesUnaryChatPath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
@@ -185,6 +254,46 @@ func TestSubmitChatInput_ExplainUsesUnaryChatPath(t *testing.T) {
 	}
 	if stub.streamCalls != 0 {
 		t.Fatalf("ChatStream calls = %d, want 0", stub.streamCalls)
+	}
+}
+
+func TestSubmitChatInput_ExplainUsesStreamPathForGeminiCLI(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "gemini-stream.sh")
+	body := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"repo summary\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	router := model.NewRouterFromConfig(model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"gemini": {Provider: model.NewGeminiCLI(script), Access: model.AccessSubscription},
+		},
+		DefaultModel:  "gemini",
+		AnalysisModel: "gemini",
+		CodingModel:   "gemini",
+		ReviewModel:   "gemini",
+	})
+	app.router = router
+
+	m, cmd := app.submitChatInput("评估这个软件")
+	_ = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+
+	msg := cmd()
+	start, ok := msg.(aiStreamStartMsg)
+	if !ok {
+		t.Fatalf("cmd() returned %T, want aiStreamStartMsg", msg)
+	}
+	if start.provider != "gemini" {
+		t.Fatalf("aiStreamStartMsg.provider = %q, want %q", start.provider, "gemini")
 	}
 }
 
@@ -298,6 +407,17 @@ func TestSubmitChatInput_StatusCommandHandledLocally(t *testing.T) {
 	last := app.chat.messages[len(app.chat.messages)-1]
 	if !strings.Contains(last.Content, "Model profile:") || !strings.Contains(last.Content, "Available providers:") {
 		t.Fatalf("status message = %q, want session summary", last.Content)
+	}
+}
+
+func TestStatusSummary_IncludesActivityWhenBusy(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.activity.Start()
+
+	summary := app.statusSummary()
+	if !strings.Contains(summary, "Activity:") {
+		t.Fatalf("statusSummary = %q, want activity line", summary)
 	}
 }
 

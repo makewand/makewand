@@ -21,22 +21,24 @@ import (
 // but are inlined here to keep the model package free of config dependencies.
 const (
 	PromptModeStdin = "stdin" // pass prompt via stdin
-	PromptModeArg   = "arg"  // pass prompt as trailing CLI argument
+	PromptModeArg   = "arg"   // pass prompt as trailing CLI argument
 )
 
 // CLIProvider wraps a subscription CLI tool (claude, gemini, codex) as a Provider.
 // It calls the CLI in non-interactive/print mode, which uses the user's subscription.
 type CLIProvider struct {
-	name     string // "claude-cli", "gemini-cli", "codex-cli"
-	binPath  string // absolute path to the binary
-	provider string // display name: "claude", "gemini", "codex"
-	buildCmd func(ctx context.Context, prompt string) *exec.Cmd
-	checkCmd func(ctx context.Context) *exec.Cmd
+	name           string // "claude-cli", "gemini-cli", "codex-cli"
+	binPath        string // absolute path to the binary
+	provider       string // display name: "claude", "gemini", "codex"
+	buildCmd       func(ctx context.Context, prompt string) *exec.Cmd
+	buildStreamCmd func(ctx context.Context, prompt string) *exec.Cmd
+	checkCmd       func(ctx context.Context) *exec.Cmd
 
 	// jsonOutput indicates the CLI is invoked with a JSON output flag.
 	// When true, chatAttempt tries parseJSONResponse before falling back to text.
 	jsonOutput        bool
 	parseJSONResponse func(raw []byte) (content string, usage *Usage, err error)
+	parseStreamLine   func(line string) ([]StreamChunk, error)
 
 	// systemFlag, if non-empty, is the CLI flag for passing system prompts
 	// separately (e.g. "--append-system-prompt" for Claude CLI).
@@ -112,6 +114,18 @@ func NewClaudeCLI(binPath string) *CLIProvider {
 		cmd.Env = filterEnv(cmd.Environ(), "CLAUDECODE")
 		return cmd
 	}
+	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		args := []string{"-p", prompt, "--output-format", "text"}
+		if modelID, ok := ModelFromContext(ctx); ok && !strings.HasSuffix(modelID, "-cli") {
+			args = append(args, "--model", modelID)
+		}
+		if sys, ok := SystemFromContext(ctx); ok {
+			args = append(args, "--append-system-prompt", sys)
+		}
+		cmd := exec.CommandContext(ctx, binPath, args...)
+		cmd.Env = filterEnv(cmd.Environ(), "CLAUDECODE")
+		return cmd
+	}
 	p.checkCmd = func(ctx context.Context) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, binPath, "--version")
 		cmd.Env = filterEnv(cmd.Environ(), "CLAUDECODE")
@@ -130,11 +144,21 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 		provider:          "gemini",
 		jsonOutput:        true,
 		parseJSONResponse: parseGeminiCLIJSON,
+		parseStreamLine:   parseGeminiCLIStreamJSONLine,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
 		args := []string{"-p", prompt, "--sandbox", "false", "--output-format", "json"}
 		// Per-call model selection: use --model to select tier-specific models
 		// (e.g. flash for fast/balanced, pro for power).
+		if modelID, ok := ModelFromContext(ctx); ok && !strings.HasSuffix(modelID, "-cli") {
+			args = append(args, "--model", modelID)
+		}
+		cmd := exec.CommandContext(ctx, binPath, args...)
+		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
+		return cmd
+	}
+	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		args := []string{"-p", prompt, "--sandbox", "false", "--output-format", "stream-json"}
 		if modelID, ok := ModelFromContext(ctx); ok && !strings.HasSuffix(modelID, "-cli") {
 			args = append(args, "--model", modelID)
 		}
@@ -170,6 +194,12 @@ func NewCodexCLI(binPath string) *CLIProvider {
 		}
 		// Default: exec with JSON output for structured usage data.
 		return exec.CommandContext(ctx, binPath, "exec", "--json", "--skip-git-repo-check", prompt)
+	}
+	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+			return exec.CommandContext(ctx, binPath, "review", "--uncommitted")
+		}
+		return exec.CommandContext(ctx, binPath, "exec", "--skip-git-repo-check", prompt)
 	}
 	p.checkCmd = func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, binPath, "--version")
@@ -380,7 +410,11 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 		ctx, cancel = context.WithCancel(ctx)
 	}
 
-	cmd := c.buildCmd(ctx, prompt)
+	buildCmd := c.buildStreamCmd
+	if buildCmd == nil {
+		buildCmd = c.buildCmd
+	}
+	cmd := buildCmd(ctx, prompt)
 	setCLIProcessGroup(cmd)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -413,6 +447,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 
 		scanner := bufio.NewScanner(stdoutPipe)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		terminalSent := false
 	streamLoop:
 		for scanner.Scan() {
 			select {
@@ -422,13 +457,36 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 			default:
 			}
 			line := stripANSI(scanner.Text())
-			if line != "" {
-				select {
-				case ch <- StreamChunk{Content: line + "\n"}:
-				case <-ctx.Done():
-					killCLIProcess(cmd)
+			if line == "" {
+				continue
+			}
+
+			if c.parseStreamLine != nil {
+				chunks, parseErr := c.parseStreamLine(line)
+				if parseErr != nil {
+					ch <- StreamChunk{Error: newProviderError(c.provider, "CLI stream parse", ErrorKindProvider, false, 0, parseErr.Error(), parseErr)}
+					terminalSent = true
 					break streamLoop
 				}
+				for _, chunk := range chunks {
+					select {
+					case ch <- chunk:
+					case <-ctx.Done():
+						killCLIProcess(cmd)
+						break streamLoop
+					}
+					if chunk.Done || chunk.Error != nil {
+						terminalSent = true
+					}
+				}
+				continue
+			}
+
+			select {
+			case ch <- StreamChunk{Content: line + "\n"}:
+			case <-ctx.Done():
+				killCLIProcess(cmd)
+				break streamLoop
 			}
 		}
 
@@ -455,7 +513,9 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 			return
 		}
 
-		ch <- StreamChunk{Done: true}
+		if !terminalSent {
+			ch <- StreamChunk{Done: true}
+		}
 	}()
 
 	return ch, nil
@@ -529,6 +589,18 @@ type geminiCLIJSON struct {
 	} `json:"stats"`
 }
 
+type geminiCLIStreamJSON struct {
+	Type    string `json:"type"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	Status  string `json:"status"`
+	Error   *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
 // parseGeminiCLIJSON extracts the response text and real usage from Gemini CLI JSON output.
 func parseGeminiCLIJSON(raw []byte) (string, *Usage, error) {
 	var resp geminiCLIJSON
@@ -560,6 +632,44 @@ func parseGeminiCLIJSON(raw []byte) (string, *Usage, error) {
 	return content, usage, nil
 }
 
+func parseGeminiCLIStreamJSONLine(line string) ([]StreamChunk, error) {
+	line = strings.TrimSpace(line)
+	if line == "" || !strings.HasPrefix(line, "{") {
+		// Gemini CLI can emit plain-text prelude lines (for example credential/cache
+		// notices) before the NDJSON event stream starts. Ignore those lines.
+		return nil, nil
+	}
+
+	var event geminiCLIStreamJSON
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		return nil, fmt.Errorf("parse gemini stream-json line: %w", err)
+	}
+
+	switch event.Type {
+	case "message":
+		if event.Role == "assistant" && event.Content != "" {
+			return []StreamChunk{{Content: event.Content}}, nil
+		}
+		return nil, nil
+	case "result":
+		if strings.EqualFold(event.Status, "success") {
+			return []StreamChunk{{Done: true}}, nil
+		}
+		msg := strings.TrimSpace(event.Message)
+		if event.Error != nil && strings.TrimSpace(event.Error.Message) != "" {
+			msg = strings.TrimSpace(event.Error.Message)
+		}
+		if msg == "" {
+			msg = "gemini stream failed"
+		}
+		return []StreamChunk{{
+			Error: newProviderError("gemini", "CLI stream", ErrorKindProvider, false, 0, msg, nil),
+		}}, nil
+	default:
+		return nil, nil
+	}
+}
+
 // --- Codex CLI JSONL Parsing ---
 
 // codexJSONLEvent represents a single line in Codex CLI `exec --json` JSONL output.
@@ -571,10 +681,10 @@ func parseGeminiCLIJSON(raw []byte) (string, *Usage, error) {
 type codexJSONLEvent struct {
 	Type string `json:"type"`
 	Item struct {
-		Type            string `json:"type"`
-		Text            string `json:"text"`             // agent_message text
+		Type             string `json:"type"`
+		Text             string `json:"text"`              // agent_message text
 		AggregatedOutput string `json:"aggregated_output"` // command_execution output
-		Status          string `json:"status"`
+		Status           string `json:"status"`
 	} `json:"item"`
 	Usage struct {
 		InputTokens       int `json:"input_tokens"`

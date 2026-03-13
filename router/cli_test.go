@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 )
 
 func TestCLIProvider_ChatStream_ReturnsErrorOnExitFailure(t *testing.T) {
@@ -136,6 +135,87 @@ func TestCLIProvider_ChatStream_EmitsTimeoutErrorOnDeadline(t *testing.T) {
 		case <-timeout:
 			t.Fatal("timed out waiting for stream timeout error")
 		}
+	}
+}
+
+func TestGeminiCLI_ChatStream_ParsesStreamJSON(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "gemini-stream.sh")
+	body := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"init\",\"session_id\":\"s\",\"model\":\"gemini\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Hello\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\" world\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewGeminiCLI(script)
+	ch, err := p.ChatStream(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
+	if err != nil {
+		t.Fatalf("ChatStream() start error = %v", err)
+	}
+
+	var (
+		parts []string
+		done  bool
+	)
+	for chunk := range ch {
+		if chunk.Error != nil {
+			t.Fatalf("stream error = %v", chunk.Error)
+		}
+		if chunk.Content != "" {
+			parts = append(parts, chunk.Content)
+		}
+		if chunk.Done {
+			done = true
+		}
+	}
+
+	if got := strings.Join(parts, ""); got != "Hello world" {
+		t.Fatalf("stream content = %q, want %q", got, "Hello world")
+	}
+	if !done {
+		t.Fatal("stream did not emit Done")
+	}
+}
+
+func TestGeminiCLI_ChatStream_IgnoresPlaintextPrelude(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "gemini-stream-prelude.sh")
+	body := "#!/bin/sh\n" +
+		"printf '%s\\n' 'Loaded cached credentials.'\n" +
+		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"OK\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewGeminiCLI(script)
+	ch, err := p.ChatStream(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
+	if err != nil {
+		t.Fatalf("ChatStream() start error = %v", err)
+	}
+
+	var (
+		content string
+		done    bool
+	)
+	for chunk := range ch {
+		if chunk.Error != nil {
+			t.Fatalf("stream error = %v", chunk.Error)
+		}
+		content += chunk.Content
+		if chunk.Done {
+			done = true
+		}
+	}
+
+	if content != "OK" {
+		t.Fatalf("stream content = %q, want %q", content, "OK")
+	}
+	if !done {
+		t.Fatal("stream did not emit Done")
 	}
 }
 

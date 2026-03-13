@@ -68,6 +68,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 				a.cancelAI()
 				a.cancelAI = nil
 			}
+			a.activity.Reset()
 			a.state = StateQuitting
 			return a, tea.Quit
 		}
@@ -75,11 +76,13 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 
 	a.chat.AddMessage(ChatMessage{Role: "user", Content: input})
 	a.chat.SetStreaming(true)
+	a.state = StateStreaming
 	a = a.applyBudgetRoutingPolicy()
+	a.activity.Start()
+	a.syncChatActivity()
 
 	messages := a.chat.ToModelMessages()
 	task := classifyTask(input)
-	systemPrompt := buildSystemPrompt(a.project, task, a.router.Mode())
 
 	ctx, cancel := context.WithTimeout(context.Background(), chatStreamTimeout)
 	a.cancelAI = cancel
@@ -87,10 +90,16 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 	// In power mode, chat uses multi-model ensemble + judge (ChatBest).
 	// Other modes keep low-latency stream-first behavior.
 	if a.router.ModeSet() && a.router.Mode() == model.ModePower {
+		project := a.project
+		router := a.router
+		activity := a.activity
 		phase := chatTaskToBuildPhase(task)
 		cmd := func() tea.Msg {
 			defer cancel()
-			content, usage, result, err := a.router.ChatBest(ctx, phase, messages, systemPrompt)
+			markChatPreparationActivity(activity, project != nil)
+			systemPrompt := buildSystemPrompt(project, task, router.Mode())
+			activity.SetPhase(chatActivityWaiting, "", "", false, i18n.Msg().ChatActivityMultiModel)
+			content, usage, result, err := router.ChatBest(ctx, phase, messages, systemPrompt)
 			if err != nil {
 				return aiResponseMsg{err: err}
 			}
@@ -109,12 +118,20 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		return a, cmd
 	}
 
-	// Explain/analyze prompts are short and benefit from unary chat.
-	// Using unary chat here avoids getting stuck waiting for an unreliable stream.
-	if shouldUseUnaryChat(task) {
+	// Explain/analyze prompts usually use unary chat for lower overhead.
+	// Gemini CLI is a special case: it supports stream-json in headless mode,
+	// which provides visible progress for repo-evaluation prompts.
+	if shouldUseUnaryChat(task) && !a.shouldPreferStreamingChat(task) {
+		project := a.project
+		router := a.router
+		activity := a.activity
 		cmd := func() tea.Msg {
 			defer cancel()
-			content, usage, result, err := a.router.Chat(ctx, task, messages, systemPrompt)
+			markChatPreparationActivity(activity, project != nil)
+			systemPrompt := buildSystemPrompt(project, task, router.Mode())
+			route, routeErr := router.Route(task)
+			markChatRoutingActivity(activity, route, routeErr)
+			content, usage, result, err := router.Chat(ctx, task, messages, systemPrompt)
 			if err != nil {
 				return aiResponseMsg{err: err}
 			}
@@ -133,9 +150,15 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		return a, cmd
 	}
 
+	project := a.project
+	router := a.router
+	activity := a.activity
 	cmd := func() tea.Msg {
-		defer cancel()
-		ch, result, err := a.router.ChatStream(ctx, task, messages, systemPrompt)
+		markChatPreparationActivity(activity, project != nil)
+		systemPrompt := buildSystemPrompt(project, task, router.Mode())
+		route, routeErr := router.Route(task)
+		markChatRoutingActivity(activity, route, routeErr)
+		ch, result, err := router.ChatStream(ctx, task, messages, systemPrompt)
 		if err != nil {
 			return aiResponseMsg{err: err}
 		}
@@ -149,6 +172,34 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 	}
 
 	return a, cmd
+}
+
+func (a App) shouldPreferStreamingChat(task model.TaskType) bool {
+	route, err := a.router.Route(task)
+	if err != nil {
+		return false
+	}
+	if route.Actual != "gemini" {
+		return false
+	}
+	_, ok := route.Provider.(*model.CLIProvider)
+	return ok
+}
+
+func markChatPreparationActivity(activity *chatActivityState, hasProject bool) {
+	activity.SetPhase(chatActivityPreparing, "", "", false, "")
+	if hasProject {
+		activity.SetPhase(chatActivityContext, "", "", false, "")
+	}
+}
+
+func markChatRoutingActivity(activity *chatActivityState, route model.RouteResult, routeErr error) {
+	activity.SetPhase(chatActivityRouting, "", "", false, "")
+	if routeErr == nil {
+		activity.SetPhase(chatActivityWaiting, route.Actual, route.Requested, route.IsFallback, "")
+		return
+	}
+	activity.SetPhase(chatActivityWaiting, "", "", false, "")
 }
 
 func (a App) handleHelpCommand() (tea.Model, tea.Cmd) {
@@ -167,6 +218,7 @@ func (a App) handleClearCommand() (tea.Model, tea.Cmd) {
 	a.pendingTestsPlan = nil
 	a.state = StateIdle
 	a.clearPendingApproval()
+	a.activity.Reset()
 	a.restoredSession = false
 	a.restoredMessageCount = 0
 	return a, tea.ClearScreen
@@ -300,6 +352,7 @@ func (a App) chatHelpText() string {
 
 func (a App) statusSummary() string {
 	var lines []string
+	msg := i18n.Msg()
 	lines = append(lines, fmt.Sprintf("Model profile: %s", a.currentModeLabel()))
 
 	available := a.router.Available()
@@ -317,6 +370,11 @@ func (a App) statusSummary() string {
 	if summary := a.pendingApprovalSummary(); summary != "" {
 		lines = append(lines, "Pending approval:")
 		lines = append(lines, summary)
+	}
+	if a.activity != nil {
+		if snapshot := a.activity.Snapshot(); snapshot.Active {
+			lines = append(lines, fmt.Sprintf("%s: %s", msg.ActivityLabel, formatChatActivityStatus(snapshot)))
+		}
 	}
 
 	if a.sessionFile != "" {

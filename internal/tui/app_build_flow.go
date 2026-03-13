@@ -26,6 +26,8 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 			Content: fmt.Sprintf("Error: %s", msg.err),
 		})
 		a.chat.SetStreaming(false)
+		a.state = StateIdle
+		a.activity.Reset()
 		return a, nil
 	}
 
@@ -40,6 +42,8 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 	isSub := a.router.IsSubscription(msg.provider)
 	a.cost.AddWithTokens(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens, isSub)
 	a.chat.SetStreaming(false)
+	a.state = StateIdle
+	a.activity.Reset()
 
 	// Record the code provider for cross-model review
 	if a.wizard.Phase() == WizardPhaseBuild && a.pipeline.CodeProvider() == "" {

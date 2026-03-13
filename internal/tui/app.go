@@ -72,6 +72,7 @@ type App struct {
 
 	// Cancellable AI context
 	cancelAI context.CancelFunc
+	activity *chatActivityState
 
 	// Build pipeline domain logic (phase transitions, retry counting, provider tracking).
 	pipeline *engine.BuildPipeline
@@ -224,6 +225,7 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 		mode:     mode,
 		cfg:      cfg,
 		router:   router,
+		activity: newChatActivityState(),
 		pipeline: engine.NewBuildPipeline(),
 		chat:     NewChatPanel(),
 		fileTree: NewFileTreePanel(),
@@ -327,6 +329,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.cancelAI()
 				a.cancelAI = nil
 			}
+			a.activity.Reset()
 			a.state = StateQuitting
 			return a, tea.Quit
 
@@ -359,6 +362,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case aiResponseMsg:
+		if a.cancelAI != nil {
+			a.cancelAI = nil
+		}
+		a.state = StateIdle
 		return a.handleAIResponse(msg)
 
 	case startPromptMsg:
@@ -367,6 +374,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case aiStreamStartMsg:
 		a.streamCh = msg.ch
 		a.streamProv = msg.provider
+		a.state = StateStreaming
+		a.activity.SetPhase(chatActivityWaiting, msg.provider, msg.requested, msg.isFallback, "")
 
 		if msg.isFallback {
 			m := i18n.Msg()
@@ -379,6 +388,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, a.waitForStreamChunk())
 
 	case aiStreamMsg:
+		emitChatStreamTrace(a.router, msg.provider, msg.chunk)
 		if msg.chunk.Error != nil {
 			a.chat.AddMessage(ChatMessage{
 				Role:    "system",
@@ -386,9 +396,21 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 			a.chat.SetStreaming(false)
 			a.streamCh = nil
+			a.state = StateIdle
+			a.activity.Reset()
+			if a.cancelAI != nil {
+				a.cancelAI()
+				a.cancelAI = nil
+			}
 		} else if msg.chunk.Done {
 			a.chat.FinishStream(msg.provider, 0)
 			a.streamCh = nil
+			a.state = StateIdle
+			a.activity.Reset()
+			if a.cancelAI != nil {
+				a.cancelAI()
+				a.cancelAI = nil
+			}
 			// After stream finishes, check for files in the response
 			content := a.chat.LastAssistantContent()
 			if content != "" && a.project != nil {
@@ -407,6 +429,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		} else {
+			a.activity.MarkChunk(msg.provider, msg.chunk.Content)
 			a.chat.AppendStream(msg.chunk.Content)
 			cmds = append(cmds, a.waitForStreamChunk())
 		}
@@ -462,6 +485,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.progress, progCmd = a.progress.Update(msg)
 		cmds = append(cmds, progCmd)
 	}
+
+	a.syncChatActivity()
 
 	var chatCmd tea.Cmd
 	a.chat, chatCmd = a.chat.Update(msg)
@@ -596,6 +621,9 @@ func (a App) renderModeBadge(msg *i18n.Messages) string {
 func (a App) viewSidePanel(width int) string {
 	var sections []string
 
+	if activityView := a.viewActivity(width); activityView != "" {
+		sections = append(sections, activityView)
+	}
 	sections = append(sections, a.fileTree.View())
 	sections = append(sections, a.cost.View(width))
 	if approvalView := a.viewPendingApproval(width); approvalView != "" {
@@ -616,6 +644,39 @@ func (a App) viewSidePanel(width int) string {
 	}
 
 	return strings.Join(sections, "\n")
+}
+
+func (a *App) syncChatActivity() {
+	if a.activity == nil {
+		return
+	}
+	snapshot := a.activity.Snapshot()
+	if !a.chat.streaming || !snapshot.Active {
+		a.chat.SetStreamProvider("")
+		a.chat.SetStreamStatus("")
+		return
+	}
+	a.chat.SetStreamProvider(snapshot.Provider)
+	a.chat.SetStreamStatus(formatChatActivityStatus(snapshot))
+}
+
+func (a *App) viewActivity(width int) string {
+	if a.activity == nil {
+		return ""
+	}
+	snapshot := a.activity.Snapshot()
+	if !snapshot.Active {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(i18n.Msg().ActivityTitle) + "\n")
+	b.WriteString(fmt.Sprintf(" %s %s\n", a.spinner.View(), formatChatActivityHeadline(snapshot)))
+	if meta := formatChatActivityMeta(snapshot); meta != "" {
+		b.WriteString(mutedStyle.Render("   "+wrapText(meta, maxInt(width-8, 12))) + "\n")
+	}
+
+	return statusBorderStyle.Width(width - 2).Render(b.String())
 }
 
 func isLGTMResponse(content string) bool {
