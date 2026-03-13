@@ -313,6 +313,12 @@ func (r *Router) Route(task TaskType) (RouteResult, error) {
 	return r.routeLegacy(task)
 }
 
+// legacyModelID returns the best-effort model ID for a provider in legacy mode.
+// Legacy routing has no tier concept, so we use TierMid as a reasonable default.
+func legacyModelID(providerName string) string {
+	return getModelID(providerName, TierMid)
+}
+
 // routeLegacy is the original routing logic (config-based model assignment).
 func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 	var modelName string
@@ -342,17 +348,21 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 				Task:      taskTypeName(task),
 				Requested: modelName,
 				Selected:  modelName,
+				ModelID:   legacyModelID(modelName),
 				Detail:    circuitOpenDetail(modelName, remaining),
 			})
 		} else {
+			modelID := legacyModelID(modelName)
 			r.emitTrace(TraceEvent{
 				Event:     "route_selected",
 				Task:      taskTypeName(task),
 				Requested: modelName,
 				Selected:  modelName,
+				ModelID:   modelID,
 			})
 			return RouteResult{
 				Provider:  p,
+				ModelID:   modelID,
 				Requested: modelName,
 				Actual:    modelName,
 			}, nil
@@ -371,20 +381,24 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 					Task:       taskTypeName(task),
 					Requested:  modelName,
 					Selected:   name,
+					ModelID:    legacyModelID(name),
 					IsFallback: true,
 					Detail:     circuitOpenDetail(name, remaining),
 				})
 				continue
 			}
+			modelID := legacyModelID(name)
 			r.emitTrace(TraceEvent{
 				Event:      "route_selected",
 				Task:       taskTypeName(task),
 				Requested:  modelName,
 				Selected:   name,
+				ModelID:    modelID,
 				IsFallback: true,
 			})
 			return RouteResult{
 				Provider:   p,
+				ModelID:    modelID,
 				Requested:  modelName,
 				Actual:     name,
 				IsFallback: true,
