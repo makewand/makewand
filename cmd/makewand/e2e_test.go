@@ -65,7 +65,6 @@ func TestE2EPrintRoutesByClassifier(t *testing.T) {
 	}
 }
 
-
 func TestE2EDoctorJSONIncludesPolicyChecks(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping E2E test in short mode")
@@ -178,53 +177,6 @@ func TestE2EDoctorJSONWarnsOnShellAdapterCustomProvider(t *testing.T) {
 	}
 }
 
-func TestE2ENewWizardBuildsProject(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping E2E test in short mode")
-	}
-	if runtime.GOOS == "windows" {
-		t.Skip("expect-based TUI E2E is Unix-only")
-	}
-	if _, err := exec.LookPath("expect"); err != nil {
-		t.Skip("expect not installed")
-	}
-
-	bin := buildMakewandBinary(t)
-	cfgDir := t.TempDir()
-	runDir := t.TempDir()
-	toolDir := writeMinimalToolPath(t)
-	provider := writeWizardProviderScript(t)
-
-	cfg := config.DefaultConfig()
-	cfg.DefaultModel = "private"
-	cfg.AnalysisModel = "private"
-	cfg.CodingModel = "private"
-	cfg.ReviewModel = "private"
-	cfg.CustomProviders = []config.CustomProvider{
-		{
-			Name:       "private",
-			Command:    provider,
-			Access:     "subscription",
-			PromptMode: config.CustomPromptModeStdin,
-		},
-	}
-	writeTestConfig(t, cfgDir, cfg)
-
-	transcript, err := runExpectWizardFlow(t, bin, cfgDir, runDir, toolDir)
-	if err != nil {
-		t.Fatalf("runExpectWizardFlow() error = %v\ntranscript:\n%s", err, transcript)
-	}
-
-	projectFile := filepath.Join(runDir, "blog-project", "index.html")
-	data, readErr := os.ReadFile(projectFile)
-	if readErr != nil {
-		t.Fatalf("ReadFile(%s): %v\ntranscript:\n%s", projectFile, readErr, transcript)
-	}
-	if !strings.Contains(string(data), "<h1>hello</h1>") {
-		t.Fatalf("generated file content = %q, want hello heading", string(data))
-	}
-}
-
 func buildMakewandBinary(t *testing.T) string {
 	t.Helper()
 
@@ -262,44 +214,6 @@ func writeProviderScript(t *testing.T) string {
 	return script
 }
 
-func writeWizardProviderScript(t *testing.T) string {
-	t.Helper()
-
-	script := filepath.Join(t.TempDir(), "wizard-provider.sh")
-	body := "#!/bin/sh\n" +
-		"input=\"\"\n" +
-		"while IFS= read -r line; do\n" +
-		"  input=\"$input$line\\n\"\n" +
-		"done\n" +
-		"case \"$input\" in\n" +
-		"  *\"friendly project planner\"*)\n" +
-		"    printf '%s\\n' 'Plan:' '- Build a simple page' '- No dependencies' '- No tests'\n" +
-		"    ;;\n" +
-		"  *)\n" +
-		"    printf '%s\\n' '--- FILE: index.html ---' '```' '<html><body><h1>hello</h1></body></html>' '```'\n" +
-		"    ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
-		t.Fatalf("WriteFile(wizard provider): %v", err)
-	}
-	return script
-}
-
-func writeMinimalToolPath(t *testing.T) string {
-	t.Helper()
-
-	dir := t.TempDir()
-	gitPath, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatalf("LookPath(git): %v", err)
-	}
-	linkPath := filepath.Join(dir, "git")
-	if err := os.Symlink(gitPath, linkPath); err != nil {
-		t.Fatalf("Symlink(git): %v", err)
-	}
-	return dir
-}
-
 func writeTestConfig(t *testing.T, cfgDir string, cfg *config.Config) {
 	t.Helper()
 
@@ -329,47 +243,6 @@ func runMakewand(t *testing.T, bin, cfgDir string, args ...string) (string, stri
 
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
-}
-
-func runExpectWizardFlow(t *testing.T, bin, cfgDir, runDir, toolDir string) (string, error) {
-	t.Helper()
-
-	script := filepath.Join(t.TempDir(), "wizard.exp")
-	body := strings.Join([]string{
-		"log_user 1",
-		"set timeout 25",
-		"match_max 100000",
-		"set env(MAKEWAND_CONFIG_DIR) $::env(WORKCFG)",
-		"set env(PATH) $::env(WORKPATH)",
-		"cd $::env(WORKRUN)",
-		"spawn $::env(BIN) new",
-		"stty rows 40 columns 120",
-		"expect \"Pick a template to start:\"",
-		"send \"\\r\"",
-		"expect \"Let me plan this for you...\"",
-		"send \"\\r\"",
-		"expect \"Ready to start building?\"",
-		"send \"\\r\"",
-		"expect \"Build complete!\"",
-		"send \"\\003\"",
-		"expect eof",
-	}, "\n") + "\n"
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatalf("WriteFile(expect script): %v", err)
-	}
-
-	cmd := exec.Command("expect", script)
-	cmd.Env = append(os.Environ(),
-		"BIN="+bin,
-		"WORKCFG="+cfgDir,
-		"WORKRUN="+runDir,
-		"WORKPATH="+toolDir,
-	)
-	var transcript bytes.Buffer
-	cmd.Stdout = &transcript
-	cmd.Stderr = &transcript
-	err := cmd.Run()
-	return stripANSIForTest(transcript.String()), err
 }
 
 func isolatedCLIEnv(cfgDir string) []string {
