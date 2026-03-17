@@ -43,14 +43,15 @@ Claude, Gemini, and Codex through adaptive mode-based routing
   makewand --print "..." - Run one prompt and print the result (CI/headless)
   makewand new     - Create a new project with guided wizard
   makewand chat    - Chat with AI about your project
+  makewand serve   - Expose your configured backend for your other devices
   makewand preview - Start a preview server
   makewand setup   - Configure AI providers and routing preferences`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
-				fmt.Println("No AI models configured. Run 'makewand setup' first.")
+			if !hasUsableBackend(cfg) {
+				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
 				return nil
 			}
 
@@ -89,6 +90,7 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 
 	rootCmd.AddCommand(newCmd())
 	rootCmd.AddCommand(chatCmd())
+	rootCmd.AddCommand(serveCmd())
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())
@@ -112,15 +114,18 @@ func newCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
+			if !hasUsableBackend(cfg) {
 				fmt.Println("Welcome to makewand!")
 				fmt.Println()
-				fmt.Println("No AI models found. Install a CLI tool or set an API key:")
+				fmt.Println("No AI models or remote backend found. Install a CLI tool, set an API key, or configure a remote makewand server:")
 				fmt.Println()
 				fmt.Println("  Option 1: Install Claude Code, Gemini CLI, or Codex CLI (subscription)")
 				fmt.Println("  Option 2: Set API keys:")
 				fmt.Println("    export ANTHROPIC_API_KEY=sk-ant-...")
 				fmt.Println("    export GEMINI_API_KEY=AI...")
+				fmt.Println("  Option 3: Use a remote backend:")
+				fmt.Println("    export MAKEWAND_REMOTE_URL=http://your-main-machine:8080")
+				fmt.Println("    export MAKEWAND_REMOTE_TOKEN=...")
 				fmt.Println()
 				fmt.Println("Run 'makewand setup' to check your configuration.")
 				return nil
@@ -152,8 +157,8 @@ func chatCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
-				fmt.Println("No AI models configured. Run 'makewand setup' first.")
+			if !hasUsableBackend(cfg) {
+				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
 				return nil
 			}
 
