@@ -10,8 +10,8 @@ make prelaunch
 
 This runs:
 
-- `go test ./...`
-- `go vet ./...`
+- `bash ./scripts/test_gate.sh` (tracked source packages under `cmd`, `internal`, and `router`)
+- `go vet ./cmd/... ./internal/... ./router`
 - build binary
 - `makewand doctor --strict --modes fast,balanced,power`
 

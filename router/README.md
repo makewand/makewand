@@ -2,7 +2,7 @@
 
 `router` is a standalone Go package for intelligent multi-provider AI routing.
 It provides Thompson Sampling–based adaptive selection, circuit breaker fault
-tolerance, ensemble+judge evaluation, and an OpenAI-compatible HTTP facade.
+tolerance, ensemble+judge evaluation, and an OpenAI-compatible subset HTTP facade.
 
 ## Quick Start
 
@@ -10,7 +10,7 @@ tolerance, ensemble+judge evaluation, and an OpenAI-compatible HTTP facade.
 import "github.com/makewand/makewand/router"
 
 // Create a router with pre-constructed providers
-r, err := router.NewRouterFromConfig(router.RouterConfig{
+r := router.NewRouterFromConfig(router.RouterConfig{
     Providers: map[string]router.ProviderEntry{
         "claude": {
             Provider: router.NewClaudeCLI("/usr/local/bin/claude"),
@@ -23,9 +23,6 @@ r, err := router.NewRouterFromConfig(router.RouterConfig{
     },
     UsageMode: "balanced", // "fast", "balanced", or "power"
 })
-if err != nil {
-    log.Fatal(err)
-}
 
 // Route and chat
 content, usage, result, err := r.Chat(ctx, router.TaskCode,
@@ -63,12 +60,12 @@ A cross-model judge selects the best output:
 content, usage, result, err := r.ChatBest(ctx, router.PhaseCode, messages, system)
 ```
 
-### OpenAI-Compatible HTTP Facade
+### OpenAI-Compatible Subset HTTP Facade
 
 Expose your router as an OpenAI-compatible API server:
 
 ```go
-r, _ := router.NewRouterFromConfig(rc)
+r := router.NewRouterFromConfig(rc)
 http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
@@ -76,6 +73,10 @@ Endpoints:
 - `POST /v1/chat/completions` — Chat completions (non-streaming)
 - `GET /v1/models` — List available providers
 - `GET /health` — Health check
+
+The HTTP facade accepts a provider name from `/v1/models` in the `model` field
+to force a specific provider. `max_tokens`, `temperature`, and HTTP streaming
+are not yet supported and return `400`.
 
 ### Strategy Hot-Reload
 
@@ -133,7 +134,7 @@ r := model.NewRouter(cfg)
 
 // After (public library API)
 import "github.com/makewand/makewand/router"
-r, err := router.NewRouterFromConfig(router.RouterConfig{
+r := router.NewRouterFromConfig(router.RouterConfig{
     Providers: map[string]router.ProviderEntry{...},
     UsageMode: "balanced",
 })
@@ -141,7 +142,7 @@ r, err := router.NewRouterFromConfig(router.RouterConfig{
 
 Key differences:
 - `NewRouterFromConfig` takes `RouterConfig` (no config package dependency)
-- Constructor returns `(*Router, error)` instead of `*Router`
+- Constructor returns `*Router`
 - `RegisterProviderFactory` is an instance method, not a package-level function
 - Strategy tables are per-instance (safe for multiple Router instances)
 

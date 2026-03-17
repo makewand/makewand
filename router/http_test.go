@@ -45,6 +45,39 @@ func TestHTTPHandler_ChatCompletions(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_ModelOverrideUsesRequestedProvider(t *testing.T) {
+	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
+	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: claude, Access: AccessSubscription},
+			"gemini": {Provider: gemini, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{"model":"gemini","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpChatResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Choices[0].Message.Content != "hello from gemini" {
+		t.Fatalf("content = %q, want %q", resp.Choices[0].Message.Content, "hello from gemini")
+	}
+}
+
 func TestHTTPHandler_EmptyMessages(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 
@@ -56,6 +89,48 @@ func TestHTTPHandler_EmptyMessages(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHTTPHandler_UnknownModelRejected(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+
+	handler := r.HTTPHandler()
+	body := `{"model":"unknown","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_RejectsUnsupportedMaxTokens(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+
+	handler := r.HTTPHandler()
+	body := `{"messages":[{"role":"user","content":"hi"}],"max_tokens":128}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_RejectsUnsupportedTemperature(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+
+	handler := r.HTTPHandler()
+	body := `{"messages":[{"role":"user","content":"hi"}],"temperature":0.5}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
 	}
 }
 
