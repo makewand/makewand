@@ -13,10 +13,10 @@ Adaptive multi-provider AI routing library and coding assistant CLI for terminal
 Orchestrates Claude, Gemini, and Codex through adaptive mode-based routing
 (`fast/balanced/power`) with Thompson Sampling, circuit breakers, and
 cost-aware provider selection. Works both as an interactive CLI tool and as
-a standalone Go routing library with an OpenAI-compatible HTTP API.
+a standalone Go routing library with an OpenAI-compatible subset HTTP API.
 通过 Thompson Sampling、熔断器和成本感知的 Provider 选择，编排 Claude、Gemini
 和 Codex，支持自适应模式路由（`fast/balanced/power`）。既可作为交互式 CLI 工具使用，
-也可作为独立的 Go 路由库使用，并提供 OpenAI 兼容的 HTTP API。
+也可作为独立的 Go 路由库使用，并提供 OpenAI 兼容子集 HTTP API。
 
 ## Features / 特性
 
@@ -24,7 +24,7 @@ a standalone Go routing library with an OpenAI-compatible HTTP API.
 - **Adaptive routing / 自适应路由** — Thompson Sampling learns provider quality per task type
 - **Circuit breaker / 熔断器** — auto-excludes failing providers with cooldown recovery
 - **Power ensemble / 强劲集成** — parallel multi-provider generation with cross-model evaluation
-- **OpenAI-compatible HTTP API** — expose the router as a `/v1/chat/completions` endpoint
+- **OpenAI-compatible subset HTTP API** — expose the router as a `/v1/chat/completions` endpoint
 - **Strategy hot-reload / 策略热重载** — customize routing via `routing.json` with live polling
 - **Cost tracking / 成本追踪** — per-request estimated costs and budget awareness
 - **Diff/patch engine / 差异引擎** — search-and-replace + unified diff for code modifications
@@ -171,7 +171,7 @@ The `router` package is a standalone Go library:
 ```go
 import "github.com/makewand/makewand/router"
 
-r, err := router.NewRouterFromConfig(router.RouterConfig{
+r := router.NewRouterFromConfig(router.RouterConfig{
     Providers: map[string]router.ProviderEntry{
         "claude": {Provider: myProvider, Access: router.AccessSubscription},
     },
@@ -184,16 +184,21 @@ content, usage, result, err := r.Chat(ctx, router.TaskCode, messages, system)
 
 ### HTTP Facade
 
-Expose the router as an OpenAI-compatible API:
-将路由器暴露为 OpenAI 兼容 API：
+Expose the router as an OpenAI-compatible subset API:
+将路由器暴露为 OpenAI 兼容子集 API：
 
 ```go
 http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
+A request may set `model` to a provider name returned by `/v1/models` to force
+that provider. `max_tokens`, `temperature`, and HTTP streaming are not yet supported.
+请求可将 `model` 设置为 `/v1/models` 返回的 Provider 名称以强制选择该 Provider。
+`max_tokens`、`temperature` 和 HTTP streaming 暂不支持。
+
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | Chat completions / 聊天补全 |
+| `POST /v1/chat/completions` | Chat completions (non-streaming subset) / 非流式聊天补全子集 |
 | `GET /v1/models` | List available providers / 列出可用 Provider |
 | `GET /health` | Health check / 健康检查 |
 

@@ -1,12 +1,13 @@
-// http.go — OpenAI-compatible HTTP facade for the Router.
+// http.go — OpenAI-compatible subset HTTP facade for the Router.
 //
 // Usage:
 //
-//	r, _ := router.NewRouterFromConfig(rc)
+//	r := router.NewRouterFromConfig(rc)
 //	http.ListenAndServe(":8080", r.HTTPHandler())
 //
-// This exposes POST /v1/chat/completions with the standard OpenAI request/response schema,
-// routing through the Router's provider selection logic.
+// This exposes POST /v1/chat/completions with a supported subset of the
+// standard OpenAI request/response schema, routing through the Router's
+// provider selection logic.
 package router
 
 import (
@@ -21,8 +22,8 @@ import (
 type httpChatRequest struct {
 	Model       string        `json:"model"`
 	Messages    []httpMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature float64       `json:"temperature,omitempty"`
+	MaxTokens   *int          `json:"max_tokens,omitempty"`
+	Temperature *float64      `json:"temperature,omitempty"`
 	Stream      bool          `json:"stream,omitempty"`
 }
 
@@ -33,11 +34,11 @@ type httpMessage struct {
 
 // httpChatResponse mirrors the OpenAI chat completions response.
 type httpChatResponse struct {
-	ID      string           `json:"id"`
-	Object  string           `json:"object"`
-	Created int64            `json:"created"`
-	Model   string           `json:"model"`
-	Choices []httpChoice     `json:"choices"`
+	ID      string            `json:"id"`
+	Object  string            `json:"object"`
+	Created int64             `json:"created"`
+	Model   string            `json:"model"`
+	Choices []httpChoice      `json:"choices"`
 	Usage   httpUsageResponse `json:"usage"`
 }
 
@@ -71,12 +72,13 @@ type HTTPHandlerOptions struct {
 	BearerToken string
 }
 
-// HTTPHandler returns an http.Handler that serves an OpenAI-compatible
+// HTTPHandler returns an http.Handler that serves an OpenAI-compatible subset
 // /v1/chat/completions endpoint backed by this Router.
 //
 // Supported features:
 //   - POST /v1/chat/completions (non-streaming)
 //   - Automatic task classification from message content
+//   - Optional provider override via the model field (provider name from /v1/models)
 //   - Provider routing via the Router's strategy tables
 //   - GET /v1/models lists available providers
 //   - Optional Bearer token authentication
@@ -128,6 +130,14 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		writeHTTPError(w, http.StatusBadRequest, "unsupported", "streaming is not yet supported via HTTP; use the Go API directly")
 		return
 	}
+	if chatReq.MaxTokens != nil {
+		writeHTTPError(w, http.StatusBadRequest, "unsupported", "max_tokens is not yet supported via HTTP; use the Go API directly")
+		return
+	}
+	if chatReq.Temperature != nil {
+		writeHTTPError(w, http.StatusBadRequest, "unsupported", "temperature is not yet supported via HTTP; use the Go API directly")
+		return
+	}
 
 	if len(chatReq.Messages) == 0 {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "messages array is empty")
@@ -155,7 +165,21 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 	}
 
 	ctx := req.Context()
-	content, usage, result, err := r.Chat(ctx, task, messages, system)
+	var (
+		content string
+		usage   Usage
+		result  RouteResult
+		err     error
+	)
+	if requestedModel := strings.ToLower(strings.TrimSpace(chatReq.Model)); requestedModel != "" {
+		if !containsString(r.registeredProviderNames(), requestedModel) {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model))
+			return
+		}
+		content, usage, result, err = r.ChatWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
+	} else {
+		content, usage, result, err = r.Chat(ctx, task, messages, system)
+	}
 	if err != nil {
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
@@ -164,12 +188,16 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		writeHTTPError(w, status, "provider_error", err.Error())
 		return
 	}
+	responseModel := result.ModelID
+	if strings.TrimSpace(responseModel) == "" {
+		responseModel = result.Actual
+	}
 
 	resp := httpChatResponse{
 		ID:      fmt.Sprintf("mw-%d", time.Now().UnixNano()),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   result.ModelID,
+		Model:   responseModel,
 		Choices: []httpChoice{
 			{
 				Index:        0,
@@ -228,4 +256,13 @@ func writeHTTPError(w http.ResponseWriter, status int, code, message string) {
 			Code:    code,
 		},
 	})
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

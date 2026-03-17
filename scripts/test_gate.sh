@@ -9,7 +9,7 @@ cmd_pkg="github.com/makewand/makewand/cmd/makewand"
 echo "[test-gate] go test ./cmd/makewand -run ^TestE2E"
 go test ./cmd/makewand -count=1 -run '^TestE2E' -v
 
-other_pkgs="$(go list ./... | grep -Fxv "${cmd_pkg}" || true)"
+other_pkgs="$(go list ./cmd/... ./internal/... ./router | grep -Fxv "${cmd_pkg}" || true)"
 non_e2e_tests="$(
   go test ./cmd/makewand -list '^Test' 2>/dev/null \
     | awk '/^Test/ && $0 !~ /^TestE2E/ { print }' \

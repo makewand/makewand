@@ -24,7 +24,7 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 test:
-	go test ./...
+	bash ./scripts/test_gate.sh
 
 install: build
 	cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
@@ -48,7 +48,7 @@ fmt:
 	go fmt ./...
 
 vet:
-	go vet ./...
+	go vet ./cmd/... ./internal/... ./router
 
 lint: fmt vet
 

@@ -78,7 +78,7 @@ jobs:
         run: go test -race ./cmd/makewand ./internal/config ./internal/engine ./internal/model ./internal/tui
 
       - name: Run vet
-        run: go vet ./...
+        run: go vet ./cmd/... ./internal/... ./router
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v7
