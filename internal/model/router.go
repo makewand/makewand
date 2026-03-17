@@ -25,6 +25,14 @@ func NewRouter(cfg *config.Config) *Router {
 
 	rc.Providers = make(map[string]ProviderEntry)
 
+	if config.HasRemoteBackend() {
+		rc.Providers["remote"] = ProviderEntry{
+			Provider: NewRemoteHTTP(config.RemoteBaseURL(), config.RemoteToken()),
+			Access:   AccessAPI,
+		}
+		return NewRouterFromConfig(rc)
+	}
+
 	// Register CLI-based providers first (subscription — preferred)
 	for _, cli := range cfg.CLIs {
 		switch cli.Name {

@@ -85,6 +85,37 @@ makewand new
 makewand --print "Explain this error" --mode fast
 ```
 
+### Personal Remote Mode / 个人远程模式
+
+Run `makewand` on one main machine and continue from other computers by pointing
+them at that host. The server uses your local providers; remote clients use the
+HTTP facade plus centralized chat session storage.
+可在一台主力机器上运行 `makewand`，并让其他电脑继续使用同一个后端。服务端使用本机
+Provider；其他电脑通过 HTTP facade 和集中式会话存储实现续接。
+
+On your main machine / 在主机上：
+
+```bash
+export MAKEWAND_SERVER_TOKEN=replace-me
+makewand serve --listen 0.0.0.0:8080
+```
+
+On another computer / 在其他电脑上：
+
+```bash
+export MAKEWAND_REMOTE_URL=http://your-main-machine:8080
+export MAKEWAND_REMOTE_TOKEN=replace-me
+makewand chat .
+```
+
+If both machines point at the same repository, set a shared workspace id to
+resume the same chat even when local paths differ:
+如果两台机器本地目录不同，但希望恢复同一段对话，可显式设置共享 workspace id：
+
+```bash
+export MAKEWAND_WORKSPACE_ID=my-repo-main
+```
+
 ## Usage Modes / 使用模式
 
 | Mode / 模式 | Tier | Behavior / 行为 | Typical Models / 典型模型 |
@@ -211,6 +242,7 @@ See [`router/README.md`](router/README.md) for full library documentation.
 makewand [prompt]              Interactive or one-shot prompt / 交互或单次执行
 makewand chat [path]           Chat about a project / 对话
 makewand new                   Create new project / 创建项目
+makewand serve                 Start personal remote server / 启动个人远程服务
 makewand preview [path]        Start preview server / 启动预览服务
 makewand setup                 Configure providers / 配置 Provider
 makewand doctor                Health check / 健康诊断

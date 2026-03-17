@@ -87,6 +87,7 @@ var (
 	NewClaudeCLI             = router.NewClaudeCLI
 	NewGeminiCLI             = router.NewGeminiCLI
 	NewCodexCLI              = router.NewCodexCLI
+	NewRemoteHTTP            = router.NewRemoteHTTP
 	NewCommandCLI            = router.NewCommandCLI
 	ClassifyTask             = router.ClassifyTask
 	EstimateCost             = router.EstimateCost
@@ -100,7 +101,9 @@ var (
 	ContextWithSystem        = router.ContextWithSystem
 	SystemFromContext        = router.SystemFromContext
 	ContextWithModel         = router.ContextWithModel
-	ModelFromContext          = router.ModelFromContext
+	ModelFromContext         = router.ModelFromContext
+	ContextWithWorkDir       = router.ContextWithWorkDir
+	WorkDirFromContext       = router.WorkDirFromContext
 	RegisterProviderFactory  = router.RegisterProviderFactory
 	ErrorKindOf              = router.ErrorKindOf
 	IsRetryableProviderError = router.IsRetryableProviderError
