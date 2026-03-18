@@ -52,6 +52,20 @@ func ModelFromContext(ctx context.Context) (string, bool) {
 	return m, ok && m != ""
 }
 
+type workDirContextKey struct{}
+
+// ContextWithWorkDir returns a new context carrying an override working
+// directory for CLI providers.
+func ContextWithWorkDir(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, workDirContextKey{}, strings.TrimSpace(dir))
+}
+
+// WorkDirFromContext retrieves the working directory override, if present.
+func WorkDirFromContext(ctx context.Context) (string, bool) {
+	dir, ok := ctx.Value(workDirContextKey{}).(string)
+	return dir, ok && dir != ""
+}
+
 // TaskType categorizes what kind of AI task is being performed.
 type TaskType int
 

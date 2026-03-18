@@ -64,6 +64,32 @@ func TestDetectConfiguredProviders(t *testing.T) {
 	assertContains(t, got, "gemini (api)")
 }
 
+func TestDetectConfiguredProviders_IncludesRemote(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
+
+	got := detectConfiguredProviders(config.DefaultConfig())
+	assertContains(t, got, "remote (http)")
+}
+
+func TestRunDoctor_AllowsRemoteOnlyConfiguration(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
+
+	report, failCount, warnCount := runDoctor(config.DefaultConfig(), nil, doctorOptions{
+		modes: []model.UsageMode{model.ModeBalanced},
+	})
+	if failCount != 0 {
+		t.Fatalf("failCount = %d, want 0", failCount)
+	}
+	if warnCount != 0 {
+		t.Fatalf("warnCount = %d, want 0", warnCount)
+	}
+
+	assertDoctorCheckStatus(t, report.Checks, "remote backend", doctorPass)
+	assertDoctorCheckStatus(t, report.Checks, "model configuration", doctorPass)
+}
+
 func TestUniqueProbeProviders(t *testing.T) {
 	routes := []doctorTaskRoute{
 		{Task: "analyze", Provider: "claude"},
@@ -211,4 +237,17 @@ func assertContainsSubstring(t *testing.T, got string, wantSubstr string) {
 	if !strings.Contains(got, wantSubstr) {
 		t.Fatalf("string %q does not contain %q", got, wantSubstr)
 	}
+}
+
+func assertDoctorCheckStatus(t *testing.T, checks []doctorCheck, name string, want doctorStatus) {
+	t.Helper()
+	for _, check := range checks {
+		if check.Name == name {
+			if check.Status != want {
+				t.Fatalf("check %q status = %q, want %q", name, check.Status, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("check %q not found in %+v", name, checks)
 }

@@ -4,6 +4,7 @@ package router
 import (
 	"fmt"
 	"math"
+	"strings"
 )
 
 func expandProviderPreference(preferred []string, registered []string, excluded map[string]bool) []string {
@@ -185,6 +186,40 @@ func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
 		Detail:    "all candidates unavailable",
 	})
 	return bs.Primary
+}
+
+// BuildProvidersForAdaptive returns the adaptive provider order for a build phase.
+// The returned names are filtered by availability, circuit state, and the caller's
+// exclusion list. When limit > 0, at most limit providers are returned.
+func (r *Router) BuildProvidersForAdaptive(phase BuildPhase, limit int, exclude ...string) []string {
+	excluded := make(map[string]bool, len(exclude))
+	for _, name := range exclude {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		excluded[name] = true
+	}
+
+	_, candidates, err := r.buildPhaseCandidates(phase, excluded)
+	if err != nil {
+		return nil
+	}
+
+	out := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if blocked, _ := r.isCircuitOpen(c.name); blocked {
+			continue
+		}
+		if !r.isBuildProviderAvailable(c.name, c.modelID) {
+			continue
+		}
+		out = append(out, c.name)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 func (r *Router) modeEntry(task TaskType) (strategyEntry, error) {

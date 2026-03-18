@@ -40,8 +40,9 @@ type Config struct {
 	OllamaAccess string `json:"ollama_access,omitempty"` // always "local"
 
 	// UI preferences
-	Language string `json:"language,omitempty"` // "zh" or "en"
-	Theme    string `json:"theme,omitempty"`    // "dark" or "light"
+	Language     string `json:"language,omitempty"`      // "zh" or "en"
+	Theme        string `json:"theme,omitempty"`         // "dark" or "light"
+	ApprovalMode string `json:"approval_mode,omitempty"` // "manual", "safe", or "autopilot"
 
 	// Cost tracking
 	MonthlyBudget float64 `json:"monthly_budget,omitempty"`
@@ -83,6 +84,10 @@ const (
 	CustomPromptModeLegacy = "legacy"
 	CustomPromptModeArg    = "arg"
 	CustomPromptModeStdin  = "stdin"
+
+	ApprovalModeManual = "manual"
+	ApprovalModeSafe   = "safe"
+	ApprovalModeAuto   = "autopilot"
 )
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -94,7 +99,20 @@ func DefaultConfig() *Config {
 		ReviewModel:   "gemini",
 		Language:      "en",
 		Theme:         "dark",
+		ApprovalMode:  ApprovalModeManual,
 		MonthlyBudget: 20.0,
+	}
+}
+
+// NormalizeApprovalMode returns a supported approval mode, defaulting to manual.
+func NormalizeApprovalMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case ApprovalModeSafe:
+		return ApprovalModeSafe
+	case ApprovalModeAuto:
+		return ApprovalModeAuto
+	default:
+		return ApprovalModeManual
 	}
 }
 
@@ -164,6 +182,7 @@ func Load() (*Config, error) {
 
 	// Auto-detect installed CLI tools
 	cfg.CLIs = detectCLIs()
+	cfg.ApprovalMode = NormalizeApprovalMode(cfg.ApprovalMode)
 
 	// If CLI tools found, set access to subscription (unless explicitly overridden)
 	for _, cli := range cfg.CLIs {
@@ -195,6 +214,7 @@ func Save(cfg *Config) error {
 
 	// Create a copy that strips env-sourced keys
 	toSave := *cfg
+	toSave.ApprovalMode = NormalizeApprovalMode(toSave.ApprovalMode)
 	if cfg.envSourcedKeys != nil {
 		if cfg.envSourcedKeys["claude"] {
 			toSave.ClaudeAPIKey = ""

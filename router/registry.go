@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 )
 
 func (r *Router) registeredProviderNames() []string {
@@ -36,10 +35,14 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 		return p, nil
 	}
 
-	// If a CLI provider is already registered for this provider name, use it
-	// (CLI providers ignore modelID — they use subscription defaults)
+	// Reuse explicitly registered providers when they are model-agnostic, or
+	// when no factory exists to materialize model-specific instances.
 	if existing, ok := r.providers[providerName]; ok {
-		if _, isCLI := existing.(*CLIProvider); isCLI {
+		if _, isCLI := existing.(*CLIProvider); isCLI || modelID == "" {
+			r.providerCache[key] = existing
+			return existing, nil
+		}
+		if _, hasFactory := getProviderFactory(providerName); !hasFactory {
 			r.providerCache[key] = existing
 			return existing, nil
 		}

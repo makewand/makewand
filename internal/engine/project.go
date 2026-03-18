@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -10,9 +11,10 @@ import (
 
 // Project represents a makewand project.
 type Project struct {
-	Name  string
-	Path  string
-	Files []FileEntry
+	Name          string
+	Path          string
+	Files         []FileEntry
+	ScanTruncated bool
 }
 
 // FileEntry represents a file in the project tree.
@@ -48,6 +50,8 @@ var sanitizeReplacer = strings.NewReplacer(
 	"|", "",
 )
 
+var errProjectScanLimitReached = errors.New("project scan limit reached")
+
 // NewProject creates a new project in the given directory.
 func NewProject(name, parentDir string) (*Project, error) {
 	safeName := sanitizeDirName(name)
@@ -65,6 +69,16 @@ func NewProject(name, parentDir string) (*Project, error) {
 
 // OpenProject opens an existing project from the current directory.
 func OpenProject(path string) (*Project, error) {
+	return openProject(path, 0)
+}
+
+// OpenProjectLimited opens an existing project but caps the number of scanned
+// entries. This is useful for latency-sensitive paths such as headless mode.
+func OpenProjectLimited(path string, maxEntries int) (*Project, error) {
+	return openProject(path, maxEntries)
+}
+
+func openProject(path string, maxEntries int) (*Project, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("open project: %w", err)
@@ -83,7 +97,7 @@ func OpenProject(path string) (*Project, error) {
 		Path: absPath,
 	}
 
-	if err := p.ScanFiles(); err != nil {
+	if err := p.scanFiles(maxEntries); err != nil {
 		return nil, err
 	}
 
@@ -92,9 +106,21 @@ func OpenProject(path string) (*Project, error) {
 
 // ScanFiles scans the project directory and populates the file list.
 func (p *Project) ScanFiles() error {
-	p.Files = nil
+	return p.scanFiles(0)
+}
 
-	return filepath.WalkDir(p.Path, func(path string, d fs.DirEntry, err error) error {
+// ScanFilesLimited scans the project directory and stops after maxEntries
+// non-root entries. A non-positive limit means unlimited scanning.
+func (p *Project) ScanFilesLimited(maxEntries int) error {
+	return p.scanFiles(maxEntries)
+}
+
+func (p *Project) scanFiles(maxEntries int) error {
+	p.Files = nil
+	p.ScanTruncated = false
+	count := 0
+
+	err := filepath.WalkDir(p.Path, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if path == p.Path {
 				return err
@@ -109,6 +135,10 @@ func (p *Project) ScanFiles() error {
 			}
 			return nil
 		}
+		if rel != "." && maxEntries > 0 && count >= maxEntries {
+			p.ScanTruncated = true
+			return errProjectScanLimitReached
+		}
 
 		var size int64
 		if !d.IsDir() {
@@ -122,9 +152,16 @@ func (p *Project) ScanFiles() error {
 			IsDir: d.IsDir(),
 			Size:  size,
 		})
+		if rel != "." {
+			count++
+		}
 
 		return nil
 	})
+	if err != nil && !errors.Is(err, errProjectScanLimitReached) {
+		return err
+	}
+	return nil
 }
 
 // validatePath checks that a relative path resolves to within the project directory.

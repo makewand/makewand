@@ -101,6 +101,32 @@ func TestShouldRejectCLIOutput_CodeOnlyAcceptsCode(t *testing.T) {
 	}
 }
 
+func TestCLIProvider_Chat_ValidationIgnoresSystemFileInstructions(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "echo-provider.sh")
+	body := "#!/bin/sh\n" +
+		"printf 'provider:reviewer\\n'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	p := NewCommandCLI("reviewer", script, nil, PromptModeStdin)
+	system := "When creating or modifying files, use this format:\n--- FILE: path/to/file ---\n```\nfile content here\n```"
+
+	content, _, err := p.Chat(
+		context.Background(),
+		[]Message{{Role: "user", Content: "please review."}},
+		system,
+		256,
+	)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if got := strings.TrimSpace(content); got != "provider:reviewer" {
+		t.Fatalf("Chat() content = %q, want %q", got, "provider:reviewer")
+	}
+}
+
 func TestCLIProvider_ChatStream_EmitsTimeoutErrorOnDeadline(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "sleep-stream-cli.sh")
@@ -908,15 +934,22 @@ func TestNewCodexCLI_ReviewTaskUsesReviewCmd(t *testing.T) {
 	cmd := p.buildCmd(ctx, "review this code")
 	args := cmd.Args
 	if len(args) < 3 || args[1] != "review" || args[2] != "--uncommitted" {
-		t.Fatalf("review task: args = %v, want [codex review --uncommitted]", args)
+		t.Fatalf("review task: args = %v, want codex review invocation", args)
 	}
 
 	// Code task → should build "codex exec --json ..."
 	ctx = ContextWithTask(context.Background(), TaskCode)
 	cmd = p.buildCmd(ctx, "write hello world")
 	args = cmd.Args
-	if len(args) < 3 || args[1] != "exec" || args[2] != "--json" {
-		t.Fatalf("code task: args = %v, want [codex exec --json ...]", args)
+	if len(args) < 8 || args[1] != "exec" || args[2] != "--sandbox" || args[3] != "read-only" || args[4] != "--ephemeral" || args[5] != "--json" || args[6] != "--skip-git-repo-check" {
+		t.Fatalf("code task: args = %v, want read-only codex exec invocation", args)
+	}
+
+	ctx = ContextWithWorkDir(ctx, t.TempDir())
+	cmd = p.buildCmd(ctx, "write hello world")
+	args = cmd.Args
+	if len(args) < 8 || args[1] != "exec" || args[2] != "--sandbox" || args[3] != "workspace-write" || args[4] != "--ephemeral" || args[5] != "--json" || args[6] != "--skip-git-repo-check" {
+		t.Fatalf("code task with workdir: args = %v, want workspace-write codex exec invocation", args)
 	}
 }
 
