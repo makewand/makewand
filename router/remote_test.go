@@ -20,6 +20,9 @@ func TestRemoteHTTPProvider_Chat(t *testing.T) {
 		if len(req.Messages) != 2 {
 			t.Fatalf("messages = %+v, want system+user", req.Messages)
 		}
+		if req.Mode != "power" {
+			t.Fatalf("mode = %q, want power", req.Mode)
+		}
 		resp := httpChatResponse{
 			Model: "remote-model",
 			Choices: []httpChoice{{
@@ -40,7 +43,8 @@ func TestRemoteHTTPProvider_Chat(t *testing.T) {
 	provider := NewRemoteHTTP(server.URL, "secret")
 	provider.chatClient = server.Client()
 
-	got, usage, err := provider.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "system prompt", 1024)
+	ctx := ContextWithUsageMode(context.Background(), ModePower)
+	got, usage, err := provider.Chat(ctx, []Message{{Role: "user", Content: "hi"}}, "system prompt", 1024)
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}

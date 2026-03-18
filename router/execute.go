@@ -73,6 +73,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
+	attemptCtx = ContextWithUsageMode(attemptCtx, ac.mode)
 	// Inject model ID into context so CLI providers can use --model for per-call selection.
 	if id.modelID != "" {
 		attemptCtx = ContextWithModel(attemptCtx, id.modelID)
@@ -286,6 +287,7 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
+	attemptCtx = ContextWithUsageMode(attemptCtx, ac.mode)
 	// Inject model ID into context so CLI providers can use --model for per-call selection.
 	if id.modelID != "" {
 		attemptCtx = ContextWithModel(attemptCtx, id.modelID)

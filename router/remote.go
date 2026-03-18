@@ -49,6 +49,7 @@ func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, syste
 	}
 
 	payload, err := json.Marshal(httpChatRequest{
+		Mode:     remoteUsageMode(ctx),
 		Messages: reqMessages,
 	})
 	if err != nil {
@@ -108,4 +109,12 @@ func (p *RemoteHTTPProvider) ChatStream(ctx context.Context, messages []Message,
 		ch <- StreamChunk{Done: true}
 	}()
 	return ch, nil
+}
+
+func remoteUsageMode(ctx context.Context) string {
+	mode, ok := UsageModeFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return mode.String()
 }

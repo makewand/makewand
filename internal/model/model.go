@@ -102,6 +102,8 @@ var (
 	SystemFromContext        = router.SystemFromContext
 	ContextWithModel         = router.ContextWithModel
 	ModelFromContext         = router.ModelFromContext
+	ContextWithUsageMode     = router.ContextWithUsageMode
+	UsageModeFromContext     = router.UsageModeFromContext
 	ContextWithWorkDir       = router.ContextWithWorkDir
 	WorkDirFromContext       = router.WorkDirFromContext
 	RegisterProviderFactory  = router.RegisterProviderFactory
