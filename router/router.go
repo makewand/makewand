@@ -52,6 +52,20 @@ func ModelFromContext(ctx context.Context) (string, bool) {
 	return m, ok && m != ""
 }
 
+type usageModeContextKey struct{}
+
+// ContextWithUsageMode returns a new context carrying the requested usage mode.
+// Providers like the remote HTTP adapter use this to preserve client-side mode.
+func ContextWithUsageMode(ctx context.Context, mode UsageMode) context.Context {
+	return context.WithValue(ctx, usageModeContextKey{}, mode)
+}
+
+// UsageModeFromContext retrieves the requested usage mode, if present.
+func UsageModeFromContext(ctx context.Context) (UsageMode, bool) {
+	mode, ok := ctx.Value(usageModeContextKey{}).(UsageMode)
+	return mode, ok
+}
+
 type workDirContextKey struct{}
 
 // ContextWithWorkDir returns a new context carrying an override working
@@ -295,6 +309,50 @@ func (r *Router) effectiveMode() UsageMode {
 		return r.mode
 	}
 	return ModeBalanced
+}
+
+// cloneWithMode creates a per-request router view that preserves shared
+// provider state while allowing a different routing mode without mutating
+// the live server router.
+func (r *Router) cloneWithMode(mode UsageMode) *Router {
+	r.mu.Lock()
+	providers := make(map[string]Provider, len(r.providers))
+	for name, provider := range r.providers {
+		providers[name] = provider
+	}
+	accessTypes := make(map[string]AccessType, len(r.accessTypes))
+	for name, access := range r.accessTypes {
+		accessTypes[name] = access
+	}
+	cachedAvail := append([]string(nil), r.cachedAvail...)
+	cachedAvailAt := r.cachedAvailAt
+	legacy := r.legacyModels
+	r.mu.Unlock()
+
+	r.providerMu.Lock()
+	providerCache := make(map[providerKey]Provider, len(r.providerCache))
+	for key, provider := range r.providerCache {
+		providerCache[key] = provider
+	}
+	r.providerMu.Unlock()
+
+	r.traceMu.RLock()
+	traceSink := r.traceSink
+	r.traceMu.RUnlock()
+
+	return &Router{
+		legacyModels:  legacy,
+		providers:     providers,
+		providerCache: providerCache,
+		accessTypes:   accessTypes,
+		usage:         r.usage,
+		breaker:       r.breaker,
+		mode:          mode,
+		modeSet:       true,
+		cachedAvail:   cachedAvail,
+		cachedAvailAt: cachedAvailAt,
+		traceSink:     traceSink,
+	}
 }
 
 func (r *Router) emitTrace(event TraceEvent) {

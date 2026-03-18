@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -78,6 +81,38 @@ func TestHTTPHandler_ModelOverrideUsesRequestedProvider(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_ModeOverrideUsesRequestedMode(t *testing.T) {
+	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
+	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: claude, Access: AccessSubscription},
+			"gemini": {Provider: gemini, Access: AccessSubscription},
+		},
+		UsageMode: "fast",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{"mode":"balanced","messages":[{"role":"user","content":"write a python function"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpChatResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Choices[0].Message.Content != "hello from claude" {
+		t.Fatalf("content = %q, want %q", resp.Choices[0].Message.Content, "hello from claude")
+	}
+}
+
 func TestHTTPHandler_EmptyMessages(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 
@@ -131,6 +166,53 @@ func TestHTTPHandler_RejectsUnsupportedTemperature(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_RejectsUnknownMode(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+
+	handler := r.HTTPHandler()
+	body := `{"mode":"turbo","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_PersistsRoutingStatsWhenConfigured(t *testing.T) {
+	dir := t.TempDir()
+	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{StatsDir: dir})
+	body := `{"messages":[{"role":"user","content":"write a helper function"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	statsPath := filepath.Join(dir, statsFile)
+	data, err := os.ReadFile(statsPath)
+	if err != nil {
+		t.Fatalf("read stats file: %v", err)
+	}
+	if !strings.Contains(string(data), `"claude": 1`) {
+		t.Fatalf("stats file = %s, want claude usage persisted", string(data))
 	}
 }
 

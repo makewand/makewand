@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -21,6 +22,7 @@ import (
 // httpChatRequest is the subset of the OpenAI chat completions request we support.
 type httpChatRequest struct {
 	Model       string        `json:"model"`
+	Mode        string        `json:"mode,omitempty"`
 	Messages    []httpMessage `json:"messages"`
 	MaxTokens   *int          `json:"max_tokens,omitempty"`
 	Temperature *float64      `json:"temperature,omitempty"`
@@ -70,6 +72,10 @@ type HTTPHandlerOptions struct {
 	// Requests must include "Authorization: Bearer <token>" to proceed.
 	// The /health endpoint is always unauthenticated.
 	BearerToken string
+
+	// StatsDir enables routing stats persistence after chat requests.
+	// When empty, HTTP requests do not read or write routing_stats.json.
+	StatsDir string
 }
 
 // HTTPHandler returns an http.Handler that serves an OpenAI-compatible subset
@@ -89,7 +95,7 @@ func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", r.requireAuth(opt.BearerToken, r.handleChatCompletions))
+	mux.HandleFunc("/v1/chat/completions", r.requireAuth(opt.BearerToken, r.handleChatCompletionsWithOptions(opt)))
 	mux.HandleFunc("/v1/models", r.requireAuth(opt.BearerToken, r.handleListModels))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -114,7 +120,13 @@ func (r *Router) requireAuth(token string, next http.HandlerFunc) http.HandlerFu
 	}
 }
 
-func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request) {
+func (r *Router) handleChatCompletionsWithOptions(opt HTTPHandlerOptions) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		r.handleChatCompletions(w, req, opt)
+	}
+}
+
+func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request, opt HTTPHandlerOptions) {
 	if req.Method != http.MethodPost {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
 		return
@@ -144,6 +156,13 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
+	activeRouter, modeErr := r.routerForHTTPMode(chatReq.Mode)
+	if modeErr != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", modeErr.Error())
+		return
+	}
+	defer activeRouter.persistHTTPStats(opt.StatsDir)
+
 	// Convert messages
 	messages := make([]Message, 0, len(chatReq.Messages))
 	var system string
@@ -172,13 +191,13 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		err     error
 	)
 	if requestedModel := strings.ToLower(strings.TrimSpace(chatReq.Model)); requestedModel != "" {
-		if !containsString(r.registeredProviderNames(), requestedModel) {
+		if !containsString(activeRouter.registeredProviderNames(), requestedModel) {
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model))
 			return
 		}
-		content, usage, result, err = r.ChatWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
+		content, usage, result, err = activeRouter.ChatWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
 	} else {
-		content, usage, result, err = r.Chat(ctx, task, messages, system)
+		content, usage, result, err = activeRouter.Chat(ctx, task, messages, system)
 	}
 	if err != nil {
 		status := http.StatusServiceUnavailable
@@ -214,6 +233,30 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (r *Router) routerForHTTPMode(requestedMode string) (*Router, error) {
+	modeName := strings.ToLower(strings.TrimSpace(requestedMode))
+	if modeName == "" {
+		return r, nil
+	}
+
+	mode, ok := ParseUsageMode(modeName)
+	if !ok {
+		return nil, fmt.Errorf("unknown mode %q; supported values are fast, balanced, power", requestedMode)
+	}
+	return r.cloneWithMode(mode), nil
+}
+
+func (r *Router) persistHTTPStats(statsDir string) {
+	statsDir = strings.TrimSpace(statsDir)
+	if statsDir == "" {
+		return
+	}
+	if err := os.MkdirAll(statsDir, 0700); err != nil {
+		return
+	}
+	_ = r.SaveStats(statsDir)
 }
 
 func (r *Router) handleListModels(w http.ResponseWriter, req *http.Request) {

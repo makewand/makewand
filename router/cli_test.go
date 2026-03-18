@@ -101,6 +101,23 @@ func TestShouldRejectCLIOutput_CodeOnlyAcceptsCode(t *testing.T) {
 	}
 }
 
+func TestShouldRejectCLIOutput_CodeOnlyRejectsWorkspaceDiscoveryResponse(t *testing.T) {
+	prompt := "Rewrite pricing.py so python3 -m unittest -q passes. Output only Python source code for pricing.py. No markdown. No prose."
+	content := "The listed files are not in `/mnt/data/makewand`; I'm locating the actual project directory and then I'll read the implementation and tests there."
+
+	reject, _ := shouldRejectCLIOutput(prompt, content)
+	if !reject {
+		t.Fatal("shouldRejectCLIOutput() = false, want true for workspace-discovery meta response")
+	}
+}
+
+func TestContainsLikelyCode_DoesNotTreatNaturalLanguageSemicolonAsCode(t *testing.T) {
+	content := "The listed files are not in `/mnt/data/makewand`; I'm locating the actual project directory."
+	if containsLikelyCode(content) {
+		t.Fatal("containsLikelyCode() = true, want false for natural-language semicolon response")
+	}
+}
+
 func TestCLIProvider_Chat_ValidationIgnoresSystemFileInstructions(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "echo-provider.sh")

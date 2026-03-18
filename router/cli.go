@@ -874,7 +874,11 @@ func looksLikePermissionMetaResponse(lower string) bool {
 		strings.Contains(lower, "the file has been written to") ||
 		strings.Contains(lower, "here's a summary of the implementation") ||
 		strings.Contains(lower, "it seems write permissions are being blocked") ||
-		strings.Contains(lower, "cannot write files in this environment")
+		strings.Contains(lower, "cannot write files in this environment") ||
+		strings.Contains(lower, "the listed files are not in") ||
+		strings.Contains(lower, "locating the actual project directory") ||
+		strings.Contains(lower, "locating the project directory") ||
+		strings.Contains(lower, "read the implementation and tests there")
 }
 
 func looksLikeCodeOnlyPrompt(prompt string) bool {
@@ -935,7 +939,7 @@ func containsLikelyCode(content string) bool {
 		}
 		// Keep this secondary heuristic strict; bullet summaries often contain
 		// braces for examples (for example "{429,503}") but are not code.
-		if strings.Contains(l, "=>") || strings.Contains(l, ";") {
+		if strings.Contains(l, "=>") {
 			return true
 		}
 	}

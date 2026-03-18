@@ -49,9 +49,18 @@ func serveCmd() *cobra.Command {
 			}
 
 			rtr := serveRouter(cfg)
+			statsDir, err := config.ConfigDir()
+			if err == nil {
+				if loadErr := rtr.LoadStats(statsDir); loadErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not load routing stats: %v\n", loadErr)
+				}
+			}
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
 
-			base := rtr.HTTPHandler(router.HTTPHandlerOptions{BearerToken: token})
+			base := rtr.HTTPHandler(router.HTTPHandlerOptions{
+				BearerToken: token,
+				StatsDir:    statsDir,
+			})
 			mux := http.NewServeMux()
 			mux.Handle("/v1/sessions/", remotesession.NewHandler(sessions, token))
 			mux.Handle("/", base)
