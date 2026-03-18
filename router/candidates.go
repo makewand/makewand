@@ -124,6 +124,9 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 }
 
 func (r *Router) BuildProviderFor(phase BuildPhase) string {
+	if name, _, ok := r.remoteOnlyProvider(); ok {
+		return name
+	}
 	bs, ok := getBuildStrategy(r.effectiveMode(), phase)
 	if !ok {
 		return ""
@@ -145,6 +148,9 @@ func (r *Router) buildStrategyForPhase(phase BuildPhase) (BuildStrategy, error) 
 // scored with ThompsonSample; the highest-scoring available provider wins.
 // Falls back to BuildProviderFor when no candidates are available.
 func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
+	if name, _, ok := r.remoteOnlyProvider(); ok {
+		return name
+	}
 	bs, candidates, err := r.buildPhaseCandidates(phase, nil)
 	if err != nil {
 		return r.BuildProviderFor(phase)
@@ -192,6 +198,17 @@ func (r *Router) BuildProviderForAdaptive(phase BuildPhase) string {
 // The returned names are filtered by availability, circuit state, and the caller's
 // exclusion list. When limit > 0, at most limit providers are returned.
 func (r *Router) BuildProvidersForAdaptive(phase BuildPhase, limit int, exclude ...string) []string {
+	if name, _, ok := r.remoteOnlyProvider(); ok {
+		if len(exclude) > 0 {
+			for _, excluded := range exclude {
+				if strings.EqualFold(strings.TrimSpace(excluded), name) {
+					return nil
+				}
+			}
+		}
+		return []string{name}
+	}
+
 	excluded := make(map[string]bool, len(exclude))
 	for _, name := range exclude {
 		name = strings.TrimSpace(name)

@@ -115,6 +115,44 @@ func TestNewRouterFromConfig_Chat(t *testing.T) {
 	}
 }
 
+func TestRoute_RemoteOnlyProvider(t *testing.T) {
+	remote := &stubProvider{name: "remote", available: true, response: "remote response"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"remote": {Provider: remote, Access: AccessAPI},
+		},
+		UsageMode: "balanced",
+	})
+
+	result, err := r.Route(TaskExplain)
+	if err != nil {
+		t.Fatalf("Route() error = %v", err)
+	}
+	if result.Actual != "remote" {
+		t.Fatalf("Route().Actual = %q, want remote", result.Actual)
+	}
+	if result.Requested != "remote" {
+		t.Fatalf("Route().Requested = %q, want remote", result.Requested)
+	}
+	if result.Provider != remote {
+		t.Fatal("Route().Provider did not return the registered remote provider")
+	}
+}
+
+func TestBuildProviderForAdaptive_RemoteOnlyProvider(t *testing.T) {
+	remote := &stubProvider{name: "remote", available: true, response: "remote response"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"remote": {Provider: remote, Access: AccessAPI},
+		},
+		UsageMode: "power",
+	})
+
+	if got := r.BuildProviderForAdaptive(PhaseCode); got != "remote" {
+		t.Fatalf("BuildProviderForAdaptive(PhaseCode) = %q, want remote", got)
+	}
+}
+
 func TestRegisterProvider_Runtime(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{
 		Providers: map[string]ProviderEntry{},
