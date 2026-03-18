@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -76,5 +78,37 @@ func TestBuildSystemPrompt_CodeTruncatesVeryLargeTree(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "more files not shown") {
 		t.Fatalf("code prompt should truncate oversized file trees")
+	}
+}
+
+func TestBuildSystemPrompt_TruncatedProjectSkipsRepoContext(t *testing.T) {
+	dir := t.TempDir()
+	rulesDir := filepath.Join(dir, ".makewand")
+	if err := os.MkdirAll(rulesDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rulesDir, "rules.md"), []byte("always test"), 0o600); err != nil {
+		t.Fatalf("WriteFile(rules): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(main.go): %v", err)
+	}
+
+	proj := &engine.Project{
+		Name:          "truncated",
+		Path:          dir,
+		ScanTruncated: true,
+		Files: []engine.FileEntry{
+			{Path: "."},
+			{Path: "main.go"},
+		},
+	}
+
+	prompt := buildSystemPrompt(proj, model.TaskCode, model.ModeBalanced)
+	if !strings.Contains(prompt, "Project scan limited to 1 entries") {
+		t.Fatalf("expected truncated scan notice, got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Project rules:") {
+		t.Fatalf("truncated project should skip repo context, got:\n%s", prompt)
 	}
 }

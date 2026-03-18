@@ -295,6 +295,13 @@ func TestProviderAttemptTimeout_BalancedCodeModerate(t *testing.T) {
 	}
 }
 
+func TestProviderAttemptTimeout_BalancedFixModerate(t *testing.T) {
+	got := providerAttemptTimeout(ModeBalanced, PhaseFix, "gemini")
+	if got != 90*time.Second {
+		t.Fatalf("providerAttemptTimeout(balanced, fix, gemini) = %s, want 90s", got)
+	}
+}
+
 func TestProviderAttemptTimeout_PowerKeepsPhaseDefault(t *testing.T) {
 	got := providerAttemptTimeout(ModePower, PhaseCode, "gemini")
 	if got != 180*time.Second {

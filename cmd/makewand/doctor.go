@@ -230,14 +230,17 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 	}
 
 	report.DetectedProviders = detectConfiguredProviders(cfg)
+	if check, ok := remoteBackendDoctorCheck(); ok {
+		report.Checks = append(report.Checks, check)
+	}
 	if check, ok := customProviderDoctorCheck(cfg); ok {
 		report.Checks = append(report.Checks, check)
 	}
-	if !cfg.HasAnyModel() {
+	if !hasUsableBackend(cfg) {
 		report.Checks = append(report.Checks, doctorCheck{
 			Name:    "model configuration",
 			Status:  doctorFail,
-			Details: "no model configured; run 'makewand setup' first",
+			Details: "no model or remote backend configured; run 'makewand setup' first",
 		})
 	} else {
 		report.Checks = append(report.Checks, doctorCheck{
@@ -398,6 +401,12 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 func detectConfiguredProviders(cfg *config.Config) []string {
 	set := make(map[string]bool)
 
+	if config.HasRemoteBackend() {
+		set["remote (http)"] = true
+	} else if config.RemoteBaseURL() != "" || config.RemoteToken() != "" {
+		set["remote (partial)"] = true
+	}
+
 	for _, cli := range cfg.CLIs {
 		name := strings.TrimSpace(cli.Name)
 		if name != "" {
@@ -427,6 +436,28 @@ func detectConfiguredProviders(cfg *config.Config) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func remoteBackendDoctorCheck() (doctorCheck, bool) {
+	url := config.RemoteBaseURL()
+	token := config.RemoteToken()
+
+	switch {
+	case url == "" && token == "":
+		return doctorCheck{}, false
+	case url != "" && token != "":
+		return doctorCheck{
+			Name:    "remote backend",
+			Status:  doctorPass,
+			Details: url,
+		}, true
+	default:
+		return doctorCheck{
+			Name:    "remote backend",
+			Status:  doctorWarn,
+			Details: fmt.Sprintf("partial remote backend configuration; missing %s", strings.Join(missingRemoteBackendEnvVars(url, token), ", ")),
+		}, true
+	}
 }
 
 func printDoctorReport(report doctorReport) {

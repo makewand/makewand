@@ -190,16 +190,33 @@ func NewCodexCLI(binPath string) *CLIProvider {
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
 		// Use dedicated review subcommand for review tasks.
 		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
-			return exec.CommandContext(ctx, binPath, "review", "--uncommitted")
+			args := []string{"review", "--uncommitted"}
+			return exec.CommandContext(ctx, binPath, args...)
 		}
 		// Default: exec with JSON output for structured usage data.
-		return exec.CommandContext(ctx, binPath, "exec", "--json", "--skip-git-repo-check", prompt)
+		args := []string{
+			"exec",
+			"--sandbox", codexSandboxMode(ctx),
+			"--ephemeral",
+			"--json",
+			"--skip-git-repo-check",
+			prompt,
+		}
+		return exec.CommandContext(ctx, binPath, args...)
 	}
 	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
 		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
-			return exec.CommandContext(ctx, binPath, "review", "--uncommitted")
+			args := []string{"review", "--uncommitted"}
+			return exec.CommandContext(ctx, binPath, args...)
 		}
-		return exec.CommandContext(ctx, binPath, "exec", "--skip-git-repo-check", prompt)
+		args := []string{
+			"exec",
+			"--sandbox", codexSandboxMode(ctx),
+			"--ephemeral",
+			"--skip-git-repo-check",
+			prompt,
+		}
+		return exec.CommandContext(ctx, binPath, args...)
 	}
 	p.checkCmd = func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, binPath, "--version")
@@ -328,6 +345,7 @@ func (c *CLIProvider) softPassProbeTimeout() bool {
 
 func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	var prompt string
+	validationPrompt := buildCLIValidationPrompt(messages)
 	if c.systemFlag != "" && system != "" {
 		// Pass system prompt via dedicated CLI flag (proper system role).
 		prompt = buildCLIPrompt(messages, "")
@@ -346,7 +364,7 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 	attempts := 0
 	for {
 		attempts++
-		content, jsonUsage, err := c.chatAttempt(ctx, prompt)
+		content, jsonUsage, err := c.chatAttempt(ctx, prompt, validationPrompt)
 		if err == nil {
 			var usage Usage
 			if jsonUsage != nil {
@@ -415,6 +433,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 		buildCmd = c.buildCmd
 	}
 	cmd := buildCmd(ctx, prompt)
+	applyCLIWorkDir(ctx, cmd)
 	setCLIProcessGroup(cmd)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -745,8 +764,28 @@ func shouldSurfaceContextError(ctxErr error) bool {
 	return errors.Is(ctxErr, context.DeadlineExceeded)
 }
 
-func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, *Usage, error) {
+func applyCLIWorkDir(ctx context.Context, cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	if dir, ok := WorkDirFromContext(ctx); ok {
+		cmd.Dir = dir
+	}
+}
+
+func codexSandboxMode(ctx context.Context) string {
+	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		return "read-only"
+	}
+	if _, ok := WorkDirFromContext(ctx); ok {
+		return "workspace-write"
+	}
+	return "read-only"
+}
+
+func (c *CLIProvider) chatAttempt(ctx context.Context, prompt, validationPrompt string) (string, *Usage, error) {
 	cmd := c.buildCmd(ctx, prompt)
+	applyCLIWorkDir(ctx, cmd)
 	setCLIProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
@@ -782,7 +821,7 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, *
 	if c.jsonOutput && c.parseJSONResponse != nil {
 		content, usage, err := c.parseJSONResponse(raw)
 		if err == nil && content != "" {
-			if reject, reason := shouldRejectCLIOutput(prompt, content); reject {
+			if reject, reason := shouldRejectCLIOutput(validationPrompt, content); reject {
 				return "", nil, newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
 			}
 			return content, usage, nil
@@ -792,7 +831,7 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, *
 
 	content := strings.TrimSpace(string(raw))
 	content = stripANSI(content)
-	if reject, reason := shouldRejectCLIOutput(prompt, content); reject {
+	if reject, reason := shouldRejectCLIOutput(validationPrompt, content); reject {
 		return "", nil, newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
 	}
 	return content, nil, nil
@@ -1005,6 +1044,20 @@ func buildCLIPrompt(messages []Message, system string) string {
 	}
 
 	return strings.TrimSpace(b.String())
+}
+
+func buildCLIValidationPrompt(messages []Message) string {
+	var parts []string
+	for _, m := range messages {
+		if strings.TrimSpace(m.Content) == "" {
+			continue
+		}
+		if m.Role != "user" {
+			continue
+		}
+		parts = append(parts, m.Content)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
 // estimateTokens provides a rough token count using a word/rune hybrid.

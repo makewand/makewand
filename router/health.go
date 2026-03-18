@@ -117,7 +117,7 @@ func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) t
 		case PhaseReview:
 			return 40 * time.Second
 		case PhaseFix:
-			return 45 * time.Second
+			return 90 * time.Second
 		default:
 			return 60 * time.Second
 		}
