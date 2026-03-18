@@ -379,6 +379,13 @@ func (r *Router) EmitTrace(event TraceEvent) {
 
 // Route selects the best provider for a given task type.
 func (r *Router) Route(task TaskType) (RouteResult, error) {
+	if name, provider, ok := r.remoteOnlyProvider(); ok {
+		return RouteResult{
+			Provider:  provider,
+			Requested: name,
+			Actual:    name,
+		}, nil
+	}
 	if r.ModeSet() {
 		return r.routeByMode(task)
 	}

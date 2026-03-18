@@ -140,6 +140,20 @@ func (r *Router) getProvider(name string) (Provider, bool) {
 	return p, ok
 }
 
+func (r *Router) remoteOnlyProvider() (string, Provider, bool) {
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+
+	if len(r.providers) != 1 {
+		return "", nil, false
+	}
+	p, ok := r.providers["remote"]
+	if !ok || p == nil || !p.IsAvailable() {
+		return "", nil, false
+	}
+	return "remote", p, true
+}
+
 // IsSubscription returns true if the named provider uses subscription access.
 func (r *Router) IsSubscription(name string) bool {
 	r.mu.Lock()
