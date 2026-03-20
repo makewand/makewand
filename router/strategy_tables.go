@@ -100,12 +100,17 @@ type rawEnsemble struct {
 	Judge      string   `json:"judge"`
 }
 
+// initErr records any failure from loading embedded strategy defaults.
+// Checked lazily in NewRouterFromConfig so callers get an error instead of a panic.
+var initErr error
+
 func init() {
 	if err := loadDefaults(defaultsJSON); err != nil {
-		panic("strategy defaults: " + err.Error())
+		initErr = fmt.Errorf("strategy defaults: %w", err)
+		return
 	}
 	if err := validateStrategyTables(); err != nil {
-		panic("strategy table validation: " + err.Error())
+		initErr = fmt.Errorf("strategy table validation: %w", err)
 	}
 }
 

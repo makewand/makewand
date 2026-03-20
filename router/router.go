@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -221,6 +222,11 @@ const availCacheTTL = 10 * time.Second
 // NewRouterFromConfig creates a Router from a config-free RouterConfig.
 // This is the primary constructor for library consumers.
 func NewRouterFromConfig(rc RouterConfig) *Router {
+	if initErr != nil {
+		// Embedded strategy defaults failed to load — should not happen in a
+		// correctly built binary. Log the error so callers can diagnose.
+		fmt.Fprintf(os.Stderr, "router: strategy init error: %v\n", initErr)
+	}
 	if rc.ConfigDir != "" {
 		_ = LoadUserOverrides(rc.ConfigDir)
 	}
@@ -264,15 +270,15 @@ func (r *Router) SetMode(m UsageMode) {
 // SetAccessType sets the access type for a named provider.
 // This is used by the CLI adapter to apply explicit access overrides from config.
 func (r *Router) SetAccessType(name string, access AccessType) {
-	r.mu.Lock()
+	r.providerMu.Lock()
 	r.accessTypes[name] = access
-	r.mu.Unlock()
+	r.providerMu.Unlock()
 }
 
 // getAccessType returns the access type for a named provider (thread-safe).
 func (r *Router) getAccessType(name string) AccessType {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
 	return r.accessTypes[name]
 }
 
@@ -315,7 +321,7 @@ func (r *Router) effectiveMode() UsageMode {
 // provider state while allowing a different routing mode without mutating
 // the live server router.
 func (r *Router) cloneWithMode(mode UsageMode) *Router {
-	r.mu.Lock()
+	r.providerMu.Lock()
 	providers := make(map[string]Provider, len(r.providers))
 	for name, provider := range r.providers {
 		providers[name] = provider
@@ -324,17 +330,17 @@ func (r *Router) cloneWithMode(mode UsageMode) *Router {
 	for name, access := range r.accessTypes {
 		accessTypes[name] = access
 	}
-	cachedAvail := append([]string(nil), r.cachedAvail...)
-	cachedAvailAt := r.cachedAvailAt
-	legacy := r.legacyModels
-	r.mu.Unlock()
-
-	r.providerMu.Lock()
 	providerCache := make(map[providerKey]Provider, len(r.providerCache))
 	for key, provider := range r.providerCache {
 		providerCache[key] = provider
 	}
 	r.providerMu.Unlock()
+
+	r.mu.Lock()
+	cachedAvail := append([]string(nil), r.cachedAvail...)
+	cachedAvailAt := r.cachedAvailAt
+	legacy := r.legacyModels
+	r.mu.Unlock()
 
 	r.traceMu.RLock()
 	traceSink := r.traceSink

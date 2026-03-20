@@ -88,16 +88,21 @@ func (r *Router) RegisterProvider(name string, provider Provider, access AccessT
 
 	r.providerMu.Lock()
 	r.providers[name] = provider
+	// Collect stale cache keys before deleting to avoid map mutation during iteration.
+	var staleKeys []providerKey
 	for k := range r.providerCache {
 		if k.name == name {
-			delete(r.providerCache, k)
+			staleKeys = append(staleKeys, k)
 		}
 	}
+	for _, k := range staleKeys {
+		delete(r.providerCache, k)
+	}
 	r.providerCache[providerKey{name: name, modelID: ""}] = provider
+	r.accessTypes[name] = access
 	r.providerMu.Unlock()
 
 	r.mu.Lock()
-	r.accessTypes[name] = access
 	r.cachedAvailAt = time.Time{}
 	r.mu.Unlock()
 	return nil
@@ -156,8 +161,8 @@ func (r *Router) remoteOnlyProvider() (string, Provider, bool) {
 
 // IsSubscription returns true if the named provider uses subscription access.
 func (r *Router) IsSubscription(name string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
 	return r.accessTypes[name] == AccessSubscription
 }
 
