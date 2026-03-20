@@ -49,6 +49,7 @@ type execPolicy struct {
 
 var restrictedAllowedCommands = map[string]struct{}{
 	"npm":     {},
+	"node":    {},
 	"pnpm":    {},
 	"yarn":    {},
 	"pip":     {},
