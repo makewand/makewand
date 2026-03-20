@@ -120,6 +120,14 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			{Label: m.ProgressInstallingDeps, Status: StepPending},
 			{Label: m.ProgressTesting, Status: StepPending},
 		})
+		if a.shouldUseAutopilotCandidates() {
+			a.activity.Start()
+			a.activity.SetPhase(chatActivityWaiting, "", "", false, m.AutomationCandidateStarted)
+			a.chat.AddMessage(ChatMessage{
+				Role:    "status",
+				Content: m.AutomationCandidateStarted,
+			})
+		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		a.cancelAI = cancel
@@ -135,6 +143,22 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			}
 
 			messages := []model.Message{{Role: "user", Content: prompt}}
+
+			if a.shouldUseAutopilotCandidates() {
+				selection := runCandidateSelectionWithActivity(ctx, a.activity, router, proj, model.PhaseCode, messages, wizardBuildSystemPrompt)
+				if strings.TrimSpace(selection.content) == "" {
+					return aiResponseMsg{err: fmt.Errorf("no candidate provider produced writable project files")}
+				}
+				return aiResponseMsg{
+					content:       selection.content,
+					provider:      selection.provider,
+					cost:          selection.usage.Cost,
+					inputTokens:   selection.usage.InputTokens,
+					outputTokens:  selection.usage.OutputTokens,
+					verified:      selection.verified,
+					selectionNote: selection.selectionNote,
+				}
+			}
 
 			// Use ChatBest: Power mode runs ensemble+judge; others use primary provider.
 			if router.ModeSet() {

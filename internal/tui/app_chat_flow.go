@@ -45,6 +45,8 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		switch parts[0] {
 		case "/mode", "/model":
 			return a.handleModeCommand(input)
+		case "/approval":
+			return a.handleApprovalModeCommand(input)
 		case "/help":
 			return a.handleHelpCommand()
 		case "/clear":
@@ -86,6 +88,33 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), chatStreamTimeout)
 	a.cancelAI = cancel
+
+	if a.shouldUseAutopilotChatCandidates(task) {
+		project := a.project
+		router := a.router
+		activity := a.activity
+		phase := chatTaskToBuildPhase(task)
+		cmd := func() tea.Msg {
+			defer cancel()
+			markChatPreparationActivity(activity, project != nil)
+			systemPrompt := buildSystemPrompt(project, task, router.Mode())
+			activity.SetPhase(chatActivityWaiting, "", "", false, i18n.Msg().AutomationCandidateStarted)
+			selection := runCandidateSelectionWithActivity(ctx, activity, router, project, phase, messages, systemPrompt)
+			if strings.TrimSpace(selection.content) == "" {
+				return aiResponseMsg{err: fmt.Errorf("no candidate provider produced a response")}
+			}
+			return aiResponseMsg{
+				content:       selection.content,
+				provider:      selection.provider,
+				cost:          selection.usage.Cost,
+				inputTokens:   selection.usage.InputTokens,
+				outputTokens:  selection.usage.OutputTokens,
+				verified:      selection.verified,
+				selectionNote: selection.selectionNote,
+			}
+		}
+		return a, cmd
+	}
 
 	// In power mode, chat uses multi-model ensemble + judge (ChatBest).
 	// Other modes keep low-latency stream-first behavior.
@@ -184,6 +213,18 @@ func (a App) shouldPreferStreamingChat(task model.TaskType) bool {
 	}
 	_, ok := route.Provider.(*model.CLIProvider)
 	return ok
+}
+
+func (a App) shouldUseAutopilotChatCandidates(task model.TaskType) bool {
+	if !a.shouldUseAutopilotCandidates() || a.project == nil {
+		return false
+	}
+	switch task {
+	case model.TaskCode, model.TaskFix:
+		return true
+	default:
+		return false
+	}
 }
 
 func markChatPreparationActivity(activity *chatActivityState, hasProject bool) {
@@ -326,6 +367,34 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+func (a App) handleApprovalModeCommand(input string) (tea.Model, tea.Cmd) {
+	msg := i18n.Msg()
+	parts := strings.Fields(input)
+
+	if len(parts) == 1 {
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf("%s: %s\n%s", msg.ApprovalModeLabel, a.currentApprovalModeLabel(), msg.ApprovalModeHelp),
+		})
+		return a, nil
+	}
+
+	switch strings.ToLower(parts[1]) {
+	case "manual", "safe", "autopilot":
+		a.setApprovalMode(parts[1])
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf(msg.ApprovalModeChanged, a.currentApprovalModeLabel()),
+		})
+	default:
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: msg.ApprovalModeHelp,
+		})
+	}
+	return a, nil
+}
+
 func (a App) currentModeLabel() string {
 	if a.router.ModeSet() {
 		return a.router.Mode().String()
@@ -342,6 +411,7 @@ func (a App) chatHelpText() string {
 		"/memory - Show compacted session memory",
 		"/status - Show current session status",
 		"/cost - Show current session cost",
+		"/approval [manual|safe|autopilot] - Switch approval behavior",
 		"/approve - Approve the pending action",
 		"/deny - Deny the pending action",
 		"/resume - Restore the last saved session",
@@ -354,6 +424,7 @@ func (a App) statusSummary() string {
 	var lines []string
 	msg := i18n.Msg()
 	lines = append(lines, fmt.Sprintf("Model profile: %s", a.currentModeLabel()))
+	lines = append(lines, fmt.Sprintf("%s: %s", msg.ApprovalModeLabel, a.currentApprovalModeLabel()))
 
 	available := a.router.Available()
 	if len(available) == 0 {
@@ -368,7 +439,7 @@ func (a App) statusSummary() string {
 	}
 
 	if summary := a.pendingApprovalSummary(); summary != "" {
-		lines = append(lines, "Pending approval:")
+		lines = append(lines, msg.ApprovalPendingLabel+":")
 		lines = append(lines, summary)
 	}
 	if a.activity != nil {

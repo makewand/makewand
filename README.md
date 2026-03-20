@@ -116,6 +116,16 @@ resume the same chat even when local paths differ:
 export MAKEWAND_WORKSPACE_ID=my-repo-main
 ```
 
+Validation scripts / 验证脚本:
+
+```bash
+# Basic connectivity / 基础连通性
+bash scripts/personal_remote_smoke.sh
+
+# Real-case regression / 真实案例回归
+bash scripts/personal_remote_realcase.sh
+```
+
 ## Usage Modes / 使用模式
 
 | Mode / 模式 | Tier | Behavior / 行为 | Typical Models / 典型模型 |
