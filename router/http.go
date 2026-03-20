@@ -11,6 +11,7 @@
 package router
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -112,7 +113,7 @@ func (r *Router) requireAuth(token string, next http.HandlerFunc) http.HandlerFu
 	}
 	expected := "Bearer " + token
 	return func(w http.ResponseWriter, req *http.Request) {
-		if req.Header.Get("Authorization") != expected {
+		if subtle.ConstantTimeCompare([]byte(req.Header.Get("Authorization")), []byte(expected)) != 1 {
 			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing Bearer token")
 			return
 		}
@@ -142,14 +143,9 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		writeHTTPError(w, http.StatusBadRequest, "unsupported", "streaming is not yet supported via HTTP; use the Go API directly")
 		return
 	}
-	if chatReq.MaxTokens != nil {
-		writeHTTPError(w, http.StatusBadRequest, "unsupported", "max_tokens is not yet supported via HTTP; use the Go API directly")
-		return
-	}
-	if chatReq.Temperature != nil {
-		writeHTTPError(w, http.StatusBadRequest, "unsupported", "temperature is not yet supported via HTTP; use the Go API directly")
-		return
-	}
+	// max_tokens and temperature are silently ignored — they are standard
+	// OpenAI fields that clients commonly include. Rejecting them would
+	// break otherwise valid requests.
 
 	if len(chatReq.Messages) == 0 {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "messages array is empty")

@@ -141,7 +141,7 @@ func TestHTTPHandler_UnknownModelRejected(t *testing.T) {
 	}
 }
 
-func TestHTTPHandler_RejectsUnsupportedMaxTokens(t *testing.T) {
+func TestHTTPHandler_IgnoresUnsupportedMaxTokens(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 
 	handler := r.HTTPHandler()
@@ -150,12 +150,14 @@ func TestHTTPHandler_RejectsUnsupportedMaxTokens(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	// max_tokens is silently ignored, so the request proceeds to routing
+	// (which fails with 503 because no provider is configured — not 400).
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("max_tokens should be silently ignored, got 400: %s", rec.Body.String())
 	}
 }
 
-func TestHTTPHandler_RejectsUnsupportedTemperature(t *testing.T) {
+func TestHTTPHandler_IgnoresUnsupportedTemperature(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 
 	handler := r.HTTPHandler()
@@ -164,8 +166,9 @@ func TestHTTPHandler_RejectsUnsupportedTemperature(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	// temperature is silently ignored, so the request proceeds to routing.
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("temperature should be silently ignored, got 400: %s", rec.Body.String())
 	}
 }
 

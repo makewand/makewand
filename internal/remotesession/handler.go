@@ -1,6 +1,7 @@
 package remotesession
 
 import (
+	"crypto/subtle"
 	"io"
 	"net/http"
 	"net/url"
@@ -65,7 +66,7 @@ func withAuth(token string, next http.Handler) http.Handler {
 	}
 	expected := "Bearer " + token
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Header.Get("Authorization") != expected {
+		if subtle.ConstantTimeCompare([]byte(req.Header.Get("Authorization")), []byte(expected)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
