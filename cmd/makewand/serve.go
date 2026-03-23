@@ -13,6 +13,7 @@ import (
 	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/remotesession"
 	"github.com/makewand/makewand/router"
+	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 	"github.com/spf13/cobra"
 )
@@ -23,6 +24,7 @@ func serveCmd() *cobra.Command {
 		token      string
 		dataDir    string
 		authConfig string
+		auditPath  string
 	)
 
 	cmd := &cobra.Command{
@@ -47,6 +49,15 @@ func serveCmd() *cobra.Command {
 				}
 				dataDir = filepath.Join(cfgDir, "server")
 			}
+			auditPath = resolveServeAuditPath(auditPath, dataDir)
+			var auditLogger *serveraudit.JSONLLogger
+			if strings.TrimSpace(auditPath) != "" {
+				auditLogger, err = serveraudit.OpenJSONL(auditPath)
+				if err != nil {
+					return fmt.Errorf("open audit log: %w", err)
+				}
+				defer auditLogger.Close()
+			}
 
 			rtr := serveRouter(cfg)
 			statsDir, err := config.ConfigDir()
@@ -58,11 +69,15 @@ func serveCmd() *cobra.Command {
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
 
 			base := rtr.HTTPHandler(router.HTTPHandlerOptions{
-				Authorizer: authz,
-				StatsDir:   statsDir,
+				Authorizer:  authz,
+				StatsDir:    statsDir,
+				AuditLogger: auditLogger,
 			})
 			mux := http.NewServeMux()
-			mux.Handle("/v1/sessions/", remotesession.NewHandlerWithAuthorizer(sessions, authz))
+			mux.Handle("/v1/sessions/", remotesession.NewHandlerWithOptions(sessions, remotesession.HandlerOptions{
+				Authorizer:  authz,
+				AuditLogger: auditLogger,
+			}))
 			mux.Handle("/", base)
 
 			server := &http.Server{
@@ -80,6 +95,9 @@ func serveCmd() *cobra.Command {
 
 			fmt.Printf("makewand server listening on %s\n", listenAddr)
 			fmt.Printf("Sessions directory: %s\n", filepath.Join(dataDir, "sessions"))
+			if auditLogger != nil {
+				fmt.Printf("Audit log: %s\n", auditPath)
+			}
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
@@ -91,6 +109,7 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&token, "token", "", "Bearer token required by remote clients")
 	cmd.Flags().StringVar(&authConfig, "auth-config", "", "path to JSON auth config with scoped tokens")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "directory used to persist remote sessions (default: ~/.config/makewand/server)")
+	cmd.Flags().StringVar(&auditPath, "audit-log", "", "path to append-only JSONL audit log (default: <data-dir>/audit.jsonl when MAKEWAND_SERVER_AUDIT_LOG is set)")
 	return cmd
 }
 
@@ -121,6 +140,21 @@ func serveRouter(cfg *config.Config) *model.Router {
 	restore := temporarilyUnsetRemoteBackendEnv()
 	defer restore()
 	return model.NewRouter(cfg)
+}
+
+func resolveServeAuditPath(flagValue, dataDir string) string {
+	flagValue = strings.TrimSpace(flagValue)
+	if flagValue != "" {
+		return flagValue
+	}
+	envValue := strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_AUDIT_LOG"))
+	if envValue == "" {
+		return ""
+	}
+	if strings.EqualFold(envValue, "1") || strings.EqualFold(envValue, "true") {
+		return filepath.Join(dataDir, "audit.jsonl")
+	}
+	return envValue
 }
 
 func temporarilyUnsetRemoteBackendEnv() func() {

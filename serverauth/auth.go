@@ -1,6 +1,8 @@
 package serverauth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -39,12 +42,15 @@ type Config struct {
 
 // TokenRule defines one remote client token and its permissions.
 type TokenRule struct {
-	Token             string   `json:"token"`
-	Description       string   `json:"description,omitempty"`
-	Scopes            []string `json:"scopes"`
-	WorkspacePrefixes []string `json:"workspace_prefixes,omitempty"`
-	AllowedProviders  []string `json:"allowed_providers,omitempty"`
-	AllowedModes      []string `json:"allowed_modes,omitempty"`
+	ID                string    `json:"id,omitempty"`
+	Token             string    `json:"token"`
+	Description       string    `json:"description,omitempty"`
+	Scopes            []string  `json:"scopes"`
+	WorkspacePrefixes []string  `json:"workspace_prefixes,omitempty"`
+	AllowedProviders  []string  `json:"allowed_providers,omitempty"`
+	AllowedModes      []string  `json:"allowed_modes,omitempty"`
+	ExpiresAt         time.Time `json:"expires_at,omitempty"`
+	Revoked           bool      `json:"revoked,omitempty"`
 }
 
 // Authorizer authenticates Bearer tokens and returns scoped grants.
@@ -54,6 +60,10 @@ type Authorizer struct {
 
 // Grant is the normalized permission view for an authenticated token.
 type Grant struct {
+	tokenID           string
+	description       string
+	expiresAt         time.Time
+	revoked           bool
 	scopes            map[string]struct{}
 	workspacePrefixes []string
 	allowedProviders  map[string]struct{}
@@ -121,6 +131,7 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 	}
 
 	grants := make(map[string]*Grant, len(cfg.Tokens))
+	ids := make(map[string]string, len(cfg.Tokens))
 	for i, rule := range cfg.Tokens {
 		token := strings.TrimSpace(rule.Token)
 		if token == "" {
@@ -133,6 +144,10 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("token entry %q: %w", token, err)
 		}
+		if existingToken, exists := ids[grant.tokenID]; exists {
+			return nil, fmt.Errorf("duplicate token id %q (tokens %q and %q)", grant.tokenID, existingToken, token)
+		}
+		ids[grant.tokenID] = token
 		grants[token] = grant
 	}
 
@@ -161,7 +176,13 @@ func (a *Authorizer) AuthenticateHeader(header string) (*Grant, bool) {
 		return nil, false
 	}
 	grant, ok := a.grants[token]
-	return grant, ok
+	if !ok || grant == nil {
+		return nil, false
+	}
+	if grant.revoked || grant.IsExpiredAt(time.Now()) {
+		return nil, false
+	}
+	return grant, true
 }
 
 // AllowsScope reports whether the grant includes the given scope.
@@ -233,6 +254,30 @@ func (g *Grant) AllowsMode(mode string) bool {
 	return ok
 }
 
+// TokenID returns a stable, non-secret identifier for the token.
+func (g *Grant) TokenID() string {
+	if g == nil {
+		return ""
+	}
+	return g.tokenID
+}
+
+// Description returns the optional human-readable token description.
+func (g *Grant) Description() string {
+	if g == nil {
+		return ""
+	}
+	return g.description
+}
+
+// IsExpiredAt reports whether the token is expired at the supplied time.
+func (g *Grant) IsExpiredAt(now time.Time) bool {
+	if g == nil || g.expiresAt.IsZero() {
+		return false
+	}
+	return !now.Before(g.expiresAt)
+}
+
 func newGrant(rule TokenRule) (*Grant, error) {
 	if len(rule.Scopes) == 0 {
 		return nil, errors.New("scopes must not be empty")
@@ -288,7 +333,16 @@ func newGrant(rule TokenRule) (*Grant, error) {
 		modes = nil
 	}
 
+	tokenID := strings.TrimSpace(rule.ID)
+	if tokenID == "" {
+		tokenID = defaultTokenID(rule.Token)
+	}
+
 	return &Grant{
+		tokenID:           tokenID,
+		description:       strings.TrimSpace(rule.Description),
+		expiresAt:         rule.ExpiresAt.UTC(),
+		revoked:           rule.Revoked,
 		scopes:            scopeSet,
 		workspacePrefixes: workspacePrefixes,
 		allowedProviders:  providers,
@@ -337,4 +391,9 @@ func compactStrings(values []string) []string {
 		}
 	}
 	return out
+}
+
+func defaultTokenID(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return "tok_" + hex.EncodeToString(sum[:6])
 }
