@@ -76,7 +76,9 @@ Endpoints:
 
 The HTTP facade accepts a provider name from `/v1/models` in the `model` field
 to force a specific provider. `max_tokens` and `temperature` are accepted but
-currently ignored for compatibility.
+currently ignored for compatibility. When wrapped by `makewand serve`, each
+response also carries `X-Request-Id` for tracing and can be paired with the
+server-side usage ledger and `/metrics` endpoint.
 
 ### Strategy Hot-Reload
 

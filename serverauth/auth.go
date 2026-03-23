@@ -26,6 +26,10 @@ const (
 	ScopeAdminTokensRead  = "admin:tokens:read"
 	ScopeAdminTokensWrite = "admin:tokens:write"
 	ScopeAdminAuditRead   = "admin:audit:read"
+	ScopeAdminUsageRead   = "admin:usage:read"
+	ScopeAdminMetricsRead = "admin:metrics:read"
+	ScopeAdminUsersRead   = "admin:users:read"
+	ScopeAdminUsersWrite  = "admin:users:write"
 )
 
 var validScopes = map[string]struct{}{
@@ -37,6 +41,10 @@ var validScopes = map[string]struct{}{
 	ScopeAdminTokensRead:  {},
 	ScopeAdminTokensWrite: {},
 	ScopeAdminAuditRead:   {},
+	ScopeAdminUsageRead:   {},
+	ScopeAdminMetricsRead: {},
+	ScopeAdminUsersRead:   {},
+	ScopeAdminUsersWrite:  {},
 }
 
 var validModes = map[string]struct{}{
@@ -140,7 +148,15 @@ func AllClientScopes() []string {
 // AllScopes returns the full scope set used by privileged admin tokens.
 func AllScopes() []string {
 	out := AllClientScopes()
-	out = append(out, ScopeAdminTokensRead, ScopeAdminTokensWrite, ScopeAdminAuditRead)
+	out = append(out,
+		ScopeAdminTokensRead,
+		ScopeAdminTokensWrite,
+		ScopeAdminAuditRead,
+		ScopeAdminUsageRead,
+		ScopeAdminMetricsRead,
+		ScopeAdminUsersRead,
+		ScopeAdminUsersWrite,
+	)
 	return out
 }
 

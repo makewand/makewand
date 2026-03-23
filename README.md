@@ -108,7 +108,8 @@ makewand token issue \
 
 MAKEWAND_SERVER_AUTH_CONFIG=~/.config/makewand/server_auth.json \
 MAKEWAND_SERVER_AUDIT_LOG=1 \
-makewand serve --listen 127.0.0.1:8080
+MAKEWAND_SERVER_USAGE_LOG=1 \
+makewand serve --listen 127.0.0.1:8080 --enable-users
 ```
 
 On another computer / 在其他电脑上：
@@ -134,6 +135,8 @@ makewand token list --auth-config ~/.config/makewand/server_auth.json
 makewand token revoke runner --auth-config ~/.config/makewand/server_auth.json
 makewand audit summary --path ~/.config/makewand/server/audit.jsonl
 makewand audit events --path ~/.config/makewand/server/audit.jsonl --limit 20
+makewand usage summary --path ~/.config/makewand/server/usage.jsonl
+makewand user list --users-dir ~/.config/makewand/server/users
 ```
 
 When the server runs with `--auth-config`, it also exposes admin APIs for live
@@ -158,6 +161,14 @@ makewand token issue \
 makewand audit summary \
   --remote-url http://your-main-machine:8080 \
   --remote-token your-admin-token
+
+makewand usage summary \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
+
+makewand user list \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
 ```
 
 Admin APIs / 管理 API：
@@ -169,8 +180,13 @@ Admin APIs / 管理 API：
 | `POST /v1/admin/tokens/{id}/revoke` | `admin:tokens:write` |
 | `GET /v1/admin/audit/summary` | `admin:audit:read` |
 | `GET /v1/admin/audit/events` | `admin:audit:read` |
-| `GET /v1/admin/usage/summary` | `admin:audit:read` |
-| `GET /v1/admin/audit/events` | `admin:audit:read` |
+| `GET /v1/admin/usage/summary` | `admin:usage:read` |
+| `GET /v1/admin/usage/events` | `admin:usage:read` |
+| `GET /v1/admin/users` | `admin:users:read` |
+| `POST /v1/admin/users/{id}/activate` | `admin:users:write` |
+| `POST /v1/admin/users/{id}/deactivate` | `admin:users:write` |
+| `POST /v1/admin/users/{id}/role` | `admin:users:write` |
+| `GET /metrics` | `admin:metrics:read` |
 
 If both machines point at the same repository, set a shared workspace id to
 resume the same chat even when local paths differ:
@@ -301,6 +317,10 @@ that provider. `stream=true` is supported; `max_tokens` and `temperature` are
 accepted but currently ignored for compatibility.
 请求可将 `model` 设置为 `/v1/models` 返回的 Provider 名称以强制选择该 Provider。
 支持 `stream=true`；`max_tokens`、`temperature` 会被接受，但当前仅作为兼容字段忽略。
+`makewand serve` also attaches `X-Request-Id` to each response and exposes a
+Prometheus-style `/metrics` endpoint when started as a server.
+`makewand serve` 还会在响应中附带 `X-Request-Id`，并暴露 Prometheus 风格的
+`/metrics` 端点。
 
 | Endpoint | Description |
 |----------|-------------|
@@ -320,6 +340,8 @@ makewand new                   Create new project / 创建项目
 makewand serve                 Start personal remote server / 启动个人远程服务
 makewand token                 Manage remote auth config / 管理远程鉴权配置
 makewand audit                 Inspect server audit log / 查看服务端审计日志
+makewand usage                 Inspect structured usage log / 查看结构化用量日志
+makewand user                  Manage registered server users / 管理注册用户
 makewand preview [path]        Start preview server / 启动预览服务
 makewand setup                 Configure providers / 配置 Provider
 makewand doctor                Health check / 健康诊断

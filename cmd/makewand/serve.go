@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
@@ -16,16 +17,21 @@ import (
 	"github.com/makewand/makewand/serveradmin"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverhttp"
+	"github.com/makewand/makewand/servermetrics"
+	"github.com/makewand/makewand/serverusage"
 	"github.com/spf13/cobra"
 )
 
 func serveCmd() *cobra.Command {
 	var (
-		listenAddr string
-		token      string
-		dataDir    string
-		authConfig string
-		auditPath  string
+		listenAddr  string
+		token       string
+		dataDir     string
+		authConfig  string
+		auditPath   string
+		usagePath   string
+		enableUsers bool
 	)
 
 	cmd := &cobra.Command{
@@ -51,6 +57,7 @@ func serveCmd() *cobra.Command {
 				dataDir = filepath.Join(cfgDir, "server")
 			}
 			auditPath = resolveServeAuditPath(auditPath, dataDir)
+			usagePath = resolveServeUsagePath(usagePath, dataDir)
 			var auditLogger *serveraudit.JSONLLogger
 			if strings.TrimSpace(auditPath) != "" {
 				auditLogger, err = serveraudit.OpenJSONL(auditPath)
@@ -58,6 +65,14 @@ func serveCmd() *cobra.Command {
 					return fmt.Errorf("open audit log: %w", err)
 				}
 				defer auditLogger.Close()
+			}
+			var usageLogger *serverusage.JSONLLogger
+			if strings.TrimSpace(usagePath) != "" {
+				usageLogger, err = serverusage.OpenJSONL(usagePath)
+				if err != nil {
+					return fmt.Errorf("open usage log: %w", err)
+				}
+				defer usageLogger.Close()
 			}
 
 			rtr := serveRouter(cfg)
@@ -68,12 +83,21 @@ func serveCmd() *cobra.Command {
 				}
 			}
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
+			var userStore *router.UserStore
+			if enableUsers {
+				userStore = router.NewUserStore(filepath.Join(dataDir, "users"))
+			}
 
-			base := rtr.HTTPHandler(router.HTTPHandlerOptions{
+			httpOpts := router.HTTPHandlerOptions{
 				Authorizer:  authz,
 				StatsDir:    statsDir,
 				AuditLogger: auditLogger,
-			})
+				UsageLogger: usageLogger,
+			}
+			base := rtr.HTTPHandler(httpOpts)
+			if userStore != nil {
+				base = rtr.HTTPHandlerWithUsers(userStore, httpOpts)
+			}
 			mux := http.NewServeMux()
 			mux.Handle("/v1/sessions/", remotesession.NewHandlerWithOptions(sessions, remotesession.HandlerOptions{
 				Authorizer:  authz,
@@ -85,13 +109,18 @@ func serveCmd() *cobra.Command {
 					TokenManager: manager,
 					AuditPath:    auditPath,
 					AuditLogger:  auditLogger,
+					UsagePath:    usagePath,
+					UserStore:    userStore,
 				}))
 			}
+			metrics := servermetrics.NewRecorder()
+			mux.Handle("/metrics", serveProtectedHandler(authz, serverauth.ScopeAdminMetricsRead, metrics.Handler()))
 			mux.Handle("/", base)
+			handler := serverhttp.WithRequestID(metrics.Middleware(mux))
 
 			server := &http.Server{
 				Addr:    listenAddr,
-				Handler: mux,
+				Handler: handler,
 			}
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
@@ -107,6 +136,12 @@ func serveCmd() *cobra.Command {
 			if auditLogger != nil {
 				fmt.Printf("Audit log: %s\n", auditPath)
 			}
+			if usageLogger != nil {
+				fmt.Printf("Usage log: %s\n", usagePath)
+			}
+			if userStore != nil {
+				fmt.Printf("Users directory: %s\n", filepath.Join(dataDir, "users"))
+			}
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
@@ -119,6 +154,8 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&authConfig, "auth-config", "", "path to JSON auth config with scoped tokens")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "directory used to persist remote sessions (default: ~/.config/makewand/server)")
 	cmd.Flags().StringVar(&auditPath, "audit-log", "", "path to append-only JSONL audit log (default: <data-dir>/audit.jsonl when MAKEWAND_SERVER_AUDIT_LOG is set)")
+	cmd.Flags().StringVar(&usagePath, "usage-log", "", "path to append-only JSONL usage ledger (default: <data-dir>/usage.jsonl)")
+	cmd.Flags().BoolVar(&enableUsers, "enable-users", false, "enable multi-user registration and admin user management")
 	return cmd
 }
 
@@ -164,6 +201,50 @@ func resolveServeAuditPath(flagValue, dataDir string) string {
 		return filepath.Join(dataDir, "audit.jsonl")
 	}
 	return envValue
+}
+
+func resolveServeUsagePath(flagValue, dataDir string) string {
+	flagValue = strings.TrimSpace(flagValue)
+	if flagValue != "" {
+		return flagValue
+	}
+	envValue := strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_USAGE_LOG"))
+	switch strings.ToLower(envValue) {
+	case "", "1", "true":
+		return filepath.Join(dataDir, "usage.jsonl")
+	case "0", "false", "off", "disabled":
+		return ""
+	default:
+		return envValue
+	}
+}
+
+func serveProtectedHandler(authz serverauth.RequestAuthorizer, scope string, next http.Handler) http.Handler {
+	if authz == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		grant, ok := authz.AuthenticateRequest(req)
+		if !ok {
+			writeServeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing Bearer token")
+			return
+		}
+		if err := grant.CheckAndConsumeRequestAt(time.Now()); err != nil {
+			writeServeError(w, http.StatusTooManyRequests, "rate_limited", err.Error())
+			return
+		}
+		if !grant.AllowsScope(scope) {
+			writeServeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("token does not allow scope %q", scope))
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+func writeServeError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, `{"error":{"message":%q,"type":"error","code":%q}}`, message, code)
 }
 
 func temporarilyUnsetRemoteBackendEnv() func() {

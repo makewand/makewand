@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -77,6 +78,20 @@ func TestResolveManagedAuthConfigPath_DefaultsToConfigDir(t *testing.T) {
 	want := filepath.Join(cfgDir, "server_auth.json")
 	if got != want {
 		t.Fatalf("resolveManagedAuthConfigPath() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadOrCreateAuthConfig_AllowsEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server_auth.json")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cfg, err := loadOrCreateAuthConfig(path)
+	if err != nil {
+		t.Fatalf("loadOrCreateAuthConfig: %v", err)
+	}
+	if len(cfg.Tokens) != 0 {
+		t.Fatalf("len(cfg.Tokens) = %d, want 0", len(cfg.Tokens))
 	}
 }
 

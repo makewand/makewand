@@ -43,6 +43,7 @@ func TestHandlerWithOptions_AuditLogsSuccessfulWrite(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPut, "/v1/sessions/repo-main", bytes.NewBufferString(`{"version":1}`))
 	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-Request-Id", "req_session")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -67,6 +68,9 @@ func TestHandlerWithOptions_AuditLogsSuccessfulWrite(t *testing.T) {
 	}
 	if event.Status != http.StatusNoContent {
 		t.Fatalf("Status = %d, want 204", event.Status)
+	}
+	if event.RequestID != "req_session" {
+		t.Fatalf("RequestID = %q, want %q", event.RequestID, "req_session")
 	}
 }
 

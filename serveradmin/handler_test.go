@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/makewand/makewand/router"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverusage"
 )
 
 func TestHandler_TokenLifecycleAndAuditQueries(t *testing.T) {
@@ -49,11 +51,35 @@ func TestHandler_TokenLifecycleAndAuditQueries(t *testing.T) {
 	if err := logger.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	usagePath := filepath.Join(t.TempDir(), "usage.jsonl")
+	usageLogger, err := serverusage.OpenJSONL(usagePath)
+	if err != nil {
+		t.Fatalf("OpenJSONL(usage): %v", err)
+	}
+	usageLogger.Log(serverusage.Entry{
+		Timestamp:        time.Date(2026, 3, 23, 1, 0, 0, 0, time.UTC),
+		TokenID:          "runner",
+		ActualProvider:   "codex",
+		Status:           200,
+		PromptTokens:     12,
+		CompletionTokens: 8,
+		CostUSD:          0.5,
+	})
+	if err := usageLogger.Close(); err != nil {
+		t.Fatalf("Close(usage): %v", err)
+	}
+	userStore := router.NewUserStore(filepath.Join(t.TempDir(), "users"))
+	user, err := userStore.CreateUser("person@example.com", "secret123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
 
 	handler := NewHandler(HandlerOptions{
 		Authorizer:   manager,
 		TokenManager: manager,
 		AuditPath:    auditPath,
+		UsagePath:    usagePath,
+		UserStore:    userStore,
 	})
 
 	createBody := []byte(`{"id":"runner","allowed_providers":["codex"],"allowed_modes":["balanced"],"workspace_prefixes":["repo-"]}`)
@@ -120,14 +146,62 @@ func TestHandler_TokenLifecycleAndAuditQueries(t *testing.T) {
 		t.Fatalf("usage status = %d, want 200; body: %s", usageRec.Code, usageRec.Body.String())
 	}
 	var usageResp struct {
-		Path  string         `json:"path"`
-		Usage map[string]any `json:"usage"`
+		Path  string              `json:"path"`
+		Usage serverusage.Summary `json:"usage"`
 	}
 	if err := json.NewDecoder(usageRec.Body).Decode(&usageResp); err != nil {
 		t.Fatalf("decode usage response: %v", err)
 	}
-	if usageResp.Usage["total_cost_usd"] != 0.25 {
-		t.Fatalf("usage total cost = %#v, want 0.25", usageResp.Usage["total_cost_usd"])
+	if usageResp.Path != usagePath {
+		t.Fatalf("usage path = %q, want %q", usageResp.Path, usagePath)
+	}
+	if usageResp.Usage.TotalCostUSD != 0.5 {
+		t.Fatalf("usage total cost = %#v, want 0.5", usageResp.Usage.TotalCostUSD)
+	}
+
+	usersReq := httptest.NewRequest(http.MethodGet, "/v1/admin/users", nil)
+	usersReq.Header.Set("Authorization", "Bearer admin-secret")
+	usersRec := httptest.NewRecorder()
+	handler.ServeHTTP(usersRec, usersReq)
+	if usersRec.Code != http.StatusOK {
+		t.Fatalf("users status = %d, want 200; body: %s", usersRec.Code, usersRec.Body.String())
+	}
+	var usersResp struct {
+		Data []router.UserView `json:"data"`
+	}
+	if err := json.NewDecoder(usersRec.Body).Decode(&usersResp); err != nil {
+		t.Fatalf("decode users response: %v", err)
+	}
+	if len(usersResp.Data) != 1 || usersResp.Data[0].ID != user.ID {
+		t.Fatalf("users response = %+v, want created user %s", usersResp.Data, user.ID)
+	}
+
+	roleReq := httptest.NewRequest(http.MethodPost, "/v1/admin/users/"+user.ID+"/role", bytes.NewBufferString(`{"role":"admin"}`))
+	roleReq.Header.Set("Authorization", "Bearer admin-secret")
+	roleReq.Header.Set("Content-Type", "application/json")
+	roleRec := httptest.NewRecorder()
+	handler.ServeHTTP(roleRec, roleReq)
+	if roleRec.Code != http.StatusOK {
+		t.Fatalf("role status = %d, want 200; body: %s", roleRec.Code, roleRec.Body.String())
+	}
+
+	deactivateReq := httptest.NewRequest(http.MethodPost, "/v1/admin/users/"+user.ID+"/deactivate", nil)
+	deactivateReq.Header.Set("Authorization", "Bearer admin-secret")
+	deactivateRec := httptest.NewRecorder()
+	handler.ServeHTTP(deactivateRec, deactivateReq)
+	if deactivateRec.Code != http.StatusOK {
+		t.Fatalf("deactivate status = %d, want 200; body: %s", deactivateRec.Code, deactivateRec.Body.String())
+	}
+
+	updatedUser, err := userStore.GetUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID: %v", err)
+	}
+	if updatedUser.Role != router.UserRoleAdmin {
+		t.Fatalf("updated role = %q, want %q", updatedUser.Role, router.UserRoleAdmin)
+	}
+	if updatedUser.IsActive {
+		t.Fatal("updated user still active, want deactivated")
 	}
 
 	revokeReq := httptest.NewRequest(http.MethodPost, "/v1/admin/tokens/runner/revoke", nil)
@@ -162,6 +236,38 @@ func TestHandler_RequiresAdminScopes(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/tokens", nil)
+	req.Header.Set("Authorization", "Bearer viewer-secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_UserEndpointsRequireUserScopes(t *testing.T) {
+	authPath := filepath.Join(t.TempDir(), "server_auth.json")
+	if err := serverauth.SaveConfigFile(authPath, serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:     "viewer",
+				Token:  "viewer-secret",
+				Scopes: []string{serverauth.ScopeAdminAuditRead},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveConfigFile: %v", err)
+	}
+	manager, err := serverauth.LoadManager(authPath)
+	if err != nil {
+		t.Fatalf("LoadManager: %v", err)
+	}
+	handler := NewHandler(HandlerOptions{
+		Authorizer:   manager,
+		TokenManager: manager,
+		UserStore:    router.NewUserStore(filepath.Join(t.TempDir(), "users")),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/users", nil)
 	req.Header.Set("Authorization", "Bearer viewer-secret")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

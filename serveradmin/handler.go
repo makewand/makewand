@@ -2,6 +2,7 @@ package serveradmin
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,8 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/router"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverhttp"
+	"github.com/makewand/makewand/serverusage"
 )
 
 type HandlerOptions struct {
@@ -18,6 +22,8 @@ type HandlerOptions struct {
 	TokenManager *serverauth.Manager
 	AuditPath    string
 	AuditLogger  serveraudit.Logger
+	UsagePath    string
+	UserStore    *router.UserStore
 }
 
 type errorResponse struct {
@@ -43,6 +49,10 @@ type issueTokenRequest struct {
 	MaxCostUSDPerMonth float64   `json:"max_cost_usd_per_month,omitempty"`
 }
 
+type updateUserRoleRequest struct {
+	Role string `json:"role"`
+}
+
 func NewHandler(opts HandlerOptions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
@@ -56,6 +66,12 @@ func NewHandler(opts HandlerOptions) http.Handler {
 			handleAuditEvents(w, req, opts)
 		case req.URL.Path == "/v1/admin/usage/summary":
 			handleUsageSummary(w, req, opts)
+		case req.URL.Path == "/v1/admin/usage/events":
+			handleUsageEvents(w, req, opts)
+		case req.URL.Path == "/v1/admin/users":
+			handleUsers(w, req, opts)
+		case userActionTarget(req.URL.Path) != "":
+			handleUserAction(w, req, opts)
 		default:
 			http.NotFound(w, req)
 		}
@@ -214,39 +230,145 @@ func handleUsageSummary(w http.ResponseWriter, req *http.Request, opts HandlerOp
 		writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
-	grant, ok := authenticateAdmin(w, req, opts, serverauth.ScopeAdminAuditRead, "admin_usage")
+	grant, ok := authenticateAdmin(w, req, opts, serverauth.ScopeAdminUsageRead, "admin_usage")
 	if !ok {
 		return
 	}
-	filter, err := filterFromQuery(req)
+	filter, err := usageFilterFromQuery(req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_usage", http.StatusBadRequest, err.Error(), 0, 0, 0)
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
-	events, err := loadAuditEvents(opts.AuditPath, filter)
+	entries, err := loadUsageEntries(opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
-	summary := serveraudit.SummarizeEvents(events)
+	summary := serverusage.SummarizeEntries(entries)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path": opts.AuditPath,
-		"usage": map[string]any{
-			"total_events":            summary.Total,
-			"total_prompt_tokens":     summary.TotalPromptTokens,
-			"total_completion_tokens": summary.TotalCompletionTokens,
-			"total_cost_usd":          summary.TotalCostUSD,
-			"cost_by_token":           summary.CostByToken,
-			"cost_by_provider":        summary.CostByProvider,
-			"by_token":                summary.ByToken,
-			"by_provider":             summary.ByProvider,
-			"earliest":                summary.Earliest,
-			"latest":                  summary.Latest,
-		},
+		"path":  opts.UsagePath,
+		"usage": summary,
 	})
-	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_usage", http.StatusOK, "", 0, 0, 0)
+	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusOK, "", 0, 0, 0)
+}
+
+func handleUsageEvents(w http.ResponseWriter, req *http.Request, opts HandlerOptions) {
+	if req.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	grant, ok := authenticateAdmin(w, req, opts, serverauth.ScopeAdminUsageRead, "admin_usage")
+	if !ok {
+		return
+	}
+	filter, err := usageFilterFromQuery(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusBadRequest, err.Error(), 0, 0, 0)
+		return
+	}
+	entries, err := loadUsageEntries(opts.UsagePath, filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path": opts.UsagePath,
+		"data": entries,
+	})
+	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusOK, "", 0, 0, 0)
+}
+
+func handleUsers(w http.ResponseWriter, req *http.Request, opts HandlerOptions) {
+	if req.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	grant, ok := authenticateAdmin(w, req, opts, serverauth.ScopeAdminUsersRead, "admin_users")
+	if !ok {
+		return
+	}
+	if opts.UserStore == nil {
+		writeError(w, http.StatusNotFound, "not_found", "user management is unavailable")
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersRead, "admin_users", http.StatusNotFound, "user management is unavailable", 0, 0, 0)
+		return
+	}
+	users, err := opts.UserStore.ListUsers()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersRead, "admin_users", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": users})
+	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersRead, "admin_users", http.StatusOK, "", 0, 0, 0)
+}
+
+func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOptions) {
+	if req.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	grant, ok := authenticateAdmin(w, req, opts, serverauth.ScopeAdminUsersWrite, "admin_users")
+	if !ok {
+		return
+	}
+	if opts.UserStore == nil {
+		writeError(w, http.StatusNotFound, "not_found", "user management is unavailable")
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusNotFound, "user management is unavailable", 0, 0, 0)
+		return
+	}
+	userID, action := splitUserActionTarget(req.URL.Path)
+	if userID == "" || action == "" {
+		http.NotFound(w, req)
+		return
+	}
+
+	var (
+		user *router.User
+		err  error
+	)
+	switch action {
+	case "activate":
+		user, err = opts.UserStore.SetUserActive(userID, true)
+	case "deactivate":
+		user, err = opts.UserStore.SetUserActive(userID, false)
+	case "role":
+		var payload updateUserRoleRequest
+		dec := json.NewDecoder(req.Body)
+		dec.DisallowUnknownFields()
+		if decodeErr := dec.Decode(&payload); decodeErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+decodeErr.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusBadRequest, "invalid JSON: "+decodeErr.Error(), 0, 0, 0)
+			return
+		}
+		user, err = opts.UserStore.SetUserRole(userID, payload.Role)
+	default:
+		http.NotFound(w, req)
+		return
+	}
+	if err != nil {
+		status := http.StatusBadRequest
+		switch {
+		case errors.Is(err, router.ErrUserNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, router.ErrInvalidUserRole):
+			status = http.StatusBadRequest
+		default:
+			status = http.StatusInternalServerError
+		}
+		writeError(w, status, "invalid_request", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, err.Error(), 0, 0, 0)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user_id": userID,
+		"action":  action,
+		"user":    user.View(),
+	})
+	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusOK, "", 0, 0, 0)
 }
 
 func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOptions, scope, kind string) (*serverauth.Grant, bool) {
@@ -285,6 +407,17 @@ func loadAuditEvents(path string, filter serveraudit.Filter) ([]serveraudit.Even
 	return events, err
 }
 
+func loadUsageEntries(path string, filter serverusage.Filter) ([]serverusage.Entry, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	entries, err := serverusage.LoadEntries(path, filter)
+	if err != nil && os.IsNotExist(err) {
+		return nil, nil
+	}
+	return entries, err
+}
+
 func filterFromQuery(req *http.Request) (serveraudit.Filter, error) {
 	query := req.URL.Query()
 	status, err := parseOptionalInt(query.Get("status"))
@@ -312,6 +445,36 @@ func filterFromQuery(req *http.Request) (serveraudit.Filter, error) {
 		Limit:       limit,
 		Since:       since,
 		Until:       until,
+	}, nil
+}
+
+func usageFilterFromQuery(req *http.Request) (serverusage.Filter, error) {
+	query := req.URL.Query()
+	status, err := parseOptionalInt(query.Get("status"))
+	if err != nil {
+		return serverusage.Filter{}, fmt.Errorf("parse status: %w", err)
+	}
+	limit, err := parseOptionalInt(query.Get("limit"))
+	if err != nil {
+		return serverusage.Filter{}, fmt.Errorf("parse limit: %w", err)
+	}
+	now := time.Now().UTC()
+	since, err := parseTimeValue(query.Get("since"), now)
+	if err != nil {
+		return serverusage.Filter{}, fmt.Errorf("parse since: %w", err)
+	}
+	until, err := parseTimeValue(query.Get("until"), now)
+	if err != nil {
+		return serverusage.Filter{}, fmt.Errorf("parse until: %w", err)
+	}
+	return serverusage.Filter{
+		TokenID:    strings.TrimSpace(query.Get("token_id")),
+		Provider:   strings.TrimSpace(query.Get("provider")),
+		Status:     status,
+		Limit:      limit,
+		Since:      since,
+		Until:      until,
+		StreamOnly: strings.EqualFold(strings.TrimSpace(query.Get("stream_only")), "true"),
 	}, nil
 }
 
@@ -349,6 +512,37 @@ func revokeTarget(path string) string {
 	return strings.TrimSpace(value)
 }
 
+func userActionTarget(path string) string {
+	const prefix = "/v1/admin/users/"
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	id, action := splitUserActionTarget(path)
+	if id == "" || action == "" {
+		return ""
+	}
+	return path
+}
+
+func splitUserActionTarget(path string) (string, string) {
+	const prefix = "/v1/admin/users/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", ""
+	}
+	value := strings.Trim(strings.TrimPrefix(path, prefix), "/")
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 {
+		return "", ""
+	}
+	action := strings.TrimSpace(parts[1])
+	switch action {
+	case "activate", "deactivate", "role":
+		return strings.TrimSpace(parts[0]), action
+	default:
+		return "", ""
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -374,6 +568,7 @@ func logAdminEvent(logger serveraudit.Logger, req *http.Request, grant *serverau
 	}
 	event := serveraudit.Event{
 		Timestamp:        time.Now().UTC(),
+		RequestID:        serverhttp.RequestIDFromRequest(req),
 		Kind:             kind,
 		Scope:            scope,
 		Status:           status,

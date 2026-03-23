@@ -46,6 +46,8 @@ Claude, Gemini, and Codex through adaptive mode-based routing
   makewand serve   - Expose your configured backend for your other devices
   makewand token   - Manage remote server auth tokens
   makewand audit   - Inspect server audit logs
+  makewand usage   - Inspect structured server usage logs
+  makewand user    - Manage registered server users
   makewand preview - Start a preview server
   makewand setup   - Configure AI providers and routing preferences`,
 		Args: cobra.ArbitraryArgs,
@@ -95,6 +97,8 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 	rootCmd.AddCommand(serveCmd())
 	rootCmd.AddCommand(tokenCmd())
 	rootCmd.AddCommand(auditCmd())
+	rootCmd.AddCommand(usageCmd())
+	rootCmd.AddCommand(userCmd())
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())

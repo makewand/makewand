@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -285,7 +286,7 @@ func loadOrCreateAuthConfig(path string) (serverauth.Config, error) {
 	if err == nil {
 		return cfg, nil
 	}
-	if os.IsNotExist(err) {
+	if os.IsNotExist(err) || err == io.EOF {
 		return serverauth.Config{}, nil
 	}
 	return serverauth.Config{}, err
