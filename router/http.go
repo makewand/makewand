@@ -13,6 +13,7 @@ package router
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -51,6 +52,25 @@ type httpChoice struct {
 	Index        int         `json:"index"`
 	Message      httpMessage `json:"message"`
 	FinishReason string      `json:"finish_reason"`
+}
+
+type httpStreamResponse struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []httpStreamChoice `json:"choices"`
+}
+
+type httpStreamChoice struct {
+	Index        int             `json:"index"`
+	Delta        httpStreamDelta `json:"delta"`
+	FinishReason string          `json:"finish_reason,omitempty"`
+}
+
+type httpStreamDelta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
 }
 
 type httpUsageResponse struct {
@@ -93,7 +113,7 @@ type HTTPHandlerOptions struct {
 // /v1/chat/completions endpoint backed by this Router.
 //
 // Supported features:
-//   - POST /v1/chat/completions (non-streaming)
+//   - POST /v1/chat/completions (streaming and non-streaming)
 //   - Automatic task classification from message content
 //   - Optional provider override via the model field (provider name from /v1/models)
 //   - Provider routing via the Router's strategy tables
@@ -189,12 +209,6 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	auditEvent.RequestedMode = strings.ToLower(strings.TrimSpace(chatReq.Mode))
 	auditEvent.RequestedModel = strings.ToLower(strings.TrimSpace(chatReq.Model))
 
-	if chatReq.Stream {
-		auditEvent.Status = http.StatusBadRequest
-		auditEvent.Error = "streaming is not yet supported via HTTP; use the Go API directly"
-		writeHTTPError(w, http.StatusBadRequest, "unsupported", "streaming is not yet supported via HTTP; use the Go API directly")
-		return
-	}
 	// max_tokens and temperature are silently ignored — they are standard
 	// OpenAI fields that clients commonly include. Rejecting them would
 	// break otherwise valid requests.
@@ -267,6 +281,11 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		}
 	}
 
+	if chatReq.Stream {
+		r.handleChatCompletionsStream(w, req, activeRouter, grant, requestedModel, task, messages, system, &auditEvent)
+		return
+	}
+
 	ctx := req.Context()
 	var (
 		content string
@@ -331,6 +350,139 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	auditEvent.CompletionTokens = usage.OutputTokens
 	auditEvent.CostUSD = usage.Cost
 	auditEvent.DurationMS = time.Since(start).Milliseconds()
+}
+
+func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event) {
+	if auditEvent == nil {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		auditEvent.Status = http.StatusInternalServerError
+		auditEvent.Error = "streaming is unavailable because the response writer does not support flushing"
+		writeHTTPError(w, http.StatusInternalServerError, "internal_error", auditEvent.Error)
+		return
+	}
+
+	ctx := req.Context()
+	var (
+		stream <-chan StreamChunk
+		result RouteResult
+		err    error
+	)
+	if requestedModel != "" {
+		if !containsString(activeRouter.registeredProviderNames(), requestedModel) {
+			auditEvent.Status = http.StatusBadRequest
+			auditEvent.Error = fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", requestedModel)
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
+			return
+		}
+		stream, result, err = activeRouter.ChatStreamWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
+	} else {
+		stream, result, err = activeRouter.ChatStream(ctx, task, messages, system)
+	}
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if strings.Contains(err.Error(), "not configured") {
+			status = http.StatusBadRequest
+		}
+		auditEvent.Status = status
+		auditEvent.Error = err.Error()
+		writeHTTPError(w, status, "provider_error", err.Error())
+		return
+	}
+
+	responseModel := result.ModelID
+	if strings.TrimSpace(responseModel) == "" {
+		responseModel = result.Actual
+	}
+	auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	streamID := fmt.Sprintf("mw-%d", time.Now().UnixNano())
+	created := time.Now().Unix()
+	sentRole := false
+	for chunk := range stream {
+		if chunk.Error != nil {
+			auditEvent.Status = http.StatusOK
+			auditEvent.Error = chunk.Error.Error()
+			_ = writeSSEData(w, map[string]any{
+				"error": map[string]any{
+					"message": chunk.Error.Error(),
+					"type":    "error",
+					"code":    "stream_error",
+				},
+			})
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+
+		if chunk.Content != "" || (!sentRole && !chunk.Done) {
+			delta := httpStreamDelta{Content: chunk.Content}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			if err := writeSSEData(w, httpStreamResponse{
+				ID:      streamID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   responseModel,
+				Choices: []httpStreamChoice{{
+					Index: 0,
+					Delta: delta,
+				}},
+			}); err != nil {
+				auditEvent.Status = http.StatusOK
+				auditEvent.Error = err.Error()
+				return
+			}
+			flusher.Flush()
+		}
+
+		if chunk.Done {
+			_ = writeSSEData(w, httpStreamResponse{
+				ID:      streamID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   responseModel,
+				Choices: []httpStreamChoice{{
+					Index:        0,
+					Delta:        httpStreamDelta{},
+					FinishReason: "stop",
+				}},
+			})
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			auditEvent.Status = http.StatusOK
+			return
+		}
+	}
+
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	flusher.Flush()
+	auditEvent.Status = http.StatusOK
+}
+
+func writeSSEData(w http.ResponseWriter, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(data); err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, "\n\n")
+	return err
 }
 
 func (r *Router) routerForHTTPMode(requestedMode string) (*Router, error) {

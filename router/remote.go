@@ -95,20 +95,93 @@ func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, syste
 }
 
 func (p *RemoteHTTPProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
-	ch := make(chan StreamChunk, 2)
-	go func() {
-		defer close(ch)
-		content, _, err := p.Chat(ctx, messages, system, maxTokens)
-		if err != nil {
-			ch <- StreamChunk{Error: err, Done: true}
-			return
+	if !p.IsAvailable() {
+		return nil, fmt.Errorf("remote provider is not configured")
+	}
+
+	reqMessages := make([]httpMessage, 0, len(messages)+1)
+	if strings.TrimSpace(system) != "" {
+		reqMessages = append(reqMessages, httpMessage{Role: "system", Content: system})
+	}
+	for _, msg := range messages {
+		reqMessages = append(reqMessages, httpMessage{Role: msg.Role, Content: msg.Content})
+	}
+
+	payload, err := json.Marshal(httpChatRequest{
+		Mode:     remoteUsageMode(ctx),
+		Messages: reqMessages,
+		Stream:   true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.token)
+
+	resp, err := p.client().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
 		}
-		if content != "" {
-			ch <- StreamChunk{Content: content}
+		return nil, fmt.Errorf("remote provider error: %s", msg)
+	}
+
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		ch := make(chan StreamChunk, 2)
+		go func() {
+			defer close(ch)
+			defer resp.Body.Close()
+			var chatResp httpChatResponse
+			if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+				ch <- StreamChunk{Error: err, Done: true}
+				return
+			}
+			if len(chatResp.Choices) > 0 && chatResp.Choices[0].Message.Content != "" {
+				ch <- StreamChunk{Content: chatResp.Choices[0].Message.Content}
+			}
+			ch <- StreamChunk{Done: true}
+		}()
+		return ch, nil
+	}
+
+	return streamSSE(ctx, resp.Body, func(data string) []StreamChunk {
+		var payload httpStreamResponse
+		if err := json.Unmarshal([]byte(data), &payload); err == nil {
+			chunks := make([]StreamChunk, 0, len(payload.Choices))
+			for _, choice := range payload.Choices {
+				if choice.Delta.Content != "" {
+					chunks = append(chunks, StreamChunk{Content: choice.Delta.Content})
+				}
+				if choice.FinishReason != "" {
+					chunks = append(chunks, StreamChunk{Done: true})
+				}
+			}
+			if len(chunks) > 0 {
+				return chunks
+			}
 		}
-		ch <- StreamChunk{Done: true}
-	}()
-	return ch, nil
+
+		var failure struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(data), &failure); err == nil && strings.TrimSpace(failure.Error.Message) != "" {
+			return []StreamChunk{{Error: fmt.Errorf("remote provider error: %s", failure.Error.Message), Done: true}}
+		}
+		return nil
+	}, func() { resp.Body.Close() }), nil
 }
 
 func remoteUsageMode(ctx context.Context) string {

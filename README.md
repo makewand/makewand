@@ -169,6 +169,8 @@ Admin APIs / 管理 API：
 | `POST /v1/admin/tokens/{id}/revoke` | `admin:tokens:write` |
 | `GET /v1/admin/audit/summary` | `admin:audit:read` |
 | `GET /v1/admin/audit/events` | `admin:audit:read` |
+| `GET /v1/admin/usage/summary` | `admin:audit:read` |
+| `GET /v1/admin/audit/events` | `admin:audit:read` |
 
 If both machines point at the same repository, set a shared workspace id to
 resume the same chat even when local paths differ:
@@ -295,13 +297,14 @@ http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
 A request may set `model` to a provider name returned by `/v1/models` to force
-that provider. `max_tokens`, `temperature`, and HTTP streaming are not yet supported.
+that provider. `stream=true` is supported; `max_tokens` and `temperature` are
+accepted but currently ignored for compatibility.
 请求可将 `model` 设置为 `/v1/models` 返回的 Provider 名称以强制选择该 Provider。
-`max_tokens`、`temperature` 和 HTTP streaming 暂不支持。
+支持 `stream=true`；`max_tokens`、`temperature` 会被接受，但当前仅作为兼容字段忽略。
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | Chat completions (non-streaming subset) / 非流式聊天补全子集 |
+| `POST /v1/chat/completions` | Chat completions (`stream=true` supported) / 支持 `stream=true` 的聊天补全 |
 | `GET /v1/models` | List available providers / 列出可用 Provider |
 | `GET /health` | Health check / 健康检查 |
 

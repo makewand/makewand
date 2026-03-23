@@ -936,3 +936,43 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 
 	return r.routeAndExecuteStream(ac, result, fallbacks, resolve)
 }
+
+// ChatStreamWith streams a response from a specific provider for a build phase.
+// It mirrors ChatWith but preserves streaming semantics for HTTP and remote use.
+func (r *Router) ChatStreamWith(ctx context.Context, name string, phase BuildPhase, messages []Message, system string, exclude ...string) (<-chan StreamChunk, RouteResult, error) {
+	result, err := r.RouteProvider(name, phase, exclude...)
+	if err != nil {
+		return nil, RouteResult{}, err
+	}
+
+	fallbacks, tier := r.chatWithFallbackCandidates(phase, result.Actual, exclude)
+
+	taskForPhase := TaskCode
+	switch phase {
+	case PhaseReview:
+		taskForPhase = TaskReview
+	case PhasePlan:
+		taskForPhase = TaskAnalyze
+	case PhaseFix:
+		taskForPhase = TaskFix
+	}
+
+	ac := &attemptContext{
+		ctx:        ContextWithTask(ctx, taskForPhase),
+		messages:   messages,
+		system:     system,
+		maxTokens:  maxTokensForPhase(phase),
+		phase:      phase,
+		mode:       r.effectiveMode(),
+		requested:  name,
+		phaseLabel: buildPhaseName(phase),
+		labels: attemptLabels{
+			attemptSuccess:  "build_chat_stream_start_success",
+			attemptError:    "build_chat_stream_start_error",
+			fallbackSkipped: "build_chat_stream_fallback_skipped",
+			failedAll:       "build_chat_stream_failed_all",
+		},
+	}
+
+	return r.routeAndExecuteStream(ac, result, fallbacks, r.buildProviderResolver(tier))
+}

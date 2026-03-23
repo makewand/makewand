@@ -54,6 +54,8 @@ func NewHandler(opts HandlerOptions) http.Handler {
 			handleAuditSummary(w, req, opts)
 		case req.URL.Path == "/v1/admin/audit/events":
 			handleAuditEvents(w, req, opts)
+		case req.URL.Path == "/v1/admin/usage/summary":
+			handleUsageSummary(w, req, opts)
 		default:
 			http.NotFound(w, req)
 		}
@@ -205,6 +207,46 @@ func handleAuditEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		"data": events,
 	})
 	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusOK, "", 0, 0, 0)
+}
+
+func handleUsageSummary(w http.ResponseWriter, req *http.Request, opts HandlerOptions) {
+	if req.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	grant, ok := authenticateAdmin(w, req, opts, serverauth.ScopeAdminAuditRead, "admin_usage")
+	if !ok {
+		return
+	}
+	filter, err := filterFromQuery(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_usage", http.StatusBadRequest, err.Error(), 0, 0, 0)
+		return
+	}
+	events, err := loadAuditEvents(opts.AuditPath, filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+		return
+	}
+	summary := serveraudit.SummarizeEvents(events)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path": opts.AuditPath,
+		"usage": map[string]any{
+			"total_events":            summary.Total,
+			"total_prompt_tokens":     summary.TotalPromptTokens,
+			"total_completion_tokens": summary.TotalCompletionTokens,
+			"total_cost_usd":          summary.TotalCostUSD,
+			"cost_by_token":           summary.CostByToken,
+			"cost_by_provider":        summary.CostByProvider,
+			"by_token":                summary.ByToken,
+			"by_provider":             summary.ByProvider,
+			"earliest":                summary.Earliest,
+			"latest":                  summary.Latest,
+		},
+	})
+	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_usage", http.StatusOK, "", 0, 0, 0)
 }
 
 func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOptions, scope, kind string) (*serverauth.Grant, bool) {
