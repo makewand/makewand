@@ -31,6 +31,7 @@ func serveCmd() *cobra.Command {
 		authConfig  string
 		auditPath   string
 		usagePath   string
+		stateDBPath string
 		enableUsers bool
 	)
 
@@ -44,7 +45,7 @@ func serveCmd() *cobra.Command {
 				return fmt.Errorf("no local AI models configured on this host; run 'makewand setup' first")
 			}
 
-			authz, manager, err := loadServeAuthorizer(token, authConfig)
+			authz, bootstrapManager, err := loadServeAuthorizer(token, authConfig)
 			if err != nil {
 				return err
 			}
@@ -57,7 +58,8 @@ func serveCmd() *cobra.Command {
 				dataDir = filepath.Join(cfgDir, "server")
 			}
 			auditPath = resolveServeAuditPath(auditPath, dataDir)
-			usagePath = resolveServeUsagePath(usagePath, dataDir)
+			stateDBPath = resolveServeStateDBPath(stateDBPath, dataDir)
+			usagePath = resolveServeUsagePath(usagePath, dataDir, stateDBPath != "")
 			var auditLogger *serveraudit.JSONLLogger
 			if strings.TrimSpace(auditPath) != "" {
 				auditLogger, err = serveraudit.OpenJSONL(auditPath)
@@ -66,13 +68,15 @@ func serveCmd() *cobra.Command {
 				}
 				defer auditLogger.Close()
 			}
-			var usageLogger *serverusage.JSONLLogger
+			var usageLogger serverusage.Logger
+			var usageJSONL *serverusage.JSONLLogger
 			if strings.TrimSpace(usagePath) != "" {
-				usageLogger, err = serverusage.OpenJSONL(usagePath)
+				usageJSONL, err = serverusage.OpenJSONL(usagePath)
 				if err != nil {
 					return fmt.Errorf("open usage log: %w", err)
 				}
-				defer usageLogger.Close()
+				defer usageJSONL.Close()
+				usageLogger = usageJSONL
 			}
 
 			rtr := serveRouter(cfg)
@@ -83,16 +87,58 @@ func serveCmd() *cobra.Command {
 				}
 			}
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
-			var userStore *router.UserStore
-			if enableUsers {
+			var (
+				tokenManager serverauth.TokenManager = bootstrapManager
+				userStore    router.UserManager
+				usageStore   serverusage.Reader
+			)
+			if strings.TrimSpace(stateDBPath) != "" {
+				sqliteTokens, err := serverauth.OpenSQLiteStore(stateDBPath)
+				if err != nil {
+					return fmt.Errorf("open sqlite token store: %w", err)
+				}
+				defer sqliteTokens.Close()
+				tokenManager = sqliteTokens
+				if authz != nil {
+					authz = serverauth.NewMultiAuthorizer(authz, sqliteTokens)
+				} else {
+					authz = sqliteTokens
+				}
+
+				sqliteUsage, err := serverusage.OpenSQLiteStore(stateDBPath)
+				if err != nil {
+					return fmt.Errorf("open sqlite usage store: %w", err)
+				}
+				defer sqliteUsage.Close()
+				usageStore = sqliteUsage
+				usageLogger = combineUsageLoggers(usageLogger, sqliteUsage)
+
+				if enableUsers {
+					sqliteUsers, err := router.OpenSQLiteUserStore(stateDBPath)
+					if err != nil {
+						return fmt.Errorf("open sqlite user store: %w", err)
+					}
+					defer sqliteUsers.Close()
+					userStore = sqliteUsers
+				}
+			}
+			if enableUsers && userStore == nil {
 				userStore = router.NewUserStore(filepath.Join(dataDir, "users"))
+			}
+			if authz == nil {
+				return fmt.Errorf("serve requires --token/--auth-config or an enabled state DB token store")
+			}
+			usageDisplayPath := usagePath
+			if usageDisplayPath == "" && strings.TrimSpace(stateDBPath) != "" && usageStore != nil {
+				usageDisplayPath = "sqlite:" + stateDBPath
 			}
 
 			httpOpts := router.HTTPHandlerOptions{
-				Authorizer:  authz,
-				StatsDir:    statsDir,
-				AuditLogger: auditLogger,
-				UsageLogger: usageLogger,
+				Authorizer:       authz,
+				StatsDir:         statsDir,
+				AuditLogger:      auditLogger,
+				UsageLogger:      usageLogger,
+				UserTokenManager: tokenManager,
 			}
 			base := rtr.HTTPHandler(httpOpts)
 			if userStore != nil {
@@ -103,13 +149,14 @@ func serveCmd() *cobra.Command {
 				Authorizer:  authz,
 				AuditLogger: auditLogger,
 			}))
-			if manager != nil {
+			if tokenManager != nil {
 				mux.Handle("/v1/admin/", serveradmin.NewHandler(serveradmin.HandlerOptions{
 					Authorizer:   authz,
-					TokenManager: manager,
+					TokenManager: tokenManager,
 					AuditPath:    auditPath,
 					AuditLogger:  auditLogger,
-					UsagePath:    usagePath,
+					UsagePath:    usageDisplayPath,
+					UsageStore:   usageStore,
 					UserStore:    userStore,
 				}))
 			}
@@ -136,11 +183,18 @@ func serveCmd() *cobra.Command {
 			if auditLogger != nil {
 				fmt.Printf("Audit log: %s\n", auditPath)
 			}
-			if usageLogger != nil {
-				fmt.Printf("Usage log: %s\n", usagePath)
+			if usageDisplayPath != "" {
+				fmt.Printf("Usage store: %s\n", usageDisplayPath)
+			}
+			if stateDBPath != "" {
+				fmt.Printf("State DB: %s\n", stateDBPath)
 			}
 			if userStore != nil {
-				fmt.Printf("Users directory: %s\n", filepath.Join(dataDir, "users"))
+				if stateDBPath != "" {
+					fmt.Printf("Users store: sqlite:%s\n", stateDBPath)
+				} else {
+					fmt.Printf("Users directory: %s\n", filepath.Join(dataDir, "users"))
+				}
 			}
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
@@ -154,7 +208,8 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&authConfig, "auth-config", "", "path to JSON auth config with scoped tokens")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "directory used to persist remote sessions (default: ~/.config/makewand/server)")
 	cmd.Flags().StringVar(&auditPath, "audit-log", "", "path to append-only JSONL audit log (default: <data-dir>/audit.jsonl when MAKEWAND_SERVER_AUDIT_LOG is set)")
-	cmd.Flags().StringVar(&usagePath, "usage-log", "", "path to append-only JSONL usage ledger (default: <data-dir>/usage.jsonl)")
+	cmd.Flags().StringVar(&usagePath, "usage-log", "", "path to append-only JSONL usage ledger (disabled by default when SQLite state DB is enabled)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state database for users, tokens, and usage (default: <data-dir>/state.db)")
 	cmd.Flags().BoolVar(&enableUsers, "enable-users", false, "enable multi-user registration and admin user management")
 	return cmd
 }
@@ -177,7 +232,7 @@ func loadServeAuthorizer(token, authConfig string) (serverauth.RequestAuthorizer
 		token = strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_TOKEN"))
 	}
 	if token == "" {
-		return nil, nil, fmt.Errorf("serve requires --token, MAKEWAND_SERVER_TOKEN, --auth-config, or MAKEWAND_SERVER_AUTH_CONFIG")
+		return nil, nil, nil
 	}
 	return serverauth.NewSingleTokenAuthorizer(token), nil, nil
 }
@@ -203,19 +258,67 @@ func resolveServeAuditPath(flagValue, dataDir string) string {
 	return envValue
 }
 
-func resolveServeUsagePath(flagValue, dataDir string) string {
+func resolveServeUsagePath(flagValue, dataDir string, hasStateDB bool) string {
 	flagValue = strings.TrimSpace(flagValue)
 	if flagValue != "" {
 		return flagValue
 	}
 	envValue := strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_USAGE_LOG"))
 	switch strings.ToLower(envValue) {
-	case "", "1", "true":
+	case "":
+		if hasStateDB {
+			return ""
+		}
+		return filepath.Join(dataDir, "usage.jsonl")
+	case "1", "true":
 		return filepath.Join(dataDir, "usage.jsonl")
 	case "0", "false", "off", "disabled":
 		return ""
 	default:
 		return envValue
+	}
+}
+
+func resolveServeStateDBPath(flagValue, dataDir string) string {
+	flagValue = strings.TrimSpace(flagValue)
+	if flagValue != "" {
+		return flagValue
+	}
+	if envValue := strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_STATE_DB")); envValue != "" {
+		if strings.EqualFold(envValue, "0") || strings.EqualFold(envValue, "false") || strings.EqualFold(envValue, "off") {
+			return ""
+		}
+		return envValue
+	}
+	return filepath.Join(dataDir, "state.db")
+}
+
+type usageMultiLogger struct {
+	items []serverusage.Logger
+}
+
+func combineUsageLoggers(items ...serverusage.Logger) serverusage.Logger {
+	filtered := make([]serverusage.Logger, 0, len(items))
+	for _, item := range items {
+		if item != nil {
+			filtered = append(filtered, item)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	return &usageMultiLogger{items: filtered}
+}
+
+func (m *usageMultiLogger) Log(entry serverusage.Entry) {
+	if m == nil {
+		return
+	}
+	for _, item := range m.items {
+		item.Log(entry)
 	}
 }
 

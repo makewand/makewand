@@ -97,6 +97,15 @@ type RequestAuthorizer interface {
 	AuthenticateRequest(req *http.Request) (*Grant, bool)
 }
 
+// TokenManager is the minimal interface required by admin APIs and login flows
+// to manage bearer tokens regardless of the backing store.
+type TokenManager interface {
+	RequestAuthorizer
+	TokenRules() []TokenRuleView
+	Issue(rule TokenRule) (TokenRuleView, string, error)
+	Revoke(tokenID string) error
+}
+
 // Authorizer authenticates Bearer tokens and returns scoped grants.
 type Authorizer struct {
 	grants map[string]*Grant

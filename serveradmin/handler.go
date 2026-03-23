@@ -19,11 +19,12 @@ import (
 
 type HandlerOptions struct {
 	Authorizer   serverauth.RequestAuthorizer
-	TokenManager *serverauth.Manager
+	TokenManager serverauth.TokenManager
 	AuditPath    string
 	AuditLogger  serveraudit.Logger
 	UsagePath    string
-	UserStore    *router.UserStore
+	UsageStore   serverusage.Reader
+	UserStore    router.UserManager
 }
 
 type errorResponse struct {
@@ -240,7 +241,7 @@ func handleUsageSummary(w http.ResponseWriter, req *http.Request, opts HandlerOp
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
-	entries, err := loadUsageEntries(opts.UsagePath, filter)
+	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
@@ -269,7 +270,7 @@ func handleUsageEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
-	entries, err := loadUsageEntries(opts.UsagePath, filter)
+	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
@@ -407,7 +408,10 @@ func loadAuditEvents(path string, filter serveraudit.Filter) ([]serveraudit.Even
 	return events, err
 }
 
-func loadUsageEntries(path string, filter serverusage.Filter) ([]serverusage.Entry, error) {
+func loadUsageEntries(store serverusage.Reader, path string, filter serverusage.Filter) ([]serverusage.Entry, error) {
+	if store != nil {
+		return store.Load(filter)
+	}
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
 	}
@@ -468,6 +472,7 @@ func usageFilterFromQuery(req *http.Request) (serverusage.Filter, error) {
 		return serverusage.Filter{}, fmt.Errorf("parse until: %w", err)
 	}
 	return serverusage.Filter{
+		RequestID:  strings.TrimSpace(query.Get("request_id")),
 		TokenID:    strings.TrimSpace(query.Get("token_id")),
 		Provider:   strings.TrimSpace(query.Get("provider")),
 		Status:     status,

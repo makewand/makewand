@@ -54,3 +54,31 @@ func TestJSONLAndSummary(t *testing.T) {
 		t.Fatalf("TotalCostUSD = %.2f, want 0.50", summary.TotalCostUSD)
 	}
 }
+
+func TestSQLiteStore_LogAndLoad(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore: %v", err)
+	}
+	defer store.Close()
+
+	store.Log(Entry{
+		Timestamp:      time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC),
+		RequestID:      "req_1",
+		TokenID:        "runner",
+		ActualProvider: "codex",
+		Status:         200,
+		CostUSD:        0.25,
+	})
+
+	entries, err := store.Load(Filter{RequestID: "req_1"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].RequestID != "req_1" {
+		t.Fatalf("RequestID = %q, want req_1", entries[0].RequestID)
+	}
+}

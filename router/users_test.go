@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/makewand/makewand/serverauth"
 )
 
 func TestUserStore_CreateUserPersistsAndValidatesPassword(t *testing.T) {
@@ -150,5 +152,58 @@ func TestHTTPHandlerWithUsers_RejectsInvalidRegistration(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid register status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPHandlerWithUsers_LoginIssuesToken(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	userStore, err := OpenSQLiteUserStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteUserStore: %v", err)
+	}
+	defer userStore.Close()
+	if _, err := userStore.CreateUserWithRole("admin@example.com", "password123", UserRoleAdmin); err != nil {
+		t.Fatalf("CreateUserWithRole: %v", err)
+	}
+
+	tokenStore, err := serverauth.OpenSQLiteStore(filepath.Join(t.TempDir(), "tokens.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore: %v", err)
+	}
+	defer tokenStore.Close()
+
+	handler := r.HTTPHandlerWithUsers(userStore, HTTPHandlerOptions{UserTokenManager: tokenStore})
+	req := httptest.NewRequest(http.MethodPost, "/v1/users/login", bytes.NewBufferString(`{"email":"admin@example.com","password":"password123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp UserLoginResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if resp.Token == "" || resp.TokenID == "" {
+		t.Fatalf("login response missing token fields: %+v", resp)
+	}
+	foundAdminScope := false
+	for _, scope := range resp.Scopes {
+		if scope == serverauth.ScopeAdminTokensRead {
+			foundAdminScope = true
+			break
+		}
+	}
+	if !foundAdminScope {
+		t.Fatalf("admin login scopes = %v, want admin scope", resp.Scopes)
 	}
 }

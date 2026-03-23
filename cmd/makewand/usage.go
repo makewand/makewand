@@ -28,6 +28,8 @@ func usageCmd() *cobra.Command {
 func usageSummaryCmd() *cobra.Command {
 	var (
 		pathFlag       string
+		stateDBPath    string
+		requestIDFlag  string
 		tokenIDFlag    string
 		providerFlag   string
 		statusFlag     int
@@ -47,7 +49,7 @@ func usageSummaryCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			query := buildUsageQuery(tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
+			query := buildUsageQuery(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
 			if remoteMode {
 				var resp remoteUsageSummaryResponse
 				if err := adminGetJSON(baseURL, bearer, "/v1/admin/usage/summary", query, &resp); err != nil {
@@ -65,11 +67,29 @@ func usageSummaryCmd() *cobra.Command {
 				return nil
 			}
 
-			path, err := resolveUsageLogPath(pathFlag)
+			filter, err := buildUsageFilter(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
 			if err != nil {
 				return err
 			}
-			filter, err := buildUsageFilter(tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
+			stateDB := resolveManagedStateDBPath(stateDBPath)
+			if stateDB != "" {
+				entries, err := serverusage.LoadSQLiteEntries(stateDB, filter)
+				if err != nil {
+					return err
+				}
+				summary := serverusage.SummarizeEntries(entries)
+				if jsonOutput {
+					data, err := json.MarshalIndent(summary, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printUsageSummary("sqlite:"+stateDB, summary)
+				return nil
+			}
+			path, err := resolveUsageLogPath(pathFlag)
 			if err != nil {
 				return err
 			}
@@ -92,6 +112,8 @@ func usageSummaryCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&pathFlag, "path", "", "path to usage JSONL (defaults to MAKEWAND_SERVER_USAGE_LOG or ~/.config/makewand/server/usage.jsonl)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for usage queries")
+	cmd.Flags().StringVar(&requestIDFlag, "request-id", "", "filter by request ID")
 	cmd.Flags().StringVar(&tokenIDFlag, "token-id", "", "filter by token ID")
 	cmd.Flags().StringVar(&providerFlag, "provider", "", "filter by actual provider")
 	cmd.Flags().IntVar(&statusFlag, "status", 0, "filter by HTTP status code")
@@ -107,6 +129,8 @@ func usageSummaryCmd() *cobra.Command {
 func usageEventsCmd() *cobra.Command {
 	var (
 		pathFlag       string
+		stateDBPath    string
+		requestIDFlag  string
 		tokenIDFlag    string
 		providerFlag   string
 		statusFlag     int
@@ -127,7 +151,7 @@ func usageEventsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			query := buildUsageQuery(tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, limitFlag, streamOnlyFlag)
+			query := buildUsageQuery(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, limitFlag, streamOnlyFlag)
 			if remoteMode {
 				var resp remoteUsageEventsResponse
 				if err := adminGetJSON(baseURL, bearer, "/v1/admin/usage/events", query, &resp); err != nil {
@@ -145,11 +169,28 @@ func usageEventsCmd() *cobra.Command {
 				return nil
 			}
 
-			path, err := resolveUsageLogPath(pathFlag)
+			filter, err := buildUsageFilter(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, limitFlag, streamOnlyFlag)
 			if err != nil {
 				return err
 			}
-			filter, err := buildUsageFilter(tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, limitFlag, streamOnlyFlag)
+			stateDB := resolveManagedStateDBPath(stateDBPath)
+			if stateDB != "" {
+				entries, err := serverusage.LoadSQLiteEntries(stateDB, filter)
+				if err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(entries, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printUsageEvents(entries)
+				return nil
+			}
+			path, err := resolveUsageLogPath(pathFlag)
 			if err != nil {
 				return err
 			}
@@ -171,6 +212,8 @@ func usageEventsCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&pathFlag, "path", "", "path to usage JSONL (defaults to MAKEWAND_SERVER_USAGE_LOG or ~/.config/makewand/server/usage.jsonl)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for usage queries")
+	cmd.Flags().StringVar(&requestIDFlag, "request-id", "", "filter by request ID")
 	cmd.Flags().StringVar(&tokenIDFlag, "token-id", "", "filter by token ID")
 	cmd.Flags().StringVar(&providerFlag, "provider", "", "filter by actual provider")
 	cmd.Flags().IntVar(&statusFlag, "status", 0, "filter by HTTP status code")
@@ -193,10 +236,10 @@ func resolveUsageLogPath(flagValue string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resolveServeUsagePath("", filepath.Join(dir, "server")), nil
+	return resolveServeUsagePath("", filepath.Join(dir, "server"), false), nil
 }
 
-func buildUsageFilter(tokenID, provider string, status int, sinceRaw, untilRaw string, limit int, streamOnly bool) (serverusage.Filter, error) {
+func buildUsageFilter(requestID, tokenID, provider string, status int, sinceRaw, untilRaw string, limit int, streamOnly bool) (serverusage.Filter, error) {
 	now := time.Now().UTC()
 	since, err := parseAuditTimeValue(sinceRaw, now)
 	if err != nil {
@@ -207,6 +250,7 @@ func buildUsageFilter(tokenID, provider string, status int, sinceRaw, untilRaw s
 		return serverusage.Filter{}, fmt.Errorf("parse until: %w", err)
 	}
 	return serverusage.Filter{
+		RequestID:  strings.TrimSpace(requestID),
 		TokenID:    strings.TrimSpace(tokenID),
 		Provider:   strings.TrimSpace(provider),
 		Status:     status,
@@ -217,8 +261,11 @@ func buildUsageFilter(tokenID, provider string, status int, sinceRaw, untilRaw s
 	}, nil
 }
 
-func buildUsageQuery(tokenID, provider string, status int, since, until string, limit int, streamOnly bool) url.Values {
+func buildUsageQuery(requestID, tokenID, provider string, status int, since, until string, limit int, streamOnly bool) url.Values {
 	query := url.Values{}
+	if strings.TrimSpace(requestID) != "" {
+		query.Set("request_id", strings.TrimSpace(requestID))
+	}
 	if strings.TrimSpace(tokenID) != "" {
 		query.Set("token_id", strings.TrimSpace(tokenID))
 	}

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/serverauth"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -66,6 +67,33 @@ type UserRegistrationResponse struct {
 	Role      string    `json:"role"`
 	CreatedAt time.Time `json:"created_at"`
 	Message   string    `json:"message"`
+}
+
+// UserLoginRequest represents a password-based login request.
+type UserLoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// UserLoginResponse returns a newly issued bearer token for the user.
+type UserLoginResponse struct {
+	Token     string                   `json:"token"`
+	TokenID   string                   `json:"token_id"`
+	ExpiresAt time.Time                `json:"expires_at,omitempty"`
+	Scopes    []string                 `json:"scopes"`
+	User      UserView                 `json:"user"`
+	Rule      serverauth.TokenRuleView `json:"rule"`
+}
+
+// UserManager is the storage contract required by registration, login, and admin user management.
+type UserManager interface {
+	CreateUser(email, password string) (*User, error)
+	CreateUserWithRole(email, password, role string) (*User, error)
+	GetUserByID(userID string) (*User, error)
+	GetUserByEmail(email string) (*User, error)
+	ListUsers() ([]UserView, error)
+	SetUserActive(userID string, active bool) (*User, error)
+	SetUserRole(userID, role string) (*User, error)
 }
 
 // UserStore manages user data persistence.
@@ -345,7 +373,7 @@ func normalizeUserRole(role string) (string, error) {
 }
 
 // HandleUserRegistration handles POST /v1/users/register requests.
-func (r *Router) HandleUserRegistration(userStore *UserStore) http.HandlerFunc {
+func (r *Router) HandleUserRegistration(userStore UserManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
@@ -406,9 +434,66 @@ func (r *Router) HandleUserRegistration(userStore *UserStore) http.HandlerFunc {
 	}
 }
 
+// HandleUserLogin handles POST /v1/users/login requests and returns a bearer
+// token issued from the configured server token manager.
+func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.TokenManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
+			return
+		}
+		if userStore == nil || tokenManager == nil {
+			writeHTTPError(w, http.StatusNotFound, "not_found", "user login is unavailable")
+			return
+		}
+
+		var loginReq UserLoginRequest
+		if err := json.NewDecoder(req.Body).Decode(&loginReq); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+			return
+		}
+		user, err := userStore.GetUserByEmail(loginReq.Email)
+		if err != nil || user == nil || !user.IsActive || !user.ValidatePassword(loginReq.Password) {
+			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid email or password")
+			return
+		}
+
+		expiresAt := time.Now().UTC().Add(24 * time.Hour)
+		view, tokenValue, err := tokenManager.Issue(serverauth.TokenRule{
+			ID:          fmt.Sprintf("%s_%d", user.ID, time.Now().UTC().UnixNano()),
+			Description: "user login " + user.Email,
+			Scopes:      loginScopesForUser(user),
+			ExpiresAt:   expiresAt,
+		})
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, "login_failed", "failed to issue login token")
+			return
+		}
+
+		resp := UserLoginResponse{
+			Token:     tokenValue,
+			TokenID:   view.ID,
+			ExpiresAt: view.ExpiresAt,
+			Scopes:    append([]string(nil), view.Scopes...),
+			User:      user.View(),
+			Rule:      view,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func loginScopesForUser(user *User) []string {
+	if user != nil && strings.EqualFold(user.Role, UserRoleAdmin) {
+		return serverauth.AllScopes()
+	}
+	return serverauth.AllClientScopes()
+}
+
 // HTTPHandlerWithUsers returns an http.Handler that includes user registration
 // endpoints in addition to the existing chat completion functionality.
-func (r *Router) HTTPHandlerWithUsers(userStore *UserStore, opts ...HTTPHandlerOptions) http.Handler {
+func (r *Router) HTTPHandlerWithUsers(userStore UserManager, opts ...HTTPHandlerOptions) http.Handler {
 	var opt HTTPHandlerOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -420,6 +505,7 @@ func (r *Router) HTTPHandlerWithUsers(userStore *UserStore, opts ...HTTPHandlerO
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore))
+	mux.HandleFunc("/v1/users/login", r.HandleUserLogin(userStore, opt.UserTokenManager))
 	mux.Handle("/", base)
 	return mux
 }

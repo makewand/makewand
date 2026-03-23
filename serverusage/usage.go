@@ -29,6 +29,7 @@ type Entry struct {
 }
 
 type Filter struct {
+	RequestID  string
 	TokenID    string
 	Provider   string
 	Status     int
@@ -53,6 +54,11 @@ type Summary struct {
 
 type Logger interface {
 	Log(Entry)
+}
+
+// Reader loads usage entries from a backing store.
+type Reader interface {
+	Load(Filter) ([]Entry, error)
 }
 
 type JSONLLogger struct {
@@ -182,6 +188,9 @@ func SortedStringTotals(m map[string]float64) []string {
 
 func matchesFilter(entry Entry, filter Filter) bool {
 	if filter.TokenID != "" && entry.TokenID != filter.TokenID {
+		return false
+	}
+	if filter.RequestID != "" && entry.RequestID != filter.RequestID {
 		return false
 	}
 	if filter.Provider != "" && !strings.EqualFold(entry.ActualProvider, filter.Provider) {
