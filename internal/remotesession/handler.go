@@ -9,6 +9,7 @@ import (
 
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverhttp"
 )
 
 const maxSessionPayloadBytes = 4 << 20 // 4 MiB
@@ -39,6 +40,7 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 		start := time.Now()
 		event := serveraudit.Event{
 			Timestamp: time.Now().UTC(),
+			RequestID: serverhttp.RequestIDFromRequest(req),
 			Kind:      "session",
 			Method:    req.Method,
 			Path:      req.URL.Path,

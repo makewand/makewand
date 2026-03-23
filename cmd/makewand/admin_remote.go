@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/router"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverusage"
 )
 
 type remoteTokenListResponse struct {
@@ -33,6 +35,20 @@ type remoteAuditSummaryResponse struct {
 type remoteAuditEventsResponse struct {
 	Path string              `json:"path"`
 	Data []serveraudit.Event `json:"data"`
+}
+
+type remoteUsageSummaryResponse struct {
+	Path  string              `json:"path"`
+	Usage serverusage.Summary `json:"usage"`
+}
+
+type remoteUsageEventsResponse struct {
+	Path string              `json:"path"`
+	Data []serverusage.Entry `json:"data"`
+}
+
+type remoteUserListResponse struct {
+	Data []router.UserView `json:"data"`
 }
 
 func resolveOptionalRemoteAdminTarget(flagURL, flagToken string) (string, string, bool, error) {

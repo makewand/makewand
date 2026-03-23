@@ -28,6 +28,9 @@ func TestUserStore_CreateUserPersistsAndValidatesPassword(t *testing.T) {
 	if user.PasswordHash == "secret123" {
 		t.Fatal("password hash should not equal plaintext password")
 	}
+	if user.Role != UserRoleMember {
+		t.Fatalf("Role = %q, want %q", user.Role, UserRoleMember)
+	}
 
 	persistedPath := filepath.Join(storeDir, "users.json")
 	if _, err := os.Stat(persistedPath); err != nil {
@@ -53,6 +56,34 @@ func TestUserStore_CreateUserPersistsAndValidatesPassword(t *testing.T) {
 	}
 	if _, err := store.GetUserByEmail("missing@example.com"); !errors.Is(err, ErrUserNotFound) {
 		t.Fatalf("GetUserByEmail(missing) error = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestUserStore_ListUsersAndMutations(t *testing.T) {
+	store := NewUserStore(t.TempDir())
+	user, err := store.CreateUser("person@example.com", "secret123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if _, err := store.SetUserRole(user.ID, UserRoleAdmin); err != nil {
+		t.Fatalf("SetUserRole: %v", err)
+	}
+	if _, err := store.SetUserActive(user.ID, false); err != nil {
+		t.Fatalf("SetUserActive: %v", err)
+	}
+
+	users, err := store.ListUsers()
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	if len(users) != 1 {
+		t.Fatalf("ListUsers() len = %d, want 1", len(users))
+	}
+	if users[0].Role != UserRoleAdmin {
+		t.Fatalf("Role = %q, want %q", users[0].Role, UserRoleAdmin)
+	}
+	if users[0].IsActive {
+		t.Fatal("IsActive = true, want false")
 	}
 }
 
@@ -84,6 +115,9 @@ func TestHTTPHandlerWithUsers_RegisterUserAndKeepModelAuth(t *testing.T) {
 	}
 	if resp.Email != "user@example.com" {
 		t.Fatalf("response email = %q, want lowercase", resp.Email)
+	}
+	if resp.Role != UserRoleMember {
+		t.Fatalf("response role = %q, want %q", resp.Role, UserRoleMember)
 	}
 	if resp.ID == "" {
 		t.Fatal("response ID should not be empty")

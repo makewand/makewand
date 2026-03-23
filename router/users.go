@@ -10,10 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/makewand/makewand/serverauth"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -22,6 +22,13 @@ var (
 	ErrUserExists = errors.New("user already exists")
 	// ErrUserNotFound indicates no stored user matched the requested email.
 	ErrUserNotFound = errors.New("user not found")
+	// ErrInvalidUserRole indicates an unsupported role value.
+	ErrInvalidUserRole = errors.New("invalid user role")
+)
+
+const (
+	UserRoleMember = "member"
+	UserRoleAdmin  = "admin"
 )
 
 // User represents a registered user in the system.
@@ -30,9 +37,20 @@ type User struct {
 	Email        string    `json:"email"`
 	PasswordHash string    `json:"password_hash"`
 	Salt         string    `json:"salt"`
+	Role         string    `json:"role,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	IsActive     bool      `json:"is_active"`
+}
+
+// UserView is the safe operator-facing representation of a stored user.
+type UserView struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	IsActive  bool      `json:"is_active"`
 }
 
 // UserRegistrationRequest represents the registration request payload.
@@ -45,6 +63,7 @@ type UserRegistrationRequest struct {
 type UserRegistrationResponse struct {
 	ID        string    `json:"id"`
 	Email     string    `json:"email"`
+	Role      string    `json:"role"`
 	CreatedAt time.Time `json:"created_at"`
 	Message   string    `json:"message"`
 }
@@ -85,6 +104,14 @@ func (us *UserStore) loadUsers() (map[string]*User, error) {
 	if err := json.Unmarshal(data, &users); err != nil {
 		return nil, fmt.Errorf("parse users file: %w", err)
 	}
+	for _, user := range users {
+		if user == nil {
+			continue
+		}
+		if user.Role == "" {
+			user.Role = UserRoleMember
+		}
+	}
 
 	return users, nil
 }
@@ -110,9 +137,18 @@ func (us *UserStore) saveUsers(users map[string]*User) error {
 
 // CreateUser creates a new user account.
 func (us *UserStore) CreateUser(email, password string) (*User, error) {
+	return us.CreateUserWithRole(email, password, UserRoleMember)
+}
+
+// CreateUserWithRole creates a new user account with an explicit role.
+func (us *UserStore) CreateUserWithRole(email, password, role string) (*User, error) {
 	users, err := us.loadUsers()
 	if err != nil {
 		return nil, fmt.Errorf("load users: %w", err)
+	}
+	role, err = normalizeUserRole(role)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check if user already exists
@@ -132,6 +168,7 @@ func (us *UserStore) CreateUser(email, password string) (*User, error) {
 		Email:        strings.ToLower(email),
 		PasswordHash: passwordHash,
 		Salt:         salt,
+		Role:         role,
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 		IsActive:     true,
@@ -143,6 +180,19 @@ func (us *UserStore) CreateUser(email, password string) (*User, error) {
 		return nil, fmt.Errorf("save users: %w", err)
 	}
 
+	return user, nil
+}
+
+// GetUserByID retrieves a user by ID.
+func (us *UserStore) GetUserByID(userID string) (*User, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
 	return user, nil
 }
 
@@ -162,10 +212,89 @@ func (us *UserStore) GetUserByEmail(email string) (*User, error) {
 	return nil, ErrUserNotFound
 }
 
+// ListUsers returns all users as safe operator-facing views.
+func (us *UserStore) ListUsers() ([]UserView, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	ids := make([]string, 0, len(users))
+	for id := range users {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	views := make([]UserView, 0, len(ids))
+	for _, id := range ids {
+		if user := users[id]; user != nil {
+			views = append(views, user.View())
+		}
+	}
+	return views, nil
+}
+
+// SetUserActive updates a user's active flag.
+func (us *UserStore) SetUserActive(userID string, active bool) (*User, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
+	user.IsActive = active
+	user.UpdatedAt = time.Now().UTC()
+	if err := us.saveUsers(users); err != nil {
+		return nil, fmt.Errorf("save users: %w", err)
+	}
+	return user, nil
+}
+
+// SetUserRole updates a user's role.
+func (us *UserStore) SetUserRole(userID, role string) (*User, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
+	role, err = normalizeUserRole(role)
+	if err != nil {
+		return nil, err
+	}
+	user.Role = role
+	user.UpdatedAt = time.Now().UTC()
+	if err := us.saveUsers(users); err != nil {
+		return nil, fmt.Errorf("save users: %w", err)
+	}
+	return user, nil
+}
+
 // ValidatePassword checks if the provided password matches the user's password.
 func (u *User) ValidatePassword(password string) bool {
 	expectedHash := hashPassword(password, u.Salt)
 	return subtle.ConstantTimeCompare([]byte(expectedHash), []byte(u.PasswordHash)) == 1
+}
+
+// View returns the sanitized form of a stored user.
+func (u *User) View() UserView {
+	if u == nil {
+		return UserView{}
+	}
+	role := u.Role
+	if role == "" {
+		role = UserRoleMember
+	}
+	return UserView{
+		ID:        u.ID,
+		Email:     u.Email,
+		Role:      role,
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+		IsActive:  u.IsActive,
+	}
 }
 
 // generateSalt creates a random salt for password hashing.
@@ -202,6 +331,17 @@ func isValidEmail(email string) bool {
 // isValidPassword checks password requirements.
 func isValidPassword(password string) bool {
 	return len(password) >= 8
+}
+
+func normalizeUserRole(role string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "", UserRoleMember:
+		return UserRoleMember, nil
+	case UserRoleAdmin:
+		return UserRoleAdmin, nil
+	default:
+		return "", fmt.Errorf("%w: %q", ErrInvalidUserRole, role)
+	}
 }
 
 // HandleUserRegistration handles POST /v1/users/register requests.
@@ -255,6 +395,7 @@ func (r *Router) HandleUserRegistration(userStore *UserStore) http.HandlerFunc {
 		resp := UserRegistrationResponse{
 			ID:        user.ID,
 			Email:     user.Email,
+			Role:      user.Role,
 			CreatedAt: user.CreatedAt,
 			Message:   "User account created successfully",
 		}
@@ -272,22 +413,13 @@ func (r *Router) HTTPHandlerWithUsers(userStore *UserStore, opts ...HTTPHandlerO
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	authz := authorizerForHTTPOptions(opt)
+	base := r.HTTPHandler(opt)
+	if userStore == nil {
+		return base
+	}
 
 	mux := http.NewServeMux()
-
-	// Existing endpoints
-	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, opt.AuditLogger, r.handleChatCompletionsWithOptions(opt)))
-	mux.HandleFunc("/v1/models", r.requireScope(authz, serverauth.ScopeModelsRead, opt.AuditLogger, r.handleListModelsWithOptions(opt)))
-
-	// User management endpoints
 	mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore))
-
-	// Health check (always unauthenticated)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
+	mux.Handle("/", base)
 	return mux
 }

@@ -15,6 +15,7 @@ import (
 // Event is one server-side audit record for an HTTP or session request.
 type Event struct {
 	Timestamp        time.Time `json:"timestamp"`
+	RequestID        string    `json:"request_id,omitempty"`
 	Kind             string    `json:"kind,omitempty"`
 	TokenID          string    `json:"token_id,omitempty"`
 	TokenDescription string    `json:"token_description,omitempty"`

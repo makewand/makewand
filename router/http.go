@@ -21,6 +21,8 @@ import (
 
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverhttp"
+	"github.com/makewand/makewand/serverusage"
 )
 
 // httpChatRequest is the subset of the OpenAI chat completions request we support.
@@ -107,6 +109,10 @@ type HTTPHandlerOptions struct {
 
 	// AuditLogger receives one event per handled request when non-nil.
 	AuditLogger serveraudit.Logger
+
+	// UsageLogger receives one structured usage entry per chat completion
+	// request, including status, realized cost, and provider metadata.
+	UsageLogger serverusage.Logger
 }
 
 // HTTPHandler returns an http.Handler that serves an OpenAI-compatible subset
@@ -185,11 +191,28 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	start := time.Now()
 	auditEvent := auditBaseEvent(req, grant, serverauth.ScopeChatInvoke)
 	auditEvent.Kind = "chat"
+	usageEntry := usageBaseEntry(req, grant)
 	defer func() {
 		if auditEvent.DurationMS == 0 {
 			auditEvent.DurationMS = time.Since(start).Milliseconds()
 		}
+		if usageEntry.DurationMS == 0 {
+			usageEntry.DurationMS = auditEvent.DurationMS
+		}
+		if usageEntry.Status == 0 {
+			usageEntry.Status = auditEvent.Status
+		}
+		if usageEntry.RequestedMode == "" {
+			usageEntry.RequestedMode = auditEvent.RequestedMode
+		}
+		if usageEntry.RequestedModel == "" {
+			usageEntry.RequestedModel = auditEvent.RequestedModel
+		}
+		if usageEntry.ActualProvider == "" {
+			usageEntry.ActualProvider = auditEvent.ActualProvider
+		}
 		logHTTPAudit(opt.AuditLogger, auditEvent, auditEvent.Status, auditEvent.ActualProvider, auditEvent.Error)
+		logHTTPUsage(opt.UsageLogger, usageEntry)
 	}()
 
 	if req.Method != http.MethodPost {
@@ -208,6 +231,9 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	}
 	auditEvent.RequestedMode = strings.ToLower(strings.TrimSpace(chatReq.Mode))
 	auditEvent.RequestedModel = strings.ToLower(strings.TrimSpace(chatReq.Model))
+	usageEntry.RequestedMode = auditEvent.RequestedMode
+	usageEntry.RequestedModel = auditEvent.RequestedModel
+	usageEntry.Stream = chatReq.Stream
 
 	// max_tokens and temperature are silently ignored — they are standard
 	// OpenAI fields that clients commonly include. Rejecting them would
@@ -230,6 +256,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 
 	effectiveMode := activeRouter.effectiveMode().String()
 	auditEvent.RequestedMode = effectiveMode
+	usageEntry.RequestedMode = effectiveMode
 	if !grant.AllowsMode(effectiveMode) {
 		auditEvent.Status = http.StatusForbidden
 		auditEvent.Error = fmt.Sprintf("token is not permitted to use mode %q", effectiveMode)
@@ -282,7 +309,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	}
 
 	if chatReq.Stream {
-		r.handleChatCompletionsStream(w, req, activeRouter, grant, requestedModel, task, messages, system, &auditEvent)
+		r.handleChatCompletionsStream(w, req, activeRouter, grant, requestedModel, task, messages, system, &auditEvent, &usageEntry)
 		return
 	}
 
@@ -346,13 +373,18 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	if auditEvent.ActualProvider == "" {
 		auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
 	}
+	usageEntry.Status = http.StatusOK
+	usageEntry.ActualProvider = auditEvent.ActualProvider
+	usageEntry.PromptTokens = usage.InputTokens
+	usageEntry.CompletionTokens = usage.OutputTokens
+	usageEntry.CostUSD = usage.Cost
 	auditEvent.PromptTokens = usage.InputTokens
 	auditEvent.CompletionTokens = usage.OutputTokens
 	auditEvent.CostUSD = usage.Cost
 	auditEvent.DurationMS = time.Since(start).Milliseconds()
 }
 
-func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event) {
+func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
 	if auditEvent == nil {
 		return
 	}
@@ -397,6 +429,9 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		responseModel = result.Actual
 	}
 	auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
+	if usageEntry != nil {
+		usageEntry.ActualProvider = auditEvent.ActualProvider
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -461,6 +496,9 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			auditEvent.Status = http.StatusOK
+			if usageEntry != nil {
+				usageEntry.Status = http.StatusOK
+			}
 			return
 		}
 	}
@@ -468,6 +506,9 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	auditEvent.Status = http.StatusOK
+	if usageEntry != nil {
+		usageEntry.Status = http.StatusOK
+	}
 }
 
 func writeSSEData(w http.ResponseWriter, payload any) error {
@@ -592,6 +633,7 @@ func containsString(values []string, target string) bool {
 func auditBaseEvent(req *http.Request, grant *serverauth.Grant, scope string) serveraudit.Event {
 	event := serveraudit.Event{
 		Timestamp: time.Now().UTC(),
+		RequestID: serverhttp.RequestIDFromRequest(req),
 		Scope:     scope,
 	}
 	if req != nil {
@@ -604,6 +646,18 @@ func auditBaseEvent(req *http.Request, grant *serverauth.Grant, scope string) se
 		event.TokenDescription = grant.Description()
 	}
 	return event
+}
+
+func usageBaseEntry(req *http.Request, grant *serverauth.Grant) serverusage.Entry {
+	entry := serverusage.Entry{
+		Timestamp: time.Now().UTC(),
+		RequestID: serverhttp.RequestIDFromRequest(req),
+	}
+	if grant != nil {
+		entry.TokenID = grant.TokenID()
+		entry.TokenDescription = grant.Description()
+	}
+	return entry
 }
 
 func logHTTPAudit(logger serveraudit.Logger, event serveraudit.Event, status int, actualProvider, errText string) {
@@ -620,6 +674,16 @@ func logHTTPAudit(logger serveraudit.Logger, event serveraudit.Event, status int
 		event.Error = errText
 	}
 	logger.Log(event)
+}
+
+func logHTTPUsage(logger serverusage.Logger, entry serverusage.Entry) {
+	if logger == nil {
+		return
+	}
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = time.Now().UTC()
+	}
+	logger.Log(entry)
 }
 
 func httpAuditKind(path string) string {

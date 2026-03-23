@@ -12,6 +12,7 @@ import (
 
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverusage"
 )
 
 type auditRecorder struct {
@@ -20,6 +21,14 @@ type auditRecorder struct {
 
 func (r *auditRecorder) Log(event serveraudit.Event) {
 	r.events = append(r.events, event)
+}
+
+type usageRecorder struct {
+	entries []serverusage.Entry
+}
+
+func (r *usageRecorder) Log(entry serverusage.Entry) {
+	r.entries = append(r.entries, entry)
 }
 
 func TestHTTPHandler_ChatCompletions(t *testing.T) {
@@ -595,6 +604,72 @@ func TestHTTPHandler_AuditLogsSuccessfulChat(t *testing.T) {
 	}
 	if event.Timestamp.IsZero() {
 		t.Fatal("Timestamp = zero, want populated audit timestamp")
+	}
+}
+
+func TestHTTPHandler_LogsUsageEntriesWithRequestID(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:           "runner",
+				Token:        "secret123",
+				Scopes:       []string{serverauth.ScopeChatInvoke},
+				AllowedModes: []string{"balanced"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	recorder := &usageRecorder{}
+	stub := &stubProvider{
+		name:         "claude",
+		available:    true,
+		response:     "hello from http",
+		inputTokens:  11,
+		outputTokens: 7,
+		cost:         0.42,
+	}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+		UsageMode:    "balanced",
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, UsageLogger: recorder})
+	body := `{"messages":[{"role":"user","content":"write a helper function"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-Id", "req_custom")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(recorder.entries) != 1 {
+		t.Fatalf("usage entries = %d, want 1", len(recorder.entries))
+	}
+	entry := recorder.entries[0]
+	if entry.RequestID != "req_custom" {
+		t.Fatalf("RequestID = %q, want %q", entry.RequestID, "req_custom")
+	}
+	if entry.TokenID != "runner" {
+		t.Fatalf("TokenID = %q, want %q", entry.TokenID, "runner")
+	}
+	if entry.ActualProvider != "claude" {
+		t.Fatalf("ActualProvider = %q, want %q", entry.ActualProvider, "claude")
+	}
+	if entry.CostUSD != 0.42 {
+		t.Fatalf("CostUSD = %.2f, want 0.42", entry.CostUSD)
+	}
+	if entry.PromptTokens != 11 || entry.CompletionTokens != 7 {
+		t.Fatalf("token counts = %d/%d, want 11/7", entry.PromptTokens, entry.CompletionTokens)
 	}
 }
 
