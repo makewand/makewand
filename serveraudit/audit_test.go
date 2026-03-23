@@ -52,11 +52,14 @@ func TestLoadEventsAndSummarize(t *testing.T) {
 		t.Fatalf("OpenJSONL: %v", err)
 	}
 	logger.Log(Event{
-		Timestamp:      time.Date(2026, 3, 23, 0, 0, 0, 0, time.UTC),
-		Kind:           "chat",
-		TokenID:        "runner",
-		Status:         200,
-		ActualProvider: "codex",
+		Timestamp:        time.Date(2026, 3, 23, 0, 0, 0, 0, time.UTC),
+		Kind:             "chat",
+		TokenID:          "runner",
+		Status:           200,
+		ActualProvider:   "codex",
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		CostUSD:          0.25,
 	})
 	logger.Log(Event{
 		Timestamp:   time.Date(2026, 3, 23, 1, 0, 0, 0, time.UTC),
@@ -82,6 +85,15 @@ func TestLoadEventsAndSummarize(t *testing.T) {
 	}
 	if summary.ByProvider["codex"] != 1 {
 		t.Fatalf("summary.ByProvider[codex] = %d, want 1", summary.ByProvider["codex"])
+	}
+	if summary.TotalPromptTokens != 10 {
+		t.Fatalf("summary.TotalPromptTokens = %d, want 10", summary.TotalPromptTokens)
+	}
+	if summary.TotalCompletionTokens != 5 {
+		t.Fatalf("summary.TotalCompletionTokens = %d, want 5", summary.TotalCompletionTokens)
+	}
+	if summary.TotalCostUSD != 0.25 {
+		t.Fatalf("summary.TotalCostUSD = %.2f, want 0.25", summary.TotalCostUSD)
 	}
 
 	allEvents, err := LoadEvents(path, Filter{})

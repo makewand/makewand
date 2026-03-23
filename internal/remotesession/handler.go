@@ -15,7 +15,7 @@ const maxSessionPayloadBytes = 4 << 20 // 4 MiB
 
 // HandlerOptions configures the session HTTP handler.
 type HandlerOptions struct {
-	Authorizer  *serverauth.Authorizer
+	Authorizer  serverauth.RequestAuthorizer
 	AuditLogger serveraudit.Logger
 }
 
@@ -28,7 +28,7 @@ func NewHandler(store *Store, bearerToken string) http.Handler {
 
 // NewHandlerWithAuthorizer returns an HTTP handler for remote session CRUD with
 // scoped token enforcement.
-func NewHandlerWithAuthorizer(store *Store, authz *serverauth.Authorizer) http.Handler {
+func NewHandlerWithAuthorizer(store *Store, authz serverauth.RequestAuthorizer) http.Handler {
 	return NewHandlerWithOptions(store, HandlerOptions{Authorizer: authz})
 }
 
@@ -59,7 +59,15 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		grant, ok := opts.Authorizer.AuthenticateRequest(req)
+		var (
+			grant *serverauth.Grant
+			ok    bool
+		)
+		if opts.Authorizer == nil {
+			ok = true
+		} else {
+			grant, ok = opts.Authorizer.AuthenticateRequest(req)
+		}
 		if !ok {
 			event.Status = http.StatusUnauthorized
 			event.Error = "unauthorized"

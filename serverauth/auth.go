@@ -18,19 +18,25 @@ import (
 )
 
 const (
-	ScopeChatInvoke     = "chat:invoke"
-	ScopeModelsRead     = "models:read"
-	ScopeSessionsRead   = "sessions:read"
-	ScopeSessionsWrite  = "sessions:write"
-	ScopeSessionsDelete = "sessions:delete"
+	ScopeChatInvoke       = "chat:invoke"
+	ScopeModelsRead       = "models:read"
+	ScopeSessionsRead     = "sessions:read"
+	ScopeSessionsWrite    = "sessions:write"
+	ScopeSessionsDelete   = "sessions:delete"
+	ScopeAdminTokensRead  = "admin:tokens:read"
+	ScopeAdminTokensWrite = "admin:tokens:write"
+	ScopeAdminAuditRead   = "admin:audit:read"
 )
 
 var validScopes = map[string]struct{}{
-	ScopeChatInvoke:     {},
-	ScopeModelsRead:     {},
-	ScopeSessionsRead:   {},
-	ScopeSessionsWrite:  {},
-	ScopeSessionsDelete: {},
+	ScopeChatInvoke:       {},
+	ScopeModelsRead:       {},
+	ScopeSessionsRead:     {},
+	ScopeSessionsWrite:    {},
+	ScopeSessionsDelete:   {},
+	ScopeAdminTokensRead:  {},
+	ScopeAdminTokensWrite: {},
+	ScopeAdminAuditRead:   {},
 }
 
 var validModes = map[string]struct{}{
@@ -57,6 +63,30 @@ type TokenRule struct {
 	Revoked            bool      `json:"revoked,omitempty"`
 	MaxRequestsPerHour int       `json:"max_requests_per_hour,omitempty"`
 	MaxRequestsPerDay  int       `json:"max_requests_per_day,omitempty"`
+	MaxCostUSDPerDay   float64   `json:"max_cost_usd_per_day,omitempty"`
+	MaxCostUSDPerMonth float64   `json:"max_cost_usd_per_month,omitempty"`
+}
+
+// TokenRuleView is a non-secret representation of a token rule suitable for
+// listing via CLI or admin APIs.
+type TokenRuleView struct {
+	ID                 string    `json:"id,omitempty"`
+	Description        string    `json:"description,omitempty"`
+	Scopes             []string  `json:"scopes"`
+	WorkspacePrefixes  []string  `json:"workspace_prefixes,omitempty"`
+	AllowedProviders   []string  `json:"allowed_providers,omitempty"`
+	AllowedModes       []string  `json:"allowed_modes,omitempty"`
+	ExpiresAt          time.Time `json:"expires_at,omitempty"`
+	Revoked            bool      `json:"revoked,omitempty"`
+	MaxRequestsPerHour int       `json:"max_requests_per_hour,omitempty"`
+	MaxRequestsPerDay  int       `json:"max_requests_per_day,omitempty"`
+	MaxCostUSDPerDay   float64   `json:"max_cost_usd_per_day,omitempty"`
+	MaxCostUSDPerMonth float64   `json:"max_cost_usd_per_month,omitempty"`
+}
+
+// RequestAuthorizer authenticates request-scoped grants for HTTP handlers.
+type RequestAuthorizer interface {
+	AuthenticateRequest(req *http.Request) (*Grant, bool)
 }
 
 // Authorizer authenticates Bearer tokens and returns scoped grants.
@@ -72,6 +102,8 @@ type Grant struct {
 	revoked            bool
 	maxRequestsPerHour int
 	maxRequestsPerDay  int
+	maxCostUSDPerDay   float64
+	maxCostUSDPerMonth float64
 	scopes             map[string]struct{}
 	workspacePrefixes  []string
 	allowedProviders   map[string]struct{}
@@ -81,15 +113,21 @@ type Grant struct {
 	quotaWindowCount   int
 	quotaDayStart      time.Time
 	quotaDayCount      int
+	costDayStart       time.Time
+	costDaySpent       float64
+	costMonthStart     time.Time
+	costMonthSpent     float64
 }
 
 var (
 	ErrHourlyQuotaExceeded = errors.New("token exceeded max_requests_per_hour")
 	ErrDailyQuotaExceeded  = errors.New("token exceeded max_requests_per_day")
+	ErrDailyCostExceeded   = errors.New("token exceeded max_cost_usd_per_day")
+	ErrMonthlyCostExceeded = errors.New("token exceeded max_cost_usd_per_month")
 )
 
-// AllScopes returns the full scope set used by legacy single-token auth.
-func AllScopes() []string {
+// AllClientScopes returns the default non-admin scope set for remote clients.
+func AllClientScopes() []string {
 	return []string{
 		ScopeChatInvoke,
 		ScopeModelsRead,
@@ -97,6 +135,13 @@ func AllScopes() []string {
 		ScopeSessionsWrite,
 		ScopeSessionsDelete,
 	}
+}
+
+// AllScopes returns the full scope set used by privileged admin tokens.
+func AllScopes() []string {
+	out := AllClientScopes()
+	out = append(out, ScopeAdminTokensRead, ScopeAdminTokensWrite, ScopeAdminAuditRead)
+	return out
 }
 
 // NewSingleTokenAuthorizer creates a permissive authorizer for the legacy
@@ -310,6 +355,53 @@ func (g *Grant) Description() string {
 	return g.description
 }
 
+// CheckCostBudgetAt reports whether the token has already exhausted its spend
+// budget before processing another request.
+func (g *Grant) CheckCostBudgetAt(now time.Time) error {
+	if g == nil || (g.maxCostUSDPerDay <= 0 && g.maxCostUSDPerMonth <= 0) {
+		return nil
+	}
+
+	utcNow := now.UTC()
+	dayWindow := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
+	monthWindow := time.Date(utcNow.Year(), utcNow.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	g.quotaMu.Lock()
+	defer g.quotaMu.Unlock()
+
+	g.resetCostWindowsLocked(dayWindow, monthWindow)
+	if g.maxCostUSDPerDay > 0 && g.costDaySpent >= g.maxCostUSDPerDay {
+		return ErrDailyCostExceeded
+	}
+	if g.maxCostUSDPerMonth > 0 && g.costMonthSpent >= g.maxCostUSDPerMonth {
+		return ErrMonthlyCostExceeded
+	}
+	return nil
+}
+
+// RecordCostAt records the realized usage cost against the token's spend
+// budgets. Zero-cost requests are ignored.
+func (g *Grant) RecordCostAt(now time.Time, costUSD float64) {
+	if g == nil || costUSD <= 0 || (g.maxCostUSDPerDay <= 0 && g.maxCostUSDPerMonth <= 0) {
+		return
+	}
+
+	utcNow := now.UTC()
+	dayWindow := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
+	monthWindow := time.Date(utcNow.Year(), utcNow.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	g.quotaMu.Lock()
+	defer g.quotaMu.Unlock()
+
+	g.resetCostWindowsLocked(dayWindow, monthWindow)
+	if g.maxCostUSDPerDay > 0 {
+		g.costDaySpent += costUSD
+	}
+	if g.maxCostUSDPerMonth > 0 {
+		g.costMonthSpent += costUSD
+	}
+}
+
 // IsExpiredAt reports whether the token is expired at the supplied time.
 func (g *Grant) IsExpiredAt(now time.Time) bool {
 	if g == nil || g.expiresAt.IsZero() {
@@ -364,6 +456,17 @@ func (g *Grant) CheckAndConsumeRequestAt(now time.Time) error {
 	return nil
 }
 
+func (g *Grant) resetCostWindowsLocked(dayWindow, monthWindow time.Time) {
+	if !dayWindow.IsZero() && (g.costDayStart.IsZero() || !g.costDayStart.Equal(dayWindow)) {
+		g.costDayStart = dayWindow
+		g.costDaySpent = 0
+	}
+	if !monthWindow.IsZero() && (g.costMonthStart.IsZero() || !g.costMonthStart.Equal(monthWindow)) {
+		g.costMonthStart = monthWindow
+		g.costMonthSpent = 0
+	}
+}
+
 func newGrant(rule TokenRule) (*Grant, error) {
 	if len(rule.Scopes) == 0 {
 		return nil, errors.New("scopes must not be empty")
@@ -373,6 +476,12 @@ func newGrant(rule TokenRule) (*Grant, error) {
 	}
 	if rule.MaxRequestsPerDay < 0 {
 		return nil, errors.New("max_requests_per_day must be >= 0")
+	}
+	if rule.MaxCostUSDPerDay < 0 {
+		return nil, errors.New("max_cost_usd_per_day must be >= 0")
+	}
+	if rule.MaxCostUSDPerMonth < 0 {
+		return nil, errors.New("max_cost_usd_per_month must be >= 0")
 	}
 
 	scopeSet := make(map[string]struct{}, len(rule.Scopes))
@@ -437,6 +546,8 @@ func newGrant(rule TokenRule) (*Grant, error) {
 		revoked:            rule.Revoked,
 		maxRequestsPerHour: rule.MaxRequestsPerHour,
 		maxRequestsPerDay:  rule.MaxRequestsPerDay,
+		maxCostUSDPerDay:   rule.MaxCostUSDPerDay,
+		maxCostUSDPerMonth: rule.MaxCostUSDPerMonth,
 		scopes:             scopeSet,
 		workspacePrefixes:  workspacePrefixes,
 		allowedProviders:   providers,
@@ -490,6 +601,90 @@ func compactStrings(values []string) []string {
 func defaultTokenID(token string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
 	return "tok_" + hex.EncodeToString(sum[:6])
+}
+
+// DerivedTokenID returns the stable non-secret token identifier derived from
+// the token value when an explicit ID is not supplied.
+func DerivedTokenID(token string) string {
+	return defaultTokenID(token)
+}
+
+// SanitizedRules returns non-secret token rules suitable for display.
+func SanitizedRules(rules []TokenRule) []TokenRuleView {
+	if len(rules) == 0 {
+		return nil
+	}
+	views := make([]TokenRuleView, 0, len(rules))
+	for _, rule := range rules {
+		id := strings.TrimSpace(rule.ID)
+		if id == "" {
+			id = DerivedTokenID(rule.Token)
+		}
+		views = append(views, TokenRuleView{
+			ID:                 id,
+			Description:        rule.Description,
+			Scopes:             append([]string(nil), rule.Scopes...),
+			WorkspacePrefixes:  append([]string(nil), rule.WorkspacePrefixes...),
+			AllowedProviders:   append([]string(nil), rule.AllowedProviders...),
+			AllowedModes:       append([]string(nil), rule.AllowedModes...),
+			ExpiresAt:          rule.ExpiresAt,
+			Revoked:            rule.Revoked,
+			MaxRequestsPerHour: rule.MaxRequestsPerHour,
+			MaxRequestsPerDay:  rule.MaxRequestsPerDay,
+			MaxCostUSDPerDay:   rule.MaxCostUSDPerDay,
+			MaxCostUSDPerMonth: rule.MaxCostUSDPerMonth,
+		})
+	}
+	return views
+}
+
+// IssueTokenRule validates and appends a token rule, backfilling a stable ID.
+func IssueTokenRule(cfg *Config, rule TokenRule) (string, error) {
+	if cfg == nil {
+		return "", fmt.Errorf("auth config is nil")
+	}
+	if strings.TrimSpace(rule.Token) == "" {
+		return "", fmt.Errorf("token value is empty")
+	}
+	cfg.Tokens = append(cfg.Tokens, rule)
+	authz, err := NewAuthorizer(*cfg)
+	if err != nil {
+		cfg.Tokens = cfg.Tokens[:len(cfg.Tokens)-1]
+		return "", err
+	}
+	grant, ok := authz.AuthenticateHeader("Bearer " + rule.Token)
+	if !ok {
+		cfg.Tokens = cfg.Tokens[:len(cfg.Tokens)-1]
+		return "", fmt.Errorf("failed to authenticate newly issued token")
+	}
+	finalID := grant.TokenID()
+	if cfg.Tokens[len(cfg.Tokens)-1].ID == "" {
+		cfg.Tokens[len(cfg.Tokens)-1].ID = finalID
+	}
+	return finalID, nil
+}
+
+// RevokeTokenRule marks the token identified by tokenID as revoked.
+func RevokeTokenRule(cfg *Config, tokenID string) error {
+	tokenID = strings.TrimSpace(tokenID)
+	if cfg == nil || tokenID == "" {
+		return fmt.Errorf("token id is required")
+	}
+	for i := range cfg.Tokens {
+		id := strings.TrimSpace(cfg.Tokens[i].ID)
+		if id == "" {
+			id = DerivedTokenID(cfg.Tokens[i].Token)
+		}
+		if id != tokenID {
+			continue
+		}
+		cfg.Tokens[i].Revoked = true
+		if cfg.Tokens[i].ID == "" {
+			cfg.Tokens[i].ID = id
+		}
+		return nil
+	}
+	return fmt.Errorf("token %q not found", tokenID)
 }
 
 // SaveConfigFile validates and writes cfg to path with restrictive permissions.

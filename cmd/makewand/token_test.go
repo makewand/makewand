@@ -11,12 +11,12 @@ import (
 
 func TestIssueTokenRule_AssignsStableID(t *testing.T) {
 	cfg := serverauth.Config{}
-	id, err := issueTokenRule(&cfg, serverauth.TokenRule{
+	id, err := serverauth.IssueTokenRule(&cfg, serverauth.TokenRule{
 		Token:  "secret",
 		Scopes: []string{serverauth.ScopeModelsRead},
 	})
 	if err != nil {
-		t.Fatalf("issueTokenRule: %v", err)
+		t.Fatalf("IssueTokenRule: %v", err)
 	}
 	if id == "" {
 		t.Fatal("issued token ID = empty")
@@ -39,11 +39,17 @@ func TestRevokeTokenRule_MarksTokenRevoked(t *testing.T) {
 			},
 		},
 	}
-	if err := revokeTokenRule(&cfg, "runner"); err != nil {
-		t.Fatalf("revokeTokenRule: %v", err)
+	if err := serverauth.RevokeTokenRule(&cfg, "runner"); err != nil {
+		t.Fatalf("RevokeTokenRule: %v", err)
 	}
 	if !cfg.Tokens[0].Revoked {
 		t.Fatal("cfg.Tokens[0].Revoked = false, want true")
+	}
+}
+
+func TestDerivedTokenID_UsesServerauth(t *testing.T) {
+	if got := derivedTokenID("secret"); got != serverauth.DerivedTokenID("secret") {
+		t.Fatalf("derivedTokenID(secret) = %q, want %q", got, serverauth.DerivedTokenID("secret"))
 	}
 }
 
@@ -75,7 +81,7 @@ func TestResolveManagedAuthConfigPath_DefaultsToConfigDir(t *testing.T) {
 }
 
 func TestSanitizedTokenRules_HidesRawToken(t *testing.T) {
-	views := sanitizedTokenRules([]serverauth.TokenRule{
+	views := serverauth.SanitizedRules([]serverauth.TokenRule{
 		{
 			Token:  "secret",
 			Scopes: []string{serverauth.ScopeModelsRead},
@@ -91,10 +97,10 @@ func TestSanitizedTokenRules_HidesRawToken(t *testing.T) {
 	if string(data) == "" {
 		t.Fatal("json output = empty")
 	}
-	if string(data) != "" && string(data) == "null" {
+	if string(data) == "null" {
 		t.Fatal("json output = null")
 	}
-	if string(data) != "" && string(data) == "{}" {
+	if string(data) == "{}" {
 		t.Fatal("json output = {}, want redacted metadata")
 	}
 	if strings.Contains(string(data), "secret") {

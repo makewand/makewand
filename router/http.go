@@ -79,7 +79,7 @@ type HTTPHandlerOptions struct {
 	// Authorizer enables scoped multi-token auth. When set, it takes precedence
 	// over BearerToken and can restrict scopes, session prefixes, providers, and
 	// modes on a per-token basis.
-	Authorizer *serverauth.Authorizer
+	Authorizer serverauth.RequestAuthorizer
 
 	// StatsDir enables routing stats persistence after chat requests.
 	// When empty, HTTP requests do not read or write routing_stats.json.
@@ -118,7 +118,7 @@ func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 
 type scopedHTTPHandler func(w http.ResponseWriter, req *http.Request, grant *serverauth.Grant)
 
-func authorizerForHTTPOptions(opt HTTPHandlerOptions) *serverauth.Authorizer {
+func authorizerForHTTPOptions(opt HTTPHandlerOptions) serverauth.RequestAuthorizer {
 	if opt.Authorizer != nil {
 		return opt.Authorizer
 	}
@@ -128,7 +128,7 @@ func authorizerForHTTPOptions(opt HTTPHandlerOptions) *serverauth.Authorizer {
 	return nil
 }
 
-func (r *Router) requireScope(authz *serverauth.Authorizer, scope string, logger serveraudit.Logger, next scopedHTTPHandler) http.HandlerFunc {
+func (r *Router) requireScope(authz serverauth.RequestAuthorizer, scope string, logger serveraudit.Logger, next scopedHTTPHandler) http.HandlerFunc {
 	if authz == nil {
 		return func(w http.ResponseWriter, req *http.Request) {
 			next(w, req, nil)
@@ -239,6 +239,12 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 			return
 		}
 	}
+	if err := grant.CheckCostBudgetAt(time.Now()); err != nil {
+		auditEvent.Status = http.StatusTooManyRequests
+		auditEvent.Error = err.Error()
+		writeHTTPError(w, http.StatusTooManyRequests, "budget_exceeded", err.Error())
+		return
+	}
 	defer activeRouter.persistHTTPStats(opt.StatsDir)
 
 	// Convert messages
@@ -315,11 +321,15 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+	grant.RecordCostAt(time.Now(), usage.Cost)
 	auditEvent.Status = http.StatusOK
 	auditEvent.ActualProvider = strings.TrimSpace(usage.Provider)
 	if auditEvent.ActualProvider == "" {
 		auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
 	}
+	auditEvent.PromptTokens = usage.InputTokens
+	auditEvent.CompletionTokens = usage.OutputTokens
+	auditEvent.CostUSD = usage.Cost
 	auditEvent.DurationMS = time.Since(start).Milliseconds()
 }
 

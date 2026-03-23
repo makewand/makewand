@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,12 +36,35 @@ func auditSummaryCmd() *cobra.Command {
 		sinceFlag     string
 		untilFlag     string
 		jsonOutput    bool
+		remoteURL     string
+		remoteToken   string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "summary",
 		Short: "Summarize audit activity",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL, bearer, remoteMode, err := resolveOptionalRemoteAdminTarget(remoteURL, remoteToken)
+			if err != nil {
+				return err
+			}
+			if remoteMode {
+				var resp remoteAuditSummaryResponse
+				if err := adminGetJSON(baseURL, bearer, "/v1/admin/audit/summary", buildAuditQuery(tokenIDFlag, kindFlag, workspaceFlag, statusFlag, sinceFlag, untilFlag, 0), &resp); err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(resp, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printAuditSummary(resp.Path, resp.Summary)
+				return nil
+			}
+
 			path, err := resolveAuditLogPath(pathFlag)
 			if err != nil {
 				return err
@@ -74,6 +98,8 @@ func auditSummaryCmd() *cobra.Command {
 	cmd.Flags().IntVar(&statusFlag, "status", 0, "filter by HTTP status code")
 	cmd.Flags().StringVar(&sinceFlag, "since", "", "filter events since RFC3339 time or relative duration like 24h")
 	cmd.Flags().StringVar(&untilFlag, "until", "", "filter events until RFC3339 time or relative duration like 1h")
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
+	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output summary as JSON")
 	return cmd
 }
@@ -89,12 +115,35 @@ func auditEventsCmd() *cobra.Command {
 		untilFlag     string
 		limitFlag     int
 		jsonOutput    bool
+		remoteURL     string
+		remoteToken   string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "events",
 		Short: "List matching audit events",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL, bearer, remoteMode, err := resolveOptionalRemoteAdminTarget(remoteURL, remoteToken)
+			if err != nil {
+				return err
+			}
+			if remoteMode {
+				var resp remoteAuditEventsResponse
+				if err := adminGetJSON(baseURL, bearer, "/v1/admin/audit/events", buildAuditQuery(tokenIDFlag, kindFlag, workspaceFlag, statusFlag, sinceFlag, untilFlag, limitFlag), &resp); err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(resp, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printAuditEvents(resp.Data)
+				return nil
+			}
+
 			path, err := resolveAuditLogPath(pathFlag)
 			if err != nil {
 				return err
@@ -128,6 +177,8 @@ func auditEventsCmd() *cobra.Command {
 	cmd.Flags().StringVar(&sinceFlag, "since", "", "filter events since RFC3339 time or relative duration like 24h")
 	cmd.Flags().StringVar(&untilFlag, "until", "", "filter events until RFC3339 time or relative duration like 1h")
 	cmd.Flags().IntVar(&limitFlag, "limit", 50, "maximum number of events to display (0 = unlimited)")
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
+	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output events as JSON")
 	return cmd
 }
@@ -191,6 +242,9 @@ func printAuditSummary(path string, summary serveraudit.Summary) {
 	if !summary.Earliest.IsZero() {
 		fmt.Printf("Window: %s -> %s\n", summary.Earliest.Format(time.RFC3339), summary.Latest.Format(time.RFC3339))
 	}
+	fmt.Printf("Prompt tokens: %d\n", summary.TotalPromptTokens)
+	fmt.Printf("Completion tokens: %d\n", summary.TotalCompletionTokens)
+	fmt.Printf("Total cost: $%.4f\n", summary.TotalCostUSD)
 	for _, key := range serveraudit.SortedStringCounts(summary.ByKind) {
 		fmt.Printf("Kind %s: %d\n", key, summary.ByKind[key])
 	}
@@ -202,6 +256,12 @@ func printAuditSummary(path string, summary serveraudit.Summary) {
 	}
 	for _, key := range serveraudit.SortedStringCounts(summary.ByProvider) {
 		fmt.Printf("Provider %s: %d\n", key, summary.ByProvider[key])
+	}
+	for _, key := range serveraudit.SortedStringTotals(summary.CostByToken) {
+		fmt.Printf("Token cost %s: $%.4f\n", key, summary.CostByToken[key])
+	}
+	for _, key := range serveraudit.SortedStringTotals(summary.CostByProvider) {
+		fmt.Printf("Provider cost %s: $%.4f\n", key, summary.CostByProvider[key])
 	}
 }
 
@@ -228,6 +288,9 @@ func printAuditEvents(events []serveraudit.Event) {
 		if evt.Path != "" {
 			line = append(line, evt.Path)
 		}
+		if evt.CostUSD > 0 {
+			line = append(line, fmt.Sprintf("cost=$%.4f", evt.CostUSD))
+		}
 		if evt.Error != "" {
 			line = append(line, "error="+evt.Error)
 		}
@@ -241,4 +304,30 @@ func loadAuditEvents(path string, filter serveraudit.Filter) ([]serveraudit.Even
 		return nil, nil
 	}
 	return events, err
+}
+
+func buildAuditQuery(tokenID, kind, workspace string, status int, since, until string, limit int) url.Values {
+	query := url.Values{}
+	if strings.TrimSpace(tokenID) != "" {
+		query.Set("token_id", strings.TrimSpace(tokenID))
+	}
+	if strings.TrimSpace(kind) != "" {
+		query.Set("kind", strings.TrimSpace(kind))
+	}
+	if strings.TrimSpace(workspace) != "" {
+		query.Set("workspace", strings.TrimSpace(workspace))
+	}
+	if status != 0 {
+		query.Set("status", strconv.Itoa(status))
+	}
+	if strings.TrimSpace(since) != "" {
+		query.Set("since", strings.TrimSpace(since))
+	}
+	if strings.TrimSpace(until) != "" {
+		query.Set("until", strings.TrimSpace(until))
+	}
+	if limit != 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	return query
 }

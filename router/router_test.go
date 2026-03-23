@@ -13,11 +13,14 @@ import (
 // stubProvider is a minimal Provider for testing.
 // Unified: supports response, failChat, failStream fields.
 type stubProvider struct {
-	name       string
-	available  bool
-	response   string
-	failChat   bool
-	failStream bool
+	name         string
+	available    bool
+	response     string
+	inputTokens  int
+	outputTokens int
+	cost         float64
+	failChat     bool
+	failStream   bool
 }
 
 func (s *stubProvider) Name() string { return s.name }
@@ -32,7 +35,13 @@ func (s *stubProvider) Chat(_ context.Context, _ []Message, _ string, _ int) (st
 	if resp == "" {
 		resp = "ok"
 	}
-	return resp, Usage{Provider: s.name, Model: s.name}, nil
+	return resp, Usage{
+		Provider:     s.name,
+		Model:        s.name,
+		InputTokens:  s.inputTokens,
+		OutputTokens: s.outputTokens,
+		Cost:         s.cost,
+	}, nil
 }
 
 func (s *stubProvider) ChatStream(_ context.Context, _ []Message, _ string, _ int) (<-chan StreamChunk, error) {

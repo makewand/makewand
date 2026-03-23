@@ -136,6 +136,40 @@ makewand audit summary --path ~/.config/makewand/server/audit.jsonl
 makewand audit events --path ~/.config/makewand/server/audit.jsonl --limit 20
 ```
 
+When the server runs with `--auth-config`, it also exposes admin APIs for live
+token rotation and audit queries. CLI commands can call them directly:
+当服务端使用 `--auth-config` 启动时，还会暴露实时 token 管理与审计查询 API；CLI
+也可直接调用：
+
+```bash
+makewand token list \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
+
+makewand token issue \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --id runner \
+  --allowed-providers codex \
+  --allowed-modes balanced \
+  --max-requests-per-day 1000 \
+  --max-cost-usd-per-day 5
+
+makewand audit summary \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
+```
+
+Admin APIs / 管理 API：
+
+| Endpoint | Scope |
+|----------|-------|
+| `GET /v1/admin/tokens` | `admin:tokens:read` |
+| `POST /v1/admin/tokens` | `admin:tokens:write` |
+| `POST /v1/admin/tokens/{id}/revoke` | `admin:tokens:write` |
+| `GET /v1/admin/audit/summary` | `admin:audit:read` |
+| `GET /v1/admin/audit/events` | `admin:audit:read` |
+
 If both machines point at the same repository, set a shared workspace id to
 resume the same chat even when local paths differ:
 如果两台机器本地目录不同，但希望恢复同一段对话，可显式设置共享 workspace id：

@@ -27,6 +27,9 @@ type Event struct {
 	RequestedModel   string    `json:"requested_model,omitempty"`
 	ActualProvider   string    `json:"actual_provider,omitempty"`
 	WorkspaceID      string    `json:"workspace_id,omitempty"`
+	PromptTokens     int       `json:"prompt_tokens,omitempty"`
+	CompletionTokens int       `json:"completion_tokens,omitempty"`
+	CostUSD          float64   `json:"cost_usd,omitempty"`
 	Error            string    `json:"error,omitempty"`
 }
 
@@ -43,13 +46,18 @@ type Filter struct {
 
 // Summary aggregates audit activity for operator review.
 type Summary struct {
-	Total      int            `json:"total"`
-	ByKind     map[string]int `json:"by_kind,omitempty"`
-	ByStatus   map[int]int    `json:"by_status,omitempty"`
-	ByToken    map[string]int `json:"by_token,omitempty"`
-	ByProvider map[string]int `json:"by_provider,omitempty"`
-	Earliest   time.Time      `json:"earliest,omitempty"`
-	Latest     time.Time      `json:"latest,omitempty"`
+	Total                 int                `json:"total"`
+	ByKind                map[string]int     `json:"by_kind,omitempty"`
+	ByStatus              map[int]int        `json:"by_status,omitempty"`
+	ByToken               map[string]int     `json:"by_token,omitempty"`
+	ByProvider            map[string]int     `json:"by_provider,omitempty"`
+	TotalPromptTokens     int                `json:"total_prompt_tokens,omitempty"`
+	TotalCompletionTokens int                `json:"total_completion_tokens,omitempty"`
+	TotalCostUSD          float64            `json:"total_cost_usd,omitempty"`
+	CostByToken           map[string]float64 `json:"cost_by_token,omitempty"`
+	CostByProvider        map[string]float64 `json:"cost_by_provider,omitempty"`
+	Earliest              time.Time          `json:"earliest,omitempty"`
+	Latest                time.Time          `json:"latest,omitempty"`
 }
 
 // Logger writes audit events.
@@ -132,10 +140,12 @@ func LoadEvents(path string, filter Filter) ([]Event, error) {
 // SummarizeEvents folds events into operator-friendly counters.
 func SummarizeEvents(events []Event) Summary {
 	summary := Summary{
-		ByKind:     make(map[string]int),
-		ByStatus:   make(map[int]int),
-		ByToken:    make(map[string]int),
-		ByProvider: make(map[string]int),
+		ByKind:         make(map[string]int),
+		ByStatus:       make(map[int]int),
+		ByToken:        make(map[string]int),
+		ByProvider:     make(map[string]int),
+		CostByToken:    make(map[string]float64),
+		CostByProvider: make(map[string]float64),
 	}
 	for i, evt := range events {
 		summary.Total++
@@ -150,6 +160,15 @@ func SummarizeEvents(events []Event) Summary {
 		}
 		if evt.ActualProvider != "" {
 			summary.ByProvider[evt.ActualProvider]++
+		}
+		summary.TotalPromptTokens += evt.PromptTokens
+		summary.TotalCompletionTokens += evt.CompletionTokens
+		summary.TotalCostUSD += evt.CostUSD
+		if evt.TokenID != "" && evt.CostUSD > 0 {
+			summary.CostByToken[evt.TokenID] += evt.CostUSD
+		}
+		if evt.ActualProvider != "" && evt.CostUSD > 0 {
+			summary.CostByProvider[evt.ActualProvider] += evt.CostUSD
 		}
 		if i == 0 || (!evt.Timestamp.IsZero() && evt.Timestamp.Before(summary.Earliest)) || summary.Earliest.IsZero() {
 			summary.Earliest = evt.Timestamp
@@ -186,6 +205,18 @@ func SortedStatusCounts(m map[int]int) []int {
 		keys = append(keys, key)
 	}
 	sort.Ints(keys)
+	return keys
+}
+
+func SortedStringTotals(m map[string]float64) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	return keys
 }
 

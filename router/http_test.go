@@ -673,6 +673,60 @@ func TestHTTPHandler_RejectsRequestsOverDailyQuota(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_RejectsRequestsOverDailyCostBudget(t *testing.T) {
+	stub := &stubProvider{
+		name:         "claude",
+		available:    true,
+		response:     "hello from http",
+		inputTokens:  10,
+		outputTokens: 5,
+		cost:         1.0,
+	}
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:            "secret123",
+				Scopes:           []string{serverauth.ScopeChatInvoke},
+				MaxCostUSDPerDay: 1.0,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req1.Header.Set("Authorization", "Bearer secret123")
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200; body: %s", rec1.Code, rec1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req2.Header.Set("Authorization", "Bearer secret123")
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429; body: %s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "max_cost_usd_per_day") {
+		t.Fatalf("second body = %q, want cost budget error", rec2.Body.String())
+	}
+}
+
 func TestHTTPHandler_MethodNotAllowed(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 
