@@ -602,6 +602,40 @@ func TestHTTPHandler_AuditLogsForbiddenModelsScope(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_RejectsRequestsOverHourlyQuota(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:              "secret123",
+				Scopes:             []string{serverauth.ScopeModelsRead},
+				MaxRequestsPerHour: 1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	r := NewRouterFromConfig(RouterConfig{})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req1.Header.Set("Authorization", "Bearer secret123")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200", rec1.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req2.Header.Set("Authorization", "Bearer secret123")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429; body: %s", rec2.Code, rec2.Body.String())
+	}
+}
+
 func TestHTTPHandler_MethodNotAllowed(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 

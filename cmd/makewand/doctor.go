@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -79,22 +80,30 @@ type doctorReport struct {
 }
 
 type doctorOptions struct {
-	modes        []model.UsageMode
-	probe        bool
-	probeTimeout time.Duration
-	probeRetries int
-	strict       bool
-	jsonOutput   bool
+	modes         []model.UsageMode
+	probe         bool
+	probeTimeout  time.Duration
+	probeRetries  int
+	remoteCheck   bool
+	remoteURL     string
+	remoteToken   string
+	remoteTimeout time.Duration
+	strict        bool
+	jsonOutput    bool
 }
 
 func doctorCmd() *cobra.Command {
 	var (
-		modesFlag        string
-		probeFlag        bool
-		probeTimeoutFlag time.Duration
-		probeRetriesFlag int
-		strictFlag       bool
-		jsonFlag         bool
+		modesFlag         string
+		probeFlag         bool
+		probeTimeoutFlag  time.Duration
+		probeRetriesFlag  int
+		remoteCheckFlag   bool
+		remoteURLFlag     string
+		remoteTokenFlag   string
+		remoteTimeoutFlag time.Duration
+		strictFlag        bool
+		jsonFlag          bool
 	)
 
 	cmd := &cobra.Command{
@@ -117,15 +126,22 @@ Examples:
 			if probeRetriesFlag < 0 {
 				return fmt.Errorf("probe retries must be >= 0")
 			}
+			if remoteTimeoutFlag <= 0 {
+				return fmt.Errorf("remote timeout must be positive")
+			}
 
 			cfg, loadErr := config.Load()
 			report, failCount, warnCount := runDoctor(cfg, loadErr, doctorOptions{
-				modes:        modes,
-				probe:        probeFlag,
-				probeTimeout: probeTimeoutFlag,
-				probeRetries: probeRetriesFlag,
-				strict:       strictFlag,
-				jsonOutput:   jsonFlag,
+				modes:         modes,
+				probe:         probeFlag,
+				probeTimeout:  probeTimeoutFlag,
+				probeRetries:  probeRetriesFlag,
+				remoteCheck:   remoteCheckFlag,
+				remoteURL:     remoteURLFlag,
+				remoteToken:   remoteTokenFlag,
+				remoteTimeout: remoteTimeoutFlag,
+				strict:        strictFlag,
+				jsonOutput:    jsonFlag,
 			})
 
 			if jsonFlag {
@@ -152,6 +168,10 @@ Examples:
 	cmd.Flags().BoolVar(&probeFlag, "probe", false, "run live provider probe requests (network/API/CLI)")
 	cmd.Flags().DurationVar(&probeTimeoutFlag, "probe-timeout", 45*time.Second, "timeout per live probe request")
 	cmd.Flags().IntVar(&probeRetriesFlag, "probe-retries", defaultDoctorProbeRetries, "retry count per provider during live probe")
+	cmd.Flags().BoolVar(&remoteCheckFlag, "remote-check", false, "verify the configured or supplied remote makewand server via /health and /v1/models")
+	cmd.Flags().StringVar(&remoteURLFlag, "remote-url", "", "remote makewand server URL to verify (defaults to MAKEWAND_REMOTE_URL)")
+	cmd.Flags().StringVar(&remoteTokenFlag, "remote-token", "", "Bearer token used for remote verification (defaults to MAKEWAND_REMOTE_TOKEN)")
+	cmd.Flags().DurationVar(&remoteTimeoutFlag, "remote-timeout", 10*time.Second, "timeout for each remote verification request")
 	cmd.Flags().BoolVar(&strictFlag, "strict", false, "treat warnings as failures")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "output report as JSON")
 	return cmd
@@ -232,6 +252,9 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 	report.DetectedProviders = detectConfiguredProviders(cfg)
 	if check, ok := remoteBackendDoctorCheck(); ok {
 		report.Checks = append(report.Checks, check)
+	}
+	if opts.remoteCheck {
+		report.Checks = append(report.Checks, runRemoteDoctorChecks(resolveRemoteDoctorTarget(opts))...)
 	}
 	if check, ok := customProviderDoctorCheck(cfg); ok {
 		report.Checks = append(report.Checks, check)
@@ -458,6 +481,131 @@ func remoteBackendDoctorCheck() (doctorCheck, bool) {
 			Details: fmt.Sprintf("partial remote backend configuration; missing %s", strings.Join(missingRemoteBackendEnvVars(url, token), ", ")),
 		}, true
 	}
+}
+
+type remoteDoctorTarget struct {
+	url     string
+	token   string
+	timeout time.Duration
+}
+
+func resolveRemoteDoctorTarget(opts doctorOptions) remoteDoctorTarget {
+	url := strings.TrimRight(strings.TrimSpace(opts.remoteURL), "/")
+	if url == "" {
+		url = config.RemoteBaseURL()
+	}
+	token := strings.TrimSpace(opts.remoteToken)
+	if token == "" {
+		token = config.RemoteToken()
+	}
+	timeout := opts.remoteTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return remoteDoctorTarget{
+		url:     url,
+		token:   token,
+		timeout: timeout,
+	}
+}
+
+func runRemoteDoctorChecks(target remoteDoctorTarget) []doctorCheck {
+	checks := make([]doctorCheck, 0, 2)
+	switch {
+	case target.url == "" && target.token == "":
+		return append(checks, doctorCheck{
+			Name:    "remote service",
+			Status:  doctorFail,
+			Details: "remote check requested but no remote backend is configured",
+		})
+	case target.url == "" || target.token == "":
+		return append(checks, doctorCheck{
+			Name:    "remote service",
+			Status:  doctorFail,
+			Details: fmt.Sprintf("remote check requested but missing %s", strings.Join(missingRemoteBackendEnvVars(target.url, target.token), ", ")),
+		})
+	}
+
+	client := &http.Client{Timeout: target.timeout}
+	healthURL := target.url + "/health"
+	resp, err := client.Get(healthURL)
+	if err != nil {
+		return append(checks, doctorCheck{
+			Name:    "remote service health",
+			Status:  doctorFail,
+			Details: err.Error(),
+		})
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service health",
+			Status:  doctorFail,
+			Details: fmt.Sprintf("%s returned HTTP %d", healthURL, resp.StatusCode),
+		})
+	} else {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service health",
+			Status:  doctorPass,
+			Details: healthURL,
+		})
+	}
+
+	req, err := http.NewRequest(http.MethodGet, target.url+"/v1/models", nil)
+	if err != nil {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: err.Error(),
+		})
+		return checks
+	}
+	req.Header.Set("Authorization", "Bearer "+target.token)
+	resp, err = client.Do(req)
+	if err != nil {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: err.Error(),
+		})
+		return checks
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: fmt.Sprintf("/v1/models returned HTTP %d", resp.StatusCode),
+		})
+		return checks
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: "invalid JSON: " + err.Error(),
+		})
+		return checks
+	}
+	modelIDs := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if strings.TrimSpace(item.ID) != "" {
+			modelIDs = append(modelIDs, item.ID)
+		}
+	}
+	sort.Strings(modelIDs)
+	checks = append(checks, doctorCheck{
+		Name:    "remote service models",
+		Status:  doctorPass,
+		Details: strings.Join(modelIDs, ", "),
+	})
+	return checks
 }
 
 func printDoctorReport(report doctorReport) {

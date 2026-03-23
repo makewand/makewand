@@ -70,6 +70,12 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			event.TokenID = grant.TokenID()
 			event.TokenDescription = grant.Description()
 		}
+		if !grant.AllowRequestAt(time.Now()) {
+			event.Status = http.StatusTooManyRequests
+			event.Error = "token exceeded max_requests_per_hour"
+			http.Error(w, "token exceeded max_requests_per_hour", http.StatusTooManyRequests)
+			return
+		}
 		workspaceID, ok := sessionIDFromPath(req.URL.Path)
 		if !ok {
 			event.Status = http.StatusNotFound
