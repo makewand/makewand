@@ -13,6 +13,7 @@ import (
 	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/remotesession"
 	"github.com/makewand/makewand/router"
+	"github.com/makewand/makewand/serverauth"
 	"github.com/spf13/cobra"
 )
 
@@ -21,6 +22,7 @@ func serveCmd() *cobra.Command {
 		listenAddr string
 		token      string
 		dataDir    string
+		authConfig string
 	)
 
 	cmd := &cobra.Command{
@@ -33,11 +35,9 @@ func serveCmd() *cobra.Command {
 				return fmt.Errorf("no local AI models configured on this host; run 'makewand setup' first")
 			}
 
-			if strings.TrimSpace(token) == "" {
-				token = strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_TOKEN"))
-			}
-			if strings.TrimSpace(token) == "" {
-				return fmt.Errorf("serve requires --token or MAKEWAND_SERVER_TOKEN")
+			authz, err := loadServeAuthorizer(token, authConfig)
+			if err != nil {
+				return err
 			}
 
 			if strings.TrimSpace(dataDir) == "" {
@@ -58,11 +58,11 @@ func serveCmd() *cobra.Command {
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
 
 			base := rtr.HTTPHandler(router.HTTPHandlerOptions{
-				BearerToken: token,
-				StatsDir:    statsDir,
+				Authorizer: authz,
+				StatsDir:   statsDir,
 			})
 			mux := http.NewServeMux()
-			mux.Handle("/v1/sessions/", remotesession.NewHandler(sessions, token))
+			mux.Handle("/v1/sessions/", remotesession.NewHandlerWithAuthorizer(sessions, authz))
 			mux.Handle("/", base)
 
 			server := &http.Server{
@@ -89,8 +89,32 @@ func serveCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&listenAddr, "listen", "127.0.0.1:8080", "listen address for the personal makewand server")
 	cmd.Flags().StringVar(&token, "token", "", "Bearer token required by remote clients")
+	cmd.Flags().StringVar(&authConfig, "auth-config", "", "path to JSON auth config with scoped tokens")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "directory used to persist remote sessions (default: ~/.config/makewand/server)")
 	return cmd
+}
+
+func loadServeAuthorizer(token, authConfig string) (*serverauth.Authorizer, error) {
+	authConfig = strings.TrimSpace(authConfig)
+	if authConfig == "" {
+		authConfig = strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_AUTH_CONFIG"))
+	}
+	if authConfig != "" {
+		authz, err := serverauth.LoadFile(authConfig)
+		if err != nil {
+			return nil, fmt.Errorf("load auth config: %w", err)
+		}
+		return authz, nil
+	}
+
+	token = strings.TrimSpace(token)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_TOKEN"))
+	}
+	if token == "" {
+		return nil, fmt.Errorf("serve requires --token, MAKEWAND_SERVER_TOKEN, --auth-config, or MAKEWAND_SERVER_AUTH_CONFIG")
+	}
+	return serverauth.NewSingleTokenAuthorizer(token), nil
 }
 
 func serveRouter(cfg *config.Config) *model.Router {

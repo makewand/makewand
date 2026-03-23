@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/makewand/makewand/serverauth"
 )
 
 func TestHTTPHandler_ChatCompletions(t *testing.T) {
@@ -304,6 +306,192 @@ func TestHTTPHandler_BearerAuth_HealthBypassesAuth(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("health should bypass auth, got status %d", rec.Code)
+	}
+}
+
+func TestHTTPHandler_AuthorizerRejectsMissingScope(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{Token: "secret123", Scopes: []string{serverauth.ScopeChatInvoke}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	r := NewRouterFromConfig(RouterConfig{})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret123")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestHTTPHandler_AuthorizerFiltersModelList(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:            "secret123",
+				Scopes:           []string{serverauth.ScopeModelsRead},
+				AllowedProviders: []string{"codex"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	claude := &stubProvider{name: "claude", available: true}
+	codex := &stubProvider{name: "codex", available: true}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: claude, Access: AccessSubscription},
+			"codex":  {Provider: codex, Access: AccessSubscription},
+		},
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret123")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0].ID != "codex" {
+		t.Fatalf("models = %+v, want [codex]", resp.Data)
+	}
+}
+
+func TestHTTPHandler_AuthorizerRejectsDisallowedMode(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:        "secret123",
+				Scopes:       []string{serverauth.ScopeChatInvoke},
+				AllowedModes: []string{"fast"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		UsageMode: "balanced",
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
+	body := `{"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_AuthorizerRejectsDisallowedProviderOverride(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:            "secret123",
+				Scopes:           []string{serverauth.ScopeChatInvoke},
+				AllowedProviders: []string{"claude"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
+	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: claude, Access: AccessSubscription},
+			"gemini": {Provider: gemini, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
+	body := `{"model":"gemini","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_AuthorizerFiltersAdaptiveProviders(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:            "secret123",
+				Scopes:           []string{serverauth.ScopeChatInvoke},
+				AllowedProviders: []string{"claude"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
+	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: claude, Access: AccessSubscription},
+			"gemini": {Provider: gemini, Access: AccessSubscription},
+		},
+		UsageMode: "balanced",
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
+	body := `{"messages":[{"role":"user","content":"write a helper function"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpChatResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Choices[0].Message.Content != "hello from claude" {
+		t.Fatalf("content = %q, want %q", resp.Choices[0].Message.Content, "hello from claude")
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/makewand/makewand/serverauth"
 )
 
 func TestClientRoundTrip(t *testing.T) {
@@ -32,5 +34,35 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 	if _, err := client.Load(context.Background(), "workspace-1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Load after delete error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestClientRoundTrip_ScopedWorkspacePrefix(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:             "secret",
+				Scopes:            []string{serverauth.ScopeSessionsRead, serverauth.ScopeSessionsWrite, serverauth.ScopeSessionsDelete},
+				WorkspacePrefixes: []string{"repo-"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	store := NewStore(t.TempDir())
+	server := httptest.NewServer(NewHandlerWithAuthorizer(store, authz))
+	defer server.Close()
+
+	client := NewClient(server.URL, "secret")
+	data := []byte(`{"saved_at":"2026-03-17T00:00:00Z","messages":[{"role":"user","content":"hi"}]}`)
+
+	if err := client.Save(context.Background(), "repo-1", data); err != nil {
+		t.Fatalf("Save(repo-1): %v", err)
+	}
+
+	if err := client.Save(context.Background(), "other-1", data); err == nil {
+		t.Fatal("Save(other-1) error = nil, want forbidden error")
 	}
 }

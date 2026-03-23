@@ -11,13 +11,14 @@
 package router
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/makewand/makewand/serverauth"
 )
 
 // httpChatRequest is the subset of the OpenAI chat completions request we support.
@@ -74,6 +75,11 @@ type HTTPHandlerOptions struct {
 	// The /health endpoint is always unauthenticated.
 	BearerToken string
 
+	// Authorizer enables scoped multi-token auth. When set, it takes precedence
+	// over BearerToken and can restrict scopes, session prefixes, providers, and
+	// modes on a per-token basis.
+	Authorizer *serverauth.Authorizer
+
 	// StatsDir enables routing stats persistence after chat requests.
 	// When empty, HTTP requests do not read or write routing_stats.json.
 	StatsDir string
@@ -94,10 +100,11 @@ func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	authz := authorizerForHTTPOptions(opt)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", r.requireAuth(opt.BearerToken, r.handleChatCompletionsWithOptions(opt)))
-	mux.HandleFunc("/v1/models", r.requireAuth(opt.BearerToken, r.handleListModels))
+	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, r.handleChatCompletionsWithOptions(opt)))
+	mux.HandleFunc("/v1/models", r.requireScope(authz, serverauth.ScopeModelsRead, r.handleListModelsWithGrant))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -105,29 +112,45 @@ func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	return mux
 }
 
-// requireAuth wraps a handler with Bearer token authentication.
-// When token is empty, the handler is returned as-is (no auth required).
-func (r *Router) requireAuth(token string, next http.HandlerFunc) http.HandlerFunc {
-	if token == "" {
-		return next
+type scopedHTTPHandler func(w http.ResponseWriter, req *http.Request, grant *serverauth.Grant)
+
+func authorizerForHTTPOptions(opt HTTPHandlerOptions) *serverauth.Authorizer {
+	if opt.Authorizer != nil {
+		return opt.Authorizer
 	}
-	expected := "Bearer " + token
+	if strings.TrimSpace(opt.BearerToken) != "" {
+		return serverauth.NewSingleTokenAuthorizer(opt.BearerToken)
+	}
+	return nil
+}
+
+func (r *Router) requireScope(authz *serverauth.Authorizer, scope string, next scopedHTTPHandler) http.HandlerFunc {
+	if authz == nil {
+		return func(w http.ResponseWriter, req *http.Request) {
+			next(w, req, nil)
+		}
+	}
 	return func(w http.ResponseWriter, req *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(req.Header.Get("Authorization")), []byte(expected)) != 1 {
+		grant, ok := authz.AuthenticateRequest(req)
+		if !ok {
 			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing Bearer token")
 			return
 		}
-		next(w, req)
+		if !grant.AllowsScope(scope) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("token does not allow scope %q", scope))
+			return
+		}
+		next(w, req, grant)
 	}
 }
 
-func (r *Router) handleChatCompletionsWithOptions(opt HTTPHandlerOptions) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
-		r.handleChatCompletions(w, req, opt)
+func (r *Router) handleChatCompletionsWithOptions(opt HTTPHandlerOptions) scopedHTTPHandler {
+	return func(w http.ResponseWriter, req *http.Request, grant *serverauth.Grant) {
+		r.handleChatCompletions(w, req, opt, grant)
 	}
 }
 
-func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request, opt HTTPHandlerOptions) {
+func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request, opt HTTPHandlerOptions, grant *serverauth.Grant) {
 	if req.Method != http.MethodPost {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
 		return
@@ -156,6 +179,25 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	if modeErr != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", modeErr.Error())
 		return
+	}
+
+	effectiveMode := activeRouter.effectiveMode().String()
+	if !grant.AllowsMode(effectiveMode) {
+		writeHTTPError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("token is not permitted to use mode %q", effectiveMode))
+		return
+	}
+
+	requestedModel := strings.ToLower(strings.TrimSpace(chatReq.Model))
+	if requestedModel != "" && !grant.AllowsProvider(requestedModel) {
+		writeHTTPError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("token is not permitted to use provider %q", chatReq.Model))
+		return
+	}
+	if allowedProviders := grant.AllowedProviders(); len(allowedProviders) > 0 {
+		activeRouter = activeRouter.cloneWithProviderAllowlist(allowedProviders)
+		if len(activeRouter.registeredProviderNames()) == 0 {
+			writeHTTPError(w, http.StatusForbidden, "forbidden", "token is not permitted to use any configured providers")
+			return
+		}
 	}
 	defer activeRouter.persistHTTPStats(opt.StatsDir)
 
@@ -186,7 +228,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		result  RouteResult
 		err     error
 	)
-	if requestedModel := strings.ToLower(strings.TrimSpace(chatReq.Model)); requestedModel != "" {
+	if requestedModel != "" {
 		if !containsString(activeRouter.registeredProviderNames(), requestedModel) {
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model))
 			return
@@ -256,6 +298,10 @@ func (r *Router) persistHTTPStats(statsDir string) {
 }
 
 func (r *Router) handleListModels(w http.ResponseWriter, req *http.Request) {
+	r.handleListModelsWithGrant(w, req, nil)
+}
+
+func (r *Router) handleListModelsWithGrant(w http.ResponseWriter, req *http.Request, grant *serverauth.Grant) {
 	if req.Method != http.MethodGet {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET is supported")
 		return
@@ -271,7 +317,12 @@ func (r *Router) handleListModels(w http.ResponseWriter, req *http.Request) {
 		Data   []modelEntry `json:"data"`
 	}
 
-	avail := r.Available()
+	activeRouter := r
+	if allowedProviders := grant.AllowedProviders(); len(allowedProviders) > 0 {
+		activeRouter = r.cloneWithProviderAllowlist(allowedProviders)
+	}
+
+	avail := activeRouter.Available()
 	data := make([]modelEntry, 0, len(avail))
 	for _, name := range avail {
 		data = append(data, modelEntry{

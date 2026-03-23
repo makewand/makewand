@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/serverauth"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -271,12 +272,13 @@ func (r *Router) HTTPHandlerWithUsers(userStore *UserStore, opts ...HTTPHandlerO
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	authz := authorizerForHTTPOptions(opt)
 
 	mux := http.NewServeMux()
 
 	// Existing endpoints
-	mux.HandleFunc("/v1/chat/completions", r.requireAuth(opt.BearerToken, r.handleChatCompletionsWithOptions(opt)))
-	mux.HandleFunc("/v1/models", r.requireAuth(opt.BearerToken, r.handleListModels))
+	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, r.handleChatCompletionsWithOptions(opt)))
+	mux.HandleFunc("/v1/models", r.requireScope(authz, serverauth.ScopeModelsRead, r.handleListModelsWithGrant))
 
 	// User management endpoints
 	mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore))

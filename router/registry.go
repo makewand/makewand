@@ -16,6 +16,9 @@ func (r *Router) registeredProviderNames() []string {
 
 	names := make([]string, 0, len(r.providers))
 	for name := range r.providers {
+		if !r.isProviderAllowed(name) {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -26,6 +29,9 @@ func (r *Router) registeredProviderNames() []string {
 // It caches instances so the same (provider, model) combination reuses the same instance.
 func (r *Router) resolveProvider(providerName, modelID string) (Provider, error) {
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
+	if !r.isProviderAllowed(providerName) {
+		return nil, fmt.Errorf("provider %q is not allowed", providerName)
+	}
 	key := providerKey{name: providerName, modelID: modelID}
 
 	r.providerMu.Lock()
@@ -63,6 +69,9 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 
 // Get returns a specific provider by name.
 func (r *Router) Get(name string) (Provider, error) {
+	if !r.isProviderAllowed(name) {
+		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q is not allowed", name), nil)
+	}
 	r.providerMu.Lock()
 	p, ok := r.providers[name]
 	r.providerMu.Unlock()
@@ -122,6 +131,9 @@ func (r *Router) Available() []string {
 	r.providerMu.Lock()
 	var names []string
 	for name, p := range r.providers {
+		if !r.isProviderAllowed(name) {
+			continue
+		}
 		if p.IsAvailable() {
 			if blocked, _ := r.isCircuitOpen(name); blocked {
 				continue
@@ -139,6 +151,9 @@ func (r *Router) Available() []string {
 
 // getProvider returns a provider by name (thread-safe).
 func (r *Router) getProvider(name string) (Provider, bool) {
+	if !r.isProviderAllowed(name) {
+		return nil, false
+	}
 	r.providerMu.Lock()
 	defer r.providerMu.Unlock()
 	p, ok := r.providers[name]
@@ -146,6 +161,9 @@ func (r *Router) getProvider(name string) (Provider, bool) {
 }
 
 func (r *Router) remoteOnlyProvider() (string, Provider, bool) {
+	if !r.isProviderAllowed("remote") {
+		return "", nil, false
+	}
 	r.providerMu.Lock()
 	defer r.providerMu.Unlock()
 
@@ -167,6 +185,9 @@ func (r *Router) IsSubscription(name string) bool {
 }
 
 func (r *Router) isBuildProviderAvailable(name, modelID string) bool {
+	if !r.isProviderAllowed(name) {
+		return false
+	}
 	r.providerMu.Lock()
 	defer r.providerMu.Unlock()
 
