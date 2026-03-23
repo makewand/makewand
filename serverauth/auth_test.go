@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestNewAuthorizer_ValidatesRules(t *testing.T) {
@@ -27,6 +28,7 @@ func TestAuthorizer_AuthenticatesScopedGrant(t *testing.T) {
 	authz, err := NewAuthorizer(Config{
 		Tokens: []TokenRule{
 			{
+				ID:                "runner",
 				Token:             "secret",
 				Scopes:            []string{ScopeChatInvoke, ScopeSessionsRead},
 				WorkspacePrefixes: []string{"repo-"},
@@ -69,6 +71,9 @@ func TestAuthorizer_AuthenticatesScopedGrant(t *testing.T) {
 	if grant.AllowsMode("power") {
 		t.Fatal("AllowsMode(power) = true, want false")
 	}
+	if got := grant.TokenID(); got != "runner" {
+		t.Fatalf("TokenID() = %q, want %q", got, "runner")
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -96,5 +101,61 @@ func TestLoadFile(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer secret")
 	if _, ok := authz.AuthenticateRequest(req); !ok {
 		t.Fatal("AuthenticateRequest() = false, want true")
+	}
+}
+
+func TestAuthorizer_RejectsRevokedAndExpiredTokens(t *testing.T) {
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	authz, err := NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{
+				Token:     "revoked",
+				Scopes:    []string{ScopeModelsRead},
+				Revoked:   true,
+				ExpiresAt: time.Now().UTC().Add(time.Hour),
+			},
+			{
+				Token:     "expired",
+				Scopes:    []string{ScopeModelsRead},
+				ExpiresAt: expiredAt,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	if _, ok := authz.AuthenticateHeader("Bearer revoked"); ok {
+		t.Fatal("AuthenticateHeader(revoked) = true, want false")
+	}
+	if _, ok := authz.AuthenticateHeader("Bearer expired"); ok {
+		t.Fatal("AuthenticateHeader(expired) = true, want false")
+	}
+}
+
+func TestNewAuthorizer_DefaultTokenIDIsStableAndUnique(t *testing.T) {
+	authz, err := NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{Token: "alpha", Scopes: []string{ScopeModelsRead}},
+			{Token: "beta", Scopes: []string{ScopeModelsRead}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	alpha, ok := authz.AuthenticateHeader("Bearer alpha")
+	if !ok {
+		t.Fatal("AuthenticateHeader(alpha) = false, want true")
+	}
+	beta, ok := authz.AuthenticateHeader("Bearer beta")
+	if !ok {
+		t.Fatal("AuthenticateHeader(beta) = false, want true")
+	}
+	if alpha.TokenID() == "" {
+		t.Fatal("alpha.TokenID() = empty, want derived ID")
+	}
+	if alpha.TokenID() == beta.TokenID() {
+		t.Fatalf("derived token IDs must be unique; both were %q", alpha.TokenID())
 	}
 }

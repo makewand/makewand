@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 )
 
@@ -83,6 +84,9 @@ type HTTPHandlerOptions struct {
 	// StatsDir enables routing stats persistence after chat requests.
 	// When empty, HTTP requests do not read or write routing_stats.json.
 	StatsDir string
+
+	// AuditLogger receives one event per handled request when non-nil.
+	AuditLogger serveraudit.Logger
 }
 
 // HTTPHandler returns an http.Handler that serves an OpenAI-compatible subset
@@ -103,8 +107,8 @@ func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	authz := authorizerForHTTPOptions(opt)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, r.handleChatCompletionsWithOptions(opt)))
-	mux.HandleFunc("/v1/models", r.requireScope(authz, serverauth.ScopeModelsRead, r.handleListModelsWithGrant))
+	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, opt.AuditLogger, r.handleChatCompletionsWithOptions(opt)))
+	mux.HandleFunc("/v1/models", r.requireScope(authz, serverauth.ScopeModelsRead, opt.AuditLogger, r.handleListModelsWithOptions(opt)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -124,7 +128,7 @@ func authorizerForHTTPOptions(opt HTTPHandlerOptions) *serverauth.Authorizer {
 	return nil
 }
 
-func (r *Router) requireScope(authz *serverauth.Authorizer, scope string, next scopedHTTPHandler) http.HandlerFunc {
+func (r *Router) requireScope(authz *serverauth.Authorizer, scope string, logger serveraudit.Logger, next scopedHTTPHandler) http.HandlerFunc {
 	if authz == nil {
 		return func(w http.ResponseWriter, req *http.Request) {
 			next(w, req, nil)
@@ -134,10 +138,12 @@ func (r *Router) requireScope(authz *serverauth.Authorizer, scope string, next s
 		grant, ok := authz.AuthenticateRequest(req)
 		if !ok {
 			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing Bearer token")
+			logHTTPAudit(logger, auditBaseEvent(req, nil, scope), http.StatusUnauthorized, "", "")
 			return
 		}
 		if !grant.AllowsScope(scope) {
 			writeHTTPError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("token does not allow scope %q", scope))
+			logHTTPAudit(logger, auditBaseEvent(req, grant, scope), http.StatusForbidden, "", "")
 			return
 		}
 		next(w, req, grant)
@@ -151,18 +157,36 @@ func (r *Router) handleChatCompletionsWithOptions(opt HTTPHandlerOptions) scoped
 }
 
 func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request, opt HTTPHandlerOptions, grant *serverauth.Grant) {
+	start := time.Now()
+	auditEvent := auditBaseEvent(req, grant, serverauth.ScopeChatInvoke)
+	auditEvent.Kind = "chat"
+	defer func() {
+		if auditEvent.DurationMS == 0 {
+			auditEvent.DurationMS = time.Since(start).Milliseconds()
+		}
+		logHTTPAudit(opt.AuditLogger, auditEvent, auditEvent.Status, auditEvent.ActualProvider, auditEvent.Error)
+	}()
+
 	if req.Method != http.MethodPost {
+		auditEvent.Status = http.StatusMethodNotAllowed
+		auditEvent.Error = "only POST is supported"
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
 		return
 	}
 
 	var chatReq httpChatRequest
 	if err := json.NewDecoder(req.Body).Decode(&chatReq); err != nil {
+		auditEvent.Status = http.StatusBadRequest
+		auditEvent.Error = "invalid JSON: " + err.Error()
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
 		return
 	}
+	auditEvent.RequestedMode = strings.ToLower(strings.TrimSpace(chatReq.Mode))
+	auditEvent.RequestedModel = strings.ToLower(strings.TrimSpace(chatReq.Model))
 
 	if chatReq.Stream {
+		auditEvent.Status = http.StatusBadRequest
+		auditEvent.Error = "streaming is not yet supported via HTTP; use the Go API directly"
 		writeHTTPError(w, http.StatusBadRequest, "unsupported", "streaming is not yet supported via HTTP; use the Go API directly")
 		return
 	}
@@ -171,30 +195,41 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	// break otherwise valid requests.
 
 	if len(chatReq.Messages) == 0 {
+		auditEvent.Status = http.StatusBadRequest
+		auditEvent.Error = "messages array is empty"
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "messages array is empty")
 		return
 	}
 
 	activeRouter, modeErr := r.routerForHTTPMode(chatReq.Mode)
 	if modeErr != nil {
+		auditEvent.Status = http.StatusBadRequest
+		auditEvent.Error = modeErr.Error()
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", modeErr.Error())
 		return
 	}
 
 	effectiveMode := activeRouter.effectiveMode().String()
+	auditEvent.RequestedMode = effectiveMode
 	if !grant.AllowsMode(effectiveMode) {
+		auditEvent.Status = http.StatusForbidden
+		auditEvent.Error = fmt.Sprintf("token is not permitted to use mode %q", effectiveMode)
 		writeHTTPError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("token is not permitted to use mode %q", effectiveMode))
 		return
 	}
 
 	requestedModel := strings.ToLower(strings.TrimSpace(chatReq.Model))
 	if requestedModel != "" && !grant.AllowsProvider(requestedModel) {
+		auditEvent.Status = http.StatusForbidden
+		auditEvent.Error = fmt.Sprintf("token is not permitted to use provider %q", chatReq.Model)
 		writeHTTPError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("token is not permitted to use provider %q", chatReq.Model))
 		return
 	}
 	if allowedProviders := grant.AllowedProviders(); len(allowedProviders) > 0 {
 		activeRouter = activeRouter.cloneWithProviderAllowlist(allowedProviders)
 		if len(activeRouter.registeredProviderNames()) == 0 {
+			auditEvent.Status = http.StatusForbidden
+			auditEvent.Error = "token is not permitted to use any configured providers"
 			writeHTTPError(w, http.StatusForbidden, "forbidden", "token is not permitted to use any configured providers")
 			return
 		}
@@ -230,6 +265,8 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	)
 	if requestedModel != "" {
 		if !containsString(activeRouter.registeredProviderNames(), requestedModel) {
+			auditEvent.Status = http.StatusBadRequest
+			auditEvent.Error = fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model)
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model))
 			return
 		}
@@ -242,6 +279,8 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		if strings.Contains(err.Error(), "not configured") {
 			status = http.StatusBadRequest
 		}
+		auditEvent.Status = status
+		auditEvent.Error = err.Error()
 		writeHTTPError(w, status, "provider_error", err.Error())
 		return
 	}
@@ -271,6 +310,12 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+	auditEvent.Status = http.StatusOK
+	auditEvent.ActualProvider = strings.TrimSpace(usage.Provider)
+	if auditEvent.ActualProvider == "" {
+		auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
+	}
+	auditEvent.DurationMS = time.Since(start).Milliseconds()
 }
 
 func (r *Router) routerForHTTPMode(requestedMode string) (*Router, error) {
@@ -298,11 +343,29 @@ func (r *Router) persistHTTPStats(statsDir string) {
 }
 
 func (r *Router) handleListModels(w http.ResponseWriter, req *http.Request) {
-	r.handleListModelsWithGrant(w, req, nil)
+	r.handleListModelsWithGrant(w, req, nil, nil)
 }
 
-func (r *Router) handleListModelsWithGrant(w http.ResponseWriter, req *http.Request, grant *serverauth.Grant) {
+func (r *Router) handleListModelsWithOptions(opt HTTPHandlerOptions) scopedHTTPHandler {
+	return func(w http.ResponseWriter, req *http.Request, grant *serverauth.Grant) {
+		r.handleListModelsWithGrant(w, req, grant, opt.AuditLogger)
+	}
+}
+
+func (r *Router) handleListModelsWithGrant(w http.ResponseWriter, req *http.Request, grant *serverauth.Grant, logger serveraudit.Logger) {
+	start := time.Now()
+	auditEvent := auditBaseEvent(req, grant, serverauth.ScopeModelsRead)
+	auditEvent.Kind = "models"
+	defer func() {
+		if auditEvent.DurationMS == 0 {
+			auditEvent.DurationMS = time.Since(start).Milliseconds()
+		}
+		logHTTPAudit(logger, auditEvent, auditEvent.Status, "", auditEvent.Error)
+	}()
+
 	if req.Method != http.MethodGet {
+		auditEvent.Status = http.StatusMethodNotAllowed
+		auditEvent.Error = "only GET is supported"
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET is supported")
 		return
 	}
@@ -334,6 +397,8 @@ func (r *Router) handleListModelsWithGrant(w http.ResponseWriter, req *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(modelsResponse{Object: "list", Data: data})
+	auditEvent.Status = http.StatusOK
+	auditEvent.DurationMS = time.Since(start).Milliseconds()
 }
 
 func writeHTTPError(w http.ResponseWriter, status int, code, message string) {
@@ -355,4 +420,48 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func auditBaseEvent(req *http.Request, grant *serverauth.Grant, scope string) serveraudit.Event {
+	event := serveraudit.Event{
+		Timestamp: time.Now().UTC(),
+		Scope:     scope,
+	}
+	if req != nil {
+		event.Kind = httpAuditKind(req.URL.Path)
+		event.Method = req.Method
+		event.Path = req.URL.Path
+	}
+	if grant != nil {
+		event.TokenID = grant.TokenID()
+		event.TokenDescription = grant.Description()
+	}
+	return event
+}
+
+func logHTTPAudit(logger serveraudit.Logger, event serveraudit.Event, status int, actualProvider, errText string) {
+	if logger == nil {
+		return
+	}
+	if event.Status == 0 {
+		event.Status = status
+	}
+	if event.ActualProvider == "" {
+		event.ActualProvider = actualProvider
+	}
+	if event.Error == "" {
+		event.Error = errText
+	}
+	logger.Log(event)
+}
+
+func httpAuditKind(path string) string {
+	switch path {
+	case "/v1/chat/completions":
+		return "chat"
+	case "/v1/models":
+		return "models"
+	default:
+		return "http"
+	}
 }

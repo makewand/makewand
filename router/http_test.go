@@ -10,8 +10,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 )
+
+type auditRecorder struct {
+	events []serveraudit.Event
+}
+
+func (r *auditRecorder) Log(event serveraudit.Event) {
+	r.events = append(r.events, event)
+}
 
 func TestHTTPHandler_ChatCompletions(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
@@ -492,6 +501,104 @@ func TestHTTPHandler_AuthorizerFiltersAdaptiveProviders(t *testing.T) {
 	}
 	if resp.Choices[0].Message.Content != "hello from claude" {
 		t.Fatalf("content = %q, want %q", resp.Choices[0].Message.Content, "hello from claude")
+	}
+}
+
+func TestHTTPHandler_AuditLogsSuccessfulChat(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:           "runner",
+				Token:        "secret123",
+				Scopes:       []string{serverauth.ScopeChatInvoke},
+				AllowedModes: []string{"balanced"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	recorder := &auditRecorder{}
+	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+		UsageMode:    "balanced",
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, AuditLogger: recorder})
+	body := `{"messages":[{"role":"user","content":"write a helper function"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+	event := recorder.events[0]
+	if event.Kind != "chat" {
+		t.Fatalf("Kind = %q, want %q", event.Kind, "chat")
+	}
+	if event.TokenID != "runner" {
+		t.Fatalf("TokenID = %q, want %q", event.TokenID, "runner")
+	}
+	if event.Status != http.StatusOK {
+		t.Fatalf("Status = %d, want 200", event.Status)
+	}
+	if event.ActualProvider != "claude" {
+		t.Fatalf("ActualProvider = %q, want %q", event.ActualProvider, "claude")
+	}
+	if event.Timestamp.IsZero() {
+		t.Fatal("Timestamp = zero, want populated audit timestamp")
+	}
+}
+
+func TestHTTPHandler_AuditLogsForbiddenModelsScope(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:     "viewer",
+				Token:  "secret123",
+				Scopes: []string{serverauth.ScopeChatInvoke},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	recorder := &auditRecorder{}
+	r := NewRouterFromConfig(RouterConfig{})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, AuditLogger: recorder})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret123")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+	event := recorder.events[0]
+	if event.Kind != "models" {
+		t.Fatalf("Kind = %q, want %q", event.Kind, "models")
+	}
+	if event.Scope != serverauth.ScopeModelsRead {
+		t.Fatalf("Scope = %q, want %q", event.Scope, serverauth.ScopeModelsRead)
+	}
+	if event.Status != http.StatusForbidden {
+		t.Fatalf("Status = %d, want 403", event.Status)
 	}
 }
 

@@ -277,8 +277,8 @@ func (r *Router) HTTPHandlerWithUsers(userStore *UserStore, opts ...HTTPHandlerO
 	mux := http.NewServeMux()
 
 	// Existing endpoints
-	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, r.handleChatCompletionsWithOptions(opt)))
-	mux.HandleFunc("/v1/models", r.requireScope(authz, serverauth.ScopeModelsRead, r.handleListModelsWithGrant))
+	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, opt.AuditLogger, r.handleChatCompletionsWithOptions(opt)))
+	mux.HandleFunc("/v1/models", r.requireScope(authz, serverauth.ScopeModelsRead, opt.AuditLogger, r.handleListModelsWithOptions(opt)))
 
 	// User management endpoints
 	mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore))

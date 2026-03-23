@@ -1,0 +1,115 @@
+package remotesession
+
+import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/makewand/makewand/serveraudit"
+	"github.com/makewand/makewand/serverauth"
+)
+
+type auditRecorder struct {
+	events []serveraudit.Event
+}
+
+func (r *auditRecorder) Log(event serveraudit.Event) {
+	r.events = append(r.events, event)
+}
+
+func TestHandlerWithOptions_AuditLogsSuccessfulWrite(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:                "runner",
+				Token:             "secret",
+				Scopes:            []string{serverauth.ScopeSessionsWrite},
+				WorkspacePrefixes: []string{"repo-"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	recorder := &auditRecorder{}
+	store := NewStore(t.TempDir())
+	handler := NewHandlerWithOptions(store, HandlerOptions{
+		Authorizer:  authz,
+		AuditLogger: recorder,
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/v1/sessions/repo-main", bytes.NewBufferString(`{"version":1}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+	event := recorder.events[0]
+	if event.Kind != "session" {
+		t.Fatalf("Kind = %q, want %q", event.Kind, "session")
+	}
+	if event.TokenID != "runner" {
+		t.Fatalf("TokenID = %q, want %q", event.TokenID, "runner")
+	}
+	if event.Scope != serverauth.ScopeSessionsWrite {
+		t.Fatalf("Scope = %q, want %q", event.Scope, serverauth.ScopeSessionsWrite)
+	}
+	if event.WorkspaceID != "repo-main" {
+		t.Fatalf("WorkspaceID = %q, want %q", event.WorkspaceID, "repo-main")
+	}
+	if event.Status != http.StatusNoContent {
+		t.Fatalf("Status = %d, want 204", event.Status)
+	}
+}
+
+func TestHandlerWithOptions_AuditLogsForbiddenWorkspace(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:                "runner",
+				Token:             "secret",
+				Scopes:            []string{serverauth.ScopeSessionsWrite},
+				WorkspacePrefixes: []string{"repo-"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	recorder := &auditRecorder{}
+	store := NewStore(t.TempDir())
+	handler := NewHandlerWithOptions(store, HandlerOptions{
+		Authorizer:  authz,
+		AuditLogger: recorder,
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/v1/sessions/other-main", bytes.NewBufferString(`{"version":1}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+	event := recorder.events[0]
+	if event.WorkspaceID != "other-main" {
+		t.Fatalf("WorkspaceID = %q, want %q", event.WorkspaceID, "other-main")
+	}
+	if event.Status != http.StatusForbidden {
+		t.Fatalf("Status = %d, want 403", event.Status)
+	}
+	if event.Error == "" {
+		t.Fatal("Error = empty, want forbidden audit message")
+	}
+}
