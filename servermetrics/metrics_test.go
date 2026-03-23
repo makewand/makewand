@@ -34,3 +34,22 @@ func TestRecorder_MiddlewareAndRenderPrometheus(t *testing.T) {
 		t.Fatalf("metrics output missing request counter: %s", rendered)
 	}
 }
+
+func TestRecorder_MiddlewarePreservesFlusher(t *testing.T) {
+	recorder := NewRecorder()
+	handler := recorder.Middleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("wrapped response writer does not implement http.Flusher")
+		}
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stream", nil))
+
+	if !rec.Flushed {
+		t.Fatal("underlying recorder was not flushed")
+	}
+}

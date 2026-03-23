@@ -12,6 +12,7 @@ import (
 
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/servermetrics"
 	"github.com/makewand/makewand/serverusage"
 )
 
@@ -79,6 +80,42 @@ func TestHTTPHandler_ChatCompletionsStream(t *testing.T) {
 	})
 
 	handler := r.HTTPHandler()
+	body := `{"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	bodyText := rec.Body.String()
+	if !strings.Contains(bodyText, `"object":"chat.completion.chunk"`) {
+		t.Fatalf("stream body missing chunk object: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"content":"hello from http"`) {
+		t.Fatalf("stream body missing content: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "data: [DONE]") {
+		t.Fatalf("stream body missing [DONE]: %s", bodyText)
+	}
+}
+
+func TestHTTPHandler_ChatCompletionsStream_WithMetricsMiddleware(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := servermetrics.NewRecorder().Middleware(r.HTTPHandler())
 	body := `{"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
