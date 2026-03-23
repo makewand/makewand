@@ -22,6 +22,15 @@ func TestNewAuthorizer_ValidatesRules(t *testing.T) {
 	if err == nil {
 		t.Fatal("NewAuthorizer() error = nil, want duplicate-token validation error")
 	}
+
+	_, err = NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{Token: "a", Scopes: []string{ScopeModelsRead}, MaxRequestsPerHour: -1},
+		},
+	})
+	if err == nil {
+		t.Fatal("NewAuthorizer() error = nil, want negative quota validation error")
+	}
 }
 
 func TestAuthorizer_AuthenticatesScopedGrant(t *testing.T) {
@@ -157,5 +166,36 @@ func TestNewAuthorizer_DefaultTokenIDIsStableAndUnique(t *testing.T) {
 	}
 	if alpha.TokenID() == beta.TokenID() {
 		t.Fatalf("derived token IDs must be unique; both were %q", alpha.TokenID())
+	}
+}
+
+func TestGrant_AllowRequestAt_ResetsHourly(t *testing.T) {
+	authz, err := NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{
+				Token:              "alpha",
+				Scopes:             []string{ScopeModelsRead},
+				MaxRequestsPerHour: 1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	grant, ok := authz.AuthenticateHeader("Bearer alpha")
+	if !ok {
+		t.Fatal("AuthenticateHeader(alpha) = false, want true")
+	}
+
+	firstHour := time.Date(2026, 3, 23, 10, 15, 0, 0, time.UTC)
+	if !grant.AllowRequestAt(firstHour) {
+		t.Fatal("AllowRequestAt(firstHour) = false, want true")
+	}
+	if grant.AllowRequestAt(firstHour.Add(10 * time.Minute)) {
+		t.Fatal("AllowRequestAt(same hour) = true, want false")
+	}
+	if !grant.AllowRequestAt(firstHour.Add(time.Hour)) {
+		t.Fatal("AllowRequestAt(next hour) = false, want true")
 	}
 }

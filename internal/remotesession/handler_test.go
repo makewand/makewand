@@ -113,3 +113,40 @@ func TestHandlerWithOptions_AuditLogsForbiddenWorkspace(t *testing.T) {
 		t.Fatal("Error = empty, want forbidden audit message")
 	}
 }
+
+func TestHandlerWithOptions_RejectsRequestsOverHourlyQuota(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:              "secret",
+				Scopes:             []string{serverauth.ScopeSessionsRead},
+				MaxRequestsPerHour: 1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	store := NewStore(t.TempDir())
+	if err := store.Save("repo-main", []byte(`{"version":1}`)); err != nil {
+		t.Fatalf("store.Save: %v", err)
+	}
+	handler := NewHandlerWithOptions(store, HandlerOptions{Authorizer: authz})
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/sessions/repo-main", nil)
+	req1.Header.Set("Authorization", "Bearer secret")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200", rec1.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/sessions/repo-main", nil)
+	req2.Header.Set("Authorization", "Bearer secret")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429", rec2.Code)
+	}
+}

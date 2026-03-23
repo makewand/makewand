@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -42,15 +43,16 @@ type Config struct {
 
 // TokenRule defines one remote client token and its permissions.
 type TokenRule struct {
-	ID                string    `json:"id,omitempty"`
-	Token             string    `json:"token"`
-	Description       string    `json:"description,omitempty"`
-	Scopes            []string  `json:"scopes"`
-	WorkspacePrefixes []string  `json:"workspace_prefixes,omitempty"`
-	AllowedProviders  []string  `json:"allowed_providers,omitempty"`
-	AllowedModes      []string  `json:"allowed_modes,omitempty"`
-	ExpiresAt         time.Time `json:"expires_at,omitempty"`
-	Revoked           bool      `json:"revoked,omitempty"`
+	ID                 string    `json:"id,omitempty"`
+	Token              string    `json:"token"`
+	Description        string    `json:"description,omitempty"`
+	Scopes             []string  `json:"scopes"`
+	WorkspacePrefixes  []string  `json:"workspace_prefixes,omitempty"`
+	AllowedProviders   []string  `json:"allowed_providers,omitempty"`
+	AllowedModes       []string  `json:"allowed_modes,omitempty"`
+	ExpiresAt          time.Time `json:"expires_at,omitempty"`
+	Revoked            bool      `json:"revoked,omitempty"`
+	MaxRequestsPerHour int       `json:"max_requests_per_hour,omitempty"`
 }
 
 // Authorizer authenticates Bearer tokens and returns scoped grants.
@@ -60,14 +62,18 @@ type Authorizer struct {
 
 // Grant is the normalized permission view for an authenticated token.
 type Grant struct {
-	tokenID           string
-	description       string
-	expiresAt         time.Time
-	revoked           bool
-	scopes            map[string]struct{}
-	workspacePrefixes []string
-	allowedProviders  map[string]struct{}
-	allowedModes      map[string]struct{}
+	tokenID            string
+	description        string
+	expiresAt          time.Time
+	revoked            bool
+	maxRequestsPerHour int
+	scopes             map[string]struct{}
+	workspacePrefixes  []string
+	allowedProviders   map[string]struct{}
+	allowedModes       map[string]struct{}
+	quotaMu            sync.Mutex
+	quotaWindowStart   time.Time
+	quotaWindowCount   int
 }
 
 // AllScopes returns the full scope set used by legacy single-token auth.
@@ -278,9 +284,33 @@ func (g *Grant) IsExpiredAt(now time.Time) bool {
 	return !now.Before(g.expiresAt)
 }
 
+// AllowRequestAt consumes one request from the token's hourly quota.
+func (g *Grant) AllowRequestAt(now time.Time) bool {
+	if g == nil || g.maxRequestsPerHour <= 0 {
+		return true
+	}
+	window := now.UTC().Truncate(time.Hour)
+
+	g.quotaMu.Lock()
+	defer g.quotaMu.Unlock()
+
+	if g.quotaWindowStart.IsZero() || !g.quotaWindowStart.Equal(window) {
+		g.quotaWindowStart = window
+		g.quotaWindowCount = 0
+	}
+	if g.quotaWindowCount >= g.maxRequestsPerHour {
+		return false
+	}
+	g.quotaWindowCount++
+	return true
+}
+
 func newGrant(rule TokenRule) (*Grant, error) {
 	if len(rule.Scopes) == 0 {
 		return nil, errors.New("scopes must not be empty")
+	}
+	if rule.MaxRequestsPerHour < 0 {
+		return nil, errors.New("max_requests_per_hour must be >= 0")
 	}
 
 	scopeSet := make(map[string]struct{}, len(rule.Scopes))
@@ -339,14 +369,15 @@ func newGrant(rule TokenRule) (*Grant, error) {
 	}
 
 	return &Grant{
-		tokenID:           tokenID,
-		description:       strings.TrimSpace(rule.Description),
-		expiresAt:         rule.ExpiresAt.UTC(),
-		revoked:           rule.Revoked,
-		scopes:            scopeSet,
-		workspacePrefixes: workspacePrefixes,
-		allowedProviders:  providers,
-		allowedModes:      modes,
+		tokenID:            tokenID,
+		description:        strings.TrimSpace(rule.Description),
+		expiresAt:          rule.ExpiresAt.UTC(),
+		revoked:            rule.Revoked,
+		maxRequestsPerHour: rule.MaxRequestsPerHour,
+		scopes:             scopeSet,
+		workspacePrefixes:  workspacePrefixes,
+		allowedProviders:   providers,
+		allowedModes:       modes,
 	}, nil
 }
 
