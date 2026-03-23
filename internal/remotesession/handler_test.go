@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/makewand/makewand/serveraudit"
@@ -148,5 +149,45 @@ func TestHandlerWithOptions_RejectsRequestsOverHourlyQuota(t *testing.T) {
 	handler.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d, want 429", rec2.Code)
+	}
+}
+
+func TestHandlerWithOptions_RejectsRequestsOverDailyQuota(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:             "secret",
+				Scopes:            []string{serverauth.ScopeSessionsRead},
+				MaxRequestsPerDay: 1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	store := NewStore(t.TempDir())
+	if err := store.Save("repo-main", []byte(`{"version":1}`)); err != nil {
+		t.Fatalf("store.Save: %v", err)
+	}
+	handler := NewHandlerWithOptions(store, HandlerOptions{Authorizer: authz})
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/sessions/repo-main", nil)
+	req1.Header.Set("Authorization", "Bearer secret")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200", rec1.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/sessions/repo-main", nil)
+	req2.Header.Set("Authorization", "Bearer secret")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429", rec2.Code)
+	}
+	if !strings.Contains(rec2.Body.String(), "max_requests_per_day") {
+		t.Fatalf("second body = %q, want daily quota error", rec2.Body.String())
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -30,6 +31,15 @@ func TestNewAuthorizer_ValidatesRules(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("NewAuthorizer() error = nil, want negative quota validation error")
+	}
+
+	_, err = NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{Token: "a", Scopes: []string{ScopeModelsRead}, MaxRequestsPerDay: -1},
+		},
+	})
+	if err == nil {
+		t.Fatal("NewAuthorizer() error = nil, want negative daily quota validation error")
 	}
 }
 
@@ -197,5 +207,87 @@ func TestGrant_AllowRequestAt_ResetsHourly(t *testing.T) {
 	}
 	if !grant.AllowRequestAt(firstHour.Add(time.Hour)) {
 		t.Fatal("AllowRequestAt(next hour) = false, want true")
+	}
+}
+
+func TestGrant_CheckAndConsumeRequestAt_ResetsDaily(t *testing.T) {
+	authz, err := NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{
+				Token:             "alpha",
+				Scopes:            []string{ScopeModelsRead},
+				MaxRequestsPerDay: 1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	grant, ok := authz.AuthenticateHeader("Bearer alpha")
+	if !ok {
+		t.Fatal("AuthenticateHeader(alpha) = false, want true")
+	}
+
+	firstDay := time.Date(2026, 3, 23, 10, 15, 0, 0, time.UTC)
+	if err := grant.CheckAndConsumeRequestAt(firstDay); err != nil {
+		t.Fatalf("CheckAndConsumeRequestAt(firstDay): %v", err)
+	}
+	if err := grant.CheckAndConsumeRequestAt(firstDay.Add(10 * time.Minute)); err != ErrDailyQuotaExceeded {
+		t.Fatalf("CheckAndConsumeRequestAt(same day) = %v, want %v", err, ErrDailyQuotaExceeded)
+	}
+	if err := grant.CheckAndConsumeRequestAt(firstDay.Add(24 * time.Hour)); err != nil {
+		t.Fatalf("CheckAndConsumeRequestAt(next day): %v", err)
+	}
+}
+
+func TestSaveAndLoadConfigFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server_auth.json")
+	cfg := Config{
+		Tokens: []TokenRule{
+			{
+				ID:                 "runner",
+				Token:              "secret",
+				Scopes:             []string{ScopeModelsRead, ScopeChatInvoke},
+				MaxRequestsPerHour: 10,
+				MaxRequestsPerDay:  100,
+			},
+		},
+	}
+	if err := SaveConfigFile(path, cfg); err != nil {
+		t.Fatalf("SaveConfigFile: %v", err)
+	}
+	loaded, err := LoadConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadConfigFile: %v", err)
+	}
+	if len(loaded.Tokens) != 1 {
+		t.Fatalf("len(loaded.Tokens) = %d, want 1", len(loaded.Tokens))
+	}
+	if loaded.Tokens[0].ID != "runner" {
+		t.Fatalf("loaded token ID = %q, want %q", loaded.Tokens[0].ID, "runner")
+	}
+	if loaded.Tokens[0].MaxRequestsPerHour != 10 {
+		t.Fatalf("loaded MaxRequestsPerHour = %d, want 10", loaded.Tokens[0].MaxRequestsPerHour)
+	}
+	if loaded.Tokens[0].MaxRequestsPerDay != 100 {
+		t.Fatalf("loaded MaxRequestsPerDay = %d, want 100", loaded.Tokens[0].MaxRequestsPerDay)
+	}
+}
+
+func TestGenerateToken(t *testing.T) {
+	first, err := GenerateToken()
+	if err != nil {
+		t.Fatalf("GenerateToken(first): %v", err)
+	}
+	second, err := GenerateToken()
+	if err != nil {
+		t.Fatalf("GenerateToken(second): %v", err)
+	}
+	if first == second {
+		t.Fatalf("GenerateToken() returned duplicate tokens: %q", first)
+	}
+	if !strings.HasPrefix(first, "mw_") {
+		t.Fatalf("GenerateToken() = %q, want mw_ prefix", first)
 	}
 }

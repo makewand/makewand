@@ -141,9 +141,9 @@ func (r *Router) requireScope(authz *serverauth.Authorizer, scope string, logger
 			logHTTPAudit(logger, auditBaseEvent(req, nil, scope), http.StatusUnauthorized, "", "")
 			return
 		}
-		if !grant.AllowRequestAt(time.Now()) {
-			writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", "token exceeded max_requests_per_hour")
-			logHTTPAudit(logger, auditBaseEvent(req, grant, scope), http.StatusTooManyRequests, "", "token exceeded max_requests_per_hour")
+		if err := grant.CheckAndConsumeRequestAt(time.Now()); err != nil {
+			writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", err.Error())
+			logHTTPAudit(logger, auditBaseEvent(req, grant, scope), http.StatusTooManyRequests, "", err.Error())
 			return
 		}
 		if !grant.AllowsScope(scope) {
