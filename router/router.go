@@ -191,6 +191,10 @@ type Router struct {
 
 	providers map[string]Provider
 
+	// providerAllowlist restricts routing to a subset of providers for
+	// request-scoped views such as remote token policies.
+	providerAllowlist map[string]struct{}
+
 	// Provider cache for mode-based routing (provider+model → instance)
 	providerCache map[providerKey]Provider
 	providerMu    sync.Mutex
@@ -317,10 +321,7 @@ func (r *Router) effectiveMode() UsageMode {
 	return ModeBalanced
 }
 
-// cloneWithMode creates a per-request router view that preserves shared
-// provider state while allowing a different routing mode without mutating
-// the live server router.
-func (r *Router) cloneWithMode(mode UsageMode) *Router {
+func (r *Router) cloneView() *Router {
 	r.providerMu.Lock()
 	providers := make(map[string]Provider, len(r.providers))
 	for name, provider := range r.providers {
@@ -342,23 +343,90 @@ func (r *Router) cloneWithMode(mode UsageMode) *Router {
 	legacy := r.legacyModels
 	r.mu.Unlock()
 
+	r.modeMu.RLock()
+	mode := r.mode
+	modeSet := r.modeSet
+	r.modeMu.RUnlock()
+
 	r.traceMu.RLock()
 	traceSink := r.traceSink
 	r.traceMu.RUnlock()
 
 	return &Router{
-		legacyModels:  legacy,
-		providers:     providers,
-		providerCache: providerCache,
-		accessTypes:   accessTypes,
-		usage:         r.usage,
-		breaker:       r.breaker,
-		mode:          mode,
-		modeSet:       true,
-		cachedAvail:   cachedAvail,
-		cachedAvailAt: cachedAvailAt,
-		traceSink:     traceSink,
+		legacyModels:      legacy,
+		providers:         providers,
+		providerAllowlist: cloneStringSet(r.providerAllowlist),
+		providerCache:     providerCache,
+		accessTypes:       accessTypes,
+		usage:             r.usage,
+		breaker:           r.breaker,
+		mode:              mode,
+		modeSet:           modeSet,
+		cachedAvail:       cachedAvail,
+		cachedAvailAt:     cachedAvailAt,
+		traceSink:         traceSink,
 	}
+}
+
+// cloneWithMode creates a per-request router view that preserves shared
+// provider state while allowing a different routing mode without mutating
+// the live server router.
+func (r *Router) cloneWithMode(mode UsageMode) *Router {
+	clone := r.cloneView()
+	clone.mode = mode
+	clone.modeSet = true
+	return clone
+}
+
+func (r *Router) cloneWithProviderAllowlist(names []string) *Router {
+	clone := r.cloneView()
+	clone.setProviderAllowlist(names)
+	return clone
+}
+
+func (r *Router) setProviderAllowlist(names []string) {
+	r.providerAllowlist = makeStringSet(names)
+	r.mu.Lock()
+	r.cachedAvail = nil
+	r.cachedAvailAt = time.Time{}
+	r.mu.Unlock()
+}
+
+func (r *Router) isProviderAllowed(name string) bool {
+	if len(r.providerAllowlist) == 0 {
+		return true
+	}
+	_, ok := r.providerAllowlist[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func makeStringSet(values []string) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		out[value] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func cloneStringSet(values map[string]struct{}) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(values))
+	for value := range values {
+		out[value] = struct{}{}
+	}
+	return out
 }
 
 func (r *Router) emitTrace(event TraceEvent) {

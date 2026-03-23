@@ -1,25 +1,52 @@
 package remotesession
 
 import (
-	"crypto/subtle"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/makewand/makewand/serverauth"
 )
 
 const maxSessionPayloadBytes = 4 << 20 // 4 MiB
 
 // NewHandler returns an HTTP handler for remote session CRUD.
 func NewHandler(store *Store, bearerToken string) http.Handler {
-	return withAuth(strings.TrimSpace(bearerToken), http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	return NewHandlerWithAuthorizer(store, serverauth.NewSingleTokenAuthorizer(strings.TrimSpace(bearerToken)))
+}
+
+// NewHandlerWithAuthorizer returns an HTTP handler for remote session CRUD with
+// scoped token enforcement.
+func NewHandlerWithAuthorizer(store *Store, authz *serverauth.Authorizer) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if store == nil {
 			http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		grant, ok := authz.AuthenticateRequest(req)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		workspaceID, ok := sessionIDFromPath(req.URL.Path)
 		if !ok {
 			http.NotFound(w, req)
+			return
+		}
+		if !grant.AllowsWorkspace(workspaceID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		scope, methodAllowed := sessionScopeForMethod(req.Method)
+		if !methodAllowed {
+			w.Header().Set("Allow", "GET, PUT, DELETE")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !grant.AllowsScope(scope) {
+			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 
@@ -57,21 +84,20 @@ func NewHandler(store *Store, bearerToken string) http.Handler {
 			w.Header().Set("Allow", "GET, PUT, DELETE")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	}))
+	})
 }
 
-func withAuth(token string, next http.Handler) http.Handler {
-	if token == "" {
-		return next
+func sessionScopeForMethod(method string) (string, bool) {
+	switch method {
+	case http.MethodGet:
+		return serverauth.ScopeSessionsRead, true
+	case http.MethodPut:
+		return serverauth.ScopeSessionsWrite, true
+	case http.MethodDelete:
+		return serverauth.ScopeSessionsDelete, true
+	default:
+		return "", false
 	}
-	expected := "Bearer " + token
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(req.Header.Get("Authorization")), []byte(expected)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, req)
-	})
 }
 
 func sessionIDFromPath(path string) (string, bool) {

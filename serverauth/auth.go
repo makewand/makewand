@@ -1,0 +1,340 @@
+package serverauth
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+)
+
+const (
+	ScopeChatInvoke     = "chat:invoke"
+	ScopeModelsRead     = "models:read"
+	ScopeSessionsRead   = "sessions:read"
+	ScopeSessionsWrite  = "sessions:write"
+	ScopeSessionsDelete = "sessions:delete"
+)
+
+var validScopes = map[string]struct{}{
+	ScopeChatInvoke:     {},
+	ScopeModelsRead:     {},
+	ScopeSessionsRead:   {},
+	ScopeSessionsWrite:  {},
+	ScopeSessionsDelete: {},
+}
+
+var validModes = map[string]struct{}{
+	"fast":     {},
+	"balanced": {},
+	"power":    {},
+}
+
+// Config defines a scoped token policy file for the makewand server.
+type Config struct {
+	Tokens []TokenRule `json:"tokens"`
+}
+
+// TokenRule defines one remote client token and its permissions.
+type TokenRule struct {
+	Token             string   `json:"token"`
+	Description       string   `json:"description,omitempty"`
+	Scopes            []string `json:"scopes"`
+	WorkspacePrefixes []string `json:"workspace_prefixes,omitempty"`
+	AllowedProviders  []string `json:"allowed_providers,omitempty"`
+	AllowedModes      []string `json:"allowed_modes,omitempty"`
+}
+
+// Authorizer authenticates Bearer tokens and returns scoped grants.
+type Authorizer struct {
+	grants map[string]*Grant
+}
+
+// Grant is the normalized permission view for an authenticated token.
+type Grant struct {
+	scopes            map[string]struct{}
+	workspacePrefixes []string
+	allowedProviders  map[string]struct{}
+	allowedModes      map[string]struct{}
+}
+
+// AllScopes returns the full scope set used by legacy single-token auth.
+func AllScopes() []string {
+	return []string{
+		ScopeChatInvoke,
+		ScopeModelsRead,
+		ScopeSessionsRead,
+		ScopeSessionsWrite,
+		ScopeSessionsDelete,
+	}
+}
+
+// NewSingleTokenAuthorizer creates a permissive authorizer for the legacy
+// single-token mode used by --token and MAKEWAND_SERVER_TOKEN.
+func NewSingleTokenAuthorizer(token string) *Authorizer {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil
+	}
+	grant, err := newGrant(TokenRule{
+		Token:  token,
+		Scopes: AllScopes(),
+	})
+	if err != nil {
+		return nil
+	}
+	return &Authorizer{
+		grants: map[string]*Grant{
+			token: grant,
+		},
+	}
+}
+
+// LoadFile parses a JSON auth config from disk.
+func LoadFile(path string) (*Authorizer, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, fmt.Errorf("auth config path is empty")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var cfg Config
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, err
+	}
+	return NewAuthorizer(cfg)
+}
+
+// NewAuthorizer validates and constructs a multi-token authorizer.
+func NewAuthorizer(cfg Config) (*Authorizer, error) {
+	if len(cfg.Tokens) == 0 {
+		return nil, errors.New("auth config requires at least one token")
+	}
+
+	grants := make(map[string]*Grant, len(cfg.Tokens))
+	for i, rule := range cfg.Tokens {
+		token := strings.TrimSpace(rule.Token)
+		if token == "" {
+			return nil, fmt.Errorf("token entry %d has an empty token", i)
+		}
+		if _, exists := grants[token]; exists {
+			return nil, fmt.Errorf("duplicate token entry %q", token)
+		}
+		grant, err := newGrant(rule)
+		if err != nil {
+			return nil, fmt.Errorf("token entry %q: %w", token, err)
+		}
+		grants[token] = grant
+	}
+
+	return &Authorizer{grants: grants}, nil
+}
+
+// AuthenticateRequest authenticates the request Authorization header.
+// When the authorizer is nil, the request is treated as unrestricted.
+func (a *Authorizer) AuthenticateRequest(req *http.Request) (*Grant, bool) {
+	if a == nil {
+		return nil, true
+	}
+	if req == nil {
+		return nil, false
+	}
+	return a.AuthenticateHeader(req.Header.Get("Authorization"))
+}
+
+// AuthenticateHeader authenticates a raw Authorization header value.
+func (a *Authorizer) AuthenticateHeader(header string) (*Grant, bool) {
+	if a == nil {
+		return nil, true
+	}
+	token, ok := bearerTokenFromHeader(header)
+	if !ok {
+		return nil, false
+	}
+	grant, ok := a.grants[token]
+	return grant, ok
+}
+
+// AllowsScope reports whether the grant includes the given scope.
+func (g *Grant) AllowsScope(scope string) bool {
+	if g == nil {
+		return true
+	}
+	scope = normalizeScope(scope)
+	if scope == "" {
+		return true
+	}
+	_, ok := g.scopes[scope]
+	return ok
+}
+
+// AllowsWorkspace reports whether the grant allows the given workspace id.
+func (g *Grant) AllowsWorkspace(workspaceID string) bool {
+	if g == nil || len(g.workspacePrefixes) == 0 {
+		return true
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return false
+	}
+	for _, prefix := range g.workspacePrefixes {
+		if strings.HasPrefix(workspaceID, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowsProvider reports whether the grant allows the given provider.
+func (g *Grant) AllowsProvider(provider string) bool {
+	if g == nil || len(g.allowedProviders) == 0 {
+		return true
+	}
+	provider = normalizeName(provider)
+	if provider == "" {
+		return true
+	}
+	_, ok := g.allowedProviders[provider]
+	return ok
+}
+
+// AllowedProviders returns the normalized provider allowlist, if any.
+func (g *Grant) AllowedProviders() []string {
+	if g == nil || len(g.allowedProviders) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(g.allowedProviders))
+	for provider := range g.allowedProviders {
+		out = append(out, provider)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AllowsMode reports whether the grant allows the given routing mode.
+func (g *Grant) AllowsMode(mode string) bool {
+	if g == nil || len(g.allowedModes) == 0 {
+		return true
+	}
+	mode = normalizeMode(mode)
+	if mode == "" {
+		return false
+	}
+	_, ok := g.allowedModes[mode]
+	return ok
+}
+
+func newGrant(rule TokenRule) (*Grant, error) {
+	if len(rule.Scopes) == 0 {
+		return nil, errors.New("scopes must not be empty")
+	}
+
+	scopeSet := make(map[string]struct{}, len(rule.Scopes))
+	for _, scope := range rule.Scopes {
+		scope = normalizeScope(scope)
+		if scope == "" {
+			return nil, errors.New("scope must not be empty")
+		}
+		if _, ok := validScopes[scope]; !ok {
+			return nil, fmt.Errorf("unknown scope %q", scope)
+		}
+		scopeSet[scope] = struct{}{}
+	}
+
+	var workspacePrefixes []string
+	for _, prefix := range rule.WorkspacePrefixes {
+		prefix = strings.TrimSpace(prefix)
+		if prefix == "" {
+			continue
+		}
+		workspacePrefixes = append(workspacePrefixes, prefix)
+	}
+	sort.Strings(workspacePrefixes)
+	workspacePrefixes = compactStrings(workspacePrefixes)
+
+	providers := make(map[string]struct{})
+	for _, provider := range rule.AllowedProviders {
+		provider = normalizeName(provider)
+		if provider == "" {
+			continue
+		}
+		providers[provider] = struct{}{}
+	}
+	if len(providers) == 0 {
+		providers = nil
+	}
+
+	modes := make(map[string]struct{})
+	for _, mode := range rule.AllowedModes {
+		mode = normalizeMode(mode)
+		if mode == "" {
+			continue
+		}
+		if _, ok := validModes[mode]; !ok {
+			return nil, fmt.Errorf("unknown mode %q", mode)
+		}
+		modes[mode] = struct{}{}
+	}
+	if len(modes) == 0 {
+		modes = nil
+	}
+
+	return &Grant{
+		scopes:            scopeSet,
+		workspacePrefixes: workspacePrefixes,
+		allowedProviders:  providers,
+		allowedModes:      modes,
+	}, nil
+}
+
+func bearerTokenFromHeader(header string) (string, bool) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return "", false
+	}
+	parts := strings.Fields(header)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return "", false
+	}
+	token := strings.TrimSpace(parts[1])
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+func normalizeScope(scope string) string {
+	return strings.ToLower(strings.TrimSpace(scope))
+}
+
+func normalizeMode(mode string) string {
+	return strings.ToLower(strings.TrimSpace(mode))
+}
+
+func normalizeName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func compactStrings(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	out := values[:0]
+	var prev string
+	for i, value := range values {
+		if i == 0 || value != prev {
+			out = append(out, value)
+			prev = value
+		}
+	}
+	return out
+}
