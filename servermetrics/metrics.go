@@ -35,7 +35,7 @@ func (r *Recorder) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, req)
+		next.ServeHTTP(wrapStatusRecorder(rec), req)
 		r.observe(req.Method, normalizePath(req.URL.Path), rec.status, time.Since(start))
 	})
 }
@@ -107,6 +107,21 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+func wrapStatusRecorder(rec *statusRecorder) http.ResponseWriter {
+	if _, ok := rec.ResponseWriter.(http.Flusher); ok {
+		return &flushStatusRecorder{statusRecorder: rec}
+	}
+	return rec
+}
+
+type flushStatusRecorder struct {
+	*statusRecorder
+}
+
+func (r *flushStatusRecorder) Flush() {
+	r.ResponseWriter.(http.Flusher).Flush()
 }
 
 func normalizePath(path string) string {
