@@ -1,13 +1,16 @@
 package serverauth
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -53,6 +56,7 @@ type TokenRule struct {
 	ExpiresAt          time.Time `json:"expires_at,omitempty"`
 	Revoked            bool      `json:"revoked,omitempty"`
 	MaxRequestsPerHour int       `json:"max_requests_per_hour,omitempty"`
+	MaxRequestsPerDay  int       `json:"max_requests_per_day,omitempty"`
 }
 
 // Authorizer authenticates Bearer tokens and returns scoped grants.
@@ -67,6 +71,7 @@ type Grant struct {
 	expiresAt          time.Time
 	revoked            bool
 	maxRequestsPerHour int
+	maxRequestsPerDay  int
 	scopes             map[string]struct{}
 	workspacePrefixes  []string
 	allowedProviders   map[string]struct{}
@@ -74,7 +79,14 @@ type Grant struct {
 	quotaMu            sync.Mutex
 	quotaWindowStart   time.Time
 	quotaWindowCount   int
+	quotaDayStart      time.Time
+	quotaDayCount      int
 }
+
+var (
+	ErrHourlyQuotaExceeded = errors.New("token exceeded max_requests_per_hour")
+	ErrDailyQuotaExceeded  = errors.New("token exceeded max_requests_per_day")
+)
 
 // AllScopes returns the full scope set used by legacy single-token auth.
 func AllScopes() []string {
@@ -158,6 +170,28 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 	}
 
 	return &Authorizer{grants: grants}, nil
+}
+
+// LoadConfigFile parses a JSON auth config from disk without constructing grants.
+func LoadConfigFile(path string) (Config, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return Config{}, fmt.Errorf("auth config path is empty")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return Config{}, err
+	}
+	defer f.Close()
+
+	var cfg Config
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
 }
 
 // AuthenticateRequest authenticates the request Authorization header.
@@ -286,23 +320,48 @@ func (g *Grant) IsExpiredAt(now time.Time) bool {
 
 // AllowRequestAt consumes one request from the token's hourly quota.
 func (g *Grant) AllowRequestAt(now time.Time) bool {
-	if g == nil || g.maxRequestsPerHour <= 0 {
-		return true
+	return g.CheckAndConsumeRequestAt(now) == nil
+}
+
+// CheckAndConsumeRequestAt consumes one request from the token's quotas and
+// returns a descriptive error when the request would exceed them.
+func (g *Grant) CheckAndConsumeRequestAt(now time.Time) error {
+	if g == nil || (g.maxRequestsPerHour <= 0 && g.maxRequestsPerDay <= 0) {
+		return nil
 	}
-	window := now.UTC().Truncate(time.Hour)
+
+	utcNow := now.UTC()
+	hourWindow := utcNow.Truncate(time.Hour)
+	dayWindow := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
 
 	g.quotaMu.Lock()
 	defer g.quotaMu.Unlock()
 
-	if g.quotaWindowStart.IsZero() || !g.quotaWindowStart.Equal(window) {
-		g.quotaWindowStart = window
-		g.quotaWindowCount = 0
+	if g.maxRequestsPerHour > 0 {
+		if g.quotaWindowStart.IsZero() || !g.quotaWindowStart.Equal(hourWindow) {
+			g.quotaWindowStart = hourWindow
+			g.quotaWindowCount = 0
+		}
+		if g.quotaWindowCount >= g.maxRequestsPerHour {
+			return ErrHourlyQuotaExceeded
+		}
 	}
-	if g.quotaWindowCount >= g.maxRequestsPerHour {
-		return false
+	if g.maxRequestsPerDay > 0 {
+		if g.quotaDayStart.IsZero() || !g.quotaDayStart.Equal(dayWindow) {
+			g.quotaDayStart = dayWindow
+			g.quotaDayCount = 0
+		}
+		if g.quotaDayCount >= g.maxRequestsPerDay {
+			return ErrDailyQuotaExceeded
+		}
 	}
-	g.quotaWindowCount++
-	return true
+	if g.maxRequestsPerHour > 0 {
+		g.quotaWindowCount++
+	}
+	if g.maxRequestsPerDay > 0 {
+		g.quotaDayCount++
+	}
+	return nil
 }
 
 func newGrant(rule TokenRule) (*Grant, error) {
@@ -311,6 +370,9 @@ func newGrant(rule TokenRule) (*Grant, error) {
 	}
 	if rule.MaxRequestsPerHour < 0 {
 		return nil, errors.New("max_requests_per_hour must be >= 0")
+	}
+	if rule.MaxRequestsPerDay < 0 {
+		return nil, errors.New("max_requests_per_day must be >= 0")
 	}
 
 	scopeSet := make(map[string]struct{}, len(rule.Scopes))
@@ -374,6 +436,7 @@ func newGrant(rule TokenRule) (*Grant, error) {
 		expiresAt:          rule.ExpiresAt.UTC(),
 		revoked:            rule.Revoked,
 		maxRequestsPerHour: rule.MaxRequestsPerHour,
+		maxRequestsPerDay:  rule.MaxRequestsPerDay,
 		scopes:             scopeSet,
 		workspacePrefixes:  workspacePrefixes,
 		allowedProviders:   providers,
@@ -427,4 +490,33 @@ func compactStrings(values []string) []string {
 func defaultTokenID(token string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
 	return "tok_" + hex.EncodeToString(sum[:6])
+}
+
+// SaveConfigFile validates and writes cfg to path with restrictive permissions.
+func SaveConfigFile(path string, cfg Config) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("auth config path is empty")
+	}
+	if _, err := NewAuthorizer(cfg); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o600)
+}
+
+// GenerateToken creates a random bearer token suitable for auth config issuance.
+func GenerateToken() (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "mw_" + base64.RawURLEncoding.EncodeToString(buf), nil
 }

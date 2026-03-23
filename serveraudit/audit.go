@@ -1,9 +1,13 @@
 package serveraudit
 
 import (
+	"bufio"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +28,28 @@ type Event struct {
 	ActualProvider   string    `json:"actual_provider,omitempty"`
 	WorkspaceID      string    `json:"workspace_id,omitempty"`
 	Error            string    `json:"error,omitempty"`
+}
+
+// Filter narrows audit events when reading from JSONL.
+type Filter struct {
+	TokenID     string
+	Kind        string
+	WorkspaceID string
+	Since       time.Time
+	Until       time.Time
+	Status      int
+	Limit       int
+}
+
+// Summary aggregates audit activity for operator review.
+type Summary struct {
+	Total      int            `json:"total"`
+	ByKind     map[string]int `json:"by_kind,omitempty"`
+	ByStatus   map[int]int    `json:"by_status,omitempty"`
+	ByToken    map[string]int `json:"by_token,omitempty"`
+	ByProvider map[string]int `json:"by_provider,omitempty"`
+	Earliest   time.Time      `json:"earliest,omitempty"`
+	Latest     time.Time      `json:"latest,omitempty"`
 }
 
 // Logger writes audit events.
@@ -72,4 +98,115 @@ func (l *JSONLLogger) Close() error {
 	err := l.f.Close()
 	l.f = nil
 	return err
+}
+
+// LoadEvents reads and filters audit events from a JSONL file.
+func LoadEvents(path string, filter Filter) ([]Event, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	events := make([]Event, 0, 64)
+	dec := json.NewDecoder(bufio.NewReader(f))
+	for {
+		var evt Event
+		if err := dec.Decode(&evt); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		if !matchesFilter(evt, filter) {
+			continue
+		}
+		events = append(events, evt)
+		if filter.Limit > 0 && len(events) >= filter.Limit {
+			break
+		}
+	}
+	return events, nil
+}
+
+// SummarizeEvents folds events into operator-friendly counters.
+func SummarizeEvents(events []Event) Summary {
+	summary := Summary{
+		ByKind:     make(map[string]int),
+		ByStatus:   make(map[int]int),
+		ByToken:    make(map[string]int),
+		ByProvider: make(map[string]int),
+	}
+	for i, evt := range events {
+		summary.Total++
+		if evt.Kind != "" {
+			summary.ByKind[evt.Kind]++
+		}
+		if evt.Status != 0 {
+			summary.ByStatus[evt.Status]++
+		}
+		if evt.TokenID != "" {
+			summary.ByToken[evt.TokenID]++
+		}
+		if evt.ActualProvider != "" {
+			summary.ByProvider[evt.ActualProvider]++
+		}
+		if i == 0 || (!evt.Timestamp.IsZero() && evt.Timestamp.Before(summary.Earliest)) || summary.Earliest.IsZero() {
+			summary.Earliest = evt.Timestamp
+		}
+		if evt.Timestamp.After(summary.Latest) {
+			summary.Latest = evt.Timestamp
+		}
+	}
+	return summary
+}
+
+func SortedStringCounts(m map[string]int) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key)
+	}
+	return out
+}
+
+func SortedStatusCounts(m map[int]int) []int {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]int, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func matchesFilter(evt Event, filter Filter) bool {
+	if filter.TokenID != "" && evt.TokenID != filter.TokenID {
+		return false
+	}
+	if filter.Kind != "" && !strings.EqualFold(evt.Kind, filter.Kind) {
+		return false
+	}
+	if filter.WorkspaceID != "" && evt.WorkspaceID != filter.WorkspaceID {
+		return false
+	}
+	if filter.Status != 0 && evt.Status != filter.Status {
+		return false
+	}
+	if !filter.Since.IsZero() && evt.Timestamp.Before(filter.Since) {
+		return false
+	}
+	if !filter.Until.IsZero() && evt.Timestamp.After(filter.Until) {
+		return false
+	}
+	return true
 }

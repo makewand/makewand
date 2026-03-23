@@ -44,6 +44,8 @@ Claude, Gemini, and Codex through adaptive mode-based routing
   makewand new     - Create a new project with guided wizard
   makewand chat    - Chat with AI about your project
   makewand serve   - Expose your configured backend for your other devices
+  makewand token   - Manage remote server auth tokens
+  makewand audit   - Inspect server audit logs
   makewand preview - Start a preview server
   makewand setup   - Configure AI providers and routing preferences`,
 		Args: cobra.ArbitraryArgs,
@@ -91,6 +93,8 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 	rootCmd.AddCommand(newCmd())
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(serveCmd())
+	rootCmd.AddCommand(tokenCmd())
+	rootCmd.AddCommand(auditCmd())
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())
