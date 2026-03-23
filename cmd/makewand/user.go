@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,12 +27,14 @@ func userCmd() *cobra.Command {
 	cmd.AddCommand(userActivateCmd())
 	cmd.AddCommand(userDeactivateCmd())
 	cmd.AddCommand(userRoleCmd())
+	cmd.AddCommand(userLoginCmd())
 	return cmd
 }
 
 func userListCmd() *cobra.Command {
 	var (
 		usersDir    string
+		stateDBPath string
 		jsonOutput  bool
 		remoteURL   string
 		remoteToken string
@@ -60,10 +65,11 @@ func userListCmd() *cobra.Command {
 				return nil
 			}
 
-			store, err := resolveUserStore(usersDir)
+			store, closeFn, header, err := openUserStore(usersDir, stateDBPath)
 			if err != nil {
 				return err
 			}
+			defer closeFn()
 			users, err := store.ListUsers()
 			if err != nil {
 				return err
@@ -76,12 +82,13 @@ func userListCmd() *cobra.Command {
 				fmt.Println(string(data))
 				return nil
 			}
-			printUsers("Users store: "+resolveUserStorePath(usersDir), users)
+			printUsers(header, users)
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&usersDir, "users-dir", "", "path to server users directory (defaults to ~/.config/makewand/server/users)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for user operations")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output users as JSON")
@@ -99,6 +106,7 @@ func userDeactivateCmd() *cobra.Command {
 func userActionCmd(action string) *cobra.Command {
 	var (
 		usersDir    string
+		stateDBPath string
 		remoteURL   string
 		remoteToken string
 	)
@@ -121,19 +129,21 @@ func userActionCmd(action string) *cobra.Command {
 				return nil
 			}
 
-			store, err := resolveUserStore(usersDir)
+			store, closeFn, header, err := openUserStore(usersDir, stateDBPath)
 			if err != nil {
 				return err
 			}
+			defer closeFn()
 			active := action == "activate"
 			if _, err := store.SetUserActive(userID, active); err != nil {
 				return err
 			}
-			fmt.Printf("%s user %s in %s\n", pastTenseAction(action), userID, resolveUserStorePath(usersDir))
+			fmt.Printf("%s user %s in %s\n", pastTenseAction(action), userID, header)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&usersDir, "users-dir", "", "path to server users directory (defaults to ~/.config/makewand/server/users)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for user operations")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
 	return cmd
@@ -142,6 +152,7 @@ func userActionCmd(action string) *cobra.Command {
 func userRoleCmd() *cobra.Command {
 	var (
 		usersDir    string
+		stateDBPath string
 		remoteURL   string
 		remoteToken string
 	)
@@ -165,26 +176,105 @@ func userRoleCmd() *cobra.Command {
 				return nil
 			}
 
-			store, err := resolveUserStore(usersDir)
+			store, closeFn, header, err := openUserStore(usersDir, stateDBPath)
 			if err != nil {
 				return err
 			}
+			defer closeFn()
 			if _, err := store.SetUserRole(userID, role); err != nil {
 				return err
 			}
-			fmt.Printf("Updated role for %s in %s\n", userID, resolveUserStorePath(usersDir))
+			fmt.Printf("Updated role for %s in %s\n", userID, header)
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&usersDir, "users-dir", "", "path to server users directory (defaults to ~/.config/makewand/server/users)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for user operations")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
 	return cmd
 }
 
-func resolveUserStore(usersDir string) (*router.UserStore, error) {
-	return router.NewUserStore(resolveUserStorePath(usersDir)), nil
+func userLoginCmd() *cobra.Command {
+	var (
+		remoteURL  string
+		email      string
+		password   string
+		jsonOutput bool
+	)
+	cmd := &cobra.Command{
+		Use:   "login",
+		Short: "Login and issue a user bearer token from a remote server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL := strings.TrimRight(strings.TrimSpace(remoteURL), "/")
+			if baseURL == "" {
+				return fmt.Errorf("user login requires --remote-url")
+			}
+			payload := map[string]string{
+				"email":    strings.TrimSpace(email),
+				"password": password,
+			}
+			data, err := json.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/users/login", bytes.NewReader(data))
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := newAdminHTTPClient().Do(req)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return err
+			}
+			if resp.StatusCode >= 400 {
+				return fmt.Errorf("user login failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			}
+			var loginResp router.UserLoginResponse
+			if err := json.Unmarshal(body, &loginResp); err != nil {
+				return err
+			}
+			if jsonOutput {
+				rendered, err := json.MarshalIndent(loginResp, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(rendered))
+				return nil
+			}
+			fmt.Printf("Token ID: %s\n", loginResp.TokenID)
+			fmt.Printf("Token: %s\n", loginResp.Token)
+			if !loginResp.ExpiresAt.IsZero() {
+				fmt.Printf("Expires at: %s\n", loginResp.ExpiresAt.UTC().Format(time.RFC3339))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand base URL")
+	cmd.Flags().StringVar(&email, "email", "", "user email")
+	cmd.Flags().StringVar(&password, "password", "", "user password")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output login response as JSON")
+	_ = cmd.MarkFlagRequired("email")
+	_ = cmd.MarkFlagRequired("password")
+	return cmd
+}
+
+func openUserStore(usersDir, stateDBPath string) (router.UserManager, func(), string, error) {
+	if stateDB := resolveManagedStateDBPath(stateDBPath); stateDB != "" {
+		store, err := router.OpenSQLiteUserStore(stateDB)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		return store, func() { _ = store.Close() }, "sqlite:" + stateDB, nil
+	}
+	path := resolveUserStorePath(usersDir)
+	return router.NewUserStore(path), func() {}, path, nil
 }
 
 func resolveUserStorePath(flagValue string) string {

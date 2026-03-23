@@ -71,6 +71,7 @@ http.ListenAndServe(":8080", r.HTTPHandler())
 
 Endpoints:
 - `POST /v1/chat/completions` — Chat completions (`stream=true` supported)
+- `POST /v1/responses` — Non-streaming Responses API subset
 - `GET /v1/models` — List available providers
 - `GET /health` — Health check
 

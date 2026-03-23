@@ -104,6 +104,45 @@ func TestHTTPHandler_ChatCompletionsStream(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_ResponsesSubset(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello from responses"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{"model":"claude","instructions":"be concise","input":"hi","metadata":{"trace":"1"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpResponsesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Object != "response" {
+		t.Fatalf("Object = %q, want response", resp.Object)
+	}
+	if resp.OutputText != "hello from responses" {
+		t.Fatalf("OutputText = %q, want %q", resp.OutputText, "hello from responses")
+	}
+	if len(resp.Output) != 1 || len(resp.Output[0].Content) != 1 || resp.Output[0].Content[0].Text != "hello from responses" {
+		t.Fatalf("Output = %+v, want assistant output text", resp.Output)
+	}
+	if resp.Metadata["trace"] != "1" {
+		t.Fatalf("Metadata = %+v, want trace=1", resp.Metadata)
+	}
+}
+
 func TestHTTPHandler_ModelOverrideUsesRequestedProvider(t *testing.T) {
 	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
 	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}

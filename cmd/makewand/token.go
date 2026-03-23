@@ -29,6 +29,7 @@ func tokenCmd() *cobra.Command {
 
 func tokenListCmd() *cobra.Command {
 	var authConfigPath string
+	var stateDBPath string
 	var jsonOutput bool
 	var remoteURL string
 	var remoteToken string
@@ -58,6 +59,23 @@ func tokenListCmd() *cobra.Command {
 				return nil
 			}
 
+			if stateDB := resolveManagedStateDBPath(stateDBPath); stateDB != "" {
+				store, err := serverauth.OpenSQLiteStore(stateDB)
+				if err != nil {
+					return err
+				}
+				defer store.Close()
+				if jsonOutput {
+					data, err := json.MarshalIndent(store.TokenRules(), "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printTokenRules("State DB: "+stateDB, store.TokenRules())
+				return nil
+			}
 			path, err := resolveManagedAuthConfigPath(authConfigPath)
 			if err != nil {
 				return err
@@ -80,6 +98,7 @@ func tokenListCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&authConfigPath, "auth-config", "", "path to JSON auth config (defaults to MAKEWAND_SERVER_AUTH_CONFIG or ~/.config/makewand/server_auth.json)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for token operations")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output token rules as JSON")
@@ -89,6 +108,7 @@ func tokenListCmd() *cobra.Command {
 func tokenIssueCmd() *cobra.Command {
 	var (
 		authConfigPath     string
+		stateDBPath        string
 		tokenID            string
 		description        string
 		tokenValue         string
@@ -156,6 +176,35 @@ func tokenIssueCmd() *cobra.Command {
 				return nil
 			}
 
+			if stateDB := resolveManagedStateDBPath(stateDBPath); stateDB != "" {
+				store, err := serverauth.OpenSQLiteStore(stateDB)
+				if err != nil {
+					return err
+				}
+				defer store.Close()
+				view, tokenValue, err := store.Issue(rule)
+				if err != nil {
+					return err
+				}
+				if jsonOutput {
+					payload := map[string]any{
+						"state_db": stateDB,
+						"token_id": view.ID,
+						"token":    tokenValue,
+						"rule":     view,
+					}
+					data, err := json.MarshalIndent(payload, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				fmt.Printf("State DB: %s\n", stateDB)
+				fmt.Printf("Token ID: %s\n", view.ID)
+				fmt.Printf("Token: %s\n", tokenValue)
+				return nil
+			}
 			path, err := resolveManagedAuthConfigPath(authConfigPath)
 			if err != nil {
 				return err
@@ -201,6 +250,7 @@ func tokenIssueCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&authConfigPath, "auth-config", "", "path to JSON auth config (defaults to MAKEWAND_SERVER_AUTH_CONFIG or ~/.config/makewand/server_auth.json)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for token operations")
 	cmd.Flags().StringVar(&tokenID, "id", "", "stable token identifier")
 	cmd.Flags().StringVar(&description, "description", "", "human-readable token description")
 	cmd.Flags().StringVar(&tokenValue, "token", "", "explicit bearer token value (default: generated)")
@@ -221,6 +271,7 @@ func tokenIssueCmd() *cobra.Command {
 
 func tokenRevokeCmd() *cobra.Command {
 	var authConfigPath string
+	var stateDBPath string
 	var remoteURL string
 	var remoteToken string
 
@@ -239,6 +290,18 @@ func tokenRevokeCmd() *cobra.Command {
 					return err
 				}
 				fmt.Printf("Revoked token %s via %s\n", args[0], baseURL)
+				return nil
+			}
+			if stateDB := resolveManagedStateDBPath(stateDBPath); stateDB != "" {
+				store, err := serverauth.OpenSQLiteStore(stateDB)
+				if err != nil {
+					return err
+				}
+				defer store.Close()
+				if err := store.Revoke(args[0]); err != nil {
+					return err
+				}
+				fmt.Printf("Revoked token %s in %s\n", args[0], stateDB)
 				return nil
 			}
 			path, err := resolveManagedAuthConfigPath(authConfigPath)
@@ -261,6 +324,7 @@ func tokenRevokeCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&authConfigPath, "auth-config", "", "path to JSON auth config (defaults to MAKEWAND_SERVER_AUTH_CONFIG or ~/.config/makewand/server_auth.json)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for token operations")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
 	return cmd
@@ -279,6 +343,17 @@ func resolveManagedAuthConfigPath(flagValue string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "server_auth.json"), nil
+}
+
+func resolveManagedStateDBPath(flagValue string) string {
+	flagValue = strings.TrimSpace(flagValue)
+	if flagValue != "" {
+		return flagValue
+	}
+	if env := strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_STATE_DB")); env != "" {
+		return env
+	}
+	return ""
 }
 
 func loadOrCreateAuthConfig(path string) (serverauth.Config, error) {
