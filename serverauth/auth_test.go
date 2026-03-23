@@ -41,6 +41,15 @@ func TestNewAuthorizer_ValidatesRules(t *testing.T) {
 	if err == nil {
 		t.Fatal("NewAuthorizer() error = nil, want negative daily quota validation error")
 	}
+
+	_, err = NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{Token: "a", Scopes: []string{ScopeModelsRead}, MaxCostUSDPerDay: -0.1},
+		},
+	})
+	if err == nil {
+		t.Fatal("NewAuthorizer() error = nil, want negative daily cost validation error")
+	}
 }
 
 func TestAuthorizer_AuthenticatesScopedGrant(t *testing.T) {
@@ -241,6 +250,55 @@ func TestGrant_CheckAndConsumeRequestAt_ResetsDaily(t *testing.T) {
 	}
 }
 
+func TestGrant_CostBudgetResetsAcrossDayAndMonth(t *testing.T) {
+	authz, err := NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{
+				Token:              "alpha",
+				Scopes:             []string{ScopeModelsRead},
+				MaxCostUSDPerDay:   1.0,
+				MaxCostUSDPerMonth: 2.0,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	grant, ok := authz.AuthenticateHeader("Bearer alpha")
+	if !ok {
+		t.Fatal("AuthenticateHeader(alpha) = false, want true")
+	}
+
+	day1 := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+	if err := grant.CheckCostBudgetAt(day1); err != nil {
+		t.Fatalf("CheckCostBudgetAt(day1): %v", err)
+	}
+	grant.RecordCostAt(day1, 1.0)
+	if err := grant.CheckCostBudgetAt(day1.Add(time.Minute)); err != ErrDailyCostExceeded {
+		t.Fatalf("CheckCostBudgetAt(same day) = %v, want %v", err, ErrDailyCostExceeded)
+	}
+
+	day2 := day1.Add(24 * time.Hour)
+	if err := grant.CheckCostBudgetAt(day2); err != nil {
+		t.Fatalf("CheckCostBudgetAt(day2): %v", err)
+	}
+	grant.RecordCostAt(day2, 1.0)
+	if err := grant.CheckCostBudgetAt(day2.Add(time.Minute)); err != ErrDailyCostExceeded {
+		t.Fatalf("CheckCostBudgetAt(day2 same day) = %v, want %v", err, ErrDailyCostExceeded)
+	}
+
+	sameMonthNextDay := day2.Add(24 * time.Hour)
+	if err := grant.CheckCostBudgetAt(sameMonthNextDay); err != ErrMonthlyCostExceeded {
+		t.Fatalf("CheckCostBudgetAt(month exhausted) = %v, want %v", err, ErrMonthlyCostExceeded)
+	}
+
+	nextMonth := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	if err := grant.CheckCostBudgetAt(nextMonth); err != nil {
+		t.Fatalf("CheckCostBudgetAt(nextMonth): %v", err)
+	}
+}
+
 func TestSaveAndLoadConfigFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "server_auth.json")
 	cfg := Config{
@@ -251,6 +309,8 @@ func TestSaveAndLoadConfigFile(t *testing.T) {
 				Scopes:             []string{ScopeModelsRead, ScopeChatInvoke},
 				MaxRequestsPerHour: 10,
 				MaxRequestsPerDay:  100,
+				MaxCostUSDPerDay:   1.25,
+				MaxCostUSDPerMonth: 20.5,
 			},
 		},
 	}
@@ -273,6 +333,12 @@ func TestSaveAndLoadConfigFile(t *testing.T) {
 	if loaded.Tokens[0].MaxRequestsPerDay != 100 {
 		t.Fatalf("loaded MaxRequestsPerDay = %d, want 100", loaded.Tokens[0].MaxRequestsPerDay)
 	}
+	if loaded.Tokens[0].MaxCostUSDPerDay != 1.25 {
+		t.Fatalf("loaded MaxCostUSDPerDay = %f, want 1.25", loaded.Tokens[0].MaxCostUSDPerDay)
+	}
+	if loaded.Tokens[0].MaxCostUSDPerMonth != 20.5 {
+		t.Fatalf("loaded MaxCostUSDPerMonth = %f, want 20.5", loaded.Tokens[0].MaxCostUSDPerMonth)
+	}
 }
 
 func TestGenerateToken(t *testing.T) {
@@ -289,5 +355,14 @@ func TestGenerateToken(t *testing.T) {
 	}
 	if !strings.HasPrefix(first, "mw_") {
 		t.Fatalf("GenerateToken() = %q, want mw_ prefix", first)
+	}
+}
+
+func TestAllClientScopes_ExcludesAdminScopes(t *testing.T) {
+	clientScopes := AllClientScopes()
+	for _, scope := range clientScopes {
+		if strings.HasPrefix(scope, "admin:") {
+			t.Fatalf("AllClientScopes() unexpectedly included admin scope %q", scope)
+		}
 	}
 }

@@ -20,22 +20,28 @@ func TestLoadServeAuthorizer_UsesConfigFile(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	authz, err := loadServeAuthorizer("", path)
+	authz, manager, err := loadServeAuthorizer("", path)
 	if err != nil {
 		t.Fatalf("loadServeAuthorizer: %v", err)
 	}
 	if authz == nil {
 		t.Fatal("loadServeAuthorizer() = nil, want authorizer")
+	}
+	if manager == nil {
+		t.Fatal("loadServeAuthorizer() manager = nil, want manager")
 	}
 }
 
 func TestLoadServeAuthorizer_UsesLegacyTokenFallback(t *testing.T) {
-	authz, err := loadServeAuthorizer("secret", "")
+	authz, manager, err := loadServeAuthorizer("secret", "")
 	if err != nil {
 		t.Fatalf("loadServeAuthorizer: %v", err)
 	}
 	if authz == nil {
 		t.Fatal("loadServeAuthorizer() = nil, want authorizer")
+	}
+	if manager != nil {
+		t.Fatal("loadServeAuthorizer() manager != nil, want nil in legacy token mode")
 	}
 }
 
