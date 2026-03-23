@@ -112,6 +112,24 @@ func TestHandler_TokenLifecycleAndAuditQueries(t *testing.T) {
 		t.Fatalf("summary total cost = %.2f, want 0.25", summaryResp.Summary.TotalCostUSD)
 	}
 
+	usageReq := httptest.NewRequest(http.MethodGet, "/v1/admin/usage/summary?token_id=runner", nil)
+	usageReq.Header.Set("Authorization", "Bearer admin-secret")
+	usageRec := httptest.NewRecorder()
+	handler.ServeHTTP(usageRec, usageReq)
+	if usageRec.Code != http.StatusOK {
+		t.Fatalf("usage status = %d, want 200; body: %s", usageRec.Code, usageRec.Body.String())
+	}
+	var usageResp struct {
+		Path  string         `json:"path"`
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.NewDecoder(usageRec.Body).Decode(&usageResp); err != nil {
+		t.Fatalf("decode usage response: %v", err)
+	}
+	if usageResp.Usage["total_cost_usd"] != 0.25 {
+		t.Fatalf("usage total cost = %#v, want 0.25", usageResp.Usage["total_cost_usd"])
+	}
+
 	revokeReq := httptest.NewRequest(http.MethodPost, "/v1/admin/tokens/runner/revoke", nil)
 	revokeReq.Header.Set("Authorization", "Bearer admin-secret")
 	revokeRec := httptest.NewRecorder()

@@ -70,13 +70,13 @@ http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
 Endpoints:
-- `POST /v1/chat/completions` — Chat completions (non-streaming)
+- `POST /v1/chat/completions` — Chat completions (`stream=true` supported)
 - `GET /v1/models` — List available providers
 - `GET /health` — Health check
 
 The HTTP facade accepts a provider name from `/v1/models` in the `model` field
-to force a specific provider. `max_tokens`, `temperature`, and HTTP streaming
-are not yet supported and return `400`.
+to force a specific provider. `max_tokens` and `temperature` are accepted but
+currently ignored for compatibility.
 
 ### Strategy Hot-Reload
 
