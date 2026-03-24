@@ -2,9 +2,13 @@ package serverteam
 
 import (
 	"crypto/rand"
+	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -212,6 +216,132 @@ func RoleRank(role string) int {
 
 func RoleAtLeast(role, required string) bool {
 	return RoleRank(role) >= RoleRank(required)
+}
+
+// BuildBillingBucket computes the current spend posture for one budgeted scope.
+func BuildBillingBucket(id, name string, budgetUSD, spendUSD float64, requestCount int) BillingBucket {
+	bucket := BillingBucket{
+		ID:                 id,
+		Name:               name,
+		MonthlyBudgetUSD:   budgetUSD,
+		SpendUSD:           spendUSD,
+		RemainingBudgetUSD: budgetUSD - spendUSD,
+		RequestCount:       requestCount,
+		OverBudget:         budgetUSD > 0 && spendUSD > budgetUSD,
+	}
+	if budgetUSD <= 0 {
+		bucket.RemainingBudgetUSD = 0
+		return bucket
+	}
+	bucket.UtilizationPercent = math.Round((spendUSD/budgetUSD)*10000) / 100
+	return bucket
+}
+
+// BuildBudgetAlert returns the alert view for a budget bucket when thresholds are exceeded.
+func BuildBudgetAlert(scopeType string, bucket BillingBucket) (BudgetAlert, bool) {
+	if bucket.MonthlyBudgetUSD <= 0 {
+		return BudgetAlert{}, false
+	}
+	severity := ""
+	switch {
+	case bucket.OverBudget || bucket.UtilizationPercent >= 100:
+		severity = "critical"
+	case bucket.UtilizationPercent >= 90:
+		severity = "high"
+	case bucket.UtilizationPercent >= 80:
+		severity = "warning"
+	default:
+		return BudgetAlert{}, false
+	}
+	return BudgetAlert{
+		ScopeType:          scopeType,
+		ID:                 bucket.ID,
+		Name:               bucket.Name,
+		Severity:           severity,
+		MonthlyBudgetUSD:   bucket.MonthlyBudgetUSD,
+		SpendUSD:           bucket.SpendUSD,
+		RemainingBudgetUSD: bucket.RemainingBudgetUSD,
+		UtilizationPercent: bucket.UtilizationPercent,
+		RequestCount:       bucket.RequestCount,
+	}, true
+}
+
+// WriteBillingSummaryCSV renders organization and project billing buckets as a unified CSV stream.
+func WriteBillingSummaryCSV(w io.Writer, summary BillingSummary) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{
+		"scope_type",
+		"id",
+		"name",
+		"monthly_budget_usd",
+		"spend_usd",
+		"remaining_budget_usd",
+		"utilization_percent",
+		"request_count",
+		"over_budget",
+	}); err != nil {
+		return err
+	}
+	writeBucket := func(scopeType string, bucket BillingBucket) error {
+		return cw.Write([]string{
+			scopeType,
+			bucket.ID,
+			bucket.Name,
+			strconv.FormatFloat(bucket.MonthlyBudgetUSD, 'f', 6, 64),
+			strconv.FormatFloat(bucket.SpendUSD, 'f', 6, 64),
+			strconv.FormatFloat(bucket.RemainingBudgetUSD, 'f', 6, 64),
+			strconv.FormatFloat(bucket.UtilizationPercent, 'f', 2, 64),
+			strconv.Itoa(bucket.RequestCount),
+			strconv.FormatBool(bucket.OverBudget),
+		})
+	}
+	for _, bucket := range summary.Organizations {
+		if err := writeBucket("organization", bucket); err != nil {
+			return err
+		}
+	}
+	for _, bucket := range summary.Projects {
+		if err := writeBucket("project", bucket); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+// WriteBudgetAlertsCSV renders budget alerts as CSV.
+func WriteBudgetAlertsCSV(w io.Writer, alerts []BudgetAlert) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{
+		"scope_type",
+		"id",
+		"name",
+		"severity",
+		"monthly_budget_usd",
+		"spend_usd",
+		"remaining_budget_usd",
+		"utilization_percent",
+		"request_count",
+	}); err != nil {
+		return err
+	}
+	for _, alert := range alerts {
+		if err := cw.Write([]string{
+			alert.ScopeType,
+			alert.ID,
+			alert.Name,
+			alert.Severity,
+			strconv.FormatFloat(alert.MonthlyBudgetUSD, 'f', 6, 64),
+			strconv.FormatFloat(alert.SpendUSD, 'f', 6, 64),
+			strconv.FormatFloat(alert.RemainingBudgetUSD, 'f', 6, 64),
+			strconv.FormatFloat(alert.UtilizationPercent, 'f', 2, 64),
+			strconv.Itoa(alert.RequestCount),
+		}); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
 }
 
 func normalizeOrganizationMembership(membership OrganizationMembership) (OrganizationMembership, error) {

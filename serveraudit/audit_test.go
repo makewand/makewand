@@ -2,9 +2,11 @@ package serveraudit
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -102,5 +104,24 @@ func TestLoadEventsAndSummarize(t *testing.T) {
 	}
 	if len(allEvents) != 2 {
 		t.Fatalf("len(allEvents) = %d, want 2", len(allEvents))
+	}
+}
+
+func TestWriteEventsCSV(t *testing.T) {
+	var buf bytes.Buffer
+	err := WriteEventsCSV(&buf, []Event{{
+		Timestamp:      time.Date(2026, 3, 23, 0, 0, 0, 0, time.UTC),
+		RequestID:      "req_1",
+		Kind:           "chat",
+		TokenID:        "runner",
+		ActualProvider: "codex",
+		Status:         200,
+	}})
+	if err != nil {
+		t.Fatalf("WriteEventsCSV: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "request_id") || !strings.Contains(out, "req_1") {
+		t.Fatalf("csv output missing expected values: %s", out)
 	}
 }

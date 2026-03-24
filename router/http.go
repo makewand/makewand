@@ -1125,10 +1125,11 @@ func checkTeamBudget(teamStore serverteam.Store, usageReader serverusage.Reader,
 	if teamStore == nil || usageReader == nil || grant == nil {
 		return nil
 	}
+	now := time.Now().UTC()
 	if projectID := strings.TrimSpace(grant.ProjectID()); projectID != "" {
 		project, err := teamStore.GetProject(projectID)
 		if err == nil && project != nil && project.MonthlyBudgetUSD > 0 {
-			entries, err := usageReader.Load(serverusage.Filter{ProjectID: projectID})
+			entries, err := usageReader.Load(serverusage.CurrentMonthFilter(serverusage.Filter{ProjectID: projectID}, now))
 			if err != nil {
 				return err
 			}
@@ -1145,7 +1146,7 @@ func checkTeamBudget(teamStore serverteam.Store, usageReader serverusage.Reader,
 	if orgID := strings.TrimSpace(grant.OrganizationID()); orgID != "" {
 		org, err := teamStore.GetOrganization(orgID)
 		if err == nil && org != nil && org.MonthlyBudgetUSD > 0 {
-			entries, err := usageReader.Load(serverusage.Filter{OrgID: orgID})
+			entries, err := usageReader.Load(serverusage.CurrentMonthFilter(serverusage.Filter{OrgID: orgID}, now))
 			if err != nil {
 				return err
 			}

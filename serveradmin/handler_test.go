@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +138,20 @@ func TestHandler_TokenLifecycleAndAuditQueries(t *testing.T) {
 	}
 	if summaryResp.Summary.TotalCostUSD != 0.25 {
 		t.Fatalf("summary total cost = %.2f, want 0.25", summaryResp.Summary.TotalCostUSD)
+	}
+
+	eventsCSVReq := httptest.NewRequest(http.MethodGet, "/v1/admin/audit/events?format=csv", nil)
+	eventsCSVReq.Header.Set("Authorization", "Bearer admin-secret")
+	eventsCSVRec := httptest.NewRecorder()
+	handler.ServeHTTP(eventsCSVRec, eventsCSVReq)
+	if eventsCSVRec.Code != http.StatusOK {
+		t.Fatalf("audit csv status = %d, want 200; body: %s", eventsCSVRec.Code, eventsCSVRec.Body.String())
+	}
+	if got := eventsCSVRec.Header().Get("Content-Type"); !strings.Contains(got, "text/csv") {
+		t.Fatalf("audit csv content-type = %q, want text/csv", got)
+	}
+	if !strings.Contains(eventsCSVRec.Body.String(), "request_id") {
+		t.Fatalf("audit csv body missing header: %s", eventsCSVRec.Body.String())
 	}
 
 	usageReq := httptest.NewRequest(http.MethodGet, "/v1/admin/usage/summary?token_id=runner", nil)
@@ -330,8 +345,22 @@ func TestHandler_OrganizationsProjectsBillingAndDashboard(t *testing.T) {
 		t.Fatal("project id = empty")
 	}
 
+	now := time.Now().UTC()
 	usageStore.Log(serverusage.Entry{
-		Timestamp:        time.Date(2026, 3, 23, 2, 0, 0, 0, time.UTC),
+		Timestamp:        serverusage.MonthStart(now).AddDate(0, -1, 0).Add(2 * time.Hour),
+		RequestID:        "req_team_old",
+		TokenID:          "runner",
+		UserID:           "usr_123",
+		OrganizationID:   createOrgResp.Organization.ID,
+		ProjectID:        createProjectResp.Project.ID,
+		ActualProvider:   "codex",
+		Status:           200,
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		CostUSD:          50,
+	})
+	usageStore.Log(serverusage.Entry{
+		Timestamp:        serverusage.MonthStart(now).Add(2 * time.Hour),
 		RequestID:        "req_team_1",
 		TokenID:          "runner",
 		UserID:           "usr_123",
@@ -410,8 +439,11 @@ func TestHandler_OrganizationsProjectsBillingAndDashboard(t *testing.T) {
 	if err := json.NewDecoder(periodsRec.Body).Decode(&periodsResp); err != nil {
 		t.Fatalf("decode periods response: %v", err)
 	}
-	if len(periodsResp.Periods) != 1 || periodsResp.Periods[0].Period != "2026-03" {
-		t.Fatalf("periods = %+v, want one 2026-03 bucket", periodsResp.Periods)
+	if len(periodsResp.Periods) != 2 {
+		t.Fatalf("periods = %+v, want two month buckets", periodsResp.Periods)
+	}
+	if periodsResp.Periods[len(periodsResp.Periods)-1].Period != serverusage.MonthStart(now).Format("2006-01") {
+		t.Fatalf("latest period = %+v, want current month %s", periodsResp.Periods, serverusage.MonthStart(now).Format("2006-01"))
 	}
 
 	alertsReq := httptest.NewRequest(http.MethodGet, "/v1/admin/billing/alerts", nil)
@@ -429,6 +461,34 @@ func TestHandler_OrganizationsProjectsBillingAndDashboard(t *testing.T) {
 	}
 	if len(alertsResp.Alerts) != 0 {
 		t.Fatalf("alerts = %+v, want none under threshold", alertsResp.Alerts)
+	}
+
+	billingCSVReq := httptest.NewRequest(http.MethodGet, "/v1/admin/billing/summary?organization_id="+createOrgResp.Organization.ID+"&format=csv", nil)
+	billingCSVReq.Header.Set("Authorization", "Bearer admin-secret")
+	billingCSVRec := httptest.NewRecorder()
+	handler.ServeHTTP(billingCSVRec, billingCSVReq)
+	if billingCSVRec.Code != http.StatusOK {
+		t.Fatalf("billing csv status = %d, want 200; body: %s", billingCSVRec.Code, billingCSVRec.Body.String())
+	}
+	if got := billingCSVRec.Header().Get("Content-Type"); !strings.Contains(got, "text/csv") {
+		t.Fatalf("billing csv content-type = %q, want text/csv", got)
+	}
+	if !strings.Contains(billingCSVRec.Body.String(), "scope_type") || !strings.Contains(billingCSVRec.Body.String(), createProjectResp.Project.ID) {
+		t.Fatalf("billing csv body missing expected values: %s", billingCSVRec.Body.String())
+	}
+
+	usageCSVReq := httptest.NewRequest(http.MethodGet, "/v1/admin/usage/events?format=csv", nil)
+	usageCSVReq.Header.Set("Authorization", "Bearer admin-secret")
+	usageCSVRec := httptest.NewRecorder()
+	handler.ServeHTTP(usageCSVRec, usageCSVReq)
+	if usageCSVRec.Code != http.StatusOK {
+		t.Fatalf("usage csv status = %d, want 200; body: %s", usageCSVRec.Code, usageCSVRec.Body.String())
+	}
+	if got := usageCSVRec.Header().Get("Content-Type"); !strings.Contains(got, "text/csv") {
+		t.Fatalf("usage csv content-type = %q, want text/csv", got)
+	}
+	if !strings.Contains(usageCSVRec.Body.String(), "request_id") || !strings.Contains(usageCSVRec.Body.String(), "req_team_1") {
+		t.Fatalf("usage csv body missing expected values: %s", usageCSVRec.Body.String())
 	}
 
 	dashboardReq := httptest.NewRequest(http.MethodGet, "/v1/admin/dashboard", nil)

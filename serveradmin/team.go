@@ -3,9 +3,9 @@ package serveradmin
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/serverteam"
@@ -196,6 +196,7 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
+	filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
 	constrainUsageFilterByGrant(&filter, grant)
 	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
@@ -209,7 +210,7 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
 			orgs = filterOrganizations(orgs, req, grant)
 			for _, org := range orgs {
-				billing.Organizations = append(billing.Organizations, newBillingBucket(
+				billing.Organizations = append(billing.Organizations, serverteam.BuildBillingBucket(
 					org.ID,
 					org.Name,
 					org.MonthlyBudgetUSD,
@@ -225,7 +226,7 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 		if projects, err := opts.TeamStore.ListProjects(orgID); err == nil {
 			projects = filterProjects(projects, req, grant)
 			for _, project := range projects {
-				billing.Projects = append(billing.Projects, newBillingBucket(
+				billing.Projects = append(billing.Projects, serverteam.BuildBillingBucket(
 					project.ID,
 					project.Name,
 					project.MonthlyBudgetUSD,
@@ -234,6 +235,16 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 				))
 			}
 		}
+	}
+	if wantsCSV(req) {
+		writeCSVHeaders(w, "billing-summary.csv")
+		if err := serverteam.WriteBillingSummaryCSV(w, billing); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+			return
+		}
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing", http.StatusOK, "", 0, 0, 0)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":    opts.UsagePath,
@@ -265,9 +276,20 @@ func handleBillingPeriods(w http.ResponseWriter, req *http.Request, opts Handler
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_periods", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
+	periods := serverusage.SummarizeMonthlyPeriods(entries)
+	if wantsCSV(req) {
+		writeCSVHeaders(w, "billing-periods.csv")
+		if err := serverusage.WritePeriodsCSV(w, periods); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_periods", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+			return
+		}
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_periods", http.StatusOK, "", 0, 0, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":    opts.UsagePath,
-		"periods": serverusage.SummarizeMonthlyPeriods(entries),
+		"periods": periods,
 	})
 	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_periods", http.StatusOK, "", 0, 0, 0)
 }
@@ -287,6 +309,7 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_alerts", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
+	filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
 	constrainUsageFilterByGrant(&filter, grant)
 	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
@@ -300,7 +323,7 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
 			orgs = filterOrganizations(orgs, req, grant)
 			for _, org := range orgs {
-				if alert, ok := billingAlertFromBucket("organization", newBillingBucket(
+				if alert, ok := serverteam.BuildBudgetAlert("organization", serverteam.BuildBillingBucket(
 					org.ID,
 					org.Name,
 					org.MonthlyBudgetUSD,
@@ -318,7 +341,7 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 		if projects, err := opts.TeamStore.ListProjects(orgID); err == nil {
 			projects = filterProjects(projects, req, grant)
 			for _, project := range projects {
-				if alert, ok := billingAlertFromBucket("project", newBillingBucket(
+				if alert, ok := serverteam.BuildBudgetAlert("project", serverteam.BuildBillingBucket(
 					project.ID,
 					project.Name,
 					project.MonthlyBudgetUSD,
@@ -329,6 +352,16 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 				}
 			}
 		}
+	}
+	if wantsCSV(req) {
+		writeCSVHeaders(w, "billing-alerts.csv")
+		if err := serverteam.WriteBudgetAlertsCSV(w, alerts); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_alerts", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+			return
+		}
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_alerts", http.StatusOK, "", 0, 0, 0)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":   opts.UsagePath,
@@ -352,6 +385,7 @@ func handleDashboard(w http.ResponseWriter, req *http.Request, opts HandlerOptio
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_dashboard", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
+	filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
 	constrainUsageFilterByGrant(&filter, grant)
 	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
@@ -698,50 +732,4 @@ func filterProjectMemberships(items []serverteam.ProjectMembership, req *http.Re
 		out = append(out, item)
 	}
 	return out
-}
-
-func newBillingBucket(id, name string, budgetUSD, spendUSD float64, requestCount int) serverteam.BillingBucket {
-	bucket := serverteam.BillingBucket{
-		ID:                 id,
-		Name:               name,
-		MonthlyBudgetUSD:   budgetUSD,
-		SpendUSD:           spendUSD,
-		RemainingBudgetUSD: budgetUSD - spendUSD,
-		RequestCount:       requestCount,
-		OverBudget:         budgetUSD > 0 && spendUSD > budgetUSD,
-	}
-	if budgetUSD <= 0 {
-		bucket.RemainingBudgetUSD = 0
-		return bucket
-	}
-	bucket.UtilizationPercent = math.Round((spendUSD/budgetUSD)*10000) / 100
-	return bucket
-}
-
-func billingAlertFromBucket(scopeType string, bucket serverteam.BillingBucket) (serverteam.BudgetAlert, bool) {
-	if bucket.MonthlyBudgetUSD <= 0 {
-		return serverteam.BudgetAlert{}, false
-	}
-	severity := ""
-	switch {
-	case bucket.OverBudget || bucket.UtilizationPercent >= 100:
-		severity = "critical"
-	case bucket.UtilizationPercent >= 90:
-		severity = "high"
-	case bucket.UtilizationPercent >= 80:
-		severity = "warning"
-	default:
-		return serverteam.BudgetAlert{}, false
-	}
-	return serverteam.BudgetAlert{
-		ScopeType:          scopeType,
-		ID:                 bucket.ID,
-		Name:               bucket.Name,
-		Severity:           severity,
-		MonthlyBudgetUSD:   bucket.MonthlyBudgetUSD,
-		SpendUSD:           bucket.SpendUSD,
-		RemainingBudgetUSD: bucket.RemainingBudgetUSD,
-		UtilizationPercent: bucket.UtilizationPercent,
-		RequestCount:       bucket.RequestCount,
-	}, true
 }

@@ -2,11 +2,13 @@ package serveraudit
 
 import (
 	"bufio"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -219,6 +221,59 @@ func SortedStringTotals(m map[string]float64) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// WriteEventsCSV renders audit events as CSV.
+func WriteEventsCSV(w io.Writer, events []Event) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{
+		"timestamp",
+		"request_id",
+		"kind",
+		"token_id",
+		"token_description",
+		"scope",
+		"method",
+		"path",
+		"status",
+		"duration_ms",
+		"requested_mode",
+		"requested_model",
+		"actual_provider",
+		"workspace_id",
+		"prompt_tokens",
+		"completion_tokens",
+		"cost_usd",
+		"error",
+	}); err != nil {
+		return err
+	}
+	for _, evt := range events {
+		if err := cw.Write([]string{
+			evt.Timestamp.UTC().Format(time.RFC3339Nano),
+			evt.RequestID,
+			evt.Kind,
+			evt.TokenID,
+			evt.TokenDescription,
+			evt.Scope,
+			evt.Method,
+			evt.Path,
+			strconv.Itoa(evt.Status),
+			strconv.FormatInt(evt.DurationMS, 10),
+			evt.RequestedMode,
+			evt.RequestedModel,
+			evt.ActualProvider,
+			evt.WorkspaceID,
+			strconv.Itoa(evt.PromptTokens),
+			strconv.Itoa(evt.CompletionTokens),
+			strconv.FormatFloat(evt.CostUSD, 'f', 6, 64),
+			evt.Error,
+		}); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
 }
 
 func matchesFilter(evt Event, filter Filter) bool {

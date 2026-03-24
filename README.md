@@ -108,6 +108,7 @@ makewand token issue \
 
 MAKEWAND_SERVER_AUTH_CONFIG=~/.config/makewand/server_auth.json \
 MAKEWAND_SERVER_AUDIT_LOG=1 \
+MAKEWAND_SERVER_ALERT_WEBHOOK=https://alerts.example.com/makewand \
 makewand serve --listen 127.0.0.1:8080 --enable-users
 ```
 
@@ -120,6 +121,16 @@ The same server also exposes a lightweight admin console at `/admin` for live
 dashboards, token issuance, team setup, and billing inspection.
 同一个服务端还会在 `/admin` 提供一个轻量管理界面，用于查看实时仪表盘、签发 token、
 配置团队和检查账单汇总。
+
+Budget enforcement and billing alerts now evaluate against the current month by
+default, so previous months no longer consume the active monthly budget. When
+`MAKEWAND_SERVER_ALERT_WEBHOOK` or `--alert-webhook` is configured, the server
+will also POST webhook notifications as organizations or projects cross
+`warning/high/critical` spend thresholds for the month.
+月预算和 billing alert 现在默认按“当前月份”计算，不会再把历史月份的支出累积到
+本月预算里。若设置 `MAKEWAND_SERVER_ALERT_WEBHOOK` 或 `--alert-webhook`，
+服务端还会在 organization / project 跨过当月 `warning/high/critical`
+预算阈值时主动发送 webhook 通知。
 
 The admin console can now sign in with a server-side browser session instead of
 storing a long-lived admin bearer token in the page. Mutating admin requests
@@ -193,9 +204,24 @@ makewand audit summary \
   --remote-url http://your-main-machine:8080 \
   --remote-token your-admin-token
 
+makewand audit events \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --csv > audit-events.csv
+
 makewand usage summary \
   --remote-url http://your-main-machine:8080 \
   --remote-token your-admin-token
+
+makewand usage events \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --csv > usage-events.csv
+
+makewand usage periods \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --csv > billing-periods.csv
 
 makewand user list \
   --remote-url http://your-main-machine:8080 \
@@ -203,7 +229,8 @@ makewand user list \
 
 makewand usage alerts \
   --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token
+  --remote-token your-admin-token \
+  --csv > billing-alerts.csv
 ```
 
 Admin APIs / 管理 API：
@@ -217,13 +244,13 @@ Admin APIs / 管理 API：
 | `GET /v1/admin/session/me` | admin browser session check |
 | `POST /v1/admin/session/logout` | admin browser logout |
 | `GET /v1/admin/audit/summary` | `admin:audit:read` |
-| `GET /v1/admin/audit/events` | `admin:audit:read` |
+| `GET /v1/admin/audit/events` | `admin:audit:read` (`?format=csv` supported) |
 | `GET /v1/admin/dashboard` | `admin:usage:read` |
-| `GET /v1/admin/billing/summary` | `admin:usage:read` |
-| `GET /v1/admin/billing/periods` | `admin:usage:read` |
-| `GET /v1/admin/billing/alerts` | `admin:usage:read` |
+| `GET /v1/admin/billing/summary` | `admin:usage:read` (`?format=csv` supported) |
+| `GET /v1/admin/billing/periods` | `admin:usage:read` (`?format=csv` supported) |
+| `GET /v1/admin/billing/alerts` | `admin:usage:read` (`?format=csv` supported) |
 | `GET /v1/admin/usage/summary` | `admin:usage:read` |
-| `GET /v1/admin/usage/events` | `admin:usage:read` |
+| `GET /v1/admin/usage/events` | `admin:usage:read` (`?format=csv` supported) |
 | `GET /v1/admin/users` | `admin:users:read` |
 | `POST /v1/admin/users/{id}/activate` | `admin:users:write` |
 | `POST /v1/admin/users/{id}/deactivate` | `admin:users:write` |

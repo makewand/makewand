@@ -1318,6 +1318,82 @@ func TestHTTPHandler_RejectsRequestsWhenProjectBudgetExceeded(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_ProjectBudgetIgnoresPreviousMonths(t *testing.T) {
+	stateDB := filepath.Join(t.TempDir(), "state.db")
+	teamStore, err := serverteam.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(team): %v", err)
+	}
+	defer teamStore.Close()
+	usageStore, err := serverusage.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(usage): %v", err)
+	}
+	defer usageStore.Close()
+
+	org, err := teamStore.CreateOrganization(serverteam.Organization{
+		ID:               "org_platform",
+		Name:             "Platform Team",
+		MonthlyBudgetUSD: 100,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+	project, err := teamStore.CreateProject(serverteam.Project{
+		ID:               "prj_checkout",
+		OrganizationID:   org.ID,
+		Name:             "Checkout API",
+		MonthlyBudgetUSD: 1,
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	now := time.Now().UTC()
+	usageStore.Log(serverusage.Entry{
+		Timestamp:      serverusage.MonthStart(now).AddDate(0, -1, 0).Add(2 * time.Hour),
+		OrganizationID: org.ID,
+		ProjectID:      project.ID,
+		CostUSD:        5,
+	})
+
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{{
+			Token:          "secret123",
+			Scopes:         []string{serverauth.ScopeChatInvoke},
+			OrganizationID: org.ID,
+			ProjectID:      project.ID,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{
+		Authorizer:  authz,
+		UsageReader: usageStore,
+		TeamStore:   teamStore,
+	})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHTTPHandler_MethodNotAllowed(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 

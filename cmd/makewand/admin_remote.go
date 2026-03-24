@@ -14,6 +14,7 @@ import (
 	"github.com/makewand/makewand/router"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverteam"
 	"github.com/makewand/makewand/serverusage"
 )
 
@@ -53,8 +54,8 @@ type remoteUsagePeriodsResponse struct {
 }
 
 type remoteBillingAlertsResponse struct {
-	Path   string           `json:"path"`
-	Alerts []map[string]any `json:"alerts"`
+	Path   string                   `json:"path"`
+	Alerts []serverteam.BudgetAlert `json:"alerts"`
 }
 
 type remoteUserListResponse struct {
@@ -84,16 +85,27 @@ func newAdminHTTPClient() *http.Client {
 }
 
 func adminGetJSON(baseURL, token, path string, query url.Values, dest any) error {
+	data, err := adminGetRaw(baseURL, token, path, query)
+	if err != nil {
+		return err
+	}
+	if dest == nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, dest)
+}
+
+func adminGetRaw(baseURL, token, path string, query url.Values) ([]byte, error) {
 	endpoint := baseURL + path
 	if len(query) > 0 {
 		endpoint += "?" + query.Encode()
 	}
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	return doAdminJSON(req, dest)
+	return doAdminRaw(req)
 }
 
 func adminPostJSON(baseURL, token, path string, body any, dest any) error {
@@ -113,19 +125,26 @@ func adminPostJSON(baseURL, token, path string, body any, dest any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	return doAdminJSON(req, dest)
-}
-
-func doAdminJSON(req *http.Request, dest any) error {
-	resp, err := newAdminHTTPClient().Do(req)
+	data, err := doAdminRaw(req)
 	if err != nil {
 		return err
+	}
+	if dest == nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, dest)
+}
+
+func doAdminRaw(req *http.Request) ([]byte, error) {
+	resp, err := newAdminHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode >= 400 {
 		var failure struct {
@@ -134,12 +153,9 @@ func doAdminJSON(req *http.Request, dest any) error {
 			} `json:"error"`
 		}
 		if json.Unmarshal(data, &failure) == nil && strings.TrimSpace(failure.Error.Message) != "" {
-			return fmt.Errorf("remote admin request failed (%d): %s", resp.StatusCode, failure.Error.Message)
+			return nil, fmt.Errorf("remote admin request failed (%d): %s", resp.StatusCode, failure.Error.Message)
 		}
-		return fmt.Errorf("remote admin request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return nil, fmt.Errorf("remote admin request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
-	if dest == nil || len(bytes.TrimSpace(data)) == 0 {
-		return nil
-	}
-	return json.Unmarshal(data, dest)
+	return data, nil
 }

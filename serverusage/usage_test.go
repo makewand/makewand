@@ -1,8 +1,10 @@
 package serverusage
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -80,5 +82,52 @@ func TestSQLiteStore_LogAndLoad(t *testing.T) {
 	}
 	if entries[0].RequestID != "req_1" {
 		t.Fatalf("RequestID = %q, want req_1", entries[0].RequestID)
+	}
+}
+
+func TestJSONLReaderAndMonthFilter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	logger, err := OpenJSONL(path)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	defer logger.Close()
+
+	currentMonth := MonthStart(time.Now().UTC())
+	previousMonth := currentMonth.AddDate(0, -1, 0)
+	logger.Log(Entry{Timestamp: previousMonth.Add(2 * time.Hour), RequestID: "old", CostUSD: 1})
+	logger.Log(Entry{Timestamp: currentMonth.Add(2 * time.Hour), RequestID: "new", CostUSD: 2})
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reader := NewJSONLReader(path)
+	entries, err := reader.Load(CurrentMonthFilter(Filter{}, time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("Load(CurrentMonthFilter): %v", err)
+	}
+	if len(entries) != 1 || entries[0].RequestID != "new" {
+		t.Fatalf("entries = %+v, want only current month record", entries)
+	}
+}
+
+func TestWriteEntriesCSV(t *testing.T) {
+	var buf bytes.Buffer
+	err := WriteEntriesCSV(&buf, []Entry{{
+		Timestamp:        time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC),
+		RequestID:        "req_1",
+		TokenID:          "runner",
+		ActualProvider:   "codex",
+		Status:           200,
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		CostUSD:          0.5,
+	}})
+	if err != nil {
+		t.Fatalf("WriteEntriesCSV: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "request_id") || !strings.Contains(out, "req_1") {
+		t.Fatalf("csv output missing expected values: %s", out)
 	}
 }

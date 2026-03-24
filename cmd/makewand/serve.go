@@ -17,6 +17,7 @@ import (
 	"github.com/makewand/makewand/internal/remotesession"
 	"github.com/makewand/makewand/router"
 	"github.com/makewand/makewand/serveradmin"
+	"github.com/makewand/makewand/serveralerts"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/serverhttp"
@@ -29,14 +30,16 @@ import (
 
 func serveCmd() *cobra.Command {
 	var (
-		listenAddr  string
-		token       string
-		dataDir     string
-		authConfig  string
-		auditPath   string
-		usagePath   string
-		stateDBPath string
-		enableUsers bool
+		listenAddr   string
+		token        string
+		dataDir      string
+		authConfig   string
+		auditPath    string
+		usagePath    string
+		alertWebhook string
+		alertState   string
+		stateDBPath  string
+		enableUsers  bool
 	)
 
 	cmd := &cobra.Command{
@@ -64,6 +67,8 @@ func serveCmd() *cobra.Command {
 			auditPath = resolveServeAuditPath(auditPath, dataDir)
 			stateDBPath = resolveServeStateDBPath(stateDBPath, dataDir)
 			usagePath = resolveServeUsagePath(usagePath, dataDir, stateDBPath != "")
+			alertWebhook = resolveServeAlertWebhook(alertWebhook)
+			alertState = resolveServeAlertStatePath(alertState, dataDir)
 			var auditLogger *serveraudit.JSONLLogger
 			if strings.TrimSpace(auditPath) != "" {
 				auditLogger, err = serveraudit.OpenJSONL(auditPath)
@@ -135,6 +140,16 @@ func serveCmd() *cobra.Command {
 					defer sqliteUsers.Close()
 					userStore = sqliteUsers
 				}
+			}
+			if usageStore == nil && strings.TrimSpace(usagePath) != "" {
+				usageStore = serverusage.NewJSONLReader(usagePath)
+			}
+			if alertWebhook != "" {
+				alertNotifier, err := serveralerts.OpenWebhookNotifier(alertWebhook, alertState, usageStore, teamStore)
+				if err != nil {
+					return fmt.Errorf("open alert notifier: %w", err)
+				}
+				usageLogger = combineUsageLoggers(usageLogger, alertNotifier)
 			}
 			if enableUsers && userStore == nil {
 				userStore = router.NewUserStore(filepath.Join(dataDir, "users"))
@@ -217,6 +232,9 @@ func serveCmd() *cobra.Command {
 			if usageDisplayPath != "" {
 				fmt.Printf("Usage store: %s\n", usageDisplayPath)
 			}
+			if alertWebhook != "" {
+				fmt.Printf("Alert webhook: configured\n")
+			}
 			if stateDBPath != "" {
 				fmt.Printf("State DB: %s\n", stateDBPath)
 			}
@@ -240,6 +258,8 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "directory used to persist remote sessions (default: ~/.config/makewand/server)")
 	cmd.Flags().StringVar(&auditPath, "audit-log", "", "path to append-only JSONL audit log (default: <data-dir>/audit.jsonl when MAKEWAND_SERVER_AUDIT_LOG is set)")
 	cmd.Flags().StringVar(&usagePath, "usage-log", "", "path to append-only JSONL usage ledger (disabled by default when SQLite state DB is enabled)")
+	cmd.Flags().StringVar(&alertWebhook, "alert-webhook", "", "HTTP endpoint that receives budget alert webhooks")
+	cmd.Flags().StringVar(&alertState, "alert-state", "", "path to persisted alert delivery state (default: <data-dir>/alert_state.json)")
 	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state database for users, tokens, and usage (default: <data-dir>/state.db)")
 	cmd.Flags().BoolVar(&enableUsers, "enable-users", false, "enable multi-user registration and admin user management")
 	return cmd
@@ -322,6 +342,23 @@ func resolveServeStateDBPath(flagValue, dataDir string) string {
 		return envValue
 	}
 	return filepath.Join(dataDir, "state.db")
+}
+
+func resolveServeAlertWebhook(flagValue string) string {
+	if value := strings.TrimSpace(flagValue); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_ALERT_WEBHOOK"))
+}
+
+func resolveServeAlertStatePath(flagValue, dataDir string) string {
+	if value := strings.TrimSpace(flagValue); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_ALERT_STATE")); value != "" {
+		return value
+	}
+	return filepath.Join(dataDir, "alert_state.json")
 }
 
 func loadOrCreateAdminSessionSecret(path string) ([]byte, error) {
