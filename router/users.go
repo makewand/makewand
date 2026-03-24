@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverteam"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -71,8 +72,10 @@ type UserRegistrationResponse struct {
 
 // UserLoginRequest represents a password-based login request.
 type UserLoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email          string `json:"email"`
+	Password       string `json:"password"`
+	OrganizationID string `json:"organization_id,omitempty"`
+	ProjectID      string `json:"project_id,omitempty"`
 }
 
 // UserLoginResponse returns a newly issued bearer token for the user.
@@ -94,6 +97,7 @@ type UserManager interface {
 	ListUsers() ([]UserView, error)
 	SetUserActive(userID string, active bool) (*User, error)
 	SetUserRole(userID, role string) (*User, error)
+	SetUserPassword(userID, password string) (*User, error)
 }
 
 // UserStore manages user data persistence.
@@ -300,6 +304,27 @@ func (us *UserStore) SetUserRole(userID, role string) (*User, error) {
 	return user, nil
 }
 
+func (us *UserStore) SetUserPassword(userID, password string) (*User, error) {
+	if !isValidPassword(password) {
+		return nil, fmt.Errorf("password must be at least 8 characters long")
+	}
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
+	user.Salt = generateSalt()
+	user.PasswordHash = hashPassword(password, user.Salt)
+	user.UpdatedAt = time.Now().UTC()
+	if err := us.saveUsers(users); err != nil {
+		return nil, fmt.Errorf("save users: %w", err)
+	}
+	return user, nil
+}
+
 // ValidatePassword checks if the provided password matches the user's password.
 func (u *User) ValidatePassword(password string) bool {
 	expectedHash := hashPassword(password, u.Salt)
@@ -436,7 +461,7 @@ func (r *Router) HandleUserRegistration(userStore UserManager) http.HandlerFunc 
 
 // HandleUserLogin handles POST /v1/users/login requests and returns a bearer
 // token issued from the configured server token manager.
-func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.TokenManager) http.HandlerFunc {
+func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.TokenManager, teamStore serverteam.Store, limiter *serverauth.LoginRateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
@@ -452,19 +477,26 @@ func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
 			return
 		}
+		key := serverauth.LoginThrottleKey(req, loginReq.Email)
+		if allowed, retryAfter := limiter.Allow(key, time.Now().UTC()); !allowed {
+			writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("too many failed logins; try again in %s", retryAfter.Round(time.Second)))
+			return
+		}
 		user, err := userStore.GetUserByEmail(loginReq.Email)
 		if err != nil || user == nil || !user.IsActive || !user.ValidatePassword(loginReq.Password) {
+			limiter.RecordFailure(key, time.Now().UTC())
 			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid email or password")
 			return
 		}
+		limiter.Reset(key)
 
 		expiresAt := time.Now().UTC().Add(24 * time.Hour)
-		view, tokenValue, err := tokenManager.Issue(serverauth.TokenRule{
-			ID:          fmt.Sprintf("%s_%d", user.ID, time.Now().UTC().UnixNano()),
-			Description: "user login " + user.Email,
-			Scopes:      loginScopesForUser(user),
-			ExpiresAt:   expiresAt,
-		})
+		rule, err := loginRuleForUser(user, loginReq, teamStore, expiresAt)
+		if err != nil {
+			writeHTTPError(w, http.StatusForbidden, "forbidden", err.Error())
+			return
+		}
+		view, tokenValue, err := tokenManager.Issue(rule)
 		if err != nil {
 			writeHTTPError(w, http.StatusInternalServerError, "login_failed", "failed to issue login token")
 			return
@@ -482,6 +514,83 @@ func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(resp)
 	}
+}
+
+func loginRuleForUser(user *User, req UserLoginRequest, teamStore serverteam.Store, expiresAt time.Time) (serverauth.TokenRule, error) {
+	rule := serverauth.TokenRule{
+		ID:          fmt.Sprintf("%s_%d", user.ID, time.Now().UTC().UnixNano()),
+		Description: "user login " + user.Email,
+		UserID:      user.ID,
+		Scopes:      loginScopesForUser(user),
+		ExpiresAt:   expiresAt,
+	}
+	if user != nil && strings.EqualFold(user.Role, UserRoleAdmin) {
+		rule.OrganizationID = strings.TrimSpace(req.OrganizationID)
+		rule.ProjectID = strings.TrimSpace(req.ProjectID)
+		return rule, nil
+	}
+	if teamStore == nil {
+		return rule, nil
+	}
+	projectID := strings.TrimSpace(req.ProjectID)
+	if projectID != "" {
+		projectMembership, err := teamStore.GetProjectMembership(projectID, user.ID)
+		if err != nil || projectMembership == nil || !projectMembership.IsActive {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not an active member of project %q", projectID)
+		}
+		if !serverteam.RoleAtLeast(projectMembership.Role, serverteam.MembershipRoleViewer) {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not allowed to access project %q", projectID)
+		}
+		rule.OrganizationID = projectMembership.OrganizationID
+		rule.ProjectID = projectMembership.ProjectID
+		return rule, nil
+	}
+	orgID := strings.TrimSpace(req.OrganizationID)
+	if orgID != "" {
+		orgMembership, err := teamStore.GetOrganizationMembership(orgID, user.ID)
+		if err != nil || orgMembership == nil || !orgMembership.IsActive {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not an active member of organization %q", orgID)
+		}
+		if !serverteam.RoleAtLeast(orgMembership.Role, serverteam.MembershipRoleViewer) {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not allowed to access organization %q", orgID)
+		}
+		rule.OrganizationID = orgMembership.OrganizationID
+		return rule, nil
+	}
+	projectMemberships, err := teamStore.ListProjectMemberships("", user.ID)
+	if err == nil {
+		activeProjects := make([]serverteam.ProjectMembership, 0, len(projectMemberships))
+		for _, membership := range projectMemberships {
+			if membership.IsActive {
+				activeProjects = append(activeProjects, membership)
+			}
+		}
+		if len(activeProjects) == 1 {
+			rule.OrganizationID = activeProjects[0].OrganizationID
+			rule.ProjectID = activeProjects[0].ProjectID
+			return rule, nil
+		}
+		if len(activeProjects) > 1 {
+			return serverauth.TokenRule{}, fmt.Errorf("multiple project memberships found; specify --project-id")
+		}
+	}
+	orgMemberships, err := teamStore.ListOrganizationMemberships("", user.ID)
+	if err == nil {
+		activeOrgs := make([]serverteam.OrganizationMembership, 0, len(orgMemberships))
+		for _, membership := range orgMemberships {
+			if membership.IsActive {
+				activeOrgs = append(activeOrgs, membership)
+			}
+		}
+		if len(activeOrgs) == 1 {
+			rule.OrganizationID = activeOrgs[0].OrganizationID
+			return rule, nil
+		}
+		if len(activeOrgs) > 1 {
+			return serverauth.TokenRule{}, fmt.Errorf("multiple organization memberships found; specify --organization-id or --project-id")
+		}
+	}
+	return serverauth.TokenRule{}, fmt.Errorf("user has no assigned organization or project membership")
 }
 
 func loginScopesForUser(user *User) []string {
@@ -505,7 +614,7 @@ func (r *Router) HTTPHandlerWithUsers(userStore UserManager, opts ...HTTPHandler
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore))
-	mux.HandleFunc("/v1/users/login", r.HandleUserLogin(userStore, opt.UserTokenManager))
+	mux.HandleFunc("/v1/users/login", r.HandleUserLogin(userStore, opt.UserTokenManager, opt.TeamStore, opt.UserLoginLimiter))
 	mux.Handle("/", base)
 	return mux
 }

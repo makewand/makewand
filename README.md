@@ -116,6 +116,17 @@ By default, `serve` now keeps users, issued tokens, and usage in
 现在 `serve` 默认会把用户、签发的 token 和 usage 持久化到
 `~/.config/makewand/server/state.db`；JSONL 审计日志仍然是可选项。
 
+The same server also exposes a lightweight admin console at `/admin` for live
+dashboards, token issuance, team setup, and billing inspection.
+同一个服务端还会在 `/admin` 提供一个轻量管理界面，用于查看实时仪表盘、签发 token、
+配置团队和检查账单汇总。
+
+The admin console can now sign in with a server-side browser session instead of
+storing a long-lived admin bearer token in the page. Mutating admin requests
+use CSRF protection automatically.
+管理界面现在支持服务端浏览器 session 登录，不必把长期 admin bearer token 放在页面
+里；涉及写操作的 admin 请求也会自动走 CSRF 保护。
+
 On another computer / 在其他电脑上：
 
 ```bash
@@ -155,6 +166,8 @@ makewand audit summary --path ~/.config/makewand/server/audit.jsonl
 makewand audit events --path ~/.config/makewand/server/audit.jsonl --limit 20
 makewand usage summary --state-db ~/.config/makewand/server/state.db
 makewand user list --state-db ~/.config/makewand/server/state.db
+makewand usage periods --state-db ~/.config/makewand/server/state.db
+makewand usage alerts --state-db ~/.config/makewand/server/state.db
 ```
 
 When the server runs with `--auth-config`, it also exposes admin APIs for live
@@ -187,6 +200,10 @@ makewand usage summary \
 makewand user list \
   --remote-url http://your-main-machine:8080 \
   --remote-token your-admin-token
+
+makewand usage alerts \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
 ```
 
 Admin APIs / 管理 API：
@@ -196,17 +213,62 @@ Admin APIs / 管理 API：
 | `GET /v1/admin/tokens` | `admin:tokens:read` |
 | `POST /v1/admin/tokens` | `admin:tokens:write` |
 | `POST /v1/admin/tokens/{id}/revoke` | `admin:tokens:write` |
+| `POST /v1/admin/session/login` | admin browser login |
+| `GET /v1/admin/session/me` | admin browser session check |
+| `POST /v1/admin/session/logout` | admin browser logout |
 | `GET /v1/admin/audit/summary` | `admin:audit:read` |
 | `GET /v1/admin/audit/events` | `admin:audit:read` |
+| `GET /v1/admin/dashboard` | `admin:usage:read` |
+| `GET /v1/admin/billing/summary` | `admin:usage:read` |
+| `GET /v1/admin/billing/periods` | `admin:usage:read` |
+| `GET /v1/admin/billing/alerts` | `admin:usage:read` |
 | `GET /v1/admin/usage/summary` | `admin:usage:read` |
 | `GET /v1/admin/usage/events` | `admin:usage:read` |
 | `GET /v1/admin/users` | `admin:users:read` |
 | `POST /v1/admin/users/{id}/activate` | `admin:users:write` |
 | `POST /v1/admin/users/{id}/deactivate` | `admin:users:write` |
 | `POST /v1/admin/users/{id}/role` | `admin:users:write` |
+| `POST /v1/admin/users/{id}/password` | `admin:users:write` |
+| `GET /v1/admin/organizations` | `admin:users:read` |
+| `POST /v1/admin/organizations` | `admin:users:write` |
+| `GET /v1/admin/projects` | `admin:users:read` |
+| `POST /v1/admin/projects` | `admin:users:write` |
+| `GET /v1/admin/organization-memberships` | `admin:users:read` |
+| `POST /v1/admin/organization-memberships` | `admin:users:write` |
+| `GET /v1/admin/project-memberships` | `admin:users:read` |
+| `POST /v1/admin/project-memberships` | `admin:users:write` |
 | `GET /metrics` | `admin:metrics:read` |
 | `POST /v1/users/register` | unauthenticated |
 | `POST /v1/users/login` | unauthenticated |
+
+List endpoints accept pragmatic filtering and pagination parameters such as
+`q`, `limit`, `offset`, plus resource-specific filters like `organization_id`,
+`project_id`, `user_id`, `role`, `active`, and `revoked`.
+列表型接口支持实用型筛选和分页参数，例如 `q`、`limit`、`offset`，以及
+`organization_id`、`project_id`、`user_id`、`role`、`active`、`revoked`
+这类资源专属过滤条件。
+
+Member users can now be attached to organizations and projects, then issue
+scoped login tokens that inherit those assignments:
+现在成员用户可绑定到 organization / project，并在登录时签发继承这些范围的 token：
+
+```bash
+makewand user login \
+  --remote-url http://your-main-machine:8080 \
+  --email you@example.com \
+  --password password123 \
+  --project-id prj_checkout
+```
+
+Production deployment templates and backup helpers live in:
+生产部署模板与备份脚本见：
+
+- [DEPLOY_PRODUCTION.md](docs/DEPLOY_PRODUCTION.md)
+- [Dockerfile](deploy/Dockerfile)
+- [docker-compose.yml](deploy/docker-compose.yml)
+- [systemd.makewand.service](deploy/systemd.makewand.service)
+- [backup_state.sh](scripts/backup_state.sh)
+- [restore_state.sh](scripts/restore_state.sh)
 
 If both machines point at the same repository, set a shared workspace id to
 resume the same chat even when local paths differ:
@@ -333,23 +395,39 @@ http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
 A request may set `model` to a provider name returned by `/v1/models` to force
-that provider. `stream=true` is supported; `max_tokens` and `temperature` are
-accepted but currently ignored for compatibility.
+that provider. The facade also accepts alias families such as `gpt-*`, `o1*`,
+`o3*`, and `o4*` for Codex-backed routing, plus `claude*`, `gemini*`, and
+`codex*`.
 请求可将 `model` 设置为 `/v1/models` 返回的 Provider 名称以强制选择该 Provider。
+同时也支持常见 alias 家族：例如把 `gpt-*`、`o1*`、`o3*`、`o4*` 映射到 Codex，
+以及把 `claude*`、`gemini*`、`codex*` 映射到对应 Provider。
+
+`stream=true` is supported; `max_tokens` and `temperature` are accepted but
+currently ignored for compatibility. `response_format` supports `json_object`
+and a pragmatic subset of `json_schema`. Basic function-style tool calling is
+also supported through `tools` and `tool_choice`.
 支持 `stream=true`；`max_tokens`、`temperature` 会被接受，但当前仅作为兼容字段忽略。
+`response_format` 支持 `json_object` 和实用型 `json_schema` 子集；也支持通过
+`tools` 与 `tool_choice` 进行基础版函数式工具调用。
 `makewand serve` also attaches `X-Request-Id` to each response and exposes a
 Prometheus-style `/metrics` endpoint when started as a server.
 `makewand serve` 还会在响应中附带 `X-Request-Id`，并暴露 Prometheus 风格的
 `/metrics` 端点。
 
+When a scoped token is associated with an organization or project and the
+corresponding monthly budget is configured in the server team store, requests
+are now rejected before routing once that budget is exhausted.
+当 scoped token 关联了 organization 或 project，且服务端团队存储里配置了对应的
+月预算后，预算耗尽时会在真正路由前直接拒绝请求。
+
 A basic OpenAI-style `POST /v1/responses` subset is also available for
-non-streaming request/response clients.
-同时也提供基础版、非 streaming 的 `POST /v1/responses` 兼容入口。
+request/response clients, including SSE streaming mode.
+同时也提供基础版的 `POST /v1/responses` 兼容入口，并支持 SSE streaming 模式。
 
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | Chat completions (`stream=true` supported) / 支持 `stream=true` 的聊天补全 |
-| `POST /v1/responses` | Non-streaming Responses API subset / 非 streaming 的 Responses API 子集 |
+| `POST /v1/responses` | Responses API subset (`stream=true`, `response_format`, `tools`) / 支持 `stream=true`、`response_format`、`tools` 的 Responses API 子集 |
 | `GET /v1/models` | List available providers / 列出可用 Provider |
 | `GET /health` | Health check / 健康检查 |
 

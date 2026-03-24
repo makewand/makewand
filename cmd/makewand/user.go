@@ -27,6 +27,7 @@ func userCmd() *cobra.Command {
 	cmd.AddCommand(userActivateCmd())
 	cmd.AddCommand(userDeactivateCmd())
 	cmd.AddCommand(userRoleCmd())
+	cmd.AddCommand(userPasswordCmd())
 	cmd.AddCommand(userLoginCmd())
 	return cmd
 }
@@ -196,12 +197,64 @@ func userRoleCmd() *cobra.Command {
 	return cmd
 }
 
+func userPasswordCmd() *cobra.Command {
+	var (
+		usersDir    string
+		stateDBPath string
+		remoteURL   string
+		remoteToken string
+		password    string
+	)
+	cmd := &cobra.Command{
+		Use:   "password <user-id>",
+		Short: "Reset a user's password",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			userID := strings.TrimSpace(args[0])
+			if strings.TrimSpace(password) == "" {
+				return fmt.Errorf("--password is required")
+			}
+			baseURL, bearer, remoteMode, err := resolveOptionalRemoteAdminTarget(remoteURL, remoteToken)
+			if err != nil {
+				return err
+			}
+			if remoteMode {
+				endpoint := "/v1/admin/users/" + url.PathEscape(userID) + "/password"
+				if err := adminPostJSON(baseURL, bearer, endpoint, map[string]string{"password": password}, &struct{}{}); err != nil {
+					return err
+				}
+				fmt.Printf("Updated password for %s via %s\n", userID, baseURL)
+				return nil
+			}
+
+			store, closeFn, header, err := openUserStore(usersDir, stateDBPath)
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			if _, err := store.SetUserPassword(userID, password); err != nil {
+				return err
+			}
+			fmt.Printf("Updated password for %s in %s\n", userID, header)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&usersDir, "users-dir", "", "path to server users directory (defaults to ~/.config/makewand/server/users)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for user operations")
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
+	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().StringVar(&password, "password", "", "new password")
+	return cmd
+}
+
 func userLoginCmd() *cobra.Command {
 	var (
-		remoteURL  string
-		email      string
-		password   string
-		jsonOutput bool
+		remoteURL      string
+		email          string
+		password       string
+		organizationID string
+		projectID      string
+		jsonOutput     bool
 	)
 	cmd := &cobra.Command{
 		Use:   "login",
@@ -214,6 +267,12 @@ func userLoginCmd() *cobra.Command {
 			payload := map[string]string{
 				"email":    strings.TrimSpace(email),
 				"password": password,
+			}
+			if strings.TrimSpace(organizationID) != "" {
+				payload["organization_id"] = strings.TrimSpace(organizationID)
+			}
+			if strings.TrimSpace(projectID) != "" {
+				payload["project_id"] = strings.TrimSpace(projectID)
 			}
 			data, err := json.Marshal(payload)
 			if err != nil {
@@ -259,6 +318,8 @@ func userLoginCmd() *cobra.Command {
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand base URL")
 	cmd.Flags().StringVar(&email, "email", "", "user email")
 	cmd.Flags().StringVar(&password, "password", "", "user password")
+	cmd.Flags().StringVar(&organizationID, "organization-id", "", "organization to scope the issued login token to")
+	cmd.Flags().StringVar(&projectID, "project-id", "", "project to scope the issued login token to")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output login response as JSON")
 	_ = cmd.MarkFlagRequired("email")
 	_ = cmd.MarkFlagRequired("password")

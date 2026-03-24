@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS usage_entries (
   request_id TEXT NOT NULL DEFAULT '',
   token_id TEXT NOT NULL DEFAULT '',
   token_description TEXT NOT NULL DEFAULT '',
+  user_id TEXT NOT NULL DEFAULT '',
+  organization_id TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
   requested_mode TEXT NOT NULL DEFAULT '',
   requested_model TEXT NOT NULL DEFAULT '',
   actual_provider TEXT NOT NULL DEFAULT '',
@@ -47,7 +50,14 @@ CREATE TABLE IF NOT EXISTS usage_entries (
   cost_usd REAL NOT NULL DEFAULT 0,
   stream INTEGER NOT NULL DEFAULT 0
 );`)
-	return err
+	if err != nil {
+		return err
+	}
+	return serverdb.EnsureColumns(s.db, "usage_entries", map[string]string{
+		"user_id":         "user_id TEXT NOT NULL DEFAULT ''",
+		"organization_id": "organization_id TEXT NOT NULL DEFAULT ''",
+		"project_id":      "project_id TEXT NOT NULL DEFAULT ''",
+	})
 }
 
 // Close closes the underlying database handle.
@@ -76,14 +86,17 @@ func (s *SQLiteStore) Log(entry Entry) {
 	}
 	_, _ = s.db.Exec(`
 INSERT INTO usage_entries (
-  timestamp, request_id, token_id, token_description, requested_mode,
+  timestamp, request_id, token_id, token_description, user_id, organization_id, project_id, requested_mode,
   requested_model, actual_provider, status, duration_ms, prompt_tokens,
   completion_tokens, cost_usd, stream
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.Timestamp.UTC().Format(time.RFC3339Nano),
 		entry.RequestID,
 		entry.TokenID,
 		entry.TokenDescription,
+		entry.UserID,
+		entry.OrganizationID,
+		entry.ProjectID,
 		entry.RequestedMode,
 		entry.RequestedModel,
 		entry.ActualProvider,
@@ -103,14 +116,26 @@ func (s *SQLiteStore) Load(filter Filter) ([]Entry, error) {
 	}
 	query := strings.Builder{}
 	query.WriteString(`
-SELECT timestamp, request_id, token_id, token_description, requested_mode,
-       requested_model, actual_provider, status, duration_ms, prompt_tokens,
-       completion_tokens, cost_usd, stream
+SELECT timestamp, request_id, token_id, token_description, user_id, organization_id, project_id,
+       requested_mode, requested_model, actual_provider,
+       status, duration_ms, prompt_tokens, completion_tokens, cost_usd, stream
 FROM usage_entries WHERE 1=1`)
 	args := make([]any, 0, 8)
 	if filter.TokenID != "" {
 		query.WriteString(` AND token_id = ?`)
 		args = append(args, filter.TokenID)
+	}
+	if filter.UserID != "" {
+		query.WriteString(` AND user_id = ?`)
+		args = append(args, filter.UserID)
+	}
+	if filter.OrgID != "" {
+		query.WriteString(` AND organization_id = ?`)
+		args = append(args, filter.OrgID)
+	}
+	if filter.ProjectID != "" {
+		query.WriteString(` AND project_id = ?`)
+		args = append(args, filter.ProjectID)
 	}
 	if filter.RequestID != "" {
 		query.WriteString(` AND request_id = ?`)
@@ -158,6 +183,9 @@ FROM usage_entries WHERE 1=1`)
 			&entry.RequestID,
 			&entry.TokenID,
 			&entry.TokenDescription,
+			&entry.UserID,
+			&entry.OrganizationID,
+			&entry.ProjectID,
 			&entry.RequestedMode,
 			&entry.RequestedModel,
 			&entry.ActualProvider,

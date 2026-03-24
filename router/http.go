@@ -23,33 +23,41 @@ import (
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/serverhttp"
+	"github.com/makewand/makewand/serverteam"
 	"github.com/makewand/makewand/serverusage"
 )
 
 // httpChatRequest is the subset of the OpenAI chat completions request we support.
 type httpChatRequest struct {
-	Model       string        `json:"model"`
-	Mode        string        `json:"mode,omitempty"`
-	Messages    []httpMessage `json:"messages"`
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
+	Model          string              `json:"model"`
+	Mode           string              `json:"mode,omitempty"`
+	Messages       []httpMessage       `json:"messages"`
+	MaxTokens      *int                `json:"max_tokens,omitempty"`
+	Temperature    *float64            `json:"temperature,omitempty"`
+	Stream         bool                `json:"stream,omitempty"`
+	ResponseFormat *httpResponseFormat `json:"response_format,omitempty"`
+	Tools          []httpTool          `json:"tools,omitempty"`
+	ToolChoice     any                 `json:"tool_choice,omitempty"`
 }
 
 type httpResponsesRequest struct {
-	Model           string            `json:"model,omitempty"`
-	Mode            string            `json:"mode,omitempty"`
-	Input           any               `json:"input"`
-	Instructions    string            `json:"instructions,omitempty"`
-	MaxOutputTokens *int              `json:"max_output_tokens,omitempty"`
-	Temperature     *float64          `json:"temperature,omitempty"`
-	Stream          bool              `json:"stream,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
+	Model           string              `json:"model,omitempty"`
+	Mode            string              `json:"mode,omitempty"`
+	Input           any                 `json:"input"`
+	Instructions    string              `json:"instructions,omitempty"`
+	MaxOutputTokens *int                `json:"max_output_tokens,omitempty"`
+	Temperature     *float64            `json:"temperature,omitempty"`
+	Stream          bool                `json:"stream,omitempty"`
+	Metadata        map[string]string   `json:"metadata,omitempty"`
+	ResponseFormat  *httpResponseFormat `json:"response_format,omitempty"`
+	Tools           []httpTool          `json:"tools,omitempty"`
+	ToolChoice      any                 `json:"tool_choice,omitempty"`
 }
 
 type httpMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string         `json:"role"`
+	Content   string         `json:"content"`
+	ToolCalls []httpToolCall `json:"tool_calls,omitempty"`
 }
 
 // httpChatResponse mirrors the OpenAI chat completions response.
@@ -106,10 +114,14 @@ type httpResponsesResponse struct {
 }
 
 type httpResponseOutput struct {
-	ID      string                `json:"id,omitempty"`
-	Type    string                `json:"type"`
-	Role    string                `json:"role,omitempty"`
-	Content []httpResponseContent `json:"content,omitempty"`
+	ID        string                `json:"id,omitempty"`
+	Type      string                `json:"type"`
+	Role      string                `json:"role,omitempty"`
+	Name      string                `json:"name,omitempty"`
+	Arguments string                `json:"arguments,omitempty"`
+	CallID    string                `json:"call_id,omitempty"`
+	Status    string                `json:"status,omitempty"`
+	Content   []httpResponseContent `json:"content,omitempty"`
 }
 
 type httpResponseContent struct {
@@ -150,9 +162,17 @@ type HTTPHandlerOptions struct {
 	// request, including status, realized cost, and provider metadata.
 	UsageLogger serverusage.Logger
 
+	// UsageReader and TeamStore enable organization/project monthly budget
+	// enforcement for scoped tokens.
+	UsageReader serverusage.Reader
+	TeamStore   serverteam.Store
+
 	// UserTokenManager issues login tokens for /v1/users/login when the users
 	// extension is enabled.
 	UserTokenManager serverauth.TokenManager
+
+	// UserLoginLimiter throttles repeated failed /v1/users/login attempts.
+	UserLoginLimiter *serverauth.LoginRateLimiter
 }
 
 // HTTPHandler returns an http.Handler that serves an OpenAI-compatible subset
@@ -280,12 +300,6 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 	usageEntry.RequestedModel = strings.ToLower(strings.TrimSpace(responsesReq.Model))
 	auditEvent.RequestedMode = usageEntry.RequestedMode
 	auditEvent.RequestedModel = usageEntry.RequestedModel
-	if responsesReq.Stream {
-		auditEvent.Status = http.StatusBadRequest
-		auditEvent.Error = "stream is not yet supported on /v1/responses"
-		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "stream is not yet supported on /v1/responses")
-		return
-	}
 	chatReq, err := responsesRequestToChatRequest(responsesReq)
 	if err != nil {
 		auditEvent.Status = http.StatusBadRequest
@@ -304,9 +318,38 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
+	if err := checkTeamBudget(opt.TeamStore, opt.UsageReader, grant); err != nil {
+		var httpErr *httpStatusError
+		if errors.As(err, &httpErr) {
+			auditEvent.Status = httpErr.Status
+			auditEvent.Error = httpErr.Message
+			writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
+			return
+		}
+		auditEvent.Status = http.StatusInternalServerError
+		auditEvent.Error = err.Error()
+		writeHTTPError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
 	auditEvent.RequestedMode = prepared.EffectiveMode
 	usageEntry.RequestedMode = prepared.EffectiveMode
 	defer prepared.Router.persistHTTPStats(opt.StatsDir)
+	if responsesReq.Stream {
+		if responsesReq.ResponseFormat != nil {
+			auditEvent.Status = http.StatusBadRequest
+			auditEvent.Error = "response_format is not supported with streaming responses"
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
+			return
+		}
+		if len(responsesReq.Tools) > 0 {
+			auditEvent.Status = http.StatusBadRequest
+			auditEvent.Error = "tools are not supported with streaming responses"
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
+			return
+		}
+		r.handleResponsesStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, responsesReq.Metadata, &auditEvent, &usageEntry)
+		return
+	}
 
 	ctx := req.Context()
 	var (
@@ -335,6 +378,14 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		writeHTTPError(w, status, "provider_error", err.Error())
 		return
 	}
+	content, err = validateHTTPResponseFormat(content, responsesReq.ResponseFormat)
+	if err != nil {
+		auditEvent.Status = http.StatusBadGateway
+		auditEvent.Error = err.Error()
+		writeHTTPError(w, http.StatusBadGateway, "invalid_model_output", err.Error())
+		return
+	}
+	toolCalls, hasToolCalls := extractHTTPToolCalls(content, responsesReq.Tools)
 	if grant != nil {
 		grant.RecordCostAt(time.Now(), usage.Cost)
 	}
@@ -362,7 +413,7 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		CreatedAt:  time.Now().Unix(),
 		Status:     "completed",
 		Model:      responseModel,
-		Output:     buildResponsesOutput(content),
+		Output:     buildResponsesOutput(content, toolCalls),
 		OutputText: content,
 		Usage: httpUsageResponse{
 			PromptTokens:     usage.InputTokens,
@@ -370,6 +421,9 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 			TotalTokens:      usage.InputTokens + usage.OutputTokens,
 		},
 		Metadata: responsesReq.Metadata,
+	}
+	if hasToolCalls {
+		resp.OutputText = ""
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -422,6 +476,18 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	usageEntry.RequestedMode = auditEvent.RequestedMode
 	usageEntry.RequestedModel = auditEvent.RequestedModel
 	usageEntry.Stream = chatReq.Stream
+	if chatReq.Stream && chatReq.ResponseFormat != nil {
+		auditEvent.Status = http.StatusBadRequest
+		auditEvent.Error = "response_format is not supported with stream=true"
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
+		return
+	}
+	if chatReq.Stream && len(chatReq.Tools) > 0 {
+		auditEvent.Status = http.StatusBadRequest
+		auditEvent.Error = "tools are not supported with stream=true"
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
+		return
+	}
 
 	// max_tokens and temperature are silently ignored — they are standard
 	// OpenAI fields that clients commonly include. Rejecting them would
@@ -442,6 +508,19 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		auditEvent.Status = httpErr.Status
 		auditEvent.Error = httpErr.Message
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
+		return
+	}
+	if err := checkTeamBudget(opt.TeamStore, opt.UsageReader, grant); err != nil {
+		var httpErr *httpStatusError
+		if errors.As(err, &httpErr) {
+			auditEvent.Status = httpErr.Status
+			auditEvent.Error = httpErr.Message
+			writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
+			return
+		}
+		auditEvent.Status = http.StatusInternalServerError
+		auditEvent.Error = err.Error()
+		writeHTTPError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	auditEvent.RequestedMode = prepared.EffectiveMode
@@ -480,6 +559,16 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		writeHTTPError(w, status, "provider_error", err.Error())
 		return
 	}
+	toolCalls, hasToolCalls := extractHTTPToolCalls(content, chatReq.Tools)
+	if !hasToolCalls {
+		content, err = validateHTTPResponseFormat(content, chatReq.ResponseFormat)
+		if err != nil {
+			auditEvent.Status = http.StatusBadGateway
+			auditEvent.Error = err.Error()
+			writeHTTPError(w, http.StatusBadGateway, "invalid_model_output", err.Error())
+			return
+		}
+	}
 	responseModel := result.ModelID
 	if strings.TrimSpace(responseModel) == "" {
 		responseModel = result.Actual
@@ -492,9 +581,13 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		Model:   responseModel,
 		Choices: []httpChoice{
 			{
-				Index:        0,
-				Message:      httpMessage{Role: "assistant", Content: content},
-				FinishReason: "stop",
+				Index: 0,
+				Message: httpMessage{
+					Role:      "assistant",
+					Content:   content,
+					ToolCalls: toolCalls,
+				},
+				FinishReason: finishReasonForToolCalls(hasToolCalls),
 			},
 		},
 		Usage: httpUsageResponse{
@@ -650,6 +743,134 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	}
 }
 
+func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, metadata map[string]string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
+	if auditEvent == nil {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		auditEvent.Status = http.StatusInternalServerError
+		auditEvent.Error = "streaming is unavailable because the response writer does not support flushing"
+		writeHTTPError(w, http.StatusInternalServerError, "internal_error", auditEvent.Error)
+		return
+	}
+
+	ctx := req.Context()
+	var (
+		stream <-chan StreamChunk
+		result RouteResult
+		err    error
+	)
+	if requestedModel != "" {
+		if !containsString(activeRouter.registeredProviderNames(), requestedModel) {
+			auditEvent.Status = http.StatusBadRequest
+			auditEvent.Error = fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", requestedModel)
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
+			return
+		}
+		stream, result, err = activeRouter.ChatStreamWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
+	} else {
+		stream, result, err = activeRouter.ChatStream(ctx, task, messages, system)
+	}
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if strings.Contains(err.Error(), "not configured") {
+			status = http.StatusBadRequest
+		}
+		auditEvent.Status = status
+		auditEvent.Error = err.Error()
+		writeHTTPError(w, status, "provider_error", err.Error())
+		return
+	}
+
+	responseModel := result.ModelID
+	if strings.TrimSpace(responseModel) == "" {
+		responseModel = result.Actual
+	}
+	auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
+	if usageEntry != nil {
+		usageEntry.ActualProvider = auditEvent.ActualProvider
+	}
+
+	responseID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	_ = writeSSEEvent(w, "response.created", map[string]any{
+		"type": "response.created",
+		"response": map[string]any{
+			"id":         responseID,
+			"object":     "response",
+			"created_at": time.Now().Unix(),
+			"status":     "in_progress",
+			"model":      responseModel,
+			"metadata":   metadata,
+		},
+	})
+	flusher.Flush()
+
+	itemID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+	var contentBuilder strings.Builder
+	for chunk := range stream {
+		if chunk.Error != nil {
+			auditEvent.Status = http.StatusOK
+			auditEvent.Error = chunk.Error.Error()
+			_ = writeSSEEvent(w, "response.error", map[string]any{
+				"type":  "response.error",
+				"error": map[string]any{"message": chunk.Error.Error(), "code": "stream_error"},
+			})
+			flusher.Flush()
+			return
+		}
+		if chunk.Content != "" {
+			contentBuilder.WriteString(chunk.Content)
+			_ = writeSSEEvent(w, "response.output_text.delta", map[string]any{
+				"type":         "response.output_text.delta",
+				"response_id":  responseID,
+				"item_id":      itemID,
+				"output_index": 0,
+				"delta":        chunk.Content,
+			})
+			flusher.Flush()
+		}
+		if chunk.Done {
+			finalText := contentBuilder.String()
+			_ = writeSSEEvent(w, "response.output_text.done", map[string]any{
+				"type":         "response.output_text.done",
+				"response_id":  responseID,
+				"item_id":      itemID,
+				"output_index": 0,
+				"text":         finalText,
+			})
+			_ = writeSSEEvent(w, "response.completed", map[string]any{
+				"type": "response.completed",
+				"response": map[string]any{
+					"id":          responseID,
+					"object":      "response",
+					"status":      "completed",
+					"model":       responseModel,
+					"output_text": finalText,
+					"metadata":    metadata,
+				},
+			})
+			flusher.Flush()
+			auditEvent.Status = http.StatusOK
+			if usageEntry != nil {
+				usageEntry.Status = http.StatusOK
+			}
+			return
+		}
+	}
+
+	auditEvent.Status = http.StatusOK
+	if usageEntry != nil {
+		usageEntry.Status = http.StatusOK
+	}
+}
+
 func writeSSEData(w http.ResponseWriter, payload any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -663,6 +884,15 @@ func writeSSEData(w http.ResponseWriter, payload any) error {
 	}
 	_, err = io.WriteString(w, "\n\n")
 	return err
+}
+
+func writeSSEEvent(w http.ResponseWriter, event string, payload any) error {
+	if strings.TrimSpace(event) != "" {
+		if _, err := io.WriteString(w, "event: "+strings.TrimSpace(event)+"\n"); err != nil {
+			return err
+		}
+	}
+	return writeSSEData(w, payload)
 }
 
 type preparedHTTPChat struct {
@@ -704,7 +934,7 @@ func (r *Router) prepareHTTPChat(chatReq httpChatRequest, grant *serverauth.Gran
 		}
 	}
 
-	requestedModel := strings.ToLower(strings.TrimSpace(chatReq.Model))
+	requestedModel := resolveHTTPModelAlias(chatReq.Model)
 	if requestedModel != "" && !grant.AllowsProvider(requestedModel) {
 		return nil, &httpStatusError{
 			Status:  http.StatusForbidden,
@@ -743,6 +973,7 @@ func (r *Router) prepareHTTPChat(chatReq httpChatRequest, grant *serverauth.Gran
 			break
 		}
 	}
+	system = augmentHTTPSystem(system, chatReq.ResponseFormat, chatReq.Tools, chatReq.ToolChoice)
 	return &preparedHTTPChat{
 		Router:         activeRouter,
 		RequestedModel: requestedModel,
@@ -883,8 +1114,52 @@ func usageBaseEntry(req *http.Request, grant *serverauth.Grant) serverusage.Entr
 	if grant != nil {
 		entry.TokenID = grant.TokenID()
 		entry.TokenDescription = grant.Description()
+		entry.UserID = grant.UserID()
+		entry.OrganizationID = grant.OrganizationID()
+		entry.ProjectID = grant.ProjectID()
 	}
 	return entry
+}
+
+func checkTeamBudget(teamStore serverteam.Store, usageReader serverusage.Reader, grant *serverauth.Grant) error {
+	if teamStore == nil || usageReader == nil || grant == nil {
+		return nil
+	}
+	if projectID := strings.TrimSpace(grant.ProjectID()); projectID != "" {
+		project, err := teamStore.GetProject(projectID)
+		if err == nil && project != nil && project.MonthlyBudgetUSD > 0 {
+			entries, err := usageReader.Load(serverusage.Filter{ProjectID: projectID})
+			if err != nil {
+				return err
+			}
+			summary := serverusage.SummarizeEntries(entries)
+			if summary.TotalCostUSD >= project.MonthlyBudgetUSD {
+				return &httpStatusError{
+					Status:  http.StatusTooManyRequests,
+					Code:    "budget_exceeded",
+					Message: fmt.Sprintf("project %q exceeded monthly budget", projectID),
+				}
+			}
+		}
+	}
+	if orgID := strings.TrimSpace(grant.OrganizationID()); orgID != "" {
+		org, err := teamStore.GetOrganization(orgID)
+		if err == nil && org != nil && org.MonthlyBudgetUSD > 0 {
+			entries, err := usageReader.Load(serverusage.Filter{OrgID: orgID})
+			if err != nil {
+				return err
+			}
+			summary := serverusage.SummarizeEntries(entries)
+			if summary.TotalCostUSD >= org.MonthlyBudgetUSD {
+				return &httpStatusError{
+					Status:  http.StatusTooManyRequests,
+					Code:    "budget_exceeded",
+					Message: fmt.Sprintf("organization %q exceeded monthly budget", orgID),
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func responsesRequestToChatRequest(req httpResponsesRequest) (httpChatRequest, error) {
@@ -893,11 +1168,14 @@ func responsesRequestToChatRequest(req httpResponsesRequest) (httpChatRequest, e
 		return httpChatRequest{}, err
 	}
 	return httpChatRequest{
-		Model:       req.Model,
-		Mode:        req.Mode,
-		Messages:    messages,
-		MaxTokens:   req.MaxOutputTokens,
-		Temperature: req.Temperature,
+		Model:          req.Model,
+		Mode:           req.Mode,
+		Messages:       messages,
+		MaxTokens:      req.MaxOutputTokens,
+		Temperature:    req.Temperature,
+		ResponseFormat: req.ResponseFormat,
+		Tools:          req.Tools,
+		ToolChoice:     req.ToolChoice,
 	}, nil
 }
 
@@ -972,7 +1250,21 @@ func responseInputItemToMessage(item any) (string, string, error) {
 	}
 }
 
-func buildResponsesOutput(content string) []httpResponseOutput {
+func buildResponsesOutput(content string, toolCalls []httpToolCall) []httpResponseOutput {
+	if len(toolCalls) > 0 {
+		out := make([]httpResponseOutput, 0, len(toolCalls))
+		for _, call := range toolCalls {
+			out = append(out, httpResponseOutput{
+				ID:        call.ID,
+				Type:      "function_call",
+				Name:      call.Function.Name,
+				Arguments: call.Function.Arguments,
+				CallID:    call.ID,
+				Status:    "completed",
+			})
+		}
+		return out
+	}
 	return []httpResponseOutput{{
 		ID:   fmt.Sprintf("msg_%d", time.Now().UnixNano()),
 		Type: "message",
@@ -1015,6 +1307,13 @@ func logHTTPUsage(logger serverusage.Logger, entry serverusage.Entry) {
 		entry.Timestamp = time.Now().UTC()
 	}
 	logger.Log(entry)
+}
+
+func finishReasonForToolCalls(hasToolCalls bool) string {
+	if hasToolCalls {
+		return "tool_calls"
+	}
+	return "stop"
 }
 
 func httpAuditKind(path string) string {

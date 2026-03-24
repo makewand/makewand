@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>makewand Admin</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/admin/style.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="rail">
+        <div class="brand">
+          <span class="brand-mark">mw</span>
+          <div>
+            <h1>makewand</h1>
+            <p>Admin Console</p>
+          </div>
+        </div>
+        <nav class="nav">
+          <button data-view="overview" class="nav-link is-active">Overview</button>
+          <button data-view="users" class="nav-link">Users</button>
+          <button data-view="tokens" class="nav-link">Tokens</button>
+          <button data-view="teams" class="nav-link">Teams</button>
+          <button data-view="billing" class="nav-link">Billing</button>
+        </nav>
+        <div class="session-panel">
+          <div class="session-row">
+            <span class="label">Session</span>
+            <span id="session-status" class="badge badge-muted">Signed out</span>
+          </div>
+          <button id="sign-out" class="ghost-button">Sign Out</button>
+        </div>
+      </aside>
+      <main class="main">
+        <section id="login-card" class="panel login-panel">
+          <div class="panel-head">
+            <h2>Sign In</h2>
+            <p>Use an admin account or paste an admin bearer token.</p>
+          </div>
+          <div class="login-grid">
+            <form id="login-form" class="stacked-form">
+              <label>
+                <span>Email</span>
+                <input id="login-email" type="email" placeholder="admin@example.com" required>
+              </label>
+              <label>
+                <span>Password</span>
+                <input id="login-password" type="password" placeholder="password" required>
+              </label>
+              <button type="submit" class="primary-button">Login</button>
+            </form>
+            <form id="token-form" class="stacked-form token-form">
+              <label>
+                <span>Bearer Token</span>
+                <textarea id="token-value" rows="4" placeholder="mw_..."></textarea>
+              </label>
+              <button type="submit" class="secondary-button">Use Existing Token</button>
+            </form>
+          </div>
+          <p id="login-error" class="error-text"></p>
+        </section>
+
+        <section id="app-shell" class="hidden">
+          <header class="hero">
+            <div>
+              <p class="eyebrow">Operations</p>
+              <h2>Routing, identity, and billing in one place</h2>
+              <p class="hero-copy">Monitor usage, manage tokens, and organize shared projects without leaving the server.</p>
+            </div>
+            <div class="hero-metrics">
+              <div class="metric-card">
+                <span class="metric-label">Requests</span>
+                <strong id="metric-requests">0</strong>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Spend</span>
+                <strong id="metric-spend">$0.00</strong>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Active Tokens</span>
+                <strong id="metric-tokens">0</strong>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Projects</span>
+                <strong id="metric-projects">0</strong>
+              </div>
+            </div>
+          </header>
+
+          <section data-panel="overview" class="view-panel is-visible">
+            <div class="grid two-up">
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Service Snapshot</h3>
+                </div>
+                <pre id="service-summary" class="code-block"></pre>
+              </div>
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Recent Totals</h3>
+                </div>
+                <pre id="usage-summary" class="code-block"></pre>
+              </div>
+            </div>
+          </section>
+
+          <section data-panel="users" class="view-panel">
+            <div class="panel">
+              <div class="panel-head">
+                <h3>Users</h3>
+              </div>
+              <div id="users-table" class="table-wrap"></div>
+            </div>
+          </section>
+
+          <section data-panel="tokens" class="view-panel">
+            <div class="grid two-up">
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Issue Token</h3>
+                </div>
+                <form id="issue-token-form" class="stacked-form compact-form">
+                  <label><span>Description</span><input id="token-description" type="text" placeholder="project runner"></label>
+                  <label><span>User ID</span><input id="token-user-id" type="text" placeholder="usr_..."></label>
+                  <label><span>Organization ID</span><input id="token-org-id" type="text" placeholder="org_..."></label>
+                  <label><span>Project ID</span><input id="token-project-id" type="text" placeholder="prj_..."></label>
+                  <label><span>Scopes</span><input id="token-scopes" type="text" value="chat:invoke,models:read,sessions:read,sessions:write,sessions:delete"></label>
+                  <label><span>Providers</span><input id="token-providers" type="text" value="codex"></label>
+                  <label><span>Modes</span><input id="token-modes" type="text" value="balanced"></label>
+                  <label><span>Max Requests / Day</span><input id="token-max-requests-day" type="number" min="0" value="0"></label>
+                  <label><span>Max Cost / Month</span><input id="token-max-cost-month" type="number" min="0" step="0.01" value="0"></label>
+                  <button type="submit" class="primary-button">Issue Token</button>
+                </form>
+                <p id="token-issue-result" class="hint-text"></p>
+              </div>
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Tokens</h3>
+                </div>
+                <div id="tokens-table" class="table-wrap"></div>
+              </div>
+            </div>
+          </section>
+
+          <section data-panel="teams" class="view-panel">
+            <div class="grid two-up">
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Create Organization</h3>
+                </div>
+                <form id="org-form" class="stacked-form compact-form">
+                  <label><span>Name</span><input id="org-name" type="text" placeholder="Platform Team"></label>
+                  <label><span>Slug</span><input id="org-slug" type="text" placeholder="platform-team"></label>
+                  <label><span>Description</span><textarea id="org-description" rows="3" placeholder="Shared engineering org"></textarea></label>
+                  <label><span>Monthly Budget</span><input id="org-budget" type="number" min="0" step="0.01" value="0"></label>
+                  <button type="submit" class="secondary-button">Create Organization</button>
+                </form>
+              </div>
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Create Project</h3>
+                </div>
+                <form id="project-form" class="stacked-form compact-form">
+                  <label><span>Organization ID</span><input id="project-org-id" type="text" placeholder="org_..."></label>
+                  <label><span>Name</span><input id="project-name" type="text" placeholder="checkout-api"></label>
+                  <label><span>Slug</span><input id="project-slug" type="text" placeholder="checkout-api"></label>
+                  <label><span>Description</span><textarea id="project-description" rows="3" placeholder="Critical payment path"></textarea></label>
+                  <label><span>Monthly Budget</span><input id="project-budget" type="number" min="0" step="0.01" value="0"></label>
+                  <button type="submit" class="secondary-button">Create Project</button>
+                </form>
+              </div>
+            </div>
+            <div class="grid two-up">
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Organizations</h3>
+                </div>
+                <div id="organizations-table" class="table-wrap"></div>
+              </div>
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Projects</h3>
+                </div>
+                <div id="projects-table" class="table-wrap"></div>
+              </div>
+            </div>
+            <div class="grid two-up">
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Organization Memberships</h3>
+                </div>
+                <form id="org-membership-form" class="stacked-form compact-form">
+                  <label><span>Organization ID</span><input id="org-membership-org-id" type="text" placeholder="org_..."></label>
+                  <label><span>User ID</span><input id="org-membership-user-id" type="text" placeholder="usr_..."></label>
+                  <label><span>Role</span><input id="org-membership-role" type="text" value="manager"></label>
+                  <button type="submit" class="secondary-button">Upsert Org Membership</button>
+                </form>
+                <div id="org-memberships-table" class="table-wrap"></div>
+              </div>
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Project Memberships</h3>
+                </div>
+                <form id="project-membership-form" class="stacked-form compact-form">
+                  <label><span>Project ID</span><input id="project-membership-project-id" type="text" placeholder="prj_..."></label>
+                  <label><span>User ID</span><input id="project-membership-user-id" type="text" placeholder="usr_..."></label>
+                  <label><span>Role</span><input id="project-membership-role" type="text" value="member"></label>
+                  <button type="submit" class="secondary-button">Upsert Project Membership</button>
+                </form>
+                <div id="project-memberships-table" class="table-wrap"></div>
+              </div>
+            </div>
+          </section>
+
+          <section data-panel="billing" class="view-panel">
+            <div class="grid two-up">
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Organization Spend</h3>
+                </div>
+                <div id="billing-orgs" class="table-wrap"></div>
+              </div>
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Project Spend</h3>
+                </div>
+                <div id="billing-projects" class="table-wrap"></div>
+              </div>
+            </div>
+            <div class="grid two-up">
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Budget Alerts</h3>
+                </div>
+                <div id="billing-alerts" class="table-wrap"></div>
+              </div>
+              <div class="panel">
+                <div class="panel-head">
+                  <h3>Monthly Periods</h3>
+                </div>
+                <div id="billing-periods" class="table-wrap"></div>
+              </div>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/admin/app.js"></script>
+  </body>
+</html>

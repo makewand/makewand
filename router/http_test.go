@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/servermetrics"
+	"github.com/makewand/makewand/serverteam"
 	"github.com/makewand/makewand/serverusage"
 )
 
@@ -177,6 +179,281 @@ func TestHTTPHandler_ResponsesSubset(t *testing.T) {
 	}
 	if resp.Metadata["trace"] != "1" {
 		t.Fatalf("Metadata = %+v, want trace=1", resp.Metadata)
+	}
+}
+
+func TestHTTPHandler_ResponsesStream(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello from responses stream"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{"model":"claude","stream":true,"input":"hi","metadata":{"trace":"1"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	bodyText := rec.Body.String()
+	if !strings.Contains(bodyText, "event: response.created") {
+		t.Fatalf("stream body missing response.created event: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "event: response.output_text.delta") {
+		t.Fatalf("stream body missing response.output_text.delta event: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"delta":"hello from responses stream"`) {
+		t.Fatalf("stream body missing response text: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "event: response.completed") {
+		t.Fatalf("stream body missing response.completed event: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"output_text":"hello from responses stream"`) {
+		t.Fatalf("stream body missing completed output text: %s", bodyText)
+	}
+}
+
+func TestHTTPHandler_ModelAliasResolvesToProvider(t *testing.T) {
+	codex := &stubProvider{name: "codex", available: true, response: "hello from codex"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"codex": {Provider: codex, Access: AccessSubscription},
+		},
+		DefaultModel: "codex",
+		CodingModel:  "codex",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpChatResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Choices[0].Message.Content != "hello from codex" {
+		t.Fatalf("content = %q, want %q", resp.Choices[0].Message.Content, "hello from codex")
+	}
+	if !strings.Contains(resp.Model, "codex") {
+		t.Fatalf("model = %q, want codex-family model id", resp.Model)
+	}
+}
+
+func TestHTTPHandler_ResponsesJSONSchema(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: `{"answer":"ok","score":1}`}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{
+		"model":"claude",
+		"input":"hi",
+		"response_format":{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"answer_payload",
+				"schema":{
+					"type":"object",
+					"properties":{
+						"answer":{"type":"string"},
+						"score":{"type":"integer"}
+					},
+					"required":["answer","score"],
+					"additionalProperties":false
+				}
+			}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpResponsesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.OutputText != `{"answer":"ok","score":1}` {
+		t.Fatalf("OutputText = %q, want normalized schema JSON", resp.OutputText)
+	}
+}
+
+func TestHTTPHandler_ResponsesJSONSchemaRejectsInvalidOutput(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: `{"answer":"ok","extra":true}`}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{
+		"model":"claude",
+		"input":"hi",
+		"response_format":{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"answer_payload",
+				"schema":{
+					"type":"object",
+					"properties":{"answer":{"type":"string"}},
+					"required":["answer"],
+					"additionalProperties":false
+				}
+			}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not allowed") {
+		t.Fatalf("body = %q, want schema validation error", rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_ChatToolCalls(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: `{"tool_calls":[{"name":"lookup_weather","arguments":{"city":"Paris"}}]}`}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{
+		"model":"claude",
+		"messages":[{"role":"user","content":"weather?"}],
+		"tools":[
+			{
+				"type":"function",
+				"function":{
+					"name":"lookup_weather",
+					"description":"Look up weather",
+					"parameters":{
+						"type":"object",
+						"properties":{"city":{"type":"string"}},
+						"required":["city"]
+					}
+				}
+			}
+		]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpChatResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", resp.Choices[0].FinishReason)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %+v, want one tool call", resp.Choices[0].Message.ToolCalls)
+	}
+	call := resp.Choices[0].Message.ToolCalls[0]
+	if call.Function.Name != "lookup_weather" {
+		t.Fatalf("tool name = %q, want lookup_weather", call.Function.Name)
+	}
+	if !strings.Contains(call.Function.Arguments, `"city":"Paris"`) {
+		t.Fatalf("arguments = %q, want city Paris", call.Function.Arguments)
+	}
+}
+
+func TestHTTPHandler_ResponsesToolCalls(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: `{"tool_calls":[{"name":"lookup_weather","arguments":{"city":"Paris"}}]}`}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler()
+	body := `{
+		"model":"claude",
+		"input":"weather?",
+		"tools":[
+			{
+				"type":"function",
+				"function":{
+					"name":"lookup_weather",
+					"description":"Look up weather",
+					"parameters":{
+						"type":"object",
+						"properties":{"city":{"type":"string"}}
+					}
+				}
+			}
+		]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpResponsesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.OutputText != "" {
+		t.Fatalf("OutputText = %q, want empty for tool call output", resp.OutputText)
+	}
+	if len(resp.Output) != 1 {
+		t.Fatalf("Output = %+v, want one function_call item", resp.Output)
+	}
+	if resp.Output[0].Type != "function_call" || resp.Output[0].Name != "lookup_weather" {
+		t.Fatalf("Output[0] = %+v, want function_call lookup_weather", resp.Output[0])
+	}
+	if !strings.Contains(resp.Output[0].Arguments, `"city":"Paris"`) {
+		t.Fatalf("Arguments = %q, want city Paris", resp.Output[0].Arguments)
 	}
 }
 
@@ -749,6 +1026,53 @@ func TestHTTPHandler_LogsUsageEntriesWithRequestID(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_LogsUsageOwnershipAttribution(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:             "runner",
+				Token:          "secret123",
+				UserID:         "usr_123",
+				OrganizationID: "org_platform",
+				ProjectID:      "prj_checkout",
+				Scopes:         []string{serverauth.ScopeChatInvoke},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	recorder := &usageRecorder{}
+	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, UsageLogger: recorder})
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(recorder.entries) != 1 {
+		t.Fatalf("usage entries = %d, want 1", len(recorder.entries))
+	}
+	entry := recorder.entries[0]
+	if entry.UserID != "usr_123" || entry.OrganizationID != "org_platform" || entry.ProjectID != "prj_checkout" {
+		t.Fatalf("ownership attribution = %+v, want user/org/project IDs", entry)
+	}
+}
+
 func TestHTTPHandler_AuditLogsForbiddenModelsScope(t *testing.T) {
 	authz, err := serverauth.NewAuthorizer(serverauth.Config{
 		Tokens: []serverauth.TokenRule{
@@ -911,6 +1235,86 @@ func TestHTTPHandler_RejectsRequestsOverDailyCostBudget(t *testing.T) {
 	}
 	if !strings.Contains(rec2.Body.String(), "max_cost_usd_per_day") {
 		t.Fatalf("second body = %q, want cost budget error", rec2.Body.String())
+	}
+}
+
+func TestHTTPHandler_RejectsRequestsWhenProjectBudgetExceeded(t *testing.T) {
+	stateDB := filepath.Join(t.TempDir(), "state.db")
+	teamStore, err := serverteam.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(team): %v", err)
+	}
+	defer teamStore.Close()
+	usageStore, err := serverusage.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(usage): %v", err)
+	}
+	defer usageStore.Close()
+
+	org, err := teamStore.CreateOrganization(serverteam.Organization{
+		ID:               "org_platform",
+		Name:             "Platform Team",
+		MonthlyBudgetUSD: 100,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+	project, err := teamStore.CreateProject(serverteam.Project{
+		ID:               "prj_checkout",
+		OrganizationID:   org.ID,
+		Name:             "Checkout API",
+		MonthlyBudgetUSD: 1,
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	usageStore.Log(serverusage.Entry{
+		Timestamp:      time.Now().UTC(),
+		OrganizationID: org.ID,
+		ProjectID:      project.ID,
+		CostUSD:        1,
+	})
+
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:          "secret123",
+				Scopes:         []string{serverauth.ScopeChatInvoke},
+				OrganizationID: org.ID,
+				ProjectID:      project.ID,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{
+		Authorizer:  authz,
+		UsageReader: usageStore,
+		TeamStore:   teamStore,
+	})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "project") {
+		t.Fatalf("body = %q, want project budget error", rec.Body.String())
 	}
 }
 
