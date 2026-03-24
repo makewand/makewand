@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverteam"
 )
 
 func TestUserStore_CreateUserPersistsAndValidatesPassword(t *testing.T) {
@@ -86,6 +88,27 @@ func TestUserStore_ListUsersAndMutations(t *testing.T) {
 	}
 	if users[0].IsActive {
 		t.Fatal("IsActive = true, want false")
+	}
+}
+
+func TestUserStore_SetUserPassword(t *testing.T) {
+	store := NewUserStore(t.TempDir())
+	user, err := store.CreateUser("person@example.com", "secret123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if _, err := store.SetUserPassword(user.ID, "newsecret123"); err != nil {
+		t.Fatalf("SetUserPassword: %v", err)
+	}
+	updated, err := store.GetUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID: %v", err)
+	}
+	if !updated.ValidatePassword("newsecret123") {
+		t.Fatal("ValidatePassword(newsecret123) = false, want true")
+	}
+	if updated.ValidatePassword("secret123") {
+		t.Fatal("old password still validates after reset")
 	}
 }
 
@@ -205,5 +228,108 @@ func TestHTTPHandlerWithUsers_LoginIssuesToken(t *testing.T) {
 	}
 	if !foundAdminScope {
 		t.Fatalf("admin login scopes = %v, want admin scope", resp.Scopes)
+	}
+}
+
+func TestHTTPHandlerWithUsers_LoginScopesMemberToProjectMembership(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"claude": {Provider: stub, Access: AccessSubscription},
+		},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	stateDB := filepath.Join(t.TempDir(), "state.db")
+	userStore, err := OpenSQLiteUserStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteUserStore: %v", err)
+	}
+	defer userStore.Close()
+	member, err := userStore.CreateUser("member@example.com", "password123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	teamStore, err := serverteam.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(team): %v", err)
+	}
+	defer teamStore.Close()
+	org, err := teamStore.CreateOrganization(serverteam.Organization{Name: "Platform Team"})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+	project, err := teamStore.CreateProject(serverteam.Project{OrganizationID: org.ID, Name: "Checkout API"})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if _, err := teamStore.UpsertProjectMembership(serverteam.ProjectMembership{
+		ProjectID: project.ID,
+		UserID:    member.ID,
+		Role:      serverteam.MembershipRoleMember,
+	}); err != nil {
+		t.Fatalf("UpsertProjectMembership: %v", err)
+	}
+
+	tokenStore, err := serverauth.OpenSQLiteStore(filepath.Join(t.TempDir(), "tokens.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(tokens): %v", err)
+	}
+	defer tokenStore.Close()
+
+	handler := r.HTTPHandlerWithUsers(userStore, HTTPHandlerOptions{
+		UserTokenManager: tokenStore,
+		TeamStore:        teamStore,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/users/login", bytes.NewBufferString(`{"email":"member@example.com","password":"password123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp UserLoginResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if resp.Rule.OrganizationID != org.ID || resp.Rule.ProjectID != project.ID {
+		t.Fatalf("scoped rule = %+v, want org=%q project=%q", resp.Rule, org.ID, project.ID)
+	}
+}
+
+func TestHTTPHandlerWithUsers_RateLimitsFailedLogins(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+	store := NewUserStore(t.TempDir())
+	if _, err := store.CreateUser("member@example.com", "password123"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	tokenStore, err := serverauth.OpenSQLiteStore(filepath.Join(t.TempDir(), "tokens.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(tokens): %v", err)
+	}
+	defer tokenStore.Close()
+	handler := r.HTTPHandlerWithUsers(store, HTTPHandlerOptions{
+		UserTokenManager: tokenStore,
+		UserLoginLimiter: serverauth.NewLoginRateLimiter(2, time.Minute, time.Minute),
+	})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/users/login", bytes.NewBufferString(`{"email":"member@example.com","password":"wrong"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status = %d, want 401; body=%s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/users/login", bytes.NewBufferString(`{"email":"member@example.com","password":"wrong"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate limited status = %d, want 429; body=%s", rec.Code, rec.Body.String())
 	}
 }

@@ -63,6 +63,9 @@ type TokenRule struct {
 	ID                 string    `json:"id,omitempty"`
 	Token              string    `json:"token"`
 	Description        string    `json:"description,omitempty"`
+	UserID             string    `json:"user_id,omitempty"`
+	OrganizationID     string    `json:"organization_id,omitempty"`
+	ProjectID          string    `json:"project_id,omitempty"`
 	Scopes             []string  `json:"scopes"`
 	WorkspacePrefixes  []string  `json:"workspace_prefixes,omitempty"`
 	AllowedProviders   []string  `json:"allowed_providers,omitempty"`
@@ -80,6 +83,9 @@ type TokenRule struct {
 type TokenRuleView struct {
 	ID                 string    `json:"id,omitempty"`
 	Description        string    `json:"description,omitempty"`
+	UserID             string    `json:"user_id,omitempty"`
+	OrganizationID     string    `json:"organization_id,omitempty"`
+	ProjectID          string    `json:"project_id,omitempty"`
 	Scopes             []string  `json:"scopes"`
 	WorkspacePrefixes  []string  `json:"workspace_prefixes,omitempty"`
 	AllowedProviders   []string  `json:"allowed_providers,omitempty"`
@@ -115,6 +121,9 @@ type Authorizer struct {
 type Grant struct {
 	tokenID            string
 	description        string
+	userID             string
+	organizationID     string
+	projectID          string
 	expiresAt          time.Time
 	revoked            bool
 	maxRequestsPerHour int
@@ -380,6 +389,30 @@ func (g *Grant) Description() string {
 	return g.description
 }
 
+// UserID returns the user associated with the token, if any.
+func (g *Grant) UserID() string {
+	if g == nil {
+		return ""
+	}
+	return g.userID
+}
+
+// OrganizationID returns the organization associated with the token, if any.
+func (g *Grant) OrganizationID() string {
+	if g == nil {
+		return ""
+	}
+	return g.organizationID
+}
+
+// ProjectID returns the project associated with the token, if any.
+func (g *Grant) ProjectID() string {
+	if g == nil {
+		return ""
+	}
+	return g.projectID
+}
+
 // CheckCostBudgetAt reports whether the token has already exhausted its spend
 // budget before processing another request.
 func (g *Grant) CheckCostBudgetAt(now time.Time) error {
@@ -567,6 +600,9 @@ func newGrant(rule TokenRule) (*Grant, error) {
 	return &Grant{
 		tokenID:            tokenID,
 		description:        strings.TrimSpace(rule.Description),
+		userID:             strings.TrimSpace(rule.UserID),
+		organizationID:     strings.TrimSpace(rule.OrganizationID),
+		projectID:          strings.TrimSpace(rule.ProjectID),
 		expiresAt:          rule.ExpiresAt.UTC(),
 		revoked:            rule.Revoked,
 		maxRequestsPerHour: rule.MaxRequestsPerHour,
@@ -578,6 +614,13 @@ func newGrant(rule TokenRule) (*Grant, error) {
 		allowedProviders:   providers,
 		allowedModes:       modes,
 	}, nil
+}
+
+// GrantFromRule constructs an in-memory grant from a token rule without
+// persisting the underlying token. It is used for ephemeral session auth such
+// as browser-admin cookies.
+func GrantFromRule(rule TokenRule) (*Grant, error) {
+	return newGrant(rule)
 }
 
 func bearerTokenFromHeader(header string) (string, bool) {
@@ -648,6 +691,9 @@ func SanitizedRules(rules []TokenRule) []TokenRuleView {
 		views = append(views, TokenRuleView{
 			ID:                 id,
 			Description:        rule.Description,
+			UserID:             strings.TrimSpace(rule.UserID),
+			OrganizationID:     strings.TrimSpace(rule.OrganizationID),
+			ProjectID:          strings.TrimSpace(rule.ProjectID),
 			Scopes:             append([]string(nil), rule.Scopes...),
 			WorkspacePrefixes:  append([]string(nil), rule.WorkspacePrefixes...),
 			AllowedProviders:   append([]string(nil), rule.AllowedProviders...),

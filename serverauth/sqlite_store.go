@@ -53,6 +53,9 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
   id TEXT PRIMARY KEY,
   token_hash TEXT NOT NULL UNIQUE,
   description TEXT NOT NULL DEFAULT '',
+  user_id TEXT NOT NULL DEFAULT '',
+  organization_id TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
   scopes_json TEXT NOT NULL,
   workspace_prefixes_json TEXT NOT NULL DEFAULT '[]',
   allowed_providers_json TEXT NOT NULL DEFAULT '[]',
@@ -65,7 +68,14 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
   max_cost_usd_per_month REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );`)
-	return err
+	if err != nil {
+		return err
+	}
+	return serverdb.EnsureColumns(s.db, "auth_tokens", map[string]string{
+		"user_id":         "user_id TEXT NOT NULL DEFAULT ''",
+		"organization_id": "organization_id TEXT NOT NULL DEFAULT ''",
+		"project_id":      "project_id TEXT NOT NULL DEFAULT ''",
+	})
 }
 
 // Close releases the underlying database handle.
@@ -171,14 +181,17 @@ func (s *SQLiteStore) Issue(rule TokenRule) (TokenRuleView, string, error) {
 	}
 	if _, err := s.db.Exec(`
 INSERT INTO auth_tokens (
-  id, token_hash, description, scopes_json, workspace_prefixes_json,
+  id, token_hash, description, user_id, organization_id, project_id, scopes_json, workspace_prefixes_json,
   allowed_providers_json, allowed_modes_json, expires_at, revoked,
   max_requests_per_hour, max_requests_per_day, max_cost_usd_per_day,
   max_cost_usd_per_month, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rule.ID,
 		hashToken(tokenValue),
 		strings.TrimSpace(rule.Description),
+		strings.TrimSpace(rule.UserID),
+		strings.TrimSpace(rule.OrganizationID),
+		strings.TrimSpace(rule.ProjectID),
 		encodedScopes,
 		encodedPrefixes,
 		encodedProviders,
@@ -225,7 +238,8 @@ func (s *SQLiteStore) Revoke(tokenID string) error {
 
 func (s *SQLiteStore) reload() error {
 	rows, err := s.db.Query(`
-SELECT id, token_hash, description, scopes_json, workspace_prefixes_json,
+SELECT id, token_hash, description, user_id, organization_id, project_id,
+       scopes_json, workspace_prefixes_json,
        allowed_providers_json, allowed_modes_json, expires_at, revoked,
        max_requests_per_hour, max_requests_per_day, max_cost_usd_per_day,
        max_cost_usd_per_month
@@ -239,19 +253,25 @@ FROM auth_tokens`)
 	views := make([]TokenRuleView, 0, 8)
 	for rows.Next() {
 		var (
-			rule          TokenRule
-			tokenHash     string
-			scopesJSON    string
-			prefixesJSON  string
-			providersJSON string
-			modesJSON     string
-			expiresAtRaw  string
-			revoked       int
+			rule           TokenRule
+			tokenHash      string
+			userID         string
+			organizationID string
+			projectID      string
+			scopesJSON     string
+			prefixesJSON   string
+			providersJSON  string
+			modesJSON      string
+			expiresAtRaw   string
+			revoked        int
 		)
 		if err := rows.Scan(
 			&rule.ID,
 			&tokenHash,
 			&rule.Description,
+			&userID,
+			&organizationID,
+			&projectID,
 			&scopesJSON,
 			&prefixesJSON,
 			&providersJSON,
@@ -265,6 +285,9 @@ FROM auth_tokens`)
 		); err != nil {
 			return err
 		}
+		rule.UserID = userID
+		rule.OrganizationID = organizationID
+		rule.ProjectID = projectID
 		if err := decodeStringSlice(scopesJSON, &rule.Scopes); err != nil {
 			return err
 		}

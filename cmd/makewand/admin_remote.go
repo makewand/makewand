@@ -47,6 +47,16 @@ type remoteUsageEventsResponse struct {
 	Data []serverusage.Entry `json:"data"`
 }
 
+type remoteUsagePeriodsResponse struct {
+	Path    string                      `json:"path"`
+	Periods []serverusage.PeriodSummary `json:"periods"`
+}
+
+type remoteBillingAlertsResponse struct {
+	Path   string           `json:"path"`
+	Alerts []map[string]any `json:"alerts"`
+}
+
 type remoteUserListResponse struct {
 	Data []router.UserView `json:"data"`
 }

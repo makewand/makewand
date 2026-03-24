@@ -204,6 +204,35 @@ func (s *SQLiteUserStore) SetUserRole(userID, role string) (*User, error) {
 	return s.GetUserByID(userID)
 }
 
+func (s *SQLiteUserStore) SetUserPassword(userID, password string) (*User, error) {
+	if s == nil {
+		return nil, fmt.Errorf("sqlite user store is unavailable")
+	}
+	if !isValidPassword(password) {
+		return nil, fmt.Errorf("password must be at least 8 characters long")
+	}
+	salt := generateSalt()
+	passwordHash := hashPassword(password, salt)
+	now := time.Now().UTC()
+	result, err := s.db.Exec(`UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE id = ?`,
+		passwordHash,
+		salt,
+		now.Format(time.RFC3339),
+		strings.TrimSpace(userID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return nil, ErrUserNotFound
+	}
+	return s.GetUserByID(userID)
+}
+
 type userScanner interface {
 	Scan(dest ...any) error
 }

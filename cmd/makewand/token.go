@@ -112,6 +112,9 @@ func tokenIssueCmd() *cobra.Command {
 		tokenID            string
 		description        string
 		tokenValue         string
+		userID             string
+		organizationID     string
+		projectID          string
 		scopesFlag         string
 		workspacePrefixes  string
 		allowedProviders   string
@@ -138,6 +141,9 @@ func tokenIssueCmd() *cobra.Command {
 				ID:                 strings.TrimSpace(tokenID),
 				Token:              tokenValue,
 				Description:        strings.TrimSpace(description),
+				UserID:             strings.TrimSpace(userID),
+				OrganizationID:     strings.TrimSpace(organizationID),
+				ProjectID:          strings.TrimSpace(projectID),
 				Scopes:             parseCSVOrDefault(scopesFlag, serverauth.AllClientScopes()),
 				WorkspacePrefixes:  parseCSV(workspacePrefixes),
 				AllowedProviders:   parseCSV(allowedProviders),
@@ -254,6 +260,9 @@ func tokenIssueCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tokenID, "id", "", "stable token identifier")
 	cmd.Flags().StringVar(&description, "description", "", "human-readable token description")
 	cmd.Flags().StringVar(&tokenValue, "token", "", "explicit bearer token value (default: generated)")
+	cmd.Flags().StringVar(&userID, "user-id", "", "associate the token with a user ID")
+	cmd.Flags().StringVar(&organizationID, "organization-id", "", "associate the token with an organization ID")
+	cmd.Flags().StringVar(&projectID, "project-id", "", "associate the token with a project ID")
 	cmd.Flags().StringVar(&scopesFlag, "scopes", "", "comma-separated scopes (default: all scopes)")
 	cmd.Flags().StringVar(&workspacePrefixes, "workspace-prefixes", "", "comma-separated allowed workspace prefixes")
 	cmd.Flags().StringVar(&allowedProviders, "allowed-providers", "", "comma-separated allowed providers")
@@ -381,6 +390,15 @@ func printTokenRules(header string, rules []serverauth.TokenRuleView) {
 		fmt.Printf("- %s\n", rule.ID)
 		if rule.Description != "" {
 			fmt.Printf("  description: %s\n", rule.Description)
+		}
+		if rule.UserID != "" {
+			fmt.Printf("  user: %s\n", rule.UserID)
+		}
+		if rule.OrganizationID != "" {
+			fmt.Printf("  organization: %s\n", rule.OrganizationID)
+		}
+		if rule.ProjectID != "" {
+			fmt.Printf("  project: %s\n", rule.ProjectID)
 		}
 		fmt.Printf("  scopes: %s\n", strings.Join(rule.Scopes, ", "))
 		if len(rule.WorkspacePrefixes) > 0 {

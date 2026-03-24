@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,6 +21,8 @@ import (
 	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/serverhttp"
 	"github.com/makewand/makewand/servermetrics"
+	"github.com/makewand/makewand/serverteam"
+	"github.com/makewand/makewand/serverui"
 	"github.com/makewand/makewand/serverusage"
 	"github.com/spf13/cobra"
 )
@@ -87,10 +91,13 @@ func serveCmd() *cobra.Command {
 				}
 			}
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
+			loginLimiter := serverauth.NewLoginRateLimiter(5, 15*time.Minute, 15*time.Minute)
 			var (
 				tokenManager serverauth.TokenManager = bootstrapManager
 				userStore    router.UserManager
 				usageStore   serverusage.Reader
+				teamStore    serverteam.Store
+				sessionMgr   *serveradmin.SessionManager
 			)
 			if strings.TrimSpace(stateDBPath) != "" {
 				sqliteTokens, err := serverauth.OpenSQLiteStore(stateDBPath)
@@ -113,6 +120,13 @@ func serveCmd() *cobra.Command {
 				usageStore = sqliteUsage
 				usageLogger = combineUsageLoggers(usageLogger, sqliteUsage)
 
+				sqliteTeams, err := serverteam.OpenSQLiteStore(stateDBPath)
+				if err != nil {
+					return fmt.Errorf("open sqlite team store: %w", err)
+				}
+				defer sqliteTeams.Close()
+				teamStore = sqliteTeams
+
 				if enableUsers {
 					sqliteUsers, err := router.OpenSQLiteUserStore(stateDBPath)
 					if err != nil {
@@ -124,6 +138,16 @@ func serveCmd() *cobra.Command {
 			}
 			if enableUsers && userStore == nil {
 				userStore = router.NewUserStore(filepath.Join(dataDir, "users"))
+			}
+			if userStore != nil {
+				secret, err := loadOrCreateAdminSessionSecret(filepath.Join(dataDir, "admin_session_secret"))
+				if err != nil {
+					return fmt.Errorf("load admin session secret: %w", err)
+				}
+				sessionMgr, err = serveradmin.NewSessionManager(userStore, secret, 12*time.Hour, loginLimiter)
+				if err != nil {
+					return fmt.Errorf("create admin session manager: %w", err)
+				}
 			}
 			if authz == nil {
 				return fmt.Errorf("serve requires --token/--auth-config or an enabled state DB token store")
@@ -138,7 +162,10 @@ func serveCmd() *cobra.Command {
 				StatsDir:         statsDir,
 				AuditLogger:      auditLogger,
 				UsageLogger:      usageLogger,
+				UsageReader:      usageStore,
+				TeamStore:        teamStore,
 				UserTokenManager: tokenManager,
+				UserLoginLimiter: loginLimiter,
 			}
 			base := rtr.HTTPHandler(httpOpts)
 			if userStore != nil {
@@ -158,10 +185,14 @@ func serveCmd() *cobra.Command {
 					UsagePath:    usageDisplayPath,
 					UsageStore:   usageStore,
 					UserStore:    userStore,
+					TeamStore:    teamStore,
+					SessionMgr:   sessionMgr,
 				}))
 			}
 			metrics := servermetrics.NewRecorder()
 			mux.Handle("/metrics", serveProtectedHandler(authz, serverauth.ScopeAdminMetricsRead, metrics.Handler()))
+			mux.Handle("/admin", serverui.Handler())
+			mux.Handle("/admin/", serverui.Handler())
 			mux.Handle("/", base)
 			handler := serverhttp.WithRequestID(metrics.Middleware(mux))
 
@@ -291,6 +322,37 @@ func resolveServeStateDBPath(flagValue, dataDir string) string {
 		return envValue
 	}
 	return filepath.Join(dataDir, "state.db")
+}
+
+func loadOrCreateAdminSessionSecret(path string) ([]byte, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, fmt.Errorf("admin session secret path is empty")
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		data = []byte(strings.TrimSpace(string(data)))
+		decoded := make([]byte, base64.RawURLEncoding.DecodedLen(len(data)))
+		n, decodeErr := base64.RawURLEncoding.Decode(decoded, data)
+		if decodeErr == nil && n >= 32 {
+			return decoded[:n], nil
+		}
+		if len(data) >= 32 {
+			return data, nil
+		}
+		return nil, fmt.Errorf("existing admin session secret is too short")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(secret)
+	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	return secret, nil
 }
 
 type usageMultiLogger struct {
