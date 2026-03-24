@@ -2,11 +2,13 @@ package serverusage
 
 import (
 	"bufio"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -86,6 +88,11 @@ type JSONLLogger struct {
 	f  *os.File
 }
 
+// JSONLReader loads usage entries from a JSONL file path.
+type JSONLReader struct {
+	path string
+}
+
 func OpenJSONL(path string) (*JSONLLogger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -95,6 +102,15 @@ func OpenJSONL(path string) (*JSONLLogger, error) {
 		return nil, err
 	}
 	return &JSONLLogger{f: f}, nil
+}
+
+// NewJSONLReader returns a Reader backed by a JSONL file path.
+func NewJSONLReader(path string) *JSONLReader {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	return &JSONLReader{path: path}
 }
 
 func (l *JSONLLogger) Log(entry Entry) {
@@ -146,6 +162,18 @@ func LoadEntries(path string, filter Filter) ([]Entry, error) {
 		}
 	}
 	return entries, nil
+}
+
+// Load reads entries from the configured JSONL path.
+func (r *JSONLReader) Load(filter Filter) ([]Entry, error) {
+	if r == nil || strings.TrimSpace(r.path) == "" {
+		return nil, nil
+	}
+	entries, err := LoadEntries(r.path, filter)
+	if err != nil && os.IsNotExist(err) {
+		return nil, nil
+	}
+	return entries, err
 }
 
 func SummarizeEntries(entries []Entry) Summary {
@@ -228,6 +256,98 @@ func SortedStringTotals(m map[string]float64) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// MonthStart returns the first instant of the month in UTC for the provided time.
+func MonthStart(at time.Time) time.Time {
+	at = at.UTC()
+	return time.Date(at.Year(), at.Month(), 1, 0, 0, 0, 0, time.UTC)
+}
+
+// CurrentMonthFilter returns a copy of filter constrained to the current month
+// when no explicit since/until window was already provided.
+func CurrentMonthFilter(filter Filter, now time.Time) Filter {
+	if !filter.Since.IsZero() || !filter.Until.IsZero() {
+		return filter
+	}
+	filter.Since = MonthStart(now)
+	return filter
+}
+
+// WriteEntriesCSV renders usage entries as CSV.
+func WriteEntriesCSV(w io.Writer, entries []Entry) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{
+		"timestamp",
+		"request_id",
+		"token_id",
+		"token_description",
+		"user_id",
+		"organization_id",
+		"project_id",
+		"requested_mode",
+		"requested_model",
+		"actual_provider",
+		"status",
+		"duration_ms",
+		"prompt_tokens",
+		"completion_tokens",
+		"cost_usd",
+		"stream",
+	}); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := cw.Write([]string{
+			entry.Timestamp.UTC().Format(time.RFC3339Nano),
+			entry.RequestID,
+			entry.TokenID,
+			entry.TokenDescription,
+			entry.UserID,
+			entry.OrganizationID,
+			entry.ProjectID,
+			entry.RequestedMode,
+			entry.RequestedModel,
+			entry.ActualProvider,
+			strconv.Itoa(entry.Status),
+			strconv.FormatInt(entry.DurationMS, 10),
+			strconv.Itoa(entry.PromptTokens),
+			strconv.Itoa(entry.CompletionTokens),
+			strconv.FormatFloat(entry.CostUSD, 'f', 6, 64),
+			strconv.FormatBool(entry.Stream),
+		}); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+// WritePeriodsCSV renders billing period summaries as CSV.
+func WritePeriodsCSV(w io.Writer, periods []PeriodSummary) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{
+		"period",
+		"total_requests",
+		"total_prompt_tokens",
+		"total_completion_tokens",
+		"total_cost_usd",
+	}); err != nil {
+		return err
+	}
+	for _, period := range periods {
+		if err := cw.Write([]string{
+			period.Period,
+			strconv.Itoa(period.TotalRequests),
+			strconv.Itoa(period.TotalPromptTokens),
+			strconv.Itoa(period.TotalCompletionTokens),
+			strconv.FormatFloat(period.TotalCostUSD, 'f', 6, 64),
+		}); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
 }
 
 func SummarizeMonthlyPeriods(entries []Entry) []PeriodSummary {

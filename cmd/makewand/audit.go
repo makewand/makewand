@@ -115,6 +115,7 @@ func auditEventsCmd() *cobra.Command {
 		untilFlag     string
 		limitFlag     int
 		jsonOutput    bool
+		csvOutput     bool
 		remoteURL     string
 		remoteToken   string
 	)
@@ -128,6 +129,16 @@ func auditEventsCmd() *cobra.Command {
 				return err
 			}
 			if remoteMode {
+				if csvOutput {
+					query := buildAuditQuery(tokenIDFlag, kindFlag, workspaceFlag, statusFlag, sinceFlag, untilFlag, limitFlag)
+					query.Set("format", "csv")
+					data, err := adminGetRaw(baseURL, bearer, "/v1/admin/audit/events", query)
+					if err != nil {
+						return err
+					}
+					fmt.Print(string(data))
+					return nil
+				}
 				var resp remoteAuditEventsResponse
 				if err := adminGetJSON(baseURL, bearer, "/v1/admin/audit/events", buildAuditQuery(tokenIDFlag, kindFlag, workspaceFlag, statusFlag, sinceFlag, untilFlag, limitFlag), &resp); err != nil {
 					return err
@@ -156,6 +167,12 @@ func auditEventsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if csvOutput {
+				if err := serveraudit.WriteEventsCSV(os.Stdout, events); err != nil {
+					return err
+				}
+				return nil
+			}
 			if jsonOutput {
 				data, err := json.MarshalIndent(events, "", "  ")
 				if err != nil {
@@ -179,6 +196,7 @@ func auditEventsCmd() *cobra.Command {
 	cmd.Flags().IntVar(&limitFlag, "limit", 50, "maximum number of events to display (0 = unlimited)")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "output events as CSV")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output events as JSON")
 	return cmd
 }

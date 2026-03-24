@@ -142,6 +142,7 @@ func usageEventsCmd() *cobra.Command {
 		limitFlag      int
 		streamOnlyFlag bool
 		jsonOutput     bool
+		csvOutput      bool
 		remoteURL      string
 		remoteToken    string
 	)
@@ -156,6 +157,15 @@ func usageEventsCmd() *cobra.Command {
 			}
 			query := buildUsageQuery(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, limitFlag, streamOnlyFlag)
 			if remoteMode {
+				if csvOutput {
+					query.Set("format", "csv")
+					data, err := adminGetRaw(baseURL, bearer, "/v1/admin/usage/events", query)
+					if err != nil {
+						return err
+					}
+					fmt.Print(string(data))
+					return nil
+				}
 				var resp remoteUsageEventsResponse
 				if err := adminGetJSON(baseURL, bearer, "/v1/admin/usage/events", query, &resp); err != nil {
 					return err
@@ -190,6 +200,9 @@ func usageEventsCmd() *cobra.Command {
 					fmt.Println(string(data))
 					return nil
 				}
+				if csvOutput {
+					return serverusage.WriteEntriesCSV(os.Stdout, entries)
+				}
 				printUsageEvents(entries)
 				return nil
 			}
@@ -209,6 +222,9 @@ func usageEventsCmd() *cobra.Command {
 				fmt.Println(string(data))
 				return nil
 			}
+			if csvOutput {
+				return serverusage.WriteEntriesCSV(os.Stdout, entries)
+			}
 			printUsageEvents(entries)
 			return nil
 		},
@@ -226,6 +242,7 @@ func usageEventsCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&streamOnlyFlag, "stream-only", false, "include only streaming chat entries")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "output entries as CSV")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output entries as JSON")
 	return cmd
 }
@@ -242,6 +259,7 @@ func usagePeriodsCmd() *cobra.Command {
 		untilFlag      string
 		streamOnlyFlag bool
 		jsonOutput     bool
+		csvOutput      bool
 		remoteURL      string
 		remoteToken    string
 	)
@@ -255,6 +273,15 @@ func usagePeriodsCmd() *cobra.Command {
 			}
 			query := buildUsageQuery(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
 			if remoteMode {
+				if csvOutput {
+					query.Set("format", "csv")
+					data, err := adminGetRaw(baseURL, bearer, "/v1/admin/billing/periods", query)
+					if err != nil {
+						return err
+					}
+					fmt.Print(string(data))
+					return nil
+				}
 				var resp remoteUsagePeriodsResponse
 				if err := adminGetJSON(baseURL, bearer, "/v1/admin/billing/periods", query, &resp); err != nil {
 					return err
@@ -290,6 +317,9 @@ func usagePeriodsCmd() *cobra.Command {
 					fmt.Println(string(data))
 					return nil
 				}
+				if csvOutput {
+					return serverusage.WritePeriodsCSV(os.Stdout, periods)
+				}
 				printUsagePeriods("sqlite:"+stateDB, periods)
 				return nil
 			}
@@ -310,6 +340,9 @@ func usagePeriodsCmd() *cobra.Command {
 				fmt.Println(string(data))
 				return nil
 			}
+			if csvOutput {
+				return serverusage.WritePeriodsCSV(os.Stdout, periods)
+			}
 			printUsagePeriods(path, periods)
 			return nil
 		},
@@ -325,6 +358,7 @@ func usagePeriodsCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&streamOnlyFlag, "stream-only", false, "include only streaming chat entries")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "output periods as CSV")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output periods as JSON")
 	return cmd
 }
@@ -335,6 +369,7 @@ func usageAlertsCmd() *cobra.Command {
 		sinceFlag   string
 		untilFlag   string
 		jsonOutput  bool
+		csvOutput   bool
 		remoteURL   string
 		remoteToken string
 	)
@@ -348,6 +383,15 @@ func usageAlertsCmd() *cobra.Command {
 			}
 			query := buildUsageQuery("", "", "", 0, sinceFlag, untilFlag, 0, false)
 			if remoteMode {
+				if csvOutput {
+					query.Set("format", "csv")
+					data, err := adminGetRaw(baseURL, bearer, "/v1/admin/billing/alerts", query)
+					if err != nil {
+						return err
+					}
+					fmt.Print(string(data))
+					return nil
+				}
 				var resp remoteBillingAlertsResponse
 				if err := adminGetJSON(baseURL, bearer, "/v1/admin/billing/alerts", query, &resp); err != nil {
 					return err
@@ -371,6 +415,7 @@ func usageAlertsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
 			entries, err := serverusage.LoadSQLiteEntries(stateDB, filter)
 			if err != nil {
 				return err
@@ -390,6 +435,9 @@ func usageAlertsCmd() *cobra.Command {
 				fmt.Println(string(data))
 				return nil
 			}
+			if csvOutput {
+				return serverteam.WriteBudgetAlertsCSV(os.Stdout, alerts)
+			}
 			printBudgetAlerts("sqlite:"+stateDB, alerts)
 			return nil
 		},
@@ -399,6 +447,7 @@ func usageAlertsCmd() *cobra.Command {
 	cmd.Flags().StringVar(&untilFlag, "until", "", "filter entries until RFC3339 time or relative duration like 1h")
 	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
 	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "output alerts as CSV")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output alerts as JSON")
 	return cmd
 }
@@ -534,8 +583,8 @@ func printUsagePeriods(path string, periods []serverusage.PeriodSummary) {
 	}
 }
 
-func computeBudgetAlerts(teamStore serverteam.Store, summary serverusage.Summary) []map[string]any {
-	alerts := make([]map[string]any, 0, 8)
+func computeBudgetAlerts(teamStore serverteam.Store, summary serverusage.Summary) []serverteam.BudgetAlert {
+	alerts := make([]serverteam.BudgetAlert, 0, 8)
 	if teamStore == nil {
 		return alerts
 	}
@@ -544,8 +593,8 @@ func computeBudgetAlerts(teamStore serverteam.Store, summary serverusage.Summary
 			if org.MonthlyBudgetUSD <= 0 {
 				continue
 			}
-			alert := buildAlertMap("organization", org.ID, org.Name, org.MonthlyBudgetUSD, summary.CostByOrganization[org.ID], summary.ByOrganization[org.ID])
-			if len(alert) > 0 {
+			alert, ok := serverteam.BuildBudgetAlert("organization", serverteam.BuildBillingBucket(org.ID, org.Name, org.MonthlyBudgetUSD, summary.CostByOrganization[org.ID], summary.ByOrganization[org.ID]))
+			if ok {
 				alerts = append(alerts, alert)
 			}
 		}
@@ -555,8 +604,8 @@ func computeBudgetAlerts(teamStore serverteam.Store, summary serverusage.Summary
 			if project.MonthlyBudgetUSD <= 0 {
 				continue
 			}
-			alert := buildAlertMap("project", project.ID, project.Name, project.MonthlyBudgetUSD, summary.CostByProject[project.ID], summary.ByProject[project.ID])
-			if len(alert) > 0 {
+			alert, ok := serverteam.BuildBudgetAlert("project", serverteam.BuildBillingBucket(project.ID, project.Name, project.MonthlyBudgetUSD, summary.CostByProject[project.ID], summary.ByProject[project.ID]))
+			if ok {
 				alerts = append(alerts, alert)
 			}
 		}
@@ -564,39 +613,7 @@ func computeBudgetAlerts(teamStore serverteam.Store, summary serverusage.Summary
 	return alerts
 }
 
-func buildAlertMap(scopeType, id, name string, budgetUSD, spendUSD float64, requestCount int) map[string]any {
-	if budgetUSD <= 0 {
-		return nil
-	}
-	utilization := 0.0
-	if budgetUSD > 0 {
-		utilization = spendUSD / budgetUSD * 100
-	}
-	severity := ""
-	switch {
-	case utilization >= 100:
-		severity = "critical"
-	case utilization >= 90:
-		severity = "high"
-	case utilization >= 80:
-		severity = "warning"
-	default:
-		return nil
-	}
-	return map[string]any{
-		"scope_type":           scopeType,
-		"id":                   id,
-		"name":                 name,
-		"severity":             severity,
-		"monthly_budget_usd":   budgetUSD,
-		"spend_usd":            spendUSD,
-		"remaining_budget_usd": budgetUSD - spendUSD,
-		"utilization_percent":  utilization,
-		"request_count":        requestCount,
-	}
-}
-
-func printBudgetAlerts(path string, alerts []map[string]any) {
+func printBudgetAlerts(path string, alerts []serverteam.BudgetAlert) {
 	fmt.Printf("Budget alerts: %s\n", path)
 	if len(alerts) == 0 {
 		fmt.Println("No budget alerts.")
@@ -604,28 +621,15 @@ func printBudgetAlerts(path string, alerts []map[string]any) {
 	}
 	for _, alert := range alerts {
 		fmt.Printf("%s %s(%s) severity=%v spend=$%.4f budget=$%.4f utilization=%.2f%% requests=%v\n",
-			emptyFallback(fmt.Sprint(alert["scope_type"]), "-"),
-			emptyFallback(fmt.Sprint(alert["name"]), "-"),
-			emptyFallback(fmt.Sprint(alert["id"]), "-"),
-			alert["severity"],
-			floatValue(alert["spend_usd"]),
-			floatValue(alert["monthly_budget_usd"]),
-			floatValue(alert["utilization_percent"]),
-			alert["request_count"],
+			emptyFallback(alert.ScopeType, "-"),
+			emptyFallback(alert.Name, "-"),
+			emptyFallback(alert.ID, "-"),
+			alert.Severity,
+			alert.SpendUSD,
+			alert.MonthlyBudgetUSD,
+			alert.UtilizationPercent,
+			alert.RequestCount,
 		)
-	}
-}
-
-func floatValue(value any) float64 {
-	switch typed := value.(type) {
-	case float64:
-		return typed
-	case float32:
-		return float64(typed)
-	case int:
-		return float64(typed)
-	default:
-		return 0
 	}
 }
 

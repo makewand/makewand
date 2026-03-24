@@ -273,6 +273,16 @@ func handleAuditEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
+	if wantsCSV(req) {
+		writeCSVHeaders(w, "audit-events.csv")
+		if err := serveraudit.WriteEventsCSV(w, events); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+			return
+		}
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusOK, "", 0, 0, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path": opts.AuditPath,
 		"data": events,
@@ -330,6 +340,16 @@ func handleUsageEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+		return
+	}
+	if wantsCSV(req) {
+		writeCSVHeaders(w, "usage-events.csv")
+		if err := serverusage.WriteEntriesCSV(w, entries); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+			return
+		}
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusOK, "", 0, 0, 0)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
