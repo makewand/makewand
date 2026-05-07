@@ -1,9 +1,20 @@
 const state = {
-  token: sessionStorage.getItem("makewand_admin_token") || "",
-  authMode: sessionStorage.getItem("makewand_admin_auth_mode") || "",
-  csrfToken: sessionStorage.getItem("makewand_admin_csrf") || "",
-  userEmail: sessionStorage.getItem("makewand_admin_user_email") || "",
+  token: "",
+  authMode: "",
+  csrfToken: "",
+  userEmail: "",
 };
+
+try {
+  [
+    "makewand_admin_token",
+    "makewand_admin_auth_mode",
+    "makewand_admin_csrf",
+    "makewand_admin_user_email",
+  ].forEach((key) => sessionStorage.removeItem(key));
+} catch {
+  // Session storage can be unavailable in hardened browser contexts.
+}
 
 const nodes = {
   loginCard: document.getElementById("login-card"),
@@ -80,27 +91,6 @@ function setSession({ token = "", authMode = "", csrfToken = "", userEmail = "" 
   state.csrfToken = csrfToken;
   state.userEmail = userEmail;
 
-  if (state.token) {
-    sessionStorage.setItem("makewand_admin_token", state.token);
-  } else {
-    sessionStorage.removeItem("makewand_admin_token");
-  }
-  if (state.authMode) {
-    sessionStorage.setItem("makewand_admin_auth_mode", state.authMode);
-  } else {
-    sessionStorage.removeItem("makewand_admin_auth_mode");
-  }
-  if (state.csrfToken) {
-    sessionStorage.setItem("makewand_admin_csrf", state.csrfToken);
-  } else {
-    sessionStorage.removeItem("makewand_admin_csrf");
-  }
-  if (state.userEmail) {
-    sessionStorage.setItem("makewand_admin_user_email", state.userEmail);
-  } else {
-    sessionStorage.removeItem("makewand_admin_user_email");
-  }
-
   if (state.token || state.authMode === "session") {
     nodes.sessionStatus.textContent = state.userEmail ? `Signed in as ${state.userEmail}` : "Signed in";
   } else {
@@ -117,14 +107,72 @@ function showApp(visible) {
   nodes.appShell.classList.toggle("hidden", !visible);
 }
 
-function renderTable(target, headers, rows) {
-  if (!rows.length) {
-    target.innerHTML = "<p class=\"hint-text\">No data yet.</p>";
+function clearNode(target) {
+  while (target.firstChild) {
+    target.removeChild(target.firstChild);
+  }
+}
+
+function appendCellContent(cellNode, value) {
+  if (value instanceof Node) {
+    cellNode.appendChild(value);
     return;
   }
-  const thead = `<thead><tr>${headers.map((header) => `<th>${header}</th>`).join("")}</tr></thead>`;
-  const tbody = `<tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell ?? ""}</td>`).join("")}</tr>`).join("")}</tbody>`;
-  target.innerHTML = `<table>${thead}${tbody}</table>`;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      if (index > 0) {
+        cellNode.appendChild(document.createTextNode(" "));
+      }
+      appendCellContent(cellNode, item);
+    });
+    return;
+  }
+  cellNode.textContent = value == null ? "" : String(value);
+}
+
+function actionButton(label, dataset = {}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "ghost-button";
+  button.textContent = label;
+  Object.entries(dataset).forEach(([key, value]) => {
+    button.dataset[key] = String(value);
+  });
+  return button;
+}
+
+function renderTable(target, headers, rows) {
+  clearNode(target);
+  if (!rows.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint-text";
+    empty.textContent = "No data yet.";
+    target.appendChild(empty);
+    return;
+  }
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  headers.forEach((header) => {
+    const th = document.createElement("th");
+    th.textContent = header;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    row.forEach((cell) => {
+      const td = document.createElement("td");
+      appendCellContent(td, cell);
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  target.appendChild(table);
 }
 
 function money(value) {
@@ -169,9 +217,15 @@ async function refresh() {
     user.role,
     user.is_active ? "yes" : "no",
     [
-      `<button class="ghost-button" data-user-role="${user.id}" data-next-role="${user.role === "admin" ? "member" : "admin"}">${user.role === "admin" ? "Make member" : "Promote admin"}</button>`,
-      `<button class="ghost-button" data-user-active="${user.id}" data-next-active="${user.is_active ? "false" : "true"}">${user.is_active ? "Deactivate" : "Activate"}</button>`,
-    ].join(" "),
+      actionButton(user.role === "admin" ? "Make member" : "Promote admin", {
+        userRole: user.id,
+        nextRole: user.role === "admin" ? "member" : "admin",
+      }),
+      actionButton(user.is_active ? "Deactivate" : "Activate", {
+        userActive: user.id,
+        nextActive: user.is_active ? "false" : "true",
+      }),
+    ],
   ]));
 
   renderTable(nodes.tokensTable, ["ID", "Description", "User", "Org", "Project", "Scopes", "Revoked", "Actions"], tokens.data.map((token) => [
@@ -182,7 +236,7 @@ async function refresh() {
     token.project_id || "",
     (token.scopes || []).join(", "),
     token.revoked ? "yes" : "no",
-    token.revoked ? "revoked" : `<button class="ghost-button" data-token-revoke="${token.id}">Revoke</button>`,
+    token.revoked ? "revoked" : actionButton("Revoke", { tokenRevoke: token.id }),
   ]));
 
   renderTable(nodes.organizationsTable, ["ID", "Name", "Budget"], orgs.data.map((org) => [

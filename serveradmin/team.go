@@ -1,7 +1,6 @@
 package serveradmin
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -73,11 +72,11 @@ func handleOrganizations(w http.ResponseWriter, req *http.Request, opts HandlerO
 			return
 		}
 		var payload organizationCreateRequest
-		dec := json.NewDecoder(req.Body)
-		dec.DisallowUnknownFields()
+		dec := newLimitedJSONDecoder(w, req)
 		if err := dec.Decode(&payload); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			status, code, message := adminJSONDecodeError(err)
+			writeError(w, status, code, message)
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", status, message, 0, 0, 0)
 			return
 		}
 		if grant != nil && grant.OrganizationID() != "" {
@@ -139,11 +138,11 @@ func handleProjects(w http.ResponseWriter, req *http.Request, opts HandlerOption
 			return
 		}
 		var payload projectCreateRequest
-		dec := json.NewDecoder(req.Body)
-		dec.DisallowUnknownFields()
+		dec := newLimitedJSONDecoder(w, req)
 		if err := dec.Decode(&payload); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			status, code, message := adminJSONDecodeError(err)
+			writeError(w, status, code, message)
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", status, message, 0, 0, 0)
 			return
 		}
 		if grant != nil && grant.OrganizationID() != "" {
@@ -472,11 +471,11 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 			return
 		}
 		var payload organizationMembershipRequest
-		dec := json.NewDecoder(req.Body)
-		dec.DisallowUnknownFields()
+		dec := newLimitedJSONDecoder(w, req)
 		if err := dec.Decode(&payload); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			status, code, message := adminJSONDecodeError(err)
+			writeError(w, status, code, message)
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", status, message, 0, 0, 0)
 			return
 		}
 		if grant != nil && grant.ProjectID() != "" {
@@ -550,11 +549,11 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 			return
 		}
 		var payload projectMembershipRequest
-		dec := json.NewDecoder(req.Body)
-		dec.DisallowUnknownFields()
+		dec := newLimitedJSONDecoder(w, req)
 		if err := dec.Decode(&payload); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			status, code, message := adminJSONDecodeError(err)
+			writeError(w, status, code, message)
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", status, message, 0, 0, 0)
 			return
 		}
 		if grant != nil && grant.ProjectID() != "" && strings.TrimSpace(payload.ProjectID) != "" && strings.TrimSpace(payload.ProjectID) != grant.ProjectID() {
