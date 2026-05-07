@@ -536,6 +536,23 @@ func TestHTTPHandler_EmptyMessages(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_RejectsOversizedChatBody(t *testing.T) {
+	r := NewRouterFromConfig(RouterConfig{})
+
+	handler := r.HTTPHandler()
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("x", maxHTTPJSONBodyBytes) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "request_too_large") {
+		t.Fatalf("body = %q, want request_too_large", rec.Body.String())
+	}
+}
+
 func TestHTTPHandler_UnknownModelRejected(t *testing.T) {
 	r := NewRouterFromConfig(RouterConfig{})
 

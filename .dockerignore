@@ -1,0 +1,27 @@
+.git
+.github
+.claude
+
+# Local build outputs
+build/
+buildtest
+modetest
+mwtest
+qualtest
+versus
+makewand
+makewand.exe
+
+# Local/generated work directories
+benchmarks/results/
+blog-project/
+notes-api/
+output/
+password-strength-checker/
+top_three_project/
+
+# Tool caches and editor noise
+.pytest_cache/
+**/__pycache__/
+**/node_modules/
+.DS_Store

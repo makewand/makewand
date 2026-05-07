@@ -16,13 +16,13 @@ package engine
 type BuildPhase int
 
 const (
-	PhaseIdle     BuildPhase = iota // not started
-	PhaseCode                       // generating code
-	PhaseReview                     // cross-model code review
-	PhaseDeps                       // dependency installation
-	PhaseTests                      // running tests
-	PhaseAutoFix                    // auto-fixing failures
-	PhaseDone                       // build complete
+	PhaseIdle    BuildPhase = iota // not started
+	PhaseCode                      // generating code
+	PhaseReview                    // cross-model code review
+	PhaseDeps                      // dependency installation
+	PhaseTests                     // running tests
+	PhaseAutoFix                   // auto-fixing failures
+	PhaseDone                      // build complete
 )
 
 // String returns a human-readable name for the phase.

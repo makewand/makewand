@@ -38,6 +38,8 @@ type errorResponse struct {
 	} `json:"error"`
 }
 
+const maxAdminJSONBodyBytes = 1 << 20 // 1 MiB
+
 type issueTokenRequest struct {
 	ID                 string    `json:"id,omitempty"`
 	Token              string    `json:"token,omitempty"`
@@ -147,11 +149,11 @@ func handleTokens(w http.ResponseWriter, req *http.Request, opts HandlerOptions)
 		return
 	}
 	var payload issueTokenRequest
-	dec := json.NewDecoder(req.Body)
-	dec.DisallowUnknownFields()
+	dec := newLimitedJSONDecoder(w, req)
 	if err := dec.Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusBadRequest, "invalid JSON: "+err.Error(), 0, 0, 0)
+		status, code, message := adminJSONDecodeError(err)
+		writeError(w, status, code, message)
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", status, message, 0, 0, 0)
 		return
 	}
 	rule := serverauth.TokenRule{
@@ -419,21 +421,21 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		user, err = opts.UserStore.SetUserActive(userID, false)
 	case "role":
 		var payload updateUserRoleRequest
-		dec := json.NewDecoder(req.Body)
-		dec.DisallowUnknownFields()
+		dec := newLimitedJSONDecoder(w, req)
 		if decodeErr := dec.Decode(&payload); decodeErr != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+decodeErr.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusBadRequest, "invalid JSON: "+decodeErr.Error(), 0, 0, 0)
+			status, code, message := adminJSONDecodeError(decodeErr)
+			writeError(w, status, code, message)
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, 0, 0, 0)
 			return
 		}
 		user, err = opts.UserStore.SetUserRole(userID, payload.Role)
 	case "password":
 		var payload updateUserPasswordRequest
-		dec := json.NewDecoder(req.Body)
-		dec.DisallowUnknownFields()
+		dec := newLimitedJSONDecoder(w, req)
 		if decodeErr := dec.Decode(&payload); decodeErr != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+decodeErr.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusBadRequest, "invalid JSON: "+decodeErr.Error(), 0, 0, 0)
+			status, code, message := adminJSONDecodeError(decodeErr)
+			writeError(w, status, code, message)
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, 0, 0, 0)
 			return
 		}
 		user, err = opts.UserStore.SetUserPassword(userID, payload.Password)
@@ -832,6 +834,21 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	resp.Error.Type = "error"
 	resp.Error.Code = code
 	writeJSON(w, status, resp)
+}
+
+func newLimitedJSONDecoder(w http.ResponseWriter, req *http.Request) *json.Decoder {
+	req.Body = http.MaxBytesReader(w, req.Body, maxAdminJSONBodyBytes)
+	dec := json.NewDecoder(req.Body)
+	dec.DisallowUnknownFields()
+	return dec
+}
+
+func adminJSONDecodeError(err error) (int, string, string) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("request body exceeds %d bytes limit", maxErr.Limit)
+	}
+	return http.StatusBadRequest, "invalid_request", "invalid JSON: " + err.Error()
 }
 
 func writeMethodNotAllowed(w http.ResponseWriter, allow string) {

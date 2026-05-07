@@ -26,23 +26,23 @@ type Symbol struct {
 
 // keyFileNames lists filenames whose first few lines are included as hints.
 var keyFileNames = map[string]bool{
-	"main.go":       true,
-	"main.py":       true,
-	"main.ts":       true,
-	"main.js":       true,
-	"app.go":        true,
-	"app.py":        true,
-	"app.ts":        true,
-	"app.js":        true,
-	"index.ts":      true,
-	"index.js":      true,
-	"package.json":  true,
-	"go.mod":        true,
-	"Makefile":      true,
-	"Cargo.toml":    true,
-	"pyproject.toml": true,
+	"main.go":          true,
+	"main.py":          true,
+	"main.ts":          true,
+	"main.js":          true,
+	"app.go":           true,
+	"app.py":           true,
+	"app.ts":           true,
+	"app.js":           true,
+	"index.ts":         true,
+	"index.js":         true,
+	"package.json":     true,
+	"go.mod":           true,
+	"Makefile":         true,
+	"Cargo.toml":       true,
+	"pyproject.toml":   true,
 	"requirements.txt": true,
-	"Dockerfile":    true,
+	"Dockerfile":       true,
 }
 
 const fileHintLines = 5
@@ -53,9 +53,9 @@ var (
 	goMethodRe = regexp.MustCompile(`^func\s+\([^)]+\)\s+(\w+)\s*\(`)
 	goTypeRe   = regexp.MustCompile(`^type\s+(\w+)\s+`)
 
-	jsFuncRe    = regexp.MustCompile(`^(?:export\s+)?(?:default\s+)?function\s+(\w+)`)
-	jsClassRe   = regexp.MustCompile(`^(?:export\s+)?(?:default\s+)?class\s+(\w+)`)
-	jsConstRe   = regexp.MustCompile(`^export\s+(?:default\s+)?(?:const|let)\s+(\w+)`)
+	jsFuncRe  = regexp.MustCompile(`^(?:export\s+)?(?:default\s+)?function\s+(\w+)`)
+	jsClassRe = regexp.MustCompile(`^(?:export\s+)?(?:default\s+)?class\s+(\w+)`)
+	jsConstRe = regexp.MustCompile(`^export\s+(?:default\s+)?(?:const|let)\s+(\w+)`)
 
 	pyDefRe   = regexp.MustCompile(`^\s*def\s+(\w+)\s*\(`)
 	pyClassRe = regexp.MustCompile(`^\s*class\s+(\w+)[\s(:]`)

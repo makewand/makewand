@@ -4,15 +4,15 @@ package tui
 type AppState int
 
 const (
-	StateIdle          AppState = iota // waiting for user input
-	StateStreaming                     // receiving AI response stream
-	StateConfirmFiles                  // waiting for Y/N on file write
-	StateConfirmDeps                   // waiting for Y/N on dependency install
-	StateConfirmTests                  // waiting for Y/N on test execution
-	StateInstallingDeps                // deps being installed
-	StateRunningTests                  // tests running
-	StateAutoFixing                    // auto-fix in progress
-	StateQuitting                      // app shutting down
+	StateIdle           AppState = iota // waiting for user input
+	StateStreaming                      // receiving AI response stream
+	StateConfirmFiles                   // waiting for Y/N on file write
+	StateConfirmDeps                    // waiting for Y/N on dependency install
+	StateConfirmTests                   // waiting for Y/N on test execution
+	StateInstallingDeps                 // deps being installed
+	StateRunningTests                   // tests running
+	StateAutoFixing                     // auto-fix in progress
+	StateQuitting                       // app shutting down
 )
 
 // String returns a human-readable name for the state.

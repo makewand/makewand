@@ -212,8 +212,12 @@ func serveCmd() *cobra.Command {
 			handler := serverhttp.WithRequestID(metrics.Middleware(mux))
 
 			server := &http.Server{
-				Addr:    listenAddr,
-				Handler: handler,
+				Addr:              listenAddr,
+				Handler:           handler,
+				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       30 * time.Second,
+				WriteTimeout:      10 * time.Minute,
+				IdleTimeout:       2 * time.Minute,
 			}
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)

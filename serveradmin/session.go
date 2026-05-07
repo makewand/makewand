@@ -75,10 +75,10 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 		return
 	}
 	var payload router.UserLoginRequest
-	dec := json.NewDecoder(req.Body)
-	dec.DisallowUnknownFields()
+	dec := newLimitedJSONDecoder(w, req)
 	if err := dec.Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+		status, code, message := adminJSONDecodeError(err)
+		writeError(w, status, code, message)
 		return
 	}
 	key := serverauth.LoginThrottleKey(req, payload.Email)

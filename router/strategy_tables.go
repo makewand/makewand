@@ -76,12 +76,12 @@ const DefaultContextBudget = 3000
 
 // rawDefaults is the JSON schema for defaults.json and user overrides.
 type rawDefaults struct {
-	Models          map[string]map[string]string     `json:"models"`
-	Costs           map[string]costEntry             `json:"costs"`
+	Models          map[string]map[string]string      `json:"models"`
+	Costs           map[string]costEntry              `json:"costs"`
 	Strategies      map[string]map[string]rawStrategy `json:"strategies"`
-	BuildStrategies map[string]map[string]rawBuild   `json:"build_strategies"`
-	ContextBudgets  map[string]map[string]int        `json:"context_budgets"`
-	PowerEnsemble   map[string]rawEnsemble           `json:"power_ensemble"`
+	BuildStrategies map[string]map[string]rawBuild    `json:"build_strategies"`
+	ContextBudgets  map[string]map[string]int         `json:"context_budgets"`
+	PowerEnsemble   map[string]rawEnsemble            `json:"power_ensemble"`
 }
 
 type rawStrategy struct {

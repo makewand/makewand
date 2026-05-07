@@ -74,6 +74,34 @@ func TestHandlerWithOptions_AuditLogsSuccessfulWrite(t *testing.T) {
 	}
 }
 
+func TestHandlerWithOptions_RejectsOversizedSessionPayload(t *testing.T) {
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				Token:  "secret",
+				Scopes: []string{serverauth.ScopeSessionsWrite},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	store := NewStore(t.TempDir())
+	handler := NewHandlerWithOptions(store, HandlerOptions{Authorizer: authz})
+	req := httptest.NewRequest(http.MethodPut, "/v1/sessions/repo-main", strings.NewReader(strings.Repeat("x", maxSessionPayloadBytes+1)))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if _, err := store.Load("repo-main"); err != ErrNotFound {
+		t.Fatalf("store.Load error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestHandlerWithOptions_AuditLogsForbiddenWorkspace(t *testing.T) {
 	authz, err := serverauth.NewAuthorizer(serverauth.Config{
 		Tokens: []serverauth.TokenRule{
