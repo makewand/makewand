@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -62,5 +63,41 @@ func TestReadFile_RejectsSymlinkEscape(t *testing.T) {
 
 	if _, err := proj.ReadFile("secret-link.txt"); err == nil {
 		t.Fatal("ReadFile should reject symlink escape, got nil error")
+	}
+}
+
+func TestScanFiles_ReturnsRootError(t *testing.T) {
+	proj, err := NewProject("scan-root-error", t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+
+	if err := os.RemoveAll(proj.Path); err != nil {
+		t.Fatalf("RemoveAll(project): %v", err)
+	}
+
+	if err := proj.ScanFiles(); err == nil {
+		t.Fatal("ScanFiles should return an error when the project root is missing")
+	}
+}
+
+func TestOpenProjectLimited_TruncatesLargeTree(t *testing.T) {
+	projectDir := t.TempDir()
+	for i := 0; i < 40; i++ {
+		path := filepath.Join(projectDir, fmt.Sprintf("file-%02d.txt", i))
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+
+	proj, err := OpenProjectLimited(projectDir, 10)
+	if err != nil {
+		t.Fatalf("OpenProjectLimited: %v", err)
+	}
+	if !proj.ScanTruncated {
+		t.Fatal("expected ScanTruncated to be true")
+	}
+	if got := len(proj.Files); got > 11 {
+		t.Fatalf("len(Files) = %d, want <= 11 (root + 10 entries)", got)
 	}
 }

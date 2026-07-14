@@ -22,6 +22,39 @@ const summaryPerLineMaxChars = 180
 const chatContextTokenBudget = 6000
 const chatMinRecentMessages = 4
 const contextTruncatedNotice = "\n- ... truncated to fit context budget ..."
+const maxSlashSuggestions = 12
+
+type slashCommandSuggestion struct {
+	Command     string
+	Description string
+}
+
+var rootSlashCommandSuggestions = []slashCommandSuggestion{
+	{Command: "/help", Description: "Show commands"},
+	{Command: "/clear", Description: "Clear conversation"},
+	{Command: "/compact", Description: "Compact chat history"},
+	{Command: "/model", Description: "Switch model profile"},
+	{Command: "/approval", Description: "Switch approval behavior"},
+	{Command: "/memory", Description: "Show compacted session memory"},
+	{Command: "/status", Description: "Show session status"},
+	{Command: "/cost", Description: "Show session cost"},
+	{Command: "/approve", Description: "Approve the pending action"},
+	{Command: "/deny", Description: "Deny the pending action"},
+	{Command: "/resume", Description: "Restore the last saved session"},
+	{Command: "/exit", Description: "Quit makewand"},
+}
+
+var modelSlashCommandSuggestions = []slashCommandSuggestion{
+	{Command: "/model fast", Description: "Fastest/cheapest routing"},
+	{Command: "/model balanced", Description: "Default mode"},
+	{Command: "/model power", Description: "Highest quality routing"},
+}
+
+var approvalSlashCommandSuggestions = []slashCommandSuggestion{
+	{Command: "/approval manual", Description: "Ask before writes and execution"},
+	{Command: "/approval safe", Description: "Auto-approve safe writes and checks"},
+	{Command: "/approval autopilot", Description: "Auto-select verified candidates"},
+}
 
 // ChatMessage represents a message in the chat panel.
 type ChatMessage struct {
@@ -33,14 +66,18 @@ type ChatMessage struct {
 
 // ChatPanel is the main chat interaction panel.
 type ChatPanel struct {
-	messages  []ChatMessage
-	viewport  viewport.Model
-	textarea  textarea.Model
-	width     int
-	height    int
-	ready     bool
-	streaming bool
-	streamBuf *strings.Builder
+	messages       []ChatMessage
+	viewport       viewport.Model
+	textarea       textarea.Model
+	width          int
+	height         int
+	ready          bool
+	streaming      bool
+	streamBuf      *strings.Builder
+	streamProvider string
+	streamStatus   string
+
+	slashSelection int
 }
 
 const (
@@ -62,9 +99,10 @@ func NewChatPanel() ChatPanel {
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 
 	return ChatPanel{
-		textarea:  ta,
-		messages:  []ChatMessage{},
-		streamBuf: &strings.Builder{},
+		textarea:       ta,
+		messages:       []ChatMessage{},
+		streamBuf:      &strings.Builder{},
+		slashSelection: -1,
 	}
 }
 
@@ -74,12 +112,103 @@ func (c *ChatPanel) AddMessage(msg ChatMessage) {
 	c.updateViewport()
 }
 
+func (c *ChatPanel) ResetMessages(messages []ChatMessage) {
+	c.messages = append([]ChatMessage(nil), messages...)
+	c.streamBuf.Reset()
+	c.streaming = false
+	c.streamProvider = ""
+	c.streamStatus = ""
+	c.updateViewport()
+}
+
+func (c *ChatPanel) CompactHistory() bool {
+	if len(c.messages) == 0 {
+		return false
+	}
+
+	preserved := make([]ChatMessage, 0, len(c.messages))
+	dialog := make([]model.Message, 0, len(c.messages))
+	for _, msg := range c.messages {
+		switch msg.Role {
+		case "user", "assistant":
+			dialog = append(dialog, model.Message{Role: msg.Role, Content: msg.Content})
+		default:
+			preserved = append(preserved, msg)
+		}
+	}
+
+	if len(dialog) <= maxChatHistory {
+		return false
+	}
+
+	compacted := summarizeHistoryWindow(dialog)
+	next := append([]ChatMessage(nil), preserved...)
+	for _, msg := range compacted {
+		next = append(next, ChatMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+	c.messages = next
+	c.updateViewport()
+	return true
+}
+
+func (c *ChatPanel) relayout() {
+	if c.width < minPanelWidth || c.height < minPanelHeight {
+		return
+	}
+
+	headerHeight := 1
+	inputHeight := 5 + c.commandSuggestionHeight()
+	vpWidth := maxInt(c.width-2, minViewportWidth)
+	vpHeight := maxInt(c.height-headerHeight-inputHeight, minViewportHeight)
+	inputWidth := maxInt(c.width-2, minInputWidth)
+
+	if !c.ready {
+		c.viewport = viewport.New(vpWidth, vpHeight)
+		c.ready = true
+	} else {
+		c.viewport.Width = vpWidth
+		c.viewport.Height = vpHeight
+	}
+
+	c.textarea.SetWidth(inputWidth)
+	c.viewport.SetContent(c.renderMessages())
+}
+
 // SetStreaming sets whether the AI is currently streaming a response.
 func (c *ChatPanel) SetStreaming(streaming bool) {
+	if c.streaming == streaming && c.streamProvider == "" && c.streamStatus == "" && !streaming {
+		return
+	}
 	c.streaming = streaming
 	if streaming {
 		c.streamBuf.Reset()
 	}
+	c.streamProvider = ""
+	c.streamStatus = ""
+	c.updateViewport()
+}
+
+// SetStreamProvider updates the provider label shown for the active stream.
+func (c *ChatPanel) SetStreamProvider(provider string) {
+	provider = strings.TrimSpace(provider)
+	if c.streamProvider == provider {
+		return
+	}
+	c.streamProvider = provider
+	c.updateViewport()
+}
+
+// SetStreamStatus updates the live status shown for the active stream.
+func (c *ChatPanel) SetStreamStatus(status string) {
+	status = strings.TrimSpace(status)
+	if c.streamStatus == status {
+		return
+	}
+	c.streamStatus = status
+	c.updateViewport()
 }
 
 // AppendStream appends text to the current streaming response.
@@ -100,6 +229,8 @@ func (c *ChatPanel) FinishStream(provider string, cost float64) {
 		c.streamBuf.Reset()
 	}
 	c.streaming = false
+	c.streamProvider = ""
+	c.streamStatus = ""
 	c.updateViewport()
 }
 
@@ -340,11 +471,29 @@ func (c *ChatPanel) renderMessages() string {
 
 	// Show streaming content
 	streamStr := c.streamBuf.String()
+	streamLabel := "AI"
+	if c.streamProvider != "" {
+		streamLabel = fmt.Sprintf("AI (%s)", c.streamProvider)
+	}
 	if c.streaming && streamStr != "" {
-		b.WriteString(aiMsgStyle.Render("AI") + " " + spinnerStyle.Render("*") + "\n")
+		b.WriteString(aiMsgStyle.Render(streamLabel) + " " + spinnerStyle.Render("*") + "\n")
 		b.WriteString(wrapText(streamStr, maxWidth) + "\n")
+		if c.streamStatus != "" {
+			b.WriteString(mutedStyle.Render(wrapText(c.streamStatus, maxWidth)) + "\n")
+		}
 	} else if c.streaming {
-		b.WriteString(spinnerStyle.Render("* "+i18n.Msg().ChatThinkingAnim) + "\n")
+		if c.streamProvider != "" {
+			b.WriteString(aiMsgStyle.Render(streamLabel) + " " + spinnerStyle.Render("*") + "\n")
+			if c.streamStatus != "" {
+				b.WriteString(mutedStyle.Render(wrapText(c.streamStatus, maxWidth)) + "\n")
+			} else {
+				b.WriteString(mutedStyle.Render(i18n.Msg().ChatThinkingAnim) + "\n")
+			}
+		} else if c.streamStatus != "" {
+			b.WriteString(spinnerStyle.Render("* "+wrapText(c.streamStatus, maxWidth)) + "\n")
+		} else {
+			b.WriteString(spinnerStyle.Render("* "+i18n.Msg().ChatThinkingAnim) + "\n")
+		}
 	}
 
 	return b.String()
@@ -364,22 +513,17 @@ func (c ChatPanel) Update(msg tea.Msg) (ChatPanel, tea.Cmd) {
 		c.width = maxInt(msg.Width, minPanelWidth)
 		c.height = maxInt(msg.Height, minPanelHeight)
 
-		headerHeight := 1
-		inputHeight := 5
-		vpWidth := maxInt(c.width-2, minViewportWidth)
-		vpHeight := maxInt(c.height-headerHeight-inputHeight, minViewportHeight)
-		inputWidth := maxInt(c.width-2, minInputWidth)
-
-		if !c.ready {
-			c.viewport = viewport.New(vpWidth, vpHeight)
-			c.viewport.SetContent(c.renderMessages())
-			c.ready = true
-		} else {
-			c.viewport.Width = vpWidth
-			c.viewport.Height = vpHeight
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyTab && c.applySlashCompletion() {
+			c.relayout()
+			c.updateViewport()
+			return c, nil
 		}
-
-		c.textarea.SetWidth(inputWidth)
+		if (msg.Type == tea.KeyUp || msg.Type == tea.KeyDown) && c.moveSlashSelection(keySelectionDelta(msg.Type)) {
+			c.relayout()
+			c.updateViewport()
+			return c, nil
+		}
 	}
 
 	var vpCmd tea.Cmd
@@ -390,6 +534,10 @@ func (c ChatPanel) Update(msg tea.Msg) (ChatPanel, tea.Cmd) {
 	c.textarea, taCmd = c.textarea.Update(msg)
 	cmds = append(cmds, taCmd)
 
+	c.syncSlashSelection()
+	c.relayout()
+	c.updateViewport()
+
 	return c, tea.Batch(cmds...)
 }
 
@@ -399,10 +547,15 @@ func (c ChatPanel) View() string {
 		return "Loading..."
 	}
 
+	inputArea := c.textarea.View()
+	if suggestions := c.renderSlashSuggestions(); suggestions != "" {
+		inputArea = suggestions + "\n" + inputArea
+	}
+
 	return fmt.Sprintf(
 		"%s\n%s",
 		c.viewport.View(),
-		c.textarea.View(),
+		inputArea,
 	)
 }
 
@@ -414,11 +567,68 @@ func (c *ChatPanel) InputValue() string {
 // ClearInput clears the text input.
 func (c *ChatPanel) ClearInput() {
 	c.textarea.Reset()
+	c.slashSelection = -1
+	c.relayout()
 }
 
 // Focus focuses the text input.
 func (c *ChatPanel) Focus() {
 	c.textarea.Focus()
+}
+
+func (c *ChatPanel) applySlashCompletion() bool {
+	input := strings.TrimSpace(c.textarea.Value())
+	if input == "" || !strings.HasPrefix(input, "/") {
+		return false
+	}
+
+	suggestions := c.currentSlashSuggestions()
+	if len(suggestions) == 0 {
+		return false
+	}
+
+	target := longestCommonSlashPrefix(suggestions)
+	if len(suggestions) == 1 || target == input {
+		index := c.slashSelection
+		if index < 0 || index >= len(suggestions) {
+			index = 0
+		}
+		target = suggestions[index].Command
+	}
+	if target == "" || target == input {
+		return false
+	}
+
+	c.textarea.SetValue(target)
+	c.textarea.SetCursor(len(target))
+	c.syncSlashSelection()
+	return true
+}
+
+func (c *ChatPanel) ApplySelectedSlashSuggestion() bool {
+	suggestions := c.visibleSlashSuggestions()
+	if len(suggestions) == 0 {
+		return false
+	}
+
+	index := c.slashSelection
+	if index < 0 || index >= len(suggestions) {
+		index = 0
+	}
+	target := suggestions[index].Command
+	if strings.TrimSpace(c.textarea.Value()) == target {
+		return false
+	}
+
+	c.textarea.SetValue(target)
+	c.textarea.SetCursor(len(target))
+	c.syncSlashSelection()
+	c.relayout()
+	return true
+}
+
+func (c ChatPanel) HasSlashSuggestions() bool {
+	return len(c.visibleSlashSuggestions()) > 0
 }
 
 // LastAssistantContent returns the content of the most recent assistant message.
@@ -434,6 +644,123 @@ func (c *ChatPanel) LastAssistantContent() string {
 // UpdatePlaceholder refreshes the textarea placeholder from i18n.
 func (c *ChatPanel) UpdatePlaceholder() {
 	c.textarea.Placeholder = i18n.Msg().ChatPlaceholder
+}
+
+func (c ChatPanel) currentSlashSuggestions() []slashCommandSuggestion {
+	input := strings.ToLower(strings.TrimSpace(c.textarea.Value()))
+	if input == "" || !strings.HasPrefix(input, "/") || strings.Contains(input, "\n") {
+		return nil
+	}
+
+	base := rootSlashCommandSuggestions
+	if input == "/model" || strings.HasPrefix(input, "/model ") {
+		base = modelSlashCommandSuggestions
+	} else if input == "/approval" || strings.HasPrefix(input, "/approval ") {
+		base = approvalSlashCommandSuggestions
+	}
+
+	matches := make([]slashCommandSuggestion, 0, len(base))
+	for _, suggestion := range base {
+		if strings.HasPrefix(strings.ToLower(suggestion.Command), input) {
+			matches = append(matches, suggestion)
+		}
+	}
+	return matches
+}
+
+func (c ChatPanel) visibleSlashSuggestions() []slashCommandSuggestion {
+	suggestions := c.currentSlashSuggestions()
+	if len(suggestions) > maxSlashSuggestions {
+		suggestions = suggestions[:maxSlashSuggestions]
+	}
+	return suggestions
+}
+
+func (c *ChatPanel) syncSlashSelection() {
+	suggestions := c.visibleSlashSuggestions()
+	if len(suggestions) == 0 {
+		c.slashSelection = -1
+		return
+	}
+	if c.slashSelection < 0 || c.slashSelection >= len(suggestions) {
+		c.slashSelection = 0
+	}
+}
+
+func (c *ChatPanel) moveSlashSelection(delta int) bool {
+	suggestions := c.visibleSlashSuggestions()
+	if len(suggestions) == 0 {
+		return false
+	}
+
+	c.syncSlashSelection()
+	c.slashSelection += delta
+	if c.slashSelection < 0 {
+		c.slashSelection = len(suggestions) - 1
+	} else if c.slashSelection >= len(suggestions) {
+		c.slashSelection = 0
+	}
+	return true
+}
+
+func (c ChatPanel) commandSuggestionHeight() int {
+	suggestions := c.visibleSlashSuggestions()
+	if len(suggestions) == 0 {
+		return 0
+	}
+	return 1 + len(suggestions)
+}
+
+func (c ChatPanel) renderSlashSuggestions() string {
+	suggestions := c.visibleSlashSuggestions()
+	if len(suggestions) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(helpStyle.Render("Commands (Up/Down to select, Enter/Tab to apply)") + "\n")
+	selected := c.slashSelection
+	if selected < 0 || selected >= len(suggestions) {
+		selected = 0
+	}
+	for i, suggestion := range suggestions {
+		prefix := "  "
+		commandStyle := lipgloss.NewStyle()
+		if i == selected {
+			prefix = selectedStyle.Render("> ")
+			commandStyle = selectedStyle
+		}
+		b.WriteString(prefix)
+		b.WriteString(commandStyle.Render(suggestion.Command))
+		b.WriteString("  ")
+		b.WriteString(mutedStyle.Render(suggestion.Description))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func longestCommonSlashPrefix(suggestions []slashCommandSuggestion) string {
+	if len(suggestions) == 0 {
+		return ""
+	}
+
+	prefix := suggestions[0].Command
+	for _, suggestion := range suggestions[1:] {
+		for !strings.HasPrefix(suggestion.Command, prefix) && prefix != "" {
+			prefix = prefix[:len(prefix)-1]
+		}
+		if prefix == "" {
+			return ""
+		}
+	}
+	return prefix
+}
+
+func keySelectionDelta(key tea.KeyType) int {
+	if key == tea.KeyUp {
+		return -1
+	}
+	return 1
 }
 
 func wrapText(text string, width int) string {

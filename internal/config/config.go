@@ -32,7 +32,7 @@ type Config struct {
 	OllamaModel string `json:"ollama_model,omitempty"`
 
 	// Usage mode and provider access types
-	UsageMode    string `json:"usage_mode,omitempty"`    // "free","economy","balanced","power"
+	UsageMode    string `json:"usage_mode,omitempty"`    // "fast","balanced","power"
 	ClaudeAccess string `json:"claude_access,omitempty"` // "subscription" or "api"
 	GeminiAccess string `json:"gemini_access,omitempty"` // "free","subscription","api"
 	OpenAIAccess string `json:"openai_access,omitempty"` // "subscription" or "api"
@@ -40,8 +40,9 @@ type Config struct {
 	OllamaAccess string `json:"ollama_access,omitempty"` // always "local"
 
 	// UI preferences
-	Language string `json:"language,omitempty"` // "zh" or "en"
-	Theme    string `json:"theme,omitempty"`    // "dark" or "light"
+	Language     string `json:"language,omitempty"`      // "zh" or "en"
+	Theme        string `json:"theme,omitempty"`         // "dark" or "light"
+	ApprovalMode string `json:"approval_mode,omitempty"` // "manual", "safe", or "autopilot"
 
 	// Cost tracking
 	MonthlyBudget float64 `json:"monthly_budget,omitempty"`
@@ -67,15 +68,27 @@ type CLITool struct {
 }
 
 // CustomProvider describes one command-based external provider.
-// The command receives the user prompt either by:
-//   - replacing "{{prompt}}" in Args entries; or
-//   - appending prompt as the final argument when no placeholder is present.
+// PromptMode controls how the prompt is delivered:
+//   - "stdin": write prompt to process stdin (recommended)
+//   - "arg": append prompt as final argument
+//   - empty: keep legacy "{{prompt}}" replacement / argv append behavior
 type CustomProvider struct {
-	Name    string   `json:"name"`
-	Command string   `json:"command"`
-	Args    []string `json:"args,omitempty"`
-	Access  string   `json:"access,omitempty"` // "free","local","subscription","api"
+	Name       string   `json:"name"`
+	Command    string   `json:"command"`
+	Args       []string `json:"args,omitempty"`
+	Access     string   `json:"access,omitempty"`      // "free","local","subscription","api"
+	PromptMode string   `json:"prompt_mode,omitempty"` // "stdin","arg"; empty keeps legacy argv/{{prompt}} delivery
 }
+
+const (
+	CustomPromptModeLegacy = "legacy"
+	CustomPromptModeArg    = "arg"
+	CustomPromptModeStdin  = "stdin"
+
+	ApprovalModeManual = "manual"
+	ApprovalModeSafe   = "safe"
+	ApprovalModeAuto   = "autopilot"
+)
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
@@ -86,7 +99,20 @@ func DefaultConfig() *Config {
 		ReviewModel:   "gemini",
 		Language:      "en",
 		Theme:         "dark",
+		ApprovalMode:  ApprovalModeManual,
 		MonthlyBudget: 20.0,
+	}
+}
+
+// NormalizeApprovalMode returns a supported approval mode, defaulting to manual.
+func NormalizeApprovalMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case ApprovalModeSafe:
+		return ApprovalModeSafe
+	case ApprovalModeAuto:
+		return ApprovalModeAuto
+	default:
+		return ApprovalModeManual
 	}
 }
 
@@ -156,6 +182,7 @@ func Load() (*Config, error) {
 
 	// Auto-detect installed CLI tools
 	cfg.CLIs = detectCLIs()
+	cfg.ApprovalMode = NormalizeApprovalMode(cfg.ApprovalMode)
 
 	// If CLI tools found, set access to subscription (unless explicitly overridden)
 	for _, cli := range cfg.CLIs {
@@ -187,6 +214,7 @@ func Save(cfg *Config) error {
 
 	// Create a copy that strips env-sourced keys
 	toSave := *cfg
+	toSave.ApprovalMode = NormalizeApprovalMode(toSave.ApprovalMode)
 	if cfg.envSourcedKeys != nil {
 		if cfg.envSourcedKeys["claude"] {
 			toSave.ClaudeAPIKey = ""
@@ -245,6 +273,40 @@ func IsCustomProviderUsable(cp CustomProvider) bool {
 	return err == nil
 }
 
+// EffectiveCustomProviderPromptMode normalizes prompt delivery mode.
+// Empty values keep legacy behavior for backward compatibility.
+func EffectiveCustomProviderPromptMode(cp CustomProvider) string {
+	switch strings.ToLower(strings.TrimSpace(cp.PromptMode)) {
+	case CustomPromptModeStdin:
+		return CustomPromptModeStdin
+	case CustomPromptModeArg:
+		return CustomPromptModeArg
+	default:
+		return CustomPromptModeLegacy
+	}
+}
+
+// CustomProviderUsesShellAdapter returns true for commands that invoke a shell
+// interpreter with an inline command string (for example sh -c, bash -lc, cmd /c).
+func CustomProviderUsesShellAdapter(cp CustomProvider) bool {
+	command := strings.ToLower(filepath.Base(strings.TrimSpace(cp.Command)))
+	if command == "" || len(cp.Args) == 0 {
+		return false
+	}
+
+	firstArg := strings.ToLower(strings.TrimSpace(cp.Args[0]))
+	switch command {
+	case "sh", "bash", "zsh", "dash", "ksh", "fish":
+		return firstArg == "-c" || firstArg == "-lc" || firstArg == "-ic"
+	case "cmd", "cmd.exe":
+		return firstArg == "/c"
+	case "powershell", "powershell.exe", "pwsh", "pwsh.exe":
+		return firstArg == "-command" || firstArg == "-c"
+	default:
+		return false
+	}
+}
+
 // HasCLI returns true if a specific CLI tool was detected.
 func (c *Config) HasCLI(name string) bool {
 	for _, cli := range c.CLIs {
@@ -276,6 +338,9 @@ func detectCLIs() []CLITool {
 		{"claude", "claude", []string{"--version"}},
 		{"gemini", "gemini", []string{"--version"}},
 		{"codex", "codex", []string{"--version"}},
+		// agy (Antigravity CLI) is the current transport for personal Gemini
+		// subscriptions; when present it takes the "gemini" provider slot.
+		{"agy", "agy", []string{"--version"}},
 	}
 
 	var results []CLITool

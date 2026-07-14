@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,12 +11,15 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
 )
 
-const maxAutoFixRetries = 3
+// maxAutoFixRetries is a local alias for the pipeline constant, used in i18n
+// messages and progress labels that reference the retry limit.
+var maxAutoFixRetries = engine.MaxAutoFixRetries
 
 // Build pipeline step indices (5-step progress).
 const (
@@ -70,44 +72,49 @@ type App struct {
 
 	// Cancellable AI context
 	cancelAI context.CancelFunc
+	activity *chatActivityState
 
-	// Build pipeline state
-	pendingFiles        []engine.ExtractedFile // files waiting to be written
-	pendingPhase        pendingPhaseType       // which phase triggered the pending files
-	confirmingFiles     bool                   // waiting for user Y/N
-	confirmingDeps      bool                   // waiting for dependency install confirmation
-	confirmingTests     bool                   // waiting for test execution confirmation
-	depsInstallApproved bool                   // user approved dependency installation
-	testsRunApproved    bool                   // user approved running tests
-	pendingDepsPlan     *engine.ExecPlan       // detected dependency install command
-	pendingTestsPlan    *engine.ExecPlan       // detected test execution command
-	autoFixAttempt      int                    // current auto-fix attempt
-	autoFixRetryAttempt int                    // attempt number for retry after file write
-	buildCodeProvider   string                 // provider that generated code
-	buildReviewProvider string                 // provider that reviewed code
+	// Build pipeline domain logic (phase transitions, retry counting, provider tracking).
+	pipeline *engine.BuildPipeline
+
+	// Build pipeline TUI state (files, plans, approvals — owned by TUI layer).
+	pendingFiles         []engine.ExtractedFile // files waiting to be written
+	pendingPhase         pendingPhaseType       // which phase triggered the pending files
+	state                AppState               // current interaction state
+	pendingDepsPlan      *engine.ExecPlan       // detected dependency install command
+	pendingTestsPlan     *engine.ExecPlan       // detected test execution command
+	pendingApproval      *approvalRequest       // current approval request, if any
+	pendingWriteVerified bool                   // true when the pending file batch passed local verification
 
 	// State
-	width    int
-	height   int
-	quitting bool
-	err      error
+	width  int
+	height int
+	err    error
 
 	// Last budget warning level that has been surfaced to the user.
 	lastBudgetNoticeLevel BudgetLevel
 
 	// Debug route diagnostics (enabled by --debug).
 	debugRoute *routeDebugState
+
+	// Chat session metadata.
+	sessionFile          string
+	lastSessionSavedAt   string
+	restoredSession      bool
+	restoredMessageCount int
 }
 
 // --- Bubble Tea message types ---
 
 type aiResponseMsg struct {
-	content      string
-	provider     string
-	cost         float64
-	inputTokens  int
-	outputTokens int
-	err          error
+	content       string
+	provider      string
+	cost          float64
+	inputTokens   int
+	outputTokens  int
+	verified      bool
+	selectionNote string
+	err           error
 }
 
 type aiStreamStartMsg struct {
@@ -173,13 +180,15 @@ type autoFixMsg struct {
 
 // autoFixResponseMsg is sent after the AI responds with a fix.
 type autoFixResponseMsg struct {
-	content      string
-	provider     string
-	cost         float64
-	inputTokens  int
-	outputTokens int
-	attempt      int
-	err          error
+	content       string
+	provider      string
+	cost          float64
+	inputTokens   int
+	outputTokens  int
+	attempt       int
+	verified      bool
+	selectionNote string
+	err           error
 }
 
 // codeReviewMsg is sent after the review AI finishes analyzing code.
@@ -221,6 +230,8 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 		mode:     mode,
 		cfg:      cfg,
 		router:   router,
+		activity: newChatActivityState(),
+		pipeline: engine.NewBuildPipeline(),
 		chat:     NewChatPanel(),
 		fileTree: NewFileTreePanel(),
 		progress: NewProgressPanel(),
@@ -237,7 +248,28 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 		}
 	}
 
+	if mode == ModeChat {
+		app.chat.ResetMessages([]ChatMessage{app.chatWelcomeMessage()})
+		if app.project != nil {
+			if sessionFile, err := chatSessionFilePath(app.project.Path); err == nil {
+				app.sessionFile = sessionFile
+			}
+		}
+	}
+
 	return app
+}
+
+func (a App) chatWelcomeMessage() ChatMessage {
+	msg := i18n.Msg()
+	return ChatMessage{
+		Role: "system",
+		Content: fmt.Sprintf("%s\n%s\n%s",
+			msg.ChatWelcome,
+			msg.ChatPrompt,
+			msg.ChatCommandHint,
+		),
+	}
 }
 
 // Init implements tea.Model.
@@ -283,27 +315,22 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, chatCmd)
 
 	case tea.KeyMsg:
-		// Handle file write confirmation
-		if a.confirmingFiles {
-			return a.handleFileConfirmKey(msg)
-		}
-		// Handle dependency install confirmation
-		if a.confirmingDeps {
-			return a.handleDepsConfirmKey(msg)
-		}
-		// Handle test execution confirmation
-		if a.confirmingTests {
-			return a.handleTestsConfirmKey(msg)
+		if next, cmd, handled := a.handlePendingApprovalKey(msg); handled {
+			return next, cmd
 		}
 
 		switch msg.String() {
-		case "ctrl+c":
+		case "ctrl+c", "ctrl+d":
 			if a.cancelAI != nil {
 				a.cancelAI()
 				a.cancelAI = nil
 			}
-			a.quitting = true
+			a.activity.Reset()
+			a.state = StateQuitting
 			return a, tea.Quit
+
+		case "ctrl+l":
+			return a, tea.ClearScreen
 
 		case "enter":
 			if a.mode == ModeNew {
@@ -313,7 +340,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "q":
 			if a.mode == ModeNew && a.wizard.Phase() == WizardPhaseTemplate {
-				a.quitting = true
+				a.state = StateQuitting
 				return a, tea.Quit
 			}
 
@@ -331,6 +358,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case aiResponseMsg:
+		if a.cancelAI != nil {
+			a.cancelAI = nil
+		}
+		a.state = StateIdle
 		return a.handleAIResponse(msg)
 
 	case startPromptMsg:
@@ -339,6 +370,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case aiStreamStartMsg:
 		a.streamCh = msg.ch
 		a.streamProv = msg.provider
+		a.state = StateStreaming
+		a.activity.SetPhase(chatActivityWaiting, msg.provider, msg.requested, msg.isFallback, "")
 
 		if msg.isFallback {
 			m := i18n.Msg()
@@ -351,6 +384,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, a.waitForStreamChunk())
 
 	case aiStreamMsg:
+		emitChatStreamTrace(a.router, msg.provider, msg.chunk)
 		if msg.chunk.Error != nil {
 			a.chat.AddMessage(ChatMessage{
 				Role:    "system",
@@ -358,9 +392,21 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 			a.chat.SetStreaming(false)
 			a.streamCh = nil
+			a.state = StateIdle
+			a.activity.Reset()
+			if a.cancelAI != nil {
+				a.cancelAI()
+				a.cancelAI = nil
+			}
 		} else if msg.chunk.Done {
 			a.chat.FinishStream(msg.provider, 0)
 			a.streamCh = nil
+			a.state = StateIdle
+			a.activity.Reset()
+			if a.cancelAI != nil {
+				a.cancelAI()
+				a.cancelAI = nil
+			}
 			// After stream finishes, check for files in the response
 			content := a.chat.LastAssistantContent()
 			if content != "" && a.project != nil {
@@ -379,6 +425,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		} else {
+			a.activity.MarkChunk(msg.provider, msg.chunk.Content)
 			a.chat.AppendStream(msg.chunk.Content)
 			cmds = append(cmds, a.waitForStreamChunk())
 		}
@@ -423,12 +470,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.startTestsPhase()
 
 	case filesUpdatedMsg:
-		if a.project != nil {
-			if err := a.project.ScanFiles(); err != nil {
-				log.Printf("scan files: %v", err)
-			}
-			a.fileTree.SetFiles(a.project.Files)
-		}
+		a.refreshProjectFiles()
 
 	case spinner.TickMsg:
 		var spinCmd tea.Cmd
@@ -440,11 +482,51 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, progCmd)
 	}
 
+	a.syncChatActivity()
+
 	var chatCmd tea.Cmd
 	a.chat, chatCmd = a.chat.Update(msg)
 	cmds = append(cmds, chatCmd)
 
 	return a, tea.Batch(cmds...)
+}
+
+func (a App) handlePendingApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+	if !a.state.IsConfirming() {
+		return a, nil, false
+	}
+
+	input := strings.TrimSpace(a.chat.InputValue())
+	if input != "" && msg.Type == tea.KeyEnter {
+		next, cmd := a.handleChatEnter()
+		return next, cmd, true
+	}
+	if input != "" {
+		return a, nil, false
+	}
+
+	switch a.state {
+	case StateConfirmFiles:
+		switch strings.ToLower(msg.String()) {
+		case "y", "enter", "n", "esc":
+			next, cmd := a.handleFileConfirmKey(msg)
+			return next, cmd, true
+		}
+	case StateConfirmDeps:
+		switch strings.ToLower(msg.String()) {
+		case "y", "enter", "n", "esc":
+			next, cmd := a.handleDepsConfirmKey(msg)
+			return next, cmd, true
+		}
+	case StateConfirmTests:
+		switch strings.ToLower(msg.String()) {
+		case "y", "enter", "n", "esc":
+			next, cmd := a.handleTestsConfirmKey(msg)
+			return next, cmd, true
+		}
+	}
+
+	return a, nil, false
 }
 
 // waitForStreamChunk reads the next chunk from the stream channel.
@@ -464,6 +546,7 @@ func (a App) waitForStreamChunk() tea.Cmd {
 func (a App) buildComplete() (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
 	a.wizard.SetPhase(WizardPhaseDone)
+	a.pendingWriteVerified = false
 	a.chat.AddMessage(ChatMessage{
 		Role:    "status",
 		Content: m.ProgressBuildComplete,
@@ -473,9 +556,23 @@ func (a App) buildComplete() (tea.Model, tea.Cmd) {
 	}
 }
 
+func (a *App) refreshProjectFiles() {
+	if a.project == nil {
+		return
+	}
+	if err := a.project.ScanFiles(); err != nil {
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf(i18n.Msg().ErrFileRefresh, err),
+		})
+		return
+	}
+	a.fileTree.SetFiles(a.project.Files)
+}
+
 // View implements tea.Model.
 func (a App) View() string {
-	if a.quitting {
+	if a.state == StateQuitting {
 		return mutedStyle.Render("Goodbye!") + "\n"
 	}
 
@@ -540,12 +637,9 @@ func (a App) renderModeBadge(msg *i18n.Messages) string {
 	var style lipgloss.Style
 
 	switch mode {
-	case model.ModeFree:
-		label = msg.ModeFree
-		style = modeBadgeFreeStyle
-	case model.ModeEconomy:
-		label = msg.ModeEconomy
-		style = modeBadgeEconomyStyle
+	case model.ModeFast:
+		label = msg.ModeFast
+		style = modeBadgeFastStyle
 	case model.ModeBalanced:
 		label = msg.ModeBalanced
 		style = modeBadgeBalancedStyle
@@ -562,8 +656,14 @@ func (a App) renderModeBadge(msg *i18n.Messages) string {
 func (a App) viewSidePanel(width int) string {
 	var sections []string
 
+	if activityView := a.viewActivity(width); activityView != "" {
+		sections = append(sections, activityView)
+	}
 	sections = append(sections, a.fileTree.View())
 	sections = append(sections, a.cost.View(width))
+	if approvalView := a.viewPendingApproval(width); approvalView != "" {
+		sections = append(sections, approvalView)
+	}
 
 	progView := a.progress.View()
 	if progView != "" {
@@ -579,6 +679,39 @@ func (a App) viewSidePanel(width int) string {
 	}
 
 	return strings.Join(sections, "\n")
+}
+
+func (a *App) syncChatActivity() {
+	if a.activity == nil {
+		return
+	}
+	snapshot := a.activity.Snapshot()
+	if !a.chat.streaming || !snapshot.Active {
+		a.chat.SetStreamProvider("")
+		a.chat.SetStreamStatus("")
+		return
+	}
+	a.chat.SetStreamProvider(snapshot.Provider)
+	a.chat.SetStreamStatus(formatChatActivityStatus(snapshot))
+}
+
+func (a *App) viewActivity(width int) string {
+	if a.activity == nil {
+		return ""
+	}
+	snapshot := a.activity.Snapshot()
+	if !snapshot.Active {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(i18n.Msg().ActivityTitle) + "\n")
+	b.WriteString(fmt.Sprintf(" %s %s\n", a.spinner.View(), formatChatActivityHeadline(snapshot)))
+	if meta := formatChatActivityMeta(snapshot); meta != "" {
+		b.WriteString(mutedStyle.Render("   "+wrapText(meta, maxInt(width-8, 12))) + "\n")
+	}
+
+	return statusBorderStyle.Width(width - 2).Render(b.String())
 }
 
 func isLGTMResponse(content string) bool {
@@ -605,16 +738,7 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 		}
 		candidates = append(candidates, filepath.Join(os.TempDir(), "makewand-trace.jsonl"))
 
-		var fileSink *jsonlTraceSink
-		var tracePath string
-		var sinkErr error
-		for _, path := range candidates {
-			fileSink, sinkErr = newJSONLTraceSink(path)
-			if sinkErr == nil {
-				tracePath = path
-				break
-			}
-		}
+		fileSink, tracePath, sinkErr := diag.OpenFirstJSONLTraceSink(candidates)
 		traceSink := &debugTraceSink{
 			file:  fileSink,
 			route: routeState,
@@ -623,16 +747,21 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 		defer traceSink.Close()
 
 		if fileSink == nil {
-			fmt.Fprintf(os.Stderr, "Warning: debug trace disabled: %v\n", sinkErr)
+			diag.Stderr().WarnErr("debug trace disabled", sinkErr)
 		} else {
-			fmt.Fprintf(os.Stderr, "Debug trace enabled: %s\n", tracePath)
+			diag.Stderr().InfoPath("Debug trace enabled", tracePath)
 		}
 	}
 
 	// Load cross-session routing quality statistics.
 	if dir, err := config.ConfigDir(); err == nil {
 		if err := app.router.LoadStats(dir); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not load routing stats: %v\n", err)
+			diag.Stderr().WarnErr("could not load routing stats", err)
+		}
+	}
+	if mode == ModeChat {
+		if _, err := app.restoreChatSession(); err != nil {
+			diag.Stderr().WarnErr("could not restore chat session", err)
 		}
 	}
 
@@ -643,7 +772,10 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 	if dir, dirErr := config.ConfigDir(); dirErr == nil {
 		if finalApp, ok := finalModel.(App); ok {
 			if err := finalApp.router.SaveStats(dir); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not save routing stats: %v\n", err)
+				diag.Stderr().WarnErr("could not save routing stats", err)
+			}
+			if err := finalApp.saveChatSession(); err != nil {
+				diag.Stderr().WarnErr("could not save chat session", err)
 			}
 		}
 	}

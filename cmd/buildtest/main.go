@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 )
@@ -22,13 +23,12 @@ func main() {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config load: %v\n", err)
+		diag.Stderr().ErrorErr("config load failed", err)
 		os.Exit(1)
 	}
 
 	modes := []model.UsageMode{
-		model.ModeFree,
-		model.ModeEconomy,
+		model.ModeFast,
 		model.ModeBalanced,
 		model.ModePower,
 	}

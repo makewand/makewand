@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,20 @@ const (
 	doctorPass doctorStatus = "pass"
 	doctorWarn doctorStatus = "warn"
 	doctorFail doctorStatus = "fail"
+)
+
+const (
+	defaultDoctorProbeRetries = 1
+	maxDoctorProbeErrorLen    = 220
+)
+
+type doctorProbeClassification string
+
+const (
+	probeClassHealthy       doctorProbeClassification = "healthy"
+	probeClassEnvironment   doctorProbeClassification = "environment"
+	probeClassConfiguration doctorProbeClassification = "configuration"
+	probeClassProvider      doctorProbeClassification = "provider"
 )
 
 type doctorCheck struct {
@@ -41,12 +56,14 @@ type doctorModeReport struct {
 }
 
 type doctorProbeReport struct {
-	Mode       string       `json:"mode"`
-	Status     doctorStatus `json:"status"`
-	Provider   string       `json:"provider,omitempty"`
-	ModelID    string       `json:"model_id,omitempty"`
-	DurationMS int64        `json:"duration_ms"`
-	Error      string       `json:"error,omitempty"`
+	Mode           string                    `json:"mode"`
+	Status         doctorStatus              `json:"status"`
+	Classification doctorProbeClassification `json:"classification,omitempty"`
+	Provider       string                    `json:"provider,omitempty"`
+	ModelID        string                    `json:"model_id,omitempty"`
+	Attempts       int                       `json:"attempts,omitempty"`
+	DurationMS     int64                     `json:"duration_ms"`
+	Error          string                    `json:"error,omitempty"`
 }
 
 type doctorReport struct {
@@ -59,23 +76,34 @@ type doctorReport struct {
 	Strict              bool                `json:"strict"`
 	ProbeEnabled        bool                `json:"probe_enabled"`
 	ProbeTimeoutSeconds int                 `json:"probe_timeout_seconds"`
+	ProbeRetries        int                 `json:"probe_retries"`
 }
 
 type doctorOptions struct {
-	modes        []model.UsageMode
-	probe        bool
-	probeTimeout time.Duration
-	strict       bool
-	jsonOutput   bool
+	modes         []model.UsageMode
+	probe         bool
+	probeTimeout  time.Duration
+	probeRetries  int
+	remoteCheck   bool
+	remoteURL     string
+	remoteToken   string
+	remoteTimeout time.Duration
+	strict        bool
+	jsonOutput    bool
 }
 
 func doctorCmd() *cobra.Command {
 	var (
-		modesFlag        string
-		probeFlag        bool
-		probeTimeoutFlag time.Duration
-		strictFlag       bool
-		jsonFlag         bool
+		modesFlag         string
+		probeFlag         bool
+		probeTimeoutFlag  time.Duration
+		probeRetriesFlag  int
+		remoteCheckFlag   bool
+		remoteURLFlag     string
+		remoteTokenFlag   string
+		remoteTimeoutFlag time.Duration
+		strictFlag        bool
+		jsonFlag          bool
 	)
 
 	cmd := &cobra.Command{
@@ -95,14 +123,25 @@ Examples:
 			if probeTimeoutFlag <= 0 {
 				return fmt.Errorf("probe timeout must be positive")
 			}
+			if probeRetriesFlag < 0 {
+				return fmt.Errorf("probe retries must be >= 0")
+			}
+			if remoteTimeoutFlag <= 0 {
+				return fmt.Errorf("remote timeout must be positive")
+			}
 
 			cfg, loadErr := config.Load()
 			report, failCount, warnCount := runDoctor(cfg, loadErr, doctorOptions{
-				modes:        modes,
-				probe:        probeFlag,
-				probeTimeout: probeTimeoutFlag,
-				strict:       strictFlag,
-				jsonOutput:   jsonFlag,
+				modes:         modes,
+				probe:         probeFlag,
+				probeTimeout:  probeTimeoutFlag,
+				probeRetries:  probeRetriesFlag,
+				remoteCheck:   remoteCheckFlag,
+				remoteURL:     remoteURLFlag,
+				remoteToken:   remoteTokenFlag,
+				remoteTimeout: remoteTimeoutFlag,
+				strict:        strictFlag,
+				jsonOutput:    jsonFlag,
 			})
 
 			if jsonFlag {
@@ -125,9 +164,14 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&modesFlag, "modes", "all", "modes to verify: all or comma list (free,economy,balanced,power)")
+	cmd.Flags().StringVar(&modesFlag, "modes", "all", "modes to verify: all or comma list (fast,balanced,power)")
 	cmd.Flags().BoolVar(&probeFlag, "probe", false, "run live provider probe requests (network/API/CLI)")
 	cmd.Flags().DurationVar(&probeTimeoutFlag, "probe-timeout", 45*time.Second, "timeout per live probe request")
+	cmd.Flags().IntVar(&probeRetriesFlag, "probe-retries", defaultDoctorProbeRetries, "retry count per provider during live probe")
+	cmd.Flags().BoolVar(&remoteCheckFlag, "remote-check", false, "verify the configured or supplied remote makewand server via /health and /v1/models")
+	cmd.Flags().StringVar(&remoteURLFlag, "remote-url", "", "remote makewand server URL to verify (defaults to MAKEWAND_REMOTE_URL)")
+	cmd.Flags().StringVar(&remoteTokenFlag, "remote-token", "", "Bearer token used for remote verification (defaults to MAKEWAND_REMOTE_TOKEN)")
+	cmd.Flags().DurationVar(&remoteTimeoutFlag, "remote-timeout", 10*time.Second, "timeout for each remote verification request")
 	cmd.Flags().BoolVar(&strictFlag, "strict", false, "treat warnings as failures")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "output report as JSON")
 	return cmd
@@ -137,8 +181,7 @@ func parseDoctorModes(raw string) ([]model.UsageMode, error) {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	if raw == "" || raw == "all" {
 		return []model.UsageMode{
-			model.ModeFree,
-			model.ModeEconomy,
+			model.ModeFast,
 			model.ModeBalanced,
 			model.ModePower,
 		}, nil
@@ -153,7 +196,7 @@ func parseDoctorModes(raw string) ([]model.UsageMode, error) {
 		}
 		m, ok := model.ParseUsageMode(token)
 		if !ok {
-			return nil, fmt.Errorf("invalid mode %q (expected free,economy,balanced,power)", token)
+			return nil, fmt.Errorf("invalid mode %q (expected fast,balanced,power)", token)
 		}
 		if seen[m] {
 			continue
@@ -176,6 +219,7 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 		Strict:              opts.strict,
 		ProbeEnabled:        opts.probe,
 		ProbeTimeoutSeconds: int(opts.probeTimeout.Seconds()),
+		ProbeRetries:        opts.probeRetries,
 	}
 
 	if p, err := config.ConfigPath(); err == nil {
@@ -206,11 +250,20 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 	}
 
 	report.DetectedProviders = detectConfiguredProviders(cfg)
-	if !cfg.HasAnyModel() {
+	if check, ok := remoteBackendDoctorCheck(); ok {
+		report.Checks = append(report.Checks, check)
+	}
+	if opts.remoteCheck {
+		report.Checks = append(report.Checks, runRemoteDoctorChecks(resolveRemoteDoctorTarget(opts))...)
+	}
+	if check, ok := customProviderDoctorCheck(cfg); ok {
+		report.Checks = append(report.Checks, check)
+	}
+	if !hasUsableBackend(cfg) {
 		report.Checks = append(report.Checks, doctorCheck{
 			Name:    "model configuration",
 			Status:  doctorFail,
-			Details: "no model configured; run 'makewand setup' first",
+			Details: "no model or remote backend configured; run 'makewand setup' first",
 		})
 	} else {
 		report.Checks = append(report.Checks, doctorCheck{
@@ -262,52 +315,77 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 		}
 
 		probeResult := doctorProbeReport{
-			Mode:   modeName,
-			Status: doctorPass,
+			Mode:           modeName,
+			Status:         doctorPass,
+			Classification: probeClassHealthy,
 		}
 		start := time.Now()
 		prompt := []model.Message{{Role: "user", Content: "Reply with one short sentence: service healthy."}}
 		system := "You are a health probe. Reply with one short sentence only."
 
-		var lastErr error
 		candidates := uniqueProbeProviders(modeResult.Routes)
 		if len(candidates) == 0 {
 			probeResult.Status = doctorFail
+			probeResult.Classification = probeClassConfiguration
 			probeResult.Error = "no probe candidate provider found"
 			probeResult.DurationMS = time.Since(start).Milliseconds()
 			report.LiveProbe = append(report.LiveProbe, probeResult)
 			continue
 		}
 
+		attemptCount := 0
+		failures := make([]doctorProbeFailure, 0, len(candidates)*(opts.probeRetries+1))
+		success := false
+
+	probeProvidersLoop:
 		for _, providerName := range candidates {
 			prov, err := router.Get(providerName)
 			if err != nil {
-				lastErr = err
+				attemptCount++
+				failures = append(failures, doctorProbeFailure{
+					provider: providerName,
+					attempt:  attemptCount,
+					class:    classifyProbeError(err),
+					err:      err,
+				})
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), opts.probeTimeout)
-			content, usage, err := prov.Chat(ctx, prompt, system, model.MaxTokensForTask(model.TaskExplain))
-			cancel()
-			if err != nil {
-				lastErr = err
-				continue
+			for try := 0; try <= opts.probeRetries; try++ {
+				attemptCount++
+				ctx, cancel := context.WithTimeout(context.Background(), opts.probeTimeout)
+				content, usage, err := prov.Chat(ctx, prompt, system, model.MaxTokensForTask(model.TaskExplain))
+				cancel()
+				if err == nil && strings.TrimSpace(content) != "" {
+					probeResult.Provider = providerName
+					probeResult.ModelID = strings.TrimSpace(usage.Model)
+					probeResult.Attempts = attemptCount
+					success = true
+					break probeProvidersLoop
+				}
+				if err == nil {
+					err = fmt.Errorf("%s returned empty probe response", providerName)
+				}
+				class := classifyProbeError(err)
+				failures = append(failures, doctorProbeFailure{
+					provider: providerName,
+					attempt:  attemptCount,
+					class:    class,
+					err:      err,
+				})
+				// Invalid config/auth/binary errors are non-retryable for this provider.
+				if class == probeClassConfiguration {
+					break
+				}
 			}
-			if strings.TrimSpace(content) == "" {
-				lastErr = fmt.Errorf("%s returned empty probe response", providerName)
-				continue
-			}
-
-			probeResult.Provider = providerName
-			probeResult.ModelID = strings.TrimSpace(usage.Model)
-			probeResult.DurationMS = time.Since(start).Milliseconds()
-			lastErr = nil
-			break
 		}
 
-		if lastErr != nil {
-			probeResult.Status = doctorFail
-			probeResult.Error = lastErr.Error()
+		if !success {
+			status, class, summary := evaluateProbeFailures(failures)
+			probeResult.Status = status
+			probeResult.Classification = class
+			probeResult.Attempts = attemptCount
+			probeResult.Error = summary
 		}
 		probeResult.DurationMS = time.Since(start).Milliseconds()
 		report.LiveProbe = append(report.LiveProbe, probeResult)
@@ -346,6 +424,12 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 func detectConfiguredProviders(cfg *config.Config) []string {
 	set := make(map[string]bool)
 
+	if config.HasRemoteBackend() {
+		set["remote (http)"] = true
+	} else if config.RemoteBaseURL() != "" || config.RemoteToken() != "" {
+		set["remote (partial)"] = true
+	}
+
 	for _, cli := range cfg.CLIs {
 		name := strings.TrimSpace(cli.Name)
 		if name != "" {
@@ -361,9 +445,6 @@ func detectConfiguredProviders(cfg *config.Config) []string {
 	if cfg.OpenAIAPIKey != "" {
 		set["openai (api)"] = true
 	}
-	if cfg.OllamaURL != "" {
-		set["ollama"] = true
-	}
 	for _, cp := range cfg.CustomProviders {
 		if config.IsCustomProviderUsable(cp) {
 			set[strings.TrimSpace(cp.Name)+" (custom)"] = true
@@ -378,6 +459,153 @@ func detectConfiguredProviders(cfg *config.Config) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func remoteBackendDoctorCheck() (doctorCheck, bool) {
+	url := config.RemoteBaseURL()
+	token := config.RemoteToken()
+
+	switch {
+	case url == "" && token == "":
+		return doctorCheck{}, false
+	case url != "" && token != "":
+		return doctorCheck{
+			Name:    "remote backend",
+			Status:  doctorPass,
+			Details: url,
+		}, true
+	default:
+		return doctorCheck{
+			Name:    "remote backend",
+			Status:  doctorWarn,
+			Details: fmt.Sprintf("partial remote backend configuration; missing %s", strings.Join(missingRemoteBackendEnvVars(url, token), ", ")),
+		}, true
+	}
+}
+
+type remoteDoctorTarget struct {
+	url     string
+	token   string
+	timeout time.Duration
+}
+
+func resolveRemoteDoctorTarget(opts doctorOptions) remoteDoctorTarget {
+	url := strings.TrimRight(strings.TrimSpace(opts.remoteURL), "/")
+	if url == "" {
+		url = config.RemoteBaseURL()
+	}
+	token := strings.TrimSpace(opts.remoteToken)
+	if token == "" {
+		token = config.RemoteToken()
+	}
+	timeout := opts.remoteTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return remoteDoctorTarget{
+		url:     url,
+		token:   token,
+		timeout: timeout,
+	}
+}
+
+func runRemoteDoctorChecks(target remoteDoctorTarget) []doctorCheck {
+	checks := make([]doctorCheck, 0, 2)
+	switch {
+	case target.url == "" && target.token == "":
+		return append(checks, doctorCheck{
+			Name:    "remote service",
+			Status:  doctorFail,
+			Details: "remote check requested but no remote backend is configured",
+		})
+	case target.url == "" || target.token == "":
+		return append(checks, doctorCheck{
+			Name:    "remote service",
+			Status:  doctorFail,
+			Details: fmt.Sprintf("remote check requested but missing %s", strings.Join(missingRemoteBackendEnvVars(target.url, target.token), ", ")),
+		})
+	}
+
+	client := &http.Client{Timeout: target.timeout}
+	healthURL := target.url + "/health"
+	resp, err := client.Get(healthURL)
+	if err != nil {
+		return append(checks, doctorCheck{
+			Name:    "remote service health",
+			Status:  doctorFail,
+			Details: err.Error(),
+		})
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service health",
+			Status:  doctorFail,
+			Details: fmt.Sprintf("%s returned HTTP %d", healthURL, resp.StatusCode),
+		})
+	} else {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service health",
+			Status:  doctorPass,
+			Details: healthURL,
+		})
+	}
+
+	req, err := http.NewRequest(http.MethodGet, target.url+"/v1/models", nil)
+	if err != nil {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: err.Error(),
+		})
+		return checks
+	}
+	req.Header.Set("Authorization", "Bearer "+target.token)
+	resp, err = client.Do(req)
+	if err != nil {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: err.Error(),
+		})
+		return checks
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: fmt.Sprintf("/v1/models returned HTTP %d", resp.StatusCode),
+		})
+		return checks
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		checks = append(checks, doctorCheck{
+			Name:    "remote service models",
+			Status:  doctorFail,
+			Details: "invalid JSON: " + err.Error(),
+		})
+		return checks
+	}
+	modelIDs := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if strings.TrimSpace(item.ID) != "" {
+			modelIDs = append(modelIDs, item.ID)
+		}
+	}
+	sort.Strings(modelIDs)
+	checks = append(checks, doctorCheck{
+		Name:    "remote service models",
+		Status:  doctorPass,
+		Details: strings.Join(modelIDs, ", "),
+	})
+	return checks
 }
 
 func printDoctorReport(report doctorReport) {
@@ -421,6 +649,12 @@ func printDoctorReport(report doctorReport) {
 		fmt.Println("Live probe:")
 		for _, p := range report.LiveProbe {
 			fmt.Printf("  [%s] %s (%dms)", strings.ToUpper(string(p.Status)), p.Mode, p.DurationMS)
+			if p.Classification != "" && p.Classification != probeClassHealthy {
+				fmt.Printf(" [%s]", p.Classification)
+			}
+			if p.Attempts > 0 {
+				fmt.Printf(" attempts=%d", p.Attempts)
+			}
 			if p.Provider != "" {
 				if p.ModelID != "" {
 					fmt.Printf(" - %s (%s)", p.Provider, p.ModelID)
@@ -493,4 +727,176 @@ func uniqueProbeProviders(routes []doctorTaskRoute) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+type doctorProbeFailure struct {
+	provider string
+	attempt  int
+	class    doctorProbeClassification
+	err      error
+}
+
+func classifyProbeError(err error) doctorProbeClassification {
+	if err == nil {
+		return probeClassHealthy
+	}
+
+	switch model.ErrorKindOf(err) {
+	case model.ErrorKindTimeout, model.ErrorKindNetwork, model.ErrorKindRateLimit:
+		return probeClassEnvironment
+	case model.ErrorKindAuth, model.ErrorKindConfig:
+		return probeClassConfiguration
+	case model.ErrorKindUnavailable:
+		return probeClassProvider
+	case model.ErrorKindProvider:
+		return probeClassProvider
+	}
+
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+
+	switch {
+	case strings.Contains(msg, "deadline exceeded"),
+		strings.Contains(msg, "timed out"),
+		strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "proxyconnect"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "network is unreachable"),
+		strings.Contains(msg, "temporary failure in name resolution"),
+		strings.Contains(msg, "no such host"),
+		strings.Contains(msg, "tls handshake timeout"),
+		strings.Contains(msg, "stream disconnected"),
+		strings.Contains(msg, "transport channel closed"),
+		strings.Contains(msg, "operation not permitted"),
+		strings.Contains(msg, "permission denied"),
+		strings.Contains(msg, "rate limit"),
+		strings.Contains(msg, "quota"):
+		return probeClassEnvironment
+	case strings.Contains(msg, "not configured"),
+		strings.Contains(msg, "is not available"),
+		strings.Contains(msg, "api key"),
+		strings.Contains(msg, "unauthorized"),
+		strings.Contains(msg, "forbidden"),
+		strings.Contains(msg, "authentication"),
+		strings.Contains(msg, "command not found"),
+		strings.Contains(msg, "no such file or directory"):
+		return probeClassConfiguration
+	default:
+		return probeClassProvider
+	}
+}
+
+func evaluateProbeFailures(failures []doctorProbeFailure) (doctorStatus, doctorProbeClassification, string) {
+	if len(failures) == 0 {
+		return doctorFail, probeClassProvider, "probe failed with unknown error"
+	}
+
+	hasProvider := false
+	hasConfig := false
+	for _, f := range failures {
+		if f.class == probeClassProvider {
+			hasProvider = true
+		}
+		if f.class == probeClassConfiguration {
+			hasConfig = true
+		}
+	}
+
+	if hasProvider {
+		return doctorFail, probeClassProvider, summarizeProbeFailures(failures, probeClassProvider)
+	}
+	if hasConfig {
+		return doctorWarn, probeClassConfiguration, summarizeProbeFailures(failures, probeClassConfiguration)
+	}
+	return doctorWarn, probeClassEnvironment, summarizeProbeFailures(failures, probeClassEnvironment)
+}
+
+func summarizeProbeFailures(failures []doctorProbeFailure, class doctorProbeClassification) string {
+	providerSet := make(map[string]bool)
+	providers := make([]string, 0, len(failures))
+	causeSet := make(map[string]bool)
+	causes := make([]string, 0, 3)
+	for _, f := range failures {
+		name := strings.TrimSpace(f.provider)
+		if name != "" && !providerSet[name] {
+			providerSet[name] = true
+			providers = append(providers, name)
+		}
+
+		cause := compactProbeError(f.err)
+		if cause == "" || causeSet[cause] {
+			continue
+		}
+		causeSet[cause] = true
+		causes = append(causes, cause)
+		if len(causes) >= 3 {
+			break
+		}
+	}
+	sort.Strings(providers)
+
+	classText := "provider"
+	if class == probeClassEnvironment {
+		classText = "environment"
+	} else if class == probeClassConfiguration {
+		classText = "configuration"
+	}
+
+	summary := fmt.Sprintf("%s issue across %d attempt(s)", classText, len(failures))
+	if len(providers) > 0 {
+		summary += fmt.Sprintf(" on %s", strings.Join(providers, ","))
+	}
+	if len(causes) > 0 {
+		summary += fmt.Sprintf(": %s", strings.Join(causes, "; "))
+	}
+	return summary
+}
+
+func compactProbeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return ""
+	}
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "operation not permitted"):
+		return "operation not permitted"
+	case strings.Contains(lower, "permission denied"):
+		return "permission denied"
+	case strings.Contains(lower, "proxyconnect"):
+		return "proxy connect failure"
+	case strings.Contains(lower, "deadline exceeded"):
+		return "deadline exceeded"
+	case strings.Contains(lower, "timed out"):
+		return "timed out"
+	case strings.Contains(lower, "timeout"):
+		return "timeout"
+	case strings.Contains(lower, "no such host"):
+		return "no such host"
+	case strings.Contains(lower, "network is unreachable"):
+		return "network is unreachable"
+	case strings.Contains(lower, "connection refused"):
+		return "connection refused"
+	case strings.Contains(lower, "stream disconnected"):
+		return "stream disconnected"
+	}
+
+	lines := strings.Split(strings.ReplaceAll(msg, "\r\n", "\n"), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > maxDoctorProbeErrorLen {
+			return line[:maxDoctorProbeErrorLen-3] + "..."
+		}
+		return line
+	}
+	if len(msg) > maxDoctorProbeErrorLen {
+		return msg[:maxDoctorProbeErrorLen-3] + "..."
+	}
+	return msg
 }

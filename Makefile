@@ -1,9 +1,9 @@
 BINARY_NAME=makewand
-VERSION=0.1.0
+VERSION=0.1.10
 BUILD_DIR=build
 MAIN_PKG=./cmd/makewand
 
-.PHONY: all build run clean test install prelaunch
+.PHONY: all build run clean test test-race install prelaunch
 
 all: build
 
@@ -24,7 +24,10 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 test:
-	go test ./...
+	bash ./scripts/test_gate.sh
+
+test-race:
+	go test -race -count=1 ./router/... ./internal/...
 
 install: build
 	cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
@@ -48,7 +51,7 @@ fmt:
 	go fmt ./...
 
 vet:
-	go vet ./...
+	go vet ./cmd/... ./internal/... ./router
 
 lint: fmt vet
 

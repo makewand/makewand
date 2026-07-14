@@ -3,9 +3,14 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 )
 
@@ -17,6 +22,7 @@ type chatFlowStubProvider struct {
 	chatErr     error
 
 	streamErr error
+	streamCtx context.Context
 
 	chatCalls   int
 	streamCalls int
@@ -38,8 +44,13 @@ func (p *chatFlowStubProvider) Chat(context.Context, []model.Message, string, in
 	return p.chatContent, usage, nil
 }
 
-func (p *chatFlowStubProvider) ChatStream(context.Context, []model.Message, string, int) (<-chan model.StreamChunk, error) {
+func (p *chatFlowStubProvider) ChatStream(ctx context.Context, _ []model.Message, _ string, _ int) (<-chan model.StreamChunk, error) {
+	return p.chatStreamWithContext(ctx)
+}
+
+func (p *chatFlowStubProvider) chatStreamWithContext(ctx context.Context) (<-chan model.StreamChunk, error) {
 	p.streamCalls++
+	p.streamCtx = ctx
 	if p.streamErr != nil {
 		return nil, p.streamErr
 	}
@@ -141,5 +152,479 @@ func TestSubmitChatInput_NonPowerUsesStreamPath(t *testing.T) {
 	}
 	if stub.chatCalls != 0 {
 		t.Fatalf("Chat calls = %d, want 0", stub.chatCalls)
+	}
+}
+
+func TestSubmitChatInput_AutopilotUsesCandidateSelectionForCodeTasks(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApprovalMode = config.ApprovalModeAuto
+	app := *NewApp(ModeChat, cfg, "")
+	app.project = newCandidateProject(t)
+
+	router := model.NewRouter(cfg)
+	router.SetMode(model.ModeBalanced)
+	alpha := &chatFlowStubProvider{
+		name:        "alpha",
+		chatContent: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a + b\n}\n```\n",
+		chatUsage: model.Usage{
+			Provider: "alpha",
+		},
+		streamErr: fmt.Errorf("stream should not be used in autopilot candidate path"),
+	}
+	bravo := &chatFlowStubProvider{
+		name:        "bravo",
+		chatContent: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n",
+		chatUsage: model.Usage{
+			Provider: "bravo",
+		},
+		streamErr: fmt.Errorf("stream should not be used in autopilot candidate path"),
+	}
+	if err := router.RegisterProvider("alpha", alpha, model.AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider(alpha): %v", err)
+	}
+	if err := router.RegisterProvider("bravo", bravo, model.AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider(bravo): %v", err)
+	}
+	app.router = router
+
+	m, cmd := app.submitChatInput("write a tiny function")
+	_ = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+
+	msg := cmd()
+	resp, ok := msg.(aiResponseMsg)
+	if !ok {
+		t.Fatalf("cmd() returned %T, want aiResponseMsg", msg)
+	}
+	if resp.err != nil {
+		t.Fatalf("aiResponseMsg.err = %v", resp.err)
+	}
+	if !resp.verified {
+		t.Fatal("aiResponseMsg.verified = false, want true")
+	}
+	if resp.provider != "bravo" {
+		t.Fatalf("aiResponseMsg.provider = %q, want %q", resp.provider, "bravo")
+	}
+	if alpha.chatCalls != 1 || bravo.chatCalls != 1 {
+		t.Fatalf("candidate chat calls = (%d, %d), want (1, 1)", alpha.chatCalls, bravo.chatCalls)
+	}
+	if alpha.streamCalls != 0 || bravo.streamCalls != 0 {
+		t.Fatalf("candidate stream calls = (%d, %d), want (0, 0)", alpha.streamCalls, bravo.streamCalls)
+	}
+}
+
+func TestSubmitChatInput_ShowsPreparingActivityImmediately(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	m, cmd := app.submitChatInput("write a tiny function")
+	app = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+	if app.state != StateStreaming {
+		t.Fatalf("state = %v, want %v", app.state, StateStreaming)
+	}
+	if !app.chat.streaming {
+		t.Fatal("chat.streaming should be true after submit")
+	}
+
+	snapshot := app.activity.Snapshot()
+	if !snapshot.Active {
+		t.Fatal("activity should be active after submit")
+	}
+	if snapshot.Phase != chatActivityPreparing {
+		t.Fatalf("activity phase = %q, want %q", snapshot.Phase, chatActivityPreparing)
+	}
+	if !strings.Contains(app.chat.streamStatus, "Preparing request context") {
+		t.Fatalf("streamStatus = %q, want preparing status", app.chat.streamStatus)
+	}
+}
+
+func TestSubmitChatInput_StreamPathKeepsContextAliveAfterStart(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	router := model.NewRouter(cfg)
+	router.SetMode(model.ModeBalanced)
+	stub := &chatFlowStubProvider{name: "private"}
+	if err := router.RegisterProvider("private", stub, model.AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+	app.router = router
+
+	m, cmd := app.submitChatInput("write a tiny function")
+	_ = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+
+	msg := cmd()
+	if _, ok := msg.(aiStreamStartMsg); !ok {
+		t.Fatalf("cmd() returned %T, want aiStreamStartMsg", msg)
+	}
+	if stub.streamCtx == nil {
+		t.Fatal("stream context was not captured")
+	}
+
+	select {
+	case <-stub.streamCtx.Done():
+		t.Fatal("stream context canceled immediately after start")
+	default:
+	}
+}
+
+func TestSubmitChatInput_ExplainUsesUnaryChatPath(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	router := model.NewRouter(cfg)
+	router.SetMode(model.ModeBalanced)
+	stub := &chatFlowStubProvider{
+		name:        "private",
+		chatContent: "I am makewand",
+		chatUsage: model.Usage{
+			Provider: "private",
+		},
+		streamErr: fmt.Errorf("stream should not be used for explain tasks"),
+	}
+	if err := router.RegisterProvider("private", stub, model.AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+	app.router = router
+
+	m, cmd := app.submitChatInput("你是谁?")
+	_ = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+
+	msg := cmd()
+	resp, ok := msg.(aiResponseMsg)
+	if !ok {
+		t.Fatalf("cmd() returned %T, want aiResponseMsg", msg)
+	}
+	if resp.err != nil {
+		t.Fatalf("aiResponseMsg.err = %v", resp.err)
+	}
+	if stub.chatCalls != 1 {
+		t.Fatalf("Chat calls = %d, want 1", stub.chatCalls)
+	}
+	if stub.streamCalls != 0 {
+		t.Fatalf("ChatStream calls = %d, want 0", stub.streamCalls)
+	}
+}
+
+func TestSubmitChatInput_ExplainUsesStreamPathForGeminiCLI(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "gemini-stream.sh")
+	body := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"repo summary\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	router := model.NewRouterFromConfig(model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"gemini": {Provider: model.NewGeminiCLI(script), Access: model.AccessSubscription},
+		},
+		DefaultModel:  "gemini",
+		AnalysisModel: "gemini",
+		CodingModel:   "gemini",
+		ReviewModel:   "gemini",
+	})
+	app.router = router
+
+	m, cmd := app.submitChatInput("评估这个软件")
+	_ = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+
+	msg := cmd()
+	start, ok := msg.(aiStreamStartMsg)
+	if !ok {
+		t.Fatalf("cmd() returned %T, want aiStreamStartMsg", msg)
+	}
+	if start.provider != "gemini" {
+		t.Fatalf("aiStreamStartMsg.provider = %q, want %q", start.provider, "gemini")
+	}
+}
+
+func TestClassifyTask_UsesSharedClassifier(t *testing.T) {
+	prompts := []string{
+		"please review.",
+		"fix, please",
+		"bug?",
+		"checkout the repo",
+		"how does this work",
+		"plan this feature",
+	}
+
+	for _, prompt := range prompts {
+		got := classifyTask(prompt)
+		want := model.ClassifyTask(prompt)
+		if got != want {
+			t.Fatalf("classifyTask(%q) = %v, want shared classifier result %v", prompt, got, want)
+		}
+	}
+}
+
+func TestSubmitChatInput_HelpCommandHandledLocally(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	before := len(app.chat.messages)
+	m, cmd := app.submitChatInput("/help")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("/help should not trigger async AI command")
+	}
+	if len(app.chat.messages) != before+1 {
+		t.Fatalf("chat message count = %d, want %d", len(app.chat.messages), before+1)
+	}
+
+	last := app.chat.messages[len(app.chat.messages)-1]
+	if last.Role != "system" {
+		t.Fatalf("last message role = %q, want system", last.Role)
+	}
+	if !strings.Contains(last.Content, "/model") || !strings.Contains(last.Content, "/exit") || !strings.Contains(last.Content, "/clear") {
+		t.Fatalf("help message = %q, want slash command hint", last.Content)
+	}
+}
+
+func TestSubmitChatInput_ExitCommandQuits(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	m, cmd := app.submitChatInput("/exit")
+	app = m.(App)
+
+	if app.state != StateQuitting {
+		t.Fatal("app should enter quitting state on /exit")
+	}
+	if cmd == nil {
+		t.Fatal("/exit should return tea.Quit command")
+	}
+	quitMsg := cmd()
+	if _, ok := quitMsg.(tea.QuitMsg); !ok {
+		t.Fatalf("/exit cmd() should return tea.QuitMsg, got %T", quitMsg)
+	}
+}
+
+func TestSubmitChatInput_ClearCommandResetsConversation(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat.AddMessage(ChatMessage{Role: "user", Content: "before clear"})
+
+	m, cmd := app.submitChatInput("/clear")
+	app = m.(App)
+
+	if cmd == nil {
+		t.Fatal("/clear should return a clear-screen command")
+	}
+	if len(app.chat.messages) != 1 {
+		t.Fatalf("chat message count = %d, want 1 welcome message", len(app.chat.messages))
+	}
+	if app.chat.messages[0].Role != "system" {
+		t.Fatalf("first message role = %q, want system", app.chat.messages[0].Role)
+	}
+}
+
+func TestSubmitChatInput_ModelAliasSwitchesMode(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.router.SetMode(model.ModeBalanced)
+
+	m, cmd := app.submitChatInput("/model power")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("/model should be handled locally")
+	}
+	if got := app.router.Mode(); got != model.ModePower {
+		t.Fatalf("router mode = %v, want %v", got, model.ModePower)
+	}
+}
+
+func TestSubmitChatInput_StatusCommandHandledLocally(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+
+	m, cmd := app.submitChatInput("/status")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("/status should not trigger async AI command")
+	}
+	last := app.chat.messages[len(app.chat.messages)-1]
+	if !strings.Contains(last.Content, "Model profile:") || !strings.Contains(last.Content, "Available providers:") {
+		t.Fatalf("status message = %q, want session summary", last.Content)
+	}
+}
+
+func TestStatusSummary_IncludesActivityWhenBusy(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.activity.Start()
+
+	summary := app.statusSummary()
+	if !strings.Contains(summary, "Activity:") {
+		t.Fatalf("statusSummary = %q, want activity line", summary)
+	}
+}
+
+func TestSubmitChatInput_CostCommandHandledLocally(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.cost.AddWithTokens("claude", 0.25, 100, 200, true)
+
+	m, cmd := app.submitChatInput("/cost")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("/cost should not trigger async AI command")
+	}
+	last := app.chat.messages[len(app.chat.messages)-1]
+	if !strings.Contains(last.Content, "Session total: $0.25") || !strings.Contains(last.Content, "claude:") {
+		t.Fatalf("cost message = %q, want cost summary", last.Content)
+	}
+}
+
+func TestHandleChatEnter_AppliesSelectedSlashSuggestionBeforeExecuting(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat, _ = app.chat.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	app.chat.textarea.SetValue("/")
+	app.chat, _ = app.chat.Update(tea.KeyMsg{Type: tea.KeyDown})
+
+	before := len(app.chat.messages)
+	m, cmd := app.handleChatEnter()
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("selecting a slash suggestion should not execute a command yet")
+	}
+	if got := app.chat.InputValue(); got != "/clear" {
+		t.Fatalf("input after Enter = %q, want %q", got, "/clear")
+	}
+	if len(app.chat.messages) != before {
+		t.Fatalf("chat message count = %d, want unchanged %d", len(app.chat.messages), before)
+	}
+}
+
+func TestSubmitChatInput_ApproveCommandHandlesPendingTests(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.state = StateConfirmTests
+	app.setPendingApproval(approvalTests, "Run project tests now?", "Command: go test ./...")
+
+	m, cmd := app.submitChatInput("/approve")
+	app = m.(App)
+
+	if cmd == nil {
+		t.Fatal("/approve should return a confirmation command when approval is pending")
+	}
+	if app.state == StateConfirmTests {
+		t.Fatal("state should not be StateConfirmTests after /approve")
+	}
+	msg := cmd()
+	if _, ok := msg.(confirmTestsRunMsg); !ok {
+		t.Fatalf("/approve returned %T, want confirmTestsRunMsg", msg)
+	}
+}
+
+func TestSubmitChatInput_DenyCommandCancelsPendingFileWrite(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.state = StateConfirmFiles
+	app.pendingFiles = []engine.ExtractedFile{{Path: "main.go", Content: "package main"}}
+	app.setPendingApproval(approvalFileWrite, "Write 1 file?", "Pending write: 1 files")
+
+	m, cmd := app.submitChatInput("/deny")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("/deny for file write should complete locally")
+	}
+	if app.state == StateConfirmFiles {
+		t.Fatal("state should not be StateConfirmFiles after /deny")
+	}
+	if len(app.pendingFiles) != 0 {
+		t.Fatal("pendingFiles should be cleared after /deny")
+	}
+	last := app.chat.messages[len(app.chat.messages)-1]
+	if !strings.Contains(last.Content, "cancel") && !strings.Contains(strings.ToLower(last.Content), "cancel") {
+		t.Fatalf("deny message = %q, want cancellation notice", last.Content)
+	}
+}
+
+func TestConfirmFiles_SlashDenyDoesNotAutoApproveOnTrailingY(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat, _ = app.chat.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	app.state = StateConfirmFiles
+	app.pendingFiles = []engine.ExtractedFile{{Path: "hello.txt", Content: "hello"}}
+	app.setPendingApproval(approvalFileWrite, "Write 1 file?", "Pending write: 1 files")
+
+	for _, r := range []rune{'/', 'd', 'e', 'n', 'y'} {
+		m, _ := app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app = m.(App)
+	}
+
+	if app.state != StateConfirmFiles {
+		t.Fatalf("state = %v, want %v before Enter", app.state, StateConfirmFiles)
+	}
+	if got := app.chat.InputValue(); got != "/deny" {
+		t.Fatalf("input = %q, want %q", got, "/deny")
+	}
+	if len(app.pendingFiles) != 1 {
+		t.Fatalf("pendingFiles = %d, want 1 before Enter", len(app.pendingFiles))
+	}
+
+	m, cmd := app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("slash deny should complete locally without async cmd")
+	}
+	app = m.(App)
+	if app.state != StateIdle {
+		t.Fatalf("state = %v, want %v after Enter", app.state, StateIdle)
+	}
+	if len(app.pendingFiles) != 0 {
+		t.Fatal("pendingFiles should be cleared after /deny")
+	}
+}
+
+func TestConfirmFiles_SlashApproveTriggersApprovalCommand(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat, _ = app.chat.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	app.state = StateConfirmFiles
+	app.pendingFiles = []engine.ExtractedFile{{Path: "hello.txt", Content: "hello"}}
+	app.setPendingApproval(approvalFileWrite, "Write 1 file?", "Pending write: 1 files")
+
+	for _, r := range []rune{'/', 'a', 'p', 'p', 'r', 'o', 'v', 'e'} {
+		m, _ := app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app = m.(App)
+	}
+
+	m, cmd := app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app = m.(App)
+	if cmd == nil {
+		t.Fatal("/approve should return async confirmation cmd")
+	}
+	if app.state != StateIdle {
+		t.Fatalf("state = %v, want %v after Enter", app.state, StateIdle)
+	}
+	msg := cmd()
+	if _, ok := msg.(confirmFileWriteMsg); !ok {
+		t.Fatalf("cmd() returned %T, want confirmFileWriteMsg", msg)
 	}
 }

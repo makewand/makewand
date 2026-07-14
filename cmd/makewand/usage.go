@@ -1,0 +1,642 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/serverteam"
+	"github.com/makewand/makewand/serverusage"
+	"github.com/spf13/cobra"
+)
+
+func usageCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "usage",
+		Short: "Inspect structured server usage logs",
+		Long:  "Summarize or list events from a makewand server JSONL usage ledger.",
+	}
+	cmd.AddCommand(usageSummaryCmd())
+	cmd.AddCommand(usageEventsCmd())
+	cmd.AddCommand(usagePeriodsCmd())
+	cmd.AddCommand(usageAlertsCmd())
+	return cmd
+}
+
+func usageSummaryCmd() *cobra.Command {
+	var (
+		pathFlag       string
+		stateDBPath    string
+		requestIDFlag  string
+		tokenIDFlag    string
+		providerFlag   string
+		statusFlag     int
+		sinceFlag      string
+		untilFlag      string
+		streamOnlyFlag bool
+		jsonOutput     bool
+		remoteURL      string
+		remoteToken    string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "summary",
+		Short: "Summarize usage activity",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL, bearer, remoteMode, err := resolveOptionalRemoteAdminTarget(remoteURL, remoteToken)
+			if err != nil {
+				return err
+			}
+			query := buildUsageQuery(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
+			if remoteMode {
+				var resp remoteUsageSummaryResponse
+				if err := adminGetJSON(baseURL, bearer, "/v1/admin/usage/summary", query, &resp); err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(resp, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printUsageSummary(resp.Path, resp.Usage)
+				return nil
+			}
+
+			filter, err := buildUsageFilter(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
+			if err != nil {
+				return err
+			}
+			stateDB := resolveManagedStateDBPath(stateDBPath)
+			if stateDB != "" {
+				entries, err := serverusage.LoadSQLiteEntries(stateDB, filter)
+				if err != nil {
+					return err
+				}
+				summary := serverusage.SummarizeEntries(entries)
+				if jsonOutput {
+					data, err := json.MarshalIndent(summary, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printUsageSummary("sqlite:"+stateDB, summary)
+				return nil
+			}
+			path, err := resolveUsageLogPath(pathFlag)
+			if err != nil {
+				return err
+			}
+			entries, err := loadUsageEntries(path, filter)
+			if err != nil {
+				return err
+			}
+			summary := serverusage.SummarizeEntries(entries)
+			if jsonOutput {
+				data, err := json.MarshalIndent(summary, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(data))
+				return nil
+			}
+			printUsageSummary(path, summary)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&pathFlag, "path", "", "path to usage JSONL (defaults to MAKEWAND_SERVER_USAGE_LOG or ~/.config/makewand/server/usage.jsonl)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for usage queries")
+	cmd.Flags().StringVar(&requestIDFlag, "request-id", "", "filter by request ID")
+	cmd.Flags().StringVar(&tokenIDFlag, "token-id", "", "filter by token ID")
+	cmd.Flags().StringVar(&providerFlag, "provider", "", "filter by actual provider")
+	cmd.Flags().IntVar(&statusFlag, "status", 0, "filter by HTTP status code")
+	cmd.Flags().StringVar(&sinceFlag, "since", "", "filter entries since RFC3339 time or relative duration like 24h")
+	cmd.Flags().StringVar(&untilFlag, "until", "", "filter entries until RFC3339 time or relative duration like 1h")
+	cmd.Flags().BoolVar(&streamOnlyFlag, "stream-only", false, "include only streaming chat entries")
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
+	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output summary as JSON")
+	return cmd
+}
+
+func usageEventsCmd() *cobra.Command {
+	var (
+		pathFlag       string
+		stateDBPath    string
+		requestIDFlag  string
+		tokenIDFlag    string
+		providerFlag   string
+		statusFlag     int
+		sinceFlag      string
+		untilFlag      string
+		limitFlag      int
+		streamOnlyFlag bool
+		jsonOutput     bool
+		csvOutput      bool
+		remoteURL      string
+		remoteToken    string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "events",
+		Short: "List matching usage entries",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL, bearer, remoteMode, err := resolveOptionalRemoteAdminTarget(remoteURL, remoteToken)
+			if err != nil {
+				return err
+			}
+			query := buildUsageQuery(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, limitFlag, streamOnlyFlag)
+			if remoteMode {
+				if csvOutput {
+					query.Set("format", "csv")
+					data, err := adminGetRaw(baseURL, bearer, "/v1/admin/usage/events", query)
+					if err != nil {
+						return err
+					}
+					fmt.Print(string(data))
+					return nil
+				}
+				var resp remoteUsageEventsResponse
+				if err := adminGetJSON(baseURL, bearer, "/v1/admin/usage/events", query, &resp); err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(resp, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printUsageEvents(resp.Data)
+				return nil
+			}
+
+			filter, err := buildUsageFilter(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, limitFlag, streamOnlyFlag)
+			if err != nil {
+				return err
+			}
+			stateDB := resolveManagedStateDBPath(stateDBPath)
+			if stateDB != "" {
+				entries, err := serverusage.LoadSQLiteEntries(stateDB, filter)
+				if err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(entries, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				if csvOutput {
+					return serverusage.WriteEntriesCSV(os.Stdout, entries)
+				}
+				printUsageEvents(entries)
+				return nil
+			}
+			path, err := resolveUsageLogPath(pathFlag)
+			if err != nil {
+				return err
+			}
+			entries, err := loadUsageEntries(path, filter)
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				data, err := json.MarshalIndent(entries, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(data))
+				return nil
+			}
+			if csvOutput {
+				return serverusage.WriteEntriesCSV(os.Stdout, entries)
+			}
+			printUsageEvents(entries)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&pathFlag, "path", "", "path to usage JSONL (defaults to MAKEWAND_SERVER_USAGE_LOG or ~/.config/makewand/server/usage.jsonl)")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for usage queries")
+	cmd.Flags().StringVar(&requestIDFlag, "request-id", "", "filter by request ID")
+	cmd.Flags().StringVar(&tokenIDFlag, "token-id", "", "filter by token ID")
+	cmd.Flags().StringVar(&providerFlag, "provider", "", "filter by actual provider")
+	cmd.Flags().IntVar(&statusFlag, "status", 0, "filter by HTTP status code")
+	cmd.Flags().StringVar(&sinceFlag, "since", "", "filter entries since RFC3339 time or relative duration like 24h")
+	cmd.Flags().StringVar(&untilFlag, "until", "", "filter entries until RFC3339 time or relative duration like 1h")
+	cmd.Flags().IntVar(&limitFlag, "limit", 50, "maximum number of entries to display (0 = unlimited)")
+	cmd.Flags().BoolVar(&streamOnlyFlag, "stream-only", false, "include only streaming chat entries")
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
+	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "output entries as CSV")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output entries as JSON")
+	return cmd
+}
+
+func usagePeriodsCmd() *cobra.Command {
+	var (
+		pathFlag       string
+		stateDBPath    string
+		requestIDFlag  string
+		tokenIDFlag    string
+		providerFlag   string
+		statusFlag     int
+		sinceFlag      string
+		untilFlag      string
+		streamOnlyFlag bool
+		jsonOutput     bool
+		csvOutput      bool
+		remoteURL      string
+		remoteToken    string
+	)
+	cmd := &cobra.Command{
+		Use:   "periods",
+		Short: "Summarize usage by month",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL, bearer, remoteMode, err := resolveOptionalRemoteAdminTarget(remoteURL, remoteToken)
+			if err != nil {
+				return err
+			}
+			query := buildUsageQuery(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
+			if remoteMode {
+				if csvOutput {
+					query.Set("format", "csv")
+					data, err := adminGetRaw(baseURL, bearer, "/v1/admin/billing/periods", query)
+					if err != nil {
+						return err
+					}
+					fmt.Print(string(data))
+					return nil
+				}
+				var resp remoteUsagePeriodsResponse
+				if err := adminGetJSON(baseURL, bearer, "/v1/admin/billing/periods", query, &resp); err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(resp, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printUsagePeriods(resp.Path, resp.Periods)
+				return nil
+			}
+
+			filter, err := buildUsageFilter(requestIDFlag, tokenIDFlag, providerFlag, statusFlag, sinceFlag, untilFlag, 0, streamOnlyFlag)
+			if err != nil {
+				return err
+			}
+			stateDB := resolveManagedStateDBPath(stateDBPath)
+			if stateDB != "" {
+				entries, err := serverusage.LoadSQLiteEntries(stateDB, filter)
+				if err != nil {
+					return err
+				}
+				periods := serverusage.SummarizeMonthlyPeriods(entries)
+				if jsonOutput {
+					data, err := json.MarshalIndent(periods, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				if csvOutput {
+					return serverusage.WritePeriodsCSV(os.Stdout, periods)
+				}
+				printUsagePeriods("sqlite:"+stateDB, periods)
+				return nil
+			}
+			path, err := resolveUsageLogPath(pathFlag)
+			if err != nil {
+				return err
+			}
+			entries, err := loadUsageEntries(path, filter)
+			if err != nil {
+				return err
+			}
+			periods := serverusage.SummarizeMonthlyPeriods(entries)
+			if jsonOutput {
+				data, err := json.MarshalIndent(periods, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(data))
+				return nil
+			}
+			if csvOutput {
+				return serverusage.WritePeriodsCSV(os.Stdout, periods)
+			}
+			printUsagePeriods(path, periods)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&pathFlag, "path", "", "path to usage JSONL")
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for usage queries")
+	cmd.Flags().StringVar(&requestIDFlag, "request-id", "", "filter by request ID")
+	cmd.Flags().StringVar(&tokenIDFlag, "token-id", "", "filter by token ID")
+	cmd.Flags().StringVar(&providerFlag, "provider", "", "filter by actual provider")
+	cmd.Flags().IntVar(&statusFlag, "status", 0, "filter by HTTP status code")
+	cmd.Flags().StringVar(&sinceFlag, "since", "", "filter entries since RFC3339 time or relative duration like 24h")
+	cmd.Flags().StringVar(&untilFlag, "until", "", "filter entries until RFC3339 time or relative duration like 1h")
+	cmd.Flags().BoolVar(&streamOnlyFlag, "stream-only", false, "include only streaming chat entries")
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
+	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "output periods as CSV")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output periods as JSON")
+	return cmd
+}
+
+func usageAlertsCmd() *cobra.Command {
+	var (
+		stateDBPath string
+		sinceFlag   string
+		untilFlag   string
+		jsonOutput  bool
+		csvOutput   bool
+		remoteURL   string
+		remoteToken string
+	)
+	cmd := &cobra.Command{
+		Use:   "alerts",
+		Short: "Show organization and project budget alerts",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL, bearer, remoteMode, err := resolveOptionalRemoteAdminTarget(remoteURL, remoteToken)
+			if err != nil {
+				return err
+			}
+			query := buildUsageQuery("", "", "", 0, sinceFlag, untilFlag, 0, false)
+			if remoteMode {
+				if csvOutput {
+					query.Set("format", "csv")
+					data, err := adminGetRaw(baseURL, bearer, "/v1/admin/billing/alerts", query)
+					if err != nil {
+						return err
+					}
+					fmt.Print(string(data))
+					return nil
+				}
+				var resp remoteBillingAlertsResponse
+				if err := adminGetJSON(baseURL, bearer, "/v1/admin/billing/alerts", query, &resp); err != nil {
+					return err
+				}
+				if jsonOutput {
+					data, err := json.MarshalIndent(resp, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(data))
+					return nil
+				}
+				printBudgetAlerts(resp.Path, resp.Alerts)
+				return nil
+			}
+			stateDB := resolveManagedStateDBPath(stateDBPath)
+			if stateDB == "" {
+				return fmt.Errorf("usage alerts require --state-db or --remote-url")
+			}
+			filter, err := buildUsageFilter("", "", "", 0, sinceFlag, untilFlag, 0, false)
+			if err != nil {
+				return err
+			}
+			filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
+			entries, err := serverusage.LoadSQLiteEntries(stateDB, filter)
+			if err != nil {
+				return err
+			}
+			teamStore, err := serverteam.OpenSQLiteStore(stateDB)
+			if err != nil {
+				return err
+			}
+			defer teamStore.Close()
+			summary := serverusage.SummarizeEntries(entries)
+			alerts := computeBudgetAlerts(teamStore, summary)
+			if jsonOutput {
+				data, err := json.MarshalIndent(alerts, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(data))
+				return nil
+			}
+			if csvOutput {
+				return serverteam.WriteBudgetAlertsCSV(os.Stdout, alerts)
+			}
+			printBudgetAlerts("sqlite:"+stateDB, alerts)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state DB for usage queries")
+	cmd.Flags().StringVar(&sinceFlag, "since", "", "filter entries since RFC3339 time or relative duration like 24h")
+	cmd.Flags().StringVar(&untilFlag, "until", "", "filter entries until RFC3339 time or relative duration like 1h")
+	cmd.Flags().StringVar(&remoteURL, "remote-url", "", "remote makewand admin base URL")
+	cmd.Flags().StringVar(&remoteToken, "remote-token", "", "remote makewand admin Bearer token")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "output alerts as CSV")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output alerts as JSON")
+	return cmd
+}
+
+func resolveUsageLogPath(flagValue string) (string, error) {
+	flagValue = strings.TrimSpace(flagValue)
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	dir, err := config.ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return resolveServeUsagePath("", filepath.Join(dir, "server"), false), nil
+}
+
+func buildUsageFilter(requestID, tokenID, provider string, status int, sinceRaw, untilRaw string, limit int, streamOnly bool) (serverusage.Filter, error) {
+	now := time.Now().UTC()
+	since, err := parseAuditTimeValue(sinceRaw, now)
+	if err != nil {
+		return serverusage.Filter{}, fmt.Errorf("parse since: %w", err)
+	}
+	until, err := parseAuditTimeValue(untilRaw, now)
+	if err != nil {
+		return serverusage.Filter{}, fmt.Errorf("parse until: %w", err)
+	}
+	return serverusage.Filter{
+		RequestID:  strings.TrimSpace(requestID),
+		TokenID:    strings.TrimSpace(tokenID),
+		Provider:   strings.TrimSpace(provider),
+		Status:     status,
+		Since:      since,
+		Until:      until,
+		Limit:      limit,
+		StreamOnly: streamOnly,
+	}, nil
+}
+
+func buildUsageQuery(requestID, tokenID, provider string, status int, since, until string, limit int, streamOnly bool) url.Values {
+	query := url.Values{}
+	if strings.TrimSpace(requestID) != "" {
+		query.Set("request_id", strings.TrimSpace(requestID))
+	}
+	if strings.TrimSpace(tokenID) != "" {
+		query.Set("token_id", strings.TrimSpace(tokenID))
+	}
+	if strings.TrimSpace(provider) != "" {
+		query.Set("provider", strings.TrimSpace(provider))
+	}
+	if status > 0 {
+		query.Set("status", fmt.Sprintf("%d", status))
+	}
+	if strings.TrimSpace(since) != "" {
+		query.Set("since", strings.TrimSpace(since))
+	}
+	if strings.TrimSpace(until) != "" {
+		query.Set("until", strings.TrimSpace(until))
+	}
+	if limit > 0 {
+		query.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	if streamOnly {
+		query.Set("stream_only", "true")
+	}
+	return query
+}
+
+func loadUsageEntries(path string, filter serverusage.Filter) ([]serverusage.Entry, error) {
+	entries, err := serverusage.LoadEntries(path, filter)
+	if err != nil && os.IsNotExist(err) {
+		return nil, nil
+	}
+	return entries, err
+}
+
+func printUsageSummary(path string, summary serverusage.Summary) {
+	fmt.Printf("Usage log: %s\n", path)
+	fmt.Printf("Total requests: %d\n", summary.TotalRequests)
+	if !summary.Earliest.IsZero() {
+		fmt.Printf("Window: %s -> %s\n", summary.Earliest.Format(time.RFC3339), summary.Latest.Format(time.RFC3339))
+	}
+	fmt.Printf("Prompt tokens: %d\n", summary.TotalPromptTokens)
+	fmt.Printf("Completion tokens: %d\n", summary.TotalCompletionTokens)
+	fmt.Printf("Total cost: $%.4f\n", summary.TotalCostUSD)
+	for _, key := range serverusage.SortedStringCounts(summary.ByToken) {
+		fmt.Printf("Token %s: %d\n", key, summary.ByToken[key])
+	}
+	for _, key := range serverusage.SortedStringCounts(summary.ByProvider) {
+		fmt.Printf("Provider %s: %d\n", key, summary.ByProvider[key])
+	}
+	for _, key := range serverusage.SortedStringTotals(summary.CostByToken) {
+		fmt.Printf("Cost token %s: $%.4f\n", key, summary.CostByToken[key])
+	}
+	for _, key := range serverusage.SortedStringTotals(summary.CostByProvider) {
+		fmt.Printf("Cost provider %s: $%.4f\n", key, summary.CostByProvider[key])
+	}
+}
+
+func printUsageEvents(entries []serverusage.Entry) {
+	if len(entries) == 0 {
+		fmt.Println("No matching usage entries.")
+		return
+	}
+	for _, entry := range entries {
+		fmt.Printf("%s status=%d token=%s provider=%s cost=$%.4f prompt=%d completion=%d stream=%t request_id=%s\n",
+			entry.Timestamp.Format(time.RFC3339),
+			entry.Status,
+			emptyFallback(entry.TokenID, "-"),
+			emptyFallback(entry.ActualProvider, "-"),
+			entry.CostUSD,
+			entry.PromptTokens,
+			entry.CompletionTokens,
+			entry.Stream,
+			emptyFallback(entry.RequestID, "-"),
+		)
+	}
+}
+
+func printUsagePeriods(path string, periods []serverusage.PeriodSummary) {
+	fmt.Printf("Usage periods: %s\n", path)
+	if len(periods) == 0 {
+		fmt.Println("No usage periods.")
+		return
+	}
+	for _, period := range periods {
+		fmt.Printf("%s requests=%d prompt=%d completion=%d cost=$%.4f\n",
+			period.Period,
+			period.TotalRequests,
+			period.TotalPromptTokens,
+			period.TotalCompletionTokens,
+			period.TotalCostUSD,
+		)
+	}
+}
+
+func computeBudgetAlerts(teamStore serverteam.Store, summary serverusage.Summary) []serverteam.BudgetAlert {
+	alerts := make([]serverteam.BudgetAlert, 0, 8)
+	if teamStore == nil {
+		return alerts
+	}
+	if orgs, err := teamStore.ListOrganizations(); err == nil {
+		for _, org := range orgs {
+			if org.MonthlyBudgetUSD <= 0 {
+				continue
+			}
+			alert, ok := serverteam.BuildBudgetAlert("organization", serverteam.BuildBillingBucket(org.ID, org.Name, org.MonthlyBudgetUSD, summary.CostByOrganization[org.ID], summary.ByOrganization[org.ID]))
+			if ok {
+				alerts = append(alerts, alert)
+			}
+		}
+	}
+	if projects, err := teamStore.ListProjects(""); err == nil {
+		for _, project := range projects {
+			if project.MonthlyBudgetUSD <= 0 {
+				continue
+			}
+			alert, ok := serverteam.BuildBudgetAlert("project", serverteam.BuildBillingBucket(project.ID, project.Name, project.MonthlyBudgetUSD, summary.CostByProject[project.ID], summary.ByProject[project.ID]))
+			if ok {
+				alerts = append(alerts, alert)
+			}
+		}
+	}
+	return alerts
+}
+
+func printBudgetAlerts(path string, alerts []serverteam.BudgetAlert) {
+	fmt.Printf("Budget alerts: %s\n", path)
+	if len(alerts) == 0 {
+		fmt.Println("No budget alerts.")
+		return
+	}
+	for _, alert := range alerts {
+		fmt.Printf("%s %s(%s) severity=%v spend=$%.4f budget=$%.4f utilization=%.2f%% requests=%v\n",
+			emptyFallback(alert.ScopeType, "-"),
+			emptyFallback(alert.Name, "-"),
+			emptyFallback(alert.ID, "-"),
+			alert.Severity,
+			alert.SpendUSD,
+			alert.MonthlyBudgetUSD,
+			alert.UtilizationPercent,
+			alert.RequestCount,
+		)
+	}
+}
+
+func emptyFallback(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}

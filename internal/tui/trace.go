@@ -1,50 +1,24 @@
 package tui
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 )
 
-type jsonlTraceSink struct {
-	mu sync.Mutex
-	f  *os.File
-}
-
-func newJSONLTraceSink(path string) (*jsonlTraceSink, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return nil, err
-	}
-	return &jsonlTraceSink{f: f}, nil
-}
-
-func (s *jsonlTraceSink) Trace(event model.TraceEvent) {
-	b, err := json.Marshal(event)
-	if err != nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, _ = s.f.Write(b)
-	_, _ = s.f.Write([]byte("\n"))
-}
-
-func (s *jsonlTraceSink) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.f.Close()
-}
-
 type debugTraceSink struct {
-	file  *jsonlTraceSink
+	file  *diag.JSONLTraceSink
 	route *routeDebugState
+}
+
+func newJSONLTraceSink(path string) (*diag.JSONLTraceSink, error) {
+	return diag.NewJSONLTraceSink(path)
 }
 
 func (s *debugTraceSink) Trace(event model.TraceEvent) {
@@ -188,4 +162,29 @@ func emitExecTrace(
 
 func boolPtr(v bool) *bool {
 	return &v
+}
+
+func emitChatStreamTrace(router *model.Router, provider string, chunk model.StreamChunk) {
+	if router == nil {
+		return
+	}
+
+	event := model.TraceEvent{
+		Timestamp: time.Now().UTC(),
+		Selected:  provider,
+	}
+
+	switch {
+	case chunk.Error != nil:
+		event.Event = "chat_stream_runtime_error"
+		event.Error = chunk.Error.Error()
+	case chunk.Done:
+		event.Event = "chat_stream_done"
+	default:
+		event.Event = "chat_stream_chunk"
+		size := utf8.RuneCountInString(chunk.Content)
+		event.Detail = fmt.Sprintf("content_runes=%d", size)
+	}
+
+	router.EmitTrace(event)
 }

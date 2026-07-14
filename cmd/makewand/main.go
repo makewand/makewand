@@ -1,17 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/tui"
@@ -19,7 +21,7 @@ import (
 )
 
 var (
-	version         = "0.1.0"
+	version         = "0.1.10"
 	debugFlag       bool
 	rootModeFlag    string
 	rootPrintFlag   bool
@@ -29,38 +31,59 @@ var (
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "makewand [prompt]",
-		Short: "AI coding assistant for everyone",
-		Long: `makewand is a terminal AI coding assistant that lets anyone
-build, modify, and deploy software through natural language conversation.
+		Short: "Multi-provider coding router for terminal makers",
+		// Provider/runtime errors are already specific; avoid noisy global usage spam.
+		SilenceUsage: true,
+		Long: `makewand is a multi-provider coding router that orchestrates
+Claude, Gemini, and Codex through adaptive mode-based routing
+(fast/balanced/power) for terminal-based coding workflows.
 
-  makewand         - Start interactive chat in current directory
+  makewand         - Start interactive chat in current directory (type /help in chat)
   makewand "..."   - Start chat and send an initial prompt
   makewand --print "..." - Run one prompt and print the result (CI/headless)
   makewand new     - Create a new project with guided wizard
   makewand chat    - Chat with AI about your project
+  makewand serve   - Expose your configured backend for your other devices
+  makewand token   - Manage remote server auth tokens
+  makewand audit   - Inspect server audit logs
+  makewand usage   - Inspect structured server usage logs
+  makewand user    - Manage registered server users
   makewand preview - Start a preview server
-  makewand setup   - Configure AI models and preferences`,
+  makewand setup   - Configure AI providers and routing preferences`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-			}
+			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
-				fmt.Println("No AI models configured. Run 'makewand setup' first.")
+			if !hasUsableBackend(cfg) {
+				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
 				return nil
 			}
 
 			if rootModeFlag != "" {
+				if _, ok := model.ParseUsageMode(rootModeFlag); !ok {
+					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", rootModeFlag)
+				}
 				cfg.UsageMode = rootModeFlag
 			}
 
 			initialPrompt := strings.TrimSpace(strings.Join(args, " "))
-			if shouldUseHeadless(initialPrompt, rootPrintFlag, isInteractiveTerminal()) {
+			isTTY := isInteractiveTerminal()
+
+			// Read prompt from stdin when piped and no args provided.
+			if initialPrompt == "" && !isTTY {
+				stdinPrompt, stdinErr := readStdinPrompt()
+				if stdinErr == nil && stdinPrompt != "" {
+					initialPrompt = stdinPrompt
+				}
+			}
+
+			if shouldUseHeadless(initialPrompt, rootPrintFlag, isTTY) {
 				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag, debugFlag)
 			}
-			if initialPrompt == "" && !isInteractiveTerminal() {
+			if rootPrintFlag && initialPrompt == "" {
+				return fmt.Errorf("--print requires a non-empty prompt (via argument or piped stdin)")
+			}
+			if initialPrompt == "" && !isTTY {
 				return fmt.Errorf("interactive TTY not detected; provide a prompt or use --print")
 			}
 
@@ -71,13 +94,19 @@ build, modify, and deploy software through natural language conversation.
 
 	rootCmd.AddCommand(newCmd())
 	rootCmd.AddCommand(chatCmd())
+	rootCmd.AddCommand(serveCmd())
+	rootCmd.AddCommand(tokenCmd())
+	rootCmd.AddCommand(auditCmd())
+	rootCmd.AddCommand(usageCmd())
+	rootCmd.AddCommand(quotaCmd())
+	rootCmd.AddCommand(userCmd())
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
-	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: free, economy, balanced, power")
+	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
-	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 2*time.Minute, "timeout for --print one-shot execution")
+	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 0, "timeout for --print (default: auto per mode)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -92,26 +121,29 @@ func newCmd() *cobra.Command {
 		Short: "Create a new project with guided wizard",
 		Long:  "Start the interactive wizard to create a new project from templates or your own description.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-			}
+			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
+			if !hasUsableBackend(cfg) {
 				fmt.Println("Welcome to makewand!")
 				fmt.Println()
-				fmt.Println("No AI models found. Install a CLI tool or set an API key:")
+				fmt.Println("No AI models or remote backend found. Install a CLI tool, set an API key, or configure a remote makewand server:")
 				fmt.Println()
 				fmt.Println("  Option 1: Install Claude Code, Gemini CLI, or Codex CLI (subscription)")
 				fmt.Println("  Option 2: Set API keys:")
 				fmt.Println("    export ANTHROPIC_API_KEY=sk-ant-...")
 				fmt.Println("    export GEMINI_API_KEY=AI...")
+				fmt.Println("  Option 3: Use a remote backend:")
+				fmt.Println("    export MAKEWAND_REMOTE_URL=http://your-main-machine:8080")
+				fmt.Println("    export MAKEWAND_REMOTE_TOKEN=...")
 				fmt.Println()
 				fmt.Println("Run 'makewand setup' to check your configuration.")
 				return nil
 			}
 
 			if modeFlag != "" {
+				if _, ok := model.ParseUsageMode(modeFlag); !ok {
+					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
+				}
 				cfg.UsageMode = modeFlag
 			}
 
@@ -119,7 +151,7 @@ func newCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: free, economy, balanced, power")
+	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: fast, balanced, power")
 	return cmd
 }
 
@@ -132,17 +164,17 @@ func chatCmd() *cobra.Command {
 		Long:  "Open an interactive chat to modify and improve your project using natural language.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-			}
+			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
-				fmt.Println("No AI models configured. Run 'makewand setup' first.")
+			if !hasUsableBackend(cfg) {
+				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
 				return nil
 			}
 
 			if modeFlag != "" {
+				if _, ok := model.ParseUsageMode(modeFlag); !ok {
+					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
+				}
 				cfg.UsageMode = modeFlag
 			}
 
@@ -155,7 +187,7 @@ func chatCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: free, economy, balanced, power")
+	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: fast, balanced, power")
 	return cmd
 }
 
@@ -207,10 +239,7 @@ func setupCmd() *cobra.Command {
 		Short: "Configure AI models and preferences",
 		Long:  "Interactive setup wizard for configuring API keys, default models, and language preferences.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
-			if err != nil {
-				cfg = config.DefaultConfig()
-			}
+			cfg := loadConfigWithWarning()
 
 			fmt.Println("makewand setup")
 			fmt.Println()
@@ -227,10 +256,14 @@ func setupCmd() *cobra.Command {
 				fmt.Println("Custom providers (config-defined):")
 				for _, cp := range cfg.CustomProviders {
 					access := accessDisplay(cp.Access, "subscription")
+					prompt := customProviderPromptLabel(cp)
 					if config.IsCustomProviderUsable(cp) {
-						fmt.Printf("  [x] %s -> %s (access: %s)\n", cp.Name, cp.Command, access)
+						fmt.Printf("  [x] %s -> %s (access: %s, prompt: %s)\n", cp.Name, cp.Command, access, prompt)
 					} else {
-						fmt.Printf("  [!] %s -> %s (access: %s, unavailable)\n", cp.Name, cp.Command, access)
+						fmt.Printf("  [!] %s -> %s (access: %s, prompt: %s, unavailable)\n", cp.Name, cp.Command, access, prompt)
+					}
+					if warning := customProviderSafetyWarning(cp); warning != "" {
+						fmt.Printf("      warning: %s\n", warning)
 					}
 				}
 				fmt.Println()
@@ -253,10 +286,8 @@ func setupCmd() *cobra.Command {
 			} else if !cfg.HasCLI("codex") {
 				fmt.Println("  [ ] OpenAI: not configured")
 			}
-			if cfg.OllamaURL != "" {
-				fmt.Printf("  Ollama URL: %s\n", cfg.OllamaURL)
-			}
 			fmt.Println()
+			printRemoteBackendStatus()
 
 			fmt.Printf("  Language: %s\n", cfg.Language)
 			fmt.Printf("  Default model: %s\n", cfg.DefaultModel)
@@ -267,10 +298,9 @@ func setupCmd() *cobra.Command {
 			}
 			fmt.Println()
 			fmt.Println("Provider access types:")
-			fmt.Printf("  Claude: %s\n", accessDisplay(cfg.ClaudeAccess, "api"))
-			fmt.Printf("  Gemini: %s\n", accessDisplay(cfg.GeminiAccess, "free"))
-			fmt.Printf("  Codex:  %s\n", accessDisplay(cfg.CodexAccess, "api"))
-			fmt.Printf("  Ollama: %s\n", accessDisplay(cfg.OllamaAccess, "local"))
+			fmt.Printf("  Claude: %s\n", accessDisplay(cfg.ClaudeAccess, "subscription"))
+			fmt.Printf("  Gemini: %s\n", accessDisplay(cfg.GeminiAccess, "subscription"))
+			fmt.Printf("  Codex:  %s\n", accessDisplay(cfg.CodexAccess, "subscription"))
 
 			if len(cfg.CLIs) > 0 {
 				fmt.Println()
@@ -282,6 +312,10 @@ func setupCmd() *cobra.Command {
 				fmt.Println("  export ANTHROPIC_API_KEY=sk-ant-...")
 				fmt.Println("  export GEMINI_API_KEY=AI...")
 				fmt.Println("  export OPENAI_API_KEY=sk-...")
+				fmt.Println()
+				fmt.Println("Or use a remote backend:")
+				fmt.Println("  export MAKEWAND_REMOTE_URL=http://your-main-machine:8080")
+				fmt.Println("  export MAKEWAND_REMOTE_TOKEN=...")
 			}
 			fmt.Println()
 			configPath, pathErr := config.ConfigPath()
@@ -292,7 +326,7 @@ func setupCmd() *cobra.Command {
 			}
 
 			if err := config.Save(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not save config: %v\n", err)
+				diag.Stderr().WarnErr("could not save config", err)
 				fmt.Fprintln(os.Stderr, "Tip: set MAKEWAND_CONFIG_DIR to a writable directory.")
 			}
 
@@ -306,6 +340,14 @@ func accessDisplay(configured, defaultValue string) string {
 		return configured
 	}
 	return defaultValue + " (default)"
+}
+
+func loadConfigWithWarning() *config.Config {
+	cfg, err := config.Load()
+	if err != nil {
+		diag.Stderr().WarnErr("could not load config", err)
+	}
+	return cfg
 }
 
 func shouldUseHeadless(prompt string, printFlag bool, interactiveTTY bool) bool {
@@ -331,6 +373,30 @@ func isCharDevice(f *os.File) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
+// readStdinPrompt reads a prompt from piped stdin.
+// It only reads when stdin is a pipe or regular file (not a device or socket).
+// Reads up to 64KB to prevent unbounded memory usage.
+func readStdinPrompt() (string, error) {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return "", err
+	}
+	// Only read if stdin is a pipe or regular file (i.e., has data).
+	if info.Mode()&(os.ModeNamedPipe|os.ModeCharDevice) == 0 && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("stdin is not a pipe or file")
+	}
+	if info.Mode()&os.ModeCharDevice != 0 {
+		return "", fmt.Errorf("stdin is a terminal")
+	}
+	const maxBytes = 64 * 1024
+	reader := bufio.NewReader(io.LimitReader(os.Stdin, maxBytes))
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, debug bool) error {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
@@ -341,11 +407,11 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	if debug {
 		traceSink, tracePath, traceErr := newHeadlessTraceSink()
 		if traceErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: debug trace disabled: %v\n", traceErr)
+			diag.Stderr().WarnErr("debug trace disabled", traceErr)
 		} else {
 			router.SetTraceSink(traceSink)
 			defer traceSink.Close()
-			fmt.Fprintf(os.Stderr, "Debug trace enabled: %s\n", tracePath)
+			diag.Stderr().InfoPath("Debug trace enabled", tracePath)
 		}
 	}
 	configDir, dirErr := config.ConfigDir()
@@ -354,13 +420,14 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	}
 	task := classifyPromptTask(prompt)
 	messages := []model.Message{{Role: "user", Content: prompt}}
-	systemPrompt := "You are makewand, an expert software engineering assistant. Provide direct, actionable answers."
+	project := openHeadlessProject(".")
+	systemPrompt := buildHeadlessSystemPrompt(project, task, router.Mode(), prompt)
 
-	ctx := context.Background()
-	cancel := func() {}
-	if timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, timeout)
+	// Auto-select timeout based on mode when user didn't set --timeout explicitly.
+	if timeout <= 0 {
+		timeout = headlessTimeoutForMode(router.Mode())
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	var (
@@ -369,7 +436,23 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 		route   model.RouteResult
 		err     error
 	)
-	if router.ModeSet() && router.Mode() == model.ModePower {
+	if shouldUseHeadlessCandidateSelection(cfg, task, project) {
+		selection := engine.RunCandidateSelection(
+			ctx,
+			router,
+			project,
+			promptTaskToBuildPhase(task),
+			messages,
+			systemPrompt,
+			nil,
+		)
+		if strings.TrimSpace(selection.Content) == "" {
+			return fmt.Errorf("no candidate provider produced a response")
+		}
+		content = selection.Content
+		usage = selection.Usage
+		route.Actual = selection.Provider
+	} else if router.ModeSet() && router.Mode() == model.ModePower {
 		content, usage, route, err = router.ChatBest(ctx, promptTaskToBuildPhase(task), messages, systemPrompt)
 	} else {
 		content, usage, route, err = router.Chat(ctx, task, messages, systemPrompt)
@@ -397,103 +480,65 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 		}
 	}
 
+	content = sanitizeHeadlessContent(prompt, task, content)
+	content = preserveGoPackageFromWorkspace(prompt, content)
+	if headlessCodeOnlyRequested(task, prompt) && strings.TrimSpace(content) == "" {
+		return fmt.Errorf("provider returned no usable code output in headless mode")
+	}
+
 	fmt.Println(strings.TrimSpace(content))
 	return nil
 }
 
-type jsonlTraceSink struct {
-	mu sync.Mutex
-	f  *os.File
-}
-
-func newJSONLTraceSink(path string) (*jsonlTraceSink, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return nil, err
+func shouldUseHeadlessCandidateSelection(cfg *config.Config, task model.TaskType, project *engine.Project) bool {
+	if project == nil || cfg == nil {
+		return false
 	}
-	return &jsonlTraceSink{f: f}, nil
-}
-
-func (s *jsonlTraceSink) Trace(event model.TraceEvent) {
-	b, err := json.Marshal(event)
-	if err != nil {
-		return
+	if config.NormalizeApprovalMode(cfg.ApprovalMode) != config.ApprovalModeAuto {
+		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, _ = s.f.Write(b)
-	_, _ = s.f.Write([]byte("\n"))
+	switch task {
+	case model.TaskCode, model.TaskFix:
+		return true
+	default:
+		return false
+	}
 }
 
-func (s *jsonlTraceSink) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.f.Close()
+const headlessProjectScanEntryLimit = 512
+
+func openHeadlessProject(path string) *engine.Project {
+	proj, err := engine.OpenProjectLimited(path, headlessProjectScanEntryLimit)
+	if err != nil {
+		return nil
+	}
+	return proj
 }
 
-func newHeadlessTraceSink() (*jsonlTraceSink, string, error) {
+func newHeadlessTraceSink() (*diag.JSONLTraceSink, string, error) {
 	var candidates []string
 	if dir, err := config.ConfigDir(); err == nil {
 		candidates = append(candidates, filepath.Join(dir, "trace.jsonl"))
 	}
 	candidates = append(candidates, filepath.Join(os.TempDir(), "makewand-trace.jsonl"))
+	return diag.OpenFirstJSONLTraceSink(candidates)
+}
 
-	var lastErr error
-	for _, path := range candidates {
-		sink, err := newJSONLTraceSink(path)
-		if err == nil {
-			return sink, path, nil
-		}
-		lastErr = err
+// headlessTimeoutForMode returns a sensible default --print timeout per mode.
+// Fast mode gets a tight budget so total wall time stays short even with fallbacks.
+func headlessTimeoutForMode(mode model.UsageMode) time.Duration {
+	switch mode {
+	case model.ModeFast:
+		return 90 * time.Second
+	case model.ModeBalanced:
+		return 3 * time.Minute
+	default: // power — ensemble needs more room
+		return 5 * time.Minute
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no trace path candidates available")
-	}
-	return nil, "", lastErr
 }
 
 func classifyPromptTask(input string) model.TaskType {
-	lower := strings.ToLower(input)
-
-	if strings.HasPrefix(lower, "/review") {
-		return model.TaskReview
-	}
-	if strings.HasPrefix(lower, "/fix") {
-		return model.TaskFix
-	}
-	if strings.HasPrefix(lower, "/ask") || strings.HasPrefix(lower, "/explain") {
-		return model.TaskExplain
-	}
-	if strings.HasPrefix(lower, "/plan") {
-		return model.TaskAnalyze
-	}
-
-	reviewKeywords := []string{"review", "check", "audit"}
-	for _, kw := range reviewKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskReview
-		}
-	}
-	fixKeywords := []string{"fix", "bug", "error"}
-	for _, kw := range fixKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskFix
-		}
-	}
-	explainKeywords := []string{"explain", "why", "how does"}
-	for _, kw := range explainKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskExplain
-		}
-	}
-	analyzeKeywords := []string{"plan", "analyze", "design"}
-	for _, kw := range analyzeKeywords {
-		if strings.Contains(lower, kw) {
-			return model.TaskAnalyze
-		}
-	}
-
-	return model.TaskCode
+	return model.ClassifyTask(input)
 }
 
 func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {
@@ -507,4 +552,231 @@ func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {
 	default:
 		return model.PhasePlan
 	}
+}
+
+func buildHeadlessSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode, prompt string) string {
+	base := tui.BuildSystemPrompt(project, task, mode)
+	headlessRules := "Headless mode rules: do not ask for permissions, do not claim to write files, and do not ask follow-up questions. Return the final answer directly."
+	if headlessCodeOnlyRequested(task, prompt) {
+		return base + " " + headlessRules + " For code/file requests, output only the final code content. No markdown fences. No summaries."
+	}
+	return base + " " + headlessRules
+}
+
+func headlessCodeOnlyRequested(task model.TaskType, prompt string) bool {
+	if task == model.TaskCode || task == model.TaskFix {
+		return true
+	}
+	lower := strings.ToLower(prompt)
+	hints := []string{
+		"return only",
+		"output only",
+		"complete content",
+		"do not output markdown",
+		"no markdown",
+		"no explanations",
+		"--- file:",
+	}
+	score := 0
+	for _, h := range hints {
+		if strings.Contains(lower, h) {
+			score++
+		}
+	}
+	return score >= 2
+}
+
+func sanitizeHeadlessContent(prompt string, task model.TaskType, content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return content
+	}
+	if !headlessCodeOnlyRequested(task, prompt) {
+		return content
+	}
+
+	if extracted, ok := extractFirstFileBlock(content); ok {
+		return strings.TrimSpace(extracted)
+	}
+	if extracted, ok := extractFirstCodeFence(content); ok {
+		return strings.TrimSpace(extracted)
+	}
+
+	trimmed := stripLeadingNonCode(content)
+	return strings.TrimSpace(trimmed)
+}
+
+var goFileRefPattern = regexp.MustCompile(`(?i)\b([A-Za-z0-9_./-]+\.go)\b`)
+
+func preserveGoPackageFromWorkspace(prompt, content string) string {
+	if strings.TrimSpace(content) == "" {
+		return content
+	}
+	lowerPrompt := strings.ToLower(prompt)
+	if !strings.Contains(lowerPrompt, "do not change package") &&
+		!strings.Contains(lowerPrompt, "don't change package") &&
+		!strings.Contains(lowerPrompt, "keep package name") {
+		return content
+	}
+
+	m := goFileRefPattern.FindStringSubmatch(prompt)
+	if len(m) < 2 {
+		return content
+	}
+	targetPath := strings.TrimSpace(m[1])
+	if targetPath == "" {
+		return content
+	}
+
+	expectedPkg, ok := readGoPackageFromFile(targetPath)
+	if !ok {
+		return content
+	}
+	actualPkg, lineIdx, ok := parseGoPackageLine(content)
+	if !ok || lineIdx < 0 {
+		return content
+	}
+	if actualPkg == expectedPkg {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	lines[lineIdx] = "package " + expectedPkg
+	return strings.Join(lines, "\n")
+}
+
+func readGoPackageFromFile(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	pkg, _, ok := parseGoPackageLine(string(data))
+	return pkg, ok
+}
+
+func parseGoPackageLine(content string) (pkg string, lineIdx int, ok bool) {
+	lines := strings.Split(content, "\n")
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "//") {
+			continue
+		}
+		if strings.HasPrefix(line, "package ") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "package "))
+			if name == "" {
+				return "", -1, false
+			}
+			name = strings.Fields(name)[0]
+			return name, i, true
+		}
+		// First non-empty, non-comment line is not a package line.
+		return "", -1, false
+	}
+	return "", -1, false
+}
+
+func extractFirstFileBlock(content string) (string, bool) {
+	lines := strings.Split(content, "\n")
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "--- FILE:") {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 || start >= len(lines) {
+		return "", false
+	}
+
+	inFence := false
+	var out []string
+	for _, line := range lines[start:] {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--- FILE:") {
+			break
+		}
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if !inFence && strings.TrimSpace(line) == "" {
+			if len(out) == 0 {
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	if len(out) == 0 {
+		return "", false
+	}
+	return strings.Join(out, "\n"), true
+}
+
+func extractFirstCodeFence(content string) (string, bool) {
+	lines := strings.Split(content, "\n")
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+
+	var out []string
+	for _, line := range lines[start:] {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			break
+		}
+		out = append(out, line)
+	}
+	if len(out) == 0 {
+		return "", false
+	}
+	return strings.Join(out, "\n"), true
+}
+
+func stripLeadingNonCode(content string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if looksLikeCodeLine(line) {
+			return strings.Join(lines[i:], "\n")
+		}
+	}
+	return content
+}
+
+func looksLikeCodeLine(line string) bool {
+	l := strings.TrimSpace(strings.ToLower(line))
+	if l == "" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(l, "package "),
+		strings.HasPrefix(l, "import "),
+		strings.HasPrefix(l, "func "),
+		strings.HasPrefix(l, "type "),
+		strings.HasPrefix(l, "var "),
+		strings.HasPrefix(l, "const "),
+		strings.HasPrefix(l, "class "),
+		strings.HasPrefix(l, "function "),
+		strings.HasPrefix(l, "def "),
+		strings.HasPrefix(l, "from "),
+		strings.HasPrefix(l, "export "),
+		strings.HasPrefix(l, "module.exports"),
+		strings.HasPrefix(l, "#!/"),
+		strings.HasPrefix(l, "if "),
+		strings.HasPrefix(l, "for "),
+		strings.HasPrefix(l, "while "),
+		strings.HasPrefix(l, "return "),
+		strings.HasPrefix(l, "{"),
+		strings.HasPrefix(l, "}"):
+		return true
+	}
+	return strings.Contains(l, "=>") || strings.Contains(l, ";") || strings.Contains(l, "{") || strings.Contains(l, "}")
 }

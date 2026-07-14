@@ -10,10 +10,10 @@ make prelaunch
 
 This runs:
 
-- `go test ./...`
-- `go vet ./...`
+- `bash ./scripts/test_gate.sh` (tracked source packages under `cmd`, `internal`, and `router`)
+- `go vet ./cmd/... ./internal/... ./router`
 - build binary
-- `makewand doctor --strict --modes economy,balanced,power`
+- `makewand doctor --strict --modes fast,balanced,power`
 
 ## 2) Run live provider probe (recommended before production)
 
@@ -24,7 +24,11 @@ MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch
 Optional tuning:
 
 - `MAKEWAND_PROBE_TIMEOUT=60s`
-- `MAKEWAND_DOCTOR_MODES=all` (includes `free` mode)
+- `MAKEWAND_PROBE_RETRIES=2`
+- `MAKEWAND_DOCTOR_MODES=all` (includes all three modes)
+- `makewand doctor --probe` now classifies probe failures as `environment`, `configuration`, or `provider`.
+  - `environment` / `configuration` probe failures are downgraded to `WARN` (to avoid mislabeling host/VPN/permission issues as product defects).
+  - `provider` probe failures remain `FAIL`.
 
 ## 3) Proxy / VPN environments
 
@@ -41,6 +45,13 @@ Gemini CLI proxy behavior:
 - default: if proxy env exists, makewand respects it
 - `MAKEWAND_GEMINI_USE_PROXY=1`: always respect proxy env
 - `MAKEWAND_GEMINI_BYPASS_PROXY=1`: force `NO_PROXY` for Google hosts
+
+Custom provider prompt delivery:
+
+- `prompt_mode: "stdin"` is the preferred safe path
+- `prompt_mode: "arg"` still works, but `doctor` warns because argv-based prompt delivery is easier to misuse
+- empty `prompt_mode` keeps legacy `{{prompt}}` / argv-append behavior for backward compatibility
+- shell adapters such as `sh -c` / `bash -c` / `cmd /c` are allowed, but `setup` and `doctor` warn unless prompt delivery is moved to stdin
 
 ## 4) CI-friendly command
 

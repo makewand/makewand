@@ -8,7 +8,7 @@ import (
 	"github.com/makewand/makewand/internal/model"
 )
 
-func TestApplyBudgetRoutingPolicy_WarningDowngradesToEconomy(t *testing.T) {
+func TestApplyBudgetRoutingPolicy_WarningDowngradesToFast(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.MonthlyBudget = 1.0
 	app := *NewApp(ModeChat, cfg, "")
@@ -16,8 +16,8 @@ func TestApplyBudgetRoutingPolicy_WarningDowngradesToEconomy(t *testing.T) {
 
 	app = app.applyBudgetRoutingPolicy()
 
-	if got := app.router.Mode(); got != model.ModeEconomy {
-		t.Fatalf("router.Mode()=%v, want %v", got, model.ModeEconomy)
+	if got := app.router.Mode(); got != model.ModeFast {
+		t.Fatalf("router.Mode()=%v, want %v", got, model.ModeFast)
 	}
 
 	found := false
@@ -32,17 +32,17 @@ func TestApplyBudgetRoutingPolicy_WarningDowngradesToEconomy(t *testing.T) {
 	}
 }
 
-func TestApplyBudgetRoutingPolicy_ExceededDowngradesToFree(t *testing.T) {
+func TestApplyBudgetRoutingPolicy_ExceededDowngradesToFast(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.MonthlyBudget = 1.0
 	app := *NewApp(ModeChat, cfg, "")
-	app.router.SetMode(model.ModeEconomy)
+	app.router.SetMode(model.ModeBalanced)
 	app.cost.Add("claude", 1.2)
 
 	app = app.applyBudgetRoutingPolicy()
 
-	if got := app.router.Mode(); got != model.ModeFree {
-		t.Fatalf("router.Mode()=%v, want %v", got, model.ModeFree)
+	if got := app.router.Mode(); got != model.ModeFast {
+		t.Fatalf("router.Mode()=%v, want %v", got, model.ModeFast)
 	}
 }
 

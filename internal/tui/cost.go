@@ -58,6 +58,14 @@ func (c *CostTracker) AddWithTokens(provider string, cost float64, inputTokens, 
 	})
 }
 
+func (c *CostTracker) Snapshot() []costEntry {
+	return append([]costEntry(nil), c.entries...)
+}
+
+func (c *CostTracker) Restore(entries []costEntry) {
+	c.entries = append([]costEntry(nil), entries...)
+}
+
 // SessionTotal returns the total cost for the current session.
 func (c *CostTracker) SessionTotal() float64 {
 	var total float64
@@ -176,9 +184,7 @@ func (c *CostTracker) View(width int) string {
 	}{
 		{"gemini", "Gemini"},
 		{"claude", "Claude"},
-		{"openai", "OpenAI"},
 		{"codex", "Codex"},
-		{"ollama", "Ollama"},
 	}
 
 	for _, p := range providers {
@@ -195,11 +201,7 @@ func (c *CostTracker) View(width int) string {
 			totalTok := inTok + outTok
 			costStr = fmt.Sprintf(msg.CostRequests, reqCount, formatTokenCount(totalTok))
 		} else if cost == 0 {
-			if p.name == "ollama" {
-				costStr = msg.CostLocal
-			} else {
-				costStr = msg.CostFree
-			}
+			costStr = msg.CostFree
 		} else {
 			costStr = fmt.Sprintf("$%.2f", cost)
 		}

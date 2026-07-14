@@ -1,7 +1,12 @@
 package main
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
@@ -12,7 +17,7 @@ func TestParseDoctorModes_All(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDoctorModes(all) error = %v", err)
 	}
-	want := []model.UsageMode{model.ModeFree, model.ModeEconomy, model.ModeBalanced, model.ModePower}
+	want := []model.UsageMode{model.ModeFast, model.ModeBalanced, model.ModePower}
 	if len(got) != len(want) {
 		t.Fatalf("len(modes) = %d, want %d", len(got), len(want))
 	}
@@ -52,7 +57,6 @@ func TestDetectConfiguredProviders(t *testing.T) {
 		{Name: "codex"},
 	}
 	cfg.GeminiAPIKey = "test-key"
-	cfg.OllamaURL = "http://localhost:11434"
 
 	got := detectConfiguredProviders(cfg)
 	if len(got) == 0 {
@@ -61,7 +65,85 @@ func TestDetectConfiguredProviders(t *testing.T) {
 	assertContains(t, got, "claude (cli)")
 	assertContains(t, got, "codex (cli)")
 	assertContains(t, got, "gemini (api)")
-	assertContains(t, got, "ollama")
+}
+
+func TestDetectConfiguredProviders_IncludesRemote(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
+
+	got := detectConfiguredProviders(config.DefaultConfig())
+	assertContains(t, got, "remote (http)")
+}
+
+func TestRunDoctor_AllowsRemoteOnlyConfiguration(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
+
+	report, failCount, warnCount := runDoctor(config.DefaultConfig(), nil, doctorOptions{
+		modes: []model.UsageMode{model.ModeBalanced},
+	})
+	if failCount != 0 {
+		t.Fatalf("failCount = %d, want 0", failCount)
+	}
+	if warnCount != 0 {
+		t.Fatalf("warnCount = %d, want 0", warnCount)
+	}
+
+	assertDoctorCheckStatus(t, report.Checks, "remote backend", doctorPass)
+	assertDoctorCheckStatus(t, report.Checks, "model configuration", doctorPass)
+}
+
+func TestResolveRemoteDoctorTarget_UsesFlagsThenEnv(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://env.example")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "env-token")
+
+	target := resolveRemoteDoctorTarget(doctorOptions{
+		remoteURL:     "http://flag.example/",
+		remoteToken:   "flag-token",
+		remoteTimeout: 3 * time.Second,
+	})
+	if target.url != "http://flag.example" {
+		t.Fatalf("target.url = %q, want %q", target.url, "http://flag.example")
+	}
+	if target.token != "flag-token" {
+		t.Fatalf("target.token = %q, want %q", target.token, "flag-token")
+	}
+
+	target = resolveRemoteDoctorTarget(doctorOptions{remoteTimeout: 2 * time.Second})
+	if target.url != "http://env.example" {
+		t.Fatalf("env target.url = %q, want %q", target.url, "http://env.example")
+	}
+	if target.token != "env-token" {
+		t.Fatalf("env target.token = %q, want %q", target.token, "env-token")
+	}
+}
+
+func TestRunRemoteDoctorChecks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/health":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v1/models":
+			if req.Header.Get("Authorization") != "Bearer secret" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"codex"},{"id":"claude"}]}`))
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	checks := runRemoteDoctorChecks(remoteDoctorTarget{
+		url:     server.URL,
+		token:   "secret",
+		timeout: 2 * time.Second,
+	})
+	assertDoctorCheckStatus(t, checks, "remote service health", doctorPass)
+	assertDoctorCheckStatus(t, checks, "remote service models", doctorPass)
 }
 
 func TestUniqueProbeProviders(t *testing.T) {
@@ -83,6 +165,119 @@ func TestUniqueProbeProviders(t *testing.T) {
 	}
 }
 
+func TestClassifyProbeError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want doctorProbeClassification
+	}{
+		{
+			name: "environment timeout",
+			err:  errors.New("request timed out after 45s"),
+			want: probeClassEnvironment,
+		},
+		{
+			name: "environment permission",
+			err:  errors.New("proxyconnect tcp: socket: operation not permitted"),
+			want: probeClassEnvironment,
+		},
+		{
+			name: "configuration missing",
+			err:  errors.New("model provider \"codex\" is not available"),
+			want: probeClassConfiguration,
+		},
+		{
+			name: "provider internal",
+			err:  errors.New("internal server error"),
+			want: probeClassProvider,
+		},
+		{
+			name: "structured rate limit",
+			err: &model.ProviderError{
+				Provider:  "openai",
+				Kind:      model.ErrorKindRateLimit,
+				Retryable: true,
+				Message:   "rate limit exceeded",
+			},
+			want: probeClassEnvironment,
+		},
+		{
+			name: "structured auth",
+			err: &model.ProviderError{
+				Provider: "claude",
+				Kind:     model.ErrorKindAuth,
+				Message:  "unauthorized",
+			},
+			want: probeClassConfiguration,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyProbeError(tc.err)
+			if got != tc.want {
+				t.Fatalf("classifyProbeError(%q) = %q, want %q", tc.err.Error(), got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateProbeFailures_DowngradeEnvironmentToWarn(t *testing.T) {
+	failures := []doctorProbeFailure{
+		{
+			provider: "codex",
+			attempt:  1,
+			class:    probeClassEnvironment,
+			err:      errors.New("proxyconnect tcp: connection refused"),
+		},
+		{
+			provider: "claude",
+			attempt:  2,
+			class:    probeClassEnvironment,
+			err:      errors.New("deadline exceeded"),
+		},
+	}
+
+	status, class, msg := evaluateProbeFailures(failures)
+	if status != doctorWarn {
+		t.Fatalf("status = %q, want %q", status, doctorWarn)
+	}
+	if class != probeClassEnvironment {
+		t.Fatalf("class = %q, want %q", class, probeClassEnvironment)
+	}
+	assertContainsSubstring(t, msg, "environment issue")
+	assertContainsSubstring(t, msg, "codex")
+	assertContainsSubstring(t, msg, "claude")
+}
+
+func TestEvaluateProbeFailures_ProviderRemainsFail(t *testing.T) {
+	failures := []doctorProbeFailure{
+		{
+			provider: "codex",
+			attempt:  1,
+			class:    probeClassProvider,
+			err:      errors.New("unexpected malformed provider response"),
+		},
+	}
+
+	status, class, msg := evaluateProbeFailures(failures)
+	if status != doctorFail {
+		t.Fatalf("status = %q, want %q", status, doctorFail)
+	}
+	if class != probeClassProvider {
+		t.Fatalf("class = %q, want %q", class, probeClassProvider)
+	}
+	assertContainsSubstring(t, msg, "provider issue")
+}
+
+func TestCompactProbeError_ShortensMultilineNoise(t *testing.T) {
+	err := errors.New("WARNING: stale tmp cleanup failed\nERROR: stream disconnected before completion\nstacktrace ...")
+	got := compactProbeError(err)
+	if got != "stream disconnected" {
+		t.Fatalf("compactProbeError() = %q, want %q", got, "stream disconnected")
+	}
+}
+
 func assertContains(t *testing.T, list []string, want string) {
 	t.Helper()
 	for _, v := range list {
@@ -91,4 +286,24 @@ func assertContains(t *testing.T, list []string, want string) {
 		}
 	}
 	t.Fatalf("list %v does not contain %q", list, want)
+}
+
+func assertContainsSubstring(t *testing.T, got string, wantSubstr string) {
+	t.Helper()
+	if !strings.Contains(got, wantSubstr) {
+		t.Fatalf("string %q does not contain %q", got, wantSubstr)
+	}
+}
+
+func assertDoctorCheckStatus(t *testing.T, checks []doctorCheck, name string, want doctorStatus) {
+	t.Helper()
+	for _, check := range checks {
+		if check.Name == name {
+			if check.Status != want {
+				t.Fatalf("check %q status = %q, want %q", name, check.Status, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("check %q not found in %+v", name, checks)
 }

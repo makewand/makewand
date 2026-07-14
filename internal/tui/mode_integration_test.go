@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -99,19 +100,19 @@ func driveMessages(t *testing.T, app App, msgs ...tea.Msg) App {
 // ---------------------------------------------------------------------------
 
 func TestMode_FreeBuild_UsesGemini(t *testing.T) {
-	app := newBuildAppWithMode(t, model.ModeFree)
+	app := newBuildAppWithMode(t, model.ModeFast)
 
 	// Simulate AI code generation response from gemini.
 	resp := buildAIResponseWithFiles("gemini", "index.js")
 	app = driveMessages(t, app, resp)
 
-	if app.buildCodeProvider != "gemini" {
-		t.Errorf("buildCodeProvider = %q, want %q", app.buildCodeProvider, "gemini")
+	if app.pipeline.CodeProvider() != "gemini" {
+		t.Errorf("buildCodeProvider = %q, want %q", app.pipeline.CodeProvider(), "gemini")
 	}
 }
 
 func TestMode_FreeBuild_NoAPIFallbackOnError(t *testing.T) {
-	app := newBuildAppWithMode(t, model.ModeFree)
+	app := newBuildAppWithMode(t, model.ModeFast)
 
 	// Simulate AI error.
 	errResp := aiResponseMsg{err: fmt.Errorf("gemini rate limited")}
@@ -125,8 +126,8 @@ func TestMode_FreeBuild_NoAPIFallbackOnError(t *testing.T) {
 }
 
 func TestMode_EconomyBuild_ReviewLGTM(t *testing.T) {
-	app := newBuildAppWithMode(t, model.ModeEconomy)
-	app.buildCodeProvider = "gemini"
+	app := newBuildAppWithMode(t, model.ModeFast)
+	app.pipeline.SetCodeProvider("gemini")
 
 	// Code step already done; simulate review returning LGTM.
 	review := codeReviewMsg{
@@ -143,7 +144,7 @@ func TestMode_EconomyBuild_ReviewLGTM(t *testing.T) {
 
 func TestMode_BalancedBuild_ReviewFindsIssues(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModeBalanced)
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Review returns fix files.
 	fixContent := "Found issues:\n--- FILE: index.js ---\n```\nconsole.log('fixed');\n```\n"
@@ -173,7 +174,7 @@ func TestMode_BalancedBuild_ReviewFindsIssues(t *testing.T) {
 
 func TestMode_BalancedBuild_ReviewFixDeclined(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModeBalanced)
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Simulate review fix files arriving.
 	app = driveMessages(t, app, filesExtractedMsg{
@@ -181,16 +182,16 @@ func TestMode_BalancedBuild_ReviewFixDeclined(t *testing.T) {
 		phase: pendingPhaseReview,
 	})
 
-	if !app.confirmingFiles {
-		t.Fatal("expected confirmingFiles=true for review fix")
+	if app.state != StateConfirmFiles {
+		t.Fatal("expected state=StateConfirmFiles for review fix")
 	}
 
 	// User declines.
 	m, _ := app.handleFileConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	app = m.(App)
 
-	if app.confirmingFiles {
-		t.Error("confirmingFiles should be false after decline")
+	if app.state == StateConfirmFiles {
+		t.Error("state should not be StateConfirmFiles after decline")
 	}
 }
 
@@ -200,7 +201,7 @@ func TestMode_PowerBuild_SingleProviderSkipsReview(t *testing.T) {
 	// NewRouter with default config has no providers → Available() returns empty.
 	// We keep the default router which has no providers.
 	app.router = model.NewRouter(config.DefaultConfig())
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Simulate file write complete in build phase.
 	app.pendingPhase = pendingPhaseBuild
@@ -222,10 +223,10 @@ func TestMode_PowerBuild_SingleProviderSkipsReview(t *testing.T) {
 
 func TestMode_AutoFixCycle_SuccessAfterOneRetry(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModeBalanced)
-	app.buildCodeProvider = "claude"
+	app.pipeline.SetCodeProvider("claude")
 
 	// Simulate auto-fix attempt 1 triggering.
-	app.autoFixAttempt = 1
+	app.pipeline.OnAutoFixAttempt(1)
 
 	// Auto-fix response with fix files.
 	fixContent := "--- FILE: index.js ---\n```\nconsole.log('auto-fixed');\n```\n"
@@ -238,8 +239,8 @@ func TestMode_AutoFixCycle_SuccessAfterOneRetry(t *testing.T) {
 	m, cmd := app.Update(fixResp)
 	app = m.(App)
 
-	if app.autoFixRetryAttempt != 1 {
-		t.Errorf("autoFixRetryAttempt = %d, want 1", app.autoFixRetryAttempt)
+	if app.pipeline.AutoFixRetryAttempt() != 1 {
+		t.Errorf("autoFixRetryAttempt = %d, want 1", app.pipeline.AutoFixRetryAttempt())
 	}
 	if cmd == nil {
 		t.Fatal("expected filesExtractedMsg command for fix files")
@@ -263,8 +264,8 @@ func TestMode_AutoFixCycle_FixFilesRequireConfirmation(t *testing.T) {
 		phase: pendingPhaseFix,
 	})
 
-	if !app.confirmingFiles {
-		t.Error("confirmingFiles should be true for auto-fix files")
+	if app.state != StateConfirmFiles {
+		t.Error("state should be StateConfirmFiles for auto-fix files")
 	}
 	if app.pendingPhase != pendingPhaseFix {
 		t.Errorf("pendingPhase = %v, want pendingPhaseFix", app.pendingPhase)
@@ -366,6 +367,51 @@ func TestMode_ChatStreaming_FallbackNotice(t *testing.T) {
 	}
 }
 
+func TestMode_ChatStreaming_UpdatesLiveActivityStatus(t *testing.T) {
+	app := *NewApp(ModeChat, config.DefaultConfig(), "")
+	app.chat.SetStreaming(true)
+	app.activity.Start()
+	app.syncChatActivity()
+
+	start := aiStreamStartMsg{
+		ch:       make(chan model.StreamChunk),
+		provider: "gemini",
+	}
+	app = driveMessages(t, app, start)
+
+	if app.state != StateStreaming {
+		t.Fatalf("state = %v, want %v", app.state, StateStreaming)
+	}
+	if app.chat.streamProvider != "gemini" {
+		t.Fatalf("streamProvider = %q, want %q", app.chat.streamProvider, "gemini")
+	}
+	if !strings.Contains(app.chat.streamStatus, "Waiting for gemini") {
+		t.Fatalf("streamStatus = %q, want waiting status", app.chat.streamStatus)
+	}
+
+	app = driveMessages(t, app, aiStreamMsg{
+		chunk:    model.StreamChunk{Content: "repo summary"},
+		provider: "gemini",
+	})
+	if !strings.Contains(app.chat.streamStatus, "Receiving response from gemini") {
+		t.Fatalf("streamStatus = %q, want receiving status", app.chat.streamStatus)
+	}
+	if !strings.Contains(app.chat.streamStatus, "1 chunk") {
+		t.Fatalf("streamStatus = %q, want chunk count", app.chat.streamStatus)
+	}
+
+	app = driveMessages(t, app, aiStreamMsg{
+		chunk:    model.StreamChunk{Done: true},
+		provider: "gemini",
+	})
+	if app.state != StateIdle {
+		t.Fatalf("state = %v, want %v", app.state, StateIdle)
+	}
+	if app.activity.Snapshot().Active {
+		t.Fatal("activity should be cleared after stream completion")
+	}
+}
+
 func TestMode_ChatStreaming_ErrorMidStream(t *testing.T) {
 	app := *NewApp(ModeChat, config.DefaultConfig(), "")
 
@@ -435,7 +481,7 @@ func TestMode_ChatConversationSummary(t *testing.T) {
 
 func TestMode_SwitchCommand_FreeToBalanced(t *testing.T) {
 	app := *NewApp(ModeChat, config.DefaultConfig(), "")
-	app.router.SetMode(model.ModeFree)
+	app.router.SetMode(model.ModeFast)
 
 	m, _ := app.handleModeCommand("/mode balanced")
 	app = m.(App)
@@ -447,13 +493,13 @@ func TestMode_SwitchCommand_FreeToBalanced(t *testing.T) {
 
 func TestMode_SwitchCommand_ShowCurrent(t *testing.T) {
 	app := *NewApp(ModeChat, config.DefaultConfig(), "")
-	app.router.SetMode(model.ModeEconomy)
+	app.router.SetMode(model.ModeFast)
 
 	m, _ := app.handleModeCommand("/mode")
 	app = m.(App)
 
 	lastMsg := app.chat.messages[len(app.chat.messages)-1]
-	if !strings.Contains(lastMsg.Content, "economy") {
+	if !strings.Contains(lastMsg.Content, "fast") {
 		t.Errorf("expected current mode in message, got %q", lastMsg.Content)
 	}
 }
@@ -472,7 +518,7 @@ func TestMode_SwitchCommand_InvalidMode(t *testing.T) {
 
 	// Should show help text.
 	lastMsg := app.chat.messages[len(app.chat.messages)-1]
-	if !strings.Contains(lastMsg.Content, "free|economy|balanced|power") {
+	if !strings.Contains(lastMsg.Content, "fast|balanced|power") {
 		t.Errorf("expected help text in message, got %q", lastMsg.Content)
 	}
 }
@@ -489,4 +535,44 @@ func TestMode_SwitchCommand_NoPanicNarrowWindow(t *testing.T) {
 	}()
 
 	_, _ = app.handleModeCommand("/mode power")
+}
+
+func TestMode_FileWriteRefreshFailureSurfacesSystemMessage(t *testing.T) {
+	app := newBuildAppWithMode(t, model.ModeBalanced)
+	app.pendingPhase = pendingPhaseBuild
+
+	if err := os.RemoveAll(app.project.Path); err != nil {
+		t.Fatalf("RemoveAll(project.Path): %v", err)
+	}
+
+	m, _ := app.handleFileWriteComplete(fileWriteCompleteMsg{written: 1})
+	app = m.(App)
+
+	if !chatContains(app.chat.messages, "Failed to refresh project files:") {
+		t.Fatalf("expected refresh failure message, got %#v", app.chat.messages)
+	}
+}
+
+func TestMode_FilesUpdatedRefreshFailureSurfacesSystemMessage(t *testing.T) {
+	app := newBuildAppWithMode(t, model.ModeBalanced)
+
+	if err := os.RemoveAll(app.project.Path); err != nil {
+		t.Fatalf("RemoveAll(project.Path): %v", err)
+	}
+
+	m, _ := app.Update(filesUpdatedMsg{})
+	app = m.(App)
+
+	if !chatContains(app.chat.messages, "Failed to refresh project files:") {
+		t.Fatalf("expected refresh failure message, got %#v", app.chat.messages)
+	}
+}
+
+func chatContains(messages []ChatMessage, needle string) bool {
+	for _, msg := range messages {
+		if strings.Contains(msg.Content, needle) {
+			return true
+		}
+	}
+	return false
 }

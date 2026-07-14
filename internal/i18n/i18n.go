@@ -37,6 +37,10 @@ type Messages struct {
 	WizardDescribeHint string
 	WizardConfirmHint  string
 	WizardNavHint      string
+	WizardErrWorkdir   string
+	WizardErrProject   string
+	WizardWarnGitInit  string
+	WizardProjectMade  string
 
 	// Templates
 	TplBlog      string
@@ -47,12 +51,75 @@ type Messages struct {
 	TplScript    string
 
 	// Chat
-	ChatWelcome      string
-	ChatPrompt       string
-	ChatThinking     string
-	ChatWorking      string
-	ChatPlaceholder  string
-	ChatThinkingAnim string
+	ChatWelcome                   string
+	ChatPrompt                    string
+	ChatCommandHint               string
+	ChatThinking                  string
+	ChatWorking                   string
+	ChatPlaceholder               string
+	ChatThinkingAnim              string
+	ActivityTitle                 string
+	ActivityLabel                 string
+	ChatActivityPreparing         string
+	ChatActivityContext           string
+	ChatActivitySelectingProvider string
+	ChatActivitySelectingGeneric  string
+	ChatActivityWaitingProvider   string
+	ChatActivityWaitingGeneric    string
+	ChatActivityStreamingProvider string
+	ChatActivityStreamingGeneric  string
+	ChatActivityWorking           string
+	ChatActivityMultiModel        string
+	ChatActivityElapsed           string
+	ChatActivityFallback          string
+	ChatActivityChunkOne          string
+	ChatActivityChunkMany         string
+	ChatActivityChars             string
+	ApprovalTitle                 string
+	ApprovalPendingLabel          string
+	ApprovalActionHint            string
+	ApprovalNone                  string
+	ApprovalPendingWrite          string
+	ApprovalPlannedCommand        string
+	ApprovalDepsConfirm           string
+	ApprovalTestsConfirm          string
+	ApprovalModeLabel             string
+	ApprovalModeManual            string
+	ApprovalModeSafe              string
+	ApprovalModeAutopilot         string
+	ApprovalModeChanged           string
+	ApprovalModeHelp              string
+	ApprovalAutoWrite             string
+	ApprovalAutoWriteAutopilot    string
+	ApprovalAutoDeps              string
+	ApprovalAutoTests             string
+	AutomationCandidateStarted    string
+	AutomationCandidateRunning    string
+	AutomationCandidateVerifying  string
+	AutomationCandidatePassed     string
+	AutomationCandidateRejected   string
+	AutomationCandidateFailed     string
+	AutomationCandidateCanceled   string
+	AutomationCandidateSelected   string
+	AutomationCandidateFallback   string
+	BuildDepsDetectFailed         string
+	BuildTestsDetectFailed        string
+	BuildDepsExecError            string
+	BuildDepsExecFailed           string
+	BuildDepsSkipped              string
+	BuildTestsSkipped             string
+	ExecDepsLabel                 string
+	ExecTestsLabel                string
+	ExecStarted                   string
+	ExecFinished                  string
+	ExecCommand                   string
+	ExecExitCode                  string
+	ExecDuration                  string
+	ExecOutput                    string
+	RestoredSessionPrefix         string
+	RestoredSessionNotice         string
+	NoCompactedMemoryNotice       string
+	MemoryRestoredAt              string
 
 	// Cost
 	CostSession      string
@@ -90,14 +157,15 @@ type Messages struct {
 	ProgressCrossModel     string
 
 	// Errors
-	ErrNoModel    string
-	ErrNoAPIKey   string
-	ErrBuildFail  string
-	ErrTestFail   string
-	ErrAutofix    string
-	ErrFileWrite  string
-	ErrMaxRetries string
-	ErrCancelled  string
+	ErrNoModel     string
+	ErrNoAPIKey    string
+	ErrBuildFail   string
+	ErrTestFail    string
+	ErrAutofix     string
+	ErrFileWrite   string
+	ErrFileRefresh string
+	ErrMaxRetries  string
+	ErrCancelled   string
 
 	// File tree
 	FileTreeTitle string
@@ -113,8 +181,7 @@ type Messages struct {
 	FallbackNotice string
 
 	// Mode
-	ModeFree     string
-	ModeEconomy  string
+	ModeFast     string
 	ModeBalanced string
 	ModePower    string
 	ModeLabel    string
@@ -131,8 +198,8 @@ type Messages struct {
 
 var en = Messages{
 	AppName:     "makewand",
-	AppTagline:  "AI coding assistant for everyone",
-	Version:     "v0.1.0",
+	AppTagline:  "Multi-provider coding router for terminal makers",
+	Version:     "v0.1.10",
 	Yes:         "Yes",
 	No:          "No",
 	Confirm:     "Confirm",
@@ -156,6 +223,10 @@ var en = Messages{
 	WizardDescribeHint: "Type your project description below:",
 	WizardConfirmHint:  "Enter/Y confirm • N cancel",
 	WizardNavHint:      "↑↓ navigate • Enter select • q quit",
+	WizardErrWorkdir:   "Error getting working directory: %s",
+	WizardErrProject:   "Error creating project: %s",
+	WizardWarnGitInit:  "Warning: git init failed: %s",
+	WizardProjectMade:  "Created project: %s",
 
 	TplBlog:      "Personal Blog / Portfolio",
 	TplEcommerce: "E-commerce Store",
@@ -164,12 +235,75 @@ var en = Messages{
 	TplMiniApp:   "Mobile App",
 	TplScript:    "Automation Script",
 
-	ChatWelcome:      "Welcome! I'm here to help you build and modify your project.",
-	ChatPrompt:       "What would you like to do?",
-	ChatThinking:     "Thinking...",
-	ChatWorking:      "Working on it...",
-	ChatPlaceholder:  "Type your message... (Enter to send, Ctrl+D for multiline)",
-	ChatThinkingAnim: "Thinking...",
+	ChatWelcome:                   "Welcome! I'm here to help you build and modify your project.",
+	ChatPrompt:                    "What would you like to do?",
+	ChatCommandHint:               "Commands: /model [fast|balanced|power] | /approval [manual|safe|autopilot] | /clear | /status | /cost | /exit (or Ctrl+D)",
+	ChatThinking:                  "Thinking...",
+	ChatWorking:                   "Working on it...",
+	ChatPlaceholder:               "Type your message... (Enter to send, / for commands)",
+	ChatThinkingAnim:              "Thinking...",
+	ActivityTitle:                 "Activity",
+	ActivityLabel:                 "Activity",
+	ChatActivityPreparing:         "Preparing request context",
+	ChatActivityContext:           "Collecting project context",
+	ChatActivitySelectingProvider: "Selecting %s",
+	ChatActivitySelectingGeneric:  "Selecting provider",
+	ChatActivityWaitingProvider:   "Waiting for %s to start responding",
+	ChatActivityWaitingGeneric:    "Waiting for model response",
+	ChatActivityStreamingProvider: "Receiving response from %s",
+	ChatActivityStreamingGeneric:  "Receiving response",
+	ChatActivityWorking:           "Working on your request",
+	ChatActivityMultiModel:        "Running multi-model evaluation",
+	ChatActivityElapsed:           "elapsed %s",
+	ChatActivityFallback:          "fallback from %s",
+	ChatActivityChunkOne:          "%d chunk",
+	ChatActivityChunkMany:         "%d chunks",
+	ChatActivityChars:             "%d chars",
+	ApprovalTitle:                 "Pending Approval",
+	ApprovalPendingLabel:          "Pending approval",
+	ApprovalActionHint:            "Use /approve or /deny (or Y/n).",
+	ApprovalNone:                  "No pending approval.",
+	ApprovalPendingWrite:          "Pending write: %d files",
+	ApprovalPlannedCommand:        "Planned command: %s",
+	ApprovalDepsConfirm:           "Install dependencies now? This may execute scripts from generated project files. (Y/n)",
+	ApprovalTestsConfirm:          "Run project tests now?",
+	ApprovalModeLabel:             "Approval mode",
+	ApprovalModeManual:            "Manual",
+	ApprovalModeSafe:              "Safe",
+	ApprovalModeAutopilot:         "Autopilot",
+	ApprovalModeChanged:           "Approval mode: %s",
+	ApprovalModeHelp:              "/approval [manual|safe|autopilot]",
+	ApprovalAutoWrite:             "Safe mode auto-approved writing %d files.",
+	ApprovalAutoWriteAutopilot:    "Autopilot applied a verified candidate and wrote %d files.",
+	ApprovalAutoDeps:              "Safe mode auto-approved dependency install.",
+	ApprovalAutoTests:             "Safe mode auto-approved test execution.",
+	AutomationCandidateStarted:    "Running multi-provider candidate verification.",
+	AutomationCandidateRunning:    "%s generating",
+	AutomationCandidateVerifying:  "%s verifying",
+	AutomationCandidatePassed:     "%s passed",
+	AutomationCandidateRejected:   "%s rejected",
+	AutomationCandidateFailed:     "%s failed",
+	AutomationCandidateCanceled:   "%s canceled",
+	AutomationCandidateSelected:   "Selected %s after verifying %d/%d candidates.",
+	AutomationCandidateFallback:   "No candidate passed local verification. Falling back to manual approval.",
+	BuildDepsDetectFailed:         "Dependency detection failed: %s",
+	BuildTestsDetectFailed:        "Test detection failed: %s",
+	BuildDepsExecError:            "Error installing dependencies: %s",
+	BuildDepsExecFailed:           "Dependency install failed:\n%s",
+	BuildDepsSkipped:              "Skipped dependency install and tests. Run them manually when you're ready.",
+	BuildTestsSkipped:             "Skipped tests. Run them manually when you're ready.",
+	ExecDepsLabel:                 "dependency install",
+	ExecTestsLabel:                "tests",
+	ExecStarted:                   "Running %s",
+	ExecFinished:                  "%s finished",
+	ExecCommand:                   "Command: %s",
+	ExecExitCode:                  "Exit code: %d",
+	ExecDuration:                  "Duration: %s",
+	ExecOutput:                    "Output: %s",
+	RestoredSessionPrefix:         "Restored previous session",
+	RestoredSessionNotice:         "%s (%d messages). Use /clear to start fresh.",
+	NoCompactedMemoryNotice:       "No compacted memory yet. Conversation is still within the active context window.",
+	MemoryRestoredAt:              "%s at %s.",
 
 	CostSession:      "Session Cost",
 	CostMonth:        "Monthly Total",
@@ -204,14 +338,15 @@ var en = Messages{
 	ProgressReviewApplied:  "Applied %d fixes from %s review",
 	ProgressCrossModel:     "%s wrote code, %s reviewing",
 
-	ErrNoModel:    "No AI model configured. Run 'makewand setup' first.",
-	ErrNoAPIKey:   "API key not set for %s. Set it with 'makewand setup' or the environment variable.",
-	ErrBuildFail:  "Build failed",
-	ErrTestFail:   "Tests failed",
-	ErrAutofix:    "Don't worry! Let me analyze and fix this...",
-	ErrFileWrite:  "Failed to write %s: %s",
-	ErrMaxRetries: "Auto-fix failed after %d attempts. Please fix manually.",
-	ErrCancelled:  "Operation cancelled",
+	ErrNoModel:     "No AI model configured. Run 'makewand setup' first.",
+	ErrNoAPIKey:    "API key not set for %s. Set it with 'makewand setup' or the environment variable.",
+	ErrBuildFail:   "Build failed",
+	ErrTestFail:    "Tests failed",
+	ErrAutofix:     "Don't worry! Let me analyze and fix this...",
+	ErrFileWrite:   "Failed to write %s: %s",
+	ErrFileRefresh: "Failed to refresh project files: %s",
+	ErrMaxRetries:  "Auto-fix failed after %d attempts. Please fix manually.",
+	ErrCancelled:   "Operation cancelled",
 
 	FileTreeTitle: "Project Files",
 	FileTreeEmpty: "(no files yet)",
@@ -223,13 +358,12 @@ var en = Messages{
 
 	FallbackNotice: "%s unavailable, using %s instead",
 
-	ModeFree:     "Free",
-	ModeEconomy:  "Economy",
+	ModeFast:     "Fast",
 	ModeBalanced: "Balanced",
 	ModePower:    "Power",
 	ModeLabel:    "Mode",
 	ModeChanged:  "Mode: %s",
-	ModeHelp:     "/mode [free|economy|balanced|power]",
+	ModeHelp:     "/model [fast|balanced|power]",
 
 	SetupWelcome:  "Welcome to makewand! Let's set up your AI models.",
 	SetupAPIKey:   "Enter your %s API key (or press Enter to skip):",
@@ -240,8 +374,8 @@ var en = Messages{
 
 var zh = Messages{
 	AppName:     "makewand",
-	AppTagline:  "人人都能用的 AI 编程助手",
-	Version:     "v0.1.0",
+	AppTagline:  "面向终端开发者的多模型编码路由器",
+	Version:     "v0.1.10",
 	Yes:         "是",
 	No:          "否",
 	Confirm:     "确认",
@@ -265,6 +399,10 @@ var zh = Messages{
 	WizardDescribeHint: "在下方输入你的项目描述：",
 	WizardConfirmHint:  "Enter/Y 确认 • N 取消",
 	WizardNavHint:      "↑↓ 导航 • Enter 选择 • q 退出",
+	WizardErrWorkdir:   "获取工作目录失败：%s",
+	WizardErrProject:   "创建项目失败：%s",
+	WizardWarnGitInit:  "警告：git 初始化失败：%s",
+	WizardProjectMade:  "已创建项目：%s",
 
 	TplBlog:      "个人博客 / 作品集",
 	TplEcommerce: "电商网站",
@@ -273,12 +411,75 @@ var zh = Messages{
 	TplMiniApp:   "小程序 / 移动端",
 	TplScript:    "自动化脚本",
 
-	ChatWelcome:      "欢迎！我来帮你构建和修改项目。",
-	ChatPrompt:       "你想做什么？",
-	ChatThinking:     "正在思考...",
-	ChatWorking:      "正在处理...",
-	ChatPlaceholder:  "输入消息... (Enter 发送, Ctrl+D 多行)",
-	ChatThinkingAnim: "正在思考...",
+	ChatWelcome:                   "欢迎！我来帮你构建和修改项目。",
+	ChatPrompt:                    "你想做什么？",
+	ChatCommandHint:               "命令：/model [fast|balanced|power] | /approval [manual|safe|autopilot] | /clear | /status | /cost | /exit（或 Ctrl+D）",
+	ChatThinking:                  "正在思考...",
+	ChatWorking:                   "正在处理...",
+	ChatPlaceholder:               "输入消息... (Enter 发送, / 查看命令)",
+	ChatThinkingAnim:              "正在思考...",
+	ActivityTitle:                 "当前活动",
+	ActivityLabel:                 "当前活动",
+	ChatActivityPreparing:         "正在准备请求",
+	ChatActivityContext:           "正在收集项目上下文",
+	ChatActivitySelectingProvider: "正在选择 %s",
+	ChatActivitySelectingGeneric:  "正在选择模型",
+	ChatActivityWaitingProvider:   "正在等待 %s 开始响应",
+	ChatActivityWaitingGeneric:    "正在等待模型响应",
+	ChatActivityStreamingProvider: "正在接收 %s 的输出",
+	ChatActivityStreamingGeneric:  "正在接收输出",
+	ChatActivityWorking:           "正在处理请求",
+	ChatActivityMultiModel:        "正在运行多模型评估",
+	ChatActivityElapsed:           "已耗时 %s",
+	ChatActivityFallback:          "从 %s 回退",
+	ChatActivityChunkOne:          "%d 个片段",
+	ChatActivityChunkMany:         "%d 个片段",
+	ChatActivityChars:             "%d 字符",
+	ApprovalTitle:                 "待确认操作",
+	ApprovalPendingLabel:          "待确认操作",
+	ApprovalActionHint:            "使用 /approve 或 /deny（或 Y/n）。",
+	ApprovalNone:                  "当前没有待确认操作。",
+	ApprovalPendingWrite:          "待写入 %d 个文件",
+	ApprovalPlannedCommand:        "计划执行命令：%s",
+	ApprovalDepsConfirm:           "现在安装依赖吗？这可能会执行生成项目中的脚本。(Y/n)",
+	ApprovalTestsConfirm:          "现在运行项目测试吗？",
+	ApprovalModeLabel:             "审批模式",
+	ApprovalModeManual:            "手动",
+	ApprovalModeSafe:              "安全",
+	ApprovalModeAutopilot:         "自动驾驶",
+	ApprovalModeChanged:           "审批模式：%s",
+	ApprovalModeHelp:              "/approval [manual|safe|autopilot]",
+	ApprovalAutoWrite:             "安全模式已自动批准写入 %d 个文件。",
+	ApprovalAutoWriteAutopilot:    "自动驾驶已应用通过验证的候选，并写入 %d 个文件。",
+	ApprovalAutoDeps:              "安全模式已自动批准安装依赖。",
+	ApprovalAutoTests:             "安全模式已自动批准运行测试。",
+	AutomationCandidateStarted:    "正在运行多 provider 候选验证。",
+	AutomationCandidateRunning:    "%s 生成中",
+	AutomationCandidateVerifying:  "%s 验证中",
+	AutomationCandidatePassed:     "%s 已通过",
+	AutomationCandidateRejected:   "%s 未通过",
+	AutomationCandidateFailed:     "%s 失败",
+	AutomationCandidateCanceled:   "%s 已取消",
+	AutomationCandidateSelected:   "已选择 %s，通过验证 %d/%d 个候选。",
+	AutomationCandidateFallback:   "没有候选通过本地验证，已回退为手动确认。",
+	BuildDepsDetectFailed:         "依赖检测失败：%s",
+	BuildTestsDetectFailed:        "测试检测失败：%s",
+	BuildDepsExecError:            "安装依赖时出错：%s",
+	BuildDepsExecFailed:           "依赖安装失败：\n%s",
+	BuildDepsSkipped:              "已跳过依赖安装和测试。准备好后可手动运行。",
+	BuildTestsSkipped:             "已跳过测试。准备好后可手动运行。",
+	ExecDepsLabel:                 "依赖安装",
+	ExecTestsLabel:                "测试",
+	ExecStarted:                   "正在执行%s",
+	ExecFinished:                  "%s已完成",
+	ExecCommand:                   "命令：%s",
+	ExecExitCode:                  "退出码：%d",
+	ExecDuration:                  "耗时：%s",
+	ExecOutput:                    "输出：%s",
+	RestoredSessionPrefix:         "已恢复上次会话",
+	RestoredSessionNotice:         "%s（%d 条消息）。使用 /clear 可重新开始。",
+	NoCompactedMemoryNotice:       "还没有压缩记忆。当前对话仍在活动上下文窗口内。",
+	MemoryRestoredAt:              "%s，时间：%s。",
 
 	CostSession:      "本次费用",
 	CostMonth:        "本月累计",
@@ -313,14 +514,15 @@ var zh = Messages{
 	ProgressReviewApplied:  "应用了 %d 个来自 %s 审查的修复",
 	ProgressCrossModel:     "%s 生成代码，%s 审查",
 
-	ErrNoModel:    "未配置 AI 模型。请先运行 'makewand setup'。",
-	ErrNoAPIKey:   "未设置 %s 的 API 密钥。用 'makewand setup' 或环境变量设置。",
-	ErrBuildFail:  "构建失败",
-	ErrTestFail:   "测试失败",
-	ErrAutofix:    "不要慌！让我来分析和修复...",
-	ErrFileWrite:  "写入 %s 失败: %s",
-	ErrMaxRetries: "自动修复在 %d 次尝试后失败，请手动修复。",
-	ErrCancelled:  "操作已取消",
+	ErrNoModel:     "未配置 AI 模型。请先运行 'makewand setup'。",
+	ErrNoAPIKey:    "未设置 %s 的 API 密钥。用 'makewand setup' 或环境变量设置。",
+	ErrBuildFail:   "构建失败",
+	ErrTestFail:    "测试失败",
+	ErrAutofix:     "不要慌！让我来分析和修复...",
+	ErrFileWrite:   "写入 %s 失败: %s",
+	ErrFileRefresh: "刷新项目文件失败: %s",
+	ErrMaxRetries:  "自动修复在 %d 次尝试后失败，请手动修复。",
+	ErrCancelled:   "操作已取消",
 
 	FileTreeTitle: "项目文件",
 	FileTreeEmpty: "（暂无文件）",
@@ -332,13 +534,12 @@ var zh = Messages{
 
 	FallbackNotice: "%s 不可用，已切换到 %s",
 
-	ModeFree:     "免费",
-	ModeEconomy:  "经济",
+	ModeFast:     "快速",
 	ModeBalanced: "平衡",
 	ModePower:    "强劲",
 	ModeLabel:    "模式",
 	ModeChanged:  "模式：%s",
-	ModeHelp:     "/mode [free|economy|balanced|power]",
+	ModeHelp:     "/model [fast|balanced|power]",
 
 	SetupWelcome:  "欢迎使用 makewand！让我们配置 AI 模型。",
 	SetupAPIKey:   "输入你的 %s API 密钥（按回车跳过）：",

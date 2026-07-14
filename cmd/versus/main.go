@@ -339,7 +339,7 @@ func runMakewand() result {
 	// Phase 2: Review (gemini — cross-model)
 	reviewProvider := router.BuildProviderFor(model.PhaseReview)
 	if reviewProvider == codeResult.Actual {
-		for _, fb := range []string{"gemini", "codex", "ollama", "claude"} {
+		for _, fb := range []string{"gemini", "codex", "claude"} {
 			if fb != codeResult.Actual {
 				reviewProvider = fb
 				break

@@ -1,0 +1,31 @@
+version: "2"
+linters:
+  # errcheck, govet, ineffassign, staticcheck, and unused are enabled by default
+  # in golangci-lint v2; gocritic and gosec are added on top (matching the prior
+  # v1 config's intent).
+  enable:
+    - gocritic
+    - gosec
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - benchmarks
+      - notes-api
+      - password-strength-checker
+      - top_three_project
+      - blog-project
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

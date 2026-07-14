@@ -75,12 +75,13 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 		a.wizard.SetPhase(WizardPhaseBuild)
 		a.mode = ModeChat
 		a = a.applyBudgetRoutingPolicy()
+		m := i18n.Msg()
 
 		cwd, err := os.Getwd()
 		if err != nil {
 			a.chat.AddMessage(ChatMessage{
 				Role:    "system",
-				Content: fmt.Sprintf("Error getting working directory: %s", err),
+				Content: fmt.Sprintf(m.WizardErrWorkdir, err),
 			})
 			return a, nil
 		}
@@ -95,7 +96,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 		if err != nil {
 			a.chat.AddMessage(ChatMessage{
 				Role:    "system",
-				Content: fmt.Sprintf("Error creating project: %s", err),
+				Content: fmt.Sprintf(m.WizardErrProject, err),
 			})
 			return a, nil
 		}
@@ -104,16 +105,14 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 		if err := proj.GitInit(context.Background()); err != nil {
 			a.chat.AddMessage(ChatMessage{
 				Role:    "system",
-				Content: fmt.Sprintf("Warning: git init failed: %s", err),
+				Content: fmt.Sprintf(m.WizardWarnGitInit, err),
 			})
 		}
 
 		a.chat.AddMessage(ChatMessage{
 			Role:    "status",
-			Content: fmt.Sprintf("Created project: %s", proj.Name),
+			Content: fmt.Sprintf(m.WizardProjectMade, proj.Name),
 		})
-
-		m := i18n.Msg()
 		a.progress.SetSteps([]ProgressStep{
 			{Label: m.ProgressAnalyzing, Status: StepDone},
 			{Label: m.ProgressCreating, Status: StepRunning},
@@ -121,6 +120,14 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			{Label: m.ProgressInstallingDeps, Status: StepPending},
 			{Label: m.ProgressTesting, Status: StepPending},
 		})
+		if a.shouldUseAutopilotCandidates() {
+			a.activity.Start()
+			a.activity.SetPhase(chatActivityWaiting, "", "", false, m.AutomationCandidateStarted)
+			a.chat.AddMessage(ChatMessage{
+				Role:    "status",
+				Content: m.AutomationCandidateStarted,
+			})
+		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		a.cancelAI = cancel
@@ -136,6 +143,22 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			}
 
 			messages := []model.Message{{Role: "user", Content: prompt}}
+
+			if a.shouldUseAutopilotCandidates() {
+				selection := runCandidateSelectionWithActivity(ctx, a.activity, router, proj, model.PhaseCode, messages, wizardBuildSystemPrompt)
+				if strings.TrimSpace(selection.content) == "" {
+					return aiResponseMsg{err: fmt.Errorf("no candidate provider produced writable project files")}
+				}
+				return aiResponseMsg{
+					content:       selection.content,
+					provider:      selection.provider,
+					cost:          selection.usage.Cost,
+					inputTokens:   selection.usage.InputTokens,
+					outputTokens:  selection.usage.OutputTokens,
+					verified:      selection.verified,
+					selectionNote: selection.selectionNote,
+				}
+			}
 
 			// Use ChatBest: Power mode runs ensemble+judge; others use primary provider.
 			if router.ModeSet() {

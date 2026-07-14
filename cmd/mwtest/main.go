@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/model"
 )
 
@@ -49,7 +50,7 @@ func main() {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config load error: %v\n", err)
+		diag.Stderr().ErrorErr("config load failed", err)
 		os.Exit(1)
 	}
 
@@ -58,7 +59,7 @@ func main() {
 		name string
 		mode model.UsageMode
 	}{
-		{"free", model.ModeFree},
+		{"fast", model.ModeFast},
 		{"balanced", model.ModeBalanced},
 		{"power", model.ModePower},
 	}
@@ -136,7 +137,7 @@ func runTest(router *model.Router, tc testCase, timeout time.Duration) {
 	start := time.Now()
 	content, usage, result, err := router.Chat(ctx, tc.task, []model.Message{
 		{Role: "user", Content: tc.prompt},
-	}, "You are a helpful assistant for non-programmers.")
+	}, "You are a helpful coding assistant.")
 	elapsed := time.Since(start)
 
 	if err != nil {
