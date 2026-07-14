@@ -139,6 +139,8 @@ type httpErrorBody struct {
 	Code    string `json:"code"`
 }
 
+const maxHTTPJSONBodyBytes = 10 << 20 // 10 MiB
+
 // HTTPHandlerOptions configures the HTTP facade behavior.
 type HTTPHandlerOptions struct {
 	// BearerToken enables authentication when non-empty.
@@ -290,10 +292,11 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 	}
 
 	var responsesReq httpResponsesRequest
-	if err := json.NewDecoder(req.Body).Decode(&responsesReq); err != nil {
-		auditEvent.Status = http.StatusBadRequest
-		auditEvent.Error = "invalid JSON: " + err.Error()
-		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+	if err := decodeLimitedHTTPJSON(w, req, &responsesReq); err != nil {
+		status, code, message := httpJSONDecodeError(err)
+		auditEvent.Status = status
+		auditEvent.Error = message
+		writeHTTPError(w, status, code, message)
 		return
 	}
 	usageEntry.RequestedMode = strings.ToLower(strings.TrimSpace(responsesReq.Mode))
@@ -465,10 +468,11 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	}
 
 	var chatReq httpChatRequest
-	if err := json.NewDecoder(req.Body).Decode(&chatReq); err != nil {
-		auditEvent.Status = http.StatusBadRequest
-		auditEvent.Error = "invalid JSON: " + err.Error()
-		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+	if err := decodeLimitedHTTPJSON(w, req, &chatReq); err != nil {
+		status, code, message := httpJSONDecodeError(err)
+		auditEvent.Status = status
+		auditEvent.Error = message
+		writeHTTPError(w, status, code, message)
 		return
 	}
 	auditEvent.RequestedMode = strings.ToLower(strings.TrimSpace(chatReq.Mode))
@@ -1077,6 +1081,19 @@ func writeHTTPError(w http.ResponseWriter, status int, code, message string) {
 			Code:    code,
 		},
 	})
+}
+
+func decodeLimitedHTTPJSON(w http.ResponseWriter, req *http.Request, dest any) error {
+	req.Body = http.MaxBytesReader(w, req.Body, maxHTTPJSONBodyBytes)
+	return json.NewDecoder(req.Body).Decode(dest)
+}
+
+func httpJSONDecodeError(err error) (int, string, string) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("request body exceeds %d bytes limit", maxErr.Limit)
+	}
+	return http.StatusBadRequest, "invalid_request", "invalid JSON: " + err.Error()
 }
 
 func containsString(values []string, target string) bool {

@@ -406,8 +406,9 @@ func (r *Router) HandleUserRegistration(userStore UserManager) http.HandlerFunc 
 		}
 
 		var regReq UserRegistrationRequest
-		if err := json.NewDecoder(req.Body).Decode(&regReq); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+		if err := decodeLimitedHTTPJSON(w, req, &regReq); err != nil {
+			status, code, message := httpJSONDecodeError(err)
+			writeHTTPError(w, status, code, message)
 			return
 		}
 
@@ -473,8 +474,9 @@ func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.
 		}
 
 		var loginReq UserLoginRequest
-		if err := json.NewDecoder(req.Body).Decode(&loginReq); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+		if err := decodeLimitedHTTPJSON(w, req, &loginReq); err != nil {
+			status, code, message := httpJSONDecodeError(err)
+			writeHTTPError(w, status, code, message)
 			return
 		}
 		key := serverauth.LoginThrottleKey(req, loginReq.Email)

@@ -174,6 +174,49 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 	return p
 }
 
+// --- Agy CLI (Antigravity) ---
+
+// NewAgyCLI creates a provider that uses `agy --print` (Antigravity CLI).
+//
+// As of June 2026 Google retired the individual-account OAuth path for the old
+// `gemini` CLI; personal Gemini subscriptions now flow exclusively through the
+// Antigravity CLI (`agy`). This provider is registered under the logical name
+// "gemini" so it slots into the existing gemini strategy-table entries, but its
+// transport is agy — the `gemini -p` metered API path is intentionally not used.
+//
+// Model selection is deliberately left to agy's own configured default (set via
+// agy's `/model` UI) rather than forced with --model: agy's model list mixes
+// Gemini, Claude, and GPT models drawn from *different* quota groups, and forcing
+// a makewand tier model id (e.g. "gemini-2.5-flash", which agy does not know)
+// would either error or silently cross pools. Override with MAKEWAND_AGY_MODEL.
+func NewAgyCLI(binPath string) *CLIProvider {
+	p := &CLIProvider{
+		name:     "agy-cli",
+		binPath:  binPath,
+		provider: "gemini",
+	}
+	buildArgs := func(prompt string) []string {
+		args := []string{"--print", "--sandbox", prompt}
+		if m := strings.TrimSpace(os.Getenv("MAKEWAND_AGY_MODEL")); m != "" {
+			args = append([]string{"--model", m}, args...)
+		}
+		return args
+	}
+	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		//nolint:gosec // G204: binPath is a resolved trusted CLI; args are internally built, not user-tainted (same pattern as the other providers).
+		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
+	}
+	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		//nolint:gosec // G204: see buildCmd above.
+		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
+	}
+	p.checkCmd = func(ctx context.Context) *exec.Cmd {
+		// `agy models` exits 0 only when signed in — doubles as an auth probe.
+		return exec.CommandContext(ctx, binPath, "models")
+	}
+	return p
+}
+
 // --- Codex CLI ---
 
 // NewCodexCLI creates a provider that uses `codex exec` (Codex CLI).
@@ -1001,11 +1044,50 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 	if errMsg == "" {
 		errMsg = runErr.Error()
 	}
+	// Subscription CLIs surface quota exhaustion as a non-zero exit with a
+	// usage-limit message on stderr, not an HTTP 429 (that path only exists for
+	// the API transports). Classify these as ErrorKindRateLimit so the quota
+	// layer seals the pool until its window resets, instead of only tripping the
+	// circuit breaker after repeated failures.
+	if looksLikeQuotaExhaustion(errMsg) {
+		return newProviderError(provider, "CLI", ErrorKindRateLimit, true, 429, errMsg, runErr)
+	}
 	base := newProviderError(provider, "CLI", ErrorKindProvider, false, 0, errMsg, runErr)
 	if looksTransient(errMsg) {
 		return &TransientCLIError{Err: newProviderError(provider, "CLI", ErrorKindNetwork, true, 0, errMsg, runErr)}
 	}
 	return base
+}
+
+// quotaExhaustionHints are substrings (lower-cased) that subscription CLIs emit
+// when a session/weekly limit is hit. Kept broad on purpose: the exact wording
+// is vendor-controlled and undocumented, and a false positive only costs a
+// temporary reroute to another pool (recoverable), whereas a miss leaves the
+// exhausted pool active. Word-boundary-ish phrases avoid matching unrelated text
+// (e.g. a user prompt that merely contains "quota").
+var quotaExhaustionHints = []string{
+	"usage limit",
+	"rate limit",
+	"quota exceeded",
+	"quota exhausted",
+	"out of quota",
+	"insufficient_quota",
+	"too many requests",
+	"resets at",
+	"limit reached",
+	"429",
+}
+
+// looksLikeQuotaExhaustion reports whether a CLI error message indicates the
+// subscription's quota/rate limit was hit (as opposed to a generic failure).
+func looksLikeQuotaExhaustion(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, hint := range quotaExhaustionHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksTransient checks if an error message matches known transient patterns.

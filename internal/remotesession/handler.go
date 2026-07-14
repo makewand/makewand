@@ -136,11 +136,17 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			_, _ = w.Write(data)
 			event.Status = http.StatusOK
 		case http.MethodPut:
-			data, err := io.ReadAll(io.LimitReader(req.Body, maxSessionPayloadBytes))
+			data, err := io.ReadAll(io.LimitReader(req.Body, maxSessionPayloadBytes+1))
 			if err != nil {
 				event.Status = http.StatusBadRequest
 				event.Error = err.Error()
 				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if len(data) > maxSessionPayloadBytes {
+				event.Status = http.StatusRequestEntityTooLarge
+				event.Error = "session payload too large"
+				http.Error(w, "session payload too large", http.StatusRequestEntityTooLarge)
 				return
 			}
 			if err := store.Save(workspaceID, data); err != nil {
