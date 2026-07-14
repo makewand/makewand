@@ -1,0 +1,22 @@
+version: "3.9"
+services:
+  makewand:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ../var/makewand:/srv/makewand/data
+    command:
+      - serve
+      - --listen
+      - 0.0.0.0:8080
+      - --enable-users
+      - --data-dir
+      - /srv/makewand/data
+      - --auth-config
+      - /srv/makewand/data/server_auth.json
+

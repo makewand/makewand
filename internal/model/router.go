@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -25,13 +26,35 @@ func NewRouter(cfg *config.Config) *Router {
 
 	rc.Providers = make(map[string]ProviderEntry)
 
+	if config.HasRemoteBackend() {
+		rc.Providers["remote"] = ProviderEntry{
+			Provider: NewRemoteHTTP(config.RemoteBaseURL(), config.RemoteToken()),
+			Access:   AccessAPI,
+		}
+		return NewRouterFromConfig(rc)
+	}
+
+	// agy (Antigravity CLI) takes the "gemini" slot when installed: personal
+	// Gemini subscriptions no longer flow through `gemini -p` (metered API).
+	hasAgy := false
+	for _, cli := range cfg.CLIs {
+		if cli.Name == "agy" {
+			hasAgy = true
+			break
+		}
+	}
+
 	// Register CLI-based providers first (subscription — preferred)
 	for _, cli := range cfg.CLIs {
 		switch cli.Name {
 		case "claude":
 			rc.Providers["claude"] = ProviderEntry{Provider: NewClaudeCLI(cli.BinPath), Access: AccessSubscription}
 		case "gemini":
-			rc.Providers["gemini"] = ProviderEntry{Provider: NewGeminiCLI(cli.BinPath), Access: AccessSubscription}
+			if !hasAgy {
+				rc.Providers["gemini"] = ProviderEntry{Provider: NewGeminiCLI(cli.BinPath), Access: AccessSubscription}
+			}
+		case "agy":
+			rc.Providers["gemini"] = ProviderEntry{Provider: NewAgyCLI(cli.BinPath), Access: AccessSubscription}
 		case "codex":
 			rc.Providers["codex"] = ProviderEntry{Provider: NewCodexCLI(cli.BinPath), Access: AccessSubscription}
 		}
@@ -77,7 +100,20 @@ func NewRouter(cfg *config.Config) *Router {
 		}
 	}
 
+	// Subscription-quota awareness: attach a snapshotter so routing can steer by
+	// remaining headroom. NewRouterFromConfig — used by tests and library
+	// embedders — stays quota-free unless they opt in.
+	snap := NewDefaultQuotaSnapshotter(0)
+	rc.Quota = snap
+
 	r := NewRouterFromConfig(rc)
+
+	// Populate the first snapshot once, off the startup path (the Claude source
+	// makes a network call). This is a one-shot goroutine that terminates — no
+	// long-lived ticker — so repeated NewRouter calls (e.g. eval/bench loops)
+	// don't leak background refreshers. Long-running servers that want periodic
+	// refresh call snap.Start(ctx) with a cancellable context of their own.
+	go snap.Refresh(context.Background())
 
 	// Apply explicit access type overrides from config (may override subscription defaults).
 	if cfg.ClaudeAccess != "" {
@@ -113,6 +149,11 @@ func NewRouter(cfg *config.Config) *Router {
 		return nil, fmt.Errorf("codex not configured")
 	})
 	_ = RegisterProviderFactory("gemini", func(modelID string) (Provider, error) {
+		// Prefer agy (Antigravity) — the current transport for personal Gemini
+		// subscriptions — over the metered `gemini -p` / API key paths.
+		if cli := cfg.GetCLI("agy"); cli != nil {
+			return NewAgyCLI(cli.BinPath), nil
+		}
 		if cli := cfg.GetCLI("gemini"); cli != nil {
 			return NewGeminiCLI(cli.BinPath), nil
 		}

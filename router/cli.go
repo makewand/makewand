@@ -174,6 +174,49 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 	return p
 }
 
+// --- Agy CLI (Antigravity) ---
+
+// NewAgyCLI creates a provider that uses `agy --print` (Antigravity CLI).
+//
+// As of June 2026 Google retired the individual-account OAuth path for the old
+// `gemini` CLI; personal Gemini subscriptions now flow exclusively through the
+// Antigravity CLI (`agy`). This provider is registered under the logical name
+// "gemini" so it slots into the existing gemini strategy-table entries, but its
+// transport is agy — the `gemini -p` metered API path is intentionally not used.
+//
+// Model selection is deliberately left to agy's own configured default (set via
+// agy's `/model` UI) rather than forced with --model: agy's model list mixes
+// Gemini, Claude, and GPT models drawn from *different* quota groups, and forcing
+// a makewand tier model id (e.g. "gemini-2.5-flash", which agy does not know)
+// would either error or silently cross pools. Override with MAKEWAND_AGY_MODEL.
+func NewAgyCLI(binPath string) *CLIProvider {
+	p := &CLIProvider{
+		name:     "agy-cli",
+		binPath:  binPath,
+		provider: "gemini",
+	}
+	buildArgs := func(prompt string) []string {
+		args := []string{"--print", "--sandbox", prompt}
+		if m := strings.TrimSpace(os.Getenv("MAKEWAND_AGY_MODEL")); m != "" {
+			args = append([]string{"--model", m}, args...)
+		}
+		return args
+	}
+	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		//nolint:gosec // G204: binPath is a resolved trusted CLI; args are internally built, not user-tainted (same pattern as the other providers).
+		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
+	}
+	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		//nolint:gosec // G204: see buildCmd above.
+		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
+	}
+	p.checkCmd = func(ctx context.Context) *exec.Cmd {
+		// `agy models` exits 0 only when signed in — doubles as an auth probe.
+		return exec.CommandContext(ctx, binPath, "models")
+	}
+	return p
+}
+
 // --- Codex CLI ---
 
 // NewCodexCLI creates a provider that uses `codex exec` (Codex CLI).
@@ -190,16 +233,33 @@ func NewCodexCLI(binPath string) *CLIProvider {
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
 		// Use dedicated review subcommand for review tasks.
 		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
-			return exec.CommandContext(ctx, binPath, "review", "--uncommitted")
+			args := []string{"review", "--uncommitted"}
+			return exec.CommandContext(ctx, binPath, args...)
 		}
 		// Default: exec with JSON output for structured usage data.
-		return exec.CommandContext(ctx, binPath, "exec", "--json", "--skip-git-repo-check", prompt)
+		args := []string{
+			"exec",
+			"--sandbox", codexSandboxMode(ctx),
+			"--ephemeral",
+			"--json",
+			"--skip-git-repo-check",
+			prompt,
+		}
+		return exec.CommandContext(ctx, binPath, args...)
 	}
 	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
 		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
-			return exec.CommandContext(ctx, binPath, "review", "--uncommitted")
+			args := []string{"review", "--uncommitted"}
+			return exec.CommandContext(ctx, binPath, args...)
 		}
-		return exec.CommandContext(ctx, binPath, "exec", "--skip-git-repo-check", prompt)
+		args := []string{
+			"exec",
+			"--sandbox", codexSandboxMode(ctx),
+			"--ephemeral",
+			"--skip-git-repo-check",
+			prompt,
+		}
+		return exec.CommandContext(ctx, binPath, args...)
 	}
 	p.checkCmd = func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, binPath, "--version")
@@ -328,6 +388,7 @@ func (c *CLIProvider) softPassProbeTimeout() bool {
 
 func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	var prompt string
+	validationPrompt := buildCLIValidationPrompt(messages)
 	if c.systemFlag != "" && system != "" {
 		// Pass system prompt via dedicated CLI flag (proper system role).
 		prompt = buildCLIPrompt(messages, "")
@@ -346,7 +407,7 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 	attempts := 0
 	for {
 		attempts++
-		content, jsonUsage, err := c.chatAttempt(ctx, prompt)
+		content, jsonUsage, err := c.chatAttempt(ctx, prompt, validationPrompt)
 		if err == nil {
 			var usage Usage
 			if jsonUsage != nil {
@@ -415,6 +476,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 		buildCmd = c.buildCmd
 	}
 	cmd := buildCmd(ctx, prompt)
+	applyCLIWorkDir(ctx, cmd)
 	setCLIProcessGroup(cmd)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -745,8 +807,28 @@ func shouldSurfaceContextError(ctxErr error) bool {
 	return errors.Is(ctxErr, context.DeadlineExceeded)
 }
 
-func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, *Usage, error) {
+func applyCLIWorkDir(ctx context.Context, cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	if dir, ok := WorkDirFromContext(ctx); ok {
+		cmd.Dir = dir
+	}
+}
+
+func codexSandboxMode(ctx context.Context) string {
+	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		return "read-only"
+	}
+	if _, ok := WorkDirFromContext(ctx); ok {
+		return "workspace-write"
+	}
+	return "read-only"
+}
+
+func (c *CLIProvider) chatAttempt(ctx context.Context, prompt, validationPrompt string) (string, *Usage, error) {
 	cmd := c.buildCmd(ctx, prompt)
+	applyCLIWorkDir(ctx, cmd)
 	setCLIProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
@@ -782,7 +864,7 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, *
 	if c.jsonOutput && c.parseJSONResponse != nil {
 		content, usage, err := c.parseJSONResponse(raw)
 		if err == nil && content != "" {
-			if reject, reason := shouldRejectCLIOutput(prompt, content); reject {
+			if reject, reason := shouldRejectCLIOutput(validationPrompt, content); reject {
 				return "", nil, newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
 			}
 			return content, usage, nil
@@ -792,7 +874,7 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt string) (string, *
 
 	content := strings.TrimSpace(string(raw))
 	content = stripANSI(content)
-	if reject, reason := shouldRejectCLIOutput(prompt, content); reject {
+	if reject, reason := shouldRejectCLIOutput(validationPrompt, content); reject {
 		return "", nil, newProviderError(c.provider, "CLI output", ErrorKindConfig, false, 0, reason, nil)
 	}
 	return content, nil, nil
@@ -835,7 +917,11 @@ func looksLikePermissionMetaResponse(lower string) bool {
 		strings.Contains(lower, "the file has been written to") ||
 		strings.Contains(lower, "here's a summary of the implementation") ||
 		strings.Contains(lower, "it seems write permissions are being blocked") ||
-		strings.Contains(lower, "cannot write files in this environment")
+		strings.Contains(lower, "cannot write files in this environment") ||
+		strings.Contains(lower, "the listed files are not in") ||
+		strings.Contains(lower, "locating the actual project directory") ||
+		strings.Contains(lower, "locating the project directory") ||
+		strings.Contains(lower, "read the implementation and tests there")
 }
 
 func looksLikeCodeOnlyPrompt(prompt string) bool {
@@ -896,7 +982,7 @@ func containsLikelyCode(content string) bool {
 		}
 		// Keep this secondary heuristic strict; bullet summaries often contain
 		// braces for examples (for example "{429,503}") but are not code.
-		if strings.Contains(l, "=>") || strings.Contains(l, ";") {
+		if strings.Contains(l, "=>") {
 			return true
 		}
 	}
@@ -958,11 +1044,50 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 	if errMsg == "" {
 		errMsg = runErr.Error()
 	}
+	// Subscription CLIs surface quota exhaustion as a non-zero exit with a
+	// usage-limit message on stderr, not an HTTP 429 (that path only exists for
+	// the API transports). Classify these as ErrorKindRateLimit so the quota
+	// layer seals the pool until its window resets, instead of only tripping the
+	// circuit breaker after repeated failures.
+	if looksLikeQuotaExhaustion(errMsg) {
+		return newProviderError(provider, "CLI", ErrorKindRateLimit, true, 429, errMsg, runErr)
+	}
 	base := newProviderError(provider, "CLI", ErrorKindProvider, false, 0, errMsg, runErr)
 	if looksTransient(errMsg) {
 		return &TransientCLIError{Err: newProviderError(provider, "CLI", ErrorKindNetwork, true, 0, errMsg, runErr)}
 	}
 	return base
+}
+
+// quotaExhaustionHints are substrings (lower-cased) that subscription CLIs emit
+// when a session/weekly limit is hit. Kept broad on purpose: the exact wording
+// is vendor-controlled and undocumented, and a false positive only costs a
+// temporary reroute to another pool (recoverable), whereas a miss leaves the
+// exhausted pool active. Word-boundary-ish phrases avoid matching unrelated text
+// (e.g. a user prompt that merely contains "quota").
+var quotaExhaustionHints = []string{
+	"usage limit",
+	"rate limit",
+	"quota exceeded",
+	"quota exhausted",
+	"out of quota",
+	"insufficient_quota",
+	"too many requests",
+	"resets at",
+	"limit reached",
+	"429",
+}
+
+// looksLikeQuotaExhaustion reports whether a CLI error message indicates the
+// subscription's quota/rate limit was hit (as opposed to a generic failure).
+func looksLikeQuotaExhaustion(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, hint := range quotaExhaustionHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksTransient checks if an error message matches known transient patterns.
@@ -1005,6 +1130,20 @@ func buildCLIPrompt(messages []Message, system string) string {
 	}
 
 	return strings.TrimSpace(b.String())
+}
+
+func buildCLIValidationPrompt(messages []Message) string {
+	var parts []string
+	for _, m := range messages {
+		if strings.TrimSpace(m.Content) == "" {
+			continue
+		}
+		if m.Role != "user" {
+			continue
+		}
+		parts = append(parts, m.Content)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
 // estimateTokens provides a rough token count using a word/rune hybrid.

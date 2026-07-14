@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
 )
 
@@ -56,6 +57,32 @@ func TestSanitizeHeadlessContent_NonCodePromptUnchanged(t *testing.T) {
 	got := sanitizeHeadlessContent("explain this", model.TaskExplain, raw)
 	if got != raw {
 		t.Fatalf("sanitizeHeadlessContent() = %q, want unchanged %q", got, raw)
+	}
+}
+
+func TestBuildHeadlessSystemPrompt_IncludesProjectContext(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/demo\n\ngo 1.23\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(go.mod): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go): %v", err)
+	}
+
+	project, err := engine.OpenProject(tmp)
+	if err != nil {
+		t.Fatalf("OpenProject(): %v", err)
+	}
+
+	got := buildHeadlessSystemPrompt(project, model.TaskCode, model.ModeBalanced, "Implement feature in main.go and return only code.")
+	if !strings.Contains(got, "Current project:") {
+		t.Fatalf("buildHeadlessSystemPrompt() missing project header:\n%s", got)
+	}
+	if !strings.Contains(got, "Project files:") {
+		t.Fatalf("buildHeadlessSystemPrompt() missing project tree:\n%s", got)
+	}
+	if !strings.Contains(got, "Headless mode rules:") {
+		t.Fatalf("buildHeadlessSystemPrompt() missing headless rules:\n%s", got)
 	}
 }
 

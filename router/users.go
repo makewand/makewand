@@ -10,9 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverteam"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -21,6 +24,13 @@ var (
 	ErrUserExists = errors.New("user already exists")
 	// ErrUserNotFound indicates no stored user matched the requested email.
 	ErrUserNotFound = errors.New("user not found")
+	// ErrInvalidUserRole indicates an unsupported role value.
+	ErrInvalidUserRole = errors.New("invalid user role")
+)
+
+const (
+	UserRoleMember = "member"
+	UserRoleAdmin  = "admin"
 )
 
 // User represents a registered user in the system.
@@ -29,9 +39,20 @@ type User struct {
 	Email        string    `json:"email"`
 	PasswordHash string    `json:"password_hash"`
 	Salt         string    `json:"salt"`
+	Role         string    `json:"role,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	IsActive     bool      `json:"is_active"`
+}
+
+// UserView is the safe operator-facing representation of a stored user.
+type UserView struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	IsActive  bool      `json:"is_active"`
 }
 
 // UserRegistrationRequest represents the registration request payload.
@@ -44,8 +65,39 @@ type UserRegistrationRequest struct {
 type UserRegistrationResponse struct {
 	ID        string    `json:"id"`
 	Email     string    `json:"email"`
+	Role      string    `json:"role"`
 	CreatedAt time.Time `json:"created_at"`
 	Message   string    `json:"message"`
+}
+
+// UserLoginRequest represents a password-based login request.
+type UserLoginRequest struct {
+	Email          string `json:"email"`
+	Password       string `json:"password"`
+	OrganizationID string `json:"organization_id,omitempty"`
+	ProjectID      string `json:"project_id,omitempty"`
+}
+
+// UserLoginResponse returns a newly issued bearer token for the user.
+type UserLoginResponse struct {
+	Token     string                   `json:"token"`
+	TokenID   string                   `json:"token_id"`
+	ExpiresAt time.Time                `json:"expires_at,omitempty"`
+	Scopes    []string                 `json:"scopes"`
+	User      UserView                 `json:"user"`
+	Rule      serverauth.TokenRuleView `json:"rule"`
+}
+
+// UserManager is the storage contract required by registration, login, and admin user management.
+type UserManager interface {
+	CreateUser(email, password string) (*User, error)
+	CreateUserWithRole(email, password, role string) (*User, error)
+	GetUserByID(userID string) (*User, error)
+	GetUserByEmail(email string) (*User, error)
+	ListUsers() ([]UserView, error)
+	SetUserActive(userID string, active bool) (*User, error)
+	SetUserRole(userID, role string) (*User, error)
+	SetUserPassword(userID, password string) (*User, error)
 }
 
 // UserStore manages user data persistence.
@@ -84,6 +136,14 @@ func (us *UserStore) loadUsers() (map[string]*User, error) {
 	if err := json.Unmarshal(data, &users); err != nil {
 		return nil, fmt.Errorf("parse users file: %w", err)
 	}
+	for _, user := range users {
+		if user == nil {
+			continue
+		}
+		if user.Role == "" {
+			user.Role = UserRoleMember
+		}
+	}
 
 	return users, nil
 }
@@ -109,9 +169,18 @@ func (us *UserStore) saveUsers(users map[string]*User) error {
 
 // CreateUser creates a new user account.
 func (us *UserStore) CreateUser(email, password string) (*User, error) {
+	return us.CreateUserWithRole(email, password, UserRoleMember)
+}
+
+// CreateUserWithRole creates a new user account with an explicit role.
+func (us *UserStore) CreateUserWithRole(email, password, role string) (*User, error) {
 	users, err := us.loadUsers()
 	if err != nil {
 		return nil, fmt.Errorf("load users: %w", err)
+	}
+	role, err = normalizeUserRole(role)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check if user already exists
@@ -131,6 +200,7 @@ func (us *UserStore) CreateUser(email, password string) (*User, error) {
 		Email:        strings.ToLower(email),
 		PasswordHash: passwordHash,
 		Salt:         salt,
+		Role:         role,
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 		IsActive:     true,
@@ -142,6 +212,19 @@ func (us *UserStore) CreateUser(email, password string) (*User, error) {
 		return nil, fmt.Errorf("save users: %w", err)
 	}
 
+	return user, nil
+}
+
+// GetUserByID retrieves a user by ID.
+func (us *UserStore) GetUserByID(userID string) (*User, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
 	return user, nil
 }
 
@@ -161,10 +244,110 @@ func (us *UserStore) GetUserByEmail(email string) (*User, error) {
 	return nil, ErrUserNotFound
 }
 
+// ListUsers returns all users as safe operator-facing views.
+func (us *UserStore) ListUsers() ([]UserView, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	ids := make([]string, 0, len(users))
+	for id := range users {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	views := make([]UserView, 0, len(ids))
+	for _, id := range ids {
+		if user := users[id]; user != nil {
+			views = append(views, user.View())
+		}
+	}
+	return views, nil
+}
+
+// SetUserActive updates a user's active flag.
+func (us *UserStore) SetUserActive(userID string, active bool) (*User, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
+	user.IsActive = active
+	user.UpdatedAt = time.Now().UTC()
+	if err := us.saveUsers(users); err != nil {
+		return nil, fmt.Errorf("save users: %w", err)
+	}
+	return user, nil
+}
+
+// SetUserRole updates a user's role.
+func (us *UserStore) SetUserRole(userID, role string) (*User, error) {
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
+	role, err = normalizeUserRole(role)
+	if err != nil {
+		return nil, err
+	}
+	user.Role = role
+	user.UpdatedAt = time.Now().UTC()
+	if err := us.saveUsers(users); err != nil {
+		return nil, fmt.Errorf("save users: %w", err)
+	}
+	return user, nil
+}
+
+func (us *UserStore) SetUserPassword(userID, password string) (*User, error) {
+	if !isValidPassword(password) {
+		return nil, fmt.Errorf("password must be at least 8 characters long")
+	}
+	users, err := us.loadUsers()
+	if err != nil {
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	user, ok := users[strings.TrimSpace(userID)]
+	if !ok || user == nil {
+		return nil, ErrUserNotFound
+	}
+	user.Salt = generateSalt()
+	user.PasswordHash = hashPassword(password, user.Salt)
+	user.UpdatedAt = time.Now().UTC()
+	if err := us.saveUsers(users); err != nil {
+		return nil, fmt.Errorf("save users: %w", err)
+	}
+	return user, nil
+}
+
 // ValidatePassword checks if the provided password matches the user's password.
 func (u *User) ValidatePassword(password string) bool {
 	expectedHash := hashPassword(password, u.Salt)
 	return subtle.ConstantTimeCompare([]byte(expectedHash), []byte(u.PasswordHash)) == 1
+}
+
+// View returns the sanitized form of a stored user.
+func (u *User) View() UserView {
+	if u == nil {
+		return UserView{}
+	}
+	role := u.Role
+	if role == "" {
+		role = UserRoleMember
+	}
+	return UserView{
+		ID:        u.ID,
+		Email:     u.Email,
+		Role:      role,
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+		IsActive:  u.IsActive,
+	}
 }
 
 // generateSalt creates a random salt for password hashing.
@@ -203,8 +386,19 @@ func isValidPassword(password string) bool {
 	return len(password) >= 8
 }
 
+func normalizeUserRole(role string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "", UserRoleMember:
+		return UserRoleMember, nil
+	case UserRoleAdmin:
+		return UserRoleAdmin, nil
+	default:
+		return "", fmt.Errorf("%w: %q", ErrInvalidUserRole, role)
+	}
+}
+
 // HandleUserRegistration handles POST /v1/users/register requests.
-func (r *Router) HandleUserRegistration(userStore *UserStore) http.HandlerFunc {
+func (r *Router) HandleUserRegistration(userStore UserManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
@@ -212,8 +406,9 @@ func (r *Router) HandleUserRegistration(userStore *UserStore) http.HandlerFunc {
 		}
 
 		var regReq UserRegistrationRequest
-		if err := json.NewDecoder(req.Body).Decode(&regReq); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+		if err := decodeLimitedHTTPJSON(w, req, &regReq); err != nil {
+			status, code, message := httpJSONDecodeError(err)
+			writeHTTPError(w, status, code, message)
 			return
 		}
 
@@ -254,6 +449,7 @@ func (r *Router) HandleUserRegistration(userStore *UserStore) http.HandlerFunc {
 		resp := UserRegistrationResponse{
 			ID:        user.ID,
 			Email:     user.Email,
+			Role:      user.Role,
 			CreatedAt: user.CreatedAt,
 			Message:   "User account created successfully",
 		}
@@ -264,28 +460,163 @@ func (r *Router) HandleUserRegistration(userStore *UserStore) http.HandlerFunc {
 	}
 }
 
+// HandleUserLogin handles POST /v1/users/login requests and returns a bearer
+// token issued from the configured server token manager.
+func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.TokenManager, teamStore serverteam.Store, limiter *serverauth.LoginRateLimiter) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
+			return
+		}
+		if userStore == nil || tokenManager == nil {
+			writeHTTPError(w, http.StatusNotFound, "not_found", "user login is unavailable")
+			return
+		}
+
+		var loginReq UserLoginRequest
+		if err := decodeLimitedHTTPJSON(w, req, &loginReq); err != nil {
+			status, code, message := httpJSONDecodeError(err)
+			writeHTTPError(w, status, code, message)
+			return
+		}
+		key := serverauth.LoginThrottleKey(req, loginReq.Email)
+		if allowed, retryAfter := limiter.Allow(key, time.Now().UTC()); !allowed {
+			writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("too many failed logins; try again in %s", retryAfter.Round(time.Second)))
+			return
+		}
+		user, err := userStore.GetUserByEmail(loginReq.Email)
+		if err != nil || user == nil || !user.IsActive || !user.ValidatePassword(loginReq.Password) {
+			limiter.RecordFailure(key, time.Now().UTC())
+			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid email or password")
+			return
+		}
+		limiter.Reset(key)
+
+		expiresAt := time.Now().UTC().Add(24 * time.Hour)
+		rule, err := loginRuleForUser(user, loginReq, teamStore, expiresAt)
+		if err != nil {
+			writeHTTPError(w, http.StatusForbidden, "forbidden", err.Error())
+			return
+		}
+		view, tokenValue, err := tokenManager.Issue(rule)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, "login_failed", "failed to issue login token")
+			return
+		}
+
+		resp := UserLoginResponse{
+			Token:     tokenValue,
+			TokenID:   view.ID,
+			ExpiresAt: view.ExpiresAt,
+			Scopes:    append([]string(nil), view.Scopes...),
+			User:      user.View(),
+			Rule:      view,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func loginRuleForUser(user *User, req UserLoginRequest, teamStore serverteam.Store, expiresAt time.Time) (serverauth.TokenRule, error) {
+	rule := serverauth.TokenRule{
+		ID:          fmt.Sprintf("%s_%d", user.ID, time.Now().UTC().UnixNano()),
+		Description: "user login " + user.Email,
+		UserID:      user.ID,
+		Scopes:      loginScopesForUser(user),
+		ExpiresAt:   expiresAt,
+	}
+	if user != nil && strings.EqualFold(user.Role, UserRoleAdmin) {
+		rule.OrganizationID = strings.TrimSpace(req.OrganizationID)
+		rule.ProjectID = strings.TrimSpace(req.ProjectID)
+		return rule, nil
+	}
+	if teamStore == nil {
+		return rule, nil
+	}
+	projectID := strings.TrimSpace(req.ProjectID)
+	if projectID != "" {
+		projectMembership, err := teamStore.GetProjectMembership(projectID, user.ID)
+		if err != nil || projectMembership == nil || !projectMembership.IsActive {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not an active member of project %q", projectID)
+		}
+		if !serverteam.RoleAtLeast(projectMembership.Role, serverteam.MembershipRoleViewer) {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not allowed to access project %q", projectID)
+		}
+		rule.OrganizationID = projectMembership.OrganizationID
+		rule.ProjectID = projectMembership.ProjectID
+		return rule, nil
+	}
+	orgID := strings.TrimSpace(req.OrganizationID)
+	if orgID != "" {
+		orgMembership, err := teamStore.GetOrganizationMembership(orgID, user.ID)
+		if err != nil || orgMembership == nil || !orgMembership.IsActive {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not an active member of organization %q", orgID)
+		}
+		if !serverteam.RoleAtLeast(orgMembership.Role, serverteam.MembershipRoleViewer) {
+			return serverauth.TokenRule{}, fmt.Errorf("user is not allowed to access organization %q", orgID)
+		}
+		rule.OrganizationID = orgMembership.OrganizationID
+		return rule, nil
+	}
+	projectMemberships, err := teamStore.ListProjectMemberships("", user.ID)
+	if err == nil {
+		activeProjects := make([]serverteam.ProjectMembership, 0, len(projectMemberships))
+		for _, membership := range projectMemberships {
+			if membership.IsActive {
+				activeProjects = append(activeProjects, membership)
+			}
+		}
+		if len(activeProjects) == 1 {
+			rule.OrganizationID = activeProjects[0].OrganizationID
+			rule.ProjectID = activeProjects[0].ProjectID
+			return rule, nil
+		}
+		if len(activeProjects) > 1 {
+			return serverauth.TokenRule{}, fmt.Errorf("multiple project memberships found; specify --project-id")
+		}
+	}
+	orgMemberships, err := teamStore.ListOrganizationMemberships("", user.ID)
+	if err == nil {
+		activeOrgs := make([]serverteam.OrganizationMembership, 0, len(orgMemberships))
+		for _, membership := range orgMemberships {
+			if membership.IsActive {
+				activeOrgs = append(activeOrgs, membership)
+			}
+		}
+		if len(activeOrgs) == 1 {
+			rule.OrganizationID = activeOrgs[0].OrganizationID
+			return rule, nil
+		}
+		if len(activeOrgs) > 1 {
+			return serverauth.TokenRule{}, fmt.Errorf("multiple organization memberships found; specify --organization-id or --project-id")
+		}
+	}
+	return serverauth.TokenRule{}, fmt.Errorf("user has no assigned organization or project membership")
+}
+
+func loginScopesForUser(user *User) []string {
+	if user != nil && strings.EqualFold(user.Role, UserRoleAdmin) {
+		return serverauth.AllScopes()
+	}
+	return serverauth.AllClientScopes()
+}
+
 // HTTPHandlerWithUsers returns an http.Handler that includes user registration
 // endpoints in addition to the existing chat completion functionality.
-func (r *Router) HTTPHandlerWithUsers(userStore *UserStore, opts ...HTTPHandlerOptions) http.Handler {
+func (r *Router) HTTPHandlerWithUsers(userStore UserManager, opts ...HTTPHandlerOptions) http.Handler {
 	var opt HTTPHandlerOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	base := r.HTTPHandler(opt)
+	if userStore == nil {
+		return base
+	}
 
 	mux := http.NewServeMux()
-
-	// Existing endpoints
-	mux.HandleFunc("/v1/chat/completions", r.requireAuth(opt.BearerToken, r.handleChatCompletions))
-	mux.HandleFunc("/v1/models", r.requireAuth(opt.BearerToken, r.handleListModels))
-
-	// User management endpoints
 	mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore))
-
-	// Health check (always unauthenticated)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
+	mux.HandleFunc("/v1/users/login", r.HandleUserLogin(userStore, opt.UserTokenManager, opt.TeamStore, opt.UserLoginLimiter))
+	mux.Handle("/", base)
 	return mux
 }

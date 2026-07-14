@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,34 @@ func ContextWithModel(ctx context.Context, modelID string) context.Context {
 func ModelFromContext(ctx context.Context) (string, bool) {
 	m, ok := ctx.Value(modelContextKey{}).(string)
 	return m, ok && m != ""
+}
+
+type usageModeContextKey struct{}
+
+// ContextWithUsageMode returns a new context carrying the requested usage mode.
+// Providers like the remote HTTP adapter use this to preserve client-side mode.
+func ContextWithUsageMode(ctx context.Context, mode UsageMode) context.Context {
+	return context.WithValue(ctx, usageModeContextKey{}, mode)
+}
+
+// UsageModeFromContext retrieves the requested usage mode, if present.
+func UsageModeFromContext(ctx context.Context) (UsageMode, bool) {
+	mode, ok := ctx.Value(usageModeContextKey{}).(UsageMode)
+	return mode, ok
+}
+
+type workDirContextKey struct{}
+
+// ContextWithWorkDir returns a new context carrying an override working
+// directory for CLI providers.
+func ContextWithWorkDir(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, workDirContextKey{}, strings.TrimSpace(dir))
+}
+
+// WorkDirFromContext retrieves the working directory override, if present.
+func WorkDirFromContext(ctx context.Context) (string, bool) {
+	dir, ok := ctx.Value(workDirContextKey{}).(string)
+	return dir, ok && dir != ""
 }
 
 // TaskType categorizes what kind of AI task is being performed.
@@ -142,6 +171,15 @@ type RouterConfig struct {
 	// ConfigDir is the directory for routing.json overrides and stats persistence.
 	// Empty string disables file-based overrides.
 	ConfigDir string
+
+	// Quota, when set, makes routing subscription-quota aware: providers low on
+	// headroom are deprioritized and confirmed-exhausted pools are skipped. Nil
+	// disables quota awareness entirely (routing behaves as before).
+	Quota QuotaController
+
+	// QuotaPolicy overrides the default warn/crit thresholds. Zero value uses
+	// DefaultQuotaPolicy.
+	QuotaPolicy QuotaPolicy
 }
 
 // providerKey is used to cache provider instances by (name, modelID).
@@ -161,6 +199,10 @@ type Router struct {
 	}
 
 	providers map[string]Provider
+
+	// providerAllowlist restricts routing to a subset of providers for
+	// request-scoped views such as remote token policies.
+	providerAllowlist map[string]struct{}
 
 	// Provider cache for mode-based routing (provider+model → instance)
 	providerCache map[providerKey]Provider
@@ -186,6 +228,10 @@ type Router struct {
 
 	traceMu   sync.RWMutex
 	traceSink TraceSink
+
+	// Subscription-quota awareness (nil when disabled).
+	quota       QuotaController
+	quotaPolicy QuotaPolicy
 }
 
 const availCacheTTL = 10 * time.Second
@@ -193,6 +239,11 @@ const availCacheTTL = 10 * time.Second
 // NewRouterFromConfig creates a Router from a config-free RouterConfig.
 // This is the primary constructor for library consumers.
 func NewRouterFromConfig(rc RouterConfig) *Router {
+	if initErr != nil {
+		// Embedded strategy defaults failed to load — should not happen in a
+		// correctly built binary. Log the error so callers can diagnose.
+		fmt.Fprintf(os.Stderr, "router: strategy init error: %v\n", initErr)
+	}
 	if rc.ConfigDir != "" {
 		_ = LoadUserOverrides(rc.ConfigDir)
 	}
@@ -203,6 +254,11 @@ func NewRouterFromConfig(rc RouterConfig) *Router {
 		accessTypes:   make(map[string]AccessType),
 		usage:         newSessionUsage(),
 		breaker:       newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
+		quota:         rc.Quota,
+		quotaPolicy:   rc.QuotaPolicy,
+	}
+	if r.quotaPolicy == (QuotaPolicy{}) {
+		r.quotaPolicy = DefaultQuotaPolicy()
 	}
 
 	r.legacyModels.defaultModel = rc.DefaultModel
@@ -236,15 +292,15 @@ func (r *Router) SetMode(m UsageMode) {
 // SetAccessType sets the access type for a named provider.
 // This is used by the CLI adapter to apply explicit access overrides from config.
 func (r *Router) SetAccessType(name string, access AccessType) {
-	r.mu.Lock()
+	r.providerMu.Lock()
 	r.accessTypes[name] = access
-	r.mu.Unlock()
+	r.providerMu.Unlock()
 }
 
 // getAccessType returns the access type for a named provider (thread-safe).
 func (r *Router) getAccessType(name string) AccessType {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
 	return r.accessTypes[name]
 }
 
@@ -283,6 +339,114 @@ func (r *Router) effectiveMode() UsageMode {
 	return ModeBalanced
 }
 
+func (r *Router) cloneView() *Router {
+	r.providerMu.Lock()
+	providers := make(map[string]Provider, len(r.providers))
+	for name, provider := range r.providers {
+		providers[name] = provider
+	}
+	accessTypes := make(map[string]AccessType, len(r.accessTypes))
+	for name, access := range r.accessTypes {
+		accessTypes[name] = access
+	}
+	providerCache := make(map[providerKey]Provider, len(r.providerCache))
+	for key, provider := range r.providerCache {
+		providerCache[key] = provider
+	}
+	r.providerMu.Unlock()
+
+	r.mu.Lock()
+	cachedAvail := append([]string(nil), r.cachedAvail...)
+	cachedAvailAt := r.cachedAvailAt
+	legacy := r.legacyModels
+	r.mu.Unlock()
+
+	r.modeMu.RLock()
+	mode := r.mode
+	modeSet := r.modeSet
+	r.modeMu.RUnlock()
+
+	r.traceMu.RLock()
+	traceSink := r.traceSink
+	r.traceMu.RUnlock()
+
+	return &Router{
+		legacyModels:      legacy,
+		providers:         providers,
+		providerAllowlist: cloneStringSet(r.providerAllowlist),
+		providerCache:     providerCache,
+		accessTypes:       accessTypes,
+		usage:             r.usage,
+		breaker:           r.breaker,
+		mode:              mode,
+		modeSet:           modeSet,
+		cachedAvail:       cachedAvail,
+		cachedAvailAt:     cachedAvailAt,
+		traceSink:         traceSink,
+	}
+}
+
+// cloneWithMode creates a per-request router view that preserves shared
+// provider state while allowing a different routing mode without mutating
+// the live server router.
+func (r *Router) cloneWithMode(mode UsageMode) *Router {
+	clone := r.cloneView()
+	clone.mode = mode
+	clone.modeSet = true
+	return clone
+}
+
+func (r *Router) cloneWithProviderAllowlist(names []string) *Router {
+	clone := r.cloneView()
+	clone.setProviderAllowlist(names)
+	return clone
+}
+
+func (r *Router) setProviderAllowlist(names []string) {
+	r.providerAllowlist = makeStringSet(names)
+	r.mu.Lock()
+	r.cachedAvail = nil
+	r.cachedAvailAt = time.Time{}
+	r.mu.Unlock()
+}
+
+func (r *Router) isProviderAllowed(name string) bool {
+	if len(r.providerAllowlist) == 0 {
+		return true
+	}
+	_, ok := r.providerAllowlist[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func makeStringSet(values []string) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		out[value] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func cloneStringSet(values map[string]struct{}) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(values))
+	for value := range values {
+		out[value] = struct{}{}
+	}
+	return out
+}
+
 func (r *Router) emitTrace(event TraceEvent) {
 	r.traceMu.RLock()
 	sink := r.traceSink
@@ -307,6 +471,13 @@ func (r *Router) EmitTrace(event TraceEvent) {
 
 // Route selects the best provider for a given task type.
 func (r *Router) Route(task TaskType) (RouteResult, error) {
+	if name, provider, ok := r.remoteOnlyProvider(); ok {
+		return RouteResult{
+			Provider:  provider,
+			Requested: name,
+			Actual:    name,
+		}, nil
+	}
 	if r.ModeSet() {
 		return r.routeByMode(task)
 	}
@@ -782,4 +953,44 @@ func (r *Router) ChatStream(ctx context.Context, task TaskType, messages []Messa
 	}
 
 	return r.routeAndExecuteStream(ac, result, fallbacks, resolve)
+}
+
+// ChatStreamWith streams a response from a specific provider for a build phase.
+// It mirrors ChatWith but preserves streaming semantics for HTTP and remote use.
+func (r *Router) ChatStreamWith(ctx context.Context, name string, phase BuildPhase, messages []Message, system string, exclude ...string) (<-chan StreamChunk, RouteResult, error) {
+	result, err := r.RouteProvider(name, phase, exclude...)
+	if err != nil {
+		return nil, RouteResult{}, err
+	}
+
+	fallbacks, tier := r.chatWithFallbackCandidates(phase, result.Actual, exclude)
+
+	taskForPhase := TaskCode
+	switch phase {
+	case PhaseReview:
+		taskForPhase = TaskReview
+	case PhasePlan:
+		taskForPhase = TaskAnalyze
+	case PhaseFix:
+		taskForPhase = TaskFix
+	}
+
+	ac := &attemptContext{
+		ctx:        ContextWithTask(ctx, taskForPhase),
+		messages:   messages,
+		system:     system,
+		maxTokens:  maxTokensForPhase(phase),
+		phase:      phase,
+		mode:       r.effectiveMode(),
+		requested:  name,
+		phaseLabel: buildPhaseName(phase),
+		labels: attemptLabels{
+			attemptSuccess:  "build_chat_stream_start_success",
+			attemptError:    "build_chat_stream_start_error",
+			fallbackSkipped: "build_chat_stream_fallback_skipped",
+			failedAll:       "build_chat_stream_failed_all",
+		},
+	}
+
+	return r.routeAndExecuteStream(ac, result, fallbacks, r.buildProviderResolver(tier))
 }

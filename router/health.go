@@ -16,6 +16,12 @@ func (r *Router) isCircuitOpen(provider string) (bool, time.Duration) {
 }
 
 func (r *Router) beforeProviderAttempt(provider string) (bool, time.Duration) {
+	// Confirmed-exhaustion quota seal is an unbypassable hard gate: a pool that
+	// returned a real 429/quota error can't serve until its window resets, so
+	// skip it here regardless of which routing path selected it.
+	if blocked, until := r.quotaHardBlocked(provider); blocked {
+		return false, time.Until(until)
+	}
 	if r.breaker == nil {
 		return true, 0
 	}
@@ -34,6 +40,9 @@ func (r *Router) recordProviderFailure(provider string) (bool, time.Time) {
 }
 
 func (r *Router) recordProviderFailureForErr(provider string, callErr error) (bool, time.Time) {
+	// Feed confirmed quota/rate-limit errors back to the quota layer so the pool
+	// is sealed until its window resets, not just circuit-broken for a cooldown.
+	r.noteQuotaError(provider, callErr)
 	if r.breaker == nil {
 		return false, time.Time{}
 	}
@@ -117,7 +126,7 @@ func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) t
 		case PhaseReview:
 			return 40 * time.Second
 		case PhaseFix:
-			return 45 * time.Second
+			return 90 * time.Second
 		default:
 			return 60 * time.Second
 		}
