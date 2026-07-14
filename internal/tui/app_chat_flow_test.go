@@ -155,6 +155,66 @@ func TestSubmitChatInput_NonPowerUsesStreamPath(t *testing.T) {
 	}
 }
 
+func TestSubmitChatInput_AutopilotUsesCandidateSelectionForCodeTasks(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApprovalMode = config.ApprovalModeAuto
+	app := *NewApp(ModeChat, cfg, "")
+	app.project = newCandidateProject(t)
+
+	router := model.NewRouter(cfg)
+	router.SetMode(model.ModeBalanced)
+	alpha := &chatFlowStubProvider{
+		name:        "alpha",
+		chatContent: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a + b\n}\n```\n",
+		chatUsage: model.Usage{
+			Provider: "alpha",
+		},
+		streamErr: fmt.Errorf("stream should not be used in autopilot candidate path"),
+	}
+	bravo := &chatFlowStubProvider{
+		name:        "bravo",
+		chatContent: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n",
+		chatUsage: model.Usage{
+			Provider: "bravo",
+		},
+		streamErr: fmt.Errorf("stream should not be used in autopilot candidate path"),
+	}
+	if err := router.RegisterProvider("alpha", alpha, model.AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider(alpha): %v", err)
+	}
+	if err := router.RegisterProvider("bravo", bravo, model.AccessSubscription); err != nil {
+		t.Fatalf("RegisterProvider(bravo): %v", err)
+	}
+	app.router = router
+
+	m, cmd := app.submitChatInput("write a tiny function")
+	_ = m.(App)
+	if cmd == nil {
+		t.Fatal("submitChatInput returned nil cmd")
+	}
+
+	msg := cmd()
+	resp, ok := msg.(aiResponseMsg)
+	if !ok {
+		t.Fatalf("cmd() returned %T, want aiResponseMsg", msg)
+	}
+	if resp.err != nil {
+		t.Fatalf("aiResponseMsg.err = %v", resp.err)
+	}
+	if !resp.verified {
+		t.Fatal("aiResponseMsg.verified = false, want true")
+	}
+	if resp.provider != "bravo" {
+		t.Fatalf("aiResponseMsg.provider = %q, want %q", resp.provider, "bravo")
+	}
+	if alpha.chatCalls != 1 || bravo.chatCalls != 1 {
+		t.Fatalf("candidate chat calls = (%d, %d), want (1, 1)", alpha.chatCalls, bravo.chatCalls)
+	}
+	if alpha.streamCalls != 0 || bravo.streamCalls != 0 {
+		t.Fatalf("candidate stream calls = (%d, %d), want (0, 0)", alpha.streamCalls, bravo.streamCalls)
+	}
+}
+
 func TestSubmitChatInput_ShowsPreparingActivityImmediately(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
@@ -503,5 +563,68 @@ func TestSubmitChatInput_DenyCommandCancelsPendingFileWrite(t *testing.T) {
 	last := app.chat.messages[len(app.chat.messages)-1]
 	if !strings.Contains(last.Content, "cancel") && !strings.Contains(strings.ToLower(last.Content), "cancel") {
 		t.Fatalf("deny message = %q, want cancellation notice", last.Content)
+	}
+}
+
+func TestConfirmFiles_SlashDenyDoesNotAutoApproveOnTrailingY(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat, _ = app.chat.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	app.state = StateConfirmFiles
+	app.pendingFiles = []engine.ExtractedFile{{Path: "hello.txt", Content: "hello"}}
+	app.setPendingApproval(approvalFileWrite, "Write 1 file?", "Pending write: 1 files")
+
+	for _, r := range []rune{'/', 'd', 'e', 'n', 'y'} {
+		m, _ := app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app = m.(App)
+	}
+
+	if app.state != StateConfirmFiles {
+		t.Fatalf("state = %v, want %v before Enter", app.state, StateConfirmFiles)
+	}
+	if got := app.chat.InputValue(); got != "/deny" {
+		t.Fatalf("input = %q, want %q", got, "/deny")
+	}
+	if len(app.pendingFiles) != 1 {
+		t.Fatalf("pendingFiles = %d, want 1 before Enter", len(app.pendingFiles))
+	}
+
+	m, cmd := app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("slash deny should complete locally without async cmd")
+	}
+	app = m.(App)
+	if app.state != StateIdle {
+		t.Fatalf("state = %v, want %v after Enter", app.state, StateIdle)
+	}
+	if len(app.pendingFiles) != 0 {
+		t.Fatal("pendingFiles should be cleared after /deny")
+	}
+}
+
+func TestConfirmFiles_SlashApproveTriggersApprovalCommand(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat, _ = app.chat.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	app.state = StateConfirmFiles
+	app.pendingFiles = []engine.ExtractedFile{{Path: "hello.txt", Content: "hello"}}
+	app.setPendingApproval(approvalFileWrite, "Write 1 file?", "Pending write: 1 files")
+
+	for _, r := range []rune{'/', 'a', 'p', 'p', 'r', 'o', 'v', 'e'} {
+		m, _ := app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app = m.(App)
+	}
+
+	m, cmd := app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app = m.(App)
+	if cmd == nil {
+		t.Fatal("/approve should return async confirmation cmd")
+	}
+	if app.state != StateIdle {
+		t.Fatalf("state = %v, want %v after Enter", app.state, StateIdle)
+	}
+	msg := cmd()
+	if _, ok := msg.(confirmFileWriteMsg); !ok {
+		t.Fatalf("cmd() returned %T, want confirmFileWriteMsg", msg)
 	}
 }

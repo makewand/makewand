@@ -65,6 +65,54 @@ func TestE2EPrintRoutesByClassifier(t *testing.T) {
 	}
 }
 
+func TestE2EPrintAutopilotUsesVerifiedCandidateSelection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based E2E fixtures are Unix-only")
+	}
+
+	bin := buildMakewandBinary(t)
+	cfgDir := t.TempDir()
+	projectDir := t.TempDir()
+	script := writeCandidateProviderScript(t)
+
+	if err := os.WriteFile(filepath.Join(projectDir, "go.mod"), []byte("module example.com/headlessautopilot\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(go.mod): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "calc.go"), []byte("package headlessautopilot\n\nfunc Multiply(a, b int) int {\n\treturn a + b\n}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(calc.go): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "calc_test.go"), []byte("package headlessautopilot\n\nimport \"testing\"\n\nfunc TestMultiply(t *testing.T) {\n\tif got := Multiply(2, 5); got != 10 {\n\t\tt.Fatalf(\"Multiply(2,5) = %d, want 10\", got)\n\t}\n}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(calc_test.go): %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.ApprovalMode = config.ApprovalModeAuto
+	cfg.UsageMode = "balanced"
+	cfg.CustomProviders = []config.CustomProvider{
+		{Name: "alpha", Command: script, Args: []string{"alpha"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "bravo", Command: script, Args: []string{"bravo"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+	}
+	writeTestConfig(t, cfgDir, cfg)
+	linkToolIntoDir(t, cfgDir, "go")
+
+	stdout, stderr, err := runMakewandInDir(t, projectDir, bin, cfgDir, "--print", "--timeout=30s", "修复 calc.go，让 go test ./... 通过。只修改必要文件。")
+	if err != nil {
+		t.Fatalf("runMakewand(autopilot --print) error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	got := strings.TrimSpace(stdout)
+	if !strings.Contains(got, "package headlessautopilot") ||
+		!strings.Contains(got, "func Multiply(a, b int) int {") ||
+		!strings.Contains(got, "return a * b") {
+		t.Fatalf("stdout = %q, want repaired Go file content", got)
+	}
+	if !strings.Contains(stderr, "[makewand] provider=bravo") {
+		t.Fatalf("stderr = %q, want verified provider marker for bravo", stderr)
+	}
+}
+
 func TestE2EDoctorJSONIncludesPolicyChecks(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping E2E test in short mode")
@@ -214,6 +262,36 @@ func writeProviderScript(t *testing.T) string {
 	return script
 }
 
+func writeCandidateProviderScript(t *testing.T) string {
+	t.Helper()
+
+	script := filepath.Join(t.TempDir(), "candidate_provider.sh")
+	body := "#!/bin/sh\n" +
+		"provider=\"$1\"\n" +
+		"if [ \"$provider\" = \"alpha\" ]; then\n" +
+		"printf '%s\\n' '--- FILE: calc.go ---' '```' 'package headlessautopilot' '' 'func Multiply(a, b int) int {' '    return a + b' '}' '```'\n" +
+		"else\n" +
+		"printf '%s\\n' '--- FILE: calc.go ---' '```' 'package headlessautopilot' '' 'func Multiply(a, b int) int {' '    return a * b' '}' '```'\n" +
+		"fi\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile(candidate provider script): %v", err)
+	}
+	return script
+}
+
+func linkToolIntoDir(t *testing.T, dir, tool string) {
+	t.Helper()
+
+	path, err := exec.LookPath(tool)
+	if err != nil {
+		t.Fatalf("LookPath(%s): %v", tool, err)
+	}
+	target := filepath.Join(dir, tool)
+	if err := os.Symlink(path, target); err != nil {
+		t.Fatalf("Symlink(%s -> %s): %v", target, path, err)
+	}
+}
+
 func writeTestConfig(t *testing.T, cfgDir string, cfg *config.Config) {
 	t.Helper()
 
@@ -234,6 +312,22 @@ func runMakewand(t *testing.T, bin, cfgDir string, args ...string) (string, stri
 	t.Helper()
 
 	cmd := exec.Command(bin, args...)
+	cmd.Env = isolatedCLIEnv(cfgDir)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+func runMakewandInDir(t *testing.T, workdir, bin, cfgDir string, args ...string) (string, string, error) {
+	t.Helper()
+
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = workdir
 	cmd.Env = isolatedCLIEnv(cfgDir)
 
 	var stdout bytes.Buffer

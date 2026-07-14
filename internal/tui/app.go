@@ -78,12 +78,13 @@ type App struct {
 	pipeline *engine.BuildPipeline
 
 	// Build pipeline TUI state (files, plans, approvals — owned by TUI layer).
-	pendingFiles     []engine.ExtractedFile // files waiting to be written
-	pendingPhase     pendingPhaseType       // which phase triggered the pending files
-	state            AppState               // current interaction state
-	pendingDepsPlan  *engine.ExecPlan       // detected dependency install command
-	pendingTestsPlan *engine.ExecPlan       // detected test execution command
-	pendingApproval  *approvalRequest       // current approval request, if any
+	pendingFiles         []engine.ExtractedFile // files waiting to be written
+	pendingPhase         pendingPhaseType       // which phase triggered the pending files
+	state                AppState               // current interaction state
+	pendingDepsPlan      *engine.ExecPlan       // detected dependency install command
+	pendingTestsPlan     *engine.ExecPlan       // detected test execution command
+	pendingApproval      *approvalRequest       // current approval request, if any
+	pendingWriteVerified bool                   // true when the pending file batch passed local verification
 
 	// State
 	width  int
@@ -106,12 +107,14 @@ type App struct {
 // --- Bubble Tea message types ---
 
 type aiResponseMsg struct {
-	content      string
-	provider     string
-	cost         float64
-	inputTokens  int
-	outputTokens int
-	err          error
+	content       string
+	provider      string
+	cost          float64
+	inputTokens   int
+	outputTokens  int
+	verified      bool
+	selectionNote string
+	err           error
 }
 
 type aiStreamStartMsg struct {
@@ -177,13 +180,15 @@ type autoFixMsg struct {
 
 // autoFixResponseMsg is sent after the AI responds with a fix.
 type autoFixResponseMsg struct {
-	content      string
-	provider     string
-	cost         float64
-	inputTokens  int
-	outputTokens int
-	attempt      int
-	err          error
+	content       string
+	provider      string
+	cost          float64
+	inputTokens   int
+	outputTokens  int
+	attempt       int
+	verified      bool
+	selectionNote string
+	err           error
 }
 
 // codeReviewMsg is sent after the review AI finishes analyzing code.
@@ -310,17 +315,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, chatCmd)
 
 	case tea.KeyMsg:
-		// Handle file write confirmation
-		if a.state == StateConfirmFiles {
-			return a.handleFileConfirmKey(msg)
-		}
-		// Handle dependency install confirmation
-		if a.state == StateConfirmDeps {
-			return a.handleDepsConfirmKey(msg)
-		}
-		// Handle test execution confirmation
-		if a.state == StateConfirmTests {
-			return a.handleTestsConfirmKey(msg)
+		if next, cmd, handled := a.handlePendingApprovalKey(msg); handled {
+			return next, cmd
 		}
 
 		switch msg.String() {
@@ -495,6 +491,44 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return a, tea.Batch(cmds...)
 }
 
+func (a App) handlePendingApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+	if !a.state.IsConfirming() {
+		return a, nil, false
+	}
+
+	input := strings.TrimSpace(a.chat.InputValue())
+	if input != "" && msg.Type == tea.KeyEnter {
+		next, cmd := a.handleChatEnter()
+		return next, cmd, true
+	}
+	if input != "" {
+		return a, nil, false
+	}
+
+	switch a.state {
+	case StateConfirmFiles:
+		switch strings.ToLower(msg.String()) {
+		case "y", "enter", "n", "esc":
+			next, cmd := a.handleFileConfirmKey(msg)
+			return next, cmd, true
+		}
+	case StateConfirmDeps:
+		switch strings.ToLower(msg.String()) {
+		case "y", "enter", "n", "esc":
+			next, cmd := a.handleDepsConfirmKey(msg)
+			return next, cmd, true
+		}
+	case StateConfirmTests:
+		switch strings.ToLower(msg.String()) {
+		case "y", "enter", "n", "esc":
+			next, cmd := a.handleTestsConfirmKey(msg)
+			return next, cmd, true
+		}
+	}
+
+	return a, nil, false
+}
+
 // waitForStreamChunk reads the next chunk from the stream channel.
 func (a App) waitForStreamChunk() tea.Cmd {
 	ch := a.streamCh
@@ -512,6 +546,7 @@ func (a App) waitForStreamChunk() tea.Cmd {
 func (a App) buildComplete() (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
 	a.wizard.SetPhase(WizardPhaseDone)
+	a.pendingWriteVerified = false
 	a.chat.AddMessage(ChatMessage{
 		Role:    "status",
 		Content: m.ProgressBuildComplete,

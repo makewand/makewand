@@ -73,15 +73,25 @@ Guidelines:
 			prompt += fmt.Sprintf("\nProject entries: %d (full tree omitted for this request type)\n", projectEntryCount(project.Files))
 		}
 
-		// Append repo context (rules, symbols, file hints) when available.
-		if rc, err := engine.LoadRepoContext(project.Path, project.Files); err == nil {
-			if ctx := rc.ForPrompt(budget); ctx != "" {
-				prompt += ctx
+		if project.ScanTruncated {
+			prompt += fmt.Sprintf("\n\nProject scan limited to %d entries to keep startup fast.\n", projectEntryCount(project.Files))
+		} else {
+			// Append repo context (rules, symbols, file hints) when available.
+			if rc, err := engine.LoadRepoContext(project.Path, project.Files); err == nil {
+				if ctx := rc.ForPrompt(budget); ctx != "" {
+					prompt += ctx
+				}
 			}
 		}
 	}
 
 	return prompt
+}
+
+// BuildSystemPrompt exposes the shared project-aware system prompt builder so
+// non-TUI entry points can reuse the same repo-context packaging.
+func BuildSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode) string {
+	return buildSystemPrompt(project, task, mode)
 }
 
 func includeProjectTreeForTask(task model.TaskType) bool {

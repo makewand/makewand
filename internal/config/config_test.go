@@ -188,3 +188,30 @@ func TestCustomProviderUsesShellAdapter(t *testing.T) {
 		t.Fatal("CustomProviderUsesShellAdapter(normal binary) = true, want false")
 	}
 }
+
+func TestDefaultConfig_ApprovalModeIsManual(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.ApprovalMode != ApprovalModeManual {
+		t.Fatalf("ApprovalMode = %q, want %q", cfg.ApprovalMode, ApprovalModeManual)
+	}
+}
+
+func TestNormalizeApprovalMode(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{input: "", want: ApprovalModeManual},
+		{input: "manual", want: ApprovalModeManual},
+		{input: "safe", want: ApprovalModeSafe},
+		{input: "SAFE", want: ApprovalModeSafe},
+		{input: "autopilot", want: ApprovalModeAuto},
+		{input: "weird", want: ApprovalModeManual},
+	}
+
+	for _, tt := range tests {
+		if got := NormalizeApprovalMode(tt.input); got != tt.want {
+			t.Fatalf("NormalizeApprovalMode(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
