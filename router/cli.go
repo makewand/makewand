@@ -174,6 +174,47 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 	return p
 }
 
+// --- Agy CLI (Antigravity) ---
+
+// NewAgyCLI creates a provider that uses `agy --print` (Antigravity CLI).
+//
+// As of June 2026 Google retired the individual-account OAuth path for the old
+// `gemini` CLI; personal Gemini subscriptions now flow exclusively through the
+// Antigravity CLI (`agy`). This provider is registered under the logical name
+// "gemini" so it slots into the existing gemini strategy-table entries, but its
+// transport is agy — the `gemini -p` metered API path is intentionally not used.
+//
+// Model selection is deliberately left to agy's own configured default (set via
+// agy's `/model` UI) rather than forced with --model: agy's model list mixes
+// Gemini, Claude, and GPT models drawn from *different* quota groups, and forcing
+// a makewand tier model id (e.g. "gemini-2.5-flash", which agy does not know)
+// would either error or silently cross pools. Override with MAKEWAND_AGY_MODEL.
+func NewAgyCLI(binPath string) *CLIProvider {
+	p := &CLIProvider{
+		name:     "agy-cli",
+		binPath:  binPath,
+		provider: "gemini",
+	}
+	buildArgs := func(prompt string) []string {
+		args := []string{"--print", "--sandbox", prompt}
+		if m := strings.TrimSpace(os.Getenv("MAKEWAND_AGY_MODEL")); m != "" {
+			args = append([]string{"--model", m}, args...)
+		}
+		return args
+	}
+	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
+	}
+	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
+	}
+	p.checkCmd = func(ctx context.Context) *exec.Cmd {
+		// `agy models` exits 0 only when signed in — doubles as an auth probe.
+		return exec.CommandContext(ctx, binPath, "models")
+	}
+	return p
+}
+
 // --- Codex CLI ---
 
 // NewCodexCLI creates a provider that uses `codex exec` (Codex CLI).
