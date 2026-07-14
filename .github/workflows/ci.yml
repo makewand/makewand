@@ -81,7 +81,7 @@ jobs:
         run: go vet ./cmd/... ./internal/... ./router
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           # Pin the linter version so `latest` can't silently drift and break CI
           # again (a v2 bump against a v1 config is what wedged this pipeline).
