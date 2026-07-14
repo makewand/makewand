@@ -73,6 +73,7 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 			requests:       r.usage.Count(provName) + r.usage.FailureCount(provName),
 			qualitySamples: r.usage.QualitySampleCount(phase, provName),
 			thompsonScore:  r.usage.ThompsonSample(phase, provName, priorBias),
+			quotaBand:      r.quotaBandFor(provName),
 		})
 	}
 
@@ -116,6 +117,7 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 			requests:       r.usage.Count(provName) + r.usage.FailureCount(provName),
 			qualitySamples: r.usage.QualitySampleCount(phase, provName),
 			thompsonScore:  r.usage.ThompsonSample(phase, provName, priorBias),
+			quotaBand:      r.quotaBandFor(provName),
 		})
 	}
 

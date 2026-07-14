@@ -22,6 +22,7 @@ a standalone Go routing library with an OpenAI-compatible subset HTTP API.
 
 - **Three usage modes / 三种使用模式** — Fast (low latency), Balanced (quality/cost), Power (ensemble + judge)
 - **Adaptive routing / 自适应路由** — Thompson Sampling learns provider quality per task type
+- **Quota-aware routing / 配额感知路由** — reads each subscription's remaining 5h/weekly usage and steers work toward the pool with headroom *before* you hit a cap (`makewand quota`)
 - **Circuit breaker / 熔断器** — auto-excludes failing providers with cooldown recovery
 - **Power ensemble / 强劲集成** — parallel multi-provider generation with cross-model evaluation
 - **OpenAI-compatible subset HTTP API** — expose the router as a `/v1/chat/completions` endpoint
@@ -338,11 +339,58 @@ All three providers are supported as subscription CLIs or via API keys:
 | Provider | CLI | API Key Env |
 |----------|-----|-------------|
 | Claude | `claude` (Claude Code) | `ANTHROPIC_API_KEY` |
-| Gemini | `gemini` (Gemini CLI) | `GEMINI_API_KEY` |
+| Gemini | `agy` (Antigravity CLI, preferred) or `gemini` (Gemini CLI) | `GEMINI_API_KEY` |
 | Codex | `codex` (Codex CLI) | `OPENAI_API_KEY` |
 
 Subscription CLIs are auto-detected and preferred. Custom command-line providers are also supported.
 订阅制 CLI 会被自动检测并优先使用。也支持自定义命令行 Provider。
+
+Since June 2026, personal Gemini subscriptions flow through the **Antigravity CLI
+(`agy`)** rather than the old `gemini` CLI. When `agy` is installed it takes the
+Gemini provider slot automatically; the metered `gemini -p` path is used only as
+a fallback when `agy` is absent. Force a specific agy model with `MAKEWAND_AGY_MODEL`.
+2026 年 6 月起，个人版 Gemini 订阅改由 **Antigravity CLI（`agy`）** 承载，取代旧的
+`gemini` CLI。检测到 `agy` 时它自动占据 Gemini 槽位；只有在没有 `agy` 时才回退到
+按量计费的 `gemini -p`。用 `MAKEWAND_AGY_MODEL` 可指定 agy 模型。
+
+### Quota-Aware Routing / 配额感知路由
+
+makewand reads each subscription's remaining usage and routes around pools that
+are running low — *before* they hit a cap and start refusing requests or charging
+metered overflow prices. Run `makewand quota` (add `--json` for scripting) to see
+the current picture:
+makewand 读取各订阅的剩余用量，在某个池子撞顶（开始拒绝请求或按量计费）**之前**就把
+任务引开。运行 `makewand quota`（加 `--json` 便于脚本处理）查看当前状态：
+
+```
+$ makewand quota
+── claude
+   5h window   19% used
+   weekly      64% used  (resets 07-19 20:00)
+── codex
+   weekly      86% used  (resets 07-21 06:08)
+   → getting low — routing will deprioritize this pool
+── gemini
+   subscription: signed in (agy)
+```
+
+How it steers routing / 如何影响路由：
+
+- **Predicted headroom** (usage %) is a *soft* signal: a pool nearing its cap is
+  tried later, but never removed — quota prediction alone can't cause a routing
+  failure. Warn/critical thresholds default to 70%/90%.
+- **Confirmed exhaustion** (a real quota/429 error) *hard-blocks* that pool until
+  its window resets, so retries route elsewhere.
+- Quota data is read locally or via your own stored credentials (Claude's OAuth
+  usage endpoint, Codex session logs, agy login state) — **nothing is uploaded**.
+  A source that can't be read simply drops out, and routing falls back to its
+  normal quality/circuit-breaker signals.
+
+- **预测余量**（用量百分比）是*软*信号：接近上限的池子会被排后，但不会被移除——仅凭预测
+  不会导致路由失败。warn/critical 阈值默认 70%/90%。
+- **确认耗尽**（真实的配额/429 错误）会把该池*硬性封锁*到窗口重置，重试自动转向别处。
+- 配额数据在本地读取或经你自己已存的凭据获取（Claude OAuth usage 接口、Codex 会话日志、
+  agy 登录态）——**不上传任何内容**。读不到的源直接退出，路由回落到常规的质量/熔断信号。
 
 ### Custom Providers / 自定义 Provider
 
@@ -471,6 +519,7 @@ makewand serve                 Start personal remote server / 启动个人远程
 makewand token                 Manage remote auth config / 管理远程鉴权配置
 makewand audit                 Inspect server audit log / 查看服务端审计日志
 makewand usage                 Inspect structured usage log / 查看结构化用量日志
+makewand quota                 Show remaining subscription quota / 查看订阅剩余配额 (--json)
 makewand user                  Manage registered server users / 管理注册用户
 makewand preview [path]        Start preview server / 启动预览服务
 makewand setup                 Configure providers / 配置 Provider
