@@ -98,6 +98,7 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 	rootCmd.AddCommand(tokenCmd())
 	rootCmd.AddCommand(auditCmd())
 	rootCmd.AddCommand(usageCmd())
+	rootCmd.AddCommand(quotaCmd())
 	rootCmd.AddCommand(userCmd())
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())

@@ -171,6 +171,15 @@ type RouterConfig struct {
 	// ConfigDir is the directory for routing.json overrides and stats persistence.
 	// Empty string disables file-based overrides.
 	ConfigDir string
+
+	// Quota, when set, makes routing subscription-quota aware: providers low on
+	// headroom are deprioritized and confirmed-exhausted pools are skipped. Nil
+	// disables quota awareness entirely (routing behaves as before).
+	Quota QuotaController
+
+	// QuotaPolicy overrides the default warn/crit thresholds. Zero value uses
+	// DefaultQuotaPolicy.
+	QuotaPolicy QuotaPolicy
 }
 
 // providerKey is used to cache provider instances by (name, modelID).
@@ -219,6 +228,10 @@ type Router struct {
 
 	traceMu   sync.RWMutex
 	traceSink TraceSink
+
+	// Subscription-quota awareness (nil when disabled).
+	quota       QuotaController
+	quotaPolicy QuotaPolicy
 }
 
 const availCacheTTL = 10 * time.Second
@@ -241,6 +254,11 @@ func NewRouterFromConfig(rc RouterConfig) *Router {
 		accessTypes:   make(map[string]AccessType),
 		usage:         newSessionUsage(),
 		breaker:       newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
+		quota:         rc.Quota,
+		quotaPolicy:   rc.QuotaPolicy,
+	}
+	if r.quotaPolicy == (QuotaPolicy{}) {
+		r.quotaPolicy = DefaultQuotaPolicy()
 	}
 
 	r.legacyModels.defaultModel = rc.DefaultModel

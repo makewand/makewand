@@ -338,6 +338,9 @@ func detectCLIs() []CLITool {
 		{"claude", "claude", []string{"--version"}},
 		{"gemini", "gemini", []string{"--version"}},
 		{"codex", "codex", []string{"--version"}},
+		// agy (Antigravity CLI) is the current transport for personal Gemini
+		// subscriptions; when present it takes the "gemini" provider slot.
+		{"agy", "agy", []string{"--version"}},
 	}
 
 	var results []CLITool
