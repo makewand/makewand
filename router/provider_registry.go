@@ -12,8 +12,8 @@ import (
 type ProviderFactory func(modelID string) (Provider, error)
 
 var (
-	resolverMu       sync.RWMutex
-	providerFactory  = map[string]ProviderFactory{}
+	resolverMu      sync.RWMutex
+	providerFactory = map[string]ProviderFactory{}
 )
 
 // RegisterProviderFactory registers or overrides a provider factory.

@@ -14,6 +14,7 @@ func Handler() http.Handler {
 	assets, _ := fs.Sub(staticFS, "static")
 	fileServer := http.FileServer(http.FS(assets))
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		setSecurityHeaders(w)
 		path := req.URL.Path
 		if path == "/admin" || path == "/admin/" {
 			http.ServeFileFS(w, req, assets, "index.html")
@@ -31,4 +32,9 @@ func Handler() http.Handler {
 		}
 		http.NotFound(w, req)
 	})
+}
+
+func setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 }

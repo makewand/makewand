@@ -19,6 +19,9 @@ func TestHandler_ServesAdminShellAndAssets(t *testing.T) {
 	if !strings.Contains(indexRec.Body.String(), "makewand Admin") {
 		t.Fatalf("index body = %q, want admin shell", indexRec.Body.String())
 	}
+	if csp := indexRec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("Content-Security-Policy = %q, want frame-ancestors protection", csp)
+	}
 
 	assetReq := httptest.NewRequest(http.MethodGet, "/admin/style.css", nil)
 	assetRec := httptest.NewRecorder()
