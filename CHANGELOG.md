@@ -24,6 +24,10 @@ All notable changes to this project are documented here. The format is based on
   - Data is read locally or via already-stored credentials (Claude OAuth usage
     endpoint, Codex session logs, agy login state); nothing is uploaded, and an
     unreadable source degrades to neutral.
+  - Quota reads are cached to disk (`~/.cache/makewand/quota-snapshot.json`,
+    120s TTL) and shared across processes, so repeated invocations don't re-hit
+    the rate-limited usage endpoints; a stale cache still serves as last-good
+    when a source is momentarily unavailable. 429-seals are never persisted.
   - Disabled by default for library embedders: `NewRouterFromConfig` is quota-free
     unless `RouterConfig.Quota` is set.
 - **Antigravity CLI (`agy`) support.** Personal Gemini subscriptions now route

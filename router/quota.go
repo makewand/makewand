@@ -219,21 +219,44 @@ type QuotaSnapshotter struct {
 	interval time.Duration
 	current  atomic.Pointer[QuotaSnapshot]
 
+	// Optional read-through/write-through disk cache, shared across processes so
+	// that repeated short-lived invocations (e.g. `makewand quota`) don't re-hit
+	// the rate-limited usage endpoints within cacheTTL. Empty path disables it.
+	cachePath string
+	cacheTTL  time.Duration
+
 	refreshMu sync.Mutex // serializes refreshes; prevents overlapping fan-out
-	// seals holds provider→until overrides from the 429-feedback path.
+	// seals holds provider→until overrides from the 429-feedback path. Never
+	// persisted to disk: a seal reflects a live 429 in this process, and a fresh
+	// process must not inherit one (window resets handle recovery anyway).
 	sealMu sync.Mutex
 	seals  map[string]time.Time
+}
+
+// WithDiskCache enables a shared disk cache at path with the given freshness TTL.
+// Returns the receiver for chaining. ttl<=0 defaults to the refresh interval.
+func (s *QuotaSnapshotter) WithDiskCache(path string, ttl time.Duration) *QuotaSnapshotter {
+	if ttl <= 0 {
+		ttl = s.interval
+	}
+	s.cachePath = path
+	s.cacheTTL = ttl
+	return s
 }
 
 // NewDefaultQuotaSnapshotter builds a snapshotter over the standard sources
 // (Claude OAuth, Codex session logs, agy login-state) using default paths.
 // interval<=0 defaults to 120s.
 func NewDefaultQuotaSnapshotter(interval time.Duration) *QuotaSnapshotter {
-	return NewQuotaSnapshotter(interval,
+	s := NewQuotaSnapshotter(interval,
 		NewClaudeQuotaSource(""),
 		NewCodexQuotaSource(""),
 		NewAgyQuotaSource(""),
 	)
+	if home, err := os.UserHomeDir(); err == nil {
+		s.WithDiskCache(filepath.Join(home, ".cache", "makewand", "quota-snapshot.json"), 0)
+	}
+	return s
 }
 
 // NewQuotaSnapshotter builds a snapshotter over the given sources. interval<=0
@@ -296,6 +319,18 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 
+	// Read-through: adopt a fresh on-disk snapshot instead of hitting the sources.
+	// A stale cache still serves as the cross-process last-good baseline below.
+	var diskPrev map[string]ProviderQuota
+	if s.cachePath != "" {
+		if cached, takenAt, ok := loadQuotaCache(s.cachePath, s.cacheTTL); ok {
+			s.applySeals(cached)
+			s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
+			return
+		}
+		diskPrev, _, _ = loadQuotaCache(s.cachePath, 0) // ignore TTL: last-good only
+	}
+
 	prev := s.Snapshot()
 	next := make(map[string]ProviderQuota, len(s.sources))
 
@@ -322,8 +357,13 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 		r := results[i]
 		if r.err != nil || !r.q.HasData {
 			// Keep last-good rather than dropping to neutral: a transient read
-			// failure shouldn't reopen a pool we just learned was exhausted.
-			if pq, ok := prev.byProvider[name]; ok {
+			// failure shouldn't reopen a pool we just learned was exhausted, nor
+			// show "unavailable" when we have a recent good value on disk.
+			if pq, ok := prev.byProvider[name]; ok && pq.HasData {
+				next[name] = pq
+				continue
+			}
+			if pq, ok := diskPrev[name]; ok && pq.HasData {
 				next[name] = pq
 				continue
 			}
@@ -336,11 +376,68 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 		next[name] = r.q
 	}
 
+	// Write-through: persist the raw source data (pre-seal) so other processes
+	// can reuse it. Seals stay in-memory only.
+	takenAt := time.Now()
+	if s.cachePath != "" {
+		storeQuotaCache(s.cachePath, next, takenAt)
+	}
+
 	// Apply active 429 seals: force the sealed provider to 100% until its window
 	// resets, overriding whatever the source reported.
 	s.applySeals(next)
 
-	s.current.Store(&QuotaSnapshot{byProvider: next, takenAt: time.Now()})
+	s.current.Store(&QuotaSnapshot{byProvider: next, takenAt: takenAt})
+}
+
+// quotaDiskFormat is the on-disk cache schema.
+type quotaDiskFormat struct {
+	Version   int             `json:"version"`
+	TakenAt   time.Time       `json:"taken_at"`
+	Providers []ProviderQuota `json:"providers"`
+}
+
+// loadQuotaCache returns the cached provider map and its timestamp when the cache
+// file exists and is younger than ttl.
+func loadQuotaCache(path string, ttl time.Duration) (map[string]ProviderQuota, time.Time, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	var d quotaDiskFormat
+	if err := json.Unmarshal(raw, &d); err != nil || d.Version != 1 {
+		return nil, time.Time{}, false
+	}
+	if ttl > 0 && time.Since(d.TakenAt) > ttl {
+		return nil, time.Time{}, false
+	}
+	m := make(map[string]ProviderQuota, len(d.Providers))
+	for _, q := range d.Providers {
+		m[strings.ToLower(q.Provider)] = q
+	}
+	return m, d.TakenAt, true
+}
+
+// storeQuotaCache atomically writes the provider map to path. Best-effort:
+// errors (e.g. unwritable cache dir) are ignored — caching is an optimization.
+func storeQuotaCache(path string, m map[string]ProviderQuota, takenAt time.Time) {
+	providers := make([]ProviderQuota, 0, len(m))
+	for _, q := range m {
+		providers = append(providers, q)
+	}
+	sort.Slice(providers, func(i, j int) bool { return providers[i].Provider < providers[j].Provider })
+	b, err := json.MarshalIndent(quotaDiskFormat{Version: 1, TakenAt: takenAt, Providers: providers}, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 // MarkExhausted seals a provider as fully used until `until` (typically the
