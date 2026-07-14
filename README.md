@@ -22,6 +22,7 @@ a standalone Go routing library with an OpenAI-compatible subset HTTP API.
 
 - **Three usage modes / 三种使用模式** — Fast (low latency), Balanced (quality/cost), Power (ensemble + judge)
 - **Adaptive routing / 自适应路由** — Thompson Sampling learns provider quality per task type
+- **Quota-aware routing / 配额感知路由** — reads each subscription's remaining 5h/weekly usage and steers work toward the pool with headroom *before* you hit a cap (`makewand quota`)
 - **Circuit breaker / 熔断器** — auto-excludes failing providers with cooldown recovery
 - **Power ensemble / 强劲集成** — parallel multi-provider generation with cross-model evaluation
 - **OpenAI-compatible subset HTTP API** — expose the router as a `/v1/chat/completions` endpoint
@@ -85,6 +86,236 @@ makewand new
 makewand --print "Explain this error" --mode fast
 ```
 
+### Personal Remote Mode / 个人远程模式
+
+Run `makewand` on one main machine and continue from other computers by pointing
+them at that host. The server uses your local providers; remote clients use the
+HTTP facade plus centralized chat session storage.
+可在一台主力机器上运行 `makewand`，并让其他电脑继续使用同一个后端。服务端使用本机
+Provider；其他电脑通过 HTTP facade 和集中式会话存储实现续接。
+
+On your main machine / 在主机上：
+
+```bash
+makewand token issue \
+  --auth-config ~/.config/makewand/server_auth.json \
+  --id runner \
+  --description "interactive remote client" \
+  --allowed-providers codex \
+  --allowed-modes balanced \
+  --workspace-prefixes repo- \
+  --max-requests-per-hour 120 \
+  --max-requests-per-day 1000
+
+MAKEWAND_SERVER_AUTH_CONFIG=~/.config/makewand/server_auth.json \
+MAKEWAND_SERVER_AUDIT_LOG=1 \
+MAKEWAND_SERVER_ALERT_WEBHOOK=https://alerts.example.com/makewand \
+makewand serve --listen 127.0.0.1:8080 --enable-users
+```
+
+By default, `serve` now keeps users, issued tokens, and usage in
+`~/.config/makewand/server/state.db`. JSONL audit logging remains optional.
+现在 `serve` 默认会把用户、签发的 token 和 usage 持久化到
+`~/.config/makewand/server/state.db`；JSONL 审计日志仍然是可选项。
+
+The same server also exposes a lightweight admin console at `/admin` for live
+dashboards, token issuance, team setup, and billing inspection.
+同一个服务端还会在 `/admin` 提供一个轻量管理界面，用于查看实时仪表盘、签发 token、
+配置团队和检查账单汇总。
+
+Budget enforcement and billing alerts now evaluate against the current month by
+default, so previous months no longer consume the active monthly budget. When
+`MAKEWAND_SERVER_ALERT_WEBHOOK` or `--alert-webhook` is configured, the server
+will also POST webhook notifications as organizations or projects cross
+`warning/high/critical` spend thresholds for the month.
+月预算和 billing alert 现在默认按“当前月份”计算，不会再把历史月份的支出累积到
+本月预算里。若设置 `MAKEWAND_SERVER_ALERT_WEBHOOK` 或 `--alert-webhook`，
+服务端还会在 organization / project 跨过当月 `warning/high/critical`
+预算阈值时主动发送 webhook 通知。
+
+The admin console can now sign in with a server-side browser session instead of
+storing a long-lived admin bearer token in the page. Mutating admin requests
+use CSRF protection automatically.
+管理界面现在支持服务端浏览器 session 登录，不必把长期 admin bearer token 放在页面
+里；涉及写操作的 admin 请求也会自动走 CSRF 保护。
+
+On another computer / 在其他电脑上：
+
+```bash
+export MAKEWAND_REMOTE_URL=http://your-main-machine:8080
+export MAKEWAND_REMOTE_TOKEN=replace-with-issued-token
+makewand chat .
+```
+
+User login flow / 用户登录发 token：
+
+```bash
+curl -X POST http://your-main-machine:8080/v1/users/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"password123"}'
+
+makewand user login \
+  --remote-url http://your-main-machine:8080 \
+  --email you@example.com \
+  --password password123
+```
+
+Check the remote server before using it / 使用前先检查远端服务：
+
+```bash
+makewand doctor --remote-check \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token replace-with-issued-token
+```
+
+Inspect or rotate server-side auth and audit data / 查看或轮换服务端鉴权与审计：
+
+```bash
+makewand token list --auth-config ~/.config/makewand/server_auth.json
+makewand token list --state-db ~/.config/makewand/server/state.db
+makewand token revoke runner --auth-config ~/.config/makewand/server_auth.json
+makewand audit summary --path ~/.config/makewand/server/audit.jsonl
+makewand audit events --path ~/.config/makewand/server/audit.jsonl --limit 20
+makewand usage summary --state-db ~/.config/makewand/server/state.db
+makewand user list --state-db ~/.config/makewand/server/state.db
+makewand usage periods --state-db ~/.config/makewand/server/state.db
+makewand usage alerts --state-db ~/.config/makewand/server/state.db
+```
+
+When the server runs with `--auth-config`, it also exposes admin APIs for live
+token rotation and audit queries. CLI commands can call them directly:
+当服务端使用 `--auth-config` 启动时，还会暴露实时 token 管理与审计查询 API；CLI
+也可直接调用：
+
+```bash
+makewand token list \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
+
+makewand token issue \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --id runner \
+  --allowed-providers codex \
+  --allowed-modes balanced \
+  --max-requests-per-day 1000 \
+  --max-cost-usd-per-day 5
+
+makewand audit summary \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
+
+makewand audit events \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --csv > audit-events.csv
+
+makewand usage summary \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
+
+makewand usage events \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --csv > usage-events.csv
+
+makewand usage periods \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --csv > billing-periods.csv
+
+makewand user list \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token
+
+makewand usage alerts \
+  --remote-url http://your-main-machine:8080 \
+  --remote-token your-admin-token \
+  --csv > billing-alerts.csv
+```
+
+Admin APIs / 管理 API：
+
+| Endpoint | Scope |
+|----------|-------|
+| `GET /v1/admin/tokens` | `admin:tokens:read` |
+| `POST /v1/admin/tokens` | `admin:tokens:write` |
+| `POST /v1/admin/tokens/{id}/revoke` | `admin:tokens:write` |
+| `POST /v1/admin/session/login` | admin browser login |
+| `GET /v1/admin/session/me` | admin browser session check |
+| `POST /v1/admin/session/logout` | admin browser logout |
+| `GET /v1/admin/audit/summary` | `admin:audit:read` |
+| `GET /v1/admin/audit/events` | `admin:audit:read` (`?format=csv` supported) |
+| `GET /v1/admin/dashboard` | `admin:usage:read` |
+| `GET /v1/admin/billing/summary` | `admin:usage:read` (`?format=csv` supported) |
+| `GET /v1/admin/billing/periods` | `admin:usage:read` (`?format=csv` supported) |
+| `GET /v1/admin/billing/alerts` | `admin:usage:read` (`?format=csv` supported) |
+| `GET /v1/admin/usage/summary` | `admin:usage:read` |
+| `GET /v1/admin/usage/events` | `admin:usage:read` (`?format=csv` supported) |
+| `GET /v1/admin/users` | `admin:users:read` |
+| `POST /v1/admin/users/{id}/activate` | `admin:users:write` |
+| `POST /v1/admin/users/{id}/deactivate` | `admin:users:write` |
+| `POST /v1/admin/users/{id}/role` | `admin:users:write` |
+| `POST /v1/admin/users/{id}/password` | `admin:users:write` |
+| `GET /v1/admin/organizations` | `admin:users:read` |
+| `POST /v1/admin/organizations` | `admin:users:write` |
+| `GET /v1/admin/projects` | `admin:users:read` |
+| `POST /v1/admin/projects` | `admin:users:write` |
+| `GET /v1/admin/organization-memberships` | `admin:users:read` |
+| `POST /v1/admin/organization-memberships` | `admin:users:write` |
+| `GET /v1/admin/project-memberships` | `admin:users:read` |
+| `POST /v1/admin/project-memberships` | `admin:users:write` |
+| `GET /metrics` | `admin:metrics:read` |
+| `POST /v1/users/register` | unauthenticated |
+| `POST /v1/users/login` | unauthenticated |
+
+List endpoints accept pragmatic filtering and pagination parameters such as
+`q`, `limit`, `offset`, plus resource-specific filters like `organization_id`,
+`project_id`, `user_id`, `role`, `active`, and `revoked`.
+列表型接口支持实用型筛选和分页参数，例如 `q`、`limit`、`offset`，以及
+`organization_id`、`project_id`、`user_id`、`role`、`active`、`revoked`
+这类资源专属过滤条件。
+
+Member users can now be attached to organizations and projects, then issue
+scoped login tokens that inherit those assignments:
+现在成员用户可绑定到 organization / project，并在登录时签发继承这些范围的 token：
+
+```bash
+makewand user login \
+  --remote-url http://your-main-machine:8080 \
+  --email you@example.com \
+  --password password123 \
+  --project-id prj_checkout
+```
+
+Production deployment templates and backup helpers live in:
+生产部署模板与备份脚本见：
+
+- [DEPLOY_PRODUCTION.md](docs/DEPLOY_PRODUCTION.md)
+- [Dockerfile](deploy/Dockerfile)
+- [docker-compose.yml](deploy/docker-compose.yml)
+- [systemd.makewand.service](deploy/systemd.makewand.service)
+- [backup_state.sh](scripts/backup_state.sh)
+- [restore_state.sh](scripts/restore_state.sh)
+
+If both machines point at the same repository, set a shared workspace id to
+resume the same chat even when local paths differ:
+如果两台机器本地目录不同，但希望恢复同一段对话，可显式设置共享 workspace id：
+
+```bash
+export MAKEWAND_WORKSPACE_ID=my-repo-main
+```
+
+Validation scripts / 验证脚本:
+
+```bash
+# Basic connectivity / 基础连通性
+bash scripts/personal_remote_smoke.sh
+
+# Real-case regression / 真实案例回归
+bash scripts/personal_remote_realcase.sh
+```
+
 ## Usage Modes / 使用模式
 
 | Mode / 模式 | Tier | Behavior / 行为 | Typical Models / 典型模型 |
@@ -108,11 +339,58 @@ All three providers are supported as subscription CLIs or via API keys:
 | Provider | CLI | API Key Env |
 |----------|-----|-------------|
 | Claude | `claude` (Claude Code) | `ANTHROPIC_API_KEY` |
-| Gemini | `gemini` (Gemini CLI) | `GEMINI_API_KEY` |
+| Gemini | `agy` (Antigravity CLI, preferred) or `gemini` (Gemini CLI) | `GEMINI_API_KEY` |
 | Codex | `codex` (Codex CLI) | `OPENAI_API_KEY` |
 
 Subscription CLIs are auto-detected and preferred. Custom command-line providers are also supported.
 订阅制 CLI 会被自动检测并优先使用。也支持自定义命令行 Provider。
+
+Since June 2026, personal Gemini subscriptions flow through the **Antigravity CLI
+(`agy`)** rather than the old `gemini` CLI. When `agy` is installed it takes the
+Gemini provider slot automatically; the metered `gemini -p` path is used only as
+a fallback when `agy` is absent. Force a specific agy model with `MAKEWAND_AGY_MODEL`.
+2026 年 6 月起，个人版 Gemini 订阅改由 **Antigravity CLI（`agy`）** 承载，取代旧的
+`gemini` CLI。检测到 `agy` 时它自动占据 Gemini 槽位；只有在没有 `agy` 时才回退到
+按量计费的 `gemini -p`。用 `MAKEWAND_AGY_MODEL` 可指定 agy 模型。
+
+### Quota-Aware Routing / 配额感知路由
+
+makewand reads each subscription's remaining usage and routes around pools that
+are running low — *before* they hit a cap and start refusing requests or charging
+metered overflow prices. Run `makewand quota` (add `--json` for scripting) to see
+the current picture:
+makewand 读取各订阅的剩余用量，在某个池子撞顶（开始拒绝请求或按量计费）**之前**就把
+任务引开。运行 `makewand quota`（加 `--json` 便于脚本处理）查看当前状态：
+
+```
+$ makewand quota
+── claude
+   5h window   19% used
+   weekly      64% used  (resets 07-19 20:00)
+── codex
+   weekly      86% used  (resets 07-21 06:08)
+   → getting low — routing will deprioritize this pool
+── gemini
+   subscription: signed in (agy)
+```
+
+How it steers routing / 如何影响路由：
+
+- **Predicted headroom** (usage %) is a *soft* signal: a pool nearing its cap is
+  tried later, but never removed — quota prediction alone can't cause a routing
+  failure. Warn/critical thresholds default to 70%/90%.
+- **Confirmed exhaustion** (a real quota/429 error) *hard-blocks* that pool until
+  its window resets, so retries route elsewhere.
+- Quota data is read locally or via your own stored credentials (Claude's OAuth
+  usage endpoint, Codex session logs, agy login state) — **nothing is uploaded**.
+  A source that can't be read simply drops out, and routing falls back to its
+  normal quality/circuit-breaker signals.
+
+- **预测余量**（用量百分比）是*软*信号：接近上限的池子会被排后，但不会被移除——仅凭预测
+  不会导致路由失败。warn/critical 阈值默认 70%/90%。
+- **确认耗尽**（真实的配额/429 错误）会把该池*硬性封锁*到窗口重置，重试自动转向别处。
+- 配额数据在本地读取或经你自己已存的凭据获取（Claude OAuth usage 接口、Codex 会话日志、
+  agy 登录态）——**不上传任何内容**。读不到的源直接退出，路由回落到常规的质量/熔断信号。
 
 ### Custom Providers / 自定义 Provider
 
@@ -192,13 +470,39 @@ http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
 A request may set `model` to a provider name returned by `/v1/models` to force
-that provider. `max_tokens`, `temperature`, and HTTP streaming are not yet supported.
+that provider. The facade also accepts alias families such as `gpt-*`, `o1*`,
+`o3*`, and `o4*` for Codex-backed routing, plus `claude*`, `gemini*`, and
+`codex*`.
 请求可将 `model` 设置为 `/v1/models` 返回的 Provider 名称以强制选择该 Provider。
-`max_tokens`、`temperature` 和 HTTP streaming 暂不支持。
+同时也支持常见 alias 家族：例如把 `gpt-*`、`o1*`、`o3*`、`o4*` 映射到 Codex，
+以及把 `claude*`、`gemini*`、`codex*` 映射到对应 Provider。
+
+`stream=true` is supported; `max_tokens` and `temperature` are accepted but
+currently ignored for compatibility. `response_format` supports `json_object`
+and a pragmatic subset of `json_schema`. Basic function-style tool calling is
+also supported through `tools` and `tool_choice`.
+支持 `stream=true`；`max_tokens`、`temperature` 会被接受，但当前仅作为兼容字段忽略。
+`response_format` 支持 `json_object` 和实用型 `json_schema` 子集；也支持通过
+`tools` 与 `tool_choice` 进行基础版函数式工具调用。
+`makewand serve` also attaches `X-Request-Id` to each response and exposes a
+Prometheus-style `/metrics` endpoint when started as a server.
+`makewand serve` 还会在响应中附带 `X-Request-Id`，并暴露 Prometheus 风格的
+`/metrics` 端点。
+
+When a scoped token is associated with an organization or project and the
+corresponding monthly budget is configured in the server team store, requests
+are now rejected before routing once that budget is exhausted.
+当 scoped token 关联了 organization 或 project，且服务端团队存储里配置了对应的
+月预算后，预算耗尽时会在真正路由前直接拒绝请求。
+
+A basic OpenAI-style `POST /v1/responses` subset is also available for
+request/response clients, including SSE streaming mode.
+同时也提供基础版的 `POST /v1/responses` 兼容入口，并支持 SSE streaming 模式。
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | Chat completions (non-streaming subset) / 非流式聊天补全子集 |
+| `POST /v1/chat/completions` | Chat completions (`stream=true` supported) / 支持 `stream=true` 的聊天补全 |
+| `POST /v1/responses` | Responses API subset (`stream=true`, `response_format`, `tools`) / 支持 `stream=true`、`response_format`、`tools` 的 Responses API 子集 |
 | `GET /v1/models` | List available providers / 列出可用 Provider |
 | `GET /health` | Health check / 健康检查 |
 
@@ -211,6 +515,12 @@ See [`router/README.md`](router/README.md) for full library documentation.
 makewand [prompt]              Interactive or one-shot prompt / 交互或单次执行
 makewand chat [path]           Chat about a project / 对话
 makewand new                   Create new project / 创建项目
+makewand serve                 Start personal remote server / 启动个人远程服务
+makewand token                 Manage remote auth config / 管理远程鉴权配置
+makewand audit                 Inspect server audit log / 查看服务端审计日志
+makewand usage                 Inspect structured usage log / 查看结构化用量日志
+makewand quota                 Show remaining subscription quota / 查看订阅剩余配额 (--json)
+makewand user                  Manage registered server users / 管理注册用户
 makewand preview [path]        Start preview server / 启动预览服务
 makewand setup                 Configure providers / 配置 Provider
 makewand doctor                Health check / 健康诊断

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,14 +12,16 @@ import (
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/engine"
+	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
+	"github.com/makewand/makewand/internal/remotesession"
 )
 
 const (
-	chatSessionVersion      = 1
-	chatSessionDirName      = "sessions"
-	restoredSessionPrefix   = "Restored previous session"
-	noCompactedMemoryNotice = "No compacted memory yet. Conversation is still within the active context window."
+	chatSessionVersion    = 1
+	chatSessionDirName    = "sessions"
+	restoredSessionPrefix = "Restored previous session"
 )
 
 type chatSessionState struct {
@@ -48,11 +51,6 @@ func (a *App) saveChatSession() error {
 		return nil
 	}
 
-	sessionFile, err := chatSessionFilePath(projectPath)
-	if err != nil {
-		return err
-	}
-
 	messages := filterSessionMessages(a.chat.messages)
 	hasConversation := false
 	for _, msg := range messages {
@@ -60,14 +58,6 @@ func (a *App) saveChatSession() error {
 			hasConversation = true
 			break
 		}
-	}
-	if !hasConversation {
-		a.sessionFile = sessionFile
-		a.lastSessionSavedAt = ""
-		if err := os.Remove(sessionFile); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
 	}
 
 	state := chatSessionState{
@@ -84,6 +74,32 @@ func (a *App) saveChatSession() error {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
+	}
+
+	if client, workspaceID, ok := remoteSessionBackend(projectPath); ok {
+		a.sessionFile = remoteSessionFileLabel(workspaceID)
+		if !hasConversation {
+			a.lastSessionSavedAt = ""
+			return client.Delete(context.Background(), workspaceID)
+		}
+		if err := client.Save(context.Background(), workspaceID, data); err != nil {
+			return err
+		}
+		a.lastSessionSavedAt = state.SavedAt
+		return nil
+	}
+
+	sessionFile, err := chatSessionFilePath(projectPath)
+	if err != nil {
+		return err
+	}
+	if !hasConversation {
+		a.sessionFile = sessionFile
+		a.lastSessionSavedAt = ""
+		if err := os.Remove(sessionFile); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
 	}
 
 	tmp := sessionFile + ".tmp"
@@ -110,12 +126,22 @@ func (a *App) restoreChatSession() (bool, error) {
 		return false, nil
 	}
 
+	if client, workspaceID, ok := remoteSessionBackend(projectPath); ok {
+		a.sessionFile = remoteSessionFileLabel(workspaceID)
+		data, err := client.Load(context.Background(), workspaceID)
+		if err == nil {
+			return a.applyChatSessionData(data)
+		}
+		if err != remotesession.ErrNotFound {
+			return false, err
+		}
+	}
+
 	sessionFile, err := chatSessionFilePath(projectPath)
 	if err != nil {
 		return false, err
 	}
 	a.sessionFile = sessionFile
-
 	data, err := os.ReadFile(sessionFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -124,6 +150,10 @@ func (a *App) restoreChatSession() (bool, error) {
 		return false, err
 	}
 
+	return a.applyChatSessionData(data)
+}
+
+func (a *App) applyChatSessionData(data []byte) (bool, error) {
 	var state chatSessionState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return false, err
@@ -131,7 +161,6 @@ func (a *App) restoreChatSession() (bool, error) {
 	if len(state.Messages) == 0 {
 		return false, nil
 	}
-
 	a.chat.ResetMessages(append([]ChatMessage(nil), state.Messages...))
 	if mode, ok := parseSavedUsageMode(state.UsageMode); ok {
 		a.router.SetMode(mode)
@@ -142,9 +171,24 @@ func (a *App) restoreChatSession() (bool, error) {
 	a.restoredMessageCount = len(state.Messages)
 	a.chat.AddMessage(ChatMessage{
 		Role:    "status",
-		Content: fmt.Sprintf("%s (%d messages). Use /clear to start fresh.", restoredSessionPrefix, len(state.Messages)),
+		Content: fmt.Sprintf(i18n.Msg().RestoredSessionNotice, currentRestoredSessionPrefix(), len(state.Messages)),
 	})
 	return true, nil
+}
+
+func remoteSessionBackend(projectPath string) (*remotesession.Client, string, bool) {
+	if !config.HasRemoteBackend() {
+		return nil, "", false
+	}
+	workspaceID, err := engine.StableWorkspaceID(projectPath)
+	if err != nil || strings.TrimSpace(workspaceID) == "" {
+		return nil, "", false
+	}
+	return remotesession.NewClient(config.RemoteBaseURL(), config.RemoteToken()), workspaceID, true
+}
+
+func remoteSessionFileLabel(workspaceID string) string {
+	return "remote://" + strings.TrimSpace(workspaceID)
 }
 
 func (a App) sessionProjectPath() string {
@@ -201,7 +245,7 @@ func sanitizeSessionStem(name string) string {
 func filterSessionMessages(messages []ChatMessage) []ChatMessage {
 	out := make([]ChatMessage, 0, len(messages))
 	for _, msg := range messages {
-		if strings.HasPrefix(strings.TrimSpace(msg.Content), restoredSessionPrefix) {
+		if isRestoredSessionNotice(msg.Content) {
 			continue
 		}
 		out = append(out, msg)
@@ -249,14 +293,26 @@ func (a App) memorySummary() string {
 		}
 	}
 
-	lines := []string{noCompactedMemoryNotice}
+	lines := []string{i18n.Msg().NoCompactedMemoryNotice}
 	if a.restoredSession {
-		lines = append(lines, fmt.Sprintf("%s at %s.", restoredSessionPrefix, sessionTimeLabel(a.lastSessionSavedAt)))
+		lines = append(lines, fmt.Sprintf(i18n.Msg().MemoryRestoredAt, currentRestoredSessionPrefix(), sessionTimeLabel(a.lastSessionSavedAt)))
 	}
 	if a.sessionFile != "" {
 		lines = append(lines, fmt.Sprintf("Session file: %s", a.sessionFile))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func currentRestoredSessionPrefix() string {
+	return i18n.Msg().RestoredSessionPrefix
+}
+
+func isRestoredSessionNotice(content string) bool {
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, restoredSessionPrefix) {
+		return true
+	}
+	return strings.HasPrefix(content, currentRestoredSessionPrefix())
 }
 
 func sessionTimeLabel(value string) string {

@@ -34,6 +34,7 @@ var rootSlashCommandSuggestions = []slashCommandSuggestion{
 	{Command: "/clear", Description: "Clear conversation"},
 	{Command: "/compact", Description: "Compact chat history"},
 	{Command: "/model", Description: "Switch model profile"},
+	{Command: "/approval", Description: "Switch approval behavior"},
 	{Command: "/memory", Description: "Show compacted session memory"},
 	{Command: "/status", Description: "Show session status"},
 	{Command: "/cost", Description: "Show session cost"},
@@ -47,6 +48,12 @@ var modelSlashCommandSuggestions = []slashCommandSuggestion{
 	{Command: "/model fast", Description: "Fastest/cheapest routing"},
 	{Command: "/model balanced", Description: "Default mode"},
 	{Command: "/model power", Description: "Highest quality routing"},
+}
+
+var approvalSlashCommandSuggestions = []slashCommandSuggestion{
+	{Command: "/approval manual", Description: "Ask before writes and execution"},
+	{Command: "/approval safe", Description: "Auto-approve safe writes and checks"},
+	{Command: "/approval autopilot", Description: "Auto-select verified candidates"},
 }
 
 // ChatMessage represents a message in the chat panel.
@@ -648,6 +655,8 @@ func (c ChatPanel) currentSlashSuggestions() []slashCommandSuggestion {
 	base := rootSlashCommandSuggestions
 	if input == "/model" || strings.HasPrefix(input, "/model ") {
 		base = modelSlashCommandSuggestions
+	} else if input == "/approval" || strings.HasPrefix(input, "/approval ") {
+		base = approvalSlashCommandSuggestions
 	}
 
 	matches := make([]slashCommandSuggestion, 0, len(base))

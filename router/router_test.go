@@ -13,11 +13,14 @@ import (
 // stubProvider is a minimal Provider for testing.
 // Unified: supports response, failChat, failStream fields.
 type stubProvider struct {
-	name       string
-	available  bool
-	response   string
-	failChat   bool
-	failStream bool
+	name         string
+	available    bool
+	response     string
+	inputTokens  int
+	outputTokens int
+	cost         float64
+	failChat     bool
+	failStream   bool
 }
 
 func (s *stubProvider) Name() string { return s.name }
@@ -32,7 +35,13 @@ func (s *stubProvider) Chat(_ context.Context, _ []Message, _ string, _ int) (st
 	if resp == "" {
 		resp = "ok"
 	}
-	return resp, Usage{Provider: s.name, Model: s.name}, nil
+	return resp, Usage{
+		Provider:     s.name,
+		Model:        s.name,
+		InputTokens:  s.inputTokens,
+		OutputTokens: s.outputTokens,
+		Cost:         s.cost,
+	}, nil
 }
 
 func (s *stubProvider) ChatStream(_ context.Context, _ []Message, _ string, _ int) (<-chan StreamChunk, error) {
@@ -112,6 +121,44 @@ func TestNewRouterFromConfig_Chat(t *testing.T) {
 	}
 	if content != "test response" {
 		t.Fatalf("Chat() = %q, want %q", content, "test response")
+	}
+}
+
+func TestRoute_RemoteOnlyProvider(t *testing.T) {
+	remote := &stubProvider{name: "remote", available: true, response: "remote response"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"remote": {Provider: remote, Access: AccessAPI},
+		},
+		UsageMode: "balanced",
+	})
+
+	result, err := r.Route(TaskExplain)
+	if err != nil {
+		t.Fatalf("Route() error = %v", err)
+	}
+	if result.Actual != "remote" {
+		t.Fatalf("Route().Actual = %q, want remote", result.Actual)
+	}
+	if result.Requested != "remote" {
+		t.Fatalf("Route().Requested = %q, want remote", result.Requested)
+	}
+	if result.Provider != remote {
+		t.Fatal("Route().Provider did not return the registered remote provider")
+	}
+}
+
+func TestBuildProviderForAdaptive_RemoteOnlyProvider(t *testing.T) {
+	remote := &stubProvider{name: "remote", available: true, response: "remote response"}
+	r := NewRouterFromConfig(RouterConfig{
+		Providers: map[string]ProviderEntry{
+			"remote": {Provider: remote, Access: AccessAPI},
+		},
+		UsageMode: "power",
+	})
+
+	if got := r.BuildProviderForAdaptive(PhaseCode); got != "remote" {
+		t.Fatalf("BuildProviderForAdaptive(PhaseCode) = %q, want remote", got)
 	}
 }
 
@@ -292,6 +339,13 @@ func TestProviderAttemptTimeout_BalancedCodeModerate(t *testing.T) {
 	got := providerAttemptTimeout(ModeBalanced, PhaseCode, "gemini")
 	if got != 90*time.Second {
 		t.Fatalf("providerAttemptTimeout(balanced, code, gemini) = %s, want 90s", got)
+	}
+}
+
+func TestProviderAttemptTimeout_BalancedFixModerate(t *testing.T) {
+	got := providerAttemptTimeout(ModeBalanced, PhaseFix, "gemini")
+	if got != 90*time.Second {
+		t.Fatalf("providerAttemptTimeout(balanced, fix, gemini) = %s, want 90s", got)
 	}
 }
 

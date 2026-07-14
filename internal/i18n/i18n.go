@@ -75,6 +75,51 @@ type Messages struct {
 	ChatActivityChunkOne          string
 	ChatActivityChunkMany         string
 	ChatActivityChars             string
+	ApprovalTitle                 string
+	ApprovalPendingLabel          string
+	ApprovalActionHint            string
+	ApprovalNone                  string
+	ApprovalPendingWrite          string
+	ApprovalPlannedCommand        string
+	ApprovalDepsConfirm           string
+	ApprovalTestsConfirm          string
+	ApprovalModeLabel             string
+	ApprovalModeManual            string
+	ApprovalModeSafe              string
+	ApprovalModeAutopilot         string
+	ApprovalModeChanged           string
+	ApprovalModeHelp              string
+	ApprovalAutoWrite             string
+	ApprovalAutoWriteAutopilot    string
+	ApprovalAutoDeps              string
+	ApprovalAutoTests             string
+	AutomationCandidateStarted    string
+	AutomationCandidateRunning    string
+	AutomationCandidateVerifying  string
+	AutomationCandidatePassed     string
+	AutomationCandidateRejected   string
+	AutomationCandidateFailed     string
+	AutomationCandidateCanceled   string
+	AutomationCandidateSelected   string
+	AutomationCandidateFallback   string
+	BuildDepsDetectFailed         string
+	BuildTestsDetectFailed        string
+	BuildDepsExecError            string
+	BuildDepsExecFailed           string
+	BuildDepsSkipped              string
+	BuildTestsSkipped             string
+	ExecDepsLabel                 string
+	ExecTestsLabel                string
+	ExecStarted                   string
+	ExecFinished                  string
+	ExecCommand                   string
+	ExecExitCode                  string
+	ExecDuration                  string
+	ExecOutput                    string
+	RestoredSessionPrefix         string
+	RestoredSessionNotice         string
+	NoCompactedMemoryNotice       string
+	MemoryRestoredAt              string
 
 	// Cost
 	CostSession      string
@@ -192,7 +237,7 @@ var en = Messages{
 
 	ChatWelcome:                   "Welcome! I'm here to help you build and modify your project.",
 	ChatPrompt:                    "What would you like to do?",
-	ChatCommandHint:               "Commands: /model [fast|balanced|power] | /clear | /status | /cost | /exit (or Ctrl+D)",
+	ChatCommandHint:               "Commands: /model [fast|balanced|power] | /approval [manual|safe|autopilot] | /clear | /status | /cost | /exit (or Ctrl+D)",
 	ChatThinking:                  "Thinking...",
 	ChatWorking:                   "Working on it...",
 	ChatPlaceholder:               "Type your message... (Enter to send, / for commands)",
@@ -214,6 +259,51 @@ var en = Messages{
 	ChatActivityChunkOne:          "%d chunk",
 	ChatActivityChunkMany:         "%d chunks",
 	ChatActivityChars:             "%d chars",
+	ApprovalTitle:                 "Pending Approval",
+	ApprovalPendingLabel:          "Pending approval",
+	ApprovalActionHint:            "Use /approve or /deny (or Y/n).",
+	ApprovalNone:                  "No pending approval.",
+	ApprovalPendingWrite:          "Pending write: %d files",
+	ApprovalPlannedCommand:        "Planned command: %s",
+	ApprovalDepsConfirm:           "Install dependencies now? This may execute scripts from generated project files. (Y/n)",
+	ApprovalTestsConfirm:          "Run project tests now?",
+	ApprovalModeLabel:             "Approval mode",
+	ApprovalModeManual:            "Manual",
+	ApprovalModeSafe:              "Safe",
+	ApprovalModeAutopilot:         "Autopilot",
+	ApprovalModeChanged:           "Approval mode: %s",
+	ApprovalModeHelp:              "/approval [manual|safe|autopilot]",
+	ApprovalAutoWrite:             "Safe mode auto-approved writing %d files.",
+	ApprovalAutoWriteAutopilot:    "Autopilot applied a verified candidate and wrote %d files.",
+	ApprovalAutoDeps:              "Safe mode auto-approved dependency install.",
+	ApprovalAutoTests:             "Safe mode auto-approved test execution.",
+	AutomationCandidateStarted:    "Running multi-provider candidate verification.",
+	AutomationCandidateRunning:    "%s generating",
+	AutomationCandidateVerifying:  "%s verifying",
+	AutomationCandidatePassed:     "%s passed",
+	AutomationCandidateRejected:   "%s rejected",
+	AutomationCandidateFailed:     "%s failed",
+	AutomationCandidateCanceled:   "%s canceled",
+	AutomationCandidateSelected:   "Selected %s after verifying %d/%d candidates.",
+	AutomationCandidateFallback:   "No candidate passed local verification. Falling back to manual approval.",
+	BuildDepsDetectFailed:         "Dependency detection failed: %s",
+	BuildTestsDetectFailed:        "Test detection failed: %s",
+	BuildDepsExecError:            "Error installing dependencies: %s",
+	BuildDepsExecFailed:           "Dependency install failed:\n%s",
+	BuildDepsSkipped:              "Skipped dependency install and tests. Run them manually when you're ready.",
+	BuildTestsSkipped:             "Skipped tests. Run them manually when you're ready.",
+	ExecDepsLabel:                 "dependency install",
+	ExecTestsLabel:                "tests",
+	ExecStarted:                   "Running %s",
+	ExecFinished:                  "%s finished",
+	ExecCommand:                   "Command: %s",
+	ExecExitCode:                  "Exit code: %d",
+	ExecDuration:                  "Duration: %s",
+	ExecOutput:                    "Output: %s",
+	RestoredSessionPrefix:         "Restored previous session",
+	RestoredSessionNotice:         "%s (%d messages). Use /clear to start fresh.",
+	NoCompactedMemoryNotice:       "No compacted memory yet. Conversation is still within the active context window.",
+	MemoryRestoredAt:              "%s at %s.",
 
 	CostSession:      "Session Cost",
 	CostMonth:        "Monthly Total",
@@ -323,7 +413,7 @@ var zh = Messages{
 
 	ChatWelcome:                   "欢迎！我来帮你构建和修改项目。",
 	ChatPrompt:                    "你想做什么？",
-	ChatCommandHint:               "命令：/model [fast|balanced|power] | /clear | /status | /cost | /exit（或 Ctrl+D）",
+	ChatCommandHint:               "命令：/model [fast|balanced|power] | /approval [manual|safe|autopilot] | /clear | /status | /cost | /exit（或 Ctrl+D）",
 	ChatThinking:                  "正在思考...",
 	ChatWorking:                   "正在处理...",
 	ChatPlaceholder:               "输入消息... (Enter 发送, / 查看命令)",
@@ -345,6 +435,51 @@ var zh = Messages{
 	ChatActivityChunkOne:          "%d 个片段",
 	ChatActivityChunkMany:         "%d 个片段",
 	ChatActivityChars:             "%d 字符",
+	ApprovalTitle:                 "待确认操作",
+	ApprovalPendingLabel:          "待确认操作",
+	ApprovalActionHint:            "使用 /approve 或 /deny（或 Y/n）。",
+	ApprovalNone:                  "当前没有待确认操作。",
+	ApprovalPendingWrite:          "待写入 %d 个文件",
+	ApprovalPlannedCommand:        "计划执行命令：%s",
+	ApprovalDepsConfirm:           "现在安装依赖吗？这可能会执行生成项目中的脚本。(Y/n)",
+	ApprovalTestsConfirm:          "现在运行项目测试吗？",
+	ApprovalModeLabel:             "审批模式",
+	ApprovalModeManual:            "手动",
+	ApprovalModeSafe:              "安全",
+	ApprovalModeAutopilot:         "自动驾驶",
+	ApprovalModeChanged:           "审批模式：%s",
+	ApprovalModeHelp:              "/approval [manual|safe|autopilot]",
+	ApprovalAutoWrite:             "安全模式已自动批准写入 %d 个文件。",
+	ApprovalAutoWriteAutopilot:    "自动驾驶已应用通过验证的候选，并写入 %d 个文件。",
+	ApprovalAutoDeps:              "安全模式已自动批准安装依赖。",
+	ApprovalAutoTests:             "安全模式已自动批准运行测试。",
+	AutomationCandidateStarted:    "正在运行多 provider 候选验证。",
+	AutomationCandidateRunning:    "%s 生成中",
+	AutomationCandidateVerifying:  "%s 验证中",
+	AutomationCandidatePassed:     "%s 已通过",
+	AutomationCandidateRejected:   "%s 未通过",
+	AutomationCandidateFailed:     "%s 失败",
+	AutomationCandidateCanceled:   "%s 已取消",
+	AutomationCandidateSelected:   "已选择 %s，通过验证 %d/%d 个候选。",
+	AutomationCandidateFallback:   "没有候选通过本地验证，已回退为手动确认。",
+	BuildDepsDetectFailed:         "依赖检测失败：%s",
+	BuildTestsDetectFailed:        "测试检测失败：%s",
+	BuildDepsExecError:            "安装依赖时出错：%s",
+	BuildDepsExecFailed:           "依赖安装失败：\n%s",
+	BuildDepsSkipped:              "已跳过依赖安装和测试。准备好后可手动运行。",
+	BuildTestsSkipped:             "已跳过测试。准备好后可手动运行。",
+	ExecDepsLabel:                 "依赖安装",
+	ExecTestsLabel:                "测试",
+	ExecStarted:                   "正在执行%s",
+	ExecFinished:                  "%s已完成",
+	ExecCommand:                   "命令：%s",
+	ExecExitCode:                  "退出码：%d",
+	ExecDuration:                  "耗时：%s",
+	ExecOutput:                    "输出：%s",
+	RestoredSessionPrefix:         "已恢复上次会话",
+	RestoredSessionNotice:         "%s（%d 条消息）。使用 /clear 可重新开始。",
+	NoCompactedMemoryNotice:       "还没有压缩记忆。当前对话仍在活动上下文窗口内。",
+	MemoryRestoredAt:              "%s，时间：%s。",
 
 	CostSession:      "本次费用",
 	CostMonth:        "本月累计",

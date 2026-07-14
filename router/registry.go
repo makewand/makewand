@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 )
 
 func (r *Router) registeredProviderNames() []string {
@@ -17,6 +16,9 @@ func (r *Router) registeredProviderNames() []string {
 
 	names := make([]string, 0, len(r.providers))
 	for name := range r.providers {
+		if !r.isProviderAllowed(name) {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -27,6 +29,9 @@ func (r *Router) registeredProviderNames() []string {
 // It caches instances so the same (provider, model) combination reuses the same instance.
 func (r *Router) resolveProvider(providerName, modelID string) (Provider, error) {
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
+	if !r.isProviderAllowed(providerName) {
+		return nil, fmt.Errorf("provider %q is not allowed", providerName)
+	}
 	key := providerKey{name: providerName, modelID: modelID}
 
 	r.providerMu.Lock()
@@ -36,10 +41,14 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 		return p, nil
 	}
 
-	// If a CLI provider is already registered for this provider name, use it
-	// (CLI providers ignore modelID — they use subscription defaults)
+	// Reuse explicitly registered providers when they are model-agnostic, or
+	// when no factory exists to materialize model-specific instances.
 	if existing, ok := r.providers[providerName]; ok {
-		if _, isCLI := existing.(*CLIProvider); isCLI {
+		if _, isCLI := existing.(*CLIProvider); isCLI || modelID == "" {
+			r.providerCache[key] = existing
+			return existing, nil
+		}
+		if _, hasFactory := getProviderFactory(providerName); !hasFactory {
 			r.providerCache[key] = existing
 			return existing, nil
 		}
@@ -60,6 +69,9 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 
 // Get returns a specific provider by name.
 func (r *Router) Get(name string) (Provider, error) {
+	if !r.isProviderAllowed(name) {
+		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q is not allowed", name), nil)
+	}
 	r.providerMu.Lock()
 	p, ok := r.providers[name]
 	r.providerMu.Unlock()
@@ -85,16 +97,21 @@ func (r *Router) RegisterProvider(name string, provider Provider, access AccessT
 
 	r.providerMu.Lock()
 	r.providers[name] = provider
+	// Collect stale cache keys before deleting to avoid map mutation during iteration.
+	var staleKeys []providerKey
 	for k := range r.providerCache {
 		if k.name == name {
-			delete(r.providerCache, k)
+			staleKeys = append(staleKeys, k)
 		}
 	}
+	for _, k := range staleKeys {
+		delete(r.providerCache, k)
+	}
 	r.providerCache[providerKey{name: name, modelID: ""}] = provider
+	r.accessTypes[name] = access
 	r.providerMu.Unlock()
 
 	r.mu.Lock()
-	r.accessTypes[name] = access
 	r.cachedAvailAt = time.Time{}
 	r.mu.Unlock()
 	return nil
@@ -114,6 +131,9 @@ func (r *Router) Available() []string {
 	r.providerMu.Lock()
 	var names []string
 	for name, p := range r.providers {
+		if !r.isProviderAllowed(name) {
+			continue
+		}
 		if p.IsAvailable() {
 			if blocked, _ := r.isCircuitOpen(name); blocked {
 				continue
@@ -131,20 +151,43 @@ func (r *Router) Available() []string {
 
 // getProvider returns a provider by name (thread-safe).
 func (r *Router) getProvider(name string) (Provider, bool) {
+	if !r.isProviderAllowed(name) {
+		return nil, false
+	}
 	r.providerMu.Lock()
 	defer r.providerMu.Unlock()
 	p, ok := r.providers[name]
 	return p, ok
 }
 
+func (r *Router) remoteOnlyProvider() (string, Provider, bool) {
+	if !r.isProviderAllowed("remote") {
+		return "", nil, false
+	}
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+
+	if len(r.providers) != 1 {
+		return "", nil, false
+	}
+	p, ok := r.providers["remote"]
+	if !ok || p == nil || !p.IsAvailable() {
+		return "", nil, false
+	}
+	return "remote", p, true
+}
+
 // IsSubscription returns true if the named provider uses subscription access.
 func (r *Router) IsSubscription(name string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
 	return r.accessTypes[name] == AccessSubscription
 }
 
 func (r *Router) isBuildProviderAvailable(name, modelID string) bool {
+	if !r.isProviderAllowed(name) {
+		return false
+	}
 	r.providerMu.Lock()
 	defer r.providerMu.Unlock()
 

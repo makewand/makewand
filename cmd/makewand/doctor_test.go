@@ -2,8 +2,11 @@ package main
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
@@ -62,6 +65,85 @@ func TestDetectConfiguredProviders(t *testing.T) {
 	assertContains(t, got, "claude (cli)")
 	assertContains(t, got, "codex (cli)")
 	assertContains(t, got, "gemini (api)")
+}
+
+func TestDetectConfiguredProviders_IncludesRemote(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
+
+	got := detectConfiguredProviders(config.DefaultConfig())
+	assertContains(t, got, "remote (http)")
+}
+
+func TestRunDoctor_AllowsRemoteOnlyConfiguration(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
+
+	report, failCount, warnCount := runDoctor(config.DefaultConfig(), nil, doctorOptions{
+		modes: []model.UsageMode{model.ModeBalanced},
+	})
+	if failCount != 0 {
+		t.Fatalf("failCount = %d, want 0", failCount)
+	}
+	if warnCount != 0 {
+		t.Fatalf("warnCount = %d, want 0", warnCount)
+	}
+
+	assertDoctorCheckStatus(t, report.Checks, "remote backend", doctorPass)
+	assertDoctorCheckStatus(t, report.Checks, "model configuration", doctorPass)
+}
+
+func TestResolveRemoteDoctorTarget_UsesFlagsThenEnv(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://env.example")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "env-token")
+
+	target := resolveRemoteDoctorTarget(doctorOptions{
+		remoteURL:     "http://flag.example/",
+		remoteToken:   "flag-token",
+		remoteTimeout: 3 * time.Second,
+	})
+	if target.url != "http://flag.example" {
+		t.Fatalf("target.url = %q, want %q", target.url, "http://flag.example")
+	}
+	if target.token != "flag-token" {
+		t.Fatalf("target.token = %q, want %q", target.token, "flag-token")
+	}
+
+	target = resolveRemoteDoctorTarget(doctorOptions{remoteTimeout: 2 * time.Second})
+	if target.url != "http://env.example" {
+		t.Fatalf("env target.url = %q, want %q", target.url, "http://env.example")
+	}
+	if target.token != "env-token" {
+		t.Fatalf("env target.token = %q, want %q", target.token, "env-token")
+	}
+}
+
+func TestRunRemoteDoctorChecks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/health":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v1/models":
+			if req.Header.Get("Authorization") != "Bearer secret" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"codex"},{"id":"claude"}]}`))
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	checks := runRemoteDoctorChecks(remoteDoctorTarget{
+		url:     server.URL,
+		token:   "secret",
+		timeout: 2 * time.Second,
+	})
+	assertDoctorCheckStatus(t, checks, "remote service health", doctorPass)
+	assertDoctorCheckStatus(t, checks, "remote service models", doctorPass)
 }
 
 func TestUniqueProbeProviders(t *testing.T) {
@@ -211,4 +293,17 @@ func assertContainsSubstring(t *testing.T, got string, wantSubstr string) {
 	if !strings.Contains(got, wantSubstr) {
 		t.Fatalf("string %q does not contain %q", got, wantSubstr)
 	}
+}
+
+func assertDoctorCheckStatus(t *testing.T, checks []doctorCheck, name string, want doctorStatus) {
+	t.Helper()
+	for _, check := range checks {
+		if check.Name == name {
+			if check.Status != want {
+				t.Fatalf("check %q status = %q, want %q", name, check.Status, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("check %q not found in %+v", name, checks)
 }

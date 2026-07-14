@@ -1,0 +1,20 @@
+[Unit]
+Description=makewand remote server
+After=network.target
+
+[Service]
+User=makewand
+Group=makewand
+WorkingDirectory=/srv/makewand
+EnvironmentFile=/etc/makewand/makewand.env
+ExecStart=/usr/local/bin/makewand serve --listen 127.0.0.1:8080 --enable-users --data-dir /var/lib/makewand --auth-config /etc/makewand/server_auth.json
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/makewand /srv/makewand
+
+[Install]
+WantedBy=multi-user.target

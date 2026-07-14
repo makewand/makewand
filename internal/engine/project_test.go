@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -77,5 +78,26 @@ func TestScanFiles_ReturnsRootError(t *testing.T) {
 
 	if err := proj.ScanFiles(); err == nil {
 		t.Fatal("ScanFiles should return an error when the project root is missing")
+	}
+}
+
+func TestOpenProjectLimited_TruncatesLargeTree(t *testing.T) {
+	projectDir := t.TempDir()
+	for i := 0; i < 40; i++ {
+		path := filepath.Join(projectDir, fmt.Sprintf("file-%02d.txt", i))
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+
+	proj, err := OpenProjectLimited(projectDir, 10)
+	if err != nil {
+		t.Fatalf("OpenProjectLimited: %v", err)
+	}
+	if !proj.ScanTruncated {
+		t.Fatal("expected ScanTruncated to be true")
+	}
+	if got := len(proj.Files); got > 11 {
+		t.Fatalf("len(Files) = %d, want <= 11 (root + 10 entries)", got)
 	}
 }

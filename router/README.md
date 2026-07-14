@@ -70,13 +70,21 @@ http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
 Endpoints:
-- `POST /v1/chat/completions` — Chat completions (non-streaming)
+- `POST /v1/chat/completions` — Chat completions (`stream=true` supported)
+- `POST /v1/responses` — Responses API subset (`stream=true` supported)
 - `GET /v1/models` — List available providers
 - `GET /health` — Health check
 
 The HTTP facade accepts a provider name from `/v1/models` in the `model` field
-to force a specific provider. `max_tokens`, `temperature`, and HTTP streaming
-are not yet supported and return `400`.
+to force a specific provider. It also accepts common alias families such as
+`gpt-*`, `o1*`, `o3*`, and `o4*` for Codex-backed routing, plus `claude*`,
+`gemini*`, and `codex*`. `max_tokens` and `temperature` are accepted but
+currently ignored for compatibility. `response_format` supports `json_object`
+and a pragmatic subset of `json_schema`; `tools` and `tool_choice` provide a
+basic function-calling compatibility layer. When wrapped by `makewand serve`,
+each response also carries `X-Request-Id` for tracing and can be paired with
+the server-side usage ledger, admin APIs, embedded `/admin` console, and
+`/metrics` endpoint.
 
 ### Strategy Hot-Reload
 

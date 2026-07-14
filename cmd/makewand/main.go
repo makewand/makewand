@@ -43,14 +43,19 @@ Claude, Gemini, and Codex through adaptive mode-based routing
   makewand --print "..." - Run one prompt and print the result (CI/headless)
   makewand new     - Create a new project with guided wizard
   makewand chat    - Chat with AI about your project
+  makewand serve   - Expose your configured backend for your other devices
+  makewand token   - Manage remote server auth tokens
+  makewand audit   - Inspect server audit logs
+  makewand usage   - Inspect structured server usage logs
+  makewand user    - Manage registered server users
   makewand preview - Start a preview server
   makewand setup   - Configure AI providers and routing preferences`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
-				fmt.Println("No AI models configured. Run 'makewand setup' first.")
+			if !hasUsableBackend(cfg) {
+				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
 				return nil
 			}
 
@@ -89,6 +94,12 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 
 	rootCmd.AddCommand(newCmd())
 	rootCmd.AddCommand(chatCmd())
+	rootCmd.AddCommand(serveCmd())
+	rootCmd.AddCommand(tokenCmd())
+	rootCmd.AddCommand(auditCmd())
+	rootCmd.AddCommand(usageCmd())
+	rootCmd.AddCommand(quotaCmd())
+	rootCmd.AddCommand(userCmd())
 	rootCmd.AddCommand(previewCmd())
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())
@@ -112,15 +123,18 @@ func newCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
+			if !hasUsableBackend(cfg) {
 				fmt.Println("Welcome to makewand!")
 				fmt.Println()
-				fmt.Println("No AI models found. Install a CLI tool or set an API key:")
+				fmt.Println("No AI models or remote backend found. Install a CLI tool, set an API key, or configure a remote makewand server:")
 				fmt.Println()
 				fmt.Println("  Option 1: Install Claude Code, Gemini CLI, or Codex CLI (subscription)")
 				fmt.Println("  Option 2: Set API keys:")
 				fmt.Println("    export ANTHROPIC_API_KEY=sk-ant-...")
 				fmt.Println("    export GEMINI_API_KEY=AI...")
+				fmt.Println("  Option 3: Use a remote backend:")
+				fmt.Println("    export MAKEWAND_REMOTE_URL=http://your-main-machine:8080")
+				fmt.Println("    export MAKEWAND_REMOTE_TOKEN=...")
 				fmt.Println()
 				fmt.Println("Run 'makewand setup' to check your configuration.")
 				return nil
@@ -152,8 +166,8 @@ func chatCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 
-			if !cfg.HasAnyModel() {
-				fmt.Println("No AI models configured. Run 'makewand setup' first.")
+			if !hasUsableBackend(cfg) {
+				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
 				return nil
 			}
 
@@ -273,6 +287,7 @@ func setupCmd() *cobra.Command {
 				fmt.Println("  [ ] OpenAI: not configured")
 			}
 			fmt.Println()
+			printRemoteBackendStatus()
 
 			fmt.Printf("  Language: %s\n", cfg.Language)
 			fmt.Printf("  Default model: %s\n", cfg.DefaultModel)
@@ -297,6 +312,10 @@ func setupCmd() *cobra.Command {
 				fmt.Println("  export ANTHROPIC_API_KEY=sk-ant-...")
 				fmt.Println("  export GEMINI_API_KEY=AI...")
 				fmt.Println("  export OPENAI_API_KEY=sk-...")
+				fmt.Println()
+				fmt.Println("Or use a remote backend:")
+				fmt.Println("  export MAKEWAND_REMOTE_URL=http://your-main-machine:8080")
+				fmt.Println("  export MAKEWAND_REMOTE_TOKEN=...")
 			}
 			fmt.Println()
 			configPath, pathErr := config.ConfigPath()
@@ -401,7 +420,8 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	}
 	task := classifyPromptTask(prompt)
 	messages := []model.Message{{Role: "user", Content: prompt}}
-	systemPrompt := buildHeadlessSystemPrompt(task, prompt)
+	project := openHeadlessProject(".")
+	systemPrompt := buildHeadlessSystemPrompt(project, task, router.Mode(), prompt)
 
 	// Auto-select timeout based on mode when user didn't set --timeout explicitly.
 	if timeout <= 0 {
@@ -416,7 +436,23 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 		route   model.RouteResult
 		err     error
 	)
-	if router.ModeSet() && router.Mode() == model.ModePower {
+	if shouldUseHeadlessCandidateSelection(cfg, task, project) {
+		selection := engine.RunCandidateSelection(
+			ctx,
+			router,
+			project,
+			promptTaskToBuildPhase(task),
+			messages,
+			systemPrompt,
+			nil,
+		)
+		if strings.TrimSpace(selection.Content) == "" {
+			return fmt.Errorf("no candidate provider produced a response")
+		}
+		content = selection.Content
+		usage = selection.Usage
+		route.Actual = selection.Provider
+	} else if router.ModeSet() && router.Mode() == model.ModePower {
 		content, usage, route, err = router.ChatBest(ctx, promptTaskToBuildPhase(task), messages, systemPrompt)
 	} else {
 		content, usage, route, err = router.Chat(ctx, task, messages, systemPrompt)
@@ -452,6 +488,31 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 
 	fmt.Println(strings.TrimSpace(content))
 	return nil
+}
+
+func shouldUseHeadlessCandidateSelection(cfg *config.Config, task model.TaskType, project *engine.Project) bool {
+	if project == nil || cfg == nil {
+		return false
+	}
+	if config.NormalizeApprovalMode(cfg.ApprovalMode) != config.ApprovalModeAuto {
+		return false
+	}
+	switch task {
+	case model.TaskCode, model.TaskFix:
+		return true
+	default:
+		return false
+	}
+}
+
+const headlessProjectScanEntryLimit = 512
+
+func openHeadlessProject(path string) *engine.Project {
+	proj, err := engine.OpenProjectLimited(path, headlessProjectScanEntryLimit)
+	if err != nil {
+		return nil
+	}
+	return proj
 }
 
 func newHeadlessTraceSink() (*diag.JSONLTraceSink, string, error) {
@@ -493,8 +554,8 @@ func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {
 	}
 }
 
-func buildHeadlessSystemPrompt(task model.TaskType, prompt string) string {
-	base := "You are makewand, a multi-provider coding router. Provide direct, actionable answers."
+func buildHeadlessSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode, prompt string) string {
+	base := tui.BuildSystemPrompt(project, task, mode)
 	headlessRules := "Headless mode rules: do not ask for permissions, do not claim to write files, and do not ask follow-up questions. Return the final answer directly."
 	if headlessCodeOnlyRequested(task, prompt) {
 		return base + " " + headlessRules + " For code/file requests, output only the final code content. No markdown fences. No summaries."

@@ -52,7 +52,7 @@ func TestDepsConfirm_DeclinePath(t *testing.T) {
 		t.Fatal("state should be StateConfirmDeps after entering deps phase")
 	}
 	last := app.chat.messages[len(app.chat.messages)-1].Content
-	if !strings.Contains(last, depsInstallConfirmPrompt) {
+	if !strings.Contains(last, i18n.Msg().ApprovalDepsConfirm) {
 		t.Fatalf("deps confirm prompt missing base text: %q", last)
 	}
 	if !strings.Contains(last, "npm install") {
@@ -115,7 +115,7 @@ func TestDepsAndTestsConfirm_AcceptPath(t *testing.T) {
 		t.Fatal("state should be StateConfirmTests after deps success")
 	}
 	last := app.chat.messages[len(app.chat.messages)-1].Content
-	if !strings.Contains(last, "Run project tests now?") {
+	if !strings.Contains(last, i18n.Msg().ApprovalTestsConfirm) {
 		t.Fatalf("tests confirm prompt missing text: %q", last)
 	}
 	if !strings.Contains(last, "npm test") {
