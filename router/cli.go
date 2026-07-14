@@ -203,9 +203,11 @@ func NewAgyCLI(binPath string) *CLIProvider {
 		return args
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		//nolint:gosec // G204: binPath is a resolved trusted CLI; args are internally built, not user-tainted (same pattern as the other providers).
 		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
 	}
 	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
+		//nolint:gosec // G204: see buildCmd above.
 		return exec.CommandContext(ctx, binPath, buildArgs(prompt)...)
 	}
 	p.checkCmd = func(ctx context.Context) *exec.Cmd {
