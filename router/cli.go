@@ -1042,11 +1042,50 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 	if errMsg == "" {
 		errMsg = runErr.Error()
 	}
+	// Subscription CLIs surface quota exhaustion as a non-zero exit with a
+	// usage-limit message on stderr, not an HTTP 429 (that path only exists for
+	// the API transports). Classify these as ErrorKindRateLimit so the quota
+	// layer seals the pool until its window resets, instead of only tripping the
+	// circuit breaker after repeated failures.
+	if looksLikeQuotaExhaustion(errMsg) {
+		return newProviderError(provider, "CLI", ErrorKindRateLimit, true, 429, errMsg, runErr)
+	}
 	base := newProviderError(provider, "CLI", ErrorKindProvider, false, 0, errMsg, runErr)
 	if looksTransient(errMsg) {
 		return &TransientCLIError{Err: newProviderError(provider, "CLI", ErrorKindNetwork, true, 0, errMsg, runErr)}
 	}
 	return base
+}
+
+// quotaExhaustionHints are substrings (lower-cased) that subscription CLIs emit
+// when a session/weekly limit is hit. Kept broad on purpose: the exact wording
+// is vendor-controlled and undocumented, and a false positive only costs a
+// temporary reroute to another pool (recoverable), whereas a miss leaves the
+// exhausted pool active. Word-boundary-ish phrases avoid matching unrelated text
+// (e.g. a user prompt that merely contains "quota").
+var quotaExhaustionHints = []string{
+	"usage limit",
+	"rate limit",
+	"quota exceeded",
+	"quota exhausted",
+	"out of quota",
+	"insufficient_quota",
+	"too many requests",
+	"resets at",
+	"limit reached",
+	"429",
+}
+
+// looksLikeQuotaExhaustion reports whether a CLI error message indicates the
+// subscription's quota/rate limit was hit (as opposed to a generic failure).
+func looksLikeQuotaExhaustion(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, hint := range quotaExhaustionHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksTransient checks if an error message matches known transient patterns.

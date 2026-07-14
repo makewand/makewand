@@ -62,9 +62,14 @@ func (r *Router) noteQuotaError(provider string, err error) {
 	if ErrorKindOf(err) != ErrorKindRateLimit {
 		return
 	}
+	// Seal only until the soonest window that could have caused the exhaustion
+	// resets — a 5-hour cap must not lock the pool out for the whole weekly
+	// window. Fall back to a conservative cooldown when no reset is known.
 	until := time.Now().Add(defaultQuotaSealCooldown)
-	if q, ok := r.quota.Snapshot().Get(provider); ok && !q.ResetAt.IsZero() && q.ResetAt.After(time.Now()) {
-		until = q.ResetAt
+	if q, ok := r.quota.Snapshot().Get(provider); ok {
+		if soonest := q.SoonestReset(); !soonest.IsZero() {
+			until = soonest
+		}
 	}
 	r.quota.MarkExhausted(provider, until)
 }

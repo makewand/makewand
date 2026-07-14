@@ -48,8 +48,9 @@ const (
 	QuotaBandOK QuotaBand = iota
 	// QuotaBandWarn: provider is between warn and crit — usable but deprioritized.
 	QuotaBandWarn
-	// QuotaBandCritical: provider is at/above crit — hard-excluded from routing
-	// unless excluding it would leave zero candidates.
+	// QuotaBandCritical: provider is at/above crit — sorted last in candidate
+	// ranking (soft signal), but never removed. Predicted quota alone can't cause
+	// a routing failure; only a confirmed-exhaustion seal hard-blocks a pool.
 	QuotaBandCritical
 )
 
@@ -70,9 +71,29 @@ type ProviderQuota struct {
 	// SourceAt is when the underlying source produced this data (not when we read
 	// it); lets callers judge staleness independent of refresh cadence.
 	SourceAt time.Time
-	// ResetAt, when non-zero, is when the binding window resets. Used by the
-	// 429-feedback path to seal a pool only until its quota actually refreshes.
+	// FiveHourResetAt / WeeklyResetAt are the per-window reset times, when known.
+	// The 429-feedback path seals only until the *soonest* future reset (see
+	// SoonestReset): a 5-hour cap must not seal a pool for the whole weekly window.
+	FiveHourResetAt time.Time
+	WeeklyResetAt   time.Time
+	// ResetAt is the window reset shown to users (weekly when known). Prefer
+	// SoonestReset for sealing decisions.
 	ResetAt time.Time
+}
+
+// SoonestReset returns the earliest future window reset among the known windows,
+// or the zero time if none is known/future. This is the conservative seal
+// target: never hold a pool past the shortest window that could have caused the
+// exhaustion.
+func (q ProviderQuota) SoonestReset() time.Time {
+	now := time.Now()
+	var soonest time.Time
+	for _, t := range []time.Time{q.FiveHourResetAt, q.WeeklyResetAt, q.ResetAt} {
+		if t.After(now) && (soonest.IsZero() || t.Before(soonest)) {
+			soonest = t
+		}
+	}
+	return soonest
 }
 
 // EffectiveUsedPct returns the binding constraint for the *subscription pool*:
@@ -343,7 +364,11 @@ func (s *QuotaSnapshotter) MarkExhausted(provider string, until time.Time) {
 	}
 	s.sealMu.Unlock()
 
-	// Reflect the seal into the current snapshot immediately.
+	// Reflect the seal into the current snapshot immediately. Hold refreshMu so a
+	// concurrent refresh() can't interleave its own read-modify-Store and clobber
+	// this update (or stamp it with a stale takenAt).
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	cur := s.Snapshot()
 	next := make(map[string]ProviderQuota, len(cur.byProvider))
 	for k, v := range cur.byProvider {
@@ -467,9 +492,9 @@ func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	q.SourceAt = time.Now()
 	q.FiveHourPct = resp.FiveHour.Utilization
 	q.WeeklyPct = resp.SevenDay.Utilization
-	if t := parseTime(resp.SevenDay.ResetsAt); !t.IsZero() {
-		q.ResetAt = t
-	}
+	q.FiveHourResetAt = parseTime(resp.FiveHour.ResetsAt)
+	q.WeeklyResetAt = parseTime(resp.SevenDay.ResetsAt)
+	q.ResetAt = q.WeeklyResetAt // weekly is the user-facing reset shown in `quota`
 	// Worst per-model weekly scoped cap.
 	for _, lim := range resp.Limits {
 		if lim.Kind == "weekly_scoped" && lim.Percent != nil {
@@ -519,24 +544,34 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 		q.HasData = true
 		q.Authed = true
 		q.SourceAt = at
-		if rl.Primary != nil {
-			p := rl.Primary.UsedPercent
-			if rl.Primary.windowMinutes() <= 600 {
-				q.FiveHourPct = &p
-			} else {
-				q.WeeklyPct = &p
+		for _, w := range []*codexWindow{rl.Primary, rl.Secondary} {
+			if w == nil {
+				continue
 			}
-			if t := parseUnixOrTime(rl.Primary.ResetsAt); !t.IsZero() {
-				q.ResetAt = t
+			p := w.UsedPercent
+			reset := parseUnixOrTime(w.ResetsAt)
+			// Classify by window length: <=600min is the 5-hour window, the
+			// larger one is weekly. A missing window_minutes (0) is ambiguous, so
+			// fall back to filling whichever percentage isn't set yet.
+			mins := w.windowMinutes()
+			switch {
+			case mins > 0 && mins <= 600:
+				q.FiveHourPct = &p
+				q.FiveHourResetAt = reset
+			case mins >= 9000:
+				q.WeeklyPct = &p
+				q.WeeklyResetAt = reset
+			case q.FiveHourPct == nil:
+				q.FiveHourPct = &p
+				q.FiveHourResetAt = reset
+			default:
+				q.WeeklyPct = &p
+				q.WeeklyResetAt = reset
 			}
 		}
-		if rl.Secondary != nil {
-			p := rl.Secondary.UsedPercent
-			if rl.Secondary.windowMinutes() >= 9000 {
-				q.WeeklyPct = &p
-			} else if q.FiveHourPct == nil {
-				q.FiveHourPct = &p
-			}
+		q.ResetAt = q.WeeklyResetAt
+		if q.ResetAt.IsZero() {
+			q.ResetAt = q.FiveHourResetAt
 		}
 		return q, nil
 	}
@@ -645,10 +680,23 @@ func (a *agyQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, bin, "models")
 	err := cmd.Run()
+	if cctx.Err() != nil {
+		// Probe timed out — return an error so the snapshotter retains last-good
+		// instead of flipping gemini to a stale/neutral reading.
+		return q, cctx.Err()
+	}
+	if err != nil {
+		// A non-zero exit is ambiguous: it could mean signed-out, but it could
+		// also be a transient agy hiccup. Stay neutral (HasData=false) rather than
+		// asserting de-auth, which would wrongly deprioritize gemini. A genuinely
+		// signed-out agy fails at call time and is handled by the circuit breaker
+		// and the confirmed-exhaustion seal path.
+		return q, nil
+	}
+	// agy exposes no usage percentage; report authed only. Banding treats an
+	// authed-but-percentless provider as neutral (OK).
 	q.HasData = true
-	q.Authed = err == nil
+	q.Authed = true
 	q.SourceAt = time.Now()
-	// agy exposes no usage percentage; leave FiveHour/Weekly nil so banding
-	// falls back to the authed/not two-state.
 	return q, nil
 }

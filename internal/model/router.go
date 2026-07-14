@@ -101,17 +101,19 @@ func NewRouter(cfg *config.Config) *Router {
 	}
 
 	// Subscription-quota awareness: attach a snapshotter so routing can steer by
-	// remaining headroom. The refresh loop's lifecycle lives here at the CLI
-	// layer (context.Background for the process lifetime); NewRouterFromConfig —
-	// used by tests and library embedders — stays quota-free unless they opt in.
+	// remaining headroom. NewRouterFromConfig — used by tests and library
+	// embedders — stays quota-free unless they opt in.
 	snap := NewDefaultQuotaSnapshotter(0)
 	rc.Quota = snap
 
 	r := NewRouterFromConfig(rc)
 
-	// Populate the first snapshot and begin periodic refresh without blocking
-	// startup (the Claude source makes a network call).
-	go snap.Start(context.Background())
+	// Populate the first snapshot once, off the startup path (the Claude source
+	// makes a network call). This is a one-shot goroutine that terminates — no
+	// long-lived ticker — so repeated NewRouter calls (e.g. eval/bench loops)
+	// don't leak background refreshers. Long-running servers that want periodic
+	// refresh call snap.Start(ctx) with a cancellable context of their own.
+	go snap.Refresh(context.Background())
 
 	// Apply explicit access type overrides from config (may override subscription defaults).
 	if cfg.ClaudeAccess != "" {
