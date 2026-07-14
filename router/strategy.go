@@ -290,12 +290,13 @@ type candidate struct {
 	name           string
 	modelID        string
 	access         AccessType
-	order          int     // original position in strategy table
-	useCount       int     // session success count
-	failureRate    float64 // fraction of requests that errored this session
-	requests       int     // total requests (counts + failures) for min-sample gate
-	qualitySamples int     // total quality outcomes (success + failure) for this phase
-	thompsonScore  float64 // sampled from Beta(α,β); higher → higher priority
+	order          int       // original position in strategy table
+	useCount       int       // session success count
+	failureRate    float64   // fraction of requests that errored this session
+	requests       int       // total requests (counts + failures) for min-sample gate
+	qualitySamples int       // total quality outcomes (success + failure) for this phase
+	thompsonScore  float64   // sampled from Beta(α,β); higher → higher priority
+	quotaBand      QuotaBand // subscription headroom band; lower (OK) sorts first
 }
 
 // minSamplesForExclusion is the default minimum number of total requests
@@ -340,6 +341,12 @@ func sortCandidatesWithMinSamples(candidates []candidate, minSamples int) {
 		hj := candidates[j].failureRate > 0.5 && candidates[j].requests >= minSamples
 		if hi != hj {
 			return !hi
+		}
+		// Subscription-quota band: prefer providers with more headroom. This is
+		// an orthogonal coarse key placed above the quality signal so a nearly
+		// exhausted pool is tried last, but Thompson still orders within a band.
+		if candidates[i].quotaBand != candidates[j].quotaBand {
+			return candidates[i].quotaBand < candidates[j].quotaBand
 		}
 		// Cold-start stability: when neither candidate has requests or quality
 		// outcomes, prefer static strategy order over random Thompson variance.
