@@ -290,10 +290,10 @@ type candidate struct {
 	name           string
 	modelID        string
 	access         AccessType
-	order          int     // original position in strategy table
-	useCount       int     // session success count
-	failureRate    float64 // fraction of requests that errored this session
-	requests       int     // total requests (counts + failures) for min-sample gate
+	order          int       // original position in strategy table
+	useCount       int       // session success count
+	failureRate    float64   // fraction of requests that errored this session
+	requests       int       // total requests (counts + failures) for min-sample gate
 	qualitySamples int       // total quality outcomes (success + failure) for this phase
 	thompsonScore  float64   // sampled from Beta(α,β); higher → higher priority
 	quotaBand      QuotaBand // subscription headroom band; lower (OK) sorts first
