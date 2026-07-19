@@ -33,13 +33,20 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 
 				// Use ChatBest: Power mode runs ensemble+judge; others use primary provider.
 				if router.ModeSet() {
-					content, usage, _, err := router.ChatBest(ctx, model.PhasePlan, messages, wizardPlanSystemPrompt)
+					content, usage, route, err := router.ChatBest(ctx, model.PhasePlan, messages, wizardPlanSystemPrompt)
+					provider := providerForUsage(usage, route)
 					if err != nil {
-						return aiResponseMsg{err: err}
+						return aiResponseMsg{
+							provider:     provider,
+							cost:         usage.Cost,
+							inputTokens:  usage.InputTokens,
+							outputTokens: usage.OutputTokens,
+							err:          err,
+						}
 					}
 					return aiResponseMsg{
 						content:      content,
-						provider:     usage.Provider,
+						provider:     provider,
 						cost:         usage.Cost,
 						inputTokens:  usage.InputTokens,
 						outputTokens: usage.OutputTokens,
@@ -147,7 +154,14 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			if a.shouldUseAutopilotCandidates() {
 				selection := runCandidateSelectionWithActivity(ctx, a.activity, router, proj, model.PhaseCode, messages, wizardBuildSystemPrompt)
 				if strings.TrimSpace(selection.content) == "" {
-					return aiResponseMsg{err: fmt.Errorf("no candidate provider produced writable project files")}
+					return aiResponseMsg{
+						provider:      selection.provider,
+						cost:          selection.usage.Cost,
+						inputTokens:   selection.usage.InputTokens,
+						outputTokens:  selection.usage.OutputTokens,
+						selectionNote: selection.selectionNote,
+						err:           selection.contentError(fmt.Errorf("no candidate provider produced writable project files")),
+					}
 				}
 				return aiResponseMsg{
 					content:       selection.content,
@@ -162,14 +176,21 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 
 			// Use ChatBest: Power mode runs ensemble+judge; others use primary provider.
 			if router.ModeSet() {
-				content, usage, _, err := router.ChatBest(ctx, model.PhaseCode, messages, wizardBuildSystemPrompt)
+				content, usage, route, err := router.ChatBest(ctx, model.PhaseCode, messages, wizardBuildSystemPrompt)
+				provider := providerForUsage(usage, route)
 				if err != nil {
-					return aiResponseMsg{err: err}
+					return aiResponseMsg{
+						provider:     provider,
+						cost:         usage.Cost,
+						inputTokens:  usage.InputTokens,
+						outputTokens: usage.OutputTokens,
+						err:          err,
+					}
 				}
 				content, usage = retryWizardBuildForMissingFiles(ctx, router, prompt, content, usage)
 				return aiResponseMsg{
 					content:      content,
-					provider:     usage.Provider,
+					provider:     providerForUsage(usage, route),
 					cost:         usage.Cost,
 					inputTokens:  usage.InputTokens,
 					outputTokens: usage.OutputTokens,
@@ -233,14 +254,17 @@ func retryWizardBuildForMissingFiles(
 	} else {
 		retryContent, retryUsage, _, err = router.Chat(ctx, model.TaskCode, retryMessages, retrySystem)
 	}
-	if err != nil || len(engine.ParseFilesBestEffort(retryContent).Files) == 0 {
-		return content, usage
-	}
-
 	total := usage
 	total.InputTokens += retryUsage.InputTokens
 	total.OutputTokens += retryUsage.OutputTokens
 	total.Cost += retryUsage.Cost
+	if err != nil || len(engine.ParseFilesBestEffort(retryContent).Files) == 0 {
+		// The retry still consumed a provider request even when it failed or did
+		// not produce writable files. Keep the original response/provider, but do
+		// not lose the known retry tokens and cost.
+		return content, total
+	}
+
 	if retryUsage.Provider != "" {
 		total.Provider = retryUsage.Provider
 	}

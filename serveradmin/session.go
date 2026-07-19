@@ -81,7 +81,7 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 		writeError(w, status, code, message)
 		return
 	}
-	key := serverauth.LoginThrottleKey(req, payload.Email)
+	key := m.limiter.ThrottleKey(req, payload.Email)
 	if allowed, retryAfter := m.limiter.Allow(key, time.Now().UTC()); !allowed {
 		writeError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("too many failed admin logins; try again in %s", retryAfter.Round(time.Second)))
 		return
@@ -199,6 +199,7 @@ func (m *SessionManager) ValidateCSRF(req *http.Request, expected string) bool {
 }
 
 func (m *SessionManager) ClearCookie(w http.ResponseWriter, req *http.Request) {
+	//nolint:gosec // G124: HttpOnly+SameSite set; Secure is intentionally conditional on TLS (loopback/tunnel deployments), which gosec cannot prove constant.
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    "",
@@ -267,6 +268,7 @@ func (m *SessionManager) parseCookie(value string) (*sessionClaims, bool) {
 }
 
 func (m *SessionManager) setCookie(w http.ResponseWriter, req *http.Request, value string, expiresAt time.Time) {
+	//nolint:gosec // G124: HttpOnly+SameSite set; Secure is intentionally conditional on TLS (loopback/tunnel deployments), which gosec cannot prove constant.
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    value,

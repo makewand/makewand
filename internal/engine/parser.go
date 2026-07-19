@@ -160,13 +160,14 @@ func ParseFiles(text string) ParseResult {
 
 		// State: saw "--- FILE: ... ---", waiting for opening fence
 		case waitingFence:
-			if fenceOpenRe.MatchString(line) {
+			switch {
+			case fenceOpenRe.MatchString(line):
 				waitingFence = false
 				inFile = true
 				inFence = true
-			} else if strings.TrimSpace(line) == "" {
+			case strings.TrimSpace(line) == "":
 				// skip blank lines between header and fence
-			} else {
+			default:
 				// Not a fence — treat the header as false positive
 				waitingFence = false
 				explanation.WriteString("--- FILE: " + currentPath + " ---\n")

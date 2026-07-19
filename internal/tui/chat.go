@@ -217,6 +217,11 @@ func (c *ChatPanel) AppendStream(text string) {
 	c.updateViewport()
 }
 
+// StreamingContent returns the response accumulated for the active stream.
+func (c *ChatPanel) StreamingContent() string {
+	return c.streamBuf.String()
+}
+
 // FinishStream finishes the current stream and adds it as a message.
 func (c *ChatPanel) FinishStream(provider string, cost float64) {
 	if c.streamBuf.Len() > 0 {
@@ -412,7 +417,7 @@ func buildHistorySummary(msgs []model.Message) string {
 		b.WriteString(render(m))
 		b.WriteString("\n")
 	}
-	b.WriteString(fmt.Sprintf("- ... %d earlier turns omitted ...\n", len(msgs)-summaryMaxLines))
+	fmt.Fprintf(&b, "- ... %d earlier turns omitted ...\n", len(msgs)-summaryMaxLines)
 	for _, m := range msgs[len(msgs)-tailCount:] {
 		b.WriteString(render(m))
 		b.WriteString("\n")
@@ -482,16 +487,17 @@ func (c *ChatPanel) renderMessages() string {
 			b.WriteString(mutedStyle.Render(wrapText(c.streamStatus, maxWidth)) + "\n")
 		}
 	} else if c.streaming {
-		if c.streamProvider != "" {
+		switch {
+		case c.streamProvider != "":
 			b.WriteString(aiMsgStyle.Render(streamLabel) + " " + spinnerStyle.Render("*") + "\n")
 			if c.streamStatus != "" {
 				b.WriteString(mutedStyle.Render(wrapText(c.streamStatus, maxWidth)) + "\n")
 			} else {
 				b.WriteString(mutedStyle.Render(i18n.Msg().ChatThinkingAnim) + "\n")
 			}
-		} else if c.streamStatus != "" {
+		case c.streamStatus != "":
 			b.WriteString(spinnerStyle.Render("* "+wrapText(c.streamStatus, maxWidth)) + "\n")
-		} else {
+		default:
 			b.WriteString(spinnerStyle.Render("* "+i18n.Msg().ChatThinkingAnim) + "\n")
 		}
 	}
@@ -779,13 +785,14 @@ func wrapText(text string, width int) string {
 		currentW := 0
 		for _, word := range words {
 			wordW := runewidth.StringWidth(word)
-			if current == "" {
+			switch {
+			case current == "":
 				current = word
 				currentW = wordW
-			} else if currentW+1+wordW <= width {
+			case currentW+1+wordW <= width:
 				current += " " + word
 				currentW += 1 + wordW
-			} else {
+			default:
 				result.WriteString(current + "\n")
 				current = word
 				currentW = wordW

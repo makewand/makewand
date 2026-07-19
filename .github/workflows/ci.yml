@@ -75,7 +75,10 @@ jobs:
         run: bash ./scripts/test_gate.sh
 
       - name: Run race tests
-        run: go test -race ./cmd/makewand ./internal/config ./internal/engine ./internal/model ./internal/tui
+        # scripts/test_race.sh is the single source of truth for race
+        # coverage; it derives its package list from `go list ./...` so the
+        # concurrency-heavy router and server* packages are always included.
+        run: bash ./scripts/test_race.sh
 
       - name: Run vet
         run: go vet ./cmd/... ./internal/... ./router

@@ -7,7 +7,7 @@ import (
 )
 
 func newTestRouterWithQuota(q QuotaController) *Router {
-	return NewRouterFromConfig(RouterConfig{Quota: q})
+	return mustNewRouter(RouterConfig{Quota: q})
 }
 
 func TestQuotaBandForReflectsSnapshot(t *testing.T) {
@@ -78,7 +78,7 @@ func TestNoteQuotaErrorSealsOnRateLimit(t *testing.T) {
 }
 
 func TestNilQuotaIsNoOp(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{}) // no quota controller
+	r := mustNewRouter(RouterConfig{}) // no quota controller
 	if allow, _ := r.beforeProviderAttempt("claude"); !allow {
 		t.Fatalf("with nil quota, provider should be allowed")
 	}

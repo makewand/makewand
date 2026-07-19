@@ -24,7 +24,7 @@ const (
 	ScopeSessionsWrite    = "sessions:write"
 	ScopeSessionsDelete   = "sessions:delete"
 	ScopeAdminTokensRead  = "admin:tokens:read"
-	ScopeAdminTokensWrite = "admin:tokens:write"
+	ScopeAdminTokensWrite = "admin:tokens:write" //nolint:gosec // G101: OAuth-style scope identifier, not a credential.
 	ScopeAdminAuditRead   = "admin:audit:read"
 	ScopeAdminUsageRead   = "admin:usage:read"
 	ScopeAdminMetricsRead = "admin:metrics:read"
@@ -134,15 +134,28 @@ type Grant struct {
 	workspacePrefixes  []string
 	allowedProviders   map[string]struct{}
 	allowedModes       map[string]struct{}
-	quotaMu            sync.Mutex
-	quotaWindowStart   time.Time
-	quotaWindowCount   int
-	quotaDayStart      time.Time
-	quotaDayCount      int
-	costDayStart       time.Time
-	costDaySpent       float64
-	costMonthStart     time.Time
-	costMonthSpent     float64
+	// usage holds the mutable quota/spend counters. It is referenced by pointer
+	// so a rebuilt authorizer can share the SAME counter state with the previous
+	// grant for a carried-over token (see carryOverGrantUsage), eliminating the
+	// copy-then-swap race where an in-flight increment on the old grant was lost.
+	usage *grantUsage
+}
+
+// grantUsage holds the in-memory quota and spend counters for a single token,
+// guarded by its own mutex. Multiple Grant instances (across an authorizer
+// rebuild) may point at the same grantUsage so that concurrent increments from
+// an in-flight request holding the old grant and new requests using the new
+// grant all accrue against one shared, mutex-protected set of counters.
+type grantUsage struct {
+	mu               sync.Mutex
+	quotaWindowStart time.Time
+	quotaWindowCount int
+	quotaDayStart    time.Time
+	quotaDayCount    int
+	costDayStart     time.Time
+	costDaySpent     float64
+	costMonthStart   time.Time
+	costMonthSpent   float64
 }
 
 var (
@@ -413,6 +426,80 @@ func (g *Grant) ProjectID() string {
 	return g.projectID
 }
 
+// Scopes returns the sorted scope set held by the grant.
+func (g *Grant) Scopes() []string {
+	if g == nil || len(g.scopes) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(g.scopes))
+	for scope := range g.scopes {
+		out = append(out, scope)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ExpiresAt returns the grant expiry, or the zero time when it never expires.
+func (g *Grant) ExpiresAt() time.Time {
+	if g == nil {
+		return time.Time{}
+	}
+	return g.expiresAt
+}
+
+// WorkspacePrefixes returns the workspace prefix allowlist, if any.
+func (g *Grant) WorkspacePrefixes() []string {
+	if g == nil || len(g.workspacePrefixes) == 0 {
+		return nil
+	}
+	return append([]string(nil), g.workspacePrefixes...)
+}
+
+// AllowedModes returns the normalized mode allowlist, if any.
+func (g *Grant) AllowedModes() []string {
+	if g == nil || len(g.allowedModes) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(g.allowedModes))
+	for mode := range g.allowedModes {
+		out = append(out, mode)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// MaxRequestsPerHour returns the hourly request quota (0 = unlimited).
+func (g *Grant) MaxRequestsPerHour() int {
+	if g == nil {
+		return 0
+	}
+	return g.maxRequestsPerHour
+}
+
+// MaxRequestsPerDay returns the daily request quota (0 = unlimited).
+func (g *Grant) MaxRequestsPerDay() int {
+	if g == nil {
+		return 0
+	}
+	return g.maxRequestsPerDay
+}
+
+// MaxCostUSDPerDay returns the daily spend budget (0 = unlimited).
+func (g *Grant) MaxCostUSDPerDay() float64 {
+	if g == nil {
+		return 0
+	}
+	return g.maxCostUSDPerDay
+}
+
+// MaxCostUSDPerMonth returns the monthly spend budget (0 = unlimited).
+func (g *Grant) MaxCostUSDPerMonth() float64 {
+	if g == nil {
+		return 0
+	}
+	return g.maxCostUSDPerMonth
+}
+
 // CheckCostBudgetAt reports whether the token has already exhausted its spend
 // budget before processing another request.
 func (g *Grant) CheckCostBudgetAt(now time.Time) error {
@@ -424,14 +511,15 @@ func (g *Grant) CheckCostBudgetAt(now time.Time) error {
 	dayWindow := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
 	monthWindow := time.Date(utcNow.Year(), utcNow.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-	g.quotaMu.Lock()
-	defer g.quotaMu.Unlock()
+	u := g.usage
+	u.mu.Lock()
+	defer u.mu.Unlock()
 
-	g.resetCostWindowsLocked(dayWindow, monthWindow)
-	if g.maxCostUSDPerDay > 0 && g.costDaySpent >= g.maxCostUSDPerDay {
+	u.resetCostWindowsLocked(dayWindow, monthWindow)
+	if g.maxCostUSDPerDay > 0 && u.costDaySpent >= g.maxCostUSDPerDay {
 		return ErrDailyCostExceeded
 	}
-	if g.maxCostUSDPerMonth > 0 && g.costMonthSpent >= g.maxCostUSDPerMonth {
+	if g.maxCostUSDPerMonth > 0 && u.costMonthSpent >= g.maxCostUSDPerMonth {
 		return ErrMonthlyCostExceeded
 	}
 	return nil
@@ -448,15 +536,16 @@ func (g *Grant) RecordCostAt(now time.Time, costUSD float64) {
 	dayWindow := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
 	monthWindow := time.Date(utcNow.Year(), utcNow.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-	g.quotaMu.Lock()
-	defer g.quotaMu.Unlock()
+	u := g.usage
+	u.mu.Lock()
+	defer u.mu.Unlock()
 
-	g.resetCostWindowsLocked(dayWindow, monthWindow)
+	u.resetCostWindowsLocked(dayWindow, monthWindow)
 	if g.maxCostUSDPerDay > 0 {
-		g.costDaySpent += costUSD
+		u.costDaySpent += costUSD
 	}
 	if g.maxCostUSDPerMonth > 0 {
-		g.costMonthSpent += costUSD
+		u.costMonthSpent += costUSD
 	}
 }
 
@@ -484,44 +573,75 @@ func (g *Grant) CheckAndConsumeRequestAt(now time.Time) error {
 	hourWindow := utcNow.Truncate(time.Hour)
 	dayWindow := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
 
-	g.quotaMu.Lock()
-	defer g.quotaMu.Unlock()
+	u := g.usage
+	u.mu.Lock()
+	defer u.mu.Unlock()
 
 	if g.maxRequestsPerHour > 0 {
-		if g.quotaWindowStart.IsZero() || !g.quotaWindowStart.Equal(hourWindow) {
-			g.quotaWindowStart = hourWindow
-			g.quotaWindowCount = 0
+		if u.quotaWindowStart.IsZero() || !u.quotaWindowStart.Equal(hourWindow) {
+			u.quotaWindowStart = hourWindow
+			u.quotaWindowCount = 0
 		}
-		if g.quotaWindowCount >= g.maxRequestsPerHour {
+		if u.quotaWindowCount >= g.maxRequestsPerHour {
 			return ErrHourlyQuotaExceeded
 		}
 	}
 	if g.maxRequestsPerDay > 0 {
-		if g.quotaDayStart.IsZero() || !g.quotaDayStart.Equal(dayWindow) {
-			g.quotaDayStart = dayWindow
-			g.quotaDayCount = 0
+		if u.quotaDayStart.IsZero() || !u.quotaDayStart.Equal(dayWindow) {
+			u.quotaDayStart = dayWindow
+			u.quotaDayCount = 0
 		}
-		if g.quotaDayCount >= g.maxRequestsPerDay {
+		if u.quotaDayCount >= g.maxRequestsPerDay {
 			return ErrDailyQuotaExceeded
 		}
 	}
 	if g.maxRequestsPerHour > 0 {
-		g.quotaWindowCount++
+		u.quotaWindowCount++
 	}
 	if g.maxRequestsPerDay > 0 {
-		g.quotaDayCount++
+		u.quotaDayCount++
 	}
 	return nil
 }
 
-func (g *Grant) resetCostWindowsLocked(dayWindow, monthWindow time.Time) {
-	if !dayWindow.IsZero() && (g.costDayStart.IsZero() || !g.costDayStart.Equal(dayWindow)) {
-		g.costDayStart = dayWindow
-		g.costDaySpent = 0
+// adoptUsageFrom shares the previous grant's usage counter state so rebuilding
+// an authorizer neither resets accrued usage nor loses increments that are
+// still in flight against the old grant. Because the SAME *grantUsage is shared
+// (not copied), a request that captured the old grant before the swap and
+// increments it afterwards accrues against the same mutex-protected counters
+// the new grant reads.
+func (g *Grant) adoptUsageFrom(prev *Grant) {
+	if g == nil || prev == nil || prev.usage == nil {
+		return
 	}
-	if !monthWindow.IsZero() && (g.costMonthStart.IsZero() || !g.costMonthStart.Equal(monthWindow)) {
-		g.costMonthStart = monthWindow
-		g.costMonthSpent = 0
+	g.usage = prev.usage
+}
+
+// carryOverGrantUsage preserves in-memory quota and spend counters across
+// authorizer rebuilds by matching grants on their storage key (token value or
+// token hash) and sharing the previous grant's usage state with the new grant.
+// Sharing rather than copying closes the copy-then-swap race: an in-flight
+// increment on the old grant is never lost because both grants reference one
+// shared, mutex-guarded counter set.
+// TODO: counters are still in-memory only; durable usage accounting across
+// restarts and multiple server instances is a larger design item.
+func carryOverGrantUsage(newGrants, oldGrants map[string]*Grant) {
+	if len(newGrants) == 0 || len(oldGrants) == 0 {
+		return
+	}
+	for key, next := range newGrants {
+		next.adoptUsageFrom(oldGrants[key])
+	}
+}
+
+func (u *grantUsage) resetCostWindowsLocked(dayWindow, monthWindow time.Time) {
+	if !dayWindow.IsZero() && (u.costDayStart.IsZero() || !u.costDayStart.Equal(dayWindow)) {
+		u.costDayStart = dayWindow
+		u.costDaySpent = 0
+	}
+	if !monthWindow.IsZero() && (u.costMonthStart.IsZero() || !u.costMonthStart.Equal(monthWindow)) {
+		u.costMonthStart = monthWindow
+		u.costMonthSpent = 0
 	}
 }
 
@@ -613,6 +733,7 @@ func newGrant(rule TokenRule) (*Grant, error) {
 		workspacePrefixes:  workspacePrefixes,
 		allowedProviders:   providers,
 		allowedModes:       modes,
+		usage:              &grantUsage{},
 	}, nil
 }
 

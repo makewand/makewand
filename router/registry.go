@@ -35,9 +35,9 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 	key := providerKey{name: providerName, modelID: modelID}
 
 	r.providerMu.Lock()
-	defer r.providerMu.Unlock()
 
 	if p, ok := r.providerCache[key]; ok {
+		r.providerMu.Unlock()
 		return p, nil
 	}
 
@@ -46,23 +46,40 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 	if existing, ok := r.providers[providerName]; ok {
 		if _, isCLI := existing.(*CLIProvider); isCLI || modelID == "" {
 			r.providerCache[key] = existing
+			r.providerMu.Unlock()
 			return existing, nil
 		}
-		if _, hasFactory := getProviderFactory(providerName); !hasFactory {
+		if _, hasFactory := r.getFactoryLocked(providerName); !hasFactory {
 			r.providerCache[key] = existing
+			r.providerMu.Unlock()
 			return existing, nil
 		}
 	}
 
-	factory, ok := getProviderFactory(providerName)
+	factory, ok := r.getFactoryLocked(providerName)
+	r.providerMu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
 	}
+
+	// Construct outside the lock: factories may probe binaries or the network,
+	// and holding providerMu here would stall every concurrent route.
 	p, err := factory(modelID)
 	if err != nil {
 		return nil, err
 	}
+	// Price from this Router's snapshot. Safe before publication: p is still
+	// exclusively owned by this goroutine until it is cached below.
+	r.attachCostTable(p)
 
+	// Re-acquire and double-check: a concurrent caller may have cached an
+	// instance for the same key while the factory ran. Keep the first one so
+	// every caller shares the same instance.
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+	if existing, ok := r.providerCache[key]; ok {
+		return existing, nil
+	}
 	r.providerCache[key] = p
 	return p, nil
 }
@@ -76,6 +93,16 @@ func (r *Router) Get(name string) (Provider, error) {
 	p, ok := r.providers[name]
 	r.providerMu.Unlock()
 	if !ok {
+		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q not configured", name), nil)
+	}
+	// Untrusted-repo mode: never hand back — nor even probe — a provider that runs
+	// a repo-aware host agent. Get returns the Provider to the caller, who could
+	// then invoke .Chat directly and bypass the router's gates. Fail closed by
+	// returning the same not-found contract as an unconfigured provider, and
+	// crucially before IsAvailable so no host health check is exec'd against the
+	// untrusted repo. untrustedRepoSafe is a no-op in trusted mode, so trusted
+	// behavior (including the probe below) is byte-for-byte unchanged.
+	if !r.untrustedRepoSafe(p) {
 		return nil, newProviderError(name, "lookup", ErrorKindConfig, false, 0, fmt.Sprintf("model provider %q not configured", name), nil)
 	}
 	if !p.IsAvailable() {
@@ -109,6 +136,7 @@ func (r *Router) RegisterProvider(name string, provider Provider, access AccessT
 	}
 	r.providerCache[providerKey{name: name, modelID: ""}] = provider
 	r.accessTypes[name] = access
+	r.attachCostTable(provider)
 	r.providerMu.Unlock()
 
 	r.mu.Lock()
@@ -122,30 +150,51 @@ func (r *Router) RegisterProvider(name string, provider Provider, access AccessT
 // Results are cached to avoid repeated health checks on every render cycle.
 func (r *Router) Available() []string {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if time.Since(r.cachedAvailAt) < availCacheTTL {
-		return r.cachedAvail
+		names := r.cachedAvail
+		r.mu.Unlock()
+		return names
 	}
+	r.mu.Unlock()
 
+	// Snapshot the provider set under the lock, then probe outside it: a cold
+	// CLI health check execs a subprocess with a multi-second timeout, and
+	// holding r.mu/r.providerMu for that long would stall every concurrent route.
+	type providerProbe struct {
+		name string
+		p    Provider
+	}
 	r.providerMu.Lock()
-	var names []string
+	probes := make([]providerProbe, 0, len(r.providers))
 	for name, p := range r.providers {
 		if !r.isProviderAllowed(name) {
 			continue
 		}
-		if p.IsAvailable() {
-			if blocked, _ := r.isCircuitOpen(name); blocked {
-				continue
-			}
-			names = append(names, name)
-		}
+		probes = append(probes, providerProbe{name: name, p: p})
 	}
 	r.providerMu.Unlock()
+
+	var names []string
+	for _, probe := range probes {
+		// Exclude providers that are not untrusted-repo-safe before probing, so an
+		// unsafe CLI is never exec'd for a health check in untrusted mode.
+		// untrustedRepoSafe is a no-op in trusted mode, so behavior is unchanged there.
+		if !r.untrustedRepoSafe(probe.p) {
+			continue
+		}
+		if probe.p.IsAvailable() {
+			if blocked, _ := r.isCircuitOpen(probe.name); blocked {
+				continue
+			}
+			names = append(names, probe.name)
+		}
+	}
 	sort.Strings(names)
 
+	r.mu.Lock()
 	r.cachedAvail = names
 	r.cachedAvailAt = time.Now()
+	r.mu.Unlock()
 	return names
 }
 
@@ -164,14 +213,25 @@ func (r *Router) remoteOnlyProvider() (string, Provider, bool) {
 	if !r.isProviderAllowed("remote") {
 		return "", nil, false
 	}
+	// Snapshot under the lock, then probe outside it: IsAvailable may exec a CLI
+	// or hit the network, and holding providerMu across that would stall every
+	// concurrent route (round-2/3 lock discipline).
 	r.providerMu.Lock()
-	defer r.providerMu.Unlock()
+	only := len(r.providers) == 1
+	p, ok := r.providers["remote"]
+	r.providerMu.Unlock()
 
-	if len(r.providers) != 1 {
+	if !only || !ok || p == nil {
 		return "", nil, false
 	}
-	p, ok := r.providers["remote"]
-	if !ok || p == nil || !p.IsAvailable() {
+	// Fail closed in untrusted mode: a provider registered under the name "remote"
+	// that is not untrusted-repo-safe (e.g. a custom/non-capable CLI) must not
+	// bypass the capability gate via this fast path. untrustedRepoSafe is a pure
+	// type assertion and a no-op in trusted mode, so trusted behavior is unchanged.
+	if !r.untrustedRepoSafe(p) {
+		return "", nil, false
+	}
+	if !p.IsAvailable() {
 		return "", nil, false
 	}
 	return "remote", p, true
@@ -189,20 +249,26 @@ func (r *Router) isBuildProviderAvailable(name, modelID string) bool {
 		return false
 	}
 	r.providerMu.Lock()
-	defer r.providerMu.Unlock()
-
-	if p, ok := r.providerCache[providerKey{name: name, modelID: modelID}]; ok {
-		return p.IsAvailable()
+	p, ok := r.providerCache[providerKey{name: name, modelID: modelID}]
+	if !ok {
+		p, ok = r.providers[name]
 	}
-	if p, ok := r.providers[name]; ok {
-		return p.IsAvailable()
+	r.providerMu.Unlock()
+	if !ok {
+		return false
 	}
-	return false
+	// Exclude providers that are not untrusted-repo-safe when untrusted mode is
+	// active. Checked before IsAvailable so an unsafe CLI is never even probed.
+	if !r.untrustedRepoSafe(p) {
+		return false
+	}
+	// Probe outside the lock: a cold CLI health check execs a subprocess.
+	return p.IsAvailable()
 }
 
 // tryBuildProvider resolves a provider instance for the given name and tier.
 func (r *Router) tryBuildProvider(name string, tier ModelTier) (Provider, string, error) {
-	models, ok := getModelTable(name)
+	models, ok := r.routingTables().modelsFor(name)
 	if !ok {
 		// Dynamically registered providers may not have a modelTable entry.
 		p, err := r.resolveProvider(name, "")

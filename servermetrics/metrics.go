@@ -72,14 +72,14 @@ func (r *Recorder) RenderPrometheus() string {
 	b.WriteString("# HELP makewand_http_requests_total Total HTTP requests handled by makewand serve.\n")
 	b.WriteString("# TYPE makewand_http_requests_total counter\n")
 	for _, key := range keys {
-		b.WriteString(fmt.Sprintf("makewand_http_requests_total{method=%q,path=%q,status=%q} %d\n",
-			key.Method, key.Path, fmt.Sprintf("%d", key.Status), r.counts[key]))
+		fmt.Fprintf(&b, "makewand_http_requests_total{method=%q,path=%q,status=%q} %d\n",
+			key.Method, key.Path, fmt.Sprintf("%d", key.Status), r.counts[key])
 	}
 	b.WriteString("# HELP makewand_http_request_duration_ms_sum Sum of HTTP request durations in milliseconds.\n")
 	b.WriteString("# TYPE makewand_http_request_duration_ms_sum counter\n")
 	for _, key := range keys {
-		b.WriteString(fmt.Sprintf("makewand_http_request_duration_ms_sum{method=%q,path=%q,status=%q} %d\n",
-			key.Method, key.Path, fmt.Sprintf("%d", key.Status), r.durationMS[key]))
+		fmt.Fprintf(&b, "makewand_http_request_duration_ms_sum{method=%q,path=%q,status=%q} %d\n",
+			key.Method, key.Path, fmt.Sprintf("%d", key.Status), r.durationMS[key])
 	}
 	return b.String()
 }

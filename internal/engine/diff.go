@@ -178,7 +178,8 @@ func ApplyEdit(filePath string, edit EditBlock) error {
 	// Replace only the first occurrence.
 	newContent := content[:idx] + edit.Replace + content[idx+len(edit.Search):]
 
-	return os.WriteFile(filePath, []byte(newContent), 0644)
+	//nolint:gosec // G703: filePath is this primitive's explicit target; callers validate against a project root (see project.go containment). No untrusted path reaches here.
+	return os.WriteFile(filePath, []byte(newContent), 0o600)
 }
 
 // hunk represents a single @@ hunk in a unified diff.
@@ -322,7 +323,8 @@ func ApplyDiff(filePath string, diff DiffBlock) error {
 		fileLines = result
 	}
 
-	return os.WriteFile(filePath, []byte(strings.Join(fileLines, "\n")), 0644)
+	//nolint:gosec // G703: filePath is this primitive's explicit target; callers validate against a project root (see project.go containment). No untrusted path reaches here.
+	return os.WriteFile(filePath, []byte(strings.Join(fileLines, "\n")), 0o600)
 }
 
 // ContainsEdits does a quick check whether text likely contains EDIT or DIFF blocks.

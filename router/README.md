@@ -10,7 +10,7 @@ tolerance, ensemble+judge evaluation, and an OpenAI-compatible subset HTTP facad
 import "github.com/makewand/makewand/router"
 
 // Create a router with pre-constructed providers
-r := router.NewRouterFromConfig(router.RouterConfig{
+r, err := router.NewRouterFromConfig(router.RouterConfig{
     Providers: map[string]router.ProviderEntry{
         "claude": {
             Provider: router.NewClaudeCLI("/usr/local/bin/claude"),
@@ -22,7 +22,12 @@ r := router.NewRouterFromConfig(router.RouterConfig{
         },
     },
     UsageMode: "balanced", // "fast", "balanced", or "power"
+    ConfigDir: "",         // optional: directory holding routing.json overrides
 })
+if err != nil {
+    // Invalid routing.json overrides or unusable embedded defaults.
+    log.Fatal(err)
+}
 
 // Route and chat
 content, usage, result, err := r.Chat(ctx, router.TaskCode,
@@ -65,7 +70,10 @@ content, usage, result, err := r.ChatBest(ctx, router.PhaseCode, messages, syste
 Expose your router as an OpenAI-compatible API server:
 
 ```go
-r := router.NewRouterFromConfig(rc)
+r, err := router.NewRouterFromConfig(rc)
+if err != nil {
+    log.Fatal(err)
+}
 http.ListenAndServe(":8080", r.HTTPHandler())
 ```
 
@@ -96,6 +104,10 @@ defer cancel()
 r.WatchOverrides(ctx, configDir)
 ```
 
+Reloads apply only to this Router instance. Every candidate is validated
+before it is swapped in; an invalid `routing.json` keeps the previous tables
+active and emits a `reload_error` trace event.
+
 ### Provider Factories
 
 Register factories for dynamic model-specific provider construction:
@@ -116,7 +128,8 @@ r.RegisterProviderFactory("claude", func(modelID string) (router.Provider, error
 
 ## Strategy Customization
 
-Place a `routing.json` in your config directory to override defaults:
+Place a `routing.json` in the directory passed as `RouterConfig.ConfigDir`
+(or call `r.LoadUserOverrides(dir)`) to override defaults:
 
 ```json
 {
@@ -129,7 +142,12 @@ Place a `routing.json` in your config directory to override defaults:
 }
 ```
 
-Only the fields you specify are overridden — absent fields keep their defaults.
+Only the fields you specify are overridden — absent fields keep their
+defaults, down to individual `(provider, tier)` and `(mode, task)` keys.
+Overrides are validated on load: `NewRouterFromConfig` returns the error, and
+`r.LoadUserOverrides` leaves the previous tables unchanged on failure.
+Overrides are scoped to the Router instance that loaded them, so two Routers
+with different config directories never affect each other.
 
 ## Migration from internal/model
 
@@ -142,7 +160,7 @@ r := model.NewRouter(cfg)
 
 // After (public library API)
 import "github.com/makewand/makewand/router"
-r := router.NewRouterFromConfig(router.RouterConfig{
+r, err := router.NewRouterFromConfig(router.RouterConfig{
     Providers: map[string]router.ProviderEntry{...},
     UsageMode: "balanced",
 })
@@ -150,9 +168,13 @@ r := router.NewRouterFromConfig(router.RouterConfig{
 
 Key differences:
 - `NewRouterFromConfig` takes `RouterConfig` (no config package dependency)
-- Constructor returns `*Router`
-- `RegisterProviderFactory` is an instance method, not a package-level function
-- Strategy tables are per-instance (safe for multiple Router instances)
+- Constructor returns `(*Router, error)` — invalid overrides fail construction
+- `RegisterProviderFactory` is an instance method — `(*Router).RegisterProviderFactory`.
+  Factories are strictly per-instance; there is no package-level registry, so two
+  Routers can build the same provider name from different configs without ever
+  affecting one another
+- Strategy tables are per-instance, deep-copied from immutable package
+  defaults (safe for multiple Router instances and parallel tests)
 
 ## Implementing a Custom Provider
 

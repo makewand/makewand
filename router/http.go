@@ -2,7 +2,8 @@
 //
 // Usage:
 //
-//	r := router.NewRouterFromConfig(rc)
+//	r, err := router.NewRouterFromConfig(rc)
+//	if err != nil { ... }
 //	http.ListenAndServe(":8080", r.HTTPHandler())
 //
 // This exposes POST /v1/chat/completions with a supported subset of the
@@ -11,6 +12,7 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -301,6 +303,7 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 	}
 	usageEntry.RequestedMode = strings.ToLower(strings.TrimSpace(responsesReq.Mode))
 	usageEntry.RequestedModel = strings.ToLower(strings.TrimSpace(responsesReq.Model))
+	usageEntry.Stream = responsesReq.Stream
 	auditEvent.RequestedMode = usageEntry.RequestedMode
 	auditEvent.RequestedModel = usageEntry.RequestedModel
 	chatReq, err := responsesRequestToChatRequest(responsesReq)
@@ -367,10 +370,9 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", responsesReq.Model))
 			return
 		}
-		content, usage, result, err = prepared.Router.ChatWith(ctx, prepared.RequestedModel, taskToBuildPhase(prepared.Task), prepared.Messages, prepared.System)
-	} else {
-		content, usage, result, err = prepared.Router.Chat(ctx, prepared.Task, prepared.Messages, prepared.System)
 	}
+	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
+	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
 	if err != nil {
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
@@ -389,10 +391,6 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		return
 	}
 	toolCalls, hasToolCalls := extractHTTPToolCalls(content, responsesReq.Tools)
-	if grant != nil {
-		grant.RecordCostAt(time.Now(), usage.Cost)
-	}
-
 	responseModel := result.ModelID
 	if strings.TrimSpace(responseModel) == "" {
 		responseModel = result.Actual
@@ -549,10 +547,9 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model))
 			return
 		}
-		content, usage, result, err = prepared.Router.ChatWith(ctx, prepared.RequestedModel, taskToBuildPhase(prepared.Task), prepared.Messages, prepared.System)
-	} else {
-		content, usage, result, err = prepared.Router.Chat(ctx, prepared.Task, prepared.Messages, prepared.System)
 	}
+	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
+	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
 	if err != nil {
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
@@ -603,7 +600,6 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
-	grant.RecordCostAt(time.Now(), usage.Cost)
 	auditEvent.Status = http.StatusOK
 	auditEvent.ActualProvider = strings.TrimSpace(usage.Provider)
 	if auditEvent.ActualProvider == "" {
@@ -636,6 +632,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	var (
 		stream <-chan StreamChunk
 		result RouteResult
+		usage  Usage
 		err    error
 	)
 	if requestedModel != "" {
@@ -645,11 +642,10 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
 			return
 		}
-		stream, result, err = activeRouter.ChatStreamWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
-	} else {
-		stream, result, err = activeRouter.ChatStream(ctx, task, messages, system)
 	}
+	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
+		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
 			status = http.StatusBadRequest
@@ -664,10 +660,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	if strings.TrimSpace(responseModel) == "" {
 		responseModel = result.Actual
 	}
-	auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
-	if usageEntry != nil {
-		usageEntry.ActualProvider = auditEvent.ActualProvider
-	}
+	applyHTTPUsage(nil, usage, result, auditEvent, usageEntry)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -678,6 +671,10 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	streamID := fmt.Sprintf("mw-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	sentRole := false
+	var contentBuilder strings.Builder
+	defer func() {
+		finalizeHTTPStreamUsage(activeRouter, grant, usage, result, messages, system, contentBuilder.String(), auditEvent, usageEntry)
+	}()
 	for chunk := range stream {
 		if chunk.Error != nil {
 			auditEvent.Status = http.StatusOK
@@ -695,6 +692,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		}
 
 		if chunk.Content != "" || (!sentRole && !chunk.Done) {
+			contentBuilder.WriteString(chunk.Content)
 			delta := httpStreamDelta{Content: chunk.Content}
 			if !sentRole {
 				delta.Role = "assistant"
@@ -763,6 +761,7 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 	var (
 		stream <-chan StreamChunk
 		result RouteResult
+		usage  Usage
 		err    error
 	)
 	if requestedModel != "" {
@@ -772,11 +771,10 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
 			return
 		}
-		stream, result, err = activeRouter.ChatStreamWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
-	} else {
-		stream, result, err = activeRouter.ChatStream(ctx, task, messages, system)
 	}
+	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
+		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
 			status = http.StatusBadRequest
@@ -791,10 +789,7 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 	if strings.TrimSpace(responseModel) == "" {
 		responseModel = result.Actual
 	}
-	auditEvent.ActualProvider = strings.TrimSpace(result.Actual)
-	if usageEntry != nil {
-		usageEntry.ActualProvider = auditEvent.ActualProvider
-	}
+	applyHTTPUsage(nil, usage, result, auditEvent, usageEntry)
 
 	responseID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -818,6 +813,9 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 
 	itemID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	var contentBuilder strings.Builder
+	defer func() {
+		finalizeHTTPStreamUsage(activeRouter, grant, usage, result, messages, system, contentBuilder.String(), auditEvent, usageEntry)
+	}()
 	for chunk := range stream {
 		if chunk.Error != nil {
 			auditEvent.Status = http.StatusOK
@@ -888,6 +886,92 @@ func writeSSEData(w http.ResponseWriter, payload any) error {
 	}
 	_, err = io.WriteString(w, "\n\n")
 	return err
+}
+
+// chatForHTTP preserves the meaning of Power mode across the HTTP and remote
+// adapters. An explicit model/provider override still wins; otherwise Power
+// executes the same generate-and-judge ensemble as local ChatBest callers.
+func (r *Router) chatForHTTP(ctx context.Context, requestedModel string, task TaskType, messages []Message, system string) (string, Usage, RouteResult, error) {
+	if requestedModel != "" {
+		return r.ChatWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
+	}
+	if r.effectiveMode() == ModePower {
+		return r.ChatBest(ctx, taskToBuildPhase(task), messages, system)
+	}
+	return r.Chat(ctx, task, messages, system)
+}
+
+// streamForHTTP returns a synthetic one-chunk stream for Power mode. Ensemble
+// selection is necessarily complete before a winner can be emitted; returning
+// only the winning answer keeps streaming clients compatible without silently
+// degrading Power to a single-provider call.
+func (r *Router) streamForHTTP(ctx context.Context, requestedModel string, task TaskType, messages []Message, system string) (<-chan StreamChunk, RouteResult, Usage, error) {
+	if requestedModel != "" {
+		stream, result, err := r.ChatStreamWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
+		return stream, result, Usage{}, err
+	}
+	if r.effectiveMode() != ModePower {
+		stream, result, err := r.ChatStream(ctx, task, messages, system)
+		return stream, result, Usage{}, err
+	}
+
+	content, usage, result, err := r.ChatBest(ctx, taskToBuildPhase(task), messages, system)
+	if err != nil {
+		return nil, result, usage, err
+	}
+	stream := make(chan StreamChunk, 2)
+	if content != "" {
+		stream <- StreamChunk{Content: content}
+	}
+	stream <- StreamChunk{Done: true}
+	close(stream)
+	return stream, result, usage, nil
+}
+
+func applyHTTPUsage(grant *serverauth.Grant, usage Usage, result RouteResult, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
+	actualProvider := strings.TrimSpace(usage.Provider)
+	if actualProvider == "" {
+		actualProvider = strings.TrimSpace(result.Actual)
+	}
+	if auditEvent != nil {
+		auditEvent.ActualProvider = actualProvider
+		auditEvent.PromptTokens = usage.InputTokens
+		auditEvent.CompletionTokens = usage.OutputTokens
+		auditEvent.CostUSD = usage.Cost
+	}
+	if usageEntry != nil {
+		usageEntry.ActualProvider = actualProvider
+		usageEntry.PromptTokens = usage.InputTokens
+		usageEntry.CompletionTokens = usage.OutputTokens
+		usageEntry.CostUSD = usage.Cost
+	}
+	if grant != nil && usage.Cost > 0 {
+		grant.RecordCostAt(time.Now(), usage.Cost)
+	}
+}
+
+func finalizeHTTPStreamUsage(r *Router, grant *serverauth.Grant, usage Usage, result RouteResult, messages []Message, system, output string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
+	// Most streaming transports cannot report token usage. Estimate it at the
+	// terminal boundary so streamed API calls cannot bypass usage logs and team
+	// budgets entirely. Subscription calls retain zero dollar cost; the estimate
+	// is priced only for providers configured as API access.
+	estimated := r.EstimateUsageForRoute(result, messages, system, output)
+	if usage.InputTokens == 0 {
+		usage.InputTokens = estimated.InputTokens
+	}
+	if usage.OutputTokens == 0 {
+		usage.OutputTokens = estimated.OutputTokens
+	}
+	if usage.Provider == "" {
+		usage.Provider = result.Actual
+	}
+	if usage.Model == "" {
+		usage.Model = result.ModelID
+	}
+	if usage.Cost == 0 {
+		usage.Cost = estimated.Cost
+	}
+	applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
 }
 
 func writeSSEEvent(w http.ResponseWriter, event string, payload any) error {
@@ -1007,13 +1091,14 @@ func (r *Router) persistHTTPStats(statsDir string) {
 		return
 	}
 	if err := os.MkdirAll(statsDir, 0700); err != nil {
+		r.emitTrace(TraceEvent{Event: "stats_persist_error", Error: err.Error()})
 		return
 	}
-	_ = r.SaveStats(statsDir)
-}
-
-func (r *Router) handleListModels(w http.ResponseWriter, req *http.Request) {
-	r.handleListModelsWithGrant(w, req, nil, nil)
+	// Debounced: per-request saves skip when nothing changed or the last write
+	// was under a second ago. Failures are surfaced through the trace stream.
+	if err := r.usage.saveDebounced(statsDir); err != nil {
+		r.emitTrace(TraceEvent{Event: "stats_persist_error", Error: err.Error()})
+	}
 }
 
 func (r *Router) handleListModelsWithOptions(opt HTTPHandlerOptions) scopedHTTPHandler {

@@ -26,6 +26,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,27 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// errUntrustedRepoSkipProbe marks a quota source that was intentionally not read
+// because reading it would exec a local repo-aware CLI while the active
+// repository is untrusted. The refresh merge treats it like any other read
+// failure: keep last-good/neutral, but crucially never launch the subprocess.
+var errUntrustedRepoSkipProbe = errors.New("untrusted repo mode: skipped local CLI quota probe")
+
+// localCLIQuotaSource is implemented by a QuotaSource whose Read execs a local
+// CLI process to probe quota (e.g. `agy models`). In untrusted-repo mode the
+// snapshotter skips such sources so an unsafe host agent is never launched merely
+// to read usage. Sources that do not implement it are treated as safe to probe
+// (claude = HTTPS OAuth endpoint, codex = local session-log file read).
+type localCLIQuotaSource interface {
+	execsLocalCLI() bool
+}
+
+// sourceExecsLocalCLI reports whether reading src spawns a local CLI process.
+func sourceExecsLocalCLI(src QuotaSource) bool {
+	e, ok := src.(localCLIQuotaSource)
+	return ok && e.execsLocalCLI()
+}
 
 // QuotaBand is an orthogonal, coarse ranking key derived from a provider's
 // remaining subscription headroom. It is deliberately *not* folded into the
@@ -231,6 +253,30 @@ type QuotaSnapshotter struct {
 	// process must not inherit one (window resets handle recovery anyway).
 	sealMu sync.Mutex
 	seals  map[string]time.Time
+
+	// repoTrust records the repository trust level so a background/forced refresh
+	// never execs a local CLI (e.g. `agy models`) to probe quota when the active
+	// repository is untrusted. Stored as int32 for lock-free atomic access. The
+	// zero value is RepoTrustTrusted, so an un-wired snapshotter probes everything
+	// exactly as before.
+	repoTrust atomic.Int32
+}
+
+// SetRepoTrust records the repository trust level. In untrusted mode, refresh
+// skips quota sources whose Read execs a local repo-aware CLI (see
+// localCLIQuotaSource). Returns the receiver for chaining. Safe to call
+// concurrently with refresh.
+func (s *QuotaSnapshotter) SetRepoTrust(t RepoTrust) *QuotaSnapshotter {
+	if s == nil {
+		return s
+	}
+	s.repoTrust.Store(int32(t))
+	return s
+}
+
+// repoTrustLevel returns the snapshotter's current repository trust level.
+func (s *QuotaSnapshotter) repoTrustLevel() RepoTrust {
+	return RepoTrust(s.repoTrust.Load())
 }
 
 // WithDiskCache enables a shared disk cache at path with the given freshness TTL.
@@ -339,8 +385,16 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 		err error
 	}
 	results := make([]result, len(s.sources))
+	untrusted := s.repoTrustLevel() == RepoTrustUntrusted
 	var wg sync.WaitGroup
 	for i, src := range s.sources {
+		// Untrusted repo mode: never exec a local CLI (e.g. `agy models`) just to
+		// probe quota. Mark the source as skipped so the merge below keeps last-good
+		// or neutral for it, without launching the subprocess.
+		if untrusted && sourceExecsLocalCLI(src) {
+			results[i] = result{q: ProviderQuota{Provider: src.Provider()}, err: errUntrustedRepoSkipProbe}
+			continue
+		}
 		wg.Add(1)
 		go func(i int, src QuotaSource) {
 			defer wg.Done()
@@ -762,6 +816,10 @@ func NewAgyQuotaSource(binPath string) QuotaSource {
 }
 
 func (a *agyQuotaSource) Provider() string { return "gemini" }
+
+// execsLocalCLI reports that reading agy quota spawns the local `agy` binary,
+// so this source is skipped in untrusted-repo mode (see localCLIQuotaSource).
+func (a *agyQuotaSource) execsLocalCLI() bool { return true }
 
 func (a *agyQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	q := ProviderQuota{Provider: "gemini"}

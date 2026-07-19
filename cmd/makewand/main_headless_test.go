@@ -62,10 +62,10 @@ func TestSanitizeHeadlessContent_NonCodePromptUnchanged(t *testing.T) {
 
 func TestBuildHeadlessSystemPrompt_IncludesProjectContext(t *testing.T) {
 	tmp := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/demo\n\ngo 1.23\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/demo\n\ngo 1.23\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(go.mod): %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(main.go): %v", err)
 	}
 
@@ -74,7 +74,7 @@ func TestBuildHeadlessSystemPrompt_IncludesProjectContext(t *testing.T) {
 		t.Fatalf("OpenProject(): %v", err)
 	}
 
-	got := buildHeadlessSystemPrompt(project, model.TaskCode, model.ModeBalanced, "Implement feature in main.go and return only code.")
+	got := buildHeadlessSystemPrompt(project, model.TaskCode, model.ModeBalanced, "Implement feature in main.go and return only code.", nil)
 	if !strings.Contains(got, "Current project:") {
 		t.Fatalf("buildHeadlessSystemPrompt() missing project header:\n%s", got)
 	}
@@ -89,7 +89,7 @@ func TestBuildHeadlessSystemPrompt_IncludesProjectContext(t *testing.T) {
 func TestPreserveGoPackageFromWorkspace_RewritesPackageWhenConstrained(t *testing.T) {
 	tmp := t.TempDir()
 	target := filepath.Join(tmp, "retry.go")
-	if err := os.WriteFile(target, []byte("package retrycase\n\nfunc RetryHTTP() {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte("package retrycase\n\nfunc RetryHTTP() {}\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(retry.go): %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestPreserveGoPackageFromWorkspace_RewritesPackageWhenConstrained(t *testin
 func TestPreserveGoPackageFromWorkspace_NoConstraintNoRewrite(t *testing.T) {
 	tmp := t.TempDir()
 	target := filepath.Join(tmp, "retry.go")
-	if err := os.WriteFile(target, []byte("package retrycase\n"), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte("package retrycase\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(retry.go): %v", err)
 	}
 

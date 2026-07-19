@@ -1,22 +1,46 @@
-version: "3.9"
 services:
   makewand:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+    # SECURITY: publish on the host loopback ONLY. The container speaks
+    # plaintext HTTP (--unsafe-no-tls below), so it must never be reachable
+    # from the network directly. For remote access use an SSH tunnel
+    # (ssh -L 8080:127.0.0.1:8080 host) or a TLS-terminating reverse proxy
+    # (nginx, Caddy) that forwards to 127.0.0.1:8080.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+    # REQUIRED for the server to start: at least one provider must be usable,
+    # or `serve` exits immediately ("no model providers available"). The image
+    # ships no subscription CLI, so supply a provider API key (ANTHROPIC_API_KEY,
+    # GEMINI_API_KEY, or OPENAI_API_KEY) via deploy/.env.
+    # Optional in the same .env: MAKEWAND_SERVER_TOKEN for a quick single-token
+    # setup. Without it, auth falls back to the SQLite state DB, which starts
+    # empty (authenticated endpoints rejected; /health still responds). Tokens are
+    # loaded at startup, so issue BEFORE first start or restart afterwards:
+    #   docker compose run --rm makewand token issue --state-db /srv/makewand/data/state.db
+    #   docker compose up -d          # (re)start to load the new token
     env_file:
-      - .env
+      - path: .env
+        required: false
     volumes:
-      - ../var/makewand:/srv/makewand/data
+      # Named volume (not a host bind mount) so the data dir is initialized
+      # with the image's makewand:makewand ownership on first start; a fresh
+      # root-owned bind mount would make state.db/session creation fail.
+      - makewand-data:/srv/makewand/data
+    # --unsafe-no-tls is required to bind 0.0.0.0 inside the container (see
+    # deploy/Dockerfile); the loopback-only port publish above keeps it off the
+    # network. --enable-users turns on auth/login/admin WITHOUT public signup;
+    # add --enable-registration to open self-service signup (accounts start
+    # inactive) and --trusted-proxy <CIDR> if fronted by a reverse proxy.
     command:
       - serve
       - --listen
       - 0.0.0.0:8080
+      - --unsafe-no-tls
       - --enable-users
       - --data-dir
       - /srv/makewand/data
-      - --auth-config
-      - /srv/makewand/data/server_auth.json
 
+volumes:
+  makewand-data:

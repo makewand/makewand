@@ -94,7 +94,11 @@ func main() {
 	fmt.Println()
 
 	// Show providers
-	tmpRouter := model.NewRouter(cfg)
+	tmpRouter, err := model.NewRouter(cfg)
+	if err != nil {
+		diag.Stderr().ErrorErr("router init failed", err)
+		os.Exit(1)
+	}
 	fmt.Print("  Providers: ")
 	fmt.Println(strings.Join(tmpRouter.Available(), ", "))
 	fmt.Println()
@@ -106,7 +110,11 @@ func main() {
 		fmt.Printf("━━━ [%d/4] %s mode (%s) ━━━\n", i+1, m.name, m.tier)
 
 		cfg.UsageMode = m.mode.String()
-		router := model.NewRouter(cfg)
+		router, err := model.NewRouter(cfg)
+		if err != nil {
+			diag.Stderr().ErrorErr("router init failed", err)
+			os.Exit(1)
+		}
 		ctx := context.Background()
 
 		codeProvider := router.BuildProviderForAdaptive(model.PhaseCode)

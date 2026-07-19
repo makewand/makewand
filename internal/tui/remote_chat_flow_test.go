@@ -72,7 +72,7 @@ func TestSubmitChatInput_RemoteOnlyExplainUsesUnaryChatPath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
 
-	m, cmd := app.submitChatInput("你是谁?")
+	m, cmd := app.submitChatInput("Explain how this code works")
 	_ = m.(App)
 	if cmd == nil {
 		t.Fatal("submitChatInput returned nil cmd")

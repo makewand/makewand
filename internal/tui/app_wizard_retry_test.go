@@ -19,6 +19,8 @@ type wizardRetryStubProvider struct {
 	errs      []error
 }
 
+const wizardRetryProviderName = "wizard-retry"
+
 func (p *wizardRetryStubProvider) Name() string { return p.name }
 
 func (p *wizardRetryStubProvider) IsAvailable() bool { return true }
@@ -55,21 +57,20 @@ func (p *wizardRetryStubProvider) ChatStream(context.Context, []model.Message, s
 
 func newWizardRetryRouter(t *testing.T, provider model.Provider) *model.Router {
 	t.Helper()
-	cfg := config.DefaultConfig()
-	cfg.CodingModel = "claude"
-	r := model.NewRouter(cfg)
-	if err := r.RegisterProvider("claude", provider, model.AccessSubscription); err != nil {
-		t.Fatalf("RegisterProvider: %v", err)
-	}
-	return r
+	return mustNewRouterFromConfig(t, model.RouterConfig{
+		UsageMode: config.UsageModeBalanced,
+		Providers: map[string]model.ProviderEntry{
+			wizardRetryProviderName: {Provider: provider, Access: model.AccessSubscription},
+		},
+	})
 }
 
 func TestRetryWizardBuildForMissingFiles_SkipsRetryWhenFilesAlreadyPresent(t *testing.T) {
-	stub := &wizardRetryStubProvider{name: "claude"}
+	stub := &wizardRetryStubProvider{name: wizardRetryProviderName}
 	router := newWizardRetryRouter(t, stub)
 
 	content := "--- FILE: index.html ---\n```\n<h1>ok</h1>\n```"
-	usage := model.Usage{Provider: "claude", InputTokens: 10, OutputTokens: 20, Cost: 0.1}
+	usage := model.Usage{Provider: wizardRetryProviderName, InputTokens: 10, OutputTokens: 20, Cost: 0.1}
 
 	gotContent, gotUsage := retryWizardBuildForMissingFiles(context.Background(), router, "build site", content, usage)
 	if gotContent != content {
@@ -85,18 +86,18 @@ func TestRetryWizardBuildForMissingFiles_SkipsRetryWhenFilesAlreadyPresent(t *te
 
 func TestRetryWizardBuildForMissingFiles_RecoversWithStrictRetry(t *testing.T) {
 	stub := &wizardRetryStubProvider{
-		name: "claude",
+		name: wizardRetryProviderName,
 		responses: []string{
 			"--- FILE: index.html ---\n```\n<h1>recovered</h1>\n```",
 		},
 		usages: []model.Usage{
-			{Provider: "claude", InputTokens: 3, OutputTokens: 7, Cost: 0.2},
+			{Provider: wizardRetryProviderName, InputTokens: 3, OutputTokens: 7, Cost: 0.2},
 		},
 	}
 	router := newWizardRetryRouter(t, stub)
 
 	original := "The project is already complete. Run open index.html."
-	usage := model.Usage{Provider: "claude", InputTokens: 11, OutputTokens: 13, Cost: 0.5}
+	usage := model.Usage{Provider: wizardRetryProviderName, InputTokens: 11, OutputTokens: 13, Cost: 0.5}
 
 	gotContent, gotUsage := retryWizardBuildForMissingFiles(context.Background(), router, "build site", original, usage)
 	if gotContent == original {
@@ -108,8 +109,8 @@ func TestRetryWizardBuildForMissingFiles_RecoversWithStrictRetry(t *testing.T) {
 	if gotUsage.Cost != 0.7 {
 		t.Fatalf("usage cost = %.3f, want 0.7", gotUsage.Cost)
 	}
-	if gotUsage.Provider != "claude" {
-		t.Fatalf("usage provider = %q, want claude", gotUsage.Provider)
+	if gotUsage.Provider != wizardRetryProviderName {
+		t.Fatalf("usage provider = %q, want %s", gotUsage.Provider, wizardRetryProviderName)
 	}
 	if stub.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1", stub.calls)
@@ -118,7 +119,7 @@ func TestRetryWizardBuildForMissingFiles_RecoversWithStrictRetry(t *testing.T) {
 
 func TestRetryWizardBuildForMissingFiles_LeavesOriginalWhenRetryStillNonFile(t *testing.T) {
 	stub := &wizardRetryStubProvider{
-		name: "claude",
+		name: wizardRetryProviderName,
 		responses: []string{
 			"```bash\nopen password-strength-checker/index.html\n```",
 		},
@@ -129,14 +130,17 @@ func TestRetryWizardBuildForMissingFiles_LeavesOriginalWhenRetryStillNonFile(t *
 	router := newWizardRetryRouter(t, stub)
 
 	original := "Project already exists."
-	usage := model.Usage{Provider: "claude", InputTokens: 7, OutputTokens: 9, Cost: 0.1}
+	usage := model.Usage{Provider: wizardRetryProviderName, InputTokens: 7, OutputTokens: 9, Cost: 0.1}
 
 	gotContent, gotUsage := retryWizardBuildForMissingFiles(context.Background(), router, "build site", original, usage)
 	if gotContent != original {
 		t.Fatalf("content changed unexpectedly: %q", gotContent)
 	}
-	if gotUsage != usage {
-		t.Fatalf("usage changed unexpectedly: got %+v want %+v", gotUsage, usage)
+	if gotUsage.InputTokens != 9 || gotUsage.OutputTokens != 11 || gotUsage.Cost != usage.Cost {
+		t.Fatalf("invalid retry usage was not accumulated: got %+v", gotUsage)
+	}
+	if gotUsage.Provider != usage.Provider {
+		t.Fatalf("original content provider = %q, want %q", gotUsage.Provider, usage.Provider)
 	}
 	if stub.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1", stub.calls)

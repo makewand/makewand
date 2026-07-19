@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -29,6 +30,22 @@ type candidateSelection struct {
 	usage         model.Usage
 	verified      bool
 	selectionNote string
+	// err carries a fail-closed sentinel from the engine when every candidate
+	// failed for that reason (currently model.ErrNoUntrustedSafeProvider, set when
+	// untrusted-repo mode had no untrusted-repo-safe provider). Callers use
+	// contentError to surface the actionable message instead of a generic failure.
+	err error
+}
+
+// contentError returns the error to report when a candidate selection produced
+// no usable content. When the selection failed closed in untrusted-repo mode it
+// returns the sentinel so handleAIResponse's chatErrorContent presents the
+// actionable untrusted-mode message; otherwise it returns the generic fallback.
+func (s candidateSelection) contentError(generic error) error {
+	if errors.Is(s.err, model.ErrNoUntrustedSafeProvider) {
+		return s.err
+	}
+	return generic
 }
 
 type candidateProgressStage = engine.CandidateProgressStage
@@ -159,31 +176,33 @@ func runCandidateSelectionWithActivity(
 	}, exclude...)
 
 	msg := i18n.Msg()
+	provider := selection.Provider
+	if provider == "" {
+		provider = selection.Usage.Provider
+	}
 	local := candidateSelection{
 		content:  selection.Content,
-		provider: selection.Provider,
+		provider: provider,
 		usage:    selection.Usage,
 		verified: selection.Verified,
+		err:      selection.Err,
 	}
-	if selection.Verified && selection.Provider != "" {
-		local.selectionNote = fmt.Sprintf(msg.AutomationCandidateSelected, selection.Provider, selection.PassedCount, selection.TotalCandidates)
-	} else if strings.TrimSpace(selection.Content) != "" {
-		local.selectionNote = msg.AutomationCandidateFallback
+	var notes []string
+	switch {
+	case selection.Verified && selection.Provider != "":
+		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateSelected, selection.Provider, selection.PassedCount, selection.TotalCandidates))
+	case selection.NotVerifiedReason != "":
+		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateIsolationUnavailable, selection.NotVerifiedReason))
+	case strings.TrimSpace(selection.Content) != "" && selection.Strength > 0:
+		notes = append(notes, msg.AutomationCandidateWeakVerification)
+	case strings.TrimSpace(selection.Content) != "":
+		notes = append(notes, msg.AutomationCandidateFallback)
 	}
+	if len(selection.DeletedFiles) > 0 {
+		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateDeletions, strings.Join(selection.DeletedFiles, ", ")))
+	}
+	local.selectionNote = strings.Join(notes, "\n")
 	return local
-}
-
-func candidateAttemptStage(ctx context.Context, attempt candidateAttempt) candidateProgressStage {
-	return engine.CandidateAttemptStage(ctx, engine.CandidateAttempt{
-		Index:        attempt.index,
-		Requested:    attempt.requested,
-		Provider:     attempt.provider,
-		Content:      attempt.content,
-		Files:        attempt.files,
-		Usage:        attempt.usage,
-		Verification: attempt.verification,
-		Err:          attempt.err,
-	})
 }
 
 func shouldRecordCandidateQuality(attempt candidateAttempt) bool {

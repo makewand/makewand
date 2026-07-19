@@ -88,6 +88,11 @@ const (
 	ApprovalModeManual = "manual"
 	ApprovalModeSafe   = "safe"
 	ApprovalModeAuto   = "autopilot"
+
+	UsageModeFast     = "fast"
+	UsageModeBalanced = "balanced"
+	UsageModePower    = "power"
+	DefaultUsageMode  = UsageModeBalanced
 )
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -97,10 +102,26 @@ func DefaultConfig() *Config {
 		AnalysisModel: "gemini",
 		CodingModel:   "claude",
 		ReviewModel:   "gemini",
+		UsageMode:     DefaultUsageMode,
 		Language:      "en",
 		Theme:         "dark",
 		ApprovalMode:  ApprovalModeManual,
 		MonthlyBudget: 20.0,
+	}
+}
+
+// NormalizeUsageMode returns a supported usage mode, defaulting to balanced.
+// This also migrates legacy configs where usage_mode was absent, empty, or invalid.
+func NormalizeUsageMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case UsageModeFast:
+		return UsageModeFast
+	case UsageModeBalanced:
+		return UsageModeBalanced
+	case UsageModePower:
+		return UsageModePower
+	default:
+		return DefaultUsageMode
 	}
 }
 
@@ -129,6 +150,8 @@ func ConfigDir() (string, error) {
 		}
 		dir = filepath.Join(home, ".config", "makewand")
 	}
+	dir = filepath.Clean(dir)
+	//nolint:gosec // G703: the path deliberately comes from the user's own MAKEWAND_CONFIG_DIR (or homedir); a local CLI honoring its user's config-dir choice is not path traversal.
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create config dir %s: %w", dir, err)
 	}
@@ -144,8 +167,27 @@ func ConfigPath() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
-// Load reads the config from disk, returning defaults if not found.
+// LoadOptions controls optional behavior of config loading.
+type LoadOptions struct {
+	// SkipCLIDetection disables probing the system for installed subscription
+	// CLI tools (the `claude/gemini/codex/agy --version` execs in detectCLIs).
+	// Untrusted-repository mode sets this: those probes inherit the process
+	// working directory (the untrusted repo) where a CLI may load project
+	// config, and untrusted mode only ever uses direct API providers anyway, so
+	// probing local CLIs is both unnecessary and unsafe. The trusted default
+	// (Load) leaves detection on and is byte-for-byte unchanged.
+	SkipCLIDetection bool
+}
+
+// Load reads the config from disk, returning defaults if not found. It performs
+// the full trusted-default load, including subscription CLI detection.
 func Load() (*Config, error) {
+	return LoadWithOptions(LoadOptions{})
+}
+
+// LoadWithOptions reads the config from disk like Load, honoring opts. See
+// LoadOptions for the available knobs. Load() is LoadWithOptions(LoadOptions{}).
+func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	cfg := DefaultConfig()
 	var loadErr error
 
@@ -180,8 +222,13 @@ func Load() (*Config, error) {
 		cfg.envSourcedKeys["openai"] = true
 	}
 
-	// Auto-detect installed CLI tools
-	cfg.CLIs = detectCLIs()
+	// Auto-detect installed CLI tools. Skipped in untrusted-repository mode so we
+	// never exec a local CLI (its `--version` probe) inside an untrusted working
+	// directory; only direct API providers are used in that mode.
+	if !opts.SkipCLIDetection {
+		cfg.CLIs = detectCLIs()
+	}
+	cfg.UsageMode = NormalizeUsageMode(cfg.UsageMode)
 	cfg.ApprovalMode = NormalizeApprovalMode(cfg.ApprovalMode)
 
 	// If CLI tools found, set access to subscription (unless explicitly overridden)
@@ -214,6 +261,7 @@ func Save(cfg *Config) error {
 
 	// Create a copy that strips env-sourced keys
 	toSave := *cfg
+	toSave.UsageMode = NormalizeUsageMode(toSave.UsageMode)
 	toSave.ApprovalMode = NormalizeApprovalMode(toSave.ApprovalMode)
 	if cfg.envSourcedKeys != nil {
 		if cfg.envSourcedKeys["claude"] {

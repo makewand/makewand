@@ -44,6 +44,28 @@ func (p *chatFlowStubProvider) Chat(context.Context, []model.Message, string, in
 	return p.chatContent, usage, nil
 }
 
+func TestHandleAIResponse_ErrorRecordsKnownUsage(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	resp := aiResponseMsg{
+		provider:     "ensemble",
+		cost:         3.75,
+		inputTokens:  30,
+		outputTokens: 3,
+		err:          fmt.Errorf("adaptive fallback failed"),
+	}
+
+	updated, _ := app.Update(resp)
+	app = updated.(App)
+	if got := app.cost.RequestCount("ensemble"); got != 1 {
+		t.Fatalf("ensemble request count = %d, want 1", got)
+	}
+	input, output := app.cost.TokensByProvider("ensemble")
+	if input != 30 || output != 3 || app.cost.SessionTotal() != 3.75 {
+		t.Fatalf("recorded error usage = input %d output %d cost %.2f", input, output, app.cost.SessionTotal())
+	}
+}
+
 func (p *chatFlowStubProvider) ChatStream(ctx context.Context, _ []model.Message, _ string, _ int) (<-chan model.StreamChunk, error) {
 	return p.chatStreamWithContext(ctx)
 }
@@ -65,7 +87,10 @@ func TestSubmitChatInput_PowerModeUsesChatBestPath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
 
-	router := model.NewRouter(cfg)
+	router, err := model.NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
 	router.SetMode(model.ModePower)
 	stub := &chatFlowStubProvider{
 		name:        "private",
@@ -122,7 +147,10 @@ func TestSubmitChatInput_NonPowerUsesStreamPath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
 
-	router := model.NewRouter(cfg)
+	router, err := model.NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
 	router.SetMode(model.ModeBalanced)
 	stub := &chatFlowStubProvider{
 		name:    "private",
@@ -155,13 +183,80 @@ func TestSubmitChatInput_NonPowerUsesStreamPath(t *testing.T) {
 	}
 }
 
+func TestStreamingChatRecordsEstimatedUsageAtTerminalDone(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"private": {Provider: &chatFlowStubProvider{name: "private"}, Access: model.AccessSubscription},
+		},
+		UsageMode: "balanced",
+	})
+	app.router = router
+
+	next, cmd := app.submitChatInput("write a tiny function")
+	app = next.(App)
+	start, ok := cmd().(aiStreamStartMsg)
+	if !ok {
+		t.Fatal("stream command did not return aiStreamStartMsg")
+	}
+	next, _ = app.Update(start)
+	app = next.(App)
+	next, _ = app.Update(aiStreamMsg{provider: start.provider, chunk: model.StreamChunk{Content: "stream ok", Done: true}})
+	app = next.(App)
+
+	if got := app.cost.RequestCount("private"); got != 1 {
+		t.Fatalf("stream request count = %d, want 1", got)
+	}
+	inputTokens, outputTokens := app.cost.TokensByProvider("private")
+	if inputTokens <= 0 || outputTokens <= 0 {
+		t.Fatalf("stream tokens = %d/%d, want positive estimates", inputTokens, outputTokens)
+	}
+	if got := app.chat.LastAssistantContent(); got != "stream ok" {
+		t.Fatalf("assistant content = %q, want streamed response", got)
+	}
+}
+
+func TestStreamingChatPreservesPartialOutputAndUsageOnError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	provider := &chatFlowStubProvider{name: "private"}
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"private": {Provider: provider, Access: model.AccessSubscription},
+		},
+		UsageMode: "balanced",
+	})
+	app.router = router
+
+	next, cmd := app.submitChatInput("write a tiny function")
+	app = next.(App)
+	start := cmd().(aiStreamStartMsg)
+	next, _ = app.Update(start)
+	app = next.(App)
+	next, _ = app.Update(aiStreamMsg{provider: start.provider, chunk: model.StreamChunk{Content: "partial answer"}})
+	app = next.(App)
+	next, _ = app.Update(aiStreamMsg{provider: start.provider, chunk: model.StreamChunk{Error: fmt.Errorf("stream interrupted"), Done: true}})
+	app = next.(App)
+
+	if got := app.chat.LastAssistantContent(); got != "partial answer" {
+		t.Fatalf("partial assistant content = %q, want preserved partial output", got)
+	}
+	if got := app.cost.RequestCount("private"); got != 1 {
+		t.Fatalf("failed partial stream request count = %d, want 1", got)
+	}
+}
+
 func TestSubmitChatInput_AutopilotUsesCandidateSelectionForCodeTasks(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.ApprovalMode = config.ApprovalModeAuto
 	app := *NewApp(ModeChat, cfg, "")
 	app.project = newCandidateProject(t)
 
-	router := model.NewRouter(cfg)
+	router, err := model.NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
 	router.SetMode(model.ModeBalanced)
 	alpha := &chatFlowStubProvider{
 		name:        "alpha",
@@ -247,7 +342,10 @@ func TestSubmitChatInput_StreamPathKeepsContextAliveAfterStart(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
 
-	router := model.NewRouter(cfg)
+	router, err := model.NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
 	router.SetMode(model.ModeBalanced)
 	stub := &chatFlowStubProvider{name: "private"}
 	if err := router.RegisterProvider("private", stub, model.AccessSubscription); err != nil {
@@ -276,11 +374,29 @@ func TestSubmitChatInput_StreamPathKeepsContextAliveAfterStart(t *testing.T) {
 	}
 }
 
+func TestAIResponseCancelsActiveContext(t *testing.T) {
+	app := *NewApp(ModeChat, config.DefaultConfig(), "")
+	canceled := false
+	app.cancelAI = func() { canceled = true }
+
+	next, _ := app.Update(aiResponseMsg{err: fmt.Errorf("stream start failed")})
+	app = next.(App)
+	if !canceled {
+		t.Fatal("aiResponseMsg did not cancel the active request context")
+	}
+	if app.cancelAI != nil {
+		t.Fatal("cancelAI was not cleared after handling response")
+	}
+}
+
 func TestSubmitChatInput_ExplainUsesUnaryChatPath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
 
-	router := model.NewRouter(cfg)
+	router, err := model.NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
 	router.SetMode(model.ModeBalanced)
 	stub := &chatFlowStubProvider{
 		name:        "private",
@@ -295,7 +411,7 @@ func TestSubmitChatInput_ExplainUsesUnaryChatPath(t *testing.T) {
 	}
 	app.router = router
 
-	m, cmd := app.submitChatInput("你是谁?")
+	m, cmd := app.submitChatInput("Explain this code")
 	_ = m.(App)
 	if cmd == nil {
 		t.Fatal("submitChatInput returned nil cmd")
@@ -326,11 +442,14 @@ func TestSubmitChatInput_ExplainUsesStreamPathForGeminiCLI(t *testing.T) {
 	body := "#!/bin/sh\n" +
 		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"repo summary\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatalf("Chmod(script): %v", err)
+	}
 
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"gemini": {Provider: model.NewGeminiCLI(script), Access: model.AccessSubscription},
 		},

@@ -7,11 +7,6 @@ import (
 	"strings"
 )
 
-// sseEvent represents a parsed SSE event.
-type sseEvent struct {
-	Data string
-}
-
 // readSSE reads Server-Sent Events from r and sends raw data strings to ch.
 // It exits when the reader is exhausted, ctx is cancelled, or "[DONE]" is received.
 // The caller should close ch after this function returns.

@@ -93,6 +93,7 @@ type Messages struct {
 	ApprovalAutoWriteAutopilot    string
 	ApprovalAutoDeps              string
 	ApprovalAutoTests             string
+	ApprovalIsolationUnavailable  string
 	AutomationCandidateStarted    string
 	AutomationCandidateRunning    string
 	AutomationCandidateVerifying  string
@@ -102,34 +103,62 @@ type Messages struct {
 	AutomationCandidateCanceled   string
 	AutomationCandidateSelected   string
 	AutomationCandidateFallback   string
-	BuildDepsDetectFailed         string
-	BuildTestsDetectFailed        string
-	BuildDepsExecError            string
-	BuildDepsExecFailed           string
-	BuildDepsSkipped              string
-	BuildTestsSkipped             string
-	ExecDepsLabel                 string
-	ExecTestsLabel                string
-	ExecStarted                   string
-	ExecFinished                  string
-	ExecCommand                   string
-	ExecExitCode                  string
-	ExecDuration                  string
-	ExecOutput                    string
-	RestoredSessionPrefix         string
-	RestoredSessionNotice         string
-	NoCompactedMemoryNotice       string
-	MemoryRestoredAt              string
+
+	AutomationCandidateIsolationUnavailable string
+	AutomationCandidateWeakVerification     string
+	AutomationCandidateDeletions            string
+	HostCLIExecNotice                       string
+	BuildDepsDetectFailed                   string
+	BuildTestsDetectFailed                  string
+	BuildDepsExecError                      string
+	BuildDepsExecFailed                     string
+	BuildDepsSkipped                        string
+	BuildTestsSkipped                       string
+	ExecDepsLabel                           string
+	ExecTestsLabel                          string
+	ExecStarted                             string
+	ExecFinished                            string
+	ExecCommand                             string
+	ExecExitCode                            string
+	ExecDuration                            string
+	ExecOutput                              string
+	RestoredSessionPrefix                   string
+	RestoredSessionNotice                   string
+	NoCompactedMemoryNotice                 string
+	MemoryRestoredAt                        string
+
+	// Chat commands and status output
+	ChatHelp             string
+	CompactDone          string
+	CompactNothing       string
+	ResumeError          string
+	ResumeNotFound       string
+	IdentityAnswer       string
+	ModelProfileLabel    string
+	ModeNotSet           string
+	StatusProvidersNone  string
+	StatusProviders      string
+	StatusProject        string
+	StatusProjectEntries string
+	StatusSessionFile    string
+	StatusLastSaved      string
+	StatusSessionCost    string
+	Goodbye              string
 
 	// Cost
-	CostSession      string
-	CostMonth        string
-	CostFree         string
-	CostLocal        string
-	CostTotal        string
-	CostSubscription string
-	CostRequests     string
-	CostTokensEst    string
+	CostSession       string
+	CostMonth         string
+	CostFree          string
+	CostLocal         string
+	CostTotal         string
+	CostSubscription  string
+	CostRequests      string
+	CostTokensEst     string
+	CostSummaryTotal  string
+	CostNoRequests    string
+	CostProviderLine  string
+	BudgetWarningMsg  string
+	BudgetExceededMsg string
 
 	// Progress
 	ProgressTitle          string
@@ -167,6 +196,8 @@ type Messages struct {
 	ErrMaxRetries  string
 	ErrCancelled   string
 
+	RepoTrustNoSafeProvider string
+
 	// File tree
 	FileTreeTitle string
 	FileTreeEmpty string
@@ -196,6 +227,7 @@ type Messages struct {
 	SetupDone     string
 }
 
+//nolint:gosec // G101 false positive: UI translation strings mention "API key" but contain no credentials.
 var en = Messages{
 	AppName:     "makewand",
 	AppTagline:  "Multi-provider coding router for terminal makers",
@@ -277,6 +309,7 @@ var en = Messages{
 	ApprovalAutoWriteAutopilot:    "Autopilot applied a verified candidate and wrote %d files.",
 	ApprovalAutoDeps:              "Safe mode auto-approved dependency install.",
 	ApprovalAutoTests:             "Safe mode auto-approved test execution.",
+	ApprovalIsolationUnavailable:  "Sandbox isolation is unavailable (%s), so this command will not run automatically.",
 	AutomationCandidateStarted:    "Running multi-provider candidate verification.",
 	AutomationCandidateRunning:    "%s generating",
 	AutomationCandidateVerifying:  "%s verifying",
@@ -286,33 +319,79 @@ var en = Messages{
 	AutomationCandidateCanceled:   "%s canceled",
 	AutomationCandidateSelected:   "Selected %s after verifying %d/%d candidates.",
 	AutomationCandidateFallback:   "No candidate passed local verification. Falling back to manual approval.",
-	BuildDepsDetectFailed:         "Dependency detection failed: %s",
-	BuildTestsDetectFailed:        "Test detection failed: %s",
-	BuildDepsExecError:            "Error installing dependencies: %s",
-	BuildDepsExecFailed:           "Dependency install failed:\n%s",
-	BuildDepsSkipped:              "Skipped dependency install and tests. Run them manually when you're ready.",
-	BuildTestsSkipped:             "Skipped tests. Run them manually when you're ready.",
-	ExecDepsLabel:                 "dependency install",
-	ExecTestsLabel:                "tests",
-	ExecStarted:                   "Running %s",
-	ExecFinished:                  "%s finished",
-	ExecCommand:                   "Command: %s",
-	ExecExitCode:                  "Exit code: %d",
-	ExecDuration:                  "Duration: %s",
-	ExecOutput:                    "Output: %s",
-	RestoredSessionPrefix:         "Restored previous session",
-	RestoredSessionNotice:         "%s (%d messages). Use /clear to start fresh.",
-	NoCompactedMemoryNotice:       "No compacted memory yet. Conversation is still within the active context window.",
-	MemoryRestoredAt:              "%s at %s.",
 
-	CostSession:      "Session Cost",
-	CostMonth:        "Monthly Total",
-	CostFree:         "free",
-	CostLocal:        "local",
-	CostTotal:        "Total",
-	CostSubscription: "subscription",
-	CostRequests:     "%d requests (~%s tokens)",
-	CostTokensEst:    "~%dK tokens",
+	AutomationCandidateIsolationUnavailable: "Candidate code was not executed: %s. Falling back to manual approval.",
+	AutomationCandidateWeakVerification:     "Best candidate passed only weak checks (no baseline tests ran). Falling back to manual approval.",
+	AutomationCandidateDeletions:            "Candidate deleted files in its workspace (not applied automatically): %s",
+	HostCLIExecNotice:                       "Note: the %s CLI ran on this host (in %s) with your environment and credentials — generation is not sandboxed. Treat untrusted repos accordingly (see SECURITY.md).",
+
+	BuildDepsDetectFailed:   "Dependency detection failed: %s",
+	BuildTestsDetectFailed:  "Test detection failed: %s",
+	BuildDepsExecError:      "Error installing dependencies: %s",
+	BuildDepsExecFailed:     "Dependency install failed:\n%s",
+	BuildDepsSkipped:        "Skipped dependency install and tests. Run them manually when you're ready.",
+	BuildTestsSkipped:       "Skipped tests. Run them manually when you're ready.",
+	ExecDepsLabel:           "dependency install",
+	ExecTestsLabel:          "tests",
+	ExecStarted:             "Running %s",
+	ExecFinished:            "%s finished",
+	ExecCommand:             "Command: %s",
+	ExecExitCode:            "Exit code: %d",
+	ExecDuration:            "Duration: %s",
+	ExecOutput:              "Output: %s",
+	RestoredSessionPrefix:   "Restored previous session",
+	RestoredSessionNotice:   "%s (%d messages). Use /clear to start fresh.",
+	NoCompactedMemoryNotice: "No compacted memory yet. Conversation is still within the active context window.",
+	MemoryRestoredAt:        "%s at %s.",
+
+	ChatHelp: "Available commands:\n" +
+		"/help - Show command help\n" +
+		"/clear - Clear the current conversation\n" +
+		"/compact - Compact older chat history\n" +
+		"/memory - Show compacted session memory\n" +
+		"/status - Show current session status\n" +
+		"/cost - Show current session cost\n" +
+		"/approval [manual|safe|autopilot] - Switch approval behavior\n" +
+		"/approve - Approve the pending action\n" +
+		"/deny - Deny the pending action\n" +
+		"/resume - Restore the last saved session\n" +
+		"/model [fast|balanced|power] - Switch routing profile\n" +
+		"/exit - Quit makewand",
+	CompactDone:    "Conversation compacted.",
+	CompactNothing: "Nothing to compact yet.",
+	ResumeError:    "Could not restore session: %s",
+	ResumeNotFound: "No saved session found for this project.",
+	IdentityAnswer: "I am **makewand**, a multi-provider AI routing tool.\n\n" +
+		"I intelligently route your requests between:\n" +
+		"- Claude (Anthropic)\n" +
+		"- Gemini (Google)\n" +
+		"- Codex (OpenAI)\n\n" +
+		"I use adaptive mode-based routing (fast/balanced/power) to choose the best provider for your task.\n\n" +
+		"Type /help for available commands, or ask me anything else!",
+	ModelProfileLabel:    "Model profile: %s",
+	ModeNotSet:           "not set (legacy routing)",
+	StatusProvidersNone:  "Available providers: none",
+	StatusProviders:      "Available providers: %s",
+	StatusProject:        "Project: %s",
+	StatusProjectEntries: "Project entries: %d",
+	StatusSessionFile:    "Session file: %s",
+	StatusLastSaved:      "Last saved: %s",
+	StatusSessionCost:    "Session cost: $%.2f",
+	Goodbye:              "Goodbye!",
+
+	CostSession:       "Session Cost",
+	CostMonth:         "Monthly Total",
+	CostFree:          "free",
+	CostLocal:         "local",
+	CostTotal:         "Total",
+	CostSubscription:  "subscription",
+	CostRequests:      "%d requests (~%s tokens)",
+	CostTokensEst:     "~%dK tokens",
+	CostSummaryTotal:  "Session total: $%.2f",
+	CostNoRequests:    "No requests yet.",
+	CostProviderLine:  "%s: $%.2f, %d requests, %d in / %d out tokens",
+	BudgetWarningMsg:  "Budget warning: $%.2f / $%.2f (%.0f%%)",
+	BudgetExceededMsg: "Budget exceeded: $%.2f / $%.2f (%.0f%%)",
 
 	ProgressTitle:          "Progress",
 	ProgressAnalyzing:      "Analyzing requirements...",
@@ -348,6 +427,8 @@ var en = Messages{
 	ErrMaxRetries:  "Auto-fix failed after %d attempts. Please fix manually.",
 	ErrCancelled:   "Operation cancelled",
 
+	RepoTrustNoSafeProvider: "Untrusted repository mode is active: only direct API providers may generate against this repo, but none are configured. Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY) to enable a safe provider, or restart with --repo-trust=trusted if you trust this repository.",
+
 	FileTreeTitle: "Project Files",
 	FileTreeEmpty: "(no files yet)",
 	FileTreeMore:  "+%d more files",
@@ -372,6 +453,7 @@ var en = Messages{
 	SetupDone:     "Setup complete! Run 'makewand new' to create your first project.",
 }
 
+//nolint:gosec // G101 false positive: UI translation strings mention "API key" but contain no credentials.
 var zh = Messages{
 	AppName:     "makewand",
 	AppTagline:  "面向终端开发者的多模型编码路由器",
@@ -453,6 +535,7 @@ var zh = Messages{
 	ApprovalAutoWriteAutopilot:    "自动驾驶已应用通过验证的候选，并写入 %d 个文件。",
 	ApprovalAutoDeps:              "安全模式已自动批准安装依赖。",
 	ApprovalAutoTests:             "安全模式已自动批准运行测试。",
+	ApprovalIsolationUnavailable:  "沙箱隔离不可用（%s），该命令不会自动执行。",
 	AutomationCandidateStarted:    "正在运行多 provider 候选验证。",
 	AutomationCandidateRunning:    "%s 生成中",
 	AutomationCandidateVerifying:  "%s 验证中",
@@ -462,33 +545,79 @@ var zh = Messages{
 	AutomationCandidateCanceled:   "%s 已取消",
 	AutomationCandidateSelected:   "已选择 %s，通过验证 %d/%d 个候选。",
 	AutomationCandidateFallback:   "没有候选通过本地验证，已回退为手动确认。",
-	BuildDepsDetectFailed:         "依赖检测失败：%s",
-	BuildTestsDetectFailed:        "测试检测失败：%s",
-	BuildDepsExecError:            "安装依赖时出错：%s",
-	BuildDepsExecFailed:           "依赖安装失败：\n%s",
-	BuildDepsSkipped:              "已跳过依赖安装和测试。准备好后可手动运行。",
-	BuildTestsSkipped:             "已跳过测试。准备好后可手动运行。",
-	ExecDepsLabel:                 "依赖安装",
-	ExecTestsLabel:                "测试",
-	ExecStarted:                   "正在执行%s",
-	ExecFinished:                  "%s已完成",
-	ExecCommand:                   "命令：%s",
-	ExecExitCode:                  "退出码：%d",
-	ExecDuration:                  "耗时：%s",
-	ExecOutput:                    "输出：%s",
-	RestoredSessionPrefix:         "已恢复上次会话",
-	RestoredSessionNotice:         "%s（%d 条消息）。使用 /clear 可重新开始。",
-	NoCompactedMemoryNotice:       "还没有压缩记忆。当前对话仍在活动上下文窗口内。",
-	MemoryRestoredAt:              "%s，时间：%s。",
 
-	CostSession:      "本次费用",
-	CostMonth:        "本月累计",
-	CostFree:         "免费",
-	CostLocal:        "本地",
-	CostTotal:        "总计",
-	CostSubscription: "订阅",
-	CostRequests:     "%d 次请求 (~%s tokens)",
-	CostTokensEst:    "~%dK tokens",
+	AutomationCandidateIsolationUnavailable: "候选代码未被执行：%s。已回退为手动确认。",
+	AutomationCandidateWeakVerification:     "最佳候选只通过了弱校验（没有运行基线测试），已回退为手动确认。",
+	AutomationCandidateDeletions:            "候选在其工作区中删除了文件（不会自动应用）：%s",
+	HostCLIExecNotice:                       "提示：%s CLI 在本机（%s）以你的环境和凭据运行——生成阶段没有沙箱。处理不可信仓库请注意（详见 SECURITY.md）。",
+
+	BuildDepsDetectFailed:   "依赖检测失败：%s",
+	BuildTestsDetectFailed:  "测试检测失败：%s",
+	BuildDepsExecError:      "安装依赖时出错：%s",
+	BuildDepsExecFailed:     "依赖安装失败：\n%s",
+	BuildDepsSkipped:        "已跳过依赖安装和测试。准备好后可手动运行。",
+	BuildTestsSkipped:       "已跳过测试。准备好后可手动运行。",
+	ExecDepsLabel:           "依赖安装",
+	ExecTestsLabel:          "测试",
+	ExecStarted:             "正在执行%s",
+	ExecFinished:            "%s已完成",
+	ExecCommand:             "命令：%s",
+	ExecExitCode:            "退出码：%d",
+	ExecDuration:            "耗时：%s",
+	ExecOutput:              "输出：%s",
+	RestoredSessionPrefix:   "已恢复上次会话",
+	RestoredSessionNotice:   "%s（%d 条消息）。使用 /clear 可重新开始。",
+	NoCompactedMemoryNotice: "还没有压缩记忆。当前对话仍在活动上下文窗口内。",
+	MemoryRestoredAt:        "%s，时间：%s。",
+
+	ChatHelp: "可用命令：\n" +
+		"/help - 显示命令帮助\n" +
+		"/clear - 清空当前对话\n" +
+		"/compact - 压缩较早的聊天历史\n" +
+		"/memory - 显示压缩后的会话记忆\n" +
+		"/status - 显示当前会话状态\n" +
+		"/cost - 显示本次会话费用\n" +
+		"/approval [manual|safe|autopilot] - 切换审批模式\n" +
+		"/approve - 批准待确认操作\n" +
+		"/deny - 拒绝待确认操作\n" +
+		"/resume - 恢复上次保存的会话\n" +
+		"/model [fast|balanced|power] - 切换路由档位\n" +
+		"/exit - 退出 makewand",
+	CompactDone:    "对话已压缩。",
+	CompactNothing: "暂时没有可压缩的内容。",
+	ResumeError:    "恢复会话失败：%s",
+	ResumeNotFound: "没有找到该项目已保存的会话。",
+	IdentityAnswer: "我是 **makewand**，一个多 provider AI 路由工具。\n\n" +
+		"我会在以下模型之间智能路由你的请求：\n" +
+		"- Claude (Anthropic)\n" +
+		"- Gemini (Google)\n" +
+		"- Codex (OpenAI)\n\n" +
+		"我使用基于档位的自适应路由（fast/balanced/power）来为你的任务选择最合适的 provider。\n\n" +
+		"输入 /help 查看可用命令，也可以直接问我任何问题！",
+	ModelProfileLabel:    "模型档位：%s",
+	ModeNotSet:           "未设置（旧版路由）",
+	StatusProvidersNone:  "可用 provider：无",
+	StatusProviders:      "可用 provider：%s",
+	StatusProject:        "项目：%s",
+	StatusProjectEntries: "项目条目：%d 个",
+	StatusSessionFile:    "会话文件：%s",
+	StatusLastSaved:      "上次保存：%s",
+	StatusSessionCost:    "本次会话费用：$%.2f",
+	Goodbye:              "再见！",
+
+	CostSession:       "本次费用",
+	CostMonth:         "本月累计",
+	CostFree:          "免费",
+	CostLocal:         "本地",
+	CostTotal:         "总计",
+	CostSubscription:  "订阅",
+	CostRequests:      "%d 次请求 (~%s tokens)",
+	CostTokensEst:     "~%dK tokens",
+	CostSummaryTotal:  "本次会话合计：$%.2f",
+	CostNoRequests:    "还没有任何请求。",
+	CostProviderLine:  "%s：$%.2f，%d 次请求，输入 %d / 输出 %d tokens",
+	BudgetWarningMsg:  "预算警告：$%.2f / $%.2f (%.0f%%)",
+	BudgetExceededMsg: "已超出预算：$%.2f / $%.2f (%.0f%%)",
 
 	ProgressTitle:          "进度",
 	ProgressAnalyzing:      "正在分析需求...",
@@ -523,6 +652,8 @@ var zh = Messages{
 	ErrFileRefresh: "刷新项目文件失败: %s",
 	ErrMaxRetries:  "自动修复在 %d 次尝试后失败，请手动修复。",
 	ErrCancelled:   "操作已取消",
+
+	RepoTrustNoSafeProvider: "已启用不可信仓库模式：只有直连 API 提供方可以对此仓库生成内容，但当前未配置任何一个。请设置 API 密钥（ANTHROPIC_API_KEY、GEMINI_API_KEY 或 OPENAI_API_KEY）以启用安全提供方，或在信任该仓库时用 --repo-trust=trusted 重新启动。",
 
 	FileTreeTitle: "项目文件",
 	FileTreeEmpty: "（暂无文件）",

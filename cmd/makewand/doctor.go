@@ -90,6 +90,7 @@ type doctorOptions struct {
 	remoteTimeout time.Duration
 	strict        bool
 	jsonOutput    bool
+	repoTrust     model.RepoTrust
 }
 
 func doctorCmd() *cobra.Command {
@@ -130,7 +131,11 @@ Examples:
 				return fmt.Errorf("remote timeout must be positive")
 			}
 
-			cfg, loadErr := config.Load()
+			// Honor the resolved repository trust when loading config: untrusted
+			// mode skips subscription-CLI detection so doctor never execs a local
+			// CLI in an untrusted working directory. Trusted mode still detects CLIs
+			// so their status is reported as before.
+			cfg, loadErr := config.LoadWithOptions(configLoadOptions())
 			report, failCount, warnCount := runDoctor(cfg, loadErr, doctorOptions{
 				modes:         modes,
 				probe:         probeFlag,
@@ -142,6 +147,10 @@ Examples:
 				remoteTimeout: remoteTimeoutFlag,
 				strict:        strictFlag,
 				jsonOutput:    jsonFlag,
+				// resolvedRepoTrust is parsed and validated once by the root
+				// PersistentPreRunE. Honoring it here keeps the live probe from
+				// executing a provider that is not untrusted-repo-safe.
+				repoTrust: resolvedRepoTrust,
 			})
 
 			if jsonFlag {
@@ -282,7 +291,18 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 		modeName := modeValue.String()
 		cfgCopy := *cfg
 		cfgCopy.UsageMode = modeName
-		router := model.NewRouter(&cfgCopy)
+		// Construct WITH the resolved trust so untrusted mode is known before the
+		// async quota refresh runs, and so mode-coverage routing fails closed on
+		// providers that are not untrusted-repo-safe.
+		router, err := model.NewRouterWithTrust(&cfgCopy, opts.repoTrust)
+		if err != nil {
+			report.ModeCoverage = append(report.ModeCoverage, doctorModeReport{
+				Mode:   modeName,
+				Status: doctorFail,
+				Routes: []doctorTaskRoute{{Task: "router init", Error: err.Error()}},
+			})
+			continue
+		}
 		if configDir != "" {
 			_ = router.LoadStats(configDir)
 		}
@@ -325,9 +345,18 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 
 		candidates := uniqueProbeProviders(modeResult.Routes)
 		if len(candidates) == 0 {
-			probeResult.Status = doctorFail
-			probeResult.Classification = probeClassConfiguration
-			probeResult.Error = "no probe candidate provider found"
+			if opts.repoTrust == model.RepoTrustUntrusted {
+				// Untrusted mode fails closed at routing when no untrusted-repo-safe
+				// provider is available, so there is nothing safe to probe. Report
+				// the skip clearly rather than executing anything.
+				probeResult.Status = doctorWarn
+				probeResult.Classification = probeClassConfiguration
+				probeResult.Error = "skipped: untrusted mode (no untrusted-repo-safe provider to probe)"
+			} else {
+				probeResult.Status = doctorFail
+				probeResult.Classification = probeClassConfiguration
+				probeResult.Error = "no probe candidate provider found"
+			}
 			probeResult.DurationMS = time.Since(start).Milliseconds()
 			report.LiveProbe = append(report.LiveProbe, probeResult)
 			continue
@@ -347,6 +376,21 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 					attempt:  attemptCount,
 					class:    classifyProbeError(err),
 					err:      err,
+				})
+				continue
+			}
+
+			// Fail-closed guard: never call Chat on a provider that is not
+			// untrusted-repo-safe while untrusted mode is active. Routing already
+			// filters these out, but the probe executes providers directly, so
+			// guard it explicitly and record the provider as skipped.
+			if opts.repoTrust == model.RepoTrustUntrusted && !probeProviderUntrustedSafe(prov) {
+				attemptCount++
+				failures = append(failures, doctorProbeFailure{
+					provider: providerName,
+					attempt:  attemptCount,
+					class:    probeClassConfiguration,
+					err:      fmt.Errorf("skipped: untrusted mode (%s is not untrusted-repo-safe)", providerName),
 				})
 				continue
 			}
@@ -715,6 +759,15 @@ func doctorTasks() []doctorTask {
 	}
 }
 
+// probeProviderUntrustedSafe reports whether a resolved provider declares itself
+// safe to run against an untrusted repository. Providers that do not implement
+// UntrustedRepoCapable are treated as unsafe (fail closed), matching the router's
+// own capability gate.
+func probeProviderUntrustedSafe(prov model.Provider) bool {
+	capable, ok := prov.(model.UntrustedRepoCapable)
+	return ok && capable.SafeForUntrustedRepo()
+}
+
 func uniqueProbeProviders(routes []doctorTaskRoute) []string {
 	seen := make(map[string]bool)
 	out := make([]string, 0, len(routes))
@@ -836,9 +889,10 @@ func summarizeProbeFailures(failures []doctorProbeFailure, class doctorProbeClas
 	sort.Strings(providers)
 
 	classText := "provider"
-	if class == probeClassEnvironment {
+	switch class {
+	case probeClassEnvironment:
 		classText = "environment"
-	} else if class == probeClassConfiguration {
+	case probeClassConfiguration:
 		classText = "configuration"
 	}
 

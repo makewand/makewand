@@ -67,7 +67,7 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string) (stri
 	if err := previewBwrapSelfTest(bwrapPath); err != nil {
 		msg := strings.TrimSpace(err.Error())
 		if !strings.Contains(msg, "MAKEWAND_UNSAFE_HOST_EXEC=1") {
-			msg = msg + "; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)"
+			msg += "; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)"
 		}
 		return "", nil, fmt.Errorf("%s", msg)
 	}
@@ -80,9 +80,12 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string) (stri
 	wrapped := []string{
 		"--die-with-parent",
 		"--new-session",
+		// Root first; fresh /proc and /dev afterwards so they overlay the
+		// read-only root instead of being shadowed by it (a shadowed /dev makes
+		// /dev/null read-only and breaks most tooling).
+		"--ro-bind", "/", "/",
 		"--proc", "/proc",
 		"--dev", "/dev",
-		"--ro-bind", "/", "/",
 		"--bind", projectPath, projectPath,
 		"--chdir", projectPath,
 		"--tmpfs", "/tmp",

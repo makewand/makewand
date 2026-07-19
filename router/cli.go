@@ -196,10 +196,15 @@ func NewAgyCLI(binPath string) *CLIProvider {
 		provider: "gemini",
 	}
 	buildArgs := func(prompt string) []string {
-		args := []string{"--print", "--sandbox", prompt}
+		// agy's --print is a string flag whose next argument is the prompt. Keep
+		// every global option before it; otherwise `--print --sandbox <prompt>`
+		// makes agy treat the literal "--sandbox" as the prompt and ignore the
+		// actual user input.
+		args := []string{"--sandbox"}
 		if m := strings.TrimSpace(os.Getenv("MAKEWAND_AGY_MODEL")); m != "" {
-			args = append([]string{"--model", m}, args...)
+			args = append(args, "--model", m)
 		}
+		args = append(args, "--print", prompt)
 		return args
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
@@ -318,6 +323,35 @@ func NewCommandCLI(providerName, command string, args []string, promptMode strin
 // Provider interface implementation
 
 func (c *CLIProvider) Name() string { return c.provider }
+
+// SafeForUntrustedRepo reports that a CLI provider is NOT safe against an
+// untrusted repo: it execs a local subscription CLI (claude/codex/gemini-cli/agy/
+// custom command) on the host with the user's env and credentials and cwd = the
+// repo, so repo content (instruction files, .mcp.json, prompt injection) can steer
+// that host-privileged agent into a confused-deputy action.
+func (c *CLIProvider) SafeForUntrustedRepo() bool { return false }
+
+// ReportedModelID distinguishes a requested tier model from what the CLI can
+// actually guarantee. Claude and Gemini accept explicit model flags. Codex and
+// Agy currently choose their own configured/default model unless Agy has an
+// explicit Makewand override, so exposing a premium model ID for those calls
+// would be misleading.
+func (c *CLIProvider) ReportedModelID(requestedModelID string) string {
+	if c == nil {
+		return requestedModelID
+	}
+	switch c.name {
+	case "agy-cli":
+		if modelID := strings.TrimSpace(os.Getenv("MAKEWAND_AGY_MODEL")); modelID != "" {
+			return modelID
+		}
+		return "agy-provider-managed"
+	case "codex-cli":
+		return "codex-provider-managed"
+	default:
+		return requestedModelID
+	}
+}
 
 func (c *CLIProvider) IsAvailable() bool {
 	c.mu.Lock()
@@ -1173,7 +1207,7 @@ func stripANSI(s string) string {
 			i++
 			if i < len(s) && s[i] == '[' {
 				i++
-				for i < len(s) && !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
+				for i < len(s) && (s[i] < 'A' || s[i] > 'Z') && (s[i] < 'a' || s[i] > 'z') {
 					i++
 				}
 				if i < len(s) {

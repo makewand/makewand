@@ -20,19 +20,27 @@ type RemoteHTTPProvider struct {
 // NewRemoteHTTP creates a provider backed by a remote makewand HTTP server.
 func NewRemoteHTTP(baseURL, token string) *RemoteHTTPProvider {
 	return &RemoteHTTPProvider{
-		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		token:   strings.TrimSpace(token),
+		baseURL:    strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		token:      strings.TrimSpace(token),
+		chatClient: newAPIClient(),
 	}
 }
 
 func (p *RemoteHTTPProvider) Name() string      { return "remote" }
 func (p *RemoteHTTPProvider) IsAvailable() bool { return p != nil && p.baseURL != "" && p.token != "" }
 
+// SafeForUntrustedRepo reports that the remote HTTP provider is safe against an
+// untrusted repo on THIS host: it makes an HTTP call to the operator's own remote
+// makewand server and runs no local repo-aware agent here. Note that repo content
+// is forwarded to that remote server; the remote's own trust posture (how it
+// handles the forwarded content) is out of scope for this local capability check.
+func (p *RemoteHTTPProvider) SafeForUntrustedRepo() bool { return true }
+
 func (p *RemoteHTTPProvider) client() *http.Client {
 	if p != nil && p.chatClient != nil {
 		return p.chatClient
 	}
-	return http.DefaultClient
+	return newAPIClient()
 }
 
 func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, system string, _ int) (string, Usage, error) {
@@ -56,14 +64,17 @@ func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, syste
 		return "", Usage{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/chat/completions", bytes.NewReader(payload))
+	// baseURL is the operator-configured remote makewand server (MAKEWAND_REMOTE_URL),
+	// not attacker-controlled per request; the client blocks cross-host redirects and
+	// enforces a TLS floor.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/chat/completions", bytes.NewReader(payload)) //nolint:gosec // G704: operator-configured remote host
 	if err != nil {
 		return "", Usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.token)
 
-	resp, err := p.client().Do(req)
+	resp, err := p.client().Do(req) //nolint:gosec // G704: operator-configured remote host (see above)
 	if err != nil {
 		return "", Usage{}, err
 	}
@@ -116,14 +127,15 @@ func (p *RemoteHTTPProvider) ChatStream(ctx context.Context, messages []Message,
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/chat/completions", bytes.NewReader(payload))
+	// baseURL is the operator-configured remote makewand server, not request-controlled.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/chat/completions", bytes.NewReader(payload)) //nolint:gosec // G704: operator-configured remote host
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.token)
 
-	resp, err := p.client().Do(req)
+	resp, err := p.client().Do(req) //nolint:gosec // G704: operator-configured remote host (see above)
 	if err != nil {
 		return nil, err
 	}

@@ -61,9 +61,9 @@ func TestJudgeSelect_WinnerProviderIsGenerator(t *testing.T) {
 			"gemini": gemini,
 		},
 		providerCache: map[providerKey]Provider{
-			{name: "claude", modelID: modelTable["claude"][TierPremium]}: claude,
-			{name: "codex", modelID: modelTable["codex"][TierPremium]}:   codex,
-			{name: "gemini", modelID: modelTable["gemini"][TierPremium]}: gemini,
+			{name: "claude", modelID: testModelID("claude", TierPremium)}: claude,
+			{name: "codex", modelID: testModelID("codex", TierPremium)}:   codex,
+			{name: "gemini", modelID: testModelID("gemini", TierPremium)}: gemini,
 		},
 		accessTypes: map[string]AccessType{
 			"claude": AccessSubscription,
@@ -116,7 +116,7 @@ func TestJudgeSelect_FallsBackToFirstOnNoWinnerLine(t *testing.T) {
 	r := &Router{
 		providers: map[string]Provider{"claude": claude, "codex": codex, "gemini": gemini},
 		providerCache: map[providerKey]Provider{
-			{name: "gemini", modelID: modelTable["gemini"][TierPremium]}: gemini,
+			{name: "gemini", modelID: testModelID("gemini", TierPremium)}: gemini,
 		},
 		accessTypes: map[string]AccessType{
 			"claude": AccessSubscription,
@@ -160,9 +160,9 @@ func TestChatBest_PowerMode_IncludesJudgeCost(t *testing.T) {
 			"gemini": gemini,
 		},
 		providerCache: map[providerKey]Provider{
-			{name: "claude", modelID: modelTable["claude"][TierPremium]}: claude,
-			{name: "codex", modelID: modelTable["codex"][TierPremium]}:   codex,
-			{name: "gemini", modelID: modelTable["gemini"][TierPremium]}: gemini,
+			{name: "claude", modelID: testModelID("claude", TierPremium)}: claude,
+			{name: "codex", modelID: testModelID("codex", TierPremium)}:   codex,
+			{name: "gemini", modelID: testModelID("gemini", TierPremium)}: gemini,
 		},
 		accessTypes: map[string]AccessType{
 			"claude": AccessSubscription,

@@ -163,7 +163,7 @@ func TestApplyEdit_Success(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
 	original := "line1\nline2\nold code\nline4\n"
-	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,7 +189,7 @@ func TestApplyEdit_FirstOccurrenceOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
 	original := "AAA\nBBB\nAAA\n"
-	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -211,7 +211,7 @@ func TestApplyEdit_FirstOccurrenceOnly(t *testing.T) {
 func TestApplyEdit_NotFound(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
-	if err := os.WriteFile(path, []byte("hello world\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("hello world\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -237,7 +237,7 @@ func TestApplyDiff_Success(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
 	original := "line1\nline2\nold line\nline4\nline5\n"
-	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -271,7 +271,7 @@ func TestApplyDiff_ContextMismatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
 	original := "line1\nline2\nline3\n"
-	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -295,7 +295,7 @@ func TestApplyDiff_ContextMismatch(t *testing.T) {
 func TestApplyDiff_MalformedHunks(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
-	if err := os.WriteFile(path, []byte("hello\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("hello\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

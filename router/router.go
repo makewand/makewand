@@ -3,9 +3,9 @@ package router
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -131,6 +131,22 @@ type Provider interface {
 	ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error)
 }
 
+// providerModelReporter is implemented by transports that cannot necessarily
+// honor the router's requested model ID. It keeps user-visible route metadata
+// honest for provider-managed subscription CLIs.
+type providerModelReporter interface {
+	ReportedModelID(requestedModelID string) string
+}
+
+func reportedModelID(provider Provider, requestedModelID string) string {
+	if reporter, ok := provider.(providerModelReporter); ok {
+		if actual := strings.TrimSpace(reporter.ReportedModelID(requestedModelID)); actual != "" {
+			return actual
+		}
+	}
+	return requestedModelID
+}
+
 // fallbackOrder defines the deterministic order for provider fallback.
 var fallbackOrder = []string{"claude", "codex", "gemini"}
 
@@ -180,6 +196,12 @@ type RouterConfig struct {
 	// QuotaPolicy overrides the default warn/crit thresholds. Zero value uses
 	// DefaultQuotaPolicy.
 	QuotaPolicy QuotaPolicy
+
+	// RepoTrust controls untrusted-repository capability routing. The zero value
+	// (RepoTrustTrusted) preserves existing behavior. RepoTrustUntrusted restricts
+	// generation to providers that do not run a repo-aware agent on the host and
+	// fails closed when none are available.
+	RepoTrust RepoTrust
 }
 
 // providerKey is used to cache provider instances by (name, modelID).
@@ -204,9 +226,21 @@ type Router struct {
 	// request-scoped views such as remote token policies.
 	providerAllowlist map[string]struct{}
 
+	// tables holds this instance's routing/pricing tables, deep-copied from the
+	// immutable package defaults at construction. Struct-literal Routers (tests)
+	// leave it unset; routingTables() then lazily adopts their own private copy
+	// of the defaults on first use, so they never read the shared, mutable
+	// package-level defaultTables. Stored atomically so that lazy first-use is
+	// race-free without a mutex on the hot routing path.
+	tables atomic.Pointer[strategyTables]
+
 	// Provider cache for mode-based routing (provider+model → instance)
 	providerCache map[providerKey]Provider
 	providerMu    sync.Mutex
+
+	// factories maps provider names to per-instance factories for dynamic
+	// model-specific construction (guarded by providerMu).
+	factories map[string]ProviderFactory
 
 	// Access types for each provider
 	accessTypes map[string]AccessType
@@ -232,33 +266,53 @@ type Router struct {
 	// Subscription-quota awareness (nil when disabled).
 	quota       QuotaController
 	quotaPolicy QuotaPolicy
+
+	// repoTrust holds the untrusted-repository trust level as an int32 so it can
+	// be read/written race-free on the hot routing path without a mutex. The zero
+	// value is RepoTrustTrusted (existing behavior).
+	repoTrust atomic.Int32
 }
 
 const availCacheTTL = 10 * time.Second
 
 // NewRouterFromConfig creates a Router from a config-free RouterConfig.
 // This is the primary constructor for library consumers.
-func NewRouterFromConfig(rc RouterConfig) *Router {
+// It returns an error when the embedded strategy defaults are unusable or when
+// rc.ConfigDir contains an invalid routing.json override.
+func NewRouterFromConfig(rc RouterConfig) (*Router, error) {
 	if initErr != nil {
 		// Embedded strategy defaults failed to load — should not happen in a
-		// correctly built binary. Log the error so callers can diagnose.
-		fmt.Fprintf(os.Stderr, "router: strategy init error: %v\n", initErr)
-	}
-	if rc.ConfigDir != "" {
-		_ = LoadUserOverrides(rc.ConfigDir)
+		// correctly built binary. Surface it so callers can diagnose.
+		return nil, initErr
 	}
 
 	r := &Router{
 		providers:     make(map[string]Provider),
 		providerCache: make(map[providerKey]Provider),
+		factories:     make(map[string]ProviderFactory),
 		accessTypes:   make(map[string]AccessType),
 		usage:         newSessionUsage(),
 		breaker:       newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
 		quota:         rc.Quota,
 		quotaPolicy:   rc.QuotaPolicy,
 	}
+	r.tables.Store(copyDefaultTables())
+	r.repoTrust.Store(int32(rc.RepoTrust))
+	// Propagate the trust level into a concrete quota snapshotter so its
+	// background/forced refresh never execs a local CLI (e.g. `agy models`) to
+	// probe quota for an unsafe provider in untrusted mode. A fake QuotaController
+	// (tests) execs nothing, so only the concrete snapshotter needs this.
+	if snap, ok := rc.Quota.(*QuotaSnapshotter); ok {
+		snap.SetRepoTrust(rc.RepoTrust)
+	}
 	if r.quotaPolicy == (QuotaPolicy{}) {
 		r.quotaPolicy = DefaultQuotaPolicy()
+	}
+
+	if rc.ConfigDir != "" {
+		if err := r.routingTables().loadUserOverrides(rc.ConfigDir); err != nil {
+			return nil, fmt.Errorf("load routing overrides: %w", err)
+		}
 	}
 
 	r.legacyModels.defaultModel = rc.DefaultModel
@@ -269,6 +323,9 @@ func NewRouterFromConfig(rc RouterConfig) *Router {
 	for name, entry := range rc.Providers {
 		r.providers[name] = entry.Provider
 		r.accessTypes[name] = entry.Access
+		// Price non-streaming responses from this Router's snapshot, not the
+		// package defaults, so pricing overrides apply to pre-built providers.
+		r.attachCostTable(entry.Provider)
 	}
 
 	if rc.UsageMode != "" {
@@ -278,7 +335,47 @@ func NewRouterFromConfig(rc RouterConfig) *Router {
 		}
 	}
 
-	return r
+	return r, nil
+}
+
+// routingTables returns this Router's strategy tables. Routers constructed via
+// struct literal (tests) have no instance tables yet; on first use they lazily
+// adopt their own private copy of the immutable defaults, so they never read the
+// shared, mutable package-level defaultTables (which the deprecated package-level
+// LoadUserOverrides can mutate).
+func (r *Router) routingTables() *strategyTables {
+	if t := r.tables.Load(); t != nil {
+		return t
+	}
+	// Lazily initialize from a fresh copy of the immutable defaults. CAS makes a
+	// concurrent first-use race-free without a mutex, avoiding lock-ordering
+	// hazards on the hot routing path (routingTables is called under other locks).
+	fresh := copyDefaultTables()
+	if r.tables.CompareAndSwap(nil, fresh) {
+		return fresh
+	}
+	return r.tables.Load()
+}
+
+// LoadUserOverrides deep-merges configDir/routing.json into this Router's
+// tables. Missing file is not an error; invalid overrides leave the tables
+// unchanged and return the error.
+func (r *Router) LoadUserOverrides(configDir string) error {
+	return r.routingTables().loadUserOverrides(configDir)
+}
+
+// ContextBudgetForMode returns this Router's context budget (in chars) for the
+// first provider of the (mode, task) strategy entry, reading this instance's
+// tables (including any user overrides). Prefer this over the deprecated
+// package-level ContextBudgetForMode, which only sees the package defaults.
+func (r *Router) ContextBudgetForMode(mode UsageMode, task TaskType) int {
+	return r.routingTables().contextBudgetForMode(mode, task)
+}
+
+// ContextBudgetForProvider returns this Router's context budget (in chars) for
+// the given provider and tier, reading this instance's tables.
+func (r *Router) ContextBudgetForProvider(provider string, tier ModelTier) int {
+	return r.routingTables().contextBudget(provider, tier)
 }
 
 // SetMode sets the usage mode and enables mode-based routing.
@@ -353,6 +450,10 @@ func (r *Router) cloneView() *Router {
 	for key, provider := range r.providerCache {
 		providerCache[key] = provider
 	}
+	factories := make(map[string]ProviderFactory, len(r.factories))
+	for name, factory := range r.factories {
+		factories[name] = factory
+	}
 	r.providerMu.Unlock()
 
 	r.mu.Lock()
@@ -370,20 +471,30 @@ func (r *Router) cloneView() *Router {
 	traceSink := r.traceSink
 	r.traceMu.RUnlock()
 
-	return &Router{
+	clone := &Router{
 		legacyModels:      legacy,
 		providers:         providers,
 		providerAllowlist: cloneStringSet(r.providerAllowlist),
 		providerCache:     providerCache,
+		factories:         factories,
 		accessTypes:       accessTypes,
 		usage:             r.usage,
 		breaker:           r.breaker,
+		quota:             r.quota,
+		quotaPolicy:       r.quotaPolicy,
 		mode:              mode,
 		modeSet:           modeSet,
 		cachedAvail:       cachedAvail,
 		cachedAvailAt:     cachedAvailAt,
 		traceSink:         traceSink,
 	}
+	// Per-request views share the parent's live tables snapshot so hot-reloads
+	// are visible through clones too.
+	clone.tables.Store(r.routingTables())
+	// Inherit the trust level so untrusted-repo enforcement survives per-request
+	// views (mode/allowlist clones) rather than silently reverting to trusted.
+	clone.repoTrust.Store(int32(r.RepoTrust()))
+	return clone
 }
 
 // cloneWithMode creates a per-request router view that preserves shared
@@ -486,8 +597,8 @@ func (r *Router) Route(task TaskType) (RouteResult, error) {
 
 // legacyModelID returns the best-effort model ID for a provider in legacy mode.
 // Legacy routing has no tier concept, so we use TierMid as a reasonable default.
-func legacyModelID(providerName string) string {
-	return getModelID(providerName, TierMid)
+func (r *Router) legacyModelID(providerName string) string {
+	return r.routingTables().modelID(providerName, TierMid)
 }
 
 // routeLegacy is the original routing logic (config-based model assignment).
@@ -511,70 +622,113 @@ func (r *Router) routeLegacy(task TaskType) (RouteResult, error) {
 		Requested: modelName,
 	})
 
-	// Try the preferred model
-	if p, ok := r.getProvider(modelName); ok && p.IsAvailable() {
-		if blocked, remaining := r.isCircuitOpen(modelName); blocked {
+	// Try the preferred model. The capability check runs BEFORE IsAvailable so an
+	// unsafe CLI is never probed (IsAvailable execs a host health check) in
+	// untrusted mode. In trusted mode untrustedRepoSafe is always true, so the
+	// unsafe branch is dead and IsAvailable gates exactly as before.
+	if p, ok := r.getProvider(modelName); ok {
+		switch {
+		case !r.untrustedRepoSafe(p):
 			r.emitTrace(TraceEvent{
 				Event:     "route_candidate_skipped",
 				Task:      taskTypeName(task),
 				Requested: modelName,
 				Selected:  modelName,
-				ModelID:   legacyModelID(modelName),
-				Detail:    circuitOpenDetail(modelName, remaining),
+				ModelID:   r.legacyModelID(modelName),
+				Detail:    untrustedRepoSkipDetail(modelName),
 			})
-		} else {
-			modelID := legacyModelID(modelName)
-			r.emitTrace(TraceEvent{
-				Event:     "route_selected",
-				Task:      taskTypeName(task),
-				Requested: modelName,
-				Selected:  modelName,
-				ModelID:   modelID,
-			})
-			return RouteResult{
-				Provider:  p,
-				ModelID:   modelID,
-				Requested: modelName,
-				Actual:    modelName,
-			}, nil
+		case !p.IsAvailable():
+			// Not available — fall through to the deterministic fallback below.
+		default:
+			if blocked, remaining := r.isCircuitOpen(modelName); blocked {
+				r.emitTrace(TraceEvent{
+					Event:     "route_candidate_skipped",
+					Task:      taskTypeName(task),
+					Requested: modelName,
+					Selected:  modelName,
+					ModelID:   r.legacyModelID(modelName),
+					Detail:    circuitOpenDetail(modelName, remaining),
+				})
+			} else {
+				modelID := r.legacyModelID(modelName)
+				r.emitTrace(TraceEvent{
+					Event:     "route_selected",
+					Task:      taskTypeName(task),
+					Requested: modelName,
+					Selected:  modelName,
+					ModelID:   modelID,
+				})
+				return RouteResult{
+					Provider:  p,
+					ModelID:   modelID,
+					Requested: modelName,
+					Actual:    modelName,
+				}, nil
+			}
 		}
 	}
 
-	// Deterministic fallback: try providers in defined order
-	for _, name := range fallbackOrder {
-		if name == modelName {
+	// Deterministic fallback: try the subscription provider's API alias first,
+	// then the remaining providers in defined order. The capability check runs
+	// BEFORE IsAvailable so an unsafe CLI is never probed in untrusted mode; in
+	// trusted mode untrustedRepoSafe is always true so gating is unchanged.
+	for _, c := range r.legacyFallbackCandidates(modelName) {
+		p, ok := r.getProvider(c.name)
+		if !ok {
 			continue
 		}
-		if p, ok := r.getProvider(name); ok && p.IsAvailable() {
-			if blocked, remaining := r.isCircuitOpen(name); blocked {
-				r.emitTrace(TraceEvent{
-					Event:      "route_candidate_skipped",
-					Task:       taskTypeName(task),
-					Requested:  modelName,
-					Selected:   name,
-					ModelID:    legacyModelID(name),
-					IsFallback: true,
-					Detail:     circuitOpenDetail(name, remaining),
-				})
-				continue
-			}
-			modelID := legacyModelID(name)
+		if !r.untrustedRepoSafe(p) {
 			r.emitTrace(TraceEvent{
-				Event:      "route_selected",
+				Event:      "route_candidate_skipped",
 				Task:       taskTypeName(task),
 				Requested:  modelName,
-				Selected:   name,
-				ModelID:    modelID,
+				Selected:   c.name,
+				ModelID:    c.modelID,
 				IsFallback: true,
+				Detail:     untrustedRepoSkipDetail(c.name),
 			})
-			return RouteResult{
-				Provider:   p,
-				ModelID:    modelID,
-				Requested:  modelName,
-				Actual:     name,
-				IsFallback: true,
-			}, nil
+			continue
 		}
+		if !p.IsAvailable() {
+			continue
+		}
+		if blocked, remaining := r.isCircuitOpen(c.name); blocked {
+			r.emitTrace(TraceEvent{
+				Event:      "route_candidate_skipped",
+				Task:       taskTypeName(task),
+				Requested:  modelName,
+				Selected:   c.name,
+				ModelID:    c.modelID,
+				IsFallback: true,
+				Detail:     circuitOpenDetail(c.name, remaining),
+			})
+			continue
+		}
+		r.emitTrace(TraceEvent{
+			Event:      "route_selected",
+			Task:       taskTypeName(task),
+			Requested:  modelName,
+			Selected:   c.name,
+			ModelID:    c.modelID,
+			IsFallback: true,
+		})
+		return RouteResult{
+			Provider:   p,
+			ModelID:    c.modelID,
+			Requested:  modelName,
+			Actual:     c.name,
+			IsFallback: true,
+		}, nil
+	}
+
+	if r.RepoTrust() == RepoTrustUntrusted {
+		r.emitTrace(TraceEvent{
+			Event:     "route_failed",
+			Task:      taskTypeName(task),
+			Requested: modelName,
+			Error:     ErrNoUntrustedSafeProvider.Error(),
+		})
+		return RouteResult{}, ErrNoUntrustedSafeProvider
 	}
 
 	r.emitTrace(TraceEvent{
@@ -609,6 +763,16 @@ func (r *Router) routeByMode(task TaskType) (RouteResult, error) {
 		Candidates: toTraceCandidates(candidates),
 	})
 	if len(candidates) == 0 {
+		if r.RepoTrust() == RepoTrustUntrusted {
+			r.emitTrace(TraceEvent{
+				Event:     "route_failed",
+				Task:      taskTypeName(task),
+				Phase:     buildPhaseName(phase),
+				Requested: requested,
+				Error:     ErrNoUntrustedSafeProvider.Error(),
+			})
+			return RouteResult{}, ErrNoUntrustedSafeProvider
+		}
 		msg := fmt.Sprintf("no AI model available for mode %q; configure one with 'makewand setup'", r.effectiveMode())
 		if r.effectiveMode() == ModeFast {
 			msg = "fast mode requires at least one provider; install a CLI or set an API key"
@@ -652,6 +816,18 @@ func (r *Router) routeByMode(task TaskType) (RouteResult, error) {
 			})
 			continue
 		}
+		if !r.untrustedRepoSafe(p) {
+			r.emitTrace(TraceEvent{
+				Event:     "route_candidate_skipped",
+				Task:      taskTypeName(task),
+				Phase:     buildPhaseName(phase),
+				Requested: requested,
+				Selected:  c.name,
+				ModelID:   c.modelID,
+				Detail:    untrustedRepoSkipDetail(c.name),
+			})
+			continue
+		}
 		if !p.IsAvailable() {
 			r.emitTrace(TraceEvent{
 				Event:     "route_candidate_skipped",
@@ -681,6 +857,17 @@ func (r *Router) routeByMode(task TaskType) (RouteResult, error) {
 			Actual:     c.name,
 			IsFallback: c.name != requested,
 		}, nil
+	}
+
+	if r.RepoTrust() == RepoTrustUntrusted {
+		r.emitTrace(TraceEvent{
+			Event:     "route_failed",
+			Task:      taskTypeName(task),
+			Phase:     buildPhaseName(phase),
+			Requested: requested,
+			Error:     ErrNoUntrustedSafeProvider.Error(),
+		})
+		return RouteResult{}, ErrNoUntrustedSafeProvider
 	}
 
 	r.emitTrace(TraceEvent{
@@ -775,7 +962,9 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 				Detail:    circuitOpenDetail(name, remaining),
 			})
 		} else {
-			if p, modelID, resolveErr := r.tryBuildProvider(name, bs.Tier); resolveErr == nil && p.IsAvailable() {
+			p, modelID, resolveErr := r.tryBuildProvider(name, bs.Tier)
+			switch {
+			case resolveErr == nil && r.untrustedRepoSafe(p) && p.IsAvailable():
 				r.emitTrace(TraceEvent{
 					Event:     "build_route_selected",
 					Phase:     buildPhaseName(phase),
@@ -789,7 +978,7 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 					Requested: name,
 					Actual:    name,
 				}, nil
-			} else if resolveErr != nil {
+			case resolveErr != nil:
 				r.emitTrace(TraceEvent{
 					Event:     "build_route_candidate_skipped",
 					Phase:     buildPhaseName(phase),
@@ -797,7 +986,16 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 					Selected:  name,
 					Error:     resolveErr.Error(),
 				})
-			} else {
+			case !r.untrustedRepoSafe(p):
+				r.emitTrace(TraceEvent{
+					Event:     "build_route_candidate_skipped",
+					Phase:     buildPhaseName(phase),
+					Requested: name,
+					Selected:  name,
+					ModelID:   modelID,
+					Detail:    untrustedRepoSkipDetail(name),
+				})
+			default:
 				r.emitTrace(TraceEvent{
 					Event:     "build_route_candidate_skipped",
 					Phase:     buildPhaseName(phase),
@@ -838,6 +1036,18 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 			})
 			continue
 		}
+		if !r.untrustedRepoSafe(p) {
+			r.emitTrace(TraceEvent{
+				Event:      "build_route_candidate_skipped",
+				Phase:      buildPhaseName(phase),
+				Requested:  name,
+				Selected:   fb,
+				ModelID:    modelID,
+				IsFallback: true,
+				Detail:     untrustedRepoSkipDetail(fb),
+			})
+			continue
+		}
 		if !p.IsAvailable() {
 			r.emitTrace(TraceEvent{
 				Event:      "build_route_candidate_skipped",
@@ -864,6 +1074,16 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 			Actual:     fb,
 			IsFallback: true,
 		}, nil
+	}
+
+	if r.RepoTrust() == RepoTrustUntrusted {
+		r.emitTrace(TraceEvent{
+			Event:     "build_route_failed",
+			Phase:     buildPhaseName(phase),
+			Requested: name,
+			Error:     ErrNoUntrustedSafeProvider.Error(),
+		})
+		return RouteResult{}, ErrNoUntrustedSafeProvider
 	}
 
 	r.emitTrace(TraceEvent{

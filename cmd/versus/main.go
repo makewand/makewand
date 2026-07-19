@@ -317,7 +317,12 @@ func runMakewand() result {
 	}
 
 	cfg.UsageMode = "balanced"
-	router := model.NewRouter(cfg)
+	router, err := model.NewRouter(cfg)
+	if err != nil {
+		r.err = err
+		fmt.Printf("  ✗ router: %v\n\n", err)
+		return r
+	}
 	ctx := context.Background()
 
 	// Phase 1: Code (claude)
@@ -409,7 +414,7 @@ func stripANSI(s string) string {
 			i++
 			if i < len(s) && s[i] == '[' {
 				i++
-				for i < len(s) && !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
+				for i < len(s) && (s[i] < 'A' || s[i] > 'Z') && (s[i] < 'a' || s[i] > 'z') {
 					i++
 				}
 				if i < len(s) {

@@ -36,6 +36,12 @@ type (
 	TransientCLIError = router.TransientCLIError
 	ProviderFactory   = router.ProviderFactory
 	SSEEventHandler   = router.SSEEventHandler
+
+	RepoTrust = router.RepoTrust
+	// UntrustedRepoCapable is implemented by providers that declare whether they
+	// are safe to use against an untrusted repository. A provider that does not
+	// implement it is unsafe in untrusted mode (fail closed).
+	UntrustedRepoCapable = router.UntrustedRepoCapable
 )
 
 // Re-export constants.
@@ -76,6 +82,10 @@ const (
 	ErrorKindTransport   = router.ErrorKindNetwork // alias for backward compat
 
 	DefaultContextBudget = router.DefaultContextBudget
+
+	// Repository trust levels for untrusted-repository mode.
+	RepoTrustTrusted   = router.RepoTrustTrusted
+	RepoTrustUntrusted = router.RepoTrustUntrusted
 )
 
 // Re-export functions.
@@ -97,7 +107,7 @@ var (
 	MaxTokensForTask           = router.MaxTokensForTask
 	ContextBudgetForProvider   = router.ContextBudgetForProvider
 	ContextBudgetForMode       = router.ContextBudgetForMode
-	LoadUserOverrides          = router.LoadUserOverrides
+	LoadUserOverrides          = router.LoadUserOverrides //nolint:staticcheck // SA1019: intentional legacy re-export kept for backward compatibility.
 	ContextWithTask            = router.ContextWithTask
 	TaskFromContext            = router.TaskFromContext
 	ContextWithSystem          = router.ContextWithSystem
@@ -108,10 +118,14 @@ var (
 	UsageModeFromContext       = router.UsageModeFromContext
 	ContextWithWorkDir         = router.ContextWithWorkDir
 	WorkDirFromContext         = router.WorkDirFromContext
-	RegisterProviderFactory    = router.RegisterProviderFactory
 	ErrorKindOf                = router.ErrorKindOf
 	IsRetryableProviderError   = router.IsRetryableProviderError
 	DetectCLIs                 = router.DetectCLIs
 	DetectCLIsJSON             = router.DetectCLIsJSON
 	ParseAccessType            = router.ParseAccessType
+	ParseRepoTrust             = router.ParseRepoTrust
+
+	// ErrNoUntrustedSafeProvider is returned when untrusted-repo mode is active
+	// but no untrusted-repo-safe (direct API) provider is available.
+	ErrNoUntrustedSafeProvider = router.ErrNoUntrustedSafeProvider
 )

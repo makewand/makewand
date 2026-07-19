@@ -41,7 +41,7 @@ func TestClaude_Chat_NormalResponse(t *testing.T) {
 			Usage:   claudeUsage{InputTokens: 10, OutputTokens: 5},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}
 
 	c := NewClaude("test-key", "claude-haiku-4-5-20251001")
@@ -65,7 +65,7 @@ func TestClaude_Chat_NormalResponse(t *testing.T) {
 func TestClaude_Chat_HTTP429(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		io.WriteString(w, `{"error":"rate limited"}`)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
 	}
 
 	c := NewClaude("test-key", claudeDefaultModel)
@@ -127,7 +127,7 @@ func TestOpenAI_Chat_NormalResponse(t *testing.T) {
 		resp.Usage.PromptTokens = 8
 		resp.Usage.CompletionTokens = 6
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}
 
 	o := NewOpenAI("test-key", "gpt-4o-mini")
@@ -151,7 +151,7 @@ func TestOpenAI_Chat_NormalResponse(t *testing.T) {
 func TestOpenAI_Chat_HTTP429(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		io.WriteString(w, `{"error":{"message":"rate limit exceeded"}}`)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limit exceeded"}}`)
 	}
 
 	o := NewOpenAI("test-key", openaiDefaultModel)

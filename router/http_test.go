@@ -36,7 +36,7 @@ func (r *usageRecorder) Log(entry serverusage.Entry) {
 
 func TestHTTPHandler_ChatCompletions(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -73,7 +73,7 @@ func TestHTTPHandler_ChatCompletions(t *testing.T) {
 
 func TestHTTPHandler_ChatCompletionsStream(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -109,7 +109,7 @@ func TestHTTPHandler_ChatCompletionsStream(t *testing.T) {
 
 func TestHTTPHandler_ChatCompletionsStream_WithMetricsMiddleware(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -145,7 +145,7 @@ func TestHTTPHandler_ChatCompletionsStream_WithMetricsMiddleware(t *testing.T) {
 
 func TestHTTPHandler_ResponsesSubset(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: "hello from responses"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -184,7 +184,7 @@ func TestHTTPHandler_ResponsesSubset(t *testing.T) {
 
 func TestHTTPHandler_ResponsesStream(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: "hello from responses stream"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -225,7 +225,7 @@ func TestHTTPHandler_ResponsesStream(t *testing.T) {
 
 func TestHTTPHandler_ModelAliasResolvesToProvider(t *testing.T) {
 	codex := &stubProvider{name: "codex", available: true, response: "hello from codex"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"codex": {Provider: codex, Access: AccessSubscription},
 		},
@@ -259,7 +259,7 @@ func TestHTTPHandler_ModelAliasResolvesToProvider(t *testing.T) {
 
 func TestHTTPHandler_ResponsesJSONSchema(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: `{"answer":"ok","score":1}`}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -307,7 +307,7 @@ func TestHTTPHandler_ResponsesJSONSchema(t *testing.T) {
 
 func TestHTTPHandler_ResponsesJSONSchemaRejectsInvalidOutput(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: `{"answer":"ok","extra":true}`}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -347,7 +347,7 @@ func TestHTTPHandler_ResponsesJSONSchemaRejectsInvalidOutput(t *testing.T) {
 
 func TestHTTPHandler_ChatToolCalls(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: `{"tool_calls":[{"name":"lookup_weather","arguments":{"city":"Paris"}}]}`}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -404,7 +404,7 @@ func TestHTTPHandler_ChatToolCalls(t *testing.T) {
 
 func TestHTTPHandler_ResponsesToolCalls(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: `{"tool_calls":[{"name":"lookup_weather","arguments":{"city":"Paris"}}]}`}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -460,7 +460,7 @@ func TestHTTPHandler_ResponsesToolCalls(t *testing.T) {
 func TestHTTPHandler_ModelOverrideUsesRequestedProvider(t *testing.T) {
 	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
 	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: claude, Access: AccessSubscription},
 			"gemini": {Provider: gemini, Access: AccessSubscription},
@@ -493,7 +493,7 @@ func TestHTTPHandler_ModelOverrideUsesRequestedProvider(t *testing.T) {
 func TestHTTPHandler_ModeOverrideUsesRequestedMode(t *testing.T) {
 	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
 	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: claude, Access: AccessSubscription},
 			"gemini": {Provider: gemini, Access: AccessSubscription},
@@ -523,7 +523,7 @@ func TestHTTPHandler_ModeOverrideUsesRequestedMode(t *testing.T) {
 }
 
 func TestHTTPHandler_EmptyMessages(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	body := `{"model":"test","messages":[]}`
@@ -537,7 +537,7 @@ func TestHTTPHandler_EmptyMessages(t *testing.T) {
 }
 
 func TestHTTPHandler_RejectsOversizedChatBody(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("x", maxHTTPJSONBodyBytes) + `"}]}`
@@ -554,7 +554,7 @@ func TestHTTPHandler_RejectsOversizedChatBody(t *testing.T) {
 }
 
 func TestHTTPHandler_UnknownModelRejected(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	body := `{"model":"unknown","messages":[{"role":"user","content":"hi"}]}`
@@ -568,7 +568,7 @@ func TestHTTPHandler_UnknownModelRejected(t *testing.T) {
 }
 
 func TestHTTPHandler_IgnoresUnsupportedMaxTokens(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	body := `{"messages":[{"role":"user","content":"hi"}],"max_tokens":128}`
@@ -584,7 +584,7 @@ func TestHTTPHandler_IgnoresUnsupportedMaxTokens(t *testing.T) {
 }
 
 func TestHTTPHandler_IgnoresUnsupportedTemperature(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	body := `{"messages":[{"role":"user","content":"hi"}],"temperature":0.5}`
@@ -599,7 +599,7 @@ func TestHTTPHandler_IgnoresUnsupportedTemperature(t *testing.T) {
 }
 
 func TestHTTPHandler_RejectsUnknownMode(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	body := `{"mode":"turbo","messages":[{"role":"user","content":"hi"}]}`
@@ -615,7 +615,7 @@ func TestHTTPHandler_RejectsUnknownMode(t *testing.T) {
 func TestHTTPHandler_PersistsRoutingStatsWhenConfigured(t *testing.T) {
 	dir := t.TempDir()
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -647,7 +647,7 @@ func TestHTTPHandler_PersistsRoutingStatsWhenConfigured(t *testing.T) {
 
 func TestHTTPHandler_ListModels(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -676,7 +676,7 @@ func TestHTTPHandler_ListModels(t *testing.T) {
 }
 
 func TestHTTPHandler_Health(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -689,7 +689,7 @@ func TestHTTPHandler_Health(t *testing.T) {
 }
 
 func TestHTTPHandler_BearerAuth_Rejects(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler(HTTPHandlerOptions{BearerToken: "secret123"})
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -703,7 +703,7 @@ func TestHTTPHandler_BearerAuth_Rejects(t *testing.T) {
 
 func TestHTTPHandler_BearerAuth_Accepts(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -721,7 +721,7 @@ func TestHTTPHandler_BearerAuth_Accepts(t *testing.T) {
 }
 
 func TestHTTPHandler_BearerAuth_HealthBypassesAuth(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler(HTTPHandlerOptions{BearerToken: "secret123"})
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -743,7 +743,7 @@ func TestHTTPHandler_AuthorizerRejectsMissingScope(t *testing.T) {
 		t.Fatalf("NewAuthorizer: %v", err)
 	}
 
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer secret123")
@@ -771,7 +771,7 @@ func TestHTTPHandler_AuthorizerFiltersModelList(t *testing.T) {
 
 	claude := &stubProvider{name: "claude", available: true}
 	codex := &stubProvider{name: "codex", available: true}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: claude, Access: AccessSubscription},
 			"codex":  {Provider: codex, Access: AccessSubscription},
@@ -816,7 +816,7 @@ func TestHTTPHandler_AuthorizerRejectsDisallowedMode(t *testing.T) {
 	}
 
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -852,7 +852,7 @@ func TestHTTPHandler_AuthorizerRejectsDisallowedProviderOverride(t *testing.T) {
 
 	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
 	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: claude, Access: AccessSubscription},
 			"gemini": {Provider: gemini, Access: AccessSubscription},
@@ -890,7 +890,7 @@ func TestHTTPHandler_AuthorizerFiltersAdaptiveProviders(t *testing.T) {
 
 	claude := &stubProvider{name: "claude", available: true, response: "hello from claude"}
 	gemini := &stubProvider{name: "gemini", available: true, response: "hello from gemini"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: claude, Access: AccessSubscription},
 			"gemini": {Provider: gemini, Access: AccessSubscription},
@@ -936,7 +936,7 @@ func TestHTTPHandler_AuditLogsSuccessfulChat(t *testing.T) {
 
 	recorder := &auditRecorder{}
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -1001,7 +1001,7 @@ func TestHTTPHandler_LogsUsageEntriesWithRequestID(t *testing.T) {
 		outputTokens: 7,
 		cost:         0.42,
 	}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -1062,7 +1062,7 @@ func TestHTTPHandler_LogsUsageOwnershipAttribution(t *testing.T) {
 
 	recorder := &usageRecorder{}
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -1105,7 +1105,7 @@ func TestHTTPHandler_AuditLogsForbiddenModelsScope(t *testing.T) {
 	}
 
 	recorder := &auditRecorder{}
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, AuditLogger: recorder})
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer secret123")
@@ -1144,7 +1144,7 @@ func TestHTTPHandler_RejectsRequestsOverHourlyQuota(t *testing.T) {
 		t.Fatalf("NewAuthorizer: %v", err)
 	}
 
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
 
 	req1 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -1178,7 +1178,7 @@ func TestHTTPHandler_RejectsRequestsOverDailyQuota(t *testing.T) {
 		t.Fatalf("NewAuthorizer: %v", err)
 	}
 
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz})
 
 	req1 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -1223,7 +1223,7 @@ func TestHTTPHandler_RejectsRequestsOverDailyCostBudget(t *testing.T) {
 		t.Fatalf("NewAuthorizer: %v", err)
 	}
 
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -1307,7 +1307,7 @@ func TestHTTPHandler_RejectsRequestsWhenProjectBudgetExceeded(t *testing.T) {
 	}
 
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -1386,7 +1386,7 @@ func TestHTTPHandler_ProjectBudgetIgnoresPreviousMonths(t *testing.T) {
 	}
 
 	stub := &stubProvider{name: "claude", available: true, response: "hello from http"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -1412,7 +1412,7 @@ func TestHTTPHandler_ProjectBudgetIgnoresPreviousMonths(t *testing.T) {
 }
 
 func TestHTTPHandler_MethodNotAllowed(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	handler := r.HTTPHandler()
 	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)

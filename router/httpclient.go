@@ -61,19 +61,6 @@ func newStreamClient() *http.Client {
 	}
 }
 
-// newHealthCheckClient returns a short-timeout client for health checks.
-func newHealthCheckClient() *http.Client {
-	return &http.Client{
-		Timeout:       3 * time.Second,
-		CheckRedirect: noRedirectToForeignHost(),
-		Transport: &http.Transport{
-			DialContext:         (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
-			TLSHandshakeTimeout: 2 * time.Second,
-			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-		},
-	}
-}
-
 // limitedReadAll reads up to maxBytes from r. Returns an error if the limit is exceeded.
 func limitedReadAll(r io.Reader, maxBytes int64) ([]byte, error) {
 	lr := io.LimitReader(r, maxBytes+1)
@@ -96,7 +83,11 @@ func marshalProviderJSON(provider string, payload any) ([]byte, error) {
 }
 
 func newProviderJSONRequest(ctx context.Context, provider, method, url string, body []byte, headers map[string]string) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	// url is always a fixed provider endpoint (package-constant hosts for
+	// claude/openai; a hardcoded googleapis.com host with a PathEscape'd model
+	// segment for gemini) — never an attacker-controlled host — and the client's
+	// transport blocks cross-host redirects and enforces a TLS floor.
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body)) //nolint:gosec // G704: fixed provider host, not request-controlled
 	if err != nil {
 		return nil, newProviderError(provider, "build request", ErrorKindConfig, false, 0, err.Error(), err)
 	}
@@ -107,7 +98,7 @@ func newProviderJSONRequest(ctx context.Context, provider, method, url string, b
 }
 
 func doProviderJSONRequest(client *http.Client, req *http.Request, provider, op string) ([]byte, error) {
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // G704: req targets a fixed provider host (see newProviderJSONRequest)
 	if err != nil {
 		return nil, wrapTransportError(provider, op, err)
 	}
@@ -124,7 +115,7 @@ func doProviderJSONRequest(client *http.Client, req *http.Request, provider, op 
 }
 
 func openProviderStream(client *http.Client, req *http.Request, provider, op string) (*http.Response, error) {
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // G704: req targets a fixed provider host (see newProviderJSONRequest)
 	if err != nil {
 		return nil, wrapTransportError(provider, op, err)
 	}

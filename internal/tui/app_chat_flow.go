@@ -39,6 +39,11 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
+	// Check for identity queries that should be answered locally
+	if isIdentityQuery(input) {
+		return a.handleIdentityQuery(input)
+	}
+
 	parts := strings.Fields(strings.ToLower(input))
 	if len(parts) > 0 {
 		// Handle slash commands locally (don't send to AI).
@@ -97,11 +102,18 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		cmd := func() tea.Msg {
 			defer cancel()
 			markChatPreparationActivity(activity, project != nil)
-			systemPrompt := buildSystemPrompt(project, task, router.Mode())
+			systemPrompt := buildSystemPrompt(project, task, router.Mode(), router)
 			activity.SetPhase(chatActivityWaiting, "", "", false, i18n.Msg().AutomationCandidateStarted)
 			selection := runCandidateSelectionWithActivity(ctx, activity, router, project, phase, messages, systemPrompt)
 			if strings.TrimSpace(selection.content) == "" {
-				return aiResponseMsg{err: fmt.Errorf("no candidate provider produced a response")}
+				return aiResponseMsg{
+					provider:      selection.provider,
+					cost:          selection.usage.Cost,
+					inputTokens:   selection.usage.InputTokens,
+					outputTokens:  selection.usage.OutputTokens,
+					selectionNote: selection.selectionNote,
+					err:           selection.contentError(fmt.Errorf("no candidate provider produced a response")),
+				}
 			}
 			return aiResponseMsg{
 				content:       selection.content,
@@ -126,15 +138,18 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		cmd := func() tea.Msg {
 			defer cancel()
 			markChatPreparationActivity(activity, project != nil)
-			systemPrompt := buildSystemPrompt(project, task, router.Mode())
+			systemPrompt := buildSystemPrompt(project, task, router.Mode(), router)
 			activity.SetPhase(chatActivityWaiting, "", "", false, i18n.Msg().ChatActivityMultiModel)
 			content, usage, result, err := router.ChatBest(ctx, phase, messages, systemPrompt)
+			provider := providerForUsage(usage, result)
 			if err != nil {
-				return aiResponseMsg{err: err}
-			}
-			provider := result.Actual
-			if provider == "" {
-				provider = usage.Provider
+				return aiResponseMsg{
+					provider:     provider,
+					cost:         usage.Cost,
+					inputTokens:  usage.InputTokens,
+					outputTokens: usage.OutputTokens,
+					err:          err,
+				}
 			}
 			return aiResponseMsg{
 				content:      content,
@@ -157,7 +172,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		cmd := func() tea.Msg {
 			defer cancel()
 			markChatPreparationActivity(activity, project != nil)
-			systemPrompt := buildSystemPrompt(project, task, router.Mode())
+			systemPrompt := buildSystemPrompt(project, task, router.Mode(), router)
 			route, routeErr := router.Route(task)
 			markChatRoutingActivity(activity, route, routeErr)
 			content, usage, result, err := router.Chat(ctx, task, messages, systemPrompt)
@@ -184,7 +199,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 	activity := a.activity
 	cmd := func() tea.Msg {
 		markChatPreparationActivity(activity, project != nil)
-		systemPrompt := buildSystemPrompt(project, task, router.Mode())
+		systemPrompt := buildSystemPrompt(project, task, router.Mode(), router)
 		route, routeErr := router.Route(task)
 		markChatRoutingActivity(activity, route, routeErr)
 		ch, result, err := router.ChatStream(ctx, task, messages, systemPrompt)
@@ -197,6 +212,9 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 			provider:   result.Actual,
 			isFallback: result.IsFallback,
 			requested:  result.Requested,
+			route:      result,
+			messages:   messages,
+			system:     systemPrompt,
 		}
 	}
 
@@ -269,13 +287,13 @@ func (a App) handleCompactCommand() (tea.Model, tea.Cmd) {
 	if a.chat.CompactHistory() {
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: "Conversation compacted.",
+			Content: i18n.Msg().CompactDone,
 		})
 		return a, nil
 	}
 	a.chat.AddMessage(ChatMessage{
 		Role:    "system",
-		Content: "Nothing to compact yet.",
+		Content: i18n.Msg().CompactNothing,
 	})
 	return a, nil
 }
@@ -309,14 +327,14 @@ func (a App) handleResumeCommand() (tea.Model, tea.Cmd) {
 	if err != nil {
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("Could not restore session: %s", err),
+			Content: fmt.Sprintf(i18n.Msg().ResumeError, err),
 		})
 		return a, nil
 	}
 	if !restored {
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: "No saved session found for this project.",
+			Content: i18n.Msg().ResumeNotFound,
 		})
 		return a, nil
 	}
@@ -331,7 +349,7 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 		// /mode with no argument: show current mode and help
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("%s: %s\n/model [fast|balanced|power]", msg.ModeLabel, a.currentModeLabel()),
+			Content: fmt.Sprintf("%s: %s\n%s", msg.ModeLabel, a.currentModeLabel(), msg.ModeHelp),
 		})
 		return a, nil
 	}
@@ -362,7 +380,7 @@ func (a App) handleModeCommand(input string) (tea.Model, tea.Cmd) {
 
 	a.chat.AddMessage(ChatMessage{
 		Role:    "system",
-		Content: fmt.Sprintf("Model profile: %s", displayName),
+		Content: fmt.Sprintf(msg.ModelProfileLabel, displayName),
 	})
 	return a, nil
 }
@@ -399,43 +417,29 @@ func (a App) currentModeLabel() string {
 	if a.router.ModeSet() {
 		return a.router.Mode().String()
 	}
-	return "not set (legacy routing)"
+	return i18n.Msg().ModeNotSet
 }
 
 func (a App) chatHelpText() string {
-	return strings.Join([]string{
-		"Available commands:",
-		"/help - Show command help",
-		"/clear - Clear the current conversation",
-		"/compact - Compact older chat history",
-		"/memory - Show compacted session memory",
-		"/status - Show current session status",
-		"/cost - Show current session cost",
-		"/approval [manual|safe|autopilot] - Switch approval behavior",
-		"/approve - Approve the pending action",
-		"/deny - Deny the pending action",
-		"/resume - Restore the last saved session",
-		"/model [fast|balanced|power] - Switch routing profile",
-		"/exit - Quit makewand",
-	}, "\n")
+	return i18n.Msg().ChatHelp
 }
 
 func (a App) statusSummary() string {
 	var lines []string
 	msg := i18n.Msg()
-	lines = append(lines, fmt.Sprintf("Model profile: %s", a.currentModeLabel()))
+	lines = append(lines, fmt.Sprintf(msg.ModelProfileLabel, a.currentModeLabel()))
 	lines = append(lines, fmt.Sprintf("%s: %s", msg.ApprovalModeLabel, a.currentApprovalModeLabel()))
 
 	available := a.router.Available()
 	if len(available) == 0 {
-		lines = append(lines, "Available providers: none")
+		lines = append(lines, msg.StatusProvidersNone)
 	} else {
-		lines = append(lines, "Available providers: "+strings.Join(available, ", "))
+		lines = append(lines, fmt.Sprintf(msg.StatusProviders, strings.Join(available, ", ")))
 	}
 
 	if a.project != nil {
-		lines = append(lines, fmt.Sprintf("Project: %s", a.project.Path))
-		lines = append(lines, fmt.Sprintf("Project entries: %d", len(a.project.Files)))
+		lines = append(lines, fmt.Sprintf(msg.StatusProject, a.project.Path))
+		lines = append(lines, fmt.Sprintf(msg.StatusProjectEntries, len(a.project.Files)))
 	}
 
 	if summary := a.pendingApprovalSummary(); summary != "" {
@@ -449,22 +453,23 @@ func (a App) statusSummary() string {
 	}
 
 	if a.sessionFile != "" {
-		lines = append(lines, fmt.Sprintf("Session file: %s", a.sessionFile))
+		lines = append(lines, fmt.Sprintf(msg.StatusSessionFile, a.sessionFile))
 	}
 	if a.lastSessionSavedAt != "" {
-		lines = append(lines, fmt.Sprintf("Last saved: %s", sessionTimeLabel(a.lastSessionSavedAt)))
+		lines = append(lines, fmt.Sprintf(msg.StatusLastSaved, sessionTimeLabel(a.lastSessionSavedAt)))
 	}
-	lines = append(lines, fmt.Sprintf("Session cost: $%.2f", a.cost.SessionTotal()))
+	lines = append(lines, fmt.Sprintf(msg.StatusSessionCost, a.cost.SessionTotal()))
 	return strings.Join(lines, "\n")
 }
 
 func (a App) costSummary() string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("Session total: $%.2f", a.cost.SessionTotal()))
+	msg := i18n.Msg()
+	lines = append(lines, fmt.Sprintf(msg.CostSummaryTotal, a.cost.SessionTotal()))
 
 	providers := a.cost.ByProvider()
 	if len(providers) == 0 {
-		lines = append(lines, "No requests yet.")
+		lines = append(lines, msg.CostNoRequests)
 		return strings.Join(lines, "\n")
 	}
 
@@ -476,7 +481,7 @@ func (a App) costSummary() string {
 		}
 		requests := a.cost.RequestCount(provider)
 		inTok, outTok := a.cost.TokensByProvider(provider)
-		lines = append(lines, fmt.Sprintf("%s: $%.2f, %d requests, %d in / %d out tokens", provider, cost, requests, inTok, outTok))
+		lines = append(lines, fmt.Sprintf(msg.CostProviderLine, provider, cost, requests, inTok, outTok))
 	}
 
 	return strings.Join(lines, "\n")
@@ -506,4 +511,30 @@ func chatTaskToBuildPhase(task model.TaskType) model.BuildPhase {
 	default:
 		return model.PhasePlan
 	}
+}
+
+// isIdentityQuery checks if the input is asking about makewand's identity
+func isIdentityQuery(input string) bool {
+	lower := strings.ToLower(input)
+	identityQueries := []string{
+		"你是谁",
+		"who are you",
+		"what are you",
+		"你是什么",
+		"what's your name",
+		"你叫什么",
+	}
+	for _, q := range identityQueries {
+		if strings.Contains(lower, q) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleIdentityQuery responds to identity questions locally without routing to AI
+func (a App) handleIdentityQuery(input string) (tea.Model, tea.Cmd) {
+	a.chat.AddMessage(ChatMessage{Role: "user", Content: input})
+	a.chat.AddMessage(ChatMessage{Role: "assistant", Content: i18n.Msg().IdentityAnswer})
+	return a, nil
 }

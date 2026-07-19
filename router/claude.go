@@ -19,6 +19,7 @@ type Claude struct {
 	model        string
 	chatClient   *http.Client
 	streamClient *http.Client
+	instanceCostTable
 }
 
 // NewClaude creates a new Claude provider.
@@ -36,6 +37,10 @@ func NewClaude(apiKey, model string) *Claude {
 
 func (c *Claude) Name() string      { return "claude" }
 func (c *Claude) IsAvailable() bool { return c.apiKey != "" }
+
+// SafeForUntrustedRepo reports that Claude is safe against an untrusted repo: it
+// is a pure HTTP call to the Anthropic API and runs no local repo-aware agent.
+func (c *Claude) SafeForUntrustedRepo() bool { return true }
 
 type claudeRequest struct {
 	Model     string          `json:"model"`
@@ -73,6 +78,10 @@ type claudeStreamEvent struct {
 }
 
 func (c *Claude) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	model := c.model
+	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
+		model = requested
+	}
 	msgs := make([]claudeMessage, 0, len(messages))
 	for _, m := range messages {
 		if m.Role == "system" {
@@ -81,11 +90,11 @@ func (c *Claude) Chat(ctx context.Context, messages []Message, system string, ma
 			}
 			continue
 		}
-		msgs = append(msgs, claudeMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, claudeMessage(m))
 	}
 
 	reqBody := claudeRequest{
-		Model:     c.model,
+		Model:     model,
 		MaxTokens: maxTokens,
 		System:    system,
 		Messages:  msgs,
@@ -121,8 +130,8 @@ func (c *Claude) Chat(ctx context.Context, messages []Message, system string, ma
 	usage := Usage{
 		InputTokens:  result.Usage.InputTokens,
 		OutputTokens: result.Usage.OutputTokens,
-		Cost:         EstimateCost(c.model, result.Usage.InputTokens, result.Usage.OutputTokens),
-		Model:        c.model,
+		Cost:         c.priceForCtx(ctx, model, result.Usage.InputTokens, result.Usage.OutputTokens),
+		Model:        model,
 		Provider:     "claude",
 	}
 
@@ -130,6 +139,10 @@ func (c *Claude) Chat(ctx context.Context, messages []Message, system string, ma
 }
 
 func (c *Claude) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	model := c.model
+	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
+		model = requested
+	}
 	msgs := make([]claudeMessage, 0, len(messages))
 	for _, m := range messages {
 		if m.Role == "system" {
@@ -138,11 +151,11 @@ func (c *Claude) ChatStream(ctx context.Context, messages []Message, system stri
 			}
 			continue
 		}
-		msgs = append(msgs, claudeMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, claudeMessage(m))
 	}
 
 	reqBody := claudeRequest{
-		Model:     c.model,
+		Model:     model,
 		MaxTokens: maxTokens,
 		System:    system,
 		Messages:  msgs,

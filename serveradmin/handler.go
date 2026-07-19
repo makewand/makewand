@@ -209,6 +209,11 @@ func handleRevokeToken(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		http.NotFound(w, req)
 		return
 	}
+	if err := enforceGrantRevokeScope(opts.TokenManager, grant, tokenID); err != nil {
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusForbidden, err.Error(), 0, 0, 0)
+		return
+	}
 	if err := opts.TokenManager.Revoke(tokenID); err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "not found") {
@@ -240,12 +245,19 @@ func handleAuditSummary(w http.ResponseWriter, req *http.Request, opts HandlerOp
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
+	allowedTokens := tenantTokenIDs(opts.TokenManager, grant)
+	if err := checkAuditTokenFilter(filter.TokenID, allowedTokens); err != nil {
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusForbidden, err.Error(), 0, 0, 0)
+		return
+	}
 	events, err := loadAuditEvents(opts.AuditPath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
+	events = filterAuditEventsByTenant(events, allowedTokens)
 	summary := serveraudit.SummarizeEvents(events)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":    opts.AuditPath,
@@ -269,12 +281,19 @@ func handleAuditEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
+	allowedTokens := tenantTokenIDs(opts.TokenManager, grant)
+	if err := checkAuditTokenFilter(filter.TokenID, allowedTokens); err != nil {
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusForbidden, err.Error(), 0, 0, 0)
+		return
+	}
 	events, err := loadAuditEvents(opts.AuditPath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminAuditRead, "admin_audit", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
+	events = filterAuditEventsByTenant(events, allowedTokens)
 	if wantsCSV(req) {
 		writeCSVHeaders(w, "audit-events.csv")
 		if err := serveraudit.WriteEventsCSV(w, events); err != nil {
@@ -409,6 +428,11 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		http.NotFound(w, req)
 		return
 	}
+	if scopedUserID := grant.UserID(); scopedUserID != "" && userID != scopedUserID {
+		writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("scoped admin tokens may only modify user %q", scopedUserID))
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only modify user %q", scopedUserID), 0, 0, 0)
+		return
+	}
 
 	var (
 		user *router.User
@@ -444,7 +468,7 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		return
 	}
 	if err != nil {
-		status := http.StatusBadRequest
+		var status int
 		switch {
 		case errors.Is(err, router.ErrUserNotFound):
 			status = http.StatusNotFound
@@ -558,6 +582,13 @@ func constrainUsageFilterByGrant(filter *serverusage.Filter, grant *serverauth.G
 	}
 }
 
+// enforceGrantTokenScope constrains a child token rule to the issuing grant.
+// The child's tenant (user/org/project), scopes, expiry, workspace/provider/mode
+// allowlists, and quotas must all be a subset of (⊆) the issuer's. Attempts to
+// grant beyond the issuer are rejected with a clear error rather than silently
+// widened. An unrestricted issuer (root admin: no expiry, empty allowlists,
+// zero quotas) imposes no ceiling on those dimensions, so ordinary issuance is
+// unaffected.
 func enforceGrantTokenScope(grant *serverauth.Grant, rule *serverauth.TokenRule) error {
 	if grant == nil || rule == nil {
 		return nil
@@ -583,7 +614,256 @@ func enforceGrantTokenScope(grant *serverauth.Grant, rule *serverauth.TokenRule)
 			return fmt.Errorf("scoped admin tokens may only issue tokens for project %q", scopedProjectID)
 		}
 	}
+
+	if allowed := stringSet(grant.Scopes()); len(allowed) > 0 {
+		for _, scope := range rule.Scopes {
+			norm := strings.ToLower(strings.TrimSpace(scope))
+			if norm == "" {
+				continue
+			}
+			if _, ok := allowed[norm]; !ok {
+				return fmt.Errorf("issued token scope %q exceeds issuer permissions", norm)
+			}
+		}
+	}
+
+	if issuerExpiry := grant.ExpiresAt(); !issuerExpiry.IsZero() {
+		if rule.ExpiresAt.IsZero() {
+			return fmt.Errorf("issued token must expire no later than the issuing token (%s)", issuerExpiry.UTC().Format(time.RFC3339))
+		}
+		if rule.ExpiresAt.After(issuerExpiry) {
+			return fmt.Errorf("issued token expiry %s exceeds issuing token expiry %s", rule.ExpiresAt.UTC().Format(time.RFC3339), issuerExpiry.UTC().Format(time.RFC3339))
+		}
+	}
+
+	if err := enforcePrefixSubset(grant.WorkspacePrefixes(), rule.WorkspacePrefixes); err != nil {
+		return err
+	}
+	if err := enforceAllowlistSubset("provider", grant.AllowedProviders(), rule.AllowedProviders); err != nil {
+		return err
+	}
+	if err := enforceAllowlistSubset("mode", grant.AllowedModes(), rule.AllowedModes); err != nil {
+		return err
+	}
+
+	if err := enforceQuotaCeiling("max_requests_per_hour", grant.MaxRequestsPerHour(), rule.MaxRequestsPerHour); err != nil {
+		return err
+	}
+	if err := enforceQuotaCeiling("max_requests_per_day", grant.MaxRequestsPerDay(), rule.MaxRequestsPerDay); err != nil {
+		return err
+	}
+	if err := enforceCostCeiling("max_cost_usd_per_day", grant.MaxCostUSDPerDay(), rule.MaxCostUSDPerDay); err != nil {
+		return err
+	}
+	if err := enforceCostCeiling("max_cost_usd_per_month", grant.MaxCostUSDPerMonth(), rule.MaxCostUSDPerMonth); err != nil {
+		return err
+	}
 	return nil
+}
+
+func stringSet(values []string) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		out[value] = struct{}{}
+	}
+	return out
+}
+
+// enforcePrefixSubset requires every child workspace prefix to be covered by an
+// issuer prefix (i.e. equal to or narrower than one of them). When the issuer
+// restricts prefixes, the child must too. The child's prefixes are normalized
+// (trimmed, blanks dropped) exactly as newGrant will normalize them BEFORE the
+// subset check, so a request of only whitespace/blank entries collapses to an
+// empty (=unrestricted) allowlist and is rejected rather than silently widening
+// access beyond the issuer.
+func enforcePrefixSubset(issuer, child []string) error {
+	if len(issuer) == 0 {
+		return nil
+	}
+	effective := normalizePrefixList(child)
+	if len(effective) == 0 {
+		return fmt.Errorf("issued token must restrict workspace_prefixes to a subset of the issuing token")
+	}
+	for _, prefix := range effective {
+		covered := false
+		for _, allowed := range issuer {
+			if strings.HasPrefix(prefix, allowed) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return fmt.Errorf("issued workspace prefix %q exceeds issuer permissions", prefix)
+		}
+	}
+	return nil
+}
+
+// enforceAllowlistSubset requires the child allowlist to be a non-empty subset
+// of the issuer's when the issuer restricts the dimension. The child allowlist
+// is normalized (lowercased, trimmed, blanks dropped) exactly as newGrant will
+// normalize it BEFORE the subset check, so a request of only whitespace/blank
+// entries collapses to an empty (=unrestricted) allowlist and is rejected
+// rather than silently widening access beyond the issuer.
+func enforceAllowlistSubset(kind string, issuer, child []string) error {
+	allowed := stringSet(issuer)
+	if len(allowed) == 0 {
+		return nil
+	}
+	effective := normalizeAllowlist(child)
+	if len(effective) == 0 {
+		return fmt.Errorf("issued token must restrict allowed %ss to a subset of the issuing token", kind)
+	}
+	for _, value := range effective {
+		if _, ok := allowed[value]; !ok {
+			return fmt.Errorf("issued %s %q exceeds issuer permissions", kind, value)
+		}
+	}
+	return nil
+}
+
+// normalizePrefixList trims and drops blank workspace prefixes, matching the
+// normalization newGrant applies (prefixes are not lowercased). Order is
+// preserved for deterministic error messages.
+func normalizePrefixList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+// normalizeAllowlist lowercases, trims, and drops blank entries, matching the
+// normalization newGrant applies to provider/mode allowlists. Order is
+// preserved for deterministic error messages.
+func normalizeAllowlist(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+// enforceQuotaCeiling requires a positive child quota that does not exceed a
+// positive issuer quota. An issuer value of 0 means unlimited and imposes no
+// ceiling.
+func enforceQuotaCeiling(field string, issuer, child int) error {
+	if issuer <= 0 {
+		return nil
+	}
+	if child <= 0 || child > issuer {
+		return fmt.Errorf("issued token %s must be between 1 and the issuer limit %d", field, issuer)
+	}
+	return nil
+}
+
+func enforceCostCeiling(field string, issuer, child float64) error {
+	if issuer <= 0 {
+		return nil
+	}
+	if child <= 0 || child > issuer {
+		return fmt.Errorf("issued token %s must be between 0 and the issuer limit %g", field, issuer)
+	}
+	return nil
+}
+
+// tenantTokenIDs returns the set of token IDs visible to a tenant-scoped grant,
+// or nil when the grant is not tenant-scoped (an unrestricted admin). The
+// caller's own token is always included.
+func tenantTokenIDs(tm serverauth.TokenManager, grant *serverauth.Grant) map[string]struct{} {
+	if grant == nil {
+		return nil
+	}
+	userID := grant.UserID()
+	orgID := grant.OrganizationID()
+	projectID := grant.ProjectID()
+	if userID == "" && orgID == "" && projectID == "" {
+		return nil
+	}
+	ids := make(map[string]struct{})
+	if tm != nil {
+		for _, view := range tm.TokenRules() {
+			if userID != "" && view.UserID != userID {
+				continue
+			}
+			if orgID != "" && view.OrganizationID != orgID {
+				continue
+			}
+			if projectID != "" && view.ProjectID != projectID {
+				continue
+			}
+			ids[view.ID] = struct{}{}
+		}
+	}
+	if id := grant.TokenID(); id != "" {
+		ids[id] = struct{}{}
+	}
+	return ids
+}
+
+// enforceGrantRevokeScope prevents a tenant-scoped admin from revoking tokens
+// outside its tenant.
+func enforceGrantRevokeScope(tm serverauth.TokenManager, grant *serverauth.Grant, tokenID string) error {
+	allowed := tenantTokenIDs(tm, grant)
+	if allowed == nil {
+		return nil
+	}
+	if _, ok := allowed[strings.TrimSpace(tokenID)]; !ok {
+		return fmt.Errorf("scoped admin tokens may only revoke tokens within their tenant")
+	}
+	return nil
+}
+
+// checkAuditTokenFilter rejects an explicit token_id filter that targets a
+// token outside the caller's tenant.
+func checkAuditTokenFilter(tokenID string, allowed map[string]struct{}) error {
+	if allowed == nil {
+		return nil
+	}
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return nil
+	}
+	if _, ok := allowed[tokenID]; !ok {
+		return fmt.Errorf("scoped admin tokens may only read audit events within their tenant")
+	}
+	return nil
+}
+
+// filterAuditEventsByTenant drops audit events whose token is outside the
+// tenant-scoped set. A nil set means the caller is unrestricted.
+func filterAuditEventsByTenant(events []serveraudit.Event, allowed map[string]struct{}) []serveraudit.Event {
+	if allowed == nil {
+		return events
+	}
+	out := events[:0]
+	for _, event := range events {
+		if _, ok := allowed[event.TokenID]; ok {
+			out = append(out, event)
+		}
+	}
+	return out
 }
 
 func filterTokenViews(items []serverauth.TokenRuleView, req *http.Request, grant *serverauth.Grant) []serverauth.TokenRuleView {

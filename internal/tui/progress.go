@@ -114,17 +114,18 @@ func (p ProgressPanel) View() string {
 		}
 
 		label := step.Label
-		if step.Status == StepRunning {
+		switch step.Status {
+		case StepRunning:
 			label = selectedStyle.Render(label)
-		} else if step.Status == StepDone {
+		case StepDone:
 			label = successStyle.Render(label)
-		} else if step.Status == StepFailed {
+		case StepFailed:
 			label = errorStyle.Render(label)
-		} else {
+		default:
 			label = mutedStyle.Render(label)
 		}
 
-		b.WriteString(fmt.Sprintf(" %s %s\n", icon, label))
+		fmt.Fprintf(&b, " %s %s\n", icon, label)
 
 		if step.Detail != "" && step.Status == StepRunning {
 			b.WriteString(mutedStyle.Render(fmt.Sprintf("   %s", step.Detail)) + "\n")

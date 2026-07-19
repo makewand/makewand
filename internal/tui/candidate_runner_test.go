@@ -10,6 +10,7 @@ import (
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/engine"
+	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
 )
 
@@ -19,6 +20,23 @@ type fixedCandidateProvider struct {
 	chatErr   error
 	chatCalls int
 	mutate    func(context.Context) error
+}
+
+type usageAfterCancelProvider struct {
+	name  string
+	usage model.Usage
+}
+
+func (p *usageAfterCancelProvider) Name() string      { return p.name }
+func (p *usageAfterCancelProvider) IsAvailable() bool { return true }
+func (p *usageAfterCancelProvider) Chat(ctx context.Context, _ []model.Message, _ string, _ int) (string, model.Usage, error) {
+	<-ctx.Done()
+	return "", p.usage, nil
+}
+func (p *usageAfterCancelProvider) ChatStream(context.Context, []model.Message, string, int) (<-chan model.StreamChunk, error) {
+	ch := make(chan model.StreamChunk)
+	close(ch)
+	return ch, nil
 }
 
 func (p *fixedCandidateProvider) Name() string      { return p.name }
@@ -42,8 +60,26 @@ func (p *fixedCandidateProvider) ChatStream(ctx context.Context, messages []mode
 	return ch, nil
 }
 
+// allowHostExecForTest opts candidate verification into direct host execution
+// via the documented escape hatch so unit tests do not depend on bubblewrap
+// being installed. The fail-closed path is covered in internal/engine.
+func allowHostExecForTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
+}
+
+func mustNewRouterFromConfig(t *testing.T, rc model.RouterConfig) *model.Router {
+	t.Helper()
+	router, err := model.NewRouterFromConfig(rc)
+	if err != nil {
+		t.Fatalf("NewRouterFromConfig: %v", err)
+	}
+	return router
+}
+
 func newCandidateProject(t *testing.T) *engine.Project {
 	t.Helper()
+	allowHostExecForTest(t)
 	project, err := engine.NewProject("candidate-project", t.TempDir())
 	if err != nil {
 		t.Fatalf("NewProject: %v", err)
@@ -101,7 +137,7 @@ func TestRunCandidateSelection_PrefersVerifiedCandidate(t *testing.T) {
 		t.Fatalf("direct candidate verification failed: %+v", report)
 	}
 
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"alpha": {Provider: &fixedCandidateProvider{name: "alpha", content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a + b\n}\n```\n"}},
 			"bravo": {Provider: &fixedCandidateProvider{name: "bravo", content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n"}},
@@ -139,13 +175,44 @@ func TestAutopilotApprovalModeUsesCandidateWorkflow(t *testing.T) {
 	}
 }
 
+func TestRunCandidateSelection_PreservesUsageWhenNoCandidateHasContent(t *testing.T) {
+	alpha := &fixedCandidateProvider{name: "alpha"}
+	bravo := &fixedCandidateProvider{name: "bravo"}
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"alpha": {Provider: alpha},
+			"bravo": {Provider: bravo},
+		},
+		UsageMode: "balanced",
+	})
+
+	selection := runCandidateSelection(
+		context.Background(),
+		router,
+		nil,
+		model.PhaseCode,
+		[]model.Message{{Role: "user", Content: "build something"}},
+		"system",
+	)
+
+	if selection.content != "" {
+		t.Fatalf("selection content = %q, want empty", selection.content)
+	}
+	if selection.provider != "ensemble" {
+		t.Fatalf("selection provider = %q, want ensemble usage attribution", selection.provider)
+	}
+	if selection.usage.InputTokens != 20 || selection.usage.OutputTokens != 40 || selection.usage.Cost != 0.2 {
+		t.Fatalf("selection usage = %+v, want both empty attempts", selection.usage)
+	}
+}
+
 func TestRunCandidateSelection_IsolatesProvidersFromFallback(t *testing.T) {
 	project := newCandidateProject(t)
 	alpha := &fixedCandidateProvider{name: "alpha", chatErr: context.DeadlineExceeded}
 	bravo := &fixedCandidateProvider{name: "bravo", content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n"}
 	charlie := &fixedCandidateProvider{name: "charlie", content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n"}
 
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"alpha":   {Provider: alpha},
 			"bravo":   {Provider: bravo},
@@ -206,7 +273,7 @@ func Mul(a, b int) int {
 		},
 	}
 
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"mutator": {Provider: mutator},
 		},
@@ -238,8 +305,125 @@ func Mul(a, b int) int {
 	}
 }
 
+func newTestlessCandidateProject(t *testing.T) *engine.Project {
+	t.Helper()
+	allowHostExecForTest(t)
+	project, err := engine.NewProject("candidate-notests", t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+	if err := project.WriteFiles([]engine.ExtractedFile{
+		{
+			Path: "go.mod",
+			Content: `module example.com/candidatenotests
+
+go 1.22
+`,
+		},
+		{
+			Path: "calc.go",
+			Content: `package candidatenotests
+
+func Mul(a, b int) int {
+	return a + b
+}
+`,
+		},
+	}); err != nil {
+		t.Fatalf("WriteFiles: %v", err)
+	}
+	if err := project.ScanFiles(); err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
+	return project
+}
+
+func TestRunCandidateSelection_StrengthOneCandidateIsNotAutoVerified(t *testing.T) {
+	project := newTestlessCandidateProject(t)
+
+	// The candidate compiles and "go test ./..." exits 0, but no tests exist,
+	// so verification strength caps at 1 and autopilot must not auto-apply it.
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"alpha": {Provider: &fixedCandidateProvider{name: "alpha", content: "--- FILE: calc.go ---\n```\npackage candidatenotests\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n"}},
+		},
+		UsageMode: "balanced",
+	})
+	router.SetMode(model.ModeBalanced)
+
+	selection := runCandidateSelection(
+		context.Background(),
+		router,
+		project,
+		model.PhaseCode,
+		[]model.Message{{Role: "user", Content: "fix multiplication"}},
+		"system",
+	)
+
+	if selection.verified {
+		t.Fatal("selection.verified = true, want false for Strength 1 candidate")
+	}
+	if strings.TrimSpace(selection.content) == "" {
+		t.Fatal("selection.content = empty, want fallback content for manual approval")
+	}
+	if selection.selectionNote != i18n.Msg().AutomationCandidateWeakVerification {
+		t.Fatalf("selectionNote = %q, want weak verification notice", selection.selectionNote)
+	}
+}
+
+func TestRunCandidateSelection_UnreportedCloneEditJoinsChangedSet(t *testing.T) {
+	project := newCandidateProject(t)
+
+	// The provider reports a FILE block for calc.go but also writes an
+	// unreported helper file into its workspace clone. The authoritative
+	// changed set is the union, so both must be verified and applied.
+	mutator := &fixedCandidateProvider{
+		name:    "mutator",
+		content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n",
+		mutate: func(ctx context.Context) error {
+			dir, ok := model.WorkDirFromContext(ctx)
+			if !ok {
+				return context.Canceled
+			}
+			return os.WriteFile(filepath.Join(dir, "helper.go"), []byte(`package candidate
+
+func Twice(a int) int {
+	return Mul(a, 2)
+}
+`), 0o600)
+		},
+	}
+
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"mutator": {Provider: mutator},
+		},
+		UsageMode: "balanced",
+	})
+	router.SetMode(model.ModeBalanced)
+
+	selection := runCandidateSelection(
+		context.Background(),
+		router,
+		project,
+		model.PhaseCode,
+		[]model.Message{{Role: "user", Content: "fix multiplication"}},
+		"system",
+	)
+
+	if !selection.verified {
+		t.Fatal("selection.verified = false, want true")
+	}
+	if !strings.Contains(selection.content, "--- FILE: calc.go ---") {
+		t.Fatalf("selection.content = %q, want reported calc.go block", selection.content)
+	}
+	if !strings.Contains(selection.content, "--- FILE: helper.go ---") {
+		t.Fatalf("selection.content = %q, want unreported helper.go clone edit included", selection.content)
+	}
+}
+
 func TestOrderedCandidateProviders_FixLimitsToTwoProviders(t *testing.T) {
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"claude": {Provider: &fixedCandidateProvider{name: "claude"}},
 			"codex":  {Provider: &fixedCandidateProvider{name: "codex"}},
@@ -256,7 +440,7 @@ func TestOrderedCandidateProviders_FixLimitsToTwoProviders(t *testing.T) {
 }
 
 func TestOrderedCandidateProviders_FixLearnsFromCandidateVerification(t *testing.T) {
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"claude": {Provider: &fixedCandidateProvider{name: "claude", content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n"}},
 			"codex":  {Provider: &fixedCandidateProvider{name: "codex", content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a + b\n}\n```\n"}},
@@ -349,7 +533,7 @@ func TestRunCandidateSelection_CancelsSlowCandidatesAfterVerifiedWinner(t *testi
 		}
 	}
 
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"alpha":   {Provider: slowProvider("alpha")},
 			"bravo":   {Provider: &fixedCandidateProvider{name: "bravo", content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n"}},
@@ -389,6 +573,43 @@ func TestRunCandidateSelection_CancelsSlowCandidatesAfterVerifiedWinner(t *testi
 	}
 }
 
+func TestRunCandidateSelection_DrainsUsageAfterEarlyWinnerCancellation(t *testing.T) {
+	project := newCandidateProject(t)
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{
+			"alpha": {
+				Provider: &usageAfterCancelProvider{
+					name:  "alpha",
+					usage: model.Usage{Provider: "alpha", InputTokens: 7, OutputTokens: 5, Cost: 0.4},
+				},
+			},
+			"bravo": {
+				Provider: &fixedCandidateProvider{
+					name:    "bravo",
+					content: "--- FILE: calc.go ---\n```\npackage candidate\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n```\n",
+				},
+			},
+		},
+		UsageMode: "balanced",
+	})
+
+	selection := runCandidateSelection(
+		context.Background(),
+		router,
+		project,
+		model.PhaseCode,
+		[]model.Message{{Role: "user", Content: "fix multiplication"}},
+		"system",
+	)
+
+	if !selection.verified || selection.provider != "bravo" {
+		t.Fatalf("selection = %+v, want verified bravo winner", selection)
+	}
+	if selection.usage.InputTokens != 17 || selection.usage.OutputTokens != 25 || selection.usage.Cost != 0.5 {
+		t.Fatalf("selection usage = %+v, want winner plus canceled in-flight attempt", selection.usage)
+	}
+}
+
 func TestRunCandidateSelectionWithActivity_ShowsProviderProgress(t *testing.T) {
 	project := newCandidateProject(t)
 	activity := newChatActivityState()
@@ -409,7 +630,7 @@ func TestRunCandidateSelectionWithActivity_ShowsProviderProgress(t *testing.T) {
 		},
 	}
 
-	router := model.NewRouterFromConfig(model.RouterConfig{
+	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
 			"alpha": {Provider: provider},
 		},
@@ -437,10 +658,7 @@ func TestRunCandidateSelectionWithActivity_ShowsProviderProgress(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(time.Second)
-	for {
-		if strings.Contains(activity.Snapshot().Detail, "alpha generating") {
-			break
-		}
+	for !strings.Contains(activity.Snapshot().Detail, "alpha generating") {
 		if time.Now().After(deadline) {
 			t.Fatalf("activity detail = %q, want generating status", activity.Snapshot().Detail)
 		}

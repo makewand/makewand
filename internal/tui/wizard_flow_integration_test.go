@@ -83,7 +83,10 @@ func TestWizardBuildsProjectFromTemplateWithoutPTY(t *testing.T) {
 func newWizardFlowRouter(t *testing.T, cfg *config.Config, provider model.Provider) *model.Router {
 	t.Helper()
 
-	r := model.NewRouter(cfg)
+	r, err := model.NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
 	if err := r.RegisterProvider("private", provider, model.AccessSubscription); err != nil {
 		t.Fatalf("RegisterProvider: %v", err)
 	}

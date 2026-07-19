@@ -117,6 +117,7 @@ func TestConfigDir_UsesEnvOverride(t *testing.T) {
 
 func TestHasAnyModel_WithCustomProvider(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "private-llm.sh")
+	//nolint:gosec // G306: test fixture script must be executable.
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s): %v", bin, err)
 	}
@@ -152,6 +153,7 @@ func TestHasAnyModel_InvalidCustomProviderNotCounted(t *testing.T) {
 
 func TestIsCustomProviderUsable_WithExecutablePath(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "provider.sh")
+	//nolint:gosec // G306: test fixture script must be executable.
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s): %v", bin, err)
 	}
@@ -194,6 +196,115 @@ func TestDefaultConfig_ApprovalModeIsManual(t *testing.T) {
 	if cfg.ApprovalMode != ApprovalModeManual {
 		t.Fatalf("ApprovalMode = %q, want %q", cfg.ApprovalMode, ApprovalModeManual)
 	}
+}
+
+func TestDefaultConfig_UsageModeIsBalanced(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.UsageMode != UsageModeBalanced {
+		t.Fatalf("UsageMode = %q, want %q", cfg.UsageMode, UsageModeBalanced)
+	}
+}
+
+func TestNormalizeUsageMode(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{input: "", want: UsageModeBalanced},
+		{input: "fast", want: UsageModeFast},
+		{input: " BALANCED ", want: UsageModeBalanced},
+		{input: "POWER", want: UsageModePower},
+		{input: "legacy", want: UsageModeBalanced},
+	}
+
+	for _, tt := range tests {
+		if got := NormalizeUsageMode(tt.input); got != tt.want {
+			t.Fatalf("NormalizeUsageMode(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestLoad_LegacyUsageModeDefaultsToBalanced(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "missing", data: `{"language":"en"}`},
+		{name: "empty", data: `{"usage_mode":""}`},
+		{name: "invalid", data: `{"usage_mode":"legacy"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfgDir := t.TempDir()
+			t.Setenv("MAKEWAND_CONFIG_DIR", cfgDir)
+			t.Setenv("PATH", t.TempDir())
+
+			path := filepath.Join(cfgDir, "config.json")
+			if err := os.WriteFile(path, []byte(tt.data), 0o600); err != nil {
+				t.Fatalf("WriteFile(%s): %v", path, err)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.UsageMode != UsageModeBalanced {
+				t.Fatalf("UsageMode = %q, want %q", cfg.UsageMode, UsageModeBalanced)
+			}
+		})
+	}
+}
+
+// TestLoadWithOptions_SkipCLIDetection verifies that untrusted-repository mode's
+// config load (LoadOptions{SkipCLIDetection:true}) never execs a subscription
+// CLI's `--version` probe, while the trusted default (Load) still detects it.
+func TestLoadWithOptions_SkipCLIDetection(t *testing.T) {
+	binDir := t.TempDir()
+
+	// Fake `claude` on PATH: writes a sentinel when its --version probe runs.
+	// The probe inherits the (restricted) test PATH, so create the sentinel via a
+	// shell builtin + redirection rather than an external command like `touch`.
+	sentinel := filepath.Join(binDir, "claude_probe_ran")
+	script := filepath.Join(binDir, "claude")
+	body := "#!/bin/sh\nprintf 'probe\\n' > \"" + sentinel + "\"\nprintf 'claude 1.2.3\\n'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture must be executable.
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	t.Run("skip does not exec probe", func(t *testing.T) {
+		t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
+		t.Setenv("PATH", binDir)
+		_ = os.Remove(sentinel)
+
+		cfg, err := LoadWithOptions(LoadOptions{SkipCLIDetection: true})
+		if err != nil {
+			t.Fatalf("LoadWithOptions(SkipCLIDetection) error: %v", err)
+		}
+		if _, statErr := os.Stat(sentinel); statErr == nil {
+			t.Fatalf("CLI --version probe was executed despite SkipCLIDetection (sentinel %q exists)", sentinel)
+		}
+		if len(cfg.CLIs) != 0 {
+			t.Fatalf("cfg.CLIs = %+v, want none when detection skipped", cfg.CLIs)
+		}
+	})
+
+	t.Run("trusted default detects CLIs", func(t *testing.T) {
+		t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
+		t.Setenv("PATH", binDir)
+		_ = os.Remove(sentinel)
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if _, statErr := os.Stat(sentinel); statErr != nil {
+			t.Fatalf("trusted Load did not exec the CLI --version probe (sentinel %q missing): %v", sentinel, statErr)
+		}
+		if !cfg.HasCLI("claude") {
+			t.Fatalf("cfg.HasCLI(claude) = false, want true; CLIs = %+v", cfg.CLIs)
+		}
+	})
 }
 
 func TestNormalizeApprovalMode(t *testing.T) {

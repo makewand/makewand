@@ -45,6 +45,10 @@ type execPolicy struct {
 	allowAnyCommand bool
 	stripSensitive  bool
 	allowedCommands map[string]struct{}
+	// allowCommandPath permits an absolute wrapper binary (bubblewrap). The
+	// wrapped inner command must already be validated against the restricted
+	// allowlist before this policy is used.
+	allowCommandPath bool
 }
 
 var restrictedAllowedCommands = map[string]struct{}{
@@ -95,6 +99,16 @@ func restrictedExecPolicy() execPolicy {
 	}
 }
 
+func isolatedExecPolicy() execPolicy {
+	return execPolicy{
+		// The bwrap wrapper is invoked by absolute path; the inner command was
+		// already validated against restrictedAllowedCommands before wrapping.
+		allowAnyCommand:  true,
+		stripSensitive:   true, // defense in depth; bwrap --clearenv rebuilds the env anyway
+		allowCommandPath: true,
+	}
+}
+
 // Exec runs a trusted command in the project directory with a timeout.
 // Used by internal engine flows like git operations.
 func (p *Project) Exec(ctx context.Context, command string, args ...string) (*ExecResult, error) {
@@ -107,9 +121,70 @@ func (p *Project) ExecRestricted(ctx context.Context, command string, args ...st
 	return p.execWithPolicy(ctx, command, args, restrictedExecPolicy())
 }
 
-// RunRestrictedPlan executes a detected restricted plan.
+// RunRestrictedPlan executes a detected restricted plan for the real project
+// (dependency installs, test runs, and auto-fix retries). It applies the SAME
+// fail-closed isolation gate as candidate verification: when bubblewrap
+// isolation is available the command runs inside the sandbox (network-isolated
+// unless it is a dependency install); when isolation is unavailable no command
+// runs on the host unless the user explicitly opts in with
+// MAKEWAND_UNSAFE_HOST_EXEC=1. Otherwise a clear "isolation unavailable" error
+// is returned so callers (the TUI) degrade to manual approval instead of
+// silently executing generated commands directly on the host.
 func (p *Project) RunRestrictedPlan(ctx context.Context, plan ExecPlan) (*ExecResult, error) {
-	return p.ExecRestricted(ctx, plan.Command, plan.Args...)
+	return p.RunVerificationPlan(ctx, plan)
+}
+
+// RunVerificationPlan executes a candidate verification plan and fails closed:
+// without working bubblewrap isolation (or the explicit
+// MAKEWAND_UNSAFE_HOST_EXEC=1 opt-in) no command is executed at all.
+// Dependency installs keep network access so package registries stay reachable;
+// every other step runs with the network namespace unshared.
+func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*ExecResult, error) {
+	env, err := resolveVerifyExecEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	if env.mode == verifyExecUnsafeHost {
+		return p.ExecRestricted(ctx, plan.Command, plan.Args...)
+	}
+	return p.execVerification(ctx, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan))
+}
+
+// verificationPlanAllowsNetwork reports whether a plan may keep network access
+// inside the sandbox. Only dependency installs qualify; quick checks, builds,
+// and test runs are network-isolated.
+func verificationPlanAllowsNetwork(plan ExecPlan) bool {
+	return plan.Kind == "deps"
+}
+
+func (p *Project) execVerification(ctx context.Context, command string, args []string, allowNetwork bool) (*ExecResult, error) {
+	if err := validateCommandName(command); err != nil {
+		return nil, err
+	}
+	if _, ok := restrictedAllowedCommands[command]; !ok {
+		return nil, fmt.Errorf("command %q is blocked by execution policy", command)
+	}
+
+	env, err := resolveVerifyExecEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	if env.mode != verifyExecIsolated {
+		return nil, fmt.Errorf("verification sandbox is not active")
+	}
+
+	projectDir, err := p.execWorkingDir()
+	if err != nil {
+		return nil, err
+	}
+	// The sandbox HOME lives inside the writable workspace so dependency
+	// installs can populate tool caches that network-isolated test steps reuse.
+	if err := os.MkdirAll(filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath)), 0o700); err != nil {
+		return nil, fmt.Errorf("create sandbox home: %w", err)
+	}
+
+	wrappedCmd, wrappedArgs := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, allowNetwork)
+	return p.execWithPolicy(ctx, wrappedCmd, wrappedArgs, isolatedExecPolicy())
 }
 
 // DetectInstallPlan detects the dependency install command for the current project.
@@ -230,7 +305,11 @@ func (w *limitedWriter) String() string { return w.buf.String() }
 const maxOutputBytes = 10 << 20 // 10 MB
 
 func (p *Project) execWithPolicy(ctx context.Context, command string, args []string, policy execPolicy) (*ExecResult, error) {
-	if err := validateCommandName(command); err != nil {
+	if policy.allowCommandPath {
+		if strings.TrimSpace(command) == "" {
+			return nil, fmt.Errorf("empty command")
+		}
+	} else if err := validateCommandName(command); err != nil {
 		return nil, err
 	}
 	if !policy.allowAnyCommand {

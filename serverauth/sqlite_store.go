@@ -321,6 +321,7 @@ FROM auth_tokens`)
 	sort.Slice(views, func(i, j int) bool { return views[i].ID < views[j].ID })
 
 	s.mu.Lock()
+	carryOverGrantUsage(grants, s.grants)
 	s.grants = grants
 	s.views = views
 	s.mu.Unlock()

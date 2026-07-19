@@ -8,7 +8,7 @@ func TestResolveOptionalRemoteAdminTarget(t *testing.T) {
 	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
 	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
 
-	urlValue, tokenValue, remoteMode, err := resolveOptionalRemoteAdminTarget("", "")
+	_, _, remoteMode, err := resolveOptionalRemoteAdminTarget("", "")
 	if err != nil {
 		t.Fatalf("resolveOptionalRemoteAdminTarget: %v", err)
 	}
@@ -16,7 +16,7 @@ func TestResolveOptionalRemoteAdminTarget(t *testing.T) {
 		t.Fatal("remoteMode = true, want false when no flags are supplied")
 	}
 
-	urlValue, tokenValue, remoteMode, err = resolveOptionalRemoteAdminTarget("http://127.0.0.1:8080", "")
+	urlValue, tokenValue, remoteMode, err := resolveOptionalRemoteAdminTarget("http://127.0.0.1:8080", "")
 	if err != nil {
 		t.Fatalf("resolveOptionalRemoteAdminTarget(flags): %v", err)
 	}

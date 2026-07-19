@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,23 +13,52 @@ import (
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/internal/buildinfo"
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
+	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/tui"
 	"github.com/spf13/cobra"
 )
 
 var (
-	version         = "0.1.10"
 	debugFlag       bool
 	rootModeFlag    string
 	rootPrintFlag   bool
 	rootTimeoutFlag time.Duration
+	repoTrustFlag   string
+
+	// resolvedRepoTrust holds the repository trust level parsed once by the root
+	// command's PersistentPreRunE, so every subcommand shares a single validated
+	// value. PersistentPreRunE rejects an invalid --repo-trust before any backend
+	// check or router construction runs.
+	resolvedRepoTrust model.RepoTrust
 )
 
+// resolveRepoTrust parses the --repo-trust flag value into a model.RepoTrust.
+// An empty or "trusted" value resolves to the trusted default; "untrusted"
+// enables fail-closed untrusted-repository routing. Any other value is rejected
+// with an actionable error.
+func resolveRepoTrust(value string) (model.RepoTrust, error) {
+	trust, ok := model.ParseRepoTrust(value)
+	if !ok {
+		return model.RepoTrustTrusted, fmt.Errorf("invalid --repo-trust %q: must be \"trusted\" or \"untrusted\"", value)
+	}
+	return trust, nil
+}
+
 func main() {
+	if err := newRootCmd().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// newRootCmd builds the makewand command tree. It is a function (not inline in
+// main) so tests can exercise the persistent flag validation and command wiring
+// without spawning a subprocess.
+func newRootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "makewand [prompt]",
 		Short: "Multi-provider coding router for terminal makers",
@@ -49,8 +79,27 @@ Claude, Gemini, and Codex through adaptive mode-based routing
   makewand usage   - Inspect structured server usage logs
   makewand user    - Manage registered server users
   makewand preview - Start a preview server
-  makewand setup   - Configure AI providers and routing preferences`,
+  makewand setup   - Configure AI providers and routing preferences
+
+Flags:
+  --repo-trust trusted|untrusted  Repository trust level (default: trusted).
+      In untrusted mode only direct API providers may generate against the repo
+      (fail closed), and repo-provided .makewand/rules.md is not treated as
+      trusted instructions. Use it for third-party/unreviewed repositories.`,
 		Args: cobra.ArbitraryArgs,
+		// Validate --repo-trust once, globally, before any subcommand's RunE and
+		// before any backend check. This is a persistent flag, so a bad value must
+		// be rejected on every subcommand (serve/doctor/setup included), not only
+		// on the paths that later resolve it. The resolved value is stored for
+		// reuse so commands that apply the trust do not re-parse it.
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			trust, err := resolveRepoTrust(repoTrustFlag)
+			if err != nil {
+				return err
+			}
+			resolvedRepoTrust = trust
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 
@@ -66,6 +115,11 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 				cfg.UsageMode = rootModeFlag
 			}
 
+			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
+			if trustErr != nil {
+				return trustErr
+			}
+
 			initialPrompt := strings.TrimSpace(strings.Join(args, " "))
 			isTTY := isInteractiveTerminal()
 
@@ -78,7 +132,7 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 			}
 
 			if shouldUseHeadless(initialPrompt, rootPrintFlag, isTTY) {
-				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag, debugFlag)
+				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag, repoTrust, debugFlag)
 			}
 			if rootPrintFlag && initialPrompt == "" {
 				return fmt.Errorf("--print requires a non-empty prompt (via argument or piped stdin)")
@@ -87,9 +141,9 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 				return fmt.Errorf("interactive TTY not detected; provide a prompt or use --print")
 			}
 
-			return tui.RunWithPrompt(tui.ModeChat, cfg, ".", initialPrompt, debugFlag)
+			return tui.RunWithPrompt(tui.ModeChat, cfg, ".", initialPrompt, repoTrust, debugFlag)
 		},
-		Version: version,
+		Version: buildinfo.FormatVersion(),
 	}
 
 	rootCmd.AddCommand(newCmd())
@@ -104,13 +158,12 @@ Claude, Gemini, and Codex through adaptive mode-based routing
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
+	rootCmd.PersistentFlags().StringVar(&repoTrustFlag, "repo-trust", "trusted", "repository trust level: trusted (default) or untrusted (only direct API providers, fail closed)")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
 	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 0, "timeout for --print (default: auto per mode)")
 
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
+	return rootCmd
 }
 
 func newCmd() *cobra.Command {
@@ -147,7 +200,12 @@ func newCmd() *cobra.Command {
 				cfg.UsageMode = modeFlag
 			}
 
-			return tui.Run(tui.ModeNew, cfg, "", debugFlag)
+			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
+			if trustErr != nil {
+				return trustErr
+			}
+
+			return tui.Run(tui.ModeNew, cfg, "", repoTrust, debugFlag)
 		},
 	}
 
@@ -178,12 +236,17 @@ func chatCmd() *cobra.Command {
 				cfg.UsageMode = modeFlag
 			}
 
+			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
+			if trustErr != nil {
+				return trustErr
+			}
+
 			projectPath := "."
 			if len(args) > 0 {
 				projectPath = args[0]
 			}
 
-			return tui.Run(tui.ModeChat, cfg, projectPath, debugFlag)
+			return tui.Run(tui.ModeChat, cfg, projectPath, repoTrust, debugFlag)
 		},
 	}
 
@@ -234,12 +297,19 @@ func previewCmd() *cobra.Command {
 }
 
 func setupCmd() *cobra.Command {
-	return &cobra.Command{
+	var modeFlag string
+
+	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Configure AI models and preferences",
-		Long:  "Interactive setup wizard for configuring API keys, default models, and language preferences.",
+		Short: "Inspect AI providers and save routing preferences",
+		Long: `Inspect auto-detected subscription CLIs, API key status, and provider access.
+The command keeps a valid configured mode and migrates unset or legacy modes to
+balanced. Use --mode to save a different preference without starting the chat UI.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
+			if err := applySetupUsageMode(cfg, modeFlag); err != nil {
+				return err
+			}
 
 			fmt.Println("makewand setup")
 			fmt.Println()
@@ -291,11 +361,7 @@ func setupCmd() *cobra.Command {
 
 			fmt.Printf("  Language: %s\n", cfg.Language)
 			fmt.Printf("  Default model: %s\n", cfg.DefaultModel)
-			if cfg.UsageMode != "" {
-				fmt.Printf("  Usage mode: %s\n", cfg.UsageMode)
-			} else {
-				fmt.Println("  Usage mode: not set (legacy routing)")
-			}
+			fmt.Printf("  Usage mode: %s\n", cfg.UsageMode)
 			fmt.Println()
 			fmt.Println("Provider access types:")
 			fmt.Printf("  Claude: %s\n", accessDisplay(cfg.ClaudeAccess, "subscription"))
@@ -328,11 +394,30 @@ func setupCmd() *cobra.Command {
 			if err := config.Save(cfg); err != nil {
 				diag.Stderr().WarnErr("could not save config", err)
 				fmt.Fprintln(os.Stderr, "Tip: set MAKEWAND_CONFIG_DIR to a writable directory.")
+				return fmt.Errorf("save setup configuration: %w", err)
 			}
 
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&modeFlag, "mode", "", "routing mode to save: fast, balanced, or power (default: keep configured mode; balanced when unset)")
+	return cmd
+}
+
+func applySetupUsageMode(cfg *config.Config, requested string) error {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		cfg.UsageMode = config.NormalizeUsageMode(cfg.UsageMode)
+		return nil
+	}
+
+	mode, ok := model.ParseUsageMode(requested)
+	if !ok {
+		return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", requested)
+	}
+	cfg.UsageMode = mode.String()
+	return nil
 }
 
 func accessDisplay(configured, defaultValue string) string {
@@ -343,11 +428,22 @@ func accessDisplay(configured, defaultValue string) string {
 }
 
 func loadConfigWithWarning() *config.Config {
-	cfg, err := config.Load()
+	cfg, err := config.LoadWithOptions(configLoadOptions())
 	if err != nil {
 		diag.Stderr().WarnErr("could not load config", err)
 	}
 	return cfg
+}
+
+// configLoadOptions derives config.LoadOptions from the resolved repository
+// trust. In untrusted mode it skips subscription-CLI detection so config load
+// never execs a local CLI (`claude/gemini/codex/agy --version`) inside an
+// untrusted working directory; only direct API providers are used there. The
+// trusted default keeps CLI detection on, unchanged.
+func configLoadOptions() config.LoadOptions {
+	return config.LoadOptions{
+		SkipCLIDetection: resolvedRepoTrust == model.RepoTrustUntrusted,
+	}
 }
 
 func shouldUseHeadless(prompt string, printFlag bool, interactiveTTY bool) bool {
@@ -397,13 +493,25 @@ func readStdinPrompt() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, debug bool) error {
+func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, repoTrust model.RepoTrust, debug bool) error {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return fmt.Errorf("prompt is empty")
 	}
 
-	router := model.NewRouter(cfg)
+	// Honor the configured language in headless mode, matching how the TUI's
+	// NewApp does it. Without this a zh-configured user gets English output,
+	// including the untrusted-mode refusal message.
+	i18n.SetLanguage(cfg.Language)
+
+	// Construct the router WITH the repository trust level so untrusted mode is
+	// known before any background work (the async quota refresh, which can exec a
+	// local CLI). This fails closed end-to-end instead of relying on a post-hoc
+	// SetRepoTrust that lands after the refresh goroutine has started.
+	router, err := model.NewRouterWithTrust(cfg, repoTrust)
+	if err != nil {
+		return fmt.Errorf("initialize model router: %w", err)
+	}
 	if debug {
 		traceSink, tracePath, traceErr := newHeadlessTraceSink()
 		if traceErr != nil {
@@ -421,7 +529,7 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 	task := classifyPromptTask(prompt)
 	messages := []model.Message{{Role: "user", Content: prompt}}
 	project := openHeadlessProject(".")
-	systemPrompt := buildHeadlessSystemPrompt(project, task, router.Mode(), prompt)
+	systemPrompt := buildHeadlessSystemPrompt(project, task, router.Mode(), prompt, router)
 
 	// Auto-select timeout based on mode when user didn't set --timeout explicitly.
 	if timeout <= 0 {
@@ -434,9 +542,9 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 		content string
 		usage   model.Usage
 		route   model.RouteResult
-		err     error
 	)
-	if shouldUseHeadlessCandidateSelection(cfg, task, project) {
+	switch {
+	case shouldUseHeadlessCandidateSelection(cfg, task, project):
 		selection := engine.RunCandidateSelection(
 			ctx,
 			router,
@@ -446,22 +554,48 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 			systemPrompt,
 			nil,
 		)
-		if strings.TrimSpace(selection.Content) == "" {
-			return fmt.Errorf("no candidate provider produced a response")
-		}
 		content = selection.Content
 		usage = selection.Usage
 		route.Actual = selection.Provider
-	} else if router.ModeSet() && router.Mode() == model.ModePower {
+		// Surface delete-only warnings even when the candidate produced no writable
+		// content: deletions are never applied automatically and must not be dropped.
+		if notice := headlessDeletionNotice(selection.DeletedFiles); notice != "" {
+			fmt.Fprintln(os.Stderr, notice)
+		}
+		if strings.TrimSpace(selection.Content) == "" {
+			// Propagate the fail-closed sentinel the engine set when untrusted-repo
+			// mode had no untrusted-repo-safe provider, so the mapping below presents
+			// the actionable untrusted-mode message instead of the generic one.
+			if errors.Is(selection.Err, model.ErrNoUntrustedSafeProvider) {
+				err = selection.Err
+			} else {
+				err = fmt.Errorf("no candidate provider produced a response")
+			}
+		}
+	case router.ModeSet() && router.Mode() == model.ModePower:
 		content, usage, route, err = router.ChatBest(ctx, promptTaskToBuildPhase(task), messages, systemPrompt)
-	} else {
+	default:
 		content, usage, route, err = router.Chat(ctx, task, messages, systemPrompt)
-	}
-	if err != nil {
-		return err
 	}
 	if dirErr == nil {
 		_ = router.SaveStats(configDir)
+	}
+	if err != nil {
+		// Untrusted-repo mode fails closed when no direct-API provider is
+		// available. Surface a clear, actionable message (Cobra prints the
+		// returned error to stderr) instead of the terse sentinel error, and
+		// keep a non-zero exit so headless/CI callers see the refusal.
+		if errors.Is(err, model.ErrNoUntrustedSafeProvider) {
+			return errors.New(i18n.Msg().RepoTrustNoSafeProvider)
+		}
+		provider := strings.TrimSpace(usage.Provider)
+		if provider == "" {
+			provider = strings.TrimSpace(route.Actual)
+		}
+		if usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.Cost > 0 {
+			fmt.Fprintf(os.Stderr, "[makewand] failed request usage: provider=%s input_tokens=%d output_tokens=%d cost_usd=%.6f\n", provider, usage.InputTokens, usage.OutputTokens, usage.Cost)
+		}
+		return err
 	}
 
 	provider := strings.TrimSpace(route.Actual)
@@ -478,6 +612,13 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 		} else {
 			fmt.Fprintf(os.Stderr, "[makewand] provider=%s\n", provider)
 		}
+		if headlessRanHostCLI(router, route, provider) {
+			wd, wdErr := os.Getwd()
+			if wdErr != nil || wd == "" {
+				wd = "."
+			}
+			fmt.Fprintf(os.Stderr, "[makewand] %s\n", fmt.Sprintf(i18n.Msg().HostCLIExecNotice, provider, wd))
+		}
 	}
 
 	content = sanitizeHeadlessContent(prompt, task, content)
@@ -488,6 +629,18 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, d
 
 	fmt.Println(strings.TrimSpace(content))
 	return nil
+}
+
+// headlessDeletionNotice formats the delete-only warning printed to stderr in
+// headless mode. Deletions are never applied automatically, so they must be
+// surfaced even when the candidate produced no writable content. Returns "" when
+// there are no deletions.
+func headlessDeletionNotice(deleted []string) string {
+	if len(deleted) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[makewand] %s",
+		fmt.Sprintf(i18n.Msg().AutomationCandidateDeletions, strings.Join(deleted, ", ")))
 }
 
 func shouldUseHeadlessCandidateSelection(cfg *config.Config, task model.TaskType, project *engine.Project) bool {
@@ -554,8 +707,20 @@ func promptTaskToBuildPhase(task model.TaskType) model.BuildPhase {
 	}
 }
 
-func buildHeadlessSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode, prompt string) string {
-	base := tui.BuildSystemPrompt(project, task, mode)
+// headlessRanHostCLI reports whether the resolved provider executed a local CLI
+// on the host (as opposed to a direct HTTP API provider). Generation via a local
+// CLI is not sandboxed, so callers surface a one-time notice. The route's Provider
+// is nil on the synthesized candidate-selection path, so fall back to the
+// subscription flag, which marks the host-executing CLI providers.
+func headlessRanHostCLI(r *model.Router, route model.RouteResult, provider string) bool {
+	if _, ok := route.Provider.(*model.CLIProvider); ok {
+		return true
+	}
+	return r != nil && r.IsSubscription(provider)
+}
+
+func buildHeadlessSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode, prompt string, r *model.Router) string {
+	base := tui.BuildSystemPrompt(project, task, mode, r)
 	headlessRules := "Headless mode rules: do not ask for permissions, do not claim to write files, and do not ask follow-up questions. Return the final answer directly."
 	if headlessCodeOnlyRequested(task, prompt) {
 		return base + " " + headlessRules + " For code/file requests, output only the final code content. No markdown fences. No summaries."

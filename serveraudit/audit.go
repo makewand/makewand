@@ -192,11 +192,7 @@ func SortedStringCounts(m map[string]int) []string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	out := make([]string, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, key)
-	}
-	return out
+	return keys
 }
 
 func SortedStatusCounts(m map[int]int) []int {

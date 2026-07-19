@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,9 +118,16 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			return
 		}
 
+		// Namespace the stored key by the caller's tenant identity so a session
+		// created by one owner is never reachable by another, even if they guess
+		// the workspace ID. When the grant carries no identity (single-user or
+		// no-auth mode, and legacy operator-issued full-access tokens), the key
+		// is unchanged and existing sessions continue to resolve.
+		storageKey := scopedWorkspaceKey(sessionOwnerKey(grant), workspaceID)
+
 		switch req.Method {
 		case http.MethodGet:
-			data, err := store.Load(workspaceID)
+			data, err := store.Load(storageKey)
 			if err != nil {
 				if err == ErrNotFound {
 					event.Status = http.StatusNotFound
@@ -133,6 +141,7 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
+			//nolint:gosec // G705: JSON session payload response (Content-Type application/json), not an HTML sink.
 			_, _ = w.Write(data)
 			event.Status = http.StatusOK
 		case http.MethodPut:
@@ -149,7 +158,7 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 				http.Error(w, "session payload too large", http.StatusRequestEntityTooLarge)
 				return
 			}
-			if err := store.Save(workspaceID, data); err != nil {
+			if err := store.Save(storageKey, data); err != nil {
 				event.Status = http.StatusInternalServerError
 				event.Error = err.Error()
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -158,7 +167,7 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			event.Status = http.StatusNoContent
 		case http.MethodDelete:
-			if err := store.Delete(workspaceID); err != nil {
+			if err := store.Delete(storageKey); err != nil {
 				event.Status = http.StatusInternalServerError
 				event.Error = err.Error()
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -173,6 +182,47 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+// sessionOwnerKey derives a stable per-tenant namespace from the caller's
+// grant. It returns an empty string when the grant carries no identity, which
+// preserves single-user/no-auth behavior and legacy operator tokens: their
+// keys stay equal to the bare workspace ID. Every field is length-prefixed so
+// distinct identities can never collide into the same namespace.
+func sessionOwnerKey(grant *serverauth.Grant) string {
+	if grant == nil {
+		return ""
+	}
+	userID := strings.TrimSpace(grant.UserID())
+	orgID := strings.TrimSpace(grant.OrganizationID())
+	projectID := strings.TrimSpace(grant.ProjectID())
+	if userID == "" && orgID == "" && projectID == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("org:")
+	b.WriteString(strconv.Itoa(len(orgID)))
+	b.WriteByte(':')
+	b.WriteString(orgID)
+	b.WriteString("|proj:")
+	b.WriteString(strconv.Itoa(len(projectID)))
+	b.WriteByte(':')
+	b.WriteString(projectID)
+	b.WriteString("|user:")
+	b.WriteString(strconv.Itoa(len(userID)))
+	b.WriteByte(':')
+	b.WriteString(userID)
+	return b.String()
+}
+
+// scopedWorkspaceKey combines the owner namespace with the workspace ID. When
+// ownerKey is empty the workspace ID is returned unchanged for backward
+// compatibility with pre-tenancy stores.
+func scopedWorkspaceKey(ownerKey, workspaceID string) string {
+	if ownerKey == "" {
+		return workspaceID
+	}
+	return ownerKey + "\x1e" + workspaceID
 }
 
 func sessionScopeForMethod(method string) (string, bool) {

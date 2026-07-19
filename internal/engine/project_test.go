@@ -36,6 +36,47 @@ func TestWriteFile_RejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestWriteFile_RejectsProtectedPaths(t *testing.T) {
+	proj, err := NewProject("protected-paths", t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{name: "git hook", path: ".git/hooks/pre-commit", wantErr: true},
+		{name: "nested git dir", path: "vendor/dep/.git/hooks/pre-commit", wantErr: true},
+		{name: "github workflow", path: ".github/workflows/ci.yml", wantErr: true},
+		{name: "circleci config", path: ".circleci/config.yml", wantErr: true},
+		{name: "gitlab ci", path: ".gitlab-ci.yml", wantErr: true},
+		{name: "jenkinsfile", path: "Jenkinsfile", wantErr: true},
+		{name: "makefile", path: "Makefile", wantErr: true},
+		{name: "test gate script", path: "scripts/test_gate.sh", wantErr: true},
+		{name: "race gate script", path: "scripts/test_race.sh", wantErr: true},
+		{name: "nested scripts shell", path: "scripts/ci/publish.sh", wantErr: true},
+		{name: "regular source file", path: "main.go", wantErr: false},
+		{name: "gitignore stays writable", path: ".gitignore", wantErr: false},
+		{name: "nested source file", path: "pkg/util/util.go", wantErr: false},
+		{name: "non-shell script stays writable", path: "scripts/gen.py", wantErr: false},
+		{name: "app source under makefile name in subdir", path: "cmd/app/main.go", wantErr: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := proj.WriteFile(tt.path, "content")
+			if tt.wantErr && err == nil {
+				t.Fatalf("WriteFile(%q) = nil, want protected path error", tt.path)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("WriteFile(%q) = %v, want nil", tt.path, err)
+			}
+		})
+	}
+}
+
 func TestReadFile_RejectsSymlinkEscape(t *testing.T) {
 	base := t.TempDir()
 	projectDir := filepath.Join(base, "project")

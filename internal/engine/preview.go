@@ -107,9 +107,14 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		command = "python"
 		args = []string{"main.py"}
 	default:
-		// Fallback: simple Python HTTP server for static sites.
+		// Fallback: simple Python HTTP server for static sites. Run the
+		// interpreter in isolated mode (-I): this drops the working directory
+		// from sys.path, disables the user site dir, and ignores PYTHON* env,
+		// so a project-local sitecustomize.py or an http/ package cannot be
+		// imported and execute host code. http.server still serves the project
+		// directory (cmd.Dir / os.getcwd()) as static files.
 		command = "python3"
-		args = []string{"-m", "http.server", "--bind", "127.0.0.1", fmt.Sprintf("%d", port)}
+		args = []string{"-I", "-m", "http.server", "--bind", "127.0.0.1", fmt.Sprintf("%d", port)}
 	}
 
 	// Project-defined scripts execute inside an isolation wrapper by default.
@@ -170,7 +175,8 @@ func (s *PreviewServer) Stop() {
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		killProcessGroup(s.cmd)
-		s.cmd.Wait()
+		// Reap the killed process; the exit error is expected and irrelevant on shutdown.
+		_ = s.cmd.Wait()
 	}
 }
 

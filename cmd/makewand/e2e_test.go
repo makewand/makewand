@@ -22,35 +22,32 @@ func TestE2EPrintRoutesByClassifier(t *testing.T) {
 	}
 
 	bin := buildMakewandBinary(t)
-	cfgDir := t.TempDir()
 	script := writeProviderScript(t)
 
 	cfg := config.DefaultConfig()
-	cfg.DefaultModel = "default-provider"
-	cfg.AnalysisModel = "planner"
-	cfg.CodingModel = "coder"
-	cfg.ReviewModel = "reviewer"
 	cfg.CustomProviders = []config.CustomProvider{
-		{Name: "default-provider", Command: script, Args: []string{"default-provider"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
-		{Name: "planner", Command: script, Args: []string{"planner"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
-		{Name: "coder", Command: script, Args: []string{"coder"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
-		{Name: "reviewer", Command: script, Args: []string{"reviewer"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "claude", Command: script, Args: []string{"claude"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "gemini", Command: script, Args: []string{"gemini"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "codex", Command: script, Args: []string{"codex"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
 	}
-	writeTestConfig(t, cfgDir, cfg)
 
 	tests := []struct {
 		name         string
 		prompt       string
 		wantProvider string
 	}{
-		{name: "review with punctuation", prompt: "please review.", wantProvider: "reviewer"},
-		{name: "fix with punctuation", prompt: "fix, please", wantProvider: "coder"},
-		{name: "checkout stays code", prompt: "checkout the repo", wantProvider: "coder"},
-		{name: "explain phrase", prompt: "how does this work", wantProvider: "planner"},
+		{name: "review with punctuation", prompt: "please review.", wantProvider: "gemini"},
+		{name: "fix with punctuation", prompt: "fix, please", wantProvider: "codex"},
+		{name: "checkout stays code", prompt: "checkout the repo", wantProvider: "claude"},
+		{name: "explain phrase", prompt: "how does this work", wantProvider: "gemini"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Isolate routing stats so every case exercises the balanced cold-start
+			// strategy rather than learning from a previous table entry.
+			cfgDir := t.TempDir()
+			writeTestConfig(t, cfgDir, cfg)
 			stdout, stderr, err := runMakewand(t, bin, cfgDir, "--print", "--timeout=5s", tt.prompt)
 			if err != nil {
 				t.Fatalf("runMakewand(%q) error = %v\nstdout:\n%s\nstderr:\n%s", tt.prompt, err, stdout, stderr)
@@ -61,7 +58,122 @@ func TestE2EPrintRoutesByClassifier(t *testing.T) {
 			if !strings.Contains(stderr, "[makewand] provider="+tt.wantProvider) {
 				t.Fatalf("stderr = %q, want provider marker for %q", stderr, tt.wantProvider)
 			}
+			// Subscription CLI providers execute generation on the host; the
+			// one-time trust-boundary notice must be surfaced.
+			if !strings.Contains(stderr, "generation is not sandboxed") {
+				t.Fatalf("stderr = %q, want host-CLI generation notice", stderr)
+			}
 		})
+	}
+}
+
+// TestE2EPrintUntrustedRepoFailsClosed verifies that --print --repo-trust=untrusted
+// with ONLY subscription CLI fixture providers (unsafe for untrusted repos) fails
+// closed: routing refuses, a clear actionable message reaches stderr, no provider
+// output is emitted, and the process exits non-zero.
+func TestE2EPrintUntrustedRepoFailsClosed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based E2E fixtures are Unix-only")
+	}
+
+	bin := buildMakewandBinary(t)
+	script := writeProviderScript(t)
+
+	cfg := config.DefaultConfig()
+	cfg.CustomProviders = []config.CustomProvider{
+		{Name: "claude", Command: script, Args: []string{"claude"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "gemini", Command: script, Args: []string{"gemini"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "codex", Command: script, Args: []string{"codex"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+	}
+	cfgDir := t.TempDir()
+	writeTestConfig(t, cfgDir, cfg)
+
+	stdout, stderr, err := runMakewand(t, bin, cfgDir, "--print", "--repo-trust=untrusted", "--timeout=5s", "please review.")
+	if err == nil {
+		t.Fatalf("runMakewand(--repo-trust=untrusted) expected non-zero exit (fail closed)\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	// The actionable untrusted-repo message must be surfaced instead of a raw error.
+	if !strings.Contains(stderr, "Untrusted repository mode is active") {
+		t.Fatalf("stderr = %q, want untrusted-repo actionable message", stderr)
+	}
+	// No subscription CLI provider may run in untrusted mode.
+	if strings.Contains(stdout, "provider:") {
+		t.Fatalf("stdout = %q, want no provider output when routing fails closed", stdout)
+	}
+}
+
+// TestE2EPrintTrustedRepoStaysGreen guards that the default (trusted) behavior is
+// unchanged when --repo-trust is omitted or set to trusted: the subscription CLI
+// fixture still runs and produces provider output.
+func TestE2EPrintTrustedRepoStaysGreen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based E2E fixtures are Unix-only")
+	}
+
+	bin := buildMakewandBinary(t)
+	script := writeProviderScript(t)
+
+	cfg := config.DefaultConfig()
+	cfg.CustomProviders = []config.CustomProvider{
+		{Name: "claude", Command: script, Args: []string{"claude"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "gemini", Command: script, Args: []string{"gemini"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "codex", Command: script, Args: []string{"codex"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+	}
+	cfgDir := t.TempDir()
+	writeTestConfig(t, cfgDir, cfg)
+
+	stdout, stderr, err := runMakewand(t, bin, cfgDir, "--print", "--repo-trust=trusted", "--timeout=5s", "please review.")
+	if err != nil {
+		t.Fatalf("runMakewand(--repo-trust=trusted) error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "provider:gemini" {
+		t.Fatalf("stdout = %q, want %q", got, "provider:gemini")
+	}
+}
+
+// TestE2EPrintHeadlessHonorsLanguage verifies that the headless (--print) path
+// applies cfg.Language: a zh-configured user must see the untrusted-mode refusal
+// in Chinese, not English. This guards against the headless entry skipping the
+// i18n.SetLanguage call that the TUI's NewApp performs.
+func TestE2EPrintHeadlessHonorsLanguage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based E2E fixtures are Unix-only")
+	}
+
+	bin := buildMakewandBinary(t)
+	script := writeProviderScript(t)
+
+	cfg := config.DefaultConfig()
+	cfg.Language = "zh"
+	// Only unsafe subscription CLI providers → untrusted mode fails closed and
+	// surfaces the localized refusal message.
+	cfg.CustomProviders = []config.CustomProvider{
+		{Name: "claude", Command: script, Args: []string{"claude"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "gemini", Command: script, Args: []string{"gemini"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "codex", Command: script, Args: []string{"codex"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+	}
+	cfgDir := t.TempDir()
+	writeTestConfig(t, cfgDir, cfg)
+
+	stdout, stderr, err := runMakewand(t, bin, cfgDir, "--print", "--repo-trust=untrusted", "--timeout=5s", "please review.")
+	if err == nil {
+		t.Fatalf("runMakewand(zh untrusted) expected non-zero exit (fail closed)\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	// The zh untrusted-repo message must be surfaced (not the English one).
+	if !strings.Contains(stderr, "已启用不可信仓库模式") {
+		t.Fatalf("stderr = %q, want zh untrusted-repo message", stderr)
+	}
+	if strings.Contains(stderr, "Untrusted repository mode is active") {
+		t.Fatalf("stderr = %q, unexpected English message for zh config", stderr)
 	}
 }
 
@@ -256,7 +368,7 @@ func writeProviderScript(t *testing.T) string {
 	body := "#!/bin/sh\n" +
 		"provider=\"$1\"\n" +
 		"printf 'provider:%s\\n' \"$provider\"\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(provider script): %v", err)
 	}
 	return script
@@ -273,7 +385,7 @@ func writeCandidateProviderScript(t *testing.T) string {
 		"else\n" +
 		"printf '%s\\n' '--- FILE: calc.go ---' '```' 'package headlessautopilot' '' 'func Multiply(a, b int) int {' '    return a * b' '}' '```'\n" +
 		"fi\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(candidate provider script): %v", err)
 	}
 	return script
@@ -340,9 +452,29 @@ func runMakewandInDir(t *testing.T, workdir, bin, cfgDir string, args ...string)
 }
 
 func isolatedCLIEnv(cfgDir string) []string {
-	env := make([]string, 0, len(os.Environ())+2)
+	env := make([]string, 0, len(os.Environ())+4)
 	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, "PATH=") || strings.HasPrefix(entry, "MAKEWAND_CONFIG_DIR=") {
+		// HOME/XDG must be isolated too: quota-aware routing reads the real
+		// user's ~/.claude, ~/.codex, and agy login state (via os.UserHomeDir)
+		// to compute per-provider quota bands. Leaking the host's live quota
+		// data makes cold-start routing non-deterministic (bands shift between
+		// runs), so point HOME at the empty isolated config dir instead.
+		// Provider API keys and remote-backend env would override the test's
+		// config (config.go layers env keys over the file; a remote URL/token
+		// switches the Router to the remote provider entirely), making routing
+		// non-hermetic on developer machines. Strip them so the fixture config
+		// is authoritative.
+		if strings.HasPrefix(entry, "PATH=") ||
+			strings.HasPrefix(entry, "MAKEWAND_CONFIG_DIR=") ||
+			strings.HasPrefix(entry, "MAKEWAND_UNSAFE_HOST_EXEC=") ||
+			strings.HasPrefix(entry, "HOME=") ||
+			strings.HasPrefix(entry, "XDG_CONFIG_HOME=") ||
+			strings.HasPrefix(entry, "XDG_CACHE_HOME=") ||
+			strings.HasPrefix(entry, "ANTHROPIC_API_KEY=") ||
+			strings.HasPrefix(entry, "GEMINI_API_KEY=") ||
+			strings.HasPrefix(entry, "OPENAI_API_KEY=") ||
+			strings.HasPrefix(entry, "MAKEWAND_REMOTE_URL=") ||
+			strings.HasPrefix(entry, "MAKEWAND_REMOTE_TOKEN=") {
 			continue
 		}
 		env = append(env, entry)
@@ -350,34 +482,14 @@ func isolatedCLIEnv(cfgDir string) []string {
 	env = append(env,
 		"MAKEWAND_CONFIG_DIR="+cfgDir,
 		"PATH="+cfgDir,
+		"HOME="+cfgDir,
+		// Candidate verification fails closed without bubblewrap isolation.
+		// E2E hosts may lack bwrap, and every provider here is a local shell
+		// fixture we wrote ourselves, so we explicitly opt into host execution
+		// instead of weakening the production fail-closed logic.
+		"MAKEWAND_UNSAFE_HOST_EXEC=1",
 	)
 	return env
-}
-
-func stripANSIForTest(s string) string {
-	var b strings.Builder
-	inEscape := false
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if !inEscape && ch == 0x1b {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '\\' {
-				inEscape = false
-			}
-			continue
-		}
-		if ch == '\r' {
-			continue
-		}
-		if ch < 0x20 && ch != '\n' && ch != '\t' {
-			continue
-		}
-		b.WriteByte(ch)
-	}
-	return b.String()
 }
 
 type doctorJSONReport struct {

@@ -3,11 +3,22 @@ package engine
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
+// allowHostExecForTest opts verification into direct host execution via the
+// documented escape hatch so unit tests do not depend on bubblewrap being
+// installed. Sandbox wrapping itself is covered by verify_isolation_test.go.
+func allowHostExecForTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
+}
+
 func newVerificationProject(t *testing.T) *Project {
 	t.Helper()
+	allowHostExecForTest(t)
 
 	project, err := NewProject("verify-project", t.TempDir())
 	if err != nil {
@@ -40,6 +51,41 @@ func TestAdd(t *testing.T) {
 	if got := Add(2, 2); got != 4 {
 		t.Fatalf("Add(2,2) = %d, want 4", got)
 	}
+}
+`,
+		},
+	}
+	if err := project.WriteFiles(files); err != nil {
+		t.Fatalf("WriteFiles: %v", err)
+	}
+	if err := project.ScanFiles(); err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
+	return project
+}
+
+func newTestlessVerificationProject(t *testing.T) *Project {
+	t.Helper()
+	allowHostExecForTest(t)
+
+	project, err := NewProject("verify-notests", t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+	files := []ExtractedFile{
+		{
+			Path: "go.mod",
+			Content: `module example.com/verifynotests
+
+go 1.22
+`,
+		},
+		{
+			Path: "math.go",
+			Content: `package verifynotests
+
+func Add(a, b int) int {
+	return a + b
 }
 `,
 		},
@@ -188,6 +234,262 @@ func TestFileCheckpoint_Restore(t *testing.T) {
 	}
 }
 
+func TestEvaluateCandidateFiles_FailsClosedWithoutIsolation(t *testing.T) {
+	project := newVerificationProject(t)
+	fakeMissingBwrap(t) // overrides the env opt-in from the fixture helper
+
+	report, err := project.EvaluateCandidateFiles(context.Background(), []ExtractedFile{{
+		Path: "math.go",
+		Content: `package verify
+
+func Add(a, b int) int {
+	return a + b
+}
+`,
+	}})
+	if err != nil {
+		t.Fatalf("EvaluateCandidateFiles: %v", err)
+	}
+	if report.Passed {
+		t.Fatal("report.Passed = true, want false when isolation is unavailable")
+	}
+	if report.Strength != 0 {
+		t.Fatalf("report.Strength = %d, want 0", report.Strength)
+	}
+	if !strings.Contains(report.IsolationError, "bubblewrap") {
+		t.Fatalf("report.IsolationError = %q, want bubblewrap reason", report.IsolationError)
+	}
+	if report.Isolated {
+		t.Fatal("report.Isolated = true, want false")
+	}
+	if len(report.QuickCheckResults) != 0 || report.DepsResult != nil || report.TestsResult != nil {
+		t.Fatalf("no command should execute without isolation; report=%+v", report)
+	}
+}
+
+func TestEvaluateCandidateFiles_RestoresBaselineTests(t *testing.T) {
+	project := newVerificationProject(t)
+
+	// The candidate breaks Add and rewrites the baseline test so its own copy
+	// would pass. Verification must judge it against the baseline test.
+	report, err := project.EvaluateCandidateFiles(context.Background(), []ExtractedFile{
+		{
+			Path: "math.go",
+			Content: `package verify
+
+func Add(a, b int) int {
+	return a - b
+}
+`,
+		},
+		{
+			Path: "math_test.go",
+			Content: `package verify
+
+import "testing"
+
+func TestAdd(t *testing.T) {
+	if got := Add(2, 2); got != 0 {
+		t.Fatalf("Add(2,2) = %d, want 0", got)
+	}
+}
+`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateCandidateFiles: %v", err)
+	}
+	if report.Passed {
+		t.Fatal("report.Passed = true, want false against restored baseline tests")
+	}
+	if report.TestsError == "" {
+		t.Fatal("report.TestsError = empty, want baseline test failure details")
+	}
+	if len(report.RestoredTests) != 1 || report.RestoredTests[0] != "math_test.go" {
+		t.Fatalf("report.RestoredTests = %v, want [math_test.go]", report.RestoredTests)
+	}
+}
+
+func TestEvaluateCandidateFiles_NoTestFilesCapsStrength(t *testing.T) {
+	project := newTestlessVerificationProject(t)
+
+	report, err := project.EvaluateCandidateFiles(context.Background(), []ExtractedFile{{
+		Path: "math.go",
+		Content: `package verifynotests
+
+func Add(a, b int) int {
+	return b + a
+}
+`,
+	}})
+	if err != nil {
+		t.Fatalf("EvaluateCandidateFiles: %v", err)
+	}
+	if !report.Passed {
+		t.Fatalf("report.Passed = false, want true (tests error: %q)", report.TestsError)
+	}
+	if report.Strength != 1 {
+		t.Fatalf("report.Strength = %d, want 1 when no tests ran", report.Strength)
+	}
+	if !report.NoTestsRan {
+		t.Fatal("report.NoTestsRan = false, want true")
+	}
+	if report.BaselineTests {
+		t.Fatal("report.BaselineTests = true, want false for a module without test files")
+	}
+}
+
+func TestEvaluateCandidateFiles_CandidateAddedTestsDoNotRaiseStrength(t *testing.T) {
+	project := newTestlessVerificationProject(t)
+
+	report, err := project.EvaluateCandidateFiles(context.Background(), []ExtractedFile{
+		{
+			Path: "math.go",
+			Content: `package verifynotests
+
+func Add(a, b int) int {
+	return b + a
+}
+`,
+		},
+		{
+			Path: "math_test.go",
+			Content: `package verifynotests
+
+import "testing"
+
+func TestAdd(t *testing.T) {
+	if got := Add(1, 2); got != 3 {
+		t.Fatalf("Add(1,2) = %d, want 3", got)
+	}
+}
+`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateCandidateFiles: %v", err)
+	}
+	if !report.Passed {
+		t.Fatalf("report.Passed = false, want true (tests error: %q)", report.TestsError)
+	}
+	if report.Strength != 1 {
+		t.Fatalf("report.Strength = %d, want 1 for candidate-provided tests", report.Strength)
+	}
+}
+
+func TestDetectNoTestsRun(t *testing.T) {
+	tests := []struct {
+		name   string
+		plan   ExecPlan
+		result *ExecResult
+		want   bool
+	}{
+		{
+			name:   "go with passing tests",
+			plan:   ExecPlan{Command: "go"},
+			result: &ExecResult{Stdout: "ok  \texample.com/verify\t0.002s\n"},
+			want:   false,
+		},
+		{
+			name:   "go without test files",
+			plan:   ExecPlan{Command: "go"},
+			result: &ExecResult{Stdout: "?   \texample.com/verify\t[no test files]\n"},
+			want:   true,
+		},
+		{
+			name:   "go with no tests to run",
+			plan:   ExecPlan{Command: "go"},
+			result: &ExecResult{Stdout: "ok  \texample.com/verify\t0.002s [no tests to run]\n"},
+			want:   true,
+		},
+		{
+			name:   "pytest no tests ran",
+			plan:   ExecPlan{Command: "pytest"},
+			result: &ExecResult{Stdout: "no tests ran in 0.01s\n"},
+			want:   true,
+		},
+		{
+			name:   "npm missing test script",
+			plan:   ExecPlan{Command: "npm"},
+			result: &ExecResult{Stderr: "Error: no test specified\n"},
+			want:   true,
+		},
+		{
+			name:   "npm node --test zero tests",
+			plan:   ExecPlan{Command: "npm"},
+			result: &ExecResult{Stdout: "# tests 0\n# pass 0\n# fail 0\n"},
+			want:   true,
+		},
+		{
+			name:   "npm node --test spec zero tests",
+			plan:   ExecPlan{Command: "npm"},
+			result: &ExecResult{Stdout: "ℹ tests 0\nℹ pass 0\n"},
+			want:   true,
+		},
+		{
+			name:   "npm zero tests phrase",
+			plan:   ExecPlan{Command: "npm"},
+			result: &ExecResult{Stdout: "found 0 tests\n"},
+			want:   true,
+		},
+		{
+			name:   "npm node --test ten tests",
+			plan:   ExecPlan{Command: "npm"},
+			result: &ExecResult{Stdout: "# tests 10\n# pass 10\n# fail 0\n"},
+			want:   false,
+		},
+		{
+			name:   "cargo zero tests",
+			plan:   ExecPlan{Command: "cargo"},
+			result: &ExecResult{Stdout: "running 0 tests\n"},
+			want:   true,
+		},
+		{
+			name:   "cargo with tests",
+			plan:   ExecPlan{Command: "cargo"},
+			result: &ExecResult{Stdout: "running 0 tests\nrunning 3 tests\n"},
+			want:   false,
+		},
+		{
+			name: "missing result",
+			plan: ExecPlan{Command: "go"},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		if got := detectNoTestsRun(tt.plan, tt.result); got != tt.want {
+			t.Fatalf("%s: detectNoTestsRun() = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestMergeCandidateFiles_CloneDiffWins(t *testing.T) {
+	reported := []ExtractedFile{
+		{Path: "calc.go", Content: "reported"},
+		{Path: "docs.md", Content: "docs"},
+	}
+	cloneDiff := []ExtractedFile{
+		{Path: "calc.go", Content: "clone"},
+		{Path: "extra.go", Content: "extra"},
+	}
+
+	merged := mergeCandidateFiles(reported, cloneDiff)
+	if len(merged) != 3 {
+		t.Fatalf("len(merged) = %d, want 3", len(merged))
+	}
+	byPath := make(map[string]string, len(merged))
+	for _, f := range merged {
+		byPath[f.Path] = f.Content
+	}
+	if byPath["calc.go"] != "clone" {
+		t.Fatalf("calc.go content = %q, want clone diff to win", byPath["calc.go"])
+	}
+	if byPath["extra.go"] != "extra" || byPath["docs.md"] != "docs" {
+		t.Fatalf("merged = %v, want union of both sets", byPath)
+	}
+}
+
 func TestChangedFilesAgainst_ReturnsAddedAndModifiedFiles(t *testing.T) {
 	project := newVerificationProject(t)
 	clone, err := project.CloneToTemp()
@@ -223,5 +525,32 @@ func Add(a, b int) int {
 	}
 	if files[0].Path != "extra.txt" || files[1].Path != "math.go" {
 		t.Fatalf("paths = (%s, %s), want (extra.txt, math.go)", files[0].Path, files[1].Path)
+	}
+}
+
+func TestChangedFilesAgainstWithDeletions_DetectsDeletedBaselineFiles(t *testing.T) {
+	project := newVerificationProject(t)
+	clone, err := project.CloneToTemp()
+	if err != nil {
+		t.Fatalf("CloneToTemp: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(clone.Path) }()
+
+	if err := os.Remove(filepath.Join(clone.Path, "math.go")); err != nil {
+		t.Fatalf("Remove(math.go): %v", err)
+	}
+	if err := clone.WriteFiles([]ExtractedFile{{Path: "extra.txt", Content: "hello"}}); err != nil {
+		t.Fatalf("WriteFiles: %v", err)
+	}
+
+	files, deleted, err := clone.ChangedFilesAgainstWithDeletions(project)
+	if err != nil {
+		t.Fatalf("ChangedFilesAgainstWithDeletions: %v", err)
+	}
+	if len(files) != 1 || files[0].Path != "extra.txt" {
+		t.Fatalf("files = %v, want only extra.txt", files)
+	}
+	if len(deleted) != 1 || deleted[0] != "math.go" {
+		t.Fatalf("deleted = %v, want [math.go]", deleted)
 	}
 }

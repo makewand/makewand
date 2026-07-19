@@ -3,7 +3,6 @@ package router
 import (
 	"context"
 	"testing"
-	"time"
 )
 
 // makeRouter creates a Router struct literal with stub providers wired for the given mode.
@@ -20,7 +19,7 @@ func makeRouter(t *testing.T, mode UsageMode, provs map[string]*stubProvider) *R
 		providers[name] = stub
 		// Cache entries for all tiers so resolveProvider never hits a real resolver.
 		for _, tier := range []ModelTier{TierCheap, TierMid, TierPremium} {
-			if models, ok := modelTable[name]; ok {
+			if models, ok := baseTables.modelsFor(name); ok {
 				cache[providerKey{name: name, modelID: models[tier]}] = stub
 			}
 		}
@@ -126,17 +125,18 @@ func TestModeRouting_BalancedModeStaticPrimaries(t *testing.T) {
 
 func TestModeRouting_PowerModeTierIsPremium(t *testing.T) {
 	// Verify the strategy table entries for Power mode use TierPremium.
-	for task, entry := range strategyTable[ModePower] {
+	// baseTables is immutable after init, so direct reads are race-free.
+	for task, entry := range baseTables.strategies[ModePower] {
 		if entry.Tier != TierPremium {
 			t.Errorf("strategyTable[ModePower][%d].Tier = %v, want TierPremium", task, entry.Tier)
 		}
 	}
 	// Verify models resolve to premium IDs.
-	wantClaude := modelTable["claude"][TierPremium]
+	wantClaude := testModelID("claude", TierPremium)
 	if wantClaude != "claude-opus-4-20250514" {
 		t.Errorf("modelTable[claude][TierPremium] = %q, want %q", wantClaude, "claude-opus-4-20250514")
 	}
-	wantGemini := modelTable["gemini"][TierPremium]
+	wantGemini := testModelID("gemini", TierPremium)
 	if wantGemini != "gemini-2.5-pro" {
 		t.Errorf("modelTable[gemini][TierPremium] = %q, want %q", wantGemini, "gemini-2.5-pro")
 	}
@@ -426,10 +426,4 @@ func TestModeRouting_RegisterProviderAndRoute(t *testing.T) {
 	if content != "ok" {
 		t.Errorf("content = %q, want %q", content, "ok")
 	}
-}
-
-// --- Helper: freeze breaker clock for deterministic circuit tests ---
-
-func freezeBreakerClock(r *Router, now time.Time) {
-	r.breaker.now = func() time.Time { return now }
 }
