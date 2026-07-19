@@ -12,7 +12,6 @@ type Messages struct {
 	// General
 	AppName     string
 	AppTagline  string
-	Version     string
 	Yes         string
 	No          string
 	Confirm     string
@@ -231,7 +230,6 @@ type Messages struct {
 var en = Messages{
 	AppName:     "makewand",
 	AppTagline:  "Multi-provider coding router for terminal makers",
-	Version:     "v0.1.10",
 	Yes:         "Yes",
 	No:          "No",
 	Confirm:     "Confirm",
@@ -457,7 +455,6 @@ var en = Messages{
 var zh = Messages{
 	AppName:     "makewand",
 	AppTagline:  "面向终端开发者的多模型编码路由器",
-	Version:     "v0.1.10",
 	Yes:         "是",
 	No:          "否",
 	Confirm:     "确认",

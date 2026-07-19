@@ -27,7 +27,16 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y expect
+          sudo apt-get install -y expect bubblewrap
+
+      - name: Live sandbox smoke (bubblewrap required, not cached)
+        # A release must never ship without the security-critical bwrap isolation
+        # path validated. MAKEWAND_REQUIRE_BWRAP=1 makes an unavailable sandbox a
+        # hard failure; -count=1 defeats the test cache. The release job depends on
+        # this job, so a broken sandbox blocks the release.
+        env:
+          MAKEWAND_REQUIRE_BWRAP: "1"
+        run: go test ./internal/engine -run '^TestEvaluateCandidateFiles_LiveBwrapIsolation$' -count=1 -v
 
       - name: Run tests
         run: bash ./scripts/test_gate.sh
@@ -75,7 +84,7 @@ jobs:
             mkdir -p "${outdir}"
 
             CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-              go build -trimpath -ldflags "-s -w -X main.version=${VERSION_NO_V}" \
+              go build -trimpath -ldflags "-s -w -X github.com/makewand/makewand/internal/buildinfo.Version=${VERSION} -X github.com/makewand/makewand/internal/buildinfo.Commit=${GITHUB_SHA:0:7}" \
               -o "${outdir}/${bin}" ./cmd/makewand
 
             if [ "$goos" = "windows" ]; then
@@ -92,6 +101,11 @@ jobs:
           build_one windows amd64
 
           (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+
+          # Fail the release if the built binary's version does not match the tag.
+          # This guards against ldflags drift silently shipping a "dev" build
+          # (the runner is linux/amd64, so verify that native artifact).
+          bash scripts/release_contract.sh "dist/makewand_${VERSION}_linux_amd64/makewand" "${VERSION}"
 
       - name: Generate Homebrew/Scoop manifests
         shell: bash

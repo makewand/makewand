@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/makewand/makewand/internal/buildinfo"
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
@@ -680,7 +681,7 @@ func (a App) viewHeader() string {
 		left = left + " " + badge
 	}
 
-	right := mutedStyle.Render(msg.Version)
+	right := mutedStyle.Render(buildinfo.VersionString())
 
 	if avail := a.router.Available(); len(avail) > 0 {
 		models := strings.Join(avail, " | ")

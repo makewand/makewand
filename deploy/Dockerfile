@@ -1,7 +1,12 @@
 FROM golang:1.25 AS build
 WORKDIR /src
 COPY . .
-RUN go build -trimpath -o /out/makewand ./cmd/makewand
+# Stamp the version into internal/buildinfo so `makewand version` in the image is
+# accurate. Pass --build-arg MAKEWAND_VERSION=vX.Y.Z at build time; defaults to "dev".
+ARG MAKEWAND_VERSION=dev
+RUN go build -trimpath \
+      -ldflags "-s -w -X github.com/makewand/makewand/internal/buildinfo.Version=${MAKEWAND_VERSION}" \
+      -o /out/makewand ./cmd/makewand
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*

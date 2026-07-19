@@ -54,7 +54,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y expect
+          # bubblewrap so the live sandbox isolation test (verify_isolation_live_test.go)
+          # actually runs instead of skipping — the generation/verification trust
+          # boundary is security-critical and must be exercised end-to-end in CI.
+          sudo apt-get install -y expect bubblewrap
 
       - name: Check formatting (gofmt)
         shell: bash
@@ -70,6 +73,15 @@ jobs:
             echo "${unformatted}"
             exit 1
           fi
+
+      - name: Live sandbox smoke (bubblewrap required, not cached)
+        # The verification/generation trust boundary is security-critical, so the
+        # real bwrap sandbox must be exercised on every run — not silently skipped
+        # if bubblewrap is missing or broken. MAKEWAND_REQUIRE_BWRAP=1 turns an
+        # unavailable sandbox into a hard failure; -count=1 defeats the test cache.
+        env:
+          MAKEWAND_REQUIRE_BWRAP: "1"
+        run: go test ./internal/engine -run '^TestEvaluateCandidateFiles_LiveBwrapIsolation$' -count=1 -v
 
       - name: Run tests
         run: bash ./scripts/test_gate.sh
@@ -89,10 +101,10 @@ jobs:
           # Pin the linter version so `latest` can't silently drift and break CI
           # again (a v2 bump against a v1 config is what wedged this pipeline).
           version: v2.12.2
-          # Gate only issues introduced by the change, not the pre-existing debt
-          # in the codebase. New code is still linted; the historical backlog is
-          # tracked separately rather than blocking every PR.
-          only-new-issues: true
+          # Full-tree gate: the historical backlog was driven to zero, so lint the
+          # whole codebase (not just changed lines) to keep it there. Flip back to
+          # only-new-issues only if an intentional, tracked backlog is reintroduced.
+          only-new-issues: false
 
       - name: Build CLI
         run: go build -trimpath -o build/makewand ./cmd/makewand

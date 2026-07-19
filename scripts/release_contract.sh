@@ -61,15 +61,20 @@ for subcmd in "${subcommands[@]}"; do
 done
 echo "✓ Subcommands respond to --help"
 
-# 4. Version tag verification (if provided)
+# 4. Version tag verification (if provided) — a mismatch is a HARD failure so a
+# release cannot ship a binary stamped "dev" (ldflags drift) under a real tag.
 if [[ -n "$VERSION_TAG" ]]; then
   echo ""
   echo "--- Version Tag Verification ---"
-  if ! echo "$VERSION_OUTPUT" | grep -q "$VERSION_TAG"; then
-    echo "⚠ Binary version ($VERSION_OUTPUT) doesn't match tag ($VERSION_TAG)"
-  else
-    echo "✓ Binary version matches tag: $VERSION_TAG"
+  # Extract the version token (3rd field of "makewand version <ver> (<commit>)")
+  # and require an EXACT match. A substring check would let a suffixed build
+  # (e.g. "v0.2.0-dirty" or "v0.2.0-extra") pass under a "v0.2.0" tag.
+  BIN_VERSION="$(printf '%s\n' "$VERSION_OUTPUT" | awk '{print $3}')"
+  if [[ "$BIN_VERSION" != "$VERSION_TAG" ]]; then
+    echo "❌ Binary version ($BIN_VERSION) doesn't exactly match tag ($VERSION_TAG); full: $VERSION_OUTPUT"
+    exit 1
   fi
+  echo "✓ Binary version matches tag exactly: $VERSION_TAG"
 fi
 
 echo ""
