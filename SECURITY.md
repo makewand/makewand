@@ -29,8 +29,8 @@ Concretely, this means:
 
 - **Your own code**: the trusted default is appropriate. The risk is comparable to running the underlying CLI on your own project.
   **你自己的代码**：默认的可信模式即可，风险与你在自己项目上跑该 CLI 相当。
-- **Untrusted third-party code** (a cloned repo you do not control): treat generation as running those provider CLIs directly on hostile input. Until a dedicated untrusted-repo mode exists, run makewand inside a VM, container, or a separate low-privilege user for such repositories. makewand does **not** currently claim to safely process hostile third-party repositories.
-  **不可信的第三方代码**（你无法掌控的克隆仓库）：请把生成阶段视为在敌对输入上直接运行这些 provider CLI。在专门的不可信仓库模式落地前，处理这类仓库请在 VM、容器或独立的低权限用户下运行 makewand。makewand 目前**不**声称能安全处理敌对的第三方仓库。
+- **Untrusted third-party code** (a cloned repo you do not control): pass `--repo-trust=untrusted`. In that mode makewand routes generation only to direct API providers or a remote makewand server (never a local repo-aware CLI) and fails closed if none is configured, and it stops treating repo-provided `.makewand/rules.md` as trusted instructions. This is capability routing, not a full sandbox: repository content (file tree, key-file summaries, review text) is still sent to the API provider as untrusted input, and it does not harden a remote makewand server the request is forwarded to. For genuinely hostile code, still run makewand inside a VM, container, or a separate low-privilege user. makewand does **not** claim to safely execute arbitrary hostile third-party code.
+  **不可信的第三方代码**（你无法掌控的克隆仓库）：请加 `--repo-trust=untrusted`。该模式下生成只路由到直接 API provider（绝不用会读取仓库的本地 CLI），未配置则 fail-closed；且不再把仓库的 `.makewand/rules.md` 当作可信指令。这是能力路由，不是完整沙箱：仓库内容（文件树、关键文件摘要、review 文本）仍会作为不可信输入发给 API provider，也不加固请求转发到的远端 makewand server。处理真正敌对的代码，仍请在 VM、容器或独立低权限用户下运行。makewand **不**声称能安全执行任意敌对的第三方代码。
 
 ## Supported Versions
 

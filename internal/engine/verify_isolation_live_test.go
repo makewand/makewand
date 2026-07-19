@@ -2,18 +2,24 @@ package engine
 
 import (
 	"context"
+	"os"
 	"testing"
 )
 
 // TestEvaluateCandidateFiles_LiveBwrapIsolation exercises the real bubblewrap
 // sandbox end-to-end. It skips when isolation is not available on the host so
-// the suite never depends on bwrap being installed.
+// the suite never depends on bwrap being installed — UNLESS MAKEWAND_REQUIRE_BWRAP=1
+// (set by CI/release), in which case an unavailable sandbox is a hard failure so
+// the security-critical isolation path can never silently go unexercised.
 func TestEvaluateCandidateFiles_LiveBwrapIsolation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live sandbox test in short mode")
 	}
 	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "0")
 	if !VerificationIsolationActive() {
+		if os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
+			t.Fatalf("MAKEWAND_REQUIRE_BWRAP=1 but bubblewrap isolation is unavailable: %v", RestrictedExecIsolationError())
+		}
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError())
 	}
 

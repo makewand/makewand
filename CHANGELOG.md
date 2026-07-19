@@ -34,6 +34,36 @@ All notable changes to this project are documented here. The format is based on
   through `agy` (the successor to the retired individual `gemini` CLI OAuth). When
   installed, `agy` takes the Gemini provider slot automatically; `MAKEWAND_AGY_MODEL`
   overrides the model.
+- **Untrusted-repository mode (`--repo-trust=trusted|untrusted`).** For cloned
+  third-party repositories you do not control, `--repo-trust=untrusted` routes
+  generation only to direct API providers (never a local repo-aware CLI) and fails
+  closed if none is configured, stops injecting the repo's `.makewand/rules.md` as
+  trusted instructions, and skips local-CLI health/quota probes in the repo's cwd.
+  The flag is validated globally and honored by `serve`, `doctor`, and `quota`.
+  Default is `trusted` (unchanged behavior). See SECURITY.md for the boundary.
+
+### Security
+
+- **Candidate verification is sandboxed and fail-closed.** Test/build/dependency
+  commands for generated candidates run inside a bubblewrap sandbox (read-only
+  root, writable workspace, cleared environment, `--unshare-net` for test/build
+  steps); when strong isolation is unavailable, verification does not execute
+  unless `MAKEWAND_UNSAFE_HOST_EXEC=1` is set. Baseline `*_test.go` and npm test
+  scripts are restored before judging, "no tests" cannot reach a passing strength,
+  and `.git`/CI config/scripts are protected write paths. Static preview serves via
+  `python3 -I` so a repo-local `sitecustomize.py`/`http` package cannot execute.
+- **Router instance isolation.** Strategy/pricing tables and provider factories are
+  per-`Router` (no shared mutable package state); overrides deep-merge at field
+  granularity with strict validation, and hot-reload recomputes from immutable
+  defaults.
+- **Multi-user server authorization.** Remote sessions are namespaced per
+  user/org/project; delegated tokens cannot widen scopes/allowlists/quota beyond
+  their issuer; self-registration creates inactive accounts in a single write;
+  login rate-limiting ignores forwarded-IP headers unless a `--trusted-proxy` is
+  configured. Public registration is a separate opt-in (`--enable-registration`).
+- Trust boundary documented in SECURITY.md (verification/preview are sandboxed;
+  generation runs provider CLIs on the host), with a one-time runtime notice on
+  first local-CLI generation.
 
 ### Changed
 
