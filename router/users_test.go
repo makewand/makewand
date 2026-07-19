@@ -15,6 +15,38 @@ import (
 	"github.com/makewand/makewand/serverteam"
 )
 
+func TestUserStore_CreateUserWithRoleActive_PersistsInactiveInOneWrite(t *testing.T) {
+	storeDir := t.TempDir()
+	store := NewUserStore(storeDir)
+
+	user, err := store.CreateUserWithRoleActive("new@example.com", "password123", UserRoleMember, false)
+	if err != nil {
+		t.Fatalf("CreateUserWithRoleActive() error = %v", err)
+	}
+	if user.IsActive {
+		t.Fatal("returned user should be inactive")
+	}
+
+	// Reload from disk: the very first persisted state must already be inactive,
+	// with no active window and no dependence on a follow-up deactivation.
+	reloaded, err := store.GetUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID() error = %v", err)
+	}
+	if reloaded.IsActive {
+		t.Fatal("persisted account should be inactive on first write")
+	}
+
+	// The default create path stays active for admin-created flows.
+	active, err := store.CreateUser("active@example.com", "password123")
+	if err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+	if !active.IsActive {
+		t.Fatal("CreateUser should default to active")
+	}
+}
+
 func TestUserStore_CreateUserPersistsAndValidatesPassword(t *testing.T) {
 	storeDir := t.TempDir()
 	store := NewUserStore(storeDir)
@@ -114,7 +146,7 @@ func TestUserStore_SetUserPassword(t *testing.T) {
 
 func TestHTTPHandlerWithUsers_RegisterUserAndKeepModelAuth(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -122,7 +154,7 @@ func TestHTTPHandlerWithUsers_RegisterUserAndKeepModelAuth(t *testing.T) {
 		CodingModel:  "claude",
 	})
 	store := NewUserStore(t.TempDir())
-	handler := r.HTTPHandlerWithUsers(store, HTTPHandlerOptions{BearerToken: "secret123"})
+	handler := r.HTTPHandlerWithUsers(store, UserEndpointOptions{EnableRegistration: true, ActivateOnRegistration: true}, HTTPHandlerOptions{BearerToken: "secret123"})
 
 	body := `{"email":"User@example.com","password":"password123"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/users/register", bytes.NewBufferString(body))
@@ -165,8 +197,8 @@ func TestHTTPHandlerWithUsers_RegisterUserAndKeepModelAuth(t *testing.T) {
 }
 
 func TestHTTPHandlerWithUsers_RejectsInvalidRegistration(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
-	handler := r.HTTPHandlerWithUsers(NewUserStore(t.TempDir()))
+	r := mustNewRouter(RouterConfig{})
+	handler := r.HTTPHandlerWithUsers(NewUserStore(t.TempDir()), UserEndpointOptions{EnableRegistration: true})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/users/register", bytes.NewBufferString(`{"email":"bad-email","password":"short"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -180,7 +212,7 @@ func TestHTTPHandlerWithUsers_RejectsInvalidRegistration(t *testing.T) {
 
 func TestHTTPHandlerWithUsers_LoginIssuesToken(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -203,7 +235,7 @@ func TestHTTPHandlerWithUsers_LoginIssuesToken(t *testing.T) {
 	}
 	defer tokenStore.Close()
 
-	handler := r.HTTPHandlerWithUsers(userStore, HTTPHandlerOptions{UserTokenManager: tokenStore})
+	handler := r.HTTPHandlerWithUsers(userStore, UserEndpointOptions{}, HTTPHandlerOptions{UserTokenManager: tokenStore})
 	req := httptest.NewRequest(http.MethodPost, "/v1/users/login", bytes.NewBufferString(`{"email":"admin@example.com","password":"password123"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -233,7 +265,7 @@ func TestHTTPHandlerWithUsers_LoginIssuesToken(t *testing.T) {
 
 func TestHTTPHandlerWithUsers_LoginScopesMemberToProjectMembership(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -278,7 +310,7 @@ func TestHTTPHandlerWithUsers_LoginScopesMemberToProjectMembership(t *testing.T)
 	}
 	defer tokenStore.Close()
 
-	handler := r.HTTPHandlerWithUsers(userStore, HTTPHandlerOptions{
+	handler := r.HTTPHandlerWithUsers(userStore, UserEndpointOptions{}, HTTPHandlerOptions{
 		UserTokenManager: tokenStore,
 		TeamStore:        teamStore,
 	})
@@ -300,7 +332,7 @@ func TestHTTPHandlerWithUsers_LoginScopesMemberToProjectMembership(t *testing.T)
 }
 
 func TestHTTPHandlerWithUsers_RateLimitsFailedLogins(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 	store := NewUserStore(t.TempDir())
 	if _, err := store.CreateUser("member@example.com", "password123"); err != nil {
 		t.Fatalf("CreateUser: %v", err)
@@ -310,7 +342,7 @@ func TestHTTPHandlerWithUsers_RateLimitsFailedLogins(t *testing.T) {
 		t.Fatalf("OpenSQLiteStore(tokens): %v", err)
 	}
 	defer tokenStore.Close()
-	handler := r.HTTPHandlerWithUsers(store, HTTPHandlerOptions{
+	handler := r.HTTPHandlerWithUsers(store, UserEndpointOptions{}, HTTPHandlerOptions{
 		UserTokenManager: tokenStore,
 		UserLoginLimiter: serverauth.NewLoginRateLimiter(2, time.Minute, time.Minute),
 	})

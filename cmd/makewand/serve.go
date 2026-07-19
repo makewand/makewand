@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
@@ -30,16 +33,19 @@ import (
 
 func serveCmd() *cobra.Command {
 	var (
-		listenAddr   string
-		token        string
-		dataDir      string
-		authConfig   string
-		auditPath    string
-		usagePath    string
-		alertWebhook string
-		alertState   string
-		stateDBPath  string
-		enableUsers  bool
+		listenAddr         string
+		token              string
+		dataDir            string
+		authConfig         string
+		auditPath          string
+		usagePath          string
+		alertWebhook       string
+		alertState         string
+		stateDBPath        string
+		enableUsers        bool
+		enableRegistration bool
+		trustedProxies     []string
+		unsafeNoTLS        bool
 	)
 
 	cmd := &cobra.Command{
@@ -47,6 +53,21 @@ func serveCmd() *cobra.Command {
 		Short: "Start a personal makewand server for remote clients",
 		Long:  "Expose your local makewand routing backend and centralized chat sessions so you can resume work from other computers.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Security: reject plaintext listening on non-loopback addresses
+			if !unsafeNoTLS && !isLoopbackAddr(listenAddr) {
+				return fmt.Errorf("refusing to listen on %q without TLS termination; use --unsafe-no-tls if absolutely necessary (not recommended)", listenAddr)
+			}
+
+			// Opening public registration implies the multi-user subsystem.
+			if enableRegistration {
+				enableUsers = true
+			}
+
+			trustedProxySet, err := serverauth.ParseTrustedProxies(trustedProxies)
+			if err != nil {
+				return err
+			}
+
 			cfg := loadConfigWithWarning()
 			if !cfg.HasAnyModel() {
 				return fmt.Errorf("no local AI models configured on this host; run 'makewand setup' first")
@@ -88,7 +109,15 @@ func serveCmd() *cobra.Command {
 				usageLogger = usageJSONL
 			}
 
-			rtr := serveRouter(cfg)
+			// Honor --repo-trust end-to-end: the HTTP facade routes through the
+			// Router's gated Chat/ChatWith pipeline, so constructing with the
+			// resolved trust makes untrusted mode fail closed for served requests
+			// (and known before the async quota refresh starts). resolvedRepoTrust
+			// is parsed and validated once by the root PersistentPreRunE.
+			rtr, err := serveRouter(cfg, resolvedRepoTrust)
+			if err != nil {
+				return fmt.Errorf("initialize model router: %w", err)
+			}
 			statsDir, err := config.ConfigDir()
 			if err == nil {
 				if loadErr := rtr.LoadStats(statsDir); loadErr != nil {
@@ -97,6 +126,9 @@ func serveCmd() *cobra.Command {
 			}
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
 			loginLimiter := serverauth.NewLoginRateLimiter(5, 15*time.Minute, 15*time.Minute)
+			loginLimiter.SetTrustedProxies(trustedProxySet)
+			registrationLimiter := serverauth.NewRegistrationRateLimiter(0, 0, 0, 0)
+			registrationLimiter.SetTrustedProxies(trustedProxySet)
 			var (
 				tokenManager serverauth.TokenManager = bootstrapManager
 				userStore    router.UserManager
@@ -184,7 +216,10 @@ func serveCmd() *cobra.Command {
 			}
 			base := rtr.HTTPHandler(httpOpts)
 			if userStore != nil {
-				base = rtr.HTTPHandlerWithUsers(userStore, httpOpts)
+				base = rtr.HTTPHandlerWithUsers(userStore, router.UserEndpointOptions{
+					EnableRegistration:  enableRegistration,
+					RegistrationLimiter: registrationLimiter,
+				}, httpOpts)
 			}
 			mux := http.NewServeMux()
 			mux.Handle("/v1/sessions/", remotesession.NewHandlerWithOptions(sessions, remotesession.HandlerOptions{
@@ -220,12 +255,20 @@ func serveCmd() *cobra.Command {
 				IdleTimeout:       2 * time.Minute,
 			}
 
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer stop()
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 			go func() {
-				<-ctx.Done()
-				_ = server.Close()
+				sig := <-sigChan
+				fmt.Printf("\nReceived signal: %v\n", sig)
+
+				shutdownCtx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
+				defer cancel()
+
+				fmt.Println("Shutting down server...")
+				if err := server.Shutdown(shutdownCtx); err != nil && err != context.DeadlineExceeded {
+					fmt.Fprintf(os.Stderr, "shutdown error: %v\n", err)
+				}
 			}()
 
 			fmt.Printf("makewand server listening on %s\n", listenAddr)
@@ -252,6 +295,7 @@ func serveCmd() *cobra.Command {
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
+			fmt.Println("Server stopped gracefully")
 			return nil
 		},
 	}
@@ -265,7 +309,10 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&alertWebhook, "alert-webhook", "", "HTTP endpoint that receives budget alert webhooks")
 	cmd.Flags().StringVar(&alertState, "alert-state", "", "path to persisted alert delivery state (default: <data-dir>/alert_state.json)")
 	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state database for users, tokens, and usage (default: <data-dir>/state.db)")
-	cmd.Flags().BoolVar(&enableUsers, "enable-users", false, "enable multi-user registration and admin user management")
+	cmd.Flags().BoolVar(&enableUsers, "enable-users", false, "enable multi-user auth, login, and admin user management (does not open public registration)")
+	cmd.Flags().BoolVar(&enableRegistration, "enable-registration", false, "allow public self-service account registration (implies --enable-users; new accounts require admin activation)")
+	cmd.Flags().StringSliceVar(&trustedProxies, "trusted-proxy", nil, "CIDR or IP of reverse proxies whose X-Forwarded-For/X-Real-IP headers are trusted for rate limiting (repeatable)")
+	cmd.Flags().BoolVar(&unsafeNoTLS, "unsafe-no-tls", false, "DANGER: allow plaintext listening on non-loopback addresses (only for testing behind a reverse proxy)")
 	return cmd
 }
 
@@ -292,10 +339,10 @@ func loadServeAuthorizer(token, authConfig string) (serverauth.RequestAuthorizer
 	return serverauth.NewSingleTokenAuthorizer(token), nil, nil
 }
 
-func serveRouter(cfg *config.Config) *model.Router {
+func serveRouter(cfg *config.Config, trust model.RepoTrust) (*model.Router, error) {
 	restore := temporarilyUnsetRemoteBackendEnv()
 	defer restore()
-	return model.NewRouter(cfg)
+	return model.NewRouterWithTrust(cfg, trust)
 }
 
 func resolveServeAuditPath(flagValue, dataDir string) string {
@@ -450,6 +497,7 @@ func serveProtectedHandler(authz serverauth.RequestAuthorizer, scope string, nex
 func writeServeError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	//nolint:gosec // G705: JSON API error response (Content-Type application/json), not an HTML sink; values are %q-escaped.
 	_, _ = fmt.Fprintf(w, `{"error":{"message":%q,"type":"error","code":%q}}`, message, code)
 }
 
@@ -466,4 +514,33 @@ func temporarilyUnsetRemoteBackendEnv() func() {
 			_ = os.Setenv("MAKEWAND_REMOTE_TOKEN", tokenValue)
 		}
 	}
+}
+
+// isLoopbackAddr reports whether addr binds only to a loopback interface.
+// It parses host:port forms (including IPv6 "[::1]:8080" and the bare ":8080")
+// with net.SplitHostPort and classifies the host via net.ParseIP.IsLoopback.
+// An empty host (bind-all, e.g. ":8080" or "0.0.0.0:8080") is NOT loopback,
+// keeping the fail-closed intent so plaintext never binds publicly by accident.
+func isLoopbackAddr(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port present; treat the whole value as the host.
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		// Bind-all (":8080") — reachable off-host, so not loopback.
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/router"
 	"github.com/spf13/cobra"
 )
@@ -21,7 +22,10 @@ func quotaCmd() *cobra.Command {
 		Long: "Read each configured subscription's remaining usage (5-hour session\n" +
 			"window and weekly cap) so you can see which pool to spend and which to\n" +
 			"rest. Data is read locally or via your own stored credentials; nothing\n" +
-			"is uploaded. Providers without a readable quota source are shown as such.",
+			"is uploaded. Providers without a readable quota source are shown as such.\n\n" +
+			"In untrusted-repository mode (--repo-trust=untrusted) quota sources that\n" +
+			"read by exec'ing a local CLI (e.g. `agy models`) are skipped, so those\n" +
+			"pools report no data.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if timeout <= 0 {
 				timeout = 30 * time.Second
@@ -29,11 +33,21 @@ func quotaCmd() *cobra.Command {
 			ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
 			defer cancel()
 
-			snap := router.NewDefaultQuotaSnapshotter(0).Refresh(ctx)
+			// Honor the resolved repository trust: in untrusted mode the snapshotter
+			// skips quota sources whose Read execs a local CLI, so `makewand quota`
+			// never runs a local CLI (e.g. `agy models`) inside an untrusted repo.
+			// The trust must be set before Refresh so the sync refresh sees it.
+			snap := router.NewDefaultQuotaSnapshotter(0).
+				SetRepoTrust(resolvedRepoTrust).
+				Refresh(ctx)
 			pol := router.DefaultQuotaPolicy()
 
 			if jsonOutput {
 				return printQuotaJSON(cmd, snap)
+			}
+			if resolvedRepoTrust == model.RepoTrustUntrusted {
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"(untrusted-repo mode: local-CLI quota sources skipped; some pools show no data)")
 			}
 			printQuotaHuman(cmd, snap, pol)
 			return nil

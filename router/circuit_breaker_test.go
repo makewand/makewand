@@ -125,13 +125,13 @@ func TestChat_FallbackWhenPrimaryCircuitOpen(t *testing.T) {
 
 func TestRegisterProviderFactory_ResolveCustomProvider(t *testing.T) {
 	const customName = "custom-resolver-test"
-	if err := RegisterProviderFactory(customName, func(modelID string) (Provider, error) {
+	r := mustNewRouter(RouterConfig{})
+	if err := r.RegisterProviderFactory(customName, func(modelID string) (Provider, error) {
 		return &stubProvider{name: customName, available: true}, nil
 	}); err != nil {
 		t.Fatalf("RegisterProviderFactory: %v", err)
 	}
 
-	r := NewRouterFromConfig(RouterConfig{})
 	p, err := r.resolveProvider(customName, "custom-model")
 	if err != nil {
 		t.Fatalf("resolveProvider(custom): %v", err)
@@ -142,7 +142,7 @@ func TestRegisterProviderFactory_ResolveCustomProvider(t *testing.T) {
 }
 
 func TestRegisterProvider_RuntimeInjection(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		DefaultModel: "private",
 		CodingModel:  "private",
 	})
@@ -162,7 +162,7 @@ func TestRegisterProvider_RuntimeInjection(t *testing.T) {
 }
 
 func TestRouteByMode_UsesDynamicallyRegisteredProvider(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		UsageMode: "balanced",
 	})
 
@@ -181,7 +181,7 @@ func TestRouteByMode_UsesDynamicallyRegisteredProvider(t *testing.T) {
 }
 
 func TestRouteProvider_FallsBackToDynamicProvider(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		UsageMode: "balanced",
 	})
 

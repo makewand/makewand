@@ -36,7 +36,7 @@ const defaultMaxSystemPromptFileTreeChars = 10000
 // buildSystemPrompt constructs the system prompt for chat mode, including the current
 // project's file tree when available. The mode parameter controls the context budget
 // allocated to repo context based on the target provider's context window.
-func buildSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode) string {
+func buildSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode, r *model.Router) string {
 	prompt := `You are makewand, a multi-provider coding assistant for terminal-based development workflows.
 
 Guidelines:
@@ -51,7 +51,12 @@ Guidelines:
 - Provide actionable code and clear reasoning`
 
 	if project != nil {
+		// Prefer the Router instance's budget so user routing.json context_budgets
+		// overrides are honored; fall back to package defaults for routerless callers.
 		budget := model.ContextBudgetForMode(mode, task)
+		if r != nil {
+			budget = r.ContextBudgetForMode(mode, task)
+		}
 
 		// Scale file tree limits proportionally to context budget.
 		scale := float64(budget) / float64(model.DefaultContextBudget)
@@ -77,7 +82,12 @@ Guidelines:
 			prompt += fmt.Sprintf("\n\nProject scan limited to %d entries to keep startup fast.\n", projectEntryCount(project.Files))
 		} else {
 			// Append repo context (rules, symbols, file hints) when available.
-			if rc, err := engine.LoadRepoContext(project.Path, project.Files); err == nil {
+			// In untrusted-repo mode, .makewand/rules.md is repo-controlled
+			// instruction text (a prompt-injection vector), so load context with
+			// UntrustedRepo=true to keep it out of the trusted "Project rules"
+			// section. The trust level rides on the Router instance.
+			rc, err := loadRepoContextForTrust(project, r)
+			if err == nil {
 				if ctx := rc.ForPrompt(budget); ctx != "" {
 					prompt += ctx
 				}
@@ -90,8 +100,18 @@ Guidelines:
 
 // BuildSystemPrompt exposes the shared project-aware system prompt builder so
 // non-TUI entry points can reuse the same repo-context packaging.
-func BuildSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode) string {
-	return buildSystemPrompt(project, task, mode)
+func BuildSystemPrompt(project *engine.Project, task model.TaskType, mode model.UsageMode, r *model.Router) string {
+	return buildSystemPrompt(project, task, mode, r)
+}
+
+// loadRepoContextForTrust loads repo context honoring the Router's repository
+// trust level. When the Router is in untrusted mode, repo-provided instruction
+// content (.makewand/rules.md) is not injected as trusted "Project rules".
+func loadRepoContextForTrust(project *engine.Project, r *model.Router) (*engine.RepoContext, error) {
+	if r != nil && r.RepoTrust() == model.RepoTrustUntrusted {
+		return engine.LoadRepoContextWithOptions(project.Path, project.Files, engine.RepoContextOptions{UntrustedRepo: true})
+	}
+	return engine.LoadRepoContext(project.Path, project.Files)
 }
 
 func includeProjectTreeForTask(task model.TaskType) bool {
@@ -135,7 +155,7 @@ func compactProjectTreeForPrompt(files []engine.FileEntry, maxLines, maxChars in
 	for i, f := range entries {
 		if lineCount >= maxLines {
 			remaining := len(entries) - i
-			b.WriteString(fmt.Sprintf("- ... %d more files not shown ...\n", remaining))
+			fmt.Fprintf(&b, "- ... %d more files not shown ...\n", remaining)
 			break
 		}
 
@@ -150,7 +170,7 @@ func compactProjectTreeForPrompt(files []engine.FileEntry, maxLines, maxChars in
 		if b.Len()+len(line) > maxChars {
 			remaining := len(entries) - i
 			if remaining > 0 {
-				b.WriteString(fmt.Sprintf("- ... %d more files not shown ...\n", remaining))
+				fmt.Fprintf(&b, "- ... %d more files not shown ...\n", remaining)
 			}
 			break
 		}

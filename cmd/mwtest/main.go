@@ -83,7 +83,11 @@ func main() {
 	for _, m := range modes {
 		fmt.Printf("\n### Mode: %s\n", strings.ToUpper(m.name))
 
-		router := model.NewRouter(cfg)
+		router, err := model.NewRouter(cfg)
+		if err != nil {
+			diag.Stderr().ErrorErr("router init failed", err)
+			os.Exit(1)
+		}
 		router.SetMode(m.mode)
 
 		for _, tc := range tests {
@@ -101,7 +105,11 @@ func main() {
 	for _, provName := range directProviders {
 		fmt.Printf("\n### Provider: %s\n", provName)
 
-		router := model.NewRouter(cfg)
+		router, err := model.NewRouter(cfg)
+		if err != nil {
+			diag.Stderr().ErrorErr("router init failed", err)
+			os.Exit(1)
+		}
 		p, err := router.Get(provName)
 		if err != nil {
 			fmt.Printf("  SKIP: %v\n", err)

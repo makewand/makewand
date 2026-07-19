@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"math/rand"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // UsageMode controls the model selection strategy (quality/cost tradeoff).
@@ -41,13 +44,83 @@ const (
 	TierPremium                  // Best quality
 )
 
-// EstimateCost returns the estimated cost in USD for the given model and token counts.
-func EstimateCost(modelID string, inputTokens, outputTokens int) float64 {
-	entry, ok := getCostEntry(modelID)
+// priceCompletion returns the USD cost for a completion priced from table t.
+// A nil t falls back to the package-level default tables, so providers created
+// outside a Router (for example a direct NewClaude caller) still get a
+// best-effort price. Reads are lock-guarded by costFor, so a live Router
+// snapshot swapped in by a hot-reload is picked up automatically.
+func priceCompletion(t *strategyTables, modelID string, inputTokens, outputTokens int) float64 {
+	if t == nil {
+		t = defaultTables
+	}
+	entry, ok := t.costFor(modelID)
 	if !ok {
 		return 0
 	}
 	return float64(inputTokens)/1_000_000*entry.Input + float64(outputTokens)/1_000_000*entry.Output
+}
+
+// EstimateCost returns the estimated cost in USD for the given model and token
+// counts, priced from the package-level default tables. Providers constructed
+// through a Router price from that Router's own snapshot instead (see
+// instanceCostTable); this remains for direct, routerless callers.
+func EstimateCost(modelID string, inputTokens, outputTokens int) float64 {
+	return priceCompletion(defaultTables, modelID, inputTokens, outputTokens)
+}
+
+// costTableContextKey carries the owning Router's per-call price snapshot.
+type costTableContextKey struct{}
+
+// contextWithCostTable returns a context carrying the Router's price snapshot so
+// a provider prices the completion from the calling Router's overrides — even
+// when the same provider instance is shared by several Routers.
+func contextWithCostTable(ctx context.Context, t *strategyTables) context.Context {
+	if t == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, costTableContextKey{}, t)
+}
+
+// costTableFromContext retrieves the per-call price snapshot, if present.
+func costTableFromContext(ctx context.Context) (*strategyTables, bool) {
+	t, ok := ctx.Value(costTableContextKey{}).(*strategyTables)
+	return t, ok && t != nil
+}
+
+// instanceCostTable is embedded by API providers (Claude, Gemini, OpenAI) so a
+// Router can price a completion from its per-instance snapshot.
+//
+// Pricing is a function of (per-call snapshot, model): priceForCtx reads the
+// snapshot the owning Router injects into the request context, so a provider
+// instance SHARED by two Routers prices each Router's calls from that Router's
+// overrides. The embedded atomic pointer is only a fallback for direct,
+// routerless callers (and is set via useCostTable at registration time).
+type instanceCostTable struct {
+	tables atomic.Pointer[strategyTables]
+}
+
+// useCostTable stores a fallback price snapshot for routerless callers. Router
+// requests carry their own snapshot in the context (see priceForCtx), so this
+// pointer is not consulted on the router-driven Chat path and a shared provider
+// registered on two Routers is never mispriced by a last-writer-wins overwrite.
+func (c *instanceCostTable) useCostTable(t *strategyTables) { c.tables.Store(t) }
+
+// priceForCtx prices a completion, preferring the per-call snapshot injected into
+// ctx by the owning Router; it falls back to the registration-time snapshot, then
+// the package defaults. Providers call this from Chat so pricing follows the
+// calling Router even when the provider instance is shared across Routers.
+func (c *instanceCostTable) priceForCtx(ctx context.Context, modelID string, inputTokens, outputTokens int) float64 {
+	if t, ok := costTableFromContext(ctx); ok {
+		return priceCompletion(t, modelID, inputTokens, outputTokens)
+	}
+	return priceCompletion(c.tables.Load(), modelID, inputTokens, outputTokens)
+}
+
+// priceFor prices a completion from the registration-time snapshot, or the
+// package defaults when none was injected. Retained for direct, routerless
+// callers that price without a request context.
+func (c *instanceCostTable) priceFor(modelID string, inputTokens, outputTokens int) float64 {
+	return priceCompletion(c.tables.Load(), modelID, inputTokens, outputTokens)
 }
 
 // ParseUsageMode converts a string to UsageMode.
@@ -96,18 +169,21 @@ func ParseAccessType(configValue, providerName string) AccessType {
 }
 
 // accessPriority returns the sort weight for access types.
-// Lower is preferred: Free/Subscription(0) < Local(1) < API(2).
-// Subscription is treated as "free" because the user already paid a flat monthly fee.
+// Lower is preferred: Subscription(0) < Free(1) < Local(2) < API(3).
+// Subscription is intentionally preferred ahead of free tiers so the router
+// spends the user's flat-rate quota before it spends per-token API budget.
 func accessPriority(at AccessType) int {
 	switch at {
-	case AccessFree, AccessSubscription:
+	case AccessSubscription:
 		return 0
-	case AccessLocal:
+	case AccessFree:
 		return 1
-	case AccessAPI:
+	case AccessLocal:
 		return 2
-	default:
+	case AccessAPI:
 		return 3
+	default:
+		return 4
 	}
 }
 
@@ -129,11 +205,19 @@ type providerQuality struct {
 // sessionUsage tracks per-provider request counts, error-failure counts, and
 // per-phase quality distributions used for Thompson Sampling–based routing.
 type sessionUsage struct {
-	mu       sync.Mutex
-	counts   map[string]int
-	failures map[string]int                  // provider errors / timeouts
-	quality  map[qualityKey]*providerQuality // Beta(α,β) per (phase, provider)
-	rng      *rand.Rand                      // injectable random source for deterministic tests
+	mu        sync.Mutex
+	counts    map[string]int
+	failures  map[string]int                  // provider errors / timeouts
+	quality   map[qualityKey]*providerQuality // Beta(α,β) per (phase, provider)
+	rng       *rand.Rand                      // injectable random source for deterministic tests
+	mutations uint64                          // bumped on every recorded change; drives save debouncing
+
+	// saveMu serializes Save calls so concurrent requests never race the
+	// temp-file rename. It is separate from mu so recording stats never blocks
+	// on disk I/O. savedMutations and lastSaveAt are guarded by saveMu.
+	saveMu         sync.Mutex
+	savedMutations uint64
+	lastSaveAt     time.Time
 }
 
 func newSessionUsage() *sessionUsage {
@@ -141,13 +225,14 @@ func newSessionUsage() *sessionUsage {
 		counts:   make(map[string]int),
 		failures: make(map[string]int),
 		quality:  make(map[qualityKey]*providerQuality),
-		rng:      rand.New(rand.NewSource(rand.Int63())),
+		rng:      rand.New(rand.NewSource(rand.Int63())), //nolint:gosec // G404: Thompson-sampling exploration jitter, not security-sensitive randomness.
 	}
 }
 
 func (s *sessionUsage) Increment(provider string) {
 	s.mu.Lock()
 	s.counts[provider]++
+	s.mutations++
 	s.mu.Unlock()
 }
 
@@ -161,6 +246,7 @@ func (s *sessionUsage) Count(provider string) int {
 func (s *sessionUsage) RecordFailure(provider string) {
 	s.mu.Lock()
 	s.failures[provider]++
+	s.mutations++
 	s.mu.Unlock()
 }
 
@@ -210,6 +296,7 @@ func (s *sessionUsage) RecordQualityOutcome(phase BuildPhase, provider string, s
 	} else {
 		s.quality[key].Failures++
 	}
+	s.mutations++
 }
 
 // ThompsonSample draws a score from Beta(α, β) for (phase, provider).
@@ -378,10 +465,34 @@ type persistedStats struct {
 	Quality  map[string]*providerQuality `json:"quality"` // key: "<phase>:<provider>"
 }
 
+// minStatsSaveInterval is the minimum time between debounced stats writes.
+// Explicit Save calls always flush regardless of the interval.
+const minStatsSaveInterval = time.Second
+
 // Save writes the session's routing statistics to configDir/routing_stats.json.
 // Existing data is replaced; the file is written atomically via a temp file.
+// Concurrent Save calls are serialized, so this is safe to call per-request.
 func (s *sessionUsage) Save(configDir string) error {
+	return s.save(configDir, true)
+}
+
+// saveDebounced is like Save but skips the write when nothing changed since the
+// last save or when the last write was less than minStatsSaveInterval ago.
+// Hot per-request paths use it so stats persistence never becomes a disk storm.
+func (s *sessionUsage) saveDebounced(configDir string) error {
+	return s.save(configDir, false)
+}
+
+func (s *sessionUsage) save(configDir string, force bool) error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
 	s.mu.Lock()
+	mutations := s.mutations
+	if !force && (mutations == s.savedMutations || time.Since(s.lastSaveAt) < minStatsSaveInterval) {
+		s.mu.Unlock()
+		return nil
+	}
 	data := persistedStats{
 		Version:  1,
 		Counts:   make(map[string]int, len(s.counts)),
@@ -405,11 +516,30 @@ func (s *sessionUsage) Save(configDir string) error {
 	if err != nil {
 		return err
 	}
-	tmpPath := filepath.Join(configDir, statsFile+".tmp")
-	if err := os.WriteFile(tmpPath, b, 0600); err != nil {
+	// Unique temp file in the target dir: saveMu serializes this instance, but a
+	// fixed temp name could still collide with another process writing the same
+	// configDir. CreateTemp files are 0600 by default.
+	tmp, err := os.CreateTemp(configDir, statsFile+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(configDir, statsFile))
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, filepath.Join(configDir, statsFile)); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	s.savedMutations = mutations
+	s.lastSaveAt = time.Now()
+	return nil
 }
 
 // Load reads cross-session routing statistics from configDir/routing_stats.json

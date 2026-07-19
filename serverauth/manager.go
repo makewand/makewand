@@ -90,6 +90,13 @@ func (m *Manager) Issue(rule TokenRule) (TokenRuleView, string, error) {
 	if err != nil {
 		return TokenRuleView{}, "", err
 	}
+	// Carry over (share) usage counters and swap the authorizer while holding
+	// m.mu, so no window exists during which the new authorizer is visible with
+	// reset counters. Sharing the underlying usage state (rather than copying)
+	// also means an increment in flight against the previous grant is not lost.
+	if m.auth != nil {
+		carryOverGrantUsage(authz.grants, m.auth.grants)
+	}
 	m.cfg = cfg
 	m.auth = authz
 
@@ -120,6 +127,11 @@ func (m *Manager) Revoke(tokenID string) error {
 	authz, err := NewAuthorizer(cfg)
 	if err != nil {
 		return err
+	}
+	// Share usage counters and swap under m.mu (see Issue): no reset window and
+	// no lost in-flight increment on the previous grant.
+	if m.auth != nil {
+		carryOverGrantUsage(authz.grants, m.auth.grants)
 	}
 	m.cfg = cfg
 	m.auth = authz

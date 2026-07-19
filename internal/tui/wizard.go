@@ -82,10 +82,9 @@ func (w *WizardPanel) SetSize(width, height int) {
 
 // Update handles key events for the wizard.
 func (w WizardPanel) Update(msg tea.Msg) (WizardPanel, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		if w.phase == WizardPhaseTemplate {
-			switch msg.String() {
+			switch keyMsg.String() {
 			case "up", "k":
 				if w.selected > 0 {
 					w.selected--

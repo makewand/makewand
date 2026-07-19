@@ -15,6 +15,7 @@ type OpenAI struct {
 	model        string
 	chatClient   *http.Client
 	streamClient *http.Client
+	instanceCostTable
 }
 
 // NewOpenAI creates a new OpenAI provider.
@@ -32,6 +33,10 @@ func NewOpenAI(apiKey, model string) *OpenAI {
 
 func (o *OpenAI) Name() string      { return "openai" }
 func (o *OpenAI) IsAvailable() bool { return o.apiKey != "" }
+
+// SafeForUntrustedRepo reports that OpenAI is safe against an untrusted repo: it
+// is a pure HTTP call to the OpenAI API and runs no local repo-aware agent.
+func (o *OpenAI) SafeForUntrustedRepo() bool { return true }
 
 type openaiRequest struct {
 	Model     string          `json:"model"`
@@ -66,6 +71,10 @@ type openaiStreamChunk struct {
 }
 
 func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	model := o.model
+	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
+		model = requested
+	}
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})
@@ -74,11 +83,11 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, ma
 		if m.Role == "system" {
 			continue
 		}
-		msgs = append(msgs, openaiMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, openaiMessage(m))
 	}
 
 	reqBody := openaiRequest{
-		Model:     o.model,
+		Model:     model,
 		Messages:  msgs,
 		MaxTokens: maxTokens,
 	}
@@ -112,8 +121,8 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, ma
 	usage := Usage{
 		InputTokens:  result.Usage.PromptTokens,
 		OutputTokens: result.Usage.CompletionTokens,
-		Cost:         EstimateCost(o.model, result.Usage.PromptTokens, result.Usage.CompletionTokens),
-		Model:        o.model,
+		Cost:         o.priceForCtx(ctx, model, result.Usage.PromptTokens, result.Usage.CompletionTokens),
+		Model:        model,
 		Provider:     "openai",
 	}
 
@@ -121,6 +130,10 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, ma
 }
 
 func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	model := o.model
+	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
+		model = requested
+	}
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})
@@ -129,11 +142,11 @@ func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system stri
 		if m.Role == "system" {
 			continue
 		}
-		msgs = append(msgs, openaiMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, openaiMessage(m))
 	}
 
 	reqBody := openaiRequest{
-		Model:     o.model,
+		Model:     model,
 		Messages:  msgs,
 		MaxTokens: maxTokens,
 		Stream:    true,

@@ -109,8 +109,46 @@ func (a App) shouldAutoApproveFileWrites(phase pendingPhaseType) bool {
 	}
 }
 
+// restrictedExecAutoApprovable reports whether restricted plans may run without
+// asking the user: sandbox isolation is active, or the user explicitly opted
+// into host execution with MAKEWAND_UNSAFE_HOST_EXEC=1. Package variables so
+// tests can fake the host isolation checker.
+var (
+	restrictedExecAutoApprovable = engine.RestrictedExecAutoApprovable
+	restrictedExecIsolationError = engine.RestrictedExecIsolationError
+)
+
 func (a App) shouldAutoApproveRestrictedPlan(plan *engine.ExecPlan) bool {
-	return a.safeApprovalEnabled() && plan != nil
+	// Safe/autopilot modes may only auto-run verification commands when strong
+	// isolation (or the explicit unsafe opt-in) is available; otherwise prompt.
+	return a.safeApprovalEnabled() && plan != nil && restrictedExecAutoApprovable()
+}
+
+// restrictedPlanIsolationNotice returns a user-facing explanation when safe or
+// autopilot mode falls back to manual approval because sandbox isolation is
+// unavailable. Empty when no explanation is needed.
+func (a App) restrictedPlanIsolationNotice() string {
+	if !a.safeApprovalEnabled() {
+		return ""
+	}
+	if err := restrictedExecIsolationError(); err != nil {
+		return fmt.Sprintf(i18n.Msg().ApprovalIsolationUnavailable, err)
+	}
+	return ""
+}
+
+// restrictedPlanBlockedNotice returns the isolation-unavailable notice when a
+// restricted plan cannot execute at all (no sandbox isolation and no
+// MAKEWAND_UNSAFE_HOST_EXEC=1 opt-in). Unlike restrictedPlanIsolationNotice it
+// fires in every approval mode, because RunRestrictedPlan now fails closed on
+// the host regardless of mode; the notice explains why the command was skipped
+// instead of silently executing or silently doing nothing. Empty when the plan
+// may run.
+func restrictedPlanBlockedNotice() string {
+	if err := restrictedExecIsolationError(); err != nil {
+		return fmt.Sprintf(i18n.Msg().ApprovalIsolationUnavailable, err)
+	}
+	return ""
 }
 
 func (a *App) addAutoApprovalStatus(content string) {

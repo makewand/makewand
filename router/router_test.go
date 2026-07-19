@@ -10,6 +10,21 @@ import (
 	"time"
 )
 
+// mustNewRouter builds a Router for tests, panicking on constructor errors so
+// test helpers without a *testing.T can use it too.
+func mustNewRouter(rc RouterConfig) *Router {
+	r, err := NewRouterFromConfig(rc)
+	if err != nil {
+		panic(fmt.Sprintf("NewRouterFromConfig: %v", err))
+	}
+	return r
+}
+
+// testModelID reads a model ID from the immutable embedded defaults.
+func testModelID(provider string, tier ModelTier) string {
+	return baseTables.modelID(provider, tier)
+}
+
 // stubProvider is a minimal Provider for testing.
 // Unified: supports response, failChat, failStream fields.
 type stubProvider struct {
@@ -62,7 +77,7 @@ func (s *stubProvider) ChatStream(_ context.Context, _ []Message, _ string, _ in
 
 func TestNewRouterFromConfig_ConfigFree(t *testing.T) {
 	// Verify that a Router can be created without any config package dependency.
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"test": {Provider: &stubProvider{name: "test", available: true, response: "hello"}, Access: AccessSubscription},
 		},
@@ -84,7 +99,7 @@ func TestNewRouterFromConfig_ConfigFree(t *testing.T) {
 
 func TestNewRouterFromConfig_LegacyRouting(t *testing.T) {
 	stub := &stubProvider{name: "mymodel", available: true, response: "ok"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"mymodel": {Provider: stub, Access: AccessFree},
 		},
@@ -106,7 +121,7 @@ func TestNewRouterFromConfig_LegacyRouting(t *testing.T) {
 
 func TestNewRouterFromConfig_Chat(t *testing.T) {
 	stub := &stubProvider{name: "claude", available: true, response: "test response"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: stub, Access: AccessSubscription},
 		},
@@ -126,7 +141,7 @@ func TestNewRouterFromConfig_Chat(t *testing.T) {
 
 func TestRoute_RemoteOnlyProvider(t *testing.T) {
 	remote := &stubProvider{name: "remote", available: true, response: "remote response"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"remote": {Provider: remote, Access: AccessAPI},
 		},
@@ -150,7 +165,7 @@ func TestRoute_RemoteOnlyProvider(t *testing.T) {
 
 func TestBuildProviderForAdaptive_RemoteOnlyProvider(t *testing.T) {
 	remote := &stubProvider{name: "remote", available: true, response: "remote response"}
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"remote": {Provider: remote, Access: AccessAPI},
 		},
@@ -163,7 +178,7 @@ func TestBuildProviderForAdaptive_RemoteOnlyProvider(t *testing.T) {
 }
 
 func TestRegisterProvider_Runtime(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{},
 		UsageMode: "fast",
 	})
@@ -254,8 +269,8 @@ func TestChat_ModeFastFallsBackToAPI(t *testing.T) {
 			"openai": openai,
 		},
 		providerCache: map[providerKey]Provider{
-			{name: "gemini", modelID: modelTable["gemini"][TierCheap]}: gemini,
-			{name: "openai", modelID: modelTable["openai"][TierCheap]}: openai,
+			{name: "gemini", modelID: testModelID("gemini", TierCheap)}: gemini,
+			{name: "openai", modelID: testModelID("openai", TierCheap)}: openai,
 		},
 		accessTypes: map[string]AccessType{
 			"gemini": AccessFree,
@@ -536,7 +551,7 @@ func TestSortCandidates_LowSampleCountNotExcluded(t *testing.T) {
 func TestNewRouterFromConfig_CLIAccessDefaultsToSubscription(t *testing.T) {
 	// Adapted from TestNewRouter_CLIAccessDefaultsToSubscription:
 	// uses NewRouterFromConfig with pre-constructed CLIProviders.
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: NewClaudeCLI("/bin/sh"), Access: AccessSubscription},
 			"gemini": {Provider: NewGeminiCLI("/bin/sh"), Access: AccessSubscription},
@@ -594,11 +609,11 @@ func TestNewRouterFromConfig_LoadsCustomProvider(t *testing.T) {
 		"for arg in \"$@\"; do\n" +
 		"  printf '%s\\n' \"$arg\"\n" +
 		"done\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"private": {
 				Provider: NewCommandCLI("private", script, []string{"--prompt", "{{prompt}}"}, "legacy"),
@@ -634,7 +649,7 @@ func TestNewRouterFromConfig_LoadsCustomProvider(t *testing.T) {
 }
 
 func TestRouteByMode_CustomProviderAccessAPIAllowedInFastMode_Router(t *testing.T) {
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"private-api": {
 				Provider: NewCommandCLI("private-api", "/bin/sh", []string{"-c", "echo ok", "{{prompt}}"}, "legacy"),
@@ -657,7 +672,7 @@ func TestNewRouterFromConfig_SkipsUnusableCustomProvider(t *testing.T) {
 	// An unusable provider (binary not found) should report IsAvailable() = false,
 	// but NewRouterFromConfig always registers what the caller gives it.
 	// The test verifies that such providers are not returned by Available().
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"broken-private": {
 				Provider: NewCommandCLI("broken-private", "/definitely/not/a/real/provider", nil, "stdin"),
@@ -671,4 +686,88 @@ func TestNewRouterFromConfig_SkipsUnusableCustomProvider(t *testing.T) {
 			t.Fatal("unusable custom provider should not be in Available()")
 		}
 	}
+}
+
+func TestRoute_LegacyFallbackCandidateRegression(t *testing.T) {
+	// Regression test for fallback candidate struct handling.
+	// Ensures that legacyFallbackCandidates properly accesses .name and .modelID fields
+	// rather than treating structs as strings.
+	primary := &stubProvider{name: "codex", available: false}
+	fallback := &stubProvider{name: "openai", available: true, response: "fallback response"}
+
+	r := &Router{
+		providers: map[string]Provider{
+			"codex":  primary,
+			"openai": fallback,
+		},
+		providerCache: map[providerKey]Provider{
+			{name: "codex", modelID: "code-davinci-002"}: primary,
+			{name: "openai", modelID: "gpt-4"}:           fallback,
+		},
+		accessTypes: map[string]AccessType{
+			"codex":  AccessSubscription,
+			"openai": AccessAPI,
+		},
+		usage:   newSessionUsage(),
+		mode:    ModeFast,
+		modeSet: true,
+	}
+
+	result, err := r.Route(TaskCode)
+	if err != nil {
+		t.Fatalf("Route(TaskCode) error = %v, want nil", err)
+	}
+	if result.Actual != "openai" {
+		t.Errorf("Route(TaskCode) actual = %q, want openai (fallback)", result.Actual)
+	}
+	if result.IsFallback != true {
+		t.Errorf("Route(TaskCode) IsFallback = %v, want true", result.IsFallback)
+	}
+
+	content, usage, _, err := r.Chat(context.Background(), TaskCode, []Message{{Role: "user", Content: "test"}}, "")
+	if err != nil {
+		t.Fatalf("Chat(TaskCode) error = %v, want nil", err)
+	}
+	if content != "fallback response" {
+		t.Errorf("Chat(TaskCode) content = %q, want fallback response", content)
+	}
+	if usage.Provider != "openai" {
+		t.Errorf("Chat(TaskCode) Provider = %q, want openai", usage.Provider)
+	}
+}
+
+func TestCloneView_PreservesQuotaAndPolicy(t *testing.T) {
+	// Verify that cloneView preserves quota and quotaPolicy for request-scoped routers.
+	mockQuota := &stubQuotaController{}
+	testPolicy := QuotaPolicy{WarnPct: 75, CritPct: 90, Hysteresis: 5}
+
+	r := &Router{
+		providers:   map[string]Provider{"test": &stubProvider{name: "test", available: true}},
+		accessTypes: map[string]AccessType{"test": AccessSubscription},
+		usage:       newSessionUsage(),
+		quota:       mockQuota,
+		quotaPolicy: testPolicy,
+	}
+
+	clone := r.cloneView()
+
+	if clone.quota != mockQuota {
+		t.Errorf("cloneView() quota = %v, want %v", clone.quota, mockQuota)
+	}
+	if clone.quotaPolicy != testPolicy {
+		t.Errorf("cloneView() quotaPolicy = %v, want %v", clone.quotaPolicy, testPolicy)
+	}
+}
+
+type stubQuotaController struct{}
+
+func (s *stubQuotaController) Snapshot() *QuotaSnapshot {
+	return &QuotaSnapshot{}
+}
+
+func (s *stubQuotaController) MarkExhausted(provider string, until time.Time) {
+}
+
+func (s *stubQuotaController) Sealed(provider string) (time.Time, bool) {
+	return time.Time{}, false
 }

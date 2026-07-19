@@ -92,6 +92,11 @@ type UserLoginResponse struct {
 type UserManager interface {
 	CreateUser(email, password string) (*User, error)
 	CreateUserWithRole(email, password, role string) (*User, error)
+	// CreateUserWithRoleActive creates a user with an explicit role and initial
+	// active state persisted in a single write. Self-registration uses it to
+	// create inactive accounts atomically (no active window, no create-then-
+	// deactivate dance).
+	CreateUserWithRoleActive(email, password, role string, active bool) (*User, error)
 	GetUserByID(userID string) (*User, error)
 	GetUserByEmail(email string) (*User, error)
 	ListUsers() ([]UserView, error)
@@ -174,6 +179,12 @@ func (us *UserStore) CreateUser(email, password string) (*User, error) {
 
 // CreateUserWithRole creates a new user account with an explicit role.
 func (us *UserStore) CreateUserWithRole(email, password, role string) (*User, error) {
+	return us.CreateUserWithRoleActive(email, password, role, true)
+}
+
+// CreateUserWithRoleActive creates a new user account with an explicit role and
+// initial active state persisted in a single write.
+func (us *UserStore) CreateUserWithRoleActive(email, password, role string, active bool) (*User, error) {
 	users, err := us.loadUsers()
 	if err != nil {
 		return nil, fmt.Errorf("load users: %w", err)
@@ -185,7 +196,7 @@ func (us *UserStore) CreateUserWithRole(email, password, role string) (*User, er
 
 	// Check if user already exists
 	for _, user := range users {
-		if strings.ToLower(user.Email) == strings.ToLower(email) {
+		if strings.EqualFold(user.Email, email) {
 			return nil, fmt.Errorf("%w: %s", ErrUserExists, email)
 		}
 	}
@@ -203,7 +214,7 @@ func (us *UserStore) CreateUserWithRole(email, password, role string) (*User, er
 		Role:         role,
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
-		IsActive:     true,
+		IsActive:     active,
 	}
 
 	users[user.ID] = user
@@ -236,7 +247,7 @@ func (us *UserStore) GetUserByEmail(email string) (*User, error) {
 	}
 
 	for _, user := range users {
-		if strings.ToLower(user.Email) == strings.ToLower(email) {
+		if strings.EqualFold(user.Email, email) {
 			return user, nil
 		}
 	}
@@ -397,8 +408,26 @@ func normalizeUserRole(role string) (string, error) {
 	}
 }
 
+// UserEndpointOptions configures the optional self-service user endpoints.
+type UserEndpointOptions struct {
+	// EnableRegistration mounts POST /v1/users/register for public self-signup.
+	// It is disabled by default: enabling users (auth + login + admin
+	// management) does not open public registration unless this is set.
+	EnableRegistration bool
+
+	// RegistrationLimiter bounds concurrent Argon2id hashing and applies per-IP
+	// and global registration rate limits. It is used only when registration is
+	// enabled; a nil limiter disables throttling (intended for tests).
+	RegistrationLimiter *serverauth.RegistrationRateLimiter
+
+	// ActivateOnRegistration makes self-registered accounts immediately active.
+	// Default false: new accounts require an admin to activate them before they
+	// can log in.
+	ActivateOnRegistration bool
+}
+
 // HandleUserRegistration handles POST /v1/users/register requests.
-func (r *Router) HandleUserRegistration(userStore UserManager) http.HandlerFunc {
+func (r *Router) HandleUserRegistration(userStore UserManager, userOpts UserEndpointOptions) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
@@ -434,8 +463,30 @@ func (r *Router) HandleUserRegistration(userStore UserManager) http.HandlerFunc 
 			return
 		}
 
-		// Create user
-		user, err := userStore.CreateUser(regReq.Email, regReq.Password)
+		// Apply per-IP and global registration rate limits before committing any
+		// expensive work. The source IP honors forwarding headers only behind a
+		// configured trusted proxy.
+		limiter := userOpts.RegistrationLimiter
+		sourceIP := serverauth.ClientIP(req, limiter.TrustedProxies())
+		if !limiter.AllowAt(sourceIP, time.Now().UTC()) {
+			writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", "too many registration attempts; try again later")
+			return
+		}
+
+		// Bound concurrent Argon2id hashing (64 MiB / 4 threads each) so a burst
+		// of registrations cannot exhaust host memory/CPU.
+		release, ok := limiter.Acquire()
+		if !ok {
+			writeHTTPError(w, http.StatusServiceUnavailable, "registration_busy", "registration is temporarily busy; try again shortly")
+			return
+		}
+		defer release()
+
+		// Create user. The account's initial active state is persisted in the same
+		// write, so a self-registered account is never briefly log-in-able before
+		// a follow-up deactivation and can never be left permanently active by a
+		// failed deactivation.
+		user, err := userStore.CreateUserWithRoleActive(regReq.Email, regReq.Password, UserRoleMember, userOpts.ActivateOnRegistration)
 		if err != nil {
 			if errors.Is(err, ErrUserExists) {
 				writeHTTPError(w, http.StatusConflict, "user_exists", err.Error())
@@ -445,13 +496,18 @@ func (r *Router) HandleUserRegistration(userStore UserManager) http.HandlerFunc 
 			return
 		}
 
+		message := "User account created successfully"
+		if !userOpts.ActivateOnRegistration {
+			message = "User account created; awaiting administrator activation"
+		}
+
 		// Return success response
 		resp := UserRegistrationResponse{
 			ID:        user.ID,
 			Email:     user.Email,
 			Role:      user.Role,
 			CreatedAt: user.CreatedAt,
-			Message:   "User account created successfully",
+			Message:   message,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -479,7 +535,7 @@ func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.
 			writeHTTPError(w, status, code, message)
 			return
 		}
-		key := serverauth.LoginThrottleKey(req, loginReq.Email)
+		key := limiter.ThrottleKey(req, loginReq.Email)
 		if allowed, retryAfter := limiter.Allow(key, time.Now().UTC()); !allowed {
 			writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("too many failed logins; try again in %s", retryAfter.Round(time.Second)))
 			return
@@ -519,6 +575,9 @@ func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.
 }
 
 func loginRuleForUser(user *User, req UserLoginRequest, teamStore serverteam.Store, expiresAt time.Time) (serverauth.TokenRule, error) {
+	if user == nil {
+		return serverauth.TokenRule{}, fmt.Errorf("login rule: nil user")
+	}
 	rule := serverauth.TokenRule{
 		ID:          fmt.Sprintf("%s_%d", user.ID, time.Now().UTC().UnixNano()),
 		Description: "user login " + user.Email,
@@ -526,7 +585,7 @@ func loginRuleForUser(user *User, req UserLoginRequest, teamStore serverteam.Sto
 		Scopes:      loginScopesForUser(user),
 		ExpiresAt:   expiresAt,
 	}
-	if user != nil && strings.EqualFold(user.Role, UserRoleAdmin) {
+	if strings.EqualFold(user.Role, UserRoleAdmin) {
 		rule.OrganizationID = strings.TrimSpace(req.OrganizationID)
 		rule.ProjectID = strings.TrimSpace(req.ProjectID)
 		return rule, nil
@@ -602,9 +661,10 @@ func loginScopesForUser(user *User) []string {
 	return serverauth.AllClientScopes()
 }
 
-// HTTPHandlerWithUsers returns an http.Handler that includes user registration
-// endpoints in addition to the existing chat completion functionality.
-func (r *Router) HTTPHandlerWithUsers(userStore UserManager, opts ...HTTPHandlerOptions) http.Handler {
+// HTTPHandlerWithUsers returns an http.Handler that includes user login (and,
+// when explicitly enabled via userOpts, public registration) in addition to
+// the existing chat completion functionality.
+func (r *Router) HTTPHandlerWithUsers(userStore UserManager, userOpts UserEndpointOptions, opts ...HTTPHandlerOptions) http.Handler {
 	var opt HTTPHandlerOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -615,7 +675,11 @@ func (r *Router) HTTPHandlerWithUsers(userStore UserManager, opts ...HTTPHandler
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore))
+	// Public self-registration is mounted only when explicitly enabled so that
+	// enabling auth does not, by itself, expose an open signup endpoint.
+	if userOpts.EnableRegistration {
+		mux.HandleFunc("/v1/users/register", r.HandleUserRegistration(userStore, userOpts))
+	}
 	mux.HandleFunc("/v1/users/login", r.HandleUserLogin(userStore, opt.UserTokenManager, opt.TeamStore, opt.UserLoginLimiter))
 	mux.Handle("/", base)
 	return mux

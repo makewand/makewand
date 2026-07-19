@@ -67,8 +67,11 @@ type App struct {
 	spinner  spinner.Model
 
 	// Streaming state
-	streamCh   <-chan model.StreamChunk
-	streamProv string
+	streamCh       <-chan model.StreamChunk
+	streamProv     string
+	streamRoute    model.RouteResult
+	streamMessages []model.Message
+	streamSystem   string
 
 	// Cancellable AI context
 	cancelAI context.CancelFunc
@@ -85,11 +88,11 @@ type App struct {
 	pendingTestsPlan     *engine.ExecPlan       // detected test execution command
 	pendingApproval      *approvalRequest       // current approval request, if any
 	pendingWriteVerified bool                   // true when the pending file batch passed local verification
+	hostCLINoticeShown   bool                   // true once the host-CLI generation notice has been shown this session
 
 	// State
 	width  int
 	height int
-	err    error
 
 	// Last budget warning level that has been surfaced to the user.
 	lastBudgetNoticeLevel BudgetLevel
@@ -102,6 +105,11 @@ type App struct {
 	lastSessionSavedAt   string
 	restoredSession      bool
 	restoredMessageCount int
+
+	// repoTrust is the repository trust level for this session. It is mirrored
+	// onto the Router (which enforces fail-closed routing) so buildSystemPrompt
+	// and any router-driven generation share a single source of truth.
+	repoTrust model.RepoTrust
 }
 
 // --- Bubble Tea message types ---
@@ -117,11 +125,21 @@ type aiResponseMsg struct {
 	err           error
 }
 
+func providerForUsage(usage model.Usage, route model.RouteResult) string {
+	if provider := strings.TrimSpace(usage.Provider); provider != "" {
+		return provider
+	}
+	return strings.TrimSpace(route.Actual)
+}
+
 type aiStreamStartMsg struct {
 	ch         <-chan model.StreamChunk
 	provider   string
 	isFallback bool
 	requested  string
+	route      model.RouteResult
+	messages   []model.Message
+	system     string
 }
 
 type aiStreamMsg struct {
@@ -217,9 +235,25 @@ type startPromptMsg struct {
 	input string
 }
 
-// NewApp creates a new App.
+// NewApp creates a new App with trusted-repository routing (the existing
+// default). It is retained for the many callers and tests that do not thread a
+// trust level; entry points that support untrusted mode use newAppWithTrust.
 func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
-	router := model.NewRouter(cfg)
+	return newAppWithTrust(mode, cfg, projectPath, model.RepoTrustTrusted)
+}
+
+// newAppWithTrust creates a new App whose Router is constructed WITH the given
+// repository trust level. Establishing trust at construction means untrusted mode
+// is known before any background work (the async quota/health refresh, which can
+// exec a local CLI) runs, so generation fails closed end-to-end.
+func newAppWithTrust(mode Mode, cfg *config.Config, projectPath string, trust model.RepoTrust) *App {
+	router, err := model.NewRouterWithTrust(cfg, trust)
+	if err != nil {
+		// A broken routing.json (or corrupted strategy defaults) leaves no
+		// usable router; fail fast with the cause instead of crashing later.
+		diag.Stderr().ErrorErr("could not initialize model router", err)
+		os.Exit(1)
+	}
 	i18n.SetLanguage(cfg.Language)
 
 	s := spinner.New()
@@ -227,17 +261,18 @@ func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
 	s.Style = spinnerStyle
 
 	app := &App{
-		mode:     mode,
-		cfg:      cfg,
-		router:   router,
-		activity: newChatActivityState(),
-		pipeline: engine.NewBuildPipeline(),
-		chat:     NewChatPanel(),
-		fileTree: NewFileTreePanel(),
-		progress: NewProgressPanel(),
-		wizard:   NewWizardPanel(),
-		cost:     NewCostTracker(),
-		spinner:  s,
+		mode:      mode,
+		cfg:       cfg,
+		router:    router,
+		repoTrust: trust,
+		activity:  newChatActivityState(),
+		pipeline:  engine.NewBuildPipeline(),
+		chat:      NewChatPanel(),
+		fileTree:  NewFileTreePanel(),
+		progress:  NewProgressPanel(),
+		wizard:    NewWizardPanel(),
+		cost:      NewCostTracker(),
+		spinner:   s,
 	}
 
 	// Open existing project if path provided
@@ -359,6 +394,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case aiResponseMsg:
 		if a.cancelAI != nil {
+			a.cancelAI()
 			a.cancelAI = nil
 		}
 		a.state = StateIdle
@@ -370,8 +406,12 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case aiStreamStartMsg:
 		a.streamCh = msg.ch
 		a.streamProv = msg.provider
+		a.streamRoute = msg.route
+		a.streamMessages = append([]model.Message(nil), msg.messages...)
+		a.streamSystem = msg.system
 		a.state = StateStreaming
 		a.activity.SetPhase(chatActivityWaiting, msg.provider, msg.requested, msg.isFallback, "")
+		a = a.noteHostCLIExec(msg.provider)
 
 		if msg.isFallback {
 			m := i18n.Msg()
@@ -385,10 +425,18 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case aiStreamMsg:
 		emitChatStreamTrace(a.router, msg.provider, msg.chunk)
-		if msg.chunk.Error != nil {
+		if msg.chunk.Content != "" {
+			a.activity.MarkChunk(msg.provider, msg.chunk.Content)
+			a.chat.AppendStream(msg.chunk.Content)
+		}
+		switch {
+		case msg.chunk.Error != nil:
+			partialContent := a.chat.StreamingContent()
+			usage := a.recordStreamUsage(msg.provider, partialContent)
+			a.chat.FinishStream(msg.provider, usage.Cost)
 			a.chat.AddMessage(ChatMessage{
 				Role:    "system",
-				Content: fmt.Sprintf("Error: %s", msg.chunk.Error),
+				Content: chatErrorContent(msg.chunk.Error),
 			})
 			a.chat.SetStreaming(false)
 			a.streamCh = nil
@@ -398,8 +446,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.cancelAI()
 				a.cancelAI = nil
 			}
-		} else if msg.chunk.Done {
-			a.chat.FinishStream(msg.provider, 0)
+		case msg.chunk.Done:
+			streamContent := a.chat.StreamingContent()
+			usage := a.recordStreamUsage(msg.provider, streamContent)
+			a.chat.FinishStream(msg.provider, usage.Cost)
 			a.streamCh = nil
 			a.state = StateIdle
 			a.activity.Reset()
@@ -424,9 +474,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					})
 				}
 			}
-		} else {
-			a.activity.MarkChunk(msg.provider, msg.chunk.Content)
-			a.chat.AppendStream(msg.chunk.Content)
+		default:
 			cmds = append(cmds, a.waitForStreamChunk())
 		}
 
@@ -489,6 +537,22 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmds = append(cmds, chatCmd)
 
 	return a, tea.Batch(cmds...)
+}
+
+func (a *App) recordStreamUsage(provider, output string) model.Usage {
+	result := a.streamRoute
+	if result.Actual == "" {
+		result.Actual = provider
+	}
+	var usage model.Usage
+	if a.router != nil {
+		usage = a.router.EstimateUsageForRoute(result, a.streamMessages, a.streamSystem, output)
+		a.cost.AddWithTokens(provider, usage.Cost, usage.InputTokens, usage.OutputTokens, a.router.IsSubscription(provider))
+	}
+	a.streamRoute = model.RouteResult{}
+	a.streamMessages = nil
+	a.streamSystem = ""
+	return usage
 }
 
 func (a App) handlePendingApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
@@ -573,7 +637,7 @@ func (a *App) refreshProjectFiles() {
 // View implements tea.Model.
 func (a App) View() string {
 	if a.state == StateQuitting {
-		return mutedStyle.Render("Goodbye!") + "\n"
+		return mutedStyle.Render(i18n.Msg().Goodbye) + "\n"
 	}
 
 	if a.mode == ModeNew && a.wizard.Phase() <= WizardPhaseConfirm {
@@ -706,7 +770,7 @@ func (a *App) viewActivity(width int) string {
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(i18n.Msg().ActivityTitle) + "\n")
-	b.WriteString(fmt.Sprintf(" %s %s\n", a.spinner.View(), formatChatActivityHeadline(snapshot)))
+	fmt.Fprintf(&b, " %s %s\n", a.spinner.View(), formatChatActivityHeadline(snapshot))
 	if meta := formatChatActivityMeta(snapshot); meta != "" {
 		b.WriteString(mutedStyle.Render("   "+wrapText(meta, maxInt(width-8, 12))) + "\n")
 	}
@@ -719,13 +783,17 @@ func isLGTMResponse(content string) bool {
 }
 
 // Run starts the Bubble Tea program.
-func Run(mode Mode, cfg *config.Config, projectPath string, debug bool) error {
-	return RunWithPrompt(mode, cfg, projectPath, "", debug)
+func Run(mode Mode, cfg *config.Config, projectPath string, repoTrust model.RepoTrust, debug bool) error {
+	return RunWithPrompt(mode, cfg, projectPath, "", repoTrust, debug)
 }
 
 // RunWithPrompt starts the Bubble Tea program with an optional initial chat prompt.
-func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt string, debug bool) error {
-	app := NewApp(mode, cfg, projectPath)
+func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt string, repoTrust model.RepoTrust, debug bool) error {
+	// Construct the App (and its Router) WITH the trust level so untrusted mode is
+	// established before any background work runs. The Router enforces fail-closed
+	// routing in untrusted mode; buildSystemPrompt reads app.repoTrust back to
+	// decide whether repo-provided rules are trusted.
+	app := newAppWithTrust(mode, cfg, projectPath, repoTrust)
 	app.initialPrompt = strings.TrimSpace(initialPrompt)
 
 	if debug {

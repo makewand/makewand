@@ -54,6 +54,15 @@ func main() {
 		os.Exit(2)
 	}
 
+	// casefix runs `go test ./...` directly on AI-generated code on the host,
+	// without the sandbox isolation the product path uses. Require the explicit
+	// opt-in so this dev tool is honest about executing untrusted output.
+	if os.Getenv("MAKEWAND_UNSAFE_HOST_EXEC") != "1" {
+		diag.Stderr().ErrorText("casefix executes AI-generated code with `go test ./...` on the host; set MAKEWAND_UNSAFE_HOST_EXEC=1 to acknowledge and continue")
+		os.Exit(2)
+	}
+	diag.Stderr().WarnErr("MAKEWAND_UNSAFE_HOST_EXEC=1: running AI-generated code directly on the host without sandbox isolation", nil)
+
 	cfg, err := config.Load()
 	if err != nil {
 		diag.Stderr().ErrorErr("config load failed", err)
@@ -85,7 +94,7 @@ func main() {
 
 	data, _ := json.MarshalIndent(report, "", "  ")
 	reportPath := filepath.Join(*root, fmt.Sprintf("%s-fix-report.json", *caseID))
-	_ = os.WriteFile(reportPath, data, 0o644)
+	_ = os.WriteFile(reportPath, data, 0o600)
 	fmt.Printf("REPORT=%s\n", reportPath)
 
 	fmt.Println()
@@ -130,7 +139,11 @@ func fixMode(cfg *config.Config, root, caseID string, mode model.UsageMode) mode
 
 	cfgCopy := *cfg
 	cfgCopy.UsageMode = mode.String()
-	router := model.NewRouter(&cfgCopy)
+	router, err := model.NewRouter(&cfgCopy)
+	if err != nil {
+		rep.Error = fmt.Sprintf("router init failed: %v", err)
+		return rep
+	}
 
 	projectContext := collectProjectFiles(projectDir, 64*1024)
 	prompt := buildModeFixPrompt(mode, beforeOut, projectContext)
@@ -259,17 +272,20 @@ func collectProjectFiles(root string, maxBytes int) string {
 }
 
 func writeFiles(root string, files []engine.ExtractedFile) (int, error) {
+	// Route AI-generated writes through the product's validated write path so path
+	// containment and protected-path checks apply here too: `..` escapes and
+	// protected files (CI configs, .git, ...) are rejected in the dev tool as well.
+	proj, err := engine.OpenProject(root)
+	if err != nil {
+		return 0, err
+	}
 	written := 0
 	for _, f := range files {
 		p := strings.TrimSpace(f.Path)
 		if p == "" {
 			continue
 		}
-		target := filepath.Join(root, filepath.FromSlash(p))
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return written, err
-		}
-		if err := os.WriteFile(target, []byte(f.Content), 0o644); err != nil {
+		if err := proj.WriteFile(p, f.Content); err != nil {
 			return written, err
 		}
 		written++

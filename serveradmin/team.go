@@ -399,13 +399,15 @@ func handleDashboard(w http.ResponseWriter, req *http.Request, opts HandlerOptio
 		},
 	}
 	if opts.TokenManager != nil && grant.AllowsScope(serverauth.ScopeAdminTokensRead) {
+		tokens := filterTokenViews(opts.TokenManager.TokenRules(), req, grant)
 		payload["tokens"] = map[string]any{
-			"count": len(opts.TokenManager.TokenRules()),
-			"data":  opts.TokenManager.TokenRules(),
+			"count": len(tokens),
+			"data":  tokens,
 		}
 	}
 	if opts.UserStore != nil && grant.AllowsScope(serverauth.ScopeAdminUsersRead) {
 		if users, err := opts.UserStore.ListUsers(); err == nil {
+			users = filterUsers(users, req, grant)
 			payload["users"] = map[string]any{
 				"count": len(users),
 				"data":  users,
@@ -701,9 +703,8 @@ func filterProjectMemberships(items []serverteam.ProjectMembership, req *http.Re
 	userID := strings.TrimSpace(query.Get("user_id"))
 	activeFilter := strings.TrimSpace(query.Get("active"))
 	if grant != nil {
-		if grant.OrganizationID() != "" {
-			// grant-scoped org is enforced via OrganizationID on each membership.
-		}
+		// The grant-scoped org is enforced per-membership in the filter loop
+		// below via grant.OrganizationID(); only the project scope is pinned here.
 		if grant.ProjectID() != "" {
 			projectID = grant.ProjectID()
 		}

@@ -266,7 +266,7 @@ func extractHTTPToolCalls(content string, tools []httpTool) ([]httpToolCall, boo
 		if !hasArguments {
 			argumentsRaw = map[string]any{}
 		}
-		arguments := "{}"
+		var arguments string
 		switch value := argumentsRaw.(type) {
 		case string:
 			arguments = strings.TrimSpace(value)

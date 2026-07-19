@@ -11,8 +11,6 @@ var (
 	colorError     = lipgloss.Color("#EF4444") // red
 	colorMuted     = lipgloss.Color("#6B7280") // gray
 	colorText      = lipgloss.Color("#E5E7EB") // light gray
-	colorBg        = lipgloss.Color("#1F2937") // dark gray
-	colorBorder    = lipgloss.Color("#374151") // border gray
 )
 
 // Styles
@@ -25,11 +23,6 @@ var (
 	subtitleStyle = lipgloss.NewStyle().
 			Foreground(colorSecondary).
 			Italic(true)
-
-	borderStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorBorder).
-			Padding(0, 1)
 
 	chatBorderStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).

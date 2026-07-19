@@ -21,7 +21,7 @@ func TestBuildSystemPrompt_ExplainOmitsProjectTree(t *testing.T) {
 		},
 	}
 
-	prompt := buildSystemPrompt(proj, model.TaskExplain, model.ModeBalanced)
+	prompt := buildSystemPrompt(proj, model.TaskExplain, model.ModeBalanced, nil)
 	if strings.Contains(prompt, "Project files:") {
 		t.Fatalf("explain prompt should omit full project tree, got:\n%s", prompt)
 	}
@@ -45,7 +45,7 @@ func TestBuildSystemPrompt_CodeUsesCompactProjectTree(t *testing.T) {
 
 	// ModeBalanced + TaskCode → claude mid → budget 10000 → scaled tree limits.
 	// With 500 small files and a 10000-char budget the tree fits, so verify it's included.
-	prompt := buildSystemPrompt(proj, model.TaskCode, model.ModeBalanced)
+	prompt := buildSystemPrompt(proj, model.TaskCode, model.ModeBalanced, nil)
 	if !strings.Contains(prompt, "Project files:") {
 		t.Fatalf("code prompt should include project files section, got:\n%s", prompt)
 	}
@@ -72,7 +72,7 @@ func TestBuildSystemPrompt_CodeTruncatesVeryLargeTree(t *testing.T) {
 		Files: files,
 	}
 
-	prompt := buildSystemPrompt(proj, model.TaskCode, model.ModeFast)
+	prompt := buildSystemPrompt(proj, model.TaskCode, model.ModeFast, nil)
 	if !strings.Contains(prompt, "Project files:") {
 		t.Fatalf("code prompt should include project files section, got:\n%s", prompt)
 	}
@@ -104,7 +104,7 @@ func TestBuildSystemPrompt_TruncatedProjectSkipsRepoContext(t *testing.T) {
 		},
 	}
 
-	prompt := buildSystemPrompt(proj, model.TaskCode, model.ModeBalanced)
+	prompt := buildSystemPrompt(proj, model.TaskCode, model.ModeBalanced, nil)
 	if !strings.Contains(prompt, "Project scan limited to 1 entries") {
 		t.Fatalf("expected truncated scan notice, got:\n%s", prompt)
 	}

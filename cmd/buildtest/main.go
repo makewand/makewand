@@ -40,7 +40,11 @@ func main() {
 	fmt.Printf("Request timeout: %s\n\n", requestTimeout.String())
 
 	// Show available providers
-	router := model.NewRouter(cfg)
+	router, err := model.NewRouter(cfg)
+	if err != nil {
+		diag.Stderr().ErrorErr("router init failed", err)
+		os.Exit(1)
+	}
 	fmt.Println("▸ Available providers:")
 	availableProviders := router.Available()
 	for _, name := range availableProviders {
@@ -74,7 +78,11 @@ func main() {
 
 	for _, mode := range modes {
 		cfg.UsageMode = mode.String()
-		r := model.NewRouter(cfg)
+		r, err := model.NewRouter(cfg)
+		if err != nil {
+			diag.Stderr().ErrorErr("router init failed", err)
+			os.Exit(1)
+		}
 
 		row := fmt.Sprintf("  %-16s", mode.String())
 		for _, p := range phases {
@@ -100,7 +108,11 @@ func main() {
 	allOK := true
 	for _, mode := range modes {
 		cfg.UsageMode = mode.String()
-		r := model.NewRouter(cfg)
+		r, err := model.NewRouter(cfg)
+		if err != nil {
+			diag.Stderr().ErrorErr("router init failed", err)
+			os.Exit(1)
+		}
 
 		codeProv := r.BuildProviderForAdaptive(model.PhaseCode)
 		reviewReq := r.BuildProviderForAdaptive(model.PhaseReview)
@@ -142,7 +154,11 @@ func main() {
 	fmt.Println()
 
 	cfg.UsageMode = "balanced"
-	router = model.NewRouter(cfg)
+	router, err = model.NewRouter(cfg)
+	if err != nil {
+		diag.Stderr().ErrorErr("router init failed", err)
+		os.Exit(1)
+	}
 
 	// Step 1: Plan (adaptive)
 	fmt.Print("  [1/4] Plan... ")

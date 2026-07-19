@@ -155,9 +155,7 @@ func TestStartPreview_IncludesStartupStderrOnReadinessFailure(t *testing.T) {
 	previewWrapProjectCmd = func(projectPath, command string, args []string) (string, []string, error) {
 		return "sh", []string{"-c", "echo uid map denied >&2; sleep 5"}, nil
 	}
-	previewCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		return exec.CommandContext(ctx, name, args...)
-	}
+	previewCommandContext = exec.CommandContext
 
 	server, err := proj.StartPreview(context.Background(), true)
 	if err == nil {

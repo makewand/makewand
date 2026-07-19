@@ -52,6 +52,55 @@ var sanitizeReplacer = strings.NewReplacer(
 
 var errProjectScanLimitReached = errors.New("project scan limit reached")
 
+// protectedWriteDirs are directories that AI-generated file writes must never
+// touch: repository metadata (git hooks would execute on the host) and CI/CD
+// definitions (they run in trusted contexts and gate verification).
+var protectedWriteDirs = map[string]bool{
+	".git":       true,
+	".github":    true,
+	".circleci":  true,
+	".buildkite": true,
+}
+
+// protectedWriteFiles are root-level verification/CI entry points that
+// AI-generated file writes must never replace. Makefile and the shell scripts
+// under scripts/ (handled separately) gate verification, so a candidate must
+// not be able to weaken the very scripts that judge it.
+var protectedWriteFiles = map[string]bool{
+	".gitlab-ci.yml":      true,
+	".travis.yml":         true,
+	"Jenkinsfile":         true,
+	"azure-pipelines.yml": true,
+	"Makefile":            true,
+	"makefile":            true,
+	"GNUmakefile":         true,
+}
+
+// isProtectedWritePath reports whether a cleaned project-relative path is
+// write-protected against generated content. Applies to both verification
+// clones and real project applies.
+func isProtectedWritePath(cleaned string) bool {
+	slashed := filepath.ToSlash(cleaned)
+	parts := strings.Split(slashed, "/")
+	// .git is protected at any depth: hooks in nested repositories execute on
+	// the host too.
+	for _, part := range parts {
+		if part == ".git" {
+			return true
+		}
+	}
+	if protectedWriteDirs[parts[0]] {
+		return true
+	}
+	// Shell scripts under scripts/ are the project's CI/verification entry
+	// points (test_gate.sh, test_race.sh, ...). Protect them without over-
+	// blocking non-shell project source that may also live under scripts/.
+	if len(parts) > 1 && parts[0] == "scripts" && strings.HasSuffix(strings.ToLower(slashed), ".sh") {
+		return true
+	}
+	return protectedWriteFiles[slashed]
+}
+
 // NewProject creates a new project in the given directory.
 func NewProject(name, parentDir string) (*Project, error) {
 	safeName := sanitizeDirName(name)
@@ -173,6 +222,9 @@ func (p *Project) validatePath(relPath string, forWrite bool) (string, error) {
 	}
 	if filepath.IsAbs(cleaned) {
 		return "", fmt.Errorf("absolute paths not allowed: %s", relPath)
+	}
+	if forWrite && isProtectedWritePath(cleaned) {
+		return "", fmt.Errorf("write to protected path not allowed: %s", relPath)
 	}
 
 	projectAbs, err := filepath.Abs(p.Path)

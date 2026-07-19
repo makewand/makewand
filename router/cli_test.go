@@ -20,7 +20,7 @@ func TestCLIProvider_ChatStream_ReturnsErrorOnExitFailure(t *testing.T) {
 		"echo stream-start\n" +
 		"echo boom-on-stderr 1>&2\n" +
 		"exit 1\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -54,7 +54,7 @@ func TestCLIProvider_Chat_TimeoutErrorIsReadable(t *testing.T) {
 	script := filepath.Join(dir, "sleep-cli.sh")
 	body := "#!/bin/sh\n" +
 		"sleep 2\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -123,7 +123,7 @@ func TestCLIProvider_Chat_ValidationIgnoresSystemFileInstructions(t *testing.T) 
 	script := filepath.Join(dir, "echo-provider.sh")
 	body := "#!/bin/sh\n" +
 		"printf 'provider:reviewer\\n'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -149,7 +149,7 @@ func TestCLIProvider_ChatStream_EmitsTimeoutErrorOnDeadline(t *testing.T) {
 	script := filepath.Join(dir, "sleep-stream-cli.sh")
 	body := "#!/bin/sh\n" +
 		"sleep 2\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -189,7 +189,7 @@ func TestGeminiCLI_ChatStream_ParsesStreamJSON(t *testing.T) {
 		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Hello\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\" world\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestGeminiCLI_ChatStream_IgnoresPlaintextPrelude(t *testing.T) {
 		"printf '%s\\n' 'Loaded cached credentials.'\n" +
 		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"OK\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -269,7 +269,7 @@ func TestNewCommandCLI_PromptPlaceholderReplacement(t *testing.T) {
 		"for arg in \"$@\"; do\n" +
 		"  printf '%s\\n' \"$arg\"\n" +
 		"done\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
 		"for arg in \"$@\"; do\n" +
 		"  printf '%s\\n' \"$arg\"\n" +
 		"done\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -322,7 +322,7 @@ func TestNewCommandCLI_WritesPromptToStdinWhenConfigured(t *testing.T) {
 	body := "#!/bin/sh\n" +
 		"printf 'mode:%s\\n' \"$1\"\n" +
 		"cat\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -357,7 +357,7 @@ func TestCLIProvider_Chat_RetriesTransientExecutionError(t *testing.T) {
 		"  exit 1\n" +
 		"fi\n" +
 		"echo \"ok after retry\"\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -398,7 +398,7 @@ func TestCLIProvider_Chat_DoesNotRetryNonTransientError(t *testing.T) {
 		"echo \"$n\" > \"$state_file\"\n" +
 		"echo \"invalid_api_key\" 1>&2\n" +
 		"exit 1\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -433,7 +433,7 @@ func TestCLIProvider_IsAvailable_UsesHealthProbe(t *testing.T) {
 		"  exit 0\n" +
 		"fi\n" +
 		"exit 1\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -448,7 +448,7 @@ func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
 	script := filepath.Join(dir, "probe-hang.sh")
 	body := "#!/bin/sh\n" +
 		"sleep 10\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -476,7 +476,7 @@ func TestCLIProvider_IsAvailable_SoftPassesTimeoutForGemini(t *testing.T) {
 	script := filepath.Join(dir, "probe-hang-gemini.sh")
 	body := "#!/bin/sh\n" +
 		"sleep 10\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -789,7 +789,7 @@ func TestCLIProvider_Chat_JSONFallbackToText(t *testing.T) {
 	script := filepath.Join(dir, "plain-text-cli.sh")
 	body := "#!/bin/sh\n" +
 		"echo 'Hello from plain text'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -825,7 +825,7 @@ func TestCLIProvider_Chat_JSONUsageUsedWhenAvailable(t *testing.T) {
 	script := filepath.Join(dir, "json-cli.sh")
 	body := "#!/bin/sh\n" +
 		`printf '{"result":"JSON hello","total_cost_usd":0.05,"usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"test-model":{"inputTokens":10,"outputTokens":5,"costUSD":0.05}}}'` + "\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -1021,6 +1021,98 @@ func TestNewGeminiCLI_ModelSelection(t *testing.T) {
 	}
 }
 
+func TestNewAgyCLI_ArgumentOrder(t *testing.T) {
+	t.Run("uses configured default and keeps print paired with prompt", func(t *testing.T) {
+		t.Setenv("MAKEWAND_AGY_MODEL", "")
+
+		p := NewAgyCLI("/usr/bin/agy")
+		// Agy's model namespace can span several quota pools and is not compatible
+		// with makewand's Gemini tier IDs, so a routing-context model is deliberately
+		// ignored unless the user opts in through MAKEWAND_AGY_MODEL.
+		ctx := ContextWithModel(context.Background(), "gemini-2.5-pro")
+		prompt := "reply with MW_AGY_PROMPT"
+		want := []string{"/usr/bin/agy", "--sandbox", "--print", prompt}
+
+		for name, build := range map[string]func(context.Context, string) *exec.Cmd{
+			"chat":   p.buildCmd,
+			"stream": p.buildStreamCmd,
+		} {
+			t.Run(name, func(t *testing.T) {
+				got := build(ctx, prompt).Args
+				if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+					t.Fatalf("args = %q, want %q", got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("environment override is a global option before print", func(t *testing.T) {
+		t.Setenv("MAKEWAND_AGY_MODEL", "  agy-model-id  ")
+
+		p := NewAgyCLI("/usr/bin/agy")
+		prompt := "reply with MW_AGY_PROMPT"
+		got := p.buildCmd(context.Background(), prompt).Args
+		want := []string{
+			"/usr/bin/agy",
+			"--sandbox",
+			"--model", "agy-model-id",
+			"--print", prompt,
+		}
+		if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+			t.Fatalf("args = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestAgyCLI_ChatPassesActualUserPrompt(t *testing.T) {
+	t.Setenv("MAKEWAND_AGY_MODEL", "")
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-agy.sh")
+	body := "#!/bin/sh\n" +
+		"if [ \"$#\" -ne 3 ] || [ \"$1\" != \"--sandbox\" ] || [ \"$2\" != \"--print\" ]; then\n" +
+		"  printf 'unexpected argv: %s\\n' \"$*\" >&2\n" +
+		"  exit 64\n" +
+		"fi\n" +
+		"printf '%s\\n' \"$3\"\n"
+	//nolint:gosec // The temporary fixture must be executable to emulate the Agy CLI.
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
+		t.Fatalf("WriteFile(fake agy): %v", err)
+	}
+
+	p := NewAgyCLI(script)
+	want := "MW_AGY_PROMPT_SENTINEL"
+	content, _, err := p.Chat(
+		context.Background(),
+		[]Message{{Role: "user", Content: want}},
+		"",
+		256,
+	)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if content != want {
+		t.Fatalf("Chat() content = %q, want actual user prompt %q", content, want)
+	}
+}
+
+func TestCLIProvider_ReportedModelID(t *testing.T) {
+	t.Setenv("MAKEWAND_AGY_MODEL", "")
+	if got := NewAgyCLI("agy").ReportedModelID("gemini-2.5-pro"); got != "agy-provider-managed" {
+		t.Fatalf("Agy ReportedModelID = %q, want provider-managed identity", got)
+	}
+	t.Setenv("MAKEWAND_AGY_MODEL", "gemini-override")
+	if got := NewAgyCLI("agy").ReportedModelID("gemini-2.5-pro"); got != "gemini-override" {
+		t.Fatalf("Agy ReportedModelID with override = %q, want gemini-override", got)
+	}
+	if got := NewCodexCLI("codex").ReportedModelID("codex-cli"); got != "codex-provider-managed" {
+		t.Fatalf("Codex ReportedModelID = %q, want provider-managed identity", got)
+	}
+	if got := NewClaudeCLI("claude").ReportedModelID("claude-opus"); got != "claude-opus" {
+		t.Fatalf("Claude ReportedModelID = %q, want requested model", got)
+	}
+}
+
 func TestNewClaudeCLI_SystemPromptFlag(t *testing.T) {
 	p := NewClaudeCLI("/usr/bin/claude")
 	ctx := ContextWithSystem(context.Background(), "You are a helpful assistant")
@@ -1042,7 +1134,7 @@ func TestClaudeCLI_Chat_SystemPromptSeparation(t *testing.T) {
 	script := filepath.Join(dir, "claude-sys.sh")
 	// Script that echoes all args so we can verify --append-system-prompt is present
 	body := "#!/bin/sh\necho \"$@\"\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile: %v", err)
 	}
 

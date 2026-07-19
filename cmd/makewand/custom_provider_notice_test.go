@@ -25,7 +25,7 @@ func TestCustomProviderSafetyWarning_ShellAdapterLegacy(t *testing.T) {
 func TestCustomProviderDoctorCheck_PassForStdin(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "provider.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat\n"), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 
@@ -53,7 +53,7 @@ func TestCustomProviderDoctorCheck_PassForStdin(t *testing.T) {
 func TestCustomProviderDoctorCheck_WarnsForArgMode(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "provider.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
 		t.Fatalf("WriteFile(script): %v", err)
 	}
 

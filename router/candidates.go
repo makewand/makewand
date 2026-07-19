@@ -15,28 +15,50 @@ func expandProviderPreference(preferred []string, registered []string, excluded 
 		registeredSet[name] = struct{}{}
 	}
 
-	for _, name := range preferred {
+	appendName := func(name string) {
 		if name == "" || seen[name] {
-			continue
+			return
 		}
 		if excluded != nil && excluded[name] {
-			continue
+			return
 		}
 		if _, ok := registeredSet[name]; !ok {
-			continue
+			return
 		}
 		seen[name] = true
 		out = append(out, name)
 	}
+	appendWithFallback := func(name string) {
+		appendName(name)
+		if alias := apiFallbackName(name); alias != "" {
+			appendName(alias)
+		}
+	}
+
+	for _, name := range preferred {
+		appendWithFallback(name)
+	}
 	for _, name := range registered {
-		if seen[name] {
+		appendWithFallback(name)
+	}
+	return out
+}
+
+func (r *Router) legacyFallbackCandidates(primaryName string) []fallbackCandidate {
+	preferred := make([]string, 0, len(fallbackOrder)+1)
+	if alias := apiFallbackName(primaryName); alias != "" {
+		preferred = append(preferred, alias)
+	}
+	for _, name := range fallbackOrder {
+		if name == primaryName {
 			continue
 		}
-		if excluded != nil && excluded[name] {
-			continue
-		}
-		seen[name] = true
-		out = append(out, name)
+		preferred = append(preferred, name)
+	}
+	ordered := expandProviderPreference(preferred, r.registeredProviderNames(), map[string]bool{primaryName: true})
+	out := make([]fallbackCandidate, 0, len(ordered))
+	for _, name := range ordered {
+		out = append(out, fallbackCandidate{name: name, modelID: r.legacyModelID(name)})
 	}
 	return out
 }
@@ -50,7 +72,7 @@ func (r *Router) modeCandidates(entry strategyEntry, excluded map[string]bool, p
 	}
 
 	for i, provName := range orderedProviders {
-		modelID := getModelID(provName, entry.Tier)
+		modelID := r.routingTables().modelID(provName, entry.Tier)
 
 		access := r.getAccessType(provName)
 
@@ -100,7 +122,7 @@ func (r *Router) buildPhaseCandidates(phase BuildPhase, excluded map[string]bool
 	candidates := make([]candidate, 0, len(orderedProviders))
 	for i, provName := range orderedProviders {
 		access := r.getAccessType(provName)
-		modelID := getModelID(provName, bs.Tier)
+		modelID := r.routingTables().modelID(provName, bs.Tier)
 
 		priorBias := 0.0
 		if pos, ok := staticOrder[provName]; ok {
@@ -129,7 +151,7 @@ func (r *Router) BuildProviderFor(phase BuildPhase) string {
 	if name, _, ok := r.remoteOnlyProvider(); ok {
 		return name
 	}
-	bs, ok := getBuildStrategy(r.effectiveMode(), phase)
+	bs, ok := r.routingTables().buildStrategy(r.effectiveMode(), phase)
 	if !ok {
 		return ""
 	}
@@ -137,7 +159,7 @@ func (r *Router) BuildProviderFor(phase BuildPhase) string {
 }
 
 func (r *Router) buildStrategyForPhase(phase BuildPhase) (BuildStrategy, error) {
-	bs, ok := getBuildStrategy(r.effectiveMode(), phase)
+	bs, ok := r.routingTables().buildStrategy(r.effectiveMode(), phase)
 	if !ok {
 		return BuildStrategy{}, fmt.Errorf("unknown build strategy for mode %d phase %d", r.effectiveMode(), phase)
 	}
@@ -242,7 +264,7 @@ func (r *Router) BuildProvidersForAdaptive(phase BuildPhase, limit int, exclude 
 }
 
 func (r *Router) modeEntry(task TaskType) (strategyEntry, error) {
-	entry, ok := getStrategyEntry(r.effectiveMode(), task)
+	entry, ok := r.routingTables().strategyFor(r.effectiveMode(), task)
 	if !ok {
 		return strategyEntry{}, fmt.Errorf("unknown usage mode: %d", r.effectiveMode())
 	}

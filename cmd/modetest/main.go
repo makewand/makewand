@@ -58,7 +58,11 @@ func main() {
 	fmt.Printf("Request timeout: %s\n\n", requestTimeout.String())
 
 	fmt.Println("▸ 可用 Provider:")
-	tmpRouter := model.NewRouter(cfg)
+	tmpRouter, err := model.NewRouter(cfg)
+	if err != nil {
+		diag.Stderr().ErrorErr("router init failed", err)
+		os.Exit(1)
+	}
 	availableProviders := tmpRouter.Available()
 	for _, name := range availableProviders {
 		fmt.Printf("  ✓ %s\n", name)
@@ -80,7 +84,11 @@ func main() {
 
 	for _, mode := range modes {
 		cfg.UsageMode = mode.String()
-		router := model.NewRouter(cfg)
+		router, err := model.NewRouter(cfg)
+		if err != nil {
+			diag.Stderr().ErrorErr("router init failed", err)
+			os.Exit(1)
+		}
 
 		row := fmt.Sprintf("  %-20s", modeNames[mode])
 		for _, t := range tasks {
@@ -121,7 +129,11 @@ func main() {
 
 	for _, mode := range modes {
 		cfg.UsageMode = mode.String()
-		router := model.NewRouter(cfg)
+		router, err := model.NewRouter(cfg)
+		if err != nil {
+			diag.Stderr().ErrorErr("router init failed", err)
+			os.Exit(1)
+		}
 
 		messages := []model.Message{
 			{Role: "user", Content: testPrompt},

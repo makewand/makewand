@@ -5,6 +5,37 @@ import (
 	"testing"
 )
 
+func TestSQLiteUserStore_CreateUserWithRoleActive_PersistsInactiveInOneWrite(t *testing.T) {
+	store, err := OpenSQLiteUserStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteUserStore: %v", err)
+	}
+	defer store.Close()
+
+	user, err := store.CreateUserWithRoleActive("new@example.com", "password123", UserRoleMember, false)
+	if err != nil {
+		t.Fatalf("CreateUserWithRoleActive: %v", err)
+	}
+	if user.IsActive {
+		t.Fatal("returned user should be inactive")
+	}
+	reloaded, err := store.GetUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID: %v", err)
+	}
+	if reloaded.IsActive {
+		t.Fatal("persisted account should be inactive on first write")
+	}
+
+	active, err := store.CreateUser("active@example.com", "password123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if !active.IsActive {
+		t.Fatal("CreateUser should default to active")
+	}
+}
+
 func TestSQLiteUserStore_CreateListAndMutate(t *testing.T) {
 	store, err := OpenSQLiteUserStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

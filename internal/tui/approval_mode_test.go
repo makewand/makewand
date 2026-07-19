@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -115,7 +116,22 @@ func TestHandleFilesExtracted_AutopilotAutoApprovesVerifiedChatWrites(t *testing
 	}
 }
 
+// stubRestrictedExecIsolation fakes the host isolation probe so approval tests
+// do not depend on bubblewrap being installed.
+func stubRestrictedExecIsolation(t *testing.T, autoApprovable bool, reason error) {
+	t.Helper()
+	oldOK := restrictedExecAutoApprovable
+	oldErr := restrictedExecIsolationError
+	restrictedExecAutoApprovable = func() bool { return autoApprovable }
+	restrictedExecIsolationError = func() error { return reason }
+	t.Cleanup(func() {
+		restrictedExecAutoApprovable = oldOK
+		restrictedExecIsolationError = oldErr
+	})
+}
+
 func TestSafeApproval_AutoRunsDepsAndTests(t *testing.T) {
+	stubRestrictedExecIsolation(t, true, nil)
 	app := newBuildAppForDepsTest(t)
 	app.cfg.ApprovalMode = config.ApprovalModeSafe
 
@@ -147,6 +163,29 @@ func TestSafeApproval_AutoRunsDepsAndTests(t *testing.T) {
 	}
 	if !chatContainsMessage(app, i18n.Msg().ApprovalAutoTests) {
 		t.Fatalf("chat missing safe tests auto-approval message: %+v", app.chat.messages)
+	}
+}
+
+func TestSafeApproval_PromptsForDepsWhenIsolationUnavailable(t *testing.T) {
+	isolationErr := errors.New("candidate verification requires bubblewrap (bwrap)")
+	stubRestrictedExecIsolation(t, false, isolationErr)
+	app := newBuildAppForDepsTest(t)
+	app.cfg.ApprovalMode = config.ApprovalModeSafe
+
+	modelAfterStart, depsCmd := app.startDepsPhase()
+	app = modelAfterStart.(App)
+	if depsCmd != nil {
+		t.Fatal("safe mode must not auto-run deps without sandbox isolation")
+	}
+	if app.state != StateConfirmDeps {
+		t.Fatalf("state = %v, want %v", app.state, StateConfirmDeps)
+	}
+	if app.pipeline.DepsApproved() {
+		t.Fatal("deps must not be marked approved without isolation")
+	}
+	wantNotice := fmt.Sprintf(i18n.Msg().ApprovalIsolationUnavailable, isolationErr)
+	if !chatContainsMessage(app, wantNotice) {
+		t.Fatalf("chat missing isolation notice %q: %+v", wantNotice, app.chat.messages)
 	}
 }
 

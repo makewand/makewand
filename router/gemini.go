@@ -17,6 +17,7 @@ type Gemini struct {
 	model        string
 	chatClient   *http.Client
 	streamClient *http.Client
+	instanceCostTable
 }
 
 // NewGemini creates a new Gemini provider.
@@ -34,6 +35,11 @@ func NewGemini(apiKey, model string) *Gemini {
 
 func (g *Gemini) Name() string      { return "gemini" }
 func (g *Gemini) IsAvailable() bool { return g.apiKey != "" }
+
+// SafeForUntrustedRepo reports that Gemini is safe against an untrusted repo: it
+// is a pure HTTP call to the Google Generative Language API and runs no local
+// repo-aware agent.
+func (g *Gemini) SafeForUntrustedRepo() bool { return true }
 
 type geminiRequest struct {
 	Contents          []geminiContent         `json:"contents"`
@@ -70,9 +76,13 @@ type geminiResponse struct {
 }
 
 func (g *Gemini) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	model := g.model
+	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
+		model = requested
+	}
 	apiURL := fmt.Sprintf(
 		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent",
-		url.PathEscape(g.model),
+		url.PathEscape(model),
 	)
 
 	var contents []geminiContent
@@ -136,8 +146,8 @@ func (g *Gemini) Chat(ctx context.Context, messages []Message, system string, ma
 	usage := Usage{
 		InputTokens:  result.UsageMetadata.PromptTokenCount,
 		OutputTokens: result.UsageMetadata.CandidatesTokenCount,
-		Cost:         EstimateCost(g.model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount),
-		Model:        g.model,
+		Cost:         g.priceForCtx(ctx, model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount),
+		Model:        model,
 		Provider:     "gemini",
 	}
 
@@ -145,9 +155,13 @@ func (g *Gemini) Chat(ctx context.Context, messages []Message, system string, ma
 }
 
 func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	model := g.model
+	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
+		model = requested
+	}
 	apiURL := fmt.Sprintf(
 		"https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse",
-		url.PathEscape(g.model),
+		url.PathEscape(model),
 	)
 
 	var contents []geminiContent

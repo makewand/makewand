@@ -35,10 +35,6 @@ func (r *Router) recordProviderSuccess(provider string) {
 	r.breaker.RecordSuccess(provider)
 }
 
-func (r *Router) recordProviderFailure(provider string) (bool, time.Time) {
-	return r.recordProviderFailureForErr(provider, nil)
-}
-
 func (r *Router) recordProviderFailureForErr(provider string, callErr error) (bool, time.Time) {
 	// Feed confirmed quota/rate-limit errors back to the quota layer so the pool
 	// is sealed until its window resets, not just circuit-broken for a cooldown.
@@ -133,8 +129,14 @@ func providerAttemptTimeout(mode UsageMode, phase BuildPhase, provider string) t
 	}
 
 	// Power mode: generous budgets — ensemble calls are parallel so total wall
-	// time is bounded by the slowest provider, not the sum.
-	return buildPhaseAttemptTimeout(phase)
+	// time is bounded by the slowest provider plus the judge. A remote provider
+	// represents that entire two-stage server-side pipeline, so its outer client
+	// deadline must cover both stages rather than one local provider attempt.
+	phaseTimeout := buildPhaseAttemptTimeout(phase)
+	if provider == "remote" {
+		return 2*phaseTimeout + 15*time.Second
+	}
+	return phaseTimeout
 }
 
 func withProviderAttemptTimeoutFor(ctx context.Context, mode UsageMode, phase BuildPhase, provider string) (context.Context, context.CancelFunc) {
@@ -153,29 +155,4 @@ func withProviderAttemptTimeoutFor(ctx context.Context, mode UsageMode, phase Bu
 func withProviderAttemptTimeout(ctx context.Context, phase BuildPhase) (context.Context, context.CancelFunc) {
 	// Backward-compatible helper for tests/default paths.
 	return withProviderAttemptTimeoutFor(ctx, ModeBalanced, phase, "")
-}
-
-func withStreamAttemptCancel(ch <-chan StreamChunk, cancel context.CancelFunc) <-chan StreamChunk {
-	if ch == nil || cancel == nil {
-		return ch
-	}
-
-	out := make(chan StreamChunk, 1)
-	go func() {
-		defer close(out)
-		defer cancel()
-		for chunk := range ch {
-			select {
-			case out <- chunk:
-			case <-time.After(30 * time.Second):
-				// Consumer stopped reading — abandon to avoid goroutine leak.
-				return
-			}
-			if chunk.Done || chunk.Error != nil {
-				return
-			}
-		}
-	}()
-
-	return out
 }

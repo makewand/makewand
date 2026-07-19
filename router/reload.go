@@ -1,7 +1,7 @@
 // reload.go — Strategy table hot-reload via file system polling.
 //
 // WatchOverrides starts a background goroutine that periodically checks
-// routing.json for changes and merges them into the package-level strategy tables.
+// routing.json for changes and merges them into this Router's strategy tables.
 // No external dependencies (fsnotify) required — uses simple stat-based polling.
 package router
 
@@ -17,8 +17,10 @@ import (
 const DefaultReloadInterval = 30 * time.Second
 
 // WatchOverrides starts a background goroutine that polls configDir/routing.json
-// for modifications. When the file changes, the new data is merged into the
-// package-level strategy tables. The goroutine stops when ctx is canceled.
+// for modifications. When the file changes, the new data is validated and
+// deep-merged into this Router's strategy tables; other Router instances are
+// unaffected. Invalid overrides keep the previous tables. The goroutine stops
+// when ctx is canceled.
 //
 // Returns immediately. Call with a cancellable context to stop the watcher.
 // Errors during reload are traced (if a TraceSink is set) but do not stop the watcher.
@@ -52,7 +54,29 @@ func (r *Router) WatchOverridesInterval(ctx context.Context, configDir string, i
 			case <-ticker.C:
 				info, err := os.Stat(path)
 				if err != nil {
-					continue // file doesn't exist or is inaccessible
+					if os.IsNotExist(err) {
+						// The override file was removed. Revert to the immutable
+						// defaults exactly once, then stay quiet until a new file
+						// appears. A zero lastMod means no override was ever active.
+						prev := lastMod.Load().(time.Time)
+						if prev.IsZero() {
+							continue
+						}
+						r.routingTables().resetToDefaults()
+						lastMod.Store(time.Time{})
+						r.emitTrace(TraceEvent{
+							Event:  "reload_success",
+							Detail: "routing.json removed; reverted to defaults",
+						})
+						continue
+					}
+					// Other stat errors (permissions, transient FS issues): surface
+					// and skip without touching the live tables.
+					r.emitTrace(TraceEvent{
+						Event: "reload_error",
+						Error: "stat routing.json: " + err.Error(),
+					})
+					continue
 				}
 
 				prev := lastMod.Load().(time.Time)
@@ -69,10 +93,12 @@ func (r *Router) WatchOverridesInterval(ctx context.Context, configDir string, i
 					continue
 				}
 
-				if err := loadDefaults(data); err != nil {
+				// applyOverrides validates the merged candidate before swapping
+				// it in; on failure the previous tables stay active.
+				if err := r.routingTables().applyOverrides(data); err != nil {
 					r.emitTrace(TraceEvent{
 						Event: "reload_error",
-						Error: "parsing routing.json: " + err.Error(),
+						Error: "applying routing.json: " + err.Error(),
 					})
 					continue
 				}

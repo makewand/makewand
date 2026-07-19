@@ -12,7 +12,7 @@ import (
 func TestWatchOverrides_ReloadsOnChange(t *testing.T) {
 	dir := t.TempDir()
 
-	r := NewRouterFromConfig(RouterConfig{
+	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"claude": {Provider: &stubProvider{name: "claude", available: true}, Access: AccessSubscription},
 		},
@@ -79,7 +79,7 @@ func TestWatchOverrides_ReloadsOnChange(t *testing.T) {
 func TestWatchOverrides_StopsOnCancel(t *testing.T) {
 	dir := t.TempDir()
 
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r.WatchOverridesInterval(ctx, dir, 50*time.Millisecond)
@@ -92,7 +92,7 @@ func TestWatchOverrides_StopsOnCancel(t *testing.T) {
 func TestWatchOverrides_IgnoresBadJSON(t *testing.T) {
 	dir := t.TempDir()
 
-	r := NewRouterFromConfig(RouterConfig{})
+	r := mustNewRouter(RouterConfig{})
 
 	var mu sync.Mutex
 	var traces []TraceEvent

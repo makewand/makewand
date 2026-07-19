@@ -66,6 +66,12 @@ func (s *SQLiteUserStore) CreateUser(email, password string) (*User, error) {
 }
 
 func (s *SQLiteUserStore) CreateUserWithRole(email, password, role string) (*User, error) {
+	return s.CreateUserWithRoleActive(email, password, role, true)
+}
+
+// CreateUserWithRoleActive creates a new user account with an explicit role and
+// initial active state persisted in a single INSERT.
+func (s *SQLiteUserStore) CreateUserWithRoleActive(email, password, role string, active bool) (*User, error) {
 	if s == nil {
 		return nil, fmt.Errorf("sqlite user store is unavailable")
 	}
@@ -88,12 +94,12 @@ func (s *SQLiteUserStore) CreateUserWithRole(email, password, role string) (*Use
 		Role:      role,
 		CreatedAt: now,
 		UpdatedAt: now,
-		IsActive:  true,
+		IsActive:  active,
 	}
 	user.PasswordHash = hashPassword(password, user.Salt)
 	_, err = s.db.Exec(`
 INSERT INTO users (id, email, password_hash, salt, role, created_at, updated_at, is_active)
-VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		user.ID,
 		user.Email,
 		user.PasswordHash,
@@ -101,6 +107,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
 		user.Role,
 		user.CreatedAt.Format(time.RFC3339),
 		user.UpdatedAt.Format(time.RFC3339),
+		boolToInt(active),
 	)
 	if err != nil {
 		return nil, err

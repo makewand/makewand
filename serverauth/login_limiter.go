@@ -1,6 +1,7 @@
 package serverauth
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ type LoginRateLimiter struct {
 	window      time.Duration
 	lockout     time.Duration
 	attempts    map[string]loginAttempt
+	trusted     *TrustedProxies
 }
 
 type loginAttempt struct {
@@ -97,23 +99,117 @@ func (l *LoginRateLimiter) Reset(key string) {
 	delete(l.attempts, key)
 }
 
+// SetTrustedProxies configures the proxy peers whose forwarding headers are
+// honored when deriving throttle keys. When unset (the default), forwarding
+// headers are ignored and keys use the direct peer address.
+func (l *LoginRateLimiter) SetTrustedProxies(trusted *TrustedProxies) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.trusted = trusted
+}
+
+// ThrottleKey derives the limiter key for a request using this limiter's
+// trusted-proxy configuration.
+func (l *LoginRateLimiter) ThrottleKey(req *http.Request, principal string) string {
+	var trusted *TrustedProxies
+	if l != nil {
+		l.mu.Lock()
+		trusted = l.trusted
+		l.mu.Unlock()
+	}
+	return strings.TrimSpace(strings.ToLower(principal)) + "|" + ClientIP(req, trusted)
+}
+
+// LoginThrottleKey derives a limiter key from the request's direct peer
+// address. Client-supplied forwarding headers (X-Forwarded-For, X-Real-IP) are
+// ignored; use LoginRateLimiter.ThrottleKey with SetTrustedProxies to honor
+// them behind a trusted reverse proxy.
 func LoginThrottleKey(req *http.Request, principal string) string {
-	principal = strings.TrimSpace(strings.ToLower(principal))
-	host := ""
-	if req != nil {
-		forwarded := strings.TrimSpace(req.Header.Get("X-Forwarded-For"))
-		if forwarded != "" {
-			host = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+	return strings.TrimSpace(strings.ToLower(principal)) + "|" + ClientIP(req, nil)
+}
+
+// TrustedProxies matches direct peer addresses against operator-configured
+// reverse proxy networks.
+type TrustedProxies struct {
+	nets []*net.IPNet
+}
+
+// ParseTrustedProxies parses proxy addresses in CIDR notation (bare IPs are
+// treated as /32 or /128). An empty list yields nil, meaning no proxies are
+// trusted.
+func ParseTrustedProxies(values []string) (*TrustedProxies, error) {
+	nets := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
 		}
-		if host == "" {
-			host = strings.TrimSpace(req.Header.Get("X-Real-IP"))
-		}
-		if host == "" {
-			host, _, _ = net.SplitHostPort(strings.TrimSpace(req.RemoteAddr))
-			if host == "" {
-				host = strings.TrimSpace(req.RemoteAddr)
+		if !strings.Contains(value, "/") {
+			ip := net.ParseIP(value)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid trusted proxy address %q", value)
 			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			value = fmt.Sprintf("%s/%d", ip.String(), bits)
+		}
+		_, network, err := net.ParseCIDR(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", value, err)
+		}
+		nets = append(nets, network)
+	}
+	if len(nets) == 0 {
+		return nil, nil
+	}
+	return &TrustedProxies{nets: nets}, nil
+}
+
+// Trusts reports whether ip belongs to a configured trusted proxy network.
+func (t *TrustedProxies) Trusts(ip net.IP) bool {
+	if t == nil || ip == nil {
+		return false
+	}
+	for _, network := range t.nets {
+		if network.Contains(ip) {
+			return true
 		}
 	}
-	return principal + "|" + host
+	return false
+}
+
+// ClientIP returns the throttling address for a request. Forwarding headers
+// are honored only when the direct peer is a trusted proxy; otherwise the
+// direct peer address is used.
+func ClientIP(req *http.Request, trusted *TrustedProxies) string {
+	if req == nil {
+		return ""
+	}
+	host := remoteHost(req.RemoteAddr)
+	if !trusted.Trusts(net.ParseIP(host)) {
+		return host
+	}
+	if forwarded := strings.TrimSpace(req.Header.Get("X-Forwarded-For")); forwarded != "" {
+		if client := strings.TrimSpace(strings.Split(forwarded, ",")[0]); client != "" {
+			return client
+		}
+	}
+	if realIP := strings.TrimSpace(req.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
+	return host
+}
+
+func remoteHost(remoteAddr string) string {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return remoteAddr
+	}
+	return strings.TrimSpace(host)
 }

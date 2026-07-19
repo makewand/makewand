@@ -117,15 +117,25 @@ func (c *CostTracker) IsSubscription(provider string) bool {
 	return false
 }
 
+// HasPayAsYouGo returns true if there are any pay-as-you-go (non-subscription) entries.
+func (c *CostTracker) HasPayAsYouGo() bool {
+	for _, e := range c.entries {
+		if !e.isSubscription {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckBudget returns a warning string if the session total approaches or exceeds the budget.
 // Returns empty string if budget is zero (disabled) or spending is below 80%.
 func (c *CostTracker) CheckBudget(budget float64) string {
 	status := c.BudgetStatus(budget)
 	switch status.Level {
 	case BudgetExceeded:
-		return fmt.Sprintf("Budget exceeded: $%.2f / $%.2f (%.0f%%)", status.Total, status.Budget, status.Percent)
+		return fmt.Sprintf(i18n.Msg().BudgetExceededMsg, status.Total, status.Budget, status.Percent)
 	case BudgetWarning:
-		return fmt.Sprintf("Budget warning: $%.2f / $%.2f (%.0f%%)", status.Total, status.Budget, status.Percent)
+		return fmt.Sprintf(i18n.Msg().BudgetWarningMsg, status.Total, status.Budget, status.Percent)
 	default:
 		return ""
 	}
@@ -194,23 +204,31 @@ func (c *CostTracker) View(width int) string {
 		}
 
 		var costStr string
-		if c.IsSubscription(p.name) {
+		switch {
+		case c.IsSubscription(p.name):
 			// Subscription: show request count and token estimate
 			reqCount := c.RequestCount(p.name)
 			inTok, outTok := c.TokensByProvider(p.name)
 			totalTok := inTok + outTok
 			costStr = fmt.Sprintf(msg.CostRequests, reqCount, formatTokenCount(totalTok))
-		} else if cost == 0 {
+		case cost == 0:
 			costStr = msg.CostFree
-		} else {
+		default:
 			costStr = fmt.Sprintf("$%.2f", cost)
 		}
-		b.WriteString(fmt.Sprintf("│ %-8s %s\n", p.label+":", costStr))
+		fmt.Fprintf(&b, "│ %-8s %s\n", p.label+":", costStr)
 	}
 
-	total := c.SessionTotal()
-	b.WriteString("│ ─────────────────\n")
-	b.WriteString(fmt.Sprintf("│ %-8s %8s\n", msg.CostTotal+":", fmt.Sprintf("$%.2f", total)))
+	// Only show total cost if there are pay-as-you-go charges
+	if c.HasPayAsYouGo() {
+		total := c.SessionTotal()
+		b.WriteString("│ ─────────────────\n")
+		fmt.Fprintf(&b, "│ %-8s %8s\n", msg.CostTotal+":", fmt.Sprintf("$%.2f", total))
+	} else {
+		// All subscription - no charge display
+		b.WriteString("│ ─────────────────\n")
+		fmt.Fprintf(&b, "│ (%s)\n", msg.CostSubscription)
+	}
 	b.WriteString("└─────────────────┘")
 
 	return b.String()

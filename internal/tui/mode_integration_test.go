@@ -61,7 +61,10 @@ func makeTestRouter(t *testing.T, mode model.UsageMode) *model.Router {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.UsageMode = mode.String()
-	r := model.NewRouter(cfg)
+	r, err := model.NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
 	r.SetMode(mode)
 	return r
 }
@@ -200,7 +203,11 @@ func TestMode_PowerBuild_SingleProviderSkipsReview(t *testing.T) {
 	// Simulate only 1 available provider by not registering any CLI/API providers.
 	// NewRouter with default config has no providers → Available() returns empty.
 	// We keep the default router which has no providers.
-	app.router = model.NewRouter(config.DefaultConfig())
+	emptyRouter, err := model.NewRouter(config.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	app.router = emptyRouter
 	app.pipeline.SetCodeProvider("claude")
 
 	// Simulate file write complete in build phase.

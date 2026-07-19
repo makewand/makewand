@@ -15,6 +15,12 @@ type breakerState struct {
 	consecutiveFailures int
 	openUntil           time.Time
 	halfOpen            bool
+	// halfOpenProbeAt records when the current half-open trial call was
+	// admitted. While set, further BeforeAttempt calls are rejected so exactly
+	// one concurrent probe decides the outcome; RecordSuccess/RecordFailure
+	// clear it. A probe that never reports back (e.g. its caller was canceled)
+	// expires after one cooldown so the provider cannot stay blocked forever.
+	halfOpenProbeAt time.Time
 }
 
 // providerCircuitBreaker implements a per-provider circuit breaker with
@@ -50,7 +56,8 @@ func (cb *providerCircuitBreaker) PeekOpen(provider string) (bool, time.Duration
 }
 
 // BeforeAttempt transitions from open->half-open when cooldown has elapsed.
-// It returns false while the circuit is still open.
+// It returns false while the circuit is still open, and false for every caller
+// but the first while a half-open trial call is in flight.
 func (cb *providerCircuitBreaker) BeforeAttempt(provider string) (bool, time.Duration) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -64,7 +71,18 @@ func (cb *providerCircuitBreaker) BeforeAttempt(provider string) (bool, time.Dur
 		// Cooldown elapsed: allow one trial call in half-open.
 		state.openUntil = time.Time{}
 		state.halfOpen = true
+		state.halfOpenProbeAt = now
 		state.consecutiveFailures = 0
+		return true, 0
+	}
+	if state.halfOpen {
+		// A half-open trial is already in flight: block concurrent callers so a
+		// single probe decides the outcome (routing falls to the next candidate).
+		// If the probe never reports back, re-arm after one cooldown.
+		if elapsed := now.Sub(state.halfOpenProbeAt); elapsed < cb.cooldown {
+			return false, cb.cooldown - elapsed
+		}
+		state.halfOpenProbeAt = now
 	}
 	return true, 0
 }
@@ -77,6 +95,7 @@ func (cb *providerCircuitBreaker) RecordSuccess(provider string) {
 	state.consecutiveFailures = 0
 	state.openUntil = time.Time{}
 	state.halfOpen = false
+	state.halfOpenProbeAt = time.Time{}
 }
 
 func (cb *providerCircuitBreaker) RecordFailure(provider string) (opened bool, until time.Time) {
@@ -95,6 +114,7 @@ func (cb *providerCircuitBreaker) RecordFailureWeighted(provider string, weight 
 	now := cb.now()
 	if state.halfOpen {
 		state.halfOpen = false
+		state.halfOpenProbeAt = time.Time{}
 		state.consecutiveFailures = 0
 		state.openUntil = now.Add(cb.cooldown)
 		return true, state.openUntil

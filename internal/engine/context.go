@@ -76,16 +76,37 @@ func symbolExtractable(path string) string {
 	}
 }
 
-// LoadRepoContext loads project rules, file hints, and symbols.
+// RepoContextOptions controls how repository content is incorporated.
+type RepoContextOptions struct {
+	// UntrustedRepo, when true, treats repository-provided instruction content as
+	// untrusted: .makewand/rules.md is NOT loaded or injected as trusted
+	// "Project rules". Symbols/file hints (structural, non-instruction context)
+	// may still be included.
+	UntrustedRepo bool
+}
+
+// LoadRepoContext loads project rules, file hints, and symbols using the
+// trusted default (opts.UntrustedRepo == false).
 func LoadRepoContext(projectDir string, files []FileEntry) (*RepoContext, error) {
+	return LoadRepoContextWithOptions(projectDir, files, RepoContextOptions{})
+}
+
+// LoadRepoContextWithOptions is LoadRepoContext with explicit trust options.
+func LoadRepoContextWithOptions(projectDir string, files []FileEntry, opts RepoContextOptions) (*RepoContext, error) {
 	rc := &RepoContext{
 		FileHints: make(map[string]string),
 	}
 
 	// Load rules from .makewand/rules.md (optional).
-	rulesPath := filepath.Join(projectDir, ".makewand", "rules.md")
-	if data, err := os.ReadFile(rulesPath); err == nil {
-		rc.Rules = strings.TrimSpace(string(data))
+	// In untrusted mode this repo-provided instruction text is attacker-controlled
+	// (a prompt-injection vector even for API providers), so it is skipped entirely
+	// and rc.Rules is left empty — the "Project rules" section is never emitted (see
+	// ForPrompt). Symbols and file hints remain structural, non-instruction context.
+	if !opts.UntrustedRepo {
+		rulesPath := filepath.Join(projectDir, ".makewand", "rules.md")
+		if data, err := os.ReadFile(rulesPath); err == nil {
+			rc.Rules = strings.TrimSpace(string(data))
+		}
 	}
 
 	// Extract file hints for key files.
@@ -97,15 +118,64 @@ func LoadRepoContext(projectDir string, files []FileEntry) (*RepoContext, error)
 		if !keyFileNames[base] {
 			continue
 		}
+		// In untrusted mode, never read through a symlink or non-regular file, and
+		// never read a file whose resolved path escapes the project root. An
+		// attacker's repo could ship a key file symlinked to .makewand/rules.md
+		// (bypassing the untrusted rules ban) or to a host secret such as
+		// ~/.ssh/id_rsa; its first lines would otherwise be injected verbatim into
+		// the system prompt (instruction injection + host-file exfiltration).
+		if opts.UntrustedRepo && !isSafeRegularFile(projectDir, f.Path) {
+			continue
+		}
 		if hint := readFirstLines(filepath.Join(projectDir, f.Path), fileHintLines); hint != "" {
 			rc.FileHints[f.Path] = hint
 		}
 	}
 
-	// Extract symbols.
-	rc.Symbols = ExtractSymbols(projectDir, files)
+	// Extract symbols. In untrusted mode, restrict extraction to safe regular
+	// in-root files so it never reads through an attacker's symlink either.
+	symbolFiles := files
+	if opts.UntrustedRepo {
+		symbolFiles = make([]FileEntry, 0, len(files))
+		for _, f := range files {
+			if f.IsDir {
+				continue
+			}
+			if !isSafeRegularFile(projectDir, f.Path) {
+				continue
+			}
+			symbolFiles = append(symbolFiles, f)
+		}
+	}
+	rc.Symbols = ExtractSymbols(projectDir, symbolFiles)
 
 	return rc, nil
+}
+
+// isSafeRegularFile reports whether joining projectDir with relPath yields a
+// regular file whose fully-resolved path stays within projectDir. It is used in
+// untrusted mode to refuse reading symlinks or other non-regular entries for
+// prompt context: os.Lstat (not os.Stat) detects a symlinked final component
+// without following it, while filepath.EvalSymlinks + isWithinDir additionally
+// reject entries reachable only through a parent directory symlink that escapes
+// the project root.
+func isSafeRegularFile(projectDir, relPath string) bool {
+	fullPath := filepath.Join(projectDir, relPath)
+
+	info, err := os.Lstat(fullPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+
+	resolved, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		return false
+	}
+	projectAbs, err := filepath.Abs(projectDir)
+	if err != nil {
+		return false
+	}
+	return isWithinDir(projectAbs, resolved)
 }
 
 // readFirstLines reads the first n lines from a file, returning them joined.

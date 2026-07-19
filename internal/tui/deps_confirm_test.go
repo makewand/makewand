@@ -81,6 +81,10 @@ func TestDepsConfirm_DeclinePath(t *testing.T) {
 }
 
 func TestDepsAndTestsConfirm_AcceptPath(t *testing.T) {
+	// The accept path reaches runDepsPlan/runTestsPlan, which fail closed without
+	// isolation. Pin isolation as available so this test exercises the run path
+	// regardless of whether bubblewrap works on the host.
+	stubRestrictedExecIsolation(t, true, nil)
 	app := newBuildAppForDepsTest(t)
 
 	model, cmd := app.startDepsPhase()

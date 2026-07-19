@@ -70,8 +70,12 @@ See [docs/PACKAGE_DISTRIBUTION.md](docs/PACKAGE_DISTRIBUTION.md) for setup.
 ## Quick Start / 快速开始
 
 ```bash
-# First-time setup / 首次配置
+# First-time setup; persists balanced routing by default
+# 首次配置；默认保存 balanced 路由模式
 makewand setup
+
+# Optionally persist a different routing mode / 可选：保存其他路由模式
+makewand setup --mode fast
 
 # Health check / 健康检查
 makewand doctor --strict --modes balanced,power
@@ -86,235 +90,13 @@ makewand new
 makewand --print "Explain this error" --mode fast
 ```
 
-### Personal Remote Mode / 个人远程模式
+### Remote Server (Alpha)
 
-Run `makewand` on one main machine and continue from other computers by pointing
-them at that host. The server uses your local providers; remote clients use the
-HTTP facade plus centralized chat session storage.
-可在一台主力机器上运行 `makewand`，并让其他电脑继续使用同一个后端。服务端使用本机
-Provider；其他电脑通过 HTTP facade 和集中式会话存储实现续接。
+⚠️ **ALPHA STATUS**: The server component is in alpha and provided without production support. For details on limitations, security considerations, and setup instructions, see [docs/SERVER_ALPHA.md](docs/SERVER_ALPHA.md).
 
-On your main machine / 在主机上：
+**Quick summary**: Makewand can run as a server for centralized session storage and remote access via SSH tunnel or TLS-terminating reverse proxy. Use `makewand serve --listen 127.0.0.1:8080 --enable-users` on your main machine and point remote clients to it via `MAKEWAND_REMOTE_URL=http://localhost:8080` (over SSH tunnel, with `MAKEWAND_REMOTE_TOKEN` set to a server-issued token).
 
-```bash
-makewand token issue \
-  --auth-config ~/.config/makewand/server_auth.json \
-  --id runner \
-  --description "interactive remote client" \
-  --allowed-providers codex \
-  --allowed-modes balanced \
-  --workspace-prefixes repo- \
-  --max-requests-per-hour 120 \
-  --max-requests-per-day 1000
-
-MAKEWAND_SERVER_AUTH_CONFIG=~/.config/makewand/server_auth.json \
-MAKEWAND_SERVER_AUDIT_LOG=1 \
-MAKEWAND_SERVER_ALERT_WEBHOOK=https://alerts.example.com/makewand \
-makewand serve --listen 127.0.0.1:8080 --enable-users
-```
-
-By default, `serve` now keeps users, issued tokens, and usage in
-`~/.config/makewand/server/state.db`. JSONL audit logging remains optional.
-现在 `serve` 默认会把用户、签发的 token 和 usage 持久化到
-`~/.config/makewand/server/state.db`；JSONL 审计日志仍然是可选项。
-
-The same server also exposes a lightweight admin console at `/admin` for live
-dashboards, token issuance, team setup, and billing inspection.
-同一个服务端还会在 `/admin` 提供一个轻量管理界面，用于查看实时仪表盘、签发 token、
-配置团队和检查账单汇总。
-
-Budget enforcement and billing alerts now evaluate against the current month by
-default, so previous months no longer consume the active monthly budget. When
-`MAKEWAND_SERVER_ALERT_WEBHOOK` or `--alert-webhook` is configured, the server
-will also POST webhook notifications as organizations or projects cross
-`warning/high/critical` spend thresholds for the month.
-月预算和 billing alert 现在默认按“当前月份”计算，不会再把历史月份的支出累积到
-本月预算里。若设置 `MAKEWAND_SERVER_ALERT_WEBHOOK` 或 `--alert-webhook`，
-服务端还会在 organization / project 跨过当月 `warning/high/critical`
-预算阈值时主动发送 webhook 通知。
-
-The admin console can now sign in with a server-side browser session instead of
-storing a long-lived admin bearer token in the page. Mutating admin requests
-use CSRF protection automatically.
-管理界面现在支持服务端浏览器 session 登录，不必把长期 admin bearer token 放在页面
-里；涉及写操作的 admin 请求也会自动走 CSRF 保护。
-
-On another computer / 在其他电脑上：
-
-```bash
-export MAKEWAND_REMOTE_URL=http://your-main-machine:8080
-export MAKEWAND_REMOTE_TOKEN=replace-with-issued-token
-makewand chat .
-```
-
-User login flow / 用户登录发 token：
-
-```bash
-curl -X POST http://your-main-machine:8080/v1/users/register \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"you@example.com","password":"password123"}'
-
-makewand user login \
-  --remote-url http://your-main-machine:8080 \
-  --email you@example.com \
-  --password password123
-```
-
-Check the remote server before using it / 使用前先检查远端服务：
-
-```bash
-makewand doctor --remote-check \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token replace-with-issued-token
-```
-
-Inspect or rotate server-side auth and audit data / 查看或轮换服务端鉴权与审计：
-
-```bash
-makewand token list --auth-config ~/.config/makewand/server_auth.json
-makewand token list --state-db ~/.config/makewand/server/state.db
-makewand token revoke runner --auth-config ~/.config/makewand/server_auth.json
-makewand audit summary --path ~/.config/makewand/server/audit.jsonl
-makewand audit events --path ~/.config/makewand/server/audit.jsonl --limit 20
-makewand usage summary --state-db ~/.config/makewand/server/state.db
-makewand user list --state-db ~/.config/makewand/server/state.db
-makewand usage periods --state-db ~/.config/makewand/server/state.db
-makewand usage alerts --state-db ~/.config/makewand/server/state.db
-```
-
-When the server runs with `--auth-config`, it also exposes admin APIs for live
-token rotation and audit queries. CLI commands can call them directly:
-当服务端使用 `--auth-config` 启动时，还会暴露实时 token 管理与审计查询 API；CLI
-也可直接调用：
-
-```bash
-makewand token list \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token
-
-makewand token issue \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token \
-  --id runner \
-  --allowed-providers codex \
-  --allowed-modes balanced \
-  --max-requests-per-day 1000 \
-  --max-cost-usd-per-day 5
-
-makewand audit summary \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token
-
-makewand audit events \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token \
-  --csv > audit-events.csv
-
-makewand usage summary \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token
-
-makewand usage events \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token \
-  --csv > usage-events.csv
-
-makewand usage periods \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token \
-  --csv > billing-periods.csv
-
-makewand user list \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token
-
-makewand usage alerts \
-  --remote-url http://your-main-machine:8080 \
-  --remote-token your-admin-token \
-  --csv > billing-alerts.csv
-```
-
-Admin APIs / 管理 API：
-
-| Endpoint | Scope |
-|----------|-------|
-| `GET /v1/admin/tokens` | `admin:tokens:read` |
-| `POST /v1/admin/tokens` | `admin:tokens:write` |
-| `POST /v1/admin/tokens/{id}/revoke` | `admin:tokens:write` |
-| `POST /v1/admin/session/login` | admin browser login |
-| `GET /v1/admin/session/me` | admin browser session check |
-| `POST /v1/admin/session/logout` | admin browser logout |
-| `GET /v1/admin/audit/summary` | `admin:audit:read` |
-| `GET /v1/admin/audit/events` | `admin:audit:read` (`?format=csv` supported) |
-| `GET /v1/admin/dashboard` | `admin:usage:read` |
-| `GET /v1/admin/billing/summary` | `admin:usage:read` (`?format=csv` supported) |
-| `GET /v1/admin/billing/periods` | `admin:usage:read` (`?format=csv` supported) |
-| `GET /v1/admin/billing/alerts` | `admin:usage:read` (`?format=csv` supported) |
-| `GET /v1/admin/usage/summary` | `admin:usage:read` |
-| `GET /v1/admin/usage/events` | `admin:usage:read` (`?format=csv` supported) |
-| `GET /v1/admin/users` | `admin:users:read` |
-| `POST /v1/admin/users/{id}/activate` | `admin:users:write` |
-| `POST /v1/admin/users/{id}/deactivate` | `admin:users:write` |
-| `POST /v1/admin/users/{id}/role` | `admin:users:write` |
-| `POST /v1/admin/users/{id}/password` | `admin:users:write` |
-| `GET /v1/admin/organizations` | `admin:users:read` |
-| `POST /v1/admin/organizations` | `admin:users:write` |
-| `GET /v1/admin/projects` | `admin:users:read` |
-| `POST /v1/admin/projects` | `admin:users:write` |
-| `GET /v1/admin/organization-memberships` | `admin:users:read` |
-| `POST /v1/admin/organization-memberships` | `admin:users:write` |
-| `GET /v1/admin/project-memberships` | `admin:users:read` |
-| `POST /v1/admin/project-memberships` | `admin:users:write` |
-| `GET /metrics` | `admin:metrics:read` |
-| `POST /v1/users/register` | unauthenticated |
-| `POST /v1/users/login` | unauthenticated |
-
-List endpoints accept pragmatic filtering and pagination parameters such as
-`q`, `limit`, `offset`, plus resource-specific filters like `organization_id`,
-`project_id`, `user_id`, `role`, `active`, and `revoked`.
-列表型接口支持实用型筛选和分页参数，例如 `q`、`limit`、`offset`，以及
-`organization_id`、`project_id`、`user_id`、`role`、`active`、`revoked`
-这类资源专属过滤条件。
-
-Member users can now be attached to organizations and projects, then issue
-scoped login tokens that inherit those assignments:
-现在成员用户可绑定到 organization / project，并在登录时签发继承这些范围的 token：
-
-```bash
-makewand user login \
-  --remote-url http://your-main-machine:8080 \
-  --email you@example.com \
-  --password password123 \
-  --project-id prj_checkout
-```
-
-Production deployment templates and backup helpers live in:
-生产部署模板与备份脚本见：
-
-- [DEPLOY_PRODUCTION.md](docs/DEPLOY_PRODUCTION.md)
-- [Dockerfile](deploy/Dockerfile)
-- [docker-compose.yml](deploy/docker-compose.yml)
-- [systemd.makewand.service](deploy/systemd.makewand.service)
-- [backup_state.sh](scripts/backup_state.sh)
-- [restore_state.sh](scripts/restore_state.sh)
-
-If both machines point at the same repository, set a shared workspace id to
-resume the same chat even when local paths differ:
-如果两台机器本地目录不同，但希望恢复同一段对话，可显式设置共享 workspace id：
-
-```bash
-export MAKEWAND_WORKSPACE_ID=my-repo-main
-```
-
-Validation scripts / 验证脚本:
-
-```bash
-# Basic connectivity / 基础连通性
-bash scripts/personal_remote_smoke.sh
-
-# Real-case regression / 真实案例回归
-bash scripts/personal_remote_realcase.sh
-```
+**Security**: The server listens on loopback by default and only accepts remote connections over SSH tunnel or TLS-based reverse proxy. Plaintext remote connections are explicitly blocked unless overridden with the `--unsafe-no-tls` flag.
 
 ## Usage Modes / 使用模式
 
@@ -449,13 +231,16 @@ The `router` package is a standalone Go library:
 ```go
 import "github.com/makewand/makewand/router"
 
-r := router.NewRouterFromConfig(router.RouterConfig{
+r, err := router.NewRouterFromConfig(router.RouterConfig{
     Providers: map[string]router.ProviderEntry{
         "claude": {Provider: myProvider, Access: router.AccessSubscription},
     },
     UsageMode: "balanced",
     ConfigDir: "/path/to/config",  // optional: loads routing.json overrides
 })
+if err != nil {
+    return err
+}
 
 content, usage, result, err := r.Chat(ctx, router.TaskCode, messages, system)
 ```
@@ -522,7 +307,8 @@ makewand usage                 Inspect structured usage log / 查看结构化用
 makewand quota                 Show remaining subscription quota / 查看订阅剩余配额 (--json)
 makewand user                  Manage registered server users / 管理注册用户
 makewand preview [path]        Start preview server / 启动预览服务
-makewand setup                 Configure providers / 配置 Provider
+makewand setup [--mode MODE]   Inspect providers and save routing mode (default: balanced)
+                               检查 Provider 并保存路由模式（默认 balanced）
 makewand doctor                Health check / 健康诊断
 
 Flags:
@@ -530,6 +316,11 @@ Flags:
   --print                       One-shot mode / 单次模式
   --timeout <duration>          Timeout for --print (default: 4m)
   --debug                       Enable trace logging / 启用追踪日志
+  --repo-trust <trusted|untrusted>  Repository trust level (default: trusted).
+                                untrusted: only direct API providers may generate
+                                (fail closed), and .makewand/rules.md is not trusted.
+                                不可信仓库模式：仅允许直连 API Provider 生成（失败即拒），
+                                且不信任 .makewand/rules.md
 ```
 
 ## Debugging / 调试
@@ -564,6 +355,8 @@ internal/
 
 ## Security / 安全
 
+- **Trust model / 信任模型**: verification and preview run in a bubblewrap sandbox, but the **generation** stage runs provider CLIs directly on the host with your environment and credentials. Repository content is untrusted input to that host-privileged agent — for untrusted third-party repos, run makewand in a VM/container/low-privilege user. See [SECURITY.md](SECURITY.md#security-model--安全模型).
+  验证与预览在 bubblewrap 沙箱内运行，但**生成**阶段会带着你的环境与凭据在宿主机上直接运行 provider CLI。仓库内容是该宿主权限 agent 的不可信输入——处理不可信的第三方仓库请在 VM/容器/低权限用户下运行。详见 [SECURITY.md](SECURITY.md#security-model--安全模型)。
 - Vulnerability reporting: [SECURITY.md](SECURITY.md)
 - Version support: [SUPPORT.md](SUPPORT.md)
 
