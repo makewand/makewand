@@ -15,5 +15,9 @@
 /password-strength-checker/
 /top_three_project/
 
+# Secrets / local env — never commit provider keys or server tokens
+.env
+deploy/.env
+
 # OS/editor noise
 .DS_Store

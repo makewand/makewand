@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -74,8 +75,12 @@ type PeriodSummary struct {
 	TotalCostUSD          float64 `json:"total_cost_usd,omitempty"`
 }
 
+// Logger persists one usage entry. Log returns an error rather than swallowing
+// it: a dropped write (disk full, lock contention, closed DB) permanently
+// under-counts usage, which silently defeats budget enforcement. Callers must
+// surface a non-nil error (log/alert) instead of ignoring it.
 type Logger interface {
-	Log(Entry)
+	Log(Entry) error
 }
 
 // Reader loads usage entries from a backing store.
@@ -113,16 +118,25 @@ func NewJSONLReader(path string) *JSONLReader {
 	return &JSONLReader{path: path}
 }
 
-func (l *JSONLLogger) Log(entry Entry) {
-	if l == nil || l.f == nil {
-		return
+func (l *JSONLLogger) Log(entry Entry) error {
+	// An unavailable sink (nil or closed) returns an error, not a silent nil, so
+	// strict accounting cannot treat "nothing was written" as success.
+	if l == nil {
+		return fmt.Errorf("usage logger is nil")
 	}
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now().UTC()
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_ = json.NewEncoder(l.f).Encode(entry)
+	// Check the file handle inside the lock to avoid racing Close, which nils it.
+	if l.f == nil {
+		return fmt.Errorf("usage logger is closed")
+	}
+	if err := json.NewEncoder(l.f).Encode(entry); err != nil {
+		return fmt.Errorf("append usage entry: %w", err)
+	}
+	return nil
 }
 
 func (l *JSONLLogger) Close() error {
@@ -166,7 +180,13 @@ func LoadEntries(path string, filter Filter) ([]Entry, error) {
 
 // Load reads entries from the configured JSONL path.
 func (r *JSONLReader) Load(filter Filter) ([]Entry, error) {
-	if r == nil || strings.TrimSpace(r.path) == "" {
+	// A nil (typed-nil) reader is unavailable — return an error so a budget check
+	// fails closed rather than reading it as zero spend. An empty path is a
+	// legitimately-empty reader (no usage file yet).
+	if r == nil {
+		return nil, fmt.Errorf("usage reader is unavailable")
+	}
+	if strings.TrimSpace(r.path) == "" {
 		return nil, nil
 	}
 	entries, err := LoadEntries(r.path, filter)

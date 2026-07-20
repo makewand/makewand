@@ -247,6 +247,12 @@ type QuotaSnapshotter struct {
 	cachePath string
 	cacheTTL  time.Duration
 
+	// started guards the background refresh loop so repeated Start calls (e.g.
+	// several entrypoints defensively starting the same snapshotter) never spawn
+	// more than one ticker goroutine. Once started, it stays started for the life
+	// of the snapshotter; the loop ends when the Start ctx is cancelled.
+	started atomic.Bool
+
 	refreshMu sync.Mutex // serializes refreshes; prevents overlapping fan-out
 	// seals holds provider→until overrides from the 429-feedback path. Never
 	// persisted to disk: a seal reflects a live 429 in this process, and a fresh
@@ -329,11 +335,39 @@ func (s *QuotaSnapshotter) Snapshot() *QuotaSnapshot {
 	return s.current.Load()
 }
 
+// LoadCache does a synchronous, network-free load of the shared on-disk quota
+// cache into the current snapshot. It lets a freshly constructed router serve
+// the last known headroom on its very first request without blocking startup on
+// any source I/O and without leaking a background goroutine. The last-good
+// values are adopted regardless of TTL — a slightly stale estimate beats a blank
+// snapshot — and the background loop (Start) supersedes them once it runs.
+//
+// No-op when the snapshotter is nil, has no disk cache configured, or the cache
+// is missing/unreadable. Safe to call before Start.
+func (s *QuotaSnapshotter) LoadCache() {
+	if s == nil || s.cachePath == "" {
+		return
+	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	if cached, takenAt, ok := loadQuotaCache(s.cachePath, 0); ok {
+		s.applySeals(cached)
+		s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
+	}
+}
+
 // Start launches the background refresh loop and blocks for the first refresh so
 // callers immediately see local sources (codex). It returns after the initial
 // refresh; the loop stops when ctx is cancelled.
+//
+// Start is idempotent: repeated calls are a no-op (they neither refresh again
+// nor spawn a second ticker). Callers wanting a one-off synchronous refresh use
+// Refresh; callers wanting a network-free warm start use LoadCache.
 func (s *QuotaSnapshotter) Start(ctx context.Context) {
 	if s == nil || len(s.sources) == 0 {
+		return
+	}
+	if !s.started.CompareAndSwap(false, true) {
 		return
 	}
 	s.refresh(ctx)

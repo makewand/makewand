@@ -69,8 +69,8 @@ func TestWebhookNotifier_DedupesBySeverityPerMonth(t *testing.T) {
 			ProjectID:      project.ID,
 			CostUSD:        cost,
 		}
-		usageStore.Log(entry)
-		notifier.Log(entry)
+		_ = usageStore.Log(entry)
+		_ = notifier.Log(entry)
 	}
 
 	if len(notifications) != 6 {

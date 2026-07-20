@@ -130,7 +130,34 @@ func (c *CostTracker) HasPayAsYouGo() bool {
 // CheckBudget returns a warning string if the session total approaches or exceeds the budget.
 // Returns empty string if budget is zero (disabled) or spending is below 80%.
 func (c *CostTracker) CheckBudget(budget float64) string {
-	status := c.BudgetStatus(budget)
+	return budgetMessage(c.BudgetStatus(budget))
+}
+
+// BudgetStatus returns a structured spend status for the current session.
+func (c *CostTracker) BudgetStatus(budget float64) BudgetStatus {
+	return budgetStatusFor(c.SessionTotal(), budget)
+}
+
+// budgetStatusFor computes spend pressure from a total against a budget. Shared
+// by the session cost panel and the persistent monthly budget ledger.
+func budgetStatusFor(total, budget float64) BudgetStatus {
+	if budget <= 0 {
+		return BudgetStatus{Level: BudgetOK}
+	}
+	pct := total / budget * 100
+	level := BudgetOK
+	switch {
+	case pct >= 100:
+		level = BudgetExceeded
+	case pct >= 80:
+		level = BudgetWarning
+	}
+	return BudgetStatus{Level: level, Total: total, Budget: budget, Percent: pct}
+}
+
+// budgetMessage renders the localized warning/exceeded notice for a status, or
+// "" when spend is below the warning threshold.
+func budgetMessage(status BudgetStatus) string {
 	switch status.Level {
 	case BudgetExceeded:
 		return fmt.Sprintf(i18n.Msg().BudgetExceededMsg, status.Total, status.Budget, status.Percent)
@@ -138,37 +165,6 @@ func (c *CostTracker) CheckBudget(budget float64) string {
 		return fmt.Sprintf(i18n.Msg().BudgetWarningMsg, status.Total, status.Budget, status.Percent)
 	default:
 		return ""
-	}
-}
-
-// BudgetStatus returns a structured spend status for routing and UI policies.
-func (c *CostTracker) BudgetStatus(budget float64) BudgetStatus {
-	if budget <= 0 {
-		return BudgetStatus{Level: BudgetOK}
-	}
-	total := c.SessionTotal()
-	pct := total / budget * 100
-	if pct >= 100 {
-		return BudgetStatus{
-			Level:   BudgetExceeded,
-			Total:   total,
-			Budget:  budget,
-			Percent: pct,
-		}
-	}
-	if pct >= 80 {
-		return BudgetStatus{
-			Level:   BudgetWarning,
-			Total:   total,
-			Budget:  budget,
-			Percent: pct,
-		}
-	}
-	return BudgetStatus{
-		Level:   BudgetOK,
-		Total:   total,
-		Budget:  budget,
-		Percent: pct,
 	}
 }
 

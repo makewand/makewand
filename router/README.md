@@ -94,14 +94,20 @@ each response also carries `X-Request-Id` for tracing and can be paired with
 the server-side usage ledger, admin APIs, embedded `/admin` console, and
 `/metrics` endpoint.
 
-### Strategy Hot-Reload
+### Strategy Hot-Reload (deprecated)
 
-Watch `routing.json` for changes and merge updates without restart:
+> **Deprecated.** `WatchOverrides` is a library-only opt-in with no makewand
+> entrypoint wired to it, and is scheduled for removal in v0.3. The CLI and
+> server load `routing.json` once at startup; restart to apply changes. New
+> embedders should not depend on it.
+
+Library embedders that still want polling can watch `routing.json` and merge
+updates without restart:
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
-r.WatchOverrides(ctx, configDir)
+r.WatchOverrides(ctx, configDir) // deprecated; removed in v0.3
 ```
 
 Reloads apply only to this Router instance. Every candidate is validated

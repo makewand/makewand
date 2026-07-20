@@ -150,6 +150,7 @@ Flags:
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(serveCmd())
 	rootCmd.AddCommand(tokenCmd())
+	rootCmd.AddCommand(stateCmd())
 	rootCmd.AddCommand(auditCmd())
 	rootCmd.AddCommand(usageCmd())
 	rootCmd.AddCommand(quotaCmd())

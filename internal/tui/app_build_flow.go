@@ -49,9 +49,8 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 		Cost:     msg.cost,
 	})
 
-	// Track cost with token details
-	isSub := a.router.IsSubscription(msg.provider)
-	a.cost.AddWithTokens(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens, isSub)
+	// Track cost with token details (session panel + monthly budget ledger).
+	a.recordKnownUsage(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens)
 	a = a.noteHostCLIExec(msg.provider)
 	a.chat.SetStreaming(false)
 	a.state = StateIdle
@@ -98,6 +97,10 @@ func chatErrorContent(err error) string {
 	return fmt.Sprintf("Error: %s", err)
 }
 
+// recordKnownUsage is the single sink for realized provider usage: it updates
+// the per-session cost panel AND the persistent month-to-date budget ledger.
+// Every success and error path that knows a cost must route through here so the
+// monthly budget reflects all pay-as-you-go spend, not just some branches.
 func (a *App) recordKnownUsage(provider string, cost float64, inputTokens, outputTokens int) {
 	provider = strings.TrimSpace(provider)
 	if a.cost == nil || provider == "" || (cost == 0 && inputTokens == 0 && outputTokens == 0) {
@@ -105,6 +108,14 @@ func (a *App) recordKnownUsage(provider string, cost float64, inputTokens, outpu
 	}
 	isSubscription := a.router != nil && a.router.IsSubscription(provider)
 	a.cost.AddWithTokens(provider, cost, inputTokens, outputTokens, isSubscription)
+	// Any nonzero realized cost is real pay-as-you-go money (subscription
+	// providers report zero cost), so accrue it to the month-to-date budget
+	// ledger regardless of the winning provider's subscription flag. This also
+	// correctly counts ensemble/candidate costs that aggregate API spend behind
+	// a subscription-flagged winner.
+	if cost > 0 {
+		a.monthly.Add(time.Now(), cost)
+	}
 }
 
 // noteHostCLIExec shows a one-time, session-scoped notice the first time a
@@ -427,9 +438,8 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 		return a.startDepsPhase()
 	}
 
-	// Track cost
-	isSub := a.router.IsSubscription(msg.provider)
-	a.cost.AddWithTokens(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens, isSub)
+	// Track cost (session panel + monthly budget ledger).
+	a.recordKnownUsage(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens)
 
 	if !msg.hasIssues {
 		// LGTM — no changes needed
@@ -991,9 +1001,8 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 		return a.buildComplete()
 	}
 
-	// Track cost
-	isSub := a.router.IsSubscription(msg.provider)
-	a.cost.AddWithTokens(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens, isSub)
+	// Track cost (session panel + monthly budget ledger).
+	a.recordKnownUsage(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens)
 
 	a.chat.AddMessage(ChatMessage{
 		Role:     "assistant",

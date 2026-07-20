@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
@@ -12,7 +13,8 @@ func TestApplyBudgetRoutingPolicy_WarningDowngradesToFast(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.MonthlyBudget = 1.0
 	app := *NewApp(ModeChat, cfg, "")
-	app.cost.Add("claude", 0.85)
+	app.monthly = LoadMonthlyLedger("") // isolated, in-memory
+	app.monthly.Add(time.Now(), 0.85)
 
 	app = app.applyBudgetRoutingPolicy()
 
@@ -37,7 +39,8 @@ func TestApplyBudgetRoutingPolicy_ExceededDowngradesToFast(t *testing.T) {
 	cfg.MonthlyBudget = 1.0
 	app := *NewApp(ModeChat, cfg, "")
 	app.router.SetMode(model.ModeBalanced)
-	app.cost.Add("claude", 1.2)
+	app.monthly = LoadMonthlyLedger("") // isolated, in-memory
+	app.monthly.Add(time.Now(), 1.2)
 
 	app = app.applyBudgetRoutingPolicy()
 
@@ -50,7 +53,8 @@ func TestApplyBudgetRoutingPolicy_DeduplicatesWarnings(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.MonthlyBudget = 1.0
 	app := *NewApp(ModeChat, cfg, "")
-	app.cost.Add("claude", 0.85)
+	app.monthly = LoadMonthlyLedger("") // isolated, in-memory
+	app.monthly.Add(time.Now(), 0.85)
 
 	app = app.applyBudgetRoutingPolicy()
 	firstCount := len(app.chat.messages)

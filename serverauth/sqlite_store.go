@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -20,6 +21,13 @@ import (
 type SQLiteStore struct {
 	path string
 	db   *sql.DB
+
+	// mutationMu serializes a whole mutation+reload (Issue/Revoke) so two
+	// concurrent writers cannot each SELECT the table, build a grants snapshot,
+	// and publish them out of order — which could drop a just-issued token or
+	// resurrect a just-revoked one. mu still guards the in-memory grants/views for
+	// concurrent readers.
+	mutationMu sync.Mutex
 
 	mu     sync.RWMutex
 	grants map[string]*Grant
@@ -41,6 +49,10 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	if err := store.reload(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.loadUsageCounters(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -71,11 +83,163 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
 	if err != nil {
 		return err
 	}
+	if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS token_usage_counters (
+  token_id TEXT PRIMARY KEY,
+  quota_window_start TEXT NOT NULL DEFAULT '',
+  quota_window_count INTEGER NOT NULL DEFAULT 0,
+  quota_day_start TEXT NOT NULL DEFAULT '',
+  quota_day_count INTEGER NOT NULL DEFAULT 0,
+  cost_day_start TEXT NOT NULL DEFAULT '',
+  cost_day_spent REAL NOT NULL DEFAULT 0,
+  cost_month_start TEXT NOT NULL DEFAULT '',
+  cost_month_spent REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT ''
+);`); err != nil {
+		return err
+	}
 	return serverdb.EnsureColumns(s.db, "auth_tokens", map[string]string{
 		"user_id":         "user_id TEXT NOT NULL DEFAULT ''",
 		"organization_id": "organization_id TEXT NOT NULL DEFAULT ''",
 		"project_id":      "project_id TEXT NOT NULL DEFAULT ''",
 	})
+}
+
+// loadUsageCounters restores persisted per-token accounting counters into the
+// in-memory grants so that hourly/daily request counts and daily/monthly spend
+// survive a server restart. Grants without a persisted row keep their zeroed
+// counters. Stale windows (a prior day/month) self-heal on next use.
+func (s *SQLiteStore) loadUsageCounters() error {
+	rows, err := s.db.Query(`
+SELECT token_id, quota_window_start, quota_window_count, quota_day_start, quota_day_count,
+       cost_day_start, cost_day_spent, cost_month_start, cost_month_spent
+FROM token_usage_counters`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	byToken := make(map[string]UsageCounters)
+	for rows.Next() {
+		var (
+			c                                         UsageCounters
+			windowStart, dayStart, costDay, costMonth string
+		)
+		if err := rows.Scan(
+			&c.TokenID,
+			&windowStart, &c.QuotaWindowCount,
+			&dayStart, &c.QuotaDayCount,
+			&costDay, &c.CostDaySpent,
+			&costMonth, &c.CostMonthSpent,
+		); err != nil {
+			return err
+		}
+		// Fail closed on a corrupt window timestamp: silently treating it as a
+		// zero (new) window would reset an exhausted quota/spend counter and let a
+		// token bypass its limit. An operator can fix or clear the bad row.
+		for field, raw := range map[string]string{
+			"quota_window_start": windowStart,
+			"quota_day_start":    dayStart,
+			"cost_day_start":     costDay,
+			"cost_month_start":   costMonth,
+		} {
+			if _, err := parseUsageTime(raw); err != nil {
+				return fmt.Errorf("corrupt token_usage_counters.%s for token %s: %w", field, c.TokenID, err)
+			}
+		}
+		c.QuotaWindowStart, _ = parseUsageTime(windowStart)
+		c.QuotaDayStart, _ = parseUsageTime(dayStart)
+		c.CostDayStart, _ = parseUsageTime(costDay)
+		c.CostMonthStart, _ = parseUsageTime(costMonth)
+		byToken[c.TokenID] = c
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, grant := range s.grants {
+		if c, ok := byToken[grant.TokenID()]; ok {
+			grant.importUsage(c)
+		}
+	}
+	return nil
+}
+
+// PersistUsageCounters writes the current in-memory accounting counters for
+// every active token to the state DB. Safe to call periodically and at
+// shutdown; each token is upserted in its own statement so a single failure
+// does not abort the rest.
+func (s *SQLiteStore) PersistUsageCounters() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.mu.RLock()
+	grants := make([]*Grant, 0, len(s.grants))
+	for _, g := range s.grants {
+		grants = append(grants, g)
+	}
+	s.mu.RUnlock()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	var errs []error
+	for _, g := range grants {
+		c, ok := g.exportUsage()
+		if !ok {
+			continue
+		}
+		if _, err := s.db.Exec(`
+INSERT INTO token_usage_counters (
+  token_id, quota_window_start, quota_window_count, quota_day_start, quota_day_count,
+  cost_day_start, cost_day_spent, cost_month_start, cost_month_spent, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(token_id) DO UPDATE SET
+  quota_window_start = excluded.quota_window_start,
+  quota_window_count = excluded.quota_window_count,
+  quota_day_start = excluded.quota_day_start,
+  quota_day_count = excluded.quota_day_count,
+  cost_day_start = excluded.cost_day_start,
+  cost_day_spent = excluded.cost_day_spent,
+  cost_month_start = excluded.cost_month_start,
+  cost_month_spent = excluded.cost_month_spent,
+  updated_at = excluded.updated_at`,
+			c.TokenID,
+			formatUsageTime(c.QuotaWindowStart), c.QuotaWindowCount,
+			formatUsageTime(c.QuotaDayStart), c.QuotaDayCount,
+			formatUsageTime(c.CostDayStart), c.CostDaySpent,
+			formatUsageTime(c.CostMonthStart), c.CostMonthSpent,
+			now,
+		); err != nil {
+			// Continue so one bad token does not block persisting the rest.
+			errs = append(errs, fmt.Errorf("token %s: %w", c.TokenID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// parseUsageTime parses a persisted RFC3339 window timestamp. An empty value is
+// a valid zero time (no window yet); a non-empty value that does not parse is an
+// error so the caller can fail closed rather than silently reset a counter.
+func parseUsageTime(raw string) (time.Time, error) {
+	// Only an exactly-empty value is a valid "no window yet". A whitespace-only or
+	// otherwise malformed value must not be trimmed into a zero time (which would
+	// silently reset a counter) — it fails strict RFC3339 parsing instead.
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.UTC(), nil
+}
+
+func formatUsageTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // Close releases the underlying database handle.
@@ -145,6 +309,11 @@ func (s *SQLiteStore) Issue(rule TokenRule) (TokenRuleView, string, error) {
 	if s == nil {
 		return TokenRuleView{}, "", fmt.Errorf("sqlite token store is unavailable")
 	}
+	// Serialize the INSERT + reload against other mutations so concurrent Issue
+	// calls (e.g. simultaneous logins) cannot publish a snapshot that drops a
+	// just-issued token.
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	if strings.TrimSpace(rule.Token) == "" {
 		token, err := GenerateToken()
 		if err != nil {
@@ -222,6 +391,10 @@ func (s *SQLiteStore) Revoke(tokenID string) error {
 	if s == nil {
 		return fmt.Errorf("sqlite token store is unavailable")
 	}
+	// Serialize against Issue/other Revoke so an interleaved reload cannot
+	// resurrect a just-revoked token or drop a concurrently-issued one.
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	result, err := s.db.Exec(`UPDATE auth_tokens SET revoked = 1 WHERE id = ?`, strings.TrimSpace(tokenID))
 	if err != nil {
 		return err

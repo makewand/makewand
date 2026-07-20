@@ -171,6 +171,38 @@ type HTTPHandlerOptions struct {
 	UsageReader serverusage.Reader
 	TeamStore   serverteam.Store
 
+	// BudgetReservationUSD is the provisional cost reserved against a budgeted
+	// scope for each admitted request until the request settles (its realized
+	// cost is folded into the scope's in-memory committed total). It bounds
+	// concurrent overshoot: the residual is at most, per simultaneously in-flight
+	// request, the amount its realized cost exceeds this estimate — so set it at
+	// or above a typical per-request cost to keep overshoot small or zero. Zero
+	// disables reservation (a headroom-only check).
+	BudgetReservationUSD float64
+
+	// StrictAccounting, when true, records a non-streaming request's usage BEFORE
+	// its success response is written and rejects the request with 503 if that
+	// record fails (or if no usage sink is configured) — so no SUCCESS response is
+	// ever returned without its usage recorded. Scope of the guarantee:
+	//   - It does NOT apply to streaming responses (already on the wire when usage
+	//     is known); those log at the tail and surface failures via
+	//     UsageLogErrorHandler.
+	//   - It does NOT un-spend an upstream provider call already made: a request
+	//     that failed after the provider ran (e.g. invalid output) still incurred
+	//     cost, recorded best-effort and surfaced, not rejected into a refund.
+	// In short: "no unrecorded success", not "no provider cost ever lost".
+	StrictAccounting bool
+
+	// UsageLogErrorHandler is invoked when persisting a usage entry fails. Outside
+	// StrictAccounting, usage logging runs after the response is written, so such a
+	// failure cannot change that request's status — but it must not be silent
+	// either, since a dropped entry under-counts budget. Wire this to a warning
+	// log/alert so the loss is visible. (Under StrictAccounting a non-streaming
+	// request logs BEFORE its success response, and a failure there is a 503
+	// instead; this handler is still called so the failure is also surfaced.)
+	// Nil disables it.
+	UsageLogErrorHandler func(error)
+
 	// UserTokenManager issues login tokens for /v1/users/login when the users
 	// extension is enabled.
 	UserTokenManager serverauth.TokenManager
@@ -263,6 +295,13 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 	auditEvent := auditBaseEvent(req, grant, serverauth.ScopeChatInvoke)
 	auditEvent.Kind = "responses"
 	usageEntry := usageBaseEntry(req, grant)
+	// Settled after the realized cost is logged (below): releases the reservation
+	// and folds the realized cost into the scope's committed total, so a budgeted
+	// scope's spend is never momentarily uncounted.
+	settleBudget := func(float64) {}
+	// usageLogged is set when strict accounting already logged usage before the
+	// response was written, so the finalizer below must not log it twice.
+	usageLogged := false
 	defer func() {
 		if auditEvent.DurationMS == 0 {
 			auditEvent.DurationMS = time.Since(start).Milliseconds()
@@ -283,7 +322,10 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 			usageEntry.ActualProvider = auditEvent.ActualProvider
 		}
 		logHTTPAudit(opt.AuditLogger, auditEvent, auditEvent.Status, auditEvent.ActualProvider, auditEvent.Error)
-		logHTTPUsage(opt.UsageLogger, usageEntry)
+		if !usageLogged {
+			opt.notifyUsageLogError(logHTTPUsage(opt.UsageLogger, usageEntry))
+		}
+		settleBudget(usageEntry.CostUSD)
 	}()
 
 	if req.Method != http.MethodPost {
@@ -324,19 +366,11 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	if err := checkTeamBudget(opt.TeamStore, opt.UsageReader, grant); err != nil {
-		var httpErr *httpStatusError
-		if errors.As(err, &httpErr) {
-			auditEvent.Status = httpErr.Status
-			auditEvent.Error = httpErr.Message
-			writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
-			return
-		}
-		auditEvent.Status = http.StatusInternalServerError
-		auditEvent.Error = err.Error()
-		writeHTTPError(w, http.StatusInternalServerError, "internal_error", err.Error())
+	settle, rejected := r.applyBudgetReservation(w, opt, grant, &auditEvent, &usageEntry)
+	if rejected {
 		return
 	}
+	settleBudget = settle
 	auditEvent.RequestedMode = prepared.EffectiveMode
 	usageEntry.RequestedMode = prepared.EffectiveMode
 	defer prepared.Router.persistHTTPStats(opt.StatsDir)
@@ -426,6 +460,15 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 	if hasToolCalls {
 		resp.OutputText = ""
 	}
+	auditEvent.DurationMS = time.Since(start).Milliseconds()
+	usageEntry.DurationMS = auditEvent.DurationMS
+
+	logged, ok := opt.recordUsageStrict(w, usageEntry, &auditEvent)
+	usageLogged = logged
+	if !ok {
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -435,6 +478,13 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	auditEvent := auditBaseEvent(req, grant, serverauth.ScopeChatInvoke)
 	auditEvent.Kind = "chat"
 	usageEntry := usageBaseEntry(req, grant)
+	// Settled after the realized cost is logged (below): releases the reservation
+	// and folds the realized cost into the scope's committed total, so a budgeted
+	// scope's spend is never momentarily uncounted.
+	settleBudget := func(float64) {}
+	// usageLogged is set when the strict-accounting path already logged usage
+	// before writing the response, so the finalizer below must not log it twice.
+	usageLogged := false
 	defer func() {
 		if auditEvent.DurationMS == 0 {
 			auditEvent.DurationMS = time.Since(start).Milliseconds()
@@ -455,7 +505,10 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 			usageEntry.ActualProvider = auditEvent.ActualProvider
 		}
 		logHTTPAudit(opt.AuditLogger, auditEvent, auditEvent.Status, auditEvent.ActualProvider, auditEvent.Error)
-		logHTTPUsage(opt.UsageLogger, usageEntry)
+		if !usageLogged {
+			opt.notifyUsageLogError(logHTTPUsage(opt.UsageLogger, usageEntry))
+		}
+		settleBudget(usageEntry.CostUSD)
 	}()
 
 	if req.Method != http.MethodPost {
@@ -512,19 +565,11 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	if err := checkTeamBudget(opt.TeamStore, opt.UsageReader, grant); err != nil {
-		var httpErr *httpStatusError
-		if errors.As(err, &httpErr) {
-			auditEvent.Status = httpErr.Status
-			auditEvent.Error = httpErr.Message
-			writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
-			return
-		}
-		auditEvent.Status = http.StatusInternalServerError
-		auditEvent.Error = err.Error()
-		writeHTTPError(w, http.StatusInternalServerError, "internal_error", err.Error())
+	settle, rejected := r.applyBudgetReservation(w, opt, grant, &auditEvent, &usageEntry)
+	if rejected {
 		return
 	}
+	settleBudget = settle
 	auditEvent.RequestedMode = prepared.EffectiveMode
 	usageEntry.RequestedMode = prepared.EffectiveMode
 	defer prepared.Router.persistHTTPStats(opt.StatsDir)
@@ -598,8 +643,8 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		},
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	// Populate the accounting fields before writing the body so strict mode can
+	// record usage first and reject on failure rather than bill-then-lose.
 	auditEvent.Status = http.StatusOK
 	auditEvent.ActualProvider = strings.TrimSpace(usage.Provider)
 	if auditEvent.ActualProvider == "" {
@@ -614,6 +659,16 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	auditEvent.CompletionTokens = usage.OutputTokens
 	auditEvent.CostUSD = usage.Cost
 	auditEvent.DurationMS = time.Since(start).Milliseconds()
+	usageEntry.DurationMS = auditEvent.DurationMS
+
+	logged, ok := opt.recordUsageStrict(w, usageEntry, &auditEvent)
+	usageLogged = logged
+	if !ok {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
@@ -1223,46 +1278,206 @@ func usageBaseEntry(req *http.Request, grant *serverauth.Grant) serverusage.Entr
 	return entry
 }
 
-func checkTeamBudget(teamStore serverteam.Store, usageReader serverusage.Reader, grant *serverauth.Grant) error {
-	if teamStore == nil || usageReader == nil || grant == nil {
-		return nil
+// recordUsageStrict, when StrictAccounting is on, logs usage before the response
+// body is written so a failure can reject the request instead of billing it
+// silently. It returns (logged, ok): logged=true means the caller must not log
+// again in its deferred finalizer; ok=false means usage could not be recorded
+// and the caller has already been sent a 503 and must stop.
+func (opt HTTPHandlerOptions) recordUsageStrict(w http.ResponseWriter, usageEntry serverusage.Entry, auditEvent *serveraudit.Event) (logged, ok bool) {
+	if !opt.StrictAccounting {
+		return false, true
 	}
+	reject := func() {
+		auditEvent.Status = http.StatusServiceUnavailable
+		auditEvent.Error = "usage accounting unavailable"
+		writeHTTPError(w, http.StatusServiceUnavailable, "accounting_unavailable", "usage could not be recorded; request rejected under strict accounting")
+	}
+	// Strict mode requires a real, PERSISTING usage sink. A nil logger records
+	// nothing; a logger that declares itself non-durable (e.g. an alert-notifier
+	// observer) returns nil without persisting. Refuse both rather than silently
+	// "succeed" with nothing written.
+	if opt.UsageLogger == nil {
+		reject()
+		return true, false
+	}
+	if d, ok := opt.UsageLogger.(interface{ Durable() bool }); ok && !d.Durable() {
+		reject()
+		return true, false
+	}
+	if err := logHTTPUsage(opt.UsageLogger, usageEntry); err != nil {
+		opt.notifyUsageLogError(err)
+		reject()
+		return true, false
+	}
+	return true, true
+}
+
+// applyBudgetReservation runs the team-budget check-and-reserve and, on
+// rejection, writes the HTTP error and records it on the audit event. It returns
+// a settle func (call with the request's realized cost once it is logged) and
+// whether the request was rejected (the caller should return immediately).
+func (r *Router) applyBudgetReservation(w http.ResponseWriter, opt HTTPHandlerOptions, grant *serverauth.Grant, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) (func(float64), bool) {
+	settle, err := r.reserveTeamBudget(opt.TeamStore, opt.UsageReader, grant, opt.BudgetReservationUSD, usageEntry)
+	if err == nil {
+		return settle, false
+	}
+	var httpErr *httpStatusError
+	if !errors.As(err, &httpErr) {
+		httpErr = &httpStatusError{Status: http.StatusInternalServerError, Code: "internal_error", Message: err.Error()}
+	}
+	auditEvent.Status = httpErr.Status
+	auditEvent.Error = httpErr.Message
+	writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
+	return func(float64) {}, true
+}
+
+// reserveTeamBudget checks the grant's project and (parent) organization monthly
+// budgets against the in-memory committed+reserved spend and, when they pass,
+// reserves `estimate` against each budgeted scope. It returns a settle func
+// (never nil) that MUST be called once with the request's realized cost after it
+// is logged: settle releases the reservation and folds the realized cost into
+// the committed total atomically, so a scope's spend is never momentarily
+// uncounted. On rejection it undoes anything it reserved and returns a
+// *httpStatusError.
+//
+// estimate<=0 keeps the reservation at zero (a headroom-only check); set it to a
+// typical per-request cost to bound concurrent overshoot.
+//
+// When usageEntry is non-nil and its OrganizationID is empty, the resolved parent
+// organization is written to it so a project-only token's spend is durably
+// attributed to that org (and re-seedable after a restart). Reserver state is
+// keyed by calendar month so a long-running process rolls over cleanly.
+func (r *Router) reserveTeamBudget(teamStore serverteam.Store, usageReader serverusage.Reader, grant *serverauth.Grant, estimate float64, usageEntry *serverusage.Entry) (func(float64), error) {
+	noop := func(float64) {}
+	if teamStore == nil || usageReader == nil || grant == nil {
+		return noop, nil
+	}
+	// Coerce a hostile reservation from a library caller (the CLI validates, but
+	// HTTPHandlerOptions is a public field) so NaN/Inf/negative can't poison the
+	// reserver via admit/settle.
+	estimate = sanitizeCost(estimate)
+	// Use the request's accounting timestamp (set once at handler start) for BOTH
+	// the durable ledger month and the in-memory month key, so a slow request that
+	// crosses a UTC month boundary is attributed to a single, consistent month.
 	now := time.Now().UTC()
+	if usageEntry != nil && !usageEntry.Timestamp.IsZero() {
+		now = usageEntry.Timestamp.UTC()
+	}
+	month := now.Format("2006-01")
+
+	var reserved []string
+	undo := func() {
+		for _, scope := range reserved {
+			r.budgetReservations.unreserve(scope, estimate)
+		}
+	}
+
+	// Organization to enforce. May come straight from the grant, or be resolved
+	// from the project's parent below so a project-only token cannot escape its
+	// organization's budget.
+	orgToCheck := strings.TrimSpace(grant.OrganizationID())
+
 	if projectID := strings.TrimSpace(grant.ProjectID()); projectID != "" {
 		project, err := teamStore.GetProject(projectID)
-		if err == nil && project != nil && project.MonthlyBudgetUSD > 0 {
-			entries, err := usageReader.Load(serverusage.CurrentMonthFilter(serverusage.Filter{ProjectID: projectID}, now))
-			if err != nil {
-				return err
+		if err != nil {
+			// Fail closed: a lookup that errors (store down, or the scope the
+			// token names no longer exists) must not be read as "no budget, allow
+			// unlimited spend".
+			undo()
+			return noop, budgetUnavailable(fmt.Sprintf("project %q", projectID), err)
+		}
+		if project != nil {
+			parentOrg := strings.TrimSpace(project.OrganizationID)
+			// Fail closed on a token that names one org but a project belonging to
+			// a different one — a misconfiguration that could otherwise bill the
+			// wrong (or no) organization budget.
+			if orgToCheck != "" && parentOrg != "" && orgToCheck != parentOrg {
+				undo()
+				return noop, &httpStatusError{
+					Status:  http.StatusForbidden,
+					Code:    "scope_conflict",
+					Message: fmt.Sprintf("token organization %q does not match project %q parent organization %q", orgToCheck, projectID, parentOrg),
+				}
 			}
-			summary := serverusage.SummarizeEntries(entries)
-			if summary.TotalCostUSD >= project.MonthlyBudgetUSD {
-				return &httpStatusError{
-					Status:  http.StatusTooManyRequests,
-					Code:    "budget_exceeded",
-					Message: fmt.Sprintf("project %q exceeded monthly budget", projectID),
+			if project.MonthlyBudgetUSD > 0 {
+				scope := month + "|project:" + projectID
+				if err := r.admitScopeBudget(usageReader, serverusage.Filter{ProjectID: projectID}, now, project.MonthlyBudgetUSD, estimate, scope, "project", projectID); err != nil {
+					undo()
+					return noop, err
+				}
+				reserved = append(reserved, scope)
+			}
+			if orgToCheck == "" {
+				orgToCheck = parentOrg
+				// Durably attribute this project-only request's spend to the parent
+				// org so the org budget seeds correctly after a restart.
+				if usageEntry != nil && strings.TrimSpace(usageEntry.OrganizationID) == "" {
+					usageEntry.OrganizationID = orgToCheck
 				}
 			}
 		}
 	}
-	if orgID := strings.TrimSpace(grant.OrganizationID()); orgID != "" {
-		org, err := teamStore.GetOrganization(orgID)
-		if err == nil && org != nil && org.MonthlyBudgetUSD > 0 {
-			entries, err := usageReader.Load(serverusage.CurrentMonthFilter(serverusage.Filter{OrgID: orgID}, now))
-			if err != nil {
-				return err
+
+	if orgToCheck != "" {
+		org, err := teamStore.GetOrganization(orgToCheck)
+		if err != nil {
+			undo()
+			return noop, budgetUnavailable(fmt.Sprintf("organization %q", orgToCheck), err)
+		}
+		if org != nil && org.MonthlyBudgetUSD > 0 {
+			scope := month + "|org:" + orgToCheck
+			if err := r.admitScopeBudget(usageReader, serverusage.Filter{OrgID: orgToCheck}, now, org.MonthlyBudgetUSD, estimate, scope, "organization", orgToCheck); err != nil {
+				undo()
+				return noop, err
 			}
-			summary := serverusage.SummarizeEntries(entries)
-			if summary.TotalCostUSD >= org.MonthlyBudgetUSD {
-				return &httpStatusError{
-					Status:  http.StatusTooManyRequests,
-					Code:    "budget_exceeded",
-					Message: fmt.Sprintf("organization %q exceeded monthly budget", orgID),
-				}
-			}
+			reserved = append(reserved, scope)
+		}
+	}
+
+	settle := func(actual float64) {
+		for _, scope := range reserved {
+			r.budgetReservations.settle(scope, estimate, actual)
+		}
+	}
+	return settle, nil
+}
+
+// admitScopeBudget seeds the scope's committed spend from the durable ledger the
+// first time it is seen (failing closed on a read error), then atomically
+// rejects the request when committed+reserved spend has reached the cap or else
+// reserves `estimate`. Subsequent admits use the in-memory committed total, so
+// there is no stale-ledger check-then-act window.
+func (r *Router) admitScopeBudget(usageReader serverusage.Reader, filter serverusage.Filter, now time.Time, budgetUSD, estimate float64, scope, kind, id string) error {
+	if !r.budgetReservations.isSeeded(scope) {
+		entries, err := usageReader.Load(serverusage.CurrentMonthFilter(filter, now))
+		if err != nil {
+			return budgetUnavailable(fmt.Sprintf("%s %q", kind, id), err)
+		}
+		// Sanitize per entry, not on the summed total: a single negative/NaN/Inf
+		// row must contribute 0, never cancel legitimate spend or wipe the sum.
+		var spent float64
+		for _, e := range entries {
+			spent += sanitizeCost(e.CostUSD)
+		}
+		r.budgetReservations.seed(scope, spent)
+	}
+	if !r.budgetReservations.admit(scope, budgetUSD, estimate) {
+		return &httpStatusError{
+			Status:  http.StatusTooManyRequests,
+			Code:    "budget_exceeded",
+			Message: fmt.Sprintf("%s %q exceeded monthly budget", kind, id),
 		}
 	}
 	return nil
+}
+
+// budgetUnavailable is the fail-closed response when budget cannot be verified.
+func budgetUnavailable(scope string, err error) error {
+	return &httpStatusError{
+		Status:  http.StatusServiceUnavailable,
+		Code:    "budget_unavailable",
+		Message: fmt.Sprintf("cannot verify budget for %s: %v", scope, err),
+	}
 }
 
 func responsesRequestToChatRequest(req httpResponsesRequest) (httpChatRequest, error) {
@@ -1402,14 +1617,26 @@ func logHTTPAudit(logger serveraudit.Logger, event serveraudit.Event, status int
 	logger.Log(event)
 }
 
-func logHTTPUsage(logger serverusage.Logger, entry serverusage.Entry) {
+func logHTTPUsage(logger serverusage.Logger, entry serverusage.Entry) error {
 	if logger == nil {
-		return
+		return nil
 	}
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now().UTC()
 	}
-	logger.Log(entry)
+	// Never persist a NaN/Inf/negative cost: it would poison later budget seeds
+	// that read this ledger back.
+	entry.CostUSD = sanitizeCost(entry.CostUSD)
+	return logger.Log(entry)
+}
+
+// notifyUsageLogError surfaces a usage-logging failure through the configured
+// handler. No-op when there is no error or no handler.
+func (o HTTPHandlerOptions) notifyUsageLogError(err error) {
+	if err == nil || o.UsageLogErrorHandler == nil {
+		return
+	}
+	o.UsageLogErrorHandler(err)
 }
 
 func finishReasonForToolCalls(hasToolCalls bool) string {

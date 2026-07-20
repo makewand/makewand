@@ -133,8 +133,8 @@ func normalizeOrganization(org Organization) (Organization, error) {
 	if org.Name == "" {
 		return Organization{}, fmt.Errorf("organization name is required")
 	}
-	if org.MonthlyBudgetUSD < 0 {
-		return Organization{}, fmt.Errorf("organization monthly budget must be >= 0")
+	if org.MonthlyBudgetUSD < 0 || math.IsNaN(org.MonthlyBudgetUSD) || math.IsInf(org.MonthlyBudgetUSD, 0) {
+		return Organization{}, fmt.Errorf("organization monthly budget must be a finite amount >= 0")
 	}
 	org.ID = strings.TrimSpace(org.ID)
 	if org.ID == "" {
@@ -165,8 +165,8 @@ func normalizeProject(project Project) (Project, error) {
 	if project.Name == "" {
 		return Project{}, fmt.Errorf("project name is required")
 	}
-	if project.MonthlyBudgetUSD < 0 {
-		return Project{}, fmt.Errorf("project monthly budget must be >= 0")
+	if project.MonthlyBudgetUSD < 0 || math.IsNaN(project.MonthlyBudgetUSD) || math.IsInf(project.MonthlyBudgetUSD, 0) {
+		return Project{}, fmt.Errorf("project monthly budget must be a finite amount >= 0")
 	}
 	project.ID = strings.TrimSpace(project.ID)
 	if project.ID == "" {

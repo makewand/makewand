@@ -2,14 +2,17 @@ package tui
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/makewand/makewand/internal/model"
 )
 
 // applyBudgetRoutingPolicy emits budget warnings and auto-downgrades routing mode
-// when spending pressure is high.
+// when spending pressure is high. The budget is measured against month-to-date
+// pay-as-you-go spend (persisted across sessions and /clear), not the current
+// conversation total.
 func (a App) applyBudgetRoutingPolicy() App {
-	status := a.cost.BudgetStatus(a.cfg.MonthlyBudget)
+	status := a.monthly.BudgetStatus(time.Now(), a.cfg.MonthlyBudget)
 	if status.Level == BudgetOK {
 		a.lastBudgetNoticeLevel = BudgetOK
 		return a
@@ -18,7 +21,7 @@ func (a App) applyBudgetRoutingPolicy() App {
 	if status.Level != a.lastBudgetNoticeLevel {
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: a.cost.CheckBudget(a.cfg.MonthlyBudget),
+			Content: budgetMessage(status),
 		})
 		a.lastBudgetNoticeLevel = status.Level
 	}

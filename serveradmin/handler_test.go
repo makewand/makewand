@@ -58,7 +58,7 @@ func TestHandler_TokenLifecycleAndAuditQueries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenJSONL(usage): %v", err)
 	}
-	usageLogger.Log(serverusage.Entry{
+	_ = usageLogger.Log(serverusage.Entry{
 		Timestamp:        time.Date(2026, 3, 23, 1, 0, 0, 0, time.UTC),
 		TokenID:          "runner",
 		ActualProvider:   "codex",
@@ -346,7 +346,7 @@ func TestHandler_OrganizationsProjectsBillingAndDashboard(t *testing.T) {
 	}
 
 	now := time.Now().UTC()
-	usageStore.Log(serverusage.Entry{
+	_ = usageStore.Log(serverusage.Entry{
 		Timestamp:        serverusage.MonthStart(now).AddDate(0, -1, 0).Add(2 * time.Hour),
 		RequestID:        "req_team_old",
 		TokenID:          "runner",
@@ -359,7 +359,7 @@ func TestHandler_OrganizationsProjectsBillingAndDashboard(t *testing.T) {
 		CompletionTokens: 5,
 		CostUSD:          50,
 	})
-	usageStore.Log(serverusage.Entry{
+	_ = usageStore.Log(serverusage.Entry{
 		Timestamp:        serverusage.MonthStart(now).Add(2 * time.Hour),
 		RequestID:        "req_team_1",
 		TokenID:          "runner",

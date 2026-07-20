@@ -26,7 +26,7 @@ a standalone Go routing library with an OpenAI-compatible subset HTTP API.
 - **Circuit breaker / 熔断器** — auto-excludes failing providers with cooldown recovery
 - **Power ensemble / 强劲集成** — parallel multi-provider generation with cross-model evaluation
 - **OpenAI-compatible subset HTTP API** — expose the router as a `/v1/chat/completions` endpoint
-- **Strategy hot-reload / 策略热重载** — customize routing via `routing.json` with live polling
+- **Strategy overrides / 策略覆盖** — customize routing via `routing.json`, loaded at startup
 - **Cost tracking / 成本追踪** — per-request estimated costs and budget awareness
 - **Diff/patch engine / 差异引擎** — search-and-replace + unified diff for code modifications
 - **Repository context / 仓库上下文** — `.makewand/rules.md`, symbol caching, file hints
@@ -219,9 +219,9 @@ Place `routing.json` in `~/.config/makewand/` to override default routing:
 }
 ```
 
-Merges non-destructively — omitted fields retain defaults. Changes are picked
-up automatically via hot-reload (30s polling).
-非破坏性合并 — 未指定的字段保留默认值。修改会通过热重载自动生效（30 秒轮询）。
+Merges non-destructively — omitted fields retain defaults. `routing.json` is
+read once at startup; restart makewand for changes to take effect.
+非破坏性合并 — 未指定的字段保留默认值。`routing.json` 在启动时读取一次，修改后需重启 makewand 生效。
 
 ## Library Usage / 库使用
 

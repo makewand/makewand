@@ -23,9 +23,49 @@
 ### Known Risks
 
 - Plaintext protocol without TLS terminates in `UNSAFE` mode only (requires explicit flag)
-- WAL database requires careful backup procedures
+- WAL database requires careful backup procedures — use `makewand state backup`
+  (VACUUM INTO snapshot), not a plain tar of the live `state.db`
 - Concurrent agent execution can interfere with local workspace
 - Remote clients may see stale session state
+
+### Accounting and Budget Behavior
+
+The budget/quota subsystem fails in the safe direction (a lookup or write error
+rejects or is surfaced; it never silently permits unlimited spend):
+
+- **Per-token quota counters persist across restarts.** A token's hourly/daily
+  request counts and daily/monthly spend are flushed to the state DB
+  periodically and once more at shutdown, and restored on startup (see
+  `token_usage_counters`). Stale day/month windows self-heal on first use; a
+  corrupt persisted window timestamp fails startup rather than silently resetting
+  a counter. Scope limits: on a *clean* shutdown the final flush runs after
+  in-flight requests drain, but a shutdown that times out (or an abnormal exit)
+  can lose the last counter delta; this covers tokens stored in the state DB
+  (issued via `token issue` or self-registration) — counters for static
+  file-based `--auth-config` tokens remain in-memory only and reset on restart;
+  and counters are per-process, so multiple server instances sharing one DB are
+  not yet strongly consistent with each other.
+- **Concurrent overshoot is bounded by reservation.** Budget admission uses an
+  in-memory committed+reserved total per scope (committed is seeded once from the
+  usage ledger, then maintained as requests settle), so admission is atomic and a
+  later request cannot re-consume headroom an earlier one already spent. Each
+  admitted request reserves `--budget-reservation` USD (default $0.01) until it
+  settles. The residual overshoot is at most, per simultaneously in-flight
+  request, the amount its realized cost exceeds the reservation — so set
+  `--budget-reservation` at or above a typical per-request cost to keep it small
+  or zero. (A request whose realized cost is under the reservation cannot
+  overshoot at all.)
+- **Usage-write failures are surfaced, and optionally fatal.** A failed usage
+  write always logs a warning (`usage accounting write failed`) so the loss is
+  visible. With `--strict-accounting`, a non-streaming request whose usage cannot
+  be recorded is rejected with 503 before its **success** response is written, so
+  no successful response is returned unrecorded (and the server refuses to start
+  with `--strict-accounting` but no usage sink). Scope: it does not apply to
+  streaming responses (already on the wire when usage is known — they log at the
+  tail), and it cannot un-spend a provider call already made — a request that
+  failed *after* the provider ran still incurred cost, recorded best-effort and
+  surfaced. A budget lookup that errors fails closed (HTTP 503
+  `budget_unavailable`).
 
 ## Personal Remote Mode
 

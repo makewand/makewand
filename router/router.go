@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -271,6 +272,125 @@ type Router struct {
 	// be read/written race-free on the hot routing path without a mutex. The zero
 	// value is RepoTrustTrusted (existing behavior).
 	repoTrust atomic.Int32
+
+	// budgetReservations tracks in-flight, not-yet-ledgered spend per budgeted
+	// scope so concurrent requests cannot each read the same month-to-date total
+	// and collectively blow past a team budget. Zero value is ready to use.
+	budgetReservations budgetReserver
+}
+
+// budgetReserver is the in-memory, per-scope spend accountant that makes budget
+// admission atomic. For each budgeted scope it holds:
+//
+//   - committed: realized month-to-date spend. Seeded ONCE from the durable
+//     usage ledger (the first time the scope is seen this process), then
+//     maintained in memory as requests settle. Because admission reads this
+//     in-memory value under the same lock that settles update, there is no
+//     check-then-act gap against a stale ledger read.
+//   - reserved: provisional spend for admitted-but-not-yet-settled requests.
+//
+// This bounds concurrent overshoot: simultaneous in-flight requests each reserve
+// an estimate, and a later request cannot re-consume headroom that an earlier
+// request already spent. (Single-process; multiple server instances sharing one
+// DB are not strongly consistent — see SERVER_ALPHA.md.)
+type budgetReserver struct {
+	mu        sync.Mutex
+	committed map[string]float64
+	reserved  map[string]float64
+	seeded    map[string]bool
+}
+
+// isSeeded reports whether the scope's committed total has been initialized.
+func (b *budgetReserver) isSeeded(scope string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.seeded[scope]
+}
+
+// seed initializes the scope's committed total from the durable ledger. The
+// first caller wins; later callers are no-ops, so a concurrent settle that
+// happened between an isSeeded check and this call is never clobbered.
+func (b *budgetReserver) seed(scope string, ledgerSpend float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.seeded[scope] {
+		return
+	}
+	if b.committed == nil {
+		b.committed = make(map[string]float64)
+	}
+	if b.seeded == nil {
+		b.seeded = make(map[string]bool)
+	}
+	b.committed[scope] = sanitizeCost(ledgerSpend)
+	b.seeded[scope] = true
+}
+
+// admit atomically checks headroom and, if there is room, reserves `estimate`.
+// With a positive estimate it counts the request's OWN reservation in the
+// headroom check (rejecting when committed+reserved+estimate would exceed
+// budget), so an admitted request always keeps committed+reserved <= budget —
+// meaning a request whose realized cost is <= its reservation can never push the
+// scope over budget. estimate<=0 is a headroom-only check (reject at/over cap)
+// with no reservation. Returns false (reserving nothing) when rejected.
+func (b *budgetReserver) admit(scope string, budget, estimate float64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	used := b.committed[scope] + b.reserved[scope]
+	if estimate > 0 {
+		if used+estimate > budget {
+			return false
+		}
+		if b.reserved == nil {
+			b.reserved = make(map[string]float64)
+		}
+		b.reserved[scope] += estimate
+		return true
+	}
+	return used < budget
+}
+
+// settle finalizes an admitted request: it releases the reservation and folds
+// the realized cost into committed, atomically, so the scope's spend is never
+// momentarily uncounted. Call after the request's cost is known.
+func (b *budgetReserver) settle(scope string, estimate, actual float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.unreserveLocked(scope, estimate)
+	if actual = sanitizeCost(actual); actual > 0 {
+		if b.committed == nil {
+			b.committed = make(map[string]float64)
+		}
+		b.committed[scope] += actual
+	}
+}
+
+// sanitizeCost coerces a cost value into a safe, budget-usable number: NaN, ±Inf
+// and negatives (which would poison the committed total or make comparisons
+// always-false) become 0.
+func sanitizeCost(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	return v
+}
+
+// unreserve drops a reservation without committing any cost. Used on rejection
+// paths where a scope was reserved before a later scope failed.
+func (b *budgetReserver) unreserve(scope string, estimate float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.unreserveLocked(scope, estimate)
+}
+
+func (b *budgetReserver) unreserveLocked(scope string, estimate float64) {
+	if estimate <= 0 || b.reserved == nil {
+		return
+	}
+	b.reserved[scope] -= estimate
+	if b.reserved[scope] <= 0 {
+		delete(b.reserved, scope)
+	}
 }
 
 const availCacheTTL = 10 * time.Second
@@ -399,6 +519,38 @@ func (r *Router) getAccessType(name string) AccessType {
 	r.providerMu.Lock()
 	defer r.providerMu.Unlock()
 	return r.accessTypes[name]
+}
+
+// StartQuotaRefresh begins periodic background refresh of subscription-quota
+// headroom, if a live snapshotter is wired. It is the composition root's job to
+// own the lifetime: pass a context tied to the process (a signal-derived one for
+// serve, the program context for the TUI) so the ticker stops on shutdown.
+//
+// Idempotent and cancellable — repeated calls never spawn a second ticker. A
+// no-op when quota awareness is disabled or the controller is a test fake with
+// no refresh loop. Construction stays network-free; nothing starts a refresh on
+// its own, which is why long-running entrypoints must call this explicitly.
+func (r *Router) StartQuotaRefresh(ctx context.Context) {
+	if r == nil || r.quota == nil {
+		return
+	}
+	if lc, ok := r.quota.(interface{ Start(context.Context) }); ok {
+		lc.Start(ctx)
+	}
+}
+
+// RefreshQuota forces one synchronous quota refresh and returns when it lands.
+// Use it where readiness matters (a health/doctor probe) rather than relying on
+// the async loop's first tick. A no-op when quota awareness is disabled.
+func (r *Router) RefreshQuota(ctx context.Context) {
+	if r == nil || r.quota == nil {
+		return
+	}
+	if rf, ok := r.quota.(interface {
+		Refresh(context.Context) *QuotaSnapshot
+	}); ok {
+		rf.Refresh(ctx)
+	}
 }
 
 // SetTraceSink enables or disables structured router trace events.

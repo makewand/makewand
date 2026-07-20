@@ -44,6 +44,16 @@ jobs:
       - name: Run vet
         run: go vet ./cmd/... ./internal/... ./router
 
+      - name: Run govulncheck
+        # Gate the release independently of CI: a tag build must re-prove there
+        # are no reachable known vulnerabilities before any artifact is built.
+        # The release job below `needs: test`, so a hit here blocks the release.
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
   release:
     runs-on: ubuntu-latest
     needs: test
