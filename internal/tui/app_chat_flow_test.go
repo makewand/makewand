@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/makewand/makewand/internal/config"
@@ -63,6 +64,32 @@ func TestHandleAIResponse_ErrorRecordsKnownUsage(t *testing.T) {
 	input, output := app.cost.TokensByProvider("ensemble")
 	if input != 30 || output != 3 || app.cost.SessionTotal() != 3.75 {
 		t.Fatalf("recorded error usage = input %d output %d cost %.2f", input, output, app.cost.SessionTotal())
+	}
+}
+
+// TestHandleAIResponse_SuccessAccruesMonthlyBudget guards the R4 wiring fix: a
+// normal (non-error) response with a pay-as-you-go cost must accrue to the
+// month-to-date budget ledger, not just the session panel.
+func TestHandleAIResponse_SuccessAccruesMonthlyBudget(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.monthly = LoadMonthlyLedger("") // isolated, in-memory
+	resp := aiResponseMsg{
+		provider:     "ensemble",
+		content:      "done",
+		cost:         2.50,
+		inputTokens:  10,
+		outputTokens: 5,
+	}
+
+	updated, _ := app.Update(resp)
+	app = updated.(App)
+
+	if got := app.cost.SessionTotal(); got != 2.50 {
+		t.Fatalf("session total = %.2f, want 2.50", got)
+	}
+	if got := app.monthly.Total(time.Now()); got != 2.50 {
+		t.Fatalf("monthly total = %.2f, want 2.50 (success path must accrue to monthly budget)", got)
 	}
 }
 

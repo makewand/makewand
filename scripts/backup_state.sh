@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
+# Thin wrapper around `makewand state backup`.
+#
+# It snapshots the SQLite state database with VACUUM INTO — a transaction-
+# consistent copy that is safe to take while the server is running, unlike a
+# plain tar of the live file — plus the auth config and JSONL ledgers. Prefer
+# calling `makewand state backup` directly; this wrapper only fills defaults.
+#
+# Usage: backup_state.sh [data-dir] [out-dir]
+#   MAKEWAND_BIN          override the makewand binary (default: makewand on PATH)
+#   MAKEWAND_AUTH_CONFIG  include this auth config (e.g. /etc/makewand/server_auth.json)
 set -euo pipefail
 
-state_dir="${1:-$HOME/.config/makewand/server}"
+data_dir="${1:-$HOME/.config/makewand/server}"
 out_dir="${2:-$PWD/backups}"
+bin="${MAKEWAND_BIN:-makewand}"
+
+mkdir -p "$out_dir"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 archive="$out_dir/makewand-backup-$timestamp.tar.gz"
 
-mkdir -p "$out_dir"
-tar -C "$state_dir" -czf "$archive" \
-  state.db \
-  server_auth.json \
-  audit.jsonl \
-  usage.jsonl \
-  2>/dev/null || tar -C "$state_dir" -czf "$archive" .
+args=(state backup "$archive" --data-dir "$data_dir")
+if [ -n "${MAKEWAND_AUTH_CONFIG:-}" ]; then
+  args+=(--auth-config "$MAKEWAND_AUTH_CONFIG")
+fi
 
-printf 'Created backup: %s\n' "$archive"
+"$bin" "${args[@]}"

@@ -65,6 +65,7 @@ type App struct {
 	progress ProgressPanel
 	wizard   WizardPanel
 	cost     *CostTracker
+	monthly  *MonthlyLedger
 	spinner  spinner.Model
 
 	// Streaming state
@@ -273,6 +274,7 @@ func newAppWithTrust(mode Mode, cfg *config.Config, projectPath string, trust mo
 		progress:  NewProgressPanel(),
 		wizard:    NewWizardPanel(),
 		cost:      NewCostTracker(),
+		monthly:   LoadMonthlyLedger(monthlyLedgerPath()),
 		spinner:   s,
 	}
 
@@ -548,7 +550,7 @@ func (a *App) recordStreamUsage(provider, output string) model.Usage {
 	var usage model.Usage
 	if a.router != nil {
 		usage = a.router.EstimateUsageForRoute(result, a.streamMessages, a.streamSystem, output)
-		a.cost.AddWithTokens(provider, usage.Cost, usage.InputTokens, usage.OutputTokens, a.router.IsSubscription(provider))
+		a.recordKnownUsage(provider, usage.Cost, usage.InputTokens, usage.OutputTokens)
 	}
 	a.streamRoute = model.RouteResult{}
 	a.streamMessages = nil
@@ -833,6 +835,13 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 			diag.Stderr().WarnErr("could not restore chat session", err)
 		}
 	}
+
+	// Keep subscription-quota headroom fresh while the TUI is open so routing
+	// steers by current usage rather than the single cache warm-up at startup.
+	// Bound to the program's lifetime: the ticker goroutine stops on exit.
+	quotaCtx, cancelQuota := context.WithCancel(context.Background())
+	defer cancelQuota()
+	app.router.StartQuotaRefresh(quotaCtx)
 
 	p := tea.NewProgram(app, tea.WithAltScreen())
 	finalModel, err := p.Run()

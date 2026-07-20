@@ -95,6 +95,16 @@ jobs:
       - name: Run vet
         run: go vet ./cmd/... ./internal/... ./router
 
+      - name: Run govulncheck
+        # Fail CI on any known vulnerability reachable from our code. The Go
+        # toolchain is selected from go.mod (go-version-file above), so bumping
+        # the `go` directive to a patched release is what clears stdlib CVEs.
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:

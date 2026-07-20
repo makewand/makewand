@@ -16,7 +16,7 @@ LDFLAGS+=-X $(BUILDINFO_PKG).Version=$(VERSION)
 LDFLAGS+=-X $(BUILDINFO_PKG).Commit=$(GIT_COMMIT)
 LDFLAGS+=-X $(BUILDINFO_PKG).Dirty=$(GIT_DIRTY)
 
-.PHONY: all build run clean test test-race test-gate install prelaunch
+.PHONY: all build run clean test test-race test-gate vulncheck install prelaunch
 
 all: build
 
@@ -44,6 +44,9 @@ test-gate:
 
 test-race:
 	bash ./scripts/test_race.sh
+
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 install: build
 	cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)

@@ -44,7 +44,10 @@ type Config struct {
 	Theme        string `json:"theme,omitempty"`         // "dark" or "light"
 	ApprovalMode string `json:"approval_mode,omitempty"` // "manual", "safe", or "autopilot"
 
-	// Cost tracking
+	// Cost tracking. MonthlyBudget is measured against month-to-date pay-as-you-go
+	// spend tracked in a persistent ledger (internal/tui MonthlyLedger) that
+	// survives /clear, new sessions, and restarts, and rolls over each calendar
+	// month. The session cost panel is separate and remains per-conversation.
 	MonthlyBudget float64 `json:"monthly_budget,omitempty"`
 	TotalSpent    float64 `json:"total_spent,omitempty"`
 
