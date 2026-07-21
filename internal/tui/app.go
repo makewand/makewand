@@ -112,6 +112,12 @@ type App struct {
 	// onto the Router (which enforces fail-closed routing) so buildSystemPrompt
 	// and any router-driven generation share a single source of truth.
 	repoTrust model.RepoTrust
+
+	// hostExecAuth is the app-layer-resolved authorization for the
+	// MAKEWAND_UNSAFE_HOST_EXEC opt-in (one-time acknowledgment state + audit
+	// sink). Zero value = not acknowledged, so restricted plans fail closed.
+	// It is injected into every Project this session opens or creates.
+	hostExecAuth engine.UnsafeHostExecAuthorization
 }
 
 // --- Bubble Tea message types ---
@@ -238,17 +244,20 @@ type startPromptMsg struct {
 }
 
 // NewApp creates a new App with trusted-repository routing (the existing
-// default). It is retained for the many callers and tests that do not thread a
+// default) and no unsafe host-execution authorization (the zero value fails
+// closed). It is retained for the many callers and tests that do not thread a
 // trust level; entry points that support untrusted mode use newAppWithTrust.
 func NewApp(mode Mode, cfg *config.Config, projectPath string) *App {
-	return newAppWithTrust(mode, cfg, projectPath, model.RepoTrustTrusted)
+	return newAppWithTrust(mode, cfg, projectPath, model.RepoTrustTrusted, engine.UnsafeHostExecAuthorization{})
 }
 
 // newAppWithTrust creates a new App whose Router is constructed WITH the given
 // repository trust level. Establishing trust at construction means untrusted mode
 // is known before any background work (the async quota/health refresh, which can
-// exec a local CLI) runs, so generation fails closed end-to-end.
-func newAppWithTrust(mode Mode, cfg *config.Config, projectPath string, trust model.RepoTrust) *App {
+// exec a local CLI) runs, so generation fails closed end-to-end. hostAuth is the
+// resolved MAKEWAND_UNSAFE_HOST_EXEC authorization; it is stored on the App and
+// injected into every Project the session opens or creates.
+func newAppWithTrust(mode Mode, cfg *config.Config, projectPath string, trust model.RepoTrust, hostAuth engine.UnsafeHostExecAuthorization) *App {
 	router, err := model.NewRouterWithTrust(cfg, trust)
 	if err != nil {
 		// A broken routing.json (or corrupted strategy defaults) leaves no
@@ -263,24 +272,26 @@ func newAppWithTrust(mode Mode, cfg *config.Config, projectPath string, trust mo
 	s.Style = spinnerStyle
 
 	app := &App{
-		mode:      mode,
-		cfg:       cfg,
-		router:    router,
-		repoTrust: trust,
-		activity:  newChatActivityState(),
-		pipeline:  engine.NewBuildPipeline(),
-		chat:      NewChatPanel(),
-		fileTree:  NewFileTreePanel(),
-		progress:  NewProgressPanel(),
-		wizard:    NewWizardPanel(),
-		cost:      NewCostTracker(),
-		monthly:   LoadMonthlyLedger(monthlyLedgerPath()),
-		spinner:   s,
+		mode:         mode,
+		cfg:          cfg,
+		router:       router,
+		repoTrust:    trust,
+		hostExecAuth: hostAuth,
+		activity:     newChatActivityState(),
+		pipeline:     engine.NewBuildPipeline(),
+		chat:         NewChatPanel(),
+		fileTree:     NewFileTreePanel(),
+		progress:     NewProgressPanel(),
+		wizard:       NewWizardPanel(),
+		cost:         NewCostTracker(),
+		monthly:      LoadMonthlyLedger(monthlyLedgerPath()),
+		spinner:      s,
 	}
 
 	// Open existing project if path provided
 	if projectPath != "" {
 		if proj, err := engine.OpenProject(projectPath); err == nil {
+			proj.SetUnsafeHostExecAuthorization(hostAuth)
 			app.project = proj
 			app.fileTree.SetFiles(proj.Files)
 		}
@@ -786,17 +797,17 @@ func isLGTMResponse(content string) bool {
 }
 
 // Run starts the Bubble Tea program.
-func Run(mode Mode, cfg *config.Config, projectPath string, repoTrust model.RepoTrust, debug bool) error {
-	return RunWithPrompt(mode, cfg, projectPath, "", repoTrust, debug)
+func Run(mode Mode, cfg *config.Config, projectPath string, repoTrust model.RepoTrust, hostAuth engine.UnsafeHostExecAuthorization, debug bool) error {
+	return RunWithPrompt(mode, cfg, projectPath, "", repoTrust, hostAuth, debug)
 }
 
 // RunWithPrompt starts the Bubble Tea program with an optional initial chat prompt.
-func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt string, repoTrust model.RepoTrust, debug bool) error {
+func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt string, repoTrust model.RepoTrust, hostAuth engine.UnsafeHostExecAuthorization, debug bool) error {
 	// Construct the App (and its Router) WITH the trust level so untrusted mode is
 	// established before any background work runs. The Router enforces fail-closed
 	// routing in untrusted mode; buildSystemPrompt reads app.repoTrust back to
 	// decide whether repo-provided rules are trusted.
-	app := newAppWithTrust(mode, cfg, projectPath, repoTrust)
+	app := newAppWithTrust(mode, cfg, projectPath, repoTrust, hostAuth)
 	app.initialPrompt = strings.TrimSpace(initialPrompt)
 
 	if debug {

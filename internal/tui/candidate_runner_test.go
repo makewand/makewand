@@ -84,6 +84,9 @@ func newCandidateProject(t *testing.T) *engine.Project {
 	if err != nil {
 		t.Fatalf("NewProject: %v", err)
 	}
+	// The env opt-in alone no longer authorizes host execution; carry the
+	// acknowledged authorization the app layer would resolve.
+	project.SetUnsafeHostExecAuthorization(engine.UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"})
 	if err := project.WriteFiles([]engine.ExtractedFile{
 		{
 			Path: "go.mod",
@@ -312,6 +315,7 @@ func newTestlessCandidateProject(t *testing.T) *engine.Project {
 	if err != nil {
 		t.Fatalf("NewProject: %v", err)
 	}
+	project.SetUnsafeHostExecAuthorization(engine.UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"})
 	if err := project.WriteFiles([]engine.ExtractedFile{
 		{
 			Path: "go.mod",

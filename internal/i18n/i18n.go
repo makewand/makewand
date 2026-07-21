@@ -107,24 +107,31 @@ type Messages struct {
 	AutomationCandidateWeakVerification     string
 	AutomationCandidateDeletions            string
 	HostCLIExecNotice                       string
-	BuildDepsDetectFailed                   string
-	BuildTestsDetectFailed                  string
-	BuildDepsExecError                      string
-	BuildDepsExecFailed                     string
-	BuildDepsSkipped                        string
-	BuildTestsSkipped                       string
-	ExecDepsLabel                           string
-	ExecTestsLabel                          string
-	ExecStarted                             string
-	ExecFinished                            string
-	ExecCommand                             string
-	ExecExitCode                            string
-	ExecDuration                            string
-	ExecOutput                              string
-	RestoredSessionPrefix                   string
-	RestoredSessionNotice                   string
-	NoCompactedMemoryNotice                 string
-	MemoryRestoredAt                        string
+
+	UnsafeHostExecAckPrompt         string
+	UnsafeHostExecAckConfirmed      string
+	UnsafeHostExecAckDeclined       string
+	UnsafeHostExecAckNonInteractive string
+	UnsafeHostExecActiveWarning     string
+	UnsafeHostExecAckSaveFailed     string
+	BuildDepsDetectFailed           string
+	BuildTestsDetectFailed          string
+	BuildDepsExecError              string
+	BuildDepsExecFailed             string
+	BuildDepsSkipped                string
+	BuildTestsSkipped               string
+	ExecDepsLabel                   string
+	ExecTestsLabel                  string
+	ExecStarted                     string
+	ExecFinished                    string
+	ExecCommand                     string
+	ExecExitCode                    string
+	ExecDuration                    string
+	ExecOutput                      string
+	RestoredSessionPrefix           string
+	RestoredSessionNotice           string
+	NoCompactedMemoryNotice         string
+	MemoryRestoredAt                string
 
 	// Chat commands and status output
 	ChatHelp             string
@@ -322,6 +329,13 @@ var en = Messages{
 	AutomationCandidateWeakVerification:     "Best candidate passed only weak checks (no baseline tests ran). Falling back to manual approval.",
 	AutomationCandidateDeletions:            "Candidate deleted files in its workspace (not applied automatically): %s",
 	HostCLIExecNotice:                       "Note: the %s CLI ran on this host (in %s) with your environment and credentials — generation is not sandboxed. Treat untrusted repos accordingly (see SECURITY.md).",
+
+	UnsafeHostExecAckPrompt:         "MAKEWAND_UNSAFE_HOST_EXEC=1 is set.\n\nThis disables sandbox isolation: AI-generated commands (dependency installs, tests, auto-fix retries, preview scripts) will run DIRECTLY on this machine with your user account and environment. A malicious or buggy generated command can read or modify your files and use your credentials. You accept full responsibility for what those commands do.\n\nThis one-time acknowledgment is recorded in your makewand config for this machine (risk statement v%d). Every host execution is written to the audit log.\n\nType \"yes\" to accept, anything else to decline: ",
+	UnsafeHostExecAckConfirmed:      "Unsafe host execution acknowledged and recorded. Every host execution will be audited.",
+	UnsafeHostExecAckDeclined:       "Acknowledgment declined. MAKEWAND_UNSAFE_HOST_EXEC=1 will be ignored; commands only run inside sandbox isolation (fail closed without it).",
+	UnsafeHostExecAckNonInteractive: "MAKEWAND_UNSAFE_HOST_EXEC=1 is set but the one-time host execution acknowledgment has not been completed on this machine. Refusing host execution (fail closed). Run makewand interactively once (e.g. `makewand setup`) to acknowledge.",
+	UnsafeHostExecActiveWarning:     "WARNING: MAKEWAND_UNSAFE_HOST_EXEC=1 — AI-generated commands run directly on this host without sandbox isolation (acknowledged %s). Executions are audited to %s.",
+	UnsafeHostExecAckSaveFailed:     "Could not record the acknowledgment (%v); host execution stays disabled (fail closed). Fix the config and retry.",
 
 	BuildDepsDetectFailed:   "Dependency detection failed: %s",
 	BuildTestsDetectFailed:  "Test detection failed: %s",
@@ -547,6 +561,13 @@ var zh = Messages{
 	AutomationCandidateWeakVerification:     "最佳候选只通过了弱校验（没有运行基线测试），已回退为手动确认。",
 	AutomationCandidateDeletions:            "候选在其工作区中删除了文件（不会自动应用）：%s",
 	HostCLIExecNotice:                       "提示：%s CLI 在本机（%s）以你的环境和凭据运行——生成阶段没有沙箱。处理不可信仓库请注意（详见 SECURITY.md）。",
+
+	UnsafeHostExecAckPrompt:         "检测到 MAKEWAND_UNSAFE_HOST_EXEC=1。\n\n这会关闭沙箱隔离：AI 生成的命令（依赖安装、测试、自动修复重试、预览脚本）将以你的用户账户和环境【直接在本机执行】。恶意或有缺陷的生成命令可以读写你的文件、使用你的凭据。你需要对这些命令的行为承担全部责任。\n\n本次一次性确认将记录在本机的 makewand 配置中（风险声明 v%d）。每一次宿主执行都会写入审计日志。\n\n输入 \"yes\" 接受，输入其他内容拒绝：",
+	UnsafeHostExecAckConfirmed:      "已确认并记录不安全宿主执行授权。每次宿主执行都会被审计。",
+	UnsafeHostExecAckDeclined:       "已拒绝确认。MAKEWAND_UNSAFE_HOST_EXEC=1 将被忽略；命令只会在沙箱隔离内执行（无沙箱时拒绝执行）。",
+	UnsafeHostExecAckNonInteractive: "已设置 MAKEWAND_UNSAFE_HOST_EXEC=1，但本机尚未完成一次性宿主执行确认。已拒绝宿主执行（fail closed）。请交互式运行一次 makewand（如 `makewand setup`）完成确认。",
+	UnsafeHostExecActiveWarning:     "警告：MAKEWAND_UNSAFE_HOST_EXEC=1——AI 生成的命令将不经沙箱隔离直接在本机执行（已于 %s 确认）。执行记录审计至 %s。",
+	UnsafeHostExecAckSaveFailed:     "无法记录确认（%v）；宿主执行保持禁用（fail closed）。请修复配置后重试。",
 
 	BuildDepsDetectFailed:   "依赖检测失败：%s",
 	BuildTestsDetectFailed:  "测试检测失败：%s",

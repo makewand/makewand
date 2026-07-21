@@ -553,7 +553,7 @@ func (a App) runDepsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	// host when sandbox isolation is unavailable and MAKEWAND_UNSAFE_HOST_EXEC is
 	// not set. Detect that here so we skip deps + tests with a clear notice
 	// instead of surfacing a raw error.
-	if notice := restrictedPlanBlockedNotice(); notice != "" {
+	if notice := a.restrictedPlanBlockedNotice(); notice != "" {
 		emitExecTrace(a.router, "pipeline.exec.skipped", "deps", plan, nil, nil, nil, "sandbox isolation unavailable")
 		emitExecTrace(a.router, "pipeline.exec.skipped", "tests", a.pendingTestsPlan, nil, nil, nil, "sandbox isolation unavailable")
 		a.progress.SetStepStatus(stepDeps, StepDone)
@@ -651,7 +651,7 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	}
 	a.clearPendingApproval()
 	// Fail closed when sandbox isolation is unavailable (see runDepsPlan).
-	if notice := restrictedPlanBlockedNotice(); notice != "" {
+	if notice := a.restrictedPlanBlockedNotice(); notice != "" {
 		emitExecTrace(a.router, "pipeline.exec.skipped", "tests", plan, nil, nil, nil, "sandbox isolation unavailable")
 		a.progress.SetStepStatus(stepTests, StepDone)
 		a.progress.SetStepDetail(stepTests, testsRunSkippedDetail)
@@ -1056,7 +1056,7 @@ func (a App) handleAutoFixFileWriteComplete() (tea.Model, tea.Cmd) {
 	// MAKEWAND_UNSAFE_HOST_EXEC opt-in), do NOT execute generated commands on the
 	// host. Surface the notice and stop the build instead of looping through
 	// fruitless auto-fix attempts.
-	if notice := restrictedPlanBlockedNotice(); notice != "" {
+	if notice := a.restrictedPlanBlockedNotice(); notice != "" {
 		emitExecTrace(router, "pipeline.exec.skipped", "tests", nil, nil, nil, nil, "sandbox isolation unavailable; auto-fix retry left unverified")
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: notice})
 		return a.buildComplete()

@@ -174,6 +174,9 @@ func (p *Project) CloneToTemp() (*Project, error) {
 		_ = os.RemoveAll(tempDir)
 		return nil, err
 	}
+	// Verification clones execute the same restricted plans as the parent, so
+	// they inherit the parent's host-execution authorization.
+	cloned.unsafeHostAuth = p.unsafeHostAuth
 	return cloned, nil
 }
 
@@ -650,9 +653,9 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 	}
 
 	// Fail closed: everything below executes candidate-influenced commands, so
-	// without working sandbox isolation (or the explicit unsafe host opt-in)
-	// nothing runs and the candidate stays unverified.
-	execEnv, isoErr := resolveVerifyExecEnvironment()
+	// without working sandbox isolation (or the acknowledged unsafe host
+	// opt-in) nothing runs and the candidate stays unverified.
+	execEnv, isoErr := resolveVerifyExecEnvironment(p.unsafeHostAuth)
 	if isoErr != nil {
 		report.IsolationError = isoErr.Error()
 		return report

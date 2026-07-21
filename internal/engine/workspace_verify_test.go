@@ -24,6 +24,9 @@ func newVerificationProject(t *testing.T) *Project {
 	if err != nil {
 		t.Fatalf("NewProject: %v", err)
 	}
+	// The env opt-in alone no longer authorizes host execution; tests carry the
+	// acknowledged authorization the app layer would resolve.
+	project.SetUnsafeHostExecAuthorization(UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"})
 	files := []ExtractedFile{
 		{
 			Path: "go.mod",

@@ -119,7 +119,7 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 
 	// Project-defined scripts execute inside an isolation wrapper by default.
 	if kind != previewStatic {
-		wrappedCommand, wrappedArgs, wrapErr := previewWrapProjectCmd(p.Path, command, args)
+		wrappedCommand, wrappedArgs, wrapErr := previewWrapProjectCmd(p.Path, command, args, p.unsafeHostAuth)
 		if wrapErr != nil {
 			cancel()
 			return nil, wrapErr

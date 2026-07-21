@@ -321,6 +321,10 @@ Flags:
                                 (fail closed), and .makewand/rules.md is not trusted.
                                 不可信仓库模式：仅允许直连 API Provider 生成（失败即拒），
                                 且不信任 .makewand/rules.md
+  --approval <manual|safe|autopilot>  Approval mode for this run only; persist a
+                                default with `makewand setup --approval ...`.
+                                本次运行的审批模式；用 `makewand setup --approval ...`
+                                持久化默认值
 ```
 
 ## Debugging / 调试
