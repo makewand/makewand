@@ -1,85 +1,19 @@
-BINARY_NAME=makewand
-VERSION=0.2.0-dev
-BUILD_DIR=build
-MAIN_PKG=./cmd/makewand
+.PHONY: all install test probe status clean
 
-# Build info package path for ldflags
-BUILDINFO_PKG=github.com/makewand/makewand/internal/buildinfo
+all: test
 
-# Detect git commit and dirty status for development builds
-GIT_COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-GIT_DIRTY=$(shell git status --porcelain 2>/dev/null | grep -q . && echo "dirty" || echo "")
-
-# ldflags for build injection
-LDFLAGS=-s -w
-LDFLAGS+=-X $(BUILDINFO_PKG).Version=$(VERSION)
-LDFLAGS+=-X $(BUILDINFO_PKG).Commit=$(GIT_COMMIT)
-LDFLAGS+=-X $(BUILDINFO_PKG).Dirty=$(GIT_DIRTY)
-
-.PHONY: all build run clean test test-race test-gate vulncheck install prelaunch
-
-all: build
-
-build:
-	@mkdir -p $(BUILD_DIR)
-	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN_PKG)
-
-run: build
-	./$(BUILD_DIR)/$(BINARY_NAME)
-
-run-new: build
-	./$(BUILD_DIR)/$(BINARY_NAME) new
-
-run-chat: build
-	./$(BUILD_DIR)/$(BINARY_NAME) chat
-
-clean:
-	rm -rf $(BUILD_DIR)
+install:
+	./scripts/install.sh
 
 test:
-	bash ./scripts/test_gate.sh
+	python3 -m unittest discover tests
 
-test-gate:
-	bash ./scripts/test_gate.sh
+probe:
+	./bin/makewand probe
 
-test-race:
-	bash ./scripts/test_race.sh
+status:
+	./bin/makewand status
 
-vulncheck:
-	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-
-install: build
-	cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
-
-# Cross-compilation
-build-all: build-linux build-darwin build-windows
-
-build-linux:
-	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 $(MAIN_PKG)
-
-build-darwin:
-	@mkdir -p $(BUILD_DIR)
-	GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 $(MAIN_PKG)
-
-build-windows:
-	@mkdir -p $(BUILD_DIR)
-	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe $(MAIN_PKG)
-
-fmt:
-	go fmt ./...
-
-vet:
-	go vet ./...
-
-lint: fmt vet
-
-prelaunch:
-	./scripts/prelaunch_gate.sh
-
-version-info:
-	@echo "Build Info:"
-	@echo "  VERSION: $(VERSION)"
-	@echo "  COMMIT:  $(GIT_COMMIT)"
-	@echo "  DIRTY:   $(GIT_DIRTY)"
-	@echo "  LDFLAGS: $(LDFLAGS)"
+clean:
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -delete 2>/dev/null || true

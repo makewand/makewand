@@ -1,12 +1,9 @@
 # Build artifacts
 /build/
-/buildtest
-/modetest
-/mwtest
-/qualtest
-/versus
-/makewand
 /makewand.exe
+__pycache__/
+*.pyc
+*.pyo
 
 # Local test/work directories
 /benchmarks/
