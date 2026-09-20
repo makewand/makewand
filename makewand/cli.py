@@ -257,9 +257,12 @@ def main():
     p_muse.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
     p_muse.add_argument("--model", help="Specific model name")
     p_muse.add_argument("--stream", action="store_true", default=False)
+    p_observe = subparsers.add_parser("observe", help="Inspect all running AI sessions, classify behavior, and report makewand optimizations")
+    p_observe.add_argument("--json", action="store_true", help="Output raw JSON format")
+
     known_subcommands = {
         "models", "status", "probe", "quota", "run", "review", "race", "search", "sandbox",
-        "claude", "codex", "agy", "muse"
+        "claude", "codex", "agy", "muse", "observe"
     }
     # If user invokes `makewand "do something"`, automatically route to `makewand run "do something"`
     if len(sys.argv) > 1 and sys.argv[1] not in known_subcommands and not sys.argv[1].startswith("-"):
@@ -326,6 +329,14 @@ def main():
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(1)
+    elif args.subcommand == "observe":
+        from makewand.observer import observe_all_dialogs, format_observation_markdown
+        rep = observe_all_dialogs()
+        if getattr(args, "json", False):
+            import json
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        else:
+            print(format_observation_markdown(rep))
 
 if __name__ == "__main__":
     main()

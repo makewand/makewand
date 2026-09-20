@@ -58,6 +58,7 @@ SLASH_COMMANDS = [
     "/race",
     "/search",
     "/sandbox",
+    "/observe",
     "/tier",
     "/clear",
     "/exit", "/quit"
@@ -230,6 +231,12 @@ def start_interactive_session():
                 run_in_sandbox(cmd_parts, workspace=cwd, stream=True)
             else:
                 print(c("用法: /sandbox <shell 命令>", COLOR_YELLOW))
+            continue
+
+        elif lower == "/observe":
+            from makewand.observer import observe_all_dialogs, format_observation_markdown
+            rep = observe_all_dialogs()
+            print("\n" + format_observation_markdown(rep) + "\n")
             continue
 
         # Check for identity queries or greetings to respond conversationally
