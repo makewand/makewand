@@ -5,7 +5,7 @@ Health probing, quota monitoring, and status cache management.
 import os
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from pathlib import Path
 from makewand.config import (
@@ -48,14 +48,19 @@ def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool
     for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
         try:
             t = datetime.strptime(clean, fmt).time()
+            if updated_at:
+                try:
+                    up_dt = datetime.fromisoformat(updated_at)
+                    reset_dt = datetime.combine(up_dt.date(), t)
+                    if reset_dt < up_dt:
+                        reset_dt += timedelta(days=1)
+                    if now >= reset_dt:
+                        return True
+                except Exception:
+                    pass
             reset_dt = datetime.combine(now.date(), t)
             if now >= reset_dt:
-                if updated_at:
-                    up_dt = datetime.fromisoformat(updated_at)
-                    if up_dt <= reset_dt:
-                        return True
-                else:
-                    return True
+                return True
         except Exception:
             continue
     return False

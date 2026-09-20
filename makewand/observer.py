@@ -78,6 +78,16 @@ def capture_session_pane(session_name, lines_count=25):
     except Exception:
         return []
 
+def is_file_locked(lock_path):
+    """Check if a file lock is actively held by a process using non-blocking flock."""
+    if not os.path.exists(lock_path):
+        return False
+    try:
+        res = subprocess.run(["flock", "-n", lock_path, "true"], capture_output=True, timeout=1)
+        return res.returncode != 0
+    except Exception:
+        return False
+
 def classify_operation(session_name, lines, metrics):
     """
     Classify the operational pattern of an AI session:
@@ -90,13 +100,17 @@ def classify_operation(session_name, lines, metrics):
     """
     text = " \n ".join(lines)
 
-    # 1. Check for hung anomaly (specifically pytest or task running without progress)
-    if "running" in text and "bash scripts/ci/run_in_ephemer" in text:
-        return "hung_anomaly", "持续占用排他单槽锁或死锁挂起，需超时看门狗"
-    if "1 task(s)" in text and "task-" in text and "running" in text:
-        # Check if sample_project_1 lock is present
-        if os.path.exists("/run/lock/sample_project_1-p920-heavy-postgres.lock"):
-            return "hung_anomaly", "持有重型数据库锁挂起中"
+    # 1. Check for hung anomaly in sample_project_1 (specifically pytest with exclusive lock held)
+    if session_name == "sample_project_1":
+        if "running" in text and "bash scripts/ci/run_in_ephemer" in text:
+            return "hung_anomaly", "持续占用排他单槽锁或死锁挂起，需超时看门狗"
+        if "1 task(s)" in text and "task-" in text and "running" in text:
+            if is_file_locked("/run/lock/sample_project_1-p920-heavy-postgres.lock"):
+                return "hung_anomaly", "持有重型数据库锁挂起中"
+
+    # Makewand orchestration / scheduling
+    if session_name == "makewand" and ("observe" in text or "schedule" in text or "orchestrat" in text):
+        return "sys_monitor", "跨会话定时巡检调度与中枢监控"
 
     # 2. Heavy DB query storm
     if "task(s)" in text and re.search(r"(\d+)\s+task\(s\)", text):
