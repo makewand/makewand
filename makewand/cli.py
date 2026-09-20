@@ -247,12 +247,19 @@ def main():
     p_muse.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
     p_muse.add_argument("--model", help="Specific model name")
     p_muse.add_argument("--stream", action="store_true", default=False)
-    p_muse.add_argument("--timeout", type=int, default=300)
+    known_subcommands = {
+        "models", "status", "probe", "quota", "run", "review", "race", "search", "sandbox",
+        "claude", "codex", "agy", "muse"
+    }
+    # If user invokes `makewand "do something"`, automatically route to `makewand run "do something"`
+    if len(sys.argv) > 1 and sys.argv[1] not in known_subcommands and not sys.argv[1].startswith("-"):
+        sys.argv.insert(1, "run")
 
     args = parser.parse_args()
 
     if not args.subcommand:
-        parser.print_help()
+        from makewand.interactive import start_interactive_session
+        start_interactive_session()
         sys.exit(0)
 
     if args.subcommand == "models":
