@@ -19,7 +19,8 @@ from makewand.config import (
     COLOR_RED,
     COLOR_BLUE,
     COLOR_CYAN,
-    COLOR_PURPLE
+    COLOR_PURPLE,
+    COLOR_RESET
 )
 from makewand.git_helper import ensure_git_worktree, get_git_diff, clone_isolated_worktree
 from makewand.health import get_or_update_status
@@ -64,6 +65,117 @@ def has_critical_defects(review_text: str) -> bool:
     defect_patterns = ["缺陷", "漏洞", "隐患", "死锁", "竞态", "泄露", "overflowerror"]
     return any(p in lower for p in defect_patterns)
 
+def is_identity_or_chit_chat(prompt: str) -> bool:
+    lower = prompt.lower().strip()
+    # Explicit action triggers take precedence: only if user explicitly asks to write/fix/build code
+    coding_action_triggers = [
+        "写代码", "写一个", "写个", "写段", "帮我写", "编写", "实现", "创建文件",
+        "生成代码", "重构", "修改代码", "改写代码", "落盘", "修bug", "修复",
+        "解决bug", "补丁", "优化代码", "写单测", "编写测试", "写脚本", "生成脚本",
+        "运行测试", "跑测试", "跑单测", "执行测试",
+        "write code", "write a", "implement", "build a", "create a file", "fix bug",
+        "patch", "refactor", "generate code", "write a test", "code a",
+        "run test", "run tests", "run the test", "run the tests"
+    ]
+    if any(t in lower for t in coding_action_triggers):
+        return False
+
+    # Check for compound follow-up indicators (e.g. "顺便", "然后", "接着", "并", "then", "and then", "also")
+    compound_connectors = [
+        "顺便", "然后", "接着", "顺带", "并且", "同时", "再帮我", "帮我", "顺便帮我",
+        "then ", "and then", "after that", "also "
+    ]
+    if any(c in lower for c in compound_connectors):
+        return False
+
+    stripped = "".join(ch for ch in lower if ch.isalnum() or '\u4e00' <= ch <= '\u9fff')
+
+    # Greetings: MUST be standalone greetings
+    chinese_greetings = ["你好", "您好", "早上好", "下午好", "晚上好", "哈喽", "嗨", "打扰一下", "请问"]
+    if stripped in chinese_greetings:
+        return True
+
+    english_greetings = ["hi", "hello", "hey", "hithere", "hellothere", "goodmorning", "goodafternoon", "goodevening"]
+    if stripped in english_greetings:
+        return True
+
+    # Check if input starts with greeting and has substantial remainder
+    for g in ["你好", "您好", "哈喽", "嗨", "hello", "hi"]:
+        if lower.startswith(g):
+            rem = lower[len(g):].strip(" ,，!！?？;；\t\n")
+            if rem:
+                return False
+
+    identity_patterns = [
+        "你是谁", "你是什么", "你叫什么", "你叫啥", "你到底是", "你究竟是", "你何方神圣",
+        "介绍一下自己", "介绍自己", "介绍一下你自己", "介绍下自己", "介绍下你自己",
+        "自我介绍", "做个自我介绍", "做一下自我介绍",
+        "你能做什么", "你能干什么", "你能干啥", "你有什么功能", "你有哪些功能", "你有什么用", "你主要用来做",
+        "谁开发了你", "谁创造了你", "谁创建了你", "谁写了你", "你的作者是谁", "你的开发者是谁",
+        "你是人类还是", "你是什么类型", "你属于哪种", "你是什么ai", "你是什么模型", "你是什么智能",
+        "whoareyou", "whatareyou", "whatisyourname", "whatsyourname",
+        "introduceyourself", "tellmeaboutyourself", "whatcanyoudo", "whatdoyoudo",
+        "whocreatedyou", "whomadeyou", "whoisyourauthor"
+    ]
+
+    task_verbs = ["分析", "审查", "解释", "说明", "排查", "测试", "执行", "运行", "run", "test", "analyze", "check", "explain"]
+    for q in identity_patterns:
+        if q in stripped:
+            if any(v in lower for v in task_verbs):
+                return False
+            return True
+
+    return False
+
+def classify_prompt_intent(prompt: str) -> str:
+    """
+    Classify user prompt into:
+    - 'identity': questions about who makewand is or what it can do
+    - 'explain': questions/explanations/chit-chat that do not need file modifications or code review
+    - 'review': code audit/review requests
+    - 'code': code generation/refactoring/fixing tasks
+    """
+    lower = prompt.lower().strip()
+
+    # Code action keywords take first priority ONLY if action verbs are present
+    coding_action_triggers = [
+        "写代码", "写一个", "写个", "写段", "帮我写", "编写", "实现", "创建文件",
+        "生成代码", "重构", "修改代码", "改写代码", "落盘", "修bug", "修复",
+        "解决bug", "补丁", "优化代码", "写单测", "编写测试", "写脚本", "生成脚本",
+        "运行测试", "跑测试", "跑单测", "执行测试",
+        "write code", "write a", "implement", "build a", "create a file", "fix bug",
+        "patch", "refactor", "generate code", "write a test", "code a",
+        "run test", "run tests", "run the test", "run the tests"
+    ]
+    if any(k in lower for k in coding_action_triggers):
+        return "code"
+
+    if is_identity_or_chit_chat(prompt):
+        return "identity"
+
+    if any(k in lower for k in ["审查", "审计", "review", "检查代码", "看下diff", "看下代码改动", "质检", "代码审计", "diff check"]):
+        return "review"
+
+    # Default to explain mode for general questions/explanations/conversations
+    # so that questions do not accidentally trigger code file changes and red-team review loops.
+    return "explain"
+
+def get_identity_message() -> str:
+    return (
+        f"{COLOR_BOLD}{COLOR_GREEN}✨ 我是 Makewand (v3.0) —— 零成本多模型 AI 订阅统一调度中枢。{COLOR_RESET}\n\n"
+        "我统合调度本机四大主流 AI 订阅服务：\n"
+        f"  {COLOR_GREEN}• Google AI Pro (Antigravity / AGY){COLOR_RESET}: 全局架构设计、复杂推理与闭环兜底\n"
+        f"  {COLOR_BLUE}• Claude Code (Anthropic){COLOR_RESET}: 高敏捷代码编写、多文件重构与实现\n"
+        f"  {COLOR_CYAN}• Codex CLI (OpenAI / gpt-6-astra){COLOR_RESET}: 独立红队代码审查与算法攻防\n"
+        f"  {COLOR_PURPLE}• Muse Code (Meta / Llama){COLOR_RESET}: 辅助生成、沙箱验证与备用编码\n\n"
+        f"{COLOR_BOLD}核心机制：{COLOR_RESET}\n"
+        "  1. 智能意图路由：精准区分闲聊/问答（直接响应）与工程开发任务（多模型流水线），杜绝误触发程序检查或缺陷修复\n"
+        "  2. 跨模型联合流水线：自动规划、编码实现、红队盲审与 Auto-Fix 缺陷自愈\n"
+        "  3. 双模型沙箱竞速 (/race)：临时工作区并发派发比拼与主裁判评定\n"
+        "  4. 订阅配额健康监控 (/status, /quota)：零 Token 额外成本自适应容灾降级\n"
+        "  5. 安全搜索与物理沙箱 (/search, /sandbox)：护栏搜索与 Bubblewrap 进程隔离"
+    )
+
 def run_pipeline(
     prompt: str,
     cwd: Optional[str] = None,
@@ -78,6 +190,46 @@ def run_pipeline(
         cwd = os.getcwd()
     if tier == "auto":
         tier = detect_task_tier(prompt)
+
+    intent = classify_prompt_intent(prompt)
+    if intent == "identity":
+        print(c("💡 Makewand 意图识别: 身份/能力问答 (无需执行代码修改或程序检查)", COLOR_BOLD + COLOR_GREEN))
+        print(get_identity_message())
+        return True
+
+    if intent == "explain":
+        print(c(f"💡 Makewand 意图识别: 技术问答/解释模式 '{prompt}' (推理档位: {tier})", COLOR_BOLD + COLOR_GREEN))
+        cache = get_or_update_status(force_probe=False)
+        c_status = cache.get("claude", {}).get("status")
+        x_status = cache.get("codex", {}).get("status")
+        m_status = cache.get("muse", {}).get("status")
+
+        qa_output = None
+        if c_status != "limited":
+            success, out, err = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream)
+            if success:
+                qa_output = out
+        if qa_output is None and x_status != "limited":
+            success, out, err = execute_codex_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream)
+            if success:
+                qa_output = out
+        if qa_output is None and m_status not in ["limited", "needs_auth", "missing"]:
+            success, out, err = execute_muse_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream)
+            if success:
+                qa_output = out
+        if qa_output is None:
+            success, out, err = execute_agy_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream)
+            if success:
+                qa_output = out
+        if qa_output and not stream:
+            print(qa_output)
+
+        return qa_output is not None
+
+    if intent == "review":
+        print(c(f"💡 Makewand 意图识别: 独立代码审计/审查模式 '{prompt}'", COLOR_BOLD + COLOR_CYAN))
+        run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt)
+        return True
 
     print(c(f"🚀 Makewand 流水线启动: '{prompt}' (自适应模型档位: {tier})", COLOR_BOLD))
     print(f"工作目录: {cwd}\n")
@@ -153,9 +305,14 @@ def run_pipeline(
         print("...\n")
 
     # Step 3: Red-team review (Cross-model verification)
-    print(c("\n▶ 阶段 2: 独立代码审计与质检 (Red-team Review - Tier: deep)", COLOR_BOLD + COLOR_CYAN))
     diff_out = get_git_diff(cwd)
-    diff_snippet = diff_out[:4500] if diff_out else "无未提交的 git diff"
+    if not diff_out or not diff_out.strip():
+        print(c("ℹ 本次任务未产生未提交的代码改动 (git diff 为空)，无需启动红队复审与自愈流水线。", COLOR_CYAN))
+        print(c("✔ 任务完成。", COLOR_GREEN + COLOR_BOLD))
+        return True
+
+    print(c("\n▶ 阶段 2: 独立代码审计与质检 (Red-team Review - Tier: deep)", COLOR_BOLD + COLOR_CYAN))
+    diff_snippet = diff_out[:4500]
 
     review_prompt = (
         f"工作目录为: {cwd}。请审查以下代码改动（git diff），严查潜在并发死锁、内存泄露、空指针与边界用例漏洞。\n"
@@ -257,7 +414,7 @@ def run_pipeline(
     print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
     return True
 
-def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300):
+def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None):
     if not cwd:
         cwd = os.getcwd()
     print(c("🔍 Makewand 代码审计工具", COLOR_BOLD + COLOR_CYAN))
@@ -269,7 +426,8 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
     cache = get_or_update_status()
     x_status = cache.get("codex", {}).get("status")
 
-    prompt = f"工作目录为: {cwd}。请详细审查当前仓库的修改（git diff），指出潜在隐患并给出修复建议：\n{diff_out[:6000]}"
+    focus = f" 特别关注要求: {user_prompt}。" if user_prompt else ""
+    prompt = f"工作目录为: {cwd}。请详细审查当前仓库的修改（git diff），{focus}指出潜在隐患并给出修复建议：\n{diff_out[:6000]}"
 
     if x_status != "limited":
         print(c("派发给 Codex CLI 进行红队审计 (gpt-6-astra)...", COLOR_CYAN))

@@ -28,7 +28,13 @@ from makewand.config import (
 )
 from makewand.health import load_status_cache, get_or_update_status
 from makewand.discovery import discover_available_models
-from makewand.orchestrator import run_pipeline, run_review, run_race
+from makewand.orchestrator import (
+    run_pipeline,
+    run_review,
+    run_race,
+    is_identity_or_chit_chat,
+    get_identity_message
+)
 from makewand.search import safe_search
 from makewand.sandbox import run_in_sandbox
 
@@ -211,11 +217,24 @@ def start_interactive_session():
         elif lower.startswith("/sandbox"):
             parts = user_input.split(maxsplit=1)
             if len(parts) > 1 and parts[1].strip():
-                cmd_parts = parts[1].strip().split()
+                raw_cmd = parts[1].strip()
+                if any(op in raw_cmd for op in ["|", ";", ">", "<", "&", "$", "`"]):
+                    cmd_parts = ["bash", "-c", raw_cmd]
+                else:
+                    import shlex
+                    try:
+                        cmd_parts = shlex.split(raw_cmd)
+                    except Exception:
+                        cmd_parts = ["bash", "-c", raw_cmd]
                 print(c(f"🛡️ 沙箱执行: {' '.join(cmd_parts)}", COLOR_CYAN))
                 run_in_sandbox(cmd_parts, workspace=cwd, stream=True)
             else:
                 print(c("用法: /sandbox <shell 命令>", COLOR_YELLOW))
+            continue
+
+        # Check for identity queries or greetings to respond conversationally
+        if is_identity_or_chit_chat(user_input):
+            print(f"\n{get_identity_message()}\n")
             continue
 
         # Regular natural language prompt -> run orchestrator pipeline!

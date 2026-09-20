@@ -854,7 +854,7 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 	defer cancelQuota()
 	app.router.StartQuotaRefresh(quotaCtx)
 
-	p := tea.NewProgram(app, tea.WithAltScreen())
+	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := p.Run()
 
 	// Save routing quality statistics so the next session inherits learned preferences.

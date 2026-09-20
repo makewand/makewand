@@ -144,6 +144,16 @@ def cmd_sandbox(args):
     cmd = args.cmd
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
+    if len(cmd) == 1:
+        cmd_str = cmd[0]
+        if any(c in cmd_str for c in ["|", ";", ">", "<", "&", "$", "`", "\n"]):
+            cmd = ["bash", "-c", cmd_str]
+        elif any(c in cmd_str for c in [" ", "\t"]) and not os.path.exists(cmd_str):
+            import shlex
+            try:
+                cmd = shlex.split(cmd_str)
+            except Exception:
+                cmd = ["bash", "-c", cmd_str]
     ws = args.cwd or os.getcwd()
     print(c(f"🛡️ Makewand 沙箱执行: {' '.join(cmd)} (工作区: {ws}, 网络: {'允许' if args.allow_net else '阻断'})", COLOR_CYAN + COLOR_BOLD))
     ret, out, err, ex = run_in_sandbox(

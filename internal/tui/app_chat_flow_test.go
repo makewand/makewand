@@ -774,3 +774,60 @@ func TestConfirmFiles_SlashApproveTriggersApprovalCommand(t *testing.T) {
 		t.Fatalf("cmd() returned %T, want confirmFileWriteMsg", msg)
 	}
 }
+
+func TestIsIdentityQuery(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+	}{
+		{"你是谁", true},
+		{"你是谁？", true},
+		{" 你是谁  ", true},
+		{"你叫什么", true},
+		{"你叫啥", true},
+		{"介绍一下你自己", true},
+		{"介绍下自己", true},
+		{"who are you", true},
+		{"你好", true},
+		{"您好！", true},
+		{"你是人类还是AI", true},
+		{"谁创建了你", true},
+		{"在这个页面你能做什么", true},
+		// Should NOT match if task keywords or compound requests exist:
+		{"你能做什么？顺便分析这份日志", false},
+		{"introduce yourself, then run the tests", false},
+		{"你好，解释一下Go语言channel", false},
+		{"帮我修复一个bug，代码里有你是谁", false},
+		{"写一个登录页面，标题是你是谁", false},
+		{"实现一个LRU缓存", false},
+		{"审查这段代码", false},
+	}
+
+	for _, c := range cases {
+		got := isIdentityQuery(c.input)
+		if got != c.want {
+			t.Errorf("isIdentityQuery(%q) = %v, want %v", c.input, got, c.want)
+		}
+	}
+}
+
+func TestSubmitChatInput_IdentityQueryHandledLocally(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat, _ = app.chat.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	m, cmd := app.submitChatInput("你是谁")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("identity query should be handled locally without async command")
+	}
+	if len(app.chat.messages) < 2 {
+		t.Fatalf("expected at least 2 messages (user + assistant), got %d", len(app.chat.messages))
+	}
+	last := app.chat.messages[len(app.chat.messages)-1]
+	if last.Role != "assistant" || !strings.Contains(last.Content, "makewand") {
+		t.Fatalf("unexpected assistant reply: %v", last)
+	}
+}
+

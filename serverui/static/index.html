@@ -19,6 +19,7 @@
         </div>
         <nav class="nav">
           <button data-view="overview" class="nav-link is-active">Overview</button>
+          <button data-view="playground" class="nav-link">Playground</button>
           <button data-view="users" class="nav-link">Users</button>
           <button data-view="tokens" class="nav-link">Tokens</button>
           <button data-view="teams" class="nav-link">Teams</button>
@@ -102,6 +103,37 @@
                 </div>
                 <pre id="usage-summary" class="code-block"></pre>
               </div>
+            </div>
+          </section>
+
+          <section data-panel="playground" class="view-panel">
+            <div class="panel playground-panel">
+              <div class="panel-head playground-head">
+                <div>
+                  <h3>Interactive Playground & Logs</h3>
+                  <p>实时与 Makewand 进行交互对话、测试意图路由并查看执行日志。</p>
+                </div>
+                <div class="playground-controls">
+                  <div class="intent-indicator">
+                    <span class="label">Intent:</span>
+                    <span id="chat-intent-badge" class="badge badge-teal">Ready</span>
+                  </div>
+                  <button id="chat-clear-btn" type="button" class="ghost-button">Clear</button>
+                </div>
+              </div>
+
+              <div id="chat-history-container" class="chat-history-wrap">
+                <div class="chat-bubble system">
+                  ✨ 欢迎使用 Makewand Web 控制台！输入闲聊或问答（如“你是谁”）将由智能意图路由直接响应；输入开发需求将触发多模型调度。
+                </div>
+              </div>
+
+              <form id="playground-form" class="chat-input-form">
+                <div class="chat-input-row">
+                  <textarea id="playground-input" rows="2" placeholder="输入您的问题或任务指令（例如：‘你是谁’，按 Enter 发送，Shift+Enter 换行）..."></textarea>
+                  <button type="submit" id="playground-send-btn" class="primary-button">Send</button>
+                </div>
+              </form>
             </div>
           </section>
 
