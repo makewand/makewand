@@ -15,9 +15,11 @@ class TestOrchestrator(unittest.TestCase):
 
     def test_has_critical_defects(self):
         # Critical defects
+        self.assertTrue(has_critical_defects("发现重大隐患: [P0] arbitrary host command execution"))
         self.assertTrue(has_critical_defects("发现重大隐患: [P1] 互斥锁存在死锁漏洞"))
         self.assertTrue(has_critical_defects("存在 [P2] 资源泄露风险，建议修改后再合并"))
         self.assertTrue(has_critical_defects("检测到 race condition 和数据竞态"))
+        self.assertTrue(has_critical_defects("LGTM; race condition in worker"))
 
         # Clean passes
         self.assertFalse(has_critical_defects("经审查，代码未发现严重漏洞，LGTM，建议直接合并"))

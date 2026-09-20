@@ -2,9 +2,11 @@
 Health probing, quota monitoring, and status cache management.
 """
 
+import os
+import re
 import json
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from pathlib import Path
 from makewand.config import (
     STATUS_CACHE_FILE,
@@ -24,39 +26,92 @@ DEFAULT_CACHE = {
     "muse": {"status": "unknown", "reason": "", "resets_at": None, "updated_at": ""}
 }
 
+def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool:
+    if not resets_at or resets_at == "待重置":
+        if updated_at:
+            try:
+                dt = datetime.fromisoformat(updated_at)
+                if (datetime.now() - dt).total_seconds() > 4 * 3600:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    now = datetime.now()
+    try:
+        dt = datetime.fromisoformat(resets_at)
+        return now >= dt
+    except Exception:
+        pass
+
+    clean = re.sub(r"\(.*?\)", "", resets_at).strip()
+    for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
+        try:
+            t = datetime.strptime(clean, fmt).time()
+            reset_dt = datetime.combine(now.date(), t)
+            if now >= reset_dt:
+                if updated_at:
+                    up_dt = datetime.fromisoformat(updated_at)
+                    if up_dt <= reset_dt:
+                        return True
+                else:
+                    return True
+        except Exception:
+            continue
+    return False
+
+def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
+    for model_name, info in cache.items():
+        if isinstance(info, dict) and info.get("status") == "limited":
+            if is_reset_time_passed(info.get("resets_at"), info.get("updated_at", "")):
+                info["status"] = "healthy"
+                info["reason"] = f"已过配额重置窗口 ({info.get('resets_at')})，已自动恢复待命"
+                info["resets_at"] = None
+                info["updated_at"] = datetime.now().isoformat()
+    return cache
+
 def load_status_cache() -> Dict[str, Any]:
     ensure_config_dir()
     cache = dict(DEFAULT_CACHE)
+    loaded = False
     if STATUS_CACHE_FILE.exists():
         try:
             with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 cache.update(data)
-                return cache
+                loaded = True
         except Exception:
             pass
 
     # Fallback to legacy trio status if available
-    if LEGACY_TRIO_CACHE.exists():
+    if not loaded and LEGACY_TRIO_CACHE.exists():
         try:
             with open(LEGACY_TRIO_CACHE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 cache.update(data)
-                return cache
         except Exception:
             pass
 
-    return cache
+    return _sanitize_cache(cache)
 
 def save_status_cache(cache: Dict[str, Any]):
     ensure_config_dir()
     try:
-        with open(STATUS_CACHE_FILE, "w", encoding="utf-8") as f:
+        tmp_file = STATUS_CACHE_FILE.parent / f".status_{os.getpid()}_{datetime.now().timestamp()}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, STATUS_CACHE_FILE)
+
         # Also update legacy trio cache file for backward compatibility
         if LEGACY_TRIO_CACHE.parent.exists():
-            with open(LEGACY_TRIO_CACHE, "w", encoding="utf-8") as f:
+            tmp_legacy = LEGACY_TRIO_CACHE.parent / f".trio_{os.getpid()}_{datetime.now().timestamp()}.tmp"
+            with open(tmp_legacy, "w", encoding="utf-8") as f:
                 json.dump(cache, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_legacy, LEGACY_TRIO_CACHE)
     except Exception:
         pass
 

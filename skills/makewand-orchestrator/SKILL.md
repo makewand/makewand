@@ -63,7 +63,14 @@ makewand review
 # 7. 并发双模型竞速对比与裁判裁决
 makewand race "实现一个快速排序函数 quick_sort(arr) 并写测试用例验证"
 
-# 8. 直接调用底层订阅单次执行 (透传)
+# 8. 带预算的安全文件搜索 (自动避开冷归档、SQLite、大文件与虚拟环境)
+makewand search "def safe_search" --cwd /path/to/project
+
+# 9. 物理隔离沙箱执行 (Bubblewrap 容器级只读根目录与凭据脱敏)
+makewand sandbox python3 -m pytest tests/
+makewand sandbox --no-net go test ./...
+
+# 10. 直接调用底层订阅单次执行 (透传)
 makewand agy "总结当前项目的架构特点"
 makewand codex "排查这段代码的死锁漏洞"
 makewand claude "编写测试套件"

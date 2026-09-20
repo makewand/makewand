@@ -44,9 +44,10 @@ def execute_agy_task(
     )
     combined = f"{out}\n{err}" if not stream else out
 
+    if code == 0:
+        return True, out, None
+
     is_limited, reason, _ = parse_agy_quota(combined)
     if is_limited:
         return False, None, f"Antigravity 配额受限: {reason}"
-    if code == 0:
-        return True, out, None
     return False, combined, ex or f"agy returned exit code {code}"

@@ -108,7 +108,21 @@ makewand review
 makewand race "实现一个快速排序函数 quick_sort(arr) 并写测试用例验证"
 ```
 
-### 6. 单模型直接透传调用
+### 6. 带预算安全搜索 (避免冷归档与大库 I/O 卡死)
+```bash
+makewand search "def safe_search" --cwd /path/to/project
+```
+
+### 7. Bubblewrap 物理进程沙箱隔离执行
+```bash
+# 隔离运行单元测试 (只读根目录、凭据自动脱敏、仅工作区可写)
+makewand sandbox python3 -m pytest tests/
+
+# 阻断外网访问执行构建/测试
+makewand sandbox --no-net go test ./...
+```
+
+### 8. 单模型直接透传调用
 ```bash
 makewand agy "总结当前项目的架构优势"
 makewand codex "分析这段代码的死锁风险"

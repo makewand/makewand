@@ -56,6 +56,9 @@ def execute_codex_task(
     )
     combined = f"{out}\n{err}" if not stream else out
 
+    if code == 0:
+        return True, out, None
+
     is_limited, reason, resets = parse_codex_quota(combined)
     if is_limited:
         cache["codex"] = {
@@ -67,6 +70,4 @@ def execute_codex_task(
         save_status_cache(cache)
         return False, None, f"Codex CLI 执行中触发额度限制: {reason}"
 
-    if code == 0:
-        return True, out, None
     return False, combined, ex or f"Codex returned exit code {code}"

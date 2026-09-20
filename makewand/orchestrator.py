@@ -5,6 +5,7 @@ Makewand Orchestrator: Multi-model pipeline, task tiering, auto-fix loop, and ra
 import os
 import sys
 import time
+import uuid
 import tempfile
 import concurrent.futures
 from pathlib import Path
@@ -42,10 +43,25 @@ def has_critical_defects(review_text: str) -> bool:
     if not review_text:
         return False
     lower = review_text.lower()
-    pass_signals = ["没有发现明显缺陷", "无需修改", "建议直接合并", "审核通过", "lgtm", "所有用例均通过且无安全漏洞", "未发现严重漏洞"]
-    if any(sig in lower for sig in pass_signals) and not any(p in lower for p in ["[p1]", "[p2]", "致命缺陷", "建议修改后再合并"]):
+    unambiguous_defects = [
+        "[p0]", "[p1]", "[p2]",
+        "p0:", "p1:", "p2:",
+        "致命缺陷", "建议修改后再合并", "需要整改", "未通过",
+        "并发死锁", "内存泄露", "数据竞态", "race condition",
+        "arbitrary host command"
+    ]
+    # If explicit defect tags exist, it is ALWAYS a defect (even if pass words appear)
+    if any(p in lower for p in unambiguous_defects):
+        return True
+
+    pass_signals = [
+        "没有发现明显缺陷", "无需修改", "建议直接合并", "审核通过", "lgtm",
+        "所有用例均通过且无安全漏洞", "未发现严重漏洞", "无安全漏洞", "未发现安全漏洞"
+    ]
+    if any(sig in lower for sig in pass_signals):
         return False
-    defect_patterns = ["[p1]", "[p2]", "致命缺陷", "并发漏洞", "数据竞态", "内存泄露", "资源泄露", "建议修改后再合并", "未被此次校验覆盖", "overflowerror", "race condition"]
+
+    defect_patterns = ["缺陷", "漏洞", "隐患", "死锁", "竞态", "泄露", "overflowerror"]
     return any(p in lower for p in defect_patterns)
 
 def run_pipeline(
@@ -57,7 +73,7 @@ def run_pipeline(
     auto_fix: bool = True,
     max_fix: int = 2,
     timeout: int = 300
-):
+) -> bool:
     if not cwd:
         cwd = os.getcwd()
     if tier == "auto":
@@ -125,7 +141,11 @@ def run_pipeline(
             coder_engine = "agy"
         else:
             print(c(f"❌ 自动降级失败: {err}", COLOR_RED))
-            sys.exit(1)
+            return False
+
+    if coder_output is None:
+        print(c("❌ 所有可用模型均无法完成编码任务，流水线终止。", COLOR_RED + COLOR_BOLD))
+        return False
 
     if coder_output and not stream:
         print(c("【编码实现输出摘要】", COLOR_BOLD))
@@ -229,7 +249,13 @@ def run_pipeline(
         print(c("【最终审计意见与质量评估】", COLOR_BOLD))
         print(review_output.strip()[:1000])
         print("...\n")
-    print(c("✔ 任务全链路自适应闭环完成。", COLOR_GREEN + COLOR_BOLD))
+
+    if review_output and has_critical_defects(review_output):
+        print(c("❌ [Makewand Quality Gate] 经修复轮次后代码仍存在未通过的缺陷，未达交付标准。", COLOR_RED + COLOR_BOLD))
+        return False
+
+    print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
+    return True
 
 def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300):
     if not cwd:
@@ -274,71 +300,76 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
     x_ok = cache.get("codex", {}).get("status") == "healthy"
     m_ok = cache.get("muse", {}).get("status") == "healthy"
 
-    wt_a = Path(tempfile.gettempdir()) / "makewand_race_agent_a"
-    wt_b = Path(tempfile.gettempdir()) / "makewand_race_agent_b"
-
     import shutil
-    shutil.rmtree(wt_a, ignore_errors=True)
-    shutil.rmtree(wt_b, ignore_errors=True)
+    race_id = uuid.uuid4().hex[:8]
+    tmp_parent = Path(tempfile.gettempdir()) / f"makewand_race_{race_id}"
+    wt_a = tmp_parent / "agent_a"
+    wt_b = tmp_parent / "agent_b"
 
-    clone_isolated_worktree(cwd, wt_a)
-    clone_isolated_worktree(cwd, wt_b)
+    try:
+        wt_a.mkdir(parents=True, exist_ok=True)
+        wt_b.mkdir(parents=True, exist_ok=True)
 
-    # Pick Contestants
-    name_a = "Codex (gpt-6-astra)" if x_ok else ("Muse Code" if m_ok else "Antigravity (Gemini Fast)")
-    name_b = "Claude Code" if c_ok else "Antigravity (Gemini Deep)"
+        clone_isolated_worktree(cwd, wt_a)
+        clone_isolated_worktree(cwd, wt_b)
 
-    print(c(f"  选手 A: {name_a} (独立工作区: {wt_a})", COLOR_CYAN + COLOR_BOLD))
-    print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
-    print(c("并发执行中，请稍候...\n", COLOR_YELLOW))
+        # Pick Contestants
+        name_a = "Codex (gpt-6-astra)" if x_ok else ("Muse Code" if m_ok else "Antigravity (Gemini Fast)")
+        name_b = "Claude Code" if c_ok else "Antigravity (Gemini Deep)"
 
-    def run_agent_a():
-        start = time.time()
-        full_p = f"工作目录绝对路径: {wt_a}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
-        if x_ok:
-            ok, out, err = execute_codex_task(full_p, cwd=str(wt_a), timeout=timeout)
-        elif m_ok:
-            ok, out, err = execute_muse_task(full_p, cwd=str(wt_a), timeout=timeout)
-        else:
-            ok, out, err = execute_agy_task(full_p, cwd=str(wt_a), timeout=timeout, tier="fast")
-        duration = round(time.time() - start, 2)
-        return name_a, ok, out, duration, wt_a
+        print(c(f"  选手 A: {name_a} (独立工作区: {wt_a})", COLOR_CYAN + COLOR_BOLD))
+        print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
+        print(c("并发执行中，请稍候...\n", COLOR_YELLOW))
 
-    def run_agent_b():
-        start = time.time()
-        full_p = f"工作目录绝对路径: {wt_b}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
-        if c_ok:
-            ok, out, err = execute_claude_task(full_p, cwd=str(wt_b), timeout=timeout)
-        else:
-            ok, out, err = execute_agy_task(full_p, cwd=str(wt_b), timeout=timeout, tier="deep")
-        duration = round(time.time() - start, 2)
-        return name_b, ok, out, duration, wt_b
+        def run_agent_a():
+            start = time.time()
+            full_p = f"工作目录绝对路径: {wt_a}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
+            if x_ok:
+                ok, out, err = execute_codex_task(full_p, cwd=str(wt_a), timeout=timeout)
+            elif m_ok:
+                ok, out, err = execute_muse_task(full_p, cwd=str(wt_a), timeout=timeout)
+            else:
+                ok, out, err = execute_agy_task(full_p, cwd=str(wt_a), timeout=timeout, tier="fast")
+            duration = round(time.time() - start, 2)
+            return name_a, ok, out, duration, wt_a
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f_a = executor.submit(run_agent_a)
-        f_b = executor.submit(run_agent_b)
-        res_a = f_a.result()
-        res_b = f_b.result()
+        def run_agent_b():
+            start = time.time()
+            full_p = f"工作目录绝对路径: {wt_b}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
+            if c_ok:
+                ok, out, err = execute_claude_task(full_p, cwd=str(wt_b), timeout=timeout)
+            else:
+                ok, out, err = execute_agy_task(full_p, cwd=str(wt_b), timeout=timeout, tier="deep")
+            duration = round(time.time() - start, 2)
+            return name_b, ok, out, duration, wt_b
 
-    diff_a = get_git_diff(str(wt_a))
-    diff_b = get_git_diff(str(wt_b))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f_a = executor.submit(run_agent_a)
+            f_b = executor.submit(run_agent_b)
+            res_a = f_a.result()
+            res_b = f_b.result()
 
-    print(c("\n============================================================", COLOR_BOLD))
-    print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
-    print(c("============================================================\n", COLOR_BOLD))
-    print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节")
-    print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节\n")
+        diff_a = get_git_diff(str(wt_a))
+        diff_b = get_git_diff(str(wt_b))
 
-    # Chief Referee evaluation with Antigravity
-    judge_prompt = (
-        f"请作为资深软件架构裁判，客观对比以下两位选手对同一任务的实现方案，指出各自优势与缺陷，并评定胜出者：\n\n"
-        f"--- 原始任务 ---\n{prompt}\n\n"
-        f"--- 选手 A ({res_a[0]}) 的改动 ---\n{diff_a[:3000] if diff_a else '无 diff'}\n\n"
-        f"--- 选手 B ({res_b[0]}) 的改动 ---\n{diff_b[:3000] if diff_b else '无 diff'}\n\n"
-        f"请给出：1. 方案对比分析 2. 最终裁决结果及推荐采纳理由。"
-    )
-    print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估...", COLOR_GREEN + COLOR_BOLD))
-    ok, judge_report, _ = execute_agy_task(judge_prompt, cwd=cwd, tier="deep")
-    if judge_report:
-        print(c("\n【裁判裁决报告】", COLOR_BOLD))
-        print(judge_report.strip())
+        print(c("\n============================================================", COLOR_BOLD))
+        print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
+        print(c("============================================================\n", COLOR_BOLD))
+        print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节")
+        print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节\n")
+
+        # Chief Referee evaluation with Antigravity
+        judge_prompt = (
+            f"请作为资深软件架构裁判，客观对比以下两位选手对同一任务的实现方案，指出各自优势与缺陷，并评定胜出者：\n\n"
+            f"--- 原始任务 ---\n{prompt}\n\n"
+            f"--- 选手 A ({res_a[0]}) 的改动 ---\n{diff_a[:3000] if diff_a else '无 diff'}\n\n"
+            f"--- 选手 B ({res_b[0]}) 的改动 ---\n{diff_b[:3000] if diff_b else '无 diff'}\n\n"
+            f"请给出：1. 方案对比分析 2. 最终裁决结果及推荐采纳理由。"
+        )
+        print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估...", COLOR_GREEN + COLOR_BOLD))
+        ok, judge_report, _ = execute_agy_task(judge_prompt, cwd=cwd, tier="deep", timeout=timeout)
+        if judge_report:
+            print(c("\n【裁判裁决报告】", COLOR_BOLD))
+            print(judge_report.strip())
+    finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)

@@ -50,6 +50,9 @@ def execute_claude_task(
     )
     combined = f"{out}\n{err}" if not stream else out
 
+    if code == 0:
+        return True, out, None
+
     is_limited, reason, resets = parse_claude_quota(combined)
     if is_limited:
         cache["claude"] = {
@@ -61,6 +64,4 @@ def execute_claude_task(
         save_status_cache(cache)
         return False, None, f"Claude Code 执行中触发额度限制: {reason}"
 
-    if code == 0:
-        return True, out, None
     return False, combined, ex or f"Claude returned exit code {code}"

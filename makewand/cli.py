@@ -2,6 +2,7 @@
 Makewand CLI: Command-line interface and subcommand parsers.
 """
 
+import os
 import sys
 import argparse
 from makewand.config import (
@@ -118,6 +119,45 @@ def cmd_quota(args):
     """Alias for status with focus on limits and reset schedule."""
     cmd_status(args)
 
+def cmd_search(args):
+    """Budgeted safe text search avoiding heavy cold archives, logs, and binaries."""
+    from makewand.search import safe_search
+    results = safe_search(
+        args.pattern,
+        root_path=args.cwd,
+        max_results=args.max_results,
+        max_depth=args.max_depth
+    )
+    if not results:
+        print("未找到匹配内容。")
+        return
+    for r in results:
+        print(f"{c(r['file'], COLOR_CYAN)}:{c(str(r['line_num']), COLOR_YELLOW)}: {r['content']}")
+    print(c(f"\n共找到 {len(results)} 条匹配结果 (已自动避开冷归档、SQLite 数据库、模型与虚拟环境)。", COLOR_GREEN))
+
+def cmd_sandbox(args):
+    """Run command inside bubblewrap process sandbox."""
+    from makewand.sandbox import run_in_sandbox
+    if not args.cmd:
+        print("请指定要在沙箱中运行的命令，例如: makewand sandbox python3 -m unittest")
+        sys.exit(1)
+    cmd = args.cmd
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    ws = args.cwd or os.getcwd()
+    print(c(f"🛡️ Makewand 沙箱执行: {' '.join(cmd)} (工作区: {ws}, 网络: {'允许' if args.allow_net else '阻断'})", COLOR_CYAN + COLOR_BOLD))
+    ret, out, err, ex = run_in_sandbox(
+        cmd,
+        workspace=ws,
+        timeout=args.timeout,
+        allow_network=args.allow_net,
+        stream=True
+    )
+    if ret != 0:
+        if ex:
+            sys.stderr.write(f"Sandbox Error: {ex}\n")
+        sys.exit(ret if ret > 0 else 1)
+
 def main():
     parser = argparse.ArgumentParser(
         prog="makewand",
@@ -161,6 +201,20 @@ def main():
     p_race.add_argument("prompt", help="Prompt for race comparison")
     p_race.add_argument("--cwd", help="Target working directory")
     p_race.add_argument("--timeout", type=int, default=300)
+
+    # search (budgeted search guardrail)
+    p_search = subparsers.add_parser("search", help="Budgeted fast search excluding cold archives and databases")
+    p_search.add_argument("pattern", help="Regex or text pattern to search for")
+    p_search.add_argument("--cwd", help="Root directory to search (default: current directory)")
+    p_search.add_argument("--max-results", type=int, default=150, help="Maximum matches to return (default: 150)")
+    p_search.add_argument("--max-depth", type=int, default=6, help="Maximum directory depth (default: 6)")
+
+    # sandbox (bubblewrap process isolation)
+    p_sb = subparsers.add_parser("sandbox", help="Run shell command inside bubblewrap process sandbox")
+    p_sb.add_argument("--cwd", help="Target working directory (default: current directory)")
+    p_sb.add_argument("--no-net", dest="allow_net", action="store_false", default=True, help="Block network inside sandbox")
+    p_sb.add_argument("--timeout", type=int, default=120, help="Execution timeout in seconds")
+    p_sb.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to execute inside sandbox")
 
     # direct runners
     p_claude = subparsers.add_parser("claude", help="Run prompt directly with Claude Code subscription")
@@ -209,10 +263,9 @@ def main():
         args.probe = True
         cmd_status(args)
     elif args.subcommand == "quota":
-        args.probe = False
         cmd_quota(args)
     elif args.subcommand == "run":
-        run_pipeline(
+        ok = run_pipeline(
             args.prompt,
             cwd=args.cwd,
             tier=args.tier,
@@ -222,26 +275,40 @@ def main():
             max_fix=args.max_fix,
             timeout=args.timeout
         )
+        if not ok:
+            sys.exit(1)
     elif args.subcommand == "review":
         run_review(cwd=args.cwd, stream=args.stream, timeout=args.timeout)
     elif args.subcommand == "race":
         run_race(args.prompt, cwd=args.cwd, timeout=args.timeout)
+    elif args.subcommand == "search":
+        cmd_search(args)
+    elif args.subcommand == "sandbox":
+        cmd_sandbox(args)
     elif args.subcommand == "claude":
         ok, out, err = execute_claude_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream)
         if ok and not args.stream: print(out)
-        elif not ok: sys.exit(1)
+        elif not ok:
+            if err: sys.stderr.write(f"{err}\n")
+            sys.exit(1)
     elif args.subcommand == "codex":
         ok, out, err = execute_codex_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream)
         if ok and not args.stream: print(out)
-        elif not ok: sys.exit(1)
+        elif not ok:
+            if err: sys.stderr.write(f"{err}\n")
+            sys.exit(1)
     elif args.subcommand == "agy":
         ok, out, err = execute_agy_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream)
         if ok and not args.stream: print(out)
-        elif not ok: sys.exit(1)
+        elif not ok:
+            if err: sys.stderr.write(f"{err}\n")
+            sys.exit(1)
     elif args.subcommand == "muse":
         ok, out, err = execute_muse_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream)
         if ok and not args.stream: print(out)
-        elif not ok: sys.exit(1)
+        elif not ok:
+            if err: sys.stderr.write(f"{err}\n")
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()

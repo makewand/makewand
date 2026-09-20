@@ -56,6 +56,9 @@ def execute_muse_task(
     )
     combined = f"{out}\n{err}" if not stream else out
 
+    if code == 0:
+        return True, out, None
+
     is_limited, reason, resets = parse_muse_quota(combined)
     if is_limited:
         cache["muse"] = {
@@ -67,6 +70,4 @@ def execute_muse_task(
         save_status_cache(cache)
         return False, None, f"Muse Code 执行中检测到限制: {reason}"
 
-    if code == 0:
-        return True, out, None
     return False, combined, ex or f"Muse returned exit code {code}"

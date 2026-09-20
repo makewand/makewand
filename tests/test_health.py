@@ -7,7 +7,7 @@ from makewand.providers.claude import parse_claude_quota
 from makewand.providers.codex import parse_codex_quota
 from makewand.providers.agy import parse_agy_quota
 from makewand.providers.muse import parse_muse_quota
-from makewand.health import load_status_cache, save_status_cache
+from makewand.health import load_status_cache, save_status_cache, is_reset_time_passed
 
 class TestHealth(unittest.TestCase):
     def test_claude_quota_parser(self):
@@ -51,6 +51,12 @@ class TestHealth(unittest.TestCase):
         self.assertIn("claude", cache)
         self.assertIn("codex", cache)
         self.assertIn("muse", cache)
+
+    def test_reset_time_passed(self):
+        # 10:58 AM with morning updated_at is past in late afternoon
+        self.assertTrue(is_reset_time_passed("10:58 AM", "2026-09-20T10:00:00"))
+        # 4 hours expired fallback
+        self.assertTrue(is_reset_time_passed(None, "2026-09-20T10:00:00"))
 
 if __name__ == "__main__":
     unittest.main()
