@@ -15,7 +15,15 @@ SENSITIVE_HOME_DIRS = [
     ".gnupg",
     ".config/gcloud",
     ".azure",
-    ".kube"
+    ".kube",
+    ".claude",
+    ".codex",
+    ".gemini",
+    ".anthropic",
+    ".openai",
+    ".config/gh",
+    ".gitconfig",
+    ".netrc"
 ]
 
 def is_bwrap_available() -> bool:
@@ -32,13 +40,11 @@ def wrap_bwrap(
     allow_network: bool = True
 ) -> List[str]:
     """
-    Wraps command with bubblewrap isolating host filesystem and credentials.
+    Wraps command with bubblewrap isolating host filesystem, IPC, PID, and credentials.
     Only the specified workspace is writable.
     """
     bwrap = shutil.which("bwrap") or "/usr/bin/bwrap"
     ws = os.path.abspath(workspace)
-    sandbox_home = os.path.join(ws, ".makewand_sandbox_home")
-    os.makedirs(sandbox_home, exist_ok=True)
 
     path_env = os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     user_home = str(Path.home())
@@ -47,17 +53,22 @@ def wrap_bwrap(
         bwrap,
         "--die-with-parent",
         "--new-session",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
         # Read-only root
         "--ro-bind", "/", "/",
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
+        # Ephemeral clean HOME in tmpfs to avoid workspace pollution
+        "--tmpfs", user_home,
         # Writable workspace only
         "--bind", ws, ws,
         "--chdir", ws,
         "--clearenv",
         "--setenv", "PATH", path_env,
-        "--setenv", "HOME", sandbox_home,
+        "--setenv", "HOME", user_home,
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "MAKEWAND_SANDBOX", "1",
     ]
@@ -65,12 +76,12 @@ def wrap_bwrap(
     if not allow_network:
         bwrap_cmd.append("--unshare-net")
 
-    # Pass locale and terminal
+    # Pass safe locale and terminal
     for var in ["LANG", "LC_ALL", "TERM"]:
         if var in os.environ:
             bwrap_cmd.extend(["--setenv", var, os.environ[var]])
 
-    # Mask sensitive host directories in user's home
+    # Explicitly mask sensitive host credential directories
     for rel_dir in SENSITIVE_HOME_DIRS:
         sensitive_path = os.path.join(user_home, rel_dir)
         if os.path.exists(sensitive_path):
@@ -89,7 +100,8 @@ def run_in_sandbox(
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command inside the bubblewrap sandbox.
-    Falls back to normal subprocess if bwrap is not available.
+    Enforces fail-closed security: refuses execution if bwrap is missing unless
+    explicitly overridden by MAKEWAND_UNSAFE_HOST_EXEC=1.
     """
     if is_bwrap_available():
         wrapped = wrap_bwrap(cmd, workspace=workspace, allow_network=allow_network)
@@ -101,10 +113,17 @@ def run_in_sandbox(
             print_prefix=print_prefix
         )
     else:
-        return run_subprocess(
-            cmd,
-            timeout=timeout,
-            cwd=workspace,
-            stream=stream,
-            print_prefix=print_prefix
+        if os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") == "1":
+            return run_subprocess(
+                cmd,
+                timeout=timeout,
+                cwd=workspace,
+                stream=stream,
+                print_prefix=print_prefix
+            )
+        return (
+            -1,
+            "",
+            "Bubblewrap (bwrap) sandbox is not available and MAKEWAND_UNSAFE_HOST_EXEC is not set. Execution blocked for security.",
+            "SandboxUnavailable"
         )

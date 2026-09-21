@@ -88,10 +88,53 @@ class TestOrchestrator(unittest.TestCase):
         self.assertTrue(has_critical_defects("检测到 race condition 和数据竞态"))
         self.assertTrue(has_critical_defects("LGTM; race condition in worker"))
 
-        # Clean passes
+        # Clean passes with natural language
         self.assertFalse(has_critical_defects("经审查，代码未发现严重漏洞，LGTM，建议直接合并"))
         self.assertFalse(has_critical_defects("所有用例均通过且无安全漏洞，审核通过"))
         self.assertFalse(has_critical_defects("没有发现明显缺陷，无需修改"))
+
+        # Crucial: Negation phrases must NOT trigger false defects!
+        self.assertFalse(has_critical_defects("经检查，未发现并发死锁，没有发现内存泄漏，亦无数据竞态隐患，表现良好。"))
+        self.assertFalse(has_critical_defects("Review result: no deadlock, no race condition, without any defect. Looks good!"))
+        self.assertFalse(has_critical_defects("经过分析，代码中不存在死锁，没有发现缺陷，建议合并。"))
+
+        # Structural JSON verdicts
+        self.assertFalse(has_critical_defects(
+            "审查意见详情...\n"
+            "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"
+        ))
+        self.assertTrue(has_critical_defects(
+            "审查意见详情...\n"
+            "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"空指针解引用\"]}"
+        ))
+
+    @patch("makewand.orchestrator.get_or_update_status")
+    @patch("makewand.orchestrator.execute_claude_task")
+    @patch("makewand.orchestrator.get_git_diff")
+    def test_fail_closed_on_unverified_review(self, mock_diff, mock_claude, mock_status):
+        mock_status.return_value = {"claude": {"status": "healthy"}, "codex": {"status": "limited"}}
+        mock_claude.return_value = (True, "Code written", None)
+        mock_diff.return_value = "diff --git a/main.py b/main.py\n+print('hello')"
+
+        # Both reviewer codex and agy fail or return None
+        with patch("makewand.orchestrator.execute_codex_task", return_value=(False, None, "error")), \
+             patch("makewand.orchestrator.execute_agy_task", return_value=(False, None, "error")):
+            res = run_pipeline("实现测试功能", cwd="/tmp", auto_fix=False)
+            # Must FAIL-CLOSED (return False, rejecting delivery)
+            self.assertFalse(res)
+
+    @patch("makewand.orchestrator.get_or_update_status")
+    @patch("makewand.orchestrator.execute_claude_task")
+    def test_explain_readonly_flag(self, mock_claude, mock_status):
+        mock_status.return_value = {"claude": {"status": "healthy"}}
+        mock_claude.return_value = (True, "Go channel explanation", None)
+
+        res = run_pipeline("解释一下Go语言channel原理", cwd="/tmp")
+        self.assertTrue(res)
+        # Must have passed readonly=True
+        mock_claude.assert_called_once()
+        _, kwargs = mock_claude.call_args
+        self.assertTrue(kwargs.get("readonly"))
 
 if __name__ == "__main__":
     unittest.main()

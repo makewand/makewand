@@ -19,12 +19,18 @@ def execute_agy_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
-    stream: bool = False
+    stream: bool = False,
+    readonly: bool = False
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Dispatches task to Antigravity CLI with automatic headless permission bypass.
+    Dispatches task to Antigravity CLI.
+    If readonly=True, enforces read-only instructions and constraints.
     """
-    cmd = ["agy", "-p", prompt, "--dangerously-skip-permissions", "--print-timeout", f"{timeout}s"]
+    final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
+    cmd = ["agy", "-p", final_prompt, "--print-timeout", f"{timeout}s"]
+    if not readonly:
+        cmd.append("--dangerously-skip-permissions")
+
     if model:
         cmd.extend(["--model", model])
     elif tier == "deep":
@@ -34,7 +40,8 @@ def execute_agy_task(
     else:
         cmd.extend(["--effort", "medium"])
 
-    print(c(f"[Makewand -> Antigravity] 派发架构/兜底任务 (Tier: {tier}, 权限自动穿透)...", COLOR_GREEN))
+    log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
+    print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN))
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout + 15,

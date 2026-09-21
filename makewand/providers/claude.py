@@ -3,7 +3,7 @@ Claude Code provider adapter (Anthropic subscription).
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_BLUE
 from makewand.providers.base import run_subprocess
@@ -15,7 +15,8 @@ def parse_claude_quota(output: str) -> Tuple[bool, str, Optional[str]]:
         reset_time = reset_match.group(1).strip() if reset_match else "待重置"
         return True, f"限流 / 额度耗尽 (重置时间: {reset_time})", reset_time
     if "rate_limit_error" in lower or "overloaded_error" in lower or "429" in lower:
-        return True, "API 并发或频次超限 (429)", "短期恢复"
+        iso_reset = (datetime.now() + timedelta(minutes=15)).isoformat()
+        return True, "API 并发或频次超限 (429)", iso_reset
     return False, "", None
 
 def execute_claude_task(
@@ -24,23 +25,31 @@ def execute_claude_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
-    stream: bool = False
+    stream: bool = False,
+    readonly: bool = False
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Dispatches task to Claude Code with automatic headless permission bypass.
+    Dispatches task to Claude Code.
+    If readonly=True, restricts tools to read-only inspection (Read, Grep, Glob) preventing writes.
     """
     from makewand.health import load_status_cache, save_status_cache
     cache = load_status_cache()
     if cache.get("claude", {}).get("status") == "limited":
         return False, None, f"Claude Code 当前额度受限: {cache['claude'].get('reason')}"
 
-    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+    cmd = ["claude", "-p", prompt]
+    if readonly:
+        cmd.extend(["--tools", "Read,Grep,Glob", "--permission-mode", "plan"])
+    else:
+        cmd.append("--dangerously-skip-permissions")
+
     if model:
         cmd.extend(["--model", model])
     elif tier == "fast":
         cmd.extend(["--model", "haiku"])
 
-    print(c(f"[Makewand -> Claude] 派发代码任务 (Tier: {tier}, 无头权限自动穿透)...", COLOR_BLUE))
+    log_desc = "只读解析任务 (工具只读约束)" if readonly else "代码任务 (无头权限自动穿透)"
+    print(c(f"[Makewand -> Claude] 派发{log_desc} (Tier: {tier})...", COLOR_BLUE))
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout,

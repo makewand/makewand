@@ -3,7 +3,7 @@ Codex CLI provider adapter (OpenAI subscription / gpt-6-astra).
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_CYAN
 from makewand.providers.base import run_subprocess
@@ -15,7 +15,8 @@ def parse_codex_quota(output: str) -> Tuple[bool, str, Optional[str]]:
         reset_time = reset_match.group(1).strip() if reset_match else "待重置"
         return True, f"使用额度耗尽 (重置时间: {reset_time})", reset_time
     if "429" in lower or "too many requests" in lower:
-        return True, "请求频率受限 (429)", "短期恢复"
+        iso_reset = (datetime.now() + timedelta(minutes=15)).isoformat()
+        return True, "请求频率受限 (429)", iso_reset
     return False, "", None
 
 def execute_codex_task(
@@ -24,17 +25,24 @@ def execute_codex_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
-    stream: bool = False
+    stream: bool = False,
+    readonly: bool = False
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Dispatches task to Codex CLI with automatic approval bypass and non-git resilience.
+    Dispatches task to Codex CLI.
+    If readonly=True, enforces read-only sandbox mode, preventing any file modifications.
     """
     from makewand.health import load_status_cache, save_status_cache
     cache = load_status_cache()
     if cache.get("codex", {}).get("status") == "limited":
         return False, None, f"Codex CLI 当前额度受限: {cache['codex'].get('reason')}"
 
-    cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
+    cmd = ["codex", "exec", "--skip-git-repo-check"]
+    if readonly:
+        cmd.extend(["--sandbox", "read-only", "--ephemeral"])
+    else:
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+
     if cwd:
         cmd.extend(["-C", str(cwd)])
     if model:

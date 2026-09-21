@@ -257,6 +257,7 @@ def main():
     p_muse.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
     p_muse.add_argument("--model", help="Specific model name")
     p_muse.add_argument("--stream", action="store_true", default=False)
+    p_muse.add_argument("--timeout", type=int, default=300)
     p_observe = subparsers.add_parser("observe", help="Inspect all running AI sessions, classify behavior, and report makewand optimizations")
     p_observe.add_argument("--json", action="store_true", help="Output raw JSON format")
 

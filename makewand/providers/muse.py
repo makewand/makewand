@@ -3,7 +3,7 @@ Muse Code provider adapter (Meta subscription / Muse interactive coding agent).
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_PURPLE
 from makewand.providers.base import run_subprocess
@@ -13,7 +13,8 @@ def parse_muse_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     if any(k in lower for k in ["missing meta credentials", "open this page to sign in", "oauth/device", "auth required", "press enter to open"]):
         return True, "未登录或需配置凭据 (运行 'muse login' 或在 ~/.config/muse/env 中配置 META_API_KEY)", "需登录授权"
     if "rate limit" in lower or "usage limit" in lower or "429" in lower:
-        return True, "Meta 订阅额度耗尽或频次受限", "待重置"
+        iso_reset = (datetime.now() + timedelta(minutes=15)).isoformat()
+        return True, "Meta 订阅额度耗尽或频次受限", iso_reset
     return False, "", None
 
 def execute_muse_task(
@@ -22,17 +23,21 @@ def execute_muse_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
-    stream: bool = False
+    stream: bool = False,
+    readonly: bool = False
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Dispatches task to Muse Code with --yolo for headless execution.
+    Dispatches task to Muse Code.
+    If readonly=True, omits --yolo bypass flag.
     """
     from makewand.health import load_status_cache, save_status_cache
     cache = load_status_cache()
     if cache.get("muse", {}).get("status") in ["limited", "needs_auth"]:
         return False, None, f"Muse Code 当前不可用: {cache['muse'].get('reason')}"
 
-    cmd = ["muse", "exec", "--yolo"]
+    cmd = ["muse", "exec"]
+    if not readonly:
+        cmd.append("--yolo")
     if cwd:
         cmd.extend(["--workspace", str(cwd)])
     if model:

@@ -5,6 +5,7 @@ Health probing, quota monitoring, and status cache management.
 import os
 import re
 import json
+import fcntl
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from pathlib import Path
@@ -82,9 +83,13 @@ def load_status_cache() -> Dict[str, Any]:
     if STATUS_CACHE_FILE.exists():
         try:
             with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                cache.update(data)
-                loaded = True
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    data = json.load(f)
+                    cache.update(data)
+                    loaded = True
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception:
             pass
 
@@ -92,8 +97,12 @@ def load_status_cache() -> Dict[str, Any]:
     if not loaded and LEGACY_TRIO_CACHE.exists():
         try:
             with open(LEGACY_TRIO_CACHE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                cache.update(data)
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    data = json.load(f)
+                    cache.update(data)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception:
             pass
 
@@ -101,22 +110,28 @@ def load_status_cache() -> Dict[str, Any]:
 
 def save_status_cache(cache: Dict[str, Any]):
     ensure_config_dir()
+    lock_file = STATUS_CACHE_FILE.parent / ".status.lock"
     try:
-        tmp_file = STATUS_CACHE_FILE.parent / f".status_{os.getpid()}_{datetime.now().timestamp()}.tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_file, STATUS_CACHE_FILE)
+        with open(lock_file, "w") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                tmp_file = STATUS_CACHE_FILE.parent / f".status_{os.getpid()}_{datetime.now().timestamp()}.tmp"
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_file, STATUS_CACHE_FILE)
 
-        # Also update legacy trio cache file for backward compatibility
-        if LEGACY_TRIO_CACHE.parent.exists():
-            tmp_legacy = LEGACY_TRIO_CACHE.parent / f".trio_{os.getpid()}_{datetime.now().timestamp()}.tmp"
-            with open(tmp_legacy, "w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_legacy, LEGACY_TRIO_CACHE)
+                # Also update legacy trio cache file for backward compatibility
+                if LEGACY_TRIO_CACHE.parent.exists():
+                    tmp_legacy = LEGACY_TRIO_CACHE.parent / f".trio_{os.getpid()}_{datetime.now().timestamp()}.tmp"
+                    with open(tmp_legacy, "w", encoding="utf-8") as f:
+                        json.dump(cache, f, indent=2, ensure_ascii=False)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_legacy, LEGACY_TRIO_CACHE)
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
 

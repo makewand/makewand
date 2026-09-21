@@ -16,6 +16,13 @@ class TestHealth(unittest.TestCase):
         self.assertTrue(limited)
         self.assertIn("8pm", resets)
 
+        # 429 Rate limit should generate an ISO timestamp ~15 min in the future
+        output_429 = "rate_limit_error: 429 Too Many Requests"
+        limited_429, reason_429, resets_429 = parse_claude_quota(output_429)
+        self.assertTrue(limited_429)
+        self.assertIsNotNone(resets_429)
+        self.assertFalse(is_reset_time_passed(resets_429))
+
         ok_out = "ok"
         limited, _, _ = parse_claude_quota(ok_out)
         self.assertFalse(limited)
@@ -25,6 +32,13 @@ class TestHealth(unittest.TestCase):
         limited, reason, resets = parse_codex_quota(output)
         self.assertTrue(limited)
         self.assertIn("10:58 AM", resets)
+
+        # 429 Rate limit
+        output_429 = "Error: 429 too many requests"
+        limited_429, reason_429, resets_429 = parse_codex_quota(output_429)
+        self.assertTrue(limited_429)
+        self.assertIsNotNone(resets_429)
+        self.assertFalse(is_reset_time_passed(resets_429))
 
         ok_out = "OpenAI Codex v0.155.1\nsucceeded"
         limited, _, _ = parse_codex_quota(ok_out)
@@ -45,6 +59,13 @@ class TestHealth(unittest.TestCase):
         self.assertTrue(limited)
         self.assertEqual(resets, "需登录授权")
 
+        # 429 Rate limit
+        output_429 = "429 rate limit exceeded"
+        limited_429, reason_429, resets_429 = parse_muse_quota(output_429)
+        self.assertTrue(limited_429)
+        self.assertIsNotNone(resets_429)
+        self.assertFalse(is_reset_time_passed(resets_429))
+
     def test_status_cache_io(self):
         cache = load_status_cache()
         self.assertIn("agy", cache)
@@ -57,6 +78,10 @@ class TestHealth(unittest.TestCase):
         self.assertTrue(is_reset_time_passed("10:58 AM", "2026-09-20T10:00:00"))
         # 4 hours expired fallback
         self.assertTrue(is_reset_time_passed(None, "2026-09-20T10:00:00"))
+        # Past ISO timestamp
+        self.assertTrue(is_reset_time_passed("2026-09-20T00:00:00"))
+        # Future ISO timestamp
+        self.assertFalse(is_reset_time_passed("2099-01-01T00:00:00"))
 
 if __name__ == "__main__":
     unittest.main()
