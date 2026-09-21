@@ -152,5 +152,59 @@ class TestOrchestrator(unittest.TestCase):
         _, kwargs = mock_claude.call_args
         self.assertTrue(kwargs.get("readonly"))
 
+    def test_select_optimal_engine_pair(self):
+        from makewand.orchestrator import select_optimal_engine_pair
+
+        all_healthy = {
+            "codex": {"status": "healthy"},
+            "claude": {"status": "healthy"},
+            "agy": {"status": "healthy"},
+            "muse": {"status": "healthy"}
+        }
+
+        # 1. Algorithmic / Concurrency task -> Codex primary coder, Claude reviewer
+        coders, reviewers, meta = select_optimal_engine_pair(
+            "实现无锁并发环形缓冲区 lock-free ring buffer 并排查死锁与竞态",
+            tier="deep",
+            cache=all_healthy
+        )
+        self.assertEqual(meta["primary_coder"], "codex")
+        self.assertIn(meta["primary_reviewer"], ["claude", "agy"])
+        self.assertNotEqual(meta["primary_coder"], meta["primary_reviewer"])
+
+        # 2. Refactoring / Frontend task -> Claude primary coder, Codex reviewer
+        coders, reviewers, meta = select_optimal_engine_pair(
+            "重构用户管理模块的前端 React 组件与页面样式，补充单测",
+            tier="standard",
+            cache=all_healthy
+        )
+        self.assertEqual(meta["primary_coder"], "claude")
+        self.assertEqual(meta["primary_reviewer"], "codex")
+        self.assertNotEqual(meta["primary_coder"], meta["primary_reviewer"])
+
+        # 3. Global Architecture / Monorepo task -> Antigravity primary coder
+        coders, reviewers, meta = select_optimal_engine_pair(
+            "总体设计全仓跨仓库微服务拆分架构与长文档方案对比",
+            tier="deep",
+            cache=all_healthy
+        )
+        self.assertEqual(meta["primary_coder"], "agy")
+        self.assertIn(meta["primary_reviewer"], ["codex", "claude"])
+        self.assertNotEqual(meta["primary_coder"], meta["primary_reviewer"])
+
+        # 4. Quota Limited fallback: When Codex is limited, algorithm falls back to Claude/AGY
+        codex_limited = {
+            "codex": {"status": "limited"},
+            "claude": {"status": "healthy"},
+            "agy": {"status": "healthy"}
+        }
+        coders, reviewers, meta = select_optimal_engine_pair(
+            "实现快速排序算法",
+            tier="standard",
+            cache=codex_limited
+        )
+        self.assertEqual(meta["primary_coder"], "claude")
+        self.assertEqual(meta["primary_reviewer"], "agy")
+
 if __name__ == "__main__":
     unittest.main()

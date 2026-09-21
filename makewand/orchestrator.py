@@ -11,7 +11,7 @@ import uuid
 import tempfile
 import concurrent.futures
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List, Dict, Any
 
 from makewand.config import (
     c,
@@ -347,6 +347,153 @@ def check_load_backpressure(load_threshold: float = 24.0) -> bool:
         pass
     return False
 
+def dispatch_task(
+    engine: str,
+    prompt: str,
+    cwd: Optional[str] = None,
+    timeout: int = 300,
+    tier: str = "standard",
+    model: Optional[str] = None,
+    stream: bool = False,
+    readonly: bool = False
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Generic multi-model task dispatcher wrapping provider adapters."""
+    res = None
+    if engine == "claude":
+        res = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly)
+    elif engine == "codex":
+        p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
+        res = execute_codex_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly)
+    elif engine == "muse":
+        p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
+        res = execute_muse_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly)
+    elif engine == "agy":
+        p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
+        res = execute_agy_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly)
+    else:
+        return False, None, f"未知或不支持的模型引擎: {engine}"
+
+    if isinstance(res, (tuple, list)) and len(res) == 3:
+        return res[0], res[1], res[2]
+    return True, (str(res) if res is not None else "LGTM"), None
+
+def select_optimal_engine_pair(
+    prompt: str,
+    tier: str = "standard",
+    cache: Optional[Dict[str, Any]] = None
+) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    """
+    Intelligently scores and pairs engines for (Implementation, Red-team Review)
+    based on task domain affinity and quota window dynamics.
+    Returns: (ordered_coders, ordered_reviewers, meta_info)
+    """
+    if cache is None:
+        cache = get_or_update_status(force_probe=False)
+
+    p_lower = prompt.lower()
+
+    # Base scores:
+    # Claude: primary general software development & engineering (2.0)
+    # Codex: short rolling window (3-4h resets) & red-team specialist (1.8)
+    # Antigravity: continuous high-capacity reasoning anchor (1.4)
+    # Muse: secondary alternative (0.8)
+    scores = {
+        "claude": 2.0,
+        "codex": 1.8,
+        "agy": 1.4,
+        "muse": 0.8
+    }
+
+    reasons = []
+
+    # 1. Semantic Domain Keywords
+    # Algorithmic, Concurrency, Low-level, Security -> Codex affinity
+    algo_keywords = [
+        "算法", "algorithm", "leetcode", "二叉树", "binary tree", "动态规划", "dynamic programming",
+        "排序", "sort", "图论", "graph", "hash", "哈希", "并发", "concurrency", "死锁", "deadlock",
+        "race condition", "竞态", "mutex", "channel", "goroutine", "thread", "asyncio", "锁",
+        "性能", "benchmark", "优化", "optimize", "内存", "memory leak", "底层", "kernel",
+        "protocol", "协议", "socket", "tcp", "udp", "汇编", "assembly", "c++", "rust",
+        "unsafe", "位运算", "bitwise", "逆向", "reverse engineering"
+    ]
+    matched_algo = [k for k in algo_keywords if k in p_lower]
+    if matched_algo:
+        scores["codex"] += 2.5
+        reasons.append(f"命中算法与底层并发特征 ({', '.join(matched_algo[:3])}) -> Codex 专精大幅加权")
+
+    # Refactoring, UI/Frontend, Web, Docs, Types -> Claude affinity
+    refactor_keywords = [
+        "重构", "refactor", "整理", "clean code", "rename", "拆分", "前端", "frontend",
+        "react", "vue", "svelte", "nextjs", "component", "组件", "css", "html", "tailwind",
+        "ui", "ux", "web", "django", "fastapi", "flask", "express", "spring", "crud",
+        "rest", "api", "endpoint", "controller", "view", "typescript", "ts", "文档",
+        "docstring", "readme", "markdown", "unittest", "pytest", "mock", "测试用例"
+    ]
+    matched_refactor = [k for k in refactor_keywords if k in p_lower]
+    if matched_refactor:
+        scores["claude"] += 2.5
+        reasons.append(f"命中工程重构/前端/框架特征 ({', '.join(matched_refactor[:3])}) -> Claude 专精大幅加权")
+
+    # Architecture, Full repo, Monorepo, Global Plan -> Antigravity affinity
+    arch_keywords = [
+        "全仓", "跨项目", "全局架构", "architecture", "跨模块", "system design", "总体设计",
+        "全链路", "全工程", "monorepo", "超长上下文", "long context", "综合分析", "技术选型",
+        "方案对比", "tradeoff", "可行性"
+    ]
+    matched_arch = [k for k in arch_keywords if k in p_lower]
+    if matched_arch:
+        scores["agy"] += 3.0
+        reasons.append(f"命中全局架构/跨模块/全仓设计特征 ({', '.join(matched_arch[:3])}) -> Antigravity 架构师加权")
+
+    # Tier adjustments
+    if tier == "deep":
+        scores["codex"] += 0.8
+        scores["agy"] += 0.8
+    elif tier == "fast":
+        scores["claude"] += 0.8
+
+    # 2. Quota Health Filter
+    for model_name in list(scores.keys()):
+        status = cache.get(model_name, {}).get("status", "unknown")
+        if status == "limited":
+            scores[model_name] = -999.0
+            reasons.append(f"{model_name} 当前额度受限 (limited)")
+        elif status in ("needs_auth", "missing"):
+            scores[model_name] = -999.0
+
+    # Sort coder candidates
+    available_coders = [m for m, sc in sorted(scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
+    if not available_coders:
+        available_coders = ["agy"]
+
+    primary_coder = available_coders[0]
+
+    # Reviewer candidates: strictly different from coder, with Codex / AGY / Claude preferred
+    reviewer_base_scores = {
+        "codex": 2.2,   # exceptional red-team adversarial tester
+        "agy": 2.0,     # deep high reasoning judge
+        "claude": 1.6,  # great for readability, lint, and test validation
+        "muse": 0.5
+    }
+    reviewer_base_scores.pop(primary_coder, None)
+    for model_name in list(reviewer_base_scores.keys()):
+        status = cache.get(model_name, {}).get("status", "unknown")
+        if status in ("limited", "needs_auth", "missing"):
+            reviewer_base_scores[model_name] = -999.0
+
+    available_reviewers = [m for m, sc in sorted(reviewer_base_scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
+    if not available_reviewers:
+        available_reviewers = ["agy"]
+
+    meta_info = {
+        "scores": scores,
+        "reasons": reasons,
+        "primary_coder": primary_coder,
+        "primary_reviewer": available_reviewers[0] if available_reviewers else "agy"
+    }
+
+    return available_coders, available_reviewers, meta_info
+
 def run_pipeline(
     prompt: str,
     cwd: Optional[str] = None,
@@ -434,75 +581,42 @@ def run_pipeline(
 
     # Step 1: Health inspection
     cache = get_or_update_status(force_probe=False)
-    c_status = cache.get("claude", {}).get("status")
-    x_status = cache.get("codex", {}).get("status")
-    m_status = cache.get("muse", {}).get("status")
 
     # Ensure git tracking in non-git directories
     ensure_git_worktree(cwd)
 
-    # Step 2: Implementation routing with fallback
+    # Step 2: Intelligent Multi-Model Routing & Implementation
+    coder_candidates, reviewer_candidates, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache)
+    primary_c = route_meta["primary_coder"]
+    primary_r = route_meta["primary_reviewer"]
+
+    print(c("🎯 [Makewand Smart Routing] 智能专精匹配与配额削峰决策:", COLOR_BOLD + COLOR_GREEN))
+    if route_meta["reasons"]:
+        for r_item in route_meta["reasons"]:
+            print(c(f"  • {r_item}", COLOR_CYAN))
+    print(c(f"  • 主力实现引擎: {primary_c.upper()} (候选梯队: {' -> '.join([c.upper() for c in coder_candidates])})", COLOR_BOLD + COLOR_BLUE))
+    print(c(f"  • 独立盲审引擎: {primary_r.upper()} (候选梯队: {' -> '.join([r.upper() for r in reviewer_candidates])})\n", COLOR_BOLD + COLOR_PURPLE))
+
     print(c(f"▶ 阶段 1: 代码编写与实现 (Implementation - Tier: {tier})", COLOR_BOLD + COLOR_BLUE))
     coder_output = None
     coder_engine = None
 
-    step_timeout = get_remaining_timeout(timeout)
-    if step_timeout <= 0:
-        print(c("❌ [Makewand Budget] 全局流水线预算已耗尽，终止任务执行。", COLOR_RED + COLOR_BOLD))
-        return False
+    for eng in coder_candidates:
+        step_timeout = get_remaining_timeout(timeout)
+        if step_timeout <= 0:
+            print(c("❌ [Makewand Budget] 全局流水线预算已耗尽，终止任务执行。", COLOR_RED + COLOR_BOLD))
+            return False
 
-    # Priority 1: Claude Code
-    if c_status != "limited":
-        success, out, err = execute_claude_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream)
+        print(c(f"→ 派发代码编写与实现任务给 {eng.upper()} (Tier: {tier})...", COLOR_BLUE + COLOR_BOLD))
+        success, out, err = dispatch_task(eng, prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=False)
         if success:
-            print(c("✔ Claude Code 完成代码编写与修改。", COLOR_GREEN))
+            print(c(f"✔ {eng.upper()} 完成代码编写与修改。", COLOR_GREEN))
             coder_output = out
-            coder_engine = "claude"
+            coder_engine = eng
+            break
         else:
-            print(c(f"⚠ Claude Code 遇到限制或故障: {err}", COLOR_YELLOW))
-            print(c("→ 自动切换备用引擎接管实现...", COLOR_YELLOW))
-
-    full_prompt = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}"
-
-    # Priority 2: Codex CLI
-    if coder_output is None and x_status != "limited":
-        step_timeout = get_remaining_timeout(timeout)
-        if step_timeout > 0:
-            print(c("→ 使用 Codex 作为主力编码引擎...", COLOR_CYAN))
-            success, out, err = execute_codex_task(full_prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream)
-            if success:
-                print(c("✔ Codex 完成代码编写与修改。", COLOR_GREEN))
-                coder_output = out
-                coder_engine = "codex"
-            else:
-                print(c(f"⚠ Codex 亦不可用: {err}", COLOR_YELLOW))
-
-    # Priority 3: Muse Code
-    if coder_output is None and m_status not in ["limited", "needs_auth", "missing"]:
-        step_timeout = get_remaining_timeout(timeout)
-        if step_timeout > 0:
-            print(c("→ 使用 Muse Code 作为备用编码引擎...", COLOR_PURPLE))
-            success, out, err = execute_muse_task(full_prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream)
-            if success:
-                print(c("✔ Muse Code 完成代码编写与修改。", COLOR_GREEN))
-                coder_output = out
-                coder_engine = "muse"
-            else:
-                print(c(f"⚠ Muse Code 亦不可用: {err}", COLOR_YELLOW))
-
-    # Priority 4: Antigravity (Google AI Pro, Conductor & Architect)
-    if coder_output is None:
-        step_timeout = get_remaining_timeout(timeout)
-        if step_timeout > 0:
-            print(c("→ 启用 Antigravity (Google AI Pro) 进行最终闭环实现...", COLOR_GREEN))
-            success, out, err = execute_agy_task(full_prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream)
-            if success:
-                print(c("✔ Antigravity 完成代码编写与修改。", COLOR_GREEN))
-                coder_output = out
-                coder_engine = "agy"
-            else:
-                print(c(f"❌ 自动降级失败: {err}", COLOR_RED))
-                return False
+            print(c(f"⚠ {eng.upper()} 遇到限制或故障: {err}", COLOR_YELLOW))
+            print(c("→ 自动切换下一顺位备用引擎接管实现...", COLOR_YELLOW))
 
     if coder_output is None:
         print(c("❌ 所有可用模型均无法完成编码任务，流水线终止。", COLOR_RED + COLOR_BOLD))
@@ -532,34 +646,27 @@ def run_pipeline(
         f"--- 代码改动 (git diff) ---\n{diff_snippet}"
     )
 
+    actual_reviewers = [r for r in reviewer_candidates if r != coder_engine]
+    if not actual_reviewers:
+        fallback_r = "agy" if coder_engine != "agy" else ("codex" if cache.get("codex", {}).get("status") != "limited" else "claude")
+        actual_reviewers = [fallback_r]
+
     review_output = None
     reviewer_engine = None
-
-    # Assign reviewer different from coder
-    step_timeout = get_remaining_timeout(timeout)
-    if step_timeout > 0 and coder_engine != "codex" and x_status != "limited":
-        print(c("→ 派发给 Codex CLI 进行独立红队审查 (gpt-6-astra, 只读隔离)...", COLOR_CYAN))
-        res = execute_codex_task(review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
-        success, out, err = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
-        if success:
-            print(c("✔ Codex 独立红队审查完成。", COLOR_GREEN))
-            review_output = out
-            reviewer_engine = "codex"
-        else:
-            print(c(f"⚠ Codex 审查未成功: {err}", COLOR_YELLOW))
-
-    if review_output is None:
+    for r_eng in actual_reviewers:
         step_timeout = get_remaining_timeout(timeout)
-        if step_timeout > 0:
-            print(c("→ 派发给 Antigravity 进行独立跨模型审查 (Google AI Pro High Reasoning, 只读隔离)...", COLOR_GREEN))
-            res = execute_agy_task(review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
-            success, out, err = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
-            if success:
-                print(c("✔ Antigravity 审查完成。", COLOR_GREEN))
-                review_output = out
-                reviewer_engine = "agy"
-            else:
-                print(c("⚠ 审查服务未产生有效响应。", COLOR_YELLOW))
+        if step_timeout <= 0:
+            break
+        print(c(f"→ 派发给 {r_eng.upper()} 进行独立跨模型红队审查 (Tier: deep, 只读隔离)...", COLOR_CYAN + COLOR_BOLD))
+        res = dispatch_task(r_eng, review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
+        success, out, err = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
+        if success and out and out.strip():
+            print(c(f"✔ {r_eng.upper()} 独立红队审查完成。", COLOR_GREEN))
+            review_output = out
+            reviewer_engine = r_eng
+            break
+        else:
+            print(c(f"⚠ {r_eng.upper()} 审查未产生有效响应: {err}", COLOR_YELLOW))
 
     # Fail-Closed Quality Gate: If code has changes but review fails completely or is empty, reject delivery
     if not review_output or not review_output.strip():
@@ -588,23 +695,23 @@ def run_pipeline(
             # Coder fixes
             fixed = False
             step_timeout = get_remaining_timeout(timeout)
-            if coder_engine == "claude" and c_status != "limited" and step_timeout > 0:
-                ok, _, _ = execute_claude_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
-                if ok: fixed = True
-            elif coder_engine == "codex" and x_status != "limited" and step_timeout > 0:
-                ok, _, _ = execute_codex_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
-                if ok: fixed = True
+            if coder_engine and step_timeout > 0:
+                print(c(f"→ 由主力编码引擎 {coder_engine.upper()} 执行缺陷修复...", COLOR_YELLOW))
+                ok, _, _ = dispatch_task(coder_engine, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False)
+                if ok:
+                    fixed = True
 
-            if not fixed and x_status != "limited":
-                step_timeout = get_remaining_timeout(timeout)
-                if step_timeout > 0:
-                    ok, _, _ = execute_codex_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
-                    if ok: fixed = True
             if not fixed:
-                step_timeout = get_remaining_timeout(timeout)
-                if step_timeout > 0:
-                    ok, _, _ = execute_agy_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
-                    if ok: fixed = True
+                for alt_c in coder_candidates:
+                    if alt_c != coder_engine:
+                        step_timeout = get_remaining_timeout(timeout)
+                        if step_timeout <= 0:
+                            break
+                        print(c(f"→ 自动切换备用引擎 {alt_c.upper()} 执行修复...", COLOR_YELLOW))
+                        ok, _, _ = dispatch_task(alt_c, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False)
+                        if ok:
+                            fixed = True
+                            break
 
             if not fixed:
                 print(c("⚠ 自动修复执行失败，终止后续轮次。", COLOR_RED))
@@ -628,15 +735,15 @@ def run_pipeline(
             )
 
             re_output = None
-            step_timeout = get_remaining_timeout(timeout)
-            if reviewer_engine == "codex" and x_status != "limited" and step_timeout > 0:
-                ok, out, _ = execute_codex_task(re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
-                if ok: re_output = out
-            if not re_output:
+            for alt_r in actual_reviewers:
                 step_timeout = get_remaining_timeout(timeout)
-                if step_timeout > 0:
-                    ok, out, _ = execute_agy_task(re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
-                    if ok: re_output = out
+                if step_timeout <= 0:
+                    break
+                res = dispatch_task(alt_r, re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
+                ok, out, _ = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
+                if ok and out and out.strip():
+                    re_output = out
+                    break
 
             if re_output:
                 review_output = re_output
