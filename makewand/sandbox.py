@@ -37,11 +37,12 @@ def is_bwrap_available() -> bool:
 def wrap_bwrap(
     command_args: List[str],
     workspace: str,
-    allow_network: bool = True
+    allow_network: bool = True,
+    readonly: bool = False
 ) -> List[str]:
     """
     Wraps command with bubblewrap isolating host filesystem, IPC, PID, and credentials.
-    Only the specified workspace is writable.
+    Workspace is mounted read-only if readonly=True, otherwise writable.
     """
     bwrap = shutil.which("bwrap") or "/usr/bin/bwrap"
     ws = os.path.abspath(workspace)
@@ -63,8 +64,8 @@ def wrap_bwrap(
         "--tmpfs", "/tmp",
         # Ephemeral clean HOME in tmpfs to avoid workspace pollution
         "--tmpfs", user_home,
-        # Writable workspace only
-        "--bind", ws, ws,
+        # Workspace mount: ro-bind if readonly, otherwise bind
+        "--ro-bind" if readonly else "--bind", ws, ws,
         "--chdir", ws,
         "--clearenv",
         "--setenv", "PATH", path_env,
@@ -95,6 +96,7 @@ def run_in_sandbox(
     workspace: str,
     timeout: int = 120,
     allow_network: bool = True,
+    readonly: bool = False,
     stream: bool = False,
     print_prefix: str = ""
 ) -> Tuple[int, str, str, Optional[str]]:
@@ -104,7 +106,7 @@ def run_in_sandbox(
     explicitly overridden by MAKEWAND_UNSAFE_HOST_EXEC=1.
     """
     if is_bwrap_available():
-        wrapped = wrap_bwrap(cmd, workspace=workspace, allow_network=allow_network)
+        wrapped = wrap_bwrap(cmd, workspace=workspace, allow_network=allow_network, readonly=readonly)
         return run_subprocess(
             wrapped,
             timeout=timeout,

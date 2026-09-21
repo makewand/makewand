@@ -40,6 +40,7 @@ def ensure_git_worktree(cwd: str) -> bool:
     if code != 0:
         print(c("[Makewand Git] 检测到当前目录尚未初始化 Git，自动建立影子 Git 跟踪树...", COLOR_YELLOW))
         run_git_cmd("git init && git config user.name 'Makewand' && git config user.email 'makewand@local'", cwd=cwd)
+        run_git_cmd("git add -A", cwd=cwd)
         run_git_cmd("git commit -m 'Makewand baseline snapshot' --allow-empty", cwd=cwd)
         return True
     return False

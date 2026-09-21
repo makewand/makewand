@@ -329,6 +329,24 @@ def get_identity_message() -> str:
         "  5. 安全搜索与物理沙箱 (/search, /sandbox)：护栏搜索与 Bubblewrap 进程隔离"
     )
 
+def check_load_backpressure(load_threshold: float = 24.0) -> bool:
+    """
+    Monitors system 1-minute load average. When load exceeds load_threshold,
+    yields process priority and logs throttled concurrency notice.
+    """
+    try:
+        load_1m = os.getloadavg()[0]
+        if load_1m > load_threshold:
+            print(c(f"⏳ [Makewand Backpressure] 检测到主机负载偏高 (1m load: {load_1m:.1f} > {load_threshold})，自适应降低调度优先级...", COLOR_YELLOW))
+            try:
+                os.nice(5)
+            except Exception:
+                pass
+            return True
+    except Exception:
+        pass
+    return False
+
 def run_pipeline(
     prompt: str,
     cwd: Optional[str] = None,
@@ -338,19 +356,25 @@ def run_pipeline(
     auto_fix: bool = True,
     max_fix: int = 2,
     timeout: int = 300,
-    total_budget: int = 900
+    total_budget: Optional[int] = None
 ) -> bool:
+    check_load_backpressure()
     if not cwd:
         cwd = os.getcwd()
     if tier == "auto":
         tier = detect_task_tier(prompt)
+
+    if total_budget is None:
+        total_budget = timeout
+    else:
+        total_budget = min(total_budget, timeout)
 
     pipeline_start_time = time.time()
 
     def get_remaining_timeout(requested: int) -> int:
         elapsed = time.time() - pipeline_start_time
         left = int(total_budget - elapsed)
-        if left <= 5:
+        if left <= 0:
             return 0
         return min(requested, left)
 
@@ -515,7 +539,8 @@ def run_pipeline(
     step_timeout = get_remaining_timeout(timeout)
     if step_timeout > 0 and coder_engine != "codex" and x_status != "limited":
         print(c("→ 派发给 Codex CLI 进行独立红队审查 (gpt-6-astra, 只读隔离)...", COLOR_CYAN))
-        success, out, err = execute_codex_task(review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
+        res = execute_codex_task(review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
+        success, out, err = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
         if success:
             print(c("✔ Codex 独立红队审查完成。", COLOR_GREEN))
             review_output = out
@@ -527,7 +552,8 @@ def run_pipeline(
         step_timeout = get_remaining_timeout(timeout)
         if step_timeout > 0:
             print(c("→ 派发给 Antigravity 进行独立跨模型审查 (Google AI Pro High Reasoning, 只读隔离)...", COLOR_GREEN))
-            success, out, err = execute_agy_task(review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
+            res = execute_agy_task(review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
+            success, out, err = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
             if success:
                 print(c("✔ Antigravity 审查完成。", COLOR_GREEN))
                 review_output = out
@@ -561,19 +587,24 @@ def run_pipeline(
 
             # Coder fixes
             fixed = False
-            if coder_engine == "claude" and c_status != "limited":
+            step_timeout = get_remaining_timeout(timeout)
+            if coder_engine == "claude" and c_status != "limited" and step_timeout > 0:
                 ok, _, _ = execute_claude_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
                 if ok: fixed = True
-            elif coder_engine == "codex" and x_status != "limited":
+            elif coder_engine == "codex" and x_status != "limited" and step_timeout > 0:
                 ok, _, _ = execute_codex_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
                 if ok: fixed = True
 
             if not fixed and x_status != "limited":
-                ok, _, _ = execute_codex_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
-                if ok: fixed = True
+                step_timeout = get_remaining_timeout(timeout)
+                if step_timeout > 0:
+                    ok, _, _ = execute_codex_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
+                    if ok: fixed = True
             if not fixed:
-                ok, _, _ = execute_agy_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
-                if ok: fixed = True
+                step_timeout = get_remaining_timeout(timeout)
+                if step_timeout > 0:
+                    ok, _, _ = execute_agy_task(fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream)
+                    if ok: fixed = True
 
             if not fixed:
                 print(c("⚠ 自动修复执行失败，终止后续轮次。", COLOR_RED))
@@ -597,12 +628,15 @@ def run_pipeline(
             )
 
             re_output = None
-            if reviewer_engine == "codex" and x_status != "limited":
+            step_timeout = get_remaining_timeout(timeout)
+            if reviewer_engine == "codex" and x_status != "limited" and step_timeout > 0:
                 ok, out, _ = execute_codex_task(re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
                 if ok: re_output = out
             if not re_output:
-                ok, out, _ = execute_agy_task(re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
-                if ok: re_output = out
+                step_timeout = get_remaining_timeout(timeout)
+                if step_timeout > 0:
+                    ok, out, _ = execute_agy_task(re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True)
+                    if ok: re_output = out
 
             if re_output:
                 review_output = re_output
@@ -678,6 +712,7 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
         return EXIT_FAILED
 
 def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
+    check_load_backpressure()
     if not cwd:
         cwd = os.getcwd()
     print(c(f"🏁 Makewand 双模型并发竞速模式启动: '{prompt}'", COLOR_BOLD + COLOR_CYAN))

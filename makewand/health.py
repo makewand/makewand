@@ -31,16 +31,29 @@ def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool
     if not resets_at or resets_at == "待重置":
         if updated_at:
             try:
-                dt = datetime.fromisoformat(updated_at)
-                if (datetime.now() - dt).total_seconds() > 4 * 3600:
+                clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
+                up_dt = datetime.fromisoformat(clean_up)
+                now = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else datetime.now()
+                if up_dt.tzinfo is not None and getattr(now, "tzinfo", None) is None:
+                    try:
+                        now = now.astimezone()
+                    except Exception:
+                        now = now.replace(tzinfo=up_dt.tzinfo)
+                if (now - up_dt).total_seconds() > 4 * 3600:
                     return True
             except Exception:
                 pass
         return False
 
-    now = datetime.now()
+    clean_resets = resets_at.replace("Z", "+00:00") if resets_at.endswith("Z") else resets_at
     try:
-        dt = datetime.fromisoformat(resets_at)
+        dt = datetime.fromisoformat(clean_resets)
+        now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.now()
+        if dt.tzinfo is not None and getattr(now, "tzinfo", None) is None:
+            try:
+                now = now.astimezone()
+            except Exception:
+                now = now.replace(tzinfo=dt.tzinfo)
         return now >= dt
     except Exception:
         pass
@@ -49,10 +62,20 @@ def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool
     for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
         try:
             t = datetime.strptime(clean, fmt).time()
+            now = datetime.now()
             if updated_at:
                 try:
-                    up_dt = datetime.fromisoformat(updated_at)
+                    clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
+                    up_dt = datetime.fromisoformat(clean_up)
                     reset_dt = datetime.combine(up_dt.date(), t)
+                    if up_dt.tzinfo is not None:
+                        now = datetime.now(up_dt.tzinfo)
+                        if getattr(now, "tzinfo", None) is None:
+                            try:
+                                now = now.astimezone()
+                            except Exception:
+                                now = now.replace(tzinfo=up_dt.tzinfo)
+                        reset_dt = reset_dt.replace(tzinfo=up_dt.tzinfo)
                     if reset_dt < up_dt:
                         reset_dt += timedelta(days=1)
                     return now >= reset_dt
@@ -113,9 +136,40 @@ def save_status_cache(cache: Dict[str, Any]):
         with open(lock_file, "w") as lock_f:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
             try:
+                # Merge with current on-disk data so concurrent probes don't clobber each other
+                disk_data = dict(DEFAULT_CACHE)
+                if STATUS_CACHE_FILE.exists():
+                    try:
+                        with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as f:
+                            loaded = json.load(f)
+                            if isinstance(loaded, dict):
+                                disk_data.update(loaded)
+                    except Exception:
+                        pass
+
+                for k, v in cache.items():
+                    if k not in disk_data:
+                        disk_data[k] = v
+                    elif isinstance(v, dict):
+                        disk_item = disk_data.get(k, {})
+                        if isinstance(disk_item, dict):
+                            # If incoming status is 'unknown' while disk has active status ('limited' or 'healthy'), preserve disk
+                            if v.get("status") == "unknown" and disk_item.get("status") in ("limited", "healthy"):
+                                continue
+                            # If incoming has older timestamp, do not overwrite newer disk status
+                            inc_time = v.get("updated_at", "")
+                            disk_time = disk_item.get("updated_at", "")
+                            if inc_time and disk_time and disk_time > inc_time and disk_item.get("status") == "limited":
+                                continue
+                        disk_data[k] = v
+                    else:
+                        disk_data[k] = v
+
+                merged = _sanitize_cache(disk_data)
+
                 tmp_file = STATUS_CACHE_FILE.parent / f".status_{os.getpid()}_{datetime.now().timestamp()}.tmp"
                 with open(tmp_file, "w", encoding="utf-8") as f:
-                    json.dump(cache, f, indent=2, ensure_ascii=False)
+                    json.dump(merged, f, indent=2, ensure_ascii=False)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp_file, STATUS_CACHE_FILE)
@@ -124,7 +178,7 @@ def save_status_cache(cache: Dict[str, Any]):
                 if LEGACY_TRIO_CACHE.parent.exists():
                     tmp_legacy = LEGACY_TRIO_CACHE.parent / f".trio_{os.getpid()}_{datetime.now().timestamp()}.tmp"
                     with open(tmp_legacy, "w", encoding="utf-8") as f:
-                        json.dump(cache, f, indent=2, ensure_ascii=False)
+                        json.dump(merged, f, indent=2, ensure_ascii=False)
                         f.flush()
                         os.fsync(f.fileno())
                     os.replace(tmp_legacy, LEGACY_TRIO_CACHE)
