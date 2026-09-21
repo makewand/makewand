@@ -75,6 +75,7 @@ class TestOrchestrator(unittest.TestCase):
 
     @patch("makewand.orchestrator.run_review")
     def test_run_pipeline_review_query(self, mock_review):
+        mock_review.return_value = 0
         # Review request must call run_review and NOT trigger code file writing
         res = run_pipeline("审查当前git diff中的并发死锁", auto_fix=True)
         self.assertTrue(res)

@@ -110,6 +110,7 @@ type TokenManager interface {
 	TokenRules() []TokenRuleView
 	Issue(rule TokenRule) (TokenRuleView, string, error)
 	Revoke(tokenID string) error
+	RevokeByUserID(userID string) error
 }
 
 // Authorizer authenticates Bearer tokens and returns scoped grants.
@@ -572,20 +573,28 @@ func (g *Grant) ReserveCostAt(now time.Time, estimatedCostUSD float64) (func(act
 			defer u.mu.Unlock()
 
 			if g.maxCostUSDPerDay > 0 {
-				u.costDayReserved -= estimatedCostUSD
-				if u.costDayReserved < 0 {
-					u.costDayReserved = 0
-				}
-				if actualCostUSD > 0 {
+				if u.costDayStart.Equal(dayWindow) {
+					u.costDayReserved -= estimatedCostUSD
+					if u.costDayReserved < 0 {
+						u.costDayReserved = 0
+					}
+					if actualCostUSD > 0 {
+						u.costDaySpent += actualCostUSD
+					}
+				} else if actualCostUSD > 0 {
 					u.costDaySpent += actualCostUSD
 				}
 			}
 			if g.maxCostUSDPerMonth > 0 {
-				u.costMonthReserved -= estimatedCostUSD
-				if u.costMonthReserved < 0 {
-					u.costMonthReserved = 0
-				}
-				if actualCostUSD > 0 {
+				if u.costMonthStart.Equal(monthWindow) {
+					u.costMonthReserved -= estimatedCostUSD
+					if u.costMonthReserved < 0 {
+						u.costMonthReserved = 0
+					}
+					if actualCostUSD > 0 {
+						u.costMonthSpent += actualCostUSD
+					}
+				} else if actualCostUSD > 0 {
 					u.costMonthSpent += actualCostUSD
 				}
 			}

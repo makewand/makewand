@@ -59,9 +59,20 @@ def detect_task_tier(prompt: str) -> str:
 def is_review_passed(review_text: str) -> bool:
     """
     Returns True if and only if review explicitly passes quality gate without defects.
-    Any unverified text, empty output, or failure to produce explicit approval returns False (Fail-Closed).
+    Any unverified text, empty output, contradiction, or failure to produce explicit approval returns False (Fail-Closed).
     """
     if not review_text or not review_text.strip():
+        return False
+
+    lower = review_text.lower().strip()
+
+    # Reject unverified or failure outputs immediately
+    unverified_signals = [
+        "unable to review", "cannot review", "failed to review",
+        "unverified", "do not approve", "not approve", "not lgtm", "disapprove",
+        "不通过", "未通过", "拒绝合并", "建议不要合并"
+    ]
+    if any(sig in lower for sig in unverified_signals):
         return False
 
     # 1. Structural JSON verdict check (from end of output to skip template quotes)
@@ -70,27 +81,46 @@ def is_review_passed(review_text: str) -> bool:
         last_match = matches[-1]
         try:
             verdict_data = json.loads(last_match.group(1).strip())
-            if isinstance(verdict_data, dict) and "pass" in verdict_data:
-                val = verdict_data["pass"]
-                if isinstance(val, bool):
-                    return val
-                elif isinstance(val, str):
-                    return val.strip().lower() in ["true", "1", "yes", "pass"]
-                elif isinstance(val, (int, float)):
-                    return bool(val)
+            if isinstance(verdict_data, dict):
+                # Contradiction check: non-empty defects MUST fail even if pass is true
+                defects = verdict_data.get("defects")
+                if defects and isinstance(defects, list) and len(defects) > 0:
+                    return False
+
+                if "pass" in verdict_data:
+                    val = verdict_data["pass"]
+                    pass_val = False
+                    if isinstance(val, bool):
+                        pass_val = val
+                    elif isinstance(val, str):
+                        pass_val = val.strip().lower() in ["true", "1", "yes", "pass"]
+                    elif isinstance(val, (int, float)):
+                        pass_val = bool(val)
+
+                    if not pass_val:
+                        return False
+                    if not has_critical_defects(review_text):
+                        return True
         except Exception:
             pass
 
     if has_critical_defects(review_text):
         return False
 
-    lower = review_text.lower()
+    # Positive confirmation check
     pass_signals = [
-        "没有发现明显缺陷", "无需修改", "建议直接合并", "审核通过", "lgtm",
+        "没有发现明显缺陷", "无需修改", "建议直接合并", "审核通过",
         "所有用例均通过且无安全漏洞", "未发现严重漏洞", "无安全漏洞", "未发现安全漏洞",
         "looks good to me", "all tests pass", "表现良好"
     ]
-    return any(sig in lower for sig in pass_signals)
+    if any(sig in lower for sig in pass_signals):
+        return True
+
+    # Standalone lgtm (guard against "not lgtm" / "isn't lgtm")
+    if "lgtm" in lower and not any(neg in lower for neg in ["not lgtm", "no lgtm", "isn't lgtm"]):
+        return True
+
+    return False
 
 def has_critical_defects(review_text: str) -> bool:
     """
@@ -105,18 +135,26 @@ def has_critical_defects(review_text: str) -> bool:
         last_match = matches[-1]
         try:
             verdict_data = json.loads(last_match.group(1).strip())
-            if isinstance(verdict_data, dict) and "pass" in verdict_data:
-                val = verdict_data["pass"]
-                if isinstance(val, bool):
-                    return not val
-                elif isinstance(val, str):
-                    return val.strip().lower() not in ["true", "1", "yes", "pass"]
-                elif isinstance(val, (int, float)):
-                    return not bool(val)
+            if isinstance(verdict_data, dict):
+                defects = verdict_data.get("defects")
+                if defects and isinstance(defects, list) and len(defects) > 0:
+                    return True
+                if "pass" in verdict_data:
+                    val = verdict_data["pass"]
+                    if isinstance(val, bool):
+                        return not val
+                    elif isinstance(val, str):
+                        return val.strip().lower() not in ["true", "1", "yes", "pass"]
+                    elif isinstance(val, (int, float)):
+                        return not bool(val)
         except Exception:
             pass
 
     lower = review_text.lower()
+
+    # Rejection signals count as defects
+    if any(sig in lower for sig in ["do not approve", "not lgtm", "disapprove", "不通过", "未通过"]):
+        return True
 
     # 2. Negation phrase stripping to avoid false positives
     cleaned = lower
@@ -148,7 +186,7 @@ def has_critical_defects(review_text: str) -> bool:
         "所有用例均通过且无安全漏洞", "未发现严重漏洞", "无安全漏洞", "未发现安全漏洞",
         "looks good to me", "all tests pass"
     ]
-    if any(sig in lower for sig in pass_signals):
+    if any(sig in lower for sig in pass_signals) and not any(neg in lower for neg in ["not lgtm", "do not approve"]):
         return False
 
     defect_patterns = ["缺陷", "漏洞", "隐患", "死锁", "竞态", "泄露", "泄漏", "overflowerror"]
@@ -364,8 +402,8 @@ def run_pipeline(
 
     if intent == "review":
         print(c(f"💡 Makewand 意图识别: 独立代码审计/审查模式 '{prompt}' (只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
-        run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt)
-        return True
+        exit_code = run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt)
+        return exit_code == EXIT_PASSED
 
     print(c(f"🚀 Makewand 流水线启动: '{prompt}' (自适应模型档位: {tier})", COLOR_BOLD))
     print(f"工作目录: {cwd}\n")
@@ -497,8 +535,8 @@ def run_pipeline(
             else:
                 print(c("⚠ 审查服务未产生有效响应。", COLOR_YELLOW))
 
-    # Fail-Closed Quality Gate: If code has changes but review fails completely, reject delivery
-    if review_output is None:
+    # Fail-Closed Quality Gate: If code has changes but review fails completely or is empty, reject delivery
+    if not review_output or not review_output.strip():
         print(c("❌ [Makewand Quality Gate] 独立审查服务未能完成代码审计 (UNVERIFIED)，出于安全防御原则阻断合并，拒绝交付。", COLOR_RED + COLOR_BOLD))
         return False
 
@@ -580,8 +618,8 @@ def run_pipeline(
         print(review_output.strip()[:1000])
         print("...\n")
 
-    if review_output and has_critical_defects(review_output):
-        print(c("❌ [Makewand Quality Gate] 经修复轮次后代码仍存在未通过的缺陷，未达交付标准。", COLOR_RED + COLOR_BOLD))
+    if not is_review_passed(review_output):
+        print(c("❌ [Makewand Quality Gate] 代码未能通过独立红队审查 (未获批准或存在缺陷)，拒绝交付。", COLOR_RED + COLOR_BOLD))
         return False
 
     print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
@@ -729,12 +767,25 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
 
         # Determine winner
         winner = None
-        if judge_report:
-            lower = judge_report.lower()
-            if "选手 b" in judge_report or "agent b" in lower or "推荐采纳选手 b" in judge_report:
-                winner = "B"
-            elif "选手 a" in judge_report or "agent a" in lower or "推荐采纳选手 a" in judge_report:
+        if ok and judge_report:
+            m_a = re.search(r"(?:推荐(?:采纳)?|采纳|胜出者|获胜|胜者|winner|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|方案)?\s*[Aa]", judge_report, re.IGNORECASE)
+            m_b = re.search(r"(?:推荐(?:采纳)?|采纳|胜出者|获胜|胜者|winner|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|方案)?\s*[Bb]", judge_report, re.IGNORECASE)
+            if m_a and not m_b:
+                if res_a[1]:
+                    winner = "A"
+            elif m_b and not m_a:
+                if res_b[1]:
+                    winner = "B"
+            elif not m_a and not m_b:
+                if res_a[1] and not res_b[1]:
+                    winner = "A"
+                elif res_b[1] and not res_a[1]:
+                    winner = "B"
+        else:
+            if res_a[1] and not res_b[1]:
                 winner = "A"
+            elif res_b[1] and not res_a[1]:
+                winner = "B"
 
         CandidateManager.save_race(
             race_id=race_id,
@@ -760,11 +811,22 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
         )
         saved_successfully = True
 
-        rec_label = winner or "B"
         print(c(f"\n💾 候选工作区已妥善封存 (Race ID: {race_id})", COLOR_GREEN + COLOR_BOLD))
-        print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {rec_label}")
-        print(f"  • 安全应用方案: makewand apply {race_id} --candidate {rec_label}")
+        if winner:
+            print(c(f"  ★ 主裁推荐胜出方案: 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
+            print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {winner}")
+            print(f"  • 安全应用方案: makewand apply {race_id} --candidate {winner}")
+        else:
+            print(c("  ⚠ 未决出唯一胜出方案，请审查后显式指定方案:", COLOR_YELLOW))
+            print(f"  • 审查方案差异: makewand inspect {race_id} --candidate A|B")
+            print(f"  • 安全应用方案: makewand apply {race_id} --candidate A|B")
         print(f"  • 丢弃废弃候选: makewand discard {race_id}\n")
+
+        if not res_a[1] and not res_b[1]:
+            print(c("❌ 两位选手均未能成功完成任务。", COLOR_RED + COLOR_BOLD))
+            return EXIT_FAILED
+        if not ok and winner is None:
+            return EXIT_UNVERIFIED
         return EXIT_PASSED
     finally:
         if not saved_successfully and session_dir.exists():

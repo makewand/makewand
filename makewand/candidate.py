@@ -22,12 +22,43 @@ from makewand.config import (
     COLOR_RED,
     COLOR_RESET,
 )
+import hashlib
 from makewand.git_helper import run_git_cmd, get_git_diff
+
+def file_sha256(path: Path) -> Optional[str]:
+    """Computes SHA-256 hex digest of a regular file. Returns None for links/missing."""
+    if not path.is_file() or os.path.islink(path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def build_manifest(dir_path: Path) -> Dict[str, str]:
+    """Builds a manifest dict mapping relative paths to SHA-256 hashes, excluding .git."""
+    manifest = {}
+    if not dir_path.exists():
+        return manifest
+    for root, _, files in os.walk(str(dir_path)):
+        for f in files:
+            p = Path(root) / f
+            if not os.path.islink(p):
+                rel = p.relative_to(dir_path).as_posix()
+                if not rel.startswith(".git"):
+                    sha = file_sha256(p)
+                    if sha is not None:
+                        manifest[rel] = sha
+    return manifest
 
 def get_candidate_files_changed(candidate_dir: Path) -> Dict[str, str]:
     """
     Returns a dict mapping relative file path to change status ('M' modified, 'A' added, 'D' deleted).
     """
+    run_git_cmd("git add -A --intent-to-add 2>/dev/null || true", cwd=str(candidate_dir))
     code, out, _ = run_git_cmd("git status --porcelain", cwd=str(candidate_dir))
     changes = {}
     if code == 0 and out:
@@ -64,11 +95,21 @@ class CandidateManager:
         race_dir = config.CANDIDATES_DIR / race_id
         race_dir.mkdir(parents=True, exist_ok=True)
 
+        base_path = Path(base_cwd).resolve()
+        baseline_manifest = build_manifest(base_path)
+
+        # Attach frozen candidate manifests
+        if "path" in agent_a and os.path.exists(agent_a["path"]):
+            agent_a["manifest"] = build_manifest(Path(agent_a["path"]))
+        if "path" in agent_b and os.path.exists(agent_b["path"]):
+            agent_b["manifest"] = build_manifest(Path(agent_b["path"]))
+
         meta = {
             "race_id": race_id,
             "prompt": prompt,
-            "base_cwd": os.path.abspath(base_cwd),
+            "base_cwd": str(base_path),
             "baseline_commit": baseline_commit,
+            "baseline_manifest": baseline_manifest,
             "created_at": datetime.now().isoformat(),
             "status": "completed",
             "winner": winner,
@@ -120,26 +161,50 @@ class CandidateManager:
         return None
 
     @staticmethod
-    def detect_conflicts(base_cwd: str, candidate_dir: Path) -> List[str]:
+    def detect_conflicts(
+        base_cwd: str,
+        candidate_dir: Path,
+        baseline_manifest: Optional[Dict[str, str]] = None,
+        baseline_commit: Optional[str] = None
+    ) -> List[str]:
         """
         Checks if any file modified by the candidate has also been modified
-        in base_cwd since the race baseline.
+        in base_cwd since the race baseline (uncommitted or committed).
         """
         candidate_changes = get_candidate_files_changed(candidate_dir)
         conflicts = []
 
+        # 1. Uncommitted changes check in base_cwd
         code, diff_out, _ = run_git_cmd("git status --porcelain", cwd=base_cwd)
+        base_dirty_files = set()
         if code == 0 and diff_out:
-            base_dirty_files = set()
             for line in diff_out.strip().splitlines():
                 line = line.strip()
                 if len(line) >= 3:
                     fpath = line[2:].strip().strip('"')
                     base_dirty_files.add(fpath)
 
+        for changed_file in candidate_changes:
+            if changed_file in base_dirty_files and changed_file not in conflicts:
+                conflicts.append(changed_file)
+
+        # 2. Baseline manifest hash comparison (preimage check)
+        if baseline_manifest:
             for changed_file in candidate_changes:
-                if changed_file in base_dirty_files:
+                target = Path(base_cwd) / changed_file
+                cur_hash = file_sha256(target) if target.exists() else None
+                base_hash = baseline_manifest.get(changed_file)
+                if cur_hash != base_hash and changed_file not in conflicts:
                     conflicts.append(changed_file)
+
+        # 3. Git commit divergence check if baseline_commit was recorded
+        if baseline_commit:
+            c_code, c_out, _ = run_git_cmd(f"git diff --name-only {baseline_commit} HEAD", cwd=base_cwd)
+            if c_code == 0 and c_out:
+                for line in c_out.strip().splitlines():
+                    f = line.strip().strip('"')
+                    if f in candidate_changes and f not in conflicts:
+                        conflicts.append(f)
 
         return conflicts
 
@@ -163,24 +228,72 @@ class CandidateManager:
         if not os.path.exists(base_cwd):
             return False, [], f"原始工作区不存在: {base_cwd}"
 
-        # Choose candidate (default to winner or 'B')
-        label = (candidate_label or race.get("winner") or "B").upper()
+        # Choose candidate (require explicit candidate if no winner)
+        if not candidate_label and not race.get("winner"):
+            return False, [], "竞速裁判未决出胜者，请显式指定待应用的候选方案: --candidate A 或 --candidate B"
+
+        label = (candidate_label or race.get("winner")).upper()
         if label not in ("A", "B"):
-            label = "B"
+            return False, [], f"无效的候选方案标识: {label}，仅支持 A 或 B"
 
         cand_info = race.get("candidates", {}).get(label, {})
         cand_path_str = cand_info.get("path")
         if not cand_path_str or not os.path.exists(cand_path_str):
             return False, [], f"候选选手 {label} 的工作区目录已丢失: {cand_path_str}"
 
+        # Prevent applying failed candidate unless forced
+        if not cand_info.get("success", True) and not force:
+            return False, [], f"候选选手 {label} 任务执行状态为失败/未完成，已阻止应用未就绪的方案 (如需强制应用请使用 --force)"
+
         candidate_dir = Path(cand_path_str)
+
+        # Integrity check: verify candidate files haven't been mutated after save
+        expected_manifest = cand_info.get("manifest")
+        if expected_manifest:
+            current_manifest = build_manifest(candidate_dir)
+            if current_manifest != expected_manifest:
+                return False, [], f"候选选手 {label} 的文件自封存后已被外部修改 (哈希校验不匹配)，拒绝应用未审查内容"
+
         changes = get_candidate_files_changed(candidate_dir)
         if not changes:
             return True, [], f"候选选手 {label} 没有产生任何有效的文件变更"
 
-        # Conflict Detection
+        # Boundary & Symlink security checks (non-bypassable, evaluated before conflict detection)
+        canonical_base = os.path.realpath(base_cwd)
+        for rel_path in changes:
+            target_file = Path(base_cwd) / rel_path
+            src_file = candidate_dir / rel_path
+
+            # Candidate file must not be a symlink
+            if os.path.islink(src_file) or src_file.is_symlink():
+                return False, [], f"安全风险: 候选文件 {rel_path} 为符号链接，已拒绝应用"
+
+            # Target file in workspace must not be a symlink
+            if os.path.islink(target_file) or target_file.is_symlink():
+                return False, [], f"安全风险: 目标文件 {rel_path} 为符号链接，已拒绝写入覆盖"
+
+            # Resolve canonical path of target
+            resolved_target = os.path.realpath(target_file)
+            if not resolved_target.startswith(canonical_base + os.sep) and resolved_target != canonical_base:
+                return False, [], f"安全越界风险: 目标文件 {rel_path} 解析落点位于工作区外部 ({resolved_target})，已拒绝写入"
+
+            # Verify parent directories are not symlinks pointing outside
+            parent = target_file.parent
+            while parent != Path(base_cwd) and parent != parent.parent:
+                if os.path.islink(parent):
+                    resolved_parent = os.path.realpath(parent)
+                    if not resolved_parent.startswith(canonical_base + os.sep) and resolved_parent != canonical_base:
+                        return False, [], f"安全越界风险: 目标父目录包含指向外部的符号链接，已拒绝写入"
+                parent = parent.parent
+
+        # Conflict Detection (dirty files + baseline manifest + baseline commit)
         if not force:
-            conflicts = CandidateManager.detect_conflicts(base_cwd, candidate_dir)
+            conflicts = CandidateManager.detect_conflicts(
+                base_cwd,
+                candidate_dir,
+                baseline_manifest=race.get("baseline_manifest"),
+                baseline_commit=race.get("baseline_commit")
+            )
             if conflicts:
                 msg = f"检测到工作区冲突: 以下文件在基线后已被修改，已阻止覆盖: {', '.join(conflicts)}"
                 return False, conflicts, msg

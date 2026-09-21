@@ -83,13 +83,6 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		}
 		return "", nil, fmt.Errorf("%s", msg)
 	}
-	if err := previewBwrapSelfTest(bwrapPath); err != nil {
-		msg := strings.TrimSpace(err.Error())
-		if !strings.Contains(msg, "MAKEWAND_UNSAFE_HOST_EXEC=1") {
-			msg = msg + "; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)"
-		}
-		return "", nil, fmt.Errorf("%s", msg)
-	}
 	projectPath = filepath.Clean(projectPath)
 	pathEnv := strings.TrimSpace(previewGetenv("PATH"))
 	if pathEnv == "" {

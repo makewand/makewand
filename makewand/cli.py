@@ -411,6 +411,9 @@ def main():
             max_fix=args.max_fix,
             timeout=args.timeout
         )
+        if not ok:
+            sys.exit(EXIT_FAILED)
+        sys.exit(EXIT_PASSED)
     elif args.subcommand == "review":
         exit_code = run_review(cwd=args.cwd, stream=args.stream, timeout=args.timeout)
         sys.exit(exit_code if exit_code is not None else 0)

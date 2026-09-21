@@ -14,6 +14,7 @@ import (
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/router"
+	"github.com/makewand/makewand/serverauth"
 	"github.com/spf13/cobra"
 )
 
@@ -139,6 +140,12 @@ func userActionCmd(action string) *cobra.Command {
 			if _, err := store.SetUserActive(userID, active); err != nil {
 				return err
 			}
+			if !active && stateDBPath != "" {
+				if tokStore, err := serverauth.OpenSQLiteStore(stateDBPath); err == nil {
+					_ = tokStore.RevokeByUserID(userID)
+					_ = tokStore.Close()
+				}
+			}
 			fmt.Printf("%s user %s in %s\n", pastTenseAction(action), userID, header)
 			return nil
 		},
@@ -184,6 +191,12 @@ func userRoleCmd() *cobra.Command {
 			defer closeFn()
 			if _, err := store.SetUserRole(userID, role); err != nil {
 				return err
+			}
+			if stateDBPath != "" {
+				if tokStore, err := serverauth.OpenSQLiteStore(stateDBPath); err == nil {
+					_ = tokStore.RevokeByUserID(userID)
+					_ = tokStore.Close()
+				}
 			}
 			fmt.Printf("Updated role for %s in %s\n", userID, header)
 			return nil
@@ -234,6 +247,12 @@ func userPasswordCmd() *cobra.Command {
 			defer closeFn()
 			if _, err := store.SetUserPassword(userID, password); err != nil {
 				return err
+			}
+			if stateDBPath != "" {
+				if tokStore, err := serverauth.OpenSQLiteStore(stateDBPath); err == nil {
+					_ = tokStore.RevokeByUserID(userID)
+					_ = tokStore.Close()
+				}
 			}
 			fmt.Printf("Updated password for %s in %s\n", userID, header)
 			return nil

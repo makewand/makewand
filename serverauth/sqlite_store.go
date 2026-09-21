@@ -289,6 +289,27 @@ func (s *SQLiteStore) authenticateToken(token string) (*Grant, bool) {
 	if grant.revoked || grant.IsExpiredAt(time.Now()) {
 		return nil, false
 	}
+	if s.db != nil {
+		var isRevoked int
+		if err := s.db.QueryRow(`SELECT revoked FROM auth_tokens WHERE token_hash = ?`, hash).Scan(&isRevoked); err == nil {
+			if isRevoked == 1 {
+				s.mu.Lock()
+				grant.revoked = true
+				s.mu.Unlock()
+				return nil, false
+			}
+		}
+	}
+	if grant.UserID() != "" && s.db != nil {
+		var isActive int
+		var role string
+		err := s.db.QueryRow(`SELECT is_active, role FROM users WHERE id = ?`, grant.UserID()).Scan(&isActive, &role)
+		if err == nil {
+			if isActive == 0 {
+				return nil, false
+			}
+		}
+	}
 	return grant, true
 }
 
@@ -405,6 +426,23 @@ func (s *SQLiteStore) Revoke(tokenID string) error {
 	}
 	if affected == 0 {
 		return fmt.Errorf("token %q not found", tokenID)
+	}
+	return s.reload()
+}
+
+// RevokeByUserID marks all tokens associated with a given userID as revoked and reloads grants.
+func (s *SQLiteStore) RevokeByUserID(userID string) error {
+	if s == nil {
+		return fmt.Errorf("sqlite token store is unavailable")
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if _, err := s.db.Exec(`UPDATE auth_tokens SET revoked = 1 WHERE user_id = ?`, userID); err != nil {
+		return err
 	}
 	return s.reload()
 }

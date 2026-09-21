@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/makewand/makewand/serveraudit"
@@ -1312,23 +1313,50 @@ func (opt HTTPHandlerOptions) recordUsageStrict(w http.ResponseWriter, usageEntr
 	return true, true
 }
 
-// applyBudgetReservation runs the team-budget check-and-reserve and, on
-// rejection, writes the HTTP error and records it on the audit event. It returns
-// a settle func (call with the request's realized cost once it is logged) and
-// whether the request was rejected (the caller should return immediately).
 func (r *Router) applyBudgetReservation(w http.ResponseWriter, opt HTTPHandlerOptions, grant *serverauth.Grant, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) (func(float64), bool) {
+	var grantRelease func(float64)
+	if grant != nil && opt.BudgetReservationUSD > 0 {
+		var err error
+		grantRelease, err = grant.ReserveCostAt(time.Now(), opt.BudgetReservationUSD)
+		if err != nil {
+			var httpErr *httpStatusError
+			if !errors.As(err, &httpErr) {
+				httpErr = &httpStatusError{Status: http.StatusTooManyRequests, Code: "budget_exceeded", Message: err.Error()}
+			}
+			auditEvent.Status = httpErr.Status
+			auditEvent.Error = httpErr.Message
+			writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
+			return func(float64) {}, true
+		}
+	}
+
 	settle, err := r.reserveTeamBudget(opt.TeamStore, opt.UsageReader, grant, opt.BudgetReservationUSD, usageEntry)
-	if err == nil {
-		return settle, false
+	if err != nil {
+		if grantRelease != nil {
+			grantRelease(0)
+		}
+		var httpErr *httpStatusError
+		if !errors.As(err, &httpErr) {
+			httpErr = &httpStatusError{Status: http.StatusInternalServerError, Code: "internal_error", Message: err.Error()}
+		}
+		auditEvent.Status = httpErr.Status
+		auditEvent.Error = httpErr.Message
+		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
+		return func(float64) {}, true
 	}
-	var httpErr *httpStatusError
-	if !errors.As(err, &httpErr) {
-		httpErr = &httpStatusError{Status: http.StatusInternalServerError, Code: "internal_error", Message: err.Error()}
+
+	var once sync.Once
+	combinedSettle := func(cost float64) {
+		once.Do(func() {
+			if grantRelease != nil {
+				grantRelease(0)
+			}
+			if settle != nil {
+				settle(cost)
+			}
+		})
 	}
-	auditEvent.Status = httpErr.Status
-	auditEvent.Error = httpErr.Message
-	writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
-	return func(float64) {}, true
+	return combinedSettle, false
 }
 
 // reserveTeamBudget checks the grant's project and (parent) organization monthly

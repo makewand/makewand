@@ -481,6 +481,11 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, err.Error(), 0, 0, 0)
 		return
 	}
+	if action == "deactivate" || action == "role" || action == "password" {
+		if opts.TokenManager != nil {
+			_ = opts.TokenManager.RevokeByUserID(userID)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user_id": userID,
 		"action":  action,

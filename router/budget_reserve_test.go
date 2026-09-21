@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/serverteam"
@@ -198,5 +200,97 @@ func TestBudgetReservationBoundsConcurrentOvershoot(t *testing.T) {
 		if c != http.StatusOK {
 			t.Fatalf("in-flight request %d: status = %d, want 200", i, c)
 		}
+	}
+}
+
+type costBlockingProvider struct {
+	name    string
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *costBlockingProvider) Name() string      { return p.name }
+func (p *costBlockingProvider) IsAvailable() bool { return true }
+func (p *costBlockingProvider) Chat(_ context.Context, _ []Message, _ string, _ int) (string, Usage, error) {
+	p.entered <- struct{}{}
+	<-p.release
+	return "ok", Usage{Cost: 0.10, Provider: p.name, Model: p.name}, nil
+}
+func (p *costBlockingProvider) ChatStream(_ context.Context, _ []Message, _ string, _ int) (<-chan StreamChunk, error) {
+	panic("unused")
+}
+
+func TestBudgetReservationBoundsConcurrentTokenBudget(t *testing.T) {
+	prov := &costBlockingProvider{name: "claude", entered: make(chan struct{}, 16), release: make(chan struct{})}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: prov, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{{
+			Token:            "test-token",
+			Scopes:           []string{serverauth.ScopeChatInvoke},
+			MaxCostUSDPerDay: 0.10,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("authorizer: %v", err)
+	}
+
+	h := r.HTTPHandler(HTTPHandlerOptions{
+		Authorizer:           authz,
+		BudgetReservationUSD: 0.10,
+	})
+
+	var wg sync.WaitGroup
+	codes := make([]int, 4)
+	fire := func() int {
+		body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer test-token")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i] = fire()
+		}(i)
+	}
+
+	// First request enters the provider
+	select {
+	case <-prov.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for request to enter provider")
+	}
+
+	// Give a moment for concurrent requests to hit the reservation check
+	time.Sleep(50 * time.Millisecond)
+
+	// Release provider and wait for all requests
+	close(prov.release)
+	wg.Wait()
+
+	successCount := 0
+	rejectedCount := 0
+	for _, code := range codes {
+		if code == http.StatusOK {
+			successCount++
+		} else if code == http.StatusTooManyRequests {
+			rejectedCount++
+		}
+	}
+
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 successful request, got %d (codes: %v)", successCount, codes)
+	}
+	if rejectedCount != 3 {
+		t.Fatalf("expected 3 rejected requests, got %d (codes: %v)", rejectedCount, codes)
 	}
 }

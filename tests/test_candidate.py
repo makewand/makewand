@@ -133,6 +133,109 @@ class TestCandidateLifecycle(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual((self.base_ws / "main.py").read_text(encoding="utf-8"), "candidate change\n")
 
+    def test_apply_symlink_defense(self):
+        race_id = "rc_symlink_test"
+        wt_b = config.CANDIDATES_DIR / race_id / "agent_b"
+        wt_b.mkdir(parents=True, exist_ok=True)
+        ensure_git_worktree(str(wt_b))
+
+        # 1. Candidate file itself is a symlink
+        evil_link = wt_b / "evil.py"
+        evil_link.symlink_to("/etc/hosts")
+
+        CandidateManager.save_race(
+            race_id=race_id,
+            prompt="安全测试",
+            base_cwd=str(self.base_ws),
+            baseline_commit="",
+            agent_a={},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True},
+            winner="B"
+        )
+
+        ok, _, msg = CandidateManager.apply_candidate(race_id, candidate_label="B")
+        self.assertFalse(ok)
+        self.assertIn("符号链接", msg)
+
+        # Remove symlink and create normal file
+        evil_link.unlink()
+        (wt_b / "normal.py").write_text("safe content\n", encoding="utf-8")
+
+        # 2. Target file in base_ws is a symlink pointing outside
+        target_link = self.base_ws / "normal.py"
+        target_link.symlink_to("/tmp")
+
+        # Re-save race to update manifest
+        CandidateManager.save_race(
+            race_id=race_id,
+            prompt="安全测试",
+            base_cwd=str(self.base_ws),
+            baseline_commit="",
+            agent_a={},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True},
+            winner="B"
+        )
+
+        ok, _, msg = CandidateManager.apply_candidate(race_id, candidate_label="B")
+        self.assertFalse(ok)
+        self.assertIn("符号链接", msg)
+
+    def test_apply_unreviewed_mutation_rejected(self):
+        race_id = "rc_mutation_test"
+        wt_b = config.CANDIDATES_DIR / race_id / "agent_b"
+        wt_b.mkdir(parents=True, exist_ok=True)
+        ensure_git_worktree(str(wt_b))
+        (wt_b / "feature.py").write_text("def foo(): return 1\n", encoding="utf-8")
+
+        CandidateManager.save_race(
+            race_id=race_id,
+            prompt="防篡改测试",
+            base_cwd=str(self.base_ws),
+            baseline_commit="",
+            agent_a={},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True},
+            winner="B"
+        )
+
+        # Mutate the file in wt_b after race has been saved
+        (wt_b / "feature.py").write_text("def foo(): return 'malicious'\n", encoding="utf-8")
+
+        ok, _, msg = CandidateManager.apply_candidate(race_id, candidate_label="B")
+        self.assertFalse(ok)
+        self.assertIn("哈希校验不匹配", msg)
+
+    def test_apply_failed_candidate_protection(self):
+        race_id = "rc_failed_cand_test"
+        wt_b = config.CANDIDATES_DIR / race_id / "agent_b"
+        wt_b.mkdir(parents=True, exist_ok=True)
+        ensure_git_worktree(str(wt_b))
+        (wt_b / "broken.py").write_text("broken code\n", encoding="utf-8")
+
+        CandidateManager.save_race(
+            race_id=race_id,
+            prompt="失败候选测试",
+            base_cwd=str(self.base_ws),
+            baseline_commit="",
+            agent_a={},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": False},
+            winner=None
+        )
+
+        # No winner declared, label omitted: must reject
+        ok, _, msg = CandidateManager.apply_candidate(race_id, candidate_label=None)
+        self.assertFalse(ok)
+        self.assertIn("未决出胜者", msg)
+
+        # Explicit label but candidate failed: must reject without --force
+        ok, _, msg = CandidateManager.apply_candidate(race_id, candidate_label="B", force=False)
+        self.assertFalse(ok)
+        self.assertIn("失败/未完成", msg)
+
+        # With --force: allowed
+        ok, _, msg = CandidateManager.apply_candidate(race_id, candidate_label="B", force=True)
+        self.assertTrue(ok)
+        self.assertTrue((self.base_ws / "broken.py").exists())
+
     def test_discard_race(self):
         race_id = "rc_discard1"
         (config.CANDIDATES_DIR / race_id).mkdir(parents=True, exist_ok=True)
@@ -152,3 +255,4 @@ class TestCandidateLifecycle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

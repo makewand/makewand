@@ -137,3 +137,42 @@ func (m *Manager) Revoke(tokenID string) error {
 	m.auth = authz
 	return nil
 }
+
+// RevokeByUserID marks all tokens for a user revoked, persists the file, and reloads the authorizer.
+func (m *Manager) RevokeByUserID(userID string) error {
+	if m == nil {
+		return http.ErrServerClosed
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg := m.cfg
+	changed := false
+	for i := range cfg.Tokens {
+		if strings.TrimSpace(cfg.Tokens[i].UserID) == userID && !cfg.Tokens[i].Revoked {
+			cfg.Tokens[i].Revoked = true
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := SaveConfigFile(m.path, cfg); err != nil {
+		return err
+	}
+	authz, err := NewAuthorizer(cfg)
+	if err != nil {
+		return err
+	}
+	if m.auth != nil {
+		carryOverGrantUsage(authz.grants, m.auth.grants)
+	}
+	m.cfg = cfg
+	m.auth = authz
+	return nil
+}
