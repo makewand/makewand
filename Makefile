@@ -1,12 +1,24 @@
-.PHONY: all install test probe status clean
+.PHONY: all install test test-py test-go prelaunch probe status clean
 
 all: test
 
 install:
 	./scripts/install.sh
 
-test:
-	python3 -m unittest discover tests
+test-py:
+	python3 -m unittest discover tests -v
+
+test-go:
+	go test -count=1 ./internal/tui ./serverui ./router ./serverteam ./serverauth ./serveradmin ./internal/remotesession
+
+test: test-py test-go
+
+prelaunch: test
+	@echo "Checking shell script syntax..."
+	@for f in scripts/*.sh; do bash -n "$$f"; done
+	@echo "Checking for local absolute paths in docs..."
+	@! grep --line-number --fixed-strings '/path/to/workspace/makewand' README.md docs/*.md 2>/dev/null || (echo "Found local absolute paths!" && exit 1)
+	@echo "Prelaunch checks passed successfully!"
 
 probe:
 	./bin/makewand probe

@@ -74,6 +74,7 @@ class TestHealth(unittest.TestCase):
         self.assertIn("muse", cache)
 
     def test_reset_time_passed(self):
+        from datetime import datetime, timedelta
         # 10:58 AM with morning updated_at is past in late afternoon
         self.assertTrue(is_reset_time_passed("10:58 AM", "2026-09-20T10:00:00"))
         # 4 hours expired fallback
@@ -82,6 +83,16 @@ class TestHealth(unittest.TestCase):
         self.assertTrue(is_reset_time_passed("2026-09-20T00:00:00"))
         # Future ISO timestamp
         self.assertFalse(is_reset_time_passed("2099-01-01T00:00:00"))
+
+        # Future time today
+        future_time = (datetime.now() + timedelta(hours=2)).strftime("%I:%M %p")
+        recent_up = (datetime.now() - timedelta(minutes=10)).isoformat()
+        self.assertFalse(is_reset_time_passed(future_time, recent_up))
+
+        # Overnight rollover: quota logged 10 min ago, reset time of day is 30 min ago
+        # which means next reset is tomorrow at that time. Should NOT be considered passed.
+        overnight_time = (datetime.now() - timedelta(minutes=30)).strftime("%I:%M %p")
+        self.assertFalse(is_reset_time_passed(overnight_time, recent_up))
 
 if __name__ == "__main__":
     unittest.main()

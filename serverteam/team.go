@@ -363,9 +363,6 @@ func normalizeOrganizationMembership(membership OrganizationMembership) (Organiz
 		membership.CreatedAt = now
 	}
 	membership.UpdatedAt = now
-	if !membership.IsActive {
-		membership.IsActive = true
-	}
 	return membership, nil
 }
 
@@ -389,9 +386,6 @@ func normalizeProjectMembership(membership ProjectMembership) (ProjectMembership
 		membership.CreatedAt = now
 	}
 	membership.UpdatedAt = now
-	if !membership.IsActive {
-		membership.IsActive = true
-	}
 	return membership, nil
 }
 

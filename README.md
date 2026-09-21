@@ -59,7 +59,7 @@ graph TD
 
 ### 快速安装
 ```bash
-cd /path/to/workspace/makewand
+cd path/to/makewand
 ./scripts/install.sh
 ```
 此命令会将可执行文件安装至 `~/.local/bin/makewand`，并建立向后兼容的 `trio` 软链接。

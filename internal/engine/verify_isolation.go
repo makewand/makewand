@@ -28,7 +28,7 @@ var (
 	verifyUserHome      = os.UserHomeDir
 	verifyGetenv        = os.Getenv
 	verifyBwrapSelfTest = func(bwrapPath string) error {
-		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "--unshare-net", "true")
+		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "--unshare-pid", "--unshare-net", "true")
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil
@@ -158,6 +158,9 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	wrapped := []string{
 		"--die-with-parent",
 		"--new-session",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
 		// Root first; fresh /proc and /dev afterwards so they overlay the
 		// read-only root instead of being shadowed by it.
 		"--ro-bind", "/", "/",

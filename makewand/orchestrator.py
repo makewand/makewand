@@ -31,6 +31,17 @@ from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
 from makewand.providers.muse import execute_muse_task
 
+# Standardized Exit Codes
+EXIT_PASSED = 0
+EXIT_INTERNAL_ERROR = 1
+EXIT_USAGE_ERROR = 2
+EXIT_FAILED = 10
+EXIT_UNVERIFIED = 11
+EXIT_CANCELLED = 12
+EXIT_BUDGET_EXHAUSTED = 13
+EXIT_APPLY_CONFLICT = 14
+EXIT_SANDBOX_UNAVAILABLE = 15
+
 def detect_task_tier(prompt: str) -> str:
     p_lower = prompt.lower()
     deep_keywords = ["审查", "审计", "review", "死锁", "并发", "安全", "漏洞", "架构", "设计", "deep", "complex", "formal", "重构"]
@@ -42,23 +53,69 @@ def detect_task_tier(prompt: str) -> str:
         return "fast"
     return "standard"
 
-def has_critical_defects(review_text: str) -> bool:
-    if not review_text:
+def is_review_passed(review_text: str) -> bool:
+    """
+    Returns True if and only if review explicitly passes quality gate without defects.
+    Any unverified text, empty output, or failure to produce explicit approval returns False (Fail-Closed).
+    """
+    if not review_text or not review_text.strip():
         return False
 
-    # 1. Structural JSON verdict check (highest precedence)
-    verdict_match = re.search(r"MAKEWAND_VERDICT:\s*(\{.*?\})", review_text, re.DOTALL)
-    if verdict_match:
+    # 1. Structural JSON verdict check (from end of output to skip template quotes)
+    matches = list(re.finditer(r"MAKEWAND_VERDICT:\s*(\{.*?\})", review_text, re.DOTALL))
+    if matches:
+        last_match = matches[-1]
         try:
-            verdict_data = json.loads(verdict_match.group(1).strip())
+            verdict_data = json.loads(last_match.group(1).strip())
             if isinstance(verdict_data, dict) and "pass" in verdict_data:
-                return not bool(verdict_data["pass"])
+                val = verdict_data["pass"]
+                if isinstance(val, bool):
+                    return val
+                elif isinstance(val, str):
+                    return val.strip().lower() in ["true", "1", "yes", "pass"]
+                elif isinstance(val, (int, float)):
+                    return bool(val)
+        except Exception:
+            pass
+
+    if has_critical_defects(review_text):
+        return False
+
+    lower = review_text.lower()
+    pass_signals = [
+        "没有发现明显缺陷", "无需修改", "建议直接合并", "审核通过", "lgtm",
+        "所有用例均通过且无安全漏洞", "未发现严重漏洞", "无安全漏洞", "未发现安全漏洞",
+        "looks good to me", "all tests pass", "表现良好"
+    ]
+    return any(sig in lower for sig in pass_signals)
+
+def has_critical_defects(review_text: str) -> bool:
+    """
+    Returns True if the review text explicitly indicates critical defects.
+    """
+    if not review_text or not review_text.strip():
+        return True
+
+    # 1. Structural JSON verdict check (from end of output)
+    matches = list(re.finditer(r"MAKEWAND_VERDICT:\s*(\{.*?\})", review_text, re.DOTALL))
+    if matches:
+        last_match = matches[-1]
+        try:
+            verdict_data = json.loads(last_match.group(1).strip())
+            if isinstance(verdict_data, dict) and "pass" in verdict_data:
+                val = verdict_data["pass"]
+                if isinstance(val, bool):
+                    return not val
+                elif isinstance(val, str):
+                    return val.strip().lower() not in ["true", "1", "yes", "pass"]
+                elif isinstance(val, (int, float)):
+                    return not bool(val)
         except Exception:
             pass
 
     lower = review_text.lower()
 
-    # 2. Negation phrase stripping to avoid false positives (e.g. "未发现死锁" falsely triggering "死锁")
+    # 2. Negation phrase stripping to avoid false positives
     cleaned = lower
     item_pat = r"(?:并发死锁|死锁|内存泄露|内存泄漏|数据竞态(?:隐患)?|竞态(?:隐患)?|race\s+condition|安全漏洞|安全隐患|缺陷|漏洞|隐患|bug|问题)"
     prefix_pat = r"(?:未发现|没有发现|未见|不存在|没有|无|亦无|并无|且无|毫无)\s*(?:明显|严重|任何|潜在|可疑)?"
@@ -80,7 +137,6 @@ def has_critical_defects(review_text: str) -> bool:
         "并发死锁", "内存泄露", "内存泄漏", "数据竞态", "race condition",
         "arbitrary host command"
     ]
-    # If explicit defect tags exist in the cleaned text, it is ALWAYS a defect
     if any(p in cleaned for p in unambiguous_defects):
         return True
 
@@ -528,37 +584,57 @@ def run_pipeline(
     print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
     return True
 
-def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None):
+def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None) -> int:
     if not cwd:
         cwd = os.getcwd()
     print(c("🔍 Makewand 代码审计工具", COLOR_BOLD + COLOR_CYAN))
     diff_out = get_git_diff(cwd)
     if not diff_out.strip():
         print("当前工作区没有检测到未提交的改动 (git diff 为空)。")
-        return
+        return EXIT_PASSED
 
     cache = get_or_update_status()
     x_status = cache.get("codex", {}).get("status")
 
     focus = f" 特别关注要求: {user_prompt}。" if user_prompt else ""
-    prompt = f"工作目录为: {cwd}。请详细审查当前仓库的修改（git diff），{focus}指出潜在隐患并给出修复建议：\n{diff_out[:6000]}"
+    prompt = (
+        f"工作目录为: {cwd}。请详细审查当前仓库的修改（git diff），{focus}指出潜在隐患并给出修复建议。\n"
+        f"【重要输出规范】请在回答最后一行务必输出且仅输出一行 JSON 判定：\n"
+        f"MAKEWAND_VERDICT: {{\"pass\": true, \"defects\": []}} (若无严重缺陷)\n"
+        f"或 MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"缺陷描述\"]}} (若存在严重隐患)\n"
+        f"--- 代码改动 (git diff) ---\n{diff_out[:6000]}"
+    )
 
+    review_res = None
     if x_status != "limited":
         print(c("派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN))
         success, out, err = execute_codex_task(prompt, cwd=cwd, tier="deep", stream=stream, timeout=timeout, readonly=True)
-        if success:
-            if not stream:
-                print(out)
-            return
-        print(c(f"Codex 不可用 ({err})，转交 Antigravity...", COLOR_YELLOW))
+        if success and out:
+            review_res = out
+        else:
+            print(c(f"Codex 不可用 ({err})，转交 Antigravity...", COLOR_YELLOW))
 
-    print(c("由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN))
-    success, out, err = execute_agy_task(prompt, cwd=cwd, tier="deep", stream=stream, timeout=timeout, readonly=True)
-    if success:
-        if not stream:
-            print(out)
+    if review_res is None:
+        print(c("由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN))
+        success, out, err = execute_agy_task(prompt, cwd=cwd, tier="deep", stream=stream, timeout=timeout, readonly=True)
+        if success and out:
+            review_res = out
+        else:
+            print(c(f"审查失败: {err}", COLOR_RED))
+
+    if not review_res:
+        print(c("❌ [Makewand Quality Gate] 独立审查服务未能产生有效输出 (UNVERIFIED)，拒绝交付。", COLOR_RED + COLOR_BOLD))
+        return EXIT_UNVERIFIED
+
+    if not stream:
+        print(review_res)
+
+    if is_review_passed(review_res):
+        print(c("✔ 代码审计通过，未发现严重缺陷 (PASSED)。", COLOR_GREEN + COLOR_BOLD))
+        return EXIT_PASSED
     else:
-        print(c(f"审查失败: {err}", COLOR_RED))
+        print(c("❌ 代码审计检测到严重隐患，未达合并标准 (FAILED)。", COLOR_RED + COLOR_BOLD))
+        return EXIT_FAILED
 
 def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
     if not cwd:

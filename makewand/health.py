@@ -55,13 +55,11 @@ def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool
                     reset_dt = datetime.combine(up_dt.date(), t)
                     if reset_dt < up_dt:
                         reset_dt += timedelta(days=1)
-                    if now >= reset_dt:
-                        return True
+                    return now >= reset_dt
                 except Exception:
                     pass
             reset_dt = datetime.combine(now.date(), t)
-            if now >= reset_dt:
-                return True
+            return now >= reset_dt
         except Exception:
             continue
     return False

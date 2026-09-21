@@ -108,6 +108,21 @@ class TestOrchestrator(unittest.TestCase):
             "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"空指针解引用\"]}"
         ))
 
+        # JSON string booleans: must not fall into bool("false") == True trap!
+        self.assertTrue(has_critical_defects(
+            "审查意见详情...\n"
+            "MAKEWAND_VERDICT: {\"pass\": \"false\", \"defects\": [\"逻辑死锁\"]}"
+        ))
+        self.assertFalse(has_critical_defects(
+            "审查意见详情...\n"
+            "MAKEWAND_VERDICT: {\"pass\": \"true\", \"defects\": []}"
+        ))
+
+        # Empty or unverified text must fail closed
+        self.assertTrue(has_critical_defects(""))
+        self.assertTrue(has_critical_defects(None))
+        self.assertTrue(has_critical_defects("   "))
+
     @patch("makewand.orchestrator.get_or_update_status")
     @patch("makewand.orchestrator.execute_claude_task")
     @patch("makewand.orchestrator.get_git_diff")

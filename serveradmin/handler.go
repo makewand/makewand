@@ -511,6 +511,14 @@ func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, nil, scope, kind, http.StatusUnauthorized, "invalid or missing admin credentials", 0, 0, 0)
 		return nil, false
 	}
+	if opts.UserStore != nil && grant.UserID() != "" {
+		u, err := opts.UserStore.GetUserByID(grant.UserID())
+		if err != nil || u == nil || !u.IsActive {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "user account is deactivated or not found")
+			logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusUnauthorized, "user account is deactivated or not found", 0, 0, 0)
+			return nil, false
+		}
+	}
 	if session != nil && requiresCSRFAuthorization(req.Method) && !opts.SessionMgr.ValidateCSRF(req, session.CSRFToken) {
 		writeError(w, http.StatusForbidden, "forbidden", "missing or invalid CSRF token")
 		logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusForbidden, "missing or invalid CSRF token", 0, 0, 0)

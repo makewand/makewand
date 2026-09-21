@@ -862,3 +862,57 @@ func TestHandler_UserPasswordResetAndMembershipEndpoints(t *testing.T) {
 		t.Fatalf("project membership list status = %d, want 200; body: %s", listRec.Code, listRec.Body.String())
 	}
 }
+
+func TestHandler_DeactivatedUserTokenRejected(t *testing.T) {
+	userStore := router.NewUserStore(filepath.Join(t.TempDir(), "users"))
+	user, err := userStore.CreateUser("deactivated@example.com", "secret123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	authPath := filepath.Join(t.TempDir(), "server_auth.json")
+	if err := serverauth.SaveConfigFile(authPath, serverauth.Config{
+		Tokens: []serverauth.TokenRule{
+			{
+				ID:     "user-token",
+				Token:  "user-secret",
+				UserID: user.ID,
+				Scopes: serverauth.AllScopes(),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveConfigFile: %v", err)
+	}
+	manager, err := serverauth.LoadManager(authPath)
+	if err != nil {
+		t.Fatalf("LoadManager: %v", err)
+	}
+
+	handler := NewHandler(HandlerOptions{
+		Authorizer:   manager,
+		TokenManager: manager,
+		UserStore:    userStore,
+	})
+
+	// Active user token works
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/tokens", nil)
+	req.Header.Set("Authorization", "Bearer user-secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("active user token status = %d, want 200", rec.Code)
+	}
+
+	// Deactivate user
+	if _, err := userStore.SetUserActive(user.ID, false); err != nil {
+		t.Fatalf("SetUserActive: %v", err)
+	}
+
+	// Deactivated user token should be rejected with 401
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("deactivated user token status = %d, want 401; body = %s", rec2.Code, rec2.Body.String())
+	}
+}
+

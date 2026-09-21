@@ -15,7 +15,7 @@ var (
 	previewUserHome      = os.UserHomeDir
 	previewGetenv        = os.Getenv
 	previewBwrapSelfTest = func(bwrapPath string) error {
-		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "true")
+		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "--unshare-pid", "true")
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil
@@ -92,15 +92,19 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 	wrapped := []string{
 		"--die-with-parent",
 		"--new-session",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
 		// Root first; fresh /proc and /dev afterwards so they overlay the
 		// read-only root instead of being shadowed by it (a shadowed /dev makes
 		// /dev/null read-only and breaks most tooling).
 		"--ro-bind", "/", "/",
 		"--proc", "/proc",
 		"--dev", "/dev",
+		// tmpfs /tmp before projectPath bind so temp-dir previews stay writable and don't shadow projectPath
+		"--tmpfs", "/tmp",
 		"--bind", projectPath, projectPath,
 		"--chdir", projectPath,
-		"--tmpfs", "/tmp",
 		"--clearenv",
 		"--setenv", "PATH", pathEnv,
 		"--setenv", "HOME", "/tmp",

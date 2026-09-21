@@ -40,21 +40,22 @@ def ensure_git_worktree(cwd: str) -> bool:
     if code != 0:
         print(c("[Makewand Git] 检测到当前目录尚未初始化 Git，自动建立影子 Git 跟踪树...", COLOR_YELLOW))
         run_git_cmd("git init && git config user.name 'Makewand' && git config user.email 'makewand@local'", cwd=cwd)
+        run_git_cmd("git commit --allow-empty -m 'Makewand baseline snapshot'", cwd=cwd)
         run_git_cmd("git add -N . 2>/dev/null || true", cwd=cwd)
         return True
     return False
 
 def get_git_diff(cwd: str) -> str:
     """
-    Extracts git diff for the workspace, including newly added/untracked files.
-    Auto-inits shadow git if necessary.
+    Extracts git diff for the workspace, including newly added, modified, and deleted files.
+    Auto-inits shadow git with baseline commit if necessary.
     """
     if not cwd:
         cwd = os.getcwd()
     ensure_git_worktree(cwd)
-    run_git_cmd("git add -N . 2>/dev/null || true", cwd=cwd)
+    run_git_cmd("git add -A --intent-to-add 2>/dev/null || git add -N . 2>/dev/null || true", cwd=cwd)
     code, diff_out, _ = run_git_cmd("git diff HEAD", cwd=cwd)
-    if not diff_out or not diff_out.strip():
+    if code != 0 or not diff_out or not diff_out.strip():
         code, diff_out, _ = run_git_cmd("git diff", cwd=cwd)
     return diff_out.strip() if diff_out else ""
 

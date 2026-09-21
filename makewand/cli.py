@@ -296,12 +296,12 @@ def main():
             max_fix=args.max_fix,
             timeout=args.timeout
         )
-        if not ok:
-            sys.exit(1)
     elif args.subcommand == "review":
-        run_review(cwd=args.cwd, stream=args.stream, timeout=args.timeout)
+        exit_code = run_review(cwd=args.cwd, stream=args.stream, timeout=args.timeout)
+        sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand == "race":
-        run_race(args.prompt, cwd=args.cwd, timeout=args.timeout)
+        exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout)
+        sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand == "search":
         cmd_search(args)
     elif args.subcommand == "sandbox":
