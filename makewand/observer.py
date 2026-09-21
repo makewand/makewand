@@ -20,12 +20,27 @@ KNOWN_WORKSPACES = {
     "sample_project_2": "/path/to/workspace/dev/sample_project_2",
     "makewand": "/path/to/workspace/makewand",
     "network": "/path/to/workspace/network",
+    "sample_project_6": "/path/to/workspace/sample_project_6/platform",
     "stock": "/path/to/workspace/stock",
     "sample_project_7": "/path/to/workspace/sample_project_7",
     "sample_project_4": "/path/to/workspace/sample_project_4",
     "sample_project_5": "/path/to/workspace/sample_project_5",
     "sample_project_3": "/path/to/workspace/dev/sample_project_3"
 }
+
+def get_session_cwd(session_name: str) -> str:
+    """Retrieve the current working directory for a tmux session dynamically."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "display-message", "-p", "-t", session_name, "#{pane_current_path}"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode("utf-8").strip()
+        if out and os.path.exists(out):
+            return out
+    except Exception:
+        pass
+    return KNOWN_WORKSPACES.get(session_name, "unknown")
 
 def get_system_metrics():
     """Collect load average and memory stats."""
@@ -88,7 +103,75 @@ def is_file_locked(lock_path):
     except Exception:
         return False
 
-def classify_operation(session_name, lines, metrics):
+def get_session_long_running_process(session_name: str, threshold_seconds: int = 900):
+    """
+    Detect if the tmux session has descendant processes executing longer than threshold_seconds.
+    """
+    try:
+        pane_pid = subprocess.check_output(
+            ["tmux", "display-message", "-p", "-t", session_name, "#{pane_pid}"],
+            stderr=subprocess.DEVNULL,
+            timeout=1
+        ).decode("utf-8").strip()
+        if not pane_pid or not pane_pid.isdigit():
+            return None
+
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid,ppid,etimes,comm,args"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode("utf-8", errors="replace")
+
+        lines = out.strip().splitlines()
+        if not lines:
+            return None
+
+        procs = {}
+        for line in lines[1:]:
+            parts = line.strip().split(None, 4)
+            if len(parts) >= 5:
+                pid_s, ppid_s, et_s, comm, args = parts
+                if pid_s.isdigit() and ppid_s.isdigit() and et_s.isdigit():
+                    procs[int(pid_s)] = {
+                        "pid": int(pid_s),
+                        "ppid": int(ppid_s),
+                        "etimes": int(et_s),
+                        "comm": comm,
+                        "args": args
+                    }
+
+        target_root = int(pane_pid)
+        descendants = set()
+        queue = [target_root]
+        while queue:
+            curr = queue.pop(0)
+            for p, info in procs.items():
+                if info["ppid"] == curr and p not in descendants:
+                    descendants.add(p)
+                    queue.append(p)
+
+        for p in descendants:
+            info = procs.get(p)
+            if not info:
+                continue
+            comm_lower = info["comm"].lower()
+            args_lower = info["args"].lower()
+            if any(k in comm_lower for k in ("bash", "zsh", "sh", "tmux", "agy", "node", "codex")):
+                continue
+            if "bin/codex" in args_lower or "antigravity" in args_lower or "node_modules" in args_lower:
+                continue
+            if info["etimes"] >= threshold_seconds:
+                return {
+                    "pid": info["pid"],
+                    "comm": info["comm"],
+                    "etimes": info["etimes"],
+                    "args": info["args"][:160]
+                }
+    except Exception:
+        pass
+    return None
+
+def classify_operation(session_name, lines, metrics, long_proc=None):
     """
     Classify the operational pattern of an AI session:
     - hung_anomaly (deadlock or stuck > 10m)
@@ -99,6 +182,16 @@ def classify_operation(session_name, lines, metrics):
     - idle_ready (waiting for user prompt)
     """
     text = " \n ".join(lines)
+
+    # 0. Check long running process first
+    if long_proc:
+        elapsed_min = long_proc["etimes"] // 60
+        if "psycopg2" in long_proc["args"] or "postgres" in long_proc["args"] or "SELECT " in long_proc["args"]:
+            return "heavy_db_query", f"执行大型 SQL 统计已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})，引发磁盘 AIO 争抢"
+        elif "pytest" in long_proc["args"] or "manage.py test" in long_proc["args"] or "test" in long_proc["args"]:
+            return "test_ci", f"运行测试套件已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
+        elif elapsed_min >= 30:
+            return "hung_anomaly", f"子进程 (PID {long_proc['pid']}, {long_proc['comm']}) 持续运行达 {elapsed_min} 分钟"
 
     # 1. Check for hung anomaly in sample_project_1 (specifically pytest with exclusive lock held)
     if session_name == "sample_project_1":
@@ -130,7 +223,10 @@ def classify_operation(session_name, lines, metrics):
         return "code_refactor", "多文件代码改写、逻辑重构与 Git 状态收敛"
 
     # 5. Idle / Ready
-    if "? for shortcuts" in text and ("Gemini" in text or "esc to cancel" not in text):
+    if ("? for shortcuts" in text and ("Gemini" in text or "esc to cancel" not in text)) or \
+       ("Keyboard: ↑/↓ Navigate" in text and "Switch Tab" in text) or \
+       (("> Ask Codex to do anything" in text or "» Ask Codex to do anything" in text or "› Ask Codex to do anything" in text) and \
+        "Waiting for background terminal" not in text and "Working (" not in text):
         return "idle_ready", "任务已闭环，处于待命提示符状态"
 
     # 6. System Monitor & Diagnostics
@@ -142,6 +238,26 @@ def classify_operation(session_name, lines, metrics):
 def analyze_makewand_optimizations(session_reports, metrics):
     """Derive global optimization recommendations for Makewand based on observed session patterns."""
     optimizations = []
+
+    # Check for long-running heavy processes or stuck DB queries
+    long_query_sessions = [
+        s for s in session_reports
+        if s.get("long_proc") and (
+            "psycopg2" in s["long_proc"].get("args", "") or
+            "SELECT " in s["long_proc"].get("args", "") or
+            s["category"] == "heavy_db_query"
+        )
+    ]
+    for s in long_query_sessions:
+        lp = s["long_proc"]
+        elapsed_m = lp["etimes"] // 60
+        if elapsed_m >= 15:
+            optimizations.append({
+                "target": "长时间高负荷数据库查询优化 (Long-Running DB Watchdog)",
+                "priority": "HIGH" if elapsed_m < 60 else "CRITICAL",
+                "reason": f"监测到会话 [{s['name']}] 中的子进程 (PID {lp['pid']}, {lp['comm']}) 已持续运行 {elapsed_m} 分钟，引发系统磁盘 AIO 争抢。",
+                "proposal": f"建议对会话 [{s['name']}] 涉及的慢 SQL (如 measurements 表模糊匹配) 建立专用索引或限制扫描区间，必要时执行取消以释放宿主机 I/O。"
+            })
 
     # Check if load is high (> 15)
     if metrics["load_1m"] > 15:
@@ -195,14 +311,16 @@ def observe_all_dialogs(save_report=True):
 
     session_reports = []
     for s in active_sessions:
-        cwd = KNOWN_WORKSPACES.get(s, "unknown")
+        cwd = get_session_cwd(s)
         lines = capture_session_pane(s, lines_count=20)
-        cat, note = classify_operation(s, lines, metrics)
+        long_proc = get_session_long_running_process(s, threshold_seconds=900)
+        cat, note = classify_operation(s, lines, metrics, long_proc=long_proc)
         session_reports.append({
             "name": s,
             "cwd": cwd,
             "category": cat,
             "status_note": note,
+            "long_proc": long_proc,
             "sample_lines": lines[-5:] if lines else []
         })
 
