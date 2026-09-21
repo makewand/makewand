@@ -22,9 +22,12 @@ from makewand.config import (
     COLOR_BLUE,
     COLOR_CYAN,
     COLOR_PURPLE,
-    COLOR_RESET
+    COLOR_RESET,
+    CANDIDATES_DIR,
+    ensure_config_dir,
 )
-from makewand.git_helper import ensure_git_worktree, get_git_diff, clone_isolated_worktree
+from makewand.git_helper import ensure_git_worktree, get_git_diff, clone_isolated_worktree, run_git_cmd
+from makewand.candidate import CandidateManager
 from makewand.health import get_or_update_status
 from makewand.providers.agy import execute_agy_task
 from makewand.providers.claude import execute_claude_task
@@ -648,18 +651,22 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
     x_ok = cache.get("codex", {}).get("status") == "healthy"
     m_ok = cache.get("muse", {}).get("status") == "healthy"
 
-    import shutil
-    race_id = uuid.uuid4().hex[:8]
-    tmp_parent = Path(tempfile.gettempdir()) / f"makewand_race_{race_id}"
-    wt_a = tmp_parent / "agent_a"
-    wt_b = tmp_parent / "agent_b"
+    ensure_config_dir()
+    race_id = f"rc_{uuid.uuid4().hex[:8]}"
+    session_dir = CANDIDATES_DIR / race_id
+    wt_a = session_dir / "agent_a"
+    wt_b = session_dir / "agent_b"
 
+    saved_successfully = False
     try:
         wt_a.mkdir(parents=True, exist_ok=True)
         wt_b.mkdir(parents=True, exist_ok=True)
 
         clone_isolated_worktree(cwd, wt_a)
         clone_isolated_worktree(cwd, wt_b)
+
+        # Record baseline commit
+        code, b_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=cwd)
 
         # Pick Contestants
         name_a = "Codex (gpt-6-astra)" if x_ok else ("Muse Code" if m_ok else "Antigravity (Gemini Fast)")
@@ -719,5 +726,47 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
         if judge_report:
             print(c("\n【裁判裁决报告】", COLOR_BOLD))
             print(judge_report.strip())
+
+        # Determine winner
+        winner = None
+        if judge_report:
+            lower = judge_report.lower()
+            if "选手 b" in judge_report or "agent b" in lower or "推荐采纳选手 b" in judge_report:
+                winner = "B"
+            elif "选手 a" in judge_report or "agent a" in lower or "推荐采纳选手 a" in judge_report:
+                winner = "A"
+
+        CandidateManager.save_race(
+            race_id=race_id,
+            prompt=prompt,
+            base_cwd=cwd,
+            baseline_commit=b_commit.strip() if (code == 0 and b_commit) else "",
+            agent_a={
+                "model": res_a[0],
+                "path": str(wt_a),
+                "duration": res_a[3],
+                "success": res_a[1],
+                "diff": diff_a,
+            },
+            agent_b={
+                "model": res_b[0],
+                "path": str(wt_b),
+                "duration": res_b[3],
+                "success": res_b[1],
+                "diff": diff_b,
+            },
+            judge_report=judge_report or "",
+            winner=winner,
+        )
+        saved_successfully = True
+
+        rec_label = winner or "B"
+        print(c(f"\n💾 候选工作区已妥善封存 (Race ID: {race_id})", COLOR_GREEN + COLOR_BOLD))
+        print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {rec_label}")
+        print(f"  • 安全应用方案: makewand apply {race_id} --candidate {rec_label}")
+        print(f"  • 丢弃废弃候选: makewand discard {race_id}\n")
+        return EXIT_PASSED
     finally:
-        shutil.rmtree(tmp_parent, ignore_errors=True)
+        if not saved_successfully and session_dir.exists():
+            import shutil
+            shutil.rmtree(session_dir, ignore_errors=True)

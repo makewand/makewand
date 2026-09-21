@@ -18,7 +18,16 @@ from makewand.config import (
 )
 from makewand.health import get_or_update_status
 from makewand.discovery import discover_available_models
-from makewand.orchestrator import run_pipeline, run_review, run_race
+from makewand.orchestrator import (
+    run_pipeline,
+    run_review,
+    run_race,
+    EXIT_PASSED,
+    EXIT_FAILED,
+    EXIT_UNVERIFIED,
+    EXIT_USAGE_ERROR,
+    EXIT_APPLY_CONFLICT,
+)
 from makewand.providers.agy import execute_agy_task
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
@@ -168,6 +177,95 @@ def cmd_sandbox(args):
             sys.stderr.write(f"Sandbox Error: {ex}\n")
         sys.exit(ret if ret > 0 else 1)
 
+def cmd_candidates(args):
+    from makewand.candidate import CandidateManager
+    races = CandidateManager.list_races()
+    if not races:
+        print("当前没有任何封存的候选工作区。通过 'makewand race <任务>' 发起竞速即可产生候选。")
+        return
+    print(c("\n============================================================", COLOR_BOLD))
+    print(c("             Makewand 竞速候选工作区列表", COLOR_BOLD + COLOR_CYAN))
+    print(c("============================================================\n", COLOR_BOLD))
+    for r in races:
+        r_id = r.get("race_id")
+        created = r.get("created_at", "")[:19]
+        prompt = r.get("prompt", "")
+        winner = r.get("winner") or "未决"
+        a_mod = r.get("candidates", {}).get("A", {}).get("model", "A")
+        b_mod = r.get("candidates", {}).get("B", {}).get("model", "B")
+        print(f"• ID: {c(r_id, COLOR_YELLOW + COLOR_BOLD)}  时间: {created}")
+        print(f"  任务: {prompt}")
+        print(f"  对决: 选手 A ({a_mod}) vs 选手 B ({b_mod}) | 推荐胜出: {c(winner, COLOR_GREEN + COLOR_BOLD)}")
+        print(f"  操作: makewand inspect {r_id} | makewand apply {r_id} | makewand discard {r_id}\n")
+
+def cmd_inspect(args):
+    from makewand.candidate import CandidateManager
+    race = CandidateManager.get_race(args.race_id)
+    if not race:
+        print(c(f"未找到候选记录: {args.race_id or '最新'}", COLOR_RED))
+        sys.exit(EXIT_USAGE_ERROR)
+
+    print(c("\n============================================================", COLOR_BOLD))
+    print(c(f"         Makewand 候选方案详情 [{race.get('race_id')}]", COLOR_BOLD + COLOR_CYAN))
+    print(c("============================================================\n", COLOR_BOLD))
+    print(f"原始任务: {c(race.get('prompt', ''), COLOR_BOLD)}")
+    print(f"工作目录: {race.get('base_cwd')}")
+    print(f"创建时间: {race.get('created_at', '')[:19]}")
+    winner = race.get("winner")
+    if winner:
+        print(f"主裁推荐: {c(f'选手 {winner}', COLOR_GREEN + COLOR_BOLD)}")
+    print()
+
+    cand = (args.candidate.upper() if args.candidate else None)
+    cand_a = race.get("candidates", {}).get("A", {})
+    cand_b = race.get("candidates", {}).get("B", {})
+
+    if cand == "A":
+        print(c(f"--- 选手 A ({cand_a.get('model')}) 改动详情 (git diff) ---", COLOR_CYAN + COLOR_BOLD))
+        diff = cand_a.get("diff", "")
+        print(diff if diff else "无有效代码变更")
+    elif cand == "B":
+        print(c(f"--- 选手 B ({cand_b.get('model')}) 改动详情 (git diff) ---", COLOR_BLUE + COLOR_BOLD))
+        diff = cand_b.get("diff", "")
+        print(diff if diff else "无有效代码变更")
+    else:
+        print(c("--- 两位选手表现对比 ---", COLOR_BOLD))
+        print(f"选手 A [{cand_a.get('model')}]: 耗时={cand_a.get('duration')}s, Diff大小={len(cand_a.get('diff', ''))} 字节, 状态={'成功' if cand_a.get('success') else '失败'}")
+        print(f"选手 B [{cand_b.get('model')}]: 耗时={cand_b.get('duration')}s, Diff大小={len(cand_b.get('diff', ''))} 字节, 状态={'成功' if cand_b.get('success') else '失败'}")
+        print()
+        if race.get("judge_report"):
+            print(c("--- 裁判裁决报告 ---", COLOR_BOLD))
+            print(race.get("judge_report").strip())
+        print(f"\n提示: 使用 'makewand inspect {race.get('race_id')} --candidate A|B' 查看完整代码差异。")
+
+def cmd_apply(args):
+    from makewand.candidate import CandidateManager
+    ok, files, msg = CandidateManager.apply_candidate(
+        race_id=args.race_id,
+        candidate_label=args.candidate,
+        dry_run=args.dry_run,
+        force=args.force
+    )
+    if not ok:
+        print(c(f"❌ {msg}", COLOR_RED + COLOR_BOLD))
+        if "冲突" in msg:
+            sys.exit(EXIT_APPLY_CONFLICT)
+        sys.exit(EXIT_FAILED)
+
+    print(c(f"✔ {msg}", COLOR_GREEN + COLOR_BOLD))
+    if files:
+        for f in files:
+            print(f"  • {f}")
+    sys.exit(EXIT_PASSED)
+
+def cmd_discard(args):
+    from makewand.candidate import CandidateManager
+    ok, msg = CandidateManager.discard_race(race_id=args.race_id, all_races=args.all)
+    if ok:
+        print(c(f"✔ {msg}", COLOR_GREEN))
+    else:
+        print(c(f"❌ {msg}", COLOR_RED))
+
 def main():
     parser = argparse.ArgumentParser(
         prog="makewand",
@@ -261,9 +359,26 @@ def main():
     p_observe = subparsers.add_parser("observe", help="Inspect all running AI sessions, classify behavior, and report makewand optimizations")
     p_observe.add_argument("--json", action="store_true", help="Output raw JSON format")
 
+    # Candidate Lifecycle Subcommands
+    p_cands = subparsers.add_parser("candidates", help="List all pending multi-model race candidate workspaces")
+
+    p_inspect = subparsers.add_parser("inspect", help="Inspect race candidate diffs and referee verdicts")
+    p_inspect.add_argument("race_id", nargs="?", default=None, help="Race ID (defaults to latest)")
+    p_inspect.add_argument("--candidate", choices=["A", "B", "a", "b"], default=None, help="Inspect specific candidate (A or B)")
+
+    p_apply = subparsers.add_parser("apply", help="Safely apply a race candidate solution to current workspace with conflict checks")
+    p_apply.add_argument("race_id", nargs="?", default=None, help="Race ID (defaults to latest)")
+    p_apply.add_argument("--candidate", choices=["A", "B", "a", "b"], default=None, help="Candidate to apply (A or B, defaults to winner)")
+    p_apply.add_argument("--dry-run", action="store_true", default=False, help="Simulate apply and show changed files without touching disk")
+    p_apply.add_argument("--force", action="store_true", default=False, help="Force overwrite even if local workspace has conflicts")
+
+    p_discard = subparsers.add_parser("discard", help="Discard saved race candidate workspaces")
+    p_discard.add_argument("race_id", nargs="?", default=None, help="Race ID to discard (defaults to latest)")
+    p_discard.add_argument("--all", action="store_true", default=False, help="Discard all candidate workspaces")
+
     known_subcommands = {
         "models", "status", "probe", "quota", "run", "review", "race", "search", "sandbox",
-        "claude", "codex", "agy", "muse", "observe"
+        "claude", "codex", "agy", "muse", "observe", "candidates", "inspect", "apply", "discard"
     }
     # If user invokes `makewand "do something"`, automatically route to `makewand run "do something"`
     if len(sys.argv) > 1 and sys.argv[1] not in known_subcommands and not sys.argv[1].startswith("-"):
@@ -302,6 +417,14 @@ def main():
     elif args.subcommand == "race":
         exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout)
         sys.exit(exit_code if exit_code is not None else 0)
+    elif args.subcommand == "candidates":
+        cmd_candidates(args)
+    elif args.subcommand == "inspect":
+        cmd_inspect(args)
+    elif args.subcommand == "apply":
+        cmd_apply(args)
+    elif args.subcommand == "discard":
+        cmd_discard(args)
     elif args.subcommand == "search":
         cmd_search(args)
     elif args.subcommand == "sandbox":

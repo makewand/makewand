@@ -366,3 +366,68 @@ func TestAllClientScopes_ExcludesAdminScopes(t *testing.T) {
 		}
 	}
 }
+
+func TestGrant_ReserveCostAt_InFlightAndRefund(t *testing.T) {
+	authorizer, err := NewAuthorizer(Config{
+		Tokens: []TokenRule{
+			{
+				Token:            "res-secret",
+				Scopes:           []string{ScopeChatInvoke},
+				MaxCostUSDPerDay: 1.0,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+	grant, ok := authorizer.AuthenticateHeader("Bearer res-secret")
+	if !ok {
+		t.Fatal("AuthenticateHeader returned false")
+	}
+
+	now := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
+
+	// 1. Reserve 0.8 USD: succeeds
+	release1, err := grant.ReserveCostAt(now, 0.8)
+	if err != nil {
+		t.Fatalf("ReserveCostAt(0.8) = %v, want nil", err)
+	}
+
+	// 2. While in-flight, another reservation of 0.3 should fail (0.8 + 0.3 > 1.0)
+	_, err = grant.ReserveCostAt(now, 0.3)
+	if err != ErrDailyCostExceeded {
+		t.Fatalf("ReserveCostAt(0.3) while 0.8 in-flight = %v, want ErrDailyCostExceeded", err)
+	}
+
+	// 3. CheckCostBudgetAt also blocks when in-flight reaches budget
+	release2, err := grant.ReserveCostAt(now, 0.2)
+	if err != nil {
+		t.Fatalf("ReserveCostAt(0.2) = %v, want nil", err)
+	}
+	if err := grant.CheckCostBudgetAt(now); err != ErrDailyCostExceeded {
+		t.Fatalf("CheckCostBudgetAt while 1.0 in-flight = %v, want ErrDailyCostExceeded", err)
+	}
+
+	// 4. Request 2 fails with 0 cost -> release(0) completely refunds
+	release2(0)
+	if err := grant.CheckCostBudgetAt(now); err != nil {
+		t.Fatalf("CheckCostBudgetAt after release(0) = %v, want nil", err)
+	}
+
+	// 5. Request 1 realizes only 0.4 cost (less than 0.8 estimated)
+	release1(0.4)
+
+	// Now remaining budget is 1.0 - 0.4 = 0.6. Reserving 0.5 succeeds
+	release3, err := grant.ReserveCostAt(now, 0.5)
+	if err != nil {
+		t.Fatalf("ReserveCostAt(0.5) after realized 0.4 = %v, want nil", err)
+	}
+	release3(0.5)
+
+	// Total spent is now 0.4 + 0.5 = 0.9. Trying to reserve 0.2 should fail
+	_, err = grant.ReserveCostAt(now, 0.2)
+	if err != ErrDailyCostExceeded {
+		t.Fatalf("ReserveCostAt(0.2) after spent 0.9 = %v, want ErrDailyCostExceeded", err)
+	}
+}
+
