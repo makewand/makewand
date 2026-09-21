@@ -188,7 +188,8 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
     is_at_prompt = (
         ("? for shortcuts" in text and ("Gemini" in text or "esc to cancel" not in text)) or
         ("Keyboard: ↑/↓ Navigate" in text and "Switch Tab" in text) or
-        (("> Ask Codex to do anything" in text or "» Ask Codex to do anything" in text or "› Ask Codex to do anything" in text))
+        (("> Ask Codex to do anything" in text or "» Ask Codex to do anything" in text or "› Ask Codex to do anything" in text)) or
+        ("Gemini" in text and ("\n>" in text or "\n >" in text or "artifacts" in text or "/artifact" in text))
     )
     is_actively_running = (
         "Waiting for background terminal" in text or
@@ -216,7 +217,7 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
 
     # 3. Check for hung anomaly in sample_project_1 (specifically pytest with exclusive lock held)
     if session_name == "sample_project_1":
-        if "running" in text and "bash scripts/ci/run_in_ephemer" in text and is_file_locked("/run/lock/sample_project_1-p920-heavy-postgres.lock"):
+        if "running" in text and "bash scripts/ci/run_in_ephemer" in text:
             return "hung_anomaly", "持续占用排他单槽锁或死锁挂起，需超时看门狗"
         if "1 task(s)" in text and "task-" in text and "running" in text:
             if is_file_locked("/run/lock/sample_project_1-p920-heavy-postgres.lock"):
