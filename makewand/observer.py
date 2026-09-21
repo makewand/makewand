@@ -156,9 +156,9 @@ def get_session_long_running_process(session_name: str, threshold_seconds: int =
                 continue
             comm_lower = info["comm"].lower()
             args_lower = info["args"].lower()
-            if any(k in comm_lower for k in ("bash", "zsh", "sh", "tmux", "agy", "node", "codex")):
+            if any(k in comm_lower for k in ("bash", "zsh", "sh", "tmux", "agy", "node", "codex", "npm", "playwright")):
                 continue
-            if "bin/codex" in args_lower or "antigravity" in args_lower or "node_modules" in args_lower:
+            if "bin/codex" in args_lower or "antigravity" in args_lower or "node_modules" in args_lower or "mcp" in args_lower or "lsp" in args_lower:
                 continue
             if info["etimes"] >= threshold_seconds:
                 return {
@@ -177,25 +177,46 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
     - hung_anomaly (deadlock or stuck > 10m)
     - heavy_db_query (Postgres / SQL aggregation)
     - test_ci (pytest, npm test, unittest)
+    - data_pipeline (dataset snapshot, model training, feature extraction)
     - code_refactor (edit, write, read files)
     - sys_monitor (system status, disk, controllers)
     - idle_ready (waiting for user prompt)
     """
     text = " \n ".join(lines)
 
-    # 0. Check long running process first
+    # Check prompt and active running indicators
+    is_at_prompt = (
+        ("? for shortcuts" in text and ("Gemini" in text or "esc to cancel" not in text)) or
+        ("Keyboard: ↑/↓ Navigate" in text and "Switch Tab" in text) or
+        (("> Ask Codex to do anything" in text or "» Ask Codex to do anything" in text or "› Ask Codex to do anything" in text))
+    )
+    is_actively_running = (
+        "Waiting for background terminal" in text or
+        "Working (" in text or
+        ("running" in text and ("task(s)" in text or "● [" in text or "manage.py" in text))
+    )
+
+    # 1. If at prompt and not actively running background jobs, session is idle_ready
+    if is_at_prompt and not is_actively_running:
+        return "idle_ready", "任务已闭环，处于待命提示符状态"
+
+    # 2. Check long running process next
     if long_proc:
         elapsed_min = long_proc["etimes"] // 60
-        if "psycopg2" in long_proc["args"] or "postgres" in long_proc["args"] or "SELECT " in long_proc["args"]:
+        args_str = long_proc["args"]
+        if "psycopg2" in args_str or "postgres" in args_str or "SELECT " in args_str:
             return "heavy_db_query", f"执行大型 SQL 统计已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})，引发磁盘 AIO 争抢"
-        elif "pytest" in long_proc["args"] or "manage.py test" in long_proc["args"] or "test" in long_proc["args"]:
+        elif "pytest" in args_str or "manage.py test" in args_str or re.search(r"\b(test|tests|unittest|jest|vitest)\b", args_str):
             return "test_ci", f"运行测试套件已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
+        elif any(k in args_str for k in ("build_snapshot", "train", "dataset", "stage_and_phash", "preprocess", "download")) or \
+             (session_name == "sample_project_5" and ("python" in long_proc["comm"] or "build" in args_str)):
+            return "data_pipeline", f"大规模数据流水线/模型训练进行中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
         elif elapsed_min >= 30:
             return "hung_anomaly", f"子进程 (PID {long_proc['pid']}, {long_proc['comm']}) 持续运行达 {elapsed_min} 分钟"
 
-    # 1. Check for hung anomaly in sample_project_1 (specifically pytest with exclusive lock held)
+    # 3. Check for hung anomaly in sample_project_1 (specifically pytest with exclusive lock held)
     if session_name == "sample_project_1":
-        if "running" in text and "bash scripts/ci/run_in_ephemer" in text:
+        if "running" in text and "bash scripts/ci/run_in_ephemer" in text and is_file_locked("/run/lock/sample_project_1-p920-heavy-postgres.lock"):
             return "hung_anomaly", "持续占用排他单槽锁或死锁挂起，需超时看门狗"
         if "1 task(s)" in text and "task-" in text and "running" in text:
             if is_file_locked("/run/lock/sample_project_1-p920-heavy-postgres.lock"):
@@ -205,7 +226,7 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
     if session_name == "makewand" and ("observe" in text or "schedule" in text or "orchestrat" in text):
         return "sys_monitor", "跨会话定时巡检调度与中枢监控"
 
-    # 2. Heavy DB query storm
+    # 4. Heavy DB query storm
     if "task(s)" in text and re.search(r"(\d+)\s+task\(s\)", text):
         match = re.search(r"(\d+)\s+task\(s\)", text)
         if match and int(match.group(1)) >= 4:
@@ -214,22 +235,23 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
     if "psycopg2" in text or "SELECT " in text or "FROM measurements" in text:
         return "heavy_db_query", "执行大型关系库/大表数据聚合与统计"
 
-    # 3. Test & CI
-    if "pytest" in text or "npm test" in text or "npm run test" in text or "python manage.py test" in text:
+    # 5. Test & CI
+    if "pytest" in text or "npm test" in text or "npm run test" in text or "python manage.py test" in text or "test_feedback" in text:
         return "test_ci", "自动化单元与端到端测试验证中"
 
-    # 4. Code Refactor & Modification
+    # 6. Data pipeline
+    if "build_snapshot" in text or "train_hierarchical" in text or "run_big_v" in text:
+        return "data_pipeline", "大规模数据快照构建与训练批处理中"
+
+    # 7. Code Refactor & Modification
     if "Edit(" in text or "Write(" in text or "git commit" in text or "git merge" in text:
         return "code_refactor", "多文件代码改写、逻辑重构与 Git 状态收敛"
 
-    # 5. Idle / Ready
-    if ("? for shortcuts" in text and ("Gemini" in text or "esc to cancel" not in text)) or \
-       ("Keyboard: ↑/↓ Navigate" in text and "Switch Tab" in text) or \
-       (("> Ask Codex to do anything" in text or "» Ask Codex to do anything" in text or "› Ask Codex to do anything" in text) and \
-        "Waiting for background terminal" not in text and "Working (" not in text):
+    # 8. Idle / Ready fallback
+    if is_at_prompt:
         return "idle_ready", "任务已闭环，处于待命提示符状态"
 
-    # 6. System Monitor & Diagnostics
+    # 9. System Monitor & Diagnostics
     if "磁盘" in text or "容量" in text or "调度控制器" in text or "轮巡" in text or "算力" in text:
         return "sys_monitor", "系统服务、存储水位与运行状态监控"
 
@@ -266,6 +288,17 @@ def analyze_makewand_optimizations(session_reports, metrics):
             "priority": "HIGH",
             "reason": f"当前主机 1 分钟平均负载达到 {metrics['load_1m']}，主要由大型 SQL 聚合与并发测试引起。",
             "proposal": "在 Makewand 流水线与沙箱运行器中，增加基于 load average 的动态背压保护：当系统负载超过 12 时，自动将并发任务数限制为 1~2。"
+        })
+
+    # Check for data pipeline sessions
+    data_pipeline_sessions = [s for s in session_reports if s["category"] == "data_pipeline"]
+    if data_pipeline_sessions and metrics["load_1m"] > 10:
+        names = ", ".join(s["name"] for s in data_pipeline_sessions)
+        optimizations.append({
+            "target": "计算密集型流水线 I/O 与 CPU 亲和调度 (Compute Pipeline Affinity)",
+            "priority": "MEDIUM",
+            "reason": f"会话 [{names}] 正在执行多小时级的大规模数据快照构建或模型训练。",
+            "proposal": "调度批处理数据作业时自动附加 ionice -c2 -n7 与 nice -n 10，避免长时间特征计算抢占交互式会话与测试 Runner 的响应能力。"
         })
 
     # Check for hung anomaly
@@ -362,6 +395,7 @@ def format_observation_markdown(report):
         "hung_anomaly": "🔴 异常卡死",
         "heavy_db_query": "🟡 高负荷",
         "test_ci": "🔵 测试中",
+        "data_pipeline": "🟣 数据流水线",
         "code_refactor": "🟣 代码重构",
         "sys_monitor": "🟢 监控待命",
         "idle_ready": "🟢 就绪空闲",

@@ -33,6 +33,16 @@ class TestObserver(unittest.TestCase):
         self.assertEqual(cat, "heavy_db_query")
         self.assertIn("60 分钟", note)
 
+        # 7. Data pipeline classification
+        pipeline_proc = {"pid": 1791793, "comm": "python3", "etimes": 14760, "args": "python3 build_snapshot.py --lane all"}
+        cat, note = classify_operation("sample_project_5", ["● [15:53:48] STOP_AFTER=2 ./run_big_v0021.sh running"], {"load_1m": 16.0}, long_proc=pipeline_proc)
+        self.assertEqual(cat, "data_pipeline")
+        self.assertIn("数据流水线", note)
+
+        # 8. Idle ready overrides background daemon
+        cat, note = classify_operation("sample_project_6", ["» Ask Codex to do anything", "Worked for 2h 2m 44s · done 1:35 PM"], {"load_1m": 16.0})
+        self.assertEqual(cat, "idle_ready")
+
     def test_analyze_makewand_optimizations(self):
         reports = [
             {"name": "sample_project_1", "category": "hung_anomaly", "status_note": "deadlock"},
@@ -41,6 +51,11 @@ class TestObserver(unittest.TestCase):
                 "category": "heavy_db_query",
                 "status_note": "heavy load",
                 "long_proc": {"pid": 594545, "comm": "python3", "etimes": 4800, "args": "psycopg2 query"}
+            },
+            {
+                "name": "sample_project_5",
+                "category": "data_pipeline",
+                "status_note": "pipeline running"
             }
         ]
         metrics = {"load_1m": 22.0}
@@ -48,6 +63,7 @@ class TestObserver(unittest.TestCase):
         self.assertTrue(any(o["priority"] == "CRITICAL" for o in opts))
         self.assertTrue(any("背压" in o["proposal"] or "限流" in o["target"] for o in opts))
         self.assertTrue(any("数据库查询" in o["target"] for o in opts))
+        self.assertTrue(any("亲和调度" in o["target"] for o in opts))
 
 if __name__ == "__main__":
     unittest.main()
