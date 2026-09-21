@@ -81,6 +81,92 @@ def get_active_tmux_sessions():
         pass
     return sessions
 
+def get_external_ai_sessions():
+    """
+    Discover active AI CLI sessions (Codex, Claude, AGY) running on external terminals
+    outside of tmux (e.g. direct SSH or desktop terminal pts/...).
+    """
+    external_sessions = []
+    tmux_ttys = set()
+    try:
+        out = subprocess.check_output(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_tty}"],
+            stderr=subprocess.DEVNULL,
+            timeout=1
+        ).decode("utf-8")
+        for line in out.strip().splitlines():
+            t = line.strip()
+            if t:
+                if t.startswith("/dev/"):
+                    t = t[5:]
+                tmux_ttys.add(t)
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid,ppid,tty,etime,comm,args"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode("utf-8", errors="replace")
+        sessions_by_tty = {}
+        my_pid = os.getpid()
+
+        for line in out.strip().splitlines()[1:]:
+            parts = line.strip().split(None, 5)
+            if len(parts) < 6:
+                continue
+            pid_s, ppid_s, tty, etime, comm, args = parts
+            if not pid_s.isdigit():
+                continue
+            pid = int(pid_s)
+            if pid == my_pid:
+                continue
+            if tty in ("?", "-", "") or tty in tmux_ttys:
+                continue
+
+            comm_lower = comm.lower()
+            args_lower = args.lower()
+
+            ai_type = None
+            if "codex" in comm_lower or "bin/codex" in args_lower or "@openai/codex" in args_lower:
+                ai_type = "codex"
+            elif "claude" in comm_lower or "bin/claude" in args_lower or "@anthropic/claude" in args_lower:
+                ai_type = "claude"
+            elif "agy" in comm_lower or "antigravity" in comm_lower:
+                ai_type = "agy"
+
+            if not ai_type:
+                continue
+
+            cwd = "unknown"
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except Exception:
+                pass
+
+            if tty not in sessions_by_tty:
+                sessions_by_tty[tty] = {
+                    "tty": tty,
+                    "pid": pid,
+                    "cwd": cwd,
+                    "ai_type": ai_type,
+                    "etime": etime,
+                    "comm": comm,
+                    "args": args[:120]
+                }
+            else:
+                if "node" not in comm and "codex-code-mode" not in comm:
+                    sessions_by_tty[tty]["comm"] = comm
+                    sessions_by_tty[tty]["pid"] = pid
+
+        for tty, info in sorted(sessions_by_tty.items()):
+            external_sessions.append(info)
+    except Exception:
+        pass
+
+    return external_sessions
+
 def capture_session_pane(session_name, lines_count=25):
     """Capture the visible text from the tmux session's pane."""
     try:
@@ -258,7 +344,7 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
 
     return "general_task", "常规任务探索与执行中"
 
-def analyze_makewand_optimizations(session_reports, metrics):
+def analyze_makewand_optimizations(session_reports, metrics, external_sessions=None):
     """Derive global optimization recommendations for Makewand based on observed session patterns."""
     optimizations = []
 
@@ -324,6 +410,16 @@ def analyze_makewand_optimizations(session_reports, metrics):
             "proposal": "可针对重构瓶颈直接调用 `makewand review` 或 `makewand race` 派发独立工作树比拼，利用 Codex (gpt-6-astra) 的算法能力加速单测攻坚与边界排查。"
         })
 
+    # Check for active external sessions
+    if external_sessions:
+        ext_cwds = {e["cwd"] for e in external_sessions if e.get("cwd") and e["cwd"] != "unknown"}
+        optimizations.append({
+            "target": "多 Session 目录隔离防踩踏守卫 (Session Isolation Guard)",
+            "priority": "LOW",
+            "reason": f"检测到宿主机存在 {len(external_sessions)} 个外部独立终端正在操作工作目录 ({', '.join(sorted(ext_cwds))})。",
+            "proposal": "Makewand 派发流水线与沙箱竞速时已启用工作树防冲突探测，避免跨终端踩踏。"
+        })
+
     # Standard healthy check
     if not optimizations:
         optimizations.append({
@@ -342,6 +438,7 @@ def observe_all_dialogs(save_report=True):
     """
     metrics = get_system_metrics()
     active_sessions = get_active_tmux_sessions()
+    external_sessions = get_external_ai_sessions()
 
     session_reports = []
     for s in active_sessions:
@@ -358,7 +455,7 @@ def observe_all_dialogs(save_report=True):
             "sample_lines": lines[-5:] if lines else []
         })
 
-    optimizations = analyze_makewand_optimizations(session_reports, metrics)
+    optimizations = analyze_makewand_optimizations(session_reports, metrics, external_sessions=external_sessions)
 
     report = {
         "timestamp": datetime.now().isoformat(),
@@ -366,6 +463,8 @@ def observe_all_dialogs(save_report=True):
         "metrics": metrics,
         "session_count": len(session_reports),
         "sessions": session_reports,
+        "external_sessions": external_sessions,
+        "external_count": len(external_sessions),
         "makewand_optimizations": optimizations
     }
 
@@ -406,6 +505,15 @@ def format_observation_markdown(report):
     for s in report["sessions"]:
         icon = status_icons.get(s["category"], "⚪")
         lines.append(f"| `{s['name']}` | `{s['cwd']}` | **{s['category']}** | {s['status_note']} | {icon} |")
+
+    if report.get("external_sessions"):
+        lines.append("")
+        lines.append("### 🖥️ 外部独立终端活跃 AI 交互会话 (External Sessions)")
+        lines.append("")
+        lines.append("| 终端 TTY | AI 引擎 | 进程 PID | 当前工作目录 (Active Workspace) | 运行耗时 | 状态 |")
+        lines.append("|---|---|---|---|---|:---:|")
+        for ext in report["external_sessions"]:
+            lines.append(f"| `{ext['tty']}` | **{ext['ai_type']}** | `{ext['pid']}` | `{ext['cwd']}` | {ext['etime']} | 🟢 活跃交互 |")
 
     lines.append("")
     lines.append("#### 🛠️ Makewand 针对性优化研判与建议：")

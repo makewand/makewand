@@ -105,27 +105,30 @@ def run_in_sandbox(
     Enforces fail-closed security: refuses execution if bwrap is missing unless
     explicitly overridden by MAKEWAND_UNSAFE_HOST_EXEC=1.
     """
+    exec_cmd = cmd
     if is_bwrap_available():
-        wrapped = wrap_bwrap(cmd, workspace=workspace, allow_network=allow_network, readonly=readonly)
-        return run_subprocess(
-            wrapped,
-            timeout=timeout,
-            cwd=workspace,
-            stream=stream,
-            print_prefix=print_prefix
-        )
-    else:
-        if os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") == "1":
-            return run_subprocess(
-                cmd,
-                timeout=timeout,
-                cwd=workspace,
-                stream=stream,
-                print_prefix=print_prefix
-            )
+        exec_cmd = wrap_bwrap(cmd, workspace=workspace, allow_network=allow_network, readonly=readonly)
+    elif os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
         return (
             -1,
             "",
             "Bubblewrap (bwrap) sandbox is not available and MAKEWAND_UNSAFE_HOST_EXEC is not set. Execution blocked for security.",
             "SandboxUnavailable"
         )
+
+    # Dynamic backpressure: when host load is elevated, deprioritize background sandbox task
+    try:
+        if os.getloadavg()[0] > 10.0:
+            nice_bin = shutil.which("nice")
+            if nice_bin:
+                exec_cmd = [nice_bin, "-n", "10"] + exec_cmd
+    except Exception:
+        pass
+
+    return run_subprocess(
+        exec_cmd,
+        timeout=timeout,
+        cwd=workspace,
+        stream=stream,
+        print_prefix=print_prefix
+    )

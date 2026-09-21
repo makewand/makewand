@@ -44,5 +44,29 @@ class TestGitHelper(unittest.TestCase):
         self.assertFalse(ensure_git_worktree("/"))
         self.assertFalse(ensure_git_worktree("/tmp"))
 
+    def test_check_working_tree_isolation(self):
+        from unittest.mock import patch
+        from makewand.git_helper import check_working_tree_isolation
+
+        fake_active = {
+            "/path/to/workspace/dev/sample_project_3": {
+                "source": "external_terminal",
+                "tty": "pts/36",
+                "pid": 12345,
+                "ai_type": "codex",
+                "cwd": "/path/to/workspace/dev/sample_project_3"
+            }
+        }
+        with patch("makewand.git_helper.get_active_interactive_working_trees", return_value=fake_active):
+            # Target is conflicting with active session
+            safe, msg = check_working_tree_isolation("/path/to/workspace/dev/sample_project_3")
+            self.assertFalse(safe)
+            self.assertIn("pts/36", msg)
+
+            # Target is safe
+            safe, msg = check_working_tree_isolation("/tmp/safe_isolated_dir")
+            self.assertTrue(safe)
+            self.assertIsNone(msg)
+
 if __name__ == "__main__":
     unittest.main()

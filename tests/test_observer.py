@@ -59,11 +59,44 @@ class TestObserver(unittest.TestCase):
             }
         ]
         metrics = {"load_1m": 22.0}
-        opts = analyze_makewand_optimizations(reports, metrics)
+        ext_sessions = [
+            {"tty": "pts/36", "ai_type": "codex", "pid": 3867843, "cwd": "/path/to/workspace/dev/sample_project_3", "etime": "10:00"}
+        ]
+        opts = analyze_makewand_optimizations(reports, metrics, external_sessions=ext_sessions)
         self.assertTrue(any(o["priority"] == "CRITICAL" for o in opts))
         self.assertTrue(any("背压" in o["proposal"] or "限流" in o["target"] for o in opts))
         self.assertTrue(any("数据库查询" in o["target"] for o in opts))
         self.assertTrue(any("亲和调度" in o["target"] for o in opts))
+        self.assertTrue(any("防踩踏守卫" in o["target"] for o in opts))
+
+    def test_get_external_ai_sessions(self):
+        from unittest.mock import patch
+        from makewand.observer import get_external_ai_sessions
+
+        fake_tmux_out = b"pts/1\npts/2\n"
+        fake_ps_out = (
+            b"  PID  PPID TT       ETIME COMMAND ARGS\n"
+            b" 1001   500 pts/1    00:10 agy     agy\n"
+            b" 2002   600 pts/36   00:20 codex   /path/to/workspace/bin/codex\n"
+            b" 3003   700 pts/38   00:05 claude  /usr/bin/claude\n"
+        )
+
+        with patch("subprocess.check_output") as mock_run, \
+             patch("os.readlink", return_value="/tmp/test_ws"):
+            def check_output_side_effect(cmd, **kwargs):
+                if cmd[0] == "tmux":
+                    return fake_tmux_out
+                elif cmd[0] == "ps":
+                    return fake_ps_out
+                return b""
+
+            mock_run.side_effect = check_output_side_effect
+            ext = get_external_ai_sessions()
+            self.assertEqual(len(ext), 2)
+            ttys = {e["tty"] for e in ext}
+            self.assertIn("pts/36", ttys)
+            self.assertIn("pts/38", ttys)
+            self.assertNotIn("pts/1", ttys)
 
 if __name__ == "__main__":
     unittest.main()

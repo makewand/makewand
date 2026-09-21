@@ -374,7 +374,18 @@ def dispatch_task(
         return False, None, f"未知或不支持的模型引擎: {engine}"
 
     if isinstance(res, (tuple, list)) and len(res) == 3:
+        try:
+            from makewand.usage import record_engine_usage
+            record_engine_usage(engine, tier=tier, success=res[0], task=prompt)
+        except Exception:
+            pass
         return res[0], res[1], res[2]
+
+    try:
+        from makewand.usage import record_engine_usage
+        record_engine_usage(engine, tier=tier, success=True, task=prompt)
+    except Exception:
+        pass
     return True, (str(res) if res is not None else "LGTM"), None
 
 def select_optimal_engine_pair(
@@ -452,7 +463,20 @@ def select_optimal_engine_pair(
     elif tier == "fast":
         scores["claude"] += 0.8
 
-    # 2. Quota Health Filter
+    # 2. Sliding Window Quota Burn-Rate Adjustment
+    try:
+        from makewand.usage import get_burn_rate_penalty
+        for model_name in list(scores.keys()):
+            if scores[model_name] > 0:
+                pen, pen_reason = get_burn_rate_penalty(model_name)
+                if pen != 0.0:
+                    scores[model_name] += pen
+                    if pen_reason:
+                        reasons.append(pen_reason)
+    except Exception:
+        pass
+
+    # 3. Quota Health Filter
     for model_name in list(scores.keys()):
         status = cache.get(model_name, {}).get("status", "unknown")
         if status == "limited":
@@ -530,6 +554,17 @@ def run_pipeline(
         print(c("💡 Makewand 意图识别: 身份/能力问答 (无需执行代码修改或程序检查)", COLOR_BOLD + COLOR_GREEN))
         print(get_identity_message())
         return True
+
+    # Check multi-session working tree isolation guard for engineering tasks
+    if intent not in ("identity", "explain"):
+        try:
+            from makewand.git_helper import check_working_tree_isolation
+            is_safe, conflict_msg = check_working_tree_isolation(cwd)
+            if not is_safe:
+                print(c(f"🛡️ [Makewand Multi-Session Guard] {conflict_msg}！", COLOR_YELLOW + COLOR_BOLD))
+                print(c("   已依从 P920 隔离铁律防护，避免并发踩踏。", COLOR_YELLOW))
+        except Exception:
+            pass
 
     if intent == "explain":
         print(c(f"💡 Makewand 意图识别: 技术问答/解释模式 '{prompt}' (推理档位: {tier}, 只读安全隔离)", COLOR_BOLD + COLOR_GREEN))

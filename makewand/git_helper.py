@@ -81,3 +81,58 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
     run_git_cmd("git init && git config user.name 'Makewand' && git config user.email 'makewand@local'", cwd=str(target_dir))
     run_git_cmd("git add -A", cwd=str(target_dir))
     run_git_cmd("git commit -m 'Makewand isolated baseline' --allow-empty", cwd=str(target_dir))
+
+def get_active_interactive_working_trees():
+    """
+    Returns a mapping of canonical working directory paths to session details
+    for all active interactive AI sessions (tmux panes + external terminals).
+    """
+    active_trees = {}
+    try:
+        from makewand.observer import get_external_ai_sessions, get_active_tmux_sessions, get_session_cwd
+        # 1. Tmux sessions
+        for s in get_active_tmux_sessions():
+            cwd = get_session_cwd(s)
+            if cwd and os.path.exists(cwd):
+                canon = str(Path(cwd).resolve())
+                active_trees[canon] = {
+                    "source": "tmux",
+                    "session_name": s,
+                    "cwd": canon
+                }
+
+        # 2. External AI sessions
+        for ext in get_external_ai_sessions():
+            cwd = ext.get("cwd")
+            if cwd and os.path.exists(cwd):
+                canon = str(Path(cwd).resolve())
+                if canon not in active_trees:
+                    active_trees[canon] = {
+                        "source": "external_terminal",
+                        "tty": ext.get("tty"),
+                        "pid": ext.get("pid"),
+                        "ai_type": ext.get("ai_type"),
+                        "cwd": canon
+                    }
+    except Exception:
+        pass
+    return active_trees
+
+def check_working_tree_isolation(target_dir: str):
+    """
+    Checks if target_dir overlaps with any active interactive AI session.
+    Returns (is_safe, conflict_warning_message).
+    """
+    if not target_dir:
+        return True, None
+    try:
+        target_path = Path(target_dir).resolve()
+        active = get_active_interactive_working_trees()
+        for active_cwd, info in active.items():
+            active_path = Path(active_cwd).resolve()
+            if target_path == active_path or active_path in target_path.parents:
+                src_desc = f"tmux 会话 [{info['session_name']}]" if info.get("source") == "tmux" else f"外部独立终端 [{info.get('tty')} · PID {info.get('pid')} · {info.get('ai_type')}]"
+                return False, f"工作区 {target_dir} 正由活跃交互会话 ({src_desc}) 操作中"
+    except Exception:
+        pass
+    return True, None

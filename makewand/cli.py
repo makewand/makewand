@@ -92,6 +92,28 @@ def cmd_status(args):
         print("  使用 'makewand probe' 刷新当前实时健康度。")
     print()
 
+    # Sliding window usage and burn-rate status
+    try:
+        from makewand.usage import get_engine_usage_stats, get_burn_rate_penalty
+        u_4h = get_engine_usage_stats(window_hours=4.0)
+        u_24h = get_engine_usage_stats(window_hours=24.0)
+        u_7d = get_engine_usage_stats(window_hours=168.0)
+        print(c("--- 本地滑动窗口用量与削峰保护看板 ---", COLOR_BOLD))
+        print(f"{'模型订阅':<12} {'4h 调用':<10} {'24h 调用':<10} {'7d 调用':<10} {'削峰保护策略'}")
+        for eng in ["claude", "codex", "agy", "muse"]:
+            c4 = u_4h.get(eng, {}).get("total", 0)
+            c24 = u_24h.get(eng, {}).get("total", 0)
+            c7d = u_7d.get(eng, {}).get("total", 0)
+            pen, reason = get_burn_rate_penalty(eng)
+            if pen == 0.0:
+                status_desc = c("🟢 额度健康平稳", COLOR_GREEN)
+            else:
+                status_desc = c(f"🟡 {reason}", COLOR_YELLOW)
+            print(f"{eng:<12} {c4:<10} {c24:<10} {c7d:<10} {status_desc}")
+        print()
+    except Exception:
+        pass
+
 def cmd_models(args):
     print(c("\n============================================================", COLOR_BOLD))
     print(c("       Makewand 多模型生态与动态发现矩阵 (Model Discovery)", COLOR_BOLD + COLOR_CYAN))
