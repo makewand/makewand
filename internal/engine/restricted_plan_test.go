@@ -29,8 +29,8 @@ func TestRunRestrictedPlan_FailsClosedWithoutIsolation(t *testing.T) {
 	if !strings.Contains(err.Error(), "MAKEWAND_UNSAFE_HOST_EXEC") {
 		t.Fatalf("error = %q, want unsafe opt-in hint", err.Error())
 	}
-	if RestrictedExecAutoApprovable() {
-		t.Fatal("RestrictedExecAutoApprovable() = true, want false without isolation")
+	if RestrictedExecAutoApprovable(UnsafeHostExecAuthorization{}) {
+		t.Fatal("RestrictedExecAutoApprovable(UnsafeHostExecAuthorization{}) = true, want false without isolation")
 	}
 }
 

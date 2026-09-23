@@ -1,125 +1,59 @@
 #!/usr/bin/env bash
+# Makewand System-wide Installer & Symlink Setup
 set -euo pipefail
 
-REPO="${MAKEWAND_REPO:-makewand/makewand}"
-VERSION="${MAKEWAND_VERSION:-latest}"
-INSTALL_DIR="${MAKEWAND_INSTALL_DIR:-$HOME/.local/bin}"
+BIN_DIR="$HOME/.local/bin"
+SKILLS_DIR="$HOME/.gemini/config/skills"
+REPO_URL="https://github.com/makewand/makewand.git"
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "missing required command: $1" >&2
-    exit 1
-  }
-}
-
-need_cmd curl
-need_cmd uname
-
-detect_os() {
-  case "$(uname -s)" in
-    Linux) echo "linux" ;;
-    Darwin) echo "darwin" ;;
-    *)
-      echo "unsupported OS: $(uname -s)" >&2
-      exit 1
-      ;;
-  esac
-}
-
-detect_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
-    arm64|aarch64) echo "arm64" ;;
-    *)
-      echo "unsupported architecture: $(uname -m)" >&2
-      exit 1
-      ;;
-  esac
-}
-
-resolve_tag() {
-  if [ "$VERSION" != "latest" ]; then
-    echo "$VERSION"
-    return
-  fi
-  curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n 1
-}
-
-TAG="$(resolve_tag)"
-if [ -z "$TAG" ]; then
-  echo "failed to resolve release tag for ${REPO}" >&2
-  exit 1
+# Detect if running from a local checkout or piped via curl ... | bash
+IS_LOCAL=0
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    CANDIDATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    if [ -f "$CANDIDATE_DIR/bin/makewand" ]; then
+        SCRIPT_DIR="$CANDIDATE_DIR"
+        IS_LOCAL=1
+    fi
 fi
 
-OS="$(detect_os)"
-ARCH="$(detect_arch)"
-
-EXT="tar.gz"
-if [ "$OS" = "windows" ]; then
-  EXT="zip"
+if [ "$IS_LOCAL" -eq 0 ]; then
+    INSTALL_ROOT="$HOME/.local/share/makewand"
+    echo "=== Downloading / Updating Makewand from repository ==="
+    mkdir -p "$(dirname "$INSTALL_ROOT")"
+    if [ -d "$INSTALL_ROOT/.git" ]; then
+        echo "Updating existing clone in $INSTALL_ROOT..."
+        git -C "$INSTALL_ROOT" pull --ff-only 2>/dev/null || true
+    else
+        echo "Cloning Makewand into $INSTALL_ROOT..."
+        git clone "$REPO_URL" "$INSTALL_ROOT"
+    fi
+    SCRIPT_DIR="$INSTALL_ROOT"
 fi
 
-ASSET="makewand_${TAG}_${OS}_${ARCH}.${EXT}"
-URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${TAG}/checksums.txt"
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+echo "=== Installing Makewand (v3.0.0) ==="
+mkdir -p "$BIN_DIR"
 
-echo "Downloading ${URL}"
-curl -fL "$URL" -o "${TMP_DIR}/${ASSET}"
+# 1. Install makewand executable
+TARGET_BIN="$BIN_DIR/makewand"
+echo "Installing $TARGET_BIN -> $SCRIPT_DIR/bin/makewand"
+ln -sf "$SCRIPT_DIR/bin/makewand" "$TARGET_BIN"
+chmod +x "$TARGET_BIN"
+chmod +x "$SCRIPT_DIR/bin/makewand"
 
-echo "Downloading ${CHECKSUMS_URL}"
-curl -fL "${CHECKSUMS_URL}" -o "${TMP_DIR}/checksums.txt"
+# 2. Maintain backwards compatibility with trio command
+TRIO_BIN="$BIN_DIR/trio"
+echo "Creating compatibility symlink $TRIO_BIN -> $TARGET_BIN"
+ln -sf "$TARGET_BIN" "$TRIO_BIN"
 
-verify_asset_checksum() {
-  local expected actual
-  expected="$(awk -v f="${ASSET}" '$2 == f {print $1}' "${TMP_DIR}/checksums.txt" | head -n 1)"
-  if [ -z "${expected}" ]; then
-    echo "checksum entry not found for ${ASSET}" >&2
-    exit 1
-  fi
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "${TMP_DIR}/${ASSET}" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "${TMP_DIR}/${ASSET}" | awk '{print $1}')"
-  else
-    echo "missing required command: sha256sum (or shasum)" >&2
-    exit 1
-  fi
-
-  if [ "${actual}" != "${expected}" ]; then
-    echo "checksum verification failed for ${ASSET}" >&2
-    echo "expected: ${expected}" >&2
-    echo "actual:   ${actual}" >&2
-    exit 1
-  fi
-  echo "Checksum verified: ${ASSET}"
-}
-
-verify_asset_checksum
-
-mkdir -p "$INSTALL_DIR"
-
-if [ "$EXT" = "zip" ]; then
-  need_cmd unzip
-  unzip -q "${TMP_DIR}/${ASSET}" -d "${TMP_DIR}"
-else
-  tar -xzf "${TMP_DIR}/${ASSET}" -C "${TMP_DIR}"
+# 3. Install Makewand global skill for Antigravity & AI agents
+echo "Installing AI Skills..."
+if [ -d "$SCRIPT_DIR/skills/makewand-orchestrator" ]; then
+    mkdir -p "$SKILLS_DIR/makewand-orchestrator"
+    cp -r "$SCRIPT_DIR/skills/makewand-orchestrator/"* "$SKILLS_DIR/makewand-orchestrator/"
+    mkdir -p "$SKILLS_DIR/trio-orchestrator"
+    cp -r "$SCRIPT_DIR/skills/makewand-orchestrator/"* "$SKILLS_DIR/trio-orchestrator/"
 fi
 
-BIN_PATH="$(find "${TMP_DIR}" -type f -name 'makewand' | head -n 1 || true)"
-if [ -z "$BIN_PATH" ]; then
-  BIN_PATH="$(find "${TMP_DIR}" -type f -name 'makewand.exe' | head -n 1 || true)"
-fi
-if [ -z "$BIN_PATH" ]; then
-  echo "failed to locate makewand binary in archive" >&2
-  exit 1
-fi
-
-install -m 0755 "$BIN_PATH" "${INSTALL_DIR}/makewand"
-
-echo "Installed makewand to ${INSTALL_DIR}/makewand"
-echo "Run: makewand --version"
+echo "=== Installation Complete ==="
+echo "You can now run 'makewand status' or 'makewand run <prompt>' from any directory."
+echo "Backward-compatible 'trio' command is also linked to 'makewand'."

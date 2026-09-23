@@ -1,7 +1,6 @@
 package model
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -161,12 +160,14 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 		return nil, err
 	}
 
-	// Populate the first snapshot once, off the startup path (the Claude source
-	// makes a network call). This is a one-shot goroutine that terminates — no
-	// long-lived ticker — so repeated NewRouter calls (e.g. eval/bench loops)
-	// don't leak background refreshers. Long-running servers that want periodic
-	// refresh call snap.Start(ctx) with a cancellable context of their own.
-	go snap.Refresh(context.Background())
+	// Warm the first snapshot from the shared on-disk cache — synchronous and
+	// network-free — so the very first request routes on the last known headroom
+	// instead of a blank snapshot. Construction owns no background goroutine and
+	// makes no network call, so repeated NewRouter calls (eval/bench loops,
+	// per-request adapters) neither leak refreshers nor block on source I/O.
+	// Long-running entrypoints keep it fresh by calling r.StartQuotaRefresh(ctx)
+	// with a context of their own (see serve and tui.Run).
+	snap.LoadCache()
 
 	// Apply explicit access type overrides from config (may override subscription defaults).
 	if cfg.ClaudeAccess != "" {

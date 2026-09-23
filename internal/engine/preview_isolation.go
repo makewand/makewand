@@ -15,7 +15,7 @@ var (
 	previewUserHome      = os.UserHomeDir
 	previewGetenv        = os.Getenv
 	previewBwrapSelfTest = func(bwrapPath string) error {
-		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "true")
+		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "--unshare-pid", "true")
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil
@@ -51,23 +51,35 @@ var previewSensitiveHomeEntries = []string{
 
 // wrapPreviewProjectCommand wraps project-defined preview scripts in an isolated
 // runtime. By default this requires bubblewrap on Linux. Users can explicitly
-// bypass this with MAKEWAND_UNSAFE_HOST_EXEC=1.
-func wrapPreviewProjectCommand(projectPath, command string, args []string) (string, []string, error) {
-	if previewUnsafe() {
+// bypass this with MAKEWAND_UNSAFE_HOST_EXEC=1 once the one-time host execution
+// acknowledgment carried by auth has been completed; the environment variable
+// alone never enables host execution.
+func wrapPreviewProjectCommand(projectPath, command string, args []string, auth UnsafeHostExecAuthorization) (string, []string, error) {
+	unsafeRequested := previewUnsafe()
+	if unsafeRequested && auth.Acknowledged {
+		auth.audit(UnsafeHostExecEvent{
+			Context: "preview",
+			Command: command,
+			Args:    append([]string(nil), args...),
+			Dir:     projectPath,
+		})
 		return command, args, nil
 	}
 	if previewGOOS != "linux" {
-		return "", nil, fmt.Errorf("project script preview requires sandbox isolation on %s; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)", previewGOOS)
+		return "", nil, fmt.Errorf("project script preview requires sandbox isolation on %s; %s", previewGOOS, unsafeBypassHint(unsafeRequested))
 	}
 
 	bwrapPath, err := previewLookPath("bwrap")
 	if err != nil {
-		return "", nil, fmt.Errorf("project script preview requires bubblewrap (bwrap); install bwrap or set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)")
+		return "", nil, fmt.Errorf("project script preview requires bubblewrap (bwrap); install bwrap or %s", unsafeBypassHint(unsafeRequested))
 	}
 	if err := previewBwrapSelfTest(bwrapPath); err != nil {
 		msg := strings.TrimSpace(err.Error())
-		if !strings.Contains(msg, "MAKEWAND_UNSAFE_HOST_EXEC=1") {
-			msg += "; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)"
+		if unsafeRequested {
+			msg = strings.ReplaceAll(msg, "set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)", unsafeBypassHint(true))
+		}
+		if !strings.Contains(msg, "MAKEWAND_UNSAFE_HOST_EXEC") {
+			msg += "; " + unsafeBypassHint(unsafeRequested)
 		}
 		return "", nil, fmt.Errorf("%s", msg)
 	}
@@ -80,15 +92,19 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string) (stri
 	wrapped := []string{
 		"--die-with-parent",
 		"--new-session",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
 		// Root first; fresh /proc and /dev afterwards so they overlay the
 		// read-only root instead of being shadowed by it (a shadowed /dev makes
 		// /dev/null read-only and breaks most tooling).
 		"--ro-bind", "/", "/",
 		"--proc", "/proc",
 		"--dev", "/dev",
+		// tmpfs /tmp before projectPath bind so temp-dir previews stay writable and don't shadow projectPath
+		"--tmpfs", "/tmp",
 		"--bind", projectPath, projectPath,
 		"--chdir", projectPath,
-		"--tmpfs", "/tmp",
 		"--clearenv",
 		"--setenv", "PATH", pathEnv,
 		"--setenv", "HOME", "/tmp",

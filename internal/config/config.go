@@ -44,7 +44,18 @@ type Config struct {
 	Theme        string `json:"theme,omitempty"`         // "dark" or "light"
 	ApprovalMode string `json:"approval_mode,omitempty"` // "manual", "safe", or "autopilot"
 
-	// Cost tracking
+	// One-time acknowledgment that MAKEWAND_UNSAFE_HOST_EXEC=1 may run
+	// AI-generated commands directly on the host. The version is bumped whenever
+	// the risk statement changes, forcing re-acknowledgment; the hostname binds
+	// the acknowledgment to this machine so a copied config does not carry it.
+	UnsafeHostExecAckVersion int    `json:"unsafe_host_exec_ack_version,omitempty"`
+	UnsafeHostExecAckAt      string `json:"unsafe_host_exec_ack_at,omitempty"` // RFC3339
+	UnsafeHostExecAckHost    string `json:"unsafe_host_exec_ack_host,omitempty"`
+
+	// Cost tracking. MonthlyBudget is measured against month-to-date pay-as-you-go
+	// spend tracked in a persistent ledger (internal/tui MonthlyLedger) that
+	// survives /clear, new sessions, and restarts, and rolls over each calendar
+	// month. The session cost panel is separate and remains per-conversation.
 	MonthlyBudget float64 `json:"monthly_budget,omitempty"`
 	TotalSpent    float64 `json:"total_spent,omitempty"`
 
@@ -93,6 +104,12 @@ const (
 	UsageModeBalanced = "balanced"
 	UsageModePower    = "power"
 	DefaultUsageMode  = UsageModeBalanced
+
+	// UnsafeHostExecAckCurrentVersion is the version of the unsafe host
+	// execution risk statement. Bump it whenever the statement (or the security
+	// model behind it) changes materially; stored acknowledgments with an older
+	// version become invalid and the user must re-acknowledge.
+	UnsafeHostExecAckCurrentVersion = 1
 )
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -135,6 +152,60 @@ func NormalizeApprovalMode(mode string) string {
 	default:
 		return ApprovalModeManual
 	}
+}
+
+// ParseApprovalMode strictly parses a user-supplied approval mode. Unlike
+// NormalizeApprovalMode (which migrates legacy/unknown config values to manual)
+// it rejects anything that is not exactly manual, safe, or autopilot, so CLI
+// flag validation can surface typos instead of silently degrading to manual.
+func ParseApprovalMode(mode string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case ApprovalModeManual:
+		return ApprovalModeManual, true
+	case ApprovalModeSafe:
+		return ApprovalModeSafe, true
+	case ApprovalModeAuto:
+		return ApprovalModeAuto, true
+	default:
+		return "", false
+	}
+}
+
+// ackHostname is a test seam for os.Hostname.
+var ackHostname = os.Hostname
+
+// UnsafeHostExecAckValid reports whether this config carries a valid one-time
+// acknowledgment for MAKEWAND_UNSAFE_HOST_EXEC host execution: the recorded
+// version must be at least the current risk-statement version and the recorded
+// hostname must match this machine. Any error resolving the local hostname
+// invalidates the acknowledgment (fail closed).
+func (c *Config) UnsafeHostExecAckValid() bool {
+	if c == nil || c.UnsafeHostExecAckVersion < UnsafeHostExecAckCurrentVersion {
+		return false
+	}
+	if strings.TrimSpace(c.UnsafeHostExecAckHost) == "" {
+		return false
+	}
+	host, err := ackHostname()
+	if err != nil {
+		return false
+	}
+	return c.UnsafeHostExecAckHost == host
+}
+
+// RecordUnsafeHostExecAck stamps the current acknowledgment version, time, and
+// hostname onto the config. It returns an error when the local hostname cannot
+// be resolved, because an acknowledgment that cannot be bound to this machine
+// would validate on any machine the config is copied to.
+func (c *Config) RecordUnsafeHostExecAck(now time.Time) error {
+	host, err := ackHostname()
+	if err != nil {
+		return fmt.Errorf("resolve hostname for unsafe host exec acknowledgment: %w", err)
+	}
+	c.UnsafeHostExecAckVersion = UnsafeHostExecAckCurrentVersion
+	c.UnsafeHostExecAckAt = now.UTC().Format(time.RFC3339)
+	c.UnsafeHostExecAckHost = host
+	return nil
 }
 
 // ConfigDir returns the path to the config directory.

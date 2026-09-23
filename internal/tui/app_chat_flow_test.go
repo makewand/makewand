@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/makewand/makewand/internal/config"
@@ -63,6 +64,32 @@ func TestHandleAIResponse_ErrorRecordsKnownUsage(t *testing.T) {
 	input, output := app.cost.TokensByProvider("ensemble")
 	if input != 30 || output != 3 || app.cost.SessionTotal() != 3.75 {
 		t.Fatalf("recorded error usage = input %d output %d cost %.2f", input, output, app.cost.SessionTotal())
+	}
+}
+
+// TestHandleAIResponse_SuccessAccruesMonthlyBudget guards the R4 wiring fix: a
+// normal (non-error) response with a pay-as-you-go cost must accrue to the
+// month-to-date budget ledger, not just the session panel.
+func TestHandleAIResponse_SuccessAccruesMonthlyBudget(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.monthly = LoadMonthlyLedger("") // isolated, in-memory
+	resp := aiResponseMsg{
+		provider:     "ensemble",
+		content:      "done",
+		cost:         2.50,
+		inputTokens:  10,
+		outputTokens: 5,
+	}
+
+	updated, _ := app.Update(resp)
+	app = updated.(App)
+
+	if got := app.cost.SessionTotal(); got != 2.50 {
+		t.Fatalf("session total = %.2f, want 2.50", got)
+	}
+	if got := app.monthly.Total(time.Now()); got != 2.50 {
+		t.Fatalf("monthly total = %.2f, want 2.50 (success path must accrue to monthly budget)", got)
 	}
 }
 
@@ -747,3 +774,60 @@ func TestConfirmFiles_SlashApproveTriggersApprovalCommand(t *testing.T) {
 		t.Fatalf("cmd() returned %T, want confirmFileWriteMsg", msg)
 	}
 }
+
+func TestIsIdentityQuery(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+	}{
+		{"你是谁", true},
+		{"你是谁？", true},
+		{" 你是谁  ", true},
+		{"你叫什么", true},
+		{"你叫啥", true},
+		{"介绍一下你自己", true},
+		{"介绍下自己", true},
+		{"who are you", true},
+		{"你好", true},
+		{"您好！", true},
+		{"你是人类还是AI", true},
+		{"谁创建了你", true},
+		{"在这个页面你能做什么", true},
+		// Should NOT match if task keywords or compound requests exist:
+		{"你能做什么？顺便分析这份日志", false},
+		{"introduce yourself, then run the tests", false},
+		{"你好，解释一下Go语言channel", false},
+		{"帮我修复一个bug，代码里有你是谁", false},
+		{"写一个登录页面，标题是你是谁", false},
+		{"实现一个LRU缓存", false},
+		{"审查这段代码", false},
+	}
+
+	for _, c := range cases {
+		got := isIdentityQuery(c.input)
+		if got != c.want {
+			t.Errorf("isIdentityQuery(%q) = %v, want %v", c.input, got, c.want)
+		}
+	}
+}
+
+func TestSubmitChatInput_IdentityQueryHandledLocally(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := *NewApp(ModeChat, cfg, "")
+	app.chat, _ = app.chat.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	m, cmd := app.submitChatInput("你是谁")
+	app = m.(App)
+
+	if cmd != nil {
+		t.Fatal("identity query should be handled locally without async command")
+	}
+	if len(app.chat.messages) < 2 {
+		t.Fatalf("expected at least 2 messages (user + assistant), got %d", len(app.chat.messages))
+	}
+	last := app.chat.messages[len(app.chat.messages)-1]
+	if last.Role != "assistant" || !strings.Contains(last.Content, "makewand") {
+		t.Fatalf("unexpected assistant reply: %v", last)
+	}
+}
+

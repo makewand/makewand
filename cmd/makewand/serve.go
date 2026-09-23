@@ -6,12 +6,15 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -46,6 +49,8 @@ func serveCmd() *cobra.Command {
 		enableRegistration bool
 		trustedProxies     []string
 		unsafeNoTLS        bool
+		budgetReservation  float64
+		strictAccounting   bool
 	)
 
 	cmd := &cobra.Command{
@@ -56,6 +61,10 @@ func serveCmd() *cobra.Command {
 			// Security: reject plaintext listening on non-loopback addresses
 			if !unsafeNoTLS && !isLoopbackAddr(listenAddr) {
 				return fmt.Errorf("refusing to listen on %q without TLS termination; use --unsafe-no-tls if absolutely necessary (not recommended)", listenAddr)
+			}
+
+			if budgetReservation < 0 || math.IsNaN(budgetReservation) || math.IsInf(budgetReservation, 0) {
+				return fmt.Errorf("--budget-reservation must be a finite, non-negative USD amount")
 			}
 
 			// Opening public registration implies the multi-user subsystem.
@@ -124,6 +133,13 @@ func serveCmd() *cobra.Command {
 					fmt.Fprintf(os.Stderr, "warning: could not load routing stats: %v\n", loadErr)
 				}
 			}
+
+			// Keep subscription-quota headroom fresh for the life of the server so
+			// routing steers by current usage rather than a single startup snapshot.
+			// Bound to the command context so the ticker goroutine stops on shutdown.
+			quotaCtx, cancelQuota := context.WithCancel(cmd.Context())
+			defer cancelQuota()
+			rtr.StartQuotaRefresh(quotaCtx)
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
 			loginLimiter := serverauth.NewLoginRateLimiter(5, 15*time.Minute, 15*time.Minute)
 			loginLimiter.SetTrustedProxies(trustedProxySet)
@@ -135,6 +151,9 @@ func serveCmd() *cobra.Command {
 				usageStore   serverusage.Reader
 				teamStore    serverteam.Store
 				sessionMgr   *serveradmin.SessionManager
+				// stopTokenFlush stops the token-counter flusher and does a final
+				// flush; nil when no state DB is configured.
+				stopTokenFlush = func() {}
 			)
 			if strings.TrimSpace(stateDBPath) != "" {
 				sqliteTokens, err := serverauth.OpenSQLiteStore(stateDBPath)
@@ -148,6 +167,45 @@ func serveCmd() *cobra.Command {
 				} else {
 					authz = sqliteTokens
 				}
+
+				// Persist per-token accounting counters so hourly/daily quotas and
+				// daily/monthly spend survive a restart instead of resetting to zero.
+				// A dedicated context + WaitGroup lets us stop the periodic flusher
+				// and JOIN it before the final flush, so the two never race (which
+				// could otherwise upsert a stale snapshot over a fresh one).
+				flushCtx, cancelFlush := context.WithCancel(context.Background())
+				var flushWG sync.WaitGroup
+				flushWG.Add(1)
+				go func() {
+					defer flushWG.Done()
+					ticker := time.NewTicker(60 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-flushCtx.Done():
+							return
+						case <-ticker.C:
+							if err := sqliteTokens.PersistUsageCounters(); err != nil {
+								fmt.Fprintf(os.Stderr, "warning: persist token usage counters failed: %v\n", err)
+							}
+						}
+					}
+				}()
+				// stopTokenFlush stops the periodic flusher, waits for it to exit,
+				// then performs a single final flush. Idempotent. Called after HTTP
+				// drain in the shutdown path (below); the defer is a safety net for
+				// abnormal exits and runs before the sqliteTokens.Close defer above.
+				var stopFlushOnce sync.Once
+				stopTokenFlush = func() {
+					stopFlushOnce.Do(func() {
+						cancelFlush()
+						flushWG.Wait()
+						if err := sqliteTokens.PersistUsageCounters(); err != nil {
+							fmt.Fprintf(os.Stderr, "warning: final persist token usage counters failed: %v\n", err)
+						}
+					})
+				}
+				defer stopTokenFlush()
 
 				sqliteUsage, err := serverusage.OpenSQLiteStore(stateDBPath)
 				if err != nil {
@@ -199,20 +257,34 @@ func serveCmd() *cobra.Command {
 			if authz == nil {
 				return fmt.Errorf("serve requires --token/--auth-config or an enabled state DB token store")
 			}
+			// Strict accounting rejects requests it cannot durably record; without a
+			// persisting sink (an alert observer does not count) that would reject
+			// every request, so fail fast at startup instead.
+			if strictAccounting && !usageSinkIsDurable(usageLogger) {
+				return fmt.Errorf("--strict-accounting requires a durable usage sink; enable a state DB (--state-db) or --usage-log (an alert webhook alone does not persist usage)")
+			}
 			usageDisplayPath := usagePath
 			if usageDisplayPath == "" && strings.TrimSpace(stateDBPath) != "" && usageStore != nil {
 				usageDisplayPath = "sqlite:" + stateDBPath
 			}
 
 			httpOpts := router.HTTPHandlerOptions{
-				Authorizer:       authz,
-				StatsDir:         statsDir,
-				AuditLogger:      auditLogger,
-				UsageLogger:      usageLogger,
-				UsageReader:      usageStore,
-				TeamStore:        teamStore,
-				UserTokenManager: tokenManager,
-				UserLoginLimiter: loginLimiter,
+				Authorizer:           authz,
+				StatsDir:             statsDir,
+				AuditLogger:          auditLogger,
+				UsageLogger:          usageLogger,
+				UsageReader:          usageStore,
+				TeamStore:            teamStore,
+				BudgetReservationUSD: budgetReservation,
+				StrictAccounting:     strictAccounting,
+				UserTokenManager:     tokenManager,
+				UserLoginLimiter:     loginLimiter,
+				// Surface dropped usage writes instead of silently under-counting
+				// budget. Logging runs after the response, so this cannot fail the
+				// request; it makes the loss visible to the operator.
+				UsageLogErrorHandler: func(err error) {
+					fmt.Fprintf(os.Stderr, "warning: usage accounting write failed (budget may under-count): %v\n", err)
+				},
 			}
 			base := rtr.HTTPHandler(httpOpts)
 			if userStore != nil {
@@ -257,6 +329,11 @@ func serveCmd() *cobra.Command {
 
 			sigChan := make(chan os.Signal, 1)
 			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+			shutdownDone := make(chan struct{})
+			// Atomic so the main goroutine can read it even on the fallback timer
+			// path (which does not receive shutdownDone and thus has no channel
+			// happens-before with the signal goroutine's write).
+			var shutdownTimedOut atomic.Bool
 
 			go func() {
 				sig := <-sigChan
@@ -266,9 +343,17 @@ func serveCmd() *cobra.Command {
 				defer cancel()
 
 				fmt.Println("Shutting down server...")
-				if err := server.Shutdown(shutdownCtx); err != nil && err != context.DeadlineExceeded {
-					fmt.Fprintf(os.Stderr, "shutdown error: %v\n", err)
+				if err := server.Shutdown(shutdownCtx); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						// Requests still in flight at the deadline are abandoned; their
+						// usage may land after the final counter flush and be lost.
+						shutdownTimedOut.Store(true)
+						fmt.Fprintln(os.Stderr, "warning: graceful shutdown timed out; in-flight requests may not have drained and their usage counters may be lost")
+					} else {
+						fmt.Fprintf(os.Stderr, "shutdown error: %v\n", err)
+					}
 				}
+				close(shutdownDone)
 			}()
 
 			fmt.Printf("makewand server listening on %s\n", listenAddr)
@@ -295,7 +380,19 @@ func serveCmd() *cobra.Command {
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
-			fmt.Println("Server stopped gracefully")
+			// The listener closed because Shutdown was signalled. Wait for it to
+			// finish draining in-flight handlers (bounded) so all token-counter
+			// mutations are done, THEN flush a final, consistent snapshot.
+			select {
+			case <-shutdownDone:
+			case <-time.After(35 * time.Second):
+			}
+			stopTokenFlush()
+			if shutdownTimedOut.Load() {
+				fmt.Println("Server stopped (shutdown timed out; some in-flight requests may not have drained)")
+			} else {
+				fmt.Println("Server stopped gracefully")
+			}
 			return nil
 		},
 	}
@@ -307,6 +404,8 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&auditPath, "audit-log", "", "path to append-only JSONL audit log (default: <data-dir>/audit.jsonl when MAKEWAND_SERVER_AUDIT_LOG is set)")
 	cmd.Flags().StringVar(&usagePath, "usage-log", "", "path to append-only JSONL usage ledger (disabled by default when SQLite state DB is enabled)")
 	cmd.Flags().StringVar(&alertWebhook, "alert-webhook", "", "HTTP endpoint that receives budget alert webhooks")
+	cmd.Flags().Float64Var(&budgetReservation, "budget-reservation", 0.01, "USD reserved per in-flight request against team budgets to bound concurrent overshoot; 0 disables (headroom-only check)")
+	cmd.Flags().BoolVar(&strictAccounting, "strict-accounting", false, "record a non-streaming request's usage before its success response and reject with 503 if it cannot be recorded, so no successful response is returned unrecorded (does not apply to streaming; does not un-spend a provider call already made)")
 	cmd.Flags().StringVar(&alertState, "alert-state", "", "path to persisted alert delivery state (default: <data-dir>/alert_state.json)")
 	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state database for users, tokens, and usage (default: <data-dir>/state.db)")
 	cmd.Flags().BoolVar(&enableUsers, "enable-users", false, "enable multi-user auth, login, and admin user management (does not open public registration)")
@@ -463,13 +562,46 @@ func combineUsageLoggers(items ...serverusage.Logger) serverusage.Logger {
 	return &usageMultiLogger{items: filtered}
 }
 
-func (m *usageMultiLogger) Log(entry serverusage.Entry) {
+func (m *usageMultiLogger) Log(entry serverusage.Entry) error {
 	if m == nil {
-		return
+		return nil
+	}
+	var errs []error
+	for _, item := range m.items {
+		if err := item.Log(entry); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Durable reports whether at least one member persists usage entries. A member
+// that does not implement Durable() is assumed durable (JSONL/SQLite sinks); a
+// member declaring Durable()==false (an alert-notifier observer) is not. Strict
+// accounting uses this so a chain that is only observers cannot falsely succeed.
+func (m *usageMultiLogger) Durable() bool {
+	if m == nil {
+		return false
 	}
 	for _, item := range m.items {
-		item.Log(entry)
+		if d, ok := item.(interface{ Durable() bool }); ok && !d.Durable() {
+			continue
+		}
+		return true
 	}
+	return false
+}
+
+// usageSinkIsDurable reports whether l persists usage entries. A nil sink is not
+// durable; a sink that does not implement Durable() is assumed durable.
+func usageSinkIsDurable(l serverusage.Logger) bool {
+	if l == nil {
+		return false
+	}
+	if d, ok := l.(interface{ Durable() bool }); ok {
+		return d.Durable()
+	}
+	return true
 }
 
 func serveProtectedHandler(authz serverauth.RequestAuthorizer, scope string, next http.Handler) http.Handler {

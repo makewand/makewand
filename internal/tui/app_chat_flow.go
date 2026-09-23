@@ -81,7 +81,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	a.chat.AddMessage(ChatMessage{Role: "user", Content: input})
+	a.chat.AddMessageForceBottom(ChatMessage{Role: "user", Content: input})
 	a.chat.SetStreaming(true)
 	a.state = StateStreaming
 	a = a.applyBudgetRoutingPolicy()
@@ -513,28 +513,110 @@ func chatTaskToBuildPhase(task model.TaskType) model.BuildPhase {
 	}
 }
 
-// isIdentityQuery checks if the input is asking about makewand's identity
+// isIdentityQuery checks if the input is asking about makewand's identity or greeting
 func isIdentityQuery(input string) bool {
-	lower := strings.ToLower(input)
-	identityQueries := []string{
-		"你是谁",
-		"who are you",
-		"what are you",
-		"你是什么",
-		"what's your name",
-		"你叫什么",
+	lower := strings.ToLower(strings.TrimSpace(input))
+	taskKeywords := []string{
+		"修复", "fix", "bug", "写代码", "写一个", "写个", "写段", "编写", "实现",
+		"生成代码", "重构", "修改代码", "改写代码", "落盘", "单测", "测试用例",
+		"implement", "build a", "write code", "write a", "refactor", "patch", "review", "审查", "审计",
 	}
-	for _, q := range identityQueries {
-		if strings.Contains(lower, q) {
+	for _, tk := range taskKeywords {
+		if strings.Contains(lower, tk) {
+			return false
+		}
+	}
+
+	compoundConnectors := []string{
+		"顺便", "然后", "接着", "顺带", "并且", "同时", "再帮我", "帮我", "顺便帮我",
+		"then", "and then", "after that", "also",
+	}
+	for _, cc := range compoundConnectors {
+		if strings.Contains(lower, cc) {
+			return false
+		}
+	}
+
+	var b strings.Builder
+	for _, r := range lower {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || (r >= 0x4e00 && r <= 0x9fff) {
+			b.WriteRune(r)
+		}
+	}
+	stripped := b.String()
+
+	greetings := []string{
+		"你好", "您好", "hi", "hello", "hey", "早上好", "下午好", "晚上好", "哈喽", "嗨", "打扰一下", "请问",
+	}
+	for _, g := range greetings {
+		if stripped == g {
 			return true
 		}
 	}
+
+	for _, g := range []string{"你好", "您好", "哈喽", "嗨", "hello", "hi"} {
+		if strings.HasPrefix(lower, g) {
+			rem := strings.Trim(lower[len(g):], " ,，!！?？;；\t\n")
+			if rem != "" {
+				return false
+			}
+		}
+	}
+
+	identityQueries := []string{
+		"你是谁",
+		"你是什么",
+		"你叫什么",
+		"你叫啥",
+		"你到底是",
+		"你究竟是",
+		"介绍一下自己",
+		"介绍自己",
+		"介绍一下你自己",
+		"介绍下自己",
+		"介绍下你自己",
+		"做个自我介绍",
+		"自我介绍",
+		"你能做什么",
+		"你能干什么",
+		"你能干啥",
+		"你有什么功能",
+		"你有哪些功能",
+		"你有什么用",
+		"谁创建了你",
+		"谁开发了你",
+		"谁创造了你",
+		"你是人类还是",
+		"你是什么类型",
+		"你是什么ai",
+		"whoareyou",
+		"whatareyou",
+		"whatisyourname",
+		"whatsyourname",
+		"introduceyourself",
+		"tellmeaboutyourself",
+		"whatcanyoudo",
+		"whatdoyoudo",
+		"whocreatedyou",
+	}
+	taskVerbs := []string{"分析", "审查", "解释", "说明", "排查", "测试", "执行", "运行", "run", "test", "analyze", "check", "explain"}
+	for _, q := range identityQueries {
+		if strings.Contains(stripped, q) {
+			for _, tv := range taskVerbs {
+				if strings.Contains(lower, tv) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
 	return false
 }
 
 // handleIdentityQuery responds to identity questions locally without routing to AI
 func (a App) handleIdentityQuery(input string) (tea.Model, tea.Cmd) {
-	a.chat.AddMessage(ChatMessage{Role: "user", Content: input})
-	a.chat.AddMessage(ChatMessage{Role: "assistant", Content: i18n.Msg().IdentityAnswer})
+	a.chat.AddMessageForceBottom(ChatMessage{Role: "user", Content: input})
+	a.chat.AddMessageForceBottom(ChatMessage{Role: "assistant", Content: i18n.Msg().IdentityAnswer})
 	return a, nil
 }

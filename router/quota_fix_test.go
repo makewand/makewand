@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -126,8 +127,10 @@ func TestAgyProbeFailureStaysNeutral(t *testing.T) {
 func TestCodexBothWindowsResets(t *testing.T) {
 	dir := t.TempDir()
 	fp := dir + "/rollout-x.jsonl"
-	content := `{"timestamp":"2026-07-14T09:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":30.0,"window_minutes":300,"resets_at":1784600000},"secondary":{"used_percent":90.0,"window_minutes":10080,"resets_at":1785000000}}}}
-`
+	reset5h := time.Now().Add(3 * time.Hour).Unix()
+	resetWeekly := time.Now().Add(5 * 24 * time.Hour).Unix()
+	content := fmt.Sprintf(`{"timestamp":"%s","payload":{"rate_limits":{"primary":{"used_percent":30.0,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":90.0,"window_minutes":10080,"resets_at":%d}}}}
+`, time.Now().Format(time.RFC3339), reset5h, resetWeekly)
 	if err := os.WriteFile(fp, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}

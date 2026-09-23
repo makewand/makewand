@@ -16,11 +16,11 @@ func TestEvaluateCandidateFiles_LiveBwrapIsolation(t *testing.T) {
 		t.Skip("skipping live sandbox test in short mode")
 	}
 	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "0")
-	if !VerificationIsolationActive() {
+	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		if os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
-			t.Fatalf("MAKEWAND_REQUIRE_BWRAP=1 but bubblewrap isolation is unavailable: %v", RestrictedExecIsolationError())
+			t.Fatalf("MAKEWAND_REQUIRE_BWRAP=1 but bubblewrap isolation is unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 		}
-		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError())
+		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}
 
 	project, err := NewProject("verify-live", t.TempDir())

@@ -140,11 +140,20 @@ func (p *Project) RunRestrictedPlan(ctx context.Context, plan ExecPlan) (*ExecRe
 // Dependency installs keep network access so package registries stay reachable;
 // every other step runs with the network namespace unshared.
 func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*ExecResult, error) {
-	env, err := resolveVerifyExecEnvironment()
+	env, err := resolveVerifyExecEnvironment(p.unsafeHostAuth)
 	if err != nil {
 		return nil, err
 	}
 	if env.mode == verifyExecUnsafeHost {
+		// Audit EVERY host execution under the unsafe opt-in, not just the
+		// first: the acknowledgment authorizes the mode, the audit trail
+		// records each use of it.
+		p.unsafeHostAuth.audit(UnsafeHostExecEvent{
+			Context: "verification",
+			Command: plan.Command,
+			Args:    append([]string(nil), plan.Args...),
+			Dir:     p.Path,
+		})
 		return p.ExecRestricted(ctx, plan.Command, plan.Args...)
 	}
 	return p.execVerification(ctx, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan))
@@ -165,7 +174,7 @@ func (p *Project) execVerification(ctx context.Context, command string, args []s
 		return nil, fmt.Errorf("command %q is blocked by execution policy", command)
 	}
 
-	env, err := resolveVerifyExecEnvironment()
+	env, err := resolveVerifyExecEnvironment(p.unsafeHostAuth)
 	if err != nil {
 		return nil, err
 	}

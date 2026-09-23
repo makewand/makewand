@@ -2,12 +2,16 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,8 +34,317 @@ type usageRecorder struct {
 	entries []serverusage.Entry
 }
 
-func (r *usageRecorder) Log(entry serverusage.Entry) {
+func (r *usageRecorder) Log(entry serverusage.Entry) error {
 	r.entries = append(r.entries, entry)
+	return nil
+}
+
+// failingUsageLogger always fails to persist, standing in for a full disk or a
+// locked/closed database.
+type failingUsageLogger struct{ calls int }
+
+func (f *failingUsageLogger) Log(serverusage.Entry) error {
+	f.calls++
+	return errors.New("disk full")
+}
+
+// TestHTTPHandler_UsageLogFailureSurfaces asserts that a failed usage write is
+// reported through UsageLogErrorHandler rather than silently dropped, and that
+// the request itself still succeeds (accounting runs after the response).
+func TestHTTPHandler_UsageLogFailureSurfaces(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "ok"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+
+	failing := &failingUsageLogger{}
+	var gotErr error
+	handler := r.HTTPHandler(HTTPHandlerOptions{
+		UsageLogger:          failing,
+		UsageLogErrorHandler: func(err error) { gotErr = err },
+	})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if failing.calls != 1 {
+		t.Fatalf("usage logger called %d times, want 1", failing.calls)
+	}
+	if gotErr == nil {
+		t.Fatal("UsageLogErrorHandler was not invoked on a failed usage write")
+	}
+}
+
+// countingUsageLogger records how many entries it stored and can be told to fail.
+type countingUsageLogger struct {
+	mu     sync.Mutex
+	calls  int
+	fail   bool
+	stored []serverusage.Entry
+}
+
+func (c *countingUsageLogger) Log(e serverusage.Entry) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.fail {
+		return errors.New("disk full")
+	}
+	c.stored = append(c.stored, e)
+	return nil
+}
+
+// TestLogHTTPUsageSanitizesCost guards that a NaN/Inf/negative cost is never
+// persisted to the ledger, where it would later poison a budget seed.
+func TestLogHTTPUsageSanitizesCost(t *testing.T) {
+	logger := &countingUsageLogger{}
+	if err := logHTTPUsage(logger, serverusage.Entry{CostUSD: math.Inf(1)}); err != nil {
+		t.Fatalf("logHTTPUsage: %v", err)
+	}
+	if len(logger.stored) != 1 {
+		t.Fatalf("stored = %d, want 1", len(logger.stored))
+	}
+	if logger.stored[0].CostUSD != 0 {
+		t.Fatalf("persisted cost = %v, want 0 (sanitized)", logger.stored[0].CostUSD)
+	}
+}
+
+// TestStrictAccountingRejectsWhenUsageWriteFails: in strict mode a non-streaming
+// request whose usage cannot be recorded is rejected with 503 and NO completion
+// body — so no successful response is returned unrecorded.
+func TestStrictAccountingRejectsWhenUsageWriteFails(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello", cost: 0.5}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	logger := &countingUsageLogger{fail: true}
+	handler := r.HTTPHandler(HTTPHandlerOptions{UsageLogger: logger, StrictAccounting: true})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hello") {
+		t.Fatalf("strict rejection must not include the model response; body: %s", rec.Body.String())
+	}
+	if logger.calls != 1 {
+		t.Fatalf("usage logger calls = %d, want exactly 1 (attempted before response)", logger.calls)
+	}
+}
+
+// sleepyProvider takes a fixed, non-trivial amount of time so the recorded
+// request duration is deterministically positive.
+type sleepyProvider struct {
+	name string
+	d    time.Duration
+}
+
+func (p *sleepyProvider) Name() string      { return p.name }
+func (p *sleepyProvider) IsAvailable() bool { return true }
+
+func (p *sleepyProvider) Chat(context.Context, []Message, string, int) (string, Usage, error) {
+	time.Sleep(p.d)
+	return "hi", Usage{Provider: p.name, InputTokens: 5, OutputTokens: 3, Cost: 0.5}, nil
+}
+
+func (p *sleepyProvider) ChatStream(context.Context, []Message, string, int) (<-chan StreamChunk, error) {
+	ch := make(chan StreamChunk, 1)
+	ch <- StreamChunk{Content: "hi", Done: true}
+	close(ch)
+	return ch, nil
+}
+
+// TestStrictAccountingRecordsPopulatedEntry proves the entry recorded BEFORE the
+// response under strict mode carries the realized fields — including a populated
+// (non-hardcoded) DurationMS — not a blank/zeroed entry.
+func TestStrictAccountingRecordsPopulatedEntry(t *testing.T) {
+	prov := &sleepyProvider{name: "claude", d: 3 * time.Millisecond}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: prov, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	logger := &countingUsageLogger{}
+	handler := r.HTTPHandler(HTTPHandlerOptions{UsageLogger: logger, StrictAccounting: true})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(logger.stored) != 1 {
+		t.Fatalf("stored entries = %d, want 1", len(logger.stored))
+	}
+	e := logger.stored[0]
+	if e.CostUSD != 0.5 || e.PromptTokens != 5 || e.CompletionTokens != 3 {
+		t.Fatalf("recorded entry not fully populated: cost=%.2f in=%d out=%d", e.CostUSD, e.PromptTokens, e.CompletionTokens)
+	}
+	if e.DurationMS <= 0 {
+		t.Fatalf("recorded DurationMS = %d, want > 0 (populated before response, not hardcoded 0)", e.DurationMS)
+	}
+}
+
+// observerOnlyLogger returns nil from Log without persisting and declares itself
+// non-durable — like an alert notifier.
+type observerOnlyLogger struct{}
+
+func (observerOnlyLogger) Log(serverusage.Entry) error { return nil }
+func (observerOnlyLogger) Durable() bool               { return false }
+
+// TestStrictAccountingRejectsObserverOnlySink: strict mode must reject when the
+// only usage sink is a non-persisting observer (which would return nil without
+// recording anything).
+func TestStrictAccountingRejectsObserverOnlySink(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{UsageLogger: observerOnlyLogger{}, StrictAccounting: true})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (observer-only sink under strict); body: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hello") {
+		t.Fatalf("strict rejection must not include the model response; body: %s", rec.Body.String())
+	}
+}
+
+// TestStrictAccountingRejectsWhenNoUsageSink: strict mode with no UsageLogger
+// cannot record anything, so it must reject rather than falsely "succeed".
+func TestStrictAccountingRejectsWhenNoUsageSink(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{StrictAccounting: true}) // no UsageLogger
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (no usage sink under strict); body: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hello") {
+		t.Fatalf("strict rejection must not include the model response; body: %s", rec.Body.String())
+	}
+}
+
+// TestStrictAccountingResponsesRejectsWhenUsageWriteFails covers the /v1/responses
+// endpoint (not just /v1/chat/completions) under strict accounting.
+func TestStrictAccountingResponsesRejectsWhenUsageWriteFails(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello", cost: 0.5}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	logger := &countingUsageLogger{fail: true}
+	handler := r.HTTPHandler(HTTPHandlerOptions{UsageLogger: logger, StrictAccounting: true})
+
+	body := `{"model":"claude","input":"hi"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hello") {
+		t.Fatalf("strict rejection must not include the model response; body: %s", rec.Body.String())
+	}
+	if logger.calls != 1 {
+		t.Fatalf("usage logger calls = %d, want 1", logger.calls)
+	}
+}
+
+// TestStrictAccountingLogsExactlyOnceOnSuccess: strict mode logs before the
+// write and must not double-log in the deferred finalizer.
+func TestStrictAccountingLogsExactlyOnceOnSuccess(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	logger := &countingUsageLogger{}
+	handler := r.HTTPHandler(HTTPHandlerOptions{UsageLogger: logger, StrictAccounting: true})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if logger.calls != 1 {
+		t.Fatalf("usage logged %d times, want exactly 1", logger.calls)
+	}
+}
+
+// TestNonStrictAccountingStillSucceedsOnUsageFailure: default (non-strict) mode
+// keeps the request successful even when usage logging fails; the failure is
+// surfaced via the error handler, not the response.
+func TestNonStrictAccountingStillSucceedsOnUsageFailure(t *testing.T) {
+	stub := &stubProvider{name: "claude", available: true, response: "hello"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	logger := &countingUsageLogger{fail: true}
+	var gotErr error
+	handler := r.HTTPHandler(HTTPHandlerOptions{
+		UsageLogger:          logger,
+		UsageLogErrorHandler: func(err error) { gotErr = err },
+	})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (non-strict); body: %s", rec.Code, rec.Body.String())
+	}
+	if gotErr == nil {
+		t.Fatal("usage failure should still be surfaced via UsageLogErrorHandler")
+	}
 }
 
 func TestHTTPHandler_ChatCompletions(t *testing.T) {
@@ -1285,7 +1598,7 @@ func TestHTTPHandler_RejectsRequestsWhenProjectBudgetExceeded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
-	usageStore.Log(serverusage.Entry{
+	_ = usageStore.Log(serverusage.Entry{
 		Timestamp:      time.Now().UTC(),
 		OrganizationID: org.ID,
 		ProjectID:      project.ID,
@@ -1335,6 +1648,173 @@ func TestHTTPHandler_RejectsRequestsWhenProjectBudgetExceeded(t *testing.T) {
 	}
 }
 
+func TestHTTPHandler_ProjectOnlyTokenHonorsParentOrgBudget(t *testing.T) {
+	stateDB := filepath.Join(t.TempDir(), "state.db")
+	teamStore, err := serverteam.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(team): %v", err)
+	}
+	defer teamStore.Close()
+	usageStore, err := serverusage.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(usage): %v", err)
+	}
+	defer usageStore.Close()
+
+	org, err := teamStore.CreateOrganization(serverteam.Organization{
+		ID: "org_platform", Name: "Platform Team", MonthlyBudgetUSD: 1,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+	// Project itself has no cap (0) — only the parent organization is budgeted.
+	project, err := teamStore.CreateProject(serverteam.Project{
+		ID: "prj_checkout", OrganizationID: org.ID, Name: "Checkout API", MonthlyBudgetUSD: 0,
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	// Organization is already at its cap (spend attributed to the org, e.g. from
+	// other tokens/projects).
+	_ = usageStore.Log(serverusage.Entry{Timestamp: time.Now().UTC(), OrganizationID: org.ID, CostUSD: 1})
+
+	// Token carries ONLY the project scope — no explicit organization id.
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{{
+			Token:     "secret123",
+			Scopes:    []string{serverauth.ScopeChatInvoke},
+			ProjectID: project.ID,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	stub := &stubProvider{name: "claude", available: true, response: "hi"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, UsageReader: usageStore, TeamStore: teamStore})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (parent org over budget); body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "organization") {
+		t.Fatalf("body = %q, want parent organization budget error", rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_BudgetFailsClosedOnLookupError(t *testing.T) {
+	stateDB := filepath.Join(t.TempDir(), "state.db")
+	teamStore, err := serverteam.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(team): %v", err)
+	}
+	defer teamStore.Close()
+	usageStore, err := serverusage.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore(usage): %v", err)
+	}
+	defer usageStore.Close()
+
+	// Token names a project that does not exist — GetProject errors. This must
+	// fail closed (503), not be read as "no budget configured, allow".
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{{
+			Token:     "secret123",
+			Scopes:    []string{serverauth.ScopeChatInvoke},
+			ProjectID: "prj_does_not_exist",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	stub := &stubProvider{name: "claude", available: true, response: "hi"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, UsageReader: usageStore, TeamStore: teamStore})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (budget unavailable, fail closed); body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "budget_unavailable") {
+		t.Fatalf("body = %q, want budget_unavailable", rec.Body.String())
+	}
+}
+
+func TestHTTPHandler_TokenOrgProjectMismatchFailsClosed(t *testing.T) {
+	stateDB := filepath.Join(t.TempDir(), "state.db")
+	teamStore, err := serverteam.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("team store: %v", err)
+	}
+	defer teamStore.Close()
+	usageStore, err := serverusage.OpenSQLiteStore(stateDB)
+	if err != nil {
+		t.Fatalf("usage store: %v", err)
+	}
+	defer usageStore.Close()
+
+	orgA, _ := teamStore.CreateOrganization(serverteam.Organization{ID: "org_a", Name: "A"})
+	orgB, _ := teamStore.CreateOrganization(serverteam.Organization{ID: "org_b", Name: "B"})
+	// Project belongs to org B, but the token claims org A → misconfiguration.
+	project, err := teamStore.CreateProject(serverteam.Project{ID: "prj_x", OrganizationID: orgB.ID, Name: "X"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{
+		Tokens: []serverauth.TokenRule{{
+			Token: "sec", Scopes: []string{serverauth.ScopeChatInvoke},
+			OrganizationID: orgA.ID, ProjectID: project.ID,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("authorizer: %v", err)
+	}
+
+	stub := &stubProvider{name: "claude", available: true, response: "hi"}
+	r := mustNewRouter(RouterConfig{
+		Providers:    map[string]ProviderEntry{"claude": {Provider: stub, Access: AccessSubscription}},
+		DefaultModel: "claude",
+		CodingModel:  "claude",
+	})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, UsageReader: usageStore, TeamStore: teamStore})
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer sec")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (org/project mismatch); body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "scope_conflict") {
+		t.Fatalf("body = %q, want scope_conflict", rec.Body.String())
+	}
+}
+
 func TestHTTPHandler_ProjectBudgetIgnoresPreviousMonths(t *testing.T) {
 	stateDB := filepath.Join(t.TempDir(), "state.db")
 	teamStore, err := serverteam.OpenSQLiteStore(stateDB)
@@ -1366,7 +1846,7 @@ func TestHTTPHandler_ProjectBudgetIgnoresPreviousMonths(t *testing.T) {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	now := time.Now().UTC()
-	usageStore.Log(serverusage.Entry{
+	_ = usageStore.Log(serverusage.Entry{
 		Timestamp:      serverusage.MonthStart(now).AddDate(0, -1, 0).Add(2 * time.Hour),
 		OrganizationID: org.ID,
 		ProjectID:      project.ID,

@@ -481,6 +481,11 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, err.Error(), 0, 0, 0)
 		return
 	}
+	if action == "deactivate" || action == "role" || action == "password" {
+		if opts.TokenManager != nil {
+			_ = opts.TokenManager.RevokeByUserID(userID)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user_id": userID,
 		"action":  action,
@@ -510,6 +515,14 @@ func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing admin credentials")
 		logAdminEvent(opts.AuditLogger, req, nil, scope, kind, http.StatusUnauthorized, "invalid or missing admin credentials", 0, 0, 0)
 		return nil, false
+	}
+	if opts.UserStore != nil && grant.UserID() != "" {
+		u, err := opts.UserStore.GetUserByID(grant.UserID())
+		if err != nil || u == nil || !u.IsActive {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "user account is deactivated or not found")
+			logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusUnauthorized, "user account is deactivated or not found", 0, 0, 0)
+			return nil, false
+		}
 	}
 	if session != nil && requiresCSRFAuthorization(req.Method) && !opts.SessionMgr.ValidateCSRF(req, session.CSRFToken) {
 		writeError(w, http.StatusForbidden, "forbidden", "missing or invalid CSRF token")

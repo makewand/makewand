@@ -15,7 +15,7 @@ func TestJSONLAndSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenJSONL: %v", err)
 	}
-	logger.Log(Entry{
+	_ = logger.Log(Entry{
 		Timestamp:        time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC),
 		RequestID:        "req_1",
 		TokenID:          "runner",
@@ -25,7 +25,7 @@ func TestJSONLAndSummary(t *testing.T) {
 		CompletionTokens: 5,
 		CostUSD:          0.5,
 	})
-	logger.Log(Entry{
+	_ = logger.Log(Entry{
 		Timestamp:      time.Date(2026, 3, 23, 11, 0, 0, 0, time.UTC),
 		RequestID:      "req_2",
 		TokenID:        "viewer",
@@ -64,7 +64,7 @@ func TestSQLiteStore_LogAndLoad(t *testing.T) {
 	}
 	defer store.Close()
 
-	store.Log(Entry{
+	_ = store.Log(Entry{
 		Timestamp:      time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC),
 		RequestID:      "req_1",
 		TokenID:        "runner",
@@ -95,8 +95,8 @@ func TestJSONLReaderAndMonthFilter(t *testing.T) {
 
 	currentMonth := MonthStart(time.Now().UTC())
 	previousMonth := currentMonth.AddDate(0, -1, 0)
-	logger.Log(Entry{Timestamp: previousMonth.Add(2 * time.Hour), RequestID: "old", CostUSD: 1})
-	logger.Log(Entry{Timestamp: currentMonth.Add(2 * time.Hour), RequestID: "new", CostUSD: 2})
+	_ = logger.Log(Entry{Timestamp: previousMonth.Add(2 * time.Hour), RequestID: "old", CostUSD: 1})
+	_ = logger.Log(Entry{Timestamp: currentMonth.Add(2 * time.Hour), RequestID: "new", CostUSD: 2})
 	if err := logger.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

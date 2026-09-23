@@ -21,7 +21,7 @@ func TestWrapPreviewProjectCommand_RequiresLinuxSandbox(t *testing.T) {
 	previewUnsafe = func() bool { return false }
 	previewBwrapSelfTest = func(string) error { return nil }
 
-	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
+	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
 	if err == nil {
 		t.Fatal("expected error on non-linux without unsafe bypass")
 	}
@@ -47,7 +47,7 @@ func TestWrapPreviewProjectCommand_RequiresBwrapOnLinux(t *testing.T) {
 	previewLookPath = func(string) (string, error) { return "", errors.New("missing") }
 	previewBwrapSelfTest = func(string) error { return nil }
 
-	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
+	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
 	if err == nil {
 		t.Fatal("expected error when bwrap is unavailable")
 	}
@@ -66,7 +66,13 @@ func TestWrapPreviewProjectCommand_UnsafeBypass(t *testing.T) {
 	previewUnsafe = func() bool { return true }
 	previewBwrapSelfTest = func(string) error { return nil }
 
-	cmd, args, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
+	var audited []UnsafeHostExecEvent
+	auth := UnsafeHostExecAuthorization{
+		Acknowledged: true,
+		Source:       "test",
+		Audit:        func(ev UnsafeHostExecEvent) { audited = append(audited, ev) },
+	}
+	cmd, args, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"}, auth)
 	if err != nil {
 		t.Fatalf("wrapPreviewProjectCommand: %v", err)
 	}
@@ -75,6 +81,34 @@ func TestWrapPreviewProjectCommand_UnsafeBypass(t *testing.T) {
 	}
 	if len(args) != 2 || args[0] != "run" || args[1] != "dev" {
 		t.Fatalf("args=%v, want [run dev]", args)
+	}
+	if len(audited) != 1 || audited[0].Context != "preview" || audited[0].Command != "npm" || audited[0].Source != "test" {
+		t.Fatalf("audited=%+v, want one preview event for npm with source test", audited)
+	}
+}
+
+// TestWrapPreviewProjectCommand_UnsafeRequestedWithoutAck confirms the env
+// opt-in alone does not bypass preview isolation: without the acknowledged
+// authorization the wrapper behaves as if the variable were unset (isolation
+// on capable hosts, fail-closed with acknowledgment guidance otherwise).
+func TestWrapPreviewProjectCommand_UnsafeRequestedWithoutAck(t *testing.T) {
+	oldGOOS := previewGOOS
+	oldUnsafe := previewUnsafe
+	oldLookPath := previewLookPath
+	t.Cleanup(func() {
+		previewGOOS = oldGOOS
+		previewUnsafe = oldUnsafe
+		previewLookPath = oldLookPath
+	})
+	previewGOOS = "darwin"
+	previewUnsafe = func() bool { return true }
+
+	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
+	if err == nil {
+		t.Fatal("expected fail-closed error when opt-in is requested but unacknowledged")
+	}
+	if !strings.Contains(err.Error(), "acknowledg") {
+		t.Fatalf("error=%q, want acknowledgment guidance", err.Error())
 	}
 }
 
@@ -106,7 +140,7 @@ func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
 		return ""
 	}
 
-	cmd, args, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
+	cmd, args, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
 	if err != nil {
 		t.Fatalf("wrapPreviewProjectCommand: %v", err)
 	}
@@ -159,7 +193,7 @@ func TestWrapPreviewProjectCommand_MasksSensitiveHomeSubpathsWhenProjectInsideHo
 	}
 
 	projectPath := "/home/alice/work/demo"
-	_, args, err := wrapPreviewProjectCommand(projectPath, "npm", []string{"run", "dev"})
+	_, args, err := wrapPreviewProjectCommand(projectPath, "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
 	if err != nil {
 		t.Fatalf("wrapPreviewProjectCommand: %v", err)
 	}
@@ -202,7 +236,7 @@ func TestWrapPreviewProjectCommand_BwrapSelfTestFailure(t *testing.T) {
 	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
 	previewBwrapSelfTest = func(string) error { return errors.New("setting up uid map: Permission denied") }
 
-	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"})
+	_, _, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
 	if err == nil {
 		t.Fatal("expected bwrap self-test error")
 	}
