@@ -40,6 +40,12 @@ ln -sf "$SCRIPT_DIR/bin/makewand" "$TARGET_BIN"
 chmod +x "$TARGET_BIN"
 chmod +x "$SCRIPT_DIR/bin/makewand"
 
+# 1.5 Build native Go server/components if Go toolchain is available
+if command -v go >/dev/null 2>&1; then
+    echo "Building native Go component ($SCRIPT_DIR/bin/makewand-server)..."
+    (cd "$SCRIPT_DIR" && go build -trimpath -o "$SCRIPT_DIR/bin/makewand-server" ./cmd/makewand 2>/dev/null || true)
+fi
+
 # 2. Maintain backwards compatibility with trio command
 TRIO_BIN="$BIN_DIR/trio"
 echo "Creating compatibility symlink $TRIO_BIN -> $TARGET_BIN"

@@ -1,6 +1,7 @@
 # Build artifacts
 /build/
 /makewand.exe
+/bin/makewand-server
 __pycache__/
 *.pyc
 *.pyo

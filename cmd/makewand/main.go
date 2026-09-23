@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -72,7 +73,68 @@ func resolveRepoTrust(value string) (model.RepoTrust, error) {
 	return trust, nil
 }
 
+func tryDelegateToPythonOrchestrator(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	subcmd := args[0]
+	orchestratorCmds := map[string]bool{
+		"run": true, "review": true, "race": true, "observe": true,
+		"models": true, "candidates": true, "inspect": true, "apply": true,
+		"discard": true, "sandbox": true, "status": true, "probe": true,
+	}
+	if !orchestratorCmds[subcmd] {
+		return false
+	}
+
+	pyBin, err := exec.LookPath("python3")
+	if err != nil {
+		pyBin, err = exec.LookPath("python")
+	}
+	if err != nil {
+		return false
+	}
+
+	exePath, _ := os.Executable()
+	exeDir := filepath.Dir(exePath)
+	repoRoot := filepath.Dir(exeDir)
+
+	scriptCandidates := []string{
+		filepath.Join(exeDir, "makewand"),
+		filepath.Join(repoRoot, "bin", "makewand"),
+		"/usr/local/bin/makewand",
+	}
+	var targetScript string
+	for _, sc := range scriptCandidates {
+		if fi, err := os.Stat(sc); err == nil && !fi.IsDir() && sc != exePath {
+			targetScript = sc
+			break
+		}
+	}
+
+	var cmd *exec.Cmd
+	if targetScript != "" {
+		cmd = exec.Command(targetScript, args...)
+	} else {
+		cmd = exec.Command(pyBin, append([]string{"-m", "makewand"}, args...)...)
+	}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		os.Exit(1)
+	}
+	os.Exit(0)
+	return true
+}
+
 func main() {
+	if len(os.Args) > 1 {
+		tryDelegateToPythonOrchestrator(os.Args[1:])
+	}
 	if err := newRootCmd().Execute(); err != nil {
 		os.Exit(1)
 	}

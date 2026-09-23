@@ -35,9 +35,22 @@ def execute_claude_task(
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache
+    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.git_helper import find_git_root
     cache = load_status_cache()
     if cache.get("claude", {}).get("status") == "limited":
         return False, None, f"Claude Code 当前额度受限: {cache['claude'].get('reason')}"
+
+    # Resolve repo_root if not provided but cwd is given
+    if not repo_root and cwd:
+        repo_root = find_git_root(cwd) or cwd
+
+    # Fail-closed enforcement: if writable, sandbox is mandatory
+    if not readonly:
+        if not is_bwrap_available():
+            return False, None, "Claude 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        if not (repo_root and cwd):
+            return False, None, "Claude 写入任务缺少工作区目录或仓库根路径，无法建立沙箱隔离，拒绝执行"
 
     cmd = ["claude", "-p", prompt]
     if readonly:
@@ -51,7 +64,6 @@ def execute_claude_task(
         cmd.extend(["--model", "haiku"])
 
     if repo_root and cwd:
-        from makewand.sandbox import is_bwrap_available, wrap_bwrap
         if is_bwrap_available():
             cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=True, readonly=readonly, repo_root=repo_root, is_provider=True)
 
