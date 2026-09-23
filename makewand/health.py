@@ -187,6 +187,23 @@ def save_status_cache(cache: Dict[str, Any]):
     except Exception:
         pass
 
+def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = None) -> None:
+    """
+    Directly writes a live rate-limit/429 status event into the shared status cache.
+    Allows immediate cross-session visibility without waiting for periodic polling probes.
+    """
+    model_name = engine.lower().strip()
+    now = datetime.now().isoformat()
+    status_entry = {
+        model_name: {
+            "status": "limited",
+            "reason": reason,
+            "resets_at": resets_at,
+            "updated_at": now
+        }
+    }
+    save_status_cache(status_entry)
+
 def probe_model(model_name: str) -> Dict[str, Any]:
     now = datetime.now().isoformat()
     if not check_cli_installed(model_name):

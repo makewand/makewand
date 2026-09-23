@@ -1,4 +1,4 @@
-.PHONY: all install test test-py test-go prelaunch probe status clean
+.PHONY: all install test test-py test-go check-secrets prelaunch probe status clean
 
 all: test
 
@@ -13,11 +13,12 @@ test-go:
 
 test: test-py test-go
 
-prelaunch: test
+check-secrets:
+	./scripts/check_secrets.sh
+
+prelaunch: test check-secrets
 	@echo "Checking shell script syntax..."
 	@for f in scripts/*.sh; do bash -n "$$f" || exit 1; done
-	@echo "Checking for local absolute paths in docs..."
-	@! grep --line-number --fixed-strings '/path/to/workspace/makewand' README.md docs/*.md 2>/dev/null || (echo "Found local absolute paths!" && exit 1)
 	@echo "Prelaunch checks passed successfully!"
 
 probe:

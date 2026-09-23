@@ -323,6 +323,7 @@ def main():
     # review
     p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity")
     p_rev.add_argument("--cwd", help="Target working directory")
+    p_rev.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_rev.add_argument("--stream", action="store_true", default=False, help="Stream review output line-by-line")
     p_rev.add_argument("--timeout", type=int, default=300)
 
@@ -437,7 +438,7 @@ def main():
             sys.exit(EXIT_FAILED)
         sys.exit(EXIT_PASSED)
     elif args.subcommand == "review":
-        exit_code = run_review(cwd=args.cwd, stream=args.stream, timeout=args.timeout)
+        exit_code = run_review(cwd=args.cwd, stream=args.stream, timeout=args.timeout, output_json=getattr(args, "json", False))
         sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand == "race":
         exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout)

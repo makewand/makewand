@@ -25,20 +25,33 @@ CLAUDE_LIMIT_24H = 60
 CLAUDE_WARN_7D = 120
 CLAUDE_LIMIT_7D = 200
 
+def _get_lock_file() -> Path:
+    ensure_config_dir()
+    return USAGE_WINDOW_FILE.parent / f".{USAGE_WINDOW_FILE.stem}.lock"
+
 def _load_raw_usage_records(max_age_days: float = 7.0) -> List[Dict[str, Any]]:
     ensure_config_dir()
     if not USAGE_WINDOW_FILE.exists():
         return []
 
+    lock_file = _get_lock_file()
+    data = []
     try:
-        with open(USAGE_WINDOW_FILE, "r", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+        with open(lock_file, "a+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_SH)
             try:
-                data = json.load(f)
+                if USAGE_WINDOW_FILE.exists():
+                    with open(USAGE_WINDOW_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     except Exception:
-        return []
+        try:
+            if USAGE_WINDOW_FILE.exists():
+                with open(USAGE_WINDOW_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+        except Exception:
+            return []
 
     if not isinstance(data, list):
         return []
@@ -59,15 +72,19 @@ def _load_raw_usage_records(max_age_days: float = 7.0) -> List[Dict[str, Any]]:
 
 def _save_raw_usage_records(records: List[Dict[str, Any]]) -> None:
     ensure_config_dir()
-    tmp_file = USAGE_WINDOW_FILE.with_suffix(".tmp")
+    lock_file = _get_lock_file()
+    tmp_file = USAGE_WINDOW_FILE.parent / f".{USAGE_WINDOW_FILE.stem}_{os.getpid()}_{datetime.now().timestamp()}.tmp"
     try:
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+        with open(lock_file, "a+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
             try:
-                json.dump(records, f, ensure_ascii=False, indent=2)
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(records, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_file, USAGE_WINDOW_FILE)
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        os.replace(tmp_file, USAGE_WINDOW_FILE)
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     except Exception:
         if tmp_file.exists():
             try:
@@ -82,7 +99,8 @@ def record_engine_usage(
     task: str = ""
 ) -> None:
     """
-    Records an invocation event of an engine into the rolling usage window.
+    Atomically records an invocation event of an engine into the rolling usage window.
+    Acquires an exclusive transactional flock across the entire Read-Modify-Write cycle.
     """
     engine_name = engine.lower().strip()
     record = {
@@ -93,9 +111,49 @@ def record_engine_usage(
         "task": (task[:100] if task else "")
     }
 
-    records = _load_raw_usage_records(max_age_days=7.0)
-    records.append(record)
-    _save_raw_usage_records(records)
+    ensure_config_dir()
+    lock_file = _get_lock_file()
+    tmp_file = USAGE_WINDOW_FILE.parent / f".{USAGE_WINDOW_FILE.stem}_{os.getpid()}_{datetime.now().timestamp()}.tmp"
+    try:
+        with open(lock_file, "a+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                # 1. Read existing records under exclusive lock
+                records = []
+                if USAGE_WINDOW_FILE.exists():
+                    try:
+                        with open(USAGE_WINDOW_FILE, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                            if isinstance(data, list):
+                                cutoff = datetime.now() - timedelta(days=7.0)
+                                for r in data:
+                                    if isinstance(r, dict) and "timestamp" in r and "engine" in r:
+                                        try:
+                                            ts = datetime.fromisoformat(r["timestamp"])
+                                            if ts >= cutoff:
+                                                records.append(r)
+                                        except Exception:
+                                            continue
+                    except Exception:
+                        records = []
+
+                # 2. Append new record
+                records.append(record)
+
+                # 3. Write via unique tmp file and atomic rename
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(records, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_file, USAGE_WINDOW_FILE)
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass
 
 def get_engine_usage_stats(window_hours: float = 4.0) -> Dict[str, Any]:
     """

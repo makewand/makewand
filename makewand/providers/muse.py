@@ -24,16 +24,31 @@ def execute_muse_task(
     tier: str = "standard",
     model: Optional[str] = None,
     stream: bool = False,
-    readonly: bool = False
+    readonly: bool = False,
+    repo_root: Optional[str] = None
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to Muse Code.
     If readonly=True, omits --yolo bypass flag.
+    If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
-    from makewand.health import load_status_cache, save_status_cache
+    from makewand.health import load_status_cache, save_status_cache, record_engine_limit
+    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.git_helper import find_git_root
     cache = load_status_cache()
     if cache.get("muse", {}).get("status") in ["limited", "needs_auth"]:
         return False, None, f"Muse Code 当前不可用: {cache['muse'].get('reason')}"
+
+    # Resolve repo_root if not provided but cwd is given
+    if not repo_root and cwd:
+        repo_root = find_git_root(cwd) or cwd
+
+    # Fail-closed enforcement: if writable, sandbox is mandatory
+    if not readonly:
+        if not is_bwrap_available():
+            return False, None, "Muse 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        if not (repo_root and cwd):
+            return False, None, "Muse 写入任务缺少工作区目录或仓库根路径，无法建立沙箱隔离，拒绝执行"
 
     cmd = ["muse", "exec"]
     if not readonly:
@@ -51,7 +66,11 @@ def execute_muse_task(
 
     cmd.append(prompt)
 
-    print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE))
+    if repo_root and cwd and is_bwrap_available():
+        cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=True, readonly=readonly, repo_root=repo_root, is_provider=True)
+
+    import sys
+    print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout,
@@ -66,13 +85,7 @@ def execute_muse_task(
 
     is_limited, reason, resets = parse_muse_quota(combined)
     if is_limited:
-        cache["muse"] = {
-            "status": "needs_auth" if "登录" in reason else "limited",
-            "reason": reason,
-            "resets_at": resets,
-            "updated_at": datetime.now().isoformat()
-        }
-        save_status_cache(cache)
+        record_engine_limit("muse", reason, resets)
         return False, None, f"Muse Code 执行中检测到限制: {reason}"
 
     return False, combined, ex or f"Muse returned exit code {code}"

@@ -4,6 +4,37 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+
+# Local AI tools & workstation environments (Never commit to public repo)
+.claude/
+.codex/
+.gemini/
+.makewand_sandbox_home/
+
+# Runtime locks, temporary state, and candidate directories
+*.lock
+.*.lock
+*.tmp
+.*.tmp
+*.tmp.*
+.*.tmp.*
+*.log
+*.patch
+quota_state.json
+usage_window.json
+candidates/
+delivery_*/
+
+# Local audit reports and scratch data
+*best_practices_report*.md
+*security_report*.md
+eval_*
+eval_results.json
+eval_claude_prompt.txt
+scratch/
 
 # Local test/work directories
 /benchmarks/
@@ -14,7 +45,14 @@ __pycache__/
 
 # Secrets / local env — never commit provider keys or server tokens
 .env
+.env.*
 deploy/.env
+*.pem
+*.key
+credentials.json
+token.json
 
 # OS/editor noise
 .DS_Store
+*.swp
+*.swo

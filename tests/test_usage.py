@@ -120,5 +120,27 @@ class TestUsage(unittest.TestCase):
             self.assertEqual(pen, 0.0)
             self.assertIsNone(reason)
 
+    def test_concurrent_record_no_lost_updates(self):
+        import concurrent.futures
+        with patch("makewand.usage.USAGE_WINDOW_FILE", self.test_file):
+            total_tasks = 40
+            def record_task(idx):
+                record_engine_usage(
+                    engine="codex" if idx % 2 == 0 else "claude",
+                    tier="standard",
+                    success=True,
+                    task=f"concurrent_task_{idx}"
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(record_task, i) for i in range(total_tasks)]
+                concurrent.futures.wait(futures)
+
+            stats = get_engine_usage_stats(window_hours=1.0)
+            self.assertEqual(stats["codex"]["total"], 20)
+            self.assertEqual(stats["claude"]["total"], 20)
+            records = _load_raw_usage_records(max_age_days=1.0)
+            self.assertEqual(len(records), total_tasks)
+
 if __name__ == "__main__":
     unittest.main()

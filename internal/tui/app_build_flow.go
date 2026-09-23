@@ -256,6 +256,10 @@ func (a App) handleFileWriteConfirm(msg confirmFileWriteMsg) (tea.Model, tea.Cmd
 
 	return a, func() tea.Msg {
 		checkpoint, checkpointErr := proj.CheckpointFiles(files)
+		if checkpointErr != nil {
+			return fileWriteCompleteMsg{written: 0, failed: len(files), errors: []string{fmt.Sprintf("checkpoint: %s", checkpointErr)}}
+		}
+
 		var written, failed int
 		var errors []string
 
@@ -267,13 +271,15 @@ func (a App) handleFileWriteConfirm(msg confirmFileWriteMsg) (tea.Model, tea.Cmd
 				written++
 			}
 		}
-		if failed > 0 && checkpointErr == nil && checkpoint != nil {
+		if failed > 0 && checkpoint != nil {
 			if err := checkpoint.Restore(); err != nil {
 				errors = append(errors, fmt.Sprintf("rollback: %s", err))
+				for _, bPath := range checkpoint.BackupPaths() {
+					errors = append(errors, fmt.Sprintf("preserved backup for manual recovery: %s", bPath))
+				}
 			}
-		}
-		if checkpointErr != nil {
-			errors = append(errors, fmt.Sprintf("checkpoint: %s", checkpointErr))
+		} else if checkpoint != nil {
+			checkpoint.Cleanup()
 		}
 
 		return fileWriteCompleteMsg{written: written, failed: failed, errors: errors}

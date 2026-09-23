@@ -26,11 +26,13 @@ def execute_claude_task(
     tier: str = "standard",
     model: Optional[str] = None,
     stream: bool = False,
-    readonly: bool = False
+    readonly: bool = False,
+    repo_root: Optional[str] = None
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to Claude Code.
     If readonly=True, restricts tools to read-only inspection (Read, Grep, Glob) preventing writes.
+    If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache
     cache = load_status_cache()
@@ -48,8 +50,14 @@ def execute_claude_task(
     elif tier == "fast":
         cmd.extend(["--model", "haiku"])
 
+    if repo_root and cwd:
+        from makewand.sandbox import is_bwrap_available, wrap_bwrap
+        if is_bwrap_available():
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=True, readonly=readonly, repo_root=repo_root, is_provider=True)
+
     log_desc = "只读解析任务 (工具只读约束)" if readonly else "代码任务 (无头权限自动穿透)"
-    print(c(f"[Makewand -> Claude] 派发{log_desc} (Tier: {tier})...", COLOR_BLUE))
+    import sys
+    print(c(f"[Makewand -> Claude] 派发{log_desc} (Tier: {tier})...", COLOR_BLUE), file=sys.stderr)
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout,
@@ -64,13 +72,8 @@ def execute_claude_task(
 
     is_limited, reason, resets = parse_claude_quota(combined)
     if is_limited:
-        cache["claude"] = {
-            "status": "limited",
-            "reason": reason,
-            "resets_at": resets,
-            "updated_at": datetime.now().isoformat()
-        }
-        save_status_cache(cache)
+        from makewand.health import record_engine_limit
+        record_engine_limit("claude", reason, resets)
         return False, None, f"Claude Code 执行中触发额度限制: {reason}"
 
     return False, combined, ex or f"Claude returned exit code {code}"

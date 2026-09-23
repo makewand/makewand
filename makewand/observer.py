@@ -13,20 +13,35 @@ import time
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from makewand.config import c, COLOR_BOLD, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_RESET
+from typing import Dict
+from makewand.config import (
+    CONFIG_DIR,
+    ensure_config_dir,
+    c,
+    COLOR_BOLD,
+    COLOR_CYAN,
+    COLOR_GREEN,
+    COLOR_YELLOW,
+    COLOR_RED,
+    COLOR_RESET
+)
 
-KNOWN_WORKSPACES = {
-    "sample_project_1": "/path/to/workspace/sample_project_1",
-    "sample_project_2": "/path/to/workspace/dev/sample_project_2",
-    "makewand": "/path/to/workspace/makewand",
-    "network": "/path/to/workspace/network",
-    "sample_project_6": "/path/to/workspace/sample_project_6/platform",
-    "stock": "/path/to/workspace/stock",
-    "sample_project_7": "/path/to/workspace/sample_project_7",
-    "sample_project_4": "/path/to/workspace/sample_project_4",
-    "sample_project_5": "/path/to/workspace/sample_project_5",
-    "sample_project_3": "/path/to/workspace/dev/sample_project_3"
-}
+def get_known_workspaces() -> Dict[str, str]:
+    """
+    Retrieves user-configured workspace directories from ~/.config/makewand/workspaces.json.
+    Allows pure dynamic detection or user-local overrides without hardcoding in open-source repository.
+    """
+    ensure_config_dir()
+    ws_file = CONFIG_DIR / "workspaces.json"
+    if ws_file.exists():
+        try:
+            with open(ws_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            pass
+    return {}
 
 def get_session_cwd(session_name: str) -> str:
     """Retrieve the current working directory for a tmux session dynamically."""
@@ -40,7 +55,7 @@ def get_session_cwd(session_name: str) -> str:
             return out
     except Exception:
         pass
-    return KNOWN_WORKSPACES.get(session_name, "unknown")
+    return get_known_workspaces().get(session_name, "unknown")
 
 def get_system_metrics():
     """Collect load average and memory stats."""
@@ -293,21 +308,26 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
         args_str = long_proc["args"]
         if "psycopg2" in args_str or "postgres" in args_str or "SELECT " in args_str:
             return "heavy_db_query", f"执行大型 SQL 统计已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})，引发磁盘 AIO 争抢"
+        elif "gh run watch" in args_str or "gh pr watch" in args_str or "gh run view" in args_str or "gh workflow" in args_str:
+            return "test_ci", f"远程 CI/GitHub Actions 构建监控中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
         elif "pytest" in args_str or "manage.py test" in args_str or re.search(r"\b(test|tests|unittest|jest|vitest)\b", args_str):
             return "test_ci", f"运行测试套件已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
-        elif any(k in args_str for k in ("build_snapshot", "train", "dataset", "stage_and_phash", "preprocess", "download")) or \
-             (session_name == "sample_project_5" and ("python" in long_proc["comm"] or "build" in args_str)):
+        elif any(k in args_str for k in ("build_snapshot", "train", "dataset", "stage_and_phash", "preprocess", "download", "pipeline")) or \
+             ("pipeline" in session_name and ("python" in long_proc["comm"] or "build" in args_str)):
             return "data_pipeline", f"大规模数据流水线/模型训练进行中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
         elif elapsed_min >= 30:
             return "hung_anomaly", f"子进程 (PID {long_proc['pid']}, {long_proc['comm']}) 持续运行达 {elapsed_min} 分钟"
 
-    # 3. Check for hung anomaly in sample_project_1 (specifically pytest with exclusive lock held)
-    if session_name == "sample_project_1":
-        if "running" in text and "bash scripts/ci/run_in_ephemer" in text:
-            return "hung_anomaly", "持续占用排他单槽锁或死锁挂起，需超时看门狗"
-        if "1 task(s)" in text and "task-" in text and "running" in text:
-            if is_file_locked("/run/lock/sample_project_1-p920-heavy-postgres.lock"):
-                return "hung_anomaly", "持有重型数据库锁挂起中"
+    # 3. Check for hung anomaly (specifically CI script or exclusive lock held)
+    if "running" in text and any(k in text for k in ("run_in_ephemer", "exclusive_lock", "heavy_lock")):
+        return "hung_anomaly", "持续占用排他单槽锁或死锁挂起，需超时看门狗"
+    if "1 task(s)" in text and "task-" in text and "running" in text:
+        try:
+            for lpath in Path("/run/lock").glob("*-heavy-*.lock"):
+                if is_file_locked(str(lpath)):
+                    return "hung_anomaly", f"持有重型数据库锁 ({lpath.name}) 挂起中"
+        except Exception:
+            pass
 
     # Makewand orchestration / scheduling
     if session_name == "makewand" and ("observe" in text or "schedule" in text or "orchestrat" in text):

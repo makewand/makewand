@@ -20,16 +20,23 @@ def execute_agy_task(
     tier: str = "standard",
     model: Optional[str] = None,
     stream: bool = False,
-    readonly: bool = False
+    readonly: bool = False,
+    repo_root: Optional[str] = None
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to Antigravity CLI.
     If readonly=True, enforces read-only instructions and constraints.
+    If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
-    cmd = ["agy", "-p", final_prompt, "--print-timeout", f"{timeout}s"]
-    if not readonly:
-        cmd.append("--dangerously-skip-permissions")
+    cmd = [
+        "agy", "-p", final_prompt,
+        "--print-timeout", f"{timeout}s",
+        "--dangerously-skip-permissions",
+        "--disable-slash-commands"
+    ]
+    if readonly:
+        cmd.extend(["--mode", "plan"])
 
     if model:
         cmd.extend(["--model", model])
@@ -40,8 +47,14 @@ def execute_agy_task(
     else:
         cmd.extend(["--effort", "medium"])
 
+    if repo_root and cwd:
+        from makewand.sandbox import is_bwrap_available, wrap_bwrap
+        if is_bwrap_available():
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=True, readonly=readonly, repo_root=repo_root, is_provider=True)
+
     log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
-    print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN))
+    import sys
+    print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN), file=sys.stderr)
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout + 15,
@@ -52,7 +65,13 @@ def execute_agy_task(
     combined = f"{out}\n{err}" if not stream else out
 
     if code == 0:
-        return True, out, None
+        cleaned_out = out.strip() if out else ""
+        if cleaned_out:
+            return True, cleaned_out, None
+        cleaned_err = err.strip() if err else ""
+        if cleaned_err and not any(k in cleaned_err.lower() for k in ["error", "fatal", "timed out"]):
+            return True, cleaned_err, None
+        return False, None, "Antigravity 执行完成但未能产生有效输出内容"
 
     is_limited, reason, _ = parse_agy_quota(combined)
     if is_limited:
