@@ -74,15 +74,24 @@ def _normalize_verdict_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(raw_pass, bool):
         pass_val = raw_pass
     elif isinstance(raw_pass, str):
-        pass_val = raw_pass.strip().lower() in ["true", "1", "yes", "pass"]
+        pass_val = raw_pass.strip().lower() in ["true", "1", "yes", "pass", "lgtm"]
     elif isinstance(raw_pass, (int, float)):
-        pass_val = bool(raw_pass)
+        # Strictly 1 is True; values like 2, -1, 0 must NOT be treated as True
+        pass_val = (raw_pass == 1)
 
     raw_defects = res.get("defects", [])
     if isinstance(raw_defects, str):
         defects_list = [raw_defects.strip()] if raw_defects.strip() else []
     elif isinstance(raw_defects, list):
         defects_list = [str(x).strip() for x in raw_defects if str(x).strip()]
+    elif isinstance(raw_defects, dict):
+        items = raw_defects.get("items") or raw_defects.get("defects") or list(raw_defects.values())
+        if isinstance(items, list):
+            defects_list = [str(x).strip() for x in items if str(x).strip()]
+        else:
+            defects_list = [str(raw_defects)]
+    elif raw_defects:
+        defects_list = [str(raw_defects).strip()]
     else:
         defects_list = []
 
@@ -190,6 +199,81 @@ def is_review_passed(review_text: str) -> bool:
         return True
 
     return False
+
+def format_review_diff(diff: str, max_chars: int = 15000) -> str:
+    """
+    Formats git diff for review prompts without silent full-truncation.
+    For small-to-medium diffs, preserves full content.
+    For large diffs (>max_chars), retains head & tail and emits clear truncation notice.
+    """
+    if not diff:
+        return ""
+    if len(diff) <= max_chars:
+        return diff
+    head_len = 10000
+    tail_len = 4000
+    head = diff[:head_len]
+    tail = diff[-tail_len:]
+    return (
+        f"{head}\n\n"
+        f"=== [Makewand Diff Truncated: 变更总长度为 {len(diff)} 字符，已展示前 {head_len} 字符及后 {tail_len} 字符核心片段。请审查模型结合只读文件读取工具审阅全貌] ===\n\n"
+        f"{tail}"
+    )
+
+def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
+    """
+    Deterministically detects and runs local unit test suites in cwd.
+    Returns (passed: bool, details: Optional[str]).
+    If no tests exist in project, returns (True, None).
+    """
+    import subprocess
+    import shutil
+    p = Path(cwd)
+
+    test_cmd = None
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{cwd}:{env.get('PYTHONPATH', '')}"
+
+    # 1. Python test suites
+    if (p / "pytest.ini").exists() or (p / "pyproject.toml").exists() or (p / "tests").is_dir() or list(p.glob("test_*.py")):
+        if shutil.which("pytest"):
+            test_target = ["tests"] if (p / "tests").is_dir() else []
+            test_cmd = ["pytest", "-q"] + test_target
+        else:
+            test_cmd = ["python3", "-m", "unittest", "discover", "-q"]
+
+    # 2. Go test suites
+    elif (p / "go.mod").exists():
+        test_cmd = ["go", "test", "./..."]
+
+    # 3. Node / npm test suites
+    elif (p / "package.json").exists():
+        try:
+            with open(p / "package.json", "r", encoding="utf-8") as f:
+                pkg_data = json.load(f)
+                if "test" in pkg_data.get("scripts", {}):
+                    test_cmd = ["npm", "test", "--", "--passWithNoTests"]
+        except Exception:
+            pass
+
+    # 4. Cargo / Rust
+    elif (p / "Cargo.toml").exists():
+        test_cmd = ["cargo", "test"]
+
+    if not test_cmd:
+        return True, None
+
+    try:
+        res = subprocess.run(test_cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+        if res.returncode == 0:
+            return True, res.stdout.strip()
+        else:
+            output = (res.stdout + "\n" + res.stderr).strip()
+            return False, output
+    except subprocess.TimeoutExpired:
+        return False, f"本地单元测试执行超时 (>{timeout}s)"
+    except Exception as ex:
+        return False, f"本地单元测试执行失败: {ex}"
 
 def has_critical_defects(review_text: str) -> bool:
     """
@@ -360,6 +444,25 @@ def classify_prompt_intent(prompt: str) -> str:
     """
     lower = prompt.lower().strip()
 
+    # 1. Action verbs for Chinese (expanded to include incremental creation words)
+    chinese_coding_triggers = [
+        "写代码", "写一个", "写个", "写段", "帮我写", "编写", "实现", "创建文件",
+        "生成代码", "重构", "修改代码", "改写代码", "落盘", "修bug", "修复",
+        "解决bug", "补丁", "优化代码", "写单测", "编写测试", "写脚本", "生成脚本",
+        "运行测试", "跑测试", "跑单测", "执行测试",
+        "添加", "增加", "支持", "接入", "对接", "开发", "引入", "新建", "加上",
+        "增加功能", "添加功能", "支持功能"
+    ]
+
+    # Action verbs for English with word boundary regex
+    english_coding_patterns = [
+        r"\bwrite\s+code\b", r"\bwrite\s+a\b", r"\bimplement\b", r"\bbuild\s+a\b",
+        r"\bcreate\s+(?:a\s+)?file\b", r"\bfix\s+bug\b", r"\bpatch\b", r"\brefactor\b",
+        r"\bgenerate\s+code\b", r"\bwrite\s+a\s+test\b", r"\bcode\s+a\b",
+        r"\brun\s+(?:the\s+)?tests?\b", r"\badd\b", r"\bcreate\b", r"\bdevelop\b",
+        r"\bsupport\b", r"\bintegrate\b"
+    ]
+
     # Check for explicit read-only or negation patterns first
     negation_patterns = [
         "不要修改", "不用修改", "别修改", "不要改", "别改", "不用改",
@@ -371,8 +474,22 @@ def classify_prompt_intent(prompt: str) -> str:
     ]
     has_negation = any(n in lower for n in negation_patterns)
 
-    # If user explicitly asks for code review/audit (e.g. "审查代码，不要修改")
-    if any(k in lower for k in ["审查", "审计", "review", "检查代码", "看下diff", "看下代码改动", "质检", "代码审计", "diff check"]):
+    # Has explicit coding action?
+    has_chinese_coding = any(k in lower for k in chinese_coding_triggers)
+    has_english_coding = any(re.search(pat, lower) for pat in english_coding_patterns)
+    has_coding_action = (has_chinese_coding or has_english_coding) and not has_negation
+
+    # If user explicitly asked for code modifications (even if they also asked to review, e.g. "实现一个登录接口并审查代码")
+    if has_coding_action:
+        # Avoid pure informational questions like "如何添加搜索功能？"
+        if not any(q in lower for q in ["如何", "怎么", "规范是什么", "是什么", "有哪些", "why", "how"]):
+            return "code"
+        elif any(act in lower for act in ["并在当前目录落盘", "保存到", "写入文件", "修改文件", "并落盘"]):
+            return "code"
+
+    # If user asked for review without coding actions (or with explicit read-only negation)
+    review_keywords = ["审查", "审计", "review", "检查代码", "看下diff", "看下代码改动", "质检", "代码审计", "diff check"]
+    if any(k in lower for k in review_keywords):
         return "review"
 
     if has_negation:
@@ -380,31 +497,6 @@ def classify_prompt_intent(prompt: str) -> str:
 
     if is_identity_or_chit_chat(prompt):
         return "identity"
-
-    # Action verbs for Chinese
-    chinese_coding_triggers = [
-        "写代码", "写一个", "写个", "写段", "帮我写", "编写", "实现", "创建文件",
-        "生成代码", "重构", "修改代码", "改写代码", "落盘", "修bug", "修复",
-        "解决bug", "补丁", "优化代码", "写单测", "编写测试", "写脚本", "生成脚本",
-        "运行测试", "跑测试", "跑单测", "执行测试"
-    ]
-    if any(k in lower for k in chinese_coding_triggers):
-        if not any(q in lower for q in ["如何", "怎么", "规范是什么", "是什么", "有哪些", "why", "how"]):
-            return "code"
-        elif any(act in lower for act in ["并在当前目录落盘", "保存到", "写入文件", "修改文件", "并落盘"]):
-            return "code"
-
-    # Action verbs for English with word boundary regex
-    english_coding_patterns = [
-        r"\bwrite\s+code\b", r"\bwrite\s+a\b", r"\bimplement\b", r"\bbuild\s+a\b",
-        r"\bcreate\s+a\s+file\b", r"\bfix\s+bug\b", r"\bpatch\b", r"\brefactor\b",
-        r"\bgenerate\s+code\b", r"\bwrite\s+a\s+test\b", r"\bcode\s+a\b",
-        r"\brun\s+(?:the\s+)?tests?\b"
-    ]
-    for pat in english_coding_patterns:
-        if re.search(pat, lower):
-            if not any(q in lower for q in ["what is", "what are", "how does", "why does"]):
-                return "code"
 
     # Default to explain mode for general questions/explanations/conversations
     return "explain"
@@ -480,10 +572,10 @@ def dispatch_task(
 
     try:
         from makewand.usage import record_engine_usage
-        record_engine_usage(engine, tier=tier, success=True, task=prompt)
+        record_engine_usage(engine, tier=tier, success=False, task=prompt)
     except Exception:
         pass
-    return True, (str(res) if res is not None else "LGTM"), None
+    return False, None, f"引擎 {engine} 适配器返回了异常或非预期格式: {type(res).__name__}"
 
 def _match_domain_keywords(keywords: List[str], text: str) -> List[str]:
     """
@@ -641,7 +733,8 @@ def run_pipeline(
     auto_fix: bool = True,
     max_fix: int = 2,
     timeout: int = 300,
-    total_budget: Optional[int] = None
+    total_budget: Optional[int] = None,
+    force_code: bool = False
 ) -> bool:
     check_load_backpressure()
     if not cwd:
@@ -663,7 +756,11 @@ def run_pipeline(
             return 0
         return min(requested, left)
 
-    intent = classify_prompt_intent(prompt)
+    if force_code:
+        intent = "code"
+    else:
+        intent = classify_prompt_intent(prompt)
+
     if intent == "identity":
         print(c("💡 Makewand 意图识别: 身份/能力问答 (无需执行代码修改或程序检查)", COLOR_BOLD + COLOR_GREEN))
         print(get_identity_message())
@@ -839,15 +936,24 @@ def run_pipeline(
         print(c("ℹ 本次任务未产生相对于基线的有效代码改动 (git diff 为空)，无需启动红队复审与自愈流水线。", COLOR_CYAN))
         return fail_and_cleanup("❌ [Makewand Quality Gate] 任务未产生任何有效代码改动，终止交付。")
 
+    # Run deterministic local test suite before review
+    print(c("🧪 [Makewand Test Gate] 正在执行本地确定性测试验证...", COLOR_CYAN))
+    test_ok, test_err = run_local_tests(cwd)
+    if not test_ok:
+        print(c(f"❌ [Makewand Test Gate] 发现单元测试失败：\n{test_err[:400]}", COLOR_RED + COLOR_BOLD))
+    else:
+        print(c("✔ [Makewand Test Gate] 本地测试套件校验通过 (或无单测需执行)。", COLOR_GREEN))
+
     print(c("\n▶ 阶段 2: 独立代码审计与质检 (Red-team Review - Tier: deep, 只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
-    diff_snippet = diff_out[:4500]
+    diff_snippet = format_review_diff(diff_out)
+    test_warning = f"\n【重要：本地测试运行失败】代码改动后本地单元测试报错如下：\n{test_err[:1500]}\n" if not test_ok else ""
 
     review_prompt = (
-        f"工作目录为: {cwd}。请审查以下代码改动（git diff），严查潜在并发死锁、内存泄露、空指针与边界用例漏洞。\n"
-        f"若发现严重隐患，请标注 [P1] 或 [P2] 并给出明确修复建议；若逻辑严谨无严重漏洞，请明确回复'LGTM / 审核通过'。\n"
+        f"工作目录为: {cwd}。请审查以下代码改动（git diff），严查潜在并发死锁、内存泄露、空指针与边界用例漏洞。{test_warning}\n"
+        f"若发现严重隐患或单测报错未解决，请标注 [P1] 或 [P2] 并给出明确修复建议；若逻辑严谨无严重漏洞且单测全通，请明确回复'LGTM / 审核通过'。\n"
         f"【重要输出规范】请在回答最后一行务必输出且仅输出一行 JSON 判定：\n"
-        f"MAKEWAND_VERDICT: {{\"pass\": true, \"defects\": []}} (若无严重缺陷)\n"
-        f"或 MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"缺陷简要描述\"]}} (若存在严重隐患)\n"
+        f"MAKEWAND_VERDICT: {{\"pass\": true, \"defects\": []}} (若无严重缺陷且单测通过)\n"
+        f"或 MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"缺陷简要描述\"]}} (若存在严重隐患或单测失败)\n"
         f"--- 代码改动 (git diff) ---\n{diff_snippet}"
     )
 
@@ -872,6 +978,12 @@ def run_pipeline(
             break
         else:
             print(c(f"⚠ {r_eng.upper()} 审查未产生有效响应: {err}", COLOR_YELLOW))
+
+    # Deterministic test gate override: if local tests failed, pass cannot be True
+    if not test_ok and review_output:
+        review_verdict = extract_verdict_json(review_output)
+        if review_verdict and review_verdict.get("pass"):
+            review_output = f"MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"本地单元测试执行失败: {test_err[:120]}\"]}}\n\n本地单测报错如下：\n{test_err[:2000]}"
 
     # Fail-Closed Quality Gate: If code has changes but review fails completely or is empty, reject delivery
     if not review_output or not review_output.strip():
@@ -898,12 +1010,14 @@ def run_pipeline(
 
             # Coder fixes
             fixed = False
+            actual_fix_engine = None
             step_timeout = get_remaining_timeout(timeout)
             if coder_engine and step_timeout > 0:
                 print(c(f"→ 由主力编码引擎 {coder_engine.upper()} 执行缺陷修复...", COLOR_YELLOW))
                 ok, _, _ = dispatch_task(coder_engine, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root)
                 if ok:
                     fixed = True
+                    actual_fix_engine = coder_engine
 
             if not fixed:
                 for alt_c in coder_candidates:
@@ -915,11 +1029,19 @@ def run_pipeline(
                         ok, _, _ = dispatch_task(alt_c, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root)
                         if ok:
                             fixed = True
+                            actual_fix_engine = alt_c
                             break
 
             if not fixed:
                 print(c("⚠ 缺陷自动修复未产生有效更新，维持当前审查结论。", COLOR_YELLOW))
                 break
+
+            # Re-run deterministic local tests after fix
+            test_ok, test_err = run_local_tests(cwd)
+            if not test_ok:
+                print(c(f"❌ [Makewand Test Gate] 修复后本地单元测试仍未通过：\n{test_err[:400]}", COLOR_RED))
+            else:
+                print(c("✔ [Makewand Test Gate] 修复后本地单元测试执行全通！", COLOR_GREEN))
 
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout <= 0:
@@ -928,17 +1050,29 @@ def run_pipeline(
 
             print(c(f"▶ [Makewand Auto-Fix] 修复已落盘，重新发起第 {current_fix_iter} 轮红队复审 (只读安全隔离)...", COLOR_CYAN))
             new_diff = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
+            new_diff_snippet = format_review_diff(new_diff)
+            re_test_warning = f"\n【重要：本地测试仍未通过】报错如下：\n{test_err[:1500]}\n" if not test_ok else ""
+
             re_review_prompt = (
-                f"工作目录为: {cwd}。经过上一轮缺陷修复后，请复审以下代码改动，检查上述缺陷是否已彻底解决，是否存在新隐患。\n"
-                f"若发现严重隐患，请标注 [P1] 或 [P2] 并给出明确修复建议；若逻辑严谨无严重漏洞，请明确回复'LGTM / 审核通过'。\n"
+                f"工作目录为: {cwd}。经过上一轮缺陷修复后，请复审以下代码改动，检查上述缺陷是否已彻底解决，是否存在新隐患。{re_test_warning}\n"
+                f"若发现严重隐患或单测报错未解决，请标注 [P1] 或 [P2] 并给出明确修复建议；若逻辑严谨无严重漏洞且单测全通，请明确回复'LGTM / 审核通过'。\n"
                 f"【重要输出规范】请在回答最后一行务必输出且仅输出一行 JSON 判定：\n"
-                f"MAKEWAND_VERDICT: {{\"pass\": true, \"defects\": []}} (若已修复且无严重缺陷)\n"
-                f"或 MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"新缺陷描述\"]}} (若仍存在严重隐患)\n"
-                f"--- 最新代码改动 (git diff) ---\n{new_diff[:4500]}"
+                f"MAKEWAND_VERDICT: {{\"pass\": true, \"defects\": []}} (若已修复且无严重缺陷且测试通过)\n"
+                f"或 MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"新缺陷描述\"]}} (若仍存在严重隐患或单测失败)\n"
+                f"--- 最新代码改动 (git diff) ---\n{new_diff_snippet}"
             )
 
+            # Strictly exclude actual_fix_engine from reviewers to preserve cross-model independence
+            candidate_re_reviewers = [r for r in actual_reviewers if r != actual_fix_engine]
+            if not candidate_re_reviewers:
+                healthy_alts = [
+                    e for e in ["codex", "claude", "agy", "muse"]
+                    if e != actual_fix_engine and cache.get(e, {}).get("status") not in ["limited", "needs_auth", "missing"]
+                ]
+                candidate_re_reviewers = healthy_alts if healthy_alts else [e for e in ["codex", "claude", "agy", "muse"] if e != actual_fix_engine]
+
             re_output = None
-            for alt_r in actual_reviewers:
+            for alt_r in candidate_re_reviewers:
                 step_timeout = get_remaining_timeout(timeout)
                 if step_timeout <= 0:
                     break
@@ -947,6 +1081,12 @@ def run_pipeline(
                 if ok and out and out.strip():
                     re_output = out
                     break
+
+            # Deterministic test gate override: if local tests failed, pass cannot be True
+            if not test_ok and re_output:
+                re_verdict = extract_verdict_json(re_output)
+                if re_verdict and re_verdict.get("pass"):
+                    re_output = f"MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"本地单元测试执行失败: {test_err[:120]}\"]}}\n\n本地单测报错如下：\n{test_err[:2000]}"
 
             if re_output:
                 # Capture the flagged defects from the prior round BEFORE overwriting review_output

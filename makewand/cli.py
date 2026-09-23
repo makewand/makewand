@@ -5,6 +5,8 @@ Makewand CLI: Command-line interface and subcommand parsers.
 import os
 import sys
 import argparse
+from pathlib import Path
+from typing import List, Optional, Dict, Any
 from makewand.config import (
     c,
     COLOR_BOLD,
@@ -288,11 +290,45 @@ def cmd_discard(args):
     else:
         print(c(f"❌ {msg}", COLOR_RED))
 
+def delegate_to_go_server(args_list: List[str]):
+    """Delegates server/TUI commands to compiled Go makewand binary or source."""
+    import shutil
+    import subprocess
+    candidates = [
+        Path(__file__).resolve().parent.parent / "bin" / "makewand-server",
+        Path(__file__).resolve().parent.parent / "bin" / "makewand-go",
+        Path(__file__).resolve().parent.parent / "dist" / "makewand",
+        shutil.which("makewand-server"),
+        shutil.which("makewand-go")
+    ]
+    bin_path = next((str(c) for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
+    if not bin_path and shutil.which("go"):
+        cmd_dir = Path(__file__).resolve().parent.parent / "cmd" / "makewand"
+        if cmd_dir.is_dir():
+            cmd = ["go", "run", "./cmd/makewand"] + args_list
+            ret = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent))
+            sys.exit(ret.returncode)
+
+    if bin_path:
+        ret = subprocess.run([bin_path] + args_list)
+        sys.exit(ret.returncode)
+
+    print(f"❌ 命令 '{args_list[0]}' 为 Makewand 服务端/远程扩展组件，需要 Go 编译产物支持。")
+    print("   请在项目根目录运行: go build -o bin/makewand-server ./cmd/makewand")
+    sys.exit(1)
+
 def main():
+    GO_SUBCOMMANDS = {
+        "serve", "chat", "new", "preview", "doctor", "setup", "token", "audit", "usage", "user", "state"
+    }
+    if len(sys.argv) > 1 and sys.argv[1] in GO_SUBCOMMANDS:
+        delegate_to_go_server(sys.argv[1:])
+
     parser = argparse.ArgumentParser(
         prog="makewand",
         description="Makewand v3.0: Unified Multi-Model AI Subscription Orchestrator"
     )
+    parser.add_argument("-v", "--version", action="version", version="makewand 3.0.0")
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     # models
@@ -432,7 +468,8 @@ def main():
             stream=args.stream,
             auto_fix=args.auto_fix,
             max_fix=args.max_fix,
-            timeout=args.timeout
+            timeout=args.timeout,
+            force_code=True
         )
         if not ok:
             sys.exit(EXIT_FAILED)

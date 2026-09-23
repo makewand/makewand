@@ -28,6 +28,20 @@ def execute_agy_task(
     If readonly=True, enforces read-only instructions and constraints.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
+    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.git_helper import find_git_root
+
+    # Resolve repo_root if not provided but cwd is given
+    if not repo_root and cwd:
+        repo_root = find_git_root(cwd) or cwd
+
+    # Fail-closed enforcement: if writable, sandbox is mandatory
+    if not readonly:
+        if not is_bwrap_available():
+            return False, None, "Antigravity 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        if not (repo_root and cwd):
+            return False, None, "Antigravity 写入任务缺少工作区目录或仓库根路径，无法建立沙箱隔离，拒绝执行"
+
     final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
     cmd = [
         "agy", "-p", final_prompt,
@@ -48,7 +62,6 @@ def execute_agy_task(
         cmd.extend(["--effort", "medium"])
 
     if repo_root and cwd:
-        from makewand.sandbox import is_bwrap_available, wrap_bwrap
         if is_bwrap_available():
             cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=True, readonly=readonly, repo_root=repo_root, is_provider=True)
 
