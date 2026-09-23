@@ -15,22 +15,37 @@ fi
 
 SCAN_FAIL=0
 
-# 1. Patterns that must NEVER appear in open-source commits
-FORBIDDEN_NAMES=(
-    "adlims"
-    "dibiaoshui"
-    "zainadiao"
-    "whereifish"
-    "yufenlei"
-    "shineiyun"
-    "watersmap"
-)
+# 1. Private project names (loaded dynamically from local config or env)
+FORBIDDEN_NAMES=()
+NAMES_FILE="${MAKEWAND_FORBIDDEN_NAMES_FILE:-${HOME}/.config/makewand/forbidden_patterns.txt}"
+if [ -f "$NAMES_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+            FORBIDDEN_NAMES+=("$line")
+        fi
+    done < "$NAMES_FILE"
+fi
+if [ -n "${MAKEWAND_FORBIDDEN_NAMES:-}" ]; then
+    IFS=', ' read -r -a extra_names <<< "$MAKEWAND_FORBIDDEN_NAMES"
+    FORBIDDEN_NAMES+=("${extra_names[@]}")
+fi
 
-# 2. Hardcoded local path patterns
-FORBIDDEN_PATHS=(
-    "/home/user/"
-    "/mnt/data/"
-)
+# 2. Hardcoded local path patterns (loaded dynamically from local config or env)
+FORBIDDEN_PATHS=()
+PATHS_FILE="${MAKEWAND_FORBIDDEN_PATHS_FILE:-${HOME}/.config/makewand/forbidden_paths.txt}"
+if [ -f "$PATHS_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+            FORBIDDEN_PATHS+=("$line")
+        fi
+    done < "$PATHS_FILE"
+fi
+if [ -n "${MAKEWAND_FORBIDDEN_PATHS:-}" ]; then
+    IFS=', ' read -r -a extra_paths <<< "$MAKEWAND_FORBIDDEN_PATHS"
+    FORBIDDEN_PATHS+=("${extra_paths[@]}")
+fi
 
 # 3. Credential & secret regex patterns
 CREDENTIAL_REGEXES=(
@@ -43,21 +58,29 @@ CREDENTIAL_REGEXES=(
 
 # 1. Scan for forbidden names
 echo "1. Scanning files for private project names..."
-for name in "${FORBIDDEN_NAMES[@]}"; do
-    if git grep -I -i -n --fixed-strings "$name" "${GREP_ARGS[@]}" ':!scripts/check_secrets.sh' 2>/dev/null; then
-        echo "❌ [SECURITY LEAK] Found forbidden private project reference: '$name'"
-        SCAN_FAIL=1
-    fi
-done
+if [ ${#FORBIDDEN_NAMES[@]} -gt 0 ]; then
+    for name in "${FORBIDDEN_NAMES[@]}"; do
+        if git grep -I -i -n --fixed-strings "$name" "${GREP_ARGS[@]}" 2>/dev/null; then
+            echo "❌ [SECURITY LEAK] Found forbidden private project reference: '$name'"
+            SCAN_FAIL=1
+        fi
+    done
+else
+    echo "   (No custom project names configured; skipped. Set ~/.config/makewand/forbidden_patterns.txt to enable)"
+fi
 
 # 2. Scan for hardcoded host paths
 echo "2. Scanning files for hardcoded host paths..."
-for path_pat in "${FORBIDDEN_PATHS[@]}"; do
-    if git grep -I -n --fixed-strings "$path_pat" "${GREP_ARGS[@]}" ':!scripts/check_secrets.sh' 2>/dev/null; then
-        echo "❌ [SECURITY LEAK] Found forbidden host absolute path: '$path_pat'"
-        SCAN_FAIL=1
-    fi
-done
+if [ ${#FORBIDDEN_PATHS[@]} -gt 0 ]; then
+    for path_pat in "${FORBIDDEN_PATHS[@]}"; do
+        if git grep -I -n --fixed-strings "$path_pat" "${GREP_ARGS[@]}" 2>/dev/null; then
+            echo "❌ [SECURITY LEAK] Found forbidden host absolute path: '$path_pat'"
+            SCAN_FAIL=1
+        fi
+    done
+else
+    echo "   (No custom host paths configured; skipped. Set ~/.config/makewand/forbidden_paths.txt to enable)"
+fi
 
 # 3. Scan for credentials
 echo "3. Scanning files for credential patterns..."
