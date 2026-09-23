@@ -20,20 +20,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
-      - name: Reject local absolute doc links
+      - name: Open-source secret & sanitization scan
         shell: bash
         run: |
-          set -euo pipefail
-          mapfile -t markdown_files < <(find README.md docs .github -type f \( -name '*.md' -o -name '*.markdown' \))
-          if [ "${#markdown_files[@]}" -eq 0 ]; then
-            exit 0
-          fi
-          if grep --line-number --fixed-strings '/mnt/data/makewand' "${markdown_files[@]}"; then
-            echo "found local absolute links; use repository-relative markdown links instead" >&2
-            exit 1
-          fi
+          ./scripts/check_secrets.sh
 
       - name: Check shell script syntax
         shell: bash
@@ -45,7 +37,7 @@ jobs:
           done
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -86,6 +78,14 @@ jobs:
       - name: Run tests
         run: bash ./scripts/test_gate.sh
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Python unit tests
+        run: python3 -m unittest discover tests -v
+
       - name: Run race tests
         # scripts/test_race.sh is the single source of truth for race
         # coverage; it derives its package list from `go list ./...` so the
@@ -94,6 +94,16 @@ jobs:
 
       - name: Run vet
         run: go vet ./cmd/... ./internal/... ./router
+
+      - name: Run govulncheck
+        # Fail CI on any known vulnerability reachable from our code. The Go
+        # toolchain is selected from go.mod (go-version-file above), so bumping
+        # the `go` directive to a patched release is what clears stdlib CVEs.
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9

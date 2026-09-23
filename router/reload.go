@@ -24,11 +24,18 @@ const DefaultReloadInterval = 30 * time.Second
 //
 // Returns immediately. Call with a cancellable context to stop the watcher.
 // Errors during reload are traced (if a TraceSink is set) but do not stop the watcher.
+//
+// Deprecated: no makewand entrypoint wires this up — the CLI and server load
+// routing.json once at startup and require a restart to apply changes. It
+// remains a library-only opt-in and is scheduled for removal in v0.3
+// (docs/MAKEWAND_OPTIMIZATION_PLAN.md). New code should not depend on it.
 func (r *Router) WatchOverrides(ctx context.Context, configDir string) {
 	r.WatchOverridesInterval(ctx, configDir, DefaultReloadInterval)
 }
 
 // WatchOverridesInterval is like WatchOverrides but with a custom polling interval.
+//
+// Deprecated: see WatchOverrides. Scheduled for removal in v0.3.
 func (r *Router) WatchOverridesInterval(ctx context.Context, configDir string, interval time.Duration) {
 	if configDir == "" || interval <= 0 {
 		return

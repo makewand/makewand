@@ -24,18 +24,41 @@ import (
 )
 
 var (
-	debugFlag       bool
-	rootModeFlag    string
-	rootPrintFlag   bool
-	rootTimeoutFlag time.Duration
-	repoTrustFlag   string
+	debugFlag        bool
+	rootModeFlag     string
+	rootPrintFlag    bool
+	rootTimeoutFlag  time.Duration
+	repoTrustFlag    string
+	rootApprovalFlag string
 
 	// resolvedRepoTrust holds the repository trust level parsed once by the root
 	// command's PersistentPreRunE, so every subcommand shares a single validated
 	// value. PersistentPreRunE rejects an invalid --repo-trust before any backend
 	// check or router construction runs.
 	resolvedRepoTrust model.RepoTrust
+
+	// resolvedApprovalOverride holds the canonical --approval value parsed once
+	// by PersistentPreRunE ("" when the flag was not given). It overrides the
+	// configured approval mode for this process only; nothing writes it back to
+	// disk except `makewand setup`, which persists its (possibly overridden)
+	// config as part of its normal save.
+	resolvedApprovalOverride string
 )
+
+// resolveApprovalOverride strictly parses the --approval flag value. An empty
+// value means "keep the configured mode". Anything else must parse exactly;
+// NormalizeApprovalMode is NOT used here because it silently degrades unknown
+// values to manual, which would hide typos like --approval autopilto.
+func resolveApprovalOverride(value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", nil
+	}
+	mode, ok := config.ParseApprovalMode(value)
+	if !ok {
+		return "", fmt.Errorf("invalid --approval %q: must be manual, safe, or autopilot", value)
+	}
+	return mode, nil
+}
 
 // resolveRepoTrust parses the --repo-trust flag value into a model.RepoTrust.
 // An empty or "trusted" value resolves to the trusted default; "untrusted"
@@ -85,7 +108,9 @@ Flags:
   --repo-trust trusted|untrusted  Repository trust level (default: trusted).
       In untrusted mode only direct API providers may generate against the repo
       (fail closed), and repo-provided .makewand/rules.md is not treated as
-      trusted instructions. Use it for third-party/unreviewed repositories.`,
+      trusted instructions. Use it for third-party/unreviewed repositories.
+  --approval manual|safe|autopilot  Approval mode for this run only (default:
+      configured value). Persist a default with 'makewand setup --approval ...'.`,
 		Args: cobra.ArbitraryArgs,
 		// Validate --repo-trust once, globally, before any subcommand's RunE and
 		// before any backend check. This is a persistent flag, so a bad value must
@@ -98,6 +123,11 @@ Flags:
 				return err
 			}
 			resolvedRepoTrust = trust
+			approval, err := resolveApprovalOverride(rootApprovalFlag)
+			if err != nil {
+				return err
+			}
+			resolvedApprovalOverride = approval
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -131,8 +161,10 @@ Flags:
 				}
 			}
 
+			hostAuth := resolveUnsafeHostExecAuth(cfg)
+
 			if shouldUseHeadless(initialPrompt, rootPrintFlag, isTTY) {
-				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag, repoTrust, debugFlag)
+				return runSinglePrompt(cfg, initialPrompt, rootTimeoutFlag, repoTrust, hostAuth, debugFlag)
 			}
 			if rootPrintFlag && initialPrompt == "" {
 				return fmt.Errorf("--print requires a non-empty prompt (via argument or piped stdin)")
@@ -141,7 +173,7 @@ Flags:
 				return fmt.Errorf("interactive TTY not detected; provide a prompt or use --print")
 			}
 
-			return tui.RunWithPrompt(tui.ModeChat, cfg, ".", initialPrompt, repoTrust, debugFlag)
+			return tui.RunWithPrompt(tui.ModeChat, cfg, ".", initialPrompt, repoTrust, hostAuth, debugFlag)
 		},
 		Version: buildinfo.FormatVersion(),
 	}
@@ -150,6 +182,7 @@ Flags:
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(serveCmd())
 	rootCmd.AddCommand(tokenCmd())
+	rootCmd.AddCommand(stateCmd())
 	rootCmd.AddCommand(auditCmd())
 	rootCmd.AddCommand(usageCmd())
 	rootCmd.AddCommand(quotaCmd())
@@ -159,6 +192,7 @@ Flags:
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
 	rootCmd.PersistentFlags().StringVar(&repoTrustFlag, "repo-trust", "trusted", "repository trust level: trusted (default) or untrusted (only direct API providers, fail closed)")
+	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`)")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
 	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 0, "timeout for --print (default: auto per mode)")
@@ -205,7 +239,7 @@ func newCmd() *cobra.Command {
 				return trustErr
 			}
 
-			return tui.Run(tui.ModeNew, cfg, "", repoTrust, debugFlag)
+			return tui.Run(tui.ModeNew, cfg, "", repoTrust, resolveUnsafeHostExecAuth(cfg), debugFlag)
 		},
 	}
 
@@ -246,7 +280,7 @@ func chatCmd() *cobra.Command {
 				projectPath = args[0]
 			}
 
-			return tui.Run(tui.ModeChat, cfg, projectPath, repoTrust, debugFlag)
+			return tui.Run(tui.ModeChat, cfg, projectPath, repoTrust, resolveUnsafeHostExecAuth(cfg), debugFlag)
 		},
 	}
 
@@ -271,6 +305,17 @@ func previewCmd() *cobra.Command {
 			proj, err := engine.OpenProject(projectPath)
 			if err != nil {
 				return fmt.Errorf("could not open project: %w", err)
+			}
+			// Preview needs the config only for the unsafe host-exec
+			// acknowledgment state (and its language). Load it ONLY when the
+			// opt-in is requested, so a preview run without the env variable
+			// keeps its pre-existing behavior of never touching the config.
+			if unsafeHostExecRequested() {
+				previewCfg, cfgErr := config.LoadWithOptions(config.LoadOptions{SkipCLIDetection: true})
+				if cfgErr != nil {
+					diag.Stderr().WarnErr("could not load config", cfgErr)
+				}
+				proj.SetUnsafeHostExecAuthorization(resolveUnsafeHostExecAuth(previewCfg))
 			}
 
 			fmt.Printf("Starting preview server for %s...\n", proj.Name)
@@ -304,12 +349,22 @@ func setupCmd() *cobra.Command {
 		Short: "Inspect AI providers and save routing preferences",
 		Long: `Inspect auto-detected subscription CLIs, API key status, and provider access.
 The command keeps a valid configured mode and migrates unset or legacy modes to
-balanced. Use --mode to save a different preference without starting the chat UI.`,
+balanced. Use --mode to save a different preference without starting the chat UI.
+Use the global --approval flag to persist an approval mode (manual/safe/autopilot):
+setup saves its configuration, so 'makewand setup --approval safe' makes the
+override permanent while '--approval' on other commands applies to that run only.
+When MAKEWAND_UNSAFE_HOST_EXEC=1 is set, setup also offers the one-time host
+execution acknowledgment required before that opt-in takes effect.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigWithWarning()
 			if err := applySetupUsageMode(cfg, modeFlag); err != nil {
 				return err
 			}
+			// Offer the one-time unsafe host-exec acknowledgment here: setup is
+			// the documented interactive path for completing it. The resolver
+			// no-ops when MAKEWAND_UNSAFE_HOST_EXEC is unset. It records the
+			// acknowledgment on cfg too, so the Save below persists it as well.
+			_ = resolveUnsafeHostExecAuth(cfg)
 
 			fmt.Println("makewand setup")
 			fmt.Println()
@@ -362,6 +417,10 @@ balanced. Use --mode to save a different preference without starting the chat UI
 			fmt.Printf("  Language: %s\n", cfg.Language)
 			fmt.Printf("  Default model: %s\n", cfg.DefaultModel)
 			fmt.Printf("  Usage mode: %s\n", cfg.UsageMode)
+			fmt.Printf("  Approval mode: %s\n", config.NormalizeApprovalMode(cfg.ApprovalMode))
+			if cfg.UnsafeHostExecAckValid() {
+				fmt.Printf("  Unsafe host exec: acknowledged v%d at %s (audit: %s)\n", cfg.UnsafeHostExecAckVersion, cfg.UnsafeHostExecAckAt, unsafeHostExecAuditPathDisplay())
+			}
 			fmt.Println()
 			fmt.Println("Provider access types:")
 			fmt.Printf("  Claude: %s\n", accessDisplay(cfg.ClaudeAccess, "subscription"))
@@ -432,6 +491,12 @@ func loadConfigWithWarning() *config.Config {
 	if err != nil {
 		diag.Stderr().WarnErr("could not load config", err)
 	}
+	// Apply the --approval runtime override AFTER load so the flag wins for this
+	// process. Commands other than setup never save the config, so the override
+	// stays runtime-only; setup saving it is the documented persistence path.
+	if resolvedApprovalOverride != "" {
+		cfg.ApprovalMode = resolvedApprovalOverride
+	}
 	return cfg
 }
 
@@ -493,7 +558,7 @@ func readStdinPrompt() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, repoTrust model.RepoTrust, debug bool) error {
+func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, repoTrust model.RepoTrust, hostAuth engine.UnsafeHostExecAuthorization, debug bool) error {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return fmt.Errorf("prompt is empty")
@@ -529,6 +594,7 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, r
 	task := classifyPromptTask(prompt)
 	messages := []model.Message{{Role: "user", Content: prompt}}
 	project := openHeadlessProject(".")
+	project.SetUnsafeHostExecAuthorization(hostAuth)
 	systemPrompt := buildHeadlessSystemPrompt(project, task, router.Mode(), prompt, router)
 
 	// Auto-select timeout based on mode when user didn't set --timeout explicitly.

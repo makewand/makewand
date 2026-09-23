@@ -110,6 +110,7 @@ type TokenManager interface {
 	TokenRules() []TokenRuleView
 	Issue(rule TokenRule) (TokenRuleView, string, error)
 	Revoke(tokenID string) error
+	RevokeByUserID(userID string) error
 }
 
 // Authorizer authenticates Bearer tokens and returns scoped grants.
@@ -147,15 +148,17 @@ type Grant struct {
 // an in-flight request holding the old grant and new requests using the new
 // grant all accrue against one shared, mutex-protected set of counters.
 type grantUsage struct {
-	mu               sync.Mutex
-	quotaWindowStart time.Time
-	quotaWindowCount int
-	quotaDayStart    time.Time
-	quotaDayCount    int
-	costDayStart     time.Time
-	costDaySpent     float64
-	costMonthStart   time.Time
-	costMonthSpent   float64
+	mu                sync.Mutex
+	quotaWindowStart  time.Time
+	quotaWindowCount  int
+	quotaDayStart     time.Time
+	quotaDayCount     int
+	costDayStart      time.Time
+	costDaySpent      float64
+	costDayReserved   float64
+	costMonthStart    time.Time
+	costMonthSpent    float64
+	costMonthReserved float64
 }
 
 var (
@@ -501,7 +504,7 @@ func (g *Grant) MaxCostUSDPerMonth() float64 {
 }
 
 // CheckCostBudgetAt reports whether the token has already exhausted its spend
-// budget before processing another request.
+// budget (including in-flight reservations) before processing another request.
 func (g *Grant) CheckCostBudgetAt(now time.Time) error {
 	if g == nil || (g.maxCostUSDPerDay <= 0 && g.maxCostUSDPerMonth <= 0) {
 		return nil
@@ -516,13 +519,89 @@ func (g *Grant) CheckCostBudgetAt(now time.Time) error {
 	defer u.mu.Unlock()
 
 	u.resetCostWindowsLocked(dayWindow, monthWindow)
-	if g.maxCostUSDPerDay > 0 && u.costDaySpent >= g.maxCostUSDPerDay {
+	if g.maxCostUSDPerDay > 0 && (u.costDaySpent+u.costDayReserved) >= g.maxCostUSDPerDay {
 		return ErrDailyCostExceeded
 	}
-	if g.maxCostUSDPerMonth > 0 && u.costMonthSpent >= g.maxCostUSDPerMonth {
+	if g.maxCostUSDPerMonth > 0 && (u.costMonthSpent+u.costMonthReserved) >= g.maxCostUSDPerMonth {
 		return ErrMonthlyCostExceeded
 	}
 	return nil
+}
+
+// ReserveCostAt reserves an estimated max cost against the token's spend budgets
+// for an in-flight request. It returns a release callback that must be invoked
+// when the request completes, providing the actual realized cost.
+// If the actual cost is 0 (e.g. cancellation or failure), the reserved budget
+// is completely refunded without consuming spend.
+func (g *Grant) ReserveCostAt(now time.Time, estimatedCostUSD float64) (func(actualCostUSD float64), error) {
+	if g == nil || estimatedCostUSD <= 0 || (g.maxCostUSDPerDay <= 0 && g.maxCostUSDPerMonth <= 0) {
+		return func(actualCostUSD float64) {
+			if g != nil && actualCostUSD > 0 {
+				g.RecordCostAt(now, actualCostUSD)
+			}
+		}, nil
+	}
+
+	utcNow := now.UTC()
+	dayWindow := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
+	monthWindow := time.Date(utcNow.Year(), utcNow.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	u := g.usage
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.resetCostWindowsLocked(dayWindow, monthWindow)
+
+	if g.maxCostUSDPerDay > 0 && (u.costDaySpent+u.costDayReserved+estimatedCostUSD) > g.maxCostUSDPerDay {
+		return nil, ErrDailyCostExceeded
+	}
+	if g.maxCostUSDPerMonth > 0 && (u.costMonthSpent+u.costMonthReserved+estimatedCostUSD) > g.maxCostUSDPerMonth {
+		return nil, ErrMonthlyCostExceeded
+	}
+
+	if g.maxCostUSDPerDay > 0 {
+		u.costDayReserved += estimatedCostUSD
+	}
+	if g.maxCostUSDPerMonth > 0 {
+		u.costMonthReserved += estimatedCostUSD
+	}
+
+	var once sync.Once
+	release := func(actualCostUSD float64) {
+		once.Do(func() {
+			u.mu.Lock()
+			defer u.mu.Unlock()
+
+			if g.maxCostUSDPerDay > 0 {
+				if u.costDayStart.Equal(dayWindow) {
+					u.costDayReserved -= estimatedCostUSD
+					if u.costDayReserved < 0 {
+						u.costDayReserved = 0
+					}
+					if actualCostUSD > 0 {
+						u.costDaySpent += actualCostUSD
+					}
+				} else if actualCostUSD > 0 {
+					u.costDaySpent += actualCostUSD
+				}
+			}
+			if g.maxCostUSDPerMonth > 0 {
+				if u.costMonthStart.Equal(monthWindow) {
+					u.costMonthReserved -= estimatedCostUSD
+					if u.costMonthReserved < 0 {
+						u.costMonthReserved = 0
+					}
+					if actualCostUSD > 0 {
+						u.costMonthSpent += actualCostUSD
+					}
+				} else if actualCostUSD > 0 {
+					u.costMonthSpent += actualCostUSD
+				}
+			}
+		})
+	}
+
+	return release, nil
 }
 
 // RecordCostAt records the realized usage cost against the token's spend
@@ -638,10 +717,12 @@ func (u *grantUsage) resetCostWindowsLocked(dayWindow, monthWindow time.Time) {
 	if !dayWindow.IsZero() && (u.costDayStart.IsZero() || !u.costDayStart.Equal(dayWindow)) {
 		u.costDayStart = dayWindow
 		u.costDaySpent = 0
+		u.costDayReserved = 0
 	}
 	if !monthWindow.IsZero() && (u.costMonthStart.IsZero() || !u.costMonthStart.Equal(monthWindow)) {
 		u.costMonthStart = monthWindow
 		u.costMonthSpent = 0
+		u.costMonthReserved = 0
 	}
 }
 

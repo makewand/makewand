@@ -15,6 +15,12 @@ type Project struct {
 	Path          string
 	Files         []FileEntry
 	ScanTruncated bool
+
+	// unsafeHostAuth is the app-layer-resolved authorization for the
+	// MAKEWAND_UNSAFE_HOST_EXEC opt-in. Zero value = not acknowledged, so
+	// restricted plans fail closed instead of running on the host. Set via
+	// SetUnsafeHostExecAuthorization; CloneToTemp propagates it.
+	unsafeHostAuth UnsafeHostExecAuthorization
 }
 
 // FileEntry represents a file in the project tree.

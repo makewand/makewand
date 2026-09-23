@@ -64,10 +64,17 @@ func OpenWebhookNotifier(webhookURL, statePath string, usageReader serverusage.R
 	return n, nil
 }
 
-// Log implements serverusage.Logger.
-func (n *WebhookNotifier) Log(entry serverusage.Entry) {
+// Durable reports that this logger does NOT persist usage entries — it only
+// observes them to fire alerts. Strict accounting must not treat a successful
+// Log here as a recorded usage entry.
+func (n *WebhookNotifier) Durable() bool { return false }
+
+// Log implements serverusage.Logger. It observes budget thresholds and fires
+// webhook notifications; it does not persist the entry, so it never reports a
+// storage error (returns nil). Notification failures are handled internally.
+func (n *WebhookNotifier) Log(entry serverusage.Entry) error {
 	if n == nil || n.usage == nil || n.teams == nil {
-		return
+		return nil
 	}
 	now := entry.Timestamp.UTC()
 	if now.IsZero() {
@@ -79,6 +86,7 @@ func (n *WebhookNotifier) Log(entry serverusage.Entry) {
 	if entry.OrganizationID != "" {
 		n.observeOrganization(entry.OrganizationID, now)
 	}
+	return nil
 }
 
 func (n *WebhookNotifier) observeProject(projectID string, now time.Time) {

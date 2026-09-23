@@ -300,6 +300,7 @@ func TestHTTPHandlerWithUsers_LoginScopesMemberToProjectMembership(t *testing.T)
 		ProjectID: project.ID,
 		UserID:    member.ID,
 		Role:      serverteam.MembershipRoleMember,
+		IsActive:  true,
 	}); err != nil {
 		t.Fatalf("UpsertProjectMembership: %v", err)
 	}

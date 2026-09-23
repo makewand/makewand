@@ -107,6 +107,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			})
 			return a, nil
 		}
+		proj.SetUnsafeHostExecAuthorization(a.hostExecAuth)
 		a.project = proj
 
 		if err := proj.GitInit(context.Background()); err != nil {

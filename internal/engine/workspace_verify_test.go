@@ -2,9 +2,13 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -24,6 +28,9 @@ func newVerificationProject(t *testing.T) *Project {
 	if err != nil {
 		t.Fatalf("NewProject: %v", err)
 	}
+	// The env opt-in alone no longer authorizes host execution; tests carry the
+	// acknowledged authorization the app layer would resolve.
+	project.SetUnsafeHostExecAuthorization(UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"})
 	files := []ExtractedFile{
 		{
 			Path: "go.mod",
@@ -231,6 +238,303 @@ func TestFileCheckpoint_Restore(t *testing.T) {
 	}
 	if _, err := project.ReadFile("new.txt"); err == nil {
 		t.Fatal("new.txt should have been removed by restore")
+	}
+}
+
+func TestCheckpointFiles_LargeFilesPreservedOnRestore(t *testing.T) {
+	project := newVerificationProject(t)
+	// Create a file exceeding maxReadFileSize (10 MiB)
+	largeName := "large.bin"
+	fullPath := filepath.Join(project.Path, largeName)
+	f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		t.Fatalf("Create large file: %v", err)
+	}
+	// Write 11 MiB of test pattern
+	chunk := make([]byte, 1024*1024)
+	for i := range chunk {
+		chunk[i] = byte(i % 256)
+	}
+	hasher := sha256.New()
+	for i := 0; i < 11; i++ {
+		hasher.Write(chunk)
+		if _, err := f.Write(chunk); err != nil {
+			f.Close()
+			t.Fatalf("Write large chunk: %v", err)
+		}
+	}
+	f.Close()
+	expectedHash := hex.EncodeToString(hasher.Sum(nil))
+	if err := os.Chmod(fullPath, 0755); err != nil {
+		t.Fatalf("Chmod large file: %v", err)
+	}
+
+	files := []ExtractedFile{
+		{
+			Path:    largeName,
+			Content: "small modified content",
+		},
+	}
+
+	checkpoint, err := project.CheckpointFiles(files)
+	if err != nil {
+		t.Fatalf("CheckpointFiles on large file: %v", err)
+	}
+
+	// Overwrite large file with new content
+	if err := project.WriteFiles(files); err != nil {
+		t.Fatalf("WriteFiles: %v", err)
+	}
+
+	// Restore checkpoint
+	if err := checkpoint.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	// Verify large file still exists, was restored to 11 MiB, AND preserved 0755 permissions!
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatalf("Large file was deleted or cannot be stated: %v", err)
+	}
+	if info.Size() != 11*1024*1024 {
+		t.Fatalf("Large file size was corrupted: got %d, expected %d", info.Size(), 11*1024*1024)
+	}
+	if info.Mode().Perm() != 0755 {
+		t.Fatalf("Large file permissions corrupted: got %v, expected 0755", info.Mode().Perm())
+	}
+
+	restoredFile, err := os.Open(fullPath)
+	if err != nil {
+		t.Fatalf("Open restored file: %v", err)
+	}
+	defer restoredFile.Close()
+	restoreHasher := sha256.New()
+	if _, err := io.Copy(restoreHasher, restoredFile); err != nil {
+		t.Fatalf("Hash restored file: %v", err)
+	}
+	gotHash := hex.EncodeToString(restoreHasher.Sum(nil))
+	if gotHash != expectedHash {
+		t.Fatalf("Large file hash corrupted: got %s, expected %s", gotHash, expectedHash)
+	}
+}
+
+func TestCheckpointFiles_RestoreFailurePreservesBackup(t *testing.T) {
+	project := newVerificationProject(t)
+	subDir := filepath.Join(project.Path, "sub")
+	if err := os.Mkdir(subDir, 0755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	defer os.Chmod(subDir, 0755)
+
+	largeName := "sub/large.bin"
+	fullPath := filepath.Join(project.Path, largeName)
+	f, err := os.Create(fullPath)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	chunk := make([]byte, 1024*1024)
+	for i := 0; i < 11; i++ {
+		if _, err := f.Write(chunk); err != nil {
+			f.Close()
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	f.Close()
+
+	checkpoint, err := project.CheckpointFiles([]ExtractedFile{{Path: largeName, Content: "mod"}})
+	if err != nil {
+		t.Fatalf("CheckpointFiles: %v", err)
+	}
+	bPaths := checkpoint.BackupPaths()
+	if len(bPaths) == 0 {
+		t.Fatalf("expected active backup path, got none")
+	}
+	bakFile := bPaths[0]
+
+	// Make subDir read-only so Restore fails when creating temp restore file
+	if err := os.Chmod(subDir, 0555); err != nil {
+		t.Fatalf("Chmod subDir: %v", err)
+	}
+
+	restoreErr := checkpoint.Restore()
+	if restoreErr == nil {
+		t.Fatalf("expected Restore to fail in read-only dir, but succeeded")
+	}
+
+	// Verify backup file still exists on disk!
+	if _, err := os.Stat(bakFile); err != nil {
+		t.Fatalf("Backup file was deleted on restore failure: %v", err)
+	}
+
+	// Restore permissions and clean up
+	os.Chmod(subDir, 0755)
+	checkpoint.Cleanup()
+	if _, err := os.Stat(bakFile); !os.IsNotExist(err) {
+		t.Fatalf("expected backup to be removed after explicit Cleanup, got: %v", err)
+	}
+}
+
+func TestCheckpointFiles_HardlinkConsistencyPreservedOnRestore(t *testing.T) {
+	project := newVerificationProject(t)
+	largeName := "large.bin"
+	fullPath := filepath.Join(project.Path, largeName)
+	linkName := "link.bin"
+	linkPath := filepath.Join(project.Path, linkName)
+
+	f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("Create large file: %v", err)
+	}
+	chunk := make([]byte, 1024*1024)
+	for i := range chunk {
+		chunk[i] = byte((i * 13) % 256)
+	}
+	hasher := sha256.New()
+	for i := 0; i < 11; i++ {
+		hasher.Write(chunk)
+		if _, err := f.Write(chunk); err != nil {
+			f.Close()
+			t.Fatalf("Write large chunk: %v", err)
+		}
+	}
+	f.Close()
+	expectedHash := hex.EncodeToString(hasher.Sum(nil))
+
+	// Create hard link
+	if err := os.Link(fullPath, linkPath); err != nil {
+		t.Fatalf("Link %s -> %s: %v", fullPath, linkPath, err)
+	}
+
+	// Verify link count is 2 and inodes match
+	infoOrig, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatalf("Stat %s: %v", fullPath, err)
+	}
+	infoLink, err := os.Stat(linkPath)
+	if err != nil {
+		t.Fatalf("Stat %s: %v", linkPath, err)
+	}
+	sysOrig := infoOrig.Sys().(*syscall.Stat_t)
+	sysLink := infoLink.Sys().(*syscall.Stat_t)
+	if sysOrig.Ino != sysLink.Ino {
+		t.Fatalf("Inodes do not match: %d vs %d", sysOrig.Ino, sysLink.Ino)
+	}
+	if sysOrig.Nlink < 2 {
+		t.Fatalf("Expected Nlink >= 2, got %d", sysOrig.Nlink)
+	}
+
+	// Checkpoint only large.bin
+	checkpoint, err := project.CheckpointFiles([]ExtractedFile{
+		{Path: largeName, Content: "mod"},
+	})
+	if err != nil {
+		t.Fatalf("CheckpointFiles: %v", err)
+	}
+
+	// Overwrite large.bin with new content
+	if err := project.WriteFiles([]ExtractedFile{
+		{Path: largeName, Content: "modified content breaking link"},
+	}); err != nil {
+		t.Fatalf("WriteFiles: %v", err)
+	}
+
+	// Restore checkpoint
+	if err := checkpoint.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	// Verify large.bin has restored 11 MiB and matching hash
+	fLarge, err := os.Open(fullPath)
+	if err != nil {
+		t.Fatalf("Open large: %v", err)
+	}
+	hLarge := sha256.New()
+	if _, err := io.Copy(hLarge, fLarge); err != nil {
+		fLarge.Close()
+		t.Fatalf("Hash large: %v", err)
+	}
+	fLarge.Close()
+	if hex.EncodeToString(hLarge.Sum(nil)) != expectedHash {
+		t.Fatalf("large.bin hash mismatch after restore")
+	}
+
+	// Verify link.bin ALSO has restored 11 MiB, matching hash, and shares inode!
+	fLink, err := os.Open(linkPath)
+	if err != nil {
+		t.Fatalf("Open link: %v", err)
+	}
+	hLink := sha256.New()
+	if _, err := io.Copy(hLink, fLink); err != nil {
+		fLink.Close()
+		t.Fatalf("Hash link: %v", err)
+	}
+	fLink.Close()
+	if hex.EncodeToString(hLink.Sum(nil)) != expectedHash {
+		t.Fatalf("link.bin hash mismatch: hard link was not restored with large.bin!")
+	}
+
+	infoAfterOrig, _ := os.Stat(fullPath)
+	infoAfterLink, _ := os.Stat(linkPath)
+	sysAfterOrig := infoAfterOrig.Sys().(*syscall.Stat_t)
+	sysAfterLink := infoAfterLink.Sys().(*syscall.Stat_t)
+	if sysAfterOrig.Ino != sysAfterLink.Ino {
+		t.Fatalf("Hard link broken! Inodes differ after restore: %d vs %d", sysAfterOrig.Ino, sysAfterLink.Ino)
+	}
+}
+
+func TestCheckpointFiles_ParentDirectoryRecreatedOnRestore(t *testing.T) {
+	project := newVerificationProject(t)
+	subDir := filepath.Join(project.Path, "sub")
+	if err := os.Mkdir(subDir, 0755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	largeName := "sub/large.bin"
+	fullPath := filepath.Join(project.Path, largeName)
+	f, err := os.Create(fullPath)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	chunk := make([]byte, 1024*1024)
+	hasher := sha256.New()
+	for i := 0; i < 11; i++ {
+		hasher.Write(chunk)
+		if _, err := f.Write(chunk); err != nil {
+			f.Close()
+			t.Fatalf("Write large chunk: %v", err)
+		}
+	}
+	f.Close()
+	expectedHash := hex.EncodeToString(hasher.Sum(nil))
+
+	checkpoint, err := project.CheckpointFiles([]ExtractedFile{
+		{Path: largeName, Content: "mod"},
+	})
+	if err != nil {
+		t.Fatalf("CheckpointFiles: %v", err)
+	}
+
+	// Delete the parent directory "sub" entirely
+	if err := os.RemoveAll(subDir); err != nil {
+		t.Fatalf("RemoveAll subDir: %v", err)
+	}
+
+	// Restore checkpoint - must recreate parent directory "sub" and restore large.bin!
+	if err := checkpoint.Restore(); err != nil {
+		t.Fatalf("Restore failed to recreate parent dir: %v", err)
+	}
+
+	// Verify large.bin exists and hash matches
+	fRestored, err := os.Open(fullPath)
+	if err != nil {
+		t.Fatalf("Open restored file in recreated dir: %v", err)
+	}
+	defer fRestored.Close()
+	hRestored := sha256.New()
+	if _, err := io.Copy(hRestored, fRestored); err != nil {
+		t.Fatalf("Hash restored: %v", err)
+	}
+	if hex.EncodeToString(hRestored.Sum(nil)) != expectedHash {
+		t.Fatalf("Restored file hash mismatch")
 	}
 }
 

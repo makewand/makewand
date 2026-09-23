@@ -7,8 +7,8 @@ makewand 的 AI 编码流程分两个阶段，二者的**信任边界不同**。
 
 ### Verification / preview is sandboxed / 验证与预览是沙箱隔离的
 
-When makewand runs a candidate's tests, builds, dependency installs, or a preview server, those commands execute inside a **bubblewrap sandbox** (read-only root, writable workspace bind, cleared environment, ephemeral HOME, and `--unshare-net` for test/build steps). On a host where strong isolation is unavailable, this stage **fails closed** — nothing runs unless you explicitly set `MAKEWAND_UNSAFE_HOST_EXEC=1`.
-当 makewand 运行候选代码的测试、构建、依赖安装或预览服务时，这些命令在 **bubblewrap 沙箱**内执行（只读根、可写 workspace、清空环境、临时 HOME，测试/构建步骤 `--unshare-net`）。在无法强隔离的主机上，该阶段**失败即停**——除非你显式设置 `MAKEWAND_UNSAFE_HOST_EXEC=1`，否则什么都不会运行。
+When makewand runs a candidate's tests, builds, dependency installs, or a preview server, those commands execute inside a **bubblewrap sandbox** (read-only root, writable workspace bind, cleared environment, ephemeral HOME, and `--unshare-net` for test/build steps). On a host where strong isolation is unavailable, this stage **fails closed** — nothing runs unless you explicitly set `MAKEWAND_UNSAFE_HOST_EXEC=1` **and** complete a one-time interactive acknowledgment. The environment variable alone never enables host execution: the acknowledgment is recorded in your config (bound to this machine and to the current risk-statement version, so copied configs and materially changed risks require re-acknowledging), non-interactive runs without it refuse host execution, and every host execution under the opt-in is appended to an audit log (`unsafe_exec_audit.jsonl` in the config directory).
+当 makewand 运行候选代码的测试、构建、依赖安装或预览服务时，这些命令在 **bubblewrap 沙箱**内执行（只读根、可写 workspace、清空环境、临时 HOME，测试/构建步骤 `--unshare-net`）。在无法强隔离的主机上，该阶段**失败即停**——除非你显式设置 `MAKEWAND_UNSAFE_HOST_EXEC=1` **并**完成一次性交互确认。仅设置环境变量永远不会启用宿主执行：确认会记录在配置中（绑定本机与当前风险声明版本，配置拷到别机或风险声明实质变更都需重新确认），未确认的非交互运行会拒绝宿主执行，且该选项下的每一次宿主执行都会追加写入审计日志（配置目录下的 `unsafe_exec_audit.jsonl`）。
 
 ### Generation runs provider CLIs on the host / 生成阶段在宿主机运行 provider CLI
 

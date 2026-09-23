@@ -122,8 +122,8 @@ func stubRestrictedExecIsolation(t *testing.T, autoApprovable bool, reason error
 	t.Helper()
 	oldOK := restrictedExecAutoApprovable
 	oldErr := restrictedExecIsolationError
-	restrictedExecAutoApprovable = func() bool { return autoApprovable }
-	restrictedExecIsolationError = func() error { return reason }
+	restrictedExecAutoApprovable = func(engine.UnsafeHostExecAuthorization) bool { return autoApprovable }
+	restrictedExecIsolationError = func(engine.UnsafeHostExecAuthorization) error { return reason }
 	t.Cleanup(func() {
 		restrictedExecAutoApprovable = oldOK
 		restrictedExecIsolationError = oldErr

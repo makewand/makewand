@@ -49,9 +49,8 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 		Cost:     msg.cost,
 	})
 
-	// Track cost with token details
-	isSub := a.router.IsSubscription(msg.provider)
-	a.cost.AddWithTokens(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens, isSub)
+	// Track cost with token details (session panel + monthly budget ledger).
+	a.recordKnownUsage(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens)
 	a = a.noteHostCLIExec(msg.provider)
 	a.chat.SetStreaming(false)
 	a.state = StateIdle
@@ -98,6 +97,10 @@ func chatErrorContent(err error) string {
 	return fmt.Sprintf("Error: %s", err)
 }
 
+// recordKnownUsage is the single sink for realized provider usage: it updates
+// the per-session cost panel AND the persistent month-to-date budget ledger.
+// Every success and error path that knows a cost must route through here so the
+// monthly budget reflects all pay-as-you-go spend, not just some branches.
 func (a *App) recordKnownUsage(provider string, cost float64, inputTokens, outputTokens int) {
 	provider = strings.TrimSpace(provider)
 	if a.cost == nil || provider == "" || (cost == 0 && inputTokens == 0 && outputTokens == 0) {
@@ -105,6 +108,14 @@ func (a *App) recordKnownUsage(provider string, cost float64, inputTokens, outpu
 	}
 	isSubscription := a.router != nil && a.router.IsSubscription(provider)
 	a.cost.AddWithTokens(provider, cost, inputTokens, outputTokens, isSubscription)
+	// Any nonzero realized cost is real pay-as-you-go money (subscription
+	// providers report zero cost), so accrue it to the month-to-date budget
+	// ledger regardless of the winning provider's subscription flag. This also
+	// correctly counts ensemble/candidate costs that aggregate API spend behind
+	// a subscription-flagged winner.
+	if cost > 0 {
+		a.monthly.Add(time.Now(), cost)
+	}
 }
 
 // noteHostCLIExec shows a one-time, session-scoped notice the first time a
@@ -245,6 +256,10 @@ func (a App) handleFileWriteConfirm(msg confirmFileWriteMsg) (tea.Model, tea.Cmd
 
 	return a, func() tea.Msg {
 		checkpoint, checkpointErr := proj.CheckpointFiles(files)
+		if checkpointErr != nil {
+			return fileWriteCompleteMsg{written: 0, failed: len(files), errors: []string{fmt.Sprintf("checkpoint: %s", checkpointErr)}}
+		}
+
 		var written, failed int
 		var errors []string
 
@@ -256,13 +271,15 @@ func (a App) handleFileWriteConfirm(msg confirmFileWriteMsg) (tea.Model, tea.Cmd
 				written++
 			}
 		}
-		if failed > 0 && checkpointErr == nil && checkpoint != nil {
+		if failed > 0 && checkpoint != nil {
 			if err := checkpoint.Restore(); err != nil {
 				errors = append(errors, fmt.Sprintf("rollback: %s", err))
+				for _, bPath := range checkpoint.BackupPaths() {
+					errors = append(errors, fmt.Sprintf("preserved backup for manual recovery: %s", bPath))
+				}
 			}
-		}
-		if checkpointErr != nil {
-			errors = append(errors, fmt.Sprintf("checkpoint: %s", checkpointErr))
+		} else if checkpoint != nil {
+			checkpoint.Cleanup()
 		}
 
 		return fileWriteCompleteMsg{written: written, failed: failed, errors: errors}
@@ -427,9 +444,8 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 		return a.startDepsPhase()
 	}
 
-	// Track cost
-	isSub := a.router.IsSubscription(msg.provider)
-	a.cost.AddWithTokens(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens, isSub)
+	// Track cost (session panel + monthly budget ledger).
+	a.recordKnownUsage(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens)
 
 	if !msg.hasIssues {
 		// LGTM — no changes needed
@@ -543,7 +559,7 @@ func (a App) runDepsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	// host when sandbox isolation is unavailable and MAKEWAND_UNSAFE_HOST_EXEC is
 	// not set. Detect that here so we skip deps + tests with a clear notice
 	// instead of surfacing a raw error.
-	if notice := restrictedPlanBlockedNotice(); notice != "" {
+	if notice := a.restrictedPlanBlockedNotice(); notice != "" {
 		emitExecTrace(a.router, "pipeline.exec.skipped", "deps", plan, nil, nil, nil, "sandbox isolation unavailable")
 		emitExecTrace(a.router, "pipeline.exec.skipped", "tests", a.pendingTestsPlan, nil, nil, nil, "sandbox isolation unavailable")
 		a.progress.SetStepStatus(stepDeps, StepDone)
@@ -641,7 +657,7 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	}
 	a.clearPendingApproval()
 	// Fail closed when sandbox isolation is unavailable (see runDepsPlan).
-	if notice := restrictedPlanBlockedNotice(); notice != "" {
+	if notice := a.restrictedPlanBlockedNotice(); notice != "" {
 		emitExecTrace(a.router, "pipeline.exec.skipped", "tests", plan, nil, nil, nil, "sandbox isolation unavailable")
 		a.progress.SetStepStatus(stepTests, StepDone)
 		a.progress.SetStepDetail(stepTests, testsRunSkippedDetail)
@@ -991,9 +1007,8 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 		return a.buildComplete()
 	}
 
-	// Track cost
-	isSub := a.router.IsSubscription(msg.provider)
-	a.cost.AddWithTokens(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens, isSub)
+	// Track cost (session panel + monthly budget ledger).
+	a.recordKnownUsage(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens)
 
 	a.chat.AddMessage(ChatMessage{
 		Role:     "assistant",
@@ -1047,7 +1062,7 @@ func (a App) handleAutoFixFileWriteComplete() (tea.Model, tea.Cmd) {
 	// MAKEWAND_UNSAFE_HOST_EXEC opt-in), do NOT execute generated commands on the
 	// host. Surface the notice and stop the build instead of looping through
 	// fruitless auto-fix attempts.
-	if notice := restrictedPlanBlockedNotice(); notice != "" {
+	if notice := a.restrictedPlanBlockedNotice(); notice != "" {
 		emitExecTrace(router, "pipeline.exec.skipped", "tests", nil, nil, nil, nil, "sandbox isolation unavailable; auto-fix retry left unverified")
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: notice})
 		return a.buildComplete()

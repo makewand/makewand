@@ -1,4 +1,4 @@
-FROM golang:1.25 AS build
+FROM golang:1.25.12 AS build
 WORKDIR /src
 COPY . .
 # Stamp the version into internal/buildinfo so `makewand version` in the image is

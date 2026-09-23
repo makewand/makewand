@@ -146,4 +146,18 @@ func TestSQLiteStore_OrganizationAndProjectMemberships(t *testing.T) {
 	if len(projectMemberships) != 1 || projectMemberships[0].Role != MembershipRoleViewer {
 		t.Fatalf("project memberships = %+v, want viewer membership", projectMemberships)
 	}
+
+	// Verify that deactivation (IsActive = false) is strictly respected and not coerced to true
+	deactivated, err := store.UpsertOrganizationMembership(OrganizationMembership{
+		OrganizationID: org.ID,
+		UserID:         "usr_a",
+		Role:           MembershipRoleManager,
+		IsActive:       false,
+	})
+	if err != nil {
+		t.Fatalf("UpsertOrganizationMembership deactivation: %v", err)
+	}
+	if deactivated.IsActive {
+		t.Fatalf("membership IsActive = true after deactivation, want false")
+	}
 }

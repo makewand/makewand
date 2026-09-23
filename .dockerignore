@@ -2,6 +2,12 @@
 .github
 .claude
 
+# Secrets — keep provider keys / server tokens out of the build context.
+# The context is the repo root (deploy/docker-compose.yml) and the builder
+# runs `COPY . .`, so an unignored .env would land in a build-stage layer.
+.env
+deploy/.env
+
 # Local build outputs
 build/
 buildtest

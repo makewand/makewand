@@ -17,7 +17,10 @@ import (
 // have to reach package registries) but run with the same filesystem isolation.
 // Without working isolation, verification fails closed: no command executes
 // unless the user explicitly opts into host execution with
-// MAKEWAND_UNSAFE_HOST_EXEC=1 (the same escape hatch the preview path uses).
+// MAKEWAND_UNSAFE_HOST_EXEC=1 (the same escape hatch the preview path uses)
+// AND has completed the one-time acknowledgment the app layer resolves into an
+// UnsafeHostExecAuthorization. The environment variable is only the request;
+// without the acknowledgment it never enables host execution.
 
 var (
 	verifyLookPath      = exec.LookPath
@@ -25,7 +28,7 @@ var (
 	verifyUserHome      = os.UserHomeDir
 	verifyGetenv        = os.Getenv
 	verifyBwrapSelfTest = func(bwrapPath string) error {
-		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "--unshare-net", "true")
+		cmd := exec.Command(bwrapPath, "--ro-bind", "/", "/", "--unshare-pid", "--unshare-net", "true")
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil
@@ -63,50 +66,71 @@ type verifyExecEnvironment struct {
 
 // resolveVerifyExecEnvironment decides how verification commands can run.
 // It fails closed: without working bubblewrap isolation, and without the
-// explicit MAKEWAND_UNSAFE_HOST_EXEC=1 opt-in, no command may execute.
-func resolveVerifyExecEnvironment() (verifyExecEnvironment, error) {
-	if verifyUnsafe() {
+// explicit MAKEWAND_UNSAFE_HOST_EXEC=1 opt-in plus its completed one-time
+// acknowledgment, no command may execute. An unacknowledged opt-in never
+// enables host execution: isolation is still attempted, and only the failure
+// message changes (it explains how to complete the acknowledgment instead of
+// suggesting the environment variable the user already set).
+func resolveVerifyExecEnvironment(auth UnsafeHostExecAuthorization) (verifyExecEnvironment, error) {
+	unsafeRequested := verifyUnsafe()
+	if unsafeRequested && auth.Acknowledged {
 		return verifyExecEnvironment{mode: verifyExecUnsafeHost}, nil
 	}
 	if verifyGOOS != "linux" {
-		return verifyExecEnvironment{}, fmt.Errorf("candidate verification requires sandbox isolation on %s; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)", verifyGOOS)
+		return verifyExecEnvironment{}, fmt.Errorf("candidate verification requires sandbox isolation on %s; %s", verifyGOOS, unsafeBypassHint(unsafeRequested))
 	}
 
 	bwrapPath, err := verifyLookPath("bwrap")
 	if err != nil {
-		return verifyExecEnvironment{}, fmt.Errorf("candidate verification requires bubblewrap (bwrap); install bwrap or set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)")
+		return verifyExecEnvironment{}, fmt.Errorf("candidate verification requires bubblewrap (bwrap); install bwrap or %s", unsafeBypassHint(unsafeRequested))
 	}
 	if err := verifyBwrapSelfTest(bwrapPath); err != nil {
 		msg := strings.TrimSpace(err.Error())
-		if !strings.Contains(msg, "MAKEWAND_UNSAFE_HOST_EXEC=1") {
-			msg += "; set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)"
+		if unsafeRequested {
+			// The self-test hint suggests setting the variable the user already
+			// set; replace it with the acknowledgment guidance.
+			msg = strings.ReplaceAll(msg, "set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)", unsafeBypassHint(true))
+		}
+		if !strings.Contains(msg, "MAKEWAND_UNSAFE_HOST_EXEC") {
+			msg += "; " + unsafeBypassHint(unsafeRequested)
 		}
 		return verifyExecEnvironment{}, fmt.Errorf("%s", msg)
 	}
 	return verifyExecEnvironment{mode: verifyExecIsolated, bwrapPath: bwrapPath}, nil
 }
 
+// unsafeBypassHint phrases the escape-hatch guidance for isolation failures.
+// When the opt-in variable is already set, the missing piece is the one-time
+// acknowledgment, so point at that instead of the variable.
+func unsafeBypassHint(unsafeRequested bool) string {
+	if unsafeRequested {
+		return "MAKEWAND_UNSAFE_HOST_EXEC=1 is set but the one-time host execution acknowledgment is missing; run makewand interactively once (e.g. `makewand setup`) to acknowledge (unsafe)"
+	}
+	return "set MAKEWAND_UNSAFE_HOST_EXEC=1 to bypass (unsafe)"
+}
+
 // VerificationIsolationActive reports whether restricted verification commands
-// will run inside the bubblewrap sandbox on this host.
-func VerificationIsolationActive() bool {
-	env, err := resolveVerifyExecEnvironment()
+// will run inside the bubblewrap sandbox on this host under the given
+// authorization.
+func VerificationIsolationActive(auth UnsafeHostExecAuthorization) bool {
+	env, err := resolveVerifyExecEnvironment(auth)
 	return err == nil && env.mode == verifyExecIsolated
 }
 
 // RestrictedExecAutoApprovable reports whether safe/autopilot approval modes may
 // run restricted plans without asking the user: either bubblewrap isolation is
 // active, or the user explicitly opted into host execution via
-// MAKEWAND_UNSAFE_HOST_EXEC=1.
-func RestrictedExecAutoApprovable() bool {
-	_, err := resolveVerifyExecEnvironment()
+// MAKEWAND_UNSAFE_HOST_EXEC=1 and completed the one-time acknowledgment.
+func RestrictedExecAutoApprovable(auth UnsafeHostExecAuthorization) bool {
+	_, err := resolveVerifyExecEnvironment(auth)
 	return err == nil
 }
 
 // RestrictedExecIsolationError returns why restricted commands cannot execute
-// under isolation, or nil when isolation is active or the user opted into host
-// execution.
-func RestrictedExecIsolationError() error {
-	_, err := resolveVerifyExecEnvironment()
+// under isolation, or nil when isolation is active or the user's acknowledged
+// host-execution opt-in applies.
+func RestrictedExecIsolationError(auth UnsafeHostExecAuthorization) error {
+	_, err := resolveVerifyExecEnvironment(auth)
 	return err
 }
 
@@ -134,6 +158,9 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	wrapped := []string{
 		"--die-with-parent",
 		"--new-session",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
 		// Root first; fresh /proc and /dev afterwards so they overlay the
 		// read-only root instead of being shadowed by it.
 		"--ro-bind", "/", "/",

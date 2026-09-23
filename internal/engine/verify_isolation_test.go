@@ -61,7 +61,7 @@ func TestResolveVerifyExecEnvironment_RequiresLinux(t *testing.T) {
 	verifyGOOS = "darwin"
 	verifyUnsafe = func() bool { return false }
 
-	_, err := resolveVerifyExecEnvironment()
+	_, err := resolveVerifyExecEnvironment(UnsafeHostExecAuthorization{})
 	if err == nil {
 		t.Fatal("expected error on non-linux without unsafe bypass")
 	}
@@ -73,18 +73,18 @@ func TestResolveVerifyExecEnvironment_RequiresLinux(t *testing.T) {
 func TestResolveVerifyExecEnvironment_RequiresBwrap(t *testing.T) {
 	fakeMissingBwrap(t)
 
-	_, err := resolveVerifyExecEnvironment()
+	_, err := resolveVerifyExecEnvironment(UnsafeHostExecAuthorization{})
 	if err == nil {
 		t.Fatal("expected error when bwrap is unavailable")
 	}
 	if !strings.Contains(err.Error(), "bubblewrap") {
 		t.Fatalf("error=%q, want bubblewrap hint", err.Error())
 	}
-	if RestrictedExecAutoApprovable() {
-		t.Fatal("RestrictedExecAutoApprovable() = true, want false without isolation")
+	if RestrictedExecAutoApprovable(UnsafeHostExecAuthorization{}) {
+		t.Fatal("RestrictedExecAutoApprovable(UnsafeHostExecAuthorization{}) = true, want false without isolation")
 	}
-	if RestrictedExecIsolationError() == nil {
-		t.Fatal("RestrictedExecIsolationError() = nil, want reason")
+	if RestrictedExecIsolationError(UnsafeHostExecAuthorization{}) == nil {
+		t.Fatal("RestrictedExecIsolationError(UnsafeHostExecAuthorization{}) = nil, want reason")
 	}
 }
 
@@ -95,7 +95,7 @@ func TestResolveVerifyExecEnvironment_SelfTestFailure(t *testing.T) {
 	verifyLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
 	verifyBwrapSelfTest = func(string) error { return errors.New("setting up uid map: Permission denied") }
 
-	_, err := resolveVerifyExecEnvironment()
+	_, err := resolveVerifyExecEnvironment(UnsafeHostExecAuthorization{})
 	if err == nil {
 		t.Fatal("expected bwrap self-test error")
 	}
@@ -111,34 +111,72 @@ func TestResolveVerifyExecEnvironment_UnsafeBypass(t *testing.T) {
 	swapVerifyIsolationVars(t)
 	verifyGOOS = "darwin" // even without a sandbox-capable OS
 	verifyUnsafe = func() bool { return true }
+	acked := UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"}
 
-	env, err := resolveVerifyExecEnvironment()
+	env, err := resolveVerifyExecEnvironment(acked)
 	if err != nil {
 		t.Fatalf("resolveVerifyExecEnvironment: %v", err)
 	}
 	if env.mode != verifyExecUnsafeHost {
 		t.Fatalf("mode = %v, want verifyExecUnsafeHost", env.mode)
 	}
-	if VerificationIsolationActive() {
-		t.Fatal("VerificationIsolationActive() = true, want false in unsafe host mode")
+	if VerificationIsolationActive(acked) {
+		t.Fatal("VerificationIsolationActive(acked) = true, want false in unsafe host mode")
 	}
-	if !RestrictedExecAutoApprovable() {
-		t.Fatal("RestrictedExecAutoApprovable() = false, want true with explicit opt-in")
+	if !RestrictedExecAutoApprovable(acked) {
+		t.Fatal("RestrictedExecAutoApprovable(acked) = false, want true with acknowledged opt-in")
+	}
+}
+
+// TestResolveVerifyExecEnvironment_UnsafeRequestedWithoutAck confirms the
+// environment variable ALONE never enables host execution: without the
+// one-time acknowledgment the resolution stays fail-closed (here: non-linux,
+// so no isolation either) and the error explains how to acknowledge.
+func TestResolveVerifyExecEnvironment_UnsafeRequestedWithoutAck(t *testing.T) {
+	swapVerifyIsolationVars(t)
+	verifyGOOS = "darwin"
+	verifyUnsafe = func() bool { return true }
+
+	_, err := resolveVerifyExecEnvironment(UnsafeHostExecAuthorization{})
+	if err == nil {
+		t.Fatal("expected fail-closed error when opt-in is requested but unacknowledged")
+	}
+	if !strings.Contains(err.Error(), "acknowledg") {
+		t.Fatalf("error = %q, want acknowledgment guidance", err.Error())
+	}
+	if RestrictedExecAutoApprovable(UnsafeHostExecAuthorization{}) {
+		t.Fatal("RestrictedExecAutoApprovable(zero) = true, want false without acknowledgment")
+	}
+}
+
+// TestResolveVerifyExecEnvironment_UnsafeRequestedWithoutAckPrefersIsolation
+// confirms an unacknowledged opt-in does not degrade a host where isolation
+// works: commands still run sandboxed.
+func TestResolveVerifyExecEnvironment_UnsafeRequestedWithoutAckPrefersIsolation(t *testing.T) {
+	fakeWorkingBwrap(t)
+	verifyUnsafe = func() bool { return true }
+
+	env, err := resolveVerifyExecEnvironment(UnsafeHostExecAuthorization{})
+	if err != nil {
+		t.Fatalf("resolveVerifyExecEnvironment: %v", err)
+	}
+	if env.mode != verifyExecIsolated {
+		t.Fatalf("mode = %v, want verifyExecIsolated (unacknowledged opt-in must not bypass sandbox)", env.mode)
 	}
 }
 
 func TestResolveVerifyExecEnvironment_IsolatedMode(t *testing.T) {
 	fakeWorkingBwrap(t)
 
-	env, err := resolveVerifyExecEnvironment()
+	env, err := resolveVerifyExecEnvironment(UnsafeHostExecAuthorization{})
 	if err != nil {
 		t.Fatalf("resolveVerifyExecEnvironment: %v", err)
 	}
 	if env.mode != verifyExecIsolated || env.bwrapPath != "/usr/bin/bwrap" {
 		t.Fatalf("env = %+v, want isolated bwrap environment", env)
 	}
-	if !VerificationIsolationActive() {
-		t.Fatal("VerificationIsolationActive() = false, want true")
+	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+		t.Fatal("VerificationIsolationActive(UnsafeHostExecAuthorization{}) = false, want true")
 	}
 }
 

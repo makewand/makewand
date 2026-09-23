@@ -9,6 +9,21 @@ import (
 	"github.com/makewand/makewand/serverdb"
 )
 
+// sinceBoundaryLayout is a fixed-width, all-9-fractional-digit RFC3339 layout
+// used ONLY to format an inclusive `>= Since` boundary. Timestamps are compared
+// as TEXT in SQL, and variable-width RFC3339Nano omits trailing zero fractions,
+// so an integer-second boundary like "…00:00:00Z" sorts AFTER a sub-second entry
+// "…00:00:00.123Z" and a `>= month-start` filter silently drops the very first
+// sub-second entries of the month. A boundary of "…00:00:00.000000000Z" sorts at
+// or before every representation of that instant, so it includes them.
+//
+// It is applied to the Since boundary only: the ENTRY rows and the `<= Until`
+// boundary keep RFC3339Nano so that old (variable-width) rows already in a
+// state.db compare exactly as they did before — using a fixed boundary against
+// legacy variable-width rows would wrongly exclude equal-instant rows from an
+// inclusive Until query.
+const sinceBoundaryLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
 // SQLiteStore persists usage entries in SQLite.
 type SQLiteStore struct {
 	path string
@@ -77,14 +92,16 @@ func (s *SQLiteStore) Path() string {
 }
 
 // Log inserts one usage entry.
-func (s *SQLiteStore) Log(entry Entry) {
+func (s *SQLiteStore) Log(entry Entry) error {
+	// Return an error for an unavailable store so strict accounting does not treat
+	// an unrecorded entry as success.
 	if s == nil || s.db == nil {
-		return
+		return fmt.Errorf("usage sqlite store is unavailable")
 	}
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now().UTC()
 	}
-	_, _ = s.db.Exec(`
+	_, err := s.db.Exec(`
 INSERT INTO usage_entries (
   timestamp, request_id, token_id, token_description, user_id, organization_id, project_id, requested_mode,
   requested_model, actual_provider, status, duration_ms, prompt_tokens,
@@ -107,12 +124,18 @@ INSERT INTO usage_entries (
 		entry.CostUSD,
 		boolToInt(entry.Stream),
 	)
+	if err != nil {
+		return fmt.Errorf("insert usage entry: %w", err)
+	}
+	return nil
 }
 
 // Load loads entries matching the supplied filter.
 func (s *SQLiteStore) Load(filter Filter) ([]Entry, error) {
+	// An unavailable store returns an error, not empty results, so a budget check
+	// reading it fails closed instead of seeing "zero spend".
 	if s == nil || s.db == nil {
-		return nil, nil
+		return nil, fmt.Errorf("usage sqlite store is unavailable")
 	}
 	query := strings.Builder{}
 	query.WriteString(`
@@ -153,10 +176,14 @@ FROM usage_entries WHERE 1=1`)
 		query.WriteString(` AND stream = 1`)
 	}
 	if !filter.Since.IsZero() {
+		// Fixed-width lower bound so an inclusive >= includes sub-second entries at
+		// the boundary instant (see sinceBoundaryLayout).
 		query.WriteString(` AND timestamp >= ?`)
-		args = append(args, filter.Since.UTC().Format(time.RFC3339Nano))
+		args = append(args, filter.Since.UTC().Format(sinceBoundaryLayout))
 	}
 	if !filter.Until.IsZero() {
+		// RFC3339Nano to match how rows (including legacy variable-width rows) are
+		// stored, so an inclusive <= keeps equal-instant rows.
 		query.WriteString(` AND timestamp <= ?`)
 		args = append(args, filter.Until.UTC().Format(time.RFC3339Nano))
 	}

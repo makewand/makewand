@@ -152,7 +152,7 @@ func TestStartPreview_IncludesStartupStderrOnReadinessFailure(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		return fmt.Errorf("timed out after %s: connection refused", timeout)
 	}
-	previewWrapProjectCmd = func(projectPath, command string, args []string) (string, []string, error) {
+	previewWrapProjectCmd = func(projectPath, command string, args []string, auth UnsafeHostExecAuthorization) (string, []string, error) {
 		return "sh", []string{"-c", "echo uid map denied >&2; sleep 5"}, nil
 	}
 	previewCommandContext = exec.CommandContext

@@ -55,6 +55,9 @@ func TestHeadlessDeleteOnlyCandidateSurfacesDeletionWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenProject: %v", err)
 	}
+	// The env opt-in alone no longer authorizes host execution; carry the
+	// acknowledged authorization the app layer would resolve.
+	project.SetUnsafeHostExecAuthorization(engine.UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"})
 
 	deleter := &deletingCandidateProvider{
 		name: "deleter",

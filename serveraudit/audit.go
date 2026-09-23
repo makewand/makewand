@@ -88,7 +88,7 @@ func OpenJSONL(path string) (*JSONLLogger, error) {
 
 // Log appends evt as one JSONL record.
 func (l *JSONLLogger) Log(evt Event) {
-	if l == nil || l.f == nil {
+	if l == nil {
 		return
 	}
 	if evt.Timestamp.IsZero() {
@@ -96,6 +96,10 @@ func (l *JSONLLogger) Log(evt Event) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Check the file handle inside the lock to avoid racing Close, which nils it.
+	if l.f == nil {
+		return
+	}
 	_ = json.NewEncoder(l.f).Encode(evt)
 }
 

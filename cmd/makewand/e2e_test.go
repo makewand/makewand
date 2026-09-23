@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/internal/config"
 )
@@ -225,6 +226,74 @@ func TestE2EPrintAutopilotUsesVerifiedCandidateSelection(t *testing.T) {
 	}
 }
 
+// TestE2EPrintUnsafeHostExecWithoutAckRefusesHostExecution locks the fail-closed
+// contract of the one-time acknowledgment: MAKEWAND_UNSAFE_HOST_EXEC=1 without
+// a recorded acknowledgment, in a non-interactive run, must NOT execute
+// candidate verification commands on the host. The refusal notice goes to
+// stderr and the (unverified) flow still completes without host execution.
+func TestE2EPrintUnsafeHostExecWithoutAckRefusesHostExecution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based E2E fixtures are Unix-only")
+	}
+
+	bin := buildMakewandBinary(t)
+	cfgDir := t.TempDir()
+	projectDir := t.TempDir()
+	script := writeCandidateProviderScript(t)
+
+	if err := os.WriteFile(filepath.Join(projectDir, "go.mod"), []byte("module example.com/headlessnoack\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(go.mod): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "calc.go"), []byte("package headlessnoack\n\nfunc Multiply(a, b int) int {\n\treturn a + b\n}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(calc.go): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "calc_test.go"), []byte("package headlessnoack\n\nimport \"testing\"\n\nfunc TestMultiply(t *testing.T) {\n\tif got := Multiply(2, 5); got != 10 {\n\t\tt.Fatalf(\"Multiply(2,5) = %d, want 10\", got)\n\t}\n}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(calc_test.go): %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.ApprovalMode = config.ApprovalModeAuto
+	cfg.UsageMode = "balanced"
+	cfg.CustomProviders = []config.CustomProvider{
+		{Name: "alpha", Command: script, Args: []string{"alpha"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+		{Name: "bravo", Command: script, Args: []string{"bravo"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+	}
+	// Deliberately NO recorded acknowledgment: the env opt-in the harness sets
+	// must be refused in this non-interactive subprocess.
+	writeTestConfigWithoutHostExecAck(t, cfgDir, cfg)
+
+	// Instead of the real `go`, install a sentinel-writing fake: if makewand
+	// executes the verification toolchain ON THE HOST despite the missing
+	// acknowledgment, the sentinel file appears. In this harness the sandbox
+	// branch is unreachable anyway — the subprocess PATH is pinned to cfgDir,
+	// which contains no bwrap — so the resolution is refusal (fail closed), and
+	// the ONLY way the fake `go` can run is a host-execution regression. This
+	// proves the refusal directly rather than inferring it from
+	// candidate-selection output.
+	sentinel := filepath.Join(t.TempDir(), "host-exec-happened")
+	fakeGo := "#!/bin/sh\ntouch \"" + sentinel + "\" 2>/dev/null || true\nexit 0\n"
+	//nolint:gosec // G306: the fake `go` must be executable (0700) to stand in for the real binary on PATH.
+	if err := os.WriteFile(filepath.Join(cfgDir, "go"), []byte(fakeGo), 0o700); err != nil {
+		t.Fatalf("WriteFile(fake go): %v", err)
+	}
+
+	stdout, stderr, err := runMakewandInDir(t, projectDir, bin, cfgDir, "--print", "--timeout=30s", "修复 calc.go，让 go test ./... 通过。只修改必要文件。")
+	if err != nil {
+		t.Fatalf("runMakewand(no-ack --print) error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "acknowledg") {
+		t.Fatalf("stderr = %q, want non-interactive acknowledgment refusal notice", stderr)
+	}
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		t.Fatalf("sentinel %s exists: verification toolchain executed on the host without acknowledgment\nstdout:\n%s\nstderr:\n%s", sentinel, stdout, stderr)
+	} else if !os.IsNotExist(statErr) {
+		t.Fatalf("Stat(sentinel): %v", statErr)
+	}
+}
+
 func TestE2EDoctorJSONIncludesPolicyChecks(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping E2E test in short mode")
@@ -405,6 +474,20 @@ func linkToolIntoDir(t *testing.T, dir, tool string) {
 }
 
 func writeTestConfig(t *testing.T, cfgDir string, cfg *config.Config) {
+	t.Helper()
+
+	// The e2e harness exports MAKEWAND_UNSAFE_HOST_EXEC=1 to the subprocess
+	// (sandbox isolation may be unavailable on CI hosts). The env opt-in alone
+	// no longer authorizes host execution, so simulate a user who completed the
+	// one-time acknowledgment on this machine; the refusal path has its own
+	// dedicated test using writeTestConfigWithoutHostExecAck.
+	if err := cfg.RecordUnsafeHostExecAck(time.Now()); err != nil {
+		t.Fatalf("RecordUnsafeHostExecAck: %v", err)
+	}
+	writeTestConfigWithoutHostExecAck(t, cfgDir, cfg)
+}
+
+func writeTestConfigWithoutHostExecAck(t *testing.T, cfgDir string, cfg *config.Config) {
 	t.Helper()
 
 	if err := os.MkdirAll(cfgDir, 0o700); err != nil {

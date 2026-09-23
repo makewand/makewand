@@ -15,18 +15,38 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 type fileCheckpointEntry struct {
-	Path    string
-	Existed bool
-	Content string
+	Path       string
+	Existed    bool
+	Content    string
+	BackupPath string
+	Mode       os.FileMode
+	Nlink      uint64
 }
 
 // FileCheckpoint stores the pre-change state for a set of project files.
 type FileCheckpoint struct {
 	project *Project
 	entries []fileCheckpointEntry
+}
+
+// BackupPaths returns the list of active backup file paths on disk.
+func (c *FileCheckpoint) BackupPaths() []string {
+	if c == nil {
+		return nil
+	}
+	var paths []string
+	for _, entry := range c.entries {
+		if entry.BackupPath != "" {
+			if _, err := os.Stat(entry.BackupPath); err == nil {
+				paths = append(paths, entry.BackupPath)
+			}
+		}
+	}
+	return paths
 }
 
 // CandidateVerification reports whether a candidate patch passed local checks.
@@ -65,25 +85,94 @@ func (p *Project) WriteFiles(files []ExtractedFile) error {
 func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error) {
 	unique := make(map[string]struct{}, len(files))
 	entries := make([]fileCheckpointEntry, 0, len(files))
+
+	cleanupOnError := func() {
+		for _, e := range entries {
+			if e.BackupPath != "" {
+				_ = os.Remove(e.BackupPath)
+			}
+		}
+	}
+
 	for _, f := range files {
 		if _, seen := unique[f.Path]; seen {
 			continue
 		}
 		unique[f.Path] = struct{}{}
 
-		content, err := p.ReadFile(f.Path)
-		if err == nil {
+		fullPath, err := p.validatePath(f.Path, true)
+		if err != nil {
+			cleanupOnError()
+			return nil, err
+		}
+
+		info, statErr := os.Lstat(fullPath)
+		if statErr == nil {
+			if info.IsDir() {
+				continue
+			}
+			mode := info.Mode()
+			var nlink uint64 = 1
+			if sys := info.Sys(); sys != nil {
+				if stat, ok := sys.(*syscall.Stat_t); ok {
+					nlink = uint64(stat.Nlink)
+				}
+			}
+			// If file size is within maxReadFileSize, read into Content
+			if info.Size() <= maxReadFileSize {
+				data, readErr := os.ReadFile(fullPath)
+				if readErr == nil {
+					entries = append(entries, fileCheckpointEntry{
+						Path:    f.Path,
+						Existed: true,
+						Content: string(data),
+						Mode:    mode,
+						Nlink:   nlink,
+					})
+					continue
+				}
+			}
+			// For files exceeding maxReadFileSize or failing memory read, preserve a temporary backup on disk
+			backupFile, createErr := os.CreateTemp("", "makewand-chkpt-*")
+			if createErr != nil {
+				cleanupOnError()
+				return nil, fmt.Errorf("create backup for %s: %w", f.Path, createErr)
+			}
+			srcFile, openErr := os.Open(fullPath)
+			if openErr != nil {
+				_ = backupFile.Close()
+				_ = os.Remove(backupFile.Name())
+				cleanupOnError()
+				return nil, fmt.Errorf("open backup source %s: %w", f.Path, openErr)
+			}
+			_, copyErr := io.Copy(backupFile, srcFile)
+			srcCloseErr := srcFile.Close()
+			dstCloseErr := backupFile.Close()
+			if copyErr != nil || srcCloseErr != nil || dstCloseErr != nil {
+				_ = os.Remove(backupFile.Name())
+				cleanupOnError()
+				return nil, fmt.Errorf("copy backup %s: copy=%v, srcClose=%v, dstClose=%v", f.Path, copyErr, srcCloseErr, dstCloseErr)
+			}
 			entries = append(entries, fileCheckpointEntry{
-				Path:    f.Path,
-				Existed: true,
-				Content: content,
+				Path:       f.Path,
+				Existed:    true,
+				BackupPath: backupFile.Name(),
+				Mode:       mode,
+				Nlink:      nlink,
 			})
 			continue
 		}
-		entries = append(entries, fileCheckpointEntry{
-			Path:    f.Path,
-			Existed: false,
-		})
+
+		if os.IsNotExist(statErr) {
+			entries = append(entries, fileCheckpointEntry{
+				Path:    f.Path,
+				Existed: false,
+			})
+			continue
+		}
+
+		cleanupOnError()
+		return nil, fmt.Errorf("stat %s: %w", f.Path, statErr)
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
@@ -96,6 +185,18 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 	}, nil
 }
 
+// Cleanup removes any temporary backup files created for large file checkpoints.
+func (c *FileCheckpoint) Cleanup() {
+	if c == nil {
+		return
+	}
+	for _, entry := range c.entries {
+		if entry.BackupPath != "" {
+			_ = os.Remove(entry.BackupPath)
+		}
+	}
+}
+
 // Restore rolls the project files back to the checkpointed state.
 func (c *FileCheckpoint) Restore() error {
 	if c == nil || c.project == nil {
@@ -104,8 +205,96 @@ func (c *FileCheckpoint) Restore() error {
 
 	for _, entry := range c.entries {
 		if entry.Existed {
+			if entry.BackupPath != "" {
+				fullPath, err := c.project.validatePath(entry.Path, true)
+				if err != nil {
+					return err
+				}
+				dir := filepath.Dir(fullPath)
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					return fmt.Errorf("ensure dir for restore %s: %w", entry.Path, err)
+				}
+				fullPath, err = c.project.validatePath(entry.Path, true)
+				if err != nil {
+					return err
+				}
+				dir = filepath.Dir(fullPath)
+
+				curInfo, curStatErr := os.Lstat(fullPath)
+				curNlink := entry.Nlink
+				if curStatErr == nil {
+					if sys := curInfo.Sys(); sys != nil {
+						if stat, ok := sys.(*syscall.Stat_t); ok {
+							curNlink = uint64(stat.Nlink)
+						}
+					}
+				}
+
+				src, err := os.Open(entry.BackupPath)
+				if err != nil {
+					return fmt.Errorf("restore %s from backup (%s): %w", entry.Path, entry.BackupPath, err)
+				}
+
+				// If file exists and has multiple hard links, write directly into the existing inode
+				// to preserve content consistency across all hard links referencing this file.
+				if curStatErr == nil && (curNlink > 1 || entry.Nlink > 1) {
+					dst, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_TRUNC, entry.Mode.Perm())
+					if err != nil {
+						src.Close()
+						return fmt.Errorf("open hardlinked target for in-place restore %s: %w", entry.Path, err)
+					}
+					_, copyErr := io.Copy(dst, src)
+					srcCloseErr := src.Close()
+					dstCloseErr := dst.Close()
+					if copyErr != nil || srcCloseErr != nil || dstCloseErr != nil {
+						return fmt.Errorf("copy in-place restore %s: copy=%v, srcClose=%v, dstClose=%v", entry.Path, copyErr, srcCloseErr, dstCloseErr)
+					}
+					if entry.Mode != 0 {
+						if err := os.Chmod(fullPath, entry.Mode.Perm()); err != nil {
+							return fmt.Errorf("chmod in-place restore %s: %w", entry.Path, err)
+						}
+					}
+					continue
+				}
+
+				// Atomic replace: write to temp file in target directory, then rename
+				tmpDst, err := os.CreateTemp(dir, ".makewand-restore-*")
+				if err != nil {
+					src.Close()
+					return fmt.Errorf("create restore temp for %s: %w", entry.Path, err)
+				}
+				_, copyErr := io.Copy(tmpDst, src)
+				srcCloseErr := src.Close()
+				closeErr := tmpDst.Close()
+				if copyErr != nil || srcCloseErr != nil || closeErr != nil {
+					_ = os.Remove(tmpDst.Name())
+					return fmt.Errorf("copy restore %s from %s: copy=%v, srcClose=%v, close=%v", entry.Path, entry.BackupPath, copyErr, srcCloseErr, closeErr)
+				}
+				// Preserve original file permissions (including executable bits)
+				if entry.Mode != 0 {
+					if err := os.Chmod(tmpDst.Name(), entry.Mode.Perm()); err != nil {
+						_ = os.Remove(tmpDst.Name())
+						return fmt.Errorf("chmod restore %s: %w", entry.Path, err)
+					}
+				}
+				if err := os.Rename(tmpDst.Name(), fullPath); err != nil {
+					_ = os.Remove(tmpDst.Name())
+					return fmt.Errorf("rename restore %s: %w", entry.Path, err)
+				}
+				continue
+			}
+
 			if err := c.project.WriteFile(entry.Path, entry.Content); err != nil {
 				return fmt.Errorf("restore %s: %w", entry.Path, err)
+			}
+			if entry.Mode != 0 {
+				fullPath, err := c.project.validatePath(entry.Path, true)
+				if err != nil {
+					return fmt.Errorf("validate path for chmod %s: %w", entry.Path, err)
+				}
+				if err := os.Chmod(fullPath, entry.Mode.Perm()); err != nil {
+					return fmt.Errorf("chmod restore %s: %w", entry.Path, err)
+				}
 			}
 			continue
 		}
@@ -118,6 +307,9 @@ func (c *FileCheckpoint) Restore() error {
 			return fmt.Errorf("remove %s: %w", entry.Path, err)
 		}
 	}
+
+	// Only clean up temporary backups when ALL files have been successfully restored!
+	c.Cleanup()
 	return nil
 }
 
@@ -174,6 +366,9 @@ func (p *Project) CloneToTemp() (*Project, error) {
 		_ = os.RemoveAll(tempDir)
 		return nil, err
 	}
+	// Verification clones execute the same restricted plans as the parent, so
+	// they inherit the parent's host-execution authorization.
+	cloned.unsafeHostAuth = p.unsafeHostAuth
 	return cloned, nil
 }
 
@@ -650,9 +845,9 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 	}
 
 	// Fail closed: everything below executes candidate-influenced commands, so
-	// without working sandbox isolation (or the explicit unsafe host opt-in)
-	// nothing runs and the candidate stays unverified.
-	execEnv, isoErr := resolveVerifyExecEnvironment()
+	// without working sandbox isolation (or the acknowledged unsafe host
+	// opt-in) nothing runs and the candidate stays unverified.
+	execEnv, isoErr := resolveVerifyExecEnvironment(p.unsafeHostAuth)
 	if isoErr != nil {
 		report.IsolationError = isoErr.Error()
 		return report

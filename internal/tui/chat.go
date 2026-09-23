@@ -112,6 +112,12 @@ func (c *ChatPanel) AddMessage(msg ChatMessage) {
 	c.updateViewport()
 }
 
+// AddMessageForceBottom adds a message and forces the viewport to the bottom.
+func (c *ChatPanel) AddMessageForceBottom(msg ChatMessage) {
+	c.messages = append(c.messages, msg)
+	c.updateViewportForceBottom()
+}
+
 func (c *ChatPanel) ResetMessages(messages []ChatMessage) {
 	c.messages = append([]ChatMessage(nil), messages...)
 	c.streamBuf.Reset()
@@ -165,6 +171,8 @@ func (c *ChatPanel) relayout() {
 	vpHeight := maxInt(c.height-headerHeight-inputHeight, minViewportHeight)
 	inputWidth := maxInt(c.width-2, minInputWidth)
 
+	wasAtBottom := !c.ready || c.viewport.AtBottom()
+
 	if !c.ready {
 		c.viewport = viewport.New(vpWidth, vpHeight)
 		c.ready = true
@@ -175,6 +183,9 @@ func (c *ChatPanel) relayout() {
 
 	c.textarea.SetWidth(inputWidth)
 	c.viewport.SetContent(c.renderMessages())
+	if wasAtBottom {
+		c.viewport.GotoBottom()
+	}
 }
 
 // SetStreaming sets whether the AI is currently streaming a response.
@@ -443,6 +454,20 @@ func (c *ChatPanel) updateViewport() {
 	if c.viewport.Width < minViewportWidth || c.viewport.Height < minViewportHeight {
 		return
 	}
+	atBottom := c.viewport.AtBottom()
+	c.viewport.SetContent(c.renderMessages())
+	if atBottom {
+		c.viewport.GotoBottom()
+	}
+}
+
+func (c *ChatPanel) updateViewportForceBottom() {
+	if !c.ready {
+		return
+	}
+	if c.viewport.Width < minViewportWidth || c.viewport.Height < minViewportHeight {
+		return
+	}
 	c.viewport.SetContent(c.renderMessages())
 	c.viewport.GotoBottom()
 }
@@ -518,23 +543,47 @@ func (c ChatPanel) Update(msg tea.Msg) (ChatPanel, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		c.width = maxInt(msg.Width, minPanelWidth)
 		c.height = maxInt(msg.Height, minPanelHeight)
+		c.relayout()
+		return c, nil
+
+	case tea.MouseMsg:
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			c.viewport.LineUp(3)
+			return c, nil
+		case tea.MouseWheelDown:
+			c.viewport.LineDown(3)
+			return c, nil
+		default:
+			var vpCmd tea.Cmd
+			c.viewport, vpCmd = c.viewport.Update(msg)
+			return c, vpCmd
+		}
 
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyTab && c.applySlashCompletion() {
 			c.relayout()
-			c.updateViewport()
 			return c, nil
 		}
 		if (msg.Type == tea.KeyUp || msg.Type == tea.KeyDown) && c.moveSlashSelection(keySelectionDelta(msg.Type)) {
 			c.relayout()
-			c.updateViewport()
+			return c, nil
+		}
+		if msg.Type == tea.KeyPgUp {
+			c.viewport.HalfViewUp()
+			return c, nil
+		}
+		if msg.Type == tea.KeyPgDown {
+			c.viewport.HalfViewDown()
 			return c, nil
 		}
 	}
 
-	var vpCmd tea.Cmd
-	c.viewport, vpCmd = c.viewport.Update(msg)
-	cmds = append(cmds, vpCmd)
+	if _, isKey := msg.(tea.KeyMsg); !isKey || !c.textarea.Focused() {
+		var vpCmd tea.Cmd
+		c.viewport, vpCmd = c.viewport.Update(msg)
+		cmds = append(cmds, vpCmd)
+	}
 
 	var taCmd tea.Cmd
 	c.textarea, taCmd = c.textarea.Update(msg)
@@ -542,7 +591,6 @@ func (c ChatPanel) Update(msg tea.Msg) (ChatPanel, tea.Cmd) {
 
 	c.syncSlashSelection()
 	c.relayout()
-	c.updateViewport()
 
 	return c, tea.Batch(cmds...)
 }

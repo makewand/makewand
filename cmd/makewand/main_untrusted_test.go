@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
 )
@@ -43,7 +44,7 @@ func TestRunSinglePromptUntrustedSurfacesActionableMessage(t *testing.T) {
 	// No API keys and no CLIs: in untrusted mode the candidate provider set is
 	// empty, which is exactly the fail-closed case the engine flags.
 
-	err = runSinglePrompt(cfg, "/fix the broken build", 5*time.Second, model.RepoTrustUntrusted, false)
+	err = runSinglePrompt(cfg, "/fix the broken build", 5*time.Second, model.RepoTrustUntrusted, engine.UnsafeHostExecAuthorization{}, false)
 	if err == nil {
 		t.Fatalf("runSinglePrompt returned nil, want fail-closed untrusted-mode error")
 	}
