@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-user@192.168.10.16}"
+REMOTE_HOST="${REMOTE_HOST:-${MAKEWAND_REMOTE_HOST:-user@127.0.0.1}}"
 REMOTE_DIR="${REMOTE_DIR:-/tmp/makewand-smoke}"
 LOCAL_BIN="${LOCAL_BIN:-/tmp/makewand-local}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:18080}"
