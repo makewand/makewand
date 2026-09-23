@@ -222,25 +222,29 @@ def format_review_diff(diff: str, max_chars: int = 15000) -> str:
 
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
-    Deterministically detects and runs local unit test suites in cwd.
+    Deterministically detects and runs local unit test suites in cwd inside Bubblewrap sandbox.
     Returns (passed: bool, details: Optional[str]).
     If no tests exist in project, returns (True, None).
     """
-    import subprocess
     import shutil
+    from makewand.sandbox import run_in_sandbox
     p = Path(cwd)
 
     test_cmd = None
-    env = dict(os.environ)
-    env["PYTHONPATH"] = f"{cwd}:{env.get('PYTHONPATH', '')}"
+    extra_env = {"PYTHONPATH": f"{cwd}:{os.environ.get('PYTHONPATH', '')}"}
 
     # 1. Python test suites
     if (p / "pytest.ini").exists() or (p / "pyproject.toml").exists() or (p / "tests").is_dir() or list(p.glob("test_*.py")):
-        if shutil.which("pytest"):
-            test_target = ["tests"] if (p / "tests").is_dir() else []
-            test_cmd = ["pytest", "-q"] + test_target
-        else:
-            test_cmd = ["python3", "-m", "unittest", "discover", "-q"]
+        py_bin = sys.executable or "python3"
+        test_target = ["tests"] if (p / "tests").is_dir() else []
+        try:
+            import pytest
+            test_cmd = [py_bin, "-m", "pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
+        except ImportError:
+            if shutil.which("pytest"):
+                test_cmd = ["pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
+            else:
+                test_cmd = [py_bin, "-m", "unittest", "discover", "-q"]
 
     # 2. Go test suites
     elif (p / "go.mod").exists():
@@ -263,17 +267,27 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     if not test_cmd:
         return True, None
 
-    try:
-        res = subprocess.run(test_cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
-        if res.returncode == 0:
-            return True, res.stdout.strip()
-        else:
-            output = (res.stdout + "\n" + res.stderr).strip()
-            return False, output
-    except subprocess.TimeoutExpired:
-        return False, f"本地单元测试执行超时 (>{timeout}s)"
-    except Exception as ex:
-        return False, f"本地单元测试执行失败: {ex}"
+    # Execute tests strictly inside isolated sandbox:
+    # allow_network=False, readonly=False (allows test artifacts inside workspace),
+    # is_provider=False (tmpfs HOME, masks credentials, drops host environment)
+    code, stdout, stderr, err_category = run_in_sandbox(
+        cmd=test_cmd,
+        workspace=cwd,
+        timeout=timeout,
+        allow_network=False,
+        readonly=False,
+        is_provider=False,
+        extra_env=extra_env
+    )
+    if code == 0:
+        return True, stdout.strip()
+    else:
+        output = (stdout + "\n" + stderr).strip()
+        if err_category == "SandboxUnavailable":
+            return False, f"Bubblewrap 沙箱不可用，根据安全防御原则阻断本地测试执行: {stderr}"
+        elif err_category:
+            return False, f"本地单元测试执行异常 ({err_category}):\n{output}"
+        return False, output
 
 def has_critical_defects(review_text: str) -> bool:
     """
@@ -756,7 +770,20 @@ def run_pipeline(
             return 0
         return min(requested, left)
 
-    if force_code:
+    # Explicit read-only / negative patterns strictly override force_code
+    explicit_readonly_triggers = [
+        "不要修改", "不用修改", "别修改", "不要改", "别改", "不用改",
+        "只看不改", "只解释", "无需修改", "不要写代码", "别写代码", "不用写代码",
+        "只分析", "只做分析", "只读", "don't modify", "do not modify", "without modifying",
+        "don't edit", "do not edit", "read only", "readonly", "explain only", "just explain"
+    ]
+    has_explicit_readonly = any(n in prompt.lower() for n in explicit_readonly_triggers)
+
+    if has_explicit_readonly:
+        intent = classify_prompt_intent(prompt)
+        if intent == "code":
+            intent = "explain"
+    elif force_code:
         intent = "code"
     else:
         intent = classify_prompt_intent(prompt)
@@ -979,11 +1006,15 @@ def run_pipeline(
         else:
             print(c(f"⚠ {r_eng.upper()} 审查未产生有效响应: {err}", COLOR_YELLOW))
 
-    # Deterministic test gate override: if local tests failed, pass cannot be True
-    if not test_ok and review_output:
-        review_verdict = extract_verdict_json(review_output)
-        if review_verdict and review_verdict.get("pass"):
-            review_output = f"MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"本地单元测试执行失败: {test_err[:120]}\"]}}\n\n本地单测报错如下：\n{test_err[:2000]}"
+    # Deterministic test gate override: if local tests failed, pass CANNOT be True under any circumstances,
+    # regardless of whether the reviewer returned structured JSON or free-form text ("LGTM").
+    if not test_ok:
+        err_snippet = (test_err or "Unknown test failure")[:200].replace('"', '\\"')
+        review_output = (
+            f"MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"本地单元测试执行失败: {err_snippet}\"]}}\n\n"
+            f"本地单测报错详情如下：\n{(test_err or '')[:2000]}\n\n"
+            f"=== 原始审查意见 (已被单元测试硬防线否决) ===\n{review_output or ''}"
+        )
 
     # Fail-Closed Quality Gate: If code has changes but review fails completely or is empty, reject delivery
     if not review_output or not review_output.strip():
@@ -1082,11 +1113,14 @@ def run_pipeline(
                     re_output = out
                     break
 
-            # Deterministic test gate override: if local tests failed, pass cannot be True
-            if not test_ok and re_output:
-                re_verdict = extract_verdict_json(re_output)
-                if re_verdict and re_verdict.get("pass"):
-                    re_output = f"MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"本地单元测试执行失败: {test_err[:120]}\"]}}\n\n本地单测报错如下：\n{test_err[:2000]}"
+            # Deterministic test gate override: if local tests failed, pass CANNOT be True under any circumstances
+            if not test_ok:
+                err_snippet = (test_err or "Unknown test failure")[:200].replace('"', '\\"')
+                re_output = (
+                    f"MAKEWAND_VERDICT: {{\"pass\": false, \"defects\": [\"本地单元测试执行失败: {err_snippet}\"]}}\n\n"
+                    f"本地单测报错详情如下：\n{(test_err or '')[:2000]}\n\n"
+                    f"=== 原始审查意见 (已被单元测试硬防线否决) ===\n{re_output or ''}"
+                )
 
             if re_output:
                 # Capture the flagged defects from the prior round BEFORE overwriting review_output
@@ -1118,6 +1152,13 @@ def run_pipeline(
         print(c("【最终审计意见与质量评估】", COLOR_BOLD))
         print(review_output.strip()[:1000])
         print("...\n")
+
+    # Non-bypassable Quality Gate: Local deterministic unit tests MUST pass
+    if not test_ok:
+        return fail_and_cleanup(
+            f"❌ [Makewand Quality Gate] 本地确定性单元测试未通过 (Tests Failing)，阻断交付。\n"
+            f"报错详情：\n{(test_err or '')[:1000]}"
+        )
 
     if not is_review_passed(review_output):
         return fail_and_cleanup("❌ [Makewand Quality Gate] 代码未能通过独立红队审查 (未获批准或存在缺陷)，拒绝交付。")

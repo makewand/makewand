@@ -4,6 +4,7 @@ Enforces host protection, masks sensitive credential directories, and confines f
 """
 
 import os
+import sys
 import shutil
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -48,7 +49,8 @@ def wrap_bwrap(
     readonly: bool = False,
     repo_root: Optional[str] = None,
     is_provider: bool = False,
-    worktree_root: Optional[str] = None
+    worktree_root: Optional[str] = None,
+    extra_env: Optional[dict] = None
 ) -> List[str]:
     """
     Wraps command with bubblewrap isolating host filesystem, IPC, PID, and credentials.
@@ -141,6 +143,33 @@ def wrap_bwrap(
             if os.path.exists(tp):
                 bwrap_cmd.extend(["--ro-bind", tp, tp])
 
+        # Mount active Python interpreter / venv if located in user home
+        mounted_home_paths = set()
+        try:
+            py_exe = os.path.abspath(sys.executable)
+            if py_exe.startswith(user_home):
+                py_dir = os.path.dirname(py_exe)
+                py_env_root = os.path.dirname(py_dir)
+                if os.path.exists(py_env_root) and py_env_root != user_home:
+                    bwrap_cmd.extend(["--ro-bind", py_env_root, py_env_root])
+                    mounted_home_paths.add(py_env_root)
+                elif os.path.exists(py_dir):
+                    bwrap_cmd.extend(["--ro-bind", py_dir, py_dir])
+                    mounted_home_paths.add(py_dir)
+        except Exception:
+            pass
+
+        # If command executable itself is located under user_home, mount it read-only (unless parent was already mounted)
+        try:
+            if command_args and os.path.isabs(command_args[0]):
+                cmd_bin = os.path.abspath(command_args[0])
+                if cmd_bin.startswith(user_home) and os.path.exists(cmd_bin):
+                    already_mounted = any(cmd_bin.startswith(mp + "/") or cmd_bin == mp for mp in mounted_home_paths)
+                    if not already_mounted and not any(cmd_bin.startswith(os.path.join(user_home, s)) for s in SENSITIVE_HOME_DIRS):
+                        bwrap_cmd.extend(["--ro-bind", cmd_bin, cmd_bin])
+        except Exception:
+            pass
+
     # Mount workspace / worktree
     if mount_root == ws:
         bwrap_cmd.extend(["--ro-bind" if readonly else "--bind", ws, ws])
@@ -179,6 +208,10 @@ def wrap_bwrap(
     for var in SAFE_PASSTHROUGH_ENVS:
         if var in os.environ:
             bwrap_cmd.extend(["--setenv", var, os.environ[var]])
+
+    if extra_env:
+        for k, v in extra_env.items():
+            bwrap_cmd.extend(["--setenv", str(k), str(v)])
 
     if not allow_network:
         bwrap_cmd.append("--unshare-net")
@@ -219,7 +252,8 @@ def run_in_sandbox(
     is_provider: bool = False,
     worktree_root: Optional[str] = None,
     stream: bool = False,
-    print_prefix: str = ""
+    print_prefix: str = "",
+    extra_env: Optional[dict] = None
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command inside the bubblewrap sandbox.
@@ -236,6 +270,7 @@ def run_in_sandbox(
             repo_root=repo_root,
             is_provider=is_provider,
             worktree_root=worktree_root,
+            extra_env=extra_env,
         )
     elif os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
         return (

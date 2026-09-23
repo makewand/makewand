@@ -87,26 +87,74 @@ func tryDelegateToPythonOrchestrator(args []string) bool {
 		return false
 	}
 
+	// Validate --repo-trust early if present in delegated arguments
+	for i, arg := range args {
+		var val string
+		if strings.HasPrefix(arg, "--repo-trust=") {
+			val = strings.TrimPrefix(arg, "--repo-trust=")
+		} else if arg == "--repo-trust" && i+1 < len(args) {
+			val = args[i+1]
+		}
+		if val != "" {
+			if val != "trusted" && val != "untrusted" {
+				fmt.Fprintf(os.Stderr, "Error: invalid --repo-trust %q: must be \"trusted\" or \"untrusted\"\n", val)
+				os.Exit(1)
+			}
+		}
+	}
+
 	pyBin, err := exec.LookPath("python3")
 	if err != nil {
 		pyBin, err = exec.LookPath("python")
 	}
 	if err != nil {
-		return false
+		fmt.Fprintf(os.Stderr, "Error: python3 runtime is required to execute %s\n", subcmd)
+		os.Exit(1)
 	}
 
 	exePath, _ := os.Executable()
 	exeDir := filepath.Dir(exePath)
 	repoRoot := filepath.Dir(exeDir)
 
-	scriptCandidates := []string{
-		filepath.Join(exeDir, "makewand"),
-		filepath.Join(repoRoot, "bin", "makewand"),
-		"/usr/local/bin/makewand",
+	var scriptCandidates []string
+	if envHome := os.Getenv("MAKEWAND_HOME"); envHome != "" {
+		scriptCandidates = append(scriptCandidates, filepath.Join(envHome, "bin", "makewand"))
 	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		scriptCandidates = append(scriptCandidates,
+			filepath.Join(home, ".local", "bin", "makewand"),
+			filepath.Join(home, ".local", "share", "makewand", "bin", "makewand"),
+		)
+	}
+	// Beside current binary (if not self)
+	scriptCandidates = append(scriptCandidates, filepath.Join(exeDir, "makewand"))
+
+	// Check if running from legitimate makewand source checkout
+	if fi, err := os.Stat(filepath.Join(repoRoot, "makewand", "__init__.py")); err == nil && !fi.IsDir() {
+		scriptCandidates = append(scriptCandidates, filepath.Join(repoRoot, "bin", "makewand"))
+	}
+
+	// Global system paths
+	scriptCandidates = append(scriptCandidates,
+		"/usr/local/bin/makewand",
+		"/usr/local/share/makewand/bin/makewand",
+		"/usr/bin/makewand",
+	)
+
 	var targetScript string
 	for _, sc := range scriptCandidates {
-		if fi, err := os.Stat(sc); err == nil && !fi.IsDir() && sc != exePath {
+		realSc, err := filepath.EvalSymlinks(sc)
+		if err != nil {
+			realSc = sc
+		}
+		realExe, err := filepath.EvalSymlinks(exePath)
+		if err != nil {
+			realExe = exePath
+		}
+		if realSc == realExe {
+			continue
+		}
+		if fi, err := os.Stat(sc); err == nil && !fi.IsDir() {
 			targetScript = sc
 			break
 		}
@@ -116,8 +164,18 @@ func tryDelegateToPythonOrchestrator(args []string) bool {
 	if targetScript != "" {
 		cmd = exec.Command(targetScript, args...)
 	} else {
-		cmd = exec.Command(pyBin, append([]string{"-m", "makewand"}, args...)...)
+		// Verify if makewand package is installed in python's system/user site-packages.
+		// Note: We strictly pass "-P" (Python Safe Path) to prevent loading arbitrary
+		// modules from untrusted current working directory.
+		checkCmd := exec.Command(pyBin, "-P", "-c", "import makewand")
+		if err := checkCmd.Run(); err == nil {
+			cmd = exec.Command(pyBin, append([]string{"-P", "-m", "makewand"}, args...)...)
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: makewand orchestrator (Python engine) could not be located in trusted system paths (~/.local/bin/makewand, ~/.local/share/makewand, or python site-packages).\nPlease run scripts/install.sh or set MAKEWAND_HOME.\n")
+			os.Exit(1)
+		}
 	}
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

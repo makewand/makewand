@@ -324,29 +324,33 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in GO_SUBCOMMANDS:
         delegate_to_go_server(sys.argv[1:])
 
+    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default="trusted", help="Repository trust level: trusted or untrusted")
+
     parser = argparse.ArgumentParser(
         prog="makewand",
-        description="Makewand v3.0: Unified Multi-Model AI Subscription Orchestrator"
+        description="Makewand v3.0: Unified Multi-Model AI Subscription Orchestrator",
+        parents=[common_parser]
     )
     parser.add_argument("-v", "--version", action="version", version="makewand 3.0.0")
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     # models
-    subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems")
+    subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems", parents=[common_parser])
 
     # status
-    p_status = subparsers.add_parser("status", help="Show health, quota limits, and reset times of all AIs")
+    p_status = subparsers.add_parser("status", help="Show health, quota limits, and reset times of all AIs", parents=[common_parser])
     p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs")
 
     # probe
-    subparsers.add_parser("probe", help="Perform live probing on all AIs and update status cache")
+    subparsers.add_parser("probe", help="Perform live probing on all AIs and update status cache", parents=[common_parser])
 
     # quota
-    p_quota = subparsers.add_parser("quota", help="Show remaining subscription quota across providers")
+    p_quota = subparsers.add_parser("quota", help="Show remaining subscription quota across providers", parents=[common_parser])
     p_quota.add_argument("--probe", action="store_true", help="Force immediate live probe")
 
     # run
-    p_run = subparsers.add_parser("run", help="Run auto-adaptive multi-model pipeline with auto-fix loop")
+    p_run = subparsers.add_parser("run", help="Run auto-adaptive multi-model pipeline with auto-fix loop", parents=[common_parser])
     p_run.add_argument("prompt", help="The task prompt to execute")
     p_run.add_argument("--cwd", help="Target working directory")
     p_run.add_argument("--tier", choices=["auto", "fast", "standard", "deep"], default="auto", help="Execution tier: fast, standard, deep")
@@ -357,14 +361,14 @@ def main():
     p_run.add_argument("--timeout", type=int, default=300, help="Per-stage timeout in seconds")
 
     # review
-    p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity")
+    p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity", parents=[common_parser])
     p_rev.add_argument("--cwd", help="Target working directory")
     p_rev.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_rev.add_argument("--stream", action="store_true", default=False, help="Stream review output line-by-line")
     p_rev.add_argument("--timeout", type=int, default=300)
 
     # race
-    p_race = subparsers.add_parser("race", help="Run prompt on two models in parallel worktrees and compare")
+    p_race = subparsers.add_parser("race", help="Run prompt on two models in parallel worktrees and compare", parents=[common_parser])
     p_race.add_argument("prompt", help="Prompt for race comparison")
     p_race.add_argument("--cwd", help="Target working directory")
     p_race.add_argument("--timeout", type=int, default=300)
@@ -440,8 +444,10 @@ def main():
         "claude", "codex", "agy", "muse", "observe", "candidates", "inspect", "apply", "discard"
     }
     # If user invokes `makewand "do something"`, automatically route to `makewand run "do something"`
+    is_auto_routed_run = False
     if len(sys.argv) > 1 and sys.argv[1] not in known_subcommands and not sys.argv[1].startswith("-"):
         sys.argv.insert(1, "run")
+        is_auto_routed_run = True
 
     args = parser.parse_args()
 
@@ -460,6 +466,9 @@ def main():
     elif args.subcommand == "quota":
         cmd_quota(args)
     elif args.subcommand == "run":
+        # Explicit `makewand run <prompt>` indicates the user intended code execution, but natural language
+        # entrypoint `makewand "<prompt>"` must allow intent classification (e.g. explain, identity, review)
+        force_code = not is_auto_routed_run
         ok = run_pipeline(
             args.prompt,
             cwd=args.cwd,
@@ -469,7 +478,7 @@ def main():
             auto_fix=args.auto_fix,
             max_fix=args.max_fix,
             timeout=args.timeout,
-            force_code=True
+            force_code=force_code
         )
         if not ok:
             sys.exit(EXIT_FAILED)
