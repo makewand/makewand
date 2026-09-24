@@ -216,23 +216,23 @@ def wrap_bwrap(
             auth_path = os.path.join(user_home, auth_rel)
             if os.path.exists(auth_path):
                 real_p = os.path.realpath(auth_path)
-                bind_flag = "--ro-bind" if (ro_file or readonly) else "--bind"
+                bind_flag = "--ro-bind" if ro_file else "--bind"
                 if real_p != auth_path and os.path.exists(real_p):
                     bwrap_cmd.extend([bind_flag, real_p, real_p])
                 bwrap_cmd.extend([bind_flag, auth_path, auth_path])
 
-        # Protect sensitive config files and hook directories within auth dirs from tampering even in writable sessions
-        if not readonly:
-            for sc_rel in [
-                ".claude/settings.json",
-                ".claude/settings.local.json",
-                ".claude/hooks",
-                ".codex/config.toml",
-                ".config/muse/settings.json"
-            ]:
-                sc_p = os.path.join(user_home, sc_rel)
-                if os.path.exists(sc_p):
-                    bwrap_cmd.extend(["--ro-bind", sc_p, sc_p])
+        # Protect sensitive config files and hook directories within auth dirs from tampering
+        for sc_rel in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude/hooks",
+            ".codex/config.toml",
+            ".config/muse/settings.json",
+            ".grok/config.toml",
+        ]:
+            sc_p = os.path.join(user_home, sc_rel)
+            if os.path.exists(sc_p):
+                bwrap_cmd.extend(["--ro-bind", sc_p, sc_p])
 
         if is_muse:
             uid = os.getuid()
