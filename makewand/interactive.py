@@ -43,10 +43,10 @@ BANNER = rf"""{COLOR_CYAN}{COLOR_BOLD}
   /  |/  /___ _/ /_____ _      ______ _____  ____/ /
  / /|_/ / __ `/ //_/ _ \ | /| / / __ `/ __ \/ __  / 
 / /  / / /_/ / ,< /  __/ |/ |/ / /_/ / / / / /_/ /  
-/_/  /_/\__,_/_/|_|\___/|__/|__/\__,_/_/ /_/\__,_/   v3.0{COLOR_RESET}
+/_/  /_/\__,_/_/|_|\___/|__/|__/\__,_/_/ /_/\__,_/   v3.1{COLOR_RESET}
 
-  ✨ {COLOR_BOLD}零成本多模型 AI 订阅统一调度中枢{COLOR_RESET}
-  统合调度: {COLOR_GREEN}Google AI Pro (AGY){COLOR_RESET} · {COLOR_BLUE}Claude Code{COLOR_RESET} · {COLOR_CYAN}Codex CLI (OpenAI){COLOR_RESET} · {COLOR_PURPLE}Muse Code (Meta){COLOR_RESET}
+  ✨ {COLOR_BOLD}零成本多模型 AI 订阅与全生态编程工具统一调度中枢{COLOR_RESET}
+  统合调度: {COLOR_GREEN}AGY (Google){COLOR_RESET} · {COLOR_BLUE}Claude Code{COLOR_RESET} · {COLOR_CYAN}Codex (OpenAI){COLOR_RESET} · {COLOR_RED}Grok (xAI){COLOR_RESET} · {COLOR_PURPLE}Muse (Meta){COLOR_RESET} · {COLOR_YELLOW}Aider/API/Local{COLOR_RESET}
 """
 
 SLASH_COMMANDS = [
@@ -104,12 +104,12 @@ def print_status_bar():
         else:
             return f"⚪ {name}"
 
-    bar = f"  状态: {fmt('AGY', 'agy')} | {fmt('Codex', 'codex')} | {fmt('Claude', 'claude')} | {fmt('Muse', 'muse')}"
+    bar = f"  状态: {fmt('AGY', 'agy')} | {fmt('Codex', 'codex')} | {fmt('Claude', 'claude')} | {fmt('Grok', 'grok')} | {fmt('Muse', 'muse')}"
     print(bar)
 
 def print_help_menu():
     print(f"\n{COLOR_BOLD}【Makewand 交互模式内置指令】{COLOR_RESET}")
-    print(f"  {COLOR_CYAN}/status, /quota{COLOR_RESET}      查看四大模型订阅健康度与额度看板")
+    print(f"  {COLOR_CYAN}/status, /quota{COLOR_RESET}      查看五大模型订阅健康度与额度看板")
     print(f"  {COLOR_CYAN}/probe{COLOR_RESET}              强制对本机已安装的 AI CLI 发起实时探活")
     print(f"  {COLOR_CYAN}/models{COLOR_RESET}             查看动态探测到的各大模型版本")
     print(f"  {COLOR_CYAN}/review{COLOR_RESET}             对当前工作区未提交的 git diff 进行独立红队审查")
@@ -121,11 +121,13 @@ def print_help_menu():
     print(f"  {COLOR_CYAN}/exit, /quit{COLOR_RESET}        退出交互会话 (快捷键: Ctrl+D)\n")
     print(f"  {COLOR_YELLOW}直接输入自然语言需求，即可自动触发全链路跨模型编码、审查与自愈！{COLOR_RESET}\n")
 
-def start_interactive_session():
+def start_interactive_session(repo_trust: str = "trusted"):
     setup_readline()
     print(BANNER)
     cwd = os.getcwd()
     print(f"  {COLOR_BOLD}工作目录:{COLOR_RESET} {cwd}")
+    if repo_trust == "untrusted":
+        print(c("  🛡️ 仓库信任级别: UNTRUSTED (已强制启用 Bubblewrap 全隔离与严格只读挂载)", COLOR_YELLOW))
     print_status_bar()
     print(f"\n  输入您的任务或提问直接开始；输入 {COLOR_CYAN}/help{COLOR_RESET} 查看内置快捷指令。按 {COLOR_YELLOW}Ctrl+C{COLOR_RESET} 取消当前输入，{COLOR_YELLOW}Ctrl+D{COLOR_RESET} 退出。\n")
 
@@ -175,7 +177,7 @@ def start_interactive_session():
             continue
 
         elif lower == "/review":
-            run_review(cwd=cwd, stream=True)
+            run_review(cwd=cwd, stream=True, repo_trust=repo_trust)
             continue
 
         elif lower == "/clear":
@@ -196,7 +198,7 @@ def start_interactive_session():
         elif lower.startswith("/race"):
             parts = user_input.split(maxsplit=1)
             if len(parts) > 1 and parts[1].strip():
-                run_race(parts[1].strip(), cwd=cwd)
+                run_race(parts[1].strip(), cwd=cwd, repo_trust=repo_trust)
             else:
                 print(c("用法: /race <待比拼的任务或算法实现>", COLOR_YELLOW))
             continue
@@ -251,7 +253,8 @@ def start_interactive_session():
                 cwd=cwd,
                 tier=current_tier,
                 stream=True,
-                auto_fix=True
+                auto_fix=True,
+                repo_trust=repo_trust
             )
         except KeyboardInterrupt:
             print(c("\n⚠ 任务已被用户中断 (Ctrl+C)。", COLOR_YELLOW))

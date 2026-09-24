@@ -6,27 +6,129 @@ import os
 import shutil
 import subprocess
 import json
+import shlex
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Union
 from makewand.config import c, COLOR_YELLOW, COLOR_RED
 
-def run_git_cmd(cmd, cwd=None, input_data=None, binary=False):
+SAFE_GIT_SECURITY_FLAGS = [
+    "-c", "diff.tool=",
+    "-c", "core.fsmonitor=",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.attributesFile=/dev/null",
+    "-c", "core.pager=cat",
+    "-c", "commit.gpgsign=false",
+]
+
+def _get_git_info_attributes_path(cwd: Optional[Union[str, Path]]) -> Optional[Path]:
+    try:
+        p = Path(cwd).resolve() if cwd else Path.cwd().resolve()
+        for cur in [p] + list(p.parents):
+            gp = cur / ".git"
+            if gp.is_dir():
+                ia = gp / "info" / "attributes"
+                if ia.exists():
+                    return ia
+                break
+            elif gp.is_file():
+                try:
+                    txt = gp.read_text(encoding="utf-8").strip()
+                    if txt.startswith("gitdir:"):
+                        gd = Path(txt[7:].strip())
+                        if not gd.is_absolute():
+                            gd = (gp.parent / gd).resolve()
+                        ia = gd / "info" / "attributes"
+                        if ia.exists():
+                            return ia
+                except Exception:
+                    pass
+                break
+    except Exception:
+        pass
+    return None
+
+def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True):
+    shielded_info = None
     try:
         is_bytes = isinstance(input_data, bytes) or binary
+        if safe and isinstance(cmd, str) and "&&" in cmd:
+            subcmds = [s.strip() for s in cmd.split("&&") if s.strip()]
+            last_rc, last_out, last_err = 0, "" if not is_bytes else b"", "" if not is_bytes else b""
+            for sc in subcmds:
+                last_rc, last_out, last_err = run_git_cmd(sc, cwd=cwd, input_data=input_data, binary=binary, safe=safe)
+                if last_rc != 0:
+                    return last_rc, last_out, last_err
+            return last_rc, last_out, last_err
+
+        use_shell = False
+        if isinstance(cmd, str):
+            if safe:
+                if any(op in cmd for op in ["||", ";", "|", "`", "$("]):
+                    raise ValueError(f"Unsafe shell metacharacter detected in git command: {cmd}")
+                cmd = shlex.split(cmd)
+            else:
+                if any(op in cmd for op in ["&&", "||", ";", "|", "`", "$("]):
+                    exec_cmd = cmd
+                    use_shell = True
+                else:
+                    cmd = shlex.split(cmd)
+
+        if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "git" and safe:
+            subcmd = cmd[1] if len(cmd) > 1 else ""
+            extra_global = ["--no-pager"]
+            if subcmd not in ["apply", "clone"]:
+                extra_global.append("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+            exec_cmd = [cmd[0]] + extra_global + SAFE_GIT_SECURITY_FLAGS + cmd[1:]
+            if subcmd == "diff":
+                diff_idx = exec_cmd.index("diff")
+                if "--no-ext-diff" not in exec_cmd:
+                    exec_cmd.insert(diff_idx + 1, "--no-ext-diff")
+                if "--no-textconv" not in exec_cmd:
+                    exec_cmd.insert(diff_idx + 2, "--no-textconv")
+            use_shell = False
+        elif not use_shell:
+            exec_cmd = cmd
+            use_shell = False
+
+        git_env = os.environ.copy()
+        if safe:
+            for k in list(git_env.keys()):
+                if k in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS") or k.startswith("GIT_CONFIG_"):
+                    git_env.pop(k, None)
+
+            # S01: Temporarily shield .git/info/attributes to neutralize host clean/smudge execution
+            ia_target = _get_git_info_attributes_path(cwd)
+            if ia_target and ia_target.exists():
+                try:
+                    shield_file = ia_target.parent / (ia_target.name + ".makewand_shield")
+                    ia_target.rename(shield_file)
+                    shielded_info = (ia_target, shield_file)
+                except Exception:
+                    pass
+
         res = subprocess.run(
-            cmd,
+            exec_cmd,
             input=input_data,
-            shell=True if isinstance(cmd, str) else False,
+            shell=use_shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=not is_bytes,
             cwd=cwd,
-            timeout=30
+            timeout=30,
+            env=git_env
         )
         return res.returncode, res.stdout, res.stderr
     except Exception as e:
         empty = b"" if (isinstance(input_data, bytes) or binary) else ""
         return -1, empty, str(e)
+    finally:
+        if shielded_info:
+            try:
+                orig_ia, shield_ia = shielded_info
+                if shield_ia.exists():
+                    shield_ia.rename(orig_ia)
+            except Exception:
+                pass
 
 def find_git_root(path: Union[str, Path]) -> Optional[str]:
     """
@@ -103,22 +205,28 @@ def get_submodule_paths(repo_dir: str) -> List[str]:
     # Sort descending by directory depth so nested submodules appear first
     return sorted(list(dict.fromkeys(paths)), key=lambda s: len(Path(s).parts), reverse=True)
 
-def get_git_diff(cwd: str, base_rev: Optional[str] = None, sub_baselines: Optional[Dict[str, str]] = None) -> str:
+def get_git_diff_status(cwd: str, base_rev: Optional[str] = None, sub_baselines: Optional[Dict[str, str]] = None) -> Tuple[str, Optional[str]]:
     """
     Extracts git diff for the workspace, including newly added, modified, and deleted files.
-    If base_rev is provided, diffs against that baseline commit, capturing both
-    intermediate commits made during the task and working tree changes.
-    If submodules exist, recursively extracts diffs from all submodules relative to
-    their baseline commits so red-team review audits actual submodule code changes.
-    Auto-inits shadow git with baseline commit if necessary.
+    Returns (diff: str, error: Optional[str]).
+    Enforces fail-closed security: if git command errors (e.g. invalid repo, exit 128),
+    returns the explicit error instead of disguising as an empty diff.
     """
     if not cwd:
         cwd = os.getcwd()
+
+    chk_code, _, chk_err = run_git_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd)
+    if chk_code != 0:
+        return "", f"Not inside a valid git working tree ({chk_err.strip()})"
+
     run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=cwd)
     ref = base_rev if base_rev else "HEAD"
-    code, diff_out, _ = run_git_cmd(["git", "diff", ref], cwd=cwd)
-    if (code != 0 or not diff_out or not diff_out.strip()) and not base_rev:
-        code, diff_out, _ = run_git_cmd(["git", "diff"], cwd=cwd)
+    code, diff_out, err = run_git_cmd(["git", "diff", ref], cwd=cwd)
+    if code != 0 and not base_rev:
+        code, diff_out, err = run_git_cmd(["git", "diff"], cwd=cwd)
+
+    if code != 0:
+        return "", f"git diff failed with exit code {code}: {err.strip()}"
 
     main_diff = diff_out.strip() if diff_out else ""
 
@@ -131,20 +239,25 @@ def get_git_diff(cwd: str, base_rev: Optional[str] = None, sub_baselines: Option
             run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=str(sub_p))
             sub_base = sub_baselines.get(sub_rel) if sub_baselines else None
             if not sub_base:
-                # Read baseline gitlink recorded in parent repo's HEAD
                 rev_code, gitlink_out, _ = run_git_cmd(["git", "rev-parse", f"HEAD:{sub_rel}"], cwd=cwd)
                 if rev_code == 0 and gitlink_out and gitlink_out.strip():
                     sub_base = gitlink_out.strip()
             sub_ref = sub_base if sub_base else "HEAD"
-            s_code, s_diff, _ = run_git_cmd(["git", "diff", "--binary", sub_ref], cwd=str(sub_p))
+            s_code, s_diff, s_err = run_git_cmd(["git", "diff", "--binary", sub_ref], cwd=str(sub_p))
             if s_code == 0 and s_diff and s_diff.strip():
                 sub_diffs.append(f"\n--- [Submodule: {sub_rel}] (diff against {sub_ref}) ---\n{s_diff.strip()}")
+            elif s_code != 0:
+                return "", f"Submodule {sub_rel} diff extraction failed with code {s_code}: {s_err.strip()}"
 
     full_diff = main_diff
     if sub_diffs:
         full_diff = (full_diff + "\n" if full_diff else "") + "\n".join(sub_diffs)
 
-    return full_diff.strip()
+    return full_diff.strip(), None
+
+def get_git_diff(cwd: str, base_rev: Optional[str] = None, sub_baselines: Optional[Dict[str, str]] = None) -> str:
+    diff_text, _ = get_git_diff_status(cwd, base_rev=base_rev, sub_baselines=sub_baselines)
+    return diff_text
 
 def clone_isolated_worktree(src_dir: str, target_dir: Path):
     """
@@ -186,7 +299,10 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
                     elif item.is_dir():
                         shutil.copytree(item, dst_item, dirs_exist_ok=True, symlinks=True, ignore_dangling_symlinks=True)
                     elif item.is_file() and not item.is_socket():
-                        shutil.copy2(item, dst_item, follow_symlinks=False)
+                        try:
+                            os.link(item, dst_item)
+                        except OSError:
+                            shutil.copy2(item, dst_item, follow_symlinks=False)
                 except Exception:
                     pass
 
@@ -559,7 +675,10 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
                                         s_dst.parent.mkdir(parents=True, exist_ok=True)
                                         if s_dst.is_symlink():
                                             s_dst.unlink()
-                                        shutil.copy2(s_src, s_dst, follow_symlinks=False)
+                                        try:
+                                            os.link(s_src, s_dst)
+                                        except OSError:
+                                            shutil.copy2(s_src, s_dst, follow_symlinks=False)
                                 except Exception as e:
                                     import sys
                                     print(c(f"❌ [Makewand Guard] 复制子模块 {sub_rel} 未跟踪文件失败 ({e})，中止基线建立。", COLOR_RED), file=sys.stderr)
@@ -659,7 +778,10 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
                             dst_f.parent.mkdir(parents=True, exist_ok=True)
                             if dst_f.is_symlink():
                                 dst_f.unlink()
-                            shutil.copy2(src_f, dst_f, follow_symlinks=False)
+                            try:
+                                os.link(src_f, dst_f)
+                            except OSError:
+                                shutil.copy2(src_f, dst_f, follow_symlinks=False)
                     except Exception as e:
                         import sys
                         print(c(f"❌ [Makewand Guard] 复制未跟踪文件失败 ({e})，中止基线建立。", COLOR_RED), file=sys.stderr)

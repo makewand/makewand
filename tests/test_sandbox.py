@@ -43,11 +43,11 @@ class TestSandbox(unittest.TestCase):
             tmpfs_targets = [wrapped_general[i + 1] for i in tmpfs_indices if i + 1 < len(wrapped_general)]
             self.assertIn(user_home, tmpfs_targets)
 
-            # 2. Verify wrap_bwrap for provider (is_provider=True) uses --ro-bind user_home
+            # 2. Verify wrap_bwrap for provider (is_provider=True) also strictly isolates user_home with tmpfs
             wrapped_provider = wrap_bwrap(["echo", "hi"], workspace=tmpdir, is_provider=True)
-            ro_bind_indices = [i for i, x in enumerate(wrapped_provider) if x == "--ro-bind"]
-            ro_bind_pairs = [(wrapped_provider[i + 1], wrapped_provider[i + 2]) for i in ro_bind_indices if i + 2 < len(wrapped_provider)]
-            self.assertIn((user_home, user_home), ro_bind_pairs)
+            p_tmpfs_indices = [i for i, x in enumerate(wrapped_provider) if x == "--tmpfs"]
+            p_tmpfs_targets = [wrapped_provider[i + 1] for i in p_tmpfs_indices if i + 1 < len(wrapped_provider)]
+            self.assertIn(user_home, p_tmpfs_targets)
 
     def test_subdirectory_mounts_full_worktree(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -130,5 +130,28 @@ class TestSandbox(unittest.TestCase):
         finally:
             shutil.rmtree(test_base, ignore_errors=True)
 
+    def test_git_directory_rename_and_tamper_blocked_in_sandbox(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from makewand.git_helper import run_git_cmd
+            ws = Path(tmpdir) / "repo"
+            ws.mkdir()
+            run_git_cmd(["git", "init"], cwd=str(ws))
+            run_git_cmd(["git", "config", "user.name", "test"], cwd=str(ws))
+            run_git_cmd(["git", "config", "user.email", "test@test"], cwd=str(ws))
+            (ws / "file.txt").write_text("hello\n")
+            run_git_cmd(["git", "add", "."], cwd=str(ws))
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=str(ws))
+
+            # Attempt to rename .git inside sandbox (must fail due to mount point protection)
+            ret_rename, _, _, _ = run_in_sandbox(["python3", "-c", "import os; os.rename('.git', '.git.bak')"], workspace=str(ws), readonly=False)
+            self.assertNotEqual(ret_rename, 0)
+            self.assertTrue((ws / ".git").is_dir())
+            self.assertFalse((ws / ".git.bak").exists())
+
+            # Attempt to modify .git/config inside sandbox (must fail with read-only fs error)
+            ret_write, _, _, _ = run_in_sandbox(["bash", "-c", "echo malicious >> .git/config"], workspace=str(ws), readonly=False)
+            self.assertNotEqual(ret_write, 0)
+
 if __name__ == "__main__":
     unittest.main()
+

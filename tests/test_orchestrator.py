@@ -140,9 +140,11 @@ class TestOrchestrator(unittest.TestCase):
         mock_claude.return_value = (True, "Code written", None)
         mock_diff.return_value = "diff --git a/main.py b/main.py\n+print('hello')"
 
-        # Both reviewer codex and agy fail or return None
+        # All candidate reviewers (codex, agy, grok, muse) fail or return None
         with patch("makewand.orchestrator.execute_codex_task", return_value=(False, None, "error")), \
-             patch("makewand.orchestrator.execute_agy_task", return_value=(False, None, "error")):
+             patch("makewand.orchestrator.execute_agy_task", return_value=(False, None, "error")), \
+             patch("makewand.orchestrator.execute_grok_task", return_value=(False, None, "error")), \
+             patch("makewand.orchestrator.execute_muse_task", return_value=(False, None, "error")):
             res = run_pipeline("实现测试功能", cwd="/tmp", auto_fix=False)
             # Must FAIL-CLOSED (return False, rejecting delivery)
             self.assertFalse(res)
@@ -644,7 +646,7 @@ class TestOrchestrator(unittest.TestCase):
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(False, "Active session")), \
                  patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                  patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
-                 patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
+                 patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}, "grok": {"status": "limited"}, "muse": {"status": "limited"}, "agy": {"status": "limited"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=mock_coder), \
                  patch("makewand.orchestrator.execute_codex_task", return_value=(True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None)):
                 res = run_pipeline("修改代码并实现功能提交交付", cwd=str(main_repo), stream=False)

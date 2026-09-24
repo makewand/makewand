@@ -42,8 +42,15 @@ chmod +x "$SCRIPT_DIR/bin/makewand"
 
 # 1.5 Build native Go server/components if Go toolchain is available
 if command -v go >/dev/null 2>&1; then
-    echo "Building native Go component ($SCRIPT_DIR/bin/makewand-server)..."
-    (cd "$SCRIPT_DIR" && go build -trimpath -o "$SCRIPT_DIR/bin/makewand-server" ./cmd/makewand 2>/dev/null || true)
+    echo "Building native Go server/components ($SCRIPT_DIR/bin/makewand-server)..."
+    if (cd "$SCRIPT_DIR" && go build -trimpath -o "$SCRIPT_DIR/bin/makewand-server" ./cmd/makewand); then
+        chmod +x "$SCRIPT_DIR/bin/makewand-server"
+        echo "✔ Native Go server/CLI successfully compiled."
+    else
+        echo "⚠️ Warning: Failed to build native Go components. Server subcommands (serve/audit/token) may be unavailable." >&2
+    fi
+else
+    echo "ℹ️ Go compiler not found. Server subcommands will require Go toolchain or precompiled binary."
 fi
 
 # 2. Maintain backwards compatibility with trio command

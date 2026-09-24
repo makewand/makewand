@@ -4,34 +4,64 @@ Maintains persistent rolling usage window for Claude, Codex, AGY, and Muse subsc
 """
 
 import os
+import sys
 import json
 import fcntl
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
+import uuid
 from makewand.config import CONFIG_DIR, ensure_config_dir
 
 USAGE_WINDOW_FILE = CONFIG_DIR / "usage_window.json"
 
 # Window thresholds for burn-rate protection:
-# Codex: rolling 3~4h window has quota refresh; warn/penalize above 20 calls/3h
-# Claude: rolling 24h/7d budget; penalize above 35 calls/24h or 120 calls/7d to save weekly tokens
-# AGY: unlimited Pro subscription anchor (0 penalty)
+# Codex: rolling 3h rate limit + 24h & 7d weekly budget (save weekly subscription tokens)
 CODEX_WARN_3H = 20
 CODEX_LIMIT_3H = 35
+CODEX_WARN_24H = 50
+CODEX_LIMIT_24H = 100
+CODEX_WARN_7D = 180
+CODEX_LIMIT_7D = 350
 
+# Claude: rolling 24h/7d budget
 CLAUDE_WARN_24H = 35
 CLAUDE_LIMIT_24H = 60
 CLAUDE_WARN_7D = 120
 CLAUDE_LIMIT_7D = 200
 
+# Grok: rolling 24h/7d budget (prevent day-one burnout of monthly/daily allowance)
+GROK_WARN_24H = 20
+GROK_LIMIT_24H = 40
+GROK_WARN_7D = 80
+GROK_LIMIT_7D = 160
+
+# Muse: rolling 24h/7d budget
+MUSE_WARN_24H = 30
+MUSE_LIMIT_24H = 60
+MUSE_WARN_7D = 100
+MUSE_LIMIT_7D = 200
+
+def _get_active_usage_file() -> Path:
+    test_env_file = os.environ.get("MAKEWAND_USAGE_FILE")
+    if test_env_file:
+        return Path(test_env_file)
+    if USAGE_WINDOW_FILE != CONFIG_DIR / "usage_window.json":
+        return Path(USAGE_WINDOW_FILE)
+    if "unittest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("MAKEWAND_TEST_MODE") == "1":
+        import tempfile
+        return Path(tempfile.gettempdir()) / "makewand_test_usage.json"
+    return USAGE_WINDOW_FILE
+
 def _get_lock_file() -> Path:
     ensure_config_dir()
-    return USAGE_WINDOW_FILE.parent / f".{USAGE_WINDOW_FILE.stem}.lock"
+    uf = _get_active_usage_file()
+    return uf.parent / f".{uf.stem}.lock"
 
 def _load_raw_usage_records(max_age_days: float = 7.0) -> List[Dict[str, Any]]:
     ensure_config_dir()
-    if not USAGE_WINDOW_FILE.exists():
+    uf = _get_active_usage_file()
+    if not uf.exists():
         return []
 
     lock_file = _get_lock_file()
@@ -40,15 +70,15 @@ def _load_raw_usage_records(max_age_days: float = 7.0) -> List[Dict[str, Any]]:
         with open(lock_file, "a+", encoding="utf-8") as lock_f:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_SH)
             try:
-                if USAGE_WINDOW_FILE.exists():
-                    with open(USAGE_WINDOW_FILE, "r", encoding="utf-8") as f:
+                if uf.exists():
+                    with open(uf, "r", encoding="utf-8") as f:
                         data = json.load(f)
             finally:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     except Exception:
         try:
-            if USAGE_WINDOW_FILE.exists():
-                with open(USAGE_WINDOW_FILE, "r", encoding="utf-8") as f:
+            if uf.exists():
+                with open(uf, "r", encoding="utf-8") as f:
                     data = json.load(f)
         except Exception:
             return []
@@ -72,8 +102,9 @@ def _load_raw_usage_records(max_age_days: float = 7.0) -> List[Dict[str, Any]]:
 
 def _save_raw_usage_records(records: List[Dict[str, Any]]) -> None:
     ensure_config_dir()
+    uf = _get_active_usage_file()
     lock_file = _get_lock_file()
-    tmp_file = USAGE_WINDOW_FILE.parent / f".{USAGE_WINDOW_FILE.stem}_{os.getpid()}_{datetime.now().timestamp()}.tmp"
+    tmp_file = uf.parent / f".{uf.stem}_{os.getpid()}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}.tmp"
     try:
         with open(lock_file, "a+", encoding="utf-8") as lock_f:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
@@ -82,7 +113,7 @@ def _save_raw_usage_records(records: List[Dict[str, Any]]) -> None:
                     json.dump(records, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp_file, USAGE_WINDOW_FILE)
+                os.replace(tmp_file, uf)
             finally:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     except Exception:
@@ -112,17 +143,18 @@ def record_engine_usage(
     }
 
     ensure_config_dir()
+    uf = _get_active_usage_file()
     lock_file = _get_lock_file()
-    tmp_file = USAGE_WINDOW_FILE.parent / f".{USAGE_WINDOW_FILE.stem}_{os.getpid()}_{datetime.now().timestamp()}.tmp"
+    tmp_file = uf.parent / f".{uf.stem}_{os.getpid()}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}.tmp"
     try:
         with open(lock_file, "a+", encoding="utf-8") as lock_f:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
             try:
                 # 1. Read existing records under exclusive lock
                 records = []
-                if USAGE_WINDOW_FILE.exists():
+                if uf.exists():
                     try:
-                        with open(USAGE_WINDOW_FILE, "r", encoding="utf-8") as f:
+                        with open(uf, "r", encoding="utf-8") as f:
                             data = json.load(f)
                             if isinstance(data, list):
                                 cutoff = datetime.now() - timedelta(days=7.0)
@@ -145,7 +177,7 @@ def record_engine_usage(
                     json.dump(records, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp_file, USAGE_WINDOW_FILE)
+                os.replace(tmp_file, uf)
             finally:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     except Exception:
@@ -167,6 +199,7 @@ def get_engine_usage_stats(window_hours: float = 4.0) -> Dict[str, Any]:
         "codex": {"total": 0, "success": 0, "failed": 0},
         "agy": {"total": 0, "success": 0, "failed": 0},
         "muse": {"total": 0, "success": 0, "failed": 0},
+        "grok": {"total": 0, "success": 0, "failed": 0},
     }
 
     for r in records:
@@ -186,47 +219,138 @@ def get_engine_usage_stats(window_hours: float = 4.0) -> Dict[str, Any]:
 
     return stats
 
+TIER_WEIGHTS = {
+    "fast": 0.5,
+    "standard": 1.0,
+    "deep": 2.0
+}
+
+def _calc_weighted_counts(records: List[Dict[str, Any]], engine: str) -> Tuple[float, float, float]:
+    now = datetime.now()
+    cutoff_3h = now - timedelta(hours=3.0)
+    cutoff_24h = now - timedelta(hours=24.0)
+    cutoff_7d = now - timedelta(days=7.0)
+
+    c_3h = 0.0
+    c_24h = 0.0
+    c_7d = 0.0
+
+    for r in records:
+        if not isinstance(r, dict) or r.get("engine") != engine:
+            continue
+        ts_str = r.get("timestamp")
+        if not ts_str:
+            continue
+        try:
+            clean_ts = ts_str.replace("Z", "+00:00") if ts_str.endswith("Z") else ts_str
+            ts = datetime.fromisoformat(clean_ts)
+            tier = r.get("tier", "standard")
+            weight = TIER_WEIGHTS.get(tier, 1.0)
+            if ts >= cutoff_3h:
+                c_3h += weight
+            if ts >= cutoff_24h:
+                c_24h += weight
+            if ts >= cutoff_7d:
+                c_7d += weight
+        except Exception:
+            continue
+
+    return round(c_3h, 1), round(c_24h, 1), round(c_7d, 1)
+
+def _calc_continuous_penalty(
+    count: float,
+    warn: float,
+    limit: float,
+    warn_pen: float,
+    limit_pen: float,
+    name: str,
+    window_name: str
+) -> Optional[Tuple[float, str]]:
+    # 15% hysteresis band below warn threshold
+    if count < warn * 0.85:
+        return None
+
+    if count < warn:
+        ratio = (count - (warn * 0.85)) / max(1.0, (warn * 0.15))
+        pen = round(warn_pen * 0.5 * ratio, 2)
+        return pen, f"{name} 过去 {window_name} 调用已达 {count:.1f} 加权当量，触发日预算平滑保护 ({pen})"
+
+    if count < limit:
+        ratio = (count - warn) / max(1.0, (limit - warn))
+        pen = round(warn_pen + (limit_pen - warn_pen) * (ratio ** 1.2), 2)
+        return pen, f"{name} 过去 {window_name} 调用已达 {count:.1f} 加权当量，触发滚动窗口削峰保护 ({pen})"
+
+    overflow = min(1.0, (count - limit) / max(1.0, limit * 0.5))
+    pen = round(limit_pen - 1.0 * overflow, 2)
+    return pen, f"{name} 过去 {window_name} 高频调用已达 {count:.1f} 加权当量，触发配额窗口削峰熔断保护 ({pen})"
+
 def get_burn_rate_penalty(engine: str) -> Tuple[float, Optional[str]]:
     """
     Computes dynamic burn-rate penalty score for routing:
     Returns (penalty, reason) where penalty <= 0.0.
+    Uses continuous mathematical flow curves and 15% hysteresis to eliminate abrupt step cliffs.
     """
     eng = engine.lower().strip()
+    if eng == "agy":
+        # Google AI Pro anchor - continuous high capacity
+        return 0.0, None
+
     records = _load_raw_usage_records(max_age_days=7.0)
-    now = datetime.now()
+    c_3h, c_24h, c_7d = _calc_weighted_counts(records, eng)
 
     if eng == "codex":
-        # 3-hour rolling window check
-        cutoff_3h = now - timedelta(hours=3.0)
-        c_3h = sum(1 for r in records if r["engine"] == "codex" and datetime.fromisoformat(r["timestamp"]) >= cutoff_3h)
-        if c_3h >= CODEX_LIMIT_3H:
-            return -1.8, f"Codex 过去 3 小时高频调用已达 {c_3h} 次，触发配额窗口削峰熔断保护 (-1.8)"
-        elif c_3h >= CODEX_WARN_3H:
-            return -0.8, f"Codex 过去 3 小时调用已达 {c_3h} 次，触发滚动窗口削峰保护 (-0.8)"
+        penalties = []
+        p_7d = _calc_continuous_penalty(c_7d, CODEX_WARN_7D, CODEX_LIMIT_7D, -1.5, -3.0, "Codex", "7 天")
+        if p_7d: penalties.append(p_7d)
+
+        p_24h = _calc_continuous_penalty(c_24h, CODEX_WARN_24H, CODEX_LIMIT_24H, -1.0, -2.0, "Codex", "24 小时")
+        if p_24h: penalties.append(p_24h)
+
+        p_3h = _calc_continuous_penalty(c_3h, CODEX_WARN_3H, CODEX_LIMIT_3H, -0.8, -1.8, "Codex", "3 小时")
+        if p_3h: penalties.append(p_3h)
+
+        if penalties:
+            penalties.sort(key=lambda x: x[0])
+            return penalties[0]
         return 0.0, None
 
     elif eng == "claude":
-        # 24-hour and 7-day rolling window check
-        cutoff_24h = now - timedelta(hours=24.0)
-        cutoff_7d = now - timedelta(days=7.0)
-        c_24h = sum(1 for r in records if r["engine"] == "claude" and datetime.fromisoformat(r["timestamp"]) >= cutoff_24h)
-        c_7d = sum(1 for r in records if r["engine"] == "claude" and datetime.fromisoformat(r["timestamp"]) >= cutoff_7d)
+        penalties = []
+        p_7d = _calc_continuous_penalty(c_7d, CLAUDE_WARN_7D, CLAUDE_LIMIT_7D, -1.2, -2.5, "Claude", "7 天")
+        if p_7d: penalties.append(p_7d)
 
-        if c_7d >= CLAUDE_LIMIT_7D:
-            return -2.5, f"Claude 过去 7 天总调用已达 {c_7d} 次，触发周预算强保护 (-2.5)"
-        elif c_7d >= CLAUDE_WARN_7D:
-            return -1.2, f"Claude 过去 7 天总调用已达 {c_7d} 次，触发周预算防御保护 (-1.2)"
-        elif c_24h >= CLAUDE_LIMIT_24H:
-            return -1.5, f"Claude 过去 24 小时调用已达 {c_24h} 次，触发日预算高压保护 (-1.5)"
-        elif c_24h >= CLAUDE_WARN_24H:
-            return -0.8, f"Claude 过去 24 小时调用已达 {c_24h} 次，触发日预算平滑保护 (-0.8)"
+        p_24h = _calc_continuous_penalty(c_24h, CLAUDE_WARN_24H, CLAUDE_LIMIT_24H, -0.8, -1.5, "Claude", "24 小时")
+        if p_24h: penalties.append(p_24h)
+
+        if penalties:
+            penalties.sort(key=lambda x: x[0])
+            return penalties[0]
         return 0.0, None
 
-    elif eng == "agy":
-        # Google AI Pro has unlimited Pro capacity; 0 penalty
+    elif eng == "grok":
+        penalties = []
+        p_7d = _calc_continuous_penalty(c_7d, GROK_WARN_7D, GROK_LIMIT_7D, -1.2, -2.5, "Grok", "7 天")
+        if p_7d: penalties.append(p_7d)
+
+        p_24h = _calc_continuous_penalty(c_24h, GROK_WARN_24H, GROK_LIMIT_24H, -1.0, -2.0, "Grok", "24 小时")
+        if p_24h: penalties.append(p_24h)
+
+        if penalties:
+            penalties.sort(key=lambda x: x[0])
+            return penalties[0]
         return 0.0, None
 
     elif eng == "muse":
+        penalties = []
+        p_7d = _calc_continuous_penalty(c_7d, MUSE_WARN_7D, MUSE_LIMIT_7D, -1.2, -2.5, "Muse", "7 天")
+        if p_7d: penalties.append(p_7d)
+
+        p_24h = _calc_continuous_penalty(c_24h, MUSE_WARN_24H, MUSE_LIMIT_24H, -0.8, -1.5, "Muse", "24 小时")
+        if p_24h: penalties.append(p_24h)
+
+        if penalties:
+            penalties.sort(key=lambda x: x[0])
+            return penalties[0]
         return 0.0, None
 
     return 0.0, None

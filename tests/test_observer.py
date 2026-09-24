@@ -43,6 +43,14 @@ class TestObserver(unittest.TestCase):
         cat, note = classify_operation("session_codex", ["» Ask Codex to do anything", "Worked for 2h 2m 44s · done 1:35 PM"], {"load_1m": 16.0})
         self.assertEqual(cat, "idle_ready")
 
+        # 9. Quota exhausted detection at prompt
+        cat, note = classify_operation("session_exhausted", [
+            "Weekly limit: [░░░░░░░░░░░░░░░░░░░░] 0% left (resets 07:49 on 28 Sep)",
+            "› Ask Codex to do anything"
+        ], {"load_1m": 1.0})
+        self.assertEqual(cat, "quota_exhausted")
+        self.assertIn("0% left", note)
+
     def test_analyze_makewand_optimizations(self):
         reports = [
             {"name": "backend_service", "category": "hung_anomaly", "status_note": "deadlock"},
@@ -56,6 +64,11 @@ class TestObserver(unittest.TestCase):
                 "name": "model_pipeline",
                 "category": "data_pipeline",
                 "status_note": "pipeline running"
+            },
+            {
+                "name": "whereifish",
+                "category": "quota_exhausted",
+                "status_note": "0% left"
             }
         ]
         metrics = {"load_1m": 22.0}
@@ -68,6 +81,7 @@ class TestObserver(unittest.TestCase):
         self.assertTrue(any("数据库查询" in o["target"] for o in opts))
         self.assertTrue(any("亲和调度" in o["target"] for o in opts))
         self.assertTrue(any("防踩踏守卫" in o["target"] for o in opts))
+        self.assertTrue(any("额度枯竭" in o["target"] for o in opts))
 
     def test_get_external_ai_sessions(self):
         from unittest.mock import patch
@@ -79,6 +93,8 @@ class TestObserver(unittest.TestCase):
             b" 1001   500 pts/1    00:10 agy     agy\n"
             b" 2002   600 pts/36   00:20 codex   /usr/local/bin/codex\n"
             b" 3003   700 pts/38   00:05 claude  /usr/bin/claude\n"
+            b" 4004   800 pts/40   00:15 grok    /home/user/.grok/bin/grok\n"
+            b" 5005   900 pts/42   00:25 muse    /home/user/.local/bin/muse\n"
         )
 
         with patch("subprocess.check_output") as mock_run, \
@@ -92,11 +108,48 @@ class TestObserver(unittest.TestCase):
 
             mock_run.side_effect = check_output_side_effect
             ext = get_external_ai_sessions()
-            self.assertEqual(len(ext), 2)
+            self.assertEqual(len(ext), 4)
             ttys = {e["tty"] for e in ext}
+            ai_types = {e["ai_type"] for e in ext}
             self.assertIn("pts/36", ttys)
             self.assertIn("pts/38", ttys)
+            self.assertIn("pts/40", ttys)
+            self.assertIn("pts/42", ttys)
+            self.assertIn("grok", ai_types)
+            self.assertIn("muse", ai_types)
             self.assertNotIn("pts/1", ttys)
+
+    def test_is_session_holding_file_lock(self):
+        from unittest.mock import patch
+        from makewand.observer import is_session_holding_file_lock
+
+        with patch("os.path.exists", return_value=True), \
+             patch("subprocess.check_output") as mock_sub:
+            def sub_side_effect(cmd, **kwargs):
+                if cmd[0] == "fuser":
+                    return b"5001 5002\n"
+                elif cmd[0] == "tmux":
+                    return b"1000\n"
+                elif cmd[0] == "ps":
+                    return b"  PID  PPID\n 1000   100\n 2000  1000\n 5001  2000\n 9000   100\n"
+                return b""
+
+            mock_sub.side_effect = sub_side_effect
+            # Session holding lock (5001 is descendant of 1000)
+            self.assertTrue(is_session_holding_file_lock("active_session", "/run/lock/test.lock"))
+
+            def sub_side_effect_unrelated(cmd, **kwargs):
+                if cmd[0] == "fuser":
+                    return b"8888\n"
+                elif cmd[0] == "tmux":
+                    return b"1000\n"
+                elif cmd[0] == "ps":
+                    return b"  PID  PPID\n 1000   100\n 2000  1000\n"
+                return b""
+
+            mock_sub.side_effect = sub_side_effect_unrelated
+            # Unrelated session does not hold lock
+            self.assertFalse(is_session_holding_file_lock("other_session", "/run/lock/test.lock"))
 
 if __name__ == "__main__":
     unittest.main()

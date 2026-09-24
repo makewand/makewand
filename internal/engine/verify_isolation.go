@@ -169,6 +169,9 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		// tmpfs /tmp before the workspace bind so temp-dir verification clones
 		// (which usually live under /tmp) stay writable inside the sandbox.
 		"--tmpfs", "/tmp",
+		// S05 defense: Mask system Unix domain sockets and host IPC runtimes
+		"--tmpfs", "/var/tmp",
+		"--tmpfs", "/run",
 		"--bind", workspacePath, workspacePath,
 		"--chdir", workspacePath,
 		"--clearenv",
@@ -177,6 +180,9 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		"--setenv", "TMPDIR", "/tmp",
 		"--setenv", "NO_COLOR", "1",
 		"--setenv", "MAKEWAND_SANDBOX", "1",
+	}
+	if gitDir := filepath.Join(workspacePath, ".git"); func() bool { _, err := os.Stat(gitDir); return err == nil }() {
+		wrapped = append(wrapped, "--ro-bind", gitDir, gitDir)
 	}
 	if !allowNetwork {
 		wrapped = append(wrapped, "--unshare-net")

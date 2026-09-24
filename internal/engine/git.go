@@ -39,9 +39,22 @@ service-account*.json
 	return nil
 }
 
+var safeGitFlags = []string{
+	"-c", "diff.tool=",
+	"-c", "core.fsmonitor=",
+	"-c", "core.hooksPath=/dev/null",
+	"-c", "core.attributesFile=/dev/null",
+	"-c", "core.pager=cat",
+	"-c", "commit.gpgsign=false",
+}
+
+const safeGitAttrSource = "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 // GitCommit stages all changes and creates a commit.
 func (p *Project) GitCommit(ctx context.Context, message string) error {
-	addResult, err := p.Exec(ctx, "git", "add", "-A")
+	addArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	addArgs = append(addArgs, "add", "-A")
+	addResult, err := p.Exec(ctx, "git", addArgs...)
 	if err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
@@ -49,7 +62,9 @@ func (p *Project) GitCommit(ctx context.Context, message string) error {
 		return fmt.Errorf("git add failed: %s", addResult.Stderr)
 	}
 
-	result, err := p.Exec(ctx, "git", "commit", "-m", message)
+	commitArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	commitArgs = append(commitArgs, "commit", "-m", message)
+	result, err := p.Exec(ctx, "git", commitArgs...)
 	if err != nil {
 		return fmt.Errorf("git commit: %w", err)
 	}
@@ -62,7 +77,9 @@ func (p *Project) GitCommit(ctx context.Context, message string) error {
 
 // GitStatus returns the current git status.
 func (p *Project) GitStatus(ctx context.Context) (string, error) {
-	result, err := p.Exec(ctx, "git", "status", "--short")
+	statusArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	statusArgs = append(statusArgs, "status", "--short")
+	result, err := p.Exec(ctx, "git", statusArgs...)
 	if err != nil {
 		return "", fmt.Errorf("git status: %w", err)
 	}
@@ -71,7 +88,9 @@ func (p *Project) GitStatus(ctx context.Context) (string, error) {
 
 // GitDiff returns the diff of uncommitted changes.
 func (p *Project) GitDiff(ctx context.Context) (string, error) {
-	result, err := p.Exec(ctx, "git", "diff")
+	diffArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	diffArgs = append(diffArgs, "diff", "--no-ext-diff", "--no-textconv")
+	result, err := p.Exec(ctx, "git", diffArgs...)
 	if err != nil {
 		return "", fmt.Errorf("git diff: %w", err)
 	}

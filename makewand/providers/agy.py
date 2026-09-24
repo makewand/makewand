@@ -2,6 +2,7 @@
 Antigravity CLI provider adapter (Google AI Pro / Gemini 3.8 Flash & Pro).
 """
 
+import os
 import re
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_GREEN
@@ -21,7 +22,9 @@ def execute_agy_task(
     model: Optional[str] = None,
     stream: bool = False,
     readonly: bool = False,
-    repo_root: Optional[str] = None
+    repo_root: Optional[str] = None,
+    repo_trust: str = "trusted",
+    allow_network: bool = True
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to Antigravity CLI.
@@ -31,16 +34,53 @@ def execute_agy_task(
     from makewand.sandbox import is_bwrap_available, wrap_bwrap
     from makewand.git_helper import find_git_root
 
-    # Resolve repo_root if not provided but cwd is given
-    if not repo_root and cwd:
+    # Normalize cwd and repo_root to ensure sandbox is never bypassed
+    if not cwd:
+        cwd = os.getcwd()
+    cwd = os.path.abspath(cwd)
+
+    if not repo_root:
         repo_root = find_git_root(cwd) or cwd
+    repo_root = os.path.abspath(repo_root)
+
+    # Untrusted repo enforcement
+    if repo_trust == "untrusted":
+        allow_network = False
+        if not is_bwrap_available():
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        if not readonly:
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务"
+
+    from makewand.health import load_status_cache, record_engine_limit
+    from makewand.config import has_api_configured, has_subscription_configured
+    from makewand.providers.api_client import call_api_chat
+
+    # If subscription is missing or limited, fallback to Gemini API
+    if not has_subscription_configured("agy"):
+        if has_api_configured("agy"):
+            import sys
+            print(c("[Makewand -> Antigravity] (纯 API 模式) 派发任务至 Google Gemini API...", COLOR_GREEN), file=sys.stderr)
+            ok, out_api, err_api = call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
+            if ok:
+                return True, out_api, None
+            return False, out_api, err_api
+        return False, None, "未找到 agy CLI 订阅，且未配置 GEMINI_API_KEY"
+
+    cache = load_status_cache()
+    if cache.get("agy", {}).get("status") in ["limited", "needs_auth"]:
+        if has_api_configured("agy"):
+            import sys
+            print(c("[Makewand -> Antigravity] 订阅当前受限，无缝自动降级为 Gemini API 模式接力执行...", COLOR_GREEN), file=sys.stderr)
+            ok, out_api, err_api = call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
+            if ok:
+                return True, out_api, None
+            return False, out_api, err_api
+        return False, None, f"Antigravity 当前不可用: {cache['agy'].get('reason')} (可配置 GEMINI_API_KEY 作为备用 API 自动接力)"
 
     # Fail-closed enforcement: if writable, sandbox is mandatory
     if not readonly:
         if not is_bwrap_available():
             return False, None, "Antigravity 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
-        if not (repo_root and cwd):
-            return False, None, "Antigravity 写入任务缺少工作区目录或仓库根路径，无法建立沙箱隔离，拒绝执行"
 
     final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
     cmd = [
@@ -54,16 +94,18 @@ def execute_agy_task(
 
     if model:
         cmd.extend(["--model", model])
-    elif tier == "deep":
-        cmd.extend(["--effort", "high"])
-    elif tier == "fast":
-        cmd.extend(["--effort", "low"])
     else:
-        cmd.extend(["--effort", "medium"])
+        from makewand.discovery import get_provider_model_tier
+        resolved = get_provider_model_tier("agy", tier)
+        if resolved.get("model") and resolved["model"] != "default":
+            cmd.extend(["--model", resolved["model"]])
+        if resolved.get("effort"):
+            cmd.extend(["--effort", resolved["effort"]])
 
-    if repo_root and cwd:
-        if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=True, readonly=readonly, repo_root=repo_root, is_provider=True)
+    if is_bwrap_available():
+        cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="agy")
+    elif repo_trust == "untrusted":
+        return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 
     log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
     import sys
@@ -86,7 +128,15 @@ def execute_agy_task(
             return True, cleaned_err, None
         return False, None, "Antigravity 执行完成但未能产生有效输出内容"
 
-    is_limited, reason, _ = parse_agy_quota(combined)
+    is_limited, reason, resets_at = parse_agy_quota(combined)
     if is_limited:
-        return False, None, f"Antigravity 配额受限: {reason}"
+        record_engine_limit("agy", reason, resets_at)
+        if has_api_configured("agy"):
+            import sys
+            print(c(f"[Makewand -> Antigravity] 订阅触发配额限制 ({reason})，无缝切换为 Gemini API Key 模式接力执行...", COLOR_GREEN), file=sys.stderr)
+            ok, out_api, err_api = call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
+            if ok:
+                return True, out_api, None
+            return False, out_api, err_api
+        return False, None, f"Antigravity 配额受限: {reason} (可配置 GEMINI_API_KEY 实现自动接力)"
     return False, combined, ex or f"agy returned exit code {code}"
