@@ -38,8 +38,8 @@ for f in index.html docs.html styles.css main.js install.sh assets/favicon.svg _
 done
 echo "✓ 静态资源检查全部通过。"
 
-# Account ID fallback (matches local cloudflare account if present)
-export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-d6350176a532ed1e84a0699962adf585}"
+# Account ID (optional, read from environment if provided)
+export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
 
 echo "📦 正在向 Cloudflare Pages 发布部署..."
 if command -v wrangler &>/dev/null; then
