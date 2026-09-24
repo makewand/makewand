@@ -51,6 +51,12 @@ class TestObserver(unittest.TestCase):
         self.assertEqual(cat, "quota_exhausted")
         self.assertIn("0% left", note)
 
+        # 10. Server / dashboard daemon classification (not hung anomaly)
+        server_proc = {"pid": 3328609, "comm": "python3", "etimes": 2100, "args": "python3 scripts/serve_retail_interactive_dashboard.py --port 8765"}
+        cat, note = classify_operation("session_dashboard", ["Serving HTTP on 0.0.0.0 port 8765 ..."], {"load_1m": 2.0}, long_proc=server_proc)
+        self.assertEqual(cat, "server_daemon")
+        self.assertIn("后台服务/仪表盘", note)
+
     def test_analyze_makewand_optimizations(self):
         reports = [
             {"name": "backend_service", "category": "hung_anomaly", "status_note": "deadlock"},
