@@ -423,3 +423,139 @@ def get_or_update_status(force_probe: bool = False) -> Dict[str, Any]:
         save_status_cache(cache)
     return cache
 
+def format_quota_bar(percentage: int, width: int = 20, colorize: bool = True) -> str:
+    """
+    Renders a colored progress bar matching modern CLI tools:
+    [████████████████████] 100% (Green)
+    [████████████░░░░░░░░]  60% (Yellow/Cyan)
+    [████░░░░░░░░░░░░░░░░]  20% (Yellow/Red)
+    [░░░░░░░░░░░░░░░░░░░░]   0% (Red)
+    """
+    pct = max(0, min(100, int(percentage)))
+    filled = int(round(width * pct / 100.0))
+    empty = width - filled
+
+    if not colorize:
+        bar = "█" * filled + "░" * empty
+        return f"[{bar}] {pct:>3}%"
+
+    from makewand.config import COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_RESET, COLOR_BOLD
+    if pct >= 50:
+        bar_color = COLOR_GREEN
+    elif pct >= 20:
+        bar_color = COLOR_YELLOW
+    else:
+        bar_color = COLOR_RED
+
+    bar = f"{bar_color}{'█' * filled}{COLOR_RESET}{'░' * empty}"
+    pct_str = f"{bar_color}{COLOR_BOLD}{pct:>3}%{COLOR_RESET}"
+    return f"[{bar}] {pct_str}"
+
+def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Calculates remaining quota percentage (0-100), visual status, and metadata
+    integrating live health status, reset windows, and rolling burn-rate tracking.
+    """
+    if info is None:
+        info = load_status_cache().get(provider, {})
+
+    status = info.get("status", "unknown")
+    reason = info.get("reason", "")
+    resets_at = info.get("resets_at")
+
+    # 1. Limited / Exhausted (0%)
+    if status == "limited":
+        reset_desc = f" (预计解封: {resets_at})" if resets_at else " (已达当前限额)"
+        return {
+            "percentage": 0,
+            "status": "limited",
+            "desc": f"额度已耗尽{reset_desc}",
+            "resets_at": resets_at,
+            "is_unlimited": False
+        }
+
+    # 2. Disabled / Missing / Needs Auth
+    if status in ("disabled", "needs_auth", "error", "missing", "unknown"):
+        return {
+            "percentage": 0,
+            "status": status,
+            "desc": reason or "未就绪或未授权",
+            "resets_at": None,
+            "is_unlimited": False
+        }
+
+    # 3. Unlimited local models or enterprise tiers
+    if provider == "local":
+        return {
+            "percentage": 100,
+            "status": "healthy",
+            "desc": "本地私有模型 · 无限额度 · 0 Token 成本",
+            "resets_at": None,
+            "is_unlimited": True
+        }
+
+    if provider == "agy":
+        return {
+            "percentage": 100,
+            "status": "healthy",
+            "desc": "Google AI Pro 订阅充足",
+            "resets_at": None,
+            "is_unlimited": True
+        }
+
+    # 4. Check for explicit percentage in output or reason
+    if reason:
+        pct_match = re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE)
+        if pct_match:
+            pct = int(pct_match.group(1))
+            return {
+                "percentage": max(0, min(100, pct)),
+                "status": "healthy" if pct > 20 else ("warning" if pct > 0 else "limited"),
+                "desc": f"官方报告剩余额度: {pct}%",
+                "resets_at": resets_at,
+                "is_unlimited": False
+            }
+
+    # 5. Estimate from rolling usage and burn rate penalty
+    try:
+        from makewand.usage import get_burn_rate_penalty, get_engine_usage_stats
+        penalty, pen_reason = get_burn_rate_penalty(provider)
+        u24 = get_engine_usage_stats(window_hours=24.0).get(provider, {}).get("total", 0)
+
+        if penalty <= -4.0:
+            pct = 5
+            desc = f"高频调用削峰保护中 (24h 调用: {u24}次)"
+        elif penalty <= -3.0:
+            pct = 20
+            desc = f"额度消耗较快 (24h 调用: {u24}次)"
+        elif penalty <= -2.0:
+            pct = 40
+            desc = f"滑动窗口用量活跃 (24h 调用: {u24}次)"
+        elif penalty <= -1.0:
+            pct = 65
+            desc = f"滑动窗口运行平稳 (24h 调用: {u24}次)"
+        else:
+            if u24 == 0:
+                pct = 100
+                desc = "额度充沛 · 滑动窗口无压力"
+            else:
+                pct = max(75, 100 - min(25, u24 * 2))
+                desc = f"额度充沛 · 运行健康 (24h 调用: {u24}次)"
+
+        return {
+            "percentage": pct,
+            "status": "healthy" if pct >= 25 else "warning",
+            "desc": desc,
+            "resets_at": resets_at,
+            "is_unlimited": False
+        }
+    except Exception:
+        return {
+            "percentage": 85,
+            "status": "healthy",
+            "desc": "运行健康",
+            "resets_at": resets_at,
+            "is_unlimited": False
+        }
+
+

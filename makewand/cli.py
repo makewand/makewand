@@ -116,6 +116,7 @@ def cmd_status(args):
     # 1. Active Tools Section
     print(c(f"--- 🟢 已激活可用工具池 (Active Dynamic Pool: N={len(active_tools)}) ---", COLOR_BOLD + COLOR_GREEN))
     if active_tools:
+        from makewand.health import calculate_provider_quota, format_quota_bar
         for key in active_tools:
             info = cache.get(key, {})
             status = info.get("status", "unknown")
@@ -126,11 +127,17 @@ def cmd_status(args):
             reason = info.get("reason", "")
             resets = info.get("resets_at")
 
+            quota_data = calculate_provider_quota(key, info)
+            pct = quota_data["percentage"]
+            bar = format_quota_bar(pct, width=20)
+            quota_desc = quota_data["desc"]
+
             print(f"{badge} {mode_badge} {c(name, COLOR_BOLD)}")
-            if reason:
-                print(f"      说明: {reason}")
+            print(f"      剩余额度: {bar}  ({quota_desc})")
+            if reason and reason != quota_desc and not (status == "healthy" and "运行正常" in reason and "运行正常" in quota_desc):
+                print(f"      运行状态: {reason}")
             if resets:
-                print(f"      预计解封/状态: {c(resets, COLOR_YELLOW + COLOR_BOLD)}")
+                print(f"      预计解封: {c(resets, COLOR_YELLOW + COLOR_BOLD)}")
             print()
     else:
         print(c("  (暂无可用的已激活工具，请查看下方待接入生态列表进行配置)\n", COLOR_YELLOW))
