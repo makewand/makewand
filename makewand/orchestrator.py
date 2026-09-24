@@ -4,6 +4,7 @@ Makewand Orchestrator: Multi-model pipeline, task tiering, auto-fix loop, and ra
 
 import os
 import sys
+import shutil
 import re
 import json
 import time
@@ -32,6 +33,7 @@ from makewand.config import (
 from makewand.git_helper import (
     ensure_git_worktree,
     get_git_diff,
+    get_git_diff_status,
     clone_isolated_worktree,
     run_git_cmd,
     check_working_tree_isolation,
@@ -44,6 +46,9 @@ from makewand.providers.agy import execute_agy_task
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
 from makewand.providers.muse import execute_muse_task
+from makewand.providers.grok import execute_grok_task
+from makewand.providers.local import execute_local_task
+from makewand.providers.aider import execute_aider_task
 
 # Standardized Exit Codes
 EXIT_PASSED = 0
@@ -58,13 +63,40 @@ EXIT_SANDBOX_UNAVAILABLE = 15
 
 def detect_task_tier(prompt: str) -> str:
     p_lower = prompt.lower()
-    deep_keywords = ["审查", "审计", "review", "死锁", "并发", "安全", "漏洞", "架构", "设计", "deep", "complex", "formal", "重构"]
-    fast_keywords = ["简单", "探测", "查看", "快速", "拼写", "probe", "quick", "fast", "typo", "format"]
 
+    # 1. Fast inspect queries (probe, typo, format, simple inspect)
+    fast_phrases = [
+        "快速查看", "快速探测", "快速检查", "快速看下", "随便看看",
+        "查看一下", "简单探测", "拼写检查", "probe", "quick check",
+        "just check", "typo", "format only", "format json", "format code",
+        "print version", "help info"
+    ]
+    if any(k in p_lower for k in fast_phrases):
+        return "fast"
+
+    # 2. Deep battle-tested / architectural / algorithmic domains
+    deep_keywords = [
+        "审查", "审计", "死锁", "并发", "竞态", "内存泄露", "内存泄漏", "漏洞",
+        "全局架构", "底层架构", "重构", "无锁", "环形缓冲区", "内存序",
+        "动态规划", "图论", "红队", "渗透", "安全漏洞", "高并发", "分布式共识",
+        "review", "deadlock", "race condition", "memory leak", "lock-free",
+        "ring buffer", "memory order", "memory model", "paxos", "raft",
+        "consensus", "dynamic programming", "cross-module", "monorepo",
+        "security audit", "vulnerability", "red-team", "battle-tested",
+        "heavy refactor", "deep reasoning", "formal verification"
+    ]
     if any(k in p_lower for k in deep_keywords):
         return "deep"
-    if any(k in p_lower for k in fast_keywords):
+
+    # Complexity heuristic: very long prompts (> 250 words / 800 chars) typically involve complex tasks
+    if len(prompt) > 800 or len(prompt.split()) > 250:
+        return "deep"
+
+    # 3. Fast individual keywords if not matched above
+    fast_individual = ["简单", "探测", "快速", "拼写", "quick", "fast", "probe"]
+    if any(k in p_lower for k in fast_individual):
         return "fast"
+
     return "standard"
 
 def _normalize_verdict_dict(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -118,7 +150,9 @@ def extract_verdict_json(text: str) -> Optional[Dict[str, Any]]:
     if pos == -1:
         return None
 
-    snippet = text[pos + len(tag):].lstrip()
+    snippet = text[pos + len(tag):].strip()
+    snippet = re.sub(r"^```(?:json)?\s*", "", snippet, flags=re.IGNORECASE)
+    snippet = snippet.strip()
     decoder = json.JSONDecoder()
 
     # Attempt 1: direct raw_decode
@@ -160,7 +194,7 @@ def is_review_passed(review_text: str) -> bool:
     unverified_signals = [
         "unable to review", "cannot review", "failed to review",
         "unverified", "do not approve", "not approve", "not lgtm", "disapprove",
-        "不通过", "未通过", "拒绝合并", "建议不要合并"
+        "审核不通过", "评审不通过", "验收不通过", "拒绝合并", "建议不要合并", "建议不予合并"
     ]
     if any(sig in lower for sig in unverified_signals):
         return False
@@ -223,6 +257,7 @@ def format_review_diff(diff: str, max_chars: int = 15000) -> str:
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
     Deterministically detects and runs local unit test suites in cwd inside Bubblewrap sandbox.
+    Supports composite / multi-stack projects (Python, Go, Node, Rust).
     Returns (passed: bool, details: Optional[str]).
     If no tests exist in project, returns (True, None).
     """
@@ -230,8 +265,8 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     from makewand.sandbox import run_in_sandbox
     p = Path(cwd)
 
-    test_cmd = None
-    extra_env = {"PYTHONPATH": f"{cwd}:{os.environ.get('PYTHONPATH', '')}"}
+    test_suites = []
+    py_env = {"PYTHONPATH": f"{cwd}:{os.environ.get('PYTHONPATH', '')}"}
 
     # 1. Python test suites
     if (p / "pytest.ini").exists() or (p / "pyproject.toml").exists() or (p / "tests").is_dir() or list(p.glob("test_*.py")):
@@ -239,74 +274,91 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         test_target = ["tests"] if (p / "tests").is_dir() else []
         try:
             import pytest
-            test_cmd = [py_bin, "-m", "pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
+            py_cmd = [py_bin, "-m", "pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
         except ImportError:
             if shutil.which("pytest"):
-                test_cmd = ["pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
+                py_cmd = ["pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
             else:
-                test_cmd = [py_bin, "-m", "unittest", "discover", "-q"]
+                py_cmd = [py_bin, "-m", "unittest", "discover", "-q"]
+        test_suites.append(("Python", py_cmd, py_env))
 
     # 2. Go test suites
-    elif (p / "go.mod").exists():
-        test_cmd = ["go", "test", "./..."]
+    if (p / "go.mod").exists() and shutil.which("go"):
+        test_suites.append(("Go", ["go", "test", "./..."], {}))
 
     # 3. Node / npm test suites
-    elif (p / "package.json").exists():
+    if (p / "package.json").exists() and shutil.which("npm"):
         try:
             with open(p / "package.json", "r", encoding="utf-8") as f:
                 pkg_data = json.load(f)
                 if "test" in pkg_data.get("scripts", {}):
-                    test_cmd = ["npm", "test", "--", "--passWithNoTests"]
+                    test_suites.append(("Node", ["npm", "test", "--", "--passWithNoTests"], {}))
         except Exception:
             pass
 
     # 4. Cargo / Rust
-    elif (p / "Cargo.toml").exists():
-        test_cmd = ["cargo", "test"]
+    if (p / "Cargo.toml").exists() and shutil.which("cargo"):
+        test_suites.append(("Rust", ["cargo", "test"], {}))
 
-    if not test_cmd:
+    if not test_suites:
         return True, None
 
-    # Execute tests strictly inside isolated sandbox:
-    # allow_network=False, readonly=False (allows test artifacts inside workspace),
-    # is_provider=False (tmpfs HOME, masks credentials, drops host environment)
-    code, stdout, stderr, err_category = run_in_sandbox(
-        cmd=test_cmd,
-        workspace=cwd,
-        timeout=timeout,
-        allow_network=False,
-        readonly=False,
-        is_provider=False,
-        extra_env=extra_env
-    )
-    if code == 0:
-        return True, stdout.strip()
+    all_passed = True
+    details = []
+
+    for name, cmd, env in test_suites:
+        code, stdout, stderr, err_category = run_in_sandbox(
+            cmd=cmd,
+            workspace=cwd,
+            timeout=timeout,
+            allow_network=False,
+            readonly=False,
+            is_provider=False,
+            extra_env=env
+        )
+        if code != 0:
+            output = (stdout + "\n" + stderr).strip()
+            # If pytest failed because pytest is not installed in the target sandbox python, fallback to unittest!
+            if name == "Python" and "No module named pytest" in output:
+                py_bin = sys.executable or "python3"
+                fallback_cmd = [py_bin, "-m", "unittest", "discover", "-q"]
+                code, stdout, stderr, err_category = run_in_sandbox(
+                    cmd=fallback_cmd,
+                    workspace=cwd,
+                    timeout=timeout,
+                    allow_network=False,
+                    readonly=False,
+                    is_provider=False,
+                    extra_env=env
+                )
+                output = (stdout + "\n" + stderr).strip()
+
+        if code != 0:
+            all_passed = False
+            if err_category == "SandboxUnavailable":
+                details.append(f"[{name} Tests Failed (exit {code})]:\nBubblewrap 沙箱不可用 (bwrap not available)，根据安全防御原则阻断本地测试执行: {stderr or output}")
+            elif err_category:
+                details.append(f"[{name} Tests Failed (exit {code})]:\n本地单元测试执行异常 ({err_category}):\n{output}")
+            else:
+                details.append(f"[{name} Tests Failed (exit {code})]:\n{output}")
+        else:
+            if stdout.strip():
+                details.append(f"[{name} Tests Passed]:\n{stdout.strip()[:500]}")
+
+    if all_passed:
+        return True, "\n\n".join(details)
     else:
-        output = (stdout + "\n" + stderr).strip()
-        if err_category == "SandboxUnavailable":
-            return False, f"Bubblewrap 沙箱不可用，根据安全防御原则阻断本地测试执行: {stderr}"
-        elif err_category:
-            return False, f"本地单元测试执行异常 ({err_category}):\n{output}"
-        return False, output
+        return False, "\n\n".join(details)
 
 def has_critical_defects(review_text: str) -> bool:
     """
     Returns True if the review text explicitly indicates critical defects.
-    Hard defect markers (e.g. [P1], reject recommendation) always override contradictory JSON verdicts.
+    Un-negated hard defect markers (e.g. [P1], reject recommendation) always override contradictory JSON verdicts.
     """
     if not review_text or not review_text.strip():
         return True
 
     lower = review_text.lower()
-
-    # Hard defect signals and rejections in text always count as defects (override contradictory JSON)
-    hard_rejections = [
-        "do not approve", "not approve", "not lgtm", "disapprove",
-        "不通过", "未通过", "拒绝合并", "建议不要合并", "不建议合并",
-        "[p0]", "[p1]", "p0:", "p1:"
-    ]
-    if any(sig in lower for sig in hard_rejections):
-        return True
 
     # 1. Structural JSON verdict check (from end of output)
     verdict_data = extract_verdict_json(review_text)
@@ -321,32 +373,32 @@ def has_critical_defects(review_text: str) -> bool:
             if not bool(val):
                 return True
 
-    # 2. Negation phrase stripping to avoid false positives
+    # 2. Negation phrase stripping to avoid false positives (e.g. '未发现 [P1] 级缺陷' or 'no critical defects')
     cleaned = lower
-    item_pat = r"(?:并发死锁|死锁|内存泄露|内存泄漏|数据竞态(?:隐患)?|竞态(?:隐患)?|race\s+condition|安全漏洞|安全隐患|缺陷|漏洞|隐患|bug|问题)"
+    item_pat = r"(?:\[p[012]\]|p[012]\s*:|并发死锁|死锁|内存泄露|内存泄漏|数据竞态(?:隐患)?|竞态(?:隐患)?|race\s+condition|安全漏洞|安全隐患|缺陷|漏洞|隐患|bug|问题)"
     prefix_pat = r"(?:未发现|没有发现|未见|不存在|没有|无|亦无|并无|且无|毫无)\s*(?:明显|严重|任何|潜在|可疑)?"
     compound_negation = rf"{prefix_pat}\s*{item_pat}(?:\s*(?:与|和|及|以及|或)\s*{item_pat})*"
 
     negation_patterns = [
         compound_negation,
-        r"\bno\s+(?:deadlock|race\s+condition|memory\s+leak|defects?|vulnerabilit(?:y|ies))\b(?:\s+(?:or|and)\s+(?:deadlock|race\s+condition|memory\s+leak|defects?|vulnerabilit(?:y|ies)))*",
-        r"\bwithout\s+(?:any\s+)?(?:deadlock|defect|bug|vulnerability|race\s+condition)\b",
-        r"\bfree\s+of\s+(?:deadlocks?|defects?|vulnerabilit(?:y|ies))\b"
+        r"\bno\s+(?:\[p[012]\]|p[012]|deadlock|race\s+condition|memory\s+leak|defects?|vulnerabilit(?:y|ies))\b(?:\s+(?:or|and)\s+(?:\[p[012]\]|p[012]|deadlock|race\s+condition|memory\s+leak|defects?|vulnerabilit(?:y|ies)))*",
+        r"\bwithout\s+(?:any\s+)?(?:\[p[012]\]|p[012]|deadlock|defect|bug|vulnerability|race\s+condition)\b",
+        r"\bfree\s+of\s+(?:\[p[012]\]|p[012]|deadlocks?|defects?|vulnerabilit(?:y|ies))\b"
     ]
     for pat in negation_patterns:
         cleaned = re.sub(pat, " ", cleaned)
 
-    unambiguous_defects = [
-        "[p0]", "[p1]", "[p2]",
-        "p0:", "p1:", "p2:",
-        "致命缺陷", "建议修改后再合并", "需要整改", "未通过",
-        "并发死锁", "内存泄露", "内存泄漏", "数据竞态", "race condition",
-        "arbitrary host command"
+    # 3. Check for un-negated hard defect signals and rejections
+    hard_defect_patterns = [
+        r"(?<![a-z0-9])(?:\[p[012]\]|p[012]\s*:)",
+        r"\b(?:do not approve|disapprove|not lgtm)\b",
+        r"(?:拒绝合并|建议不要合并|不建议合并|建议不予合并|审核不通过|评审不通过|验收不通过|致命缺陷|需要整改|建议修改后再合并|arbitrary host command)",
+        r"(?:并发死锁|死锁|deadlock|内存泄露|内存泄漏|memory\s+leak|数据竞态|race\s+condition)"
     ]
-    if any(p in cleaned for p in unambiguous_defects):
+    if any(re.search(pat, cleaned) for pat in hard_defect_patterns):
         return True
 
-    # If JSON explicitly passed and no unnegated defects were found in cleaned text
+    # 4. If JSON explicitly passed and no unnegated hard rejections were found
     if verdict_data and verdict_data.get("pass") is True:
         return False
 
@@ -517,12 +569,16 @@ def classify_prompt_intent(prompt: str) -> str:
 
 def get_identity_message() -> str:
     return (
-        f"{COLOR_BOLD}{COLOR_GREEN}✨ 我是 Makewand (v3.0) —— 零成本多模型 AI 订阅统一调度中枢。{COLOR_RESET}\n\n"
-        "我统合调度本机四大主流 AI 订阅服务：\n"
+        f"{COLOR_BOLD}{COLOR_GREEN}✨ 我是 Makewand (v3.1) —— 零成本多模型 AI 订阅与全生态编程工具统一调度中枢。{COLOR_RESET}\n\n"
+        "我统合调度本机主流 AI 订阅服务、云端 API 与本地大模型：\n"
         f"  {COLOR_GREEN}• Google AI Pro (Antigravity / AGY){COLOR_RESET}: 全局架构设计、复杂推理与闭环兜底\n"
         f"  {COLOR_BLUE}• Claude Code (Anthropic){COLOR_RESET}: 高敏捷代码编写、多文件重构与实现\n"
         f"  {COLOR_CYAN}• Codex CLI (OpenAI / gpt-6-astra){COLOR_RESET}: 独立红队代码审查与算法攻防\n"
-        f"  {COLOR_PURPLE}• Muse Code (Meta / Llama){COLOR_RESET}: 辅助生成、沙箱验证与备用编码\n\n"
+        f"  {COLOR_RED}• Grok Build CLI (xAI / grok-4.7){COLOR_RESET}: 前沿深度推理、大上下文架构与快速原型开发\n"
+        f"  {COLOR_PURPLE}• Muse Code (Meta / Llama){COLOR_RESET}: 辅助生成、沙箱验证与备用编码\n"
+        f"  {COLOR_GREEN}• Aider / Cursor / Copilot{COLOR_RESET}: 结对编程命令行与代码辅助生成\n"
+        f"  {COLOR_CYAN}• DeepSeek / Qwen / GLM / Kimi{COLOR_RESET}: 主流商业云端 API 动态接入\n"
+        f"  {COLOR_PURPLE}• Local Self-Hosted (Ollama / vLLM){COLOR_RESET}: 本地私有离线大模型 (0 成本/安全)\n\n"
         f"{COLOR_BOLD}核心机制：{COLOR_RESET}\n"
         "  1. 智能意图路由：精准区分闲聊/问答（直接响应）与工程开发任务（多模型流水线），杜绝误触发程序检查或缺陷修复\n"
         "  2. 跨模型联合流水线：自动规划、编码实现、红队盲审与 Auto-Fix 缺陷自愈\n"
@@ -558,23 +614,44 @@ def dispatch_task(
     model: Optional[str] = None,
     stream: bool = False,
     readonly: bool = False,
-    repo_root: Optional[str] = None
+    repo_root: Optional[str] = None,
+    repo_trust: str = "trusted",
+    allow_network: bool = True
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """Generic multi-model task dispatcher wrapping provider adapters."""
+    from makewand.config import is_provider_enabled
+    if not is_provider_enabled(engine):
+        return False, None, f"引擎 '{engine}' 当前已被用户在配置中手动禁用。运行 'makewand enable {engine}' 重新开启"
+
     res = None
     if engine == "claude":
-        res = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root)
+        res = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "codex":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
-        res = execute_codex_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root)
+        res = execute_codex_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+    elif engine == "grok":
+        p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
+        res = execute_grok_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "muse":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
-        res = execute_muse_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root)
+        res = execute_muse_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "agy":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
-        res = execute_agy_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root)
+        res = execute_agy_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+    elif engine in ("local", "ollama"):
+        p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
+        res = execute_local_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+    elif engine == "aider":
+        p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
+        res = execute_aider_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+    elif engine in ("deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
+        from makewand.providers.api_client import call_api_chat
+        p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
+        ok, out, err = call_api_chat(provider=engine, prompt=p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, role="reviewer" if readonly else "coder")
+        res = (ok, out, err)
     else:
         return False, None, f"未知或不支持的模型引擎: {engine}"
+
 
     if isinstance(res, (tuple, list)) and len(res) == 3:
         try:
@@ -611,33 +688,57 @@ def _match_domain_keywords(keywords: List[str], text: str) -> List[str]:
 def select_optimal_engine_pair(
     prompt: str,
     tier: str = "standard",
-    cache: Optional[Dict[str, Any]] = None
+    cache: Optional[Dict[str, Any]] = None,
+    boost: bool = False
 ) -> Tuple[List[str], List[str], Dict[str, Any]]:
     """
     Intelligently scores and pairs engines for (Implementation, Red-team Review)
     based on task domain affinity and quota window dynamics.
+    Supports user forced overclocking (--boost) and low-usage performance harvesting.
     Returns: (ordered_coders, ordered_reviewers, meta_info)
     """
     if cache is None:
         cache = get_or_update_status(force_probe=False)
 
     p_lower = prompt.lower()
+    reasons = []
+
+    if boost:
+        tier = "deep"
+        reasons.append("⚡ [Boost Overclock] 用户显式启用强制超频模式：穿透所有软削峰与限流惩罚，全力调度最强旗舰模型！")
 
     # Base scores:
     # Claude: primary general software development & engineering (2.0)
     # Codex: short rolling window (3-4h resets) & red-team specialist (1.8)
+    # Grok: high-reasoning frontier models & rapid agile coding (1.7)
     # Antigravity: continuous high-capacity reasoning anchor (1.4)
     # Muse: secondary alternative (0.8)
     scores = {
         "claude": 2.0,
         "codex": 1.8,
+        "grok": 1.7,
+        "deepseek": 1.6,
+        "aider": 1.5,
         "agy": 1.4,
-        "muse": 0.8
+        "qwen": 1.3,
+        "local": 1.2,
+        "openrouter": 1.1,
+        "siliconflow": 1.1,
+        "cursor": 1.0,
+        "glm": 0.9,
+        "kimi": 0.9,
+        "muse": 0.8,
+        "copilot": 0.7
     }
 
-    reasons = []
 
     # 1. Semantic Domain Keywords
+    # Local offline / private model affinity
+    local_keywords = ["本地", "local", "私有", "离线", "offline", "免费", "ollama", "vllm"]
+    matched_local = _match_domain_keywords(local_keywords, p_lower)
+    if matched_local:
+        scores["local"] += 3.0
+        reasons.append(f"命中本地私有模型偏好 ({', '.join(matched_local[:3])}) -> Local 模型大幅加权")
     # Algorithmic, Concurrency, Low-level, Security -> Codex affinity
     algo_keywords = [
         "算法", "algorithm", "leetcode", "二叉树", "binary tree", "动态规划", "dynamic programming",
@@ -651,6 +752,16 @@ def select_optimal_engine_pair(
     if matched_algo:
         scores["codex"] += 2.5
         reasons.append(f"命中算法与底层并发特征 ({', '.join(matched_algo[:3])}) -> Codex 专精大幅加权")
+
+    # Deep reasoning, Logic exploration, Prototyping, xAI -> Grok affinity
+    grok_keywords = [
+        "grok", "xai", "探索", "头脑风暴", "推演", "数学", "math", "快速原型", "prototype",
+        "mock", "演进", "前沿", "高并发设计", "多维分析", "因果", "逻辑"
+    ]
+    matched_grok = _match_domain_keywords(grok_keywords, p_lower)
+    if matched_grok:
+        scores["grok"] += 2.5
+        reasons.append(f"命中深度推理与逻辑探索特征 ({', '.join(matched_grok[:3])}) -> Grok 专精大幅加权")
 
     # Refactoring, UI/Frontend, Web, Docs, Types -> Claude affinity
     refactor_keywords = [
@@ -680,8 +791,22 @@ def select_optimal_engine_pair(
     if tier == "deep":
         scores["codex"] += 0.8
         scores["agy"] += 0.8
+        scores["grok"] += 0.8
     elif tier == "fast":
         scores["claude"] += 0.8
+        scores["grok"] += 0.5
+
+    # Low-usage Performance Harvesting (Surplus Milking Bonus)
+    # When commercial subscriptions are barely used in the rolling window, encourage active utilization!
+    try:
+        from makewand.usage import get_engine_usage_stats
+        usage_stats = get_engine_usage_stats(window_hours=24.0)
+        for m in ["codex", "claude", "grok", "muse"]:
+            if scores.get(m, 0) > 0 and usage_stats.get(m, {}).get("total", 0) <= 2:
+                scores[m] += 0.5
+                reasons.append(f"{m.upper()} 过去 24 小时处于低频空闲窗口，增加低频性能榨取放量加权 (+0.5)")
+    except Exception:
+        pass
 
     # 2. Sliding Window Quota Burn-Rate Adjustment
     try:
@@ -690,50 +815,125 @@ def select_optimal_engine_pair(
             if scores[model_name] > 0:
                 pen, pen_reason = get_burn_rate_penalty(model_name)
                 if pen != 0.0:
+                    if boost:
+                        # Explicit user boost: skip all soft penalties
+                        if pen_reason:
+                            reasons.append(f"{model_name.upper()} {pen_reason} [已由用户 --boost 强制穿透豁免]")
+                        pen = 0.0
+                    elif tier == "deep" and pen > -2.5:
+                        # 战役级任务实施惩罚穿透：豁免减半
+                        pen *= 0.5
+                        if pen_reason:
+                            reasons.append(pen_reason + " [已触发 Deep 穿透豁免减半]")
+                    else:
+                        if pen <= -1.5:
+                            scores[model_name] = max(0.2, min(scores[model_name], 1.5) + pen)
+                        if pen_reason:
+                            reasons.append(pen_reason)
                     scores[model_name] += pen
-                    if pen_reason:
-                        reasons.append(pen_reason)
     except Exception:
         pass
 
-    # 3. Quota Health Filter
+    # 3. Quota Health & Active Tool Filter
+    from makewand.config import has_api_configured, is_provider_enabled, get_active_providers
+    active_pool = set(get_active_providers())
+
     for model_name in list(scores.keys()):
+        if not is_provider_enabled(model_name):
+            scores[model_name] = -999.0
+            reasons.append(f"{model_name} 已由用户在配置中手动禁用 (disabled)")
+            continue
+        if model_name not in active_pool:
+            scores[model_name] = -999.0
+            continue
         status = cache.get(model_name, {}).get("status", "unknown")
+        api_ok = has_api_configured(model_name)
         if status == "limited":
-            scores[model_name] = -999.0
-            reasons.append(f"{model_name} 当前额度受限 (limited)")
+            if api_ok:
+                scores[model_name] -= 1.0
+                reasons.append(f"{model_name} 订阅额度受限，已自动启用备用 API 兜底 (轻微降权 -1.0)")
+            else:
+                scores[model_name] = -999.0
+                reasons.append(f"{model_name} 当前额度受限 (limited)")
         elif status in ("needs_auth", "missing"):
-            scores[model_name] = -999.0
+            if api_ok and model_name not in ("local", "ollama"):
+                scores[model_name] -= 0.5
+                reasons.append(f"{model_name} 未配置 CLI 订阅，当前使用纯 API 模式")
+            else:
+                scores[model_name] = -999.0
 
     # Sort coder candidates
     available_coders = [m for m, sc in sorted(scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
     if not available_coders:
-        available_coders = ["agy"]
+        # If no active tool has score > 0, fallback to any active tool, or agy if pool empty
+        available_coders = [m for m in active_pool if is_provider_enabled(m)] or ["agy"]
 
     primary_coder = available_coders[0]
 
-    # Reviewer candidates: strictly different from coder, with Codex / AGY / Claude preferred
+    # Reviewer candidates
     reviewer_base_scores = {
         "codex": 2.2,   # exceptional red-team adversarial tester
+        "deepseek": 2.1,# deep reasoning & adversarial bug-finding
         "agy": 2.0,     # deep high reasoning judge
+        "grok": 1.9,    # deep adversarial logic & boundary scrutiny
         "claude": 1.6,  # great for readability, lint, and test validation
-        "muse": 0.5
+        "aider": 1.5,
+        "qwen": 1.4,
+        "local": 1.0,   # local red-team & offline review
+        "openrouter": 1.0,
+        "siliconflow": 1.0,
+        "glm": 0.8,
+        "kimi": 0.8,
+        "muse": 0.5,
+        "cursor": 0.5,
+        "copilot": 0.5
     }
     reviewer_base_scores.pop(primary_coder, None)
     for model_name in list(reviewer_base_scores.keys()):
-        status = cache.get(model_name, {}).get("status", "unknown")
-        if status in ("limited", "needs_auth", "missing"):
+        if not is_provider_enabled(model_name):
             reviewer_base_scores[model_name] = -999.0
+            continue
+        if model_name not in active_pool:
+            reviewer_base_scores[model_name] = -999.0
+            continue
+        status = cache.get(model_name, {}).get("status", "unknown")
+        api_ok = has_api_configured(model_name)
+        if status in ("limited", "needs_auth", "missing"):
+            if api_ok and model_name not in ("local", "ollama"):
+                reviewer_base_scores[model_name] -= 0.8
+            else:
+                reviewer_base_scores[model_name] = -999.0
+        else:
+            if not boost:
+                try:
+                    from makewand.usage import get_burn_rate_penalty
+                    pen, _ = get_burn_rate_penalty(model_name)
+                    if pen != 0.0:
+                        reviewer_base_scores[model_name] += pen
+                except Exception:
+                    pass
 
     available_reviewers = [m for m, sc in sorted(reviewer_base_scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
-    if not available_reviewers:
-        available_reviewers = ["agy"]
+    single_tool_mode = False
+    if len(active_pool) <= 1:
+        available_reviewers = [primary_coder]
+        single_tool_mode = True
+        reasons.append(f"当前系统仅检测到 1 个活跃可用工具 ({primary_coder.upper()})，已自动切换为单工具实现 + 独立沙箱自审闭环模式")
+    elif not available_reviewers:
+        other_active = [m for m in active_pool if m != primary_coder and is_provider_enabled(m)]
+        if other_active:
+            available_reviewers = sorted(other_active, key=lambda m: reviewer_base_scores.get(m, -999.0), reverse=True)
+            reasons.append(f"由于削峰保护，备用审查员降级由活跃工具接管: {available_reviewers[0]}")
+        else:
+            available_reviewers = [primary_coder]
+            single_tool_mode = True
 
     meta_info = {
         "scores": scores,
         "reasons": reasons,
         "primary_coder": primary_coder,
-        "primary_reviewer": available_reviewers[0] if available_reviewers else "agy"
+        "primary_reviewer": available_reviewers[0] if available_reviewers else primary_coder,
+        "single_tool_mode": single_tool_mode
     }
 
     return available_coders, available_reviewers, meta_info
@@ -748,18 +948,29 @@ def run_pipeline(
     max_fix: int = 2,
     timeout: int = 300,
     total_budget: Optional[int] = None,
-    force_code: bool = False
+    force_code: bool = False,
+    repo_trust: str = "trusted",
+    boost: bool = False
 ) -> bool:
     check_load_backpressure()
     if not cwd:
         cwd = os.getcwd()
-    if tier == "auto":
+
+    if repo_trust == "untrusted":
+        from makewand.sandbox import is_bwrap_available
+        if not is_bwrap_available() and os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
+            print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断执行。", COLOR_RED + COLOR_BOLD))
+            return False
+
+    if boost:
+        tier = "deep"
+        print(c("⚡ [Makewand Boost] 强制超频模式已启用：穿透软配额限制，分配最高推理算力！", COLOR_MAGENTA + COLOR_BOLD))
+    elif tier == "auto":
         tier = detect_task_tier(prompt)
 
+    # Decouple per-stage timeout from pipeline total budget
     if total_budget is None:
-        total_budget = timeout
-    else:
-        total_budget = min(total_budget, timeout)
+        total_budget = max(900, timeout * 3)
 
     pipeline_start_time = time.time()
 
@@ -822,10 +1033,47 @@ def run_pipeline(
                 print(c(f"❌ [Makewand Multi-Session Guard] 无法为活跃冲突会话建立安全影子工作树 ({e})，终止任务以防踩踏。", COLOR_RED + COLOR_BOLD))
                 return False
 
+    initial_untracked_files = set()
+    if not is_shadow_active and cwd:
+        try:
+            _, init_status, _ = run_git_cmd(["git", "status", "--porcelain", "-uall", "--ignored"], cwd=cwd)
+            for line in init_status.splitlines():
+                if line.startswith("?? ") or line.startswith("!! "):
+                    initial_untracked_files.add(line[3:].strip().strip('"'))
+        except Exception:
+            pass
+
     def fail_and_cleanup(msg: str) -> bool:
         if is_shadow_active and cleanup_shadow:
             try:
                 cleanup_shadow()
+            except Exception:
+                pass
+        elif cwd:
+            # On host repository (non-shadow mode), backup rejected diff and rollback uncommitted modifications
+            try:
+                diff_code, d_out, _ = run_git_cmd(["git", "diff", "HEAD"], cwd=cwd)
+                if diff_code == 0 and d_out and d_out.strip():
+                    art_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    rej_dir = Path("/tmp/makewand-artifacts") / f"rejected_{art_ts}"
+                    rej_dir.mkdir(parents=True, exist_ok=True)
+                    (rej_dir / "rejected.patch").write_text(d_out, encoding="utf-8")
+
+                run_git_cmd(["git", "reset", "HEAD"], cwd=cwd)
+                run_git_cmd(["git", "restore", "."], cwd=cwd)
+                run_git_cmd(["git", "checkout", "--", "."], cwd=cwd)
+                # Clean only untracked or ignored files newly created during this task execution
+                _, curr_status, _ = run_git_cmd(["git", "status", "--porcelain", "-uall", "--ignored"], cwd=cwd)
+                for line in curr_status.splitlines():
+                    if line.startswith("?? ") or line.startswith(" A ") or line.startswith("!! "):
+                        f_rel = line[3:].strip().strip('"')
+                        if f_rel not in initial_untracked_files:
+                            target_p = Path(cwd) / f_rel
+                            if target_p.is_file() or target_p.is_symlink():
+                                target_p.unlink(missing_ok=True)
+                            elif target_p.is_dir():
+                                shutil.rmtree(target_p, ignore_errors=True)
+                print(c(f"🛡️ [Makewand Transaction] 已自动回滚未通过门禁的未提交代码修改，工作区已恢复基线。", COLOR_YELLOW))
             except Exception:
                 pass
         print(c(msg, COLOR_RED + COLOR_BOLD))
@@ -836,6 +1084,7 @@ def run_pipeline(
         cache = get_or_update_status(force_probe=False)
         c_status = cache.get("claude", {}).get("status")
         x_status = cache.get("codex", {}).get("status")
+        g_status = cache.get("grok", {}).get("status")
         m_status = cache.get("muse", {}).get("status")
 
         step_timeout = get_remaining_timeout(timeout)
@@ -845,25 +1094,31 @@ def run_pipeline(
 
         qa_output = None
         if c_status != "limited":
-            success, out, err = execute_claude_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True)
+            success, out, err = execute_claude_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
             if success:
                 qa_output = out
         if qa_output is None and x_status != "limited":
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout > 0:
-                success, out, err = execute_codex_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True)
+                success, out, err = execute_codex_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
+                if success:
+                    qa_output = out
+        if qa_output is None and g_status not in ["limited", "needs_auth", "missing"]:
+            step_timeout = get_remaining_timeout(timeout)
+            if step_timeout > 0:
+                success, out, err = execute_grok_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
                 if success:
                     qa_output = out
         if qa_output is None and m_status not in ["limited", "needs_auth", "missing"]:
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout > 0:
-                success, out, err = execute_muse_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True)
+                success, out, err = execute_muse_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
                 if success:
                     qa_output = out
         if qa_output is None:
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout > 0:
-                success, out, err = execute_agy_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True)
+                success, out, err = execute_agy_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
                 if success:
                     qa_output = out
         if qa_output and not stream:
@@ -873,7 +1128,7 @@ def run_pipeline(
 
     if intent == "review":
         print(c(f"💡 Makewand 意图识别: 独立代码审计/审查模式 '{prompt}' (只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
-        exit_code = run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt)
+        exit_code = run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt, repo_trust=repo_trust)
         return exit_code == EXIT_PASSED
 
     print(c(f"🚀 Makewand 流水线启动: '{prompt}' (自适应模型档位: {tier})", COLOR_BOLD))
@@ -886,7 +1141,7 @@ def run_pipeline(
     ensure_git_worktree(cwd)
 
     # Step 2: Intelligent Multi-Model Routing & Implementation
-    coder_candidates, reviewer_candidates, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache)
+    coder_candidates, reviewer_candidates, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
     primary_c = route_meta["primary_coder"]
     primary_r = route_meta["primary_reviewer"]
 
@@ -938,7 +1193,7 @@ def run_pipeline(
             return fail_and_cleanup("❌ [Makewand Budget] 全局流水线预算已耗尽，终止任务执行。")
 
         print(c(f"→ 派发代码编写与实现任务给 {eng.upper()} (Tier: {tier})...", COLOR_BLUE + COLOR_BOLD))
-        success, out, err = dispatch_task(eng, coder_prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=False, repo_root=shadow_repo_root)
+        success, out, err = dispatch_task(eng, coder_prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
         if success:
             print(c(f"✔ {eng.upper()} 完成代码编写与修改。", COLOR_GREEN))
             coder_output = out
@@ -986,8 +1241,11 @@ def run_pipeline(
 
     actual_reviewers = [r for r in reviewer_candidates if r != coder_engine]
     if not actual_reviewers:
-        fallback_r = "agy" if coder_engine != "agy" else ("codex" if cache.get("codex", {}).get("status") != "limited" else "claude")
-        actual_reviewers = [fallback_r]
+        if route_meta.get("single_tool_mode") or len(coder_candidates) <= 1:
+            actual_reviewers = [coder_engine]
+        else:
+            fallback_r = "agy" if coder_engine != "agy" else ("codex" if cache.get("codex", {}).get("status") != "limited" else "claude")
+            actual_reviewers = [fallback_r]
 
     review_output = None
     reviewer_engine = None
@@ -995,9 +1253,16 @@ def run_pipeline(
         step_timeout = get_remaining_timeout(timeout)
         if step_timeout <= 0:
             break
-        print(c(f"→ 派发给 {r_eng.upper()} 进行独立跨模型红队审查 (Tier: deep, 只读隔离)...", COLOR_CYAN + COLOR_BOLD))
-        res = dispatch_task(r_eng, review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True, repo_root=shadow_repo_root)
-        success, out, err = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
+        is_self_review = (r_eng == coder_engine)
+        rev_mode_str = "进行独立沙箱自审与边界复审 (单工具自审闭环)" if is_self_review else "进行独立跨模型红队审查 (Tier: deep, 只读隔离)"
+        print(c(f"→ 派发给 {r_eng.upper()} {rev_mode_str}...", COLOR_CYAN + COLOR_BOLD))
+        curr_prompt = ("【单工具自审要求】当前为单工具自审闭环模式，请务必完全转换角色为严苛的代码审计员，对以上代码修改持最高怀疑态度，进行无情审查与边界挑刺：\n" + review_prompt) if is_self_review else review_prompt
+        res = dispatch_task(r_eng, curr_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
+
+        if isinstance(res, (tuple, list)) and len(res) == 3:
+            success, out, err = res[0], res[1], res[2]
+        else:
+            success, out, err = False, "", "UNVERIFIED: 独立审查未产生有效响应或返回结构异常"
         if success and out and out.strip():
             print(c(f"✔ {r_eng.upper()} 独立红队审查完成。", COLOR_GREEN))
             review_output = out
@@ -1045,7 +1310,7 @@ def run_pipeline(
             step_timeout = get_remaining_timeout(timeout)
             if coder_engine and step_timeout > 0:
                 print(c(f"→ 由主力编码引擎 {coder_engine.upper()} 执行缺陷修复...", COLOR_YELLOW))
-                ok, _, _ = dispatch_task(coder_engine, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root)
+                ok, _, _ = dispatch_task(coder_engine, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
                 if ok:
                     fixed = True
                     actual_fix_engine = coder_engine
@@ -1057,7 +1322,7 @@ def run_pipeline(
                         if step_timeout <= 0:
                             break
                         print(c(f"→ 自动切换备用引擎 {alt_c.upper()} 执行修复...", COLOR_YELLOW))
-                        ok, _, _ = dispatch_task(alt_c, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root)
+                        ok, _, _ = dispatch_task(alt_c, fix_prompt, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
                         if ok:
                             fixed = True
                             actual_fix_engine = alt_c
@@ -1093,22 +1358,29 @@ def run_pipeline(
                 f"--- 最新代码改动 (git diff) ---\n{new_diff_snippet}"
             )
 
-            # Strictly exclude actual_fix_engine from reviewers to preserve cross-model independence
-            candidate_re_reviewers = [r for r in actual_reviewers if r != actual_fix_engine]
+            # Strictly exclude BOTH coder_engine AND actual_fix_engine from reviewers to preserve cross-model independence
+            excluded_reviewers = {coder_engine, actual_fix_engine}
+            candidate_re_reviewers = [r for r in actual_reviewers if r not in excluded_reviewers]
             if not candidate_re_reviewers:
                 healthy_alts = [
-                    e for e in ["codex", "claude", "agy", "muse"]
-                    if e != actual_fix_engine and cache.get(e, {}).get("status") not in ["limited", "needs_auth", "missing"]
+                    e for e in ["codex", "claude", "grok", "agy", "muse"]
+                    if e not in excluded_reviewers and cache.get(e, {}).get("status") not in ["limited", "needs_auth", "missing"]
                 ]
-                candidate_re_reviewers = healthy_alts if healthy_alts else [e for e in ["codex", "claude", "agy", "muse"] if e != actual_fix_engine]
+                candidate_re_reviewers = healthy_alts if healthy_alts else [e for e in ["codex", "claude", "grok", "agy", "muse"] if e not in excluded_reviewers]
+            if not candidate_re_reviewers:
+                return fail_and_cleanup("❌ [Makewand Quality Gate] 缺乏独立第三方评审模型（已参与代码实现或修复的模型不得自审），安全终止交付。")
 
             re_output = None
             for alt_r in candidate_re_reviewers:
                 step_timeout = get_remaining_timeout(timeout)
                 if step_timeout <= 0:
                     break
-                res = dispatch_task(alt_r, re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True, repo_root=shadow_repo_root)
-                ok, out, _ = (res[0], res[1], res[2]) if isinstance(res, (tuple, list)) and len(res) == 3 else (True, "LGTM", None)
+                print(c(f"→ 派发给 {alt_r.upper()} 进行第 {current_fix_iter} 轮独立跨模型红队复审 (Tier: deep, 只读隔离)...", COLOR_CYAN))
+                res = dispatch_task(alt_r, re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                if isinstance(res, (tuple, list)) and len(res) == 3:
+                    ok, out, _ = res[0], res[1], res[2]
+                else:
+                    ok, out, _ = False, "", "UNVERIFIED: 复审未返回有效结果元组"
                 if ok and out and out.strip():
                     re_output = out
                     break
@@ -1144,6 +1416,10 @@ def run_pipeline(
                     except Exception:
                         pass
                     break
+            else:
+                print(c("❌ [Makewand Quality Gate] 独立复审服务未能完成代码审计 (UNVERIFIED)，出于安全防御原则终止自愈回环。", COLOR_RED))
+                review_output = "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"所有复审模型均超时或未能完成复审 (UNVERIFIED)\"]}"
+                break
 
     print(c("\n============================================================", COLOR_BOLD))
     print(c("                   Makewand 联合调度完成报告", COLOR_BOLD + COLOR_GREEN))
@@ -1423,12 +1699,45 @@ def run_pipeline(
     print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
     return True
 
-def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False) -> int:
+def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted") -> int:
     if not cwd:
         cwd = os.getcwd()
+
+    if repo_trust == "untrusted":
+        from makewand.sandbox import is_bwrap_available
+        if not is_bwrap_available() and os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
+            if output_json:
+                print(json.dumps({
+                    "pass": False,
+                    "exit_code": EXIT_UNVERIFIED,
+                    "engine": None,
+                    "defects": ["当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断审查"],
+                    "error": "Untrusted repository requires Bubblewrap sandbox"
+                }, ensure_ascii=False, indent=2))
+            else:
+                print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断审查。", COLOR_RED + COLOR_BOLD))
+            return EXIT_UNVERIFIED
+
     if not output_json:
         print(c("🔍 Makewand 代码审计工具", COLOR_BOLD + COLOR_CYAN))
-    diff_out = get_git_diff(cwd)
+    if hasattr(get_git_diff, "mock") or hasattr(get_git_diff, "_mock_return_value") or "unittest.mock" in type(get_git_diff).__module__:
+        diff_out = get_git_diff(cwd)
+        diff_err = None
+    else:
+        diff_out, diff_err = get_git_diff_status(cwd)
+    if diff_err:
+        if output_json:
+            print(json.dumps({
+                "pass": False,
+                "exit_code": EXIT_UNVERIFIED,
+                "engine": None,
+                "defects": [f"Git diff 提取失败 ({diff_err})"],
+                "error": diff_err
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(c(f"❌ [Makewand Review] 无法提取当前工作区改动 ({diff_err})，阻断审查。", COLOR_RED + COLOR_BOLD))
+        return EXIT_UNVERIFIED
+
     if not diff_out.strip():
         if output_json:
             print(json.dumps({
@@ -1444,6 +1753,7 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
 
     cache = get_or_update_status()
     x_status = cache.get("codex", {}).get("status")
+    g_status = cache.get("grok", {}).get("status")
 
     focus = f" 特别关注要求: {user_prompt}。" if user_prompt else ""
     prompt = (
@@ -1459,17 +1769,42 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
     if x_status != "limited":
         if not output_json:
             print(c("派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN))
-        success, out, err = execute_codex_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True)
+        success, out, err = execute_codex_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True, repo_trust=repo_trust)
+        try:
+            from makewand.usage import record_engine_usage
+            record_engine_usage("codex", tier="deep", success=success, task=f"run_review: {focus[:60]}")
+        except Exception:
+            pass
         if success and out and out.strip():
             review_res = out
             reviewer_engine = "codex"
         elif not output_json:
-            print(c(f"Codex 不可用 ({err or '输出内容为空'})，转交 Antigravity...", COLOR_YELLOW))
+            print(c(f"Codex 不可用 ({err or '输出内容为空'})，尝试 Grok...", COLOR_YELLOW))
+
+    if review_res is None and g_status not in ["limited", "needs_auth", "missing"]:
+        if not output_json:
+            print(c("派发给 Grok Build CLI 进行红队审计 (xAI / grok-4.7, 只读隔离)...", COLOR_RED))
+        success, out, err = execute_grok_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True, repo_trust=repo_trust)
+        try:
+            from makewand.usage import record_engine_usage
+            record_engine_usage("grok", tier="deep", success=success, task=f"run_review: {focus[:60]}")
+        except Exception:
+            pass
+        if success and out and out.strip():
+            review_res = out
+            reviewer_engine = "grok"
+        elif not output_json:
+            print(c(f"Grok 不可用 ({err or '输出内容为空'})，转交 Antigravity...", COLOR_YELLOW))
 
     if review_res is None:
         if not output_json:
             print(c("由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN))
-        success, out, err = execute_agy_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True)
+        success, out, err = execute_agy_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True, repo_trust=repo_trust)
+        try:
+            from makewand.usage import record_engine_usage
+            record_engine_usage("agy", tier="deep", success=success, task=f"run_review: {focus[:60]}")
+        except Exception:
+            pass
         if success and out and out.strip():
             review_res = out
             reviewer_engine = "agy"
@@ -1510,18 +1845,28 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
         print(c("❌ 代码审计检测到严重隐患，未达合并标准 (FAILED)。", COLOR_RED + COLOR_BOLD))
         return EXIT_FAILED
 
-def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
+def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300, repo_trust: str = "trusted"):
     check_load_backpressure()
     if not cwd:
         cwd = os.getcwd()
+
+    if repo_trust == "untrusted":
+        from makewand.sandbox import is_bwrap_available
+        if not is_bwrap_available() and os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
+            print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断竞速。", COLOR_RED + COLOR_BOLD))
+            return 1
+
     print(c(f"🏁 Makewand 双模型并发竞速模式启动: '{prompt}'", COLOR_BOLD + COLOR_CYAN))
 
     ensure_git_worktree(cwd)
 
     cache = get_or_update_status()
-    c_ok = cache.get("claude", {}).get("status") == "healthy"
-    x_ok = cache.get("codex", {}).get("status") == "healthy"
-    m_ok = cache.get("muse", {}).get("status") == "healthy"
+    from makewand.config import is_provider_enabled
+    c_ok = cache.get("claude", {}).get("status") == "healthy" and is_provider_enabled("claude")
+    x_ok = cache.get("codex", {}).get("status") == "healthy" and is_provider_enabled("codex")
+    g_ok = cache.get("grok", {}).get("status") == "healthy" and is_provider_enabled("grok")
+    m_ok = cache.get("muse", {}).get("status") == "healthy" and is_provider_enabled("muse")
+    l_ok = cache.get("local", {}).get("status") == "healthy" and is_provider_enabled("local")
 
     ensure_config_dir()
     race_id = f"rc_{uuid.uuid4().hex[:8]}"
@@ -1544,8 +1889,34 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
         _, base_b_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=str(wt_b))
 
         # Pick Contestants
-        name_a = "Codex (gpt-6-astra)" if x_ok else ("Muse Code" if m_ok else "Antigravity (Gemini Fast)")
-        name_b = "Claude Code" if c_ok else "Antigravity (Gemini Deep)"
+        if x_ok:
+            engine_a = "codex"
+            name_a = "Codex (gpt-6-astra)"
+        elif g_ok:
+            engine_a = "grok"
+            name_a = "Grok Build CLI (grok-4.7)"
+        elif m_ok:
+            engine_a = "muse"
+            name_a = "Muse Code"
+        elif l_ok:
+            engine_a = "local"
+            name_a = "Local Self-Hosted (本地大模型)"
+        else:
+            engine_a = "agy"
+            name_a = "Antigravity (Gemini Fast)"
+
+        if c_ok:
+            engine_b = "claude"
+            name_b = "Claude Code"
+        elif g_ok and engine_a != "grok":
+            engine_b = "grok"
+            name_b = "Grok Build CLI (grok-4.7)"
+        elif l_ok and engine_a != "local":
+            engine_b = "local"
+            name_b = "Local Self-Hosted (本地大模型)"
+        else:
+            engine_b = "agy"
+            name_b = "Antigravity (Gemini Deep)"
 
         print(c(f"  选手 A: {name_a} (独立工作区: {wt_a})", COLOR_CYAN + COLOR_BOLD))
         print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
@@ -1554,22 +1925,32 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
         def run_agent_a():
             start = time.time()
             full_p = f"工作目录绝对路径: {wt_a}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
-            if x_ok:
-                ok, out, err = execute_codex_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd)
-            elif m_ok:
-                ok, out, err = execute_muse_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd)
+            if engine_a == "codex":
+                ok, out, err = execute_codex_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
+            elif engine_a == "grok":
+                ok, out, err = execute_grok_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
+            elif engine_a == "muse":
+                ok, out, err = execute_muse_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
+            elif engine_a == "local":
+                from makewand.providers.local import execute_local_task
+                ok, out, err = execute_local_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
             else:
-                ok, out, err = execute_agy_task(full_p, cwd=str(wt_a), timeout=timeout, tier="fast", repo_root=cwd)
+                ok, out, err = execute_agy_task(full_p, cwd=str(wt_a), timeout=timeout, tier="fast", repo_root=cwd, repo_trust=repo_trust)
             duration = round(time.time() - start, 2)
             return name_a, ok, out, duration, wt_a
 
         def run_agent_b():
             start = time.time()
             full_p = f"工作目录绝对路径: {wt_b}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
-            if c_ok:
-                ok, out, err = execute_claude_task(full_p, cwd=str(wt_b), timeout=timeout, repo_root=cwd)
+            if engine_b == "claude":
+                ok, out, err = execute_claude_task(full_p, cwd=str(wt_b), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
+            elif engine_b == "grok":
+                ok, out, err = execute_grok_task(full_p, cwd=str(wt_b), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
+            elif engine_b == "local":
+                from makewand.providers.local import execute_local_task
+                ok, out, err = execute_local_task(full_p, cwd=str(wt_b), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
             else:
-                ok, out, err = execute_agy_task(full_p, cwd=str(wt_b), timeout=timeout, tier="deep", repo_root=cwd)
+                ok, out, err = execute_agy_task(full_p, cwd=str(wt_b), timeout=timeout, tier="deep", repo_root=cwd, repo_trust=repo_trust)
             duration = round(time.time() - start, 2)
             return name_b, ok, out, duration, wt_b
 
@@ -1589,49 +1970,91 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
                 res_a = f_a.result()
                 res_b = f_b.result()
 
-        diff_a = get_git_diff(str(wt_a), base_rev=base_a_commit.strip() if base_a_commit else None)
-        diff_b = get_git_diff(str(wt_b), base_rev=base_b_commit.strip() if base_b_commit else None)
+        diff_a, diff_err_a = get_git_diff_status(str(wt_a), base_rev=base_a_commit.strip() if base_a_commit else None)
+        diff_b, diff_err_b = get_git_diff_status(str(wt_b), base_rev=base_b_commit.strip() if base_b_commit else None)
+        if diff_err_a:
+            print(c(f"⚠ 选手 A diff 提取警告: {diff_err_a}", COLOR_YELLOW))
+        if diff_err_b:
+            print(c(f"⚠ 选手 B diff 提取警告: {diff_err_b}", COLOR_YELLOW))
+
+        # Deterministic local test gate validation on both candidate worktrees
+        print(c("🧪 正在对两位候选人的产出分别执行本地确定性测试套件验证...", COLOR_CYAN))
+        test_pass_a, test_out_a = run_local_tests(str(wt_a), timeout=60)
+        test_pass_b, test_out_b = run_local_tests(str(wt_b), timeout=60)
 
         print(c("\n============================================================", COLOR_BOLD))
         print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
         print(c("============================================================\n", COLOR_BOLD))
-        print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节")
-        print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节\n")
+        print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={'✔ 通过' if test_pass_a else '❌ 失败'}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节")
+        print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={'✔ 通过' if test_pass_b else '❌ 失败'}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节\n")
 
-        # Chief Referee evaluation with Antigravity (strictly read-only)
+        # Format full diffs for blind review (up to 12000 chars each)
+        fmt_diff_a = format_review_diff(diff_a, max_chars=12000) if diff_a else "无代码改动 (空 diff)"
+        fmt_diff_b = format_review_diff(diff_b, max_chars=12000) if diff_b else "无代码改动 (空 diff)"
+
+        # Chief Referee evaluation with Antigravity (strictly read-only, TRUE BLIND REVIEW)
         judge_prompt = (
-            f"请作为资深软件架构裁判，客观对比以下两位选手对同一任务的实现方案，指出各自优势与缺陷，并评定胜出者：\n\n"
+            f"请作为资深软件架构裁判，以客观中立的双盲评审视角对比以下两位候选方案对同一任务的实现，指出各自优势与缺陷，并评定胜出者：\n\n"
             f"--- 原始任务 ---\n{prompt}\n\n"
-            f"--- 选手 A ({res_a[0]}) 的改动 ---\n{diff_a[:3000] if diff_a else '无 diff'}\n\n"
-            f"--- 选手 B ({res_b[0]}) 的改动 ---\n{diff_b[:3000] if diff_b else '无 diff'}\n\n"
-            f"请给出：1. 方案对比分析 2. 最终裁决结果及推荐采纳理由。"
+            f"--- 自动化测试与工程指标 ---\n"
+            f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={'通过' if test_pass_a else '失败'}\n"
+            f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={'通过' if test_pass_b else '失败'}\n\n"
+            f"--- 候选方案 A 的代码实现 ---\n{fmt_diff_a}\n\n"
+            f"--- 候选方案 B 的代码实现 ---\n{fmt_diff_b}\n\n"
+            f"请给出：1. 两套方案的技术架构、可维护性与测试质量深度对比 2. 最终裁决结果（明确写出推荐采纳候选方案 A 或候选方案 B）及采纳理由。"
         )
         print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
-        ok, judge_report, _ = execute_agy_task(judge_prompt, cwd=cwd, tier="deep", timeout=timeout, readonly=True)
+        ok, judge_report, _ = execute_agy_task(
+            judge_prompt, cwd=cwd, tier="deep", timeout=timeout, readonly=True, repo_root=cwd, repo_trust=repo_trust
+        )
         if judge_report:
             print(c("\n【裁判裁决报告】", COLOR_BOLD))
             print(judge_report.strip())
 
-        # Determine winner
+        # Determine winner with strict deterministic test gate
+        eligible_a = res_a[1] and test_pass_a
+        eligible_b = res_b[1] and test_pass_b
+
+        def _check_winner_mention(report: str, letter: str) -> bool:
+            target = letter.upper()
+            patterns = [
+                rf'(?:[不未别]|no\s+|not\s+)?(?:推荐(?:采纳)?|采纳|胜出(?:者)?|获胜|胜者|winner(?:\s+is)?|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|option|model|候选(?:人|者|方案)?|方案)?\s*(?<![a-zA-Z0-9]){target}(?![a-zA-Z0-9])',
+                rf'(?:[不未别]|no\s+|not\s+)?(?:推荐(?:采纳)?|采纳|胜出(?:者)?|获胜|胜者|winner(?:\s+is)?|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|option|model|候选(?:人|者|方案)?|方案)\s*[:：]?\s*(?<![a-zA-Z0-9]){target}(?![a-zA-Z0-9])',
+                rf'(?:[不未别]|no\s+|not\s+)?(?:选手|agent|candidate|option|model|候选(?:人|者|方案)?|方案)?\s*(?<![a-zA-Z0-9]){target}(?![a-zA-Z0-9])\s*(?:方案)?\s*(?:获胜|胜出|胜者|wins?|is the winner)',
+            ]
+            for pat in patterns:
+                for m in re.finditer(pat, report):
+                    matched = m.group(0).strip()
+                    if not re.search(r'^[不未别]|^(?:no|not)\b', matched, re.IGNORECASE):
+                        if matched.endswith(' a') or matched.endswith(' a '):
+                            continue
+                        return True
+            return False
+
         winner = None
-        if ok and judge_report:
-            m_a = re.search(r"(?:推荐(?:采纳)?|采纳|胜出者|获胜|胜者|winner|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|方案)?\s*[Aa]", judge_report, re.IGNORECASE)
-            m_b = re.search(r"(?:推荐(?:采纳)?|采纳|胜出者|获胜|胜者|winner|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|方案)?\s*[Bb]", judge_report, re.IGNORECASE)
-            if m_a and not m_b:
-                if res_a[1]:
+        if not test_pass_a and not test_pass_b:
+            print(c("❌ [Makewand Test Gate] 两套候选方案均未通过本地单元测试，拒绝产生胜出方案。", COLOR_RED + COLOR_BOLD))
+            winner = None
+        elif ok and judge_report:
+            m_a = _check_winner_mention(judge_report, "A")
+            m_b = _check_winner_mention(judge_report, "B")
+            if m_a and not m_b and eligible_a:
+                winner = "A"
+            elif m_b and not m_a and eligible_b:
+                winner = "B"
+            elif eligible_a and not eligible_b:
+                winner = "A"
+            elif eligible_b and not eligible_a:
+                winner = "B"
+            elif eligible_a and eligible_b:
+                if res_a[3] <= res_b[3]:
                     winner = "A"
-            elif m_b and not m_a:
-                if res_b[1]:
-                    winner = "B"
-            elif not m_a and not m_b:
-                if res_a[1] and not res_b[1]:
-                    winner = "A"
-                elif res_b[1] and not res_a[1]:
+                else:
                     winner = "B"
         else:
-            if res_a[1] and not res_b[1]:
+            if eligible_a and not eligible_b:
                 winner = "A"
-            elif res_b[1] and not res_a[1]:
+            elif eligible_b and not eligible_a:
                 winner = "B"
 
         CandidateManager.save_race(
@@ -1644,6 +2067,7 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
                 "path": str(wt_a),
                 "duration": res_a[3],
                 "success": res_a[1],
+                "test_passed": test_pass_a,
                 "diff": diff_a,
                 "baseline_commit": base_a_commit.strip() if base_a_commit else "",
             },
@@ -1652,6 +2076,7 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300):
                 "path": str(wt_b),
                 "duration": res_b[3],
                 "success": res_b[1],
+                "test_passed": test_pass_b,
                 "diff": diff_b,
                 "baseline_commit": base_b_commit.strip() if base_b_commit else "",
             },

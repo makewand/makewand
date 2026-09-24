@@ -103,6 +103,9 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		"--dev", "/dev",
 		// tmpfs /tmp before projectPath bind so temp-dir previews stay writable and don't shadow projectPath
 		"--tmpfs", "/tmp",
+		// S05 defense: Mask system Unix domain sockets and host IPC runtimes
+		"--tmpfs", "/var/tmp",
+		"--tmpfs", "/run",
 		"--bind", projectPath, projectPath,
 		"--chdir", projectPath,
 		"--clearenv",

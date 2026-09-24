@@ -160,10 +160,11 @@ func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*Exec
 }
 
 // verificationPlanAllowsNetwork reports whether a plan may keep network access
-// inside the sandbox. Only dependency installs qualify; quick checks, builds,
-// and test runs are network-isolated.
+// inside the sandbox. Dependency installs keep network access to reach package
+// registries. Test runs also keep network access to ensure the loopback
+// interface is available for local mock servers and IPC.
 func verificationPlanAllowsNetwork(plan ExecPlan) bool {
-	return plan.Kind == "deps"
+	return plan.Kind == "deps" || plan.Kind == "tests"
 }
 
 func (p *Project) execVerification(ctx context.Context, command string, args []string, allowNetwork bool) (*ExecResult, error) {

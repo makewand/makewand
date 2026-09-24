@@ -150,6 +150,10 @@ def get_external_ai_sessions():
                 ai_type = "claude"
             elif "agy" in comm_lower or "antigravity" in comm_lower:
                 ai_type = "agy"
+            elif "grok" in comm_lower or "bin/grok" in args_lower:
+                ai_type = "grok"
+            elif "muse" in comm_lower or "bin/muse" in args_lower or "muse-bin" in comm_lower:
+                ai_type = "muse"
 
             if not ai_type:
                 continue
@@ -201,6 +205,52 @@ def is_file_locked(lock_path):
     try:
         res = subprocess.run(["flock", "-n", lock_path, "true"], capture_output=True, timeout=1)
         return res.returncode != 0
+    except Exception:
+        return False
+
+def is_session_holding_file_lock(session_name: str, lock_path: str) -> bool:
+    """Check if the given tmux session or any of its descendant processes holds the lock file."""
+    if not os.path.exists(lock_path):
+        return False
+    try:
+        out = subprocess.check_output(["fuser", lock_path], stderr=subprocess.DEVNULL, timeout=1).decode("utf-8")
+        holder_pids = set(int(p) for p in out.strip().split() if p.isdigit())
+        if not holder_pids:
+            return False
+
+        pane_pid_s = subprocess.check_output(
+            ["tmux", "display-message", "-p", "-t", session_name, "#{pane_pid}"],
+            stderr=subprocess.DEVNULL,
+            timeout=1
+        ).decode("utf-8").strip()
+        if not pane_pid_s or not pane_pid_s.isdigit():
+            return False
+
+        pane_pid = int(pane_pid_s)
+        if pane_pid in holder_pids:
+            return True
+
+        ps_out = subprocess.check_output(
+            ["ps", "-eo", "pid,ppid"],
+            stderr=subprocess.DEVNULL,
+            timeout=1
+        ).decode("utf-8")
+        tree = {}
+        for line in ps_out.strip().splitlines()[1:]:
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                tree[int(parts[0])] = int(parts[1])
+
+        queue = [pane_pid]
+        descendants = set()
+        while queue:
+            curr = queue.pop(0)
+            for child, parent in tree.items():
+                if parent == curr and child not in descendants:
+                    descendants.add(child)
+                    queue.append(child)
+
+        return bool(holder_pids & descendants)
     except Exception:
         return False
 
@@ -257,8 +307,11 @@ def get_session_long_running_process(session_name: str, threshold_seconds: int =
                 continue
             comm_lower = info["comm"].lower()
             args_lower = info["args"].lower()
-            if any(k in comm_lower for k in ("bash", "zsh", "sh", "tmux", "agy", "node", "codex", "npm", "playwright")):
+            if comm_lower in ("zsh", "sh", "dash", "tmux", "agy", "node", "codex", "npm", "playwright"):
                 continue
+            if comm_lower == "bash":
+                if not any(k in args_lower for k in ("while", "until", "for", ".sh", "eval", "python", "curl", "grep", "sleep")):
+                    continue
             if "bin/codex" in args_lower or "antigravity" in args_lower or "node_modules" in args_lower or "mcp" in args_lower or "lsp" in args_lower:
                 continue
             if info["etimes"] >= threshold_seconds:
@@ -298,6 +351,22 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
         ("running" in text and ("task(s)" in text or "● [" in text or "manage.py" in text))
     )
 
+    # Check for quota exhaustion indicators
+    is_quota_exhausted = (
+        ("Weekly limit:" in text and "0% left" in text) or
+        "You've reached your limit" in text or
+        "Credit balance is too low" in text or
+        "Usage limit reached" in text or
+        "rate_limit_exceeded" in text or
+        "quota exceeded" in text
+    )
+    if is_quota_exhausted and is_at_prompt:
+        reset_hint = ""
+        match = re.search(r"resets\s+([0-9:]+\s+on\s+[0-9a-zA-Z]+|[0-9a-zA-Z\s:]+)", text)
+        if match:
+            reset_hint = f" (重置时间: {match.group(1).strip()})"
+        return "quota_exhausted", f"底层模型配额已 100% 耗尽 (0% left){reset_hint}，建议由 AGY/Grok 接管"
+
     # 1. If at prompt and not actively running background jobs, session is idle_ready
     if is_at_prompt and not is_actively_running:
         return "idle_ready", "任务已闭环，处于待命提示符状态"
@@ -308,7 +377,7 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
         args_str = long_proc["args"]
         if "psycopg2" in args_str or "postgres" in args_str or "SELECT " in args_str:
             return "heavy_db_query", f"执行大型 SQL 统计已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})，引发磁盘 AIO 争抢"
-        elif "gh run watch" in args_str or "gh pr watch" in args_str or "gh run view" in args_str or "gh workflow" in args_str:
+        elif any(k in args_str for k in ("gh run watch", "gh pr watch", "gh run view", "gh workflow", "gh pr checks", "tea pr")) or ("gh " in args_str and "--watch" in args_str):
             return "test_ci", f"远程 CI/GitHub Actions 构建监控中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
         elif "pytest" in args_str or "manage.py test" in args_str or re.search(r"\b(test|tests|unittest|jest|vitest)\b", args_str):
             return "test_ci", f"运行测试套件已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
@@ -324,7 +393,7 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
     if "1 task(s)" in text and "task-" in text and "running" in text:
         try:
             for lpath in Path("/run/lock").glob("*-heavy-*.lock"):
-                if is_file_locked(str(lpath)):
+                if is_session_holding_file_lock(session_name, str(lpath)):
                     return "hung_anomaly", f"持有重型数据库锁 ({lpath.name}) 挂起中"
         except Exception:
             pass
@@ -355,7 +424,7 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
         return "code_refactor", "多文件代码改写、逻辑重构与 Git 状态收敛"
 
     # 8. Idle / Ready fallback
-    if is_at_prompt:
+    if is_at_prompt and not is_actively_running:
         return "idle_ready", "任务已闭环，处于待命提示符状态"
 
     # 9. System Monitor & Diagnostics
@@ -430,6 +499,17 @@ def analyze_makewand_optimizations(session_reports, metrics, external_sessions=N
             "proposal": "可针对重构瓶颈直接调用 `makewand review` 或 `makewand race` 派发独立工作树比拼，利用 Codex (gpt-6-astra) 的算法能力加速单测攻坚与边界排查。"
         })
 
+    # Check for quota exhausted sessions
+    quota_exhausted_sessions = [s for s in session_reports if s["category"] == "quota_exhausted"]
+    if quota_exhausted_sessions:
+        names = ", ".join(s["name"] for s in quota_exhausted_sessions)
+        optimizations.append({
+            "target": "会话额度枯竭无缝接管 (Quota Exhaustion Handover)",
+            "priority": "HIGH",
+            "reason": f"监测到会话 [{names}] 的底层模型配额已彻底耗尽 (0% left)，直接输入将被限流阻断。",
+            "proposal": f"建议在该工作区改用 `makewand run ... --tier deep`，无缝分流至 Google AI Pro (Gemini 3.8) 或 Grok 4.7 顶格算力接续开发。"
+        })
+
     # Check for active external sessions
     if external_sessions:
         ext_cwds = {e["cwd"] for e in external_sessions if e.get("cwd") and e["cwd"] != "unknown"}
@@ -451,7 +531,7 @@ def analyze_makewand_optimizations(session_reports, metrics, external_sessions=N
 
     return optimizations
 
-def observe_all_dialogs(save_report=True):
+def observe_all_dialogs(save_report=True, clean_hung=False):
     """
     Run a complete observation turn across all dialogs.
     Returns structured observation dict.
@@ -461,11 +541,27 @@ def observe_all_dialogs(save_report=True):
     external_sessions = get_external_ai_sessions()
 
     session_reports = []
+    cleaned_pids = []
     for s in active_sessions:
         cwd = get_session_cwd(s)
         lines = capture_session_pane(s, lines_count=20)
         long_proc = get_session_long_running_process(s, threshold_seconds=900)
         cat, note = classify_operation(s, lines, metrics, long_proc=long_proc)
+
+        # Optional clean hung processes
+        if clean_hung and cat == "hung_anomaly" and long_proc and long_proc["etimes"] >= 1800:
+            comm_lower = long_proc["comm"].lower()
+            args_lower = long_proc["args"].lower()
+            if not any(k in comm_lower or k in args_lower for k in ("gh", "git", "cargo", "go", "gcc", "clang", "rustc", "npm", "node")):
+                try:
+                    import signal
+                    os.kill(long_proc["pid"], signal.SIGTERM)
+                    cleaned_pids.append({"session": s, "pid": long_proc["pid"], "comm": long_proc["comm"]})
+                    note += f" [已自动执行超时回收: SIGTERM PID {long_proc['pid']}]"
+                    cat = "idle_ready"
+                except Exception:
+                    pass
+
         session_reports.append({
             "name": s,
             "cwd": cwd,
@@ -485,7 +581,8 @@ def observe_all_dialogs(save_report=True):
         "sessions": session_reports,
         "external_sessions": external_sessions,
         "external_count": len(external_sessions),
-        "makewand_optimizations": optimizations
+        "makewand_optimizations": optimizations,
+        "cleaned_pids": cleaned_pids
     }
 
     if save_report:
@@ -514,6 +611,7 @@ def format_observation_markdown(report):
     status_icons = {
         "hung_anomaly": "🔴 异常卡死",
         "heavy_db_query": "🟡 高负荷",
+        "quota_exhausted": "⚠️ 额度已见底",
         "test_ci": "🔵 测试中",
         "data_pipeline": "🟣 数据流水线",
         "code_refactor": "🟣 代码重构",

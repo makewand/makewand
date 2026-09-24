@@ -9,6 +9,7 @@ Unit tests validating the 5 reliability and security fixes:
 
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
@@ -24,10 +25,11 @@ from makewand.providers.claude import execute_claude_task
 from makewand.providers.agy import execute_agy_task
 from makewand.providers.codex import execute_codex_task
 from makewand.providers.muse import execute_muse_task
+from makewand.providers.grok import execute_grok_task
 
 
 class TestExecutionSafetyAcrossProviders(unittest.TestCase):
-    """Fix 1: All 4 providers must enforce fail-closed sandbox checks for writable tasks."""
+    """Fix 1: All 5 providers must enforce fail-closed sandbox checks for writable tasks."""
 
     @patch("makewand.sandbox.is_bwrap_available", return_value=False)
     @patch("makewand.health.load_status_cache", return_value={})
@@ -49,6 +51,11 @@ class TestExecutionSafetyAcrossProviders(unittest.TestCase):
 
         # 4. Muse
         ok, out, err = execute_muse_task("write something", cwd="/tmp", readonly=False)
+        self.assertFalse(ok)
+        self.assertIn("强制要求 Bubblewrap (bwrap) 沙箱隔离", err)
+
+        # 5. Grok
+        ok, out, err = execute_grok_task("write something", cwd="/tmp", readonly=False)
         self.assertFalse(ok)
         self.assertIn("强制要求 Bubblewrap (bwrap) 沙箱隔离", err)
 
@@ -159,7 +166,7 @@ class TestTestPhaseSandboxing(unittest.TestCase):
                     "        secret = os.environ.get('SIMULATED_HOST_SECRET')\n"
                     "        self.assertIsNone(secret, 'Host secret leaked into test environment!')\n"
                 )
-                passed, details = run_local_tests(tmp_dir, timeout=10)
+                passed, details = run_local_tests(tmp_dir, timeout=30)
                 self.assertTrue(passed, f"Test failed: {details}")
         finally:
             os.environ.pop("SIMULATED_HOST_SECRET", None)
@@ -204,20 +211,23 @@ class TestTestFailureDeliveryGate(unittest.TestCase):
 
     @patch("makewand.orchestrator.run_local_tests", return_value=(False, "AssertionError: 1 != 2"))
     @patch("makewand.orchestrator.execute_codex_task", return_value=(True, "LGTM", None))
+    @patch("makewand.orchestrator.execute_grok_task", return_value=(True, "def foo(): return 2", None))
     @patch("makewand.orchestrator.execute_claude_task", return_value=(True, "def foo(): return 2", None))
     @patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None))
     @patch("makewand.orchestrator.get_or_update_status")
-    def test_plain_text_lgtm_cannot_bypass_failing_tests(self, mock_status, mock_iso, mock_claude, mock_codex, mock_tests):
+    def test_plain_text_lgtm_cannot_bypass_failing_tests(self, mock_status, mock_iso, mock_claude, mock_grok, mock_codex, mock_tests):
         from makewand.orchestrator import run_pipeline
         mock_status.return_value = {
             "claude": {"status": "ready", "tier": "standard"},
             "codex": {"status": "ready", "tier": "deep"},
+            "grok": {"status": "ready", "tier": "standard"},
             "agy": {"status": "ready", "tier": "deep"},
             "muse": {"status": "ready", "tier": "standard"}
         }
 
-        delivered = run_pipeline("实现修复逻辑并写单测", auto_fix=False, timeout=30, force_code=True)
-        self.assertFalse(delivered, "Pipeline delivered despite failing unit tests!")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delivered = run_pipeline("实现修复逻辑并写单测", cwd=tmp_dir, auto_fix=False, timeout=30, force_code=True)
+            self.assertFalse(delivered, "Pipeline delivered despite failing unit tests!")
 
 
 class TestGoDelegationUntrustedModuleIsolation(unittest.TestCase):

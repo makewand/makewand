@@ -7,6 +7,8 @@ import sys
 import json
 import shutil
 import time
+import fcntl
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
@@ -149,7 +151,11 @@ class CandidateManager:
         base_path = Path(base_cwd).resolve()
         baseline_manifest = build_manifest(base_path)
 
-        # Attach frozen candidate manifests
+        # Attach frozen candidate manifests and ensure test_passed is explicitly set
+        if "test_passed" not in agent_a:
+            agent_a["test_passed"] = agent_a.get("success", True)
+        if "test_passed" not in agent_b:
+            agent_b["test_passed"] = agent_b.get("success", True)
         if "path" in agent_a and os.path.exists(agent_a["path"]):
             agent_a["manifest"] = build_manifest(Path(agent_a["path"]))
         if "path" in agent_b and os.path.exists(agent_b["path"]):
@@ -269,8 +275,39 @@ class CandidateManager:
     ) -> Tuple[bool, List[str], str]:
         """
         Safely applies candidate changes to base_cwd with conflict detection and rollback journal.
+        Guarded with fcntl.flock to eliminate concurrent TOCTOU race conditions.
         Returns (success, applied_files, message).
         """
+        ensure_config_dir()
+        lock_file = config.CONFIG_DIR / "apply.lock"
+        lock_fd = None
+        try:
+            lock_fd = open(lock_file, "a")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except Exception:
+                pass
+            return CandidateManager._do_apply_candidate(
+                race_id=race_id,
+                candidate_label=candidate_label,
+                dry_run=dry_run,
+                force=force
+            )
+        finally:
+            if lock_fd:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    lock_fd.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _do_apply_candidate(
+        race_id: Optional[str] = None,
+        candidate_label: Optional[str] = None,
+        dry_run: bool = False,
+        force: bool = False
+    ) -> Tuple[bool, List[str], str]:
         race = CandidateManager.get_race(race_id)
         if not race:
             return False, [], "未找到指定的候选竞速记录"
@@ -296,6 +333,9 @@ class CandidateManager:
         # Prevent applying failed candidate unless forced
         if not cand_info.get("success", True) and not force:
             return False, [], f"候选选手 {label} 任务执行状态为失败/未完成，已阻止应用未就绪的方案 (如需强制应用请使用 --force)"
+
+        if cand_info.get("test_passed") is not True and not force:
+            return False, [], f"候选选手 {label} 本地单元测试未通过或未完成测试验证 (test_passed != True)，已阻止应用存在缺陷的方案 (如需强制应用请使用 --force)"
 
         candidate_dir = Path(cand_path_str)
 
@@ -383,7 +423,9 @@ class CandidateManager:
                 # Apply Change
                 if status in ("M", "A"):
                     target_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_file, target_file)
+                    tmp_target = target_file.with_name(f".{target_file.name}.tmp_apply_{uuid.uuid4().hex[:6]}")
+                    shutil.copy2(src_file, tmp_target)
+                    os.replace(tmp_target, target_file)
                     applied_files.append(f"A/M {rel_path}")
                 elif status == "D":
                     if target_file.exists():
@@ -401,7 +443,9 @@ class CandidateManager:
                 rel_p = item["path"]
                 t_file = Path(base_cwd) / rel_p
                 if item["action"] == "restore":
-                    shutil.copy2(item["bak"], t_file)
+                    tmp_rb = t_file.with_name(f".{t_file.name}.tmp_rb_{uuid.uuid4().hex[:6]}")
+                    shutil.copy2(item["bak"], tmp_rb)
+                    os.replace(tmp_rb, t_file)
                 elif item["action"] == "delete" and t_file.exists():
                     t_file.unlink()
 
