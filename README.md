@@ -35,29 +35,29 @@ curl -fsSL https://makewand.org/install.sh | bash
 ## 🏗️ 架构拓扑 (Architecture)
 
 ```mermaid
-graph TD
-    User([终端用户 / AI Agent]) --> MakewandCLI[Makewand CLI / Skill]
+flowchart TD
+    User(["终端用户 / AI Agent"]) --> MakewandCLI["Makewand CLI / Skill"]
     
-    subgraph 决策与探活层
-        MakewandCLI --> Health[健康与配额感知器 health.py]
-        Health --> Cache[~/.config/makewand/status.json]
-        MakewandCLI --> Router[自适应路由与档位判定]
+    subgraph Decision ["决策与探活层"]
+        MakewandCLI --> Health["健康与配额感知器 health.py"]
+        Health --> Cache["~/.config/makewand/status.json"]
+        MakewandCLI --> Router["自适应路由与档位判定"]
     end
 
-    subgraph 订阅模型池 (本地已登录 CLI)
-        Router --> AGY[Antigravity CLI\nGoogle AI Pro / Gemini 3.8]
-        Router --> Claude[Claude Code CLI\nAnthropic 订阅]
-        Router --> Codex[Codex CLI\nOpenAI / gpt-6-astra]
-        Router --> Muse[Muse Code CLI\nMeta 订阅 / Llama]
+    subgraph Pool ["订阅模型池 (本地已登录 CLI)"]
+        Router --> AGY["Antigravity CLI<br>Google AI Pro / Gemini 3.8"]
+        Router --> Claude["Claude Code CLI<br>Anthropic 订阅"]
+        Router --> Codex["Codex CLI<br>OpenAI / gpt-6-astra"]
+        Router --> Muse["Muse Code CLI<br>Meta 订阅 / Llama"]
     end
 
-    subgraph 协同流水线 Pipeline
-        Claude -->|主力实现| Diff[代码 Diff 生成]
+    subgraph Pipeline ["协同流水线 Pipeline"]
+        Claude -->|主力实现| Diff["代码 Diff 生成"]
         Codex -->|降级实现| Diff
-        Diff -->|独立红队审查| CodexReview[Codex / AGY 深度审查]
-        CodexReview -->|检测到 P1/P2 缺陷| AutoFix[Auto-Fix 修复循环]
+        Diff -->|独立红队审查| CodexReview["Codex / AGY 深度审查"]
+        CodexReview -->|检测到 P1/P2 缺陷| AutoFix["Auto-Fix 修复循环"]
         AutoFix --> Diff
-        CodexReview -->|审核通过 LGTM| Done[最终交付验收]
+        CodexReview -->|审核通过 LGTM| Done["最终交付验收"]
     end
 ```
 
