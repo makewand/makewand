@@ -23,6 +23,7 @@ from makewand.config import (
     COLOR_RED,
     COLOR_BLUE,
     COLOR_PURPLE,
+    COLOR_GRAY,
     COLOR_RESET,
     ensure_config_dir
 )
@@ -60,6 +61,7 @@ SLASH_COMMANDS = [
     "/sandbox",
     "/observe",
     "/tier",
+    "/multiline", "/paste",
     "/clear",
     "/exit", "/quit"
 ]
@@ -80,13 +82,40 @@ def setup_readline():
 
     atexit.register(lambda: readline.write_history_file(hist_file) if os.path.exists(hist_dir) else None)
 
+    import glob
+
     def completer(text, state):
-        options = [cmd for cmd in SLASH_COMMANDS if cmd.startswith(text)]
+        try:
+            line = readline.get_line_buffer()
+        except Exception:
+            line = text
+
+        # If at beginning of line and starts with /
+        if line.lstrip().startswith("/") and " " not in line.lstrip():
+            options = [cmd for cmd in SLASH_COMMANDS if cmd.startswith(text)]
+        else:
+            # File and directory path auto-completion
+            try:
+                expanded = os.path.expanduser(text)
+                raw_matches = glob.glob(expanded + "*")
+                options = []
+                for m in raw_matches:
+                    if os.path.isdir(m):
+                        options.append(m + "/")
+                    else:
+                        options.append(m)
+            except Exception:
+                options = []
+
         if state < len(options):
             return options[state]
         return None
 
     readline.set_completer(completer)
+    try:
+        readline.set_completer_delims(" \t\n`~!@#$%^&*()=+[{]}\\|;:\'\",<>?")
+    except Exception:
+        pass
     readline.parse_and_bind("tab: complete")
 
 def print_status_bar():
@@ -119,11 +148,13 @@ def print_help_menu():
     print(f"  {COLOR_CYAN}/search <关键字>{COLOR_RESET}    安全带预算搜索代码，避开数据库与冷归档")
     print(f"  {COLOR_CYAN}/sandbox <命令>{COLOR_RESET}     在 Bubblewrap 物理沙箱中运行命令")
     print(f"  {COLOR_CYAN}/tier <auto|fast|standard|deep>{COLOR_RESET} 切换当前任务推理档位")
+    print(f"  {COLOR_CYAN}/multiline, /paste{COLOR_RESET}   开启多行代码/文本粘贴模式 (输入 EOF 或 Ctrl+D 提交)")
     print(f"  {COLOR_CYAN}/clear{COLOR_RESET}              清屏")
     print(f"  {COLOR_CYAN}/exit, /quit{COLOR_RESET}        退出交互会话 (快捷键: Ctrl+D)\n")
-    print(f"  {COLOR_YELLOW}直接输入自然语言需求，即可自动触发全链路跨模型编码、审查与自愈！{COLOR_RESET}\n")
+    print(f"  {COLOR_YELLOW}提示: 支持行尾 '\\' 快速换行延续，或使用 \"\"\" 包裹多行代码。{COLOR_RESET}\n")
 
 def start_interactive_session(repo_trust: str = "trusted"):
+    from makewand.markdown import render_terminal_markdown
     setup_readline()
     print(BANNER)
     cwd = os.getcwd()
@@ -139,13 +170,37 @@ def start_interactive_session(repo_trust: str = "trusted"):
         try:
             # Clean, minimalist prompt matching Claude Code and Codex CLI
             prompt_str = f"\001{COLOR_CYAN}{COLOR_BOLD}\002>\001{COLOR_RESET}\002 "
-            user_input = input(prompt_str).strip()
+            first_line = input(prompt_str)
         except KeyboardInterrupt:
             print("\n")
             continue
         except EOFError:
             print(f"\n{COLOR_CYAN}退出 Makewand 会话。再见！{COLOR_RESET}")
             break
+
+        lines = [first_line]
+        cont_prompt = f"\001{COLOR_GRAY}\002... \001{COLOR_RESET}\002 "
+
+        # Handle line continuation via trailing backslash or unclosed triple quotes
+        while True:
+            cur_full = "\n".join(lines)
+            last = lines[-1].rstrip()
+            if last.endswith("\\"):
+                lines[-1] = last[:-1]
+                try:
+                    lines.append(input(cont_prompt))
+                    continue
+                except (KeyboardInterrupt, EOFError):
+                    break
+            if (cur_full.count('"""') % 2 == 1) or (cur_full.count("'''") % 2 == 1):
+                try:
+                    lines.append(input(cont_prompt))
+                    continue
+                except (KeyboardInterrupt, EOFError):
+                    break
+            break
+
+        user_input = "\n".join(lines).strip()
 
         if not user_input:
             continue
@@ -244,9 +299,29 @@ def start_interactive_session(repo_trust: str = "trusted"):
             print("\n" + format_observation_markdown(rep) + "\n")
             continue
 
+        elif lower in ("/multiline", "/paste"):
+            print(c("【多行输入模式】已开启：请在此输入或粘贴长文本，输入完毕后单独输入 'EOF' 或按 Ctrl+D 提交：", COLOR_CYAN))
+            paste_lines = []
+            while True:
+                try:
+                    pl = input(f"\001{COLOR_GRAY}\002... \001{COLOR_RESET}\002 ")
+                    if pl.strip() == "EOF":
+                        break
+                    paste_lines.append(pl)
+                except EOFError:
+                    print()
+                    break
+                except KeyboardInterrupt:
+                    print("\n" + c("已取消多行输入。", COLOR_YELLOW))
+                    paste_lines = []
+                    break
+            user_input = "\n".join(paste_lines).strip()
+            if not user_input:
+                continue
+
         # Check for identity queries or greetings to respond conversationally
         if is_identity_or_chit_chat(user_input):
-            print(f"\n{get_identity_message()}\n")
+            print("\n" + render_terminal_markdown(get_identity_message()) + "\n")
             continue
 
         # Regular natural language prompt -> run orchestrator pipeline!

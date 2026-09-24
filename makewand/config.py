@@ -22,6 +22,8 @@ COLOR_BLUE = "\033[94m"
 COLOR_CYAN = "\033[96m"
 COLOR_PURPLE = "\033[95m"
 COLOR_BOLD = "\033[1m"
+COLOR_DIM = "\033[2m"
+COLOR_GRAY = "\033[90m"
 COLOR_RESET = "\033[0m"
 
 def supports_color() -> bool:
