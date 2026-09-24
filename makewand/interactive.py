@@ -90,21 +90,23 @@ def setup_readline():
     readline.parse_and_bind("tab: complete")
 
 def print_status_bar():
+    from makewand.health import calculate_provider_quota
     cache = load_status_cache()
     def fmt(name, key):
         info = cache.get(key, {})
         st = info.get("status", "unknown")
+        quota = calculate_provider_quota(key, info)
+        pct = quota["percentage"]
         if st == "healthy":
-            return f"{COLOR_GREEN}🟢 {name}{COLOR_RESET}"
+            return f"{COLOR_GREEN}🟢 {name} {pct}%{COLOR_RESET}"
         elif st == "limited":
-            rst = info.get("resets_at", "限流")
-            return f"{COLOR_RED}🔴 {name} ({rst}){COLOR_RESET}"
+            return f"{COLOR_RED}🔴 {name} 0% (限流){COLOR_RESET}"
         elif st == "needs_auth":
             return f"{COLOR_YELLOW}🔑 {name} (需授权){COLOR_RESET}"
         else:
             return f"⚪ {name}"
 
-    bar = f"  状态: {fmt('AGY', 'agy')} | {fmt('Codex', 'codex')} | {fmt('Claude', 'claude')} | {fmt('Grok', 'grok')} | {fmt('Muse', 'muse')}"
+    bar = f"  状态: {fmt('AGY', 'agy')} | {fmt('Claude', 'claude')} | {fmt('Codex', 'codex')} | {fmt('Grok', 'grok')} | {fmt('Muse', 'muse')}"
     print(bar)
 
 def print_help_menu():
@@ -135,7 +137,8 @@ def start_interactive_session(repo_trust: str = "trusted"):
 
     while True:
         try:
-            prompt_str = f"{COLOR_CYAN}{COLOR_BOLD}makewand{COLOR_RESET} ({COLOR_YELLOW}{current_tier}{COLOR_RESET})> "
+            # Clean, minimalist prompt matching Claude Code and Codex CLI
+            prompt_str = f"\001{COLOR_CYAN}{COLOR_BOLD}\002>\001{COLOR_RESET}\002 "
             user_input = input(prompt_str).strip()
         except KeyboardInterrupt:
             print("\n")
