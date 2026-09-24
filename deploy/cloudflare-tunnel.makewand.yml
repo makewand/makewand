@@ -1,0 +1,34 @@
+# ==============================================================================
+# Cloudflare Tunnel Configuration for Makewand Dynamic Gateway & Web Console
+# Used to expose local `makewand serve` (default port 8080) safely to the public
+# ==============================================================================
+
+# Replace with your actual tunnel UUID generated via `cloudflared tunnel create makewand-gateway`
+tunnel: makewand-gateway
+credentials-file: /home/user/.cloudflared/makewand-gateway.json
+protocol: http2
+
+ingress:
+  # Web Console & Admin UI
+  - hostname: console.makewand.org
+    service: http://127.0.0.1:8080
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: true
+
+  # OpenAPI / Completions Gateway
+  - hostname: api.makewand.org
+    service: http://127.0.0.1:8080
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: true
+
+  # Alternate domain mapping
+  - hostname: console.makewand.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: true
+
+  # Fallback 404
+  - service: http_status:404

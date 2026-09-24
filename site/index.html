@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Makewand · 多模型编程订阅联合调度与红队自愈体系 (v3.1.0)</title>
+  <meta name="description" content="零额外 Token 成本，统合调度本地 Antigravity、Claude Code、Codex CLI、Grok、Muse 与全生态主流编程模型。动态拓扑感知、红队盲审、独立工作树沙箱与企业级网关。">
+  <meta name="keywords" content="Makewand, AI Orchestration, Claude Code, Codex CLI, Antigravity, Grok, Multi-Model, AI Pair Programming, Red-Team Audit, Zero Token Cost">
+  <meta property="og:title" content="Makewand · The Multi-Engine AI Orchestration Framework">
+  <meta property="og:description" content="零额外 Token 成本，统合调度本地主流 AI 编程工具与云端大模型，自主拓扑感知与红队自愈。">
+  <meta property="og:url" content="https://makewand.org">
+  <meta property="og:type" content="website">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header class="header">
+    <div class="container nav">
+      <a href="index.html" class="brand">
+        <img src="assets/favicon.svg" alt="Makewand Logo" class="brand-icon">
+        <span>Makewand</span>
+        <span class="badge">v3.1.0</span>
+      </a>
+
+      <ul class="nav-links">
+        <li><a href="#features" class="nav-link">核心特性</a></li>
+        <li><a href="#ecosystem" class="nav-link">工具生态</a></li>
+        <li><a href="#comparison" class="nav-link">能力对比</a></li>
+        <li><a href="docs.html" class="nav-link">技术文档</a></li>
+        <li><a href="https://github.com/makewand/makewand" target="_blank" class="nav-link">GitHub 源码</a></li>
+      </ul>
+
+      <div class="nav-cta">
+        <a href="docs.html" class="btn btn-outline btn-sm">快速上手</a>
+        <a href="https://github.com/makewand/makewand/releases/tag/v3.1.0" target="_blank" class="btn btn-primary btn-sm">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          下载 Release
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Section -->
+  <section class="hero">
+    <div class="container">
+      <div class="hero-pill">
+        <span class="badge badge-green">
+          <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-right:4px;"></span>
+          v3.1.0 正式发布：全生态主流编程工具自适应接入与拓扑感知
+        </span>
+      </div>
+
+      <h1 class="hero-title">
+        多模型编程订阅联合调度<br>
+        <span class="gradient-text">零 Token 成本 · 动态拓扑 · 红队自愈</span>
+      </h1>
+
+      <p class="hero-subtitle">
+        统合调度本地 <strong>Google Antigravity、Claude Code、Codex CLI、Grok Build、Muse Code</strong> 现有官方订阅，
+        无缝扩展 <strong>Aider、Cursor、DeepSeek、Qwen</strong>。按您已登录的工具自动组网，实现跨模型代码评审与物理隔离沙箱。
+      </p>
+
+      <div class="hero-actions">
+        <div class="install-box">
+          <span>$ curl -fsSL https://makewand.org/install.sh | bash</span>
+          <button class="copy-btn" data-copy="curl -fsSL https://makewand.org/install.sh | bash" title="复制一键安装命令">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
+
+        <a href="docs.html" class="btn btn-outline">
+          查阅使用文档 →
+        </a>
+      </div>
+
+      <!-- Interactive Terminal Simulator -->
+      <div class="terminal-wrapper">
+        <div class="terminal-header">
+          <div class="terminal-dots">
+            <span class="dot dot-red"></span>
+            <span class="dot dot-yellow"></span>
+            <span class="dot dot-green"></span>
+          </div>
+          <div class="terminal-tabs">
+            <button class="terminal-tab active" data-tab="run">makewand run</button>
+            <button class="terminal-tab" data-tab="review">makewand review</button>
+            <button class="terminal-tab" data-tab="race">makewand race</button>
+            <button class="terminal-tab" data-tab="observe">makewand observe</button>
+          </div>
+          <div style="font-size:0.8rem;color:var(--text-muted);font-family:var(--font-mono);">bash (interactive)</div>
+        </div>
+        <div class="terminal-body" id="terminalBody">
+          <!-- Populated by main.js -->
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Core Innovations Section -->
+  <section class="features" id="features">
+    <div class="container">
+      <div class="section-head">
+        <h2 class="section-title">为专业开发者打造的下一代 AI 编排体系</h2>
+        <p class="section-desc">告别单一模型视野盲区与昂贵 API 账单，榨干本地所有可用 AI 订阅能力。</p>
+      </div>
+
+      <div class="grid-3">
+        <!-- Feature 1 -->
+        <div class="card">
+          <div class="card-icon">⚡</div>
+          <h3 class="card-title">自适应动态拓扑引擎</h3>
+          <p class="card-desc">
+            开箱即检。提供 1 个工具则启动 Shadow Worktree 独立批判自省；提供 2 个及以上工具则自动组建异构互审网络，
+            从 0 到 15+ 工具全平滑缩放，永不硬编码限制。
+          </p>
+        </div>
+
+        <!-- Feature 2 -->
+        <div class="card">
+          <div class="card-icon">💰</div>
+          <h3 class="card-title">零额外 Token 订阅复用</h3>
+          <p class="card-desc">
+            直接复用您已开通的 Google AI Pro、Claude Max、Codex Pro 等官方专业订阅，
+            直接驱动本地 CLI 子进程，摆脱昂贵的商业 API 转发中介。
+          </p>
+        </div>
+
+        <!-- Feature 3 -->
+        <div class="card">
+          <div class="card-icon">🛡️</div>
+          <h3 class="card-title">物理隔离红队独立盲审</h3>
+          <p class="card-desc">
+            Primary 编码模型与 Review 审查模型在上下文和思维树上严格物理隔离，审查者只看 Git Diff 与代码逻辑，
+            彻底斩断“自写自测、自我圆谎”的思维盲区。
+          </p>
+        </div>
+
+        <!-- Feature 4 -->
+        <div class="card">
+          <div class="card-icon">🌿</div>
+          <h3 class="card-title">Git Worktree 沙箱防踩踏</h3>
+          <p class="card-desc">
+            所有改动在独立的临时 Git Worktree 中进行单测与验证，不碰主工作区未提交代码；
+            多会话并发执行与宿主机负载背压自适应控制，杜绝代码踩踏。
+          </p>
+        </div>
+
+        <!-- Feature 5 -->
+        <div class="card">
+          <div class="card-icon">🔄</div>
+          <h3 class="card-title">配额治理与自愈降级回环</h3>
+          <p class="card-desc">
+            实时感知各模型 24 小时配额消耗与限流状态（429）。遇到额度告罄自动降级至备选健康模型无缝接管，
+            保障长时间无人值守任务（/goal）稳定闭环。
+          </p>
+        </div>
+
+        <!-- Feature 6 -->
+        <div class="card">
+          <div class="card-icon">🏢</div>
+          <h3 class="card-title">企业级多租户与 Web 控制台</h3>
+          <p class="card-desc">
+            内置 OpenAI 兼容网关与 Web 管理后台（Playground、Token 配额鉴权、团队组织计费、审计日志），
+            支持 Docker、Systemd 与 Cloudflare Tunnel 一键部署。
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Supported Ecosystem Universe -->
+  <section class="ecosystem" id="ecosystem">
+    <div class="container">
+      <div class="section-head">
+        <h2 class="section-title">15+ 主流 AI 编程工具与大模型宇宙</h2>
+        <p class="section-desc">您提供几个，Makewand 就实际驱动几个。生态兼容并蓄，随时自由增减。</p>
+      </div>
+
+      <div class="filter-tabs">
+        <button class="filter-btn active" data-filter="all">全部支持 (15+)</button>
+        <button class="filter-btn" data-filter="cli">本地 CLI 订阅生态</button>
+        <button class="filter-btn" data-filter="api">云端主流 API 模型</button>
+        <button class="filter-btn" data-filter="local">本地离线私有模型</button>
+      </div>
+
+      <div class="tool-grid">
+        <!-- Claude -->
+        <div class="tool-card" data-category="cli">
+          <div class="tool-icon" style="color:#d97706;background:rgba(217,119,6,0.15);">C</div>
+          <div class="tool-info">
+            <h4>Claude Code</h4>
+            <p>Anthropic 官方 CLI (Claude 3.7 Sonnet / Opus)，擅长架构重构与深层逻辑理解。</p>
+            <span class="tool-badge badge-cli">CLI 订阅</span>
+          </div>
+        </div>
+
+        <!-- Codex -->
+        <div class="tool-card" data-category="cli">
+          <div class="tool-icon" style="color:#10b981;background:rgba(16,185,129,0.15);">X</div>
+          <div class="tool-info">
+            <h4>Codex CLI</h4>
+            <p>OpenAI 官方 CLI (gpt-6-astra / o3-mini)，算法精度极高，红队盲审中坚力量。</p>
+            <span class="tool-badge badge-cli">CLI 订阅</span>
+          </div>
+        </div>
+
+        <!-- Antigravity -->
+        <div class="tool-card" data-category="cli">
+          <div class="tool-icon" style="color:#06b6d4;background:rgba(6,182,212,0.15);">A</div>
+          <div class="tool-info">
+            <h4>Google Antigravity</h4>
+            <p>Google AI Pro (Gemini 3.8 Pro / Flash)，200万超大上下文与敏捷多 Agent 体系。</p>
+            <span class="tool-badge badge-cli">CLI 订阅</span>
+          </div>
+        </div>
+
+        <!-- Grok -->
+        <div class="tool-card" data-category="cli">
+          <div class="tool-icon" style="color:#a855f7;background:rgba(168,85,247,0.15);">G</div>
+          <div class="tool-info">
+            <h4>Grok Build CLI</h4>
+            <p>xAI Grok 4.7 架构，超高生成吞吐与敏捷调试响应，适合大规模竞速派发。</p>
+            <span class="tool-badge badge-cli">CLI 订阅</span>
+          </div>
+        </div>
+
+        <!-- Muse -->
+        <div class="tool-card" data-category="cli">
+          <div class="tool-icon" style="color:#ec4899;background:rgba(236,72,153,0.15);">M</div>
+          <div class="tool-info">
+            <h4>Muse Code</h4>
+            <p>本地深度调优推理引擎，专精测试驱动开发 (TDD) 与单元测试边界挖掘。</p>
+            <span class="tool-badge badge-cli">CLI 订阅</span>
+          </div>
+        </div>
+
+        <!-- Aider -->
+        <div class="tool-card" data-category="cli">
+          <div class="tool-icon" style="color:#38bdf8;background:rgba(56,189,248,0.15);">Ai</div>
+          <div class="tool-info">
+            <h4>Aider CLI</h4>
+            <p>经典终端 AI 配对编程利器，自动 Git 提交与 Repo-Map 代码图谱感知。</p>
+            <span class="tool-badge badge-cli">CLI 开源</span>
+          </div>
+        </div>
+
+        <!-- Cursor & Copilot -->
+        <div class="tool-card" data-category="cli">
+          <div class="tool-icon" style="color:#818cf8;background:rgba(129,140,248,0.15);">Cu</div>
+          <div class="tool-info">
+            <h4>Cursor / Copilot</h4>
+            <p>主流 IDE 伴侣协议映射，支持通过标准 CLI 代理捕获与协同调度。</p>
+            <span class="tool-badge badge-cli">IDE / CLI</span>
+          </div>
+        </div>
+
+        <!-- DeepSeek -->
+        <div class="tool-card" data-category="api">
+          <div class="tool-icon" style="color:#3b82f6;background:rgba(59,130,246,0.15);">D</div>
+          <div class="tool-info">
+            <h4>DeepSeek (V3 / R1)</h4>
+            <p>深度推理双引擎（Chat 与 Reasoner），极具性价比的云端独立审计方。</p>
+            <span class="tool-badge badge-api">Cloud API</span>
+          </div>
+        </div>
+
+        <!-- Qwen -->
+        <div class="tool-card" data-category="api">
+          <div class="tool-icon" style="color:#f97316;background:rgba(249,115,22,0.15);">Q</div>
+          <div class="tool-info">
+            <h4>Qwen (2.5-Coder / Max)</h4>
+            <p>通义千问专业代码大模型，卓越的多语言代码补全与复杂算法能力。</p>
+            <span class="tool-badge badge-api">Cloud API</span>
+          </div>
+        </div>
+
+        <!-- GLM & Kimi -->
+        <div class="tool-card" data-category="api">
+          <div class="tool-icon" style="color:#14b8a6;background:rgba(20,184,166,0.15);">GK</div>
+          <div class="tool-info">
+            <h4>GLM-4 / Kimi</h4>
+            <p>智谱 GLM-4 与月之暗面 Kimi 长文本大模型，长达百万 Token 的文档检索。</p>
+            <span class="tool-badge badge-api">Cloud API</span>
+          </div>
+        </div>
+
+        <!-- OpenRouter & SiliconFlow -->
+        <div class="tool-card" data-category="api">
+          <div class="tool-icon" style="color:#6366f1;background:rgba(99,102,241,0.15);">OS</div>
+          <div class="tool-info">
+            <h4>OpenRouter / 硅基流动</h4>
+            <p>聚合中继与一站式推理加速平台，数百种前沿开源模型自由随选随换。</p>
+            <span class="tool-badge badge-api">API Gateway</span>
+          </div>
+        </div>
+
+        <!-- Local Ollama / vLLM -->
+        <div class="tool-card" data-category="local">
+          <div class="tool-icon" style="color:#eab308;background:rgba(234,179,8,0.15);">L</div>
+          <div class="tool-info">
+            <h4>Ollama / vLLM (Local)</h4>
+            <p>完全离线私有化运行。配备智能休眠守卫，GPU 训练等重型任务运行时不抢占显存。</p>
+            <span class="tool-badge badge-local">本地离线</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Comparison Matrix -->
+  <section class="comparison-section" id="comparison">
+    <div class="container">
+      <div class="section-head">
+        <h2 class="section-title">全方位能力对比矩阵</h2>
+        <p class="section-desc">为什么真正的生产级工程需要 Makewand 联合调度？</p>
+      </div>
+
+      <div class="table-wrapper">
+        <table class="comp-table">
+          <thead>
+            <tr>
+              <th>核心能力与指标</th>
+              <th class="highlight">✨ Makewand 联合体系</th>
+              <th>单模型 AI CLI (如 Claude/Codex)</th>
+              <th>商业多模型网关 (如 OpenRouter)</th>
+              <th>开源通用 Agent 框架</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>额外 API Token 成本</strong></td>
+              <td class="highlight"><span class="check">0 额外花费</span>（直复用本机现有订阅）</td>
+              <td>0（仅限单一订阅工具）</td>
+              <td><span class="cross">昂贵</span>（按百万 Token 持续计费）</td>
+              <td>按 Token 计费</td>
+            </tr>
+            <tr>
+              <td><strong>多模型异构红队盲审</strong></td>
+              <td class="highlight"><span class="check">原生支持</span>（物理 Worktree 隔离）</td>
+              <td><span class="cross">不支持</span>（同上下文自我圆谎）</td>
+              <td>需手动多次拼凑调用</td>
+              <td>仅软件层 Prompt 模拟</td>
+            </tr>
+            <tr>
+              <td><strong>工具池自适应感知 (N=1~15+)</strong></td>
+              <td class="highlight"><span class="check">动态拓扑</span>（用户有几个就用几个）</td>
+              <td>单工具锁定</td>
+              <td>需用户逐个充值 API Key</td>
+              <td>固定配置硬编码</td>
+            </tr>
+            <tr>
+              <td><strong>物理 Worktree 隔离防踩踏</strong></td>
+              <td class="highlight"><span class="check">全自动沙箱</span>（带负载背压流控）</td>
+              <td>直接修改主代码区</td>
+              <td>无本地文件感知</td>
+              <td>简单读写覆盖</td>
+            </tr>
+            <tr>
+              <td><strong>额度耗尽 (429) 自愈降级</strong></td>
+              <td class="highlight"><span class="check">秒级自动分流接管</span></td>
+              <td><span class="cross">任务阻断中断</span></td>
+              <td>抛出 API 错误</td>
+              <td>需手动重启调试</td>
+            </tr>
+            <tr>
+              <td><strong>企业级 Web 管理控制台</strong></td>
+              <td class="highlight"><span class="check">内置</span>（Playground/用户/Token/审计）</td>
+              <td>仅终端交互</td>
+              <td>提供基础后台</td>
+              <td>通常需自建前端</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA Box -->
+  <section class="cta-section">
+    <div class="container">
+      <div class="cta-box">
+        <h2 style="font-size:2.4rem;font-weight:800;margin-bottom:16px;">立即开启多模型协同编程新范式</h2>
+        <p style="color:var(--text-secondary);font-size:1.15rem;margin-bottom:36px;max-width:640px;margin-left:auto;margin-right:auto;">
+          支持 Linux, macOS, WSL。一键安装脚本，自动检测本机订阅工具，即刻赋能跨模型红队审查与并发竞速。
+        </p>
+
+        <div style="display:flex;align-items:center;justify-content:center;gap:16px;flex-wrap:wrap;">
+          <div class="install-box">
+            <span>curl -fsSL https://makewand.org/install.sh | bash</span>
+            <button class="copy-btn" data-copy="curl -fsSL https://makewand.org/install.sh | bash" title="复制">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <a href="docs.html" class="btn btn-primary">查阅完整开发文档</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-col">
+          <div class="brand" style="margin-bottom:16px;">
+            <img src="assets/favicon.svg" alt="Makewand Logo" class="brand-icon">
+            <span>Makewand</span>
+          </div>
+          <p style="font-size:0.9rem;color:var(--text-muted);max-width:320px;line-height:1.6;">
+            零额外成本的多模型 AI 订阅联合调度与红队自愈体系。由开源社区驱动，面向未来的下一代 AI 编程编排体系。
+          </p>
+          <div style="margin-top:16px;display:flex;gap:12px;">
+            <span class="badge" style="background:rgba(255,255,255,0.05);color:var(--text-secondary);border:1px solid var(--border-subtle);">
+              Cloudflare Edge Protected
+            </span>
+            <span class="badge" style="background:rgba(255,255,255,0.05);color:var(--text-secondary);border:1px solid var(--border-subtle);">
+              MIT Licensed
+            </span>
+          </div>
+        </div>
+
+        <div class="footer-col">
+          <h5>产品与生态</h5>
+          <ul class="footer-links">
+            <li><a href="#features">核心特性</a></li>
+            <li><a href="#ecosystem">支持工具矩阵</a></li>
+            <li><a href="#comparison">架构能力对比</a></li>
+            <li><a href="https://github.com/makewand/makewand/releases" target="_blank">版本发布日志</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h5>文档与指南</h5>
+          <ul class="footer-links">
+            <li><a href="docs.html#quickstart">快速开始</a></li>
+            <li><a href="docs.html#cli">CLI 命令参考</a></li>
+            <li><a href="docs.html#topology">自适应拓扑引擎</a></li>
+            <li><a href="docs.html#cloudflare">Cloudflare 部署指南</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h5>开源与支持</h5>
+          <ul class="footer-links">
+            <li><a href="https://github.com/makewand/makewand" target="_blank">GitHub Repository</a></li>
+            <li><a href="https://github.com/makewand/makewand/issues" target="_blank">问题反馈 (Issues)</a></li>
+            <li><a href="https://makewand.org" target="_blank">makewand.org</a></li>
+            <li><a href="https://makewand.com" target="_blank">makewand.com</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom">
+        <div>© 2026 Makewand Project. Released under the MIT License.</div>
+        <div style="display:flex;gap:16px;">
+          <a href="https://makewand.org">makewand.org</a>
+          <span>·</span>
+          <a href="https://makewand.com">makewand.com</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

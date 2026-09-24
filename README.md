@@ -1,13 +1,21 @@
-# Makewand (魔杖) v3.0
+# Makewand (魔杖) v3.1.0
 
-> **零成本多模型 AI 订阅联合调度系统** (Unified Multi-Model Subscription Orchestrator)  
-> 统合调用本机 **Antigravity (Google AI Pro)**、**Claude Code**、**Codex CLI (OpenAI)** 与 **Muse Code (Meta)** 订阅，实现额度自适应、跨模型红队盲审、自愈回环与双模型并发竞速。
+> **多模型编程订阅联合调度与红队自愈体系** (Unified Multi-Model Subscription Orchestrator)  
+> 官方网站：[https://makewand.org](https://makewand.org) · 备用镜像：[https://makewand.com](https://makewand.com)  
+> 统合调用本机 **Antigravity (Google AI Pro)**、**Claude Code**、**Codex CLI (OpenAI)**、**Grok Build**、**Muse Code** 与全生态主流编程模型（15+ 工具动态拓扑感知），实现零额外 Token 成本、跨模型红队盲审、自愈回环与并发竞速。
+
+```bash
+# 🚀 官方一键快速安装
+curl -fsSL https://makewand.org/install.sh | bash
+```
 
 ---
 
 ## 🌟 核心特性 (Key Features)
 
-- **💰 零额外 Token 计费**：完全基于本机已订阅的官方 CLI 工具（`agy`、`claude`、`codex`、`muse`），不产生第三方 API 扣费。
+- **🌐 官方网站与文档中心**：托管于 Cloudflare Pages 全球边缘网络（[makewand.org](https://makewand.org) / [makewand.com](https://makewand.com)），提供交互式终端模拟器与完整手册。
+- **🔌 全生态工具自适应拓扑**：动态感知用户已登录的工具池（用户配置几个就使用几个，N>=2 启动异构交叉互审，N=1 启动 Shadow Worktree 独立批判自省）。
+- **💰 零额外 Token 计费**：完全基于本机已订阅的官方 CLI 工具（`agy`、`claude`、`codex`、`muse`、`grok`），不产生第三方 API 扣费。
 - **⚡ 额度感知与自适应降级 (Quota-Aware Routing)**：
   - 自动检测各订阅的 5小时/每周额度与限流状态，精准识别解封重置时间。
   - 当主力模型（如 Claude）达到使用上限时，秒级自动降级至备用健康模型（Codex / Muse / Antigravity），确保任务不中断。

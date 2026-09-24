@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>技术文档 · Makewand 开发者手册 (v3.1.0)</title>
+  <meta name="description" content="Makewand 开发者手册与架构指南：CLI 命令参考、动态拓扑架构、多模型红队盲审、企业级网关与 Cloudflare 部署。">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    .docs-layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 48px;
+      padding: 48px 0 100px;
+    }
+    .docs-sidebar {
+      position: sticky;
+      top: 100px;
+      height: fit-content;
+      border-right: 1px solid var(--border-subtle);
+      padding-right: 24px;
+    }
+    .sidebar-group {
+      margin-bottom: 28px;
+    }
+    .sidebar-title {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+      font-weight: 700;
+    }
+    .sidebar-links {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .sidebar-link {
+      color: var(--text-secondary);
+      font-size: 0.92rem;
+      display: block;
+      padding: 6px 10px;
+      border-radius: var(--radius-sm);
+    }
+    .sidebar-link:hover, .sidebar-link.active {
+      color: var(--text-primary);
+      background: rgba(255, 255, 255, 0.05);
+    }
+    .docs-content {
+      max-width: 860px;
+    }
+    .docs-section {
+      margin-bottom: 64px;
+      scroll-margin-top: 100px;
+    }
+    .docs-h1 {
+      font-size: 2.4rem;
+      font-weight: 800;
+      margin-bottom: 16px;
+      letter-spacing: -0.03em;
+    }
+    .docs-h2 {
+      font-size: 1.7rem;
+      font-weight: 700;
+      margin: 40px 0 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+    .docs-h3 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 24px 0 12px;
+      color: #38bdf8;
+    }
+    .docs-p {
+      color: var(--text-secondary);
+      font-size: 1.02rem;
+      line-height: 1.75;
+      margin-bottom: 16px;
+    }
+    .code-block {
+      background: #060913;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 18px;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      color: #e2e8f0;
+      overflow-x: auto;
+      margin: 16px 0 24px;
+      line-height: 1.6;
+    }
+    .note-box {
+      background: rgba(59, 130, 246, 0.08);
+      border-left: 4px solid var(--accent-blue);
+      padding: 16px 20px;
+      border-radius: 0 var(--radius-md) var(--radius-md) 0;
+      margin: 20px 0;
+      font-size: 0.95rem;
+      color: #93c5fd;
+    }
+    .success-box {
+      background: rgba(16, 185, 129, 0.08);
+      border-left: 4px solid var(--accent-emerald);
+      padding: 16px 20px;
+      border-radius: 0 var(--radius-md) var(--radius-md) 0;
+      margin: 20px 0;
+      font-size: 0.95rem;
+      color: #6ee7b7;
+    }
+    @media (max-width: 900px) {
+      .docs-layout { grid-template-columns: 1fr; }
+      .docs-sidebar { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header class="header">
+    <div class="container nav">
+      <a href="index.html" class="brand">
+        <img src="assets/favicon.svg" alt="Makewand Logo" class="brand-icon">
+        <span>Makewand</span>
+        <span class="badge">Docs</span>
+      </a>
+
+      <ul class="nav-links">
+        <li><a href="index.html#features" class="nav-link">首页</a></li>
+        <li><a href="docs.html" class="nav-link active">文档中心</a></li>
+        <li><a href="https://github.com/makewand/makewand" target="_blank" class="nav-link">GitHub</a></li>
+        <li><a href="https://github.com/makewand/makewand/releases/tag/v3.1.0" target="_blank" class="nav-link">v3.1.0</a></li>
+      </ul>
+
+      <div class="nav-cta">
+        <a href="https://makewand.org" class="btn btn-outline btn-sm">返回官网</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="container docs-layout">
+    <!-- Sidebar Navigation -->
+    <aside class="docs-sidebar">
+      <div class="sidebar-group">
+        <div class="sidebar-title">开始使用</div>
+        <ul class="sidebar-links">
+          <li><a href="#quickstart" class="sidebar-link active">快速上手</a></li>
+          <li><a href="#installation" class="sidebar-link">环境安装与依赖</a></li>
+          <li><a href="#topology" class="sidebar-link">自适应动态拓扑</a></li>
+        </ul>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-title">CLI 核心命令</div>
+        <ul class="sidebar-links">
+          <li><a href="#cli-run" class="sidebar-link">makewand run</a></li>
+          <li><a href="#cli-review" class="sidebar-link">makewand review</a></li>
+          <li><a href="#cli-race" class="sidebar-link">makewand race</a></li>
+          <li><a href="#cli-observe" class="sidebar-link">makewand observe</a></li>
+          <li><a href="#cli-serve" class="sidebar-link">makewand serve (网关)</a></li>
+        </ul>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-title">部署与 Cloudflare</div>
+        <ul class="sidebar-links">
+          <li><a href="#cloudflare-pages" class="sidebar-link">Cloudflare Pages 托管</a></li>
+          <li><a href="#cloudflare-domains" class="sidebar-link">双域名绑定 (.org / .com)</a></li>
+          <li><a href="#cloudflare-tunnel" class="sidebar-link">Cloudflare Tunnel 穿透</a></li>
+          <li><a href="#docker-systemd" class="sidebar-link">Docker 与 Systemd 守护</a></li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="docs-content">
+      <!-- Section: Quickstart -->
+      <section class="docs-section" id="quickstart">
+        <h1 class="docs-h1">Makewand 快速上手指南</h1>
+        <p class="docs-p">
+          Makewand 是一套零额外 Token 成本的跨模型编程编排系统。它能够自适应感知您本地已安装、登录或配置的 AI 编程工具，
+          并在物理隔离的 Git Worktree 中进行协同编码、异构红队盲审、自愈回环与并发竞速。
+        </p>
+
+        <div class="note-box">
+          <strong>核心哲学：</strong> 用户登录或者提供了几个工具，系统就实际使用几个工具。无需强制用户购买额外的通用 API Token，直接榨干本地订阅（Google AI Pro, Claude Max, Codex Pro, Grok 等）。
+        </div>
+
+        <h2 class="docs-h2" id="installation">环境安装与依赖</h2>
+        <p class="docs-p">支持 Linux、macOS 与 Windows (WSL2)。</p>
+
+        <div class="code-block">
+# 方式一：一键自动安装脚本（推荐）
+curl -fsSL https://makewand.org/install.sh | bash
+
+# 方式二：通过 Git 源码检出安装
+git clone https://github.com/makewand/makewand.git
+cd makewand
+pip install -e .
+        </div>
+
+        <p class="docs-p">安装完成后，运行环境自检：</p>
+        <div class="code-block">
+$ makewand
+# 输出工具池状态表格：
+# 🟢 已激活可用工具池 (Active Providers): [claude, codex, agy, grok, muse]
+# ⚪ 待接入主流工具生态 (Standby Ecosystem): [aider, cursor, deepseek, qwen, ...]
+        </div>
+      </section>
+
+      <!-- Section: Dynamic Topology -->
+      <section class="docs-section" id="topology">
+        <h2 class="docs-h2">自适应动态拓扑感知 (Dynamic Topology)</h2>
+        <p class="docs-p">
+          Makewand 会实时探测当前环境（检查 CLI 可执行路径、环境变量、认证配置），动态计算活跃工具集合 <code>active_pool</code>：
+        </p>
+        <ul style="color:var(--text-secondary);margin-left:24px;margin-bottom:16px;line-height:1.8;">
+          <li><strong>N &ge; 2（异构多模型就绪）</strong>：自动启用 <em>Heterogeneous Cross-Model Review Mode</em>。主编码器写完后，自动唤起第二异构模型执行独立红队盲审并回环修复。</li>
+          <li><strong>N = 1（单一模型可用）</strong>：自动启用 <em>Resilient Single-Tool Mode</em>。创建独立的 Shadow Worktree，切换至对抗性 Prompt 提示词进行自我批判与极端边界排查。</li>
+          <li><strong>N = 0（无可用工具）</strong>：输出友好的工具接入引导与配置提示，绝不静默崩溃。</li>
+        </ul>
+
+        <div class="success-box">
+          <strong>保护机制：</strong> 本地重型模型 <code>local</code> (Ollama/vLLM) 默认关闭。当主机存在 GPU 训练等关键计算任务时，绝不发生显存与算力争抢。
+        </div>
+      </section>
+
+      <!-- Section: CLI Reference -->
+      <section class="docs-section" id="cli-run">
+        <h2 class="docs-h2">CLI 核心命令指南</h2>
+
+        <h3 class="docs-h3">1. makewand run · 智能编排流水线</h3>
+        <p class="docs-p">驱动主编码器实现功能，并在沙箱中完成单元测试与异构审核：</p>
+        <div class="code-block">
+# 自动选择最适合的模型
+makewand run "重构用户认证模块，加入 ed25519 签名验证"
+
+# 显式指定编码方与审查方
+makewand run "优化 SQL 慢查询" --provider claude --review-by codex
+
+# 指定算力梯队 (fast / standard / deep / max)
+makewand run "攻坚死锁问题" --tier deep
+        </div>
+
+        <h3 class="docs-h3" id="cli-review">2. makewand review · 独立红队安全盲审</h3>
+        <p class="docs-p">
+          在完全独立的 Git Worktree 中执行红队审查，审查模型仅接收 Git Diff 与逻辑约束，杜绝原作者上下文偏见：
+        </p>
+        <div class="code-block">
+# 对当前工作区未提交改动进行红队审计
+makewand review --provider codex
+
+# 针对指定敏感文件审计并自动生成修复建议
+makewand review --provider codex --target src/auth_engine.py
+        </div>
+
+        <h3 class="docs-h3" id="cli-race">3. makewand race · 多模型并发沙箱竞速</h3>
+        <p class="docs-p">
+          为两个或更多模型分别克隆独立的 Worktree 沙箱，并发派发相同需求，由客观测试套件（通过率、吞吐量、代码行数）择优采用：
+        </p>
+        <div class="code-block">
+makewand race "实现高并发内存环形缓冲区" --models claude,codex
+        </div>
+
+        <h3 class="docs-h3" id="cli-observe">4. makewand observe · 跨会话态势巡检</h3>
+        <p class="docs-p">
+          多终端开发时，一键巡检主机上所有活跃的 AI 会话（Tmux 与独立 TTY），精准分型长耗时任务、CI 测试、常驻服务与额度枯竭状态：
+        </p>
+        <div class="code-block">
+makewand observe
+# 支持自动输出 Markdown 或 JSON 格式，无缝集成进 CI/CD 或监控大屏
+        </div>
+
+        <h3 class="docs-h3" id="cli-serve">5. makewand serve · 企业级网关与 Web 控制台</h3>
+        <p class="docs-p">
+          启动企业级 OpenAI 兼容 HTTP 网关与内置管理后台：
+        </p>
+        <div class="code-block">
+makewand serve --listen 0.0.0.0:8080 --enable-users
+# 访问 http://localhost:8080/admin 即可进入现代化 Web UI 管理后台
+        </div>
+      </section>
+
+      <!-- Section: Cloudflare Deployment -->
+      <section class="docs-section" id="cloudflare-pages">
+        <h2 class="docs-h2">Cloudflare 部署实战指南</h2>
+        <p class="docs-p">
+          针对注册在 Cloudflare 的 <code>makewand.org</code> 与 <code>makewand.com</code>，推荐采用“静态前端走 Cloudflare Pages + 动态网关走 Cloudflare Tunnel”的黄金架构。
+        </p>
+
+        <h3 class="docs-h3" id="cloudflare-domains">1. Cloudflare Pages 静态站部署 (官网与文档)</h3>
+        <p class="docs-p">本项目 <code>site/</code> 目录为纯静态、极速现代前端，具备自动 SEO、安全 Headers 与暗色 Glassmorphism 设计：</p>
+        <div class="code-block">
+# 一键通过 Wrangler 部署到 Cloudflare Pages
+npx wrangler pages deploy site/ --project-name=makewand --branch=master
+
+# 部署成功后，在 Cloudflare 控制台中为该 Pages 项目添加自定义域名：
+# 1. makewand.org (主域名)
+# 2. www.makewand.org (子域名)
+# 3. makewand.com (商业镜像或设置 301 重定向至 makewand.org)
+        </div>
+
+        <h3 class="docs-h3" id="cloudflare-tunnel">2. Cloudflare Tunnel 穿透配置 (管理后台与 API)</h3>
+        <p class="docs-p">
+          如果您希望将本机运行的 <code>makewand serve</code> (8080端口) 安全映射到公网（如 <code>console.makewand.org</code> 或 <code>api.makewand.org</code>），无需公网 IP 和复杂端口映射：
+        </p>
+        <div class="code-block">
+# 创建隧道
+cloudflared tunnel create makewand-gateway
+
+# 配置 ingress 映射 (例如 deploy/cloudflare-tunnel.yml)
+tunnel: &lt;tunnel-uuid&gt;
+credentials-file: ~/.cloudflared/&lt;tunnel-uuid&gt;.json
+
+ingress:
+  - hostname: console.makewand.org
+    service: http://localhost:8080
+  - hostname: api.makewand.org
+    service: http://localhost:8080
+  - service: http_status:404
+
+# 绑定 Cloudflare DNS 路由并启动守护服务
+cloudflared tunnel route dns makewand-gateway console.makewand.org
+cloudflared tunnel run makewand-gateway
+        </div>
+
+        <h3 class="docs-h3" id="docker-systemd">3. Docker 与 Systemd 生产常驻</h3>
+        <p class="docs-p">
+          生产环境下，可通过项目自带的 <code>deploy/systemd.makewand.service</code> 或 <code>deploy/docker-compose.yml</code> 进行自动化常驻保活与日志轮转。
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container footer-bottom">
+      <div>© 2026 Makewand Project. Released under the MIT License.</div>
+      <div>
+        <a href="https://makewand.org">makewand.org</a> · <a href="https://makewand.com">makewand.com</a>
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>
