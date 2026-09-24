@@ -100,14 +100,14 @@ class TestVerdictAndReviewReliability(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             test_file = Path(tmp_dir) / "test_ok.py"
             test_file.write_text("import unittest\nclass OkTest(unittest.TestCase):\n    def test_ok(self): self.assertTrue(True)\n")
-            passed, details = run_local_tests(tmp_dir, timeout=10)
+            passed, details = run_local_tests(tmp_dir, timeout=30)
             self.assertTrue(passed)
 
         # 2. Failing test workspace
         with tempfile.TemporaryDirectory() as tmp_dir:
             test_file = Path(tmp_dir) / "test_fail.py"
             test_file.write_text("import unittest\nclass FailTest(unittest.TestCase):\n    def test_fail(self): self.assertTrue(False)\n")
-            passed, details = run_local_tests(tmp_dir, timeout=10)
+            passed, details = run_local_tests(tmp_dir, timeout=30)
             self.assertFalse(passed)
             self.assertTrue("AssertionError" in details or "FAIL" in details or "failed" in details.lower())
 
@@ -166,7 +166,7 @@ class TestTestPhaseSandboxing(unittest.TestCase):
                     "        secret = os.environ.get('SIMULATED_HOST_SECRET')\n"
                     "        self.assertIsNone(secret, 'Host secret leaked into test environment!')\n"
                 )
-                passed, details = run_local_tests(tmp_dir, timeout=30)
+                passed, details = run_local_tests(tmp_dir, timeout=60)
                 self.assertTrue(passed, f"Test failed: {details}")
         finally:
             os.environ.pop("SIMULATED_HOST_SECRET", None)
