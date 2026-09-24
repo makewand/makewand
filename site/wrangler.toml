@@ -1,0 +1,9 @@
+# Cloudflare Pages configuration for Makewand official site
+name = "makewand"
+compatibility_date = "2026-09-24"
+pages_build_output_dir = "."
+
+[vars]
+ENVIRONMENT = "production"
+DEFAULT_DOMAIN = "makewand.org"
+SECONDARY_DOMAIN = "makewand.com"
