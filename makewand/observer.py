@@ -384,6 +384,9 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
         elif any(k in args_str for k in ("build_snapshot", "train", "dataset", "stage_and_phash", "preprocess", "download", "pipeline")) or \
              ("pipeline" in session_name and ("python" in long_proc["comm"] or "build" in args_str)):
             return "data_pipeline", f"大规模数据流水线/模型训练进行中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
+        elif any(k in args_str for k in ("serve", "server", "uvicorn", "gunicorn", "dashboard", "http.server", "flask", "fastapi", "streamlit", "gradio", "webpack", "vite")) or \
+             any(k in long_proc["comm"].lower() for k in ("uvicorn", "gunicorn", "caddy", "nginx")):
+            return "server_daemon", f"后台服务/仪表盘运行中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
         elif elapsed_min >= 30:
             return "hung_anomaly", f"子进程 (PID {long_proc['pid']}, {long_proc['comm']}) 持续运行达 {elapsed_min} 分钟"
 
@@ -614,6 +617,7 @@ def format_observation_markdown(report):
         "quota_exhausted": "⚠️ 额度已见底",
         "test_ci": "🔵 测试中",
         "data_pipeline": "🟣 数据流水线",
+        "server_daemon": "🟢 服务运行中",
         "code_refactor": "🟣 代码重构",
         "sys_monitor": "🟢 监控待命",
         "idle_ready": "🟢 就绪空闲",
