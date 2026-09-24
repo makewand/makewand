@@ -147,6 +147,7 @@ def print_help_menu():
     print(f"  {COLOR_CYAN}/race <任务>{COLOR_RESET}        在隔离临时沙箱中并发派发两组模型竞速比拼")
     print(f"  {COLOR_CYAN}/search <关键字>{COLOR_RESET}    安全带预算搜索代码，避开数据库与冷归档")
     print(f"  {COLOR_CYAN}/sandbox <命令>{COLOR_RESET}     在 Bubblewrap 物理沙箱中运行命令")
+    print(f"  {COLOR_CYAN}/observe{COLOR_RESET}            全局跨终端/tmux 活跃 AI 会话与系统分型巡检")
     print(f"  {COLOR_CYAN}/tier <auto|fast|standard|deep>{COLOR_RESET} 切换当前任务推理档位")
     print(f"  {COLOR_CYAN}/multiline, /paste{COLOR_RESET}   开启多行代码/文本粘贴模式 (输入 EOF 或 Ctrl+D 提交)")
     print(f"  {COLOR_CYAN}/clear{COLOR_RESET}              清屏")
