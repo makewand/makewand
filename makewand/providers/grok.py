@@ -103,7 +103,7 @@ def execute_grok_task(
 
     cmd = ["grok", "-p", prompt, "--output-format", "plain"]
     if readonly:
-        cmd.extend(["--permission-mode", "plan", "--max-turns", "10"])
+        cmd.extend(["--permission-mode", "plan", "--max-turns", "25"])
     else:
         cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions"])
 
