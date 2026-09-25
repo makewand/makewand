@@ -272,6 +272,8 @@ def wrap_bwrap(
         "--setenv", "HOME", user_home,
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "MAKEWAND_SANDBOX", "1",
+        "--setenv", "PAGER", "cat",
+        "--setenv", "CI", "1",
     ])
 
     if readonly:
@@ -281,7 +283,7 @@ def wrap_bwrap(
     # pass provider API variables ONLY tailored to the active provider when is_provider is True
     SAFE_PASSTHROUGH_ENVS = [
         "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
-        "NODE_PATH", "PYTHONPATH"
+        "NODE_PATH", "PYTHONPATH", "PAGER"
     ]
     if allow_network:
         SAFE_PASSTHROUGH_ENVS.extend([
