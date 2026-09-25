@@ -89,8 +89,6 @@ def execute_agy_task(
         "--dangerously-skip-permissions",
         "--disable-slash-commands"
     ]
-    if readonly:
-        cmd.extend(["--mode", "plan"])
 
     if model:
         cmd.extend(["--model", model])
