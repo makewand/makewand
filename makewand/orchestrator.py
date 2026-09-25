@@ -811,13 +811,14 @@ def select_optimal_engine_pair(
     # 2. Sliding Window Quota Burn-Rate Adjustment
     try:
         from makewand.usage import get_burn_rate_penalty
+        is_explain_query = (classify_prompt_intent(prompt) == "explain")
         for model_name in list(scores.keys()):
             if scores[model_name] > 0:
                 pen, pen_reason = get_burn_rate_penalty(model_name)
                 if pen != 0.0:
-                    if boost:
-                        # Explicit user boost: skip all soft penalties
-                        if pen_reason:
+                    if boost or is_explain_query:
+                        # Explicit user boost or read-only explanation: skip all soft penalties
+                        if pen_reason and boost:
                             reasons.append(f"{model_name.upper()} {pen_reason} [已由用户 --boost 强制穿透豁免]")
                         pen = 0.0
                     elif tier == "deep" and pen > -2.5:
@@ -846,7 +847,10 @@ def select_optimal_engine_pair(
         if model_name not in active_pool:
             scores[model_name] = -999.0
             continue
-        status = cache.get(model_name, {}).get("status", "unknown")
+        if cache and model_name not in cache:
+            status = "missing"
+        else:
+            status = cache.get(model_name, {}).get("status", "unknown")
         api_ok = has_api_configured(model_name)
         if status == "limited":
             if api_ok:
@@ -896,7 +900,10 @@ def select_optimal_engine_pair(
         if model_name not in active_pool:
             reviewer_base_scores[model_name] = -999.0
             continue
-        status = cache.get(model_name, {}).get("status", "unknown")
+        if cache and model_name not in cache:
+            status = "missing"
+        else:
+            status = cache.get(model_name, {}).get("status", "unknown")
         api_ok = has_api_configured(model_name)
         if status in ("limited", "needs_auth", "missing"):
             if api_ok and model_name not in ("local", "ollama"):
@@ -1019,7 +1026,7 @@ def run_pipeline(
 
         if not is_safe:
             print(c(f"🛡️ [Makewand Multi-Session Guard] {conflict_msg}！", COLOR_YELLOW + COLOR_BOLD))
-            print(c("   依从 P920 工作树隔离铁律，自动切换为独立影子工作树进行开发与审查...", COLOR_YELLOW))
+            print(c("   依从多会话与脏工作区隔离安全策略，自动切换为独立影子工作树进行开发与审查...", COLOR_YELLOW))
             try:
                 shadow_res = create_ephemeral_shadow_worktree(cwd, prefix="guard")
                 shadow_worktree_dir, shadow_branch, cleanup_shadow = shadow_res[0], shadow_res[1], shadow_res[2]
@@ -1034,12 +1041,15 @@ def run_pipeline(
                 return False
 
     initial_untracked_files = set()
+    initial_dirty = False
     if not is_shadow_active and cwd:
         try:
             _, init_status, _ = run_git_cmd(["git", "status", "--porcelain", "-uall", "--ignored"], cwd=cwd)
             for line in init_status.splitlines():
                 if line.startswith("?? ") or line.startswith("!! "):
                     initial_untracked_files.add(line[3:].strip().strip('"'))
+                elif line.strip():
+                    initial_dirty = True
         except Exception:
             pass
 
@@ -1059,9 +1069,13 @@ def run_pipeline(
                     rej_dir.mkdir(parents=True, exist_ok=True)
                     (rej_dir / "rejected.patch").write_text(d_out, encoding="utf-8")
 
-                run_git_cmd(["git", "reset", "HEAD"], cwd=cwd)
-                run_git_cmd(["git", "restore", "."], cwd=cwd)
-                run_git_cmd(["git", "checkout", "--", "."], cwd=cwd)
+                if not initial_dirty:
+                    run_git_cmd(["git", "reset", "HEAD"], cwd=cwd)
+                    run_git_cmd(["git", "restore", "."], cwd=cwd)
+                    run_git_cmd(["git", "checkout", "--", "."], cwd=cwd)
+                else:
+                    print(c("🛡️ [Makewand Safety] 检测到宿主原有未提交改动，保留现场不执行破坏性 reset/checkout。", COLOR_YELLOW))
+
                 # Clean only untracked or ignored files newly created during this task execution
                 _, curr_status, _ = run_git_cmd(["git", "status", "--porcelain", "-uall", "--ignored"], cwd=cwd)
                 for line in curr_status.splitlines():
@@ -1073,7 +1087,7 @@ def run_pipeline(
                                 target_p.unlink(missing_ok=True)
                             elif target_p.is_dir():
                                 shutil.rmtree(target_p, ignore_errors=True)
-                print(c(f"🛡️ [Makewand Transaction] 已自动回滚未通过门禁的未提交代码修改，工作区已恢复基线。", COLOR_YELLOW))
+                print(c(f"🛡️ [Makewand Transaction] 已自动维护未通过门禁的代码，工作区已恢复基线安全。", COLOR_YELLOW))
             except Exception:
                 pass
         print(c(msg, COLOR_RED + COLOR_BOLD))
@@ -1082,45 +1096,25 @@ def run_pipeline(
     if intent == "explain":
         print(c(f"💡 Makewand 意图识别: 技术问答/解释模式 '{prompt}' (推理档位: {tier}, 只读安全隔离)", COLOR_BOLD + COLOR_GREEN))
         cache = get_or_update_status(force_probe=False)
-        c_status = cache.get("claude", {}).get("status")
-        x_status = cache.get("codex", {}).get("status")
-        g_status = cache.get("grok", {}).get("status")
-        m_status = cache.get("muse", {}).get("status")
-
-        step_timeout = get_remaining_timeout(timeout)
-        if step_timeout <= 0:
-            print(c("❌ [Makewand Budget] 全局流水线预算已耗尽，终止问答执行。", COLOR_RED + COLOR_BOLD))
-            return False
+        available_coders, _, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
+        primary_c = route_meta.get("primary_coder") or (available_coders[0] if available_coders else "claude")
+        sorted_engines = available_coders if available_coders else ["claude", "codex", "grok", "agy", "muse"]
+        print(c(f"🎯 [Makewand Smart Routing] 技术解释优先指派引擎: {primary_c.upper()} (候选梯队: {' -> '.join(e.upper() for e in sorted_engines)})", COLOR_CYAN))
 
         qa_output = None
-        if c_status != "limited":
-            success, out, err = execute_claude_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
-            if success:
+        for eng in sorted_engines:
+            step_timeout = get_remaining_timeout(timeout)
+            if step_timeout <= 0:
+                print(c("❌ [Makewand Budget] 全局流水线预算已耗尽，终止问答执行。", COLOR_RED + COLOR_BOLD))
+                return False
+            ok, out, err = dispatch_task(
+                eng, prompt, cwd=cwd, timeout=step_timeout, tier=tier,
+                model=model, stream=stream, readonly=True, repo_trust=repo_trust
+            )
+            if ok and out and out.strip():
                 qa_output = out
-        if qa_output is None and x_status != "limited":
-            step_timeout = get_remaining_timeout(timeout)
-            if step_timeout > 0:
-                success, out, err = execute_codex_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
-                if success:
-                    qa_output = out
-        if qa_output is None and g_status not in ["limited", "needs_auth", "missing"]:
-            step_timeout = get_remaining_timeout(timeout)
-            if step_timeout > 0:
-                success, out, err = execute_grok_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
-                if success:
-                    qa_output = out
-        if qa_output is None and m_status not in ["limited", "needs_auth", "missing"]:
-            step_timeout = get_remaining_timeout(timeout)
-            if step_timeout > 0:
-                success, out, err = execute_muse_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
-                if success:
-                    qa_output = out
-        if qa_output is None:
-            step_timeout = get_remaining_timeout(timeout)
-            if step_timeout > 0:
-                success, out, err = execute_agy_task(prompt, cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream, readonly=True, repo_trust=repo_trust)
-                if success:
-                    qa_output = out
+                break
+
         if qa_output and not stream:
             print(qa_output)
 
@@ -1349,8 +1343,17 @@ def run_pipeline(
             new_diff_snippet = format_review_diff(new_diff)
             re_test_warning = f"\n【重要：本地测试仍未通过】报错如下：\n{test_err[:1500]}\n" if not test_ok else ""
 
+            prior_verdict = extract_verdict_json(review_output)
+            prior_defects = prior_verdict.get("defects", []) if prior_verdict else []
+            if prior_defects:
+                defects_summary = "\n".join(f"- {d}" for d in prior_defects)
+                prior_defects_block = f"\n【上一轮审查指出的核心缺陷清单】\n{defects_summary}\n"
+            else:
+                prior_snippet = review_output[:1200]
+                prior_defects_block = f"\n【上一轮审查意见摘要】\n{prior_snippet}\n"
+
             re_review_prompt = (
-                f"工作目录为: {cwd}。经过上一轮缺陷修复后，请复审以下代码改动，检查上述缺陷是否已彻底解决，是否存在新隐患。{re_test_warning}\n"
+                f"工作目录为: {cwd}。经过上一轮缺陷修复后，请复审以下代码改动，检查上述缺陷是否已彻底解决，是否存在新隐患。{prior_defects_block}{re_test_warning}\n"
                 f"若发现严重隐患或单测报错未解决，请标注 [P1] 或 [P2] 并给出明确修复建议；若逻辑严谨无严重漏洞且单测全通，请明确回复'LGTM / 审核通过'。\n"
                 f"【重要输出规范】请在回答最后一行务必输出且仅输出一行 JSON 判定：\n"
                 f"MAKEWAND_VERDICT: {{\"pass\": true, \"defects\": []}} (若已修复且无严重缺陷且测试通过)\n"

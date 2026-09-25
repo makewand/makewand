@@ -442,6 +442,12 @@ def check_working_tree_isolation(target_dir: str):
             if target_path == active_path or active_path in target_path.parents or target_path in active_path.parents:
                 src_desc = f"tmux 会话 [{info['session_name']}]" if info.get("source") == "tmux" else f"外部独立终端 [{info.get('tty')} · PID {info.get('pid')} · {info.get('ai_type')}]"
                 return False, f"工作区 {target_dir} 与活跃交互会话 ({src_desc}) 存在工作树重叠冲突"
+
+        # 3. Dirty Working Tree Guard: if working tree has any uncommitted changes,
+        # enforce shadow worktree to protect user WIP from accidental rollback
+        code, status_out, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=str(target_path))
+        if code == 0 and status_out and status_out.strip():
+            return False, f"工作区 {target_dir} 存在未提交的代码修改 (Dirty Working Tree)"
     except Exception:
         pass
     return True, None

@@ -91,6 +91,13 @@ class TestGitHelper(unittest.TestCase):
             self.assertTrue(safe)
             self.assertIsNone(msg)
 
+        # 3. Dirty Working Tree Guard
+        ensure_git_worktree(str(self.test_dir))
+        (self.test_dir / "dirty.py").write_text("print('wip')\n", encoding="utf-8")
+        safe, msg = check_working_tree_isolation(str(self.test_dir))
+        self.assertFalse(safe)
+        self.assertIn("Dirty Working Tree", msg)
+
     def test_create_ephemeral_shadow_worktree(self):
         from makewand.git_helper import create_ephemeral_shadow_worktree, run_git_cmd
 

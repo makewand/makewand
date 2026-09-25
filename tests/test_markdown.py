@@ -3,7 +3,13 @@ Unit tests for terminal markdown renderer.
 """
 
 import unittest
-from makewand.markdown import render_terminal_markdown, highlight_code_line
+from makewand.markdown import (
+    render_terminal_markdown,
+    highlight_code_line,
+    display_width,
+    pad_display,
+    strip_ansi
+)
 
 class TestMarkdownRenderer(unittest.TestCase):
     def test_render_headers(self):
@@ -34,6 +40,52 @@ class TestMarkdownRenderer(unittest.TestCase):
     def test_empty_text(self):
         self.assertEqual(render_terminal_markdown(""), "")
         self.assertIsNone(render_terminal_markdown(None))
+
+    def test_table_rendering(self):
+        table_md = (
+            "| Model | Tier | Status |\n"
+            "| :--- | :---: | ---: |\n"
+            "| Claude | standard | Active |\n"
+            "| Codex | deep | Healthy |\n"
+            "| 谷歌模型 | auto | 正常 |"
+        )
+        rendered = render_terminal_markdown(table_md)
+        self.assertIn("Claude", rendered)
+        self.assertIn("Codex", rendered)
+        self.assertIn("谷歌模型", rendered)
+        self.assertIn("┌", rendered)
+        self.assertIn("├", rendered)
+        self.assertIn("└", rendered)
+
+    def test_alerts_rendering(self):
+        alert_md = (
+            "> [!NOTE]\n"
+            "> This is an important note.\n"
+            "> Please take heed."
+        )
+        rendered = render_terminal_markdown(alert_md)
+        self.assertIn("NOTE", rendered)
+        self.assertIn("This is an important note.", rendered)
+        self.assertIn("╭─", rendered)
+        self.assertIn("╰─", rendered)
+
+        warn_md = "> [!WARNING] Danger ahead!"
+        rendered_warn = render_terminal_markdown(warn_md)
+        self.assertIn("WARNING", rendered_warn)
+        self.assertIn("Danger ahead!", rendered_warn)
+
+    def test_standard_blockquote(self):
+        quote_md = "> Normal quoted text line"
+        rendered = render_terminal_markdown(quote_md)
+        self.assertIn("Normal quoted text line", rendered)
+        self.assertIn("│", rendered)
+
+    def test_display_width_and_padding(self):
+        self.assertEqual(display_width("hello"), 5)
+        self.assertEqual(display_width("测试"), 4)  # 2 full-width chars = 4
+        padded = pad_display("test", 8, align="left")
+        self.assertEqual(len(padded), 8)
+        self.assertEqual(padded, "test    ")
 
 if __name__ == "__main__":
     unittest.main()
