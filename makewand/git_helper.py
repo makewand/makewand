@@ -219,11 +219,18 @@ def get_git_diff_status(cwd: str, base_rev: Optional[str] = None, sub_baselines:
     if chk_code != 0:
         return "", f"Not inside a valid git working tree ({chk_err.strip()})"
 
-    run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=cwd)
-    ref = base_rev if base_rev else "HEAD"
-    code, diff_out, err = run_git_cmd(["git", "diff", ref], cwd=cwd)
-    if code != 0 and not base_rev:
-        code, diff_out, err = run_git_cmd(["git", "diff"], cwd=cwd)
+    has_head, _, _ = run_git_cmd(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd)
+    if has_head != 0 and not base_rev:
+        # Repository has no commits yet: stage untracked files and diff against empty tree hash
+        run_git_cmd(["git", "add", "-A"], cwd=cwd)
+        ref = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        code, diff_out, err = run_git_cmd(["git", "diff", "--cached", ref], cwd=cwd)
+    else:
+        run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=cwd)
+        ref = base_rev if base_rev else "HEAD"
+        code, diff_out, err = run_git_cmd(["git", "diff", ref], cwd=cwd)
+        if code != 0 and not base_rev:
+            code, diff_out, err = run_git_cmd(["git", "diff"], cwd=cwd)
 
     if code != 0:
         return "", f"git diff failed with exit code {code}: {err.strip()}"

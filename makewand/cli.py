@@ -529,6 +529,7 @@ def main():
     p_run.add_argument("--tier", choices=["auto", "fast", "standard", "deep"], default="auto", help="Execution tier: fast, standard, deep")
     p_run.add_argument("--model", help="Explicit model override")
     p_run.add_argument("--no-auto-fix", dest="auto_fix", action="store_false", default=True, help="Disable review defect auto-fix loop")
+    p_run.add_argument("--max-fix", type=int, default=2, help="Maximum auto-fix iterations (default: 2)")
     p_run.add_argument("--stream", action="store_true", default=False, help="Stream subprocess output line-by-line")
     p_run.add_argument("--timeout", type=int, default=300, help="Per-stage timeout in seconds")
     p_run.add_argument("--boost", action="store_true", default=False, help="Force boost/overclock mode: bypass soft burn rate penalty and allocate highest reasoning power")
@@ -725,7 +726,7 @@ def main():
             model=args.model,
             stream=args.stream,
             auto_fix=args.auto_fix,
-            max_fix=args.max_fix,
+            max_fix=getattr(args, "max_fix", 2),
             timeout=args.timeout,
             force_code=force_code,
             repo_trust=repo_trust,
