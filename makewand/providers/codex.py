@@ -26,6 +26,7 @@ def execute_codex_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     stream: bool = False,
     readonly: bool = False,
     repo_root: Optional[str] = None,
@@ -95,13 +96,13 @@ def execute_codex_task(
 
     if cwd:
         cmd.extend(["-C", str(cwd)])
-    if model:
-        cmd.extend(["-c", f"model=\"{model}\""])
-    else:
-        from makewand.discovery import get_provider_model_tier
-        resolved = get_provider_model_tier("codex", tier)
-        cmd.extend(["-c", f"model=\"{resolved['model']}\""])
-        cmd.extend(["-c", f"model_reasoning_effort=\"{resolved['effort']}\""])
+    from makewand.discovery import get_provider_model_tier
+    resolved = get_provider_model_tier("codex", tier)
+    target_model = model or resolved["model"]
+    cmd.extend(["-c", f"model=\"{target_model}\""])
+    target_effort = effort or resolved.get("effort")
+    if target_effort and target_effort != "none":
+        cmd.extend(["-c", f"model_reasoning_effort=\"{target_effort}\""])
 
     cmd.append(prompt)
 

@@ -75,7 +75,8 @@ class TestUniversalToolAdaptation(unittest.TestCase):
         """Tests dynamic active tool pool detection based on real-time environment."""
         with patch("makewand.config.has_subscription_configured") as mock_sub, \
              patch("makewand.config.has_api_configured") as mock_api, \
-             patch("makewand.config.is_provider_enabled") as mock_en:
+             patch("makewand.config.is_provider_enabled") as mock_en, \
+             patch("makewand.providers.local.is_local_model_available", return_value=(False, None, None)):
 
             mock_en.return_value = True
 

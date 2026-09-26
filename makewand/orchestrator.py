@@ -612,6 +612,7 @@ def dispatch_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     stream: bool = False,
     readonly: bool = False,
     repo_root: Optional[str] = None,
@@ -626,23 +627,25 @@ def dispatch_task(
     if tier == "auto" or not tier:
         try:
             from makewand.pacing import resolve_dynamic_tier_and_effort
-            dyn_tier, dyn_model, _ = resolve_dynamic_tier_and_effort(engine, requested_tier="auto")
+            dyn_tier, dyn_model, dyn_effort = resolve_dynamic_tier_and_effort(engine, requested_tier="auto")
             tier = dyn_tier
             if not model and dyn_model and dyn_model != "default":
                 model = dyn_model
+            if not effort and dyn_effort:
+                effort = dyn_effort
         except Exception:
             tier = "standard"
     if engine == "claude":
-        res = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+        res = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, effort=effort, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "codex":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
-        res = execute_codex_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+        res = execute_codex_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, effort=effort, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "grok":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
-        res = execute_grok_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+        res = execute_grok_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, effort=effort, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "muse":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
-        res = execute_muse_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+        res = execute_muse_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, effort=effort, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "agy":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
         res = execute_agy_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
@@ -834,12 +837,14 @@ def select_optimal_engine_pair(
                         pen *= 0.5
                         if pen_reason:
                             reasons.append(pen_reason + " [已触发 Deep 穿透豁免减半]")
+                        scores[model_name] += pen
                     else:
                         if pen <= -1.5:
                             scores[model_name] = max(0.2, min(scores[model_name], 1.5) + pen)
+                        else:
+                            scores[model_name] += pen
                         if pen_reason:
                             reasons.append(pen_reason)
-                    scores[model_name] += pen
     except Exception:
         pass
 

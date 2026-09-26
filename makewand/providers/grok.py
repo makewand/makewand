@@ -39,6 +39,7 @@ def execute_grok_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     stream: bool = False,
     readonly: bool = False,
     repo_root: Optional[str] = None,
@@ -110,14 +111,13 @@ def execute_grok_task(
     if cwd:
         cmd.extend(["--cwd", str(cwd)])
 
-    if model:
-        cmd.extend(["--model", model])
-    else:
-        from makewand.discovery import get_provider_model_tier
-        resolved = get_provider_model_tier("grok", tier)
-        cmd.extend(["--model", resolved["model"]])
-        if resolved.get("effort"):
-            cmd.extend(["--reasoning-effort", resolved["effort"]])
+    from makewand.discovery import get_provider_model_tier
+    resolved = get_provider_model_tier("grok", tier)
+    target_model = model or resolved["model"]
+    cmd.extend(["--model", target_model])
+    target_effort = effort or resolved.get("effort")
+    if target_effort and target_effort != "none":
+        cmd.extend(["--reasoning-effort", target_effort])
 
     if is_bwrap_available():
         cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="grok")

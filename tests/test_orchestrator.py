@@ -140,11 +140,12 @@ class TestOrchestrator(unittest.TestCase):
         mock_claude.return_value = (True, "Code written", None)
         mock_diff.return_value = "diff --git a/main.py b/main.py\n+print('hello')"
 
-        # All candidate reviewers (codex, agy, grok, muse) fail or return None
+        # All candidate reviewers (codex, agy, grok, muse, local) fail or return None
         with patch("makewand.orchestrator.execute_codex_task", return_value=(False, None, "error")), \
              patch("makewand.orchestrator.execute_agy_task", return_value=(False, None, "error")), \
              patch("makewand.orchestrator.execute_grok_task", return_value=(False, None, "error")), \
-             patch("makewand.orchestrator.execute_muse_task", return_value=(False, None, "error")):
+             patch("makewand.orchestrator.execute_muse_task", return_value=(False, None, "error")), \
+             patch("makewand.orchestrator.execute_local_task", return_value=(False, None, "error")):
             res = run_pipeline("实现测试功能", cwd="/tmp", auto_fix=False)
             # Must FAIL-CLOSED (return False, rejecting delivery)
             self.assertFalse(res)

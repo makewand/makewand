@@ -28,7 +28,7 @@ class TestHybridRouting(unittest.TestCase):
     def setUp(self):
         self.patch_cfg = patch("makewand.config.load_user_config", return_value={"enabled_providers": {"local": True}})
         self.mock_cfg = self.patch_cfg.start()
-        self.patch_local = patch("makewand.providers.local.is_local_model_available", return_value=(True, "gemma4:31b", None))
+        self.patch_local = patch("makewand.providers.local.is_local_model_available", return_value=(True, "gemma4:31b", ["gemma4:31b"]))
         self.mock_local = self.patch_local.start()
 
     def tearDown(self):
@@ -100,12 +100,12 @@ class TestHybridRouting(unittest.TestCase):
         mock_call_api.assert_called_once()
 
     def test_local_model_functions(self):
-        avail, active, all_m = is_local_model_available()
-        # In this host, Ollama is actively running on localhost:11434 with models
+        from makewand.providers import local as local_mod
+        avail, active, all_m = local_mod.is_local_model_available()
         if avail:
             self.assertTrue(len(all_m) > 0)
             self.assertIn(active, all_m)
-            self.assertEqual(list_local_models(), all_m)
+            self.assertEqual(local_mod.list_local_models(), all_m)
         is_lim, _, _ = parse_local_quota("any output")
         self.assertFalse(is_lim)
 

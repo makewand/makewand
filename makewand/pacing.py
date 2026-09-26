@@ -47,7 +47,7 @@ PROVIDER_DEFAULT_CYCLES = {
 
 def parse_reset_time_to_seconds_left(resets_at_str: Optional[str]) -> Optional[float]:
     """
-    Parses resets_at string (e.g., '2026-09-28 07:53', '10:58 (2026-09-27)', 'in 2 hours')
+    Parses resets_at string (e.g., '2026-09-28 07:53', '10:58 (2026-09-27)', 'Sep 27th, 2026 10:58 AM', '8pm (Asia/Shanghai)', 'in 2 hours')
     into seconds remaining from now.
     """
     if not resets_at_str or not isinstance(resets_at_str, str):
@@ -79,7 +79,30 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str]) -> Optional[f
         except Exception:
             pass
 
-    # Pattern 3: Relative hours/minutes e.g. "3h 20m" or "45m"
+    # Pattern 3: Month-day date support (e.g. "Sep 27th, 2026 10:58 AM", "Oct 3 at 2pm")
+    date_match = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,\s*(\d{4}))?(?:\s+at\s+|\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s, re.IGNORECASE)
+    if date_match:
+        try:
+            month_str = date_match.group(1).capitalize()[:3]
+            day_val = int(date_match.group(2))
+            year_val = int(date_match.group(3)) if date_match.group(3) else now.year
+            hour_val = int(date_match.group(4))
+            min_val = int(date_match.group(5)) if date_match.group(5) else 0
+            ampm = date_match.group(6).lower() if date_match.group(6) else ""
+            if ampm == "pm" and hour_val < 12:
+                hour_val += 12
+            elif ampm == "am" and hour_val == 12:
+                hour_val = 0
+            months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            if month_str in months:
+                month_val = months.index(month_str) + 1
+                reset_dt = datetime(year_val, month_val, day_val, hour_val, min_val)
+                diff = (reset_dt - now).total_seconds()
+                return max(0.0, diff)
+        except Exception:
+            pass
+
+    # Pattern 4: Relative hours/minutes e.g. "3h 20m" or "45m" or "in 2 hours"
     m_hours = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hours?|小时)", s, re.IGNORECASE)
     m_mins = re.search(r"(\d+)\s*(?:m|min|minutes?|分钟)", s, re.IGNORECASE)
     if m_hours or m_mins:
@@ -89,6 +112,19 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str]) -> Optional[f
         if m_mins:
             secs += float(m_mins.group(1)) * 60
         return max(0.0, secs)
+
+    # Pattern 5: Time of day with stripped timezone e.g. "8pm (Asia/Shanghai)", "10:58 AM"
+    clean_time = re.sub(r"\(.*?\)", "", s).strip()
+    for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
+        try:
+            t = datetime.strptime(clean_time, fmt).time()
+            reset_dt = datetime.combine(now.date(), t)
+            if reset_dt < now:
+                reset_dt += timedelta(days=1)
+            diff = (reset_dt - now).total_seconds()
+            return max(0.0, diff)
+        except Exception:
+            continue
 
     return None
 
@@ -143,31 +179,31 @@ def calculate_dynamic_pacing(
 
     cycle_total = PROVIDER_DEFAULT_CYCLES.get(provider, CYCLE_7_DAYS)
     seconds_left = parse_reset_time_to_seconds_left(resets_at)
+    has_explicit_anchor = False
 
     if seconds_left is not None:
-        # Use known reset anchor
+        has_explicit_anchor = True
         if seconds_left > cycle_total:
             cycle_total = max(cycle_total, seconds_left)
         time_elapsed_ratio = max(0.0, min(1.0, 1.0 - (seconds_left / cycle_total)))
-    else:
-        # Fallback: estimate from rolling usage records
-        try:
-            from makewand.usage import get_engine_usage_stats
-            u24 = get_engine_usage_stats(window_hours=24.0).get(provider, {}).get("total", 0)
-            # Estimate elapsed ratio from diurnal cycle
-            now = datetime.now()
-            day_fraction = (now.hour * 3600 + now.minute * 60 + now.second) / 86400.0
-            time_elapsed_ratio = day_fraction
-            seconds_left = (1.0 - day_fraction) * 86400.0
-        except Exception:
-            time_elapsed_ratio = 0.5
-            seconds_left = cycle_total * 0.5
+    if not has_explicit_anchor:
+        return {
+            "provider": provider,
+            "pacing_state": PACING_BALANCED,
+            "quota_percentage": percentage,
+            "recommended_tier": "standard",
+            "recommended_effort": "high",
+            "routing_boost": 0.0,
+            "reason": f"{provider.upper()} 运行健康平稳 (自适应基准调步)",
+            "delta": 0.0,
+            "seconds_left": cycle_total * 0.5,
+        }
 
     consumed_ratio = max(0.0, min(1.0, 1.0 - (percentage / 100.0)))
     delta = consumed_ratio - time_elapsed_ratio
 
-    # 1. Harvest Condition: In the last 10% of cycle, with >15% quota remaining
-    is_harvest_window = (seconds_left is not None and seconds_left <= (0.12 * cycle_total))
+    # 1. Harvest Condition: In the last 12% of cycle with explicit anchor confirmed, with >15% quota remaining
+    is_harvest_window = has_explicit_anchor and (seconds_left <= (0.12 * cycle_total))
     if is_harvest_window and percentage >= 15:
         hrs_left = round(seconds_left / 3600.0, 1)
         return {

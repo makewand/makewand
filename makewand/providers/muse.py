@@ -28,6 +28,7 @@ def execute_muse_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     stream: bool = False,
     readonly: bool = False,
     repo_root: Optional[str] = None,
@@ -96,15 +97,14 @@ def execute_muse_task(
         cmd.extend(["--trust-workspace", "--disable-approval", "--disable-write"])
     if cwd:
         cmd.extend(["--workspace", str(cwd)])
-    if model:
-        cmd.extend(["--model", model])
-    else:
-        from makewand.discovery import get_provider_model_tier
-        resolved = get_provider_model_tier("muse", tier)
-        if resolved.get("model") and resolved["model"] != "default":
-            cmd.extend(["--model", resolved["model"]])
-        if resolved.get("effort"):
-            cmd.extend(["--reasoning-effort", resolved["effort"]])
+    from makewand.discovery import get_provider_model_tier
+    resolved = get_provider_model_tier("muse", tier)
+    target_model = model or resolved.get("model")
+    if target_model and target_model != "default":
+        cmd.extend(["--model", target_model])
+    target_effort = effort or resolved.get("effort")
+    if target_effort and target_effort != "none":
+        cmd.extend(["--reasoning-effort", target_effort])
 
     cmd.append(prompt)
 
