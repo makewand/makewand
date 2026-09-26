@@ -222,8 +222,6 @@ def render_terminal_markdown(text: str) -> str:
         return None
     if not text:
         return ""
-    if not supports_color():
-        return text
 
     lines = text.splitlines()
     output: List[str] = []
