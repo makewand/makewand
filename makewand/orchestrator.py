@@ -623,7 +623,15 @@ def dispatch_task(
     if not is_provider_enabled(engine):
         return False, None, f"引擎 '{engine}' 当前已被用户在配置中手动禁用。运行 'makewand enable {engine}' 重新开启"
 
-    res = None
+    if tier == "auto" or not tier:
+        try:
+            from makewand.pacing import resolve_dynamic_tier_and_effort
+            dyn_tier, dyn_model, _ = resolve_dynamic_tier_and_effort(engine, requested_tier="auto")
+            tier = dyn_tier
+            if not model and dyn_model and dyn_model != "default":
+                model = dyn_model
+        except Exception:
+            tier = "standard"
     if engine == "claude":
         res = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "codex":
@@ -835,6 +843,22 @@ def select_optimal_engine_pair(
     except Exception:
         pass
 
+    # 2.5 Dynamic Quota Pacing & Calendar Progression Alignment
+    pacings = {}
+    try:
+        from makewand.pacing import get_all_providers_pacing
+        pacings = get_all_providers_pacing(cache=cache)
+        for model_name, p_data in pacings.items():
+            if model_name in scores and scores[model_name] > -500:
+                p_boost = p_data.get("routing_boost", 0.0)
+                if p_boost != 0.0 and not boost:
+                    scores[model_name] += p_boost
+                p_reason = p_data.get("reason")
+                if p_reason and p_data.get("pacing_state") in ("harvest", "under_burned", "over_burned"):
+                    reasons.append(p_reason)
+    except Exception:
+        pass
+
     # 3. Quota Health & Active Tool Filter
     from makewand.config import has_api_configured, is_provider_enabled, get_active_providers
     active_pool = set(get_active_providers())
@@ -940,7 +964,8 @@ def select_optimal_engine_pair(
         "reasons": reasons,
         "primary_coder": primary_coder,
         "primary_reviewer": available_reviewers[0] if available_reviewers else primary_coder,
-        "single_tool_mode": single_tool_mode
+        "single_tool_mode": single_tool_mode,
+        "pacings": pacings
     }
 
     return available_coders, available_reviewers, meta_info
