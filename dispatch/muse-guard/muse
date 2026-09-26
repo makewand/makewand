@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Muse Code 启动封装
+#  1) 强制在 muse.slice cgroup 内运行 —— 该 cgroup 被 /etc/nftables-muse-guard.nft
+#     限制为只能访问 127.0.0.1:7890,任何直连都会被 reject
+#  2) 启动前实测管控是否生效,未生效就拒绝启动(fail-closed)
+#  3) 代理环境变量统一指向 7890
+#  4) 自动加载 ~/.config/muse/env 里的凭据(META_API_KEY / MUSE_BASE_URL)
+# 真实启动器在 ~/.local/libexec/muse-bin/muse(不在 PATH,避免绕过管控)
+set -euo pipefail
+REAL="$HOME/.local/libexec/muse-bin/muse"
+PROXY="http://127.0.0.1:7890"
+ENVFILE="$HOME/.config/muse/env"
+
+[[ -x "$REAL" ]] || { echo "muse: 启动器未安装($REAL)" >&2; exit 1; }
+# shellcheck disable=SC1090
+[[ -f "$ENVFILE" ]] && source "$ENVFILE"
+
+# ---- 出网管控自检(fail-closed)----
+# nft 规则在加载时把 muse.slice 解析成 cgroup ID:slice 不存在则加载失败,slice 重建则规则静默失效。
+# 所以每次启动前:确保 slice 存在,再在 slice 内实测"直连本机其他端口被拒"。
+# 探测端口必须在 slice 外可连,否则"连不上"证明不了管控生效。
+tcp_ok() { timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+in_slice_tcp_ok() {
+  systemd-run --user --scope --quiet --slice=muse --collect -- \
+    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null
+}
+guard_verified() {
+  local p
+  for p in 7891 22; do
+    tcp_ok "$p" || continue            # 这个端口本来就连不上,换一个
+    ! in_slice_tcp_ok "$p"             # slice 外能连、slice 内被拒 → 管控生效
+    return
+  done
+  echo "muse: 找不到可用的探测端口,只能检查服务状态" >&2
+  systemctl is-active --quiet muse-guard
+}
+if [[ "${MUSE_ALLOW_UNGUARDED:-0}" != 1 ]]; then
+  systemctl --user start muse.slice
+  if ! guard_verified; then
+    # 自愈:重载规则,让它重新解析当前 slice 的 cgroup ID(需要免密 sudo;不可用就直接拒绝)
+    sudo -n systemctl restart muse-guard >/dev/null 2>&1 || true
+    guard_verified || {
+      echo "muse: 出网管控(muse-guard)未生效,拒绝启动。排查: systemctl status muse-guard" >&2
+      echo "      确认风险后可临时设 MUSE_ALLOW_UNGUARDED=1 跳过" >&2
+      exit 1
+    }
+  fi
+fi
+
+args=()
+[[ -n "${MUSE_BASE_URL:-}" ]] && args+=(--base-url "$MUSE_BASE_URL")
+
+# 内存上限:muse.slice 本身没有上限(MemoryMax=infinity),失控时会拖垮整机
+# (见 ~/.claude/CLAUDE.md「临时/探针脚本必须带内存上限」)
+exec systemd-run --user --scope --quiet --slice=muse --collect \
+  -p MemoryMax="${MUSE_MEM:-16G}" -p MemorySwapMax=0 \
+  --setenv=http_proxy="$PROXY"  --setenv=https_proxy="$PROXY" \
+  --setenv=HTTP_PROXY="$PROXY"  --setenv=HTTPS_PROXY="$PROXY" \
+  --setenv=all_proxy="$PROXY"   --setenv=ALL_PROXY="$PROXY" \
+  --setenv=no_proxy=""          --setenv=NO_PROXY="" \
+  ${META_API_KEY:+--setenv=META_API_KEY="$META_API_KEY"} \
+  -- "$REAL" "${args[@]}" "$@"

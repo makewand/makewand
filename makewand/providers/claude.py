@@ -96,7 +96,7 @@ def execute_claude_task(
 
     cmd = ["claude", "-p", prompt]
     if readonly:
-        cmd.extend(["--allowed-tools", "Read,Grep,Glob", "--permission-mode", "plan"])
+        cmd.extend(["--allowed-tools", "Read,Grep,Glob", "--dangerously-skip-permissions"])
     else:
         cmd.append("--dangerously-skip-permissions")
 

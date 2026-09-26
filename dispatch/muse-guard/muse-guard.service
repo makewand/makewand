@@ -1,0 +1,18 @@
+[Unit]
+Description=Muse Code egress guard (only via 127.0.0.1:7890 proxy)
+# muse.slice 属于用户 1000 的 user manager(linger 开启,开机即启动):
+# 必须等它起来并确保 slice 已创建,再加载按 cgroup 路径匹配的 nft 规则。
+# PartOf:user manager 重启时一并重载,让规则重新解析新的 cgroup ID。
+After=user@1000.service
+Requires=user@1000.service
+PartOf=user@1000.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/systemctl --user -M user@ start muse.slice
+ExecStart=/usr/sbin/nft -f /etc/nftables-muse-guard.nft
+ExecStop=-/usr/sbin/nft delete table inet muse_guard
+
+[Install]
+WantedBy=user@1000.service

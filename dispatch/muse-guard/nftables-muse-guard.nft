@@ -1,0 +1,23 @@
+# Muse Code 出网管控:只允许经 127.0.0.1:7890 代理,禁止一切直连
+# 独立表,不影响 ufw / docker 等已有规则。删除:  nft delete table inet muse_guard
+#
+# 注意:socket cgroupv2 在"加载时"把路径解析成 cgroup ID。
+#   - muse.slice 不存在 → 加载失败(2026-09-26 开机就是这样失败的);
+#   - muse.slice 被销毁重建 → 规则仍指向旧 ID,静默失效。
+# 所以 muse-guard.service 先确保 slice 存在再加载,~/.local/bin/muse 每次启动前实测管控是否生效。
+#
+# 前两行让本文件可重复加载:先确保表存在再删掉,整个文件是一个原子事务。
+table inet muse_guard
+delete table inet muse_guard
+table inet muse_guard {
+    chain muse_out {
+        # 唯一放行:本机 7890 代理
+        ip daddr 127.0.0.1 tcp dport 7890 accept
+        # 其余一律拒绝(用 reject 让程序立即报错,而不是卡住)
+        counter reject with icmpx type admin-prohibited
+    }
+    chain output {
+        type filter hook output priority filter; policy accept;
+        socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/muse.slice" jump muse_out
+    }
+}

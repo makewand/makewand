@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# ai-dispatch — 把一个子任务派给指定 CLI(claude/codex/muse/grok),统一权限、超时和结果格式。
+# 任何前台(Claude / Codex / Muse)都用 shell 调它,调度行为因此与"谁在当前台"无关。
+#
+# 用法:
+#   ai-dispatch <engine> [选项] [提示词...]     提示词也可用 -f FILE 或管道传入;
+#                                               参数和管道同时给时,管道内容附在提示词后面;
+#                                               提示词以 - 开头时写在 -- 之后
+#     engine: claude | codex | muse | grok(grok 只允许只读)
+# 选项:
+#   --rw            可写。在临时 git worktree(真实检出,不是硬链接)里执行,改动以补丁交回,
+#                   由前台决定是否 git apply。默认只读。
+#   -C DIR          工作目录(默认当前目录)
+#   -t SEC          墙钟超时(正整数),默认 900。前台工具自己有超时的,-t 要比它小
+#   -f FILE         从文件读提示词
+#   --schema FILE   要求最终输出符合该 JSON Schema(四家都有原生参数)
+#   --model M       指定模型;--effort E 指定推理档位(claude/codex/muse)
+#   --with-env      --rw 时把原目录的 .env 复制进 worktree(默认不复制)
+#   --link-deps     --rw 时把原目录的 .venv/node_modules 软链进 worktree(默认不链;软链可写穿)
+#   --dry-run       只打印将执行的命令
+# 环境变量:
+#   名字像密钥的变量(*_API_KEY *_TOKEN *_SECRET* *_PASSWORD AWS_* 等)默认不传给子 CLI,
+#   需要保留的写进 AI_DISPATCH_KEEP_ENV="GH_TOKEN FOO";AI_DISPATCH_MEM 内存上限(默认 16G);
+#   AI_DISPATCH_HOME 运行目录根(默认 ~/.cache/ai-dispatch)
+# 输出:
+#   运行目录 <根>/<id>/:prompt.txt cmd.txt stdout stderr result.txt meta.json [changes.patch]
+#   标准输出只有一行 JSON(即 meta.json),前台据此读取 result/patch 路径。
+# 退出码:0 成功 | 2 用法错误 | 3 额度/限流 | 4 超时 | 5 引擎失败或被杀 | 6 策略拒绝
+#         7 本机调度环境故障 | 130/143 被中断
+#
+# 隔离手段(2026-09-26 逐项实测):
+#   claude  --restricted(不继承 ~/.claude/settings.json 的宽泛放行)+ dontAsk + 内置 OS 沙箱:
+#           Bash 只读模式下连 cwd 也只读,可写模式只能写 worktree 和临时目录;
+#           Write/Edit 工具拒绝工作目录以外的路径;各家凭据目录对 Bash 不可读
+#   codex   OS 沙箱 read-only / workspace-write
+#   muse    :read-only / :auto-review 档(自带沙箱,可写档只能写 workspace 和临时目录)
+#   grok    只读沙箱且不给 shell(实测它被拦后会用等价命令伪造结果)
+#   每个任务套 systemd scope 内存上限(见 ~/.claude/CLAUDE.md「临时/探针脚本必须带内存上限」)
+set -euo pipefail
+
+die() { echo "ai-dispatch: $1" >&2; exit "${2:-2}"; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+need() { (($# >= 2)) && [[ -n "$2" ]] || die "$1 需要一个参数值"; }
+
+ENGINE="${1:-}"
+case "$ENGINE" in
+  -h|--help) usage; exit 0 ;;
+  claude|codex|muse|grok) shift ;;
+  "") die "缺少 engine(claude|codex|muse|grok),用 -h 看用法" ;;
+  *) die "未知 engine: $ENGINE" ;;
+esac
+
+MODE=ro; CWD="$PWD"; TIMEOUT=900; PFILE=""; SCHEMA=""; MODEL=""; EFFORT=""
+WITH_ENV=0; LINK_DEPS=0; DRY=0; PROMPT_ARGS=()
+while (($#)); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --rw) MODE=rw ;;
+    -C) need "$@"; CWD="$2"; shift ;;
+    -t) need "$@"; TIMEOUT="$2"; shift ;;
+    -f) need "$@"; PFILE="$2"; shift ;;
+    --schema) need "$@"; SCHEMA="$2"; shift ;;
+    --model) need "$@"; MODEL="$2"; shift ;;
+    --effort) need "$@"; EFFORT="$2"; shift ;;
+    --with-env) WITH_ENV=1 ;;
+    --link-deps) LINK_DEPS=1 ;;
+    --dry-run) DRY=1 ;;
+    --) shift; PROMPT_ARGS+=("$@"); break ;;
+    -*) die "未知选项: $1(提示词以 - 开头时写在 -- 之后)" ;;
+    *) PROMPT_ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+# ---- 参数校验(都在创建运行目录之前,失败不留垃圾)----
+[[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "-t 需要正整数秒(0 会让 timeout 变成不限时)"
+_d="$(CDPATH='' cd -- "$CWD" 2>/dev/null && pwd)" || die "工作目录不存在: $CWD"; CWD="$_d"
+[[ -z "$PFILE" || ( -f "$PFILE" && -r "$PFILE" ) ]] || die "提示词文件不可读: $PFILE"
+[[ -z "$SCHEMA" || ( -f "$SCHEMA" && -r "$SCHEMA" ) ]] || die "schema 文件不可读: $SCHEMA"
+if [[ -n "$SCHEMA" ]]; then SCHEMA="$(CDPATH='' cd -- "$(dirname -- "$SCHEMA")" && pwd)/$(basename -- "$SCHEMA")"; fi
+if [[ "$ENGINE" == grok && "$MODE" == rw ]]; then
+  die "策略:grok 只允许只读(它实测会在被拦后伪造子任务结果)" 6
+fi
+
+ROOT=""; SUB=""; BASE=""; DIRTY=0; SUBM=0
+if [[ "$MODE" == rw ]]; then
+  [[ "$(git -C "$CWD" rev-parse --is-inside-work-tree 2>/dev/null)" == true ]] || die "--rw 需要 git 工作区: $CWD" 6
+  ROOT="$(git -C "$CWD" rev-parse --show-toplevel)"
+  SUB="$(git -C "$CWD" rev-parse --show-prefix)"
+  # 补丁以派发时的提交为基准:引擎在 worktree 里自己 commit 也不会丢改动
+  BASE="$(git -C "$ROOT" rev-parse --verify -q 'HEAD^{commit}')" || die "--rw 需要至少一个提交(空仓库?): $ROOT" 2
+  if [[ -n "$SUB" ]] && ! git -C "$ROOT" cat-file -e "$BASE:${SUB%/}" 2>/dev/null; then
+    die "子目录 '$SUB' 不在 HEAD 里(未跟踪或被 .gitignore 忽略),--rw 无法定位" 2
+  fi
+  [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] && DIRTY=1
+  [[ -s "$ROOT/.gitmodules" ]] && SUBM=1
+fi
+
+if ((DRY == 0)); then
+  { command -v systemd-run >/dev/null && systemd-run --user --scope --quiet --collect -- true 2>/dev/null; } \
+    || die "systemd-run --user 不可用(没有用户 bus?),不在无内存上限的情况下运行" 7
+fi
+
+# ---- 运行目录:mktemp 原子创建,并发实例不会撞 ID ----
+BASE_DIR="${AI_DISPATCH_HOME:-$HOME/.cache/ai-dispatch}"
+[[ "$BASE_DIR" == /* ]] || BASE_DIR="$PWD/$BASE_DIR"
+mkdir -p "$BASE_DIR"
+RUN="$(mktemp -d "$BASE_DIR/$(date +%Y%m%d-%H%M%S)-$ENGINE-XXXXXX")"
+ID="$(basename "$RUN")"
+abort() { rm -rf "$RUN"; die "$@"; }
+
+# ---- 提示词 ----
+if [[ -n "$PFILE" ]]; then
+  cp -- "$PFILE" "$RUN/prompt.txt"
+elif ((${#PROMPT_ARGS[@]})); then
+  { printf '%s\n' "${PROMPT_ARGS[*]}"
+    # 参数 + 管道同时给时附上管道内容(如 git diff | ai-dispatch claude "review");
+    # 只认 FIFO 和普通文件:前台 Bash 工具的 stdin 是 /dev/null,不会阻塞
+    if [[ -p /dev/stdin || -f /dev/stdin ]]; then printf '\n'; cat; fi
+  } > "$RUN/prompt.txt"
+elif [[ ! -t 0 ]]; then
+  cat > "$RUN/prompt.txt"
+else
+  abort "没有提示词(参数、-f 或管道三选一)"
+fi
+grep -q '[^[:space:]]' "$RUN/prompt.txt" || abort "提示词为空(或只有空白)"
+PSIZE=$(wc -c < "$RUN/prompt.txt")
+# grok 只能从 argv 传提示词,单个参数上限约 128KB;其余三家走 stdin 或文件
+if [[ "$ENGINE" == grok ]] && ((PSIZE > 100000)); then
+  abort "提示词 ${PSIZE}B 超过 grok 的 argv 上限,请改成引用文件路径"
+fi
+
+# ---- 可写模式:临时 worktree ----
+WORK="$CWD"; WT=""; CHILD=""
+cleanup() {
+  if [[ -n "$CHILD" ]] && kill -0 "$CHILD" 2>/dev/null; then
+    kill -TERM "$CHILD" 2>/dev/null || true; wait "$CHILD" 2>/dev/null || true
+  fi
+  if [[ -n "$WT" && -d "$WT" ]]; then
+    git -C "$ROOT" worktree remove --force "$WT" >/dev/null 2>&1 \
+      || { chmod -R u+w "$WT" 2>/dev/null; rm -rf "$WT" 2>/dev/null; } || true
+    git -C "$ROOT" worktree prune >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+if [[ "$MODE" == rw ]]; then
+  if ((DRY == 0)); then
+    WT="$RUN/wt"
+    git -C "$ROOT" worktree add --detach --quiet "$WT" "$BASE" || abort "创建 worktree 失败" 7
+    if ((LINK_DEPS)); then
+      for d in .venv node_modules; do [[ -e "$ROOT/$d" && ! -e "$WT/$d" ]] && ln -s "$ROOT/$d" "$WT/$d"; done
+    fi
+    if ((WITH_ENV)) && [[ -f "$ROOT/.env" ]]; then cp -p "$ROOT/.env" "$WT/.env"; fi
+  fi
+  WORK="$RUN/wt/$SUB"
+fi
+
+# ---- 环境:清掉父 Claude 会话的变量和密钥类变量 ----
+SCRUB=(-u CDPATH -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH
+       -u CLAUDE_CODE_FORCE_SYNC_OUTPUT -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN
+       -u CLAUDE_CODE_NO_FLICKER -u CLAUDE_CODE_SESSION_ATTENDED -u CLAUDE_CODE_SESSION_ID
+       -u CLAUDE_EFFORT -u CLAUDE_PID)
+# 子 CLI 都用各自的订阅登录文件认证;例如 ANTHROPIC_API_KEY 一旦传给 claude,它会改走按量计费的 API
+KEEP=" ${AI_DISPATCH_KEEP_ENV:-} CLAUDE_CODE_OAUTH_TOKEN "
+while IFS= read -r v; do
+  [[ "$KEEP" == *" $v "* ]] && continue
+  case "$v" in
+    *_API_KEY|*_APIKEY|*_TOKEN|*_SECRET|*_SECRET_*|*_PASSWORD|*_ACCESS_KEY*|*_CREDENTIALS|AWS_*|GOOGLE_APPLICATION_CREDENTIALS)
+      SCRUB+=(-u "$v") ;;
+  esac
+done < <(compgen -e)
+
+# ---- 组装命令 ----
+STDIN=/dev/null; STEXT=""
+[[ -n "$SCHEMA" ]] && STEXT="$(cat "$SCHEMA")"
+case "$ENGINE" in
+  claude)
+    # 各家凭据目录对沙箱内的 Bash 不可读(只列存在的路径)
+    DENY_READ=()
+    for p in .codex .codex-2 .codex-3 .ssh .aws .gnupg .config/muse .grok .gemini .claude/.credentials.json \
+             .claude-account-2 .netrc .git-credentials .docker .config/gh .kube .npmrc .pypirc; do
+      [[ -e "$HOME/$p" ]] && DENY_READ+=("$HOME/$p")
+    done
+    CSB="$(python3 - "$MODE" "$WORK" "${DENY_READ[@]}" <<'PY'
+import json, sys
+mode, work, deny = sys.argv[1], sys.argv[2], sys.argv[3:]
+fs = {"denyRead": deny}
+if mode == "ro":
+    fs["denyWrite"] = [work]          # 只读模式下 cwd 也只读,由 OS 保证而不是靠模型自觉
+print(json.dumps({"sandbox": {"enabled": True, "failIfUnavailable": True,
+                              "allowUnsandboxedCommands": False,
+                              "autoAllowBashIfSandboxed": True, "filesystem": fs}}))
+PY
+)"
+    CMD=(claude -p --restricted --strict-mcp-config --permission-mode dontAsk
+         --no-session-persistence --output-format json --settings "$CSB")
+    if [[ "$MODE" == ro ]]; then
+      CMD+=(--tools Read,Glob,Grep,Bash --allowedTools Read Glob Grep Bash)
+    else
+      CMD+=(--tools Read,Glob,Grep,Edit,Write,Bash --allowedTools Read Glob Grep Edit Write Bash)
+    fi
+    [[ -n "$MODEL" ]] && CMD+=(--model "$MODEL")
+    [[ -n "$EFFORT" ]] && CMD+=(--effort "$EFFORT")
+    [[ -n "$SCHEMA" ]] && CMD+=(--json-schema "$STEXT")
+    STDIN="$RUN/prompt.txt" ;;
+  codex)
+    # octo-codex 的 Spark 自动降级在 ChatGPT 账号下会 400(2026-09-26 实测),默认关掉,
+    # 让额度耗尽直接返回 75(映射为退出码 3);修好后可设 AI_DISPATCH_CODEX_DOWNGRADE=1
+    [[ "${AI_DISPATCH_CODEX_DOWNGRADE:-0}" == 1 ]] || SCRUB+=(OCTO_CODEX_NO_DOWNGRADE=1)
+    SB=read-only; [[ "$MODE" == rw ]] && SB=workspace-write
+    CMD=(octo-codex exec --sandbox "$SB" --skip-git-repo-check --ephemeral --json
+         -C "$WORK" -o "$RUN/result.txt")
+    [[ -n "$MODEL" ]] && CMD+=(-m "$MODEL")
+    [[ -n "$EFFORT" ]] && CMD+=(-c "model_reasoning_effort=\"$EFFORT\"")
+    [[ -n "$SCHEMA" ]] && CMD+=(--output-schema "$SCHEMA")
+    CMD+=(-)
+    STDIN="$RUN/prompt.txt" ;;
+  muse)
+    PROF=:read-only; [[ "$MODE" == rw ]] && PROF=:auto-review
+    CMD=(muse exec --permission-profile "$PROF" --workspace "$WORK" --no-session-log --json
+         --prompt-file "$RUN/prompt.txt")
+    [[ "$MODE" == ro ]] && CMD+=(--disable-write)
+    [[ -n "$MODEL" ]] && CMD+=(--model "$MODEL")
+    [[ -n "$EFFORT" ]] && CMD+=(--reasoning-effort "$EFFORT")
+    [[ -n "$SCHEMA" ]] && CMD+=(--output-schema "$SCHEMA")
+    # 内存上限由 muse 封装加在它自己的 scope 上(外层 scope 管不住:进程会被移进 muse.slice)
+    SCRUB+=(MUSE_MEM="${AI_DISPATCH_MEM:-16G}") ;;
+  grok)
+    # --single=值 的写法:提示词以 - 开头(markdown 列表)时也能通过参数解析
+    CMD=(grok "--single=$(cat "$RUN/prompt.txt")" --sandbox read-only --tools read_file,grep,list_dir
+         --permission-mode dontAsk --output-format streaming-messages-json)
+    [[ -n "$SCHEMA" ]] && CMD+=(--json-schema "$STEXT") ;;
+esac
+
+WRAP=(timeout -k 30 "$TIMEOUT")
+SCOPE=""
+if [[ "$ENGINE" != muse ]]; then
+  # scope 起固定名字、不加 --collect:事后才能查到 Result=oom-kill(退出码判断不可靠:
+  # 内核只杀最大的子进程时引擎可能照常退出 0);成功的 scope 会被 systemd 自动回收
+  SCOPE="aid-$ID.scope"
+  WRAP=(systemd-run --user --scope --quiet --unit="aid-$ID"
+        -p "MemoryMax=${AI_DISPATCH_MEM:-16G}" -p MemorySwapMax=0 -- "${WRAP[@]}")
+fi
+FULL=(env "${SCRUB[@]}" "${WRAP[@]}" "${CMD[@]}")
+
+# 日志:提示词和 schema 正文单独存档,cmd.txt 里只放占位符
+SHOW=()
+for a in "${FULL[@]}"; do
+  if [[ "$ENGINE" == grok && "${a:0:9}" == "--single=" ]]; then SHOW+=("--single=<prompt:${PSIZE}B>")
+  elif [[ -n "$STEXT" && "$a" == "$STEXT" ]]; then SHOW+=("<schema:$SCHEMA>")
+  else SHOW+=("$a"); fi
+done
+{ printf '%q ' "${SHOW[@]}"; echo; } > "$RUN/cmd.txt"
+if ((DRY)); then
+  cat "$RUN/cmd.txt"; echo "stdin: $STDIN  cwd: $WORK"
+  rm -rf "$RUN"; exit 0
+fi
+
+# ---- 执行:引擎放后台,本脚本被 TERM/INT 时把信号转给它(timeout 会再转给引擎进程组)----
+on_signal() {
+  kill -"$1" "$CHILD" 2>/dev/null || true
+  wait "$CHILD" 2>/dev/null || true
+  printf '{"id":"%s","engine":"%s","status":"cancelled","exit":%d,"run_dir":"%s"}\n' \
+    "$ID" "$ENGINE" "$2" "$RUN" | tee "$RUN/meta.json"
+  exit "$2"
+}
+T0=$(date +%s)
+set +e
+( cd "$WORK" && exec "${FULL[@]}" < "$STDIN" > "$RUN/stdout" 2> "$RUN/stderr" ) &
+CHILD=$!
+trap 'on_signal TERM 143' TERM HUP
+trap 'on_signal INT 130' INT
+wait "$CHILD"; RC=$?
+trap - TERM HUP INT
+CHILD=""
+set -e
+SECS=$(( $(date +%s) - T0 ))
+OOM=0
+if [[ -n "$SCOPE" ]]; then
+  [[ "$(systemctl --user show "$SCOPE" -p Result --value 2>/dev/null)" == oom-kill ]] && OOM=1
+  systemctl --user reset-failed "$SCOPE" >/dev/null 2>&1 || true
+fi
+
+# ---- 可写模式:收集补丁(基准是派发时的提交)----
+PATCH=""
+if [[ "$MODE" == rw && -d "$WT" ]]; then
+  git -C "$WT" add -A -- . ':!.venv' ':!node_modules' ':!.env' >/dev/null 2>&1 || true
+  git -C "$WT" diff --cached --binary "$BASE" > "$RUN/changes.patch" 2>/dev/null || true
+  if [[ -s "$RUN/changes.patch" ]]; then PATCH="$RUN/changes.patch"; else rm -f "$RUN/changes.patch"; fi
+fi
+
+# ---- 解析结果、分类状态、写 meta ----
+python3 - "$ENGINE" "$RUN" "$RC" "$SECS" "$MODE" "$CWD" "$PATCH" "$DIRTY" "$TIMEOUT" "$WORK" "$SUBM" "$OOM" <<'PY'
+import json, re, sys, os
+engine, run, rc, secs, mode, cwd, patch, dirty, tmo, work, subm, oom = sys.argv[1:]
+rc, secs, tmo = int(rc), int(secs), int(tmo)
+
+def rd(name):
+    try:
+        with open(os.path.join(run, name), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+def events(text):
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                e = json.loads(line)
+                if isinstance(e, dict):
+                    yield e
+            except Exception:
+                pass
+
+out, err = rd("stdout"), rd("stderr")
+res_path = os.path.join(run, "result.txt")
+
+# result:模型的最终回答;errtext:只收集"错误信息",额度判断只看它,
+# 不看模型正文(正文里出现 quota/429 很常见,makewand 就栽在这种子串误判上)
+result, extra, errtext, failed = None, {}, err[-4000:], rc != 0
+if engine == "claude":
+    try:
+        d = json.loads(out)
+        so = d.get("structured_output")
+        result = so if so is not None else d.get("result")
+        extra = {k: d.get(k) for k in ("subtype", "num_turns", "total_cost_usd")}
+        if d.get("permission_denials"):
+            extra["permission_denials"] = len(d["permission_denials"])
+        if d.get("is_error"):
+            failed, errtext, result = True, errtext + "\n" + str(d.get("result")), None
+    except Exception:
+        pass
+elif engine == "codex":
+    if os.path.exists(res_path):
+        result = rd("result.txt").strip() or None
+    for e in events(out):
+        if e.get("type") in ("error", "turn.failed"):
+            errtext += "\n" + json.dumps(e, ensure_ascii=False)[:500]
+elif engine == "grok":
+    for e in events(out):
+        if e.get("type") == "result":
+            extra = {k: e.get(k) for k in ("subtype", "num_turns", "total_cost_usd")}
+            if e.get("is_error") or str(e.get("subtype", "")).startswith("error"):
+                failed, errtext = True, errtext + "\n" + str(e.get("result"))
+            else:
+                result = e.get("result")
+elif engine == "muse":
+    for e in events(out):
+        pl = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+        pt = str(e.get("payload_type", ""))
+        if pt.startswith("run.terminal."):
+            extra["terminal"] = pl.get("terminal")
+            if pt == "run.terminal.completed":
+                result = pl.get("text")
+            else:
+                failed = True
+                errtext += "\n" + json.dumps(pl, ensure_ascii=False)[:500]
+        elif "error" in pt:
+            errtext += "\n" + json.dumps(pl, ensure_ascii=False)[:500]
+
+if result is not None and not isinstance(result, str):
+    result = json.dumps(result, ensure_ascii=False)
+if result is not None and engine != "codex":
+    with open(res_path, "w", encoding="utf-8", errors="replace") as f:
+        f.write(result if result.endswith("\n") else result + "\n")
+
+# 路径里可能恰好含 quota/429 之类的词(例如仓库叫 rate-limiter),判额度前先去掉
+et = errtext
+for p in sorted({cwd, work, run}, key=len, reverse=True):
+    if p:
+        et = et.replace(p, "<path>")
+quota_pat = r"usage limit|rate.?limit|quota|resourceexhausted|too many requests|\b429\b|无可用额度|额度"
+
+if oom == "1":
+    # scope 触发过内存上限:哪怕引擎最后退出 0,结果也可能残缺(例如测试进程被杀)
+    status, code = "killed", 5
+    extra["hint"] = "任务超过内存上限 AI_DISPATCH_MEM(默认 16G),被 OOM 终止"
+elif rc == 124 or (rc == 137 and secs >= tmo):
+    status, code = "timeout", 4
+elif rc > 128:
+    status, code = "killed", 5
+    extra["hint"] = "引擎被信号终止"
+elif rc == 75 or (failed and re.search(quota_pat, et.lower())):
+    status, code = "quota", 3
+elif failed:
+    status, code = "engine_error", 5
+elif result is None and not patch:
+    status, code = "no_result", 5
+else:
+    status, code = "ok", 0
+
+meta = {"id": os.path.basename(run), "engine": engine, "mode": mode, "cwd": cwd, "status": status,
+        "exit": code, "engine_rc": rc, "seconds": secs,
+        "result": res_path if os.path.exists(res_path) else None,
+        "patch": patch or None, "run_dir": run}
+if mode == "rw" and dirty == "1":
+    meta["warning"] = "原工作区有未提交改动,worktree 基于 HEAD,不含这些改动"
+if mode == "rw" and subm == "1":
+    meta["warning_submodules"] = "worktree 未检出子模块(目录为空),涉及子模块的任务结果不可信"
+meta.update({k: v for k, v in extra.items() if v is not None})
+if code != 0:
+    meta["stderr_tail"] = err.strip()[-400:]
+    if not err.strip():
+        meta["stdout_tail"] = out.strip()[-400:]
+text = json.dumps(meta, ensure_ascii=False).encode("utf-8", "replace").decode("utf-8")
+with open(os.path.join(run, "meta.json"), "w", encoding="utf-8") as f:
+    f.write(text + "\n")
+print(text)
+sys.exit(code)
+PY
