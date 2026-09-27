@@ -31,7 +31,7 @@ case "${1:-}" in
       echo "$h:已加入 project_doc_fallback_filenames"
     done
     echo "验证(不调用模型):"
-    ( cd /path/to/workspace/sample_project_1 2>/dev/null && codex debug prompt-input 2>/dev/null | grep -c 'AGENTS.md instructions' ) \
+    ( cd "${MAKEWAND_TEST_DIR:-$HOME}" 2>/dev/null && codex debug prompt-input 2>/dev/null | grep -c 'AGENTS.md instructions' ) \
       || echo "  (codex debug prompt-input 不可用,跳过验证)" ;;
 
   codex-global)

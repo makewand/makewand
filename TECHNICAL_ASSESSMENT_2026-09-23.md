@@ -1,6 +1,6 @@
 # Makewand 技术评估报告
 
-评估日期：2026-09-23。范围：/path/to/workspace/makewand 当前工作区，基准提交 c0287b3 及评估开始时已有的 18 项未提交文件变更；不是对仅该提交或某个发布版本的评估。
+评估日期：2026-09-23。范围：makewand 当前工作区，基准提交 c0287b3 及评估开始时已有的 18 项未提交文件变更；不是对仅该提交或某个发布版本的评估。
 
 **综合评分：68/100。定位：有明显工程投入、适合可信单用户环境受控试用的多模型开发工具；尚不能据此认定为安全边界完整、策略统一的生产级联合调度平台。** 主要扣分来自已复现的宿主执行绕过、信任参数遗漏，以及两套实现的策略分叉，而非功能数量不足。
 
@@ -22,7 +22,7 @@ Python 负责 run/review/race、候选应用、健康缓存与会话观察；Go 
 | 候选验证 | race 没有调用本地测试门禁 | 独立副本验证，保留基线测试，强度分级 |
 
 这种拆分有利于 Python 快速适配 CLI、Go 承担长驻服务，但语义重复已经形成实质性风险：同一个产品的不同入口，对安全、预算和成功状态给出不同保证。
-依据：[Go→Python 入口](/path/to/workspace/makewand/cmd/makewand/main.go:81)、[Python→Go 入口](/path/to/workspace/makewand/makewand/cli.py:303)。
+依据：[Go→Python 入口](cmd/makewand/main.go:81)、[Python→Go 入口](makewand/cli.py:303)。
 
 ### 2. 意图与路由算法
 
@@ -35,7 +35,7 @@ score = 基础偏好 + 领域加权 + 档位加权 + 调用窗口惩罚，再过
 权重可解释，但没有实验结果证明当前数值具有最优性。问答、独立 review、race 另有固定选择逻辑，并未统一使用该算法。无候选时硬回退 agy，也可能重新引入已不可用的 provider。
 
 Go 确实实现了 Beta 后验抽样和质量反馈，而不是仅在文档中宣称自适应；排序还受订阅/API 访问优先级、故障率、配额分段和冷启动静态顺序约束。其价值在于可以利用实际验证结果调整偏好。局限是质量信号主要来自测试与裁判选择，仍会受任务分布、模型升级、裁判偏差影响；未见统一的跨语言反馈账本或完整的任务条件化质量模型。
-依据：[意图分类](/path/to/workspace/makewand/makewand/orchestrator.py:463)、[Python 评分](/path/to/workspace/makewand/makewand/orchestrator.py:629)、[Go 排序](/path/to/workspace/makewand/router/strategy.go:416)、[后验抽样](/path/to/workspace/makewand/router/strategy.go:307)。
+依据：[意图分类](makewand/orchestrator.py:463)、[Python 评分](makewand/orchestrator.py:629)、[Go 排序](router/strategy.go:416)、[后验抽样](router/strategy.go:307)。
 
 ### 3. 滑动窗口配额与防限流
 
@@ -51,7 +51,7 @@ Python 的实现值得肯定：记录事件的完整读改写周期使用 flock�
 - 多进程可以同时读取尚未计入在途请求的窗口，锁住写账并不等于原子准入。
 
 Go 通过 Claude OAuth 用量源、Codex 会话日志、AGY 登录状态构造快照；预测额度用于软排序，实际 429 用于执行边界封禁，并结合最早重置时间和熔断器。设计比 Python 更完整，但数据仍有陈旧、缺失、来源变化的风险，也未覆盖所有 Python provider。
-依据：[Python usage](/path/to/workspace/makewand/makewand/usage.py:90)、[记录入口](/path/to/workspace/makewand/makewand/orchestrator.py:597)、[健康探测](/path/to/workspace/makewand/makewand/health.py:209)、[Go 配额门禁](/path/to/workspace/makewand/router/quota_gate.go:1)。
+依据：[Python usage](makewand/usage.py:90)、[记录入口](makewand/orchestrator.py:597)、[健康探测](makewand/health.py:209)、[Go 配额门禁](router/quota_gate.go:1)。
 
 ### 4. 双模型竞速与独立审查
 
@@ -65,7 +65,7 @@ Python race 为两个候选创建独立目录，保留 diff、耗时、基线与
 - winner 依赖自然语言正则；裁判失败但仅一个候选执行成功时，仍可能推荐该候选。
 
 Go CandidateSelection 则支持验证强度、基线测试保护、达到强度门槛后取消其他工作，并继续收集已开始尝试的用量，避免漏账。这是应当复用的较成熟实现。即便 provider 名称不同，也不能保证底层模型或供应商不同，尤其在聚合 CLI 可切换底层模型时。
-依据：[Python race](/path/to/workspace/makewand/makewand/orchestrator.py:1594)、[裁判输入](/path/to/workspace/makewand/makewand/orchestrator.py:1714)、[Go 候选选择](/path/to/workspace/makewand/internal/engine/candidate_service.go:136)。
+依据：[Python race](makewand/orchestrator.py:1594)、[裁判输入](makewand/orchestrator.py:1714)、[Go 候选选择](internal/engine/candidate_service.go:136)。
 
 ### 5. Auto-Fix 与质量门禁
 
@@ -80,7 +80,7 @@ Python run 默认最多修复两轮，复审排除实际修复引擎，存在独
 - Go BuildPipeline 在 ReviewError、ReviewNoFixFiles 以及单 provider 时可继续，修复后也不统一强制复审。这属于另一套产品策略，不能套用 Python 的严格闭环宣传。
 
 另一个已复现的问题：让 Git helper 返回退出码 128 后，独立 run_review 仍返回 exit 0、pass=true。原因是 Git 错误被变成空 diff，再被解释成“无修改”。
-依据：[Python 最终门禁](/path/to/workspace/makewand/makewand/orchestrator.py:1210)、[测试发现](/path/to/workspace/makewand/makewand/orchestrator.py:224)、[Go 非阻塞审查](/path/to/workspace/makewand/internal/engine/buildpipeline.go:214)、[空 diff 通过](/path/to/workspace/makewand/makewand/orchestrator.py:1501)。
+依据：[Python 最终门禁](makewand/orchestrator.py:1210)、[测试发现](makewand/orchestrator.py:224)、[Go 非阻塞审查](internal/engine/buildpipeline.go:214)、[空 diff 通过](makewand/orchestrator.py:1501)。
 
 ## 二、安全防护与沙箱隔离评析
 
@@ -100,34 +100,34 @@ run_review 先在宿主调用 get_git_diff，后调用 provider；git_helper.run
 
 影响：能影响该仓库 Git 配置或相关扩展的内容，可能以 Makewand 用户身份执行宿主命令；这也关系到模型可以写 .git 的候选目录在返回宿主处理时的边界。普通远端 Git clone 不自动继承攻击者的本地 .git/config，因此不能描述成“克隆任意仓库立即执行”；本次证明的是处理已带该配置的工作区确实越过沙箱。
 修复：仓库 Git 操作使用统一隔离执行器，过滤环境与配置、禁用可执行扩展；不要仅加 --no-ext-diff 而遗漏 textconv/filter/fsmonitor/hooks 等不同路径。
-依据：[宿主 Git runner](/path/to/workspace/makewand/makewand/git_helper.py:13)、[差异提取](/path/to/workspace/makewand/makewand/git_helper.py:108)、[review 调用顺序](/path/to/workspace/makewand/makewand/orchestrator.py:1501)。
+依据：[宿主 Git runner](makewand/git_helper.py:13)、[差异提取](makewand/git_helper.py:108)、[review 调用顺序](makewand/orchestrator.py:1501)。
 
 **S02｜高危｜只读直接调用在缺少 cwd 时跳过 bwrap，mock 执行器已验证。**
 
 CLI 的 --cwd 默认 None。provider untrusted 分支检查 bwrap 存在、拒绝写模式，但真正包装要求 repo_root and cwd。execute_claude_task(..., readonly=True, repo_trust="untrusted") 不给 cwd 时，最终 runner 收到的是 claude 本体，cwd=None，而非 bwrap。相同包装模式存在于其他适配器。
 影响：显式要求 untrusted 的调用仍可能继承宿主环境和网络；只读工具参数不是进程隔离。普通直接写调用则会因缺少 cwd 被拒绝，与 README 用法也存在偏差。
 修复：在入口归一化 cwd，再构造不可降级的执行计划；对所有 provider 做“真实包装发生”的参数化测试。
-依据：[Claude 检查与包装](/path/to/workspace/makewand/makewand/providers/claude.py:43)、[CLI 参数转交](/path/to/workspace/makewand/makewand/cli.py:530)。
+依据：[Claude 检查与包装](makewand/providers/claude.py:43)、[CLI 参数转交](makewand/cli.py:530)。
 
 **S03｜高危｜race 裁判丢失 repo_trust，mock 已验证。**
 
 race 选手收到 untrusted，裁判 execute_agy_task 没有 repo_trust 参数，恢复默认 trusted、allow_network=True。即使两位选手都失败，代码仍调用裁判；mock 复现得到一次默认可信裁判调用，之后 race 才返回失败。
 修复：trust/network/readonly 使用不可变 ExecutionPolicy，贯穿实现、修复、探活、裁判、Git 和测试；untrusted 禁止写的任务应在任何仓库初始化前整体拒绝。
-依据：[裁判调用](/path/to/workspace/makewand/makewand/orchestrator.py:1723)。交互入口也未携带 repo_trust，应纳入同一矩阵测试：[交互入口](/path/to/workspace/makewand/makewand/cli.py:477)。
+依据：[裁判调用](makewand/orchestrator.py:1723)。交互入口也未携带 repo_trust，应纳入同一矩阵测试：[交互入口](makewand/cli.py:477)。
 
 **S04｜高危边界缺口｜凭据隔离不完整，部分已复现。**
 
 provider 模式统一透传多家 API_KEY；伪造环境实验确认 Claude 包装同时包含 ANTHROPIC_API_KEY、OPENAI_API_KEY、XAI_API_KEY，跨供应商凭据隔离不成立。当前 provider 的配置目录实际使用可写 --bind，和函数注释中的“只读授权凭据”不一致；可读整个 HOME 配合黑名单也会遗漏其他敏感文件。Muse 还跳过 PID 隔离，并开放运行时目录，不能沿用其他 provider 的隔离强度描述。
 影响：被注入的 agent 或其子进程可接触额外凭据与持久配置；本次仅验证伪造变量，没有读取或外传真实凭据。
 修复：按 provider 最小化环境；凭据与可写缓存拆分；认证尽可能移到受控 broker；为兼容性例外制定独立能力声明。
-依据：[认证目录挂载](/path/to/workspace/makewand/makewand/sandbox.py:138)、[环境透传](/path/to/workspace/makewand/makewand/sandbox.py:249)、[Muse 例外](/path/to/workspace/makewand/makewand/sandbox.py:125)。
+依据：[认证目录挂载](makewand/sandbox.py:138)、[环境透传](makewand/sandbox.py:249)、[Muse 例外](makewand/sandbox.py:125)。
 
 **S05｜条件性高危｜只读根和禁网不能阻断可见 Unix socket，已真实复现。**
 
 在 /var/tmp 创建自有 Unix socket，Python run_in_sandbox(readonly=True, allow_network=False) 仍成功连接并收到无害标记。ro-bind / / 保留宿主可读文件树和未遮蔽 socket；--unshare-net 不阻断所有基于路径的本地 socket。
 影响取决于宿主是否暴露当前用户有权限连接的代理、D-Bus、容器等服务；本次没有连接这些真实服务，不能据此声称已获取 root。Go 也采用宽根挂载，值得用相同矩阵单独验证。
 修复：改为最小 rootfs 挂载白名单，遮蔽 /run、/var/run、/var/tmp 等非必需路径，只显式代理必要 IPC。
-依据：[Python 挂载](/path/to/workspace/makewand/makewand/sandbox.py:120)、[Go 挂载](/path/to/workspace/makewand/internal/engine/verify_isolation.go:150)、[Linux Unix socket 说明](https://man7.org/linux/man-pages/man7/unix.7.html)。
+依据：[Python 挂载](makewand/sandbox.py:120)、[Go 挂载](internal/engine/verify_isolation.go:150)、[Linux Unix socket 说明](https://man7.org/linux/man-pages/man7/unix.7.html)。
 
 ### 3. 其他安全与可用性边界
 
@@ -168,7 +168,7 @@ provider 模式统一透传多家 API_KEY；伪造环境实验确认 Claude 包�
 这些是包级语句覆盖率，不是分支覆盖率；serverui 的 Go 覆盖率不表示浏览器 JavaScript 已被全面测试。没有测量 Python 行/分支覆盖率。
 
 CI 已包含真实 bwrap smoke、全仓测试、race、vet、govulncheck、lint 和构建，是明显优点。本次没有执行在线 govulncheck 或 golangci-lint，不能把 CI 配置当成当前运行结果。Makefile 的 test-go 仅列出部分包，和 CI 全仓门禁不完全一致。
-依据：[CI](/path/to/workspace/makewand/.github/workflows/ci.yml:1)、[Makefile](/path/to/workspace/makewand/Makefile:11)。
+依据：[CI](.github/workflows/ci.yml:1)、[Makefile](Makefile:11)。
 
 ### 2. 并发与可靠性
 
@@ -188,7 +188,7 @@ CI 已包含真实 bwrap smoke、全仓测试、race、vet、govulncheck、lint 
 - observer 基于 tmux 文本、ps、load average 输出启发式建议；不是死锁证明或分布式追踪。sample_lines 和命令参数可能保存敏感内容，缺少统一脱敏。discovery 是本地配置解析加静态列表，不是实时能力协商。
 - Python 测试部分路径调用实际全局用量记录，测试输出受真实窗口统计影响；应使用隔离配置根，避免测试污染用户状态及路由不确定性。
 
-依据：[进程管理](/path/to/workspace/makewand/makewand/providers/base.py:64)、[应用锁](/path/to/workspace/makewand/makewand/candidate.py:277)、[journal](/path/to/workspace/makewand/makewand/candidate.py:428)、[Go breaker](/path/to/workspace/makewand/router/circuit_breaker.go:61)、[服务配置](/path/to/workspace/makewand/cmd/makewand/serve.go:273)、[observer 存储](/path/to/workspace/makewand/makewand/observer.py:454)。
+依据：[进程管理](makewand/providers/base.py:64)、[应用锁](makewand/candidate.py:277)、[journal](makewand/candidate.py:428)、[Go breaker](router/circuit_breaker.go:61)、[服务配置](cmd/makewand/serve.go:273)、[observer 存储](makewand/observer.py:454)。
 
 ### 3. 服务端生产边界
 
@@ -197,7 +197,7 @@ Go 服务并非简单转发壳，已有可用的管理与多租户基础。但�
 HTTP 明确只提供兼容子集，max_tokens/temperature 被接受但忽略；客户端可能误以为预算或采样参数已生效。应声明 capability 或明确拒绝不支持字段。
 
 “零额外 token 费用”只能是符合特定配置的使用方式，不能概括整个系统：Go 包含计费 API 路由，Python 也透传 API 凭据。实际账单、供应商规则与模型版本未在本次实测。
-依据：[预算预留](/path/to/workspace/makewand/router/http.go:1316)、[strict accounting 默认值](/path/to/workspace/makewand/cmd/makewand/serve.go:407)、[兼容参数](/path/to/workspace/makewand/router/http.go:548)。
+依据：[预算预留](router/http.go:1316)、[strict accounting 默认值](cmd/makewand/serve.go:407)、[兼容参数](router/http.go:548)。
 
 ## 四、核心优势与现存不足/潜在隐患
 

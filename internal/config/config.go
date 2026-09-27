@@ -128,14 +128,15 @@ func DefaultConfig() *Config {
 }
 
 // NormalizeUsageMode returns a supported usage mode, defaulting to balanced.
+// Accepts canonical Go modes (fast, balanced, power) and Python aliases (standard, deep).
 // This also migrates legacy configs where usage_mode was absent, empty, or invalid.
 func NormalizeUsageMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case UsageModeFast:
 		return UsageModeFast
-	case UsageModeBalanced:
+	case UsageModeBalanced, "standard":
 		return UsageModeBalanced
-	case UsageModePower:
+	case UsageModePower, "deep":
 		return UsageModePower
 	default:
 		return DefaultUsageMode

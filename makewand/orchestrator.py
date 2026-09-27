@@ -635,6 +635,9 @@ def dispatch_task(
                 effort = dyn_effort
         except Exception:
             tier = "standard"
+    else:
+        from makewand.config import normalize_tier
+        tier = normalize_tier(tier)
     if engine == "claude":
         res = execute_claude_task(prompt, cwd=cwd, timeout=timeout, tier=tier, model=model, effort=effort, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "codex":
@@ -718,6 +721,9 @@ def select_optimal_engine_pair(
     if boost:
         tier = "deep"
         reasons.append("⚡ [Boost Overclock] 用户显式启用强制超频模式：穿透所有软削峰与限流惩罚，全力调度最强旗舰模型！")
+    else:
+        from makewand.config import normalize_tier
+        tier = normalize_tier(tier)
 
     # Base scores:
     # Claude: primary general software development & engineering (2.0)
@@ -1022,6 +1028,9 @@ def run_pipeline(
         print(c("⚡ [Makewand Boost] 强制超频模式已启用：穿透软配额限制，分配最高推理算力！", COLOR_MAGENTA + COLOR_BOLD))
     elif tier == "auto" or not tier:
         tier = "auto"
+    else:
+        from makewand.config import normalize_tier
+        tier = normalize_tier(tier)
 
     # Decouple per-stage timeout from pipeline total budget
     if total_budget is None:

@@ -214,6 +214,10 @@ func TestNormalizeUsageMode(t *testing.T) {
 		{input: "fast", want: UsageModeFast},
 		{input: " BALANCED ", want: UsageModeBalanced},
 		{input: "POWER", want: UsageModePower},
+		{input: "standard", want: UsageModeBalanced},
+		{input: "deep", want: UsageModePower},
+		{input: " STANDARD ", want: UsageModeBalanced},
+		{input: " DEEP ", want: UsageModePower},
 		{input: "legacy", want: UsageModeBalanced},
 	}
 

@@ -29,51 +29,74 @@ DEFAULT_SYSTEM_PROMPTS = {
     )
 }
 
-def _make_http_request(url: str, headers: Dict[str, str], data: Dict[str, Any], timeout: int = 180, stream: bool = False, print_prefix: str = "") -> Tuple[int, str, Optional[str]]:
-    """Executes HTTP POST request using urllib.request."""
+def _make_http_request(
+    url: str,
+    headers: Dict[str, str],
+    data: Dict[str, Any],
+    timeout: int = 180,
+    stream: bool = False,
+    print_prefix: str = "",
+    max_retries: int = 2,
+    backoff_factor: float = 0.5,
+) -> Tuple[int, str, Optional[str]]:
+    """Executes HTTP POST request using urllib.request with exponential backoff retry."""
     body_bytes = json.dumps(data).encode("utf-8")
-    req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            code = resp.status
-            if stream:
-                full_text = []
-                # Simple SSE / chunk streaming
-                for line in resp:
-                    line_str = line.decode("utf-8", errors="replace")
-                    if line_str.startswith("data: "):
-                        data_part = line_str[6:].strip()
-                        if data_part == "[DONE]":
-                            break
-                        try:
-                            delta_json = json.loads(data_part)
-                            # OpenAI style
-                            delta_content = delta_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                            # Anthropic style
-                            if not delta_content and "delta" in delta_json:
-                                delta_content = delta_json["delta"].get("text", "")
-                            if delta_content:
-                                full_text.append(delta_content)
-                                if print_prefix:
-                                    sys.stdout.write(delta_content)
-                                    sys.stdout.flush()
-                        except Exception:
-                            pass
-                if print_prefix:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                return code, "".join(full_text), None
-            else:
-                raw_response = resp.read().decode("utf-8", errors="replace")
-                return code, raw_response, None
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
-        return e.code, err_body, f"HTTP Error {e.code}: {e.reason} - {err_body[:200]}"
-    except urllib.error.URLError as e:
-        return -1, "", f"Network/URL Error: {e.reason}"
-    except Exception as e:
-        return -1, "", f"Execution Exception: {str(e)}"
+    attempt = 0
+    while True:
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = resp.status
+                if stream:
+                    full_text = []
+                    # Simple SSE / chunk streaming
+                    for line in resp:
+                        line_str = line.decode("utf-8", errors="replace")
+                        if line_str.startswith("data: "):
+                            data_part = line_str[6:].strip()
+                            if data_part == "[DONE]":
+                                break
+                            try:
+                                delta_json = json.loads(data_part)
+                                delta_content = ""
+                                choices = delta_json.get("choices")
+                                if choices and isinstance(choices, list) and len(choices) > 0:
+                                    delta_content = choices[0].get("delta", {}).get("content", "")
+                                elif "delta" in delta_json:
+                                    delta_content = delta_json["delta"].get("text", "")
+                                if delta_content:
+                                    full_text.append(delta_content)
+                                    if print_prefix:
+                                        sys.stdout.write(delta_content)
+                                        sys.stdout.flush()
+                            except Exception:
+                                pass
+                    if print_prefix:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    return code, "".join(full_text), None
+                else:
+                    raw_response = resp.read().decode("utf-8", errors="replace")
+                    return code, raw_response, None
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                attempt += 1
+                sleep_sec = backoff_factor * (2 ** (attempt - 1))
+                time.sleep(sleep_sec)
+                continue
+            return e.code, err_body, f"HTTP Error {e.code}: {e.reason} - {err_body[:200]}"
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_retries:
+                attempt += 1
+                sleep_sec = backoff_factor * (2 ** (attempt - 1))
+                time.sleep(sleep_sec)
+                continue
+            reason = getattr(e, "reason", str(e))
+            return -1, "", f"Network/URL Error: {reason}"
+        except Exception as e:
+            return -1, "", f"Execution Exception: {str(e)}"
 
 def call_api_chat(
     provider: str,
@@ -86,13 +109,24 @@ def call_api_chat(
     cwd: Optional[str] = None,
     role: str = "coder",
     print_prefix: str = "",
-    extra_params: Optional[Dict[str, Any]] = None
+    extra_params: Optional[Dict[str, Any]] = None,
+    max_retries: int = 2,
+    backoff_factor: float = 0.5,
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Dispatches a task via API to OpenAI, Anthropic, Gemini, xAI, or Local (Ollama/vLLM).
     Returns (success: bool, response_content: str, error_msg: Optional[str]).
     """
+    if extra_params:
+        extra_params = dict(extra_params)
+        if "max_retries" in extra_params:
+            max_retries = extra_params.pop("max_retries")
+        if "backoff_factor" in extra_params:
+            backoff_factor = extra_params.pop("backoff_factor")
+
     p = provider.lower().strip()
+    from makewand.config import normalize_tier
+    tier = normalize_tier(tier)
     cfg = get_api_config(p)
     api_key = cfg.get("api_key")
     base_url = cfg.get("base_url")
@@ -126,7 +160,10 @@ def call_api_chat(
             "messages": [{"role": "user", "content": prompt}],
             "stream": stream
         }
-        code, raw, err = _make_http_request(endpoint, headers, data, timeout=timeout, stream=stream, print_prefix=print_prefix)
+        code, raw, err = _make_http_request(
+            endpoint, headers, data, timeout=timeout, stream=stream,
+            print_prefix=print_prefix, max_retries=max_retries, backoff_factor=backoff_factor
+        )
         if code != 200:
             return False, raw, err or f"Anthropic API returned status {code}"
         if stream:
@@ -153,7 +190,10 @@ def call_api_chat(
             "contents": [{"role": "user", "parts": [{"text": full_content}]}],
             "generationConfig": {"temperature": 0.2}
         }
-        code, raw, err = _make_http_request(endpoint, headers, data, timeout=timeout, stream=False)
+        code, raw, err = _make_http_request(
+            endpoint, headers, data, timeout=timeout, stream=False,
+            max_retries=max_retries, backoff_factor=backoff_factor
+        )
         if code != 200:
             return False, raw, err or f"Gemini API returned status {code}"
         try:
@@ -263,7 +303,10 @@ def call_api_chat(
         if p in ("local", "ollama") and "keep_alive" not in data:
             data["keep_alive"] = "0"
 
-        code, raw, err = _make_http_request(endpoint, headers, data, timeout=timeout, stream=stream, print_prefix=print_prefix)
+        code, raw, err = _make_http_request(
+            endpoint, headers, data, timeout=timeout, stream=stream,
+            print_prefix=print_prefix, max_retries=max_retries, backoff_factor=backoff_factor
+        )
         if code != 200:
             return False, raw, err or f"{p.upper()} API returned status {code}"
         if stream:

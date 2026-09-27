@@ -103,6 +103,53 @@ func tryDelegateToPythonOrchestrator(args []string) bool {
 		}
 	}
 
+	// Normalize --mode / --tier across Go and Python boundary:
+	// Translate flag and values so Python receives --tier with canonical Python names.
+	translatedArgs := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--mode" && i+1 < len(args) {
+			modeVal := args[i+1]
+			i++
+			if pyTier, ok := engine.ToPythonTier(modeVal); ok {
+				translatedArgs = append(translatedArgs, "--tier", pyTier)
+			} else {
+				translatedArgs = append(translatedArgs, "--tier", modeVal)
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--mode=") {
+			modeVal := strings.TrimPrefix(arg, "--mode=")
+			if pyTier, ok := engine.ToPythonTier(modeVal); ok {
+				translatedArgs = append(translatedArgs, "--tier="+pyTier)
+			} else {
+				translatedArgs = append(translatedArgs, "--tier="+modeVal)
+			}
+			continue
+		}
+		if arg == "--tier" && i+1 < len(args) {
+			tierVal := args[i+1]
+			i++
+			if pyTier, ok := engine.ToPythonTier(tierVal); ok {
+				translatedArgs = append(translatedArgs, "--tier", pyTier)
+			} else {
+				translatedArgs = append(translatedArgs, "--tier", tierVal)
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--tier=") {
+			tierVal := strings.TrimPrefix(arg, "--tier=")
+			if pyTier, ok := engine.ToPythonTier(tierVal); ok {
+				translatedArgs = append(translatedArgs, "--tier="+pyTier)
+			} else {
+				translatedArgs = append(translatedArgs, "--tier="+tierVal)
+			}
+			continue
+		}
+		translatedArgs = append(translatedArgs, arg)
+	}
+	args = translatedArgs
+
 	pyBin, err := exec.LookPath("python3")
 	if err != nil {
 		pyBin, err = exec.LookPath("python")
@@ -259,10 +306,11 @@ Flags:
 			}
 
 			if rootModeFlag != "" {
-				if _, ok := model.ParseUsageMode(rootModeFlag); !ok {
+				m, ok := model.ParseUsageMode(rootModeFlag)
+				if !ok {
 					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", rootModeFlag)
 				}
-				cfg.UsageMode = rootModeFlag
+				cfg.UsageMode = m.String()
 			}
 
 			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
@@ -314,6 +362,7 @@ Flags:
 	rootCmd.PersistentFlags().StringVar(&repoTrustFlag, "repo-trust", "trusted", "repository trust level: trusted (default) or untrusted (only direct API providers, fail closed)")
 	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`)")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
+	rootCmd.Flags().StringVar(&rootModeFlag, "tier", "", "alias for --mode: fast, balanced (standard), power (deep)")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
 	rootCmd.Flags().DurationVar(&rootTimeoutFlag, "timeout", 0, "timeout for --print (default: auto per mode)")
 
@@ -348,10 +397,11 @@ func newCmd() *cobra.Command {
 			}
 
 			if modeFlag != "" {
-				if _, ok := model.ParseUsageMode(modeFlag); !ok {
+				m, ok := model.ParseUsageMode(modeFlag)
+				if !ok {
 					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
 				}
-				cfg.UsageMode = modeFlag
+				cfg.UsageMode = m.String()
 			}
 
 			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
@@ -364,6 +414,7 @@ func newCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: fast, balanced, power")
+	cmd.Flags().StringVar(&modeFlag, "tier", "", "alias for --mode: fast, balanced (standard), power (deep)")
 	return cmd
 }
 
@@ -384,10 +435,11 @@ func chatCmd() *cobra.Command {
 			}
 
 			if modeFlag != "" {
-				if _, ok := model.ParseUsageMode(modeFlag); !ok {
+				m, ok := model.ParseUsageMode(modeFlag)
+				if !ok {
 					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
 				}
-				cfg.UsageMode = modeFlag
+				cfg.UsageMode = m.String()
 			}
 
 			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
@@ -405,6 +457,7 @@ func chatCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&modeFlag, "mode", "", "usage mode: fast, balanced, power")
+	cmd.Flags().StringVar(&modeFlag, "tier", "", "alias for --mode: fast, balanced (standard), power (deep)")
 	return cmd
 }
 
@@ -581,6 +634,7 @@ execution acknowledgment required before that opt-in takes effect.`,
 	}
 
 	cmd.Flags().StringVar(&modeFlag, "mode", "", "routing mode to save: fast, balanced, or power (default: keep configured mode; balanced when unset)")
+	cmd.Flags().StringVar(&modeFlag, "tier", "", "alias for --mode: fast, balanced (standard), power (deep)")
 	return cmd
 }
 

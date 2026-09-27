@@ -16,7 +16,9 @@ from makewand.config import (
     COLOR_RED,
     COLOR_BLUE,
     COLOR_PURPLE,
-    COLOR_RESET
+    COLOR_RESET,
+    normalize_tier,
+    tier_to_go_mode,
 )
 from makewand.health import get_or_update_status
 from makewand.discovery import discover_available_models
@@ -526,7 +528,8 @@ def main():
     p_run = subparsers.add_parser("run", help="Run auto-adaptive multi-model pipeline with auto-fix loop", parents=[sub_common_parser])
     p_run.add_argument("prompt", help="The task prompt to execute")
     p_run.add_argument("--cwd", help="Target working directory")
-    p_run.add_argument("--tier", choices=["auto", "fast", "standard", "deep"], default="auto", help="Execution tier: fast, standard, deep")
+    p_run.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="auto", help="Execution tier: fast, standard (balanced), deep (power)")
+    p_run.add_argument("--mode", dest="tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], help="Alias for --tier: fast, balanced, power")
     p_run.add_argument("--model", help="Explicit model override")
     p_run.add_argument("--no-auto-fix", dest="auto_fix", action="store_false", default=True, help="Disable review defect auto-fix loop")
     p_run.add_argument("--max-fix", type=int, default=2, help="Maximum auto-fix iterations (default: 2)")
@@ -564,7 +567,8 @@ def main():
     p_claude = subparsers.add_parser("claude", help="Run prompt directly with Claude Code subscription", parents=[sub_common_parser])
     p_claude.add_argument("prompt", help="Prompt for Claude")
     p_claude.add_argument("--cwd", help="Working directory")
-    p_claude.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_claude.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_claude.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_claude.add_argument("--model", help="Specific model name")
     p_claude.add_argument("--stream", action="store_true", default=False)
     p_claude.add_argument("--timeout", type=int, default=300)
@@ -573,7 +577,8 @@ def main():
     p_codex = subparsers.add_parser("codex", help="Run prompt directly with Codex CLI subscription", parents=[sub_common_parser])
     p_codex.add_argument("prompt", help="Prompt for Codex")
     p_codex.add_argument("--cwd", help="Working directory")
-    p_codex.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_codex.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_codex.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_codex.add_argument("--model", help="Specific model name")
     p_codex.add_argument("--stream", action="store_true", default=False)
     p_codex.add_argument("--timeout", type=int, default=300)
@@ -582,7 +587,8 @@ def main():
     p_agy = subparsers.add_parser("agy", help="Run prompt directly with Antigravity CLI subscription", parents=[sub_common_parser])
     p_agy.add_argument("prompt", help="Prompt for Antigravity")
     p_agy.add_argument("--cwd", help="Working directory")
-    p_agy.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_agy.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_agy.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_agy.add_argument("--model", help="Specific model name")
     p_agy.add_argument("--stream", action="store_true", default=False)
     p_agy.add_argument("--timeout", type=int, default=300)
@@ -591,7 +597,8 @@ def main():
     p_muse = subparsers.add_parser("muse", help="Run prompt directly with Muse Code subscription", parents=[sub_common_parser])
     p_muse.add_argument("prompt", help="Prompt for Muse Code")
     p_muse.add_argument("--cwd", help="Working directory")
-    p_muse.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_muse.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_muse.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_muse.add_argument("--model", help="Specific model name")
     p_muse.add_argument("--stream", action="store_true", default=False)
     p_muse.add_argument("--timeout", type=int, default=300)
@@ -600,7 +607,8 @@ def main():
     p_grok = subparsers.add_parser("grok", help="Run prompt directly with Grok Build CLI (xAI subscription)", parents=[sub_common_parser])
     p_grok.add_argument("prompt", help="Prompt for Grok")
     p_grok.add_argument("--cwd", help="Working directory")
-    p_grok.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_grok.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_grok.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_grok.add_argument("--model", help="Specific model name")
     p_grok.add_argument("--stream", action="store_true", default=False)
     p_grok.add_argument("--timeout", type=int, default=300)
@@ -609,7 +617,8 @@ def main():
     p_local = subparsers.add_parser("local", help="Run prompt directly with local self-hosted model (Ollama / vLLM, 0 token cost)", parents=[sub_common_parser])
     p_local.add_argument("prompt", help="Prompt for local model")
     p_local.add_argument("--cwd", help="Working directory")
-    p_local.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_local.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_local.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_local.add_argument("--model", help="Specific model name (e.g. gemma4:31b, llama3.2)")
     p_local.add_argument("--stream", action="store_true", default=False)
     p_local.add_argument("--timeout", type=int, default=300)
@@ -648,7 +657,8 @@ def main():
     p_aider = subparsers.add_parser("aider", help="Run prompt directly with Aider CLI pair programmer", parents=[sub_common_parser])
     p_aider.add_argument("prompt", help="Prompt for Aider")
     p_aider.add_argument("--cwd", help="Working directory")
-    p_aider.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_aider.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_aider.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_aider.add_argument("--model", help="Specific model name")
     p_aider.add_argument("--stream", action="store_true", default=False)
     p_aider.add_argument("--timeout", type=int, default=300)
@@ -657,7 +667,8 @@ def main():
     p_deepseek = subparsers.add_parser("deepseek", help="Run prompt directly with DeepSeek API", parents=[sub_common_parser])
     p_deepseek.add_argument("prompt", help="Prompt for DeepSeek")
     p_deepseek.add_argument("--cwd", help="Working directory")
-    p_deepseek.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_deepseek.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_deepseek.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_deepseek.add_argument("--model", help="Specific model name (e.g. deepseek-chat, deepseek-reasoner)")
     p_deepseek.add_argument("--stream", action="store_true", default=False)
     p_deepseek.add_argument("--timeout", type=int, default=300)
@@ -666,7 +677,8 @@ def main():
     p_qwen = subparsers.add_parser("qwen", help="Run prompt directly with Aliyun Qwen API", parents=[sub_common_parser])
     p_qwen.add_argument("prompt", help="Prompt for Qwen")
     p_qwen.add_argument("--cwd", help="Working directory")
-    p_qwen.add_argument("--tier", choices=["fast", "standard", "deep"], default="standard")
+    p_qwen.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+    p_qwen.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_qwen.add_argument("--model", help="Specific model name (e.g. qwen2.5-coder-32b-instruct, qwen-max)")
     p_qwen.add_argument("--stream", action="store_true", default=False)
     p_qwen.add_argument("--timeout", type=int, default=300)
@@ -696,6 +708,8 @@ def main():
                 break
 
     args = parser.parse_args()
+    if hasattr(args, "tier") and args.tier:
+        args.tier = normalize_tier(args.tier)
 
     if not args.subcommand:
         from makewand.interactive import start_interactive_session
@@ -722,7 +736,7 @@ def main():
         ok = run_pipeline(
             args.prompt,
             cwd=args.cwd,
-            tier=args.tier,
+            tier=normalize_tier(args.tier),
             model=args.model,
             stream=args.stream,
             auto_fix=args.auto_fix,

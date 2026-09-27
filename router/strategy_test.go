@@ -80,3 +80,49 @@ func TestSortCandidatesForMode_ColdStartPrefersStaticOrder(t *testing.T) {
 		t.Fatalf("economy cold-start first candidate = %q, want %q (static order)", candidates[0].name, "preferred")
 	}
 }
+
+func TestParseUsageModeAndAliases(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantMode  UsageMode
+		wantOk    bool
+		wantStr   string
+		wantPy    string
+	}{
+		{input: "fast", wantMode: ModeFast, wantOk: true, wantStr: "fast", wantPy: "fast"},
+		{input: "balanced", wantMode: ModeBalanced, wantOk: true, wantStr: "balanced", wantPy: "standard"},
+		{input: "power", wantMode: ModePower, wantOk: true, wantStr: "power", wantPy: "deep"},
+		// Aliases
+		{input: "standard", wantMode: ModeBalanced, wantOk: true, wantStr: "balanced", wantPy: "standard"},
+		{input: "deep", wantMode: ModePower, wantOk: true, wantStr: "power", wantPy: "deep"},
+		{input: " STANDARD ", wantMode: ModeBalanced, wantOk: true, wantStr: "balanced", wantPy: "standard"},
+		{input: " DEEP ", wantMode: ModePower, wantOk: true, wantStr: "power", wantPy: "deep"},
+		// Invalid
+		{input: "unknown", wantMode: 0, wantOk: false},
+		{input: "", wantMode: 0, wantOk: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			mode, ok := ParseUsageMode(tt.input)
+			if ok != tt.wantOk {
+				t.Fatalf("ParseUsageMode(%q) ok = %v, want %v", tt.input, ok, tt.wantOk)
+			}
+			if ok {
+				if mode != tt.wantMode {
+					t.Errorf("ParseUsageMode(%q) = %v, want %v", tt.input, mode, tt.wantMode)
+				}
+				if mode.String() != tt.wantStr {
+					t.Errorf("String() = %q, want %q", mode.String(), tt.wantStr)
+				}
+				if py := UsageModeToPythonTier(mode); py != tt.wantPy {
+					t.Errorf("UsageModeToPythonTier(%v) = %q, want %q", mode, py, tt.wantPy)
+				}
+				norm, normOk := NormalizeModeOrTier(tt.input)
+				if !normOk || norm != tt.wantStr {
+					t.Errorf("NormalizeModeOrTier(%q) = (%q, %v), want (%q, true)", tt.input, norm, normOk, tt.wantStr)
+				}
+			}
+		})
+	}
+}

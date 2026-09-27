@@ -104,6 +104,9 @@ var (
 	ClassifyTask               = router.ClassifyTask
 	EstimateCost               = router.EstimateCost
 	ParseUsageMode             = router.ParseUsageMode
+	UsageModeToPythonTier      = router.UsageModeToPythonTier
+	PythonTierToUsageMode      = router.PythonTierToUsageMode
+	NormalizeModeOrTier        = router.NormalizeModeOrTier
 	MaxTokensForTask           = router.MaxTokensForTask
 	ContextBudgetForProvider   = router.ContextBudgetForProvider
 	ContextBudgetForMode       = router.ContextBudgetForMode

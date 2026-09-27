@@ -93,7 +93,7 @@ cloudflared tunnel create makewand-gateway
 参考仓库中的 `deploy/cloudflare-tunnel.makewand.yml`：
 ```yaml
 tunnel: <Tunnel-UUID>
-credentials-file: /path/to/workspace/.cloudflared/<Tunnel-UUID>.json
+credentials-file: ~/.cloudflared/<Tunnel-UUID>.json
 protocol: http2
 
 ingress:

@@ -5,6 +5,7 @@ Makewand configuration and environment constants.
 import os
 import sys
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 # Cache directories
 CONFIG_DIR = Path.home() / ".config" / "makewand"
@@ -274,6 +275,33 @@ def normalize_provider_name(provider: str) -> str:
     elif p in ("silicon",):
         return "siliconflow"
     return p
+
+def normalize_tier(tier: Optional[str]) -> str:
+    """
+    Normalizes tier/mode string between Python (fast, standard, deep)
+    and Go (fast, balanced, power).
+    """
+    if not tier:
+        return "standard"
+    t = str(tier).lower().strip()
+    if t in ("fast",):
+        return "fast"
+    if t in ("standard", "balanced"):
+        return "standard"
+    if t in ("deep", "power"):
+        return "deep"
+    if t in ("auto",):
+        return "auto"
+    return "standard"
+
+def tier_to_go_mode(tier: Optional[str]) -> str:
+    """Translates Python tier to Go canonical usage mode (fast, balanced, power)."""
+    norm = normalize_tier(tier)
+    if norm == "fast":
+        return "fast"
+    elif norm == "deep":
+        return "power"
+    return "balanced"
 
 def is_provider_enabled(provider: str) -> bool:
     """Returns True if provider is enabled."""

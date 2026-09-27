@@ -5,7 +5,7 @@
 
 # Replace with your actual tunnel UUID generated via `cloudflared tunnel create makewand-gateway`
 tunnel: makewand-gateway
-credentials-file: /path/to/workspace/.cloudflared/makewand-gateway.json
+credentials-file: ~/.cloudflared/makewand-gateway.json
 protocol: http2
 
 ingress:

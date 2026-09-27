@@ -72,7 +72,7 @@ class TestObserver(unittest.TestCase):
                 "status_note": "pipeline running"
             },
             {
-                "name": "sample_project_4",
+                "name": "demo-app",
                 "category": "quota_exhausted",
                 "status_note": "0% left"
             }
@@ -99,8 +99,8 @@ class TestObserver(unittest.TestCase):
             b" 1001   500 pts/1    00:10 agy     agy\n"
             b" 2002   600 pts/36   00:20 codex   /usr/local/bin/codex\n"
             b" 3003   700 pts/38   00:05 claude  /usr/bin/claude\n"
-            b" 4004   800 pts/40   00:15 grok    /path/to/workspace/.grok/bin/grok\n"
-            b" 5005   900 pts/42   00:25 muse    /path/to/workspace/.local/bin/muse\n"
+            b" 4004   800 pts/40   00:15 grok    /opt/grok/bin/grok\n"
+            b" 5005   900 pts/42   00:25 muse    /opt/muse/bin/muse\n"
         )
 
         with patch("subprocess.check_output") as mock_run, \

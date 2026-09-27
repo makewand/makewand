@@ -476,16 +476,19 @@ def start_interactive_session(repo_trust: str = "trusted"):
             print()
             continue
 
-        elif lower.startswith("/tier"):
+        elif lower.split()[0] in ("/tier", "/mode"):
             parts = user_input.split(maxsplit=1)
-            if len(parts) > 1 and parts[1].strip() in ("auto", "fast", "standard", "deep"):
-                current_tier = parts[1].strip()
+            from makewand.config import normalize_tier
+            valid_modes = ("auto", "fast", "standard", "deep", "balanced", "power")
+            if len(parts) > 1 and parts[1].strip().lower() in valid_modes:
+                raw_tier = parts[1].strip().lower()
+                current_tier = normalize_tier(raw_tier)
                 print(c(f"✔ 推理档位已切换为: {current_tier}", COLOR_GREEN))
             else:
                 print(c(f"当前推理档位: {current_tier} (可选: auto, fast, standard, deep)", COLOR_YELLOW))
             continue
 
-        elif lower.startswith(("/model", "/provider")):
+        elif lower.split()[0] in ("/model", "/provider"):
             parts = user_input.split(maxsplit=1)
             from makewand.config import get_active_providers
             all_known = list(dict.fromkeys(["auto", "claude", "codex", "grok", "agy", "muse", "local", "aider"] + get_active_providers()))

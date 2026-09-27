@@ -66,11 +66,11 @@ const terminalScenarios = {
 
 | 会话名称 | 工作区路径 | 操作分型 | 运行态势与细节 | 状态 |
 |---|---|---|---|:---:|
-| <span class="term-cmd">sample_project_1</span> | /path/to/workspace/sample_project_1 | test_ci | PR #852 CI 全绿，已自动合并完成 | <span class="term-success">🟢 闭环就绪</span> |
-| <span class="term-cmd">stock</span> | /path/to/workspace/stock | server_daemon | 零售仪表盘后台服务正常监听 (8765) | <span class="term-success">🟢 运行中</span> |
-| <span class="term-cmd">sample_project_4</span> | /path/to/workspace/sample_project_4 | quota_exhausted | 模型配额已见底 (0% left)，AGY接管 | <span class="term-warn">⚠️ 额度已见底</span> |
-| <span class="term-cmd">sample_project_7</span> | /path/to/workspace/sample_project_7 | test_ci | 单元与端到端自动化测试进行中 | <span class="term-info">🔵 测试中</span> |
-| <span class="term-cmd">makewand</span> | /path/to/workspace/makewand | idle_ready | v3.1.0 已发布，工作区干净待命 | <span class="term-success">🟢 就绪空闲</span> |
+| <span class="term-cmd">project-a</span> | /workspace/project-a | test_ci | PR #852 CI 全绿，已自动合并完成 | <span class="term-success">🟢 闭环就绪</span> |
+| <span class="term-cmd">demo-service</span> | /workspace/demo-service | server_daemon | 零售仪表盘后台服务正常监听 (8765) | <span class="term-success">🟢 运行中</span> |
+| <span class="term-cmd">demo-app</span> | /workspace/demo-app | quota_exhausted | 模型配额已见底 (0% left)，AGY接管 | <span class="term-warn">⚠️ 额度已见底</span> |
+| <span class="term-cmd">project-b</span> | /workspace/project-b | test_ci | 单元与端到端自动化测试进行中 | <span class="term-info">🔵 测试中</span> |
+| <span class="term-cmd">makewand</span> | /workspace/makewand | idle_ready | v3.1.0 已发布，工作区干净待命 | <span class="term-success">🟢 就绪空闲</span> |
 `
 };
 

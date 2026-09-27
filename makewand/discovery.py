@@ -117,7 +117,8 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
     for a given provider and tier based on official local cache and config files.
     Returns: {"model": str, "effort": str, "is_dynamic": bool}
     """
-    tier = (tier or "standard").lower()
+    from makewand.config import normalize_tier
+    tier = normalize_tier(tier)
     
     if provider == "claude":
         # Check Anthropic official model catalog

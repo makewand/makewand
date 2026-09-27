@@ -38,6 +38,8 @@ func TestApplySetupUsageMode(t *testing.T) {
 		{name: "configured mode is canonicalized", configured: " FAST ", want: config.UsageModeFast},
 		{name: "flag overrides configured mode", configured: "power", requested: "balanced", want: config.UsageModeBalanced},
 		{name: "flag is canonicalized", configured: "balanced", requested: " POWER ", want: config.UsageModePower},
+		{name: "standard tier maps to balanced mode", configured: "power", requested: "standard", want: config.UsageModeBalanced},
+		{name: "deep tier maps to power mode", configured: "balanced", requested: "deep", want: config.UsageModePower},
 		{name: "invalid flag is rejected", configured: "balanced", requested: "legacy", want: config.UsageModeBalanced, wantErr: true},
 	}
 
@@ -63,6 +65,8 @@ func TestSetupCmdPersistsRoutingMode(t *testing.T) {
 	}{
 		{name: "legacy empty becomes balanced", want: config.UsageModeBalanced},
 		{name: "mode flag is persisted", args: []string{"--mode", "power"}, want: config.UsageModePower},
+		{name: "tier flag alias standard is persisted as balanced", args: []string{"--tier", "standard"}, want: config.UsageModeBalanced},
+		{name: "tier flag alias deep is persisted as power", args: []string{"--tier", "deep"}, want: config.UsageModePower},
 	}
 
 	for _, tt := range tests {

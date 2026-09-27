@@ -124,13 +124,14 @@ func (c *instanceCostTable) priceFor(modelID string, inputTokens, outputTokens i
 }
 
 // ParseUsageMode converts a string to UsageMode.
+// Supports canonical Go usage modes (fast, balanced, power) and Python tier aliases (standard -> balanced, deep -> power).
 func ParseUsageMode(s string) (UsageMode, bool) {
-	switch strings.ToLower(s) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "fast":
 		return ModeFast, true
-	case "balanced":
+	case "balanced", "standard":
 		return ModeBalanced, true
-	case "power":
+	case "power", "deep":
 		return ModePower, true
 	default:
 		return 0, false
@@ -149,6 +150,35 @@ func (m UsageMode) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// UsageModeToPythonTier maps Go UsageMode to the equivalent Python orchestrator tier string.
+func UsageModeToPythonTier(m UsageMode) string {
+	switch m {
+	case ModeFast:
+		return "fast"
+	case ModeBalanced:
+		return "standard"
+	case ModePower:
+		return "deep"
+	default:
+		return "standard"
+	}
+}
+
+// PythonTierToUsageMode maps Python tier string to Go UsageMode.
+func PythonTierToUsageMode(tier string) (UsageMode, bool) {
+	return ParseUsageMode(tier)
+}
+
+// NormalizeModeOrTier normalizes either Go mode (fast, balanced, power) or Python tier (fast, standard, deep)
+// into canonical Go usage mode string ("fast", "balanced", "power").
+func NormalizeModeOrTier(s string) (string, bool) {
+	m, ok := ParseUsageMode(s)
+	if !ok {
+		return "", false
+	}
+	return m.String(), true
 }
 
 // ParseAccessType determines the AccessType from a config value and provider name.

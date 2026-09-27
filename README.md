@@ -138,6 +138,18 @@ makewand claude "编写测试用例"
 makewand muse "检查系统配置项"
 ```
 
+### 9. 统一模式定义与跨语言契约 (Unified Modes & Tiers Contract)
+
+Makewand 在 Python（`orchestrator` / CLI / REPL）与 Go（`router` / TUI / 守护进程）之间保证双向无缝映射与透明别名支持：
+
+| Go Usage Mode | Python Tier | 档位定位与适用场景 |
+|:---:|:---:|---|
+| `fast` | `fast` | 极速响应、低延迟，适合单测生成与简单语法补齐 |
+| `balanced` | `standard` | 均衡平衡档（默认），适合常规编码重构与流水线执行 |
+| `power` | `deep` | 深度推理、最大思考步数（High Effort），适合复杂并发、架构解耦与深度审计 |
+
+- **跨语言参数对齐**：命令行支持 `--mode` 与 `--tier` 互为别名，无论传入 `fast`、`balanced`、`power` 还是 `fast`、`standard`、`deep`，系统均能自适应双向转换与持久化配置。
+
 ---
 
 ## 🤖 主流 AI 协同接入 (AI Integrations)
