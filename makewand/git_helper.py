@@ -20,16 +20,15 @@ SAFE_GIT_SECURITY_FLAGS = [
     "-c", "commit.gpgsign=false",
 ]
 
-def _get_git_info_attributes_path(cwd: Optional[Union[str, Path]]) -> Optional[Path]:
+def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path]:
+    paths: List[Path] = []
     try:
         p = Path(cwd).resolve() if cwd else Path.cwd().resolve()
         for cur in [p] + list(p.parents):
             gp = cur / ".git"
+            git_dirs: List[Path] = []
             if gp.is_dir():
-                ia = gp / "info" / "attributes"
-                if ia.exists():
-                    return ia
-                break
+                git_dirs.append(gp)
             elif gp.is_file():
                 try:
                     txt = gp.read_text(encoding="utf-8").strip()
@@ -37,18 +36,28 @@ def _get_git_info_attributes_path(cwd: Optional[Union[str, Path]]) -> Optional[P
                         gd = Path(txt[7:].strip())
                         if not gd.is_absolute():
                             gd = (gp.parent / gd).resolve()
-                        ia = gd / "info" / "attributes"
-                        if ia.exists():
-                            return ia
+                        git_dirs.append(gd)
+                        commondir_file = gd / "commondir"
+                        if commondir_file.exists():
+                            cd_txt = commondir_file.read_text(encoding="utf-8").strip()
+                            cd_path = Path(cd_txt)
+                            if not cd_path.is_absolute():
+                                cd_path = (gd / cd_path).resolve()
+                            git_dirs.append(cd_path)
                 except Exception:
                     pass
+            for gdir in git_dirs:
+                ia = gdir / "info" / "attributes"
+                if ia.exists() and ia not in paths:
+                    paths.append(ia)
+            if gp.exists():
                 break
     except Exception:
         pass
-    return None
+    return paths
 
 def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True):
-    shielded_info = None
+    shielded_infos: List[Tuple[Path, Path]] = []
     try:
         is_bytes = isinstance(input_data, bytes) or binary
         if safe and isinstance(cmd, str) and "&&" in cmd:
@@ -93,18 +102,19 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True):
         git_env = os.environ.copy()
         if safe:
             for k in list(git_env.keys()):
-                if k in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS") or k.startswith("GIT_CONFIG_"):
+                if k in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES") or k.startswith("GIT_CONFIG_"):
                     git_env.pop(k, None)
 
-            # S01: Temporarily shield .git/info/attributes to neutralize host clean/smudge execution
-            ia_target = _get_git_info_attributes_path(cwd)
-            if ia_target and ia_target.exists():
-                try:
-                    shield_file = ia_target.parent / (ia_target.name + ".makewand_shield")
-                    ia_target.rename(shield_file)
-                    shielded_info = (ia_target, shield_file)
-                except Exception:
-                    pass
+            # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees
+            ia_targets = _get_git_info_attributes_paths(cwd)
+            for ia_target in ia_targets:
+                if ia_target.exists():
+                    try:
+                        shield_file = ia_target.parent / (ia_target.name + f".makewand_shield_{os.getpid()}_{len(shielded_infos)}")
+                        ia_target.rename(shield_file)
+                        shielded_infos.append((ia_target, shield_file))
+                    except Exception:
+                        pass
 
         res = subprocess.run(
             exec_cmd,
@@ -122,9 +132,8 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True):
         empty = b"" if (isinstance(input_data, bytes) or binary) else ""
         return -1, empty, str(e)
     finally:
-        if shielded_info:
+        for orig_ia, shield_ia in shielded_infos:
             try:
-                orig_ia, shield_ia = shielded_info
                 if shield_ia.exists():
                     shield_ia.rename(orig_ia)
             except Exception:

@@ -6,6 +6,7 @@ Enforces host protection, masks sensitive credential directories, and confines f
 import os
 import sys
 import shutil
+import stat
 from pathlib import Path
 from typing import List, Tuple, Optional
 from makewand.providers.base import run_subprocess
@@ -122,10 +123,7 @@ def wrap_bwrap(
         bwrap,
         "--die-with-parent",
         "--new-session",
-    ]
-    if not is_muse:
-        bwrap_cmd.append("--unshare-pid")
-    bwrap_cmd.extend([
+        "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
         "--clearenv",
@@ -134,10 +132,10 @@ def wrap_bwrap(
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
-    ])
+    ]
 
     # S05 defense: Mask system Unix domain sockets and host IPC runtimes
-    for sock_runtime_dir in ["/var/tmp", "/run", "/var/run"]:
+    for sock_runtime_dir in ["/run", "/var/tmp", "/var/run"]:
         if os.path.exists(sock_runtime_dir) and not os.path.islink(sock_runtime_dir):
             bwrap_cmd.extend(["--tmpfs", sock_runtime_dir])
 
@@ -238,12 +236,6 @@ def wrap_bwrap(
             if os.path.exists(sc_p):
                 bwrap_cmd.extend(["--ro-bind", sc_p, sc_p])
 
-        if is_muse:
-            uid = os.getuid()
-            run_user = f"/run/user/{uid}"
-            if os.path.exists(run_user):
-                bwrap_cmd.extend(["--ro-bind", run_user, run_user])
-
     # Mount workspace / worktree
     if mount_root == ws:
         bwrap_cmd.extend(["--ro-bind" if readonly else "--bind", ws, ws])
@@ -302,7 +294,7 @@ def wrap_bwrap(
         elif is_grok:
             SAFE_PASSTHROUGH_ENVS.extend(["XAI_API_KEY", "GROK_API_KEY", "GROK_AUTH_TOKEN", "GROK_WEB_FETCH_PROXY"])
         elif is_muse:
-            SAFE_PASSTHROUGH_ENVS.extend(["META_API_KEY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"])
+            SAFE_PASSTHROUGH_ENVS.extend(["META_API_KEY"])
         elif is_agy:
             SAFE_PASSTHROUGH_ENVS.extend(["GEMINI_API_KEY"])
         elif is_aider:
@@ -315,6 +307,27 @@ def wrap_bwrap(
     for var in SAFE_PASSTHROUGH_ENVS:
         if var in os.environ:
             bwrap_cmd.extend(["--setenv", var, os.environ[var]])
+
+    # Strip any D-Bus environment variables to prevent host escape / privilege escalation
+    for k in list(os.environ.keys()):
+        if "DBUS" in k:
+            bwrap_cmd.extend(["--unsetenv", k])
+
+    # Mask pre-existing pathname AF_UNIX sockets in workspace/mount_root to prevent host breakout
+    try:
+        for scan_root in {ws, mount_root}:
+            if os.path.exists(scan_root):
+                for root, dirs, files in os.walk(scan_root):
+                    for entry in dirs + files:
+                        entry_path = os.path.join(root, entry)
+                        try:
+                            st = os.lstat(entry_path)
+                            if stat.S_ISSOCK(st.st_mode):
+                                bwrap_cmd.extend(["--ro-bind", "/dev/null", entry_path])
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
     if extra_env:
         for k, v in extra_env.items():

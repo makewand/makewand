@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/makewand/makewand/internal/model"
@@ -110,4 +111,82 @@ func (p *failingCandidateProvider) ChatStream(context.Context, []model.Message, 
 	ch := make(chan model.StreamChunk)
 	close(ch)
 	return ch, nil
+}
+
+type fixedContentProvider struct {
+	name    string
+	content string
+}
+
+func (p *fixedContentProvider) Name() string      { return p.name }
+func (p *fixedContentProvider) IsAvailable() bool { return true }
+func (p *fixedContentProvider) Chat(context.Context, []model.Message, string, int) (string, model.Usage, error) {
+	return p.content, model.Usage{Provider: p.name}, nil
+}
+func (p *fixedContentProvider) ChatStream(context.Context, []model.Message, string, int) (<-chan model.StreamChunk, error) {
+	ch := make(chan model.StreamChunk)
+	close(ch)
+	return ch, nil
+}
+
+func TestRunCandidateSelection_DeliversExactVerifiedPayload(t *testing.T) {
+	allowHostExecForTest(t)
+	p, err := NewProject("candidate-verified-payload", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetUnsafeHostExecAuthorization(UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"})
+	err = p.WriteFiles([]ExtractedFile{
+		{Path: "go.mod", Content: "module example.com/audit\n\ngo 1.22\n"},
+		{Path: "math.go", Content: "package audit\nfunc Add(a, b int) int { return a + b }\n"},
+		{Path: "math_test.go", Content: "package audit\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(2, 2) != 4 { t.Fatal(\"wrong\") } }\n"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = p.ScanFiles(); err != nil {
+		t.Fatal(err)
+	}
+
+	files := []ExtractedFile{
+		{Path: "math.go", Content: "package audit\nfunc Add(a, b int) int { return b + a }\n"},
+		{Path: "math_test.go", Content: "package audit\nTHIS IS INVALID GO\n"},
+	}
+	provider := &fixedContentProvider{name: "claude", content: RenderExtractedFiles(files)}
+	r, err := model.NewRouterFromConfig(model.RouterConfig{
+		Providers: map[string]model.ProviderEntry{"claude": {Provider: provider}},
+		UsageMode: "balanced",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selection := RunCandidateSelection(context.Background(), r, p, model.PhaseCode, []model.Message{{Role: "user", Content: "implement addition"}}, "", nil)
+	if !selection.Verified {
+		t.Fatalf("expected verified selection, got %+v", selection)
+	}
+	if strings.Contains(selection.Content, "THIS IS INVALID GO") {
+		t.Fatal("unverified test file was delivered in selection.Content")
+	}
+	if len(selection.VerifiedFiles) != 1 || selection.VerifiedFiles[0].Path != "math.go" {
+		t.Fatalf("unexpected VerifiedFiles: %+v", selection.VerifiedFiles)
+	}
+	if selection.VerifiedDigest == "" {
+		t.Fatal("expected non-empty VerifiedDigest")
+	}
+	// Applying delivered selection to baseline project must succeed and pass verification
+	if err = p.WriteFiles(ParseFilesBestEffort(selection.Content).Files); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := p.DetectTestPlan()
+	if err != nil || plan == nil {
+		t.Fatalf("DetectTestPlan: %v", err)
+	}
+	result, err := p.RunVerificationPlan(context.Background(), *plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("delivered content failed verification: %s", result.Stderr)
+	}
 }

@@ -142,3 +142,40 @@ func TestOpenProjectLimited_TruncatesLargeTree(t *testing.T) {
 		t.Fatalf("len(Files) = %d, want <= 11 (root + 10 entries)", got)
 	}
 }
+
+func TestWriteFile_UnlinksPreExistingHardlink(t *testing.T) {
+	proj, err := NewProject("hardlink-defense", t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("original-external-content"), 0o600); err != nil {
+		t.Fatalf("WriteFile(outside): %v", err)
+	}
+
+	target := filepath.Join(proj.Path, "linked.txt")
+	if err := os.Link(outside, target); err != nil {
+		t.Skipf("hard links not supported: %v", err)
+	}
+
+	if err := proj.WriteFile("linked.txt", "overwritten-content"); err != nil {
+		t.Fatalf("WriteFile(linked.txt): %v", err)
+	}
+
+	outsideContent, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("ReadFile(outside): %v", err)
+	}
+	if string(outsideContent) != "original-external-content" {
+		t.Fatalf("outside file was mutated through hardlink: got %q, want %q", string(outsideContent), "original-external-content")
+	}
+
+	projectContent, err := proj.ReadFile("linked.txt")
+	if err != nil {
+		t.Fatalf("ReadFile(linked.txt): %v", err)
+	}
+	if projectContent != "overwritten-content" {
+		t.Fatalf("project file content = %q, want %q", projectContent, "overwritten-content")
+	}
+}

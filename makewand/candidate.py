@@ -11,7 +11,7 @@ import fcntl
 import uuid
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 
 import makewand.config as config
 from makewand.config import (
@@ -57,6 +57,19 @@ def build_manifest(dir_path: Path) -> Dict[str, str]:
                 if sha is not None:
                     manifest[rel] = sha
     return manifest
+
+def _verify_safe_target_path(base_cwd: Union[str, Path], rel_path: str) -> Path:
+    canonical_base = os.path.realpath(base_cwd)
+    cur = Path(base_cwd)
+    for part in Path(rel_path).parts:
+        cur = cur / part
+        if os.path.islink(cur) or cur.is_symlink():
+            raise ValueError(f"安全越界风险: 路径组件 {part} 包含符号链接")
+        if cur.exists():
+            resolved = os.path.realpath(cur)
+            if not (resolved == canonical_base or resolved.startswith(canonical_base + os.sep)):
+                raise ValueError(f"安全越界风险: 路径组件 {part} 逃逸出工作区 ({resolved})")
+    return cur
 
 def get_candidate_files_changed(candidate_dir: Path, baseline_commit: Optional[str] = None) -> Dict[str, str]:
     """
@@ -339,14 +352,16 @@ class CandidateManager:
             lock_fd = open(lock_file, "a")
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            except Exception:
-                pass
+            except Exception as e:
+                return False, [], f"无法获取候选应用独占锁 (apply.lock): {e}"
             return CandidateManager._do_apply_candidate(
                 race_id=race_id,
                 candidate_label=candidate_label,
                 dry_run=dry_run,
                 force=force
             )
+        except Exception as e:
+            return False, [], f"打开候选应用锁失败: {e}"
         finally:
             if lock_fd:
                 try:
@@ -462,11 +477,16 @@ class CandidateManager:
 
         try:
             for rel_path, status in changes.items():
-                target_file = Path(base_cwd) / rel_path
+                target_file = _verify_safe_target_path(base_cwd, rel_path)
                 src_file = candidate_dir / rel_path
+
+                if os.path.islink(src_file) or src_file.is_symlink():
+                    raise ValueError(f"安全越界风险: 候选文件 {rel_path} 为符号链接")
 
                 # Backup existing
                 if target_file.exists():
+                    if os.path.islink(target_file) or target_file.is_symlink():
+                        raise ValueError(f"安全越界风险: 目标文件 {rel_path} 为符号链接")
                     bak_file = backup_dir / rel_path
                     bak_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(target_file, bak_file)
@@ -477,12 +497,38 @@ class CandidateManager:
                 # Apply Change
                 if status in ("M", "A"):
                     target_file.parent.mkdir(parents=True, exist_ok=True)
-                    tmp_target = target_file.with_name(f".{target_file.name}.tmp_apply_{uuid.uuid4().hex[:6]}")
-                    shutil.copy2(src_file, tmp_target)
+                    _verify_safe_target_path(base_cwd, rel_path)
+
+                    tmp_name = f".{target_file.name}.tmp_apply_{uuid.uuid4().hex[:6]}"
+                    tmp_target = target_file.with_name(tmp_name)
+                    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    if hasattr(os, "O_NOFOLLOW"):
+                        open_flags |= os.O_NOFOLLOW
+                    fd = os.open(str(tmp_target), open_flags, 0o600)
+                    try:
+                        with open(src_file, "rb") as sf:
+                            while True:
+                                chunk = sf.read(65536)
+                                if not chunk:
+                                    break
+                                os.write(fd, chunk)
+                    finally:
+                        os.close(fd)
+
+                    # Re-verify before replacing
+                    _verify_safe_target_path(base_cwd, rel_path)
+                    if target_file.exists() and (os.path.islink(target_file) or target_file.is_symlink()):
+                        try:
+                            os.unlink(tmp_target)
+                        except Exception:
+                            pass
+                        raise ValueError(f"安全越界风险: 目标文件 {rel_path} 为符号链接")
+
                     os.replace(tmp_target, target_file)
                     applied_files.append(f"A/M {rel_path}")
                 elif status == "D":
                     if target_file.exists():
+                        _verify_safe_target_path(base_cwd, rel_path)
                         target_file.unlink()
                         applied_files.append(f"D   {rel_path}")
 
@@ -495,13 +541,31 @@ class CandidateManager:
             # Rollback
             for item in reversed(journal):
                 rel_p = item["path"]
-                t_file = Path(base_cwd) / rel_p
-                if item["action"] == "restore":
-                    tmp_rb = t_file.with_name(f".{t_file.name}.tmp_rb_{uuid.uuid4().hex[:6]}")
-                    shutil.copy2(item["bak"], tmp_rb)
-                    os.replace(tmp_rb, t_file)
-                elif item["action"] == "delete" and t_file.exists():
-                    t_file.unlink()
+                try:
+                    t_file = _verify_safe_target_path(base_cwd, rel_p)
+                    if item["action"] == "restore":
+                        tmp_name = f".{t_file.name}.tmp_rb_{uuid.uuid4().hex[:6]}"
+                        tmp_rb = t_file.with_name(tmp_name)
+                        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        if hasattr(os, "O_NOFOLLOW"):
+                            open_flags |= os.O_NOFOLLOW
+                        fd = os.open(str(tmp_rb), open_flags, 0o600)
+                        try:
+                            with open(item["bak"], "rb") as bf:
+                                while True:
+                                    chunk = bf.read(65536)
+                                    if not chunk:
+                                        break
+                                    os.write(fd, chunk)
+                        finally:
+                            os.close(fd)
+                        _verify_safe_target_path(base_cwd, rel_p)
+                        os.replace(tmp_rb, t_file)
+                    elif item["action"] == "delete" and t_file.exists():
+                        _verify_safe_target_path(base_cwd, rel_p)
+                        t_file.unlink()
+                except Exception:
+                    pass
 
             return False, [], f"应用过程中发生异常并已自动回滚: {str(e)}"
 

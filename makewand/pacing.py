@@ -45,10 +45,10 @@ PROVIDER_DEFAULT_CYCLES = {
 }
 
 
-def parse_reset_time_to_seconds_left(resets_at_str: Optional[str]) -> Optional[float]:
+def parse_reset_time_to_seconds_left(resets_at_str: Optional[str], updated_at: Optional[str] = None) -> Optional[float]:
     """
     Parses resets_at string (e.g., '2026-09-28 07:53', '10:58 (2026-09-27)', 'Sep 27th, 2026 10:58 AM', '8pm (Asia/Shanghai)', 'in 2 hours')
-    into seconds remaining from now.
+    into seconds remaining from now, subtracting elapsed time if updated_at is provided.
     """
     if not resets_at_str or not isinstance(resets_at_str, str):
         return None
@@ -56,7 +56,26 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str]) -> Optional[f
     s = resets_at_str.strip()
     now = datetime.now()
 
-    # Pattern 1: ISO or standard YYYY-MM-DD HH:MM
+    elapsed = 0.0
+    if updated_at:
+        try:
+            clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
+            up_dt = datetime.fromisoformat(clean_up)
+            now_comp = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else now
+            elapsed = max(0.0, (now_comp - up_dt).total_seconds())
+        except Exception:
+            elapsed = 0.0
+
+    # Pattern 1: ISO or standard YYYY-MM-DD HH:MM (with timezone support)
+    try:
+        clean_s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_s)
+        now_tz = datetime.now(dt.tzinfo) if dt.tzinfo is not None else now
+        diff = (dt - now_tz).total_seconds()
+        return max(0.0, diff)
+    except Exception:
+        pass
+
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?", s)
     if m:
         try:
@@ -111,7 +130,8 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str]) -> Optional[f
             secs += float(m_hours.group(1)) * 3600
         if m_mins:
             secs += float(m_mins.group(1)) * 60
-        return max(0.0, secs)
+        secs = max(0.0, secs - elapsed)
+        return secs
 
     # Pattern 5: Time of day with stripped timezone e.g. "8pm (Asia/Shanghai)", "10:58 AM", "at 2:00 PM"
     clean_time = re.sub(r"\(.*?\)", "", s).strip().rstrip(".,")
@@ -151,20 +171,7 @@ def calculate_dynamic_pacing(
     resets_at = quota_data.get("resets_at")
     is_unlimited = quota_data.get("is_unlimited", False)
 
-    # Unlimited providers (local, agy base tier)
-    if is_unlimited or provider in ("local", "agy"):
-        return {
-            "provider": provider,
-            "pacing_state": PACING_BALANCED,
-            "quota_percentage": 100,
-            "recommended_tier": "deep" if provider == "agy" else "standard",
-            "recommended_effort": "high",
-            "routing_boost": 0.5 if provider == "agy" else 0.0,
-            "reason": f"{provider.upper()} 算力充沛无硬限额，全天候平稳就绪",
-            "delta": 0.0,
-        }
-
-    # Hard-limited or broken
+    # Hard-limited or broken (takes precedence over is_unlimited / agy / local)
     if status in ("limited", "needs_auth", "error", "disabled") or percentage <= 0:
         reset_hint = f" (解封时间: {resets_at})" if resets_at else ""
         return {
@@ -178,8 +185,22 @@ def calculate_dynamic_pacing(
             "delta": 1.0,
         }
 
+    # Unlimited providers (local, agy base tier)
+    if is_unlimited or provider in ("local", "agy"):
+        return {
+            "provider": provider,
+            "pacing_state": PACING_BALANCED,
+            "quota_percentage": 100,
+            "recommended_tier": "deep" if provider == "agy" else "standard",
+            "recommended_effort": "high",
+            "routing_boost": 0.5 if provider == "agy" else 0.0,
+            "reason": f"{provider.upper()} 算力充沛无硬限额，全天候平稳就绪",
+            "delta": 0.0,
+        }
+
     cycle_total = PROVIDER_DEFAULT_CYCLES.get(provider, CYCLE_7_DAYS)
-    seconds_left = parse_reset_time_to_seconds_left(resets_at)
+    updated_at = quota_data.get("updated_at") or info.get("updated_at")
+    seconds_left = parse_reset_time_to_seconds_left(resets_at, updated_at=updated_at)
     has_explicit_anchor = False
 
     if seconds_left is not None:
@@ -204,7 +225,7 @@ def calculate_dynamic_pacing(
     delta = consumed_ratio - time_elapsed_ratio
 
     # 1. Harvest Condition: In the last 12% of cycle with explicit anchor confirmed, with >15% quota remaining
-    is_harvest_window = has_explicit_anchor and (seconds_left <= (0.12 * cycle_total))
+    is_harvest_window = has_explicit_anchor and (0 < seconds_left <= (0.12 * cycle_total))
     if is_harvest_window and percentage >= 15:
         hrs_left = round(seconds_left / 3600.0, 1)
         return {

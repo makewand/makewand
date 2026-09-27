@@ -341,5 +341,32 @@ except OSError:
             diff_out = get_git_diff(str(main_repo), sub_baselines=None)
             self.assertIn("sub v2 committed in child", diff_out)
 
+    def test_git_info_attributes_shielded_in_linked_worktree(self):
+        from makewand.git_helper import run_git_cmd
+        with tempfile.TemporaryDirectory(prefix="makewand_git_attr_") as td:
+            root = Path(td)
+            repo = root / "repo"
+            linked = root / "linked"
+            marker = root / "clean_marker"
+            repo.mkdir()
+
+            run_git_cmd(["git", "init"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=str(repo))
+            (repo / "f.txt").write_text("base")
+            run_git_cmd(["git", "add", "f.txt"], cwd=str(repo))
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=str(repo))
+
+            run_git_cmd(["git", "worktree", "add", "-b", "linked-br", str(linked)], cwd=str(repo))
+
+            # Configure harmful clean filter in main repo
+            run_git_cmd(["git", "config", "filter.harmful.clean", f"cat; printf leaked > {marker}"], cwd=str(repo))
+            (repo / ".git" / "info" / "attributes").write_text("*.txt filter=harmful\n")
+
+            (linked / "f.txt").write_text("modified")
+            rc, out, err = run_git_cmd(["git", "add", "-A"], cwd=str(linked))
+            self.assertEqual(rc, 0)
+            self.assertFalse(marker.exists(), "host clean filter must not execute in linked worktree!")
+
 if __name__ == "__main__":
     unittest.main()

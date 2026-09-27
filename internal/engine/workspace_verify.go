@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
@@ -25,6 +28,8 @@ type fileCheckpointEntry struct {
 	BackupPath string
 	Mode       os.FileMode
 	Nlink      uint64
+	Dev        uint64
+	Ino        uint64
 }
 
 // FileCheckpoint stores the pre-change state for a set of project files.
@@ -69,6 +74,9 @@ type CandidateVerification struct {
 	TestsPlan         *ExecPlan
 	TestsResult       *ExecResult
 	TestsError        string
+	VerifiedFiles     []ExtractedFile // exact files verified in the tree
+	VerifiedContent   string          // rendered payload of verified files
+	VerifiedDigest    string          // sha256 hex digest of verified files
 }
 
 // WriteFiles writes a batch of extracted files into the project.
@@ -113,9 +121,13 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 			}
 			mode := info.Mode()
 			var nlink uint64 = 1
+			var dev uint64
+			var ino uint64
 			if sys := info.Sys(); sys != nil {
 				if stat, ok := sys.(*syscall.Stat_t); ok {
 					nlink = uint64(stat.Nlink)
+					dev = uint64(stat.Dev)
+					ino = uint64(stat.Ino)
 				}
 			}
 			// If file size is within maxReadFileSize, read into Content
@@ -128,6 +140,8 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 						Content: string(data),
 						Mode:    mode,
 						Nlink:   nlink,
+						Dev:     dev,
+						Ino:     ino,
 					})
 					continue
 				}
@@ -159,6 +173,8 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 				BackupPath: backupFile.Name(),
 				Mode:       mode,
 				Nlink:      nlink,
+				Dev:        dev,
+				Ino:        ino,
 			})
 			continue
 		}
@@ -197,6 +213,34 @@ func (c *FileCheckpoint) Cleanup() {
 	}
 }
 
+func (c *FileCheckpoint) findInternalHardlinkSibling(targetPath string, dev, ino uint64) string {
+	if c == nil || c.project == nil || ino == 0 {
+		return ""
+	}
+	var siblingPath string
+	_ = filepath.WalkDir(c.project.Path, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			if d != nil && d.IsDir() && shouldIgnoreSet[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if p == targetPath {
+			return nil
+		}
+		if fi, statErr := os.Lstat(p); statErr == nil {
+			if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
+				if uint64(sys.Dev) == dev && uint64(sys.Ino) == ino {
+					siblingPath = p
+					return fs.SkipAll
+				}
+			}
+		}
+		return nil
+	})
+	return siblingPath
+}
+
 // Restore rolls the project files back to the checkpointed state.
 func (c *FileCheckpoint) Restore() error {
 	if c == nil || c.project == nil {
@@ -220,41 +264,33 @@ func (c *FileCheckpoint) Restore() error {
 				}
 				dir = filepath.Dir(fullPath)
 
-				curInfo, curStatErr := os.Lstat(fullPath)
-				curNlink := entry.Nlink
-				if curStatErr == nil {
-					if sys := curInfo.Sys(); sys != nil {
-						if stat, ok := sys.(*syscall.Stat_t); ok {
-							curNlink = uint64(stat.Nlink)
-						}
-					}
-				}
-
 				src, err := os.Open(entry.BackupPath)
 				if err != nil {
 					return fmt.Errorf("restore %s from backup (%s): %w", entry.Path, entry.BackupPath, err)
 				}
 
-				// If file exists and has multiple hard links, write directly into the existing inode
-				// to preserve content consistency across all hard links referencing this file.
-				if curStatErr == nil && (curNlink > 1 || entry.Nlink > 1) {
-					dst, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_TRUNC, entry.Mode.Perm())
-					if err != nil {
-						src.Close()
-						return fmt.Errorf("open hardlinked target for in-place restore %s: %w", entry.Path, err)
-					}
-					_, copyErr := io.Copy(dst, src)
-					srcCloseErr := src.Close()
-					dstCloseErr := dst.Close()
-					if copyErr != nil || srcCloseErr != nil || dstCloseErr != nil {
-						return fmt.Errorf("copy in-place restore %s: copy=%v, srcClose=%v, dstClose=%v", entry.Path, copyErr, srcCloseErr, dstCloseErr)
-					}
-					if entry.Mode != 0 {
-						if err := os.Chmod(fullPath, entry.Mode.Perm()); err != nil {
-							return fmt.Errorf("chmod in-place restore %s: %w", entry.Path, err)
+				// If file was part of an internal hard link group within the workspace,
+				// check if another file in the workspace still holds that exact (Dev, Ino).
+				// If so, re-establish the hardlink to preserve internal consistency without mutating external files.
+				if entry.Nlink > 1 && entry.Ino != 0 {
+					sibling := c.findInternalHardlinkSibling(fullPath, entry.Dev, entry.Ino)
+					if sibling != "" {
+						_ = os.Remove(fullPath)
+						if err := os.Link(sibling, fullPath); err == nil {
+							dst, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_TRUNC, entry.Mode.Perm())
+							if err == nil {
+								_, copyErr := io.Copy(dst, src)
+								_ = src.Close()
+								_ = dst.Close()
+								if copyErr == nil {
+									if entry.Mode != 0 {
+										_ = os.Chmod(fullPath, entry.Mode.Perm())
+									}
+									continue
+								}
+							}
 						}
 					}
-					continue
 				}
 
 				// Atomic replace: write to temp file in target directory, then rename
@@ -282,6 +318,21 @@ func (c *FileCheckpoint) Restore() error {
 					return fmt.Errorf("rename restore %s: %w", entry.Path, err)
 				}
 				continue
+			}
+
+			if entry.Nlink > 1 && entry.Ino != 0 {
+				fullPath, err := c.project.validatePath(entry.Path, true)
+				if err == nil {
+					sibling := c.findInternalHardlinkSibling(fullPath, entry.Dev, entry.Ino)
+					if sibling != "" {
+						_ = os.Remove(fullPath)
+						if err := os.Link(sibling, fullPath); err == nil {
+							if err := os.WriteFile(fullPath, []byte(entry.Content), entry.Mode.Perm()); err == nil {
+								continue
+							}
+						}
+					}
+				}
 			}
 
 			if err := c.project.WriteFile(entry.Path, entry.Content); err != nil {
@@ -410,7 +461,85 @@ func (p *Project) EvaluateCandidateFiles(ctx context.Context, files []ExtractedF
 
 	report := clone.verifyRestrictedWorkspace(ctx, applied, p.baselineTrustedTests())
 	report.RestoredTests = restored
+
+	// Record exact verified files from clone
+	verifiedFiles := make([]ExtractedFile, 0, len(applied))
+	seen := make(map[string]bool, len(applied))
+	for _, f := range applied {
+		if seen[f.Path] {
+			continue
+		}
+		seen[f.Path] = true
+		content, err := clone.ReadFile(f.Path)
+		if err == nil {
+			verifiedFiles = append(verifiedFiles, ExtractedFile{Path: f.Path, Content: content})
+		} else {
+			verifiedFiles = append(verifiedFiles, f)
+		}
+	}
+	report.VerifiedFiles = verifiedFiles
+	report.VerifiedContent = RenderExtractedFiles(verifiedFiles)
+	report.VerifiedDigest = calculateFilesDigest(verifiedFiles)
+
+	// F02: If candidate introduced a new TestMain, cap Strength at 1 (cannot earn Strength 2)
+	if introducesNewTestMain(p, files) && report.Strength > 1 {
+		report.Strength = 1
+	}
+
 	return report, nil
+}
+
+func calculateFilesDigest(files []ExtractedFile) string {
+	sortedFiles := make([]ExtractedFile, len(files))
+	copy(sortedFiles, files)
+	sort.Slice(sortedFiles, func(i, j int) bool {
+		return sortedFiles[i].Path < sortedFiles[j].Path
+	})
+	hasher := sha256.New()
+	for _, f := range sortedFiles {
+		hasher.Write([]byte(f.Path))
+		hasher.Write([]byte{0})
+		hasher.Write([]byte(f.Content))
+		hasher.Write([]byte{0})
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func introducesNewTestMain(baseline *Project, files []ExtractedFile) bool {
+	for _, f := range files {
+		if !strings.HasSuffix(f.Path, ".go") {
+			continue
+		}
+		if !hasTestMainFunction(f.Path, f.Content) {
+			continue
+		}
+		if baseline == nil {
+			return true
+		}
+		baseContent, err := baseline.ReadFile(f.Path)
+		if err != nil {
+			return true
+		}
+		if !hasTestMainFunction(f.Path, baseContent) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTestMainFunction(path, content string) bool {
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, path, content, 0)
+	if err != nil {
+		return strings.Contains(content, "TestMain(")
+	}
+	for _, decl := range node.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name != nil && fn.Name.Name == "TestMain" {
+			return true
+		}
+	}
+	return false
 }
 
 // splitBaselineTestOverwrites partitions candidate files into the set that may
@@ -893,7 +1022,23 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		return report
 	}
 	if testsPlan != nil {
-		result, err := p.RunVerificationPlan(ctx, *testsPlan)
+		runPlan := *testsPlan
+		if runPlan.Command == "go" {
+			hasV := false
+			for _, a := range runPlan.Args {
+				if a == "-v" {
+					hasV = true
+					break
+				}
+			}
+			if !hasV && len(runPlan.Args) > 0 && runPlan.Args[0] == "test" {
+				newArgs := make([]string, 0, len(runPlan.Args)+1)
+				newArgs = append(newArgs, "test", "-v")
+				newArgs = append(newArgs, runPlan.Args[1:]...)
+				runPlan.Args = newArgs
+			}
+		}
+		result, err := p.RunVerificationPlan(ctx, runPlan)
 		if result != nil {
 			report.TestsResult = result
 		}
@@ -906,11 +1051,11 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 			return report
 		}
 		report.Passed = true
-		report.NoTestsRan = detectNoTestsRun(*testsPlan, result)
+		report.NoTestsRan = detectNoTestsRun(runPlan, result)
 		// Strength 2 requires baseline-trusted tests to have actually run and
 		// passed. A candidate that merely compiles, or whose only tests are the
 		// ones it wrote itself, caps at Strength 1.
-		if !report.NoTestsRan && baselineHasTests {
+		if !report.NoTestsRan && baselineHasTests && !introducesNewTestMain(nil, files) {
 			report.Strength = 2
 		} else {
 			report.Strength = 1
@@ -943,7 +1088,7 @@ func detectNoTestsRun(plan ExecPlan, result *ExecResult) bool {
 	output := result.Stdout + "\n" + result.Stderr
 	switch plan.Command {
 	case "go":
-		return !goTestOutputRanTests(result.Stdout)
+		return !goTestOutputRanTests(plan, result.Stdout)
 	case "pytest":
 		return strings.Contains(output, "no tests ran")
 	case "npm", "pnpm", "yarn":
@@ -970,7 +1115,11 @@ func detectNoTestsRun(plan ExecPlan, result *ExecResult) bool {
 	}
 }
 
-func goTestOutputRanTests(stdout string) bool {
+func goTestOutputRanTests(plan ExecPlan, stdout string) bool {
+	isVerbose := slices.Contains(plan.Args, "-v") || strings.Contains(stdout, "=== RUN")
+	if isVerbose {
+		return strings.Contains(stdout, "--- PASS:")
+	}
 	for _, line := range strings.Split(stdout, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) > 0 && fields[0] == "ok" && !strings.Contains(line, "no tests to run") {

@@ -306,7 +306,8 @@ def cmd_models(args):
     print(c("6. Local Self-Hosted (本地大模型 / Ollama / vLLM):", COLOR_BOLD + COLOR_PURPLE))
     try:
         from makewand.providers.local import is_local_model_available, get_default_local_model, list_local_models
-        if is_local_model_available():
+        avail, _, _ = is_local_model_available()
+        if avail:
             print(f"   当前默认: {c(get_default_local_model(), COLOR_GREEN + COLOR_BOLD)}")
             print(f"   检测到可用模型: {', '.join(list_local_models())}")
             print("   自适应机制: 本地 GPU 离线执行，0 Token 外部调用成本，数据 100% 本地安全私有。\n")

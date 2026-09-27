@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -50,8 +52,66 @@ var safeGitFlags = []string{
 
 const safeGitAttrSource = "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
+// shieldGitAttributes temporarily masks any info/attributes files across primary
+// and linked worktrees to prevent host clean/smudge filters from executing.
+func shieldGitAttributes(projectPath string) func() {
+	var restorations []func()
+	var gitDirs []string
+
+	for cur := projectPath; cur != "" && cur != filepath.Dir(cur); cur = filepath.Dir(cur) {
+		gitPath := filepath.Join(cur, ".git")
+		fi, err := os.Stat(gitPath)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			gitDirs = append(gitDirs, gitPath)
+		} else {
+			content, err := os.ReadFile(gitPath)
+			if err == nil {
+				txt := strings.TrimSpace(string(content))
+				if strings.HasPrefix(txt, "gitdir:") {
+					gd := strings.TrimSpace(strings.TrimPrefix(txt, "gitdir:"))
+					if !filepath.IsAbs(gd) {
+						gd = filepath.Join(cur, gd)
+					}
+					gitDirs = append(gitDirs, gd)
+					cdBytes, err := os.ReadFile(filepath.Join(gd, "commondir"))
+					if err == nil {
+						cd := strings.TrimSpace(string(cdBytes))
+						if !filepath.IsAbs(cd) {
+							cd = filepath.Join(gd, cd)
+						}
+						gitDirs = append(gitDirs, cd)
+					}
+				}
+			}
+		}
+		for _, gd := range gitDirs {
+			attrPath := filepath.Join(gd, "info", "attributes")
+			if _, err := os.Stat(attrPath); err == nil {
+				shieldPath := fmt.Sprintf("%s.mw_shield_%d_%d", attrPath, os.Getpid(), len(restorations))
+				if err := os.Rename(attrPath, shieldPath); err == nil {
+					restorations = append(restorations, func() {
+						_ = os.Rename(shieldPath, attrPath)
+					})
+				}
+			}
+		}
+		break
+	}
+
+	return func() {
+		for _, r := range restorations {
+			r()
+		}
+	}
+}
+
 // GitCommit stages all changes and creates a commit.
 func (p *Project) GitCommit(ctx context.Context, message string) error {
+	defer shieldGitAttributes(p.Path)()
+
 	addArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
 	addArgs = append(addArgs, "add", "-A")
 	addResult, err := p.Exec(ctx, "git", addArgs...)
@@ -77,6 +137,8 @@ func (p *Project) GitCommit(ctx context.Context, message string) error {
 
 // GitStatus returns the current git status.
 func (p *Project) GitStatus(ctx context.Context) (string, error) {
+	defer shieldGitAttributes(p.Path)()
+
 	statusArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
 	statusArgs = append(statusArgs, "status", "--short")
 	result, err := p.Exec(ctx, "git", statusArgs...)
@@ -88,6 +150,8 @@ func (p *Project) GitStatus(ctx context.Context) (string, error) {
 
 // GitDiff returns the diff of uncommitted changes.
 func (p *Project) GitDiff(ctx context.Context) (string, error) {
+	defer shieldGitAttributes(p.Path)()
+
 	diffArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
 	diffArgs = append(diffArgs, "diff", "--no-ext-diff", "--no-textconv")
 	result, err := p.Exec(ctx, "git", diffArgs...)

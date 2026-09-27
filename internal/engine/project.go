@@ -341,6 +341,12 @@ func (p *Project) WriteFile(relPath, content string) error {
 		return err
 	}
 
+	// Remove any pre-existing destination file first so shared hardlink inodes
+	// outside the workspace are unlinked and not mutated in-place.
+	if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("unlink existing file: %w", err)
+	}
+
 	if err := os.WriteFile(fullPath, []byte(content), 0600); err != nil {
 		return fmt.Errorf("write file: %w", err)
 	}

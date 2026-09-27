@@ -26,6 +26,7 @@ from makewand.config import (
     COLOR_BLUE,
     COLOR_CYAN,
     COLOR_PURPLE,
+    COLOR_MAGENTA,
     COLOR_RESET,
     CANDIDATES_DIR,
     ensure_config_dir,
@@ -2193,11 +2194,16 @@ def run_race(
             print(f"  • 安全应用方案: makewand apply {race_id} --candidate A|B")
         print(f"  • 丢弃废弃候选: makewand discard {race_id}\n")
 
+        if not test_pass_a and not test_pass_b:
+            print(c("❌ [Makewand Test Gate] 两套候选方案均未通过本地单元测试，拒绝交付。", COLOR_RED + COLOR_BOLD))
+            return EXIT_FAILED
         if not res_a[1] and not res_b[1]:
             print(c("❌ 两位选手均未能成功完成任务。", COLOR_RED + COLOR_BOLD))
             return EXIT_FAILED
         if not ok and winner is None:
             return EXIT_UNVERIFIED
+        if winner is None:
+            return EXIT_FAILED
         return EXIT_PASSED
     finally:
         if not saved_successfully and session_dir.exists():

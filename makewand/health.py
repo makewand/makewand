@@ -145,13 +145,45 @@ def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool
     return False
 
 def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
+    now_dt = datetime.now()
     for model_name, info in cache.items():
         if isinstance(info, dict) and info.get("status") == "limited":
-            if is_reset_time_passed(info.get("resets_at"), info.get("updated_at", "")):
+            resets_at = info.get("resets_at")
+            updated_at = info.get("updated_at", "")
+            if is_reset_time_passed(resets_at, updated_at):
                 info["status"] = "healthy"
-                info["reason"] = f"已过配额重置窗口 ({info.get('resets_at')})，已自动恢复待命"
+                info["reason"] = f"已过配额重置窗口 ({resets_at})，已自动恢复待命"
                 info["resets_at"] = None
-                info["updated_at"] = datetime.now().isoformat()
+                info["updated_at"] = now_dt.isoformat()
+            elif resets_at and updated_at:
+                rel_match = re.search(r"in\s+(\d+(?:\.\d+)?)\s*(hour|minute|min|hr|h|m)", str(resets_at), re.IGNORECASE)
+                if rel_match:
+                    try:
+                        val = float(rel_match.group(1))
+                        unit = rel_match.group(2).lower()
+                        total_secs = val * 3600 if unit.startswith("h") else val * 60
+                        clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
+                        up_dt = datetime.fromisoformat(clean_up)
+                        now_comp = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else now_dt
+                        elapsed = (now_comp - up_dt).total_seconds()
+                        rem_secs = total_secs - elapsed
+                        if rem_secs <= 0:
+                            info["status"] = "healthy"
+                            info["reason"] = f"已过配额重置窗口 ({resets_at})，已自动恢复待命"
+                            info["resets_at"] = None
+                            info["updated_at"] = now_dt.isoformat()
+                        else:
+                            if rem_secs >= 3600:
+                                rem_hours = rem_secs / 3600
+                                if rem_hours.is_integer() or abs(rem_hours - round(rem_hours)) < 0.05:
+                                    info["resets_at"] = f"in {int(round(rem_hours))} hours"
+                                else:
+                                    info["resets_at"] = f"in {rem_hours:.1f} hours"
+                            else:
+                                rem_mins = max(1, int(round(rem_secs / 60)))
+                                info["resets_at"] = f"in {rem_mins} minutes"
+                    except Exception:
+                        pass
     return cache
 
 def load_status_cache() -> Dict[str, Any]:
@@ -279,7 +311,8 @@ def probe_model(model_name: str) -> Dict[str, Any]:
     # 1. Local self-hosted models (Ollama, vLLM, LocalAI)
     if model_name in ("local", "ollama"):
         from makewand.providers.local import is_local_model_available, get_default_local_model, list_local_models
-        if is_local_model_available():
+        ok, reason, models = is_local_model_available()
+        if ok:
             active_m = get_default_local_model()
             all_m = list_local_models() or []
             m_desc = f"{active_m}" + (f" (共 {len(all_m)} 个本地模型)" if len(all_m) > 1 else "")
@@ -292,7 +325,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
             }
         return {
             "status": "missing",
-            "reason": "本地 Ollama / vLLM (http://localhost:11434) 未响应或未检测到可用模型",
+            "reason": reason or "本地 Ollama / vLLM (http://localhost:11434) 未响应或未检测到可用模型",
             "resets_at": None,
             "updated_at": now,
             "mode": "local"
@@ -463,100 +496,98 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
     status = info.get("status", "unknown")
     reason = info.get("reason", "")
     resets_at = info.get("resets_at")
+    updated_at = info.get("updated_at", "")
 
     # 1. Limited / Exhausted (0%)
     if status == "limited":
         reset_desc = f" (预计解封: {resets_at})" if resets_at else " (已达当前限额)"
-        return {
+        res = {
             "percentage": 0,
             "status": "limited",
             "desc": f"额度已耗尽{reset_desc}",
             "resets_at": resets_at,
             "is_unlimited": False
         }
-
     # 2. Disabled / Missing / Needs Auth
-    if status in ("disabled", "needs_auth", "error", "missing", "unknown"):
-        return {
+    elif status in ("disabled", "needs_auth", "error", "missing", "unknown"):
+        res = {
             "percentage": 0,
             "status": status,
             "desc": reason or "未就绪或未授权",
             "resets_at": None,
             "is_unlimited": False
         }
-
     # 3. Unlimited local models or enterprise tiers
-    if provider == "local":
-        return {
+    elif provider == "local":
+        res = {
             "percentage": 100,
             "status": "healthy",
             "desc": "本地私有模型 · 无限额度 · 0 Token 成本",
             "resets_at": None,
             "is_unlimited": True
         }
-
-    if provider == "agy":
-        return {
+    elif provider == "agy":
+        res = {
             "percentage": 100,
             "status": "healthy",
             "desc": "Google AI Pro 订阅充足",
             "resets_at": None,
             "is_unlimited": True
         }
-
-    # 4. Check for explicit percentage in output or reason
-    if reason:
+    elif reason and re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE):
         pct_match = re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE)
-        if pct_match:
-            pct = int(pct_match.group(1))
-            return {
-                "percentage": max(0, min(100, pct)),
-                "status": "healthy" if pct > 20 else ("warning" if pct > 0 else "limited"),
-                "desc": f"官方报告剩余额度: {pct}%",
+        pct = int(pct_match.group(1))
+        res = {
+            "percentage": max(0, min(100, pct)),
+            "status": "healthy" if pct > 20 else ("warning" if pct > 0 else "limited"),
+            "desc": f"官方报告剩余额度: {pct}%",
+            "resets_at": resets_at,
+            "is_unlimited": False
+        }
+    else:
+        # 5. Estimate from rolling usage and burn rate penalty
+        try:
+            from makewand.usage import get_burn_rate_penalty, get_engine_usage_stats
+            penalty, pen_reason = get_burn_rate_penalty(provider)
+            u24 = get_engine_usage_stats(window_hours=24.0).get(provider, {}).get("total", 0)
+
+            if penalty <= -4.0:
+                pct = 5
+                desc = f"高频调用削峰保护中 (24h 调用: {u24}次)"
+            elif penalty <= -3.0:
+                pct = 20
+                desc = f"额度消耗较快 (24h 调用: {u24}次)"
+            elif penalty <= -2.0:
+                pct = 40
+                desc = f"滑动窗口用量活跃 (24h 调用: {u24}次)"
+            elif penalty <= -1.0:
+                pct = 65
+                desc = f"滑动窗口运行平稳 (24h 调用: {u24}次)"
+            else:
+                if u24 == 0:
+                    pct = 100
+                    desc = "额度充沛 · 滑动窗口无压力"
+                else:
+                    pct = max(75, 100 - min(25, u24 * 2))
+                    desc = f"额度充沛 · 运行健康 (24h 调用: {u24}次)"
+
+            res = {
+                "percentage": pct,
+                "status": "healthy" if pct >= 25 else "warning",
+                "desc": desc,
+                "resets_at": resets_at,
+                "is_unlimited": False
+            }
+        except Exception:
+            res = {
+                "percentage": 85,
+                "status": "healthy",
+                "desc": "运行健康",
                 "resets_at": resets_at,
                 "is_unlimited": False
             }
 
-    # 5. Estimate from rolling usage and burn rate penalty
-    try:
-        from makewand.usage import get_burn_rate_penalty, get_engine_usage_stats
-        penalty, pen_reason = get_burn_rate_penalty(provider)
-        u24 = get_engine_usage_stats(window_hours=24.0).get(provider, {}).get("total", 0)
-
-        if penalty <= -4.0:
-            pct = 5
-            desc = f"高频调用削峰保护中 (24h 调用: {u24}次)"
-        elif penalty <= -3.0:
-            pct = 20
-            desc = f"额度消耗较快 (24h 调用: {u24}次)"
-        elif penalty <= -2.0:
-            pct = 40
-            desc = f"滑动窗口用量活跃 (24h 调用: {u24}次)"
-        elif penalty <= -1.0:
-            pct = 65
-            desc = f"滑动窗口运行平稳 (24h 调用: {u24}次)"
-        else:
-            if u24 == 0:
-                pct = 100
-                desc = "额度充沛 · 滑动窗口无压力"
-            else:
-                pct = max(75, 100 - min(25, u24 * 2))
-                desc = f"额度充沛 · 运行健康 (24h 调用: {u24}次)"
-
-        return {
-            "percentage": pct,
-            "status": "healthy" if pct >= 25 else "warning",
-            "desc": desc,
-            "resets_at": resets_at,
-            "is_unlimited": False
-        }
-    except Exception:
-        return {
-            "percentage": 85,
-            "status": "healthy",
-            "desc": "运行健康",
-            "resets_at": resets_at,
-            "is_unlimited": False
-        }
+    res["updated_at"] = updated_at
+    return res
 
 

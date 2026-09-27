@@ -3,6 +3,7 @@ Unit tests for bubblewrap sandbox bridge.
 """
 
 import os
+import sys
 import unittest
 import tempfile
 from pathlib import Path
@@ -151,6 +152,40 @@ class TestSandbox(unittest.TestCase):
             # Attempt to modify .git/config inside sandbox (must fail with read-only fs error)
             ret_write, _, _, _ = run_in_sandbox(["bash", "-c", "echo malicious >> .git/config"], workspace=str(ws), readonly=False)
             self.assertNotEqual(ret_write, 0)
+
+    def test_unix_domain_socket_and_dbus_isolation_in_sandbox(self):
+        import socket
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ws = Path(tmpdir) / "socket_ws"
+            ws.mkdir()
+            sock_path = ws / "test.sock"
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(str(sock_path))
+            s.listen(1)
+
+            # Inside sandbox, attempting to connect to the AF_UNIX socket must fail
+            code = (
+                "import socket, sys\n"
+                "s = socket.socket(socket.AF_UNIX)\n"
+                f"try:\n"
+                f"    s.connect({repr(str(sock_path))})\n"
+                f"    sys.exit(0)\n"
+                f"except Exception:\n"
+                f"    sys.exit(42)\n"
+            )
+            ret, out, err, _ = run_in_sandbox([sys.executable, "-c", code], workspace=str(ws))
+            s.close()
+            # Must exit with 42 (connection failed / rejected)
+            self.assertEqual(ret, 42)
+
+            # Also verify DBUS env vars and /run/user are not leaked even for muse
+            cmd_muse = wrap_bwrap(["muse", "run"], workspace=str(ws), is_provider=True)
+            self.assertNotIn("/run/user", " ".join(cmd_muse))
+            setenv_indices = [i for i, x in enumerate(cmd_muse) if x == "--setenv"]
+            setenv_vars = [cmd_muse[i + 1] for i in setenv_indices if i + 1 < len(cmd_muse)]
+            self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", setenv_vars)
+            self.assertIn("--unsetenv", cmd_muse)
+            self.assertIn("--unshare-pid", cmd_muse)
 
 if __name__ == "__main__":
     unittest.main()

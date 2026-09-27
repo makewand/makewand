@@ -707,6 +707,18 @@ func TestDetectNoTestsRun(t *testing.T) {
 			want:   true,
 		},
 		{
+			name:   "go -v with no tests to run",
+			plan:   ExecPlan{Command: "go", Args: []string{"test", "-v"}},
+			result: &ExecResult{Stdout: "testing: warning: no tests to run\nPASS\nok  \texample.com/verify\t0.002s [no tests to run]\n"},
+			want:   true,
+		},
+		{
+			name:   "go -v with passing tests",
+			plan:   ExecPlan{Command: "go", Args: []string{"test", "-v"}},
+			result: &ExecResult{Stdout: "=== RUN   TestAdd\n--- PASS: TestAdd (0.00s)\nPASS\nok  \texample.com/verify\t0.002s\n"},
+			want:   false,
+		},
+		{
 			name:   "pytest no tests ran",
 			plan:   ExecPlan{Command: "pytest"},
 			result: &ExecResult{Stdout: "no tests ran in 0.01s\n"},
@@ -858,3 +870,88 @@ func TestChangedFilesAgainstWithDeletions_DetectsDeletedBaselineFiles(t *testing
 		t.Fatalf("deleted = %v, want [math.go]", deleted)
 	}
 }
+
+func TestEvaluateCandidateFiles_VerifiedFilesDigestMatchesVerifiedBytes(t *testing.T) {
+	project := newVerificationProject(t)
+
+	// Candidate modifies math.go and attempts to modify math_test.go with invalid content.
+	files := []ExtractedFile{
+		{
+			Path: "math.go",
+			Content: `package verify
+
+func Add(a, b int) int {
+	return b + a
+}
+`,
+		},
+		{
+			Path: "math_test.go",
+			Content: `package verify
+THIS IS INVALID GO SYNTAX
+`,
+		},
+	}
+
+	report, err := project.EvaluateCandidateFiles(context.Background(), files)
+	if err != nil {
+		t.Fatalf("EvaluateCandidateFiles: %v", err)
+	}
+	if !report.Passed {
+		t.Fatalf("report.Passed = false, want true (baseline tests restored): %v", report.TestsError)
+	}
+	if len(report.VerifiedFiles) != 1 || report.VerifiedFiles[0].Path != "math.go" {
+		t.Fatalf("report.VerifiedFiles = %+v, want only math.go", report.VerifiedFiles)
+	}
+	if strings.Contains(report.VerifiedContent, "INVALID GO SYNTAX") {
+		t.Fatal("report.VerifiedContent contained unverified test file")
+	}
+	if report.VerifiedDigest == "" {
+		t.Fatal("report.VerifiedDigest is empty")
+	}
+	expectedDigest := calculateFilesDigest(report.VerifiedFiles)
+	if report.VerifiedDigest != expectedDigest {
+		t.Fatalf("report.VerifiedDigest = %s, want %s", report.VerifiedDigest, expectedDigest)
+	}
+}
+
+func TestEvaluateCandidateFiles_TestMainDoesNotBypassStrength(t *testing.T) {
+	project := newVerificationProject(t)
+
+	// Candidate introduces a wrong implementation of Add and a TestMain that exits 0 early.
+	files := []ExtractedFile{
+		{
+			Path: "math.go",
+			Content: `package verify
+
+func Add(a, b int) int {
+	return 0
+}
+`,
+		},
+		{
+			Path: "bypass_test.go",
+			Content: `package verify
+
+import (
+	"os"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	os.Exit(0)
+}
+`,
+		},
+	}
+
+	report, err := project.EvaluateCandidateFiles(context.Background(), files)
+	if err != nil {
+		t.Fatalf("EvaluateCandidateFiles: %v", err)
+	}
+	// The candidate must NOT earn Strength 2
+	if report.Strength >= 2 {
+		t.Fatalf("report.Strength = %d, want < 2 (TestMain must not bypass baseline tests)", report.Strength)
+	}
+}
+

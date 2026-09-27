@@ -44,7 +44,9 @@ type CandidateSelection struct {
 	// surfaced when untrusted-repo mode had no direct-API provider). Callers can
 	// errors.Is against it to present the actionable message instead of a generic
 	// "no candidate produced a response".
-	Err error
+	Err            error
+	VerifiedFiles  []ExtractedFile
+	VerifiedDigest string
 }
 
 type CandidateProgressStage string
@@ -225,6 +227,10 @@ func RunCandidateSelection(
 						attempt.Err = verifyErr
 					} else {
 						attempt.Verification = verification
+						if verification.Passed {
+							attempt.Files = verification.VerifiedFiles
+							attempt.Content = verification.VerifiedContent
+						}
 					}
 				}
 			}
@@ -310,6 +316,8 @@ func RunCandidateSelection(
 			PassedCount:     passedCount,
 			TotalCandidates: len(providers),
 			DeletedFiles:    bestVerified.DeletedFiles,
+			VerifiedFiles:   bestVerified.Verification.VerifiedFiles,
+			VerifiedDigest:  bestVerified.Verification.VerifiedDigest,
 		}
 	}
 
@@ -325,6 +333,8 @@ func RunCandidateSelection(
 			TotalCandidates:   len(providers),
 			DeletedFiles:      bestSuccessful.DeletedFiles,
 			NotVerifiedReason: notVerifiedReason,
+			VerifiedFiles:     bestSuccessful.Verification.VerifiedFiles,
+			VerifiedDigest:    bestSuccessful.Verification.VerifiedDigest,
 		}
 	}
 
