@@ -52,10 +52,19 @@ class TestAuditV31Fixes(unittest.TestCase):
         self.assertEqual(resets2, "2:00 PM")
         self.assertNotIn("at ", resets2.lower())
 
+        is_lim3, reason3, resets3 = parse_claude_quota("You have hit your 5-hour limit. Resets at 2:00 PM.")
+        self.assertTrue(is_lim3)
+        self.assertEqual(resets3, "2:00 PM")
+        self.assertNotIn("at ", resets3.lower())
+
         # 2. Pacing seconds left parser
         sec = parse_reset_time_to_seconds_left("at 2:00 PM")
         self.assertIsNotNone(sec)
         self.assertGreaterEqual(sec, 0)
+
+        sec_dot = parse_reset_time_to_seconds_left("2:00 PM.")
+        self.assertIsNotNone(sec_dot)
+        self.assertGreaterEqual(sec_dot, 0)
 
         sec_in = parse_reset_time_to_seconds_left("in 3h 15m")
         self.assertIsNotNone(sec_in)
@@ -285,6 +294,33 @@ class TestAuditV31Fixes(unittest.TestCase):
                 self.assertEqual(mock_dispatch.call_args[0][0], "codex")
                 self.assertIsNone(mock_dispatch.call_args[1].get("model"))
 
+            # Test code modification mode with forced_engine
+            call_args_list = []
+            def fake_dispatch(eng, prompt, cwd=None, **kw):
+                call_args_list.append((eng, kw))
+                if kw.get("readonly"):
+                    return True, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None
+                else:
+                    (Path(cwd) / "app.py").write_text("print('updated')\n")
+                    return True, "written", None
+
+            with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
+                 patch("makewand.orchestrator.get_or_update_status", return_value={"agy": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
+                 patch("makewand.config.get_active_providers", return_value=["agy", "claude"]), \
+                 patch("makewand.orchestrator.dispatch_task", side_effect=fake_dispatch), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "ok")):
+                run_pipeline("修改代码", cwd=tmpdir, stream=False, auto_fix=False, force_code=True, forced_engine="agy")
+                self.assertEqual(call_args_list[0][0], "agy")
+                self.assertIsNone(call_args_list[0][1].get("model"))
+
+            # Test conversational turn with forced_engine
+            with patch("makewand.interactive.dispatch_task") as mock_chat_dispatch:
+                mock_chat_dispatch.return_value = (True, "Chat answer", None)
+                from makewand.interactive import handle_conversational_turn
+                handle_conversational_turn("hello", [], tmpdir, forced_engine="codex")
+                self.assertEqual(mock_chat_dispatch.call_args[0][0], "codex")
+                self.assertIsNone(mock_chat_dispatch.call_args[1].get("model"))
+
     def test_p1_d_single_tool_auto_fix_loop(self):
         """P1-D: Single-tool mode allows coder engine to re-review its own fixes."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -375,6 +411,43 @@ class TestAuditV31Fixes(unittest.TestCase):
                 evicted = CandidateManager.prune_old_candidates(max_candidates=4)
                 self.assertEqual(evicted, 3)
                 self.assertEqual(len(list(cand_dir.iterdir())), 4)
+
+                # Symlink eviction test: must unlink symlinks without crashing with OSError: Cannot call rmtree on a symbolic link
+                cand_link = cand_dir / "rc_symlink"
+                cand_target = Path(td) / "external_target"
+                cand_target.mkdir()
+                os.utime(cand_target, (1000, 1000))
+                cand_link.symlink_to(cand_target)
+                CandidateManager.prune_old_candidates(max_candidates=4)
+                self.assertFalse(cand_link.exists())
+
+        # 4. fail_and_cleanup captures committed changes against task_baseline into rejected.patch
+        with tempfile.TemporaryDirectory() as td:
+            from makewand.git_helper import run_git_cmd
+            run_git_cmd(["git", "init"], cwd=td)
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=td)
+            run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=td)
+            (Path(td) / "main.py").write_text("print('baseline')\n")
+            run_git_cmd(["git", "add", "."], cwd=td)
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=td)
+
+            def buggy_coder(p, cwd=None, **kw):
+                (Path(cwd) / "main.py").write_text("print('committed bug')\n")
+                run_git_cmd(["git", "add", "."], cwd=cwd)
+                run_git_cmd(["git", "commit", "-m", "bug commit"], cwd=cwd)
+                return True, "ok", None
+
+            with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
+                 patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
+                 patch("makewand.orchestrator.execute_claude_task", side_effect=buggy_coder), \
+                 patch("makewand.orchestrator.execute_codex_task", return_value=(True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"bug\"]}", None)):
+                run_pipeline("fix code", cwd=td, stream=False, auto_fix=False, force_code=True)
+                rej_dirs = list(Path("/tmp/makewand-artifacts").glob("rejected_*"))
+                self.assertTrue(len(rej_dirs) > 0)
+                latest_rej = sorted(rej_dirs, key=lambda d: d.stat().st_mtime)[-1]
+                patch_file = latest_rej / "rejected.patch"
+                self.assertTrue(patch_file.exists())
+                self.assertIn("committed bug", patch_file.read_text())
 
 
 if __name__ == "__main__":

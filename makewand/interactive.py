@@ -573,7 +573,14 @@ def start_interactive_session(repo_trust: str = "trusted"):
         if lower.startswith("/chat "):
             query = user_input[6:].strip()
             if query:
-                handle_conversational_turn(query, conversation_history, cwd, current_tier, repo_trust)
+                handle_conversational_turn(
+                    query,
+                    conversation_history,
+                    cwd,
+                    current_tier,
+                    repo_trust,
+                    forced_engine=current_engine if current_engine != "auto" else None,
+                )
             continue
 
         # Force pipeline command: /run <task>

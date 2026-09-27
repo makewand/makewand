@@ -213,7 +213,8 @@ def wrap_bwrap(
             provider_auth_paths.append((".grok", False))
             provider_auth_dirs.append(".grok")
         elif is_aider:
-            provider_auth_paths.append((".aider.conf.yml", True))
+            provider_auth_paths.extend([(".aider", False), (".aider.conf.yml", True)])
+            provider_auth_dirs.append(".aider")
 
         for auth_rel, ro_file in provider_auth_paths:
             auth_path = os.path.join(user_home, auth_rel)
@@ -307,7 +308,8 @@ def wrap_bwrap(
         elif is_aider:
             SAFE_PASSTHROUGH_ENVS.extend([
                 "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
-                "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "AIDER_API_KEY", "AIDER_MODEL"
+                "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "AIDER_API_KEY", "AIDER_MODEL",
+                "OPENAI_API_BASE", "OLLAMA_API_BASE"
             ])
 
     for var in SAFE_PASSTHROUGH_ENVS:

@@ -201,7 +201,7 @@ class CandidateManager:
 
         entries = []
         for entry in config.CANDIDATES_DIR.iterdir():
-            if entry.is_dir():
+            if entry.is_dir() or entry.is_symlink():
                 ts = 0.0
                 meta_file = entry / "meta.json"
                 if meta_file.exists():
@@ -228,7 +228,10 @@ class CandidateManager:
             to_remove = entries[max_candidates:]
             for entry, _ in to_remove:
                 try:
-                    shutil.rmtree(entry, ignore_errors=True)
+                    if entry.is_symlink() or not entry.is_dir():
+                        entry.unlink(missing_ok=True)
+                    else:
+                        shutil.rmtree(entry, ignore_errors=True)
                     evicted += 1
                 except Exception:
                     pass

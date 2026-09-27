@@ -1430,7 +1430,12 @@ def run_pipeline(
 
             # If system has only 1 tool available, allow the coder engine to re-review its own fixes
             from makewand.config import get_active_providers
-            is_single_tool = route_meta.get("single_tool_mode", False) or (len(set(get_active_providers())) <= 1)
+            active_providers_list = get_active_providers()
+            is_single_tool = (
+                route_meta.get("single_tool_mode", False)
+                or (len(set(active_providers_list)) <= 1)
+                or (len(coder_candidates) <= 1)
+            )
             if is_single_tool:
                 candidate_re_reviewers = [coder_engine]
             else:
@@ -1438,11 +1443,19 @@ def run_pipeline(
                 excluded_reviewers = {coder_engine, actual_fix_engine}
                 candidate_re_reviewers = [r for r in actual_reviewers if r not in excluded_reviewers]
                 if not candidate_re_reviewers:
+                    active_pool_set = set(active_providers_list)
                     healthy_alts = [
-                        e for e in ["codex", "claude", "grok", "agy", "muse"]
+                        e for e in active_pool_set
                         if e not in excluded_reviewers and cache.get(e, {}).get("status") not in ["limited", "needs_auth", "missing"]
                     ]
-                    candidate_re_reviewers = healthy_alts if healthy_alts else [e for e in ["codex", "claude", "grok", "agy", "muse"] if e not in excluded_reviewers]
+                    if healthy_alts:
+                        candidate_re_reviewers = healthy_alts
+                    else:
+                        other_active = [e for e in active_pool_set if e not in excluded_reviewers]
+                        if other_active:
+                            candidate_re_reviewers = other_active
+                        else:
+                            candidate_re_reviewers = [coder_engine]
                 if not candidate_re_reviewers:
                     return fail_and_cleanup("❌ [Makewand Quality Gate] 缺乏独立第三方评审模型（已参与代码实现或修复的模型不得自审），安全终止交付。")
 

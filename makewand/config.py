@@ -60,6 +60,10 @@ def load_api_keys() -> dict:
     """Loads ~/.config/makewand/api_keys.json."""
     if API_KEYS_FILE.exists():
         try:
+            try:
+                os.chmod(API_KEYS_FILE, 0o600)
+            except Exception:
+                pass
             import json
             with open(API_KEYS_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)

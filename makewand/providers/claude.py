@@ -12,16 +12,16 @@ from makewand.providers.base import run_subprocess
 def parse_claude_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     lower = output.lower()
     if any(k in lower for k in ["hit your limit", "hit your monthly spend limit", "hit your usage limit", "usage limit reached", "5-hour limit", "weekly limit reached", "exceeded your current quota"]):
-        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit\s*(?:[·•\-]\s*)?resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
-        reset_time = reset_match.group(1).strip() if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
+        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit\s*(?:[·•\-\.]\s*)?resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
+        reset_time = reset_match.group(1).strip().rstrip(". ") if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
         return True, f"限流 / 额度耗尽 (重置时间: {reset_time})", reset_time
     if "overloaded_error" in lower or "server overloaded" in lower:
         iso_reset = (datetime.now() + timedelta(minutes=3)).isoformat()
         return True, "Anthropic 服务端负载过高 (Overloaded)", iso_reset
     if "rate_limit_error" in lower or (re.search(r"\b(?:rate\s*limit(?:ed)?|too\s*many\s*requests|http\s+429|status(?:\s*code)?\s*[:=]?\s*429)\b", lower) and "middleware" not in lower and "test_" not in lower):
-        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit\s*(?:[·•\-]\s*)?resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
+        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit\s*(?:[·•\-\.]\s*)?resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
         if reset_match:
-            reset_time = reset_match.group(1).strip()
+            reset_time = reset_match.group(1).strip().rstrip(". ")
             return True, f"限流 / 额度耗尽 (重置时间: {reset_time})", reset_time
         iso_reset = (datetime.now() + timedelta(hours=3)).isoformat()
         return True, "API 并发或频次超限 (429)", iso_reset

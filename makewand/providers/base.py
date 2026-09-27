@@ -120,7 +120,7 @@ def run_subprocess(
                         payload = data.encode("utf-8") if isinstance(data, str) else data
                         p.stdin.write(payload)
                         p.stdin.flush()
-                    except (BrokenPipeError, OSError, ValueError):
+                    except Exception:
                         pass
                     finally:
                         try:
