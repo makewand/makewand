@@ -10,6 +10,7 @@ import shutil
 import codecs
 import selectors
 import subprocess
+import threading
 from typing import Tuple, Optional
 
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024  # 10 MB output guardrail
@@ -114,17 +115,21 @@ def run_subprocess(
                 start_new_session=True
             )
             if input_text is not None:
-                try:
-                    payload = input_text.encode("utf-8") if isinstance(input_text, str) else input_text
-                    proc.stdin.write(payload)
-                    proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
-                finally:
+                def _feed_stdin(p, data):
                     try:
-                        proc.stdin.close()
-                    except Exception:
+                        payload = data.encode("utf-8") if isinstance(data, str) else data
+                        p.stdin.write(payload)
+                        p.stdin.flush()
+                    except (BrokenPipeError, OSError, ValueError):
                         pass
+                    finally:
+                        try:
+                            p.stdin.close()
+                        except Exception:
+                            pass
+
+                stdin_thread = threading.Thread(target=_feed_stdin, args=(proc, input_text), daemon=True)
+                stdin_thread.start()
 
             # Set stdout to non-blocking mode to prevent readline deadlocks on partial lines
             os.set_blocking(proc.stdout.fileno(), False)

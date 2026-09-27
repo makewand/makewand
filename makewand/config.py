@@ -2,6 +2,7 @@
 Makewand configuration and environment constants.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -80,8 +81,15 @@ def save_api_key(provider: str, api_key: str, base_url: str = None, model: str =
         keys[p]["model"] = model
     try:
         import json
-        with open(API_KEYS_FILE, "w", encoding="utf-8") as f:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+        fd = os.open(API_KEYS_FILE, flags, mode)
+        with open(fd, "w", encoding="utf-8") as f:
             json.dump(keys, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(API_KEYS_FILE, 0o600)
+        except Exception:
+            pass
         return True
     except Exception:
         return False

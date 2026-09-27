@@ -278,9 +278,14 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
     from makewand.sandbox import is_bwrap_available
     has_bwrap = is_bwrap_available()
 
+    EXCLUDED_DIRS = {
+        ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        "node_modules", ".venv", "venv", "env", "benchmarks", ".tox", "dist", "build", ".cache"
+    }
+
     if resolved not in [Path("/"), Path("/tmp"), Path.home()]:
         for item in resolved.glob("*"):
-            if item.name not in [".git", "__pycache__", ".pytest_cache"]:
+            if item.name not in EXCLUDED_DIRS:
                 try:
                     dst_item = target_dir / item.name
                     if item.is_symlink():
@@ -304,12 +309,16 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
                             elif has_bwrap:
                                 os.symlink(raw_target, dst_item)
                     elif item.is_dir():
-                        shutil.copytree(item, dst_item, dirs_exist_ok=True, symlinks=True, ignore_dangling_symlinks=True)
+                        shutil.copytree(
+                            item,
+                            dst_item,
+                            dirs_exist_ok=True,
+                            symlinks=True,
+                            ignore_dangling_symlinks=True,
+                            ignore=shutil.ignore_patterns(*EXCLUDED_DIRS, "*.pyc")
+                        )
                     elif item.is_file() and not item.is_socket():
-                        try:
-                            os.link(item, dst_item)
-                        except OSError:
-                            shutil.copy2(item, dst_item, follow_symlinks=False)
+                        shutil.copy2(item, dst_item, follow_symlinks=False)
                 except Exception:
                     pass
 
@@ -688,10 +697,7 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
                                         s_dst.parent.mkdir(parents=True, exist_ok=True)
                                         if s_dst.is_symlink():
                                             s_dst.unlink()
-                                        try:
-                                            os.link(s_src, s_dst)
-                                        except OSError:
-                                            shutil.copy2(s_src, s_dst, follow_symlinks=False)
+                                        shutil.copy2(s_src, s_dst, follow_symlinks=False)
                                 except Exception as e:
                                     import sys
                                     print(c(f"❌ [Makewand Guard] 复制子模块 {sub_rel} 未跟踪文件失败 ({e})，中止基线建立。", COLOR_RED), file=sys.stderr)
@@ -791,10 +797,7 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
                             dst_f.parent.mkdir(parents=True, exist_ok=True)
                             if dst_f.is_symlink():
                                 dst_f.unlink()
-                            try:
-                                os.link(src_f, dst_f)
-                            except OSError:
-                                shutil.copy2(src_f, dst_f, follow_symlinks=False)
+                            shutil.copy2(src_f, dst_f, follow_symlinks=False)
                     except Exception as e:
                         import sys
                         print(c(f"❌ [Makewand Guard] 复制未跟踪文件失败 ({e})，中止基线建立。", COLOR_RED), file=sys.stderr)

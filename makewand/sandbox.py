@@ -106,7 +106,7 @@ def wrap_bwrap(
     p_name = (provider_name or "").lower().strip()
     if not p_name and command_args:
         first_bin = os.path.basename(str(command_args[0])).lower()
-        for candidate in ["claude", "codex", "agy", "muse", "grok"]:
+        for candidate in ["claude", "codex", "agy", "muse", "grok", "aider"]:
             if first_bin == candidate or first_bin.startswith(candidate + "-") or first_bin.startswith(candidate + "."):
                 p_name = candidate
                 break
@@ -116,6 +116,7 @@ def wrap_bwrap(
     is_codex = is_provider and (p_name == "codex")
     is_agy = is_provider and (p_name == "agy")
     is_grok = is_provider and (p_name == "grok")
+    is_aider = is_provider and (p_name == "aider")
 
     bwrap_cmd = [
         bwrap,
@@ -211,6 +212,8 @@ def wrap_bwrap(
         elif is_grok:
             provider_auth_paths.append((".grok", False))
             provider_auth_dirs.append(".grok")
+        elif is_aider:
+            provider_auth_paths.append((".aider.conf.yml", True))
 
         for auth_rel, ro_file in provider_auth_paths:
             auth_path = os.path.join(user_home, auth_rel)
@@ -301,6 +304,11 @@ def wrap_bwrap(
             SAFE_PASSTHROUGH_ENVS.extend(["META_API_KEY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"])
         elif is_agy:
             SAFE_PASSTHROUGH_ENVS.extend(["GEMINI_API_KEY"])
+        elif is_aider:
+            SAFE_PASSTHROUGH_ENVS.extend([
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+                "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "AIDER_API_KEY", "AIDER_MODEL"
+            ])
 
     for var in SAFE_PASSTHROUGH_ENVS:
         if var in os.environ:

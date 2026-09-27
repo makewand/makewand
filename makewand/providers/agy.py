@@ -86,25 +86,24 @@ def execute_agy_task(
     p_file = None
     try:
         final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
+        base_flags = [
+            "--print-timeout", f"{timeout}s",
+            "--disable-slash-commands"
+        ]
+        if readonly:
+            base_flags.extend(["--mode", "plan"])
+        else:
+            base_flags.append("--dangerously-skip-permissions")
+
         if len(final_prompt.encode("utf-8")) > 32 * 1024:
             import time
             p_file = os.path.join(cwd, f".makewand_agy_p_{os.getpid()}_{time.time_ns()}.txt")
             with open(p_file, "w", encoding="utf-8") as pf:
                 pf.write(final_prompt)
             prompt_instruction = f"请读取并完整执行当前目录任务文件 {os.path.basename(p_file)} 中所指定的任务要求与代码规范："
-            cmd = [
-                "agy", "-p", prompt_instruction,
-                "--print-timeout", f"{timeout}s",
-                "--dangerously-skip-permissions",
-                "--disable-slash-commands"
-            ]
+            cmd = ["agy", "-p", prompt_instruction] + base_flags
         else:
-            cmd = [
-                "agy", "-p", final_prompt,
-                "--print-timeout", f"{timeout}s",
-                "--dangerously-skip-permissions",
-                "--disable-slash-commands"
-            ]
+            cmd = ["agy", "-p", final_prompt] + base_flags
 
         from makewand.discovery import get_provider_model_tier
         resolved = get_provider_model_tier("agy", tier)

@@ -588,6 +588,7 @@ def start_interactive_session(repo_trust: str = "trusted"):
                         stream=True,
                         auto_fix=True,
                         repo_trust=repo_trust,
+                        forced_engine=current_engine if current_engine != "auto" else None,
                     )
                 except KeyboardInterrupt:
                     print(c("\n⚠ 任务已被用户中断 (Ctrl+C)。", COLOR_YELLOW))
@@ -629,7 +630,7 @@ def start_interactive_session(repo_trust: str = "trusted"):
                 user_input,
                 cwd=cwd,
                 tier=current_tier,
-                model=current_engine if current_engine != "auto" else None,
+                forced_engine=current_engine if current_engine != "auto" else None,
                 stream=True,
                 auto_fix=True,
                 repo_trust=repo_trust,

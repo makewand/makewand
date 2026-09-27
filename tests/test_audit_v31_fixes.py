@@ -44,8 +44,13 @@ class TestAuditV31Fixes(unittest.TestCase):
         # 1. Claude quota output parser
         is_lim, reason, resets = parse_claude_quota("You've hit your limit · resets at 2:00 PM (Asia/Shanghai)")
         self.assertTrue(is_lim)
-        self.assertIsNotNone(resets)
+        self.assertEqual(resets, "2:00 PM (Asia/Shanghai)")
         self.assertNotIn("at ", resets.lower())
+
+        is_lim2, reason2, resets2 = parse_claude_quota("You've hit your limit · resets at 2:00 PM")
+        self.assertTrue(is_lim2)
+        self.assertEqual(resets2, "2:00 PM")
+        self.assertNotIn("at ", resets2.lower())
 
         # 2. Pacing seconds left parser
         sec = parse_reset_time_to_seconds_left("at 2:00 PM")
@@ -135,17 +140,33 @@ class TestAuditV31Fixes(unittest.TestCase):
 
     def test_p0_4_race_mode_symmetric_dispatch_and_usage(self):
         """P0-4: Race mode must symmetrically handle Claude, Codex, Grok, Muse, AGY with dispatch_task."""
-        with patch("makewand.orchestrator.dispatch_task") as mock_dispatch, \
-             patch("makewand.orchestrator.execute_agy_task", return_value=(True, "推荐采纳候选方案 A", None)):
-            mock_dispatch.return_value = (True, "output code", None)
+        with tempfile.TemporaryDirectory() as td:
+            from makewand.git_helper import run_git_cmd
+            run_git_cmd(["git", "init"], cwd=td)
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=td)
+            run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=td)
+            run_git_cmd(["git", "commit", "-m", "init", "--allow-empty"], cwd=td)
 
-            # Test Claude as Racer A, Codex as Racer B
-            rc = run_race("task", engine_a="claude", engine_b="codex")
-            self.assertIsInstance(rc, int)
-            self.assertEqual(mock_dispatch.call_count, 2)
-            called_engines = [call[0][0] for call in mock_dispatch.call_args_list]
-            self.assertIn("claude", called_engines)
-            self.assertIn("codex", called_engines)
+            def fake_clone(src, target):
+                target.mkdir(parents=True, exist_ok=True)
+                run_git_cmd(["git", "init"], cwd=str(target))
+                run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(target))
+                run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=str(target))
+                run_git_cmd(["git", "commit", "-m", "init", "--allow-empty"], cwd=str(target))
+
+            with patch("makewand.orchestrator.dispatch_task") as mock_dispatch, \
+                 patch("makewand.orchestrator.clone_isolated_worktree", side_effect=fake_clone), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "all passed")), \
+                 patch("makewand.orchestrator.execute_agy_task", return_value=(True, "推荐采纳候选方案 A", None)):
+                mock_dispatch.return_value = (True, "output code", None)
+
+                # Test Claude as Racer A, Codex as Racer B
+                rc = run_race("task", cwd=td, engine_a="claude", engine_b="codex")
+                self.assertIsInstance(rc, int)
+                self.assertEqual(mock_dispatch.call_count, 2)
+                called_engines = [call[0][0] for call in mock_dispatch.call_args_list]
+                self.assertIn("claude", called_engines)
+                self.assertIn("codex", called_engines)
 
         # Verify dispatch_task records usage
         with patch("makewand.orchestrator.execute_claude_task", return_value=(True, "ok", None)), \
@@ -206,6 +227,154 @@ class TestAuditV31Fixes(unittest.TestCase):
         rc, out, err, ex = run_subprocess(["echo", "test_cleanup"], input_text="pipe_in", timeout=5)
         self.assertEqual(rc, 0)
         self.assertIn("test_cleanup", out)
+
+    def test_p0_a_clone_isolated_worktree_copies_files_and_excludes_dirs(self):
+        """P0-A: clone_isolated_worktree uses copy2 (different inodes) and excludes node_modules, benchmarks, etc."""
+        from makewand.git_helper import clone_isolated_worktree
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            dst = Path(td) / "dst"
+            src.mkdir()
+            (src / "app.py").write_text("print('hello')\n")
+            (src / "node_modules").mkdir()
+            (src / "node_modules" / "pkg.js").write_text("dummy")
+            (src / "benchmarks").mkdir()
+            (src / "benchmarks" / "bench.py").write_text("dummy")
+            (src / ".venv").mkdir()
+            (src / ".venv" / "pip").write_text("dummy")
+            (src / "__pycache__").mkdir()
+            (src / "__pycache__" / "c.pyc").write_text("dummy")
+
+            clone_isolated_worktree(str(src), dst)
+
+            # File must be copied with distinct inode
+            src_file = src / "app.py"
+            dst_file = dst / "app.py"
+            self.assertTrue(dst_file.exists())
+            self.assertNotEqual(src_file.stat().st_ino, dst_file.stat().st_ino)
+
+            # Excluded directories must NOT be in dst
+            self.assertFalse((dst / "node_modules").exists())
+            self.assertFalse((dst / "benchmarks").exists())
+            self.assertFalse((dst / ".venv").exists())
+            self.assertFalse((dst / "__pycache__").exists())
+
+    def test_p1_a_streaming_long_stdin_no_deadlock(self):
+        """P1-A: run_subprocess with stream=True handles >64KB stdin via async thread without deadlocking."""
+        long_input = "line " * 20000 + "\n"  # >100KB
+        rc, out, err, ex = run_subprocess(["cat"], input_text=long_input, stream=True, timeout=5)
+        self.assertEqual(rc, 0)
+        self.assertIn("line line", out)
+        self.assertIsNone(ex)
+
+    def test_p1_c_forced_engine_not_passed_as_model_arg(self):
+        """P1-C: forced_engine prioritizes engine without passing engine name to child CLI --model."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from makewand.git_helper import run_git_cmd
+            run_git_cmd(["git", "init"], cwd=tmpdir)
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=tmpdir)
+            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=tmpdir)
+            (Path(tmpdir) / "app.py").write_text("print('test')\n")
+            run_git_cmd(["git", "add", "."], cwd=tmpdir)
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=tmpdir)
+
+            with patch("makewand.orchestrator.dispatch_task") as mock_dispatch:
+                mock_dispatch.return_value = (True, "Answer", None)
+                # Test explain mode with forced_engine
+                run_pipeline("解释这段代码", cwd=tmpdir, forced_engine="codex")
+                self.assertEqual(mock_dispatch.call_args[0][0], "codex")
+                self.assertIsNone(mock_dispatch.call_args[1].get("model"))
+
+    def test_p1_d_single_tool_auto_fix_loop(self):
+        """P1-D: Single-tool mode allows coder engine to re-review its own fixes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from makewand.git_helper import run_git_cmd
+            run_git_cmd(["git", "init"], cwd=tmpdir)
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=tmpdir)
+            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=tmpdir)
+            (Path(tmpdir) / "app.py").write_text("v1\n")
+            run_git_cmd(["git", "add", "."], cwd=tmpdir)
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=tmpdir)
+
+            call_count = [0]
+            def single_engine_dispatch(eng, prompt, cwd=None, **kw):
+                call_count[0] += 1
+                if kw.get("readonly"):
+                    if "经过上一轮缺陷修复后" in prompt:
+                        return True, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None
+                    else:
+                        return True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"typo bug\"]}", None
+                else:
+                    (Path(cwd) / "app.py").write_text(f"new content {call_count[0]}\n")
+                    return True, "code written", None
+
+            with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
+                 patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}}), \
+                 patch("makewand.config.get_active_providers", return_value=["codex"]), \
+                 patch("makewand.orchestrator.dispatch_task", side_effect=single_engine_dispatch), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "ok")):
+                res = run_pipeline("修改代码", cwd=tmpdir, stream=False, auto_fix=True, force_code=True)
+                self.assertTrue(res)
+
+    def test_p1_e_aider_sandbox_env_and_mount(self):
+        """P1-E: Aider in sandbox passes API keys and ro-bind mounts ~/.aider.conf.yml if exists."""
+        from makewand.sandbox import wrap_bwrap
+        with tempfile.TemporaryDirectory() as tmpdir:
+            conf_file = Path.home() / ".aider.conf.yml"
+            conf_created = False
+            if not conf_file.exists():
+                try:
+                    conf_file.write_text("model: gpt-4o\n")
+                    conf_created = True
+                except Exception:
+                    pass
+            try:
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-aider-123", "ANTHROPIC_API_KEY": "sk-ant-test"}):
+                    bwrap_cmd = wrap_bwrap(["aider", "--help"], workspace=tmpdir, is_provider=True, provider_name="aider")
+                    self.assertIn("OPENAI_API_KEY", bwrap_cmd)
+                    self.assertIn("sk-test-aider-123", bwrap_cmd)
+                    self.assertIn("ANTHROPIC_API_KEY", bwrap_cmd)
+                    if conf_file.exists():
+                        self.assertIn(str(conf_file), bwrap_cmd)
+            finally:
+                if conf_created and conf_file.exists():
+                    conf_file.unlink()
+
+    def test_p2_improvements(self):
+        """P2 improvements: 0600 api_keys, agy --mode plan in readonly, fail_and_cleanup baseline diff, LRU eviction."""
+        # 1. 0600 api_keys.json
+        import stat
+        from makewand.config import save_api_key
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "api_keys.json"
+            with patch("makewand.config.API_KEYS_FILE", f), patch("makewand.config.CONFIG_DIR", Path(td)):
+                save_api_key("claude", "test-key")
+                self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
+
+        # 2. AGY --mode plan in readonly
+        with patch("makewand.health.load_status_cache", return_value={}), \
+             patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.providers.agy.run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, "ok", "", None)
+            execute_agy_task("plan prompt", readonly=True)
+            cmd = mock_sub.call_args[0][0]
+            self.assertIn("--mode", cmd)
+            self.assertIn("plan", cmd)
+            self.assertNotIn("--dangerously-skip-permissions", cmd)
+
+        # 3. Candidate LRU eviction
+        from makewand.candidate import CandidateManager
+        with tempfile.TemporaryDirectory() as td:
+            cand_dir = Path(td) / "candidates"
+            cand_dir.mkdir()
+            for i in range(7):
+                d = cand_dir / f"rc_{i}"
+                d.mkdir()
+                (d / "meta.json").write_text(f"{{\"created_at\": \"2026-09-27T0{i}:00:00\"}}")
+            with patch("makewand.config.CANDIDATES_DIR", cand_dir):
+                evicted = CandidateManager.prune_old_candidates(max_candidates=4)
+                self.assertEqual(evicted, 3)
+                self.assertEqual(len(list(cand_dir.iterdir())), 4)
 
 
 if __name__ == "__main__":

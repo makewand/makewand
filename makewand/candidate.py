@@ -181,7 +181,58 @@ class CandidateManager:
         with open(meta_file, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
 
+        # LRU eviction: keep only latest 3-5 candidates (default: 5)
+        try:
+            CandidateManager.prune_old_candidates(max_candidates=5)
+        except Exception:
+            pass
+
         return race_dir
+
+    @staticmethod
+    def prune_old_candidates(max_candidates: int = 5) -> int:
+        """
+        LRU eviction to keep only the latest candidates (default: 5)
+        and clean up older candidate directories to prevent disk exhaustion.
+        """
+        ensure_config_dir()
+        if not config.CANDIDATES_DIR.exists():
+            return 0
+
+        entries = []
+        for entry in config.CANDIDATES_DIR.iterdir():
+            if entry.is_dir():
+                ts = 0.0
+                meta_file = entry / "meta.json"
+                if meta_file.exists():
+                    try:
+                        with open(meta_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                            c_str = data.get("created_at")
+                            if c_str:
+                                ts = datetime.fromisoformat(c_str).timestamp()
+                    except Exception:
+                        pass
+                if ts <= 0.0:
+                    try:
+                        ts = entry.stat().st_mtime
+                    except Exception:
+                        ts = 0.0
+                entries.append((entry, ts))
+
+        # Sort descending by timestamp (newest first)
+        entries.sort(key=lambda x: x[1], reverse=True)
+
+        evicted = 0
+        if len(entries) > max_candidates:
+            to_remove = entries[max_candidates:]
+            for entry, _ in to_remove:
+                try:
+                    shutil.rmtree(entry, ignore_errors=True)
+                    evicted += 1
+                except Exception:
+                    pass
+        return evicted
 
     @staticmethod
     def list_races() -> List[Dict[str, Any]]:

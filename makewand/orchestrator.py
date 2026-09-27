@@ -1004,7 +1004,8 @@ def run_pipeline(
     total_budget: Optional[int] = None,
     force_code: bool = False,
     repo_trust: str = "trusted",
-    boost: bool = False
+    boost: bool = False,
+    forced_engine: Optional[str] = None
 ) -> bool:
     check_load_backpressure()
     if not cwd:
@@ -1113,7 +1114,8 @@ def run_pipeline(
         elif cwd:
             # On host repository (non-shadow mode), backup rejected diff and rollback uncommitted modifications
             try:
-                diff_code, d_out, _ = run_git_cmd(["git", "diff", "HEAD"], cwd=cwd)
+                diff_ref = task_baseline if task_baseline else "HEAD"
+                diff_code, d_out, _ = run_git_cmd(["git", "diff", diff_ref], cwd=cwd)
                 if diff_code == 0 and d_out and d_out.strip():
                     art_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     rej_dir = Path("/tmp/makewand-artifacts") / f"rejected_{art_ts}"
@@ -1149,8 +1151,12 @@ def run_pipeline(
         print(c(f"💡 Makewand 意图识别: 技术问答/解释模式 '{prompt}' (推理档位: {tier}, 只读安全隔离)", COLOR_BOLD + COLOR_GREEN))
         cache = get_or_update_status(force_probe=False)
         available_coders, _, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
-        primary_c = route_meta.get("primary_coder") or (available_coders[0] if available_coders else "claude")
-        sorted_engines = available_coders if available_coders else ["claude", "codex", "grok", "agy", "muse"]
+        if forced_engine and forced_engine != "auto":
+            primary_c = forced_engine.lower()
+            sorted_engines = [primary_c]
+        else:
+            primary_c = route_meta.get("primary_coder") or (available_coders[0] if available_coders else "claude")
+            sorted_engines = available_coders if available_coders else ["claude", "codex", "grok", "agy", "muse"]
         print(c(f"🎯 [Makewand Smart Routing] 技术解释优先指派引擎: {primary_c.upper()} (候选梯队: {' -> '.join(e.upper() for e in sorted_engines)})", COLOR_CYAN))
 
         qa_output = None
@@ -1188,7 +1194,15 @@ def run_pipeline(
 
     # Step 2: Intelligent Multi-Model Routing & Implementation
     coder_candidates, reviewer_candidates, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
-    primary_c = route_meta["primary_coder"]
+    if forced_engine and forced_engine != "auto":
+        f_eng = forced_engine.lower()
+        if f_eng in coder_candidates:
+            coder_candidates.remove(f_eng)
+        coder_candidates.insert(0, f_eng)
+        primary_c = f_eng
+        route_meta["primary_coder"] = f_eng
+    else:
+        primary_c = route_meta["primary_coder"]
     primary_r = route_meta["primary_reviewer"]
 
     print(c("🎯 [Makewand Smart Routing] 智能专精匹配与配额削峰决策:", COLOR_BOLD + COLOR_GREEN))
@@ -1414,25 +1428,34 @@ def run_pipeline(
                 f"--- 最新代码改动 (git diff) ---\n{new_diff_snippet}"
             )
 
-            # Strictly exclude BOTH coder_engine AND actual_fix_engine from reviewers to preserve cross-model independence
-            excluded_reviewers = {coder_engine, actual_fix_engine}
-            candidate_re_reviewers = [r for r in actual_reviewers if r not in excluded_reviewers]
-            if not candidate_re_reviewers:
-                healthy_alts = [
-                    e for e in ["codex", "claude", "grok", "agy", "muse"]
-                    if e not in excluded_reviewers and cache.get(e, {}).get("status") not in ["limited", "needs_auth", "missing"]
-                ]
-                candidate_re_reviewers = healthy_alts if healthy_alts else [e for e in ["codex", "claude", "grok", "agy", "muse"] if e not in excluded_reviewers]
-            if not candidate_re_reviewers:
-                return fail_and_cleanup("❌ [Makewand Quality Gate] 缺乏独立第三方评审模型（已参与代码实现或修复的模型不得自审），安全终止交付。")
+            # If system has only 1 tool available, allow the coder engine to re-review its own fixes
+            from makewand.config import get_active_providers
+            is_single_tool = route_meta.get("single_tool_mode", False) or (len(set(get_active_providers())) <= 1)
+            if is_single_tool:
+                candidate_re_reviewers = [coder_engine]
+            else:
+                # Strictly exclude BOTH coder_engine AND actual_fix_engine from reviewers to preserve cross-model independence
+                excluded_reviewers = {coder_engine, actual_fix_engine}
+                candidate_re_reviewers = [r for r in actual_reviewers if r not in excluded_reviewers]
+                if not candidate_re_reviewers:
+                    healthy_alts = [
+                        e for e in ["codex", "claude", "grok", "agy", "muse"]
+                        if e not in excluded_reviewers and cache.get(e, {}).get("status") not in ["limited", "needs_auth", "missing"]
+                    ]
+                    candidate_re_reviewers = healthy_alts if healthy_alts else [e for e in ["codex", "claude", "grok", "agy", "muse"] if e not in excluded_reviewers]
+                if not candidate_re_reviewers:
+                    return fail_and_cleanup("❌ [Makewand Quality Gate] 缺乏独立第三方评审模型（已参与代码实现或修复的模型不得自审），安全终止交付。")
 
             re_output = None
             for alt_r in candidate_re_reviewers:
                 step_timeout = get_remaining_timeout(timeout)
                 if step_timeout <= 0:
                     break
-                print(c(f"→ 派发给 {alt_r.upper()} 进行第 {current_fix_iter} 轮独立跨模型红队复审 (Tier: deep, 只读隔离)...", COLOR_CYAN))
-                res = dispatch_task(alt_r, re_review_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                is_self_re_review = (alt_r == coder_engine)
+                rev_mode_str = "进行独立沙箱自审与边界复审 (单工具自审闭环)" if is_self_re_review else f"进行第 {current_fix_iter} 轮独立跨模型红队复审 (Tier: deep, 只读隔离)"
+                print(c(f"→ 派发给 {alt_r.upper()} {rev_mode_str}...", COLOR_CYAN))
+                curr_re_prompt = ("【单工具自审要求】当前为单工具自审闭环模式，请务必完全转换角色为严苛的代码审计员，对以上修复后的代码持最高怀疑态度，进行无情审查与边界挑刺：\n" + re_review_prompt) if is_self_re_review else re_review_prompt
+                res = dispatch_task(alt_r, curr_re_prompt, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
                 if isinstance(res, (tuple, list)) and len(res) == 3:
                     ok, out, _ = res[0], res[1], res[2]
                 else:
