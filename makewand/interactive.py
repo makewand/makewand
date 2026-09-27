@@ -22,6 +22,8 @@ try:
 except ImportError:
     readline = None
 
+_readline_initialized = False
+
 from makewand.config import (
     c,
     COLOR_BOLD,
@@ -304,11 +306,17 @@ def handle_conversational_turn(
 
 def setup_readline():
     """Initializes readline with history file and tab completers."""
-    if readline is None:
+    global _readline_initialized
+    if readline is None or _readline_initialized:
         return
 
+    _readline_initialized = True
+
     hist_dir = Path.home() / ".config" / "makewand"
-    hist_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        hist_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     hist_file = str(hist_dir / "history")
 
     try:
@@ -317,11 +325,14 @@ def setup_readline():
     except Exception:
         pass
 
-    atexit.register(
-        lambda: readline.write_history_file(hist_file)
-        if os.path.exists(hist_dir)
-        else None
-    )
+    def _save_history():
+        try:
+            if os.path.exists(hist_dir):
+                readline.write_history_file(hist_file)
+        except Exception:
+            pass
+
+    atexit.register(_save_history)
 
     import glob
 
