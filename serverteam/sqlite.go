@@ -114,8 +114,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		org.Slug,
 		org.Description,
 		org.MonthlyBudgetUSD,
-		org.CreatedAt.Format(time.RFC3339),
-		org.UpdatedAt.Format(time.RFC3339),
+		org.CreatedAt.Format(time.RFC3339Nano),
+		org.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(org.IsActive),
 	)
 	if err != nil {
@@ -174,8 +174,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		project.Slug,
 		project.Description,
 		project.MonthlyBudgetUSD,
-		project.CreatedAt.Format(time.RFC3339),
-		project.UpdatedAt.Format(time.RFC3339),
+		project.CreatedAt.Format(time.RFC3339Nano),
+		project.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(project.IsActive),
 	)
 	if err != nil {
@@ -242,8 +242,8 @@ ON CONFLICT(organization_id, user_id) DO UPDATE SET
 		membership.OrganizationID,
 		membership.UserID,
 		membership.Role,
-		membership.CreatedAt.Format(time.RFC3339),
-		membership.UpdatedAt.Format(time.RFC3339),
+		membership.CreatedAt.Format(time.RFC3339Nano),
+		membership.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(membership.IsActive),
 	)
 	if err != nil {
@@ -325,8 +325,8 @@ ON CONFLICT(project_id, user_id) DO UPDATE SET
 		membership.OrganizationID,
 		membership.UserID,
 		membership.Role,
-		membership.CreatedAt.Format(time.RFC3339),
-		membership.UpdatedAt.Format(time.RFC3339),
+		membership.CreatedAt.Format(time.RFC3339Nano),
+		membership.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(membership.IsActive),
 	)
 	if err != nil {

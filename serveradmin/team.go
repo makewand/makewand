@@ -59,7 +59,7 @@ func handleOrganizations(w http.ResponseWriter, req *http.Request, opts HandlerO
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersRead, "admin_organizations", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 			return
 		}
-		items = filterOrganizations(items, req, grant)
+		items = filterOrganizations(items, req, grant, opts.TeamStore)
 		page := paginateBounds(len(items), req)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"data":       items[page.Start:page.End],
@@ -79,7 +79,7 @@ func handleOrganizations(w http.ResponseWriter, req *http.Request, opts HandlerO
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", status, message, 0, 0, 0)
 			return
 		}
-		if grant != nil && grant.OrganizationID() != "" {
+		if grant != nil && (grant.OrganizationID() != "" || grant.ProjectID() != "") {
 			writeError(w, http.StatusForbidden, "forbidden", "scoped admin tokens cannot create additional organizations")
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusForbidden, "scoped admin tokens cannot create additional organizations", 0, 0, 0)
 			return
@@ -207,7 +207,7 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 	billing := serverteam.BillingSummary{}
 	if opts.TeamStore != nil {
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
-			orgs = filterOrganizations(orgs, req, grant)
+			orgs = filterOrganizations(orgs, req, grant, opts.TeamStore)
 			for _, org := range orgs {
 				billing.Organizations = append(billing.Organizations, serverteam.BuildBillingBucket(
 					org.ID,
@@ -320,7 +320,7 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 	alerts := make([]serverteam.BudgetAlert, 0, 8)
 	if opts.TeamStore != nil {
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
-			orgs = filterOrganizations(orgs, req, grant)
+			orgs = filterOrganizations(orgs, req, grant, opts.TeamStore)
 			for _, org := range orgs {
 				if alert, ok := serverteam.BuildBudgetAlert("organization", serverteam.BuildBillingBucket(
 					org.ID,
@@ -407,7 +407,7 @@ func handleDashboard(w http.ResponseWriter, req *http.Request, opts HandlerOptio
 	}
 	if opts.UserStore != nil && grant.AllowsScope(serverauth.ScopeAdminUsersRead) {
 		if users, err := opts.UserStore.ListUsers(); err == nil {
-			users = filterUsers(users, req, grant)
+			users = filterUsers(users, req, grant, opts.TeamStore)
 			payload["users"] = map[string]any{
 				"count": len(users),
 				"data":  users,
@@ -416,7 +416,7 @@ func handleDashboard(w http.ResponseWriter, req *http.Request, opts HandlerOptio
 	}
 	if opts.TeamStore != nil && grant.AllowsScope(serverauth.ScopeAdminUsersRead) {
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
-			orgs = filterOrganizations(orgs, req, grant)
+			orgs = filterOrganizations(orgs, req, grant, opts.TeamStore)
 			payload["organizations"] = map[string]any{
 				"count": len(orgs),
 				"data":  orgs,
@@ -447,6 +447,10 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 	case http.MethodGet:
 		grant, ok := authenticateAdmin(w, req, opts, serverauth.ScopeAdminUsersRead, "admin_organization_memberships")
 		if !ok {
+			return
+		}
+		if grant.ProjectID() != "" {
+			writeError(w, http.StatusForbidden, "forbidden", "project-scoped tokens cannot list organization memberships")
 			return
 		}
 		orgID := strings.TrimSpace(req.URL.Query().Get("organization_id"))
@@ -497,6 +501,17 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 		active := true
 		if payload.IsActive != nil {
 			active = *payload.IsActive
+		}
+		if grant.UserID() != "" && strings.TrimSpace(payload.UserID) != grant.UserID() {
+			writeError(w, http.StatusForbidden, "forbidden", "user-scoped tokens may only manage their own memberships")
+			return
+		}
+		if err := validateMembershipTarget(opts, payload.UserID, payload.OrganizationID, "", payload.Role); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		if !revokeMembershipCredentials(w, req, opts, grant, strings.TrimSpace(payload.UserID), strings.TrimSpace(payload.OrganizationID), "") {
+			return
 		}
 		item, err := opts.TeamStore.UpsertOrganizationMembership(serverteam.OrganizationMembership{
 			OrganizationID: strings.TrimSpace(payload.OrganizationID),
@@ -558,6 +573,9 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", status, message, 0, 0, 0)
 			return
 		}
+		if strings.TrimSpace(payload.ProjectID) == "" && grant.ProjectID() != "" {
+			payload.ProjectID = grant.ProjectID()
+		}
 		if grant != nil && grant.ProjectID() != "" && strings.TrimSpace(payload.ProjectID) != "" && strings.TrimSpace(payload.ProjectID) != grant.ProjectID() {
 			writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("scoped admin tokens may only manage project %q", grant.ProjectID()))
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage project %q", grant.ProjectID()), 0, 0, 0)
@@ -580,6 +598,17 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 		if payload.IsActive != nil {
 			active = *payload.IsActive
 		}
+		if grant.UserID() != "" && strings.TrimSpace(payload.UserID) != grant.UserID() {
+			writeError(w, http.StatusForbidden, "forbidden", "user-scoped tokens may only manage their own memberships")
+			return
+		}
+		if err := validateMembershipTarget(opts, payload.UserID, "", payload.ProjectID, payload.Role); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		if !revokeMembershipCredentials(w, req, opts, grant, strings.TrimSpace(payload.UserID), "", strings.TrimSpace(payload.ProjectID)) {
+			return
+		}
 		item, err := opts.TeamStore.UpsertProjectMembership(serverteam.ProjectMembership{
 			ProjectID: strings.TrimSpace(payload.ProjectID),
 			UserID:    strings.TrimSpace(payload.UserID),
@@ -598,7 +627,7 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 	}
 }
 
-func filterOrganizations(items []serverteam.Organization, req *http.Request, grant *serverauth.Grant) []serverteam.Organization {
+func filterOrganizations(items []serverteam.Organization, req *http.Request, grant *serverauth.Grant, teams serverteam.Store) []serverteam.Organization {
 	if len(items) == 0 {
 		return nil
 	}
@@ -607,6 +636,16 @@ func filterOrganizations(items []serverteam.Organization, req *http.Request, gra
 	scopedOrgID := ""
 	if grant != nil {
 		scopedOrgID = grant.OrganizationID()
+		if grant.ProjectID() != "" {
+			if teams == nil {
+				return nil
+			}
+			project, err := teams.GetProject(grant.ProjectID())
+			if err != nil || project == nil || (scopedOrgID != "" && scopedOrgID != project.OrganizationID) {
+				return nil
+			}
+			scopedOrgID = project.OrganizationID
+		}
 	}
 	out := make([]serverteam.Organization, 0, len(items))
 	for _, item := range items {
@@ -668,6 +707,9 @@ func filterOrganizationMemberships(items []serverteam.OrganizationMembership, re
 	orgID := strings.TrimSpace(query.Get("organization_id"))
 	userID := strings.TrimSpace(query.Get("user_id"))
 	activeFilter := strings.TrimSpace(query.Get("active"))
+	if grant != nil && grant.UserID() != "" {
+		userID = grant.UserID()
+	}
 	if grant != nil && grant.OrganizationID() != "" {
 		orgID = grant.OrganizationID()
 	}
@@ -702,6 +744,9 @@ func filterProjectMemberships(items []serverteam.ProjectMembership, req *http.Re
 	projectID := strings.TrimSpace(query.Get("project_id"))
 	userID := strings.TrimSpace(query.Get("user_id"))
 	activeFilter := strings.TrimSpace(query.Get("active"))
+	if grant != nil && grant.UserID() != "" {
+		userID = grant.UserID()
+	}
 	if grant != nil {
 		// The grant-scoped org is enforced per-membership in the filter loop
 		// below via grant.OrganizationID(); only the project scope is pinned here.

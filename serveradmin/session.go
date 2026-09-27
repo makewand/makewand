@@ -26,11 +26,12 @@ type SessionManager struct {
 }
 
 type sessionClaims struct {
-	UserID    string `json:"user_id"`
-	Email     string `json:"email"`
-	Role      string `json:"role"`
-	CSRFToken string `json:"csrf_token"`
-	ExpiresAt int64  `json:"expires_at"`
+	UserID      string `json:"user_id"`
+	AuthVersion string `json:"auth_version"`
+	Email       string `json:"email"`
+	Role        string `json:"role"`
+	CSRFToken   string `json:"csrf_token"`
+	ExpiresAt   int64  `json:"expires_at"`
 }
 
 type AdminSession struct {
@@ -167,7 +168,7 @@ func (m *SessionManager) Authenticate(req *http.Request) (*serverauth.Grant, *Ad
 		return nil, nil, false
 	}
 	user, err := m.userStore.GetUserByID(claims.UserID)
-	if err != nil || user == nil || !user.IsActive || !strings.EqualFold(user.Role, router.UserRoleAdmin) {
+	if err != nil || user == nil || !user.IsActive || !strings.EqualFold(user.Role, router.UserRoleAdmin) || !hmac.Equal([]byte(claims.AuthVersion), []byte(m.userAuthVersion(user))) {
 		return nil, nil, false
 	}
 	grant, err := serverauth.GrantFromRule(serverauth.TokenRule{
@@ -218,11 +219,12 @@ func (m *SessionManager) createSession(user *router.User) (*AdminSession, string
 	}
 	expiresAt := time.Now().UTC().Add(m.ttl)
 	claims := sessionClaims{
-		UserID:    user.ID,
-		Email:     user.Email,
-		Role:      user.Role,
-		CSRFToken: randomToken(18),
-		ExpiresAt: expiresAt.Unix(),
+		UserID:      user.ID,
+		AuthVersion: m.userAuthVersion(user),
+		Email:       user.Email,
+		Role:        user.Role,
+		CSRFToken:   randomToken(18),
+		ExpiresAt:   expiresAt.Unix(),
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
@@ -235,6 +237,14 @@ func (m *SessionManager) createSession(user *router.User) (*AdminSession, string
 		ExpiresAt: expiresAt,
 		CSRFToken: claims.CSRFToken,
 	}, value, nil
+}
+
+// Bind cookies to persisted authorization state without exposing password hashes.
+// The HMAC changes on password, role, or active-state updates, survives restarts,
+// and rejects cookies issued before authorization-version binding was introduced.
+func (m *SessionManager) userAuthVersion(user *router.User) string {
+	state, _ := json.Marshal([]any{user.ID, user.PasswordHash, user.Salt, user.Role, user.IsActive, user.UpdatedAt})
+	return base64.RawURLEncoding.EncodeToString(m.sign(state))
 }
 
 func (m *SessionManager) parseCookie(value string) (*sessionClaims, bool) {

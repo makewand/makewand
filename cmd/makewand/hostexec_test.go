@@ -147,8 +147,8 @@ func TestPersistUnsafeHostExecAckFailureLeavesNoResidue(t *testing.T) {
 
 // TestSetupDoesNotResurrectFailedAck runs the real setup command with the env
 // opt-in, an interactive "yes", and a corrupt config that makes the REAL
-// persist fail. Setup's own trailing config.Save (which rewrites the corrupt
-// file with defaults) must NOT smuggle the failed acknowledgment to disk.
+// persist fail. Setup must preserve the corrupt shared config and must NOT
+// smuggle the failed acknowledgment to disk through its trailing config.Save.
 func TestSetupDoesNotResurrectFailedAck(t *testing.T) {
 	cfgDir := t.TempDir()
 	t.Setenv("MAKEWAND_CONFIG_DIR", cfgDir)
@@ -172,24 +172,20 @@ func TestSetupDoesNotResurrectFailedAck(t *testing.T) {
 	cmd.SetArgs([]string{"setup"})
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("setup error: %v", err)
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("setup must report that the corrupt shared config cannot be saved")
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(config): %v", err)
 	}
-	var saved struct {
-		AckVersion int    `json:"unsafe_host_exec_ack_version"`
-		AckAt      string `json:"unsafe_host_exec_ack_at"`
-		AckHost    string `json:"unsafe_host_exec_ack_host"`
+	if string(data) != "{corrupt" {
+		t.Fatalf("setup replaced the corrupt shared config: %s", data)
 	}
-	if err := json.Unmarshal(data, &saved); err != nil {
-		t.Fatalf("Unmarshal(saved config): %v (raw: %s)", err, data)
-	}
-	if saved.AckVersion != 0 || saved.AckAt != "" || saved.AckHost != "" {
-		t.Fatalf("setup persisted the failed acknowledgment: %+v\nraw: %s", saved, data)
+	loaded, _ := config.Load()
+	if loaded.UnsafeHostExecAckValid() {
+		t.Fatal("setup resurrected an acknowledgment that was never persisted")
 	}
 }
 

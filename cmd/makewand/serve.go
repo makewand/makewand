@@ -162,6 +162,9 @@ func serveCmd() *cobra.Command {
 				}
 				defer sqliteTokens.Close()
 				tokenManager = sqliteTokens
+				if bootstrapManager != nil {
+					tokenManager = serverauth.NewMultiTokenManager(sqliteTokens, bootstrapManager)
+				}
 				if authz != nil {
 					authz = serverauth.NewMultiAuthorizer(authz, sqliteTokens)
 				} else {
@@ -257,6 +260,7 @@ func serveCmd() *cobra.Command {
 			if authz == nil {
 				return fmt.Errorf("serve requires --token/--auth-config or an enabled state DB token store")
 			}
+			authz = router.WithUserAuthorization(authz, userStore, teamStore)
 			// Strict accounting rejects requests it cannot durably record; without a
 			// persisting sink (an alert observer does not count) that would reject
 			// every request, so fail fast at startup instead.

@@ -76,6 +76,7 @@ func shieldGitAttributes(projectPath string) func() {
 						gd = filepath.Join(cur, gd)
 					}
 					gitDirs = append(gitDirs, gd)
+					//nolint:gosec // G703: Git's linked-worktree metadata deliberately refers to the common repository outside the selected worktree; this reads only its fixed commondir file.
 					cdBytes, err := os.ReadFile(filepath.Join(gd, "commondir"))
 					if err == nil {
 						cd := strings.TrimSpace(string(cdBytes))
@@ -89,6 +90,7 @@ func shieldGitAttributes(projectPath string) func() {
 		}
 		for _, gd := range gitDirs {
 			attrPath := filepath.Join(gd, "info", "attributes")
+			//nolint:gosec // G703: the Git administrative directory may be outside a linked worktree; the fixed attributes path is intentionally masked and restored for safe Git execution.
 			if _, err := os.Stat(attrPath); err == nil {
 				shieldPath := fmt.Sprintf("%s.mw_shield_%d_%d", attrPath, os.Getpid(), len(restorations))
 				if err := os.Rename(attrPath, shieldPath); err == nil {

@@ -6,7 +6,7 @@ Maintains persistent rolling usage window for Claude, Codex, AGY, and Muse subsc
 import os
 import sys
 import json
-import fcntl
+from makewand import filelock as fcntl
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path

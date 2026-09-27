@@ -144,15 +144,17 @@ class TestCandidateLockingAndAtomicReplace(unittest.TestCase):
                 src_file = cand_dir / "foo.txt"
                 src_file.write_text("candidate content")
 
-                CandidateManager.save_race(
-                    race_id=race_id,
-                    prompt="test race",
-                    base_cwd=str(target_ws),
-                    baseline_commit="HEAD",
-                    agent_a={"name": "Agent A", "path": str(cand_dir), "success": True, "duration": 1.0, "diff_size": 10},
-                    agent_b={"name": "Agent B", "path": str(cand_dir), "success": True, "duration": 1.0, "diff_size": 10},
-                    winner="A"
-                )
+                # This non-Git fixture supplies the same plan at seal and apply.
+                with patch("makewand.candidate.get_candidate_files_changed", return_value={"foo.txt": "M"}):
+                    CandidateManager.save_race(
+                        race_id=race_id,
+                        prompt="test race",
+                        base_cwd=str(target_ws),
+                        baseline_commit="HEAD",
+                        agent_a={"name": "Agent A", "path": str(cand_dir), "success": True, "duration": 1.0, "diff_size": 10},
+                        agent_b={"name": "Agent B", "path": str(cand_dir), "success": True, "duration": 1.0, "diff_size": 10},
+                        winner="A"
+                    )
 
                 with patch("makewand.candidate.get_candidate_files_changed", return_value={"foo.txt": "M"}), \
                      patch("makewand.candidate.run_git_cmd", return_value=(0, "", "")):
@@ -485,5 +487,4 @@ class TestCatalogDrivenTierResolutionAndSandboxWhitelist(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 

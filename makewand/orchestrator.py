@@ -41,7 +41,8 @@ from makewand.git_helper import (
     create_ephemeral_shadow_worktree,
     get_submodule_paths,
 )
-from makewand.candidate import CandidateManager
+from makewand.candidate import CandidateManager, build_manifest, get_candidate_files_changed
+from makewand.artifact import workspace_snapshot
 from makewand.health import get_or_update_status
 from makewand.providers.agy import execute_agy_task
 from makewand.providers.claude import execute_claude_task
@@ -264,21 +265,33 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
     import shutil
     from makewand.sandbox import run_in_sandbox
+    from makewand.artifact import workspace_snapshot, changed_inputs
     p = Path(cwd)
 
     test_suites = []
-    py_env = {"PYTHONPATH": f"{cwd}:{os.environ.get('PYTHONPATH', '')}"}
+    py_env = {"PYTHONPATH": f"{cwd}:{os.environ.get('PYTHONPATH', '')}", "PYTHONDONTWRITEBYTECODE": "1"}
 
     # 1. Python test suites
-    if (p / "pytest.ini").exists() or (p / "pyproject.toml").exists() or (p / "tests").is_dir() or list(p.glob("test_*.py")):
+    py_tests = list(p.glob("test_*.py")) or list(p.glob("*_test.py"))
+    if (p / "tests").is_dir():
+        py_tests += list((p / "tests").rglob("test_*.py")) + list((p / "tests").rglob("*_test.py"))
+    pytest_config = (p / "pytest.ini").is_file()
+    if (p / "pyproject.toml").is_file():
+        try:
+            import tomllib
+            with (p / "pyproject.toml").open("rb") as f:
+                pytest_config = pytest_config or bool(tomllib.load(f).get("tool", {}).get("pytest"))
+        except (ImportError, OSError, ValueError):
+            pass
+    if pytest_config or py_tests:
         py_bin = sys.executable or "python3"
-        test_target = ["tests"] if (p / "tests").is_dir() else []
+        test_target = []  # Respect pytest configuration and collect root-level tests too.
         try:
             import pytest
-            py_cmd = [py_bin, "-m", "pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
+            py_cmd = [py_bin, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:langsmith", "-p", "no:django"] + test_target
         except ImportError:
             if shutil.which("pytest"):
-                py_cmd = ["pytest", "-q", "-p", "no:langsmith", "-p", "no:django"] + test_target
+                py_cmd = ["pytest", "-q", "-p", "no:cacheprovider", "-p", "no:langsmith", "-p", "no:django"] + test_target
             else:
                 py_cmd = [py_bin, "-m", "unittest", "discover", "-q"]
         test_suites.append(("Python", py_cmd, py_env))
@@ -293,7 +306,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             with open(p / "package.json", "r", encoding="utf-8") as f:
                 pkg_data = json.load(f)
                 if "test" in pkg_data.get("scripts", {}):
-                    test_suites.append(("Node", ["npm", "test", "--", "--passWithNoTests"], {}))
+                    test_suites.append(("Node", ["npm", "test"], {}))
         except Exception:
             pass
 
@@ -303,6 +316,11 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
 
     if not test_suites:
         return True, None
+
+    try:
+        tested_inputs = workspace_snapshot(cwd)
+    except OSError as exc:
+        return False, f"无法封存测试输入: {exc}"
 
     all_passed = True
     details = []
@@ -345,6 +363,14 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         else:
             if stdout.strip():
                 details.append(f"[{name} Tests Passed]:\n{stdout.strip()[:500]}")
+
+    try:
+        changed = changed_inputs(tested_inputs, workspace_snapshot(cwd))
+    except OSError as exc:
+        return False, f"无法复核测试输入: {exc}"
+    if changed:
+        all_passed = False
+        details.append("测试修改了待交付输入，必须重新生成并验证: " + ", ".join(changed[:20]))
 
     if all_passed:
         return True, "\n\n".join(details)
@@ -584,7 +610,7 @@ def get_identity_message() -> str:
         "  1. 智能意图路由：精准区分闲聊/问答（直接响应）与工程开发任务（多模型流水线），杜绝误触发程序检查或缺陷修复\n"
         "  2. 跨模型联合流水线：自动规划、编码实现、红队盲审与 Auto-Fix 缺陷自愈\n"
         "  3. 双模型沙箱竞速 (/race)：临时工作区并发派发比拼与主裁判评定\n"
-        "  4. 订阅配额健康监控 (/status, /quota)：零 Token 额外成本自适应容灾降级\n"
+        "  4. 订阅配额健康监控 (/status, /quota)：按订阅额度与显式 API 费用策略切换\n"
         "  5. 安全搜索与物理沙箱 (/search, /sandbox)：护栏搜索与 Bubblewrap 进程隔离"
     )
 
@@ -999,6 +1025,115 @@ def select_optimal_engine_pair(
 
     return available_coders, available_reviewers, meta_info
 
+def _freeze_delivery_inputs(root: str, reviewed_inputs: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Freeze deliverable paths before review; Git metadata is not authority later."""
+    repositories = [""] + get_submodule_paths(root)
+    frozen = {}
+    for relative_repo in repositories:
+        repo = Path(root) / relative_repo
+        if not repo.exists():
+            continue
+        if relative_repo and not (repo / ".git").exists():
+            raise OSError(f"cannot verify uninitialized submodule {relative_repo}")
+        code, names, error = run_git_cmd(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."],
+            cwd=str(repo), binary=True)
+        if code:
+            raise OSError(f"cannot freeze delivery paths: {error}")
+        expected = {}
+        prefix = relative_repo + "/" if relative_repo else ""
+        for raw in names.split(b"\0"):
+            if not raw:
+                continue
+            path = os.fsdecode(raw).rstrip("/")
+            if Path(path).is_absolute() or ".." in Path(path).parts:
+                raise OSError("invalid delivery path")
+            record = reviewed_inputs.get(prefix + path)
+            if record is not None and record[0] in ("file", "link"):
+                expected[path] = record
+            elif (repo / path).exists() or (repo / path).is_symlink():
+                if prefix + path not in repositories:
+                    raise OSError(f"delivery path missing from reviewed inputs: {prefix + path}")
+        frozen[relative_repo] = expected
+    return frozen
+
+
+def _verify_delivery_commit(repo: str, commit: str, expected: Dict[str, Any], gitlinks: Dict[str, str]) -> str:
+    """Compare immutable Git blobs/modes against the reviewed source records.
+
+    A clean worktree is insufficient: hooks, filters, or a changed index/HEAD can
+    create a clean but unreviewed commit. Read objects by ID, never through Git's
+    worktree filters, then export and push only this verified commit ID.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise OSError("invalid delivery commit ID")
+    code, listing, error = run_git_cmd(["git", "--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", commit], cwd=repo, binary=True)
+    if code:
+        raise OSError(f"cannot read delivery tree: {error}")
+    blobs = []
+    found = set()
+    found_links = set()
+    for entry in listing.split(b"\0"):
+        if not entry:
+            continue
+        header, raw_path = entry.split(b"\t", 1)
+        mode, kind, oid = header.split()
+        path = os.fsdecode(raw_path)
+        if mode == b"160000" and kind == b"commit":
+            if gitlinks.get(path) != oid.decode("ascii"):
+                raise OSError(f"unverified submodule commit: {path}")
+            found_links.add(path)
+            continue
+        record = expected.get(path)
+        if kind != b"blob" or record is None:
+            raise OSError(f"unreviewed delivery path: {path}")
+        expected_mode = b"120000" if record[0] == "link" else (b"100755" if record[2] & 0o100 else b"100644")
+        if mode != expected_mode:
+            raise OSError(f"delivery mode differs from review: {path}")
+        blobs.append((path, oid, record))
+        found.add(path)
+    if found != set(expected) or found_links != set(gitlinks):
+        raise OSError("delivery tree added or removed reviewed paths")
+    if blobs:
+        object_ids = b"".join(oid + b"\n" for _, oid, _ in blobs)
+        code, sizes, error = run_git_cmd(["git", "--no-replace-objects", "cat-file", "--batch-check"], cwd=repo,
+                                       input_data=object_ids, binary=True)
+        if code or len(sizes.splitlines()) != len(blobs):
+            raise OSError(f"cannot measure delivery objects: {error}")
+        total_size = 0
+        for line, (path, oid, _) in zip(sizes.splitlines(), blobs):
+            header = line.split()
+            if len(header) != 3 or header[:2] != [oid, b"blob"]:
+                raise OSError(f"invalid delivery object: {path}")
+            total_size += int(header[2])
+            if total_size > 512 * 1024 * 1024:
+                raise OSError("delivery objects exceeded the input budget")
+        code, data, error = run_git_cmd(["git", "--no-replace-objects", "cat-file", "--batch"], cwd=repo,
+                                      input_data=object_ids, binary=True)
+        if code:
+            raise OSError(f"cannot read delivery blobs: {error}")
+        offset = 0
+        for path, oid, record in blobs:
+            end = data.find(b"\n", offset)
+            header = data[offset:end].split()
+            if end < 0 or len(header) != 3 or header[:2] != [oid, b"blob"]:
+                raise OSError(f"invalid delivery object: {path}")
+            size = int(header[2])
+            content = data[end + 1:end + 1 + size]
+            if len(content) != size or data[end + 1 + size:end + 2 + size] != b"\n":
+                raise OSError(f"truncated delivery object: {path}")
+            offset = end + size + 2
+            matches = content == os.fsencode(record[1]) if record[0] == "link" else hashlib.sha256(content).hexdigest() == record[1]
+            if not matches:
+                raise OSError(f"delivery content differs from review: {path}")
+        if offset != len(data):
+            raise OSError("unexpected delivery object data")
+    code, tree, error = run_git_cmd(["git", "--no-replace-objects", "rev-parse", commit + "^{tree}"], cwd=repo)
+    if code or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree.strip()):
+        raise OSError(f"cannot identify verified delivery tree: {error}")
+    return tree.strip()
+
+
 def run_pipeline(
     prompt: str,
     cwd: Optional[str] = None,
@@ -1291,7 +1426,21 @@ def run_pipeline(
 
     # Run deterministic local test suite before review
     print(c("🧪 [Makewand Test Gate] 正在执行本地确定性测试验证...", COLOR_CYAN))
+    try:
+        tested_inputs = workspace_snapshot(worktree_for_diff)
+    except OSError as exc:
+        return fail_and_cleanup(f"无法封存测试前内容: {exc}")
     test_ok, test_err = run_local_tests(cwd)
+    try:
+        reviewed_inputs = workspace_snapshot(worktree_for_diff)
+        if reviewed_inputs != tested_inputs:
+            test_ok, test_err = False, "测试开始至审查快照之间产物发生变化，必须重新测试。"
+        diff_out = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
+        delivery_inputs = _freeze_delivery_inputs(worktree_for_diff, reviewed_inputs) if is_shadow_active else {}
+        if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
+            return fail_and_cleanup("审查快照生成期间工作区发生变化，拒绝交付。")
+    except OSError as exc:
+        return fail_and_cleanup(f"无法封存待审查内容: {exc}")
     if not test_ok:
         print(c(f"❌ [Makewand Test Gate] 发现单元测试失败：\n{test_err[:400]}", COLOR_RED + COLOR_BOLD))
     else:
@@ -1404,6 +1553,10 @@ def run_pipeline(
                 break
 
             # Re-run deterministic local tests after fix
+            try:
+                tested_inputs = workspace_snapshot(worktree_for_diff)
+            except OSError as exc:
+                return fail_and_cleanup(f"无法封存修复后测试输入: {exc}")
             test_ok, test_err = run_local_tests(cwd)
             if not test_ok:
                 print(c(f"❌ [Makewand Test Gate] 修复后本地单元测试仍未通过：\n{test_err[:400]}", COLOR_RED))
@@ -1416,7 +1569,16 @@ def run_pipeline(
                 break
 
             print(c(f"▶ [Makewand Auto-Fix] 修复已落盘，重新发起第 {current_fix_iter} 轮红队复审 (只读安全隔离)...", COLOR_CYAN))
-            new_diff = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
+            try:
+                reviewed_inputs = workspace_snapshot(worktree_for_diff)
+                if reviewed_inputs != tested_inputs:
+                    test_ok, test_err = False, "修复后测试至复审之间产物发生变化，必须重新测试。"
+                new_diff = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
+                delivery_inputs = _freeze_delivery_inputs(worktree_for_diff, reviewed_inputs) if is_shadow_active else {}
+                if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
+                    return fail_and_cleanup("复审快照生成期间工作区发生变化，拒绝交付。")
+            except OSError as exc:
+                return fail_and_cleanup(f"无法封存待复审内容: {exc}")
             new_diff_snippet = format_review_diff(new_diff)
             re_test_warning = f"\n【重要：本地测试仍未通过】报错如下：\n{test_err[:1500]}\n" if not test_ok else ""
 
@@ -1541,6 +1703,12 @@ def run_pipeline(
     if not is_review_passed(review_output):
         return fail_and_cleanup("❌ [Makewand Quality Gate] 代码未能通过独立红队审查 (未获批准或存在缺陷)，拒绝交付。")
 
+    try:
+        if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
+            return fail_and_cleanup("❌ [Makewand Quality Gate] 审查期间产物内容或权限发生变化，拒绝交付未审查版本。")
+    except OSError as exc:
+        return fail_and_cleanup(f"无法复核已审查内容: {exc}")
+
     if is_shadow_active:
         if shadow_branch:
             delivered_branch = shadow_branch
@@ -1558,11 +1726,13 @@ def run_pipeline(
                 artifacts_dir.mkdir(parents=True, exist_ok=True)
                 patch_file = artifacts_dir / "makewand_delivery.patch"
                 sub_patches = []
+                verified_submodules = {}
+                submodule_pushes = []
 
                 # 0. Commit any changes inside submodules first so gitlinks can be staged
                 # Crucial: Use get_submodule_paths to correctly handle paths with spaces and descending depth
                 if (Path(worktree_root) / ".gitmodules").exists():
-                    sorted_subs = get_submodule_paths(worktree_root)
+                    sorted_subs = sorted((p for p in delivery_inputs if p), key=lambda p: len(Path(p).parts), reverse=True)
                     for sub_rel in sorted_subs:
                         dst_sub = Path(worktree_root) / sub_rel
                         if dst_sub.exists():
@@ -1580,10 +1750,21 @@ def run_pipeline(
                                 if c_sub_code != 0:
                                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 提交失败 ({c_sub_err})，拒绝交付。")
 
+                            commit_code, sub_commit, sub_error = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(dst_sub))
+                            if commit_code:
+                                raise OSError(f"cannot identify submodule commit: {sub_error}")
+                            sub_commit = sub_commit.strip()
+                            child_links = {path[len(sub_rel) + 1:]: value for path, value in verified_submodules.items()
+                                           if path.startswith(sub_rel + "/") and not any(
+                                               path.startswith(parent + "/") for parent in verified_submodules
+                                               if parent != path and parent.startswith(sub_rel + "/"))}
+                            sub_tree = _verify_delivery_commit(str(dst_sub), sub_commit, delivery_inputs[sub_rel], child_links)
+                            verified_submodules[sub_rel] = sub_commit
+
                             # Generate binary-safe submodule patch if sub_base is known
                             sub_base = sub_baselines.get(sub_rel)
                             if sub_base:
-                                p_sub_code, p_sub_b, p_sub_err = run_git_cmd(["git", "diff", "--binary", "--full-index", sub_base, "HEAD"], cwd=str(dst_sub), binary=True)
+                                p_sub_code, p_sub_b, p_sub_err = run_git_cmd(["git", "--no-replace-objects", "diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", sub_base, sub_commit], cwd=str(dst_sub), binary=True)
                                 if p_sub_code != 0:
                                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 交付补丁导出失败 ({p_sub_err})，阻断交付。")
                                 if p_sub_b and p_sub_b.strip():
@@ -1598,16 +1779,16 @@ def run_pipeline(
                                     sub_patches.append({
                                         "rel_path": sub_rel,
                                         "patch_file": str(sub_patch_p),
-                                        "sha256": hashlib.sha256(p_sub_b).hexdigest()
+                                        "sha256": hashlib.sha256(p_sub_b).hexdigest(),
+                                        "verified_commit": sub_commit,
+                                        "verified_tree": sub_tree,
                                     })
 
                             # Sync submodule commit object to src_sub so host can inspect/merge
                             if repo_root:
                                 src_sub = Path(repo_root) / sub_rel
                                 if src_sub.exists():
-                                    push_code, _, push_err = run_git_cmd(["git", "push", str(src_sub.resolve()), f"HEAD:refs/heads/{delivered_branch}"], cwd=str(dst_sub))
-                                    if push_code != 0:
-                                        return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 分支推送同步失败 ({push_err})，阻断交付。")
+                                    submodule_pushes.append((str(dst_sub), str(src_sub.resolve()), sub_commit))
 
                 # 1. Stage changes and verify staging success
                 add_code, _, add_err = run_git_cmd(["git", "add", "-A"], cwd=worktree_root)
@@ -1636,20 +1817,17 @@ def run_pipeline(
                 if baseline_commit and impl_commit == baseline_commit:
                     return fail_and_cleanup("❌ [Makewand Quality Gate] 影子分支没有检测到任何已落盘的代码修改，拒绝交付空提交。")
 
-                # Synchronize main repository delivery branch to repo_root so host can directly inspect/merge
-                if repo_root and delivered_branch:
-                    push_code, _, push_err = run_git_cmd(
-                        ["git", "push", str(repo_root), f"HEAD:refs/heads/{delivered_branch}"],
-                        cwd=worktree_root
-                    )
-                    if push_code != 0:
-                        return fail_and_cleanup(f"❌ [Makewand Quality Gate] 主仓库交付分支同步失败 ({push_err})，阻断交付。")
+                root_links = {path: value for path, value in verified_submodules.items()
+                              if not any(path.startswith(parent + "/") for parent in verified_submodules if parent != path)}
+                impl_tree = _verify_delivery_commit(worktree_root, impl_commit, delivery_inputs[""], root_links)
+                if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
+                    return fail_and_cleanup("❌ [Makewand Quality Gate] 暂存或提交期间产物发生变化，拒绝交付未审查版本。")
 
                 # 4. Generate binary-safe, full-index patch covering the entire task range (baseline_commit -> HEAD)
                 # Saved outside the repository to prevent artifact leakage or uncommitted file pollution
                 if baseline_commit:
                     p_code, p_diff_b, p_err = run_git_cmd([
-                        "git", "diff", "--binary", "--full-index", baseline_commit, "HEAD"
+                        "git", "--no-replace-objects", "diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", baseline_commit, impl_commit
                     ], cwd=worktree_root, binary=True)
                     if p_code != 0 or not p_diff_b or len(p_diff_b.strip()) == 0:
                         return fail_and_cleanup(f"❌ [Makewand Quality Gate] 交付补丁导出失败或内容为空 (code: {p_code}, err: {p_err})，阻断交付。")
@@ -1666,6 +1844,20 @@ def run_pipeline(
                 if dirty_check.strip():
                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子工作区交付后存在未受控改动或脏文件 ({dirty_check.strip()[:120]})，阻断交付。")
 
+                if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
+                    return fail_and_cleanup("❌ [Makewand Quality Gate] 导出期间工作区发生变化，拒绝交付。")
+
+                # Publish immutable, verified objects only. Moving HEAD between
+                # validation and push/export cannot replace approved content.
+                for sub_repo, destination, sub_commit in submodule_pushes:
+                    push_code, _, push_error = run_git_cmd(["git", "--no-replace-objects", "push", destination, f"{sub_commit}:refs/heads/{delivered_branch}"], cwd=sub_repo)
+                    if push_code:
+                        return fail_and_cleanup(f"子模块交付提交同步失败: {push_error}")
+                if repo_root and delivered_branch:
+                    push_code, _, push_error = run_git_cmd(["git", "--no-replace-objects", "push", str(repo_root), f"{impl_commit}:refs/heads/{delivered_branch}"], cwd=worktree_root)
+                    if push_code:
+                        return fail_and_cleanup(f"主仓库交付提交同步失败: {push_error}")
+
                 # Tree-based dirty baseline detection: compare tree hashes to avoid false conflict on clean repo
                 tree_b_code, tree_b, _ = run_git_cmd(["git", "rev-parse", f"{baseline_commit}^{{tree}}"], cwd=worktree_root) if baseline_commit else (1, "", "")
                 tree_h_code, tree_h, _ = run_git_cmd(["git", "rev-parse", f"{repo_head}^{{tree}}"], cwd=worktree_root) if repo_head else (1, "", "")
@@ -1676,6 +1868,8 @@ def run_pipeline(
                 manifest_data = {
                     "timestamp": art_ts,
                     "delivered_branch": delivered_branch,
+                    "verified_commit": impl_commit,
+                    "verified_tree": impl_tree,
                     "repo_root": repo_apply_root,
                     "baseline_commit": baseline_commit,
                     "repo_head": repo_head,
@@ -1792,7 +1986,7 @@ def run_pipeline(
                     print(f"  一键应用交付补丁 (推荐): {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}")
                     print(f"  手动应用: git -C {apply_root_esc} apply {patch_file_esc}\n")
                 else:
-                    print(f"  宿主机仓库可直接合并独立审查通过的改动: git -C {apply_root_esc} merge {delivered_branch}")
+                    print(f"  宿主机仓库可直接合并独立审查通过的改动: git -C {apply_root_esc} merge {impl_commit}")
                     print(f"  独立补丁备用存档: {c(str(patch_file), COLOR_CYAN)}")
                     print(f"  一键应用脚本备用: {c(apply_script_esc, COLOR_CYAN)}\n")
             else:
@@ -1947,6 +2141,29 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
         print(c("❌ 代码审计检测到严重隐患，未达合并标准 (FAILED)。", COLOR_RED + COLOR_BOLD))
         return EXIT_FAILED
 
+def parse_race_verdict(report: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Only one explicit structured verdict can authorize a candidate."""
+    lines = [line.partition(":")[2].strip() for line in (report or "").splitlines()
+             if line.strip().startswith("MAKEWAND_RACE_VERDICT:")]
+    if len(lines) != 1:
+        return None
+    try:
+        verdict = json.loads(lines[0])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(verdict, dict) or type(verdict.get("pass")) is not bool:
+        return None
+    defects = verdict.get("defects")
+    if not isinstance(defects, list) or not all(isinstance(item, str) for item in defects):
+        return None
+    if verdict["pass"]:
+        if verdict.get("winner") not in ("A", "B") or defects:
+            return None
+    elif verdict.get("winner") is not None:
+        return None
+    return verdict
+
+
 def run_race(
     prompt: str,
     cwd: Optional[str] = None,
@@ -2068,6 +2285,23 @@ def run_race(
                 res_a = f_a.result()
                 res_b = f_b.result()
 
+        # Deterministic local test gate validation on both candidate worktrees
+        print(c("🧪 正在对两位候选人的产出分别执行本地确定性测试套件验证...", COLOR_CYAN))
+        tested_a = workspace_snapshot(wt_a)
+        tested_b = workspace_snapshot(wt_b)
+        test_pass_a, test_out_a = run_local_tests(str(wt_a), timeout=60)
+        test_pass_b, test_out_b = run_local_tests(str(wt_b), timeout=60)
+
+        reviewed_a = workspace_snapshot(wt_a)
+        reviewed_b = workspace_snapshot(wt_b)
+        if reviewed_a != tested_a:
+            test_pass_a, test_out_a = False, "候选A在测试至审查之间发生变化，必须重新测试。"
+        if reviewed_b != tested_b:
+            test_pass_b, test_out_b = False, "候选B在测试至审查之间发生变化，必须重新测试。"
+        manifest_a = build_manifest(wt_a)
+        manifest_b = build_manifest(wt_b)
+        changes_a = get_candidate_files_changed(wt_a, baseline_commit=base_a_commit.strip() if base_a_commit else None)
+        changes_b = get_candidate_files_changed(wt_b, baseline_commit=base_b_commit.strip() if base_b_commit else None)
         diff_a, diff_err_a = get_git_diff_status(str(wt_a), base_rev=base_a_commit.strip() if base_a_commit else None)
         diff_b, diff_err_b = get_git_diff_status(str(wt_b), base_rev=base_b_commit.strip() if base_b_commit else None)
         if diff_err_a:
@@ -2075,10 +2309,6 @@ def run_race(
         if diff_err_b:
             print(c(f"⚠ 选手 B diff 提取警告: {diff_err_b}", COLOR_YELLOW))
 
-        # Deterministic local test gate validation on both candidate worktrees
-        print(c("🧪 正在对两位候选人的产出分别执行本地确定性测试套件验证...", COLOR_CYAN))
-        test_pass_a, test_out_a = run_local_tests(str(wt_a), timeout=60)
-        test_pass_b, test_out_b = run_local_tests(str(wt_b), timeout=60)
 
         print(c("\n============================================================", COLOR_BOLD))
         print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
@@ -2099,7 +2329,9 @@ def run_race(
             f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={'通过' if test_pass_b else '失败'}\n\n"
             f"--- 候选方案 A 的代码实现 ---\n{fmt_diff_a}\n\n"
             f"--- 候选方案 B 的代码实现 ---\n{fmt_diff_b}\n\n"
-            f"请给出：1. 两套方案的技术架构、可维护性与测试质量深度对比 2. 最终裁决结果（明确写出推荐采纳候选方案 A 或候选方案 B）及采纳理由。"
+            f"请给出两套方案的架构、可维护性与测试质量对比及采纳理由。"
+            f'最后单独一行输出 MAKEWAND_RACE_VERDICT: {{"pass": true, "winner": "A", "defects": []}}，winner 仅可为 A 或 B。'
+            f'若两个方案均不可采纳，输出 MAKEWAND_RACE_VERDICT: {{"pass": false, "winner": null, "defects": ["原因"]}}。不得强行选出胜者。'
         )
         print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
         ok, judge_report, _ = execute_agy_task(
@@ -2110,77 +2342,55 @@ def run_race(
             print(judge_report.strip())
 
         # Determine winner with strict deterministic test gate
-        eligible_a = res_a[1] and test_pass_a
-        eligible_b = res_b[1] and test_pass_b
+        eligible_a = res_a[1] and test_pass_a and not diff_err_a and bool(diff_a.strip())
+        eligible_b = res_b[1] and test_pass_b and not diff_err_b and bool(diff_b.strip())
 
-        def _check_winner_mention(report: str, letter: str) -> bool:
-            target = letter.upper()
-            patterns = [
-                rf'(?:[不未别]|no\s+|not\s+)?(?:推荐(?:采纳)?|采纳|胜出(?:者)?|获胜|胜者|winner(?:\s+is)?|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|option|model|候选(?:人|者|方案)?|方案)?\s*(?<![a-zA-Z0-9]){target}(?![a-zA-Z0-9])',
-                rf'(?:[不未别]|no\s+|not\s+)?(?:推荐(?:采纳)?|采纳|胜出(?:者)?|获胜|胜者|winner(?:\s+is)?|prefer|recommend)\s*[:：]?\s*(?:选手|agent|candidate|option|model|候选(?:人|者|方案)?|方案)\s*[:：]?\s*(?<![a-zA-Z0-9]){target}(?![a-zA-Z0-9])',
-                rf'(?:[不未别]|no\s+|not\s+)?(?:选手|agent|candidate|option|model|候选(?:人|者|方案)?|方案)?\s*(?<![a-zA-Z0-9]){target}(?![a-zA-Z0-9])\s*(?:方案)?\s*(?:获胜|胜出|胜者|wins?|is the winner)',
-            ]
-            for pat in patterns:
-                for m in re.finditer(pat, report):
-                    matched = m.group(0).strip()
-                    if not re.search(r'^[不未别]|^(?:no|not)\b', matched, re.IGNORECASE):
-                        if matched.endswith(' a') or matched.endswith(' a '):
-                            continue
-                        return True
-            return False
-
-        winner = None
-        if not test_pass_a and not test_pass_b:
-            print(c("❌ [Makewand Test Gate] 两套候选方案均未通过本地单元测试，拒绝产生胜出方案。", COLOR_RED + COLOR_BOLD))
+        # A rejected, missing or malformed verdict never turns into a winner.
+        verdict = parse_race_verdict(judge_report) if ok else None
+        winner = verdict.get("winner") if verdict and verdict["pass"] else None
+        if winner == "A" and not eligible_a or winner == "B" and not eligible_b:
             winner = None
-        elif ok and judge_report:
-            m_a = _check_winner_mention(judge_report, "A")
-            m_b = _check_winner_mention(judge_report, "B")
-            if m_a and not m_b and eligible_a:
-                winner = "A"
-            elif m_b and not m_a and eligible_b:
-                winner = "B"
-            elif eligible_a and not eligible_b:
-                winner = "A"
-            elif eligible_b and not eligible_a:
-                winner = "B"
-            elif eligible_a and eligible_b:
-                if res_a[3] <= res_b[3]:
-                    winner = "A"
-                else:
-                    winner = "B"
-        else:
-            if eligible_a and not eligible_b:
-                winner = "A"
-            elif eligible_b and not eligible_a:
-                winner = "B"
+        if workspace_snapshot(wt_a) != reviewed_a or workspace_snapshot(wt_b) != reviewed_b:
+            winner = None
+            verdict = None
+            print(c("裁判审查期间候选内容发生变化，拒绝应用。", COLOR_RED))
 
-        CandidateManager.save_race(
-            race_id=race_id,
-            prompt=prompt,
-            base_cwd=cwd,
-            baseline_commit=b_commit.strip() if (code == 0 and b_commit) else "",
-            agent_a={
-                "model": res_a[0],
-                "path": str(wt_a),
-                "duration": res_a[3],
-                "success": res_a[1],
-                "test_passed": test_pass_a,
-                "diff": diff_a,
-                "baseline_commit": base_a_commit.strip() if base_a_commit else "",
-            },
-            agent_b={
-                "model": res_b[0],
-                "path": str(wt_b),
-                "duration": res_b[3],
-                "success": res_b[1],
-                "test_passed": test_pass_b,
-                "diff": diff_b,
-                "baseline_commit": base_b_commit.strip() if base_b_commit else "",
-            },
-            judge_report=judge_report or "",
-            winner=winner,
-        )
+        try:
+            CandidateManager.save_race(
+                race_id=race_id,
+                prompt=prompt,
+                base_cwd=cwd,
+                baseline_commit=b_commit.strip() if (code == 0 and b_commit) else "",
+                agent_a={
+                    "model": res_a[0],
+                    "path": str(wt_a),
+                    "duration": res_a[3],
+                    "success": res_a[1],
+                    "test_passed": test_pass_a,
+                    "review_passed": winner == "A",
+                    "manifest": manifest_a,
+                    "changes": changes_a,
+                    "diff": diff_a,
+                    "baseline_commit": base_a_commit.strip() if base_a_commit else "",
+                },
+                agent_b={
+                    "model": res_b[0],
+                    "path": str(wt_b),
+                    "duration": res_b[3],
+                    "success": res_b[1],
+                    "test_passed": test_pass_b,
+                    "review_passed": winner == "B",
+                    "manifest": manifest_b,
+                    "changes": changes_b,
+                    "diff": diff_b,
+                    "baseline_commit": base_b_commit.strip() if base_b_commit else "",
+                },
+                judge_report=judge_report or "",
+                winner=winner,
+            )
+        except (ValueError, OSError) as exc:
+            print(c(f"候选封存完整性检查失败，拒绝交付 (UNVERIFIED): {exc}", COLOR_RED))
+            return EXIT_UNVERIFIED
         saved_successfully = True
 
         print(c(f"\n💾 候选工作区已妥善封存 (Race ID: {race_id})", COLOR_GREEN + COLOR_BOLD))
@@ -2200,7 +2410,7 @@ def run_race(
         if not res_a[1] and not res_b[1]:
             print(c("❌ 两位选手均未能成功完成任务。", COLOR_RED + COLOR_BOLD))
             return EXIT_FAILED
-        if not ok and winner is None:
+        if verdict is None and winner is None:
             return EXIT_UNVERIFIED
         if winner is None:
             return EXIT_FAILED

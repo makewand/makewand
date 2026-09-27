@@ -117,6 +117,9 @@ def call_api_chat(
     Dispatches a task via API to OpenAI, Anthropic, Gemini, xAI, or Local (Ollama/vLLM).
     Returns (success: bool, response_content: str, error_msg: Optional[str]).
     """
+    from makewand.config import is_api_allowed, api_policy_error
+    if not is_api_allowed(provider):
+        return False, "", api_policy_error()
     if extra_params:
         extra_params = dict(extra_params)
         if "max_retries" in extra_params:

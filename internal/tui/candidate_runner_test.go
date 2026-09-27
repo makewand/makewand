@@ -158,8 +158,8 @@ func TestRunCandidateSelection_PrefersVerifiedCandidate(t *testing.T) {
 		"system",
 	)
 
-	if !selection.verified {
-		t.Fatal("selection.verified = false, want true")
+	if selection.verified {
+		t.Fatal("candidate-controlled checks must require approval")
 	}
 	if selection.provider != "bravo" {
 		t.Fatalf("selection.provider = %q, want %q", selection.provider, "bravo")
@@ -234,8 +234,8 @@ func TestRunCandidateSelection_IsolatesProvidersFromFallback(t *testing.T) {
 		"system",
 	)
 
-	if !selection.verified {
-		t.Fatal("selection.verified = false, want true")
+	if selection.verified {
+		t.Fatal("candidate-controlled checks must require approval")
 	}
 	if alpha.chatCalls != 1 || bravo.chatCalls != 1 || charlie.chatCalls != 1 {
 		t.Fatalf("chatCalls = (%d, %d, %d), want (1, 1, 1)", alpha.chatCalls, bravo.chatCalls, charlie.chatCalls)
@@ -293,8 +293,8 @@ func Mul(a, b int) int {
 		"system",
 	)
 
-	if !selection.verified {
-		t.Fatal("selection.verified = false, want true")
+	if selection.verified {
+		t.Fatal("candidate-controlled checks must require approval")
 	}
 	if !strings.Contains(selection.content, "--- FILE: calc.go ---") {
 		t.Fatalf("selection.content = %q, want synthesized file block", selection.content)
@@ -415,8 +415,8 @@ func Twice(a int) int {
 		"system",
 	)
 
-	if !selection.verified {
-		t.Fatal("selection.verified = false, want true")
+	if selection.verified {
+		t.Fatal("candidate-controlled checks must require approval")
 	}
 	if !strings.Contains(selection.content, "--- FILE: calc.go ---") {
 		t.Fatalf("selection.content = %q, want reported calc.go block", selection.content)
@@ -516,7 +516,7 @@ func TestShouldRecordCandidateQuality(t *testing.T) {
 	}
 }
 
-func TestRunCandidateSelection_CancelsSlowCandidatesAfterVerifiedWinner(t *testing.T) {
+func TestRunCandidateSelection_ExternalCancellationStopsSlowCandidates(t *testing.T) {
 	project := newCandidateProject(t)
 	slowCanceled := make(chan struct{}, 2)
 	slowProvider := func(name string) *fixedCandidateProvider {
@@ -548,8 +548,10 @@ func TestRunCandidateSelection_CancelsSlowCandidatesAfterVerifiedWinner(t *testi
 	router.SetMode(model.ModeBalanced)
 
 	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 	selection := runCandidateSelection(
-		context.Background(),
+		ctx,
 		router,
 		project,
 		model.PhaseCode,
@@ -558,8 +560,8 @@ func TestRunCandidateSelection_CancelsSlowCandidatesAfterVerifiedWinner(t *testi
 	)
 	elapsed := time.Since(start)
 
-	if !selection.verified {
-		t.Fatal("selection.verified = false, want true")
+	if selection.verified {
+		t.Fatal("candidate-controlled checks must require approval")
 	}
 	if elapsed >= 2*time.Second {
 		t.Fatalf("runCandidateSelection elapsed = %s, want early cancellation before 2s", elapsed)
@@ -577,7 +579,7 @@ func TestRunCandidateSelection_CancelsSlowCandidatesAfterVerifiedWinner(t *testi
 	}
 }
 
-func TestRunCandidateSelection_DrainsUsageAfterEarlyWinnerCancellation(t *testing.T) {
+func TestRunCandidateSelection_DrainsUsageAfterExternalCancellation(t *testing.T) {
 	project := newCandidateProject(t)
 	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
@@ -597,8 +599,10 @@ func TestRunCandidateSelection_DrainsUsageAfterEarlyWinnerCancellation(t *testin
 		UsageMode: "balanced",
 	})
 
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 	selection := runCandidateSelection(
-		context.Background(),
+		ctx,
 		router,
 		project,
 		model.PhaseCode,
@@ -606,8 +610,8 @@ func TestRunCandidateSelection_DrainsUsageAfterEarlyWinnerCancellation(t *testin
 		"system",
 	)
 
-	if !selection.verified || selection.provider != "bravo" {
-		t.Fatalf("selection = %+v, want verified bravo winner", selection)
+	if selection.verified || selection.provider != "bravo" {
+		t.Fatalf("selection = %+v, want bravo with manual approval", selection)
 	}
 	if selection.usage.InputTokens != 17 || selection.usage.OutputTokens != 25 || selection.usage.Cost != 0.5 {
 		t.Fatalf("selection usage = %+v, want winner plus canceled in-flight attempt", selection.usage)
@@ -671,8 +675,8 @@ func TestRunCandidateSelectionWithActivity_ShowsProviderProgress(t *testing.T) {
 
 	close(release)
 	selection := <-done
-	if !selection.verified {
-		t.Fatal("selection.verified = false, want true")
+	if selection.verified {
+		t.Fatal("candidate-controlled checks must require approval")
 	}
 	if !strings.Contains(activity.Snapshot().Detail, "alpha passed") {
 		t.Fatalf("activity detail = %q, want passed status", activity.Snapshot().Detail)

@@ -280,9 +280,10 @@ func TestBudgetReservationBoundsConcurrentTokenBudget(t *testing.T) {
 	successCount := 0
 	rejectedCount := 0
 	for _, code := range codes {
-		if code == http.StatusOK {
+		switch code {
+		case http.StatusOK:
 			successCount++
-		} else if code == http.StatusTooManyRequests {
+		case http.StatusTooManyRequests:
 			rejectedCount++
 		}
 	}

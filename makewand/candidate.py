@@ -7,8 +7,9 @@ import sys
 import json
 import shutil
 import time
-import fcntl
+from makewand import filelock as fcntl
 import uuid
+import stat
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
@@ -40,12 +41,21 @@ def file_sha256(path: Path) -> Optional[str]:
     except Exception:
         return None
 
-def build_manifest(dir_path: Path) -> Dict[str, str]:
-    """Builds a manifest dict mapping relative paths to SHA-256 hashes, excluding .git folder only."""
+def file_record(path: Path) -> Optional[Dict[str, Any]]:
+    digest = file_sha256(path)
+    if digest is None:
+        return None
+    return {"sha256": digest, "mode": stat.S_IMODE(path.stat().st_mode)}
+
+
+def build_manifest(dir_path: Path) -> Dict[str, Any]:
+    """Bind regular file content AND permissions; old hash-only manifests fail closed."""
     manifest = {}
     if not dir_path.exists():
         return manifest
-    for root, _, files in os.walk(str(dir_path)):
+    for root, directories, files in os.walk(str(dir_path)):
+        if Path(root) == dir_path:
+            directories[:] = [directory for directory in directories if directory != ".git"]
         for f in files:
             p = Path(root) / f
             if not os.path.islink(p):
@@ -53,10 +63,61 @@ def build_manifest(dir_path: Path) -> Dict[str, str]:
                 parts = Path(rel).parts
                 if parts and parts[0] == ".git":
                     continue
-                sha = file_sha256(p)
-                if sha is not None:
-                    manifest[rel] = sha
+                record = file_record(p)
+                if record is not None:
+                    manifest[rel] = record
     return manifest
+
+
+def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None):
+    """Write through directory handles and atomically replace, preserving mode.
+
+    The source is checked while copying, so a changed candidate cannot win the
+    gap between manifest validation and application. No shared inode is edited.
+    """
+    parts = Path(rel_path).parts
+    if not parts or Path(rel_path).is_absolute() or any(x in (".", "..") for x in parts):
+        raise ValueError("invalid workspace-relative path")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(workspace, directory_flags)
+    temp_name = ".makewand-" + uuid.uuid4().hex
+    created = False
+    try:
+        for component in parts[:-1]:
+            try:
+                os.mkdir(component, 0o755, dir_fd=directory)
+            except FileExistsError:
+                pass
+            child = os.open(component, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(source_fd, "rb") as src:
+            source_stat = os.fstat(src.fileno())
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise ValueError("source must be a regular file")
+            mode = stat.S_IMODE(source_stat.st_mode)
+            if expected is not None and mode & 0o7000:
+                raise ValueError("candidate cannot introduce special permission bits")
+            fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            created = True
+            with os.fdopen(fd, "wb") as dst:
+                digest = hashlib.sha256()
+                while chunk := src.read(65536):
+                    digest.update(chunk)
+                    dst.write(chunk)
+                if expected is not None and expected != {"sha256": digest.hexdigest(), "mode": mode}:
+                    raise ValueError("candidate changed during apply")
+                dst.flush()
+                os.fchmod(dst.fileno(), mode)
+                os.fsync(dst.fileno())
+        os.replace(temp_name, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
+        created = False
+        os.fsync(directory)
+    finally:
+        if created:
+            os.unlink(temp_name, dir_fd=directory)
+        os.close(directory)
 
 def _verify_safe_target_path(base_cwd: Union[str, Path], rel_path: str) -> Path:
     canonical_base = os.path.realpath(base_cwd)
@@ -70,6 +131,27 @@ def _verify_safe_target_path(base_cwd: Union[str, Path], rel_path: str) -> Path:
             if not (resolved == canonical_base or resolved.startswith(canonical_base + os.sep)):
                 raise ValueError(f"安全越界风险: 路径组件 {part} 逃逸出工作区 ({resolved})")
     return cur
+
+
+def _atomic_remove(workspace: str, rel_path: str):
+    """Remove a workspace entry without following mutable parent symlinks."""
+    parts = Path(rel_path).parts
+    if not parts or Path(rel_path).is_absolute() or any(x in (".", "..") for x in parts):
+        raise ValueError("invalid workspace-relative path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(workspace, flags)
+    try:
+        for component in parts[:-1]:
+            child = os.open(component, flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        try:
+            os.unlink(parts[-1], dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 def get_candidate_files_changed(candidate_dir: Path, baseline_commit: Optional[str] = None) -> Dict[str, str]:
     """
@@ -170,9 +252,26 @@ class CandidateManager:
         if "test_passed" not in agent_b:
             agent_b["test_passed"] = agent_b.get("success", True)
         if "path" in agent_a and os.path.exists(agent_a["path"]):
-            agent_a["manifest"] = build_manifest(Path(agent_a["path"]))
+            current = build_manifest(Path(agent_a["path"]))
+            if "manifest" in agent_a and agent_a["manifest"] != current:
+                raise ValueError("candidate A changed after review")
+            agent_a["manifest"] = current
         if "path" in agent_b and os.path.exists(agent_b["path"]):
-            agent_b["manifest"] = build_manifest(Path(agent_b["path"]))
+            current = build_manifest(Path(agent_b["path"]))
+            if "manifest" in agent_b and agent_b["manifest"] != current:
+                raise ValueError("candidate B changed after review")
+            agent_b["manifest"] = current
+
+        # Freeze the complete application plan, including deletions, outside the
+        # candidate's writable Git metadata. A caller that performed a review
+        # supplies the pre-review plan and any later change fails closed.
+        for label, agent in (("A", agent_a), ("B", agent_b)):
+            if agent.get("path") and os.path.exists(agent["path"]):
+                changes = get_candidate_files_changed(
+                    Path(agent["path"]), agent.get("baseline_commit") or baseline_commit)
+                if "changes" in agent and agent["changes"] != changes:
+                    raise ValueError(f"candidate {label} application plan changed after review")
+                agent["changes"] = changes
 
         meta = {
             "race_id": race_id,
@@ -317,7 +416,7 @@ class CandidateManager:
         if baseline_manifest:
             for changed_file in candidate_changes:
                 target = Path(base_cwd) / changed_file
-                cur_hash = file_sha256(target) if target.exists() else None
+                cur_hash = file_record(target) if target.exists() else None
                 base_hash = baseline_manifest.get(changed_file)
                 if cur_hash != base_hash and changed_file not in conflicts:
                     conflicts.append(changed_file)
@@ -342,9 +441,11 @@ class CandidateManager:
     ) -> Tuple[bool, List[str], str]:
         """
         Safely applies candidate changes to base_cwd with conflict detection and rollback journal.
-        Guarded with fcntl.flock to eliminate concurrent TOCTOU race conditions.
+        Guarded with a file lock to serialize Makewand apply operations.
         Returns (success, applied_files, message).
         """
+        if os.name != "posix":
+            return False, [], "安全候选应用需要 POSIX 目录句柄；Windows 请在 WSL2 中运行 makewand apply。"
         ensure_config_dir()
         lock_file = config.CONFIG_DIR / "apply.lock"
         lock_fd = None
@@ -406,6 +507,9 @@ class CandidateManager:
         if cand_info.get("test_passed") is not True and not force:
             return False, [], f"候选选手 {label} 本地单元测试未通过或未完成测试验证 (test_passed != True)，已阻止应用存在缺陷的方案 (如需强制应用请使用 --force)"
 
+        if cand_info.get("review_passed") is False and not force:
+            return False, [], f"候选选手 {label} 未获裁判批准，已阻止应用 (人工确认后可使用 --force)"
+
         candidate_dir = Path(cand_path_str)
 
         # Integrity check: verify candidate files haven't been mutated after save
@@ -417,7 +521,11 @@ class CandidateManager:
             return False, [], f"候选选手 {label} 的文件自封存后已被外部修改 (哈希校验不匹配)，拒绝应用未审查内容"
 
         cand_baseline = cand_info.get("baseline_commit") or race.get("baseline_commit")
-        changes = get_candidate_files_changed(candidate_dir, baseline_commit=cand_baseline)
+        changes = cand_info.get("changes")
+        if not isinstance(changes, dict):
+            return False, [], "候选缺少封存的变更计划，请重新运行竞速后再应用"
+        if changes != get_candidate_files_changed(candidate_dir, baseline_commit=cand_baseline):
+            return False, [], "候选的 Git 变更计划自复审后发生变化，拒绝应用未审查内容"
         if not changes:
             return True, [], f"候选选手 {label} 没有产生任何有效的文件变更"
 
@@ -426,10 +534,16 @@ class CandidateManager:
         for rel_path in changes:
             target_file = Path(base_cwd) / rel_path
             src_file = candidate_dir / rel_path
-
             # Candidate file must not be a symlink
             if os.path.islink(src_file) or src_file.is_symlink():
                 return False, [], f"安全风险: 候选文件 {rel_path} 为符号链接，已拒绝应用"
+
+            if changes[rel_path] not in ("A", "M", "D"):
+                return False, [], f"候选变更类型无效: {rel_path}"
+            if changes[rel_path] == "D" and (rel_path in expected_manifest or src_file.exists()):
+                return False, [], f"删除计划与已审核文件清单不一致: {rel_path}"
+            if changes[rel_path] != "D" and rel_path not in expected_manifest:
+                return False, [], f"候选文件 {rel_path} 未包含在已审核清单中"
 
             # Target file in workspace must not be a symlink
             if os.path.islink(target_file) or target_file.is_symlink():
@@ -499,37 +613,12 @@ class CandidateManager:
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                     _verify_safe_target_path(base_cwd, rel_path)
 
-                    tmp_name = f".{target_file.name}.tmp_apply_{uuid.uuid4().hex[:6]}"
-                    tmp_target = target_file.with_name(tmp_name)
-                    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                    if hasattr(os, "O_NOFOLLOW"):
-                        open_flags |= os.O_NOFOLLOW
-                    fd = os.open(str(tmp_target), open_flags, 0o600)
-                    try:
-                        with open(src_file, "rb") as sf:
-                            while True:
-                                chunk = sf.read(65536)
-                                if not chunk:
-                                    break
-                                os.write(fd, chunk)
-                    finally:
-                        os.close(fd)
-
-                    # Re-verify before replacing
-                    _verify_safe_target_path(base_cwd, rel_path)
-                    if target_file.exists() and (os.path.islink(target_file) or target_file.is_symlink()):
-                        try:
-                            os.unlink(tmp_target)
-                        except Exception:
-                            pass
-                        raise ValueError(f"安全越界风险: 目标文件 {rel_path} 为符号链接")
-
-                    os.replace(tmp_target, target_file)
+                    _atomic_copy(base_cwd, rel_path, src_file, expected_manifest.get(rel_path))
                     applied_files.append(f"A/M {rel_path}")
                 elif status == "D":
                     if target_file.exists():
                         _verify_safe_target_path(base_cwd, rel_path)
-                        target_file.unlink()
+                        _atomic_remove(base_cwd, rel_path)
                         applied_files.append(f"D   {rel_path}")
 
             with open(backup_dir / "journal.json", "w", encoding="utf-8") as jf:
@@ -539,34 +628,22 @@ class CandidateManager:
 
         except Exception as e:
             # Rollback
+            rollback_errors = []
             for item in reversed(journal):
                 rel_p = item["path"]
                 try:
                     t_file = _verify_safe_target_path(base_cwd, rel_p)
                     if item["action"] == "restore":
-                        tmp_name = f".{t_file.name}.tmp_rb_{uuid.uuid4().hex[:6]}"
-                        tmp_rb = t_file.with_name(tmp_name)
-                        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                        if hasattr(os, "O_NOFOLLOW"):
-                            open_flags |= os.O_NOFOLLOW
-                        fd = os.open(str(tmp_rb), open_flags, 0o600)
-                        try:
-                            with open(item["bak"], "rb") as bf:
-                                while True:
-                                    chunk = bf.read(65536)
-                                    if not chunk:
-                                        break
-                                    os.write(fd, chunk)
-                        finally:
-                            os.close(fd)
-                        _verify_safe_target_path(base_cwd, rel_p)
-                        os.replace(tmp_rb, t_file)
+                        _atomic_copy(base_cwd, rel_p, Path(item["bak"]))
                     elif item["action"] == "delete" and t_file.exists():
                         _verify_safe_target_path(base_cwd, rel_p)
-                        t_file.unlink()
-                except Exception:
-                    pass
+                        _atomic_remove(base_cwd, rel_p)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"{rel_p}: {rollback_error}")
 
+            if rollback_errors:
+                return False, [], (f"应用失败: {e}；部分文件回滚失败: {'; '.join(rollback_errors)}。"
+                                   f"备份保留于 {backup_dir}")
             return False, [], f"应用过程中发生异常并已自动回滚: {str(e)}"
 
     @staticmethod

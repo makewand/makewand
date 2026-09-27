@@ -29,6 +29,8 @@ type candidateSelection struct {
 	provider      string
 	usage         model.Usage
 	verified      bool
+	files         []engine.ExtractedFile
+	digest        string
 	selectionNote string
 	// err carries a fail-closed sentinel from the engine when every candidate
 	// failed for that reason (currently model.ErrNoUntrustedSafeProvider, set when
@@ -185,6 +187,8 @@ func runCandidateSelectionWithActivity(
 		provider: provider,
 		usage:    selection.Usage,
 		verified: selection.Verified,
+		files:    selection.VerifiedFiles,
+		digest:   selection.VerifiedDigest,
 		err:      selection.Err,
 	}
 	var notes []string

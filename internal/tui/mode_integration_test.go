@@ -198,7 +198,7 @@ func TestMode_BalancedBuild_ReviewFixDeclined(t *testing.T) {
 	}
 }
 
-func TestMode_PowerBuild_SingleProviderSkipsReview(t *testing.T) {
+func TestMode_PowerBuild_NoProvidersStillRequiresReview(t *testing.T) {
 	app := newBuildAppWithMode(t, model.ModePower)
 	// Simulate only 1 available provider by not registering any CLI/API providers.
 	// NewRouter with default config has no providers → Available() returns empty.
@@ -215,12 +215,11 @@ func TestMode_PowerBuild_SingleProviderSkipsReview(t *testing.T) {
 	m, _ := app.handleFileWriteComplete(fileWriteCompleteMsg{written: 3})
 	app = m.(App)
 
-	// With <= 1 available provider, review should be skipped.
-	if app.progress.steps[stepReview].Status != StepDone {
-		t.Errorf("review step status = %v, want StepDone (skipped)", app.progress.steps[stepReview].Status)
+	if app.progress.steps[stepReview].Status != StepRunning {
+		t.Fatalf("review must be attempted, got %v", app.progress.steps[stepReview].Status)
 	}
-	if !strings.Contains(app.progress.steps[stepReview].Detail, "single provider") {
-		t.Errorf("review detail = %q, want 'single provider' note", app.progress.steps[stepReview].Detail)
+	if app.pipeline.Phase() != engine.PhaseReview {
+		t.Fatalf("phase=%v, want review", app.pipeline.Phase())
 	}
 }
 

@@ -2,7 +2,7 @@
 
 > **多模型编程订阅联合调度与红队自愈体系** (Unified Multi-Model Subscription Orchestrator)  
 > 官方网站：[https://makewand.org](https://makewand.org) · 备用镜像：[https://makewand.com](https://makewand.com)  
-> 统合调用本机 **Antigravity (Google AI Pro)**、**Claude Code**、**Codex CLI (OpenAI)**、**Grok Build**、**Muse Code** 与全生态主流编程模型（15+ 工具动态拓扑感知），实现零额外 Token 成本、跨模型红队盲审、自愈回环与并发竞速。
+> 统合调用本机 **Antigravity (Google AI Pro)**、**Claude Code**、**Codex CLI (OpenAI)**、**Grok Build**、**Muse Code** 与其他已配置工具，提供订阅优先调度、显式付费 API 策略、跨模型审查、自愈回环与候选比较。
 
 ```bash
 # 🚀 官方一键快速安装
@@ -15,7 +15,7 @@ curl -fsSL https://makewand.org/install.sh | bash
 
 - **🌐 官方网站与文档中心**：托管于 Cloudflare Pages 全球边缘网络（[makewand.org](https://makewand.org) / [makewand.com](https://makewand.com)），提供交互式终端模拟器与完整手册。
 - **🔌 全生态工具自适应拓扑**：动态感知用户已登录的工具池（用户配置几个就使用几个，N>=2 启动异构交叉互审，N=1 启动 Shadow Worktree 独立批判自省）。
-- **💰 零额外 Token 计费**：完全基于本机已订阅的官方 CLI 工具（`agy`、`claude`、`codex`、`muse`、`grok`），不产生第三方 API 扣费。
+- **💰 明确的 API 费用策略**：默认 `subscription_only`，禁止 Makewand 直接调用云 API，即使环境中已有 API key 也不会自动转为付费回退。设置 `MAKEWAND_API_POLICY=allow_paid` 或配置 `"api_policy": "allow_paid"` 才允许按量计费的 API 与回退；`makewand status` 展示当前策略。官方 CLI 自身的计费模式、订阅配额和本机资源消耗仍由相应工具及配置决定。
 - **⚡ 额度感知与自适应降级 (Quota-Aware Routing)**：
   - 自动检测各订阅的 5小时/每周额度与限流状态，精准识别解封重置时间。
   - 当主力模型（如 Claude）达到使用上限时，秒级自动降级至备用健康模型（Codex / Muse / Antigravity），确保任务不中断。
@@ -70,7 +70,9 @@ flowchart TD
 cd path/to/makewand
 ./scripts/install.sh
 ```
-此命令会将可执行文件安装至 `~/.local/bin/makewand`，并建立向后兼容的 `trio` 软链接。
+源码安装需要 Git、Python 3.9+ 和 `go.mod` 指定的 Go 工具链。安装器先编译 Go 组件，再原子更新 `~/.local/bin/makewand`，并建立向后兼容的 `trio` 软链接。
+
+预编译 Release、Homebrew 和 Scoop 安装包含 Go CLI 与同版本 Python 引擎；运行时需要 Python 3.9+。手动解包时须将整个目录一起安装，保留二进制旁的 `lib/`。Homebrew/Scoop 会声明 Python 依赖。供应商 CLI 与项目测试工具需要单独安装；Makewand Python 引擎本身仅使用标准库。
 
 ---
 

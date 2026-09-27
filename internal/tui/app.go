@@ -89,8 +89,9 @@ type App struct {
 	pendingDepsPlan      *engine.ExecPlan       // detected dependency install command
 	pendingTestsPlan     *engine.ExecPlan       // detected test execution command
 	pendingApproval      *approvalRequest       // current approval request, if any
-	pendingWriteVerified bool                   // true when the pending file batch passed local verification
-	hostCLINoticeShown   bool                   // true once the host-CLI generation notice has been shown this session
+	pendingWriteDigest   string
+	pendingWriteVerified bool // true when the pending file batch passed local verification
+	hostCLINoticeShown   bool // true once the host-CLI generation notice has been shown this session
 
 	// State
 	width  int
@@ -129,6 +130,8 @@ type aiResponseMsg struct {
 	inputTokens   int
 	outputTokens  int
 	verified      bool
+	files         []engine.ExtractedFile
+	digest        string
 	selectionNote string
 	err           error
 }
@@ -213,6 +216,8 @@ type autoFixResponseMsg struct {
 	outputTokens  int
 	attempt       int
 	verified      bool
+	files         []engine.ExtractedFile
+	digest        string
 	selectionNote string
 	err           error
 }
@@ -625,6 +630,7 @@ func (a App) buildComplete() (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
 	a.wizard.SetPhase(WizardPhaseDone)
 	a.pendingWriteVerified = false
+	a.pendingWriteDigest = ""
 	a.chat.AddMessage(ChatMessage{
 		Role:    "status",
 		Content: m.ProgressBuildComplete,

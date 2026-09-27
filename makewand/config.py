@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 # Cache directories
-CONFIG_DIR = Path.home() / ".config" / "makewand"
+CONFIG_DIR = Path(os.environ.get("MAKEWAND_CONFIG_DIR", Path.home() / ".config" / "makewand")).expanduser().resolve()
 STATUS_CACHE_FILE = CONFIG_DIR / "status.json"
 CANDIDATES_DIR = CONFIG_DIR / "candidates"
 BACKUPS_DIR = CONFIG_DIR / "backups"
 
 # Compatibility cache path with Gemini / Antigravity config
-LEGACY_TRIO_CACHE = Path.home() / ".gemini" / "config" / "trio_status.json"
+LEGACY_TRIO_CACHE = (CONFIG_DIR / "legacy_status.json" if os.environ.get("MAKEWAND_CONFIG_DIR")
+                     else Path.home() / ".gemini" / "config" / "trio_status.json")
 
 # Terminal Color Codes
 COLOR_GREEN = "\033[92m"
@@ -196,6 +197,19 @@ def has_api_configured(provider: str) -> bool:
     cfg = get_api_config(p)
     return bool(cfg.get("api_key"))
 
+def get_api_policy() -> str:
+    """Cloud API billing requires an explicit opt-in, even when keys exist."""
+    value = os.environ.get("MAKEWAND_API_POLICY", load_user_config().get("api_policy", "subscription_only"))
+    return "allow_paid" if isinstance(value, str) and value.strip().lower() == "allow_paid" else "subscription_only"
+
+def is_api_allowed(provider: str) -> bool:
+    return normalize_provider_name(provider) == "local" or get_api_policy() == "allow_paid"
+
+def api_policy_error() -> str:
+    return ("当前 API 策略为 subscription_only，已阻止可能产生费用的云 API 调用；"
+            "如需允许按量计费，请设置 MAKEWAND_API_POLICY=allow_paid "
+            "或配置 api_policy=allow_paid。")
+
 def save_user_config(cfg: dict) -> bool:
     """Saves dictionary to ~/.config/makewand/config.json."""
     ensure_config_dir()
@@ -210,19 +224,27 @@ def save_user_config(cfg: dict) -> bool:
 def get_enabled_providers() -> dict:
     """
     Returns dict of provider -> bool.
-    Default: all providers enabled (True).
+    Default: cloud/CLI providers enabled; local models require opt-in.
     Can be overridden in config.json under 'enabled_providers'
     or via environment variables (e.g. MAKEWAND_DISABLE_<PROVIDER>=1 or MAKEWAND_ENABLE_PROVIDERS=...).
     """
     import os
     cfg = load_user_config()
-    enabled = {p: True for p in ALL_SUPPORTED_PROVIDERS}
+    enabled = {p: p != "local" for p in ALL_SUPPORTED_PROVIDERS}
+    # Read the previous website installer schema during upgrades. Canonical
+    # enabled_providers and explicit environment settings still take precedence.
+    legacy_active = cfg.get("active_providers")
+    if isinstance(legacy_active, list):
+        active = {normalize_provider_name(p) for p in legacy_active if isinstance(p, str)}
+        enabled = {p: p in active for p in enabled}
+    if isinstance(cfg.get("local_model_enabled"), bool):
+        enabled["local"] = cfg["local_model_enabled"]
     user_settings = cfg.get("enabled_providers", {})
     if isinstance(user_settings, dict):
         for k, v in user_settings.items():
             k_clean = normalize_provider_name(k)
-            if k_clean in enabled:
-                enabled[k_clean] = bool(v)
+            if k_clean in enabled and isinstance(v, bool):
+                enabled[k_clean] = v
 
     # Check env overrides
     # 1. MAKEWAND_DISABLE_<PROVIDER>=1
@@ -368,7 +390,7 @@ def get_provider_execution_mode(provider: str) -> str:
         avail, _, _ = is_local_model_available(timeout=0.5)
         return "local" if avail else "none"
     sub_ok = has_subscription_configured(p)
-    api_ok = has_api_configured(p)
+    api_ok = is_api_allowed(p) and has_api_configured(p)
     if sub_ok and api_ok:
         return "hybrid"
     elif sub_ok:
@@ -389,4 +411,3 @@ def get_active_providers() -> list:
         if mode in ("subscription", "api", "hybrid", "local"):
             active.append(p)
     return active
-

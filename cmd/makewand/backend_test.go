@@ -22,6 +22,7 @@ func TestServeRouter_IgnoresRemoteBackendEnv(t *testing.T) {
 	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
 
 	cfg := config.DefaultConfig()
+	cfg.APIPolicy = config.APIPolicyAllowPaid
 	cfg.OpenAIAPIKey = "openai-test-key"
 
 	rtr, err := serveRouter(cfg, model.RepoTrustTrusted)

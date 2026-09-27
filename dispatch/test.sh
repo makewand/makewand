@@ -43,6 +43,36 @@ cat > "$W/stubs/grok" <<'EOF'
 case "$1" in --single=*) P="${1#--single=}";; *) echo "error: unexpected argument '$1'" >&2; exit 2;; esac
 printf '{"type":"result","subtype":"success","result":"GROK:%s"}\n' "${P:0:12}"
 EOF
+# Unit mode does not require a logged-in systemd user session. These stubs
+# validate scope arguments and result classification; real cgroup/OOM coverage
+# is available explicitly with AI_DISPATCH_TEST_LIVE_SYSTEMD=1.
+if [[ "${AI_DISPATCH_TEST_LIVE_SYSTEMD:-0}" != 1 ]]; then
+  cat > "$W/stubs/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+memory=0; swap=0
+while (($#)); do
+  case "$1" in
+    MemoryMax=*) memory=1 ;;
+    MemorySwapMax=0) swap=1 ;;
+    --) shift; break ;;
+  esac
+  shift
+done
+[[ "$1" == true ]] && exit 0
+[[ "$memory" == 1 && "$swap" == 1 ]] || exit 7
+[[ "${STUB_MODE:-}" == oom ]] && exit 137
+exec "$@"
+STUB
+  cat > "$W/stubs/systemctl" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == *"show "* ]]; then
+  if [[ "${STUB_MODE:-}" == oom ]]; then echo oom-kill; else echo success; fi
+fi
+exit 0
+STUB
+  echo 'Dispatch unit tests: stub systemd scope; set AI_DISPATCH_TEST_LIVE_SYSTEMD=1 for live cgroup tests.'
+fi
 chmod +x "$W/stubs/"*
 export PATH="$W/stubs:$PATH"
 
@@ -117,3 +147,4 @@ grep -q '"status":"cancelled"' "$W/sig.out" && ok "被杀时输出 cancelled 的
 [[ $(git -C "$R" worktree list | wc -l) == 1 ]] && ok "被杀后 worktree 已清理" || bad "被杀后 worktree 残留"
 
 echo; echo "通过 $PASS,失败 $FAIL"
+((FAIL == 0))

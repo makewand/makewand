@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          for f in scripts/*.sh; do
+          for f in scripts/*.sh site/install.sh dispatch/*.sh dispatch/ai-dispatch; do
             bash -n "${f}"
           done
 
@@ -84,7 +84,16 @@ jobs:
           python-version: '3.12'
 
       - name: Run Python unit tests
-        run: python3 -m unittest discover tests -v
+        run: python3 -I scripts/test_python.py
+
+      - name: Dispatch regression tests
+        run: bash dispatch/test.sh
+
+      - name: Offline benchmark harness
+        run: python3 -I benchmarks/test_runner.py
+
+      - name: Installer and unpacked release contract
+        run: python3 -I scripts/test_installation.py
 
       - name: Run race tests
         # scripts/test_race.sh is the single source of truth for race
@@ -93,7 +102,7 @@ jobs:
         run: bash ./scripts/test_race.sh
 
       - name: Run vet
-        run: go vet ./cmd/... ./internal/... ./router
+        run: go vet ./...
 
       - name: Run govulncheck
         # Fail CI on any known vulnerability reachable from our code. The Go

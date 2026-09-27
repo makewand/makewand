@@ -8,8 +8,7 @@ from pathlib import Path
 
 # Add project root to sys.path so makewand package can be imported directly
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_ROOT))
+sys.path.insert(0, str(PACKAGE_ROOT))
 
 from makewand.cli import main
 

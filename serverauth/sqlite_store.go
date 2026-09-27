@@ -99,9 +99,10 @@ CREATE TABLE IF NOT EXISTS token_usage_counters (
 		return err
 	}
 	return serverdb.EnsureColumns(s.db, "auth_tokens", map[string]string{
-		"user_id":         "user_id TEXT NOT NULL DEFAULT ''",
-		"organization_id": "organization_id TEXT NOT NULL DEFAULT ''",
-		"project_id":      "project_id TEXT NOT NULL DEFAULT ''",
+		"user_id":               "user_id TEXT NOT NULL DEFAULT ''",
+		"authorization_version": "authorization_version TEXT NOT NULL DEFAULT ''",
+		"organization_id":       "organization_id TEXT NOT NULL DEFAULT ''",
+		"project_id":            "project_id TEXT NOT NULL DEFAULT ''",
 	})
 }
 
@@ -291,13 +292,8 @@ func (s *SQLiteStore) authenticateToken(token string) (*Grant, bool) {
 	}
 	if s.db != nil {
 		var isRevoked int
-		if err := s.db.QueryRow(`SELECT revoked FROM auth_tokens WHERE token_hash = ?`, hash).Scan(&isRevoked); err == nil {
-			if isRevoked == 1 {
-				s.mu.Lock()
-				grant.revoked = true
-				s.mu.Unlock()
-				return nil, false
-			}
+		if err := s.db.QueryRow(`SELECT revoked FROM auth_tokens WHERE token_hash = ?`, hash).Scan(&isRevoked); err != nil || isRevoked != 0 {
+			return nil, false
 		}
 	}
 	if grant.UserID() != "" && s.db != nil {
@@ -374,8 +370,8 @@ INSERT INTO auth_tokens (
   id, token_hash, description, user_id, organization_id, project_id, scopes_json, workspace_prefixes_json,
   allowed_providers_json, allowed_modes_json, expires_at, revoked,
   max_requests_per_hour, max_requests_per_day, max_cost_usd_per_day,
-  max_cost_usd_per_month, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  max_cost_usd_per_month, created_at, authorization_version
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rule.ID,
 		hashToken(tokenValue),
 		strings.TrimSpace(rule.Description),
@@ -393,6 +389,7 @@ INSERT INTO auth_tokens (
 		rule.MaxCostUSDPerDay,
 		rule.MaxCostUSDPerMonth,
 		time.Now().UTC().Format(time.RFC3339),
+		rule.AuthorizationVersion,
 	); err != nil {
 		return TokenRuleView{}, "", err
 	}
@@ -453,7 +450,7 @@ SELECT id, token_hash, description, user_id, organization_id, project_id,
        scopes_json, workspace_prefixes_json,
        allowed_providers_json, allowed_modes_json, expires_at, revoked,
        max_requests_per_hour, max_requests_per_day, max_cost_usd_per_day,
-       max_cost_usd_per_month
+       max_cost_usd_per_month, authorization_version
 FROM auth_tokens`)
 	if err != nil {
 		return err
@@ -493,6 +490,7 @@ FROM auth_tokens`)
 			&rule.MaxRequestsPerDay,
 			&rule.MaxCostUSDPerDay,
 			&rule.MaxCostUSDPerMonth,
+			&rule.AuthorizationVersion,
 		); err != nil {
 			return err
 		}

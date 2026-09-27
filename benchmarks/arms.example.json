@@ -1,0 +1,5 @@
+{
+  "makewand-fast": ["makewand", "run", "{prompt}", "--cwd", "{workspace}", "--tier", "fast", "--timeout", "{timeout}"],
+  "makewand-standard": ["makewand", "run", "{prompt}", "--cwd", "{workspace}", "--tier", "standard", "--timeout", "{timeout}"],
+  "makewand-deep": ["makewand", "run", "{prompt}", "--cwd", "{workspace}", "--tier", "deep", "--timeout", "{timeout}"]
+}

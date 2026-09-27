@@ -1,81 +1,36 @@
 #!/usr/bin/env bash
+# Validate the executable exactly as an unpacked release, outside the checkout.
 set -euo pipefail
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
-
-BINARY="${1:-./build/makewand}"
+BINARY="${1:-$ROOT_DIR/build/makewand}"
 VERSION_TAG="${2:-}"
-
-echo "=== Release Contract Verification ==="
-echo ""
-
-if [[ ! -f "$BINARY" ]]; then
-  echo "❌ Binary not found: $BINARY"
-  exit 1
-fi
-
-echo "✓ Binary exists: $BINARY"
-
-# 1. Verify --version output
-echo ""
-echo "--- Version Output ---"
-VERSION_OUTPUT=$("$BINARY" --version)
-echo "$VERSION_OUTPUT"
-
-# Extract version from output (first word should be "makewand", then "version", then version string)
-if ! echo "$VERSION_OUTPUT" | grep -q "makewand version"; then
-  echo "❌ --version output format incorrect"
-  exit 1
-fi
-echo "✓ --version output format correct"
-
-# 2. Verify key public commands exist in help
-echo ""
-echo "--- Help Output Verification ---"
-HELP_OUTPUT=$("$BINARY" --help)
-
-required_commands=(
-  "makewand \[prompt\]"
-  "new"
-  "chat"
-  "serve"
-)
-
-for cmd in "${required_commands[@]}"; do
-  if ! echo "$HELP_OUTPUT" | grep -q "$cmd"; then
-    echo "❌ Required command not documented: $cmd"
-    exit 1
-  fi
+BINARY="$(python3 -I -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_posix())' "$BINARY")"
+[[ -f "$BINARY" ]] || { echo "Binary not found: $BINARY" >&2; exit 1; }
+for required in bin/makewand makewand/__init__.py makewand/cli.py makewand/VERSION; do
+    [[ -f "$(dirname "$BINARY")/lib/makewand/python/$required" ]] || {
+        echo "Incomplete release: bundled Python engine file $required is required." >&2; exit 1;
+    }
 done
-echo "✓ All required commands documented in --help"
-
-# 3. Verify subcommand help works
-echo ""
-echo "--- Subcommand Help Verification ---"
-subcommands=("new" "chat" "serve")
-for subcmd in "${subcommands[@]}"; do
-  if ! "$BINARY" "$subcmd" --help >/dev/null 2>&1; then
-    echo "⚠ Subcommand help may have issues: $subcmd"
-  fi
-done
-echo "✓ Subcommands respond to --help"
-
-# 4. Version tag verification (if provided) — a mismatch is a HARD failure so a
-# release cannot ship a binary stamped "dev" (ldflags drift) under a real tag.
-if [[ -n "$VERSION_TAG" ]]; then
-  echo ""
-  echo "--- Version Tag Verification ---"
-  # Extract the version token (3rd field of "makewand version <ver> (<commit>)")
-  # and require an EXACT match. A substring check would let a suffixed build
-  # (e.g. "v0.2.0-dirty" or "v0.2.0-extra") pass under a "v0.2.0" tag.
-  BIN_VERSION="$(printf '%s\n' "$VERSION_OUTPUT" | awk '{print $3}')"
-  if [[ "$BIN_VERSION" != "$VERSION_TAG" ]]; then
-    echo "❌ Binary version ($BIN_VERSION) doesn't exactly match tag ($VERSION_TAG); full: $VERSION_OUTPUT"
-    exit 1
-  fi
-  echo "✓ Binary version matches tag exactly: $VERSION_TAG"
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+mkdir -p "$WORK_DIR/makewand" "$WORK_DIR/config"
+printf 'raise RuntimeError("untrusted cwd imported")\n' > "$WORK_DIR/makewand/__init__.py"
+cd "$WORK_DIR"
+unset MAKEWAND_HOME PYTHONPATH PYTHONHOME
+export MAKEWAND_CONFIG_DIR="$WORK_DIR/config"
+export MAKEWAND_USAGE_FILE="$WORK_DIR/usage.json"
+VERSION_OUTPUT="$("$BINARY" --version)"
+[[ "$VERSION_OUTPUT" == 'makewand version '* ]] || { echo "Invalid version: $VERSION_OUTPUT" >&2; exit 1; }
+BIN_VERSION="$(printf '%s\n' "$VERSION_OUTPUT" | awk '{print $3}')"
+if [[ -n "$VERSION_TAG" && "$BIN_VERSION" != "$VERSION_TAG" ]]; then
+    echo "Version mismatch: $BIN_VERSION != $VERSION_TAG" >&2; exit 1
 fi
-
-echo ""
-echo "=== Release Contract Passed ✓ ==="
+PY_VERSION="$(python3 -I "$(dirname "$BINARY")/lib/makewand/python/bin/makewand" --version)"
+[[ "$PY_VERSION" == "makewand $BIN_VERSION" ]] || { echo "Engine version mismatch: $PY_VERSION / $VERSION_OUTPUT" >&2; exit 1; }
+"$BINARY" --help >/dev/null
+for command in new chat serve run review race status probe quota models observe candidates inspect apply discard; do
+    "$BINARY" "$command" --help >/dev/null
+done
+"$BINARY" review --repo-trust untrusted --help >/dev/null
+python3 -I "$ROOT_DIR/scripts/check_cli_examples.py" "$BINARY"
+echo "Release contract passed: complete engines, matching version, public commands and cwd isolation."

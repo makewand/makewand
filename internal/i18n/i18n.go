@@ -326,7 +326,7 @@ var en = Messages{
 	AutomationCandidateFallback:   "No candidate passed local verification. Falling back to manual approval.",
 
 	AutomationCandidateIsolationUnavailable: "Candidate code was not executed: %s. Falling back to manual approval.",
-	AutomationCandidateWeakVerification:     "Best candidate passed only weak checks (no baseline tests ran). Falling back to manual approval.",
+	AutomationCandidateWeakVerification:     "Local checks passed. Test output comes from candidate-controlled code, so applying the candidate requires approval.",
 	AutomationCandidateDeletions:            "Candidate deleted files in its workspace (not applied automatically): %s",
 	HostCLIExecNotice:                       "Note: the %s CLI ran on this host (in %s) with your environment and credentials — generation is not sandboxed. Treat untrusted repos accordingly (see SECURITY.md).",
 
@@ -558,7 +558,7 @@ var zh = Messages{
 	AutomationCandidateFallback:   "没有候选通过本地验证，已回退为手动确认。",
 
 	AutomationCandidateIsolationUnavailable: "候选代码未被执行：%s。已回退为手动确认。",
-	AutomationCandidateWeakVerification:     "最佳候选只通过了弱校验（没有运行基线测试），已回退为手动确认。",
+	AutomationCandidateWeakVerification:     "本地检查已通过。测试输出来自候选代码，应用修改仍需要手动确认。",
 	AutomationCandidateDeletions:            "候选在其工作区中删除了文件（不会自动应用）：%s",
 	HostCLIExecNotice:                       "提示：%s CLI 在本机（%s）以你的环境和凭据运行——生成阶段没有沙箱。处理不可信仓库请注意（详见 SECURITY.md）。",
 

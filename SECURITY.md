@@ -32,6 +32,24 @@ Concretely, this means:
 - **Untrusted third-party code** (a cloned repo you do not control): pass `--repo-trust=untrusted`. In that mode makewand routes generation only to direct API providers or a remote makewand server (never a local repo-aware CLI) and fails closed if none is configured, and it stops treating repo-provided `.makewand/rules.md` as trusted instructions. This is capability routing, not a full sandbox: repository content (file tree, key-file summaries, review text) is still sent to the API provider as untrusted input, and it does not harden a remote makewand server the request is forwarded to. For genuinely hostile code, still run makewand inside a VM, container, or a separate low-privilege user. makewand does **not** claim to safely execute arbitrary hostile third-party code.
   **不可信的第三方代码**（你无法掌控的克隆仓库）：请加 `--repo-trust=untrusted`。该模式下生成只路由到直接 API provider（绝不用会读取仓库的本地 CLI），未配置则 fail-closed；且不再把仓库的 `.makewand/rules.md` 当作可信指令。这是能力路由，不是完整沙箱：仓库内容（文件树、关键文件摘要、review 文本）仍会作为不可信输入发给 API provider，也不加固请求转发到的远端 makewand server。处理真正敌对的代码，仍请在 VM、容器或独立低权限用户下运行。makewand **不**声称能安全执行任意敌对的第三方代码。
 
+### Acceptance and billing boundaries / 验收与费用边界
+
+Local test output is diagnostic evidence, not an independent acceptance certificate.
+Go local checks do not grant Strength 2 or authorize automatic application; a person
+must approve the sealed candidate. See [the verification contract](docs/VERIFICATION_CONTRACT.md)
+and [server credential invalidation](docs/SERVER_AUTHORIZATION.md) for the exact guarantees.
+本地测试结果不能证明候选进程没有伪造输出；Go 的本地验证通过后仍需人工批准封存产物。
+
+Direct cloud APIs and API fallback are disabled by default, including in untrusted
+repository mode. Explicitly set `MAKEWAND_API_POLICY=allow_paid` or `api_policy` to
+`allow_paid` to enable them. A remote server and third-party CLIs retain their own
+billing policies. 环境中存在 API key 本身不再授权 Makewand 发起云 API 调用。
+
+Python candidate application requires POSIX directory handles for safe atomic
+replacement. Use WSL2 on Windows; native Windows package smoke tests cover loading
+and command help, not the complete execution and application workflow.
+Python 候选应用在 Windows 原生环境会明确拒绝；完整执行流程请使用 WSL2。
+
 ## Supported Versions
 
 | Version | Supported |

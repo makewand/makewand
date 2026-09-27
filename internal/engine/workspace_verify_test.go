@@ -79,6 +79,7 @@ func newTestlessVerificationProject(t *testing.T) *Project {
 	if err != nil {
 		t.Fatalf("NewProject: %v", err)
 	}
+	project.SetUnsafeHostExecAuthorization(UnsafeHostExecAuthorization{Acknowledged: true, Source: "test"})
 	files := []ExtractedFile{
 		{
 			Path: "go.mod",
@@ -127,8 +128,8 @@ func Add(a, b int) int {
 	if !report.HasTests {
 		t.Fatal("report.HasTests = false, want true")
 	}
-	if report.Strength != 2 {
-		t.Fatalf("report.Strength = %d, want 2", report.Strength)
+	if report.Strength != 1 {
+		t.Fatalf("report.Strength = %d, want 1 (candidate-controlled evidence)", report.Strength)
 	}
 	if !report.DepsSkipped {
 		t.Fatal("report.DepsSkipped = false, want true for unchanged Go module metadata")
@@ -324,7 +325,7 @@ func TestCheckpointFiles_RestoreFailurePreservesBackup(t *testing.T) {
 	if err := os.Mkdir(subDir, 0755); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
-	defer os.Chmod(subDir, 0755)
+	defer func() { _ = os.Chmod(subDir, 0755) }()
 
 	largeName := "sub/large.bin"
 	fullPath := filepath.Join(project.Path, largeName)
@@ -367,7 +368,9 @@ func TestCheckpointFiles_RestoreFailurePreservesBackup(t *testing.T) {
 	}
 
 	// Restore permissions and clean up
-	os.Chmod(subDir, 0755)
+	if err := os.Chmod(subDir, 0755); err != nil {
+		t.Fatalf("restore directory permissions: %v", err)
+	}
 	checkpoint.Cleanup()
 	if _, err := os.Stat(bakFile); !os.IsNotExist(err) {
 		t.Fatalf("expected backup to be removed after explicit Cleanup, got: %v", err)
@@ -689,10 +692,10 @@ func TestDetectNoTestsRun(t *testing.T) {
 		want   bool
 	}{
 		{
-			name:   "go with passing tests",
+			name:   "unstructured go output is not execution evidence",
 			plan:   ExecPlan{Command: "go"},
 			result: &ExecResult{Stdout: "ok  \texample.com/verify\t0.002s\n"},
-			want:   false,
+			want:   true,
 		},
 		{
 			name:   "go without test files",
@@ -713,10 +716,10 @@ func TestDetectNoTestsRun(t *testing.T) {
 			want:   true,
 		},
 		{
-			name:   "go -v with passing tests",
+			name:   "unstructured verbose go output is not execution evidence",
 			plan:   ExecPlan{Command: "go", Args: []string{"test", "-v"}},
 			result: &ExecResult{Stdout: "=== RUN   TestAdd\n--- PASS: TestAdd (0.00s)\nPASS\nok  \texample.com/verify\t0.002s\n"},
-			want:   false,
+			want:   true,
 		},
 		{
 			name:   "pytest no tests ran",
@@ -954,4 +957,3 @@ func TestMain(m *testing.M) {
 		t.Fatalf("report.Strength = %d, want < 2 (TestMain must not bypass baseline tests)", report.Strength)
 	}
 }
-

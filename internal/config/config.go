@@ -7,12 +7,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 )
 
 // Config holds the application configuration.
 type Config struct {
+	// APIPolicy controls direct cloud API use and paid API fallback. Keys alone
+	// do not opt in; remote gateway policy belongs to that server.
+	APIPolicy string `json:"api_policy,omitempty"`
+
 	// Model API keys
 	ClaudeAPIKey string `json:"claude_api_key,omitempty"`
 	GeminiAPIKey string `json:"gemini_api_key,omitempty"`
@@ -92,6 +97,9 @@ type CustomProvider struct {
 }
 
 const (
+	APIPolicySubscriptionOnly = "subscription_only"
+	APIPolicyAllowPaid        = "allow_paid"
+
 	CustomPromptModeLegacy = "legacy"
 	CustomPromptModeArg    = "arg"
 	CustomPromptModeStdin  = "stdin"
@@ -115,6 +123,7 @@ const (
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
+		APIPolicy:     APIPolicySubscriptionOnly,
 		DefaultModel:  "claude",
 		AnalysisModel: "gemini",
 		CodingModel:   "claude",
@@ -126,6 +135,28 @@ func DefaultConfig() *Config {
 		MonthlyBudget: 20.0,
 	}
 }
+
+// NormalizeAPIPolicy fails closed for absent and unknown values.
+func NormalizeAPIPolicy(policy string) string {
+	if strings.ToLower(strings.TrimSpace(policy)) == APIPolicyAllowPaid {
+		return APIPolicyAllowPaid
+	}
+	return APIPolicySubscriptionOnly
+}
+
+// EffectiveAPIPolicy gives an explicit environment override precedence over
+// configuration. Even a misspelled/empty override disables direct API spend.
+func (c *Config) EffectiveAPIPolicy() string {
+	if policy, present := os.LookupEnv("MAKEWAND_API_POLICY"); present {
+		return NormalizeAPIPolicy(policy)
+	}
+	if c == nil {
+		return APIPolicySubscriptionOnly
+	}
+	return NormalizeAPIPolicy(c.APIPolicy)
+}
+
+func (c *Config) PaidAPIAllowed() bool { return c.EffectiveAPIPolicy() == APIPolicyAllowPaid }
 
 // NormalizeUsageMode returns a supported usage mode, defaulting to balanced.
 // Accepts canonical Go modes (fast, balanced, power) and Python aliases (standard, deep).
@@ -300,6 +331,7 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	if !opts.SkipCLIDetection {
 		cfg.CLIs = detectCLIs()
 	}
+	cfg.APIPolicy = NormalizeAPIPolicy(cfg.APIPolicy)
 	cfg.UsageMode = NormalizeUsageMode(cfg.UsageMode)
 	cfg.ApprovalMode = NormalizeApprovalMode(cfg.ApprovalMode)
 
@@ -324,8 +356,12 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	return cfg, loadErr
 }
 
-// Save writes the config to disk, stripping env-sourced API keys.
+// Save updates Go-owned fields while preserving fields used by the Python
+// engine in the shared config file. Environment-sourced keys are never saved.
 func Save(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("cannot save nil config")
+	}
 	path, err := ConfigPath()
 	if err != nil {
 		return err
@@ -333,6 +369,7 @@ func Save(cfg *Config) error {
 
 	// Create a copy that strips env-sourced keys
 	toSave := *cfg
+	toSave.APIPolicy = NormalizeAPIPolicy(toSave.APIPolicy)
 	toSave.UsageMode = NormalizeUsageMode(toSave.UsageMode)
 	toSave.ApprovalMode = NormalizeApprovalMode(toSave.ApprovalMode)
 	if cfg.envSourcedKeys != nil {
@@ -347,20 +384,84 @@ func Save(cfg *Config) error {
 		}
 	}
 
-	data, err := json.MarshalIndent(&toSave, "", "  ")
+	// Read the current disk version, not a snapshot taken at Load: another
+	// frontend may have changed its own fields while this Go process was open.
+	merged := make(map[string]json.RawMessage)
+	if existing, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(existing, &merged); err != nil {
+			return fmt.Errorf("preserve existing config: %w", err)
+		}
+		if merged == nil {
+			merged = make(map[string]json.RawMessage)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read existing config: %w", err)
+	}
+
+	// Remove ALL Go fields first, including omitted/cleared values and case
+	// aliases accepted by encoding/json. Merely overlaying Marshal's output
+	// would resurrect removed values, including old or environment-sourced keys.
+	known := make(map[string]bool)
+	typ := reflect.TypeFor[Config]()
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.PkgPath != "" {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		known[strings.ToLower(name)] = true
+	}
+	for key := range merged {
+		if known[strings.ToLower(key)] {
+			delete(merged, key)
+		}
+	}
+	encoded, err := json.Marshal(&toSave)
+	if err != nil {
+		return err
+	}
+	var updates map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &updates); err != nil {
+		return err
+	}
+	for key, value := range updates {
+		merged[key] = value
+	}
+	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0600)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // HasAnyModel returns true if at least one model is configured (API key or CLI tool).
 func (c *Config) HasAnyModel() bool {
-	if c.ClaudeAPIKey != "" || c.GeminiAPIKey != "" || c.OpenAIAPIKey != "" || len(c.CLIs) > 0 {
+	if len(c.CLIs) > 0 || c.PaidAPIAllowed() && (c.ClaudeAPIKey != "" || c.GeminiAPIKey != "" || c.OpenAIAPIKey != "") {
 		return true
 	}
 	for _, cp := range c.CustomProviders {
+		if strings.EqualFold(strings.TrimSpace(cp.Access), "api") && !c.PaidAPIAllowed() {
+			continue
+		}
 		if IsCustomProviderUsable(cp) {
 			return true
 		}

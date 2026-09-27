@@ -181,6 +181,18 @@ func handleTokens(w http.ResponseWriter, req *http.Request, opts HandlerOptions)
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusForbidden, err.Error(), 0, 0, 0)
 		return
 	}
+	if opts.UserStore != nil && rule.UserID != "" {
+		user, err := opts.UserStore.GetUserByID(rule.UserID)
+		if err != nil || user == nil || !user.IsActive {
+			writeError(w, http.StatusBadRequest, "invalid_request", "token user must be an active account")
+			return
+		}
+		rule.AuthorizationVersion, err = router.UserAuthorizationVersion(user, rule.OrganizationID, rule.ProjectID, opts.TeamStore)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not read user authorization state")
+			return
+		}
+	}
 	view, tokenValue, err := opts.TokenManager.Issue(rule)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -400,7 +412,7 @@ func handleUsers(w http.ResponseWriter, req *http.Request, opts HandlerOptions) 
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersRead, "admin_users", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
-	users = filterUsers(users, req, grant)
+	users = filterUsers(users, req, grant, opts.TeamStore)
 	page := paginateBounds(len(users), req)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"data":       users[page.Start:page.End],
@@ -428,9 +440,9 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		http.NotFound(w, req)
 		return
 	}
-	if scopedUserID := grant.UserID(); scopedUserID != "" && userID != scopedUserID {
-		writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("scoped admin tokens may only modify user %q", scopedUserID))
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only modify user %q", scopedUserID), 0, 0, 0)
+	if err := authorizeUserAction(grant, userID, action, opts); err != nil {
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusForbidden, err.Error(), 0, 0, 0)
 		return
 	}
 
@@ -442,6 +454,9 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 	case "activate":
 		user, err = opts.UserStore.SetUserActive(userID, true)
 	case "deactivate":
+		if !revokeUserCredentials(w, req, opts, grant, userID, "admin_users") {
+			return
+		}
 		user, err = opts.UserStore.SetUserActive(userID, false)
 	case "role":
 		var payload updateUserRoleRequest
@@ -452,6 +467,14 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, 0, 0, 0)
 			return
 		}
+		role := strings.ToLower(strings.TrimSpace(payload.Role))
+		if role != "" && role != router.UserRoleMember && role != router.UserRoleAdmin {
+			writeError(w, http.StatusBadRequest, "invalid_request", "invalid user role")
+			return
+		}
+		if !revokeUserCredentials(w, req, opts, grant, userID, "admin_users") {
+			return
+		}
 		user, err = opts.UserStore.SetUserRole(userID, payload.Role)
 	case "password":
 		var payload updateUserPasswordRequest
@@ -460,6 +483,13 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 			status, code, message := adminJSONDecodeError(decodeErr)
 			writeError(w, status, code, message)
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, 0, 0, 0)
+			return
+		}
+		if len(payload.Password) < 8 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "password must be at least 8 characters long")
+			return
+		}
+		if !revokeUserCredentials(w, req, opts, grant, userID, "admin_users") {
 			return
 		}
 		user, err = opts.UserStore.SetUserPassword(userID, payload.Password)
@@ -481,11 +511,7 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, err.Error(), 0, 0, 0)
 		return
 	}
-	if action == "deactivate" || action == "role" || action == "password" {
-		if opts.TokenManager != nil {
-			_ = opts.TokenManager.RevokeByUserID(userID)
-		}
-	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user_id": userID,
 		"action":  action,
@@ -516,14 +542,12 @@ func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, nil, scope, kind, http.StatusUnauthorized, "invalid or missing admin credentials", 0, 0, 0)
 		return nil, false
 	}
-	if opts.UserStore != nil && grant.UserID() != "" {
-		u, err := opts.UserStore.GetUserByID(grant.UserID())
-		if err != nil || u == nil || !u.IsActive {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "user account is deactivated or not found")
-			logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusUnauthorized, "user account is deactivated or not found", 0, 0, 0)
-			return nil, false
-		}
+	if !router.UserGrantIsCurrent(grant, opts.UserStore, opts.TeamStore) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "user account or membership is no longer authorized")
+		logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusUnauthorized, "user account or membership is no longer authorized", 0, 0, 0)
+		return nil, false
 	}
+
 	if session != nil && requiresCSRFAuthorization(req.Method) && !opts.SessionMgr.ValidateCSRF(req, session.CSRFToken) {
 		writeError(w, http.StatusForbidden, "forbidden", "missing or invalid CSRF token")
 		logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusForbidden, "missing or invalid CSRF token", 0, 0, 0)
@@ -815,15 +839,11 @@ func tenantTokenIDs(tm serverauth.TokenManager, grant *serverauth.Grant) map[str
 		return nil
 	}
 	ids := make(map[string]struct{})
+	excluded := make(map[string]bool)
 	if tm != nil {
 		for _, view := range tm.TokenRules() {
-			if userID != "" && view.UserID != userID {
-				continue
-			}
-			if orgID != "" && view.OrganizationID != orgID {
-				continue
-			}
-			if projectID != "" && view.ProjectID != projectID {
+			if (userID != "" && view.UserID != userID) || (orgID != "" && view.OrganizationID != orgID) || (projectID != "" && view.ProjectID != projectID) {
+				excluded[view.ID] = true
 				continue
 			}
 			ids[view.ID] = struct{}{}
@@ -832,6 +852,12 @@ func tenantTokenIDs(tm serverauth.TokenManager, grant *serverauth.Grant) map[str
 	if id := grant.TokenID(); id != "" {
 		ids[id] = struct{}{}
 	}
+	// Legacy backing stores can share an ID. Audit filtering and ID-only
+	// revocation must not resolve that ambiguity in a scoped caller's favor.
+	for id := range excluded {
+		delete(ids, id)
+	}
+
 	return ids
 }
 
@@ -927,7 +953,7 @@ func filterTokenViews(items []serverauth.TokenRuleView, req *http.Request, grant
 	return out
 }
 
-func filterUsers(items []router.UserView, req *http.Request, grant *serverauth.Grant) []router.UserView {
+func filterUsers(items []router.UserView, req *http.Request, grant *serverauth.Grant, teams serverteam.Store) []router.UserView {
 	if len(items) == 0 {
 		return nil
 	}
@@ -942,6 +968,9 @@ func filterUsers(items []router.UserView, req *http.Request, grant *serverauth.G
 	out := make([]router.UserView, 0, len(items))
 	for _, item := range items {
 		if userID != "" && item.ID != userID {
+			continue
+		}
+		if !userWithinTenant(grant, item.ID, teams) {
 			continue
 		}
 		if role != "" && strings.ToLower(item.Role) != role {

@@ -5,7 +5,7 @@ Health probing, quota monitoring, and status cache management.
 import os
 import re
 import json
-import fcntl
+from makewand import filelock as fcntl
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
@@ -52,10 +52,10 @@ def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool
         return False
 
     # Relative time support (e.g. "in 3 hours", "in 15 minutes", "in 24 hours")
-    rel_match = re.search(r"in\s+(\d+)\s*(hour|minute|min|hr|h|m)", resets_at, re.IGNORECASE)
+    rel_match = re.search(r"in\s+(\d+(?:\.\d+)?)\s*(hour|minute|min|hr|h|m)", resets_at, re.IGNORECASE)
     if rel_match and updated_at:
         try:
-            val = int(rel_match.group(1))
+            val = float(rel_match.group(1))
             unit = rel_match.group(2).lower()
             delta = timedelta(hours=val) if unit.startswith("h") else timedelta(minutes=val)
             clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
@@ -150,40 +150,27 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(info, dict) and info.get("status") == "limited":
             resets_at = info.get("resets_at")
             updated_at = info.get("updated_at", "")
+            # Normalize once to an absolute deadline. Rewriting the duration
+            # without its reference time causes every read/save to subtract
+            # the same elapsed interval again.
+            if resets_at and updated_at and re.match(r"^in\s+", str(resets_at), re.IGNORECASE):
+                relative = re.fullmatch(
+                    r"in\s+((?:\d+(?:\.\d+)?\s*(?:hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\s*)+)",
+                    str(resets_at).strip(), re.IGNORECASE)
+                if relative:
+                    try:
+                        parts = re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]+)", relative.group(1), re.IGNORECASE)
+                        seconds = sum(float(n) * (3600 if u.lower().startswith("h") else 60 if u.lower().startswith("m") else 1) for n, u in parts)
+                        observed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                        resets_at = (observed + timedelta(seconds=seconds)).isoformat()
+                        info["resets_at"] = resets_at
+                    except (TypeError, ValueError, OverflowError):
+                        pass
             if is_reset_time_passed(resets_at, updated_at):
                 info["status"] = "healthy"
                 info["reason"] = f"已过配额重置窗口 ({resets_at})，已自动恢复待命"
                 info["resets_at"] = None
                 info["updated_at"] = now_dt.isoformat()
-            elif resets_at and updated_at:
-                rel_match = re.search(r"in\s+(\d+(?:\.\d+)?)\s*(hour|minute|min|hr|h|m)", str(resets_at), re.IGNORECASE)
-                if rel_match:
-                    try:
-                        val = float(rel_match.group(1))
-                        unit = rel_match.group(2).lower()
-                        total_secs = val * 3600 if unit.startswith("h") else val * 60
-                        clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
-                        up_dt = datetime.fromisoformat(clean_up)
-                        now_comp = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else now_dt
-                        elapsed = (now_comp - up_dt).total_seconds()
-                        rem_secs = total_secs - elapsed
-                        if rem_secs <= 0:
-                            info["status"] = "healthy"
-                            info["reason"] = f"已过配额重置窗口 ({resets_at})，已自动恢复待命"
-                            info["resets_at"] = None
-                            info["updated_at"] = now_dt.isoformat()
-                        else:
-                            if rem_secs >= 3600:
-                                rem_hours = rem_secs / 3600
-                                if rem_hours.is_integer() or abs(rem_hours - round(rem_hours)) < 0.05:
-                                    info["resets_at"] = f"in {int(round(rem_hours))} hours"
-                                else:
-                                    info["resets_at"] = f"in {rem_hours:.1f} hours"
-                            else:
-                                rem_mins = max(1, int(round(rem_secs / 60)))
-                                info["resets_at"] = f"in {rem_mins} minutes"
-                    except Exception:
-                        pass
     return cache
 
 def load_status_cache() -> Dict[str, Any]:
@@ -589,5 +576,4 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
 
     res["updated_at"] = updated_at
     return res
-
 

@@ -26,7 +26,7 @@ non_e2e_tests="$(
 
 echo "[test-gate] go test all packages (except cmd/makewand)"
 if [[ -n "${other_pkgs}" ]]; then
-  go test ${other_pkgs}
+  go test -count=1 ${other_pkgs}
 fi
 
 if [[ -n "${non_e2e_tests}" ]]; then

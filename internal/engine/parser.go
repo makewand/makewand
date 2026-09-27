@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"io/fs"
 	"regexp"
 	"strconv"
 	"strings"
@@ -11,6 +12,9 @@ import (
 type ExtractedFile struct {
 	Path    string
 	Content string
+	// Mode is a sealed file permission snapshot when ModeKnown is true.
+	Mode      fs.FileMode
+	ModeKnown bool
 }
 
 // ParseResult holds the result of parsing AI output for file blocks.

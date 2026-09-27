@@ -915,4 +915,3 @@ func TestHandler_DeactivatedUserTokenRejected(t *testing.T) {
 		t.Fatalf("deactivated user token status = %d, want 401; body = %s", rec2.Code, rec2.Body.String())
 	}
 }
-

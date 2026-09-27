@@ -23,6 +23,7 @@ const (
 	PhaseTests                     // running tests
 	PhaseAutoFix                   // auto-fixing failures
 	PhaseDone                      // build complete
+	PhaseBlocked                   // acceptance did not complete
 )
 
 // String returns a human-readable name for the phase.
@@ -42,6 +43,8 @@ func (p BuildPhase) String() string {
 		return "AutoFix"
 	case PhaseDone:
 		return "Done"
+	case PhaseBlocked:
+		return "Blocked"
 	default:
 		return "Unknown"
 	}
@@ -56,13 +59,14 @@ type ActionKind int
 const (
 	ActionNone              ActionKind = iota
 	ActionStartReview                  // begin cross-model code review
-	ActionSkipReview                   // review skipped (single provider or error)
+	ActionSkipReview                   // reserved for an explicit review policy
 	ActionStartDeps                    // begin dependency installation phase
 	ActionStartTests                   // begin test execution phase
 	ActionStartAutoFix                 // begin auto-fix attempt
 	ActionAutoFixRetry                 // re-run deps+tests after fix files written
 	ActionBuildComplete                // the entire build pipeline is done
 	ActionMaxRetriesReached            // auto-fix retries exhausted, build done
+	ActionReviewBlocked                // review failed or did not approve the current files
 )
 
 // String returns a human-readable name for the action.
@@ -86,6 +90,8 @@ func (a ActionKind) String() string {
 		return "BuildComplete"
 	case ActionMaxRetriesReached:
 		return "MaxRetriesReached"
+	case ActionReviewBlocked:
+		return "ReviewBlocked"
 	default:
 		return "Unknown"
 	}
@@ -111,7 +117,7 @@ const (
 	ReviewLGTM       ReviewResult = iota // no issues found
 	ReviewHasIssues                      // issues found with fix files
 	ReviewNoFixFiles                     // issues found but no parseable fix files
-	ReviewError                          // review failed (non-fatal)
+	ReviewError                          // review failed; blocks acceptance
 )
 
 // BuildPipeline manages build wizard state transitions.
@@ -130,8 +136,9 @@ type BuildPipeline struct {
 	depsApproved  bool
 	testsApproved bool
 
-	// Available provider count (set by TUI so pipeline can decide on review skip)
+	// Available provider count (reported by the TUI for routing diagnostics)
 	availableProviders int
+	reviewAttempts     int
 }
 
 // NewBuildPipeline creates a new pipeline in the idle state.
@@ -202,7 +209,7 @@ func (p *BuildPipeline) SetTestsApproved(approved bool) {
 }
 
 // SetAvailableProviders tells the pipeline how many providers are available.
-// This drives the review skip decision.
+// Provider availability never bypasses the review gate.
 func (p *BuildPipeline) SetAvailableProviders(count int) {
 	p.availableProviders = count
 }
@@ -210,36 +217,37 @@ func (p *BuildPipeline) SetAvailableProviders(count int) {
 // --- Phase transition methods ---
 
 // OnCodeWritten is called after code files have been written to disk.
-// It decides whether to proceed to review or skip it.
+// Every generated revision requires a review.
 func (p *BuildPipeline) OnCodeWritten() BuildAction {
-	if p.availableProviders <= 1 {
-		p.phase = PhaseDeps
-		return BuildAction{Kind: ActionSkipReview, SkipReason: "single provider"}
+	p.reviewAttempts++
+	if p.reviewAttempts > MaxAutoFixRetries+1 {
+		p.phase = PhaseBlocked
+		return BuildAction{Kind: ActionReviewBlocked, SkipReason: "review did not approve the revised files"}
 	}
+	// One provider still performs a separate review call/context.
 	p.phase = PhaseReview
 	return BuildAction{Kind: ActionStartReview}
 }
 
-// OnReviewComplete is called after the code review finishes.
+// OnReviewComplete accepts only an explicit approval. Errors, unresolved
+// defects, and unknown outcomes never advance to dependency/test execution.
 func (p *BuildPipeline) OnReviewComplete(result ReviewResult) BuildAction {
 	switch result {
-	case ReviewLGTM, ReviewNoFixFiles, ReviewError:
-		// Move to deps regardless — review is non-blocking
+	case ReviewLGTM:
 		p.phase = PhaseDeps
 		return BuildAction{Kind: ActionStartDeps}
 	case ReviewHasIssues:
-		// TUI will handle writing fix files, then call OnReviewFixesWritten
 		return BuildAction{Kind: ActionNone}
 	default:
-		p.phase = PhaseDeps
-		return BuildAction{Kind: ActionStartDeps}
+		p.phase = PhaseBlocked
+		return BuildAction{Kind: ActionReviewBlocked}
 	}
 }
 
-// OnReviewFixesWritten is called after review fix files have been written.
+// Review-generated changes need their own review before they can be accepted.
 func (p *BuildPipeline) OnReviewFixesWritten() BuildAction {
-	p.phase = PhaseDeps
-	return BuildAction{Kind: ActionStartDeps}
+	p.phase = PhaseReview
+	return BuildAction{Kind: ActionStartReview}
 }
 
 // OnDepsComplete is called after dependency installation finishes.

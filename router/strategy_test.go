@@ -83,11 +83,11 @@ func TestSortCandidatesForMode_ColdStartPrefersStaticOrder(t *testing.T) {
 
 func TestParseUsageModeAndAliases(t *testing.T) {
 	tests := []struct {
-		input     string
-		wantMode  UsageMode
-		wantOk    bool
-		wantStr   string
-		wantPy    string
+		input    string
+		wantMode UsageMode
+		wantOk   bool
+		wantStr  string
+		wantPy   string
 	}{
 		{input: "fast", wantMode: ModeFast, wantOk: true, wantStr: "fast", wantPy: "fast"},
 		{input: "balanced", wantMode: ModeBalanced, wantOk: true, wantStr: "balanced", wantPy: "standard"},

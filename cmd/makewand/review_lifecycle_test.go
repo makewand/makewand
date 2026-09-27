@@ -18,8 +18,8 @@ import (
 
 type reviewReevalProvider struct{}
 
-func (reviewReevalProvider) Name() string        { return "claude" }
-func (reviewReevalProvider) IsAvailable() bool  { return true }
+func (reviewReevalProvider) Name() string      { return "claude" }
+func (reviewReevalProvider) IsAvailable() bool { return true }
 func (reviewReevalProvider) Chat(context.Context, []router.Message, string, int) (string, router.Usage, error) {
 	return "review", router.Usage{}, nil
 }

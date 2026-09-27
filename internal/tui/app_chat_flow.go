@@ -122,6 +122,8 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 				inputTokens:   selection.usage.InputTokens,
 				outputTokens:  selection.usage.OutputTokens,
 				verified:      selection.verified,
+				files:         selection.files,
+				digest:        selection.digest,
 				selectionNote: selection.selectionNote,
 			}
 		}

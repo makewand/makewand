@@ -12,6 +12,7 @@ func TestNewRouterWithTrust(t *testing.T) {
 	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
 
 	cfg := config.DefaultConfig()
+	cfg.APIPolicy = config.APIPolicyAllowPaid
 	cfg.OpenAIAPIKey = "openai-test-key"
 
 	untrusted, err := NewRouterWithTrust(cfg, RepoTrustUntrusted)
@@ -37,6 +38,7 @@ func TestNewRouterDefaultsToTrusted(t *testing.T) {
 	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
 
 	cfg := config.DefaultConfig()
+	cfg.APIPolicy = config.APIPolicyAllowPaid
 	cfg.OpenAIAPIKey = "openai-test-key"
 
 	r, err := NewRouter(cfg)

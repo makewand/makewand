@@ -90,4 +90,3 @@ func TestHandler_ServesPlaygroundAndChatAssets(t *testing.T) {
 		t.Fatalf("app.js missing intent classification logic")
 	}
 }
-

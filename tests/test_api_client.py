@@ -339,6 +339,12 @@ class TestMakeHttpRequest(unittest.TestCase):
 class TestCallApiChat(unittest.TestCase):
     """Tests for provider-specific logic in call_api_chat."""
 
+    def setUp(self):
+        # These are transport tests under an explicitly enabled billing policy.
+        policy = patch("makewand.config.get_api_policy", return_value="allow_paid")
+        policy.start()
+        self.addCleanup(policy.stop)
+
     @patch("makewand.providers.api_client.get_api_config")
     def test_claude_missing_key(self, mock_get_cfg):
         mock_get_cfg.return_value = {"api_key": "", "base_url": ""}

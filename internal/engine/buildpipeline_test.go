@@ -15,21 +15,13 @@ func TestNewBuildPipeline_StartsIdle(t *testing.T) {
 	}
 }
 
-func TestOnCodeWritten_SingleProvider_SkipsReview(t *testing.T) {
+func TestOnCodeWritten_SingleProvider_RequiresReview(t *testing.T) {
 	p := NewBuildPipeline()
 	p.SetAvailableProviders(1)
 	p.SetCodeProvider("gemini")
-
 	action := p.OnCodeWritten()
-
-	if action.Kind != ActionSkipReview {
-		t.Fatalf("Kind = %v, want ActionSkipReview", action.Kind)
-	}
-	if action.SkipReason != "single provider" {
-		t.Fatalf("SkipReason = %q, want 'single provider'", action.SkipReason)
-	}
-	if p.Phase() != PhaseDeps {
-		t.Fatalf("Phase() = %v, want PhaseDeps", p.Phase())
+	if action.Kind != ActionStartReview || p.Phase() != PhaseReview {
+		t.Fatalf("action=%+v phase=%v; review is mandatory", action, p.Phase())
 	}
 }
 
@@ -62,14 +54,17 @@ func TestOnReviewComplete_LGTM_MovesDeps(t *testing.T) {
 	}
 }
 
-func TestOnReviewComplete_Error_NonFatal(t *testing.T) {
+func TestOnReviewComplete_Error_BlocksAcceptance(t *testing.T) {
 	p := NewBuildPipeline()
 	p.SetPhase(PhaseReview)
 
 	action := p.OnReviewComplete(ReviewError)
 
-	if action.Kind != ActionStartDeps {
-		t.Fatalf("Kind = %v, want ActionStartDeps", action.Kind)
+	if action.Kind != ActionReviewBlocked {
+		t.Fatalf("Kind = %v, want ActionReviewBlocked", action.Kind)
+	}
+	if p.Phase() != PhaseBlocked {
+		t.Fatalf("phase=%v, want blocked", p.Phase())
 	}
 }
 
@@ -84,28 +79,31 @@ func TestOnReviewComplete_HasIssues_ReturnsNone(t *testing.T) {
 	}
 }
 
-func TestOnReviewComplete_NoFixFiles_MovesDeps(t *testing.T) {
+func TestOnReviewComplete_NoFixFiles_BlocksAcceptance(t *testing.T) {
 	p := NewBuildPipeline()
 	p.SetPhase(PhaseReview)
 
 	action := p.OnReviewComplete(ReviewNoFixFiles)
 
-	if action.Kind != ActionStartDeps {
-		t.Fatalf("Kind = %v, want ActionStartDeps", action.Kind)
+	if action.Kind != ActionReviewBlocked {
+		t.Fatalf("Kind = %v, want ActionReviewBlocked", action.Kind)
+	}
+	if p.Phase() != PhaseBlocked {
+		t.Fatalf("phase=%v, want blocked", p.Phase())
 	}
 }
 
-func TestOnReviewFixesWritten_MovesDeps(t *testing.T) {
+func TestOnReviewFixesWritten_RequiresNewReview(t *testing.T) {
 	p := NewBuildPipeline()
 	p.SetPhase(PhaseReview)
 
 	action := p.OnReviewFixesWritten()
 
-	if action.Kind != ActionStartDeps {
-		t.Fatalf("Kind = %v, want ActionStartDeps", action.Kind)
+	if action.Kind != ActionStartReview {
+		t.Fatalf("Kind = %v, want ActionStartReview", action.Kind)
 	}
-	if p.Phase() != PhaseDeps {
-		t.Fatalf("Phase() = %v, want PhaseDeps", p.Phase())
+	if p.Phase() != PhaseReview {
+		t.Fatalf("Phase() = %v, want PhaseReview", p.Phase())
 	}
 }
 

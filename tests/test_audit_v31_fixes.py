@@ -79,7 +79,8 @@ class TestAuditV31Fixes(unittest.TestCase):
             "deepseek": {"status": "healthy"},
             "qwen": {"status": "healthy"},
         }
-        with patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
+        with patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
+             patch("makewand.config.load_user_config", return_value={"enabled_providers": {"local": True}}):
             # 1. Coding prompt: local and deepseek must NOT be in available coders
             coders, reviewers, meta = select_optimal_engine_pair(
                 "在当前目录编写一个支持重试机制的 HTTP Client",

@@ -56,7 +56,7 @@ func TestChatPanel_MouseWheelScrollAndPreserveOffset(t *testing.T) {
 	}
 
 	// Scroll up using mouse wheel
-	chat, _ = chat.Update(tea.MouseMsg{Type: tea.MouseWheelUp})
+	chat, _ = chat.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
 	if chat.viewport.YOffset >= initialOffset {
 		t.Fatalf("expected YOffset to decrease after MouseWheelUp, got %d (initial %d)", chat.viewport.YOffset, initialOffset)
 	}
@@ -95,4 +95,3 @@ func TestChatPanel_WindowResizePreservesBottomFollow(t *testing.T) {
 		t.Fatal("expected viewport to remain at bottom after expanding window")
 	}
 }
-

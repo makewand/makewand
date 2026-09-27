@@ -26,6 +26,20 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 // background work (e.g. quota/health refresh) runs, so untrusted mode fails
 // closed end-to-end rather than after a post-construction SetRepoTrust call.
 func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
+	if cfg == nil {
+		cfg = config.DefaultConfig()
+	}
+	// Snapshot the spend decision and keys before constructing providers or
+	// factory closures. Later config mutations cannot turn a subscription-only
+	// router into a paid API router through dynamic model resolution.
+	resolved := *cfg
+	allowPaid := cfg.PaidAPIAllowed()
+	if !allowPaid {
+		resolved.ClaudeAPIKey = ""
+		resolved.GeminiAPIKey = ""
+		resolved.OpenAIAPIKey = ""
+	}
+	cfg = &resolved
 	rc := RouterConfig{}
 	rc.RepoTrust = trust
 
@@ -51,6 +65,7 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 
 	rc.Providers = make(map[string]ProviderEntry)
 
+	// An explicitly connected gateway applies its own server-side spend policy.
 	if config.HasRemoteBackend() {
 		rc.Providers["remote"] = ProviderEntry{
 			Provider: NewRemoteHTTP(config.RemoteBaseURL(), config.RemoteToken()),
@@ -70,8 +85,8 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	}
 
 	// Register CLI-based providers first (subscription — preferred). When the
-	// matching API key also exists, keep an `*-api` sibling in the pool so the
-	// router can fall back to paid API usage after the subscription path fails.
+	// explicit allow_paid policy and matching key exist, keep an `*-api` sibling
+	// so the router can fall back after the subscription path fails.
 	for _, cli := range cfg.CLIs {
 		switch cli.Name {
 		case "claude":
@@ -143,6 +158,9 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 		if access == "" {
 			access = "subscription"
 		}
+		if !allowPaid && ParseAccessType(access, name) == AccessAPI {
+			continue
+		}
 		rc.Providers[name] = ProviderEntry{
 			Provider: NewCommandCLI(name, command, cp.Args, config.EffectiveCustomProviderPromptMode(cp)),
 			Access:   ParseAccessType(access, name),
@@ -170,16 +188,16 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	snap.LoadCache()
 
 	// Apply explicit access type overrides from config (may override subscription defaults).
-	if cfg.ClaudeAccess != "" {
+	if cfg.ClaudeAccess != "" && (allowPaid || !strings.EqualFold(strings.TrimSpace(cfg.ClaudeAccess), "api")) {
 		r.SetAccessType("claude", ParseAccessType(cfg.ClaudeAccess, "claude"))
 	}
-	if cfg.GeminiAccess != "" {
+	if cfg.GeminiAccess != "" && (allowPaid || !strings.EqualFold(strings.TrimSpace(cfg.GeminiAccess), "api")) {
 		r.SetAccessType("gemini", ParseAccessType(cfg.GeminiAccess, "gemini"))
 	}
-	if cfg.OpenAIAccess != "" {
+	if cfg.OpenAIAccess != "" && (allowPaid || !strings.EqualFold(strings.TrimSpace(cfg.OpenAIAccess), "api")) {
 		r.SetAccessType("openai", ParseAccessType(cfg.OpenAIAccess, "openai"))
 	}
-	if cfg.CodexAccess != "" {
+	if cfg.CodexAccess != "" && (allowPaid || !strings.EqualFold(strings.TrimSpace(cfg.CodexAccess), "api")) {
 		r.SetAccessType("codex", ParseAccessType(cfg.CodexAccess, "codex"))
 	}
 

@@ -26,7 +26,7 @@ from makewand.orchestrator import select_optimal_engine_pair
 class TestHybridRouting(unittest.TestCase):
 
     def setUp(self):
-        self.patch_cfg = patch("makewand.config.load_user_config", return_value={"enabled_providers": {"local": True}})
+        self.patch_cfg = patch("makewand.config.load_user_config", return_value={"api_policy": "allow_paid", "enabled_providers": {"local": True}})
         self.mock_cfg = self.patch_cfg.start()
         self.patch_local = patch("makewand.providers.local.is_local_model_available", return_value=(True, "gemma4:31b", ["gemma4:31b"]))
         self.mock_local = self.patch_local.start()

@@ -222,6 +222,14 @@ class TestConversationHistorySlidingWindow(unittest.TestCase):
 class TestSlashCommandHandling(unittest.TestCase):
     """Tests for REPL slash command routing and execution."""
 
+    def setUp(self):
+        # Slash routing must neither inspect live provider state nor register
+        # history writes against the developer's real home directory.
+        for target, value in (("render_welcome_card", "Makewand"), ("setup_readline", None)):
+            replacement = patch("makewand.interactive." + target, return_value=value)
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
     @patch("sys.stdout", new_callable=io.StringIO)
     @patch("builtins.input", side_effect=["/help", "/?", "/exit"])
     def test_help_slash_commands(self, mock_input, mock_stdout):

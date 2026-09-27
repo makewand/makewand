@@ -130,6 +130,7 @@ func (us *UserStore) loadUsers() (map[string]*User, error) {
 	users := make(map[string]*User)
 
 	filePath := us.usersFilePath()
+	//nolint:gosec // G703: dataDir is the server operator's store location, not request input; the filename is fixed to users.json.
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -575,6 +576,22 @@ func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.
 }
 
 func loginRuleForUser(user *User, req UserLoginRequest, teamStore serverteam.Store, expiresAt time.Time) (serverauth.TokenRule, error) {
+	rule, err := resolveLoginRuleForUser(user, req, teamStore, expiresAt)
+	if err != nil {
+		return serverauth.TokenRule{}, err
+	}
+	if orgID := strings.TrimSpace(req.OrganizationID); orgID != "" && orgID != rule.OrganizationID {
+		return serverauth.TokenRule{}, fmt.Errorf("project does not belong to the requested organization")
+	}
+	grant, err := serverauth.GrantFromRule(rule)
+	if err != nil || !UserGrantIsCurrent(grant, nil, teamStore) {
+		return serverauth.TokenRule{}, fmt.Errorf("user is not an active member of the requested organization or project")
+	}
+	rule.AuthorizationVersion, err = UserAuthorizationVersion(user, rule.OrganizationID, rule.ProjectID, teamStore)
+	return rule, err
+}
+
+func resolveLoginRuleForUser(user *User, req UserLoginRequest, teamStore serverteam.Store, expiresAt time.Time) (serverauth.TokenRule, error) {
 	if user == nil {
 		return serverauth.TokenRule{}, fmt.Errorf("login rule: nil user")
 	}
@@ -669,6 +686,7 @@ func (r *Router) HTTPHandlerWithUsers(userStore UserManager, userOpts UserEndpoi
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	opt.Authorizer = WithUserAuthorization(authorizerForHTTPOptions(opt), userStore, opt.TeamStore)
 	base := r.HTTPHandler(opt)
 	if userStore == nil {
 		return base

@@ -162,8 +162,8 @@ func TestRunCandidateSelection_DeliversExactVerifiedPayload(t *testing.T) {
 	}
 
 	selection := RunCandidateSelection(context.Background(), r, p, model.PhaseCode, []model.Message{{Role: "user", Content: "implement addition"}}, "", nil)
-	if !selection.Verified {
-		t.Fatalf("expected verified selection, got %+v", selection)
+	if selection.Verified {
+		t.Fatalf("candidate-controlled evidence must require approval, got %+v", selection)
 	}
 	if strings.Contains(selection.Content, "THIS IS INVALID GO") {
 		t.Fatal("unverified test file was delivered in selection.Content")

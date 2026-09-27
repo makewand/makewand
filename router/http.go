@@ -227,7 +227,7 @@ func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	authz := authorizerForHTTPOptions(opt)
+	authz := WithUserAuthorization(authorizerForHTTPOptions(opt), nil, opt.TeamStore)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", r.requireScope(authz, serverauth.ScopeChatInvoke, opt.AuditLogger, r.handleChatCompletionsWithOptions(opt)))

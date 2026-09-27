@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -326,31 +327,57 @@ func isWithinDir(base, target string) bool {
 
 // WriteFile writes content to a file in the project.
 func (p *Project) WriteFile(relPath, content string) error {
-	fullPath, err := p.validatePath(relPath, true)
-	if err != nil {
-		return err
-	}
+	return p.writeFileMode(relPath, content, nil)
+}
 
-	dir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create directory: %w", err)
-	}
-
-	// Re-validate after directory creation to reduce TOCTOU exposure.
+func (p *Project) writeFileMode(relPath, content string, requestedMode *fs.FileMode) error {
 	if _, err := p.validatePath(relPath, true); err != nil {
 		return err
 	}
-
-	// Remove any pre-existing destination file first so shared hardlink inodes
-	// outside the workspace are unlinked and not mutated in-place.
-	if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("unlink existing file: %w", err)
+	root, err := os.OpenRoot(p.Path)
+	if err != nil {
+		return err
 	}
-
-	if err := os.WriteFile(fullPath, []byte(content), 0600); err != nil {
-		return fmt.Errorf("write file: %w", err)
+	defer root.Close()
+	relPath = filepath.Clean(relPath)
+	mode := fs.FileMode(0o600)
+	if info, err := root.Lstat(relPath); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing to replace non-regular file: %s", relPath)
+		}
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-
+	if requestedMode != nil {
+		mode = requestedMode.Perm()
+	}
+	dir := filepath.Dir(relPath)
+	if err := root.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create directory: %w", err)
+	}
+	// Root-relative operations resist parent symlink swaps; atomic replacement
+	// preserves the old file on errors and never truncates shared hardlink inodes.
+	tempPath := filepath.Join(dir, ".makewand-write-"+rand.Text())
+	tmp, err := root.OpenFile(tempPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+	defer func() { _ = root.Remove(tempPath) }()
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := root.Rename(tempPath, relPath); err != nil {
+		return fmt.Errorf("replace file: %w", err)
+	}
 	return nil
 }
 

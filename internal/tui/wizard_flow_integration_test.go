@@ -23,6 +23,7 @@ func TestWizardBuildsProjectFromTemplateWithoutPTY(t *testing.T) {
 		responses: []string{
 			"Plan:\n- Build a simple page\n- No dependencies\n- No tests\n",
 			"--- FILE: index.html ---\n```\n<html><body><h1>hello</h1></body></html>\n```",
+			"LGTM",
 		},
 	}
 
@@ -75,8 +76,8 @@ func TestWizardBuildsProjectFromTemplateWithoutPTY(t *testing.T) {
 	if app.wizard.Phase() != WizardPhaseDone {
 		t.Fatalf("final wizard phase = %v, want %v", app.wizard.Phase(), WizardPhaseDone)
 	}
-	if provider.calls != 2 {
-		t.Fatalf("provider calls = %d, want 2", provider.calls)
+	if provider.calls != 3 {
+		t.Fatalf("provider calls = %d, want 3 (plan, implementation, review)", provider.calls)
 	}
 }
 

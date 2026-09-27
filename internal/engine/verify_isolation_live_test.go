@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"net"
 	"os"
+	"strconv"
 	"testing"
 )
 
@@ -48,7 +50,52 @@ func TestEvaluateCandidateFiles_LiveBwrapIsolation(t *testing.T) {
 	if !report.Isolated {
 		t.Fatalf("report.Isolated = false, want true; report=%+v", report)
 	}
-	if !report.Passed || report.Strength != 2 {
-		t.Fatalf("report = %+v, want isolated pass at strength 2", report)
+	if !report.Passed || report.Strength != 1 {
+		t.Fatalf("report = %+v, want isolated local-check pass at strength 1", report)
+	}
+}
+
+// Bubblewrap configures an isolated loopback interface. A local test server
+// remains reachable, while the host listener and default network are hidden.
+func TestVerificationNetworkHasOnlyIsolatedLoopback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live sandbox test")
+	}
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "0")
+	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+		if os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
+			t.Fatal(RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
+		}
+		t.Skip("bubblewrap unavailable")
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	p, err := NewProject("network", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := `import socket, sys
+host_port = int(sys.argv[1])
+s = socket.socket()
+s.bind(("127.0.0.1",0))
+s.listen()
+local = socket.create_connection(s.getsockname(), timeout=1)
+local.close()
+s.close()
+try:
+    socket.create_connection(("127.0.0.1",host_port), timeout=1)
+except OSError:
+    pass
+else:
+    raise RuntimeError("host loopback exposed")
+with open("/proc/net/route") as f:
+    assert all(line.split()[1] != "00000000" for line in list(f)[1:]), "default route exposed"
+`
+	result, err := p.RunVerificationPlan(context.Background(), ExecPlan{Kind: "tests", Command: "python3", Args: []string{"-c", source, strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)}})
+	if err != nil || result == nil || result.ExitCode != 0 {
+		t.Fatalf("isolated loopback: %v %+v", err, result)
 	}
 }

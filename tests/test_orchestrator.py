@@ -146,7 +146,8 @@ class TestOrchestrator(unittest.TestCase):
              patch("makewand.orchestrator.execute_grok_task", return_value=(False, None, "error")), \
              patch("makewand.orchestrator.execute_muse_task", return_value=(False, None, "error")), \
              patch("makewand.orchestrator.execute_local_task", return_value=(False, None, "error")):
-            res = run_pipeline("实现测试功能", cwd="/tmp", auto_fix=False)
+            with tempfile.TemporaryDirectory() as workspace:
+                res = run_pipeline("实现测试功能", cwd=workspace, auto_fix=False)
             # Must FAIL-CLOSED (return False, rejecting delivery)
             self.assertFalse(res)
 
@@ -569,6 +570,7 @@ class TestOrchestrator(unittest.TestCase):
         without corrupted splitting and reports rollback failure when reverse apply fails.
         """
         import subprocess
+        import shutil
         from makewand.git_helper import ShadowWorktreeResult, run_git_cmd
         from makewand.orchestrator import run_pipeline
 
@@ -612,13 +614,9 @@ class TestOrchestrator(unittest.TestCase):
             _, head_out, _ = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(main_repo))
 
             dst_sub = shadow_dir / "lib:colon_dir"
-            dst_sub.mkdir(parents=True)
-            run_git_cmd(["git", "init"], cwd=str(dst_sub))
-            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(dst_sub))
-            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=str(dst_sub))
-            (dst_sub / "sub.txt").write_text("sub v1\n")
-            run_git_cmd(["git", "add", "-A"], cwd=str(dst_sub))
-            run_git_cmd(["git", "commit", "-m", "init sub"], cwd=str(dst_sub))
+            # Copy the same Git object baseline. Independent commits can differ
+            # when setup crosses a second, making sub_base_hash unavailable.
+            shutil.copytree(src_sub, dst_sub)
 
             (shadow_dir / ".gitmodules").write_text('[submodule "lib:colon_dir"]\n\tpath = lib:colon_dir\n\turl = ./lib:colon_dir\n')
             run_git_cmd(["git", "add", "-A"], cwd=str(shadow_dir))

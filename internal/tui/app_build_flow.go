@@ -73,8 +73,12 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 		} else if engine.ContainsFiles(msg.content) {
 			result = engine.ParseFiles(msg.content)
 		}
+		if len(msg.files) > 0 {
+			result.Files = msg.files
+		}
 		if len(result.Files) > 0 {
-			a.pendingWriteVerified = msg.verified
+			a.pendingWriteDigest = msg.digest
+			a.pendingWriteVerified = msg.verified && engine.VerifiedFilesMatch(result.Files, msg.digest)
 			return a, func() tea.Msg {
 				return filesExtractedMsg{files: result.Files, phase: phase}
 			}
@@ -82,6 +86,7 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 	}
 
 	a.pendingWriteVerified = false
+	a.pendingWriteDigest = ""
 
 	return a, nil
 }
@@ -197,6 +202,7 @@ func (a App) handleFileConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.clearPendingApproval()
 		a.pendingFiles = nil
 		a.pendingWriteVerified = false
+		a.pendingWriteDigest = ""
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
 			Content: m.FileCancelled,
@@ -250,11 +256,16 @@ func (a App) handleFileWriteConfirm(msg confirmFileWriteMsg) (tea.Model, tea.Cmd
 		return a, nil
 	}
 
-	files := a.pendingFiles
+	files := append([]engine.ExtractedFile(nil), a.pendingFiles...)
+	digest := a.pendingWriteDigest
+	a.pendingWriteDigest = ""
 	proj := a.project
 	a.pendingFiles = nil
 
 	return a, func() tea.Msg {
+		if digest != "" && !engine.VerifiedFilesMatch(files, digest) {
+			return fileWriteCompleteMsg{failed: len(files), errors: []string{"candidate payload changed after verification"}}
+		}
 		checkpoint, checkpointErr := proj.CheckpointFiles(files)
 		if checkpointErr != nil {
 			return fileWriteCompleteMsg{written: 0, failed: len(files), errors: []string{fmt.Sprintf("checkpoint: %s", checkpointErr)}}
@@ -264,7 +275,7 @@ func (a App) handleFileWriteConfirm(msg confirmFileWriteMsg) (tea.Model, tea.Cmd
 		var errors []string
 
 		for _, f := range files {
-			if err := proj.WriteFile(f.Path, f.Content); err != nil {
+			if err := proj.WriteFiles([]engine.ExtractedFile{f}); err != nil {
 				failed++
 				errors = append(errors, fmt.Sprintf("%s: %s", f.Path, err))
 			} else {
@@ -307,18 +318,15 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 	// Refresh file tree synchronously so downstream review sees the latest files.
 	a.refreshProjectFiles()
 	a.pendingWriteVerified = false
+	a.pendingWriteDigest = ""
+
+	if msg.failed > 0 {
+		return a.blockBuildReview("File writes failed; acceptance stopped")
+	}
 
 	if a.pendingPhase == pendingPhaseReview {
-		// Review fix files written — continue to deps phase
-		a.progress.SetStepStatus(stepReview, StepDone)
-		a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressReviewApplied, msg.written, a.pipeline.ReviewProvider()))
 		a.pipeline.OnReviewFixesWritten()
-		depsModel, depsCmd := a.startDepsPhase()
-		a = depsModel.(App)
-		if depsCmd != nil {
-			cmds = append(cmds, depsCmd)
-		}
-		return a, tea.Batch(cmds...)
+		return a.startCodeReview()
 	}
 
 	if a.pendingPhase == pendingPhaseFix {
@@ -327,103 +335,115 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 	}
 
 	if a.pendingPhase == pendingPhaseBuild {
-		a = a.applyBudgetRoutingPolicy()
-
-		// Update progress: generate code → done
 		a.progress.SetStepStatus(stepCode, StepDone)
 		a.progress.SetStepDetail(stepCode, fmt.Sprintf(m.ProgressFilesWritten, msg.written))
+		return a.startCodeReview()
+	}
+	return a, tea.Batch(cmds...)
+}
 
-		// Ask the pipeline whether to review or skip.
-		codeProvider := a.pipeline.CodeProvider()
-		a.pipeline.SetAvailableProviders(len(a.router.Available()))
-		action := a.pipeline.OnCodeWritten()
+func (a App) startCodeReview() (tea.Model, tea.Cmd) {
+	m := i18n.Msg()
+	var cmds []tea.Cmd
+	a = a.applyBudgetRoutingPolicy()
 
-		if action.Kind == engine.ActionSkipReview {
-			a.progress.SetStepStatus(stepReview, StepDone)
-			a.progress.SetStepDetail(stepReview, fmt.Sprintf("skipped (%s)", action.SkipReason))
-			depsModel, depsCmd := a.startDepsPhase()
-			a = depsModel.(App)
-			if depsCmd != nil {
-				cmds = append(cmds, depsCmd)
+	// Every generated revision must pass review.
+	codeProvider := a.pipeline.CodeProvider()
+	a.pipeline.SetAvailableProviders(len(a.router.Available()))
+	action := a.pipeline.OnCodeWritten()
+
+	if action.Kind == engine.ActionReviewBlocked {
+		return a.blockBuildReview(action.SkipReason)
+	}
+
+	a.progress.SetStepStatus(stepReview, StepRunning)
+
+	// In Power mode the ensemble handles provider selection internally.
+	// In other modes, pre-determine the review provider for the progress display.
+	if a.router.Mode() == model.ModePower {
+		a.progress.SetStepDetail(stepReview, fmt.Sprintf("Power: %s → ensemble", codeProvider))
+	} else {
+		reviewProvider := a.router.BuildProviderFor(model.PhaseReview)
+		if reviewProvider == codeProvider && len(a.router.Available()) > 1 {
+			result, err := a.router.RouteProvider(reviewProvider, model.PhaseReview, codeProvider)
+			if err == nil {
+				reviewProvider = result.Actual
 			}
-			return a, tea.Batch(cmds...)
+		}
+		a.pipeline.SetReviewProvider(reviewProvider)
+		a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressCrossModel, codeProvider, reviewProvider))
+	}
+
+	proj := a.project
+	router := a.router
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	a.cancelAI = cancel
+	cmds = append(cmds, func() tea.Msg {
+		defer cancel()
+
+		// Collect files for review (cap at ~32 KB to avoid CLI timeout).
+		const maxReviewBytes = 32 * 1024
+		var fileContents strings.Builder
+		if proj != nil {
+			for _, f := range proj.Files {
+				if f.IsDir {
+					continue
+				}
+				content, err := proj.ReadFile(f.Path)
+				if err != nil {
+					continue
+				}
+				entry := fmt.Sprintf("--- FILE: %s ---\n```\n%s\n```\n\n", f.Path, content)
+				if fileContents.Len()+len(entry) > maxReviewBytes {
+					fmt.Fprintf(&fileContents, "(... %d more files omitted for size)\n", len(proj.Files))
+					break
+				}
+				fileContents.WriteString(entry)
+			}
 		}
 
-		a.progress.SetStepStatus(stepReview, StepRunning)
+		reviewPrompt := buildReviewUserPrompt(fileContents.String())
+		messages := []model.Message{{Role: "user", Content: reviewPrompt}}
 
-		// In Power mode the ensemble handles provider selection internally.
-		// In other modes, pre-determine the review provider for the progress display.
-		if a.router.Mode() == model.ModePower {
-			a.progress.SetStepDetail(stepReview, fmt.Sprintf("Power: %s → ensemble", codeProvider))
-		} else {
-			reviewProvider := a.router.BuildProviderFor(model.PhaseReview)
-			if reviewProvider == codeProvider {
-				result, err := a.router.RouteProvider(reviewProvider, model.PhaseReview, codeProvider)
-				if err == nil {
-					reviewProvider = result.Actual
-				}
-			}
-			a.pipeline.SetReviewProvider(reviewProvider)
-			a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressCrossModel, codeProvider, reviewProvider))
+		// ChatBest: Power mode uses ensemble+judge; others use the single review provider.
+		// Prefer another provider; with one available, review in a separate call.
+		var exclude []string
+		if len(router.Available()) > 1 {
+			exclude = []string{codeProvider}
 		}
-
-		proj := a.project
-		router := a.router
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		a.cancelAI = cancel
-		cmds = append(cmds, func() tea.Msg {
-			defer cancel()
-
-			// Collect files for review (cap at ~32 KB to avoid CLI timeout).
-			const maxReviewBytes = 32 * 1024
-			var fileContents strings.Builder
-			if proj != nil {
-				for _, f := range proj.Files {
-					if f.IsDir {
-						continue
-					}
-					content, err := proj.ReadFile(f.Path)
-					if err != nil {
-						continue
-					}
-					entry := fmt.Sprintf("--- FILE: %s ---\n```\n%s\n```\n\n", f.Path, content)
-					if fileContents.Len()+len(entry) > maxReviewBytes {
-						fmt.Fprintf(&fileContents, "(... %d more files omitted for size)\n", len(proj.Files))
-						break
-					}
-					fileContents.WriteString(entry)
-				}
-			}
-
-			reviewPrompt := buildReviewUserPrompt(fileContents.String())
-			messages := []model.Message{{Role: "user", Content: reviewPrompt}}
-
-			// ChatBest: Power mode uses ensemble+judge; others use the single review provider.
-			// Exclude the code provider so cross-model constraint is always enforced.
-			content, usage, route, err := router.ChatBest(ctx, model.PhaseReview, messages, codeReviewSystemPrompt, codeProvider)
-			provider := providerForUsage(usage, route)
-			if err != nil {
-				return codeReviewMsg{
-					provider:     provider,
-					cost:         usage.Cost,
-					inputTokens:  usage.InputTokens,
-					outputTokens: usage.OutputTokens,
-					err:          err,
-				}
-			}
-
+		content, usage, route, err := router.ChatBest(ctx, model.PhaseReview, messages, codeReviewSystemPrompt, exclude...)
+		provider := providerForUsage(usage, route)
+		if err != nil {
 			return codeReviewMsg{
-				content:      content,
 				provider:     provider,
 				cost:         usage.Cost,
 				inputTokens:  usage.InputTokens,
 				outputTokens: usage.OutputTokens,
-				hasIssues:    !isLGTMResponse(content),
+				err:          err,
 			}
-		})
-	}
+		}
 
+		return codeReviewMsg{
+			content:      content,
+			provider:     provider,
+			cost:         usage.Cost,
+			inputTokens:  usage.InputTokens,
+			outputTokens: usage.OutputTokens,
+			hasIssues:    !isLGTMResponse(content),
+		}
+	})
 	return a, tea.Batch(cmds...)
+}
+
+func (a App) blockBuildReview(reason string) (tea.Model, tea.Cmd) {
+	a.pipeline.SetPhase(engine.PhaseBlocked)
+	a.progress.SetStepStatus(stepReview, StepFailed)
+	a.progress.SetStepDetail(stepReview, reason)
+	a.chat.AddMessage(ChatMessage{Role: "system", Content: "Build acceptance blocked: " + reason})
+	a.state = StateIdle
+	a.chat.SetStreaming(false)
+	a.activity.Reset()
+	return a, nil
 }
 
 // --- Code Review ---
@@ -433,15 +453,8 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 
 	if msg.err != nil {
 		a.recordKnownUsage(msg.provider, msg.cost, msg.inputTokens, msg.outputTokens)
-		// Review error is non-fatal — skip review and continue to deps
-		a.progress.SetStepStatus(stepReview, StepDone)
-		a.progress.SetStepDetail(stepReview, fmt.Sprintf("skipped: %s", msg.err))
-		a.chat.AddMessage(ChatMessage{
-			Role:    "system",
-			Content: fmt.Sprintf("Review skipped: %s", msg.err),
-		})
 		a.pipeline.OnReviewComplete(engine.ReviewError)
-		return a.startDepsPhase()
+		return a.blockBuildReview(fmt.Sprintf("Review failed: %s", msg.err))
 	}
 
 	// Track cost (session panel + monthly budget ledger).
@@ -471,11 +484,8 @@ func (a App) handleCodeReview(msg codeReviewMsg) (tea.Model, tea.Cmd) {
 
 	result := engine.ParseFilesBestEffort(msg.content)
 	if len(result.Files) == 0 {
-		// Review had comments but no file fixes — treat as LGTM
-		a.progress.SetStepStatus(stepReview, StepDone)
-		a.progress.SetStepDetail(stepReview, fmt.Sprintf(m.ProgressReviewDone, msg.provider))
 		a.pipeline.OnReviewComplete(engine.ReviewNoFixFiles)
-		return a.startDepsPhase()
+		return a.blockBuildReview("Review reported unresolved issues without applicable fixes")
 	}
 
 	a.pipeline.OnReviewComplete(engine.ReviewHasIssues)
@@ -946,6 +956,8 @@ func (a App) handleAutoFix(msg autoFixMsg) (tea.Model, tea.Cmd) {
 				outputTokens:  selection.usage.OutputTokens,
 				attempt:       attempt,
 				verified:      selection.verified,
+				files:         selection.files,
+				digest:        selection.digest,
 				selectionNote: selection.selectionNote,
 			}
 		}
@@ -1020,6 +1032,9 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 
 	// Parse fix files
 	result := engine.ParseFilesBestEffort(msg.content)
+	if len(msg.files) > 0 {
+		result.Files = msg.files
+	}
 	pipelineAction := a.pipeline.OnAutoFixResponse(len(result.Files) > 0, msg.attempt)
 	if pipelineAction.Kind == engine.ActionMaxRetriesReached {
 		a.progress.SetStepStatus(fixStepIdx, StepFailed)
@@ -1038,7 +1053,8 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 	}
 
 	// Ask for confirmation before writing fix files
-	a.pendingWriteVerified = msg.verified
+	a.pendingWriteDigest = msg.digest
+	a.pendingWriteVerified = msg.verified && engine.VerifiedFilesMatch(result.Files, msg.digest)
 	return a, func() tea.Msg {
 		return filesExtractedMsg{files: result.Files, phase: pendingPhaseFix}
 	}

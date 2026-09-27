@@ -1,0 +1,13 @@
+创建一个实时聊天室:
+- 前端: React + Tailwind CSS
+- 后端: FastAPI + WebSocket
+- 功能:
+  - 输入昵称即可进入 (不需要注册)
+  - 实时消息推送
+  - 显示在线用户列表
+  - 用户加入/退出通知
+  - 消息时间戳
+  - 自动滚动到最新消息
+- 前端和后端各有 package.json / requirements.txt
+- 有 README 说明如何启动
+- 后端有基本测试

@@ -1,0 +1,11 @@
+创建一个 Markdown 博客生成器 CLI 工具:
+- Python 3, 用 Click 做命令行
+- 命令: build (编译), serve (本地预览), new (创建新文章)
+- 读取 posts/ 目录的 .md 文件
+- 生成 HTML 到 dist/ 目录
+- 支持 YAML front matter (title, date, tags)
+- 首页文章列表按时间倒序
+- 文章页有上一篇/下一篇导航
+- 内置 CSS 主题 (不依赖外部 CDN)
+- 有 requirements.txt 和 setup.py
+- 有单元测试

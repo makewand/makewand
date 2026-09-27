@@ -161,10 +161,10 @@ func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*Exec
 
 // verificationPlanAllowsNetwork reports whether a plan may keep network access
 // inside the sandbox. Dependency installs keep network access to reach package
-// registries. Test runs also keep network access to ensure the loopback
-// interface is available for local mock servers and IPC.
+// registries. Bubblewrap brings up loopback in the isolated network namespace,
+// so local mock servers work without exposing the host network.
 func verificationPlanAllowsNetwork(plan ExecPlan) bool {
-	return plan.Kind == "deps" || plan.Kind == "tests"
+	return plan.Kind == "deps"
 }
 
 func (p *Project) execVerification(ctx context.Context, command string, args []string, allowNetwork bool) (*ExecResult, error) {

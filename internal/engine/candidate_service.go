@@ -63,8 +63,8 @@ const (
 const maxVerifiedCandidateStrength = 2
 
 // autopilotMinCandidateStrength is the acceptance floor for automatic
-// application: real (baseline) tests must have run and passed. Candidates that
-// merely compile or install dependencies (Strength 1) require user approval.
+// application: an independent trusted acceptance driver must attest the result.
+// Candidate-controlled local test output is Strength 1 and requires approval.
 const autopilotMinCandidateStrength = 2
 
 type CandidateProgressFunc func(provider string, stage CandidateProgressStage)

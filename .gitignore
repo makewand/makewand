@@ -38,7 +38,15 @@ eval_claude_prompt.txt
 scratch/
 
 # Local test/work directories
-/benchmarks/
+/benchmarks/*
+!/benchmarks/README.md
+!/benchmarks/run.sh
+!/benchmarks/runner.py
+!/benchmarks/test_runner.py
+!/benchmarks/arms.example.json
+!/benchmarks/fixtures/
+!/benchmarks/prompts/
+/benchmarks/results/
 /blog-project/
 /notes-api/
 /password-strength-checker/

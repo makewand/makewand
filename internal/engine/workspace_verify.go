@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
@@ -74,6 +73,8 @@ type CandidateVerification struct {
 	TestsPlan         *ExecPlan
 	TestsResult       *ExecResult
 	TestsError        string
+	IntegrityError    string          // input tree changed during verification
+	EvidenceLimit     string          // successful candidate-controlled output is not an independent attestation
 	VerifiedFiles     []ExtractedFile // exact files verified in the tree
 	VerifiedContent   string          // rendered payload of verified files
 	VerifiedDigest    string          // sha256 hex digest of verified files
@@ -82,7 +83,11 @@ type CandidateVerification struct {
 // WriteFiles writes a batch of extracted files into the project.
 func (p *Project) WriteFiles(files []ExtractedFile) error {
 	for _, f := range files {
-		if err := p.WriteFile(f.Path, f.Content); err != nil {
+		var mode *fs.FileMode
+		if f.ModeKnown {
+			mode = &f.Mode
+		}
+		if err := p.writeFileMode(f.Path, f.Content, mode); err != nil {
 			return fmt.Errorf("write %s: %w", f.Path, err)
 		}
 	}
@@ -446,7 +451,7 @@ func (p *Project) EvaluateCandidateFiles(ctx context.Context, files []ExtractedF
 		return CandidateVerification{}, err
 	}
 	// A candidate can edit package.json to weaken scripts.test (e.g. set it to
-	// "true") and earn a Strength-2 pass. Restore the baseline test script in the
+	// "true") and skip the baseline checks. Restore the baseline test script in the
 	// clone - like *_test.go files are restored - so the trusted baseline command
 	// is what actually runs.
 	if restoredScript, err := p.restoreBaselineNpmTestScript(clone); err != nil {
@@ -459,31 +464,38 @@ func (p *Project) EvaluateCandidateFiles(ctx context.Context, files []ExtractedF
 		return CandidateVerification{}, err
 	}
 
-	report := clone.verifyRestrictedWorkspace(ctx, applied, p.baselineTrustedTests())
-	report.RestoredTests = restored
-
-	// Record exact verified files from clone
-	verifiedFiles := make([]ExtractedFile, 0, len(applied))
-	seen := make(map[string]bool, len(applied))
-	for _, f := range applied {
-		if seen[f.Path] {
-			continue
-		}
-		seen[f.Path] = true
-		content, err := clone.ReadFile(f.Path)
-		if err == nil {
-			verifiedFiles = append(verifiedFiles, ExtractedFile{Path: f.Path, Content: content})
-		} else {
-			verifiedFiles = append(verifiedFiles, f)
-		}
+	// Resolve the execution contract from the trusted baseline before any
+	// candidate-controlled metadata can choose a different runner.
+	contract, err := p.baselineVerificationContract()
+	if err != nil {
+		return CandidateVerification{}, err
 	}
-	report.VerifiedFiles = verifiedFiles
-	report.VerifiedContent = RenderExtractedFiles(verifiedFiles)
-	report.VerifiedDigest = calculateFilesDigest(verifiedFiles)
-
-	// F02: If candidate introduced a new TestMain, cap Strength at 1 (cannot earn Strength 2)
-	if introducesNewTestMain(p, files) && report.Strength > 1 {
-		report.Strength = 1
+	sealed, err := snapshotCandidateFiles(clone, applied)
+	if err != nil {
+		return CandidateVerification{}, err
+	}
+	before, err := workspaceInputDigest(clone.Path)
+	if err != nil {
+		return CandidateVerification{}, err
+	}
+	report := clone.verifyRestrictedWorkspace(ctx, sealed, contract)
+	report.RestoredTests = restored
+	after, err := workspaceInputDigest(clone.Path)
+	afterFiles, filesErr := snapshotCandidateFiles(clone, sealed)
+	if err != nil || filesErr != nil || before != after || !extractedFilesEqual(sealed, afterFiles) {
+		report.Passed = false
+		report.Strength = 0
+		report.IntegrityError = "verification changed its input files or permissions; review the generated changes and verify again"
+		if err != nil {
+			report.IntegrityError += ": " + err.Error()
+		}
+		return report, nil
+	}
+	// Seal the pre-execution bytes, never the mutable post-test workspace.
+	if report.Passed {
+		report.VerifiedFiles = sealed
+		report.VerifiedContent = RenderExtractedFiles(sealed)
+		report.VerifiedDigest = calculateFilesDigest(sealed)
 	}
 
 	return report, nil
@@ -496,50 +508,12 @@ func calculateFilesDigest(files []ExtractedFile) string {
 		return sortedFiles[i].Path < sortedFiles[j].Path
 	})
 	hasher := sha256.New()
+	encoder := json.NewEncoder(hasher)
 	for _, f := range sortedFiles {
-		hasher.Write([]byte(f.Path))
-		hasher.Write([]byte{0})
-		hasher.Write([]byte(f.Content))
-		hasher.Write([]byte{0})
+		_ = encoder.Encode(f)
 	}
+
 	return hex.EncodeToString(hasher.Sum(nil))
-}
-
-func introducesNewTestMain(baseline *Project, files []ExtractedFile) bool {
-	for _, f := range files {
-		if !strings.HasSuffix(f.Path, ".go") {
-			continue
-		}
-		if !hasTestMainFunction(f.Path, f.Content) {
-			continue
-		}
-		if baseline == nil {
-			return true
-		}
-		baseContent, err := baseline.ReadFile(f.Path)
-		if err != nil {
-			return true
-		}
-		if !hasTestMainFunction(f.Path, baseContent) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasTestMainFunction(path, content string) bool {
-	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, path, content, 0)
-	if err != nil {
-		return strings.Contains(content, "TestMain(")
-	}
-	for _, decl := range node.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Name != nil && fn.Name.Name == "TestMain" {
-			return true
-		}
-	}
-	return false
 }
 
 // splitBaselineTestOverwrites partitions candidate files into the set that may
@@ -582,7 +556,8 @@ func isBaselineTestFile(path string) bool {
 }
 
 // baselineTrustedTests reports whether the baseline project defines tests of
-// its own that verification may trust for Strength >= 2. Config-driven runners
+// its own. This describes the test plan, not a trusted acceptance attestation.
+// Config-driven runners
 // (npm test script, pytest.ini) are explicit baseline verification commands;
 // file-driven runners like "go test" additionally require baseline test files,
 // otherwise a candidate could raise Strength just by shipping its own tests.
@@ -885,13 +860,19 @@ func (p *Project) ChangedFilesAgainstWithDeletions(base *Project) ([]ExtractedFi
 		if err != nil {
 			return nil, nil, err
 		}
+		info, statErr := os.Lstat(filepath.Join(p.Path, entry.Path))
+		if statErr != nil {
+			return nil, nil, statErr
+		}
+		baseInfo, baseStatErr := os.Lstat(filepath.Join(base.Path, entry.Path))
 		baseContent, err := base.ReadFile(entry.Path)
-		if err == nil && baseContent == content {
+		if err == nil && baseStatErr == nil && baseContent == content && baseInfo.Mode().Perm() == info.Mode().Perm() {
 			continue
 		}
 		files = append(files, ExtractedFile{
 			Path:    entry.Path,
 			Content: content,
+			Mode:    info.Mode().Perm(), ModeKnown: true,
 		})
 	}
 
@@ -921,17 +902,17 @@ func mergeCandidateFiles(reported, cloneDiff []ExtractedFile) []ExtractedFile {
 	if len(cloneDiff) == 0 {
 		return reported
 	}
-	merged := make(map[string]string, len(reported)+len(cloneDiff))
+	merged := make(map[string]ExtractedFile, len(reported)+len(cloneDiff))
 	for _, f := range reported {
-		merged[f.Path] = f.Content
+		merged[f.Path] = f
 	}
 	for _, f := range cloneDiff {
-		merged[f.Path] = f.Content
+		merged[f.Path] = f
 	}
 
 	out := make([]ExtractedFile, 0, len(merged))
-	for path, content := range merged {
-		out = append(out, ExtractedFile{Path: path, Content: content})
+	for _, file := range merged {
+		out = append(out, file)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Path < out[j].Path
@@ -942,10 +923,10 @@ func mergeCandidateFiles(reported, cloneDiff []ExtractedFile) []ExtractedFile {
 // extractedFilesEqual compares two file sets by path and content, ignoring
 // order and duplicate paths (last occurrence wins, matching write semantics).
 func extractedFilesEqual(a, b []ExtractedFile) bool {
-	toMap := func(files []ExtractedFile) map[string]string {
-		m := make(map[string]string, len(files))
+	toMap := func(files []ExtractedFile) map[string]ExtractedFile {
+		m := make(map[string]ExtractedFile, len(files))
 		for _, f := range files {
-			m[f.Path] = f.Content
+			m[f.Path] = f
 		}
 		return m
 	}
@@ -963,11 +944,26 @@ func extractedFilesEqual(a, b []ExtractedFile) bool {
 
 // VerifyRestrictedWorkspace runs layered candidate verification in-project.
 func (p *Project) VerifyRestrictedWorkspace(ctx context.Context, files []ExtractedFile) CandidateVerification {
-	return p.verifyRestrictedWorkspace(ctx, files, p.baselineTrustedTests())
+	contract, err := p.baselineVerificationContract()
+	if err != nil {
+		return CandidateVerification{TestsError: err.Error()}
+	}
+	before, err := workspaceInputDigest(p.Path)
+	if err != nil {
+		return CandidateVerification{IntegrityError: err.Error()}
+	}
+	report := p.verifyRestrictedWorkspace(ctx, files, contract)
+	after, err := workspaceInputDigest(p.Path)
+	if err != nil || before != after {
+		report.Passed = false
+		report.Strength = 0
+		report.IntegrityError = "verification changed its input files or permissions; verify the new state again"
+	}
+	return report
 }
 
-func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []ExtractedFile, baselineHasTests bool) CandidateVerification {
-	report := CandidateVerification{BaselineTests: baselineHasTests}
+func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []ExtractedFile, contract verificationContract) CandidateVerification {
+	report := CandidateVerification{BaselineTests: contract.hasTests}
 
 	if !p.runInlineQuickChecks(files, &report) {
 		return report
@@ -987,13 +983,9 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		return report
 	}
 
-	depsPlan, depsErr := p.DetectInstallPlan()
+	depsPlan := contract.deps
 	if depsPlan != nil {
 		report.DepsPlan = depsPlan
-	}
-	if depsErr != nil {
-		report.DepsError = depsErr.Error()
-		return report
 	}
 	if depsPlan != nil && shouldRunDependencyPlan(*depsPlan, files) {
 		result, err := p.RunVerificationPlan(ctx, *depsPlan)
@@ -1012,32 +1004,18 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		report.DepsSkipped = true
 	}
 
-	testsPlan, testsErr := p.DetectTestPlan()
+	testsPlan := contract.tests
 	if testsPlan != nil {
 		report.TestsPlan = testsPlan
 		report.HasTests = true
 	}
-	if testsErr != nil {
-		report.TestsError = testsErr.Error()
-		return report
-	}
 	if testsPlan != nil {
 		runPlan := *testsPlan
-		if runPlan.Command == "go" {
-			hasV := false
-			for _, a := range runPlan.Args {
-				if a == "-v" {
-					hasV = true
-					break
-				}
-			}
-			if !hasV && len(runPlan.Args) > 0 && runPlan.Args[0] == "test" {
-				newArgs := make([]string, 0, len(runPlan.Args)+1)
-				newArgs = append(newArgs, "test", "-v")
-				newArgs = append(newArgs, runPlan.Args[1:]...)
-				runPlan.Args = newArgs
-			}
+		if runPlan.Command == "go" && len(runPlan.Args) > 0 && runPlan.Args[0] == "test" {
+			// Disable cached results and require the tool's structured event stream.
+			runPlan.Args = append([]string{"test", "-json", "-count=1"}, runPlan.Args[1:]...)
 		}
+
 		result, err := p.RunVerificationPlan(ctx, runPlan)
 		if result != nil {
 			report.TestsResult = result
@@ -1052,14 +1030,18 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		}
 		report.Passed = true
 		report.NoTestsRan = detectNoTestsRun(runPlan, result)
-		// Strength 2 requires baseline-trusted tests to have actually run and
-		// passed. A candidate that merely compiles, or whose only tests are the
-		// ones it wrote itself, caps at Strength 1.
-		if !report.NoTestsRan && baselineHasTests && !introducesNewTestMain(nil, files) {
-			report.Strength = 2
-		} else {
-			report.Strength = 1
+		if runPlan.Command == "go" && len(contract.goTests) > 0 && !goBaselineTestsPassed(contract.goTests, result) {
+			report.Passed = false
+			report.NoTestsRan = true
+			report.TestsError = "test output did not confirm every expected baseline Go test"
+			return report
 		}
+		// Test code and the implementation share a process. Even structured output
+		// can be forged by that process; it cannot authorize automatic application.
+		// Strength 2 is reserved for an independent trusted acceptance driver.
+		report.Strength = 1
+		report.EvidenceLimit = "local checks passed; candidate-controlled test output requires human approval"
+
 		return report
 	}
 
@@ -1116,13 +1098,11 @@ func detectNoTestsRun(plan ExecPlan, result *ExecResult) bool {
 }
 
 func goTestOutputRanTests(plan ExecPlan, stdout string) bool {
-	isVerbose := slices.Contains(plan.Args, "-v") || strings.Contains(stdout, "=== RUN")
-	if isVerbose {
-		return strings.Contains(stdout, "--- PASS:")
+	if !slices.Contains(plan.Args, "-json") {
+		return false
 	}
-	for _, line := range strings.Split(stdout, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) > 0 && fields[0] == "ok" && !strings.Contains(line, "no tests to run") {
+	for _, event := range parseGoTestEvents(stdout) {
+		if event.Action == "pass" && event.Test != "" {
 			return true
 		}
 	}

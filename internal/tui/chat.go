@@ -547,12 +547,12 @@ func (c ChatPanel) Update(msg tea.Msg) (ChatPanel, tea.Cmd) {
 		return c, nil
 
 	case tea.MouseMsg:
-		switch msg.Type {
-		case tea.MouseWheelUp:
-			c.viewport.LineUp(3)
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			c.viewport.ScrollUp(3)
 			return c, nil
-		case tea.MouseWheelDown:
-			c.viewport.LineDown(3)
+		case tea.MouseButtonWheelDown:
+			c.viewport.ScrollDown(3)
 			return c, nil
 		default:
 			var vpCmd tea.Cmd
@@ -570,11 +570,11 @@ func (c ChatPanel) Update(msg tea.Msg) (ChatPanel, tea.Cmd) {
 			return c, nil
 		}
 		if msg.Type == tea.KeyPgUp {
-			c.viewport.HalfViewUp()
+			c.viewport.HalfPageUp()
 			return c, nil
 		}
 		if msg.Type == tea.KeyPgDown {
-			c.viewport.HalfViewDown()
+			c.viewport.HalfPageDown()
 			return c, nil
 		}
 	}

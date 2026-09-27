@@ -160,65 +160,24 @@ func tryDelegateToPythonOrchestrator(args []string) bool {
 	}
 
 	exePath, _ := os.Executable()
-	exeDir := filepath.Dir(exePath)
-	repoRoot := filepath.Dir(exeDir)
-
-	var scriptCandidates []string
-	if envHome := os.Getenv("MAKEWAND_HOME"); envHome != "" {
-		scriptCandidates = append(scriptCandidates, filepath.Join(envHome, "bin", "makewand"))
+	if realExe, err := filepath.EvalSymlinks(exePath); err == nil {
+		exePath = realExe
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		scriptCandidates = append(scriptCandidates,
-			filepath.Join(home, ".local", "bin", "makewand"),
-			filepath.Join(home, ".local", "share", "makewand", "bin", "makewand"),
-		)
-	}
-	// Beside current binary (if not self)
-	scriptCandidates = append(scriptCandidates, filepath.Join(exeDir, "makewand"))
-
-	// Check if running from legitimate makewand source checkout
-	if fi, err := os.Stat(filepath.Join(repoRoot, "makewand", "__init__.py")); err == nil && !fi.IsDir() {
-		scriptCandidates = append(scriptCandidates, filepath.Join(repoRoot, "bin", "makewand"))
-	}
-
-	// Global system paths
-	scriptCandidates = append(scriptCandidates,
-		"/usr/local/bin/makewand",
-		"/usr/local/share/makewand/bin/makewand",
-		"/usr/bin/makewand",
-	)
-
-	var targetScript string
-	for _, sc := range scriptCandidates {
-		realSc, err := filepath.EvalSymlinks(sc)
-		if err != nil {
-			realSc = sc
-		}
-		realExe, err := filepath.EvalSymlinks(exePath)
-		if err != nil {
-			realExe = exePath
-		}
-		if realSc == realExe {
-			continue
-		}
-		if fi, err := os.Stat(sc); err == nil && !fi.IsDir() {
-			targetScript = sc
-			break
-		}
-	}
-
+	home, _ := os.UserHomeDir()
+	launcher := findPythonLauncher(exePath, os.Getenv("MAKEWAND_HOME"), home)
 	var cmd *exec.Cmd
-	if targetScript != "" {
-		cmd = exec.Command(targetScript, args...)
+	if launcher != "" {
+		// Isolated mode ignores cwd, PYTHONPATH and user site startup hooks. The
+		// installed launcher inserts its own fixed package root explicitly.
+		//nolint:gosec // G702: executable is a fixed Python name resolved from the user's PATH; launcher is a verified installation path and arguments never pass through a shell.
+		cmd = exec.Command(pyBin, append([]string{"-I", launcher}, args...)...)
 	} else {
-		// Verify if makewand package is installed in python's system/user site-packages.
-		// Note: We strictly pass "-P" (Python Safe Path) to prevent loading arbitrary
-		// modules from untrusted current working directory.
-		checkCmd := exec.Command(pyBin, "-P", "-c", "import makewand")
+		checkCmd := exec.Command(pyBin, "-I", "-c", "import makewand")
 		if err := checkCmd.Run(); err == nil {
-			cmd = exec.Command(pyBin, append([]string{"-P", "-m", "makewand"}, args...)...)
+			//nolint:gosec // G702: fixed interpreter/module, isolated import path, and literal argv forwarding without shell evaluation.
+			cmd = exec.Command(pyBin, append([]string{"-I", "-m", "makewand"}, args...)...)
 		} else {
-			fmt.Fprintf(os.Stderr, "Error: makewand orchestrator (Python engine) could not be located in trusted system paths (~/.local/bin/makewand, ~/.local/share/makewand, or python site-packages).\nPlease run scripts/install.sh or set MAKEWAND_HOME.\n")
+			fmt.Fprintln(os.Stderr, "Error: makewand Python engine could not be located. Keep the release lib/ directory beside the binary, run scripts/install.sh, or set MAKEWAND_HOME to a complete installation.")
 			os.Exit(1)
 		}
 	}
@@ -234,6 +193,38 @@ func tryDelegateToPythonOrchestrator(args []string) bool {
 	}
 	os.Exit(0)
 	return true
+}
+
+// findPythonLauncher uses installation roots only, never the working directory
+// or an arbitrary executable named makewand on PATH.
+func findPythonLauncher(exePath, explicitHome, userHome string) string {
+	exeDir := filepath.Dir(exePath)
+	roots := []string{}
+	if explicitHome != "" {
+		if absolute, err := filepath.Abs(explicitHome); err == nil {
+			roots = append(roots, absolute, filepath.Join(absolute, "lib", "makewand", "python"))
+		}
+	}
+	roots = append(roots,
+		filepath.Join(exeDir, "lib", "makewand", "python"), // release / Homebrew libexec
+		filepath.Join(filepath.Dir(exeDir), "lib", "makewand", "python"),
+		filepath.Dir(exeDir), // source checkout bin/ or build/
+	)
+	if userHome != "" {
+		roots = append(roots, filepath.Join(userHome, ".local", "share", "makewand"), filepath.Join(userHome, ".makewand_app"))
+	}
+	roots = append(roots, "/usr/local/share/makewand", "/usr/share/makewand")
+	for _, root := range roots {
+		launcher := filepath.Join(root, "bin", "makewand")
+		packageFile := filepath.Join(root, "makewand", "__init__.py")
+		if info, err := os.Stat(packageFile); err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if info, err := os.Stat(launcher); err == nil && info.Mode().IsRegular() {
+			return launcher
+		}
+	}
+	return ""
 }
 
 func main() {
@@ -385,7 +376,8 @@ func newCmd() *cobra.Command {
 				fmt.Println("No AI models or remote backend found. Install a CLI tool, set an API key, or configure a remote makewand server:")
 				fmt.Println()
 				fmt.Println("  Option 1: Install Claude Code, Gemini CLI, or Codex CLI (subscription)")
-				fmt.Println("  Option 2: Set API keys:")
+				fmt.Println("  Option 2: Explicitly enable paid API use and set API keys:")
+				fmt.Println("    export MAKEWAND_API_POLICY=allow_paid")
 				fmt.Println("    export ANTHROPIC_API_KEY=sk-ant-...")
 				fmt.Println("    export GEMINI_API_KEY=AI...")
 				fmt.Println("  Option 3: Use a remote backend:")
@@ -568,6 +560,7 @@ execution acknowledgment required before that opt-in takes effect.`,
 			}
 
 			// Show API key status
+			fmt.Printf("API policy: %s (keys alone do not enable paid API use)\n", cfg.EffectiveAPIPolicy())
 			fmt.Println("API keys:")
 			if cfg.ClaudeAPIKey != "" {
 				fmt.Println("  [x] Claude API key configured")
@@ -607,6 +600,7 @@ execution acknowledgment required before that opt-in takes effect.`,
 			} else {
 				fmt.Println()
 				fmt.Println("No subscription CLIs detected. To use API keys:")
+				fmt.Println("  export MAKEWAND_API_POLICY=allow_paid")
 				fmt.Println("  export ANTHROPIC_API_KEY=sk-ant-...")
 				fmt.Println("  export GEMINI_API_KEY=AI...")
 				fmt.Println("  export OPENAI_API_KEY=sk-...")

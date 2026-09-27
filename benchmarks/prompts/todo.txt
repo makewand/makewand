@@ -1,0 +1,8 @@
+创建一个待办事项应用:
+- React + Tailwind CSS
+- 添加、完成、删除任务
+- 任务分类: 工作 / 生活 / 学习
+- 数据保存到 localStorage
+- 统计面板显示完成率
+- 亮色/暗色切换
+- 有 package.json 和测试

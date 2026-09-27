@@ -38,11 +38,23 @@ jobs:
           MAKEWAND_REQUIRE_BWRAP: "1"
         run: go test ./internal/engine -run '^TestEvaluateCandidateFiles_LiveBwrapIsolation$' -count=1 -v
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python, dispatch and installer tests
+        run: |
+          python3 -I scripts/test_python.py
+          bash dispatch/test.sh
+          python3 -I scripts/test_installation.py
+          python3 -I benchmarks/test_runner.py
+
       - name: Run tests
         run: bash ./scripts/test_gate.sh
 
       - name: Run vet
-        run: go vet ./cmd/... ./internal/... ./router
+        run: go vet ./...
 
       - name: Run govulncheck
         # Gate the release independently of CI: a tag build must re-prove there
@@ -54,9 +66,28 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           "$(go env GOPATH)/bin/govulncheck" ./...
 
+  package-smoke:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Execute unpacked native release without checkout fallback
+        shell: bash
+        run: |
+          python3 -m unittest discover -s tests -p test_filelock.py -v
+          python3 -I scripts/test_installation.py InstallationTests.test_release_bundle_from_clean_extraction
+
   release:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, package-smoke]
     env:
       HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
       SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
@@ -77,7 +108,6 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
-          VERSION_NO_V="${VERSION#v}"
           mkdir -p dist
 
           build_one() {
@@ -96,6 +126,8 @@ jobs:
             CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
               go build -trimpath -ldflags "-s -w -X github.com/makewand/makewand/internal/buildinfo.Version=${VERSION} -X github.com/makewand/makewand/internal/buildinfo.Commit=${GITHUB_SHA:0:7}" \
               -o "${outdir}/${bin}" ./cmd/makewand
+
+            python3 -I scripts/stage_python_engine.py "${outdir}" "${VERSION}"
 
             if [ "$goos" = "windows" ]; then
               (cd dist && zip -q -r "${base}.zip" "${base}")

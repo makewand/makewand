@@ -7,7 +7,7 @@ Automatically retrieves relevant hints for new tasks to avoid repeated pitfalls.
 import os
 import time
 import json
-import fcntl
+from makewand import filelock as fcntl
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional

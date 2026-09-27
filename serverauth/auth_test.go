@@ -430,4 +430,3 @@ func TestGrant_ReserveCostAt_InFlightAndRefund(t *testing.T) {
 		t.Fatalf("ReserveCostAt(0.2) after spent 0.9 = %v, want ErrDailyCostExceeded", err)
 	}
 }
-

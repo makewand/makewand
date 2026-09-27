@@ -105,8 +105,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		user.PasswordHash,
 		user.Salt,
 		user.Role,
-		user.CreatedAt.Format(time.RFC3339),
-		user.UpdatedAt.Format(time.RFC3339),
+		user.CreatedAt.Format(time.RFC3339Nano),
+		user.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(active),
 	)
 	if err != nil {
@@ -167,7 +167,7 @@ func (s *SQLiteUserStore) SetUserActive(userID string, active bool) (*User, erro
 		return nil, fmt.Errorf("sqlite user store is unavailable")
 	}
 	now := time.Now().UTC()
-	result, err := s.db.Exec(`UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?`, boolToInt(active), now.Format(time.RFC3339), strings.TrimSpace(userID))
+	result, err := s.db.Exec(`UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?`, boolToInt(active), now.Format(time.RFC3339Nano), strings.TrimSpace(userID))
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +197,7 @@ func (s *SQLiteUserStore) SetUserRole(userID, role string) (*User, error) {
 		return nil, err
 	}
 	now := time.Now().UTC()
-	result, err := s.db.Exec(`UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, role, now.Format(time.RFC3339), strings.TrimSpace(userID))
+	result, err := s.db.Exec(`UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, role, now.Format(time.RFC3339Nano), strings.TrimSpace(userID))
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +224,7 @@ func (s *SQLiteUserStore) SetUserPassword(userID, password string) (*User, error
 	result, err := s.db.Exec(`UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE id = ?`,
 		passwordHash,
 		salt,
-		now.Format(time.RFC3339),
+		now.Format(time.RFC3339Nano),
 		strings.TrimSpace(userID),
 	)
 	if err != nil {

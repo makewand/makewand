@@ -12,8 +12,14 @@ mkdir -p "$GOCACHE"
 echo "[prelaunch] test gate"
 bash ./scripts/test_gate.sh
 
-echo "[prelaunch] go vet ./cmd/... ./internal/... ./router"
-go vet ./cmd/... ./internal/... ./router
+echo "[prelaunch] Python, dispatch, installation contracts"
+python3 -I scripts/test_python.py
+bash dispatch/test.sh
+python3 -I scripts/test_installation.py
+python3 -I benchmarks/test_runner.py
+
+echo "[prelaunch] go vet ./..."
+go vet ./...
 
 echo "[prelaunch] go build ./cmd/makewand"
 mkdir -p build

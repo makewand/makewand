@@ -235,6 +235,7 @@ func (a App) handleDenyCommand() (tea.Model, tea.Cmd) {
 		a.clearPendingApproval()
 		a.pendingFiles = nil
 		a.pendingWriteVerified = false
+		a.pendingWriteDigest = ""
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
 			Content: i18n.Msg().FileCancelled,

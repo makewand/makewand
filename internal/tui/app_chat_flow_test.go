@@ -323,8 +323,8 @@ func TestSubmitChatInput_AutopilotUsesCandidateSelectionForCodeTasks(t *testing.
 	if resp.err != nil {
 		t.Fatalf("aiResponseMsg.err = %v", resp.err)
 	}
-	if !resp.verified {
-		t.Fatal("aiResponseMsg.verified = false, want true")
+	if resp.verified {
+		t.Fatal("candidate-controlled checks must require approval")
 	}
 	if resp.provider != "bravo" {
 		t.Fatalf("aiResponseMsg.provider = %q, want %q", resp.provider, "bravo")
@@ -830,4 +830,3 @@ func TestSubmitChatInput_IdentityQueryHandledLocally(t *testing.T) {
 		t.Fatalf("unexpected assistant reply: %v", last)
 	}
 }
-

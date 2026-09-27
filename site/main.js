@@ -30,7 +30,7 @@ const terminalScenarios = {
 `,
 
   review: `
-<span class="term-prompt">user@dev:~/project$</span> <span class="term-cmd">makewand review --provider codex --target src/payment_gateway.py</span>
+<span class="term-prompt">user@dev:~/project$</span> <span class="term-cmd">makewand review --json</span>
 <span class="term-info">🔍 [Makewand Blind Audit] Spawning isolated worktree for zero-bias security review...</span>
 <span class="term-sub">Running static AST analysis & edge-case fuzzing with gpt-6-astra...</span>
 <span class="term-sub">--------------------------------------------------------------------------------</span>
@@ -43,11 +43,11 @@ const terminalScenarios = {
   File: <span class="term-sub">src/payment_gateway.py:289</span>
   Detail: Exponential backoff without jitter may trigger thundering herd on gateway recovery.
 
-<span class="term-info">💡 Auto-Fix Recommendation: Run 'makewand apply --fix' to auto-patch all 2 findings.</span>
+<span class="term-info">💡 Auto-Fix Recommendation: Review the findings, then run makewand run with a repair task.</span>
 `,
 
   race: `
-<span class="term-prompt">user@dev:~/project$</span> <span class="term-cmd">makewand race "Implement parallel zarr tensor slice loader" --models claude,codex</span>
+<span class="term-prompt">user@dev:~/project$</span> <span class="term-cmd">makewand race "Implement parallel zarr tensor slice loader"</span>
 <span class="term-info">🏁 [Makewand Race Engine] Dual-Model Concurrent Speed & Quality Race</span>
 <span class="term-sub">Creating 2 parallel sandboxed worktrees...</span>
   ↳ Worktree A: <span class="term-sub">.makewand_sandbox/race_claude</span>

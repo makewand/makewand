@@ -69,6 +69,7 @@ class Makewand < Formula
   homepage "https://github.com/${REPO}"
   version "${VERSION}"
   license "MIT"
+  depends_on "python@3.12"
 
   on_macos do
     if Hardware::CPU.arm?
@@ -91,11 +92,14 @@ class Makewand < Formula
   end
 
   def install
-    bin.install Dir["*/makewand"].first
+    bundle = File.exist?("makewand") ? Pathname.pwd : Pathname(Dir["*/makewand"].first).dirname
+    libexec.install bundle/"makewand", bundle/"lib"
+    (bin/"makewand").write_env_script libexec/"makewand", PATH: "#{Formula["python@3.12"].opt_libexec}/bin:#{ENV["PATH"]}"
   end
 
   test do
     assert_match "makewand version", shell_output("#{bin}/makewand --version")
+    assert_match "usage:", shell_output("#{bin}/makewand run --help")
   end
 end
 EOF
@@ -106,6 +110,7 @@ cat >"${SCOOP_OUT}" <<EOF
   "description": "AI coding assistant CLI",
   "homepage": "https://github.com/${REPO}",
   "license": "MIT",
+  "depends": "main/python",
   "architecture": {
     "64bit": {
       "url": "${RELEASE_BASE_URL}/${WINDOWS_AMD64}",

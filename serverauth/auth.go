@@ -60,22 +60,23 @@ type Config struct {
 
 // TokenRule defines one remote client token and its permissions.
 type TokenRule struct {
-	ID                 string    `json:"id,omitempty"`
-	Token              string    `json:"token"`
-	Description        string    `json:"description,omitempty"`
-	UserID             string    `json:"user_id,omitempty"`
-	OrganizationID     string    `json:"organization_id,omitempty"`
-	ProjectID          string    `json:"project_id,omitempty"`
-	Scopes             []string  `json:"scopes"`
-	WorkspacePrefixes  []string  `json:"workspace_prefixes,omitempty"`
-	AllowedProviders   []string  `json:"allowed_providers,omitempty"`
-	AllowedModes       []string  `json:"allowed_modes,omitempty"`
-	ExpiresAt          time.Time `json:"expires_at,omitempty"`
-	Revoked            bool      `json:"revoked,omitempty"`
-	MaxRequestsPerHour int       `json:"max_requests_per_hour,omitempty"`
-	MaxRequestsPerDay  int       `json:"max_requests_per_day,omitempty"`
-	MaxCostUSDPerDay   float64   `json:"max_cost_usd_per_day,omitempty"`
-	MaxCostUSDPerMonth float64   `json:"max_cost_usd_per_month,omitempty"`
+	AuthorizationVersion string    `json:"authorization_version,omitempty"`
+	ID                   string    `json:"id,omitempty"`
+	Token                string    `json:"token"`
+	Description          string    `json:"description,omitempty"`
+	UserID               string    `json:"user_id,omitempty"`
+	OrganizationID       string    `json:"organization_id,omitempty"`
+	ProjectID            string    `json:"project_id,omitempty"`
+	Scopes               []string  `json:"scopes"`
+	WorkspacePrefixes    []string  `json:"workspace_prefixes,omitempty"`
+	AllowedProviders     []string  `json:"allowed_providers,omitempty"`
+	AllowedModes         []string  `json:"allowed_modes,omitempty"`
+	ExpiresAt            time.Time `json:"expires_at,omitempty"`
+	Revoked              bool      `json:"revoked,omitempty"`
+	MaxRequestsPerHour   int       `json:"max_requests_per_hour,omitempty"`
+	MaxRequestsPerDay    int       `json:"max_requests_per_day,omitempty"`
+	MaxCostUSDPerDay     float64   `json:"max_cost_usd_per_day,omitempty"`
+	MaxCostUSDPerMonth   float64   `json:"max_cost_usd_per_month,omitempty"`
 }
 
 // TokenRuleView is a non-secret representation of a token rule suitable for
@@ -120,21 +121,22 @@ type Authorizer struct {
 
 // Grant is the normalized permission view for an authenticated token.
 type Grant struct {
-	tokenID            string
-	description        string
-	userID             string
-	organizationID     string
-	projectID          string
-	expiresAt          time.Time
-	revoked            bool
-	maxRequestsPerHour int
-	maxRequestsPerDay  int
-	maxCostUSDPerDay   float64
-	maxCostUSDPerMonth float64
-	scopes             map[string]struct{}
-	workspacePrefixes  []string
-	allowedProviders   map[string]struct{}
-	allowedModes       map[string]struct{}
+	authorizationVersion string
+	tokenID              string
+	description          string
+	userID               string
+	organizationID       string
+	projectID            string
+	expiresAt            time.Time
+	revoked              bool
+	maxRequestsPerHour   int
+	maxRequestsPerDay    int
+	maxCostUSDPerDay     float64
+	maxCostUSDPerMonth   float64
+	scopes               map[string]struct{}
+	workspacePrefixes    []string
+	allowedProviders     map[string]struct{}
+	allowedModes         map[string]struct{}
 	// usage holds the mutable quota/spend counters. It is referenced by pointer
 	// so a rebuilt authorizer can share the SAME counter state with the previous
 	// grant for a carried-over token (see carryOverGrantUsage), eliminating the
@@ -406,6 +408,14 @@ func (g *Grant) Description() string {
 }
 
 // UserID returns the user associated with the token, if any.
+// AuthorizationVersion binds a user token to its issuance-time account and membership state.
+func (g *Grant) AuthorizationVersion() string {
+	if g == nil {
+		return ""
+	}
+	return g.authorizationVersion
+}
+
 func (g *Grant) UserID() string {
 	if g == nil {
 		return ""
@@ -799,22 +809,23 @@ func newGrant(rule TokenRule) (*Grant, error) {
 	}
 
 	return &Grant{
-		tokenID:            tokenID,
-		description:        strings.TrimSpace(rule.Description),
-		userID:             strings.TrimSpace(rule.UserID),
-		organizationID:     strings.TrimSpace(rule.OrganizationID),
-		projectID:          strings.TrimSpace(rule.ProjectID),
-		expiresAt:          rule.ExpiresAt.UTC(),
-		revoked:            rule.Revoked,
-		maxRequestsPerHour: rule.MaxRequestsPerHour,
-		maxRequestsPerDay:  rule.MaxRequestsPerDay,
-		maxCostUSDPerDay:   rule.MaxCostUSDPerDay,
-		maxCostUSDPerMonth: rule.MaxCostUSDPerMonth,
-		scopes:             scopeSet,
-		workspacePrefixes:  workspacePrefixes,
-		allowedProviders:   providers,
-		allowedModes:       modes,
-		usage:              &grantUsage{},
+		authorizationVersion: rule.AuthorizationVersion,
+		tokenID:              tokenID,
+		description:          strings.TrimSpace(rule.Description),
+		userID:               strings.TrimSpace(rule.UserID),
+		organizationID:       strings.TrimSpace(rule.OrganizationID),
+		projectID:            strings.TrimSpace(rule.ProjectID),
+		expiresAt:            rule.ExpiresAt.UTC(),
+		revoked:              rule.Revoked,
+		maxRequestsPerHour:   rule.MaxRequestsPerHour,
+		maxRequestsPerDay:    rule.MaxRequestsPerDay,
+		maxCostUSDPerDay:     rule.MaxCostUSDPerDay,
+		maxCostUSDPerMonth:   rule.MaxCostUSDPerMonth,
+		scopes:               scopeSet,
+		workspacePrefixes:    workspacePrefixes,
+		allowedProviders:     providers,
+		allowedModes:         modes,
+		usage:                &grantUsage{},
 	}, nil
 }
 

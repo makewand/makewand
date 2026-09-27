@@ -7,6 +7,7 @@ import sys
 import argparse
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+from makewand import __version__
 from makewand.config import (
     c,
     COLOR_BOLD,
@@ -54,6 +55,9 @@ def cmd_status(args):
     print(c("       Makewand Multi-Model AI 订阅与全工具拓扑看板", COLOR_BOLD + COLOR_CYAN))
     print(c("============================================================\n", COLOR_BOLD))
 
+    from makewand.config import get_api_policy
+    policy = get_api_policy()
+    print("API 费用策略: " + ("allow_paid（允许云 API 按量计费）" if policy == "allow_paid" else "subscription_only（禁止 Makewand 云 API 调用）"))
     cache = get_or_update_status(force_probe=args.probe)
 
     status_badges = {
@@ -69,7 +73,7 @@ def cmd_status(args):
 
     mode_badges = {
         "hybrid":       c("[双模自适应: 订阅优先+API兜底]", COLOR_CYAN + COLOR_BOLD),
-        "subscription": c("[订阅模式: 0 Token 成本]", COLOR_GREEN),
+        "subscription": c("[订阅模式: 消耗工具订阅额度]", COLOR_GREEN),
         "api":          c("[纯 API 模式: 按量计费]", COLOR_BLUE + COLOR_BOLD),
         "local":        c("[本地私有: 0 成本/离线/隐私]", COLOR_PURPLE + COLOR_BOLD),
         "disabled":     c("[🚫 已关闭]", COLOR_RED),
@@ -310,7 +314,7 @@ def cmd_models(args):
         if avail:
             print(f"   当前默认: {c(get_default_local_model(), COLOR_GREEN + COLOR_BOLD)}")
             print(f"   检测到可用模型: {', '.join(list_local_models())}")
-            print("   自适应机制: 本地 GPU 离线执行，0 Token 外部调用成本，数据 100% 本地安全私有。\n")
+            print("   自适应机制: 使用配置的本地模型端点；数据去向取决于该端点配置。\n")
         else:
             print("   状态: 未检测到本地 Ollama / vLLM 服务 (http://localhost:11434 未响应)\n")
     except Exception as e:
@@ -508,7 +512,7 @@ def main():
         description="Makewand v3.1: Unified Multi-Model AI Subscription & Universal Tool Orchestrator",
         parents=[common_parser]
     )
-    parser.add_argument("-v", "--version", action="version", version="makewand 3.1.0")
+    parser.add_argument("-v", "--version", action="version", version=f"makewand {__version__}")
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     # models
