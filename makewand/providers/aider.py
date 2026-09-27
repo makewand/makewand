@@ -37,35 +37,67 @@ def execute_aider_task(
     if not is_aider_available():
         return False, None, "未在 PATH 中找到 'aider' 命令。请先运行 'pip install aider-chat' 或使用其他活跃模型"
 
-    work_dir = cwd or os.getcwd()
-    cmd = ["aider", "--message", prompt, "--yes-always", "--no-auto-commits", "--no-gitignore"]
+    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.git_helper import find_git_root
+    from makewand.providers.base import run_subprocess
 
-    if readonly:
-        cmd.append("--read-only")
+    work_dir = os.path.abspath(cwd or os.getcwd())
+    if not repo_root:
+        repo_root = find_git_root(work_dir) or work_dir
+    repo_root = os.path.abspath(repo_root)
 
-    cfg = get_api_config("aider")
-    active_model = model or cfg.get("model")
-    if active_model:
-        cmd += ["--model", active_model]
+    # Untrusted repo enforcement
+    if repo_trust == "untrusted":
+        allow_network = False
+        if not is_bwrap_available():
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        if not readonly:
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务"
 
-    print(c(f"[Makewand -> Aider] 派发任务至 Aider Pair Programmer...", COLOR_GREEN), file=sys.stderr)
+    # Fail-closed enforcement: if writable, sandbox is mandatory
+    if not readonly:
+        if not is_bwrap_available():
+            return False, None, "Aider 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
+    p_file = None
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=work_dir,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True
-        )
-        out = proc.stdout
-        err = proc.stderr
-        if proc.returncode == 0:
-            return True, out or "Aider task completed successfully", None
+        if len(prompt.encode("utf-8")) > 32 * 1024:
+            import time
+            p_file = os.path.join(work_dir, f".makewand_aider_p_{os.getpid()}_{time.time_ns()}.txt")
+            with open(p_file, "w", encoding="utf-8") as pf:
+                pf.write(prompt)
+            cmd = ["aider", "--message-file", str(p_file), "--yes-always", "--no-auto-commits", "--no-gitignore"]
         else:
-            return False, out, err or f"Aider exited with code {proc.returncode}"
-    except subprocess.TimeoutExpired:
-        return False, None, f"Aider task timed out after {timeout}s"
-    except Exception as e:
-        return False, None, f"Aider execution error: {e}"
+            cmd = ["aider", "--message", prompt, "--yes-always", "--no-auto-commits", "--no-gitignore"]
+
+        if readonly:
+            cmd.append("--read-only")
+
+        cfg = get_api_config("aider")
+        active_model = model or cfg.get("model")
+        if active_model:
+            cmd += ["--model", active_model]
+
+        if is_bwrap_available():
+            cmd = wrap_bwrap(cmd, workspace=work_dir, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="aider")
+
+        log_desc = "只读解析任务" if readonly else "代码编写任务"
+        print(c(f"[Makewand -> Aider] 派发{log_desc}至 Aider Pair Programmer (沙箱隔离)...", COLOR_GREEN), file=sys.stderr)
+
+        code, out, err, ex = run_subprocess(
+            cmd,
+            timeout=timeout,
+            cwd=work_dir,
+            stream=stream,
+            print_prefix=c("[Aider Live]", COLOR_GREEN)
+        )
+    finally:
+        if p_file and os.path.exists(p_file):
+            try:
+                os.unlink(p_file)
+            except Exception:
+                pass
+    if code == 0:
+        return True, out or "Aider task completed successfully", None
+    else:
+        return False, out, err or ex or f"Aider exited with code {code}"

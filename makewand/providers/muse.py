@@ -106,22 +106,37 @@ def execute_muse_task(
     if target_effort and target_effort != "none":
         cmd.extend(["--reasoning-effort", target_effort])
 
-    cmd.append(prompt)
+    p_file = None
+    try:
+        if len(prompt.encode("utf-8")) > 32 * 1024:
+            import time
+            p_file = os.path.join(cwd, f".makewand_muse_p_{os.getpid()}_{time.time_ns()}.txt")
+            with open(p_file, "w", encoding="utf-8") as pf:
+                pf.write(prompt)
+            cmd.extend(["--prompt-file", str(p_file)])
+        else:
+            cmd.append(prompt)
 
-    if is_bwrap_available():
-        cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="muse")
-    elif repo_trust == "untrusted":
-        return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        if is_bwrap_available():
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="muse")
+        elif repo_trust == "untrusted":
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 
-    import sys
-    print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
-    code, out, err, ex = run_subprocess(
-        cmd,
-        timeout=timeout,
-        cwd=cwd,
-        stream=stream,
-        print_prefix=c("[Muse Live]", COLOR_PURPLE)
-    )
+        import sys
+        print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
+        code, out, err, ex = run_subprocess(
+            cmd,
+            timeout=timeout,
+            cwd=cwd,
+            stream=stream,
+            print_prefix=c("[Muse Live]", COLOR_PURPLE)
+        )
+    finally:
+        if p_file and os.path.exists(p_file):
+            try:
+                os.unlink(p_file)
+            except Exception:
+                pass
     combined = f"{out}\n{err}" if not stream else out
 
     if code == 0:

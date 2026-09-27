@@ -20,6 +20,7 @@ def execute_agy_task(
     timeout: int = 300,
     tier: str = "standard",
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     stream: bool = False,
     readonly: bool = False,
     repo_root: Optional[str] = None,
@@ -82,39 +83,59 @@ def execute_agy_task(
         if not is_bwrap_available():
             return False, None, "Antigravity 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
-    final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
-    cmd = [
-        "agy", "-p", final_prompt,
-        "--print-timeout", f"{timeout}s",
-        "--dangerously-skip-permissions",
-        "--disable-slash-commands"
-    ]
+    p_file = None
+    try:
+        final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
+        if len(final_prompt.encode("utf-8")) > 32 * 1024:
+            import time
+            p_file = os.path.join(cwd, f".makewand_agy_p_{os.getpid()}_{time.time_ns()}.txt")
+            with open(p_file, "w", encoding="utf-8") as pf:
+                pf.write(final_prompt)
+            prompt_instruction = f"请读取并完整执行当前目录任务文件 {os.path.basename(p_file)} 中所指定的任务要求与代码规范："
+            cmd = [
+                "agy", "-p", prompt_instruction,
+                "--print-timeout", f"{timeout}s",
+                "--dangerously-skip-permissions",
+                "--disable-slash-commands"
+            ]
+        else:
+            cmd = [
+                "agy", "-p", final_prompt,
+                "--print-timeout", f"{timeout}s",
+                "--dangerously-skip-permissions",
+                "--disable-slash-commands"
+            ]
 
-    if model:
-        cmd.extend(["--model", model])
-    else:
         from makewand.discovery import get_provider_model_tier
         resolved = get_provider_model_tier("agy", tier)
-        if resolved.get("model") and resolved["model"] != "default":
-            cmd.extend(["--model", resolved["model"]])
-        if resolved.get("effort"):
-            cmd.extend(["--effort", resolved["effort"]])
+        target_model = model or resolved.get("model")
+        if target_model and target_model != "default":
+            cmd.extend(["--model", target_model])
+        target_effort = effort or resolved.get("effort")
+        if target_effort and target_effort != "none":
+            cmd.extend(["--effort", target_effort])
 
-    if is_bwrap_available():
-        cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="agy")
-    elif repo_trust == "untrusted":
-        return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        if is_bwrap_available():
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="agy")
+        elif repo_trust == "untrusted":
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 
-    log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
-    import sys
-    print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN), file=sys.stderr)
-    code, out, err, ex = run_subprocess(
-        cmd,
-        timeout=timeout + 15,
-        cwd=cwd,
-        stream=stream,
-        print_prefix=c("[AGY Live]", COLOR_GREEN)
-    )
+        log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
+        import sys
+        print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN), file=sys.stderr)
+        code, out, err, ex = run_subprocess(
+            cmd,
+            timeout=timeout + 15,
+            cwd=cwd,
+            stream=stream,
+            print_prefix=c("[AGY Live]", COLOR_GREEN)
+        )
+    finally:
+        if p_file and os.path.exists(p_file):
+            try:
+                os.unlink(p_file)
+            except Exception:
+                pass
     combined = f"{out}\n{err}" if not stream else out
 
     if code == 0:

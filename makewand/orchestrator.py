@@ -648,7 +648,7 @@ def dispatch_task(
         res = execute_muse_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, effort=effort, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine == "agy":
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
-        res = execute_agy_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
+        res = execute_agy_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, effort=effort, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
     elif engine in ("local", "ollama"):
         p = f"目标工作目录绝对路径: {cwd}\n请在该目录下创建/修改对应代码文件并落盘：\n{prompt}" if not readonly and cwd else prompt
         res = execute_local_task(p, cwd=cwd, timeout=timeout, tier=tier, model=model, stream=stream, readonly=readonly, repo_root=repo_root, repo_trust=repo_trust, allow_network=allow_network)
@@ -700,7 +700,8 @@ def select_optimal_engine_pair(
     prompt: str,
     tier: str = "standard",
     cache: Optional[Dict[str, Any]] = None,
-    boost: bool = False
+    boost: bool = False,
+    require_file_editing: Optional[bool] = None
 ) -> Tuple[List[str], List[str], Dict[str, Any]]:
     """
     Intelligently scores and pairs engines for (Implementation, Red-team Review)
@@ -895,11 +896,27 @@ def select_optimal_engine_pair(
             else:
                 scores[model_name] = -999.0
 
+    if require_file_editing is None:
+        require_file_editing = (classify_prompt_intent(prompt) == "code")
+
+    NON_AGENTIC_CHAT_MODELS = {"local", "ollama", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"}
+
     # Sort coder candidates
     available_coders = [m for m, sc in sorted(scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
+    if require_file_editing:
+        filtered_coders = [m for m in available_coders if m not in NON_AGENTIC_CHAT_MODELS]
+        if filtered_coders:
+            available_coders = filtered_coders
+        else:
+            reasons.append("⚠️ 无可用自主工具 Agent 候选，降级保留 API/Local 引擎")
+
     if not available_coders:
         # If no active tool has score > 0, fallback to any active tool, or agy if pool empty
         available_coders = [m for m in active_pool if is_provider_enabled(m)] or ["agy"]
+        if require_file_editing:
+            filtered_coders = [m for m in available_coders if m not in NON_AGENTIC_CHAT_MODELS]
+            if filtered_coders:
+                available_coders = filtered_coders
 
     primary_coder = available_coders[0]
 
@@ -1002,8 +1019,8 @@ def run_pipeline(
     if boost:
         tier = "deep"
         print(c("⚡ [Makewand Boost] 强制超频模式已启用：穿透软配额限制，分配最高推理算力！", COLOR_MAGENTA + COLOR_BOLD))
-    elif tier == "auto":
-        tier = detect_task_tier(prompt)
+    elif tier == "auto" or not tier:
+        tier = "auto"
 
     # Decouple per-stage timeout from pipeline total budget
     if total_budget is None:
@@ -1072,6 +1089,7 @@ def run_pipeline(
 
     initial_untracked_files = set()
     initial_dirty = False
+    task_baseline = None
     if not is_shadow_active and cwd:
         try:
             _, init_status, _ = run_git_cmd(["git", "status", "--porcelain", "-uall", "--ignored"], cwd=cwd)
@@ -1080,6 +1098,9 @@ def run_pipeline(
                     initial_untracked_files.add(line[3:].strip().strip('"'))
                 elif line.strip():
                     initial_dirty = True
+            c_code, h_commit, _ = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=cwd)
+            if c_code == 0 and h_commit and h_commit.strip():
+                task_baseline = h_commit.strip()
         except Exception:
             pass
 
@@ -1100,7 +1121,8 @@ def run_pipeline(
                     (rej_dir / "rejected.patch").write_text(d_out, encoding="utf-8")
 
                 if not initial_dirty:
-                    run_git_cmd(["git", "reset", "HEAD"], cwd=cwd)
+                    target_ref = task_baseline if task_baseline else "HEAD"
+                    run_git_cmd(["git", "reset", "--hard", target_ref], cwd=cwd)
                     run_git_cmd(["git", "restore", "."], cwd=cwd)
                     run_git_cmd(["git", "checkout", "--", "."], cwd=cwd)
                 else:
@@ -1196,7 +1218,8 @@ def run_pipeline(
                     if s_head and s_head.strip():
                         active_sub_baselines[s_rel] = s_head.strip()
 
-    print(c(f"▶ 阶段 1: 代码编写与实现 (Implementation - Tier: {tier})", COLOR_BOLD + COLOR_BLUE))
+    disp_tier = tier if tier != "auto" else "auto (自适应动态调步)"
+    print(c(f"▶ 阶段 1: 代码编写与实现 (Implementation - Tier: {disp_tier})", COLOR_BOLD + COLOR_BLUE))
     # Retrieve past quality lessons and failure patterns
     memory_hints = ""
     try:
@@ -1878,7 +1901,14 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
         print(c("❌ 代码审计检测到严重隐患，未达合并标准 (FAILED)。", COLOR_RED + COLOR_BOLD))
         return EXIT_FAILED
 
-def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300, repo_trust: str = "trusted"):
+def run_race(
+    prompt: str,
+    cwd: Optional[str] = None,
+    timeout: int = 300,
+    repo_trust: str = "trusted",
+    engine_a: Optional[str] = None,
+    engine_b: Optional[str] = None
+):
     check_load_backpressure()
     if not cwd:
         cwd = os.getcwd()
@@ -1922,7 +1952,9 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300, repo_tr
         _, base_b_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=str(wt_b))
 
         # Pick Contestants
-        if x_ok:
+        if engine_a:
+            name_a = engine_a.upper()
+        elif x_ok:
             engine_a = "codex"
             name_a = "Codex (gpt-6-astra)"
         elif g_ok:
@@ -1938,7 +1970,9 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300, repo_tr
             engine_a = "agy"
             name_a = "Antigravity (Gemini Fast)"
 
-        if c_ok:
+        if engine_b:
+            name_b = engine_b.upper()
+        elif c_ok and engine_a != "claude":
             engine_b = "claude"
             name_b = "Claude Code"
         elif g_ok and engine_a != "grok":
@@ -1955,37 +1989,22 @@ def run_race(prompt: str, cwd: Optional[str] = None, timeout: int = 300, repo_tr
         print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
         print(c("并发执行中，请稍候...\n", COLOR_YELLOW))
 
-        def run_agent_a():
+        def run_single_racer(engine: str, name: str, wt: Path):
             start = time.time()
-            full_p = f"工作目录绝对路径: {wt_a}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
-            if engine_a == "codex":
-                ok, out, err = execute_codex_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
-            elif engine_a == "grok":
-                ok, out, err = execute_grok_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
-            elif engine_a == "muse":
-                ok, out, err = execute_muse_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
-            elif engine_a == "local":
-                from makewand.providers.local import execute_local_task
-                ok, out, err = execute_local_task(full_p, cwd=str(wt_a), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
-            else:
-                ok, out, err = execute_agy_task(full_p, cwd=str(wt_a), timeout=timeout, tier="fast", repo_root=cwd, repo_trust=repo_trust)
+            full_p = f"工作目录绝对路径: {wt}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
+            ok, out, err = dispatch_task(
+                engine, full_p, cwd=str(wt), timeout=timeout,
+                tier="standard", repo_root=cwd, repo_trust=repo_trust
+            )
             duration = round(time.time() - start, 2)
-            return name_a, ok, out, duration, wt_a
+            try:
+                record_engine_usage(engine, success=ok, tier="standard")
+            except Exception:
+                pass
+            return name, ok, out, duration, wt
 
-        def run_agent_b():
-            start = time.time()
-            full_p = f"工作目录绝对路径: {wt_b}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
-            if engine_b == "claude":
-                ok, out, err = execute_claude_task(full_p, cwd=str(wt_b), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
-            elif engine_b == "grok":
-                ok, out, err = execute_grok_task(full_p, cwd=str(wt_b), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
-            elif engine_b == "local":
-                from makewand.providers.local import execute_local_task
-                ok, out, err = execute_local_task(full_p, cwd=str(wt_b), timeout=timeout, repo_root=cwd, repo_trust=repo_trust)
-            else:
-                ok, out, err = execute_agy_task(full_p, cwd=str(wt_b), timeout=timeout, tier="deep", repo_root=cwd, repo_trust=repo_trust)
-            duration = round(time.time() - start, 2)
-            return name_b, ok, out, duration, wt_b
+        run_agent_a = lambda: run_single_racer(engine_a, name_a, wt_a)
+        run_agent_b = lambda: run_single_racer(engine_b, name_b, wt_b)
 
         try:
             high_load = os.getloadavg()[0] > 24.0

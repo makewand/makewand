@@ -113,8 +113,9 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str]) -> Optional[f
             secs += float(m_mins.group(1)) * 60
         return max(0.0, secs)
 
-    # Pattern 5: Time of day with stripped timezone e.g. "8pm (Asia/Shanghai)", "10:58 AM"
+    # Pattern 5: Time of day with stripped timezone e.g. "8pm (Asia/Shanghai)", "10:58 AM", "at 2:00 PM"
     clean_time = re.sub(r"\(.*?\)", "", s).strip()
+    clean_time = re.sub(r"^(?:at|in)\s+", "", clean_time, flags=re.IGNORECASE).strip()
     for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
         try:
             t = datetime.strptime(clean_time, fmt).time()

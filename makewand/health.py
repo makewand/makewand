@@ -102,6 +102,7 @@ def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool
         pass
 
     clean = re.sub(r"\(.*?\)", "", resets_at).strip()
+    clean = re.sub(r"^(?:at|in)\s+", "", clean, flags=re.IGNORECASE).strip()
     for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
         try:
             t = datetime.strptime(clean, fmt).time()

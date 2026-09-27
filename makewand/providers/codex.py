@@ -104,7 +104,12 @@ def execute_codex_task(
     if target_effort and target_effort != "none":
         cmd.extend(["-c", f"model_reasoning_effort=\"{target_effort}\""])
 
-    cmd.append(prompt)
+    input_text = None
+    if len(prompt.encode("utf-8")) > 32 * 1024:
+        cmd.append("-")
+        input_text = prompt
+    else:
+        cmd.append(prompt)
 
     if is_bwrap_available():
         cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="codex")
@@ -117,6 +122,7 @@ def execute_codex_task(
         cmd,
         timeout=timeout,
         cwd=cwd,
+        input_text=input_text,
         stream=stream,
         print_prefix=c("[Codex Live]", COLOR_CYAN)
     )

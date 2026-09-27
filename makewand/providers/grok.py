@@ -102,38 +102,54 @@ def execute_grok_task(
         if not is_bwrap_available():
             return False, None, "Grok 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
-    cmd = ["grok", "-p", prompt, "--output-format", "plain"]
-    if readonly:
-        cmd.extend(["--permission-mode", "plan", "--max-turns", "25"])
-    else:
-        cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions"])
+    p_file = None
+    try:
+        if len(prompt.encode("utf-8")) > 32 * 1024:
+            import time
+            p_file = os.path.join(cwd, f".makewand_grok_p_{os.getpid()}_{time.time_ns()}.txt")
+            with open(p_file, "w", encoding="utf-8") as pf:
+                pf.write(prompt)
+            cmd = ["grok", "--prompt-file", str(p_file), "--output-format", "plain"]
+        else:
+            cmd = ["grok", "-p", prompt, "--output-format", "plain"]
 
-    if cwd:
-        cmd.extend(["--cwd", str(cwd)])
+        if readonly:
+            cmd.extend(["--permission-mode", "plan", "--max-turns", "25"])
+        else:
+            cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions"])
 
-    from makewand.discovery import get_provider_model_tier
-    resolved = get_provider_model_tier("grok", tier)
-    target_model = model or resolved["model"]
-    cmd.extend(["--model", target_model])
-    target_effort = effort or resolved.get("effort")
-    if target_effort and target_effort != "none":
-        cmd.extend(["--reasoning-effort", target_effort])
+        if cwd:
+            cmd.extend(["--cwd", str(cwd)])
 
-    if is_bwrap_available():
-        cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="grok")
-    elif repo_trust == "untrusted":
-        return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        from makewand.discovery import get_provider_model_tier
+        resolved = get_provider_model_tier("grok", tier)
+        target_model = model or resolved["model"]
+        cmd.extend(["--model", target_model])
+        target_effort = effort or resolved.get("effort")
+        if target_effort and target_effort != "none":
+            cmd.extend(["--reasoning-effort", target_effort])
 
-    log_desc = "只读解析/审查任务 (Plan 模式)" if readonly else "代码任务 (自动审批执行)"
-    import sys
-    print(c(f"[Makewand -> Grok] 派发{log_desc} (Tier: {tier}, xAI Provider)...", COLOR_YELLOW), file=sys.stderr)
-    code, out, err, ex = run_subprocess(
-        cmd,
-        timeout=timeout,
-        cwd=cwd,
-        stream=stream,
-        print_prefix=c("[Grok Live]", COLOR_YELLOW)
-    )
+        if is_bwrap_available():
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="grok")
+        elif repo_trust == "untrusted":
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+
+        log_desc = "只读解析/审查任务 (Plan 模式)" if readonly else "代码任务 (自动审批执行)"
+        import sys
+        print(c(f"[Makewand -> Grok] 派发{log_desc} (Tier: {tier}, xAI Provider)...", COLOR_YELLOW), file=sys.stderr)
+        code, out, err, ex = run_subprocess(
+            cmd,
+            timeout=timeout,
+            cwd=cwd,
+            stream=stream,
+            print_prefix=c("[Grok Live]", COLOR_YELLOW)
+        )
+    finally:
+        if p_file and os.path.exists(p_file):
+            try:
+                os.unlink(p_file)
+            except Exception:
+                pass
     combined = f"{out}\n{err}" if not stream else out
 
     if code == 0:

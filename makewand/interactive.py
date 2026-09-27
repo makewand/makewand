@@ -73,6 +73,7 @@ SLASH_COMMANDS = [
     "/sandbox",
     "/observe",
     "/tier",
+    "/model", "/provider",
     "/chat",
     "/run",
     "/multiline", "/paste",
@@ -186,6 +187,7 @@ def print_help_menu():
         ("/sandbox <命令>", "在 Bubblewrap 物理沙箱中运行指定 shell 命令"),
         ("/observe", "全局巡检跨终端与 tmux 中的活跃 AI 会话"),
         ("/tier <档位>", "切换推理档位 (auto, fast, standard, deep)"),
+        ("/model <模型>", "临时锁定指定模型引擎 (auto, claude, codex, grok, agy, muse...)"),
         ("/run <任务>", "显式强制启动全套多模型编码、测试门禁与红队自愈流水线"),
         ("/chat <提问>", "显式以技术问答/分析模式咨询主力大模型"),
         ("/multiline", "开启多行长文本粘贴模式 (输入 EOF 或 Ctrl+D 提交)"),
@@ -231,6 +233,7 @@ def handle_conversational_turn(
     tier: str = "standard",
     repo_trust: str = "trusted",
     stream: bool = True,
+    forced_engine: Optional[str] = None,
 ):
     """
     Handles a conversational query/explanation/analysis turn.
@@ -239,11 +242,14 @@ def handle_conversational_turn(
     # Build augmented prompt with recent conversation history
     context_prefix = ""
     if conversation_history:
-        recent_turns = conversation_history[-8:]  # Last 4 turns
+        recent_turns = conversation_history[-6:]  # Last 3 turns
         formatted_history = []
         for turn in recent_turns:
             role = "用户" if turn["role"] == "user" else "AI助手"
-            formatted_history.append(f"{role}: {turn['content']}")
+            c_text = turn["content"]
+            if len(c_text) > 1500:
+                c_text = c_text[:1500] + "... [历史截断]"
+            formatted_history.append(f"{role}: {c_text}")
         context_prefix = (
             "【前序会话上下文】\n"
             + "\n".join(formatted_history)
@@ -252,12 +258,16 @@ def handle_conversational_turn(
 
     full_prompt = context_prefix + user_input if context_prefix else user_input
 
-    cache = get_or_update_status(force_probe=False)
-    available_coders, _, route_meta = select_optimal_engine_pair(user_input, tier=tier, cache=cache)
-    primary = route_meta.get("primary_coder") or (available_coders[0] if available_coders else "agy")
-    sorted_engines = available_coders if available_coders else [primary, "agy", "claude", "codex", "local"]
-    if primary not in sorted_engines:
-        sorted_engines.insert(0, primary)
+    if forced_engine and forced_engine != "auto":
+        primary = forced_engine
+        sorted_engines = [forced_engine]
+    else:
+        cache = get_or_update_status(force_probe=False)
+        available_coders, _, route_meta = select_optimal_engine_pair(user_input, tier=tier, cache=cache)
+        primary = route_meta.get("primary_coder") or (available_coders[0] if available_coders else "agy")
+        sorted_engines = available_coders if available_coders else [primary, "agy", "claude", "codex", "local"]
+        if primary not in sorted_engines:
+            sorted_engines.insert(0, primary)
 
     print(f"{COLOR_GRAY}● [{primary.upper()}] 正在思考...{COLOR_RESET}\n")
 
@@ -362,6 +372,7 @@ def start_interactive_session(repo_trust: str = "trusted"):
     print()
 
     current_tier = "auto"
+    current_engine = "auto"
     conversation_history: List[Dict[str, str]] = []
 
     while True:
@@ -472,6 +483,22 @@ def start_interactive_session(repo_trust: str = "trusted"):
                 print(c(f"✔ 推理档位已切换为: {current_tier}", COLOR_GREEN))
             else:
                 print(c(f"当前推理档位: {current_tier} (可选: auto, fast, standard, deep)", COLOR_YELLOW))
+            continue
+
+        elif lower.startswith(("/model", "/provider")):
+            parts = user_input.split(maxsplit=1)
+            from makewand.config import get_active_providers
+            all_known = list(dict.fromkeys(["auto", "claude", "codex", "grok", "agy", "muse", "local", "aider"] + get_active_providers()))
+            if len(parts) > 1 and parts[1].strip():
+                target_m = parts[1].strip().lower()
+                if target_m in all_known:
+                    current_engine = target_m
+                    print(c(f"✔ 交互会话已指定锁定引擎: {current_engine.upper() if current_engine != 'auto' else '自动智能路由'}", COLOR_GREEN))
+                else:
+                    print(c(f"未知引擎 '{target_m}'。可用选项: {', '.join(all_known)}", COLOR_YELLOW))
+            else:
+                desc = current_engine.upper() if current_engine != "auto" else "自动智能路由 (auto)"
+                print(c(f"当前锁定引擎: {desc} (运行 '/model <engine>' 或 '/model auto' 切换)", COLOR_YELLOW))
             continue
 
         elif lower.startswith("/race"):
@@ -588,6 +615,7 @@ def start_interactive_session(repo_trust: str = "trusted"):
                 cwd,
                 tier=current_tier,
                 repo_trust=repo_trust,
+                forced_engine=current_engine if current_engine != "auto" else None,
             )
             continue
 
@@ -601,6 +629,7 @@ def start_interactive_session(repo_trust: str = "trusted"):
                 user_input,
                 cwd=cwd,
                 tier=current_tier,
+                model=current_engine if current_engine != "auto" else None,
                 stream=True,
                 auto_fix=True,
                 repo_trust=repo_trust,

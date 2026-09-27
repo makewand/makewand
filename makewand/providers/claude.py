@@ -11,15 +11,15 @@ from makewand.providers.base import run_subprocess
 
 def parse_claude_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     lower = output.lower()
-    if any(k in lower for k in ["hit your monthly spend limit", "hit your usage limit", "usage limit reached", "5-hour limit", "weekly limit reached", "exceeded your current quota"]):
-        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit resets\s+([^·\n]+)", output, re.IGNORECASE)
+    if any(k in lower for k in ["hit your limit", "hit your monthly spend limit", "hit your usage limit", "usage limit reached", "5-hour limit", "weekly limit reached", "exceeded your current quota"]):
+        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
         reset_time = reset_match.group(1).strip() if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
         return True, f"限流 / 额度耗尽 (重置时间: {reset_time})", reset_time
     if "overloaded_error" in lower or "server overloaded" in lower:
         iso_reset = (datetime.now() + timedelta(minutes=3)).isoformat()
         return True, "Anthropic 服务端负载过高 (Overloaded)", iso_reset
     if "rate_limit_error" in lower or (re.search(r"\b(?:rate\s*limit(?:ed)?|too\s*many\s*requests|http\s+429|status(?:\s*code)?\s*[:=]?\s*429)\b", lower) and "middleware" not in lower and "test_" not in lower):
-        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit resets\s+([^·\n]+)", output, re.IGNORECASE)
+        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
         if reset_match:
             reset_time = reset_match.group(1).strip()
             return True, f"限流 / 额度耗尽 (重置时间: {reset_time})", reset_time
@@ -95,7 +95,12 @@ def execute_claude_task(
         if not is_bwrap_available():
             return False, None, "Claude 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
-    cmd = ["claude", "-p", prompt]
+    input_text = None
+    if len(prompt.encode("utf-8")) > 32 * 1024:
+        cmd = ["claude", "-p"]
+        input_text = prompt
+    else:
+        cmd = ["claude", "-p", prompt]
     if readonly:
         cmd.extend(["--allowed-tools", "Read,Grep,Glob", "--dangerously-skip-permissions"])
     else:
@@ -121,6 +126,7 @@ def execute_claude_task(
         cmd,
         timeout=timeout,
         cwd=cwd,
+        input_text=input_text,
         stream=stream,
         print_prefix=c("[Claude Live]", COLOR_BLUE)
     )

@@ -43,11 +43,11 @@ MUSE_WARN_7D = 100
 MUSE_LIMIT_7D = 200
 
 def _get_active_usage_file() -> Path:
+    if USAGE_WINDOW_FILE != CONFIG_DIR / "usage_window.json":
+        return Path(USAGE_WINDOW_FILE)
     test_env_file = os.environ.get("MAKEWAND_USAGE_FILE")
     if test_env_file:
         return Path(test_env_file)
-    if USAGE_WINDOW_FILE != CONFIG_DIR / "usage_window.json":
-        return Path(USAGE_WINDOW_FILE)
     if "unittest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("MAKEWAND_TEST_MODE") == "1":
         import tempfile
         return Path(tempfile.gettempdir()) / "makewand_test_usage.json"

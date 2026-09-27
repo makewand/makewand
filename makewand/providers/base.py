@@ -84,6 +84,7 @@ def run_subprocess(
             proc = subprocess.Popen(
                 cmd,
                 shell=True if isinstance(cmd, str) else False,
+                stdin=subprocess.PIPE if input_text is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -105,12 +106,26 @@ def run_subprocess(
             proc = subprocess.Popen(
                 cmd,
                 shell=True if isinstance(cmd, str) else False,
+                stdin=subprocess.PIPE if input_text is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=False,
                 cwd=cwd,
                 start_new_session=True
             )
+            if input_text is not None:
+                try:
+                    payload = input_text.encode("utf-8") if isinstance(input_text, str) else input_text
+                    proc.stdin.write(payload)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+
             # Set stdout to non-blocking mode to prevent readline deadlocks on partial lines
             os.set_blocking(proc.stdout.fileno(), False)
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -191,3 +206,11 @@ def run_subprocess(
         if proc:
             kill_process_tree(proc)
         return -1, "", "", str(e)
+    finally:
+        if proc:
+            for pipe in (getattr(proc, "stdout", None), getattr(proc, "stderr", None), getattr(proc, "stdin", None)):
+                if pipe and not getattr(pipe, "closed", True):
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
