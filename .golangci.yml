@@ -13,19 +13,13 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
+    # Only paths that exist in this repository. `benchmarks` holds the tracked
+    # benchmark harness plus locally generated (gitignored) result projects.
+    # Stale entries for local scratch projects (notes-api, blog-project, ...)
+    # and the golangci-lint template defaults (third_party, builtin, examples)
+    # were removed: none of them exist here, so they only hid future code.
     paths:
       - benchmarks
-      - notes-api
-      - password-strength-checker
-      - top_three_project
-      - blog-project
-      - third_party$
-      - builtin$
-      - examples$
 formatters:
   exclusions:
     generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
