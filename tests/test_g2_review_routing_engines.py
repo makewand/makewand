@@ -61,6 +61,26 @@ class TestRunReviewHonoursDisableAndHealth(unittest.TestCase):
         self.assertEqual(code, orch.EXIT_PASSED)
         self.assertEqual(calls, {"codex": 0, "grok": 0, "agy": 1})
 
+    def test_local_only_review_routes_to_local_and_fails_closed_without_cloud_fallback(self):
+        cloud_mocks = {name: MagicMock(return_value=(True, PASS_LINE, None))
+                       for name in ("execute_codex_task", "execute_grok_task", "execute_agy_task")}
+        local_mock = MagicMock(return_value=(True, PASS_LINE, None))
+        cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}, "local": {"status": "healthy"}}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(orch, "get_git_diff", return_value="diff --git a/a b/a\n+x"))
+            stack.enter_context(patch.object(orch, "get_or_update_status", return_value=cache))
+            stack.enter_context(patch("makewand.config.is_provider_enabled", return_value=True))
+            for name, mock in cloud_mocks.items():
+                stack.enter_context(patch.object(orch, name, mock))
+            stack.enter_context(patch.object(orch, "execute_local_task", local_mock))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            code = orch.run_review(cwd="/tmp", output_json=True, local_only=True)
+
+        self.assertEqual(code, orch.EXIT_PASSED)
+        self.assertEqual(local_mock.call_count, 1)
+        for name, mock in cloud_mocks.items():
+            self.assertEqual(mock.call_count, 0, f"Cloud engine {name} must NOT be called in local_only mode")
+
 
 class TestRunRaceHonoursDisableAndHealth(unittest.TestCase):
     def setUp(self):

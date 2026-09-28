@@ -709,6 +709,7 @@ def main():
     p_rev.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_rev.add_argument("--stream", action="store_true", default=False, help="Stream review output line-by-line")
     p_rev.add_argument("--timeout", type=int, default=300)
+    p_rev.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: review diff using only local self-hosted model")
 
     # race
     p_race = subparsers.add_parser("race", help="Run prompt on two models in parallel worktrees and compare", parents=[sub_common_parser])
@@ -949,7 +950,14 @@ def main():
             sys.exit(EXIT_FAILED)
         sys.exit(EXIT_PASSED)
     elif args.subcommand == "review":
-        exit_code = run_review(cwd=args.cwd, stream=args.stream, timeout=args.timeout, output_json=getattr(args, "json", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        exit_code = run_review(
+            cwd=args.cwd,
+            stream=args.stream,
+            timeout=args.timeout,
+            output_json=getattr(args, "json", False),
+            repo_trust=getattr(args, "repo_trust", "trusted"),
+            local_only=getattr(args, "local_only", False)
+        )
         sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand == "race":
         exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout, repo_trust=getattr(args, "repo_trust", "trusted"))

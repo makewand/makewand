@@ -21,9 +21,13 @@ concurrency:
 
 jobs:
   analyze:
-    name: Analyze (Go)
+    name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['go', 'python']
 
     steps:
       - name: Checkout
@@ -32,12 +36,13 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4.37.4
         with:
-          languages: go
+          languages: ${{ matrix.language }}
 
       - name: Autobuild
+        if: matrix.language == 'go'
         uses: github/codeql-action/autobuild@v4.37.4
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4.37.4
         with:
-          category: "/language:go"
+          category: "/language:${{ matrix.language }}"

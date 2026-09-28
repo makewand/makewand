@@ -66,6 +66,32 @@ def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
             return None
         return norm
 
+    def _safe_write_file(rel: str, content: str) -> bool:
+        dest = os.path.join(clean_cwd, rel)
+        if os.path.isdir(dest):
+            return False
+        parent = os.path.dirname(dest)
+        os.makedirs(parent, exist_ok=True)
+        # Write to a temporary file in the same directory and atomically replace (os.replace).
+        # This prevents partial writes on interruption and safely replaces inodes without
+        # in-place truncating external hardlinked files (defense against F04).
+        import tempfile
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=parent, delete=False, encoding="utf-8") as tmp:
+                tmp.write(content)
+                tmp.flush()
+                tmp_path = tmp.name
+            os.replace(tmp_path, dest)
+            return True
+        except Exception:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return False
+
     # 1. First, check for unified diff blocks and apply via git apply if possible
     diff_blocks = re.findall(r"```(?:diff|patch)?\s*\n(--- [^\n]+\n\+\+\+ [^\n]+\n[\s\S]*?)```", output)
     if diff_blocks:
@@ -94,12 +120,8 @@ def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
     p1 = re.compile(r"```[a-zA-Z0-9_-]*\s+(?:filepath|file|path)[=:\s]+[\"']?([^\s\"'\n`]+)[\"']?\s*\n([\s\S]*?)```")
     for match in p1.finditer(output):
         rel = _is_safe_rel_path(match.group(1))
-        if rel:
-            dest = os.path.join(clean_cwd, rel)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as f:
-                f.write(match.group(2))
-            if rel not in modified:
+        if rel and rel not in modified:
+            if _safe_write_file(rel, match.group(2)):
                 modified.append(rel)
 
     # 3. Pattern 2: ```(filepath|path|file)[:\s]+path/to/file.ext
@@ -107,11 +129,8 @@ def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
     for match in p2.finditer(output):
         rel = _is_safe_rel_path(match.group(1))
         if rel and rel not in modified:
-            dest = os.path.join(clean_cwd, rel)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as f:
-                f.write(match.group(2))
-            modified.append(rel)
+            if _safe_write_file(rel, match.group(2)):
+                modified.append(rel)
 
     # 4. Pattern 3: Header preceding code block:
     # e.g.: ### `path/to/file.ext`\n```python\n...```
@@ -120,11 +139,8 @@ def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
     for match in p3.finditer(output):
         rel = _is_safe_rel_path(match.group(1))
         if rel and rel not in modified:
-            dest = os.path.join(clean_cwd, rel)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as f:
-                f.write(match.group(2))
-            modified.append(rel)
+            if _safe_write_file(rel, match.group(2)):
+                modified.append(rel)
 
     return modified
 

@@ -1686,7 +1686,7 @@ def _run_pipeline_impl(
 
     if intent == "review":
         print(c(f"💡 Makewand 意图识别: 独立代码审计/审查模式 '{prompt}' (只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
-        exit_code = run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt, repo_trust=repo_trust)
+        exit_code = run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt, repo_trust=repo_trust, local_only=local_only)
         return exit_code == EXIT_PASSED
 
     print(c(f"🚀 Makewand 流水线启动: '{prompt}' (自适应模型档位: {tier})", COLOR_BOLD))
@@ -2422,7 +2422,7 @@ def _engine_usable(engine: str, cache: Optional[Dict[str, Any]], require_healthy
         return False, f"健康状态为 {status}"
     return True, ""
 
-def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted") -> int:
+def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted", local_only: bool = False) -> int:
     if not cwd:
         cwd = os.getcwd()
 
@@ -2484,11 +2484,16 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
     )
 
     # Reviewer ladder honours `makewand disable <engine>` and the cached health status.
-    reviewer_ladder = [
-        ("codex", "派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN),
-        ("grok", "派发给 Grok Build CLI 进行红队审计 (xAI / grok-4.7, 只读隔离)...", COLOR_RED),
-        ("agy", "由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN),
-    ]
+    if local_only:
+        reviewer_ladder = [
+            ("local", "派发给本地自托管模型进行独立红队审计 (Ollama / vLLM, 100% 离线隐私零 Token, 只读隔离)...", COLOR_CYAN),
+        ]
+    else:
+        reviewer_ladder = [
+            ("codex", "派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN),
+            ("grok", "派发给 Grok Build CLI 进行红队审计 (xAI / grok-4.7, 只读隔离)...", COLOR_RED),
+            ("agy", "由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN),
+        ]
     review_res = None
     reviewer_engine = None
     attempted = []
@@ -2512,8 +2517,12 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
 
     if not review_res:
         no_engine = not attempted
-        reason = ("没有已启用且健康的审查引擎 (codex/grok/agy 均被禁用或不可用)" if no_engine
-                  else "独立审查服务未能产生有效输出 (UNVERIFIED)")
+        if local_only:
+            reason = ("本地审查引擎不可用或已被禁用 (根据 --local-only 隐私安全原则阻断向外部云端回退)" if no_engine
+                      else "本地审查引擎未能产生有效输出 (根据 --local-only 隐私安全原则阻断向外部云端回退)")
+        else:
+            reason = ("没有已启用且健康的审查引擎 (codex/grok/agy 均被禁用或不可用)" if no_engine
+                      else "独立审查服务未能产生有效输出 (UNVERIFIED)")
         if output_json:
             print(json.dumps({
                 "pass": False,

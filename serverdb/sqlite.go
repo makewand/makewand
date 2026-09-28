@@ -26,7 +26,7 @@ func Open(path string) (*sql.DB, error) {
 	// foreign_keys=OFF. modernc.org/sqlite applies `_pragma` DSN options to every
 	// connection it opens, so encode them there instead. journal_mode=WAL is a
 	// persistent database-level setting, so a one-time Exec below is sufficient.
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	dsn := path + "?_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

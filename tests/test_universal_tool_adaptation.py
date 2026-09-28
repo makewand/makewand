@@ -240,6 +240,47 @@ class TestUniversalToolAdaptation(unittest.TestCase):
             self.assertFalse((Path(tmp_dir) / "escape.txt").exists())
             self.assertFalse((Path(tmp_dir) / ".git" / "config").exists())
 
+    def test_apply_agentic_code_output_hardlink_and_directory_safety(self):
+        """Ensures atomic write decouples hardlinks without truncating external inodes, and rejects directory overwrite."""
+        import tempfile
+        from makewand.providers.api_client import apply_agentic_code_output
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # 1. Test directory protection
+            sub_dir = Path(tmp_dir) / "somedir"
+            sub_dir.mkdir()
+            dir_output = "```filepath: somedir\nnot allowed\n```\n"
+            mod1 = apply_agentic_code_output(dir_output, tmp_dir)
+            self.assertEqual(len(mod1), 0)
+            self.assertTrue(sub_dir.is_dir())
+
+            # 2. Test hardlink decoupling (defense against F04 in-place truncation)
+            external_dir = tempfile.mkdtemp()
+            try:
+                external_file = Path(external_dir) / "important_host.conf"
+                external_file.write_text("HOST_CONFIG_ORIGINAL")
+
+                target_file = Path(tmp_dir) / "linked.conf"
+                os.link(str(external_file), str(target_file))
+
+                # Verify they share the same inode initially
+                self.assertEqual(os.stat(external_file).st_ino, os.stat(target_file).st_ino)
+
+                # Overwrite via apply_agentic_code_output
+                hardlink_output = "```filepath: linked.conf\nNEW_AGENT_CODE\n```\n"
+                mod2 = apply_agentic_code_output(hardlink_output, tmp_dir)
+                self.assertIn("linked.conf", mod2)
+
+                # The workspace file has the new content
+                self.assertEqual(target_file.read_text(), "NEW_AGENT_CODE\n")
+                # The external hardlinked file MUST remain untouched!
+                self.assertEqual(external_file.read_text(), "HOST_CONFIG_ORIGINAL")
+                # And their inodes must now be decoupled!
+                self.assertNotEqual(os.stat(external_file).st_ino, os.stat(target_file).st_ino)
+            finally:
+                import shutil
+                shutil.rmtree(external_dir, ignore_errors=True)
+
     def test_local_only_and_provider_override(self):
         """Tests local_only and forced_engine routing behavior."""
         from makewand.orchestrator import _run_pipeline_impl

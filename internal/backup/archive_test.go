@@ -1,6 +1,8 @@
 package backup_test
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -157,5 +159,92 @@ func TestRestoreRejectsOversizedEntry(t *testing.T) {
 	}
 	if _, err := os.Stat(dstDB); err == nil {
 		t.Fatal("Restore must not leave oversized files on disk")
+	}
+}
+
+// TestRestoreRejectsExcessiveEntryCount confirms archives with more entries than
+// maxArchiveEntryCount are rejected to prevent inode exhaustion.
+func TestRestoreRejectsExcessiveEntryCount(t *testing.T) {
+	srcDir := t.TempDir()
+	stateDB := filepath.Join(srcDir, "state.db")
+	seedDB(t, stateDB, 5)
+
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if _, err := backup.Create(archive, backup.Options{StateDBPath: stateDB}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Set limit to 1 entry (a valid backup has at least manifest.json + state.db = 2 entries).
+	cleanup := backup.SetMaxArchiveLimitsForTest(1024*1024, 10*1024*1024, 1)
+	defer cleanup()
+
+	dstDB := filepath.Join(t.TempDir(), "state.db")
+	_, err := backup.Restore(archive, backup.Options{StateDBPath: dstDB})
+	if err == nil {
+		t.Fatal("Restore should fail when entry count exceeds limit, got nil")
+	}
+	if _, err := os.Stat(dstDB); err == nil {
+		t.Fatal("Restore must not install files from archive exceeding entry limit")
+	}
+}
+
+// TestRestoreRejectsManifestTraversal verifies that a malicious manifest.json with
+// directory traversal paths cannot write files outside the destination directory.
+func TestRestoreRejectsManifestTraversal(t *testing.T) {
+	tmpDir := t.TempDir()
+	archivePath := filepath.Join(tmpDir, "malicious.tar.gz")
+
+	// Create an archive containing a crafted manifest.json with traversal filename.
+	f, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatalf("Create archive: %v", err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+
+	badManifest := []byte(`{
+		"version": 1,
+		"created_at": "2026-09-28T00:00:00Z",
+		"files": [
+			{"name": "../../evil.txt", "size": 4, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+		]
+	}`)
+
+	hdr := &tar.Header{
+		Name:     "manifest.json",
+		Mode:     0o600,
+		Size:     int64(len(badManifest)),
+		Typeflag: tar.TypeReg,
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	if _, err := tw.Write(badManifest); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	stateDir := filepath.Join(tmpDir, "target_state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	escapedFile := filepath.Join(tmpDir, "evil.txt")
+	_, err = backup.Restore(archivePath, backup.Options{
+		StateDBPath: filepath.Join(stateDir, "state.db"),
+	})
+	if err == nil {
+		t.Fatal("Restore must fail on malicious manifest containing path traversal, got nil")
+	}
+	if _, err := os.Stat(escapedFile); err == nil {
+		t.Fatalf("Path traversal succeeded: %s was created!", escapedFile)
 	}
 }

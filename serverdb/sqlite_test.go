@@ -49,8 +49,8 @@ func TestOpenPragmasApplyToEveryConnection(t *testing.T) {
 		if fk != 1 {
 			t.Errorf("conn %d: foreign_keys=%d, want 1", i, fk)
 		}
-		if busy != 5000 {
-			t.Errorf("conn %d: busy_timeout=%d, want 5000", i, busy)
+		if busy != 30000 {
+			t.Errorf("conn %d: busy_timeout=%d, want 30000", i, busy)
 		}
 	}
 }

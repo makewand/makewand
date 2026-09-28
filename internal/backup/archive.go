@@ -38,11 +38,14 @@ const (
 	MaxArchiveEntrySize = 512 * 1024 * 1024
 	// MaxArchiveTotalSize limits the total uncompressed size across all entries to 2GB.
 	MaxArchiveTotalSize = 2 * 1024 * 1024 * 1024
+	// MaxArchiveEntryCount limits the total number of entries to prevent inode exhaustion.
+	MaxArchiveEntryCount = 10000
 )
 
 var (
-	maxArchiveEntrySize int64 = MaxArchiveEntrySize
-	maxArchiveTotalSize int64 = MaxArchiveTotalSize
+	maxArchiveEntrySize  int64 = MaxArchiveEntrySize
+	maxArchiveTotalSize  int64 = MaxArchiveTotalSize
+	maxArchiveEntryCount int   = MaxArchiveEntryCount
 )
 
 // SnapshotSQLite writes a transaction-consistent copy of the SQLite database at
@@ -224,6 +227,10 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 		}
 	}
 	for _, f := range manifest.Files {
+		if f.Name != filepath.Base(f.Name) || strings.Contains(f.Name, "..") {
+			discardStaged()
+			return nil, fmt.Errorf("unsafe manifest file entry: %q", f.Name)
+		}
 		src := filepath.Join(staging, f.Name)
 		dst := targetPath(f.Name, opts, stateDir)
 		if dst == "" {
@@ -339,6 +346,9 @@ func targetPath(name string, opts Options, stateDir string) string {
 		if stateDir == "" {
 			return ""
 		}
+		if name != filepath.Base(name) || strings.Contains(name, "..") {
+			return ""
+		}
 		return filepath.Join(stateDir, name)
 	}
 }
@@ -413,7 +423,10 @@ func extractTarGz(archivePath, destDir string) error {
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 
-	var totalExtracted int64
+	var (
+		totalExtracted int64
+		entryCount     int
+	)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -421,6 +434,10 @@ func extractTarGz(archivePath, destDir string) error {
 		}
 		if err != nil {
 			return fmt.Errorf("read tar: %w", err)
+		}
+		entryCount++
+		if entryCount > maxArchiveEntryCount {
+			return fmt.Errorf("archive entry count exceeds limit of %d", maxArchiveEntryCount)
 		}
 		// Flat archive only: reject any path separators or traversal (zip-slip).
 		name := hdr.Name
