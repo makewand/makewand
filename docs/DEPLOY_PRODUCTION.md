@@ -65,6 +65,12 @@ Use [`deploy/prometheus.yml`](../deploy/prometheus.yml) to scrape
 `/metrics`. Pair it with an admin metrics token that only carries
 `admin:metrics:read`.
 
+The `path` label uses route templates (for example
+`/v1/admin/users/:id/role` or `/v1/sessions/:workspace`); any other path,
+including unauthenticated 404 probes, is reported as `path="other"`, and
+non-standard methods as `method="OTHER"`. The recorder also keeps at most 512
+label combinations, so clients cannot grow the series set.
+
 ## Operational Notes
 
 - Prefer `127.0.0.1` + SSH tunnel or a private overlay network.
