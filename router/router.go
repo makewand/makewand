@@ -512,9 +512,19 @@ func (r *Router) routingTables() *strategyTables {
 	return r.tables.Load()
 }
 
-// LoadUserOverrides deep-merges configDir/routing.json into this Router's
-// tables. Missing file is not an error; invalid overrides leave the tables
-// unchanged and return the error.
+// LoadUserOverrides applies configDir/routing.json to this Router's tables.
+//
+// The file's fields are deep-merged over the immutable built-in defaults, NOT
+// over the current snapshot: every successful call replaces whatever overrides
+// were applied before (including the ones RouterConfig.ConfigDir loaded at
+// construction), so only the most recently loaded routing.json is in effect.
+// Within that file, absent fields keep their built-in defaults. This is the
+// same replace semantics the WatchOverrides hot-reload relies on to stay
+// idempotent (deleting a field from routing.json reverts it to its default).
+// To combine settings from several places, put them in one routing.json.
+//
+// A missing routing.json is not an error and leaves the current tables
+// unchanged; an invalid one also leaves them unchanged and returns the error.
 func (r *Router) LoadUserOverrides(configDir string) error {
 	return r.routingTables().loadUserOverrides(configDir)
 }

@@ -1,7 +1,7 @@
 // reload.go — Strategy table hot-reload via file system polling.
 //
 // WatchOverrides starts a background goroutine that periodically checks
-// routing.json for changes and merges them into this Router's strategy tables.
+// routing.json for changes and re-applies it over the built-in defaults.
 // No external dependencies (fsnotify) required — uses simple stat-based polling.
 package router
 
@@ -17,10 +17,11 @@ import (
 const DefaultReloadInterval = 30 * time.Second
 
 // WatchOverrides starts a background goroutine that polls configDir/routing.json
-// for modifications. When the file changes, the new data is validated and
-// deep-merged into this Router's strategy tables; other Router instances are
-// unaffected. Invalid overrides keep the previous tables. The goroutine stops
-// when ctx is canceled.
+// for modifications. When the file changes, the new data is deep-merged over
+// the immutable built-in defaults, validated, and swapped in — replacing the
+// previously applied overrides, so removing a field reverts it to its default;
+// other Router instances are unaffected. Invalid overrides keep the previous
+// tables. The goroutine stops when ctx is canceled.
 //
 // Returns immediately. Call with a cancellable context to stop the watcher.
 // Errors during reload are traced (if a TraceSink is set) but do not stop the watcher.
