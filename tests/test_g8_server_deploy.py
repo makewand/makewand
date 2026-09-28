@@ -68,5 +68,41 @@ class SystemdUnitTests(unittest.TestCase):
         self.assertNotIn("- `/etc/makewand/server_auth.json`", guide)
 
 
+def _version_tuple(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+class ContainerDeploymentTests(unittest.TestCase):
+    """go-server#4, go-server#12, eng-delivery#8: the documented Compose path must boot."""
+
+    def test_dockerfile_go_version_satisfies_go_mod(self):
+        go_mod = (ROOT / "go.mod").read_text(encoding="utf-8")
+        required = re.search(r"^go (\d+\.\d+(?:\.\d+)?)\s*$", go_mod, re.M).group(1)
+        dockerfile = (DEPLOY / "Dockerfile").read_text(encoding="utf-8")
+        image = re.search(r"^FROM golang:(\d+\.\d+(?:\.\d+)?)\S*\s+AS build", dockerfile, re.M)
+        self.assertIsNotNone(image, "build stage must pin a golang:<version> image")
+        self.assertGreaterEqual(_version_tuple(image.group(1)), _version_tuple(required))
+        self.assertRegex(dockerfile, r"(?m)^ENV GOTOOLCHAIN=local$")
+
+    def test_image_is_documented_as_server_only(self):
+        dockerfile = (DEPLOY / "Dockerfile").read_text(encoding="utf-8")
+        guide = (DOCS / "DEPLOY_PRODUCTION.md").read_text(encoding="utf-8")
+        self.assertIn("Server-only image", dockerfile)
+        self.assertNotIn("python3", re.findall(r"(?m)^RUN apt-get.*$", dockerfile)[0])
+        self.assertIn("**server-only**", guide)
+        self.assertIn("no Python runtime", guide)
+
+    def test_compose_opts_into_paid_api_with_explanation(self):
+        compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
+        match = re.search(r"(?m)^\s+MAKEWAND_API_POLICY:\s*(\S+)\s*$", compose)
+        self.assertIsNotNone(match, "compose must set MAKEWAND_API_POLICY for the API-key-only image")
+        self.assertIn("allow_paid", match.group(1))
+        self.assertIn("PAID API OPT-IN", compose)
+        guide = (DOCS / "DEPLOY_PRODUCTION.md").read_text(encoding="utf-8")
+        env_example = guide[guide.index("Example `deploy/.env`"):]
+        self.assertIn("MAKEWAND_API_POLICY=allow_paid", env_example)
+        self.assertIn("subscription_only", guide)
+
+
 if __name__ == "__main__":
     unittest.main()

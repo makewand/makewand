@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 )
@@ -67,5 +69,29 @@ func TestServeRegistrationGlobalLimitAlert(t *testing.T) {
 	}
 	if len(audit.events) != 1 || audit.events[0].Kind != "registration_global_limit" || audit.events[0].Status != 429 {
 		t.Fatalf("audit events=%+v", audit.events)
+	}
+}
+
+// go-server#4: an API-key-only deployment (the documented Docker Compose shape)
+// must be told to opt into paid API use instead of "run makewand setup".
+func TestServeNoModelsErrorExplainsAPIPolicy(t *testing.T) {
+	t.Setenv("MAKEWAND_API_POLICY", "")
+	if err := os.Unsetenv("MAKEWAND_API_POLICY"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{OpenAIAPIKey: "sk-test"}
+	if cfg.HasAnyModel() {
+		t.Fatal("API key alone should not enable a model under the default policy")
+	}
+	err := serveNoModelsError(cfg)
+	if err == nil || !strings.Contains(err.Error(), "MAKEWAND_API_POLICY=allow_paid") {
+		t.Fatalf("error=%v, want a MAKEWAND_API_POLICY=allow_paid hint", err)
+	}
+	t.Setenv("MAKEWAND_API_POLICY", "allow_paid")
+	if !cfg.HasAnyModel() {
+		t.Fatal("allow_paid should enable the API key provider")
+	}
+	if err := serveNoModelsError(&config.Config{}); err == nil || !strings.Contains(err.Error(), "makewand setup") {
+		t.Fatalf("no-key error=%v", err)
 	}
 }

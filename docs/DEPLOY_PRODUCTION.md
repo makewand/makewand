@@ -51,12 +51,33 @@ sudo systemctl daemon-reload && sudo systemctl start makewand
 Use [`deploy/docker-compose.yml`](../deploy/docker-compose.yml)
 with [`deploy/Dockerfile`](../deploy/Dockerfile).
 
-Example `.env`:
+The image is **server-only**: it contains the Go `makewand` binary (built with
+the Go version required by `go.mod`) and no Python runtime or orchestration
+engine. `serve`, `token`, `user`, `state`, `audit`, and `usage` work inside the
+container; `run`, `review`, `race`, `status`, `probe`, `models`, and the other
+engine commands do not. It also ships no subscription CLI (Claude Code, Codex,
+Gemini CLI), so it can only serve through provider API keys.
+
+**Paid API opt-in is required.** makewand's default `api_policy` is
+`subscription_only`, which ignores `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and
+`OPENAI_API_KEY` so that a key in the environment never causes paid API charges
+by itself. With only an API key the server therefore has no usable model and
+exits at startup. The Compose file sets `MAKEWAND_API_POLICY=allow_paid` for
+this reason; every request the container serves is billed to your API key.
+Bound spend with token quotas (`--max-cost-usd-per-day` and similar on
+`token issue`) and organization/project budgets.
+
+Example `deploy/.env`:
 
 ```bash
 OPENAI_API_KEY=replace-me
+# Already the Compose default; keep it explicit if you template this file.
+MAKEWAND_API_POLICY=allow_paid
 MAKEWAND_SERVER_AUDIT_LOG=1
 ```
+
+Without `allow_paid`, `serve` stops with `no usable AI models: provider API keys
+are set, but api_policy is "subscription_only" ...`.
 
 ## Backup and Restore
 

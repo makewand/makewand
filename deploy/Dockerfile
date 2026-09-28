@@ -1,4 +1,14 @@
-FROM golang:1.25.12 AS build
+# Server-only image. It contains the Go `makewand` binary and nothing else:
+# `serve`, `token`, `user`, `state`, `audit`, `usage`, and the other Go
+# commands work, but the Python orchestration engine and python3 are NOT
+# installed, so `run`, `review`, `race`, `observe`, `models`, `candidates`,
+# `inspect`, `apply`, `discard`, `sandbox`, `status`, and `probe` exit with
+# "python3 runtime is required". Use a release archive or package for those.
+#
+# The Go version must be at least the `go` directive in go.mod. GOTOOLCHAIN=local
+# makes a mismatch fail the build instead of downloading a toolchain.
+FROM golang:1.26.7 AS build
+ENV GOTOOLCHAIN=local
 WORKDIR /src
 COPY . .
 # Stamp the version into internal/buildinfo so `makewand version` in the image is
@@ -25,6 +35,11 @@ ENTRYPOINT ["/usr/local/bin/makewand"]
 # on the host loopback only (see deploy/docker-compose.yml, which uses
 # "127.0.0.1:8080:8080") and reach it via an SSH tunnel, or put a
 # TLS-terminating reverse proxy (nginx, Caddy) in front.
+#
+# Providers: the image has no subscription CLI, so it serves through provider
+# API keys only, which requires MAKEWAND_API_POLICY=allow_paid (the default
+# api_policy ignores API keys to avoid unexpected paid charges);
+# deploy/docker-compose.yml sets it and explains the billing implication.
 #
 # Auth is fail-closed: with no --token/--auth-config and an empty state DB,
 # every authenticated endpoint is rejected until a token exists (the unauthenticated

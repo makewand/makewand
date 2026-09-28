@@ -11,8 +11,8 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     # REQUIRED for the server to start: at least one provider must be usable,
-    # or `serve` exits immediately ("no model providers available"). The image
-    # ships no subscription CLI, so supply a provider API key (ANTHROPIC_API_KEY,
+    # or `serve` exits immediately ("no usable AI models"). The image ships no
+    # subscription CLI, so supply a provider API key (ANTHROPIC_API_KEY,
     # GEMINI_API_KEY, or OPENAI_API_KEY) via deploy/.env.
     # Optional in the same .env: MAKEWAND_SERVER_TOKEN for a quick single-token
     # setup. Without it, auth falls back to the SQLite state DB, which starts
@@ -23,6 +23,15 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      # PAID API OPT-IN. makewand's default api_policy is subscription_only,
+      # which ignores provider API keys so that having a key in the environment
+      # never causes paid API charges by itself. This image has no subscription
+      # CLI, so an API key is its only provider and the policy must allow paid
+      # use or `serve` exits at startup. Requests served by this container are
+      # billed to the API key(s) in deploy/.env; bound spend with token quotas
+      # and team budgets. To override, set MAKEWAND_API_POLICY in deploy/.env.
+      MAKEWAND_API_POLICY: ${MAKEWAND_API_POLICY:-allow_paid}
     volumes:
       # Named volume (not a host bind mount) so the data dir is initialized
       # with the image's makewand:makewand ownership on first start; a fresh

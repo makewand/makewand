@@ -88,7 +88,7 @@ func serveCmd() *cobra.Command {
 
 			cfg := loadConfigWithWarning()
 			if !cfg.HasAnyModel() {
-				return fmt.Errorf("no local AI models configured on this host; run 'makewand setup' first")
+				return serveNoModelsError(cfg)
 			}
 
 			authz, bootstrapManager, err := loadServeAuthorizer(token, authConfig)
@@ -437,6 +437,17 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().IntVar(&registrationSlots, "registration-concurrency", serverauth.DefaultRegistrationConcurrency, "maximum concurrent self-registration password hashes (excess requests get 503)")
 	cmd.Flags().BoolVar(&unsafeNoTLS, "unsafe-no-tls", false, "DANGER: allow plaintext listening on non-loopback addresses (only for testing behind a reverse proxy)")
 	return cmd
+}
+
+// serveNoModelsError explains why serve has no usable model. Provider API keys
+// are ignored unless the API policy is allow_paid (paid API use must be opted
+// into), which is the usual cause for container deployments that ship no
+// subscription CLI and only set an API key.
+func serveNoModelsError(cfg *config.Config) error {
+	if cfg != nil && !cfg.PaidAPIAllowed() && (cfg.ClaudeAPIKey != "" || cfg.GeminiAPIKey != "" || cfg.OpenAIAPIKey != "") {
+		return fmt.Errorf("no usable AI models: provider API keys are set, but api_policy is %q, which ignores them to prevent unexpected paid API charges; set MAKEWAND_API_POLICY=allow_paid (or \"api_policy\": \"allow_paid\" in config.json) to serve through the API keys, or run 'makewand setup' to configure a subscription CLI", cfg.EffectiveAPIPolicy())
+	}
+	return fmt.Errorf("no local AI models configured on this host; run 'makewand setup' first")
 }
 
 // serveRegistrationLimits validates the self-registration flags. A global
