@@ -6,6 +6,8 @@ display width formatting (pad_display), and conversation history sliding window 
 
 import io
 import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -34,11 +36,24 @@ class TestInteractiveConsole(unittest.TestCase):
         self.assertIn("/help", card)
 
     def test_get_git_branch(self):
-        cwd = os.getcwd()
-        branch = get_git_branch(cwd)
-        # Should be master on this repo
-        self.assertIsNotNone(branch)
-        self.assertEqual(branch, "master")
+        # Hermetic: a fresh repository on a named branch, independent of the
+        # checkout the tests run from (feature branch, detached PR head, tarball).
+        with tempfile.TemporaryDirectory(prefix="makewand-branch-") as repo:
+            def git(*args):
+                subprocess.run(["git", "-C", repo, "-c", "user.name=Branch Test",
+                                "-c", "user.email=branch@example.invalid", *args],
+                               check=True, capture_output=True, text=True)
+
+            git("init", "-q")
+            git("commit", "-q", "--allow-empty", "-m", "init")
+            git("checkout", "-q", "-b", "feature/g5-hermetic-branch")
+            self.assertEqual(get_git_branch(repo), "feature/g5-hermetic-branch")
+
+        with tempfile.TemporaryDirectory(prefix="makewand-no-repo-") as plain:
+            outside_repo = subprocess.run(["git", "-C", plain, "rev-parse", "--git-dir"],
+                                          capture_output=True).returncode != 0
+            if outside_repo:  # TMPDIR itself may live inside a checkout
+                self.assertIsNone(get_git_branch(plain))
 
     def test_format_short_path(self):
         home = str(Path.home())

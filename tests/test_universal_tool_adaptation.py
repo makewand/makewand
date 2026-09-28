@@ -73,9 +73,12 @@ class TestUniversalToolAdaptation(unittest.TestCase):
 
     def test_dynamic_active_providers_detection(self):
         """Tests dynamic active tool pool detection based on real-time environment."""
+        # Paid API providers only count once billing is explicitly allowed. The test
+        # used to inherit allow_paid from a config.json leaked by test_hybrid_routing.
         with patch("makewand.config.has_subscription_configured") as mock_sub, \
              patch("makewand.config.has_api_configured") as mock_api, \
              patch("makewand.config.is_provider_enabled") as mock_en, \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": "allow_paid"}), \
              patch("makewand.providers.local.is_local_model_available", return_value=(False, None, None)):
 
             mock_en.return_value = True

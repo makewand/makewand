@@ -79,8 +79,12 @@ class TestAuditV31Fixes(unittest.TestCase):
             "deepseek": {"status": "healthy"},
             "qwen": {"status": "healthy"},
         }
+        # The local model is enabled *and reachable* by construction: the result must
+        # not depend on whether an Ollama daemon happens to run on the test host.
         with patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
-             patch("makewand.config.load_user_config", return_value={"enabled_providers": {"local": True}}):
+             patch("makewand.config.load_user_config", return_value={"enabled_providers": {"local": True}}), \
+             patch("makewand.providers.local.is_local_model_available",
+                   return_value=(True, "qwen2.5-coder:7b", ["qwen2.5-coder:7b"])):
             # 1. Coding prompt: local and deepseek must NOT be in available coders
             coders, reviewers, meta = select_optimal_engine_pair(
                 "在当前目录编写一个支持重试机制的 HTTP Client",
@@ -356,26 +360,18 @@ class TestAuditV31Fixes(unittest.TestCase):
     def test_p1_e_aider_sandbox_env_and_mount(self):
         """P1-E: Aider in sandbox passes API keys and ro-bind mounts ~/.aider.conf.yml if exists."""
         from makewand.sandbox import wrap_bwrap
-        with tempfile.TemporaryDirectory() as tmpdir:
-            conf_file = Path.home() / ".aider.conf.yml"
-            conf_created = False
-            if not conf_file.exists():
-                try:
-                    conf_file.write_text("model: gpt-4o\n")
-                    conf_created = True
-                except Exception:
-                    pass
-            try:
-                with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-aider-123", "ANTHROPIC_API_KEY": "sk-ant-test"}):
-                    bwrap_cmd = wrap_bwrap(["aider", "--help"], workspace=tmpdir, is_provider=True, provider_name="aider")
-                    self.assertIn("OPENAI_API_KEY", bwrap_cmd)
-                    self.assertIn("sk-test-aider-123", bwrap_cmd)
-                    self.assertIn("ANTHROPIC_API_KEY", bwrap_cmd)
-                    if conf_file.exists():
-                        self.assertIn(str(conf_file), bwrap_cmd)
-            finally:
-                if conf_created and conf_file.exists():
-                    conf_file.unlink()
+        # A throwaway HOME: the test must never create (or delete) ~/.aider.conf.yml
+        # in the developer's real home directory.
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as fake_home:
+            conf_file = Path(fake_home) / ".aider.conf.yml"
+            conf_file.write_text("model: gpt-4o\n")
+            with patch.dict(os.environ, {"HOME": fake_home, "OPENAI_API_KEY": "sk-test-aider-123",
+                                         "ANTHROPIC_API_KEY": "sk-ant-test"}):
+                bwrap_cmd = wrap_bwrap(["aider", "--help"], workspace=tmpdir, is_provider=True, provider_name="aider")
+                self.assertIn("OPENAI_API_KEY", bwrap_cmd)
+                self.assertIn("sk-test-aider-123", bwrap_cmd)
+                self.assertIn("ANTHROPIC_API_KEY", bwrap_cmd)
+                self.assertIn(str(conf_file), bwrap_cmd)
 
     def test_p2_improvements(self):
         """P2 improvements: 0600 api_keys, agy --mode plan in readonly, fail_and_cleanup baseline diff, LRU eviction."""

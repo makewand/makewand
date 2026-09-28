@@ -2,10 +2,15 @@
 Unit tests for Makewand Hybrid Routing (Subscription + API Key Fallback) and Local Model Provider.
 """
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import makewand.config as config
 
 from makewand.config import (
     get_provider_execution_mode,
@@ -26,14 +31,26 @@ from makewand.orchestrator import select_optimal_engine_pair
 class TestHybridRouting(unittest.TestCase):
 
     def setUp(self):
+        # Every config write of this class lands in a per-test directory: the
+        # patched allow_paid/local config below must never be persisted into the
+        # session (or a developer's real) config.json.
+        temp = tempfile.TemporaryDirectory(prefix="makewand-hybrid-config-")
+        self.addCleanup(temp.cleanup)
+        self.config_dir = Path(temp.name) / "config"
+        for name, value in (("CONFIG_DIR", self.config_dir),
+                            ("CONFIG_FILE", self.config_dir / "config.json"),
+                            ("API_KEYS_FILE", self.config_dir / "api_keys.json"),
+                            ("CANDIDATES_DIR", self.config_dir / "candidates"),
+                            ("BACKUPS_DIR", self.config_dir / "backups")):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.patch_cfg = patch("makewand.config.load_user_config", return_value={"api_policy": "allow_paid", "enabled_providers": {"local": True}})
         self.mock_cfg = self.patch_cfg.start()
+        self.addCleanup(self.patch_cfg.stop)
         self.patch_local = patch("makewand.providers.local.is_local_model_available", return_value=(True, "gemma4:31b", ["gemma4:31b"]))
         self.mock_local = self.patch_local.start()
-
-    def tearDown(self):
-        self.patch_cfg.stop()
-        self.patch_local.stop()
+        self.addCleanup(self.patch_local.stop)
 
     def test_execution_mode_detection(self):
         # 1. Local
@@ -163,10 +180,20 @@ class TestHybridRouting(unittest.TestCase):
         from makewand.config import set_provider_enabled, is_provider_enabled, get_provider_execution_mode
         from makewand.orchestrator import dispatch_task
 
+        # Exercise the real config round trip (per-test file), not the patched loader:
+        # toggling one provider must keep the user's other settings, including a
+        # subscription_only billing policy.
+        self.patch_cfg.stop()
+        config.CONFIG_DIR.mkdir(parents=True)
+        seed = {"api_policy": "subscription_only", "enabled_providers": {"local": True}, "custom_key": 7}
+        config.CONFIG_FILE.write_text(json.dumps(seed), encoding="utf-8")
+
         # Disable local
-        set_provider_enabled("local", False)
+        self.assertTrue(set_provider_enabled("local", False))
         self.assertFalse(is_provider_enabled("local"))
         self.assertEqual(get_provider_execution_mode("local"), "disabled")
+        saved = json.loads(config.CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(saved, {"api_policy": "subscription_only", "enabled_providers": {"local": False}, "custom_key": 7})
 
         # Probe when disabled returns disabled status
         probe_res = probe_model("local")
@@ -178,8 +205,11 @@ class TestHybridRouting(unittest.TestCase):
         self.assertIn("禁用", err)
 
         # Re-enable local
-        set_provider_enabled("local", True)
+        self.assertTrue(set_provider_enabled("local", True))
         self.assertTrue(is_provider_enabled("local"))
+        saved = json.loads(config.CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(saved["api_policy"], "subscription_only")
+        self.assertIs(saved["enabled_providers"]["local"], True)
 
 if __name__ == "__main__":
     unittest.main()
