@@ -225,8 +225,11 @@ func NewAgyCLI(binPath string) *CLIProvider {
 // --- Codex CLI ---
 
 // NewCodexCLI creates a provider that uses `codex exec` (Codex CLI).
-// Task-aware: uses `codex review --uncommitted` for review tasks,
+// Task-aware: uses `codex review --uncommitted` for local review tasks,
 // `codex exec --json` for code/analysis tasks (provides structured usage data).
+// Remote-origin requests (see ContextWithRemoteOrigin) never use the review
+// subcommand: it ignores the prompt and reviews the serving host's working
+// tree, so they always run the caller's prompt through `codex exec`.
 func NewCodexCLI(binPath string) *CLIProvider {
 	p := &CLIProvider{
 		name:              "codex-cli",
@@ -236,8 +239,8 @@ func NewCodexCLI(binPath string) *CLIProvider {
 		parseJSONResponse: parseCodexCLIJSONL,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		// Use dedicated review subcommand for review tasks.
-		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		// Use dedicated review subcommand for local review tasks.
+		if codexUsesReviewSubcommand(ctx) {
 			args := []string{"review", "--uncommitted"}
 			return exec.CommandContext(ctx, binPath, args...)
 		}
@@ -253,7 +256,7 @@ func NewCodexCLI(binPath string) *CLIProvider {
 		return exec.CommandContext(ctx, binPath, args...)
 	}
 	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		if codexUsesReviewSubcommand(ctx) {
 			args := []string{"review", "--uncommitted"}
 			return exec.CommandContext(ctx, binPath, args...)
 		}
@@ -438,6 +441,14 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 		defer cliCancel()
 	}
 
+	ctx, cleanupWorkDir, err := prepareRemoteCLIWorkDir(ctx, c.provider)
+	if err != nil {
+		return "", Usage{}, err
+	}
+	// Every attempt has been waited for when Chat returns, so the scratch dir
+	// is gone before the caller sees the result.
+	defer cleanupWorkDir()
+
 	attempts := 0
 	for {
 		attempts++
@@ -505,6 +516,12 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 		ctx, cancel = context.WithCancel(ctx)
 	}
 
+	ctx, cleanupWorkDir, err := prepareRemoteCLIWorkDir(ctx, c.provider)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	buildCmd := c.buildStreamCmd
 	if buildCmd == nil {
 		buildCmd = c.buildCmd
@@ -515,16 +532,19 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		cleanupWorkDir()
 		return nil, newProviderError(c.provider, "CLI pipe", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
+		cleanupWorkDir()
 		return nil, newProviderError(c.provider, "CLI stderr pipe", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		cancel()
+		cleanupWorkDir()
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
@@ -532,6 +552,9 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 	go func() {
 		defer cancel()
 		defer close(ch)
+		// Safety net; the normal path removes the scratch dir right after
+		// cmd.Wait, before any terminal chunk reaches the consumer.
+		defer cleanupWorkDir()
 		start := time.Now()
 
 		var stderr bytes.Buffer
@@ -590,6 +613,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 
 		<-stderrDone
 		waitErr := cmd.Wait()
+		cleanupWorkDir()
 		duration := time.Since(start)
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -847,11 +871,64 @@ func applyCLIWorkDir(ctx context.Context, cmd *exec.Cmd) {
 	}
 	if dir, ok := WorkDirFromContext(ctx); ok {
 		cmd.Dir = dir
+		return
 	}
+	if dir, ok := ctx.Value(cliScratchDirContextKey{}).(string); ok && dir != "" {
+		cmd.Dir = dir
+	}
+}
+
+// cliScratchDirContextKey carries the per-call scratch directory that
+// prepareRemoteCLIWorkDir created. It is deliberately distinct from the public
+// WorkDir key: it is not an explicit caller choice and must not widen the Codex
+// sandbox to workspace-write.
+type cliScratchDirContextKey struct{}
+
+// prepareRemoteCLIWorkDir isolates a remote-origin CLI call that has no
+// explicit WorkDir: the command runs in a freshly created, empty, private
+// (0700) temporary directory instead of inheriting the server process's cwd,
+// so a remote caller can never steer the agent at the serving host's working
+// tree through relative paths or cwd-discovered instruction files. The
+// returned cleanup removes the directory and is idempotent. Local calls and
+// calls with an explicit WorkDir are returned unchanged.
+func prepareRemoteCLIWorkDir(ctx context.Context, provider string) (context.Context, func(), error) {
+	noop := func() {}
+	if !RemoteOriginFromContext(ctx) {
+		return ctx, noop, nil
+	}
+	if _, ok := WorkDirFromContext(ctx); ok {
+		return ctx, noop, nil
+	}
+	dir, err := os.MkdirTemp("", "makewand-remote-cli-*")
+	if err != nil {
+		return ctx, noop, newProviderError(provider, "CLI scratch dir", ErrorKindConfig, false, 0, err.Error(), err)
+	}
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() { _ = os.RemoveAll(dir) })
+	}
+	return context.WithValue(ctx, cliScratchDirContextKey{}, dir), cleanup, nil
+}
+
+// codexUsesReviewSubcommand reports whether a Codex call should run
+// `codex review --uncommitted`. Only local review tasks do: the subcommand
+// ignores the prompt and reviews the uncommitted changes of the current
+// directory, which for a remote caller would be the serving host's state.
+func codexUsesReviewSubcommand(ctx context.Context) bool {
+	if RemoteOriginFromContext(ctx) {
+		return false
+	}
+	task, ok := TaskFromContext(ctx)
+	return ok && task == TaskReview
 }
 
 func codexSandboxMode(ctx context.Context) string {
 	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		return "read-only"
+	}
+	// Remote callers never get a writable Codex sandbox, even when an embedder
+	// supplied an explicit WorkDir.
+	if RemoteOriginFromContext(ctx) {
 		return "read-only"
 	}
 	if _, ok := WorkDirFromContext(ctx); ok {

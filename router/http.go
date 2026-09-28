@@ -947,7 +947,13 @@ func writeSSEData(w http.ResponseWriter, payload any) error {
 // chatForHTTP preserves the meaning of Power mode across the HTTP and remote
 // adapters. An explicit model/provider override still wins; otherwise Power
 // executes the same generate-and-judge ensemble as local ChatBest callers.
+//
+// Every HTTP request is marked as remote-origin (ContextWithRemoteOrigin): a
+// network caller must never make a local CLI run a host-state-dependent
+// command (e.g. `codex review --uncommitted` on the server's working tree) or
+// inherit the server process's cwd.
 func (r *Router) chatForHTTP(ctx context.Context, requestedModel string, task TaskType, messages []Message, system string) (string, Usage, RouteResult, error) {
+	ctx = ContextWithRemoteOrigin(ctx)
 	if requestedModel != "" {
 		return r.ChatWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
 	}
@@ -962,6 +968,7 @@ func (r *Router) chatForHTTP(ctx context.Context, requestedModel string, task Ta
 // only the winning answer keeps streaming clients compatible without silently
 // degrading Power to a single-provider call.
 func (r *Router) streamForHTTP(ctx context.Context, requestedModel string, task TaskType, messages []Message, system string) (<-chan StreamChunk, RouteResult, Usage, error) {
+	ctx = ContextWithRemoteOrigin(ctx)
 	if requestedModel != "" {
 		stream, result, err := r.ChatStreamWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
 		return stream, result, Usage{}, err

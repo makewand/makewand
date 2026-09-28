@@ -82,6 +82,34 @@ func WorkDirFromContext(ctx context.Context) (string, bool) {
 	return dir, ok && dir != ""
 }
 
+type remoteOriginContextKey struct{}
+
+// ContextWithRemoteOrigin marks ctx as serving a remote (network) caller, such
+// as a request received by the HTTP facade. Remote requests must never make a
+// local CLI provider run a command whose result depends on the serving host's
+// state, so for a marked context:
+//
+//   - the Codex CLI never maps TaskReview to `codex review --uncommitted` (which
+//     ignores the prompt and reviews the host working tree); it runs the
+//     caller's prompt through `codex exec` in a read-only sandbox instead;
+//   - when no explicit WorkDir is set (see ContextWithWorkDir), every CLI
+//     invocation runs in its own freshly created, empty temporary directory
+//     that is removed afterwards, never in the server process's cwd.
+//
+// The HTTP facade (HTTPHandler) applies this marker to every chat request.
+// Embedders that expose Router.Chat & co. over their own network front-end
+// should apply it too.
+func ContextWithRemoteOrigin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, remoteOriginContextKey{}, true)
+}
+
+// RemoteOriginFromContext reports whether ctx was marked by
+// ContextWithRemoteOrigin.
+func RemoteOriginFromContext(ctx context.Context) bool {
+	remote, _ := ctx.Value(remoteOriginContextKey{}).(bool)
+	return remote
+}
+
 // TaskType categorizes what kind of AI task is being performed.
 type TaskType int
 
