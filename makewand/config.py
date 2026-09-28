@@ -13,6 +13,51 @@ STATUS_CACHE_FILE = CONFIG_DIR / "status.json"
 CANDIDATES_DIR = CONFIG_DIR / "candidates"
 BACKUPS_DIR = CONFIG_DIR / "backups"
 
+# Private state for artifacts (delivery/rejected patches, rollback backups,
+# workspace locks) and shadow worktrees. Never a shared fixed /tmp path.
+def _default_state_dir() -> Path:
+    xdg_state = os.environ.get("XDG_STATE_HOME", "")
+    # XDG: relative values are invalid and must be ignored.
+    base = Path(xdg_state).expanduser() if xdg_state and Path(xdg_state).expanduser().is_absolute() else Path.home() / ".local" / "state"
+    return base / "makewand"
+
+ARTIFACTS_DIR = Path(os.path.abspath(Path(os.environ.get("MAKEWAND_ARTIFACTS_DIR") or (_default_state_dir() / "artifacts")).expanduser()))
+SHADOW_WORKTREES_DIR = Path(os.path.abspath(Path(os.environ.get("MAKEWAND_SHADOW_DIR") or (_default_state_dir() / "shadow-worktrees")).expanduser()))
+
+
+def ensure_private_dir(path) -> Path:
+    """Create ``path`` (and missing parents) and return it as a private 0700 directory.
+
+    Refuses a final component that is a symlink, is not a directory, or is not
+    owned by the current user, so a pre-planted directory in a shared location
+    can never receive Makewand artifacts.
+    """
+    target = Path(os.path.abspath(Path(path).expanduser()))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(target, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(target)
+    import stat as _stat
+    if _stat.S_ISLNK(info.st_mode):
+        raise PermissionError(f"refusing symlinked private directory: {target}")
+    if not _stat.S_ISDIR(info.st_mode):
+        raise PermissionError(f"private directory path is not a directory: {target}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise PermissionError(f"private directory is owned by another user (uid {info.st_uid}): {target}")
+    if _stat.S_IMODE(info.st_mode) != 0o700:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow and hasattr(os, "fchmod"):
+            fd = os.open(target, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
+            try:
+                os.fchmod(fd, 0o700)
+            finally:
+                os.close(fd)
+        else:  # pragma: no cover - platforms without O_NOFOLLOW
+            os.chmod(target, 0o700)
+    return target
+
 # Compatibility cache path with Gemini / Antigravity config
 LEGACY_TRIO_CACHE = (CONFIG_DIR / "legacy_status.json" if os.environ.get("MAKEWAND_CONFIG_DIR")
                      else Path.home() / ".gemini" / "config" / "trio_status.json")
