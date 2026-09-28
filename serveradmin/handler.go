@@ -563,7 +563,7 @@ func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusForbidden, fmt.Sprintf("token does not allow scope %q", scope), 0, 0, 0)
 		return nil, false
 	}
-	return grant, true
+	return elevateGlobalAdministratorGrant(grant, opts.UserStore), true
 }
 
 type pageWindow struct {

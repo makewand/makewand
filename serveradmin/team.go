@@ -79,6 +79,11 @@ func handleOrganizations(w http.ResponseWriter, req *http.Request, opts HandlerO
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", status, message, 0, 0, 0)
 			return
 		}
+		if err := forbidUserBoundTenantAdministration(grant); err != nil {
+			writeError(w, http.StatusForbidden, "forbidden", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusForbidden, err.Error(), 0, 0, 0)
+			return
+		}
 		if grant != nil && (grant.OrganizationID() != "" || grant.ProjectID() != "") {
 			writeError(w, http.StatusForbidden, "forbidden", "scoped admin tokens cannot create additional organizations")
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusForbidden, "scoped admin tokens cannot create additional organizations", 0, 0, 0)
@@ -125,7 +130,7 @@ func handleProjects(w http.ResponseWriter, req *http.Request, opts HandlerOption
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersRead, "admin_projects", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 			return
 		}
-		items = filterProjects(items, req, grant)
+		items = filterProjects(items, req, grant, opts.TeamStore)
 		page := paginateBounds(len(items), req)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"data":       items[page.Start:page.End],
@@ -143,6 +148,11 @@ func handleProjects(w http.ResponseWriter, req *http.Request, opts HandlerOption
 			status, code, message := adminJSONDecodeError(err)
 			writeError(w, status, code, message)
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", status, message, 0, 0, 0)
+			return
+		}
+		if err := forbidUserBoundTenantAdministration(grant); err != nil {
+			writeError(w, http.StatusForbidden, "forbidden", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusForbidden, err.Error(), 0, 0, 0)
 			return
 		}
 		if grant != nil && grant.OrganizationID() != "" {
@@ -207,7 +217,7 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 	billing := serverteam.BillingSummary{}
 	if opts.TeamStore != nil {
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
-			orgs = filterOrganizations(orgs, req, grant, opts.TeamStore)
+			orgs = filterBillableOrganizations(filterOrganizations(orgs, req, grant, opts.TeamStore), grant, opts.TeamStore)
 			for _, org := range orgs {
 				billing.Organizations = append(billing.Organizations, serverteam.BuildBillingBucket(
 					org.ID,
@@ -223,7 +233,7 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 			orgID = grant.OrganizationID()
 		}
 		if projects, err := opts.TeamStore.ListProjects(orgID); err == nil {
-			projects = filterProjects(projects, req, grant)
+			projects = filterProjects(projects, req, grant, opts.TeamStore)
 			for _, project := range projects {
 				billing.Projects = append(billing.Projects, serverteam.BuildBillingBucket(
 					project.ID,
@@ -320,7 +330,7 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 	alerts := make([]serverteam.BudgetAlert, 0, 8)
 	if opts.TeamStore != nil {
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
-			orgs = filterOrganizations(orgs, req, grant, opts.TeamStore)
+			orgs = filterBillableOrganizations(filterOrganizations(orgs, req, grant, opts.TeamStore), grant, opts.TeamStore)
 			for _, org := range orgs {
 				if alert, ok := serverteam.BuildBudgetAlert("organization", serverteam.BuildBillingBucket(
 					org.ID,
@@ -338,7 +348,7 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 			orgID = grant.OrganizationID()
 		}
 		if projects, err := opts.TeamStore.ListProjects(orgID); err == nil {
-			projects = filterProjects(projects, req, grant)
+			projects = filterProjects(projects, req, grant, opts.TeamStore)
 			for _, project := range projects {
 				if alert, ok := serverteam.BuildBudgetAlert("project", serverteam.BuildBillingBucket(
 					project.ID,
@@ -427,7 +437,7 @@ func handleDashboard(w http.ResponseWriter, req *http.Request, opts HandlerOptio
 			orgID = grant.OrganizationID()
 		}
 		if projects, err := opts.TeamStore.ListProjects(orgID); err == nil {
-			projects = filterProjects(projects, req, grant)
+			projects = filterProjects(projects, req, grant, opts.TeamStore)
 			payload["projects"] = map[string]any{
 				"count": len(projects),
 				"data":  projects,
@@ -484,6 +494,11 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", status, message, 0, 0, 0)
 			return
 		}
+		if err := forbidUserBoundTenantAdministration(grant); err != nil {
+			writeError(w, http.StatusForbidden, "forbidden", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, err.Error(), 0, 0, 0)
+			return
+		}
 		if grant != nil && grant.ProjectID() != "" {
 			writeError(w, http.StatusForbidden, "forbidden", "project-scoped admin tokens cannot manage organization memberships")
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, "project-scoped admin tokens cannot manage organization memberships", 0, 0, 0)
@@ -501,10 +516,6 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 		active := true
 		if payload.IsActive != nil {
 			active = *payload.IsActive
-		}
-		if grant.UserID() != "" && strings.TrimSpace(payload.UserID) != grant.UserID() {
-			writeError(w, http.StatusForbidden, "forbidden", "user-scoped tokens may only manage their own memberships")
-			return
 		}
 		if err := validateMembershipTarget(opts, payload.UserID, payload.OrganizationID, "", payload.Role); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -573,6 +584,11 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", status, message, 0, 0, 0)
 			return
 		}
+		if err := forbidUserBoundTenantAdministration(grant); err != nil {
+			writeError(w, http.StatusForbidden, "forbidden", err.Error())
+			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, err.Error(), 0, 0, 0)
+			return
+		}
 		if strings.TrimSpace(payload.ProjectID) == "" && grant.ProjectID() != "" {
 			payload.ProjectID = grant.ProjectID()
 		}
@@ -597,10 +613,6 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 		active := true
 		if payload.IsActive != nil {
 			active = *payload.IsActive
-		}
-		if grant.UserID() != "" && strings.TrimSpace(payload.UserID) != grant.UserID() {
-			writeError(w, http.StatusForbidden, "forbidden", "user-scoped tokens may only manage their own memberships")
-			return
 		}
 		if err := validateMembershipTarget(opts, payload.UserID, "", payload.ProjectID, payload.Role); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -633,23 +645,11 @@ func filterOrganizations(items []serverteam.Organization, req *http.Request, gra
 	}
 	query := req.URL.Query()
 	q := strings.ToLower(strings.TrimSpace(query.Get("q")))
-	scopedOrgID := ""
-	if grant != nil {
-		scopedOrgID = grant.OrganizationID()
-		if grant.ProjectID() != "" {
-			if teams == nil {
-				return nil
-			}
-			project, err := teams.GetProject(grant.ProjectID())
-			if err != nil || project == nil || (scopedOrgID != "" && scopedOrgID != project.OrganizationID) {
-				return nil
-			}
-			scopedOrgID = project.OrganizationID
-		}
-	}
+	view := resolveTenantView(grant, teams)
 	out := make([]serverteam.Organization, 0, len(items))
 	for _, item := range items {
-		if scopedOrgID != "" && item.ID != scopedOrgID {
+		item, ok := view.organization(item)
+		if !ok {
 			continue
 		}
 		if q != "" {
@@ -663,28 +663,33 @@ func filterOrganizations(items []serverteam.Organization, req *http.Request, gra
 	return out
 }
 
-func filterProjects(items []serverteam.Project, req *http.Request, grant *serverauth.Grant) []serverteam.Project {
+// filterBillableOrganizations keeps only organizations whose budget and spend
+// the grant may see; parents shown by name only are excluded from billing.
+func filterBillableOrganizations(items []serverteam.Organization, grant *serverauth.Grant, teams serverteam.Store) []serverteam.Organization {
+	view := resolveTenantView(grant, teams)
+	out := make([]serverteam.Organization, 0, len(items))
+	for _, item := range items {
+		if view.organizationBudgetVisible(item.ID) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func filterProjects(items []serverteam.Project, req *http.Request, grant *serverauth.Grant, teams serverteam.Store) []serverteam.Project {
 	if len(items) == 0 {
 		return nil
 	}
 	query := req.URL.Query()
 	q := strings.ToLower(strings.TrimSpace(query.Get("q")))
 	orgID := strings.TrimSpace(query.Get("organization_id"))
-	projectID := ""
-	if grant != nil {
-		if grant.OrganizationID() != "" {
-			orgID = grant.OrganizationID()
-		}
-		if grant.ProjectID() != "" {
-			projectID = grant.ProjectID()
-		}
-	}
+	view := resolveTenantView(grant, teams)
 	out := make([]serverteam.Project, 0, len(items))
 	for _, item := range items {
-		if orgID != "" && item.OrganizationID != orgID {
+		if !view.project(item) {
 			continue
 		}
-		if projectID != "" && item.ID != projectID {
+		if orgID != "" && item.OrganizationID != orgID {
 			continue
 		}
 		if q != "" {
