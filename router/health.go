@@ -16,23 +16,31 @@ func (r *Router) isCircuitOpen(provider string) (bool, time.Duration) {
 }
 
 func (r *Router) beforeProviderAttempt(provider string) (bool, time.Duration) {
+	allow, remaining, _ := r.admitProviderAttempt(provider)
+	return allow, remaining
+}
+
+// admitProviderAttempt is beforeProviderAttempt returning the breaker admission
+// ticket that recordProviderSuccess needs to tell the half-open probe apart
+// from stale in-flight requests.
+func (r *Router) admitProviderAttempt(provider string) (bool, time.Duration, breakerTicket) {
 	// Confirmed-exhaustion quota seal is an unbypassable hard gate: a pool that
 	// returned a real 429/quota error can't serve until its window resets, so
 	// skip it here regardless of which routing path selected it.
 	if blocked, until := r.quotaHardBlocked(provider); blocked {
-		return false, time.Until(until)
+		return false, time.Until(until), breakerTicket{}
 	}
 	if r.breaker == nil {
-		return true, 0
+		return true, 0, breakerTicket{}
 	}
-	return r.breaker.BeforeAttempt(provider)
+	return r.breaker.Admit(provider)
 }
 
-func (r *Router) recordProviderSuccess(provider string) {
+func (r *Router) recordProviderSuccess(provider string, ticket breakerTicket) {
 	if r.breaker == nil {
 		return
 	}
-	r.breaker.RecordSuccess(provider)
+	r.breaker.RecordAdmittedSuccess(provider, ticket)
 }
 
 func (r *Router) recordProviderFailureForErr(provider string, callErr error) (bool, time.Time) {

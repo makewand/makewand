@@ -447,9 +447,12 @@ func (t *strategyTables) replace(candidate *strategyTables) {
 }
 
 // loadUserOverrides loads user-customized routing tables from configDir/routing.json.
-// Missing file is not an error. Fields present in the override file are
-// deep-merged over the current snapshot; absent fields keep their values.
-// Invalid overrides leave the snapshot unchanged and return the error.
+// Missing file is not an error (the snapshot is left unchanged). Fields present
+// in the override file are deep-merged over a fresh copy of the immutable
+// built-in defaults (see applyOverrides) and the result replaces the snapshot,
+// so overrides applied by an earlier call are discarded; absent fields keep
+// their built-in defaults. Invalid overrides leave the snapshot unchanged and
+// return the error.
 func (t *strategyTables) loadUserOverrides(configDir string) error {
 	path := filepath.Join(configDir, "routing.json")
 	data, err := os.ReadFile(path)
@@ -722,8 +725,9 @@ func (t *strategyTables) contextBudgetForMode(mode UsageMode, task TaskType) int
 
 // LoadUserOverrides loads user-customized routing tables from configDir/routing.json
 // into the package-level default tables. Missing file is not an error. Fields
-// present in the override file are deep-merged over the defaults; absent fields
-// keep their default values.
+// present in the override file are deep-merged over the built-in defaults;
+// absent fields keep their default values. Each call replaces the overrides a
+// previous call applied.
 //
 // Deprecated: this only affects the package-level helpers (ContextBudgetForProvider,
 // ContextBudgetForMode, EstimateCost). Use RouterConfig.ConfigDir or

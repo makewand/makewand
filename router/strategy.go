@@ -425,10 +425,19 @@ const minSamplesForExclusion = 5
 // unstable providers (for example repeated CLI auth/timeout failures).
 const minSamplesForFastDegrade = 2
 
+// minQualitySamplesForThompson is the minimum number of recorded quality
+// outcomes (RecordQualityOutcome successes + failures for the phase) a provider
+// needs before Thompson sampling may move it away from the static strategy
+// order. Below it, the Beta posterior is dominated by the weak static prior and
+// sampling would only add noise.
+const minQualitySamplesForThompson = 3
+
 // sortCandidates sorts candidates by:
 //  1. Access type priority (Free/Subscription < Local < API)
 //  2. Hard exclusion: >50% error-failure rate with ≥5 total requests
-//  3. Thompson Sampling score (adaptive quality signal seeded by static table priors)
+//  3. Thompson Sampling score (adaptive quality signal seeded by static table
+//     priors) — only between candidates where at least one has
+//     minQualitySamplesForThompson quality outcomes; otherwise static order
 //  4. Session use count (load balance among equal-score candidates)
 //  5. Original strategy table order as a stable tiebreaker
 func sortCandidates(candidates []candidate) {
@@ -465,10 +474,14 @@ func sortCandidatesWithMinSamples(candidates []candidate, minSamples int) {
 		if candidates[i].quotaBand != candidates[j].quotaBand {
 			return candidates[i].quotaBand < candidates[j].quotaBand
 		}
-		// Cold-start stability: when neither candidate has requests or quality
-		// outcomes, prefer static strategy order over random Thompson variance.
-		if candidates[i].requests == 0 && candidates[j].requests == 0 &&
-			candidates[i].qualitySamples == 0 && candidates[j].qualitySamples == 0 {
+		// No evidence, no deviation: Thompson may only reorder a pair once at
+		// least one side has minQualitySamplesForThompson real quality outcomes
+		// for this phase. Request counts are NOT quality evidence — ordinary
+		// Chat/HTTP traffic increments them without ever recording quality —
+		// so two providers with too few outcomes keep their static strategy
+		// order instead of being shuffled by weak-prior sampling noise.
+		if candidates[i].qualitySamples < minQualitySamplesForThompson &&
+			candidates[j].qualitySamples < minQualitySamplesForThompson {
 			return candidates[i].order < candidates[j].order
 		}
 		// Thompson score is the primary quality signal.

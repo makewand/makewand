@@ -1,14 +1,18 @@
 // http.go — OpenAI-compatible subset HTTP facade for the Router.
 //
-// Usage:
+// Usage (bind to loopback and require a token; HTTPHandler() without options
+// is unauthenticated):
 //
 //	r, err := router.NewRouterFromConfig(rc)
 //	if err != nil { ... }
-//	http.ListenAndServe(":8080", r.HTTPHandler())
+//	h := r.HTTPHandler(router.HTTPHandlerOptions{BearerToken: token})
+//	http.ListenAndServe("127.0.0.1:8080", h)
 //
 // This exposes POST /v1/chat/completions with a supported subset of the
 // standard OpenAI request/response schema, routing through the Router's
-// provider selection logic.
+// provider selection logic. With local CLI providers registered, every
+// authorized message runs that CLI on the serving host (see ContextWithRemoteOrigin
+// and router/README.md "Security model").
 package router
 
 import (
@@ -221,7 +225,13 @@ type HTTPHandlerOptions struct {
 //   - Optional provider override via the model field (provider name from /v1/models)
 //   - Provider routing via the Router's strategy tables
 //   - GET /v1/models lists available providers
-//   - Optional Bearer token authentication
+//   - Optional Bearer token / scoped-token authentication (HTTPHandlerOptions).
+//     Without BearerToken or Authorizer every endpoint is UNAUTHENTICATED.
+//
+// Every chat request is served with a ContextWithRemoteOrigin context, so local
+// CLI providers never run host-state-dependent commands for it and, absent an
+// explicit WorkDir, run in a per-invocation empty temporary directory rather
+// than the server process's cwd.
 func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	var opt HTTPHandlerOptions
 	if len(opts) > 0 {
@@ -947,7 +957,13 @@ func writeSSEData(w http.ResponseWriter, payload any) error {
 // chatForHTTP preserves the meaning of Power mode across the HTTP and remote
 // adapters. An explicit model/provider override still wins; otherwise Power
 // executes the same generate-and-judge ensemble as local ChatBest callers.
+//
+// Every HTTP request is marked as remote-origin (ContextWithRemoteOrigin): a
+// network caller must never make a local CLI run a host-state-dependent
+// command (e.g. `codex review --uncommitted` on the server's working tree) or
+// inherit the server process's cwd.
 func (r *Router) chatForHTTP(ctx context.Context, requestedModel string, task TaskType, messages []Message, system string) (string, Usage, RouteResult, error) {
+	ctx = ContextWithRemoteOrigin(ctx)
 	if requestedModel != "" {
 		return r.ChatWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
 	}
@@ -962,6 +978,7 @@ func (r *Router) chatForHTTP(ctx context.Context, requestedModel string, task Ta
 // only the winning answer keeps streaming clients compatible without silently
 // degrading Power to a single-provider call.
 func (r *Router) streamForHTTP(ctx context.Context, requestedModel string, task TaskType, messages []Message, system string) (<-chan StreamChunk, RouteResult, Usage, error) {
+	ctx = ContextWithRemoteOrigin(ctx)
 	if requestedModel != "" {
 		stream, result, err := r.ChatStreamWith(ctx, requestedModel, taskToBuildPhase(task), messages, system)
 		return stream, result, Usage{}, err

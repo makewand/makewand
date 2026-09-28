@@ -82,6 +82,34 @@ func WorkDirFromContext(ctx context.Context) (string, bool) {
 	return dir, ok && dir != ""
 }
 
+type remoteOriginContextKey struct{}
+
+// ContextWithRemoteOrigin marks ctx as serving a remote (network) caller, such
+// as a request received by the HTTP facade. Remote requests must never make a
+// local CLI provider run a command whose result depends on the serving host's
+// state, so for a marked context:
+//
+//   - the Codex CLI never maps TaskReview to `codex review --uncommitted` (which
+//     ignores the prompt and reviews the host working tree); it runs the
+//     caller's prompt through `codex exec` in a read-only sandbox instead;
+//   - when no explicit WorkDir is set (see ContextWithWorkDir), every CLI
+//     invocation runs in its own freshly created, empty temporary directory
+//     that is removed afterwards, never in the server process's cwd.
+//
+// The HTTP facade (HTTPHandler) applies this marker to every chat request.
+// Embedders that expose Router.Chat & co. over their own network front-end
+// should apply it too.
+func ContextWithRemoteOrigin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, remoteOriginContextKey{}, true)
+}
+
+// RemoteOriginFromContext reports whether ctx was marked by
+// ContextWithRemoteOrigin.
+func RemoteOriginFromContext(ctx context.Context) bool {
+	remote, _ := ctx.Value(remoteOriginContextKey{}).(bool)
+	return remote
+}
+
 // TaskType categorizes what kind of AI task is being performed.
 type TaskType int
 
@@ -238,6 +266,13 @@ type Router struct {
 	// Provider cache for mode-based routing (provider+model → instance)
 	providerCache map[providerKey]Provider
 	providerMu    sync.Mutex
+
+	// cacheRoot is set on per-request views (cloneView) to the long-lived
+	// Router they were derived from. Factory-built provider instances are
+	// resolved through, and cached on, the root so later views reuse them
+	// instead of re-running the factory (and, for API providers, building new
+	// HTTP transports) on every request. Nil on a root Router.
+	cacheRoot *Router
 
 	// factories maps provider names to per-instance factories for dynamic
 	// model-specific construction (guarded by providerMu).
@@ -477,9 +512,19 @@ func (r *Router) routingTables() *strategyTables {
 	return r.tables.Load()
 }
 
-// LoadUserOverrides deep-merges configDir/routing.json into this Router's
-// tables. Missing file is not an error; invalid overrides leave the tables
-// unchanged and return the error.
+// LoadUserOverrides applies configDir/routing.json to this Router's tables.
+//
+// The file's fields are deep-merged over the immutable built-in defaults, NOT
+// over the current snapshot: every successful call replaces whatever overrides
+// were applied before (including the ones RouterConfig.ConfigDir loaded at
+// construction), so only the most recently loaded routing.json is in effect.
+// Within that file, absent fields keep their built-in defaults. This is the
+// same replace semantics the WatchOverrides hot-reload relies on to stay
+// idempotent (deleting a field from routing.json reverts it to its default).
+// To combine settings from several places, put them in one routing.json.
+//
+// A missing routing.json is not an error and leaves the current tables
+// unchanged; an invalid one also leaves them unchanged and returns the error.
 func (r *Router) LoadUserOverrides(configDir string) error {
 	return r.routingTables().loadUserOverrides(configDir)
 }
@@ -623,7 +668,13 @@ func (r *Router) cloneView() *Router {
 	traceSink := r.traceSink
 	r.traceMu.RUnlock()
 
+	root := r.cacheRoot
+	if root == nil {
+		root = r
+	}
+
 	clone := &Router{
+		cacheRoot:         root,
 		legacyModels:      legacy,
 		providers:         providers,
 		providerAllowlist: cloneStringSet(r.providerAllowlist),

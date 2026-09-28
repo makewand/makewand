@@ -185,10 +185,11 @@ func TestCircuitBreaker_HalfOpenAllowsSingleProbe(t *testing.T) {
 
 	// Next cooldown expiry admits one probe again; success closes the circuit.
 	now = now.Add(11 * time.Second)
-	if ok, _ := cb.BeforeAttempt("claude"); !ok {
+	ok, _, probe := cb.Admit("claude")
+	if !ok {
 		t.Fatal("cooldown expiry should admit a new probe")
 	}
-	cb.RecordSuccess("claude")
+	cb.RecordAdmittedSuccess("claude", probe)
 	if ok, _ := cb.BeforeAttempt("claude"); !ok {
 		t.Fatal("BeforeAttempt should allow traffic after a successful probe")
 	}

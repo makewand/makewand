@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -225,8 +226,11 @@ func NewAgyCLI(binPath string) *CLIProvider {
 // --- Codex CLI ---
 
 // NewCodexCLI creates a provider that uses `codex exec` (Codex CLI).
-// Task-aware: uses `codex review --uncommitted` for review tasks,
+// Task-aware: uses `codex review --uncommitted` for local review tasks,
 // `codex exec --json` for code/analysis tasks (provides structured usage data).
+// Remote-origin requests (see ContextWithRemoteOrigin) never use the review
+// subcommand: it ignores the prompt and reviews the serving host's working
+// tree, so they always run the caller's prompt through `codex exec`.
 func NewCodexCLI(binPath string) *CLIProvider {
 	p := &CLIProvider{
 		name:              "codex-cli",
@@ -236,8 +240,8 @@ func NewCodexCLI(binPath string) *CLIProvider {
 		parseJSONResponse: parseCodexCLIJSONL,
 	}
 	p.buildCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		// Use dedicated review subcommand for review tasks.
-		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		// Use dedicated review subcommand for local review tasks.
+		if codexUsesReviewSubcommand(ctx) {
 			args := []string{"review", "--uncommitted"}
 			return exec.CommandContext(ctx, binPath, args...)
 		}
@@ -253,7 +257,7 @@ func NewCodexCLI(binPath string) *CLIProvider {
 		return exec.CommandContext(ctx, binPath, args...)
 	}
 	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
-		if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		if codexUsesReviewSubcommand(ctx) {
 			args := []string{"review", "--uncommitted"}
 			return exec.CommandContext(ctx, binPath, args...)
 		}
@@ -438,10 +442,21 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 		defer cliCancel()
 	}
 
+	// The scratch dir is kept out of ctx on purpose: ctx flows into every
+	// exec.CommandContext, and deriving it from a filesystem-created value
+	// would taint all of them for gosec's G702 analysis.
+	scratchDir, cleanupWorkDir, err := prepareRemoteCLIWorkDir(ctx, c.provider)
+	if err != nil {
+		return "", Usage{}, err
+	}
+	// Every attempt has been waited for when Chat returns, so the scratch dir
+	// is gone before the caller sees the result.
+	defer cleanupWorkDir()
+
 	attempts := 0
 	for {
 		attempts++
-		content, jsonUsage, err := c.chatAttempt(ctx, prompt, validationPrompt)
+		content, jsonUsage, err := c.chatAttempt(ctx, prompt, validationPrompt, scratchDir)
 		if err == nil {
 			var usage Usage
 			if jsonUsage != nil {
@@ -505,26 +520,35 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 		ctx, cancel = context.WithCancel(ctx)
 	}
 
+	scratchDir, cleanupWorkDir, err := prepareRemoteCLIWorkDir(ctx, c.provider)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	buildCmd := c.buildStreamCmd
 	if buildCmd == nil {
 		buildCmd = c.buildCmd
 	}
 	cmd := buildCmd(ctx, prompt)
-	applyCLIWorkDir(ctx, cmd)
+	applyCLIWorkDir(ctx, cmd, scratchDir)
 	setCLIProcessGroup(cmd)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		cleanupWorkDir()
 		return nil, newProviderError(c.provider, "CLI pipe", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
+		cleanupWorkDir()
 		return nil, newProviderError(c.provider, "CLI stderr pipe", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		cancel()
+		cleanupWorkDir()
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
@@ -532,6 +556,9 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 	go func() {
 		defer cancel()
 		defer close(ch)
+		// Safety net; the normal path removes the scratch dir right after
+		// cmd.Wait, before any terminal chunk reaches the consumer.
+		defer cleanupWorkDir()
 		start := time.Now()
 
 		var stderr bytes.Buffer
@@ -590,6 +617,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 
 		<-stderrDone
 		waitErr := cmd.Wait()
+		cleanupWorkDir()
 		duration := time.Since(start)
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -841,17 +869,97 @@ func shouldSurfaceContextError(ctxErr error) bool {
 	return errors.Is(ctxErr, context.DeadlineExceeded)
 }
 
-func applyCLIWorkDir(ctx context.Context, cmd *exec.Cmd) {
+// applyCLIWorkDir sets the directory a CLI command runs in. An explicit
+// caller-chosen WorkDir (ContextWithWorkDir) wins. Otherwise scratchDir, the
+// per-call directory from prepareRemoteCLIWorkDir, is used when non-empty.
+// Local calls without a WorkDir keep inheriting the process cwd.
+func applyCLIWorkDir(ctx context.Context, cmd *exec.Cmd, scratchDir string) {
 	if cmd == nil {
 		return
 	}
 	if dir, ok := WorkDirFromContext(ctx); ok {
 		cmd.Dir = dir
+		return
 	}
+	if scratchDir != "" {
+		// Go resolves a relative Cmd.Path against Cmd.Dir. A custom command
+		// such as "./bin/llm" is accepted by config and probed by IsAvailable
+		// relative to the process cwd, so pin it there before moving the
+		// process into the empty scratch dir; otherwise every remote call to
+		// an "available" provider fails with "no such file or directory".
+		pinRelativeCommandPath(cmd)
+		cmd.Dir = scratchDir
+	}
+}
+
+// pinRelativeCommandPath makes a relative command path that contains a path
+// separator (e.g. "./bin/llm", "tools/llm") absolute against the current
+// process working directory. Bare names were already resolved through PATH by
+// exec.Command and absolute paths are left untouched.
+func pinRelativeCommandPath(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Path == "" || filepath.IsAbs(cmd.Path) {
+		return
+	}
+	if !strings.ContainsRune(cmd.Path, filepath.Separator) {
+		return
+	}
+	abs, err := filepath.Abs(cmd.Path)
+	if err != nil {
+		return
+	}
+	cmd.Path = abs
+}
+
+// prepareRemoteCLIWorkDir isolates a remote-origin CLI call that has no
+// explicit WorkDir: it returns a freshly created, empty, private (0700)
+// temporary directory for the command to run in instead of inheriting the
+// server process's cwd, so a remote caller can never steer the agent at the
+// serving host's working tree through relative paths or cwd-discovered
+// instruction files. The returned cleanup removes the directory and is
+// idempotent. Local calls and calls with an explicit WorkDir get an empty dir
+// and a no-op cleanup.
+//
+// The directory is returned as a plain value rather than stored in ctx: ctx is
+// passed to every buildCmd/exec.CommandContext, and it must stay free of
+// filesystem-derived values (gosec G702 taint analysis).
+func prepareRemoteCLIWorkDir(ctx context.Context, provider string) (string, func(), error) {
+	noop := func() {}
+	if !RemoteOriginFromContext(ctx) {
+		return "", noop, nil
+	}
+	if _, ok := WorkDirFromContext(ctx); ok {
+		return "", noop, nil
+	}
+	dir, err := os.MkdirTemp("", "makewand-remote-cli-*")
+	if err != nil {
+		return "", noop, newProviderError(provider, "CLI scratch dir", ErrorKindConfig, false, 0, err.Error(), err)
+	}
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() { _ = os.RemoveAll(dir) })
+	}
+	return dir, cleanup, nil
+}
+
+// codexUsesReviewSubcommand reports whether a Codex call should run
+// `codex review --uncommitted`. Only local review tasks do: the subcommand
+// ignores the prompt and reviews the uncommitted changes of the current
+// directory, which for a remote caller would be the serving host's state.
+func codexUsesReviewSubcommand(ctx context.Context) bool {
+	if RemoteOriginFromContext(ctx) {
+		return false
+	}
+	task, ok := TaskFromContext(ctx)
+	return ok && task == TaskReview
 }
 
 func codexSandboxMode(ctx context.Context) string {
 	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		return "read-only"
+	}
+	// Remote callers never get a writable Codex sandbox, even when an embedder
+	// supplied an explicit WorkDir.
+	if RemoteOriginFromContext(ctx) {
 		return "read-only"
 	}
 	if _, ok := WorkDirFromContext(ctx); ok {
@@ -860,9 +968,9 @@ func codexSandboxMode(ctx context.Context) string {
 	return "read-only"
 }
 
-func (c *CLIProvider) chatAttempt(ctx context.Context, prompt, validationPrompt string) (string, *Usage, error) {
+func (c *CLIProvider) chatAttempt(ctx context.Context, prompt, validationPrompt, scratchDir string) (string, *Usage, error) {
 	cmd := c.buildCmd(ctx, prompt)
-	applyCLIWorkDir(ctx, cmd)
+	applyCLIWorkDir(ctx, cmd, scratchDir)
 	setCLIProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
