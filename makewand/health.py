@@ -791,6 +791,11 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
 
     res["updated_at"] = updated_at
     res["source_label"] = QUOTA_SOURCE_LABELS.get(res.get("source"), "")
+    try:
+        from makewand.usage import get_predictive_pacing_status
+        res["predictive_pacing"] = get_predictive_pacing_status(provider)
+    except Exception:
+        pass
     if is_status_stale(info):
         res["stale"] = True
         res["desc"] = f"{res['desc']} · 状态缓存已超过 {STATUS_STALE_SECONDS // 3600} 小时未刷新，按中性处理 (运行 'makewand probe')"

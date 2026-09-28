@@ -293,6 +293,57 @@ class TestUniversalToolAdaptation(unittest.TestCase):
             args, kwargs = mock_dispatch.call_args
             self.assertEqual(args[0], "local")
 
+    def test_execute_agentic_tool_batch(self):
+        """Tests executing a batch of tool actions (write_file, read_file, run_command)."""
+        import tempfile
+        from makewand.providers.api_client import execute_agentic_tool_batch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            actions = [
+                {"action": "write_file", "path": "pkg/mod.py", "content": "x = 42\n"},
+                {"action": "read_file", "path": "pkg/mod.py"},
+                {"action": "run_command", "cmd": "echo batch_command_success"},
+            ]
+            results = execute_agentic_tool_batch(actions, tmp_dir)
+            self.assertEqual(len(results), 3)
+
+            # 1. write_file result
+            self.assertEqual(results[0]["status"], "ok")
+            self.assertEqual(results[0]["path"], "pkg/mod.py")
+            self.assertTrue((Path(tmp_dir) / "pkg" / "mod.py").exists())
+
+            # 2. read_file result
+            self.assertEqual(results[1]["status"], "ok")
+            self.assertEqual(results[1]["content"], "x = 42\n")
+
+            # 3. run_command result
+            self.assertEqual(results[2]["status"], "ok")
+            self.assertIn("batch_command_success", results[2]["stdout"])
+
+    def test_apply_agentic_code_output_tool_batch(self):
+        """Tests parsing tool batch JSON block inside apply_agentic_code_output."""
+        import tempfile
+        from makewand.providers.api_client import apply_agentic_code_output
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            batch_output = (
+                "Here is the batch execution plan:\n\n"
+                "```json:makewand-tools\n"
+                "[\n"
+                '  {"action": "write_file", "path": "services/user.py", "content": "class User: pass\\n"},\n'
+                '  {"action": "write_file", "path": "services/auth.py", "content": "class Auth: pass\\n"}\n'
+                "]\n"
+                "```\n"
+            )
+            modified = apply_agentic_code_output(batch_output, tmp_dir)
+            self.assertEqual(len(modified), 2)
+            self.assertIn("services/user.py", modified)
+            self.assertIn("services/auth.py", modified)
+            self.assertTrue((Path(tmp_dir) / "services" / "user.py").exists())
+            self.assertTrue((Path(tmp_dir) / "services" / "auth.py").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

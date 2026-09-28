@@ -147,5 +147,32 @@ class TestUsage(unittest.TestCase):
             records = _load_raw_usage_records(max_age_days=1.0)
             self.assertEqual(len(records), total_tasks)
 
+    def test_predictive_pacing_status(self):
+        from makewand.usage import get_predictive_pacing_status
+        with patch("makewand.usage.USAGE_WINDOW_FILE", self.test_file):
+            # 1. agy should always be nominal
+            res_agy = get_predictive_pacing_status("agy")
+            self.assertEqual(res_agy["status"], "nominal")
+            self.assertEqual(res_agy["quota_risk"], "low")
+
+            # 2. Initially empty usage -> nominal
+            res_codex = get_predictive_pacing_status("codex")
+            self.assertEqual(res_codex["status"], "nominal")
+            self.assertEqual(res_codex["quota_risk"], "low")
+
+            # 3. Inject heavy usage for codex -> critical
+            now_iso = datetime.now().isoformat()
+            records = [
+                {"timestamp": now_iso, "engine": "codex", "tier": "standard", "success": True}
+                for _ in range(35)
+            ]
+            _save_raw_usage_records(records)
+            res_heavy = get_predictive_pacing_status("codex")
+            self.assertEqual(res_heavy["status"], "critical")
+            self.assertEqual(res_heavy["quota_risk"], "high")
+            self.assertGreaterEqual(res_heavy["utilization_pct"], 90.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+

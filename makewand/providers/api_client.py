@@ -142,7 +142,134 @@ def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
             if _safe_write_file(rel, match.group(2)):
                 modified.append(rel)
 
+    # 5. Pattern 4: Single-Program Tool Batch JSON blocks (CodeMode pattern)
+    # e.g.: ```json:makewand-tools\n[{"action": "write_file", "path": "...", "content": "..."}]\n```
+    tool_blocks = re.findall(r"```(?:json)?[:\s]*(?:makewand-tools|tools|actions|batch)?\s*\n(\[\s*\{[\s\S]*?\}\s*\])\s*```", output)
+    if tool_blocks:
+        for block in tool_blocks:
+            try:
+                actions = json.loads(block)
+                if isinstance(actions, list):
+                    for act in actions:
+                        if isinstance(act, dict) and act.get("action") in ("write_file", "write", "create_file"):
+                            p = act.get("path") or act.get("filepath") or act.get("file")
+                            content = act.get("content", "")
+                            if p and isinstance(content, str):
+                                rel = _is_safe_rel_path(str(p))
+                                if rel and rel not in modified:
+                                    if _safe_write_file(rel, content):
+                                        modified.append(rel)
+            except Exception:
+                pass
+
     return modified
+
+
+def execute_agentic_tool_batch(
+    tools: List[Dict[str, Any]],
+    cwd: str,
+    allow_command: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Executes a batch of agentic tool actions inside cwd with safety confinement.
+    Supported actions:
+      - write_file: {"action": "write_file", "path": "...", "content": "..."}
+      - read_file: {"action": "read_file", "path": "..."}
+      - run_command: {"action": "run_command", "cmd": "..."} (executes in sandbox)
+    """
+    clean_cwd = os.path.realpath(os.path.abspath(cwd))
+    results: List[Dict[str, Any]] = []
+
+    def _is_safe_rel_path(p: str) -> Optional[str]:
+        p = str(p).strip().strip("'\"`*:#")
+        if not p or os.path.isabs(p):
+            return None
+        norm = os.path.normpath(p)
+        parts = Path(norm).parts
+        if ".." in parts or any(part.startswith(".git") for part in parts):
+            return None
+        full = os.path.realpath(os.path.abspath(os.path.join(clean_cwd, norm)))
+        if not full.startswith(clean_cwd + os.sep) and full != clean_cwd:
+            return None
+        return norm
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            results.append({"status": "error", "error": "Tool call must be an object"})
+            continue
+
+        action = str(tool.get("action", "")).strip().lower()
+        if action in ("write_file", "write", "create_file"):
+            p = tool.get("path") or tool.get("filepath") or tool.get("file")
+            content = tool.get("content", "")
+            rel = _is_safe_rel_path(str(p)) if p else None
+            if not rel:
+                results.append({"action": action, "path": p, "status": "error", "error": "Invalid or unsafe filepath"})
+                continue
+            dest = os.path.join(clean_cwd, rel)
+            parent = os.path.dirname(dest)
+            os.makedirs(parent, exist_ok=True)
+            import tempfile
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile("w", dir=parent, delete=False, encoding="utf-8") as tmp:
+                    tmp.write(str(content))
+                    tmp.flush()
+                    tmp_path = tmp.name
+                os.replace(tmp_path, dest)
+                results.append({"action": action, "path": rel, "status": "ok", "bytes_written": len(str(content).encode("utf-8"))})
+            except Exception as e:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                results.append({"action": action, "path": rel, "status": "error", "error": str(e)})
+
+        elif action in ("read_file", "read", "view_file"):
+            p = tool.get("path") or tool.get("filepath") or tool.get("file")
+            rel = _is_safe_rel_path(str(p)) if p else None
+            if not rel:
+                results.append({"action": action, "path": p, "status": "error", "error": "Invalid or unsafe filepath"})
+                continue
+            dest = os.path.join(clean_cwd, rel)
+            if not os.path.isfile(dest):
+                results.append({"action": action, "path": rel, "status": "error", "error": "File does not exist"})
+                continue
+            try:
+                if os.path.getsize(dest) > 512 * 1024:
+                    results.append({"action": action, "path": rel, "status": "error", "error": "File exceeds maximum 512KB limit"})
+                    continue
+                with open(dest, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                results.append({"action": action, "path": rel, "status": "ok", "content": content})
+            except Exception as e:
+                results.append({"action": action, "path": rel, "status": "error", "error": str(e)})
+
+        elif action in ("run_command", "cmd", "exec"):
+            if not allow_command:
+                results.append({"action": action, "status": "error", "error": "Command execution disabled"})
+                continue
+            cmd = tool.get("cmd") or tool.get("command")
+            if not cmd:
+                results.append({"action": action, "status": "error", "error": "Missing cmd argument"})
+                continue
+            from makewand.sandbox import run_in_sandbox
+            cmd_args = ["bash", "-c", str(cmd)] if isinstance(cmd, str) else list(cmd)
+            ret, out, err, ex = run_in_sandbox(cmd_args, workspace=clean_cwd, timeout=60)
+            results.append({
+                "action": action,
+                "cmd": str(cmd),
+                "status": "ok" if ret == 0 else "failed",
+                "returncode": ret,
+                "stdout": out,
+                "stderr": err,
+                "error": ex
+            })
+        else:
+            results.append({"action": action, "status": "error", "error": f"Unknown tool action: {action}"})
+
+    return results
 
 
 class _DeadlineExceeded(Exception):

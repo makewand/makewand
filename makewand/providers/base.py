@@ -72,7 +72,8 @@ def run_subprocess(
     cwd: Optional[str] = None,
     input_text: Optional[str] = None,
     stream: bool = False,
-    print_prefix: str = ""
+    print_prefix: str = "",
+    pass_fds: tuple = ()
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command with process group isolation and true non-blocking streaming.
@@ -81,6 +82,7 @@ def run_subprocess(
     """
     proc = None
     try:
+        popen_kwargs = {"pass_fds": pass_fds} if pass_fds else {}
         if not stream:
             proc = subprocess.Popen(
                 cmd,
@@ -90,7 +92,8 @@ def run_subprocess(
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=cwd,
-                start_new_session=True
+                start_new_session=True,
+                **popen_kwargs
             )
             try:
                 stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
@@ -112,7 +115,8 @@ def run_subprocess(
                 stderr=subprocess.STDOUT,
                 text=False,
                 cwd=cwd,
-                start_new_session=True
+                start_new_session=True,
+                **popen_kwargs
             )
             if input_text is not None:
                 def _feed_stdin(p, data):

@@ -319,6 +319,26 @@ int calculateChecksum(const char* buffer, size_t length_of_data) {
         )
 
 
+    def test_compute_symbol_pagerank_promotes_central_files(self):
+        from makewand.repomap import compute_symbol_pagerank, extract_file_symbols
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpp = Path(tmpdir)
+            (tmpp / "core.py").write_text("class CoreEngine:\n    def run(self):\n        pass\n")
+            (tmpp / "service_a.py").write_text("from core import CoreEngine\ne = CoreEngine()\n")
+            (tmpp / "service_b.py").write_text("from core import CoreEngine\ne2 = CoreEngine()\n")
+            (tmpp / "isolated.py").write_text("def lone_function():\n    return 42\n")
+
+            candidates = ["core.py", "service_a.py", "service_b.py", "isolated.py"]
+            file_symbols = {p: extract_file_symbols(tmpp / p) for p in candidates}
+            ranks = compute_symbol_pagerank(tmpp, candidates, file_symbols)
+
+            self.assertIn("core.py", ranks)
+            self.assertIn("isolated.py", ranks)
+            # core.py is referenced by 2 services, so its PageRank must exceed isolated.py
+            self.assertGreater(ranks["core.py"], ranks["isolated.py"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

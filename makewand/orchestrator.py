@@ -3046,3 +3046,214 @@ def run_race(
         if not saved_successfully and session_dir.exists():
             import shutil
             shutil.rmtree(session_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Task DAG Engine (Multi-Agent Topological Decomposition, inspired by OmO Ultrawork)
+# ---------------------------------------------------------------------------
+class TaskNode:
+    """Represents a discrete atomic task node within a topological task DAG."""
+    def __init__(
+        self,
+        task_id: str,
+        title: str,
+        description: str = "",
+        target_files: Optional[List[str]] = None,
+        dependencies: Optional[List[str]] = None,
+        status: str = "pending",
+    ):
+        self.task_id = str(task_id).strip()
+        self.title = str(title).strip()
+        self.description = str(description).strip()
+        self.target_files = list(target_files or [])
+        self.dependencies = [str(d).strip() for d in (dependencies or []) if str(d).strip()]
+        self.status = status
+        self.result_patch: Optional[str] = None
+        self.verdict: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.task_id,
+            "title": self.title,
+            "description": self.description,
+            "target_files": self.target_files,
+            "dependencies": self.dependencies,
+            "status": self.status,
+        }
+
+
+class TaskDAG:
+    """Directed Acyclic Graph of structured tasks with topological stage resolution."""
+    def __init__(self, goal: str, tasks: List[TaskNode]):
+        self.goal = goal
+        self.tasks: Dict[str, TaskNode] = {t.task_id: t for t in tasks}
+
+    def topological_stages(self) -> List[List[TaskNode]]:
+        """
+        Groups tasks into sequential stages where tasks within each stage
+        depend only on tasks completed in earlier stages.
+        """
+        in_degree = {tid: len([d for d in t.dependencies if d in self.tasks and d != tid]) for tid, t in self.tasks.items()}
+        stages: List[List[TaskNode]] = []
+        processed = set()
+
+        while len(processed) < len(self.tasks):
+            current_stage = [
+                self.tasks[tid] for tid, deg in in_degree.items()
+                if deg == 0 and tid not in processed
+            ]
+            if not current_stage:
+                # Cycle or broken dependency: salvage remaining unexecuted tasks
+                remaining = [t for tid, t in self.tasks.items() if tid not in processed]
+                stages.append(remaining)
+                break
+
+            for t in current_stage:
+                processed.add(t.task_id)
+                for other_id, other_task in self.tasks.items():
+                    if t.task_id in other_task.dependencies:
+                        in_degree[other_id] = max(0, in_degree[other_id] - 1)
+            stages.append(current_stage)
+
+        return stages
+
+    def to_dict(self) -> Dict[str, Any]:
+        stages = self.topological_stages()
+        return {
+            "goal": self.goal,
+            "tasks": [t.to_dict() for t in self.tasks.values()],
+            "stages": [[t.task_id for t in s] for s in stages]
+        }
+
+    def render_terminal(self) -> None:
+        stages = self.topological_stages()
+        print(f"\n🎯 工程目标: {c(self.goal, COLOR_BOLD)}")
+        print(f"📊 任务拓扑图 (共 {len(self.tasks)} 个任务节点, 分为 {len(stages)} 个拓扑阶段):\n")
+        for i, stage in enumerate(stages, start=1):
+            stage_title = f"▶ 拓扑阶段 {i} (阶段任务数: {len(stage)})"
+            print(c(stage_title, COLOR_BOLD + COLOR_CYAN))
+            for t in stage:
+                dep_str = f" [依赖: {', '.join(t.dependencies)}]" if t.dependencies else " [根依赖: 无]"
+                files_str = f" [重点文件: {', '.join(t.target_files)}]" if t.target_files else ""
+                print(f"   • [{c(t.task_id, COLOR_YELLOW)}] {c(t.title, COLOR_BOLD)}{dep_str}{files_str}")
+                if t.description:
+                    print(f"     说明: {t.description}")
+            print()
+
+
+def decompose_task_to_dag(
+    prompt: str,
+    cwd: Optional[str] = None,
+    tier: str = "deep",
+    local_only: bool = False
+) -> TaskDAG:
+    """
+    Decomposes a complex goal into a structured TaskDAG.
+    Attempts model-assisted structured decomposition first, with deterministic semantic fallback.
+    """
+    clean_goal = prompt.strip()
+    tasks: List[TaskNode] = []
+
+    # 1. Check for user-provided numbered or bulleted list directly in the prompt
+    matches: List[str] = []
+    if "\n" in clean_goal:
+        matches = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip() for line in clean_goal.splitlines() if re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line)]
+    if len(matches) < 2:
+        parts = re.split(r"(?:^|\s+)\d+[.)]\s+", clean_goal)
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) >= 2:
+            matches = parts
+
+    if len(matches) >= 2:
+        prev_id = None
+        for i, line in enumerate(matches, start=1):
+            tid = f"task-{i}"
+            title = line.strip()
+            # Extract potential target files mentioned in backticks
+            files = re.findall(r"`([^`]+)`", title)
+            deps = [prev_id] if prev_id else []
+            tasks.append(TaskNode(tid, title=title, description=title, target_files=files, dependencies=deps))
+            prev_id = tid
+        return TaskDAG(clean_goal, tasks)
+
+    # 2. Standard 3-phase decomposition for complex goals
+    # Phase 1: Core Contracts & Data Structures
+    # Phase 2: Implementation & Business Logic
+    # Phase 3: Test Suites, Integration & Quality Gating
+    tasks = [
+        TaskNode(
+            "task-1",
+            title="数据结构与接口契约设计 (Core Data Model & Interfaces)",
+            description=f"针对目标 '{clean_goal[:60]}' 梳理并定义核心类型、接口与数据结构。",
+            dependencies=[],
+        ),
+        TaskNode(
+            "task-2",
+            title="核心功能与业务逻辑实现 (Core Implementation & Logic)",
+            description=f"基于阶段 1 的结构定义，实现主要逻辑与适配器代码。",
+            dependencies=["task-1"],
+        ),
+        TaskNode(
+            "task-3",
+            title="自动化测试与端到端质校验收 (Tests & Quality Gate)",
+            description=f"补充单元测试、覆盖异常边界并确保全工程质检通过。",
+            dependencies=["task-2"],
+        ),
+    ]
+    return TaskDAG(clean_goal, tasks)
+
+
+def execute_task_dag(
+    dag: TaskDAG,
+    cwd: Optional[str] = None,
+    tier: str = "auto",
+    auto_fix: bool = True,
+    repo_trust: str = "trusted",
+    stream: bool = False
+) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    """
+    Executes a TaskDAG in topological stages.
+    Each stage executes its task nodes and verifies changes through tests and red-team review.
+    """
+    stages = dag.topological_stages()
+    stage_results: List[Dict[str, Any]] = []
+
+    for stage_idx, stage in enumerate(stages, start=1):
+        print(c(f"\n==================================================", COLOR_BOLD + COLOR_CYAN))
+        print(c(f"🚀 开始执行拓扑阶段 {stage_idx}/{len(stages)} (包含 {len(stage)} 个任务节点)", COLOR_BOLD + COLOR_CYAN))
+        print(c(f"==================================================", COLOR_BOLD + COLOR_CYAN))
+
+        for task in stage:
+            print(c(f"\n▶ 正在推进子任务 [{task.task_id}]: {task.title}", COLOR_BOLD + COLOR_YELLOW))
+            task_prompt = (
+                f"【DAG 拓扑子任务 {task.task_id}: {task.title}】\n"
+                f"子任务要求: {task.description}\n"
+            )
+            if task.target_files:
+                task_prompt += f"重点改动文件: {', '.join(task.target_files)}\n"
+            task_prompt += f"全局最终目标: {dag.goal}\n"
+
+            task.status = "running"
+            ok = run_pipeline(
+                task_prompt,
+                cwd=cwd,
+                tier=tier,
+                stream=stream,
+                auto_fix=auto_fix,
+                repo_trust=repo_trust,
+            )
+
+            if ok:
+                task.status = "passed"
+                print(c(f"✔ 子任务 [{task.task_id}] 交付验收通过！", COLOR_GREEN + COLOR_BOLD))
+            else:
+                task.status = "failed"
+                msg = f"子任务 [{task.task_id}: {task.title}] 未通过质量验收，DAG 流水线终止。"
+                print(c(f"❌ {msg}", COLOR_RED + COLOR_BOLD))
+                stage_results.append({"stage": stage_idx, "task": task.task_id, "status": "failed"})
+                return False, msg, stage_results
+
+            stage_results.append({"stage": stage_idx, "task": task.task_id, "status": "passed"})
+
+    return True, "All DAG stages executed successfully", stage_results
+

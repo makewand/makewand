@@ -192,6 +192,43 @@ class TestSandbox(unittest.TestCase):
             self.assertIn("--unsetenv", cmd_muse)
             self.assertIn("--unshare-pid", cmd_muse)
 
+    def test_seccomp_bpf_filter_blocks_dangerous_syscalls(self):
+        from makewand.sandbox import generate_seccomp_bpf_filter, is_bwrap_available, run_in_sandbox
+        bpf = generate_seccomp_bpf_filter()
+        self.assertIsNotNone(bpf)
+        self.assertGreater(len(bpf), 16)
+
+        if not is_bwrap_available():
+            self.skipTest("bwrap not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Inside the sandbox with seccomp, calling ptrace should return -1 with EPERM (errno 1)
+            code = (
+                "import ctypes, sys\n"
+                "libc = ctypes.CDLL(None, use_errno=True)\n"
+                "res = libc.syscall(101, 0, 0, 0, 0)\n"
+                "err = ctypes.get_errno()\n"
+                "print(f'res={res},err={err}')\n"
+                "sys.exit(0 if (res == -1 and err == 1) else 1)\n"
+            )
+            ret, out, err, _ = run_in_sandbox(
+                [sys.executable, "-c", code],
+                workspace=tmpdir,
+                enable_seccomp=True
+            )
+            self.assertEqual(ret, 0, f"Expected ptrace blocked with EPERM, got: {out} {err}")
+
+    def test_proc_masking_hardens_kernel_symbols(self):
+        from makewand.sandbox import wrap_bwrap
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = wrap_bwrap(["echo", "hi"], workspace=tmpdir)
+            joined = " ".join(cmd)
+            self.assertIn("--proc /proc", joined)
+            if os.path.exists("/proc/kallsyms"):
+                self.assertIn("--ro-bind /dev/null /proc/kallsyms", joined)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

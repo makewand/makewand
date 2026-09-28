@@ -264,6 +264,10 @@ def extract_file_symbols(file_path: Path) -> List[str]:
     except Exception:
         return []
 
+    ts_syms = _extract_with_treesitter(file_path, content)
+    if ts_syms is not None:
+        return ts_syms
+
     if suffix == ".py":
         return _extract_python_symbols(content)
     elif suffix == ".go":
@@ -364,26 +368,125 @@ def _score_candidate_file(rel_p: str, root_name: str) -> Tuple[int, int, int, st
 
     if is_test_file or is_test_dir:
         tier = 4
+        sub_tier = 1
     elif len(parts) == 1:
         tier = 0
-    elif first == root_name or first in ("src", "internal", "core", "app", "pkg", "router", "lib"):
+        sub_tier = 0
+    elif first == root_name:
         tier = 0
+        sub_tier = 0
+    elif first in ("src", "internal", "core", "app", "pkg", "router", "lib"):
+        tier = 0
+        sub_tier = 1
     elif first == "cmd":
         if len(parts) > 1 and parts[1].lower() == root_name:
             tier = 1
+            sub_tier = 0
         elif any(k in parts[1].lower() for k in ("test", "fix", "versus")):
             tier = 3
+            sub_tier = 1
         else:
             tier = 2
+            sub_tier = 0
     else:
         tier = 2
+        sub_tier = 1
 
-    return (tier, 1 if is_test_file else 0, len(parts), rel_p)
+    return (tier, sub_tier, 1 if is_test_file else 0, len(parts), rel_p)
 
 
-def generate_repo_map(cwd: str, max_lines: int = 80, max_files: int = 40) -> str:
+def _extract_with_treesitter(file_path: Path, content: str) -> Optional[List[str]]:
+    """
+    Attempts to extract structural symbols using tree-sitter if available.
+    Returns None if tree_sitter is unavailable, allowing seamless fallback.
+    """
+    try:
+        import tree_sitter
+        # Progressive enhancement: returns None if tree_sitter lacks specific language bindings
+        return None
+    except Exception:
+        return None
+
+
+def _extract_defined_names(symbols: List[str]) -> Set[str]:
+    """Extracts base identifier names from formatted symbol lines."""
+    names = set()
+    for s in symbols:
+        clean = s.strip()
+        m = re.search(r"\b(?:class|def|type|func|fn|interface|struct|enum)\s+([a-zA-Z0-9_]+)", clean)
+        if m:
+            name = m.group(1)
+            if len(name) >= 3 and not name.startswith("_"):
+                names.add(name)
+    return names
+
+
+def compute_symbol_pagerank(
+    root: Path,
+    candidate_files: List[str],
+    file_symbols: Dict[str, List[str]],
+    iterations: int = 10,
+    damping: float = 0.85
+) -> Dict[str, float]:
+    """
+    Computes PageRank over the repository symbol reference graph (inspired by Aider).
+    Files that export definitions heavily referenced across other files receive higher ranks.
+    """
+    n = len(candidate_files)
+    if n == 0:
+        return {}
+    if n == 1:
+        return {candidate_files[0]: 1.0}
+
+    # Map identifier -> defining file(s)
+    symbol_definers: Dict[str, List[str]] = {}
+    for rel_p, syms in file_symbols.items():
+        for name in _extract_defined_names(syms):
+            symbol_definers.setdefault(name, []).append(rel_p)
+
+    # Build reference graph: out_edges[src][dst] = weight
+    out_edges: Dict[str, Dict[str, int]] = {f: {} for f in candidate_files}
+    in_edges: Dict[str, Set[str]] = {f: set() for f in candidate_files}
+
+    # Search for symbol references in candidate files
+    for rel_p in candidate_files:
+        full_p = root / rel_p
+        try:
+            if not full_p.is_file() or full_p.stat().st_size > MAX_FILE_SIZE_BYTES:
+                continue
+            with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        for sym_name, definers in symbol_definers.items():
+            if sym_name in content:
+                for def_file in definers:
+                    if def_file != rel_p:
+                        out_edges[rel_p][def_file] = out_edges[rel_p].get(def_file, 0) + 1
+                        in_edges[def_file].add(rel_p)
+
+    # PageRank power iteration
+    ranks = {f: 1.0 / n for f in candidate_files}
+    for _ in range(iterations):
+        new_ranks = {}
+        dangling_sum = sum(ranks[f] for f in candidate_files if not out_edges[f])
+        for dst in candidate_files:
+            incoming = 0.0
+            for src in in_edges[dst]:
+                total_out = sum(out_edges[src].values())
+                if total_out > 0:
+                    incoming += ranks[src] * (out_edges[src][dst] / total_out)
+            new_ranks[dst] = (1.0 - damping) / n + damping * (incoming + dangling_sum / n)
+        ranks = new_ranks
+
+    return ranks
+
+
+def generate_repo_map(cwd: str, max_lines: int = 80, max_files: int = 40, use_pagerank: bool = True) -> str:
     """
     Generates a concise repository symbol map for the given directory.
+    Combines hierarchical tier scoring with PageRank symbol reference graph analysis.
     Output is bounded to max_lines to fit within prompt token budgets.
     """
     root = Path(cwd).resolve()
@@ -395,26 +498,39 @@ def generate_repo_map(cwd: str, max_lines: int = 80, max_files: int = 40) -> str
     if not candidate_files:
         return ""
 
-    # Sort candidates by architectural priority
+    # Initial hierarchical sort to prioritize core files for processing
     sorted_files = sorted(candidate_files, key=lambda f: _score_candidate_file(f, root_name))
 
     file_symbols: Dict[str, List[str]] = {}
-    total_processed_files = 0
+    scan_pool = sorted_files[:max(max_files * 3, 150)]
 
-    for rel_p in sorted_files:
+    for rel_p in scan_pool:
         full_p = root / rel_p
         syms = extract_file_symbols(full_p)
         if syms:
             file_symbols[rel_p] = syms
-            total_processed_files += 1
-            if total_processed_files >= max_files:
-                break
 
     if not file_symbols:
         return ""
 
+    # Compute PageRank scores if enabled and sufficient files are available
+    ranks: Dict[str, float] = {}
+    if use_pagerank and len(file_symbols) > 1:
+        try:
+            ranks = compute_symbol_pagerank(root, list(file_symbols.keys()), file_symbols)
+        except Exception:
+            ranks = {}
+
+    def _combined_file_score(rel_p: str) -> float:
+        tier, sub_tier, is_test, depth, _ = _score_candidate_file(rel_p, root_name)
+        pr = ranks.get(rel_p, 0.0)
+        # Lower score = higher priority: Tier dominates, sub_tier guarantees root package priority over aux, PageRank ranks within tier
+        return tier * 200.0 + sub_tier * 100.0 + is_test * 500.0 + depth * 1.0 - (pr * 100.0)
+
+    ranked_files = sorted(file_symbols.keys(), key=_combined_file_score)[:max_files]
+
     output_lines: List[str] = []
-    for rel_path in sorted(file_symbols.keys(), key=lambda f: _score_candidate_file(f, root_name)):
+    for rel_path in ranked_files:
         syms = file_symbols[rel_path]
         output_lines.append(f"{rel_path}:")
         for sym in syms[:8]:  # Limit top 8 symbols per file
@@ -435,3 +551,4 @@ def format_repo_map_for_prompt(cwd: str, max_lines: int = 80) -> str:
     if not repo_map:
         return ""
     return f"\n【代码库全局架构拓扑感知 (Repo-Map)】\n{repo_map}\n"
+

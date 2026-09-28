@@ -257,8 +257,15 @@ def cmd_status(args):
             c24 = u_24h.get(eng, {}).get("total", 0)
             c7d = u_7d.get(eng, {}).get("total", 0)
             pen, reason = get_burn_rate_penalty(eng)
+            from makewand.usage import get_predictive_pacing_status
+            pace = get_predictive_pacing_status(eng)
+
             if not is_provider_enabled(eng):
                 status_desc = c("🚫 用户已手动禁用", COLOR_RED)
+            elif pace.get("status") == "critical":
+                status_desc = c(f"🔴 预测高危 ({pace.get('velocity_per_hour', 0):.1f}当量/h, 消耗{pace.get('utilization_pct', 0)}%)", COLOR_RED + COLOR_BOLD)
+            elif pace.get("status") == "pacing":
+                status_desc = c(f"🟡 削峰调步 ({pace.get('velocity_per_hour', 0):.1f}当量/h, 消耗{pace.get('utilization_pct', 0)}%)", COLOR_YELLOW)
             elif pen == 0.0:
                 status_desc = c("🟢 额度健康平稳 (0 成本)" if eng in ("local", "aider") else "🟢 额度健康平稳", COLOR_GREEN)
             else:
@@ -455,6 +462,31 @@ def cmd_repomap(args):
             print()
         else:
             print("未在当前工作区发现有效代码符号或工作区为空。")
+
+def cmd_plan(args):
+    """Decompose complex goals into DAG tasks and execute topologically."""
+    import json
+    from makewand.orchestrator import decompose_task_to_dag, execute_task_dag
+    cwd = getattr(args, "cwd", None) or os.getcwd()
+    prompt = args.prompt
+    tier = getattr(args, "tier", "deep")
+    repo_trust = getattr(args, "repo_trust", "trusted")
+
+    dag = decompose_task_to_dag(prompt, cwd=cwd, tier=tier, local_only=getattr(args, "local_only", False))
+
+    if getattr(args, "json", False):
+        print(json.dumps(dag.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        dag.render_terminal()
+
+    if getattr(args, "execute", False):
+        print(c("🚀 [Makewand DAG Engine] 正在拓扑推进执行流水线...", COLOR_BOLD + COLOR_GREEN))
+        ok, summary, stage_results = execute_task_dag(dag, cwd=cwd, tier=tier, repo_trust=repo_trust)
+        if not ok:
+            print(c(f"\n❌ [Makewand DAG Engine] 流水线执行未完全通过: {summary}", COLOR_BOLD + COLOR_RED))
+            sys.exit(1)
+        print(c(f"\n✔ [Makewand DAG Engine] 全部 DAG 拓扑阶段均已高质量交付验收！", COLOR_BOLD + COLOR_GREEN))
+        sys.exit(0)
 
 def cmd_sandbox(args):
     """Run command inside bubblewrap process sandbox."""
@@ -765,6 +797,15 @@ def main():
     p_repomap.add_argument("--max-files", type=int, default=40, help="Max files to include in repo map (default: 40)")
     p_repomap.add_argument("--json", action="store_true", help="Output repo map in JSON format")
 
+    # plan (multi-agent DAG task decomposition pipeline, inspired by OmO Ultrawork)
+    p_plan = subparsers.add_parser("plan", help="Decompose complex goals into DAG tasks and execute topologically", parents=[sub_common_parser])
+    p_plan.add_argument("prompt", help="High-level engineering goal to decompose")
+    p_plan.add_argument("--cwd", help="Target working directory")
+    p_plan.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="deep")
+    p_plan.add_argument("--execute", action="store_true", default=False, help="Execute decomposed DAG tasks topologically with verification gates")
+    p_plan.add_argument("--json", action="store_true", default=False, help="Output plan in JSON format")
+    p_plan.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False)
+
     # sandbox (bubblewrap process isolation)
     p_sb = subparsers.add_parser("sandbox", help="Run shell command inside bubblewrap process sandbox", parents=[sub_common_parser])
     p_sb.add_argument("--cwd", help="Target working directory (default: current directory)")
@@ -920,7 +961,7 @@ def main():
         "claude", "codex", "agy", "grok", "muse", "local", "aider", "deepseek", "qwen", "glm", "kimi",
         "openrouter", "siliconflow", "cursor", "copilot",
         "observe", "candidates", "inspect", "apply", "discard",
-        "enable", "disable", "repomap"
+        "enable", "disable", "repomap", "plan"
     }
     # If user invokes `makewand "do something"` or `makewand --repo-trust untrusted "do something"`, automatically route to `makewand run ...`
     is_auto_routed_run = False
@@ -1019,6 +1060,8 @@ def main():
         cmd_search(args)
     elif args.subcommand == "repomap":
         cmd_repomap(args)
+    elif args.subcommand == "plan":
+        cmd_plan(args)
     elif args.subcommand == "sandbox":
         cmd_sandbox(args)
     elif args.subcommand == "claude":

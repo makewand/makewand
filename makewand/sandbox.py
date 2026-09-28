@@ -27,8 +27,10 @@ starts inside a writable workspace are not masked.
 
 import json
 import os
+import platform
 import socket
 import stat
+import struct
 import sys
 import shutil
 import tempfile
@@ -315,6 +317,81 @@ _host_var_cache: Dict[str, object] = {"at": 0.0, "masks": None}
 
 # Claude project key length after which Claude Code switches to a hashed key.
 _CLAUDE_PROJECT_KEY_MAX = 200
+
+
+def generate_seccomp_bpf_filter() -> Optional[bytes]:
+    """
+    Constructs a strict seccomp-bpf filter program blocking high-risk Linux syscalls
+    (ptrace, bpf, keyctl, process_vm_readv, process_vm_writev, userfaultfd).
+    Returns raw compiled BPF bytecode matching the host machine architecture,
+    or None if architecture is unsupported or BPF generation fails.
+    """
+    try:
+        BPF_LD, BPF_W, BPF_ABS = 0x00, 0x00, 0x20
+        BPF_JMP, BPF_JEQ, BPF_K = 0x05, 0x10, 0x00
+        BPF_RET = 0x06
+        SECCOMP_RET_ERRNO = 0x00050000
+        SECCOMP_RET_ALLOW = 0x7fff0000
+        EPERM = 1
+
+        AUDIT_ARCH_X86_64 = 0xc000003e
+        AUDIT_ARCH_AARCH64 = 0xc00000b7
+
+        machine = platform.machine().lower()
+        if machine in ("x86_64", "amd64"):
+            expected_arch = AUDIT_ARCH_X86_64
+            blocked_syscalls = [
+                101,  # ptrace
+                321,  # bpf
+                250,  # keyctl
+                310,  # process_vm_readv
+                311,  # process_vm_writev
+                323,  # userfaultfd
+            ]
+        elif machine in ("aarch64", "arm64"):
+            expected_arch = AUDIT_ARCH_AARCH64
+            blocked_syscalls = [
+                117,  # ptrace
+                280,  # bpf
+                219,  # keyctl
+                270,  # process_vm_readv
+                271,  # process_vm_writev
+                282,  # userfaultfd
+            ]
+        else:
+            return None
+
+        instructions = []
+
+        def stmt(code: int, k: int):
+            instructions.append(struct.pack("<HBBI", code, 0, 0, k))
+
+        def jmp(code: int, k: int, jt: int, jf: int):
+            instructions.append(struct.pack("<HBBI", code, jt, jf, k))
+
+        # 1. Load architecture: [BPF_LD | BPF_W | BPF_ABS, offset 4]
+        stmt(BPF_LD | BPF_W | BPF_ABS, 4)
+        # 2. Check architecture matches expected_arch, otherwise jump to errno
+        jmp(BPF_JMP | BPF_JEQ | BPF_K, expected_arch, 1, 0)
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+
+        # 3. Load syscall number: [BPF_LD | BPF_W | BPF_ABS, offset 0]
+        stmt(BPF_LD | BPF_W | BPF_ABS, 0)
+
+        # 4. Filter blocked syscalls: jump to errno block if matched
+        n = len(blocked_syscalls)
+        for i, sc in enumerate(blocked_syscalls):
+            remaining = n - 1 - i
+            jmp(BPF_JMP | BPF_JEQ | BPF_K, sc, remaining + 1, 0)
+
+        # 5. Default allow
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+        # 6. Blocked errno (EPERM = 1)
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+
+        return b"".join(instructions)
+    except Exception:
+        return None
 
 
 def is_bwrap_available() -> bool:
@@ -669,7 +746,8 @@ def wrap_bwrap(
     worktree_root: Optional[str] = None,
     extra_env: Optional[dict] = None,
     provider_name: Optional[str] = None,
-    extra_ro_binds: Optional[List[str]] = None
+    extra_ro_binds: Optional[List[str]] = None,
+    seccomp_fd: Optional[int] = None
 ) -> List[str]:
     """
     Wraps command with bubblewrap isolating host filesystem, IPC, PID, and credentials.
@@ -759,6 +837,17 @@ def wrap_bwrap(
         "--dev", "/dev",
         "--tmpfs", "/tmp",
     ]
+
+    # Hardened /proc masking (kernel symbols, core dump triggers, sched debug)
+    for proc_leaf in ("/proc/kallsyms", "/proc/kcore", "/proc/sysrq-trigger", "/proc/sched_debug"):
+        if os.path.exists(proc_leaf):
+            bwrap_cmd.extend(["--ro-bind", "/dev/null", proc_leaf])
+    for proc_dir in ("/proc/acpi", "/proc/asound"):
+        if os.path.isdir(proc_dir):
+            bwrap_cmd.extend(["--tmpfs", proc_dir])
+
+    if seccomp_fd is not None:
+        bwrap_cmd.extend(["--seccomp", str(seccomp_fd)])
 
     # S05 defense: Mask system Unix domain sockets and host IPC runtimes
     for sock_runtime_dir in SOCKET_RUNTIME_DIRS:
@@ -1226,59 +1315,84 @@ def run_in_sandbox(
     extra_env: Optional[dict] = None,
     audit_context: str = "sandbox",
     extra_ro_binds: Optional[List[str]] = None,
+    enable_seccomp: bool = True,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
-    Executes a command inside the bubblewrap sandbox.
+    Executes a command inside the bubblewrap sandbox with optional Seccomp-BPF filtering.
     Enforces fail-closed security: when bwrap is missing, host execution needs
     MAKEWAND_UNSAFE_HOST_EXEC=1 *and* the recorded one-time acknowledgment
     (shared with the Go engine); every such execution is audited.
     """
     exec_cmd = cmd
-    if is_bwrap_available():
-        try:
-            exec_cmd = wrap_bwrap(
-                cmd,
-                workspace=workspace,
-                allow_network=allow_network,
-                readonly=readonly,
-                repo_root=repo_root,
-                is_provider=is_provider,
-                worktree_root=worktree_root,
-                extra_env=extra_env,
-                extra_ro_binds=extra_ro_binds,
-            )
-        except SandboxConfigError as exc:
-            _warn(str(exc))
-            return -1, "", str(exc), "SandboxConfigError"
-    else:
-        authorized, source = resolve_unsafe_host_exec()
-        if not authorized:
-            msg = (
-                "Bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged "
-                "(MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
-            )
-            _warn(msg)
-            return -1, "", msg, "SandboxUnavailable"
-        audit_unsafe_host_exec(audit_context, cmd, os.path.abspath(workspace), source)
-
-    # Dynamic backpressure: when host load is elevated, deprioritize background sandbox task
+    seccomp_r = None
+    pass_fds: tuple = ()
     try:
-        load_1m = os.getloadavg()[0]
-        if load_1m > 10.0:
-            nice_bin = shutil.which("nice")
-            if nice_bin:
-                nice_val = "15" if load_1m > 18.0 else "10"
-                exec_cmd = [nice_bin, "-n", nice_val] + exec_cmd
-            ionice_bin = shutil.which("ionice")
-            if ionice_bin and load_1m > 12.0:
-                exec_cmd = [ionice_bin, "-c2", "-n7"] + exec_cmd
-    except Exception:
-        pass
+        if is_bwrap_available():
+            if enable_seccomp:
+                bpf_filter = generate_seccomp_bpf_filter()
+                if bpf_filter:
+                    try:
+                        r, w = os.pipe()
+                        os.write(w, bpf_filter)
+                        os.close(w)
+                        seccomp_r = r
+                        pass_fds = (seccomp_r,)
+                    except Exception:
+                        seccomp_r = None
+                        pass_fds = ()
 
-    return run_subprocess(
-        exec_cmd,
-        timeout=timeout,
-        cwd=workspace,
-        stream=stream,
-        print_prefix=print_prefix
-    )
+            try:
+                exec_cmd = wrap_bwrap(
+                    cmd,
+                    workspace=workspace,
+                    allow_network=allow_network,
+                    readonly=readonly,
+                    repo_root=repo_root,
+                    is_provider=is_provider,
+                    worktree_root=worktree_root,
+                    extra_env=extra_env,
+                    extra_ro_binds=extra_ro_binds,
+                    seccomp_fd=seccomp_r,
+                )
+            except SandboxConfigError as exc:
+                _warn(str(exc))
+                return -1, "", str(exc), "SandboxConfigError"
+        else:
+            authorized, source = resolve_unsafe_host_exec()
+            if not authorized:
+                msg = (
+                    "Bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged "
+                    "(MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
+                )
+                _warn(msg)
+                return -1, "", msg, "SandboxUnavailable"
+            audit_unsafe_host_exec(audit_context, cmd, os.path.abspath(workspace), source)
+
+        # Dynamic backpressure: when host load is elevated, deprioritize background sandbox task
+        try:
+            load_1m = os.getloadavg()[0]
+            if load_1m > 10.0:
+                nice_bin = shutil.which("nice")
+                if nice_bin:
+                    nice_val = "15" if load_1m > 18.0 else "10"
+                    exec_cmd = [nice_bin, "-n", nice_val] + exec_cmd
+                ionice_bin = shutil.which("ionice")
+                if ionice_bin and load_1m > 12.0:
+                    exec_cmd = [ionice_bin, "-c2", "-n7"] + exec_cmd
+        except Exception:
+            pass
+
+        return run_subprocess(
+            exec_cmd,
+            timeout=timeout,
+            cwd=workspace,
+            stream=stream,
+            print_prefix=print_prefix,
+            pass_fds=pass_fds
+        )
+    finally:
+        if seccomp_r is not None:
+            try:
+                os.close(seccomp_r)
+            except Exception:
+                pass

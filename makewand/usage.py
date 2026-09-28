@@ -415,3 +415,61 @@ def get_all_engine_reliability(engines: List[str]) -> Dict[str, Tuple[Optional[f
     records = _load_raw_usage_records(max_age_days=7.0)
     now = datetime.now()
     return {e: _reliability_from_records(records, e, now=now) for e in engines}
+
+
+def get_predictive_pacing_status(engine: str) -> Dict[str, Any]:
+    """
+    Computes real-time predictive rate pacing and risk forecast for an engine.
+    Calculates velocity (weighted requests per hour), remaining buffer, and risk tier:
+      - 'nominal': Healthy usage well within quota velocity.
+      - 'pacing': Approaching warning threshold, recommendation to pace or route light tasks to local/auxiliary.
+      - 'critical': Imminent quota depletion risk (>= 90% of window limit).
+    """
+    eng = engine.lower().strip()
+    if eng in ("agy", "local"):
+        return {
+            "engine": eng,
+            "status": "nominal",
+            "velocity_per_hour": 0.0,
+            "quota_risk": "low",
+            "message": "高通量锚点 / 无限额度",
+            "recommendation": "可承载任意强度任务"
+        }
+
+    records = _load_raw_usage_records(max_age_days=1.0)
+    c_3h, c_24h, _ = _calc_weighted_counts(records, eng)
+
+    limit_3h = CODEX_LIMIT_3H if eng == "codex" else 40.0
+    warn_3h = CODEX_WARN_3H if eng == "codex" else 25.0
+
+    velocity = round(c_3h / 3.0, 2)
+    utilization_3h = min(1.0, c_3h / max(1.0, limit_3h))
+
+    if c_3h >= limit_3h * 0.9:
+        status = "critical"
+        risk = "high"
+        msg = f"近期消耗速度过快 ({velocity:.1f} 当量/时)，已消耗窗口限额的 {utilization_3h*100:.0f}%"
+        rec = "建议仅将最关键的深度重构任务指派给该引擎，常规解释与轻量级任务分流至 Local/Grok"
+    elif c_3h >= warn_3h:
+        status = "pacing"
+        risk = "medium"
+        msg = f"已进入削峰缓冲区间 ({velocity:.1f} 当量/时)，已消耗 {utilization_3h*100:.0f}%"
+        rec = "启用自适应调步，只读与初审任务优先分流"
+    else:
+        status = "nominal"
+        risk = "low"
+        msg = f"配额速率平稳安全 ({velocity:.1f} 当量/时)"
+        rec = "正常执行调度"
+
+    return {
+        "engine": eng,
+        "status": status,
+        "velocity_per_hour": velocity,
+        "weighted_3h": c_3h,
+        "limit_3h": limit_3h,
+        "utilization_pct": round(utilization_3h * 100, 1),
+        "quota_risk": risk,
+        "message": msg,
+        "recommendation": rec
+    }
+
