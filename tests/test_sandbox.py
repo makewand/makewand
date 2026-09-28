@@ -179,7 +179,12 @@ class TestSandbox(unittest.TestCase):
             self.assertEqual(ret, 42)
 
             # Also verify DBUS env vars and /run/user are not leaked even for muse
-            cmd_muse = wrap_bwrap(["muse", "run"], workspace=str(ws), is_provider=True)
+            # (fake HOME: provider mounts must never touch the real ~/.config/muse from tests)
+            from unittest.mock import patch
+            fake_home = Path(tmpdir) / "home"
+            (fake_home / ".config" / "muse").mkdir(parents=True)
+            with patch.dict(os.environ, {"HOME": str(fake_home), "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1/bus"}):
+                cmd_muse = wrap_bwrap(["muse", "run"], workspace=str(ws), is_provider=True)
             self.assertNotIn("/run/user", " ".join(cmd_muse))
             setenv_indices = [i for i, x in enumerate(cmd_muse) if x == "--setenv"]
             setenv_vars = [cmd_muse[i + 1] for i in setenv_indices if i + 1 < len(cmd_muse)]
