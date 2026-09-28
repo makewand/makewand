@@ -12,6 +12,11 @@ Validates:
 9. Pipeline timeout and budget decoupling.
 """
 
+try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
+    import _isolation  # noqa: F401
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests import _isolation  # noqa: F401
+
 import os
 import json
 import tempfile
@@ -56,7 +61,13 @@ class TestAdaptiveGovernance(unittest.TestCase):
         self.assertFalse(is_reset_time_passed(resets_tomorrow, datetime.now().isoformat()))
 
     def test_monotonic_status_cache_saving(self):
-        with patch("makewand.health.STATUS_CACHE_FILE", self.status_file):
+        # Both the status cache and its legacy Gemini/Antigravity mirror
+        # (~/.gemini/config/trio_status.json by default) must stay in the test dir.
+        legacy_dir = Path(self.test_dir) / "legacy"
+        legacy_dir.mkdir()
+        legacy_file = legacy_dir / "trio_status.json"
+        with patch("makewand.health.STATUS_CACHE_FILE", self.status_file), \
+             patch("makewand.health.LEGACY_TRIO_CACHE", legacy_file):
             now = datetime.now()
             # 1. Save newer healthy state at 01:00
             newer_state = {
@@ -83,6 +94,8 @@ class TestAdaptiveGovernance(unittest.TestCase):
             # 3. Cache MUST preserve newer healthy state!
             current = load_status_cache()
             self.assertEqual(current["codex"]["status"], "healthy", "Older snapshot must not overwrite newer healthy cache!")
+            if legacy_file.exists():  # the legacy mirror, when written, lands here only
+                self.assertEqual(json.loads(legacy_file.read_text())["codex"]["status"], "healthy")
 
     def test_tier_weighted_usage_accounting(self):
         records = [

@@ -7,6 +7,11 @@ Validates dynamic topology adaptation:
 - Mainstream ecosystem tools (Aider CLI, DeepSeek API, Aliyun Qwen API, etc.)
 """
 
+try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
+    import _isolation  # noqa: F401
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests import _isolation  # noqa: F401
+
 import os
 import sys
 from pathlib import Path
@@ -73,9 +78,12 @@ class TestUniversalToolAdaptation(unittest.TestCase):
 
     def test_dynamic_active_providers_detection(self):
         """Tests dynamic active tool pool detection based on real-time environment."""
+        # Paid API providers only count once billing is explicitly allowed. The test
+        # used to inherit allow_paid from a config.json leaked by test_hybrid_routing.
         with patch("makewand.config.has_subscription_configured") as mock_sub, \
              patch("makewand.config.has_api_configured") as mock_api, \
              patch("makewand.config.is_provider_enabled") as mock_en, \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": "allow_paid"}), \
              patch("makewand.providers.local.is_local_model_available", return_value=(False, None, None)):
 
             mock_en.return_value = True

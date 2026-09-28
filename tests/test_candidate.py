@@ -2,6 +2,11 @@
 Unit tests for Makewand Candidate Lifecycle Management (inspect / apply / discard).
 """
 
+try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
+    import _isolation  # noqa: F401
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests import _isolation  # noqa: F401
+
 import os
 import shutil
 import tempfile
