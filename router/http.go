@@ -1,14 +1,18 @@
 // http.go — OpenAI-compatible subset HTTP facade for the Router.
 //
-// Usage:
+// Usage (bind to loopback and require a token; HTTPHandler() without options
+// is unauthenticated):
 //
 //	r, err := router.NewRouterFromConfig(rc)
 //	if err != nil { ... }
-//	http.ListenAndServe(":8080", r.HTTPHandler())
+//	h := r.HTTPHandler(router.HTTPHandlerOptions{BearerToken: token})
+//	http.ListenAndServe("127.0.0.1:8080", h)
 //
 // This exposes POST /v1/chat/completions with a supported subset of the
 // standard OpenAI request/response schema, routing through the Router's
-// provider selection logic.
+// provider selection logic. With local CLI providers registered, every
+// authorized message runs that CLI on the serving host (see ContextWithRemoteOrigin
+// and router/README.md "Security model").
 package router
 
 import (
@@ -221,7 +225,13 @@ type HTTPHandlerOptions struct {
 //   - Optional provider override via the model field (provider name from /v1/models)
 //   - Provider routing via the Router's strategy tables
 //   - GET /v1/models lists available providers
-//   - Optional Bearer token authentication
+//   - Optional Bearer token / scoped-token authentication (HTTPHandlerOptions).
+//     Without BearerToken or Authorizer every endpoint is UNAUTHENTICATED.
+//
+// Every chat request is served with a ContextWithRemoteOrigin context, so local
+// CLI providers never run host-state-dependent commands for it and, absent an
+// explicit WorkDir, run in a per-invocation empty temporary directory rather
+// than the server process's cwd.
 func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	var opt HTTPHandlerOptions
 	if len(opts) > 0 {
