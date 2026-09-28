@@ -24,7 +24,13 @@
 
 - Plaintext protocol without TLS terminates in `UNSAFE` mode only (requires explicit flag)
 - WAL database requires careful backup procedures — use `makewand state backup`
-  (VACUUM INTO snapshot), not a plain tar of the live `state.db`
+  (VACUUM INTO snapshot), not a plain `cp`/`tar` of the live `state.db`
+- The JSONL audit log is append-only by convention but not tamper-evident (no
+  hash chain or signature): anyone with write access to the host can edit it.
+  Ship it to external append-only storage if you need tamper evidence. Admin
+  mutations record their actor and target (`action`, `target_user_id`,
+  `target_organization_id`, `target_project_id`, `target_token_id`,
+  `target_role`, `target_active`)
 - Concurrent agent execution can interfere with local workspace
 - Remote clients may see stale session state
 
@@ -130,8 +136,9 @@ makewand chat .
 
 - **Default**: Loopback only (`127.0.0.1:8080`). Must use SSH tunnel or reverse proxy for remote access
 - **Never**: Listen on `0.0.0.0` without TLS termination
-- **Recommended**: Use TLS-terminating reverse proxy (nginx, Caddy) for network access
+- **Recommended**: Use TLS-terminating reverse proxy (nginx, Caddy) for network access, and pass the proxy address with `--trusted-proxy` so rate limits see real client addresses
 - **SSH Tunnel**: Simplest secure remote access method
+- **Public internet**: unsupported (see above). If you still expose the server, for example with the Cloudflare Tunnel in [CLOUDFLARE_WEBSITE_DEPLOYMENT.md](CLOUDFLARE_WEBSITE_DEPLOYMENT.md), read that guide's risk section and put an identity-aware access layer in front of `/admin` and `/v1/admin/`
 
 ```bash
 # SSH tunnel example
@@ -150,8 +157,13 @@ ssh -L 8080:127.0.0.1:8080 -N user@remote-host &
 
 - Multi-user mode is **disabled by default**; without `--enable-users` clients authenticate with scoped tokens only (`--token`, `--auth-config`, or tokens issued into the state DB)
 - `--enable-users` enables user management, login, and the admin API **without** opening public registration. Sessions are namespaced per authenticated identity (user/org/project) and are not accessible across tenants
-- `--enable-registration` (implies `--enable-users`) opens the public `/v1/users/register` endpoint. Self-registered accounts are created **inactive** and require an admin to activate (`makewand user activate`). Registration is rate-limited per-IP and globally, and password hashing is concurrency-bounded (returns 503 when saturated). Keep this **off** unless you control network access to the port
-- `--trusted-proxy <CIDR|IP>` (repeatable): only when the direct peer matches one of these is an `X-Forwarded-For`/`X-Real-IP` header trusted for rate-limiting. By default client-supplied forwarding headers are ignored
+- `--enable-registration` (implies `--enable-users`) opens the public `/v1/users/register` endpoint. Self-registered accounts are created **inactive** and require an admin to activate (`makewand user activate`). Keep this **off** unless you control network access to the port. Registration limits:
+  - The per-address limit is the primary control: `--registration-per-ip-limit` (default 5) registrations per client address per `--registration-window` (default `1h`). IPv6 clients are counted per `/64`, because one client normally controls a whole `/64`.
+  - `--registration-global-limit` (default 30 per window) is a backstop on the total number of new, inactive accounts. When it is reached, the server logs a `warning: self-registration global limit reached` line and a `registration_global_limit` audit event, and rejects further sign-ups until the window ends. A distributed client can still exhaust it, so review pending accounts (`makewand user list`) when the alert fires, and raise the limit, or set it to `0` to disable the global cap and rely on the per-address limit.
+  - Password hashing is concurrency-bounded by `--registration-concurrency` (default 2); excess requests get 503.
+  - Inactive self-registered accounts are not deleted automatically.
+- `--trusted-proxy <CIDR|IP>` (repeatable): only when the direct peer matches one of these are forwarding headers used for rate limiting. By default client-supplied forwarding headers are ignored. `X-Forwarded-For` is read **from the right**: hops that belong to a trusted proxy are skipped and the first untrusted hop is the client, so a client-supplied left-most value cannot change the limiter key. List every proxy hop that appends to the header (for example both the load balancer and nginx). The proxy must append to `X-Forwarded-For` (nginx `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, Caddy and `cloudflared` do this by default) or overwrite it with the peer address. `X-Real-IP` is used only when no `X-Forwarded-For` header is present
+- Login failures are limited per account and client address (5 failures per 15 minutes, then a 15-minute lockout); IPv6 clients are counted per `/64`
 - Sessions are stored locally and not replicated
 
 ## Configuration
@@ -166,6 +178,10 @@ makewand serve \
   --enable-users                      # Enable multi-user auth, login, admin API (no public signup)
   --enable-registration               # Open public /v1/users/register (implies --enable-users; accounts need admin activation)
   --trusted-proxy <CIDR|IP>           # Trust XFF/X-Real-IP from these peers for rate limiting (repeatable)
+  --registration-per-ip-limit 5       # Sign-ups per client address (IPv6 /64) per window
+  --registration-global-limit 30      # Sign-ups from all clients per window; 0 disables the global cap
+  --registration-window 1h            # Window for both registration limits
+  --registration-concurrency 2        # Concurrent registration password hashes
   --state-db path/to/state.db         # SQLite state DB (users, tokens, usage)
   --data-dir path/to/dir              # Session/state directory (default ~/.config/makewand/server)
   --audit-log path/to/audit.jsonl     # JSONL audit log path
@@ -173,6 +189,22 @@ makewand serve \
   --alert-webhook http://...          # Webhook for budget alerts
   --unsafe-no-tls                     # DANGER: allow plaintext on non-loopback (proxy/testing only)
 ```
+
+### Environment Variables
+
+Flags take precedence over these variables.
+
+| Variable | Used when | Effect |
+|---|---|---|
+| `MAKEWAND_SERVER_TOKEN` | no `--token`, `--auth-config`, or `MAKEWAND_SERVER_AUTH_CONFIG` | Single bearer token with every scope |
+| `MAKEWAND_SERVER_AUTH_CONFIG` | no `--auth-config` | Path to the scoped-token auth config (takes precedence over `--token`/`MAKEWAND_SERVER_TOKEN`); it must stay writable, because revocations rewrite it |
+| `MAKEWAND_SERVER_STATE_DB` | no `--state-db` | Path to the SQLite state DB; `0`, `false`, or `off` disables it. Default `<data-dir>/state.db` |
+| `MAKEWAND_SERVER_AUDIT_LOG` | no `--audit-log` | `1`/`true` writes `<data-dir>/audit.jsonl`; any other value is a path. Unset: no audit log |
+| `MAKEWAND_SERVER_USAGE_LOG` | no `--usage-log` | `1`/`true` writes `<data-dir>/usage.jsonl`; `0`/`false`/`off`/`disabled` turns the JSONL ledger off; any other value is a path. Unset: off when the state DB is enabled, otherwise `<data-dir>/usage.jsonl` |
+| `MAKEWAND_SERVER_ALERT_WEBHOOK` | no `--alert-webhook` | URL that receives budget alert webhooks |
+| `MAKEWAND_SERVER_ALERT_STATE` | no `--alert-state` | Path of the alert delivery state. Default `<data-dir>/alert_state.json` |
+| `MAKEWAND_API_POLICY` | always | `allow_paid` lets the server use provider API keys (billed); anything else, including the default `subscription_only`, ignores them. Required for API-key-only hosts such as the Docker image |
+| `MAKEWAND_CONFIG_DIR` | always | makewand config directory (default `~/.config/makewand`); `--data-dir` defaults to `<config dir>/server` |
 
 ### Accessing Server Data
 
@@ -210,16 +242,16 @@ makewand usage summary --state-db ~/.config/makewand/server/state.db
 
 ### Database errors
 
-- Backup your state.db before troubleshooting: `cp ~/.config/makewand/server/state.db{,.backup}`
+- Back up before troubleshooting with `makewand state backup ~/makewand-backup.tar.gz --data-dir ~/.config/makewand/server` (add `--auth-config <path>` if you use one). It snapshots the live database with `VACUUM INTO`. Do **not** `cp state.db`: while the server runs, recent writes live in `state.db-wal`, so a copy of the main file alone can be missing tables and rows
 - WAL files (`-wal`, `-shm`) are normal and should not be deleted
 - Do not directly modify the database; use provided CLI commands
 - Report backup/restore issues on GitHub
 
 ### Performance
 
-- Server is single-threaded and designed for small teams
-- Do not run high-concurrency workloads
-- Monitor `/admin` dashboard for session and usage stats
+- The server handles requests concurrently (Go `net/http`), but it is sized and tested for small teams: one process, one SQLite state DB, per-process rate-limit and quota counters, and no horizontal scaling or HA
+- Do not run high-concurrency workloads; registration password hashing is capped by `--registration-concurrency`
+- Monitor the `/admin` dashboard and `/metrics` for session and usage stats
 
 ## Feedback and Reporting Issues
 

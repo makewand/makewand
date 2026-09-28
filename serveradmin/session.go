@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/makewand/makewand/router"
@@ -18,14 +19,34 @@ import (
 
 const adminSessionCookieName = "makewand_admin_session"
 
+// DefaultAdminSessionIdleTimeout ends a browser session that has not been used
+// for this long, even inside its absolute lifetime.
+const DefaultAdminSessionIdleTimeout = 30 * time.Minute
+
+// SessionManager issues HMAC-signed admin browser cookies and tracks every live
+// session in server memory. A cookie is accepted only while its session is
+// registered, so logout revokes it on the server, idle sessions expire, and a
+// server restart signs every browser session out.
 type SessionManager struct {
-	userStore router.UserManager
-	secret    []byte
-	ttl       time.Duration
-	limiter   *serverauth.LoginRateLimiter
+	userStore   router.UserManager
+	secret      []byte
+	ttl         time.Duration
+	idleTimeout time.Duration
+	limiter     *serverauth.LoginRateLimiter
+	now         func() time.Time
+
+	mu       sync.Mutex
+	sessions map[string]*adminSessionRecord
+}
+
+type adminSessionRecord struct {
+	userID    string
+	expiresAt time.Time
+	lastSeen  time.Time
 }
 
 type sessionClaims struct {
+	SessionID   string `json:"sid"`
 	UserID      string `json:"user_id"`
 	AuthVersion string `json:"auth_version"`
 	Email       string `json:"email"`
@@ -38,6 +59,7 @@ type AdminSession struct {
 	User      router.UserView `json:"user"`
 	ExpiresAt time.Time       `json:"expires_at"`
 	CSRFToken string          `json:"csrf_token"`
+	id        string
 }
 
 type adminSessionLoginResponse struct {
@@ -59,11 +81,78 @@ func NewSessionManager(userStore router.UserManager, secret []byte, ttl time.Dur
 		ttl = 12 * time.Hour
 	}
 	return &SessionManager{
-		userStore: userStore,
-		secret:    secret,
-		ttl:       ttl,
-		limiter:   limiter,
+		userStore:   userStore,
+		secret:      secret,
+		ttl:         ttl,
+		idleTimeout: DefaultAdminSessionIdleTimeout,
+		limiter:     limiter,
+		now:         func() time.Time { return time.Now().UTC() },
+		sessions:    make(map[string]*adminSessionRecord),
 	}, nil
+}
+
+// SetIdleTimeout changes the idle timeout; a non-positive value disables it
+// (sessions then end only at their absolute expiry, logout, or restart).
+func (m *SessionManager) SetIdleTimeout(timeout time.Duration) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idleTimeout = timeout
+}
+
+// IdleTimeout returns the configured idle timeout.
+func (m *SessionManager) IdleTimeout() time.Duration {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.idleTimeout
+}
+
+func (m *SessionManager) currentTime() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now().UTC()
+}
+
+// touchSession reports whether sid is a live session for userID and, if so,
+// records activity. Expired and idle sessions are removed.
+func (m *SessionManager) touchSession(sid, userID string) bool {
+	now := m.currentTime()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record, ok := m.sessions[sid]
+	if !ok || record.userID != userID {
+		return false
+	}
+	if !now.Before(record.expiresAt) || (m.idleTimeout > 0 && now.Sub(record.lastSeen) > m.idleTimeout) {
+		delete(m.sessions, sid)
+		return false
+	}
+	record.lastSeen = now
+	return true
+}
+
+func (m *SessionManager) registerSession(sid, userID string, expiresAt time.Time) {
+	now := m.currentTime()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, record := range m.sessions {
+		if !now.Before(record.expiresAt) || (m.idleTimeout > 0 && now.Sub(record.lastSeen) > m.idleTimeout) {
+			delete(m.sessions, id)
+		}
+	}
+	m.sessions[sid] = &adminSessionRecord{userID: userID, expiresAt: expiresAt, lastSeen: now}
+}
+
+func (m *SessionManager) revokeSession(sid string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, sid)
 }
 
 func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Request) {
@@ -88,7 +177,16 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 		return
 	}
 	user, err := m.userStore.GetUserByEmail(payload.Email)
-	if err != nil || user == nil || !user.IsActive || !user.ValidatePassword(payload.Password) {
+	// Always spend one password hash: unknown and inactive accounts must take
+	// as long as a wrong password, or response time reveals which accounts
+	// exist.
+	passwordOK := false
+	if err == nil && user != nil {
+		passwordOK = user.ValidatePassword(payload.Password)
+	} else {
+		_ = timingEqualizerUser.ValidatePassword(payload.Password)
+	}
+	if !passwordOK || !user.IsActive {
 		m.limiter.RecordFailure(key, time.Now().UTC())
 		writeError(w, http.StatusUnauthorized, "unauthorized", "invalid email or password")
 		return
@@ -126,6 +224,8 @@ func (m *SessionManager) HandleSessionLogout(w http.ResponseWriter, req *http.Re
 			writeError(w, http.StatusForbidden, "forbidden", "missing or invalid CSRF token")
 			return
 		}
+		// Revoke on the server so a copied cookie stops working too.
+		m.revokeSession(session.id)
 	}
 	m.ClearCookie(w, req)
 	writeJSON(w, http.StatusOK, map[string]any{"signed_out": true})
@@ -164,11 +264,14 @@ func (m *SessionManager) Authenticate(req *http.Request) (*serverauth.Grant, *Ad
 		return nil, nil, false
 	}
 	claims, ok := m.parseCookie(cookie.Value)
-	if !ok {
+	if !ok || claims.SessionID == "" {
 		return nil, nil, false
 	}
 	user, err := m.userStore.GetUserByID(claims.UserID)
 	if err != nil || user == nil || !user.IsActive || !strings.EqualFold(user.Role, router.UserRoleAdmin) || !hmac.Equal([]byte(claims.AuthVersion), []byte(m.userAuthVersion(user))) {
+		return nil, nil, false
+	}
+	if !m.touchSession(claims.SessionID, claims.UserID) {
 		return nil, nil, false
 	}
 	grant, err := serverauth.GrantFromRule(serverauth.TokenRule{
@@ -184,6 +287,7 @@ func (m *SessionManager) Authenticate(req *http.Request) (*serverauth.Grant, *Ad
 		User:      user.View(),
 		ExpiresAt: time.Unix(claims.ExpiresAt, 0).UTC(),
 		CSRFToken: claims.CSRFToken,
+		id:        claims.SessionID,
 	}
 	return grant, session, true
 }
@@ -217,8 +321,9 @@ func (m *SessionManager) createSession(user *router.User) (*AdminSession, string
 	if m == nil || user == nil {
 		return nil, "", fmt.Errorf("admin session manager is unavailable")
 	}
-	expiresAt := time.Now().UTC().Add(m.ttl)
+	expiresAt := m.currentTime().Add(m.ttl)
 	claims := sessionClaims{
+		SessionID:   randomToken(24),
 		UserID:      user.ID,
 		AuthVersion: m.userAuthVersion(user),
 		Email:       user.Email,
@@ -232,10 +337,12 @@ func (m *SessionManager) createSession(user *router.User) (*AdminSession, string
 	}
 	sig := m.sign(payload)
 	value := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
+	m.registerSession(claims.SessionID, user.ID, time.Unix(claims.ExpiresAt, 0).UTC())
 	return &AdminSession{
 		User:      user.View(),
 		ExpiresAt: expiresAt,
 		CSRFToken: claims.CSRFToken,
+		id:        claims.SessionID,
 	}, value, nil
 }
 
@@ -271,7 +378,7 @@ func (m *SessionManager) parseCookie(value string) (*sessionClaims, bool) {
 	if claims.UserID == "" || claims.CSRFToken == "" || claims.ExpiresAt == 0 {
 		return nil, false
 	}
-	if time.Now().UTC().After(time.Unix(claims.ExpiresAt, 0).UTC()) {
+	if m.currentTime().After(time.Unix(claims.ExpiresAt, 0).UTC()) {
 		return nil, false
 	}
 	return &claims, true
@@ -295,6 +402,10 @@ func (m *SessionManager) sign(payload []byte) []byte {
 	_, _ = mac.Write(payload)
 	return mac.Sum(nil)
 }
+
+// timingEqualizerUser has no valid password: validating against it performs
+// the same Argon2id work as a real account and always fails.
+var timingEqualizerUser = &router.User{Salt: "makewand-login-timing-equalizer"}
 
 func randomToken(size int) string {
 	buf := make([]byte, size)

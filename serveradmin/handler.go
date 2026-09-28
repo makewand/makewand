@@ -178,25 +178,27 @@ func handleTokens(w http.ResponseWriter, req *http.Request, opts HandlerOptions)
 	}
 	if err := enforceGrantTokenScope(grant, &rule); err != nil {
 		writeError(w, http.StatusForbidden, "forbidden", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusForbidden, err.Error(), 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusForbidden, err.Error(), tokenAuditTarget("issue_token", rule))
 		return
 	}
 	if opts.UserStore != nil && rule.UserID != "" {
 		user, err := opts.UserStore.GetUserByID(rule.UserID)
 		if err != nil || user == nil || !user.IsActive {
 			writeError(w, http.StatusBadRequest, "invalid_request", "token user must be an active account")
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusBadRequest, "token user must be an active account", tokenAuditTarget("issue_token", rule))
 			return
 		}
 		rule.AuthorizationVersion, err = router.UserAuthorizationVersion(user, rule.OrganizationID, rule.ProjectID, opts.TeamStore)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "could not read user authorization state")
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusInternalServerError, "could not read user authorization state", tokenAuditTarget("issue_token", rule))
 			return
 		}
 	}
 	view, tokenValue, err := opts.TokenManager.Issue(rule)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusBadRequest, err.Error(), 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusBadRequest, err.Error(), tokenAuditTarget("issue_token", rule))
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -204,7 +206,9 @@ func handleTokens(w http.ResponseWriter, req *http.Request, opts HandlerOptions)
 		"token":    tokenValue,
 		"rule":     view,
 	})
-	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusCreated, "", 0, 0, 0)
+	issued := tokenAuditTarget("issue_token", rule)
+	issued.TokenID = view.ID
+	logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusCreated, "", issued)
 }
 
 func handleRevokeToken(w http.ResponseWriter, req *http.Request, opts HandlerOptions) {
@@ -223,7 +227,7 @@ func handleRevokeToken(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 	}
 	if err := enforceGrantRevokeScope(opts.TokenManager, grant, tokenID); err != nil {
 		writeError(w, http.StatusForbidden, "forbidden", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusForbidden, err.Error(), 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusForbidden, err.Error(), auditTarget{Action: "revoke_token", TokenID: tokenID})
 		return
 	}
 	if err := opts.TokenManager.Revoke(tokenID); err != nil {
@@ -232,14 +236,14 @@ func handleRevokeToken(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 			status = http.StatusNotFound
 		}
 		writeError(w, status, "invalid_request", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", status, err.Error(), 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", status, err.Error(), auditTarget{Action: "revoke_token", TokenID: tokenID})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token_id": tokenID,
 		"revoked":  true,
 	})
-	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusOK, "", 0, 0, 0)
+	logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminTokensWrite, "admin_tokens", http.StatusOK, "", auditTarget{Action: "revoke_token", TokenID: tokenID})
 }
 
 func handleAuditSummary(w http.ResponseWriter, req *http.Request, opts HandlerOptions) {
@@ -440,9 +444,10 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		http.NotFound(w, req)
 		return
 	}
+	target := auditTarget{Action: action, UserID: userID}
 	if err := authorizeUserAction(grant, userID, action, opts); err != nil {
 		writeError(w, http.StatusForbidden, "forbidden", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusForbidden, err.Error(), 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusForbidden, err.Error(), target)
 		return
 	}
 
@@ -464,12 +469,14 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		if decodeErr := dec.Decode(&payload); decodeErr != nil {
 			status, code, message := adminJSONDecodeError(decodeErr)
 			writeError(w, status, code, message)
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, target)
 			return
 		}
 		role := strings.ToLower(strings.TrimSpace(payload.Role))
+		target.Role = role
 		if role != "" && role != router.UserRoleMember && role != router.UserRoleAdmin {
 			writeError(w, http.StatusBadRequest, "invalid_request", "invalid user role")
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusBadRequest, "invalid user role", target)
 			return
 		}
 		if !revokeUserCredentials(w, req, opts, grant, userID, "admin_users") {
@@ -482,11 +489,12 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		if decodeErr := dec.Decode(&payload); decodeErr != nil {
 			status, code, message := adminJSONDecodeError(decodeErr)
 			writeError(w, status, code, message)
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, target)
 			return
 		}
 		if len(payload.Password) < 8 {
 			writeError(w, http.StatusBadRequest, "invalid_request", "password must be at least 8 characters long")
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusBadRequest, "password must be at least 8 characters long", target)
 			return
 		}
 		if !revokeUserCredentials(w, req, opts, grant, userID, "admin_users") {
@@ -508,7 +516,7 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 			status = http.StatusInternalServerError
 		}
 		writeError(w, status, "invalid_request", err.Error())
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, err.Error(), 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, err.Error(), target)
 		return
 	}
 
@@ -517,7 +525,11 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 		"action":  action,
 		"user":    user.View(),
 	})
-	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusOK, "", 0, 0, 0)
+	if action == "activate" || action == "deactivate" {
+		active := user.IsActive
+		target.Active = &active
+	}
+	logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusOK, "", target)
 }
 
 func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOptions, scope, kind string) (*serverauth.Grant, bool) {
@@ -563,7 +575,7 @@ func authenticateAdmin(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, grant, scope, kind, http.StatusForbidden, fmt.Sprintf("token does not allow scope %q", scope), 0, 0, 0)
 		return nil, false
 	}
-	return grant, true
+	return elevateGlobalAdministratorGrant(grant, opts.UserStore), true
 }
 
 type pageWindow struct {
@@ -616,6 +628,16 @@ func constrainUsageFilterByGrant(filter *serverusage.Filter, grant *serverauth.G
 	}
 	if grant.UserID() != "" {
 		filter.UserID = grant.UserID()
+	}
+}
+
+func tokenAuditTarget(action string, rule serverauth.TokenRule) auditTarget {
+	return auditTarget{
+		Action:         action,
+		UserID:         strings.TrimSpace(rule.UserID),
+		OrganizationID: strings.TrimSpace(rule.OrganizationID),
+		ProjectID:      strings.TrimSpace(rule.ProjectID),
+		TokenID:        strings.TrimSpace(rule.ID),
 	}
 }
 
@@ -1182,16 +1204,63 @@ func logAdminEvent(logger serveraudit.Logger, req *http.Request, grant *serverau
 	if logger == nil {
 		return
 	}
+	event := adminEvent(req, grant, scope, kind, status, errText)
+	event.PromptTokens = promptTokens
+	event.CompletionTokens = completionTokens
+	event.CostUSD = costUSD
+	logger.Log(event)
+}
+
+// auditTarget describes what an admin mutation changed.
+type auditTarget struct {
+	Action         string
+	UserID         string
+	OrganizationID string
+	ProjectID      string
+	TokenID        string
+	Role           string
+	Active         *bool
+}
+
+func membershipAuditTarget(action, userID, orgID, projectID, role string, active *bool) auditTarget {
+	effective := true
+	if active != nil {
+		effective = *active
+	}
+	return auditTarget{
+		Action:         action,
+		UserID:         strings.TrimSpace(userID),
+		OrganizationID: strings.TrimSpace(orgID),
+		ProjectID:      strings.TrimSpace(projectID),
+		Role:           strings.ToLower(strings.TrimSpace(role)),
+		Active:         &effective,
+	}
+}
+
+// logAdminTargetEvent records an admin mutation together with its target.
+func logAdminTargetEvent(logger serveraudit.Logger, req *http.Request, grant *serverauth.Grant, scope, kind string, status int, errText string, target auditTarget) {
+	if logger == nil {
+		return
+	}
+	event := adminEvent(req, grant, scope, kind, status, errText)
+	event.Action = target.Action
+	event.TargetUserID = target.UserID
+	event.TargetOrganizationID = target.OrganizationID
+	event.TargetProjectID = target.ProjectID
+	event.TargetTokenID = target.TokenID
+	event.TargetRole = target.Role
+	event.TargetActive = target.Active
+	logger.Log(event)
+}
+
+func adminEvent(req *http.Request, grant *serverauth.Grant, scope, kind string, status int, errText string) serveraudit.Event {
 	event := serveraudit.Event{
-		Timestamp:        time.Now().UTC(),
-		RequestID:        serverhttp.RequestIDFromRequest(req),
-		Kind:             kind,
-		Scope:            scope,
-		Status:           status,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		CostUSD:          costUSD,
-		Error:            errText,
+		Timestamp: time.Now().UTC(),
+		RequestID: serverhttp.RequestIDFromRequest(req),
+		Kind:      kind,
+		Scope:     scope,
+		Status:    status,
+		Error:     errText,
 	}
 	if req != nil {
 		event.Method = req.Method
@@ -1200,6 +1269,7 @@ func logAdminEvent(logger serveraudit.Logger, req *http.Request, grant *serverau
 	if grant != nil {
 		event.TokenID = grant.TokenID()
 		event.TokenDescription = grant.Description()
+		event.ActorUserID = grant.UserID()
 	}
-	logger.Log(event)
+	return event
 }

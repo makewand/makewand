@@ -112,15 +112,20 @@ func (l *LoginRateLimiter) SetTrustedProxies(trusted *TrustedProxies) {
 }
 
 // ThrottleKey derives the limiter key for a request using this limiter's
-// trusted-proxy configuration.
+// trusted-proxy configuration. The address part is bucketed with
+// RateLimitSource so rotating addresses inside one IPv6 /64 shares a key.
 func (l *LoginRateLimiter) ThrottleKey(req *http.Request, principal string) string {
-	var trusted *TrustedProxies
-	if l != nil {
-		l.mu.Lock()
-		trusted = l.trusted
-		l.mu.Unlock()
+	return strings.TrimSpace(strings.ToLower(principal)) + "|" + RateLimitSource(ClientIP(req, l.TrustedProxies()))
+}
+
+// TrustedProxies returns the configured trusted proxy set, if any.
+func (l *LoginRateLimiter) TrustedProxies() *TrustedProxies {
+	if l == nil {
+		return nil
 	}
-	return strings.TrimSpace(strings.ToLower(principal)) + "|" + ClientIP(req, trusted)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.trusted
 }
 
 // LoginThrottleKey derives a limiter key from the request's direct peer
@@ -128,7 +133,24 @@ func (l *LoginRateLimiter) ThrottleKey(req *http.Request, principal string) stri
 // ignored; use LoginRateLimiter.ThrottleKey with SetTrustedProxies to honor
 // them behind a trusted reverse proxy.
 func LoginThrottleKey(req *http.Request, principal string) string {
-	return strings.TrimSpace(strings.ToLower(principal)) + "|" + ClientIP(req, nil)
+	return strings.TrimSpace(strings.ToLower(principal)) + "|" + RateLimitSource(ClientIP(req, nil))
+}
+
+// RateLimitSource maps a client address to its rate-limiting bucket. IPv4
+// addresses (including IPv4-mapped IPv6) are used as-is; IPv6 addresses are
+// bucketed by their /64 network because a single client normally controls a
+// whole /64 and could otherwise rotate addresses to evade per-source limits.
+// Values that are not IP addresses are returned unchanged.
+func RateLimitSource(addr string) string {
+	addr = strings.TrimSpace(addr)
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return addr
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return (&net.IPNet{IP: ip.Mask(net.CIDRMask(64, 128)), Mask: net.CIDRMask(64, 128)}).String()
 }
 
 // TrustedProxies matches direct peer addresses against operator-configured
@@ -186,6 +208,16 @@ func (t *TrustedProxies) Trusts(ip net.IP) bool {
 // ClientIP returns the throttling address for a request. Forwarding headers
 // are honored only when the direct peer is a trusted proxy; otherwise the
 // direct peer address is used.
+//
+// Behind trusted proxies the X-Forwarded-For chain (all header lines, in
+// order) is walked from the right: hops appended by trusted proxies are
+// skipped and the first untrusted hop is the client. Hops further left are
+// supplied by the client and are never used, so a forged left-most hop cannot
+// change the result. A malformed hop inside the proxy-appended part makes the
+// chain untrustworthy and falls back to the direct peer. When every hop is a
+// trusted proxy the left-most hop is used. X-Real-IP is consulted only when no
+// X-Forwarded-For header is present and must be a valid IP address. Reverse
+// proxies must therefore append to (or overwrite) X-Forwarded-For.
 func ClientIP(req *http.Request, trusted *TrustedProxies) string {
 	if req == nil {
 		return ""
@@ -194,15 +226,50 @@ func ClientIP(req *http.Request, trusted *TrustedProxies) string {
 	if !trusted.Trusts(net.ParseIP(host)) {
 		return host
 	}
-	if forwarded := strings.TrimSpace(req.Header.Get("X-Forwarded-For")); forwarded != "" {
-		if client := strings.TrimSpace(strings.Split(forwarded, ",")[0]); client != "" {
-			return client
+	if values := req.Header.Values("X-Forwarded-For"); len(values) > 0 {
+		var hops []string
+		for _, value := range values {
+			for _, hop := range strings.Split(value, ",") {
+				if hop = strings.TrimSpace(hop); hop != "" {
+					hops = append(hops, hop)
+				}
+			}
+		}
+		if len(hops) > 0 {
+			var leftmost net.IP
+			for i := len(hops) - 1; i >= 0; i-- {
+				ip := parseForwardedIP(hops[i])
+				if ip == nil {
+					return host
+				}
+				if !trusted.Trusts(ip) {
+					return ip.String()
+				}
+				leftmost = ip
+			}
+			return leftmost.String()
 		}
 	}
-	if realIP := strings.TrimSpace(req.Header.Get("X-Real-IP")); realIP != "" {
-		return realIP
+	if realIP := parseForwardedIP(req.Header.Get("X-Real-IP")); realIP != nil {
+		return realIP.String()
 	}
 	return host
+}
+
+// parseForwardedIP parses one forwarding-header hop, accepting bare IPv4/IPv6
+// addresses and host:port / [v6]:port forms. It returns nil for anything else.
+func parseForwardedIP(value string) net.IP {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if ip := net.ParseIP(strings.Trim(value, "[]")); ip != nil {
+		return ip
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return net.ParseIP(host)
+	}
+	return nil
 }
 
 func remoteHost(remoteAddr string) string {

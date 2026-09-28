@@ -10,14 +10,38 @@ import (
 
 const HeaderRequestID = "X-Request-Id"
 
+// MaxRequestIDLength bounds client-supplied request IDs. Longer values are
+// replaced by a generated ID.
+const MaxRequestIDLength = 128
+
+// ValidRequestID reports whether a client-supplied request ID may be echoed
+// into response headers, audit records, and usage records: 1 to
+// MaxRequestIDLength bytes of ASCII letters, digits, and "-_.:/".
+func ValidRequestID(value string) bool {
+	if value == "" || len(value) > MaxRequestIDLength {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.' || c == ':' || c == '/':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 type requestIDContextKey struct{}
 
 // WithRequestID ensures every request has a stable request ID available in
-// context and echoed back in the response header.
+// context and echoed back in the response header. A client-supplied ID is kept
+// only when ValidRequestID accepts it; otherwise a new ID is generated.
 func WithRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		requestID := strings.TrimSpace(req.Header.Get(HeaderRequestID))
-		if requestID == "" {
+		if !ValidRequestID(requestID) {
 			requestID = generateRequestID()
 		}
 		w.Header().Set(HeaderRequestID, requestID)
@@ -43,7 +67,10 @@ func RequestIDFromRequest(req *http.Request) string {
 	if value := RequestIDFromContext(req.Context()); value != "" {
 		return value
 	}
-	return strings.TrimSpace(req.Header.Get(HeaderRequestID))
+	if value := strings.TrimSpace(req.Header.Get(HeaderRequestID)); ValidRequestID(value) {
+		return value
+	}
+	return ""
 }
 
 func generateRequestID() string {

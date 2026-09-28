@@ -5,9 +5,23 @@ After=network.target
 [Service]
 User=makewand
 Group=makewand
+# Every file the server writes lives under /var/lib/makewand, which systemd
+# creates for the service user (StateDirectory) and keeps writable under
+# ProtectSystem=strict. That includes the auth config: revoking a token, and the
+# password/role/active-state changes that revoke a user's tokens, rewrite
+# server_auth.json. Keeping it under /etc (read-only here) made those
+# revocations fail. Migrating from an older unit:
+#   install -o makewand -g makewand -m 0600 /etc/makewand/server_auth.json /var/lib/makewand/server_auth.json
+StateDirectory=makewand
+StateDirectoryMode=0700
 WorkingDirectory=/srv/makewand
+# ProtectHome=true hides /home, so keep HOME and the makewand config directory
+# (config.json, routing stats, provider CLI logins) in the state directory too.
+Environment=HOME=/var/lib/makewand
+Environment=MAKEWAND_CONFIG_DIR=/var/lib/makewand/config
+# Secrets such as provider API keys; readable only, never written by the server.
 EnvironmentFile=/etc/makewand/makewand.env
-ExecStart=/usr/local/bin/makewand serve --listen 127.0.0.1:8080 --enable-users --data-dir /var/lib/makewand --auth-config /etc/makewand/server_auth.json
+ExecStart=/usr/local/bin/makewand serve --listen 127.0.0.1:8080 --enable-users --data-dir /var/lib/makewand --auth-config /var/lib/makewand/server_auth.json
 Restart=always
 RestartSec=3
 NoNewPrivileges=true

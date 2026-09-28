@@ -32,7 +32,14 @@ func userWithinTenant(grant *serverauth.Grant, userID string, teams serverteam.S
 }
 
 func isGlobalAdministrator(grant *serverauth.Grant) bool {
-	if grant == nil || grant.UserID() != "" || grant.OrganizationID() != "" || grant.ProjectID() != "" {
+	return grant != nil && grant.UserID() == "" && hasUnrestrictedCapabilities(grant)
+}
+
+// hasUnrestrictedCapabilities reports whether grant carries every server scope
+// without tenant, workspace, provider, mode, or quota restrictions. It ignores
+// the user binding so callers can decide separately how to treat it.
+func hasUnrestrictedCapabilities(grant *serverauth.Grant) bool {
+	if grant == nil || grant.OrganizationID() != "" || grant.ProjectID() != "" {
 		return false
 	}
 	if len(grant.WorkspacePrefixes()) != 0 || len(grant.AllowedProviders()) != 0 || len(grant.AllowedModes()) != 0 || grant.MaxRequestsPerHour() > 0 || grant.MaxRequestsPerDay() > 0 || grant.MaxCostUSDPerDay() > 0 || grant.MaxCostUSDPerMonth() > 0 {
@@ -46,6 +53,48 @@ func isGlobalAdministrator(grant *serverauth.Grant) bool {
 		}
 	}
 	return true
+}
+
+// elevateGlobalAdministratorGrant gives the unrestricted, full-scope token of a
+// currently active global administrator account (for example the token that
+// /v1/users/login and `makewand user login` return to an admin) the same
+// unbound capability set as that administrator's browser session. The account
+// role and active state are read from the user store on every request, so a
+// demotion or deactivation removes the elevation immediately. Tenant-scoped or
+// otherwise restricted tokens, and tokens of non-admin accounts, keep their
+// user binding and every R01 tenant boundary.
+func elevateGlobalAdministratorGrant(grant *serverauth.Grant, users router.UserManager) *serverauth.Grant {
+	if grant == nil || grant.UserID() == "" || users == nil || !hasUnrestrictedCapabilities(grant) {
+		return grant
+	}
+	user, err := users.GetUserByID(grant.UserID())
+	if err != nil || user == nil || !user.IsActive || !strings.EqualFold(user.Role, router.UserRoleAdmin) {
+		return grant
+	}
+	elevated, err := serverauth.GrantFromRule(serverauth.TokenRule{
+		ID:          grant.TokenID(),
+		Description: grant.Description(),
+		Scopes:      serverauth.AllScopes(),
+		ExpiresAt:   grant.ExpiresAt(),
+	})
+	if err != nil {
+		return grant
+	}
+	return elevated
+}
+
+// forbidUserBoundTenantAdministration rejects tenant-structure mutations
+// (organizations, projects, and memberships) from tokens bound to a user.
+// Such tokens exist for self-service account actions; membership and tenant
+// changes require a global administrator or a tenant administrator token
+// (organization- or project-scoped, not bound to a user). Without this rule a
+// user-bound admin:users:write token could add its owner to any tenant as an
+// owner or raise its own role.
+func forbidUserBoundTenantAdministration(grant *serverauth.Grant) error {
+	if grant != nil && grant.UserID() != "" {
+		return fmt.Errorf("user-bound tokens cannot manage organizations, projects, or memberships; use a global or tenant administrator token")
+	}
+	return nil
 }
 
 func authorizeUserAction(grant *serverauth.Grant, userID, action string, opts HandlerOptions) error {

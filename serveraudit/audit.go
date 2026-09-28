@@ -34,6 +34,17 @@ type Event struct {
 	CompletionTokens int       `json:"completion_tokens,omitempty"`
 	CostUSD          float64   `json:"cost_usd,omitempty"`
 	Error            string    `json:"error,omitempty"`
+
+	// Admin mutation details. ActorUserID is the user bound to the acting
+	// token, if any; the Target fields describe what the request changed.
+	ActorUserID          string `json:"actor_user_id,omitempty"`
+	Action               string `json:"action,omitempty"`
+	TargetUserID         string `json:"target_user_id,omitempty"`
+	TargetOrganizationID string `json:"target_organization_id,omitempty"`
+	TargetProjectID      string `json:"target_project_id,omitempty"`
+	TargetTokenID        string `json:"target_token_id,omitempty"`
+	TargetRole           string `json:"target_role,omitempty"`
+	TargetActive         *bool  `json:"target_active,omitempty"`
 }
 
 // Filter narrows audit events when reading from JSONL.
@@ -245,6 +256,14 @@ func WriteEventsCSV(w io.Writer, events []Event) error {
 		"completion_tokens",
 		"cost_usd",
 		"error",
+		"actor_user_id",
+		"action",
+		"target_user_id",
+		"target_organization_id",
+		"target_project_id",
+		"target_token_id",
+		"target_role",
+		"target_active",
 	}); err != nil {
 		return err
 	}
@@ -268,12 +287,27 @@ func WriteEventsCSV(w io.Writer, events []Event) error {
 			strconv.Itoa(evt.CompletionTokens),
 			strconv.FormatFloat(evt.CostUSD, 'f', 6, 64),
 			evt.Error,
+			evt.ActorUserID,
+			evt.Action,
+			evt.TargetUserID,
+			evt.TargetOrganizationID,
+			evt.TargetProjectID,
+			evt.TargetTokenID,
+			evt.TargetRole,
+			optionalBool(evt.TargetActive),
 		}); err != nil {
 			return err
 		}
 	}
 	cw.Flush()
 	return cw.Error()
+}
+
+func optionalBool(value *bool) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatBool(*value)
 }
 
 func matchesFilter(evt Event, filter Filter) bool {
