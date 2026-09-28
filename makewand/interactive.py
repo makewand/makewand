@@ -129,9 +129,18 @@ def get_model_status_badges(cache: Optional[Dict[str, Any]] = None) -> str:
         info = cache.get(key, {})
         st = info.get("status", "unknown")
         quota = calculate_provider_quota(key, info)
-        pct = quota.get("percentage", 100)
-        if st == "healthy":
-            badges.append(f"{COLOR_GREEN}🟢 {name} {pct}%{COLOR_RESET}")
+        pct = quota.get("percentage")
+        source = quota.get("source")
+        if source == "official" and pct is not None:
+            pct_text = f" {pct}%"
+        elif source == "local_estimate" and pct is not None:
+            pct_text = f" ≈{pct}%(本地估算)"
+        else:
+            pct_text = ""
+        if st == "healthy" and quota.get("stale"):
+            badges.append(f"{COLOR_GRAY}⚪ {name} (状态过期){COLOR_RESET}")
+        elif st == "healthy":
+            badges.append(f"{COLOR_GREEN}🟢 {name}{pct_text}{COLOR_RESET}")
         elif st == "limited":
             badges.append(f"{COLOR_RED}🔴 {name} 0%{COLOR_RESET}")
         elif st == "needs_auth":
@@ -304,31 +313,121 @@ def handle_conversational_turn(
         print()
 
 
+HISTORY_MAX_ENTRIES = 1000
+# Above this size the history file is never loaded as-is: only its tail is kept.
+HISTORY_MAX_BYTES = 5 * 1024 * 1024
+# Upper bound on how much of the tail is read while compacting (memory cap).
+HISTORY_TAIL_READ_LIMIT = 2 * 1024 * 1024
+_LIBEDIT_HISTORY_HEADER = b"_HiStOrY_V2_"
+
+
+def get_history_file() -> Path:
+    """REPL history lives under the (MAKEWAND_CONFIG_DIR-controlled) config dir."""
+    from makewand import config as _config
+    return Path(_config.CONFIG_DIR) / "history"
+
+
+def _read_tail_lines(path: Path, max_lines: int, read_limit: int) -> List[bytes]:
+    """Return the last `max_lines` lines reading at most `read_limit` bytes from the end."""
+    block = 64 * 1024
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        pos = end
+        chunks: List[bytes] = []
+        newlines = 0
+        consumed = 0
+        while pos > 0 and newlines <= max_lines and consumed < read_limit:
+            step = min(block, pos, read_limit - consumed)
+            pos -= step
+            f.seek(pos)
+            chunk = f.read(step)
+            consumed += len(chunk)
+            newlines += chunk.count(b"\n")
+            chunks.append(chunk)
+    data = b"".join(reversed(chunks))
+    lines = data.splitlines()
+    if pos > 0 and lines:
+        lines = lines[1:]  # first line may be a partial line
+    return lines[-max_lines:]
+
+
+def compact_history_file(path: Path, max_lines: int = HISTORY_MAX_ENTRIES,
+                         max_bytes: int = HISTORY_MAX_BYTES) -> bool:
+    """
+    Keep only the last `max_lines` entries of an oversized history file, reading
+    just its tail and replacing it atomically. Returns True when rewritten.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    if st.st_size <= max_bytes:
+        return False
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(path, "rb") as f:
+            header = f.readline(len(_LIBEDIT_HISTORY_HEADER) + 2).rstrip(b"\r\n")
+        lines = _read_tail_lines(path, max_lines, HISTORY_TAIL_READ_LIMIT)
+        if header == _LIBEDIT_HISTORY_HEADER and (not lines or lines[0] != header):
+            lines = [header] + lines[-(max_lines - 1):]
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(b"\n".join(lines) + (b"\n" if lines else b""))
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
 def setup_readline():
-    """Initializes readline with history file and tab completers."""
+    """Initializes readline with a bounded history file and tab completers."""
     global _readline_initialized
     if readline is None or _readline_initialized:
         return
 
     _readline_initialized = True
 
-    hist_dir = Path.home() / ".config" / "makewand"
+    hist_path = get_history_file()
+    hist_dir = hist_path.parent
     try:
-        hist_dir.mkdir(parents=True, exist_ok=True)
+        hist_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     except Exception:
         pass
-    hist_file = str(hist_dir / "history")
+    hist_file = str(hist_path)
 
     try:
-        if os.path.exists(hist_file):
+        readline.set_history_length(HISTORY_MAX_ENTRIES)
+    except Exception:
+        pass
+
+    # Never load a runaway history file whole (it once reached 909 MB and cost
+    # ~6 GB RSS per start): compact it to its tail first.
+    compact_history_file(hist_path)
+
+    try:
+        if os.path.exists(hist_file) and os.path.getsize(hist_file) <= HISTORY_MAX_BYTES:
             readline.read_history_file(hist_file)
     except Exception:
         pass
 
+    rl = readline
+
     def _save_history():
         try:
             if os.path.exists(hist_dir):
-                readline.write_history_file(hist_file)
+                rl.set_history_length(HISTORY_MAX_ENTRIES)
+                rl.write_history_file(hist_file)
+                try:
+                    os.chmod(hist_file, 0o600)
+                except OSError:
+                    pass
         except Exception:
             pass
 
