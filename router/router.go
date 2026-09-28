@@ -267,6 +267,13 @@ type Router struct {
 	providerCache map[providerKey]Provider
 	providerMu    sync.Mutex
 
+	// cacheRoot is set on per-request views (cloneView) to the long-lived
+	// Router they were derived from. Factory-built provider instances are
+	// resolved through, and cached on, the root so later views reuse them
+	// instead of re-running the factory (and, for API providers, building new
+	// HTTP transports) on every request. Nil on a root Router.
+	cacheRoot *Router
+
 	// factories maps provider names to per-instance factories for dynamic
 	// model-specific construction (guarded by providerMu).
 	factories map[string]ProviderFactory
@@ -651,7 +658,13 @@ func (r *Router) cloneView() *Router {
 	traceSink := r.traceSink
 	r.traceMu.RUnlock()
 
+	root := r.cacheRoot
+	if root == nil {
+		root = r
+	}
+
 	clone := &Router{
+		cacheRoot:         root,
 		legacyModels:      legacy,
 		providers:         providers,
 		providerAllowlist: cloneStringSet(r.providerAllowlist),

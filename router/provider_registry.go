@@ -12,7 +12,10 @@ type ProviderFactory func(modelID string) (Provider, error)
 // RegisterProviderFactory registers or overrides a provider factory on this
 // Router. Factories are strictly per-instance, so two Routers can build the
 // same provider name from different configurations without ever affecting one
-// another. There is no package-level factory registry.
+// another. There is no package-level factory registry. Instances the factory
+// builds are cached per (name, model) on this Router and shared with its
+// per-request views (e.g. HTTP requests carrying a mode or a provider
+// allowlist); re-registering a factory invalidates that name's cache.
 func (r *Router) RegisterProviderFactory(name string, factory ProviderFactory) error {
 	name = strings.TrimSpace(strings.ToLower(name))
 	if name == "" {
@@ -27,6 +30,16 @@ func (r *Router) RegisterProviderFactory(name string, factory ProviderFactory) e
 		r.factories = make(map[string]ProviderFactory)
 	}
 	r.factories[name] = factory
+	// Drop instances cached for this name so the new factory takes effect.
+	// Per-request views resolve factory-built providers through this Router's
+	// cache, so stale entries would otherwise outlive the re-registration.
+	// Entries that merely point at a registered provider are recomputed on the
+	// next lookup.
+	for key := range r.providerCache {
+		if key.name == name {
+			delete(r.providerCache, key)
+		}
+	}
 	r.providerMu.Unlock()
 	return nil
 }

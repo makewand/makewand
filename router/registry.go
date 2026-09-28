@@ -57,14 +57,61 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 	}
 
 	factory, ok := r.getFactoryLocked(providerName)
+	root := r.cacheRoot
 	r.providerMu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
 	}
 
+	if root == nil {
+		return r.resolveFactoryInstance(key, factory)
+	}
+
+	// Per-request view: resolve through the long-lived root so the instance is
+	// built at most once and shared by every later view, instead of dying with
+	// this request's clone. Locks are never nested (clone then root), so there
+	// is no lock-ordering hazard.
+	p, err := root.resolveFactoryInstance(key, factory)
+	if err != nil {
+		return nil, err
+	}
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+	if existing, ok := r.providerCache[key]; ok {
+		return existing, nil
+	}
+	r.providerCache[key] = p
+	return p, nil
+}
+
+// resolveFactoryInstance returns this Router's cached factory-built instance
+// for key, constructing it on a miss with this Router's current factory for
+// key.name. fallback is used only when this Router has no factory for the name
+// (a per-request view whose root never had one); such an instance is returned
+// uncached so a root never caches a provider its own factories cannot produce.
+func (r *Router) resolveFactoryInstance(key providerKey, fallback ProviderFactory) (Provider, error) {
+	r.providerMu.Lock()
+	if p, ok := r.providerCache[key]; ok {
+		r.providerMu.Unlock()
+		return p, nil
+	}
+	factory, ok := r.getFactoryLocked(key.name)
+	r.providerMu.Unlock()
+	if !ok {
+		if fallback == nil {
+			return nil, fmt.Errorf("unknown provider: %s", key.name)
+		}
+		p, err := fallback(key.modelID)
+		if err != nil {
+			return nil, err
+		}
+		r.attachCostTable(p)
+		return p, nil
+	}
+
 	// Construct outside the lock: factories may probe binaries or the network,
 	// and holding providerMu here would stall every concurrent route.
-	p, err := factory(modelID)
+	p, err := factory(key.modelID)
 	if err != nil {
 		return nil, err
 	}
