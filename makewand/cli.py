@@ -700,7 +700,7 @@ def main():
     p_run.add_argument("--max-fix", type=int, default=2, help="Maximum auto-fix iterations (default: 2)")
     p_run.add_argument("--stream", action="store_true", default=False, help="Stream subprocess output line-by-line")
     p_run.add_argument("--boost", action="store_true", default=False, help="Force boost/overclock mode: bypass soft burn rate penalty and allocate highest reasoning power")
-    p_run.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100% offline mode: use local self-hosted models for both coding and review")
+    p_run.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: use local self-hosted models for both coding and review")
     p_run.add_argument("--provider", dest="provider", default=None, help="Explicit primary provider override (e.g. deepseek, qwen, local, claude, codex, agy, grok, muse)")
 
     # review
