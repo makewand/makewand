@@ -2234,6 +2234,22 @@ def run_pipeline(
     print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
     return True
 
+_UNUSABLE_ENGINE_STATUSES = ("limited", "needs_auth", "missing", "disabled")
+
+
+def _engine_usable(engine: str, cache: Optional[Dict[str, Any]], require_healthy: bool = False) -> Tuple[bool, str]:
+    """An engine may be selected only if the user has not disabled it and its cached health allows it."""
+    from makewand.config import is_provider_enabled
+    if not is_provider_enabled(engine):
+        return False, f"已被用户禁用 (makewand enable {engine} 可重新开启)"
+    status = ((cache or {}).get(engine) or {}).get("status")
+    if require_healthy and status != "healthy":
+        return False, f"健康状态为 {status or 'unknown'}"
+    if status in _UNUSABLE_ENGINE_STATUSES:
+        return False, f"健康状态为 {status}"
+    return True, ""
+
+
 def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted") -> int:
     if not cwd:
         cwd = os.getcwd()
@@ -2287,8 +2303,6 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
         return EXIT_PASSED
 
     cache = get_or_update_status()
-    x_status = cache.get("codex", {}).get("status")
-    g_status = cache.get("grok", {}).get("status")
 
     focus = f" 特别关注要求: {user_prompt}。" if user_prompt else ""
     prompt = (
@@ -2297,64 +2311,48 @@ def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 3
         f"--- 代码改动 (git diff) ---\n{diff_out[:6000]}"
     )
 
+    # Reviewer ladder honours `makewand disable <engine>` and the cached health status.
+    reviewer_ladder = [
+        ("codex", "派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN),
+        ("grok", "派发给 Grok Build CLI 进行红队审计 (xAI / grok-4.7, 只读隔离)...", COLOR_RED),
+        ("agy", "由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN),
+    ]
     review_res = None
     reviewer_engine = None
-    if x_status != "limited":
+    attempted = []
+    for eng, banner, color in reviewer_ladder:
+        usable, why = _engine_usable(eng, cache)
+        if not usable:
+            if not output_json:
+                print(c(f"跳过 {eng.upper()} 审查引擎: {why}", COLOR_YELLOW))
+            continue
+        attempted.append(eng)
         if not output_json:
-            print(c("派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN))
-        success, out, err = execute_codex_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True, repo_trust=repo_trust)
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("codex", tier="deep", success=success, task=f"run_review: {focus[:60]}")
-        except Exception:
-            pass
+            print(c(banner, color))
+        success, out, err = dispatch_task(eng, prompt, cwd=cwd, timeout=timeout, tier="deep",
+                                          stream=stream and not output_json, readonly=True, repo_trust=repo_trust)
         if success and out and out.strip():
             review_res = out
-            reviewer_engine = "codex"
-        elif not output_json:
-            print(c(f"Codex 不可用 ({err or '输出内容为空'})，尝试 Grok...", COLOR_YELLOW))
-
-    if review_res is None and g_status not in ["limited", "needs_auth", "missing"]:
+            reviewer_engine = eng
+            break
         if not output_json:
-            print(c("派发给 Grok Build CLI 进行红队审计 (xAI / grok-4.7, 只读隔离)...", COLOR_RED))
-        success, out, err = execute_grok_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True, repo_trust=repo_trust)
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("grok", tier="deep", success=success, task=f"run_review: {focus[:60]}")
-        except Exception:
-            pass
-        if success and out and out.strip():
-            review_res = out
-            reviewer_engine = "grok"
-        elif not output_json:
-            print(c(f"Grok 不可用 ({err or '输出内容为空'})，转交 Antigravity...", COLOR_YELLOW))
-
-    if review_res is None:
-        if not output_json:
-            print(c("由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN))
-        success, out, err = execute_agy_task(prompt, cwd=cwd, tier="deep", stream=stream and not output_json, timeout=timeout, readonly=True, repo_trust=repo_trust)
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("agy", tier="deep", success=success, task=f"run_review: {focus[:60]}")
-        except Exception:
-            pass
-        if success and out and out.strip():
-            review_res = out
-            reviewer_engine = "agy"
-        elif not output_json:
-            print(c(f"审查失败: {err or '输出内容为空'}", COLOR_RED))
+            print(c(f"{eng.upper()} 审查失败 ({err or '输出内容为空'})，尝试下一审查引擎...", COLOR_YELLOW))
 
     if not review_res:
+        no_engine = not attempted
+        reason = ("没有已启用且健康的审查引擎 (codex/grok/agy 均被禁用或不可用)" if no_engine
+                  else "独立审查服务未能产生有效输出 (UNVERIFIED)")
         if output_json:
             print(json.dumps({
                 "pass": False,
                 "exit_code": EXIT_UNVERIFIED,
                 "engine": None,
-                "defects": ["独立审查服务未能产生有效输出 (UNVERIFIED)"],
-                "error": "Independent review engine failed to produce valid output"
+                "verdict_status": REVIEW_UNVERIFIED,
+                "defects": [reason],
+                "error": "No enabled and healthy review engine" if no_engine else "Independent review engine failed to produce valid output"
             }, ensure_ascii=False, indent=2))
         else:
-            print(c("❌ [Makewand Quality Gate] 独立审查服务未能产生有效输出 (UNVERIFIED)，拒绝交付。", COLOR_RED + COLOR_BOLD))
+            print(c(f"❌ [Makewand Quality Gate] {reason}，拒绝交付。", COLOR_RED + COLOR_BOLD))
         return EXIT_UNVERIFIED
 
     review_res, verdict = resolve_review_verdict(review_res, reviewer_engine, cwd=cwd, timeout=timeout,
@@ -2410,6 +2408,21 @@ def parse_race_verdict(report: Optional[str]) -> Optional[Dict[str, Any]]:
     return verdict
 
 
+_RACE_JUDGE_ORDER = ("agy", "codex", "claude", "grok", "muse", "local")
+
+
+def _select_race_judge(cache: Optional[Dict[str, Any]], contestants: Tuple[Optional[str], ...]) -> Optional[str]:
+    """Antigravity first; otherwise an enabled/usable non-contestant, and only then a contestant (blind A/B)."""
+    usable = [e for e in _RACE_JUDGE_ORDER if _engine_usable(e, cache)[0]]
+    if "agy" in usable:
+        return "agy"
+    taken = {e for e in contestants if e}
+    for e in usable:
+        if e not in taken:
+            return e
+    return usable[0] if usable else None
+
+
 def run_race(
     prompt: str,
     cwd: Optional[str] = None,
@@ -2439,6 +2452,55 @@ def run_race(
     g_ok = cache.get("grok", {}).get("status") == "healthy" and is_provider_enabled("grok")
     m_ok = cache.get("muse", {}).get("status") == "healthy" and is_provider_enabled("muse")
     l_ok = cache.get("local", {}).get("status") == "healthy" and is_provider_enabled("local")
+    # agy used to be an unconditional fallback; it must now also be enabled and not known-unhealthy.
+    agy_ok = _engine_usable("agy", cache)[0]
+
+    # Explicitly requested contestants must still be enabled and usable.
+    for explicit in (engine_a, engine_b):
+        if explicit:
+            usable, why = _engine_usable(explicit.lower(), cache)
+            if not usable:
+                print(c(f"❌ [Makewand Race] 指定的竞速引擎 {explicit.upper()} 不可用: {why}", COLOR_RED + COLOR_BOLD))
+                return EXIT_UNVERIFIED
+
+    # Pick Contestants
+    if engine_a:
+        name_a = engine_a.upper()
+    elif x_ok:
+        engine_a = "codex"
+        name_a = "Codex (gpt-6-astra)"
+    elif g_ok:
+        engine_a = "grok"
+        name_a = "Grok Build CLI (grok-4.7)"
+    elif m_ok:
+        engine_a = "muse"
+        name_a = "Muse Code"
+    elif l_ok:
+        engine_a = "local"
+        name_a = "Local Self-Hosted (本地大模型)"
+    elif agy_ok:
+        engine_a = "agy"
+        name_a = "Antigravity (Gemini Fast)"
+
+    if engine_b:
+        name_b = engine_b.upper()
+    elif c_ok and engine_a != "claude":
+        engine_b = "claude"
+        name_b = "Claude Code"
+    elif g_ok and engine_a != "grok":
+        engine_b = "grok"
+        name_b = "Grok Build CLI (grok-4.7)"
+    elif l_ok and engine_a != "local":
+        engine_b = "local"
+        name_b = "Local Self-Hosted (本地大模型)"
+    elif agy_ok:
+        engine_b = "agy"
+        name_b = "Antigravity (Gemini Deep)"
+
+    if not engine_a or not engine_b:
+        print(c("❌ [Makewand Race] 没有足够的已启用且健康的引擎参与竞速 (被禁用或 limited/needs_auth/missing 的引擎不会被派发)。"
+                "请运行 'makewand status' 检查或用 'makewand enable <engine>' 重新开启。", COLOR_RED + COLOR_BOLD))
+        return EXIT_UNVERIFIED
 
     ensure_config_dir()
     race_id = f"rc_{uuid.uuid4().hex[:8]}"
@@ -2460,40 +2522,6 @@ def run_race(
         _, base_a_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=str(wt_a))
         _, base_b_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=str(wt_b))
 
-        # Pick Contestants
-        if engine_a:
-            name_a = engine_a.upper()
-        elif x_ok:
-            engine_a = "codex"
-            name_a = "Codex (gpt-6-astra)"
-        elif g_ok:
-            engine_a = "grok"
-            name_a = "Grok Build CLI (grok-4.7)"
-        elif m_ok:
-            engine_a = "muse"
-            name_a = "Muse Code"
-        elif l_ok:
-            engine_a = "local"
-            name_a = "Local Self-Hosted (本地大模型)"
-        else:
-            engine_a = "agy"
-            name_a = "Antigravity (Gemini Fast)"
-
-        if engine_b:
-            name_b = engine_b.upper()
-        elif c_ok and engine_a != "claude":
-            engine_b = "claude"
-            name_b = "Claude Code"
-        elif g_ok and engine_a != "grok":
-            engine_b = "grok"
-            name_b = "Grok Build CLI (grok-4.7)"
-        elif l_ok and engine_a != "local":
-            engine_b = "local"
-            name_b = "Local Self-Hosted (本地大模型)"
-        else:
-            engine_b = "agy"
-            name_b = "Antigravity (Gemini Deep)"
-
         print(c(f"  选手 A: {name_a} (独立工作区: {wt_a})", COLOR_CYAN + COLOR_BOLD))
         print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
         print(c("并发执行中，请稍候...\n", COLOR_YELLOW))
@@ -2506,10 +2534,6 @@ def run_race(
                 tier="standard", repo_root=cwd, repo_trust=repo_trust
             )
             duration = round(time.time() - start, 2)
-            try:
-                record_engine_usage(engine, success=ok, tier="standard")
-            except Exception:
-                pass
             return name, ok, out, duration, wt
 
         run_agent_a = lambda: run_single_racer(engine_a, name_a, wt_a)
@@ -2535,15 +2559,17 @@ def run_race(
         print(c("🧪 正在对两位候选人的产出分别执行本地确定性测试套件验证...", COLOR_CYAN))
         tested_a = workspace_snapshot(wt_a)
         tested_b = workspace_snapshot(wt_b)
-        test_pass_a, test_out_a = run_local_tests(str(wt_a), timeout=60)
-        test_pass_b, test_out_b = run_local_tests(str(wt_b), timeout=60)
+        test_pass_a, _ = run_local_tests(str(wt_a), timeout=60)
+        test_pass_b, _ = run_local_tests(str(wt_b), timeout=60)
 
         reviewed_a = workspace_snapshot(wt_a)
         reviewed_b = workspace_snapshot(wt_b)
         if reviewed_a != tested_a:
-            test_pass_a, test_out_a = False, "候选A在测试至审查之间发生变化，必须重新测试。"
+            test_pass_a = False
+            print(c("⚠ 候选A在测试至审查之间发生变化，必须重新测试。", COLOR_YELLOW))
         if reviewed_b != tested_b:
-            test_pass_b, test_out_b = False, "候选B在测试至审查之间发生变化，必须重新测试。"
+            test_pass_b = False
+            print(c("⚠ 候选B在测试至审查之间发生变化，必须重新测试。", COLOR_YELLOW))
         manifest_a = build_manifest(wt_a)
         manifest_b = build_manifest(wt_b)
         changes_a = get_candidate_files_changed(wt_a, baseline_commit=base_a_commit.strip() if base_a_commit else None)
@@ -2579,10 +2605,21 @@ def run_race(
             f'最后单独一行输出 MAKEWAND_RACE_VERDICT: {{"pass": true, "winner": "A", "defects": []}}，winner 仅可为 A 或 B。'
             f'若两个方案均不可采纳，输出 MAKEWAND_RACE_VERDICT: {{"pass": false, "winner": null, "defects": ["原因"]}}。不得强行选出胜者。'
         )
-        print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
-        ok, judge_report, _ = execute_agy_task(
-            judge_prompt, cwd=cwd, tier="deep", timeout=timeout, readonly=True, repo_root=cwd, repo_trust=repo_trust
-        )
+        judge_engine = _select_race_judge(cache, (engine_a, engine_b))
+        if judge_engine is None:
+            print(c("❌ [Makewand Race] 没有已启用且健康的裁判引擎，无法评定胜者 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD))
+            ok, judge_report = False, None
+        elif judge_engine == "agy":
+            print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
+            ok, judge_report, _ = execute_agy_task(
+                judge_prompt, cwd=cwd, tier="deep", timeout=timeout, readonly=True, repo_root=cwd, repo_trust=repo_trust
+            )
+        else:
+            print(c(f"Antigravity 不可用，由 {judge_engine.upper()} 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
+            ok, judge_report, _ = dispatch_task(
+                judge_engine, judge_prompt, cwd=cwd, timeout=timeout, tier="deep", readonly=True,
+                repo_root=cwd, repo_trust=repo_trust
+            )
         if judge_report:
             print(c("\n【裁判裁决报告】", COLOR_BOLD))
             print(judge_report.strip())
