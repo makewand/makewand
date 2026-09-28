@@ -47,7 +47,7 @@ func TestG8_MetricsLabelsAreBoundedRouteTemplates(t *testing.T) {
 }
 
 func TestG8_MetricsKnownRoutesUseTemplates(t *testing.T) {
-	cases := map[string]string{
+	cases := map[string]string{ //nolint:gosec // G101: test route path fixtures
 		"/health":                            "/health",
 		"/metrics":                           "/metrics",
 		"/v1/chat/completions":               "/v1/chat/completions",
