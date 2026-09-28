@@ -18,6 +18,7 @@ func swapVerifyIsolationVars(t *testing.T) {
 	oldUserHome := verifyUserHome
 	oldGetenv := verifyGetenv
 	oldSelfTest := verifyBwrapSelfTest
+	oldGoEnvProbe := sandboxGoEnvProbe
 	t.Cleanup(func() {
 		verifyGOOS = oldGOOS
 		verifyUnsafe = oldUnsafe
@@ -25,7 +26,10 @@ func swapVerifyIsolationVars(t *testing.T) {
 		verifyUserHome = oldUserHome
 		verifyGetenv = oldGetenv
 		verifyBwrapSelfTest = oldSelfTest
+		sandboxGoEnvProbe = oldGoEnvProbe
 	})
+	// Unit tests never exec the host Go toolchain.
+	sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return hostGoEnv{}, errors.New("go env disabled in unit tests") }
 }
 
 // fakeWorkingBwrap simulates a Linux host with functional bubblewrap.
@@ -194,7 +198,7 @@ func TestWrapVerificationCommand_NetworkIsolationByStep(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd, args := wrapVerificationCommand("/usr/bin/bwrap", "/tmp/demo", "go", []string{"test", "./..."}, tt.allowNetwork)
+			cmd, args := wrapVerificationCommand("/usr/bin/bwrap", "/tmp/demo", "go", []string{"test", "./..."}, tt.allowNetwork, nil)
 			if cmd != "/usr/bin/bwrap" {
 				t.Fatalf("cmd = %q, want /usr/bin/bwrap", cmd)
 			}
@@ -207,9 +211,11 @@ func TestWrapVerificationCommand_NetworkIsolationByStep(t *testing.T) {
 
 func TestWrapVerificationCommand_SandboxLayout(t *testing.T) {
 	fakeWorkingBwrap(t)
+	home := t.TempDir()
+	verifyUserHome = func() (string, error) { return home, nil }
 
 	workspace := "/tmp/makewand-candidate-123"
-	_, args := wrapVerificationCommand("/usr/bin/bwrap", workspace, "go", []string{"test", "./..."}, false)
+	_, args := wrapVerificationCommand("/usr/bin/bwrap", workspace, "go", []string{"test", "./..."}, false, nil)
 
 	if !containsArg(args, "--clearenv") {
 		t.Fatalf("args should clear inherited environment; got %v", args)
@@ -227,7 +233,7 @@ func TestWrapVerificationCommand_SandboxLayout(t *testing.T) {
 	if !containsArgPair(args, "HOME", wantHome) {
 		t.Fatalf("args should set HOME under the workspace (%s); got %v", wantHome, args)
 	}
-	if !containsArgPair(args, "--tmpfs", "/home/alice") {
+	if !containsArgPair(args, "--tmpfs", home) {
 		t.Fatalf("args should mask host HOME; got %v", args)
 	}
 	if len(args) < 3 || args[len(args)-3] != "go" {

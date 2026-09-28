@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
 )
@@ -402,9 +403,13 @@ func (a App) handleApprovalModeCommand(input string) (tea.Model, tea.Cmd) {
 	switch strings.ToLower(parts[1]) {
 	case "manual", "safe", "autopilot":
 		a.setApprovalMode(parts[1])
+		content := fmt.Sprintf(msg.ApprovalModeChanged, a.currentApprovalModeLabel())
+		if a.currentApprovalMode() == config.ApprovalModeAuto {
+			content += "\n" + msg.ApprovalModeAutopilotNote
+		}
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf(msg.ApprovalModeChanged, a.currentApprovalModeLabel()),
+			Content: content,
 		})
 	default:
 		a.chat.AddMessage(ChatMessage{

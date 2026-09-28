@@ -9,7 +9,7 @@ import (
 
 func TestLoad_EnvOverridesWhenConfigMissing(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useTempHome(t, home)
 	t.Setenv("ANTHROPIC_API_KEY", "ant-test-key")
 	t.Setenv("GEMINI_API_KEY", "gem-test-key")
 	t.Setenv("OPENAI_API_KEY", "openai-test-key")
@@ -28,14 +28,22 @@ func TestLoad_EnvOverridesWhenConfigMissing(t *testing.T) {
 	if cfg.OpenAIAPIKey != "openai-test-key" {
 		t.Fatalf("OpenAIAPIKey = %q, want %q", cfg.OpenAIAPIKey, "openai-test-key")
 	}
+	// Keys alone do not opt into paid API use (default subscription_only), and
+	// the hermetic test PATH has no provider CLI, so nothing is usable yet.
+	// (This used to pass only because real CLIs on the developer PATH were
+	// detected.)
+	if cfg.HasAnyModel() {
+		t.Fatal("HasAnyModel() = true, want false: env keys alone must not enable paid API use")
+	}
+	cfg.APIPolicy = APIPolicyAllowPaid
 	if !cfg.HasAnyModel() {
-		t.Fatal("HasAnyModel() = false, want true")
+		t.Fatal("HasAnyModel() = false, want true once paid API use is allowed")
 	}
 }
 
 func TestLoad_ParseErrorStillAppliesEnvOverrides(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useTempHome(t, home)
 	t.Setenv("OPENAI_API_KEY", "openai-env-key")
 
 	cfgDir := filepath.Join(home, ".config", "makewand")
@@ -61,7 +69,7 @@ func TestLoad_ParseErrorStillAppliesEnvOverrides(t *testing.T) {
 
 func TestSave_StripsEnvSourcedKeys(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useTempHome(t, home)
 	t.Setenv("OPENAI_API_KEY", "openai-env-key")
 
 	cfg, err := Load()

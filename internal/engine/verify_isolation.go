@@ -144,16 +144,20 @@ const sandboxHomeRelPath = ".makewand/sandbox-home"
 
 // wrapVerificationCommand wraps a verification command in bubblewrap. The
 // workspace is the only writable host path; everything else is read-only with
-// tmpfs /tmp, a cleared environment, and sensitive HOME entries masked. When
-// allowNetwork is false the sandbox additionally unshares the network
-// namespace, which is the default for test/build/compile steps.
-func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool) (string, []string) {
+// tmpfs /tmp, a cleared environment, and the host HOME hidden (only toolchain
+// directories are re-bound read-only, see sandbox_home.go). readOnly lists
+// workspace paths (protected paths such as .git, CI definitions and
+// verification scripts) that are re-bound read-only on top of the writable
+// workspace. When allowNetwork is false the sandbox additionally unshares the
+// network namespace, which is the default for test/build/compile steps.
+func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string) (string, []string) {
 	workspacePath = filepath.Clean(workspacePath)
 	pathEnv := strings.TrimSpace(verifyGetenv("PATH"))
 	if pathEnv == "" {
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
 	sandboxHome := filepath.Join(workspacePath, filepath.FromSlash(sandboxHomeRelPath))
+	layout := verifyHomeLayout(workspacePath, pathEnv)
 
 	wrapped := []string{
 		"--die-with-parent",
@@ -172,7 +176,16 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		// S05 defense: Mask system Unix domain sockets and host IPC runtimes
 		"--tmpfs", "/var/tmp",
 		"--tmpfs", "/run",
-		"--bind", workspacePath, workspacePath,
+	}
+	// Hide HOME (and re-bind toolchains) before the workspace bind so a
+	// workspace under HOME stays visible and writable.
+	wrapped = append(wrapped, layout.beforeWorkspace...)
+	wrapped = append(wrapped, "--bind", workspacePath, workspacePath)
+	wrapped = append(wrapped, layout.afterWorkspace...)
+	for _, path := range readOnly {
+		wrapped = append(wrapped, "--ro-bind", path, path)
+	}
+	wrapped = append(wrapped,
 		"--chdir", workspacePath,
 		"--clearenv",
 		"--setenv", "PATH", pathEnv,
@@ -180,10 +193,8 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		"--setenv", "TMPDIR", "/tmp",
 		"--setenv", "NO_COLOR", "1",
 		"--setenv", "MAKEWAND_SANDBOX", "1",
-	}
-	if gitDir := filepath.Join(workspacePath, ".git"); func() bool { _, err := os.Stat(gitDir); return err == nil }() {
-		wrapped = append(wrapped, "--ro-bind", gitDir, gitDir)
-	}
+	)
+	wrapped = append(wrapped, layout.setenvArgs()...)
 	if !allowNetwork {
 		wrapped = append(wrapped, "--unshare-net")
 	}
@@ -193,37 +204,17 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 			wrapped = append(wrapped, "--setenv", key, value)
 		}
 	}
-	wrapped = append(wrapped, verifyHomeMaskArgs(workspacePath)...)
 	wrapped = append(wrapped, command)
 	wrapped = append(wrapped, args...)
 	return bwrapPath, wrapped
 }
 
-func verifyHomeMaskArgs(workspacePath string) []string {
+// verifyHomeLayout resolves the sandbox HOME layout for a workspace from the
+// verification environment hooks.
+func verifyHomeLayout(workspacePath, pathEnv string) sandboxHomeLayout {
 	home, err := verifyUserHome()
 	if err != nil {
-		return nil
+		return sandboxHomeLayout{}
 	}
-	home = strings.TrimSpace(home)
-	if home == "" {
-		return nil
-	}
-	home = filepath.Clean(home)
-
-	// If the workspace lives outside HOME, hide the entire host home tree.
-	if !pathWithin(home, workspacePath) {
-		return []string{"--tmpfs", home}
-	}
-
-	// If the workspace is under HOME, mask common sensitive subpaths but keep
-	// the workspace path accessible.
-	out := make([]string, 0, len(previewSensitiveHomeEntries)*2)
-	for _, entry := range previewSensitiveHomeEntries {
-		target := filepath.Join(home, entry)
-		if pathWithin(target, workspacePath) {
-			continue
-		}
-		out = append(out, "--tmpfs", target)
-	}
-	return out
+	return buildSandboxHomeLayout(home, workspacePath, pathEnv, verifyGetenv)
 }

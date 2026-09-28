@@ -139,11 +139,26 @@ func (p *Project) RunRestrictedPlan(ctx context.Context, plan ExecPlan) (*ExecRe
 // MAKEWAND_UNSAFE_HOST_EXEC=1 opt-in) no command is executed at all.
 // Dependency installs keep network access so package registries stay reachable;
 // every other step runs with the network namespace unshared.
+//
+// Protected paths (isProtectedWritePath) are guarded around every run: they are
+// bound read-only inside the sandbox, and any change that still happens (or
+// happens on the acknowledged unsafe host path) is rolled back and reported as
+// an error wrapping ErrProtectedPathsModified, alongside the command result.
 func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*ExecResult, error) {
 	env, err := resolveVerifyExecEnvironment(p.unsafeHostAuth)
 	if err != nil {
 		return nil, err
 	}
+	projectDir, err := p.execWorkingDir()
+	if err != nil {
+		return nil, err
+	}
+	guard, err := snapshotProtectedPaths(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot protected paths before running %s: %w", plan.Command, err)
+	}
+
+	var result *ExecResult
 	if env.mode == verifyExecUnsafeHost {
 		// Audit EVERY host execution under the unsafe opt-in, not just the
 		// first: the acknowledgment authorizes the mode, the audit trail
@@ -154,9 +169,17 @@ func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*Exec
 			Args:    append([]string(nil), plan.Args...),
 			Dir:     p.Path,
 		})
-		return p.ExecRestricted(ctx, plan.Command, plan.Args...)
+		result, err = p.ExecRestricted(ctx, plan.Command, plan.Args...)
+	} else {
+		result, err = p.execVerification(ctx, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan), guard.readOnlyBinds())
 	}
-	return p.execVerification(ctx, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan))
+	if guardErr := guard.enforce(); guardErr != nil {
+		if err != nil {
+			return result, fmt.Errorf("%w; %v", guardErr, err)
+		}
+		return result, guardErr
+	}
+	return result, err
 }
 
 // verificationPlanAllowsNetwork reports whether a plan may keep network access
@@ -167,7 +190,7 @@ func verificationPlanAllowsNetwork(plan ExecPlan) bool {
 	return plan.Kind == "deps"
 }
 
-func (p *Project) execVerification(ctx context.Context, command string, args []string, allowNetwork bool) (*ExecResult, error) {
+func (p *Project) execVerification(ctx context.Context, command string, args []string, allowNetwork bool, readOnly []string) (*ExecResult, error) {
 	if err := validateCommandName(command); err != nil {
 		return nil, err
 	}
@@ -193,8 +216,49 @@ func (p *Project) execVerification(ctx context.Context, command string, args []s
 		return nil, fmt.Errorf("create sandbox home: %w", err)
 	}
 
-	wrappedCmd, wrappedArgs := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, allowNetwork)
-	return p.execWithPolicy(ctx, wrappedCmd, wrappedArgs, isolatedExecPolicy())
+	wrappedCmd, wrappedArgs := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, allowNetwork, readOnly)
+	if command == "go" {
+		// The sandbox pins GOTOOLCHAIN=local; report an unsatisfiable go.mod
+		// requirement as an environment problem instead of letting it surface
+		// as a failed (candidate-attributed) test run.
+		if err := checkSandboxGoToolchain(projectDir, verifyHomeLayout(projectDir, sandboxPathEnv()).goVersion); err != nil {
+			return nil, err
+		}
+	}
+	result, err := p.execWithPolicy(ctx, wrappedCmd, wrappedArgs, isolatedExecPolicy())
+	if err == nil && isBwrapSetupFailure(result) {
+		// bubblewrap itself failed before the command started; this is a
+		// sandbox/environment problem, not a failing project command, so it
+		// must not reach auto-fix or quality statistics as a test failure.
+		return result, fmt.Errorf("verification sandbox failed to start: %s", firstLine(result.Stderr))
+	}
+	return result, err
+}
+
+// sandboxPathEnv is the PATH the verification sandbox uses.
+func sandboxPathEnv() string {
+	pathEnv := strings.TrimSpace(verifyGetenv("PATH"))
+	if pathEnv == "" {
+		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	return pathEnv
+}
+
+// isBwrapSetupFailure reports whether a sandboxed run failed inside bubblewrap
+// setup (mounts, namespaces) before the wrapped command executed.
+func isBwrapSetupFailure(result *ExecResult) bool {
+	if result == nil || result.ExitCode != 1 || strings.TrimSpace(result.Stdout) != "" {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(result.Stderr), "bwrap: ")
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // DetectInstallPlan detects the dependency install command for the current project.
@@ -242,10 +306,12 @@ func (p *Project) DetectTestPlan() (*ExecPlan, error) {
 			}
 		}
 	}
-	if _, err := p.ReadFile("pytest.ini"); err == nil {
+	// Explicit pytest configuration keeps its historical priority over go.mod
+	// and Cargo.toml (it is a declared test runner).
+	if detector := p.pytestConfigDetector(); detector != "" {
 		return &ExecPlan{
 			Kind:     "tests",
-			Detector: "pytest.ini",
+			Detector: detector,
 			Command:  "pytest",
 			Args:     nil,
 		}, nil
@@ -266,7 +332,100 @@ func (p *Project) DetectTestPlan() (*ExecPlan, error) {
 			Args:     []string{"test"},
 		}, nil
 	}
+	// Convention-only Python suites (conftest.py, test_*.py, *_test.py) rank
+	// below every declared runner so mixed repositories keep their runner.
+	if detector := p.pytestFileDetector(); detector != "" {
+		return &ExecPlan{
+			Kind:     "tests",
+			Detector: detector,
+			Command:  "pytest",
+			Args:     nil,
+		}, nil
+	}
 	return nil, nil
+}
+
+// pytestConfigDetector returns the file that declares a pytest configuration:
+// pytest.ini, pyproject.toml [tool.pytest...], setup.cfg [tool:pytest] or
+// tox.ini [pytest]. It returns "" when none does.
+func (p *Project) pytestConfigDetector() string {
+	if _, err := p.ReadFile("pytest.ini"); err == nil {
+		return "pytest.ini"
+	}
+	for _, c := range []struct {
+		file     string
+		sections []string
+	}{
+		{"pyproject.toml", []string{"[tool.pytest.ini_options]", "[tool.pytest]"}},
+		{"setup.cfg", []string{"[tool:pytest]"}},
+		{"tox.ini", []string{"[pytest]"}},
+	} {
+		content, err := p.ReadFile(c.file)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(content, "\n") {
+			line = strings.TrimSpace(line)
+			for _, section := range c.sections {
+				if strings.EqualFold(line, section) {
+					return c.file
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// pytestFileDetector finds a pytest suite by convention: a conftest.py or a
+// test_*.py / *_test.py module, searched breadth-first over a bounded part of
+// the tree (ignored directories such as .venv and node_modules are skipped).
+func (p *Project) pytestFileDetector() string {
+	const (
+		maxDepth   = 4
+		maxEntries = 5000
+	)
+	root, err := p.execWorkingDir()
+	if err != nil {
+		return ""
+	}
+	type dirItem struct {
+		rel   string
+		depth int
+	}
+	queue := []dirItem{{rel: ".", depth: 0}}
+	seen := 0
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+		entries, err := os.ReadDir(filepath.Join(root, item.rel))
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			seen++
+			if seen > maxEntries {
+				return ""
+			}
+			name := entry.Name()
+			rel := filepath.ToSlash(filepath.Join(item.rel, name))
+			if entry.IsDir() {
+				if item.depth+1 < maxDepth && !shouldIgnoreSet[name] && !strings.HasPrefix(name, ".") && name != "site-packages" {
+					queue = append(queue, dirItem{rel: rel, depth: item.depth + 1})
+				}
+				continue
+			}
+			if !entry.Type().IsRegular() {
+				continue
+			}
+			lower := strings.ToLower(name)
+			if lower == "conftest.py" ||
+				(strings.HasPrefix(lower, "test_") && strings.HasSuffix(lower, ".py")) ||
+				(strings.HasSuffix(lower, "_test.py") && lower != "_test.py") {
+				return rel
+			}
+		}
+	}
+	return ""
 }
 
 // InstallDeps detects the project type and installs dependencies.
@@ -314,6 +473,18 @@ func (w *limitedWriter) String() string { return w.buf.String() }
 
 const maxOutputBytes = 10 << 20 // 10 MB
 
+// RestrictedPlanTimeout bounds a single project command (dependency install,
+// test run, verification step). Callers that impose their own deadline (the
+// TUI build flow) use this same value, so the engine never kills a command
+// earlier than the caller's budget allows.
+const RestrictedPlanTimeout = 10 * time.Minute
+
+// restrictedExecContext derives the execution context for one command: the
+// caller's deadline when it is sooner, otherwise RestrictedPlanTimeout.
+func restrictedExecContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, RestrictedPlanTimeout)
+}
+
 func (p *Project) execWithPolicy(ctx context.Context, command string, args []string, policy execPolicy) (*ExecResult, error) {
 	if policy.allowCommandPath {
 		if strings.TrimSpace(command) == "" {
@@ -333,7 +504,7 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	ctx, cancel := restrictedExecContext(ctx)
 	defer cancel()
 
 	cmd := exec.Command(command, args...)

@@ -20,9 +20,15 @@ type CandidateAttempt struct {
 	Content      string
 	Files        []ExtractedFile
 	DeletedFiles []string
-	Usage        model.Usage
-	Verification CandidateVerification
-	Err          error
+	// LargeFiles are files over the verified-change size limit that the
+	// candidate added or modified; they are reported, never applied.
+	LargeFiles []string
+	// UnchangedLargeFiles are oversized baseline files the candidate left
+	// alone; they are skipped by the diff and recorded here.
+	UnchangedLargeFiles []string
+	Usage               model.Usage
+	Verification        CandidateVerification
+	Err                 error
 }
 
 type CandidateSelection struct {
@@ -47,6 +53,17 @@ type CandidateSelection struct {
 	Err            error
 	VerifiedFiles  []ExtractedFile
 	VerifiedDigest string
+	// RestoredTests lists the selected candidate's edits to pre-existing test
+	// files (and package.json scripts.test) that were discarded: verification
+	// keeps the baseline tests, and the delivered file set (VerifiedFiles)
+	// excludes those edits. Callers must tell the user.
+	RestoredTests []string
+	// NoTestsExecuted reports that the selected candidate was checked without
+	// running any test (no baseline test plan, or the plan ran zero tests).
+	NoTestsExecuted bool
+	// LargeFiles lists files over the size limit the selected candidate
+	// changed; they are not part of the delivered change set.
+	LargeFiles []string
 }
 
 type CandidateProgressStage string
@@ -58,6 +75,9 @@ const (
 	CandidateProgressRejected  CandidateProgressStage = "rejected"
 	CandidateProgressFailed    CandidateProgressStage = "failed"
 	CandidateProgressCanceled  CandidateProgressStage = "canceled"
+	// CandidateProgressUnverified: the candidate produced a change but could
+	// not be verified (no baseline tests, sandbox or toolchain unavailable).
+	CandidateProgressUnverified CandidateProgressStage = "unverified"
 )
 
 const maxVerifiedCandidateStrength = 2
@@ -208,11 +228,14 @@ func RunCandidateSelection(
 					// union of what the model reported and what it actually
 					// edited on disk. Unreported clone edits are verified and
 					// applied like reported ones; deletions are surfaced.
-					changedFiles, deletedFiles, diffErr := candidateProject.ChangedFilesAgainstWithDeletions(project)
+					diff, diffErr := candidateProject.DiffAgainst(project)
+					changedFiles := diff.Files
 					if diffErr != nil {
 						attempt.Err = diffErr
 					} else {
-						attempt.DeletedFiles = deletedFiles
+						attempt.DeletedFiles = diff.Deleted
+						attempt.LargeFiles = diff.LargeChanged
+						attempt.UnchangedLargeFiles = diff.LargeUnchanged
 						merged := mergeCandidateFiles(attempt.Files, changedFiles)
 						if len(changedFiles) > 0 && !extractedFilesEqual(merged, attempt.Files) {
 							attempt.Files = merged
@@ -318,6 +341,9 @@ func RunCandidateSelection(
 			DeletedFiles:    bestVerified.DeletedFiles,
 			VerifiedFiles:   bestVerified.Verification.VerifiedFiles,
 			VerifiedDigest:  bestVerified.Verification.VerifiedDigest,
+			RestoredTests:   discardedTestEdits(*bestVerified),
+			NoTestsExecuted: noTestsExecuted(*bestVerified),
+			LargeFiles:      bestVerified.LargeFiles,
 		}
 	}
 
@@ -335,6 +361,9 @@ func RunCandidateSelection(
 			NotVerifiedReason: notVerifiedReason,
 			VerifiedFiles:     bestSuccessful.Verification.VerifiedFiles,
 			VerifiedDigest:    bestSuccessful.Verification.VerifiedDigest,
+			RestoredTests:     discardedTestEdits(*bestSuccessful),
+			NoTestsExecuted:   noTestsExecuted(*bestSuccessful),
+			LargeFiles:        bestSuccessful.LargeFiles,
 		}
 	}
 
@@ -350,12 +379,48 @@ func RunCandidateSelection(
 	}
 }
 
+// discardedTestEdits returns the attempt's test-file edits that are NOT part
+// of its delivered content. Only a passing verification replaces the delivered
+// files with the verified set (which keeps baseline tests); otherwise the raw
+// candidate content, test edits included, goes to manual approval.
+func discardedTestEdits(attempt CandidateAttempt) []string {
+	if !attempt.Verification.Passed || len(attempt.Verification.RestoredTests) == 0 {
+		return nil
+	}
+	return append([]string(nil), attempt.Verification.RestoredTests...)
+}
+
+// noTestsExecuted reports whether the attempt's checks ran no test at all.
+func noTestsExecuted(attempt CandidateAttempt) bool {
+	v := attempt.Verification
+	return v.NoTestPlan || (v.Passed && v.NoTestsRan)
+}
+
+// verificationRank orders verification outcomes: a (weak) pass, then
+// unverified output whose checks did not fail (no test plan, sandbox
+// unavailable), then output that failed a check.
+func verificationRank(v CandidateVerification) int {
+	switch {
+	case v.Passed:
+		return 2
+	case v.IntegrityError != "":
+		return 0
+	case v.EnvironmentError || v.IsolationError != "":
+		return 1
+	case v.QuickCheckError != "" || v.DepsError != "" || v.TestsError != "":
+		return 0
+	default:
+		return 1
+	}
+}
+
 // attemptOutranks reports whether a beats b as the fallback candidate: prefer
-// weak verification passes over unverified output, then higher strength, then
-// the earlier provider in routing order.
+// weak verification passes over unverified output and unverified output over
+// failed checks, then higher strength, then the earlier provider in routing
+// order.
 func attemptOutranks(a, b CandidateAttempt) bool {
-	if a.Verification.Passed != b.Verification.Passed {
-		return a.Verification.Passed
+	if ra, rb := verificationRank(a.Verification), verificationRank(b.Verification); ra != rb {
+		return ra > rb
 	}
 	if a.Verification.Strength != b.Verification.Strength {
 		return a.Verification.Strength > b.Verification.Strength
@@ -378,7 +443,20 @@ func CandidateAttemptStage(ctx context.Context, attempt CandidateAttempt) Candid
 	if attempt.Verification.Passed {
 		return CandidateProgressPassed
 	}
+	if verificationUnattributable(attempt.Verification) {
+		return CandidateProgressUnverified
+	}
 	return CandidateProgressRejected
+}
+
+// verificationUnattributable reports whether a non-passing verification says
+// nothing about the candidate's quality: there was nothing to verify against
+// (no baseline test plan) or the environment could not run the checks.
+func verificationUnattributable(v CandidateVerification) bool {
+	if v.Passed {
+		return false
+	}
+	return v.NoTestPlan || v.IsolationError != "" || v.EnvironmentError
 }
 
 func ShouldRecordCandidateQuality(attempt CandidateAttempt) bool {
@@ -386,6 +464,10 @@ func ShouldRecordCandidateQuality(attempt CandidateAttempt) bool {
 		return false
 	}
 	if attempt.Err != nil {
+		return false
+	}
+	// Unverifiable outcomes must not count against (or for) the provider.
+	if verificationUnattributable(attempt.Verification) {
 		return false
 	}
 	return attempt.Verification.Passed || len(attempt.Files) > 0 || strings.TrimSpace(attempt.Content) != ""

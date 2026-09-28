@@ -3,8 +3,11 @@ package backup
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,10 +143,27 @@ func Create(archivePath string, opts Options) (*Manifest, error) {
 	return b.manifest, nil
 }
 
+// ErrStateDBInUse is returned by Restore when the target state database is
+// still open by another connection (typically a running server).
+var ErrStateDBInUse = errors.New("state database is in use")
+
+// renameFile is os.Rename; a package variable so tests can inject failures.
+var renameFile = os.Rename
+
 // Restore extracts archivePath, verifies every file against the manifest
-// checksum, then atomically moves each component to the target path named in
-// opts. The server must be stopped: Restore replaces state.db and clears any
-// stale WAL/SHM sidecars so the restored snapshot is not shadowed.
+// checksum, then installs each component at the target path named in opts.
+//
+// Preconditions and ordering:
+//   - The server must be stopped. Restore refuses (ErrStateDBInUse) while any
+//     connection still has the target state database open, detected through
+//     SQLite's own WAL-index lock.
+//   - Every component is first copied next to its destination; no live path
+//     is touched until all copies succeeded.
+//   - state.db is replaced atomically. Its -wal/-shm sidecars are moved aside
+//     before the swap and deleted only after the new database is in place; if
+//     the swap fails they are moved back, so the old database keeps the
+//     transactions still held in its WAL. After a successful swap they are
+//     removed so they cannot be replayed onto the restored snapshot.
 func Restore(archivePath string, opts Options) (*Manifest, error) {
 	staging, err := os.MkdirTemp("", "makewand-restore-")
 	if err != nil {
@@ -168,6 +188,16 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 		}
 	}
 
+	if opts.StateDBPath != "" {
+		inUse, err := stateDBInUse(opts.StateDBPath)
+		if err != nil {
+			return nil, fmt.Errorf("check whether %s is in use: %w", opts.StateDBPath, err)
+		}
+		if inUse {
+			return nil, fmt.Errorf("%w: %s is open by another process (is the makewand server still running?); stop it before restoring", ErrStateDBInUse, opts.StateDBPath)
+		}
+	}
+
 	stateDir := ""
 	if opts.StateDBPath != "" {
 		stateDir = filepath.Dir(opts.StateDBPath)
@@ -175,6 +205,14 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 		stateDir = filepath.Dir(opts.AuthConfigPath)
 	}
 
+	// Phase 1: stage every component beside its destination.
+	type install struct{ name, tmp, dst string }
+	var installs []install
+	discardStaged := func() {
+		for _, in := range installs {
+			_ = os.Remove(in.tmp)
+		}
+	}
 	for _, f := range manifest.Files {
 		src := filepath.Join(staging, f.Name)
 		dst := targetPath(f.Name, opts, stateDir)
@@ -182,17 +220,102 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			discardStaged()
 			return nil, fmt.Errorf("prepare target dir for %s: %w", f.Name, err)
 		}
-		if f.Name == archiveStateDBName {
-			_ = os.Remove(dst + "-wal")
-			_ = os.Remove(dst + "-shm")
-		}
-		if err := atomicReplace(src, dst); err != nil {
+		tmp, err := stageBeside(src, dst)
+		if err != nil {
+			discardStaged()
 			return nil, fmt.Errorf("install %s: %w", f.Name, err)
+		}
+		installs = append(installs, install{name: f.Name, tmp: tmp, dst: dst})
+	}
+
+	// Phase 2: swap each staged copy into place.
+	for i, in := range installs {
+		var err error
+		if in.name == archiveStateDBName {
+			err = replaceStateDB(in.tmp, in.dst)
+		} else {
+			err = renameFile(in.tmp, in.dst)
+		}
+		if err != nil {
+			for _, rest := range installs[i:] {
+				_ = os.Remove(rest.tmp)
+			}
+			return nil, fmt.Errorf("install %s: %w", in.name, err)
 		}
 	}
 	return manifest, nil
+}
+
+// replaceStateDB swaps the staged database into dst. The old -wal/-shm files
+// are parked under unique names first and only deleted once the swap has
+// succeeded; on failure they are put back untouched.
+func replaceStateDB(tmp, dst string) error {
+	type parked struct{ orig, aside string }
+	var sidecars []parked
+	unpark := func() error {
+		var errs []error
+		for _, p := range sidecars {
+			if err := renameFile(p.aside, p.orig); err != nil {
+				errs = append(errs, fmt.Errorf("put back %s (kept at %s): %w", p.orig, p.aside, err))
+			}
+		}
+		return errors.Join(errs...)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		orig := dst + suffix
+		if _, err := os.Lstat(orig); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return errors.Join(fmt.Errorf("inspect %s: %w", orig, err), unpark())
+		}
+		aside := orig + ".pre-restore-" + rand.Text()
+		if err := renameFile(orig, aside); err != nil {
+			return errors.Join(fmt.Errorf("move aside %s: %w", orig, err), unpark())
+		}
+		sidecars = append(sidecars, parked{orig: orig, aside: aside})
+	}
+	if err := renameFile(tmp, dst); err != nil {
+		return errors.Join(fmt.Errorf("rename into place: %w", err), unpark())
+	}
+	// The restored snapshot is in place; the parked sidecars belong to the
+	// replaced database and must never be replayed onto it.
+	for _, p := range sidecars {
+		_ = os.Remove(p.aside)
+	}
+	return nil
+}
+
+// stageBeside copies src into a new uniquely named temporary file in dst's
+// directory (so the final rename stays on one filesystem) and returns its path.
+func stageBeside(src, dst string) (string, error) {
+	out, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".restore-*")
+	if err != nil {
+		return "", err
+	}
+	tmp := out.Name()
+	in, err := os.Open(src)
+	if err != nil {
+		out.Close()
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("open %s: %w", src, err)
+	}
+	_, copyErr := io.Copy(out, in)
+	in.Close()
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	if err := errors.Join(copyErr, syncErr, closeErr); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("stage %s: %w", dst, err)
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
 }
 
 // targetPath maps a canonical archive entry name to its restore destination.
@@ -225,20 +348,6 @@ func copyFile(src, dst string) error {
 		return fmt.Errorf("copy %s: %w", src, err)
 	}
 	return out.Close()
-}
-
-// atomicReplace installs src at dst atomically, tolerating a cross-filesystem
-// staging dir by copying into the destination directory first, then renaming.
-func atomicReplace(src, dst string) error {
-	tmp := dst + ".restore.tmp"
-	if err := copyFile(src, tmp); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename into place: %w", err)
-	}
-	return nil
 }
 
 func writeTarGz(archivePath, dir string, names []string) error {

@@ -98,9 +98,12 @@ func stateRestoreCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "restore <archive.tar.gz>",
 		Short: "Restore state from a backup archive",
-		Long: "Restore verifies every file against the archive manifest checksum, then\n" +
-			"atomically installs each component. Stop the server first: restoring a live\n" +
-			"state database can corrupt it.",
+		Long: "Restore verifies every file against the archive manifest checksum, stages\n" +
+			"every component beside its destination, then atomically installs each one.\n" +
+			"Stop the server first: restore refuses to run while the state database is\n" +
+			"still open by another process. The old database's -wal/-shm files are only\n" +
+			"removed after the restored database is in place; if installing fails they\n" +
+			"are kept, so the existing state stays intact.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dataDir, stateDB, authConfig = resolveStatePaths(dataDir, stateDB, authConfig)
