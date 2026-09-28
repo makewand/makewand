@@ -91,10 +91,13 @@ func shieldGitAttributes(projectPath string) func() {
 		for _, gd := range gitDirs {
 			attrPath := filepath.Join(gd, "info", "attributes")
 			// Self-healing: if attrPath is absent, check for any orphan .mw_shield_* from an aborted previous run
+			//nolint:gosec // G703: self-healing check for attributes file in git administrative directory.
 			if _, err := os.Stat(attrPath); err != nil {
 				if matches, globErr := filepath.Glob(filepath.Join(gd, "info", "attributes.mw_shield_*")); globErr == nil && len(matches) > 0 {
+					//nolint:gosec // G703: restoring orphaned attributes shield file.
 					_ = os.Rename(matches[0], attrPath)
 					for _, leftover := range matches[1:] {
+						//nolint:gosec // G703: cleaning up extra orphaned shield files.
 						_ = os.Remove(leftover)
 					}
 				}
