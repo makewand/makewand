@@ -162,6 +162,13 @@ def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
             except Exception:
                 pass
 
+    if modified:
+        try:
+            from makewand.linter import auto_format_files
+            auto_format_files(clean_cwd, modified)
+        except Exception:
+            pass
+
     return modified
 
 

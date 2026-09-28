@@ -481,12 +481,64 @@ def cmd_plan(args):
 
     if getattr(args, "execute", False):
         print(c("🚀 [Makewand DAG Engine] 正在拓扑推进执行流水线...", COLOR_BOLD + COLOR_GREEN))
-        ok, summary, stage_results = execute_task_dag(dag, cwd=cwd, tier=tier, repo_trust=repo_trust)
+        ok, summary, stage_results = execute_task_dag(
+            dag,
+            cwd=cwd,
+            tier=tier,
+            repo_trust=repo_trust,
+            tiered=getattr(args, "tiered", False),
+            architect_engine=getattr(args, "architect", None),
+            worker_engine=getattr(args, "worker", None),
+        )
         if not ok:
             print(c(f"\n❌ [Makewand DAG Engine] 流水线执行未完全通过: {summary}", COLOR_BOLD + COLOR_RED))
             sys.exit(1)
         print(c(f"\n✔ [Makewand DAG Engine] 全部 DAG 拓扑阶段均已高质量交付验收！", COLOR_BOLD + COLOR_GREEN))
         sys.exit(0)
+
+def cmd_aci(args):
+    """LLM-dedicated Agent-Computer Interface commands (SWE-agent inspired)."""
+    from makewand.aci import view_window, search_code
+    cwd = getattr(args, "cwd", None) or os.getcwd()
+    if args.action == "view":
+        print(view_window(args.target, line_number=args.line, cwd=cwd))
+    elif args.action in ("search", "grep"):
+        print(search_code(args.target, cwd=cwd))
+
+def cmd_mcp(args):
+    """Model Context Protocol commands."""
+    import json
+    from makewand.mcp import MCPClient
+    cwd = getattr(args, "cwd", None) or os.getcwd()
+    client = MCPClient(args.server_cmd, cwd=cwd)
+    ok, msg = client.initialize()
+    if not ok:
+        print(c(f"❌ MCP 初始化失败: {msg}", COLOR_RED + COLOR_BOLD))
+        sys.exit(1)
+    try:
+        if args.action == "list":
+            tools = client.list_tools()
+            server_name = client.server_info.get("name", "unknown")
+            server_ver = client.server_info.get("version", "")
+            print(c(f"✔ 成功连接 MCP 服务端: {server_name} v{server_ver}", COLOR_GREEN + COLOR_BOLD))
+            print(f"发现可用工具 ({len(tools)} 个):\n")
+            for t in tools:
+                print(f"  • {c(t.get('name', ''), COLOR_BOLD + COLOR_CYAN)}: {t.get('description', '')}")
+        elif args.action == "call":
+            if not getattr(args, "tool", None):
+                print(c("❌ 请指定要调用的工具名称: --tool <name>", COLOR_RED))
+                sys.exit(1)
+            raw_args = {}
+            if getattr(args, "args", None):
+                try:
+                    raw_args = json.loads(args.args)
+                except Exception as e:
+                    print(c(f"❌ 参数 JSON 解析失败: {e}", COLOR_RED))
+                    sys.exit(1)
+            res = client.call_tool(args.tool, raw_args)
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+    finally:
+        client.close()
 
 def cmd_sandbox(args):
     """Run command inside bubblewrap process sandbox."""
@@ -805,6 +857,24 @@ def main():
     p_plan.add_argument("--execute", action="store_true", default=False, help="Execute decomposed DAG tasks topologically with verification gates")
     p_plan.add_argument("--json", action="store_true", default=False, help="Output plan in JSON format")
     p_plan.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False)
+    p_plan.add_argument("--tiered", action="store_true", default=False, help="Enable Architect-Worker tiered dispatch (Architect for design/audit, Worker for implementation)")
+    p_plan.add_argument("--architect", default=None, help="Engine for Architect role (e.g. claude, codex, agy)")
+    p_plan.add_argument("--worker", default=None, help="Engine for Worker role (e.g. local, deepseek, qwen)")
+
+    # aci (LLM-dedicated Agent-Computer Interface, inspired by SWE-agent)
+    p_aci = subparsers.add_parser("aci", help="LLM-dedicated Agent-Computer Interface (SWE-agent inspired)", parents=[sub_common_parser])
+    p_aci.add_argument("action", choices=["view", "search", "grep"], help="ACI action to perform")
+    p_aci.add_argument("target", help="Filepath for view, or search term for search/grep")
+    p_aci.add_argument("line", nargs="?", type=int, default=1, help="Line number for view window (default: 1)")
+    p_aci.add_argument("--cwd", help="Working directory")
+
+    # mcp (Model Context Protocol client integration, inspired by Claude Code)
+    p_mcp = subparsers.add_parser("mcp", help="Model Context Protocol (MCP) server integration", parents=[sub_common_parser])
+    p_mcp.add_argument("action", choices=["list", "call"], help="MCP action: list tools, or call a tool")
+    p_mcp.add_argument("--tool", help="Tool name for call action")
+    p_mcp.add_argument("--args", help="JSON string arguments for tool call")
+    p_mcp.add_argument("--cwd", help="Working directory")
+    p_mcp.add_argument("server_cmd", nargs="+", help="Command to launch MCP server (e.g. npx -y @modelcontextprotocol/server-...)")
 
     # sandbox (bubblewrap process isolation)
     p_sb = subparsers.add_parser("sandbox", help="Run shell command inside bubblewrap process sandbox", parents=[sub_common_parser])
@@ -961,7 +1031,7 @@ def main():
         "claude", "codex", "agy", "grok", "muse", "local", "aider", "deepseek", "qwen", "glm", "kimi",
         "openrouter", "siliconflow", "cursor", "copilot",
         "observe", "candidates", "inspect", "apply", "discard",
-        "enable", "disable", "repomap", "plan"
+        "enable", "disable", "repomap", "plan", "aci", "mcp"
     }
     # If user invokes `makewand "do something"` or `makewand --repo-trust untrusted "do something"`, automatically route to `makewand run ...`
     is_auto_routed_run = False
@@ -1062,6 +1132,10 @@ def main():
         cmd_repomap(args)
     elif args.subcommand == "plan":
         cmd_plan(args)
+    elif args.subcommand == "aci":
+        cmd_aci(args)
+    elif args.subcommand == "mcp":
+        cmd_mcp(args)
     elif args.subcommand == "sandbox":
         cmd_sandbox(args)
     elif args.subcommand == "claude":

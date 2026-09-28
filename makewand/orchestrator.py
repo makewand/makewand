@@ -451,6 +451,17 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     from makewand.sandbox import run_in_sandbox
     from makewand.artifact import workspace_snapshot, changed_inputs
     p = Path(cwd)
+    # Fast Syntax & Compilation Pre-Gate (Aider-inspired)
+    try:
+        from makewand.linter import fast_syntax_check
+        from makewand.git_helper import get_dirty_files
+        dirty = get_dirty_files(cwd)
+        if dirty:
+            syntax_ok, syntax_errs = fast_syntax_check(cwd, dirty)
+            if not syntax_ok:
+                return False, "代码静态语法校验失败 (Fast Syntax Gate):\n" + "\n".join(syntax_errs)
+    except Exception:
+        pass
 
     test_suites = []
     py_env = {"PYTHONPATH": f"{cwd}:{os.environ.get('PYTHONPATH', '')}", "PYTHONDONTWRITEBYTECODE": "1"}
@@ -538,6 +549,12 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
 
         if code != 0:
             all_passed = False
+            # Protect LLM context from giant test failure dumps via folded truncation
+            try:
+                from makewand.aci import truncate_output_folded
+                output = truncate_output_folded(output, max_lines=60, max_bytes=8192)
+            except Exception:
+                pass
             if err_category == "SandboxUnavailable":
                 details.append(f"[{name} Tests Failed (exit {code})]:\nBubblewrap 沙箱不可用 (bwrap not available)，根据安全防御原则阻断本地测试执行: {stderr or output}")
             elif err_category:
@@ -557,6 +574,13 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         details.append("测试修改了待交付输入，必须重新生成并验证: " + ", ".join(changed[:20]))
 
     if all_passed:
+        # Record verified test commands in workspace playbook
+        try:
+            from makewand.memory import record_verified_command
+            for name, cmd, _ in test_suites:
+                record_verified_command(cwd, "test", " ".join(cmd))
+        except Exception:
+            pass
         return True, "\n\n".join(details)
     else:
         return False, "\n\n".join(details)
@@ -1777,11 +1801,23 @@ def _run_pipeline_impl(
     except Exception:
         pass
 
+    # Retrieve repository-specific playbook (verified build/test commands & conventions)
+    playbook_hints = ""
+    try:
+        from makewand.memory import format_playbook_for_prompt
+        playbook_hints = format_playbook_for_prompt(cwd)
+        if playbook_hints:
+            print(c("📘 [Makewand Playbook] 加载工程专属构建与测试指南...", COLOR_CYAN))
+    except Exception:
+        pass
+
     prompt_parts = [prompt]
     if repo_map_snippet:
         prompt_parts.append(repo_map_snippet)
     if memory_hints:
         prompt_parts.append(memory_hints)
+    if playbook_hints:
+        prompt_parts.append(playbook_hints)
     coder_prompt = "\n".join(prompt_parts)
 
     coder_output = None
@@ -3209,10 +3245,15 @@ def execute_task_dag(
     tier: str = "auto",
     auto_fix: bool = True,
     repo_trust: str = "trusted",
-    stream: bool = False
+    stream: bool = False,
+    tiered: bool = False,
+    architect_engine: Optional[str] = None,
+    worker_engine: Optional[str] = None,
 ) -> Tuple[bool, str, List[Dict[str, Any]]]:
     """
-    Executes a TaskDAG in topological stages.
+    Executes a TaskDAG in topological stages with optional Architect-Worker tiered dispatch.
+    - Architect (deep reasoning, e.g. Claude 3.7 / Codex): handles Stage 1 design/contracts & final audit.
+    - Worker (fast lightweight, e.g. local / fast API): executes intermediate implementation nodes.
     Each stage executes its task nodes and verifies changes through tests and red-team review.
     """
     stages = dag.topological_stages()
@@ -3233,11 +3274,26 @@ def execute_task_dag(
                 task_prompt += f"重点改动文件: {', '.join(task.target_files)}\n"
             task_prompt += f"全局最终目标: {dag.goal}\n"
 
+            # Determine task tier and engine when tiered dispatch is enabled
+            task_tier = tier
+            task_forced_engine = None
+            if tiered:
+                # Stage 1 is Architect (contracts & interfaces), Stage 2+ is Worker (implementation)
+                if stage_idx == 1:
+                    task_tier = "power" if tier == "auto" else tier
+                    task_forced_engine = architect_engine
+                    print(c(f"🏛️  [Architect-Worker] 子任务指派架构师角色 (Architect Tier: {task_tier})", COLOR_PURPLE))
+                else:
+                    task_tier = "fast" if tier == "auto" else tier
+                    task_forced_engine = worker_engine
+                    print(c(f"⚡ [Architect-Worker] 子任务指派执行工兵角色 (Worker Tier: {task_tier})", COLOR_BLUE))
+
             task.status = "running"
             ok = run_pipeline(
                 task_prompt,
                 cwd=cwd,
-                tier=tier,
+                tier=task_tier,
+                forced_engine=task_forced_engine,
                 stream=stream,
                 auto_fix=auto_fix,
                 repo_trust=repo_trust,

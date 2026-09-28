@@ -277,3 +277,121 @@ def format_kibitzer_guidance(prompt: str, stage: str = "implementation") -> str:
             lines.append(f"{i}. 避坑要点: {n['focus']}")
             lines.append(f"   质量准则: {n['guidance']}")
     return "\n".join(lines) + "\n"
+
+
+# =========================================================================
+# Workspace Playbook & Repo Knowledge Persistence (inspired by Devin / Claude Code)
+# =========================================================================
+
+import hashlib
+
+def _get_playbook_path(cwd: str) -> Path:
+    clean_cwd = Path(os.path.realpath(os.path.abspath(cwd)))
+    repo_playbook = clean_cwd / ".makewand" / "playbook.json"
+    if repo_playbook.parent.exists() or (clean_cwd / ".git").exists():
+        return repo_playbook
+    # fallback to CONFIG_DIR / "playbooks" / <hash>.json
+    h = hashlib.sha256(str(clean_cwd).encode("utf-8")).hexdigest()[:16]
+    return CONFIG_DIR / "playbooks" / f"{h}.json"
+
+def load_workspace_playbook(cwd: str) -> Dict[str, Any]:
+    """
+    Loads persistent workspace playbook containing verified build/test commands
+    and repo-specific architectural conventions.
+    """
+    p = _get_playbook_path(cwd)
+    default_pb = {
+        "verified_test_commands": [],
+        "verified_build_commands": [],
+        "verified_lint_commands": [],
+        "project_conventions": []
+    }
+    if not p.exists():
+        return default_pb
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                for k in default_pb:
+                    if k not in data:
+                        data[k] = []
+                return data
+    except Exception:
+        pass
+    return default_pb
+
+def save_workspace_playbook(cwd: str, playbook: Dict[str, Any]) -> bool:
+    """
+    Saves workspace playbook atomically.
+    """
+    p = _get_playbook_path(cwd)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(f".tmp_{os.getpid()}_{time.time_ns()}")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(playbook, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+def record_verified_command(cwd: str, category: str, command: str) -> None:
+    """
+    Records a verified working test, build, or lint command for this repository.
+    """
+    if not command or not command.strip():
+        return
+    cmd = command.strip()
+    key_map = {
+        "test": "verified_test_commands",
+        "build": "verified_build_commands",
+        "lint": "verified_lint_commands",
+    }
+    key = key_map.get(category, "verified_test_commands")
+    data = load_workspace_playbook(cwd)
+    cmd_list = data.get(key, [])
+    if cmd not in cmd_list:
+        cmd_list.append(cmd)
+        data[key] = cmd_list[-5:]  # keep top 5
+        save_workspace_playbook(cwd, data)
+
+def record_project_convention(cwd: str, convention: str) -> None:
+    """
+    Records a repository-specific architectural convention or quirk learned across sessions.
+    """
+    if not convention or not convention.strip():
+        return
+    conv = convention.strip()
+    data = load_workspace_playbook(cwd)
+    conv_list = data.get("project_conventions", [])
+    if conv not in conv_list:
+        conv_list.append(conv)
+        data["project_conventions"] = conv_list[-10:]
+        save_workspace_playbook(cwd, data)
+
+def format_playbook_for_prompt(cwd: str) -> str:
+    """
+    Formats the workspace playbook as a prompt instruction section.
+    """
+    data = load_workspace_playbook(cwd)
+    tests = data.get("verified_test_commands", [])
+    builds = data.get("verified_build_commands", [])
+    lints = data.get("verified_lint_commands", [])
+    convs = data.get("project_conventions", [])
+
+    if not tests and not builds and not lints and not convs:
+        return ""
+
+    lines = ["\n【工程专属构建与测试指南 (Workspace Playbook)】"]
+    if tests:
+        lines.append(f"• 已验证测试指令: {', '.join(tests)}")
+    if builds:
+        lines.append(f"• 已验证构建指令: {', '.join(builds)}")
+    if lints:
+        lines.append(f"• 已验证代码规范/Lint: {', '.join(lints)}")
+    if convs:
+        lines.append("• 本工程专属经验与规约:")
+        for c_rule in convs:
+            lines.append(f"  - {c_rule}")
+    return "\n".join(lines) + "\n"
+
