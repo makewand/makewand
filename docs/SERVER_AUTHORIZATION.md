@@ -64,6 +64,17 @@ including across server restarts. Existing cookies created before this binding
 was introduced require a new login. Membership changes do not affect a global
 administrator's browser session, whose authority is the global account role.
 
+Each browser session is also registered in server memory. A signed cookie is
+accepted only while its session is registered, so:
+
+- `POST /v1/admin/session/logout` revokes the session on the server; a copied
+  cookie stops working at once, while the same administrator's other sessions
+  stay valid;
+- a session unused for 30 minutes expires (idle timeout), in addition to the
+  12-hour absolute lifetime; every authenticated admin request resets the idle
+  timer;
+- restarting the server signs out every browser session.
+
 The SQLite token store adds `authorization_version` automatically on open. User
 and membership update timestamps retain nanosecond precision. Existing databases
 and older timestamp formats remain readable. Service tokens without a `user_id`
