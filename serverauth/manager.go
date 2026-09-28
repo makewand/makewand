@@ -77,7 +77,10 @@ func (m *Manager) Issue(rule TokenRule) (TokenRuleView, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	cfg := m.cfg
+	// Work on a copy: the shared Tokens backing array must not be mutated
+	// unless the change is persisted, or a failed save would leave the
+	// listing and the live authorizer disagreeing.
+	cfg := cloneConfig(m.cfg)
 	tokenValue := rule.Token
 	finalID, err := IssueTokenRule(&cfg, rule)
 	if err != nil {
@@ -117,7 +120,10 @@ func (m *Manager) Revoke(tokenID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	cfg := m.cfg
+	// Work on a copy: the shared Tokens backing array must not be mutated
+	// unless the change is persisted, or a failed save would leave the
+	// listing and the live authorizer disagreeing.
+	cfg := cloneConfig(m.cfg)
 	if err := RevokeTokenRule(&cfg, tokenID); err != nil {
 		return err
 	}
@@ -151,7 +157,10 @@ func (m *Manager) RevokeByUserID(userID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	cfg := m.cfg
+	// Work on a copy: the shared Tokens backing array must not be mutated
+	// unless the change is persisted, or a failed save would leave the
+	// listing and the live authorizer disagreeing.
+	cfg := cloneConfig(m.cfg)
 	changed := false
 	for i := range cfg.Tokens {
 		if strings.TrimSpace(cfg.Tokens[i].UserID) == userID && !cfg.Tokens[i].Revoked {
@@ -175,4 +184,12 @@ func (m *Manager) RevokeByUserID(userID string) error {
 	m.cfg = cfg
 	m.auth = authz
 	return nil
+}
+
+// cloneConfig copies cfg deeply enough for Issue/Revoke edits, which append to
+// or modify elements of Tokens.
+func cloneConfig(cfg Config) Config {
+	out := cfg
+	out.Tokens = append([]TokenRule(nil), cfg.Tokens...)
+	return out
 }
