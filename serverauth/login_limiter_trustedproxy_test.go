@@ -53,9 +53,19 @@ func TestLoginRateLimiter_ThrottleKeyHonorsTrustedProxy(t *testing.T) {
 	}
 	l.SetTrustedProxies(tp)
 
-	// The peer is now trusted, so the first XFF hop is used.
+	// The peer is now trusted, so the right-most untrusted XFF hop (the one
+	// appended by the trusted proxy chain) is used.
 	if key := l.ThrottleKey(req, "u"); !strings.Contains(key, "1.2.3.4") {
 		t.Fatalf("trusted-proxy key %q must use the forwarded client IP", key)
+	}
+
+	// A client-supplied left-most hop must never be used: an appending proxy
+	// turns "forged" into "forged, <real client>".
+	spoofed := httptest.NewRequest("POST", "/", nil)
+	spoofed.RemoteAddr = "10.0.0.5:5555"
+	spoofed.Header.Set("X-Forwarded-For", "9.9.9.9, 1.2.3.4")
+	if key := l.ThrottleKey(spoofed, "u"); !strings.Contains(key, "1.2.3.4") || strings.Contains(key, "9.9.9.9") {
+		t.Fatalf("trusted-proxy key %q must ignore the client-controlled left-most hop", key)
 	}
 
 	// An untrusted peer must still ignore XFF even with a trusted set configured.

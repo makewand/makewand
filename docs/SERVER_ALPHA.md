@@ -150,8 +150,13 @@ ssh -L 8080:127.0.0.1:8080 -N user@remote-host &
 
 - Multi-user mode is **disabled by default**; without `--enable-users` clients authenticate with scoped tokens only (`--token`, `--auth-config`, or tokens issued into the state DB)
 - `--enable-users` enables user management, login, and the admin API **without** opening public registration. Sessions are namespaced per authenticated identity (user/org/project) and are not accessible across tenants
-- `--enable-registration` (implies `--enable-users`) opens the public `/v1/users/register` endpoint. Self-registered accounts are created **inactive** and require an admin to activate (`makewand user activate`). Registration is rate-limited per-IP and globally, and password hashing is concurrency-bounded (returns 503 when saturated). Keep this **off** unless you control network access to the port
-- `--trusted-proxy <CIDR|IP>` (repeatable): only when the direct peer matches one of these is an `X-Forwarded-For`/`X-Real-IP` header trusted for rate-limiting. By default client-supplied forwarding headers are ignored
+- `--enable-registration` (implies `--enable-users`) opens the public `/v1/users/register` endpoint. Self-registered accounts are created **inactive** and require an admin to activate (`makewand user activate`). Keep this **off** unless you control network access to the port. Registration limits:
+  - The per-address limit is the primary control: `--registration-per-ip-limit` (default 5) registrations per client address per `--registration-window` (default `1h`). IPv6 clients are counted per `/64`, because one client normally controls a whole `/64`.
+  - `--registration-global-limit` (default 30 per window) is a backstop on the total number of new, inactive accounts. When it is reached, the server logs a `warning: self-registration global limit reached` line and a `registration_global_limit` audit event, and rejects further sign-ups until the window ends. A distributed client can still exhaust it, so review pending accounts (`makewand user list`) when the alert fires, and raise the limit, or set it to `0` to disable the global cap and rely on the per-address limit.
+  - Password hashing is concurrency-bounded by `--registration-concurrency` (default 2); excess requests get 503.
+  - Inactive self-registered accounts are not deleted automatically.
+- `--trusted-proxy <CIDR|IP>` (repeatable): only when the direct peer matches one of these are forwarding headers used for rate limiting. By default client-supplied forwarding headers are ignored. `X-Forwarded-For` is read **from the right**: hops that belong to a trusted proxy are skipped and the first untrusted hop is the client, so a client-supplied left-most value cannot change the limiter key. List every proxy hop that appends to the header (for example both the load balancer and nginx). The proxy must append to `X-Forwarded-For` (nginx `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, Caddy and `cloudflared` do this by default) or overwrite it with the peer address. `X-Real-IP` is used only when no `X-Forwarded-For` header is present
+- Login failures are limited per account and client address (5 failures per 15 minutes, then a 15-minute lockout); IPv6 clients are counted per `/64`
 - Sessions are stored locally and not replicated
 
 ## Configuration
@@ -166,6 +171,10 @@ makewand serve \
   --enable-users                      # Enable multi-user auth, login, admin API (no public signup)
   --enable-registration               # Open public /v1/users/register (implies --enable-users; accounts need admin activation)
   --trusted-proxy <CIDR|IP>           # Trust XFF/X-Real-IP from these peers for rate limiting (repeatable)
+  --registration-per-ip-limit 5       # Sign-ups per client address (IPv6 /64) per window
+  --registration-global-limit 30      # Sign-ups from all clients per window; 0 disables the global cap
+  --registration-window 1h            # Window for both registration limits
+  --registration-concurrency 2        # Concurrent registration password hashes
   --state-db path/to/state.db         # SQLite state DB (users, tokens, usage)
   --data-dir path/to/dir              # Session/state directory (default ~/.config/makewand/server)
   --audit-log path/to/audit.jsonl     # JSONL audit log path

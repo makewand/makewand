@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -51,6 +52,10 @@ func serveCmd() *cobra.Command {
 		unsafeNoTLS        bool
 		budgetReservation  float64
 		strictAccounting   bool
+		registrationPerIP  int
+		registrationGlobal int
+		registrationWindow time.Duration
+		registrationSlots  int
 	)
 
 	cmd := &cobra.Command{
@@ -73,6 +78,10 @@ func serveCmd() *cobra.Command {
 			}
 
 			trustedProxySet, err := serverauth.ParseTrustedProxies(trustedProxies)
+			if err != nil {
+				return err
+			}
+			registrationLimits, err := serveRegistrationLimits(registrationPerIP, registrationGlobal, registrationWindow, registrationSlots)
 			if err != nil {
 				return err
 			}
@@ -143,8 +152,15 @@ func serveCmd() *cobra.Command {
 			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
 			loginLimiter := serverauth.NewLoginRateLimiter(5, 15*time.Minute, 15*time.Minute)
 			loginLimiter.SetTrustedProxies(trustedProxySet)
-			registrationLimiter := serverauth.NewRegistrationRateLimiter(0, 0, 0, 0)
+			registrationLimiter := serverauth.NewRegistrationRateLimiterWithLimits(registrationLimits)
 			registrationLimiter.SetTrustedProxies(trustedProxySet)
+			if enableRegistration {
+				var alertAudit serveraudit.Logger
+				if auditLogger != nil {
+					alertAudit = auditLogger
+				}
+				registrationLimiter.SetGlobalLimitAlert(registrationGlobalLimitAlert(os.Stderr, alertAudit))
+			}
 			var (
 				tokenManager serverauth.TokenManager = bootstrapManager
 				userStore    router.UserManager
@@ -414,9 +430,58 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state database for users, tokens, and usage (default: <data-dir>/state.db)")
 	cmd.Flags().BoolVar(&enableUsers, "enable-users", false, "enable multi-user auth, login, and admin user management (does not open public registration)")
 	cmd.Flags().BoolVar(&enableRegistration, "enable-registration", false, "allow public self-service account registration (implies --enable-users; new accounts require admin activation)")
-	cmd.Flags().StringSliceVar(&trustedProxies, "trusted-proxy", nil, "CIDR or IP of reverse proxies whose X-Forwarded-For/X-Real-IP headers are trusted for rate limiting (repeatable)")
+	cmd.Flags().StringSliceVar(&trustedProxies, "trusted-proxy", nil, "CIDR or IP of reverse proxies whose X-Forwarded-For/X-Real-IP headers are trusted for rate limiting (repeatable); X-Forwarded-For is read right to left, skipping these proxies")
+	cmd.Flags().IntVar(&registrationPerIP, "registration-per-ip-limit", serverauth.DefaultRegistrationPerSource, "self-registrations allowed per client address (IPv6: per /64) per --registration-window")
+	cmd.Flags().IntVar(&registrationGlobal, "registration-global-limit", serverauth.DefaultRegistrationGlobal, "self-registrations allowed from all clients per --registration-window; reaching it logs a warning and an audit event; 0 disables the global cap (the per-address limit still applies)")
+	cmd.Flags().DurationVar(&registrationWindow, "registration-window", serverauth.DefaultRegistrationWindow, "fixed window for the self-registration limits")
+	cmd.Flags().IntVar(&registrationSlots, "registration-concurrency", serverauth.DefaultRegistrationConcurrency, "maximum concurrent self-registration password hashes (excess requests get 503)")
 	cmd.Flags().BoolVar(&unsafeNoTLS, "unsafe-no-tls", false, "DANGER: allow plaintext listening on non-loopback addresses (only for testing behind a reverse proxy)")
 	return cmd
+}
+
+// serveRegistrationLimits validates the self-registration flags. A global
+// limit of 0 disables the global cap; the per-address limit is always on.
+func serveRegistrationLimits(perIP, global int, window time.Duration, concurrency int) (serverauth.RegistrationLimits, error) {
+	if perIP < 1 {
+		return serverauth.RegistrationLimits{}, fmt.Errorf("--registration-per-ip-limit must be at least 1")
+	}
+	if global < 0 {
+		return serverauth.RegistrationLimits{}, fmt.Errorf("--registration-global-limit must be >= 0 (0 disables the global cap)")
+	}
+	if window <= 0 {
+		return serverauth.RegistrationLimits{}, fmt.Errorf("--registration-window must be positive")
+	}
+	if concurrency < 1 {
+		return serverauth.RegistrationLimits{}, fmt.Errorf("--registration-concurrency must be at least 1")
+	}
+	limits := serverauth.RegistrationLimits{MaxConcurrent: concurrency, MaxPerSource: perIP, MaxGlobal: global, Window: window}
+	if global == 0 {
+		limits.MaxGlobal = -1
+	}
+	return limits, nil
+}
+
+// registrationGlobalLimitAlert reports the first global-cap rejection of each
+// window on stderr and, when configured, in the audit log, so an operator can
+// tell that legitimate sign-ups are being refused and review pending accounts.
+func registrationGlobalLimitAlert(w io.Writer, audit serveraudit.Logger) func(serverauth.RegistrationLimitAlert) {
+	return func(alert serverauth.RegistrationLimitAlert) {
+		message := fmt.Sprintf("self-registration global limit reached (%d per %s, window started %s); further registrations are rejected until %s. Review inactive accounts with 'makewand user list' and raise --registration-global-limit if these sign-ups are legitimate",
+			alert.Limit, alert.Window, alert.WindowStart.UTC().Format(time.RFC3339), alert.WindowStart.Add(alert.Window).UTC().Format(time.RFC3339))
+		if w != nil {
+			fmt.Fprintf(w, "warning: %s\n", message)
+		}
+		if audit != nil {
+			audit.Log(serveraudit.Event{
+				Timestamp: time.Now().UTC(),
+				Kind:      "registration_global_limit",
+				Method:    http.MethodPost,
+				Path:      "/v1/users/register",
+				Status:    http.StatusTooManyRequests,
+				Error:     message,
+			})
+		}
+	}
 }
 
 func loadServeAuthorizer(token, authConfig string) (serverauth.RequestAuthorizer, *serverauth.Manager, error) {
