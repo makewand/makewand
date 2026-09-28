@@ -24,7 +24,13 @@
 
 - Plaintext protocol without TLS terminates in `UNSAFE` mode only (requires explicit flag)
 - WAL database requires careful backup procedures — use `makewand state backup`
-  (VACUUM INTO snapshot), not a plain tar of the live `state.db`
+  (VACUUM INTO snapshot), not a plain `cp`/`tar` of the live `state.db`
+- The JSONL audit log is append-only by convention but not tamper-evident (no
+  hash chain or signature): anyone with write access to the host can edit it.
+  Ship it to external append-only storage if you need tamper evidence. Admin
+  mutations record their actor and target (`action`, `target_user_id`,
+  `target_organization_id`, `target_project_id`, `target_token_id`,
+  `target_role`, `target_active`)
 - Concurrent agent execution can interfere with local workspace
 - Remote clients may see stale session state
 
@@ -130,8 +136,9 @@ makewand chat .
 
 - **Default**: Loopback only (`127.0.0.1:8080`). Must use SSH tunnel or reverse proxy for remote access
 - **Never**: Listen on `0.0.0.0` without TLS termination
-- **Recommended**: Use TLS-terminating reverse proxy (nginx, Caddy) for network access
+- **Recommended**: Use TLS-terminating reverse proxy (nginx, Caddy) for network access, and pass the proxy address with `--trusted-proxy` so rate limits see real client addresses
 - **SSH Tunnel**: Simplest secure remote access method
+- **Public internet**: unsupported (see above). If you still expose the server, for example with the Cloudflare Tunnel in [CLOUDFLARE_WEBSITE_DEPLOYMENT.md](CLOUDFLARE_WEBSITE_DEPLOYMENT.md), read that guide's risk section and put an identity-aware access layer in front of `/admin` and `/v1/admin/`
 
 ```bash
 # SSH tunnel example
@@ -183,6 +190,22 @@ makewand serve \
   --unsafe-no-tls                     # DANGER: allow plaintext on non-loopback (proxy/testing only)
 ```
 
+### Environment Variables
+
+Flags take precedence over these variables.
+
+| Variable | Used when | Effect |
+|---|---|---|
+| `MAKEWAND_SERVER_TOKEN` | no `--token`, `--auth-config`, or `MAKEWAND_SERVER_AUTH_CONFIG` | Single bearer token with every scope |
+| `MAKEWAND_SERVER_AUTH_CONFIG` | no `--auth-config` | Path to the scoped-token auth config (takes precedence over `--token`/`MAKEWAND_SERVER_TOKEN`); it must stay writable, because revocations rewrite it |
+| `MAKEWAND_SERVER_STATE_DB` | no `--state-db` | Path to the SQLite state DB; `0`, `false`, or `off` disables it. Default `<data-dir>/state.db` |
+| `MAKEWAND_SERVER_AUDIT_LOG` | no `--audit-log` | `1`/`true` writes `<data-dir>/audit.jsonl`; any other value is a path. Unset: no audit log |
+| `MAKEWAND_SERVER_USAGE_LOG` | no `--usage-log` | `1`/`true` writes `<data-dir>/usage.jsonl`; `0`/`false`/`off`/`disabled` turns the JSONL ledger off; any other value is a path. Unset: off when the state DB is enabled, otherwise `<data-dir>/usage.jsonl` |
+| `MAKEWAND_SERVER_ALERT_WEBHOOK` | no `--alert-webhook` | URL that receives budget alert webhooks |
+| `MAKEWAND_SERVER_ALERT_STATE` | no `--alert-state` | Path of the alert delivery state. Default `<data-dir>/alert_state.json` |
+| `MAKEWAND_API_POLICY` | always | `allow_paid` lets the server use provider API keys (billed); anything else, including the default `subscription_only`, ignores them. Required for API-key-only hosts such as the Docker image |
+| `MAKEWAND_CONFIG_DIR` | always | makewand config directory (default `~/.config/makewand`); `--data-dir` defaults to `<config dir>/server` |
+
 ### Accessing Server Data
 
 ```bash
@@ -219,16 +242,16 @@ makewand usage summary --state-db ~/.config/makewand/server/state.db
 
 ### Database errors
 
-- Backup your state.db before troubleshooting: `cp ~/.config/makewand/server/state.db{,.backup}`
+- Back up before troubleshooting with `makewand state backup ~/makewand-backup.tar.gz --data-dir ~/.config/makewand/server` (add `--auth-config <path>` if you use one). It snapshots the live database with `VACUUM INTO`. Do **not** `cp state.db`: while the server runs, recent writes live in `state.db-wal`, so a copy of the main file alone can be missing tables and rows
 - WAL files (`-wal`, `-shm`) are normal and should not be deleted
 - Do not directly modify the database; use provided CLI commands
 - Report backup/restore issues on GitHub
 
 ### Performance
 
-- Server is single-threaded and designed for small teams
-- Do not run high-concurrency workloads
-- Monitor `/admin` dashboard for session and usage stats
+- The server handles requests concurrently (Go `net/http`), but it is sized and tested for small teams: one process, one SQLite state DB, per-process rate-limit and quota counters, and no horizontal scaling or HA
+- Do not run high-concurrency workloads; registration password hashing is capped by `--registration-concurrency`
+- Monitor the `/admin` dashboard and `/metrics` for session and usage stats
 
 ## Feedback and Reporting Issues
 

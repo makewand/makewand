@@ -9,7 +9,7 @@
 | 模块 | 托管平台 | 目标域名 | 说明 |
 |---|---|---|---|
 | **官网与技术文档** | **Cloudflare Pages** | `makewand.org`<br>`www.makewand.org`<br>`makewand.com` | 极速边缘静态托管、自动免费 SSL、全球 CDN、零服务器成本 |
-| **在线控制台 / API 网关** | **Cloudflare Tunnel** | `console.makewand.org`<br>`api.makewand.org` | 安全穿透内网 `makewand serve` (端口 8080)，免公网 IP，内置安全防御 |
+| **在线控制台 / API 网关（可选，不受支持的公网暴露）** | **Cloudflare Tunnel** | `console.makewand.org`<br>`api.makewand.org` | 把本机 `makewand serve`（端口 8080）暴露到公网；属于 [SERVER_ALPHA](SERVER_ALPHA.md) 明确不支持的部署形态，必须先满足第三部分的前置条件 |
 
 ---
 
@@ -79,9 +79,31 @@ bash scripts/deploy_website.sh --preview 8090
 
 ---
 
-## 第三部分：Cloudflare Tunnel 映射后台管理与 API（可选）
+## 第三部分：Cloudflare Tunnel 映射后台管理与 API（可选，不受支持）
 
-若您需要在公网访问本机的 `makewand serve` Web 控制台（端口 8080）与 OpenAI 兼容 API：
+若您需要在公网访问本机的 `makewand serve` Web 控制台（端口 8080）与 OpenAI 兼容 API，请先读完本节风险与前置条件。
+
+### 风险说明
+
+- **公网部署不在支持范围内。** [SERVER_ALPHA](SERVER_ALPHA.md) 把服务端定位为个人或受信网络使用的 alpha 组件，"Public internet deployment" 明确不受支持；隧道会把 `/admin` 控制台、`/v1/admin/*` 管理 API、登录接口与模型调用接口一起暴露给整个互联网。
+- Tunnel 只解决"无需公网 IP"与边缘 TLS，**不提供身份认证**。不加访问控制时，任何人都能访问登录页并对管理员账号做在线口令猜测，只受登录限速与 Argon2id 成本约束。
+- 模型调用按服务端配置的订阅或 API key 计费，泄露的 token 会直接消耗您的额度。
+- 源站是 `127.0.0.1:8080` 上的明文 HTTP，TLS 只在 Cloudflare 边缘终止，本机其他进程也能访问该端口。
+
+### 前置条件（全部满足后再启用）
+
+1. **在 Cloudflare Zero Trust 为 `console.makewand.org` 配置 Cloudflare Access 应用**，只允许指定身份（邮箱/IdP 组）访问；`/admin` 与 `/v1/admin/` 不得在无 Access 保护的主机名上可达。`api.makewand.org` 若只给程序调用，使用 Access Service Token 或至少保证只发放带配额的 scoped token。
+2. **以 `--trusted-proxy 127.0.0.1` 启动服务。** `cloudflared` 从本机回环地址连到源站，并把真实客户端 IP 追加到 `X-Forwarded-For` 末尾；服务端从右向左跳过可信代理取第一个不可信地址，登录与注册限速才会按真实客户端生效。不配置时所有请求共享 `127.0.0.1` 这一个限速键，一个攻击者即可把所有人锁在登录之外。
+3. **只监听回环地址**：`makewand serve --listen 127.0.0.1:8080 ...`，不要使用 `--unsafe-no-tls` 绑定 `0.0.0.0`。
+4. **不要开启 `--enable-registration`**；账号由管理员创建，管理员使用强口令。
+5. 客户端 token 按最小权限发放并设置配额（`makewand token issue --max-requests-per-day ... --max-cost-usd-per-month ...`），启用审计日志（`--audit-log` 或 `MAKEWAND_SERVER_AUDIT_LOG=1`），并定期检查 `/v1/admin/audit/events`。
+6. 若 API 通过付费 API key 服务（`MAKEWAND_API_POLICY=allow_paid`），为组织/项目设置月度预算。
+
+启动示例：
+
+```bash
+makewand serve --listen 127.0.0.1:8080 --enable-users --trusted-proxy 127.0.0.1 --audit-log ~/.config/makewand/server/audit.jsonl
+```
 
 ### 1. 创建 Tunnel
 ```bash
@@ -113,7 +135,7 @@ cloudflared tunnel route dns makewand-gateway api.makewand.org
 # 启动隧道
 cloudflared tunnel --config deploy/cloudflare-tunnel.makewand.yml run
 ```
-配置成功后，访问 `https://console.makewand.org/admin` 即可直接进入 Makewand Web 控制台。
+配置成功后，先通过 Cloudflare Access 登录，再访问 `https://console.makewand.org/admin` 进入 Makewand Web 控制台。未配置 Access 前不要执行 `cloudflared tunnel ... run`。
 
 ---
 

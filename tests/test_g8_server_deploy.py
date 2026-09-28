@@ -104,5 +104,46 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertIn("subscription_only", guide)
 
 
+class ServerDocsTests(unittest.TestCase):
+    """go-server#5, go-server#12: server docs must match the code and not mislead operators."""
+
+    def setUp(self):
+        self.alpha = (DOCS / "SERVER_ALPHA.md").read_text(encoding="utf-8")
+
+    def test_troubleshooting_backup_uses_state_backup(self):
+        # A copy command on a state.db path (the old advice was
+        # `cp ~/.config/makewand/server/state.db{,.backup}`) loses WAL data.
+        self.assertIsNone(re.search(r"cp\s+[~/$][^`\s]*state\.db", self.alpha), "plain cp of a live WAL database loses data")
+        troubleshooting = self.alpha[self.alpha.index("### Database errors"):]
+        self.assertIn("makewand state backup", troubleshooting.split("###")[1])
+
+    def test_no_single_threaded_claim(self):
+        self.assertNotRegex(self.alpha.lower(), r"single[- ]threaded")
+        self.assertIn("concurrently", self.alpha)
+
+    def test_every_server_environment_variable_is_documented(self):
+        serve = (ROOT / "cmd" / "makewand" / "serve.go").read_text(encoding="utf-8")
+        names = set(re.findall(r'os\.(?:Getenv|LookupEnv)\("(MAKEWAND_SERVER_[A-Z_]+)"\)', serve))
+        self.assertGreaterEqual(len(names), 7, names)
+        missing = sorted(name for name in names if f"`{name}`" not in self.alpha)
+        self.assertEqual(missing, [], "undocumented serve environment variables")
+
+    def test_registration_and_proxy_flags_are_documented(self):
+        for flag in ("--registration-per-ip-limit", "--registration-global-limit", "--registration-window",
+                     "--registration-concurrency", "--trusted-proxy"):
+            self.assertIn(flag, self.alpha)
+        self.assertIn("from the right", self.alpha)
+
+    def test_cloudflare_exposure_states_risks_and_prerequisites(self):
+        guide = (DOCS / "CLOUDFLARE_WEBSITE_DEPLOYMENT.md").read_text(encoding="utf-8")
+        for needle in ("风险说明", "前置条件", "Cloudflare Access", "--trusted-proxy 127.0.0.1", "SERVER_ALPHA", "--enable-registration"):
+            self.assertIn(needle, guide)
+        tunnel = (DEPLOY / "cloudflare-tunnel.makewand.yml").read_text(encoding="utf-8")
+        self.assertIn("WARNING", tunnel)
+        self.assertIn("--trusted-proxy 127.0.0.1", tunnel)
+        self.assertNotIn("noTLSVerify", tunnel)
+        self.assertNotIn("safely to the public", tunnel)
+
+
 if __name__ == "__main__":
     unittest.main()
