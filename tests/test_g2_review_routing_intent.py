@@ -58,6 +58,19 @@ EXTRA_QUESTIONS = [
     "更新日志已经写好了，还有什么要补充的吗？",
     "实现细节在 foo.py 里，这样做对吗？",
     "How do I add a flag?",
+    "这个项目支持 Windows 么",
+    "这个项目支持不支持 Windows",
+    "这个项目支持 Windows 不",
+    "这个库支持异步不支持",
+    "Any plans to support Windows",
+    "Explain what the patch command does",
+    "Tell me which files implement the router",
+    "解释一下 patch 命令",
+    "列出支持的平台",
+    "介绍一下项目支持的功能",
+    "说明一下 add 子命令的用法",
+    "Describe how the add command works",
+    "Show me where we create the config file",
 ]
 
 # Explicit imperative coding instructions must still reach the code pipeline, including polite questions

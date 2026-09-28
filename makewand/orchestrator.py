@@ -659,14 +659,23 @@ _ZH_QUESTION_MARKERS = (
     "对不对", "行不行", "好不好", "为什么", "为何", "怎么", "怎样", "如何", "什么", "哪些", "哪个",
     "哪里", "哪儿", "请问", "想知道", "问一下",
 )
+_ZH_FINAL_PARTICLES = ("吗", "呢", "么", "不", "没")
+_ZH_A_NOT_A = re.compile(r"([\u4e00-\u9fa5]{1,2})(?:[^\u4e00-\u9fa5\n]{0,10}|[\u4e00-\u9fa5]{0,4})(?:不|没)\1")
+_ZH_INQUIRY_STARTERS = re.compile(
+    r"^(?:请(?:问)?|帮我|帮忙|麻烦|给我|替我|你来)?\s*(?:解释|介绍|说明|讲讲|描述|列出|告诉我|看看|分析|阐述|梳理|查看|检索|阅读|展示|总结)"
+)
+_EN_INQUIRY_STARTERS = re.compile(
+    r"^(?:(?:please|kindly|can\s+you|could\s+you)\s+)?(?:explain|describe|tell\s+me|show\s+me|list|summarize|walk\s+me\s+through|detail|elaborate\s+on|inspect|outline)\b"
+)
 _EN_QUESTION_STARTERS = re.compile(
     r"^(?:does|do|did|is|are|was|were|am|can|could|should|would|will|shall|may|might|what|which|"
-    r"who|whom|whose|when|where|why|how|isn't|aren't|doesn't|don't|didn't|can't|won't|wouldn't|"
+    r"who|whom|whose|when|where|why|how|any\s+plans?\s+to|isn't|aren't|doesn't|don't|didn't|can't|won't|wouldn't|"
     r"shouldn't|couldn't)\b"
 )
 _EN_QUESTION_PHRASES = re.compile(
-    r"\b(?:how\s+(?:does|do|did|is|are|can|could|should|would)|what\s+(?:is|are|does|do)|"
-    r"why\s+(?:does|do|is|are)|is\s+there|are\s+there|whether|i\s+wonder|wondering)\b"
+    r"\b(?:how\s+(?:does|do|did|is|are|can|could|should|would|to)|what\s+(?:is|are|does|do)|"
+    r"why\s+(?:does|do|is|are)|where\s+(?:we|do|does|is|are|can)|which\s+(?:files?|parts?|modules?)|"
+    r"is\s+there|are\s+there|whether|i\s+wonder|wondering|any\s+plans?\s+to)\b"
 )
 _ZH_CODE_VERBS = (
     r"(?:添加|增加|加上|加入|加个|实现|修复|修改|修正|修一下|编写|创建|新建|生成|重构|补充|补上|补全|删除|删掉|"
@@ -716,7 +725,15 @@ def _split_prompt_clauses(lower: str) -> List[str]:
 def _is_question_clause(clause: str) -> bool:
     if clause.endswith(("?", "？")):
         return True
+    if any(clause.endswith(p) for p in _ZH_FINAL_PARTICLES):
+        return True
     if any(m in clause for m in _ZH_QUESTION_MARKERS):
+        return True
+    if _ZH_A_NOT_A.search(clause):
+        return True
+    if _ZH_INQUIRY_STARTERS.match(clause):
+        return True
+    if _EN_INQUIRY_STARTERS.match(clause):
         return True
     if _EN_QUESTION_STARTERS.match(clause) or _EN_QUESTION_PHRASES.search(clause):
         return True
