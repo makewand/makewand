@@ -1,26 +1,57 @@
 name: Normalize Release Metadata
 
+# Manual maintenance tool for existing GitHub release bodies: de-duplicates
+# repeated bullet lines, appends a "Full Changelog" link when missing, and can
+# rewrite links that still point at a former repository location.
+#
+# It holds contents: write over every release, so it only runs on demand
+# (never on push) and defaults to a dry run that just logs what would change.
+# Former repository URLs come from the `legacy_repo_urls` input or the
+# LEGACY_REPO_URLS repository variable; nothing account-specific is hardcoded.
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - ".github/workflows/normalize-release-metadata.yml"
   workflow_dispatch:
+    inputs:
+      legacy_repo_urls:
+        description: "Comma-separated former repo URLs to rewrite to this repository (empty: use the LEGACY_REPO_URLS variable, if any)"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Only log the releases that would change"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
 
+concurrency:
+  group: normalize-release-metadata
+  cancel-in-progress: false
+
 jobs:
   normalize:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Normalize release notes
         uses: actions/github-script@v9
+        env:
+          LEGACY_REPO_URLS: ${{ inputs.legacy_repo_urls || vars.LEGACY_REPO_URLS || '' }}
+          DRY_RUN: ${{ inputs.dry_run }}
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const canonical = `https://github.com/${owner}/${repo}`;
+            // Anything but an explicit "false" is a dry run (fail safe).
+            const dryRun = String(process.env.DRY_RUN || "").trim().toLowerCase() !== "false";
+            const legacyUrls = String(process.env.LEGACY_REPO_URLS || "")
+              .split(",")
+              .map((u) => u.trim().replace(/\/+$/, ""))
+              .filter((u) => /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+$/.test(u))
+              .filter((u) => u.toLowerCase() !== canonical.toLowerCase());
+            core.info(`Mode: ${dryRun ? "dry run" : "apply"}; legacy URLs: ${legacyUrls.length}`);
 
             const semver = /^v(\d+)\.(\d+)\.(\d+)$/;
             const releases = await github.paginate(github.rest.repos.listReleases, {
@@ -55,31 +86,36 @@ jobs:
               const cur = stable[i].release;
               const prev = i > 0 ? stable[i - 1].release : null;
               const expectedChangelogLine = prev
-                ? `**Full Changelog**: https://github.com/${owner}/${repo}/compare/${prev.tag_name}...${cur.tag_name}`
-                : `**Full Changelog**: https://github.com/${owner}/${repo}/commits/${cur.tag_name}`;
+                ? `**Full Changelog**: ${canonical}/compare/${prev.tag_name}...${cur.tag_name}`
+                : `**Full Changelog**: ${canonical}/commits/${cur.tag_name}`;
 
               const currentBody = (cur.body || "").trim();
-              const fixedOwnerBody = currentBody.replaceAll(
-                "https://github.com/bnumsn/makewand",
-                `https://github.com/${owner}/${repo}`
-              );
-
-              const seen = new Set();
-              const dedupedLines = [];
-              for (const line of fixedOwnerBody.split("\n")) {
-                const key = line.trim();
-                if (key === "") {
-                  dedupedLines.push(line);
-                  continue;
-                }
-                if (seen.has(key)) {
-                  continue;
-                }
-                seen.add(key);
-                dedupedLines.push(line);
+              let body = currentBody;
+              for (const url of legacyUrls) {
+                body = body.split(url).join(canonical);
               }
 
-              let normalizedBody = dedupedLines.join("\n").trim();
+              // Drop repeated bullet lines only. Code fences, blank lines and
+              // any line inside a fenced block are kept verbatim, so install
+              // snippets (which legitimately repeat "```") stay intact.
+              const seen = new Set();
+              const kept = [];
+              let inFence = false;
+              for (const line of body.split("\n")) {
+                const key = line.trim();
+                if (key.startsWith("```")) {
+                  inFence = !inFence;
+                  kept.push(line);
+                  continue;
+                }
+                if (!inFence && /^[-*] /.test(key)) {
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                }
+                kept.push(line);
+              }
+
+              let normalizedBody = kept.join("\n").trim();
               if (!normalizedBody.includes("**Full Changelog**:")) {
                 normalizedBody = normalizedBody
                   ? `${normalizedBody}\n\n${expectedChangelogLine}`
@@ -88,6 +124,11 @@ jobs:
 
               if (normalizedBody === currentBody) {
                 core.info(`No change: ${cur.tag_name}`);
+                continue;
+              }
+
+              if (dryRun) {
+                core.info(`[dry run] Would update: ${cur.tag_name}`);
                 continue;
               }
 

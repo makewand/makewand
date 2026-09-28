@@ -18,6 +18,8 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # A hung test must not hold a runner for the 6h default.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -26,6 +28,14 @@ jobs:
         shell: bash
         run: |
           ./scripts/check_secrets.sh
+
+      - name: Secret scanner regression tests
+        shell: bash
+        run: bash scripts/test_check_secrets.sh
+
+      - name: Version consistency
+        shell: bash
+        run: bash scripts/check_version.sh
 
       - name: Check shell script syntax
         shell: bash
@@ -50,6 +60,39 @@ jobs:
           # actually runs instead of skipping — the generation/verification trust
           # boundary is security-critical and must be exercised end-to-end in CI.
           sudo apt-get install -y expect bubblewrap
+
+      - name: Allow unprivileged user namespaces for bubblewrap
+        # Ubuntu 24.04 runners ship kernel.apparmor_restrict_unprivileged_userns=1:
+        # an unconfined process may still create a user namespace, but AppArmor
+        # moves it into the `unprivileged_userns` profile, which denies every
+        # capability inside it. bwrap --unshare-net then cannot bring up loopback
+        # (CAP_NET_ADMIN) and dies with "loopback: Failed RTM_NEWADDR: Operation
+        # not permitted" -- the failure behind every CI/Release run since
+        # 2026-07-19. Relax the restriction for this ephemeral runner only; `|| true`
+        # keeps older images (no such sysctl) working, and the next step still
+        # hard-fails if bwrap remains unusable.
+        shell: bash
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Diagnose bubblewrap sandbox
+        shell: bash
+        run: |
+          set -uo pipefail
+          # First the minimal network-namespace check, then the exact probe the
+          # product uses (internal/engine/verify_isolation.go).
+          if out="$(bwrap --unshare-net --ro-bind / / true 2>&1)" \
+            && out="$(bwrap --ro-bind / / --unshare-pid --unshare-net true 2>&1)"; then
+            echo "bubblewrap OK: $(bwrap --version)"
+            exit 0
+          fi
+          echo "::error title=bubblewrap sandbox unavailable::bwrap network-namespace probe failed: ${out}. The live sandbox gate (MAKEWAND_REQUIRE_BWRAP=1) cannot pass on this runner. 'Operation not permitted' on RTM_NEWADDR/loopback means unprivileged user namespaces are capability-restricted (AppArmor kernel.apparmor_restrict_unprivileged_userns=1)."
+          echo "--- runner diagnostics ---"
+          bwrap --version || true
+          uname -a || true
+          for k in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces; do
+            sysctl "$k" 2>/dev/null || echo "$k: (not present)"
+          done
+          exit 1
 
       - name: Check formatting (gofmt)
         shell: bash

@@ -13,9 +13,21 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung test must not hold the release for the 6h default.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Secret scan and tag/version consistency
+        # The tag must equal "v" + makewand.__version__ and every hardcoded copy
+        # (README, site, welcome card, CHANGELOG) must agree before anything is
+        # built: v3.0.1/v3.0.2 were tagged while __version__ still said 3.0.0.
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/check_secrets.sh
+          bash scripts/check_version.sh --tag "${GITHUB_REF_NAME}"
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -28,6 +40,36 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y expect bubblewrap
+
+      - name: Allow unprivileged user namespaces for bubblewrap
+        # Ubuntu 24.04 runners ship kernel.apparmor_restrict_unprivileged_userns=1,
+        # which strips all capabilities inside bwrap's user namespace, so
+        # `bwrap --unshare-net` fails with "loopback: Failed RTM_NEWADDR: Operation
+        # not permitted". That failed the test job of every 3.x tag, so the release
+        # job never ran. Relax it for this ephemeral runner; `|| true` tolerates
+        # images without the sysctl, and the diagnostic below still hard-fails.
+        shell: bash
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Diagnose bubblewrap sandbox
+        shell: bash
+        run: |
+          set -uo pipefail
+          # First the minimal network-namespace check, then the exact probe the
+          # product uses (internal/engine/verify_isolation.go).
+          if out="$(bwrap --unshare-net --ro-bind / / true 2>&1)" \
+            && out="$(bwrap --ro-bind / / --unshare-pid --unshare-net true 2>&1)"; then
+            echo "bubblewrap OK: $(bwrap --version)"
+            exit 0
+          fi
+          echo "::error title=bubblewrap sandbox unavailable::bwrap network-namespace probe failed: ${out}. A release cannot ship without the live sandbox gate (MAKEWAND_REQUIRE_BWRAP=1). 'Operation not permitted' on RTM_NEWADDR/loopback means unprivileged user namespaces are capability-restricted (AppArmor kernel.apparmor_restrict_unprivileged_userns=1)."
+          echo "--- runner diagnostics ---"
+          bwrap --version || true
+          uname -a || true
+          for k in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces; do
+            sysctl "$k" 2>/dev/null || echo "$k: (not present)"
+          done
+          exit 1
 
       - name: Live sandbox smoke (bubblewrap required, not cached)
         # A release must never ship without the security-critical bwrap isolation
@@ -71,6 +113,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -88,6 +131,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: [test, package-smoke]
+    timeout-minutes: 30
     env:
       HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
       SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
@@ -108,6 +152,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
+          # Archives keep the tag in their names, but both engines report the bare
+          # semantic version ("makewand version 3.2.0"), exactly like a source
+          # install stamped from makewand.__version__ by scripts/install.sh.
+          SEMVER="${VERSION#v}"
           mkdir -p dist
 
           build_one() {
@@ -124,10 +172,10 @@ jobs:
             mkdir -p "${outdir}"
 
             CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-              go build -trimpath -ldflags "-s -w -X github.com/makewand/makewand/internal/buildinfo.Version=${VERSION} -X github.com/makewand/makewand/internal/buildinfo.Commit=${GITHUB_SHA:0:7}" \
+              go build -trimpath -ldflags "-s -w -X github.com/makewand/makewand/internal/buildinfo.Version=${SEMVER} -X github.com/makewand/makewand/internal/buildinfo.Commit=${GITHUB_SHA:0:7}" \
               -o "${outdir}/${bin}" ./cmd/makewand
 
-            python3 -I scripts/stage_python_engine.py "${outdir}" "${VERSION}"
+            python3 -I scripts/stage_python_engine.py "${outdir}" "${SEMVER}"
 
             if [ "$goos" = "windows" ]; then
               (cd dist && zip -q -r "${base}.zip" "${base}")
@@ -147,7 +195,7 @@ jobs:
           # Fail the release if the built binary's version does not match the tag.
           # This guards against ldflags drift silently shipping a "dev" build
           # (the runner is linux/amd64, so verify that native artifact).
-          bash scripts/release_contract.sh "dist/makewand_${VERSION}_linux_amd64/makewand" "${VERSION}"
+          bash scripts/release_contract.sh "dist/makewand_${VERSION}_linux_amd64/makewand" "${SEMVER}"
 
       - name: Generate Homebrew/Scoop manifests
         shell: bash
@@ -174,7 +222,13 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
           REPO="${GITHUB_REPOSITORY}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
           PREV_TAG="$(git tag --sort=-version:refname | grep '^v' | grep -Fxv "${VERSION}" | head -n 1 || true)"
+          TAP_REPO="${HOMEBREW_TAP_REPO:-makewand/homebrew-makewand}"
+          TAP_NAME="${TAP_REPO#*/}"
+          TAP="${TAP_REPO%%/*}/${TAP_NAME#homebrew-}"
+          BUCKET_REPO="${SCOOP_BUCKET_REPO:-makewand/scoop-makewand}"
+          FENCE='```'
 
           {
             echo "## Highlights"
@@ -184,25 +238,48 @@ jobs:
               git log --pretty='- %s (%h)' -n 20 | sed -n '1,40p'
             fi
             echo
-            echo "## Install"
-            echo '```bash'
-            echo "curl -fsSL https://raw.githubusercontent.com/${REPO}/master/scripts/install.sh | bash"
-            echo '```'
+            echo "## Install (prebuilt, no Go toolchain required)"
             echo
-            echo "## Verify download integrity"
-            echo '```bash'
-            echo 'sha256sum -c checksums.txt'
-            echo '```'
+            echo "Each archive contains the Go CLI and the matching Python engine (lib/); Python 3.9+ must be on PATH."
+            echo "Keep the extracted directory together and put it (or a symlink to its makewand binary) on PATH."
+            echo
+            echo "${FENCE}bash"
+            echo "# PLATFORM: linux_amd64 | linux_arm64 | darwin_amd64 | darwin_arm64"
+            echo "PLATFORM=linux_amd64"
+            echo "ARCHIVE=makewand_${VERSION}_\${PLATFORM}.tar.gz"
+            echo "curl -fsSLO ${BASE_URL}/\${ARCHIVE}"
+            echo "curl -fsSLO ${BASE_URL}/checksums.txt"
+            echo "grep \" \${ARCHIVE}\$\" checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -"
+            echo "tar -xzf \"\${ARCHIVE}\""
+            echo "./makewand_${VERSION}_\${PLATFORM}/makewand --version"
+            echo "${FENCE}"
+            echo
+            echo "Windows: download makewand_${VERSION}_windows_amd64.zip and checksums.txt, verify the SHA-256, extract, and run makewand.exe."
+            echo
+            if [ -n "${PACKAGE_REPO_TOKEN:-}" ]; then
+              echo "Package managers (updated by this release):"
+              echo
+              echo "${FENCE}bash"
+              echo "brew install ${TAP}/makewand"
+              echo "scoop bucket add makewand https://github.com/${BUCKET_REPO} && scoop install makewand"
+              echo "${FENCE}"
+              echo
+            fi
+            echo "Build from source instead (tracks master; needs the Go toolchain from go.mod and Python 3.9+):"
+            echo
+            echo "${FENCE}bash"
+            echo "curl -fsSL https://raw.githubusercontent.com/${REPO}/master/scripts/install.sh | bash"
+            echo "${FENCE}"
             echo
             echo "## Verify checksum signature (cosign keyless)"
-            echo '```bash'
+            echo "${FENCE}bash"
             echo "cosign verify-blob \\"
             echo "  --certificate checksums.txt.pem \\"
             echo "  --signature checksums.txt.sig \\"
             echo "  --certificate-identity-regexp 'https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+' \\"
             echo "  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \\"
             echo "  checksums.txt"
-            echo '```'
+            echo "${FENCE}"
             echo
             if [ -n "${PREV_TAG}" ]; then
               echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG}...${VERSION}"
