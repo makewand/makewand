@@ -263,7 +263,7 @@ func TestCheckSandboxGoToolchain(t *testing.T) {
 }
 
 func TestIsBwrapSetupFailure(t *testing.T) {
-	if !isBwrapSetupFailure(&ExecResult{ExitCode: 1, Stderr: "bwrap: Can't mkdir /home/u/.aws: Read-only file system\n"}) {
+	if !isBwrapSetupFailure(&ExecResult{ExitCode: 1, Stderr: "bwrap: Can't mkdir /home/alice/.aws: Read-only file system\n"}) {
 		t.Fatal("bwrap mount failure not recognized")
 	}
 	if isBwrapSetupFailure(&ExecResult{ExitCode: 1, Stderr: "FAIL: TestX\n"}) {
