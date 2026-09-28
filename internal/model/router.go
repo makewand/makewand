@@ -204,7 +204,18 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	// Register per-instance factories for dynamic resolution in mode-based
 	// routing, so concurrent routers built from different configs never share
 	// factory closures.
+	//
+	// An explicit `claude_access: "api"` / `gemini_access: "api"` (honored only
+	// under allow_paid, where the key survived the policy snapshot above) wins
+	// over an installed subscription CLI here too, mirroring the static
+	// registration: otherwise every mode-routed path would silently run the CLI
+	// while the router accounts for it as API access.
+	claudeExplicitAPI := strings.EqualFold(strings.TrimSpace(cfg.ClaudeAccess), "api") && cfg.ClaudeAPIKey != ""
+	geminiExplicitAPI := strings.EqualFold(strings.TrimSpace(cfg.GeminiAccess), "api") && cfg.GeminiAPIKey != ""
 	_ = r.RegisterProviderFactory("claude", func(modelID string) (Provider, error) {
+		if claudeExplicitAPI {
+			return NewClaude(cfg.ClaudeAPIKey, modelID), nil
+		}
 		if cli := cfg.GetCLI("claude"); cli != nil {
 			return NewClaudeCLI(cli.BinPath), nil
 		}
@@ -223,6 +234,9 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 		return nil, fmt.Errorf("codex not configured")
 	})
 	_ = r.RegisterProviderFactory("gemini", func(modelID string) (Provider, error) {
+		if geminiExplicitAPI {
+			return NewGemini(cfg.GeminiAPIKey, modelID), nil
+		}
 		// Prefer agy (Antigravity) — the current transport for personal Gemini
 		// subscriptions — over the metered `gemini -p` / API key paths.
 		if cli := cfg.GetCLI("agy"); cli != nil {
