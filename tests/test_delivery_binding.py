@@ -1,5 +1,10 @@
 """Real-Git delivery regressions: immutable reviewed commits and mixed tests."""
 
+try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
+    import _isolation  # noqa: F401
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests import _isolation  # noqa: F401
+
 import contextlib
 import io
 import json
@@ -40,12 +45,13 @@ class DeliveryBindingTests(unittest.TestCase):
         shutil.copytree(self.base, self.shadow)
         self.branch = "makewand/delivery-regression"
         self.reviewed = False
-        self.artifacts_before = set(Path("/tmp/makewand-artifacts").glob("delivery_*"))
+        self.artifacts_root = _isolation.artifacts_root()
+        self.artifacts_before = set(self.artifacts_root.glob("delivery_*"))
         self.addCleanup(self.clean_artifacts)
 
     def delivery_artifacts(self):
         result = set()
-        for path in set(Path("/tmp/makewand-artifacts").glob("delivery_*")) - self.artifacts_before:
+        for path in set(self.artifacts_root.glob("delivery_*")) - self.artifacts_before:
             manifest = path / "delivery_manifest.json"
             if manifest.exists() and json.loads(manifest.read_text()).get("repo_root") == str(self.base):
                 result.add(path)

@@ -12,7 +12,13 @@ Comprehensive Verification Tests for v3.1.0 Full Audit Remediations:
 10. Subprocess pipe file descriptor leak protection.
 """
 
+try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
+    import _isolation  # noqa: F401
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests import _isolation  # noqa: F401
+
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -35,6 +41,20 @@ from makewand.providers.muse import execute_muse_task
 from makewand.providers.aider import execute_aider_task
 from makewand.providers.agy import execute_agy_task
 from makewand.interactive import handle_conversational_turn
+
+
+def _read_text(path):
+    try:
+        return Path(path).read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def _patch_stamp(directory):
+    try:
+        return (Path(directory) / "rejected.patch").stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 class TestAuditV31Fixes(unittest.TestCase):
@@ -438,11 +458,20 @@ class TestAuditV31Fixes(unittest.TestCase):
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=buggy_coder), \
                  patch("makewand.orchestrator.execute_codex_task", return_value=(True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"bug\"]}", None)):
+                art_base = _isolation.artifacts_root()
+                rej_before = {d: _patch_stamp(d) for d in art_base.glob("rejected_*")}
                 run_pipeline("fix code", cwd=td, stream=False, auto_fix=False, force_code=True)
-                rej_dirs = list(Path("/tmp/makewand-artifacts").glob("rejected_*"))
+                # Only this task's rejection: other tests/processes may share a legacy
+                # fixed artifacts path, and rejected_<second> names can be reused
+                # within one second, so match on a fresh patch with our content.
+                rej_dirs = [d for d in art_base.glob("rejected_*")
+                            if _patch_stamp(d) != rej_before.get(d)
+                            and "committed bug" in _read_text(d / "rejected.patch")]
+                for rej in rej_dirs:
+                    if rej not in rej_before:  # never delete a directory we did not create
+                        self.addCleanup(shutil.rmtree, rej, True)
                 self.assertTrue(len(rej_dirs) > 0)
-                latest_rej = sorted(rej_dirs, key=lambda d: d.stat().st_mtime)[-1]
-                patch_file = latest_rej / "rejected.patch"
+                patch_file = rej_dirs[0] / "rejected.patch"
                 self.assertTrue(patch_file.exists())
                 self.assertIn("committed bug", patch_file.read_text())
 

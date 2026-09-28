@@ -4,6 +4,11 @@ Verifies HTTP requests, retries with exponential backoff, status code handling (
 network timeouts, token headers, streaming parsing, and multi-provider dispatching.
 """
 
+try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
+    import _isolation  # noqa: F401
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests import _isolation  # noqa: F401
+
 import io
 import json
 import socket
