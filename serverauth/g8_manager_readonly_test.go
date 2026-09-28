@@ -38,7 +38,10 @@ func TestG8_ManagerFailedPersistenceLeavesStateConsistent(t *testing.T) {
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700); _ = os.Chmod(path, 0o600) })
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o700) //nolint:gosec // G302: restoring a private test directory's owner-only permissions.
+		_ = os.Chmod(path, 0o600)
+	})
 
 	authenticates := func(secret string) bool {
 		req := httptest.NewRequest("GET", "/v1/models", nil)
@@ -73,7 +76,7 @@ func TestG8_ManagerFailedPersistenceLeavesStateConsistent(t *testing.T) {
 	}
 
 	// Once the file is writable again the same calls succeed and persist.
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: owner-only test directory.
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {

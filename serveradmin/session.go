@@ -184,7 +184,7 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 	if err == nil && user != nil {
 		passwordOK = user.ValidatePassword(payload.Password)
 	} else {
-		timingEqualizerUser.ValidatePassword(payload.Password)
+		_ = timingEqualizerUser.ValidatePassword(payload.Password)
 	}
 	if !passwordOK || !user.IsActive {
 		m.limiter.RecordFailure(key, time.Now().UTC())
