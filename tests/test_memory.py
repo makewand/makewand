@@ -15,8 +15,11 @@ from unittest.mock import patch
 
 from makewand.memory import (
     record_autofix_lesson,
+    record_failure_pattern,
     get_relevant_hints,
+    get_kibitzer_nudges,
     format_memory_hints_for_prompt,
+    format_kibitzer_guidance,
     _load_patterns,
     _save_patterns,
 )
@@ -77,6 +80,37 @@ class TestMemory(unittest.TestCase):
         # Ensure subsequent operations proceed normally without hanging on stale locks
         hints = get_relevant_hints("concurrency")
         self.assertIsInstance(hints, list)
+
+    def test_kibitzer_nudges_and_formatting(self):
+        # Implementation stage nudges
+        nudges = get_kibitzer_nudges("Refactor goroutine and unbuffered channel handling in Go worker", stage="implementation")
+        self.assertTrue(len(nudges) >= 1)
+        self.assertTrue(any("Go goroutine leaks" in n["focus"] for n in nudges))
+
+        guidance_impl = format_kibitzer_guidance("Refactor goroutine and unbuffered channel handling in Go worker", stage="implementation")
+        self.assertIn("【Makewand Kibitzer 实时工程质量与避坑护航】", guidance_impl)
+        self.assertIn("避坑要点:", guidance_impl)
+        self.assertIn("质量准则:", guidance_impl)
+
+        # Review stage nudges
+        guidance_rev = format_kibitzer_guidance("Review rust borrow checker and unwrap usage", stage="review")
+        self.assertIn("【Makewand Kibitzer 独立审计核查要点】", guidance_rev)
+        self.assertIn("核验隐患:", guidance_rev)
+        self.assertIn("验收准则:", guidance_rev)
+
+        # Unmatched query
+        self.assertEqual(format_kibitzer_guidance("completely unrelated 98765"), "")
+
+    def test_record_failure_pattern(self):
+        ok = record_failure_pattern(
+            issue="Socket FD leak in HTTP client keep-alive",
+            lesson="Always invoke resp.Body.Close() or configure Transport.ResponseHeaderTimeout",
+            keywords=["socket", "http_client", "fd_leak"]
+        )
+        self.assertTrue(ok)
+        nudges = get_kibitzer_nudges("Fix http_client socket connections", stage="implementation")
+        self.assertTrue(len(nudges) >= 1)
+        self.assertTrue(any("Socket FD leak" in n["focus"] for n in nudges))
 
 if __name__ == "__main__":
     unittest.main()

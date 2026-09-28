@@ -432,6 +432,30 @@ def cmd_search(args):
         print(f"{c(r['file'], COLOR_CYAN)}:{c(str(r['line_num']), COLOR_YELLOW)}: {r['content']}")
     print(c(f"\n共找到 {len(results)} 条匹配结果 (已自动避开冷归档、SQLite 数据库、模型与虚拟环境)。", COLOR_GREEN))
 
+def cmd_repomap(args):
+    """Generate concise repository symbol map (AST/regex extracted)."""
+    from makewand.repomap import generate_repo_map
+    cwd = getattr(args, "cwd", None) or os.getcwd()
+    max_lines = getattr(args, "max_lines", 80)
+    max_files = getattr(args, "max_files", 40)
+    repomap = generate_repo_map(cwd=cwd, max_lines=max_lines, max_files=max_files)
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps({
+            "cwd": cwd,
+            "repomap": repomap,
+            "lines": len(repomap.splitlines()) if repomap else 0
+        }, ensure_ascii=False, indent=2))
+    else:
+        if repomap:
+            print(c("\n============================================================", COLOR_BOLD))
+            print(c("       Makewand 代码库全局架构感知拓扑 (Repo-Map)", COLOR_BOLD + COLOR_CYAN))
+            print(c("============================================================\n", COLOR_BOLD))
+            print(repomap)
+            print()
+        else:
+            print("未在当前工作区发现有效代码符号或工作区为空。")
+
 def cmd_sandbox(args):
     """Run command inside bubblewrap process sandbox."""
     from makewand.sandbox import run_in_sandbox
@@ -518,8 +542,12 @@ def cmd_inspect(args):
         print(diff if diff else "无有效代码变更")
     else:
         print(c("--- 两位选手表现对比 ---", COLOR_BOLD))
-        print(f"选手 A [{cand_a.get('model')}]: 耗时={cand_a.get('duration')}s, Diff大小={len(cand_a.get('diff', ''))} 字节, 状态={'成功' if cand_a.get('success') else '失败'}")
-        print(f"选手 B [{cand_b.get('model')}]: 耗时={cand_b.get('duration')}s, Diff大小={len(cand_b.get('diff', ''))} 字节, 状态={'成功' if cand_b.get('success') else '失败'}")
+        pars_a = cand_a.get("parsimony", {})
+        pars_b = cand_b.get("parsimony", {})
+        pars_info_a = f", 精简度={pars_a.get('parsimony_ratio', 1.0):.2f}" if pars_a else ""
+        pars_info_b = f", 精简度={pars_b.get('parsimony_ratio', 1.0):.2f}" if pars_b else ""
+        print(f"选手 A [{cand_a.get('model')}]: 耗时={cand_a.get('duration')}s, Diff大小={len(cand_a.get('diff', ''))} 字节{pars_info_a}, 状态={'成功' if cand_a.get('success') else '失败'}")
+        print(f"选手 B [{cand_b.get('model')}]: 耗时={cand_b.get('duration')}s, Diff大小={len(cand_b.get('diff', ''))} 字节{pars_info_b}, 状态={'成功' if cand_b.get('success') else '失败'}")
         print()
         if race.get("judge_report"):
             print(c("--- 裁判裁决报告 ---", COLOR_BOLD))
@@ -724,6 +752,13 @@ def main():
     p_search.add_argument("--max-results", type=int, default=150, help="Maximum matches to return (default: 150)")
     p_search.add_argument("--max-depth", type=int, default=6, help="Maximum directory depth (default: 6)")
 
+    # repomap (codebase architecture symbol map)
+    p_repomap = subparsers.add_parser("repomap", help="Generate concise repository symbol map (AST/regex extracted)", parents=[sub_common_parser])
+    p_repomap.add_argument("--cwd", help="Root directory to map (default: current directory)")
+    p_repomap.add_argument("--max-lines", type=int, default=80, help="Max lines of repo map output (default: 80)")
+    p_repomap.add_argument("--max-files", type=int, default=40, help="Max files to include in repo map (default: 40)")
+    p_repomap.add_argument("--json", action="store_true", help="Output repo map in JSON format")
+
     # sandbox (bubblewrap process isolation)
     p_sb = subparsers.add_parser("sandbox", help="Run shell command inside bubblewrap process sandbox", parents=[sub_common_parser])
     p_sb.add_argument("--cwd", help="Target working directory (default: current directory)")
@@ -879,7 +914,7 @@ def main():
         "claude", "codex", "agy", "grok", "muse", "local", "aider", "deepseek", "qwen", "glm", "kimi",
         "openrouter", "siliconflow", "cursor", "copilot",
         "observe", "candidates", "inspect", "apply", "discard",
-        "enable", "disable"
+        "enable", "disable", "repomap"
     }
     # If user invokes `makewand "do something"` or `makewand --repo-trust untrusted "do something"`, automatically route to `makewand run ...`
     is_auto_routed_run = False
@@ -976,6 +1011,8 @@ def main():
         cmd_disable(args)
     elif args.subcommand == "search":
         cmd_search(args)
+    elif args.subcommand == "repomap":
+        cmd_repomap(args)
     elif args.subcommand == "sandbox":
         cmd_sandbox(args)
     elif args.subcommand == "claude":

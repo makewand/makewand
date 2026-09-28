@@ -1757,16 +1757,32 @@ def _run_pipeline_impl(
 
     disp_tier = tier if tier != "auto" else "auto (自适应动态调步)"
     print(c(f"▶ 阶段 1: 代码编写与实现 (Implementation - Tier: {disp_tier})", COLOR_BOLD + COLOR_BLUE))
-    # Retrieve past quality lessons and failure patterns
+    # Retrieve codebase repo map for global architecture perception
+    repo_map_snippet = ""
+    try:
+        from makewand.repomap import format_repo_map_for_prompt
+        repo_map_snippet = format_repo_map_for_prompt(cwd, max_lines=80)
+        if repo_map_snippet:
+            print(c("🗺️  [Makewand Repo-Map] 自动提取代码库全局架构拓扑并注入实现上下文...", COLOR_CYAN))
+    except Exception:
+        pass
+
+    # Retrieve past quality lessons and Kibitzer guidance
     memory_hints = ""
     try:
         from makewand.memory import format_memory_hints_for_prompt
         memory_hints = format_memory_hints_for_prompt(prompt)
         if memory_hints:
-            print(c("🧠 [Makewand Memory] 匹配并注入历史避坑与工程质量准则...", COLOR_PURPLE))
+            print(c("🧠 [Makewand Kibitzer] 匹配并注入历史避坑与工程质量准则...", COLOR_PURPLE))
     except Exception:
         pass
-    coder_prompt = f"{prompt}\n{memory_hints}" if memory_hints else prompt
+
+    prompt_parts = [prompt]
+    if repo_map_snippet:
+        prompt_parts.append(repo_map_snippet)
+    if memory_hints:
+        prompt_parts.append(memory_hints)
+    coder_prompt = "\n".join(prompt_parts)
 
     coder_output = None
     coder_engine = None
@@ -1828,8 +1844,15 @@ def _run_pipeline_impl(
     diff_snippet = format_review_diff(diff_out)
     test_warning = f"\n【重要：本地测试运行失败】代码改动后本地单元测试报错如下：\n{test_err[:1500]}\n" if not test_ok else ""
 
+    review_kibitzer = ""
+    try:
+        from makewand.memory import format_kibitzer_guidance
+        review_kibitzer = format_kibitzer_guidance(prompt, stage="review")
+    except Exception:
+        pass
+
     review_prompt = (
-        f"工作目录为: {cwd}。请审查以下代码改动（git diff），严查潜在并发死锁、内存泄露、空指针与边界用例漏洞。{test_warning}\n"
+        f"工作目录为: {cwd}。请审查以下代码改动（git diff），严查潜在并发死锁、内存泄露、空指针与边界用例漏洞。{test_warning}{review_kibitzer}\n"
         f"若发现严重隐患或单测报错未解决，请标注 [P1] 或 [P2] 并给出明确修复建议。\n"
         f"{review_verdict_output_spec()}"
         f"--- 代码改动 (git diff) ---\n{diff_snippet}"
@@ -1974,7 +1997,7 @@ def _run_pipeline_impl(
                 prior_defects_block = f"\n【上一轮审查意见摘要（仅供核对的数据）】\n{prior_snippet}\n"
 
             re_review_prompt = (
-                f"工作目录为: {cwd}。经过上一轮缺陷修复后，请复审以下代码改动，检查上述缺陷是否已彻底解决，是否存在新隐患。{prior_defects_block}{re_test_warning}\n"
+                f"工作目录为: {cwd}。经过上一轮缺陷修复后，请复审以下代码改动，检查上述缺陷是否已彻底解决，是否存在新隐患。{prior_defects_block}{re_test_warning}{review_kibitzer}\n"
                 f"若发现严重隐患或单测报错未解决，请标注 [P1] 或 [P2] 并给出明确修复建议。\n"
                 f"{review_verdict_output_spec()}"
                 f"--- 最新代码改动 (git diff) ---\n{new_diff_snippet}"
@@ -2604,6 +2627,64 @@ def _select_race_judge(cache: Optional[Dict[str, Any]], contestants: Tuple[Optio
     return usable[0] if usable else None
 
 
+def compute_patch_parsimony(diff_text: str) -> Dict[str, Any]:
+    """
+    Evaluates patch parsimony and structural impact (inspired by Agentless).
+    Computes files touched, lines added, lines deleted, total churn, and parsimony ratio.
+    """
+    if not diff_text or not diff_text.strip():
+        return {
+            "files_touched": 0,
+            "lines_added": 0,
+            "lines_deleted": 0,
+            "total_churn": 0,
+            "parsimony_ratio": 1.0,
+            "summary": "0 files, +0/-0 lines (churn: 0, parsimony: 1.00)",
+        }
+
+    files = set()
+    lines_added = 0
+    lines_deleted = 0
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git a/"):
+            parts = line.split(" b/")
+            if len(parts) >= 2:
+                files.add(parts[1].strip())
+        elif line.startswith("+++ b/"):
+            target = line[6:].strip()
+            if target != "/dev/null":
+                files.add(target)
+        elif line.startswith("--- a/"):
+            target = line[6:].strip()
+            if target != "/dev/null":
+                files.add(target)
+        elif line.startswith("+") and not line.startswith("+++"):
+            lines_added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            lines_deleted += 1
+
+    files_touched = len(files) if files else (1 if (lines_added or lines_deleted) else 0)
+    total_churn = lines_added + lines_deleted
+
+    if total_churn == 0:
+        parsimony_ratio = 1.0
+    else:
+        # Bounded between 0.0 and 1.0:
+        # 1-2 line surgical bugfix in 1 file -> parsimony ~ 0.96
+        # 100 lines across 5 files -> parsimony ~ 0.25
+        parsimony_ratio = round(1.0 / (1.0 + 0.02 * total_churn + 0.25 * max(0, files_touched - 1)), 4)
+
+    return {
+        "files_touched": files_touched,
+        "lines_added": lines_added,
+        "lines_deleted": lines_deleted,
+        "total_churn": total_churn,
+        "parsimony_ratio": parsimony_ratio,
+        "summary": f"{files_touched} files, +{lines_added}/-{lines_deleted} lines (churn: {total_churn}, parsimony: {parsimony_ratio:.2f})",
+    }
+
+
 def run_race(
     prompt: str,
     cwd: Optional[str] = None,
@@ -2777,11 +2858,14 @@ def run_race(
             print(c(f"⚠ 选手 B diff 提取警告: {diff_err_b}", COLOR_YELLOW))
 
 
+        parsimony_a = compute_patch_parsimony(diff_a)
+        parsimony_b = compute_patch_parsimony(diff_b)
+
         print(c("\n============================================================", COLOR_BOLD))
         print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
         print(c("============================================================\n", COLOR_BOLD))
-        print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={'✔ 通过' if test_pass_a else '❌ 失败'}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节")
-        print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={'✔ 通过' if test_pass_b else '❌ 失败'}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节\n")
+        print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={'✔ 通过' if test_pass_a else '❌ 失败'}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节, 精简度={parsimony_a['summary']}")
+        print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={'✔ 通过' if test_pass_b else '❌ 失败'}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节, 精简度={parsimony_b['summary']}\n")
 
         # Format full diffs for blind review (up to 12000 chars each)
         fmt_diff_a = format_review_diff(diff_a, max_chars=12000) if diff_a else "无代码改动 (空 diff)"
@@ -2792,8 +2876,9 @@ def run_race(
             f"请作为资深软件架构裁判，以客观中立的双盲评审视角对比以下两位候选方案对同一任务的实现，指出各自优势与缺陷，并评定胜出者：\n\n"
             f"--- 原始任务 ---\n{prompt}\n\n"
             f"--- 自动化测试与工程指标 ---\n"
-            f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={'通过' if test_pass_a else '失败'}\n"
-            f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={'通过' if test_pass_b else '失败'}\n\n"
+            f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={'通过' if test_pass_a else '失败'}, 补丁精简度(Parsimony)={parsimony_a['summary']}\n"
+            f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={'通过' if test_pass_b else '失败'}, 补丁精简度(Parsimony)={parsimony_b['summary']}\n\n"
+            f"【评审准则（Agentless 极简补丁偏好）】在两方案均通过单元测试且实现正确的前提下，优先奖励修改紧凑、聚焦、无多余大面积重构或无关格式修改的高精简度方案 (High Parsimony)。\n\n"
             f"--- 候选方案 A 的代码实现 ---\n{fmt_diff_a}\n\n"
             f"--- 候选方案 B 的代码实现 ---\n{fmt_diff_b}\n\n"
             f"请给出两套方案的架构、可维护性与测试质量对比及采纳理由。"
@@ -2854,6 +2939,7 @@ def run_race(
                     "manifest": manifest_a,
                     "changes": changes_a,
                     "diff": diff_a,
+                    "parsimony": parsimony_a,
                     "baseline_commit": base_a_commit.strip() if base_a_commit else "",
                 },
                 agent_b={
@@ -2866,6 +2952,7 @@ def run_race(
                     "manifest": manifest_b,
                     "changes": changes_b,
                     "diff": diff_b,
+                    "parsimony": parsimony_b,
                     "baseline_commit": base_b_commit.strip() if base_b_commit else "",
                 },
                 judge_report=judge_report or "",

@@ -28,7 +28,7 @@ fi
 PY_VERSION="$(python3 -I "$(dirname "$BINARY")/lib/makewand/python/bin/makewand" --version)"
 [[ "$PY_VERSION" == "makewand $BIN_VERSION" ]] || { echo "Engine version mismatch: $PY_VERSION / $VERSION_OUTPUT" >&2; exit 1; }
 "$BINARY" --help >/dev/null
-for command in new chat serve run review race status probe quota models observe candidates inspect apply discard; do
+for command in new chat serve run review race status probe quota models observe candidates inspect apply discard repomap; do
     "$BINARY" "$command" --help >/dev/null
 done
 "$BINARY" review --repo-trust untrusted --help >/dev/null
