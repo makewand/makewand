@@ -533,10 +533,16 @@ def cmd_inspect(args):
     cand_b = race.get("candidates", {}).get("B", {})
 
     if cand == "A":
+        pars_a = cand_a.get("parsimony", {})
+        if pars_a:
+            print(c(f"--- 选手 A ({cand_a.get('model')}) 补丁精简度: {pars_a.get('summary', '')} ---", COLOR_CYAN + COLOR_BOLD))
         print(c(f"--- 选手 A ({cand_a.get('model')}) 改动详情 (git diff) ---", COLOR_CYAN + COLOR_BOLD))
         diff = cand_a.get("diff", "")
         print(diff if diff else "无有效代码变更")
     elif cand == "B":
+        pars_b = cand_b.get("parsimony", {})
+        if pars_b:
+            print(c(f"--- 选手 B ({cand_b.get('model')}) 补丁精简度: {pars_b.get('summary', '')} ---", COLOR_BLUE + COLOR_BOLD))
         print(c(f"--- 选手 B ({cand_b.get('model')}) 改动详情 (git diff) ---", COLOR_BLUE + COLOR_BOLD))
         diff = cand_b.get("diff", "")
         print(diff if diff else "无有效代码变更")

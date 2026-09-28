@@ -9,6 +9,7 @@ global architecture context without overloading the context window.
 import ast
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -33,8 +34,31 @@ DEFAULT_IGNORE_DIRS: Set[str] = {
     "site-packages",
 }
 
+# Supported file extensions for symbol extraction
+SUPPORTED_EXTENSIONS: Set[str] = {
+    ".py", ".go", ".ts", ".tsx", ".js", ".jsx", ".rs",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
+}
+
 # Max file size to parse (skip massive generated files)
 MAX_FILE_SIZE_BYTES = 256 * 1024
+
+
+def _extract_balanced_parens(s: str, start_pos: int) -> Tuple[str, int]:
+    """Extracts content inside balanced parentheses starting at start_pos."""
+    depth = 1
+    i = start_pos
+    s_len = len(s)
+    while i < s_len and depth > 0:
+        ch = s[i]
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        i += 1
+    if depth == 0:
+        return s[start_pos:i - 1], i
+    return "", -1
 
 
 def _extract_python_symbols(content: str) -> List[str]:
@@ -45,17 +69,49 @@ def _extract_python_symbols(content: str) -> List[str]:
     except Exception:
         return []
 
-    for node in tree.body:
+    def _node_priority(node: ast.AST) -> int:
+        if isinstance(node, ast.ClassDef):
+            return 0 if not node.name.startswith("_") else 2
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return 1 if not node.name.startswith("_") else 3
+        return 4
+
+    for node in sorted(tree.body, key=_node_priority):
         if isinstance(node, ast.ClassDef):
             symbols.append(f"  class {node.name}:")
-            for item in node.body:
+            def _method_priority(m: ast.AST) -> int:
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if m.name == "__init__":
+                        return 0
+                    if not m.name.startswith("_"):
+                        return 1
+                    return 2
+                return 3
+
+            for item in sorted(node.body, key=_method_priority):
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    args = [a.arg for a in item.args.args if a.arg != "self" and a.arg != "cls"]
+                    args = []
+                    if hasattr(item.args, "posonlyargs"):
+                        for a in item.args.posonlyargs:
+                            if a.arg not in ("self", "cls"):
+                                args.append(a.arg)
+                    for a in item.args.args:
+                        if a.arg not in ("self", "cls"):
+                            args.append(a.arg)
+                    for a in item.args.kwonlyargs:
+                        args.append(a.arg)
                     arg_str = ", ".join(args[:4]) + ("..." if len(args) > 4 else "")
                     prefix = "async def" if isinstance(item, ast.AsyncFunctionDef) else "def"
                     symbols.append(f"    {prefix} {item.name}({arg_str})")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            args = [a.arg for a in node.args.args]
+            args = []
+            if hasattr(node.args, "posonlyargs"):
+                for a in node.args.posonlyargs:
+                    args.append(a.arg)
+            for a in node.args.args:
+                args.append(a.arg)
+            for a in node.args.kwonlyargs:
+                args.append(a.arg)
             arg_str = ", ".join(args[:4]) + ("..." if len(args) > 4 else "")
             prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
             symbols.append(f"  {prefix} {node.name}({arg_str})")
@@ -65,18 +121,31 @@ def _extract_python_symbols(content: str) -> List[str]:
 def _extract_go_symbols(content: str) -> List[str]:
     """Extracts Go types, interfaces, structs, and functions."""
     symbols = []
-    # Match type Foo struct / interface
-    type_pattern = re.compile(r"^\s*type\s+([A-Za-z0-9_]+)\s+(struct|interface)", re.MULTILINE)
+
+    # Match grouped type (...) blocks
+    type_block_pattern = re.compile(r"^\s*type\s*\(([^)]+)\)", re.MULTILINE)
+    for tb in type_block_pattern.finditer(content):
+        block_text = tb.group(1)
+        for line in block_text.splitlines():
+            m = re.match(r"^\s*([A-Za-z0-9_]+)\s*(=?\s*[A-Za-z0-9_*\[\]]+(?:\.[A-Za-z0-9_]+)?)", line)
+            if m:
+                symbols.append(f"  type {m.group(1)} {m.group(2)}")
+
+    # Match single type Foo struct / interface / alias / etc
+    type_pattern = re.compile(r"^\s*type\s+([A-Za-z0-9_]+)\s+([A-Za-z0-9_*\[\]]+(?:\.[A-Za-z0-9_]+)?)", re.MULTILINE)
     for m in type_pattern.finditer(content):
+        if m.group(1) == "(":
+            continue
         symbols.append(f"  type {m.group(1)} {m.group(2)}")
 
-    # Match func (r *Receiver) Method(args) ... or func Foo(args) ...
-    func_pattern = re.compile(r"^\s*func\s+(?:\(([^)]+)\)\s+)?([A-Za-z0-9_]+)\s*\(([^)]*)\)", re.MULTILINE)
+    # Match func (r *Receiver) Method(args) ... or func Foo[T any](args) ...
+    func_pattern = re.compile(r"^\s*func\s+(?:\(([^)]+)\)\s+)?([A-Za-z0-9_]+)\s*(?:\[[^\]]*\])?\s*\(", re.MULTILINE)
     for m in func_pattern.finditer(content):
-        recv, name, args = m.groups()
+        recv, name = m.groups()
         if name.startswith("Test") or name.startswith("Benchmark") or name.startswith("Example"):
             continue
-        clean_args = re.sub(r"\s+", " ", args.strip())
+        raw_args, _ = _extract_balanced_parens(content, m.end())
+        clean_args = re.sub(r"\s+", " ", raw_args.strip())
         if len(clean_args) > 30:
             clean_args = clean_args[:27] + "..."
         if recv:
@@ -84,34 +153,40 @@ def _extract_go_symbols(content: str) -> List[str]:
             symbols.append(f"  func ({clean_recv}) {name}({clean_args})")
         else:
             symbols.append(f"  func {name}({clean_args})")
+
     return symbols
 
 
 def _extract_ts_js_symbols(content: str) -> List[str]:
-    """Extracts TypeScript / JavaScript classes, interfaces, and exported functions."""
+    """Extracts TypeScript / JavaScript classes, interfaces, types, enums, and functions."""
     symbols = []
-    # Classes & Interfaces & Types
-    class_pattern = re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(class|interface|type)\s+([A-Za-z0-9_]+)", re.MULTILINE)
+    # Classes & Interfaces & Types & Enums
+    class_pattern = re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(class|interface|type|enum)\s+([A-Za-z0-9_]+)", re.MULTILINE)
     for m in class_pattern.finditer(content):
         symbols.append(f"  {m.group(1)} {m.group(2)}")
 
-    # Functions
-    func_pattern = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", re.MULTILINE)
+    # Functions: export function foo(args) or async function foo(args)
+    func_pattern = re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(", re.MULTILINE)
     for m in func_pattern.finditer(content):
-        name, args = m.groups()
-        clean_args = re.sub(r"\s+", " ", args.strip())
+        name = m.group(1)
+        raw_args, _ = _extract_balanced_parens(content, m.end())
+        clean_args = re.sub(r"\s+", " ", raw_args.strip())
         if len(clean_args) > 30:
             clean_args = clean_args[:27] + "..."
         symbols.append(f"  function {name}({clean_args})")
 
-    # Arrow functions / const functions: export const foo = (...) =>
-    arrow_pattern = re.compile(r"^\s*(?:export\s+)?const\s+([A-Za-z0-9_]+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>", re.MULTILINE)
+    # Arrow functions / const functions: export const foo = (...) => or const foo = async (...) =>
+    arrow_pattern = re.compile(r"^\s*(?:export\s+)?const\s+([A-Za-z0-9_]+)\s*(?::\s*[^=]+)?=\s*(?:async\s*)?(?:<[^>]*>)?\s*\(", re.MULTILINE)
     for m in arrow_pattern.finditer(content):
-        name, args = m.groups()
-        clean_args = re.sub(r"\s+", " ", args.strip())
-        if len(clean_args) > 30:
-            clean_args = clean_args[:27] + "..."
-        symbols.append(f"  const {name}({clean_args})")
+        name = m.group(1)
+        raw_args, end_pos = _extract_balanced_parens(content, m.end())
+        rest = content[end_pos:end_pos + 40]
+        if "=>" in rest:
+            clean_args = re.sub(r"\s+", " ", raw_args.strip())
+            if len(clean_args) > 30:
+                clean_args = clean_args[:27] + "..."
+            symbols.append(f"  const {name}({clean_args})")
+
     return symbols
 
 
@@ -128,26 +203,53 @@ def _extract_rust_symbols(content: str) -> List[str]:
 
     # Functions
     fn_pattern = re.compile(
-        r"^\s*(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern(?:\s+\"[^\"]+\")?\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)",
+        r"^\s*(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern(?:\s+\"[^\"]+\")?\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(",
         re.MULTILINE,
     )
     for m in fn_pattern.finditer(content):
-        name, args = m.groups()
+        name = m.group(1)
         if name.startswith("test_") or name.startswith("bench_"):
             continue
-        clean_args = re.sub(r"\s+", " ", args.strip())
+        raw_args, _ = _extract_balanced_parens(content, m.end())
+        clean_args = re.sub(r"\s+", " ", raw_args.strip())
         if len(clean_args) > 30:
             clean_args = clean_args[:27] + "..."
         symbols.append(f"  fn {name}({clean_args})")
 
-    # Impl blocks
+    # Impl blocks with trait bounds, lifetimes, and path qualifiers
     impl_pattern = re.compile(
-        r"^\s*impl(?:\s*<[^>]*>)?\s+([A-Za-z0-9_]+(?:\s+for\s+[A-Za-z0-9_]+)?)",
+        r"^\s*impl(?:\s*<[^>]*>)?\s+([A-Za-z0-9_:<>\s&'*+(),]+?)(?:\s+where\b|\s*\{)",
         re.MULTILINE,
     )
     for m in impl_pattern.finditer(content):
-        target = m.group(1).strip()
-        symbols.append(f"  impl {target}")
+        target = re.sub(r"\s+", " ", m.group(1).strip())
+        if target:
+            symbols.append(f"  impl {target}")
+
+    return symbols
+
+
+def _extract_c_cpp_symbols(content: str) -> List[str]:
+    """Extracts C and C++ classes, structs, enums, and top-level functions."""
+    symbols = []
+    # Classes, Structs, Enums
+    type_pattern = re.compile(r"^\s*(?:typedef\s+)?(class|struct|enum(?:\s+class)?)\s+([A-Za-z0-9_]+)", re.MULTILINE)
+    for m in type_pattern.finditer(content):
+        kind = m.group(1)
+        name = m.group(2)
+        symbols.append(f"  {kind} {name}")
+
+    # Functions
+    func_pattern = re.compile(r"^\s*(?:[A-Za-z0-9_:*&<>]+\s+)+([A-Za-z0-9_]+)\s*\(", re.MULTILINE)
+    for m in func_pattern.finditer(content):
+        name = m.group(1)
+        if name in ("if", "while", "for", "switch", "catch", "return", "sizeof"):
+            continue
+        raw_args, _ = _extract_balanced_parens(content, m.end())
+        clean_args = re.sub(r"\s+", " ", raw_args.strip())
+        if len(clean_args) > 30:
+            clean_args = clean_args[:27] + "..."
+        symbols.append(f"  func {name}({clean_args})")
 
     return symbols
 
@@ -170,27 +272,113 @@ def extract_file_symbols(file_path: Path) -> List[str]:
         return _extract_ts_js_symbols(content)
     elif suffix == ".rs":
         return _extract_rust_symbols(content)
+    elif suffix in (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp"):
+        return _extract_c_cpp_symbols(content)
     return []
 
 
-def _dir_priority(d: str) -> int:
-    dl = d.lower()
-    if dl in (
-        "makewand", "internal", "cmd", "serverdb", "serverauth",
-        "serveradmin", "serverhttp", "serverui", "servermetrics",
-        "router", "src", "pkg", "lib", "core", "app"
-    ):
-        return 0
-    if any(k in dl for k in ("bench", "fixture", "test", "tests", "script", "scripts", "doc", "docs", "site")):
-        return 2
-    return 1
+def _collect_candidate_files(root: Path) -> List[str]:
+    """
+    Collects code file paths relative to root, prioritizing git-tracked files
+    if available, otherwise falling back to filesystem walk.
+    """
+    # 1. Fast path: git ls-files if inside a git repo
+    try:
+        res = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(root),
+            capture_output=True,
+            text=False,
+            timeout=5,
+        )
+        if res.returncode == 0 and res.stdout:
+            raw_entries = res.stdout.split(b"\x00")
+            git_files = []
+            for entry in raw_entries:
+                if not entry:
+                    continue
+                try:
+                    rel_p = entry.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if Path(rel_p).suffix.lower() in SUPPORTED_EXTENSIONS:
+                    git_files.append(rel_p)
+            if git_files:
+                return git_files
+    except Exception:
+        pass
+
+    # 2. Fallback: os.walk
+    collected = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in DEFAULT_IGNORE_DIRS and not d.startswith(".")]
+        rel_dir = Path(dirpath).relative_to(root)
+        if any(part in DEFAULT_IGNORE_DIRS for part in rel_dir.parts):
+            continue
+        for fname in filenames:
+            if fname.startswith("."):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in SUPPORTED_EXTENSIONS:
+                rel_p = str((Path(dirpath) / fname).relative_to(root))
+                collected.append(rel_p)
+    return collected
 
 
-def _file_priority(fname: str) -> int:
-    fn_lower = fname.lower()
-    if "test" in fn_lower or "bench" in fn_lower or "fixture" in fn_lower or "mock" in fn_lower:
-        return 1
-    return 0
+def _score_candidate_file(rel_p: str, root_name: str) -> Tuple[int, int, int, str]:
+    """
+    Hierarchical file prioritization score (lower = higher priority):
+    - Tier 0: Direct root files & core project packages (makewand, src, internal, pkg, core, router, app, lib)
+    - Tier 1: CLI entrypoint matching project name (cmd/makewand/main.go)
+    - Tier 2: General implementation files
+    - Tier 3: Test runner binaries, helper scripts (cmd/buildtest, cmd/casefix, scripts)
+    - Tier 4: Test files & benchmark suites
+    """
+    parts = Path(rel_p).parts
+    if not parts:
+        return (99, 1, 99, rel_p)
+
+    fname = parts[-1].lower()
+
+    # Test / bench file check
+    is_test_file = (
+        fname.startswith("test_")
+        or fname.endswith("_test.py")
+        or fname.endswith("_test.go")
+        or fname.endswith(".test.ts")
+        or fname.endswith(".spec.ts")
+        or fname.endswith(".test.js")
+        or fname.endswith(".spec.js")
+        or "bench" in fname
+        or "mock" in fname
+        or "fixture" in fname
+    )
+
+    # Test / bench directory check
+    is_test_dir = any(
+        any(k in part.lower() for k in ("test", "bench", "fixture", "mock", "doc", "script", "site", "example"))
+        for part in parts[:-1]
+    )
+
+    first = parts[0].lower()
+
+    if is_test_file or is_test_dir:
+        tier = 4
+    elif len(parts) == 1:
+        tier = 0
+    elif first == root_name or first in ("src", "internal", "core", "app", "pkg", "router", "lib"):
+        tier = 0
+    elif first == "cmd":
+        if len(parts) > 1 and parts[1].lower() == root_name:
+            tier = 1
+        elif any(k in parts[1].lower() for k in ("test", "fix", "versus")):
+            tier = 3
+        else:
+            tier = 2
+    else:
+        tier = 2
+
+    return (tier, 1 if is_test_file else 0, len(parts), rel_p)
 
 
 def generate_repo_map(cwd: str, max_lines: int = 80, max_files: int = 40) -> str:
@@ -202,53 +390,32 @@ def generate_repo_map(cwd: str, max_lines: int = 80, max_files: int = 40) -> str
     if not root.is_dir():
         return ""
 
+    root_name = root.name.lower()
+    candidate_files = _collect_candidate_files(root)
+    if not candidate_files:
+        return ""
+
+    # Sort candidates by architectural priority
+    sorted_files = sorted(candidate_files, key=lambda f: _score_candidate_file(f, root_name))
+
     file_symbols: Dict[str, List[str]] = {}
-    total_found_files = 0
+    total_processed_files = 0
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Exclude ignored directories in-place
-        dirnames[:] = [d for d in dirnames if d not in DEFAULT_IGNORE_DIRS and not d.startswith(".")]
-        # Prioritize core business/source code over test suites and benchmarks
-        dirnames.sort(key=lambda d: (_dir_priority(d), d))
-
-        rel_dir = Path(dirpath).relative_to(root)
-        if any(part in DEFAULT_IGNORE_DIRS for part in rel_dir.parts):
-            continue
-
-        # Prioritize non-test implementation files
-        sorted_files = sorted(filenames, key=lambda f: (_file_priority(f), f))
-
-        for fname in sorted_files:
-            if fname.startswith("."):
-                continue
-            ext = os.path.splitext(fname)[1].lower()
-            if ext not in (".py", ".go", ".ts", ".tsx", ".js", ".jsx", ".rs"):
-                continue
-
-            full_p = Path(dirpath) / fname
-            rel_p = str(full_p.relative_to(root))
-
-            syms = extract_file_symbols(full_p)
-            if syms:
-                file_symbols[rel_p] = syms
-                total_found_files += 1
-                if total_found_files >= max_files:
-                    break
-        if total_found_files >= max_files:
-            break
+    for rel_p in sorted_files:
+        full_p = root / rel_p
+        syms = extract_file_symbols(full_p)
+        if syms:
+            file_symbols[rel_p] = syms
+            total_processed_files += 1
+            if total_processed_files >= max_files:
+                break
 
     if not file_symbols:
         return ""
 
     output_lines: List[str] = []
-    # Sort files according to priority: core dirs first, non-test first
-    def _file_sort_key(rel_p: str) -> Tuple[int, int, str]:
-        parts = Path(rel_p).parts
-        d_prio = _dir_priority(parts[0]) if len(parts) > 1 else 0
-        f_prio = _file_priority(Path(rel_p).name)
-        return (d_prio, f_prio, rel_p)
-
-    for rel_path, syms in sorted(file_symbols.items(), key=lambda item: _file_sort_key(item[0])):
+    for rel_path in sorted(file_symbols.keys(), key=lambda f: _score_candidate_file(f, root_name)):
+        syms = file_symbols[rel_path]
         output_lines.append(f"{rel_path}:")
         for sym in syms[:8]:  # Limit top 8 symbols per file
             output_lines.append(sym)

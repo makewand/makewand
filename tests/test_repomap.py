@@ -228,5 +228,97 @@ fn test_internal_helper() {}
                 self.assertGreater(data["lines"], 0)
 
 
+    def test_extract_go_symbols_advanced(self):
+        go_code = """
+package router
+
+type (
+    Provider = string
+    Message = struct{ Text string }
+)
+
+type QuotaBand string
+
+func MapSlice[T any, R any](items []T, f func(T) R) []R {
+    return nil
+}
+"""
+        symbols = _extract_go_symbols(go_code)
+        self.assertIn("  type Provider = string", symbols)
+        self.assertIn("  type Message = struct", symbols)
+        self.assertIn("  type QuotaBand string", symbols)
+        self.assertIn("  func MapSlice(items []T, f func(T) R)", symbols)
+
+    def test_extract_ts_symbols_advanced(self):
+        ts_code = """
+export enum ServiceStatus {
+    HEALTHY = 1,
+    DEGRADED = 2,
+}
+
+export const executePipeline = async <T>(req: T, timeout: number) => {
+    return true;
+};
+"""
+        symbols = _extract_ts_js_symbols(ts_code)
+        self.assertIn("  enum ServiceStatus", symbols)
+        self.assertIn("  const executePipeline(req: T, timeout: number)", symbols)
+
+    def test_extract_rust_symbols_advanced(self):
+        rs_code = """
+impl<T: Send + Sync> TaskProcessor for Box<dyn TaskProcessor + T> where T: 'static {
+    fn process(&self) {}
+}
+
+impl std::fmt::Display for TaskQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
+}
+"""
+        symbols = _extract_rust_symbols(rs_code)
+        self.assertIn("  impl TaskProcessor for Box<dyn TaskProcessor + T>", symbols)
+        self.assertIn("  impl std::fmt::Display for TaskQueue", symbols)
+
+    def test_extract_c_cpp_symbols(self):
+        cpp_code = """
+class DatabaseConnection {
+public:
+    void connect();
+};
+
+struct PacketHeader {
+    int id;
+};
+
+enum class State {
+    INIT,
+    RUNNING
+};
+
+int calculateChecksum(const char* buffer, size_t length_of_data) {
+    return 0;
+}
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+            f.write(cpp_code)
+            f_path = Path(f.name)
+        try:
+            symbols = extract_file_symbols(f_path)
+            self.assertIn("  class DatabaseConnection", symbols)
+            self.assertIn("  struct PacketHeader", symbols)
+            self.assertIn("  enum class State", symbols)
+            self.assertIn("  func calculateChecksum(const char* buffer, size_t ...)", symbols)
+        finally:
+            f_path.unlink()
+
+    def test_repomap_on_makewand_codebase(self):
+        repo_map = generate_repo_map(str(Path(__file__).resolve().parent.parent), max_lines=60)
+        self.assertTrue(
+            "makewand/orchestrator.py:" in repo_map
+            or "makewand/candidate.py:" in repo_map
+            or "makewand/cli.py:" in repo_map
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+

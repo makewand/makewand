@@ -263,6 +263,12 @@ class CandidateManager:
             agent_a["test_passed"] = agent_a.get("success", True)
         if "test_passed" not in agent_b:
             agent_b["test_passed"] = agent_b.get("success", True)
+
+        # Auto-populate patch parsimony metrics if missing
+        for agent in (agent_a, agent_b):
+            if "parsimony" not in agent and "diff" in agent:
+                from makewand.orchestrator import compute_patch_parsimony
+                agent["parsimony"] = compute_patch_parsimony(agent.get("diff", ""))
         if "path" in agent_a and os.path.exists(agent_a["path"]):
             current = build_manifest(Path(agent_a["path"]))
             if "manifest" in agent_a and agent_a["manifest"] != current:

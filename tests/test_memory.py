@@ -112,5 +112,15 @@ class TestMemory(unittest.TestCase):
         self.assertTrue(len(nudges) >= 1)
         self.assertTrue(any("Socket FD leak" in n["focus"] for n in nudges))
 
+    def test_record_failure_pattern_auto_extracts_keywords(self):
+        ok = record_failure_pattern(
+            issue="Database deadlock during transaction commit",
+            lesson="Configure statement timeout and avoid nested transactions"
+        )
+        self.assertTrue(ok)
+        hints = get_relevant_hints("database deadlock commit")
+        self.assertTrue(any("Database deadlock" in h["issue"] for h in hints))
+
+
 if __name__ == "__main__":
     unittest.main()

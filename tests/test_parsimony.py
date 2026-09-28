@@ -143,5 +143,69 @@ diff --git a/b.py b/b.py
                 config.CANDIDATES_DIR = orig_cands
 
 
+    def test_compute_patch_parsimony_spaces_and_binary(self):
+        diff_with_spaces = """diff --git a/my path/file one.py b/my path/file one.py
+--- a/my path/file one.py
++++ b/my path/file one.py
+@@ -1 +1 @@
+-old
++new
+Binary files a/assets/icon.png and b/assets/icon.png differ
+"""
+        res = compute_patch_parsimony(diff_with_spaces)
+        self.assertEqual(res["files_touched"], 2)
+        self.assertEqual(res["lines_added"], 1)
+        self.assertEqual(res["lines_deleted"], 1)
+        self.assertEqual(res["total_churn"], 2)
+
+    def test_parsimony_auto_populated_if_omitted_in_save_race(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir = Path(tmpdir)
+            orig_config = config.CONFIG_DIR
+            orig_cands = config.CANDIDATES_DIR
+            try:
+                config.CONFIG_DIR = test_dir / "config"
+                config.CANDIDATES_DIR = config.CONFIG_DIR / "candidates"
+                config.ensure_config_dir()
+
+                race_id = "rc_auto_pars_test"
+                wt_a = config.CANDIDATES_DIR / race_id / "agent_a"
+                wt_b = config.CANDIDATES_DIR / race_id / "agent_b"
+                wt_a.mkdir(parents=True, exist_ok=True)
+                wt_b.mkdir(parents=True, exist_ok=True)
+
+                # Notice: "parsimony" key is deliberately omitted from agent_a and agent_b
+                CandidateManager.save_race(
+                    race_id=race_id,
+                    prompt="Fix bug",
+                    base_cwd=str(test_dir),
+                    baseline_commit="",
+                    agent_a={
+                        "model": "Codex",
+                        "path": str(wt_a),
+                        "duration": 5.0,
+                        "success": True,
+                        "diff": "+++ b/calc.py\n+val = 42\n",
+                    },
+                    agent_b={
+                        "model": "Claude",
+                        "path": str(wt_b),
+                        "duration": 6.0,
+                        "success": True,
+                        "diff": "+++ b/calc.py\n+val = 43\n",
+                    },
+                )
+
+                saved = CandidateManager.get_race(race_id)
+                cand_a = saved["candidates"]["A"]
+                self.assertIn("parsimony", cand_a)
+                self.assertEqual(cand_a["parsimony"]["lines_added"], 1)
+                self.assertEqual(cand_a["parsimony"]["files_touched"], 1)
+            finally:
+                config.CONFIG_DIR = orig_config
+                config.CANDIDATES_DIR = orig_cands
+
+
 if __name__ == "__main__":
     unittest.main()
+

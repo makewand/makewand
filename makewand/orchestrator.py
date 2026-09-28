@@ -1837,6 +1837,16 @@ def _run_pipeline_impl(
         return fail_and_cleanup(f"无法封存待审查内容: {exc}")
     if not test_ok:
         print(c(f"❌ [Makewand Test Gate] 发现单元测试失败：\n{test_err[:400]}", COLOR_RED + COLOR_BOLD))
+        try:
+            from makewand.memory import record_failure_pattern
+            clean_err = test_err.strip()
+            first_err = clean_err.splitlines()[-1][:180] if clean_err else "Local unit tests failed"
+            record_failure_pattern(
+                issue=f"Test gate failure in {Path(cwd).name}: {first_err}",
+                lesson="Ensure deterministic local unit tests pass cleanly before submitting code."
+            )
+        except Exception:
+            pass
     else:
         print(c("✔ [Makewand Test Gate] 本地测试套件校验通过 (或无单测需执行)。", COLOR_GREEN))
 
@@ -1966,6 +1976,16 @@ def _run_pipeline_impl(
             test_ok, test_err = run_local_tests(cwd)
             if not test_ok:
                 print(c(f"❌ [Makewand Test Gate] 修复后本地单元测试仍未通过：\n{test_err[:400]}", COLOR_RED))
+                try:
+                    from makewand.memory import record_failure_pattern
+                    clean_err = test_err.strip()
+                    first_err = clean_err.splitlines()[-1][:180] if clean_err else "Local unit tests failed in auto-fix"
+                    record_failure_pattern(
+                        issue=f"Auto-fix test failure in {Path(cwd).name}: {first_err}",
+                        lesson="Auto-fix patch failed to resolve regression or introduced new unit test error."
+                    )
+                except Exception:
+                    pass
             else:
                 print(c("✔ [Makewand Test Gate] 修复后本地单元测试执行全通！", COLOR_GREEN))
 
@@ -2647,11 +2667,7 @@ def compute_patch_parsimony(diff_text: str) -> Dict[str, Any]:
     lines_deleted = 0
 
     for line in diff_text.splitlines():
-        if line.startswith("diff --git a/"):
-            parts = line.split(" b/")
-            if len(parts) >= 2:
-                files.add(parts[1].strip())
-        elif line.startswith("+++ b/"):
+        if line.startswith("+++ b/"):
             target = line[6:].strip()
             if target != "/dev/null":
                 files.add(target)
@@ -2659,6 +2675,14 @@ def compute_patch_parsimony(diff_text: str) -> Dict[str, Any]:
             target = line[6:].strip()
             if target != "/dev/null":
                 files.add(target)
+        elif line.startswith("diff --git "):
+            m = re.match(r"^diff --git a/(.+?) b/(.+)$", line)
+            if m:
+                files.add(m.group(2).strip())
+        elif line.startswith("Binary files "):
+            m = re.match(r"^Binary files (?:a/)?(.+?) and (?:b/)?(.+?) differ", line)
+            if m:
+                files.add(m.group(2).strip())
         elif line.startswith("+") and not line.startswith("+++"):
             lines_added += 1
         elif line.startswith("-") and not line.startswith("---"):
@@ -2667,7 +2691,7 @@ def compute_patch_parsimony(diff_text: str) -> Dict[str, Any]:
     files_touched = len(files) if files else (1 if (lines_added or lines_deleted) else 0)
     total_churn = lines_added + lines_deleted
 
-    if total_churn == 0:
+    if total_churn == 0 and files_touched <= 1:
         parsimony_ratio = 1.0
     else:
         # Bounded between 0.0 and 1.0:
@@ -2802,9 +2826,34 @@ def run_race(
         print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
         print(c("并发执行中，请稍候...\n", COLOR_YELLOW))
 
+        # Retrieve codebase repo map for global architecture perception
+        repo_map_snippet = ""
+        try:
+            from makewand.repomap import format_repo_map_for_prompt
+            repo_map_snippet = format_repo_map_for_prompt(cwd, max_lines=80)
+            if repo_map_snippet:
+                print(c("🗺️  [Makewand Repo-Map] 自动提取代码库全局架构拓扑并注入竞速选手上下文...", COLOR_CYAN))
+        except Exception:
+            pass
+
+        # Retrieve past quality lessons and Kibitzer guidance
+        memory_hints = ""
+        try:
+            from makewand.memory import format_memory_hints_for_prompt
+            memory_hints = format_memory_hints_for_prompt(prompt)
+            if memory_hints:
+                print(c("🧠 [Makewand Kibitzer] 匹配并注入历史避坑与工程质量准则...", COLOR_PURPLE))
+        except Exception:
+            pass
+
         def run_single_racer(engine: str, name: str, wt: Path):
             start = time.time()
-            full_p = f"工作目录绝对路径: {wt}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"
+            prompt_parts = [f"工作目录绝对路径: {wt}\n请在该目录下完成代码编写并直接落盘：\n{prompt}"]
+            if repo_map_snippet:
+                prompt_parts.append(repo_map_snippet)
+            if memory_hints:
+                prompt_parts.append(memory_hints)
+            full_p = "\n".join(prompt_parts)
             ok, out, err = dispatch_task(
                 engine, full_p, cwd=str(wt), timeout=timeout,
                 tier="standard", repo_root=cwd, repo_trust=repo_trust
@@ -2872,13 +2921,21 @@ def run_race(
         fmt_diff_b = format_review_diff(diff_b, max_chars=12000) if diff_b else "无代码改动 (空 diff)"
 
         # Chief Referee evaluation with Antigravity (strictly read-only, TRUE BLIND REVIEW)
+        judge_kibitzer = ""
+        try:
+            from makewand.memory import format_kibitzer_guidance
+            judge_kibitzer = format_kibitzer_guidance(prompt, stage="review")
+        except Exception:
+            pass
+
         judge_prompt = (
             f"请作为资深软件架构裁判，以客观中立的双盲评审视角对比以下两位候选方案对同一任务的实现，指出各自优势与缺陷，并评定胜出者：\n\n"
             f"--- 原始任务 ---\n{prompt}\n\n"
             f"--- 自动化测试与工程指标 ---\n"
             f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={'通过' if test_pass_a else '失败'}, 补丁精简度(Parsimony)={parsimony_a['summary']}\n"
             f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={'通过' if test_pass_b else '失败'}, 补丁精简度(Parsimony)={parsimony_b['summary']}\n\n"
-            f"【评审准则（Agentless 极简补丁偏好）】在两方案均通过单元测试且实现正确的前提下，优先奖励修改紧凑、聚焦、无多余大面积重构或无关格式修改的高精简度方案 (High Parsimony)。\n\n"
+            f"【评审准则（Agentless 极简补丁偏好）】在两方案均通过单元测试且实现正确的前提下，优先奖励修改紧凑、聚焦、无多余大面积重构或无关格式修改的高精简度方案 (High Parsimony)。\n"
+            f"{judge_kibitzer}\n"
             f"--- 候选方案 A 的代码实现 ---\n{fmt_diff_a}\n\n"
             f"--- 候选方案 B 的代码实现 ---\n{fmt_diff_b}\n\n"
             f"请给出两套方案的架构、可维护性与测试质量对比及采纳理由。"
