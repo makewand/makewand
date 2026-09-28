@@ -33,6 +33,16 @@ const (
 	archiveStateDBName = "state.db"
 	archiveAuthName    = "server_auth.json"
 	archiveManifest    = "manifest.json"
+
+	// MaxArchiveEntrySize limits a single restored file to 512MB to prevent decompression bombs.
+	MaxArchiveEntrySize = 512 * 1024 * 1024
+	// MaxArchiveTotalSize limits the total uncompressed size across all entries to 2GB.
+	MaxArchiveTotalSize = 2 * 1024 * 1024 * 1024
+)
+
+var (
+	maxArchiveEntrySize int64 = MaxArchiveEntrySize
+	maxArchiveTotalSize int64 = MaxArchiveTotalSize
 )
 
 // SnapshotSQLite writes a transaction-consistent copy of the SQLite database at
@@ -403,6 +413,7 @@ func extractTarGz(archivePath, destDir string) error {
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 
+	var totalExtracted int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -424,9 +435,23 @@ func extractTarGz(archivePath, destDir string) error {
 		if err != nil {
 			return fmt.Errorf("create %s: %w", name, err)
 		}
-		if _, err := io.Copy(out, tr); err != nil { //nolint:gosec // G110: archives are operator-owned local backups, not untrusted input.
+		lr := io.LimitReader(tr, maxArchiveEntrySize+1)
+		//nolint:gosec // G110: extraction is bounded by maxArchiveEntrySize and maxArchiveTotalSize.
+		written, err := io.Copy(out, lr)
+		if err != nil {
 			out.Close()
 			return fmt.Errorf("extract %s: %w", name, err)
+		}
+		if written > maxArchiveEntrySize {
+			out.Close()
+			_ = os.Remove(dst)
+			return fmt.Errorf("extract %s: entry exceeds max allowed size of %d bytes", name, maxArchiveEntrySize)
+		}
+		totalExtracted += written
+		if totalExtracted > maxArchiveTotalSize {
+			out.Close()
+			_ = os.Remove(dst)
+			return fmt.Errorf("archive exceeds total uncompressed size limit of %d bytes", maxArchiveTotalSize)
 		}
 		if err := out.Close(); err != nil {
 			return fmt.Errorf("close %s: %w", name, err)

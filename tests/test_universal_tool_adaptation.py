@@ -193,5 +193,65 @@ class TestUniversalToolAdaptation(unittest.TestCase):
             ok = set_provider_enabled("invalid_tool_xyz", True)
             self.assertFalse(ok)
 
+    def test_apply_agentic_code_output_file_blocks(self):
+        """Tests extracting and writing files from LLM code block outputs."""
+        import tempfile
+        from makewand.providers.api_client import apply_agentic_code_output
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            sample_output = (
+                "Here is the implementation:\n\n"
+                "```filepath: src/calc.py\n"
+                "def add(a, b):\n"
+                "    return a + b\n"
+                "```\n\n"
+                "And here is another file:\n\n"
+                "### `tests/test_calc.py`\n"
+                "```python\n"
+                "from src.calc import add\n"
+                "assert add(1, 2) == 3\n"
+                "```\n"
+            )
+            modified = apply_agentic_code_output(sample_output, tmp_dir)
+            self.assertEqual(len(modified), 2)
+            self.assertIn("src/calc.py", modified)
+            self.assertIn("tests/test_calc.py", modified)
+
+            calc_path = Path(tmp_dir) / "src" / "calc.py"
+            test_path = Path(tmp_dir) / "tests" / "test_calc.py"
+            self.assertTrue(calc_path.exists())
+            self.assertTrue(test_path.exists())
+            self.assertIn("def add(a, b):", calc_path.read_text())
+            self.assertIn("assert add(1, 2) == 3", test_path.read_text())
+
+    def test_apply_agentic_code_output_security_traversal_blocked(self):
+        """Ensures directory traversal and .git paths are strictly blocked."""
+        import tempfile
+        from makewand.providers.api_client import apply_agentic_code_output
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            malicious_output = (
+                "```filepath: ../../../escape.txt\nevil\n```\n"
+                "```filepath: .git/config\nmalicious\n```\n"
+                "```filepath: /etc/passwd\nroot\n```\n"
+            )
+            modified = apply_agentic_code_output(malicious_output, tmp_dir)
+            self.assertEqual(len(modified), 0)
+            self.assertFalse((Path(tmp_dir) / "escape.txt").exists())
+            self.assertFalse((Path(tmp_dir) / ".git" / "config").exists())
+
+    def test_local_only_and_provider_override(self):
+        """Tests local_only and forced_engine routing behavior."""
+        from makewand.orchestrator import _run_pipeline_impl
+        with patch("makewand.orchestrator.dispatch_task") as mock_dispatch, \
+             patch("makewand.orchestrator.PipelineWorkspaceGuard.acquire_workspace_lock", return_value=None):
+            mock_dispatch.return_value = (True, "mock explanation", None)
+            ok = _run_pipeline_impl("只解释原理，不用修改文件", local_only=True)
+            self.assertTrue(ok)
+            mock_dispatch.assert_called()
+            args, kwargs = mock_dispatch.call_args
+            self.assertEqual(args[0], "local")
+
 if __name__ == "__main__":
     unittest.main()
+

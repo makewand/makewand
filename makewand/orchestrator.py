@@ -1525,6 +1525,7 @@ def _run_pipeline_impl(
     repo_trust: str = "trusted",
     boost: bool = False,
     forced_engine: Optional[str] = None,
+    local_only: bool = False,
     _guard: Optional[PipelineWorkspaceGuard] = None
 ) -> bool:
     if _guard is None:
@@ -1653,7 +1654,10 @@ def _run_pipeline_impl(
         print(c(f"💡 Makewand 意图识别: 技术问答/解释模式 '{prompt}' (推理档位: {tier}, 只读安全隔离)", COLOR_BOLD + COLOR_GREEN))
         cache = get_or_update_status(force_probe=False)
         available_coders, _, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
-        if forced_engine and forced_engine != "auto":
+        if local_only:
+            primary_c = "local"
+            sorted_engines = ["local"]
+        elif forced_engine and forced_engine != "auto":
             primary_c = forced_engine.lower()
             sorted_engines = [primary_c]
         else:
@@ -1693,7 +1697,15 @@ def _run_pipeline_impl(
 
     # Step 2: Intelligent Multi-Model Routing & Implementation
     coder_candidates, reviewer_candidates, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
-    if forced_engine and forced_engine != "auto":
+    if local_only:
+        coder_candidates = ["local"]
+        reviewer_candidates = ["local"]
+        primary_c = "local"
+        route_meta["primary_coder"] = "local"
+        route_meta["primary_reviewer"] = "local"
+        route_meta["single_tool_mode"] = True
+        route_meta["reasons"] = ["用户指定 --local-only / --offline 模式：强制使用本机开源模型闭环 (100% 离线隐私零 Token)"]
+    elif forced_engine and forced_engine != "auto":
         f_eng = forced_engine.lower()
         if f_eng in coder_candidates:
             coder_candidates.remove(f_eng)

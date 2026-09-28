@@ -133,3 +133,29 @@ func TestRestoreRejectsCorruptArchive(t *testing.T) {
 		t.Fatal("Restore must not install any file from a corrupt archive")
 	}
 }
+
+// TestRestoreRejectsOversizedEntry confirms decompression bomb defenses reject
+// files that expand beyond the configured safe entry limit.
+func TestRestoreRejectsOversizedEntry(t *testing.T) {
+	srcDir := t.TempDir()
+	stateDB := filepath.Join(srcDir, "state.db")
+	seedDB(t, stateDB, 5)
+
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if _, err := backup.Create(archive, backup.Options{StateDBPath: stateDB}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Set limit to 10 bytes to trigger decompression bomb protection.
+	cleanup := backup.SetMaxArchiveLimitsForTest(10, 1000)
+	defer cleanup()
+
+	dstDB := filepath.Join(t.TempDir(), "state.db")
+	_, err := backup.Restore(archive, backup.Options{StateDBPath: dstDB})
+	if err == nil {
+		t.Fatal("Restore should fail when entry exceeds max allowed size, got nil")
+	}
+	if _, err := os.Stat(dstDB); err == nil {
+		t.Fatal("Restore must not leave oversized files on disk")
+	}
+}

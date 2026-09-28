@@ -699,8 +699,9 @@ def main():
     p_run.add_argument("--no-auto-fix", dest="auto_fix", action="store_false", default=True, help="Disable review defect auto-fix loop")
     p_run.add_argument("--max-fix", type=int, default=2, help="Maximum auto-fix iterations (default: 2)")
     p_run.add_argument("--stream", action="store_true", default=False, help="Stream subprocess output line-by-line")
-    p_run.add_argument("--timeout", type=int, default=300, help="Per-stage timeout in seconds")
     p_run.add_argument("--boost", action="store_true", default=False, help="Force boost/overclock mode: bypass soft burn rate penalty and allocate highest reasoning power")
+    p_run.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100% offline mode: use local self-hosted models for both coding and review")
+    p_run.add_argument("--provider", dest="provider", default=None, help="Explicit primary provider override (e.g. deepseek, qwen, local, claude, codex, agy, grok, muse)")
 
     # review
     p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity", parents=[sub_common_parser])
@@ -940,7 +941,9 @@ def main():
             timeout=args.timeout,
             force_code=force_code,
             repo_trust=repo_trust,
-            boost=getattr(args, "boost", False)
+            boost=getattr(args, "boost", False),
+            forced_engine=getattr(args, "provider", None),
+            local_only=getattr(args, "local_only", False)
         )
         if not ok:
             sys.exit(EXIT_FAILED)

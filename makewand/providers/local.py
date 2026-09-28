@@ -156,7 +156,8 @@ def execute_local_task(
         # Read-only dispatches (reviews, Q&A) must use the reviewer system prompt.
         role = "reviewer"
     if not readonly:
-        print(c("ℹ️ 本地模型仅返回文本补全，不会直接修改工作区文件；需要落盘的任务将由调用方按实际 diff 验收。", COLOR_YELLOW), file=sys.stderr)
+        from makewand.config import COLOR_CYAN
+        print(c("ℹ️ 本地模型已激活 Agentic 文件解析落盘；返回的代码块将由系统自动写入工作区并参与质量门禁验收。", COLOR_CYAN), file=sys.stderr)
 
     avail, def_model, all_models = is_local_model_available()
     if not avail:

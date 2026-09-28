@@ -11,14 +11,21 @@ import time
 import threading
 import urllib.request
 import urllib.error
+import re
+from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
-from makewand.config import get_api_config, c, COLOR_CYAN, COLOR_YELLOW, COLOR_RED, COLOR_RESET
+from makewand.config import get_api_config, c, COLOR_CYAN, COLOR_YELLOW, COLOR_RED, COLOR_RESET, COLOR_GREEN
 
 DEFAULT_SYSTEM_PROMPTS = {
     "coder": (
-        "You are an expert software engineer and code implementation specialist. "
-        "Analyze the project requirements carefully and output precise, idiomatic, and robust code. "
-        "When modifying existing files or creating new ones, provide complete working code blocks."
+        "You are an expert software engineer and autonomous code implementation agent. "
+        "Analyze the project requirements carefully and implement the required changes by outputting "
+        "file code blocks with target relative filepaths, formatted exactly as:\n"
+        "```filepath: relative/path/to/file.ext\n"
+        "<complete file content>\n"
+        "```\n"
+        "Or provide a standard unified diff block (```diff ... ```). "
+        "Always ensure your code is complete, syntactically valid, and includes all necessary imports."
     ),
     "reviewer": (
         "You are an elite, independent Red-Team Code Reviewer and Security Auditor. "
@@ -29,6 +36,98 @@ DEFAULT_SYSTEM_PROMPTS = {
         '{"pass": true|false, "defects": ["description of defect 1", ...]}\n'
     )
 }
+
+def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
+    """
+    Parses LLM code generation output and applies file modifications to cwd.
+    Supports:
+      1. Explicit filepath code blocks: ```filepath: path/to/file.ext\n<content>\n```
+      2. File marker directives: File: `path/to/file.ext` or ### `path/to/file.ext`
+      3. Unified diff blocks: ```diff\n--- a/file\n+++ b/file\n...```
+    Returns list of modified relative file paths.
+    Enforces strict security containment: no path traversal, no .git tampering, no symlink escape.
+    """
+    if not output or not cwd:
+        return []
+
+    clean_cwd = os.path.realpath(os.path.abspath(cwd))
+    modified: List[str] = []
+
+    def _is_safe_rel_path(p: str) -> Optional[str]:
+        p = p.strip().strip("'\"`*:#")
+        if not p or os.path.isabs(p):
+            return None
+        norm = os.path.normpath(p)
+        parts = Path(norm).parts
+        if ".." in parts or any(part.startswith(".git") for part in parts):
+            return None
+        full = os.path.realpath(os.path.abspath(os.path.join(clean_cwd, norm)))
+        if not full.startswith(clean_cwd + os.sep) and full != clean_cwd:
+            return None
+        return norm
+
+    # 1. First, check for unified diff blocks and apply via git apply if possible
+    diff_blocks = re.findall(r"```(?:diff|patch)?\s*\n(--- [^\n]+\n\+\+\+ [^\n]+\n[\s\S]*?)```", output)
+    if diff_blocks:
+        for diff_text in diff_blocks:
+            try:
+                import subprocess
+                p = subprocess.run(
+                    ["git", "apply", "--whitespace=nowarn", "-"],
+                    input=diff_text.encode("utf-8"),
+                    cwd=clean_cwd,
+                    capture_output=True,
+                    timeout=5
+                )
+                if p.returncode == 0:
+                    for line in diff_text.splitlines():
+                        if line.startswith("+++ b/"):
+                            rel = _is_safe_rel_path(line[6:].strip())
+                            if rel and rel not in modified:
+                                modified.append(rel)
+            except Exception:
+                pass
+        if modified:
+            return modified
+
+    # 2. Pattern 1: ```[lang] (filepath|file|path)[=:\s]+path/to/file.ext
+    p1 = re.compile(r"```[a-zA-Z0-9_-]*\s+(?:filepath|file|path)[=:\s]+[\"']?([^\s\"'\n`]+)[\"']?\s*\n([\s\S]*?)```")
+    for match in p1.finditer(output):
+        rel = _is_safe_rel_path(match.group(1))
+        if rel:
+            dest = os.path.join(clean_cwd, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(match.group(2))
+            if rel not in modified:
+                modified.append(rel)
+
+    # 3. Pattern 2: ```(filepath|path|file)[:\s]+path/to/file.ext
+    p2 = re.compile(r"```(?:filepath|path|file)[:\s]+[\"']?([^\s\"'\n`]+)[\"']?\s*\n([\s\S]*?)```")
+    for match in p2.finditer(output):
+        rel = _is_safe_rel_path(match.group(1))
+        if rel and rel not in modified:
+            dest = os.path.join(clean_cwd, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(match.group(2))
+            modified.append(rel)
+
+    # 4. Pattern 3: Header preceding code block:
+    # e.g.: ### `path/to/file.ext`\n```python\n...```
+    # or File: `path/to/file.ext`\n```python\n...```
+    p3 = re.compile(r"(?:###|##|#|\*\*File:\*\*|File:)\s+[`\"']?([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)[`\"']?\s*\n+```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)```")
+    for match in p3.finditer(output):
+        rel = _is_safe_rel_path(match.group(1))
+        if rel and rel not in modified:
+            dest = os.path.join(clean_cwd, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(match.group(2))
+            modified.append(rel)
+
+    return modified
+
 
 class _DeadlineExceeded(Exception):
     """Raised inside the request worker when the total deadline has passed."""
@@ -228,6 +327,15 @@ def call_api_chat(
         if cwd:
             system_prompt += f"\nTarget working directory: {cwd}"
 
+    def _apply_code_if_coder(text: str) -> None:
+        if role == "coder" and cwd and text:
+            try:
+                mod_files = apply_agentic_code_output(text, cwd)
+                if mod_files:
+                    print(c(f"✔ [{p.upper()} Agentic] 成功提取并落地 {len(mod_files)} 个修改文件: {', '.join(mod_files[:4])}", COLOR_GREEN), file=sys.stderr)
+            except Exception:
+                pass
+
     # 1. Anthropic Claude Messages API
     if p in ("claude", "anthropic"):
         if not api_key:
@@ -258,12 +366,15 @@ def call_api_chat(
         if code != 200:
             return False, raw, err or f"Anthropic API returned status {code}"
         if stream:
+            _apply_code_if_coder(raw)
             return True, raw, None
         try:
             resp_json = json.loads(raw)
             content_blocks = resp_json.get("content", [])
             text_chunks = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
-            return True, "".join(text_chunks), None
+            res_text = "".join(text_chunks)
+            _apply_code_if_coder(res_text)
+            return True, res_text, None
         except Exception as e:
             return False, raw, f"JSON parse error: {e}"
 
@@ -296,6 +407,7 @@ def call_api_chat(
                 if stream and print_prefix:
                     sys.stdout.write(text_out + "\n")
                     sys.stdout.flush()
+                _apply_code_if_coder(text_out)
                 return True, text_out, None
             return False, raw, "No candidates returned by Gemini API"
         except Exception as e:
@@ -401,12 +513,14 @@ def call_api_chat(
         if code != 200:
             return False, raw, err or f"{p.upper()} API returned status {code}"
         if stream:
+            _apply_code_if_coder(raw)
             return True, raw, None
         try:
             resp_json = json.loads(raw)
             choices = resp_json.get("choices", [])
             if choices:
                 msg_content = choices[0].get("message", {}).get("content", "")
+                _apply_code_if_coder(msg_content)
                 return True, msg_content, None
             return False, raw, "No choices returned by API"
         except Exception as e:
