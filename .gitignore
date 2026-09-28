@@ -2,6 +2,11 @@
 /build/
 /makewand.exe
 /bin/makewand-server
+# Go test binaries, coverage and profiles
+*.test
+coverage.out
+*.coverprofile
+*.pprof
 __pycache__/
 *.pyc
 *.pyo
@@ -61,8 +66,27 @@ deploy/.env
 credentials.json
 token.json
 
+# Python tooling caches and virtualenvs
+.venv/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Browser/e2e screenshots and other generated output (never commit binaries)
+/output/
+
+# Website deploy tool state (links to hosting accounts)
+.wrangler/
+.vercel/
+node_modules/
+
+# Merge/patch leftovers
+*.orig
+*.rej
+
 # OS/editor noise
 .DS_Store
 *.swp
 *.swo
-.wrangler/
+.idea/

@@ -1,5 +1,14 @@
 # Package Distribution (Homebrew + Scoop)
 
+> **Status (2026-09-28):** the tap and bucket still serve **v0.1.10**
+> (2026-03-06). Every 3.x tag (v3.0.0–v3.1.0) failed in the Release workflow's
+> `test` job (bubblewrap gate on Ubuntu 24.04 runners, fixed in
+> `.github/workflows/release.yml`), so no 3.x archives or manifests were ever
+> published and `brew install` / `scoop install` currently install 0.1.10. They
+> update automatically on the next tag whose Release workflow succeeds with
+> `PACKAGE_REPO_TOKEN` configured. Until then, install 3.x from source
+> (`scripts/install.sh`, needs the go.mod Go toolchain).
+
 The release workflow now auto-generates package manifests on every `v*` tag:
 
 - `dist/homebrew/Formula/makewand.rb`
@@ -28,6 +37,10 @@ If configured, release workflow can also push updates to:
    - `SCOOP_BUCKET_REPO` (override default bucket repo)
 
 ## End-user install commands
+
+Both packages install the Go CLI together with its bundled Python engine
+(`lib/`) and depend on Python 3.9+ (`python@3.12` on Homebrew, `main/python` on
+Scoop).
 
 Homebrew:
 

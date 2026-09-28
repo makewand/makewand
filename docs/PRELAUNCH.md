@@ -2,24 +2,66 @@
 
 Use this checklist before shipping a release.
 
-## 1) Run static gate
+## 0) Prerequisites
+
+- Go toolchain: `make` pins analyzers to the version in `go.mod`
+  (`GOTOOLCHAIN=go<version>`), so a newer local Go (e.g. go1.27) is fine; the
+  pinned toolchain is downloaded on first use.
+- `golangci-lint` **v2.12.2** (the version pinned in `.github/workflows/ci.yml`):
+  `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2`
+- `govulncheck`: `go install golang.org/x/vuln/cmd/govulncheck@latest`
+- `bubblewrap` (`bwrap`) for the sandbox tests. On Ubuntu 24.04, if
+  `bwrap --unshare-net --ro-bind / / true` fails with
+  `loopback: Failed RTM_NEWADDR: Operation not permitted`, AppArmor restricts
+  unprivileged user namespaces; CI runs
+  `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (evaluate that
+  trade-off before doing the same on a workstation).
+- Provider CLIs / API keys configured for the modes you ship (used by `doctor`).
+
+## 1) Run the release gate
 
 ```bash
 make prelaunch
 ```
 
-This runs:
+`make prelaunch` runs, in order (stops at the first failure):
 
-- `bash ./scripts/test_gate.sh` (tracked source packages under `cmd`, `internal`, and `router`)
-- `go vet ./cmd/... ./internal/... ./router`
-- build binary
-- `makewand doctor --strict --modes fast,balanced,power`
+1. `./scripts/check_secrets.sh` — built-in credential / private-address / home-path
+   rules plus your private patterns from `~/.config/makewand/forbidden_*.txt`
+2. `make test-scripts` — `scripts/test_check_secrets.sh` (scanner regression
+   corpus) and `scripts/check_version.sh` (README, site, welcome card, CHANGELOG
+   and Go default agree with `makewand.__version__`)
+3. `make check-shell` — `bash -n` on `scripts/*.sh`, `site/install.sh`, `dispatch/*`
+4. `make fmt-check` — `gofmt -l` on tracked Go files
+5. `make lint` — `golangci-lint run ./...` under the go.mod toolchain
+6. `bash ./scripts/prelaunch_gate.sh`:
+   - `bash ./scripts/test_gate.sh` (all `go list ./...` packages, E2E first, then `go vet ./...`)
+   - Python unit tests, dispatch regression tests, installer/release-bundle
+     contract, offline benchmark harness
+   - `go vet ./...`, `go build -trimpath -o build/makewand ./cmd/makewand`
+   - `build/makewand doctor --strict --modes fast,balanced,power`
+     (`MAKEWAND_DOCTOR_MODES` overrides the modes)
+7. `make race` — `scripts/test_race.sh` (race detector on every package)
+8. `make vuln` — `govulncheck ./...` under the go.mod toolchain
+
+These cover every check of the CI `verify` job; `doctor --strict` is the
+operator-only addition. CI additionally *requires* the live bubblewrap sandbox
+test instead of skipping it when `bwrap` is unusable — reproduce that on Linux
+with `MAKEWAND_REQUIRE_BWRAP=1 make prelaunch`. Individual targets (`make lint`,
+`make vuln`, `make fmt-check`, `make test-scripts`, ...) can be run on their own
+before pushing.
+
+Before tagging, also run `bash scripts/check_version.sh --tag vX.Y.Z`: the
+Release workflow refuses a tag that differs from `v` + `makewand.__version__`.
 
 ## 2) Run live provider probe (recommended before production)
 
 ```bash
 MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch
 ```
+
+This adds `makewand doctor --strict --probe` to step 6 and spends real provider
+quota.
 
 Optional tuning:
 

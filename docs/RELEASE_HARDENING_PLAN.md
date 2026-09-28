@@ -3,6 +3,22 @@
 > 依据：2026-07-20 外部评估逐条核实（master@590ecba）+ codex gpt-5.6-sol ultra 对抗讨论。
 > 所有引用行号以 590ecba 为准。分三个 Wave：W0 发布阻塞、W1 高优先、W2 条件项。
 
+## 2026-09-28 更新：发布链实际状态（eng-delivery#1/#2/#10/#12）
+
+- 本方案 0.2 引入的 CI/Release `MAKEWAND_REQUIRE_BWRAP=1` 硬门禁在 GitHub 托管
+  ubuntu-24.04 runner 上从未通过：runner 默认 `kernel.apparmor_restrict_unprivileged_userns=1`，
+  bwrap 在用户命名空间内无能力，`--unshare-net` 配 loopback 报
+  `Failed RTM_NEWADDR: Operation not permitted`。因此 v3.0.0–v3.1.0 的 Release 全部在
+  `test` job 失败，未产出任何制品，Homebrew/Scoop 停在 v0.1.10。
+- 修复：保留硬门禁；ci.yml/release.yml 在安装 bubblewrap 后执行
+  `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true`，再做
+  `bwrap --unshare-net` 诊断（失败时输出可读错误与 sysctl 现状）；所有 job 加
+  `timeout-minutes`；Release 额外校验 tag == `v` + `makewand.__version__`。
+- 0.2 的"可选 Makefile vulncheck target"已落地为 `make vuln`，另有 `make lint`
+  （均以 go.mod 版本 `GOTOOLCHAIN` 运行，避免新版本地 Go 下预编译分析器 panic）。
+  发布前门禁以 `make prelaunch` 为准，内容见 [PRELAUNCH.md](PRELAUNCH.md)。
+- 以下"全绿"结论均为本地门禁；以 GitHub 上 CI/Release 实际运行结果为准。
+
 ## 最终状态：codex 六验签核 **可合并（Alpha）** ✅
 
 四项 backlog 经 5 修复轮（F/F2/F3/F4/F5）+ 6 次 codex gpt-5.6-sol ultra 验收，从
@@ -108,7 +124,7 @@ codex 五验判 strict/shutdown/typed-nil-reader 三项 PASS，仅剩 1 个**我
 
 - `.github/workflows/ci.yml`：新增 job `vulncheck`——setup-go（go-version-file）→ `go install golang.org/x/vuln/cmd/govulncheck@latest` → `govulncheck ./...`。
 - `.github/workflows/release.yml`：build 之前加同一 step（发布链独立把关，不依赖 CI 曾经绿过）。
-- 可选：`Makefile` 加 `vulncheck` target 供本地跑。
+- 可选：`Makefile` 加 `vulncheck` target 供本地跑。（已实现：`make vuln`，2026-09-28）
 - 验收：CI 绿；将 go.mod 临时降回 1.25.0 时门禁必须红（负向验证一次）。
 
 ### 0.3 `.env` 排除
