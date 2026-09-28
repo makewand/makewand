@@ -35,5 +35,7 @@ func Open(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Serialize connections to 1 to eliminate write-lock contention under concurrent goroutines.
+	db.SetMaxOpenConns(1)
 	return db, nil
 }

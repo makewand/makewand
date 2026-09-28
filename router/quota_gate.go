@@ -36,7 +36,8 @@ func (r *Router) quotaBandFor(provider string) QuotaBand {
 	if !ok {
 		return QuotaBandOK
 	}
-	return r.quotaPolicy.band(q, false)
+	_, sealed := r.quota.Sealed(provider)
+	return r.quotaPolicy.band(q, sealed)
 }
 
 // quotaHardBlocked reports whether a provider is under an active confirmed-

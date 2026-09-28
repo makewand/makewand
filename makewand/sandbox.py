@@ -668,7 +668,8 @@ def wrap_bwrap(
     is_provider: bool = False,
     worktree_root: Optional[str] = None,
     extra_env: Optional[dict] = None,
-    provider_name: Optional[str] = None
+    provider_name: Optional[str] = None,
+    extra_ro_binds: Optional[List[str]] = None
 ) -> List[str]:
     """
     Wraps command with bubblewrap isolating host filesystem, IPC, PID, and credentials.
@@ -840,6 +841,11 @@ def wrap_bwrap(
                         _ro_rebind(real_bin)
     except Exception:
         pass
+
+    if extra_ro_binds:
+        for extra_path in extra_ro_binds:
+            if os.path.exists(extra_path):
+                _ro_rebind(extra_path)
 
     # Re-expose PATH toolchain directories that live under masked data prefixes
     # (never other users' homes or our own HOME, which follows the SAFE list).
@@ -1219,6 +1225,7 @@ def run_in_sandbox(
     print_prefix: str = "",
     extra_env: Optional[dict] = None,
     audit_context: str = "sandbox",
+    extra_ro_binds: Optional[List[str]] = None,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command inside the bubblewrap sandbox.
@@ -1238,6 +1245,7 @@ def run_in_sandbox(
                 is_provider=is_provider,
                 worktree_root=worktree_root,
                 extra_env=extra_env,
+                extra_ro_binds=extra_ro_binds,
             )
         except SandboxConfigError as exc:
             _warn(str(exc))

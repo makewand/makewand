@@ -98,11 +98,15 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		"--tmpfs", "/var/tmp",
 		"--tmpfs", "/run",
 	}
+	// Hide sensitive host roots (/root, /mnt, /media, /srv) before project bind.
+	wrapped = append(wrapped, sandboxMaskedRoots(projectPath)...)
 	// Hide the host HOME (re-binding only toolchains, read-only) before the
 	// project bind so a project under HOME stays visible and writable.
 	wrapped = append(wrapped, layout.beforeWorkspace...)
 	wrapped = append(wrapped, "--bind", projectPath, projectPath)
 	wrapped = append(wrapped, layout.afterWorkspace...)
+	// Mask existing domain sockets in project with /dev/null
+	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(projectPath)...)
 	if gitDir := filepath.Join(projectPath, ".git"); isRealDirOrFile(gitDir) {
 		wrapped = append(wrapped, "--ro-bind", gitDir, gitDir)
 	}

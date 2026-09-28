@@ -272,7 +272,7 @@ def _calc_continuous_penalty(
 
     if count < warn:
         ratio = (count - (warn * 0.85)) / max(1.0, (warn * 0.15))
-        pen = round(warn_pen * 0.5 * ratio, 2)
+        pen = round(warn_pen * ratio, 2)
         return pen, f"{name} 过去 {window_name} 调用已达 {count:.1f} 加权当量，触发日预算平滑保护 ({pen})"
 
     if count < limit:

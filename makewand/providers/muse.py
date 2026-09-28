@@ -107,10 +107,12 @@ def execute_muse_task(
         cmd.extend(["--reasoning-effort", target_effort])
 
     p_file = None
+    p_dir = None
     try:
         if len(prompt.encode("utf-8")) > 32 * 1024:
-            import time
-            p_file = os.path.join(cwd, f".makewand_muse_p_{os.getpid()}_{time.time_ns()}.txt")
+            import tempfile
+            p_dir = tempfile.mkdtemp(prefix="makewand-muse-")
+            p_file = os.path.join(p_dir, "prompt.txt")
             with open(p_file, "w", encoding="utf-8") as pf:
                 pf.write(prompt)
             cmd.extend(["--prompt-file", str(p_file)])
@@ -119,7 +121,7 @@ def execute_muse_task(
 
         if is_bwrap_available():
             try:
-                cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="muse")
+                cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="muse", extra_ro_binds=[p_file] if p_file else None)
             except SandboxConfigError as exc:
                 return False, None, f"Muse 沙箱构建失败，拒绝执行 (fail closed): {exc}"
         elif repo_trust == "untrusted":
@@ -138,6 +140,12 @@ def execute_muse_task(
         if p_file and os.path.exists(p_file):
             try:
                 os.unlink(p_file)
+            except Exception:
+                pass
+        if p_dir and os.path.exists(p_dir):
+            try:
+                import shutil
+                shutil.rmtree(p_dir, ignore_errors=True)
             except Exception:
                 pass
     combined = f"{out}\n{err}" if not stream else out

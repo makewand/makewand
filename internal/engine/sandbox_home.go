@@ -255,6 +255,63 @@ func sandboxMaskSensitiveEntries(home, keep string) []string {
 	return out
 }
 
+// sandboxMaskedHostRoots lists host root prefixes that should be masked with tmpfs
+// to prevent cross-project and credential inspection.
+var sandboxMaskedHostRoots = []string{"/root", "/mnt", "/media", "/srv"}
+
+func sandboxMaskedRoots(workspace string) []string {
+	var out []string
+	cleanWS := filepath.Clean(workspace)
+	home := strings.TrimSpace(os.Getenv("HOME"))
+	if home != "" {
+		home = filepath.Clean(home)
+	}
+	for _, r := range sandboxMaskedHostRoots {
+		r = filepath.Clean(r)
+		if r == "/" || r == cleanWS || (home != "" && r == home) {
+			continue
+		}
+		if pathWithin(r, cleanWS) || (home != "" && pathWithin(r, home)) {
+			continue
+		}
+		fi, err := os.Stat(r)
+		if err == nil && fi.IsDir() {
+			out = append(out, "--tmpfs", r)
+		}
+	}
+	return out
+}
+
+// sandboxWorkspaceSocketMasks scans the workspace for pre-existing AF_UNIX domain sockets
+// and masks them with /dev/null so sandboxed commands cannot connect to host daemons.
+func sandboxWorkspaceSocketMasks(workspace string) []string {
+	var out []string
+	cleanWS := filepath.Clean(workspace)
+	count := 0
+	_ = filepath.WalkDir(cleanWS, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".git" || name == "node_modules" || name == ".venv" || name == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if count >= 64 {
+			return filepath.SkipAll
+		}
+		info, err := d.Info()
+		if err == nil && info.Mode()&os.ModeSocket != 0 {
+			out = append(out, "--ro-bind", os.DevNull, path)
+			count++
+		}
+		return nil
+	})
+	return out
+}
+
 // resolveSandboxToolchains resolves the host toolchains the sandbox needs:
 // the read-only HOME subtrees to re-bind, extra environment, and the host Go
 // version.

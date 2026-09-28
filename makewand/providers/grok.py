@@ -126,10 +126,12 @@ def execute_grok_task(
             return False, None, "Grok 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
     p_file = None
+    p_dir = None
     try:
         if len(prompt.encode("utf-8")) > 32 * 1024:
-            import time
-            p_file = os.path.join(cwd, f".makewand_grok_p_{os.getpid()}_{time.time_ns()}.txt")
+            import tempfile
+            p_dir = tempfile.mkdtemp(prefix="makewand-grok-")
+            p_file = os.path.join(p_dir, "prompt.txt")
             with open(p_file, "w", encoding="utf-8") as pf:
                 pf.write(prompt)
             cmd = ["grok", "--prompt-file", str(p_file), "--output-format", "plain"]
@@ -153,7 +155,7 @@ def execute_grok_task(
             cmd.extend(["--reasoning-effort", target_effort])
 
         if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="grok")
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="grok", extra_ro_binds=[p_file] if p_file else None)
         elif repo_trust == "untrusted":
             return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 
@@ -171,6 +173,12 @@ def execute_grok_task(
         if p_file and os.path.exists(p_file):
             try:
                 os.unlink(p_file)
+            except Exception:
+                pass
+        if p_dir and os.path.exists(p_dir):
+            try:
+                import shutil
+                shutil.rmtree(p_dir, ignore_errors=True)
             except Exception:
                 pass
     combined = f"{out}\n{err}" if not stream else out

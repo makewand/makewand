@@ -230,9 +230,18 @@ class TestTestFailureDeliveryGate(unittest.TestCase):
             "muse": {"status": "ready", "tier": "standard"}
         }
 
+        def fake_coder(prompt, cwd=None, **kwargs):
+            if cwd:
+                (Path(cwd) / "solution.py").write_text("def foo(): return 2\n")
+            return True, "def foo(): return 2", None
+
+        mock_grok.side_effect = fake_coder
+        mock_claude.side_effect = fake_coder
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             delivered = run_pipeline("实现修复逻辑并写单测", cwd=tmp_dir, auto_fix=False, timeout=30, force_code=True)
             self.assertFalse(delivered, "Pipeline delivered despite failing unit tests!")
+            self.assertTrue(mock_tests.called, "run_local_tests should have been called!")
 
 
 class TestGoDelegationUntrustedModuleIsolation(unittest.TestCase):

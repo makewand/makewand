@@ -136,6 +136,7 @@ def execute_agy_task(
             return False, None, "Antigravity 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
     p_file = None
+    p_dir = None
     try:
         final_prompt = f"【只读分析任务，严禁任何代码文件修改或写操作】\n{prompt}" if readonly else prompt
         base_flags = [
@@ -148,11 +149,12 @@ def execute_agy_task(
             base_flags.append("--dangerously-skip-permissions")
 
         if len(final_prompt.encode("utf-8")) > 32 * 1024:
-            import time
-            p_file = os.path.join(cwd, f".makewand_agy_p_{os.getpid()}_{time.time_ns()}.txt")
+            import tempfile
+            p_dir = tempfile.mkdtemp(prefix="makewand-agy-")
+            p_file = os.path.join(p_dir, "prompt.txt")
             with open(p_file, "w", encoding="utf-8") as pf:
                 pf.write(final_prompt)
-            prompt_instruction = f"请读取并完整执行当前目录任务文件 {os.path.basename(p_file)} 中所指定的任务要求与代码规范："
+            prompt_instruction = f"请读取并完整执行任务文件 {p_file} 中所指定的任务要求与代码规范："
             cmd = ["agy", "-p", prompt_instruction] + base_flags
         else:
             cmd = ["agy", "-p", final_prompt] + base_flags
@@ -167,7 +169,7 @@ def execute_agy_task(
             cmd.extend(["--effort", target_effort])
 
         if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="agy")
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="agy", extra_ro_binds=[p_file] if p_file else None)
         elif repo_trust == "untrusted":
             return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 
@@ -185,6 +187,12 @@ def execute_agy_task(
         if p_file and os.path.exists(p_file):
             try:
                 os.unlink(p_file)
+            except Exception:
+                pass
+        if p_dir and os.path.exists(p_dir):
+            try:
+                import shutil
+                shutil.rmtree(p_dir, ignore_errors=True)
             except Exception:
                 pass
     combined = f"{out}\n{err}" if not stream else out

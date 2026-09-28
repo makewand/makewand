@@ -177,11 +177,15 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		"--tmpfs", "/var/tmp",
 		"--tmpfs", "/run",
 	}
+	// Hide sensitive host roots (/root, /mnt, /media, /srv) before workspace bind.
+	wrapped = append(wrapped, sandboxMaskedRoots(workspacePath)...)
 	// Hide HOME (and re-bind toolchains) before the workspace bind so a
 	// workspace under HOME stays visible and writable.
 	wrapped = append(wrapped, layout.beforeWorkspace...)
 	wrapped = append(wrapped, "--bind", workspacePath, workspacePath)
 	wrapped = append(wrapped, layout.afterWorkspace...)
+	// Mask existing domain sockets in workspace with /dev/null
+	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(workspacePath)...)
 	for _, path := range readOnly {
 		wrapped = append(wrapped, "--ro-bind", path, path)
 	}

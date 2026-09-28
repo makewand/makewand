@@ -90,6 +90,15 @@ func shieldGitAttributes(projectPath string) func() {
 		}
 		for _, gd := range gitDirs {
 			attrPath := filepath.Join(gd, "info", "attributes")
+			// Self-healing: if attrPath is absent, check for any orphan .mw_shield_* from an aborted previous run
+			if _, err := os.Stat(attrPath); err != nil {
+				if matches, globErr := filepath.Glob(filepath.Join(gd, "info", "attributes.mw_shield_*")); globErr == nil && len(matches) > 0 {
+					_ = os.Rename(matches[0], attrPath)
+					for _, leftover := range matches[1:] {
+						_ = os.Remove(leftover)
+					}
+				}
+			}
 			//nolint:gosec // G703: the Git administrative directory may be outside a linked worktree; the fixed attributes path is intentionally masked and restored for safe Git execution.
 			if _, err := os.Stat(attrPath); err == nil {
 				shieldPath := fmt.Sprintf("%s.mw_shield_%d_%d", attrPath, os.Getpid(), len(restorations))

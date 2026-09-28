@@ -60,10 +60,12 @@ def execute_aider_task(
             return False, None, "Aider 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
     p_file = None
+    p_dir = None
     try:
         if len(prompt.encode("utf-8")) > 32 * 1024:
-            import time
-            p_file = os.path.join(work_dir, f".makewand_aider_p_{os.getpid()}_{time.time_ns()}.txt")
+            import tempfile
+            p_dir = tempfile.mkdtemp(prefix="makewand-aider-")
+            p_file = os.path.join(p_dir, "prompt.txt")
             with open(p_file, "w", encoding="utf-8") as pf:
                 pf.write(prompt)
             cmd = ["aider", "--message-file", str(p_file), "--yes-always", "--no-auto-commits", "--no-gitignore"]
@@ -79,7 +81,7 @@ def execute_aider_task(
             cmd += ["--model", active_model]
 
         if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=work_dir, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="aider")
+            cmd = wrap_bwrap(cmd, workspace=work_dir, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="aider", extra_ro_binds=[p_file] if p_file else None)
 
         log_desc = "只读解析任务" if readonly else "代码编写任务"
         print(c(f"[Makewand -> Aider] 派发{log_desc}至 Aider Pair Programmer (沙箱隔离)...", COLOR_GREEN), file=sys.stderr)
@@ -95,6 +97,12 @@ def execute_aider_task(
         if p_file and os.path.exists(p_file):
             try:
                 os.unlink(p_file)
+            except Exception:
+                pass
+        if p_dir and os.path.exists(p_dir):
+            try:
+                import shutil
+                shutil.rmtree(p_dir, ignore_errors=True)
             except Exception:
                 pass
     if code == 0:

@@ -29,6 +29,9 @@ dist/
 .*.tmp.*
 *.log
 *.patch
+.makewand_*
+.*_p_*.txt
+*.mw_shield_*
 quota_state.json
 usage_window.json
 candidates/

@@ -132,6 +132,16 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees
             ia_targets = _get_git_info_attributes_paths(cwd)
             for ia_target in ia_targets:
+                if not ia_target.exists():
+                    # Self-healing: restore any orphaned shield files from a crashed previous run
+                    try:
+                        orphans = sorted(ia_target.parent.glob(ia_target.name + ".makewand_shield_*"))
+                        if orphans:
+                            orphans[0].rename(ia_target)
+                            for extra_orphan in orphans[1:]:
+                                extra_orphan.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 if ia_target.exists():
                     try:
                         shield_file = ia_target.parent / (ia_target.name + f".makewand_shield_{os.getpid()}_{len(shielded_infos)}")
