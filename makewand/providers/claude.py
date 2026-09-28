@@ -9,6 +9,9 @@ from typing import Tuple, Optional
 from makewand.config import c, COLOR_BLUE
 from makewand.providers.base import run_subprocess
 
+# Built-in tools available to read-only Claude tasks (review / analysis).
+CLAUDE_READONLY_TOOLS = "Read,Grep,Glob"
+
 def parse_claude_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     lower = output.lower()
     if any(k in lower for k in ["hit your limit", "hit your monthly spend limit", "hit your usage limit", "usage limit reached", "5-hour limit", "weekly limit reached", "exceeded your current quota"]):
@@ -42,11 +45,12 @@ def execute_claude_task(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to Claude Code.
-    If readonly=True, restricts tools to read-only inspection (Read, Grep, Glob) preventing writes.
+    If readonly=True, restricts the built-in tool set to read-only inspection (Read, Grep, Glob)
+    under a non-bypass permission mode, so every other tool is denied without prompting.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache
-    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.sandbox import is_bwrap_available, wrap_bwrap, SandboxConfigError
     from makewand.git_helper import find_git_root
     # Untrusted repo enforcement
     if repo_trust == "untrusted":
@@ -102,7 +106,20 @@ def execute_claude_task(
     else:
         cmd = ["claude", "-p", prompt]
     if readonly:
-        cmd.extend(["--allowed-tools", "Read,Grep,Glob", "--dangerously-skip-permissions"])
+        # Read-only inspection must never run under a bypass mode: --allowedTools
+        # only pre-approves tools and is meaningless with
+        # --dangerously-skip-permissions. --tools limits the built-in tool set
+        # itself, dontAsk denies anything not pre-approved (no prompt in -p mode),
+        # project/local settings (repo-controlled hooks) and MCP servers are not
+        # loaded, and no session transcript is persisted.
+        cmd.extend([
+            "--tools", CLAUDE_READONLY_TOOLS,
+            "--allowedTools", CLAUDE_READONLY_TOOLS,
+            "--permission-mode", "dontAsk",
+            "--setting-sources", "user",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+        ])
     else:
         cmd.append("--dangerously-skip-permissions")
 
@@ -115,7 +132,10 @@ def execute_claude_task(
         cmd.extend(["--effort", target_effort])
 
     if is_bwrap_available():
-        cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="claude")
+        try:
+            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="claude")
+        except SandboxConfigError as exc:
+            return False, None, f"Claude 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     elif repo_trust == "untrusted":
         return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 

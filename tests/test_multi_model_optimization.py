@@ -30,6 +30,40 @@ from makewand.providers.muse import execute_muse_task
 from makewand.providers.grok import execute_grok_task, parse_grok_quota
 
 
+class _FakeProviderHome:
+    """
+    Temporary HOME with fake provider state directories, so sandbox assertions do
+    not depend on the real ~/.claude / ~/.grok of the machine running the tests
+    (eng-delivery#3) and never create placeholders in them.
+    """
+
+    def __enter__(self):
+        self.home = Path(tempfile.mkdtemp(prefix="mm-fake-home-"))
+        self.workspace = Path(tempfile.mkdtemp(prefix="mm-ws-"))
+        for rel in (".claude/commands", ".codex", ".grok/bin", ".gemini"):
+            (self.home / rel).mkdir(parents=True, exist_ok=True)
+        (self.home / ".claude" / "CLAUDE.md").write_text("global\n")
+        (self.home / ".claude" / "settings.json").write_text("{}\n")
+        (self.home / ".grok" / "bin" / "grok").write_text("#!/bin/sh\n")
+        (self.home / ".grok" / "config.toml").write_text("")
+        self._env = patch.dict(os.environ, {"HOME": str(self.home)})
+        self._env.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._env.stop()
+        shutil.rmtree(self.home, ignore_errors=True)
+        shutil.rmtree(self.workspace, ignore_errors=True)
+        return False
+
+    def path(self, rel):
+        return str(self.home / rel)
+
+
+def _pairs(cmd, flag):
+    return [(cmd[i + 1], cmd[i + 2]) for i, x in enumerate(cmd[:-2]) if x == flag]
+
+
 class TestProviderPromptContaminationImmunity(unittest.TestCase):
     """
     Validates that user prompts containing provider names (e.g. 'muse', 'claude', 'codex')
@@ -41,26 +75,30 @@ class TestProviderPromptContaminationImmunity(unittest.TestCase):
         # A non-provider command whose arguments mention 'muse' should NOT be treated as Muse.
         # It must retain --unshare-pid.
         cmd = ["python3", "-c", "print('analyzing muse code and claude adapters')"]
-        bwrap_cmd = wrap_bwrap(cmd, workspace="/tmp", is_provider=False)
+        with tempfile.TemporaryDirectory() as ws:
+            bwrap_cmd = wrap_bwrap(cmd, workspace=ws, is_provider=False)
         self.assertIn("--unshare-pid", bwrap_cmd)
 
     @patch("makewand.sandbox.is_bwrap_available", return_value=True)
     def test_provider_name_strict_isolation_masks_other_credentials(self, mock_bwrap):
-        user_home = str(Path.home())
-        # When provider_name="claude", claude dirs are mounted, but codex/gemini dirs must be masked with tmpfs
-        cmd = ["claude", "-p", "review muse architecture"]
-        bwrap_cmd = wrap_bwrap(cmd, workspace="/tmp", is_provider=True, provider_name="claude")
+        with _FakeProviderHome() as fh:
+            user_home = str(fh.home)
+            # When provider_name="claude", claude dirs are mounted, but codex/gemini dirs must be masked with tmpfs
+            cmd = ["claude", "-p", "review muse architecture"]
+            bwrap_cmd = wrap_bwrap(cmd, workspace=str(fh.workspace), is_provider=True, provider_name="claude")
 
-        # Claude auth dir should be ro-bound
-        claude_config = os.path.join(user_home, ".claude")
-        self.assertIn(claude_config, bwrap_cmd)
+            # Claude state dir is mounted (writable state), its instruction/config paths read-only
+            claude_config = fh.path(".claude")
+            self.assertIn((claude_config, claude_config), _pairs(bwrap_cmd, "--bind"))
+            ro = _pairs(bwrap_cmd, "--ro-bind")
+            for rel in ("CLAUDE.md", "settings.json", "commands", "hooks", "skills", "plugins", "agents"):
+                p = os.path.join(claude_config, rel)
+                self.assertIn((p, p), ro, rel)
 
-        # Other providers' auth dirs MUST NOT be mounted (isolated by HOME tmpfs)
-        codex_config = os.path.join(user_home, ".codex")
-        self.assertIn("--tmpfs", bwrap_cmd)
-        self.assertIn(user_home, bwrap_cmd)
-        self.assertNotIn(f"--bind {codex_config} {codex_config}", " ".join(bwrap_cmd))
-        self.assertNotIn(f"--ro-bind {codex_config} {codex_config}", " ".join(bwrap_cmd))
+            # Other providers' auth dirs MUST NOT be mounted (isolated by HOME tmpfs)
+            self.assertIn(("--tmpfs", user_home), list(zip(bwrap_cmd, bwrap_cmd[1:])))
+            for other in (".codex", ".grok", ".gemini"):
+                self.assertNotIn(fh.path(other), bwrap_cmd)
 
 
 class TestFailClosedReviewQualityGate(unittest.TestCase):
@@ -238,10 +276,14 @@ class TestGrokProviderIntegration(unittest.TestCase):
     @patch("makewand.sandbox.is_bwrap_available", return_value=True)
     @patch("makewand.providers.grok.run_subprocess")
     def test_grok_cli_argument_construction(self, mock_run, mock_bwrap, mock_which):
+        with _FakeProviderHome() as fh:
+            self._grok_cli_argument_construction(mock_run, str(fh.workspace))
+
+    def _grok_cli_argument_construction(self, mock_run, ws):
         mock_run.return_value = (0, "Grok response", "", None)
 
         # 1. Fast tier: grok-4.7-build-fast, effort low, readonly=True -> plan mode
-        ok, out, err = execute_grok_task("analyze problem", cwd="/tmp", tier="fast", readonly=True)
+        ok, out, err = execute_grok_task("analyze problem", cwd=ws, tier="fast", readonly=True)
         self.assertTrue(ok)
         cmd_args = mock_run.call_args[0][0]
         self.assertIn("--model", cmd_args)
@@ -254,7 +296,7 @@ class TestGrokProviderIntegration(unittest.TestCase):
         self.assertEqual(cmd_args[cmd_args.index("--output-format") + 1], "plain")
 
         # 2. Deep tier: grok-4.7, effort high, writable -> always-approve and bypassPermissions
-        ok, out, err = execute_grok_task("write complex module", cwd="/tmp", tier="deep", readonly=False)
+        ok, out, err = execute_grok_task("write complex module", cwd=ws, tier="deep", readonly=False)
         self.assertTrue(ok)
         cmd_args = mock_run.call_args[0][0]
         self.assertIn("--model", cmd_args)
@@ -267,22 +309,29 @@ class TestGrokProviderIntegration(unittest.TestCase):
 
     @patch("makewand.sandbox.is_bwrap_available", return_value=True)
     def test_grok_sandbox_isolation_credentials(self, mock_bwrap):
-        user_home = str(Path.home())
-        # Grok as active provider mounts ~/.grok, and does NOT mount ~/.claude or ~/.codex
-        cmd = ["grok", "-p", "hello"]
-        bwrap_cmd = wrap_bwrap(cmd, workspace="/tmp", is_provider=True, provider_name="grok")
-        grok_dir = os.path.join(user_home, ".grok")
-        claude_dir = os.path.join(user_home, ".claude")
-        codex_dir = os.path.join(user_home, ".codex")
+        with _FakeProviderHome() as fh:
+            ws = str(fh.workspace)
+            # Grok as active provider mounts ~/.grok, and does NOT mount ~/.claude or ~/.codex
+            cmd = ["grok", "-p", "hello"]
+            for readonly in (False, True):
+                bwrap_cmd = wrap_bwrap(cmd, workspace=ws, is_provider=True, provider_name="grok", readonly=readonly)
+                grok_dir = fh.path(".grok")
+                binds = _pairs(bwrap_cmd, "--bind")
+                ro = _pairs(bwrap_cmd, "--ro-bind")
+                self.assertIn((grok_dir, grok_dir), binds)
+                # bin/ and config.toml are re-mounted read-only AFTER the ~/.grok bind
+                root_idx = bwrap_cmd.index(grok_dir)
+                for rel in ("bin", "config.toml"):
+                    p = os.path.join(grok_dir, rel)
+                    self.assertIn((p, p), ro, rel)
+                    self.assertGreater(bwrap_cmd.index(p), root_idx, rel)
+                for other in (".claude", ".codex"):
+                    self.assertNotIn(fh.path(other), bwrap_cmd)
 
-        self.assertIn(grok_dir, bwrap_cmd)
-        self.assertNotIn(f"--bind {claude_dir} {claude_dir}", " ".join(bwrap_cmd))
-        self.assertNotIn(f"--bind {codex_dir} {codex_dir}", " ".join(bwrap_cmd))
-
-        # Other provider (e.g. claude) mounts ~/.claude, and does NOT mount ~/.grok
-        bwrap_cmd_claude = wrap_bwrap(["claude"], workspace="/tmp", is_provider=True, provider_name="claude")
-        self.assertNotIn(f"--bind {grok_dir} {grok_dir}", " ".join(bwrap_cmd_claude))
-        self.assertNotIn(f"--ro-bind {grok_dir} {grok_dir}", " ".join(bwrap_cmd_claude))
+            # Other provider (e.g. claude) mounts ~/.claude, and does NOT mount ~/.grok
+            bwrap_cmd_claude = wrap_bwrap(["claude"], workspace=ws, is_provider=True, provider_name="claude")
+            self.assertNotIn(fh.path(".grok"), bwrap_cmd_claude)
+            self.assertNotIn(fh.path(".grok/bin"), bwrap_cmd_claude)
 
     def test_grok_quota_parsing(self):
         # Healthy output
@@ -358,17 +407,21 @@ class TestCatalogDrivenTierResolutionAndSandboxWhitelist(unittest.TestCase):
     @patch("makewand.sandbox.is_bwrap_available", return_value=True)
     def test_sandbox_strict_tmpfs_whitelist_isolation(self, mock_bwrap):
         from makewand.sandbox import wrap_bwrap
-        user_home = str(Path.home())
-        
-        # When provider_name="claude", HOME is tmpfs, only .claude is mounted, .codex is NEVER mounted
-        cmd = wrap_bwrap(["claude", "-p", "test"], "/tmp", is_provider=True, provider_name="claude")
-        self.assertIn("--tmpfs", cmd)
-        self.assertIn(user_home, cmd)
-        claude_dir = os.path.join(user_home, ".claude")
-        codex_dir = os.path.join(user_home, ".codex")
-        self.assertIn(claude_dir, cmd)
-        self.assertNotIn(f"--bind {codex_dir} {codex_dir}", " ".join(cmd))
-        self.assertNotIn(f"--ro-bind {codex_dir} {codex_dir}", " ".join(cmd))
+        with _FakeProviderHome() as fh:
+            user_home = str(fh.home)
+
+            # When provider_name="claude", HOME is tmpfs, only .claude is mounted, .codex is NEVER mounted
+            cmd = wrap_bwrap(["claude", "-p", "test"], str(fh.workspace), is_provider=True, provider_name="claude")
+            self.assertIn(("--tmpfs", user_home), list(zip(cmd, cmd[1:])))
+            claude_dir = fh.path(".claude")
+            self.assertIn((claude_dir, claude_dir), _pairs(cmd, "--bind"))
+            self.assertNotIn(fh.path(".codex"), cmd)
+
+            # read-only tasks mount the whole claude state root read-only
+            cmd_ro = wrap_bwrap(["claude", "-p", "test"], str(fh.workspace), is_provider=True,
+                                provider_name="claude", readonly=True)
+            self.assertIn((claude_dir, claude_dir), _pairs(cmd_ro, "--ro-bind"))
+            self.assertNotIn((claude_dir, claude_dir), _pairs(cmd_ro, "--bind"))
 
     def test_pipeline_transactional_rollback_on_test_failure(self):
         from makewand.git_helper import run_git_cmd
@@ -430,7 +483,8 @@ class TestCatalogDrivenTierResolutionAndSandboxWhitelist(unittest.TestCase):
 
     def test_sandbox_masks_var_tmp_and_run(self):
         from makewand.sandbox import wrap_bwrap
-        cmd = wrap_bwrap(["echo", "hi"], "/tmp")
+        with tempfile.TemporaryDirectory() as ws:
+            cmd = wrap_bwrap(["echo", "hi"], ws)
         self.assertIn("/var/tmp", cmd)
         self.assertIn("/run", cmd)
 

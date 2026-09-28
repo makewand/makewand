@@ -41,7 +41,7 @@ def execute_muse_task(
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
-    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.sandbox import is_bwrap_available, wrap_bwrap, SandboxConfigError
     from makewand.git_helper import find_git_root
     # Untrusted repo enforcement
     if repo_trust == "untrusted":
@@ -118,7 +118,10 @@ def execute_muse_task(
             cmd.append(prompt)
 
         if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="muse")
+            try:
+                cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="muse")
+            except SandboxConfigError as exc:
+                return False, None, f"Muse 沙箱构建失败，拒绝执行 (fail closed): {exc}"
         elif repo_trust == "untrusted":
             return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 
