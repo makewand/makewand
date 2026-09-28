@@ -79,14 +79,17 @@ func handleOrganizations(w http.ResponseWriter, req *http.Request, opts HandlerO
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", status, message, 0, 0, 0)
 			return
 		}
+		target := func() auditTarget {
+			return auditTarget{Action: "create_organization", OrganizationID: strings.TrimSpace(payload.ID)}
+		}
 		if err := forbidUserBoundTenantAdministration(grant); err != nil {
 			writeError(w, http.StatusForbidden, "forbidden", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusForbidden, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusForbidden, err.Error(), target())
 			return
 		}
 		if grant != nil && (grant.OrganizationID() != "" || grant.ProjectID() != "") {
 			writeError(w, http.StatusForbidden, "forbidden", "scoped admin tokens cannot create additional organizations")
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusForbidden, "scoped admin tokens cannot create additional organizations", 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusForbidden, "scoped admin tokens cannot create additional organizations", target())
 			return
 		}
 		item, err := opts.TeamStore.CreateOrganization(serverteam.Organization{
@@ -99,11 +102,11 @@ func handleOrganizations(w http.ResponseWriter, req *http.Request, opts HandlerO
 		})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusBadRequest, err.Error(), target())
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"organization": item})
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusCreated, "", 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organizations", http.StatusCreated, "", target())
 	default:
 		writeMethodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}
@@ -150,9 +153,12 @@ func handleProjects(w http.ResponseWriter, req *http.Request, opts HandlerOption
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", status, message, 0, 0, 0)
 			return
 		}
+		target := func() auditTarget {
+			return auditTarget{Action: "create_project", OrganizationID: strings.TrimSpace(payload.OrganizationID), ProjectID: strings.TrimSpace(payload.ID)}
+		}
 		if err := forbidUserBoundTenantAdministration(grant); err != nil {
 			writeError(w, http.StatusForbidden, "forbidden", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusForbidden, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusForbidden, err.Error(), target())
 			return
 		}
 		if grant != nil && grant.OrganizationID() != "" {
@@ -160,13 +166,13 @@ func handleProjects(w http.ResponseWriter, req *http.Request, opts HandlerOption
 				payload.OrganizationID = grant.OrganizationID()
 			} else if strings.TrimSpace(payload.OrganizationID) != grant.OrganizationID() {
 				writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()))
-				logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()), 0, 0, 0)
+				logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()), target())
 				return
 			}
 		}
 		if grant != nil && grant.ProjectID() != "" {
 			writeError(w, http.StatusForbidden, "forbidden", "scoped project admin tokens cannot create additional projects")
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusForbidden, "scoped project admin tokens cannot create additional projects", 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusForbidden, "scoped project admin tokens cannot create additional projects", target())
 			return
 		}
 		item, err := opts.TeamStore.CreateProject(serverteam.Project{
@@ -180,11 +186,11 @@ func handleProjects(w http.ResponseWriter, req *http.Request, opts HandlerOption
 		})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusBadRequest, err.Error(), target())
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"project": item})
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusCreated, "", 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_projects", http.StatusCreated, "", target())
 	default:
 		writeMethodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}
@@ -494,14 +500,17 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", status, message, 0, 0, 0)
 			return
 		}
+		target := func() auditTarget {
+			return membershipAuditTarget("upsert_organization_membership", payload.UserID, payload.OrganizationID, "", payload.Role, payload.IsActive)
+		}
 		if err := forbidUserBoundTenantAdministration(grant); err != nil {
 			writeError(w, http.StatusForbidden, "forbidden", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, err.Error(), target())
 			return
 		}
 		if grant != nil && grant.ProjectID() != "" {
 			writeError(w, http.StatusForbidden, "forbidden", "project-scoped admin tokens cannot manage organization memberships")
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, "project-scoped admin tokens cannot manage organization memberships", 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, "project-scoped admin tokens cannot manage organization memberships", target())
 			return
 		}
 		if grant != nil && grant.OrganizationID() != "" {
@@ -509,7 +518,7 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 				payload.OrganizationID = grant.OrganizationID()
 			} else if strings.TrimSpace(payload.OrganizationID) != grant.OrganizationID() {
 				writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()))
-				logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()), 0, 0, 0)
+				logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()), target())
 				return
 			}
 		}
@@ -519,6 +528,7 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 		}
 		if err := validateMembershipTarget(opts, payload.UserID, payload.OrganizationID, "", payload.Role); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusBadRequest, err.Error(), target())
 			return
 		}
 		if !revokeMembershipCredentials(w, req, opts, grant, strings.TrimSpace(payload.UserID), strings.TrimSpace(payload.OrganizationID), "") {
@@ -532,11 +542,11 @@ func handleOrganizationMemberships(w http.ResponseWriter, req *http.Request, opt
 		})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusBadRequest, err.Error(), target())
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"membership": item})
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusCreated, "", 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_organization_memberships", http.StatusCreated, "", target())
 	default:
 		writeMethodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}
@@ -584,9 +594,12 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", status, message, 0, 0, 0)
 			return
 		}
+		target := func() auditTarget {
+			return membershipAuditTarget("upsert_project_membership", payload.UserID, "", payload.ProjectID, payload.Role, payload.IsActive)
+		}
 		if err := forbidUserBoundTenantAdministration(grant); err != nil {
 			writeError(w, http.StatusForbidden, "forbidden", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, err.Error(), target())
 			return
 		}
 		if strings.TrimSpace(payload.ProjectID) == "" && grant.ProjectID() != "" {
@@ -594,19 +607,19 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 		}
 		if grant != nil && grant.ProjectID() != "" && strings.TrimSpace(payload.ProjectID) != "" && strings.TrimSpace(payload.ProjectID) != grant.ProjectID() {
 			writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("scoped admin tokens may only manage project %q", grant.ProjectID()))
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage project %q", grant.ProjectID()), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage project %q", grant.ProjectID()), target())
 			return
 		}
 		if grant != nil && grant.OrganizationID() != "" {
 			project, err := opts.TeamStore.GetProject(strings.TrimSpace(payload.ProjectID))
 			if err != nil {
 				writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-				logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusBadRequest, err.Error(), 0, 0, 0)
+				logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusBadRequest, err.Error(), target())
 				return
 			}
 			if project.OrganizationID != grant.OrganizationID() {
 				writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()))
-				logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()), 0, 0, 0)
+				logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusForbidden, fmt.Sprintf("scoped admin tokens may only manage organization %q", grant.OrganizationID()), target())
 				return
 			}
 		}
@@ -616,6 +629,7 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 		}
 		if err := validateMembershipTarget(opts, payload.UserID, "", payload.ProjectID, payload.Role); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusBadRequest, err.Error(), target())
 			return
 		}
 		if !revokeMembershipCredentials(w, req, opts, grant, strings.TrimSpace(payload.UserID), "", strings.TrimSpace(payload.ProjectID)) {
@@ -629,11 +643,11 @@ func handleProjectMemberships(w http.ResponseWriter, req *http.Request, opts Han
 		})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-			logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusBadRequest, err.Error(), 0, 0, 0)
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusBadRequest, err.Error(), target())
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"membership": item})
-		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusCreated, "", 0, 0, 0)
+		logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_project_memberships", http.StatusCreated, "", target())
 	default:
 		writeMethodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}

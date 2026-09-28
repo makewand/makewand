@@ -177,7 +177,16 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 		return
 	}
 	user, err := m.userStore.GetUserByEmail(payload.Email)
-	if err != nil || user == nil || !user.IsActive || !user.ValidatePassword(payload.Password) {
+	// Always spend one password hash: unknown and inactive accounts must take
+	// as long as a wrong password, or response time reveals which accounts
+	// exist.
+	passwordOK := false
+	if err == nil && user != nil {
+		passwordOK = user.ValidatePassword(payload.Password)
+	} else {
+		timingEqualizerUser.ValidatePassword(payload.Password)
+	}
+	if !passwordOK || !user.IsActive {
 		m.limiter.RecordFailure(key, time.Now().UTC())
 		writeError(w, http.StatusUnauthorized, "unauthorized", "invalid email or password")
 		return
@@ -393,6 +402,10 @@ func (m *SessionManager) sign(payload []byte) []byte {
 	_, _ = mac.Write(payload)
 	return mac.Sum(nil)
 }
+
+// timingEqualizerUser has no valid password: validating against it performs
+// the same Argon2id work as a real account and always fails.
+var timingEqualizerUser = &router.User{Salt: "makewand-login-timing-equalizer"}
 
 func randomToken(size int) string {
 	buf := make([]byte, size)
