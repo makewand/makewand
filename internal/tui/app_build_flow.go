@@ -159,9 +159,12 @@ func (a App) handleFilesExtracted(msg filesExtractedMsg) (tea.Model, tea.Cmd) {
 				return confirmFileWriteMsg{confirmed: true}
 			}
 		}
+		// Autopilot needs Strength 2, which local checks cannot give yet, so
+		// explain why approval is needed instead of claiming no candidate
+		// passed (candidates may well have passed local checks).
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
-			Content: m.AutomationCandidateFallback,
+			Content: m.AutopilotApprovalRequired,
 		})
 	}
 
@@ -588,7 +591,7 @@ func (a App) runDepsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 		Role:    "status",
 		Content: execStartedMessage(i18n.Msg().ExecDepsLabel, execCommandDetails(planValue.DisplayCommand())),
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), engine.RestrictedPlanTimeout)
 	a.cancelAI = cancel
 	return a, func() tea.Msg {
 		defer cancel()
@@ -682,7 +685,7 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 		Role:    "status",
 		Content: execStartedMessage(i18n.Msg().ExecTestsLabel, execCommandDetails(planValue.DisplayCommand())),
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), engine.RestrictedPlanTimeout)
 	a.cancelAI = cancel
 	return a, func() tea.Msg {
 		defer cancel()
@@ -1108,19 +1111,16 @@ func (a App) handleAutoFixFileWriteComplete() (tea.Model, tea.Cmd) {
 			emitExecTrace(router, "pipeline.exec.plan_detected", "deps", depsPlan, nil, nil, nil, "auto-fix retry detected dependency install plan")
 			emitExecTrace(router, "pipeline.exec.started", "deps", depsPlan, nil, nil, nil, "auto-fix retry running dependency install plan")
 			depsResult, err := proj.RunRestrictedPlan(ctx, *depsPlan)
-			if err != nil || (depsResult != nil && depsResult.ExitCode != 0) {
-				if err != nil {
-					emitExecTrace(router, "pipeline.exec.error", "deps", depsPlan, nil, depsResult, err, "auto-fix retry dependency install failed")
-				} else {
-					emitExecTrace(router, "pipeline.exec.failed", "deps", depsPlan, nil, depsResult, nil, "auto-fix retry dependency install exited non-zero")
-				}
-				errOut := ""
-				if depsResult != nil {
-					errOut = depsResult.Stderr + depsResult.Stdout
-				} else if err != nil {
-					errOut = err.Error()
-				}
-				return autoFixMsg{errOutput: errOut, attempt: attempt + 1}
+			if err != nil {
+				// An execution error (sandbox failed to start, host toolchain
+				// too old, protected paths touched) is not something another
+				// AI fix can repair: stop the retry loop and show it.
+				emitExecTrace(router, "pipeline.exec.error", "deps", depsPlan, nil, depsResult, err, "auto-fix retry dependency install failed")
+				return testRunMsg{result: depsResult, err: err}
+			}
+			if depsResult != nil && depsResult.ExitCode != 0 {
+				emitExecTrace(router, "pipeline.exec.failed", "deps", depsPlan, nil, depsResult, nil, "auto-fix retry dependency install exited non-zero")
+				return autoFixMsg{errOutput: depsResult.Stderr + depsResult.Stdout, attempt: attempt + 1}
 			}
 			emitExecTrace(router, "pipeline.exec.succeeded", "deps", depsPlan, nil, depsResult, nil, "auto-fix retry dependency install completed")
 		} else {
@@ -1141,23 +1141,17 @@ func (a App) handleAutoFixFileWriteComplete() (tea.Model, tea.Cmd) {
 		emitExecTrace(router, "pipeline.exec.plan_detected", "tests", testsPlan, nil, nil, nil, "auto-fix retry detected test execution plan")
 		emitExecTrace(router, "pipeline.exec.started", "tests", testsPlan, nil, nil, nil, "auto-fix retry running test execution plan")
 		testResult, err := proj.RunRestrictedPlan(ctx, *testsPlan)
-		if err != nil || (testResult != nil && testResult.ExitCode != 0) {
-			if err != nil {
-				emitExecTrace(router, "pipeline.exec.error", "tests", testsPlan, nil, testResult, err, "auto-fix retry test execution failed")
-			} else {
-				emitExecTrace(router, "pipeline.exec.failed", "tests", testsPlan, nil, testResult, nil, "auto-fix retry test command exited non-zero")
-			}
-			if testResult != nil && strings.Contains(testResult.Stdout, "No test framework") {
+		if err != nil {
+			emitExecTrace(router, "pipeline.exec.error", "tests", testsPlan, nil, testResult, err, "auto-fix retry test execution failed")
+			return testRunMsg{result: testResult, err: err}
+		}
+		if testResult != nil && testResult.ExitCode != 0 {
+			emitExecTrace(router, "pipeline.exec.failed", "tests", testsPlan, nil, testResult, nil, "auto-fix retry test command exited non-zero")
+			if strings.Contains(testResult.Stdout, "No test framework") {
 				emitExecTrace(router, "pipeline.exec.not_detected", "tests", testsPlan, nil, testResult, nil, "auto-fix retry reported no test framework")
 				return testRunMsg{result: testResult, noTest: true}
 			}
-			errOut := ""
-			if testResult != nil {
-				errOut = testResult.Stderr + testResult.Stdout
-			} else if err != nil {
-				errOut = err.Error()
-			}
-			return autoFixMsg{errOutput: errOut, attempt: attempt + 1}
+			return autoFixMsg{errOutput: testResult.Stderr + testResult.Stdout, attempt: attempt + 1}
 		}
 		emitExecTrace(router, "pipeline.exec.succeeded", "tests", testsPlan, nil, testResult, nil, "auto-fix retry test execution completed")
 

@@ -106,6 +106,12 @@ type Messages struct {
 	AutomationCandidateIsolationUnavailable string
 	AutomationCandidateWeakVerification     string
 	AutomationCandidateDeletions            string
+	AutomationCandidateUnverified           string
+	AutomationCandidateRestoredTests        string
+	AutomationCandidateNoTests              string
+	AutomationCandidateLargeFiles           string
+	AutopilotApprovalRequired               string
+	ApprovalModeAutopilotNote               string
 	HostCLIExecNotice                       string
 
 	UnsafeHostExecAckPrompt         string
@@ -326,8 +332,14 @@ var en = Messages{
 	AutomationCandidateFallback:   "No candidate passed local verification. Falling back to manual approval.",
 
 	AutomationCandidateIsolationUnavailable: "Candidate code was not executed: %s. Falling back to manual approval.",
-	AutomationCandidateWeakVerification:     "Local checks passed. Test output comes from candidate-controlled code, so applying the candidate requires approval.",
+	AutomationCandidateWeakVerification:     "Local checks passed, but the passing test results are self-reported by the candidate's own code and were not independently verified. Applying the candidate requires your approval.",
 	AutomationCandidateDeletions:            "Candidate deleted files in its workspace (not applied automatically): %s",
+	AutomationCandidateUnverified:           "%s unverified",
+	AutomationCandidateRestoredTests:        "The following test file changes were discarded (verification keeps the project's existing tests; these edits are not applied): %s",
+	AutomationCandidateNoTests:              "No tests were executed for this candidate (no test plan was detected, or the test command ran zero tests); only syntax/compile checks ran. Review it before applying.",
+	AutomationCandidateLargeFiles:           "Candidate changed files larger than 10 MiB; they cannot be verified or applied and are not included: %s",
+	AutopilotApprovalRequired:               "Autopilot only applies candidates automatically at verification Strength 2 (an independent acceptance check). Local checks top out at Strength 1 because test results come from candidate code, so approval is required to apply.",
+	ApprovalModeAutopilotNote:               "Note: autopilot runs several candidates and ranks them by local checks, but it only applies a candidate automatically at Strength 2, which local verification cannot reach yet (maximum Strength 1). In practice every write still asks for your approval.",
 	HostCLIExecNotice:                       "Note: the %s CLI ran on this host (in %s) with your environment and credentials — generation is not sandboxed. Treat untrusted repos accordingly (see SECURITY.md).",
 
 	UnsafeHostExecAckPrompt:         "MAKEWAND_UNSAFE_HOST_EXEC=1 is set.\n\nThis disables sandbox isolation: AI-generated commands (dependency installs, tests, auto-fix retries, preview scripts) will run DIRECTLY on this machine with your user account and environment. A malicious or buggy generated command can read or modify your files and use your credentials. You accept full responsibility for what those commands do.\n\nThis one-time acknowledgment is recorded in your makewand config for this machine (risk statement v%d). Every host execution is written to the audit log.\n\nType \"yes\" to accept, anything else to decline: ",
@@ -558,8 +570,14 @@ var zh = Messages{
 	AutomationCandidateFallback:   "没有候选通过本地验证，已回退为手动确认。",
 
 	AutomationCandidateIsolationUnavailable: "候选代码未被执行：%s。已回退为手动确认。",
-	AutomationCandidateWeakVerification:     "本地检查已通过。测试输出来自候选代码，应用修改仍需要手动确认。",
+	AutomationCandidateWeakVerification:     "本地检查已通过，但测试通过结果由候选自身的代码报告，未经独立验证。应用修改需要你手动确认。",
 	AutomationCandidateDeletions:            "候选在其工作区中删除了文件（不会自动应用）：%s",
+	AutomationCandidateUnverified:           "%s 未验证",
+	AutomationCandidateRestoredTests:        "以下测试文件改动已被丢弃（验证沿用项目原有测试，这些改动不会被应用）：%s",
+	AutomationCandidateNoTests:              "该候选没有执行任何测试（未检测到测试计划，或测试命令实际运行了 0 个测试），只做了语法/编译检查。应用前请自行审阅。",
+	AutomationCandidateLargeFiles:           "候选修改了超过 10 MiB 的文件，这些文件无法验证也不会被应用（未包含在改动中）：%s",
+	AutopilotApprovalRequired:               "自动驾驶只会自动应用验证强度达到 2（独立验收）的候选。本地检查最高只有强度 1，因为测试结果来自候选代码，所以应用修改需要你确认。",
+	ApprovalModeAutopilotNote:               "说明：自动驾驶会并行生成多个候选并按本地检查排序，但只会自动应用强度 2 的候选，而目前本地验证最高只给强度 1。实际上每次写入仍会请求你批准。",
 	HostCLIExecNotice:                       "提示：%s CLI 在本机（%s）以你的环境和凭据运行——生成阶段没有沙箱。处理不可信仓库请注意（详见 SECURITY.md）。",
 
 	UnsafeHostExecAckPrompt:         "检测到 MAKEWAND_UNSAFE_HOST_EXEC=1。\n\n这会关闭沙箱隔离：AI 生成的命令（依赖安装、测试、自动修复重试、预览脚本）将以你的用户账户和环境【直接在本机执行】。恶意或有缺陷的生成命令可以读写你的文件、使用你的凭据。你需要对这些命令的行为承担全部责任。\n\n本次一次性确认将记录在本机的 makewand 配置中（风险声明 v%d）。每一次宿主执行都会写入审计日志。\n\n输入 \"yes\" 接受，输入其他内容拒绝：",

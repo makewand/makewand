@@ -105,8 +105,18 @@ func isProtectedWritePath(cleaned string) bool {
 	if len(parts) > 1 && parts[0] == "scripts" && strings.HasSuffix(strings.ToLower(slashed), ".sh") {
 		return true
 	}
+	// .makewand/rules.md is injected into every trusted-mode system prompt as
+	// "Project rules"; generated content (and code run by restricted plans)
+	// must never be able to plant persistent instructions there. Compared
+	// case-insensitively for case-insensitive filesystems.
+	if strings.EqualFold(slashed, protectedRulesPath) {
+		return true
+	}
 	return protectedWriteFiles[slashed]
 }
+
+// protectedRulesPath is the trusted project-rules file loaded by LoadRepoContext.
+const protectedRulesPath = ".makewand/rules.md"
 
 // NewProject creates a new project in the given directory.
 func NewProject(name, parentDir string) (*Project, error) {

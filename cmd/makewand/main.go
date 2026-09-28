@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,82 +74,173 @@ func resolveRepoTrust(value string) (model.RepoTrust, error) {
 	return trust, nil
 }
 
-func tryDelegateToPythonOrchestrator(args []string) bool {
-	if len(args) == 0 {
-		return false
+// pythonOrchestratorCmds are the subcommands implemented by the Python
+// orchestrator; the Go binary forwards them unchanged.
+var pythonOrchestratorCmds = map[string]bool{
+	"run": true, "review": true, "race": true, "observe": true,
+	"models": true, "candidates": true, "inspect": true, "apply": true,
+	"discard": true, "sandbox": true, "status": true, "probe": true,
+}
+
+// pythonDelegation is a command line routed to the Python orchestrator.
+type pythonDelegation struct {
+	subcmd string
+	args   []string // argv for the Python CLI (global flags first, then the subcommand)
+	notes  []string // non-fatal notices for stderr
+}
+
+// planPythonDelegation decides whether args name a Python orchestrator
+// subcommand. Root persistent flags (--repo-trust, --approval, --debug) may
+// precede the subcommand, in both "--flag value" and "--flag=value" forms, as
+// cobra's help advertises; they are skipped when looking for the subcommand.
+// It returns (nil, nil) when the command line belongs to the Go CLI.
+//
+// Forwarding: --repo-trust is understood by the Python CLI and forwarded.
+// --debug only controls Go-side routing traces and is dropped with a note.
+// --approval cannot be honored by the Python orchestrator (it has no approval
+// modes), so it is rejected rather than silently ignored - the same outcome the
+// Python CLI gives when --approval follows the subcommand.
+func planPythonDelegation(args []string) (*pythonDelegation, error) {
+	var (
+		globals  []string
+		approval string
+		debug    bool
+		i        int
+	)
+	flagValue := func(name string) (string, bool, error) {
+		arg := args[i]
+		if arg == name {
+			if i+1 >= len(args) {
+				return "", true, fmt.Errorf("flag needs an argument: %s", name)
+			}
+			i += 2
+			return args[i-1], true, nil
+		}
+		if value, ok := strings.CutPrefix(arg, name+"="); ok {
+			i++
+			return value, true, nil
+		}
+		return "", false, nil
 	}
-	subcmd := args[0]
-	orchestratorCmds := map[string]bool{
-		"run": true, "review": true, "race": true, "observe": true,
-		"models": true, "candidates": true, "inspect": true, "apply": true,
-		"discard": true, "sandbox": true, "status": true, "probe": true,
+scan:
+	for i < len(args) {
+		arg := args[i]
+		switch {
+		case arg == "--debug":
+			debug = true
+			i++
+		case strings.HasPrefix(arg, "--debug="):
+			value, err := strconv.ParseBool(strings.TrimPrefix(arg, "--debug="))
+			if err != nil {
+				return nil, fmt.Errorf("invalid --debug value %q", strings.TrimPrefix(arg, "--debug="))
+			}
+			debug = value
+			i++
+		default:
+			if value, ok, err := flagValue("--repo-trust"); ok {
+				if err != nil {
+					return nil, err
+				}
+				if _, err := resolveRepoTrust(value); err != nil {
+					return nil, err
+				}
+				globals = append(globals, "--repo-trust", value)
+				continue
+			}
+			if value, ok, err := flagValue("--approval"); ok {
+				if err != nil {
+					return nil, err
+				}
+				mode, err := resolveApprovalOverride(value)
+				if err != nil {
+					return nil, err
+				}
+				approval = mode
+				continue
+			}
+			break scan
+		}
 	}
-	if !orchestratorCmds[subcmd] {
-		return false
+	if i >= len(args) || !pythonOrchestratorCmds[args[i]] {
+		return nil, nil
+	}
+	subcmd := args[i]
+	rest := args[i+1:]
+	if approval != "" {
+		return nil, fmt.Errorf("--approval %s applies to makewand chat sessions only; %q is handled by the Python orchestrator, which has no approval modes, so it cannot be honored (remove --approval)", approval, subcmd)
 	}
 
 	// Validate --repo-trust early if present in delegated arguments
-	for i, arg := range args {
+	for j, arg := range rest {
 		var val string
 		if strings.HasPrefix(arg, "--repo-trust=") {
 			val = strings.TrimPrefix(arg, "--repo-trust=")
-		} else if arg == "--repo-trust" && i+1 < len(args) {
-			val = args[i+1]
+		} else if arg == "--repo-trust" && j+1 < len(rest) {
+			val = rest[j+1]
 		}
 		if val != "" {
 			if val != "trusted" && val != "untrusted" {
-				fmt.Fprintf(os.Stderr, "Error: invalid --repo-trust %q: must be \"trusted\" or \"untrusted\"\n", val)
-				os.Exit(1)
+				return nil, fmt.Errorf("invalid --repo-trust %q: must be \"trusted\" or \"untrusted\"", val)
 			}
 		}
 	}
 
-	// Normalize --mode / --tier across Go and Python boundary:
-	// Translate flag and values so Python receives --tier with canonical Python names.
+	delegation := &pythonDelegation{subcmd: subcmd}
+	if debug {
+		delegation.notes = append(delegation.notes, "note: --debug only affects makewand chat sessions; ignored for "+subcmd)
+	}
+	delegation.args = append(append(globals, subcmd), translatePythonTierArgs(rest)...)
+	return delegation, nil
+}
+
+// translatePythonTierArgs normalizes --mode / --tier across the Go and Python
+// boundary: Python receives --tier with canonical Python tier names.
+func translatePythonTierArgs(args []string) []string {
 	translatedArgs := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if arg == "--mode" && i+1 < len(args) {
-			modeVal := args[i+1]
+		if (arg == "--mode" || arg == "--tier") && i+1 < len(args) {
+			value := args[i+1]
 			i++
-			if pyTier, ok := engine.ToPythonTier(modeVal); ok {
-				translatedArgs = append(translatedArgs, "--tier", pyTier)
-			} else {
-				translatedArgs = append(translatedArgs, "--tier", modeVal)
+			if pyTier, ok := engine.ToPythonTier(value); ok {
+				value = pyTier
 			}
+			translatedArgs = append(translatedArgs, "--tier", value)
 			continue
 		}
-		if strings.HasPrefix(arg, "--mode=") {
-			modeVal := strings.TrimPrefix(arg, "--mode=")
-			if pyTier, ok := engine.ToPythonTier(modeVal); ok {
-				translatedArgs = append(translatedArgs, "--tier="+pyTier)
-			} else {
-				translatedArgs = append(translatedArgs, "--tier="+modeVal)
+		if value, ok := strings.CutPrefix(arg, "--mode="); ok {
+			if pyTier, ok := engine.ToPythonTier(value); ok {
+				value = pyTier
 			}
+			translatedArgs = append(translatedArgs, "--tier="+value)
 			continue
 		}
-		if arg == "--tier" && i+1 < len(args) {
-			tierVal := args[i+1]
-			i++
-			if pyTier, ok := engine.ToPythonTier(tierVal); ok {
-				translatedArgs = append(translatedArgs, "--tier", pyTier)
-			} else {
-				translatedArgs = append(translatedArgs, "--tier", tierVal)
+		if value, ok := strings.CutPrefix(arg, "--tier="); ok {
+			if pyTier, ok := engine.ToPythonTier(value); ok {
+				value = pyTier
 			}
-			continue
-		}
-		if strings.HasPrefix(arg, "--tier=") {
-			tierVal := strings.TrimPrefix(arg, "--tier=")
-			if pyTier, ok := engine.ToPythonTier(tierVal); ok {
-				translatedArgs = append(translatedArgs, "--tier="+pyTier)
-			} else {
-				translatedArgs = append(translatedArgs, "--tier="+tierVal)
-			}
+			translatedArgs = append(translatedArgs, "--tier="+value)
 			continue
 		}
 		translatedArgs = append(translatedArgs, arg)
 	}
-	args = translatedArgs
+	return translatedArgs
+}
+
+func tryDelegateToPythonOrchestrator(args []string) bool {
+	delegation, err := planPythonDelegation(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if delegation == nil {
+		return false
+	}
+	for _, note := range delegation.notes {
+		fmt.Fprintln(os.Stderr, note)
+	}
+	subcmd := delegation.subcmd
+	args = delegation.args
 
 	pyBin, err := exec.LookPath("python3")
 	if err != nil {
@@ -268,7 +360,11 @@ Flags:
       (fail closed), and repo-provided .makewand/rules.md is not treated as
       trusted instructions. Use it for third-party/unreviewed repositories.
   --approval manual|safe|autopilot  Approval mode for this run only (default:
-      configured value). Persist a default with 'makewand setup --approval ...'.`,
+      configured value). Persist a default with 'makewand setup --approval ...'.
+      autopilot generates and ranks several candidates, but it only applies one
+      automatically at verification Strength 2 (an independent acceptance
+      check). Local checks top out at Strength 1 because test results come from
+      candidate code, so autopilot currently always asks before writing.`,
 		Args: cobra.ArbitraryArgs,
 		// Validate --repo-trust once, globally, before any subcommand's RunE and
 		// before any backend check. This is a persistent flag, so a bad value must
@@ -351,7 +447,7 @@ Flags:
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
 	rootCmd.PersistentFlags().StringVar(&repoTrustFlag, "repo-trust", "trusted", "repository trust level: trusted (default) or untrusted (only direct API providers, fail closed)")
-	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`)")
+	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`; autopilot still asks before applying until Strength-2 verification exists)")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().StringVar(&rootModeFlag, "tier", "", "alias for --mode: fast, balanced (standard), power (deep)")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
@@ -518,6 +614,8 @@ balanced. Use --mode to save a different preference without starting the chat UI
 Use the global --approval flag to persist an approval mode (manual/safe/autopilot):
 setup saves its configuration, so 'makewand setup --approval safe' makes the
 override permanent while '--approval' on other commands applies to that run only.
+Note: autopilot only auto-applies candidates verified at Strength 2, which local
+checks cannot reach yet (maximum Strength 1), so it currently asks before writing.
 When MAKEWAND_UNSAFE_HOST_EXEC=1 is set, setup also offers the one-time host
 execution acknowledgment required before that opt-in takes effect.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -796,6 +894,11 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, r
 		if notice := headlessDeletionNotice(selection.DeletedFiles); notice != "" {
 			fmt.Fprintln(os.Stderr, notice)
 		}
+		// Likewise for the other parts of the candidate that are not in the
+		// printed change set, and for how weakly it was verified.
+		for _, notice := range headlessSelectionNotices(selection) {
+			fmt.Fprintln(os.Stderr, notice)
+		}
 		if strings.TrimSpace(selection.Content) == "" {
 			// Propagate the fail-closed sentinel the engine set when untrusted-repo
 			// mode had no untrusted-repo-safe provider, so the mapping below presents
@@ -875,6 +978,32 @@ func headlessDeletionNotice(deleted []string) string {
 	}
 	return fmt.Sprintf("[makewand] %s",
 		fmt.Sprintf(i18n.Msg().AutomationCandidateDeletions, strings.Join(deleted, ", ")))
+}
+
+// headlessSelectionNotices formats the stderr notices for a candidate
+// selection besides deletions: discarded test-file edits (the printed content
+// is the verified set, which keeps the baseline tests), oversized files that
+// were not included, and how the printed candidate was (not) verified.
+func headlessSelectionNotices(selection engine.CandidateSelection) []string {
+	msg := i18n.Msg()
+	var notices []string
+	if len(selection.RestoredTests) > 0 {
+		notices = append(notices, "[makewand] "+fmt.Sprintf(msg.AutomationCandidateRestoredTests, strings.Join(selection.RestoredTests, ", ")))
+	}
+	if len(selection.LargeFiles) > 0 {
+		notices = append(notices, "[makewand] "+fmt.Sprintf(msg.AutomationCandidateLargeFiles, strings.Join(selection.LargeFiles, ", ")))
+	}
+	if strings.TrimSpace(selection.Content) != "" && !selection.Verified {
+		switch {
+		case selection.NotVerifiedReason != "":
+			notices = append(notices, "[makewand] "+fmt.Sprintf(msg.AutomationCandidateIsolationUnavailable, selection.NotVerifiedReason))
+		case selection.NoTestsExecuted:
+			notices = append(notices, "[makewand] "+msg.AutomationCandidateNoTests)
+		case selection.Strength > 0:
+			notices = append(notices, "[makewand] "+msg.AutomationCandidateWeakVerification)
+		}
+	}
+	return notices
 }
 
 func shouldUseHeadlessCandidateSelection(cfg *config.Config, task model.TaskType, project *engine.Project) bool {

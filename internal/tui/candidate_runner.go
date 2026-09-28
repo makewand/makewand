@@ -53,12 +53,13 @@ func (s candidateSelection) contentError(generic error) error {
 type candidateProgressStage = engine.CandidateProgressStage
 
 const (
-	candidateProgressRunning   = engine.CandidateProgressRunning
-	candidateProgressVerifying = engine.CandidateProgressVerifying
-	candidateProgressPassed    = engine.CandidateProgressPassed
-	candidateProgressRejected  = engine.CandidateProgressRejected
-	candidateProgressFailed    = engine.CandidateProgressFailed
-	candidateProgressCanceled  = engine.CandidateProgressCanceled
+	candidateProgressRunning    = engine.CandidateProgressRunning
+	candidateProgressVerifying  = engine.CandidateProgressVerifying
+	candidateProgressPassed     = engine.CandidateProgressPassed
+	candidateProgressRejected   = engine.CandidateProgressRejected
+	candidateProgressFailed     = engine.CandidateProgressFailed
+	candidateProgressCanceled   = engine.CandidateProgressCanceled
+	candidateProgressUnverified = engine.CandidateProgressUnverified
 )
 
 type candidateProgressReporter struct {
@@ -150,6 +151,8 @@ func formatCandidateProgress(provider string, stage candidateProgressStage) stri
 		return fmt.Sprintf(msg.AutomationCandidateFailed, provider)
 	case candidateProgressCanceled:
 		return fmt.Sprintf(msg.AutomationCandidateCanceled, provider)
+	case candidateProgressUnverified:
+		return fmt.Sprintf(msg.AutomationCandidateUnverified, provider)
 	default:
 		return fmt.Sprintf(msg.AutomationCandidateRunning, provider)
 	}
@@ -177,7 +180,6 @@ func runCandidateSelectionWithActivity(
 		}
 	}, exclude...)
 
-	msg := i18n.Msg()
 	provider := selection.Provider
 	if provider == "" {
 		provider = selection.Usage.Provider
@@ -191,22 +193,40 @@ func runCandidateSelectionWithActivity(
 		digest:   selection.VerifiedDigest,
 		err:      selection.Err,
 	}
+	local.selectionNote = candidateSelectionNote(selection)
+	return local
+}
+
+// candidateSelectionNote renders the user-facing notes for a candidate
+// selection: how (and whether) it was verified, plus every part of the
+// candidate that is NOT delivered (deletions, discarded test edits, oversized
+// files), so nothing is dropped silently.
+func candidateSelectionNote(selection engine.CandidateSelection) string {
+	msg := i18n.Msg()
+	hasContent := strings.TrimSpace(selection.Content) != ""
 	var notes []string
 	switch {
 	case selection.Verified && selection.Provider != "":
 		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateSelected, selection.Provider, selection.PassedCount, selection.TotalCandidates))
 	case selection.NotVerifiedReason != "":
 		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateIsolationUnavailable, selection.NotVerifiedReason))
-	case strings.TrimSpace(selection.Content) != "" && selection.Strength > 0:
+	case hasContent && selection.NoTestsExecuted:
+		notes = append(notes, msg.AutomationCandidateNoTests)
+	case hasContent && selection.Strength > 0:
 		notes = append(notes, msg.AutomationCandidateWeakVerification)
-	case strings.TrimSpace(selection.Content) != "":
+	case hasContent:
 		notes = append(notes, msg.AutomationCandidateFallback)
 	}
 	if len(selection.DeletedFiles) > 0 {
 		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateDeletions, strings.Join(selection.DeletedFiles, ", ")))
 	}
-	local.selectionNote = strings.Join(notes, "\n")
-	return local
+	if len(selection.RestoredTests) > 0 {
+		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateRestoredTests, strings.Join(selection.RestoredTests, ", ")))
+	}
+	if len(selection.LargeFiles) > 0 {
+		notes = append(notes, fmt.Sprintf(msg.AutomationCandidateLargeFiles, strings.Join(selection.LargeFiles, ", ")))
+	}
+	return strings.Join(notes, "\n")
 }
 
 func shouldRecordCandidateQuality(attempt candidateAttempt) bool {

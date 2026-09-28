@@ -38,17 +38,6 @@ var (
 	}
 )
 
-var previewSensitiveHomeEntries = []string{
-	".ssh",
-	".aws",
-	".gnupg",
-	".kube",
-	".config",
-	".netrc",
-	".npmrc",
-	".pypirc",
-}
-
 // wrapPreviewProjectCommand wraps project-defined preview scripts in an isolated
 // runtime. By default this requires bubblewrap on Linux. Users can explicitly
 // bypass this with MAKEWAND_UNSAFE_HOST_EXEC=1 once the one-time host execution
@@ -89,6 +78,8 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
 
+	layout := buildSandboxHomeLayout(previewHome(), projectPath, pathEnv, previewGetenv)
+
 	wrapped := []string{
 		"--die-with-parent",
 		"--new-session",
@@ -106,7 +97,16 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		// S05 defense: Mask system Unix domain sockets and host IPC runtimes
 		"--tmpfs", "/var/tmp",
 		"--tmpfs", "/run",
-		"--bind", projectPath, projectPath,
+	}
+	// Hide the host HOME (re-binding only toolchains, read-only) before the
+	// project bind so a project under HOME stays visible and writable.
+	wrapped = append(wrapped, layout.beforeWorkspace...)
+	wrapped = append(wrapped, "--bind", projectPath, projectPath)
+	wrapped = append(wrapped, layout.afterWorkspace...)
+	if gitDir := filepath.Join(projectPath, ".git"); isRealDirOrFile(gitDir) {
+		wrapped = append(wrapped, "--ro-bind", gitDir, gitDir)
+	}
+	wrapped = append(wrapped,
 		"--chdir", projectPath,
 		"--clearenv",
 		"--setenv", "PATH", pathEnv,
@@ -114,46 +114,32 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		"--setenv", "TMPDIR", "/tmp",
 		"--setenv", "NO_COLOR", "1",
 		"--setenv", "MAKEWAND_SANDBOX", "1",
-	}
+	)
+	wrapped = append(wrapped, layout.setenvArgs()...)
 	for _, key := range []string{"LANG", "LC_ALL", "LC_CTYPE", "TERM"} {
 		value := strings.TrimSpace(previewGetenv(key))
 		if value != "" {
 			wrapped = append(wrapped, "--setenv", key, value)
 		}
 	}
-	wrapped = append(wrapped, previewHomeMaskArgs(projectPath)...)
 	wrapped = append(wrapped, command)
 	wrapped = append(wrapped, args...)
 	return bwrapPath, wrapped, nil
 }
 
-func previewHomeMaskArgs(projectPath string) []string {
+func previewHome() string {
 	home, err := previewUserHome()
 	if err != nil {
-		return nil
+		return ""
 	}
-	home = strings.TrimSpace(home)
-	if home == "" {
-		return nil
-	}
-	home = filepath.Clean(home)
+	return home
+}
 
-	// If the project lives outside HOME, hide the entire host home tree.
-	if !pathWithin(home, projectPath) {
-		return []string{"--tmpfs", home}
-	}
-
-	// If the project is under HOME, mask common sensitive subpaths but keep
-	// the project path accessible.
-	out := make([]string, 0, len(previewSensitiveHomeEntries)*2)
-	for _, entry := range previewSensitiveHomeEntries {
-		target := filepath.Join(home, entry)
-		if pathWithin(target, projectPath) {
-			continue
-		}
-		out = append(out, "--tmpfs", target)
-	}
-	return out
+// isRealDirOrFile reports whether path is a real directory or regular file (not
+// a symlink). Only such paths may be bound: bubblewrap follows symlinks.
+func isRealDirOrFile(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && (info.IsDir() || info.Mode().IsRegular())
 }
 
 func pathWithin(base, target string) bool {

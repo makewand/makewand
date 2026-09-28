@@ -370,8 +370,10 @@ func TestRunCandidateSelection_StrengthOneCandidateIsNotAutoVerified(t *testing.
 	if strings.TrimSpace(selection.content) == "" {
 		t.Fatal("selection.content = empty, want fallback content for manual approval")
 	}
-	if selection.selectionNote != i18n.Msg().AutomationCandidateWeakVerification {
-		t.Fatalf("selectionNote = %q, want weak verification notice", selection.selectionNote)
+	// "go test ./..." ran zero tests: the note must say no tests executed
+	// rather than the generic weak-verification wording.
+	if selection.selectionNote != i18n.Msg().AutomationCandidateNoTests {
+		t.Fatalf("selectionNote = %q, want no-tests notice", selection.selectionNote)
 	}
 }
 

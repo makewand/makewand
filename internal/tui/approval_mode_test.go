@@ -206,7 +206,12 @@ func TestAutopilotBuildFallsBackToManualWhenCandidateUnverified(t *testing.T) {
 	if app.state != StateConfirmFiles {
 		t.Fatalf("state = %v, want %v", app.state, StateConfirmFiles)
 	}
-	if !chatContainsMessage(app, i18n.Msg().AutomationCandidateFallback) {
-		t.Fatalf("chat missing autopilot fallback message: %+v", app.chat.messages)
+	// The notice must explain the Strength-2 requirement honestly instead of
+	// claiming that no candidate passed local verification.
+	if !chatContainsMessage(app, i18n.Msg().AutopilotApprovalRequired) {
+		t.Fatalf("chat missing autopilot approval explanation: %+v", app.chat.messages)
+	}
+	if chatContainsMessage(app, i18n.Msg().AutomationCandidateFallback) {
+		t.Fatalf("chat claims no candidate passed local verification: %+v", app.chat.messages)
 	}
 }

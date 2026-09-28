@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -112,13 +113,17 @@ func TestWrapPreviewProjectCommand_UnsafeRequestedWithoutAck(t *testing.T) {
 	}
 }
 
-func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
+// fakePreviewSandbox installs a Linux host with working bubblewrap and a real
+// (temporary) HOME for the preview wrapper, restoring everything afterwards.
+func fakePreviewSandbox(t *testing.T) string {
+	t.Helper()
 	oldGOOS := previewGOOS
 	oldUnsafe := previewUnsafe
 	oldLookPath := previewLookPath
 	oldUserHome := previewUserHome
 	oldGetenv := previewGetenv
 	oldSelfTest := previewBwrapSelfTest
+	oldGoEnvProbe := sandboxGoEnvProbe
 	t.Cleanup(func() {
 		previewGOOS = oldGOOS
 		previewUnsafe = oldUnsafe
@@ -126,12 +131,14 @@ func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
 		previewUserHome = oldUserHome
 		previewGetenv = oldGetenv
 		previewBwrapSelfTest = oldSelfTest
+		sandboxGoEnvProbe = oldGoEnvProbe
 	})
 
+	home := t.TempDir()
 	previewGOOS = "linux"
 	previewUnsafe = func() bool { return false }
 	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
-	previewUserHome = func() (string, error) { return "/home/alice", nil }
+	previewUserHome = func() (string, error) { return home, nil }
 	previewBwrapSelfTest = func(string) error { return nil }
 	previewGetenv = func(key string) string {
 		if key == "PATH" {
@@ -139,6 +146,12 @@ func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
 		}
 		return ""
 	}
+	sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return hostGoEnv{}, errors.New("go env disabled in unit tests") }
+	return home
+}
+
+func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
+	home := fakePreviewSandbox(t)
 
 	cmd, args, err := wrapPreviewProjectCommand("/tmp/demo", "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
 	if err != nil {
@@ -159,49 +172,39 @@ func TestWrapPreviewProjectCommand_BwrapWrapsCommand(t *testing.T) {
 	if !containsArgPair(args, "HOME", "/tmp") {
 		t.Fatalf("wrapped args should set HOME=/tmp; got %v", args)
 	}
-	if !containsArgPair(args, "--tmpfs", "/home/alice") {
+	if !containsArgPair(args, "--tmpfs", home) {
 		t.Fatalf("wrapped args should mask host HOME; got %v", args)
 	}
 }
 
-func TestWrapPreviewProjectCommand_MasksSensitiveHomeSubpathsWhenProjectInsideHome(t *testing.T) {
-	oldGOOS := previewGOOS
-	oldUnsafe := previewUnsafe
-	oldLookPath := previewLookPath
-	oldUserHome := previewUserHome
-	oldGetenv := previewGetenv
-	oldSelfTest := previewBwrapSelfTest
-	t.Cleanup(func() {
-		previewGOOS = oldGOOS
-		previewUnsafe = oldUnsafe
-		previewLookPath = oldLookPath
-		previewUserHome = oldUserHome
-		previewGetenv = oldGetenv
-		previewBwrapSelfTest = oldSelfTest
-	})
-
-	previewGOOS = "linux"
-	previewUnsafe = func() bool { return false }
-	previewLookPath = func(string) (string, error) { return "/usr/bin/bwrap", nil }
-	previewUserHome = func() (string, error) { return "/home/alice", nil }
-	previewBwrapSelfTest = func(string) error { return nil }
-	previewGetenv = func(key string) string {
-		if key == "PATH" {
-			return "/usr/bin:/bin"
-		}
-		return ""
+// A project under HOME used to get per-entry masks (--tmpfs HOME/.ssh, ...):
+// missing or file entries made bwrap fail with "Can't mkdir", and everything
+// not on the list (AI CLI credentials, .git-credentials, ...) stayed readable.
+// HOME is now hidden wholesale BEFORE the project bind re-exposes the project.
+func TestWrapPreviewProjectCommand_HidesWholeHomeWhenProjectInsideHome(t *testing.T) {
+	home := fakePreviewSandbox(t)
+	projectPath := filepath.Join(home, "work", "demo")
+	if err := os.MkdirAll(projectPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".netrc"), []byte("machine x password y\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	projectPath := "/home/alice/work/demo"
 	_, args, err := wrapPreviewProjectCommand(projectPath, "npm", []string{"run", "dev"}, UnsafeHostExecAuthorization{})
 	if err != nil {
 		t.Fatalf("wrapPreviewProjectCommand: %v", err)
 	}
-	if containsArgPair(args, "--tmpfs", "/home/alice") {
-		t.Fatalf("project under HOME should not mask entire HOME; got %v", args)
+	tmpfsIdx := argPairIndex(args, "--tmpfs", home)
+	bindIdx := argPairIndex(args, "--bind", projectPath)
+	if tmpfsIdx < 0 || bindIdx < 0 || tmpfsIdx > bindIdx {
+		t.Fatalf("HOME tmpfs (idx %d) must precede the project bind (idx %d): %v", tmpfsIdx, bindIdx, args)
 	}
-	if !containsArgPair(args, "--tmpfs", "/home/alice/.ssh") {
-		t.Fatalf("expected sensitive HOME path mask for .ssh; got %v", args)
+	for _, entry := range []string{".ssh", ".aws", ".netrc", ".npmrc"} {
+		target := filepath.Join(home, entry)
+		if containsArgPair(args, "--tmpfs", target) || containsArgPair(args, os.DevNull, target) {
+			t.Fatalf("per-entry mask for %s is unnecessary (and breaks on missing/file entries): %v", entry, args)
+		}
 	}
 }
 
@@ -255,6 +258,16 @@ func containsArg(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// argPairIndex returns the index of the first "left right" pair, or -1.
+func argPairIndex(args []string, left, right string) int {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == left && args[i+1] == right {
+			return i
+		}
+	}
+	return -1
 }
 
 func containsArgPair(args []string, left, right string) bool {

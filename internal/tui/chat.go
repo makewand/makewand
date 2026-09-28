@@ -53,7 +53,7 @@ var modelSlashCommandSuggestions = []slashCommandSuggestion{
 var approvalSlashCommandSuggestions = []slashCommandSuggestion{
 	{Command: "/approval manual", Description: "Ask before writes and execution"},
 	{Command: "/approval safe", Description: "Auto-approve safe writes and checks"},
-	{Command: "/approval autopilot", Description: "Auto-select verified candidates"},
+	{Command: "/approval autopilot", Description: "Rank candidates by local checks; still asks before applying"},
 }
 
 // ChatMessage represents a message in the chat panel.

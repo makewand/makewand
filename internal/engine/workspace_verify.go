@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/parser"
 	"go/token"
@@ -21,14 +22,18 @@ import (
 )
 
 type fileCheckpointEntry struct {
-	Path       string
-	Existed    bool
-	Content    string
-	BackupPath string
-	Mode       os.FileMode
-	Nlink      uint64
-	Dev        uint64
-	Ino        uint64
+	Path    string
+	Existed bool
+	// CreatedDirs lists the parent directories (project-relative, deepest
+	// first) that did not exist at checkpoint time. WriteFiles creates them for
+	// a new file; Restore removes them again when they are left empty.
+	CreatedDirs []string
+	Content     string
+	BackupPath  string
+	Mode        os.FileMode
+	Nlink       uint64
+	Dev         uint64
+	Ino         uint64
 }
 
 // FileCheckpoint stores the pre-change state for a set of project files.
@@ -60,7 +65,9 @@ type CandidateVerification struct {
 	HasTests          bool
 	Isolated          bool     // external commands ran inside the bubblewrap sandbox
 	IsolationError    string   // why verification could not execute commands (fail closed)
+	EnvironmentError  bool     // a check could not run for environment reasons (sandbox setup, host toolchain), not because the candidate failed it
 	NoTestsRan        bool     // the test command succeeded but executed no actual tests
+	NoTestPlan        bool     // the baseline defines no test command: only quick checks ran, nothing was verified
 	BaselineTests     bool     // the baseline workspace defined its own test plan
 	RestoredTests     []string // baseline test files restored before verification
 	QuickCheckPlans   []ExecPlan
@@ -186,8 +193,9 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 
 		if os.IsNotExist(statErr) {
 			entries = append(entries, fileCheckpointEntry{
-				Path:    f.Path,
-				Existed: false,
+				Path:        f.Path,
+				Existed:     false,
+				CreatedDirs: p.missingParentDirs(f.Path),
 			})
 			continue
 		}
@@ -362,11 +370,56 @@ func (c *FileCheckpoint) Restore() error {
 		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", entry.Path, err)
 		}
+		c.removeCreatedDirs(entry.CreatedDirs)
 	}
 
 	// Only clean up temporary backups when ALL files have been successfully restored!
 	c.Cleanup()
 	return nil
+}
+
+// missingParentDirs returns the parent directories of relPath that do not
+// exist yet, deepest first.
+func (p *Project) missingParentDirs(relPath string) []string {
+	var missing []string
+	dir := filepath.Dir(filepath.Clean(relPath))
+	for dir != "." && dir != string(filepath.Separator) && dir != "" {
+		if _, err := os.Lstat(filepath.Join(p.Path, dir)); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			break
+		}
+		missing = append(missing, dir)
+		dir = filepath.Dir(dir)
+	}
+	return missing
+}
+
+// removeCreatedDirs removes directories a rolled-back write created, deepest
+// first, stopping at the first one that is not empty (it holds other files
+// now) or cannot be removed. Root-confined so a swapped symlink cannot
+// redirect the removal.
+func (c *FileCheckpoint) removeCreatedDirs(dirs []string) {
+	if len(dirs) == 0 {
+		return
+	}
+	root, err := os.OpenRoot(c.project.Path)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	for _, dir := range dirs {
+		info, err := root.Lstat(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return
+		}
+		if !info.IsDir() || root.Remove(dir) != nil {
+			return
+		}
+	}
 }
 
 // CloneToTemp copies the project into a temporary directory for isolated checks.
@@ -468,6 +521,11 @@ func (p *Project) EvaluateCandidateFiles(ctx context.Context, files []ExtractedF
 	// candidate-controlled metadata can choose a different runner.
 	contract, err := p.baselineVerificationContract()
 	if err != nil {
+		return CandidateVerification{}, err
+	}
+	// Per-run canary tests (clone only, planted before the input digest so the
+	// integrity check covers them) make blind test-output forgery detectable.
+	if err := contract.plantGoCanaries(clone); err != nil {
 		return CandidateVerification{}, err
 	}
 	sealed, err := snapshotCandidateFiles(clone, applied)
@@ -842,34 +900,76 @@ func (p *Project) ChangedFilesAgainst(base *Project) ([]ExtractedFile, error) {
 // exist in p. Callers must surface deletions to the user; they are never
 // silently dropped.
 func (p *Project) ChangedFilesAgainstWithDeletions(base *Project) ([]ExtractedFile, []string, error) {
+	diff, err := p.DiffAgainst(base)
+	return diff.Files, diff.Deleted, err
+}
+
+// CandidateDiff is the change set of a candidate workspace against its base.
+type CandidateDiff struct {
+	// Files are the added/modified files that can be verified and applied.
+	Files []ExtractedFile
+	// Deleted are baseline files missing from the candidate workspace.
+	Deleted []string
+	// LargeChanged are files over the size limit for verified changes
+	// (maxReadFileSize) that the candidate added or modified. They cannot be
+	// verified or applied and are reported instead of failing the candidate.
+	LargeChanged []string
+	// LargeUnchanged are files over the size limit that the candidate left
+	// untouched (compared by streaming, never loaded into memory). They are
+	// skipped and recorded.
+	LargeUnchanged []string
+}
+
+// DiffAgainst compares the workspace p with base. Files larger than the
+// verified-change limit never fail the diff: unchanged ones are skipped and
+// recorded, changed ones are reported as not applicable.
+func (p *Project) DiffAgainst(base *Project) (CandidateDiff, error) {
+	var diff CandidateDiff
 	if p == nil || base == nil {
-		return nil, nil, nil
+		return diff, nil
 	}
 	if err := p.ScanFiles(); err != nil {
-		return nil, nil, err
+		return diff, err
 	}
 
 	present := make(map[string]struct{}, len(p.Files))
-	var files []ExtractedFile
 	for _, entry := range p.Files {
 		if entry.IsDir || entry.Path == "." {
 			continue
 		}
 		present[entry.Path] = struct{}{}
+		fullPath := filepath.Join(p.Path, entry.Path)
+		info, statErr := os.Lstat(fullPath)
+		if statErr != nil {
+			return CandidateDiff{}, statErr
+		}
+		basePath := filepath.Join(base.Path, entry.Path)
+		baseInfo, baseStatErr := os.Lstat(basePath)
+		if info.Mode().IsRegular() && info.Size() > maxReadFileSize {
+			same := baseStatErr == nil && baseInfo.Mode().IsRegular() && baseInfo.Mode().Perm() == info.Mode().Perm()
+			if same {
+				equal, err := sameFileContent(fullPath, basePath)
+				if err != nil {
+					return CandidateDiff{}, err
+				}
+				same = equal
+			}
+			if same {
+				diff.LargeUnchanged = append(diff.LargeUnchanged, entry.Path)
+			} else {
+				diff.LargeChanged = append(diff.LargeChanged, entry.Path)
+			}
+			continue
+		}
 		content, err := p.ReadFile(entry.Path)
 		if err != nil {
-			return nil, nil, err
+			return CandidateDiff{}, err
 		}
-		info, statErr := os.Lstat(filepath.Join(p.Path, entry.Path))
-		if statErr != nil {
-			return nil, nil, statErr
-		}
-		baseInfo, baseStatErr := os.Lstat(filepath.Join(base.Path, entry.Path))
 		baseContent, err := base.ReadFile(entry.Path)
 		if err == nil && baseStatErr == nil && baseContent == content && baseInfo.Mode().Perm() == info.Mode().Perm() {
 			continue
 		}
-		files = append(files, ExtractedFile{
+		diff.Files = append(diff.Files, ExtractedFile{
 			Path:    entry.Path,
 			Content: content,
 			Mode:    info.Mode().Perm(), ModeKnown: true,
@@ -878,21 +978,56 @@ func (p *Project) ChangedFilesAgainstWithDeletions(base *Project) ([]ExtractedFi
 
 	// base.Files is a read-only snapshot here; do not rescan base because it may
 	// be shared across concurrent candidate attempts.
-	var deleted []string
 	for _, entry := range base.Files {
 		if entry.IsDir || entry.Path == "." {
 			continue
 		}
 		if _, ok := present[entry.Path]; !ok {
-			deleted = append(deleted, entry.Path)
+			diff.Deleted = append(diff.Deleted, entry.Path)
 		}
 	}
 
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Path < files[j].Path
+	sort.Slice(diff.Files, func(i, j int) bool {
+		return diff.Files[i].Path < diff.Files[j].Path
 	})
-	sort.Strings(deleted)
-	return files, deleted, nil
+	sort.Strings(diff.Deleted)
+	sort.Strings(diff.LargeChanged)
+	sort.Strings(diff.LargeUnchanged)
+	return diff, nil
+}
+
+// sameFileContent streams two files and reports whether their bytes match.
+func sameFileContent(a, b string) (bool, error) {
+	fa, err := os.Open(a)
+	if err != nil {
+		return false, err
+	}
+	defer fa.Close()
+	fb, err := os.Open(b)
+	if err != nil {
+		return false, err
+	}
+	defer fb.Close()
+	bufA := make([]byte, 64<<10)
+	bufB := make([]byte, 64<<10)
+	for {
+		na, errA := io.ReadFull(fa, bufA)
+		nb, errB := io.ReadFull(fb, bufB)
+		if na != nb || string(bufA[:na]) != string(bufB[:nb]) {
+			return false, nil
+		}
+		endA := errA == io.EOF || errA == io.ErrUnexpectedEOF
+		endB := errB == io.EOF || errB == io.ErrUnexpectedEOF
+		if errA != nil && !endA {
+			return false, errA
+		}
+		if errB != nil && !endB {
+			return false, errB
+		}
+		if endA || endB {
+			return endA && endB, nil
+		}
+	}
 }
 
 // mergeCandidateFiles unions model-reported FILE blocks with the clone diff.
@@ -994,6 +1129,7 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		}
 		if err != nil {
 			report.DepsError = err.Error()
+			report.EnvironmentError = isEnvironmentExecError(err)
 			return report
 		}
 		if result != nil && result.ExitCode != 0 {
@@ -1022,6 +1158,7 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		}
 		if err != nil {
 			report.TestsError = err.Error()
+			report.EnvironmentError = isEnvironmentExecError(err)
 			return report
 		}
 		if result != nil && result.ExitCode != 0 {
@@ -1045,8 +1182,11 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		return report
 	}
 
-	report.Passed = true
-	report.Strength = 1
+	// No baseline test plan: only syntax/compile quick checks ran. That is not
+	// verification, so the candidate is reported as unverified (never Passed)
+	// and callers present it as "no tests were executed".
+	report.NoTestPlan = true
+	report.NoTestsRan = true
 	return report
 }
 
@@ -1153,6 +1293,7 @@ func (p *Project) runExternalQuickChecks(ctx context.Context, files []ExtractedF
 		}
 		if err != nil {
 			report.QuickCheckError = err.Error()
+			report.EnvironmentError = isEnvironmentExecError(err)
 			return false
 		}
 		if result != nil && result.ExitCode != 0 {
@@ -1245,6 +1386,13 @@ func slicesEqual(a, b []string) bool {
 func commandAvailable(command string) bool {
 	_, err := exec.LookPath(command)
 	return err == nil
+}
+
+// isEnvironmentExecError reports whether a RunVerificationPlan error means
+// the check could not run (sandbox setup, host toolchain, ...) rather than the
+// candidate misbehaving. Touching protected paths is the candidate's doing.
+func isEnvironmentExecError(err error) bool {
+	return err != nil && !errors.Is(err, ErrProtectedPathsModified)
 }
 
 func execFailureDetail(result *ExecResult) string {
