@@ -98,15 +98,22 @@ class TestOrchestrator(unittest.TestCase):
         self.assertTrue(has_critical_defects("检测到 race condition 和数据竞态"))
         self.assertTrue(has_critical_defects("LGTM; race condition in worker"))
 
-        # Clean passes with natural language
-        self.assertFalse(has_critical_defects("经审查，代码未发现严重漏洞，LGTM，建议直接合并"))
-        self.assertFalse(has_critical_defects("所有用例均通过且无安全漏洞，审核通过"))
-        self.assertFalse(has_critical_defects("没有发现明显缺陷，无需修改"))
+        # Free-text approval without a MAKEWAND_VERDICT line is UNVERIFIED and therefore fail-closed
+        # (py-orchestrator#4 / replay-0926-memory#5): keywords can no longer approve a change.
+        self.assertTrue(has_critical_defects("经审查，代码未发现严重漏洞，LGTM，建议直接合并"))
+        self.assertTrue(has_critical_defects("所有用例均通过且无安全漏洞，审核通过"))
+        self.assertTrue(has_critical_defects("没有发现明显缺陷，无需修改"))
 
-        # Crucial: Negation phrases must NOT trigger false defects!
-        self.assertFalse(has_critical_defects("经检查，未发现并发死锁，没有发现内存泄漏，亦无数据竞态隐患，表现良好。"))
-        self.assertFalse(has_critical_defects("Review result: no deadlock, no race condition, without any defect. Looks good!"))
-        self.assertFalse(has_critical_defects("经过分析，代码中不存在死锁，没有发现缺陷，建议合并。"))
+        # The structured verdict is authoritative: prose mentioning deadlocks/leaks/[P1] cannot veto an explicit
+        # pass=true verdict (arch-product#1), whether or not the prose is negated.
+        self.assertFalse(has_critical_defects(
+            "经检查，未发现并发死锁，没有发现内存泄漏，亦无数据竞态隐患，表现良好。\n"
+            "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"))
+        self.assertFalse(has_critical_defects(
+            "Review result: no deadlock, no race condition, without any defect. Looks good!\n"
+            "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"))
+        self.assertFalse(has_critical_defects(
+            "我重点检查了并发死锁与内存泄露风险，LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"))
 
         # Structural JSON verdicts
         self.assertFalse(has_critical_defects(
@@ -319,13 +326,15 @@ class TestOrchestrator(unittest.TestCase):
         self.assertFalse(v4["pass"])
         self.assertFalse(is_review_passed(text_contradiction))
 
-        # 5. Contradiction: body text contains [P1] defect but final JSON claimed pass=True with empty defects
+        # 5. Body text mentions [P1] but the explicit structured verdict is pass=true with empty defects:
+        # per the verdict contract the MAKEWAND_VERDICT line is authoritative and keywords cannot override it
+        # (arch-product#1). Reviewers must put real defects into the verdict's defects array.
         text_body_p1_contradiction = (
             "Review Summary:\n"
             "1. [P1] External symlink write-through vulnerability detected.\n"
             "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"
         )
-        self.assertFalse(is_review_passed(text_body_p1_contradiction))
+        self.assertTrue(is_review_passed(text_body_p1_contradiction))
 
     def test_shadow_delivery_artifact_isolation(self):
         from makewand.git_helper import run_git_cmd, ShadowWorktreeResult
