@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import makewand.orchestrator as orch
 from makewand.git_helper import ShadowWorktreeResult, run_git_cmd
+import makewand.config as makewand_config
 
 
 def git(path, *args):
@@ -40,12 +41,12 @@ class DeliveryBindingTests(unittest.TestCase):
         shutil.copytree(self.base, self.shadow)
         self.branch = "makewand/delivery-regression"
         self.reviewed = False
-        self.artifacts_before = set(Path("/tmp/makewand-artifacts").glob("delivery_*"))
+        self.artifacts_before = set(Path(makewand_config.ARTIFACTS_DIR).glob("delivery_*"))
         self.addCleanup(self.clean_artifacts)
 
     def delivery_artifacts(self):
         result = set()
-        for path in set(Path("/tmp/makewand-artifacts").glob("delivery_*")) - self.artifacts_before:
+        for path in set(Path(makewand_config.ARTIFACTS_DIR).glob("delivery_*")) - self.artifacts_before:
             manifest = path / "delivery_manifest.json"
             if manifest.exists() and json.loads(manifest.read_text()).get("repo_root") == str(self.base):
                 result.add(path)

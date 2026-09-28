@@ -35,6 +35,7 @@ from makewand.providers.muse import execute_muse_task
 from makewand.providers.aider import execute_aider_task
 from makewand.providers.agy import execute_agy_task
 from makewand.interactive import handle_conversational_turn
+import makewand.config as makewand_config
 
 
 class TestAuditV31Fixes(unittest.TestCase):
@@ -443,7 +444,7 @@ class TestAuditV31Fixes(unittest.TestCase):
                  patch("makewand.orchestrator.execute_claude_task", side_effect=buggy_coder), \
                  patch("makewand.orchestrator.execute_codex_task", return_value=(True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"bug\"]}", None)):
                 run_pipeline("fix code", cwd=td, stream=False, auto_fix=False, force_code=True)
-                rej_dirs = list(Path("/tmp/makewand-artifacts").glob("rejected_*"))
+                rej_dirs = list(Path(makewand_config.ARTIFACTS_DIR).glob("rejected_*"))
                 self.assertTrue(len(rej_dirs) > 0)
                 latest_rej = sorted(rej_dirs, key=lambda d: d.stat().st_mtime)[-1]
                 patch_file = latest_rej / "rejected.patch"

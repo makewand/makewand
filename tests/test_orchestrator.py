@@ -19,6 +19,7 @@ from makewand.orchestrator import (
     EXIT_FAILED,
     EXIT_UNVERIFIED
 )
+import makewand.config as makewand_config
 
 class TestOrchestrator(unittest.TestCase):
     def test_detect_task_tier(self):
@@ -503,7 +504,7 @@ class TestOrchestrator(unittest.TestCase):
                 (Path(cwd) / "file.txt").write_text("updated by task")
                 return True, "Code updated", None
 
-            art_base = Path("/tmp/makewand-artifacts")
+            art_base = Path(makewand_config.ARTIFACTS_DIR)
             pre_dirs = set(art_base.glob("delivery_*")) if art_base.exists() else set()
 
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(False, "Active session")), \
@@ -634,7 +635,7 @@ class TestOrchestrator(unittest.TestCase):
                 sub_baselines={"lib:colon_dir": sub_base_hash.strip()}
             )
 
-            art_base = Path("/tmp/makewand-artifacts")
+            art_base = Path(makewand_config.ARTIFACTS_DIR)
             pre_dirs = set(art_base.glob("delivery_*")) if art_base.exists() else set()
 
             def mock_coder(prompt, cwd=None, **kwargs):

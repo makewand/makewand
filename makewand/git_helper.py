@@ -3,13 +3,35 @@ Git workspace resilience and isolated worktree management.
 """
 
 import os
+import sys
+import stat
+import time
+import errno
 import shutil
+import hashlib
+import tempfile
 import subprocess
 import json
 import shlex
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Union
-from makewand.config import c, COLOR_YELLOW, COLOR_RED
+import makewand.config as config
+from makewand.config import c, COLOR_YELLOW, COLOR_RED, ensure_private_dir
+
+# Every git subprocess shares one generous, configurable timeout. A timeout is
+# reported as rc=-1; callers that establish baselines or restore state must
+# treat any non-zero rc as a hard failure (see HostWorkspaceTransaction).
+DEFAULT_GIT_TIMEOUT = 300.0
+
+
+def get_git_timeout() -> float:
+    raw = os.environ.get("MAKEWAND_GIT_TIMEOUT", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_GIT_TIMEOUT
+    except ValueError:
+        value = DEFAULT_GIT_TIMEOUT
+    return value if value > 0 else DEFAULT_GIT_TIMEOUT
 
 SAFE_GIT_SECURITY_FLAGS = [
     "-c", "diff.tool=",
@@ -56,15 +78,17 @@ def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path
         pass
     return paths
 
-def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True):
+def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout=None):
     shielded_infos: List[Tuple[Path, Path]] = []
+    if timeout is None:
+        timeout = get_git_timeout()
     try:
         is_bytes = isinstance(input_data, bytes) or binary
         if safe and isinstance(cmd, str) and "&&" in cmd:
             subcmds = [s.strip() for s in cmd.split("&&") if s.strip()]
             last_rc, last_out, last_err = 0, "" if not is_bytes else b"", "" if not is_bytes else b""
             for sc in subcmds:
-                last_rc, last_out, last_err = run_git_cmd(sc, cwd=cwd, input_data=input_data, binary=binary, safe=safe)
+                last_rc, last_out, last_err = run_git_cmd(sc, cwd=cwd, input_data=input_data, binary=binary, safe=safe, timeout=timeout)
                 if last_rc != 0:
                     return last_rc, last_out, last_err
             return last_rc, last_out, last_err
@@ -124,7 +148,7 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True):
             stderr=subprocess.PIPE,
             text=not is_bytes,
             cwd=cwd,
-            timeout=30,
+            timeout=timeout,
             env=git_env
         )
         return res.returncode, res.stdout, res.stderr
@@ -139,6 +163,23 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True):
             except Exception:
                 pass
 
+def _is_git_marker(marker: Path) -> bool:
+    """True for a real repository marker: a .git directory with HEAD or a gitdir file.
+
+    A stray empty ``.git`` directory (e.g. /tmp/.git) is not a repository for git
+    and must not be treated as one either.
+    """
+    try:
+        if marker.is_dir():
+            return (marker / "HEAD").is_file()
+        if marker.is_file():
+            with open(marker, "r", encoding="utf-8", errors="replace") as handle:
+                return handle.read(8).startswith("gitdir:")
+    except OSError:
+        return False
+    return False
+
+
 def find_git_root(path: Union[str, Path]) -> Optional[str]:
     """
     Traverses upward from path to find the enclosing git repository root.
@@ -148,37 +189,113 @@ def find_git_root(path: Union[str, Path]) -> Optional[str]:
     try:
         curr = Path(path).resolve()
         while curr != curr.parent:
-            if (curr / ".git").exists():
+            if _is_git_marker(curr / ".git"):
                 return str(curr)
             curr = curr.parent
     except Exception:
         pass
     return None
 
-def ensure_git_worktree(cwd: str) -> bool:
-    """
-    Ensures cwd is inside a git repository.
-    If not, automatically initializes a lightweight shadow git tracking tree
-    so diff extraction and red-team audits work seamlessly without manual git init.
-    Protects root system directories (/, /tmp, ~) from accidental init.
+EPHEMERAL_GIT_MARKER = "makewand-ephemeral"
+EPHEMERAL_BASELINE_SUBJECT = "Makewand baseline snapshot"
+
+
+def _refused_init_roots() -> List[Path]:
+    roots = [Path("/"), Path("/tmp")]
+    try:
+        roots += [Path.home(), Path.home().resolve()]
+    except Exception:
+        pass
+    return roots
+
+
+def _remove_git_dir(git_dir: Path) -> Optional[str]:
+    """Removes a .git directory Makewand created; never follows a symlink."""
+    try:
+        info = os.lstat(git_dir)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"无法检查 {git_dir}: {exc}"
+    if not stat.S_ISDIR(info.st_mode):
+        return f"{git_dir} 不是目录（可能已被替换为链接或文件），拒绝删除"
+    errors = _rmtree_collect(git_dir)
+    if errors or os.path.lexists(git_dir):
+        return "无法完全删除 Makewand 创建的 .git: " + "; ".join(errors[:3])
+    return None
+
+
+def _rmtree_collect(path: Path) -> List[str]:
+    """shutil.rmtree that reports every failure instead of hiding it."""
+    errors: List[str] = []
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=lambda func, p, exc: errors.append(f"{p}: {exc}"))
+    else:  # pragma: no cover - older interpreters
+        shutil.rmtree(path, onerror=lambda func, p, exc: errors.append(f"{p}: {exc[1]}"))
+    return errors
+
+
+def init_git_baseline(cwd: str, ephemeral: bool = False) -> Tuple[bool, Optional[str]]:
+    """Ensures cwd is inside a git work tree, initializing one when there is none.
+
+    Returns (created, error). Every git step is checked: when init/config/add/
+    commit fails, the freshly created .git is removed again and an error is
+    returned, so callers never continue from an empty or partial baseline.
+    An existing repository whose state git cannot read is an error, never a
+    reason to create a nested repository.
     """
     if not cwd:
         cwd = os.getcwd()
     resolved = Path(cwd).resolve()
-    if resolved in [Path("/"), Path("/tmp"), Path.home()]:
-        return False
+    if resolved in _refused_init_roots():
+        return False, f"拒绝在系统目录或用户主目录 ({resolved}) 自动初始化 Git"
+    if find_git_root(resolved):
+        code, out, err = run_git_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(resolved))
+        if code == 0 and out.strip() == "true":
+            return False, None
+        return False, f"无法读取已有 Git 仓库状态 (rc={code}): {(err or '').strip()[:200]}"
 
-    code, _, _ = run_git_cmd("git rev-parse --is-inside-work-tree", cwd=cwd)
-    if code != 0:
-        import sys
-        print(c("[Makewand Git] 检测到当前目录尚未初始化 Git，自动建立影子 Git 跟踪树...", COLOR_YELLOW), file=sys.stderr)
-        run_git_cmd(["git", "init"], cwd=cwd)
-        run_git_cmd(["git", "config", "user.name", "Makewand"], cwd=cwd)
-        run_git_cmd(["git", "config", "user.email", "makewand@local"], cwd=cwd)
-        run_git_cmd(["git", "add", "-A"], cwd=cwd)
-        run_git_cmd(["git", "commit", "-m", "Makewand baseline snapshot", "--allow-empty"], cwd=cwd)
-        return True
-    return False
+    git_dir = resolved / ".git"
+    print(c(f"[Makewand Git] {resolved} 不是 Git 仓库，建立临时 Git 基线（任务结束后自动移除）...", COLOR_YELLOW), file=sys.stderr)
+    steps = [
+        (["git", "init", "-q"], "git init"),
+        (["git", "config", "user.name", "Makewand"], "git config user.name"),
+        (["git", "config", "user.email", "makewand@local"], "git config user.email"),
+    ]
+    for cmd, label in steps:
+        code, _, err = run_git_cmd(cmd, cwd=str(resolved))
+        if code != 0:
+            cleanup_err = _remove_git_dir(git_dir)
+            return False, f"{label} 失败 (rc={code}): {(err or '').strip()[:200]}" + (f"；{cleanup_err}" if cleanup_err else "")
+    if ephemeral:
+        try:
+            (git_dir / EPHEMERAL_GIT_MARKER).write_text(json.dumps({"pid": os.getpid(), "created": datetime.now().isoformat()}), encoding="utf-8")
+        except OSError as exc:
+            cleanup_err = _remove_git_dir(git_dir)
+            return False, f"无法写入临时仓库标记: {exc}" + (f"；{cleanup_err}" if cleanup_err else "")
+    for cmd, label in [
+        (["git", "add", "-A"], "git add -A"),
+        (["git", "commit", "-q", "--no-verify", "-m", EPHEMERAL_BASELINE_SUBJECT, "--allow-empty"], "git commit"),
+    ]:
+        code, _, err = run_git_cmd(cmd, cwd=str(resolved))
+        if code != 0:
+            cleanup_err = _remove_git_dir(git_dir)
+            return False, (f"{label} 失败 (rc={code})，无法建立完整基线: {(err or '').strip()[:300]}"
+                           + (f"；{cleanup_err}" if cleanup_err else ""))
+    return True, None
+
+
+def ensure_git_worktree(cwd: str) -> bool:
+    """
+    Ensures cwd is inside a git repository, initializing a baseline repository
+    when it is not. Returns True only when a repository was created. Failures
+    are reported and leave no partially initialized .git behind.
+    Protects root system directories (/, /tmp, ~) from accidental init.
+    """
+    created, error = init_git_baseline(cwd)
+    if error:
+        print(c(f"❌ [Makewand Git] {error}", COLOR_RED), file=sys.stderr)
+    return created
 
 def get_submodule_paths(repo_dir: str) -> List[str]:
     """
@@ -231,11 +348,16 @@ def get_git_diff_status(cwd: str, base_rev: Optional[str] = None, sub_baselines:
     has_head, _, _ = run_git_cmd(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd)
     if has_head != 0 and not base_rev:
         # Repository has no commits yet: stage untracked files and diff against empty tree hash
-        run_git_cmd(["git", "add", "-A"], cwd=cwd)
+        add_code, _, add_err = run_git_cmd(["git", "add", "-A"], cwd=cwd)
+        if add_code != 0:
+            return "", f"git add failed with exit code {add_code}: {add_err.strip()}"
         ref = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         code, diff_out, err = run_git_cmd(["git", "diff", "--cached", ref], cwd=cwd)
     else:
-        run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=cwd)
+        # New files must be visible in the diff; a failed intent-to-add would hide them.
+        ita_code, _, ita_err = run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=cwd)
+        if ita_code != 0:
+            return "", f"git add --intent-to-add failed with exit code {ita_code}: {ita_err.strip()}"
         ref = base_rev if base_rev else "HEAD"
         code, diff_out, err = run_git_cmd(["git", "diff", ref], cwd=cwd)
         if code != 0 and not base_rev:
@@ -469,12 +591,17 @@ def check_working_tree_isolation(target_dir: str):
                 return False, f"工作区 {target_dir} 与活跃交互会话 ({src_desc}) 存在工作树重叠冲突"
 
         # 3. Dirty Working Tree Guard: if working tree has any uncommitted changes,
-        # enforce shadow worktree to protect user WIP from accidental rollback
-        code, status_out, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=str(target_path))
-        if code == 0 and status_out and status_out.strip():
-            return False, f"工作区 {target_dir} 存在未提交的代码修改 (Dirty Working Tree)"
-    except Exception:
-        pass
+        # enforce shadow worktree to protect user WIP from accidental rollback.
+        # A non-git directory is handled by the host transaction; a git repository
+        # whose status cannot be read is never assumed clean.
+        if find_git_root(target_path):
+            code, status_out, status_err = run_git_cmd(["git", "status", "--porcelain"], cwd=str(target_path))
+            if code != 0:
+                return False, f"无法读取工作区 {target_dir} 的 git 状态 (rc={code}: {(status_err or '').strip()[:120]})，按不安全处理"
+            if status_out and status_out.strip():
+                return False, f"工作区 {target_dir} 存在未提交的代码修改 (Dirty Working Tree)"
+    except Exception as exc:
+        return False, f"工作区隔离检查异常 ({exc})，按不安全处理"
     return True, None
 
 class ShadowWorktreeResult(tuple):
@@ -576,19 +703,32 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
     Preserves relative subdirectories when called from inside a repository.
     Returns: (effective_worktree_dir, branch_name, cleanup_callback) as ShadowWorktreeResult.
     """
+    import sys
     import uuid
     from datetime import datetime
 
     base_path = Path(base_dir).resolve()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     rand_id = uuid.uuid4().hex[:6]
-    shadow_base = Path("/tmp/makewand-shadow-worktrees")
-    shadow_base.mkdir(parents=True, exist_ok=True)
-    worktree_dir = shadow_base / f"{base_path.name}_{timestamp}_{rand_id}"
+    try:
+        # Private (0700), unpredictable directory; never a shared fixed /tmp path.
+        worktree_dir = create_private_shadow_dir(base_path.name)
+    except OSError as exc:
+        print(c(f"❌ [Makewand Guard] 无法创建私有影子工作树目录 ({exc})。", COLOR_RED), file=sys.stderr)
+        return None, None, None
     branch_name = f"makewand/{prefix}_{timestamp}_{rand_id}"
 
+    def discard_worktree_dir():
+        errors = _rmtree_collect(worktree_dir) if worktree_dir.exists() else []
+        if errors:
+            print(c(f"⚠ [Makewand Guard] 影子工作树残留清理失败: {errors[0]}", COLOR_YELLOW), file=sys.stderr)
+
     # Check if base_dir is inside a git repository
-    code, is_inside, _ = run_git_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(base_path))
+    code, is_inside, is_inside_err = run_git_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(base_path))
+    if code != 0 and find_git_root(base_path):
+        print(c(f"❌ [Makewand Guard] 无法读取仓库状态 (rc={code}: {(is_inside_err or '').strip()[:120]})，拒绝以非 Git 副本代替影子工作树。", COLOR_RED), file=sys.stderr)
+        discard_worktree_dir()
+        return None, None, None
     if code == 0 and "true" in is_inside.strip().lower():
         code, repo_root_str, _ = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=str(base_path))
         repo_root = Path(repo_root_str.strip()).resolve() if code == 0 and repo_root_str.strip() else base_path
@@ -605,12 +745,22 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
         # Create lightweight independent clone with shared objects (decoupled git metadata for sandbox writeability)
         cmd = ["git", "-c", "protocol.file.allow=always", "clone", "--shared", str(repo_root), str(worktree_dir)]
         wt_code, wt_out, wt_err = run_git_cmd(cmd)
+        if wt_code != 0:
+            # A failed or timed-out clone leaves a partial directory; never fall
+            # back to copying into it.
+            print(c(f"❌ [Makewand Guard] 影子工作树克隆失败 (rc={wt_code}: {(wt_err or '').strip()[:160]})，拒绝使用残缺副本。", COLOR_RED), file=sys.stderr)
+            discard_worktree_dir()
+            return None, None, None
         if wt_code == 0:
             def cleanup():
                 shutil.rmtree(worktree_dir, ignore_errors=True)
 
             co_target = repo_head_hash if repo_head_hash else "HEAD"
-            run_git_cmd(["git", "checkout", "-b", branch_name, co_target], cwd=str(worktree_dir))
+            co_code, _, co_err = run_git_cmd(["git", "checkout", "-q", "-b", branch_name, co_target], cwd=str(worktree_dir))
+            if co_code != 0:
+                print(c(f"❌ [Makewand Guard] 影子分支检出失败 (rc={co_code}: {(co_err or '').strip()[:160]})，拒绝残缺快照。", COLOR_RED), file=sys.stderr)
+                cleanup()
+                return None, None, None
 
             # 0. Submodule recursion & dirty state forwarding
             sub_baselines = {}
@@ -860,7 +1010,7 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
                 sub_baselines=sub_baselines
             )
 
-    # Fallback to standalone isolated copy (no git branch)
+    # Fallback to standalone isolated copy (no git branch) for non-git directories
     try:
         clone_isolated_worktree(str(base_path), worktree_dir)
         def clone_cleanup():
@@ -875,5 +1025,1061 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
             repo_root=str(base_path),
             worktree_root=str(worktree_dir)
         )
-    except Exception:
+    except Exception as exc:
+        print(c(f"❌ [Makewand Guard] 隔离副本建立失败 ({exc})。", COLOR_RED), file=sys.stderr)
+        discard_worktree_dir()
         return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Private artifacts (shared contract 1): 0700 directories, 0600 files, names
+# from tempfile.mkdtemp (unpredictable), writes never follow symlinks, and a
+# bounded retention so state does not grow without limit.
+# ---------------------------------------------------------------------------
+
+ARTIFACT_PREFIXES = ("delivery_", "rejected_", "txn_", "baseline_")
+DEFAULT_ARTIFACT_RETENTION = 50
+DEFAULT_SHADOW_RETENTION = 20
+# Rollback backups and shadow worktrees may belong to a task that is still
+# running; they are never pruned while young.
+PROTECTED_YOUNG_SECONDS = 24 * 3600
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _prune_old_entries(root: Path, keep: int, prefixes: Tuple[str, ...], young_protected: Tuple[str, ...]) -> List[str]:
+    """Keeps the newest ``keep`` entries with the given prefixes; returns removed names."""
+    entries = []
+    with os.scandir(root) as iterator:
+        for entry in iterator:
+            if entry.name.startswith(prefixes):
+                try:
+                    entries.append((entry.stat(follow_symlinks=False).st_mtime, entry.name, entry))
+                except OSError:
+                    continue
+    entries.sort(reverse=True)
+    removed = []
+    now = time.time()
+    for mtime, name, entry in entries[keep:]:
+        if name.startswith(young_protected) and now - mtime < PROTECTED_YOUNG_SECONDS:
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            errors = _rmtree_collect(Path(entry.path))
+            if errors:
+                print(c(f"⚠ [Makewand Artifacts] 清理过期产物 {name} 失败: {errors[0]}", COLOR_YELLOW), file=sys.stderr)
+                continue
+        else:
+            os.unlink(entry.path)
+        removed.append(name)
+    return removed
+
+
+def create_private_artifact_dir(kind: str) -> Path:
+    """Creates <ARTIFACTS_DIR>/<kind>_<timestamp>_<random> as a private 0700 directory."""
+    root = ensure_private_dir(config.ARTIFACTS_DIR)
+    try:
+        _prune_old_entries(root, _positive_int_env("MAKEWAND_ARTIFACTS_KEEP", DEFAULT_ARTIFACT_RETENTION),
+                           ARTIFACT_PREFIXES, ("txn_",))
+    except OSError as exc:
+        print(c(f"⚠ [Makewand Artifacts] 产物保留策略执行失败: {exc}", COLOR_YELLOW), file=sys.stderr)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(tempfile.mkdtemp(prefix=f"{kind}_{stamp}_", dir=str(root)))
+    os.chmod(path, 0o700)
+    return path
+
+
+def create_private_shadow_dir(base_name: str) -> Path:
+    """Creates an empty private directory for a shadow worktree under SHADOW_WORKTREES_DIR."""
+    root = ensure_private_dir(config.SHADOW_WORKTREES_DIR)
+    try:
+        _prune_old_entries(root, _positive_int_env("MAKEWAND_SHADOW_KEEP", DEFAULT_SHADOW_RETENTION), ("wt_",), ("wt_",))
+    except OSError as exc:
+        print(c(f"⚠ [Makewand Shadow] 影子工作树保留策略执行失败: {exc}", COLOR_YELLOW), file=sys.stderr)
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (base_name or "workspace"))[:40] or "workspace"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(tempfile.mkdtemp(prefix=f"wt_{safe}_{stamp}_", dir=str(root)))
+    os.chmod(path, 0o700)
+    return path
+
+
+def write_private_file(path: Union[str, Path], data: Union[str, bytes], mode: int = 0o600) -> Path:
+    """Creates a new file exclusively (never follows or reuses an existing path) with ``mode``."""
+    path = Path(path)
+    payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        if hasattr(os, "fchmod"):
+            os.fchmod(handle.fileno(), mode)
+        handle.write(payload)
+        handle.flush()
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Per-repository workspace lock: one makewand code task per repository.
+# The lock file lives in the private state directory, never in the user repo.
+# ---------------------------------------------------------------------------
+
+class WorkspaceLockError(RuntimeError):
+    pass
+
+
+def workspace_lock_root(cwd: Union[str, Path]) -> str:
+    real = os.path.realpath(str(cwd))
+    git_root = find_git_root(real)
+    if git_root:
+        code, out, _ = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=real)
+        if code == 0 and out and out.strip():
+            return os.path.realpath(out.strip())
+        # A git failure must never disable locking: fall back to the filesystem root.
+        return os.path.realpath(git_root)
+    return real
+
+
+class WorkspaceLock:
+    def __init__(self, cwd: Union[str, Path]):
+        self.root = workspace_lock_root(cwd)
+        self.path: Optional[Path] = None
+        self._handle = None
+
+    def acquire(self) -> "WorkspaceLock":
+        from makewand import filelock
+        ensure_private_dir(config.ARTIFACTS_DIR)
+        lock_dir = ensure_private_dir(Path(config.ARTIFACTS_DIR) / ".locks")
+        key = hashlib.sha256(os.fsencode(self.root)).hexdigest()[:32]
+        self.path = lock_dir / f"{key}.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        handle = os.fdopen(os.open(self.path, flags, 0o600), "r+", encoding="utf-8")
+        try:
+            filelock.flock(handle, filelock.LOCK_EX | filelock.LOCK_NB)
+        except OSError:
+            detail = ""
+            try:
+                info = json.loads(handle.read(4096) or "{}")
+                if info.get("pid"):
+                    detail = f" (PID {info.get('pid')}，开始于 {info.get('started', '?')})"
+            except (OSError, ValueError):
+                pass
+            handle.close()
+            raise WorkspaceLockError(f"另一个 makewand 任务正在此目录运行: {self.root}{detail}。请等待该任务结束后再试。")
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({"pid": os.getpid(), "root": self.root, "started": datetime.now().isoformat(timespec="seconds")}))
+        handle.flush()
+        self._handle = handle
+        return self
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        from makewand import filelock
+        try:
+            handle.seek(0)
+            handle.truncate()
+            filelock.flock(handle, filelock.LOCK_UN)
+        finally:
+            handle.close()
+
+
+# ---------------------------------------------------------------------------
+# Host-mode transaction: the task-start snapshot is taken before any git init,
+# rollback only removes paths that did not exist before the task, restores
+# tracked files from the baseline commit and pre-existing untracked/ignored
+# files from private backups, and reports success only after verification.
+# ---------------------------------------------------------------------------
+
+EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+# Large dependency/build directories: contents are recorded as metadata only.
+HEAVY_DIR_NAMES = frozenset({
+    "node_modules", "venv", ".venv", "env", ".tox", "__pycache__", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", "target", "dist", "build", ".cache", ".gradle", ".next", ".nuxt", "bower_components",
+    ".terraform",
+})
+# Regenerable caches that tests create; not worth a delivery warning.
+REGENERABLE_CACHE_NAMES = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+DEFAULT_BACKUP_FILE_LIMIT = 1024 * 1024
+DEFAULT_BACKUP_TOTAL_LIMIT = 50 * 1024 * 1024
+DEFAULT_SNAPSHOT_MAX_ENTRIES = 300000
+DEFAULT_SNAPSHOT_SECONDS = 120
+
+
+class SnapshotError(RuntimeError):
+    pass
+
+
+class FsEntry(tuple):
+    """(kind, size, mtime_ns, mode, dev, ino, link, atime_ns) for one path."""
+    __slots__ = ()
+    kind = property(lambda self: self[0])
+    size = property(lambda self: self[1])
+    mtime_ns = property(lambda self: self[2])
+    mode = property(lambda self: self[3])
+    dev = property(lambda self: self[4])
+    ino = property(lambda self: self[5])
+    link = property(lambda self: self[6])
+    atime_ns = property(lambda self: self[7])
+
+
+def _fs_entry(path: str, info: os.stat_result, link: Optional[str] = None) -> FsEntry:
+    mode = info.st_mode
+    if stat.S_ISLNK(mode):
+        kind = "link"
+        link = link if link is not None else os.readlink(path)
+    elif stat.S_ISDIR(mode):
+        kind = "dir"
+    elif stat.S_ISREG(mode):
+        kind = "file"
+    else:
+        kind = "other"
+    if kind != "link":
+        link = None
+    size = info.st_size if kind == "file" else 0
+    return FsEntry((kind, size, info.st_mtime_ns, stat.S_IMODE(mode), info.st_dev, info.st_ino, link, info.st_atime_ns))
+
+
+def _same_entry(current: Optional[FsEntry], expected: FsEntry) -> bool:
+    if current is None or current.kind != expected.kind:
+        return False
+    if expected.kind == "file":
+        return (current.size, current.mtime_ns, current.mode) == (expected.size, expected.mtime_ns, expected.mode)
+    if expected.kind == "link":
+        return current.link == expected.link
+    return True
+
+
+def _makewand_state_paths() -> set:
+    """Makewand's own state directories are never part of a workspace snapshot."""
+    paths = set()
+    for candidate_path in (getattr(config, "ARTIFACTS_DIR", None), getattr(config, "SHADOW_WORKTREES_DIR", None),
+                           getattr(config, "CONFIG_DIR", None)):
+        if candidate_path:
+            paths.add(os.path.realpath(str(candidate_path)))
+    return paths
+
+
+def scan_workspace_tree(root: Union[str, Path], strict: bool = True, errors: Optional[List[str]] = None,
+                        max_entries: Optional[int] = None, time_budget: Optional[float] = None) -> Dict[str, FsEntry]:
+    """Records every path under root (never following symlinks), skipping .git entries
+    and makewand's own state directories.
+
+    strict=True raises SnapshotError on any unreadable path or budget overrun,
+    because an incomplete task-start snapshot could later misclassify a
+    pre-existing file as task-created.
+    """
+    root = str(root)
+    excluded = _makewand_state_paths()
+    limit = max_entries or _positive_int_env("MAKEWAND_SNAPSHOT_MAX_ENTRIES", DEFAULT_SNAPSHOT_MAX_ENTRIES)
+    deadline = time.monotonic() + (time_budget or _positive_int_env("MAKEWAND_SNAPSHOT_SECONDS", DEFAULT_SNAPSHOT_SECONDS))
+    entries: Dict[str, FsEntry] = {}
+
+    def problem(message: str) -> None:
+        if strict:
+            raise SnapshotError(message)
+        if errors is not None:
+            errors.append(message)
+
+    stack = [""]
+    while stack:
+        rel_dir = stack.pop()
+        abs_dir = os.path.join(root, rel_dir) if rel_dir else root
+        try:
+            with os.scandir(abs_dir) as iterator:
+                children = list(iterator)
+        except OSError as exc:
+            problem(f"无法读取目录 {rel_dir or '.'}: {exc.strerror or exc}")
+            continue
+        for child in children:
+            if child.name == ".git" or child.path in excluded:
+                continue
+            rel = f"{rel_dir}/{child.name}" if rel_dir else child.name
+            try:
+                entry = _fs_entry(child.path, os.lstat(child.path))
+            except OSError as exc:
+                problem(f"无法读取 {rel}: {exc.strerror or exc}")
+                continue
+            entries[rel] = entry
+            if entry.kind == "dir":
+                stack.append(rel)
+        if len(entries) > limit:
+            problem(f"工作区条目超过 {limit} 个 (MAKEWAND_SNAPSHOT_MAX_ENTRIES)")
+            break
+        if time.monotonic() > deadline:
+            problem("工作区快照超出时间预算 (MAKEWAND_SNAPSHOT_SECONDS)")
+            break
+    return entries
+
+
+# The host transaction restores through directory handles so a symlink planted
+# by the task can never redirect a delete or restore outside the workspace.
+HOST_TRANSACTION_SUPPORTED = os.name == "posix" and all(
+    fn in os.supports_dir_fd for fn in (os.open, os.stat, os.unlink, os.rmdir, os.rename, os.mkdir, os.readlink, os.symlink))
+
+_NOFOLLOW_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_parent(root: str, rel: str, create: bool = False) -> Tuple[int, str]:
+    """Opens the parent directory of rel without following any symlink component."""
+    parts = rel.split("/")
+    fd = os.open(root, _NOFOLLOW_DIR_FLAGS)
+    try:
+        for part in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(part, 0o777, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child = os.open(part, _NOFOLLOW_DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parts[-1]
+
+
+def _lstat_at(root: str, rel: str) -> Optional[FsEntry]:
+    try:
+        fd, name = _open_parent(root, rel)
+    except OSError:
+        return None
+    try:
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        link = os.readlink(name, dir_fd=fd) if stat.S_ISLNK(info.st_mode) else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return _fs_entry(name, info, link)
+
+
+def _unlink_at(root: str, rel: str) -> None:
+    fd, name = _open_parent(root, rel)
+    try:
+        os.unlink(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _rmdir_at(root: str, rel: str) -> None:
+    fd, name = _open_parent(root, rel)
+    try:
+        os.rmdir(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _rename_at(root: str, src_rel: str, dst_rel: str) -> None:
+    src_fd, src_name = _open_parent(root, src_rel)
+    try:
+        dst_fd, dst_name = _open_parent(root, dst_rel, create=True)
+        try:
+            os.rename(src_name, dst_name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+
+def _copy_regular_nofollow(source: str, destination: Path) -> Tuple[str, int]:
+    """Copies a regular file without following links; returns (sha256, size)."""
+    src_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    with os.fdopen(src_fd, "rb") as src:
+        if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        digest = hashlib.sha256()
+        size = 0
+        with os.fdopen(os.open(destination, flags, 0o600), "wb") as dst:
+            while chunk := src.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+                dst.write(chunk)
+    return digest.hexdigest(), size
+
+
+def _file_sha256_at(root: str, rel: str) -> Optional[str]:
+    try:
+        fd, name = _open_parent(root, rel)
+    except OSError:
+        return None
+    try:
+        file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=fd)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    digest = hashlib.sha256()
+    with os.fdopen(file_fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _summarize_paths(paths: List[str], limit: int = 20) -> str:
+    shown = ", ".join(paths[:limit])
+    return shown + (f" …（另有 {len(paths) - limit} 项）" if len(paths) > limit else "")
+
+
+def _is_regenerable_cache(rel: str) -> bool:
+    parts = rel.split("/")
+    return any(part in REGENERABLE_CACHE_NAMES for part in parts[:-1]) or rel.endswith((".pyc", ".pyo"))
+
+
+class HostWorkspaceTransaction:
+    """Data-safety transaction for a task that edits the user's own directory."""
+
+    def __init__(self, cwd: Union[str, Path]):
+        self.cwd = os.path.realpath(str(cwd))
+        self.is_git_repo = find_git_root(self.cwd) is not None
+        self.root: Optional[str] = None
+        self.pre: Dict[str, FsEntry] = {}
+        self.created_git = False
+        self.keep_git = False
+        self.baseline_commit: Optional[str] = None
+        self.head_ref: Optional[str] = None
+        self.initial_dirty = False
+        self.dirty_tracked: set = set()
+        self.tracked: set = set()
+        self.backup_dir: Optional[Path] = None
+        self.backups: Dict[str, Tuple[Path, str]] = {}
+        self.unbacked: Dict[str, str] = {}
+        self.state = "new"
+        self.succeeded: Optional[bool] = None
+        self._rejected_dir: Optional[Path] = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.state == "active"
+
+    @property
+    def git_dir(self) -> Path:
+        return Path(self.root or self.cwd) / ".git"
+
+    # -- phase 1: before any git init ------------------------------------
+    def capture_pre_snapshot(self) -> Optional[str]:
+        if not HOST_TRANSACTION_SUPPORTED:
+            return "当前平台缺少 POSIX 目录句柄，无法保证宿主模式安全回滚（Windows 请在 WSL2 中运行）"
+        if self.is_git_repo:
+            code, top, err = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=self.cwd)
+            if code != 0 or not top.strip():
+                return f"无法定位 Git 仓库根目录 (rc={code}): {(err or '').strip()[:200]}"
+            self.root = os.path.realpath(top.strip())
+            self._discard_stale_ephemeral_git()
+        if not self.is_git_repo:
+            self.root = self.cwd
+            if Path(self.root) in _refused_init_roots():
+                return f"拒绝在系统目录或用户主目录 ({self.root}) 中执行会修改文件的任务，请进入具体项目目录"
+        root_prefix = self.root.rstrip(os.sep) + os.sep
+        for state_path in sorted(_makewand_state_paths()):
+            if state_path == self.root or state_path.startswith(root_prefix):
+                return f"makewand 状态目录 {state_path} 位于工作区内，不能在宿主模式下安全回滚"
+        try:
+            home = Path.home().resolve()
+            if home == Path(self.root) or Path(self.root) in home.parents:
+                # The user's home holds provider credentials and session state that
+                # change during a task; never snapshot/roll back it in place.
+                return f"工作区 {self.root} 包含用户主目录，不能在宿主模式下安全回滚"
+        except (OSError, RuntimeError):
+            pass
+        try:
+            self.pre = scan_workspace_tree(self.root, strict=True)
+        except SnapshotError as exc:
+            return f"无法建立任务前完整快照 ({exc})"
+        self.state = "snapshotted"
+        return None
+
+    def _discard_stale_ephemeral_git(self) -> None:
+        """A temporary .git left by an interrupted makewand run is removed when untouched."""
+        marker = Path(self.root) / ".git" / EPHEMERAL_GIT_MARKER
+        if not marker.is_file() or Path(self.root, ".git").is_symlink():
+            return
+        try:
+            owner = int(json.loads(marker.read_text(encoding="utf-8") or "{}").get("pid") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            owner = 0
+        if owner and owner != os.getpid():
+            try:
+                os.kill(owner, 0)
+                return  # the creating makewand process is still running
+            except PermissionError:
+                return
+            except OSError:
+                pass
+        count_code, count, _ = run_git_cmd(["git", "rev-list", "--count", "--all"], cwd=self.root)
+        subject_code, subject, _ = run_git_cmd(["git", "log", "-1", "--format=%s"], cwd=self.root)
+        if count_code == 0 and subject_code == 0 and count.strip() == "1" and subject.strip() == EPHEMERAL_BASELINE_SUBJECT:
+            error = _remove_git_dir(Path(self.root) / ".git")
+            if error is None:
+                print(c(f"[Makewand Git] 已移除上次中断遗留的临时 .git ({self.root})", COLOR_YELLOW))
+                self.is_git_repo = find_git_root(self.cwd) is not None
+                if self.is_git_repo:
+                    code, top, _ = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=self.cwd)
+                    self.root = os.path.realpath(top.strip()) if code == 0 and top.strip() else self.root
+        else:
+            print(c(f"[Makewand Git] {self.root}/.git 带有 makewand 临时标记但已有其他提交，按普通仓库处理", COLOR_YELLOW))
+
+    # -- phase 2: immediately before the first model dispatch -------------
+    def begin(self) -> Optional[str]:
+        if self.state != "snapshotted":
+            return "内部错误: 尚未完成任务前快照"
+        try:
+            if not self.is_git_repo:
+                created, error = init_git_baseline(self.root, ephemeral=True)
+                if error or not created:
+                    return f"无法为非 Git 目录建立基线，已在派发任何模型前中止，未改动任何文件: {error or '未创建仓库'}"
+                self.created_git = True
+            error = self._capture_git_baseline() or self._backup_untracked_files()
+        except Exception as exc:  # noqa: BLE001 - reported, then aborted
+            error = f"建立任务基线时发生异常: {type(exc).__name__}: {exc}"
+        if error:
+            self._abort_begin()
+            return error
+        self.state = "active"
+        return None
+
+    def _abort_begin(self) -> None:
+        self.state = "aborted"
+        if self.created_git:
+            removal_error = _remove_git_dir(self.git_dir)
+            if removal_error:
+                self.keep_git = True
+                print(c(f"⚠ [Makewand Transaction] {removal_error}", COLOR_RED), file=sys.stderr)
+        self._discard_backups()
+
+    def _capture_git_baseline(self) -> Optional[str]:
+        code, out, err = run_git_cmd(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=self.root, binary=True)
+        if code != 0:
+            return f"git status 失败 (rc={code})，无法确认任务前基线，已在派发任何模型前中止: {os.fsdecode(err or b'').strip()[:200]}"
+        tokens = [t for t in out.split(b"\0")]
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            index += 1
+            if len(token) < 4:
+                continue
+            self.initial_dirty = True
+            xy, path = token[:2], os.fsdecode(token[3:])
+            if xy != b"??":
+                self.dirty_tracked.add(path)
+            if xy[:1] in (b"R", b"C") and index < len(tokens):
+                self.dirty_tracked.add(os.fsdecode(tokens[index]))
+                index += 1
+        code, head, err = run_git_cmd(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=self.root)
+        if code == 0 and head.strip():
+            self.baseline_commit = head.strip()
+        else:
+            unborn_code, _, _ = run_git_cmd(["git", "symbolic-ref", "-q", "HEAD"], cwd=self.root)
+            if unborn_code != 0:
+                return f"无法读取基线提交 (rc={code}): {(err or '').strip()[:200]}"
+        ref_code, ref, _ = run_git_cmd(["git", "symbolic-ref", "-q", "HEAD"], cwd=self.root)
+        self.head_ref = ref.strip() if ref_code == 0 and ref.strip() else None
+        code, listed, err = run_git_cmd(["git", "ls-files", "-z", "--cached"], cwd=self.root, binary=True)
+        if code != 0:
+            return f"git ls-files 失败 (rc={code})，无法确认被跟踪文件: {os.fsdecode(err or b'').strip()[:200]}"
+        self.tracked = {os.fsdecode(name) for name in listed.split(b"\0") if name}
+        return None
+
+    def _backup_untracked_files(self) -> Optional[str]:
+        per_file = _positive_int_env("MAKEWAND_BACKUP_FILE_LIMIT", DEFAULT_BACKUP_FILE_LIMIT)
+        total_limit = _positive_int_env("MAKEWAND_BACKUP_TOTAL_LIMIT", DEFAULT_BACKUP_TOTAL_LIMIT)
+        total = 0
+        index = []
+        for rel, entry in sorted(self.pre.items()):
+            if entry.kind != "file" or (rel in self.tracked and rel not in self.dirty_tracked):
+                continue
+            if any(part in HEAVY_DIR_NAMES for part in rel.split("/")[:-1]):
+                self.unbacked[rel] = "位于依赖/构建大目录，只记录元数据"
+                continue
+            if entry.size > per_file:
+                self.unbacked[rel] = f"超过单文件备份上限 {per_file} 字节"
+                continue
+            if total + entry.size > total_limit:
+                self.unbacked[rel] = f"超过备份总量上限 {total_limit} 字节"
+                continue
+            if self.backup_dir is None:
+                self.backup_dir = create_private_artifact_dir("txn")
+            target = self.backup_dir / f"{len(self.backups):06d}.bak"
+            try:
+                digest, size = _copy_regular_nofollow(os.path.join(self.root, rel), target)
+            except OSError as exc:
+                self.unbacked[rel] = f"无法读取备份 ({exc.strerror or exc})"
+                continue
+            if size != entry.size:
+                self.unbacked[rel] = "备份期间文件发生变化"
+                continue
+            self.backups[rel] = (target, digest)
+            total += size
+            index.append({"path": rel, "backup": target.name, "sha256": digest, "mode": oct(entry.mode)})
+        if self.backup_dir is not None:
+            write_private_file(self.backup_dir / "index.json", json.dumps(
+                {"root": self.root, "files": index, "not_backed_up": self.unbacked}, ensure_ascii=False, indent=2))
+        return None
+
+    def _discard_backups(self) -> None:
+        if self.backup_dir is not None and self.backup_dir.exists():
+            errors = _rmtree_collect(self.backup_dir)
+            if errors:
+                print(c(f"⚠ [Makewand Transaction] 无法删除临时备份 {self.backup_dir}: {errors[0]}", COLOR_YELLOW), file=sys.stderr)
+        self.backup_dir = None
+
+    def _git_restores(self, rel: str) -> bool:
+        """True when a clean hard reset to the baseline commit is responsible for rel."""
+        return bool(self.baseline_commit) and not self.initial_dirty and rel in self.tracked
+
+    # -- failure path -------------------------------------------------------
+    def rollback(self, reason: str = "") -> bool:
+        if self.state != "active":
+            return bool(self.succeeded)
+        self.state = "rolling_back"
+        problems: List[str] = []
+        notes: List[str] = []
+        try:
+            self._rollback_steps(reason, problems, notes)
+        except Exception as exc:  # noqa: BLE001 - never swallowed: reported below
+            problems.append(f"回滚过程发生异常: {type(exc).__name__}: {exc}")
+        self._finish(not problems, problems, notes, rollback=True)
+        return not problems
+
+    def _rejected_artifacts(self) -> Path:
+        if self._rejected_dir is None:
+            self._rejected_dir = create_private_artifact_dir("rejected")
+        return self._rejected_dir
+
+    def _rollback_steps(self, reason: str, problems: List[str], notes: List[str]) -> None:
+        root = self.root
+        base = self.baseline_commit or EMPTY_TREE_HASH
+        code, diff_bytes, _ = run_git_cmd(["git", "diff", "--binary", base], cwd=root, binary=True)
+        if code == 0 and diff_bytes and diff_bytes.strip():
+            rejected = self._rejected_artifacts()
+            write_private_file(rejected / "rejected.patch", diff_bytes)
+            write_private_file(rejected / "manifest.json", json.dumps(
+                {"repo_root": root, "baseline_commit": self.baseline_commit, "reason": reason}, ensure_ascii=False, indent=2))
+            notes.append(f"被拒改动已存档: {rejected / 'rejected.patch'}")
+        elif code != 0:
+            notes.append(f"无法导出被拒改动补丁 (rc={code})")
+
+        # Before any git reset: git deletes intent-to-add/indexed paths that are not
+        # in the baseline, so relocated pre-existing files are put back first and
+        # pre-existing untracked files the task added to the index are unstaged.
+        scan_errors: List[str] = []
+        current = scan_workspace_tree(root, strict=False, errors=scan_errors)
+        problems.extend(f"回滚扫描: {msg}" for msg in scan_errors)
+        self._recover_relocated(current, problems, notes)
+
+        if self.baseline_commit and not self.initial_dirty:
+            untrack_error = self._untrack_preexisting_paths()
+            if untrack_error:
+                problems.append(untrack_error + "；未删除或恢复任何文件")
+                return
+            if self.head_ref:
+                ref_code, ref, _ = run_git_cmd(["git", "symbolic-ref", "-q", "HEAD"], cwd=root)
+                if ref_code != 0 or ref.strip() != self.head_ref:
+                    code, _, err = run_git_cmd(["git", "symbolic-ref", "HEAD", self.head_ref], cwd=root)
+                    if code != 0:
+                        problems.append(f"无法切回原分支 {self.head_ref} (rc={code}: {err.strip()[:120]})；未删除或恢复任何文件")
+                        return
+            code, _, err = run_git_cmd(["git", "reset", "--hard", "-q", self.baseline_commit], cwd=root)
+            if code != 0:
+                problems.append(f"git reset --hard 失败 (rc={code}: {err.strip()[:160]})；为避免在半恢复状态上继续操作，未删除或恢复任何文件")
+                return
+        elif self.baseline_commit:
+            code, head, _ = run_git_cmd(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=root)
+            if code != 0 or head.strip() != self.baseline_commit:
+                code, _, err = run_git_cmd(["git", "reset", "--soft", "-q", self.baseline_commit], cwd=root)
+                if code != 0:
+                    problems.append(f"git reset --soft 失败 (rc={code}: {err.strip()[:160]})；未删除或恢复任何文件")
+                    return
+        else:
+            code, _, _ = run_git_cmd(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=root)
+            if code == 0:
+                code, _, err = run_git_cmd(["git", "update-ref", "-d", "HEAD"], cwd=root)
+                if code != 0:
+                    problems.append(f"无法撤销任务在空仓库中创建的提交 (rc={code}: {err.strip()[:120]})；未删除或恢复任何文件")
+                    return
+            if not self.initial_dirty:
+                code, _, err = run_git_cmd(["git", "read-tree", "--empty"], cwd=root)
+                if code != 0:
+                    problems.append(f"无法清空任务写入的暂存区 (rc={code})")
+
+        current = scan_workspace_tree(root, strict=False)
+        self._delete_new_paths(current, problems)
+        self._restore_pre_entries(problems)
+        self._verify(problems)
+
+    def _untrack_preexisting_paths(self) -> Optional[str]:
+        """Unstages pre-existing untracked/ignored files the task added to the index."""
+        code, listed, err = run_git_cmd(["git", "ls-files", "-z", "--cached"], cwd=self.root, binary=True)
+        if code != 0:
+            return f"无法读取当前暂存区 (rc={code})"
+        indexed = {os.fsdecode(name) for name in listed.split(b"\0") if name}
+        paths = sorted(rel for rel in indexed if rel in self.pre and rel not in self.tracked)
+        if not paths:
+            return None
+        code, _, err = run_git_cmd(["git", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
+                                    "--pathspec-from-file=-", "--pathspec-file-nul"],
+                                   cwd=self.root, input_data=b"\0".join(os.fsencode(p) for p in paths))
+        if code != 0:
+            return f"无法把任务前已存在的未跟踪文件移出暂存区 (rc={code}: {os.fsdecode(err or b'').strip()[:160]})"
+        return None
+
+    def _recover_relocated(self, current: Dict[str, FsEntry], problems: List[str], notes: List[str]) -> None:
+        """Pre-existing inodes found at new paths are moved back or quarantined, never deleted."""
+        by_inode = {(e.dev, e.ino): rel for rel, e in self.pre.items() if e.kind == "file"}
+        for rel, entry in sorted(current.items()):
+            if rel in self.pre or entry.kind != "file":
+                continue
+            original = by_inode.get((entry.dev, entry.ino))
+            if not original:
+                continue
+            expected = self.pre[original]
+            now = _lstat_at(self.root, original)
+            if now is not None and (now.dev, now.ino) == (entry.dev, entry.ino):
+                continue  # an extra hard link: removing the new name keeps the original
+            try:
+                if (entry.size, entry.mtime_ns) == (expected.size, expected.mtime_ns) and (now is None or now.kind != "dir"):
+                    _rename_at(self.root, rel, original)
+                else:
+                    # Either a moved-and-modified original or a new file reusing a freed
+                    # inode: it is neither deleted nor left in the workspace.
+                    destination = self._quarantine(rel)
+                    notes.append(f"{rel} 与任务前文件 {original} 共用 inode 但内容已变，已移出工作区隔离保存: {destination}")
+            except OSError as exc:
+                problems.append(f"无法处理与任务前文件 {original} 共用 inode 的 {rel}: {exc.strerror or exc}")
+
+    def _quarantine(self, rel: str) -> Path:
+        folder = self._rejected_artifacts() / "quarantine"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        destination = folder / rel.replace("/", "__")
+        suffix = 1
+        while os.path.lexists(destination):
+            destination = folder / f"{rel.replace('/', '__')}.{suffix}"
+            suffix += 1
+        fd, name = _open_parent(self.root, rel)
+        try:
+            try:
+                os.rename(name, str(destination), src_dir_fd=fd)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                _copy_regular_nofollow(os.path.join(self.root, rel), destination)
+                os.unlink(name, dir_fd=fd)
+        finally:
+            os.close(fd)
+        return destination
+
+    def _delete_new_paths(self, current: Dict[str, FsEntry], problems: List[str]) -> None:
+        new_paths = [rel for rel in current if rel not in self.pre]
+        for rel in sorted(new_paths, key=lambda p: (p.count("/"), p), reverse=True):
+            entry = current[rel]
+            try:
+                if entry.kind == "dir":
+                    try:
+                        _rmdir_at(self.root, rel)
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                            raise
+                        # A directory the task created may hold a nested .git it also created.
+                        leftovers = os.listdir(os.path.join(self.root, rel))
+                        if leftovers and all(name == ".git" for name in leftovers) and not os.path.islink(os.path.join(self.root, rel, ".git")):
+                            nested = Path(self.root, rel, ".git")
+                            if nested.is_dir():
+                                _rmtree_collect(nested)
+                            else:
+                                nested.unlink()
+                            _rmdir_at(self.root, rel)
+                        else:
+                            raise
+                else:
+                    _unlink_at(self.root, rel)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                problems.append(f"无法删除本次任务新建的 {rel}: {exc.strerror or exc}")
+
+    def _restore_pre_entries(self, problems: List[str]) -> None:
+        root = self.root
+        # Directories first (shallow to deep) so files and links have their parents.
+        for rel, entry in sorted(((r, e) for r, e in self.pre.items() if e.kind == "dir"), key=lambda item: item[0].count("/")):
+            current = _lstat_at(root, rel)
+            try:
+                if current is not None and current.kind != "dir":
+                    # Pre-existing files were already moved back by inode; whatever
+                    # now occupies a pre-existing directory path was created by the task.
+                    _unlink_at(root, rel)
+                    current = None
+                if current is None:
+                    fd, name = _open_parent(root, rel, create=True)
+                    try:
+                        os.mkdir(name, 0o700, dir_fd=fd)
+                    finally:
+                        os.close(fd)
+                    current = _lstat_at(root, rel)
+                if current is not None and current.kind == "dir" and current.mode != entry.mode:
+                    fd, name = _open_parent(root, rel)
+                    try:
+                        dir_fd = os.open(name, _NOFOLLOW_DIR_FLAGS, dir_fd=fd)
+                        try:
+                            os.fchmod(dir_fd, entry.mode)
+                        finally:
+                            os.close(dir_fd)
+                    finally:
+                        os.close(fd)
+            except OSError as exc:
+                problems.append(f"无法恢复目录 {rel}: {exc.strerror or exc}")
+
+        checkout_paths: List[str] = []
+        for rel, entry in sorted(self.pre.items()):
+            if entry.kind == "dir" or self._git_restores(rel):
+                continue
+            current = _lstat_at(root, rel)
+            if _same_entry(current, entry):
+                continue
+            if rel in self.tracked and rel not in self.dirty_tracked and self.baseline_commit:
+                checkout_paths.append(rel)  # clean tracked file in a dirty-start tree
+                continue
+            try:
+                if current is not None and current.kind == "dir":
+                    _rmdir_at(root, rel)
+                if entry.kind == "link":
+                    if current is not None and current.kind != "dir":
+                        _unlink_at(root, rel)
+                    fd, name = _open_parent(root, rel, create=True)
+                    try:
+                        os.symlink(entry.link, name, dir_fd=fd)
+                    finally:
+                        os.close(fd)
+                elif entry.kind == "file" and rel in self.backups:
+                    self._restore_file(rel, entry)
+            except OSError as exc:
+                problems.append(f"无法恢复 {rel}: {exc.strerror or exc}")
+        if checkout_paths:
+            code, _, err = run_git_cmd(["git", "checkout", self.baseline_commit, "--pathspec-from-file=-", "--pathspec-file-nul"],
+                                       cwd=root, input_data=b"\0".join(os.fsencode(p) for p in checkout_paths))
+            if code != 0:
+                problems.append(f"无法从基线提交恢复被跟踪文件 (rc={code}: {os.fsdecode(err or b'').strip()[:160]})")
+
+    def _restore_file(self, rel: str, entry: FsEntry) -> None:
+        backup, _ = self.backups[rel]
+        fd, name = _open_parent(self.root, rel, create=True)
+        temp_name = f".makewand-restore-{os.getpid()}-{time.monotonic_ns()}"
+        created = False
+        try:
+            src_fd = os.open(backup, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(src_fd, "rb") as src:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                with os.fdopen(os.open(temp_name, flags, 0o600, dir_fd=fd), "wb") as dst:
+                    created = True
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
+                    dst.flush()
+                    os.fchmod(dst.fileno(), entry.mode)
+                    os.fsync(dst.fileno())
+                    os.utime(dst.fileno(), ns=(entry.atime_ns, entry.mtime_ns))
+            os.replace(temp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
+            created = False
+        finally:
+            if created:
+                try:
+                    os.unlink(temp_name, dir_fd=fd)
+                except OSError:
+                    pass
+            os.close(fd)
+
+    def _verify(self, problems: List[str]) -> None:
+        root = self.root
+        scan_errors: List[str] = []
+        current = scan_workspace_tree(root, strict=False, errors=scan_errors)
+        problems.extend(f"核验扫描: {msg}" for msg in scan_errors)
+        leftovers = sorted(rel for rel in current if rel not in self.pre)
+        if leftovers:
+            problems.append(f"本次任务新建的路径未能清除: {_summarize_paths(leftovers)}")
+        missing, changed = [], []
+        for rel, entry in sorted(self.pre.items()):
+            now = current.get(rel)
+            if now is None:
+                missing.append(rel)
+            elif now.kind != entry.kind:
+                changed.append(rel)
+            elif entry.kind == "file" and not self._git_restores(rel) and not (rel in self.tracked and rel not in self.dirty_tracked):
+                if not _same_entry(now, entry):
+                    changed.append(rel)
+                elif rel in self.backups and _file_sha256_at(root, rel) != self.backups[rel][1]:
+                    changed.append(rel)
+            elif entry.kind == "link" and now.link != entry.link:
+                changed.append(rel)
+        for label, paths in (("任务前已存在但现已丢失", missing), ("任务前已存在但未能恢复原内容", changed)):
+            if paths:
+                detail = [f"{p}（{self.unbacked[p]}）" if p in self.unbacked else p for p in paths]
+                problems.append(f"{label}: {_summarize_paths(detail)}")
+        if self.baseline_commit:
+            code, status_out, err = run_git_cmd(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root, binary=True)
+            if code != 0:
+                problems.append(f"无法核验 git 状态 (rc={code})")
+            else:
+                dirty = sorted({os.fsdecode(t[3:]) for t in status_out.split(b"\0") if len(t) > 3})
+                expected = self.dirty_tracked | {rel for rel in self.pre if rel not in self.tracked}
+                unexpected = [p for p in dirty if p not in expected]
+                if unexpected:
+                    problems.append(f"被跟踪文件未能恢复到基线: {_summarize_paths(unexpected)}")
+            code, head, _ = run_git_cmd(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=root)
+            if code != 0 or head.strip() != self.baseline_commit:
+                problems.append("HEAD 未能回到任务基线提交")
+
+    # -- success path -------------------------------------------------------
+    def finalize_success(self) -> None:
+        if self.state != "active":
+            return
+        self.state = "finalizing"
+        problems: List[str] = []
+        notes: List[str] = []
+        warnings_out: List[str] = []
+        try:
+            scan_errors: List[str] = []
+            current = scan_workspace_tree(self.root, strict=False, errors=scan_errors)
+            notes.extend(f"交付核查扫描: {msg}" for msg in scan_errors)
+            changed = [rel for rel, entry in sorted(self.pre.items())
+                       if entry.kind != "dir" and rel not in self.tracked and not _is_regenerable_cache(rel)
+                       and not _same_entry(current.get(rel), entry)]
+            new_paths = [rel for rel, entry in current.items() if rel not in self.pre and entry.kind != "dir"]
+            reviewed: set = set()
+            if new_paths or changed:
+                # Tracked files and untracked-but-not-ignored files are part of the reviewed diff.
+                code, listed, _ = run_git_cmd(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=self.root, binary=True)
+                if code == 0:
+                    reviewed = {os.fsdecode(name) for name in listed.split(b"\0") if name}
+                else:
+                    notes.append("无法判定文件是否被 .gitignore 忽略，以下文件均按未审查处理")
+            changed = [rel for rel in changed if rel not in reviewed]
+            new_ignored = sorted(rel for rel in new_paths if rel not in reviewed and not _is_regenerable_cache(rel))
+            if changed:
+                detail = [f"{p}（未备份: {self.unbacked[p]}）" if p in self.unbacked else p for p in changed]
+                warnings_out.append(f"任务前已存在、被 .gitignore 忽略的文件被修改或删除: {_summarize_paths(detail)}")
+            if new_ignored:
+                warnings_out.append(f"本次任务新建了被 .gitignore 忽略的文件: {_summarize_paths(new_ignored)}")
+            if self.created_git:
+                self._save_nongit_delivery(problems, notes)
+            keep_backups = any(p in self.backups for p in changed)
+            if keep_backups:
+                notes.append(f"这些文件任务前的原始内容备份在: {self.backup_dir}")
+            else:
+                self._discard_backups()
+        except Exception as exc:  # noqa: BLE001 - reported below
+            problems.append(f"交付收尾发生异常: {type(exc).__name__}: {exc}")
+        if warnings_out:
+            print(c("⚠️ [Makewand Transaction] 以下改动不在审查 diff 中（被 .gitignore 忽略），请人工核查：", COLOR_YELLOW))
+            for line in warnings_out:
+                print(c(f"   • {line}", COLOR_YELLOW))
+        self._finish(not problems, problems, notes, rollback=False)
+
+    def _save_nongit_delivery(self, problems: List[str], notes: List[str]) -> None:
+        code, _, err = run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=self.root)
+        if code == 0:
+            code, patch_bytes, err = run_git_cmd(["git", "diff", "--binary", "--full-index", self.baseline_commit], cwd=self.root, binary=True)
+        if code != 0:
+            problems.append(f"无法导出交付补丁 (rc={code})")
+            return
+        delivery = create_private_artifact_dir("delivery")
+        patch_file = write_private_file(delivery / "makewand_delivery.patch", patch_bytes or b"")
+        write_private_file(delivery / "delivery_manifest.json", json.dumps({
+            "repo_root": self.root, "mode": "non-git-host", "baseline_commit": self.baseline_commit,
+            "main_patch": str(patch_file), "sha256": hashlib.sha256(patch_bytes or b"").hexdigest(),
+        }, ensure_ascii=False, indent=2))
+        notes.append(f"交付补丁已存入私有产物目录: {patch_file}")
+
+    def _bundle_baseline(self, notes: List[str]) -> bool:
+        if not self.baseline_commit:
+            return False
+        target = create_private_artifact_dir("baseline") / "baseline.bundle"
+        code, _, err = run_git_cmd(["git", "bundle", "create", str(target), self.baseline_commit], cwd=self.root)
+        if code != 0:
+            code, _, err = run_git_cmd(["git", "bundle", "create", str(target), "HEAD"], cwd=self.root)
+        if code != 0:
+            return False
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        notes.append(f"任务基线已导出为 git bundle，可用于人工恢复: git clone {shlex.quote(str(target))} <目录>")
+        return True
+
+    def _finish(self, ok: bool, problems: List[str], notes: List[str], rollback: bool) -> None:
+        if self.created_git and os.path.lexists(self.git_dir):
+            if ok or self._bundle_baseline(notes):
+                removal_error = _remove_git_dir(self.git_dir)
+                if removal_error:
+                    problems.append(removal_error)
+                    self.keep_git = True
+            else:
+                self.keep_git = True
+                problems.append(f"为保留恢复依据，暂未删除 makewand 创建的临时仓库 {self.git_dir}（核对后可手动删除）")
+        if rollback:
+            if not problems:
+                self._discard_backups()
+            elif self.backup_dir is not None:
+                notes.append(f"任务前文件备份保存在: {self.backup_dir}")
+        self.succeeded = not problems
+        self.state = "rolled_back" if rollback else "committed"
+        if rollback and not problems:
+            print(c("🛡️ [Makewand Transaction] 已回滚本次任务的全部改动并逐项核验，工作区已恢复基线。", COLOR_YELLOW))
+        elif problems:
+            title = "回滚未能完全恢复任务前状态" if rollback else "交付收尾存在问题"
+            print(c(f"⚠️ [Makewand Transaction] {title}，请人工检查：", COLOR_RED))
+            for line in problems[:30]:
+                print(c(f"   • {line}", COLOR_RED))
+        for line in notes:
+            print(c(f"   {line}", COLOR_YELLOW))
+
+    def close(self, succeeded: bool, reason: str = "") -> None:
+        """Safety net for every exit path, including exceptions and interrupts."""
+        if self.state == "active":
+            if succeeded:
+                self.finalize_success()
+            else:
+                self.rollback(reason or "流水线异常中断")
+        if self.created_git and not self.keep_git and os.path.lexists(self.git_dir):
+            removal_error = _remove_git_dir(self.git_dir)
+            if removal_error:
+                print(c(f"⚠ [Makewand Transaction] {removal_error}", COLOR_RED))
+
+
+class PipelineWorkspaceGuard:
+    """Resources for one run_pipeline call: repository lock + host transaction."""
+
+    def __init__(self):
+        self.lock: Optional[WorkspaceLock] = None
+        self.txn: Optional[HostWorkspaceTransaction] = None
+
+    def acquire_workspace_lock(self, cwd: Union[str, Path]) -> Optional[str]:
+        if self.lock is not None:
+            return None
+        try:
+            self.lock = WorkspaceLock(cwd).acquire()
+        except WorkspaceLockError as exc:
+            return str(exc)
+        except OSError as exc:
+            return f"无法获取工作区锁: {exc}"
+        return None
+
+    def close(self, result: Any, error: Optional[BaseException]) -> None:
+        try:
+            if self.txn is not None:
+                reason = f"流水线异常中断: {type(error).__name__}: {error}" if error is not None else "流水线未通过"
+                self.txn.close(succeeded=(error is None and result is True), reason=reason)
+        except Exception as exc:  # noqa: BLE001 - must not mask the pipeline outcome
+            print(c(f"⚠️ [Makewand Transaction] 收尾时发生异常，请人工检查工作区: {type(exc).__name__}: {exc}", COLOR_RED))
+        finally:
+            if self.lock is not None:
+                try:
+                    self.lock.release()
+                except OSError as exc:
+                    print(c(f"⚠ [Makewand Workspace Lock] 释放工作区锁失败: {exc}", COLOR_YELLOW))
+                self.lock = None

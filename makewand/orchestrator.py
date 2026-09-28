@@ -5,6 +5,7 @@ Makewand Orchestrator: Multi-model pipeline, task tiering, auto-fix loop, and ra
 import os
 import sys
 import shutil
+import functools
 import re
 import json
 import time
@@ -30,9 +31,14 @@ from makewand.config import (
     COLOR_RESET,
     CANDIDATES_DIR,
     ensure_config_dir,
+    ensure_private_dir,
 )
 from makewand.git_helper import (
     ensure_git_worktree,
+    HostWorkspaceTransaction,
+    PipelineWorkspaceGuard,
+    create_private_artifact_dir,
+    write_private_file,
     get_git_diff,
     get_git_diff_status,
     clone_isolated_worktree,
@@ -1134,7 +1140,31 @@ def _verify_delivery_commit(repo: str, commit: str, expected: Dict[str, Any], gi
     return tree.strip()
 
 
-def run_pipeline(
+def _no_provider_detected(forced_engine: Optional[str], route_meta: Dict[str, Any]) -> bool:
+    """True when routing fell back to a placeholder engine with zero active providers (N=0)."""
+    if forced_engine and forced_engine != "auto":
+        return False
+    if route_meta.get("no_active_providers"):
+        return True
+    if not route_meta.get("single_tool_mode"):
+        return False
+    from makewand.config import get_active_providers
+    try:
+        return not get_active_providers()
+    except Exception:
+        return False
+
+
+def _print_no_provider_guidance() -> None:
+    print(c("❌ [Makewand Setup] 未检测到任何可用的 AI 编码工具 (0 个)，任务未执行，工作区未做任何改动。", COLOR_RED + COLOR_BOLD))
+    print("   接入引导：")
+    print("   • 安装并登录任一订阅 CLI：claude / codex / agy (Gemini) / grok / muse；")
+    print("   • 或配置 API Key（如 ANTHROPIC_API_KEY / OPENAI_API_KEY），并设置 MAKEWAND_API_POLICY=allow_paid 允许按量计费；")
+    print("   • 或启用本地模型：makewand enable local（需本机 Ollama / vLLM）。")
+    print("   完成后运行 makewand status 查看检测结果。")
+
+
+def _run_pipeline_impl(
     prompt: str,
     cwd: Optional[str] = None,
     tier: str = "auto",
@@ -1147,8 +1177,11 @@ def run_pipeline(
     force_code: bool = False,
     repo_trust: str = "trusted",
     boost: bool = False,
-    forced_engine: Optional[str] = None
+    forced_engine: Optional[str] = None,
+    _guard: Optional[PipelineWorkspaceGuard] = None
 ) -> bool:
+    if _guard is None:
+        _guard = PipelineWorkspaceGuard()
     check_load_backpressure()
     if not cwd:
         cwd = os.getcwd()
@@ -1210,12 +1243,32 @@ def run_pipeline(
     shadow_worktree_dir = None
     shadow_branch = None
     cleanup_shadow = None
+    host_txn: Optional[HostWorkspaceTransaction] = None
 
     if intent not in ("identity", "explain", "review"):
+        # One makewand code task per repository: a second task would otherwise
+        # roll back or overwrite the first one's in-flight work.
+        lock_error = _guard.acquire_workspace_lock(cwd)
+        if lock_error:
+            print(c(f"❌ [Makewand Workspace Lock] {lock_error}", COLOR_RED + COLOR_BOLD))
+            return False
         try:
             is_safe, conflict_msg = check_working_tree_isolation(cwd)
-        except Exception:
-            is_safe, conflict_msg = True, None
+        except Exception as exc:
+            is_safe, conflict_msg = False, f"工作区隔离检查异常 ({exc})"
+
+        if is_safe:
+            # Host mode: record the complete task-start state BEFORE any git init.
+            host_txn = HostWorkspaceTransaction(cwd)
+            snapshot_error = host_txn.capture_pre_snapshot()
+            if snapshot_error:
+                if not host_txn.is_git_repo:
+                    print(c(f"❌ [Makewand Transaction] {snapshot_error}，为保护数据已中止，未改动任何文件。", COLOR_RED + COLOR_BOLD))
+                    return False
+                # A git repository can still be worked on safely in a shadow worktree.
+                host_txn = None
+                is_safe, conflict_msg = False, snapshot_error
+            _guard.txn = host_txn
 
         if not is_safe:
             print(c(f"🛡️ [Makewand Multi-Session Guard] {conflict_msg}！", COLOR_YELLOW + COLOR_BOLD))
@@ -1233,62 +1286,19 @@ def run_pipeline(
                 print(c(f"❌ [Makewand Multi-Session Guard] 无法为活跃冲突会话建立安全影子工作树 ({e})，终止任务以防踩踏。", COLOR_RED + COLOR_BOLD))
                 return False
 
-    initial_untracked_files = set()
-    initial_dirty = False
     task_baseline = None
-    if not is_shadow_active and cwd:
-        try:
-            _, init_status, _ = run_git_cmd(["git", "status", "--porcelain", "-uall", "--ignored"], cwd=cwd)
-            for line in init_status.splitlines():
-                if line.startswith("?? ") or line.startswith("!! "):
-                    initial_untracked_files.add(line[3:].strip().strip('"'))
-                elif line.strip():
-                    initial_dirty = True
-            c_code, h_commit, _ = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=cwd)
-            if c_code == 0 and h_commit and h_commit.strip():
-                task_baseline = h_commit.strip()
-        except Exception:
-            pass
 
     def fail_and_cleanup(msg: str) -> bool:
         if is_shadow_active and cleanup_shadow:
             try:
                 cleanup_shadow()
-            except Exception:
-                pass
-        elif cwd:
-            # On host repository (non-shadow mode), backup rejected diff and rollback uncommitted modifications
-            try:
-                diff_ref = task_baseline if task_baseline else "HEAD"
-                diff_code, d_out, _ = run_git_cmd(["git", "diff", diff_ref], cwd=cwd)
-                if diff_code == 0 and d_out and d_out.strip():
-                    art_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    rej_dir = Path("/tmp/makewand-artifacts") / f"rejected_{art_ts}"
-                    rej_dir.mkdir(parents=True, exist_ok=True)
-                    (rej_dir / "rejected.patch").write_text(d_out, encoding="utf-8")
-
-                if not initial_dirty:
-                    target_ref = task_baseline if task_baseline else "HEAD"
-                    run_git_cmd(["git", "reset", "--hard", target_ref], cwd=cwd)
-                    run_git_cmd(["git", "restore", "."], cwd=cwd)
-                    run_git_cmd(["git", "checkout", "--", "."], cwd=cwd)
-                else:
-                    print(c("🛡️ [Makewand Safety] 检测到宿主原有未提交改动，保留现场不执行破坏性 reset/checkout。", COLOR_YELLOW))
-
-                # Clean only untracked or ignored files newly created during this task execution
-                _, curr_status, _ = run_git_cmd(["git", "status", "--porcelain", "-uall", "--ignored"], cwd=cwd)
-                for line in curr_status.splitlines():
-                    if line.startswith("?? ") or line.startswith(" A ") or line.startswith("!! "):
-                        f_rel = line[3:].strip().strip('"')
-                        if f_rel not in initial_untracked_files:
-                            target_p = Path(cwd) / f_rel
-                            if target_p.is_file() or target_p.is_symlink():
-                                target_p.unlink(missing_ok=True)
-                            elif target_p.is_dir():
-                                shutil.rmtree(target_p, ignore_errors=True)
-                print(c(f"🛡️ [Makewand Transaction] 已自动维护未通过门禁的代码，工作区已恢复基线安全。", COLOR_YELLOW))
-            except Exception:
-                pass
+            except Exception as exc:
+                print(c(f"⚠️ [Makewand Shadow] 影子工作树清理失败，请手动检查: {exc}", COLOR_YELLOW))
+        elif host_txn is not None and host_txn.is_active:
+            # Host mode: roll back only this task's changes (task-created paths are
+            # removed, tracked files come from the baseline commit, pre-existing
+            # untracked/ignored files from private backups) and verify the result.
+            host_txn.rollback(msg)
         print(c(msg, COLOR_RED + COLOR_BOLD))
         return False
 
@@ -1334,9 +1344,6 @@ def run_pipeline(
     # Step 1: Health inspection
     cache = get_or_update_status(force_probe=False)
 
-    # Ensure git tracking in non-git directories
-    ensure_git_worktree(cwd)
-
     # Step 2: Intelligent Multi-Model Routing & Implementation
     coder_candidates, reviewer_candidates, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
     if forced_engine and forced_engine != "auto":
@@ -1349,6 +1356,12 @@ def run_pipeline(
     else:
         primary_c = route_meta["primary_coder"]
     primary_r = route_meta["primary_reviewer"]
+
+    if _no_provider_detected(forced_engine, route_meta):
+        _print_no_provider_guidance()
+        if is_shadow_active and cleanup_shadow:
+            cleanup_shadow()
+        return False
 
     print(c("🎯 [Makewand Smart Routing] 智能专精匹配与配额削峰决策:", COLOR_BOLD + COLOR_GREEN))
     if route_meta["reasons"]:
@@ -1365,8 +1378,14 @@ def run_pipeline(
         task_baseline = getattr(shadow_res, "baseline_commit", None)
         active_sub_baselines = getattr(shadow_res, "sub_baselines", {}) or {}
     else:
-        _, cur_head, _ = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=cwd)
-        task_baseline = cur_head.strip() if cur_head else None
+        # Host mode: git baseline (every git step rc-checked; a non-git directory
+        # gets a temporary .git) plus backups of untracked/ignored files, all
+        # before the first model dispatch. Any failure aborts with no deletion.
+        begin_error = host_txn.begin() if host_txn is not None else "内部错误: 宿主模式缺少任务事务"
+        if begin_error:
+            print(c(f"❌ [Makewand Transaction] {begin_error}", COLOR_RED + COLOR_BOLD))
+            return False
+        task_baseline = host_txn.baseline_commit
         active_sub_baselines = {}
         if (Path(cwd) / ".gitmodules").exists():
             sorted_subs = get_submodule_paths(cwd)
@@ -1721,9 +1740,8 @@ def run_pipeline(
                 worktree_root = getattr(shadow_res, "worktree_root", shadow_worktree_dir)
 
                 art_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                art_id = uuid.uuid4().hex[:6]
-                artifacts_dir = Path("/tmp/makewand-artifacts") / f"delivery_{art_ts}_{art_id}"
-                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                # Private 0700 directory with an unpredictable name (never shared /tmp).
+                artifacts_dir = create_private_artifact_dir("delivery")
                 patch_file = artifacts_dir / "makewand_delivery.patch"
                 sub_patches = []
                 verified_submodules = {}
@@ -1773,7 +1791,7 @@ def run_pipeline(
                                     if sub_patch_p.exists():
                                         return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 补丁文件已存在冲突，阻断交付。")
                                     try:
-                                        sub_patch_p.write_bytes(p_sub_b)
+                                        write_private_file(sub_patch_p, p_sub_b)
                                     except Exception as swe:
                                         return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 补丁写入磁盘失败 ({swe})，阻断交付。")
                                     sub_patches.append({
@@ -1808,8 +1826,8 @@ def run_pipeline(
                         return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子分支代码提交失败 ({c_err})，拒绝交付。")
 
                 # Verify that working tree is 100% clean and matches the committed state
-                _, clean_check, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=worktree_root)
-                if clean_check and clean_check.strip():
+                clean_code, clean_check, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=worktree_root)
+                if clean_code != 0 or (clean_check and clean_check.strip()):
                     return fail_and_cleanup("❌ [Makewand Quality Gate] 交付提交后工作区残留未审查改动，拒绝交付未验证内容。")
 
                 # 3. Verify that the task produced actual net changes compared to baseline
@@ -1832,7 +1850,7 @@ def run_pipeline(
                     if p_code != 0 or not p_diff_b or len(p_diff_b.strip()) == 0:
                         return fail_and_cleanup(f"❌ [Makewand Quality Gate] 交付补丁导出失败或内容为空 (code: {p_code}, err: {p_err})，阻断交付。")
                     try:
-                        patch_file.write_bytes(p_diff_b)
+                        write_private_file(patch_file, p_diff_b)
                     except Exception as we:
                         return fail_and_cleanup(f"❌ [Makewand Quality Gate] 交付补丁写入磁盘失败 ({we})，阻断交付。")
 
@@ -1840,8 +1858,8 @@ def run_pipeline(
                         return fail_and_cleanup("❌ [Makewand Quality Gate] 交付补丁文件校验失败 (文件不存在或大小为0)，阻断交付。")
 
                 # 5. Post-delivery integrity check: shadow worktree must be 100% clean
-                _, dirty_check, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=worktree_root)
-                if dirty_check.strip():
+                dirty_code, dirty_check, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=worktree_root)
+                if dirty_code != 0 or dirty_check.strip():
                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子工作区交付后存在未受控改动或脏文件 ({dirty_check.strip()[:120]})，阻断交付。")
 
                 if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
@@ -1878,7 +1896,7 @@ def run_pipeline(
                     "submodule_patches": sub_patches
                 }
                 manifest_file = artifacts_dir / "delivery_manifest.json"
-                manifest_file.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
+                write_private_file(manifest_file, json.dumps(manifest_data, indent=2, ensure_ascii=False))
 
                 script_lines = [
                     "#!/usr/bin/env bash",
@@ -1960,8 +1978,7 @@ def run_pipeline(
                 script_lines.append('printf "✔ 所有补丁已原子应用成功，目标仓库改动就绪。\\n"')
 
                 apply_script_file = artifacts_dir / "apply_delivery.sh"
-                apply_script_file.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
-                os.chmod(apply_script_file, 0o755)
+                write_private_file(apply_script_file, "\n".join(script_lines) + "\n", mode=0o700)
 
             except Exception as e:
                 return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子分支交付发生异常 ({e})，拒绝交付。")
@@ -1992,8 +2009,33 @@ def run_pipeline(
             else:
                 print("  已在独立隔离副本保存所有产物，原工作区未受任何修改污染。\n")
 
+    if host_txn is not None:
+        # Report ignored-file changes that the reviewed diff cannot show, archive
+        # the delivery patch and remove a temporary .git for non-git directories.
+        host_txn.finalize_success()
     print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
     return True
+
+
+@functools.wraps(_run_pipeline_impl)
+def run_pipeline(*args, **kwargs) -> bool:
+    """Runs the pipeline; the workspace lock and host transaction are always closed.
+
+    Any exit (failure, exception or interrupt) that leaves the host transaction
+    open rolls it back, and a temporary .git created for a non-git directory is
+    removed.
+    """
+    guard = PipelineWorkspaceGuard()
+    result: Any = False
+    error: Optional[BaseException] = None
+    try:
+        result = _run_pipeline_impl(*args, _guard=guard, **kwargs)
+        return result
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        guard.close(result, error)
 
 def run_review(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted") -> int:
     if not cwd:
