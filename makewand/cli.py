@@ -40,6 +40,40 @@ from makewand.providers.codex import execute_codex_task
 from makewand.providers.muse import execute_muse_task
 from makewand.providers.grok import execute_grok_task
 
+def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
+    """Machine-readable status; quota numbers carry their source explicitly."""
+    from makewand.config import get_all_supported_providers, get_provider_execution_mode, get_api_policy
+    from makewand.health import calculate_provider_quota, is_status_stale, STATUS_STALE_SECONDS
+    providers = {}
+    for key in get_all_supported_providers():
+        info = cache.get(key, {}) if isinstance(cache.get(key), dict) else {}
+        quota = calculate_provider_quota(key, info)
+        providers[key] = {
+            "status": info.get("status", "unknown"),
+            "reason": info.get("reason", ""),
+            "mode": get_provider_execution_mode(key),
+            "updated_at": info.get("updated_at", ""),
+            "stale": is_status_stale(info),
+            "verified": info.get("verified", True) if info.get("status") == "healthy" else None,
+            "resets_at": info.get("resets_at"),
+            "quota": {
+                "percentage": quota.get("percentage"),
+                "source": quota.get("source"),
+                "source_label": quota.get("source_label"),
+                "desc": quota.get("desc"),
+            },
+        }
+    return {
+        "engine": "python",
+        "version": __version__,
+        "api_policy": get_api_policy(),
+        "quota_semantics": ("Python 入口的额度数值除 source=official (CLI 输出中的官方百分比) 外，均来自本地调用计数估算"
+                            "或健康状态推定，不是官方 5 小时/每周剩余额度；官方额度读取仅在 Go 组件 'makewand-server quota' 中实现"),
+        "stale_after_seconds": STATUS_STALE_SECONDS,
+        "providers": providers,
+    }
+
+
 def cmd_status(args):
     import shutil
     from makewand.config import (
@@ -51,6 +85,12 @@ def cmd_status(args):
         normalize_provider_name
     )
 
+    if getattr(args, "json", False):
+        import json
+        cache = get_or_update_status(force_probe=getattr(args, "probe", False))
+        print(json.dumps(build_status_json(cache), ensure_ascii=False, indent=2))
+        return
+
     print(c("\n============================================================", COLOR_BOLD))
     print(c("       Makewand Multi-Model AI 订阅与全工具拓扑看板", COLOR_BOLD + COLOR_CYAN))
     print(c("============================================================\n", COLOR_BOLD))
@@ -58,7 +98,9 @@ def cmd_status(args):
     from makewand.config import get_api_policy
     policy = get_api_policy()
     print("API 费用策略: " + ("allow_paid（允许云 API 按量计费）" if policy == "allow_paid" else "subscription_only（禁止 Makewand 云 API 调用）"))
-    cache = get_or_update_status(force_probe=args.probe)
+    print(c("额度说明: 除标注“官方报告”外，下方额度条为本地调用计数估算或由健康状态推定，不是官方剩余配额；"
+            "官方 5 小时/每周额度读取仅在 Go 组件 'makewand-server quota' 中实现。", COLOR_YELLOW))
+    cache = get_or_update_status(force_probe=getattr(args, "probe", False))
 
     status_badges = {
         "healthy":    c("[🟢 正常可用]", COLOR_GREEN + COLOR_BOLD),
@@ -122,11 +164,13 @@ def cmd_status(args):
     # 1. Active Tools Section
     print(c(f"--- 🟢 已激活可用工具池 (Active Dynamic Pool: N={len(active_tools)}) ---", COLOR_BOLD + COLOR_GREEN))
     if active_tools:
-        from makewand.health import calculate_provider_quota, format_quota_bar
+        from makewand.health import calculate_provider_quota, format_quota_bar, get_reauth_hint
         for key in active_tools:
             info = cache.get(key, {})
             status = info.get("status", "unknown")
             badge = status_badges.get(status, f"[{status}]")
+            if status == "healthy" and info.get("verified") is False:
+                badge = c("[🟡 已安装·未验证]", COLOR_YELLOW + COLOR_BOLD)
             mode = get_provider_execution_mode(key)
             mode_badge = mode_badges.get(mode, f"[{mode}]")
             name = display_names.get(key, key)
@@ -135,13 +179,18 @@ def cmd_status(args):
 
             quota_data = calculate_provider_quota(key, info)
             pct = quota_data["percentage"]
-            bar = format_quota_bar(pct, width=20)
             quota_desc = quota_data["desc"]
 
             print(f"{badge} {mode_badge} {c(name, COLOR_BOLD)}")
-            print(f"      剩余额度: {bar}  ({quota_desc})")
+            if pct is None:
+                print(f"      额度指示: 未探测  ({quota_desc})")
+            else:
+                bar = format_quota_bar(pct, width=20)
+                print(f"      额度指示: {bar}  ({quota_desc})")
             if reason and reason != quota_desc and not (status == "healthy" and "运行正常" in reason and "运行正常" in quota_desc):
                 print(f"      运行状态: {reason}")
+            if status == "needs_auth" and "重新登录" not in f"{reason}{quota_desc}":
+                print(c(f"      操作提示: {get_reauth_hint(key)}", COLOR_YELLOW))
             if resets:
                 print(f"      预计解封: {c(resets, COLOR_YELLOW + COLOR_BOLD)}")
             print()
@@ -191,7 +240,8 @@ def cmd_status(args):
     print(c("--- AI 工具开关与配置指令 ---", COLOR_BOLD))
     print(f"  • 禁用工具: {c('makewand disable <tool>', COLOR_CYAN)}  (例如: makewand disable local 或 makewand disable muse)")
     print(f"  • 启用工具: {c('makewand enable <tool>', COLOR_GREEN)}   (例如: makewand enable local 或 makewand enable all)")
-    print(f"  • 支持的全部工具: {c(', '.join(all_tools), COLOR_YELLOW)}\n")
+    print(f"  • 支持的全部工具: {c(', '.join(t for t in all_tools if t not in ('cursor', 'copilot')), COLOR_YELLOW)}")
+    print(f"  • 仅安装检测、暂无执行适配: {c('cursor, copilot', COLOR_YELLOW)}\n")
 
     # 5. Sliding window usage and burn-rate status
     try:
@@ -218,61 +268,91 @@ def cmd_status(args):
     except Exception:
         pass
 
-def cmd_enable(args):
-    """Enables one or all AI tool providers."""
-    from makewand.config import set_provider_enabled, get_all_supported_providers, normalize_provider_name, get_active_providers
+def _resolve_provider_arg(raw: str, allow_all: bool) -> str:
+    """Normalizes a provider name/alias or exits with an explicit usage error."""
+    from makewand.config import get_all_supported_providers, normalize_provider_name
+    target = (raw or "").lower().strip()
+    if allow_all and target == "all":
+        return "all"
+    norm = normalize_provider_name(target)
+    supported = get_all_supported_providers()
+    if norm not in supported:
+        choices = ", ".join(supported) + (", all" if allow_all else "")
+        print(c(f"❌ 未知或不支持的工具名称: {raw!r} (支持: {choices}；别名如 ollama/gemini/openai/anthropic 会自动映射)", COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_USAGE_ERROR)
+    return norm
+
+
+def _ollama_service_hint(action: str) -> str:
+    return f"sudo systemctl {action} ollama"
+
+
+def _manage_ollama_service(action: str) -> bool:
+    """Runs a *non-interactive* sudo systemctl action and reports the real outcome."""
     import subprocess
-    target = args.provider.lower().strip()
-    all_supported = get_all_supported_providers()
+    try:
+        res = subprocess.run(["sudo", "-n", "systemctl", action, "ollama"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(c(f"  ⚠ 无法执行 '{_ollama_service_hint(action)}': {exc}", COLOR_YELLOW), file=sys.stderr)
+        return False
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip().splitlines()[:1]
+        print(c(f"  ⚠ '{_ollama_service_hint(action)}' 失败 (exit {res.returncode}{': ' + detail[0] if detail else ''})；"
+                "如需密码请手动执行该命令", COLOR_YELLOW), file=sys.stderr)
+        return False
+    return True
+
+
+def _ollama_is_active() -> Optional[bool]:
+    import subprocess
+    try:
+        res = subprocess.run(["systemctl", "is-active", "ollama"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.stdout.strip() == "active"
+
+
+def cmd_enable(args):
+    """Enables one or all AI tool providers. Never starts system services implicitly."""
+    from makewand.config import set_provider_enabled, get_all_supported_providers, get_active_providers
+    target = _resolve_provider_arg(args.provider, allow_all=True)
+    manage = getattr(args, "manage_service", False)
+    targets = get_all_supported_providers() if target == "all" else [target]
+    failed = [p for p in targets if not set_provider_enabled(p, True)]
+    if failed:
+        print(c(f"❌ 写入配置失败，未能启用: {', '.join(failed)} (检查 {os.environ.get('MAKEWAND_CONFIG_DIR') or '~/.config/makewand'} 是否可写)", COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_FAILED)
     if target == "all":
-        for p in all_supported:
-            set_provider_enabled(p, True)
-        try:
-            res = subprocess.run(["systemctl", "is-active", "ollama"], capture_output=True, text=True)
-            if res.stdout.strip() != "active":
-                subprocess.run(["sudo", "systemctl", "start", "ollama"], capture_output=True)
-        except Exception:
-            pass
         active = get_active_providers()
         print(c(f"✔ 已成功启用全部 AI 工具！当前动态可用池检测到 {len(active)} 个工具: {', '.join(active)}", COLOR_GREEN + COLOR_BOLD))
     else:
-        norm = normalize_provider_name(target)
-        ok = set_provider_enabled(norm, True)
-        if ok:
-            print(c(f"✔ 已成功启用 AI 工具: {norm} (运行 'makewand status' 查看最新状态)", COLOR_GREEN + COLOR_BOLD))
-            if norm == "local":
-                try:
-                    res = subprocess.run(["systemctl", "is-active", "ollama"], capture_output=True, text=True)
-                    if res.stdout.strip() != "active":
-                        subprocess.run(["sudo", "systemctl", "start", "ollama"], capture_output=True)
-                        print(c("  ✔ 已自动唤醒本地 Ollama 守护服务 (http://localhost:11434)", COLOR_GREEN))
-                except Exception:
-                    pass
-        else:
-            supported = ", ".join(all_supported) + ", all"
-            print(c(f"❌ 未知或不支持的工具名称: {target} (支持: {supported})", COLOR_RED), file=sys.stderr)
-            sys.exit(1)
+        print(c(f"✔ 已成功启用 AI 工具: {target} (运行 'makewand status' 查看最新状态)", COLOR_GREEN + COLOR_BOLD))
+    if "local" in targets:
+        active = _ollama_is_active()
+        if active is False:
+            if manage:
+                if _manage_ollama_service("start"):
+                    print(c("  ✔ 已按 --manage-service 启动本地 Ollama 服务", COLOR_GREEN))
+            else:
+                print(c(f"  ℹ️ 本地 Ollama 服务未运行；如需启动请执行 '{_ollama_service_hint('start')}' "
+                        "(或加 --manage-service 让 makewand 以 sudo -n 代为执行)", COLOR_YELLOW))
+
 
 def cmd_disable(args):
-    """Disables an AI tool provider."""
-    from makewand.config import set_provider_enabled, get_all_supported_providers, normalize_provider_name
-    import subprocess
-    target = args.provider.lower().strip()
-    norm = normalize_provider_name(target)
-    ok = set_provider_enabled(norm, False)
-    if ok:
-        print(c(f"✔ 已成功禁用 AI 工具: {norm} (Makewand 调度流水线将不再向其派发任务)", COLOR_YELLOW + COLOR_BOLD))
-        if norm == "local":
-            try:
-                subprocess.run(["sudo", "systemctl", "stop", "ollama"], capture_output=True)
-                print(c("  ✔ 已自动停止本地 Ollama 后台服务并彻底释放内存", COLOR_GREEN))
-            except Exception:
-                pass
-        print(f"  提示: 随时可运行 'makewand enable {norm}' 重新启用。")
-    else:
-        supported = ", ".join(get_all_supported_providers())
-        print(c(f"❌ 未知或不支持的工具名称: {target} (支持: {supported})", COLOR_RED), file=sys.stderr)
-        sys.exit(1)
+    """Disables an AI tool provider. Never stops system services implicitly."""
+    from makewand.config import set_provider_enabled
+    target = _resolve_provider_arg(args.provider, allow_all=False)
+    if not set_provider_enabled(target, False):
+        print(c(f"❌ 写入配置失败，未能禁用: {target}", COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_FAILED)
+    print(c(f"✔ 已成功禁用 AI 工具: {target} (Makewand 调度流水线将不再向其派发任务)", COLOR_YELLOW + COLOR_BOLD))
+    if target == "local":
+        if getattr(args, "manage_service", False):
+            if _manage_ollama_service("stop"):
+                print(c("  ✔ 已按 --manage-service 停止本地 Ollama 服务", COLOR_GREEN))
+        else:
+            print(f"  提示: Ollama 系统服务保持原状；如需停止请执行 '{_ollama_service_hint('stop')}' (或加 --manage-service)")
+    print(f"  提示: 随时可运行 'makewand enable {target}' 重新启用。")
 
 
 def cmd_models(args):
@@ -282,30 +362,37 @@ def cmd_models(args):
 
     models = discover_available_models()
 
+    def _model_lines(key: str, detected_src: str) -> None:
+        entry = models[key]
+        default_label = "当前默认" if entry.get("default_source") == "detected" else "内置默认 (未在本机检测到，仅作兜底)"
+        print(f"   {default_label}: {c(entry['current_default'], COLOR_GREEN + COLOR_BOLD)}")
+        available = entry.get("available") or []
+        if entry.get("source") == "detected":
+            print(f"   检测到版本 (来自 {detected_src}): {', '.join(available) if available else '无'}")
+        elif available:
+            print(f"   内置参考列表 (非检测结果，未找到 {detected_src}): {', '.join(available)}")
+        else:
+            print(f"   未检测到本机模型列表 ({detected_src} 不存在)")
+
     print(c("1. Claude Code (Anthropic 订阅):", COLOR_BOLD + COLOR_BLUE))
-    print(f"   当前默认: {c(models['claude']['current_default'], COLOR_GREEN + COLOR_BOLD)}")
-    print(f"   检测到版本: {', '.join(models['claude']['available']) if models['claude']['available'] else '跟随官方动态下发'}")
-    print("   自适应机制: 采用动态别名与 --fallback-model，官方升级新代际即刻自动同步。\n")
+    _model_lines("claude", "~/.claude 模型目录缓存 / ~/.claude.json")
+    print("   调用方式: 按档位传别名 (fable/sonnet/haiku)，具体版本由 Claude Code 解析。\n")
 
     print(c("2. Codex CLI (OpenAI 订阅):", COLOR_BOLD + COLOR_CYAN))
-    print(f"   当前默认: {c(models['codex']['current_default'], COLOR_GREEN + COLOR_BOLD)}")
-    print(f"   检测到版本: {', '.join(models['codex']['available']) if models['codex']['available'] else '跟随官方动态下发'}")
-    print("   自适应机制: 实时读取 config.toml 与模型热迁移表，支持动态推理深度。\n")
+    _model_lines("codex", "~/.codex/config.toml")
+    print("   调用方式: 读取 config.toml 中的 model，否则使用内置默认。\n")
 
     print(c("3. Antigravity (Google AI Pro):", COLOR_BOLD + COLOR_GREEN))
-    print(f"   当前默认: {c(models['agy']['current_default'], COLOR_GREEN + COLOR_BOLD)}")
-    print(f"   检测到版本: {', '.join(models['agy']['available'])}")
-    print("   自适应机制: 原生搭载 Gemini 3.8 全系列与动态思维推理 (effort low/medium/high)。\n")
+    _model_lines("agy", "agy 模型缓存 (当前未实现检测)")
+    print("   调用方式: 使用内置默认模型名与 --effort；未做在线模型发现。\n")
 
     print(c("4. Muse Code (Meta 订阅):", COLOR_BOLD + COLOR_PURPLE))
-    print(f"   当前默认: {c(models['muse']['current_default'], COLOR_GREEN + COLOR_BOLD)}")
-    print(f"   预置配置: {', '.join(models['muse']['available'])}")
-    print("   自适应机制: 支持 --preset 与 --reasoning-effort (low/high/ultra)，集成 OS 沙箱管控。\n")
+    _model_lines("muse", "~/.config/muse/settings.json")
+    print("   调用方式: 支持 --preset 与 --reasoning-effort。\n")
 
     print(c("5. Grok Build CLI (xAI 订阅):", COLOR_BOLD + COLOR_RED))
-    print(f"   当前默认: {c(models['grok']['current_default'], COLOR_GREEN + COLOR_BOLD)}")
-    print(f"   检测到版本: {', '.join(models['grok']['available']) if models['grok']['available'] else '跟随官方动态下发'}")
-    print("   自适应机制: 读取 models_cache.json，支持 --reasoning-effort (low/medium/high/xhigh) 与多代模型。\n")
+    _model_lines("grok", "~/.grok/models_cache.json")
+    print("   调用方式: 读取 models_cache.json，否则使用内置默认。\n")
 
     print(c("6. Local Self-Hosted (本地大模型 / Ollama / vLLM):", COLOR_BOLD + COLOR_PURPLE))
     try:
@@ -320,10 +407,10 @@ def cmd_models(args):
     except Exception as e:
         print(f"   状态: 检测异常 ({e})\n")
 
-    print(c("--- 新模型自适应与透传规则 ---", COLOR_BOLD))
-    print("  ✔ 零硬编码: 默认不锁定静态模型版本号，直接调用官方推荐指针。")
-    print("  ✔ 智能映射: --tier fast/standard/deep 自动根据提供商最新技术代差映射。")
-    print("  ✔ 自由透传: 支持 --model <任意新模型名> 直接传递给底层 CLI，永不过时。\n")
+    print(c("--- 模型选择规则 ---", COLOR_BOLD))
+    print("  • 优先使用本机 CLI 缓存/配置中检测到的模型；未检测到时使用 makewand 内置的默认模型名 (硬编码兜底，可能过时)。")
+    print("  • --tier fast/standard/deep 映射到上述模型或别名。")
+    print("  • 可用 --model <模型名> 显式指定，原样传给底层 CLI。\n")
 
 def cmd_quota(args):
     """Alias for status with focus on limits and reset schedule."""
@@ -467,31 +554,102 @@ def cmd_discard(args):
     else:
         print(c(f"❌ {msg}", COLOR_RED))
 
-def delegate_to_go_server(args_list: List[str]):
-    """Delegates server/TUI commands to compiled Go makewand binary or source."""
-    import shutil
+def _normalize_version(text: str) -> str:
+    return text.strip().lstrip("vV")
+
+
+def read_go_binary_version(bin_path: str, timeout: float = 5.0) -> Optional[str]:
+    """Returns the version a Go makewand binary reports via --version (cobra format)."""
+    import re as _re
     import subprocess
+    try:
+        res = subprocess.run([bin_path, "--version"], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _re.search(r"\bversion\s+(\S+)", f"{res.stdout}\n{res.stderr}")
+    return match.group(1) if match else None
+
+
+def check_go_python_version(bin_path: str) -> Optional[str]:
+    """
+    Compares the Go component's version with this Python engine's version.
+    Returns a warning string on mismatch/unknown, None when they agree.
+    Set MAKEWAND_SKIP_VERSION_CHECK=1 to skip.
+    """
+    if os.environ.get("MAKEWAND_SKIP_VERSION_CHECK") == "1":
+        return None
+    go_version = read_go_binary_version(bin_path)
+    if go_version is None:
+        return (f"⚠ 无法读取 Go 组件版本 ({bin_path} --version)，无法确认其与 Python 引擎 {__version__} 一致；"
+                "建议重新运行 scripts/install.sh")
+    if _normalize_version(go_version).startswith("dev"):
+        return (f"⚠ Go 组件 {bin_path} 为未标记版本的开发构建 ({go_version})，无法确认与 Python 引擎 {__version__} 一致；"
+                "发行安装请运行 scripts/install.sh")
+    if _normalize_version(go_version) != _normalize_version(__version__):
+        return (f"⚠ 版本不一致：Go 组件 {go_version} ({bin_path}) ≠ Python 引擎 {__version__}；"
+                "两套引擎可能行为不一致，请重新运行 scripts/install.sh 以同步")
+    return None
+
+
+def _find_go_binary() -> Optional[str]:
+    import shutil
+    root = Path(__file__).resolve().parent.parent
     candidates = [
-        Path(__file__).resolve().parent.parent / "bin" / "makewand-server",
-        Path(__file__).resolve().parent.parent / "bin" / "makewand-go",
-        Path(__file__).resolve().parent.parent / "dist" / "makewand",
+        root / "bin" / "makewand-server",
+        root / "bin" / "makewand-go",
+        root / "dist" / "makewand",
         shutil.which("makewand-server"),
         shutil.which("makewand-go")
     ]
-    bin_path = next((str(c) for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
-    if not bin_path and shutil.which("go"):
-        cmd_dir = Path(__file__).resolve().parent.parent / "cmd" / "makewand"
-        if cmd_dir.is_dir():
-            cmd = ["go", "run", "./cmd/makewand"] + args_list
-            ret = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent))
-            sys.exit(ret.returncode)
+    return next((str(c) for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
+
+
+def _build_dev_go_binary() -> Optional[str]:
+    """MAKEWAND_DEV=1 only: build the source tree into a cache binary (no `go run` in the user's cwd)."""
+    import shutil
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    if not shutil.which("go") or not (root / "cmd" / "makewand").is_dir():
+        return None
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "makewand"
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    target = cache_root / "makewand-dev"
+    print(c(f"ℹ️ MAKEWAND_DEV=1：从源码构建 Go 组件 ({root}) ...", COLOR_YELLOW), file=sys.stderr)
+    build = subprocess.run(
+        ["go", "build", "-ldflags", f"-X github.com/makewand/makewand/internal/buildinfo.Version={__version__}",
+         "-o", str(target), "./cmd/makewand"],
+        cwd=str(root),
+    )
+    return str(target) if build.returncode == 0 and target.is_file() else None
+
+
+def delegate_to_go_server(args_list: List[str]):
+    """
+    Delegates server/TUI commands to the compiled Go makewand binary.
+
+    Installed use never compiles or `go run`s the source tree: that path used to
+    run with cwd = the makewand source root, so relative paths (e.g. `chat .`)
+    silently pointed at the wrong directory. Developers can opt in with
+    MAKEWAND_DEV=1, which builds a cache binary and runs it in the user's cwd.
+    """
+    import subprocess
+    bin_path = _find_go_binary()
+    if not bin_path and os.environ.get("MAKEWAND_DEV") == "1":
+        bin_path = _build_dev_go_binary()
 
     if bin_path:
+        warning = check_go_python_version(bin_path)
+        if warning:
+            print(c(warning, COLOR_YELLOW), file=sys.stderr)
         ret = subprocess.run([bin_path] + args_list)
         sys.exit(ret.returncode)
 
-    print(f"❌ 命令 '{args_list[0]}' 为 Makewand 服务端/远程扩展组件，需要 Go 编译产物支持。")
-    print("   请在项目根目录运行: go build -o bin/makewand-server ./cmd/makewand")
+    print(f"❌ 命令 '{args_list[0]}' 为 Makewand 服务端/远程扩展组件，需要 Go 编译产物支持。", file=sys.stderr)
+    print("   请重新运行 scripts/install.sh，或在源码根目录运行: go build -o bin/makewand-server ./cmd/makewand", file=sys.stderr)
+    print("   (开发者可设置 MAKEWAND_DEV=1 让 makewand 自动从源码构建)", file=sys.stderr)
     sys.exit(1)
 
 def main():
@@ -519,15 +677,17 @@ def main():
     subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems", parents=[sub_common_parser])
 
     # status
-    p_status = subparsers.add_parser("status", help="Show health, quota limits, and reset times of all AIs", parents=[sub_common_parser])
-    p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs")
+    p_status = subparsers.add_parser("status", help="Show health, quota indicators (local estimates), and reset times of all AIs", parents=[sub_common_parser])
+    p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs (real model calls for claude/codex/muse/grok)")
+    p_status.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # probe
     subparsers.add_parser("probe", help="Perform live probing on all AIs and update status cache", parents=[sub_common_parser])
 
     # quota
-    p_quota = subparsers.add_parser("quota", help="Show remaining subscription quota across providers", parents=[sub_common_parser])
+    p_quota = subparsers.add_parser("quota", help="Show quota indicators (Python: local call-count estimates, not official quota)", parents=[sub_common_parser])
     p_quota.add_argument("--probe", action="store_true", help="Force immediate live probe")
+    p_quota.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # run
     p_run = subparsers.add_parser("run", help="Run auto-adaptive multi-model pipeline with auto-fix loop", parents=[sub_common_parser])
@@ -631,7 +791,10 @@ def main():
 
     p_observe = subparsers.add_parser("observe", help="Inspect all running AI sessions, classify behavior, and report makewand optimizations", parents=[sub_common_parser])
     p_observe.add_argument("--json", action="store_true", help="Output raw JSON format")
-    p_observe.add_argument("--clean-hung", action="store_true", default=False, help="Automatically terminate confirmed hung zombie/network processes exceeding 30 minutes")
+    p_observe.add_argument("--clean-hung", action="store_true", default=False,
+                           help="List makewand-dispatched processes running over 30 minutes as cleanup candidates (nothing is killed without --confirm-pids)")
+    p_observe.add_argument("--confirm-pids", default=None,
+                           help="Comma-separated PIDs from the --clean-hung candidate list to SIGTERM (explicit confirmation)")
 
     # Candidate Lifecycle Subcommands
     p_cands = subparsers.add_parser("candidates", help="List all pending multi-model race candidate workspaces", parents=[sub_common_parser])
@@ -654,10 +817,14 @@ def main():
     all_supported = get_all_supported_providers()
 
     p_enable = subparsers.add_parser("enable", help="Enable an AI tool provider", parents=[sub_common_parser])
-    p_enable.add_argument("provider", choices=all_supported + ["all"], help="Provider name to enable")
+    p_enable.add_argument("provider", help=f"Provider name or alias to enable: {', '.join(all_supported)}, all")
+    p_enable.add_argument("--manage-service", action="store_true", default=False,
+                          help="For local: also run 'sudo -n systemctl start ollama' (never done implicitly)")
 
     p_disable = subparsers.add_parser("disable", help="Disable an AI tool provider", parents=[sub_common_parser])
-    p_disable.add_argument("provider", choices=all_supported, help="Provider name to disable")
+    p_disable.add_argument("provider", help=f"Provider name or alias to disable: {', '.join(all_supported)}")
+    p_disable.add_argument("--manage-service", action="store_true", default=False,
+                           help="For local: also run 'sudo -n systemctl stop ollama' (never done implicitly)")
 
     p_aider = subparsers.add_parser("aider", help="Run prompt directly with Aider CLI pair programmer", parents=[sub_common_parser])
     p_aider.add_argument("prompt", help="Prompt for Aider")
@@ -689,6 +856,22 @@ def main():
     p_qwen.add_argument("--timeout", type=int, default=300)
     p_qwen.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
+    for api_provider, label in (("glm", "Zhipu GLM API"), ("kimi", "Moonshot Kimi API"),
+                                ("openrouter", "OpenRouter API"), ("siliconflow", "SiliconFlow API")):
+        p_api = subparsers.add_parser(api_provider, help=f"Run prompt directly with {label} (text only; does not edit files)", parents=[sub_common_parser])
+        p_api.add_argument("prompt", help=f"Prompt for {label}")
+        p_api.add_argument("--cwd", help="Working directory")
+        p_api.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
+        p_api.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
+        p_api.add_argument("--model", help="Specific model name")
+        p_api.add_argument("--stream", action="store_true", default=False)
+        p_api.add_argument("--timeout", type=int, default=300)
+        p_api.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
+
+    for detect_only in ("cursor", "copilot"):
+        p_det = subparsers.add_parser(detect_only, help=f"{detect_only}: detected only, no execution adapter yet", parents=[sub_common_parser])
+        p_det.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
+
     known_subcommands = {
         "models", "status", "probe", "quota", "run", "review", "race", "search", "sandbox",
         "claude", "codex", "agy", "grok", "muse", "local", "aider", "deepseek", "qwen", "glm", "kimi",
@@ -715,6 +898,14 @@ def main():
     args = parser.parse_args()
     if hasattr(args, "tier") and args.tier:
         args.tier = normalize_tier(args.tier)
+
+    # Mark this process as a makewand dispatcher: every provider CLI, sandbox and
+    # test process it spawns inherits MAKEWAND_DISPATCH_ID, which is how
+    # `observe --clean-hung` tells makewand's own processes apart from the
+    # user's sessions. `sandbox` runs a user-chosen command, so it is not marked.
+    if args.subcommand != "sandbox":
+        from makewand.observer import mark_process_as_dispatcher
+        mark_process_as_dispatcher()
 
     if not args.subcommand:
         from makewand.interactive import start_interactive_session
@@ -867,18 +1058,44 @@ def main():
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(1)
+    elif args.subcommand in ("cursor", "copilot"):
+        print(c(f"❌ {args.subcommand} 目前只做安装检测，尚无执行适配器，无法直接派发任务。"
+                "请改用 claude/codex/agy/grok/muse/aider 或 API provider。", COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_USAGE_ERROR)
     elif args.subcommand == "observe":
         from makewand.observer import observe_all_dialogs, format_observation_markdown
-        rep = observe_all_dialogs(clean_hung=getattr(args, "clean_hung", False))
+        confirm_raw = getattr(args, "confirm_pids", None)
+        confirm_pids = []
+        if confirm_raw:
+            if not getattr(args, "clean_hung", False):
+                print(c("❌ --confirm-pids 只能与 --clean-hung 一起使用", COLOR_RED), file=sys.stderr)
+                sys.exit(EXIT_USAGE_ERROR)
+            try:
+                confirm_pids = [int(p) for p in confirm_raw.replace(" ", "").split(",") if p]
+            except ValueError:
+                print(c(f"❌ --confirm-pids 需要逗号分隔的 PID 列表，收到: {confirm_raw}", COLOR_RED), file=sys.stderr)
+                sys.exit(EXIT_USAGE_ERROR)
+        rep = observe_all_dialogs(clean_hung=getattr(args, "clean_hung", False), confirm_pids=confirm_pids)
         if getattr(args, "json", False):
             import json
             print(json.dumps(rep, ensure_ascii=False, indent=2))
         else:
             print(format_observation_markdown(rep))
+            if getattr(args, "clean_hung", False):
+                candidates = rep.get("hung_candidates") or []
+                if not candidates:
+                    print(c("\n✔ 没有发现 makewand 派发且运行超过 30 分钟的进程；不会处理任何交互会话或用户自己的进程。", COLOR_GREEN))
+                elif not confirm_pids:
+                    pid_list = ",".join(str(cand["pid"]) for cand in candidates)
+                    print(c("\n⚠ 以上为清理候选 (仅限 makewand 自己派发、无控制终端、运行超过 30 分钟)，尚未发送任何信号。", COLOR_YELLOW))
+                    print(f"  确认后执行: makewand observe --clean-hung --confirm-pids {pid_list}")
             if rep.get("cleaned_pids"):
-                print(c("\n🧹 已成功清理僵尸挂死进程:", COLOR_GREEN + COLOR_BOLD))
+                print(c("\n🧹 已向确认的 makewand 派发进程发送 SIGTERM:", COLOR_GREEN + COLOR_BOLD))
                 for cp in rep["cleaned_pids"]:
-                    print(f"  • 会话 [{cp['session']}], PID {cp['pid']} ({cp['comm']})")
+                    print(f"  • PID {cp['pid']} ({cp['comm']}, dispatch {cp['dispatch_id']})")
+            skipped = sorted(set(confirm_pids) - {cp["pid"] for cp in rep.get("cleaned_pids", [])})
+            if skipped:
+                print(c(f"  跳过的 PID (不是当前候选或已退出): {', '.join(map(str, skipped))}", COLOR_YELLOW))
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,11 @@
 """
-Dynamic model discovery across all AI subscription ecosystems.
+Model discovery across AI subscription CLIs.
+
+Each provider entry reports where its data came from:
+- "source": "detected" when the list was read from the local CLI cache/config,
+  otherwise "builtin" (makewand's hardcoded reference list, which may be stale);
+- "default_source": the same for "current_default".
+Callers must not present builtin values as detected versions.
 """
 
 import re
@@ -15,6 +21,9 @@ def discover_available_models() -> Dict[str, Any]:
         "muse": {"current_default": "Meta Provider (Default Llama / Code Preset)", "available": ["native-basic", "miniswe"]},
         "grok": {"current_default": "grok-4.7", "available": ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]}
     }
+    for entry in models.values():
+        entry["source"] = "builtin"
+        entry["default_source"] = "builtin"
 
     # Discover Claude models from official catalog cache (~/.claude/cache/model-catalog/*.json) and ~/.claude.json
     try:
@@ -43,6 +52,7 @@ def discover_available_models() -> Dict[str, Any]:
                     catalog_found.append(lbl)
                 if catalog_found:
                     models["claude"]["available"] = catalog_found
+                    models["claude"]["source"] = "detected"
     except Exception:
         pass
 
@@ -51,7 +61,9 @@ def discover_available_models() -> Dict[str, Any]:
         if claude_json.exists():
             raw = claude_json.read_text(encoding="utf-8")
             data = json.loads(raw)
-            found = set(models["claude"]["available"])
+            # Only merge with the current list when that list itself was detected;
+            # never mix the builtin reference list into "detected" results.
+            found = set(models["claude"]["available"]) if models["claude"]["source"] == "detected" else set()
             for m in re.findall(r'"model":\s*"([^"]+)"', raw):
                 found.add(m)
             for m in data.get("additionalModelOptionsCache", []):
@@ -59,10 +71,10 @@ def discover_available_models() -> Dict[str, Any]:
                 lbl = m.get("label")
                 if val and str(val).startswith("claude-"):
                     found.add(f"{val} ({lbl})" if lbl else str(val))
-            models["claude"]["available"] = sorted(
-                [m for m in found if m.startswith("claude-")],
-                reverse=True
-            )
+            detected = sorted([m for m in found if m.startswith("claude-")], reverse=True)
+            if detected:
+                models["claude"]["available"] = detected
+                models["claude"]["source"] = "detected"
     except Exception:
         pass
 
@@ -80,8 +92,11 @@ def discover_available_models() -> Dict[str, Any]:
             for m in re.findall(r'model\s*=\s*"([^"]+)"', raw):
                 found.add(m)
             models["codex"]["available"] = sorted(list(found), reverse=True)
-            if "gpt-6-astra" in found:
-                models["codex"]["current_default"] = "gpt-6-astra"
+            models["codex"]["source"] = "detected"
+            configured = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
+            if configured:
+                models["codex"]["current_default"] = configured.group(1)
+                models["codex"]["default_source"] = "detected"
     except Exception:
         pass
 
@@ -92,6 +107,7 @@ def discover_available_models() -> Dict[str, Any]:
             data = json.loads(muse_settings.read_text(encoding="utf-8"))
             if "model" in data:
                 models["muse"]["current_default"] = data["model"]
+                models["muse"]["default_source"] = "detected"
     except Exception:
         pass
 
@@ -104,8 +120,10 @@ def discover_available_models() -> Dict[str, Any]:
                 discovered = list(g_data["models"].keys())
                 if discovered:
                     models["grok"]["available"] = discovered
+                    models["grok"]["source"] = "detected"
                     if "grok-4.7" in discovered:
                         models["grok"]["current_default"] = "grok-4.7"
+                        models["grok"]["default_source"] = "detected"
     except Exception:
         pass
 
