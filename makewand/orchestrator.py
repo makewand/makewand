@@ -527,6 +527,110 @@ def is_identity_or_chit_chat(prompt: str) -> bool:
 
     return False
 
+# --- Intent classification: yes/no and exploratory questions are read-only unless an explicit
+# imperative coding instruction is present. When unsure, prefer read-only.
+_ZH_QUESTION_MARKERS = (
+    "吗", "呢", "是否", "能否", "能不能", "可不可以", "会不会", "有没有", "要不要", "是不是",
+    "对不对", "行不行", "好不好", "为什么", "为何", "怎么", "怎样", "如何", "什么", "哪些", "哪个",
+    "哪里", "哪儿", "请问", "想知道", "问一下",
+)
+_EN_QUESTION_STARTERS = re.compile(
+    r"^(?:does|do|did|is|are|was|were|am|can|could|should|would|will|shall|may|might|what|which|"
+    r"who|whom|whose|when|where|why|how|isn't|aren't|doesn't|don't|didn't|can't|won't|wouldn't|"
+    r"shouldn't|couldn't)\b"
+)
+_EN_QUESTION_PHRASES = re.compile(
+    r"\b(?:how\s+(?:does|do|did|is|are|can|could|should|would)|what\s+(?:is|are|does|do)|"
+    r"why\s+(?:does|do|is|are)|is\s+there|are\s+there|whether|i\s+wonder|wondering)\b"
+)
+_ZH_CODE_VERBS = (
+    r"(?:添加|增加|加上|加入|加个|实现|修复|修改|修正|修一下|编写|创建|新建|生成|重构|补充|补上|补全|删除|删掉|"
+    r"移除|去掉|更新|升级|替换|迁移|优化|引入|接入|对接|集成|改成|改为|改一下|写一个|写个|写一下|写|改|加|修|删)"
+)
+_ZH_POLITE_IMPERATIVE = re.compile(
+    r"(?:请(?!问|求|教)|帮我|帮忙|麻烦|给我|替我|你来)"
+    r"(?:你|您|帮我|帮忙|再|也|顺便|直接|给我|一起|先|尽快|马上|立即|务必)*\s*" + _ZH_CODE_VERBS + r"(?!了)"
+    r"|(?:请(?!问|求|教)|帮我|帮忙|麻烦|给我|替我|你来)[^，,。！!？?；;\n]{0,4}把[^，,。！!？?；;\n]{1,30}?"
+    r"(?:改成|改为|修改为|替换为|替换成|加上|加入|添加到|删掉|删除|移除|去掉)"
+)
+_ZH_SEQUENCE_IMPERATIVE = re.compile(r"^(?:然后|接着|之后|随后|最后|顺便|另外|同时|并且|再)\s*" + _ZH_CODE_VERBS + r"(?!了)")
+_ZH_CLAUSE_IMPERATIVE = re.compile(
+    r"^(?:添加|增加|加上|加入|实现|修复|修改|修正|编写|创建|新建|生成|重构|补充|补上|补全|删除|删掉|移除|去掉|"
+    r"更新|升级|替换|迁移|优化|引入|接入|写)"
+    r"(?:一个|一下|一些|个|下|它|这个|那个|这些|那些|该|对应|相应|新的|上|掉)"
+)
+_EN_CODE_VERBS = (
+    r"(?:add|implement|create|write|fix|refactor|build|generate|patch|integrate|remove|delete|update|rename|"
+    r"migrate|change|modify|introduce|extend|replace|convert|optimize|upgrade|rewrite|make|port|bump|move|support)"
+)
+_EN_POLITE_IMPERATIVE = re.compile(
+    r"\b(?:please|kindly|go\s+ahead\s+and|i\s+want\s+you\s+to|i\s+need\s+you\s+to|i'd\s+like\s+you\s+to|"
+    r"let's|let\s+us)\s+(?:(?:also|just|now|then|go\s+ahead\s+and)\s+)*" + _EN_CODE_VERBS + r"\b"
+)
+_EN_CLAUSE_IMPERATIVE = re.compile(
+    r"^" + _EN_CODE_VERBS + r"\s+(?:a|an|the|this|that|these|those|it|them|some|all|any|new|missing|proper|"
+    r"unit|tests?|support|logging|docs?|documentation|comments?|type|types|error|errors|retries|--?\w+|`)\b"
+)
+_EN_LEADING_CONNECTORS = re.compile(
+    r"^(?:(?:and\s+then|and|then|also|so|next|finally|afterwards|after\s+that|if\s+so|if\s+not|otherwise|"
+    r"just|now|please|kindly|go\s+ahead\s+and)\s+)+"
+)
+_EXPLICIT_WRITE_DIRECTIVES = ("并在当前目录落盘", "并落盘", "直接落盘", "落盘到", "写入文件并保存")
+_CLAUSE_SPLIT_RE = re.compile(r"[。！!；;\n，,：:]|\.(?=\s|$)|(?<=[？?])")
+
+
+def _split_prompt_clauses(lower: str) -> List[str]:
+    clauses = []
+    for raw in _CLAUSE_SPLIT_RE.split(lower):
+        clause = raw.strip().lstrip("-*•>#\"'“”‘’`（）()[] \t")
+        if clause:
+            clauses.append(clause)
+    return clauses
+
+
+def _is_question_clause(clause: str) -> bool:
+    if clause.endswith(("?", "？")):
+        return True
+    if any(m in clause for m in _ZH_QUESTION_MARKERS):
+        return True
+    if _EN_QUESTION_STARTERS.match(clause) or _EN_QUESTION_PHRASES.search(clause):
+        return True
+    return False
+
+
+def is_inquiry_prompt(prompt: str) -> bool:
+    """True for yes/no or exploratory questions (？/?, 吗/呢/是否/能否..., does/is/can/what/which...)."""
+    lower = (prompt or "").lower().strip()
+    if not lower:
+        return False
+    if lower.endswith(("?", "？")):
+        return True
+    return any(_is_question_clause(cl) for cl in _split_prompt_clauses(lower))
+
+
+def has_explicit_coding_imperative(prompt: str) -> bool:
+    """
+    Detects an explicit imperative coding instruction such as '请添加…', '帮我实现…', 'please add …',
+    'add a …' at the start of a non-question clause, or '…并在当前目录落盘'.
+    """
+    lower = (prompt or "").lower().strip()
+    if not lower:
+        return False
+    if any(d in lower for d in _EXPLICIT_WRITE_DIRECTIVES):
+        return True
+    if _ZH_POLITE_IMPERATIVE.search(lower) or _EN_POLITE_IMPERATIVE.search(lower):
+        return True
+    for clause in _split_prompt_clauses(lower):
+        if _is_question_clause(clause):
+            continue
+        if _ZH_SEQUENCE_IMPERATIVE.match(clause) or _ZH_CLAUSE_IMPERATIVE.match(clause):
+            return True
+        en_clause = _EN_LEADING_CONNECTORS.sub("", clause)
+        if _EN_CLAUSE_IMPERATIVE.match(en_clause):
+            return True
+    return False
+
+
 def classify_prompt_intent(prompt: str) -> str:
     """
     Classify user prompt into:
@@ -534,6 +638,9 @@ def classify_prompt_intent(prompt: str) -> str:
     - 'explain': questions/explanations/chit-chat (strictly read-only execution)
     - 'review': code audit/review requests (strictly read-only execution)
     - 'code': code generation/refactoring/fixing tasks
+
+    Yes/no and exploratory questions are read-only ('explain'/'review'/'identity') unless the prompt
+    also carries an explicit imperative coding instruction; when unsure, prefer read-only.
     """
     lower = prompt.lower().strip()
 
@@ -556,29 +663,25 @@ def classify_prompt_intent(prompt: str) -> str:
         r"\bsupport\b", r"\bintegrate\b"
     ]
 
-    # Check for explicit read-only or negation patterns first
+    # Explicit read-only directives always win over any coding action.
     negation_patterns = [
         "不要修改", "不用修改", "别修改", "不要改", "别改", "不用改",
         "只看不改", "只解释", "无需修改", "不要写代码", "别写代码", "不用写代码",
-        "只分析", "只做分析", "只读", "规范是什么", "是如何实现", "是怎么实现", "原理是什么",
+        "只分析", "只做分析", "只读",
         "don't modify", "do not modify", "without modifying", "don't edit", "do not edit",
-        "read only", "readonly", "explain only", "just explain", "how does", "how do i",
-        "what is", "why does", "what are"
+        "read only", "readonly", "explain only", "just explain"
     ]
     has_negation = any(n in lower for n in negation_patterns)
 
-    # Has explicit coding action?
     has_chinese_coding = any(k in lower for k in chinese_coding_triggers)
     has_english_coding = any(re.search(pat, lower) for pat in english_coding_patterns)
-    has_coding_action = (has_chinese_coding or has_english_coding) and not has_negation
+    explicit_imperative = has_explicit_coding_imperative(lower)
+    has_coding_action = (has_chinese_coding or has_english_coding or explicit_imperative) and not has_negation
 
-    # If user explicitly asked for code modifications (even if they also asked to review, e.g. "实现一个登录接口并审查代码")
-    if has_coding_action:
-        # Avoid pure informational questions like "如何添加搜索功能？"
-        if not any(q in lower for q in ["如何", "怎么", "规范是什么", "是什么", "有哪些", "why", "how"]):
-            return "code"
-        elif any(act in lower for act in ["并在当前目录落盘", "保存到", "写入文件", "修改文件", "并落盘"]):
-            return "code"
+    # Questions ("这个项目支持 Windows 吗？", "Should I add a lockfile?") stay read-only unless an explicit
+    # imperative instruction is present ("…？如果不支持，请添加支持", "Could you please add …?").
+    if has_coding_action and (explicit_imperative or not is_inquiry_prompt(lower)):
+        return "code"
 
     # If user asked for review without coding actions (or with explicit read-only negation)
     review_keywords = ["审查", "审计", "review", "检查代码", "看下diff", "看下代码改动", "质检", "代码审计", "diff check"]
