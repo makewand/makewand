@@ -34,6 +34,9 @@ type attemptIdentity struct {
 	modelID    string
 	provider   Provider
 	isFallback bool
+	// ticket is the circuit-breaker admission for this attempt, set once the
+	// attempt is admitted; its success is recorded against it.
+	ticket breakerTicket
 }
 
 // attemptContext bundles the per-call parameters needed by tryProvider.
@@ -96,7 +99,8 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 		return tryProviderResult{skipped: true, err: callerErr}
 	}
 	// Circuit breaker pre-check
-	if allow, remaining := r.beforeProviderAttempt(id.name); !allow {
+	allow, remaining, ticket := r.admitProviderAttempt(id.name)
+	if !allow {
 		detail := circuitOpenDetail(id.name, remaining)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.fallbackSkipped,
@@ -110,6 +114,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 		})
 		return tryProviderResult{skipped: true, err: fmt.Errorf("%s", detail)}
 	}
+	id.ticket = ticket
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
@@ -131,7 +136,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 			actualModelID = usage.Model
 		}
 		r.usage.Increment(id.name)
-		r.recordProviderSuccess(id.name)
+		r.recordProviderSuccess(id.name, id.ticket)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.attemptSuccess,
 			Task:       ac.taskLabel,
@@ -367,7 +372,7 @@ const streamForwardTimeout = 30 * time.Second
 
 func (r *Router) recordStreamAttemptSuccess(ac *attemptContext, id attemptIdentity, start time.Time) {
 	r.usage.Increment(id.name)
-	r.recordProviderSuccess(id.name)
+	r.recordProviderSuccess(id.name, id.ticket)
 	r.emitTrace(TraceEvent{
 		Event:      ac.labels.attemptSuccess,
 		Task:       ac.taskLabel,
@@ -526,7 +531,8 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 	}
 
 	// Circuit breaker pre-check
-	if allow, remaining := r.beforeProviderAttempt(id.name); !allow {
+	allow, remaining, ticket := r.admitProviderAttempt(id.name)
+	if !allow {
 		detail := circuitOpenDetail(id.name, remaining)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.fallbackSkipped,
@@ -540,6 +546,7 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 		})
 		return tryStreamResult{skipped: true, err: fmt.Errorf("%s", detail)}
 	}
+	id.ticket = ticket
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)

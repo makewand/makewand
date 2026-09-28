@@ -35,12 +35,16 @@ func TestProviderCircuitBreaker_StateTransitions(t *testing.T) {
 	}
 
 	now = now.Add(11 * time.Second)
-	if allow, _ := cb.BeforeAttempt("claude"); !allow {
+	allow, _, probe := cb.Admit("claude")
+	if !allow || !probe.probe {
 		t.Fatal("second cooldown expiry should allow another half-open trial")
 	}
-	cb.RecordSuccess("claude")
+	cb.RecordAdmittedSuccess("claude", probe)
 	if blocked, _ := cb.PeekOpen("claude"); blocked {
-		t.Fatal("RecordSuccess should close the circuit")
+		t.Fatal("the probe's success should close the circuit")
+	}
+	if allow, _ := cb.BeforeAttempt("claude"); !allow {
+		t.Fatal("closed circuit should admit traffic after the probe succeeded")
 	}
 }
 
