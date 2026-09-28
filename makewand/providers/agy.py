@@ -8,11 +8,63 @@ from typing import Tuple, Optional
 from makewand.config import c, COLOR_GREEN
 from makewand.providers.base import run_subprocess
 
+# Rate limiting must be recognised from its *context*, never from a bare "429"
+# (line counts, PIDs, hashes and test totals routinely contain 429). Aligned
+# with the codex/claude parsers.
+_AGY_RATE_LIMIT_RE = re.compile(
+    r"\b(?:"
+    r"resource[_\s]?exhausted"
+    r"|quota\s*exceeded"
+    r"|rate[\s_-]*limit(?:ed|\s+exceeded)?"
+    r"|too\s*many\s*requests"
+    r"|429\s+too\s*many"
+    r"|http(?:/[\d.]+)?\s+429"
+    r"|status(?:\s*code)?\s*[:=]?\s*429"
+    r"|code\s*[:=]\s*429"
+    r")\b"
+)
+
+_AGY_REGION_RE = re.compile(
+    r"not\s+(?:currently\s+)?(?:available|supported)\s+in\s+your\s+(?:location|region|country)"
+    r"|(?:user\s+)?location\s+is\s+not\s+supported"
+    r"|unsupported\s+(?:location|region|country)"
+    r"|not\s+available\s+in\s+your\s+(?:area|territory)"
+)
+
+_AGY_AUTH_RE = re.compile(
+    r"\bunauthenticated\b"
+    r"|authentication\s+(?:required|failed)"
+    r"|not\s+(?:logged|signed)\s+in"
+    r"|please\s+(?:log|sign)\s*in"
+    r"|login\s+required"
+    r"|invalid[_\s](?:credentials|grant|api[_\s]key)"
+    r"|(?:oauth|access)\s+token\s+(?:has\s+)?expired"
+    r"|\b401\s+unauthorized\b"
+)
+
+
 def parse_agy_quota(output: str) -> Tuple[bool, str, Optional[str]]:
-    lower = output.lower()
-    if "resourceexhausted" in lower or "quota exceeded" in lower or "429" in lower:
+    lower = (output or "").lower()
+    if _AGY_RATE_LIMIT_RE.search(lower):
         return True, "Google AI 配额暂时耗尽", "待重置"
     return False, "", None
+
+
+def classify_agy_failure(output: str) -> Optional[Tuple[str, str, Optional[float]]]:
+    """
+    Classifies a non-quota agy failure that says something about the provider
+    itself (not about the task). Returns (status, reason, ttl_seconds) or None.
+    """
+    lower = (output or "").lower()
+    if _AGY_REGION_RE.search(lower):
+        from makewand.health import REGION_BLOCK_TTL_SECONDS
+        return ("error",
+                "Antigravity 在当前地区/账号不可用 (真实派发返回地区限制)，暂停派发并在有效期后自动复查",
+                REGION_BLOCK_TTL_SECONDS)
+    if _AGY_AUTH_RE.search(lower):
+        from makewand.health import get_reauth_hint
+        return "needs_auth", f"Antigravity 认证失败 (真实派发) · {get_reauth_hint('agy')}", None
+    return None
 
 def execute_agy_task(
     prompt: str,
@@ -147,6 +199,16 @@ def execute_agy_task(
         return False, None, "Antigravity 执行完成但未能产生有效输出内容"
 
     is_limited, reason, resets_at = parse_agy_quota(combined)
+    if not is_limited:
+        failure = classify_agy_failure(combined)
+        if failure:
+            status, fail_reason, ttl = failure
+            from makewand.health import record_engine_failure
+            try:
+                record_engine_failure("agy", status, fail_reason, ttl_seconds=ttl)
+            except Exception:
+                pass
+            return False, combined, fail_reason
     if is_limited:
         record_engine_limit("agy", reason, resets_at)
         if has_api_configured("agy"):

@@ -977,6 +977,65 @@ def _match_domain_keywords(keywords: List[str], text: str) -> List[str]:
                 matched.append(k)
     return matched
 
+# ---------------------------------------------------------------------------
+# Routing penalty math (bounded, continuous).
+#
+# Burn-rate: usage.get_burn_rate_penalty() returns pen in [-4.0, 0]. It used to
+# be applied as `max(0.2, min(score, 1.5) + pen)` once pen <= -1.5, a cliff that
+# flattened every engine to 0.2 and erased task affinity. It is now a
+# multiplicative factor in [BURN_PENALTY_MIN_FACTOR, 1]: continuous, monotone,
+# never turns a positive score non-positive (the engine stays eligible), and
+# keeps task affinity proportional.
+# Reliability: time-decayed success rate of real dispatches (usage ledger)
+# scales scores by a factor in [RELIABILITY_MIN_FACTOR, 1] for every engine,
+# agy included.
+# ---------------------------------------------------------------------------
+BURN_PENALTY_FULL_SCALE = 4.0
+BURN_PENALTY_MIN_FACTOR = 0.45
+RELIABILITY_GOOD_RATE = 0.8
+RELIABILITY_BAD_RATE = 0.2
+RELIABILITY_MIN_FACTOR = 0.5
+# Detected tools that have no execution adapter in dispatch_task yet.
+ENGINES_WITHOUT_EXECUTOR = frozenset({"cursor", "copilot"})
+
+
+def burn_rate_factor(pen: float) -> float:
+    """Multiplier in [BURN_PENALTY_MIN_FACTOR, 1] for a burn-rate penalty <= 0."""
+    try:
+        pen = float(pen)
+    except (TypeError, ValueError):
+        return 1.0
+    if pen != pen or pen >= 0.0:  # NaN or no penalty
+        return 1.0
+    severity = min(1.0, -pen / BURN_PENALTY_FULL_SCALE)
+    return max(BURN_PENALTY_MIN_FACTOR, 1.0 - (1.0 - BURN_PENALTY_MIN_FACTOR) * severity)
+
+
+def apply_burn_rate_penalty(score: float, pen: float) -> float:
+    """Bounded soft down-weighting: score*MIN_FACTOR <= result <= score for score > 0."""
+    if score <= 0:
+        return score
+    return score * burn_rate_factor(pen)
+
+
+def reliability_factor(rate: Optional[float]) -> float:
+    """Multiplier in [RELIABILITY_MIN_FACTOR, 1]; None (insufficient evidence) is neutral."""
+    if rate is None:
+        return 1.0
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        return 1.0
+    if rate != rate:
+        return 1.0
+    if rate >= RELIABILITY_GOOD_RATE:
+        return 1.0
+    if rate <= RELIABILITY_BAD_RATE:
+        return RELIABILITY_MIN_FACTOR
+    span = (rate - RELIABILITY_BAD_RATE) / (RELIABILITY_GOOD_RATE - RELIABILITY_BAD_RATE)
+    return RELIABILITY_MIN_FACTOR + (1.0 - RELIABILITY_MIN_FACTOR) * span
+
+
 def select_optimal_engine_pair(
     prompt: str,
     tier: str = "standard",
@@ -1104,7 +1163,7 @@ def select_optimal_engine_pair(
     except Exception:
         pass
 
-    # 2. Sliding Window Quota Burn-Rate Adjustment
+    # 2. Sliding Window Quota Burn-Rate Adjustment (bounded soft down-weighting)
     try:
         from makewand.usage import get_burn_rate_penalty
         is_explain_query = (classify_prompt_intent(prompt) == "explain")
@@ -1117,19 +1176,16 @@ def select_optimal_engine_pair(
                         if pen_reason and boost:
                             reasons.append(f"{model_name.upper()} {pen_reason} [已由用户 --boost 强制穿透豁免]")
                         pen = 0.0
-                    elif tier == "deep" and pen > -2.5:
-                        # 战役级任务实施惩罚穿透：豁免减半
-                        pen *= 0.5
-                        if pen_reason:
-                            reasons.append(pen_reason + " [已触发 Deep 穿透豁免减半]")
-                        scores[model_name] += pen
                     else:
-                        if pen <= -1.5:
-                            scores[model_name] = max(0.2, min(scores[model_name], 1.5) + pen)
-                        else:
-                            scores[model_name] += pen
+                        suffix = ""
+                        if tier == "deep" and pen > -2.5:
+                            # 战役级任务实施惩罚穿透：豁免减半
+                            pen *= 0.5
+                            suffix = " [已触发 Deep 穿透豁免减半]"
+                        factor = burn_rate_factor(pen)
+                        scores[model_name] = apply_burn_rate_penalty(scores[model_name], pen)
                         if pen_reason:
-                            reasons.append(pen_reason)
+                            reasons.append(f"{pen_reason}{suffix} -> 软降权 ×{factor:.2f} (有界，不排除该引擎)")
     except Exception:
         pass
 
@@ -1144,15 +1200,25 @@ def select_optimal_engine_pair(
                 if p_boost != 0.0 and not boost:
                     scores[model_name] += p_boost
                 p_reason = p_data.get("reason")
-                if p_reason and p_data.get("pacing_state") in ("harvest", "under_burned", "over_burned"):
+                if p_reason and (p_data.get("pacing_state") in ("harvest", "under_burned", "over_burned")
+                                 or p_data.get("signal") == "reliability"):
                     reasons.append(p_reason)
     except Exception:
         pass
+
+    if tier == "auto":
+        try:
+            from makewand.pacing import describe_auto_tier_signal
+            reasons.append(f"tier={describe_auto_tier_signal(cache, pacings=pacings or None)}")
+        except Exception:
+            pass
 
     # 3. Quota Health & Active Tool Filter
     from makewand.config import has_api_configured, is_provider_enabled, get_active_providers
     active_pool = set(get_active_providers())
 
+    from makewand.health import get_reauth_hint, is_status_stale
+    stale_engines = []
     for model_name in list(scores.keys()):
         if not is_provider_enabled(model_name):
             scores[model_name] = -999.0
@@ -1161,10 +1227,16 @@ def select_optimal_engine_pair(
         if model_name not in active_pool:
             scores[model_name] = -999.0
             continue
+        if model_name in ENGINES_WITHOUT_EXECUTOR:
+            scores[model_name] = -999.0
+            reasons.append(f"{model_name} 已检测到但暂无执行适配，不参与派发")
+            continue
         if cache and model_name not in cache:
             status = "missing"
         else:
             status = cache.get(model_name, {}).get("status", "unknown")
+        if is_status_stale(cache.get(model_name) if cache else None):
+            stale_engines.append(model_name)
         api_ok = has_api_configured(model_name)
         if status == "limited":
             if api_ok:
@@ -1179,6 +1251,24 @@ def select_optimal_engine_pair(
                 reasons.append(f"{model_name} 未配置 CLI 订阅，当前使用纯 API 模式")
             else:
                 scores[model_name] = -999.0
+                if status == "needs_auth":
+                    reasons.append(get_reauth_hint(model_name))
+    if stale_engines:
+        reasons.append(f"引擎状态缓存已超过 6 小时未刷新 ({', '.join(sorted(stale_engines))})，按中性处理；建议运行 'makewand probe'")
+
+    # 3.5 Real-dispatch reliability (all engines, agy included): time-decayed
+    # success rate from the usage ledger scales the remaining eligible scores.
+    reliability = {}
+    try:
+        from makewand.usage import get_all_engine_reliability
+        reliability = get_all_engine_reliability(list(scores.keys()))
+        for model_name, (rate, weight, _raw) in reliability.items():
+            factor = reliability_factor(rate)
+            if factor < 1.0 and scores.get(model_name, 0) > 0:
+                scores[model_name] *= factor
+                reasons.append(f"{model_name.upper()} 近 7 天真实派发成功率 {rate:.0%} (有效样本 {weight:g})，按可靠性软降权 ×{factor:.2f}")
+    except Exception:
+        reliability = {}
 
     if require_file_editing is None:
         require_file_editing = (classify_prompt_intent(prompt) == "code")
@@ -1195,8 +1285,12 @@ def select_optimal_engine_pair(
             reasons.append("⚠️ 无可用自主工具 Agent 候选，降级保留 API/Local 引擎")
 
     if not available_coders:
-        # If no active tool has score > 0, fallback to any active tool, or agy if pool empty
-        available_coders = [m for m in active_pool if is_provider_enabled(m)] or ["agy"]
+        # If no active tool has score > 0, fallback to any active tool (deterministic:
+        # best score first, then name), or agy if the pool is empty.
+        available_coders = sorted(
+            (m for m in active_pool if is_provider_enabled(m) and m not in ENGINES_WITHOUT_EXECUTOR),
+            key=lambda m: (-scores.get(m, -999.0), m),
+        ) or ["agy"]
         if require_file_editing:
             filtered_coders = [m for m in available_coders if m not in NON_AGENTIC_CHAT_MODELS]
             if filtered_coders:
@@ -1241,14 +1335,22 @@ def select_optimal_engine_pair(
             else:
                 reviewer_base_scores[model_name] = -999.0
         else:
+            if model_name in ENGINES_WITHOUT_EXECUTOR:
+                reviewer_base_scores[model_name] = -999.0
+                continue
             if not boost:
                 try:
                     from makewand.usage import get_burn_rate_penalty
                     pen, _ = get_burn_rate_penalty(model_name)
                     if pen != 0.0:
-                        reviewer_base_scores[model_name] += pen
+                        reviewer_base_scores[model_name] = apply_burn_rate_penalty(reviewer_base_scores[model_name], pen)
                 except Exception:
                     pass
+            rate = (reliability.get(model_name) or (None,))[0]
+            reviewer_base_scores[model_name] = (
+                reviewer_base_scores[model_name] * reliability_factor(rate)
+                if reviewer_base_scores[model_name] > 0 else reviewer_base_scores[model_name]
+            )
 
     available_reviewers = [m for m, sc in sorted(reviewer_base_scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
     single_tool_mode = False
@@ -1257,9 +1359,9 @@ def select_optimal_engine_pair(
         single_tool_mode = True
         reasons.append(f"当前系统仅检测到 1 个活跃可用工具 ({primary_coder.upper()})，已自动切换为单工具实现 + 独立沙箱自审闭环模式")
     elif not available_reviewers:
-        other_active = [m for m in active_pool if m != primary_coder and is_provider_enabled(m)]
+        other_active = [m for m in active_pool if m != primary_coder and is_provider_enabled(m) and m not in ENGINES_WITHOUT_EXECUTOR]
         if other_active:
-            available_reviewers = sorted(other_active, key=lambda m: reviewer_base_scores.get(m, -999.0), reverse=True)
+            available_reviewers = sorted(other_active, key=lambda m: (-reviewer_base_scores.get(m, -999.0), m))
             reasons.append(f"由于削峰保护，备用审查员降级由活跃工具接管: {available_reviewers[0]}")
         else:
             available_reviewers = [primary_coder]

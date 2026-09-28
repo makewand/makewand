@@ -134,8 +134,17 @@ def execute_local_task(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to locally deployed open-source model via OpenAI-compatible endpoint.
-    Zero token cost, fully private.
-    Enforces GPU VRAM protection and lower scheduling priority to prevent impacting training tasks.
+    Zero token cost; data goes wherever the configured endpoint lives.
+
+    Inference runs inside the model server (Ollama / vLLM), not in a child of
+    makewand, so makewand must not renice itself: os.nice() on the caller is
+    irreversible without privileges and would slow every later dispatch, test
+    run and sandbox of this process. CPU/GPU pressure is controlled through the
+    server request options (num_gpu / num_thread) below instead. (If makewand
+    ever spawns its own inference child, lower *its* priority via preexec_fn.)
+
+    The endpoint is a chat completion API: it returns text and never edits files.
+    Callers that need file changes must verify the diff (run_pipeline/run_race do).
     """
     from makewand.providers.api_client import call_api_chat
     from makewand.config import COLOR_YELLOW, is_provider_enabled
@@ -143,11 +152,11 @@ def execute_local_task(
     if not is_provider_enabled("local"):
         return False, None, "本地大模型 (Local AI) 当前已被用户在配置中手动禁用。运行 'makewand enable local' 重新开启"
 
-    # Lower CPU scheduling priority so background training tasks get full CPU
-    try:
-        os.nice(15)
-    except Exception:
-        pass
+    if readonly and role == "coder":
+        # Read-only dispatches (reviews, Q&A) must use the reviewer system prompt.
+        role = "reviewer"
+    if not readonly:
+        print(c("ℹ️ 本地模型仅返回文本补全，不会直接修改工作区文件；需要落盘的任务将由调用方按实际 diff 验收。", COLOR_YELLOW), file=sys.stderr)
 
     avail, def_model, all_models = is_local_model_available()
     if not avail:

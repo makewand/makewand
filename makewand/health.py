@@ -33,6 +33,61 @@ DEFAULT_CACHE = {
 
 STATUS_LOCK_FILE = STATUS_CACHE_FILE.parent / ".status.lock"
 
+# A cached "healthy"/"warning" verdict older than this is no longer evidence of
+# anything: it is treated as neutral and the user is asked to re-probe.
+STATUS_STALE_SECONDS = 6 * 3600
+# Failure verdicts self-heal back to neutral ("unknown") after a TTL so that one
+# probe timeout or one failed login check can never exclude a provider forever.
+STATUS_TTL_SECONDS = {
+    "error": 30 * 60,
+    "needs_auth": 30 * 60,
+}
+# Geographic/account-level blocks rarely change within minutes; re-check later.
+REGION_BLOCK_TTL_SECONDS = 6 * 3600
+
+REAUTH_HINTS = {
+    "claude": "运行 'claude' 并在会话内执行 /login",
+    "codex": "运行 'codex login'",
+    "muse": "运行 'muse login'",
+    "grok": "运行 'grok' 按提示登录，或设置 XAI_API_KEY",
+    "agy": "运行 'agy' 按提示登录 Google 账号",
+}
+
+
+def get_reauth_hint(provider: str) -> str:
+    """Actionable re-login instruction for a provider in needs_auth state."""
+    name = (provider or "").lower().strip()
+    step = REAUTH_HINTS.get(name, f"重新登录 {name} CLI 或配置其 API Key")
+    return f"{name} 需要重新登录：{step}，完成后运行 'makewand probe' 刷新状态"
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        clean = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        return datetime.fromisoformat(clean)
+    except (TypeError, ValueError):
+        return None
+
+
+def status_age_seconds(info: Dict[str, Any]) -> Optional[float]:
+    """Seconds since a cache entry was written, or None when unknown."""
+    if not isinstance(info, dict):
+        return None
+    stamp = _parse_timestamp(info.get("updated_at"))
+    if stamp is None:
+        return None
+    now = datetime.now(stamp.tzinfo) if stamp.tzinfo is not None else datetime.now()
+    return (now - stamp).total_seconds()
+
+
+def _entry_ttl_seconds(info: Dict[str, Any]) -> Optional[float]:
+    explicit = info.get("ttl_seconds")
+    if isinstance(explicit, (int, float)) and explicit > 0:
+        return float(explicit)
+    return STATUS_TTL_SECONDS.get(info.get("status"))
+
 def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool:
     if not resets_at or resets_at == "待重置":
         if updated_at:
@@ -171,11 +226,41 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                 info["reason"] = f"已过配额重置窗口 ({resets_at})，已自动恢复待命"
                 info["resets_at"] = None
                 info["updated_at"] = now_dt.isoformat()
+        elif isinstance(info, dict) and info.get("status") in STATUS_TTL_SECONDS:
+            ttl = _entry_ttl_seconds(info)
+            age = status_age_seconds(info)
+            if ttl is not None and (age is None or age >= ttl):
+                previous = info.get("status")
+                old_reason = str(info.get("reason") or "").strip()
+                info["status"] = "unknown"
+                info["expired_from"] = previous
+                info["reason"] = (
+                    f"上次状态 {previous}（{old_reason[:80] or '无详情'}）已超过 {int(ttl // 60)} 分钟有效期，"
+                    "按中性处理；运行 'makewand probe' 重新探测"
+                )
+                info["resets_at"] = None
+                info.pop("ttl_seconds", None)
+                info["updated_at"] = now_dt.isoformat()
+        if isinstance(info, dict):
+            age = status_age_seconds(info)
+            info["stale"] = bool(
+                info.get("status") in ("healthy", "warning")
+                and age is not None
+                and age >= STATUS_STALE_SECONDS
+            )
     return cache
+
+
+def is_status_stale(info: Optional[Dict[str, Any]]) -> bool:
+    """True when a healthy/warning verdict is too old to be trusted."""
+    if not isinstance(info, dict) or info.get("status") not in ("healthy", "warning"):
+        return False
+    age = status_age_seconds(info)
+    return age is not None and age >= STATUS_STALE_SECONDS
 
 def load_status_cache() -> Dict[str, Any]:
     ensure_config_dir()
-    cache = dict(DEFAULT_CACHE)
+    cache = {k: dict(v) for k, v in DEFAULT_CACHE.items()}
     loaded = False
     lock_file = STATUS_CACHE_FILE.parent / ".status.lock"
     try:
@@ -215,7 +300,7 @@ def save_status_cache(cache: Dict[str, Any]):
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
             try:
                 # Merge with current on-disk data so concurrent probes don't clobber each other
-                disk_data = dict(DEFAULT_CACHE)
+                disk_data = {k: dict(v) for k, v in DEFAULT_CACHE.items()}
                 if STATUS_CACHE_FILE.exists():
                     try:
                         with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -265,12 +350,44 @@ def save_status_cache(cache: Dict[str, Any]):
     except Exception:
         pass
 
+def record_engine_failure(
+    engine: str,
+    status: str,
+    reason: str,
+    ttl_seconds: Optional[float] = None,
+    source: str = "dispatch",
+) -> None:
+    """
+    Writes a non-quota failure observed during a real dispatch (region block,
+    authentication failure, broken CLI) into the shared status cache with a TTL.
+    After the TTL the entry decays to neutral "unknown" (see _sanitize_cache).
+    """
+    if status not in STATUS_TTL_SECONDS:
+        raise ValueError(f"unsupported failure status: {status}")
+    model_name = engine.lower().strip()
+    entry: Dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "resets_at": None,
+        "updated_at": datetime.now().isoformat(),
+        "source": source,
+    }
+    if ttl_seconds:
+        entry["ttl_seconds"] = float(ttl_seconds)
+    save_status_cache({model_name: entry})
+
+
 def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = None) -> None:
     """
     Directly writes a live rate-limit/429 status event into the shared status cache.
     Allows immediate cross-session visibility without waiting for periodic polling probes.
+    Login/credential failures reported through this legacy entry point are stored as
+    needs_auth with a TTL instead of a fake quota limit.
     """
     model_name = engine.lower().strip()
+    if resets_at == "需登录授权" or "登录" in str(reason or ""):
+        record_engine_failure(model_name, "needs_auth", f"{reason} · {get_reauth_hint(model_name)}")
+        return
     now = datetime.now().isoformat()
     status_entry = {
         model_name: {
@@ -373,11 +490,16 @@ def probe_model(model_name: str) -> Dict[str, Any]:
         return {"status": "warning", "reason": combined.strip()[:120], "resets_at": None, "updated_at": now, "mode": mode}
 
     elif model_name == "agy":
+        # `agy --version` only proves the binary is installed. Account, region and
+        # quota availability are learned from real dispatches (providers/agy.py
+        # writes region/auth failures back with a TTL) and the usage ledger.
         code, out, err, ex = run_subprocess("agy --version", timeout=5)
         if code == 0:
             version = out.strip() or "v1.x"
-            sub_desc = f"Antigravity (Google AI Pro, {version}) 运行就绪" + (" (已配置 API 备用兜底)" if api_configured else "")
-            return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
+            sub_desc = (f"Antigravity 已安装 ({version})；仅版本检测，账号/地区可用性未经真实调用验证"
+                        + (" (已配置 API 备用兜底)" if api_configured else ""))
+            return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now,
+                    "mode": mode, "verified": False}
         return {"status": "warning", "reason": err.strip()[:100] or "agy 版本检测异常", "resets_at": None, "updated_at": now, "mode": mode}
 
     elif model_name == "muse":
@@ -435,14 +557,73 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     return {"status": "unknown", "reason": "Unknown model", "resets_at": None, "updated_at": now, "mode": "none"}
 
+PROBE_REUSE_SECONDS = 120
+
+
+def _is_live_dispatch_failure(info: Any) -> bool:
+    return (isinstance(info, dict) and info.get("source") == "dispatch"
+            and info.get("status") in STATUS_TTL_SECONDS)
+
+
+def _merge_probe_result(model: str, previous: Any, probed: Dict[str, Any]) -> Dict[str, Any]:
+    """A version-only probe must not erase a still-valid failure seen by a real dispatch."""
+    if probed.get("verified") is False and probed.get("status") == "healthy" and _is_live_dispatch_failure(previous):
+        kept = dict(previous)
+        note = " (版本探测仅证明已安装，保留真实派发失败记录直到过期)"
+        reason = str(previous.get("reason", ""))
+        kept["reason"] = reason if note in reason else f"{reason}{note}"
+        return kept
+    return probed
+
+
+def _probed_since(info: Any, started: datetime) -> bool:
+    if not isinstance(info, dict):
+        return False
+    stamp = _parse_timestamp(info.get("updated_at"))
+    if stamp is None:
+        return False
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone().replace(tzinfo=None)
+    return stamp >= started - timedelta(seconds=PROBE_REUSE_SECONDS)
+
+
 def get_or_update_status(force_probe: bool = False) -> Dict[str, Any]:
     from makewand.config import get_all_supported_providers
     cache = load_status_cache()
-    if force_probe:
+    if not force_probe:
+        return cache
+    # Probes of claude/codex/muse/grok are real model calls. Serialize them across
+    # processes so two concurrent `makewand probe` runs do not double the spend: a
+    # waiter reuses the fresh result of the probe that held the lock.
+    ensure_config_dir()
+    probe_lock = STATUS_CACHE_FILE.parent / ".probe.lock"
+    started = datetime.now()
+    try:
+        lock_f = open(probe_lock, "a+")
+    except OSError:
+        lock_f = None
+    try:
+        if lock_f is not None:
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("⏳ 另一个 makewand 探测正在进行，等待其结果以避免重复消耗额度...", flush=True)
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                cache = load_status_cache()
+                if all(_probed_since(cache.get(m), started) for m in get_all_supported_providers()):
+                    return cache
+        cache = load_status_cache()
         for model in get_all_supported_providers():
-            cache[model] = probe_model(model)
+            cache[model] = _merge_probe_result(model, cache.get(model), probe_model(model))
         save_status_cache(cache)
-    return cache
+        return cache
+    finally:
+        if lock_f is not None:
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_f.close()
 
 def format_quota_bar(percentage: int, width: int = 20, colorize: bool = True) -> str:
     """
@@ -472,10 +653,24 @@ def format_quota_bar(percentage: int, width: int = 20, colorize: bool = True) ->
     pct_str = f"{bar_color}{COLOR_BOLD}{pct:>3}%{COLOR_RESET}"
     return f"[{bar}] {pct_str}"
 
+QUOTA_SOURCE_LABELS = {
+    "official": "官方报告",
+    "local_estimate": "本地调用计数估算，非真实配额",
+    "assumed": "无额度信号，未做估算",
+    "status": "由健康状态推定",
+    "unknown": "未探测",
+}
+
+
 def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Calculates remaining quota percentage (0-100), visual status, and metadata
-    integrating live health status, reset windows, and rolling burn-rate tracking.
+    Returns a quota *indicator* (0-100) for display and pacing.
+
+    Only percentages parsed from provider output ("NN% left") are official
+    ("source": "official"). Everything else is either inferred from the health
+    status or estimated from makewand's own local call counts
+    ("source": "local_estimate"); callers must not present those as real quota.
+    "unknown" (never probed) is neutral: it is not an exhausted quota.
     """
     if info is None:
         info = load_status_cache().get(provider, {})
@@ -493,33 +688,50 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
             "status": "limited",
             "desc": f"额度已耗尽{reset_desc}",
             "resets_at": resets_at,
-            "is_unlimited": False
+            "is_unlimited": False,
+            "source": "status",
         }
-    # 2. Disabled / Missing / Needs Auth
-    elif status in ("disabled", "needs_auth", "error", "missing", "unknown"):
+    # 2. Never probed / expired verdict: neutral, not "0% left"
+    elif status == "unknown":
+        res = {
+            "percentage": None,
+            "status": "unknown",
+            "desc": reason or "未探测 (中性处理；运行 'makewand probe' 获取实时状态)",
+            "resets_at": None,
+            "is_unlimited": False,
+            "source": "unknown",
+        }
+    # 3. Disabled / Missing / Needs Auth / Error
+    elif status in ("disabled", "needs_auth", "error", "missing"):
+        desc = reason or "未就绪或未授权"
+        if status == "needs_auth" and "重新登录" not in desc:
+            desc = f"{desc} · {get_reauth_hint(provider)}"
         res = {
             "percentage": 0,
             "status": status,
-            "desc": reason or "未就绪或未授权",
+            "desc": desc,
             "resets_at": None,
-            "is_unlimited": False
+            "is_unlimited": False,
+            "source": "status",
         }
-    # 3. Unlimited local models or enterprise tiers
+    # 4. Unlimited local models or enterprise tiers
     elif provider == "local":
         res = {
             "percentage": 100,
             "status": "healthy",
-            "desc": "本地私有模型 · 无限额度 · 0 Token 成本",
+            "desc": "本地私有模型 · 无云端额度 · 0 Token 成本",
             "resets_at": None,
-            "is_unlimited": True
+            "is_unlimited": True,
+            "source": "assumed",
         }
     elif provider == "agy":
         res = {
             "percentage": 100,
             "status": "healthy",
-            "desc": "Google AI Pro 订阅充足",
+            "desc": "无额度查询接口，未做估算 (可用性以真实派发结果为准)",
             "resets_at": None,
-            "is_unlimited": True
+            "is_unlimited": True,
+            "source": "assumed",
         }
     elif reason and re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE):
         pct_match = re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE)
@@ -529,7 +741,8 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
             "status": "healthy" if pct > 20 else ("warning" if pct > 0 else "limited"),
             "desc": f"官方报告剩余额度: {pct}%",
             "resets_at": resets_at,
-            "is_unlimited": False
+            "is_unlimited": False,
+            "source": "official",
         }
     else:
         # 5. Estimate from rolling usage and burn rate penalty
@@ -561,19 +774,25 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
             res = {
                 "percentage": pct,
                 "status": "healthy" if pct >= 25 else "warning",
-                "desc": desc,
+                "desc": f"{desc} [本地调用计数估算，非真实配额]",
                 "resets_at": resets_at,
-                "is_unlimited": False
+                "is_unlimited": False,
+                "source": "local_estimate",
             }
         except Exception:
             res = {
                 "percentage": 85,
                 "status": "healthy",
-                "desc": "运行健康",
+                "desc": "运行健康 [本地调用计数估算，非真实配额]",
                 "resets_at": resets_at,
-                "is_unlimited": False
+                "is_unlimited": False,
+                "source": "local_estimate",
             }
 
     res["updated_at"] = updated_at
+    res["source_label"] = QUOTA_SOURCE_LABELS.get(res.get("source"), "")
+    if is_status_stale(info):
+        res["stale"] = True
+        res["desc"] = f"{res['desc']} · 状态缓存已超过 {STATUS_STALE_SECONDS // 3600} 小时未刷新，按中性处理 (运行 'makewand probe')"
     return res
 

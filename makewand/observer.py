@@ -10,10 +10,12 @@ import re
 import sys
 import json
 import time
+import uuid
+import signal
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List, Optional, Any, Iterable
 from makewand.config import (
     CONFIG_DIR,
     ensure_config_dir,
@@ -25,6 +27,196 @@ from makewand.config import (
     COLOR_RED,
     COLOR_RESET
 )
+
+# ---------------------------------------------------------------------------
+# Ownership of processes for `observe --clean-hung`.
+#
+# makewand marks itself as a dispatcher at CLI start (MAKEWAND_DISPATCH_ID in
+# os.environ), so every process it spawns inherits the marker in its initial
+# environment (/proc/<pid>/environ). Sandboxed children run under bwrap
+# --clearenv, but the bwrap process itself carries the marker. Only such marked,
+# terminal-less (setsid) processes are ever cleanup candidates; interactive
+# sessions, editors, shells, ssh, and the user's own claude/codex/grok/muse/agy
+# sessions never carry the marker or own a controlling terminal.
+# ---------------------------------------------------------------------------
+DISPATCH_ENV_VAR = "MAKEWAND_DISPATCH_ID"
+HUNG_MIN_AGE_SECONDS = 1800
+PROTECTED_COMMS = frozenset({
+    # shells
+    "bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh", "nu", "xonsh",
+    # editors / pagers / interactive tools
+    "vim", "nvim", "vi", "view", "emacs", "emacsclient", "nano", "micro", "hx", "helix", "kak",
+    "less", "more", "man", "top", "htop", "btop", "watch", "tail", "psql", "mysql", "sqlite3",
+    # remote sessions and multiplexers
+    "ssh", "sshd", "mosh", "mosh-client", "mosh-server", "tmux", "tmux: server", "screen",
+    # system
+    "systemd", "init",
+})
+
+
+def new_dispatch_id() -> str:
+    return f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def mark_process_as_dispatcher() -> str:
+    """Give this makewand process a fresh dispatch id inherited by its children."""
+    dispatch_id = new_dispatch_id()
+    os.environ[DISPATCH_ENV_VAR] = dispatch_id
+    return dispatch_id
+
+
+def _read_proc_environ(pid: int) -> Optional[Dict[str, str]]:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    env: Dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            k, _, v = item.partition(b"=")
+            env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    return env
+
+
+def _read_proc_stat(pid: int) -> Optional[Dict[str, Any]]:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        lpar, rpar = raw.index("("), raw.rindex(")")
+        comm = raw[lpar + 1:rpar]
+        fields = raw[rpar + 2:].split()
+        return {
+            "pid": pid,
+            "comm": comm,
+            "ppid": int(fields[1]),
+            "pgrp": int(fields[2]),
+            "tty_nr": int(fields[4]),
+            "starttime": int(fields[19]),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def _read_proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+
+
+def _process_age_seconds(starttime_ticks: int) -> Optional[float]:
+    try:
+        ticks = os.sysconf("SC_CLK_TCK")
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return max(0.0, uptime - starttime_ticks / float(ticks))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _list_pids() -> Iterable[int]:
+    try:
+        return [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return []
+
+
+def get_dispatch_id(pid: int) -> Optional[str]:
+    env = _read_proc_environ(pid)
+    return env.get(DISPATCH_ENV_VAR) if env else None
+
+
+def _own_ancestors() -> set:
+    seen = set()
+    pid = os.getpid()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        stat = _read_proc_stat(pid)
+        if not stat:
+            break
+        pid = stat["ppid"]
+    return seen
+
+
+def find_makewand_dispatched_processes(min_age_seconds: int = HUNG_MIN_AGE_SECONDS) -> List[Dict[str, Any]]:
+    """
+    Lists processes that makewand itself dispatched and that have outlived
+    `min_age_seconds`: they carry MAKEWAND_DISPATCH_ID, have no controlling
+    terminal, are not shells/editors/remote sessions, and are the top of their
+    dispatched tree. Nothing is signalled here.
+    """
+    stats: Dict[int, Dict[str, Any]] = {}
+    marks: Dict[int, str] = {}
+    for pid in _list_pids():
+        stat = _read_proc_stat(pid)
+        if not stat:
+            continue
+        stats[pid] = stat
+        mark = get_dispatch_id(pid)
+        if mark:
+            marks[pid] = mark
+
+    protected = _own_ancestors()
+    own_mark = os.environ.get(DISPATCH_ENV_VAR)
+    candidates = []
+    for pid, mark in sorted(marks.items()):
+        stat = stats[pid]
+        if pid in protected or mark == own_mark:
+            continue
+        if marks.get(stat["ppid"]) == mark:
+            continue  # not the top of this dispatched tree
+        if stat["tty_nr"] != 0:
+            continue  # attached to a terminal: interactive, never ours to kill
+        comm = stat["comm"]
+        if comm.lower() in PROTECTED_COMMS:
+            continue
+        age = _process_age_seconds(stat["starttime"])
+        if age is None or age < min_age_seconds:
+            continue
+        dispatcher_pid = None
+        head = mark.split("-", 1)[0]
+        if head.isdigit():
+            dispatcher_pid = int(head)
+        candidates.append({
+            "pid": pid,
+            "pgid": stat["pgrp"],
+            "comm": comm,
+            "args": _read_proc_cmdline(pid)[:160],
+            "etimes": int(age),
+            "starttime": stat["starttime"],
+            "dispatch_id": mark,
+            "dispatcher_pid": dispatcher_pid,
+            "dispatcher_alive": bool(dispatcher_pid and dispatcher_pid in stats),
+        })
+    return candidates
+
+
+def terminate_dispatched_processes(candidates: List[Dict[str, Any]], confirm_pids: Iterable[int]) -> List[Dict[str, Any]]:
+    """
+    Sends SIGTERM only to candidates whose PID the user explicitly confirmed,
+    after re-checking that the PID still belongs to the same dispatched process.
+    """
+    confirmed = {int(p) for p in confirm_pids}
+    cleaned = []
+    for cand in candidates:
+        pid = cand["pid"]
+        if pid not in confirmed:
+            continue
+        stat = _read_proc_stat(pid)
+        if not stat or stat["starttime"] != cand["starttime"] or get_dispatch_id(pid) != cand["dispatch_id"]:
+            continue  # exited or PID reused
+        try:
+            if stat["pgrp"] == pid:
+                os.killpg(pid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        cleaned.append({"pid": pid, "comm": cand["comm"], "dispatch_id": cand["dispatch_id"]})
+    return cleaned
+
 
 def get_known_workspaces() -> Dict[str, str]:
     """
@@ -307,7 +499,7 @@ def get_session_long_running_process(session_name: str, threshold_seconds: int =
                 continue
             comm_lower = info["comm"].lower()
             args_lower = info["args"].lower()
-            if comm_lower in ("zsh", "sh", "dash", "tmux", "agy", "node", "codex", "npm", "playwright"):
+            if comm_lower in ("zsh", "sh", "dash", "tmux", "agy", "node", "codex", "claude", "grok", "muse", "npm", "playwright"):
                 continue
             if comm_lower == "bash":
                 if not any(k in args_lower for k in ("while", "until", "for", ".sh", "eval", "python", "curl", "grep", "sleep")):
@@ -319,7 +511,8 @@ def get_session_long_running_process(session_name: str, threshold_seconds: int =
                     "pid": info["pid"],
                     "comm": info["comm"],
                     "etimes": info["etimes"],
-                    "args": info["args"][:160]
+                    "args": info["args"][:160],
+                    "makewand_dispatched": bool(get_dispatch_id(info["pid"])),
                 }
     except Exception:
         pass
@@ -387,8 +580,10 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
         elif any(k in args_str for k in ("serve", "server", "uvicorn", "gunicorn", "dashboard", "http.server", "flask", "fastapi", "streamlit", "gradio", "webpack", "vite")) or \
              any(k in long_proc["comm"].lower() for k in ("uvicorn", "gunicorn", "caddy", "nginx")):
             return "server_daemon", f"后台服务/仪表盘运行中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
+        elif elapsed_min >= 30 and long_proc.get("makewand_dispatched"):
+            return "hung_anomaly", f"makewand 派发的子进程 (PID {long_proc['pid']}, {long_proc['comm']}) 持续运行达 {elapsed_min} 分钟，疑似挂起"
         elif elapsed_min >= 30:
-            return "hung_anomaly", f"子进程 (PID {long_proc['pid']}, {long_proc['comm']}) 持续运行达 {elapsed_min} 分钟"
+            return "long_running", f"长时运行进程 (PID {long_proc['pid']}, {long_proc['comm']}, {elapsed_min} 分钟)；非 makewand 派发，仅观察不处理"
 
     # 3. Check for hung anomaly (specifically CI script or exclusive lock held)
     if "running" in text and any(k in text for k in ("run_in_ephemer", "exclusive_lock", "heavy_lock")):
@@ -534,10 +729,14 @@ def analyze_makewand_optimizations(session_reports, metrics, external_sessions=N
 
     return optimizations
 
-def observe_all_dialogs(save_report=True, clean_hung=False):
+def observe_all_dialogs(save_report=True, clean_hung=False, confirm_pids: Optional[Iterable[int]] = None):
     """
     Run a complete observation turn across all dialogs.
     Returns structured observation dict.
+
+    clean_hung only *lists* makewand-dispatched processes older than 30 minutes
+    (report["hung_candidates"]). A signal is sent only to PIDs the caller also
+    passes in confirm_pids (the CLI's explicit --confirm-pids argument).
     """
     metrics = get_system_metrics()
     active_sessions = get_active_tmux_sessions()
@@ -545,25 +744,12 @@ def observe_all_dialogs(save_report=True, clean_hung=False):
 
     session_reports = []
     cleaned_pids = []
+    hung_candidates: List[Dict[str, Any]] = []
     for s in active_sessions:
         cwd = get_session_cwd(s)
         lines = capture_session_pane(s, lines_count=20)
         long_proc = get_session_long_running_process(s, threshold_seconds=900)
         cat, note = classify_operation(s, lines, metrics, long_proc=long_proc)
-
-        # Optional clean hung processes
-        if clean_hung and cat == "hung_anomaly" and long_proc and long_proc["etimes"] >= 1800:
-            comm_lower = long_proc["comm"].lower()
-            args_lower = long_proc["args"].lower()
-            if not any(k in comm_lower or k in args_lower for k in ("gh", "git", "cargo", "go", "gcc", "clang", "rustc", "npm", "node")):
-                try:
-                    import signal
-                    os.kill(long_proc["pid"], signal.SIGTERM)
-                    cleaned_pids.append({"session": s, "pid": long_proc["pid"], "comm": long_proc["comm"]})
-                    note += f" [已自动执行超时回收: SIGTERM PID {long_proc['pid']}]"
-                    cat = "idle_ready"
-                except Exception:
-                    pass
 
         session_reports.append({
             "name": s,
@@ -573,6 +759,11 @@ def observe_all_dialogs(save_report=True, clean_hung=False):
             "long_proc": long_proc,
             "sample_lines": lines[-5:] if lines else []
         })
+
+    if clean_hung:
+        hung_candidates = find_makewand_dispatched_processes(min_age_seconds=HUNG_MIN_AGE_SECONDS)
+        if confirm_pids:
+            cleaned_pids = terminate_dispatched_processes(hung_candidates, confirm_pids)
 
     optimizations = analyze_makewand_optimizations(session_reports, metrics, external_sessions=external_sessions)
 
@@ -585,16 +776,21 @@ def observe_all_dialogs(save_report=True, clean_hung=False):
         "external_sessions": external_sessions,
         "external_count": len(external_sessions),
         "makewand_optimizations": optimizations,
+        "hung_candidates": hung_candidates,
         "cleaned_pids": cleaned_pids
     }
 
     if save_report:
-        save_dir = Path.home() / ".config" / "makewand"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        report_path = save_dir / "dialog_observations.json"
+        from makewand import config as _config
+        save_dir = Path(_config.CONFIG_DIR)
         try:
-            with open(report_path, "w", encoding="utf-8") as f:
+            save_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            report_path = save_dir / "dialog_observations.json"
+            # The report contains captured terminal text: owner-only.
+            fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
+            os.chmod(report_path, 0o600)
         except Exception:
             pass
 
@@ -612,7 +808,8 @@ def format_observation_markdown(report):
     lines.append("|---|---|---|---|:---:|")
 
     status_icons = {
-        "hung_anomaly": "🔴 异常卡死",
+        "hung_anomaly": "🔴 疑似挂起",
+        "long_running": "🟡 长时运行",
         "heavy_db_query": "🟡 高负荷",
         "quota_exhausted": "⚠️ 额度已见底",
         "test_ci": "🔵 测试中",
@@ -636,6 +833,16 @@ def format_observation_markdown(report):
         lines.append("|---|---|---|---|---|:---:|")
         for ext in report["external_sessions"]:
             lines.append(f"| `{ext['tty']}` | **{ext['ai_type']}** | `{ext['pid']}` | `{ext['cwd']}` | {ext['etime']} | 🟢 活跃交互 |")
+
+    if report.get("hung_candidates"):
+        lines.append("")
+        lines.append("### ⏱️ makewand 派发且运行超过 30 分钟的进程 (清理候选，尚未处理)")
+        lines.append("")
+        lines.append("| PID | 进程 | 运行时长 | 派发者 PID | 派发者存活 | 命令 |")
+        lines.append("|---|---|---|---|:---:|---|")
+        for cand in report["hung_candidates"]:
+            alive = "是" if cand.get("dispatcher_alive") else "否"
+            lines.append(f"| `{cand['pid']}` | {cand['comm']} | {cand['etimes'] // 60} 分钟 | `{cand.get('dispatcher_pid')}` | {alive} | `{cand.get('args', '')}` |")
 
     lines.append("")
     lines.append("#### 🛠️ Makewand 针对性优化研判与建议：")
