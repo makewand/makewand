@@ -229,7 +229,16 @@ class DeliveryBindingTests(unittest.TestCase):
             orch._verify_delivery_commit(str(self.shadow), commit, frozen[""], {})
 
 
+def _has_pytest():
+    try:
+        import pytest  # noqa: F401
+        return True
+    except ImportError:
+        return bool(shutil.which("pytest"))
+
+
 class MixedTestDiscoveryTests(unittest.TestCase):
+    @unittest.skipUnless(_has_pytest(), "pytest required for root python discovery test")
     def test_root_python_tests_are_not_hidden_by_node_tests_directory(self):
         with tempfile.TemporaryDirectory(prefix="makewand-mixed-tests-") as directory:
             root = Path(directory)

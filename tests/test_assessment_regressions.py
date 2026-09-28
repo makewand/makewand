@@ -166,8 +166,10 @@ class AssessmentFixtures(unittest.TestCase):
         repo.mkdir()
         (repo / "app.py").write_text("VALUE = 1\n")
         (repo / "test_app.py").write_text(
-            "from pathlib import Path\ndef test_write():\n"
-            "    Path('app.py').write_text('UNVERIFIED = True\\n')\n")
+            "import unittest\nfrom pathlib import Path\n"
+            "class TestWrite(unittest.TestCase):\n"
+            "    def test_write(self):\n"
+            "        Path('app.py').write_text('UNVERIFIED = True\\n')\n")
         with patch("makewand.sandbox.run_in_sandbox", side_effect=fixture_process):
             ok, details = orch.run_local_tests(str(repo))
         self.assertFalse(ok)
@@ -179,8 +181,10 @@ class AssessmentFixtures(unittest.TestCase):
         (repo / "target").mkdir()
         (repo / "target/app.py").write_text("VALUE = 1\n")
         (repo / "test_app.py").write_text(
-            "from pathlib import Path\ndef test_write():\n"
-            "    Path('target/app.py').write_text('not valid Python!\\n')\n")
+            "import unittest\nfrom pathlib import Path\n"
+            "class TestWrite(unittest.TestCase):\n"
+            "    def test_write(self):\n"
+            "        Path('target/app.py').write_text('not valid Python!\\n')\n")
         with patch("makewand.sandbox.run_in_sandbox", side_effect=fixture_process):
             ok, details = orch.run_local_tests(str(repo))
         self.assertFalse(ok)
