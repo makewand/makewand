@@ -354,3 +354,64 @@ def get_burn_rate_penalty(engine: str) -> Tuple[float, Optional[str]]:
         return 0.0, None
 
     return 0.0, None
+
+
+# ---------------------------------------------------------------------------
+# Real-dispatch reliability (success rate) from the rolling ledger.
+#
+# The burn-rate penalty above is about *quota* (agy is exempt because it has no
+# local quota model). Reliability is about whether dispatches actually succeed,
+# and applies to every engine including agy: a provider whose CLI is installed
+# but keeps failing (region block, expired login, crashing CLI) must lose
+# priority even while its health probe still says "installed".
+# Records are time-decayed so that a recovered provider regains trust and old
+# failures fade out; with too little recent evidence the result is neutral.
+# ---------------------------------------------------------------------------
+RELIABILITY_HALF_LIFE_HOURS = 72.0
+RELIABILITY_MIN_EFFECTIVE_SAMPLES = 4.0
+
+
+def _reliability_from_records(records: List[Dict[str, Any]], engine: str,
+                              now: Optional[datetime] = None) -> Tuple[Optional[float], float, int]:
+    now = now or datetime.now()
+    eng = engine.lower().strip()
+    ok_weight = 0.0
+    total_weight = 0.0
+    raw = 0
+    for r in records:
+        if not isinstance(r, dict) or r.get("engine") != eng:
+            continue
+        stamp = r.get("timestamp")
+        if not isinstance(stamp, str):
+            continue
+        try:
+            ts = datetime.fromisoformat(stamp.replace("Z", "+00:00") if stamp.endswith("Z") else stamp)
+            if ts.tzinfo is not None:
+                ts = ts.astimezone().replace(tzinfo=None)
+        except ValueError:
+            continue
+        age_h = max(0.0, (now - ts).total_seconds() / 3600.0)
+        weight = 0.5 ** (age_h / RELIABILITY_HALF_LIFE_HOURS)
+        raw += 1
+        total_weight += weight
+        if r.get("success", True):
+            ok_weight += weight
+    if total_weight < RELIABILITY_MIN_EFFECTIVE_SAMPLES:
+        return None, round(total_weight, 2), raw
+    return ok_weight / total_weight, round(total_weight, 2), raw
+
+
+def get_engine_reliability(engine: str) -> Tuple[Optional[float], float, int]:
+    """
+    Returns (success_rate, effective_samples, raw_samples) for real dispatches of
+    `engine` in the 7-day ledger. success_rate is None when there is not enough
+    recent evidence (neutral).
+    """
+    return _reliability_from_records(_load_raw_usage_records(max_age_days=7.0), engine)
+
+
+def get_all_engine_reliability(engines: List[str]) -> Dict[str, Tuple[Optional[float], float, int]]:
+    """Batch variant of get_engine_reliability reading the ledger once."""
+    records = _load_raw_usage_records(max_age_days=7.0)
+    now = datetime.now()
+    return {e: _reliability_from_records(records, e, now=now) for e in engines}

@@ -134,11 +134,15 @@ class TestAdaptiveGovernance(unittest.TestCase):
             "agy": {"status": "healthy"},
             "muse": {"status": "healthy"},
         }
-        # Simulate heavy usage penalty on codex (-1.8)
-        with patch("makewand.usage.get_burn_rate_penalty", side_effect=lambda eng: (-1.8, "Heavy usage") if eng == "codex" else (0.0, None)):
+        # Simulate a saturated heavy-usage penalty on codex (-4.0). The burn-rate
+        # penalty is a bounded soft down-weight (no hard 0.2 clamp any more): the
+        # engine stays eligible, but at saturation it loses the primary slot even
+        # with its algorithm affinity.
+        with patch("makewand.usage.get_burn_rate_penalty", side_effect=lambda eng: (-4.0, "Heavy usage") if eng == "codex" else (0.0, None)):
             # Standard mode: codex score penalized
             coders_std, _, meta_std = select_optimal_engine_pair("实现一个动态规划算法", tier="standard", cache=healthy_cache, boost=False)
             self.assertNotEqual(meta_std["primary_coder"], "codex", "Heavily penalized codex must not be primary coder in standard mode")
+            self.assertIn("codex", coders_std, "Burn-rate penalty is soft: codex must remain an eligible fallback")
 
             # Boost mode: codex penalty is penetrated!
             coders_boost, _, meta_boost = select_optimal_engine_pair("实现一个动态规划算法", tier="deep", cache=healthy_cache, boost=True)
