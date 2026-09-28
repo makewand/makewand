@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import time
+import threading
 import urllib.request
 import urllib.error
 from typing import Tuple, Optional, Dict, Any, List
@@ -29,6 +30,78 @@ DEFAULT_SYSTEM_PROMPTS = {
     )
 }
 
+class _DeadlineExceeded(Exception):
+    """Raised inside the request worker when the total deadline has passed."""
+
+
+def _response_socket(resp: Any):
+    """Best-effort access to the socket under an http.client response."""
+    import socket as _socket
+    fp = getattr(resp, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    return sock if isinstance(sock, _socket.socket) else None
+
+
+def _abort_response(resp: Any) -> None:
+    """Wake a reader blocked in recv() on this response (shutdown, not close)."""
+    import socket as _socket
+    sock = _response_socket(resp)
+    if sock is not None:
+        try:
+            sock.shutdown(_socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+def _perform_request(req, per_read_timeout: float, stream: bool, print_prefix: str,
+                     deadline: float, abort: "threading.Event", holder: List[Any],
+                     partial: List[str]) -> Tuple[int, str, Optional[str]]:
+    with urllib.request.urlopen(req, timeout=per_read_timeout) as resp:
+        holder.append(resp)
+        code = resp.status
+        if stream:
+            # Simple SSE / chunk streaming
+            for line in resp:
+                if abort.is_set() or time.monotonic() >= deadline:
+                    raise _DeadlineExceeded()
+                line_str = line.decode("utf-8", errors="replace")
+                if line_str.startswith("data: "):
+                    data_part = line_str[6:].strip()
+                    if data_part == "[DONE]":
+                        break
+                    try:
+                        delta_json = json.loads(data_part)
+                        delta_content = ""
+                        choices = delta_json.get("choices")
+                        if choices and isinstance(choices, list) and len(choices) > 0:
+                            delta_content = choices[0].get("delta", {}).get("content", "")
+                        elif "delta" in delta_json:
+                            delta_content = delta_json["delta"].get("text", "")
+                        if delta_content:
+                            partial.append(delta_content)
+                            if print_prefix:
+                                sys.stdout.write(delta_content)
+                                sys.stdout.flush()
+                    except Exception:
+                        pass
+            if abort.is_set():
+                raise _DeadlineExceeded()
+            if print_prefix:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            return code, "".join(partial), None
+        try:
+            raw_response = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            if abort.is_set():
+                raise _DeadlineExceeded()
+            raise
+        if abort.is_set():
+            raise _DeadlineExceeded()
+        return code, raw_response, None
+
+
 def _make_http_request(
     url: str,
     headers: Dict[str, str],
@@ -39,51 +112,64 @@ def _make_http_request(
     max_retries: int = 2,
     backoff_factor: float = 0.5,
 ) -> Tuple[int, str, Optional[str]]:
-    """Executes HTTP POST request using urllib.request with exponential backoff retry."""
+    """
+    Executes an HTTP POST with exponential backoff retry under a *total* deadline.
+
+    `timeout` bounds the whole call (all attempts, backoff sleeps, headers and the
+    streamed or buffered body), measured with time.monotonic(). urllib's own
+    timeout is only a per-recv limit, so a server that trickles a byte at a time
+    could otherwise extend a call indefinitely. Each attempt runs in a worker
+    thread that the caller stops waiting for at the deadline; the response
+    socket is shut down so the worker unwinds promptly.
+    """
     body_bytes = json.dumps(data).encode("utf-8")
+    total = max(0.001, float(timeout))
+    deadline = time.monotonic() + total
+
+    def _timeout_result(partial_text: str = "") -> Tuple[int, str, Optional[str]]:
+        return -1, partial_text, f"Total timeout exceeded: API call did not finish within {timeout}s (monotonic deadline)"
 
     attempt = 0
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _timeout_result()
         req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
+        abort = threading.Event()
+        holder: List[Any] = []
+        partial: List[str] = []
+        outcome: Dict[str, Any] = {}
+
+        def _runner():
+            try:
+                outcome["value"] = _perform_request(req, remaining, stream, print_prefix,
+                                                    deadline, abort, holder, partial)
+            except BaseException as exc:  # re-raised in the calling thread
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=_runner, name="makewand-api-request", daemon=True)
+        worker.start()
+        worker.join(max(0.0, deadline - time.monotonic()))
+        if worker.is_alive():
+            abort.set()
+            for resp in holder:
+                _abort_response(resp)
+            worker.join(0.5)
+            return _timeout_result("".join(partial))
+
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                code = resp.status
-                if stream:
-                    full_text = []
-                    # Simple SSE / chunk streaming
-                    for line in resp:
-                        line_str = line.decode("utf-8", errors="replace")
-                        if line_str.startswith("data: "):
-                            data_part = line_str[6:].strip()
-                            if data_part == "[DONE]":
-                                break
-                            try:
-                                delta_json = json.loads(data_part)
-                                delta_content = ""
-                                choices = delta_json.get("choices")
-                                if choices and isinstance(choices, list) and len(choices) > 0:
-                                    delta_content = choices[0].get("delta", {}).get("content", "")
-                                elif "delta" in delta_json:
-                                    delta_content = delta_json["delta"].get("text", "")
-                                if delta_content:
-                                    full_text.append(delta_content)
-                                    if print_prefix:
-                                        sys.stdout.write(delta_content)
-                                        sys.stdout.flush()
-                            except Exception:
-                                pass
-                    if print_prefix:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                    return code, "".join(full_text), None
-                else:
-                    raw_response = resp.read().decode("utf-8", errors="replace")
-                    return code, raw_response, None
+            if "error" in outcome:
+                raise outcome["error"]
+            return outcome["value"]
+        except _DeadlineExceeded:
+            return _timeout_result("".join(partial))
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
             if e.code in (429, 500, 502, 503, 504) and attempt < max_retries:
                 attempt += 1
                 sleep_sec = backoff_factor * (2 ** (attempt - 1))
+                if deadline - time.monotonic() <= sleep_sec:
+                    return e.code, err_body, f"HTTP Error {e.code}: {e.reason} - {err_body[:200]} (retry skipped: total timeout would be exceeded)"
                 time.sleep(sleep_sec)
                 continue
             return e.code, err_body, f"HTTP Error {e.code}: {e.reason} - {err_body[:200]}"
@@ -91,6 +177,8 @@ def _make_http_request(
             if attempt < max_retries:
                 attempt += 1
                 sleep_sec = backoff_factor * (2 ** (attempt - 1))
+                if deadline - time.monotonic() <= sleep_sec:
+                    return _timeout_result()
                 time.sleep(sleep_sec)
                 continue
             reason = getattr(e, "reason", str(e))
