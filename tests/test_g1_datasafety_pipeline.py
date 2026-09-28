@@ -455,6 +455,23 @@ class NoProviderTests(PipelineHarness):
         self.assertFalse((project / ".git").exists())
         self.assertEqual(tree_state(project), before)
 
+    def test_zero_providers_race_leaves_no_candidates(self):
+        project = make_project(self.base / "n0race")
+        candidates = self.base / "config" / "candidates"
+        out = io.StringIO()
+        with patch.object(orch, "CANDIDATES_DIR", candidates), \
+                patch.object(config, "CANDIDATES_DIR", candidates), \
+                patch.object(orch, "check_load_backpressure", return_value=True), \
+                patch.object(orch, "dispatch_task") as dispatch, \
+                patch("makewand.config.get_active_providers", return_value=[]), \
+                contextlib.redirect_stdout(out):
+            code = orch.run_race("write quick_sort", cwd=str(project))
+        self.assertEqual(code, orch.EXIT_FAILED)
+        dispatch.assert_not_called()
+        self.assertFalse(candidates.exists() and any(candidates.iterdir()))
+        self.assertFalse((project / ".git").exists())
+        self.assertNotIn("Antigravity (Gemini", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

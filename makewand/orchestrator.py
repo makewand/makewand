@@ -2224,9 +2224,16 @@ def run_race(
             print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断竞速。", COLOR_RED + COLOR_BOLD))
             return 1
 
+    if not (engine_a and engine_b):
+        from makewand.config import get_active_providers
+        if not get_active_providers():
+            _print_no_provider_guidance()
+            return EXIT_FAILED
+
     print(c(f"🏁 Makewand 双模型并发竞速模式启动: '{prompt}'", COLOR_BOLD + COLOR_CYAN))
 
-    ensure_git_worktree(cwd)
+    # Candidates are isolated copies with their own git baseline; the host
+    # directory is never git-initialized by a race (apply works from manifests).
 
     cache = get_or_update_status()
     from makewand.config import is_provider_enabled
@@ -2244,11 +2251,18 @@ def run_race(
 
     saved_successfully = False
     try:
-        wt_a.mkdir(parents=True, exist_ok=True)
-        wt_b.mkdir(parents=True, exist_ok=True)
+        # Candidate copies are private (0700) and never contain .gitignore'd files.
+        ensure_private_dir(CANDIDATES_DIR)
+        ensure_private_dir(session_dir)
+        wt_a.mkdir(mode=0o700, parents=True, exist_ok=True)
+        wt_b.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        clone_isolated_worktree(cwd, wt_a)
-        clone_isolated_worktree(cwd, wt_b)
+        try:
+            clone_isolated_worktree(cwd, wt_a)
+            clone_isolated_worktree(cwd, wt_b)
+        except OSError as exc:
+            print(c(f"❌ [Makewand Race] 无法建立候选隔离副本，已中止竞速: {exc}", COLOR_RED + COLOR_BOLD))
+            return EXIT_FAILED
 
         # Record baseline commit of host workspace
         code, b_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=cwd)
@@ -2396,6 +2410,11 @@ def run_race(
             winner = None
             verdict = None
             print(c("裁判审查期间候选内容发生变化，拒绝应用。", COLOR_RED))
+
+        if not res_a[1] and not res_b[1] and not diff_a.strip() and not diff_b.strip():
+            # Nothing to inspect or apply: do not archive empty candidate copies.
+            print(c("❌ 两位选手均未能成功完成任务且没有产生任何改动，不保留候选工作区。", COLOR_RED + COLOR_BOLD))
+            return EXIT_FAILED
 
         try:
             CandidateManager.save_race(

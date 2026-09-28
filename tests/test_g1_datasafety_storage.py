@@ -8,6 +8,7 @@ and candidate eviction is never silent.
 
 import contextlib
 import io
+import json
 import os
 import stat
 import tempfile
@@ -18,6 +19,7 @@ from unittest.mock import patch
 import makewand.config as config
 import makewand.git_helper as git_helper
 import makewand.orchestrator as orch
+from makewand import candidate
 from makewand.git_helper import run_git_cmd
 
 
@@ -255,6 +257,113 @@ class GitCommandTests(StorageHarness):
             failed = git_helper.create_ephemeral_shadow_worktree(str(repo), prefix="g1")
         self.assertIsNone(failed[0])
         self.assertEqual(list((self.state / "shadow").iterdir()), [], "a partial clone is never reused")
+
+
+class CandidateTests(StorageHarness):
+    def test_isolated_copy_skips_ignored_files_in_git_and_plain_directories(self):
+        repo = self.make_repo()
+        target = self.base / "copy_git"
+        git_helper.clone_isolated_worktree(str(repo), target)
+        self.assertTrue((target / "app.py").exists())
+        self.assertFalse((target / ".env").exists())
+        self.assertFalse((target / "data").exists())
+
+        plain = self.base / "plain_dir"
+        plain.mkdir()
+        (plain / ".gitignore").write_text("*.key\n")
+        (plain / "main.py").write_text("print(1)\n")
+        (plain / "server.key").write_text("PRIVATE\n")
+        target_plain = self.base / "copy_plain"
+        git_helper.clone_isolated_worktree(str(plain), target_plain)
+        self.assertTrue((target_plain / "main.py").exists())
+        self.assertFalse((target_plain / "server.key").exists())
+        self.assertFalse((plain / ".git").exists())
+
+    def test_race_candidates_are_private_without_secrets_and_host_is_not_git_initialized(self):
+        """py-orchestrator#7/#8: candidates 0700, meta 0600, no .env copy, no host git init."""
+        host = self.base / "race_host"
+        host.mkdir()
+        (host / ".gitignore").write_text(".env\n")
+        (host / ".env").write_text("TOKEN=secret\n")
+        (host / "app.py").write_text("BASE = 1\n")
+
+        def dispatch(engine, prompt, cwd=None, **kwargs):
+            (Path(cwd) / "app.py").write_text("CANDIDATE = 1\n")
+            return True, "implemented", None
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
+            stack.enter_context(patch.object(orch, "get_or_update_status", return_value={}))
+            stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
+            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
+            stack.enter_context(patch.object(orch, "execute_agy_task", return_value=(
+                True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None)))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            code = orch.run_race("Implement update", cwd=str(host), engine_a="codex", engine_b="claude")
+        self.assertEqual(code, orch.EXIT_PASSED)
+        self.assertFalse((host / ".git").exists(), "race must not git-init the user's directory")
+        candidates = self.config_dir / "candidates"
+        self.assertEqual(mode_of(candidates), 0o700)
+        races = list(candidates.iterdir())
+        self.assertEqual(len(races), 1)
+        self.assertEqual(mode_of(races[0]), 0o700)
+        self.assertEqual(mode_of(races[0] / "meta.json"), 0o600)
+        self.assertFalse(list(races[0].rglob(".env")), "ignored secrets are never copied into candidates")
+
+        holder = git_helper.WorkspaceLock(str(host)).acquire()
+        try:
+            ok, _, message = candidate.CandidateManager.apply_candidate(races[0].name, "A")
+        finally:
+            holder.release()
+        self.assertFalse(ok)
+        self.assertIn("另一个 makewand 任务正在此目录运行", message)
+        self.assertEqual((host / "app.py").read_text(), "BASE = 1\n")
+
+        ok, applied, message = candidate.CandidateManager.apply_candidate(races[0].name, "A")
+        self.assertTrue(ok, message)
+        self.assertEqual((host / "app.py").read_text(), "CANDIDATE = 1\n")
+        self.assertEqual((host / ".env").read_text(), "TOKEN=secret\n")
+        meta = json.loads((races[0] / "meta.json").read_text())
+        self.assertEqual(meta.get("applied_candidate"), "A")
+        self.assertEqual(mode_of(self.config_dir / "backups"), 0o700)
+
+    def test_race_where_both_racers_fail_without_changes_keeps_no_candidates(self):
+        """arch-product#7: a race that produced nothing leaves no candidate directories behind."""
+        host = self.base / "race_empty"
+        host.mkdir()
+        (host / "app.py").write_text("BASE = 1\n")
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
+            stack.enter_context(patch.object(orch, "get_or_update_status", return_value={}))
+            stack.enter_context(patch.object(orch, "dispatch_task", return_value=(False, "", "quota")))
+            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
+            stack.enter_context(patch.object(orch, "execute_agy_task", return_value=(False, "", "unavailable")))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            code = orch.run_race("Implement update", cwd=str(host), engine_a="codex", engine_b="claude")
+        self.assertEqual(code, orch.EXIT_FAILED)
+        candidates = self.config_dir / "candidates"
+        self.assertEqual(list(candidates.iterdir()) if candidates.exists() else [], [])
+
+    def test_eviction_prefers_applied_candidates_and_reports_unapplied(self):
+        candidates = self.config_dir / "candidates"
+        candidates.mkdir(parents=True)
+        for index in range(6):
+            race = candidates / f"rc_{index}"
+            race.mkdir()
+            meta = {"created_at": f"2026-09-27T0{index}:00:00"}
+            if index in (4, 5):
+                meta["applied_at"] = "2026-09-28T00:00:00"
+            (race / "meta.json").write_text(json.dumps(meta))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            evicted = candidate.CandidateManager.prune_old_candidates(max_candidates=3)
+        self.assertEqual(evicted, 3)
+        remaining = sorted(p.name for p in candidates.iterdir())
+        # Both applied ones go first even though they are the newest, then the oldest unapplied.
+        self.assertEqual(remaining, ["rc_1", "rc_2", "rc_3"])
+        self.assertIn("rc_0", err.getvalue())
+        self.assertIn("从未应用", err.getvalue())
+        self.assertNotIn("rc_4", err.getvalue())
 
 
 if __name__ == "__main__":

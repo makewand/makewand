@@ -17,6 +17,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 import makewand.config as config
 from makewand.config import (
     ensure_config_dir,
+    ensure_private_dir,
     c,
     COLOR_BOLD,
     COLOR_CYAN,
@@ -26,7 +27,7 @@ from makewand.config import (
     COLOR_RESET,
 )
 import hashlib
-from makewand.git_helper import run_git_cmd, get_git_diff
+from makewand.git_helper import run_git_cmd, get_git_diff, WorkspaceLock, WorkspaceLockError
 
 def file_sha256(path: Path) -> Optional[str]:
     """Computes SHA-256 hex digest of a regular file. Returns None for links/missing."""
@@ -118,6 +119,16 @@ def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None):
         if created:
             os.unlink(temp_name, dir_fd=directory)
         os.close(directory)
+
+def _write_private_json(path: Path, data: Dict[str, Any]) -> None:
+    """Writes JSON as a 0600 file without following a symlink at ``path``."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        if hasattr(os, "fchmod"):
+            os.fchmod(handle.fileno(), 0o600)
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+
 
 def _verify_safe_target_path(base_cwd: Union[str, Path], rel_path: str) -> Path:
     canonical_base = os.path.realpath(base_cwd)
@@ -240,8 +251,9 @@ class CandidateManager:
         winner: Optional[str] = None
     ) -> Path:
         ensure_config_dir()
-        race_dir = config.CANDIDATES_DIR / race_id
-        race_dir.mkdir(parents=True, exist_ok=True)
+        # Candidates hold copies of workspace sources: private 0700 directories.
+        ensure_private_dir(config.CANDIDATES_DIR)
+        race_dir = ensure_private_dir(config.CANDIDATES_DIR / race_id)
 
         base_path = Path(base_cwd).resolve()
         baseline_manifest = build_manifest(base_path)
@@ -290,22 +302,26 @@ class CandidateManager:
         }
 
         meta_file = race_dir / "meta.json"
-        with open(meta_file, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
+        _write_private_json(meta_file, meta)
 
-        # LRU eviction: keep only latest 3-5 candidates (default: 5)
+        # LRU eviction: keep only the latest candidates; unapplied ones are
+        # evicted last and every such eviction is reported.
         try:
-            CandidateManager.prune_old_candidates(max_candidates=5)
-        except Exception:
-            pass
+            CandidateManager.prune_old_candidates(max_candidates=CandidateManager.DEFAULT_MAX_CANDIDATES)
+        except Exception as exc:
+            print(c(f"⚠ [Makewand Candidates] 候选清理失败: {exc}", COLOR_YELLOW), file=sys.stderr)
 
         return race_dir
 
+    DEFAULT_MAX_CANDIDATES = 10
+
     @staticmethod
-    def prune_old_candidates(max_candidates: int = 5) -> int:
+    def prune_old_candidates(max_candidates: int = DEFAULT_MAX_CANDIDATES) -> int:
         """
-        LRU eviction to keep only the latest candidates (default: 5)
-        and clean up older candidate directories to prevent disk exhaustion.
+        LRU eviction to keep only the latest candidates and clean up older
+        candidate directories to prevent disk exhaustion. Candidates that were
+        already applied are evicted first; evicting a candidate that was never
+        applied is always reported, never silent.
         """
         ensure_config_dir()
         if not config.CANDIDATES_DIR.exists():
@@ -315,14 +331,16 @@ class CandidateManager:
         for entry in config.CANDIDATES_DIR.iterdir():
             if entry.is_dir() or entry.is_symlink():
                 ts = 0.0
+                applied = False
                 meta_file = entry / "meta.json"
-                if meta_file.exists():
+                if not entry.is_symlink() and meta_file.exists():
                     try:
                         with open(meta_file, "r", encoding="utf-8") as f:
                             data = json.load(f)
                             c_str = data.get("created_at")
                             if c_str:
                                 ts = datetime.fromisoformat(c_str).timestamp()
+                            applied = bool(data.get("applied_at"))
                     except Exception:
                         pass
                 if ts <= 0.0:
@@ -330,23 +348,30 @@ class CandidateManager:
                         ts = entry.stat().st_mtime
                     except Exception:
                         ts = 0.0
-                entries.append((entry, ts))
+                entries.append((entry, ts, applied))
 
-        # Sort descending by timestamp (newest first)
+        # Newest first; beyond the limit, applied candidates go before unapplied ones.
         entries.sort(key=lambda x: x[1], reverse=True)
-
         evicted = 0
-        if len(entries) > max_candidates:
-            to_remove = entries[max_candidates:]
-            for entry, _ in to_remove:
+        excess = len(entries) - max_candidates
+        if excess > 0:
+            older = entries[max_candidates:] + entries[:max_candidates]
+            to_remove = sorted(older, key=lambda x: (not x[2], x[1]))[:excess]
+            unapplied = []
+            for entry, _, applied in to_remove:
                 try:
                     if entry.is_symlink() or not entry.is_dir():
                         entry.unlink(missing_ok=True)
                     else:
-                        shutil.rmtree(entry, ignore_errors=True)
+                        shutil.rmtree(entry)
                     evicted += 1
-                except Exception:
-                    pass
+                    if not applied and not entry.is_symlink():
+                        unapplied.append(entry.name)
+                except Exception as exc:
+                    print(c(f"⚠ [Makewand Candidates] 无法清理候选 {entry.name}: {exc}", COLOR_YELLOW), file=sys.stderr)
+            if unapplied:
+                print(c(f"⚠ [Makewand Candidates] 候选数量超过上限 {max_candidates}，已清理以下从未应用的旧候选: "
+                        f"{', '.join(unapplied)}", COLOR_YELLOW), file=sys.stderr)
         return evicted
 
     @staticmethod
@@ -455,12 +480,27 @@ class CandidateManager:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
             except Exception as e:
                 return False, [], f"无法获取候选应用独占锁 (apply.lock): {e}"
-            return CandidateManager._do_apply_candidate(
-                race_id=race_id,
-                candidate_label=candidate_label,
-                dry_run=dry_run,
-                force=force
-            )
+            # Writing into the workspace must not race a makewand task running there.
+            workspace_lock = None
+            race = CandidateManager.get_race(race_id)
+            base_cwd = race.get("base_cwd") if race else None
+            if not dry_run and base_cwd and os.path.isdir(base_cwd):
+                try:
+                    workspace_lock = WorkspaceLock(base_cwd).acquire()
+                except WorkspaceLockError as e:
+                    return False, [], str(e)
+                except OSError as e:
+                    return False, [], f"无法获取工作区锁: {e}"
+            try:
+                return CandidateManager._do_apply_candidate(
+                    race_id=race_id,
+                    candidate_label=candidate_label,
+                    dry_run=dry_run,
+                    force=force
+                )
+            finally:
+                if workspace_lock is not None:
+                    workspace_lock.release()
         except Exception as e:
             return False, [], f"打开候选应用锁失败: {e}"
         finally:
@@ -580,11 +620,12 @@ class CandidateManager:
             preview = [f"{status} {path}" for path, status in changes.items()]
             return True, preview, f"[Dry-run] 演练完成，共涉及 {len(changes)} 个文件的增删改"
 
-        # Create Backup Journal
+        # Create Backup Journal (holds copies of workspace files: private 0700)
         ensure_config_dir()
+        ensure_private_dir(config.BACKUPS_DIR)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_dir = config.BACKUPS_DIR / f"{r_id}_{ts}"
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         journal = []
         applied_files = []
@@ -624,6 +665,7 @@ class CandidateManager:
             with open(backup_dir / "journal.json", "w", encoding="utf-8") as jf:
                 json.dump(journal, jf, indent=2)
 
+            CandidateManager._mark_applied(r_id, label)
             return True, applied_files, f"成功应用候选方案 {label} ({len(applied_files)} 个变更已同步)"
 
         except Exception as e:
@@ -645,6 +687,19 @@ class CandidateManager:
                 return False, [], (f"应用失败: {e}；部分文件回滚失败: {'; '.join(rollback_errors)}。"
                                    f"备份保留于 {backup_dir}")
             return False, [], f"应用过程中发生异常并已自动回滚: {str(e)}"
+
+    @staticmethod
+    def _mark_applied(race_id: str, label: str) -> None:
+        """Records the application so LRU eviction can prefer applied candidates."""
+        meta_file = config.CANDIDATES_DIR / race_id / "meta.json"
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            meta["applied_at"] = datetime.now().isoformat()
+            meta["applied_candidate"] = label
+            _write_private_json(meta_file, meta)
+        except Exception as exc:
+            print(c(f"⚠ [Makewand Candidates] 无法记录候选 {race_id} 的应用状态: {exc}", COLOR_YELLOW), file=sys.stderr)
 
     @staticmethod
     def discard_race(race_id: Optional[str] = None, all_races: bool = False) -> Tuple[bool, str]:
