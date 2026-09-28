@@ -60,3 +60,17 @@ class TestLinter(unittest.TestCase):
         py_file.write_text("x = 1 + 2\n", encoding="utf-8")
         res = auto_format_files(self.cwd, ["code.py"])
         self.assertIn("code.py", res)
+
+    def test_fast_syntax_check_detects_js_syntax_error(self):
+        js_file = Path(self.cwd) / "bad.js"
+        js_file.write_text("function bad( { return 1; }", encoding="utf-8")
+        ok, errors = fast_syntax_check(self.cwd, ["bad.js"])
+        self.assertFalse(ok)
+        self.assertIn("bad.js", errors[0])
+
+    def test_fast_syntax_check_detects_rust_syntax_error(self):
+        rs_file = Path(self.cwd) / "bad.rs"
+        rs_file.write_text("fn main( { println!(\"error\"); }", encoding="utf-8")
+        ok, errors = fast_syntax_check(self.cwd, ["bad.rs"])
+        self.assertFalse(ok)
+        self.assertIn("bad.rs", errors[0])

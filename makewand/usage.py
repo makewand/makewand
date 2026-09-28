@@ -439,8 +439,13 @@ def get_predictive_pacing_status(engine: str) -> Dict[str, Any]:
     records = _load_raw_usage_records(max_age_days=1.0)
     c_3h, c_24h, _ = _calc_weighted_counts(records, eng)
 
-    limit_3h = CODEX_LIMIT_3H if eng == "codex" else 40.0
-    warn_3h = CODEX_WARN_3H if eng == "codex" else 25.0
+    threshold_map = {
+        "codex": (float(CODEX_LIMIT_3H), float(CODEX_WARN_3H)),
+        "grok": (15.0, 10.0),
+        "claude": (25.0, 16.0),
+        "muse": (25.0, 16.0),
+    }
+    limit_3h, warn_3h = threshold_map.get(eng, (40.0, 25.0))
 
     velocity = round(c_3h / 3.0, 2)
     utilization_3h = min(1.0, c_3h / max(1.0, limit_3h))

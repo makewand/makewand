@@ -169,4 +169,36 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
             except Exception as e:
                 errors.append(f"[{rel}] JSON 格式错误: {e}")
 
+        elif ext in (".js", ".mjs", ".cjs"):
+            if shutil.which("node"):
+                try:
+                    p = subprocess.run(
+                        ["node", "-c", full_path],
+                        cwd=clean_cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if p.returncode != 0:
+                        err = p.stderr.strip() or f"JavaScript 语法错误: {rel}"
+                        errors.append(f"[{rel}] {err}")
+                except Exception as e:
+                    errors.append(f"[{rel}] Node.js 语法检查异常: {e}")
+
+        elif ext == ".rs":
+            if shutil.which("rustc"):
+                try:
+                    p = subprocess.run(
+                        ["rustc", "--emit=metadata", "-o", "/dev/null", full_path],
+                        cwd=clean_cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=8
+                    )
+                    if p.returncode != 0:
+                        err = p.stderr.strip().splitlines()[0] if p.stderr.strip() else f"Rust 编译检查失败: {rel}"
+                        errors.append(f"[{rel}] {err}")
+                except Exception as e:
+                    errors.append(f"[{rel}] Rustc 语法检查异常: {e}")
+
     return (len(errors) == 0, errors)

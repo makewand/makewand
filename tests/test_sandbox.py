@@ -204,9 +204,10 @@ class TestSandbox(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Inside the sandbox with seccomp, calling ptrace should return -1 with EPERM (errno 1)
             code = (
-                "import ctypes, sys\n"
+                "import ctypes, sys, platform\n"
                 "libc = ctypes.CDLL(None, use_errno=True)\n"
-                "res = libc.syscall(101, 0, 0, 0, 0)\n"
+                "nr = 117 if platform.machine().lower() in ('aarch64', 'arm64') else 101\n"
+                "res = libc.syscall(nr, 0, 0, 0, 0)\n"
                 "err = ctypes.get_errno()\n"
                 "print(f'res={res},err={err}')\n"
                 "sys.exit(0 if (res == -1 and err == 1) else 1)\n"

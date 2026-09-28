@@ -80,7 +80,7 @@ var pythonOrchestratorCmds = map[string]bool{
 	"run": true, "review": true, "race": true, "observe": true,
 	"models": true, "candidates": true, "inspect": true, "apply": true,
 	"discard": true, "sandbox": true, "status": true, "probe": true,
-	"repomap": true,
+	"repomap": true, "plan": true, "aci": true, "mcp": true,
 }
 
 // pythonDelegation is a command line routed to the Python orchestrator.

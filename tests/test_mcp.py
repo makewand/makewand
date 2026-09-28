@@ -56,7 +56,9 @@ while True:
                 ]
             }
         }
-        sys.stdout.write(json.dumps(resp) + "\\n")
+        body = json.dumps(resp)
+        # Test multi-line HTTP headers before body
+        sys.stdout.write(f"Content-Length: {len(body.encode('utf-8'))}\\r\\nContent-Type: application/json\\r\\n\\r\\n{body}")
         sys.stdout.flush()
     elif method == "tools/call":
         tool_name = msg.get("params", {}).get("name")
@@ -108,3 +110,35 @@ class TestMCPClient(unittest.TestCase):
         # 4. Clean close
         client.close()
         self.assertIsNone(client.proc)
+
+    def test_mcp_client_stderr_flood_no_deadlock(self):
+        # Creates server that writes 256KB to stderr before responding
+        flood_server = Path(self.temp_dir.name) / "flood_server.py"
+        flood_code = """
+import sys
+import json
+
+# Write 256KB of garbage to stderr
+sys.stderr.write("X" * (256 * 1024))
+sys.stderr.flush()
+
+line = sys.stdin.readline()
+msg = json.loads(line)
+resp = {
+    "jsonrpc": "2.0",
+    "id": msg.get("id"),
+    "result": {
+        "protocolVersion": "2024-11-05",
+        "serverInfo": {"name": "flood-server", "version": "1.0"},
+        "capabilities": {}
+    }
+}
+sys.stdout.write(json.dumps(resp) + "\\n")
+sys.stdout.flush()
+"""
+        flood_server.write_text(flood_code, encoding="utf-8")
+        client = MCPClient([sys.executable, str(flood_server)], cwd=self.temp_dir.name, timeout=5.0)
+        ok, msg = client.initialize()
+        self.assertTrue(ok)
+        self.assertEqual(client.server_info.get("name"), "flood-server")
+        client.close()
