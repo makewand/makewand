@@ -142,6 +142,49 @@ class TestTaskDAG(unittest.TestCase):
             self.assertEqual(calls[2].get("forced_engine"), "claude")
             self.assertEqual(calls[2].get("tier"), "power")
 
+    def test_execute_task_dag_propagates_local_only(self):
+        t1 = TaskNode("t1", "Local Task 1")
+        t2 = TaskNode("t2", "Local Task 2", dependencies=["t1"])
+        dag = TaskDAG("Offline Goal", [t1, t2])
+
+        calls = []
+        def mock_run_pipeline(*args, **kwargs):
+            calls.append(kwargs)
+            return True
+
+        with patch("makewand.orchestrator.run_pipeline", side_effect=mock_run_pipeline):
+            ok, summary, results = execute_task_dag(
+                dag,
+                local_only=True
+            )
+            self.assertTrue(ok)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[0].get("local_only"))
+            self.assertTrue(calls[1].get("local_only"))
+
+    def test_task_dag_validate_detects_cycles_and_missing_deps(self):
+        # 1. Missing dependency
+        t1 = TaskNode("t1", "Task 1", dependencies=["ghost-task"])
+        dag_missing = TaskDAG("Goal", [t1])
+        valid, errs = dag_missing.validate()
+        self.assertFalse(valid)
+        self.assertTrue(any("ghost-task" in e for e in errs))
+
+        # 2. Self cycle
+        t2 = TaskNode("t2", "Task 2", dependencies=["t2"])
+        dag_self = TaskDAG("Goal", [t2])
+        valid, errs = dag_self.validate()
+        self.assertFalse(valid)
+        self.assertTrue(any("自循环" in e for e in errs))
+
+        # 3. Circular dependency (tA -> tB -> tA)
+        ta = TaskNode("ta", "A", dependencies=["tb"])
+        tb = TaskNode("tb", "B", dependencies=["ta"])
+        dag_cycle = TaskDAG("Goal", [ta, tb])
+        valid, errs = dag_cycle.validate()
+        self.assertFalse(valid)
+        self.assertTrue(any("循环依赖环路" in e for e in errs))
+
 
 if __name__ == "__main__":
     unittest.main()

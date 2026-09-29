@@ -489,6 +489,7 @@ def cmd_plan(args):
             tiered=getattr(args, "tiered", False),
             architect_engine=getattr(args, "architect", None),
             worker_engine=getattr(args, "worker", None),
+            local_only=getattr(args, "local_only", False),
         )
         if not ok:
             print(c(f"\n❌ [Makewand DAG Engine] 流水线执行未完全通过: {summary}", COLOR_BOLD + COLOR_RED))

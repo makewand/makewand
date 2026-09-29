@@ -142,3 +142,27 @@ sys.stdout.flush()
         self.assertTrue(ok)
         self.assertEqual(client.server_info.get("name"), "flood-server")
         client.close()
+
+    def test_mcp_client_notification_flood_respects_deadline(self):
+        # Creates server that continuously emits notifications without responding
+        flood_notify_server = Path(self.temp_dir.name) / "flood_notify_server.py"
+        flood_code = """
+import sys
+import time
+import json
+
+line = sys.stdin.readline()
+while True:
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "log", "params": {"msg": "spam"}}) + "\\n")
+    sys.stdout.flush()
+    time.sleep(0.02)
+"""
+        flood_notify_server.write_text(flood_code, encoding="utf-8")
+        import time
+        start_t = time.monotonic()
+        client = MCPClient([sys.executable, str(flood_notify_server)], cwd=self.temp_dir.name, timeout=0.15)
+        ok, msg = client.initialize()
+        elapsed = time.monotonic() - start_t
+        self.assertFalse(ok)
+        self.assertLess(elapsed, 1.0)
+        client.close()

@@ -74,3 +74,34 @@ class TestLinter(unittest.TestCase):
         ok, errors = fast_syntax_check(self.cwd, ["bad.rs"])
         self.assertFalse(ok)
         self.assertIn("bad.rs", errors[0])
+
+    def test_fast_syntax_check_py_compile_shadowing_defense(self):
+        """
+        Ensures a malicious py_compile.py placed in the workspace cannot hijack execution,
+        and syntax checking succeeds in-process safely.
+        """
+        canary = Path(self.cwd) / "pwned_canary.txt"
+        malicious_py_compile = Path(self.cwd) / "py_compile.py"
+        malicious_py_compile.write_text(f"from pathlib import Path\nPath({repr(str(canary))}).write_text('pwned')\n", encoding="utf-8")
+
+        valid_py = Path(self.cwd) / "service.py"
+        valid_py.write_text("def run():\n    return 42\n", encoding="utf-8")
+
+        ok, errors = fast_syntax_check(self.cwd, ["service.py"])
+        self.assertTrue(ok)
+        self.assertEqual(errors, [])
+        # The canary must NEVER have been created
+        self.assertFalse(canary.exists(), "Security failure: workspace py_compile.py was executed!")
+
+    def test_run_local_tests_fast_syntax_gate_integration(self):
+        """
+        Verifies that run_local_tests detects dirty files and fails fast on syntax errors
+        even in a project without existing test suites.
+        """
+        from makewand.orchestrator import run_local_tests
+        bad_py = Path(self.cwd) / "invalid.py"
+        bad_py.write_text("def invalid(\n", encoding="utf-8")
+
+        ok, out = run_local_tests(self.cwd)
+        self.assertFalse(ok)
+        self.assertIn("Fast Syntax Gate", out)

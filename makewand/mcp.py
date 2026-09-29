@@ -127,8 +127,15 @@ class MCPClient:
             if is_notification:
                 return None
 
+            deadline = time.monotonic() + max(0.1, float(self.timeout))
+            max_mcp_message_bytes = 16 * 1024 * 1024  # 16MB cap to prevent memory exhaustion
+
             while True:
-                line = self._read_line(self.timeout)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+
+                line = self._read_line(remaining)
                 if line is None:
                     return None
                 line = line.strip()
@@ -139,12 +146,22 @@ class MCPClient:
                 if line.lower().startswith("content-length:"):
                     try:
                         content_len = int(line.split(":", 1)[1].strip())
+                        if content_len <= 0 or content_len > max_mcp_message_bytes:
+                            return None
                         # Drain any remaining headers until empty line
                         while True:
-                            header_line = self._read_line(self.timeout)
-                            if header_line is None or header_line == "":
+                            rem_hdr = deadline - time.monotonic()
+                            if rem_hdr <= 0:
+                                return None
+                            header_line = self._read_line(rem_hdr)
+                            if header_line is None:
+                                return None
+                            if header_line == "":
                                 break
-                        body_bytes = self._read_bytes(content_len, self.timeout)
+                        rem_body = deadline - time.monotonic()
+                        if rem_body <= 0:
+                            return None
+                        body_bytes = self._read_bytes(content_len, rem_body)
                         if not body_bytes:
                             return None
                         data = json.loads(body_bytes.decode("utf-8", errors="replace"))
@@ -154,6 +171,8 @@ class MCPClient:
                         continue
                 else:
                     try:
+                        if len(line.encode("utf-8")) > max_mcp_message_bytes:
+                            continue
                         data = json.loads(line)
                         if data.get("id") == req_id:
                             return data

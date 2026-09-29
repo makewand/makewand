@@ -131,17 +131,14 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
 
         if ext == ".py":
             try:
-                # python3 -m py_compile checks syntax without executing module
-                p = subprocess.run(
-                    [sys.executable, "-m", "py_compile", full_path],
-                    cwd=clean_cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if p.returncode != 0:
-                    err = p.stderr.strip() or f"Python 语法错误: {rel}"
-                    errors.append(f"[{rel}] {err}")
+                # In-process compilation check: runs in microseconds without subprocess overhead,
+                # and strictly immune to cwd Python module shadowing (e.g. malicious py_compile.py).
+                with open(full_path, "rb") as f:
+                    source_bytes = f.read()
+                compile(source_bytes, rel, "exec", dont_inherit=True)
+            except SyntaxError as syn_err:
+                err_msg = f"SyntaxError: {syn_err.msg} (line {syn_err.lineno}, col {syn_err.offset})"
+                errors.append(f"[{rel}] {err_msg}")
             except Exception as e:
                 errors.append(f"[{rel}] 静态编译检查异常: {e}")
 

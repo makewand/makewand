@@ -407,6 +407,46 @@ def get_git_diff(cwd: str, base_rev: Optional[str] = None, sub_baselines: Option
     diff_text, _ = get_git_diff_status(cwd, base_rev=base_rev, sub_baselines=sub_baselines)
     return diff_text
 
+
+def get_dirty_files(cwd: Optional[Union[str, Path]] = None) -> List[str]:
+    """
+    Returns relative paths of all dirty files (modified, untracked, staged, renamed)
+    in the git repository. Returns candidate files if not inside a git repository.
+    """
+    if not cwd:
+        cwd = os.getcwd()
+    cwd_str = str(cwd)
+
+    # 1. Try git status --porcelain -uall
+    code, out, _ = run_git_cmd(["git", "status", "--porcelain", "-uall"], cwd=cwd_str)
+    if code == 0 and out is not None:
+        dirty: List[str] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if len(line) < 3:
+                continue
+            path_part = line[2:].strip()
+            if " -> " in path_part:
+                path_part = path_part.split(" -> ")[1].strip()
+            path_part = path_part.strip('"\'')
+            if path_part and path_part not in dirty:
+                dirty.append(path_part)
+        return dirty
+
+    # 2. Fallback for non-git directories: collect candidate source files in cwd
+    try:
+        from makewand.repomap import _collect_candidate_files
+        return _collect_candidate_files(Path(cwd_str))
+    except Exception:
+        fallback_files: List[str] = []
+        for root, dirs, files in os.walk(cwd_str):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "vendor", "__pycache__", "venv")]
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), cwd_str)
+                fallback_files.append(rel)
+        return fallback_files[:100]
+
+
 CLONE_EXCLUDED_DIRS = {
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     "node_modules", ".venv", "venv", "env", "benchmarks", ".tox", "dist", "build", ".cache"

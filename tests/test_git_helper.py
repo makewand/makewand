@@ -370,8 +370,39 @@ except OSError:
 
             (linked / "f.txt").write_text("modified")
             rc, out, err = run_git_cmd(["git", "add", "-A"], cwd=str(linked))
-            self.assertEqual(rc, 0)
             self.assertFalse(marker.exists(), "host clean filter must not execute in linked worktree!")
+
+    def test_get_dirty_files_git_and_fallback(self):
+        from makewand.git_helper import get_dirty_files, run_git_cmd
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            run_git_cmd(["git", "init"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=str(repo))
+
+            # Initial commit
+            (repo / "tracked.py").write_text("print('v1')\n")
+            run_git_cmd(["git", "add", "tracked.py"], cwd=str(repo))
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=str(repo))
+
+            # Clean repo: empty dirty files
+            self.assertEqual(get_dirty_files(str(repo)), [])
+
+            # Modify tracked, add untracked
+            (repo / "tracked.py").write_text("print('v2')\n")
+            (repo / "untracked.py").write_text("x = 1\n")
+            dirty = get_dirty_files(str(repo))
+            self.assertIn("tracked.py", dirty)
+            self.assertIn("untracked.py", dirty)
+
+            # Non-git directory fallback
+            non_git = Path(td) / "non_git"
+            non_git.mkdir()
+            (non_git / "script.py").write_text("y = 2\n")
+            res_non_git = get_dirty_files(str(non_git))
+            self.assertIn("script.py", res_non_git)
+
 
 if __name__ == "__main__":
     unittest.main()

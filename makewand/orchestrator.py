@@ -460,8 +460,8 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             syntax_ok, syntax_errs = fast_syntax_check(cwd, dirty)
             if not syntax_ok:
                 return False, "代码静态语法校验失败 (Fast Syntax Gate):\n" + "\n".join(syntax_errs)
-    except Exception:
-        pass
+    except Exception as e:
+        print(c(f"⚠️ [Fast Syntax Gate] 语法预检执行提示: {e}", COLOR_YELLOW), file=sys.stderr)
 
     test_suites = []
     py_env = {"PYTHONPATH": f"{cwd}:{os.environ.get('PYTHONPATH', '')}", "PYTHONDONTWRITEBYTECODE": "1"}
@@ -3153,6 +3153,41 @@ class TaskDAG:
 
         return stages
 
+    def validate(self) -> Tuple[bool, List[str]]:
+        """
+        Validates DAG integrity: checks for unknown dependencies, self-dependencies,
+        and circular dependencies. Returns (is_valid, error_list).
+        """
+        errors = []
+        for tid, t in self.tasks.items():
+            for dep in t.dependencies:
+                if dep == tid:
+                    errors.append(f"任务节点 [{tid}] 存在自循环依赖")
+                elif dep not in self.tasks:
+                    errors.append(f"任务节点 [{tid}] 依赖了不存在的任务 [{dep}]")
+
+        visited: Dict[str, int] = {}
+        def _has_cycle(curr: str, path: List[str]) -> bool:
+            visited[curr] = 1
+            for dep in self.tasks[curr].dependencies:
+                if dep not in self.tasks:
+                    continue
+                if visited.get(dep, 0) == 1:
+                    cycle_str = " -> ".join(path + [curr, dep])
+                    errors.append(f"发现循环依赖环路: {cycle_str}")
+                    return True
+                if visited.get(dep, 0) == 0:
+                    if _has_cycle(dep, path + [curr]):
+                        return True
+            visited[curr] = 2
+            return False
+
+        for tid in self.tasks:
+            if visited.get(tid, 0) == 0:
+                _has_cycle(tid, [])
+
+        return (len(errors) == 0, errors)
+
     def to_dict(self) -> Dict[str, Any]:
         stages = self.topological_stages()
         return {
@@ -3184,8 +3219,8 @@ def decompose_task_to_dag(
     local_only: bool = False
 ) -> TaskDAG:
     """
-    Decomposes a complex goal into a structured TaskDAG.
-    Attempts model-assisted structured decomposition first, with deterministic semantic fallback.
+    Decomposes an engineering goal into a structured TaskDAG using semantic list
+    extraction or deterministic architectural 3-stage partitioning (Contracts -> Logic -> Verification).
     """
     clean_goal = prompt.strip()
     tasks: List[TaskNode] = []
@@ -3249,13 +3284,21 @@ def execute_task_dag(
     tiered: bool = False,
     architect_engine: Optional[str] = None,
     worker_engine: Optional[str] = None,
+    local_only: bool = False,
 ) -> Tuple[bool, str, List[Dict[str, Any]]]:
     """
     Executes a TaskDAG in topological stages with optional Architect-Worker tiered dispatch.
     - Architect (deep reasoning, e.g. Claude 3.7 / Codex): handles Stage 1 design/contracts & final audit.
     - Worker (fast lightweight, e.g. local / fast API): executes intermediate implementation nodes.
+    - local_only / offline constraint is strictly propagated to every stage and task.
     Each stage executes its task nodes and verifies changes through tests and red-team review.
     """
+    valid, errors = dag.validate()
+    if not valid:
+        err_msg = f"DAG 拓扑结构校验失败: {'; '.join(errors)}"
+        print(c(f"❌ {err_msg}", COLOR_RED + COLOR_BOLD))
+        return False, err_msg, []
+
     stages = dag.topological_stages()
     stage_results: List[Dict[str, Any]] = []
 
@@ -3305,6 +3348,7 @@ def execute_task_dag(
                 stream=stream,
                 auto_fix=auto_fix,
                 repo_trust=repo_trust,
+                local_only=local_only,
             )
 
             if ok:
