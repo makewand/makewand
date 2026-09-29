@@ -3278,15 +3278,23 @@ def execute_task_dag(
             task_tier = tier
             task_forced_engine = None
             if tiered:
-                # Stage 1 is Architect (contracts & interfaces), Stage 2+ is Worker (implementation)
-                if stage_idx == 1:
+                # Stage 1 (contracts & architecture) and final stage (quality audit / review) use Architect (power tier).
+                # Intermediate implementation stages use Worker (fast tier).
+                is_architect_stage = (stage_idx == 1) or (len(stages) >= 3 and stage_idx == len(stages))
+                if not is_architect_stage:
+                    title_desc = f"{task.title} {task.description}".lower()
+                    if any(kw in title_desc for kw in ("audit", "review", "verification", "终审", "审查", "验收")):
+                        is_architect_stage = True
+
+                if is_architect_stage:
                     task_tier = "power" if tier == "auto" else tier
                     task_forced_engine = architect_engine
-                    print(c(f"🏛️  [Architect-Worker] 子任务指派架构师角色 (Architect Tier: {task_tier})", COLOR_PURPLE))
+                    role_desc = "架构设计" if stage_idx == 1 else "终审质检"
+                    print(c(f"🏛️  [Architect-Worker] 子任务指派架构师角色 ({role_desc}, Tier: {task_tier})", COLOR_PURPLE))
                 else:
                     task_tier = "fast" if tier == "auto" else tier
                     task_forced_engine = worker_engine
-                    print(c(f"⚡ [Architect-Worker] 子任务指派执行工兵角色 (Worker Tier: {task_tier})", COLOR_BLUE))
+                    print(c(f"⚡ [Architect-Worker] 子任务指派执行工兵角色 (功能实施, Tier: {task_tier})", COLOR_BLUE))
 
             task.status = "running"
             ok = run_pipeline(

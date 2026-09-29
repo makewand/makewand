@@ -398,12 +398,67 @@ def _score_candidate_file(rel_p: str, root_name: str) -> Tuple[int, int, int, st
 def _extract_with_treesitter(file_path: Path, content: str) -> Optional[List[str]]:
     """
     Attempts to extract structural symbols using tree-sitter if available.
-    Returns None if tree_sitter is unavailable, allowing seamless fallback.
+    Returns None if tree_sitter or the language parser is unavailable,
+    allowing seamless fallback to ast or regex.
     """
     try:
-        import tree_sitter
-        # Progressive enhancement: returns None if tree_sitter lacks specific language bindings
-        return None
+        import tree_sitter  # type: ignore
+        parser = None
+        ext = file_path.suffix.lower()
+
+        # Try tree_sitter_languages if available
+        try:
+            import tree_sitter_languages  # type: ignore
+            lang_map = {
+                ".py": "python",
+                ".go": "go",
+                ".rs": "rust",
+                ".js": "javascript",
+                ".jsx": "javascript",
+                ".ts": "typescript",
+                ".tsx": "tsx",
+                ".c": "c",
+                ".cpp": "cpp",
+                ".cc": "cpp",
+                ".h": "c",
+                ".hpp": "cpp",
+            }
+            lang_name = lang_map.get(ext)
+            if lang_name:
+                parser = tree_sitter_languages.get_parser(lang_name)
+        except Exception:
+            pass
+
+        if parser is None:
+            return None
+
+        content_bytes = content.encode("utf-8")
+        tree = parser.parse(content_bytes)
+        root_node = tree.root_node
+        symbols = []
+
+        def _traverse(node, depth=0):
+            if depth > 2:
+                return
+            node_type = str(node.type)
+            if node_type in (
+                "function_definition", "function_declaration", "method_declaration", "method_definition",
+                "class_definition", "class_declaration", "struct_item", "type_declaration", "type_spec"
+            ):
+                name = None
+                for child in node.children:
+                    if child.type in ("identifier", "name", "type_identifier", "field_identifier"):
+                        name = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
+                        break
+                if name and not name.startswith("test_") and not name.startswith("Test"):
+                    indent = "  " if depth <= 1 else "    "
+                    symbols.append(f"{indent}{node_type} {name}")
+
+            for child in node.children:
+                _traverse(child, depth + 1)
+
+        _traverse(root_node)
+        return symbols if symbols else None
     except Exception:
         return None
 

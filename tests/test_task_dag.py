@@ -112,6 +112,36 @@ class TestTaskDAG(unittest.TestCase):
             self.assertEqual(calls[1].get("forced_engine"), "local")
             self.assertEqual(calls[1].get("tier"), "fast")
 
+    def test_execute_task_dag_tiered_dispatch_three_stages_with_audit(self):
+        t1 = TaskNode("t1", "Design Contracts")
+        t2 = TaskNode("t2", "Implement Logic", dependencies=["t1"])
+        t3 = TaskNode("t3", "Final Audit and Quality Gate", dependencies=["t2"])
+        dag = TaskDAG("Goal", [t1, t2, t3])
+
+        calls = []
+        def mock_run_pipeline(*args, **kwargs):
+            calls.append(kwargs)
+            return True
+
+        with patch("makewand.orchestrator.run_pipeline", side_effect=mock_run_pipeline):
+            ok, summary, results = execute_task_dag(
+                dag,
+                tiered=True,
+                architect_engine="claude",
+                worker_engine="local"
+            )
+            self.assertTrue(ok)
+            self.assertEqual(len(calls), 3)
+            # Stage 1: Architect (claude, power tier)
+            self.assertEqual(calls[0].get("forced_engine"), "claude")
+            self.assertEqual(calls[0].get("tier"), "power")
+            # Stage 2: Worker (local, fast tier)
+            self.assertEqual(calls[1].get("forced_engine"), "local")
+            self.assertEqual(calls[1].get("tier"), "fast")
+            # Stage 3: Architect (claude, power tier for final audit)
+            self.assertEqual(calls[2].get("forced_engine"), "claude")
+            self.assertEqual(calls[2].get("tier"), "power")
+
 
 if __name__ == "__main__":
     unittest.main()

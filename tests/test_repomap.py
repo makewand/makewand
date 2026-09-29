@@ -337,6 +337,46 @@ int calculateChecksum(const char* buffer, size_t length_of_data) {
             # core.py is referenced by 2 services, so its PageRank must exceed isolated.py
             self.assertGreater(ranks["core.py"], ranks["isolated.py"])
 
+    def test_extract_with_treesitter_fallback(self):
+        from makewand.repomap import _extract_with_treesitter
+        res = _extract_with_treesitter(Path("foo.py"), "def bar(): pass")
+        # When tree-sitter bindings are not installed in the environment, returns None gracefully
+        self.assertIsNone(res)
+
+    def test_extract_with_treesitter_mocked_success(self):
+        from makewand.repomap import _extract_with_treesitter
+        from unittest.mock import MagicMock
+        import sys
+
+        # Mock tree_sitter and tree_sitter_languages
+        mock_ts = MagicMock()
+        mock_ts_lang = MagicMock()
+        mock_parser = MagicMock()
+
+        # Construct a fake tree with a function_definition node
+        class FakeNode:
+            def __init__(self, node_type, start_byte, end_byte, children=None):
+                self.type = node_type
+                self.start_byte = start_byte
+                self.end_byte = end_byte
+                self.children = children or []
+
+        code = "def calculate_total(items):\n    return sum(items)\n"
+        # "calculate_total" is at offset 4 to 19
+        id_node = FakeNode("identifier", 4, 19)
+        fn_node = FakeNode("function_definition", 0, len(code), children=[id_node])
+        root_node = FakeNode("module", 0, len(code), children=[fn_node])
+
+        mock_tree = MagicMock()
+        mock_tree.root_node = root_node
+        mock_parser.parse.return_value = mock_tree
+        mock_ts_lang.get_parser.return_value = mock_parser
+
+        with patch.dict(sys.modules, {"tree_sitter": mock_ts, "tree_sitter_languages": mock_ts_lang}):
+            res = _extract_with_treesitter(Path("calc.py"), code)
+            self.assertIsNotNone(res)
+            self.assertIn("  function_definition calculate_total", res)
+
 
 if __name__ == "__main__":
     unittest.main()
