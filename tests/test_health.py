@@ -45,6 +45,24 @@ class TestHealth(unittest.TestCase):
         self.assertIsNotNone(resets_429)
         self.assertFalse(is_reset_time_passed(resets_429))
 
+        # Proactive weekly warning (e.g. from session zainaqi)
+        output_warn = "⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown. ⚠ weekly limit: 7% left · /status"
+        limited_warn, reason_warn, resets_warn = parse_codex_quota(output_warn)
+        self.assertTrue(limited_warn)
+        self.assertIn("7%", reason_warn)
+
+        # Reached usage limit with relative time
+        output_reached = "You've reached your usage limit. Try again in 2 hours."
+        limited_r, reason_r, resets_r = parse_codex_quota(output_reached)
+        self.assertTrue(limited_r)
+        self.assertIn("2 hours", resets_r)
+
+        # Weekly limit reached
+        output_weekly = "weekly limit reached · resets at 10-04 10:40"
+        limited_w, reason_w, resets_w = parse_codex_quota(output_weekly)
+        self.assertTrue(limited_w)
+        self.assertIn("10-04 10:40", resets_w)
+
         ok_out = "OpenAI Codex v0.155.1\nsucceeded"
         limited, _, _ = parse_codex_quota(ok_out)
         self.assertFalse(limited)
@@ -98,6 +116,58 @@ class TestHealth(unittest.TestCase):
         # which means next reset is tomorrow at that time. Should NOT be considered passed.
         overnight_time = (datetime.now() - timedelta(minutes=30)).strftime("%I:%M %p")
         self.assertFalse(is_reset_time_passed(overnight_time, recent_up))
+
+    def test_official_quota_reader(self):
+        import os
+        import json
+        from makewand.health import calculate_provider_quota
+        cache_dir = os.path.expanduser("~/.cache/makewand")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, "quota-snapshot.json")
+        sample_snapshot = {
+            "version": 1,
+            "taken_at": "2026-09-30T07:00:00Z",
+            "providers": [
+                {
+                    "Provider": "claude",
+                    "FiveHourPct": 10,
+                    "WeeklyPct": 75,
+                    "ScopedPct": 100,
+                    "Authed": True,
+                    "HasData": True,
+                    "WeeklyResetAt": "2026-10-04T12:00:00Z",
+                    "ResetAt": "2026-10-04T12:00:00Z",
+                },
+                {
+                    "Provider": "codex",
+                    "FiveHourPct": None,
+                    "WeeklyPct": 92,
+                    "ScopedPct": None,
+                    "Authed": True,
+                    "HasData": True,
+                    "WeeklyResetAt": "2026-10-04T10:40:00Z",
+                    "ResetAt": "2026-10-04T10:40:00Z",
+                },
+            ],
+        }
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(sample_snapshot, f)
+
+            q_claude = calculate_provider_quota("claude", {"status": "healthy"})
+            self.assertEqual(q_claude["source"], "official")
+            self.assertEqual(q_claude["percentage"], 25)
+            self.assertIn("官方报告", q_claude["desc"])
+            self.assertIn("100%", q_claude["desc"])
+
+            q_codex = calculate_provider_quota("codex", {"status": "healthy"})
+            self.assertEqual(q_codex["source"], "official")
+            self.assertEqual(q_codex["percentage"], 8)
+            self.assertIn("官方报告", q_codex["desc"])
+            self.assertEqual(q_codex["status"], "warning")
+        finally:
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
 
 if __name__ == "__main__":
     unittest.main()

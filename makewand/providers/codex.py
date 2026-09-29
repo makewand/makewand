@@ -11,13 +11,38 @@ from makewand.providers.base import run_subprocess
 
 def parse_codex_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     lower = output.lower()
-    if "hit your usage limit" in lower or "rate_limit_exceeded" in lower:
-        reset_match = re.search(r"try again at\s+([^.\n]+)", output, re.IGNORECASE)
-        reset_time = reset_match.group(1).strip() if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
+
+    # 1. Proactive weekly exhaustion warnings (e.g., "weekly limit: 7% left" or "less than 10% of your weekly limit left")
+    pct_left_match = re.search(r"weekly\s*limit:\s*(\d+)%\s*left", lower) or re.search(r"less\s*than\s*(\d+)%\s*of\s*(?:your\s+)?weekly\s*limit\s*left", lower)
+    if pct_left_match:
+        pct_val = int(pct_left_match.group(1))
+        if pct_val <= 10:
+            iso_reset = (datetime.now() + timedelta(hours=3)).isoformat()
+            return True, f"每周额度濒临耗尽 (剩余 {pct_val}%)", iso_reset
+
+    # 2. Hard quota / usage limit reached
+    if any(k in lower for k in [
+        "hit your usage limit",
+        "hit your limit",
+        "reached your usage limit",
+        "reached your limit",
+        "usage limit reached",
+        "weekly limit reached",
+        "rate_limit_exceeded",
+        "exceeded your current quota",
+        "exceeded your limit",
+    ]):
+        reset_match = re.search(r"(?:try\s+again\s+(?:at|in)|resets\s+(?:at|in)?)\s+([^·.\n]+)", output, re.IGNORECASE)
+        reset_time = reset_match.group(1).strip().rstrip(". ") if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
         return True, f"使用额度耗尽 (重置时间: {reset_time})", reset_time
-    if re.search(r"\b(?:rate\s*limit|usage\s*limit|quota\s*exceeded|too\s*many\s*requests|429\s+too\s*many|http\s+429|status(?:\s*code)?\s*[:=]?\s*429)\b", lower):
-        iso_reset = (datetime.now() + timedelta(hours=3)).isoformat()
-        return True, "请求频率受限 (429)", iso_reset
+
+    # 3. 429 and rate limit patterns with context anchoring
+    if re.search(r"\b(?:rate\s*limit(?:ed)?|usage\s*limit|quota\s*exceeded|too\s*many\s*requests|429\s+too\s*many|http\s+429|status(?:\s*code)?\s*[:=]?\s*429)\b", lower):
+        if "middleware" not in lower and "test_" not in lower:
+            reset_match = re.search(r"(?:try\s+again\s+(?:at|in)|resets\s+(?:at|in)?)\s+([^·.\n]+)", output, re.IGNORECASE)
+            reset_time = reset_match.group(1).strip().rstrip(". ") if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
+            return True, f"请求频率受限 (429 · 重置时间: {reset_time})", reset_time
+
     return False, "", None
 
 def execute_codex_task(
@@ -120,7 +145,7 @@ def execute_codex_task(
         return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
 
     import sys
-    print(c(f"[Makewand -> Codex] 派发任务 (Tier: {tier}, gpt-6-astra)...", COLOR_CYAN), file=sys.stderr)
+    print(c(f"[Makewand -> Codex] 派发任务 (Tier: {tier}, {target_model})...", COLOR_CYAN), file=sys.stderr)
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout,

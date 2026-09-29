@@ -695,18 +695,36 @@ func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 // --- Source: Codex (session-log rate_limits) ---
 
 type codexQuotaSource struct {
-	sessionsDir string
+	sessionsDirs []string
 }
 
 // NewCodexQuotaSource reads Codex Plus/Pro usage. sessionsDir empty →
-// ~/.codex/sessions.
+// discovers $CODEX_HOME/sessions, ~/.codex/sessions, and ~/.codex-2/sessions.
 func NewCodexQuotaSource(sessionsDir string) QuotaSource {
-	if sessionsDir == "" {
+	var dirs []string
+	if sessionsDir != "" {
+		dirs = append(dirs, sessionsDir)
+	} else {
+		if ch := os.Getenv("CODEX_HOME"); ch != "" {
+			dirs = append(dirs, filepath.Join(ch, "sessions"))
+		}
 		if home, err := os.UserHomeDir(); err == nil {
-			sessionsDir = filepath.Join(home, ".codex", "sessions")
+			for _, sub := range []string{".codex", ".codex-2"} {
+				p := filepath.Join(home, sub, "sessions")
+				found := false
+				for _, d := range dirs {
+					if d == p {
+						found = true
+						break
+					}
+				}
+				if !found {
+					dirs = append(dirs, p)
+				}
+			}
 		}
 	}
-	return &codexQuotaSource{sessionsDir: sessionsDir}
+	return &codexQuotaSource{sessionsDirs: dirs}
 }
 
 func (c *codexQuotaSource) Provider() string { return "codex" }
@@ -714,7 +732,7 @@ func (c *codexQuotaSource) Provider() string { return "codex" }
 func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	q := ProviderQuota{Provider: "codex"}
 
-	files, err := recentJSONL(c.sessionsDir, 8)
+	files, err := recentJSONLFromDirs(c.sessionsDirs, 8)
 	if err != nil {
 		return q, err
 	}

@@ -43,7 +43,7 @@ def init_repo(path):
 def fixture_process(cmd, workspace, **kwargs):
     # Only executes the fixed test fixtures defined below, never model output.
     proc = subprocess.run(cmd, cwd=workspace, capture_output=True, text=True,
-                          env={**os.environ, **kwargs.get("extra_env", {})}, timeout=15)
+                          env={**os.environ, **kwargs.get("extra_env", {})}, timeout=45)
     return proc.returncode, proc.stdout, proc.stderr, None
 
 

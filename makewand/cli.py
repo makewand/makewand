@@ -122,10 +122,12 @@ def cmd_status(args):
         "none":         c("[未配置]", COLOR_RESET),
     }
 
+    from makewand.discovery import get_provider_model_tier
+    codex_active_model = get_provider_model_tier("codex", "standard").get("model", "gpt-6-astra")
     display_names = {
         "agy": "Antigravity (Google AI Pro / Gemini 3.8)",
         "claude": "Claude Code (Anthropic Subscription)",
-        "codex": "Codex CLI (OpenAI Subscription / gpt-6-astra)",
+        "codex": f"Codex CLI (OpenAI Subscription / {codex_active_model})",
         "grok": "Grok Build CLI (xAI Subscription / grok-4.7)",
         "muse": "Muse Code (Meta Subscription / Llama 4)",
         "aider": "Aider CLI (Pair Programmer CLI)",
@@ -386,8 +388,8 @@ def cmd_models(args):
     print("   调用方式: 按档位传别名 (fable/sonnet/haiku)，具体版本由 Claude Code 解析。\n")
 
     print(c("2. Codex CLI (OpenAI 订阅):", COLOR_BOLD + COLOR_CYAN))
-    _model_lines("codex", "~/.codex/config.toml")
-    print("   调用方式: 读取 config.toml 中的 model，否则使用内置默认。\n")
+    _model_lines("codex", "~/.codex 模型目录缓存 / config.toml")
+    print("   调用方式: 自动读取 models_cache.json 与 config.toml 动态映射档位 (--tier fast/standard/deep)。\n")
 
     print(c("3. Antigravity (Google AI Pro):", COLOR_BOLD + COLOR_GREEN))
     _model_lines("agy", "agy 模型缓存 (当前未实现检测)")

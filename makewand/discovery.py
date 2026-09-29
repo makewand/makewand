@@ -8,6 +8,7 @@ Each provider entry reports where its data came from:
 Callers must not present builtin values as detected versions.
 """
 
+import os
 import re
 import json
 from pathlib import Path
@@ -78,24 +79,68 @@ def discover_available_models() -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Discover Codex models from ~/.codex/config.toml
+    # Discover Codex models from models_cache.json, config.toml, and CODEX_HOME
     try:
-        codex_toml = Path.home() / ".codex" / "config.toml"
-        if codex_toml.exists():
-            raw = codex_toml.read_text(encoding="utf-8")
-            found = set()
-            for m in re.findall(r'\[tui\.model_availability_nux\]\s*([\s\S]*?)(?=\n\[|$)', raw):
-                for line in m.splitlines():
-                    if "=" in line:
-                        name = line.split("=")[0].strip().strip('"')
-                        found.add(name)
-            for m in re.findall(r'model\s*=\s*"([^"]+)"', raw):
-                found.add(m)
+        codex_bases = []
+        if os.environ.get("CODEX_HOME"):
+            codex_bases.append(Path(os.environ["CODEX_HOME"]))
+        codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
+
+        found = set()
+        configured_model = None
+
+        for base in codex_bases:
+            if not base.exists():
+                continue
+
+            # 1. Read models_cache.json (official model catalog from OpenAI)
+            cache_file = base / "models_cache.json"
+            if cache_file.exists():
+                try:
+                    cdata = json.loads(cache_file.read_text(encoding="utf-8"))
+                    for m in cdata.get("models", []):
+                        slug = m.get("slug") or m.get("id")
+                        desc = m.get("description", "")
+                        if slug:
+                            if desc:
+                                found.add(f"{slug} ({desc})")
+                            else:
+                                found.add(slug)
+                except Exception:
+                    pass
+
+            # 2. Read config.toml
+            codex_toml = base / "config.toml"
+            if codex_toml.exists():
+                try:
+                    raw = codex_toml.read_text(encoding="utf-8")
+                    for m in re.findall(r'\[tui\.model_availability_nux\]\s*([\s\S]*?)(?=\n\[|$)', raw):
+                        for line in m.splitlines():
+                            if "=" in line:
+                                name = line.split("=")[0].strip().strip('"')
+                                found.add(name)
+                    for m in re.findall(r'model\s*=\s*"([^"]+)"', raw):
+                        found.add(m)
+                    if not configured_model:
+                        cfg_m = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
+                        if cfg_m:
+                            configured_model = cfg_m.group(1).strip()
+                except Exception:
+                    pass
+
+        if found:
             models["codex"]["available"] = sorted(list(found), reverse=True)
             models["codex"]["source"] = "detected"
-            configured = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
-            if configured:
-                models["codex"]["current_default"] = configured.group(1)
+        if configured_model:
+            models["codex"]["current_default"] = configured_model
+            models["codex"]["default_source"] = "detected"
+        elif found:
+            slugs = [f.split()[0] for f in found]
+            if "gpt-6.1-sol" in slugs:
+                models["codex"]["current_default"] = "gpt-6.1-sol"
+                models["codex"]["default_source"] = "detected"
+            elif "gpt-6-astra" in slugs:
+                models["codex"]["current_default"] = "gpt-6-astra"
                 models["codex"]["default_source"] = "detected"
     except Exception:
         pass
@@ -186,18 +231,60 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
             return {"model": "sonnet", "effort": "medium", "is_dynamic": False, "full_id": "claude-sonnet-5"}
 
     elif provider == "codex":
-        model_name = "gpt-6-astra"
-        try:
-            codex_toml = Path.home() / ".codex" / "config.toml"
-            if codex_toml.exists():
-                raw = codex_toml.read_text(encoding="utf-8")
-                m = re.search(r'model\s*=\s*"([^"]+)"', raw)
-                if m:
-                    model_name = m.group(1).strip()
-        except Exception:
-            pass
-        effort = "max" if tier == "deep" else ("high" if tier == "standard" else "low")
-        return {"model": model_name, "effort": effort, "is_dynamic": True}
+        discovered_models = []
+        configured_default = None
+
+        codex_bases = []
+        if os.environ.get("CODEX_HOME"):
+            codex_bases.append(Path(os.environ["CODEX_HOME"]))
+        codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
+
+        for base in codex_bases:
+            if not base.exists():
+                continue
+            cache_file = base / "models_cache.json"
+            if cache_file.exists() and not discovered_models:
+                try:
+                    cdata = json.loads(cache_file.read_text(encoding="utf-8"))
+                    for m in cdata.get("models", []):
+                        slug = m.get("slug") or m.get("id")
+                        if slug:
+                            discovered_models.append((slug, m.get("description", "")))
+                except Exception:
+                    pass
+            cfg_file = base / "config.toml"
+            if cfg_file.exists() and not configured_default:
+                try:
+                    raw = cfg_file.read_text(encoding="utf-8")
+                    m = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
+                    if m:
+                        configured_default = m.group(1).strip()
+                except Exception:
+                    pass
+
+        slugs = [s[0] for s in discovered_models]
+
+        if tier == "fast":
+            fast_candidates = [s for s in slugs if "luna" in s or "reserve" in s]
+            chosen = fast_candidates[0] if fast_candidates else (configured_default or "gpt-6-luna")
+            return {"model": chosen, "effort": "low", "is_dynamic": True}
+
+        if tier == "deep":
+            deep_candidates = [s for s in slugs if "6.1" in s or "astra" in s]
+            chosen = deep_candidates[0] if deep_candidates else (configured_default or "gpt-6-astra")
+            return {"model": chosen, "effort": "max", "is_dynamic": True}
+
+        # standard tier
+        if configured_default and (not slugs or configured_default in slugs):
+            chosen = configured_default
+        elif "gpt-6.1-sol" in slugs:
+            chosen = "gpt-6.1-sol"
+        elif "gpt-6-astra" in slugs:
+            chosen = "gpt-6-astra"
+        else:
+            chosen = slugs[0] if slugs else "gpt-6-astra"
+
+        return {"model": chosen, "effort": "high", "is_dynamic": True}
 
     elif provider == "grok":
         model_name = "grok-4.7"

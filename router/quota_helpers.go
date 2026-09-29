@@ -43,30 +43,35 @@ func httpGetJSON(ctx context.Context, url string, headers map[string]string) ([]
 	return body, nil
 }
 
-// recentJSONL returns up to `limit` .jsonl files under dir (recursively), newest
-// mtime first.
-func recentJSONL(dir string, limit int) ([]string, error) {
+// recentJSONLFromDirs returns up to `limit` .jsonl files across multiple directories (recursively),
+// newest mtime first. Non-existent or unreadable directories are skipped gracefully.
+func recentJSONLFromDirs(dirs []string, limit int) ([]string, error) {
 	type entry struct {
 		path string
 		mod  time.Time
 	}
 	var entries []entry
-	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip unreadable subtrees
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
 		}
-		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			continue
+		}
+		_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil // skip unreadable subtrees
+			}
+			if d.IsDir() || filepath.Ext(path) != ".jsonl" {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			entries = append(entries, entry{path: path, mod: info.ModTime()})
 			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		entries = append(entries, entry{path: path, mod: info.ModTime()})
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].mod.After(entries[j].mod) })
 	if limit > 0 && len(entries) > limit {
@@ -77,6 +82,12 @@ func recentJSONL(dir string, limit int) ([]string, error) {
 		out[i] = e.path
 	}
 	return out, nil
+}
+
+// recentJSONL returns up to `limit` .jsonl files under dir (recursively), newest
+// mtime first.
+func recentJSONL(dir string, limit int) ([]string, error) {
+	return recentJSONLFromDirs([]string{dir}, limit)
 }
 
 // parseTime parses an RFC3339 timestamp, returning the zero time on failure.

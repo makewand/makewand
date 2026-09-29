@@ -662,6 +662,82 @@ QUOTA_SOURCE_LABELS = {
 }
 
 
+def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to read official subscription quota from Go router's snapshot cache
+    (~/.cache/makewand/quota-snapshot.json) or recent local session rate_limits.
+    Returns official quota dict if available, otherwise None.
+    """
+    cache_path = os.path.expanduser("~/.cache/makewand/quota-snapshot.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for p in d.get("providers", []):
+                if p.get("Provider", "").lower() == provider.lower() and p.get("HasData"):
+                    used_candidates = [p.get("WeeklyPct"), p.get("FiveHourPct")]
+                    used_vals = [float(x) for x in used_candidates if x is not None]
+                    if used_vals:
+                        worst_used = max(used_vals)
+                        pct = max(0, min(100, int(round(100 - worst_used))))
+                        scoped = p.get("ScopedPct")
+                        scoped_msg = " · 顶配模型周限额已达 100%" if (scoped and scoped >= 99) else ""
+                        r_at = p.get("ResetAt") or p.get("WeeklyResetAt") or p.get("FiveHourResetAt") or resets_at
+                        r_str = f" · 重置时间: {r_at[:16]}" if r_at and not str(r_at).startswith("0001") else ""
+                        return {
+                            "percentage": pct,
+                            "status": "healthy" if pct >= 25 else ("warning" if pct > 0 else "limited"),
+                            "desc": f"官方报告剩余额度: {pct}% (已用 {int(worst_used)}%){scoped_msg}{r_str}",
+                            "resets_at": r_at if r_at and not str(r_at).startswith("0001") else None,
+                            "is_unlimited": False,
+                            "source": "official",
+                        }
+        except Exception:
+            pass
+
+    if provider.lower() == "codex":
+        # Direct session fallback if snapshot cache is absent/stale
+        import glob
+        paths = []
+        for base in [os.environ.get("CODEX_HOME"), os.path.expanduser("~/.codex"), os.path.expanduser("~/.codex-2")]:
+            if base and os.path.isdir(base):
+                sdir = os.path.join(base, "sessions")
+                if os.path.isdir(sdir):
+                    for f in glob.glob(f"{sdir}/**/*.jsonl", recursive=True):
+                        try:
+                            paths.append((os.path.getmtime(f), f))
+                        except OSError:
+                            pass
+        paths.sort(reverse=True)
+        for mtime, p in paths[:5]:
+            try:
+                with open(p, "r", errors="ignore") as f:
+                    for line in f:
+                        if "rate_limits" in line:
+                            try:
+                                data = json.loads(line)
+                                rl = data.get("payload", {}).get("rate_limits")
+                                if rl and rl.get("primary"):
+                                    used = float(rl["primary"].get("used_percent", 0))
+                                    pct = max(0, min(100, int(round(100 - used))))
+                                    reset_ts = rl["primary"].get("resets_at")
+                                    r_fmt = datetime.fromtimestamp(reset_ts).strftime("%m-%d %H:%M") if reset_ts else ""
+                                    r_str = f" · 重置时间: {r_fmt}" if reset_ts else ""
+                                    return {
+                                        "percentage": pct,
+                                        "status": "healthy" if pct >= 25 else ("warning" if pct > 0 else "limited"),
+                                        "desc": f"官方报告每周剩余额度: {pct}% (已用 {int(used)}%){r_str}",
+                                        "resets_at": str(reset_ts) if reset_ts else None,
+                                        "is_unlimited": False,
+                                        "source": "official",
+                                    }
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+    return None
+
+
 def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Returns a quota *indicator* (0-100) for display and pacing.
@@ -745,49 +821,54 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
             "source": "official",
         }
     else:
-        # 5. Estimate from rolling usage and burn rate penalty
-        try:
-            from makewand.usage import get_burn_rate_penalty, get_engine_usage_stats
-            penalty, pen_reason = get_burn_rate_penalty(provider)
-            u24 = get_engine_usage_stats(window_hours=24.0).get(provider, {}).get("total", 0)
+        # Check official snapshot/session quota before falling back to local counter estimate
+        official_quota = _get_official_subscription_quota(provider, resets_at=resets_at)
+        if official_quota:
+            res = official_quota
+        else:
+            # 5. Estimate from rolling usage and burn rate penalty
+            try:
+                from makewand.usage import get_burn_rate_penalty, get_engine_usage_stats
+                penalty, pen_reason = get_burn_rate_penalty(provider)
+                u24 = get_engine_usage_stats(window_hours=24.0).get(provider, {}).get("total", 0)
 
-            if penalty <= -4.0:
-                pct = 5
-                desc = f"高频调用削峰保护中 (24h 调用: {u24}次)"
-            elif penalty <= -3.0:
-                pct = 20
-                desc = f"额度消耗较快 (24h 调用: {u24}次)"
-            elif penalty <= -2.0:
-                pct = 40
-                desc = f"滑动窗口用量活跃 (24h 调用: {u24}次)"
-            elif penalty <= -1.0:
-                pct = 65
-                desc = f"滑动窗口运行平稳 (24h 调用: {u24}次)"
-            else:
-                if u24 == 0:
-                    pct = 100
-                    desc = "额度充沛 · 滑动窗口无压力"
+                if penalty <= -4.0:
+                    pct = 5
+                    desc = f"高频调用削峰保护中 (24h 调用: {u24}次)"
+                elif penalty <= -3.0:
+                    pct = 20
+                    desc = f"额度消耗较快 (24h 调用: {u24}次)"
+                elif penalty <= -2.0:
+                    pct = 40
+                    desc = f"滑动窗口用量活跃 (24h 调用: {u24}次)"
+                elif penalty <= -1.0:
+                    pct = 65
+                    desc = f"滑动窗口运行平稳 (24h 调用: {u24}次)"
                 else:
-                    pct = max(75, 100 - min(25, u24 * 2))
-                    desc = f"额度充沛 · 运行健康 (24h 调用: {u24}次)"
+                    if u24 == 0:
+                        pct = 100
+                        desc = "额度充沛 · 滑动窗口无压力"
+                    else:
+                        pct = max(75, 100 - min(25, u24 * 2))
+                        desc = f"额度充沛 · 运行健康 (24h 调用: {u24}次)"
 
-            res = {
-                "percentage": pct,
-                "status": "healthy" if pct >= 25 else "warning",
-                "desc": f"{desc} [本地调用计数估算，非真实配额]",
-                "resets_at": resets_at,
-                "is_unlimited": False,
-                "source": "local_estimate",
-            }
-        except Exception:
-            res = {
-                "percentage": 85,
-                "status": "healthy",
-                "desc": "运行健康 [本地调用计数估算，非真实配额]",
-                "resets_at": resets_at,
-                "is_unlimited": False,
-                "source": "local_estimate",
-            }
+                res = {
+                    "percentage": pct,
+                    "status": "healthy" if pct >= 25 else "warning",
+                    "desc": f"{desc} [本地调用计数估算，非真实配额]",
+                    "resets_at": resets_at,
+                    "is_unlimited": False,
+                    "source": "local_estimate",
+                }
+            except Exception:
+                res = {
+                    "percentage": 85,
+                    "status": "healthy",
+                    "desc": "运行健康 [本地调用计数估算，非真实配额]",
+                    "resets_at": resets_at,
+                    "is_unlimited": False,
+                    "source": "local_estimate",
+                }
 
     res["updated_at"] = updated_at
     res["source_label"] = QUOTA_SOURCE_LABELS.get(res.get("source"), "")
