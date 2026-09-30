@@ -625,6 +625,7 @@ def cmd_inspect(args):
     cand = (args.candidate.upper() if args.candidate else None)
     cand_a = race.get("candidates", {}).get("A", {})
     cand_b = race.get("candidates", {}).get("B", {})
+    cand_m = race.get("candidates", {}).get("M", {})
 
     if cand == "A":
         pars_a = cand_a.get("parsimony", {})
@@ -640,19 +641,37 @@ def cmd_inspect(args):
         print(c(f"--- 选手 B ({cand_b.get('model')}) 改动详情 (git diff) ---", COLOR_BLUE + COLOR_BOLD))
         diff = cand_b.get("diff", "")
         print(diff if diff else "无有效代码变更")
+    elif cand == "M":
+        if not cand_m:
+            print(c("当前候选竞速尚未生成 Candidate M (Hybrid) 方案，正在尝试合成...", COLOR_YELLOW))
+            from makewand.candidate import CandidateManager
+            ok_m, cand_m, msg_m = CandidateManager.create_hybrid_candidate(race.get("race_id"))
+            if not ok_m or not cand_m:
+                print(c(f"❌ 合成 Candidate M 失败: {msg_m}", COLOR_RED))
+                sys.exit(EXIT_FAILED)
+        pars_m = cand_m.get("parsimony", {})
+        if pars_m:
+            print(c(f"--- 混合方案 M ({cand_m.get('model')}) 补丁精简度: {pars_m.get('summary', '')} ---", COLOR_GREEN + COLOR_BOLD))
+        print(c(f"--- 混合方案 M ({cand_m.get('model')}) 改动详情 (git diff) ---", COLOR_GREEN + COLOR_BOLD))
+        diff = cand_m.get("diff", "")
+        print(diff if diff else "无有效代码变更")
     else:
-        print(c("--- 两位选手表现对比 ---", COLOR_BOLD))
+        print(c("--- 参赛方案表现对比 ---", COLOR_BOLD))
         pars_a = cand_a.get("parsimony", {})
         pars_b = cand_b.get("parsimony", {})
         pars_info_a = f", 精简度={pars_a.get('parsimony_ratio', 1.0):.2f}" if pars_a else ""
         pars_info_b = f", 精简度={pars_b.get('parsimony_ratio', 1.0):.2f}" if pars_b else ""
         print(f"选手 A [{cand_a.get('model')}]: 耗时={cand_a.get('duration')}s, Diff大小={len(cand_a.get('diff', ''))} 字节{pars_info_a}, 状态={'成功' if cand_a.get('success') else '失败'}")
         print(f"选手 B [{cand_b.get('model')}]: 耗时={cand_b.get('duration')}s, Diff大小={len(cand_b.get('diff', ''))} 字节{pars_info_b}, 状态={'成功' if cand_b.get('success') else '失败'}")
+        if cand_m:
+            pars_m = cand_m.get("parsimony", {})
+            pars_info_m = f", 精简度={pars_m.get('parsimony_ratio', 1.0):.2f}" if pars_m else ""
+            print(f"混合 M [{cand_m.get('model')}]: 3-Way 语义合成, 单测={'✔ 通过' if cand_m.get('test_passed') else '❌ 失败'}, Diff大小={len(cand_m.get('diff', ''))} 字节{pars_info_m}")
         print()
         if race.get("judge_report"):
             print(c("--- 裁判裁决报告 ---", COLOR_BOLD))
             print(race.get("judge_report").strip())
-        print(f"\n提示: 使用 'makewand inspect {race.get('race_id')} --candidate A|B' 查看完整代码差异。")
+        print(f"\n提示: 使用 'makewand inspect {race.get('race_id')} --candidate A|B|M' 查看完整代码差异。")
 
 def cmd_apply(args):
     from makewand.candidate import CandidateManager
@@ -660,7 +679,8 @@ def cmd_apply(args):
         race_id=args.race_id,
         candidate_label=args.candidate,
         dry_run=args.dry_run,
-        force=args.force
+        force=args.force,
+        merge=getattr(args, "merge", False)
     )
     if not ok:
         print(c(f"❌ {msg}", COLOR_RED + COLOR_BOLD))
@@ -681,6 +701,51 @@ def cmd_discard(args):
         print(c(f"✔ {msg}", COLOR_GREEN))
     else:
         print(c(f"❌ {msg}", COLOR_RED))
+
+def cmd_daemon(args):
+    from makewand.daemon import start_daemon, stop_daemon, daemon_status_cmd
+    action = args.action
+    if action == "start":
+        sys.exit(start_daemon(foreground=getattr(args, "foreground", False)))
+    elif action == "stop":
+        sys.exit(stop_daemon())
+    elif action == "restart":
+        stop_daemon()
+        sys.exit(start_daemon(foreground=getattr(args, "foreground", False)))
+    elif action == "status":
+        sys.exit(daemon_status_cmd())
+
+def cmd_sessions(args):
+    from makewand.collision import get_all_active_sessions_report
+    rep = get_all_active_sessions_report()
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        return
+
+    print(c("\n============================================================", COLOR_BOLD))
+    print(c("       Makewand 跨会话活跃拓扑与工作树占用看板", COLOR_BOLD + COLOR_CYAN))
+    print(c("============================================================\n", COLOR_BOLD))
+    print(f"• 活跃 AI 进程数: {c(str(rep['total_active_sessions']), COLOR_GREEN + COLOR_BOLD)}")
+    print(f"• 活跃 Tmux 窗格数: {rep['total_tmux_panes']}\n")
+
+    by_repo = rep.get("sessions_by_repo", {})
+    if not by_repo:
+        print(c("✔ 当前主机无外部并发 AI 编码会话运行，工作树状态纯净。", COLOR_GREEN))
+        return
+
+    for repo, procs in by_repo.items():
+        print(c(f"📁 仓库/目录: {repo}", COLOR_BOLD + COLOR_YELLOW))
+        for p in procs:
+            tty = p.get("tty", "?")
+            comm = p.get("comm", "")
+            ai_type = p.get("ai_type", "")
+            pid = p.get("pid")
+            etime = p.get("etime", "")
+            cwd = p.get("cwd", "")
+            print(f"  • PID {c(str(pid), COLOR_CYAN)} [{c(ai_type.upper(), COLOR_GREEN)} - {comm}] 终端: {tty} 耗时: {etime}")
+            print(f"    工作目录: {cwd}")
+        print()
 
 def _normalize_version(text: str) -> str:
     return text.strip().lstrip("vV")
@@ -849,11 +914,17 @@ def main():
     common_parser.add_argument("-C", "--cwd", dest="cwd", default=None, help="Target working directory (default: current directory)")
     common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=None, help="Read task prompt from file")
     common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default="trusted", help="Repository trust level: trusted or untrusted")
+    common_parser.add_argument("--daemon", action="store_true", default=False, help="Dispatch command via resident daemon if available (<15ms latency)")
+    common_parser.add_argument("--no-daemon", action="store_true", default=False, help="Bypass resident daemon and run standalone")
+    common_parser.add_argument("--allow-collision", action="store_true", default=False, help="Bypass cross-session collision warning and force execution")
 
     sub_common_parser = argparse.ArgumentParser(add_help=False)
     sub_common_parser.add_argument("-C", "--cwd", dest="cwd", default=argparse.SUPPRESS, help="Target working directory (default: current directory)")
     sub_common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=argparse.SUPPRESS, help="Read task prompt from file")
     sub_common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default=argparse.SUPPRESS, help="Repository trust level: trusted or untrusted")
+    sub_common_parser.add_argument("--daemon", action="store_true", default=argparse.SUPPRESS, help="Dispatch command via resident daemon if available (<15ms latency)")
+    sub_common_parser.add_argument("--no-daemon", action="store_true", default=argparse.SUPPRESS, help="Bypass resident daemon and run standalone")
+    sub_common_parser.add_argument("--allow-collision", action="store_true", default=argparse.SUPPRESS, help="Bypass cross-session collision warning and force execution")
 
     parser = argparse.ArgumentParser(
         prog="makewand",
@@ -1013,17 +1084,27 @@ def main():
 
     p_inspect = subparsers.add_parser("inspect", help="Inspect race candidate diffs and referee verdicts", parents=[sub_common_parser])
     p_inspect.add_argument("race_id", nargs="?", default=None, help="Race ID (defaults to latest)")
-    p_inspect.add_argument("--candidate", choices=["A", "B", "a", "b"], default=None, help="Inspect specific candidate (A or B)")
+    p_inspect.add_argument("--candidate", choices=["A", "B", "M", "a", "b", "m"], default=None, help="Inspect specific candidate (A, B, or M)")
 
     p_apply = subparsers.add_parser("apply", help="Safely apply a race candidate solution to current workspace with conflict checks", parents=[sub_common_parser])
     p_apply.add_argument("race_id", nargs="?", default=None, help="Race ID (defaults to latest)")
-    p_apply.add_argument("--candidate", choices=["A", "B", "a", "b"], default=None, help="Candidate to apply (A or B, defaults to winner)")
+    p_apply.add_argument("--candidate", choices=["A", "B", "M", "a", "b", "m"], default=None, help="Candidate to apply (A, B, or M, defaults to winner)")
+    p_apply.add_argument("--merge", "--hybrid", dest="merge", action="store_true", default=False, help="Synthesize and apply 3-way AST & patch hybrid merged solution")
     p_apply.add_argument("--dry-run", action="store_true", default=False, help="Simulate apply and show changed files without touching disk")
     p_apply.add_argument("--force", action="store_true", default=False, help="Force overwrite even if local workspace has conflicts")
 
     p_discard = subparsers.add_parser("discard", help="Discard saved race candidate workspaces", parents=[sub_common_parser])
     p_discard.add_argument("race_id", nargs="?", default=None, help="Race ID to discard (defaults to latest)")
     p_discard.add_argument("--all", action="store_true", default=False, help="Discard all candidate workspaces")
+
+    # daemon (Resident Daemon / IPC Socket Fast-Path)
+    p_daemon = subparsers.add_parser("daemon", help="Manage resident daemon for <15ms IPC socket fast-path", parents=[sub_common_parser])
+    p_daemon.add_argument("action", choices=["start", "stop", "restart", "status"], help="Daemon lifecycle action")
+    p_daemon.add_argument("--foreground", action="store_true", default=False, help="Run daemon in foreground (debug mode)")
+
+    # sessions (Host-wide AI session observer and worktree collision detector)
+    p_sessions = subparsers.add_parser("sessions", help="Show active AI sessions across tmux/terminals and worktree allocation map", parents=[sub_common_parser])
+    p_sessions.add_argument("--json", action="store_true", default=False, help="Output sessions report in JSON format")
 
     from makewand.config import get_all_supported_providers
     all_supported = get_all_supported_providers()
@@ -1085,7 +1166,8 @@ def main():
         "claude", "codex", "agy", "grok", "muse", "local", "aider", "deepseek", "qwen", "glm", "kimi",
         "openrouter", "siliconflow", "cursor", "copilot",
         "observe", "candidates", "inspect", "apply", "discard",
-        "enable", "disable", "repomap", "plan", "aci", "mcp"
+        "enable", "disable", "repomap", "plan", "aci", "mcp",
+        "daemon", "sessions"
     }
     # Auto-route to `makewand run ...` if user invokes `makewand "prompt"`, `makewand -C /dir -f task.txt`, or pipes stdin
     is_auto_routed_run = False
@@ -1111,6 +1193,18 @@ def main():
     if hasattr(args, "tier") and args.tier:
         args.tier = normalize_tier(args.tier)
 
+    # Honor --no-daemon flag
+    if getattr(args, "no_daemon", False):
+        os.environ["MAKEWAND_NO_DAEMON"] = "1"
+
+    # Daemon fast-path dispatch if requested via --daemon or MAKEWAND_DAEMON=1
+    if (getattr(args, "daemon", False) or os.environ.get("MAKEWAND_DAEMON") == "1") and args.subcommand != "daemon":
+        if os.environ.get("MAKEWAND_INSIDE_DAEMON") != "1":
+            from makewand.daemon import try_dispatch_via_daemon
+            daemon_code = try_dispatch_via_daemon(sys.argv[1:], cwd=getattr(args, "cwd", None))
+            if daemon_code is not None:
+                sys.exit(daemon_code)
+
     # Mark this process as a makewand dispatcher: every provider CLI, sandbox and
     # test process it spawns inherits MAKEWAND_DISPATCH_ID, which is how
     # `observe --clean-hung` tells makewand's own processes apart from the
@@ -1130,6 +1224,20 @@ def main():
     elif not getattr(args, "cwd", None):
         args.cwd = os.getcwd()
 
+    # Pre-flight cross-session collision check for engineering commands
+    if args.subcommand in ("run", "race", "apply"):
+        if not getattr(args, "allow_collision", False) and not getattr(args, "force", False):
+            try:
+                from makewand.collision import detect_cross_session_collisions, format_collision_warning
+                col_rep = detect_cross_session_collisions(args.cwd)
+                if col_rep.get("has_collision"):
+                    print(format_collision_warning(col_rep), file=sys.stderr)
+                    if col_rep.get("git_locked"):
+                        print(c("❌ [Makewand Collision Guard] Git 索引锁已被占用，终止执行以防止写坏 Git 仓库。", COLOR_RED + COLOR_BOLD), file=sys.stderr)
+                        sys.exit(EXIT_FAILED)
+            except Exception:
+                pass
+
     if not args.subcommand:
         from makewand.interactive import start_interactive_session
         start_interactive_session(repo_trust=getattr(args, "repo_trust", "trusted"))
@@ -1143,7 +1251,11 @@ def main():
     if args.subcommand in prompt_subcommands:
         args.prompt = _resolve_cli_prompt(args, original_cwd=original_cwd, required=True)
 
-    if args.subcommand == "models":
+    if args.subcommand == "daemon":
+        cmd_daemon(args)
+    elif args.subcommand == "sessions":
+        cmd_sessions(args)
+    elif args.subcommand == "models":
         cmd_models(args)
     elif args.subcommand == "status":
         cmd_status(args)

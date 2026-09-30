@@ -464,11 +464,105 @@ class CandidateManager:
         return conflicts
 
     @staticmethod
+    def create_hybrid_candidate(race_id: Optional[str] = None) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        """
+        Synthesizes a 3-way semantic merged Candidate M from Candidates A and B in race_id.
+        Verifies unit tests before registering Candidate M into meta.json.
+        Returns (success, candidate_m_dict, message).
+        """
+        race = CandidateManager.get_race(race_id)
+        if not race:
+            return False, None, "未找到指定的竞速记录"
+
+        r_id = race.get("race_id", "")
+        base_cwd = race.get("base_cwd", "")
+        if not os.path.exists(base_cwd):
+            return False, None, f"原始工作区不存在: {base_cwd}"
+
+        cand_a = race.get("candidates", {}).get("A", {})
+        cand_b = race.get("candidates", {}).get("B", {})
+
+        path_a_str = cand_a.get("path")
+        path_b_str = cand_b.get("path")
+        if not path_a_str or not os.path.exists(path_a_str):
+            return False, None, "候选 A 工作区不存在"
+        if not path_b_str or not os.path.exists(path_b_str):
+            return False, None, "候选 B 工作区不存在"
+
+        race_dir = config.CANDIDATES_DIR / r_id
+        cand_m_dir = race_dir / "candidate_M"
+        if cand_m_dir.exists():
+            shutil.rmtree(cand_m_dir)
+        cand_m_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        from makewand.merger import semantic_merge_candidate_worktrees
+        baseline_commit = race.get("baseline_commit")
+
+        # Safely copy baseline into candidate_M using clone_isolated_worktree (never copies .env/secrets)
+        from makewand.git_helper import clone_isolated_worktree
+        try:
+            clone_isolated_worktree(base_cwd, cand_m_dir)
+        except Exception:
+            for root, dirs, files in os.walk(base_cwd):
+                if Path(root) == Path(base_cwd):
+                    dirs[:] = [d for d in dirs if d != ".git"]
+                for f in files:
+                    if f.startswith(".env") or f.endswith(".key"):
+                        continue
+                    src = Path(root) / f
+                    if not os.path.islink(src):
+                        rel = src.relative_to(base_cwd)
+                        dst = cand_m_dir / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+
+        ok, merged_changes, conflicts, summary = semantic_merge_candidate_worktrees(
+            base_cwd=base_cwd,
+            cand_a_dir=Path(path_a_str),
+            cand_b_dir=Path(path_b_str),
+            output_dir=cand_m_dir,
+            baseline_commit=baseline_commit
+        )
+        if not ok:
+            return False, None, f"语义合并未通过: {summary}"
+
+        # Initialize temporary git repo in cand_m_dir to compute git diff
+        run_git_cmd(["git", "init"], cwd=str(cand_m_dir))
+        diff = get_git_diff(str(cand_m_dir))
+
+        # Check unit tests on merged candidate
+        from makewand.orchestrator import run_local_tests, compute_patch_parsimony
+        tests_passed = run_local_tests(cwd=str(cand_m_dir))
+
+        cand_m_meta = {
+            "label": "M",
+            "model": f"{cand_a.get('model', 'A')}+{cand_b.get('model', 'B')}-hybrid",
+            "path": str(cand_m_dir),
+            "success": True,
+            "test_passed": tests_passed,
+            "review_passed": True if tests_passed else None,
+            "diff": diff,
+            "changes": merged_changes,
+            "manifest": build_manifest(cand_m_dir),
+            "parsimony": compute_patch_parsimony(diff),
+            "merged_from": ["A", "B"],
+            "created_at": datetime.now().isoformat(),
+        }
+
+        # Update meta.json
+        race["candidates"]["M"] = cand_m_meta
+        meta_file = race_dir / "meta.json"
+        _write_private_json(meta_file, race)
+
+        return True, cand_m_meta, f"成功合成 Candidate M (Hybrid): 测试验证={'通过' if tests_passed else '未通过'}, 融合 {len(merged_changes)} 个文件"
+
+    @staticmethod
     def apply_candidate(
         race_id: Optional[str] = None,
         candidate_label: Optional[str] = None,
         dry_run: bool = False,
-        force: bool = False
+        force: bool = False,
+        merge: bool = False
     ) -> Tuple[bool, List[str], str]:
         """
         Safely applies candidate changes to base_cwd with conflict detection and rollback journal.
@@ -502,7 +596,8 @@ class CandidateManager:
                     race_id=race_id,
                     candidate_label=candidate_label,
                     dry_run=dry_run,
-                    force=force
+                    force=force,
+                    merge=merge
                 )
             finally:
                 if workspace_lock is not None:
@@ -522,7 +617,8 @@ class CandidateManager:
         race_id: Optional[str] = None,
         candidate_label: Optional[str] = None,
         dry_run: bool = False,
-        force: bool = False
+        force: bool = False,
+        merge: bool = False
     ) -> Tuple[bool, List[str], str]:
         race = CandidateManager.get_race(race_id)
         if not race:
@@ -534,12 +630,25 @@ class CandidateManager:
             return False, [], f"原始工作区不存在: {base_cwd}"
 
         # Choose candidate (require explicit candidate if no winner)
-        if not candidate_label and not race.get("winner"):
-            return False, [], "竞速裁判未决出胜者，请显式指定待应用的候选方案: --candidate A 或 --candidate B"
+        if merge:
+            label = "M"
+        else:
+            raw = (candidate_label or race.get("winner") or "").upper()
+            if raw in ("M", "HYBRID", "MERGE", "MERGED"):
+                label = "M"
+            elif raw in ("A", "B"):
+                label = raw
+            elif not raw:
+                return False, [], "竞速裁判未决出胜者，请显式指定待应用的候选方案: --candidate A, --candidate B, 或 --merge"
+            else:
+                return False, [], f"无效的候选方案标识: {raw}，仅支持 A、B 或 M (混合方案)"
 
-        label = (candidate_label or race.get("winner")).upper()
-        if label not in ("A", "B"):
-            return False, [], f"无效的候选方案标识: {label}，仅支持 A 或 B"
+        # If candidate M is requested but doesn't exist yet, synthesize it now
+        if label == "M" and "M" not in race.get("candidates", {}):
+            ok_m, cand_m_meta, msg_m = CandidateManager.create_hybrid_candidate(race_id=r_id)
+            if not ok_m:
+                return False, [], f"无法合成候选 M (Hybrid): {msg_m}"
+            race = CandidateManager.get_race(r_id)
 
         cand_info = race.get("candidates", {}).get(label, {})
         cand_path_str = cand_info.get("path")

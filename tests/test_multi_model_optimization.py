@@ -756,6 +756,262 @@ class TestCliOptimizationsAndCircuitBreaker(unittest.TestCase):
             os.remove(tf_path)
 
 
+class TestResidentDaemon(unittest.TestCase):
+    """Direction 1: Resident Daemon and IPC Socket Fast-Path unit tests."""
+
+    def test_daemon_io_stream_duck_typing(self):
+        import threading
+        from makewand.daemon import DaemonIOStream
+
+        class MockSocket:
+            def __init__(self):
+                self.sent = []
+            def sendall(self, b):
+                self.sent.append(b)
+
+        sock = MockSocket()
+        lock = threading.Lock()
+        stream = DaemonIOStream(sock, "out", lock)
+
+        self.assertTrue(stream.isatty())
+        self.assertTrue(stream.writable())
+        self.assertFalse(stream.readable())
+        self.assertFalse(stream.seekable())
+        self.assertEqual(stream.encoding, "utf-8")
+        self.assertEqual(stream.errors, "replace")
+
+        stream.write("hello world\n")
+        self.assertEqual(len(sock.sent), 1)
+        data = json.loads(sock.sent[0].decode())
+        self.assertEqual(data["type"], "out")
+        self.assertEqual(data["data"], "hello world\n")
+
+        stream.writelines(["line1\n", "line2\n"])
+        self.assertEqual(len(sock.sent), 3)
+
+    def test_daemon_socket_and_pid_paths(self):
+        from makewand.daemon import get_daemon_socket_path, get_daemon_pid_path, get_daemon_log_path
+        sock_p = get_daemon_socket_path()
+        pid_p = get_daemon_pid_path()
+        log_p = get_daemon_log_path()
+        self.assertTrue(str(sock_p).endswith("makewand.sock"))
+        self.assertTrue(str(pid_p).endswith("makewand.pid"))
+        self.assertTrue(str(log_p).endswith("daemon.log"))
+
+    def test_daemon_status_when_not_running(self):
+        from makewand.daemon import is_daemon_running, daemon_status_cmd
+        with patch("makewand.daemon.get_daemon_pid_path") as mock_pid:
+            mock_pid.return_value = Path("/tmp/nonexistent_makewand_pid_file.pid")
+            running, pid = is_daemon_running()
+            self.assertFalse(running)
+            self.assertIsNone(pid)
+            # daemon_status_cmd exits 0
+            code = daemon_status_cmd()
+            self.assertEqual(code, 0)
+
+
+class TestThreeWaySemanticMerger(unittest.TestCase):
+    """Direction 2: 3-Way AST and Patch Semantic Merger unit tests."""
+
+    def test_ast_merge_disjoint_python_functions(self):
+        from makewand.merger import ast_merge_python_file
+
+        base_code = '''def calculate_total(prices):
+    return sum(prices)
+
+def format_currency(val):
+    return f"${val}"
+'''
+
+        # Candidate A improves calculate_total
+        code_a = '''def calculate_total(prices):
+    # Support empty or None
+    if not prices:
+        return 0.0
+    return float(sum(prices))
+
+def format_currency(val):
+    return f"${val}"
+'''
+
+        # Candidate B improves format_currency
+        code_b = '''def calculate_total(prices):
+    return sum(prices)
+
+def format_currency(val):
+    # Support negative numbers and decimals
+    return f"${val:,.2f}"
+'''
+
+        ok, merged, strategy = ast_merge_python_file(base_code, code_a, code_b)
+        self.assertTrue(ok)
+        self.assertIn("float(sum(prices))", merged)
+        self.assertIn("${val:,.2f}", merged)
+        self.assertEqual(strategy, "ast_symbol_splice")
+
+    def test_ast_merge_with_new_imports(self):
+        from makewand.merger import ast_merge_python_file
+
+        base_code = '''def process_item(item):
+    return item
+'''
+
+        code_a = '''import math
+
+def process_item(item):
+    return math.sqrt(item)
+'''
+
+        code_b = '''import sys
+
+def process_item(item):
+    return item
+
+def get_platform():
+    return sys.platform
+'''
+
+        ok, merged, strategy = ast_merge_python_file(base_code, code_a, code_b)
+        self.assertTrue(ok)
+        self.assertIn("import math", merged)
+        self.assertIn("import sys", merged)
+        self.assertIn("math.sqrt", merged)
+        self.assertIn("get_platform", merged)
+
+    def test_semantic_merge_candidate_worktrees(self):
+        from makewand.merger import semantic_merge_candidate_worktrees
+
+        with tempfile.TemporaryDirectory() as td:
+            base_dir = Path(td) / "base"
+            cand_a = Path(td) / "cand_a"
+            cand_b = Path(td) / "cand_b"
+            out_dir = Path(td) / "merged"
+
+            for d in (base_dir, cand_a, cand_b, out_dir):
+                d.mkdir(parents=True, exist_ok=True)
+
+            # Base files
+            (base_dir / "common.py").write_text("def a(): return 1\ndef b(): return 2\n")
+            (base_dir / "file_a_only.txt").write_text("initial a\n")
+            (base_dir / "file_b_only.txt").write_text("initial b\n")
+
+            # Clone to cand_a and cand_b
+            shutil.copytree(base_dir, cand_a, dirs_exist_ok=True)
+            shutil.copytree(base_dir, cand_b, dirs_exist_ok=True)
+            shutil.copytree(base_dir, out_dir, dirs_exist_ok=True)
+
+            # Candidate A touches common.py (func a) and file_a_only.txt
+            (cand_a / "common.py").write_text("def a(): return 100\ndef b(): return 2\n")
+            (cand_a / "file_a_only.txt").write_text("modified by a\n")
+
+            # Candidate B touches common.py (func b) and file_b_only.txt
+            (cand_b / "common.py").write_text("def a(): return 1\ndef b(): return 200\n")
+            (cand_b / "file_b_only.txt").write_text("modified by b\n")
+
+            ok, changes, conflicts, msg = semantic_merge_candidate_worktrees(
+                base_cwd=str(base_dir),
+                cand_a_dir=cand_a,
+                cand_b_dir=cand_b,
+                output_dir=out_dir
+            )
+
+            self.assertTrue(ok, msg)
+            self.assertEqual(len(conflicts), 0)
+            self.assertEqual((out_dir / "file_a_only.txt").read_text().strip(), "modified by a")
+            self.assertEqual((out_dir / "file_b_only.txt").read_text().strip(), "modified by b")
+            merged_py = (out_dir / "common.py").read_text()
+            self.assertIn("return 100", merged_py)
+            self.assertIn("return 200", merged_py)
+
+    def test_candidate_manager_hybrid_candidate_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            base_dir = Path(td) / "workspace"
+            base_dir.mkdir()
+            (base_dir / "module.py").write_text("def x(): return 1\ndef y(): return 2\n")
+
+            cand_a_dir = Path(td) / "cand_a"
+            cand_b_dir = Path(td) / "cand_b"
+            cand_a_dir.mkdir()
+            cand_b_dir.mkdir()
+
+            (cand_a_dir / "module.py").write_text("def x(): return 10\ndef y(): return 2\n")
+            (cand_b_dir / "module.py").write_text("def x(): return 1\ndef y(): return 20\n")
+
+            race_id = "test_rc_hybrid_1"
+            race_data = {
+                "race_id": race_id,
+                "base_cwd": str(base_dir),
+                "candidates": {
+                    "A": {
+                        "model": "model-a",
+                        "path": str(cand_a_dir),
+                        "success": True,
+                        "test_passed": True,
+                    },
+                    "B": {
+                        "model": "model-b",
+                        "path": str(cand_b_dir),
+                        "success": True,
+                        "test_passed": True,
+                    }
+                }
+            }
+
+            with patch("makewand.candidate.CandidateManager.get_race", return_value=race_data), \
+                 patch("makewand.candidate.config.CANDIDATES_DIR", Path(td) / "candidates"), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, None)):
+
+                (Path(td) / "candidates" / race_id).mkdir(parents=True, exist_ok=True)
+                ok, cand_m, msg = CandidateManager.create_hybrid_candidate(race_id)
+                self.assertTrue(ok, msg)
+                self.assertIsNotNone(cand_m)
+                self.assertEqual(cand_m["label"], "M")
+                self.assertTrue(cand_m["test_passed"])
+
+
+class TestCrossSessionCollisionDetection(unittest.TestCase):
+    """Direction 3: Cross-Session Collision Detection and Host-wide Awareness tests."""
+
+    def test_detect_cross_session_collisions_clean(self):
+        from makewand.collision import detect_cross_session_collisions
+        with tempfile.TemporaryDirectory() as td:
+            rep = detect_cross_session_collisions(td)
+            self.assertIn("has_collision", rep)
+            self.assertIn("collisions", rep)
+            self.assertIn("suggested_worktree_cmd", rep)
+
+    def test_detect_cross_session_collisions_with_simulated_peer(self):
+        from makewand.collision import detect_cross_session_collisions, format_collision_warning
+        with tempfile.TemporaryDirectory() as td:
+            fake_proc = {
+                "pid": 999999,
+                "ppid": 1,
+                "ai_type": "claude",
+                "comm": "claude",
+                "args": "claude -p edit",
+                "tty": "pts/99",
+                "etime": "01:00",
+                "cwd": os.path.realpath(td)
+            }
+            with patch("makewand.collision.get_active_ai_processes", return_value=[fake_proc]):
+                rep = detect_cross_session_collisions(td)
+                self.assertTrue(rep["has_collision"])
+                self.assertEqual(len(rep["same_worktree_sessions"]), 1)
+                self.assertEqual(rep["same_worktree_sessions"][0]["ai_type"], "claude")
+
+                warning_text = format_collision_warning(rep)
+                self.assertIn("碰撞感知", warning_text)
+                self.assertIn("PID", warning_text)
+                self.assertIn("999999", warning_text)
+                self.assertIn("git worktree add", warning_text)
+
+    def test_get_all_active_sessions_report(self):
+        from makewand.collision import get_all_active_sessions_report
+        rep = get_all_active_sessions_report()
+        self.assertIn("total_active_sessions", rep)
+        self.assertIn("sessions_by_repo", rep)
+
+
 if __name__ == "__main__":
     unittest.main()
 

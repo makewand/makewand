@@ -3056,6 +3056,19 @@ def run_race(
             return EXIT_UNVERIFIED
         saved_successfully = True
 
+        # Attempt 3-way AST & patch semantic hybrid merge between A and B
+        hybrid_created = False
+        try:
+            ok_m, cand_m_meta, msg_m = CandidateManager.create_hybrid_candidate(race_id=race_id)
+            if ok_m and cand_m_meta and cand_m_meta.get("test_passed"):
+                hybrid_created = True
+                print(c("✨ [Makewand 3-Way Merge] 成功融合选手 A 与选手 B 的互补代码并全量通过本地单测！", COLOR_GREEN + COLOR_BOLD))
+                print(c(f"  • 合成方案: Candidate M (Hybrid) - {cand_m_meta.get('model')}", COLOR_CYAN + COLOR_BOLD))
+                print(f"  • 审查混合方案: makewand inspect {race_id} --candidate M")
+                print(f"  • 一键应用混合: makewand apply {race_id} --merge\n")
+        except Exception:
+            pass
+
         print(c(f"\n💾 候选工作区已妥善封存 (Race ID: {race_id})", COLOR_GREEN + COLOR_BOLD))
         if winner:
             print(c(f"  ★ 主裁推荐胜出方案: 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
@@ -3065,6 +3078,8 @@ def run_race(
             print(c("  ⚠ 未决出唯一胜出方案，请审查后显式指定方案:", COLOR_YELLOW))
             print(f"  • 审查方案差异: makewand inspect {race_id} --candidate A|B")
             print(f"  • 安全应用方案: makewand apply {race_id} --candidate A|B")
+        if hybrid_created:
+            print(c(f"  ★ 3-Way 混合方案已就绪: makewand apply {race_id} --merge", COLOR_GREEN + COLOR_BOLD))
         print(f"  • 丢弃废弃候选: makewand discard {race_id}\n")
 
         if not test_pass_a and not test_pass_b:
