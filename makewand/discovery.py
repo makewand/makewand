@@ -12,7 +12,104 @@ import os
 import re
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
+
+# Generic capability & family keywords for zero-hardcoding model ranking
+FAST_FAMILIES = ["haiku", "luna", "flash", "mini", "nano", "reserve"]
+FAST_KEYWORDS = ["fast", "fastest", "speed", "rapid", "lightweight", "affordable", "easier", "quick", "turbo", "efficient"]
+
+DEEP_FAMILIES = ["opus", "fable", "mythos", "astra", "ultra", "frontier"]
+DEEP_KEYWORDS = ["demanding", "toughest", "most capable", "complex", "flagship", "pro-high", "deep"]
+
+STANDARD_FAMILIES = ["sonnet", "sol", "standard"]
+STANDARD_KEYWORDS = ["workhorse", "balanced", "everyday", "general"]
+
+
+def parse_semver(slug: str) -> tuple:
+    """
+    Extract (major, minor, patch) version tuple from model slugs or labels.
+    Handles formats like:
+      - 'gpt-6.1-sol' -> (6, 1, 0)
+      - 'gpt-6.5-sol' -> (6, 5, 0)
+      - 'gpt-7-astra' -> (7, 0, 0)
+      - 'claude-opus-5-5' -> (5, 5, 0)
+      - 'claude-fable-5-1[1m]' -> (5, 1, 0)
+      - 'claude-haiku-4-5-20251001' -> (4, 5, 0)
+      - 'grok-4.7' -> (4, 7, 0)
+      - 'gemini-3.8-pro' -> (3, 8, 0)
+    """
+    clean = re.sub(r"\b20\d{6}\b", "", slug)
+    clean = re.sub(r"\[\w+\]", "", clean)
+    matches = re.findall(r"(?<![a-zA-Z0-9])(\d+)(?:[.\-_](\d+))?(?:[.\-_](\d+))?(?![a-zA-Z0-9])", clean)
+    best_ver = (0, 0, 0)
+    for m in matches:
+        v = tuple(int(x) if x else 0 for x in m)
+        if v[0] < 100 and v > best_ver:
+            best_ver = v
+    return best_ver
+
+
+def score_model_for_tier(slug: str, desc: str = "", tier: str = "standard") -> int:
+    """
+    Generic capability ranking function for assigning models to tiers:
+    - Combines semantic version priority with capability family and descriptive keywords.
+    - Eliminates any hardcoded model version checks.
+    """
+    text = f"{slug} {desc}".lower()
+    ver = parse_semver(slug)
+    ver_score = ver[0] * 100000 + ver[1] * 1000 + ver[2]
+
+    fast_fam = sum(1 for k in FAST_FAMILIES if k in text)
+    fast_kw = sum(1 for k in FAST_KEYWORDS if k in text)
+
+    deep_fam = sum(1 for k in DEEP_FAMILIES if k in text)
+    deep_kw = sum(1 for k in DEEP_KEYWORDS if k in text)
+
+    std_fam = sum(1 for k in STANDARD_FAMILIES if k in text)
+    std_kw = sum(1 for k in STANDARD_KEYWORDS if k in text)
+
+    tier = tier.lower()
+    score = ver_score
+    if tier == "fast":
+        score += fast_fam * 200000 + fast_kw * 30000
+        score -= (deep_fam * 250000 + deep_kw * 40000)
+        score -= (std_fam * 100000)
+    elif tier == "deep":
+        score += deep_fam * 200000 + deep_kw * 30000
+        score -= (fast_fam * 250000 + fast_kw * 40000)
+    else:  # standard
+        score += std_fam * 200000 + std_kw * 30000
+        score -= (fast_fam * 150000)
+        score -= (deep_fam * 50000)
+        if not fast_fam and not deep_fam and not std_fam:
+            score += 15000
+    return score
+
+
+def rank_models_for_tier(models, tier: str = "standard") -> List[Tuple[int, str, str]]:
+    """
+    Rank any list of models (tuples, dicts, or strings) for a specific tier.
+    Returns sorted list of (score, slug, desc).
+    """
+    scored = []
+    for item in models:
+        if isinstance(item, tuple):
+            slug = item[0]
+            desc = item[1] if len(item) > 1 else ""
+        elif isinstance(item, dict):
+            slug = item.get("slug") or item.get("id") or item.get("model") or ""
+            desc = item.get("description") or item.get("name") or ""
+        else:
+            parts = str(item).split(None, 1)
+            slug = parts[0]
+            desc = parts[1] if len(parts) > 1 else ""
+        if not slug:
+            continue
+        s = score_model_for_tier(slug, desc, tier)
+        scored.append((s, slug, desc))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
 
 def discover_available_models() -> Dict[str, Any]:
     models = {
@@ -129,18 +226,19 @@ def discover_available_models() -> Dict[str, Any]:
                     pass
 
         if found:
-            models["codex"]["available"] = sorted(list(found), reverse=True)
+            models["codex"]["available"] = sorted(
+                list(found),
+                key=lambda x: (parse_semver(x.split()[0]), x),
+                reverse=True
+            )
             models["codex"]["source"] = "detected"
         if configured_model:
             models["codex"]["current_default"] = configured_model
             models["codex"]["default_source"] = "detected"
         elif found:
-            slugs = [f.split()[0] for f in found]
-            if "gpt-6.1-sol" in slugs:
-                models["codex"]["current_default"] = "gpt-6.1-sol"
-                models["codex"]["default_source"] = "detected"
-            elif "gpt-6-astra" in slugs:
-                models["codex"]["current_default"] = "gpt-6-astra"
+            ranked_std = rank_models_for_tier(list(found), "standard")
+            if ranked_std:
+                models["codex"]["current_default"] = ranked_std[0][1]
                 models["codex"]["default_source"] = "detected"
     except Exception:
         pass
@@ -164,10 +262,15 @@ def discover_available_models() -> Dict[str, Any]:
             if "models" in g_data and isinstance(g_data["models"], dict):
                 discovered = list(g_data["models"].keys())
                 if discovered:
-                    models["grok"]["available"] = discovered
+                    models["grok"]["available"] = sorted(
+                        discovered,
+                        key=lambda x: (parse_semver(x.split()[0]), x),
+                        reverse=True
+                    )
                     models["grok"]["source"] = "detected"
-                    if "grok-4.7" in discovered:
-                        models["grok"]["current_default"] = "grok-4.7"
+                    ranked_std = rank_models_for_tier(discovered, "standard")
+                    if ranked_std:
+                        models["grok"]["current_default"] = ranked_std[0][1]
                         models["grok"]["default_source"] = "detected"
     except Exception:
         pass
@@ -192,36 +295,35 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 if files:
                     cat_data = json.loads(files[0].read_text(encoding="utf-8"))
                     cfg_models = cat_data.get("catalog", {}).get("config", {}).get("models", [])
-                    top_flagship = None
-                    sonnet_model = None
-                    haiku_model = None
+                    claude_catalog = []
+                    efforts_map = {}
                     for m in cfg_models:
-                        notice = (m.get("notice", {}).get("text") or "").lower()
-                        desc = (m.get("description") or "").lower()
                         mid = m.get("id", "")
+                        if not mid:
+                            continue
+                        mname = m.get("name", "")
+                        mdesc = m.get("description", "")
+                        notice = (m.get("notice", {}).get("text") or "") if m.get("notice") else ""
                         efforts = [o.get("id") for o in m.get("thinking", {}).get("effort_options", [])]
-                        max_effort = efforts[-1] if efforts else "max"
-                        
-                        if not top_flagship and ("most capable" in notice or "toughest" in desc or "fable" in mid or "mythos" in mid):
-                            top_flagship = (mid, max_effort)
-                        elif not sonnet_model and ("sonnet" in mid or "efficient" in desc):
-                            sonnet_model = (mid, "medium")
-                        elif not haiku_model and ("haiku" in mid or "fastest" in desc):
-                            haiku_model = (mid, "low")
-                    
-                    if tier == "deep" and top_flagship:
-                        # Use alias "fable" if ID contains fable for maximum CLI compatibility
-                        alias = "fable" if "fable" in top_flagship[0] else top_flagship[0]
-                        return {"model": alias, "effort": top_flagship[1], "is_dynamic": True, "full_id": top_flagship[0]}
-                    elif tier == "standard" and sonnet_model:
-                        alias = "sonnet" if "sonnet" in sonnet_model[0] else sonnet_model[0]
-                        return {"model": alias, "effort": sonnet_model[1], "is_dynamic": True, "full_id": sonnet_model[0]}
-                    elif tier == "fast" and haiku_model:
-                        alias = "haiku" if "haiku" in haiku_model[0] else haiku_model[0]
-                        return {"model": alias, "effort": haiku_model[1], "is_dynamic": True, "full_id": haiku_model[0]}
+                        efforts_map[mid] = efforts
+                        claude_catalog.append((mid, f"{mname} {mdesc} {notice}"))
+
+                    if claude_catalog:
+                        ranked = rank_models_for_tier(claude_catalog, tier)
+                        if ranked:
+                            top_id = ranked[0][1]
+                            alias = "fable" if "fable" in top_id else ("haiku" if "haiku" in top_id else ("sonnet" if "sonnet" in top_id else top_id))
+                            efforts = efforts_map.get(top_id, [])
+                            if tier == "deep":
+                                effort = efforts[-1] if efforts else "max"
+                            elif tier == "fast":
+                                effort = "low"
+                            else:
+                                effort = "medium" if "medium" in efforts else ("high" if "high" in efforts else "medium")
+                            return {"model": alias, "effort": effort, "is_dynamic": True, "full_id": top_id}
         except Exception:
             pass
-            
+
         # Default fallback if catalog unavailable
         if tier == "deep":
             return {"model": "fable", "effort": "max", "is_dynamic": False, "full_id": "claude-fable-5-1"}
@@ -262,54 +364,45 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 except Exception:
                     pass
 
-        slugs = [s[0] for s in discovered_models]
+        effort = "max" if tier == "deep" else ("low" if tier == "fast" else "high")
 
-        if tier == "fast":
-            fast_candidates = [s for s in slugs if "luna" in s or "reserve" in s]
-            chosen = fast_candidates[0] if fast_candidates else (configured_default or "gpt-6-luna")
-            return {"model": chosen, "effort": "low", "is_dynamic": True}
+        # If user explicitly configured a model in config.toml and requested standard tier, honor it
+        if tier == "standard" and configured_default:
+            return {"model": configured_default, "effort": effort, "is_dynamic": True}
 
-        if tier == "deep":
-            deep_candidates = [s for s in slugs if "6.1" in s or "astra" in s]
-            chosen = deep_candidates[0] if deep_candidates else (configured_default or "gpt-6-astra")
-            return {"model": chosen, "effort": "max", "is_dynamic": True}
+        if discovered_models:
+            ranked = rank_models_for_tier(discovered_models, tier)
+            if ranked:
+                return {"model": ranked[0][1], "effort": effort, "is_dynamic": True}
 
-        # standard tier
-        if configured_default and (not slugs or configured_default in slugs):
-            chosen = configured_default
-        elif "gpt-6.1-sol" in slugs:
-            chosen = "gpt-6.1-sol"
-        elif "gpt-6-astra" in slugs:
-            chosen = "gpt-6-astra"
-        else:
-            chosen = slugs[0] if slugs else "gpt-6-astra"
-
-        return {"model": chosen, "effort": "high", "is_dynamic": True}
+        fallback_models = {
+            "fast": "gpt-6-luna",
+            "deep": "gpt-6-astra",
+            "standard": configured_default or "gpt-6.1-sol"
+        }
+        return {"model": fallback_models.get(tier, "gpt-6.1-sol"), "effort": effort, "is_dynamic": False}
 
     elif provider == "grok":
-        model_name = "grok-4.7"
+        discovered_grok = []
         try:
             grok_cache = Path.home() / ".grok" / "models_cache.json"
             if grok_cache.exists():
                 g_data = json.loads(grok_cache.read_text(encoding="utf-8"))
                 models_dict = g_data.get("models", {})
-                if "grok-4.7" in models_dict:
-                    model_name = "grok-4.7"
-                elif models_dict:
-                    model_name = list(models_dict.keys())[0]
+                for k, v in models_dict.items():
+                    desc = v.get("description", "") if isinstance(v, dict) else ""
+                    discovered_grok.append((k, desc))
         except Exception:
             pass
-        if tier == "fast":
-            effort = "low"
-            # Use fast variant if requested
-            model_target = "grok-4.7-build-fast" if "grok-4.7" in model_name else model_name
-        elif tier == "deep":
-            effort = "high"
-            model_target = model_name
-        else:
-            effort = "medium"
-            model_target = model_name
-        return {"model": model_target, "effort": effort, "is_dynamic": True}
+
+        effort = "high" if tier == "deep" else ("low" if tier == "fast" else "medium")
+        if discovered_grok:
+            ranked = rank_models_for_tier(discovered_grok, tier)
+            if ranked:
+                return {"model": ranked[0][1], "effort": effort, "is_dynamic": True}
+
+        fallback = "grok-4.7-build-fast" if tier == "fast" else "grok-4.7"
+        return {"model": fallback, "effort": effort, "is_dynamic": False}
 
     elif provider == "muse":
         model_name = "muse-spark-1.3-contributor"

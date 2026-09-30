@@ -539,6 +539,79 @@ class TestCatalogDrivenTierResolutionAndSandboxWhitelist(unittest.TestCase):
             self.assertIn("单元测试未通过", msg)
 
 
+class TestGenericModelSemVerDiscovery(unittest.TestCase):
+    """
+    Validates zero-code-change semantic version parsing and tier capability ranking:
+    Future models (e.g. gpt-6.5, gpt-7, claude-6, grok-5) are automatically
+    discovered, classified, and ranked without any hardcoded model strings.
+    """
+
+    def test_parse_semver_multi_format_resilience(self):
+        from makewand.discovery import parse_semver
+        self.assertEqual(parse_semver("gpt-6.1-sol"), (6, 1, 0))
+        self.assertEqual(parse_semver("gpt-6-astra"), (6, 0, 0))
+        self.assertEqual(parse_semver("gpt-6.5-sol"), (6, 5, 0))
+        self.assertEqual(parse_semver("gpt-7-astra"), (7, 0, 0))
+        self.assertEqual(parse_semver("claude-opus-5-5"), (5, 5, 0))
+        self.assertEqual(parse_semver("claude-fable-5-1[1m]"), (5, 1, 0))
+        self.assertEqual(parse_semver("claude-haiku-4-5-20251001"), (4, 5, 0))
+        self.assertEqual(parse_semver("grok-4.7"), (4, 7, 0))
+        self.assertEqual(parse_semver("grok-5.0-build-fast"), (5, 0, 0))
+        self.assertEqual(parse_semver("gemini-3.8-pro"), (3, 8, 0))
+
+    def test_rank_models_for_tier_current_and_future_simulation(self):
+        from makewand.discovery import rank_models_for_tier
+
+        # Simulated next-generation OpenAI models
+        simulated_future_models = [
+            ("gpt-6.5-sol", "Latest workhorse model for coding and everyday work."),
+            ("gpt-7-astra", "Frontier intelligence for the most demanding work."),
+            ("gpt-6.5-luna", "Fast and affordable model for easier tasks."),
+            ("gpt-6.1-sol", "Previous generation workhorse model."),
+            ("gpt-6-astra", "Previous generation frontier model."),
+            ("gpt-6-luna", "Previous fast model.")
+        ]
+
+        # Fast tier picks latest fast model
+        fast_ranked = rank_models_for_tier(simulated_future_models, "fast")
+        self.assertEqual(fast_ranked[0][1], "gpt-6.5-luna")
+
+        # Standard tier picks latest workhorse model
+        std_ranked = rank_models_for_tier(simulated_future_models, "standard")
+        self.assertEqual(std_ranked[0][1], "gpt-6.5-sol")
+
+        # Deep tier picks latest frontier reasoning model
+        deep_ranked = rank_models_for_tier(simulated_future_models, "deep")
+        self.assertEqual(deep_ranked[0][1], "gpt-7-astra")
+
+    def test_get_provider_model_tier_adapts_to_future_cache_without_code_changes(self):
+        from makewand.discovery import get_provider_model_tier
+        with tempfile.TemporaryDirectory() as tmp_codex:
+            fake_base = Path(tmp_codex)
+            future_cache = {
+                "models": [
+                    {"slug": "gpt-6.5-sol", "description": "Latest workhorse model for coding and everyday work."},
+                    {"slug": "gpt-7-astra", "description": "Frontier intelligence for the most demanding work."},
+                    {"slug": "gpt-6.5-luna", "description": "Fast and affordable model for easier tasks."}
+                ]
+            }
+            (fake_base / "models_cache.json").write_text(json.dumps(future_cache), encoding="utf-8")
+
+            with patch.dict(os.environ, {"CODEX_HOME": str(fake_base)}):
+                # Ensure no other base dirs interfere
+                with patch("pathlib.Path.home", return_value=fake_base):
+                    fast_res = get_provider_model_tier("codex", "fast")
+                    self.assertEqual(fast_res["model"], "gpt-6.5-luna")
+                    self.assertEqual(fast_res["effort"], "low")
+
+                    std_res = get_provider_model_tier("codex", "standard")
+                    self.assertEqual(std_res["model"], "gpt-6.5-sol")
+
+                    deep_res = get_provider_model_tier("codex", "deep")
+                    self.assertEqual(deep_res["model"], "gpt-7-astra")
+                    self.assertEqual(deep_res["effort"], "max")
+
+
 if __name__ == "__main__":
     unittest.main()
 
