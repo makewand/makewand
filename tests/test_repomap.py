@@ -311,12 +311,24 @@ int calculateChecksum(const char* buffer, size_t length_of_data) {
             f_path.unlink()
 
     def test_repomap_on_makewand_codebase(self):
-        repo_map = generate_repo_map(str(Path(__file__).resolve().parent.parent), max_lines=60)
+        root = str(Path(__file__).resolve().parent.parent)
+        line_budget, max_files = 60, 40
+        repo_map = generate_repo_map(root, max_lines=line_budget, max_files=max_files)
+        lines = repo_map.splitlines()
+        self.assertTrue(lines)
+        self.assertLessEqual(len(lines), line_budget + 1)
+
+        # New tracked modules change PageRank, so a small prompt budget need not
+        # include these specific files. Preserve their coverage assertion in the
+        # full selected map (a header plus at most eight symbols per file).
+        full_map = generate_repo_map(root, max_lines=max_files * 9 + 1, max_files=max_files)
         self.assertTrue(
-            "makewand/orchestrator.py:" in repo_map
-            or "makewand/candidate.py:" in repo_map
-            or "makewand/cli.py:" in repo_map
+            "makewand/orchestrator.py:" in full_map
+            or "makewand/candidate.py:" in full_map
+            or "makewand/cli.py:" in full_map
         )
+        self.assertEqual(lines[-1], "  ... (more symbols truncated)")
+        self.assertEqual(lines[:-1], full_map.splitlines()[:line_budget])
 
 
     def test_compute_symbol_pagerank_promotes_central_files(self):

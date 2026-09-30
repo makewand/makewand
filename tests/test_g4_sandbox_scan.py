@@ -91,7 +91,29 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
             deep = base / "a" / "b" / "c"
             deep.mkdir(parents=True)
             (deep / ".git").mkdir()  # depth 5 below /tmp
-            with home_outside_tmp():
+            real_scandir = os.scandir
+
+            class FixtureRootEntries:
+                def __init__(self, entries):
+                    self.entries = entries
+
+                def __enter__(self):
+                    self.entries.__enter__()
+                    return self
+
+                def __exit__(self, *error):
+                    return self.entries.__exit__(*error)
+
+                def __iter__(self):
+                    return (entry for entry in self.entries if entry.name == base.name)
+
+            def fixture_scandir(path):
+                # Keep the real /tmp broad-workspace branch and real child
+                # entries, but don't spend its entry budget on other sessions.
+                entries = real_scandir(path)
+                return FixtureRootEntries(entries) if os.fspath(path) == "/tmp" else entries
+
+            with home_outside_tmp(), patch("makewand.sandbox.os.scandir", side_effect=fixture_scandir):
                 t0 = time.monotonic()
                 cmd = wrap_bwrap(["true"], workspace="/tmp")
                 elapsed = time.monotonic() - t0
