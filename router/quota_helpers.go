@@ -84,12 +84,6 @@ func recentJSONLFromDirs(dirs []string, limit int) ([]string, error) {
 	return out, nil
 }
 
-// recentJSONL returns up to `limit` .jsonl files under dir (recursively), newest
-// mtime first.
-func recentJSONL(dir string, limit int) ([]string, error) {
-	return recentJSONLFromDirs([]string{dir}, limit)
-}
-
 // parseTime parses an RFC3339 timestamp, returning the zero time on failure.
 func parseTime(s string) time.Time {
 	if s == "" {
