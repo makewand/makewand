@@ -63,10 +63,17 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
                 "desc": quota.get("desc"),
             },
         }
+    import shutil
     return {
         "engine": "python",
         "version": __version__,
         "api_policy": get_api_policy(),
+        "privacy_attestation": {
+            "sandbox_available": bool(shutil.which("bwrap")),
+            "local_only_supported": True,
+            "offline_flags": ["--local-only", "--offline", "--provider local"],
+            "repo_trust_levels": ["trusted", "untrusted"],
+        },
         "quota_semantics": ("Python 入口的额度数值除 source=official (CLI 输出中的官方百分比) 外，均来自本地调用计数估算"
                             "或健康状态推定，不是官方 5 小时/每周剩余额度；官方额度读取仅在 Go 组件 'makewand-server quota' 中实现"),
         "stale_after_seconds": STATUS_STALE_SECONDS,
@@ -470,7 +477,7 @@ def cmd_plan(args):
     import json
     from makewand.orchestrator import decompose_task_to_dag, execute_task_dag
     cwd = getattr(args, "cwd", None) or os.getcwd()
-    prompt = args.prompt
+    prompt = getattr(args, "prompt", None) or _resolve_cli_prompt(args, required=True)
     tier = getattr(args, "tier", "deep")
     repo_trust = getattr(args, "repo_trust", "trusted")
 
@@ -773,7 +780,65 @@ def delegate_to_go_server(args_list: List[str]):
     print("   (开发者可设置 MAKEWAND_DEV=1 让 makewand 自动从源码构建)", file=sys.stderr)
     sys.exit(1)
 
+
+def _resolve_cli_prompt(args, original_cwd: Optional[str] = None, required: bool = True) -> str:
+    """
+    Resolves the task prompt from positional argument, file flag (-f/-F/--file/--prompt-file),
+    or non-TTY stdin pipe (e.g. `cat task.txt | makewand`).
+    """
+    prompt = getattr(args, "prompt", None)
+    if prompt and isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+    if prompt and isinstance(prompt, list):
+        prompt_str = " ".join(str(p) for p in prompt).strip()
+        if prompt_str:
+            return prompt_str
+
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file:
+        target_path = Path(prompt_file).expanduser()
+        resolved_path = None
+        if target_path.is_file():
+            resolved_path = target_path
+        elif not target_path.is_absolute():
+            if getattr(args, "cwd", None):
+                p_cwd = Path(args.cwd) / target_path
+                if p_cwd.is_file():
+                    resolved_path = p_cwd
+            if not resolved_path and original_cwd:
+                p_orig = Path(original_cwd) / target_path
+                if p_orig.is_file():
+                    resolved_path = p_orig
+
+        if not resolved_path:
+            print(c(f"❌ 提示词文件不存在: {prompt_file}", COLOR_RED), file=sys.stderr)
+            sys.exit(EXIT_USAGE_ERROR)
+        try:
+            content = resolved_path.read_text(encoding="utf-8").strip()
+            if not content:
+                print(c(f"❌ 提示词文件内容为空: {resolved_path}", COLOR_RED), file=sys.stderr)
+                sys.exit(EXIT_USAGE_ERROR)
+            return content
+        except Exception as e:
+            print(c(f"❌ 读取提示词文件失败: {e}", COLOR_RED), file=sys.stderr)
+            sys.exit(EXIT_USAGE_ERROR)
+
+    if not sys.stdin.isatty():
+        try:
+            content = sys.stdin.read().strip()
+            if content:
+                return content
+        except Exception:
+            pass
+
+    if required:
+        print(c("❌ 缺少任务提示词。可直接传入参数、使用 -f/--prompt-file 指定文件，或通过管道标准输入传入。", COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_USAGE_ERROR)
+    return ""
+
+
 def main():
+    original_cwd = os.getcwd()
     GO_SUBCOMMANDS = {
         "serve", "chat", "new", "preview", "doctor", "setup", "token", "audit", "usage", "user", "state"
     }
@@ -781,9 +846,13 @@ def main():
         delegate_to_go_server(sys.argv[1:])
 
     common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument("-C", "--cwd", dest="cwd", default=None, help="Target working directory (default: current directory)")
+    common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=None, help="Read task prompt from file")
     common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default="trusted", help="Repository trust level: trusted or untrusted")
 
     sub_common_parser = argparse.ArgumentParser(add_help=False)
+    sub_common_parser.add_argument("-C", "--cwd", dest="cwd", default=argparse.SUPPRESS, help="Target working directory (default: current directory)")
+    sub_common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=argparse.SUPPRESS, help="Read task prompt from file")
     sub_common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default=argparse.SUPPRESS, help="Repository trust level: trusted or untrusted")
 
     parser = argparse.ArgumentParser(
@@ -812,8 +881,7 @@ def main():
 
     # run
     p_run = subparsers.add_parser("run", help="Run auto-adaptive multi-model pipeline with auto-fix loop", parents=[sub_common_parser])
-    p_run.add_argument("prompt", help="The task prompt to execute")
-    p_run.add_argument("--cwd", help="Target working directory")
+    p_run.add_argument("prompt", nargs="?", default=None, help="The task prompt to execute")
     p_run.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="auto", help="Execution tier: fast, standard (balanced), deep (power)")
     p_run.add_argument("--mode", dest="tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], help="Alias for --tier: fast, balanced, power")
     p_run.add_argument("--model", help="Explicit model override")
@@ -823,10 +891,10 @@ def main():
     p_run.add_argument("--boost", action="store_true", default=False, help="Force boost/overclock mode: bypass soft burn rate penalty and allocate highest reasoning power")
     p_run.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: use local self-hosted models for both coding and review")
     p_run.add_argument("--provider", dest="provider", default=None, help="Explicit primary provider override (e.g. deepseek, qwen, local, claude, codex, agy, grok, muse)")
+    p_run.add_argument("--timeout", type=int, default=300, help="Pipeline execution timeout in seconds (default: 300)")
 
     # review
     p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity", parents=[sub_common_parser])
-    p_rev.add_argument("--cwd", help="Target working directory")
     p_rev.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_rev.add_argument("--stream", action="store_true", default=False, help="Stream review output line-by-line")
     p_rev.add_argument("--timeout", type=int, default=300)
@@ -834,28 +902,24 @@ def main():
 
     # race
     p_race = subparsers.add_parser("race", help="Run prompt on two models in parallel worktrees and compare", parents=[sub_common_parser])
-    p_race.add_argument("prompt", help="Prompt for race comparison")
-    p_race.add_argument("--cwd", help="Target working directory")
+    p_race.add_argument("prompt", nargs="?", default=None, help="Prompt for race comparison")
     p_race.add_argument("--timeout", type=int, default=300)
 
     # search (budgeted search guardrail)
     p_search = subparsers.add_parser("search", help="Budgeted fast search excluding cold archives and databases", parents=[sub_common_parser])
     p_search.add_argument("pattern", help="Regex or text pattern to search for")
-    p_search.add_argument("--cwd", help="Root directory to search (default: current directory)")
     p_search.add_argument("--max-results", type=int, default=150, help="Maximum matches to return (default: 150)")
     p_search.add_argument("--max-depth", type=int, default=6, help="Maximum directory depth (default: 6)")
 
     # repomap (codebase architecture symbol map)
     p_repomap = subparsers.add_parser("repomap", help="Generate concise repository symbol map (AST/regex extracted)", parents=[sub_common_parser])
-    p_repomap.add_argument("--cwd", help="Root directory to map (default: current directory)")
     p_repomap.add_argument("--max-lines", type=int, default=80, help="Max lines of repo map output (default: 80)")
     p_repomap.add_argument("--max-files", type=int, default=40, help="Max files to include in repo map (default: 40)")
     p_repomap.add_argument("--json", action="store_true", help="Output repo map in JSON format")
 
     # plan (multi-agent DAG task decomposition pipeline, inspired by OmO Ultrawork)
     p_plan = subparsers.add_parser("plan", help="Decompose complex goals into DAG tasks and execute topologically", parents=[sub_common_parser])
-    p_plan.add_argument("prompt", help="High-level engineering goal to decompose")
-    p_plan.add_argument("--cwd", help="Target working directory")
+    p_plan.add_argument("prompt", nargs="?", default=None, help="High-level engineering goal to decompose")
     p_plan.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="deep")
     p_plan.add_argument("--execute", action="store_true", default=False, help="Execute decomposed DAG tasks topologically with verification gates")
     p_plan.add_argument("--json", action="store_true", default=False, help="Output plan in JSON format")
@@ -869,26 +933,22 @@ def main():
     p_aci.add_argument("action", choices=["view", "search", "grep"], help="ACI action to perform")
     p_aci.add_argument("target", help="Filepath for view, or search term for search/grep")
     p_aci.add_argument("line", nargs="?", type=int, default=1, help="Line number for view window (default: 1)")
-    p_aci.add_argument("--cwd", help="Working directory")
 
     # mcp (Model Context Protocol client integration, inspired by Claude Code)
     p_mcp = subparsers.add_parser("mcp", help="Model Context Protocol (MCP) server integration", parents=[sub_common_parser])
     p_mcp.add_argument("action", choices=["list", "call"], help="MCP action: list tools, or call a tool")
     p_mcp.add_argument("--tool", help="Tool name for call action")
     p_mcp.add_argument("--args", help="JSON string arguments for tool call")
-    p_mcp.add_argument("--cwd", help="Working directory")
     p_mcp.add_argument("server_cmd", nargs="+", help="Command to launch MCP server (e.g. npx -y @modelcontextprotocol/server-...)")
 
     # sandbox (bubblewrap process isolation)
     p_sb = subparsers.add_parser("sandbox", help="Run shell command inside bubblewrap process sandbox", parents=[sub_common_parser])
-    p_sb.add_argument("--cwd", help="Target working directory (default: current directory)")
     p_sb.add_argument("--no-net", dest="allow_net", action="store_false", default=True, help="Block network inside sandbox")
     p_sb.add_argument("--timeout", type=int, default=120, help="Execution timeout in seconds")
     p_sb.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to execute inside sandbox")
 
     p_claude = subparsers.add_parser("claude", help="Run prompt directly with Claude Code subscription", parents=[sub_common_parser])
-    p_claude.add_argument("prompt", help="Prompt for Claude")
-    p_claude.add_argument("--cwd", help="Working directory")
+    p_claude.add_argument("prompt", nargs="?", default=None, help="Prompt for Claude")
     p_claude.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_claude.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_claude.add_argument("--model", help="Specific model name")
@@ -897,8 +957,7 @@ def main():
     p_claude.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_codex = subparsers.add_parser("codex", help="Run prompt directly with Codex CLI subscription", parents=[sub_common_parser])
-    p_codex.add_argument("prompt", help="Prompt for Codex")
-    p_codex.add_argument("--cwd", help="Working directory")
+    p_codex.add_argument("prompt", nargs="?", default=None, help="Prompt for Codex")
     p_codex.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_codex.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_codex.add_argument("--model", help="Specific model name")
@@ -907,8 +966,7 @@ def main():
     p_codex.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_agy = subparsers.add_parser("agy", help="Run prompt directly with Antigravity CLI subscription", parents=[sub_common_parser])
-    p_agy.add_argument("prompt", help="Prompt for Antigravity")
-    p_agy.add_argument("--cwd", help="Working directory")
+    p_agy.add_argument("prompt", nargs="?", default=None, help="Prompt for Antigravity")
     p_agy.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_agy.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_agy.add_argument("--model", help="Specific model name")
@@ -917,8 +975,7 @@ def main():
     p_agy.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_muse = subparsers.add_parser("muse", help="Run prompt directly with Muse Code subscription", parents=[sub_common_parser])
-    p_muse.add_argument("prompt", help="Prompt for Muse Code")
-    p_muse.add_argument("--cwd", help="Working directory")
+    p_muse.add_argument("prompt", nargs="?", default=None, help="Prompt for Muse Code")
     p_muse.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_muse.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_muse.add_argument("--model", help="Specific model name")
@@ -927,8 +984,7 @@ def main():
     p_muse.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_grok = subparsers.add_parser("grok", help="Run prompt directly with Grok Build CLI (xAI subscription)", parents=[sub_common_parser])
-    p_grok.add_argument("prompt", help="Prompt for Grok")
-    p_grok.add_argument("--cwd", help="Working directory")
+    p_grok.add_argument("prompt", nargs="?", default=None, help="Prompt for Grok")
     p_grok.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_grok.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_grok.add_argument("--model", help="Specific model name")
@@ -937,8 +993,7 @@ def main():
     p_grok.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_local = subparsers.add_parser("local", help="Run prompt directly with local self-hosted model (Ollama / vLLM, 0 token cost)", parents=[sub_common_parser])
-    p_local.add_argument("prompt", help="Prompt for local model")
-    p_local.add_argument("--cwd", help="Working directory")
+    p_local.add_argument("prompt", nargs="?", default=None, help="Prompt for local model")
     p_local.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_local.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_local.add_argument("--model", help="Specific model name (e.g. gemma4:31b, llama3.2)")
@@ -984,8 +1039,7 @@ def main():
                            help="For local: also run 'sudo -n systemctl stop ollama' (never done implicitly)")
 
     p_aider = subparsers.add_parser("aider", help="Run prompt directly with Aider CLI pair programmer", parents=[sub_common_parser])
-    p_aider.add_argument("prompt", help="Prompt for Aider")
-    p_aider.add_argument("--cwd", help="Working directory")
+    p_aider.add_argument("prompt", nargs="?", default=None, help="Prompt for Aider")
     p_aider.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_aider.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_aider.add_argument("--model", help="Specific model name")
@@ -994,8 +1048,7 @@ def main():
     p_aider.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_deepseek = subparsers.add_parser("deepseek", help="Run prompt directly with DeepSeek API", parents=[sub_common_parser])
-    p_deepseek.add_argument("prompt", help="Prompt for DeepSeek")
-    p_deepseek.add_argument("--cwd", help="Working directory")
+    p_deepseek.add_argument("prompt", nargs="?", default=None, help="Prompt for DeepSeek")
     p_deepseek.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_deepseek.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_deepseek.add_argument("--model", help="Specific model name (e.g. deepseek-chat, deepseek-reasoner)")
@@ -1004,8 +1057,7 @@ def main():
     p_deepseek.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_qwen = subparsers.add_parser("qwen", help="Run prompt directly with Aliyun Qwen API", parents=[sub_common_parser])
-    p_qwen.add_argument("prompt", help="Prompt for Qwen")
-    p_qwen.add_argument("--cwd", help="Working directory")
+    p_qwen.add_argument("prompt", nargs="?", default=None, help="Prompt for Qwen")
     p_qwen.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
     p_qwen.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_qwen.add_argument("--model", help="Specific model name (e.g. qwen2.5-coder-32b-instruct, qwen-max)")
@@ -1016,8 +1068,7 @@ def main():
     for api_provider, label in (("glm", "Zhipu GLM API"), ("kimi", "Moonshot Kimi API"),
                                 ("openrouter", "OpenRouter API"), ("siliconflow", "SiliconFlow API")):
         p_api = subparsers.add_parser(api_provider, help=f"Run prompt directly with {label} (text only; does not edit files)", parents=[sub_common_parser])
-        p_api.add_argument("prompt", help=f"Prompt for {label}")
-        p_api.add_argument("--cwd", help="Working directory")
+        p_api.add_argument("prompt", nargs="?", default=None, help=f"Prompt for {label}")
         p_api.add_argument("--tier", choices=["fast", "standard", "deep", "balanced", "power"], default="standard")
         p_api.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
         p_api.add_argument("--model", help="Specific model name")
@@ -1036,21 +1087,25 @@ def main():
         "observe", "candidates", "inspect", "apply", "discard",
         "enable", "disable", "repomap", "plan", "aci", "mcp"
     }
-    # If user invokes `makewand "do something"` or `makewand --repo-trust untrusted "do something"`, automatically route to `makewand run ...`
+    # Auto-route to `makewand run ...` if user invokes `makewand "prompt"`, `makewand -C /dir -f task.txt`, or pipes stdin
     is_auto_routed_run = False
-    has_subcmd = any(arg in known_subcommands for arg in sys.argv[1:])
-    if not has_subcmd and len(sys.argv) > 1:
-        idx = 1
-        while idx < len(sys.argv):
-            arg = sys.argv[idx]
-            if arg in ("--repo-trust", "-t"):
-                idx += 2
-            elif arg.startswith("-"):
-                idx += 1
-            else:
-                sys.argv.insert(idx, "run")
-                is_auto_routed_run = True
-                break
+    try:
+        common_opts, remaining = common_parser.parse_known_args(sys.argv[1:])
+    except Exception:
+        common_opts, remaining = None, []
+
+    first_remaining = remaining[0] if remaining else None
+    has_subcmd = first_remaining in known_subcommands
+    is_help_or_version = any(arg in ("-h", "--help", "-v", "--version") for arg in sys.argv[1:])
+
+    if not has_subcmd and not is_help_or_version:
+        has_prompt_arg = bool(remaining)
+        has_file_flag = bool(getattr(common_opts, "prompt_file", None))
+        has_piped_stdin = not sys.stdin.isatty()
+
+        if has_prompt_arg or has_file_flag or has_piped_stdin:
+            sys.argv.insert(1, "run")
+            is_auto_routed_run = True
 
     args = parser.parse_args()
     if hasattr(args, "tier") and args.tier:
@@ -1064,13 +1119,29 @@ def main():
         from makewand.observer import mark_process_as_dispatcher
         mark_process_as_dispatcher()
 
+    # Handle directory redirection (-C / --cwd) across all commands
+    if hasattr(args, "cwd") and args.cwd:
+        args.cwd = os.path.abspath(args.cwd)
+        try:
+            os.chdir(args.cwd)
+        except OSError as e:
+            print(c(f"❌ 无法切换工作目录到 {args.cwd}: {e}", COLOR_RED), file=sys.stderr)
+            sys.exit(EXIT_USAGE_ERROR)
+    elif not getattr(args, "cwd", None):
+        args.cwd = os.getcwd()
+
     if not args.subcommand:
         from makewand.interactive import start_interactive_session
         start_interactive_session(repo_trust=getattr(args, "repo_trust", "trusted"))
         sys.exit(0)
 
-    if hasattr(args, "cwd"):
-        args.cwd = os.path.abspath(args.cwd) if args.cwd else os.getcwd()
+    # Subcommands that consume prompt text (from argument, -f file, or stdin pipe)
+    prompt_subcommands = {
+        "run", "race", "plan", "claude", "codex", "agy", "muse", "grok",
+        "local", "aider", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"
+    }
+    if args.subcommand in prompt_subcommands:
+        args.prompt = _resolve_cli_prompt(args, original_cwd=original_cwd, required=True)
 
     if args.subcommand == "models":
         cmd_models(args)
@@ -1094,7 +1165,7 @@ def main():
             stream=args.stream,
             auto_fix=args.auto_fix,
             max_fix=getattr(args, "max_fix", 2),
-            timeout=args.timeout,
+            timeout=getattr(args, "timeout", 300),
             force_code=force_code,
             repo_trust=repo_trust,
             boost=getattr(args, "boost", False),

@@ -241,6 +241,14 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                 info["resets_at"] = None
                 info.pop("ttl_seconds", None)
                 info["updated_at"] = now_dt.isoformat()
+        # Circuit breaker: protect provider from auto-exhaustion when official quota < 8%
+        if isinstance(info, dict) and info.get("status") in ("healthy", "warning", "unknown") and model_name in ("codex", "claude"):
+            off_q = _get_official_subscription_quota(model_name)
+            if off_q and off_q.get("status") == "limited":
+                info["status"] = "limited"
+                info["reason"] = f"保护阈值拦截 (剩余 {off_q.get('percentage')}% < 8%): {off_q.get('desc')}"
+                info["resets_at"] = off_q.get("resets_at")
+                info["updated_at"] = now_dt.isoformat()
         if isinstance(info, dict):
             age = status_age_seconds(info)
             info["stale"] = bool(
@@ -686,7 +694,7 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                         r_str = f" · 重置时间: {r_at[:16]}" if r_at and not str(r_at).startswith("0001") else ""
                         return {
                             "percentage": pct,
-                            "status": "healthy" if pct >= 25 else ("warning" if pct > 0 else "limited"),
+                            "status": "healthy" if pct >= 25 else ("warning" if pct >= 8 else "limited"),
                             "desc": f"官方报告剩余额度: {pct}% (已用 {int(worst_used)}%){scoped_msg}{r_str}",
                             "resets_at": r_at if r_at and not str(r_at).startswith("0001") else None,
                             "is_unlimited": False,
@@ -725,7 +733,7 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                                     r_str = f" · 重置时间: {r_fmt}" if reset_ts else ""
                                     return {
                                         "percentage": pct,
-                                        "status": "healthy" if pct >= 25 else ("warning" if pct > 0 else "limited"),
+                                        "status": "healthy" if pct >= 25 else ("warning" if pct >= 8 else "limited"),
                                         "desc": f"官方报告每周剩余额度: {pct}% (已用 {int(used)}%){r_str}",
                                         "resets_at": str(reset_ts) if reset_ts else None,
                                         "is_unlimited": False,
@@ -814,7 +822,7 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
         pct = int(pct_match.group(1))
         res = {
             "percentage": max(0, min(100, pct)),
-            "status": "healthy" if pct > 20 else ("warning" if pct > 0 else "limited"),
+            "status": "healthy" if pct > 20 else ("warning" if pct >= 8 else "limited"),
             "desc": f"官方报告剩余额度: {pct}%",
             "resets_at": resets_at,
             "is_unlimited": False,

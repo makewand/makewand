@@ -612,6 +612,151 @@ class TestGenericModelSemVerDiscovery(unittest.TestCase):
                     self.assertEqual(deep_res["effort"], "max")
 
 
+class TestCliOptimizationsAndCircuitBreaker(unittest.TestCase):
+    """
+    Validates CLI ergonomics (-C cwd redirection, -f/--prompt-file, non-TTY stdin piping)
+    and the low-quota circuit breaker (<= 8% quota protection for external subscriptions).
+    """
+
+    def test_resolve_cli_prompt_from_positional_string(self):
+        from makewand.cli import _resolve_cli_prompt
+        import argparse
+        args = argparse.Namespace(prompt="hello world", prompt_file=None)
+        res = _resolve_cli_prompt(args)
+        self.assertEqual(res, "hello world")
+
+    def test_resolve_cli_prompt_from_file_flag(self):
+        from makewand.cli import _resolve_cli_prompt
+        import argparse
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            tf.write("prompt from task file\n")
+            tf_name = tf.name
+        try:
+            args = argparse.Namespace(prompt=None, prompt_file=tf_name)
+            res = _resolve_cli_prompt(args)
+            self.assertEqual(res, "prompt from task file")
+        finally:
+            os.remove(tf_name)
+
+    def test_resolve_cli_prompt_from_piped_stdin(self):
+        from makewand.cli import _resolve_cli_prompt
+        import argparse
+        import io
+        args = argparse.Namespace(prompt=None, prompt_file=None)
+        with patch("sys.stdin", io.StringIO("prompt from piped stdin\n")):
+            with patch("sys.stdin.isatty", return_value=False):
+                res = _resolve_cli_prompt(args)
+                self.assertEqual(res, "prompt from piped stdin")
+
+    def test_resolve_cli_prompt_missing_raises_exit(self):
+        from makewand.cli import _resolve_cli_prompt
+        import argparse
+        args = argparse.Namespace(prompt=None, prompt_file=None)
+        with patch("sys.stdin.isatty", return_value=True):
+            with self.assertRaises(SystemExit):
+                _resolve_cli_prompt(args, required=True)
+
+    def test_low_quota_circuit_breaker_threshold(self):
+        from makewand.health import _get_official_subscription_quota
+        # Simulate snapshot cache with 6% quota remaining (94% used)
+        snapshot_data = {
+            "providers": [
+                {
+                    "Provider": "codex",
+                    "HasData": True,
+                    "WeeklyPct": 94,
+                    "ResetAt": "2026-10-04T10:40:00"
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            json.dump(snapshot_data, tf)
+            tf_path = tf.name
+
+        try:
+            with patch("os.path.expanduser", return_value=tf_path):
+                q = _get_official_subscription_quota("codex")
+                self.assertIsNotNone(q)
+                self.assertEqual(q["percentage"], 6)
+                self.assertEqual(q["status"], "limited")  # <= 8% is limited
+        finally:
+            os.remove(tf_path)
+
+    def test_safe_quota_above_circuit_breaker(self):
+        from makewand.health import _get_official_subscription_quota
+        snapshot_data = {
+            "providers": [
+                {
+                    "Provider": "claude",
+                    "HasData": True,
+                    "WeeklyPct": 85,
+                    "ResetAt": "2026-10-04T11:59:00"
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            json.dump(snapshot_data, tf)
+            tf_path = tf.name
+
+        try:
+            with patch("os.path.expanduser", return_value=tf_path):
+                q = _get_official_subscription_quota("claude")
+                self.assertIsNotNone(q)
+                self.assertEqual(q["percentage"], 15)
+                self.assertEqual(q["status"], "warning")  # > 8% but < 25% is warning
+        finally:
+            os.remove(tf_path)
+
+    def test_status_json_contains_privacy_attestation(self):
+        from makewand.cli import build_status_json
+        cache = {
+            "codex": {"status": "limited", "updated_at": "2026-09-30T09:00:00"},
+            "local": {"status": "healthy", "updated_at": "2026-09-30T09:00:00"}
+        }
+        st = build_status_json(cache)
+        self.assertIn("privacy_attestation", st)
+        pa = st["privacy_attestation"]
+        self.assertTrue(pa["local_only_supported"])
+        self.assertIn("--local-only", pa["offline_flags"])
+        self.assertIn("trusted", pa["repo_trust_levels"])
+
+    def test_cli_parser_routing_with_cwd_and_file(self):
+        import subprocess
+        # Test CLI auto-routing to run with -C and -f
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            tf.write("echo test task\n")
+            tf_path = tf.name
+
+        try:
+            cmd = [
+                sys.executable, "-c",
+                f"import sys, os; from makewand.cli import main; sys.argv = ['makewand', '-C', '/tmp', '-f', '{tf_path}', '--help']; main()"
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("usage: makewand", res.stdout)
+        finally:
+            os.remove(tf_path)
+
+    def test_cli_subcommand_inherits_cwd_and_file(self):
+        import subprocess
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            tf.write("echo task for codex\n")
+            tf_path = tf.name
+
+        try:
+            cmd = [
+                sys.executable, "-c",
+                f"import sys, os; from makewand.cli import main; sys.argv = ['makewand', 'codex', '-C', '/tmp', '-f', '{tf_path}', '--help']; main()"
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("usage: makewand codex", res.stdout)
+        finally:
+            os.remove(tf_path)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
