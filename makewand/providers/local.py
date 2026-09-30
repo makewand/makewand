@@ -147,6 +147,7 @@ def execute_local_task(
     Callers that need file changes must verify the diff (run_pipeline/run_race do).
     """
     from makewand.providers.api_client import call_api_chat
+    from makewand.workflow import provider_outcome
     from makewand.config import COLOR_YELLOW, is_provider_enabled
 
     if not is_provider_enabled("local"):
@@ -184,7 +185,7 @@ def execute_local_task(
     print(c(f"[Makewand -> Local AI] 派发免费本地任务 (模型: {active_model}, 零Token成本)...", COLOR_GREEN), file=sys.stderr)
 
     try:
-        ok, out, err = call_api_chat(
+        result = call_api_chat(
             provider="local",
             prompt=prompt,
             model=active_model,
@@ -197,9 +198,6 @@ def execute_local_task(
             extra_params=extra_params
         )
 
-        if ok:
-            return True, out, None
-        return False, out, err
+        return provider_outcome(result)
     finally:
         unload_local_model(active_model)
-

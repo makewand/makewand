@@ -33,11 +33,15 @@ test-install:
 
 test-benchmark:
 	python3 -I benchmarks/test_runner.py
+	python3 -I benchmarks/test_deep_config_acceptance_v4.py
+	python3 -I benchmarks/test_analyze_results.py
 
 # Release-tooling self-tests: secret scanner regression corpus + version consistency.
 test-scripts:
 	bash scripts/test_check_secrets.sh
 	bash scripts/check_version.sh
+	python3 -I scripts/generate_cli_contract.py --check
+	python3 -I scripts/check_execution_contract.py
 
 test: test-py test-go test-dispatch test-install test-benchmark test-scripts
 

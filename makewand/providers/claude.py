@@ -7,7 +7,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_BLUE
-from makewand.providers.base import run_subprocess
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.workflow import provider_outcome
 
 # Built-in tools available to read-only Claude tasks (review / analysis).
 CLAUDE_READONLY_TOOLS = "Read,Grep,Glob"
@@ -69,20 +70,14 @@ def execute_claude_task(
         if has_api_configured("claude"):
             import sys
             print(c("[Makewand -> Claude] (纯 API 模式) 派发任务至 Anthropic Claude API...", COLOR_BLUE), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, "未找到 Claude CLI 订阅，且未配置 ANTHROPIC_API_KEY"
 
     if cache.get("claude", {}).get("status") == "limited":
         if has_api_configured("claude"):
             import sys
             print(c("[Makewand -> Claude] 订阅额度受限，无缝自动降级为 Anthropic API 模式接力执行...", COLOR_BLUE), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Claude Code 当前额度受限: {cache['claude'].get('reason')} (可配置 ANTHROPIC_API_KEY 作为备用 API 自动接力)"
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
@@ -142,6 +137,8 @@ def execute_claude_task(
     log_desc = "只读解析任务 (工具只读约束)" if readonly else "代码任务 (无头权限自动穿透)"
     import sys
     print(c(f"[Makewand -> Claude] 派发{log_desc} (Tier: {tier})...", COLOR_BLUE), file=sys.stderr)
+    from makewand.execution_runtime import mark_provider_invocation
+    mark_provider_invocation()
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout,
@@ -155,6 +152,9 @@ def execute_claude_task(
     if code == 0:
         return True, out, None
 
+    if is_process_timeout(ex) or code < 0:
+        return model_process_failure("claude", code, combined, err, ex, readonly)
+
     is_limited, reason, resets = parse_claude_quota(combined)
     if is_limited:
         from makewand.health import record_engine_limit
@@ -162,10 +162,7 @@ def execute_claude_task(
         if has_api_configured("claude"):
             import sys
             print(c(f"[Makewand -> Claude] 订阅触发限流 ({reason})，无缝切换为 Anthropic API Key 模式接力执行...", COLOR_BLUE), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Claude Code 执行中触发额度限制: {reason} (可配置 ANTHROPIC_API_KEY 实现自动接力)"
 
-    return False, combined, ex or f"Claude returned exit code {code}"
+    return model_process_failure("claude", code, combined, err, ex, readonly)

@@ -122,11 +122,21 @@ func (us *UserStore) usersFilePath() string {
 
 // ensureDataDir creates the data directory if it doesn't exist.
 func (us *UserStore) ensureDataDir() error {
+	// #nosec G703 -- dataDir is operator configuration supplied at startup, never an HTTP path or user identifier.
 	return os.MkdirAll(us.dataDir, 0700)
 }
 
 // loadUsers loads all users from the JSON file.
 func (us *UserStore) loadUsers() (map[string]*User, error) {
+	release, err := us.lockUserFile(false)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return us.loadUsersUnlocked()
+}
+
+func (us *UserStore) loadUsersUnlocked() (map[string]*User, error) {
 	users := make(map[string]*User)
 
 	filePath := us.usersFilePath()
@@ -166,7 +176,7 @@ func (us *UserStore) saveUsers(users map[string]*User) error {
 	}
 
 	filePath := us.usersFilePath()
-	if err := os.WriteFile(filePath, data, 0600); err != nil {
+	if err := replaceUserFile(filePath, data); err != nil {
 		return fmt.Errorf("write users file: %w", err)
 	}
 
@@ -186,7 +196,13 @@ func (us *UserStore) CreateUserWithRole(email, password, role string) (*User, er
 // CreateUserWithRoleActive creates a new user account with an explicit role and
 // initial active state persisted in a single write.
 func (us *UserStore) CreateUserWithRoleActive(email, password, role string, active bool) (*User, error) {
-	users, err := us.loadUsers()
+	release, lockErr := us.lockUserFile(true)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	users, err := us.loadUsersUnlocked()
 	if err != nil {
 		return nil, fmt.Errorf("load users: %w", err)
 	}
@@ -278,7 +294,13 @@ func (us *UserStore) ListUsers() ([]UserView, error) {
 
 // SetUserActive updates a user's active flag.
 func (us *UserStore) SetUserActive(userID string, active bool) (*User, error) {
-	users, err := us.loadUsers()
+	release, lockErr := us.lockUserFile(true)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	users, err := us.loadUsersUnlocked()
 	if err != nil {
 		return nil, fmt.Errorf("load users: %w", err)
 	}
@@ -296,7 +318,13 @@ func (us *UserStore) SetUserActive(userID string, active bool) (*User, error) {
 
 // SetUserRole updates a user's role.
 func (us *UserStore) SetUserRole(userID, role string) (*User, error) {
-	users, err := us.loadUsers()
+	release, lockErr := us.lockUserFile(true)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	users, err := us.loadUsersUnlocked()
 	if err != nil {
 		return nil, fmt.Errorf("load users: %w", err)
 	}
@@ -317,10 +345,16 @@ func (us *UserStore) SetUserRole(userID, role string) (*User, error) {
 }
 
 func (us *UserStore) SetUserPassword(userID, password string) (*User, error) {
+	release, lockErr := us.lockUserFile(true)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
 	if !isValidPassword(password) {
 		return nil, fmt.Errorf("password must be at least 8 characters long")
 	}
-	users, err := us.loadUsers()
+	users, err := us.loadUsersUnlocked()
 	if err != nil {
 		return nil, fmt.Errorf("load users: %w", err)
 	}
@@ -389,13 +423,16 @@ func generateUserID() string {
 
 // isValidEmail performs basic email validation.
 func isValidEmail(email string) bool {
+	if len(email) > 254 {
+		return false
+	}
 	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
 	return emailRegex.MatchString(email)
 }
 
 // isValidPassword checks password requirements.
 func isValidPassword(password string) bool {
-	return len(password) >= 8
+	return len(password) >= 8 && len(password) <= 1024
 }
 
 func normalizeUserRole(role string) (string, error) {
@@ -436,6 +473,7 @@ func (r *Router) HandleUserRegistration(userStore UserManager, userOpts UserEndp
 		}
 
 		var regReq UserRegistrationRequest
+		req.Body = http.MaxBytesReader(w, req.Body, 64<<10)
 		if err := decodeLimitedHTTPJSON(w, req, &regReq); err != nil {
 			status, code, message := httpJSONDecodeError(err)
 			writeHTTPError(w, status, code, message)
@@ -531,18 +569,35 @@ func (r *Router) HandleUserLogin(userStore UserManager, tokenManager serverauth.
 		}
 
 		var loginReq UserLoginRequest
+		req.Body = http.MaxBytesReader(w, req.Body, 64<<10)
 		if err := decodeLimitedHTTPJSON(w, req, &loginReq); err != nil {
 			status, code, message := httpJSONDecodeError(err)
 			writeHTTPError(w, status, code, message)
 			return
 		}
 		key := limiter.ThrottleKey(req, loginReq.Email)
-		if allowed, retryAfter := limiter.Allow(key, time.Now().UTC()); !allowed {
+		if len(loginReq.Password) > 1024 {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "password is too long")
+			return
+		}
+		if allowed, retryAfter := limiter.Admit(req, loginReq.Email, time.Now().UTC()); !allowed {
 			writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("too many failed logins; try again in %s", retryAfter.Round(time.Second)))
 			return
 		}
+		releaseHash, acquired := serverauth.AcquirePasswordHash()
+		if !acquired {
+			writeHTTPError(w, http.StatusServiceUnavailable, "login_busy", "login is temporarily busy; try again shortly")
+			return
+		}
+		defer releaseHash()
 		user, err := userStore.GetUserByEmail(loginReq.Email)
-		if err != nil || user == nil || !user.IsActive || !user.ValidatePassword(loginReq.Password) {
+		passwordOK := false
+		if err == nil && user != nil {
+			passwordOK = user.ValidatePassword(loginReq.Password)
+		} else {
+			_ = (&User{Salt: "makewand-login-timing-equalizer"}).ValidatePassword(loginReq.Password)
+		}
+		if !passwordOK || !user.IsActive {
 			limiter.RecordFailure(key, time.Now().UTC())
 			writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "invalid email or password")
 			return

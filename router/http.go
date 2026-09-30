@@ -214,6 +214,11 @@ type HTTPHandlerOptions struct {
 
 	// UserLoginLimiter throttles repeated failed /v1/users/login attempts.
 	UserLoginLimiter *serverauth.LoginRateLimiter
+
+	// ReadinessCheck validates local dependencies without making model calls.
+	ReadinessCheck func(context.Context) error
+	// Observer records bounded provider/infrastructure events for operators.
+	Observer func(kind, provider string)
 }
 
 // HTTPHandler returns an http.Handler that serves an OpenAI-compatible subset
@@ -246,6 +251,21 @@ func (r *Router) HTTPHandler(opts ...HTTPHandlerOptions) http.Handler {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, req *http.Request) {
+		if opt.ReadinessCheck != nil {
+			ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+			defer cancel()
+			if err := opt.ReadinessCheck(ctx); err != nil {
+				if opt.Observer != nil {
+					opt.Observer("readiness", "")
+				}
+				writeHTTPError(w, http.StatusServiceUnavailable, "not_ready", "server dependencies are unavailable")
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 	})
 	return mux
 }
@@ -398,7 +418,7 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
 			return
 		}
-		r.handleResponsesStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, responsesReq.Metadata, &auditEvent, &usageEntry)
+		r.handleResponsesStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, responsesReq.Metadata, &auditEvent, &usageEntry, opt)
 		return
 	}
 
@@ -419,6 +439,9 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
 	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
 	if err != nil {
+		if opt.Observer != nil {
+			opt.Observer("provider", result.Actual)
+		}
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
 			status = http.StatusBadRequest
@@ -586,7 +609,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	defer prepared.Router.persistHTTPStats(opt.StatsDir)
 
 	if chatReq.Stream {
-		r.handleChatCompletionsStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, &auditEvent, &usageEntry)
+		r.handleChatCompletionsStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, &auditEvent, &usageEntry, opt)
 		return
 	}
 
@@ -607,6 +630,9 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
 	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
 	if err != nil {
+		if opt.Observer != nil {
+			opt.Observer("provider", result.Actual)
+		}
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
 			status = http.StatusBadRequest
@@ -682,7 +708,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
+func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry, opt HTTPHandlerOptions) {
 	if auditEvent == nil {
 		return
 	}
@@ -712,6 +738,9 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
 		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
+		if opt.Observer != nil {
+			opt.Observer("provider", result.Actual)
+		}
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
 			status = http.StatusBadRequest
@@ -743,6 +772,9 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	}()
 	for chunk := range stream {
 		if chunk.Error != nil {
+			if opt.Observer != nil {
+				opt.Observer("provider", result.Actual)
+			}
 			auditEvent.Status = http.StatusOK
 			auditEvent.Error = chunk.Error.Error()
 			_ = writeSSEData(w, map[string]any{
@@ -811,7 +843,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	}
 }
 
-func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, metadata map[string]string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
+func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, metadata map[string]string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry, opt HTTPHandlerOptions) {
 	if auditEvent == nil {
 		return
 	}
@@ -841,6 +873,9 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
 		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
+		if opt.Observer != nil {
+			opt.Observer("provider", result.Actual)
+		}
 		status := http.StatusServiceUnavailable
 		if strings.Contains(err.Error(), "not configured") {
 			status = http.StatusBadRequest
@@ -884,6 +919,9 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 	}()
 	for chunk := range stream {
 		if chunk.Error != nil {
+			if opt.Observer != nil {
+				opt.Observer("provider", result.Actual)
+			}
 			auditEvent.Status = http.StatusOK
 			auditEvent.Error = chunk.Error.Error()
 			_ = writeSSEEvent(w, "response.error", map[string]any{
@@ -1494,16 +1532,12 @@ func (r *Router) reserveTeamBudget(teamStore serverteam.Store, usageReader serve
 // there is no stale-ledger check-then-act window.
 func (r *Router) admitScopeBudget(usageReader serverusage.Reader, filter serverusage.Filter, now time.Time, budgetUSD, estimate float64, scope, kind, id string) error {
 	if !r.budgetReservations.isSeeded(scope) {
-		entries, err := usageReader.Load(serverusage.CurrentMonthFilter(filter, now))
+		spent, _, err := serverusage.Spend(usageReader, serverusage.CurrentMonthFilter(filter, now))
 		if err != nil {
 			return budgetUnavailable(fmt.Sprintf("%s %q", kind, id), err)
 		}
 		// Sanitize per entry, not on the summed total: a single negative/NaN/Inf
 		// row must contribute 0, never cancel legitimate spend or wipe the sum.
-		var spent float64
-		for _, e := range entries {
-			spent += sanitizeCost(e.CostUSD)
-		}
 		r.budgetReservations.seed(scope, spent)
 	}
 	if !r.budgetReservations.admit(scope, budgetUSD, estimate) {
@@ -1678,10 +1712,15 @@ func logHTTPUsage(logger serverusage.Logger, entry serverusage.Entry) error {
 // notifyUsageLogError surfaces a usage-logging failure through the configured
 // handler. No-op when there is no error or no handler.
 func (o HTTPHandlerOptions) notifyUsageLogError(err error) {
-	if err == nil || o.UsageLogErrorHandler == nil {
+	if err == nil {
 		return
 	}
-	o.UsageLogErrorHandler(err)
+	if o.Observer != nil {
+		o.Observer("usage", "")
+	}
+	if o.UsageLogErrorHandler != nil {
+		o.UsageLogErrorHandler(err)
+	}
 }
 
 func finishReasonForToolCalls(hasToolCalls bool) string {

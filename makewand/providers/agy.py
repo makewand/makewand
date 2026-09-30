@@ -6,7 +6,8 @@ import os
 import re
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_GREEN
-from makewand.providers.base import run_subprocess
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.workflow import provider_outcome
 
 # Rate limiting must be recognised from its *context*, never from a bare "429"
 # (line counts, PIDs, hashes and test totals routinely contain 429). Aligned
@@ -113,10 +114,7 @@ def execute_agy_task(
         if has_api_configured("agy"):
             import sys
             print(c("[Makewand -> Antigravity] (纯 API 模式) 派发任务至 Google Gemini API...", COLOR_GREEN), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, "未找到 agy CLI 订阅，且未配置 GEMINI_API_KEY"
 
     cache = load_status_cache()
@@ -124,10 +122,7 @@ def execute_agy_task(
         if has_api_configured("agy"):
             import sys
             print(c("[Makewand -> Antigravity] 订阅当前受限，无缝自动降级为 Gemini API 模式接力执行...", COLOR_GREEN), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Antigravity 当前不可用: {cache['agy'].get('reason')} (可配置 GEMINI_API_KEY 作为备用 API 自动接力)"
 
     # Fail-closed enforcement: if writable, sandbox is mandatory
@@ -176,9 +171,11 @@ def execute_agy_task(
         log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
         import sys
         print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN), file=sys.stderr)
+        from makewand.execution_runtime import mark_provider_invocation
+        mark_provider_invocation()
         code, out, err, ex = run_subprocess(
             cmd,
-            timeout=timeout + 15,
+            timeout=timeout,
             cwd=cwd,
             stream=stream,
             print_prefix=c("[AGY Live]", COLOR_GREEN)
@@ -206,6 +203,9 @@ def execute_agy_task(
             return True, cleaned_err, None
         return False, None, "Antigravity 执行完成但未能产生有效输出内容"
 
+    if is_process_timeout(ex) or code < 0:
+        return model_process_failure("agy", code, combined, err, ex, readonly)
+
     is_limited, reason, resets_at = parse_agy_quota(combined)
     if not is_limited:
         failure = classify_agy_failure(combined)
@@ -222,9 +222,6 @@ def execute_agy_task(
         if has_api_configured("agy"):
             import sys
             print(c(f"[Makewand -> Antigravity] 订阅触发配额限制 ({reason})，无缝切换为 Gemini API Key 模式接力执行...", COLOR_GREEN), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Antigravity 配额受限: {reason} (可配置 GEMINI_API_KEY 实现自动接力)"
-    return False, combined, ex or f"agy returned exit code {code}"
+    return model_process_failure("agy", code, combined, err, ex, readonly)

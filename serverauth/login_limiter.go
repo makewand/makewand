@@ -16,6 +16,15 @@ type LoginRateLimiter struct {
 	lockout     time.Duration
 	attempts    map[string]loginAttempt
 	trusted     *TrustedProxies
+	admissions  map[string]loginAdmission
+	lastCleanup time.Time
+}
+
+const maxLoginKeys = 4096
+
+type loginAdmission struct {
+	start time.Time
+	count int
 }
 
 type loginAttempt struct {
@@ -39,6 +48,7 @@ func NewLoginRateLimiter(maxFailures int, window, lockout time.Duration) *LoginR
 		window:      window,
 		lockout:     lockout,
 		attempts:    make(map[string]loginAttempt),
+		admissions:  make(map[string]loginAdmission),
 	}
 }
 
@@ -52,6 +62,7 @@ func (l *LoginRateLimiter) Allow(key string, now time.Time) (bool, time.Duration
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.cleanupLocked(now)
 	attempt, ok := l.attempts[key]
 	if !ok {
 		return true, 0
@@ -75,15 +86,21 @@ func (l *LoginRateLimiter) RecordFailure(key string, now time.Time) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	attempt := l.attempts[key]
-	if attempt.windowStart.IsZero() || now.Sub(attempt.windowStart) > l.window {
-		attempt = loginAttempt{windowStart: now}
+	l.cleanupLocked(now)
+	for _, failureKey := range []string{key, "account:" + loginPrincipalFromKey(key)} {
+		if _, exists := l.attempts[failureKey]; !exists && len(l.attempts) >= maxLoginKeys {
+			continue
+		}
+		attempt := l.attempts[failureKey]
+		if attempt.windowStart.IsZero() || now.Sub(attempt.windowStart) > l.window {
+			attempt = loginAttempt{windowStart: now}
+		}
+		attempt.failures++
+		if attempt.failures >= l.maxFailures {
+			attempt.lockedUntil = now.Add(l.lockout)
+		}
+		l.attempts[failureKey] = attempt
 	}
-	attempt.failures++
-	if attempt.failures >= l.maxFailures {
-		attempt.lockedUntil = now.Add(l.lockout)
-	}
-	l.attempts[key] = attempt
 }
 
 func (l *LoginRateLimiter) Reset(key string) {
@@ -97,6 +114,79 @@ func (l *LoginRateLimiter) Reset(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.attempts, key)
+	delete(l.attempts, "account:"+loginPrincipalFromKey(key))
+}
+
+// The source address is appended last and cannot contain '|'. Principals can
+// contain it, so the last separator preserves the complete account identity.
+// Legacy caller keys without a source separator retain their existing meaning.
+func loginPrincipalFromKey(key string) string {
+	if separator := strings.LastIndexByte(key, '|'); separator >= 0 {
+		return key[:separator]
+	}
+	return key
+}
+
+// Admit reserves a login attempt before any password hash. Source and global
+// limits prevent rotating principals from bypassing account lockouts. Capacity
+// exhaustion fails closed rather than evicting a live security limit.
+func (l *LoginRateLimiter) Admit(req *http.Request, principal string, now time.Time) (bool, time.Duration) {
+	if l == nil {
+		return true, 0
+	}
+	principal = strings.ToLower(strings.TrimSpace(principal))
+	if len(principal) > 254 {
+		return false, l.window
+	}
+	source := RateLimitSource(ClientIP(req, l.TrustedProxies()))
+	key := principal + "|" + source
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.cleanupLocked(now)
+	for _, failureKey := range []string{key, "account:" + principal} {
+		if attempt := l.attempts[failureKey]; now.Before(attempt.lockedUntil) {
+			return false, attempt.lockedUntil.Sub(now)
+		}
+	}
+	limits := []struct {
+		key string
+		max int
+	}{{"source:" + source, 30}, {"global", 300}}
+	for _, limit := range limits {
+		bucket, exists := l.admissions[limit.key]
+		if !exists && len(l.admissions) >= maxLoginKeys {
+			return false, l.window
+		}
+		if !bucket.start.IsZero() && now.Sub(bucket.start) < l.window && bucket.count >= limit.max {
+			return false, l.window - now.Sub(bucket.start)
+		}
+	}
+	for _, limit := range limits {
+		bucket := l.admissions[limit.key]
+		if bucket.start.IsZero() || now.Sub(bucket.start) >= l.window {
+			bucket = loginAdmission{start: now}
+		}
+		bucket.count++
+		l.admissions[limit.key] = bucket
+	}
+	return true, 0
+}
+
+func (l *LoginRateLimiter) cleanupLocked(now time.Time) {
+	if !l.lastCleanup.IsZero() && now.Sub(l.lastCleanup) < time.Minute {
+		return
+	}
+	l.lastCleanup = now
+	for key, attempt := range l.attempts {
+		if now.Sub(attempt.windowStart) >= l.window && !now.Before(attempt.lockedUntil) {
+			delete(l.attempts, key)
+		}
+	}
+	for key, bucket := range l.admissions {
+		if now.Sub(bucket.start) >= l.window {
+			delete(l.admissions, key)
+		}
+	}
 }
 
 // SetTrustedProxies configures the proxy peers whose forwarding headers are

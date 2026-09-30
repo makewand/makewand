@@ -635,6 +635,23 @@ def _provider_mounts(
     profile = PROVIDER_PROFILES.get(p_name)
     if not profile:
         return [], [], []
+    if p_name == "codex":
+        # A configured Codex home selects one account. Never silently switch
+        # accounts after --clearenv, or expose another account's state as well.
+        selected = _norm(os.path.expanduser(os.environ.get("CODEX_HOME") or
+                                           os.path.join(user_home, ".codex")))
+        real_selected = os.path.realpath(selected)
+        if (_broad_workspace(real_selected, user_home) or _home_exposed(real_selected, user_home)
+                or any(_is_within(os.path.realpath(path), real_selected) or
+                       _is_within(real_selected, os.path.realpath(path)) for path in project_paths)):
+            raise SandboxConfigError("CODEX_HOME must be a dedicated provider state directory")
+        if os.environ.get("CODEX_HOME") and not os.path.isdir(selected):
+            raise SandboxConfigError("configured CODEX_HOME does not exist; refusing account fallback")
+        profile = dict(profile)
+        profile["roots"] = [selected]
+        for category in ("protected", "ephemeral"):
+            profile[category] = [(selected, *entry[1:]) for entry in profile.get(category, [])
+                                 if entry[0] == ".codex"]
     args: List[str] = []
     scan_roots: List[str] = []
     scan_skip: List[str] = []
@@ -1060,6 +1077,9 @@ def wrap_bwrap(
             SAFE_PASSTHROUGH_ENVS.extend(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"])
         elif p_name == "codex":
             SAFE_PASSTHROUGH_ENVS.extend(["OPENAI_API_KEY", "CODEX_API_KEY"])
+            if os.environ.get("CODEX_HOME"):
+                bwrap_cmd.extend(["--setenv", "CODEX_HOME",
+                                  _norm(os.path.expanduser(os.environ["CODEX_HOME"]))])
         elif p_name == "grok":
             SAFE_PASSTHROUGH_ENVS.extend(["XAI_API_KEY", "GROK_API_KEY", "GROK_AUTH_TOKEN", "GROK_WEB_FETCH_PROXY"])
         elif p_name == "muse":

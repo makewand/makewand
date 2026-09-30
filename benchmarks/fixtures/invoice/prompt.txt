@@ -1,0 +1,1 @@
+重构并修复 invoice_api.py 和 pricing.py。保留公开函数 total_invoice(lines) 与 price_line(line)。line 含 quantity（非 bool 非负整数）和 unit_price（非负、有限的十进制字符串）；缺字段或非法值抛 ValueError。price_line 返回 quantity*unit_price 四舍五入到2位小数（Decimal ROUND_HALF_UP）的字符串；total_invoice 复用 helper，对每行已舍入价格求和，返回2位小数字符串，空列表为 0.00。不得修改输入，只用标准库。

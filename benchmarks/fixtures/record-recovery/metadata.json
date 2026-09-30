@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "record-recovery",
+  "risk": "high",
+  "category": "exception-recovery",
+  "language": "python",
+  "public_apis": [
+    [
+      "records.py",
+      "recover_records"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

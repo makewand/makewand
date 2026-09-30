@@ -90,6 +90,8 @@ const (
 
 // Re-export functions.
 var (
+	ChatProvider               = router.ChatProvider
+	ChatStreamProvider         = router.ChatStreamProvider
 	NewRouterFromConfig        = router.NewRouterFromConfig
 	NewClaude                  = router.NewClaude
 	NewGemini                  = router.NewGemini
@@ -102,6 +104,7 @@ var (
 	NewDefaultQuotaSnapshotter = router.NewDefaultQuotaSnapshotter
 	NewCommandCLI              = router.NewCommandCLI
 	ClassifyTask               = router.ClassifyTask
+	ClassifyCLIExecutionError  = router.ClassifyCLIExecutionError
 	EstimateCost               = router.EstimateCost
 	ParseUsageMode             = router.ParseUsageMode
 	UsageModeToPythonTier      = router.UsageModeToPythonTier

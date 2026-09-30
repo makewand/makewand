@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "log-levels",
+  "risk": "medium",
+  "category": "multi-file-refactor",
+  "language": "python",
+  "public_apis": [
+    [
+      "logs_api.py",
+      "summarize_logs"
+    ],
+    [
+      "log_parse.py",
+      "parse_level"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

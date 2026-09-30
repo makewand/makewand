@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "invoice",
+  "risk": "high",
+  "category": "multi-file-refactor",
+  "language": "python",
+  "public_apis": [
+    [
+      "invoice_api.py",
+      "total_invoice"
+    ],
+    [
+      "pricing.py",
+      "price_line"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

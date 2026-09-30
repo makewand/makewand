@@ -1,0 +1,1 @@
+修复 records.py 的 recover_records(rows)。逐条处理 dict 记录：id 必须是非空字符串（输出 strip 后的 id），value 必须是非 bool 整数或 strip 后的 ASCII 十进制整数字符串（可带 +/-）。忽略其他字段。无效行继续处理后续行，记录 {index, reason:'invalid'}；有效记录的 id 重复时保留第一次、记录 reason:'duplicate'。无效性判断先于重复判断。返回 {records:[{id,value}], errors:[{index,reason}]}。不得修改输入，只用标准库。

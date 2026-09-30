@@ -18,7 +18,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"syscall"
 )
 
 type fileCheckpointEntry struct {
@@ -132,15 +131,10 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 				continue
 			}
 			mode := info.Mode()
-			var nlink uint64 = 1
-			var dev uint64
-			var ino uint64
-			if sys := info.Sys(); sys != nil {
-				if stat, ok := sys.(*syscall.Stat_t); ok {
-					nlink = uint64(stat.Nlink)
-					dev = uint64(stat.Dev)
-					ino = uint64(stat.Ino)
-				}
+			identity, identityErr := checkpointIdentity(fullPath, info)
+			if identityErr != nil {
+				cleanupOnError()
+				return nil, fmt.Errorf("identify checkpoint %s: %w", f.Path, identityErr)
 			}
 			// If file size is within maxReadFileSize, read into Content
 			if info.Size() <= maxReadFileSize {
@@ -151,9 +145,9 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 						Existed: true,
 						Content: string(data),
 						Mode:    mode,
-						Nlink:   nlink,
-						Dev:     dev,
-						Ino:     ino,
+						Nlink:   identity.Nlink,
+						Dev:     identity.Dev,
+						Ino:     identity.Ino,
 					})
 					continue
 				}
@@ -184,9 +178,9 @@ func (p *Project) CheckpointFiles(files []ExtractedFile) (*FileCheckpoint, error
 				Existed:    true,
 				BackupPath: backupFile.Name(),
 				Mode:       mode,
-				Nlink:      nlink,
-				Dev:        dev,
-				Ino:        ino,
+				Nlink:      identity.Nlink,
+				Dev:        identity.Dev,
+				Ino:        identity.Ino,
 			})
 			continue
 		}
@@ -242,8 +236,8 @@ func (c *FileCheckpoint) findInternalHardlinkSibling(targetPath string, dev, ino
 			return nil
 		}
 		if fi, statErr := os.Lstat(p); statErr == nil {
-			if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
-				if uint64(sys.Dev) == dev && uint64(sys.Ino) == ino {
+			if identity, err := checkpointIdentity(p, fi); err == nil {
+				if identity.Dev == dev && identity.Ino == ino {
 					siblingPath = p
 					return fs.SkipAll
 				}
@@ -424,12 +418,45 @@ func (c *FileCheckpoint) removeCreatedDirs(dirs []string) {
 
 // CloneToTemp copies the project into a temporary directory for isolated checks.
 func (p *Project) CloneToTemp() (*Project, error) {
+	return p.cloneToTemp(nil)
+}
+
+func (p *Project) cloneToTemp(copyContents func(*os.File, *os.File) error) (*Project, error) {
+	return p.cloneToTempContext(context.Background(), copyContents)
+}
+
+func (p *Project) cloneToTempContext(ctx context.Context, copyContents func(*os.File, *os.File) error) (*Project, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	source, err := os.OpenRoot(p.Path)
+	if err != nil {
+		return nil, fmt.Errorf("open source workspace: %w", err)
+	}
+	defer source.Close()
+
 	tempDir, err := os.MkdirTemp("", "makewand-candidate-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp workspace: %w", err)
 	}
+	targetInfo, err := os.Stat(tempDir)
+	if err != nil {
+		_ = os.RemoveAll(tempDir)
+		return nil, err
+	}
+	capabilities := make(workspaceCopyCapabilities)
+	if copyContents == nil {
+		copyContents, err = selectWorkspaceCopier(p.Path, tempDir)
+		if err != nil {
+			_ = os.RemoveAll(tempDir)
+			return nil, err
+		}
+	}
 
 	if err := filepath.WalkDir(p.Path, func(path string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -464,7 +491,26 @@ func (p *Project) CloneToTemp() (*Project, error) {
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return err
 		}
-		return copyFile(path, target, info.Mode().Perm())
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("workspace input is not a regular file: %s", rel)
+		}
+		in, err := source.Open(rel)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		opened, err := in.Stat()
+		if err != nil {
+			return err
+		}
+		if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+			return fmt.Errorf("workspace input changed during copy: %s", rel)
+		}
+		copier := copyContents
+		if copier == nil {
+			copier = func(in, out *os.File) error { return capabilities.copy(in, out, opened, targetInfo) }
+		}
+		return copyWorkspaceFile(in, target, info.Mode().Perm(), copier)
 	}); err != nil {
 		_ = os.RemoveAll(tempDir)
 		return nil, fmt.Errorf("copy project to temp workspace: %w", err)
@@ -1407,23 +1453,4 @@ func execFailureDetail(result *ExecResult) string {
 		msg = fmt.Sprintf("command exited with status %d", result.ExitCode)
 	}
 	return msg
-}
-
-func copyFile(src, dst string, mode fs.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
 }

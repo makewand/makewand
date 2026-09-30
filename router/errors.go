@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/makewand/makewand/execution"
 )
 
 // ErrorKind classifies provider failures in a way that routing, retries, and
@@ -67,6 +69,29 @@ func (e *ProviderError) Error() string {
 }
 
 func (e *ProviderError) Unwrap() error { return e.Err }
+
+// ExecutionStatus preserves known provider failures across the native CLI's
+// shared exit-code boundary. Transport uncertainty is still classified before
+// this method by execution.ErrorStatus and the dispatch accounting wrapper.
+func (e *ProviderError) ExecutionStatus() execution.Status {
+	if e == nil {
+		return execution.InternalError
+	}
+	switch e.Kind {
+	case ErrorKindConfig:
+		return execution.InvalidRequest
+	case ErrorKindAuth, ErrorKindRateLimit, ErrorKindProvider, ErrorKindUnavailable:
+		return execution.Failed
+	case ErrorKindTimeout:
+		return execution.Timeout
+	case ErrorKindCanceled:
+		return execution.Cancelled
+	case ErrorKindNetwork:
+		return execution.Unknown
+	default:
+		return execution.InternalError
+	}
+}
 
 func ErrorKindOf(err error) ErrorKind {
 	if err == nil {

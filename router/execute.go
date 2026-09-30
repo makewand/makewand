@@ -126,7 +126,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 	if id.modelID != "" {
 		attemptCtx = ContextWithModel(attemptCtx, id.modelID)
 	}
-	content, usage, chatErr := id.provider.Chat(attemptCtx, ac.messages, ac.system, ac.maxTokens)
+	content, usage, chatErr := ChatProvider(attemptCtx, id.provider, ac.messages, ac.system, ac.maxTokens)
 	attemptCancel()
 
 	if chatErr == nil {
@@ -297,6 +297,9 @@ func (r *Router) iterateFallbackCandidates(ac *attemptContext, candidates []fall
 		if res.err == nil {
 			return res.content, res.usage, res.route, nil
 		}
+		if stopExecutionReplay(res.err) {
+			return "", res.usage, res.route, res.err
+		}
 		if firstErr == nil {
 			firstErr = res.err
 		}
@@ -316,6 +319,11 @@ func (r *Router) iterateFallbackCandidates(ac *attemptContext, candidates []fall
 // routeAndExecute implements the unified Chat/ChatWith execution pipeline.
 // It tries the primary provider, then iterates fallback candidates on failure.
 func (r *Router) routeAndExecute(ac *attemptContext, result RouteResult, fallbacks []fallbackCandidate, resolve candidateResolver) (string, Usage, RouteResult, error) {
+	var configErr error
+	ac.ctx, configErr = r.executionContext(ac.ctx)
+	if configErr != nil {
+		return "", Usage{}, result, configErr
+	}
 	// Try primary
 	primaryRes := r.tryProvider(ac, attemptIdentity{
 		name:       result.Actual,
@@ -327,6 +335,9 @@ func (r *Router) routeAndExecute(ac *attemptContext, result RouteResult, fallbac
 		return primaryRes.content, primaryRes.usage, primaryRes.route, nil
 	}
 	firstErr := primaryRes.err
+	if stopExecutionReplay(firstErr) {
+		return "", primaryRes.usage, result, firstErr
+	}
 	if callerErr := ac.ctx.Err(); callerErr != nil {
 		return "", Usage{}, result, callerErr
 	}
@@ -335,6 +346,9 @@ func (r *Router) routeAndExecute(ac *attemptContext, result RouteResult, fallbac
 	content, usage, route, fbErr := r.iterateFallbackCandidates(ac, fallbacks, resolve)
 	if fbErr == nil {
 		return content, usage, route, nil
+	}
+	if stopExecutionReplay(fbErr) {
+		return "", usage, result, fbErr
 	}
 	if callerErr := ac.ctx.Err(); callerErr != nil {
 		return "", Usage{}, result, callerErr
@@ -558,7 +572,7 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 	if requestedModelID != "" {
 		attemptCtx = ContextWithModel(attemptCtx, requestedModelID)
 	}
-	ch, streamErr := id.provider.ChatStream(attemptCtx, ac.messages, ac.system, ac.maxTokens)
+	ch, streamErr := ChatStreamProvider(attemptCtx, id.provider, ac.messages, ac.system, ac.maxTokens)
 
 	if streamErr != nil {
 		attemptCancel()
@@ -620,6 +634,11 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 
 // routeAndExecuteStream implements the unified ChatStream execution pipeline.
 func (r *Router) routeAndExecuteStream(ac *attemptContext, result RouteResult, fallbacks []fallbackCandidate, resolve candidateResolver) (<-chan StreamChunk, RouteResult, error) {
+	var configErr error
+	ac.ctx, configErr = r.executionContext(ac.ctx)
+	if configErr != nil {
+		return nil, result, configErr
+	}
 	// Try primary
 	primaryRes := r.tryStreamProvider(ac, attemptIdentity{
 		name:       result.Actual,
@@ -631,6 +650,9 @@ func (r *Router) routeAndExecuteStream(ac *attemptContext, result RouteResult, f
 		return primaryRes.ch, primaryRes.route, nil
 	}
 	firstErr := primaryRes.err
+	if stopExecutionReplay(firstErr) {
+		return nil, result, firstErr
+	}
 	if callerErr := ac.ctx.Err(); callerErr != nil {
 		return nil, result, callerErr
 	}
@@ -710,6 +732,9 @@ func (r *Router) routeAndExecuteStream(ac *attemptContext, result RouteResult, f
 		}
 		if res.err == nil {
 			return res.ch, res.route, nil
+		}
+		if stopExecutionReplay(res.err) {
+			return nil, result, res.err
 		}
 		if firstErr == nil {
 			firstErr = res.err

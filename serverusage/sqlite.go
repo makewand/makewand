@@ -68,11 +68,22 @@ CREATE TABLE IF NOT EXISTS usage_entries (
 	if err != nil {
 		return err
 	}
-	return serverdb.EnsureColumns(s.db, "usage_entries", map[string]string{
+	if err := serverdb.EnsureColumns(s.db, "usage_entries", map[string]string{
 		"user_id":         "user_id TEXT NOT NULL DEFAULT ''",
 		"organization_id": "organization_id TEXT NOT NULL DEFAULT ''",
 		"project_id":      "project_id TEXT NOT NULL DEFAULT ''",
-	})
+	}); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+CREATE INDEX IF NOT EXISTS usage_timestamp ON usage_entries(timestamp DESC);
+CREATE INDEX IF NOT EXISTS usage_org_time ON usage_entries(organization_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS usage_project_time ON usage_entries(project_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS usage_token_time ON usage_entries(token_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS usage_user_time ON usage_entries(user_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS usage_request ON usage_entries(request_id);
+`)
+	return err
 }
 
 // Close closes the underlying database handle.
@@ -137,62 +148,8 @@ func (s *SQLiteStore) Load(filter Filter) ([]Entry, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("usage sqlite store is unavailable")
 	}
-	query := strings.Builder{}
-	query.WriteString(`
-SELECT timestamp, request_id, token_id, token_description, user_id, organization_id, project_id,
-       requested_mode, requested_model, actual_provider,
-       status, duration_ms, prompt_tokens, completion_tokens, cost_usd, stream
-FROM usage_entries WHERE 1=1`)
-	args := make([]any, 0, 8)
-	if filter.TokenID != "" {
-		query.WriteString(` AND token_id = ?`)
-		args = append(args, filter.TokenID)
-	}
-	if filter.UserID != "" {
-		query.WriteString(` AND user_id = ?`)
-		args = append(args, filter.UserID)
-	}
-	if filter.OrgID != "" {
-		query.WriteString(` AND organization_id = ?`)
-		args = append(args, filter.OrgID)
-	}
-	if filter.ProjectID != "" {
-		query.WriteString(` AND project_id = ?`)
-		args = append(args, filter.ProjectID)
-	}
-	if filter.RequestID != "" {
-		query.WriteString(` AND request_id = ?`)
-		args = append(args, filter.RequestID)
-	}
-	if filter.Provider != "" {
-		query.WriteString(` AND lower(actual_provider) = lower(?)`)
-		args = append(args, filter.Provider)
-	}
-	if filter.Status != 0 {
-		query.WriteString(` AND status = ?`)
-		args = append(args, filter.Status)
-	}
-	if filter.StreamOnly {
-		query.WriteString(` AND stream = 1`)
-	}
-	if !filter.Since.IsZero() {
-		// Fixed-width lower bound so an inclusive >= includes sub-second entries at
-		// the boundary instant (see sinceBoundaryLayout).
-		query.WriteString(` AND timestamp >= ?`)
-		args = append(args, filter.Since.UTC().Format(sinceBoundaryLayout))
-	}
-	if !filter.Until.IsZero() {
-		// RFC3339Nano to match how rows (including legacy variable-width rows) are
-		// stored, so an inclusive <= keeps equal-instant rows.
-		query.WriteString(` AND timestamp <= ?`)
-		args = append(args, filter.Until.UTC().Format(time.RFC3339Nano))
-	}
-	query.WriteString(` ORDER BY timestamp DESC`)
-	if filter.Limit > 0 {
-		query.WriteString(` LIMIT ?`)
-		args = append(args, filter.Limit)
-	}
-	rows, err := s.db.Query(query.String(), args...)
+	query, args := usageSelection(filter)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -258,4 +215,70 @@ func LoadSQLiteEntries(path string, filter Filter) ([]Entry, error) {
 
 func (s *SQLiteStore) String() string {
 	return fmt.Sprintf("sqlite:%s", s.path)
+}
+
+func usageSelection(filter Filter) (string, []any) {
+	query := strings.Builder{}
+	query.WriteString(`
+SELECT timestamp, request_id, token_id, token_description, user_id, organization_id, project_id,
+       requested_mode, requested_model, actual_provider,
+       status, duration_ms, prompt_tokens, completion_tokens, cost_usd, stream
+FROM usage_entries WHERE 1=1`)
+	args := make([]any, 0, 8)
+	if filter.TokenID != "" {
+		query.WriteString(` AND token_id = ?`)
+		args = append(args, filter.TokenID)
+	}
+	if filter.UserID != "" {
+		query.WriteString(` AND user_id = ?`)
+		args = append(args, filter.UserID)
+	}
+	if filter.OrgID != "" {
+		query.WriteString(` AND organization_id = ?`)
+		args = append(args, filter.OrgID)
+	}
+	if filter.ProjectID != "" {
+		query.WriteString(` AND project_id = ?`)
+		args = append(args, filter.ProjectID)
+	}
+	if filter.RequestID != "" {
+		query.WriteString(` AND request_id = ?`)
+		args = append(args, filter.RequestID)
+	}
+	if filter.Provider != "" {
+		query.WriteString(` AND lower(actual_provider) = lower(?)`)
+		args = append(args, filter.Provider)
+	}
+	if filter.Status != 0 {
+		query.WriteString(` AND status = ?`)
+		args = append(args, filter.Status)
+	}
+	if filter.StreamOnly {
+		query.WriteString(` AND stream = 1`)
+	}
+	if !filter.Since.IsZero() {
+		// Fixed-width lower bound so an inclusive >= includes sub-second entries at
+		// the boundary instant (see sinceBoundaryLayout).
+		query.WriteString(` AND timestamp >= ?`)
+		args = append(args, filter.Since.UTC().Format(sinceBoundaryLayout))
+	}
+	if !filter.Until.IsZero() {
+		// RFC3339Nano to match how rows (including legacy variable-width rows) are
+		// stored, so an inclusive <= keeps equal-instant rows.
+		query.WriteString(` AND timestamp <= ?`)
+		args = append(args, filter.Until.UTC().Format(time.RFC3339Nano))
+	}
+	query.WriteString(` ORDER BY timestamp DESC, id DESC`)
+	if filter.Limit > 0 {
+		query.WriteString(` LIMIT ?`)
+		args = append(args, filter.Limit)
+	}
+	if filter.Offset > 0 {
+		if filter.Limit <= 0 {
+			query.WriteString(` LIMIT -1`)
+		}
+		query.WriteString(` OFFSET ?`)
+		args = append(args, filter.Offset)
+	}
+	return query.String(), args
 }

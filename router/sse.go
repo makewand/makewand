@@ -3,14 +3,22 @@ package router
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"strings"
+
+	"github.com/makewand/makewand/execution"
 )
 
 // readSSE reads Server-Sent Events from r and sends raw data strings to ch.
 // It exits when the reader is exhausted, ctx is cancelled, or "[DONE]" is received.
 // The caller should close ch after this function returns.
 func readSSE(ctx context.Context, r io.Reader, ch chan<- string) error {
+	_, err := readSSEState(ctx, r, ch)
+	return err
+}
+
+func readSSEState(ctx context.Context, r io.Reader, ch chan<- string) (bool, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
 	var dataBuilder strings.Builder
@@ -19,7 +27,7 @@ func readSSE(ctx context.Context, r io.Reader, ch chan<- string) error {
 		// Check for context cancellation
 		select {
 		case <-ctx.Done():
-			return nil
+			return false, nil
 		default:
 		}
 
@@ -32,13 +40,13 @@ func readSSE(ctx context.Context, r io.Reader, ch chan<- string) error {
 				dataBuilder.Reset()
 
 				if data == "[DONE]" {
-					return nil
+					return true, nil
 				}
 
 				select {
 				case ch <- data:
 				case <-ctx.Done():
-					return nil
+					return false, nil
 				}
 			}
 			continue
@@ -55,6 +63,9 @@ func readSSE(ctx context.Context, r io.Reader, ch chan<- string) error {
 	// Flush any remaining data
 	if dataBuilder.Len() > 0 {
 		data := dataBuilder.String()
+		if data == "[DONE]" {
+			return true, nil
+		}
 		if data != "[DONE]" {
 			select {
 			case ch <- data:
@@ -64,9 +75,9 @@ func readSSE(ctx context.Context, r io.Reader, ch chan<- string) error {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
 }
 
 // SSEEventHandler converts a raw SSE data string into zero or more StreamChunks.
@@ -81,35 +92,39 @@ func streamSSE(ctx context.Context, r io.Reader, handler SSEEventHandler, cleanu
 	ch := make(chan StreamChunk, 64)
 	go func() {
 		defer close(ch)
+		readCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
 		if cleanup != nil {
 			defer cleanup()
 		}
 
 		dataCh := make(chan string, 64)
-		errCh := make(chan error, 1)
-		go func(dataCh chan<- string, errCh chan<- error) {
+		type readResult struct {
+			completed bool
+			err       error
+		}
+		resultCh := make(chan readResult, 1)
+		go func() {
 			defer close(dataCh)
-			errCh <- readSSE(ctx, r, dataCh)
-			close(errCh)
-		}(dataCh, errCh)
+			completed, err := readSSEState(readCtx, r, dataCh)
+			resultCh <- readResult{completed: completed, err: err}
+		}()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case err, ok := <-errCh:
-				if !ok {
-					errCh = nil
-					continue
-				}
-				errCh = nil
-				if err != nil {
-					ch <- StreamChunk{Error: err}
-					return
-				}
 			case data, ok := <-dataCh:
 				if !ok {
-					ch <- StreamChunk{Done: true}
+					result := <-resultCh
+					if result.err != nil || !result.completed {
+						if result.err == nil {
+							result.err = fmt.Errorf("SSE stream ended before its completion marker")
+						}
+						ch <- StreamChunk{Done: true, Error: &execution.UnknownOutcomeError{Err: result.err}}
+					} else {
+						ch <- StreamChunk{Done: true}
+					}
 					return
 				}
 				for _, chunk := range handler(data) {

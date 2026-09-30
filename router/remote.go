@@ -43,7 +43,13 @@ func (p *RemoteHTTPProvider) client() *http.Client {
 	return newAPIClient()
 }
 
-func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, system string, _ int) (string, Usage, error) {
+func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	return dispatchChat(ctx, p, func(attemptCtx context.Context) (string, Usage, error) {
+		return p.chatUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (p *RemoteHTTPProvider) chatUnaccounted(ctx context.Context, messages []Message, system string, _ int) (string, Usage, error) {
 	if !p.IsAvailable() {
 		return "", Usage{}, fmt.Errorf("remote provider is not configured")
 	}
@@ -76,7 +82,7 @@ func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, syste
 
 	resp, err := p.client().Do(req) //nolint:gosec // G704: operator-configured remote host (see above)
 	if err != nil {
-		return "", Usage{}, err
+		return "", Usage{}, wrapTransportError("remote", "request", err)
 	}
 	defer resp.Body.Close()
 
@@ -86,15 +92,15 @@ func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, syste
 		if msg == "" {
 			msg = resp.Status
 		}
-		return "", Usage{}, fmt.Errorf("remote provider error: %s", msg)
+		return "", Usage{}, newProviderStatusError("remote", "request", resp.StatusCode, []byte(msg))
 	}
 
 	var chatResp httpChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return "", Usage{}, err
+		return "", Usage{}, newProviderError("remote", "parse response", ErrorKindProvider, false, 0, err.Error(), err)
 	}
 	if len(chatResp.Choices) == 0 {
-		return "", Usage{}, fmt.Errorf("remote provider returned no choices")
+		return "", Usage{}, newProviderError("remote", "parse response", ErrorKindProvider, false, 0, "no choices", nil)
 	}
 
 	return chatResp.Choices[0].Message.Content, Usage{
@@ -106,6 +112,12 @@ func (p *RemoteHTTPProvider) Chat(ctx context.Context, messages []Message, syste
 }
 
 func (p *RemoteHTTPProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	return dispatchStream(ctx, p, func(attemptCtx context.Context) (<-chan StreamChunk, error) {
+		return p.chatStreamUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (p *RemoteHTTPProvider) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	if !p.IsAvailable() {
 		return nil, fmt.Errorf("remote provider is not configured")
 	}
@@ -146,7 +158,7 @@ func (p *RemoteHTTPProvider) ChatStream(ctx context.Context, messages []Message,
 		if msg == "" {
 			msg = resp.Status
 		}
-		return nil, fmt.Errorf("remote provider error: %s", msg)
+		return nil, newProviderStatusError("remote", "stream", resp.StatusCode, []byte(msg))
 	}
 
 	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
@@ -156,7 +168,7 @@ func (p *RemoteHTTPProvider) ChatStream(ctx context.Context, messages []Message,
 			defer resp.Body.Close()
 			var chatResp httpChatResponse
 			if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-				ch <- StreamChunk{Error: err, Done: true}
+				ch <- StreamChunk{Error: newProviderError("remote", "parse response", ErrorKindProvider, false, 0, err.Error(), err), Done: true}
 				return
 			}
 			if len(chatResp.Choices) > 0 && chatResp.Choices[0].Message.Content != "" {

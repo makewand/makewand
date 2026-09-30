@@ -339,7 +339,7 @@ func TestNewCommandCLI_WritesPromptToStdinWhenConfigured(t *testing.T) {
 	}
 }
 
-func TestCLIProvider_Chat_RetriesTransientExecutionError(t *testing.T) {
+func TestCLIProvider_Chat_RetriesExplicitQuotaRejection(t *testing.T) {
 	dir := t.TempDir()
 	stateFile := filepath.Join(dir, "attempts.txt")
 	script := filepath.Join(dir, "flaky-cli.sh")
@@ -353,7 +353,7 @@ func TestCLIProvider_Chat_RetriesTransientExecutionError(t *testing.T) {
 		"n=$((n+1))\n" +
 		"echo \"$n\" > \"$state_file\"\n" +
 		"if [ \"$n\" -eq 1 ]; then\n" +
-		"  echo \"stream closed unexpectedly: Transport error (1007)\" 1>&2\n" +
+		"  echo \"quota exceeded\" 1>&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
 		"echo \"ok after retry\"\n"

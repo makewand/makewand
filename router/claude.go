@@ -78,6 +78,12 @@ type claudeStreamEvent struct {
 }
 
 func (c *Claude) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	return dispatchChat(ctx, c, func(attemptCtx context.Context) (string, Usage, error) {
+		return c.chatUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (c *Claude) chatUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	model := c.model
 	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
 		model = requested
@@ -128,17 +134,24 @@ func (c *Claude) Chat(ctx context.Context, messages []Message, system string, ma
 	}
 
 	usage := Usage{
-		InputTokens:  result.Usage.InputTokens,
-		OutputTokens: result.Usage.OutputTokens,
-		Cost:         c.priceForCtx(ctx, model, result.Usage.InputTokens, result.Usage.OutputTokens),
-		Model:        model,
-		Provider:     "claude",
+		MeasuredTokens: result.Usage.InputTokens > 0 || result.Usage.OutputTokens > 0,
+		InputTokens:    result.Usage.InputTokens,
+		OutputTokens:   result.Usage.OutputTokens,
+		Cost:           c.priceForCtx(ctx, model, result.Usage.InputTokens, result.Usage.OutputTokens),
+		Model:          model,
+		Provider:       "claude",
 	}
 
 	return b.String(), usage, nil
 }
 
 func (c *Claude) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	return dispatchStream(ctx, c, func(attemptCtx context.Context) (<-chan StreamChunk, error) {
+		return c.chatStreamUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (c *Claude) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	model := c.model
 	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
 		model = requested

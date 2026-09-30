@@ -1,6 +1,7 @@
 package serveralerts
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -60,6 +61,8 @@ func TestWebhookNotifier_DedupesBySeverityPerMonth(t *testing.T) {
 		t.Fatalf("OpenWebhookNotifier: %v", err)
 	}
 
+	defer notifier.Close()
+
 	now := serverusage.MonthStart(time.Now().UTC()).Add(2 * time.Hour)
 	for i, cost := range []float64{50, 35, 1, 10, 10} {
 		entry := serverusage.Entry{
@@ -71,6 +74,11 @@ func TestWebhookNotifier_DedupesBySeverityPerMonth(t *testing.T) {
 		}
 		_ = usageStore.Log(entry)
 		_ = notifier.Log(entry)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := notifier.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
 	}
 
 	if len(notifications) != 6 {

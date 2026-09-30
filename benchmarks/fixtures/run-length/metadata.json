@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "run-length",
+  "risk": "low",
+  "category": "function-fix",
+  "language": "python",
+  "public_apis": [
+    [
+      "runs.py",
+      "encode_runs"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

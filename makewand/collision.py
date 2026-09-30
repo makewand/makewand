@@ -293,7 +293,6 @@ def get_all_active_sessions_report() -> Dict[str, Any]:
     """Generates a complete host-wide session and worktree topology report."""
     ai_procs = get_active_ai_processes()
     panes = get_all_active_tmux_panes()
-    pane_map = {p["pane_pid"]: p for p in panes}
 
     by_repo: Dict[str, List[Dict[str, Any]]] = {}
     for proc in ai_procs:

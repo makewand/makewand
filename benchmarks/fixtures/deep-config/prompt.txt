@@ -1,0 +1,1 @@
+重构并修复 config_api.py 与 config_merge.py。保留两个公开接口 merge_config(payload) 和 merge_values(payload)，payload 含 dict base/override，两接口结果必须一致。仅当相同键的两值都是 dict 才递归合并；其他 override 值（包括列表和 None）完整替换。返回新结构，不修改输入，不与输入共享可变对象。API 应复用 helper，只用标准库。

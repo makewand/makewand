@@ -34,6 +34,7 @@ def get_git_timeout() -> float:
     return value if value > 0 else DEFAULT_GIT_TIMEOUT
 
 SAFE_GIT_SECURITY_FLAGS = [
+    "--no-replace-objects",
     "-c", "diff.tool=",
     "-c", "core.fsmonitor=",
     "-c", "core.hooksPath=/dev/null",
@@ -485,45 +486,71 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
     Safely copies a workspace into an isolated directory for race or testing.
     Only tracked and untracked-but-not-ignored files are copied: files matched
     by .gitignore (.env, data, logs, ...) never leave the user's workspace.
-    Skips system sockets, fifos, .git, and cache directories.
+    Skips system sockets, fifos, .git and untracked dependency/build directories.
+    Cache names never exclude tracked files or deliverable source files.
     Preserves internal symlinks safely remapped to target_dir.
     Enforces fail-closed protection against write-through external symlinks when bwrap is unavailable.
     Raises OSError when the copy or its git baseline cannot be established.
     """
     target_dir = Path(target_dir)
+    if target_dir.is_symlink():
+        raise OSError("isolated workspace target must not be a symlink")
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     resolved = Path(src_dir).resolve()
     from makewand.sandbox import is_bwrap_available
     has_bwrap = is_bwrap_available()
 
     copy_errors: List[str] = []
-    if resolved not in _refused_init_roots():
-        for rel in list_workspace_copy_paths(resolved):
+    copied_paths = set()
+    # A cache directory name is not evidence that its contents are disposable.
+    # Preserve its deliverable files, and preserve tracked files everywhere.
+    excluded = CLONE_EXCLUDED_DIRS - {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache"}
+    def copy_inputs(source_root: Path, destination_root: Path):
+        tracked = set()
+        if find_git_root(source_root):
+            code, names, detail = run_git_cmd(["git", "ls-files", "--cached", "-z", "--", "."], cwd=str(source_root), binary=True)
+            if code != 0:
+                raise OSError(f"无法核对隔离副本的已跟踪文件: {os.fsdecode(detail)}")
+            tracked = {os.fsdecode(name) for name in names.split(b"\0") if name}
+        for rel in list_workspace_copy_paths(source_root):
             rel = rel.rstrip("/")
             parts = Path(rel).parts
-            if not parts or any(part in CLONE_EXCLUDED_DIRS for part in parts) or rel.endswith(".pyc"):
+            if not parts or ".git" in parts or (rel not in tracked and any(part in excluded for part in parts)):
                 continue
             if Path(rel).is_absolute() or ".." in parts:
                 raise OSError(f"invalid workspace path from git: {rel}")
-            src_item = resolved / rel
-            dst_item = target_dir / rel
+            src_item = source_root / rel
+            dst_item = destination_root / rel
             try:
+                # A cached Git path can survive replacement of its parent with
+                # a symlink. Do not read outside the source or write through a
+                # copied directory link while materializing that tracked path.
+                for root_path, item in ((source_root, src_item), (target_dir, dst_item)):
+                    parent = item.parent
+                    while parent != root_path:
+                        if parent.is_symlink():
+                            raise OSError(f"workspace path crosses directory symlink: {item}")
+                        parent = parent.parent
                 if not os.path.lexists(src_item):
                     continue
                 dst_item.parent.mkdir(parents=True, exist_ok=True)
                 if src_item.is_symlink():
                     os.symlink(os.readlink(src_item), dst_item)
+                    copied_paths.add(dst_item.relative_to(target_dir).as_posix())
                 elif src_item.is_dir():
-                    # Submodule / nested repository entry reported as a directory.
-                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True, symlinks=True,
-                                    ignore_dangling_symlinks=True,
-                                    ignore=shutil.ignore_patterns(*CLONE_EXCLUDED_DIRS, "*.pyc"))
+                    # Gitlinks and nested repositories have their own ignore
+                    # rules. Re-enumerate there; never copy the directory whole.
+                    dst_item.mkdir(parents=True, exist_ok=True)
+                    copy_inputs(src_item, dst_item)
                 elif src_item.is_file():
                     shutil.copy2(src_item, dst_item, follow_symlinks=False)
+                    copied_paths.add(dst_item.relative_to(target_dir).as_posix())
             except OSError as exc:
-                copy_errors.append(f"{rel}: {exc}")
+                copy_errors.append(f"{src_item.relative_to(resolved)}: {exc}")
+    if resolved not in _refused_init_roots():
+        copy_inputs(resolved, target_dir)
     if copy_errors:
-        print(c(f"⚠ [Makewand Clone] {len(copy_errors)} 个文件复制失败: {'; '.join(copy_errors[:3])}", COLOR_YELLOW), file=sys.stderr)
+        raise OSError(f"隔离副本复制不完整: {'; '.join(copy_errors[:3])}")
 
     # Sanitize symlinks across target_dir
     sanitize_shadow_symlinks(target_dir, resolved)
@@ -541,11 +568,22 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
     for cmd in (["git", "init", "-q"],
                 ["git", "config", "user.name", "Makewand"],
                 ["git", "config", "user.email", "makewand@local"],
-                ["git", "add", "-A"],
-                ["git", "commit", "-q", "--no-verify", "-m", "Makewand isolated baseline", "--allow-empty"]):
+                ["git", "add", "-A"]):
         code, _, err = run_git_cmd(cmd, cwd=str(target_dir))
         if code != 0:
             raise OSError(f"隔离副本基线建立失败 ({' '.join(cmd[1:3])}, rc={code}): {(err or '').strip()[:200]}")
+    # Only force-add the exact safely enumerated files. A source file that was
+    # tracked before a later .gitignore rule must remain tracked in the clone.
+    # Literal pathspecs prevent a copied filename containing '*' from admitting
+    # other ignored files. Sanitized, removed links are not staged.
+    copied = sorted(path for path in copied_paths if os.path.lexists(target_dir / path))
+    for offset in range(0, len(copied), 256):
+        code, _, err = run_git_cmd(["git", "--literal-pathspecs", "add", "-f", "--", *copied[offset:offset + 256]], cwd=str(target_dir))
+        if code != 0:
+            raise OSError(f"隔离副本安全基线暂存失败: {(err or '').strip()[:200]}")
+    code, _, err = run_git_cmd(["git", "commit", "-q", "--no-verify", "-m", "Makewand isolated baseline", "--allow-empty"], cwd=str(target_dir))
+    if code != 0:
+        raise OSError(f"隔离副本基线提交失败: {(err or '').strip()[:200]}")
 
 def get_active_interactive_working_trees():
     """

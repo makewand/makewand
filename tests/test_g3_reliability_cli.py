@@ -61,6 +61,55 @@ class _CliCase(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
 
+class TestNativeCommandDelegation(_CliCase):
+    def test_shared_globals_reach_native_commands_without_losing_values(self):
+        from makewand.command_contract import NATIVE_GO_COMMANDS, PYTHON_COMMANDS
+        prefixes = [[], ["-C", "directory with spaces"], ["--cwd=directory with spaces"],
+                    ["--repo-trust", "untrusted"], ["--debug", "--approval=safe"],
+                    ["-Cdirectory with spaces"], ["--max-model-calls", "12"],
+                    ["--call-budget-file=temporary-ledger.json"]]
+        for command in sorted(NATIVE_GO_COMMANDS - PYTHON_COMMANDS):
+            for prefix in prefixes:
+                with self.subTest(command=command, prefix=prefix), patch.object(cli, "delegate_to_go_server") as delegate:
+                    arguments = [*prefix, command, "--help"]
+                    code, _, err = self.run_main(*arguments)
+                    self.assertEqual(code, 0, err)
+                    delegate.assert_called_once_with(arguments)
+
+    def test_python_task_globals_are_rejected_before_native_execution(self):
+        from makewand.command_contract import PYTHON_BOOLEAN_FLAGS, PYTHON_VALUE_FLAGS, SHARED_VALUE_FLAGS
+        flags = [[flag] for flag in sorted(PYTHON_BOOLEAN_FLAGS)]
+        flags += [[flag, "value"] for flag in sorted(PYTHON_VALUE_FLAGS - SHARED_VALUE_FLAGS)]
+        flags += [["-ftask.txt"], ["-Ftask.txt"]]
+        for arguments in flags:
+            for before in (True, False):
+                argv = [*arguments, "serve", "--help"] if before else ["serve", *arguments, "--help"]
+                with self.subTest(argv=argv), patch.object(cli, "delegate_to_go_server") as delegate:
+                    code, _, err = self.run_main(*argv)
+                    self.assertEqual(code, cli.EXIT_USAGE_ERROR)
+                    self.assertIn("cannot be honored", err)
+                    delegate.assert_not_called()
+
+    def test_python_command_ownership_and_literal_native_arguments_remain_intact(self):
+        self.assertIsNone(cli._plan_native_go_delegation(["-C", "/tmp", "repomap", "--help"]))
+        self.assertIsNone(cli._plan_native_go_delegation(["quota", "--json"]))
+        self.assertIsNone(cli._plan_native_go_delegation(["--cwd"]))
+        self.assertEqual(cli._plan_native_go_delegation(["new", "--", "--file"]), ["new", "--", "--file"])
+        self.assertEqual(cli._plan_native_go_delegation(["-C", "-f", "serve"]), ["-C", "-f", "serve"])
+
+    def test_bundled_python_engine_finds_its_own_native_binary(self):
+        engine = self.root / "release/lib/makewand/python/makewand/cli.py"
+        engine.parent.mkdir(parents=True)
+        for name in ("makewand", "makewand.exe"):
+            with self.subTest(executable=name):
+                binary = self.root / "release" / name
+                binary.write_text("fixture")
+                binary.chmod(0o755)
+                with patch.object(cli, "__file__", str(engine)), patch("shutil.which", return_value=None):
+                    self.assertEqual(cli._find_go_binary(), str(binary))
+                binary.unlink()
+
+
 class TestQuotaHonesty(_CliCase):
     """arch-product#5."""
 

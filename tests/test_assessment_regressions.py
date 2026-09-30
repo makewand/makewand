@@ -143,6 +143,7 @@ class AssessmentFixtures(unittest.TestCase):
         info = dict(race["candidates"]["A"])
         info.pop("manifest")
         info.pop("changes")
+        info.pop("input_manifest", None)
         candidate.CandidateManager.save_race(
             "mode", "delete second", str(base), race["baseline_commit"],
             info, {}, winner="A")
@@ -212,27 +213,59 @@ class AssessmentFixtures(unittest.TestCase):
             s.enter_context(contextlib.redirect_stdout(io.StringIO()))
             self.assertFalse(orch.run_pipeline("Implement update", cwd=str(repo), force_code=True, auto_fix=False))
 
-    def run_race_fixture(self, verdict):
+    def run_race_fixture(self, verdict, timeout=300, on_dispatch=None):
         repo = self.root / "race"
         init_repo(repo)
         (repo / "app.py").write_text("BASE = 1\n")
+        (repo / "test_app.py").write_text("def test_candidate():\n    import app\n    assert app.CANDIDATE == 1\n")
         git(repo, "add", "-A")
         git(repo, "commit", "-m", "baseline")
 
-        def dispatch(engine, prompt, cwd, **kwargs):
+        def dispatch(engine, prompt, cwd, readonly=False, **kwargs):
+            if on_dispatch:
+                on_dispatch(engine, readonly, kwargs)
+            if readonly:
+                return True, verdict, None
             (Path(cwd) / "app.py").write_text("CANDIDATE = 1\n")
             return True, "implemented", None
 
         with contextlib.ExitStack() as s:
             s.enter_context(patch.object(orch, "CANDIDATES_DIR", config.CANDIDATES_DIR))
             s.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
+            s.enter_context(patch.object(orch.os, "getloadavg", return_value=(25.0, 25.0, 25.0)))
             s.enter_context(patch.object(orch, "get_or_update_status", return_value={}))
             s.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
-            s.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
-            s.enter_context(patch.object(orch, "execute_agy_task", return_value=(True, verdict, None)))
+            s.enter_context(patch.object(orch, "run_local_tests", return_value=(True, "fixture test command passed")))
             s.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            code = orch.run_race("Implement update", cwd=str(repo), engine_a="codex", engine_b="claude")
+            code = orch.run_race("Implement update", cwd=str(repo), engine_a="codex", engine_b="claude", timeout=timeout)
         return code, candidate.CandidateManager.get_race()
+
+    def test_race_sequential_stages_share_the_total_time_budget(self):
+        import time
+        timeouts = []
+        def observe(engine, readonly, kwargs):
+            timeouts.append(kwargs["timeout"])
+            if not readonly:
+                time.sleep(1.05)
+        code, race = self.run_race_fixture('MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "B", "defects": []}', timeout=8, on_dispatch=observe)
+        self.assertEqual(code, orch.EXIT_PASSED)
+        self.assertEqual(len(timeouts), 3)
+        self.assertGreater(timeouts[0], timeouts[1])
+        # Both contestants share the generation deadline. The independent
+        # judge receives the time held back before generation started.
+        self.assertLess(timeouts[2], timeouts[0] + 2)
+        self.assertGreater(timeouts[2], timeouts[1])
+
+    def test_expired_race_does_not_admit_another_model_call(self):
+        import time
+        calls = []
+        def exhaust(engine, readonly, kwargs):
+            calls.append(engine)
+            time.sleep(2.1)
+        code, race = self.run_race_fixture('MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "B", "defects": []}', timeout=2, on_dispatch=exhaust)
+        self.assertNotEqual(code, orch.EXIT_PASSED)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(race["winner"])
 
     def test_race_natural_language_rejection_never_picks_fastest(self):
         code, race = self.run_race_fixture("两套候选方案均存在严重安全缺陷，拒绝采纳任何方案。")

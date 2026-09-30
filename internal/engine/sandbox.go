@@ -21,6 +21,10 @@ type ExecResult struct {
 	Stderr   string
 	ExitCode int
 	Duration time.Duration
+	// Dropped bytes report bounded output capture without turning a successful
+	// command into an io.ErrShortWrite failure.
+	StdoutDroppedBytes int64
+	StderrDroppedBytes int64
 }
 
 // ExecPlan describes one command candidate detected from project files.
@@ -454,19 +458,26 @@ func (p *Project) RunTests(ctx context.Context) (*ExecResult, error) {
 
 // limitedWriter wraps a bytes.Buffer but silently discards data beyond the limit.
 type limitedWriter struct {
-	buf   bytes.Buffer
-	limit int
+	buf     bytes.Buffer
+	limit   int
+	dropped int64
 }
 
 func (w *limitedWriter) Write(p []byte) (int, error) {
+	inputLen := len(p)
 	remaining := w.limit - w.buf.Len()
 	if remaining <= 0 {
-		return len(p), nil // discard
+		w.dropped += int64(inputLen)
+		return inputLen, nil // discard
 	}
 	if len(p) > remaining {
+		w.dropped += int64(len(p) - remaining)
 		p = p[:remaining]
 	}
-	return w.buf.Write(p)
+	if _, err := w.buf.Write(p); err != nil {
+		return 0, err
+	}
+	return inputLen, nil
 }
 
 func (w *limitedWriter) String() string { return w.buf.String() }
@@ -541,9 +552,11 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 	duration := time.Since(start)
 
 	result := &ExecResult{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		Duration: duration,
+		Stdout:             stdout.String(),
+		Stderr:             stderr.String(),
+		Duration:           duration,
+		StdoutDroppedBytes: stdout.dropped,
+		StderrDroppedBytes: stderr.dropped,
 	}
 
 	if err != nil {

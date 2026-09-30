@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "query-values",
+  "risk": "medium",
+  "category": "input-boundary",
+  "language": "python",
+  "public_apis": [
+    [
+      "query.py",
+      "parse_query"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

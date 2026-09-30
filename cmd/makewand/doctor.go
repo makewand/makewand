@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/makewand/makewand/execution"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
@@ -398,7 +401,7 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 			for try := 0; try <= opts.probeRetries; try++ {
 				attemptCount++
 				ctx, cancel := context.WithTimeout(context.Background(), opts.probeTimeout)
-				content, usage, err := prov.Chat(ctx, prompt, system, model.MaxTokensForTask(model.TaskExplain))
+				content, usage, err := model.ChatProvider(ctx, prov, prompt, system, model.MaxTokensForTask(model.TaskExplain))
 				cancel()
 				if err == nil && strings.TrimSpace(content) != "" {
 					probeResult.Provider = providerName
@@ -418,6 +421,9 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 					err:      err,
 				})
 				// Invalid config/auth/binary errors are non-retryable for this provider.
+				if errors.Is(err, execution.ErrUnknownOutcome) || errors.Is(err, execution.ErrBudgetExhausted) {
+					break probeProvidersLoop
+				}
 				if class == probeClassConfiguration {
 					break
 				}

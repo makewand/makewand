@@ -1,0 +1,1 @@
+修复 retry.py 的 recover_sequence(events)。这是不睡眠、不访问网络的确定性重试模拟。先验证所有事件只能是 ok/transient/fatal，否则 ValueError。按顺序最多执行3次：ok成功停止、fatal失败停止、transient仅在还有下一事件且未达到上限时记录退避延迟 1、2 并继续。事件耗尽失败。返回 dict：status 为 ok/failed，attempts 为实际次数，delays 为延迟列表。不得修改输入，只用标准库。

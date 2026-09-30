@@ -174,12 +174,17 @@ class DeliveryBindingTests(unittest.TestCase):
     def test_race_metadata_change_during_review_returns_unverified_without_traceback(self):
         import makewand.config as config
         candidates = self.root / "candidates"
+        (self.base / "test_app.py").write_text("def test_fixture():\n    assert True\n")
 
-        def dispatch(engine, prompt, cwd, **kwargs):
+        def dispatch(engine, prompt, cwd, readonly=False, **kwargs):
+            if readonly:
+                return judge(engine, prompt, cwd=cwd, **kwargs)
             (Path(cwd) / "app.txt").write_text("APPROVED\n")
             return True, "implemented", None
 
+        judge_calls = []
         def judge(*args, **kwargs):
+            judge_calls.append((args, kwargs))
             candidate = next(candidates.glob("*/agent_a"))
             git(candidate, "rm", "--cached", "app.txt")
             (candidate / ".git/info/exclude").write_text("app.txt\n")
@@ -193,11 +198,12 @@ class DeliveryBindingTests(unittest.TestCase):
             stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
             stack.enter_context(patch.object(orch, "get_or_update_status", return_value={}))
             stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
-            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
-            stack.enter_context(patch.object(orch, "execute_agy_task", side_effect=judge))
+            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, "fixture tests passed")))
+            stack.enter_context(patch.object(orch, "execute_agy_task", side_effect=AssertionError("race judging must use the unified dispatcher")))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = orch.run_race("Implement update", cwd=str(self.base), engine_a="codex", engine_b="claude")
         self.assertEqual(code, orch.EXIT_UNVERIFIED)
+        self.assertEqual(len(judge_calls), 1)
         self.assertEqual(list(candidates.iterdir()), [])
 
     def test_verified_tree_preserves_binary_symlink_and_executable_inputs(self):

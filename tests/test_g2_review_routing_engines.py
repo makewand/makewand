@@ -92,6 +92,7 @@ class TestRunRaceHonoursDisableAndHealth(unittest.TestCase):
         for args in (["init"], ["config", "user.name", "G2"], ["config", "user.email", "g2@example.invalid"]):
             run_git_cmd(["git", *args], cwd=str(self.repo))
         (self.repo / "app.py").write_text("BASE = 1\n", encoding="utf-8")
+        (self.repo / "test_app.py").write_text("def test_fixture():\n    assert True\n", encoding="utf-8")
         run_git_cmd(["git", "add", "-A"], cwd=str(self.repo))
         run_git_cmd(["git", "commit", "-m", "baseline"], cwd=str(self.repo))
         self.candidates = self.root / "config" / "candidates"
@@ -113,17 +114,16 @@ class TestRunRaceHonoursDisableAndHealth(unittest.TestCase):
             (Path(cwd) / "app.py").write_text(f"CANDIDATE = '{engine}'\n", encoding="utf-8")
             return True, "implemented", None
 
-        agy_judge = MagicMock(return_value=(True, verdict, None))
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
             stack.enter_context(patch.object(orch, "get_or_update_status", return_value=cache))
             stack.enter_context(patch("makewand.config.is_provider_enabled", side_effect=enabled_except(*disabled)))
             stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
-            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
-            stack.enter_context(patch.object(orch, "execute_agy_task", agy_judge))
+            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, "fixture tests passed")))
+            stack.enter_context(patch.object(orch, "execute_agy_task", side_effect=AssertionError("race judging must use the unified dispatcher")))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = orch.run_race("Implement update", cwd=str(self.repo), engine_a=engine_a, engine_b=engine_b)
-        return code, agy_judge.call_count
+        return code, self.dispatched.count(("agy", True))
 
     def test_no_contestant_falls_back_to_disabled_agy(self):
         cache = {e: {"status": "missing"} for e in ("claude", "codex", "grok", "muse", "local")}

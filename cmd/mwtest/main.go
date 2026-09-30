@@ -118,7 +118,7 @@ func main() {
 
 		ctx, cancel := context.WithTimeout(context.Background(), *requestTimeout)
 		start := time.Now()
-		content, usage, err := p.Chat(ctx, []model.Message{
+		content, usage, err := model.ChatProvider(ctx, p, []model.Message{
 			{Role: "user", Content: codeTest.prompt},
 		}, "You are a helpful programming assistant.", 4096)
 		elapsed := time.Since(start)

@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/makewand/makewand/execution"
 )
 
 // Prompt delivery modes for custom command providers.
@@ -484,7 +486,7 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 
 		if attempts >= cliMaxAttempts || !isTransientCLIError(err) || ctx.Err() != nil {
 			if attempts > 1 {
-				return "", Usage{}, fmt.Errorf("%s (after %d attempts)", err.Error(), attempts)
+				return "", Usage{}, fmt.Errorf("%w (after %d attempts)", err, attempts)
 			}
 			return "", Usage{}, err
 		}
@@ -495,7 +497,7 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 		case <-ctx.Done():
 			timer.Stop()
 			if attempts > 1 {
-				return "", Usage{}, fmt.Errorf("%s (after %d attempts)", err.Error(), attempts)
+				return "", Usage{}, fmt.Errorf("%w (after %d attempts)", err, attempts)
 			}
 			return "", Usage{}, err
 		case <-timer.C:
@@ -504,6 +506,18 @@ func (c *CLIProvider) Chat(ctx context.Context, messages []Message, system strin
 }
 
 func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	ctx, attempt, err := reserveProvider(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := c.chatStreamUnaccounted(ctx, messages, system, maxTokens)
+	if err != nil {
+		return nil, completeProvider(attempt, Usage{}, err)
+	}
+	return observeDispatchStream(ctx, stream, attempt), nil
+}
+
+func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	var prompt string
 	if c.systemFlag != "" && system != "" {
 		prompt = buildCLIPrompt(messages, "")
@@ -570,7 +584,7 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 
 		scanner := bufio.NewScanner(stdoutPipe)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		terminalSent := false
+		var parseFailure error
 	streamLoop:
 		for scanner.Scan() {
 			select {
@@ -587,19 +601,30 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 			if c.parseStreamLine != nil {
 				chunks, parseErr := c.parseStreamLine(line)
 				if parseErr != nil {
-					ch <- StreamChunk{Error: newProviderError(c.provider, "CLI stream parse", ErrorKindProvider, false, 0, parseErr.Error(), parseErr)}
-					terminalSent = true
+					parseFailure = newProviderError(c.provider, "CLI stream parse", ErrorKindProvider, false, 0, parseErr.Error(), parseErr)
+					killCLIProcess(cmd)
 					break streamLoop
 				}
 				for _, chunk := range chunks {
+					if chunk.Error != nil {
+						parseFailure = chunk.Error
+						killCLIProcess(cmd)
+						break streamLoop
+					}
+					// A vendor's logical done event is provisional until the
+					// process exits successfully; otherwise a late failure can be
+					// recorded as success and hide an unknown dispatch outcome.
+					if chunk.Done {
+						chunk.Done = false
+						if chunk.Content == "" {
+							continue
+						}
+					}
 					select {
 					case ch <- chunk:
 					case <-ctx.Done():
 						killCLIProcess(cmd)
 						break streamLoop
-					}
-					if chunk.Done || chunk.Error != nil {
-						terminalSent = true
 					}
 				}
 				continue
@@ -631,15 +656,17 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 			ch <- StreamChunk{Error: newProviderError(c.provider, "CLI stream", ErrorKindProvider, false, 0, scanErr.Error(), scanErr)}
 			return
 		}
+		if parseFailure != nil {
+			ch <- StreamChunk{Error: parseFailure, Done: true}
+			return
+		}
 
 		if waitErr != nil {
 			ch <- StreamChunk{Error: formatCLIExecutionError(c.provider, stderr.String(), waitErr, nil, duration)}
 			return
 		}
 
-		if !terminalSent {
-			ch <- StreamChunk{Done: true}
-		}
+		ch <- StreamChunk{Done: true}
 	}()
 
 	return ch, nil
@@ -675,10 +702,16 @@ func parseClaudeCLIJSON(raw []byte) (string, *Usage, error) {
 	}
 
 	usage := &Usage{
-		InputTokens:  resp.Usage.InputTokens,
-		OutputTokens: resp.Usage.OutputTokens,
-		Cost:         resp.TotalCostUSD,
-		Provider:     "claude",
+		InputTokens:    resp.Usage.InputTokens,
+		OutputTokens:   resp.Usage.OutputTokens,
+		Cost:           resp.TotalCostUSD,
+		Provider:       "claude",
+		MeasuredTokens: resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0,
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) == nil {
+		value, exists := fields["total_cost_usd"]
+		usage.MeasuredCost = exists && string(value) != "null"
 	}
 
 	// Extract model name and per-model cost from modelUsage if available.
@@ -692,9 +725,11 @@ func parseClaudeCLIJSON(raw []byte) (string, *Usage, error) {
 		}
 		if mu.CostUSD > 0 {
 			usage.Cost = mu.CostUSD
+			usage.MeasuredCost = true
 		}
 		break // Take the first (usually only) model entry.
 	}
+	usage.MeasuredTokens = usage.InputTokens > 0 || usage.OutputTokens > 0
 
 	return content, usage, nil
 }
@@ -751,6 +786,7 @@ func parseGeminiCLIJSON(raw []byte) (string, *Usage, error) {
 	}
 	usage.InputTokens = totalInput
 	usage.OutputTokens = totalOutput
+	usage.MeasuredTokens = totalInput > 0 || totalOutput > 0
 	usage.Model = modelName
 
 	return content, usage, nil
@@ -847,10 +883,11 @@ func parseCodexCLIJSONL(raw []byte) (string, *Usage, error) {
 			// Extract real token usage from the turn summary.
 			if event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0 {
 				bestUsage = &Usage{
-					InputTokens:  event.Usage.InputTokens,
-					OutputTokens: event.Usage.OutputTokens,
-					Cost:         0, // Codex CLI uses subscription; no per-token cost.
-					Provider:     "codex",
+					MeasuredTokens: true,
+					InputTokens:    event.Usage.InputTokens,
+					OutputTokens:   event.Usage.OutputTokens,
+					Cost:           0, // Codex CLI uses subscription; no per-token cost.
+					Provider:       "codex",
 				}
 			}
 		}
@@ -969,6 +1006,19 @@ func codexSandboxMode(ctx context.Context) string {
 }
 
 func (c *CLIProvider) chatAttempt(ctx context.Context, prompt, validationPrompt, scratchDir string) (string, *Usage, error) {
+	ctx, attempt, err := reserveProvider(ctx, c)
+	if err != nil {
+		return "", nil, err
+	}
+	content, usage, err := c.chatReservedAttempt(ctx, prompt, validationPrompt, scratchDir)
+	var observed Usage
+	if usage != nil {
+		observed = *usage
+	}
+	return content, usage, completeProvider(attempt, observed, err)
+}
+
+func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validationPrompt, scratchDir string) (string, *Usage, error) {
 	cmd := c.buildCmd(ctx, prompt)
 	applyCLIWorkDir(ctx, cmd, scratchDir)
 	setCLIProcessGroup(cmd)
@@ -1135,6 +1185,9 @@ func isTransientCLIError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, execution.ErrUnknownOutcome) || stopExecutionReplay(err) {
+		return false
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
@@ -1175,6 +1228,12 @@ func formatCLIContextError(provider string, ctxErr error, duration time.Duration
 	default:
 		return newProviderError(provider, "CLI", ErrorKindProvider, false, 0, fmt.Sprintf("context error after %s: %v", rounded, ctxErr), ctxErr)
 	}
+}
+
+// ClassifyCLIExecutionError shares the single-process CLI outcome classification
+// with comparison tools that dispatch a raw vendor process without retries.
+func ClassifyCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+	return formatCLIExecutionError(provider, stderr, runErr, ctxErr, duration)
 }
 
 func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {

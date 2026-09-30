@@ -1,0 +1,1 @@
+修复 search.py 的 lower_bound(payload)。payload 含升序数字列表 items 与数字 target；返回首个大于等于 target 的索引，若不存在返回长度。允许重复值和空列表。items 非升序应抛 ValueError；不得修改输入。只用标准库。

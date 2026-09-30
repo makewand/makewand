@@ -10,10 +10,15 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/makewand/makewand/execution"
+
 	"github.com/makewand/makewand/internal/model"
 )
 
 type CandidateAttempt struct {
+	TaskID       string
+	ID           string
+	Status       execution.Status
 	Index        int
 	Requested    string
 	Provider     string
@@ -32,6 +37,9 @@ type CandidateAttempt struct {
 }
 
 type CandidateSelection struct {
+	TaskID          string
+	Status          execution.Status
+	Attempts        []CandidateState
 	Content         string
 	Provider        string
 	Usage           model.Usage
@@ -67,6 +75,19 @@ type CandidateSelection struct {
 }
 
 type CandidateProgressStage string
+
+// CandidateState keeps each outcome without retaining discarded candidate payloads.
+type CandidateState struct {
+	TaskID         string
+	ID             string
+	Requested      string
+	Provider       string
+	Status         execution.Status
+	Usage          model.Usage
+	Strength       int
+	ArtifactDigest string
+	ErrorKind      *string
+}
 
 const (
 	CandidateProgressRunning   CandidateProgressStage = "running"
@@ -162,11 +183,58 @@ func RunCandidateSelection(
 	system string,
 	progress CandidateProgressFunc,
 	exclude ...string,
-) CandidateSelection {
+) (selection CandidateSelection) {
+	var executionErr error
+	var executionConfig execution.Config
+	ctx, executionConfig, executionErr = execution.EnsureContext(ctx)
+	if executionErr != nil {
+		return CandidateSelection{Err: executionErr, Status: execution.InvalidRequest}
+	}
+	options, err := candidateSelectionOptions(ctx)
+	if err != nil {
+		return CandidateSelection{TaskID: executionConfig.TaskID, Err: err, Status: execution.InvalidRequest}
+	}
+	if options.Timeout > 0 {
+		var cancelTimeout context.CancelFunc
+		ctx, cancelTimeout = context.WithTimeout(ctx, options.Timeout)
+		defer cancelTimeout()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	selectionStage, executionErr := execution.StartStage(ctx, "selection", "go", false)
+	if executionErr != nil {
+		return CandidateSelection{TaskID: executionConfig.TaskID, Err: executionErr, Status: execution.InternalError}
+	}
+	var allAttempts []CandidateState
+	defer func() {
+		selection.TaskID = executionConfig.TaskID
+		selection.Attempts = allAttempts
+		switch {
+		case selection.Err != nil:
+			selection.Status = candidateErrorStatus(selection.Err)
+		case selection.Verified:
+			selection.Status = execution.Passed
+		case selection.Content != "":
+			selection.Status = execution.Unverified
+		case ctx.Err() != nil:
+			selection.Status = candidateErrorStatus(ctx.Err())
+		default:
+			selection.Status = execution.Failed
+		}
+		outcome := execution.Outcome{Status: selection.Status, Known: selection.Status != execution.Unknown && selection.Status != execution.Timeout && selection.Status != execution.Cancelled}
+		if selection.VerifiedDigest != "" {
+			outcome.ArtifactDigest = &selection.VerifiedDigest
+		}
+		if err := selectionStage.Complete(outcome); err != nil {
+			selection.Err = err
+			selection.Status = execution.InternalError
+		}
+	}()
 
 	providers := OrderedCandidateProviders(router, phase, exclude...)
+	if options.MaxCandidates > 0 && len(providers) > options.MaxCandidates {
+		providers = providers[:options.MaxCandidates]
+	}
 	if len(providers) == 0 {
 		// In untrusted mode the candidate provider set is filtered to
 		// untrusted-repo-safe (direct API) providers; an empty set is the
@@ -179,20 +247,69 @@ func RunCandidateSelection(
 	}
 
 	results := make(chan CandidateAttempt, len(providers))
+	concurrency := len(providers)
+	if options.MaxConcurrent > 0 && options.MaxConcurrent < concurrency {
+		concurrency = options.MaxConcurrent
+	}
+	slots := make(chan struct{}, concurrency)
+	turns := make([]chan struct{}, len(providers)+1)
+	if concurrency == 1 {
+		for i := range turns {
+			turns[i] = make(chan struct{})
+		}
+		close(turns[0])
+	}
+	budget := &candidateCostBudget{limit: options.MaxCostUSD}
 	var wg sync.WaitGroup
 	for i, name := range providers {
 		wg.Add(1)
 		go func(idx int, providerName string) {
 			defer wg.Done()
+			if concurrency == 1 {
+				defer close(turns[idx+1])
+				select {
+				case <-turns[idx]:
+				case <-ctx.Done():
+					results <- CandidateAttempt{Index: idx, Requested: providerName, Provider: providerName, Err: ctx.Err()}
+					reportProgress(progress, providerName, CandidateProgressCanceled)
+					return
+				}
+			}
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				results <- CandidateAttempt{Index: idx, Requested: providerName, Provider: providerName, Err: ctx.Err()}
+				reportProgress(progress, providerName, CandidateProgressCanceled)
+				return
+			}
+			if ctx.Err() != nil || !budget.admit() {
+				results <- CandidateAttempt{Index: idx, Requested: providerName, Provider: providerName, Err: context.Canceled}
+				reportProgress(progress, providerName, CandidateProgressCanceled)
+				return
+			}
 			reportProgress(progress, providerName, CandidateProgressRunning)
-			attemptCtx := ctx
+			candidateID := execution.NewID()
+			attemptCtx := execution.ContextWithStage(ctx, "generation")
 			candidateProject := project
 			if project != nil {
-				cloned, cloneErr := project.CloneToTemp()
+				copyStage, stageErr := execution.StartStageForAttempt(attemptCtx, "copy", providerName, false, candidateID)
+				if stageErr != nil {
+					results <- CandidateAttempt{Index: idx, Requested: providerName, Provider: providerName, ID: candidateID, Err: stageErr}
+					return
+				}
+				cloned, cloneErr := project.cloneToTempContext(ctx, nil)
+				if eventErr := copyStage.Complete(execution.Outcome{Status: candidateErrorStatus(cloneErr), Known: true}); eventErr != nil {
+					cloneErr = errors.Join(cloneErr, eventErr)
+				}
 				if cloneErr != nil {
+					if cloned != nil {
+						_ = os.RemoveAll(cloned.Path)
+					}
 					reportProgress(progress, providerName, CandidateProgressFailed)
 					results <- CandidateAttempt{
 						Index:     idx,
+						ID:        candidateID,
 						Requested: providerName,
 						Provider:  providerName,
 						Err:       cloneErr,
@@ -201,12 +318,22 @@ func RunCandidateSelection(
 				}
 				defer os.RemoveAll(cloned.Path)
 				candidateProject = cloned
-				attemptCtx = model.ContextWithWorkDir(ctx, cloned.Path)
+				attemptCtx = model.ContextWithWorkDir(attemptCtx, cloned.Path)
 			}
 
 			attemptExclude := isolatedCandidateExcludes(router, providerName, exclude...)
+			generationStage, stageErr := execution.StartStageForAttempt(attemptCtx, "generation", providerName, false, candidateID)
+			if stageErr != nil {
+				results <- CandidateAttempt{Index: idx, Requested: providerName, Provider: providerName, ID: candidateID, Err: stageErr}
+				return
+			}
 			content, usage, route, err := router.ChatWith(attemptCtx, providerName, phase, messages, system, attemptExclude...)
+			if eventErr := generationStage.Complete(execution.Outcome{Status: candidateErrorStatus(err), Known: err == nil || !errors.Is(err, execution.ErrUnknownOutcome)}); eventErr != nil {
+				err = errors.Join(err, eventErr)
+			}
+			budget.record(usage.Cost)
 			attempt := CandidateAttempt{
+				ID:        candidateID,
 				Index:     idx,
 				Requested: providerName,
 				Content:   content,
@@ -245,7 +372,27 @@ func RunCandidateSelection(
 				}
 				if attempt.Err == nil && project != nil && len(attempt.Files) > 0 {
 					reportProgress(progress, providerName, CandidateProgressVerifying)
-					verification, verifyErr := project.EvaluateCandidateFiles(ctx, attempt.Files)
+					verificationStage, stageErr := execution.StartStageForAttempt(attemptCtx, "verification", providerName, true, candidateID)
+					if stageErr != nil {
+						attempt.Err = stageErr
+						results <- attempt
+						return
+					}
+					verification, verifyErr := project.EvaluateCandidateFiles(attemptCtx, attempt.Files)
+					verificationStatus := candidateErrorStatus(verifyErr)
+					if verifyErr == nil && !verification.Passed {
+						verificationStatus = execution.Unverified
+						if verification.IsolationError != "" {
+							verificationStatus = execution.SandboxUnavailable
+						}
+					}
+					verificationOutcome := execution.Outcome{Status: verificationStatus, Known: true}
+					if verification.VerifiedDigest != "" {
+						verificationOutcome.ArtifactDigest = &verification.VerifiedDigest
+					}
+					if eventErr := verificationStage.Complete(verificationOutcome); eventErr != nil {
+						verifyErr = errors.Join(verifyErr, eventErr)
+					}
 					if verifyErr != nil {
 						attempt.Err = verifyErr
 					} else {
@@ -275,6 +422,20 @@ func RunCandidateSelection(
 
 	for completed := 0; completed < len(providers); completed++ {
 		attempt := <-results
+		attempt.TaskID = executionConfig.TaskID
+		if attempt.ID == "" {
+			attempt.ID = execution.NewID()
+		}
+		attempt.Status = candidateErrorStatus(attempt.Err)
+		if attempt.Err == nil && !attempt.Verification.Passed {
+			attempt.Status = execution.Unverified
+		}
+		state := CandidateState{TaskID: attempt.TaskID, ID: attempt.ID, Requested: attempt.Requested, Provider: attempt.Provider, Status: attempt.Status, Usage: attempt.Usage, Strength: attempt.Verification.Strength, ArtifactDigest: attempt.Verification.VerifiedDigest}
+		if attempt.Err != nil {
+			kind := string(model.ErrorKindOf(attempt.Err))
+			state.ErrorKind = &kind
+		}
+		allAttempts = append(allAttempts, state)
 		totalUsage.InputTokens += attempt.Usage.InputTokens
 		totalUsage.OutputTokens += attempt.Usage.OutputTokens
 		totalUsage.Cost += attempt.Usage.Cost
@@ -289,6 +450,9 @@ func RunCandidateSelection(
 		// way the all-failure return below surfaces it so callers can present the
 		// actionable message rather than a generic failure.
 		if untrustedSafeErr == nil && errors.Is(attempt.Err, model.ErrNoUntrustedSafeProvider) {
+			untrustedSafeErr = attempt.Err
+		}
+		if untrustedSafeErr == nil && (errors.Is(attempt.Err, execution.ErrBudgetExhausted) || errors.Is(attempt.Err, execution.ErrUnknownOutcome)) {
 			untrustedSafeErr = attempt.Err
 		}
 		// Track deletions even from a delete-only candidate that returned empty
@@ -383,6 +547,23 @@ func RunCandidateSelection(
 // of its delivered content. Only a passing verification replaces the delivered
 // files with the verified set (which keeps baseline tests); otherwise the raw
 // candidate content, test edits included, goes to manual approval.
+func candidateErrorStatus(err error) execution.Status {
+	switch {
+	case err == nil:
+		return execution.Passed
+	case errors.Is(err, execution.ErrBudgetExhausted):
+		return execution.BudgetExhausted
+	case errors.Is(err, context.Canceled):
+		return execution.Cancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		return execution.Timeout
+	case errors.Is(err, execution.ErrUnknownOutcome):
+		return execution.Unknown
+	default:
+		return execution.Failed
+	}
+}
+
 func discardedTestEdits(attempt CandidateAttempt) []string {
 	if !attempt.Verification.Passed || len(attempt.Verification.RestoredTests) == 0 {
 		return nil

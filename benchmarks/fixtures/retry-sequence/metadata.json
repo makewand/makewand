@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "retry-sequence",
+  "risk": "high",
+  "category": "exception-recovery",
+  "language": "python",
+  "public_apis": [
+    [
+      "retry.py",
+      "recover_sequence"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

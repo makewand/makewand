@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,6 +46,7 @@ type Filter struct {
 	Since      time.Time
 	Until      time.Time
 	Limit      int
+	Offset     int
 	StreamOnly bool
 }
 
@@ -86,6 +88,99 @@ type Logger interface {
 // Reader loads usage entries from a backing store.
 type Reader interface {
 	Load(Filter) ([]Entry, error)
+}
+
+// Aggregator lets persistent stores calculate totals without loading event
+// bodies into application memory. Existing Reader implementations still work.
+type Aggregator interface {
+	Summarize(Filter) (Summary, error)
+	Spend(Filter) (float64, int, error)
+}
+
+type Counter interface{ Count(Filter) (int, error) }
+type PeriodAggregator interface {
+	MonthlyPeriods(Filter) ([]PeriodSummary, error)
+}
+
+func Count(reader Reader, filter Filter) (int, error) {
+	filter.Limit, filter.Offset = 0, 0
+	if c, ok := reader.(Counter); ok {
+		return c.Count(filter)
+	}
+	entries, err := reader.Load(filter)
+	return len(entries), err
+}
+
+func MonthlyPeriods(reader Reader, filter Filter) ([]PeriodSummary, error) {
+	if a, ok := reader.(PeriodAggregator); ok {
+		return a.MonthlyPeriods(filter)
+	}
+	entries, err := reader.Load(filter)
+	if err != nil {
+		return nil, err
+	}
+	return SummarizeMonthlyPeriods(entries), nil
+}
+
+// Count scans JSONL without retaining event bodies in memory.
+func (r *JSONLReader) Count(filter Filter) (int, error) {
+	if r == nil {
+		return 0, fmt.Errorf("usage reader is unavailable")
+	}
+	f, err := os.Open(r.path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(bufio.NewReader(f))
+	count := 0
+	for {
+		var entry Entry
+		if err := dec.Decode(&entry); err != nil {
+			if err == io.EOF {
+				return count, nil
+			}
+			return 0, err
+		}
+		if matchesFilter(entry, filter) {
+			count++
+		}
+	}
+}
+
+func Summarize(reader Reader, filter Filter) (Summary, error) {
+	if a, ok := reader.(Aggregator); ok {
+		return a.Summarize(filter)
+	}
+	entries, err := reader.Load(filter)
+	if err != nil {
+		return Summary{}, err
+	}
+	return SummarizeEntries(entries), nil
+}
+
+// Spend counts only finite positive costs, matching budget admission rules.
+func Spend(reader Reader, filter Filter) (float64, int, error) {
+	if a, ok := reader.(Aggregator); ok {
+		return a.Spend(filter)
+	}
+	entries, err := reader.Load(filter)
+	if err != nil {
+		return 0, 0, err
+	}
+	var cost float64
+	for _, e := range entries {
+		if e.CostUSD > 0 && !math.IsNaN(e.CostUSD) && !math.IsInf(e.CostUSD, 0) {
+			cost += e.CostUSD
+		}
+	}
+	if math.IsInf(cost, 1) {
+		cost = math.MaxFloat64
+	}
+	return cost, len(entries), nil
 }
 
 type JSONLLogger struct {
@@ -158,6 +253,7 @@ func LoadEntries(path string, filter Filter) ([]Entry, error) {
 	defer f.Close()
 
 	entries := make([]Entry, 0, 64)
+	skipped := 0
 	dec := json.NewDecoder(bufio.NewReader(f))
 	for {
 		var entry Entry
@@ -168,6 +264,10 @@ func LoadEntries(path string, filter Filter) ([]Entry, error) {
 			return nil, err
 		}
 		if !matchesFilter(entry, filter) {
+			continue
+		}
+		if skipped < filter.Offset {
+			skipped++
 			continue
 		}
 		entries = append(entries, entry)

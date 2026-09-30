@@ -2,7 +2,7 @@
 # Version consistency gate (eng-delivery#9).
 #
 # Single source of truth: `__version__` in makewand/__init__.py. The source
-# installer stamps it into the Go binary (scripts/install.sh) and release builds
+# installer stamps it into the Go binary (scripts/install_source.py) and release builds
 # stamp the tag, which must be "v" + __version__. Everything that still has to
 # repeat the number (README title, website, welcome card, CHANGELOG) is checked
 # against it here, so a bump that misses a copy fails `make test`, CI and the
@@ -95,12 +95,55 @@ else
     fail "$BUILDINFO: default Version must stay \"dev\"; stamp releases with -ldflags instead"
 fi
 
-# The source installer must derive the Go version from __version__.
-if grep -qF 'makewand.__version__' scripts/install.sh 2>/dev/null \
-    && grep -qF 'buildinfo.Version=$SOURCE_VERSION' scripts/install.sh 2>/dev/null; then
-    pass "scripts/install.sh stamps the Go binary from __version__"
+# The shell entry delegates to the transaction that checks the frozen Python
+# engine's version, stamps it into Go, and rejects a mixed engine version.
+if grep -qE '^exec python3 -I "\$SCRIPT_ROOT/scripts/install_source.py" "\$SCRIPT_ROOT"$' scripts/install.sh 2>/dev/null; then
+    pass "scripts/install.sh delegates to the frozen source installer"
 else
-    fail "scripts/install.sh must stamp buildinfo.Version from makewand.__version__"
+    fail "scripts/install.sh must delegate to scripts/install_source.py"
+fi
+if python3 - scripts/install_source.py <<'PY'
+import ast
+import sys
+from pathlib import Path
+
+try:
+    tree = ast.parse(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, SyntaxError):
+    sys.exit(1)
+
+def same(node, expression):
+    return ast.dump(node) == ast.dump(ast.parse(expression, mode="eval").body)
+
+assignments = {target.id: node.value for node in ast.walk(tree)
+               if isinstance(node, ast.Assign) for target in node.targets
+               if isinstance(target, ast.Name)}
+python_version = assignments.get("python_version")
+python_probe = python_version is not None and any(
+    isinstance(node, ast.Call) and same(node.func, "subprocess.check_output")
+    and node.args and isinstance(node.args[0], ast.List)
+    and all(any(same(argument, expression) for argument in node.args[0].elts)
+            for expression in ('sys.executable', '"-I"', '"--version"', 'str(stage / "bin/makewand")'))
+    for node in ast.walk(python_version))
+derived_version = "version" in assignments and same(assignments["version"], 'python_version[len("makewand "): ]')
+stamped_build = any(
+    isinstance(node, ast.Call) and same(node.func, "subprocess.run")
+    and node.args and isinstance(node.args[0], ast.List)
+    and all(any(same(argument, expression) for argument in node.args[0].elts)
+            for expression in ('"go"', '"build"', '"-ldflags"',
+                               '"-X github.com/makewand/makewand/internal/buildinfo.Version=" + version'))
+    for node in ast.walk(tree))
+version_gate = any(
+    isinstance(node, ast.If) and same(node.test, 'native_version != "makewand version " + version')
+    and any(isinstance(action, ast.Raise) and isinstance(action.exc, ast.Call)
+            and same(action.exc.func, "RuntimeError") for action in node.body)
+    for node in ast.walk(tree))
+sys.exit(0 if python_probe and derived_version and stamped_build and version_gate else 1)
+PY
+then
+    pass "scripts/install_source.py stamps and enforces the frozen Python/Go version contract"
+else
+    fail "scripts/install_source.py must derive Go buildinfo.Version from the frozen Python engine and reject version mismatches"
 fi
 
 # Keep a Changelog: the current version needs a released section.

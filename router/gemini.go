@@ -63,7 +63,8 @@ type geminiGenerationConfig struct {
 
 type geminiResponse struct {
 	Candidates []struct {
-		Content struct {
+		FinishReason string `json:"finishReason"`
+		Content      struct {
 			Parts []struct {
 				Text string `json:"text"`
 			} `json:"parts"`
@@ -76,6 +77,12 @@ type geminiResponse struct {
 }
 
 func (g *Gemini) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	return dispatchChat(ctx, g, func(attemptCtx context.Context) (string, Usage, error) {
+		return g.chatUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (g *Gemini) chatUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	model := g.model
 	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
 		model = requested
@@ -144,17 +151,24 @@ func (g *Gemini) Chat(ctx context.Context, messages []Message, system string, ma
 	}
 
 	usage := Usage{
-		InputTokens:  result.UsageMetadata.PromptTokenCount,
-		OutputTokens: result.UsageMetadata.CandidatesTokenCount,
-		Cost:         g.priceForCtx(ctx, model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount),
-		Model:        model,
-		Provider:     "gemini",
+		MeasuredTokens: result.UsageMetadata.PromptTokenCount > 0 || result.UsageMetadata.CandidatesTokenCount > 0,
+		InputTokens:    result.UsageMetadata.PromptTokenCount,
+		OutputTokens:   result.UsageMetadata.CandidatesTokenCount,
+		Cost:           g.priceForCtx(ctx, model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount),
+		Model:          model,
+		Provider:       "gemini",
 	}
 
 	return b.String(), usage, nil
 }
 
 func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	return dispatchStream(ctx, g, func(attemptCtx context.Context) (<-chan StreamChunk, error) {
+		return g.chatStreamUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (g *Gemini) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	model := g.model
 	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
 		model = requested
@@ -220,6 +234,9 @@ func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system stri
 			if p.Text != "" {
 				chunks = append(chunks, StreamChunk{Content: p.Text})
 			}
+		}
+		if result.Candidates[0].FinishReason != "" {
+			chunks = append(chunks, StreamChunk{Done: true})
 		}
 		return chunks
 	}, func() { resp.Body.Close() })

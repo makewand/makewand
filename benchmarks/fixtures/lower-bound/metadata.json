@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "lower-bound",
+  "risk": "low",
+  "category": "function-fix",
+  "language": "python",
+  "public_apis": [
+    [
+      "search.py",
+      "lower_bound"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

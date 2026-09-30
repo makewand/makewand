@@ -1,0 +1,1 @@
+修复 windows.py 的 moving_averages(payload)。values 是数字列表，width 必须是正整数且不能是 bool，非法 width 抛 ValueError。返回所有连续、完整 width 窗口的算术平均数；窗口不足时返回 []。不得修改输入，只用标准库。

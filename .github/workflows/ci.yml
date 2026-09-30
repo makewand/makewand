@@ -51,6 +51,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Shared command contract
+        run: python3 -I scripts/generate_cli_contract.py --check
+
+      - name: Shared execution contract
+        run: python3 -I scripts/check_execution_contract.py
+
       - name: Install E2E dependencies
         shell: bash
         run: |
@@ -136,7 +142,10 @@ jobs:
         run: bash dispatch/test.sh
 
       - name: Offline benchmark harness
-        run: python3 -I benchmarks/test_runner.py
+        run: |
+          python3 -I benchmarks/test_runner.py
+          python3 -I benchmarks/test_deep_config_acceptance_v4.py
+          python3 -I benchmarks/test_analyze_results.py
 
       - name: Installer and unpacked release contract
         run: python3 -I scripts/test_installation.py

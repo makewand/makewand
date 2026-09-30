@@ -407,6 +407,39 @@ def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = Non
     }
     save_status_cache(status_entry)
 
+def _run_model_probe(engine: str, command: str, timeout: int):
+    """Health echoes use the shared runtime, ledger and parent deadline."""
+    from makewand.config import get_api_policy
+    from makewand.execution_contract import ExecutionRequest
+    from makewand.execution_runtime import execute, task_id, current_context
+    context = current_context()
+    captured = []
+
+    def invoke(remaining):
+        from makewand.execution_runtime import mark_provider_invocation
+        from makewand.providers.base import model_process_failure, is_process_timeout
+        mark_provider_invocation()
+        raw = run_subprocess(command, timeout=remaining)
+        captured.append(raw)
+        if raw[0] == 0:
+            return True, raw[1], None
+        parser = {"claude": parse_claude_quota, "codex": parse_codex_quota,
+                  "muse": parse_muse_quota, "grok": parse_grok_quota,
+                  "agy": parse_agy_quota}.get(engine)
+        if raw[0] > 0 and not is_process_timeout(raw[3]) and parser is not None:
+            if parser(f"{raw[1]}\n{raw[2]}")[0]:
+                return False, raw[1], raw[3] or raw[2] or "model probe explicitly refused"
+        return model_process_failure(engine, raw[0], raw[1], raw[2], raw[3], readonly=True)
+
+    request = ExecutionRequest(task_id=task_id(), stage="probe", engine=engine,
+        tier="probe", readonly=True, api_policy=get_api_policy(),
+        deadline_unix_ms=context.get("deadline_unix_ms"), timeout_ms=max(1, int(timeout * 1000)))
+    result = execute(request, invoke)
+    if captured and result.status in ("PASSED", "FAILED"):
+        return captured[0]
+    return (124 if result.status == "TIMEOUT" else 127), "", "", result.error
+
+
 def probe_model(model_name: str) -> Dict[str, Any]:
     now = datetime.now().isoformat()
     from makewand.config import has_api_configured, has_subscription_configured, is_provider_enabled
@@ -469,7 +502,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     if model_name == "claude":
         cmd = 'claude -p "echo ok"'
-        code, out, err, ex = run_subprocess(cmd, timeout=15)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=15)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_claude_quota(combined)
         if is_limited:
@@ -484,7 +517,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     elif model_name == "codex":
         cmd = 'codex exec --sandbox read-only --skip-git-repo-check "echo ok"'
-        code, out, err, ex = run_subprocess(cmd, timeout=35)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=35)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_codex_quota(combined)
         if is_limited:
@@ -512,7 +545,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     elif model_name == "muse":
         cmd = 'muse exec --disable-write --trust-workspace "echo ok"'
-        code, out, err, ex = run_subprocess(cmd, timeout=25)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=25)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_muse_quota(combined)
         if is_limited:
@@ -527,7 +560,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     elif model_name == "grok":
         cmd = 'grok -p "echo ok" --output-format plain'
-        code, out, err, ex = run_subprocess(cmd, timeout=20)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=20)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_grok_quota(combined)
         if is_limited:
@@ -671,79 +704,180 @@ QUOTA_SOURCE_LABELS = {
 
 
 def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Attempts to read official subscription quota from Go router's snapshot cache
-    (~/.cache/makewand/quota-snapshot.json) or recent local session rate_limits.
-    Returns official quota dict if available, otherwise None.
-    """
-    cache_path = os.path.expanduser("~/.cache/makewand/quota-snapshot.json")
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            for p in d.get("providers", []):
-                if p.get("Provider", "").lower() == provider.lower() and p.get("HasData"):
-                    used_candidates = [p.get("WeeklyPct"), p.get("FiveHourPct")]
-                    used_vals = [float(x) for x in used_candidates if x is not None]
-                    if used_vals:
-                        worst_used = max(used_vals)
-                        pct = max(0, min(100, int(round(100 - worst_used))))
-                        scoped = p.get("ScopedPct")
-                        scoped_msg = " · 顶配模型周限额已达 100%" if (scoped and scoped >= 99) else ""
-                        r_at = p.get("ResetAt") or p.get("WeeklyResetAt") or p.get("FiveHourResetAt") or resets_at
-                        r_str = f" · 重置时间: {r_at[:16]}" if r_at and not str(r_at).startswith("0001") else ""
-                        return {
-                            "percentage": pct,
-                            "status": "healthy" if pct >= 25 else ("warning" if pct >= 8 else "limited"),
-                            "desc": f"官方报告剩余额度: {pct}% (已用 {int(worst_used)}%){scoped_msg}{r_str}",
-                            "resets_at": r_at if r_at and not str(r_at).startswith("0001") else None,
-                            "is_unlimited": False,
-                            "source": "official",
-                        }
-        except Exception:
-            pass
+    """Read recent quota evidence for the CLI's selected account root.
 
-    if provider.lower() == "codex":
-        # Direct session fallback if snapshot cache is absent/stale
-        import glob
+    Windows expire at their reset or after 15 minutes without an observation.
+    Newer evidence replaces only the same window, so a weekly sample cannot
+    erase a fresh 5-hour limit. Unbound snapshots cannot identify a custom
+    CODEX_HOME account. No cache, authentication state or provider is changed.
+    """
+    import math
+    import time
+    from datetime import timezone
+
+    now = time.time()
+    ttl = 15 * 60
+    evidence = []
+    reasons = set()
+    provider = provider.lower().strip()
+
+    def timestamp(value):
+        if value is None or isinstance(value, bool) or str(value).startswith("0001"):
+            return None
+        try:
+            if isinstance(value, (int, float)) or str(value).replace(".", "", 1).isdigit():
+                parsed = float(value)
+            else:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
+
+    def observed_at(modified, *values):
+        # Event timestamps prevent an unrelated log append or file touch from
+        # renewing old data; mtime bounds legacy records without timestamps.
+        parsed = [timestamp(value) for value in values]
+        return min([now, modified] + [value for value in parsed if value is not None])
+
+    def add(used, minutes, reset, observed, origin, window_key, scoped=None):
+        try:
+            if isinstance(used, bool):
+                return
+            used = float(used)
+            if not math.isfinite(used) or not 0 <= used <= 100:
+                reasons.add("invalid_percentage")
+                return
+            reset_time = timestamp(reset)
+            if reset not in (None, "", "0001-01-01T00:00:00Z") and reset_time is None:
+                reasons.add("invalid_reset")
+                return
+            if reset_time is not None and reset_time <= now:
+                reasons.add("window_reset")
+                return
+            if now - observed > ttl:
+                reasons.add("stale_observation")
+                return
+            label = ("每周窗口" if minutes == 10080 else "5 小时滚动窗口" if minutes == 300
+                     else f"{minutes} 分钟窗口" if minutes else "未知时间窗口")
+            evidence.append({"used_percent": used, "window_minutes": minutes,
+                             "window": label, "window_key": window_key,
+                             "resets_at": datetime.fromtimestamp(reset_time, timezone.utc).isoformat() if reset_time else None,
+                             "observed": observed, "selected_source": origin,
+                             "scoped_percent": scoped})
+        except (ValueError, TypeError, OverflowError, OSError):
+            reasons.add("invalid_window")
+
+    default_codex_home = os.path.abspath(os.path.expanduser("~/.codex"))
+    codex_home = os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"))
+    cache_path = os.path.expanduser("~/.cache/makewand/quota-snapshot.json")
+    try:
+        with open(cache_path, "r", encoding="utf-8") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("quota snapshot exceeds read limit")
+        snapshot = json.loads(raw)
+        modified = os.path.getmtime(cache_path)
+        for entry in snapshot.get("providers", []):
+            if not isinstance(entry, dict) or str(entry.get("Provider", "")).lower() != provider or not entry.get("HasData"):
+                continue
+            if provider == "codex" and codex_home != default_codex_home:
+                bound_home = entry.get("CodexHome") or snapshot.get("codex_home")
+                if not isinstance(bound_home, str) or os.path.abspath(os.path.expanduser(bound_home)) != codex_home:
+                    reasons.add("unbound_account_root")
+                    continue
+            observed = observed_at(modified, snapshot.get("taken_at"), entry.get("SourceAt"))
+            for key, minutes, reset_key in (("WeeklyPct", 10080, "WeeklyResetAt"),
+                                           ("FiveHourPct", 300, "FiveHourResetAt")):
+                if entry.get(key) is None:
+                    continue
+                reset = entry.get(reset_key)
+                if not reset or str(reset).startswith("0001"):
+                    reset = entry.get("ResetAt") if key == "WeeklyPct" or entry.get("WeeklyPct") is None else None
+                add(entry[key], minutes, reset, observed, "quota_snapshot", str(minutes), entry.get("ScopedPct"))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, AttributeError):
+        reasons.add("invalid_snapshot")
+
+    if provider == "codex":
+        # Follow exactly the official CLI's account-root selection. Never fall
+        # back to another account's home or combine its session observations.
+        sessions = Path(codex_home) / "sessions"
         paths = []
-        for base in [os.environ.get("CODEX_HOME"), os.path.expanduser("~/.codex"), os.path.expanduser("~/.codex-2")]:
-            if base and os.path.isdir(base):
-                sdir = os.path.join(base, "sessions")
-                if os.path.isdir(sdir):
-                    for f in glob.glob(f"{sdir}/**/*.jsonl", recursive=True):
-                        try:
-                            paths.append((os.path.getmtime(f), f))
-                        except OSError:
-                            pass
-        paths.sort(reverse=True)
-        for mtime, p in paths[:5]:
+        if sessions.is_dir():
+            for path in sessions.rglob("*.jsonl"):
+                try:
+                    paths.append((path.stat().st_mtime, path))
+                except OSError:
+                    pass
+        for modified, path in sorted(paths, reverse=True)[:8]:
             try:
-                with open(p, "r", errors="ignore") as f:
-                    for line in f:
-                        if "rate_limits" in line:
+                with path.open("rb") as stream:
+                    size = stream.seek(0, 2)
+                    start = max(0, size - 4 * 1024 * 1024)
+                    stream.seek(start)
+                    if start:
+                        stream.readline()
+                    lines = stream.read(4 * 1024 * 1024).splitlines()
+                for line in reversed(lines):
+                    if b"rate_limits" not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        payload = record.get("payload") or {}
+                        limits = payload.get("rate_limits") or record.get("rate_limits")
+                        if not isinstance(limits, dict):
+                            continue
+                        observed = observed_at(modified, record.get("timestamp"), payload.get("timestamp"))
+                        for slot in ("primary", "secondary"):
+                            window = limits.get(slot)
+                            if not isinstance(window, dict) or "used_percent" not in window:
+                                continue
+                            duration = window.get("window_minutes", window.get("limit_window_minutes"))
                             try:
-                                data = json.loads(line)
-                                rl = data.get("payload", {}).get("rate_limits")
-                                if rl and rl.get("primary"):
-                                    used = float(rl["primary"].get("used_percent", 0))
-                                    pct = max(0, min(100, int(round(100 - used))))
-                                    reset_ts = rl["primary"].get("resets_at")
-                                    r_fmt = datetime.fromtimestamp(reset_ts).strftime("%m-%d %H:%M") if reset_ts else ""
-                                    r_str = f" · 重置时间: {r_fmt}" if reset_ts else ""
-                                    return {
-                                        "percentage": pct,
-                                        "status": "healthy" if pct >= 25 else ("warning" if pct >= 8 else "limited"),
-                                        "desc": f"官方报告每周剩余额度: {pct}% (已用 {int(used)}%){r_str}",
-                                        "resets_at": str(reset_ts) if reset_ts else None,
-                                        "is_unlimited": False,
-                                        "source": "official",
-                                    }
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-    return None
+                                duration = int(duration) if duration is not None and not isinstance(duration, bool) else None
+                                if duration is not None and duration <= 0:
+                                    duration = None
+                            except (TypeError, ValueError, OverflowError):
+                                duration = None
+                            add(window["used_percent"], duration, window.get("resets_at"), observed,
+                                "codex_session", str(duration) if duration else "unknown_" + slot)
+                        # The latest complete event, rather than the first one,
+                        # describes this session's current quota observation.
+                        break
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+            except OSError:
+                continue
+
+    if not evidence:
+        if reasons:
+            return {"percentage": None, "status": "unknown", "desc": "官方额度数据陈旧、过期或无法关联当前认证目录；按未知处理",
+                    "resets_at": None, "is_unlimited": False, "source": "unknown",
+                    "selected_source": None, "windows": [], "ttl_seconds": ttl,
+                    "unverified_reasons": sorted(reasons)}
+        return None
+    windows = {}
+    for candidate in evidence:
+        key = candidate["window_key"]
+        previous = windows.get(key)
+        if previous is None or (candidate["observed"], candidate["selected_source"] == "codex_session") > (previous["observed"], previous["selected_source"] == "codex_session"):
+            windows[key] = candidate
+    worst = max(windows.values(), key=lambda entry: entry["used_percent"])
+    remaining = round(100 - worst["used_percent"], 2)
+    scoped = worst.get("scoped_percent")
+    scoped_message = ""
+    if isinstance(scoped, (int, float)) and not isinstance(scoped, bool) and scoped >= 99:
+        scoped_message = " · 顶配模型周限额已达 100%（仅提示）"
+    return {"percentage": remaining, "status": "healthy" if remaining >= 25 else "warning" if remaining >= 8 else "limited",
+            "desc": f"官方报告{worst['window']}剩余额度: {remaining:g}% (已用 {worst['used_percent']:g}%){scoped_message}",
+            "resets_at": worst["resets_at"], "is_unlimited": False, "source": "official",
+            "selected_source": worst["selected_source"], "window": worst["window"],
+            "window_minutes": worst["window_minutes"], "ttl_seconds": ttl,
+            "observed_at": datetime.fromtimestamp(worst["observed"], timezone.utc).isoformat(),
+            "age_seconds": max(0, now - worst["observed"]),
+            "windows": [{key: value for key, value in entry.items() if key not in ("observed", "window_key", "scoped_percent")}
+                        for entry in windows.values()]}
 
 
 def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -889,4 +1023,3 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
         res["stale"] = True
         res["desc"] = f"{res['desc']} · 状态缓存已超过 {STATUS_STALE_SECONDS // 3600} 小时未刷新，按中性处理 (运行 'makewand probe')"
     return res
-

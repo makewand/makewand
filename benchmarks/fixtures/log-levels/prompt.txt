@@ -1,0 +1,1 @@
+重构并修复 logs_api.py 和 log_parse.py，保留 summarize_logs(lines) 与 parse_level(line)。日志格式为可带首尾空白的 [LEVEL] message，LEVEL 只能是 DEBUG/INFO/WARNING/ERROR、大小写不敏感，] 后必须有至少一个空白且 message 去空白后非空。parse_level 返回小写等级，非法格式或非字符串返回 None；summarize_logs 复用 helper，忽略非法行，返回含 debug/info/warning/error 四个键的计数 dict。不得修改输入，只用标准库。

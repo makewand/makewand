@@ -6,6 +6,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/makewand/makewand/execution"
 )
 
 func TestReadSSE_LargeEvent(t *testing.T) {
@@ -46,6 +48,33 @@ func (r errReader) Read(p []byte) (int, error) {
 }
 
 var _ io.Reader = errReader{}
+
+func TestStreamSSE_TruncatedEOFIsUnknown(t *testing.T) {
+	for _, payload := range []string{"", "data: partial\n\n"} {
+		var terminal error
+		for chunk := range streamSSE(context.Background(), strings.NewReader(payload), func(data string) []StreamChunk { return []StreamChunk{{Content: data}} }, nil) {
+			if chunk.Error != nil {
+				terminal = chunk.Error
+			}
+		}
+		if !errors.Is(terminal, execution.ErrUnknownOutcome) {
+			t.Fatalf("truncated SSE recorded success: payload=%q err=%v", payload, terminal)
+		}
+	}
+}
+
+func TestStreamSSE_CompletionMarkerWithoutTrailingNewline(t *testing.T) {
+	var done bool
+	for chunk := range streamSSE(context.Background(), strings.NewReader("data: [DONE]"), func(string) []StreamChunk { return nil }, nil) {
+		if chunk.Error != nil {
+			t.Fatal(chunk.Error)
+		}
+		done = done || chunk.Done
+	}
+	if !done {
+		t.Fatal("actual completion marker ignored")
+	}
+}
 
 func TestStreamSSE_RoutesEventsViaHandler(t *testing.T) {
 	payload := "data: {\"text\":\"hello\"}\n\ndata: {\"text\":\"world\"}\n\ndata: [DONE]\n\n"

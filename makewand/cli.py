@@ -5,9 +5,14 @@ Makewand CLI: Command-line interface and subcommand parsers.
 import os
 import sys
 import argparse
+import math
+import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from makewand import __version__
+from makewand.command_contract import (
+    PYTHON_COMMANDS, NATIVE_GO_COMMANDS, PYTHON_VALUE_FLAGS, PYTHON_BOOLEAN_FLAGS, SHARED_VALUE_FLAGS,
+)
 from makewand.config import (
     c,
     COLOR_BOLD,
@@ -23,22 +28,72 @@ from makewand.config import (
 )
 from makewand.health import get_or_update_status
 from makewand.discovery import discover_available_models
-from makewand.orchestrator import (
-    run_pipeline,
-    run_review,
-    run_race,
-    select_optimal_engine_pair,
-    EXIT_PASSED,
-    EXIT_FAILED,
-    EXIT_UNVERIFIED,
-    EXIT_USAGE_ERROR,
-    EXIT_APPLY_CONFLICT,
+from makewand.execution_contract import (
+    EXIT_PASSED, EXIT_FAILED, EXIT_UNVERIFIED, EXIT_USAGE_ERROR, EXIT_APPLY_CONFLICT,
 )
+
+# Query/help commands need no provider or orchestration imports. Keep these
+# public wrappers so integrations and existing patches retain their API.
+def run_pipeline(*args, **kwargs):
+    from makewand.orchestrator import run_pipeline as execute
+    return execute(*args, **kwargs)
+
+
+def run_review(*args, **kwargs):
+    from makewand.orchestrator import run_review as execute
+    return execute(*args, **kwargs)
+
+
+def review_saved_hybrid(*args, **kwargs):
+    from makewand.orchestrator import review_saved_hybrid as execute
+    return execute(*args, **kwargs)
+
+
+def run_race(*args, **kwargs):
+    from makewand.orchestrator import run_race as execute
+    return execute(*args, **kwargs)
+
+
+def select_optimal_engine_pair(*args, **kwargs):
+    from makewand.orchestrator import select_optimal_engine_pair as execute
+    return execute(*args, **kwargs)
+
+
 from makewand.providers.agy import execute_agy_task
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
 from makewand.providers.muse import execute_muse_task
 from makewand.providers.grok import execute_grok_task
+
+def _execute_direct_task(engine, execute, prompt, **kwargs):
+    """Direct commands share typed admission, deadlines and observation."""
+    from makewand.execution_contract import ExecutionRequest
+    from makewand import execution_runtime
+    from makewand.config import get_api_policy
+    from makewand.workflow import remember_result
+    context = execution_runtime.current_context()
+    maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
+    request = ExecutionRequest(task_id=execution_runtime.task_id(),
+        stage=context.get("stage") or "direct", engine=engine,
+        tier=kwargs.get("tier", "standard"), model=kwargs.get("model"),
+        readonly=kwargs.get("readonly", False), repo_trust=kwargs.get("repo_trust", "trusted"),
+        api_policy=get_api_policy(), deadline_unix_ms=context.get("deadline_unix_ms"),
+        timeout_ms=max(1, math.ceil(kwargs.get("timeout", 300) * 1000)),
+        budget_file=os.environ.get("MAKEWAND_CALL_BUDGET_FILE"),
+        max_model_calls=int(maximum) if maximum else None,
+        workflow=context.get("workflow") or "direct", risk=context.get("risk"),
+        prompt=prompt, cwd=kwargs.get("cwd") or os.getcwd())
+    def callback(effective_timeout):
+        from makewand.workflow import provider_outcome
+        return provider_outcome(execute(prompt, **dict(kwargs, timeout=effective_timeout)))
+    return remember_result(execution_runtime.execute(request, callback))
+
+
+def _execution_exit_code(fallback=EXIT_FAILED):
+    from makewand.workflow import last_result
+    result = last_result()
+    return getattr(result, "exit_code", fallback)
+
 
 def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
     """Machine-readable status; quota numbers carry their source explicitly."""
@@ -502,7 +557,7 @@ def cmd_plan(args):
         )
         if not ok:
             print(c(f"\n❌ [Makewand DAG Engine] 流水线执行未完全通过: {summary}", COLOR_BOLD + COLOR_RED))
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
         print(c(f"\n✔ [Makewand DAG Engine] 全部 DAG 拓扑阶段均已高质量交付验收！", COLOR_BOLD + COLOR_GREEN))
         sys.exit(0)
 
@@ -643,12 +698,8 @@ def cmd_inspect(args):
         print(diff if diff else "无有效代码变更")
     elif cand == "M":
         if not cand_m:
-            print(c("当前候选竞速尚未生成 Candidate M (Hybrid) 方案，正在尝试合成...", COLOR_YELLOW))
-            from makewand.candidate import CandidateManager
-            ok_m, cand_m, msg_m = CandidateManager.create_hybrid_candidate(race.get("race_id"))
-            if not ok_m or not cand_m:
-                print(c(f"❌ 合成 Candidate M 失败: {msg_m}", COLOR_RED))
-                sys.exit(EXIT_FAILED)
+            print(c("尚未生成混合候选。请显式运行 makewand merge " + race.get("race_id", "") + " 创建候选后检查。", COLOR_YELLOW))
+            return
         pars_m = cand_m.get("parsimony", {})
         if pars_m:
             print(c(f"--- 混合方案 M ({cand_m.get('model')}) 补丁精简度: {pars_m.get('summary', '')} ---", COLOR_GREEN + COLOR_BOLD))
@@ -680,10 +731,18 @@ def cmd_apply(args):
         candidate_label=args.candidate,
         dry_run=args.dry_run,
         force=args.force,
-        merge=getattr(args, "merge", False)
+        merge=getattr(args, "merge", False),
+        **({"protected_paths": args.protected_paths} if getattr(args, "protected_paths", None) is not None else {})
     )
     if not ok:
         print(c(f"❌ {msg}", COLOR_RED + COLOR_BOLD))
+        if getattr(msg, "status", None) == "TIMEOUT":
+            from makewand.execution_contract import ExecutionResult, EXIT_TIMEOUT
+            from makewand.execution_runtime import task_id
+            from makewand.workflow import remember_result
+            remember_result(ExecutionResult(False, None, str(msg), status="TIMEOUT",
+                task_id=task_id(), stage="apply", engine="candidate"))
+            sys.exit(EXIT_TIMEOUT)
         if "冲突" in msg:
             sys.exit(EXIT_APPLY_CONFLICT)
         sys.exit(EXIT_FAILED)
@@ -789,11 +848,15 @@ def _find_go_binary() -> Optional[str]:
     root = Path(__file__).resolve().parent.parent
     candidates = [
         root / "bin" / "makewand-server",
+        root / "bin" / "makewand-server.exe",
         root / "bin" / "makewand-go",
+        root / "bin" / "makewand-go.exe",
         root / "dist" / "makewand",
         shutil.which("makewand-server"),
         shutil.which("makewand-go")
     ]
+    if root.name == "python" and root.parent.name == "makewand" and root.parent.parent.name == "lib":
+        candidates[4:4] = [root.parents[2] / "makewand", root.parents[2] / "makewand.exe"]
     return next((str(c) for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
 
 
@@ -902,29 +965,88 @@ def _resolve_cli_prompt(args, original_cwd: Optional[str] = None, required: bool
     return ""
 
 
+def _plan_native_go_delegation(argv: List[str]) -> Optional[List[str]]:
+    """Locate native commands after shared globals, preserving literal argv."""
+    native_commands = NATIVE_GO_COMMANDS - PYTHON_COMMANDS
+    neutral_values = {"-C", "--cwd", "--repo-trust", "--approval"} | SHARED_VALUE_FLAGS
+    neutral_booleans = {"--debug"}
+    value_flags = neutral_values | PYTHON_VALUE_FLAGS
+    boolean_flags = neutral_booleans | PYTHON_BOOLEAN_FLAGS
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        flag, equals, _ = argument.partition("=")
+        if flag in value_flags:
+            index += 1 if equals else 2
+        elif flag in boolean_flags:
+            index += 1
+        elif len(argument) > 2 and argument[:2] in {"-C", "-f", "-F"}:
+            index += 1
+        else:
+            break
+    if index >= len(argv) or argv[index] not in native_commands:
+        return None
+    command = argv[index]
+    task_flags = (PYTHON_VALUE_FLAGS - neutral_values) | PYTHON_BOOLEAN_FLAGS
+    position = 0
+    while position < len(argv):
+        argument = argv[position]
+        if argument == "--":
+            break
+        flag, equals, _ = argument.partition("=")
+        if len(argument) > 2 and argument[:2] in {"-f", "-F"}:
+            flag = argument[:2]
+        if flag in task_flags:
+            raise ValueError(f"{flag} applies to Python model tasks and cannot be honored by native Go command {command!r}")
+        position += 2 if flag in neutral_values and not equals else 1
+    return list(argv)
+
+
 def main():
     original_cwd = os.getcwd()
-    GO_SUBCOMMANDS = {
-        "serve", "chat", "new", "preview", "doctor", "setup", "token", "audit", "usage", "user", "state"
-    }
-    if len(sys.argv) > 1 and sys.argv[1] in GO_SUBCOMMANDS:
-        delegate_to_go_server(sys.argv[1:])
+    inherited_budget_file = os.environ.get("MAKEWAND_CALL_BUDGET_FILE")
+    inherited_maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
+    try:
+        native_argv = _plan_native_go_delegation(sys.argv[1:])
+    except ValueError as error:
+        print(f"makewand: error: {error}", file=sys.stderr)
+        sys.exit(EXIT_USAGE_ERROR)
+    if native_argv is not None:
+        return delegate_to_go_server(native_argv)
 
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("-C", "--cwd", dest="cwd", default=None, help="Target working directory (default: current directory)")
     common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=None, help="Read task prompt from file")
     common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default="trusted", help="Repository trust level: trusted or untrusted")
-    common_parser.add_argument("--daemon", action="store_true", default=False, help="Dispatch command via resident daemon if available (<15ms latency)")
+    common_parser.add_argument("--daemon", action="store_true", default=False, help="Dispatch command via resident daemon using an isolated task worker")
     common_parser.add_argument("--no-daemon", action="store_true", default=False, help="Bypass resident daemon and run standalone")
     common_parser.add_argument("--allow-collision", action="store_true", default=False, help="Bypass cross-session collision warning and force execution")
+    common_parser.add_argument("--max-model-calls", type=int, default=None, help="Maximum attempted Makewand model tasks, including retries and reviewers")
+    common_parser.add_argument("--call-budget-file", default=None, help="Shared admission ledger for model task budgets")
+    common_parser.add_argument("--protect", dest="global_protected_paths", action="append", default=None, metavar="PATH", help="Preserve a task-relative file; repeat for multiple files")
 
     sub_common_parser = argparse.ArgumentParser(add_help=False)
     sub_common_parser.add_argument("-C", "--cwd", dest="cwd", default=argparse.SUPPRESS, help="Target working directory (default: current directory)")
     sub_common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=argparse.SUPPRESS, help="Read task prompt from file")
     sub_common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default=argparse.SUPPRESS, help="Repository trust level: trusted or untrusted")
-    sub_common_parser.add_argument("--daemon", action="store_true", default=argparse.SUPPRESS, help="Dispatch command via resident daemon if available (<15ms latency)")
+    sub_common_parser.add_argument("--daemon", action="store_true", default=argparse.SUPPRESS, help="Dispatch command via resident daemon using an isolated task worker")
     sub_common_parser.add_argument("--no-daemon", action="store_true", default=argparse.SUPPRESS, help="Bypass resident daemon and run standalone")
     sub_common_parser.add_argument("--allow-collision", action="store_true", default=argparse.SUPPRESS, help="Bypass cross-session collision warning and force execution")
+    sub_common_parser.add_argument("--max-model-calls", type=int, default=argparse.SUPPRESS, help="Maximum attempted Makewand model tasks")
+    sub_common_parser.add_argument("--call-budget-file", default=argparse.SUPPRESS, help="Shared model task admission ledger")
+    sub_common_parser.add_argument("--protect", dest="protected_paths", action="append", default=None, metavar="PATH", help="Preserve file content and permissions; repeat for multiple files")
+
+    for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
+        options.add_argument("--workflow", choices=["auto", "single", "pipeline", "race"],
+                             default="auto" if default is None else default,
+                             help="Verification workflow; single still runs independent read-only review")
+        options.add_argument("--risk", choices=["auto", "low", "high"],
+                             default="auto" if default is None else default,
+                             help="Unknown risk requires cross-provider review; high cannot use single")
+        options.add_argument("--total-timeout", type=float, default=default,
+                             help="Shared wall-clock deadline for every task stage, in seconds")
+        options.add_argument("--judge-reserve-seconds", type=float, default=default,
+                             help="Race time reserved for judging; default is 25%%, capped at 60 seconds")
 
     parser = argparse.ArgumentParser(
         prog="makewand",
@@ -966,15 +1088,21 @@ def main():
 
     # review
     p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity", parents=[sub_common_parser])
+    p_rev.add_argument("--race-id", help="Review and approve the exact sealed hybrid of this saved race")
+    p_rev.add_argument("--candidate", choices=["M"], default=None, help="Saved candidate to review (requires --race-id)")
     p_rev.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_rev.add_argument("--stream", action="store_true", default=False, help="Stream review output line-by-line")
     p_rev.add_argument("--timeout", type=int, default=300)
     p_rev.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: review diff using only local self-hosted model")
 
+    p_merge = subparsers.add_parser("merge", help="Synthesize and test a saved hybrid candidate", parents=[sub_common_parser])
+    p_merge.add_argument("race_id", nargs="?", default=None)
+
     # race
     p_race = subparsers.add_parser("race", help="Run prompt on two models in parallel worktrees and compare", parents=[sub_common_parser])
     p_race.add_argument("prompt", nargs="?", default=None, help="Prompt for race comparison")
     p_race.add_argument("--timeout", type=int, default=300)
+    p_race.add_argument("--hybrid", action="store_true", help="Also synthesize a sealed hybrid candidate; requires separate review before apply")
 
     # search (budgeted search guardrail)
     p_search = subparsers.add_parser("search", help="Budgeted fast search excluding cold archives and databases", parents=[sub_common_parser])
@@ -1080,7 +1208,7 @@ def main():
                            help="Comma-separated PIDs from the --clean-hung candidate list to SIGTERM (explicit confirmation)")
 
     # Candidate Lifecycle Subcommands
-    p_cands = subparsers.add_parser("candidates", help="List all pending multi-model race candidate workspaces", parents=[sub_common_parser])
+    subparsers.add_parser("candidates", help="List all pending multi-model race candidate workspaces", parents=[sub_common_parser])
 
     p_inspect = subparsers.add_parser("inspect", help="Inspect race candidate diffs and referee verdicts", parents=[sub_common_parser])
     p_inspect.add_argument("race_id", nargs="?", default=None, help="Race ID (defaults to latest)")
@@ -1161,14 +1289,7 @@ def main():
         p_det = subparsers.add_parser(detect_only, help=f"{detect_only}: detected only, no execution adapter yet", parents=[sub_common_parser])
         p_det.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
 
-    known_subcommands = {
-        "models", "status", "probe", "quota", "run", "review", "race", "search", "sandbox",
-        "claude", "codex", "agy", "grok", "muse", "local", "aider", "deepseek", "qwen", "glm", "kimi",
-        "openrouter", "siliconflow", "cursor", "copilot",
-        "observe", "candidates", "inspect", "apply", "discard",
-        "enable", "disable", "repomap", "plan", "aci", "mcp",
-        "daemon", "sessions"
-    }
+    known_subcommands = PYTHON_COMMANDS
     # Auto-route to `makewand run ...` if user invokes `makewand "prompt"`, `makewand -C /dir -f task.txt`, or pipes stdin
     is_auto_routed_run = False
     try:
@@ -1190,18 +1311,76 @@ def main():
             is_auto_routed_run = True
 
     args = parser.parse_args()
+    declared_protection = (getattr(args, "global_protected_paths", None) or []) + (getattr(args, "protected_paths", None) or [])
+    args.protected_paths = declared_protection or None
+    if args.protected_paths and args.subcommand not in ("run", "race", "apply"):
+        parser.error("--protect requires run, race or apply")
+    from makewand.workflow import choose_workflow, judge_reserve
+    try:
+        selected = choose_workflow("race" if args.subcommand == "race" else args.workflow, args.risk)
+        if hasattr(args, "timeout") and args.timeout <= 0:
+            raise ValueError("--timeout must be positive")
+        if args.subcommand == "race" and args.workflow not in ("auto", "race"):
+            raise ValueError("race command cannot use a different --workflow")
+        if args.workflow != "auto" and args.subcommand not in ("run", "race"):
+            raise ValueError("--workflow applies to run and race commands")
+        if selected.workflow == "race" and args.subcommand == "run":
+            if getattr(args, "local_only", False):
+                raise ValueError("race requires distinct providers and cannot use --local-only")
+            if getattr(args, "model", None) is not None or getattr(args, "stream", False):
+                raise ValueError("race does not accept a shared --model or --stream override")
+        if args.total_timeout is not None:
+            judge_reserve(args.total_timeout, 0)
+        if args.judge_reserve_seconds is not None:
+            if selected.workflow != "race" or args.subcommand not in ("run", "race"):
+                raise ValueError("--judge-reserve-seconds requires a race workflow")
+            judge_reserve(args.total_timeout if args.total_timeout is not None else getattr(args, "timeout", 300), args.judge_reserve_seconds)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.subcommand == "review" and args.candidate and not args.race_id:
+        parser.error("review --candidate requires --race-id")
     if hasattr(args, "tier") and args.tier:
         args.tier = normalize_tier(args.tier)
+
+    try:
+        inherited_limit = int(inherited_maximum) if inherited_maximum is not None else None
+        if inherited_limit is not None and inherited_limit <= 0:
+            raise ValueError("MAKEWAND_MAX_MODEL_CALLS must be positive")
+        if args.max_model_calls is not None and args.max_model_calls <= 0:
+            raise ValueError("--max-model-calls must be positive")
+        parent_budget = str(Path(original_cwd, Path(inherited_budget_file).expanduser()).resolve()) if inherited_budget_file else None
+        explicit_budget = str(Path(original_cwd, Path(args.call_budget_file).expanduser()).resolve()) if args.call_budget_file else None
+        if parent_budget and explicit_budget and parent_budget != explicit_budget:
+            raise ValueError("--call-budget-file cannot replace an inherited model task ledger")
+    except (OSError, TypeError, ValueError) as error:
+        parser.error(str(error))
+    if args.max_model_calls is not None:
+        args.max_model_calls = min(args.max_model_calls, inherited_limit) if inherited_limit is not None else args.max_model_calls
+        if not explicit_budget and not parent_budget:
+            import uuid
+            from makewand.config import CONFIG_DIR, ensure_config_dir
+            ensure_config_dir()
+            explicit_budget = str(CONFIG_DIR / ("call-budget-" + uuid.uuid4().hex + ".json"))
+        os.environ["MAKEWAND_MAX_MODEL_CALLS"] = str(args.max_model_calls)
+    elif inherited_limit is not None:
+        os.environ["MAKEWAND_MAX_MODEL_CALLS"] = str(inherited_limit)
+    if parent_budget or explicit_budget:
+        args.call_budget_file = parent_budget or explicit_budget
+        os.environ["MAKEWAND_CALL_BUDGET_FILE"] = args.call_budget_file
 
     # Honor --no-daemon flag
     if getattr(args, "no_daemon", False):
         os.environ["MAKEWAND_NO_DAEMON"] = "1"
 
-    # Daemon fast-path dispatch if requested via --daemon or MAKEWAND_DAEMON=1
+    # Daemon isolated-worker dispatch if requested via --daemon or MAKEWAND_DAEMON=1
     if (getattr(args, "daemon", False) or os.environ.get("MAKEWAND_DAEMON") == "1") and args.subcommand != "daemon":
         if os.environ.get("MAKEWAND_INSIDE_DAEMON") != "1":
             from makewand.daemon import try_dispatch_via_daemon
-            daemon_code = try_dispatch_via_daemon(sys.argv[1:], cwd=getattr(args, "cwd", None))
+            stdin_text = None
+            if args.subcommand in {"run", "race", "plan", "claude", "codex", "agy", "muse", "grok", "local", "aider", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"}:
+                if not getattr(args, "prompt", None) and not getattr(args, "prompt_file", None) and not sys.stdin.isatty():
+                    stdin_text = sys.stdin.read()
+            daemon_code = try_dispatch_via_daemon(sys.argv[1:], cwd=original_cwd, stdin=stdin_text)
             if daemon_code is not None:
                 sys.exit(daemon_code)
 
@@ -1251,6 +1430,35 @@ def main():
     if args.subcommand in prompt_subcommands:
         args.prompt = _resolve_cli_prompt(args, original_cwd=original_cwd, required=True)
 
+    from makewand.execution_runtime import execution_context
+    from makewand.workflow import remember_result
+    from makewand.telemetry import stage
+    remember_result(None)
+    deadline = math.ceil(time.time() * 1000 + args.total_timeout * 1000) if args.total_timeout is not None else None
+    workflow = selected.workflow if args.subcommand in ("run", "race") else "review" if args.subcommand == "review" else "direct"
+    with execution_context(deadline_unix_ms=deadline, workflow=workflow, risk=selected.risk):
+        exit_signal = None
+        with stage("command") as span:
+            try:
+                result = _dispatch_parsed_command(args, is_auto_routed_run)
+            except SystemExit as signal:
+                exit_signal = signal
+                from makewand.execution_contract import STATUS_CODES
+                code = signal.code if signal.code is not None else 0
+                status = next((name for name, number in STATUS_CODES.items() if number == code), "UNKNOWN")
+                span.finish(status=status)
+                result = None
+            else:
+                from makewand.workflow import last_result
+                outcome = last_result()
+                span.finish(status=getattr(outcome, "status", "PASSED" if outcome is None or outcome[0] else "FAILED"))
+        if exit_signal is not None:
+            raise exit_signal
+        return result
+
+
+def _dispatch_parsed_command(args, is_auto_routed_run=False):
+
     if args.subcommand == "daemon":
         cmd_daemon(args)
     elif args.subcommand == "sessions":
@@ -1282,14 +1490,28 @@ def main():
             repo_trust=repo_trust,
             boost=getattr(args, "boost", False),
             forced_engine=getattr(args, "provider", None),
-            local_only=getattr(args, "local_only", False)
+            local_only=getattr(args, "local_only", False),
+            workflow=args.workflow, risk=args.risk, total_timeout=args.total_timeout,
+            judge_reserve_seconds=args.judge_reserve_seconds,
+            **({"protected_paths": args.protected_paths} if args.protected_paths is not None else {}),
         )
         if not ok:
-            sys.exit(EXIT_FAILED)
+            sys.exit(_execution_exit_code())
         sys.exit(EXIT_PASSED)
+    elif args.subcommand == "merge":
+        from makewand.candidate import CandidateManager
+        ok, hybrid, detail = CandidateManager.create_hybrid_candidate(args.race_id)
+        print(detail)
+        if not ok:
+            sys.exit(EXIT_FAILED)
+        race = CandidateManager.get_race(args.race_id)
+        print("独立复审: makewand review --race-id " + race["race_id"] + " --candidate M")
+        sys.exit(EXIT_PASSED if hybrid.get("test_passed") is True else EXIT_UNVERIFIED)
     elif args.subcommand == "review":
-        exit_code = run_review(
-            cwd=args.cwd,
+        review_fn = review_saved_hybrid if args.race_id else run_review
+        review_options = {"race_id": args.race_id} if args.race_id else {"cwd": args.cwd}
+        exit_code = review_fn(
+            **review_options,
             stream=args.stream,
             timeout=args.timeout,
             output_json=getattr(args, "json", False),
@@ -1298,7 +1520,7 @@ def main():
         )
         sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand == "race":
-        exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout, repo_trust=getattr(args, "repo_trust", "trusted"))
+        exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout, repo_trust=getattr(args, "repo_trust", "trusted"), synthesize_hybrid=getattr(args, "hybrid", False), total_timeout=args.total_timeout, judge_reserve_seconds=args.judge_reserve_seconds, risk=args.risk, **({"protected_paths": args.protected_paths} if args.protected_paths is not None else {}))
         sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand == "candidates":
         cmd_candidates(args)
@@ -1325,7 +1547,7 @@ def main():
     elif args.subcommand == "sandbox":
         cmd_sandbox(args)
     elif args.subcommand == "claude":
-        ok, out, err = execute_claude_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("claude", execute_claude_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("claude", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1334,9 +1556,9 @@ def main():
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
     elif args.subcommand == "codex":
-        ok, out, err = execute_codex_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("codex", execute_codex_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("codex", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1345,9 +1567,9 @@ def main():
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
     elif args.subcommand == "agy":
-        ok, out, err = execute_agy_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("agy", execute_agy_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("agy", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1356,9 +1578,9 @@ def main():
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
     elif args.subcommand == "muse":
-        ok, out, err = execute_muse_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("muse", execute_muse_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("muse", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1367,9 +1589,9 @@ def main():
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
     elif args.subcommand == "grok":
-        ok, out, err = execute_grok_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("grok", execute_grok_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("grok", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1378,10 +1600,10 @@ def main():
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
     elif args.subcommand == "local":
         from makewand.providers.local import execute_local_task
-        ok, out, err = execute_local_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("local", execute_local_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("local", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1390,10 +1612,10 @@ def main():
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
     elif args.subcommand == "aider":
         from makewand.providers.aider import execute_aider_task
-        ok, out, err = execute_aider_task(args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("aider", execute_aider_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("aider", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1405,16 +1627,12 @@ def main():
             sys.exit(1)
     elif args.subcommand in ("deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
         from makewand.orchestrator import dispatch_task
-        ok, out, err = dispatch_task(args.subcommand, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage(args.subcommand, tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
+        from makewand.workflow import remember_result
+        ok, out, err = remember_result(dispatch_task(args.subcommand, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted")))
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
-            sys.exit(1)
+            sys.exit(_execution_exit_code())
     elif args.subcommand in ("cursor", "copilot"):
         print(c(f"❌ {args.subcommand} 目前只做安装检测，尚无执行适配器，无法直接派发任务。"
                 "请改用 claude/codex/agy/grok/muse/aider 或 API provider。", COLOR_RED), file=sys.stderr)

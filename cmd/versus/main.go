@@ -1,15 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/makewand/makewand/execution"
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
@@ -44,6 +44,14 @@ type result struct {
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, _, err := execution.EnsureContext(ctx)
+	if err != nil {
+		stop()
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(execution.ErrorStatus(err).ExitCode())
+	}
+	defer stop()
 	fmt.Println("╔══════════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║   Raw CLI vs makewand 多模型管道对比 (versus)                       ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════════════════╣")
@@ -63,19 +71,19 @@ func main() {
 
 	// 1. Gemini CLI raw
 	fmt.Println("━━━ [1/4] gemini CLI (raw) ━━━")
-	results = append(results, runCLI("gemini (raw)", "gemini", []string{"-p", fullPrompt, "--sandbox", "false"}))
+	results = append(results, runCLI(ctx, "gemini (raw)", "gemini", []string{"-p", fullPrompt, "--sandbox", "false"}))
 
 	// 2. Codex CLI raw
 	fmt.Println("━━━ [2/4] codex CLI (raw) ━━━")
-	results = append(results, runCLI("codex (raw)", "codex", []string{"exec", "--skip-git-repo-check", fullPrompt}))
+	results = append(results, runCLI(ctx, "codex (raw)", "codex", []string{"exec", "--skip-git-repo-check", fullPrompt}))
 
 	// 3. Claude CLI raw
 	fmt.Println("━━━ [3/4] claude CLI (raw) ━━━")
-	results = append(results, runCLI("claude (raw)", "claude", []string{"-p", fullPrompt}))
+	results = append(results, runCLI(ctx, "claude (raw)", "claude", []string{"-p", fullPrompt}))
 
 	// 4. makewand balanced pipeline
 	fmt.Println("━━━ [4/4] makewand balanced (multi-model) ━━━")
-	results = append(results, runMakewand())
+	results = append(results, runMakewand(ctx))
 
 	// Summary table
 	fmt.Println()
@@ -218,95 +226,15 @@ func main() {
 	fmt.Println("═══ 测试完成 ═══")
 }
 
-func runCLI(name, bin string, args []string) result {
-	r := result{name: name}
-
-	binPath, err := exec.LookPath(bin)
-	if err != nil {
-		r.err = fmt.Errorf("%s not found", bin)
-		fmt.Printf("  ✗ %s not found\n\n", bin)
-		return r
-	}
-
-	fmt.Printf("  Running %s... ", binPath)
-
+func runCLI(ctx context.Context, name, bin string, args []string) result {
 	timeout := 5 * time.Minute
 	if bin == "codex" {
 		timeout = 90 * time.Second // codex exec can block; hard limit
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	cmd := exec.Command(binPath, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// Claude Code: unset CLAUDECODE for nested invocation
-	if bin == "claude" {
-		env := os.Environ()
-		filtered := make([]string, 0, len(env))
-		for _, e := range env {
-			if !strings.HasPrefix(e, "CLAUDECODE=") {
-				filtered = append(filtered, e)
-			}
-		}
-		cmd.Env = filtered
-	}
-
-	// Gemini: bypass proxy
-	if bin == "gemini" {
-		cmd.Env = ensureNoProxyCopy(cmd.Environ())
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Start(); err != nil {
-		r.err = fmt.Errorf("start: %v", err)
-		fmt.Printf("✗ %v\n\n", err)
-		return r
-	}
-
-	// Kill entire process group on context cancel
-	cmdDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			if cmd.Process != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			}
-		case <-cmdDone:
-		}
-	}()
-
-	start := time.Now()
-	err = cmd.Wait()
-	close(cmdDone)
-	r.elapsed = time.Since(start)
-
-	if err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		r.err = fmt.Errorf("%s", errMsg)
-		fmt.Printf("✗ (%.0fs) %s\n\n", r.elapsed.Seconds(), errMsg[:min(len(errMsg), 100)])
-		return r
-	}
-
-	r.output = stripANSI(stdout.String())
-	parsed := engine.ParseFilesBestEffort(r.output)
-	r.files = parsed.Files
-
-	for _, f := range r.files {
-		r.totalLines += strings.Count(f.Content, "\n") + 1
-	}
-
-	fmt.Printf("✓ %.0fs, %d files, %d lines\n\n", r.elapsed.Seconds(), len(r.files), r.totalLines)
-	return r
+	return runCLIWithTimeout(ctx, name, bin, args, timeout)
 }
 
-func runMakewand() result {
+func runMakewand(ctx context.Context) result {
 	r := result{name: "makewand (balanced)"}
 
 	cfg, err := config.Load()
@@ -323,8 +251,6 @@ func runMakewand() result {
 		fmt.Printf("  ✗ router: %v\n\n", err)
 		return r
 	}
-	ctx := context.Background()
-
 	// Phase 1: Code (claude)
 	codeProvider := router.BuildProviderFor(model.PhaseCode)
 	fmt.Printf("  Code: %s... ", codeProvider)

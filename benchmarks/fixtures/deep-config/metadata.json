@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "deep-config",
+  "risk": "medium",
+  "category": "multi-file-refactor",
+  "language": "python",
+  "public_apis": [
+    [
+      "config_api.py",
+      "merge_config"
+    ],
+    [
+      "config_merge.py",
+      "merge_values"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true
+}

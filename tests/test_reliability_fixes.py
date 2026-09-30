@@ -94,10 +94,15 @@ class TestVerdictAndReviewReliability(unittest.TestCase):
 
     @patch("makewand.orchestrator.execute_claude_task", return_value=None)
     def test_dispatch_task_fails_closed_on_none_adapter_return(self, mock_claude):
-        ok, out, err = dispatch_task("claude", "test prompt", cwd="/tmp", readonly=True)
+        result = dispatch_task("claude", "test prompt", cwd="/tmp", readonly=True)
+        ok, out, err = result
         self.assertFalse(ok)
         self.assertIsNone(out)
-        self.assertIn("非预期格式", err)
+        self.assertIsInstance(err, str)
+        self.assertTrue(err)
+        self.assertEqual(result.status, "UNKNOWN")
+        self.assertFalse(result.outcome_known)
+        mock_claude.assert_called_once()
 
     def test_run_local_tests_deterministic_behavior(self):
         import tempfile

@@ -36,8 +36,10 @@
 
 ### Accounting and Budget Behavior
 
-The budget/quota subsystem fails in the safe direction (a lookup or write error
-rejects or is surfaced; it never silently permits unlimited spend):
+Budget lookup errors reject admission, while usage-write errors are surfaced
+and can reject non-streaming success responses in strict mode. Currency limits
+depend on provider-reported costs; unknown costs cannot provide a monetary hard
+cap:
 
 - **Per-token quota counters persist across restarts.** A token's hourly/daily
   request counts and daily/monthly spend are flushed to the state DB
@@ -72,6 +74,66 @@ rejects or is surfaced; it never silently permits unlimited spend):
   failed *after* the provider ran still incurred cost, recorded best-effort and
   surfaced. A budget lookup that errors fails closed (HTTP 503
   `budget_unavailable`).
+- **Budget alerts are asynchronous.** Usage entries are still written directly
+  to SQLite or JSONL; only webhook notifications enter a bounded queue of 64.
+  Deliveries use a 10-second timeout and at most three attempts, with an
+  `Idempotency-Key` identifying the scope, month, and severity. Queue saturation,
+  delivery failures, and state-write failures are logged and counted. Shutdown
+  drains notifications before closing the stores, with a 20-second deadline.
+  Pending notifications are held in memory and can be lost on an abnormal exit
+  or when the shutdown drain deadline expires;
+  receivers should honor the idempotency key because a retry can follow a
+  successful delivery whose response was lost.
+
+### Login and User Storage
+
+- User and browser-admin login share per-source and global admission limits:
+  30 attempts per source and 300 across the process per 15-minute window.
+  Five failures lock the account for 15 minutes across source addresses.
+  IPv6 sources share a /64 bucket; forwarding headers are honored only for
+  configured trusted proxies. Login state has a capacity of 4,096 keys per map;
+  expired keys are reclaimed during subsequent requests.
+- `--registration-concurrency` controls the process-wide password-hash limit
+  shared by login and registration (default 2). Excess requests receive 503
+  instead of waiting in an unbounded hash queue. Login and registration bodies
+  are limited to 64 KiB, email addresses to 254 bytes, and passwords to 1,024
+  bytes. Passwords must contain at least eight bytes when created or reset.
+  This shared gate covers HTTP login and self-registration; administrative user
+  creation/password reset and standalone CLI commands do not use it.
+- SQLite remains the default multi-user store. When
+  `MAKEWAND_SERVER_STATE_DB=off` selects the JSON fallback, user reads and writes
+  use a stable sidecar file lock across objects and processes; writes sync a
+  temporary file and replace `users.json` atomically. The fallback requires a
+  local filesystem with file-lock and atomic-replacement support. Using this
+  fallback does not make quotas, sessions, or browser logins shared across
+  server processes.
+
+### Usage Queries and Monitoring
+
+- SQLite usage queries have indexes for time, organization, project, token,
+  user, and request ID. Summary, billing, monthly-period, dashboard, budget, and
+  alert calculations use SQL aggregation rather than loading event bodies into
+  application memory. Existing databases receive the indexes at startup.
+- `/v1/admin/usage/events` returns 100 events by default, accepts `limit` up to
+  1,000 and a non-negative `offset`, and includes `pagination` metadata in JSON.
+  CSV preserves its columns and follows the same pagination; `X-Total-Count`
+  reports the matching event count. Tenant and user scope restrictions also
+  constrain the count. Callers exporting a complete history must request
+  subsequent pages. Offset pages and counts can shift when new events arrive.
+  A fixed `until` excludes newer timestamps, but late writes for older requests
+  can still change earlier pages.
+- `/health` is a process liveness check. `/ready` uses a two-second context to
+  check local SQLite availability when a state database is enabled; it returns
+  503 when that check fails. It does not make model calls or prove provider
+  credentials, quota, disk capacity, or write durability. JSONL-only mode has no
+  SQLite readiness check.
+- Protected `/metrics` includes HTTP request counts, latency histograms, active
+  requests, provider/usage/webhook/readiness/database error counts, and usage
+  database connection counts and wait duration. Database error counters cover
+  readiness ping failures; other admin/database operations are not all
+  separately instrumented. Provider labels describe the final HTTP invocation
+  or streaming failure; successful fallback attempts do
+  not expose every intermediate provider failure as a separate error counter.
 
 ## Personal Remote Mode
 
@@ -163,7 +225,7 @@ ssh -L 8080:127.0.0.1:8080 -N user@remote-host &
   - Password hashing is concurrency-bounded by `--registration-concurrency` (default 2); excess requests get 503.
   - Inactive self-registered accounts are not deleted automatically.
 - `--trusted-proxy <CIDR|IP>` (repeatable): only when the direct peer matches one of these are forwarding headers used for rate limiting. By default client-supplied forwarding headers are ignored. `X-Forwarded-For` is read **from the right**: hops that belong to a trusted proxy are skipped and the first untrusted hop is the client, so a client-supplied left-most value cannot change the limiter key. List every proxy hop that appends to the header (for example both the load balancer and nginx). The proxy must append to `X-Forwarded-For` (nginx `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, Caddy and `cloudflared` do this by default) or overwrite it with the peer address. `X-Real-IP` is used only when no `X-Forwarded-For` header is present
-- Login failures are limited per account and client address (5 failures per 15 minutes, then a 15-minute lockout); IPv6 clients are counted per `/64`
+- Login admission is limited per source and across the process; five failures also lock the account across source addresses for 15 minutes (see [Login and User Storage](#login-and-user-storage)). IPv6 clients share a `/64` bucket
 - Sessions are stored locally and not replicated
 
 ## Configuration
@@ -181,7 +243,7 @@ makewand serve \
   --registration-per-ip-limit 5       # Sign-ups per client address (IPv6 /64) per window
   --registration-global-limit 30      # Sign-ups from all clients per window; 0 disables the global cap
   --registration-window 1h            # Window for both registration limits
-  --registration-concurrency 2        # Concurrent registration password hashes
+  --registration-concurrency 2        # Shared login/registration password hashes
   --state-db path/to/state.db         # SQLite state DB (users, tokens, usage)
   --data-dir path/to/dir              # Session/state directory (default ~/.config/makewand/server)
   --audit-log path/to/audit.jsonl     # JSONL audit log path
@@ -250,7 +312,7 @@ makewand usage summary --state-db ~/.config/makewand/server/state.db
 ### Performance
 
 - The server handles requests concurrently (Go `net/http`), but it is sized and tested for small teams: one process, one SQLite state DB, per-process rate-limit and quota counters, and no horizontal scaling or HA
-- Do not run high-concurrency workloads; registration password hashing is capped by `--registration-concurrency`
+- Password hashing across login and registration is capped by `--registration-concurrency`; rate-limit and quota state remains per process
 - Monitor the `/admin` dashboard and `/metrics` for session and usage stats
 
 ## Feedback and Reporting Issues

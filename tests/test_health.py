@@ -120,13 +120,19 @@ class TestHealth(unittest.TestCase):
     def test_official_quota_reader(self):
         import os
         import json
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
         from makewand.health import calculate_provider_quota
         cache_dir = os.path.expanduser("~/.cache/makewand")
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(cache_dir, "quota-snapshot.json")
+        codex_home = os.path.join(cache_dir, "official-quota-test-codex")
+        now = datetime.now(timezone.utc)
+        claude_reset = (now + timedelta(days=4)).isoformat().replace("+00:00", "Z")
+        codex_reset = (now + timedelta(days=5)).isoformat().replace("+00:00", "Z")
         sample_snapshot = {
             "version": 1,
-            "taken_at": "2026-09-30T07:00:00Z",
+            "taken_at": now.isoformat().replace("+00:00", "Z"),
             "providers": [
                 {
                     "Provider": "claude",
@@ -135,8 +141,8 @@ class TestHealth(unittest.TestCase):
                     "ScopedPct": 100,
                     "Authed": True,
                     "HasData": True,
-                    "WeeklyResetAt": "2026-10-04T12:00:00Z",
-                    "ResetAt": "2026-10-04T12:00:00Z",
+                    "WeeklyResetAt": claude_reset,
+                    "ResetAt": claude_reset,
                 },
                 {
                     "Provider": "codex",
@@ -145,8 +151,9 @@ class TestHealth(unittest.TestCase):
                     "ScopedPct": None,
                     "Authed": True,
                     "HasData": True,
-                    "WeeklyResetAt": "2026-10-04T10:40:00Z",
-                    "ResetAt": "2026-10-04T10:40:00Z",
+                    "CodexHome": codex_home,
+                    "WeeklyResetAt": codex_reset,
+                    "ResetAt": codex_reset,
                 },
             ],
         }
@@ -160,11 +167,12 @@ class TestHealth(unittest.TestCase):
             self.assertIn("官方报告", q_claude["desc"])
             self.assertIn("100%", q_claude["desc"])
 
-            q_codex = calculate_provider_quota("codex", {"status": "healthy"})
-            self.assertEqual(q_codex["source"], "official")
-            self.assertEqual(q_codex["percentage"], 8)
-            self.assertIn("官方报告", q_codex["desc"])
-            self.assertEqual(q_codex["status"], "warning")
+            with patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                q_codex = calculate_provider_quota("codex", {"status": "healthy"})
+                self.assertEqual(q_codex["source"], "official")
+                self.assertEqual(q_codex["percentage"], 8)
+                self.assertIn("官方报告", q_codex["desc"])
+                self.assertEqual(q_codex["status"], "warning")
         finally:
             if os.path.exists(cache_file):
                 os.remove(cache_file)

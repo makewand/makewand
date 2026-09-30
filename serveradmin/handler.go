@@ -343,13 +343,12 @@ func handleUsageSummary(w http.ResponseWriter, req *http.Request, opts HandlerOp
 		return
 	}
 	constrainUsageFilterByGrant(&filter, grant)
-	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
+	summary, err := summarizeUsage(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
-	summary := serverusage.SummarizeEntries(entries)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":  opts.UsagePath,
 		"usage": summary,
@@ -372,6 +371,12 @@ func handleUsageEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusBadRequest, err.Error(), 0, 0, 0)
 		return
 	}
+	if filter.Limit == 0 {
+		filter.Limit = 100
+	}
+	if filter.Limit > 1000 {
+		filter.Limit = 1000
+	}
 	constrainUsageFilterByGrant(&filter, grant)
 	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
@@ -379,6 +384,13 @@ func handleUsageEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
+	total, err := countUsage(opts.UsageStore, opts.UsagePath, filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusInternalServerError, err.Error(), 0, 0, 0)
+		return
+	}
+	w.Header().Set("X-Total-Count", strconv.Itoa(total))
 	if wantsCSV(req) {
 		writeCSVHeaders(w, "usage-events.csv")
 		if err := serverusage.WriteEntriesCSV(w, entries); err != nil {
@@ -390,8 +402,9 @@ func handleUsageEvents(w http.ResponseWriter, req *http.Request, opts HandlerOpt
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path": opts.UsagePath,
-		"data": entries,
+		"path":       opts.UsagePath,
+		"data":       entries,
+		"pagination": map[string]any{"total": total, "limit": filter.Limit, "offset": filter.Offset, "returned": len(entries)},
 	})
 	logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_usage", http.StatusOK, "", 0, 0, 0)
 }
@@ -492,9 +505,9 @@ func handleUserAction(w http.ResponseWriter, req *http.Request, opts HandlerOpti
 			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", status, message, target)
 			return
 		}
-		if len(payload.Password) < 8 {
-			writeError(w, http.StatusBadRequest, "invalid_request", "password must be at least 8 characters long")
-			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusBadRequest, "password must be at least 8 characters long", target)
+		if len(payload.Password) < 8 || len(payload.Password) > 1024 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "password must be between 8 and 1024 bytes")
+			logAdminTargetEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsersWrite, "admin_users", http.StatusBadRequest, "password must be between 8 and 1024 bytes", target)
 			return
 		}
 		if !revokeUserCredentials(w, req, opts, grant, userID, "admin_users") {
@@ -597,12 +610,15 @@ func paginateBounds(total int, req *http.Request) pageWindow {
 			offset = value
 		}
 	}
+	if limit > 1000 {
+		limit = 1000
+	}
 	if offset > total {
 		offset = total
 	}
-	end := offset + limit
-	if end > total {
-		end = total
+	end := total
+	if limit < total-offset {
+		end = offset + limit
 	}
 	return pageWindow{Limit: limit, Offset: offset, Start: offset, End: end}
 }
@@ -1077,6 +1093,13 @@ func usageFilterFromQuery(req *http.Request) (serverusage.Filter, error) {
 	if err != nil {
 		return serverusage.Filter{}, fmt.Errorf("parse limit: %w", err)
 	}
+	offset, err := parseOptionalInt(query.Get("offset"))
+	if err != nil {
+		return serverusage.Filter{}, fmt.Errorf("parse offset: %w", err)
+	}
+	if limit < 0 || offset < 0 {
+		return serverusage.Filter{}, fmt.Errorf("limit and offset must be non-negative")
+	}
 	now := time.Now().UTC()
 	since, err := parseTimeValue(query.Get("since"), now)
 	if err != nil {
@@ -1095,6 +1118,7 @@ func usageFilterFromQuery(req *http.Request) (serverusage.Filter, error) {
 		Provider:   strings.TrimSpace(query.Get("provider")),
 		Status:     status,
 		Limit:      limit,
+		Offset:     offset,
 		Since:      since,
 		Until:      until,
 		StreamOnly: strings.EqualFold(strings.TrimSpace(query.Get("stream_only")), "true"),
@@ -1272,4 +1296,34 @@ func adminEvent(req *http.Request, grant *serverauth.Grant, scope, kind string, 
 		event.ActorUserID = grant.UserID()
 	}
 	return event
+}
+
+func summarizeUsage(store serverusage.Reader, path string, filter serverusage.Filter) (serverusage.Summary, error) {
+	if store == nil {
+		if strings.TrimSpace(path) == "" {
+			return serverusage.SummarizeEntries(nil), nil
+		}
+		store = serverusage.NewJSONLReader(path)
+	}
+	return serverusage.Summarize(store, filter)
+}
+
+func countUsage(store serverusage.Reader, path string, filter serverusage.Filter) (int, error) {
+	if store == nil {
+		if strings.TrimSpace(path) == "" {
+			return 0, nil
+		}
+		store = serverusage.NewJSONLReader(path)
+	}
+	return serverusage.Count(store, filter)
+}
+
+func monthlyUsage(store serverusage.Reader, path string, filter serverusage.Filter) ([]serverusage.PeriodSummary, error) {
+	if store == nil {
+		if strings.TrimSpace(path) == "" {
+			return nil, nil
+		}
+		store = serverusage.NewJSONLReader(path)
+	}
+	return serverusage.MonthlyPeriods(store, filter)
 }

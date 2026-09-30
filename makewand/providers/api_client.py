@@ -9,6 +9,9 @@ import sys
 import json
 import time
 import threading
+import functools
+import inspect
+import math
 import urllib.request
 import urllib.error
 import re
@@ -288,13 +291,23 @@ class _DeadlineExceeded(Exception):
     """Raised inside the request worker when the total deadline has passed."""
 
 
+class _IncompleteStream(Exception):
+    """A received stream does not establish a completed remote response."""
+
+
 def _response_socket(resp: Any):
     """Best-effort access to the socket under an http.client response."""
     import socket as _socket
-    fp = getattr(resp, "fp", None)
-    raw = getattr(fp, "raw", None)
-    sock = getattr(raw, "_sock", None)
-    return sock if isinstance(sock, _socket.socket) else None
+    fp = resp
+    for _ in range(4):
+        raw = getattr(fp, "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if isinstance(sock, _socket.socket):
+            return sock
+        fp = getattr(fp, "fp", None)
+        if fp is None:
+            break
+    return None
 
 
 def _abort_response(resp: Any) -> None:
@@ -316,18 +329,26 @@ def _perform_request(req, per_read_timeout: float, stream: bool, print_prefix: s
         code = resp.status
         if stream:
             # Simple SSE / chunk streaming
+            terminal = False
             for line in resp:
                 if abort.is_set() or time.monotonic() >= deadline:
                     raise _DeadlineExceeded()
                 line_str = line.decode("utf-8", errors="replace")
-                if line_str.startswith("data: "):
-                    data_part = line_str[6:].strip()
+                if line_str.startswith("data:"):
+                    data_part = line_str[5:].strip()
                     if data_part == "[DONE]":
+                        terminal = True
                         break
                     try:
                         delta_json = json.loads(data_part)
+                        if not isinstance(delta_json, dict):
+                            raise ValueError("stream frame must be an object")
                         delta_content = ""
                         choices = delta_json.get("choices")
+                        if delta_json.get("type") == "message_stop":
+                            terminal = True
+                        if isinstance(choices, list) and any(isinstance(item, dict) and item.get("finish_reason") is not None for item in choices):
+                            terminal = True
                         if choices and isinstance(choices, list) and len(choices) > 0:
                             delta_content = choices[0].get("delta", {}).get("content", "")
                         elif "delta" in delta_json:
@@ -337,10 +358,14 @@ def _perform_request(req, per_read_timeout: float, stream: bool, print_prefix: s
                             if print_prefix:
                                 sys.stdout.write(delta_content)
                                 sys.stdout.flush()
-                    except Exception:
-                        pass
+                    except (ValueError, TypeError, AttributeError) as exc:
+                        raise _IncompleteStream("Malformed API stream frame") from exc
+                    if terminal:
+                        break
             if abort.is_set():
                 raise _DeadlineExceeded()
+            if not terminal:
+                raise _IncompleteStream("API stream ended without a terminal response")
             if print_prefix:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -376,71 +401,105 @@ def _make_http_request(
     thread that the caller stops waiting for at the deadline; the response
     socket is shut down so the worker unwinds promptly.
     """
+    from makewand.providers.base import ProcessExecutionError
+    from makewand.execution_contract import ExecutionRequest
+    from makewand.execution_runtime import current_context, execute, execution_context, mark_provider_invocation, task_id
+    from makewand.workflow import provider_outcome
+
     body_bytes = json.dumps(data).encode("utf-8")
     total = max(0.001, float(timeout))
-    deadline = time.monotonic() + total
+    parent_deadline = current_context().get("_deadline_monotonic")
+    deadline = min(time.monotonic() + total, parent_deadline) if parent_deadline is not None else time.monotonic() + total
 
-    def _timeout_result(partial_text: str = "") -> Tuple[int, str, Optional[str]]:
-        return -1, partial_text, f"Total timeout exceeded: API call did not finish within {timeout}s (monotonic deadline)"
+    def timeout_result(partial_text=""):
+        return -1, partial_text, ProcessExecutionError(f"Total timeout exceeded: API call did not finish within {timeout}s (monotonic deadline)", "TIMEOUT")
 
-    attempt = 0
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return _timeout_result()
+    def perform(remaining):
         req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
         abort = threading.Event()
         holder: List[Any] = []
         partial: List[str] = []
         outcome: Dict[str, Any] = {}
 
-        def _runner():
+        def runner():
             try:
-                outcome["value"] = _perform_request(req, remaining, stream, print_prefix,
-                                                    deadline, abort, holder, partial)
-            except BaseException as exc:  # re-raised in the calling thread
+                outcome["value"] = _perform_request(req, remaining, stream, print_prefix, deadline, abort, holder, partial)
+            except urllib.error.HTTPError as exc:
+                # Error bodies are untrusted network reads too. Keep their
+                # bounded read in this deadline-controlled worker.
+                holder.append(exc)
+                try:
+                    body = exc.read(65536).decode("utf-8", errors="replace") if exc.fp else ""
+                    outcome["value"] = (exc.code, body, ProcessExecutionError(f"HTTP Error {exc.code}: {exc.reason} - {body[:200]}", "FAILED"))
+                except Exception as error:
+                    outcome["error"] = error
+                finally:
+                    exc.close()
+            except BaseException as exc:
                 outcome["error"] = exc
 
-        worker = threading.Thread(target=_runner, name="makewand-api-request", daemon=True)
+        worker = threading.Thread(target=runner, name="makewand-api-request", daemon=True)
         worker.start()
-        worker.join(max(0.0, deadline - time.monotonic()))
+        worker.join(max(0.0, min(remaining, deadline - time.monotonic())))
         if worker.is_alive():
             abort.set()
             for resp in holder:
                 _abort_response(resp)
-            worker.join(0.5)
-            return _timeout_result("".join(partial))
+            # No replay and no synchronous wait beyond the caller's deadline.
+            return timeout_result("".join(partial))
+        error = outcome.get("error")
+        if error is not None:
+            if isinstance(error, (_DeadlineExceeded, TimeoutError)) or isinstance(getattr(error, "reason", None), TimeoutError):
+                return timeout_result("".join(partial))
+            if isinstance(error, _IncompleteStream):
+                return -1, "".join(partial), ProcessExecutionError(str(error), "UNKNOWN")
+            if isinstance(error, urllib.error.URLError):
+                return -1, "".join(partial), ProcessExecutionError(f"Network/URL Error: {error.reason}", "UNKNOWN")
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise error
+            return -1, "".join(partial), ProcessExecutionError(f"Execution Exception: {error}", "UNKNOWN")
+        return outcome["value"]
 
-        try:
-            if "error" in outcome:
-                raise outcome["error"]
-            return outcome["value"]
-        except _DeadlineExceeded:
-            return _timeout_result("".join(partial))
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
-            if e.code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                attempt += 1
-                sleep_sec = backoff_factor * (2 ** (attempt - 1))
-                if deadline - time.monotonic() <= sleep_sec:
-                    return e.code, err_body, f"HTTP Error {e.code}: {e.reason} - {err_body[:200]} (retry skipped: total timeout would be exceeded)"
-                time.sleep(sleep_sec)
-                continue
-            return e.code, err_body, f"HTTP Error {e.code}: {e.reason} - {err_body[:200]}"
-        except (urllib.error.URLError, TimeoutError) as e:
-            if attempt < max_retries:
-                attempt += 1
-                sleep_sec = backoff_factor * (2 ** (attempt - 1))
-                if deadline - time.monotonic() <= sleep_sec:
-                    return _timeout_result()
-                time.sleep(sleep_sec)
-                continue
-            reason = getattr(e, "reason", str(e))
-            return -1, "", f"Network/URL Error: {reason}"
-        except Exception as e:
-            return -1, "", f"Execution Exception: {str(e)}"
+    attempt = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return timeout_result()
+        if attempt == 0:
+            value = perform(remaining)
+        else:
+            context = current_context()
+            parent = context.get("_request")
+            request = ExecutionRequest(task_id=task_id(), stage=context.get("stage") or "api_retry",
+                engine=parent.engine if parent else "api", tier=parent.tier if parent else "standard",
+                model=parent.model if parent else None, readonly=parent.readonly if parent else False,
+                api_policy=parent.api_policy if parent else "allow_paid",
+                timeout_ms=max(1, int(remaining * 1000)))
+            captured = []
 
-def call_api_chat(
+            def invoke(effective):
+                mark_provider_invocation()
+                raw = perform(min(remaining, effective) if effective is not None else remaining)
+                captured.append(raw)
+                return provider_outcome((raw[0] == 200, raw[1], raw[2]))
+
+            with execution_context(lease_id=None):
+                result = execute(request, invoke)
+            if not captured or result.status not in ("PASSED", "FAILED"):
+                return -1, result.output or "", ProcessExecutionError(result.error or "API retry could not complete", result.status)
+            value = captured[0]
+        code, raw, error = value
+        # Only an explicit HTTP refusal permits a new dispatch. Connection
+        # loss, deadline and incomplete response have unknown remote outcomes.
+        if code not in (429, 500, 502, 503, 504) or getattr(error, "execution_status", None) != "FAILED" or attempt >= max_retries:
+            return value
+        attempt += 1
+        sleep_sec = backoff_factor * (2 ** (attempt - 1))
+        if deadline - time.monotonic() <= sleep_sec:
+            return code, raw, error
+        time.sleep(sleep_sec)
+
+def _call_api_chat(
     provider: str,
     prompt: str,
     system_prompt: Optional[str] = None,
@@ -680,3 +739,57 @@ def call_api_chat(
             return False, raw, "No choices returned by API"
         except Exception as e:
             return False, raw, f"JSON parse error: {e}"
+
+
+_API_SIGNATURE = inspect.signature(_call_api_chat)
+
+
+@functools.wraps(_call_api_chat)
+def call_api_chat(*args, **kwargs):
+    """Preserve the API interface while sharing SDK admission and read-only scope."""
+    from makewand.execution_contract import ExecutionRequest, ExecutionResult
+    from makewand.execution_runtime import claim_provider_invocation, current_context, execute, execution_context, mark_provider_invocation, task_id
+    from makewand.providers.base import ProcessExecutionError
+    from makewand.workflow import provider_outcome
+    from makewand.config import get_api_policy, is_api_allowed, api_policy_error, normalize_provider_name
+
+    arguments = _API_SIGNATURE.bind(*args, **kwargs)
+    arguments.apply_defaults()
+    options = dict(arguments.arguments)
+    context = current_context()
+    parent = context.get("_request")
+    readonly = (parent.readonly if parent else context.get("readonly", False)) or options["role"] == "reviewer"
+    if readonly:
+        options["role"] = "reviewer"
+    if (not is_api_allowed(options["provider"])
+            or parent is not None and parent.api_policy == "subscription_only" and normalize_provider_name(options["provider"]) != "local"):
+        return False, "", api_policy_error()
+    try:
+        timeout = float(options["timeout"])
+        if isinstance(options["timeout"], bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("invalid timeout")
+    except (TypeError, ValueError, OverflowError):
+        return ExecutionResult(False, "", "API timeout must be a finite positive number", status="INVALID_REQUEST")
+
+    def invoke(remaining):
+        mark_provider_invocation()
+        effective = dict(options)
+        if remaining is not None:
+            effective["timeout"] = min(timeout, remaining)
+        return provider_outcome(_call_api_chat(**effective))
+
+    if claim_provider_invocation():
+        deadline = context.get("_deadline_monotonic")
+        remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
+        return invoke(remaining)
+    request = ExecutionRequest(task_id=task_id(), stage=context.get("stage") or "api",
+        engine=options["provider"], tier=options["tier"], model=options["model"], readonly=bool(readonly),
+        api_policy=parent.api_policy if parent else get_api_policy(), timeout_ms=max(1, int(timeout * 1000)),
+        prompt=options["prompt"], cwd=options["cwd"])
+    with execution_context(lease_id=None):
+        result = execute(request, invoke)
+    # Legacy CLI adapters unpack and reconstruct the tuple; keep runner-owned
+    # status evidence in the string-compatible error across those boundaries.
+    if not result.success and result.error is not None:
+        return ExecutionResult(False, result.output, ProcessExecutionError(result.error, result.status), **result._metadata)
+    return result

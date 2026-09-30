@@ -161,6 +161,9 @@ func (l *RegistrationRateLimiter) AllowAt(sourceIP string, now time.Time) bool {
 		if l.perIPCounts[source] >= l.limits.MaxPerSource {
 			return false
 		}
+		if _, exists := l.perIPCounts[source]; !exists && len(l.perIPCounts) >= maxLoginKeys {
+			return false
+		}
 		if l.limits.MaxGlobal > 0 && l.globalCount >= l.limits.MaxGlobal {
 			if !l.globalAlerted && l.onGlobalLimit != nil {
 				l.globalAlerted = true
@@ -182,16 +185,21 @@ func (l *RegistrationRateLimiter) AllowAt(sourceIP string, now time.Time) bool {
 // Acquire reserves one concurrent hashing slot without blocking. It returns a
 // release function and true on success, or false when all slots are busy.
 func (l *RegistrationRateLimiter) Acquire() (func(), bool) {
+	sharedRelease, ok := AcquirePasswordHash()
+	if !ok {
+		return nil, false
+	}
 	if l == nil {
-		return func() {}, true
+		return sharedRelease, true
 	}
 	select {
 	case l.sem <- struct{}{}:
 		var once sync.Once
 		return func() {
-			once.Do(func() { <-l.sem })
+			once.Do(func() { <-l.sem; sharedRelease() })
 		}, true
 	default:
+		sharedRelease()
 		return nil, false
 	}
 }

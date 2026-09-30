@@ -467,5 +467,8 @@ func sanitizeDirName(name string) string {
 
 func shouldIgnore(path string) bool {
 	base := filepath.Base(path)
-	return shouldIgnoreSet[base]
+	if shouldIgnoreSet[base] {
+		return true
+	}
+	return isWorkspaceSecretPath(path)
 }

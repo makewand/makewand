@@ -924,49 +924,39 @@ def get_platform():
             self.assertIn("return 200", merged_py)
 
     def test_candidate_manager_hybrid_candidate_lifecycle(self):
+        from makewand.candidate import build_manifest
+        from makewand.git_helper import clone_isolated_worktree, ensure_git_worktree, run_git_cmd
         with tempfile.TemporaryDirectory() as td:
             base_dir = Path(td) / "workspace"
             base_dir.mkdir()
             (base_dir / "module.py").write_text("def x(): return 1\ndef y(): return 2\n")
-
-            cand_a_dir = Path(td) / "cand_a"
-            cand_b_dir = Path(td) / "cand_b"
-            cand_a_dir.mkdir()
-            cand_b_dir.mkdir()
-
-            (cand_a_dir / "module.py").write_text("def x(): return 10\ndef y(): return 2\n")
-            (cand_b_dir / "module.py").write_text("def x(): return 1\ndef y(): return 20\n")
-
+            (base_dir / "test_module.py").write_text("def test_module():\n    assert True\n")
+            self.assertTrue(ensure_git_worktree(str(base_dir)))
+            baseline = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(base_dir))[1].strip()
             race_id = "test_rc_hybrid_1"
-            race_data = {
-                "race_id": race_id,
-                "base_cwd": str(base_dir),
-                "candidates": {
-                    "A": {
-                        "model": "model-a",
-                        "path": str(cand_a_dir),
-                        "success": True,
-                        "test_passed": True,
-                    },
-                    "B": {
-                        "model": "model-b",
-                        "path": str(cand_b_dir),
-                        "success": True,
-                        "test_passed": True,
-                    }
-                }
-            }
-
-            with patch("makewand.candidate.CandidateManager.get_race", return_value=race_data), \
-                 patch("makewand.candidate.config.CANDIDATES_DIR", Path(td) / "candidates"), \
+            with patch("makewand.candidate.config.CANDIDATES_DIR", Path(td) / "candidates"), \
                  patch("makewand.orchestrator.run_local_tests", return_value=(True, None)):
-
-                (Path(td) / "candidates" / race_id).mkdir(parents=True, exist_ok=True)
+                race_dir = Path(td) / "candidates" / race_id
+                cand_a_dir, cand_b_dir, frozen = [race_dir / name for name in ("A", "B", "baseline")]
+                for destination in (cand_a_dir, cand_b_dir, frozen):
+                    clone_isolated_worktree(str(base_dir), destination)
+                (cand_a_dir / "module.py").write_text("def x(): return 10\ndef y(): return 2\n")
+                (cand_b_dir / "module.py").write_text("def x(): return 1\ndef y(): return 20\n")
+                agents = []
+                for model, path in (("model-a", cand_a_dir), ("model-b", cand_b_dir)):
+                    candidate_baseline = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(path))[1].strip()
+                    agents.append({"model": model, "path": str(path), "baseline_commit": candidate_baseline,
+                                   "success": True, "test_passed": True})
+                CandidateManager.save_race(race_id, "merge complementary fixes", str(base_dir), baseline,
+                                           *agents, baseline_dir=frozen,
+                                           frozen_baseline_manifest=build_manifest(frozen))
                 ok, cand_m, msg = CandidateManager.create_hybrid_candidate(race_id)
                 self.assertTrue(ok, msg)
                 self.assertIsNotNone(cand_m)
                 self.assertEqual(cand_m["label"], "M")
-                self.assertTrue(cand_m["test_passed"])
+                self.assertIs(cand_m["test_passed"], True)
+                self.assertIsNone(cand_m["review_passed"])
+                self.assertEqual(CandidateManager.get_race(race_id)["candidates"]["M"], cand_m)
 
 
 class TestCrossSessionCollisionDetection(unittest.TestCase):

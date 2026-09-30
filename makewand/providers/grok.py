@@ -7,7 +7,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_YELLOW
-from makewand.providers.base import run_subprocess
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.workflow import provider_outcome
 
 # Context-anchored patterns (aligned with codex/claude): a bare "429" token in
 # arbitrary output ("line 429", "429 errors", PIDs, hashes) is never a limit.
@@ -95,20 +96,14 @@ def execute_grok_task(
         if has_api_configured("grok"):
             import sys
             print(c("[Makewand -> Grok] (纯 API 模式) 派发任务至 xAI API...", COLOR_YELLOW), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, "未找到 Grok Build CLI 订阅，且未配置 XAI_API_KEY"
 
     if cache.get("grok", {}).get("status") in ["limited", "needs_auth"]:
         if has_api_configured("grok"):
             import sys
             print(c("[Makewand -> Grok] 订阅当前受限，无缝自动降级为 xAI API 模式接力执行...", COLOR_YELLOW), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Grok Build 当前不可用: {cache['grok'].get('reason')} (可配置 XAI_API_KEY 作为备用 API 自动接力)"
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
@@ -162,6 +157,8 @@ def execute_grok_task(
         log_desc = "只读解析/审查任务 (Plan 模式)" if readonly else "代码任务 (自动审批执行)"
         import sys
         print(c(f"[Makewand -> Grok] 派发{log_desc} (Tier: {tier}, xAI Provider)...", COLOR_YELLOW), file=sys.stderr)
+        from makewand.execution_runtime import mark_provider_invocation
+        mark_provider_invocation()
         code, out, err, ex = run_subprocess(
             cmd,
             timeout=timeout,
@@ -186,16 +183,16 @@ def execute_grok_task(
     if code == 0:
         return True, out, None
 
+    if is_process_timeout(ex) or code < 0:
+        return model_process_failure("grok", code, combined, err, ex, readonly)
+
     is_limited, reason, resets = parse_grok_quota(combined)
     if is_limited:
         record_engine_limit("grok", reason, resets)
         if has_api_configured("grok"):
             import sys
             print(c(f"[Makewand -> Grok] 订阅触发限制 ({reason})，无缝切换为 xAI API Key 模式接力执行...", COLOR_YELLOW), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Grok Build 执行中检测到限制: {reason} (可配置 XAI_API_KEY 实现自动接力)"
 
-    return False, combined, ex or f"Grok returned exit code {code}"
+    return model_process_failure("grok", code, combined, err, ex, readonly)

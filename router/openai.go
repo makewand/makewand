@@ -71,6 +71,12 @@ type openaiStreamChunk struct {
 }
 
 func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
+	return dispatchChat(ctx, o, func(attemptCtx context.Context) (string, Usage, error) {
+		return o.chatUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
 	model := o.model
 	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
 		model = requested
@@ -119,17 +125,24 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, ma
 	}
 
 	usage := Usage{
-		InputTokens:  result.Usage.PromptTokens,
-		OutputTokens: result.Usage.CompletionTokens,
-		Cost:         o.priceForCtx(ctx, model, result.Usage.PromptTokens, result.Usage.CompletionTokens),
-		Model:        model,
-		Provider:     "openai",
+		MeasuredTokens: result.Usage.PromptTokens > 0 || result.Usage.CompletionTokens > 0,
+		InputTokens:    result.Usage.PromptTokens,
+		OutputTokens:   result.Usage.CompletionTokens,
+		Cost:           o.priceForCtx(ctx, model, result.Usage.PromptTokens, result.Usage.CompletionTokens),
+		Model:          model,
+		Provider:       "openai",
 	}
 
 	return text, usage, nil
 }
 
 func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	return dispatchStream(ctx, o, func(attemptCtx context.Context) (<-chan StreamChunk, error) {
+		return o.chatStreamUnaccounted(attemptCtx, messages, system, maxTokens)
+	})
+}
+
+func (o *OpenAI) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
 	model := o.model
 	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
 		model = requested

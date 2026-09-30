@@ -39,7 +39,7 @@ def execute_aider_task(
 
     from makewand.sandbox import is_bwrap_available, wrap_bwrap
     from makewand.git_helper import find_git_root
-    from makewand.providers.base import run_subprocess
+    from makewand.providers.base import run_subprocess, model_process_failure
 
     work_dir = os.path.abspath(cwd or os.getcwd())
     if not repo_root:
@@ -86,6 +86,8 @@ def execute_aider_task(
         log_desc = "只读解析任务" if readonly else "代码编写任务"
         print(c(f"[Makewand -> Aider] 派发{log_desc}至 Aider Pair Programmer (沙箱隔离)...", COLOR_GREEN), file=sys.stderr)
 
+        from makewand.execution_runtime import mark_provider_invocation
+        mark_provider_invocation()
         code, out, err, ex = run_subprocess(
             cmd,
             timeout=timeout,
@@ -108,4 +110,4 @@ def execute_aider_task(
     if code == 0:
         return True, out or "Aider task completed successfully", None
     else:
-        return False, out, err or ex or f"Aider exited with code {code}"
+        return model_process_failure("aider", code, out, err, ex, readonly)

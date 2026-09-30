@@ -1,0 +1,1 @@
+修复 paths.py 的 normalize_relative_path(value)。将反斜杠视为分隔符，折叠空片段和 .，用 .. 消去前一片段，返回 / 分隔相对路径；空结果返回 .。拒绝前导 / 或反斜杠、ASCII 盘符前缀（含 C:relative）、NUL，以及 .. 越出根目录，均抛 ValueError。这里只进行词法规范化，不访问文件系统。只用标准库。

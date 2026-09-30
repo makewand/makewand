@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "slugs",
+  "risk": "low",
+  "category": "function-fix",
+  "language": "python",
+  "public_apis": [
+    [
+      "slugs.py",
+      "unique_slugs"
+    ]
+  ],
+  "budget_policy": "same wall-clock and acceptance time limits for every task/arm; externally configured before execution",
+  "preregistered": true,
+  "legacy_fixture_unchanged": true
+}

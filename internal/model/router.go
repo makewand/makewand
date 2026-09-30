@@ -41,6 +41,7 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	}
 	cfg = &resolved
 	rc := RouterConfig{}
+	rc.ExecutionAPIPolicy = cfg.EffectiveAPIPolicy()
 	rc.RepoTrust = trust
 
 	// Point the Router at the config dir so it loads routing.json into its own

@@ -51,9 +51,17 @@ scratch/
 !/benchmarks/run.sh
 !/benchmarks/runner.py
 !/benchmarks/test_runner.py
+!/benchmarks/analyze_results.py
+!/benchmarks/test_analyze_results.py
+!/benchmarks/test_deep_config_acceptance_v4.py
 !/benchmarks/arms.example.json
+!/benchmarks/model_arm.py
+!/benchmarks/arms.subscription.json
+!/benchmarks/acceptance.py
+!/benchmarks/acceptance_worker.py
 !/benchmarks/fixtures/
 !/benchmarks/prompts/
+!/benchmarks/smoke_tests/
 /benchmarks/results/
 /blog-project/
 /notes-api/

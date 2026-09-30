@@ -213,13 +213,12 @@ func handleBillingSummary(w http.ResponseWriter, req *http.Request, opts Handler
 	}
 	filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
 	constrainUsageFilterByGrant(&filter, grant)
-	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
+	summary, err := summarizeUsage(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
-	summary := serverusage.SummarizeEntries(entries)
 	billing := serverteam.BillingSummary{}
 	if opts.TeamStore != nil {
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
@@ -285,13 +284,12 @@ func handleBillingPeriods(w http.ResponseWriter, req *http.Request, opts Handler
 		return
 	}
 	constrainUsageFilterByGrant(&filter, grant)
-	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
+	periods, err := monthlyUsage(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_periods", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
-	periods := serverusage.SummarizeMonthlyPeriods(entries)
 	if wantsCSV(req) {
 		writeCSVHeaders(w, "billing-periods.csv")
 		if err := serverusage.WritePeriodsCSV(w, periods); err != nil {
@@ -326,13 +324,12 @@ func handleBillingAlerts(w http.ResponseWriter, req *http.Request, opts HandlerO
 	}
 	filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
 	constrainUsageFilterByGrant(&filter, grant)
-	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
+	summary, err := summarizeUsage(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_billing_alerts", http.StatusInternalServerError, err.Error(), 0, 0, 0)
 		return
 	}
-	summary := serverusage.SummarizeEntries(entries)
 	alerts := make([]serverteam.BudgetAlert, 0, 8)
 	if opts.TeamStore != nil {
 		if orgs, err := opts.TeamStore.ListOrganizations(); err == nil {
@@ -402,7 +399,7 @@ func handleDashboard(w http.ResponseWriter, req *http.Request, opts HandlerOptio
 	}
 	filter = serverusage.CurrentMonthFilter(filter, time.Now().UTC())
 	constrainUsageFilterByGrant(&filter, grant)
-	entries, err := loadUsageEntries(opts.UsageStore, opts.UsagePath, filter)
+	summary, err := summarizeUsage(opts.UsageStore, opts.UsagePath, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		logAdminEvent(opts.AuditLogger, req, grant, serverauth.ScopeAdminUsageRead, "admin_dashboard", http.StatusInternalServerError, err.Error(), 0, 0, 0)
@@ -411,7 +408,7 @@ func handleDashboard(w http.ResponseWriter, req *http.Request, opts HandlerOptio
 	payload := map[string]any{
 		"usage": map[string]any{
 			"path":    opts.UsagePath,
-			"summary": serverusage.SummarizeEntries(entries),
+			"summary": summary,
 		},
 	}
 	if opts.TokenManager != nil && grant.AllowsScope(serverauth.ScopeAdminTokensRead) {

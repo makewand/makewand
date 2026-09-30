@@ -189,19 +189,31 @@ class TestAuditV31Fixes(unittest.TestCase):
                 run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=str(target))
                 run_git_cmd(["git", "commit", "-m", "init", "--allow-empty"], cwd=str(target))
 
+            def fake_dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):
+                if readonly:
+                    return True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None
+                (Path(cwd) / "app.py").write_text(f"ENGINE = {engine!r}\n", encoding="utf-8")
+                return True, "output code", None
+
             with patch("makewand.orchestrator.dispatch_task") as mock_dispatch, \
                  patch("makewand.orchestrator.clone_isolated_worktree", side_effect=fake_clone), \
                  patch("makewand.orchestrator.run_local_tests", return_value=(True, "all passed")), \
-                 patch("makewand.orchestrator.execute_agy_task", return_value=(True, "推荐采纳候选方案 A", None)):
-                mock_dispatch.return_value = (True, "output code", None)
+                 patch("makewand.orchestrator.get_or_update_status", return_value={engine: {"status": "healthy"} for engine in ("claude", "codex", "agy")}), \
+                 patch("makewand.config.is_provider_enabled", return_value=True), \
+                 patch("makewand.orchestrator.execute_agy_task", side_effect=AssertionError("AGY must use the unified dispatcher")):
+                mock_dispatch.side_effect = fake_dispatch
 
                 # Test Claude as Racer A, Codex as Racer B
                 rc = run_race("task", cwd=td, engine_a="claude", engine_b="codex")
-                self.assertIsInstance(rc, int)
-                self.assertEqual(mock_dispatch.call_count, 2)
+                self.assertEqual(rc, 0)
+                self.assertEqual(mock_dispatch.call_count, 3)
                 called_engines = [call[0][0] for call in mock_dispatch.call_args_list]
                 self.assertIn("claude", called_engines)
                 self.assertIn("codex", called_engines)
+                readonly_calls = [call for call in mock_dispatch.call_args_list if call.kwargs.get("readonly")]
+                self.assertEqual(len(readonly_calls), 1)
+                self.assertEqual(readonly_calls[0].args[0], "agy")
+                self.assertEqual(readonly_calls[0].kwargs["tier"], "deep")
 
         # Verify dispatch_task records usage
         with patch("makewand.orchestrator.execute_claude_task", return_value=(True, "ok", None)), \
@@ -264,13 +276,14 @@ class TestAuditV31Fixes(unittest.TestCase):
         self.assertIn("test_cleanup", out)
 
     def test_p0_a_clone_isolated_worktree_copies_files_and_excludes_dirs(self):
-        """P0-A: clone_isolated_worktree uses copy2 (different inodes) and excludes node_modules, benchmarks, etc."""
+        """P0-A: copies have distinct inodes; dependencies and ignored caches stay excluded."""
         from makewand.git_helper import clone_isolated_worktree
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src"
             dst = Path(td) / "dst"
             src.mkdir()
             (src / "app.py").write_text("print('hello')\n")
+            (src / ".gitignore").write_text("__pycache__/\n")
             (src / "node_modules").mkdir()
             (src / "node_modules" / "pkg.js").write_text("dummy")
             (src / "benchmarks").mkdir()
@@ -375,7 +388,8 @@ class TestAuditV31Fixes(unittest.TestCase):
                  patch("makewand.config.get_active_providers", return_value=["codex"]), \
                  patch("makewand.orchestrator.dispatch_task", side_effect=single_engine_dispatch), \
                  patch("makewand.orchestrator.run_local_tests", return_value=(True, "ok")):
-                res = run_pipeline("修改代码", cwd=tmpdir, stream=False, auto_fix=True, force_code=True)
+                res = run_pipeline("修改代码", cwd=tmpdir, stream=False, auto_fix=True, force_code=True,
+                                   workflow="single", risk="low")
                 self.assertTrue(res)
 
     def test_p1_e_aider_sandbox_env_and_mount(self):

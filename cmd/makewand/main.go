@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/makewand/makewand/execution"
+
 	"github.com/makewand/makewand/internal/buildinfo"
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/diag"
@@ -26,12 +28,14 @@ import (
 )
 
 var (
-	debugFlag        bool
-	rootModeFlag     string
-	rootPrintFlag    bool
-	rootTimeoutFlag  time.Duration
-	repoTrustFlag    string
-	rootApprovalFlag string
+	debugFlag              bool
+	rootModeFlag           string
+	rootPrintFlag          bool
+	rootTimeoutFlag        time.Duration
+	repoTrustFlag          string
+	rootApprovalFlag       string
+	rootMaxModelCallsFlag  int
+	rootCallBudgetFileFlag string
 
 	// resolvedRepoTrust holds the repository trust level parsed once by the root
 	// command's PersistentPreRunE, so every subcommand shares a single validated
@@ -74,14 +78,7 @@ func resolveRepoTrust(value string) (model.RepoTrust, error) {
 	return trust, nil
 }
 
-// pythonOrchestratorCmds are the subcommands implemented by the Python
-// orchestrator; the Go binary forwards them unchanged.
-var pythonOrchestratorCmds = map[string]bool{
-	"run": true, "review": true, "race": true, "observe": true,
-	"models": true, "candidates": true, "inspect": true, "apply": true,
-	"discard": true, "sandbox": true, "status": true, "probe": true,
-	"repomap": true, "plan": true, "aci": true, "mcp": true,
-}
+//go:generate python3 -I ../../scripts/generate_cli_contract.py
 
 // pythonDelegation is a command line routed to the Python orchestrator.
 type pythonDelegation struct {
@@ -103,10 +100,12 @@ type pythonDelegation struct {
 // Python CLI gives when --approval follows the subcommand.
 func planPythonDelegation(args []string) (*pythonDelegation, error) {
 	var (
-		globals  []string
-		approval string
-		debug    bool
-		i        int
+		globals    []string
+		approval   string
+		debug      bool
+		pythonOnly bool
+		natural    bool
+		i          int
 	)
 	flagValue := func(name string) (string, bool, error) {
 		arg := args[i]
@@ -138,6 +137,38 @@ scan:
 			debug = value
 			i++
 		default:
+			if pythonGlobalBooleanFlags[arg] {
+				pythonOnly = true
+				globals = append(globals, arg)
+				i++
+				continue
+			}
+			matched := false
+			for name := range pythonGlobalValueFlags {
+				if value, ok, err := flagValue(name); ok {
+					if err != nil {
+						return nil, err
+					}
+					if !sharedGlobalValueFlags[name] {
+						pythonOnly = true
+					}
+					if name == "--max-model-calls" {
+						maximum, parseErr := strconv.Atoi(value)
+						if parseErr != nil || maximum <= 0 {
+							return nil, fmt.Errorf("--max-model-calls must be a positive integer")
+						}
+					}
+					if name == "--call-budget-file" && strings.TrimSpace(value) == "" {
+						return nil, fmt.Errorf("--call-budget-file requires a nonempty path")
+					}
+					globals = append(globals, name, value)
+					matched = true
+					break
+				}
+			}
+			if matched {
+				continue
+			}
 			if value, ok, err := flagValue("--repo-trust"); ok {
 				if err != nil {
 					return nil, err
@@ -162,11 +193,21 @@ scan:
 			break scan
 		}
 	}
-	if i >= len(args) || !pythonOrchestratorCmds[args[i]] {
+	subcmd := "run"
+	var rest []string
+	switch {
+	case i < len(args) && pythonOrchestratorCmds[args[i]]:
+		subcmd = args[i]
+		rest = args[i+1:]
+	case pythonOnly:
+		if i < len(args) && nativeGoCommands[args[i]] {
+			return nil, fmt.Errorf("python task flags cannot be used with native Go command %q", args[i])
+		}
+		natural = true
+		rest = args[i:]
+	default:
 		return nil, nil
 	}
-	subcmd := args[i]
-	rest := args[i+1:]
 	if approval != "" {
 		return nil, fmt.Errorf("--approval %s applies to makewand chat sessions only; %q is handled by the Python orchestrator, which has no approval modes, so it cannot be honored (remove --approval)", approval, subcmd)
 	}
@@ -190,7 +231,12 @@ scan:
 	if debug {
 		delegation.notes = append(delegation.notes, "note: --debug only affects makewand chat sessions; ignored for "+subcmd)
 	}
-	delegation.args = append(append(globals, subcmd), translatePythonTierArgs(rest)...)
+	if natural {
+		delegation.args = append(delegation.args, globals...)
+		delegation.args = append(delegation.args, translatePythonTierArgs(rest)...)
+	} else {
+		delegation.args = append(append(globals, subcmd), translatePythonTierArgs(rest)...)
+	}
 	return delegation, nil
 }
 
@@ -232,7 +278,7 @@ func tryDelegateToPythonOrchestrator(args []string) bool {
 	delegation, err := planPythonDelegation(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		os.Exit(execution.InvalidRequest.ExitCode())
 	}
 	if delegation == nil {
 		return false
@@ -325,7 +371,7 @@ func main() {
 		tryDelegateToPythonOrchestrator(os.Args[1:])
 	}
 	if err := newRootCmd().Execute(); err != nil {
-		os.Exit(1)
+		os.Exit(execution.ErrorStatus(err).ExitCode())
 	}
 }
 
@@ -333,6 +379,7 @@ func main() {
 // main) so tests can exercise the persistent flag validation and command wiring
 // without spawning a subprocess.
 func newRootCmd() *cobra.Command {
+	var workingDir string
 	rootCmd := &cobra.Command{
 		Use:   "makewand [prompt]",
 		Short: "Multi-provider coding router for terminal makers",
@@ -383,6 +430,14 @@ Flags:
 				return err
 			}
 			resolvedApprovalOverride = approval
+			if workingDir != "" {
+				if err := os.Chdir(workingDir); err != nil {
+					return fmt.Errorf("change working directory: %w", err)
+				}
+			}
+			if err := configureExecutionBudget(cmd); err != nil {
+				return &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true, Err: err}
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -447,8 +502,11 @@ Flags:
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
+	rootCmd.PersistentFlags().StringVarP(&workingDir, "cwd", "C", "", "target working directory")
 	rootCmd.PersistentFlags().StringVar(&repoTrustFlag, "repo-trust", "trusted", "repository trust level: trusted (default) or untrusted (only direct API providers, fail closed)")
 	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`; autopilot still asks before applying until Strength-2 verification exists)")
+	rootCmd.PersistentFlags().IntVar(&rootMaxModelCallsFlag, "max-model-calls", 0, "maximum attempted model dispatches shared by Go and Python (failed and canceled calls count)")
+	rootCmd.PersistentFlags().StringVar(&rootCallBudgetFileFlag, "call-budget-file", "", "persistent process-safe model call budget ledger")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().StringVar(&rootModeFlag, "tier", "", "alias for --mode: fast, balanced (standard), power (deep)")
 	rootCmd.Flags().BoolVar(&rootPrintFlag, "print", false, "run one prompt and print the result (non-interactive)")
@@ -904,7 +962,7 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, r
 			// Propagate the fail-closed sentinel the engine set when untrusted-repo
 			// mode had no untrusted-repo-safe provider, so the mapping below presents
 			// the actionable untrusted-mode message instead of the generic one.
-			if errors.Is(selection.Err, model.ErrNoUntrustedSafeProvider) {
+			if selection.Err != nil {
 				err = selection.Err
 			} else {
 				err = fmt.Errorf("no candidate provider produced a response")

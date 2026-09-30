@@ -7,24 +7,12 @@ into a verified hybrid candidate (Candidate M), tested and applied atomically.
 """
 
 import os
-import sys
 import ast
-import shutil
+import difflib
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Set
-
-from makewand.config import (
-    c,
-    COLOR_BOLD,
-    COLOR_CYAN,
-    COLOR_GREEN,
-    COLOR_YELLOW,
-    COLOR_RED,
-    COLOR_RESET,
-)
-from makewand.git_helper import run_git_cmd, get_git_diff
+from typing import Dict, List, Optional, Tuple
 
 
 def line_level_3way_merge(
@@ -73,11 +61,7 @@ def line_level_3way_merge(
         except Exception:
             pass
 
-    # Pure Python fallback line merge
-    import difflib
-    diff_a = list(difflib.ndiff(base_text.splitlines(keepends=True), text_a.splitlines(keepends=True)))
-    diff_b = list(difflib.ndiff(base_text.splitlines(keepends=True), text_b.splitlines(keepends=True)))
-    # If fallback fails to merge cleanly
+    # The Python-aware caller may retry with conservative whole-text edits.
     return False, text_a, True
 
 
@@ -96,7 +80,8 @@ def extract_python_symbols(source_code: str) -> Dict[str, Tuple[int, int, str, a
     lines = source_code.splitlines(keepends=True)
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            start_line = getattr(node, "lineno", 1)
+            start_line = min([getattr(node, "lineno", 1)] +
+                             [decorator.lineno for decorator in node.decorator_list])
             end_line = getattr(node, "end_lineno", start_line)
             # Slice source lines
             slice_lines = "".join(lines[start_line - 1 : end_line])
@@ -127,129 +112,85 @@ def extract_python_imports(source_code: str) -> Tuple[List[str], int]:
     return import_lines, last_line
 
 
+def _merge_disjoint_text(base_code: str, code_a: str, code_b: str):
+    """Merge whole-text edits; AST is used only to recognize import additions.
+
+    Rebuilding a module from selected symbols loses constants, deletions,
+    decorators and other top-level statements. Every byte participates here.
+    """
+    base = base_code.splitlines(keepends=True)
+    edits = []
+    for side, source in enumerate((code_a, code_b)):
+        lines = source.splitlines(keepends=True)
+        for tag, start, end, other_start, other_end in difflib.SequenceMatcher(
+                None, base, lines, autojunk=False).get_opcodes():
+            if tag != "equal":
+                edits.append((start, end, lines[other_start:other_end], side))
+    merged_edits = []
+    for start, end, replacement, side in sorted(edits, key=lambda item: (item[0], item[1], item[3])):
+        if merged_edits:
+            prior_start, prior_end, prior_replacement, prior_side = merged_edits[-1]
+            if start == prior_start and end == prior_end and replacement == prior_replacement:
+                continue
+            if start == end == prior_start == prior_end:
+                def imports_only(lines):
+                    try:
+                        nodes = ast.parse("".join(lines)).body
+                        return bool(nodes) and all(isinstance(node, (ast.Import, ast.ImportFrom)) for node in nodes)
+                    except SyntaxError:
+                        return False
+                if imports_only(prior_replacement) and imports_only(replacement):
+                    merged_edits[-1] = (start, end, prior_replacement + replacement, prior_side)
+                    continue
+                return False, ""
+            # Insertion at a replacement boundary is ambiguous. Adjacent
+            # nonempty edits are safe and keep their complete source text.
+            overlap = start < prior_end or (start == prior_start and (start == end or prior_start == prior_end))
+            if overlap:
+                return False, ""
+        merged_edits.append((start, end, replacement, side))
+    result = list(base)
+    for start, end, replacement, _ in reversed(merged_edits):
+        result[start:end] = replacement
+    return True, "".join(result)
+
+
 def ast_merge_python_file(base_code: str, code_a: str, code_b: str) -> Tuple[bool, str, str]:
-    """
-    Performs an AST-aware semantic merge for Python files:
-    1. Compares symbol definitions (functions, classes) in A and B against Base.
-    2. If A modified a symbol and B left it unchanged, takes A's version.
-    3. If B modified a symbol and A left it unchanged, takes B's version.
-    4. Merges newly added imports and top-level additions.
-    5. Falls back to line-level 3-way merge if both modified the same symbol or syntax errors exist.
-    Returns (success, merged_code, merge_strategy).
-    """
+    """Use a complete text three-way merge, with conservative AST assistance."""
     if code_a == code_b:
-        return True, code_a, "identical"
-    if code_a == base_code:
-        return True, code_b, "take_b"
-    if code_b == base_code:
-        return True, code_a, "take_a"
-
-    syms_base = extract_python_symbols(base_code)
-    syms_a = extract_python_symbols(code_a)
-    syms_b = extract_python_symbols(code_b)
-
-    # If any file couldn't be parsed, fallback immediately to line-level merge
-    if not syms_base and not syms_a and not syms_b:
-        ok, res, conflict = line_level_3way_merge(base_code, code_a, code_b)
-        return ok, res, "line_3way" if ok else "conflict"
-
-    # Analyze changes per symbol
-    all_sym_names = sorted(set(syms_base.keys()) | set(syms_a.keys()) | set(syms_b.keys()))
-    replacements_a: Dict[str, Tuple[int, int, str]] = {}
-    replacements_b: Dict[str, Tuple[int, int, str]] = {}
-    conflicting_symbols = []
-
-    for name in all_sym_names:
-        in_base = name in syms_base
-        in_a = name in syms_a
-        in_b = name in syms_b
-
-        # Check modifications
-        mod_a = False
-        if in_base and in_a:
-            mod_a = (syms_a[name][2].strip() != syms_base[name][2].strip())
-        elif in_base != in_a:
-            mod_a = True
-
-        mod_b = False
-        if in_base and in_b:
-            mod_b = (syms_b[name][2].strip() != syms_base[name][2].strip())
-        elif in_base != in_b:
-            mod_b = True
-
-        if mod_a and mod_b:
-            # Both modified the same symbol
-            if in_a and in_b and syms_a[name][2].strip() == syms_b[name][2].strip():
-                # Both made the identical change to this symbol
-                replacements_a[name] = syms_a[name][:3]  # type: ignore
-            else:
-                conflicting_symbols.append(name)
-        elif mod_a:
-            if in_a and in_base:
-                replacements_a[name] = syms_a[name][:3]  # type: ignore
-        elif mod_b:
-            if in_b and in_base:
-                replacements_b[name] = syms_b[name][:3]  # type: ignore
-
-    # If both modified the same symbol differently, AST symbol-level splicing cannot resolve it
-    if conflicting_symbols:
-        ok, res, conflict = line_level_3way_merge(base_code, code_a, code_b)
-        return ok, res, "line_3way" if ok else "conflict"
-
-    # Splice symbol changes into base code lines
-    base_lines = base_code.splitlines(keepends=True)
-    # Sort replacements by line number descending so line indices don't shift earlier edits
-    actions = []
-    for name, (start, end, src) in replacements_a.items():
-        base_start, base_end, _, _ = syms_base[name]
-        actions.append((base_start, base_end, src))
-    for name, (start, end, src) in replacements_b.items():
-        base_start, base_end, _, _ = syms_base[name]
-        actions.append((base_start, base_end, src))
-
-    actions.sort(key=lambda x: x[0], reverse=True)
-
-    # Apply symbol replacements
-    for b_start, b_end, replacement_src in actions:
-        rep_lines = replacement_src.splitlines(keepends=True)
-        if not rep_lines or not rep_lines[-1].endswith("\n"):
-            rep_lines.append("\n")
-        base_lines[b_start - 1 : b_end] = rep_lines
-
-    # Check for newly added symbols in A or B
-    added_in_a = [name for name in syms_a if name not in syms_base and name not in syms_b]
-    added_in_b = [name for name in syms_b if name not in syms_base and name not in syms_a]
-    for name in added_in_a:
-        base_lines.append("\n\n" + syms_a[name][2].strip() + "\n")
-    for name in added_in_b:
-        base_lines.append("\n\n" + syms_b[name][2].strip() + "\n")
-
-    # Check for newly added imports
-    imports_base, last_imp_base = extract_python_imports(base_code)
-    imports_a, _ = extract_python_imports(code_a)
-    imports_b, _ = extract_python_imports(code_b)
-
-    new_imports = []
-    base_imp_set = set(imports_base)
-    for imp in imports_a + imports_b:
-        if imp not in base_imp_set and imp not in new_imports:
-            new_imports.append(imp)
-
-    if new_imports:
-        insert_idx = min(last_imp_base, len(base_lines))
-        import_block = "".join(f"{imp}\n" for imp in new_imports)
-        base_lines.insert(insert_idx, import_block)
-
-    merged_code = "".join(base_lines)
-
-    # Validate syntax of merged code
-    try:
-        ast.parse(merged_code)
-        return True, merged_code, "ast_symbol_splice"
-    except SyntaxError:
-        # Fallback to standard 3-way line merge
-        ok, res, conflict = line_level_3way_merge(base_code, code_a, code_b)
-        return ok, res, "line_3way_fallback" if ok else "conflict"
+        ok, merged, strategy = True, code_a, "identical"
+    elif code_a == base_code:
+        ok, merged, strategy = True, code_b, "take_b"
+    elif code_b == base_code:
+        ok, merged, strategy = True, code_a, "take_a"
+    else:
+        # An identical newly added definition belongs in the result once. Git
+        # can duplicate it when one side also changes the preceding last line.
+        # Remove only that exact shared AST span from A; all remaining text,
+        # including constants, comments and module statements, still participates.
+        symbols_base = extract_python_symbols(base_code)
+        symbols_a = extract_python_symbols(code_a)
+        symbols_b = extract_python_symbols(code_b)
+        shared = [symbols_a[name] for name in symbols_a.keys() & symbols_b.keys()
+                  if name not in symbols_base and symbols_a[name][2] == symbols_b[name][2]]
+        merge_a = code_a
+        if shared:
+            lines_a = code_a.splitlines(keepends=True)
+            for start, end, _, _ in sorted(shared, reverse=True, key=lambda symbol: symbol[0]):
+                del lines_a[start - 1:end]
+            merge_a = "".join(lines_a)
+        ok, merged, _ = line_level_3way_merge(base_code, merge_a, code_b)
+        if not ok:
+            ok, merged = _merge_disjoint_text(base_code, merge_a, code_b)
+        # Keep the existing public strategy label for callers; the implementation
+        # now preserves full text rather than splicing a subset of AST symbols.
+        strategy = "ast_symbol_splice" if ok else "conflict"
+    if ok:
+        try:
+            ast.parse(merged)
+        except SyntaxError:
+            return False, merged, "conflict"
+    return ok, merged, strategy
 
 
 def merge_file_content(
@@ -262,9 +203,12 @@ def merge_file_content(
     Merges content of a single file between Base, Candidate A, and Candidate B.
     Returns (success, merged_content, strategy_or_error).
     """
-    content_base = base_file.read_text(encoding="utf-8", errors="replace") if (base_file and base_file.is_file()) else ""
-    content_a = file_a.read_text(encoding="utf-8", errors="replace") if (file_a and file_a.is_file()) else ""
-    content_b = file_b.read_text(encoding="utf-8", errors="replace") if (file_b and file_b.is_file()) else ""
+    try:
+        content_base = base_file.read_text(encoding="utf-8") if (base_file and base_file.is_file()) else ""
+        content_a = file_a.read_text(encoding="utf-8") if (file_a and file_a.is_file()) else ""
+        content_b = file_b.read_text(encoding="utf-8") if (file_b and file_b.is_file()) else ""
+    except (UnicodeError, OSError) as exc:
+        return False, None, f"文本合并输入不可读: {exc}"
 
     if rel_path.endswith(".py"):
         ok, res, strategy = ast_merge_python_file(content_base, content_a, content_b)
@@ -278,41 +222,38 @@ def merge_file_content(
     return False, None, "文本行合并冲突 (包含重叠修改)"
 
 
+def _changes_between(baseline, candidate):
+    return {path: ("D" if path not in candidate else "A" if path not in baseline else "M")
+            for path in sorted(baseline.keys() | candidate.keys())
+            if baseline.get(path) != candidate.get(path)}
+
+
 def get_worktree_changes_fallback(base_dir: Path, worktree_dir: Path) -> Dict[str, str]:
-    """Fallback scanner comparing worktree_dir files against base_dir when git status is empty or non-git."""
-    changes = {}
-    if not worktree_dir.exists():
-        return changes
-    for root, _, files in os.walk(str(worktree_dir)):
-        for f in files:
-            p = Path(root) / f
-            if os.path.islink(p):
-                continue
-            rel = p.relative_to(worktree_dir).as_posix()
-            if rel.startswith(".git"):
-                continue
-            base_p = base_dir / rel
-            if not base_p.exists():
-                changes[rel] = "A"
-            else:
-                try:
-                    if p.read_bytes() != base_p.read_bytes():
-                        changes[rel] = "M"
-                except Exception:
-                    changes[rel] = "M"
-    if base_dir.exists():
-        for root, _, files in os.walk(str(base_dir)):
-            for f in files:
-                p = Path(root) / f
-                if os.path.islink(p):
-                    continue
-                rel = p.relative_to(base_dir).as_posix()
-                if rel.startswith(".git"):
-                    continue
-                wt_p = worktree_dir / rel
-                if not wt_p.exists():
-                    changes[rel] = "D"
-    return changes
+    """Compare complete regular-file records, including permission changes."""
+    from makewand.candidate import build_manifest
+    return _changes_between(build_manifest(base_dir), build_manifest(worktree_dir))
+
+
+def _merge_path(root: Path, relative: str) -> Path:
+    from makewand.candidate import _verify_safe_target_path
+    parts = Path(relative).parts
+    if not parts or Path(relative).is_absolute() or any(part in (".", "..", ".git") for part in parts):
+        raise ValueError("invalid merge path")
+    return _verify_safe_target_path(root, relative)
+
+
+def _sealed_bytes(root: Path, relative: str, expected) -> bytes:
+    import hashlib
+    import stat
+    target = _merge_path(root, relative)
+    with os.fdopen(os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("merge input must be a regular file")
+        content = handle.read()
+        if expected != {"sha256": hashlib.sha256(content).hexdigest(), "mode": stat.S_IMODE(info.st_mode)}:
+            raise ValueError("merge input changed after sealing")
+        return content
 
 
 def semantic_merge_candidate_worktrees(
@@ -320,93 +261,85 @@ def semantic_merge_candidate_worktrees(
     cand_a_dir: Path,
     cand_b_dir: Path,
     output_dir: Path,
-    baseline_commit: Optional[str] = None
+    baseline_commit: Optional[str] = None,
+    changes_a=None,
+    changes_b=None,
+    manifest_a=None,
+    manifest_b=None,
+    baseline_manifest=None,
 ) -> Tuple[bool, Dict[str, str], List[str], str]:
-    """
-    Synthesizes Candidate A and Candidate B into output_dir using 3-way semantic merge.
-    Returns (success, merged_changes, conflict_files, summary_message).
-    """
-    from makewand.candidate import get_candidate_files_changed
-
-    changes_a = get_candidate_files_changed(cand_a_dir, baseline_commit=baseline_commit)
-    changes_b = get_candidate_files_changed(cand_b_dir, baseline_commit=baseline_commit)
-
-    # Fallback to direct directory diff if git returned nothing (e.g. non-git directory or mock test dir)
-    if not changes_a:
-        changes_a = get_worktree_changes_fallback(Path(base_cwd), cand_a_dir)
-    if not changes_b:
-        changes_b = get_worktree_changes_fallback(Path(base_cwd), cand_b_dir)
-
-    all_files = sorted(set(changes_a.keys()) | set(changes_b.keys()))
-    if not all_files:
-        return True, {}, [], "无待合并的代码改动"
-
-    merged_changes: Dict[str, str] = {}
-    conflict_files: List[str] = []
-
-    for rel_path in all_files:
-        st_a = changes_a.get(rel_path)
-        st_b = changes_b.get(rel_path)
-
-        path_base = Path(base_cwd) / rel_path
-        path_a = cand_a_dir / rel_path
-        path_b = cand_b_dir / rel_path
-        out_target = output_dir / rel_path
-
-        out_target.parent.mkdir(parents=True, exist_ok=True)
-
-        # Case 1: Modified/added only in A
-        if st_a and not st_b:
-            if st_a == "D":
-                if out_target.exists():
-                    out_target.unlink()
-                merged_changes[rel_path] = "D"
-            else:
-                shutil.copy2(path_a, out_target)
-                merged_changes[rel_path] = st_a
-            continue
-
-        # Case 2: Modified/added only in B
-        if st_b and not st_a:
-            if st_b == "D":
-                if out_target.exists():
-                    out_target.unlink()
-                merged_changes[rel_path] = "D"
-            else:
-                shutil.copy2(path_b, out_target)
-                merged_changes[rel_path] = st_b
-            continue
-
-        # Case 3: Both modified / touched the same file
-        if st_a == "D" and st_b == "D":
-            if out_target.exists():
-                out_target.unlink()
-            merged_changes[rel_path] = "D"
-            continue
-
-        if (st_a == "D" and st_b != "D") or (st_b == "D" and st_a != "D"):
-            conflict_files.append(rel_path)
-            continue
-
-        # Both added or modified
-        if path_a.is_file() and path_b.is_file():
-            # Check if byte identical
-            if path_a.read_bytes() == path_b.read_bytes():
-                shutil.copy2(path_a, out_target)
-                merged_changes[rel_path] = st_a
+    """Merge frozen whole-file inputs. Git metadata cannot choose deliverables."""
+    from makewand.candidate import build_manifest, _atomic_copy
+    base_dir = Path(base_cwd)
+    try:
+        baseline = baseline_manifest if baseline_manifest is not None else build_manifest(base_dir)
+        sealed_a = manifest_a if manifest_a is not None else build_manifest(cand_a_dir)
+        sealed_b = manifest_b if manifest_b is not None else build_manifest(cand_b_dir)
+        actual_a, actual_b = _changes_between(baseline, sealed_a), _changes_between(baseline, sealed_b)
+        if changes_a is not None and changes_a != actual_a or changes_b is not None and changes_b != actual_b:
+            return False, {}, [], "候选变更计划与冻结基线不一致"
+        changes_a, changes_b = actual_a, actual_b
+        merged_changes, conflicts = {}, []
+        for relative in sorted(changes_a.keys() | changes_b.keys()):
+            st_a, st_b = changes_a.get(relative), changes_b.get(relative)
+            target = _merge_path(output_dir, relative)
+            _merge_path(base_dir, relative)
+            _merge_path(cand_a_dir, relative)
+            _merge_path(cand_b_dir, relative)
+            if st_a == "D" and st_b == "D" or st_a == "D" and not st_b or st_b == "D" and not st_a:
+                if target.exists():
+                    target.unlink()
+                merged_changes[relative] = "D"
                 continue
-
-            # Merge contents
-            ok, merged_content, strat = merge_file_content(rel_path, path_base, path_a, path_b)
-            if ok and merged_content is not None:
-                out_target.write_text(merged_content, encoding="utf-8")
-                merged_changes[rel_path] = "M"
+            if st_a == "D" or st_b == "D":
+                conflicts.append(relative)
+                continue
+            if not st_b:
+                _atomic_copy(str(output_dir), relative, cand_a_dir / relative, sealed_a[relative])
+                merged_changes[relative] = st_a
+                continue
+            if not st_a:
+                _atomic_copy(str(output_dir), relative, cand_b_dir / relative, sealed_b[relative])
+                merged_changes[relative] = st_b
+                continue
+            content_a = _sealed_bytes(cand_a_dir, relative, sealed_a[relative])
+            content_b = _sealed_bytes(cand_b_dir, relative, sealed_b[relative])
+            content_base = _sealed_bytes(base_dir, relative, baseline[relative]) if relative in baseline else b""
+            mode_base = baseline.get(relative, {}).get("mode")
+            mode_a, mode_b = sealed_a[relative]["mode"], sealed_b[relative]["mode"]
+            if mode_a == mode_b:
+                mode = mode_a
+            elif mode_a == mode_base:
+                mode = mode_b
+            elif mode_b == mode_base:
+                mode = mode_a
             else:
-                conflict_files.append(rel_path)
-        else:
-            conflict_files.append(rel_path)
-
-    if conflict_files:
-        return False, {}, conflict_files, f"语义合并冲突: 共有 {len(conflict_files)} 个文件存在不可调和的冲突改动 ({', '.join(conflict_files[:5])})"
-
-    return True, merged_changes, [], f"3-way 语义合并成功，共融合 {len(merged_changes)} 个文件"
+                conflicts.append(relative)
+                continue
+            if mode & 0o7000:
+                conflicts.append(relative)
+                continue
+            if content_a == content_b:
+                merged = content_a
+            else:
+                try:
+                    text_base, text_a, text_b = [content.decode("utf-8") for content in (content_base, content_a, content_b)]
+                    if relative.endswith(".py"):
+                        ok, text, _ = ast_merge_python_file(text_base, text_a, text_b)
+                    else:
+                        ok, text, _ = line_level_3way_merge(text_base, text_a, text_b)
+                except UnicodeError:
+                    ok = False
+                if not ok:
+                    conflicts.append(relative)
+                    continue
+                merged = text.encode("utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(merged)
+            target.chmod(mode)
+            merged_changes[relative] = "M" if relative in baseline else "A"
+        if conflicts:
+            return False, {}, conflicts, "语义合并冲突: " + ", ".join(conflicts[:5])
+        return True, merged_changes, [], f"3-way 语义合并成功，共融合 {len(merged_changes)} 个文件"
+    except (OSError, ValueError, KeyError) as exc:
+        return False, {}, [], f"合并输入完整性校验失败: {exc}"

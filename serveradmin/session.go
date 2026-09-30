@@ -165,6 +165,7 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 		return
 	}
 	var payload router.UserLoginRequest
+	req.Body = http.MaxBytesReader(w, req.Body, 64<<10)
 	dec := newLimitedJSONDecoder(w, req)
 	if err := dec.Decode(&payload); err != nil {
 		status, code, message := adminJSONDecodeError(err)
@@ -172,10 +173,20 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 		return
 	}
 	key := m.limiter.ThrottleKey(req, payload.Email)
-	if allowed, retryAfter := m.limiter.Allow(key, time.Now().UTC()); !allowed {
+	if len(payload.Password) > 1024 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "password is too long")
+		return
+	}
+	if allowed, retryAfter := m.limiter.Admit(req, payload.Email, time.Now().UTC()); !allowed {
 		writeError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("too many failed admin logins; try again in %s", retryAfter.Round(time.Second)))
 		return
 	}
+	releaseHash, acquired := serverauth.AcquirePasswordHash()
+	if !acquired {
+		writeError(w, http.StatusServiceUnavailable, "login_busy", "login is temporarily busy; try again shortly")
+		return
+	}
+	defer releaseHash()
 	user, err := m.userStore.GetUserByEmail(payload.Email)
 	// Always spend one password hash: unknown and inactive accounts must take
 	// as long as a wrong password, or response time reveals which accounts

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -86,6 +87,7 @@ func serveCmd() *cobra.Command {
 				return err
 			}
 
+			serverauth.ConfigurePasswordHashConcurrency(registrationLimits.MaxConcurrent)
 			cfg := loadConfigWithWarning()
 			if !cfg.HasAnyModel() {
 				return serveNoModelsError(cfg)
@@ -108,6 +110,7 @@ func serveCmd() *cobra.Command {
 			usagePath = resolveServeUsagePath(usagePath, dataDir, stateDBPath != "")
 			alertWebhook = resolveServeAlertWebhook(alertWebhook)
 			alertState = resolveServeAlertStatePath(alertState, dataDir)
+			metrics := servermetrics.NewRecorder()
 			var auditLogger *serveraudit.JSONLLogger
 			if strings.TrimSpace(auditPath) != "" {
 				auditLogger, err = serveraudit.OpenJSONL(auditPath)
@@ -254,10 +257,18 @@ func serveCmd() *cobra.Command {
 				usageStore = serverusage.NewJSONLReader(usagePath)
 			}
 			if alertWebhook != "" {
-				alertNotifier, err := serveralerts.OpenWebhookNotifier(alertWebhook, alertState, usageStore, teamStore)
+				alertNotifier, err := serveralerts.OpenWebhookNotifierWithOptions(alertWebhook, alertState, usageStore, teamStore, serveralerts.NotifierOptions{ErrorHandler: func(err error) {
+					metrics.ObserveError("webhook", "")
+					fmt.Fprintf(os.Stderr, "warning: budget alert delivery failed: %v\n", err)
+				}})
 				if err != nil {
 					return fmt.Errorf("open alert notifier: %w", err)
 				}
+				defer func() {
+					if err := alertNotifier.Close(); err != nil {
+						fmt.Fprintf(os.Stderr, "warning: close budget alert notifier: %v\n", err)
+					}
+				}()
 				usageLogger = combineUsageLoggers(usageLogger, alertNotifier)
 			}
 			if enableUsers && userStore == nil {
@@ -299,6 +310,8 @@ func serveCmd() *cobra.Command {
 				StrictAccounting:     strictAccounting,
 				UserTokenManager:     tokenManager,
 				UserLoginLimiter:     loginLimiter,
+				Observer:             metrics.ObserveError,
+				ReadinessCheck:       serveReadinessCheck(usageStore, metrics),
 				// Surface dropped usage writes instead of silently under-counting
 				// budget. Logging runs after the response, so this cannot fail the
 				// request; it makes the loss visible to the operator.
@@ -331,7 +344,6 @@ func serveCmd() *cobra.Command {
 					SessionMgr:   sessionMgr,
 				}))
 			}
-			metrics := servermetrics.NewRecorder()
 			mux.Handle("/metrics", serveProtectedHandler(authz, serverauth.ScopeAdminMetricsRead, metrics.Handler()))
 			mux.Handle("/admin", serverui.Handler())
 			mux.Handle("/admin/", serverui.Handler())
@@ -434,7 +446,7 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().IntVar(&registrationPerIP, "registration-per-ip-limit", serverauth.DefaultRegistrationPerSource, "self-registrations allowed per client address (IPv6: per /64) per --registration-window")
 	cmd.Flags().IntVar(&registrationGlobal, "registration-global-limit", serverauth.DefaultRegistrationGlobal, "self-registrations allowed from all clients per --registration-window; reaching it logs a warning and an audit event; 0 disables the global cap (the per-address limit still applies)")
 	cmd.Flags().DurationVar(&registrationWindow, "registration-window", serverauth.DefaultRegistrationWindow, "fixed window for the self-registration limits")
-	cmd.Flags().IntVar(&registrationSlots, "registration-concurrency", serverauth.DefaultRegistrationConcurrency, "maximum concurrent self-registration password hashes (excess requests get 503)")
+	cmd.Flags().IntVar(&registrationSlots, "registration-concurrency", serverauth.DefaultRegistrationConcurrency, "maximum concurrent password hashes shared by login and registration (excess requests get 503)")
 	cmd.Flags().BoolVar(&unsafeNoTLS, "unsafe-no-tls", false, "DANGER: allow plaintext listening on non-loopback addresses (only for testing behind a reverse proxy)")
 	return cmd
 }
@@ -755,4 +767,21 @@ func isLoopbackAddr(addr string) bool {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+// Readiness covers local dependency availability without making model calls.
+func serveReadinessCheck(usage serverusage.Reader, metrics *servermetrics.Recorder) func(context.Context) error {
+	if db, ok := usage.(interface{ DBStats() sql.DBStats }); ok {
+		metrics.SetDBStats(db.DBStats)
+	}
+	if db, ok := usage.(interface{ Ping(context.Context) error }); ok {
+		return func(ctx context.Context) error {
+			err := db.Ping(ctx)
+			if err != nil {
+				metrics.ObserveError("db", "")
+			}
+			return err
+		}
+	}
+	return nil
 }

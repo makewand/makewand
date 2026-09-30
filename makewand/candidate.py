@@ -10,6 +10,8 @@ import time
 from makewand import filelock as fcntl
 import uuid
 import stat
+import tempfile
+import errno
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
@@ -28,6 +30,32 @@ from makewand.config import (
 )
 import hashlib
 from makewand.git_helper import run_git_cmd, get_git_diff, WorkspaceLock, WorkspaceLockError
+from makewand.protected_files import ProtectedFiles, ProtectionError
+
+
+def _race_protection(race):
+    # Presence is authoritative: malformed declarations cannot become legacy.
+    return ProtectedFiles.from_dict(race["protected_files"]) if "protected_files" in race else ProtectedFiles()
+
+
+class CandidateMessage(str):
+    """Add an outcome category without changing the legacy apply tuple."""
+    def __new__(cls, message, status):
+        value = str.__new__(cls, message)
+        value.status = status
+        return value
+
+
+class CandidateDeadlineExceeded(TimeoutError):
+    pass
+
+
+def _check_apply_deadline():
+    from makewand.execution_runtime import current_context
+    deadline = current_context().get("_deadline_monotonic")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise CandidateDeadlineExceeded("候选应用的总执行期限已耗尽，保留封存候选")
+    return deadline
 
 def file_sha256(path: Path) -> Optional[str]:
     """Computes SHA-256 hex digest of a regular file. Returns None for links/missing."""
@@ -51,6 +79,7 @@ def file_record(path: Path) -> Optional[Dict[str, Any]]:
 
 def build_manifest(dir_path: Path) -> Dict[str, Any]:
     """Bind regular file content AND permissions; old hash-only manifests fail closed."""
+    dir_path = Path(dir_path)
     manifest = {}
     if not dir_path.exists():
         return manifest
@@ -68,6 +97,67 @@ def build_manifest(dir_path: Path) -> Dict[str, Any]:
                 if record is not None:
                     manifest[rel] = record
     return manifest
+
+
+def remove_new_generated_bytecode(workspace: Union[str, Path], baseline_manifest: Dict[str, Any]) -> List[str]:
+    """Remove reproducible, untracked Python caches before the first seal.
+
+    Existing baseline files, tracked files and arbitrary cache contents remain
+    inputs. Never use this during approval or application of a sealed candidate.
+    """
+    import importlib.util
+    import marshal
+    root = Path(workspace).resolve()
+    code, output, error = run_git_cmd(["git", "ls-files", "--cached", "-z", "--", "."], cwd=str(root), binary=True)
+    if code != 0:
+        raise OSError(f"cannot protect tracked files before cache cleanup: {os.fsdecode(error)}")
+    protected = set(baseline_manifest) | {os.fsdecode(name) for name in output.split(b"\0") if name}
+    removed = []
+    for directory, directories, files in os.walk(root, followlinks=False):
+        directories[:] = [name for name in directories if name != ".git" and not (Path(directory) / name).is_symlink()]
+        if Path(directory).name != "__pycache__":
+            continue
+        for name in files:
+            path = Path(directory) / name
+            relative = path.relative_to(root).as_posix()
+            if relative in protected or path.is_symlink() or not path.is_file() or not name.endswith(".pyc"):
+                continue
+            try:
+                source = Path(importlib.util.source_from_cache(str(path)))
+                _verify_safe_target_path(root, source.relative_to(root).as_posix())
+                if source.is_symlink() or not source.is_file() or source.stat().st_size > 4 * 1024 * 1024:
+                    continue
+                tag = f"{source.stem}.{sys.implementation.cache_tag}"
+                optimization = next((level for level in (0, 1, 2)
+                                     if name == tag + (f".opt-{level}" if level else "") + ".pyc"), None)
+                if optimization is None or path.stat().st_size > 16 * 1024 * 1024:
+                    continue
+                data = path.read_bytes()
+                if len(data) < 16 or data[:4] != importlib.util.MAGIC_NUMBER:
+                    continue
+                source_bytes = source.read_bytes()
+                matches = False
+                for filename in {str(source), source.name, source.relative_to(root).as_posix()}:
+                    # Keep the trusted code object referenced while serializing,
+                    # matching CPython's pyc writer. Never deserialize candidate
+                    # marshal data, whose length fields are untrusted.
+                    compiled = compile(source_bytes, filename, "exec", dont_inherit=True, optimize=optimization)
+                    if marshal.dumps(compiled) == data[16:]:
+                        matches = True
+                        break
+                if not matches:
+                    continue
+                _atomic_remove(str(root), relative)
+                removed.append(relative)
+                # Remove only the now-empty generated directory; preserve any
+                # neighboring source, tracked data, links or unknown artifacts.
+                try:
+                    path.parent.rmdir()
+                except OSError:
+                    pass
+            except (OSError, ValueError, SyntaxError, EOFError, TypeError, MemoryError):
+                continue
+    return sorted(removed)
 
 
 def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None):
@@ -121,13 +211,89 @@ def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None):
         os.close(directory)
 
 def _write_private_json(path: Path, data: Dict[str, Any]) -> None:
-    """Writes JSON as a 0600 file without following a symlink at ``path``."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        if hasattr(os, "fchmod"):
-            os.fchmod(handle.fileno(), 0o600)
-        json.dump(data, handle, indent=2, ensure_ascii=False)
+    """Publish complete private metadata atomically, without following links."""
+    if path.is_symlink():
+        raise ValueError("candidate metadata must not be a symlink")
+    fd, temporary = tempfile.mkstemp(prefix=".meta-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _input_manifest(directory: Path) -> Dict[str, Any]:
+    from makewand.artifact import workspace_snapshot
+    # Lists round-trip through metadata JSON; tuples would compare unequal.
+    return {path: list(record) for path, record in workspace_snapshot(directory).items()}
+
+
+def _export_baseline(source: Path, revision: str, destination: Path) -> bool:
+    """Read fixed Git blobs, never checkout mutable HEAD or invoke filters."""
+    if not isinstance(revision, str) or len(revision) not in (40, 64) or any(character not in "0123456789abcdefABCDEF" for character in revision):
+        return False
+    code, tree, _ = run_git_cmd(["git", "--no-replace-objects", "ls-tree", "-r", "-z", revision],
+                              cwd=str(source), binary=True)
+    if code != 0:
+        return False
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for entry in tree.split(b"\0"):
+        if not entry:
+            continue
+        header, name = entry.split(b"\t", 1)
+        mode, kind, oid = header.split()
+        relative = os.fsdecode(name)
+        parts = Path(relative).parts
+        if Path(relative).is_absolute() or not parts or any(part in ("..", ".git") for part in parts):
+            raise ValueError("invalid frozen baseline path")
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
+            raise ValueError("hybrid baseline contains unsupported links or submodules")
+        code, content, error = run_git_cmd(["git", "--no-replace-objects", "cat-file", "blob", os.fsdecode(oid)],
+                                         cwd=str(source), binary=True)
+        if code != 0:
+            raise OSError(f"cannot export frozen baseline: {error}")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if mode == b"100755" else 0o644)
+    return True
+
+
+def _candidate_seal_error_unchecked(agent: Dict[str, Any], race: Dict[str, Any]) -> Optional[str]:
+    path = Path(agent.get("path") or "")
+    if not agent.get("path") or not path.is_dir() or path.is_symlink():
+        return "候选工作区不存在或为符号链接"
+    expected = agent.get("manifest")
+    if not isinstance(expected, dict) or build_manifest(path) != expected:
+        return "候选文件哈希或权限自封存后发生变化"
+    if "input_manifest" in agent and _input_manifest(path) != agent["input_manifest"]:
+        return "候选完整输入自封存后发生变化"
+    changes = agent.get("changes")
+    if not isinstance(changes, dict) or changes != get_candidate_files_changed(
+            path, agent.get("baseline_commit") or race.get("baseline_commit")):
+        return "候选 Git 变更计划自封存后发生变化"
+    for relative, status in changes.items():
+        parts = Path(relative).parts
+        if not parts or Path(relative).is_absolute() or any(part in ("..", ".git") for part in parts):
+            return "候选变更计划包含非法路径"
+        _verify_safe_target_path(path, relative)
+        if status not in ("A", "M", "D") or (status == "D") != (relative not in expected):
+            return "候选变更计划与已封存文件不一致"
+    return None
+
+
+def _candidate_seal_error(agent: Dict[str, Any], race: Dict[str, Any]) -> Optional[str]:
+    try:
+        _race_protection(race).verify(agent.get("path"))
+        return _candidate_seal_error_unchecked(agent, race)
+    except ProtectionError as exc:
+        return CandidateMessage(f"候选受保护文件校验失败: {exc}", exc.status)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f"候选完整性校验失败: {exc}"
 
 
 def _verify_safe_target_path(base_cwd: Union[str, Path], rel_path: str) -> Path:
@@ -236,6 +402,28 @@ def get_candidate_files_changed(candidate_dir: Path, baseline_commit: Optional[s
 
     return changes
 
+def _hybrid_tests_available(root: Path) -> bool:
+    if (root / "pytest.ini").is_file() or list(root.glob("test_*.py")) or list(root.glob("*_test.py")):
+        return True
+    if (root / "tests").is_dir() and any((root / "tests").rglob("*test*.py")):
+        return True
+    if (root / "go.mod").is_file() and shutil.which("go"):
+        return True
+    if (root / "Cargo.toml").is_file() and shutil.which("cargo"):
+        return True
+    if (root / "package.json").is_file() and shutil.which("npm"):
+        try:
+            return bool(json.loads((root / "package.json").read_text()).get("scripts", {}).get("test"))
+        except (OSError, ValueError):
+            return False
+    if (root / "pyproject.toml").is_file():
+        try:
+            return "[tool.pytest" in (root / "pyproject.toml").read_text()
+        except OSError:
+            pass
+    return False
+
+
 class CandidateManager:
     """Manages the lifecycle of race candidates."""
 
@@ -248,15 +436,45 @@ class CandidateManager:
         agent_a: Dict[str, Any],
         agent_b: Dict[str, Any],
         judge_report: str = "",
-        winner: Optional[str] = None
+        winner: Optional[str] = None,
+        baseline_dir: Optional[Union[str, Path]] = None,
+        baseline_manifest: Optional[Dict[str, Any]] = None,
+        frozen_baseline_manifest: Optional[Dict[str, Any]] = None,
+        protected_files: Optional[Dict[str, Any]] = None,
     ) -> Path:
+        ensure_config_dir()
+        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                return CandidateManager._save_race_locked(
+                    race_id, prompt, base_cwd, baseline_commit, agent_a, agent_b,
+                    judge_report, winner, baseline_dir, baseline_manifest, frozen_baseline_manifest, protected_files)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _save_race_locked(
+        race_id: str,
+        prompt: str,
+        base_cwd: str,
+        baseline_commit: str,
+        agent_a: Dict[str, Any],
+        agent_b: Dict[str, Any],
+        judge_report: str = "",
+        winner: Optional[str] = None,
+        baseline_dir: Optional[Union[str, Path]] = None,
+        baseline_manifest: Optional[Dict[str, Any]] = None,
+        frozen_baseline_manifest: Optional[Dict[str, Any]] = None,
+        protected_files: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        protection = ProtectedFiles.from_dict(protected_files) if protected_files is not None else None
         ensure_config_dir()
         # Candidates hold copies of workspace sources: private 0700 directories.
         ensure_private_dir(config.CANDIDATES_DIR)
         race_dir = ensure_private_dir(config.CANDIDATES_DIR / race_id)
 
         base_path = Path(base_cwd).resolve()
-        baseline_manifest = build_manifest(base_path)
+        baseline_manifest = baseline_manifest if baseline_manifest is not None else build_manifest(base_path)
 
         # Attach frozen candidate manifests and ensure test_passed is explicitly set
         if "test_passed" not in agent_a:
@@ -274,11 +492,19 @@ class CandidateManager:
             if "manifest" in agent_a and agent_a["manifest"] != current:
                 raise ValueError("candidate A changed after review")
             agent_a["manifest"] = current
+            inputs = _input_manifest(Path(agent_a["path"]))
+            if "input_manifest" in agent_a and agent_a["input_manifest"] != inputs:
+                raise ValueError("candidate A inputs changed after review")
+            agent_a["input_manifest"] = inputs
         if "path" in agent_b and os.path.exists(agent_b["path"]):
             current = build_manifest(Path(agent_b["path"]))
             if "manifest" in agent_b and agent_b["manifest"] != current:
                 raise ValueError("candidate B changed after review")
             agent_b["manifest"] = current
+            inputs = _input_manifest(Path(agent_b["path"]))
+            if "input_manifest" in agent_b and agent_b["input_manifest"] != inputs:
+                raise ValueError("candidate B inputs changed after review")
+            agent_b["input_manifest"] = inputs
 
         # Freeze the complete application plan, including deletions, outside the
         # candidate's writable Git metadata. A caller that performed a review
@@ -291,12 +517,59 @@ class CandidateManager:
                     raise ValueError(f"candidate {label} application plan changed after review")
                 agent["changes"] = changes
 
+        # A hybrid must use the version that produced A/B, including the dirty
+        # workspace snapshot captured before generation. Never reconstruct it
+        # from the user's current working directory at merge time.
+        frozen_baseline = None
+        baseline_error = None
+        try:
+            if baseline_dir is not None:
+                source = Path(baseline_dir)
+                if source.is_symlink() or not source.is_dir():
+                    raise ValueError("frozen baseline must be a real directory")
+                frozen_baseline = source
+                if frozen_baseline_manifest is not None and build_manifest(source) != frozen_baseline_manifest:
+                    raise ValueError("frozen baseline changed during generation")
+            else:
+                exported = []
+                for agent in (agent_a, agent_b):
+                    revision = agent.get("baseline_commit")
+                    if not revision or not agent.get("path"):
+                        continue
+                    target = race_dir / ("baseline-" + uuid.uuid4().hex)
+                    if _export_baseline(Path(agent["path"]), revision, target):
+                        exported.append(target)
+                    else:
+                        shutil.rmtree(target, ignore_errors=True)
+                if exported:
+                    frozen_baseline = exported[0]
+                    try:
+                        if any(build_manifest(path) != build_manifest(frozen_baseline) for path in exported[1:]):
+                            raise ValueError("candidate A/B baselines differ")
+                    finally:
+                        for path in exported[1:]:
+                            shutil.rmtree(path, ignore_errors=True)
+            if protection is not None and frozen_baseline is not None:
+                if baseline_dir is None:
+                    protection.prepare_workspace(frozen_baseline)
+                else:
+                    protection.verify(frozen_baseline)
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, ProtectionError) and exc.status == "TIMEOUT":
+                raise
+            frozen_baseline = None
+            baseline_error = str(exc)
+
         meta = {
             "race_id": race_id,
             "prompt": prompt,
             "base_cwd": str(base_path),
             "baseline_commit": baseline_commit,
             "baseline_manifest": baseline_manifest,
+            "baseline_dir": str(frozen_baseline) if frozen_baseline is not None else None,
+            "frozen_baseline_manifest": build_manifest(frozen_baseline) if frozen_baseline is not None else None,
+            "frozen_baseline_inputs": _input_manifest(frozen_baseline) if frozen_baseline is not None else None,
+            "baseline_error": baseline_error,
             "created_at": datetime.now().isoformat(),
             "status": "completed",
             "winner": winner,
@@ -306,6 +579,8 @@ class CandidateManager:
                 "B": agent_b,
             }
         }
+        if protection is not None:
+            meta["protected_files"] = protection.to_dict()
 
         meta_file = race_dir / "meta.json"
         _write_private_json(meta_file, meta)
@@ -313,7 +588,7 @@ class CandidateManager:
         # LRU eviction: keep only the latest candidates; unapplied ones are
         # evicted last and every such eviction is reported.
         try:
-            CandidateManager.prune_old_candidates(max_candidates=CandidateManager.DEFAULT_MAX_CANDIDATES)
+            CandidateManager._prune_old_candidates_locked(max_candidates=CandidateManager.DEFAULT_MAX_CANDIDATES)
         except Exception as exc:
             print(c(f"⚠ [Makewand Candidates] 候选清理失败: {exc}", COLOR_YELLOW), file=sys.stderr)
 
@@ -323,6 +598,16 @@ class CandidateManager:
 
     @staticmethod
     def prune_old_candidates(max_candidates: int = DEFAULT_MAX_CANDIDATES) -> int:
+        ensure_config_dir()
+        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                return CandidateManager._prune_old_candidates_locked(max_candidates)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _prune_old_candidates_locked(max_candidates: int = DEFAULT_MAX_CANDIDATES) -> int:
         """
         LRU eviction to keep only the latest candidates and clean up older
         candidate directories to prevent disk exhaustion. Candidates that were
@@ -464,97 +749,181 @@ class CandidateManager:
         return conflicts
 
     @staticmethod
-    def create_hybrid_candidate(race_id: Optional[str] = None) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-        """
-        Synthesizes a 3-way semantic merged Candidate M from Candidates A and B in race_id.
-        Verifies unit tests before registering Candidate M into meta.json.
-        Returns (success, candidate_m_dict, message).
-        """
+    def create_hybrid_candidate(race_id: Optional[str] = None, test_timeout: Optional[float] = None) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        """Serialize synthesis and application, preserving existing sealed M."""
+        if os.name != "posix":
+            return False, None, "安全混合候选需要 POSIX 目录句柄；Windows 请在 WSL2 中运行"
+        deadline = None
+        if test_timeout is not None:
+            if isinstance(test_timeout, bool) or not isinstance(test_timeout, (int, float)) or not 0 < test_timeout < float("inf"):
+                return False, None, "混合候选测试预算已耗尽或无效"
+            deadline = time.monotonic() + test_timeout
+        ensure_config_dir()
+        try:
+            with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    return CandidateManager._create_hybrid_candidate_locked(race_id, deadline=deadline)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        except (OSError, ValueError) as exc:
+            return False, None, f"无法合成候选 M: {exc}"
+
+    @staticmethod
+    def _create_hybrid_candidate_locked(race_id: Optional[str] = None, deadline: Optional[float] = None) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False, None, "混合候选测试预算已耗尽"
         race = CandidateManager.get_race(race_id)
         if not race:
             return False, None, "未找到指定的竞速记录"
-
         r_id = race.get("race_id", "")
-        base_cwd = race.get("base_cwd", "")
-        if not os.path.exists(base_cwd):
-            return False, None, f"原始工作区不存在: {base_cwd}"
-
-        cand_a = race.get("candidates", {}).get("A", {})
-        cand_b = race.get("candidates", {}).get("B", {})
-
-        path_a_str = cand_a.get("path")
-        path_b_str = cand_b.get("path")
-        if not path_a_str or not os.path.exists(path_a_str):
-            return False, None, "候选 A 工作区不存在"
-        if not path_b_str or not os.path.exists(path_b_str):
-            return False, None, "候选 B 工作区不存在"
-
-        race_dir = config.CANDIDATES_DIR / r_id
-        cand_m_dir = race_dir / "candidate_M"
-        if cand_m_dir.exists():
-            shutil.rmtree(cand_m_dir)
-        cand_m_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-        from makewand.merger import semantic_merge_candidate_worktrees
-        baseline_commit = race.get("baseline_commit")
-
-        # Safely copy baseline into candidate_M using clone_isolated_worktree (never copies .env/secrets)
-        from makewand.git_helper import clone_isolated_worktree
+        if not r_id or Path(r_id).name != r_id or r_id in (".", ".."):
+            return False, None, "无效竞速记录路径"
+        candidates = race.get("candidates", {})
         try:
-            clone_isolated_worktree(base_cwd, cand_m_dir)
-        except Exception:
-            for root, dirs, files in os.walk(base_cwd):
-                if Path(root) == Path(base_cwd):
-                    dirs[:] = [d for d in dirs if d != ".git"]
-                for f in files:
-                    if f.startswith(".env") or f.endswith(".key"):
-                        continue
-                    src = Path(root) / f
-                    if not os.path.islink(src):
-                        rel = src.relative_to(base_cwd)
-                        dst = cand_m_dir / rel
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, dst)
+            protection = _race_protection(race)
+            protection.verify(race.get("base_cwd"))
+        except ProtectionError as exc:
+            return False, None, CandidateMessage(f"受保护文件校验失败: {exc}", exc.status)
+        if "M" in candidates:
+            error = _candidate_seal_error(candidates["M"], race)
+            if error:
+                detail = f"已封存候选 M 完整性校验失败: {error}"
+                return False, None, CandidateMessage(detail, error.status) if isinstance(error, CandidateMessage) else detail
+            return True, candidates["M"], "候选 M 已封存；保留原有验证与复审状态"
+        base_path = Path(race.get("baseline_dir") or "")
+        expected_base = race.get("frozen_baseline_manifest")
+        expected_inputs = race.get("frozen_baseline_inputs")
+        if not race.get("baseline_dir") or not isinstance(expected_base, dict) or expected_inputs is None:
+            return False, None, "缺少竞速开始时的冻结基线，请重新生成候选后再合并"
+        cand_m_dir = None
+        registered = False
+        try:
+            protection.verify(base_path)
+            if base_path.is_symlink() or not base_path.is_dir() or build_manifest(base_path) != expected_base or _input_manifest(base_path) != expected_inputs:
+                return False, None, "冻结基线内容或权限发生变化，拒绝合并"
+            if any(record[0] != "file" for record in expected_inputs.values()):
+                return False, None, "混合基线包含不支持的链接或特殊文件"
+            for label in ("A", "B"):
+                error = _candidate_seal_error(candidates.get(label, {}), race)
+                if error:
+                    detail = f"候选 {label} 完整性校验失败: {error}"
+                    return False, None, CandidateMessage(detail, error.status) if isinstance(error, CandidateMessage) else detail
+            cand_a, cand_b = candidates["A"], candidates["B"]
+            from makewand.merger import semantic_merge_candidate_worktrees
+            from makewand.git_helper import clone_isolated_worktree
+            from makewand.orchestrator import run_local_tests, compute_patch_parsimony
+            race_dir = config.CANDIDATES_DIR / r_id
+            cand_m_dir = race_dir / ("candidate_M_" + uuid.uuid4().hex)
+            # A failed safe clone is an error. Never fall back to an unrestricted
+            # directory walk that could copy ignored credentials or data.
+            clone_isolated_worktree(str(base_path), cand_m_dir)
+            protection.prepare_workspace(cand_m_dir)
+            if build_manifest(cand_m_dir) != expected_base:
+                return False, None, "安全克隆未保留完整冻结基线，拒绝合并"
+            code, baseline_commit, detail = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(cand_m_dir))
+            if code != 0 or not baseline_commit.strip():
+                return False, None, f"无法建立混合候选 Git 基线: {detail}"
+            baseline_commit = baseline_commit.strip()
+            ok, merged_changes, _, summary = semantic_merge_candidate_worktrees(
+                str(base_path), Path(cand_a["path"]), Path(cand_b["path"]), cand_m_dir,
+                changes_a=cand_a["changes"], changes_b=cand_b["changes"],
+                manifest_a=cand_a["manifest"], manifest_b=cand_b["manifest"],
+                baseline_manifest=expected_base)
+            if not ok:
+                return False, None, f"语义合并未通过: {summary}"
+            protection.verify(cand_m_dir)
+            if get_candidate_files_changed(cand_m_dir, baseline_commit) != merged_changes:
+                return False, None, "混合候选变更计划与实际 Git 差异不一致"
+            diff = get_git_diff(str(cand_m_dir), base_rev=baseline_commit)
+            sealed_manifest = build_manifest(cand_m_dir)
+            sealed_inputs = _input_manifest(cand_m_dir)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, None, "混合候选测试预算已耗尽，不启动测试"
+                test_result = run_local_tests(cwd=str(cand_m_dir), timeout=remaining)
+                if time.monotonic() >= deadline:
+                    return False, None, "混合候选测试超过剩余预算，拒绝保存"
+            else:
+                test_result = run_local_tests(cwd=str(cand_m_dir))
+            protection.verify(cand_m_dir)
+            # A tuple is always truthy, including (False, error). Neither a
+            # missing suite nor a malformed result is a passing attestation.
+            if isinstance(test_result, tuple) and len(test_result) == 2 and isinstance(test_result[0], bool):
+                test_ok, test_detail = test_result
+            else:
+                test_ok, test_detail = False, "无效的本地测试结果协议"
+            tests_available = _hybrid_tests_available(base_path)
+            tests_passed = test_ok if tests_available else None
+            if (build_manifest(cand_m_dir) != sealed_manifest or _input_manifest(cand_m_dir) != sealed_inputs
+                    or get_candidate_files_changed(cand_m_dir, baseline_commit) != merged_changes):
+                return False, None, "合并测试改变了已封存内容、权限或变更计划，拒绝保存候选 M"
+            if build_manifest(base_path) != expected_base or _input_manifest(base_path) != expected_inputs:
+                return False, None, "合并期间冻结基线发生变化"
+            for label in ("A", "B"):
+                error = _candidate_seal_error(candidates[label], race)
+                if error:
+                    detail = f"合并期间候选 {label} 完整性失效: {error}"
+                    return False, None, CandidateMessage(detail, error.status) if isinstance(error, CandidateMessage) else detail
+            cand_m = {
+                "label": "M", "model": f"{cand_a.get('model', 'A')}+{cand_b.get('model', 'B')}-hybrid",
+                "path": str(cand_m_dir), "success": True,
+                "test_passed": tests_passed, "test_details": test_detail,
+                "review_passed": None, "diff": diff, "changes": merged_changes,
+                "manifest": sealed_manifest, "input_manifest": sealed_inputs,
+                "baseline_commit": baseline_commit,
+                "parsimony": compute_patch_parsimony(diff), "merged_from": ["A", "B"],
+                "created_at": datetime.now().isoformat(),
+            }
+            candidates["M"] = cand_m
+            protection.verify(cand_m_dir)
+            protection.verify(race.get("base_cwd"))
+            _write_private_json(race_dir / "meta.json", race)
+            registered = True
+            state = "通过" if tests_passed is True else "未通过" if tests_passed is False else "无可执行测试"
+            return True, cand_m, f"成功合成 Candidate M (Hybrid): 测试验证={state}，待独立复审"
+        except ProtectionError as exc:
+            return False, None, CandidateMessage(f"混合候选受保护文件校验失败: {exc}", exc.status)
+        except (OSError, ValueError, KeyError) as exc:
+            return False, None, f"混合候选完整性校验失败: {exc}"
+        finally:
+            if cand_m_dir is not None and not registered:
+                shutil.rmtree(cand_m_dir, ignore_errors=True)
 
-        ok, merged_changes, conflicts, summary = semantic_merge_candidate_worktrees(
-            base_cwd=base_cwd,
-            cand_a_dir=Path(path_a_str),
-            cand_b_dir=Path(path_b_str),
-            output_dir=cand_m_dir,
-            baseline_commit=baseline_commit
-        )
-        if not ok:
-            return False, None, f"语义合并未通过: {summary}"
-
-        # Initialize temporary git repo in cand_m_dir to compute git diff
-        run_git_cmd(["git", "init"], cwd=str(cand_m_dir))
-        diff = get_git_diff(str(cand_m_dir))
-
-        # Check unit tests on merged candidate
-        from makewand.orchestrator import run_local_tests, compute_patch_parsimony
-        tests_passed = run_local_tests(cwd=str(cand_m_dir))
-
-        cand_m_meta = {
-            "label": "M",
-            "model": f"{cand_a.get('model', 'A')}+{cand_b.get('model', 'B')}-hybrid",
-            "path": str(cand_m_dir),
-            "success": True,
-            "test_passed": tests_passed,
-            "review_passed": True if tests_passed else None,
-            "diff": diff,
-            "changes": merged_changes,
-            "manifest": build_manifest(cand_m_dir),
-            "parsimony": compute_patch_parsimony(diff),
-            "merged_from": ["A", "B"],
-            "created_at": datetime.now().isoformat(),
-        }
-
-        # Update meta.json
-        race["candidates"]["M"] = cand_m_meta
-        meta_file = race_dir / "meta.json"
-        _write_private_json(meta_file, race)
-
-        return True, cand_m_meta, f"成功合成 Candidate M (Hybrid): 测试验证={'通过' if tests_passed else '未通过'}, 融合 {len(merged_changes)} 个文件"
+    @staticmethod
+    def approve_hybrid_candidate(race_id: str, expected_manifest: Dict[str, Any],
+                                 expected_changes: Dict[str, str], review_report: str = "") -> Tuple[bool, str]:
+        """Bind an independently approved review to the exact sealed hybrid."""
+        from makewand.review_contract import evaluate_review_verdict, REVIEW_PASSED
+        if not isinstance(review_report, str) or evaluate_review_verdict(review_report)["status"] != REVIEW_PASSED:
+            return False, "候选 M 复审缺少有效、明确通过的 MAKEWAND_VERDICT 裁决"
+        ensure_config_dir()
+        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                race = CandidateManager.get_race(race_id)
+                hybrid = race.get("candidates", {}).get("M") if race else None
+                if (not hybrid or hybrid.get("manifest") != expected_manifest
+                        or hybrid.get("changes") != expected_changes):
+                    return False, "复审对象与已封存候选 M 不一致"
+                try:
+                    protection = _race_protection(race)
+                    protection.verify(hybrid.get("path"))
+                    protection.verify(race.get("base_cwd"))
+                except ProtectionError as exc:
+                    return False, CandidateMessage(f"候选 M 受保护文件校验失败: {exc}", exc.status)
+                error = _candidate_seal_error(hybrid, race)
+                if error:
+                    return False, error
+                if hybrid.get("test_passed") is not True:
+                    return False, "候选 M 未完成测试验证，不能授予自动复审批准"
+                hybrid["review_passed"] = True
+                hybrid["review_report"] = review_report
+                _write_private_json(config.CANDIDATES_DIR / race["race_id"] / "meta.json", race)
+                return True, "候选 M 独立复审已绑定封存产物"
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     @staticmethod
     def apply_candidate(
@@ -562,7 +931,8 @@ class CandidateManager:
         candidate_label: Optional[str] = None,
         dry_run: bool = False,
         force: bool = False,
-        merge: bool = False
+        merge: bool = False,
+        protected_paths=None,
     ) -> Tuple[bool, List[str], str]:
         """
         Safely applies candidate changes to base_cwd with conflict detection and rollback journal.
@@ -575,9 +945,23 @@ class CandidateManager:
         lock_file = config.CONFIG_DIR / "apply.lock"
         lock_fd = None
         try:
+            deadline = _check_apply_deadline()
             lock_fd = open(lock_file, "a")
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                if deadline is None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                else:
+                    while True:
+                        _check_apply_deadline()
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except OSError as error:
+                            if error.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                                raise
+                            time.sleep(min(.01, max(0, deadline - time.monotonic())))
+            except CandidateDeadlineExceeded:
+                raise
             except Exception as e:
                 return False, [], f"无法获取候选应用独占锁 (apply.lock): {e}"
             # Writing into the workspace must not race a makewand task running there.
@@ -597,11 +981,14 @@ class CandidateManager:
                     candidate_label=candidate_label,
                     dry_run=dry_run,
                     force=force,
-                    merge=merge
+                    merge=merge,
+                    protected_paths=protected_paths,
                 )
             finally:
                 if workspace_lock is not None:
                     workspace_lock.release()
+        except CandidateDeadlineExceeded as e:
+            return False, [], CandidateMessage(str(e), "TIMEOUT")
         except Exception as e:
             return False, [], f"打开候选应用锁失败: {e}"
         finally:
@@ -618,8 +1005,13 @@ class CandidateManager:
         candidate_label: Optional[str] = None,
         dry_run: bool = False,
         force: bool = False,
-        merge: bool = False
+        merge: bool = False,
+        protected_paths=None,
     ) -> Tuple[bool, List[str], str]:
+        try:
+            _check_apply_deadline()
+        except CandidateDeadlineExceeded as error:
+            return False, [], CandidateMessage(str(error), "TIMEOUT")
         race = CandidateManager.get_race(race_id)
         if not race:
             return False, [], "未找到指定的候选竞速记录"
@@ -628,6 +1020,12 @@ class CandidateManager:
         base_cwd = race.get("base_cwd", "")
         if not os.path.exists(base_cwd):
             return False, [], f"原始工作区不存在: {base_cwd}"
+        try:
+            protection = _race_protection(race)
+            protection.verify(base_cwd)
+            additional = ProtectedFiles.capture(base_cwd, protected_paths)
+        except ProtectionError as exc:
+            return False, [], CandidateMessage(f"受保护文件校验失败: {exc}", exc.status)
 
         # Choose candidate (require explicit candidate if no winner)
         if merge:
@@ -645,9 +1043,13 @@ class CandidateManager:
 
         # If candidate M is requested but doesn't exist yet, synthesize it now
         if label == "M" and "M" not in race.get("candidates", {}):
-            ok_m, cand_m_meta, msg_m = CandidateManager.create_hybrid_candidate(race_id=r_id)
+            if dry_run:
+                return False, [], "候选 M 尚未合成；dry-run 不执行测试或创建候选，请先显式合成"
+            # The public apply path already holds apply.lock.
+            ok_m, cand_m_meta, msg_m = CandidateManager._create_hybrid_candidate_locked(race_id=r_id)
             if not ok_m:
-                return False, [], f"无法合成候选 M (Hybrid): {msg_m}"
+                detail = f"无法合成候选 M (Hybrid): {msg_m}"
+                return False, [], CandidateMessage(detail, msg_m.status) if isinstance(msg_m, CandidateMessage) else detail
             race = CandidateManager.get_race(r_id)
 
         cand_info = race.get("candidates", {}).get(label, {})
@@ -664,8 +1066,16 @@ class CandidateManager:
 
         if cand_info.get("review_passed") is False and not force:
             return False, [], f"候选选手 {label} 未获裁判批准，已阻止应用 (人工确认后可使用 --force)"
+        if label == "M" and cand_info.get("review_passed") is not True and not force:
+            return False, [], "候选 M 尚未获独立复审批准；测试通过不能代替复审 (人工确认后可使用 --force)"
 
         candidate_dir = Path(cand_path_str)
+        try:
+            protection.verify(candidate_dir)
+            additional.verify(candidate_dir)
+            additional.verify(base_cwd)
+        except ProtectionError as exc:
+            return False, [], CandidateMessage(f"受保护文件校验失败: {exc}", exc.status)
 
         # Integrity check: verify candidate files haven't been mutated after save
         expected_manifest = cand_info.get("manifest")
@@ -674,6 +1084,8 @@ class CandidateManager:
         current_manifest = build_manifest(candidate_dir)
         if current_manifest != expected_manifest:
             return False, [], f"候选选手 {label} 的文件自封存后已被外部修改 (哈希校验不匹配)，拒绝应用未审查内容"
+        if "input_manifest" in cand_info and _input_manifest(candidate_dir) != cand_info["input_manifest"]:
+            return False, [], f"候选选手 {label} 完整输入自封存后发生变化，拒绝应用未审查内容"
 
         cand_baseline = cand_info.get("baseline_commit") or race.get("baseline_commit")
         changes = cand_info.get("changes")
@@ -731,6 +1143,13 @@ class CandidateManager:
                 msg = f"检测到工作区冲突: 以下文件在基线后已被修改，已阻止覆盖: {', '.join(conflicts)}"
                 return False, conflicts, msg
 
+        try:
+            for guard in (protection, additional):
+                guard.verify(candidate_dir)
+                guard.verify(base_cwd)
+        except ProtectionError as exc:
+            return False, [], CandidateMessage(f"受保护文件校验失败: {exc}", exc.status)
+
         if dry_run:
             preview = [f"{status} {path}" for path, status in changes.items()]
             return True, preview, f"[Dry-run] 演练完成，共涉及 {len(changes)} 个文件的增删改"
@@ -747,6 +1166,10 @@ class CandidateManager:
 
         try:
             for rel_path, status in changes.items():
+                _check_apply_deadline()
+                for guard in (protection, additional):
+                    guard.verify(candidate_dir)
+                    guard.verify(base_cwd)
                 target_file = _verify_safe_target_path(base_cwd, rel_path)
                 src_file = candidate_dir / rel_path
 
@@ -777,9 +1200,15 @@ class CandidateManager:
                         _atomic_remove(base_cwd, rel_path)
                         applied_files.append(f"D   {rel_path}")
 
+                _check_apply_deadline()
+
             with open(backup_dir / "journal.json", "w", encoding="utf-8") as jf:
                 json.dump(journal, jf, indent=2)
 
+            _check_apply_deadline()
+            for guard in (protection, additional):
+                guard.verify(candidate_dir)
+                guard.verify(base_cwd)
             CandidateManager._mark_applied(r_id, label)
             return True, applied_files, f"成功应用候选方案 {label} ({len(applied_files)} 个变更已同步)"
 
@@ -799,9 +1228,11 @@ class CandidateManager:
                     rollback_errors.append(f"{rel_p}: {rollback_error}")
 
             if rollback_errors:
-                return False, [], (f"应用失败: {e}；部分文件回滚失败: {'; '.join(rollback_errors)}。"
-                                   f"备份保留于 {backup_dir}")
-            return False, [], f"应用过程中发生异常并已自动回滚: {str(e)}"
+                detail = (f"应用失败: {e}；部分文件回滚失败: {'; '.join(rollback_errors)}。"
+                          f"备份保留于 {backup_dir}")
+                return False, [], CandidateMessage(detail, e.status) if isinstance(e, ProtectionError) else CandidateMessage(detail, "TIMEOUT") if isinstance(e, CandidateDeadlineExceeded) else detail
+            detail = f"应用过程中发生异常并已自动回滚: {str(e)}"
+            return False, [], CandidateMessage(detail, e.status) if isinstance(e, ProtectionError) else CandidateMessage(detail, "TIMEOUT") if isinstance(e, CandidateDeadlineExceeded) else detail
 
     @staticmethod
     def _mark_applied(race_id: str, label: str) -> None:
@@ -818,6 +1249,16 @@ class CandidateManager:
 
     @staticmethod
     def discard_race(race_id: Optional[str] = None, all_races: bool = False) -> Tuple[bool, str]:
+        ensure_config_dir()
+        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                return CandidateManager._discard_race_locked(race_id, all_races)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _discard_race_locked(race_id: Optional[str] = None, all_races: bool = False) -> Tuple[bool, str]:
         ensure_config_dir()
         if all_races:
             if config.CANDIDATES_DIR.exists():

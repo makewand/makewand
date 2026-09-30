@@ -141,6 +141,9 @@ type Usage struct {
 	Cost         float64
 	Model        string
 	Provider     string
+	// Measured flags distinguish authoritative transport usage from heuristic estimates.
+	MeasuredTokens bool
+	MeasuredCost   bool
 }
 
 // RouteResult describes which provider was selected and whether a fallback occurred.
@@ -200,6 +203,9 @@ type ProviderEntry struct {
 // RouterConfig provides configuration for creating a Router without depending
 // on the config package. Library consumers use this directly.
 type RouterConfig struct {
+	// ExecutionAPIPolicy records the caller's spend-policy snapshot; this metadata
+	// does not change the library's existing provider configuration semantics.
+	ExecutionAPIPolicy string
 	// Providers maps provider names to pre-constructed provider instances.
 	Providers map[string]ProviderEntry
 
@@ -249,7 +255,8 @@ type Router struct {
 		reviewModel   string
 	}
 
-	providers map[string]Provider
+	providers          map[string]Provider
+	executionAPIPolicy string
 
 	// providerAllowlist restricts routing to a subset of providers for
 	// request-scoped views such as remote token policies.
@@ -442,14 +449,15 @@ func NewRouterFromConfig(rc RouterConfig) (*Router, error) {
 	}
 
 	r := &Router{
-		providers:     make(map[string]Provider),
-		providerCache: make(map[providerKey]Provider),
-		factories:     make(map[string]ProviderFactory),
-		accessTypes:   make(map[string]AccessType),
-		usage:         newSessionUsage(),
-		breaker:       newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
-		quota:         rc.Quota,
-		quotaPolicy:   rc.QuotaPolicy,
+		executionAPIPolicy: rc.ExecutionAPIPolicy,
+		providers:          make(map[string]Provider),
+		providerCache:      make(map[providerKey]Provider),
+		factories:          make(map[string]ProviderFactory),
+		accessTypes:        make(map[string]AccessType),
+		usage:              newSessionUsage(),
+		breaker:            newProviderCircuitBreaker(defaultCircuitFailureThreshold, defaultCircuitCooldown),
+		quota:              rc.Quota,
+		quotaPolicy:        rc.QuotaPolicy,
 	}
 	r.tables.Store(copyDefaultTables())
 	r.repoTrust.Store(int32(rc.RepoTrust))
@@ -674,22 +682,23 @@ func (r *Router) cloneView() *Router {
 	}
 
 	clone := &Router{
-		cacheRoot:         root,
-		legacyModels:      legacy,
-		providers:         providers,
-		providerAllowlist: cloneStringSet(r.providerAllowlist),
-		providerCache:     providerCache,
-		factories:         factories,
-		accessTypes:       accessTypes,
-		usage:             r.usage,
-		breaker:           r.breaker,
-		quota:             r.quota,
-		quotaPolicy:       r.quotaPolicy,
-		mode:              mode,
-		modeSet:           modeSet,
-		cachedAvail:       cachedAvail,
-		cachedAvailAt:     cachedAvailAt,
-		traceSink:         traceSink,
+		cacheRoot:          root,
+		legacyModels:       legacy,
+		providers:          providers,
+		providerAllowlist:  cloneStringSet(r.providerAllowlist),
+		providerCache:      providerCache,
+		factories:          factories,
+		accessTypes:        accessTypes,
+		usage:              r.usage,
+		breaker:            r.breaker,
+		quota:              r.quota,
+		quotaPolicy:        r.quotaPolicy,
+		executionAPIPolicy: r.executionAPIPolicy,
+		mode:               mode,
+		modeSet:            modeSet,
+		cachedAvail:        cachedAvail,
+		cachedAvailAt:      cachedAvailAt,
+		traceSink:          traceSink,
 	}
 	// Per-request views share the parent's live tables snapshot so hot-reloads
 	// are visible through clones too.

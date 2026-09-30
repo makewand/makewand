@@ -1,10 +1,16 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/makewand/makewand/execution"
 
 	"github.com/makewand/makewand/internal/model"
 )
@@ -161,7 +167,41 @@ func TestRunCandidateSelection_DeliversExactVerifiedPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	selection := RunCandidateSelection(context.Background(), r, p, model.PhaseCode, []model.Message{{Role: "user", Content: "implement addition"}}, "", nil)
+	eventsPath := filepath.Join(t.TempDir(), "events.jsonl")
+	ctx := execution.ContextWithConfig(context.Background(), execution.Config{TaskID: "verified-candidate-task", EventsPath: eventsPath, LedgerPath: filepath.Join(t.TempDir(), "calls.json"), MaxCalls: 1})
+	selection := RunCandidateSelection(ctx, r, p, model.PhaseCode, []model.Message{{Role: "user", Content: "implement addition"}}, "", nil)
+	if selection.TaskID != "verified-candidate-task" || selection.Status != execution.Unverified || len(selection.Attempts) != 1 || selection.Attempts[0].Status != execution.Passed {
+		t.Fatalf("candidate state lost or acceptance raised: %+v", selection)
+	}
+	data, eventErr := os.ReadFile(eventsPath)
+	if eventErr != nil {
+		t.Fatal(eventErr)
+	}
+	stages, spans := make(map[string]bool), make(map[string]int)
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var event execution.Event
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatal(err)
+		}
+		if err := event.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if event.TaskID != selection.TaskID {
+			t.Fatalf("stage task identity changed: %+v", event)
+		}
+		stages[event.Stage] = true
+		spans[event.EventID]++
+	}
+	for _, stage := range []string{"copy", "generation", "provider", "verification", "selection"} {
+		if !stages[stage] {
+			t.Errorf("missing %s stage", stage)
+		}
+	}
+	for id, count := range spans {
+		if count != 2 {
+			t.Errorf("unpaired start/end span %s: %d records", id, count)
+		}
+	}
 	if selection.Verified {
 		t.Fatalf("candidate-controlled evidence must require approval, got %+v", selection)
 	}

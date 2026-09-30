@@ -3,10 +3,13 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/makewand/makewand/execution"
 )
 
 // EnsembleResult holds one provider's response in a parallel ensemble run.
@@ -22,9 +25,21 @@ type EnsembleResult struct {
 // Returns all successful attempts, including empty-content responses, so the
 // caller can account for every consumed request before selecting usable output.
 func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) []EnsembleResult {
+	results, _ := r.EnsembleWithError(ctx, phase, messages, system, exclude...)
+	return results
+}
+
+// EnsembleWithError preserves terminal admission and unknown-outcome errors
+// instead of allowing ChatBest to replay failed generators through fallback.
+func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) ([]EnsembleResult, error) {
+	var err error
+	ctx, err = r.executionContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	pe, ok := r.routingTables().powerEnsembleFor(phase)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	excluded := make(map[string]bool, len(exclude))
@@ -77,7 +92,7 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 			Phase:  buildPhaseName(phase),
 			Detail: "no available generator provider",
 		})
-		return nil
+		return nil, nil
 	}
 	r.emitTrace(TraceEvent{
 		Event:  "ensemble_start",
@@ -87,6 +102,8 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 
 	maxTokens := maxTokensForPhase(phase)
 	results := make([]EnsembleResult, len(slots))
+	var terminalMu sync.Mutex
+	var terminalErr error
 	var wg sync.WaitGroup
 	for i, s := range slots {
 		wg.Add(1)
@@ -119,6 +136,13 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 				provider: sl.p,
 			})
 			if res.err != nil || res.skipped {
+				if stopExecutionReplay(res.err) {
+					terminalMu.Lock()
+					if terminalErr == nil || errors.Is(res.err, execution.ErrUnknownOutcome) {
+						terminalErr = res.err
+					}
+					terminalMu.Unlock()
+				}
 				return
 			}
 			results[idx] = EnsembleResult{sl.name, res.route.ModelID, res.content, res.usage}
@@ -142,7 +166,7 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 		Phase:  buildPhaseName(phase),
 		Detail: fmt.Sprintf("success=%d/%d usable=%d", len(out), len(slots), usable),
 	})
-	return out
+	return out, terminalErr
 }
 
 // judgeSelect asks the designated judge provider to pick the best result from an ensemble.
@@ -158,8 +182,13 @@ func (r *Router) judgeSelect(ctx context.Context, phase BuildPhase, results []En
 // judge prompt: without them a judge can only compare prose quality and may
 // confidently select an answer that does not satisfy the user's task.
 func (r *Router) judgeSelectForRequest(ctx context.Context, phase BuildPhase, original []Message, originalSystem string, results []EnsembleResult) EnsembleResult {
+	result, _ := r.judgeSelectForRequestWithError(ctx, phase, original, originalSystem, results)
+	return result
+}
+
+func (r *Router) judgeSelectForRequestWithError(ctx context.Context, phase BuildPhase, original []Message, originalSystem string, results []EnsembleResult) (EnsembleResult, error) {
 	if len(results) == 0 {
-		return EnsembleResult{}
+		return EnsembleResult{}, nil
 	}
 	if len(results) == 1 {
 		// A single surviving result was not compared, so it is not a quality
@@ -169,7 +198,7 @@ func (r *Router) judgeSelectForRequest(ctx context.Context, phase BuildPhase, or
 			Phase:    buildPhaseName(phase),
 			Selected: results[0].Provider,
 		})
-		return selectedWithoutJudgeUsage(results[0])
+		return selectedWithoutJudgeUsage(results[0]), nil
 	}
 
 	pe, ok := r.routingTables().powerEnsembleFor(phase)
@@ -179,7 +208,7 @@ func (r *Router) judgeSelectForRequest(ctx context.Context, phase BuildPhase, or
 			Phase:  buildPhaseName(phase),
 			Detail: "power ensemble config missing",
 		})
-		return selectedWithoutJudgeUsage(results[0])
+		return selectedWithoutJudgeUsage(results[0]), nil
 	}
 
 	// The capability check runs BEFORE IsAvailable (short-circuit order) so an
@@ -202,7 +231,7 @@ func (r *Router) judgeSelectForRequest(ctx context.Context, phase BuildPhase, or
 			Selected: pe.Judge,
 			Error:    reason,
 		})
-		return selectedWithoutJudgeUsage(results[0])
+		return selectedWithoutJudgeUsage(results[0]), nil
 	}
 	judgeMessages := []Message{{Role: "user", Content: buildJudgePrompt(original, originalSystem, results)}}
 	ac := &attemptContext{
@@ -227,7 +256,10 @@ func (r *Router) judgeSelectForRequest(ctx context.Context, phase BuildPhase, or
 		provider: judgeP,
 	})
 	if judgeResult.err != nil || judgeResult.skipped {
-		return selectedWithoutJudgeUsage(results[0])
+		if stopExecutionReplay(judgeResult.err) {
+			return selectedWithoutJudgeUsage(results[0]), judgeResult.err
+		}
+		return selectedWithoutJudgeUsage(results[0]), nil
 	}
 	content := judgeResult.content
 	usage := judgeResult.usage
@@ -246,7 +278,7 @@ func (r *Router) judgeSelectForRequest(ctx context.Context, phase BuildPhase, or
 		})
 		winner := selectedWithoutJudgeUsage(results[0])
 		winner.Usage = usage
-		return winner
+		return winner, nil
 	}
 	winner := results[winnerIndex]
 	r.emitTrace(TraceEvent{
@@ -269,7 +301,7 @@ func (r *Router) judgeSelectForRequest(ctx context.Context, phase BuildPhase, or
 		ModelID:  winner.ModelID,  // winning generator's model (for display)
 		Content:  winner.Content,  // original generator output, not judge's reproduction
 		Usage:    usage,           // judge's usage (for cost tracking)
-	}
+	}, nil
 }
 
 func selectedWithoutJudgeUsage(result EnsembleResult) EnsembleResult {
@@ -374,6 +406,11 @@ func judgeSystemFor(phase BuildPhase) string {
 //   - Other modes: uses Thompson Sampling to adaptively select the primary provider
 //     from the buildStrategyTable candidates, then delegates to ChatWith.
 func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) (string, Usage, RouteResult, error) {
+	var contextErr error
+	ctx, contextErr = r.executionContext(ctx)
+	if contextErr != nil {
+		return "", Usage{}, RouteResult{}, contextErr
+	}
 	if r.effectiveMode() != ModePower {
 		return r.ChatWith(ctx, r.BuildProviderForAdaptive(phase), phase, messages, system, exclude...)
 	}
@@ -384,7 +421,16 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 		Detail: "mode=power",
 	})
 
-	attempts := r.Ensemble(ctx, phase, messages, system, exclude...)
+	attempts, ensembleErr := r.EnsembleWithError(ctx, phase, messages, system, exclude...)
+	if ensembleErr != nil {
+		var total Usage
+		for _, attempt := range attempts {
+			total.InputTokens += attempt.Usage.InputTokens
+			total.OutputTokens += attempt.Usage.OutputTokens
+			total.Cost += attempt.Usage.Cost
+		}
+		return "", total, RouteResult{}, ensembleErr
+	}
 	results := make([]EnsembleResult, 0, len(attempts))
 	for _, result := range attempts {
 		if strings.TrimSpace(result.Content) != "" {
@@ -413,7 +459,7 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 		return content, fallbackUsage, route, err
 	}
 
-	best := r.judgeSelectForRequest(ctx, phase, messages, system, results)
+	best, judgeErr := r.judgeSelectForRequestWithError(ctx, phase, messages, system, results)
 
 	// Accumulate usage across all ensemble calls: generators + judge.
 	var total Usage
@@ -428,6 +474,9 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	total.Cost += best.Usage.Cost
 	total.Provider = best.Provider // winning generator
 	total.Model = best.ModelID
+	if judgeErr != nil {
+		return "", total, RouteResult{}, judgeErr
+	}
 
 	r.emitTrace(TraceEvent{
 		Event:    "chat_best_power_selected",

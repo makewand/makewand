@@ -1,0 +1,6 @@
+{
+  "single-claude": ["python3", "-I", "{adapter}", "single-claude", "--workspace", "{workspace}", "--prompt-file", "{prompt_file}", "--timeout", "{timeout}", "--risk", "{risk}"],
+  "single-codex": ["python3", "-I", "{adapter}", "single-codex", "--workspace", "{workspace}", "--prompt-file", "{prompt_file}", "--timeout", "{timeout}", "--risk", "{risk}"],
+  "pipeline-cross-review": ["python3", "-I", "{adapter}", "pipeline", "--workspace", "{workspace}", "--prompt-file", "{prompt_file}", "--timeout", "{timeout}", "--risk", "{risk}", "--auto-fix", "--max-fix", "2"],
+  "race-and-apply": ["python3", "-I", "{adapter}", "race", "--workspace", "{workspace}", "--prompt-file", "{prompt_file}", "--timeout", "{timeout}", "--risk", "{risk}"]
+}

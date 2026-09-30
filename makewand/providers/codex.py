@@ -7,7 +7,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_CYAN
-from makewand.providers.base import run_subprocess
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.workflow import provider_outcome
 
 def parse_codex_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     lower = output.lower()
@@ -83,20 +84,14 @@ def execute_codex_task(
         if has_api_configured("codex"):
             import sys
             print(c("[Makewand -> Codex] (纯 API 模式) 派发任务至 OpenAI API...", COLOR_CYAN), file=sys.stderr)
-            ok, out, err = call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out, None
-            return False, out, err
+            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, "未找到 Codex CLI 订阅，且未配置 OPENAI_API_KEY"
 
     if cache.get("codex", {}).get("status") == "limited":
         if has_api_configured("codex"):
             import sys
             print(c("[Makewand -> Codex] 订阅配额已耗尽，无缝自动降级为 OpenAI API 模式接力执行...", COLOR_CYAN), file=sys.stderr)
-            ok, out, err = call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out, None
-            return False, out, err
+            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Codex CLI 当前额度受限: {cache['codex'].get('reason')} (可配置 OPENAI_API_KEY 作为备用 API 自动接力)"
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
@@ -146,6 +141,8 @@ def execute_codex_task(
 
     import sys
     print(c(f"[Makewand -> Codex] 派发任务 (Tier: {tier}, {target_model})...", COLOR_CYAN), file=sys.stderr)
+    from makewand.execution_runtime import mark_provider_invocation
+    mark_provider_invocation()
     code, out, err, ex = run_subprocess(
         cmd,
         timeout=timeout,
@@ -159,16 +156,16 @@ def execute_codex_task(
     if code == 0:
         return True, out, None
 
+    if is_process_timeout(ex) or code < 0:
+        return model_process_failure("codex", code, combined, err, ex, readonly)
+
     is_limited, reason, resets = parse_codex_quota(combined)
     if is_limited:
         record_engine_limit("codex", reason, resets)
         if has_api_configured("codex"):
             import sys
             print(c(f"[Makewand -> Codex] 订阅触发限流 ({reason})，无缝切换为 OpenAI API Key 模式接力执行...", COLOR_CYAN), file=sys.stderr)
-            ok, out_api, err_api = call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd)
-            if ok:
-                return True, out_api, None
-            return False, out_api, err_api
+            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
         return False, None, f"Codex CLI 执行中触发额度限制: {reason} (可配置 OPENAI_API_KEY 实现自动接力)"
 
-    return False, combined, ex or f"Codex returned exit code {code}"
+    return model_process_failure("codex", code, combined, err, ex, readonly)

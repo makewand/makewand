@@ -15,6 +15,42 @@ from typing import Tuple, Optional
 
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024  # 10 MB output guardrail
 
+
+class ProcessExecutionError(str):
+    """String-compatible runner evidence; never derived from model output."""
+    def __new__(cls, message, status):
+        value = super().__new__(cls, message)
+        value.execution_status = status
+        return value
+
+
+def is_process_timeout(error):
+    """Timeout evidence belongs to the runner, never partial model output."""
+    import re
+    return (getattr(error, "execution_status", None) == "TIMEOUT"
+            or isinstance(error, str) and re.fullmatch(r"Command timed out after [0-9.]+ seconds", error) is not None)
+
+
+def model_process_failure(engine, code, output, stderr=None, exception=None, readonly=False):
+    """A local process exit cannot establish a remote model's final outcome.
+
+    Call this only after explicit configuration/quota/auth rejection handling.
+    Spawn errors are known preflight failures; an admitted process's generic
+    nonzero termination is unknown, including positive exit codes and stderr.
+    """
+    from makewand.execution_contract import ExecutionResult
+    status = getattr(exception, "execution_status", None)
+    if status is None and is_process_timeout(exception):
+        status = "TIMEOUT"  # compatibility with runner fixtures/older callers
+    status = status or "UNKNOWN"
+    # Keep useful stderr on generic exits without treating its text as proof of
+    # remote completion. Timeout/spawn evidence takes precedence over stderr.
+    error = (exception or stderr) if status in ("TIMEOUT", "FAILED") else (stderr or exception)
+    error = error or f"{engine} returned exit code {code}"
+    return ExecutionResult(False, output, str(error), status=status, engine=engine,
+        readonly=readonly, outcome_known=status == "FAILED",
+        error_kind="deadline" if status == "TIMEOUT" else "process_start" if status == "FAILED" else "process_exit")
+
 def check_cli_installed(bin_name: str) -> bool:
     return shutil.which(bin_name) is not None
 
@@ -97,14 +133,15 @@ def run_subprocess(
             )
             try:
                 stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
-                return proc.returncode, stdout, stderr, None
+                error = ProcessExecutionError(f"Command returned exit code {proc.returncode}", "UNKNOWN") if proc.returncode else None
+                return proc.returncode, stdout, stderr, error
             except subprocess.TimeoutExpired:
                 kill_process_tree(proc)
                 try:
                     stdout, stderr = proc.communicate(timeout=0.5)
                 except Exception:
                     stdout, stderr = "", ""
-                return -1, stdout or "", stderr or "", f"Command timed out after {timeout} seconds"
+                return -1, stdout or "", stderr or "", ProcessExecutionError(f"Command timed out after {timeout} seconds", "TIMEOUT")
 
         else:
             proc = subprocess.Popen(
@@ -151,7 +188,7 @@ def run_subprocess(
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         kill_process_tree(proc)
-                        return -1, "".join(collected), "", f"Command timed out after {timeout} seconds"
+                        return -1, "".join(collected), "", ProcessExecutionError(f"Command timed out after {timeout} seconds", "TIMEOUT")
 
                     events = sel.select(timeout=min(0.2, max(0.05, remaining)))
                     for key, mask in events:
@@ -203,7 +240,8 @@ def run_subprocess(
                         break
 
                 ret = proc.wait()
-                return ret, "".join(collected), "", None
+                error = ProcessExecutionError(f"Command returned exit code {ret}", "UNKNOWN") if ret else None
+                return ret, "".join(collected), "", error
             finally:
                 sel.close()
 
@@ -214,7 +252,7 @@ def run_subprocess(
     except Exception as e:
         if proc:
             kill_process_tree(proc)
-        return -1, "", "", str(e)
+        return -1, "", "", ProcessExecutionError(str(e), "UNKNOWN" if proc is not None else "FAILED")
     finally:
         if proc:
             for pipe in (getattr(proc, "stdout", None), getattr(proc, "stderr", None), getattr(proc, "stdin", None)):

@@ -19,6 +19,7 @@ func killProcessGroup(cmd *exec.Cmd) {
 		return
 	}
 	// Use taskkill /T /F to kill the entire process tree on Windows.
+	// #nosec G204 -- fixed executable and arguments, no shell; PID is the integer from the os.Process started by this engine.
 	_ = exec.Command("taskkill", "/T", "/F", "/PID",
 		strconv.Itoa(cmd.Process.Pid)).Run()
 }

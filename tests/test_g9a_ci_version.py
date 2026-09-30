@@ -24,6 +24,7 @@ VERSION_SURFACE = [
     "site/main.js",
     "internal/buildinfo/buildinfo.go",
     "scripts/install.sh",
+    "scripts/install_source.py",
     "CHANGELOG.md",
 ]
 
@@ -80,6 +81,8 @@ class CheckVersionTests(unittest.TestCase):
             "tests/test_interactive.py": lambda s: s + f'\n# card shows "Makewand ({stale})"\n',
             "CHANGELOG.md": lambda s: s.replace(f"## [{version}]", "## [0.0.1]"),
             "internal/buildinfo/buildinfo.go": lambda s: s.replace('Version = "dev"', f'Version = "{version}"', 1),
+            "scripts/install.sh": lambda s: s.replace('exec python3 -I "$SCRIPT_ROOT/scripts/install_source.py" "$SCRIPT_ROOT"', 'echo "installation bypassed"', 1),
+            "scripts/install_source.py": lambda s: s.replace('"-X github.com/makewand/makewand/internal/buildinfo.Version=" + version', '"-X github.com/makewand/makewand/internal/buildinfo.Version=0.0.1"', 1),
         }
         for rel, mutate in cases.items():
             with self.subTest(file=rel), tempfile.TemporaryDirectory() as tmp:
@@ -94,6 +97,24 @@ class CheckVersionTests(unittest.TestCase):
                 result = self._run(root=root)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(rel, result.stderr)
+
+    def test_installer_rejects_mixed_or_unchecked_engine_versions(self):
+        mutations = [
+            lambda s: s.replace('version = python_version[len("makewand "):]', 'version = "0.0.1"', 1),
+            lambda s: s.replace('if native_version != "makewand version " + version:', 'if False:', 1),
+            lambda s: s.replace('"-I", "-B", str(stage / "bin/makewand"), "--version"', '"-I", "-B", str(stage / "bin/makewand"), "--help"', 1),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index), tempfile.TemporaryDirectory() as tmp:
+                root = self._fixture(tmp)
+                target = root / "scripts/install_source.py"
+                original = target.read_text(encoding="utf-8")
+                mutated = mutate(original)
+                self.assertNotEqual(original, mutated)
+                target.write_text(mutated, encoding="utf-8")
+                result = self._run(root=root)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("scripts/install_source.py", result.stderr)
 
 
 class ChangelogTests(unittest.TestCase):

@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -417,9 +416,15 @@ func TestCheckpointFiles_HardlinkConsistencyPreservedOnRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat %s: %v", linkPath, err)
 	}
-	sysOrig := infoOrig.Sys().(*syscall.Stat_t)
-	sysLink := infoLink.Sys().(*syscall.Stat_t)
-	if sysOrig.Ino != sysLink.Ino {
+	sysOrig, err := checkpointIdentity(fullPath, infoOrig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysLink, err := checkpointIdentity(linkPath, infoLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sysOrig.sameFile(sysLink) {
 		t.Fatalf("Inodes do not match: %d vs %d", sysOrig.Ino, sysLink.Ino)
 	}
 	if sysOrig.Nlink < 2 {
@@ -476,11 +481,23 @@ func TestCheckpointFiles_HardlinkConsistencyPreservedOnRestore(t *testing.T) {
 		t.Fatalf("link.bin hash mismatch: hard link was not restored with large.bin!")
 	}
 
-	infoAfterOrig, _ := os.Stat(fullPath)
-	infoAfterLink, _ := os.Stat(linkPath)
-	sysAfterOrig := infoAfterOrig.Sys().(*syscall.Stat_t)
-	sysAfterLink := infoAfterLink.Sys().(*syscall.Stat_t)
-	if sysAfterOrig.Ino != sysAfterLink.Ino {
+	infoAfterOrig, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoAfterLink, err := os.Stat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysAfterOrig, err := checkpointIdentity(fullPath, infoAfterOrig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysAfterLink, err := checkpointIdentity(linkPath, infoAfterLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sysAfterOrig.sameFile(sysAfterLink) {
 		t.Fatalf("Hard link broken! Inodes differ after restore: %d vs %d", sysAfterOrig.Ino, sysAfterLink.Ino)
 	}
 }

@@ -2,8 +2,11 @@ package serveralerts
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -36,13 +39,53 @@ type WebhookNotifier struct {
 	teams      serverteam.Store
 	client     *http.Client
 
-	mu    sync.Mutex
-	state map[string]stateEntry
+	mu      sync.Mutex
+	state   map[string]stateEntry
+	pending map[string]bool
+	queue   chan queuedNotification
+	cancel  context.CancelFunc
+	done    chan struct{}
+	closed  bool
+	options NotifierOptions
 }
 
 // OpenWebhookNotifier creates a budget alert notifier. Empty webhook URLs
 // return nil so callers can wire this in conditionally.
 func OpenWebhookNotifier(webhookURL, statePath string, usageReader serverusage.Reader, teamStore serverteam.Store) (*WebhookNotifier, error) {
+	return OpenWebhookNotifierWithOptions(webhookURL, statePath, usageReader, teamStore, NotifierOptions{})
+}
+
+// NotifierOptions bounds asynchronous delivery and makes failures observable.
+type NotifierOptions struct {
+	QueueSize    int
+	Timeout      time.Duration
+	MaxAttempts  int
+	RetryDelay   time.Duration
+	ErrorHandler func(error)
+}
+
+type queuedNotification struct {
+	key, pendingKey, month string
+	payload                Notification
+}
+
+func OpenWebhookNotifierWithOptions(webhookURL, statePath string, usageReader serverusage.Reader, teamStore serverteam.Store, options NotifierOptions) (*WebhookNotifier, error) {
+	if options.QueueSize <= 0 {
+		options.QueueSize = 64
+	}
+	if options.Timeout <= 0 {
+		options.Timeout = 10 * time.Second
+	}
+	if options.MaxAttempts <= 0 {
+		options.MaxAttempts = 3
+	}
+	if options.RetryDelay <= 0 {
+		options.RetryDelay = 100 * time.Millisecond
+	}
+	if options.ErrorHandler == nil {
+		options.ErrorHandler = func(err error) { log.Printf("budget alert delivery failed: %v", err) }
+	}
+
 	webhookURL = strings.TrimSpace(webhookURL)
 	if webhookURL == "" {
 		return nil, nil
@@ -55,12 +98,19 @@ func OpenWebhookNotifier(webhookURL, statePath string, usageReader serverusage.R
 		statePath:  strings.TrimSpace(statePath),
 		usage:      usageReader,
 		teams:      teamStore,
-		client:     &http.Client{Timeout: 10 * time.Second},
+		client:     &http.Client{Timeout: options.Timeout},
 		state:      make(map[string]stateEntry),
+		pending:    make(map[string]bool),
+		queue:      make(chan queuedNotification, options.QueueSize),
+		done:       make(chan struct{}),
+		options:    options,
 	}
 	if err := n.loadState(); err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	n.cancel = cancel
+	go n.run(ctx)
 	return n, nil
 }
 
@@ -94,7 +144,7 @@ func (n *WebhookNotifier) observeProject(projectID string, now time.Time) {
 	if err != nil || project == nil || project.MonthlyBudgetUSD <= 0 || !project.IsActive {
 		return
 	}
-	entries, err := n.usage.Load(serverusage.CurrentMonthFilter(serverusage.Filter{ProjectID: project.ID}, now))
+	cost, count, err := serverusage.Spend(n.usage, serverusage.CurrentMonthFilter(serverusage.Filter{ProjectID: project.ID}, now))
 	if err != nil {
 		return
 	}
@@ -102,8 +152,8 @@ func (n *WebhookNotifier) observeProject(projectID string, now time.Time) {
 		project.ID,
 		project.Name,
 		project.MonthlyBudgetUSD,
-		serverusage.SummarizeEntries(entries).TotalCostUSD,
-		len(entries),
+		cost,
+		count,
 	)
 	n.notifyIfNew("project", bucket, now)
 }
@@ -113,7 +163,7 @@ func (n *WebhookNotifier) observeOrganization(orgID string, now time.Time) {
 	if err != nil || org == nil || org.MonthlyBudgetUSD <= 0 || !org.IsActive {
 		return
 	}
-	entries, err := n.usage.Load(serverusage.CurrentMonthFilter(serverusage.Filter{OrgID: org.ID}, now))
+	cost, count, err := serverusage.Spend(n.usage, serverusage.CurrentMonthFilter(serverusage.Filter{OrgID: org.ID}, now))
 	if err != nil {
 		return
 	}
@@ -121,8 +171,8 @@ func (n *WebhookNotifier) observeOrganization(orgID string, now time.Time) {
 		org.ID,
 		org.Name,
 		org.MonthlyBudgetUSD,
-		serverusage.SummarizeEntries(entries).TotalCostUSD,
-		len(entries),
+		cost,
+		count,
 	)
 	n.notifyIfNew("organization", bucket, now)
 }
@@ -135,40 +185,147 @@ func (n *WebhookNotifier) notifyIfNew(scopeType string, bucket serverteam.Billin
 	key := scopeType + ":" + bucket.ID
 	month := serverusage.MonthStart(now).Format("2006-01")
 
+	pendingKey := key + "|" + month + "|" + alert.Severity
 	n.mu.Lock()
 	current := n.state[key]
-	if current.Month == month && current.Severity == alert.Severity {
+	if n.closed || n.pending[pendingKey] || (current.Month == month && severityRank(current.Severity) >= severityRank(alert.Severity)) {
 		n.mu.Unlock()
 		return
 	}
-	n.mu.Unlock()
-
-	payload := Notification{
-		Timestamp: now,
-		Source:    "makewand",
-		Alert:     alert,
+	job := queuedNotification{key: key, pendingKey: pendingKey, month: month, payload: Notification{Timestamp: now, Source: "makewand", Alert: alert}}
+	select {
+	case n.queue <- job:
+		n.pending[pendingKey] = true
+		n.mu.Unlock()
+	default:
+		n.mu.Unlock()
+		n.options.ErrorHandler(fmt.Errorf("budget alert queue full"))
 	}
+}
+
+func severityRank(severity string) int {
+	switch severity {
+	case "warning":
+		return 1
+	case "high":
+		return 2
+	case "critical":
+		return 3
+	}
+	return 0
+}
+
+func (n *WebhookNotifier) run(ctx context.Context) {
+	defer close(n.done)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-n.queue:
+			if !ok {
+				return
+			}
+			err := n.deliver(ctx, job.payload)
+			n.mu.Lock()
+			delete(n.pending, job.pendingKey)
+			if err == nil {
+				current := n.state[job.key]
+				if current.Month != job.month || severityRank(current.Severity) < severityRank(job.payload.Alert.Severity) {
+					n.state[job.key] = stateEntry{Severity: job.payload.Alert.Severity, Month: job.month}
+					err = n.saveStateLocked()
+				}
+			}
+			n.mu.Unlock()
+			if err != nil {
+				n.options.ErrorHandler(err)
+			}
+		}
+	}
+}
+
+func (n *WebhookNotifier) deliver(ctx context.Context, payload Notification) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, n.webhookURL, bytes.NewReader(data))
-	if err != nil {
-		return
+	for attempt := 0; attempt < n.options.MaxAttempts; attempt++ {
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, n.webhookURL, bytes.NewReader(data))
+		if requestErr != nil {
+			return requestErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		// Receivers can use this stable key to make retries idempotent.
+		req.Header.Set("Idempotency-Key", payload.Alert.ScopeType+":"+payload.Alert.ID+":"+payload.Timestamp.UTC().Format("2006-01")+":"+payload.Alert.Severity)
+		resp, sendErr := n.client.Do(req)
+		if sendErr == nil {
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			sendErr = fmt.Errorf("budget alert webhook HTTP %d", resp.StatusCode)
+			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				return sendErr
+			}
+		}
+		err = sendErr
+		if attempt+1 < n.options.MaxAttempts {
+			timer := time.NewTimer(n.options.RetryDelay * time.Duration(1<<attempt))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := n.client.Do(req)
-	if err != nil {
-		return
+	return err
+}
+
+// Flush waits for accepted notifications without closing the notifier.
+func (n *WebhookNotifier) Flush(ctx context.Context) error {
+	if n == nil {
+		return nil
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		n.mu.Lock()
+		empty := len(n.pending) == 0
+		n.mu.Unlock()
+		if empty {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// Close drains the bounded queue before stores are closed. Its deadline also
+// cancels in-flight HTTP requests; no worker remains after Close returns.
+func (n *WebhookNotifier) Close() error {
+	if n == nil {
+		return nil
 	}
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.state[key] = stateEntry{Severity: alert.Severity, Month: month}
-	_ = n.saveStateLocked()
+	if !n.closed {
+		n.closed = true
+		close(n.queue)
+	}
+	n.mu.Unlock()
+	timer := time.NewTimer(20 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-n.done:
+		n.cancel()
+		return nil
+	case <-timer.C:
+		n.cancel()
+		<-n.done
+		return errors.New("budget alert shutdown timed out")
+	}
 }
 
 func (n *WebhookNotifier) loadState() error {

@@ -33,4 +33,6 @@ for command in new chat serve run review race status probe quota models observe 
 done
 "$BINARY" review --repo-trust untrusted --help >/dev/null
 python3 -I "$ROOT_DIR/scripts/check_cli_examples.py" "$BINARY"
+python3 -I "$ROOT_DIR/scripts/check_cli_contract.py" "$BINARY" \
+    --python-launcher "$(dirname "$BINARY")/lib/makewand/python/bin/makewand"
 echo "Release contract passed: complete engines, matching version, public commands and cwd isolation."

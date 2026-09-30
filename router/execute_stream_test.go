@@ -176,8 +176,8 @@ func TestChatStream_StreamErrorDoesNotRecordSuccess(t *testing.T) {
 	}
 }
 
-func TestChatStream_FallsBackOnErrorBeforeFirstToken(t *testing.T) {
-	primaryErr := newProviderError("claude", "stream", ErrorKindNetwork, true, 0, "connection reset", nil)
+func TestChatStream_FallsBackOnExplicitRejectionBeforeFirstToken(t *testing.T) {
+	primaryErr := newProviderError("claude", "stream", ErrorKindUnavailable, true, 503, "temporarily unavailable", nil)
 	primary := &controlledStreamProvider{
 		name:      "claude",
 		available: true,

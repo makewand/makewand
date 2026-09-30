@@ -56,7 +56,7 @@ BLOCKED_PORTS = frozenset({11434})
 LEGACY_ARTIFACTS_ROOT = Path("/tmp/makewand-artifacts")
 
 _SCRUB_SUFFIXES = ("_API_KEY", "_AUTH_TOKEN", "_BASE_URL", "_MODEL")
-_SCRUB_PREFIXES = ("MAKEWAND_", "LOCAL_MODEL_", "OLLAMA_")
+_SCRUB_PREFIXES = ("MAKEWAND_", "LOCAL_MODEL_", "OLLAMA_", "CODEX_")
 # Repository redirection variables (set e.g. inside git hooks) would make the
 # fixture repositories created by tests operate on the caller's repository.
 _SCRUB_GIT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",

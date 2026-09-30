@@ -9,11 +9,46 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-> 占位概要 / Placeholder summary of the 2026-09-28 evaluation remediation round.
-> Each group's entry below is a one-line pointer; the docs group completes the
-> wording before the next tag.
+Evaluation remediation through 2026-09-30; changes remain unreleased.
+评估修复截至 2026-09-30，以下变更尚未发布。
 
 ### Fixed
+
+- Native Go and Python dispatches now share execution outcomes, task identity,
+  deadlines, an atomic call budget and expiring workflow capacity holds. Unknown
+  results stop automatic fallback and replay; race reserves judge calls and time in advance.
+- Conservative workflow selection retains independent tests and sealed review.
+  Opt-in stage events report timing without logging prompts or credentials;
+  unknown token, cost and memory measurements remain null. A fixed 12-task
+  repeated offline suite verifies independent acceptance and early-exit refusal.
+  Its 72 stub trials validate the evaluator; live workflow/model effectiveness
+  was not remeasured. This phase adds zero live calls to the exhausted 12/12 budget.
+
+- Python daemon isolates every request in a worker, preserves argv/stdin/client
+  policies, bounds IPC resources, and never replays a sent request after losing
+  its result. Cancellation and versioned request status have regression coverage.
+- Hybrid candidates retain complete three-way changes, file modes and deletions;
+  tests and independent review bind to the sealed baseline and artifact. Git
+  replacement refs and moving HEAD cannot hide changes from approval.
+- Race stages, composite test suites and test fallbacks share their remaining
+  time budget. Verification does not write workspace playbook state or Python
+  bytecode; isolated copies retain tracked and deliverable cache-directory
+  source while respecting ignored files in nested repositories.
+- Subscription task admission uses a locked cross-process budget; failures,
+  review follow-ups and live health probes count. Benchmarks independently verify
+  child results, reject early exits, bound output and record evidence provenance.
+- Login source/account/global limits and a shared password-hash concurrency cap
+  bound resource use; JSON user writes serialize across processes. SQL usage
+  aggregation, indexed paging, asynchronous webhook delivery, readiness and
+  request/database metrics replace unbounded reads and blocking notification.
+- Source installation freezes both engines and embedded assets, verifies matching
+  versions and both public entry points, then switches atomically. Failed upgrades
+  preserve a runnable previous version. A shared command registry prevents
+  delegation drift, including global working-directory arguments.
+- Go candidate fan-out, timeout and cost thresholds are configurable; workspace
+  copies use safe filesystem-aware reflinks with ordinary-copy fallback. Output
+  limits drain discarded bytes without turning successful commands into failures.
+
 
 - **Release and CI pipelines unblocked on GitHub-hosted runners / 发布链与 CI 解锁
   (eng-delivery#1, #2).** Every 3.x tag failed in the `test` job, so no 3.x
@@ -41,8 +76,6 @@ All notable changes to this project are documented here. The format is based on
   `make lint` / `make vuln` run golangci-lint and govulncheck under the go.mod
   toolchain; `make prelaunch` now matches docs/PRELAUNCH.md; the release-metadata
   workflow no longer hardcodes a personal account and defaults to a dry run.
-- _Other remediation groups of this round (sandbox, orchestrator, review
-  verdicts, credential directories, …): summary pending from the docs group._
 
 ### Changed (merged after 3.1.0, 2026-09-24 – 2026-09-27)
 

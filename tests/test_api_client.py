@@ -126,15 +126,10 @@ class TestMakeHttpRequest(unittest.TestCase):
             mock_urlopen.reset_mock()
             mock_sleep.reset_mock()
 
-            fp = io.BytesIO(f"Internal server error {error_code}".encode("utf-8"))
-            http_err = urllib.error.HTTPError(
-                url="https://api.example.com",
-                code=error_code,
-                msg="Server Error",
-                hdrs={},
-                fp=fp,
-            )
-            mock_urlopen.side_effect = http_err
+            def refuse(*args, **kwargs):
+                raise urllib.error.HTTPError("https://api.example.com", error_code,
+                    "Server Error", {}, io.BytesIO(f"Internal server error {error_code}".encode()))
+            mock_urlopen.side_effect = refuse
 
             code, body, err = _make_http_request(
                 url="https://api.example.com",
@@ -184,15 +179,10 @@ class TestMakeHttpRequest(unittest.TestCase):
     @patch("urllib.request.urlopen")
     def test_retries_on_429_exhausted(self, mock_urlopen, mock_sleep):
         """Tests retrying on 429 Rate Limit error up to max_retries."""
-        fp = io.BytesIO(b'{"error": "rate limit exceeded"}')
-        http_err = urllib.error.HTTPError(
-            url="https://api.example.com",
-            code=429,
-            msg="Too Many Requests",
-            hdrs={},
-            fp=fp,
-        )
-        mock_urlopen.side_effect = http_err
+        def refuse(*args, **kwargs):
+            raise urllib.error.HTTPError("https://api.example.com", 429,
+                "Too Many Requests", {}, io.BytesIO(b'{"error": "rate limit exceeded"}'))
+        mock_urlopen.side_effect = refuse
 
         code, body, err = _make_http_request(
             url="https://api.example.com",
@@ -285,8 +275,8 @@ class TestMakeHttpRequest(unittest.TestCase):
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
-    def test_retries_on_network_timeout(self, mock_urlopen, mock_sleep):
-        """Tests retry on TimeoutError / URLError timeout."""
+    def test_network_timeout_stops_without_replay(self, mock_urlopen, mock_sleep):
+        """A timeout does not establish that the remote request was rejected."""
         mock_urlopen.side_effect = urllib.error.URLError(socket.timeout("timed out"))
 
         code, body, err = _make_http_request(
@@ -298,14 +288,14 @@ class TestMakeHttpRequest(unittest.TestCase):
         )
 
         self.assertEqual(code, -1)
-        self.assertIn("Network/URL Error", err)
-        self.assertEqual(mock_urlopen.call_count, 3)
-        self.assertEqual(mock_sleep.call_count, 2)
+        self.assertEqual(err.execution_status, "TIMEOUT")
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
-    def test_timeout_error_recovering(self, mock_urlopen, mock_sleep):
-        """Tests network timeout recovering on retry."""
+    def test_timeout_cannot_consume_a_later_success_response(self, mock_urlopen, mock_sleep):
+        """A queued success must remain unused after an uncertain timeout."""
         mock_resp = MagicMock()
         mock_resp.status = 200
         mock_resp.read.return_value = b'{"ok": true}'
@@ -321,11 +311,10 @@ class TestMakeHttpRequest(unittest.TestCase):
             backoff_factor=0.2,
         )
 
-        self.assertEqual(code, 200)
-        self.assertEqual(body, '{"ok": true}')
-        self.assertIsNone(err)
-        self.assertEqual(mock_urlopen.call_count, 2)
-        mock_sleep.assert_called_once_with(0.2)
+        self.assertEqual(code, -1)
+        self.assertEqual(err.execution_status, "TIMEOUT")
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
 
     @patch("urllib.request.urlopen")
     def test_general_exception_handling(self, mock_urlopen):

@@ -286,8 +286,11 @@ class CandidateTests(StorageHarness):
         (host / ".gitignore").write_text(".env\n")
         (host / ".env").write_text("TOKEN=secret\n")
         (host / "app.py").write_text("BASE = 1\n")
+        (host / "test_app.py").write_text("def test_fixture():\n    assert True\n")
 
-        def dispatch(engine, prompt, cwd=None, **kwargs):
+        def dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):
+            if readonly:
+                return True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None
             (Path(cwd) / "app.py").write_text("CANDIDATE = 1\n")
             return True, "implemented", None
 
@@ -295,9 +298,8 @@ class CandidateTests(StorageHarness):
             stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
             stack.enter_context(patch.object(orch, "get_or_update_status", return_value={}))
             stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
-            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
-            stack.enter_context(patch.object(orch, "execute_agy_task", return_value=(
-                True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None)))
+            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, "fixture tests passed")))
+            stack.enter_context(patch.object(orch, "execute_agy_task", side_effect=AssertionError("race judging must use the unified dispatcher")))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = orch.run_race("Implement update", cwd=str(host), engine_a="codex", engine_b="claude")
         self.assertEqual(code, orch.EXIT_PASSED)
@@ -337,7 +339,7 @@ class CandidateTests(StorageHarness):
             stack.enter_context(patch.object(orch, "get_or_update_status", return_value={}))
             stack.enter_context(patch.object(orch, "dispatch_task", return_value=(False, "", "quota")))
             stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
-            stack.enter_context(patch.object(orch, "execute_agy_task", return_value=(False, "", "unavailable")))
+            stack.enter_context(patch.object(orch, "execute_agy_task", side_effect=AssertionError("race judging must use the unified dispatcher")))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = orch.run_race("Implement update", cwd=str(host), engine_a="codex", engine_b="claude")
         self.assertEqual(code, orch.EXIT_FAILED)

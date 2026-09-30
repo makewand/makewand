@@ -44,7 +44,7 @@ def safe_search(
     flags = re.IGNORECASE if ignore_case else 0
     try:
         regex = re.compile(pattern, flags)
-    except re.error as e:
+    except re.error:
         regex = re.compile(re.escape(pattern), flags)
 
     root_depth = len(root.parts)
