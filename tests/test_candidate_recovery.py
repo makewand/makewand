@@ -584,6 +584,30 @@ os._exit(87)
         self.assertEqual(build_manifest(self.workspace), interrupted)
         self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "prepared")
 
+    def test_build_manifest_filters_project_ignore_dirs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("print('hello')")
+            (root / "node_modules" / "dep").mkdir(parents=True)
+            (root / "node_modules" / "dep" / "index.js").write_text("console.log(1)")
+            (root / ".venv" / "lib").mkdir(parents=True)
+            (root / ".venv" / "lib" / "mod.py").write_text("x = 1")
+            (root / "target" / "debug").mkdir(parents=True)
+            (root / "target" / "debug" / "bin").write_text("binary")
+            (root / "build").mkdir(parents=True)
+            (root / "build" / "bundle.js").write_text("bundle")
+            (root / "env").write_text("ENV_VAR=1")
+
+            manifest = build_manifest(root)
+            self.assertIn("src/app.py", manifest)
+            self.assertIn("env", manifest)
+            self.assertNotIn("node_modules/dep/index.js", manifest)
+            self.assertNotIn(".venv/lib/mod.py", manifest)
+            self.assertNotIn("target/debug/bin", manifest)
+            self.assertNotIn("build/bundle.js", manifest)
+
 
 if __name__ == "__main__":
     unittest.main()
+

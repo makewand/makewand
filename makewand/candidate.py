@@ -17,6 +17,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
 
+import hashlib
 import makewand.config as config
 from makewand.config import (
     ensure_config_dir,
@@ -24,11 +25,71 @@ from makewand.config import (
     c,
     COLOR_YELLOW,
 )
-import hashlib
-from makewand.git_helper import run_git_cmd, get_git_diff, _read_workspace_diff, WorkspaceLock, WorkspaceLockError
+from makewand.git_helper import (
+    run_git_cmd,
+    get_git_diff,
+    _read_workspace_diff,
+    WorkspaceLock,
+    WorkspaceLockError,
+    workspace_lock_root,
+)
 from makewand.protected_files import ProtectedFiles, ProtectionError
 
 _NO_SECURITY_EXPECTATION = object()
+
+
+def get_scoped_apply_lock_path(base_cwd: Optional[Union[str, Path]] = None) -> Path:
+    """Returns the lock file path scoped per workspace/git repository."""
+    ensure_config_dir()
+    if not base_cwd:
+        return config.CONFIG_DIR / "apply.lock"
+    try:
+        root = workspace_lock_root(base_cwd)
+    except Exception:
+        root = os.path.realpath(str(base_cwd))
+    key = hashlib.sha256(os.fsencode(root)).hexdigest()[:16]
+    return config.CONFIG_DIR / f"apply_{key}.lock"
+
+
+@contextlib.contextmanager
+def scoped_apply_lock(base_cwd: Optional[Union[str, Path]] = None):
+    """
+    Context manager acquiring the apply lock.
+    Scopes the exclusive lock per workspace/git repository so operations across
+    different repositories run concurrently without blocking each other.
+    """
+    ensure_config_dir()
+    global_lock_file = config.CONFIG_DIR / "apply.lock"
+    scoped_lock_file = get_scoped_apply_lock_path(base_cwd)
+
+    global_fd = open(global_lock_file, "a")
+    scoped_fd = None
+    try:
+        if base_cwd:
+            fcntl.flock(global_fd, fcntl.LOCK_SH)
+            scoped_fd = open(scoped_lock_file, "a")
+            fcntl.flock(scoped_fd, fcntl.LOCK_EX)
+        else:
+            fcntl.flock(global_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if scoped_fd is not None:
+            try:
+                fcntl.flock(scoped_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                scoped_fd.close()
+            except Exception:
+                pass
+        try:
+            fcntl.flock(global_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            global_fd.close()
+        except Exception:
+            pass
 
 
 def _race_protection(race):
@@ -96,15 +157,18 @@ def build_manifest(dir_path: Path) -> Dict[str, Any]:
     manifest = {}
     if not dir_path.exists():
         return manifest
+    from makewand.constants import PROJECT_IGNORE_DIRS
     for root, directories, files in os.walk(str(dir_path)):
-        if Path(root) == dir_path:
-            directories[:] = [directory for directory in directories if directory != ".git"]
+        directories[:] = [directory for directory in directories if directory not in PROJECT_IGNORE_DIRS and directory != ".git"]
+        rel_dir = Path(root).relative_to(dir_path)
+        if any(part in PROJECT_IGNORE_DIRS or part == ".git" for part in rel_dir.parts):
+            continue
         for f in files:
             p = Path(root) / f
             if not os.path.islink(p):
                 rel = p.relative_to(dir_path).as_posix()
                 parts = Path(rel).parts
-                if parts and parts[0] == ".git":
+                if any(part in PROJECT_IGNORE_DIRS or part == ".git" for part in parts[:-1]):
                     continue
                 record = file_record(p)
                 if record is not None:
@@ -771,8 +835,7 @@ class CandidateManager:
         """Explicitly recover interrupted applies under both application locks."""
         ensure_config_dir()
         try:
-            with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
+            with scoped_apply_lock(base_cwd):
                 workspace_lock = None
                 try:
                     workspace_lock = WorkspaceLock(base_cwd).acquire()
@@ -787,7 +850,6 @@ class CandidateManager:
                 finally:
                     if workspace_lock is not None:
                         workspace_lock.release()
-                    fcntl.flock(lock, fcntl.LOCK_UN)
         except (OSError, ValueError, WorkspaceLockError) as error:
             return False, [], f"中断应用恢复已停止，保留工作区与备份: {error}"
 
@@ -807,14 +869,10 @@ class CandidateManager:
         protected_files: Optional[Dict[str, Any]] = None,
     ) -> Path:
         ensure_config_dir()
-        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                return CandidateManager._save_race_locked(
-                    race_id, prompt, base_cwd, baseline_commit, agent_a, agent_b,
-                    judge_report, winner, baseline_dir, baseline_manifest, frozen_baseline_manifest, protected_files)
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        with scoped_apply_lock(base_cwd):
+            return CandidateManager._save_race_locked(
+                race_id, prompt, base_cwd, baseline_commit, agent_a, agent_b,
+                judge_report, winner, baseline_dir, baseline_manifest, frozen_baseline_manifest, protected_files)
 
     @staticmethod
     def _save_race_locked(
@@ -962,12 +1020,8 @@ class CandidateManager:
     @staticmethod
     def prune_old_candidates(max_candidates: int = DEFAULT_MAX_CANDIDATES) -> int:
         ensure_config_dir()
-        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                return CandidateManager._prune_old_candidates_locked(max_candidates)
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        with scoped_apply_lock():
+            return CandidateManager._prune_old_candidates_locked(max_candidates)
 
     @staticmethod
     def _prune_old_candidates_locked(max_candidates: int = DEFAULT_MAX_CANDIDATES) -> int:
@@ -1123,12 +1177,10 @@ class CandidateManager:
             deadline = time.monotonic() + test_timeout
         ensure_config_dir()
         try:
-            with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                try:
-                    return CandidateManager._create_hybrid_candidate_locked(race_id, deadline=deadline)
-                finally:
-                    fcntl.flock(lock, fcntl.LOCK_UN)
+            race = CandidateManager.get_race(race_id)
+            base_cwd = race.get("base_cwd") if race else None
+            with scoped_apply_lock(base_cwd):
+                return CandidateManager._create_hybrid_candidate_locked(race_id, deadline=deadline)
         except (OSError, ValueError) as exc:
             return False, None, f"无法合成候选 M: {exc}"
 
@@ -1266,31 +1318,29 @@ class CandidateManager:
         if not isinstance(review_report, str) or evaluate_review_verdict(review_report)["status"] != REVIEW_PASSED:
             return False, "候选 M 复审缺少有效、明确通过的 MAKEWAND_VERDICT 裁决"
         ensure_config_dir()
-        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        race = CandidateManager.get_race(race_id)
+        base_cwd = race.get("base_cwd") if race else None
+        with scoped_apply_lock(base_cwd):
+            race = CandidateManager.get_race(race_id)
+            hybrid = race.get("candidates", {}).get("M") if race else None
+            if (not hybrid or hybrid.get("manifest") != expected_manifest
+                    or hybrid.get("changes") != expected_changes):
+                return False, "复审对象与已封存候选 M 不一致"
             try:
-                race = CandidateManager.get_race(race_id)
-                hybrid = race.get("candidates", {}).get("M") if race else None
-                if (not hybrid or hybrid.get("manifest") != expected_manifest
-                        or hybrid.get("changes") != expected_changes):
-                    return False, "复审对象与已封存候选 M 不一致"
-                try:
-                    protection = _race_protection(race)
-                    protection.verify(hybrid.get("path"))
-                    protection.verify(race.get("base_cwd"))
-                except ProtectionError as exc:
-                    return False, CandidateMessage(f"候选 M 受保护文件校验失败: {exc}", exc.status)
-                error = _candidate_seal_error(hybrid, race)
-                if error:
-                    return False, error
-                if hybrid.get("test_passed") is not True:
-                    return False, "候选 M 未完成测试验证，不能授予自动复审批准"
-                hybrid["review_passed"] = True
-                hybrid["review_report"] = review_report
-                _write_private_json(config.CANDIDATES_DIR / race["race_id"] / "meta.json", race)
-                return True, "候选 M 独立复审已绑定封存产物"
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+                protection = _race_protection(race)
+                protection.verify(hybrid.get("path"))
+                protection.verify(race.get("base_cwd"))
+            except ProtectionError as exc:
+                return False, CandidateMessage(f"候选 M 受保护文件校验失败: {exc}", exc.status)
+            error = _candidate_seal_error(hybrid, race)
+            if error:
+                return False, error
+            if hybrid.get("test_passed") is not True:
+                return False, "候选 M 未完成测试验证，不能授予自动复审批准"
+            hybrid["review_passed"] = True
+            hybrid["review_report"] = review_report
+            _write_private_json(config.CANDIDATES_DIR / race["race_id"] / "meta.json", race)
+            return True, "候选 M 独立复审已绑定封存产物"
 
     @staticmethod
     def apply_candidate(
@@ -1309,32 +1359,50 @@ class CandidateManager:
         if os.name not in ("posix", "nt"):
             return False, [], "当前平台缺少安全候选应用后端。"
         ensure_config_dir()
+        race = CandidateManager.get_race(race_id)
+        base_cwd = race.get("base_cwd") if race else None
+
         lock_file = config.CONFIG_DIR / "apply.lock"
+        scoped_lock_file = get_scoped_apply_lock_path(base_cwd)
         lock_fd = None
+        scoped_fd = None
         try:
             deadline = _check_apply_deadline()
             lock_fd = open(lock_file, "a")
+            target_lock_op = fcntl.LOCK_SH if base_cwd else fcntl.LOCK_EX
             try:
                 if deadline is None:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    fcntl.flock(lock_fd, target_lock_op)
+                    if base_cwd:
+                        scoped_fd = open(scoped_lock_file, "a")
+                        fcntl.flock(scoped_fd, fcntl.LOCK_EX)
                 else:
                     while True:
                         _check_apply_deadline()
                         try:
-                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(lock_fd, target_lock_op | fcntl.LOCK_NB)
                             break
                         except OSError as error:
                             if error.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
                                 raise
                             time.sleep(min(.01, max(0, deadline - time.monotonic())))
+                    if base_cwd:
+                        scoped_fd = open(scoped_lock_file, "a")
+                        while True:
+                            _check_apply_deadline()
+                            try:
+                                fcntl.flock(scoped_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except OSError as error:
+                                if error.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                                    raise
+                                time.sleep(min(.01, max(0, deadline - time.monotonic())))
             except CandidateDeadlineExceeded:
                 raise
             except Exception as e:
                 return False, [], f"无法获取候选应用独占锁 (apply.lock): {e}"
             # Writing into the workspace must not race a makewand task running there.
             workspace_lock = None
-            race = CandidateManager.get_race(race_id)
-            base_cwd = race.get("base_cwd") if race else None
             if not dry_run and base_cwd and os.path.isdir(base_cwd):
                 try:
                     workspace_lock = WorkspaceLock(base_cwd).acquire()
@@ -1367,9 +1435,21 @@ class CandidateManager:
         except Exception as e:
             return False, [], f"打开候选应用锁失败: {e}"
         finally:
-            if lock_fd:
+            if scoped_fd is not None:
+                try:
+                    fcntl.flock(scoped_fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    scoped_fd.close()
+                except Exception:
+                    pass
+            if lock_fd is not None:
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
                     lock_fd.close()
                 except Exception:
                     pass
@@ -1743,12 +1823,10 @@ class CandidateManager:
     @staticmethod
     def discard_race(race_id: Optional[str] = None, all_races: bool = False) -> Tuple[bool, str]:
         ensure_config_dir()
-        with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                return CandidateManager._discard_race_locked(race_id, all_races)
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        race = CandidateManager.get_race(race_id) if race_id else None
+        base_cwd = race.get("base_cwd") if race else None
+        with scoped_apply_lock(base_cwd):
+            return CandidateManager._discard_race_locked(race_id, all_races)
 
     @staticmethod
     def _discard_race_locked(race_id: Optional[str] = None, all_races: bool = False) -> Tuple[bool, str]:

@@ -361,6 +361,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
     elif provider == "codex":
         discovered_models = []
         configured_default = None
+        configured_effort = None
 
         codex_bases = []
         if os.environ.get("CODEX_HOME"):
@@ -384,16 +385,20 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 except Exception:
                     pass
             cfg_file = base / "config.toml"
-            if cfg_file.exists() and not configured_default:
+            if cfg_file.exists():
                 try:
                     raw = cfg_file.read_text(encoding="utf-8")
-                    m = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
-                    if m and _valid_model_id(m.group(1)):
-                        configured_default = m.group(1).strip()
+                    if not configured_default:
+                        m = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
+                        if m and _valid_model_id(m.group(1)):
+                            configured_default = m.group(1).strip()
+                    m_eff = re.search(r'^\s*model_reasoning_effort\s*=\s*"([^"]+)"', raw, re.MULTILINE)
+                    if m_eff:
+                        configured_effort = m_eff.group(1).strip()
                 except Exception:
                     pass
 
-        effort = "max" if tier == "deep" else ("low" if tier == "fast" else "high")
+        effort = configured_effort if (tier == "standard" and configured_effort) else ("max" if tier == "deep" else ("low" if tier == "fast" else "high"))
 
         # If user explicitly configured a model in config.toml and requested standard tier, honor it
         if tier == "standard" and configured_default:
@@ -438,6 +443,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
     elif provider == "muse":
         model_name = "muse-spark-1.3-contributor"
         detected = False
+        configured_effort = None
         try:
             muse_settings = Path.home() / ".config" / "muse" / "settings.json"
             if muse_settings.exists():
@@ -445,9 +451,12 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 if _valid_model_id(data.get("model")):
                     model_name = data["model"].strip()
                     detected = True
+                cfg_effort = data.get("reasoning_effort") or data.get("effort")
+                if cfg_effort and isinstance(cfg_effort, str):
+                    configured_effort = cfg_effort.strip()
         except Exception:
             pass
-        effort = "xhigh" if tier == "deep" else ("high" if tier == "standard" else "low")
+        effort = configured_effort if (tier == "standard" and configured_effort) else ("xhigh" if tier == "deep" else ("high" if tier == "standard" else "low"))
         return _tier_resolution(model_name, effort, is_dynamic=detected)
 
     elif provider == "agy":
@@ -456,3 +465,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         return _tier_resolution(model_name, effort, is_dynamic=False)
 
     return _tier_resolution("default", "medium", is_dynamic=False)
+
+
+# Backward-compatible and convenience alias
+resolve_model_and_effort = get_provider_model_tier

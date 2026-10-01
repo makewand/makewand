@@ -112,6 +112,47 @@ def extract_python_imports(source_code: str) -> Tuple[List[str], int]:
     return import_lines, last_line
 
 
+def _can_merge_disjoint_insertions(lines_a: List[str], lines_b: List[str]) -> bool:
+    """Checks whether two insertions at the same position consist of non-conflicting top-level definitions."""
+    try:
+        tree_a = ast.parse("".join(lines_a))
+        tree_b = ast.parse("".join(lines_b))
+    except SyntaxError:
+        return False
+
+    allowed_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)
+    if not (tree_a.body and tree_b.body):
+        return False
+    if not (all(isinstance(node, allowed_types) for node in tree_a.body) and
+            all(isinstance(node, allowed_types) for node in tree_b.body)):
+        return False
+
+    def get_names(tree):
+        names = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name)
+        return names
+
+    names_a = get_names(tree_a)
+    names_b = get_names(tree_b)
+    if names_a & names_b:
+        return False
+
+    combined = list(lines_a)
+    if combined and not combined[-1].endswith("\n"):
+        combined[-1] = combined[-1] + "\n"
+    combined.extend(lines_b)
+    try:
+        ast.parse("".join(combined))
+        return True
+    except SyntaxError:
+        return False
+
+
 def _merge_disjoint_text(base_code: str, code_a: str, code_b: str):
     """Merge whole-text edits; AST is used only to recognize import additions.
 
@@ -132,15 +173,33 @@ def _merge_disjoint_text(base_code: str, code_a: str, code_b: str):
             prior_start, prior_end, prior_replacement, prior_side = merged_edits[-1]
             if start == prior_start and end == prior_end and replacement == prior_replacement:
                 continue
-            if start == end == prior_start == prior_end:
+            if start == prior_start and end == prior_end:
+                common_len = 0
+                for line_a, line_b in zip(prior_replacement, replacement):
+                    if line_a == line_b:
+                        common_len += 1
+                    else:
+                        break
+                rest_prior = prior_replacement[common_len:]
+                rest_curr = replacement[common_len:]
+                shared_prefix = list(prior_replacement[:common_len])
+
                 def imports_only(lines):
                     try:
                         nodes = ast.parse("".join(lines)).body
                         return bool(nodes) and all(isinstance(node, (ast.Import, ast.ImportFrom)) for node in nodes)
                     except SyntaxError:
                         return False
-                if imports_only(prior_replacement) and imports_only(replacement):
-                    merged_edits[-1] = (start, end, prior_replacement + replacement, prior_side)
+
+                if imports_only(rest_prior) and imports_only(rest_curr):
+                    merged_edits[-1] = (start, end, shared_prefix + rest_prior + rest_curr, prior_side)
+                    continue
+                if _can_merge_disjoint_insertions(rest_prior, rest_curr):
+                    combined_replacement = shared_prefix + list(rest_prior)
+                    if combined_replacement and not combined_replacement[-1].endswith("\n"):
+                        combined_replacement[-1] = combined_replacement[-1] + "\n"
+                    combined_replacement.extend(rest_curr)
+                    merged_edits[-1] = (start, end, combined_replacement, prior_side)
                     continue
                 return False, ""
             # Insertion at a replacement boundary is ambiguous. Adjacent
@@ -228,8 +287,19 @@ def _changes_between(baseline, candidate):
             if baseline.get(path) != candidate.get(path)}
 
 
-def get_worktree_changes_fallback(base_dir: Path, worktree_dir: Path) -> Dict[str, str]:
-    """Compare complete regular-file records, including permission changes."""
+def get_worktree_changes_fallback(base_dir: Path, worktree_dir: Path, baseline_commit: Optional[str] = None) -> Dict[str, str]:
+    """
+    Streamlined candidate change detection: uses git status / git diff when
+    a git repository is present, avoiding redundant full-disk manifest computation.
+    Falls back to manifest comparison for non-git workspaces.
+    """
+    from makewand.git_helper import find_git_root
+    if find_git_root(worktree_dir):
+        from makewand.candidate import get_candidate_files_changed
+        try:
+            return get_candidate_files_changed(worktree_dir, baseline_commit=baseline_commit)
+        except Exception:
+            pass
     from makewand.candidate import build_manifest
     return _changes_between(build_manifest(base_dir), build_manifest(worktree_dir))
 
@@ -269,16 +339,71 @@ def semantic_merge_candidate_worktrees(
     baseline_manifest=None,
 ) -> Tuple[bool, Dict[str, str], List[str], str]:
     """Merge frozen whole-file inputs. Git metadata cannot choose deliverables."""
-    from makewand.candidate import build_manifest, _atomic_copy
+    from makewand.candidate import build_manifest, _atomic_copy, file_record
+    from makewand.git_helper import find_git_root
     base_dir = Path(base_cwd)
     try:
-        baseline = baseline_manifest if baseline_manifest is not None else build_manifest(base_dir)
-        sealed_a = manifest_a if manifest_a is not None else build_manifest(cand_a_dir)
-        sealed_b = manifest_b if manifest_b is not None else build_manifest(cand_b_dir)
-        actual_a, actual_b = _changes_between(baseline, sealed_a), _changes_between(baseline, sealed_b)
-        if changes_a is not None and changes_a != actual_a or changes_b is not None and changes_b != actual_b:
-            return False, {}, [], "候选变更计划与冻结基线不一致"
-        changes_a, changes_b = actual_a, actual_b
+        # Detect candidate changes: fast-path via git status/diff when manifests/changes are omitted
+        if changes_a is None:
+            changes_a = get_worktree_changes_fallback(base_dir, cand_a_dir, baseline_commit=baseline_commit)
+        if changes_b is None:
+            changes_b = get_worktree_changes_fallback(base_dir, cand_b_dir, baseline_commit=baseline_commit)
+
+        has_git_a = bool(find_git_root(cand_a_dir))
+        has_git_b = bool(find_git_root(cand_b_dir))
+
+        if manifest_a is not None and baseline_manifest is not None:
+            baseline = baseline_manifest
+            sealed_a = manifest_a
+            actual_a = _changes_between(baseline, sealed_a)
+            if changes_a is not None and changes_a != actual_a:
+                return False, {}, [], "候选变更计划与冻结基线不一致"
+            changes_a = actual_a
+        elif has_git_a and manifest_a is None:
+            sealed_a = {}
+            for rel in changes_a:
+                rec = file_record(cand_a_dir / rel)
+                if rec is not None:
+                    sealed_a[rel] = rec
+        else:
+            baseline = baseline_manifest if baseline_manifest is not None else build_manifest(base_dir)
+            sealed_a = manifest_a if manifest_a is not None else build_manifest(cand_a_dir)
+            actual_a = _changes_between(baseline, sealed_a)
+            if changes_a is not None and changes_a != actual_a:
+                return False, {}, [], "候选变更计划与冻结基线不一致"
+            changes_a = actual_a
+
+        if manifest_b is not None and baseline_manifest is not None:
+            baseline = baseline_manifest
+            sealed_b = manifest_b
+            actual_b = _changes_between(baseline, sealed_b)
+            if changes_b is not None and changes_b != actual_b:
+                return False, {}, [], "候选变更计划与冻结基线不一致"
+            changes_b = actual_b
+        elif has_git_b and manifest_b is None:
+            sealed_b = {}
+            for rel in changes_b:
+                rec = file_record(cand_b_dir / rel)
+                if rec is not None:
+                    sealed_b[rel] = rec
+        else:
+            if "baseline" not in locals():
+                baseline = baseline_manifest if baseline_manifest is not None else build_manifest(base_dir)
+            sealed_b = manifest_b if manifest_b is not None else build_manifest(cand_b_dir)
+            actual_b = _changes_between(baseline, sealed_b)
+            if changes_b is not None and changes_b != actual_b:
+                return False, {}, [], "候选变更计划与冻结基线不一致"
+            changes_b = actual_b
+
+        if baseline_manifest is not None:
+            baseline = baseline_manifest
+        elif "baseline" not in locals():
+            baseline = {}
+            for rel in (changes_a.keys() | changes_b.keys()):
+                rec = file_record(base_dir / rel)
+                if rec is not None:
+                    baseline[rel] = rec
+
         merged_changes, conflicts = {}, []
         for relative in sorted(changes_a.keys() | changes_b.keys()):
             st_a, st_b = changes_a.get(relative), changes_b.get(relative)
@@ -295,12 +420,21 @@ def semantic_merge_candidate_worktrees(
                 conflicts.append(relative)
                 continue
             if not st_b:
+                if relative not in sealed_a:
+                    conflicts.append(relative)
+                    continue
                 _atomic_copy(str(output_dir), relative, cand_a_dir / relative, sealed_a[relative])
                 merged_changes[relative] = st_a
                 continue
             if not st_a:
+                if relative not in sealed_b:
+                    conflicts.append(relative)
+                    continue
                 _atomic_copy(str(output_dir), relative, cand_b_dir / relative, sealed_b[relative])
                 merged_changes[relative] = st_b
+                continue
+            if relative not in sealed_a or relative not in sealed_b:
+                conflicts.append(relative)
                 continue
             content_a = _sealed_bytes(cand_a_dir, relative, sealed_a[relative])
             content_b = _sealed_bytes(cand_b_dir, relative, sealed_b[relative])

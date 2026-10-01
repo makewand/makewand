@@ -176,19 +176,23 @@ func openPendingApprovalStore(ctx context.Context, project string, create bool) 
 		return nil, fmt.Errorf("unsupported pending approval schema %d", version)
 	}
 	if version == 0 {
-		tx, err := s.db.BeginTx(ctx, nil)
+		conn, err := s.db.Conn(ctx)
 		if err != nil {
 			return nil, err
 		}
-		defer func() { _ = tx.Rollback() }()
-		_, err = tx.ExecContext(ctx, `CREATE TABLE approvals (id TEXT PRIMARY KEY, body BLOB NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL, diagnostic TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+		defer conn.Close()
+		if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+			return nil, err
+		}
+		defer func() { _, _ = conn.ExecContext(context.Background(), `ROLLBACK`) }()
+		_, err = conn.ExecContext(ctx, `CREATE TABLE approvals (id TEXT PRIMARY KEY, body BLOB NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL, diagnostic TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
 CREATE TABLE approval_audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, approval_id TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL, recorded_at TEXT NOT NULL);
 CREATE TABLE candidate_attempts (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, body BLOB NOT NULL, digest TEXT NOT NULL, recorded_at TEXT NOT NULL);
 PRAGMA user_version=1`)
 		if err != nil {
 			return nil, err
 		}
-		if err := tx.Commit(); err != nil {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 			return nil, err
 		}
 	}
@@ -350,22 +354,29 @@ func (p *Project) SavePendingApproval(ctx context.Context, files []ExtractedFile
 		return nil, err
 	}
 	defer s.close()
-	tx, err := s.db.BeginTx(ctx, nil)
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `UPDATE approvals SET state='superseded' WHERE state IN ('pending','authorized','invalidated')`); err != nil {
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), `ROLLBACK`) }()
+	if _, err := conn.ExecContext(ctx, `UPDATE approvals SET state='superseded' WHERE state IN ('pending','authorized','invalidated')`); err != nil {
 		return nil, err
 	}
 	sum := sha256.Sum256(body)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO approvals(id,body,digest,state,created_at) VALUES(?,?,?,'pending',?)`, record.ID, body, hex.EncodeToString(sum[:]), record.CreatedAt); err != nil {
+	if _, err := conn.ExecContext(ctx, `INSERT INTO approvals(id,body,digest,state,created_at) VALUES(?,?,?,'pending',?)`, record.ID, body, hex.EncodeToString(sum[:]), record.CreatedAt); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO approval_audit(approval_id,event,detail,recorded_at) VALUES(?,'pending',?,?)`, record.ID, record.Kind, record.CreatedAt); err != nil {
+	if _, err := conn.ExecContext(ctx, `INSERT INTO approval_audit(approval_id,event,detail,recorded_at) VALUES(?,'pending',?,?)`, record.ID, record.Kind, record.CreatedAt); err != nil {
 		return nil, err
 	}
-	return record, tx.Commit()
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, err
+	}
+	return record, nil
 }
 
 func decodePendingApproval(body []byte, digest string) (*PendingApproval, error) {
@@ -386,18 +397,22 @@ func decodePendingApproval(body []byte, digest string) (*PendingApproval, error)
 }
 
 func (s *pendingApprovalStore) transition(ctx context.Context, id, state, detail string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), `ROLLBACK`) }()
 	query := `UPDATE approvals SET state=?,diagnostic=? WHERE id=? AND state IN ('pending','authorized','invalidated')`
 	if state == "applied" || state == "failed" {
 		// A completion is bound to its original record and may arrive after a
 		// newer candidate superseded it. Retain both decisions in the audit.
 		query = `UPDATE approvals SET state=?,diagnostic=? WHERE id=?`
 	}
-	result, err := tx.ExecContext(ctx, query, state, detail, id)
+	result, err := conn.ExecContext(ctx, query, state, detail, id)
 	if err != nil {
 		return err
 	}
@@ -405,10 +420,11 @@ func (s *pendingApprovalStore) transition(ctx context.Context, id, state, detail
 	if err != nil || count != 1 {
 		return fmt.Errorf("pending approval is no longer active")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO approval_audit(approval_id,event,detail,recorded_at) VALUES(?,?,?,?)`, id, state, detail, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := conn.ExecContext(ctx, `INSERT INTO approval_audit(approval_id,event,detail,recorded_at) VALUES(?,?,?,?)`, id, state, detail, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	_, err = conn.ExecContext(ctx, `COMMIT`)
+	return err
 }
 
 // LoadPendingApproval only recovers evidence. A complete postimage means an

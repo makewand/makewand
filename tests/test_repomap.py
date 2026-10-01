@@ -9,7 +9,6 @@ except ImportError:  # python3 -m unittest tests.<module>
 
 import io
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -168,8 +167,8 @@ fn test_internal_helper() {}
             lines = repo_map.splitlines()
 
             # src/engine.py should appear before tests/ and benchmarks/
-            src_idx = next(i for i, l in enumerate(lines) if "src/engine.py" in l)
-            test_idx = next(i for i, l in enumerate(lines) if "tests/test_main.py" in l)
+            src_idx = next(i for i, line in enumerate(lines) if "src/engine.py" in line)
+            test_idx = next(i for i, line in enumerate(lines) if "tests/test_main.py" in line)
             self.assertLess(src_idx, test_idx)
 
     def test_generate_repo_map_budget_truncation(self):
@@ -349,6 +348,20 @@ int calculateChecksum(const char* buffer, size_t length_of_data) {
             # core.py is referenced by 2 services, so its PageRank must exceed isolated.py
             self.assertGreater(ranks["core.py"], ranks["isolated.py"])
 
+    def test_compute_symbol_pagerank_word_boundary_precision(self):
+        from makewand.repomap import compute_symbol_pagerank, extract_file_symbols
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpp = Path(tmpdir)
+            (tmpp / "items.py").write_text("class Item:\n    def get_id(self): pass\n")
+            (tmpp / "user.py").write_text("def process(x: Item): pass\n")
+            (tmpp / "unrelated.py").write_text("def itemize_all(): pass\n")
+
+            candidates = ["items.py", "user.py", "unrelated.py"]
+            file_symbols = {p: extract_file_symbols(tmpp / p) for p in candidates}
+            ranks = compute_symbol_pagerank(tmpp, candidates, file_symbols)
+
+            self.assertGreater(ranks["items.py"], ranks["unrelated.py"])
+
     def test_extract_with_treesitter_fallback(self):
         from makewand.repomap import _extract_with_treesitter
         res = _extract_with_treesitter(Path("foo.py"), "def bar(): pass")
@@ -389,8 +402,86 @@ int calculateChecksum(const char* buffer, size_t length_of_data) {
             self.assertIsNotNone(res)
             self.assertIn("  function_definition calculate_total", res)
 
+    def test_extract_defined_names_treesitter_and_go_receivers(self):
+        from makewand.repomap import _extract_defined_names
+        syms = [
+            "  function_definition calculate_total",
+            "  class_definition MyService",
+            "    method_definition fetch_data",
+            "  struct_item Record",
+            "  type_declaration Config",
+            "  func (c *Config) Validate()",
+            "  type Handler struct",
+            "  def standalone_func()",
+            "  function_item process_batch",
+            "  trait_item Processor",
+            "  interface_declaration UserProfile",
+            "  class_specifier DatabaseEngine",
+            "  enum_declaration Status",
+        ]
+        names = _extract_defined_names(syms)
+        self.assertIn("calculate_total", names)
+        self.assertIn("MyService", names)
+        self.assertIn("fetch_data", names)
+        self.assertIn("Record", names)
+        self.assertIn("Config", names)
+        self.assertIn("Validate", names)
+        self.assertIn("Handler", names)
+        self.assertIn("standalone_func", names)
+        self.assertIn("process_batch", names)
+        self.assertIn("Processor", names)
+        self.assertIn("UserProfile", names)
+        self.assertIn("DatabaseEngine", names)
+        self.assertIn("Status", names)
+
+    def test_treesitter_captures_class_methods_at_depth(self):
+        from makewand.repomap import _extract_with_treesitter
+        from unittest.mock import MagicMock
+        import sys
+
+        mock_ts = MagicMock()
+        mock_ts_lang = MagicMock()
+        mock_parser = MagicMock()
+
+        class FakeNode:
+            def __init__(self, node_type, start_byte, end_byte, children=None):
+                self.type = node_type
+                self.start_byte = start_byte
+                self.end_byte = end_byte
+                self.children = children or []
+
+        code = "class Service:\n    def run(self):\n        pass\n"
+        # module (0) -> class_definition (1) -> block (2) -> function_definition (3) -> identifier (4)
+        m_id = FakeNode("identifier", 23, 26)
+        fn_node = FakeNode("function_definition", 19, 41, children=[m_id])
+        block_node = FakeNode("block", 14, 41, children=[fn_node])
+        c_id = FakeNode("identifier", 6, 13)
+        class_node = FakeNode("class_definition", 0, 41, children=[c_id, block_node])
+        root_node = FakeNode("module", 0, 41, children=[class_node])
+
+        mock_tree = MagicMock()
+        mock_tree.root_node = root_node
+        mock_parser.parse.return_value = mock_tree
+        mock_ts_lang.get_parser.return_value = mock_parser
+
+        with patch.dict(sys.modules, {"tree_sitter": mock_ts, "tree_sitter_languages": mock_ts_lang}):
+            res = _extract_with_treesitter(Path("service.py"), code)
+            self.assertIsNotNone(res)
+            self.assertIn("  class_definition Service", res)
+            self.assertIn("    function_definition run", res)
+
+    def test_treesitter_availability_caching(self):
+        from makewand.repomap import is_treesitter_available
+        import makewand.repomap as rm
+        # When tree_sitter is not installed and not in sys.modules
+        rm._TREESITTER_AVAILABLE = False
+        self.assertFalse(is_treesitter_available())
+        # Caching works: repeated call doesn't raise or re-import
+        self.assertFalse(is_treesitter_available())
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

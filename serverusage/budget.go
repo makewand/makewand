@@ -238,27 +238,32 @@ func entryScopes(entry Entry) []BudgetScope {
 // logAndSettle records usage and releases a durable reservation atomically.
 // Repeating the callback cannot duplicate either the usage or the charge.
 func (s *SQLiteStore) logAndSettle(entry Entry) error {
-	tx, err := s.db.Begin()
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("settle transaction: %w", err)
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), `ROLLBACK`) }()
 	var estimate int64
 	if entry.ReservationID != "" {
 		if math.IsNaN(entry.CostUSD) || math.IsInf(entry.CostUSD, 0) || entry.CostUSD < 0 {
 			return fmt.Errorf("invalid settlement cost")
 		}
-		if _, err = tx.Exec(`UPDATE budget_reservations SET state=state WHERE request_id=?`, entry.ReservationID); err != nil {
+		if _, err = conn.ExecContext(ctx, `UPDATE budget_reservations SET state=state WHERE request_id=?`, entry.ReservationID); err != nil {
 			return err
 		}
 		var state string
-		if err = tx.QueryRow(`SELECT state,estimate_micro_usd FROM budget_reservations WHERE request_id=?`, entry.ReservationID).Scan(&state, &estimate); err != nil {
+		if err = conn.QueryRowContext(ctx, `SELECT state,estimate_micro_usd FROM budget_reservations WHERE request_id=?`, entry.ReservationID).Scan(&state, &estimate); err != nil {
 			return fmt.Errorf("settle reservation: %w", err)
 		}
 		if state == "settled" {
 			return nil
 		}
-		rows, err := tx.Query(`SELECT kind,scope_id,period FROM budget_reservation_scopes WHERE request_id=?`, entry.ReservationID)
+		rows, err := conn.QueryContext(ctx, `SELECT kind,scope_id,period FROM budget_reservation_scopes WHERE request_id=?`, entry.ReservationID)
 		if err != nil {
 			return err
 		}
@@ -292,7 +297,7 @@ func (s *SQLiteStore) logAndSettle(entry Entry) error {
 		entry.CostUSD = float64(estimate) / 1_000_000
 		entry.EstimatedCost = true
 	}
-	if err = insertUsage(tx, entry); err != nil {
+	if err = insertUsage(ctx, conn, entry); err != nil {
 		return err
 	}
 	actual := MicroUSD(entry.CostUSD)
@@ -301,18 +306,19 @@ func (s *SQLiteStore) logAndSettle(entry Entry) error {
 			if scope.ID == "" {
 				continue
 			}
-			if _, err = tx.Exec(`UPDATE budget_accounts SET settled_micro_usd=settled_micro_usd+? WHERE kind=? AND scope_id=? AND period=?`, actual, scope.Kind, scope.ID, scope.Period); err != nil {
+			if _, err = conn.ExecContext(ctx, `UPDATE budget_accounts SET settled_micro_usd=settled_micro_usd+? WHERE kind=? AND scope_id=? AND period=?`, actual, scope.Kind, scope.ID, scope.Period); err != nil {
 				return err
 			}
 		}
 	}
 	if entry.ReservationID != "" {
-		if _, err = tx.Exec(`UPDATE budget_accounts SET reserved_micro_usd=reserved_micro_usd-? WHERE (kind,scope_id,period) IN (SELECT kind,scope_id,period FROM budget_reservation_scopes WHERE request_id=?)`, estimate, entry.ReservationID); err != nil {
+		if _, err = conn.ExecContext(ctx, `UPDATE budget_accounts SET reserved_micro_usd=reserved_micro_usd-? WHERE (kind,scope_id,period) IN (SELECT kind,scope_id,period FROM budget_reservation_scopes WHERE request_id=?)`, estimate, entry.ReservationID); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`UPDATE budget_reservations SET state='settled',actual_micro_usd=? WHERE request_id=?`, actual, entry.ReservationID); err != nil {
+		if _, err = conn.ExecContext(ctx, `UPDATE budget_reservations SET state='settled',actual_micro_usd=? WHERE request_id=?`, actual, entry.ReservationID); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	_, err = conn.ExecContext(ctx, `COMMIT`)
+	return err
 }

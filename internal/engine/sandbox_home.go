@@ -284,6 +284,8 @@ func sandboxMaskedRoots(workspace string) []string {
 
 // sandboxWorkspaceSocketMasks scans the workspace for pre-existing AF_UNIX domain sockets
 // and masks them with /dev/null so sandboxed commands cannot connect to host daemons.
+// Note: It intentionally does NOT skip ignored directories (like .git, node_modules, .cache),
+// because sockets placed in those subdirectories are still connectable from the sandbox.
 func sandboxWorkspaceSocketMasks(workspace string) []string {
 	var out []string
 	cleanWS := filepath.Clean(workspace)
@@ -293,13 +295,9 @@ func sandboxWorkspaceSocketMasks(workspace string) []string {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == ".venv" || name == "vendor" {
-				return filepath.SkipDir
-			}
 			return nil
 		}
-		if count >= 64 {
+		if count >= 512 {
 			return filepath.SkipAll
 		}
 		info, err := d.Info()

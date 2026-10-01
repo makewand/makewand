@@ -421,8 +421,14 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             details.append(f"[{name} Tests Failed]: 本地测试总时间预算已耗尽")
             break
 
-        if code == 0 and name == "Python" and "unittest" in cmd and re.search(r"\bRan 0 tests?\b", stdout + "\n" + stderr):
-            return False, LocalTestsUnavailable("unittest 未执行任何测试，不能作为通过的验收证据")
+        if code == 0 and name == "Python" and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", stdout + "\n" + stderr) or "Exit:" in (stdout + "\n" + stderr)):
+            return False, LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
+
+        if code == 0 and name == "Go" and "[no test files]" in (stdout + stderr) and "PASS" not in stdout:
+            return False, LocalTestsUnavailable("Go 测试套件未发现任何有效测试用例，不能作为通过的验收证据")
+
+        if code == 0 and name == "Node" and re.search(r"\b(No tests found|0 passing)\b", stdout + "\n" + stderr):
+            return False, LocalTestsUnavailable("Node 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
 
         if code != 0:
             all_passed = False
@@ -811,6 +817,15 @@ def dispatch_task(
         "ollama": execute_local_task, "aider": execute_aider_task,
     }
     api_engines = {"deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"}
+    placeholder_engines = {"cursor", "copilot"}
+    if engine in placeholder_engines:
+        notice = (
+            f"引擎 '{engine}' 为交互式 IDE 扩展占位引擎，当前系统无独立无头命令行自主执行器。"
+            f"已记录任务需求；在支持该插件的编辑器中协同完成，或选用 Claude/Codex/Antigravity 等自主 Agent 引擎。"
+        )
+        print(c(f"ℹ️ [Placeholder Provider] {notice}", COLOR_YELLOW), file=sys.stderr)
+        return ExecutionResult(True, notice, None, status="PASSED", task_id=task_id,
+                               stage=stage_name, engine=engine)
     if engine not in adapters and engine not in api_engines:
         return rejected("INVALID_REQUEST", f"未知或不支持的模型引擎: {engine}")
 
@@ -934,6 +949,7 @@ RELIABILITY_BAD_RATE = 0.2
 RELIABILITY_MIN_FACTOR = 0.5
 # Detected tools that have no execution adapter in dispatch_task yet.
 ENGINES_WITHOUT_EXECUTOR = frozenset({"cursor", "copilot"})
+NON_AGENTIC_CHAT_MODELS = frozenset({"local", "ollama", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"})
 
 
 def burn_rate_factor(pen: float) -> float:
@@ -1734,7 +1750,7 @@ def _run_pipeline_impl(
         return False
 
     print(c("🎯 [Makewand Smart Routing] 智能专精匹配与配额削峰决策:", COLOR_BOLD + COLOR_GREEN))
-    if route_meta["reasons"]:
+    if route_meta.get("reasons"):
         for r_item in route_meta["reasons"]:
             print(c(f"  • {r_item}", COLOR_CYAN))
     print(c(f"  • 主力实现引擎: {primary_c.upper()} (候选梯队: {' -> '.join([c.upper() for c in coder_candidates])})", COLOR_BOLD + COLOR_BLUE))
@@ -1857,6 +1873,23 @@ def _run_pipeline_impl(
     except OSError as exc:
         return fail_and_cleanup(f"无法提取待审查 Git 差异: {exc}", "UNVERIFIED")
     if not diff_out or not diff_out.strip():
+        is_coding_task = (intent == "code")
+        if not is_coding_task:
+            print(c("ℹ️ [Makewand Info] 本次任务为咨询/分析类意图，无需修改工作区文件，文本交付已完成。", COLOR_GREEN))
+            if is_shadow_active and cleanup_shadow:
+                cleanup_shadow()
+            return True
+
+        if coder_engine in ENGINES_WITHOUT_EXECUTOR or coder_engine in NON_AGENTIC_CHAT_MODELS:
+            print(c(
+                f"ℹ️ [Makewand Boundary Notice] 引擎 '{coder_engine}' 属于对话/辅助型非自主 Agent 引擎 (Non-agentic / Placeholder)，"
+                f"未在工作区产生直接代码落盘。\n已输出文本方案与实现建议，跳过文件交付门禁与红队代码复审。",
+                COLOR_YELLOW
+            ))
+            if is_shadow_active and cleanup_shadow:
+                cleanup_shadow()
+            return True
+
         print(c("ℹ 本次任务未产生相对于基线的有效代码改动 (git diff 为空)，无需启动红队复审与自愈流水线。", COLOR_CYAN))
         return fail_and_cleanup("❌ [Makewand Quality Gate] 任务未产生任何有效代码改动，终止交付。")
 

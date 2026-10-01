@@ -19,8 +19,9 @@ import (
 // SQLiteStore persists token rules in SQLite while keeping active grants
 // resident in memory for efficient quota and budget accounting.
 type SQLiteStore struct {
-	path string
-	db   *sql.DB
+	path   string
+	db     *sql.DB
+	ownsDB bool
 
 	// mutationMu serializes a whole mutation+reload (Issue/Revoke) so two
 	// concurrent writers cannot each SELECT the table, build a grants snapshot,
@@ -40,20 +41,32 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	store, err := NewSQLiteStoreWithDB(db, path)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	store.ownsDB = true
+	return store, nil
+}
+
+// NewSQLiteStoreWithDB initializes a token store using an existing shared database handle.
+func NewSQLiteStoreWithDB(db *sql.DB, path string) (*SQLiteStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("sqlite db is nil")
+	}
 	store := &SQLiteStore{
-		path: path,
-		db:   db,
+		path:   path,
+		db:     db,
+		ownsDB: false,
 	}
 	if err := store.ensureSchema(); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	if err := store.reload(); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	if err := store.loadUsageCounters(); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
@@ -243,9 +256,9 @@ func formatUsageTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-// Close releases the underlying database handle.
+// Close releases the underlying database handle if owned.
 func (s *SQLiteStore) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil || s.db == nil || !s.ownsDB {
 		return nil
 	}
 	return s.db.Close()

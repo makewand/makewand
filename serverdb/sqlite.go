@@ -1,11 +1,14 @@
 package serverdb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -37,14 +40,11 @@ func Open(path string) (*sql.DB, error) {
 	if err = file.Close(); err != nil {
 		return nil, err
 	}
-	// busy_timeout and foreign_keys are per-CONNECTION settings. database/sql
-	// pools connections and opens new ones on demand, so setting them with a
-	// single db.Exec would configure only whichever connection happened to run
-	// it — every other pooled connection would silently get busy_timeout=0 and
-	// foreign_keys=OFF. modernc.org/sqlite applies `_pragma` DSN options to every
-	// connection it opens, so encode them there instead. journal_mode=WAL is a
-	// persistent database-level setting, so a one-time Exec below is sufficient.
-	dsn := path + "?_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)"
+	// busy_timeout, foreign_keys and synchronous are per-CONNECTION settings.
+	// modernc.org/sqlite applies `_pragma` DSN options to every connection it opens,
+	// so encode them there instead of single db.Exec. journal_mode=WAL is a
+	// persistent database-level setting, configured via Exec below.
+	dsn := path + "?_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -56,4 +56,45 @@ func Open(path string) (*sql.DB, error) {
 	// Serialize connections to 1 to eliminate write-lock contention under concurrent goroutines.
 	db.SetMaxOpenConns(1)
 	return db, nil
+}
+
+// Checkpoint performs a passive WAL checkpoint (PRAGMA wal_checkpoint(PASSIVE)).
+func Checkpoint(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	_, err := db.Exec(`PRAGMA wal_checkpoint(PASSIVE);`)
+	return err
+}
+
+// StartWALCheckpointLoop starts a periodic goroutine that performs passive WAL checkpoints.
+// Returns a stop function that waits for the loop to terminate and runs a final checkpoint.
+func StartWALCheckpointLoop(ctx context.Context, db *sql.DB, interval time.Duration) func() {
+	if db == nil || interval <= 0 {
+		return func() {}
+	}
+	checkpointCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-checkpointCtx.Done():
+				return
+			case <-ticker.C:
+				_ = Checkpoint(db)
+			}
+		}
+	}()
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			cancel()
+			wg.Wait()
+			_ = Checkpoint(db)
+		})
+	}
 }

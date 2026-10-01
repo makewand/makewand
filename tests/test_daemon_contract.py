@@ -395,6 +395,82 @@ class DaemonSocketTests(unittest.TestCase):
         self.assertEqual(pong["active_requests"], 1)
         self.assertEqual(pong["max_workers"], 1)
 
+    def test_slot_saturation_retries_and_succeeds_when_slot_frees_up(self):
+        path = self.start_server(max_workers=1)
+        long_request = _request(["long"], self.root)
+        client = self.connect(long_request)
+        _messages(client, until="out")
+
+        def release_slot_later():
+            time.sleep(0.08)
+            client.close()
+
+        releaser = threading.Thread(target=release_slot_later)
+        releaser.start()
+        try:
+            with patch("makewand.daemon.get_daemon_socket_path", return_value=path):
+                code = daemon.try_dispatch_via_daemon(["once"], cwd=str(self.root), timeout=3, max_retries=6)
+            self.assertEqual(code, 0)
+            self.assertTrue((self.root / "count").exists())
+        finally:
+            releaser.join()
+
+    def test_slot_saturation_fallback_to_standalone_when_retries_exhausted(self):
+        path = self.start_server(max_workers=1)
+        long_request = _request(["long"], self.root)
+        client = self.connect(long_request)
+        _messages(client, until="out")
+        try:
+            with patch("makewand.daemon.get_daemon_socket_path", return_value=path), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                code = daemon.try_dispatch_via_daemon(["once"], cwd=str(self.root), timeout=0.15, max_retries=2, fallback_on_busy=True)
+            self.assertIsNone(code)
+            self.assertFalse((self.root / "count").exists())
+        finally:
+            client.close()
+
+    def test_slot_saturation_returns_busy_when_fallback_disabled(self):
+        path = self.start_server(max_workers=1)
+        long_request = _request(["long"], self.root)
+        client = self.connect(long_request)
+        _messages(client, until="out")
+        try:
+            with patch("makewand.daemon.get_daemon_socket_path", return_value=path), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                code = daemon.try_dispatch_via_daemon(["once"], cwd=str(self.root), timeout=0.15, max_retries=2, fallback_on_busy=False)
+            self.assertEqual(code, EXIT_BUSY)
+            self.assertFalse((self.root / "count").exists())
+        finally:
+            client.close()
+
+    def test_slot_saturation_keyboard_interrupt_returns_cancelled(self):
+        path = self.start_server(max_workers=1)
+        long_request = _request(["long"], self.root)
+        client = self.connect(long_request)
+        _messages(client, until="out")
+        try:
+            with patch("makewand.daemon.get_daemon_socket_path", return_value=path), \
+                 patch("time.sleep", side_effect=KeyboardInterrupt("user interrupt")), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                code = daemon.try_dispatch_via_daemon(["once"], cwd=str(self.root), timeout=2, max_retries=3)
+            self.assertEqual(code, daemon.EXIT_CANCELLED)
+        finally:
+            client.close()
+
+    def test_slot_saturation_honors_daemon_require_env(self):
+        path = self.start_server(max_workers=1)
+        long_request = _request(["long"], self.root)
+        client = self.connect(long_request)
+        _messages(client, until="out")
+        try:
+            with patch("makewand.daemon.get_daemon_socket_path", return_value=path), \
+                 patch.dict(os.environ, {"MAKEWAND_DAEMON_REQUIRE": "1"}), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                code = daemon.try_dispatch_via_daemon(["once"], cwd=str(self.root), timeout=0.15, max_retries=1)
+            self.assertEqual(code, EXIT_BUSY)
+        finally:
+            client.close()
+
     def test_duplicate_request_id_never_reexecutes(self):
         self.start_server()
         request = _request(["once"], self.root)

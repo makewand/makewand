@@ -13,6 +13,7 @@ from pathlib import Path
 from makewand import call_budget
 from makewand.execution_contract import ExecutionRequest, ExecutionResult, identifier
 
+TIMEOUT_SOFT_GRACE = float(os.environ.get("MAKEWAND_TIMEOUT_SOFT_GRACE", "0.02"))
 _context = contextvars.ContextVar("makewand_execution", default=None)
 
 
@@ -214,12 +215,31 @@ def execute(request, callback):
                     value = callback(remaining)
                     elapsed = max(0, int((time.monotonic() - started) * 1000))
                     result = _normalize(request, value, elapsed, attempt)
-                    if deadline is not None and time.monotonic() > deadline:
-                        result = _result(request, "TIMEOUT", output=result.output,
+                    if deadline is not None and time.monotonic() > deadline + TIMEOUT_SOFT_GRACE:
+                        sanitized_out = result.output.replace("\0", "") if isinstance(result.output, str) else result.output
+                        result = _result(request, "TIMEOUT", output=sanitized_out,
                             error="execution deadline expired", attempt_id=attempt,
                             duration_ms=elapsed, error_kind="deadline", outcome_known=False)
-                except (TimeoutError, subprocess.TimeoutExpired):
-                    result = _result(request, "TIMEOUT", error="provider execution timed out", attempt_id=attempt,
+                except (TimeoutError, subprocess.TimeoutExpired) as exc:
+                    output = (
+                        getattr(exc, "output", None)
+                        or getattr(exc, "stdout", None)
+                        or getattr(exc, "partial_output", None)
+                        or getattr(exc, "text", None)
+                    )
+                    if isinstance(output, bytes):
+                        output = output.decode("utf-8", errors="replace")
+                    if isinstance(output, str):
+                        output = output.replace("\0", "")
+                    error = "provider execution timed out"
+                    stderr = getattr(exc, "stderr", None)
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode("utf-8", errors="replace")
+                    if isinstance(stderr, str):
+                        stderr = stderr.replace("\0", "").strip()
+                    if stderr:
+                        error = f"{error}: {stderr}"
+                    result = _result(request, "TIMEOUT", output=output, error=error, attempt_id=attempt,
                         duration_ms=max(0, int((time.monotonic() - started) * 1000)), error_kind="deadline", outcome_known=False)
                 except (KeyboardInterrupt, SystemExit) as error:
                     interruption = error

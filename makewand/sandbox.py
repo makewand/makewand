@@ -1355,6 +1355,53 @@ def audit_unsafe_host_exec(context: str, cmd, cwd: str, source: Optional[str]) -
         _warn(f"unsafe host exec audit write failed: {exc}")
 
 
+def apply_posix_sandbox_rlimits():
+    """Apply POSIX rlimits (RLIMIT_AS, RLIMIT_NPROC, RLIMIT_FSIZE) on child processes where supported."""
+    if os.name != "posix":
+        return
+    try:
+        import resource
+    except ImportError:
+        return
+
+    # RLIMIT_FSIZE: Max file size writable by process (default: 1 GiB)
+    try:
+        fsize_bytes = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_FSIZE", 1024 * 1024 * 1024))
+        cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        if cur_hard == resource.RLIM_INFINITY or cur_hard < 0:
+            soft = fsize_bytes
+        else:
+            soft = min(fsize_bytes, cur_hard)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, cur_hard))
+    except Exception:
+        pass
+
+    # RLIMIT_AS: Max virtual address space (default: 16 GiB)
+    try:
+        as_bytes = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_AS", 16 * 1024 * 1024 * 1024))
+        cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_AS)
+        if cur_hard == resource.RLIM_INFINITY or cur_hard < 0:
+            soft = as_bytes
+        else:
+            soft = min(as_bytes, cur_hard)
+        resource.setrlimit(resource.RLIMIT_AS, (soft, cur_hard))
+    except Exception:
+        pass
+
+    # RLIMIT_NPROC: Max number of processes/threads for UID (default: 65536)
+    try:
+        nproc_limit = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_NPROC", 65536))
+        cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        effective_limit = max(nproc_limit, cur_soft) if cur_soft > 0 else nproc_limit
+        if cur_hard == resource.RLIM_INFINITY or cur_hard < 0:
+            soft = effective_limit
+        else:
+            soft = min(effective_limit, cur_hard)
+        resource.setrlimit(resource.RLIMIT_NPROC, (soft, cur_hard))
+    except Exception:
+        pass
+
+
 def run_in_sandbox(
     cmd: List[str],
     workspace: str,
@@ -1442,7 +1489,8 @@ def run_in_sandbox(
             cwd=workspace,
             stream=stream,
             print_prefix=print_prefix,
-            pass_fds=pass_fds
+            pass_fds=pass_fds,
+            preexec_fn=apply_posix_sandbox_rlimits,
         )
     finally:
         if seccomp_r is not None:

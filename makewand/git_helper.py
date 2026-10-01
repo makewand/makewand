@@ -50,6 +50,7 @@ SAFE_GIT_SECURITY_FLAGS = [
 
 def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path]:
     paths: List[Path] = []
+    seen_dirs = set()
     try:
         p = Path(cwd).resolve() if cwd else Path.cwd().resolve()
         for cur in [p] + list(p.parents):
@@ -75,9 +76,26 @@ def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path
                 except Exception:
                     pass
             for gdir in git_dirs:
-                ia = gdir / "info" / "attributes"
-                if ia.exists() and ia not in paths:
-                    paths.append(ia)
+                try:
+                    resolved_dir = gdir.resolve()
+                except Exception:
+                    resolved_dir = gdir
+                if resolved_dir not in seen_dirs:
+                    seen_dirs.add(resolved_dir)
+                    info_dir = resolved_dir / "info"
+                    ia = info_dir / "attributes"
+                    gate_file = info_dir / "attributes.mw_gate"
+                    needs_shield = False
+                    if ia.exists() or gate_file.exists():
+                        needs_shield = True
+                    elif info_dir.is_dir():
+                        try:
+                            if any(info_dir.glob("attributes.*shield_*")):
+                                needs_shield = True
+                        except Exception:
+                            pass
+                    if needs_shield:
+                        paths.append(ia)
             if gp.exists():
                 break
     except Exception:
@@ -85,7 +103,7 @@ def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path
     return paths
 
 def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout=None):
-    shielded_infos: List[Tuple[Path, Path]] = []
+    shielded_infos: List[Tuple[Any, ...]] = []
     if timeout is None:
         timeout = get_git_timeout()
     try:
@@ -138,26 +156,86 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                 git_env["GIT_INDEX_FILE"] = _diff_index.get()
             git_env["GIT_OPTIONAL_LOCKS"] = "0"
 
-            # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees
-            ia_targets = _get_git_info_attributes_paths(cwd)
+            # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees.
+            # Use deterministic sorting and attributes.lock file locking to avoid multi-session collisions.
+            ia_targets = sorted(_get_git_info_attributes_paths(cwd), key=lambda p: str(p.resolve()))
             for ia_target in ia_targets:
-                if not ia_target.exists():
-                    # Self-healing: restore any orphaned shield files from a crashed previous run
-                    try:
-                        orphans = sorted(ia_target.parent.glob(ia_target.name + ".makewand_shield_*"))
-                        if orphans:
+                info_dir = ia_target.parent
+                try:
+                    info_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                lock_file = info_dir / "attributes.mw_gate"
+                lock_handle = None
+                try:
+                    lock_handle = open(lock_file, "a+", encoding="utf-8")
+                    from makewand import filelock
+                    start_t = time.monotonic()
+                    lock_timeout = timeout if timeout is not None else get_git_timeout()
+                    acquired = False
+                    while time.monotonic() - start_t < lock_timeout:
+                        try:
+                            filelock.flock(lock_handle, filelock.LOCK_EX | filelock.LOCK_NB)
+                            acquired = True
+                            break
+                        except (OSError, BlockingIOError):
+                            time.sleep(0.01)
+                    if not acquired:
+                        raise OSError("timed out acquiring attributes lock")
+                except Exception as exc:
+                    if lock_handle is not None:
+                        try:
+                            lock_handle.close()
+                        except Exception:
+                            pass
+                    raise OSError(f"Cannot shield Git attributes at {ia_target}: {exc}") from exc
+
+                # Under lock: self-heal any orphaned shield files from an aborted previous run
+                try:
+                    orphans = sorted(
+                        list(info_dir.glob(ia_target.name + ".makewand_shield_*"))
+                        + list(info_dir.glob(ia_target.name + ".mw_shield_*"))
+                    )
+                    if orphans:
+                        if not ia_target.exists():
                             orphans[0].rename(ia_target)
                             for extra_orphan in orphans[1:]:
                                 extra_orphan.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                        else:
+                            for stale_orphan in orphans:
+                                stale_orphan.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                # If the attributes file is present, rename it to mask clean/smudge filters
                 if ia_target.exists():
                     try:
-                        shield_file = ia_target.parent / (ia_target.name + f".makewand_shield_{os.getpid()}_{len(shielded_infos)}")
+                        shield_file = info_dir / (ia_target.name + f".makewand_shield_{os.getpid()}_{len(shielded_infos)}")
                         ia_target.rename(shield_file)
-                        shielded_infos.append((ia_target, shield_file))
-                    except OSError as exc:
+                        shielded_infos.append((ia_target, shield_file, lock_handle))
+                    except Exception as exc:
+                        try:
+                            from makewand import filelock
+                            filelock.flock(lock_handle, filelock.LOCK_UN)
+                        except Exception:
+                            pass
+                        try:
+                            lock_handle.close()
+                        except Exception:
+                            pass
                         raise OSError(f"Cannot shield Git attributes at {ia_target}: {exc}") from exc
+                else:
+                    # No attributes file exists; release lock immediately so operations on repositories
+                    # without attributes do not block each other during git execution.
+                    try:
+                        from makewand import filelock
+                        filelock.flock(lock_handle, filelock.LOCK_UN)
+                    except Exception:
+                        pass
+                    try:
+                        lock_handle.close()
+                    except Exception:
+                        pass
 
         # Git emits UTF-8 text independently of the Windows ANSI code page.
         # Preserve undecodable bytes rather than crashing a pipe reader; binary
@@ -180,12 +258,26 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
         empty = b"" if (isinstance(input_data, bytes) or binary) else ""
         return -1, empty, str(e)
     finally:
-        for orig_ia, shield_ia in shielded_infos:
-            try:
-                if shield_ia.exists():
-                    shield_ia.rename(orig_ia)
-            except Exception:
-                pass
+        for item in reversed(shielded_infos):
+            orig_ia = item[0]
+            shield_ia = item[1]
+            lock_handle = item[2] if len(item) > 2 else None
+            if shield_ia is not None:
+                try:
+                    if shield_ia.exists():
+                        shield_ia.rename(orig_ia)
+                except Exception:
+                    pass
+            if lock_handle is not None:
+                try:
+                    from makewand import filelock
+                    filelock.flock(lock_handle, filelock.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    lock_handle.close()
+                except Exception:
+                    pass
 
 def _is_git_marker(marker: Path) -> bool:
     """True for a real repository marker: a .git directory with HEAD or a gitdir file.
@@ -544,6 +636,105 @@ def list_workspace_copy_paths(src_dir: Union[str, Path]) -> List[str]:
     return sorted({os.fsdecode(name) for name in out.split(b"\0") if name})
 
 
+_REFLINK_SUPPORTED: Optional[bool] = None
+
+
+def _is_reflink_supported() -> bool:
+    """Checks whether kernel copy_file_range is supported on this platform."""
+    global _REFLINK_SUPPORTED
+    if _REFLINK_SUPPORTED is not None:
+        return _REFLINK_SUPPORTED
+    if os.name == "nt":
+        _REFLINK_SUPPORTED = False
+        return False
+    _REFLINK_SUPPORTED = hasattr(os, "copy_file_range")
+    return _REFLINK_SUPPORTED
+
+
+def _copy_file_range(src_item: Path, dst_item: Path) -> bool:
+    """
+    Attempts zero-overhead kernel copy using os.copy_file_range.
+    Preserves file permissions and metadata via shutil.copystat.
+    Returns True if copy succeeded, False otherwise.
+    """
+    if not hasattr(os, "copy_file_range") or os.name == "nt":
+        return False
+    src_fd = None
+    dst_fd = None
+    try:
+        src_fd = os.open(str(src_item), os.O_RDONLY)
+        st = os.fstat(src_fd)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        total_bytes = st.st_size
+        # Ensure user write permission during copy; copystat restores original mode and metadata later
+        dst_fd = os.open(str(dst_item), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, (st.st_mode & 0o777) | 0o600)
+        copied = 0
+        while copied < total_bytes:
+            chunk = min(total_bytes - copied, 1 << 30)  # 1GB chunk
+            n = os.copy_file_range(src_fd, dst_fd, chunk)
+            if n == 0:
+                break
+            copied += n
+        if copied != total_bytes:
+            if dst_fd is not None:
+                try:
+                    os.close(dst_fd)
+                except Exception:
+                    pass
+                dst_fd = None
+            try:
+                dst_item.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+        # Close write descriptor before copying metadata and timestamps
+        if dst_fd is not None:
+            try:
+                os.close(dst_fd)
+            except Exception:
+                pass
+            dst_fd = None
+        try:
+            shutil.copystat(src_item, dst_item, follow_symlinks=False)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        if dst_fd is not None:
+            try:
+                os.close(dst_fd)
+            except Exception:
+                pass
+            dst_fd = None
+        try:
+            dst_item.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+    finally:
+        if dst_fd is not None:
+            try:
+                os.close(dst_fd)
+            except Exception:
+                pass
+        if src_fd is not None:
+            try:
+                os.close(src_fd)
+            except Exception:
+                pass
+
+
+def _copy_file_with_reflink(src_item: Path, dst_item: Path):
+    """
+    Copies a regular file using kernel copy_file_range where supported to avoid
+    subprocess overhead and physical copy duplication, falling back to shutil.copy2.
+    """
+    if _copy_file_range(src_item, dst_item):
+        return
+    shutil.copy2(src_item, dst_item, follow_symlinks=False)
+
+
 def clone_isolated_worktree(src_dir: str, target_dir: Path):
     """
     Safely copies a workspace into an isolated directory for race or testing.
@@ -606,7 +797,7 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
                     dst_item.mkdir(parents=True, exist_ok=True)
                     copy_inputs(src_item, dst_item)
                 elif src_item.is_file():
-                    shutil.copy2(src_item, dst_item, follow_symlinks=False)
+                    _copy_file_with_reflink(src_item, dst_item)
                     copied_paths.add(dst_item.relative_to(target_dir).as_posix())
             except OSError as exc:
                 copy_errors.append(f"{src_item.relative_to(resolved)}: {exc}")

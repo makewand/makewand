@@ -229,6 +229,35 @@ class ExecutionRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "TIMEOUT")
         self.assertFalse(result.outcome_known)
 
+    def test_timeout_preserves_partial_output_from_exception(self):
+        def timed_out_with_output(timeout):
+            raise subprocess.TimeoutExpired("model-cmd", timeout, output=b"partial generated code...", stderr=b"timeout err")
+        result = execute(self.request(), timed_out_with_output)
+        self.assertEqual(result.status, "TIMEOUT")
+        self.assertEqual(result.output, "partial generated code...")
+        self.assertIn("provider execution timed out", result.error)
+        self.assertIn("timeout err", result.error)
+
+    def test_timeout_preserves_output_with_null_bytes(self):
+        def timed_out_with_nulls(timeout):
+            raise subprocess.TimeoutExpired("model-cmd", timeout, output=b"valid code\x00with null", stderr=b"err\x00msg")
+        result = execute(self.request(), timed_out_with_nulls)
+        self.assertEqual(result.status, "TIMEOUT")
+        self.assertEqual(result.output, "valid codewith null")
+        self.assertIn("provider execution timed out", result.error)
+        self.assertIn("errmsg", result.error)
+
+    def test_timeout_soft_grace_allows_minor_jitter(self):
+        # Monotonic time advances by 105ms on a 100ms timeout (5ms over, within 20ms soft grace)
+        monotonic = [100.0]
+        def timely_with_slight_jitter(timeout):
+            monotonic[0] += 0.105
+            return True, "successful code generation", None
+        with patch("makewand.execution_runtime.time.monotonic", side_effect=lambda: monotonic[0]):
+            result = execute(self.request(timeout_ms=100), timely_with_slight_jitter)
+        self.assertEqual(result.status, "PASSED")
+        self.assertEqual(result.output, "successful code generation")
+
     def test_invalid_adapter_and_interruption_still_complete_accounting(self):
         result = execute(self.request(), lambda timeout: ("truthy", "bad", None))
         self.assertEqual(result.status, "UNKNOWN")

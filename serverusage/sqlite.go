@@ -1,6 +1,7 @@
 package serverusage
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -26,8 +27,9 @@ const sinceBoundaryLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
 // SQLiteStore persists usage entries in SQLite.
 type SQLiteStore struct {
-	path string
-	db   *sql.DB
+	path   string
+	db     *sql.DB
+	ownsDB bool
 }
 
 // OpenSQLiteStore opens or creates a SQLite-backed usage store.
@@ -36,9 +38,22 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &SQLiteStore{path: path, db: db}
-	if err := store.ensureSchema(); err != nil {
+	store, err := NewSQLiteStoreWithDB(db, path)
+	if err != nil {
 		_ = db.Close()
+		return nil, err
+	}
+	store.ownsDB = true
+	return store, nil
+}
+
+// NewSQLiteStoreWithDB initializes a usage store using an existing shared database handle.
+func NewSQLiteStoreWithDB(db *sql.DB, path string) (*SQLiteStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("sqlite db is nil")
+	}
+	store := &SQLiteStore{path: path, db: db, ownsDB: false}
+	if err := store.ensureSchema(); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -96,9 +111,9 @@ CREATE INDEX IF NOT EXISTS usage_request ON usage_entries(request_id);
 	return s.ensureBudgetSchema()
 }
 
-// Close closes the underlying database handle.
+// Close closes the underlying database handle if owned.
 func (s *SQLiteStore) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil || s.db == nil || !s.ownsDB {
 		return nil
 	}
 	return s.db.Close()
@@ -126,11 +141,11 @@ func (s *SQLiteStore) Log(entry Entry) error {
 }
 
 type sqlExecer interface {
-	Exec(query string, args ...any) (sql.Result, error)
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func insertUsage(exec sqlExecer, entry Entry) error {
-	_, err := exec.Exec(`
+func insertUsage(ctx context.Context, exec sqlExecer, entry Entry) error {
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO usage_entries (
   timestamp, request_id, token_id, token_description, user_id, organization_id, project_id, requested_mode,
   requested_model, actual_provider, status, duration_ms, prompt_tokens,

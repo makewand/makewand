@@ -29,6 +29,7 @@ import (
 	"github.com/makewand/makewand/serveralerts"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverdb"
 	"github.com/makewand/makewand/serverhttp"
 	"github.com/makewand/makewand/servermetrics"
 	"github.com/makewand/makewand/serverteam"
@@ -187,7 +188,16 @@ func serveCmd() *cobra.Command {
 				stopTokenFlush = func() {}
 			)
 			if strings.TrimSpace(stateDBPath) != "" {
-				sqliteTokens, err := serverauth.OpenSQLiteStore(stateDBPath)
+				stateDB, err := serverdb.Open(stateDBPath)
+				if err != nil {
+					return fmt.Errorf("open sqlite state database: %w", err)
+				}
+				defer stateDB.Close()
+
+				stopCheckpoint := serverdb.StartWALCheckpointLoop(context.Background(), stateDB, 60*time.Second)
+				defer stopCheckpoint()
+
+				sqliteTokens, err := serverauth.NewSQLiteStoreWithDB(stateDB, stateDBPath)
 				if err != nil {
 					return fmt.Errorf("open sqlite token store: %w", err)
 				}
@@ -241,7 +251,7 @@ func serveCmd() *cobra.Command {
 				}
 				defer stopTokenFlush()
 
-				sqliteUsage, err := serverusage.OpenSQLiteStore(stateDBPath)
+				sqliteUsage, err := serverusage.NewSQLiteStoreWithDB(stateDB, stateDBPath)
 				if err != nil {
 					return fmt.Errorf("open sqlite usage store: %w", err)
 				}
@@ -250,7 +260,7 @@ func serveCmd() *cobra.Command {
 				budgetStore = sqliteUsage
 				usageLogger = combineUsageLoggers(usageLogger, sqliteUsage)
 
-				sqliteTeams, err := serverteam.OpenSQLiteStore(stateDBPath)
+				sqliteTeams, err := serverteam.NewSQLiteStoreWithDB(stateDB, stateDBPath)
 				if err != nil {
 					return fmt.Errorf("open sqlite team store: %w", err)
 				}
@@ -258,7 +268,7 @@ func serveCmd() *cobra.Command {
 				teamStore = sqliteTeams
 
 				if enableUsers {
-					sqliteUsers, err := router.OpenSQLiteUserStore(stateDBPath)
+					sqliteUsers, err := router.NewSQLiteUserStoreWithDB(stateDB, stateDBPath)
 					if err != nil {
 						return fmt.Errorf("open sqlite user store: %w", err)
 					}

@@ -145,7 +145,7 @@ class TestGitHelper(unittest.TestCase):
             self.assertFalse(Path(wt_dir).parent.exists())
 
     def test_symlink_containment_and_jailbreak_defense(self):
-        from makewand.git_helper import create_ephemeral_shadow_worktree, run_git_cmd, get_git_diff
+        from makewand.git_helper import create_ephemeral_shadow_worktree, run_git_cmd
         from makewand.sandbox import is_bwrap_available, wrap_bwrap, run_subprocess
         from unittest.mock import patch
 
@@ -403,6 +403,123 @@ except OSError:
             res_non_git = get_dirty_files(str(non_git))
             self.assertIn("script.py", res_non_git)
 
+    def test_git_info_attributes_shielded_concurrently(self):
+        import concurrent.futures
+        from makewand.git_helper import run_git_cmd
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            marker = Path(td) / "clean_marker"
+            repo.mkdir()
+
+            run_git_cmd(["git", "init"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=str(repo))
+            (repo / "f.txt").write_text("base")
+            run_git_cmd(["git", "add", "f.txt"], cwd=str(repo))
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=str(repo))
+
+            run_git_cmd(["git", "config", "filter.harmful.clean", f"cat; printf leaked > {marker}"], cwd=str(repo))
+            attr_file = repo / ".git" / "info" / "attributes"
+            attr_content = "*.txt filter=harmful\n"
+            attr_file.write_text(attr_content)
+
+            def worker(idx):
+                # Run git status, diff, or rev-parse
+                cmd = ["git", "status"] if idx % 2 == 0 else ["git", "diff"]
+                code, out, err = run_git_cmd(cmd, cwd=str(repo))
+                return code, err
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(worker, i) for i in range(16)]
+                for f in concurrent.futures.as_completed(futures):
+                    code, err = f.result()
+                    self.assertEqual(code, 0, f"Git command failed: {err}")
+
+            self.assertFalse(marker.exists(), "host clean filter executed during concurrent operations!")
+            self.assertTrue(attr_file.exists(), "attributes file was deleted or not restored!")
+            self.assertEqual(attr_file.read_text(), attr_content)
+
+    def test_git_info_attributes_orphan_self_healing(self):
+        from makewand.git_helper import run_git_cmd
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            run_git_cmd(["git", "init"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=str(repo))
+
+            info_dir = repo / ".git" / "info"
+            info_dir.mkdir(parents=True, exist_ok=True)
+            orphan = info_dir / "attributes.makewand_shield_99999_0"
+            content = "*.dat filter=special\n"
+            orphan.write_text(content)
+
+            code, out, err = run_git_cmd(["git", "status"], cwd=str(repo))
+            self.assertEqual(code, 0, f"Git status failed: {err}")
+
+            attr_file = info_dir / "attributes"
+            self.assertTrue(attr_file.exists(), "attributes file was not self-healed from orphan!")
+            self.assertEqual(attr_file.read_text(), content)
+            self.assertFalse(orphan.exists(), "orphan shield file was not cleaned up!")
+
+    def test_git_info_attributes_worktree_deduplication(self):
+        from makewand.git_helper import run_git_cmd
+        with tempfile.TemporaryDirectory() as td:
+            main_repo = Path(td) / "main"
+            wt_repo = Path(td) / "worktree"
+            main_repo.mkdir()
+
+            run_git_cmd(["git", "init"], cwd=str(main_repo))
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(main_repo))
+            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=str(main_repo))
+            (main_repo / "f.txt").write_text("base")
+            run_git_cmd(["git", "add", "f.txt"], cwd=str(main_repo))
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=str(main_repo))
+
+            run_git_cmd(["git", "worktree", "add", str(wt_repo), "-b", "wt-branch"], cwd=str(main_repo))
+
+            main_info = main_repo / ".git" / "info"
+            main_info.mkdir(parents=True, exist_ok=True)
+            main_attr = main_info / "attributes"
+            content = "*.txt -text\n"
+            main_attr.write_text(content)
+
+            # In linked worktree, run_git_cmd must succeed without deadlocks or errors
+            code, out, err = run_git_cmd(["git", "status"], cwd=str(wt_repo))
+            self.assertEqual(code, 0, f"worktree git status failed: {err}")
+            self.assertTrue(main_attr.exists())
+            self.assertEqual(main_attr.read_text(), content)
+
+    def test_reflink_copy_where_supported(self):
+        from makewand.git_helper import _is_reflink_supported, _copy_file_with_reflink
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src.txt"
+            dst = Path(td) / "dst.txt"
+            src.write_text("reflink content verification")
+            _copy_file_with_reflink(src, dst)
+            self.assertTrue(dst.exists())
+            self.assertEqual(dst.read_text(), "reflink content verification")
+            # Probe reflink support boolean doesn't crash and caches result
+            supported = _is_reflink_supported()
+            self.assertIsInstance(supported, bool)
+
+    def test_reflink_copy_fallback_on_readonly_file_and_cross_device(self):
+        from makewand.git_helper import _copy_file_with_reflink
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "ro.txt"
+            dst = Path(td) / "dst_ro.txt"
+            src.write_text("read only content")
+            os.chmod(src, 0o444)
+
+            # Simulate cross-device link failure in copy_file_range
+            with patch("os.copy_file_range", side_effect=OSError(18, "Invalid cross-device link")):
+                _copy_file_with_reflink(src, dst)
+                self.assertTrue(dst.exists())
+                self.assertEqual(dst.read_text(), "read only content")
+                self.assertEqual(dst.stat().st_mode & 0o777, 0o444)
+
 
 if __name__ == "__main__":
     unittest.main()
+

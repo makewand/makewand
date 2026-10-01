@@ -39,18 +39,25 @@ func TestOpenPragmasApplyToEveryConnection(t *testing.T) {
 	}()
 
 	for i, c := range conns {
-		var fk, busy int
+		var fk, busy, syncMode int
 		if err := c.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
 			t.Fatalf("conn %d read foreign_keys: %v", i, err)
 		}
 		if err := c.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busy); err != nil {
 			t.Fatalf("conn %d read busy_timeout: %v", i, err)
 		}
+		if err := c.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&syncMode); err != nil {
+			t.Fatalf("conn %d read synchronous: %v", i, err)
+		}
 		if fk != 1 {
 			t.Errorf("conn %d: foreign_keys=%d, want 1", i, fk)
 		}
 		if busy != 30000 {
 			t.Errorf("conn %d: busy_timeout=%d, want 30000", i, busy)
+		}
+		// PRAGMA synchronous = NORMAL is 1 in SQLite
+		if syncMode != 1 {
+			t.Errorf("conn %d: synchronous=%d, want 1 (NORMAL)", i, syncMode)
 		}
 	}
 }
@@ -70,4 +77,13 @@ func TestOpenEnablesWAL(t *testing.T) {
 	if mode != "wal" {
 		t.Errorf("journal_mode=%q, want wal", mode)
 	}
+
+	// Test checkpoint execution
+	if err := Checkpoint(db); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	// Test checkpoint loop start and stop
+	stop := StartWALCheckpointLoop(context.Background(), db, 50)
+	stop()
 }

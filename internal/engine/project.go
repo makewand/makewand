@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -34,16 +35,8 @@ type FileEntry struct {
 	Modified bool // changed in current session
 }
 
-// shouldIgnoreSet is a package-level set for fast ignore lookups.
-var shouldIgnoreSet = map[string]bool{
-	".git":         true,
-	"node_modules": true,
-	"__pycache__":  true,
-	".venv":        true,
-	"venv":         true,
-	".DS_Store":    true,
-	".makewand":    true,
-}
+// shouldIgnoreSet is an alias to ProjectIgnoreDirs for backwards compatibility.
+var shouldIgnoreSet = ProjectIgnoreDirs
 
 // sanitizeReplacer is a package-level replacer for directory name sanitization.
 var sanitizeReplacer = strings.NewReplacer(
@@ -435,22 +428,51 @@ func writeFileModeAt(root *os.Root, relPath, content string, requestedMode *fs.F
 
 const maxReadFileSize = 10 << 20 // 10 MB
 
-// ReadFile reads a file from the project.
+// ReadFile reads a file from the project using Go 1.24 os.OpenRoot to prevent TOCTOU escapes.
 func (p *Project) ReadFile(relPath string) (string, error) {
-	fullPath, err := p.validatePath(relPath, false)
-	if err != nil {
+	if _, err := p.validatePath(relPath, false); err != nil {
 		return "", err
 	}
-	info, err := os.Stat(fullPath)
+	root, err := os.OpenRoot(p.Path)
 	if err != nil {
 		return "", fmt.Errorf("read file: %w", err)
+	}
+	defer root.Close()
+
+	cleanRel := filepath.Clean(relPath)
+	info, err := root.Stat(cleanRel)
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("read file: %s is a directory", relPath)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("read file: %s is not a regular file", relPath)
 	}
 	if info.Size() > maxReadFileSize {
 		return "", fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), maxReadFileSize)
 	}
-	data, err := os.ReadFile(fullPath)
+
+	f, err := root.Open(cleanRel)
 	if err != nil {
 		return "", fmt.Errorf("read file: %w", err)
+	}
+	defer f.Close()
+
+	openInfo, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+	if !openInfo.Mode().IsRegular() {
+		return "", fmt.Errorf("read file: %s is not a regular file", relPath)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxReadFileSize+1))
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+	if int64(len(data)) > maxReadFileSize {
+		return "", fmt.Errorf("file too large: %d bytes (max %d)", len(data), maxReadFileSize)
 	}
 	return string(data), nil
 }

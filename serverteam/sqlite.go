@@ -10,8 +10,9 @@ import (
 )
 
 type SQLiteStore struct {
-	path string
-	db   *sql.DB
+	path   string
+	db     *sql.DB
+	ownsDB bool
 }
 
 func OpenSQLiteStore(path string) (*SQLiteStore, error) {
@@ -19,9 +20,22 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &SQLiteStore{path: path, db: db}
-	if err := store.ensureSchema(); err != nil {
+	store, err := NewSQLiteStoreWithDB(db, path)
+	if err != nil {
 		_ = db.Close()
+		return nil, err
+	}
+	store.ownsDB = true
+	return store, nil
+}
+
+// NewSQLiteStoreWithDB initializes a team store using an existing shared database handle.
+func NewSQLiteStoreWithDB(db *sql.DB, path string) (*SQLiteStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("sqlite db is nil")
+	}
+	store := &SQLiteStore{path: path, db: db, ownsDB: false}
+	if err := store.ensureSchema(); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -92,7 +106,7 @@ CREATE TABLE IF NOT EXISTS project_memberships (
 }
 
 func (s *SQLiteStore) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil || s.db == nil || !s.ownsDB {
 		return nil
 	}
 	return s.db.Close()

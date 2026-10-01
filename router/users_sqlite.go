@@ -12,8 +12,9 @@ import (
 
 // SQLiteUserStore persists users in a SQLite state database.
 type SQLiteUserStore struct {
-	path string
-	db   *sql.DB
+	path   string
+	db     *sql.DB
+	ownsDB bool
 }
 
 // OpenSQLiteUserStore opens or creates a SQLite-backed user store.
@@ -22,9 +23,22 @@ func OpenSQLiteUserStore(path string) (*SQLiteUserStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &SQLiteUserStore{path: path, db: db}
-	if err := store.ensureSchema(); err != nil {
+	store, err := NewSQLiteUserStoreWithDB(db, path)
+	if err != nil {
 		_ = db.Close()
+		return nil, err
+	}
+	store.ownsDB = true
+	return store, nil
+}
+
+// NewSQLiteUserStoreWithDB initializes a user store using an existing shared database handle.
+func NewSQLiteUserStoreWithDB(db *sql.DB, path string) (*SQLiteUserStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("sqlite db is nil")
+	}
+	store := &SQLiteUserStore{path: path, db: db, ownsDB: false}
+	if err := store.ensureSchema(); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -45,9 +59,9 @@ CREATE TABLE IF NOT EXISTS users (
 	return err
 }
 
-// Close closes the underlying database handle.
+// Close closes the underlying database handle if owned.
 func (s *SQLiteUserStore) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil || s.db == nil || !s.ownsDB {
 		return nil
 	}
 	return s.db.Close()

@@ -2,15 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/router"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
+	"github.com/makewand/makewand/serverdb"
+	"github.com/makewand/makewand/serverteam"
+	"github.com/makewand/makewand/serverusage"
 )
 
 type captureAudit struct{ events []serveraudit.Event }
@@ -93,5 +99,52 @@ func TestServeNoModelsErrorExplainsAPIPolicy(t *testing.T) {
 	}
 	if err := serveNoModelsError(&config.Config{}); err == nil || !strings.Contains(err.Error(), "makewand setup") {
 		t.Fatalf("no-key error=%v", err)
+	}
+}
+
+func TestServeSingleStateDBInstance(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := serverdb.Open(dbPath)
+	if err != nil {
+		t.Fatalf("serverdb.Open: %v", err)
+	}
+	defer db.Close()
+
+	stopCheckpoint := serverdb.StartWALCheckpointLoop(context.Background(), db, 50*time.Millisecond)
+	defer stopCheckpoint()
+
+	tokens, err := serverauth.NewSQLiteStoreWithDB(db, dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStoreWithDB (tokens): %v", err)
+	}
+	defer tokens.Close()
+
+	usage, err := serverusage.NewSQLiteStoreWithDB(db, dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStoreWithDB (usage): %v", err)
+	}
+	defer usage.Close()
+
+	teams, err := serverteam.NewSQLiteStoreWithDB(db, dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStoreWithDB (teams): %v", err)
+	}
+	defer teams.Close()
+
+	users, err := router.NewSQLiteUserStoreWithDB(db, dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteUserStoreWithDB (users): %v", err)
+	}
+	defer users.Close()
+
+	// Verify all stores function concurrently on the shared db instance
+	if _, err := teams.CreateOrganization(serverteam.Organization{ID: "org-1", Name: "Org One", Slug: "org-one"}); err != nil {
+		t.Fatalf("teams.CreateOrganization: %v", err)
+	}
+	if err := usage.Log(serverusage.Entry{RequestID: "req-1", OrganizationID: "org-1", PromptTokens: 10, CostUSD: 0.05}); err != nil {
+		t.Fatalf("usage.Log: %v", err)
+	}
+	if err := serverdb.Checkpoint(db); err != nil {
+		t.Fatalf("serverdb.Checkpoint: %v", err)
 	}
 }

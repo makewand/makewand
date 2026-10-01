@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from makewand.sandbox import wrap_bwrap, is_bwrap_available, run_in_sandbox
 from makewand.orchestrator import run_local_tests, dispatch_task, run_pipeline, run_review, run_race
-from makewand.candidate import CandidateManager
+from makewand.candidate import CandidateManager, get_scoped_apply_lock_path, scoped_apply_lock
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
 from makewand.providers.agy import execute_agy_task
@@ -209,6 +209,31 @@ class TestCandidateLockingAndAtomicReplace(unittest.TestCase):
                 config.CONFIG_DIR = orig_config_dir
                 config.CANDIDATES_DIR = orig_cand_dir
                 config.BACKUPS_DIR = orig_backups_dir
+
+    def test_scoped_apply_lock_parallel_across_workspaces(self):
+        import makewand.config as config
+        orig_config_dir = config.CONFIG_DIR
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            try:
+                config.CONFIG_DIR = Path(tmp_dir) / "config"
+                config.ensure_config_dir()
+
+                ws_1 = str(Path(tmp_dir) / "ws1")
+                ws_2 = str(Path(tmp_dir) / "ws2")
+                p1 = get_scoped_apply_lock_path(ws_1)
+                p2 = get_scoped_apply_lock_path(ws_2)
+                self.assertNotEqual(p1, p2)
+                self.assertTrue(str(p1).startswith(str(config.CONFIG_DIR)))
+
+                # Both workspaces can acquire their scoped lock simultaneously without deadlock or blocking
+                with scoped_apply_lock(ws_1):
+                    with scoped_apply_lock(ws_2):
+                        # Both held simultaneously
+                        self.assertTrue(p1.exists())
+                        self.assertTrue(p2.exists())
+            finally:
+                config.CONFIG_DIR = orig_config_dir
+
 
 
 class TestUntrustedRepoSandboxEnforcement(unittest.TestCase):
@@ -880,6 +905,52 @@ def get_platform():
         self.assertIn("math.sqrt", merged)
         self.assertIn("get_platform", merged)
 
+    def test_ast_merge_disjoint_function_insertions_at_same_position(self):
+        from makewand.merger import ast_merge_python_file
+
+        base_code = '''def existing_func():
+    return 42
+'''
+        code_a = '''def existing_func():
+    return 42
+
+def func_a():
+    return "alpha"
+'''
+        code_b = '''def existing_func():
+    return 42
+
+def func_b():
+    return "beta"
+'''
+        ok, merged, strategy = ast_merge_python_file(base_code, code_a, code_b)
+        self.assertTrue(ok)
+        self.assertIn("def func_a():", merged)
+        self.assertIn("def func_b():", merged)
+        self.assertIn("def existing_func():", merged)
+
+    def test_ast_merge_conflicting_function_insertions_at_same_position(self):
+        from makewand.merger import ast_merge_python_file
+
+        base_code = '''def existing_func():
+    return 42
+'''
+        code_a = '''def existing_func():
+    return 42
+
+def func_a():
+    return "alpha"
+'''
+        code_b = '''def existing_func():
+    return 42
+
+def func_a():
+    return "conflict_version"
+'''
+        ok, merged, strategy = ast_merge_python_file(base_code, code_a, code_b)
+        self.assertFalse(ok)
+        self.assertEqual(strategy, "conflict")
+
     def test_semantic_merge_candidate_worktrees(self):
         from makewand.merger import semantic_merge_candidate_worktrees
 
@@ -924,6 +995,47 @@ def get_platform():
             merged_py = (out_dir / "common.py").read_text()
             self.assertIn("return 100", merged_py)
             self.assertIn("return 200", merged_py)
+
+    def test_get_worktree_changes_fallback_and_git_accelerated_merge(self):
+        from makewand.merger import get_worktree_changes_fallback, semantic_merge_candidate_worktrees
+        from makewand.git_helper import ensure_git_worktree, run_git_cmd, clone_isolated_worktree
+
+        with tempfile.TemporaryDirectory() as td:
+            base_dir = Path(td) / "base"
+            cand_a = Path(td) / "cand_a"
+            cand_b = Path(td) / "cand_b"
+            out_dir = Path(td) / "merged"
+
+            base_dir.mkdir(parents=True, exist_ok=True)
+            (base_dir / "app.py").write_text("def hello(): return 'world'\n")
+            self.assertTrue(ensure_git_worktree(str(base_dir)))
+            base_commit = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(base_dir))[1].strip()
+
+            clone_isolated_worktree(str(base_dir), cand_a)
+            clone_isolated_worktree(str(base_dir), cand_b)
+            clone_isolated_worktree(str(base_dir), out_dir)
+
+            (cand_a / "app.py").write_text("def hello(): return 'cand_a'\n")
+            (cand_a / "extra_a.py").write_text("# extra A\n")
+            (cand_b / "extra_b.py").write_text("# extra B\n")
+
+            # Test get_worktree_changes_fallback in git mode
+            changes_a = get_worktree_changes_fallback(base_dir, cand_a, baseline_commit=base_commit)
+            self.assertIn("app.py", changes_a)
+            self.assertIn("extra_a.py", changes_a)
+
+            # Test semantic_merge_candidate_worktrees without manifests (exercises streamlined git change detection)
+            ok, merged_changes, conflicts, msg = semantic_merge_candidate_worktrees(
+                base_cwd=str(base_dir),
+                cand_a_dir=cand_a,
+                cand_b_dir=cand_b,
+                output_dir=out_dir,
+                baseline_commit=base_commit,
+            )
+            self.assertTrue(ok, msg)
+            self.assertEqual(len(conflicts), 0)
+            self.assertTrue((out_dir / "extra_a.py").exists())
+            self.assertTrue((out_dir / "extra_b.py").exists())
 
     def test_candidate_manager_hybrid_candidate_lifecycle(self):
         from makewand.candidate import build_manifest
@@ -1002,6 +1114,61 @@ class TestCrossSessionCollisionDetection(unittest.TestCase):
         rep = get_all_active_sessions_report()
         self.assertIn("total_active_sessions", rep)
         self.assertIn("sessions_by_repo", rep)
+
+
+class TestDisjointStatementMerging(unittest.TestCase):
+    """3-Way disjoint top-level definition merging unit tests."""
+
+    def test_disjoint_functions_merge_cleanly(self):
+        from makewand.merger import _merge_disjoint_text
+        base = "def existing():\n    return 0\n"
+        code_a = "def existing():\n    return 0\n\ndef func_a():\n    return 1\n"
+        code_b = "def existing():\n    return 0\n\ndef func_b():\n    return 2\n"
+
+        ok, merged = _merge_disjoint_text(base, code_a, code_b)
+        self.assertTrue(ok)
+        self.assertIn("def func_a():", merged)
+        self.assertIn("def func_b():", merged)
+
+    def test_disjoint_function_and_class_merge(self):
+        from makewand.merger import _merge_disjoint_text
+        base = "def existing():\n    return 0\n"
+        code_a = "def existing():\n    return 0\n\ndef func_a():\n    pass\n"
+        code_b = "def existing():\n    return 0\n\nclass WorkerService:\n    pass\n"
+
+        ok, merged = _merge_disjoint_text(base, code_a, code_b)
+        self.assertTrue(ok)
+        self.assertIn("def func_a():", merged)
+        self.assertIn("class WorkerService:", merged)
+
+    def test_disjoint_merge_with_non_newline_eof(self):
+        from makewand.merger import _merge_disjoint_text
+        base = "def existing():\n    return 0"
+        code_a = "def existing():\n    return 0\n\ndef func_a():\n    return 1"
+        code_b = "def existing():\n    return 0\n\nclass WorkerService:\n    pass"
+
+        ok, merged = _merge_disjoint_text(base, code_a, code_b)
+        self.assertTrue(ok)
+        self.assertIn("def func_a():", merged)
+        self.assertIn("class WorkerService:", merged)
+
+    def test_same_symbol_name_rejected_as_conflict(self):
+        from makewand.merger import _merge_disjoint_text
+        base = "def existing():\n    return 0\n"
+        code_a = "def existing():\n    return 0\n\ndef helper():\n    return 'a'\n"
+        code_b = "def existing():\n    return 0\n\ndef helper():\n    return 'b'\n"
+
+        ok, merged = _merge_disjoint_text(base, code_a, code_b)
+        self.assertFalse(ok)
+
+    def test_arbitrary_expressions_not_auto_merged(self):
+        from makewand.merger import _merge_disjoint_text
+        base = "def existing():\n    return 0\n"
+        code_a = "def existing():\n    return 0\n\nprint('side effect a')\n"
+        code_b = "def existing():\n    return 0\n\ndef helper():\n    pass\n"
+
+        ok, merged = _merge_disjoint_text(base, code_a, code_b)
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

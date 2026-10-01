@@ -119,5 +119,46 @@ class TestApiTotalDeadline(unittest.TestCase):
         self.assertNotEqual(code, 200)
 
 
+class TestMuseSandboxPassthrough(unittest.TestCase):
+    def test_muse_sandboxed_direct_passthrough(self):
+        from makewand.providers.muse import get_muse_executable
+        with patch("os.path.isfile", return_value=True), \
+             patch("os.access", return_value=True), \
+             patch("shutil.which", return_value="/home/alice/.local/bin/muse"), \
+             patch("makewand.providers.muse._is_dbus_systemd_available", return_value=False):
+            exe, flags = get_muse_executable(sandboxed=True)
+            self.assertTrue(exe.endswith("muse-bin/muse"))
+            self.assertIn("--disable-sandbox", flags)
+
+    def test_muse_host_with_dbus_returns_default(self):
+        from makewand.providers.muse import get_muse_executable
+        with patch("makewand.providers.muse._is_dbus_systemd_available", return_value=True), \
+             patch("shutil.which", return_value="/home/alice/.local/bin/muse"):
+            exe, flags = get_muse_executable(sandboxed=False)
+            self.assertEqual(exe, "muse")
+            self.assertEqual(flags, [])
+
+    def test_dbus_check_detects_dead_socket_path(self):
+        from makewand.providers.muse import _is_dbus_systemd_available
+        with patch.dict("os.environ", {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent/bus/socket"}), \
+             patch("shutil.which", return_value="/usr/bin/systemd-run"):
+            self.assertFalse(_is_dbus_systemd_available())
+
+    def test_muse_finds_real_bin_with_isolated_home(self):
+        from makewand.providers.muse import get_muse_executable
+        from unittest.mock import MagicMock
+        fake_pwd = MagicMock()
+        fake_pwd.pw_dir = "/real/home/alice"
+        with patch.dict("os.environ", {"HOME": "/tmp/isolated-home"}, clear=False), \
+             patch("pwd.getpwuid", return_value=fake_pwd), \
+             patch("os.path.isfile", side_effect=lambda p: p == "/real/home/alice/.local/libexec/muse-bin/muse"), \
+             patch("os.access", return_value=True), \
+             patch("shutil.which", return_value="/tmp/isolated-home/bin/muse"), \
+             patch("makewand.providers.muse._is_dbus_systemd_available", return_value=False):
+            exe, flags = get_muse_executable(sandboxed=True)
+            self.assertEqual(exe, "/real/home/alice/.local/libexec/muse-bin/muse")
+            self.assertEqual(flags, ["--disable-sandbox"])
+
+
 if __name__ == "__main__":
     unittest.main()

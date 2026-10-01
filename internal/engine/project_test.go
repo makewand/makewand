@@ -107,6 +107,45 @@ func TestReadFile_RejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestReadFile_NormalAndEdgeCases(t *testing.T) {
+	dir := t.TempDir()
+	proj, err := OpenProject(dir)
+	if err != nil {
+		t.Fatalf("OpenProject: %v", err)
+	}
+
+	// Write normal file
+	if err := proj.WriteFile("hello.txt", "hello world"); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	content, err := proj.ReadFile("hello.txt")
+	if err != nil {
+		t.Fatalf("ReadFile(hello.txt): %v", err)
+	}
+	if content != "hello world" {
+		t.Fatalf("ReadFile content = %q, want %q", content, "hello world")
+	}
+
+	// Non-existent file
+	if _, err := proj.ReadFile("nonexistent.txt"); err == nil {
+		t.Fatal("ReadFile should error on nonexistent file, got nil")
+	}
+
+	// Subdir creation and reading a directory
+	subDir := filepath.Join(dir, "subdir")
+	if err := os.MkdirAll(subDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if _, err := proj.ReadFile("subdir"); err == nil {
+		t.Fatal("ReadFile should error on directory, got nil")
+	}
+
+	// Traversal
+	if _, err := proj.ReadFile("../outside.txt"); err == nil {
+		t.Fatal("ReadFile should error on path traversal, got nil")
+	}
+}
+
 func TestScanFiles_ReturnsRootError(t *testing.T) {
 	proj, err := NewProject("scan-root-error", t.TempDir())
 	if err != nil {
@@ -177,5 +216,19 @@ func TestWriteFile_UnlinksPreExistingHardlink(t *testing.T) {
 	}
 	if projectContent != "overwritten-content" {
 		t.Fatalf("project file content = %q, want %q", projectContent, "overwritten-content")
+	}
+}
+
+func TestProjectIgnoreDirs(t *testing.T) {
+	for _, dir := range []string{".git", "node_modules", ".venv", "vendor", "target", "dist", "build", "__pycache__"} {
+		if !IsProjectIgnoredDir(dir) {
+			t.Errorf("IsProjectIgnoredDir(%q) = false, want true", dir)
+		}
+		if !shouldIgnore(dir) {
+			t.Errorf("shouldIgnore(%q) = false, want true", dir)
+		}
+	}
+	if IsProjectIgnoredDir("src") {
+		t.Errorf("IsProjectIgnoredDir(\"src\") = true, want false")
 	}
 }

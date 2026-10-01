@@ -538,6 +538,7 @@ def inspect_file(path, *, deadline=None):
 def manifest(workspace, *, input_snapshot=False):
     """Scan through pinned directories and refuse every reparse entry."""
     import time
+    from makewand.constants import PROJECT_IGNORE_DIRS
     root = Path(os.path.abspath(workspace))
     result = {}
     started = time.monotonic()
@@ -547,14 +548,18 @@ def manifest(workspace, *, input_snapshot=False):
         nonlocal total_bytes
         with pinned_directory(directory):
             for child in os.scandir(directory):
-                if directory == root and child.name == ".git":
+                if child.name == ".git":
+                    continue
+                info = child.stat(follow_symlinks=False)
+                is_reparse = bool(getattr(info, "st_file_attributes", 0) & 0x400)
+                is_dir = stat.S_ISDIR(info.st_mode)
+                if (is_dir or is_reparse) and child.name in PROJECT_IGNORE_DIRS:
                     continue
                 relative = Path(child.path).relative_to(root).as_posix()
                 relative_parts(relative)
-                info = child.stat(follow_symlinks=False)
-                if getattr(info, "st_file_attributes", 0) & 0x400:
+                if is_reparse:
                     raise ValueError("Windows workspace contains a reparse point: " + relative)
-                if stat.S_ISDIR(info.st_mode):
+                if is_dir:
                     scan(Path(child.path))
                 elif stat.S_ISREG(info.st_mode):
                     total_bytes += info.st_size

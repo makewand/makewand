@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -271,5 +272,80 @@ func TestIsBwrapSetupFailure(t *testing.T) {
 	}
 	if isBwrapSetupFailure(&ExecResult{ExitCode: 1, Stdout: "ran", Stderr: "bwrap: x"}) {
 		t.Fatal("a command that produced output did start")
+	}
+}
+
+func TestSandboxWorkspaceSocketMasks_IncludesIgnoredDirectories(t *testing.T) {
+	ws := t.TempDir()
+	gitDir := filepath.Join(ws, ".git")
+	if err := os.MkdirAll(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sockInGit := filepath.Join(gitDir, "daemon.sock")
+	l1, err := net.Listen("unix", sockInGit)
+	if err != nil {
+		t.Skipf("cannot create unix socket: %v", err)
+	}
+	defer l1.Close()
+
+	nodeDir := filepath.Join(ws, "node_modules", "daemon")
+	if err := os.MkdirAll(nodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sockInNode := filepath.Join(nodeDir, "ipc.sock")
+	l2, err := net.Listen("unix", sockInNode)
+	if err != nil {
+		t.Skipf("cannot create unix socket: %v", err)
+	}
+	defer l2.Close()
+
+	masks := sandboxWorkspaceSocketMasks(ws)
+	foundGit := false
+	foundNode := false
+	for i, arg := range masks {
+		if arg == sockInGit && i > 0 && masks[i-1] == os.DevNull {
+			foundGit = true
+		}
+		if arg == sockInNode && i > 0 && masks[i-1] == os.DevNull {
+			foundNode = true
+		}
+	}
+	if !foundGit {
+		t.Errorf("socket in .git (%s) was not masked in: %v", sockInGit, masks)
+	}
+	if !foundNode {
+		t.Errorf("socket in node_modules (%s) was not masked in: %v", sockInNode, masks)
+	}
+}
+
+func TestSanitizeGitExecEnv(t *testing.T) {
+	inputEnv := []string{
+		"PATH=/usr/bin:/bin",
+		"GIT_DIR=/evil/git/dir",
+		"GIT_WORK_TREE=/evil/wt",
+		"GIT_INDEX_FILE=/evil/index",
+		"GIT_EXTERNAL_DIFF=/tmp/evil_diff",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.fsmonitor",
+		"GIT_CONFIG_VALUE_0=evil.sh",
+		"GIT_SSH_COMMAND=ssh -o ProxyCommand=evil",
+		"USER=testuser",
+	}
+	cleaned := sanitizeGitExecEnv(inputEnv)
+	for _, entry := range cleaned {
+		eq := strings.IndexByte(entry, '=')
+		if eq <= 0 {
+			continue
+		}
+		k := entry[:eq]
+		if isDangerousGitEnv(k) {
+			t.Errorf("dangerous git env %q not stripped: %s", k, entry)
+		}
+	}
+	if !hasEnvKey(cleaned, "GIT_OPTIONAL_LOCKS") {
+		t.Errorf("GIT_OPTIONAL_LOCKS=0 was not added")
+	}
+	if !hasEnvKey(cleaned, "USER") {
+		t.Errorf("USER was improperly stripped")
 	}
 }

@@ -322,6 +322,13 @@ def activate() -> SimpleNamespace:
         scrubbed_env=[],
     )
 
+    try:
+        import pwd
+        real_user_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except Exception:
+        real_user_home = previous_home
+    user_base = os.environ.get("PYTHONUSERBASE") or str(real_user_home / ".local")
+
     if owner:
         state.scrubbed_env = _scrub_environment()
         for path in (home, state.runtime_dir):
@@ -331,6 +338,7 @@ def activate() -> SimpleNamespace:
         os.environ.update({
             ROOT_ENV: str(root),
             "HOME": str(home),
+            "PYTHONUSERBASE": user_base,
             "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_STATE_HOME": str(home / ".local" / "state"),
             "XDG_CACHE_HOME": str(home / ".cache"),
@@ -346,8 +354,11 @@ def activate() -> SimpleNamespace:
         })
         atexit.register(_cleanup, root, os.getpid())
         _install_sigterm_cleanup(root, os.getpid())
-    elif str(state.bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = str(state.bin_dir) + os.pathsep + os.environ.get("PATH", os.defpath)
+    else:
+        if "PYTHONUSERBASE" not in os.environ:
+            os.environ["PYTHONUSERBASE"] = user_base
+        if str(state.bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = str(state.bin_dir) + os.pathsep + os.environ.get("PATH", os.defpath)
 
     _install_network_guard(state.network_log)
     if str(REPO_ROOT) not in sys.path:

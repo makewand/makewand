@@ -10,29 +10,12 @@ import ast
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Directories to skip when building the repository symbol map
-DEFAULT_IGNORE_DIRS: Set[str] = {
-    ".git",
-    "__pycache__",
-    "node_modules",
-    "vendor",
-    "target",
-    "dist",
-    "build",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".venv",
-    "venv",
-    "env",
-    ".coverage",
-    ".tox",
-    ".idea",
-    ".vscode",
-    "site-packages",
-}
+from makewand.constants import DEFAULT_IGNORE_DIRS, PROJECT_IGNORE_DIRS  # noqa: F401
+
 
 # Supported file extensions for symbol extraction
 SUPPORTED_EXTENSIONS: Set[str] = {
@@ -42,6 +25,8 @@ SUPPORTED_EXTENSIONS: Set[str] = {
 
 # Max file size to parse (skip massive generated files)
 MAX_FILE_SIZE_BYTES = 256 * 1024
+
+_WORD_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9_]+\b")
 
 
 def _extract_balanced_parens(s: str, start_pos: int) -> Tuple[str, int]:
@@ -395,39 +380,66 @@ def _score_candidate_file(rel_p: str, root_name: str) -> Tuple[int, int, int, st
     return (tier, sub_tier, 1 if is_test_file else 0, len(parts), rel_p)
 
 
+_TREESITTER_AVAILABLE: Optional[bool] = None
+_TREESITTER_PARSER_CACHE: Dict[str, Any] = {}
+
+
+def is_treesitter_available() -> bool:
+    """Returns True if tree_sitter and tree_sitter_languages are importable, cached at module level."""
+    global _TREESITTER_AVAILABLE
+    if sys.modules.get("tree_sitter") is not None and sys.modules.get("tree_sitter_languages") is not None:
+        return True
+    if _TREESITTER_AVAILABLE is not None:
+        return _TREESITTER_AVAILABLE
+    try:
+        import tree_sitter  # type: ignore # noqa: F401
+        import tree_sitter_languages  # type: ignore # noqa: F401
+        _TREESITTER_AVAILABLE = True
+    except Exception:
+        _TREESITTER_AVAILABLE = False
+    return _TREESITTER_AVAILABLE
+
+
 def _extract_with_treesitter(file_path: Path, content: str) -> Optional[List[str]]:
     """
     Attempts to extract structural symbols using tree-sitter if available.
     Returns None if tree_sitter or the language parser is unavailable,
     allowing seamless fallback to ast or regex.
     """
+    if not is_treesitter_available():
+        return None
     try:
-        import tree_sitter  # type: ignore
-        parser = None
         ext = file_path.suffix.lower()
+        lang_map = {
+            ".py": "python",
+            ".go": "go",
+            ".rs": "rust",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "tsx",
+            ".c": "c",
+            ".cpp": "cpp",
+            ".cc": "cpp",
+            ".h": "c",
+            ".hpp": "cpp",
+        }
+        lang_name = lang_map.get(ext)
+        if not lang_name:
+            return None
 
-        # Try tree_sitter_languages if available
-        try:
-            import tree_sitter_languages  # type: ignore
-            lang_map = {
-                ".py": "python",
-                ".go": "go",
-                ".rs": "rust",
-                ".js": "javascript",
-                ".jsx": "javascript",
-                ".ts": "typescript",
-                ".tsx": "tsx",
-                ".c": "c",
-                ".cpp": "cpp",
-                ".cc": "cpp",
-                ".h": "c",
-                ".hpp": "cpp",
-            }
-            lang_name = lang_map.get(ext)
-            if lang_name:
+        # Check cached parser
+        parser = _TREESITTER_PARSER_CACHE.get(lang_name)
+        if parser is None:
+            try:
+                import tree_sitter_languages  # type: ignore
                 parser = tree_sitter_languages.get_parser(lang_name)
-        except Exception:
-            pass
+                if parser is not None:
+                    # Do not permanently cache mocks in test suites
+                    if not hasattr(tree_sitter_languages, "_mock_return_value") and not hasattr(parser, "_mock_return_value"):
+                        _TREESITTER_PARSER_CACHE[lang_name] = parser
+            except Exception:
+                pass
 
         if parser is None:
             return None
@@ -437,25 +449,40 @@ def _extract_with_treesitter(file_path: Path, content: str) -> Optional[List[str
         root_node = tree.root_node
         symbols = []
 
-        def _traverse(node, depth=0):
-            if depth > 2:
+        def _traverse(node, depth=0, inside_class=False):
+            if depth > 6:
                 return
             node_type = str(node.type)
+            is_class = node_type in (
+                "class_definition", "class_declaration", "class_specifier",
+                "struct_item", "struct_specifier"
+            )
             if node_type in (
-                "function_definition", "function_declaration", "method_declaration", "method_definition",
-                "class_definition", "class_declaration", "struct_item", "type_declaration", "type_spec"
+                "function_definition", "function_declaration", "function_item",
+                "method_declaration", "method_definition",
+                "class_definition", "class_declaration", "class_specifier",
+                "struct_item", "struct_specifier",
+                "type_declaration", "type_spec", "type_alias_declaration",
+                "interface_declaration", "enum_declaration", "enum_item", "enum_specifier",
+                "trait_item", "impl_item"
             ):
                 name = None
                 for child in node.children:
-                    if child.type in ("identifier", "name", "type_identifier", "field_identifier"):
+                    if child.type in (
+                        "identifier", "name", "type_identifier",
+                        "field_identifier", "property_identifier"
+                    ):
+                        name = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
+                        break
+                    elif child.type == "qualified_identifier":
                         name = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
                         break
                 if name and not name.startswith("test_") and not name.startswith("Test"):
-                    indent = "  " if depth <= 1 else "    "
+                    indent = "    " if inside_class else "  "
                     symbols.append(f"{indent}{node_type} {name}")
 
             for child in node.children:
-                _traverse(child, depth + 1)
+                _traverse(child, depth + 1, inside_class=inside_class or is_class)
 
         _traverse(root_node)
         return symbols if symbols else None
@@ -468,7 +495,25 @@ def _extract_defined_names(symbols: List[str]) -> Set[str]:
     names = set()
     for s in symbols:
         clean = s.strip()
-        m = re.search(r"\b(?:class|def|type|func|fn|interface|struct|enum)\s+([a-zA-Z0-9_]+)", clean)
+        # Handle Go method receivers: func (r *Receiver) MethodName(...)
+        go_recv_m = re.search(r"\bfunc\s*\([^)]+\)\s*([a-zA-Z0-9_]+)", clean)
+        if go_recv_m:
+            name = go_recv_m.group(1)
+            if len(name) >= 3 and not name.startswith("_"):
+                names.add(name)
+            continue
+
+        m = re.search(
+            r"\b(?:class|def|type|func|fn|interface|struct|enum|const|trait|impl|"
+            r"function_definition|function_declaration|function_item|"
+            r"method_declaration|method_definition|"
+            r"class_definition|class_declaration|class_specifier|"
+            r"struct_item|struct_specifier|"
+            r"type_declaration|type_spec|type_alias_declaration|"
+            r"interface_declaration|enum_declaration|enum_item|enum_specifier|"
+            r"trait_item|impl_item)\s+([a-zA-Z0-9_]+)",
+            clean,
+        )
         if m:
             name = m.group(1)
             if len(name) >= 3 and not name.startswith("_"):
@@ -499,11 +544,13 @@ def compute_symbol_pagerank(
         for name in _extract_defined_names(syms):
             symbol_definers.setdefault(name, []).append(rel_p)
 
+    sym_keys = set(symbol_definers.keys())
+
     # Build reference graph: out_edges[src][dst] = weight
     out_edges: Dict[str, Dict[str, int]] = {f: {} for f in candidate_files}
     in_edges: Dict[str, Set[str]] = {f: set() for f in candidate_files}
 
-    # Search for symbol references in candidate files
+    # Search for symbol references in candidate files using fast word token set intersection
     for rel_p in candidate_files:
         full_p = root / rel_p
         try:
@@ -514,12 +561,13 @@ def compute_symbol_pagerank(
         except Exception:
             continue
 
-        for sym_name, definers in symbol_definers.items():
-            if sym_name in content:
-                for def_file in definers:
-                    if def_file != rel_p:
-                        out_edges[rel_p][def_file] = out_edges[rel_p].get(def_file, 0) + 1
-                        in_edges[def_file].add(rel_p)
+        file_tokens = set(_WORD_TOKEN_PATTERN.findall(content))
+        matched_symbols = file_tokens & sym_keys
+        for sym_name in matched_symbols:
+            for def_file in symbol_definers[sym_name]:
+                if def_file != rel_p:
+                    out_edges[rel_p][def_file] = out_edges[rel_p].get(def_file, 0) + 1
+                    in_edges[def_file].add(rel_p)
 
     # PageRank power iteration
     ranks = {f: 1.0 / n for f in candidate_files}

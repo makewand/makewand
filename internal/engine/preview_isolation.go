@@ -105,11 +105,11 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 	wrapped = append(wrapped, layout.beforeWorkspace...)
 	wrapped = append(wrapped, "--bind", projectPath, projectPath)
 	wrapped = append(wrapped, layout.afterWorkspace...)
-	// Mask existing domain sockets in project with /dev/null
-	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(projectPath)...)
 	if gitDir := filepath.Join(projectPath, ".git"); isRealDirOrFile(gitDir) {
 		wrapped = append(wrapped, "--ro-bind", gitDir, gitDir)
 	}
+	// Mask existing domain sockets in project with /dev/null (must come after .git bind to prevent shadowing)
+	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(projectPath)...)
 	wrapped = append(wrapped,
 		"--chdir", projectPath,
 		"--clearenv",

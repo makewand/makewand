@@ -228,8 +228,24 @@ class TestSandbox(unittest.TestCase):
             if os.path.exists("/proc/kallsyms"):
                 self.assertIn("--ro-bind /dev/null /proc/kallsyms", joined)
 
+    def test_posix_sandbox_rlimits(self):
+        if os.name == "posix":
+            import subprocess
+            code = (
+                "import os, sys, resource\n"
+                "from makewand.sandbox import apply_posix_sandbox_rlimits\n"
+                "apply_posix_sandbox_rlimits()\n"
+                "fsize_soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)\n"
+                "assert fsize_soft == 1024 * 1024 * 1024, f'unexpected fsize: {fsize_soft}'\n"
+                "as_soft, _ = resource.getrlimit(resource.RLIMIT_AS)\n"
+                "assert as_soft == 16 * 1024 * 1024 * 1024, f'unexpected as: {as_soft}'\n"
+            )
+            res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"rlimits test failed: {res.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

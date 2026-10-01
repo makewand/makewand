@@ -8,6 +8,7 @@ result and must never cause a second task execution.
 import codecs
 import json
 import os
+import random
 import selectors
 import signal
 import socket
@@ -441,11 +442,15 @@ def is_daemon_running() -> Tuple[bool, Optional[int]]:
 
 def try_dispatch_via_daemon(argv: List[str], cwd: Optional[str] = None,
                             timeout: Optional[float] = None,
-                            stdin: Optional[str] = None) -> Optional[int]:
-    """Return None only before connecting; cwd is the original invocation directory.
+                            stdin: Optional[str] = None,
+                            max_retries: Optional[int] = None,
+                            fallback_on_busy: Optional[bool] = None) -> Optional[int]:
+    """Return None before connecting or on slot saturation fallback; cwd is the invocation directory.
 
-    Once connected, transmission or result errors return a nonzero exit code.
-    Replaying a task after an uncertain result would duplicate writes or fees.
+    Once connected and accepted, transmission or result errors return a nonzero exit code.
+    If the daemon rejects a request prior to acceptance due to slot saturation (EXIT_BUSY),
+    the client performs exponential backoff retries and, if still saturated, falls back
+    to returning None so the command can run as a standalone process.
     """
     if os.environ.get("MAKEWAND_NO_DAEMON") == "1" or os.environ.get("MAKEWAND_INSIDE_DAEMON") == "1":
         return None
@@ -453,18 +458,36 @@ def try_dispatch_via_daemon(argv: List[str], cwd: Optional[str] = None,
     if not sock_path.exists():
         return None
     duration = DEFAULT_TIMEOUT if timeout is None else timeout
-    request_id = uuid.uuid4().hex
-    request = {"version": PROTOCOL_VERSION, "request_id": request_id, "cmd": "execute",
-               "argv": list(argv), "cwd": os.path.abspath(cwd or os.getcwd()),
-               "env": dict(os.environ), "timeout": duration, "stdin": stdin or ""}
+    overall_deadline = time.monotonic() + duration
+
+    if max_retries is None:
+        try:
+            max_retries = int(os.environ.get("MAKEWAND_DAEMON_MAX_RETRIES", "3"))
+        except ValueError:
+            max_retries = 3
+    if max_retries < 0:
+        max_retries = 0
+
+    if fallback_on_busy is None:
+        allow_fallback = (
+            os.environ.get("MAKEWAND_DAEMON_FALLBACK", "1").strip().lower() not in ("0", "false", "no")
+            and os.environ.get("MAKEWAND_DAEMON_REQUIRE") != "1"
+        )
+    else:
+        allow_fallback = bool(fallback_on_busy)
+
+    base_request = {"version": PROTOCOL_VERSION, "cmd": "execute",
+                    "argv": list(argv), "cwd": os.path.abspath(cwd or os.getcwd()),
+                    "env": dict(os.environ), "timeout": duration, "stdin": stdin or ""}
     try:
-        validate_request(request)
-        payload = (json.dumps(request, ensure_ascii=False) + "\n").encode()
-        if len(payload) > MAX_REQUEST_BYTES:
+        validate_request(dict(base_request, request_id=uuid.uuid4().hex))
+        payload_test = (json.dumps(dict(base_request, request_id=uuid.uuid4().hex), ensure_ascii=False) + "\n").encode()
+        if len(payload_test) > MAX_REQUEST_BYTES:
             raise ValueError("daemon request exceeds size limit")
     except (ValueError, TypeError) as exc:
         print(f"Makewand daemon: {exc}", file=sys.stderr)
         return 2
+
     try:
         pong = _probe_daemon(sock_path)
     except (OSError, ValueError):
@@ -474,70 +497,127 @@ def try_dispatch_via_daemon(argv: List[str], cwd: Optional[str] = None,
         print("Makewand daemon protocol mismatch; restart the daemon or use --no-daemon",
               file=sys.stderr)
         return EXIT_IPC_ERROR
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    backoff_base = 0.05
+    last_busy_error = None
+    is_busy = False
+    request_id = ""
+
     try:
-        sock.settimeout(min(0.6, duration))
-        sock.connect(str(sock_path))
-    except OSError:
-        sock.close()
-        return None
-    deadline = time.monotonic() + duration
-    try:
-        sock.settimeout(min(SEND_TIMEOUT, duration))
-        sock.sendall(payload)
-        buffer, total_output, accepted = bytearray(), 0, False
-        while True:
-            message = _read_message(sock, buffer, deadline)
-            kind = message.get("type")
-            if message.get("request_id") not in (None, request_id):
-                raise ValueError("daemon response request_id mismatch")
-            if kind == "accepted":
-                if (accepted or message.get("version") != PROTOCOL_VERSION
-                        or message.get("request_id") != request_id):
-                    raise ValueError("invalid daemon acknowledgment")
-                accepted = True
-            elif kind in ("out", "err"):
-                if not accepted or not isinstance(message.get("data"), str):
-                    raise ValueError("invalid daemon output")
-                total_output += len(message["data"].encode("utf-8"))
-                if total_output > MAX_OUTPUT_BYTES:
-                    raise ValueError("daemon output exceeds size limit")
-                stream = sys.stdout if kind == "out" else sys.stderr
-                stream.write(message["data"])
-                stream.flush()
-            elif kind == "exit":
-                code = message.get("code")
-                if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 255:
-                    raise ValueError("invalid daemon exit code")
-                if not accepted and code == 0:
-                    raise ValueError("daemon did not acknowledge request execution")
-                if "result" in message:
-                    from makewand.execution_contract import ExecutionResult
-                    from makewand.workflow import remember_result
-                    result = ExecutionResult.from_dict(message["result"])
-                    if result.task_id != request_id:
-                        raise ValueError("daemon result task_id mismatch")
-                    if result.status != _execution_outcome(request_id, code).get("status"):
-                        raise ValueError("daemon result does not match transport outcome")
-                    remember_result(result)
-                if message.get("error"):
-                    print(f"Makewand daemon: {message['error']} (request {request_id})", file=sys.stderr)
-                return code
-            else:
-                raise ValueError("invalid daemon response type")
+        for attempt in range(max_retries + 1):
+            remaining = overall_deadline - time.monotonic()
+            if remaining < 0.01:
+                break
+
+            request_id = uuid.uuid4().hex
+            timeout_val = max(0.01, min(remaining, duration))
+            attempt_request = dict(base_request, request_id=request_id, timeout=timeout_val)
+            try:
+                payload = (json.dumps(attempt_request, ensure_ascii=False) + "\n").encode()
+                if len(payload) > MAX_REQUEST_BYTES:
+                    raise ValueError("daemon request exceeds size limit")
+            except (ValueError, TypeError) as exc:
+                print(f"Makewand daemon: {exc}", file=sys.stderr)
+                return 2
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(min(0.6, remaining))
+                sock.connect(str(sock_path))
+            except OSError:
+                sock.close()
+                if allow_fallback or attempt == 0:
+                    return None
+                return EXIT_IPC_ERROR
+
+            attempt_deadline = time.monotonic() + timeout_val
+            is_busy = False
+            accepted = False
+            try:
+                sock.settimeout(min(SEND_TIMEOUT, remaining))
+                sock.sendall(payload)
+                buffer, total_output = bytearray(), 0
+                while True:
+                    message = _read_message(sock, buffer, attempt_deadline)
+                    kind = message.get("type")
+                    if message.get("request_id") not in (None, request_id):
+                        raise ValueError("daemon response request_id mismatch")
+                    if kind == "accepted":
+                        if (accepted or message.get("version") != PROTOCOL_VERSION
+                                or message.get("request_id") != request_id):
+                            raise ValueError("invalid daemon acknowledgment")
+                        accepted = True
+                    elif kind in ("out", "err"):
+                        if not accepted or not isinstance(message.get("data"), str):
+                            raise ValueError("invalid daemon output")
+                        total_output += len(message["data"].encode("utf-8"))
+                        if total_output > MAX_OUTPUT_BYTES:
+                            raise ValueError("daemon output exceeds size limit")
+                        stream = sys.stdout if kind == "out" else sys.stderr
+                        stream.write(message["data"])
+                        stream.flush()
+                    elif kind == "exit":
+                        code = message.get("code")
+                        if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 255:
+                            raise ValueError("invalid daemon exit code")
+                        if not accepted and code == 0:
+                            raise ValueError("daemon did not acknowledge request execution")
+
+                        if not accepted and code == EXIT_BUSY:
+                            # Daemon slot saturation: rejected before acceptance (worker or connection limit)
+                            is_busy = True
+                            last_busy_error = message.get("error") or "daemon slots saturated"
+                            break
+
+                        if "result" in message:
+                            from makewand.execution_contract import ExecutionResult
+                            from makewand.workflow import remember_result
+                            result = ExecutionResult.from_dict(message["result"])
+                            if result.task_id != request_id:
+                                raise ValueError("daemon result task_id mismatch")
+                            if result.status != _execution_outcome(request_id, code).get("status"):
+                                raise ValueError("daemon result does not match transport outcome")
+                            remember_result(result)
+                        if message.get("error"):
+                            print(f"Makewand daemon: {message['error']} (request {request_id})", file=sys.stderr)
+                        return code
+                    else:
+                        raise ValueError("invalid daemon response type")
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"Makewand daemon: {exc}; result uncertain, task was not replayed "
+                      f"(request {request_id})", file=sys.stderr)
+                return EXIT_TIMEOUT if isinstance(exc, TimeoutError) else EXIT_IPC_ERROR
+            finally:
+                if accepted:
+                    try:
+                        _send_message(sock, {"version": PROTOCOL_VERSION, "cmd": "cancel",
+                                            "request_id": request_id}, timeout=0.1)
+                    except OSError:
+                        pass
+                sock.close()
+
+            if is_busy:
+                if attempt < max_retries:
+                    backoff = backoff_base * (2 ** attempt) + random.uniform(0.005, 0.02)
+                    if time.monotonic() + backoff < overall_deadline:
+                        time.sleep(backoff)
+                        continue
+                break
     except KeyboardInterrupt:
         return EXIT_CANCELLED
-    except (OSError, ValueError, TypeError) as exc:
-        print(f"Makewand daemon: {exc}; result uncertain, task was not replayed "
-              f"(request {request_id})", file=sys.stderr)
-        return EXIT_TIMEOUT if isinstance(exc, TimeoutError) else EXIT_IPC_ERROR
-    finally:
-        try:
-            _send_message(sock, {"version": PROTOCOL_VERSION, "cmd": "cancel",
-                                "request_id": request_id}, timeout=0.1)
-        except OSError:
-            pass
-        sock.close()
+
+    if is_busy or last_busy_error:
+        if last_busy_error:
+            print(f"Makewand daemon: {last_busy_error} (request {request_id})", file=sys.stderr)
+        if allow_fallback:
+            print("Makewand daemon: workers saturated after retries; falling back to standalone process",
+                  file=sys.stderr)
+            return None
+        return EXIT_BUSY
+
+    if allow_fallback:
+        return None
+    return EXIT_TIMEOUT
 
 
 def query_daemon_request(request_id, *, cancel=False, timeout=0.6):

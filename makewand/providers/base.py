@@ -12,7 +12,7 @@ import codecs
 import math
 import selectors
 import subprocess
-from typing import Tuple, Optional
+from typing import Callable, Optional, Tuple
 
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024  # 10 MB output guardrail
 MAX_STREAM_QUEUE_BYTES = 256 * 1024
@@ -134,7 +134,8 @@ def run_subprocess(
     input_text: Optional[str] = None,
     stream: bool = False,
     print_prefix: str = "",
-    pass_fds: tuple = ()
+    pass_fds: tuple = (),
+    preexec_fn: Optional[Callable[[], None]] = None,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command with one deadline and a shared raw stdout/stderr byte limit.
@@ -234,6 +235,8 @@ def run_subprocess(
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Command timeout must be finite and positive")
         popen_kwargs = {"pass_fds": pass_fds} if pass_fds else {}
+        if preexec_fn is not None and os.name != "nt":
+            popen_kwargs["preexec_fn"] = preexec_fn
         deadline = time.monotonic() + timeout
         proc = subprocess.Popen(
             cmd,

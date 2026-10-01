@@ -507,6 +507,13 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 	if policy.stripSensitive {
 		cmd.Env = sanitizeExecEnv(cmd.Environ())
 	}
+	if filepath.Base(command) == "git" {
+		baseEnv := cmd.Env
+		if baseEnv == nil {
+			baseEnv = cmd.Environ()
+		}
+		cmd.Env = sanitizeGitExecEnv(baseEnv)
+	}
 	setProcessGroup(cmd)
 
 	capture := processjob.NewCapture(maxOutputBytes, func() { killProcessGroup(cmd) })
@@ -636,6 +643,46 @@ func isSensitiveEnv(key string) bool {
 		return true
 	}
 	return slices.ContainsFunc(sensitiveEnvSuffixes, func(s string) bool { return strings.HasSuffix(key, s) })
+}
+
+var dangerousGitEnvs = map[string]bool{
+	"GIT_DIR":                          true,
+	"GIT_WORK_TREE":                    true,
+	"GIT_INDEX_FILE":                   true,
+	"GIT_OBJECT_DIRECTORY":             true,
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+	"GIT_EXTERNAL_DIFF":                true,
+	"GIT_DIFF_OPTS":                    true,
+	"GIT_PAGER":                        true,
+	"GIT_SSH":                          true,
+	"GIT_SSH_COMMAND":                  true,
+	"GIT_ASKPASS":                      true,
+}
+
+func isDangerousGitEnv(key string) bool {
+	if dangerousGitEnvs[key] {
+		return true
+	}
+	return strings.HasPrefix(key, "GIT_CONFIG_")
+}
+
+func sanitizeGitExecEnv(env []string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		eq := strings.IndexByte(entry, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := entry[:eq]
+		if isDangerousGitEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	if !hasEnvKey(out, "GIT_OPTIONAL_LOCKS") {
+		out = append(out, "GIT_OPTIONAL_LOCKS=0")
+	}
+	return out
 }
 
 func quoteArg(arg string) string {

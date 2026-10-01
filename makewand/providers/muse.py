@@ -5,7 +5,7 @@ Muse Code provider adapter (Meta subscription / Muse interactive coding agent).
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from makewand.config import c, COLOR_PURPLE
 from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
 from makewand.workflow import provider_outcome
@@ -22,6 +22,63 @@ def parse_muse_quota(output: str) -> Tuple[bool, str, Optional[str]]:
         iso_reset = (datetime.now() + timedelta(hours=2)).isoformat()
         return True, "Meta 订阅额度耗尽或频次受限", iso_reset
     return False, "", None
+
+def _is_dbus_systemd_available() -> bool:
+    """Checks whether user-level systemd / D-Bus session bus is functional."""
+    import shutil
+    if not shutil.which("systemd-run"):
+        return False
+
+    addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if addr:
+        if addr.startswith("unix:path="):
+            sock_path = addr.split("unix:path=", 1)[1].split(",", 1)[0]
+            if not os.path.exists(sock_path):
+                return False
+    else:
+        bus_path = f"/run/user/{os.getuid()}/bus"
+        if not os.path.exists(bus_path):
+            return False
+    return True
+
+def get_muse_executable(sandboxed: bool = False) -> Tuple[str, List[str]]:
+    """
+    Resolves the muse binary path and extra flags.
+    In sandboxed environments (e.g. Bubblewrap, containers) or where D-Bus/systemd
+    is unavailable, detects if 'muse' is a wrapper and directly invokes the real
+    underlying binary (~/.local/libexec/muse-bin/muse) with --disable-sandbox to
+    eliminate D-Bus Exit 17 crashes.
+    """
+    import shutil
+
+    candidates = [
+        os.environ.get("MUSE_REAL_BIN"),
+        os.path.expanduser("~/.local/libexec/muse-bin/muse"),
+    ]
+    try:
+        import pwd
+        real_user_home = pwd.getpwuid(os.getuid()).pw_dir
+        candidates.append(os.path.join(real_user_home, ".local/libexec/muse-bin/muse"))
+    except Exception:
+        pass
+
+    real_bin = None
+    for cand in candidates:
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            real_bin = cand
+            break
+
+    muse_bin = shutil.which("muse") or "muse"
+
+    needs_direct_passthrough = False
+    if sandboxed or not _is_dbus_systemd_available():
+        if real_bin:
+            if muse_bin != real_bin or sandboxed:
+                needs_direct_passthrough = True
+
+    if needs_direct_passthrough and real_bin:
+        return real_bin, ["--disable-sandbox"]
+    return "muse", []
 
 def execute_muse_task(
     prompt: str,
@@ -85,7 +142,13 @@ def execute_muse_task(
         if not is_bwrap_available():
             return False, None, "Muse 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
-    cmd = ["muse", "exec", "--no-session-log"]
+    sandboxed = is_bwrap_available() or not _is_dbus_systemd_available()
+    muse_bin, extra_flags = get_muse_executable(sandboxed=sandboxed)
+
+    cmd = [muse_bin, "exec", "--no-session-log"]
+    for flag in extra_flags:
+        if flag not in cmd:
+            cmd.append(flag)
     if not readonly:
         cmd.append("--yolo")
     else:

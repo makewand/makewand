@@ -423,7 +423,7 @@ func (c *CLIProvider) healthCheck() bool {
 
 func (c *CLIProvider) softPassProbeTimeout() bool {
 	switch c.provider {
-	case "gemini", "claude", "codex":
+	case "gemini", "claude", "codex", "muse", "grok":
 		return true
 	default:
 		return false

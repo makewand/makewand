@@ -184,11 +184,11 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	wrapped = append(wrapped, layout.beforeWorkspace...)
 	wrapped = append(wrapped, "--bind", workspacePath, workspacePath)
 	wrapped = append(wrapped, layout.afterWorkspace...)
-	// Mask existing domain sockets in workspace with /dev/null
-	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(workspacePath)...)
 	for _, path := range readOnly {
 		wrapped = append(wrapped, "--ro-bind", path, path)
 	}
+	// Mask existing domain sockets in workspace with /dev/null (must come after readOnly binds to prevent shadowing)
+	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(workspacePath)...)
 	wrapped = append(wrapped,
 		"--chdir", workspacePath,
 		"--clearenv",

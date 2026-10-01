@@ -460,7 +460,70 @@ def _run_model_probe(engine: str, command: str, timeout: int, *, repo_trust="tru
     return (124 if result.status == "TIMEOUT" else 127), "", "", result.error
 
 
-def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str, Any]:
+def _resolve_probe_timeout(
+    model_name: str,
+    base_timeout: int,
+    tier: Optional[str] = None,
+    effort: Optional[str] = None,
+) -> int:
+    """Dynamically adapt probe timeouts based on model reasoning effort, tier, or env settings.
+
+    Prevents deep reasoning models (e.g. Muse with reasoning_effort: max, Codex deep)
+    from being misclassified as dead due to short echo probe deadlines.
+    """
+    env_override = os.environ.get(f"MAKEWAND_PROBE_TIMEOUT_{model_name.upper()}")
+    if env_override:
+        try:
+            return max(5, int(env_override))
+        except ValueError:
+            pass
+    if "MAKEWAND_PROBE_TIMEOUT" in os.environ:
+        try:
+            return max(5, int(os.environ["MAKEWAND_PROBE_TIMEOUT"]))
+        except ValueError:
+            pass
+
+    # Generous base timeouts for cold starts, container init and handshake
+    relaxed_base = {
+        "claude": 30,
+        "codex": 45,
+        "muse": 45,
+        "grok": 35,
+        "agy": 15,
+        "aider": 15,
+    }.get(model_name, max(base_timeout, 30))
+    timeout = max(base_timeout, relaxed_base)
+
+    effective_effort = effort
+    effective_tier = tier or "standard"
+    if not effective_effort:
+        try:
+            from makewand.discovery import resolve_model_and_effort
+            res = resolve_model_and_effort(model_name, tier=effective_tier)
+            effective_effort = res.get("effort")
+        except Exception:
+            pass
+
+    eff_lower = (effective_effort or "").lower()
+    if eff_lower in ("max", "xhigh") or effective_tier == "deep":
+        timeout = max(timeout, 90)
+    elif eff_lower == "high":
+        timeout = max(timeout, 60)
+    elif eff_lower == "medium":
+        timeout = max(timeout, 45)
+
+    return timeout
+
+
+def probe_model(
+    model_name: str,
+    *,
+    repo_trust: str = "trusted",
+    cwd: Optional[str] = None,
+    tier: Optional[str] = "standard",
+    effort: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> Dict[str, Any]:
     now = datetime.now().isoformat()
     from makewand.config import has_api_configured, has_subscription_configured, is_provider_enabled
 
@@ -529,7 +592,8 @@ def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str,
 
     if model_name == "claude":
         cmd = 'claude -p "echo ok"'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=15, repo_trust=repo_trust, cwd=cwd)
+        t = _resolve_probe_timeout(model_name, timeout or 30, tier=tier, effort=effort)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=t, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_claude_quota(combined)
         if is_limited:
@@ -538,13 +602,19 @@ def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str,
         if code == 0:
             sub_desc = "Claude Code 订阅运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
+        if ex and "timed out" in ex.lower():
+            err_lower = (combined + " " + ex).lower()
+            if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
+                return {"status": "needs_auth", "reason": "等待 OAuth 登录 (请运行 'claude login')", "resets_at": None, "updated_at": now, "mode": mode}
+            return {"status": "warning", "reason": f"Claude 探活超时 ({t}s，可能正处于深度思考中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
         if ex:
             return {"status": "error", "reason": ex, "resets_at": None, "updated_at": now, "mode": mode}
         return {"status": "healthy" if "ok" in out.lower() else "warning", "reason": combined.strip()[:120], "resets_at": None, "updated_at": now, "mode": mode}
 
     elif model_name == "codex":
         cmd = 'codex exec --sandbox read-only --skip-git-repo-check "echo ok"'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=35, repo_trust=repo_trust, cwd=cwd)
+        t = _resolve_probe_timeout(model_name, timeout or 45, tier=tier, effort=effort)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=t, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_codex_quota(combined)
         if is_limited:
@@ -553,6 +623,11 @@ def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str,
         if code == 0:
             sub_desc = "Codex 订阅运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
+        if ex and "timed out" in ex.lower():
+            err_lower = (combined + " " + ex).lower()
+            if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
+                return {"status": "needs_auth", "reason": "等待 OAuth 浏览器授权登录 (请运行 'codex login')", "resets_at": None, "updated_at": now, "mode": mode}
+            return {"status": "warning", "reason": f"Codex 探活超时 ({t}s，可能正处于深度推理中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
         if ex:
             return {"status": "error", "reason": ex, "resets_at": None, "updated_at": now, "mode": mode}
         return {"status": "warning", "reason": combined.strip()[:120], "resets_at": None, "updated_at": now, "mode": mode}
@@ -562,7 +637,7 @@ def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str,
         # quota availability are learned from real dispatches (providers/agy.py
         # writes region/auth failures back with a TTL) and the usage ledger.
         with tempfile.TemporaryDirectory(prefix="makewand-version-") as neutral:
-            code, out, err, ex = run_subprocess(["agy", "--version"], timeout=5, cwd=neutral)
+            code, out, err, ex = run_subprocess(["agy", "--version"], timeout=timeout or 5, cwd=neutral)
         if code == 0:
             version = out.strip() or "v1.x"
             sub_desc = (f"Antigravity 已安装 ({version})；仅版本检测，账号/地区可用性未经真实调用验证"
@@ -573,7 +648,8 @@ def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str,
 
     elif model_name == "muse":
         cmd = 'muse exec --disable-write --trust-workspace "echo ok"'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=25, repo_trust=repo_trust, cwd=cwd)
+        t = _resolve_probe_timeout(model_name, timeout or 45, tier=tier, effort=effort)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=t, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_muse_quota(combined)
         if is_limited:
@@ -583,12 +659,16 @@ def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str,
             sub_desc = "Muse Code (Meta 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         if ex and "timed out" in ex.lower():
-            return {"status": "needs_auth", "reason": "等待 OAuth 浏览器授权登录 (请运行 'muse login')", "resets_at": None, "updated_at": now, "mode": mode}
+            err_lower = (combined + " " + ex).lower()
+            if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
+                return {"status": "needs_auth", "reason": "等待 OAuth 浏览器授权登录 (请运行 'muse login')", "resets_at": None, "updated_at": now, "mode": mode}
+            return {"status": "warning", "reason": f"Muse 探活超时 ({t}s，可能正处于深度推理中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
         return {"status": "warning", "reason": combined.strip()[:120] or ex or "Muse 状态未知", "resets_at": None, "updated_at": now, "mode": mode}
 
     elif model_name == "grok":
         cmd = 'grok -p "echo ok" --output-format plain'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=20, repo_trust=repo_trust, cwd=cwd)
+        t = _resolve_probe_timeout(model_name, timeout or 35, tier=tier, effort=effort)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=t, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_grok_quota(combined)
         if is_limited:
@@ -597,6 +677,11 @@ def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str,
         if code == 0:
             sub_desc = "Grok Build (xAI 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
+        if ex and "timed out" in ex.lower():
+            err_lower = (combined + " " + ex).lower()
+            if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
+                return {"status": "needs_auth", "reason": "等待授权登录", "resets_at": None, "updated_at": now, "mode": mode}
+            return {"status": "warning", "reason": f"Grok 探活超时 ({t}s，可能正处于推理中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
         if ex:
             return {"status": "error", "reason": ex, "resets_at": None, "updated_at": now, "mode": mode}
     elif model_name == "aider":
