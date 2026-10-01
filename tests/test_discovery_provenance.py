@@ -105,6 +105,68 @@ class DiscoveryProvenanceTests(unittest.TestCase):
         ]}}})
         self.assertEqual(discover_available_models()["claude"]["available"], ["claude-fixture-9 (Fixture)"])
 
+    def test_valid_agy_model_and_effort_detected_from_settings(self):
+        self.write(".gemini/antigravity-cli/settings.json", {"model": "Gemini 3.8 Flash (High)"})
+        result = get_provider_model_tier("agy", "standard")
+        self.assertTrue(result["is_dynamic"])
+        self.assertEqual(result["model"], "gemini-3.8-flash")
+        self.assertEqual(result["effort"], "high")
+        self.assertEqual(result["effort_source"], "detected")
+        models = discover_available_models()
+        self.assertEqual(models["agy"]["default_source"], "detected")
+        self.assertEqual(models["agy"]["current_default"], "gemini-3.8-flash")
+
+    def test_empty_invalid_or_malformed_agy_settings_do_not_mark_detection(self):
+        path = self.write(".gemini/antigravity-cli/settings.json", {})
+        for value in (None, "", "   ", False, [], {}, "model\ninvalid", "--option"):
+            with self.subTest(value=value):
+                path.write_text(json.dumps({"model": value}))
+                self.assertFalse(get_provider_model_tier("agy")["is_dynamic"])
+                self.assertEqual(discover_available_models()["agy"]["default_source"], "builtin")
+        path.write_text("{broken")
+        self.assertFalse(get_provider_model_tier("agy")["is_dynamic"])
+
+    def test_agy_catalog_discovery(self):
+        self.write(".gemini/models_cache.json", {"models": [
+            {"id": "gemini-3.8-pro", "description": "flagship frontier deep"},
+            {"id": "gemini-3.8-flash", "description": "fast speed lightweight"}
+        ]})
+        models = discover_available_models()
+        self.assertEqual(models["agy"]["source"], "detected")
+        self.assertIn("gemini-3.8-pro (flagship frontier deep)", models["agy"]["available"])
+        self.assertIn("gemini-3.8-flash (fast speed lightweight)", models["agy"]["available"])
+        res_deep = get_provider_model_tier("agy", "deep")
+        self.assertTrue(res_deep["is_dynamic"])
+        self.assertEqual(res_deep["model"], "gemini-3.8-pro")
+        res_fast = get_provider_model_tier("agy", "fast")
+        self.assertTrue(res_fast["is_dynamic"])
+        self.assertEqual(res_fast["model"], "gemini-3.8-flash")
+
+    def test_valid_agy_model_from_settings_preserves_builtin_deep_fallback(self):
+        self.write(".gemini/antigravity-cli/settings.json", {"model": "Gemini 3.8 Flash (High)"})
+        res_deep = get_provider_model_tier("agy", "deep")
+        self.assertFalse(res_deep["is_dynamic"])
+        self.assertEqual(res_deep["source"], "builtin")
+        self.assertEqual(res_deep["model"], "gemini-3.1-pro-high")
+        res_fast = get_provider_model_tier("agy", "fast")
+        self.assertFalse(res_fast["is_dynamic"])
+        self.assertEqual(res_fast["model"], "gemini-3.8-flash-high")
+
+    def test_agy_available_models_in_settings(self):
+        self.write(".gemini/antigravity-cli/settings.json", {
+            "model": "Gemini 3.8 Flash (High)",
+            "available_models": [
+                {"id": "gemini-3.8-pro", "description": "frontier deep"},
+                {"id": "gemini-3.8-flash", "description": "fast lightweight"}
+            ]
+        })
+        res_deep = get_provider_model_tier("agy", "deep")
+        self.assertTrue(res_deep["is_dynamic"])
+        self.assertEqual(res_deep["model"], "gemini-3.8-pro")
+        res_std = get_provider_model_tier("agy", "standard")
+        self.assertTrue(res_std["is_dynamic"])
+        self.assertEqual(res_std["model"], "gemini-3.8-flash")
+
 
 if __name__ == "__main__":
     unittest.main()

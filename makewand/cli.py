@@ -468,8 +468,8 @@ def cmd_models(args):
     print("   调用方式: 自动读取 models_cache.json 与 config.toml 动态映射档位 (--tier fast/standard/deep)。\n")
 
     print(c("3. Antigravity (Google AI Pro):", COLOR_BOLD + COLOR_GREEN))
-    _model_lines("agy", "agy 模型缓存 (当前未实现检测)")
-    print("   调用方式: 使用内置默认模型名与 --effort；未做在线模型发现。\n")
+    _model_lines("agy", "~/.gemini/antigravity-cli/settings.json / 模型缓存")
+    print("   调用方式: 自动读取 settings.json 与模型缓存动态映射档位 (--tier fast/standard/deep)。\n")
 
     print(c("4. Muse Code (Meta 订阅):", COLOR_BOLD + COLOR_PURPLE))
     _model_lines("muse", "~/.config/muse/settings.json")
