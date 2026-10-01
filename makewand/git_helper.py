@@ -41,6 +41,9 @@ SAFE_GIT_SECURITY_FLAGS = [
     "-c", "core.fsmonitor=",
     "-c", "core.hooksPath=/dev/null",
     "-c", "core.attributesFile=/dev/null",
+    # Delivery is bound to the exact reviewed bytes, including CRLF files.
+    # A user's global Windows Git setting must not normalize those blobs.
+    "-c", "core.autocrlf=false",
     "-c", "core.pager=cat",
     "-c", "commit.gpgsign=false",
 ]
@@ -156,6 +159,10 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                     except OSError as exc:
                         raise OSError(f"Cannot shield Git attributes at {ia_target}: {exc}") from exc
 
+        # Git emits UTF-8 text independently of the Windows ANSI code page.
+        # Preserve undecodable bytes rather than crashing a pipe reader; binary
+        # object reads remain byte-for-byte and never use a text wrapper.
+        text_options = {} if is_bytes else {"encoding": "utf-8", "errors": "surrogateescape"}
         res = subprocess.run(
             exec_cmd,
             input=input_data,
@@ -163,6 +170,7 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=not is_bytes,
+            **text_options,
             cwd=cwd,
             timeout=timeout,
             env=git_env

@@ -246,6 +246,89 @@ def validate_application_security_descriptor(value, expected_security):
 _NO_SECURITY_CHECK = object()
 
 
+def ensure_private_file_descriptor(fd):
+    """Protect one already-open regular file without resolving its name again."""
+    import msvcrt
+    from ctypes import wintypes
+    kernel, advapi = _api(), ctypes.WinDLL("advapi32", use_last_error=True)
+    handle = msvcrt.get_osfhandle(fd)
+    info = _info(handle)
+    if info.attributes & 0x10 or info.links != 1:
+        raise ValueError("Private Windows state must be a regular file with one link")
+    signatures = {
+        "OpenProcessToken": ([wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)], wintypes.BOOL),
+        "GetTokenInformation": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "GetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)], wintypes.DWORD),
+        "EqualSid": ([ctypes.c_void_p, ctypes.c_void_p], wintypes.BOOL),
+        "ConvertSidToStringSidW": ([ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW": ([wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p], wintypes.BOOL),
+        "GetSecurityDescriptorDacl": ([ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+        "SetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], wintypes.DWORD),
+    }
+    for name, (arguments, result) in signatures.items():
+        getattr(advapi, name).argtypes = arguments
+        getattr(advapi, name).restype = result
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.ReOpenFile.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+    kernel.ReOpenFile.restype = wintypes.HANDLE
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    token, sid_text = wintypes.HANDLE(), wintypes.LPWSTR()
+    owner_descriptor, private_descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    private_handle = None
+    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 8, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        def token_sid(kind):
+            needed = wintypes.DWORD()
+            advapi.GetTokenInformation(token, kind, None, 0, ctypes.byref(needed))
+            data = ctypes.create_string_buffer(needed.value)
+            if not advapi.GetTokenInformation(token, kind, data, needed.value, ctypes.byref(needed)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return data, ctypes.cast(data, ctypes.POINTER(ctypes.c_void_p))[0]
+
+        user_data, user = token_sid(1)
+        owner = ctypes.c_void_p()
+        error = advapi.GetSecurityInfo(handle, 1, 1, ctypes.byref(owner), None, None, None, ctypes.byref(owner_descriptor))
+        if error:
+            raise ctypes.WinError(error)
+        change_owner = not advapi.EqualSid(owner, user)
+        if change_owner:
+            default_data, default_owner = token_sid(4)
+            if not advapi.EqualSid(owner, default_owner):
+                raise PermissionError("Private Windows state file is owned by another account")
+        access = 0x20000 | 0x40000 | (0x80000 if change_owner else 0)  # READ_CONTROL | WRITE_DAC | WRITE_OWNER
+        private_handle = kernel.ReOpenFile(handle, access, 3, 0)
+        if private_handle == ctypes.c_void_p(-1).value:
+            private_handle = None
+            raise ctypes.WinError(ctypes.get_last_error())
+        if change_owner:
+            error = advapi.SetSecurityInfo(private_handle, 1, 1, user, None, None, None)
+            if error:
+                raise ctypes.WinError(error)
+        if not advapi.ConvertSidToStringSidW(user, ctypes.byref(sid_text)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                "D:P(A;;FA;;;" + sid_text.value + ")(A;;FA;;;SY)", 1, ctypes.byref(private_descriptor), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not advapi.GetSecurityDescriptorDacl(private_descriptor, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        error = advapi.SetSecurityInfo(private_handle, 1, 4 | 0x80000000, None, None, acl, None)
+        if error:
+            raise ctypes.WinError(error)
+    finally:
+        if private_handle is not None:
+            kernel.CloseHandle(private_handle)
+        for descriptor in (owner_descriptor, private_descriptor):
+            if descriptor:
+                kernel.LocalFree(descriptor)
+        if sid_text:
+            kernel.LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+        kernel.CloseHandle(token)
+
+
 def ensure_private_directory(path):
     """Refuse foreign owners and enforce an actual owner/SYSTEM Windows DACL."""
     from ctypes import wintypes
@@ -340,7 +423,10 @@ def _info(handle):
 
 def _open(path, *, directory=False, read=False, create=False, access=None):
     kernel = _api()
-    desired = access if access is not None else (0x80000000 if read else (0x40000000 if create else 0))
+    # A zero-access metadata handle does not participate in Windows sharing
+    # checks. Request actual read/traverse access so omitting SHARE_DELETE
+    # really prevents an ancestor from being renamed while it is pinned.
+    desired = access if access is not None else (0x80000000 if read else (0x40000000 if create else (0x20 | 0x80 if directory else 0x80)))
     handle = kernel.CreateFileW(str(path), desired,
                                1 if read else (0 if create else 3), None, 1 if create else 3,
                                0x00200000 | (0x02000000 if directory else 0), None)
@@ -563,7 +649,7 @@ def copy_backup(source, destination):
 def replace_file(temporary, destination):
     """Handle-relative atomic replacement, including readonly target files.
 
-    FileRenameInfoEx ignores the readonly attribute without temporarily chmoding
+    FileRenameInformationEx ignores readonly without temporarily chmoding
     a user file. A process exit can therefore leave only its preimage/postimage,
     never a permission-only intermediate state. Requires Windows 10 or newer.
     """
@@ -591,7 +677,10 @@ def replace_file(temporary, destination):
             info.root = parent
             info.name_length = len(encoded)
             ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.name.offset, encoded, len(encoded))
-            _set_file_information(source, 22, buffer, len(buffer))
+            # The Win32 wrapper rejects non-NULL RootDirectory. The NT service
+            # accepts this fixed handle and keeps destination resolution rooted
+            # in it, including when replacing a readonly target.
+            _set_nt_file_information(source, 65, buffer, len(buffer))
         finally:
             if parent is not None:
                 kernel.CloseHandle(parent)
@@ -605,3 +694,25 @@ def _set_file_information(handle, kind, buffer, size):
     setter.restype = wintypes.BOOL
     if not setter(handle, kind, buffer, size):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _set_nt_file_information(handle, kind, buffer, size):
+    """Set handle-relative file information through the user-mode NT service."""
+    from ctypes import wintypes
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status_or_pointer", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    setter = ntdll.NtSetInformationFile
+    setter.argtypes = [wintypes.HANDLE, ctypes.POINTER(IoStatusBlock), ctypes.c_void_p,
+                       wintypes.ULONG, ctypes.c_int]
+    setter.restype = ctypes.c_int32  # NTSTATUS is signed 32 bit on x64 too.
+    status = setter(handle, ctypes.byref(IoStatusBlock()), buffer, size, kind)
+    if status != 0:
+        # The handles are synchronous; never publish a commit for an incomplete
+        # STATUS_PENDING result or an informational status we did not expect.
+        converter = ntdll.RtlNtStatusToDosError
+        converter.argtypes = [ctypes.c_int32]
+        converter.restype = wintypes.ULONG
+        raise ctypes.WinError(converter(status))

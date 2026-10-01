@@ -159,6 +159,49 @@ class NativeWindowsFileTests(unittest.TestCase):
         self.assertTrue(getter(descriptor, ctypes.byref(control), ctypes.byref(revision)))
         self.assertTrue(control.value & 0x1000, "DACL must be protected against inherited broad access")
 
+    def test_private_open_file_acl_is_bound_to_the_handle_and_rejects_hardlinks(self):
+        from makewand.native_windows import application_security, ensure_private_file_descriptor
+        target = self.workspace / "audit.log"
+        target.write_bytes(b"original")
+        before = application_security(target)
+        fd = os.open(target, os.O_WRONLY | os.O_APPEND)
+        try:
+            ensure_private_file_descriptor(fd)
+            os.write(fd, b"\nentry")
+        finally:
+            os.close(fd)
+        private = application_security(target)
+        self.assertNotEqual(before, private)
+        self.assertEqual(target.read_bytes(), b"original\nentry")
+        outside = self.root / "outside-hardlink.log"
+        os.link(target, outside)
+        fd = os.open(target, os.O_WRONLY | os.O_APPEND)
+        try:
+            with self.assertRaises(ValueError):
+                ensure_private_file_descriptor(fd)
+        finally:
+            os.close(fd)
+        self.assertEqual(application_security(outside), private)
+        self.assertEqual(outside.read_bytes(), b"original\nentry")
+
+    def test_readonly_unicode_replacement_does_not_change_an_outside_hardlink(self):
+        from makewand.native_windows import atomic_copy, atomic_remove, inspect_file
+        relative = "中文-😀.txt"
+        target = self.workspace / relative
+        target.write_bytes(b"before")
+        target.chmod(stat.S_IREAD)
+        outside = self.root / "outside.txt"
+        os.link(target, outside)
+        atomic_copy(self.workspace, relative, self.source, inspect_file(self.source))
+        self.assertEqual(target.read_bytes(), b"candidate\r\n")
+        self.assertEqual(outside.read_bytes(), b"before")
+        self.assertFalse(outside.stat().st_mode & stat.S_IWRITE)
+        target.chmod(stat.S_IREAD)
+        atomic_remove(self.workspace, relative)
+        self.assertFalse(target.exists())
+        self.assertEqual(outside.read_bytes(), b"before")
+        self.assertFalse(outside.stat().st_mode & stat.S_IWRITE)
+
     def test_replacement_preserves_existing_restrictive_dacl(self):
         from makewand.native_windows import _security_descriptor, _set_dacl, dacl_fingerprint, inspect_file
         state = config.ensure_private_dir(self.root / "private")

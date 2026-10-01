@@ -204,7 +204,21 @@ func replaceApplyFile(root *os.Root, source, destination string) error {
 	header.NameLength = nameLength
 	names := unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(&buffer[0]), unsafe.Offsetof(renameInformation{}.Name))), len(name))
 	copy(names, name)
-	return windows.SetFileInformationByHandle(sourceHandle, windows.FileRenameInfoEx, &buffer[0], bufferSize)
+	// The Win32 SetFileInformationByHandle wrapper rejects a non-NULL root.
+	// NtSetInformationFile accepts the same fixed-root structure without any
+	// pathname fallback. FileRenameInformationEx is NT class 65 (Win32 class 22).
+	// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ne-wdm-_file_information_class
+	var status windows.IO_STATUS_BLOCK
+	if err := windows.NtSetInformationFile(sourceHandle, &status, &buffer[0], bufferSize, 65); err != nil {
+		if ntstatus, ok := err.(windows.NTStatus); ok {
+			// Translate to a Win32 errno so wrapped access/sharing failures retain
+			// ordinary os.IsNotExist/errors.Is semantics. Nonzero informational
+			// status, including unexpected pending I/O, also fails closed.
+			return fmt.Errorf("fixed-root Windows replacement: %w", ntstatus.Errno())
+		}
+		return err
+	}
+	return nil
 }
 
 func removeApplyFile(root *os.Root, path string) error {

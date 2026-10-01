@@ -29,16 +29,21 @@ jobs:
       - name: Install offline test dependency
         run: python -m pip install pytest
       - name: Native file, process and complete delivery runtime
-        run: python -I scripts/test_python.py test_native_windows test_native_windows_pipeline test_native_delivery test_candidate_recovery
+        run: python -I scripts/test_python.py test_native_windows test_native_windows_pipeline test_native_delivery test_candidate_recovery test_windows_runtime_regression
       - name: Native Go identity and durable apply
+        if: ${{ !cancelled() }}
         run: go test ./internal/engine -run '^TestApply|^TestCheckpointIdentity|^TestWindowsApply|^TestEngineProcess|^TestOutputCapture|^TestPreviewProcess|^TestPendingApproval' -count=1 -v
       - name: Native Go approval restart and fresh human review
+        if: ${{ !cancelled() }}
         run: go test ./internal/tui -run '^TestPendingApproval' -count=1 -v
       - name: Native Go process Jobs and bounded output
+        if: ${{ !cancelled() }}
         run: go test ./internal/processjob -count=1 -v
       - name: Native Router and raw CLI process lifecycle
+        if: ${{ !cancelled() }}
         run: go test ./router ./cmd/versus -run '^TestCLIProcess|^TestRawCLI' -count=1 -v
       - name: Native shared integer call ledger
+        if: ${{ !cancelled() }}
         run: go test ./execution -run '^Test(LedgerConcurrent|LedgerMaximum|LedgerMalformed|LedgerRejects|ContextCannot|NestedContext|CanonicalExecution|MalformedWire|ContractNullable)' -count=1 -v
 
   load-and-recovery:

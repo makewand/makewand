@@ -1308,8 +1308,8 @@ def is_unsafe_host_exec_authorized() -> bool:
 def audit_unsafe_host_exec(context: str, cmd, cwd: str, source: Optional[str]) -> None:
     """Appends one host-execution record (same fields as the Go audit log). Never blocks execution."""
     try:
-        cfg_dir = _makewand_config_dir()
-        cfg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        from makewand.config import ensure_private_dir
+        cfg_dir = ensure_private_dir(_makewand_config_dir())
         if isinstance(cmd, (list, tuple)):
             command = str(cmd[0]) if cmd else ""
             args = [str(a) for a in cmd[1:]]
@@ -1325,11 +1325,29 @@ def audit_unsafe_host_exec(context: str, cmd, cwd: str, source: Optional[str]) -
         entry["dir"] = cwd
         entry["source"] = source or ""
         line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
-        fd = os.open(str(cfg_dir / UNSAFE_HOST_EXEC_AUDIT_FILE), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        audit_path = cfg_dir / UNSAFE_HOST_EXEC_AUDIT_FILE
+        if audit_path.is_symlink():
+            raise PermissionError("refusing symlinked host execution audit file")
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(str(audit_path), flags, 0o600)
         try:
-            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
-                os.fchmod(fd, 0o600)
-            os.write(fd, line.encode("utf-8"))
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise PermissionError("host execution audit must be a regular file with one link")
+            if os.name == "nt":
+                from makewand.native_windows import ensure_private_file_descriptor
+                ensure_private_file_descriptor(fd)
+            else:
+                if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                    raise PermissionError("host execution audit file is owned by another user")
+                if stat.S_IMODE(info.st_mode) != 0o600:
+                    os.fchmod(fd, 0o600)
+            payload = line.encode("utf-8")
+            while payload:
+                written = os.write(fd, payload)
+                if written <= 0:
+                    raise OSError("host execution audit write made no progress")
+                payload = payload[written:]
         finally:
             os.close(fd)
     except Exception as exc:

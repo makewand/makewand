@@ -162,6 +162,7 @@ type localProvider struct {
 	calls           atomic.Int64
 	bulkheadRelease chan struct{}
 	releaseOnce     sync.Once
+	cancelStarted   sync.Map
 	Identity        string
 	Delay           time.Duration
 }
@@ -183,6 +184,11 @@ func (p *localProvider) Chat(ctx context.Context, messages []router.Message, _ s
 	content := ""
 	if len(messages) > 0 {
 		content = messages[len(messages)-1].Content
+	}
+	if strings.HasPrefix(content, "slow:cancel:") {
+		p.cancelStarted.Store(content, true)
+		<-ctx.Done()
+		return "", router.Usage{MeasuredCost: true}, ctx.Err()
 	}
 	if content == "slow:crash" {
 		<-ctx.Done()
@@ -298,6 +304,7 @@ func serveChild(o options) error {
 		return nil
 	}})
 	mux := http.NewServeMux()
+	var cancelCompleted sync.Map
 	mux.HandleFunc("/drill/inflight", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]int64{"active": provider.active.Load(), "peak": provider.peak.Load(), "calls": provider.calls.Load()})
 	})
@@ -305,7 +312,22 @@ func serveChild(o options) error {
 		provider.releaseOnce.Do(func() { close(provider.bulkheadRelease) })
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.Handle("/", handler)
+	mux.HandleFunc("/drill/cancellation", func(w http.ResponseWriter, req *http.Request) {
+		id := req.URL.Query().Get("request_id")
+		_, started := provider.cancelStarted.Load(id)
+		_, completed := cancelCompleted.Load(id)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"started": started, "completed": completed})
+	})
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		id := serverhttp.RequestIDFromRequest(req)
+		if strings.HasPrefix(id, "slow:cancel:") {
+			// Router's usage finalizer runs before ServeHTTP returns. A client
+			// transport cancellation or provider exit alone does not prove that
+			// the durable reservation has finished settling.
+			defer cancelCompleted.Store(id, true)
+		}
+		handler.ServeHTTP(w, req)
+	}))
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -452,7 +474,7 @@ func waitActive(ctx context.Context, client *http.Client, url string) error {
 	}
 }
 
-func post(ctx context.Context, client *http.Client, url, token, content string, stream bool) (int, string, error) {
+func post(ctx context.Context, client *http.Client, url, token, content string, stream bool, requestID ...string) (int, string, error) {
 	payload, _ := json.Marshal(map[string]any{"model": "claude", "messages": []map[string]string{{"role": "user", "content": content}}, "stream": stream})
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
@@ -460,6 +482,9 @@ func post(ctx context.Context, client *http.Client, url, token, content string, 
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+token)
+	if len(requestID) != 0 {
+		request.Header.Set(serverhttp.HeaderRequestID, requestID[0])
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, "", err
@@ -467,6 +492,44 @@ func post(ctx context.Context, client *http.Client, url, token, content string, 
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	return response.StatusCode, string(data), err
+}
+
+func waitCancellation(ctx context.Context, client *http.Client, baseURL, id string, completed bool) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/drill/cancellation", nil)
+		if err != nil {
+			return err
+		}
+		query := request.URL.Query()
+		query.Set("request_id", id)
+		request.URL.RawQuery = query.Encode()
+		response, err := client.Do(request)
+		if err != nil {
+			return err
+		}
+		var state struct {
+			Started   bool `json:"started"`
+			Completed bool `json:"completed"`
+		}
+		err = json.NewDecoder(response.Body).Decode(&state)
+		response.Body.Close()
+		if err != nil {
+			return err
+		}
+		if state.Completed && !state.Started {
+			return fmt.Errorf("cancellation %s completed without dispatching the provider", id)
+		}
+		if state.Started && (!completed || state.Completed) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for cancellation %s completed=%t: %w", id, completed, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func runHTTP(ctx context.Context, o options, client *http.Client, url string) (latency, error) {
@@ -666,43 +729,37 @@ func runDrill(ctx context.Context, o options, r *report) error {
 	}
 	db.Close()
 	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("slow:cancel:%d", i)
 		cancelCtx, cancel := context.WithCancel(ctx)
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			_, _, _ = post(cancelCtx, client, child.url, "drill-control", "slow:cancel", false)
+			_, _, _ = post(cancelCtx, client, child.url, "drill-control", id, false, id)
 		}()
-		if err = waitActive(ctx, client, child.url); err != nil {
+		if err = waitCancellation(ctx, client, child.url, id, false); err != nil {
 			cancel()
 			return err
 		}
 		cancel()
 		<-done
+		if err = waitCancellation(ctx, client, child.url, id, true); err != nil {
+			return err
+		}
 	}
 	db, err = serverdb.Open(path)
 	if err != nil {
 		return err
 	}
-	var pending int
-	cancelWait := time.Now().Add(5 * time.Second)
-	for {
-		err = db.QueryRow(`SELECT COUNT(*) FROM budget_reservations r JOIN budget_reservation_scopes s ON s.request_id=r.request_id WHERE s.scope_id='control' AND r.state='pending'`).Scan(&pending)
-		if err != nil || pending == 0 || time.Now().After(cancelWait) {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			db.Close()
-			return ctx.Err()
-		case <-time.After(10 * time.Millisecond):
-		}
+	var pending, refunded int
+	err = db.QueryRow(`SELECT COUNT(*) FROM budget_reservations r JOIN budget_reservation_scopes s ON s.request_id=r.request_id WHERE s.scope_id='control' AND r.state='pending'`).Scan(&pending)
+	if err == nil {
+		err = db.QueryRow(`SELECT COUNT(*) FROM usage_entries WHERE token_id='control' AND request_id LIKE 'slow:cancel:%' AND cost_micro_usd=0`).Scan(&refunded)
 	}
-
 	db.Close()
 	if err != nil {
 		return err
 	}
-	if err = record(r, "cancel_refunds_known_unspent", pending == 0, fmt.Sprintf("pending control reservations=%d", pending)); err != nil {
+	if err = record(r, "cancel_refunds_known_unspent", pending == 0 && refunded == 8, fmt.Sprintf("8 distinct providers started and HTTP handlers settled; pending control reservations=%d zero-cost refunds=%d", pending, refunded)); err != nil {
 		return err
 	}
 	if err = backupDrill(ctx, o, r, child, directory, client); err != nil {
