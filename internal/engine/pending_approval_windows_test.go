@@ -58,6 +58,7 @@ func TestPendingApprovalWindowsSidecarHardlinkRefusesWithoutChangingOutsideACL(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	legacyBefore := legacyApplyWindowsSecurity(t, outside)
 	if err := os.Link(outside, filepath.Join(path, "approvals.sqlite-wal")); err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +72,9 @@ func TestPendingApprovalWindowsSidecarHardlinkRefusesWithoutChangingOutsideACL(t
 	after, err := applyFileSecurity(outside)
 	if err != nil || after != before {
 		t.Fatalf("outside ACL changed: %s -> %s, %v", before, after, err)
+	}
+	if legacyAfter := legacyApplyWindowsSecurity(t, outside); legacyAfter != legacyBefore {
+		t.Fatalf("outside legacy DACL changed: %s -> %s", legacyBefore, legacyAfter)
 	}
 }
 
@@ -96,7 +100,7 @@ func TestPendingApprovalWindowsPrivateDirectoryBindsCurrentUser(t *testing.T) {
 	if err != nil || owner == nil || !owner.Equals(user.User.Sid) {
 		t.Fatalf("default group owner was not bound to current user: %v", err)
 	}
-	actual, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	actual, err := applyQuerySecurity(handle, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,9 +108,17 @@ func TestPendingApprovalWindowsPrivateDirectoryBindsCurrentUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Both values use the OS's canonical SID representation (an administrative
-	// user's SID can be abbreviated LA), while binding the same exact accounts.
-	if actual.String() != expected.String() {
-		t.Fatalf("private directory DACL differs: %s, want %s", actual.String(), expected.String())
+	actualValue, err := applySecurityValue(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedValue, err := applySecurityValue(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The DACL contract preserves every ACE and its inheritance flags, plus
+	// protection. Owner was checked independently above; AI is bookkeeping.
+	if actualValue != expectedValue {
+		t.Fatalf("private directory DACL differs: %s, want %s", actualValue, expectedValue)
 	}
 }

@@ -214,10 +214,11 @@ class NativeWindowsFileTests(unittest.TestCase):
 
     def test_original_security_restores_across_a_private_backup_directory(self):
         from makewand.native_windows import (application_security, application_security_descriptor,
-                                            atomic_copy, copy_backup, inspect_file,
+                                            atomic_copy, copy_backup, dacl_fingerprint, inspect_file,
                                             validate_application_security_descriptor)
         target = self.workspace / "file.txt"
         target.write_bytes(b"original")
+        legacy_security = dacl_fingerprint(target)
         original = inspect_file(target)
         security = application_security(target)
         descriptor = application_security_descriptor(target)
@@ -227,6 +228,8 @@ class NativeWindowsFileTests(unittest.TestCase):
         copy_backup(target, backup)
         self.assertNotEqual(application_security(backup), security)
         atomic_copy(self.workspace, "file.txt", self.source, inspect_file(self.source))
+        self.assertEqual(dacl_fingerprint(target), legacy_security)
+        self.assertEqual(application_security(target), security)
 
         def before_replace(value):
             self.assertEqual(value, security)
@@ -236,6 +239,67 @@ class NativeWindowsFileTests(unittest.TestCase):
                     restore_security=descriptor, before_replace=before_replace)
         self.assertEqual(target.read_bytes(), b"original")
         self.assertEqual(application_security(target), security)
+        self.assertEqual(dacl_fingerprint(target), legacy_security)
+        self.assertEqual(application_security_descriptor(target), descriptor)
+
+    def test_fixed_handle_security_seals_the_saved_ace_flags(self):
+        import ctypes
+        from ctypes import wintypes
+        from makewand.native_windows import (_api, _application_security_value, _open,
+                                            _open_file_security_descriptor, _security_descriptor,
+                                            application_security)
+        target = self.workspace / "inherited.txt"
+        target.write_bytes(b"fixture")
+        saved = _security_descriptor(target, 4)
+        expected = _application_security_value(saved)
+        self.assertEqual(application_security(target), expected)
+        handle = _open(target, access=0x20000 | 0x80)
+        shown = ctypes.c_void_p()
+        kernel, advapi = _api(), ctypes.WinDLL("advapi32", use_last_error=True)
+        getter = advapi.GetSecurityInfo
+        getter.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        getter.restype = wintypes.DWORD
+        try:
+            self.assertEqual(getter(handle, 1, 4, None, None, None, None, ctypes.byref(shown)), 0)
+            presented = _application_security_value(shown)
+            self.assertEqual(_application_security_value(_open_file_security_descriptor(handle)), expected)
+            get_control = advapi.GetSecurityDescriptorControl
+            get_control.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)]
+            get_control.restype = wintypes.BOOL
+            get_dacl = advapi.GetSecurityDescriptorDacl
+            get_dacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p),
+                                ctypes.POINTER(wintypes.BOOL)]
+            get_dacl.restype = wintypes.BOOL
+
+            def summary(descriptor):
+                control, revision = wintypes.WORD(), wintypes.DWORD()
+                present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+                self.assertTrue(get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)))
+                self.assertTrue(get_dacl(descriptor, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted)))
+                entries = []
+                if acl:
+                    size = ctypes.c_uint16.from_address(acl.value + 2).value
+                    count = ctypes.c_uint16.from_address(acl.value + 4).value
+                    raw = ctypes.string_at(acl, size)
+                    offset = 8
+                    for _ in range(count):
+                        entry_size = int.from_bytes(raw[offset + 2:offset + 4], "little")
+                        entries.append((raw[offset], raw[offset + 1], raw[offset + 4:offset + 8].hex()))
+                        offset += entry_size
+                return hex(control.value), entries
+
+            # Keep evidence of legacy/current presentation differences without
+            # weakening any saved-byte or ACE-inheritance preservation check.
+            print("Windows saved/presented DACL seals:", expected, presented,
+                  "control/type/ACE flags/mask:", summary(saved), summary(shown))
+            self.assertEqual(_application_security_value(_security_descriptor(target, 4)), expected)
+        finally:
+            if shown:
+                kernel.LocalFree.argtypes = [ctypes.c_void_p]
+                kernel.LocalFree.restype = ctypes.c_void_p
+                kernel.LocalFree(shown)
+            kernel.CloseHandle(handle)
 
 
 @unittest.skipUnless(os.name == "nt", "requires real native Windows delivery")
@@ -292,7 +356,7 @@ class NativeWindowsCandidateTests(unittest.TestCase):
 
     def test_mid_apply_failure_restores_bytes_deletions_and_additions(self):
         from makewand import candidate as module
-        from makewand.native_windows import dacl_fingerprint
+        from makewand.native_windows import application_security, application_security_descriptor, dacl_fingerprint
         real_copy = module._atomic_copy
         calls = 0
 
@@ -306,12 +370,16 @@ class NativeWindowsCandidateTests(unittest.TestCase):
 
         before = build_manifest(self.workspace)
         before_acls = {name: dacl_fingerprint(self.workspace / name) for name in before}
+        before_seals = {name: application_security(self.workspace / name) for name in before}
+        before_descriptors = {name: application_security_descriptor(self.workspace / name) for name in before}
         with mock.patch.object(module, "_atomic_copy", side_effect=injected_copy):
             ok, _, message = CandidateManager.apply_candidate("windows-runtime", "B")
         self.assertFalse(ok, message)
         self.assertIn("回滚", message)
         self.assertEqual(build_manifest(self.workspace), before)
         self.assertEqual({name: dacl_fingerprint(self.workspace / name) for name in before}, before_acls)
+        self.assertEqual({name: application_security(self.workspace / name) for name in before}, before_seals)
+        self.assertEqual({name: application_security_descriptor(self.workspace / name) for name in before}, before_descriptors)
 
     def crash_before_commit(self):
         repository = Path(__file__).resolve().parent.parent

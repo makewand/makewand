@@ -261,8 +261,12 @@ class MixedTestDiscoveryTests(unittest.TestCase):
 
             def fixture_process(cmd, workspace, **kwargs):
                 commands.append(cmd)
+                # This regression exercises discovery, without loading unrelated
+                # pytest plugins installed in the developer's Python environment.
+                fixture_env = {**os.environ, **kwargs.get("extra_env", {}),
+                               "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
                 result = subprocess.run(cmd, cwd=workspace, capture_output=True, text=True,
-                                        env={**os.environ, **kwargs.get("extra_env", {})}, timeout=20)
+                                        env=fixture_env, timeout=20)
                 return result.returncode, result.stdout, result.stderr, None
 
             with patch("makewand.sandbox.run_in_sandbox", side_effect=fixture_process):

@@ -19,7 +19,7 @@ func applyPrivateOpenHandle(handle windows.Handle, directory bool) error {
 	if err != nil {
 		return err
 	}
-	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	sd, err := applyQuerySecurity(handle, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		return err
 	}
@@ -60,8 +60,14 @@ func applyPrivateOpenHandle(handle windows.Handle, directory bool) error {
 	// Directory callers already acquired WRITE_OWNER/WRITE_DAC on their fixed,
 	// non-reparse handle while every ancestor was pinned against replacement.
 	if normalizeOwner {
-		if err := windows.SetSecurityInfo(privateHandle, windows.SE_FILE_OBJECT,
-			windows.OWNER_SECURITY_INFORMATION, user.User.Sid, nil, nil, nil); err != nil {
+		ownerDescriptor, err := windows.NewSecurityDescriptor()
+		if err != nil {
+			return err
+		}
+		if err := ownerDescriptor.SetOwner(user.User.Sid, false); err != nil {
+			return err
+		}
+		if err := applySetCapturedSecurity(privateHandle, windows.OWNER_SECURITY_INFORMATION, ownerDescriptor); err != nil {
 			return fmt.Errorf("normalize authorized default owner: %w", err)
 		}
 	}
@@ -69,12 +75,18 @@ func applyPrivateOpenHandle(handle windows.Handle, directory bool) error {
 	if err != nil {
 		return err
 	}
-	dacl, _, err := private.DACL()
+	if err := applySetCapturedDACL(privateHandle, private); err != nil {
+		return err
+	}
+	actual, err := applyQuerySecurity(privateHandle, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		return err
 	}
-	return windows.SetSecurityInfo(privateHandle, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	actualOwner, _, err := actual.Owner()
+	if err != nil || actualOwner == nil || !actualOwner.Equals(user.User.Sid) {
+		return fmt.Errorf("private state owner differs from current user")
+	}
+	return nil
 }
 
 func privatePendingFile(file *os.File) error {

@@ -119,6 +119,104 @@ func TestApplyPreservesEditBetweenReplacements(t *testing.T) {
 	}
 }
 
+type applyRemovingHeaderContext struct {
+	context.Context
+	p       *Project
+	removed bool
+	err     error
+}
+
+func (c *applyRemovingHeaderContext) Err() error {
+	if c.removed {
+		return c.err
+	}
+	data, err := os.ReadFile(filepath.Join(c.p.Path, "a.txt"))
+	if err == nil && string(data) == "new-a" {
+		state, _, err := c.p.applyStatePath()
+		if err == nil {
+			err = os.Remove(filepath.Join(state, "pending", "journal.json"))
+		}
+		c.removed = true
+		c.err = errors.Join(context.Canceled, err)
+	}
+	return c.err
+}
+
+func TestApplyMissingPublishedHeaderPreservesRecoveryEvidence(t *testing.T) {
+	p := applyFixture(t)
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := p.WriteFile(name, "old-"+strings.TrimSuffix(name, ".txt")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := &applyRemovingHeaderContext{Context: context.Background(), p: p}
+	err := p.ApplyFilesTransactional(ctx, []ExtractedFile{{Path: "a.txt", Content: "new-a"}, {Path: "b.txt", Content: "new-b"}}, nil)
+	if !ctx.removed || !errors.Is(err, context.Canceled) || !errors.Is(err, ErrStaleApply) {
+		t.Fatalf("missing published header was treated as successful rollback: removed=%v, err=%v", ctx.removed, err)
+	}
+	requireApplyContent(t, p, "a.txt", "new-a")
+	requireApplyContent(t, p, "b.txt", "old-b")
+	state, _, err := p.applyStatePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"000000.before", "000000.after", "000001.before", "000001.after"} {
+		if _, err := os.Stat(filepath.Join(state, "pending", name)); err != nil {
+			t.Fatalf("missing header caused evidence %s to be removed: %v", name, err)
+		}
+	}
+	// ApplyFilesTransactional has closed its state. A fresh process/instance
+	// must retain the same fault evidence without inventing a replacement header.
+	reopened, err := p.openApplyState(context.Background(), false)
+	if err != nil || reopened == nil {
+		t.Fatalf("open uncertain recovery state: %v", err)
+	}
+	defer reopened.close()
+	if reopened.published {
+		t.Fatal("fresh state inherited the active instance's in-memory publication flag")
+	}
+	if err := p.recoverApplyLocked(reopened); !errors.Is(err, ErrStaleApply) {
+		t.Fatalf("fresh recovery cleared lost-header evidence: %v", err)
+	}
+	for _, name := range []string{"lost-header", "000000.before", "000000.after", "000001.before", "000001.after"} {
+		if _, err := reopened.root.Stat(filepath.Join("pending", name)); err != nil {
+			t.Fatalf("fresh recovery removed fault evidence %s: %v", name, err)
+		}
+	}
+	if _, err := reopened.root.Stat(filepath.Join("pending", "journal.json")); !os.IsNotExist(err) {
+		t.Fatalf("lost header was replaced with a guessed journal: %v", err)
+	}
+	requireApplyContent(t, p, "a.txt", "new-a")
+	requireApplyContent(t, p, "b.txt", "old-b")
+}
+
+func TestApplyUnpublishedPreparationCanBeCleanedWithoutWorkspaceWrites(t *testing.T) {
+	p := applyFixture(t)
+	if err := p.WriteFile("old.txt", "before"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := p.openApplyState(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.close()
+	if err := state.root.Mkdir("pending", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A preparation interrupted before its first header may leave a sealed
+	// blob; the protocol has not allowed any workspace replacement yet.
+	if err := os.WriteFile(filepath.Join(state.path, "pending", "000000.before"), []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.recoverApplyLocked(state); err != nil {
+		t.Fatalf("unpublished preparation could not be cleaned: %v", err)
+	}
+	requireApplyContent(t, p, "old.txt", "before")
+	if _, err := state.root.Stat("pending"); !os.IsNotExist(err) {
+		t.Fatalf("unpublished preparation was preserved as a false conflict: %v", err)
+	}
+}
+
 func TestApplyRecoveryCleanupUsesHeldRoot(t *testing.T) {
 	p := applyFixture(t)
 	if err := os.Mkdir(filepath.Join(p.Path, "nested"), 0o700); err != nil {
@@ -248,6 +346,30 @@ func TestApplyRecoveryRestoresWholeBatchAndRemovesCreatedPaths(t *testing.T) {
 	}
 	if err := p.RecoverInterruptedApply(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestApplyRecoveryFinalPreimageCheckPreservesLateExternalEdit(t *testing.T) {
+	p := applyFixture(t)
+	state, _ := preparePartialApply(t, p)
+	defer state.close()
+	state.afterRestore = func(entry applyJournalEntry) error {
+		if entry.Path == filepath.Join("nested", "new.txt") {
+			return os.WriteFile(filepath.Join(p.Path, "a.txt"), []byte("late external edit"), 0o600)
+		}
+		return nil
+	}
+	if err := p.recoverApplyLocked(state); !errors.Is(err, ErrStaleApply) {
+		t.Fatalf("recovery published success after a restored target changed: %v", err)
+	}
+	requireApplyContent(t, p, "a.txt", "late external edit")
+	requireApplyContent(t, p, "b.txt", "old-b")
+	journal, err := state.read()
+	if err != nil || journal.State != "applying" {
+		t.Fatalf("recovery evidence was finalized: %v, %v", journal, err)
+	}
+	if _, err := state.root.Stat(filepath.Join("pending", "000000.before")); err != nil {
+		t.Fatalf("recovery preimage evidence was removed: %v", err)
 	}
 }
 

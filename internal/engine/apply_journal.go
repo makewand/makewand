@@ -53,6 +53,8 @@ type applyJournalState struct {
 	root          *os.Root
 	lock          *os.File
 	syncDirectory func(string) error
+	afterRestore  func(applyJournalEntry) error
+	published     bool
 }
 
 var openApplyWorkspaceRoot = os.OpenRoot
@@ -248,7 +250,14 @@ func (p *Project) openApplyState(ctx context.Context, create bool) (*applyJourna
 		// key, and applyStatePath rejects state inside the candidate workspace.
 		//nolint:gosec // G703: validated external state path, not a candidate-relative filename.
 		if _, err := os.Lstat(filepath.Join(path, "pending", "journal.json")); os.IsNotExist(err) {
-			return nil, nil
+			// A persisted lost-header diagnostic also needs the lock and fixed
+			// state root, even though no journal is available to recover.
+			//nolint:gosec // G703: same validated external state path as the journal.
+			if _, markerErr := os.Lstat(filepath.Join(path, "pending", "lost-header")); os.IsNotExist(markerErr) {
+				return nil, nil
+			} else if markerErr != nil {
+				return nil, markerErr
+			}
 		} else if err != nil {
 			return nil, err
 		}
@@ -326,7 +335,7 @@ func (p *Project) prepareApplyJournal(ctx context.Context, s *applyJournalState,
 		if resultErr != nil {
 			// A published header owns its preimages even when the following
 			// directory sync failed. Preserve them for the next recovery.
-			if _, err := s.root.Lstat(filepath.Join("pending", "journal.json")); os.IsNotExist(err) {
+			if _, err := s.root.Lstat(filepath.Join("pending", "journal.json")); os.IsNotExist(err) && !s.published {
 				_ = s.removePending()
 			}
 		}
@@ -480,6 +489,7 @@ func (s *applyJournalState) write(journal *applyJournal) error {
 	if err := s.root.Rename(name, filepath.Join("pending", "journal.json")); err != nil {
 		return err
 	}
+	s.published = true
 	syncDir := s.syncDirectory
 	if syncDir == nil {
 		syncDir = syncApplyDirectory
@@ -511,12 +521,19 @@ func (s *applyJournalState) read() (*applyJournal, error) {
 	if err := json.Unmarshal(content, &journal); err != nil {
 		return nil, err
 	}
+	s.published = true
 	return &journal, nil
 }
 
 func (p *Project) recoverApplyLocked(s *applyJournalState) error {
 	journal, err := s.read()
 	if os.IsNotExist(err) {
+		if _, markerErr := s.root.Lstat(filepath.Join("pending", "lost-header")); !os.IsNotExist(markerErr) {
+			return errors.Join(fmt.Errorf("%w: published apply header was lost; evidence preserved at %s", ErrStaleApply, s.path), markerErr)
+		}
+		if s.published {
+			return errors.Join(fmt.Errorf("%w: published apply journal is missing; evidence preserved at %s", ErrStaleApply, s.path), s.markLostHeader())
+		}
 		// A crash before publishing the header cannot have written the workspace.
 		return s.removePending()
 	}
@@ -560,12 +577,51 @@ func (p *Project) recoverApplyLocked(s *applyJournalState) error {
 		if err := p.restoreApplyEntry(root, s, entry); err != nil {
 			return fmt.Errorf("recover %s: %w; journal preserved at %s", entry.Path, err, s.path)
 		}
+		if s.afterRestore != nil {
+			if err := s.afterRestore(entry); err != nil {
+				return err
+			}
+		}
+	}
+	// A later restoration or an external writer may have changed an earlier
+	// target. Publish success only after checking every actual preimage again.
+	if err := checkApplyWorkspace(workspace, journal.RootID); err != nil {
+		return fmt.Errorf("%w; journal preserved at %s", err, s.path)
+	}
+	if err := checkApplyRoot(root, journal.RootID); err != nil {
+		return fmt.Errorf("%w; journal preserved at %s", err, s.path)
+	}
+	if err := p.validateApplyRecovery(root, s, journal, false); err != nil {
+		return fmt.Errorf("%w; journal preserved at %s", err, s.path)
 	}
 	journal.State = "rolled_back"
 	if err := s.write(journal); err != nil {
 		return err
 	}
 	return s.removePending()
+}
+
+// This diagnostic is written only after observing a previously published
+// header disappear. It carries no replacement journal or guessed preimages;
+// a fresh process must preserve the remaining evidence rather than treating
+// this known fault as an ordinary interruption before initial publication.
+func (s *applyJournalState) markLostHeader() error {
+	file, err := s.root.OpenFile(filepath.Join("pending", "lost-header"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("persist lost apply header diagnostic: %w", err)
+	}
+	if _, err = file.WriteString("apply header disappeared after publication; recovery is uncertain\n"); err == nil {
+		err = file.Sync()
+	}
+	err = errors.Join(err, file.Close())
+	if err != nil {
+		return fmt.Errorf("flush lost apply header diagnostic: %w", err)
+	}
+	syncDir := s.syncDirectory
+	if syncDir == nil {
+		syncDir = syncApplyDirectory
+	}
+	return errors.Join(syncDir(filepath.Join(s.path, "pending")), syncDir(s.path))
 }
 
 func (p *Project) validateApplyRecovery(root *os.Root, s *applyJournalState, journal *applyJournal, allowAfter bool) error {
@@ -860,6 +916,7 @@ func (p *Project) validateApplyPostimages(root *os.Root, journal *applyJournal) 
 
 func (s *applyJournalState) removePending() error {
 	if _, err := s.root.Lstat("pending"); os.IsNotExist(err) {
+		s.published = false
 		return nil
 	} else if err != nil {
 		return err
@@ -867,5 +924,6 @@ func (s *applyJournalState) removePending() error {
 	if err := s.root.RemoveAll("pending"); err != nil {
 		return err
 	}
+	s.published = false
 	return syncApplyDirectory(s.path)
 }

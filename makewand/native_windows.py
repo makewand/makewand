@@ -59,21 +59,42 @@ def _security_descriptor(path, information):
 
 
 def _set_dacl(path, descriptor, *, protected=None):
+    """Set the original DACL on a captured object without re-inheriting ACEs."""
     from ctypes import wintypes
+    path = Path(path)
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    setter = advapi.SetFileSecurityW
-    setter.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
-    setter.restype = wintypes.BOOL
-    if protected is None:
-        get_control = advapi.GetSecurityDescriptorControl
-        get_control.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)]
-        get_control.restype = wintypes.BOOL
-        control, revision = wintypes.WORD(), wintypes.DWORD()
-        if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
+    # The NT query/set pair uses the descriptor actually stored on the file.
+    # GetSecurityInfo can present legacy ACEs through the current inheritance
+    # model, and SetSecurityInfo propagates/reconstructs inherited ACEs. Neither
+    # behavior is suitable for restoring an exact sealed preimage.
+    # https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-zwsetsecurityobject
+    length = advapi.GetSecurityDescriptorLength
+    length.argtypes = [ctypes.c_void_p]
+    length.restype = wintypes.DWORD
+    size = length(descriptor)
+    if not 20 <= size <= 65536:
+        raise ValueError("Windows application security descriptor exceeds its bound")
+    owned = ctypes.create_string_buffer(ctypes.string_at(descriptor, size))
+    if protected is not None:
+        set_control = advapi.SetSecurityDescriptorControl
+        set_control.argtypes = [ctypes.c_void_p, wintypes.WORD, wintypes.WORD]
+        set_control.restype = wintypes.BOOL
+        if not set_control(owned, 0x1000, 0x1000 if protected else 0):
             raise ctypes.WinError(ctypes.get_last_error())
-        protected = bool(control.value & 0x1000)
-    if not setter(str(path), 4 | (0x80000000 if protected else 0x20000000), descriptor):
-        raise ctypes.WinError(ctypes.get_last_error())
+    with pinned_directory(path.parent):
+        handle = _open(path, directory=path.is_dir(), access=0x40000 | 0x20000 | 0x80)
+        try:
+            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+            setter = ntdll.NtSetSecurityObject
+            setter.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p]
+            setter.restype = ctypes.c_int32
+            status = setter(handle, 4, owned)  # DACL_SECURITY_INFORMATION only
+            _check_nt_status(status)
+            if (_application_security_value(_open_file_security_descriptor(handle))
+                    != _application_security_value(owned)):
+                raise ValueError("Windows did not preserve the exact original application DACL")
+        finally:
+            _api().CloseHandle(handle)
 
 
 def dacl_fingerprint(path):
@@ -97,55 +118,55 @@ def _open_file_security_descriptor(handle):
     """Copy the DACL descriptor of one captured object, never a fresh pathname."""
     from ctypes import wintypes
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    getter = advapi.GetSecurityInfo
-    getter.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD,
-                      ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                      ctypes.POINTER(ctypes.c_void_p)]
-    getter.restype = wintypes.DWORD
-    descriptor = ctypes.c_void_p()
-    error = getter(handle, 1, 4, None, None, None, None, ctypes.byref(descriptor))
-    if error:
-        raise ctypes.WinError(error)
-    try:
-        # Construct a canonical DACL-only self-relative snapshot while the
-        # original descriptor and its ACL pointers are still alive.
-        class AbsoluteDescriptor(ctypes.Structure):
-            _fields_ = [("revision", ctypes.c_ubyte), ("reserved", ctypes.c_ubyte),
-                        ("control", wintypes.WORD), ("owner", ctypes.c_void_p),
-                        ("group", ctypes.c_void_p), ("sacl", ctypes.c_void_p), ("dacl", ctypes.c_void_p)]
-        signatures = {
-            "GetSecurityDescriptorDacl": ([ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
-            "GetSecurityDescriptorControl": ([ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
-            "InitializeSecurityDescriptor": ([ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
-            "SetSecurityDescriptorDacl": ([ctypes.c_void_p, wintypes.BOOL, ctypes.c_void_p, wintypes.BOOL], wintypes.BOOL),
-            "SetSecurityDescriptorControl": ([ctypes.c_void_p, wintypes.WORD, wintypes.WORD], wintypes.BOOL),
-            "MakeSelfRelativeSD": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
-        }
-        for name, (arguments, result) in signatures.items():
-            getattr(advapi, name).argtypes = arguments
-            getattr(advapi, name).restype = result
-        present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
-        control, revision = wintypes.WORD(), wintypes.DWORD()
-        absolute = AbsoluteDescriptor()
-        if (not advapi.GetSecurityDescriptorDacl(descriptor, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted))
-                or not advapi.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision))
-                or not advapi.InitializeSecurityDescriptor(ctypes.byref(absolute), 1)
-                or not advapi.SetSecurityDescriptorDacl(ctypes.byref(absolute), present, acl, defaulted)
-                or not advapi.SetSecurityDescriptorControl(ctypes.byref(absolute), 0x1000, control.value & 0x1000)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        size = wintypes.DWORD()
-        advapi.MakeSelfRelativeSD(ctypes.byref(absolute), None, ctypes.byref(size))
-        if not 20 <= size.value <= 65536:
-            raise ValueError("Windows application security descriptor exceeds its bound")
-        snapshot = ctypes.create_string_buffer(size.value)
-        if not advapi.MakeSelfRelativeSD(ctypes.byref(absolute), snapshot, ctypes.byref(size)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return ctypes.create_string_buffer(snapshot.raw)
-    finally:
-        kernel = _api()
-        kernel.LocalFree.argtypes = [ctypes.c_void_p]
-        kernel.LocalFree.restype = ctypes.c_void_p
-        kernel.LocalFree(descriptor)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    getter = ntdll.NtQuerySecurityObject
+    getter.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.ULONG,
+                      ctypes.POINTER(wintypes.ULONG)]
+    getter.restype = ctypes.c_int32
+    needed = wintypes.ULONG()
+    # NTFS limits descriptors to 64 KiB; one bounded buffer avoids a size/query
+    # race. Unlike GetSecurityInfo this reads the saved ACE flags without
+    # converting a legacy inheritance model for presentation.
+    # https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-zwquerysecurityobject
+    descriptor = ctypes.create_string_buffer(65536)
+    status = getter(handle, 4, descriptor, len(descriptor), ctypes.byref(needed))
+    _check_nt_status(status)
+    if not 20 <= needed.value <= len(descriptor):
+        raise ValueError("Windows application security descriptor exceeds its bound")
+    # Construct a canonical DACL-only self-relative snapshot while the
+    # original descriptor and its ACL pointers are still alive.
+    class AbsoluteDescriptor(ctypes.Structure):
+        _fields_ = [("revision", ctypes.c_ubyte), ("reserved", ctypes.c_ubyte),
+                    ("control", wintypes.WORD), ("owner", ctypes.c_void_p),
+                    ("group", ctypes.c_void_p), ("sacl", ctypes.c_void_p), ("dacl", ctypes.c_void_p)]
+    signatures = {
+        "GetSecurityDescriptorDacl": ([ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+        "GetSecurityDescriptorControl": ([ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "InitializeSecurityDescriptor": ([ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+        "SetSecurityDescriptorDacl": ([ctypes.c_void_p, wintypes.BOOL, ctypes.c_void_p, wintypes.BOOL], wintypes.BOOL),
+        "SetSecurityDescriptorControl": ([ctypes.c_void_p, wintypes.WORD, wintypes.WORD], wintypes.BOOL),
+        "MakeSelfRelativeSD": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+    }
+    for name, (arguments, result) in signatures.items():
+        getattr(advapi, name).argtypes = arguments
+        getattr(advapi, name).restype = result
+    present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+    control, revision = wintypes.WORD(), wintypes.DWORD()
+    absolute = AbsoluteDescriptor()
+    if (not advapi.GetSecurityDescriptorDacl(descriptor, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted))
+            or not advapi.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision))
+            or not advapi.InitializeSecurityDescriptor(ctypes.byref(absolute), 1)
+            or not advapi.SetSecurityDescriptorDacl(ctypes.byref(absolute), present, acl, defaulted)
+            or not advapi.SetSecurityDescriptorControl(ctypes.byref(absolute), 0x1000, control.value & 0x1000)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    size = wintypes.DWORD()
+    advapi.MakeSelfRelativeSD(ctypes.byref(absolute), None, ctypes.byref(size))
+    if not 20 <= size.value <= 65536:
+        raise ValueError("Windows application security descriptor exceeds its bound")
+    snapshot = ctypes.create_string_buffer(size.value)
+    if not advapi.MakeSelfRelativeSD(ctypes.byref(absolute), snapshot, ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return ctypes.create_string_buffer(snapshot.raw)
 
 
 def _application_security_descriptor(path):
@@ -601,13 +622,13 @@ def atomic_copy(workspace, relative, source, expected=None, *, restore_acl=False
             elif _copy_source_acl and (expected is None or restore_acl):
                 # Legacy host copies retain source ACLs. Transaction rollback
                 # supplies its separately sealed original security descriptor.
-                _set_dacl(temporary, _security_descriptor(source, 4))
+                _set_dacl(temporary, _open_file_security_descriptor(msvcrt.get_osfhandle(src.fileno())))
             elif os.path.lexists(destination):
-                handle = _open(destination)
+                handle = _open(destination, access=0x20000 | 0x80)
                 try:
                     # Preserve the original file DACL. A replacement must not
                     # widen a restrictive ACL by inheriting its parent's ACL.
-                    _set_dacl(temporary, _security_descriptor(destination, 4))
+                    _set_dacl(temporary, _open_file_security_descriptor(handle))
                 finally:
                     _api().CloseHandle(handle)
             if before_replace is not None:
@@ -709,9 +730,15 @@ def _set_nt_file_information(handle, kind, buffer, size):
                        wintypes.ULONG, ctypes.c_int]
     setter.restype = ctypes.c_int32  # NTSTATUS is signed 32 bit on x64 too.
     status = setter(handle, ctypes.byref(IoStatusBlock()), buffer, size, kind)
+    _check_nt_status(status)
+
+
+def _check_nt_status(status):
+    from ctypes import wintypes
     if status != 0:
         # The handles are synchronous; never publish a commit for an incomplete
         # STATUS_PENDING result or an informational status we did not expect.
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
         converter = ntdll.RtlNtStatusToDosError
         converter.argtypes = [ctypes.c_int32]
         converter.restype = wintypes.ULONG

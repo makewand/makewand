@@ -308,6 +308,26 @@ os._exit(87)
         self.assertFalse(ok, message)
         self.assertEqual(build_manifest(self.workspace), self.before)
 
+    def test_missing_journal_header_during_failure_cannot_claim_rollback(self):
+        def remove_header_and_fail(workspace, relative, **kwargs):
+            self.assertEqual(relative, "b.txt")
+            next(config.BACKUPS_DIR.glob("*/journal.json")).unlink()
+            raise OSError("injected missing journal header before deletion")
+        with mock.patch.object(candidate_module, "_atomic_remove", side_effect=remove_header_and_fail):
+            ok, _, message = CandidateManager.apply_candidate("recovery-fixture", "B")
+        self.assertFalse(ok, message)
+        self.assertNotIn("已自动回滚", message)
+        self.assertIn("restored preimage changes", message)
+        self.assertEqual((self.workspace / "a.txt").read_bytes(), b"after:a\n")
+        self.assertEqual((self.workspace / "b.txt").read_bytes(), b"before:b.txt\n")
+        self.assertFalse((self.workspace / "new.txt").exists())
+        journal = next(config.BACKUPS_DIR.glob("*/journal.json"))
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "failed")
+        ok, recovered, message = CandidateManager.recover_interrupted_applications(str(self.workspace))
+        self.assertTrue(ok, message)
+        self.assertTrue(recovered)
+        self.assertEqual(build_manifest(self.workspace), self.before)
+
     def test_recovery_rechecks_each_target_after_preflight(self):
         journal = self.crash_apply(all_changes=True)
         real_restore = candidate_module._restore_application_entry
@@ -325,6 +345,78 @@ os._exit(87)
         self.assertIn("conflicts", message)
         self.assertEqual((self.workspace / "a.txt").read_bytes(), b"user edit during recovery\n")
         self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "prepared")
+
+    def test_recovery_rechecks_all_preimages_before_publishing_completion(self):
+        journal = self.crash_apply(all_changes=True)
+        real_restore = candidate_module._restore_application_entry
+        injected = False
+        def edit_after_last_restore(root, item, folder, **kwargs):
+            nonlocal injected
+            result = real_restore(root, item, folder, **kwargs)
+            if item["path"] == "a.txt":
+                injected = True
+                (self.workspace / "b.txt").write_bytes(b"user edit after complete restoration\n")
+            return result
+        with mock.patch.object(candidate_module, "_restore_application_entry", side_effect=edit_after_last_restore):
+            ok, recovered, message = CandidateManager.recover_interrupted_applications(str(self.workspace))
+        self.assertTrue(injected)
+        self.assertFalse(ok, message)
+        self.assertEqual(recovered, [])
+        self.assertIn("restored preimage changes", message)
+        self.assertEqual((self.workspace / "b.txt").read_bytes(), b"user edit after complete restoration\n")
+        self.assertEqual((self.workspace / "a.txt").read_bytes(), b"before:a.txt\n")
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "prepared")
+        edited = build_manifest(self.workspace)
+        ok, _, _ = CandidateManager.recover_interrupted_applications(str(self.workspace))
+        self.assertFalse(ok)
+        self.assertEqual(build_manifest(self.workspace), edited)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX file modes")
+    def test_recovery_rechecks_restored_modes_before_publishing_completion(self):
+        journal = self.crash_apply(all_changes=True)
+        real_restore = candidate_module._restore_application_entry
+        def edit_after_last_restore(root, item, folder, **kwargs):
+            result = real_restore(root, item, folder, **kwargs)
+            if item["path"] == "a.txt":
+                (self.workspace / "b.txt").chmod(0o700)
+            return result
+        with mock.patch.object(candidate_module, "_restore_application_entry", side_effect=edit_after_last_restore):
+            ok, _, message = CandidateManager.recover_interrupted_applications(str(self.workspace))
+        self.assertFalse(ok, message)
+        self.assertIn("restored preimage changes", message)
+        self.assertEqual((self.workspace / "b.txt").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "prepared")
+
+    @unittest.skipUnless(os.name == "nt", "requires actual Windows file security")
+    def test_recovery_rechecks_restored_dacl_before_publishing_completion(self):
+        from makewand.native_windows import application_security, ensure_private_file_descriptor
+        original_security = application_security(self.workspace / "b.txt")
+        journal = self.crash_apply(all_changes=True)
+        real_restore = candidate_module._restore_application_entry
+        changed_security = []
+        def edit_after_last_restore(root, item, folder, **kwargs):
+            result = real_restore(root, item, folder, **kwargs)
+            if item["path"] == "a.txt":
+                fd = os.open(self.workspace / "b.txt", os.O_WRONLY | os.O_BINARY)
+                try:
+                    ensure_private_file_descriptor(fd)
+                finally:
+                    os.close(fd)
+                changed_security.append(application_security(self.workspace / "b.txt"))
+            return result
+        with mock.patch.object(candidate_module, "_restore_application_entry", side_effect=edit_after_last_restore):
+            ok, recovered, message = CandidateManager.recover_interrupted_applications(str(self.workspace))
+        self.assertEqual(len(changed_security), 1)
+        self.assertNotEqual(changed_security[0], original_security)
+        self.assertFalse(ok, message)
+        self.assertEqual(recovered, [])
+        self.assertIn("restored file security changes", message)
+        self.assertEqual(application_security(self.workspace / "b.txt"), changed_security[0])
+        self.assertEqual(build_manifest(self.workspace), self.before)
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "prepared")
+        ok, _, _ = CandidateManager.recover_interrupted_applications(str(self.workspace))
+        self.assertFalse(ok)
+        self.assertEqual(application_security(self.workspace / "b.txt"), changed_security[0])
 
     @unittest.skipUnless(os.name == "posix", "Windows pins the workspace against root replacement")
     def test_workspace_replacement_preserves_new_directory_during_failure(self):

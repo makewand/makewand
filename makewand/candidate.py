@@ -444,6 +444,18 @@ def _restore_application_entry(root, item, folder, *, workspace_identity=None):
                        expected_security=item.get("after_security") if os.name == "nt" else _NO_SECURITY_EXPECTATION)
 
 
+def _verify_restored_application(root, entries, identity):
+    """A completed restore is authority only after its actual preimages match."""
+    _application_workspace_identity(root, identity)
+    for item in entries:
+        _application_workspace_identity(root, identity)
+        if _application_target_record(root, item["path"]) != item["before"]:
+            raise ValueError("Interrupted apply rollback conflicts with restored preimage changes: " + item["path"])
+        if os.name == "nt" and _application_target_security(root, item["path"]) != item["before_security"]:
+            raise ValueError("Interrupted apply rollback conflicts with restored file security changes: " + item["path"])
+    _application_workspace_identity(root, identity)
+
+
 def _recover_application_journals(base_cwd):
     """Recover durable preimages while refusing later user modifications.
 
@@ -529,6 +541,7 @@ def _recover_application_journals(base_cwd):
             if current != item["before"]:
                 _restore_application_entry(root, item, folder, workspace_identity=frozen["workspace_identity"])
             _remove_application_dirs(root, item.get("created_dirs", []), frozen["workspace_identity"])
+        _verify_restored_application(root, pending, frozen["workspace_identity"])
         frozen["state"] = "rolled_back"
         _write_application_journal(path, frozen)
         recovered.append(str(folder))
@@ -1691,6 +1704,9 @@ class CandidateManager:
                     if published.get("state") == "committed":
                         return False, [], CandidateMessage(f"应用提交结果未确定，已保留提交日志: {e}；{backup_dir}", "UNKNOWN")
                 _recover_application_journals(base_cwd)
+                # A missing header must not make recovery silently skip this
+                # transaction and authorize a false rolled-back marker.
+                _verify_restored_application(base_cwd, journal, workspace_identity)
             except Exception as rollback_error:
                 rollback_errors.append(str(rollback_error))
 

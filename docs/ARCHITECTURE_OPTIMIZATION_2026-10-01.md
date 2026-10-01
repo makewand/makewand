@@ -4,8 +4,8 @@
 
 | 工作 | 已实现的行为 | 持续验证 |
 |---|---|---|
-| 独立可信验收 | Go `stdio-v1` 父进程持有预期结果，以固定的受信运行时执行候选黑盒行为；只读工作区、隐藏预期、PID/IPC/网络隔离；记录绑定规范、运行时、完整基线、候选和交付摘要，父进程私有 MAC 拒绝导入证书；TUI 自动应用必须持有有效记录并再次验证 | `internal/engine/trusted_acceptance_test.go` 的真实 bubblewrap 对抗用例，TUI 自动与人工应用回归；CI 强制要求可运行的 bwrap |
-| Windows 原生流程 | Python 固定目录/文件句柄拒绝 junction、reparse、ADS 和路径别名；生成使用独立副本，实际测试、封存、复审后应用；原子替换/删除/恢复保留 DACL 和 readonly 属性；Job Object 管理启动、进程树、输出、时间、进程数与内存 | `Architecture runtime` 的 `windows-latest` 实机作业运行 native 后端、Git/非 Git 完整流程、硬中断恢复、Go 文件身份/事务/共享预算 |
+| 独立可信验收 | Go `stdio-v1` 父进程持有预期结果，以固定的受信运行时执行候选黑盒行为；只读工作区、隐藏预期、PID/IPC/网络隔离；记录绑定规范、运行时、完整基线、候选和交付摘要，父进程私有 MAC 拒绝导入证书；TUI 候选 autopilot 自动应用必须持有有效记录并再次验证 | `internal/engine/trusted_acceptance_test.go` 的真实 bubblewrap 对抗用例，TUI 自动与人工应用回归；CI 强制要求可运行的 bwrap |
+| Windows 原生流程 | Python 固定目录/文件句柄拒绝 junction、reparse、ADS 和歧义名称；合法 8.3 根目录别名按文件身份识别；生成使用独立副本，实际测试、封存、复审后应用；原子替换/删除/恢复保留 DACL 和 readonly 属性；Job Object 管理启动、进程树、输出、时间、进程数与内存 | `Architecture runtime` 的 `windows-latest` 实机作业运行 native 后端、Git/非 Git 完整流程、硬中断恢复、Go 文件身份/事务/共享预算 |
 | 负载与恢复演练 | `cmd/server-drill` 发起实际 HTTP 多租户竞争，测量延迟与吞吐，核查 Router 身份隔离、取消、未知消费、在途 SIGKILL 与重启、SIGTERM 流式排空；真实 WAL 热备份、损坏归档与 schema 检查、多组件恢复中断 | 每次 push/PR 执行短 profile 并保存 JSON；`make drill-long` 执行 10,000 请求及 100,000 Router 调用 |
 | 持久预算 | SQLite 整数微美元准入与余额汇总；独立进程共享 reservation，使用与结算同事务提交、重复回调幂等；确认无消费可退款，未知或中断消费保守保留预留 | 多个独立 SQLite 对象并发争抢预算、重启、失败用量、重复结算与真实 HTTP 演练 |
 | Provider 并发限制 | 每个 API provider 默认最多 8 个并发，本地/订阅 CLI 默认 1 个；请求视图共享额度，流式调用持有许可至结束或取消；排队超时与取消不触发模型、不扣调用预算 | 并发上限、共享视图、取消竞争、流式许可、半开熔断探针与 race 回归 |
