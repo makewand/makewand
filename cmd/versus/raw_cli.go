@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"github.com/makewand/makewand/execution"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 // rawCLIProvider performs one raw baseline process. ChatProvider supplies the
@@ -41,24 +41,34 @@ func (p *rawCLIProvider) Chat(ctx context.Context, _ []model.Message, _ string, 
 		return nil
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	capture := processjob.NewCapture(processjob.MaxOutputBytes, func() { killProcessGroup(cmd) })
+	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
 	usage := model.Usage{Provider: p.name}
 	started := time.Now()
-	if err := cmd.Run(); err != nil {
+	cleanupProcess, startErr := processjob.Start(cmd)
+	if startErr != nil {
+		return "", usage, fmt.Errorf("start raw CLI: %w", startErr)
+	}
+	defer cleanupProcess()
+	defer killProcessGroup(cmd)
+	waitErr := cmd.Wait()
+	if capture.Exceeded() {
+		return "", usage, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
+	}
+	if err := waitErr; err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
-			return "", usage, model.ClassifyCLIExecutionError(p.name, stderr.String(), err, contextErr, time.Since(started))
+			return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StderrString(), err, contextErr, time.Since(started))
 		}
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
-			return "", usage, fmt.Errorf("start raw CLI: %w", err)
+			return "", usage, &execution.UnknownOutcomeError{Err: fmt.Errorf("wait raw CLI: %w", err)}
 		}
 		if exitErr.ExitCode() < 0 {
 			return "", usage, &execution.UnknownOutcomeError{Err: fmt.Errorf("raw CLI terminated without an exit result: %w", err)}
 		}
-		return "", usage, model.ClassifyCLIExecutionError(p.name, stderr.String(), err, nil, time.Since(started))
+		return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StderrString(), err, nil, time.Since(started))
 	}
-	return stdout.String(), usage, nil
+	return capture.StdoutString(), usage, nil
 }
 
 func runCLIWithTimeout(parent context.Context, name, bin string, args []string, timeout time.Duration) result {

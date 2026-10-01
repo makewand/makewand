@@ -17,6 +17,11 @@ import (
 )
 
 type Entry struct {
+	// ReservationID is an internal, server-generated accounting identity. The
+	// client-supplied tracing request ID is deliberately not an idempotency key.
+	ReservationID    string    `json:"-"`
+	UncertainCost    bool      `json:"billing_uncertain,omitempty"`
+	EstimatedCost    bool      `json:"estimated_cost,omitempty"`
 	Timestamp        time.Time `json:"timestamp"`
 	RequestID        string    `json:"request_id,omitempty"`
 	TokenID          string    `json:"token_id,omitempty"`

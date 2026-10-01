@@ -46,7 +46,7 @@ func existingExtras(dataDir string) []string {
 		return nil
 	}
 	var out []string
-	for _, name := range []string{"audit.jsonl", "usage.jsonl", "alert_state.json"} {
+	for _, name := range []string{"audit.jsonl", "usage.jsonl", "alert_state.json", "admin_session_secret"} {
 		p := filepath.Join(dataDir, name)
 		if _, err := os.Stat(p); err == nil {
 			out = append(out, p)
@@ -72,6 +72,9 @@ func stateBackupCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "note: state db %q not found; skipping\n", stateDB)
 			}
 			opts.ExtraFiles = existingExtras(dataDir)
+			if dataDir != "" {
+				opts.ExtraDirectories = []string{filepath.Join(dataDir, "sessions")}
+			}
 
 			manifest, err := backup.Create(args[0], opts)
 			if err != nil {

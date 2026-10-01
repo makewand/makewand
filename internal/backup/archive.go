@@ -3,7 +3,6 @@ package backup
 import (
 	"archive/tar"
 	"compress/gzip"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +26,11 @@ type Options struct {
 	// ExtraFiles are additional files (audit.jsonl, usage.jsonl, ...) archived and
 	// restored by basename into the state database's directory.
 	ExtraFiles []string
+	// ExtraDirectories includes the server sessions tree, rejecting symlinks.
+	ExtraDirectories []string
+	// Progress observes durable restore milestones. It runs synchronously and
+	// should return promptly; it grants no ability to alter the install plan.
+	Progress func(phase, component string)
 }
 
 const (
@@ -93,7 +97,9 @@ func Create(archivePath string, opts Options) (*Manifest, error) {
 		staged = append(staged, entry{archiveStateDBName, dst})
 	}
 	if strings.TrimSpace(opts.AuthConfigPath) != "" {
-		if _, err := os.Stat(opts.AuthConfigPath); err == nil {
+		if _, err := os.Stat(opts.AuthConfigPath); err != nil {
+			return nil, fmt.Errorf("auth source: %w", err)
+		} else {
 			dst := filepath.Join(staging, archiveAuthName)
 			if err := copyFile(opts.AuthConfigPath, dst); err != nil {
 				return nil, err
@@ -107,7 +113,7 @@ func Create(archivePath string, opts Options) (*Manifest, error) {
 			continue
 		}
 		if _, err := os.Stat(extra); err != nil {
-			continue
+			return nil, fmt.Errorf("extra source: %w", err)
 		}
 		name := filepath.Base(extra)
 		if name == archiveStateDBName || name == archiveAuthName || name == archiveManifest {
@@ -119,15 +125,87 @@ func Create(archivePath string, opts Options) (*Manifest, error) {
 		}
 		staged = append(staged, entry{name, dst})
 	}
+	for _, directory := range opts.ExtraDirectories {
+		if filepath.Base(filepath.Clean(directory)) != "sessions" {
+			return nil, fmt.Errorf("unsupported backup directory: %s", directory)
+		}
+		if _, err := os.Stat(directory); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		err := filepath.WalkDir(directory, func(path string, item fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if item.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("backup directory contains symlink: %s", path)
+			}
+			if item.IsDir() {
+				return nil
+			}
+			if !item.Type().IsRegular() {
+				return fmt.Errorf("backup directory contains special file: %s", path)
+			}
+			relative, err := filepath.Rel(directory, path)
+			if err != nil {
+				return err
+			}
+			name := "sessions/" + filepath.ToSlash(relative)
+			if !safeArchiveName(name) {
+				return fmt.Errorf("unsafe backup path %s", name)
+			}
+			destination := filepath.Join(staging, filepath.FromSlash(name))
+			if err = os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				return err
+			}
+			if err = copyFile(path, destination); err != nil {
+				return err
+			}
+			staged = append(staged, entry{name, destination})
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(staged) == 0 {
 		return nil, fmt.Errorf("nothing to back up: no state-db, auth-config, or extra files found")
 	}
 
+	namesSeen := make(map[string]bool)
+	for _, item := range staged {
+		if namesSeen[item.name] {
+			return nil, fmt.Errorf("duplicate backup entry %q", item.name)
+		}
+		namesSeen[item.name] = true
+	}
+	if len(staged) > maxArchiveEntryCount-1 {
+		return nil, fmt.Errorf("backup entry count exceeds archive limit")
+	}
+	var totalSize int64
 	b := NewBackup()
+	if len(opts.ExtraDirectories) > 0 {
+		b.manifest.Directories = []string{"sessions"}
+	}
 	for _, s := range staged {
+		if s.name == archiveStateDBName {
+			schemas, err := validateSQLite(s.path)
+			if err != nil {
+				return nil, err
+			}
+			b.manifest.DatabaseSchema = schemas
+		}
 		info, err := os.Stat(s.path)
 		if err != nil {
 			return nil, fmt.Errorf("stat staged %s: %w", s.name, err)
+		}
+		if info.Size() > maxArchiveEntrySize {
+			return nil, fmt.Errorf("backup entry %s exceeds archive size limit", s.name)
+		}
+		totalSize += info.Size()
+		if totalSize > maxArchiveTotalSize {
+			return nil, fmt.Errorf("backup exceeds archive total size limit")
 		}
 		b.AddFile(s.name, info)
 		hash, err := ComputeFileHash(s.path)
@@ -191,14 +269,9 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Verify before touching any live path so a corrupt archive aborts cleanly.
-	for _, f := range manifest.Files {
-		if f.Error != "" {
-			return nil, fmt.Errorf("archive records a backup-time error for %s: %s", f.Name, f.Error)
-		}
-		if err := VerifyFile(filepath.Join(staging, f.Name), f.Hash); err != nil {
-			return nil, err
-		}
+	// Validate hashes, completeness and database structure before any live write.
+	if err := verifyStaging(staging, manifest); err != nil {
+		return nil, err
 	}
 
 	if opts.StateDBPath != "" {
@@ -218,16 +291,27 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 		stateDir = filepath.Dir(opts.AuthConfigPath)
 	}
 
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, err
+	}
+	lock, err := acquireRestoreLock(filepath.Join(stateDir, restoreLockName))
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	if err := recoverRestoreLocked(opts); err != nil {
+		return nil, err
+	}
+
 	// Phase 1: stage every component beside its destination.
-	type install struct{ name, tmp, dst string }
-	var installs []install
+	var installs []restoreInstall
 	discardStaged := func() {
 		for _, in := range installs {
-			_ = os.Remove(in.tmp)
+			_ = os.Remove(in.Tmp)
 		}
 	}
 	for _, f := range manifest.Files {
-		if f.Name != filepath.Base(f.Name) || strings.Contains(f.Name, "..") {
+		if !safeArchiveName(f.Name) {
 			discardStaged()
 			return nil, fmt.Errorf("unsafe manifest file entry: %q", f.Name)
 		}
@@ -245,65 +329,64 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 			discardStaged()
 			return nil, fmt.Errorf("install %s: %w", f.Name, err)
 		}
-		installs = append(installs, install{name: f.Name, tmp: tmp, dst: dst})
+		installs = append(installs, restoreInstall{Name: f.Name, Tmp: tmp, Dst: dst})
 	}
 
-	// Phase 2: swap each staged copy into place.
-	for i, in := range installs {
-		var err error
-		if in.name == archiveStateDBName {
-			err = replaceStateDB(in.tmp, in.dst)
-		} else {
-			err = renameFile(in.tmp, in.dst)
+	for _, directory := range manifest.Directories {
+		if directory != "sessions" {
+			discardStaged()
+			return nil, fmt.Errorf("unsupported restore directory %q", directory)
 		}
-		if err != nil {
-			for _, rest := range installs[i:] {
-				_ = os.Remove(rest.tmp)
+		tree := filepath.Join(stateDir, "sessions")
+		planned := make(map[string]bool)
+		for _, install := range installs {
+			planned[install.Dst] = true
+		}
+		err := filepath.WalkDir(tree, func(path string, item fs.DirEntry, walkErr error) error {
+			if os.IsNotExist(walkErr) {
+				return nil
 			}
-			return nil, fmt.Errorf("install %s: %w", in.name, err)
+			if walkErr != nil {
+				return walkErr
+			}
+			if item.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("restore sessions target contains symlink")
+			}
+			if item.IsDir() {
+				return nil
+			}
+			if !item.Type().IsRegular() {
+				return fmt.Errorf("restore sessions target contains special file")
+			}
+			if !planned[path] {
+				relative, err := filepath.Rel(stateDir, path)
+				if err != nil {
+					return err
+				}
+				installs = append(installs, restoreInstall{Name: filepath.ToSlash(relative), Dst: path, Remove: true})
+			}
+			return nil
+		})
+		if err != nil {
+			discardStaged()
+			return nil, err
 		}
+	}
+	destinations := make(map[string]bool)
+	for _, install := range installs {
+		absolute, err := filepath.Abs(install.Dst)
+		if err != nil || destinations[absolute] || strings.HasPrefix(filepath.Base(absolute), ".makewand-") {
+			discardStaged()
+			return nil, fmt.Errorf("duplicate or reserved restore target %s", install.Dst)
+		}
+		destinations[absolute] = true
+	}
+
+	// Phase 2: durably journal preimages, then install or recover as a unit.
+	if err := journaledInstall(opts, installs); err != nil {
+		return nil, err
 	}
 	return manifest, nil
-}
-
-// replaceStateDB swaps the staged database into dst. The old -wal/-shm files
-// are parked under unique names first and only deleted once the swap has
-// succeeded; on failure they are put back untouched.
-func replaceStateDB(tmp, dst string) error {
-	type parked struct{ orig, aside string }
-	var sidecars []parked
-	unpark := func() error {
-		var errs []error
-		for _, p := range sidecars {
-			if err := renameFile(p.aside, p.orig); err != nil {
-				errs = append(errs, fmt.Errorf("put back %s (kept at %s): %w", p.orig, p.aside, err))
-			}
-		}
-		return errors.Join(errs...)
-	}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		orig := dst + suffix
-		if _, err := os.Lstat(orig); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			return errors.Join(fmt.Errorf("inspect %s: %w", orig, err), unpark())
-		}
-		aside := orig + ".pre-restore-" + rand.Text()
-		if err := renameFile(orig, aside); err != nil {
-			return errors.Join(fmt.Errorf("move aside %s: %w", orig, err), unpark())
-		}
-		sidecars = append(sidecars, parked{orig: orig, aside: aside})
-	}
-	if err := renameFile(tmp, dst); err != nil {
-		return errors.Join(fmt.Errorf("rename into place: %w", err), unpark())
-	}
-	// The restored snapshot is in place; the parked sidecars belong to the
-	// replaced database and must never be replayed onto it.
-	for _, p := range sidecars {
-		_ = os.Remove(p.aside)
-	}
-	return nil
 }
 
 // stageBeside copies src into a new uniquely named temporary file in dst's
@@ -346,14 +429,21 @@ func targetPath(name string, opts Options, stateDir string) string {
 		if stateDir == "" {
 			return ""
 		}
-		if name != filepath.Base(name) || strings.Contains(name, "..") {
+		if !safeArchiveName(name) {
 			return ""
 		}
-		return filepath.Join(stateDir, name)
+		return filepath.Join(stateDir, filepath.FromSlash(name))
 	}
 }
 
 func copyFile(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("backup source is not a regular file: %s", src)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", src, err)
@@ -363,19 +453,21 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if written, err := io.Copy(out, io.LimitReader(in, maxArchiveEntrySize+1)); err != nil || written > maxArchiveEntrySize {
 		out.Close()
-		return fmt.Errorf("copy %s: %w", src, err)
+		return fmt.Errorf("copy %s failed or exceeded archive size limit: %v", src, err)
 	}
 	return out.Close()
 }
 
 func writeTarGz(archivePath, dir string, names []string) error {
-	f, err := os.OpenFile(archivePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.CreateTemp(filepath.Dir(archivePath), ".makewand-backup-*")
 	if err != nil {
 		return fmt.Errorf("create archive: %w", err)
 	}
 	defer f.Close()
+	temporary := f.Name()
+	defer os.Remove(temporary)
 	gz := gzip.NewWriter(f)
 	defer gz.Close()
 	tw := tar.NewWriter(gz)
@@ -407,11 +499,23 @@ func writeTarGz(archivePath, dir string, names []string) error {
 	if err := tw.Close(); err != nil {
 		return fmt.Errorf("close tar: %w", err)
 	}
-	return nil
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, archivePath); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(archivePath))
 }
 
 func extractTarGz(archivePath, destDir string) error {
-	f, err := os.Open(archivePath)
+	f, err := os.Open(archivePath) //nolint:gosec // Operator-provided archive source; this read grants no destination path.
 	if err != nil {
 		return fmt.Errorf("open archive: %w", err)
 	}
@@ -426,6 +530,7 @@ func extractTarGz(archivePath, destDir string) error {
 	var (
 		totalExtracted int64
 		entryCount     int
+		seen           = make(map[string]bool)
 	)
 	for {
 		hdr, err := tr.Next()
@@ -441,14 +546,18 @@ func extractTarGz(archivePath, destDir string) error {
 		}
 		// Flat archive only: reject any path separators or traversal (zip-slip).
 		name := hdr.Name
-		if name != filepath.Base(name) || strings.Contains(name, "..") {
+		if !safeArchiveName(name) || seen[name] {
 			return fmt.Errorf("unsafe archive entry: %q", hdr.Name)
 		}
+		seen[name] = true
 		if hdr.Typeflag != tar.TypeReg {
-			continue
+			return fmt.Errorf("unsupported archive entry type: %q", name)
 		}
-		dst := filepath.Join(destDir, name) //nolint:gosec // G305: name is validated above to be a bare basename (no separators or "..").
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		dst := filepath.Join(destDir, filepath.FromSlash(name)) //nolint:gosec // G305: name is validated above to be a bare basename (no separators or "..").
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			return err
+		}
+		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // Canonical allowlisted archive name under the new private staging directory.
 		if err != nil {
 			return fmt.Errorf("create %s: %w", name, err)
 		}
@@ -461,13 +570,13 @@ func extractTarGz(archivePath, destDir string) error {
 		}
 		if written > maxArchiveEntrySize {
 			out.Close()
-			_ = os.Remove(dst)
+			_ = os.Remove(dst) //nolint:gosec // Only the just-created, validated private staging path is removed.
 			return fmt.Errorf("extract %s: entry exceeds max allowed size of %d bytes", name, maxArchiveEntrySize)
 		}
 		totalExtracted += written
 		if totalExtracted > maxArchiveTotalSize {
 			out.Close()
-			_ = os.Remove(dst)
+			_ = os.Remove(dst) //nolint:gosec // Only the just-created, validated private staging path is removed.
 			return fmt.Errorf("archive exceeds total uncompressed size limit of %d bytes", maxArchiveTotalSize)
 		}
 		if err := out.Close(); err != nil {

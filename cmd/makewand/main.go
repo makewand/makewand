@@ -652,8 +652,12 @@ func previewCmd() *cobra.Command {
 			fmt.Printf("Preview running at %s\n", server.URL())
 			fmt.Println("   Press Ctrl+C to stop")
 
-			<-ctx.Done()
-			return nil
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-server.Done():
+				return server.Err()
+			}
 		},
 	}
 

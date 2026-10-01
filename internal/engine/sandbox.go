@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 // ExecResult holds the result of a command execution.
@@ -21,8 +23,8 @@ type ExecResult struct {
 	Stderr   string
 	ExitCode int
 	Duration time.Duration
-	// Dropped bytes report bounded output capture without turning a successful
-	// command into an io.ErrShortWrite failure.
+	// Dropped bytes report output discarded after the combined raw stream cap.
+	// Such results carry an uncertain-outcome error and must not count as passed.
 	StdoutDroppedBytes int64
 	StderrDroppedBytes int64
 }
@@ -221,6 +223,13 @@ func (p *Project) execVerification(ctx context.Context, command string, args []s
 	}
 
 	wrappedCmd, wrappedArgs := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, allowNetwork, readOnly)
+	if acceptancePolicy(ctx) != nil {
+		// Local diagnostics must not introduce undeclared cache files into the
+		// execution tree later sealed by independent acceptance.
+		cut := len(wrappedArgs) - len(args) - 1
+		settings := []string{"--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTHONPYCACHEPREFIX", "/tmp/makewand-bytecode", "--setenv", "PYTEST_ADDOPTS", "-p no:cacheprovider", "--setenv", "CARGO_TARGET_DIR", filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "cargo-target")}
+		wrappedArgs = append(append(append([]string(nil), wrappedArgs[:cut]...), settings...), wrappedArgs[cut:]...)
+	}
 	if command == "go" {
 		// The sandbox pins GOTOOLCHAIN=local; report an unsatisfiable go.mod
 		// requirement as an environment problem instead of letting it surface
@@ -456,33 +465,7 @@ func (p *Project) RunTests(ctx context.Context) (*ExecResult, error) {
 	return p.RunRestrictedPlan(ctx, *plan)
 }
 
-// limitedWriter wraps a bytes.Buffer but silently discards data beyond the limit.
-type limitedWriter struct {
-	buf     bytes.Buffer
-	limit   int
-	dropped int64
-}
-
-func (w *limitedWriter) Write(p []byte) (int, error) {
-	inputLen := len(p)
-	remaining := w.limit - w.buf.Len()
-	if remaining <= 0 {
-		w.dropped += int64(inputLen)
-		return inputLen, nil // discard
-	}
-	if len(p) > remaining {
-		w.dropped += int64(len(p) - remaining)
-		p = p[:remaining]
-	}
-	if _, err := w.buf.Write(p); err != nil {
-		return 0, err
-	}
-	return inputLen, nil
-}
-
-func (w *limitedWriter) String() string { return w.buf.String() }
-
-const maxOutputBytes = 10 << 20 // 10 MB
+const maxOutputBytes = processjob.MaxOutputBytes
 
 // RestrictedPlanTimeout bounds a single project command (dependency install,
 // test run, verification step). Callers that impose their own deadline (the
@@ -518,6 +501,7 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 	ctx, cancel := restrictedExecContext(ctx)
 	defer cancel()
 
+	// #nosec G702 -- argv bypasses the shell; names/allowlist are checked above, and executable paths require the explicit internal policy.
 	cmd := exec.Command(command, args...)
 	cmd.Dir = projectDir
 	if policy.stripSensitive {
@@ -525,15 +509,16 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 	}
 	setProcessGroup(cmd)
 
-	stdout := &limitedWriter{limit: maxOutputBytes}
-	stderr := &limitedWriter{limit: maxOutputBytes}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	capture := processjob.NewCapture(maxOutputBytes, func() { killProcessGroup(cmd) })
+	cmd.Stdout = capture.Stdout()
+	cmd.Stderr = capture.Stderr()
 
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	cleanupProcess, err := processjob.Start(cmd)
+	if err != nil {
 		return nil, fmt.Errorf("exec %s: %w", command, err)
 	}
+	defer cleanupProcess()
 
 	// Kill the entire process group when the context deadline is exceeded.
 	watchDone := make(chan struct{})
@@ -549,14 +534,28 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 
 	err = cmd.Wait()
 	close(watchDone)
+	killProcessGroup(cmd)
 	duration := time.Since(start)
 
+	stdoutDropped, stderrDropped := capture.DroppedBytes()
 	result := &ExecResult{
-		Stdout:             stdout.String(),
-		Stderr:             stderr.String(),
+		Stdout:             capture.StdoutString(),
+		Stderr:             capture.StderrString(),
 		Duration:           duration,
-		StdoutDroppedBytes: stdout.dropped,
-		StderrDroppedBytes: stderr.dropped,
+		StdoutDroppedBytes: stdoutDropped,
+		StderrDroppedBytes: stderrDropped,
+	}
+	if capture.Exceeded() {
+		result.ExitCode = -1
+		return result, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result.ExitCode = -1
+		return result, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, ctxErr)}
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		result.ExitCode = -1
+		return result, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s inherited output pipes did not close: %w", command, err)}
 	}
 
 	if err != nil {

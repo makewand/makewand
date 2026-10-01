@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/makewand/makewand/execution"
 	"github.com/makewand/makewand/serveraudit"
 	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/serverhttp"
@@ -184,6 +185,9 @@ type HTTPHandlerOptions struct {
 	// or above a typical per-request cost to keep overshoot small or zero. Zero
 	// disables reservation (a headroom-only check).
 	BudgetReservationUSD float64
+	// BudgetReserver enables SQLite-backed, cross-process token and team budget
+	// admission. UsageLogger must settle reservations in the same durable store.
+	BudgetReserver serverusage.BudgetReserver
 
 	// StrictAccounting, when true, records a non-streaming request's usage BEFORE
 	// its success response is written and rejects the request with 503 if that
@@ -397,7 +401,7 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	settle, rejected := r.applyBudgetReservation(w, opt, grant, &auditEvent, &usageEntry)
+	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry)
 	if rejected {
 		return
 	}
@@ -438,6 +442,9 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 	}
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
 	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
+	if err != nil && errors.Is(err, execution.ErrUnknownOutcome) && !usage.MeasuredCost {
+		usageEntry.UncertainCost = true
+	}
 	if err != nil {
 		if opt.Observer != nil {
 			opt.Observer("provider", result.Actual)
@@ -599,7 +606,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	settle, rejected := r.applyBudgetReservation(w, opt, grant, &auditEvent, &usageEntry)
+	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry)
 	if rejected {
 		return
 	}
@@ -629,6 +636,9 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	}
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
 	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
+	if err != nil && errors.Is(err, execution.ErrUnknownOutcome) && !usage.MeasuredCost {
+		usageEntry.UncertainCost = true
+	}
 	if err != nil {
 		if opt.Observer != nil {
 			opt.Observer("provider", result.Actual)
@@ -738,6 +748,9 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
 		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
+		if usageEntry != nil && errors.Is(err, execution.ErrUnknownOutcome) && !usage.MeasuredCost {
+			usageEntry.UncertainCost = true
+		}
 		if opt.Observer != nil {
 			opt.Observer("provider", result.Actual)
 		}
@@ -873,6 +886,9 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
 		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
+		if usageEntry != nil && errors.Is(err, execution.ErrUnknownOutcome) && !usage.MeasuredCost {
+			usageEntry.UncertainCost = true
+		}
 		if opt.Observer != nil {
 			opt.Observer("provider", result.Actual)
 		}
@@ -1083,6 +1099,9 @@ func finalizeHTTPStreamUsage(r *Router, grant *serverauth.Grant, usage Usage, re
 		usage.Cost = estimated.Cost
 	}
 	applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
+	if usageEntry != nil && auditEvent != nil && auditEvent.Error != "" && !usage.MeasuredCost {
+		usageEntry.UncertainCost = true
+	}
 }
 
 func writeSSEEvent(w http.ResponseWriter, event string, payload any) error {
@@ -1368,7 +1387,24 @@ func (opt HTTPHandlerOptions) recordUsageStrict(w http.ResponseWriter, usageEntr
 	return true, true
 }
 
-func (r *Router) applyBudgetReservation(w http.ResponseWriter, opt HTTPHandlerOptions, grant *serverauth.Grant, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) (func(float64), bool) {
+func (r *Router) applyBudgetReservation(ctx context.Context, w http.ResponseWriter, opt HTTPHandlerOptions, grant *serverauth.Grant, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) (func(float64), bool) {
+	if opt.BudgetReserver != nil && opt.BudgetReservationUSD > 0 {
+		err := opt.reserveDurableBudget(ctx, grant, usageEntry)
+		if err == nil {
+			return func(float64) {}, false
+		}
+		status, code := http.StatusServiceUnavailable, "budget_unavailable"
+		if errors.Is(err, serverusage.ErrBudgetExceeded) {
+			status, code = http.StatusTooManyRequests, "budget_exceeded"
+		}
+		var scopeErr *httpStatusError
+		if errors.As(err, &scopeErr) {
+			status, code = scopeErr.Status, scopeErr.Code
+		}
+		auditEvent.Status, auditEvent.Error = status, err.Error()
+		writeHTTPError(w, status, code, err.Error())
+		return func(float64) {}, true
+	}
 	var grantRelease func(float64)
 	if grant != nil && opt.BudgetReservationUSD > 0 {
 		var err error

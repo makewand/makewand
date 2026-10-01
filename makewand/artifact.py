@@ -12,6 +12,9 @@ CACHE_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cach
 
 
 def workspace_snapshot(workspace):
+    if os.name == "nt":
+        from makewand.native_windows import manifest
+        return manifest(workspace, input_snapshot=True)
     root = Path(workspace)
     result = {}
     paths_to_check = set()

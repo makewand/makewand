@@ -3,11 +3,16 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 var (
@@ -27,6 +32,9 @@ type PreviewServer struct {
 	cmd     *exec.Cmd
 	port    int
 	cancel  context.CancelFunc
+	done    chan struct{}
+	waitErr error // published by closing done
+	stop    sync.Once
 }
 
 // StartPreview starts a development server for the project.
@@ -89,6 +97,7 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		project: p,
 		port:    port,
 		cancel:  cancel,
+		done:    make(chan struct{}),
 	}
 
 	var command string
@@ -134,25 +143,56 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 		fmt.Sprintf("PORT=%d", port),
 		"HOST=127.0.0.1",
 	)
-	startupStderr := &limitedWriter{limit: previewStartupStderrLimit}
-	cmd.Stderr = startupStderr
 	setProcessGroup(cmd)
+	capture := processjob.NewCapture(maxOutputBytes, func() { killProcessGroup(cmd) })
+	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
 	server.cmd = cmd
 
-	if err := cmd.Start(); err != nil {
+	cleanupProcess, err := processjob.Start(cmd)
+	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("start preview server: %w", err)
 	}
-	if err := previewWaitForPort(ctx, port, previewReadyTimeout); err != nil {
-		cancel()
+	go func() {
+		waitErr := cmd.Wait()
 		killProcessGroup(cmd)
-		_ = cmd.Wait()
-		stderrMsg := strings.TrimSpace(startupStderr.String())
+		cleanupProcess()
+		if capture.Exceeded() {
+			waitErr = &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
+		} else if errors.Is(waitErr, exec.ErrWaitDelay) {
+			waitErr = &execution.UnknownOutcomeError{Err: waitErr}
+		}
+		server.waitErr = waitErr
+		close(server.done)
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			killProcessGroup(cmd)
+		case <-server.done:
+		}
+	}()
+	if err := previewWaitForPort(ctx, port, previewReadyTimeout); err != nil {
+		server.Stop()
+		stderrMsg := capture.StderrString()
+		if len(stderrMsg) > previewStartupStderrLimit {
+			stderrMsg = stderrMsg[:previewStartupStderrLimit]
+		}
+		stderrMsg = strings.TrimSpace(stderrMsg)
 		if stderrMsg != "" {
 			stderrMsg = strings.Join(strings.Fields(stderrMsg), " ")
 			return nil, fmt.Errorf("preview server did not become ready on 127.0.0.1:%d: %w; startup stderr: %s", port, err, stderrMsg)
 		}
 		return nil, fmt.Errorf("preview server did not become ready on 127.0.0.1:%d: %w", port, err)
+	}
+	select {
+	case <-server.done:
+		cancel()
+		if server.waitErr != nil {
+			return nil, fmt.Errorf("preview server exited before readiness: %w", server.waitErr)
+		}
+		return nil, fmt.Errorf("preview server exited before readiness")
+	default:
 	}
 
 	return server, nil
@@ -170,13 +210,33 @@ func (s *PreviewServer) Port() int {
 
 // Stop stops the preview server.
 func (s *PreviewServer) Stop() {
-	if s.cancel != nil {
-		s.cancel()
+	if s == nil {
+		return
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		killProcessGroup(s.cmd)
-		// Reap the killed process; the exit error is expected and irrelevant on shutdown.
-		_ = s.cmd.Wait()
+	s.stop.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.cmd != nil && s.cmd.Process != nil {
+			killProcessGroup(s.cmd)
+		}
+	})
+	if s.done != nil {
+		<-s.done
+	}
+}
+
+// Done closes when the process and its inherited output pipes have finished.
+func (s *PreviewServer) Done() <-chan struct{} { return s.done }
+
+// Err returns the final execution result after Done, or nil while running.
+// Output overflow and incomplete inherited pipes are uncertain outcomes.
+func (s *PreviewServer) Err() error {
+	select {
+	case <-s.done:
+		return s.waitErr
+	default:
+		return nil
 	}
 }
 

@@ -31,6 +31,7 @@ type candidateSelection struct {
 	verified      bool
 	files         []engine.ExtractedFile
 	digest        string
+	acceptance    *engine.TrustedAcceptanceRecord
 	selectionNote string
 	// err carries a fail-closed sentinel from the engine when every candidate
 	// failed for that reason (currently model.ErrNoUntrustedSafeProvider, set when
@@ -179,19 +180,27 @@ func runCandidateSelectionWithActivity(
 			reporter.Set(provider, stage)
 		}
 	}, exclude...)
+	if project != nil {
+		if err := project.RecordCandidateAttempts(ctx, selection); err != nil {
+			selection.Err = errors.Join(selection.Err, fmt.Errorf("persist candidate attempt audit: %w", err))
+			selection.Content = ""
+			selection.VerifiedFiles = nil
+		}
+	}
 
 	provider := selection.Provider
 	if provider == "" {
 		provider = selection.Usage.Provider
 	}
 	local := candidateSelection{
-		content:  selection.Content,
-		provider: provider,
-		usage:    selection.Usage,
-		verified: selection.Verified,
-		files:    selection.VerifiedFiles,
-		digest:   selection.VerifiedDigest,
-		err:      selection.Err,
+		content:    selection.Content,
+		provider:   provider,
+		usage:      selection.Usage,
+		verified:   selection.Verified,
+		files:      selection.VerifiedFiles,
+		digest:     selection.VerifiedDigest,
+		acceptance: selection.Acceptance,
+		err:        selection.Err,
 	}
 	local.selectionNote = candidateSelectionNote(selection)
 	return local

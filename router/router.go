@@ -203,6 +203,11 @@ type ProviderEntry struct {
 // RouterConfig provides configuration for creating a Router without depending
 // on the config package. Library consumers use this directly.
 type RouterConfig struct {
+	// APIConcurrency and CLIConcurrency bound each provider instance (defaults 8/1).
+	APIConcurrency int
+	CLIConcurrency int
+	// ProviderQueueTimeout bounds admission wait (default 30 seconds).
+	ProviderQueueTimeout time.Duration
 	// ExecutionAPIPolicy records the caller's spend-policy snapshot; this metadata
 	// does not change the library's existing provider configuration semantics.
 	ExecutionAPIPolicy string
@@ -273,6 +278,7 @@ type Router struct {
 	// Provider cache for mode-based routing (provider+model → instance)
 	providerCache map[providerKey]Provider
 	providerMu    sync.Mutex
+	bulkheads     *providerBulkheads
 
 	// cacheRoot is set on per-request views (cloneView) to the long-lived
 	// Router they were derived from. Factory-built provider instances are
@@ -448,7 +454,12 @@ func NewRouterFromConfig(rc RouterConfig) (*Router, error) {
 		return nil, initErr
 	}
 
+	bulkheads, err := newProviderBulkheads(rc.APIConcurrency, rc.CLIConcurrency, rc.ProviderQueueTimeout)
+	if err != nil {
+		return nil, err
+	}
 	r := &Router{
+		bulkheads:          bulkheads,
 		executionAPIPolicy: rc.ExecutionAPIPolicy,
 		providers:          make(map[string]Provider),
 		providerCache:      make(map[providerKey]Provider),

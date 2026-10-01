@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"time"
 )
 
 // Manifest describes a backup archive.
 type Manifest struct {
-	SchemaVersion string    `json:"schema_version"`
-	BackupTime    time.Time `json:"backup_time"`
-	Files         []File    `json:"files"`
-	Checksum      string    `json:"checksum"`
+	SchemaVersion  string         `json:"schema_version"`
+	BackupTime     time.Time      `json:"backup_time"`
+	Files          []File         `json:"files"`
+	Checksum       string         `json:"checksum"`
+	DatabaseSchema map[string]int `json:"database_schema,omitempty"`
+	Directories    []string       `json:"directories,omitempty"`
 }
 
 // File describes a single file in the backup.
@@ -76,7 +79,14 @@ func (b *Backup) SetFileError(name, err string) {
 
 // Finalize prepares the manifest for serialization.
 func (b *Backup) Finalize() error {
-	for _, f := range b.files {
+	b.manifest.Files = nil
+	names := make([]string, 0, len(b.files))
+	for name := range b.files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		f := b.files[name]
 		b.manifest.Files = append(b.manifest.Files, *f)
 	}
 	return nil

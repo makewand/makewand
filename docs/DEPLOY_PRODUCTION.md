@@ -131,3 +131,15 @@ label combinations, so clients cannot grow the series set.
 - Rotate admin tokens and session secrets on a schedule.
 - Back up the state directory before upgrades.
 - Run `makewand doctor --remote-check` after each deploy.
+
+
+Restore validates archive entry type/path/size/hash and database integrity,
+foreign keys and schema compatibility before installation. A synced preimage
+journal covers the state database, sidecars, auth configuration and included
+session/ledger files. An interrupted multi-component install rolls back on the
+next `state restore` or `serve` startup, before opening stores. If recovery fails,
+startup stops with the recovery error and keeps its evidence. Keep the service
+stopped during restore, and never delete a pending recovery journal to force
+startup. Run the local fault/load profile described in
+[SERVER_ALPHA.md](SERVER_ALPHA.md#load-and-recovery-runtime-gate) when assessing
+an installation; its local RPO/RTO measurements are not a deployment SLA.

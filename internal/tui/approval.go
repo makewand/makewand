@@ -32,6 +32,7 @@ func (a *App) setPendingApproval(kind approvalKind, title, details string) {
 		Title:   strings.TrimSpace(title),
 		Details: strings.TrimSpace(details),
 	}
+	a.persistApprovalRequest()
 }
 
 func (a *App) clearPendingApproval() {
@@ -89,6 +90,9 @@ func (a App) safeApprovalEnabled() bool {
 }
 
 func (a App) shouldAutoApproveFileWrites(phase pendingPhaseType) bool {
+	if a.pendingRecovery {
+		return false
+	}
 	mode := a.currentApprovalMode()
 	if !a.safeApprovalEnabled() || a.project == nil {
 		return false
@@ -96,7 +100,7 @@ func (a App) shouldAutoApproveFileWrites(phase pendingPhaseType) bool {
 	if mode == config.ApprovalModeAuto {
 		switch phase {
 		case pendingPhaseChat, pendingPhaseBuild, pendingPhaseFix:
-			return a.pendingWriteVerified
+			return a.pendingWriteVerified && engine.TrustedAcceptanceRecordMatches(a.pendingFiles, a.pendingWriteAcceptance)
 		default:
 			return false
 		}
@@ -121,7 +125,7 @@ var (
 func (a App) shouldAutoApproveRestrictedPlan(plan *engine.ExecPlan) bool {
 	// Safe/autopilot modes may only auto-run verification commands when strong
 	// isolation (or the acknowledged unsafe opt-in) is available; otherwise prompt.
-	return a.safeApprovalEnabled() && plan != nil && restrictedExecAutoApprovable(a.hostExecAuth)
+	return !a.pendingRecovery && a.safeApprovalEnabled() && plan != nil && restrictedExecAutoApprovable(a.hostExecAuth)
 }
 
 // restrictedPlanIsolationNotice returns a user-facing explanation when safe or
@@ -200,6 +204,9 @@ func (a App) viewPendingApproval(width int) string {
 }
 
 func (a App) handleApproveCommand() (tea.Model, tea.Cmd) {
+	if !a.persistApprovalDecision(true) {
+		return a, nil
+	}
 	switch a.activeApprovalKind() {
 	case approvalFileWrite:
 		a.state = StateIdle
@@ -229,6 +236,9 @@ func (a App) handleApproveCommand() (tea.Model, tea.Cmd) {
 }
 
 func (a App) handleDenyCommand() (tea.Model, tea.Cmd) {
+	if !a.persistApprovalDecision(false) {
+		return a, nil
+	}
 	switch a.activeApprovalKind() {
 	case approvalFileWrite:
 		a.state = StateIdle
@@ -236,6 +246,7 @@ func (a App) handleDenyCommand() (tea.Model, tea.Cmd) {
 		a.pendingFiles = nil
 		a.pendingWriteVerified = false
 		a.pendingWriteDigest = ""
+		a.pendingWriteAcceptance = nil
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
 			Content: i18n.Msg().FileCancelled,

@@ -127,6 +127,11 @@ jobs:
       - name: Run tests
         run: bash ./scripts/test_gate.sh
 
+      - name: Independent trusted acceptance (real sandbox required)
+        env:
+          MAKEWAND_REQUIRE_BWRAP: "1"
+        run: go test ./internal/engine -run 'TrustedAcceptance' -count=1 -v
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:

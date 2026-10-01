@@ -61,6 +61,7 @@ type CandidateSelection struct {
 	Err            error
 	VerifiedFiles  []ExtractedFile
 	VerifiedDigest string
+	Acceptance     *TrustedAcceptanceRecord
 	// RestoredTests lists the selected candidate's edits to pre-existing test
 	// files (and package.json scripts.test) that were discarded: verification
 	// keeps the baseline tests, and the delivered file set (VerifiedFiles)
@@ -86,6 +87,7 @@ type CandidateState struct {
 	Usage          model.Usage
 	Strength       int
 	ArtifactDigest string
+	Acceptance     *TrustedAcceptanceRecord
 	ErrorKind      *string
 }
 
@@ -189,6 +191,10 @@ func RunCandidateSelection(
 	ctx, executionConfig, executionErr = execution.EnsureContext(ctx)
 	if executionErr != nil {
 		return CandidateSelection{Err: executionErr, Status: execution.InvalidRequest}
+	}
+	ctx, executionErr = prepareTrustedAcceptance(ctx, project)
+	if executionErr != nil {
+		return CandidateSelection{TaskID: executionConfig.TaskID, Err: executionErr, Status: execution.InvalidRequest}
 	}
 	options, err := candidateSelectionOptions(ctx)
 	if err != nil {
@@ -430,7 +436,7 @@ func RunCandidateSelection(
 		if attempt.Err == nil && !attempt.Verification.Passed {
 			attempt.Status = execution.Unverified
 		}
-		state := CandidateState{TaskID: attempt.TaskID, ID: attempt.ID, Requested: attempt.Requested, Provider: attempt.Provider, Status: attempt.Status, Usage: attempt.Usage, Strength: attempt.Verification.Strength, ArtifactDigest: attempt.Verification.VerifiedDigest}
+		state := CandidateState{TaskID: attempt.TaskID, ID: attempt.ID, Requested: attempt.Requested, Provider: attempt.Provider, Status: attempt.Status, Usage: attempt.Usage, Strength: attempt.Verification.Strength, ArtifactDigest: attempt.Verification.VerifiedDigest, Acceptance: attempt.Verification.Acceptance}
 		if attempt.Err != nil {
 			kind := string(model.ErrorKindOf(attempt.Err))
 			state.ErrorKind = &kind
@@ -444,6 +450,9 @@ func RunCandidateSelection(
 		}
 		if notVerifiedReason == "" && attempt.Verification.IsolationError != "" {
 			notVerifiedReason = attempt.Verification.IsolationError
+		}
+		if notVerifiedReason == "" && attempt.Verification.AcceptanceError != "" {
+			notVerifiedReason = attempt.Verification.AcceptanceError
 		}
 		// Preserve the fail-closed untrusted-mode sentinel instead of discarding it
 		// with the rest of the per-attempt error: when every candidate fails this
@@ -505,6 +514,7 @@ func RunCandidateSelection(
 			DeletedFiles:    bestVerified.DeletedFiles,
 			VerifiedFiles:   bestVerified.Verification.VerifiedFiles,
 			VerifiedDigest:  bestVerified.Verification.VerifiedDigest,
+			Acceptance:      bestVerified.Verification.Acceptance,
 			RestoredTests:   discardedTestEdits(*bestVerified),
 			NoTestsExecuted: noTestsExecuted(*bestVerified),
 			LargeFiles:      bestVerified.LargeFiles,
@@ -525,6 +535,7 @@ func RunCandidateSelection(
 			NotVerifiedReason: notVerifiedReason,
 			VerifiedFiles:     bestSuccessful.Verification.VerifiedFiles,
 			VerifiedDigest:    bestSuccessful.Verification.VerifiedDigest,
+			Acceptance:        bestSuccessful.Verification.Acceptance,
 			RestoredTests:     discardedTestEdits(*bestSuccessful),
 			NoTestsExecuted:   noTestsExecuted(*bestSuccessful),
 			LargeFiles:        bestSuccessful.LargeFiles,
@@ -574,7 +585,7 @@ func discardedTestEdits(attempt CandidateAttempt) []string {
 // noTestsExecuted reports whether the attempt's checks ran no test at all.
 func noTestsExecuted(attempt CandidateAttempt) bool {
 	v := attempt.Verification
-	return v.NoTestPlan || (v.Passed && v.NoTestsRan)
+	return v.Acceptance == nil && (v.NoTestPlan || (v.Passed && v.NoTestsRan))
 }
 
 // verificationRank orders verification outcomes: a (weak) pass, then
@@ -588,7 +599,7 @@ func verificationRank(v CandidateVerification) int {
 		return 0
 	case v.EnvironmentError || v.IsolationError != "":
 		return 1
-	case v.QuickCheckError != "" || v.DepsError != "" || v.TestsError != "":
+	case v.QuickCheckError != "" || v.DepsError != "" || v.TestsError != "" || v.AcceptanceError != "":
 		return 0
 	default:
 		return 1
@@ -637,7 +648,7 @@ func verificationUnattributable(v CandidateVerification) bool {
 	if v.Passed {
 		return false
 	}
-	return v.NoTestPlan || v.IsolationError != "" || v.EnvironmentError
+	return (v.NoTestPlan && v.AcceptanceError == "") || v.IsolationError != "" || v.EnvironmentError
 }
 
 func ShouldRecordCandidateQuality(attempt CandidateAttempt) bool {

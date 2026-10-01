@@ -12,6 +12,7 @@ import uuid
 import stat
 import tempfile
 import errno
+import contextlib
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
@@ -21,16 +22,13 @@ from makewand.config import (
     ensure_config_dir,
     ensure_private_dir,
     c,
-    COLOR_BOLD,
-    COLOR_CYAN,
-    COLOR_GREEN,
     COLOR_YELLOW,
-    COLOR_RED,
-    COLOR_RESET,
 )
 import hashlib
 from makewand.git_helper import run_git_cmd, get_git_diff, _read_workspace_diff, WorkspaceLock, WorkspaceLockError
 from makewand.protected_files import ProtectedFiles, ProtectionError
+
+_NO_SECURITY_EXPECTATION = object()
 
 
 def _race_protection(race):
@@ -59,6 +57,12 @@ def _check_apply_deadline():
 
 def file_sha256(path: Path) -> Optional[str]:
     """Computes SHA-256 hex digest of a regular file. Returns None for links/missing."""
+    if os.name == "nt":
+        from makewand.native_windows import inspect_file
+        try:
+            return inspect_file(path)["sha256"]
+        except (OSError, ValueError):
+            return None
     if not path.is_file() or os.path.islink(path):
         return None
     try:
@@ -71,6 +75,12 @@ def file_sha256(path: Path) -> Optional[str]:
         return None
 
 def file_record(path: Path) -> Optional[Dict[str, Any]]:
+    if os.name == "nt":
+        from makewand.native_windows import inspect_file
+        try:
+            return inspect_file(path)
+        except FileNotFoundError:
+            return None
     digest = file_sha256(path)
     if digest is None:
         return None
@@ -80,6 +90,9 @@ def file_record(path: Path) -> Optional[Dict[str, Any]]:
 def build_manifest(dir_path: Path) -> Dict[str, Any]:
     """Bind regular file content AND permissions; old hash-only manifests fail closed."""
     dir_path = Path(dir_path)
+    if os.name == "nt":
+        from makewand.native_windows import manifest
+        return manifest(dir_path)
     manifest = {}
     if not dir_path.exists():
         return manifest
@@ -160,20 +173,34 @@ def remove_new_generated_bytecode(workspace: Union[str, Path], baseline_manifest
     return sorted(removed)
 
 
-def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None):
+def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None, *, temporary_name=None,
+                 workspace_identity=None, before_replace=None):
     """Write through directory handles and atomically replace, preserving mode.
 
     The source is checked while copying, so a changed candidate cannot win the
     gap between manifest validation and application. No shared inode is edited.
     """
+    if os.name == "nt":
+        from makewand.native_windows import atomic_copy
+        return atomic_copy(workspace, rel_path, source, expected, temporary_name=temporary_name,
+                           before_replace=before_replace)
     parts = Path(rel_path).parts
     if not parts or Path(rel_path).is_absolute() or any(x in (".", "..") for x in parts):
         raise ValueError("invalid workspace-relative path")
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     directory = os.open(workspace, directory_flags)
-    temp_name = ".makewand-" + uuid.uuid4().hex
+    temp_name = temporary_name if temporary_name is not None else ".makewand-" + uuid.uuid4().hex
+    if (not isinstance(temp_name, str) or len(temp_name) != len(".makewand-") + 32
+            or not temp_name.startswith(".makewand-")
+            or any(character not in "0123456789abcdef" for character in temp_name[len(".makewand-"):])):
+        os.close(directory)
+        raise ValueError("invalid registered application temporary name")
     created = False
     try:
+        if workspace_identity is not None:
+            opened = os.fstat(directory)
+            if [opened.st_dev, opened.st_ino] != workspace_identity:
+                raise ValueError("Application opened workspace identity changed")
         for component in parts[:-1]:
             try:
                 os.mkdir(component, 0o755, dir_fd=directory)
@@ -220,10 +247,292 @@ def _write_private_json(path: Path, data: Dict[str, Any]) -> None:
             json.dump(data, handle, indent=2, ensure_ascii=False)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        if os.name == "nt":
+            from makewand.native_windows import replace_file
+            replace_file(temporary, path)
+        else:
+            os.replace(temporary, path)
+        if os.name == "posix":
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _write_application_journal(path, data):
+    if len(json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")) > 16 * 1024 * 1024:
+        raise ValueError("Application journal exceeds its recovery size limit")
+    _write_private_json(path, data)
+
+
+def _application_workspace_identity(root, expected):
+    identity = os.stat(root, follow_symlinks=False)
+    if not stat.S_ISDIR(identity.st_mode) or [identity.st_dev, identity.st_ino] != expected:
+        raise ValueError("Interrupted application workspace identity changed")
+
+
+def _application_target_record(root, relative):
+    target = _verify_safe_target_path(root, relative)
+    if not os.path.lexists(target):
+        return None
+    record = file_record(target)
+    if record is None:
+        raise ValueError("Application target is not a regular file: " + relative)
+    return record
+
+
+def _application_target_security(root, relative):
+    """Host transaction metadata; Windows ACLs never enter model manifests."""
+    if os.name != "nt":
+        return None
+    target = _verify_safe_target_path(root, relative)
+    if not os.path.lexists(target):
+        return None
+    from makewand.native_windows import application_security
+    return application_security(target)
+
+
+def _validate_application_security(root, item, current):
+    if os.name != "nt":
+        return
+    if "before_security" not in item or "after_security" not in item:
+        raise ValueError("Interrupted Windows application lacks frozen file security")
+    for key in ("before_security", "after_security"):
+        value = item[key]
+        if value is not None and (not isinstance(value, str) or not value or len(value) > 16384):
+            raise ValueError("Invalid interrupted application file security")
+    if item["before"] is not None and (item["before_security"] is None
+            or not isinstance(item.get("before_security_descriptor"), str)
+            or not item["before_security_descriptor"] or len(item["before_security_descriptor"]) > 1024 * 1024):
+        raise ValueError("Interrupted Windows application lacks original file security")
+    if item["before"] is not None:
+        from makewand.native_windows import validate_application_security_descriptor
+        validate_application_security_descriptor(item["before_security_descriptor"], item["before_security"])
+    allowed = []
+    if current == item["before"]:
+        allowed.append(item["before_security"])
+    if current == item["after"]:
+        allowed.append(item["after_security"])
+    if _application_target_security(root, item["path"]) not in allowed:
+        raise ValueError("Interrupted apply conflicts with later file security changes: " + item["path"])
+
+
+def _validate_application_temp(root, item, folder):
+    relative = item.get("temp")
+    if relative is None:  # Older journals did not register sibling scratch files.
+        return None
+    if not isinstance(relative, str):
+        raise ValueError("Invalid interrupted application temporary path")
+    temp = Path(relative)
+    name = temp.name
+    if (relative != temp.as_posix() or temp.is_absolute()
+            or temp.parent != Path(item["path"]).parent
+            or len(name) != len(".makewand-") + 32 or not name.startswith(".makewand-")
+            or any(character not in "0123456789abcdef" for character in name[len(".makewand-"):])):
+        raise ValueError("Invalid interrupted application temporary path")
+    target = _verify_safe_target_path(root, relative)
+    if not os.path.lexists(target):
+        return target
+    if target.is_symlink() or not target.is_file() or target.stat().st_size > 512 * 1024 * 1024:
+        raise ValueError("Interrupted application temporary path changed")
+    size = target.stat().st_size
+    current = file_sha256(target)
+    for bucket, record in (("preimages", item.get("before")), ("postimages", item.get("after"))):
+        if record is None:
+            continue
+        source = folder / bucket / item["path"]
+        if not source.exists():
+            continue
+        digest = hashlib.sha256()
+        remaining = size
+        if os.name == "nt":
+            from makewand.native_windows import regular_reader
+            source_reader = regular_reader(source)
+        else:
+            source_reader = os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb")
+        with source_reader as stream:
+            while remaining:
+                chunk = stream.read(min(65536, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                remaining -= len(chunk)
+        if remaining == 0 and digest.hexdigest() == current:
+            return target
+    raise ValueError("Interrupted application temporary content changed")
+
+
+def _remove_application_temp(root, item, folder, *, workspace_identity=None):
+    target = _validate_application_temp(root, item, folder)
+    if target is not None and os.path.lexists(target):
+        _atomic_remove(root, item["temp"], workspace_identity=workspace_identity)
+
+
+def _missing_application_dirs(root, relative):
+    result = []
+    parent = Path(relative).parent
+    while parent != Path("."):
+        if os.path.lexists(Path(root) / parent):
+            break
+        result.append(parent.as_posix())
+        parent = parent.parent
+    return result
+
+
+def _remove_application_dirs(root, directories, identity):
+    for relative in directories:
+        _application_workspace_identity(root, identity)
+        if os.name == "nt":
+            from makewand.native_windows import atomic_remove
+            try:
+                atomic_remove(root, relative, directory=True)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                if error.errno in (errno.ENOTEMPTY, errno.EEXIST) or getattr(error, "winerror", None) == 145:
+                    break
+                raise
+        else:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = os.open(root, flags)
+            try:
+                opened = os.fstat(directory)
+                if [opened.st_dev, opened.st_ino] != identity:
+                    raise ValueError("Interrupted application workspace identity changed")
+                parts = Path(relative).parts
+                for component in parts[:-1]:
+                    child = os.open(component, flags, dir_fd=directory)
+                    os.close(directory)
+                    directory = child
+                os.rmdir(parts[-1], dir_fd=directory)
+                os.fsync(directory)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    break
+                raise
+            finally:
+                os.close(directory)
+
+
+def _restore_application_entry(root, item, folder, *, workspace_identity=None):
+    if item["action"] == "restore":
+        backup = folder / "preimages" / item["path"]
+        if os.name == "nt":
+            from makewand.native_windows import atomic_copy
+            def validate_restoration(security):
+                current = _application_target_record(root, item["path"])
+                if current not in (item["before"], item["after"]):
+                    raise ValueError("Interrupted apply conflicts with later workspace changes: " + item["path"])
+                _validate_application_security(root, item, current)
+                if security != item["before_security"]:
+                    raise ValueError("Interrupted application original file security changed")
+            atomic_copy(root, item["path"], backup, item["before"], restore_acl=True,
+                        temporary_name=Path(item["temp"]).name if item.get("temp") else None,
+                        restore_security=item["before_security_descriptor"], before_replace=validate_restoration)
+        else:
+            _atomic_copy(root, item["path"], backup, item["before"],
+                         temporary_name=Path(item["temp"]).name if item.get("temp") else None,
+                         workspace_identity=workspace_identity)
+    else:
+        _atomic_remove(root, item["path"], workspace_identity=workspace_identity,
+                       expected_security=item.get("after_security") if os.name == "nt" else _NO_SECURITY_EXPECTATION)
+
+
+def _recover_application_journals(base_cwd):
+    """Recover durable preimages while refusing later user modifications.
+
+    The caller holds the workspace and apply locks. Every interrupted mutation
+    must match its frozen preimage or postimage before *any* rollback begins.
+    """
+    root = os.path.realpath(base_cwd)
+    if not config.BACKUPS_DIR.exists():
+        return []
+    recovered = []
+    plans = []
+    for folder in sorted(config.BACKUPS_DIR.iterdir()):
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        path = folder / "journal.json"
+        if not path.exists():
+            continue
+        if path.is_symlink() or path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("Invalid interrupted application journal")
+        with path.open(encoding="utf-8") as stream:
+            frozen = json.load(stream)
+        # Historical list journals were written only after successful apply.
+        if isinstance(frozen, list):
+            continue
+        if not isinstance(frozen, dict) or frozen.get("workspace") != root:
+            continue
+        if frozen.get("state") in ("committed", "rolled_back"):
+            continue
+        _application_workspace_identity(root, frozen.get("workspace_identity"))
+        if frozen.get("schema") != 1 or frozen.get("state") not in ("prepared", "failed") or not isinstance(frozen.get("entries"), list):
+            raise ValueError("Invalid interrupted application journal schema")
+        entries = frozen["entries"]
+        if os.name == "nt" and entries and frozen.get("security_schema") != 1:
+            raise ValueError("Interrupted Windows application lacks frozen file security; preserve evidence for manual review")
+        pending = []
+        seen = set()
+        for item in entries:
+            if not isinstance(item, dict) or item.get("path") in seen:
+                raise ValueError("Invalid interrupted application journal entry")
+            relative = item.get("path")
+            if not isinstance(relative, str):
+                raise ValueError("Invalid interrupted application journal path")
+            parts = relative.split("/")
+            if any(not part or part in (".", "..", ".git") for part in parts) or Path(relative).is_absolute():
+                raise ValueError("Unsafe interrupted application journal path")
+            seen.add(relative)
+            for directory in item.get("created_dirs", []):
+                if (not isinstance(directory, str) or Path(directory).is_absolute()
+                        or Path(directory).as_posix() != directory
+                        or any(part in (".", "..", ".git") for part in Path(directory).parts)
+                        or not relative.startswith(directory + "/")):
+                    raise ValueError("Invalid interrupted application directory")
+            current = _application_target_record(root, relative)
+            before, after = item.get("before"), item.get("after")
+            if current not in (before, after):
+                raise ValueError(f"Interrupted apply conflicts with later workspace changes: {relative}")
+            _validate_application_security(root, item, current)
+            if item.get("action") == "restore":
+                backup = (folder / "preimages").joinpath(*parts)
+                _verify_safe_target_path(folder / "preimages", relative)
+                if before is None or file_record(backup) != before:
+                    raise ValueError(f"Interrupted apply backup changed: {relative}")
+            elif item.get("action") != "delete" or before is not None:
+                raise ValueError("Invalid interrupted application journal action")
+            if "postimage" in item:
+                if item["postimage"] != "postimages/" + relative:
+                    raise ValueError("Invalid interrupted application postimage path")
+                postimage = _verify_safe_target_path(folder / "postimages", relative)
+                if after is None or file_record(postimage) != after:
+                    raise ValueError("Interrupted application postimage changed: " + relative)
+            _validate_application_temp(root, item, folder)
+            pending.append(item)
+        plans.append((folder, path, frozen, pending))
+    # Validate all journals and their preimages before changing even one file.
+    for folder, path, frozen, pending in plans:
+        for item in reversed(pending):
+            _application_workspace_identity(root, frozen["workspace_identity"])
+            current = _application_target_record(root, item["path"])
+            if current not in (item["before"], item["after"]):
+                raise ValueError("Interrupted apply conflicts with later workspace changes: " + item["path"])
+            _validate_application_security(root, item, current)
+            _remove_application_temp(root, item, folder, workspace_identity=frozen["workspace_identity"])
+            if current != item["before"]:
+                _restore_application_entry(root, item, folder, workspace_identity=frozen["workspace_identity"])
+            _remove_application_dirs(root, item.get("created_dirs", []), frozen["workspace_identity"])
+        frozen["state"] = "rolled_back"
+        _write_application_journal(path, frozen)
+        recovered.append(str(folder))
+    return recovered
 
 
 def _input_manifest(directory: Path) -> Dict[str, Any]:
@@ -297,6 +606,9 @@ def _candidate_seal_error(agent: Dict[str, Any], race: Dict[str, Any]) -> Option
 
 
 def _verify_safe_target_path(base_cwd: Union[str, Path], rel_path: str) -> Path:
+    if os.name == "nt":
+        from makewand.native_windows import validate_target
+        return validate_target(base_cwd, rel_path)
     canonical_base = os.path.realpath(base_cwd)
     cur = Path(base_cwd)
     for part in Path(rel_path).parts:
@@ -310,14 +622,24 @@ def _verify_safe_target_path(base_cwd: Union[str, Path], rel_path: str) -> Path:
     return cur
 
 
-def _atomic_remove(workspace: str, rel_path: str):
+def _atomic_remove(workspace: str, rel_path: str, *, workspace_identity=None,
+                   expected_security=_NO_SECURITY_EXPECTATION):
     """Remove a workspace entry without following mutable parent symlinks."""
+    if os.name == "nt":
+        from makewand.native_windows import atomic_remove
+        if expected_security is _NO_SECURITY_EXPECTATION:
+            return atomic_remove(workspace, rel_path)
+        return atomic_remove(workspace, rel_path, expected_security=expected_security)
     parts = Path(rel_path).parts
     if not parts or Path(rel_path).is_absolute() or any(x in (".", "..") for x in parts):
         raise ValueError("invalid workspace-relative path")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     directory = os.open(workspace, flags)
     try:
+        if workspace_identity is not None:
+            opened = os.fstat(directory)
+            if [opened.st_dev, opened.st_ino] != workspace_identity:
+                raise ValueError("Application opened workspace identity changed")
         for component in parts[:-1]:
             child = os.open(component, flags, dir_fd=directory)
             os.close(directory)
@@ -430,6 +752,31 @@ def _hybrid_tests_available(root: Path) -> bool:
 
 class CandidateManager:
     """Manages the lifecycle of race candidates."""
+
+    @staticmethod
+    def recover_interrupted_applications(base_cwd) -> Tuple[bool, List[str], str]:
+        """Explicitly recover interrupted applies under both application locks."""
+        ensure_config_dir()
+        try:
+            with open(config.CONFIG_DIR / "apply.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                workspace_lock = None
+                try:
+                    workspace_lock = WorkspaceLock(base_cwd).acquire()
+                    if os.name == "nt":
+                        from makewand.native_windows import pinned_directory
+                        boundary = pinned_directory(base_cwd)
+                    else:
+                        boundary = contextlib.nullcontext()
+                    with boundary:
+                        recovered = _recover_application_journals(base_cwd)
+                    return True, recovered, f"已恢复 {len(recovered)} 项中断应用"
+                finally:
+                    if workspace_lock is not None:
+                        workspace_lock.release()
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        except (OSError, ValueError, WorkspaceLockError) as error:
+            return False, [], f"中断应用恢复已停止，保留工作区与备份: {error}"
 
     @staticmethod
     def save_race(
@@ -754,8 +1101,8 @@ class CandidateManager:
     @staticmethod
     def create_hybrid_candidate(race_id: Optional[str] = None, test_timeout: Optional[float] = None) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         """Serialize synthesis and application, preserving existing sealed M."""
-        if os.name != "posix":
-            return False, None, "安全混合候选需要 POSIX 目录句柄；Windows 请在 WSL2 中运行"
+        if os.name not in ("posix", "nt"):
+            return False, None, "当前平台缺少安全目录句柄后端"
         deadline = None
         if test_timeout is not None:
             if isinstance(test_timeout, bool) or not isinstance(test_timeout, (int, float)) or not 0 < test_timeout < float("inf"):
@@ -946,8 +1293,8 @@ class CandidateManager:
         Guarded with a file lock to serialize Makewand apply operations.
         Returns (success, applied_files, message).
         """
-        if os.name != "posix":
-            return False, [], "安全候选应用需要 POSIX 目录句柄；Windows 请在 WSL2 中运行 makewand apply。"
+        if os.name not in ("posix", "nt"):
+            return False, [], "当前平台缺少安全候选应用后端。"
         ensure_config_dir()
         lock_file = config.CONFIG_DIR / "apply.lock"
         lock_fd = None
@@ -983,14 +1330,22 @@ class CandidateManager:
                 except OSError as e:
                     return False, [], f"无法获取工作区锁: {e}"
             try:
-                return CandidateManager._do_apply_candidate(
-                    race_id=race_id,
-                    candidate_label=candidate_label,
-                    dry_run=dry_run,
-                    force=force,
-                    merge=merge,
-                    protected_paths=protected_paths,
-                )
+                if os.name == "nt" and base_cwd:
+                    from makewand.native_windows import pinned_directory
+                    boundary = pinned_directory(base_cwd)
+                else:
+                    boundary = contextlib.nullcontext()
+                with boundary:
+                    if not dry_run and base_cwd:
+                        _recover_application_journals(base_cwd)
+                    return CandidateManager._do_apply_candidate(
+                        race_id=race_id,
+                        candidate_label=candidate_label,
+                        dry_run=dry_run,
+                        force=force,
+                        merge=merge,
+                        protected_paths=protected_paths,
+                    )
             finally:
                 if workspace_lock is not None:
                     workspace_lock.release()
@@ -1025,6 +1380,8 @@ class CandidateManager:
 
         r_id = race.get("race_id", "")
         base_cwd = race.get("base_cwd", "")
+        if not isinstance(r_id, str) or not r_id or Path(r_id).name != r_id or r_id in (".", ".."):
+            return False, [], "无效竞速记录路径"
         if not os.path.exists(base_cwd):
             return False, [], f"原始工作区不存在: {base_cwd}"
         try:
@@ -1134,7 +1491,7 @@ class CandidateManager:
                 if os.path.islink(parent):
                     resolved_parent = os.path.realpath(parent)
                     if not resolved_parent.startswith(canonical_base + os.sep) and resolved_parent != canonical_base:
-                        return False, [], f"安全越界风险: 目标父目录包含指向外部的符号链接，已拒绝写入"
+                        return False, [], "安全越界风险: 目标父目录包含指向外部的符号链接，已拒绝写入"
                 parent = parent.parent
 
         # Conflict Detection (dirty files + baseline manifest + baseline commit)
@@ -1161,19 +1518,61 @@ class CandidateManager:
             preview = [f"{status} {path}" for path, status in changes.items()]
             return True, preview, f"[Dry-run] 演练完成，共涉及 {len(changes)} 个文件的增删改"
 
+        # Freeze every current target before the first mutation, including
+        # absent additions. Force can accept prior edits, but never edits made
+        # after this transaction starts.
+        identity = os.stat(base_cwd, follow_symlinks=False)
+        workspace_identity = [identity.st_dev, identity.st_ino]
+        try:
+            _application_workspace_identity(base_cwd, workspace_identity)
+            preimages = {relative: _application_target_record(base_cwd, relative)
+                         for relative in changes}
+            before_security = {}
+            before_security_descriptors = {}
+            if os.name == "nt":
+                from makewand.native_windows import application_security_descriptor, validate_application_security_descriptor
+                for relative, current in preimages.items():
+                    before_security[relative] = _application_target_security(base_cwd, relative)
+                    before_security_descriptors[relative] = (application_security_descriptor(
+                        _verify_safe_target_path(base_cwd, relative)) if current is not None else None)
+                    if current is not None:
+                        validate_application_security_descriptor(before_security_descriptors[relative], before_security[relative])
+                    if (_application_target_record(base_cwd, relative) != current
+                            or _application_target_security(base_cwd, relative) != before_security[relative]):
+                        raise ValueError("Application target changed while freezing file security: " + relative)
+            baseline = race.get("baseline_manifest")
+            if not force and isinstance(baseline, dict):
+                for relative, current in preimages.items():
+                    if current != baseline.get(relative):
+                        raise ValueError("Application target changed since its baseline: " + relative)
+        except (OSError, ValueError) as error:
+            return False, [], str(error)
+
         # Create Backup Journal (holds copies of workspace files: private 0700)
         ensure_config_dir()
         ensure_private_dir(config.BACKUPS_DIR)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_dir = config.BACKUPS_DIR / f"{r_id}_{ts}"
+        backup_dir = config.BACKUPS_DIR / f"{r_id}_{ts}_{uuid.uuid4().hex[:8]}"
         backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         journal = []
+        durable_journal = {"schema": 1, "workspace": os.path.realpath(base_cwd), "race_id": r_id,
+                           "workspace_identity": workspace_identity,
+                           "candidate": label, "state": "prepared", "entries": journal}
+        if os.name == "nt":
+            durable_journal["security_schema"] = 1
+        journal_path = backup_dir / "journal.json"
         applied_files = []
 
         try:
+            _write_application_journal(journal_path, durable_journal)
             for rel_path, status in changes.items():
                 _check_apply_deadline()
+                _application_workspace_identity(base_cwd, workspace_identity)
+                if _application_target_record(base_cwd, rel_path) != preimages[rel_path]:
+                    raise ValueError("Application target changed before write: " + rel_path)
+                if os.name == "nt" and _application_target_security(base_cwd, rel_path) != before_security[rel_path]:
+                    raise ValueError("Application target file security changed before write: " + rel_path)
                 for guard in (protection, additional):
                     guard.verify(candidate_dir)
                     guard.verify(base_cwd)
@@ -1183,61 +1582,132 @@ class CandidateManager:
                 if os.path.islink(src_file) or src_file.is_symlink():
                     raise ValueError(f"安全越界风险: 候选文件 {rel_path} 为符号链接")
 
+                postimage = None
+                if status in ("M", "A"):
+                    postimages = backup_dir / "postimages"
+                    postimages.mkdir(mode=0o700, exist_ok=True)
+                    _atomic_copy(str(postimages), rel_path, src_file, expected_manifest[rel_path])
+                    if file_record(postimages / rel_path) != expected_manifest[rel_path]:
+                        raise ValueError("Application postimage changed while sealing: " + rel_path)
+                    postimage = "postimages/" + rel_path
+
                 # Backup existing
                 if target_file.exists():
                     if os.path.islink(target_file) or target_file.is_symlink():
                         raise ValueError(f"安全越界风险: 目标文件 {rel_path} 为符号链接")
-                    bak_file = backup_dir / rel_path
+                    bak_file = backup_dir / "preimages" / rel_path
                     bak_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(target_file, bak_file)
-                    journal.append({"path": rel_path, "action": "restore", "bak": str(bak_file)})
+                    if os.name == "nt":
+                        from makewand.native_windows import copy_backup
+                        copy_backup(target_file, bak_file)
+                    else:
+                        shutil.copy2(target_file, bak_file)
+                    if file_record(bak_file) != preimages[rel_path]:
+                        raise ValueError("Application preimage changed during backup: " + rel_path)
+                    journal.append({"path": rel_path, "action": "restore", "bak": str(bak_file),
+                                    "before": file_record(bak_file), "after": expected_manifest.get(rel_path)})
                 else:
-                    journal.append({"path": rel_path, "action": "delete"})
+                    journal.append({"path": rel_path, "action": "delete", "before": None,
+                                    "after": expected_manifest.get(rel_path)})
+                entry = journal[-1]
+                if os.name == "nt":
+                    entry["before_security"] = before_security[rel_path]
+                    entry["after_security"] = None if status == "D" else before_security[rel_path]
+                    entry["before_security_descriptor"] = before_security_descriptors[rel_path]
+                entry["temp"] = (Path(rel_path).parent / (".makewand-" + uuid.uuid4().hex)).as_posix()
+                entry["created_dirs"] = _missing_application_dirs(base_cwd, rel_path)
+                if postimage is not None:
+                    entry["postimage"] = postimage
+
+                # Complete and fsync the rollback plan before changing user data.
+                _write_application_journal(journal_path, durable_journal)
+                _application_workspace_identity(base_cwd, workspace_identity)
+                if _application_target_record(base_cwd, rel_path) != preimages[rel_path]:
+                    raise ValueError("Application target changed while preparing write: " + rel_path)
+                if os.name == "nt" and _application_target_security(base_cwd, rel_path) != before_security[rel_path]:
+                    raise ValueError("Application target file security changed while preparing write: " + rel_path)
 
                 # Apply Change
                 if status in ("M", "A"):
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                     _verify_safe_target_path(base_cwd, rel_path)
 
-                    _atomic_copy(base_cwd, rel_path, src_file, expected_manifest.get(rel_path))
+                    before_replace = None
+                    if os.name == "nt":
+                        def record_after_security(security):
+                            _application_workspace_identity(base_cwd, workspace_identity)
+                            if (_application_target_record(base_cwd, rel_path) != preimages[rel_path]
+                                    or _application_target_security(base_cwd, rel_path) != before_security[rel_path]):
+                                raise ValueError("Application target changed before replacement: " + rel_path)
+                            if preimages[rel_path] is not None and security != before_security[rel_path]:
+                                raise ValueError("Application replacement file security changed: " + rel_path)
+                            if not isinstance(security, str) or not security or len(security) > 16384:
+                                raise ValueError("Invalid application replacement file security")
+                            entry["after_security"] = security
+                            _write_application_journal(journal_path, durable_journal)
+                        before_replace = record_after_security
+                    _atomic_copy(base_cwd, rel_path, src_file, expected_manifest.get(rel_path),
+                                 temporary_name=Path(entry["temp"]).name,
+                                 workspace_identity=workspace_identity, before_replace=before_replace)
                     applied_files.append(f"A/M {rel_path}")
                 elif status == "D":
                     if target_file.exists():
                         _verify_safe_target_path(base_cwd, rel_path)
-                        _atomic_remove(base_cwd, rel_path)
+                        _atomic_remove(base_cwd, rel_path, workspace_identity=workspace_identity,
+                                       expected_security=before_security[rel_path] if os.name == "nt" else _NO_SECURITY_EXPECTATION)
                         applied_files.append(f"D   {rel_path}")
 
                 _check_apply_deadline()
-
-            with open(backup_dir / "journal.json", "w", encoding="utf-8") as jf:
-                json.dump(journal, jf, indent=2)
 
             _check_apply_deadline()
             for guard in (protection, additional):
                 guard.verify(candidate_dir)
                 guard.verify(base_cwd)
+            _application_workspace_identity(base_cwd, workspace_identity)
+            for relative, status in changes.items():
+                expected = None if status == "D" else expected_manifest[relative]
+                if _application_target_record(base_cwd, relative) != expected:
+                    raise ValueError("Application postimage changed before commit: " + relative)
+            if os.name == "nt":
+                for entry in journal:
+                    if _application_target_security(base_cwd, entry["path"]) != entry["after_security"]:
+                        raise ValueError("Application postimage file security changed before commit: " + entry["path"])
+            durable_journal["state"] = "committed"
+            _write_application_journal(journal_path, durable_journal)
             CandidateManager._mark_applied(r_id, label)
             return True, applied_files, f"成功应用候选方案 {label} ({len(applied_files)} 个变更已同步)"
 
         except Exception as e:
-            # Rollback
+            # The same complete preflight used on restart protects user edits
+            # during immediate failure rollback. A conflict preserves every
+            # target and the private evidence instead of partly restoring first.
             rollback_errors = []
-            for item in reversed(journal):
-                rel_p = item["path"]
-                try:
-                    t_file = _verify_safe_target_path(base_cwd, rel_p)
-                    if item["action"] == "restore":
-                        _atomic_copy(base_cwd, rel_p, Path(item["bak"]))
-                    elif item["action"] == "delete" and t_file.exists():
-                        _verify_safe_target_path(base_cwd, rel_p)
-                        _atomic_remove(base_cwd, rel_p)
-                except Exception as rollback_error:
-                    rollback_errors.append(f"{rel_p}: {rollback_error}")
+            try:
+                # Publication may succeed before a metadata sync reports an
+                # error. A committed marker must never be called rolled back.
+                if journal_path.exists():
+                    with journal_path.open(encoding="utf-8") as stream:
+                        published = json.load(stream)
+                    if published.get("state") == "committed":
+                        return False, [], CandidateMessage(f"应用提交结果未确定，已保留提交日志: {e}；{backup_dir}", "UNKNOWN")
+                _recover_application_journals(base_cwd)
+            except Exception as rollback_error:
+                rollback_errors.append(str(rollback_error))
 
             if rollback_errors:
+                durable_journal["state"] = "failed"
+                try:
+                    _write_application_journal(journal_path, durable_journal)
+                except (OSError, ValueError):
+                    pass
                 detail = (f"应用失败: {e}；部分文件回滚失败: {'; '.join(rollback_errors)}。"
                           f"备份保留于 {backup_dir}")
                 return False, [], CandidateMessage(detail, e.status) if isinstance(e, ProtectionError) else CandidateMessage(detail, "TIMEOUT") if isinstance(e, CandidateDeadlineExceeded) else detail
+            durable_journal["state"] = "rolled_back"
+            try:
+                _write_application_journal(journal_path, durable_journal)
+            except (OSError, ValueError):
+                pass
             detail = f"应用过程中发生异常并已自动回滚: {str(e)}"
             return False, [], CandidateMessage(detail, e.status) if isinstance(e, ProtectionError) else CandidateMessage(detail, "TIMEOUT") if isinstance(e, CandidateDeadlineExceeded) else detail
 

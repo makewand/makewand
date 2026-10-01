@@ -19,6 +19,24 @@ func Open(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("sqlite path is not a regular file: %s", path)
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	// SQLite's default mode depends on umask; create the credential/usage DB
+	// privately before the driver can create a world-readable state file.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err = file.Chmod(0o600); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err = file.Close(); err != nil {
+		return nil, err
+	}
 	// busy_timeout and foreign_keys are per-CONNECTION settings. database/sql
 	// pools connections and opens new ones on demand, so setting them with a
 	// single db.Exec would configure only whichever connection happened to run

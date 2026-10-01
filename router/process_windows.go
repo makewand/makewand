@@ -4,19 +4,17 @@ package router
 
 import (
 	"os/exec"
-	"strconv"
+	"syscall"
+
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 func setCLIProcessGroup(cmd *exec.Cmd) {
-	_ = cmd
+	if cmd != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
+	}
 }
 
 func killCLIProcess(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	// Use taskkill /T /F to kill the entire process tree on Windows.
-	// /T kills child processes, /F forces termination.
-	pid := strconv.Itoa(cmd.Process.Pid)
-	_ = exec.Command("taskkill", "/T", "/F", "/PID", pid).Run()
+	_ = processjob.Kill(cmd)
 }

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,10 +44,77 @@ func TestRawCLIChildStub(t *testing.T) {
 		os.Exit(1)
 	case "sleep":
 		time.Sleep(5 * time.Second)
+	case "flood":
+		block := strings.Repeat("x", 32<<10)
+		for _, stream := range []*os.File{os.Stdout, os.Stderr} {
+			for written := 0; written < 6<<20; written += len(block) {
+				if _, err := stream.WriteString(block); err != nil {
+					os.Exit(4)
+				}
+			}
+		}
+	case "marker":
+		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+		if err := os.WriteFile(path+".ready", []byte("ready"), 0o600); err != nil {
+			os.Exit(4)
+		}
+		time.Sleep(2 * time.Second)
+		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+		if err := os.WriteFile(path+".escaped", []byte("escaped"), 0o600); err != nil {
+			os.Exit(4)
+		}
+	case "leader":
+		// #nosec G204 G702 -- parent-controlled Go test executable and fixed helper selector.
+		child := exec.Command(os.Args[0], rawStubArgs()...)
+		child.Env = append(os.Environ(), "MAKEWAND_VERSUS_CHILD_MODE=marker")
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		if runtime.GOOS == "windows" {
+			setProcessGroup(child)
+		}
+		if err := child.Start(); err != nil {
+			os.Exit(5)
+		}
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+			if _, err := os.Stat(path + ".ready"); err == nil {
+				fmt.Print("leader\n")
+				os.Exit(0)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		os.Exit(6)
 	default:
 		fmt.Println("--- FILE: fixture.txt ---\n```\nsynthetic fixture\n```")
 	}
 	os.Exit(0)
+}
+
+func TestRawCLIOutputOverflowConsumesOneUnknownAttempt(t *testing.T) {
+	bin, state, ledger, _ := setupRawStub(t, 3, "flood")
+	r := runCLIWithTimeout(context.Background(), "offline", bin, rawStubArgs(), 5*time.Second)
+	attempts := readRawAttempts(t, ledger)
+	if !errors.Is(r.err, execution.ErrUnknownOutcome) || execution.ErrorStatus(r.err) != execution.Unknown || rawDispatchCount(t, state) != 1 || len(attempts) != 1 || attempts[0].Known {
+		t.Fatalf("overflow replayed or marked complete: err=%v attempts=%+v", r.err, attempts)
+	}
+}
+
+func TestRawCLILeaderExitClearsDescendantsAndPipes(t *testing.T) {
+	bin, state, _, _ := setupRawStub(t, 3, "leader")
+	started := time.Now()
+	r := runCLIWithTimeout(context.Background(), "offline", bin, rawStubArgs(), 5*time.Second)
+	if time.Since(started) > 1800*time.Millisecond || (r.err != nil && !errors.Is(r.err, execution.ErrUnknownOutcome)) {
+		t.Fatalf("leader/stdio was not bounded: err=%v elapsed=%v", r.err, time.Since(started))
+	}
+	if _, err := os.Stat(state + ".ready"); err != nil {
+		t.Fatalf("real descendant was not started: %v", err)
+	}
+	if remaining := time.Until(started.Add(2300 * time.Millisecond)); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	if _, err := os.Stat(state + ".escaped"); !os.IsNotExist(err) {
+		t.Fatalf("descendant survived raw command completion: %v", err)
+	}
 }
 
 type rawLedgerAttempt struct {

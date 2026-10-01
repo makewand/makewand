@@ -1,8 +1,13 @@
 package tui
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -79,40 +84,148 @@ func TestHandleFilesExtracted_SafeModeAutoApprovesChatWrites(t *testing.T) {
 }
 
 func TestHandleFilesExtracted_AutopilotAutoApprovesVerifiedChatWrites(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.ApprovalMode = config.ApprovalModeAuto
-	app := *NewApp(ModeChat, cfg, "")
-
-	project, err := engine.NewProject("autopilot-chat-write", t.TempDir())
-	if err != nil {
-		t.Fatalf("NewProject: %v", err)
-	}
-	app.project = project
+	app, report := trustedAutopilotFixture(t)
 	app.pendingWriteVerified = true
-
-	modelAfterFiles, cmd := app.handleFilesExtracted(filesExtractedMsg{
-		files: []engine.ExtractedFile{{Path: "hello.txt", Content: "hello"}},
-		phase: pendingPhaseChat,
-	})
+	app.pendingWriteAcceptance = report.Acceptance
+	app.pendingWriteDigest = report.VerifiedDigest
+	modelAfterFiles, cmd := app.handleFilesExtracted(filesExtractedMsg{files: report.VerifiedFiles, phase: pendingPhaseChat})
 	app = modelAfterFiles.(App)
-
-	if cmd == nil {
-		t.Fatal("autopilot should auto-approve verified chat file writes")
-	}
-	if app.state == StateConfirmFiles {
-		t.Fatal("state should not enter StateConfirmFiles for verified autopilot chat writes")
+	if cmd == nil || app.state == StateConfirmFiles {
+		t.Fatal("parent-issued independent acceptance should auto-approve autopilot writes")
 	}
 	if !chatContainsMessage(app, fmt.Sprintf(i18n.Msg().ApprovalAutoWriteAutopilot, 1)) {
 		t.Fatalf("chat missing autopilot auto-approval status: %+v", app.chat.messages)
 	}
-
-	msg := cmd()
-	confirm, ok := msg.(confirmFileWriteMsg)
-	if !ok {
-		t.Fatalf("cmd() returned %T, want confirmFileWriteMsg", msg)
+	confirm, ok := cmd().(confirmFileWriteMsg)
+	if !ok || !confirm.confirmed || !confirm.automatic {
+		t.Fatal("automatic authorization was not retained")
 	}
-	if !confirm.confirmed {
-		t.Fatal("confirmFileWriteMsg.confirmed = false, want true")
+	_, write := app.handleFileWriteConfirm(confirm)
+	result := write().(fileWriteCompleteMsg)
+	if result.failed != 0 || result.written != 1 {
+		t.Fatalf("valid parent approval could not be applied: %+v", result)
+	}
+}
+
+func trustedAutopilotFixture(t *testing.T) (App, engine.CandidateVerification) {
+	t.Helper()
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "0")
+	if !engine.VerificationIsolationActive(engine.UnsafeHostExecAuthorization{}) {
+		if os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
+			t.Fatal("required real bubblewrap isolation is unavailable")
+		}
+		t.Skip("real bubblewrap isolation is unavailable")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		if os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
+			t.Fatal("required python3 acceptance runtime is unavailable")
+		}
+		t.Skip("python3 is unavailable")
+	}
+	root := t.TempDir()
+	t.Setenv("MAKEWAND_APPLY_STATE_DIR", filepath.Join(root, "private-apply"))
+	project, err := engine.NewProject("autopilot", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := project.WriteFile("main.py", "print('before')\n"); err != nil {
+		t.Fatal(err)
+	}
+	spec := engine.TrustedAcceptanceSpec{Schema: 1, Command: "python3", Args: []string{"-I", "main.py"}, Cases: []engine.TrustedAcceptanceCase{{Name: "behavior", Stdout: "42\n"}}}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "acceptance.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAKEWAND_TRUSTED_ACCEPTANCE_FILE", path)
+	report, err := project.EvaluateCandidateFiles(context.Background(), []engine.ExtractedFile{{Path: "main.py", Content: "print(42)\n"}})
+	if err != nil || report.Acceptance == nil || report.Strength != 2 {
+		t.Fatalf("real trusted fixture failed: %v %+v", err, report)
+	}
+	cfg := config.DefaultConfig()
+	cfg.ApprovalMode = config.ApprovalModeAuto
+	app := *NewApp(ModeChat, cfg, "")
+	app.project = project
+	return app, report
+}
+
+func TestAutopilotNeverAutoApprovesMissingOrImportedReceipts(t *testing.T) {
+	app, report := trustedAutopilotFixture(t)
+	data, err := json.Marshal(report.Acceptance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var imported engine.TrustedAcceptanceRecord
+	if err := json.Unmarshal(data, &imported); err != nil {
+		t.Fatal(err)
+	}
+	for _, receipt := range []*engine.TrustedAcceptanceRecord{nil, &imported} {
+		for _, phase := range []pendingPhaseType{pendingPhaseChat, pendingPhaseBuild, pendingPhaseFix} {
+			app.pendingWriteVerified = true // an obsolete/fabricated bool is not proof
+			app.pendingWriteAcceptance = receipt
+			app.pendingWriteDigest = report.VerifiedDigest
+			model, command := app.handleFilesExtracted(filesExtractedMsg{files: report.VerifiedFiles, phase: phase})
+			if command != nil || model.(App).state != StateConfirmFiles {
+				t.Fatalf("phase %v auto-approved a missing/imported receipt", phase)
+			}
+		}
+	}
+}
+
+func TestAutopilotAutomaticWriteRejectsMissingAndStaleReceipts(t *testing.T) {
+	for _, name := range []string{"missing", "stale baseline", "stale policy"} {
+		t.Run(name, func(t *testing.T) {
+			app, report := trustedAutopilotFixture(t)
+			app.pendingFiles = report.VerifiedFiles
+			app.pendingWriteVerified = true
+			app.pendingWriteDigest = report.VerifiedDigest
+			app.pendingWriteAcceptance = report.Acceptance
+			switch name {
+			case "missing":
+				app.pendingWriteAcceptance = nil
+			case "stale baseline":
+				if err := app.project.WriteFile("outside-patch.txt", "external editor"); err != nil {
+					t.Fatal(err)
+				}
+			case "stale policy":
+				path := os.Getenv("MAKEWAND_TRUSTED_ACCEPTANCE_FILE")
+				// This path is the isolated specification fixture created by this test.
+				if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil { //nolint:gosec
+					t.Fatal(err)
+				}
+			}
+			_, command := app.handleFileWriteConfirm(confirmFileWriteMsg{confirmed: true, automatic: true})
+			result := command().(fileWriteCompleteMsg)
+			if result.written != 0 || result.failed != 1 {
+				t.Fatalf("%s granted automatic application: %+v", name, result)
+			}
+			data, err := os.ReadFile(filepath.Join(app.project.Path, "main.py"))
+			if err != nil || string(data) != "print('before')\n" {
+				t.Fatalf("%s changed target: %q %v", name, data, err)
+			}
+		})
+	}
+}
+
+func TestAutopilotExplicitHumanApprovalAllowsMissingReceipt(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MAKEWAND_APPLY_STATE_DIR", filepath.Join(root, "private-apply"))
+	cfg := config.DefaultConfig()
+	cfg.ApprovalMode = config.ApprovalModeAuto
+	app := *NewApp(ModeChat, cfg, "")
+	project, err := engine.NewProject("manual", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.project = project
+	app.pendingFiles = []engine.ExtractedFile{{Path: "human.txt", Content: "human approved"}}
+	_, command := app.handleFileWriteConfirm(confirmFileWriteMsg{confirmed: true})
+	result := command().(fileWriteCompleteMsg)
+	if result.failed != 0 || result.written != 1 {
+		t.Fatalf("explicit human approval was blocked: %+v", result)
 	}
 }
 

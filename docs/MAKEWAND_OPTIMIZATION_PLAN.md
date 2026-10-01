@@ -5,6 +5,8 @@
 适用范围：CLI、Router 库、可信代码执行与验证、自托管 Server  
 关联文档：[AI 编排 MVP](AI_ORCHESTRATION_MVP.md)
 
+2026-10-01 实施补充：本文件保留 7 月的原始基线与发布愿景。上一轮评估所列的独立可信验收、原生 Windows 流程、负载与恢复演练，以及实施中确认的预算和应用恢复缺口，现已落实到代码与持续门禁；详见 [长期架构优化实施记录](ARCHITECTURE_OPTIMIZATION_2026-10-01.md)。发布历史与 Server GA 的三个版本观察窗口仍按实际证据判断，不能用单次演练代替。
+
 ## 1. 执行摘要
 
 Makewand 已具备多 Provider 路由、熔断、配额感知、Power ensemble、TUI、

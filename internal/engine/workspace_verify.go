@@ -79,11 +79,13 @@ type CandidateVerification struct {
 	TestsPlan         *ExecPlan
 	TestsResult       *ExecResult
 	TestsError        string
-	IntegrityError    string          // input tree changed during verification
-	EvidenceLimit     string          // successful candidate-controlled output is not an independent attestation
-	VerifiedFiles     []ExtractedFile // exact files verified in the tree
-	VerifiedContent   string          // rendered payload of verified files
-	VerifiedDigest    string          // sha256 hex digest of verified files
+	IntegrityError    string                   // input tree changed during verification
+	EvidenceLimit     string                   // successful candidate-controlled output is not an independent attestation
+	AcceptanceError   string                   // independent acceptance failed or could not execute
+	Acceptance        *TrustedAcceptanceRecord // trusted parent verdict, bound to the sealed inputs
+	VerifiedFiles     []ExtractedFile          // exact files verified in the tree
+	VerifiedContent   string                   // rendered payload of verified files
+	VerifiedDigest    string                   // sha256 hex digest of verified files
 }
 
 // WriteFiles writes a batch of extracted files into the project.
@@ -378,7 +380,7 @@ func (p *Project) missingParentDirs(relPath string) []string {
 	var missing []string
 	dir := filepath.Dir(filepath.Clean(relPath))
 	for dir != "." && dir != string(filepath.Separator) && dir != "" {
-		if _, err := os.Lstat(filepath.Join(p.Path, dir)); err == nil {
+		if _, err := os.Lstat(filepath.Join(p.Path, dir)); err == nil { //nolint:gosec // Read-only parent metadata; callers have validated relPath within the project root.
 			break
 		} else if !os.IsNotExist(err) {
 			break
@@ -539,6 +541,17 @@ func (p *Project) cloneToTempContext(ctx context.Context, copyContents func(*os.
 // scoring in verifyRestrictedWorkspace ensures they cannot raise Strength on
 // their own.
 func (p *Project) EvaluateCandidateFiles(ctx context.Context, files []ExtractedFile) (CandidateVerification, error) {
+	ctx, err := prepareTrustedAcceptance(ctx, p)
+	if err != nil {
+		return CandidateVerification{}, err
+	}
+	baselineDigest := ""
+	if acceptancePolicy(ctx) != nil {
+		baselineDigest, err = AcceptanceInputDigest(p.Path)
+		if err != nil {
+			return CandidateVerification{}, err
+		}
+	}
 	clone, err := p.CloneToTemp()
 	if err != nil {
 		return CandidateVerification{}, err
@@ -582,13 +595,22 @@ func (p *Project) EvaluateCandidateFiles(ctx context.Context, files []ExtractedF
 	if err != nil {
 		return CandidateVerification{}, err
 	}
+	acceptanceBefore := ""
+	if acceptancePolicy(ctx) != nil {
+		acceptanceBefore, err = AcceptanceInputDigest(clone.Path)
+		if err != nil {
+			return CandidateVerification{}, err
+		}
+	}
 	report := clone.verifyRestrictedWorkspace(ctx, sealed, contract)
 	report.RestoredTests = restored
+	clone.applyTrustedAcceptance(ctx, &report, acceptanceBefore, baselineDigest, sealed)
 	after, err := workspaceInputDigest(clone.Path)
 	afterFiles, filesErr := snapshotCandidateFiles(clone, sealed)
 	if err != nil || filesErr != nil || before != after || !extractedFilesEqual(sealed, afterFiles) {
 		report.Passed = false
 		report.Strength = 0
+		report.Acceptance = nil
 		report.IntegrityError = "verification changed its input files or permissions; review the generated changes and verify again"
 		if err != nil {
 			report.IntegrityError += ": " + err.Error()
@@ -1125,6 +1147,10 @@ func extractedFilesEqual(a, b []ExtractedFile) bool {
 
 // VerifyRestrictedWorkspace runs layered candidate verification in-project.
 func (p *Project) VerifyRestrictedWorkspace(ctx context.Context, files []ExtractedFile) CandidateVerification {
+	ctx, err := prepareTrustedAcceptance(ctx, p)
+	if err != nil {
+		return CandidateVerification{AcceptanceError: err.Error(), EnvironmentError: true}
+	}
 	contract, err := p.baselineVerificationContract()
 	if err != nil {
 		return CandidateVerification{TestsError: err.Error()}
@@ -1133,12 +1159,33 @@ func (p *Project) VerifyRestrictedWorkspace(ctx context.Context, files []Extract
 	if err != nil {
 		return CandidateVerification{IntegrityError: err.Error()}
 	}
-	report := p.verifyRestrictedWorkspace(ctx, files, contract)
+	acceptanceBefore := ""
+	if acceptancePolicy(ctx) != nil {
+		acceptanceBefore, err = AcceptanceInputDigest(p.Path)
+		if err != nil {
+			return CandidateVerification{AcceptanceError: err.Error(), EnvironmentError: true}
+		}
+	}
+	sealed := files
+	if acceptancePolicy(ctx) != nil {
+		sealed, err = snapshotCandidateFiles(p, files)
+		if err != nil {
+			return CandidateVerification{IntegrityError: err.Error()}
+		}
+	}
+	report := p.verifyRestrictedWorkspace(ctx, sealed, contract)
+	p.applyTrustedAcceptance(ctx, &report, acceptanceBefore, acceptanceBefore, sealed)
 	after, err := workspaceInputDigest(p.Path)
 	if err != nil || before != after {
 		report.Passed = false
 		report.Strength = 0
+		report.Acceptance = nil
 		report.IntegrityError = "verification changed its input files or permissions; verify the new state again"
+	}
+	if report.Passed && report.Acceptance != nil {
+		report.VerifiedFiles = sealed
+		report.VerifiedContent = RenderExtractedFiles(sealed)
+		report.VerifiedDigest = calculateFilesDigest(sealed)
 	}
 	return report
 }
@@ -1329,6 +1376,12 @@ func (p *Project) runExternalQuickChecks(ctx context.Context, files []ExtractedF
 	}
 
 	for _, plan := range detectQuickCheckPlans(files) {
+		if acceptancePolicy(ctx) != nil && plan.Command == "python3" && len(plan.Args) >= 2 && plan.Args[0] == "-m" && plan.Args[1] == "py_compile" {
+			// Compile syntax in memory so trusted acceptance never treats generated
+			// bytecode as an extra, undeclared execution input. -I keeps project
+			// modules from replacing the trusted standard-library compiler helper.
+			plan.Args = append([]string{"-I", "-c", "import pathlib,sys; [compile(pathlib.Path(p).read_bytes(),p,\"exec\") for p in sys.argv[1:]]"}, plan.Args[2:]...)
+		}
 		if !commandAvailable(plan.Command) {
 			continue
 		}

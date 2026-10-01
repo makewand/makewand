@@ -45,6 +45,9 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 }
 
 func (s *SQLiteStore) ensureSchema() error {
+	if err := s.checkSchemaVersion(); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS usage_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +66,8 @@ CREATE TABLE IF NOT EXISTS usage_entries (
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0,
+  cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+ cost_estimated INTEGER NOT NULL DEFAULT 0,
   stream INTEGER NOT NULL DEFAULT 0
 );`)
 	if err != nil {
@@ -72,6 +77,8 @@ CREATE TABLE IF NOT EXISTS usage_entries (
 		"user_id":         "user_id TEXT NOT NULL DEFAULT ''",
 		"organization_id": "organization_id TEXT NOT NULL DEFAULT ''",
 		"project_id":      "project_id TEXT NOT NULL DEFAULT ''",
+		"cost_micro_usd":  "cost_micro_usd INTEGER NOT NULL DEFAULT 0",
+		"cost_estimated":  "cost_estimated INTEGER NOT NULL DEFAULT 0",
 	}); err != nil {
 		return err
 	}
@@ -83,7 +90,10 @@ CREATE INDEX IF NOT EXISTS usage_token_time ON usage_entries(token_id, timestamp
 CREATE INDEX IF NOT EXISTS usage_user_time ON usage_entries(user_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS usage_request ON usage_entries(request_id);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.ensureBudgetSchema()
 }
 
 // Close closes the underlying database handle.
@@ -112,12 +122,20 @@ func (s *SQLiteStore) Log(entry Entry) error {
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now().UTC()
 	}
-	_, err := s.db.Exec(`
+	return s.logAndSettle(entry)
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func insertUsage(exec sqlExecer, entry Entry) error {
+	_, err := exec.Exec(`
 INSERT INTO usage_entries (
   timestamp, request_id, token_id, token_description, user_id, organization_id, project_id, requested_mode,
   requested_model, actual_provider, status, duration_ms, prompt_tokens,
-  completion_tokens, cost_usd, stream
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  completion_tokens, cost_usd, cost_micro_usd, cost_estimated, stream
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.Timestamp.UTC().Format(time.RFC3339Nano),
 		entry.RequestID,
 		entry.TokenID,
@@ -133,6 +151,8 @@ INSERT INTO usage_entries (
 		entry.PromptTokens,
 		entry.CompletionTokens,
 		entry.CostUSD,
+		MicroUSD(entry.CostUSD),
+		boolToInt(entry.EstimatedCost),
 		boolToInt(entry.Stream),
 	)
 	if err != nil {
@@ -161,6 +181,7 @@ func (s *SQLiteStore) Load(filter Filter) ([]Entry, error) {
 			entry        Entry
 			timestampRaw string
 			stream       int
+			estimated    int
 		)
 		if err := rows.Scan(
 			&timestampRaw,
@@ -178,6 +199,7 @@ func (s *SQLiteStore) Load(filter Filter) ([]Entry, error) {
 			&entry.PromptTokens,
 			&entry.CompletionTokens,
 			&entry.CostUSD,
+			&estimated,
 			&stream,
 		); err != nil {
 			return nil, err
@@ -188,6 +210,7 @@ func (s *SQLiteStore) Load(filter Filter) ([]Entry, error) {
 		}
 		entry.Timestamp = ts.UTC()
 		entry.Stream = stream == 1
+		entry.EstimatedCost = estimated == 1
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -222,7 +245,7 @@ func usageSelection(filter Filter) (string, []any) {
 	query.WriteString(`
 SELECT timestamp, request_id, token_id, token_description, user_id, organization_id, project_id,
        requested_mode, requested_model, actual_provider,
-       status, duration_ms, prompt_tokens, completion_tokens, cost_usd, stream
+       status, duration_ms, prompt_tokens, completion_tokens, cost_usd, cost_estimated, stream
 FROM usage_entries WHERE 1=1`)
 	args := make([]any, 0, 8)
 	if filter.TokenID != "" {

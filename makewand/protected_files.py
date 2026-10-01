@@ -1,8 +1,9 @@
-"""Frozen task file constraints, checked through POSIX no-follow descriptors.
+"""Frozen task constraints, verified through native non-following handles.
 
-Nonempty protection requires POSIX directory-relative opens and O_NOFOLLOW.
-Only content and complete permission mode are policy inputs; no ACLs or other
-permission attributes are captured. Empty protection is a portable no-op.
+POSIX captures content and complete permission mode. Native Windows verifies
+stable file identities and its supported readonly permission bits; candidate
+replacement and rollback preserve Windows DACLs separately. ACLs are not inputs
+to this frozen policy. Empty protection is a portable no-op.
 """
 import base64
 import hashlib
@@ -28,6 +29,8 @@ class ProtectionError(ValueError):
 
 
 def _platform():
+    if os.name == "nt":
+        return
     if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW")
             or not hasattr(os, "O_DIRECTORY") or os.open not in os.supports_dir_fd):
         raise ProtectionError("Protected files require POSIX no-follow directory descriptors")
@@ -86,6 +89,29 @@ def _bound(directories, bindings, file_fd, leaf):
 
 
 def _inspect(base, relative, expected=None, *, check_mode=True, restore_mode=False):
+    if os.name == "nt":
+        from makewand.native_windows import inspect_file, pinned_directory, relative_parts, regular_reader
+        try:
+            path = os.path.join(base, *relative_parts(relative))
+            _deadline()
+            record = inspect_file(path, deadline=_deadline)
+            if expected is not None:
+                if record["sha256"] != expected["sha256"]:
+                    raise ProtectionError("Protected file content changed: " + repr(relative))
+                if restore_mode and record["mode"] != expected["mode"]:
+                    with pinned_directory(os.path.dirname(path)), regular_reader(path) as reader:
+                        if os.fstat(reader.fileno()).st_nlink != 1:
+                            raise ProtectionError("Cannot restore mode of a multiply linked protected file")
+                        _deadline()
+                        os.chmod(path, expected["mode"])
+                    record = inspect_file(path, deadline=_deadline)
+                if check_mode and record["mode"] != expected["mode"]:
+                    raise ProtectionError("Protected file mode changed: " + repr(relative))
+            return record
+        except (OSError, ValueError) as error:
+            if isinstance(error, ProtectionError):
+                raise
+            raise ProtectionError("Cannot safely inspect protected Windows file " + repr(relative) + ": " + str(error)) from error
     _platform()
     _deadline()
     directories, bindings = [], []
@@ -229,6 +255,8 @@ class ProtectedFiles:
             raise ProtectionError("Protected preflight rollback option must be boolean")
         if not self._entries:
             return ": # No protected files\n"
+        if os.name == "nt":
+            raise ProtectionError("POSIX shell delivery is unavailable on native Windows; use transactional candidate apply")
         _platform()
         payload = base64.b64encode(json.dumps({"workspace": _base(base_cwd),
                                               "snapshot": self.to_dict()}, ensure_ascii=True).encode()).decode()

@@ -4,22 +4,17 @@ package engine
 
 import (
 	"os/exec"
-	"strconv"
 	"syscall"
+
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+	if cmd != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 	}
 }
 
 func killProcessGroup(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	// Use taskkill /T /F to kill the entire process tree on Windows.
-	// #nosec G204 -- fixed executable and arguments, no shell; PID is the integer from the os.Process started by this engine.
-	_ = exec.Command("taskkill", "/T", "/F", "/PID",
-		strconv.Itoa(cmd.Process.Pid)).Run()
+	_ = processjob.Kill(cmd)
 }

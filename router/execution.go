@@ -118,7 +118,14 @@ func providerOutcome(err error, usage Usage) execution.Outcome {
 func completeProvider(attempt *execution.Attempt, usage Usage, callErr error) error {
 	outcome := providerOutcome(callErr, usage)
 	if err := attempt.Complete(outcome); err != nil {
-		return fmt.Errorf("%w: %w", errExecutionAccounting, err)
+		accountingErr := fmt.Errorf("%w: %w", errExecutionAccounting, err)
+		if callErr != nil {
+			accountingErr = errors.Join(accountingErr, callErr)
+		}
+		if !outcome.Known && !errors.Is(accountingErr, execution.ErrUnknownOutcome) {
+			return &execution.UnknownOutcomeError{Err: accountingErr}
+		}
+		return accountingErr
 	}
 	if callErr != nil && !outcome.Known && !errors.Is(callErr, execution.ErrUnknownOutcome) {
 		return &execution.UnknownOutcomeError{Err: callErr}

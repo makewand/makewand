@@ -95,6 +95,19 @@ def _scrub_environment() -> List[str]:
 def _write_stubs(bin_dir: Path, log_file: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     for name in STUBBED_CLIS:
+        if os.name == "nt":
+            # PATHEXT lookup must find our fixture before any installed real
+            # agent. Never expand caller argv in cmd.exe: shell metacharacters
+            # in a test prompt must remain inert. Windows logs the CLI name.
+            script = bin_dir / (name + ".cmd")
+            script.write_text(
+                "@echo off\n"
+                f'>>"{log_file}" echo {name}\n'
+                f"echo makewand test stub: {name} is disabled during tests 1>&2\n"
+                f"exit /b {STUB_EXIT_CODE}\n",
+                encoding="utf-8",
+            )
+            continue
         script = bin_dir / name
         script.write_text(
             "#!/bin/sh\n"

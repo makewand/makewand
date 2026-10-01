@@ -33,6 +33,9 @@ def ensure_private_dir(path) -> Path:
     can never receive Makewand artifacts.
     """
     target = Path(os.path.abspath(Path(path).expanduser()))
+    if os.name == "nt":
+        from makewand.native_windows import ensure_private_directory
+        return ensure_private_directory(target)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         os.mkdir(target, 0o700)
@@ -84,6 +87,10 @@ def c(text: str, color: str) -> str:
     return text
 
 def ensure_config_dir():
+    if os.name == "nt":
+        for directory in (CONFIG_DIR, CANDIDATES_DIR, BACKUPS_DIR):
+            ensure_private_dir(directory)
+        return
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)

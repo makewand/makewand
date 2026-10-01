@@ -18,14 +18,14 @@ type breakerState struct {
 	// halfOpenProbeAt records when the current half-open trial call was
 	// admitted. While set, further BeforeAttempt calls are rejected so exactly
 	// one concurrent probe decides the outcome; the probe's success or any
-	// failure clears it. A probe that never reports back (e.g. its caller was
-	// canceled) expires after one cooldown so the provider cannot stay blocked
-	// forever.
+	// failure clears it. The owning attempt explicitly releases a canceled
+	// lease; wall-clock cooldown never admits a second live probe.
 	halfOpenProbeAt time.Time
 	// epoch counts transitions into the open state. Admission tickets carry the
 	// epoch they were issued in, so a success can be matched to the half-open
 	// probe of the CURRENT open episode.
 	epoch uint64
+	lease uint64
 }
 
 // breakerTicket identifies one admission granted by Admit. A success only
@@ -35,6 +35,7 @@ type breakerState struct {
 // cannot shorten the cooldown.
 type breakerTicket struct {
 	epoch uint64
+	lease uint64
 	probe bool
 }
 
@@ -96,19 +97,39 @@ func (cb *providerCircuitBreaker) Admit(provider string) (bool, time.Duration, b
 		state.halfOpen = true
 		state.halfOpenProbeAt = now
 		state.consecutiveFailures = 0
-		return true, 0, breakerTicket{epoch: state.epoch, probe: true}
+		state.lease++
+		return true, 0, breakerTicket{epoch: state.epoch, lease: state.lease, probe: true}
 	}
 	if state.halfOpen {
-		// A half-open trial is already in flight: block concurrent callers so a
-		// single probe decides the outcome (routing falls to the next candidate).
-		// If the probe never reports back, re-arm after one cooldown.
-		if elapsed := now.Sub(state.halfOpenProbeAt); elapsed < cb.cooldown {
-			return false, cb.cooldown - elapsed, breakerTicket{}
+		if !state.halfOpenProbeAt.IsZero() {
+			return false, cb.cooldown, breakerTicket{}
 		}
 		state.halfOpenProbeAt = now
-		return true, 0, breakerTicket{epoch: state.epoch, probe: true}
+		state.lease++
+		return true, 0, breakerTicket{epoch: state.epoch, lease: state.lease, probe: true}
 	}
+
 	return true, 0, breakerTicket{epoch: state.epoch}
+}
+
+// ReleaseAdmission abandons a matching half-open lease without treating a
+// cancellation or accounting refusal as provider health evidence.
+func (cb *providerCircuitBreaker) ReleaseAdmission(provider string, ticket breakerTicket) {
+	if !ticket.probe {
+		return
+	}
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	state := cb.stateLocked(provider)
+	if state.halfOpen && state.epoch == ticket.epoch && state.lease == ticket.lease {
+		state.halfOpenProbeAt = time.Time{}
+	}
+}
+
+func (r *Router) releaseBreakerAdmission(provider string, ticket breakerTicket) {
+	if r.breaker != nil {
+		r.breaker.ReleaseAdmission(provider, ticket)
+	}
 }
 
 // RecordSuccess records a success that cannot be matched to an admission. It
@@ -134,7 +155,7 @@ func (cb *providerCircuitBreaker) RecordAdmittedSuccess(provider string, ticket 
 		return
 	}
 	if state.halfOpen {
-		if !ticket.probe || ticket.epoch != state.epoch {
+		if !ticket.probe || ticket.epoch != state.epoch || ticket.lease != state.lease {
 			return
 		}
 		state.halfOpen = false

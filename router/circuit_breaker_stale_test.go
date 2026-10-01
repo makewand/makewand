@@ -52,8 +52,9 @@ func (g *gatedProvider) ChatStream(context.Context, []Message, string, int) (<-c
 func TestInFlightSuccessAfterTimeoutTripKeepsCircuitOpen(t *testing.T) {
 	g := &gatedProvider{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	r := mustNewRouter(RouterConfig{
-		Providers: map[string]ProviderEntry{"claude": {Provider: g, Access: AccessSubscription}},
-		UsageMode: "balanced",
+		Providers:      map[string]ProviderEntry{"claude": {Provider: g, Access: AccessSubscription}},
+		UsageMode:      "balanced",
+		CLIConcurrency: 2,
 	})
 
 	done := make(chan error, 1)

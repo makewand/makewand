@@ -125,6 +125,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 				verified:      selection.verified,
 				files:         selection.files,
 				digest:        selection.digest,
+				acceptance:    selection.acceptance,
 				selectionNote: selection.selectionNote,
 			}
 		}

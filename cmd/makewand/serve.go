@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/makewand/makewand/internal/backup"
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/remotesession"
@@ -38,25 +39,28 @@ import (
 
 func serveCmd() *cobra.Command {
 	var (
-		listenAddr         string
-		token              string
-		dataDir            string
-		authConfig         string
-		auditPath          string
-		usagePath          string
-		alertWebhook       string
-		alertState         string
-		stateDBPath        string
-		enableUsers        bool
-		enableRegistration bool
-		trustedProxies     []string
-		unsafeNoTLS        bool
-		budgetReservation  float64
-		strictAccounting   bool
-		registrationPerIP  int
-		registrationGlobal int
-		registrationWindow time.Duration
-		registrationSlots  int
+		listenAddr           string
+		token                string
+		dataDir              string
+		authConfig           string
+		auditPath            string
+		usagePath            string
+		alertWebhook         string
+		alertState           string
+		stateDBPath          string
+		enableUsers          bool
+		enableRegistration   bool
+		trustedProxies       []string
+		unsafeNoTLS          bool
+		budgetReservation    float64
+		strictAccounting     bool
+		apiConcurrency       int
+		cliConcurrency       int
+		providerQueueTimeout time.Duration
+		registrationPerIP    int
+		registrationGlobal   int
+		registrationWindow   time.Duration
+		registrationSlots    int
 	)
 
 	cmd := &cobra.Command{
@@ -93,11 +97,6 @@ func serveCmd() *cobra.Command {
 				return serveNoModelsError(cfg)
 			}
 
-			authz, bootstrapManager, err := loadServeAuthorizer(token, authConfig)
-			if err != nil {
-				return err
-			}
-
 			if strings.TrimSpace(dataDir) == "" {
 				cfgDir, err := config.ConfigDir()
 				if err != nil {
@@ -110,7 +109,16 @@ func serveCmd() *cobra.Command {
 			usagePath = resolveServeUsagePath(usagePath, dataDir, stateDBPath != "")
 			alertWebhook = resolveServeAlertWebhook(alertWebhook)
 			alertState = resolveServeAlertStatePath(alertState, dataDir)
+			if err := backup.RecoverRestore(backup.Options{StateDBPath: stateDBPath, AuthConfigPath: authConfig}); err != nil {
+				return fmt.Errorf("recover interrupted state restore: %w", err)
+			}
+			authz, bootstrapManager, err := loadServeAuthorizer(token, authConfig)
+			if err != nil {
+				return err
+			}
+
 			metrics := servermetrics.NewRecorder()
+			var draining atomic.Bool
 			var auditLogger *serveraudit.JSONLLogger
 			if strings.TrimSpace(auditPath) != "" {
 				auditLogger, err = serveraudit.OpenJSONL(auditPath)
@@ -138,6 +146,9 @@ func serveCmd() *cobra.Command {
 			rtr, err := serveRouter(cfg, resolvedRepoTrust)
 			if err != nil {
 				return fmt.Errorf("initialize model router: %w", err)
+			}
+			if err := rtr.ConfigureConcurrency(apiConcurrency, cliConcurrency, providerQueueTimeout); err != nil {
+				return err
 			}
 			statsDir, err := config.ConfigDir()
 			if err == nil {
@@ -168,6 +179,7 @@ func serveCmd() *cobra.Command {
 				tokenManager serverauth.TokenManager = bootstrapManager
 				userStore    router.UserManager
 				usageStore   serverusage.Reader
+				budgetStore  serverusage.BudgetReserver
 				teamStore    serverteam.Store
 				sessionMgr   *serveradmin.SessionManager
 				// stopTokenFlush stops the token-counter flusher and does a final
@@ -235,6 +247,7 @@ func serveCmd() *cobra.Command {
 				}
 				defer sqliteUsage.Close()
 				usageStore = sqliteUsage
+				budgetStore = sqliteUsage
 				usageLogger = combineUsageLoggers(usageLogger, sqliteUsage)
 
 				sqliteTeams, err := serverteam.OpenSQLiteStore(stateDBPath)
@@ -307,11 +320,17 @@ func serveCmd() *cobra.Command {
 				UsageReader:          usageStore,
 				TeamStore:            teamStore,
 				BudgetReservationUSD: budgetReservation,
-				StrictAccounting:     strictAccounting,
+				BudgetReserver:       budgetStore,
+				StrictAccounting:     strictAccounting || (budgetStore != nil && budgetReservation > 0),
 				UserTokenManager:     tokenManager,
 				UserLoginLimiter:     loginLimiter,
 				Observer:             metrics.ObserveError,
-				ReadinessCheck:       serveReadinessCheck(usageStore, metrics),
+				ReadinessCheck: func(ctx context.Context) error {
+					if draining.Load() {
+						return fmt.Errorf("server is draining")
+					}
+					return serveReadinessCheck(usageStore, metrics)(ctx)
+				},
 				// Surface dropped usage writes instead of silently under-counting
 				// budget. Logging runs after the response, so this cannot fail the
 				// request; it makes the loss visible to the operator.
@@ -361,6 +380,9 @@ func serveCmd() *cobra.Command {
 
 			sigChan := make(chan os.Signal, 1)
 			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(sigChan)
+			stopSignalWait := make(chan struct{})
+			defer close(stopSignalWait)
 			shutdownDone := make(chan struct{})
 			// Atomic so the main goroutine can read it even on the fallback timer
 			// path (which does not receive shutdownDone and thus has no channel
@@ -368,10 +390,16 @@ func serveCmd() *cobra.Command {
 			var shutdownTimedOut atomic.Bool
 
 			go func() {
-				sig := <-sigChan
-				fmt.Printf("\nReceived signal: %v\n", sig)
+				select {
+				case sig := <-sigChan:
+					fmt.Printf("\nReceived signal: %v\n", sig)
+				case <-cmd.Context().Done():
+				case <-stopSignalWait:
+					return
+				}
+				draining.Store(true)
 
-				shutdownCtx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 
 				fmt.Println("Shutting down server...")
@@ -437,6 +465,9 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&usagePath, "usage-log", "", "path to append-only JSONL usage ledger (disabled by default when SQLite state DB is enabled)")
 	cmd.Flags().StringVar(&alertWebhook, "alert-webhook", "", "HTTP endpoint that receives budget alert webhooks")
 	cmd.Flags().Float64Var(&budgetReservation, "budget-reservation", 0.01, "USD reserved per in-flight request against team budgets to bound concurrent overshoot; 0 disables (headroom-only check)")
+	cmd.Flags().IntVar(&apiConcurrency, "api-concurrency", 8, "maximum simultaneous calls per API provider")
+	cmd.Flags().IntVar(&cliConcurrency, "cli-concurrency", 1, "maximum simultaneous calls per subscription/local provider")
+	cmd.Flags().DurationVar(&providerQueueTimeout, "provider-queue-timeout", 30*time.Second, "maximum wait for a provider concurrency slot")
 	cmd.Flags().BoolVar(&strictAccounting, "strict-accounting", false, "record a non-streaming request's usage before its success response and reject with 503 if it cannot be recorded, so no successful response is returned unrecorded (does not apply to streaming; does not un-spend a provider call already made)")
 	cmd.Flags().StringVar(&alertState, "alert-state", "", "path to persisted alert delivery state (default: <data-dir>/alert_state.json)")
 	cmd.Flags().StringVar(&stateDBPath, "state-db", "", "path to SQLite state database for users, tokens, and usage (default: <data-dir>/state.db)")

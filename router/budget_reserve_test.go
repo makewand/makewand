@@ -151,9 +151,10 @@ func TestBudgetReservationBoundsConcurrentOvershoot(t *testing.T) {
 
 	prov := &blockingProvider{name: "claude", entered: make(chan struct{}, 8), release: make(chan struct{})}
 	r := mustNewRouter(RouterConfig{
-		Providers:    map[string]ProviderEntry{"claude": {Provider: prov, Access: AccessSubscription}},
-		DefaultModel: "claude",
-		CodingModel:  "claude",
+		Providers:      map[string]ProviderEntry{"claude": {Provider: prov, Access: AccessSubscription}},
+		CLIConcurrency: 2,
+		DefaultModel:   "claude",
+		CodingModel:    "claude",
 	})
 	handler := r.HTTPHandler(HTTPHandlerOptions{
 		Authorizer:           authz,

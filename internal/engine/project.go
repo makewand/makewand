@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Project represents a makewand project.
@@ -127,10 +129,14 @@ func NewProject(name, parentDir string) (*Project, error) {
 		return nil, fmt.Errorf("create project directory: %w", err)
 	}
 
-	return &Project{
+	p := &Project{
 		Name: name,
 		Path: path,
-	}, nil
+	}
+	if err := p.recoverOnOpen(); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // OpenProject opens an existing project from the current directory.
@@ -145,7 +151,7 @@ func OpenProjectLimited(path string, maxEntries int) (*Project, error) {
 }
 
 func openProject(path string, maxEntries int) (*Project, error) {
-	info, err := os.Stat(path)
+	info, err := os.Stat(path) //nolint:gosec // Read-only metadata for the user-selected project directory; recovery binds the opened root identity.
 	if err != nil {
 		return nil, fmt.Errorf("open project: %w", err)
 	}
@@ -162,12 +168,24 @@ func openProject(path string, maxEntries int) (*Project, error) {
 		Name: filepath.Base(absPath),
 		Path: absPath,
 	}
+	if err := p.recoverOnOpen(); err != nil {
+		return nil, err
+	}
 
 	if err := p.scanFiles(maxEntries); err != nil {
 		return nil, err
 	}
 
 	return p, nil
+}
+
+func (p *Project) recoverOnOpen() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := p.RecoverInterruptedApply(ctx); err != nil {
+		return fmt.Errorf("recover interrupted project apply: %w", err)
+	}
+	return nil
 }
 
 // ScanFiles scans the project directory and populates the file list.
@@ -349,6 +367,15 @@ func (p *Project) writeFileMode(relPath, content string, requestedMode *fs.FileM
 		return err
 	}
 	defer root.Close()
+	return writeFileModeRoot(root, relPath, content, requestedMode)
+}
+
+func writeFileModeRoot(root *os.Root, relPath, content string, requestedMode *fs.FileMode) error {
+	tempPath := filepath.Join(filepath.Dir(filepath.Clean(relPath)), ".makewand-write-"+rand.Text())
+	return writeFileModeAt(root, relPath, content, requestedMode, tempPath, "")
+}
+
+func writeFileModeAt(root *os.Root, relPath, content string, requestedMode *fs.FileMode, tempPath, security string, beforeRename ...func(*os.File) error) error {
 	relPath = filepath.Clean(relPath)
 	mode := fs.FileMode(0o600)
 	if info, err := root.Lstat(relPath); err == nil {
@@ -368,7 +395,6 @@ func (p *Project) writeFileMode(relPath, content string, requestedMode *fs.FileM
 	}
 	// Root-relative operations resist parent symlink swaps; atomic replacement
 	// preserves the old file on errors and never truncates shared hardlink inodes.
-	tempPath := filepath.Join(dir, ".makewand-write-"+rand.Text())
 	tmp, err := root.OpenFile(tempPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("create temporary file: %w", err)
@@ -382,10 +408,26 @@ func (p *Project) writeFileMode(relPath, content string, requestedMode *fs.FileM
 		tmp.Close()
 		return err
 	}
+	if err := applySetOpenFileSecurity(tmp, security); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	for _, prepare := range beforeRename {
+		if prepare != nil {
+			if err := prepare(tmp); err != nil {
+				tmp.Close()
+				return err
+			}
+		}
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := root.Rename(tempPath, relPath); err != nil {
+	if err := replaceApplyFile(root, tempPath, relPath); err != nil {
 		return fmt.Errorf("replace file: %w", err)
 	}
 	return nil

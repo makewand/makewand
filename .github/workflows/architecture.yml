@@ -1,0 +1,60 @@
+name: Architecture runtime
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: architecture-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install offline test dependency
+        run: python -m pip install pytest
+      - name: Native file, process and complete delivery runtime
+        run: python -I scripts/test_python.py test_native_windows test_native_windows_pipeline test_native_delivery test_candidate_recovery
+      - name: Native Go identity and durable apply
+        run: go test ./internal/engine -run '^TestApply|^TestCheckpointIdentity|^TestWindowsApply|^TestEngineProcess|^TestOutputCapture|^TestPreviewProcess|^TestPendingApproval' -count=1 -v
+      - name: Native Go approval restart and fresh human review
+        run: go test ./internal/tui -run '^TestPendingApproval' -count=1 -v
+      - name: Native Go process Jobs and bounded output
+        run: go test ./internal/processjob -count=1 -v
+      - name: Native Router and raw CLI process lifecycle
+        run: go test ./router ./cmd/versus -run '^TestCLIProcess|^TestRawCLI' -count=1 -v
+      - name: Native shared integer call ledger
+        run: go test ./execution -run '^Test(LedgerConcurrent|LedgerMaximum|LedgerMalformed|LedgerRejects|ContextCannot|NestedContext|CanonicalExecution|MalformedWire|ContractNullable)' -count=1 -v
+
+  load-and-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: HTTP load, persistent budget and hard process interruption
+        run: go run ./cmd/server-drill --output build/server-drill.json --requests 400 --concurrency 32 --tenants 4 --router-calls 100000
+      - name: Archive measured drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-drill-${{ github.sha }}
+          path: build/server-drill.json
+          if-no-files-found: error

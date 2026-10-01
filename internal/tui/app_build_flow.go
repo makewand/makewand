@@ -78,7 +78,8 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 		}
 		if len(result.Files) > 0 {
 			a.pendingWriteDigest = msg.digest
-			a.pendingWriteVerified = msg.verified && engine.VerifiedFilesMatch(result.Files, msg.digest)
+			a.pendingWriteAcceptance = msg.acceptance
+			a.pendingWriteVerified = msg.verified && engine.TrustedAcceptanceRecordMatches(result.Files, msg.acceptance) && engine.VerifiedFilesMatch(result.Files, msg.digest)
 			return a, func() tea.Msg {
 				return filesExtractedMsg{files: result.Files, phase: phase}
 			}
@@ -87,6 +88,7 @@ func (a App) handleAIResponse(msg aiResponseMsg) (tea.Model, tea.Cmd) {
 
 	a.pendingWriteVerified = false
 	a.pendingWriteDigest = ""
+	a.pendingWriteAcceptance = nil
 
 	return a, nil
 }
@@ -150,16 +152,19 @@ func (a App) handleFilesExtracted(msg filesExtractedMsg) (tea.Model, tea.Cmd) {
 	m := i18n.Msg()
 	a.pendingFiles = msg.files
 	a.pendingPhase = msg.phase
+	if !a.persistPendingFiles() {
+		return a, nil
+	}
 
 	if msg.phase == pendingPhaseBuild {
 		a.progress.SetStepDetail(stepCode, fmt.Sprintf(m.ProgressFilesFound, len(msg.files)))
-		if !a.shouldUseAutopilotCandidates() || a.pendingWriteVerified {
+		if !a.shouldUseAutopilotCandidates() || a.shouldAutoApproveFileWrites(msg.phase) {
 			// Build phase: auto-confirm file writing unless autopilot verification failed.
 			return a, func() tea.Msg {
-				return confirmFileWriteMsg{confirmed: true}
+				return confirmFileWriteMsg{confirmed: true, automatic: true}
 			}
 		}
-		// Autopilot needs Strength 2, which local checks cannot give yet, so
+		// Autopilot needs configured independent acceptance at Strength 2;
 		// explain why approval is needed instead of claiming no candidate
 		// passed (candidates may well have passed local checks).
 		a.chat.AddMessage(ChatMessage{
@@ -171,7 +176,7 @@ func (a App) handleFilesExtracted(msg filesExtractedMsg) (tea.Model, tea.Cmd) {
 	if a.shouldAutoApproveFileWrites(msg.phase) {
 		a.addAutoApprovalStatus(a.autoApprovedWriteStatus(len(msg.files)))
 		return a, func() tea.Msg {
-			return confirmFileWriteMsg{confirmed: true}
+			return confirmFileWriteMsg{confirmed: true, automatic: true}
 		}
 	}
 
@@ -206,6 +211,7 @@ func (a App) handleFileConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.pendingFiles = nil
 		a.pendingWriteVerified = false
 		a.pendingWriteDigest = ""
+		a.pendingWriteAcceptance = nil
 		a.chat.AddMessage(ChatMessage{
 			Role:    "system",
 			Content: m.FileCancelled,
@@ -256,51 +262,51 @@ func (a App) handleTestsConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (a App) handleFileWriteConfirm(msg confirmFileWriteMsg) (tea.Model, tea.Cmd) {
 	if !msg.confirmed || a.project == nil || len(a.pendingFiles) == 0 {
 		a.pendingFiles = nil
+		a.pendingWriteDigest = ""
+		a.pendingWriteAcceptance = nil
 		return a, nil
 	}
-
 	files := append([]engine.ExtractedFile(nil), a.pendingFiles...)
-	digest := a.pendingWriteDigest
-	a.pendingWriteDigest = ""
+	persisted, persistenceErr := a.beginPendingWrite(msg)
+	if persistenceErr != nil {
+		a.pendingPersistenceNotice(persistenceErr)
+		return a, nil
+	}
+	digest, acceptance := a.pendingWriteDigest, a.pendingWriteAcceptance
+	requireIndependent := msg.automatic && a.shouldUseAutopilotCandidates()
 	proj := a.project
+	a.pendingWriteDigest = ""
+	a.pendingWriteAcceptance = nil
 	a.pendingFiles = nil
-
 	return a, func() tea.Msg {
-		if digest != "" && !engine.VerifiedFilesMatch(files, digest) {
-			return fileWriteCompleteMsg{failed: len(files), errors: []string{"candidate payload changed after verification"}}
-		}
-		checkpoint, checkpointErr := proj.CheckpointFiles(files)
-		if checkpointErr != nil {
-			return fileWriteCompleteMsg{written: 0, failed: len(files), errors: []string{fmt.Sprintf("checkpoint: %s", checkpointErr)}}
-		}
-
-		var written, failed int
-		var errors []string
-
-		for _, f := range files {
-			if err := proj.WriteFiles([]engine.ExtractedFile{f}); err != nil {
-				failed++
-				errors = append(errors, fmt.Sprintf("%s: %s", f.Path, err))
-			} else {
-				written++
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		err := proj.ApplyFilesTransactional(ctx, files, func() error {
+			if err := proj.ValidatePendingApprovalForApply(ctx, persisted, files); err != nil {
+				return err
 			}
-		}
-		if failed > 0 && checkpoint != nil {
-			if err := checkpoint.Restore(); err != nil {
-				errors = append(errors, fmt.Sprintf("rollback: %s", err))
-				for _, bPath := range checkpoint.BackupPaths() {
-					errors = append(errors, fmt.Sprintf("preserved backup for manual recovery: %s", bPath))
-				}
+			if requireIndependent && !engine.TrustedAcceptanceRecordMatches(files, acceptance) {
+				return errors.New("automatic application requires independent acceptance issued by this trusted parent")
 			}
-		} else if checkpoint != nil {
-			checkpoint.Cleanup()
+			if digest != "" && !engine.VerifiedFilesMatch(files, digest) {
+				return errors.New("candidate payload changed after verification")
+			}
+			if acceptance != nil {
+				return proj.ValidateTrustedAcceptance(ctx, files, acceptance)
+			}
+			return nil
+		})
+		if err != nil {
+			return fileWriteCompleteMsg{failed: len(files), errors: []string{err.Error()}, approval: persisted}
 		}
-
-		return fileWriteCompleteMsg{written: written, failed: failed, errors: errors}
+		return fileWriteCompleteMsg{written: len(files), approval: persisted}
 	}
 }
 
 func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.Cmd) {
+	if a.finishPendingWrite(msg) {
+		return a, nil
+	}
 	m := i18n.Msg()
 	var cmds []tea.Cmd
 
@@ -322,6 +328,7 @@ func (a App) handleFileWriteComplete(msg fileWriteCompleteMsg) (tea.Model, tea.C
 	a.refreshProjectFiles()
 	a.pendingWriteVerified = false
 	a.pendingWriteDigest = ""
+	a.pendingWriteAcceptance = nil
 
 	if msg.failed > 0 {
 		return a.blockBuildReview("File writes failed; acceptance stopped")
@@ -567,6 +574,10 @@ func (a App) runDepsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	if a.project == nil || plan == nil {
 		return a, nil
 	}
+	persisted, recovered := a.pendingPersistence, a.pendingRecovery
+	if persisted != nil && persisted.Kind != string(approvalDeps) {
+		persisted = nil
+	}
 	a.clearPendingApproval()
 	// Fail closed: RunRestrictedPlan will refuse to run generated commands on the
 	// host when sandbox isolation is unavailable and MAKEWAND_UNSAFE_HOST_EXEC is
@@ -582,10 +593,14 @@ func (a App) runDepsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: notice})
 		a.pendingDepsPlan = nil
 		a.pendingTestsPlan = nil
+		if a.finishPendingExecution(persisted, nil, errors.New(notice), recovered) {
+			return a, nil
+		}
 		return a.buildComplete()
 	}
 	proj := a.project
 	planValue := *plan
+	planValue.Args = append([]string(nil), plan.Args...)
 	emitExecTrace(a.router, "pipeline.exec.started", "deps", &planValue, nil, nil, nil, "running dependency install plan")
 	a.chat.AddMessage(ChatMessage{
 		Role:    "status",
@@ -595,8 +610,14 @@ func (a App) runDepsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	a.cancelAI = cancel
 	return a, func() tea.Msg {
 		defer cancel()
+		if !engine.PendingApprovalPlanMatches(persisted, plan) {
+			return depsInstallMsg{err: errors.New("pending approval command payload changed after queueing"), approval: persisted, recovered: recovered}
+		}
+		if err := proj.ValidatePendingApprovalPlanForApply(ctx, persisted, planValue); err != nil {
+			return depsInstallMsg{err: err, approval: persisted, recovered: recovered}
+		}
 		result, err := proj.RunRestrictedPlan(ctx, planValue)
-		return depsInstallMsg{result: result, err: err}
+		return depsInstallMsg{result: result, err: err, approval: persisted, recovered: recovered}
 	}
 }
 
@@ -668,6 +689,10 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	if a.project == nil || plan == nil {
 		return a, nil
 	}
+	persisted, recovered := a.pendingPersistence, a.pendingRecovery
+	if persisted != nil && persisted.Kind != string(approvalTests) {
+		persisted = nil
+	}
 	a.clearPendingApproval()
 	// Fail closed when sandbox isolation is unavailable (see runDepsPlan).
 	if notice := a.restrictedPlanBlockedNotice(); notice != "" {
@@ -676,10 +701,14 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 		a.progress.SetStepDetail(stepTests, testsRunSkippedDetail)
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: notice})
 		a.pendingTestsPlan = nil
+		if a.finishPendingExecution(persisted, nil, errors.New(notice), recovered) {
+			return a, nil
+		}
 		return a.buildComplete()
 	}
 	proj := a.project
 	planValue := *plan
+	planValue.Args = append([]string(nil), plan.Args...)
 	emitExecTrace(a.router, "pipeline.exec.started", "tests", &planValue, nil, nil, nil, "running test execution plan")
 	a.chat.AddMessage(ChatMessage{
 		Role:    "status",
@@ -689,8 +718,14 @@ func (a App) runTestsPlan(plan *engine.ExecPlan) (tea.Model, tea.Cmd) {
 	a.cancelAI = cancel
 	return a, func() tea.Msg {
 		defer cancel()
+		if !engine.PendingApprovalPlanMatches(persisted, plan) {
+			return testRunMsg{err: errors.New("pending approval command payload changed after queueing"), approval: persisted, recovered: recovered}
+		}
+		if err := proj.ValidatePendingApprovalPlanForApply(ctx, persisted, planValue); err != nil {
+			return testRunMsg{err: err, approval: persisted, recovered: recovered}
+		}
 		result, err := proj.RunRestrictedPlan(ctx, planValue)
-		return testRunMsg{result: result, err: err}
+		return testRunMsg{result: result, err: err, approval: persisted, recovered: recovered}
 	}
 }
 
@@ -724,6 +759,9 @@ func (a App) handleDepsInstallConfirm(msg confirmDepsInstallMsg) (tea.Model, tea
 }
 
 func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
+	if a.finishPendingExecution(msg.approval, msg.result, msg.err, msg.recovered) {
+		return a, nil
+	}
 	m := i18n.Msg()
 	plan := a.pendingDepsPlan
 	commandDetails := ""
@@ -814,6 +852,9 @@ func (a App) handleTestsRunConfirm(msg confirmTestsRunMsg) (tea.Model, tea.Cmd) 
 // --- Test running ---
 
 func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
+	if a.finishPendingExecution(msg.approval, msg.result, msg.err, msg.recovered) {
+		return a, nil
+	}
 	m := i18n.Msg()
 	plan := a.pendingTestsPlan
 	commandDetails := ""
@@ -961,6 +1002,7 @@ func (a App) handleAutoFix(msg autoFixMsg) (tea.Model, tea.Cmd) {
 				verified:      selection.verified,
 				files:         selection.files,
 				digest:        selection.digest,
+				acceptance:    selection.acceptance,
 				selectionNote: selection.selectionNote,
 			}
 		}
@@ -1057,7 +1099,8 @@ func (a App) handleAutoFixResponse(msg autoFixResponseMsg) (tea.Model, tea.Cmd) 
 
 	// Ask for confirmation before writing fix files
 	a.pendingWriteDigest = msg.digest
-	a.pendingWriteVerified = msg.verified && engine.VerifiedFilesMatch(result.Files, msg.digest)
+	a.pendingWriteAcceptance = msg.acceptance
+	a.pendingWriteVerified = msg.verified && engine.TrustedAcceptanceRecordMatches(result.Files, msg.acceptance) && engine.VerifiedFilesMatch(result.Files, msg.digest)
 	return a, func() tea.Msg {
 		return filesExtractedMsg{files: result.Files, phase: pendingPhaseFix}
 	}

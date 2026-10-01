@@ -73,6 +73,19 @@ def kill_process_tree(proc: subprocess.Popen, timeout_grace: float = 0.3):
     """
     if proc is None:
         return
+    if os.name == "nt":
+        job = getattr(proc, "_makewand_job", None)
+        if job is not None:
+            job.terminate()
+        else:
+            # Only pre-assignment spawn cleanup reaches this fallback. Native
+            # execution is started suspended and must join its job first.
+            proc.kill()
+        try:
+            proc.wait(timeout=.5)
+        except subprocess.TimeoutExpired:
+            pass
+        return
     # Every process created below uses start_new_session=True: its initial PGID
     # is its PID. Looking up the leader after poll()/wait() would lose the group
     # when that leader has exited but children still hold its pipes or keep running.
@@ -134,6 +147,10 @@ def run_subprocess(
     cancellation guarantee.
     Returns: (returncode, stdout, stderr, exception_or_timeout_msg)
     """
+    if os.name == "nt":
+        from makewand.windows_process import run_windows_subprocess
+        return run_windows_subprocess(cmd, timeout, cwd, input_text, stream, print_prefix, pass_fds,
+                                      output_limit=MAX_OUTPUT_BYTES, stream_queue_limit=MAX_STREAM_QUEUE_BYTES)
     proc = None
     selector = None
     cleaned_group = False

@@ -53,16 +53,16 @@ cap:
   file-based `--auth-config` tokens remain in-memory only and reset on restart;
   and counters are per-process, so multiple server instances sharing one DB are
   not yet strongly consistent with each other.
-- **Concurrent overshoot is bounded by reservation.** Budget admission uses an
-  in-memory committed+reserved total per scope (committed is seeded once from the
-  usage ledger, then maintained as requests settle), so admission is atomic and a
-  later request cannot re-consume headroom an earlier one already spent. Each
-  admitted request reserves `--budget-reservation` USD (default $0.01) until it
-  settles. The residual overshoot is at most, per simultaneously in-flight
-  request, the amount its realized cost exceeds the reservation — so set
-  `--budget-reservation` at or above a typical per-request cost to keep it small
-  or zero. (A request whose realized cost is under the reservation cannot
-  overshoot at all.)
+- **SQLite reservations persist and serialize across processes.** The trusted
+  server reserves integer micro-USD before dispatch for token day/month and
+  organization/project month scopes. Integer account totals and usage settlement
+  update in one transaction, avoiding repeated history scans. A duplicate usage
+  callback does not charge twice. Confirmed cancellation before consumption
+  refunds its reservation; an interrupted/unknown call conservatively keeps its
+  reservation after restart. `--budget-reservation` still estimates one call:
+  actual cost above that estimate can exceed the remaining money cap, and unknown
+  provider cost cannot establish a monetary hard cap. JSONL-only deployments
+  retain their documented process-local budget behavior.
 - **Usage-write failures are surfaced, and optionally fatal.** A failed usage
   write always logs a warning (`usage accounting write failed`) so the loss is
   visible. With `--strict-accounting`, a non-streaming request whose usage cannot
@@ -84,6 +84,17 @@ cap:
   or when the shutdown drain deadline expires;
   receivers should honor the idempotency key because a retry can follow a
   successful delivery whose response was lost.
+
+### Provider Concurrency
+
+Each provider has a shared admission limit across request-scoped Router views:
+8 concurrent API calls and 1 concurrent local/subscription CLI call by default.
+`--api-concurrency`, `--cli-concurrency`, and `--provider-queue-timeout`
+(default 30 seconds) configure these limits. Queue cancellation or expiry
+does not dispatch a provider or consume the execution call ledger. Streaming
+calls hold their slot until terminal completion or cancellation. Independent
+server processes have separate provider slots; persistent currency reservations
+still coordinate their monetary admission through SQLite.
 
 ### Login and User Storage
 
@@ -323,3 +334,21 @@ If you encounter issues with the alpha server:
 2. Collect relevant logs from `~/.config/makewand/server/audit.jsonl`
 3. Report on GitHub with clear reproduction steps
 4. Include version: `makewand --version`
+
+
+## Load and recovery runtime gate
+
+[`cmd/server-drill`](../cmd/server-drill) runs actual loopback HTTP traffic,
+independent Router identities, real SQLite WAL backups and hard process
+interruption/restart against deterministic local providers. Reports include
+p50/p95 latency, throughput, unexpected error rate and acknowledged-record
+RPO/RTO. It checks tenant budget contention, cancellation, persistent unknown
+reservations, stream draining, archive corruption, foreign keys, supported
+schema migration and multi-component restore recovery.
+
+Run `make test-architecture` for the short profile or `make drill-long` for
+10,000 requests. `Architecture runtime` runs a short profile on every push/PR
+and archives the JSON report. Hardware, provider latency, deployment topology
+and data size influence results. This gate provides repeatable measurements;
+it does not promote Server to GA, assert a production SLA or replace the
+three-release evidence window in the original optimization plan.

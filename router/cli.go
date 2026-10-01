@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 // Prompt delivery modes for custom command providers.
@@ -391,11 +392,14 @@ func (c *CLIProvider) healthCheck() bool {
 		return false
 	}
 	setCLIProcessGroup(cmd)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	capture := processjob.NewCapture(processjob.MaxOutputBytes, func() { killCLIProcess(cmd) })
+	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
+	cleanupProcess, err := processjob.Start(cmd)
+	if err != nil {
 		return false
 	}
+	defer cleanupProcess()
+	defer killCLIProcess(cmd)
 
 	done := make(chan error, 1)
 	go func() {
@@ -404,11 +408,11 @@ func (c *CLIProvider) healthCheck() bool {
 
 	select {
 	case err := <-done:
-		return err == nil
+		return err == nil && !capture.Exceeded()
 	case <-ctx.Done():
 		killCLIProcess(cmd)
 		<-done
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && c.softPassProbeTimeout() {
+		if !capture.Exceeded() && errors.Is(ctx.Err(), context.DeadlineExceeded) && c.softPassProbeTimeout() {
 			// Some subscription CLIs can stall on --version probes when network/auth is slow.
 			// Treat timeout as "unknown but likely available" and let request-time retries decide.
 			return true
@@ -547,20 +551,18 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 	cmd := buildCmd(ctx, prompt)
 	applyCLIWorkDir(ctx, cmd, scratchDir)
 	setCLIProcessGroup(cmd)
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		cleanupWorkDir()
-		return nil, newProviderError(c.provider, "CLI pipe", ErrorKindConfig, false, 0, err.Error(), err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		cancel()
-		cleanupWorkDir()
-		return nil, newProviderError(c.provider, "CLI stderr pipe", ErrorKindConfig, false, 0, err.Error(), err)
-	}
+	// Let exec own the OS pipes so WaitDelay can bound inherited descriptors
+	// after leader exit. Waiting only after Scanner sees EOF leaves that bound
+	// inactive whenever a descendant keeps stdout open.
+	stdoutPipe, stdoutWriter := io.Pipe()
+	capture := processjob.NewCapture(processjob.MaxOutputBytes, func() { killCLIProcess(cmd) })
+	cmd.Stdout = io.MultiWriter(capture.Stdout(), stdoutWriter)
+	cmd.Stderr = capture.Stderr()
 
-	if err := cmd.Start(); err != nil {
+	cleanupProcess, err := processjob.Start(cmd)
+	if err != nil {
+		_ = stdoutPipe.Close()
+		_ = stdoutWriter.Close()
 		cancel()
 		cleanupWorkDir()
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
@@ -568,18 +570,32 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 
 	ch := make(chan StreamChunk, 64)
 	go func() {
+		defer cleanupProcess()
+		defer killCLIProcess(cmd)
 		defer cancel()
 		defer close(ch)
 		// Safety net; the normal path removes the scratch dir right after
 		// cmd.Wait, before any terminal chunk reaches the consumer.
 		defer cleanupWorkDir()
+		defer func() { _ = stdoutPipe.Close() }()
 		start := time.Now()
 
-		var stderr bytes.Buffer
-		stderrDone := make(chan struct{})
+		watchDone := make(chan struct{})
+		defer close(watchDone)
 		go func() {
-			_, _ = io.Copy(&stderr, stderrPipe)
-			close(stderrDone)
+			select {
+			case <-ctx.Done():
+				killCLIProcess(cmd)
+				_ = stdoutPipe.CloseWithError(ctx.Err())
+			case <-watchDone:
+			}
+		}()
+		waitDone := make(chan error, 1)
+		go func() {
+			waitErr := cmd.Wait()
+			killCLIProcess(cmd)
+			_ = stdoutWriter.Close()
+			waitDone <- waitErr
 		}()
 
 		scanner := bufio.NewScanner(stdoutPipe)
@@ -639,11 +655,18 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		}
 
 		scanErr := scanner.Err()
-
-		<-stderrDone
-		waitErr := cmd.Wait()
+		if scanErr != nil || parseFailure != nil || ctx.Err() != nil {
+			killCLIProcess(cmd)
+			// An abandoned parser must release exec's stdout copying goroutine.
+			_ = stdoutPipe.Close()
+		}
+		waitErr := <-waitDone
 		cleanupWorkDir()
 		duration := time.Since(start)
+		if capture.Exceeded() {
+			ch <- StreamChunk{Error: &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}}
+			return
+		}
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if shouldSurfaceContextError(ctxErr) {
@@ -653,7 +676,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		}
 
 		if scanErr != nil {
-			ch <- StreamChunk{Error: newProviderError(c.provider, "CLI stream", ErrorKindProvider, false, 0, scanErr.Error(), scanErr)}
+			ch <- StreamChunk{Error: &execution.UnknownOutcomeError{Err: fmt.Errorf("%s CLI stream could not be fully read: %w", c.provider, scanErr)}}
 			return
 		}
 		if parseFailure != nil {
@@ -662,7 +685,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		}
 
 		if waitErr != nil {
-			ch <- StreamChunk{Error: formatCLIExecutionError(c.provider, stderr.String(), waitErr, nil, duration)}
+			ch <- StreamChunk{Error: formatCLIExecutionError(c.provider, capture.StderrString(), waitErr, nil, duration)}
 			return
 		}
 
@@ -1023,14 +1046,17 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	applyCLIWorkDir(ctx, cmd, scratchDir)
 	setCLIProcessGroup(cmd)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	capture := processjob.NewCapture(processjob.MaxOutputBytes, func() { killCLIProcess(cmd) })
+	cmd.Stdout = capture.Stdout()
+	cmd.Stderr = capture.Stderr()
 
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	cleanupProcess, err := processjob.Start(cmd)
+	if err != nil {
 		return "", nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
+	defer cleanupProcess()
+	defer killCLIProcess(cmd)
 
 	done := make(chan error, 1)
 	go func() {
@@ -1046,11 +1072,14 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	}
 
 	duration := time.Since(start)
+	if capture.Exceeded() {
+		return "", nil, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
+	}
 	if runErr != nil {
-		return "", nil, formatCLIExecutionError(c.provider, stderr.String(), runErr, ctx.Err(), duration)
+		return "", nil, formatCLIExecutionError(c.provider, capture.StderrString(), runErr, ctx.Err(), duration)
 	}
 
-	raw := stdout.Bytes()
+	raw := capture.StdoutBytes()
 
 	// Try structured JSON parsing when the CLI was invoked with a JSON output flag.
 	if c.jsonOutput && c.parseJSONResponse != nil {
@@ -1239,6 +1268,10 @@ func ClassifyCLIExecutionError(provider, stderr string, runErr error, ctxErr err
 func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
 	if ctxErr != nil {
 		return formatCLIContextError(provider, ctxErr, duration)
+	}
+	var exitErr *exec.ExitError
+	if errors.Is(runErr, exec.ErrWaitDelay) || (errors.As(runErr, &exitErr) && exitErr.ExitCode() < 0) {
+		return &execution.UnknownOutcomeError{Err: fmt.Errorf("%s CLI terminated without a complete exit/output result: %w", provider, runErr)}
 	}
 
 	errMsg := strings.TrimSpace(stderr)

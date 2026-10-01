@@ -74,7 +74,7 @@ func TestRestore_FailedInstallKeepsLiveDatabaseAndWAL(t *testing.T) {
 		}
 	}
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 3 {
+	if len(entries) != 4 || readOrEmpty(filepath.Join(dir, restoreLockName)) != "" {
 		var names []string
 		for _, e := range entries {
 			names = append(names, e.Name())

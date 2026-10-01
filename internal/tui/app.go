@@ -83,15 +83,18 @@ type App struct {
 	pipeline *engine.BuildPipeline
 
 	// Build pipeline TUI state (files, plans, approvals — owned by TUI layer).
-	pendingFiles         []engine.ExtractedFile // files waiting to be written
-	pendingPhase         pendingPhaseType       // which phase triggered the pending files
-	state                AppState               // current interaction state
-	pendingDepsPlan      *engine.ExecPlan       // detected dependency install command
-	pendingTestsPlan     *engine.ExecPlan       // detected test execution command
-	pendingApproval      *approvalRequest       // current approval request, if any
-	pendingWriteDigest   string
-	pendingWriteVerified bool // true when the pending file batch passed local verification
-	hostCLINoticeShown   bool // true once the host-CLI generation notice has been shown this session
+	pendingFiles           []engine.ExtractedFile // files waiting to be written
+	pendingPhase           pendingPhaseType       // which phase triggered the pending files
+	state                  AppState               // current interaction state
+	pendingDepsPlan        *engine.ExecPlan       // detected dependency install command
+	pendingTestsPlan       *engine.ExecPlan       // detected test execution command
+	pendingApproval        *approvalRequest       // current approval request, if any
+	pendingWriteDigest     string
+	pendingWriteAcceptance *engine.TrustedAcceptanceRecord
+	pendingWriteVerified   bool // true when the pending file batch passed local verification
+	pendingPersistence     *engine.PendingApproval
+	pendingRecovery        bool // recovered evidence needs one new manual decision
+	hostCLINoticeShown     bool // true once the host-CLI generation notice has been shown this session
 
 	// State
 	width  int
@@ -132,6 +135,7 @@ type aiResponseMsg struct {
 	verified      bool
 	files         []engine.ExtractedFile
 	digest        string
+	acceptance    *engine.TrustedAcceptanceRecord
 	selectionNote string
 	err           error
 }
@@ -166,22 +170,27 @@ type filesExtractedMsg struct {
 	phase pendingPhaseType
 }
 
-// confirmFileWriteMsg is sent when user confirms/declines file writing.
+// confirmFileWriteMsg retains whether authorization was a human decision or
+// an automatic policy decision; autopilot must validate parent-issued proof.
 type confirmFileWriteMsg struct {
 	confirmed bool
+	automatic bool
 }
 
 // fileWriteCompleteMsg is sent after files are written to disk.
 type fileWriteCompleteMsg struct {
-	written int
-	failed  int
-	errors  []string
+	written  int
+	failed   int
+	errors   []string
+	approval *engine.PendingApproval
 }
 
 // depsInstallMsg is sent after dependency installation completes.
 type depsInstallMsg struct {
-	result *engine.ExecResult
-	err    error
+	result    *engine.ExecResult
+	err       error
+	approval  *engine.PendingApproval
+	recovered bool
 }
 
 // confirmDepsInstallMsg is sent when user confirms/declines dependency installation.
@@ -196,9 +205,11 @@ type confirmTestsRunMsg struct {
 
 // testRunMsg is sent after tests complete.
 type testRunMsg struct {
-	result *engine.ExecResult
-	err    error
-	noTest bool // true when no test framework detected
+	result    *engine.ExecResult
+	err       error
+	noTest    bool // true when no test framework detected
+	approval  *engine.PendingApproval
+	recovered bool
 }
 
 // autoFixMsg triggers an auto-fix attempt.
@@ -218,6 +229,7 @@ type autoFixResponseMsg struct {
 	verified      bool
 	files         []engine.ExtractedFile
 	digest        string
+	acceptance    *engine.TrustedAcceptanceRecord
 	selectionNote string
 	err           error
 }
@@ -311,6 +323,7 @@ func newAppWithTrust(mode Mode, cfg *config.Config, projectPath string, trust mo
 		}
 	}
 
+	app.restorePendingApproval()
 	return app
 }
 
@@ -333,7 +346,7 @@ func (a App) Init() tea.Cmd {
 		tea.WindowSize(),
 	}
 	if a.mode == ModeChat {
-		if prompt := strings.TrimSpace(a.initialPrompt); prompt != "" {
+		if prompt := strings.TrimSpace(a.initialPrompt); prompt != "" && !a.pendingRecovery {
 			cmds = append(cmds, func() tea.Msg {
 				return startPromptMsg{input: prompt}
 			})
@@ -587,6 +600,15 @@ func (a App) handlePendingApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool)
 	if input != "" {
 		return a, nil, false
 	}
+	// Keyboard decisions share the same durable boundary as /approve and /deny.
+	switch strings.ToLower(msg.String()) {
+	case "y", "enter":
+		next, cmd := a.handleApproveCommand()
+		return next, cmd, true
+	case "n", "esc":
+		next, cmd := a.handleDenyCommand()
+		return next, cmd, true
+	}
 
 	switch a.state {
 	case StateConfirmFiles:
@@ -631,6 +653,7 @@ func (a App) buildComplete() (tea.Model, tea.Cmd) {
 	a.wizard.SetPhase(WizardPhaseDone)
 	a.pendingWriteVerified = false
 	a.pendingWriteDigest = ""
+	a.pendingWriteAcceptance = nil
 	a.chat.AddMessage(ChatMessage{
 		Role:    "status",
 		Content: m.ProgressBuildComplete,

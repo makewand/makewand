@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/makewand/makewand/execution"
 	"time"
 )
 
@@ -98,6 +99,11 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 		})
 		return tryProviderResult{skipped: true, err: callerErr}
 	}
+	release, err := r.acquireProvider(ac.ctx, id.name)
+	if err != nil {
+		return tryProviderResult{skipped: true, err: err}
+	}
+	defer release()
 	// Circuit breaker pre-check
 	allow, remaining, ticket := r.admitProviderAttempt(id.name)
 	if !allow {
@@ -115,6 +121,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 		return tryProviderResult{skipped: true, err: fmt.Errorf("%s", detail)}
 	}
 	id.ticket = ticket
+	defer r.releaseBreakerAdmission(id.name, ticket)
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
@@ -162,6 +169,10 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 
 	detail := ""
 	providerFailure := true
+	if errors.Is(chatErr, execution.ErrBudgetExhausted) || errors.Is(chatErr, errExecutionAccounting) {
+		providerFailure = false
+		detail = "execution admission/accounting refused"
+	}
 	if ac.ctx.Err() != nil {
 		// The caller's context ending is not provider-health evidence, even if a
 		// transport wraps the cancellation in a generic CLI/config error.
@@ -181,7 +192,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 		Detail:     detail,
 	})
 	if !providerFailure {
-		return tryProviderResult{err: chatErr}
+		return tryProviderResult{usage: usage, route: RouteResult{Provider: id.provider, ModelID: actualModelID, Requested: ac.requested, Actual: id.name, IsFallback: id.isFallback}, err: chatErr}
 	}
 	r.usage.RecordFailure(id.name)
 	if opened, until := r.recordProviderFailureForErr(id.name, chatErr); opened {
@@ -194,7 +205,21 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 			Detail:   circuitOpenDetail(id.name, time.Until(until)),
 		})
 	}
-	return tryProviderResult{err: chatErr}
+	return tryProviderResult{usage: usage, route: RouteResult{Provider: id.provider, ModelID: actualModelID, Requested: ac.requested, Actual: id.name, IsFallback: id.isFallback}, err: chatErr}
+}
+
+// mergeAttemptUsage retains spend from failed calls when a request falls back.
+// Route metadata continues to describe the returned/last transport; trace events
+// identify each attempt separately. A negative cost cannot refund another call.
+func mergeAttemptUsage(current, prior Usage) Usage {
+	current.InputTokens += prior.InputTokens
+	current.OutputTokens += prior.OutputTokens
+	current.Cost = sanitizeCost(current.Cost) + sanitizeCost(prior.Cost)
+	if prior.InputTokens != 0 || prior.OutputTokens != 0 || prior.Cost != 0 {
+		current.MeasuredTokens = current.MeasuredTokens && prior.MeasuredTokens
+		current.MeasuredCost = current.MeasuredCost && prior.MeasuredCost
+	}
+	return current
 }
 
 // candidateResolver is a function that returns (provider, modelID, error) for a
@@ -221,10 +246,12 @@ type fallbackCandidate struct {
 // Returns the first successful result or the accumulated first error.
 func (r *Router) iterateFallbackCandidates(ac *attemptContext, candidates []fallbackCandidate, resolve candidateResolver) (string, Usage, RouteResult, error) {
 	var firstErr error
+	var spent Usage
+	var lastRoute RouteResult
 
 	for _, c := range candidates {
 		if callerErr := ac.ctx.Err(); callerErr != nil {
-			return "", Usage{}, RouteResult{}, callerErr
+			return "", spent, lastRoute, callerErr
 		}
 		if blocked, remaining := r.isCircuitOpen(c.name); blocked {
 			r.emitTrace(TraceEvent{
@@ -294,12 +321,15 @@ func (r *Router) iterateFallbackCandidates(ac *attemptContext, candidates []fall
 			}
 			continue
 		}
+		res.usage = mergeAttemptUsage(res.usage, spent)
+		lastRoute = res.route
 		if res.err == nil {
 			return res.content, res.usage, res.route, nil
 		}
 		if stopExecutionReplay(res.err) {
 			return "", res.usage, res.route, res.err
 		}
+		spent = res.usage
 		if firstErr == nil {
 			firstErr = res.err
 		}
@@ -313,7 +343,7 @@ func (r *Router) iterateFallbackCandidates(ac *attemptContext, candidates []fall
 	if firstErr == nil {
 		firstErr = errNoFallbackAttempted
 	}
-	return "", Usage{}, RouteResult{}, firstErr
+	return "", spent, lastRoute, firstErr
 }
 
 // routeAndExecute implements the unified Chat/ChatWith execution pipeline.
@@ -339,11 +369,12 @@ func (r *Router) routeAndExecute(ac *attemptContext, result RouteResult, fallbac
 		return "", primaryRes.usage, result, firstErr
 	}
 	if callerErr := ac.ctx.Err(); callerErr != nil {
-		return "", Usage{}, result, callerErr
+		return "", primaryRes.usage, result, callerErr
 	}
 
 	// Try fallbacks
 	content, usage, route, fbErr := r.iterateFallbackCandidates(ac, fallbacks, resolve)
+	usage = mergeAttemptUsage(usage, primaryRes.usage)
 	if fbErr == nil {
 		return content, usage, route, nil
 	}
@@ -351,7 +382,7 @@ func (r *Router) routeAndExecute(ac *attemptContext, result RouteResult, fallbac
 		return "", usage, result, fbErr
 	}
 	if callerErr := ac.ctx.Err(); callerErr != nil {
-		return "", Usage{}, result, callerErr
+		return "", usage, result, callerErr
 	}
 	if firstErr == nil {
 		firstErr = fbErr
@@ -368,7 +399,7 @@ func (r *Router) routeAndExecute(ac *attemptContext, result RouteResult, fallbac
 		Selected:  result.Actual,
 		Error:     firstErr.Error(),
 	})
-	return "", Usage{}, result, firstErr
+	return "", usage, result, firstErr
 }
 
 // tryStreamProvider attempts a single ChatStream call against the given provider.
@@ -403,6 +434,10 @@ func (r *Router) recordStreamAttemptSuccess(ac *attemptContext, id attemptIdenti
 func (r *Router) recordStreamAttemptError(ac *attemptContext, id attemptIdentity, start time.Time, streamErr error) {
 	detail := "stream terminated with error"
 	providerFailure := true
+	if errors.Is(streamErr, execution.ErrBudgetExhausted) || errors.Is(streamErr, errExecutionAccounting) {
+		providerFailure = false
+		detail = "execution admission/accounting refused"
+	}
 	if ac.ctx.Err() != nil {
 		// A caller cancellation/deadline is not evidence that the provider is
 		// unhealthy. Keep it visible in traces without poisoning routing feedback.
@@ -449,11 +484,13 @@ func (r *Router) observeStreamAttempt(
 	attemptCancel context.CancelFunc,
 	source <-chan StreamChunk,
 	first StreamChunk,
+	release func(),
 ) <-chan StreamChunk {
 	out := make(chan StreamChunk, 1)
 
 	go func() {
 		defer close(out)
+		defer release()
 		defer attemptCancel()
 
 		forward := func(chunk StreamChunk) bool {
@@ -544,6 +581,16 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 		return tryStreamResult{skipped: true, err: callerErr}
 	}
 
+	release, err := r.acquireProvider(ac.ctx, id.name)
+	if err != nil {
+		return tryStreamResult{skipped: true, err: err}
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			release()
+		}
+	}()
 	// Circuit breaker pre-check
 	allow, remaining, ticket := r.admitProviderAttempt(id.name)
 	if !allow {
@@ -561,6 +608,8 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 		return tryStreamResult{skipped: true, err: fmt.Errorf("%s", detail)}
 	}
 	id.ticket = ticket
+	releasePermit := release
+	release = func() { r.releaseBreakerAdmission(id.name, ticket); releasePermit() }
 
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
@@ -616,8 +665,9 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 				return tryStreamResult{err: chunk.Error}
 			}
 			if chunk.Done || chunk.Content != "" {
+				transferred = true
 				return tryStreamResult{
-					ch:    r.observeStreamAttempt(ac, id, start, attemptCtx, attemptCancel, ch, chunk),
+					ch:    r.observeStreamAttempt(ac, id, start, attemptCtx, attemptCancel, ch, chunk, release),
 					route: route,
 				}
 			}

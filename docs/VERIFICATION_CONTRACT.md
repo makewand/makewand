@@ -9,14 +9,50 @@ from candidate-controlled code as an independent acceptance certificate.
   Go test was missing, or verification changed the input files or permissions.
 - **Strength 1:** the local checks completed successfully. Human approval is
   required before applying the candidate, including when baseline tests ran.
-- **Strength 2:** reserved for a trusted acceptance driver independent of the
-  candidate process. No current local test runner grants this strength.
+- **Strength 2:** all isolated local checks and a configured independent trusted
+  acceptance driver passed for the same frozen inputs and delivered artifact.
+  Without that driver, local test success remains Strength 1.
 
-This changes the previous autopilot behavior: passing local tests no longer
-authorizes automatic file application. Makewand still runs and ranks candidates,
+Passing local tests alone does not authorize automatic file application. A
+valid Strength 2 record can authorize autopilot; manual application remains
+available for successful local diagnostics. Makewand still runs and ranks candidates,
 shows check results, and prepares a candidate for approval. Even Go's structured
 JSON test events can be forged by code executing in the test process; matching
 every expected baseline test improves diagnostics but does not remove this limit.
+
+Configure `MAKEWAND_TRUSTED_ACCEPTANCE_FILE` as a JSON file outside the project,
+or use `ContextWithTrustedAcceptance(ctx, spec)` in the Go SDK. The `stdio-v1`
+driver resolves a trusted runtime outside the candidate before generation and
+binds its executable hash, command and arguments. A trusted parent compares
+stdin-driven stdout, stderr and exit status to expectations kept out of the
+candidate sandbox. Candidate output is application data, never an approval
+protocol. Each behavioral case uses a read-only workspace, private home, and
+separate PID, IPC and network namespaces through Linux Bubblewrap.
+
+The record binds the policy, full baseline, full candidate tree and delivered
+patch. This stricter input tree includes dependency and build directories;
+symlinks, special files and unsealed inputs stop strong acceptance. Expected
+results are hidden from candidate processes. The parent authenticates the
+record with a private, in-process MAC; JSON export/import cannot recreate
+approval. Restart requires fresh verification. Immediately before application,
+the TUI checks the record and the baseline again under the application lock.
+Unsafe host execution never grants Strength 2, even if a later check isolates
+successfully. Configured acceptance errors or failures cannot fall back to
+strong approval. The supplied cases establish only their specified behavior,
+not arbitrary code safety or complete requirement coverage.
+
+Example private specification (replace the fixed runtime path for the host):
+
+```json
+{
+  "schema": 1,
+  "command": "/usr/bin/python3",
+  "args": ["-I", "app.py"],
+  "timeout": "10s",
+  "max_output_bytes": 65536,
+  "cases": [{"name": "basic", "stdin": "2\n", "stdout": "4\n", "stderr": "", "exit_code": 0}]
+}
+```
 
 The execution plan comes from the baseline project. Adding a `package.json` to a
 Go candidate cannot replace `go test` with an npm command. The existing baseline
@@ -67,8 +103,10 @@ the verification strength or human-approval requirement.
 One call can exceed the soft cost limit. Unknown or zero reported subscription
 cost cannot provide a monetary hard cap. Timeouts request cancellation between
 copied files and through provider/check contexts; they cannot undo completed
-writes or a provider request already accepted remotely. These Go controls do
-not join the Python `--max-model-calls` ledger. Go callers can use
+writes or a provider request already accepted remotely. The candidate cost
+setting is separate from the shared integer call ledger: native Go and Python
+dispatches both join `--max-model-calls` / `--call-budget-file` admission.
+Go callers can use
 `ContextWithCandidateSelectionOptions(ctx, CandidateSelectionOptions{...})`;
 context options replace the candidate environment settings, with zero fields
 using defaults. Invalid resource settings are rejected.
@@ -94,9 +132,10 @@ points, missing identity information, and detected metadata changes. Supported
 identity formats currently cover NTFS, FAT, FAT32 and exFAT. ReFS and unknown
 filesystems are rejected: the 64-bit index is not guaranteed unique on ReFS.
 [Microsoft documents this identity limitation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information).
-Windows cross-compilation is not runtime validation of checkpoint behavior,
-sandboxing or Unix permission semantics; native runtime validation is still
-required on the supported filesystems.
+The `Architecture runtime` workflow exercises actual NTFS handles, file identity,
+transaction recovery and permissions on `windows-latest`. Other filesystem
+formats remain subject to their capability checks; this NTFS run does not certify
+them or provide Linux sandbox isolation on Windows.
 
 ## Python pipeline and race candidates
 
@@ -131,8 +170,27 @@ plan, including deletions. Application checks all three; changing Git metadata
 cannot introduce extra deletions. `--force` can override a human decision about
 test/review failures or workspace conflicts, but cannot bypass artifact integrity.
 Candidates saved by older versions must be regenerated. Replacement and rollback
-preserve permissions and use POSIX directory handles; native Windows users must
-run the full apply workflow in WSL2.
+preserve supported permissions. POSIX uses directory handles; native Windows
+uses pinned, non-reparse Win32 directory/file handles and atomic handle-based
+replacement/deletion. Windows rejects junctions, alternate data streams, DOS
+device names and ambiguous paths. DACLs and readonly attributes are retained;
+Unix executable/owner bits are not emulated. Windows pipeline generation always
+uses a shadow copy, including for a non-Git directory. The complete offline
+generate/test/seal/review/apply/rollback flow runs in the native Windows CI job.
+Testing generated code on Windows still requires explicit unsafe-host consent
+when Linux sandbox isolation is unavailable; it cannot grant Strength 2.
+Windows subprocesses in the Python runner start suspended, join a Job Object,
+and then resume. Jobs bound process trees, output, deadline, process count and
+memory; they do not isolate files, credentials or networking. Unknown batch
+shims are rejected; recognized Node shims invoke the fixed JS entry directly.
+The fixtures exercise runtime contracts, not every third-party model CLI.
+
+Native Go command, Router CLI, raw CLI and preview processes also use shared
+Windows Jobs, with suspended startup and no breakaway. Their combined raw
+stdout/stderr limit is 10 MiB; overflow is an UNKNOWN outcome, never a successful
+truncated response. Deadline cancellation, normal leader exit and preview Stop
+reap inherited pipes and terminate supervised descendants. Unix process groups
+retain their existing containment limits.
 
 Python shadow delivery also freezes each repository's deliverable path set before
 review, including submodules. After staging and committing, it compares the raw
@@ -230,3 +288,31 @@ The command registry in `makewand/command_contract.json` drives Python dispatch
 and generated Go delegation tables. Generation drift and help-routing checks
 are part of release validation. Public help must reach the command's actual
 parser, not merely return a successful root help response.
+
+
+## Interrupted application recovery
+
+Go TUI delivery uses `Project.ApplyFilesTransactional(ctx, files, validate)`:
+seal bounded preimages and fixed sibling scratch names in private state outside
+the workspace, sync the journal, replace files through a held root, then publish
+a committed marker. `OpenProject` and `NewProject` recover a pending application;
+SDK callers can invoke `RecoverInterruptedApply(ctx)` explicitly. Recovery checks
+workspace identity, every preimage and all current paths before changing any
+file. A conflicting external edit preserves the workspace and journal and
+returns `ErrStaleApply`. The private state defaults to the makewand config's
+`apply-journals` directory; `MAKEWAND_APPLY_STATE_DIR` overrides it. Low-level
+`WriteFile`/`WriteFiles` remain direct write APIs; their callers should use the
+transaction API for recoverable multi-file delivery.
+
+Python saves an application journal before each mutation and recovers pending
+applications on the next apply under the same workspace/apply locks. SDK users
+can call `CandidateManager.recover_interrupted_applications(base_cwd)` explicitly.
+Recovery validates all journals and backups before beginning, refuses later
+workspace changes, and remains resumable if interrupted again. Committed and
+rolled-back markers are durable; Python keeps preimages and journals as evidence.
+
+These are recoverable transactions, not instantaneous filesystem-wide atomic
+visibility. External editors do not join the writer lock. The crash tests cover
+process termination and restart; they do not certify hardware power-loss or
+network-filesystem durability. Windows flushes file data and journal headers
+without claiming POSIX directory-fsync semantics.
