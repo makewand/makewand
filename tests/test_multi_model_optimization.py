@@ -524,6 +524,8 @@ class TestCatalogDrivenTierResolutionAndSandboxWhitelist(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             cand_p = Path(tmp_dir) / "wt_a"
             cand_p.mkdir(parents=True, exist_ok=True)
+            from makewand.git_helper import ensure_git_worktree
+            self.assertTrue(ensure_git_worktree(str(cand_p)))
             (cand_p / "foo.py").write_text("x = 1\n")
             CandidateManager.save_race(
                 race_id=race_id,
@@ -935,7 +937,7 @@ def get_platform():
             baseline = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(base_dir))[1].strip()
             race_id = "test_rc_hybrid_1"
             with patch("makewand.candidate.config.CANDIDATES_DIR", Path(td) / "candidates"), \
-                 patch("makewand.orchestrator.run_local_tests", return_value=(True, None)):
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "fixture tests passed")):
                 race_dir = Path(td) / "candidates" / race_id
                 cand_a_dir, cand_b_dir, frozen = [race_dir / name for name in ("A", "B", "baseline")]
                 for destination in (cand_a_dir, cand_b_dir, frozen):
@@ -1004,5 +1006,3 @@ class TestCrossSessionCollisionDetection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

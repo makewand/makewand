@@ -7,6 +7,7 @@ import re
 import json
 from makewand import filelock as fcntl
 import uuid
+import tempfile
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from pathlib import Path
@@ -407,19 +408,38 @@ def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = Non
     }
     save_status_cache(status_entry)
 
-def _run_model_probe(engine: str, command: str, timeout: int):
+class ProbePolicyError(ValueError):
+    """Live host inference cannot satisfy an untrusted repository policy."""
+
+
+def _validate_probe_policy(repo_trust):
+    if repo_trust not in ("trusted", "untrusted"):
+        raise ValueError("invalid repository trust policy")
+    if repo_trust == "untrusted":
+        raise ProbePolicyError("不可信仓库禁止宿主模型探活；请在可信目录显式运行 probe。缓存状态读取不需要模型调用。")
+
+
+def _run_model_probe(engine: str, command: str, timeout: int, *, repo_trust="trusted", cwd=None):
     """Health echoes use the shared runtime, ledger and parent deadline."""
     from makewand.config import get_api_policy
     from makewand.execution_contract import ExecutionRequest
     from makewand.execution_runtime import execute, task_id, current_context
     context = current_context()
     captured = []
+    try:
+        _validate_probe_policy(repo_trust)
+    except (ProbePolicyError, ValueError) as error:
+        from makewand.providers.base import ProcessExecutionError
+        return 127, "", "", ProcessExecutionError(str(error), "UNVERIFIED" if isinstance(error, ProbePolicyError) else "INVALID_REQUEST")
 
     def invoke(remaining):
         from makewand.execution_runtime import mark_provider_invocation
         from makewand.providers.base import model_process_failure, is_process_timeout
         mark_provider_invocation()
-        raw = run_subprocess(command, timeout=remaining)
+        # Generated echo probes do not need project files or project hooks.
+        # Give even trusted probes a disposable neutral working directory.
+        with tempfile.TemporaryDirectory(prefix="makewand-probe-") as neutral:
+            raw = run_subprocess(command, timeout=remaining, cwd=neutral)
         captured.append(raw)
         if raw[0] == 0:
             return True, raw[1], None
@@ -432,7 +452,7 @@ def _run_model_probe(engine: str, command: str, timeout: int):
         return model_process_failure(engine, raw[0], raw[1], raw[2], raw[3], readonly=True)
 
     request = ExecutionRequest(task_id=task_id(), stage="probe", engine=engine,
-        tier="probe", readonly=True, api_policy=get_api_policy(),
+        tier="probe", readonly=True, repo_trust=repo_trust, cwd=cwd or os.getcwd(), api_policy=get_api_policy(),
         deadline_unix_ms=context.get("deadline_unix_ms"), timeout_ms=max(1, int(timeout * 1000)))
     result = execute(request, invoke)
     if captured and result.status in ("PASSED", "FAILED"):
@@ -440,7 +460,7 @@ def _run_model_probe(engine: str, command: str, timeout: int):
     return (124 if result.status == "TIMEOUT" else 127), "", "", result.error
 
 
-def probe_model(model_name: str) -> Dict[str, Any]:
+def probe_model(model_name: str, *, repo_trust="trusted", cwd=None) -> Dict[str, Any]:
     now = datetime.now().isoformat()
     from makewand.config import has_api_configured, has_subscription_configured, is_provider_enabled
 
@@ -499,10 +519,17 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     # 3. Subscription Probes
     mode = "hybrid" if api_configured else "subscription"
+    if model_name in ("claude", "codex", "muse", "grok"):
+        try:
+            _validate_probe_policy(repo_trust)
+        except (ProbePolicyError, ValueError) as error:
+            return {"status": "unknown", "reason": str(error), "resets_at": None,
+                    "updated_at": now, "mode": mode, "verified": False,
+                    "execution_status": "UNVERIFIED" if isinstance(error, ProbePolicyError) else "INVALID_REQUEST"}
 
     if model_name == "claude":
         cmd = 'claude -p "echo ok"'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=15)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=15, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_claude_quota(combined)
         if is_limited:
@@ -517,7 +544,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     elif model_name == "codex":
         cmd = 'codex exec --sandbox read-only --skip-git-repo-check "echo ok"'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=35)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=35, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_codex_quota(combined)
         if is_limited:
@@ -534,7 +561,8 @@ def probe_model(model_name: str) -> Dict[str, Any]:
         # `agy --version` only proves the binary is installed. Account, region and
         # quota availability are learned from real dispatches (providers/agy.py
         # writes region/auth failures back with a TTL) and the usage ledger.
-        code, out, err, ex = run_subprocess("agy --version", timeout=5)
+        with tempfile.TemporaryDirectory(prefix="makewand-version-") as neutral:
+            code, out, err, ex = run_subprocess(["agy", "--version"], timeout=5, cwd=neutral)
         if code == 0:
             version = out.strip() or "v1.x"
             sub_desc = (f"Antigravity 已安装 ({version})；仅版本检测，账号/地区可用性未经真实调用验证"
@@ -545,7 +573,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     elif model_name == "muse":
         cmd = 'muse exec --disable-write --trust-workspace "echo ok"'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=25)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=25, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_muse_quota(combined)
         if is_limited:
@@ -560,7 +588,7 @@ def probe_model(model_name: str) -> Dict[str, Any]:
 
     elif model_name == "grok":
         cmd = 'grok -p "echo ok" --output-format plain'
-        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=20)
+        code, out, err, ex = _run_model_probe(model_name, cmd, timeout=20, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_grok_quota(combined)
         if is_limited:
@@ -572,7 +600,8 @@ def probe_model(model_name: str) -> Dict[str, Any]:
         if ex:
             return {"status": "error", "reason": ex, "resets_at": None, "updated_at": now, "mode": mode}
     elif model_name == "aider":
-        code, out, err, ex = run_subprocess("aider --version", timeout=5)
+        with tempfile.TemporaryDirectory(prefix="makewand-version-") as neutral:
+            code, out, err, ex = run_subprocess(["aider", "--version"], timeout=5, cwd=neutral)
         if code == 0:
             version = out.strip().replace("aider ", "v")
             sub_desc = f"Aider AI Pair Programmer ({version}) 运行就绪" + (" (已配置 API 备用兜底)" if api_configured else "")
@@ -628,8 +657,10 @@ def _probed_since(info: Any, started: datetime) -> bool:
     return stamp >= started - timedelta(seconds=PROBE_REUSE_SECONDS)
 
 
-def get_or_update_status(force_probe: bool = False) -> Dict[str, Any]:
+def get_or_update_status(force_probe: bool = False, *, repo_trust="trusted", cwd=None) -> Dict[str, Any]:
     from makewand.config import get_all_supported_providers
+    if force_probe:
+        _validate_probe_policy(repo_trust)
     cache = load_status_cache()
     if not force_probe:
         return cache
@@ -655,7 +686,9 @@ def get_or_update_status(force_probe: bool = False) -> Dict[str, Any]:
                     return cache
         cache = load_status_cache()
         for model in get_all_supported_providers():
-            cache[model] = _merge_probe_result(model, cache.get(model), probe_model(model))
+            probed = (probe_model(model) if repo_trust == "trusted" and cwd is None
+                      else probe_model(model, repo_trust=repo_trust, cwd=cwd))
+            cache[model] = _merge_probe_result(model, cache.get(model), probed)
         save_status_cache(cache)
         return cache
     finally:

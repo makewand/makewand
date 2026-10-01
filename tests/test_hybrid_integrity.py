@@ -34,7 +34,7 @@ class HybridIntegrityTests(unittest.TestCase):
             self.addCleanup(override.stop)
         config.ensure_config_dir()
 
-    def race(self, tests=True):
+    def race(self, tests=True, pytest_config=None):
         base = self.root / "workspace"
         base.mkdir()
         self.assertTrue(ensure_git_worktree(str(base)))
@@ -45,6 +45,8 @@ class HybridIntegrityTests(unittest.TestCase):
         (base / "run.sh").chmod(0o755)
         if tests:
             (base / "test_module.py").write_text("def test_valid():\n    assert True\n")
+        if pytest_config is not None:
+            (base / "pyproject.toml").write_text(pytest_config)
         self.assertEqual(run_git_cmd(["git", "add", "-A"], cwd=str(base))[0], 0)
         self.assertEqual(run_git_cmd(["git", "commit", "-m", "fixture"], cwd=str(base))[0], 0)
         baseline = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(base))[1].strip()
@@ -67,7 +69,7 @@ class HybridIntegrityTests(unittest.TestCase):
                                    frozen_baseline_manifest=build_manifest(frozen))
         return base, a, b, frozen
 
-    def synthesize(self, result=(True, None), side_effect=None):
+    def synthesize(self, result=(True, "fixture tests passed"), side_effect=None):
         with patch("makewand.orchestrator.run_local_tests", return_value=result, side_effect=side_effect):
             return CandidateManager.create_hybrid_candidate("hybrid")
 
@@ -211,7 +213,8 @@ class HybridIntegrityTests(unittest.TestCase):
         self.assertIn("__pycache__/actual_source.py", candidate["manifest"])
         self.assertFalse(any(name.endswith(".pyc") for name in candidate["manifest"]))
         self.assertNotIn(".makewand/playbook.json", candidate["changes"])
-        self.assertTrue(CandidateManager.apply_candidate(race["race_id"], "A")[0])
+        applied, _, message = CandidateManager.apply_candidate(race["race_id"], "A")
+        self.assertTrue(applied, message)
         self.assertEqual((base / "__pycache__/actual_source.py").read_text(), "SOURCE = True\n")
         self.assertEqual((base / ".makewand/playbook.json").read_text(), '{"project_conventions": ["preserve me"]}\n')
 
@@ -388,6 +391,34 @@ class HybridIntegrityTests(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertIsNone(hybrid["test_passed"])
         self.assertIsNone(hybrid["review_passed"])
+        self.assertFalse(CandidateManager.apply_candidate("hybrid", "M")[0])
+
+    def test_empty_pytest_config_without_executed_tests_cannot_pass_hybrid(self):
+        base, _, _, _ = self.race(tests=False, pytest_config="[tool.pytest]\n")
+        original = (base / "module.py").read_bytes()
+        ok, hybrid, detail = CandidateManager.create_hybrid_candidate("hybrid")
+        self.assertTrue(ok, detail)
+        self.assertIsNone(hybrid["test_details"])
+        self.assertIsNone(hybrid["test_passed"])
+        self.assertFalse(CandidateManager.approve_hybrid_candidate(
+            "hybrid", hybrid["manifest"], hybrid["changes"],
+            'MAKEWAND_VERDICT: {"pass": true, "defects": []}',
+        )[0])
+        self.assertFalse(CandidateManager.apply_candidate("hybrid", "M")[0])
+        self.assertEqual((base / "module.py").read_bytes(), original)
+
+    def test_missing_test_evidence_cannot_pass_detected_hybrid(self):
+        self.race()
+        ok, hybrid, detail = self.synthesize((True, None))
+        self.assertTrue(ok, detail)
+        self.assertIsNone(hybrid["test_passed"])
+        self.assertFalse(CandidateManager.apply_candidate("hybrid", "M")[0])
+
+    def test_unavailable_tests_remain_unknown_for_hybrid(self):
+        self.race()
+        ok, hybrid, detail = self.synthesize((False, orch.LocalTestsUnavailable("test runner missing")))
+        self.assertTrue(ok, detail)
+        self.assertIsNone(hybrid["test_passed"])
         self.assertFalse(CandidateManager.apply_candidate("hybrid", "M")[0])
 
     def test_hybrid_review_api_rejects_missing_failed_and_contradictory_reports(self):

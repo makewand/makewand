@@ -156,7 +156,7 @@ class ArtifactTests(StorageHarness):
                                 ("get_or_update_status", {}),
                                 ("select_optimal_engine_pair", (["codex"], ["claude"], {
                                     "primary_coder": "codex", "primary_reviewer": "claude", "reasons": []})),
-                                ("run_local_tests", (True, None))):
+                                ("run_local_tests", (True, "fixture tests passed"))):
                 stack.enter_context(patch.object(orch, name, return_value=value))
             stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
             stack.enter_context(patch("makewand.memory.format_memory_hints_for_prompt", return_value=""))
@@ -338,7 +338,7 @@ class CandidateTests(StorageHarness):
             stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
             stack.enter_context(patch.object(orch, "get_or_update_status", return_value={}))
             stack.enter_context(patch.object(orch, "dispatch_task", return_value=(False, "", "quota")))
-            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
+            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, "fixture tests passed")))
             stack.enter_context(patch.object(orch, "execute_agy_task", side_effect=AssertionError("race judging must use the unified dispatcher")))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = orch.run_race("Implement update", cwd=str(host), engine_a="codex", engine_b="claude")

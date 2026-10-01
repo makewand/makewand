@@ -90,7 +90,7 @@ class DeliveryBindingTests(unittest.TestCase):
                 ("get_or_update_status", {}),
                 ("select_optimal_engine_pair", (["codex"], ["claude"], {
                     "primary_coder": "codex", "primary_reviewer": "claude", "reasons": []})),
-                ("run_local_tests", (True, None)),
+                ("run_local_tests", (True, "fixture tests passed")),
             ]:
                 stack.enter_context(patch.object(orch, name, return_value=value))
             stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
@@ -171,7 +171,7 @@ class DeliveryBindingTests(unittest.TestCase):
         self.assertIn("+APPROVED", patch_text)
         self.assertNotIn("UNREVIEWED", patch_text)
 
-    def test_race_metadata_change_during_review_returns_unverified_without_traceback(self):
+    def test_race_index_changes_cannot_hide_reviewed_files(self):
         import makewand.config as config
         candidates = self.root / "candidates"
         (self.base / "test_app.py").write_text("def test_fixture():\n    assert True\n")
@@ -202,9 +202,13 @@ class DeliveryBindingTests(unittest.TestCase):
             stack.enter_context(patch.object(orch, "execute_agy_task", side_effect=AssertionError("race judging must use the unified dispatcher")))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = orch.run_race("Implement update", cwd=str(self.base), engine_a="codex", engine_b="claude")
-        self.assertEqual(code, orch.EXIT_UNVERIFIED)
+        # Inspection now constructs its own index from the frozen baseline.
+        # Removing a real index entry cannot hide the reviewed application plan.
+        self.assertEqual(code, 0)
         self.assertEqual(len(judge_calls), 1)
-        self.assertEqual(list(candidates.iterdir()), [])
+        race = json.loads(next(candidates.glob("*/meta.json")).read_text())
+        self.assertEqual(race["candidates"]["A"]["changes"]["app.txt"], "M")
+        self.assertIn("app.txt", race["candidates"]["A"]["manifest"])
 
     def test_verified_tree_preserves_binary_symlink_and_executable_inputs(self):
         script = self.shadow / "run tool.sh"

@@ -132,9 +132,11 @@ class AssessmentFixtures(unittest.TestCase):
         (path / ".git/info/exclude").write_text("second.txt\n")
         self.assertEqual(candidate.build_manifest(path), frozen)
         ok, _, message = candidate.CandidateManager.apply_candidate("mode", force=True)
-        self.assertFalse(ok, message)
-        self.assertEqual((base / "second.txt").read_text(), "before\n")
-        self.assertIn("before", (base / "run.sh").read_text())
+        self.assertTrue(ok, message)
+        # The private index makes this metadata-only attack ineffective: apply
+        # delivers the reviewed bytes instead of treating the file as deleted.
+        self.assertEqual((base / "second.txt").read_text(), "after\n")
+        self.assertIn("after", (base / "run.sh").read_text())
 
     def test_reviewed_deletion_is_applied(self):
         base, path = self.make_candidate()

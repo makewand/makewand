@@ -157,7 +157,7 @@ class TestQuestionNeverEntersWritePipeline(unittest.TestCase):
                 stack.enter_context(patch.object(orch, "select_optimal_engine_pair", return_value=(
                     ["claude"], ["codex"], {"primary_coder": "claude", "primary_reviewer": "codex", "reasons": []})))
                 stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
-                stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
+                stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, "fixture tests passed")))
                 stack.enter_context(patch("makewand.memory.format_memory_hints_for_prompt", return_value=""))
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 orch.run_pipeline("这个项目支持 Windows 吗？", cwd=str(work), force_code=False, auto_fix=True)

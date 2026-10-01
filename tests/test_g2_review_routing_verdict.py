@@ -185,7 +185,7 @@ class PipelineFixture(unittest.TestCase):
         self.artifacts = self.root / "artifacts"
         self.calls = []
 
-    def run_pipeline(self, reviews, fixer=None, test_result=(True, None), auto_fix=True, task_prompt=None):
+    def run_pipeline(self, reviews, fixer=None, test_result=(True, "fixture tests passed"), auto_fix=True, task_prompt=None):
         reviews = list(reviews)
 
         def dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):

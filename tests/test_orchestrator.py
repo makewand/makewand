@@ -396,6 +396,7 @@ class TestOrchestrator(unittest.TestCase):
                     return True, "Code written", None
 
                 with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(False, "Active tmux session")), \
+                     patch("makewand.orchestrator.run_local_tests", return_value=(True, "fixture tests passed")), \
                      patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                      patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
                      patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
@@ -484,6 +485,7 @@ class TestOrchestrator(unittest.TestCase):
                 return True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None
 
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "fixture tests passed")), \
                  patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=mock_coder_commit), \
@@ -542,6 +544,7 @@ class TestOrchestrator(unittest.TestCase):
             pre_dirs = set(art_base.glob("delivery_*")) if art_base.exists() else set()
 
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(False, "Active session")), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "fixture tests passed")), \
                  patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                  patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
@@ -587,6 +590,7 @@ class TestOrchestrator(unittest.TestCase):
             (Path(base_tmp) / "main.py").write_text("print('hello')")
 
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "fixture tests passed")), \
                  patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", return_value=(True, "code written", None)), \
@@ -678,6 +682,7 @@ class TestOrchestrator(unittest.TestCase):
                 return True, "Code updated", None
 
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(False, "Active session")), \
+                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "fixture tests passed")), \
                  patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                  patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}, "grok": {"status": "limited"}, "muse": {"status": "limited"}, "agy": {"status": "limited"}}), \

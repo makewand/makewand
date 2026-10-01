@@ -136,6 +136,20 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _status_cache(args):
+    import json
+    from makewand.health import ProbePolicyError
+    try:
+        return get_or_update_status(force_probe=getattr(args, "probe", False),
+            repo_trust=getattr(args, "repo_trust", "trusted"), cwd=getattr(args, "cwd", None))
+    except ProbePolicyError as error:
+        if getattr(args, "json", False):
+            print(json.dumps({"status": "UNVERIFIED", "exit_code": EXIT_UNVERIFIED, "error": str(error)}, ensure_ascii=False))
+        else:
+            print(str(error), file=sys.stderr)
+        raise SystemExit(EXIT_UNVERIFIED)
+
+
 def cmd_status(args):
     import shutil
     from makewand.config import (
@@ -149,7 +163,7 @@ def cmd_status(args):
 
     if getattr(args, "json", False):
         import json
-        cache = get_or_update_status(force_probe=getattr(args, "probe", False))
+        cache = _status_cache(args)
         print(json.dumps(build_status_json(cache), ensure_ascii=False, indent=2))
         return
 
@@ -162,7 +176,7 @@ def cmd_status(args):
     print("API 费用策略: " + ("allow_paid（允许云 API 按量计费）" if policy == "allow_paid" else "subscription_only（禁止 Makewand 云 API 调用）"))
     print(c("额度说明: 除标注“官方报告”外，下方额度条为本地调用计数估算或由健康状态推定，不是官方剩余配额；"
             "官方 5 小时/每周额度读取仅在 Go 组件 'makewand-server quota' 中实现。", COLOR_YELLOW))
-    cache = get_or_update_status(force_probe=getattr(args, "probe", False))
+    cache = _status_cache(args)
 
     status_badges = {
         "healthy":    c("[🟢 正常可用]", COLOR_GREEN + COLOR_BOLD),

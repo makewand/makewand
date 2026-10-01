@@ -25,6 +25,23 @@ STANDARD_FAMILIES = ["sonnet", "sol", "standard"]
 STANDARD_KEYWORDS = ["workhorse", "balanced", "everyday", "general"]
 
 
+def _valid_model_id(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,199}", value.strip()) is not None
+
+
+def _tier_resolution(model, effort, *, is_dynamic, full_id=None, effort_source="builtin"):
+    """Model provenance and effort provenance are independent facts.
+
+    Builtin effort settings preserve historical defaults; they do not prove
+    that a newly discovered commercial model supports those capabilities.
+    """
+    result = {"model": model.strip(), "effort": effort, "is_dynamic": is_dynamic,
+              "source": "detected" if is_dynamic else "builtin", "effort_source": effort_source}
+    if full_id is not None:
+        result["full_id"] = full_id.strip()
+    return result
+
+
 def parse_semver(slug: str) -> tuple:
     """
     Extract (major, minor, patch) version tuple from model slugs or labels.
@@ -113,7 +130,7 @@ def rank_models_for_tier(models, tier: str = "standard") -> List[Tuple[int, str,
 
 def discover_available_models() -> Dict[str, Any]:
     models = {
-        "claude": {"current_default": "claude-sonnet-5 (Sonnet 5)", "available": ["claude-fable-5-1[1m] (Fable 5.1 - 官方最高旗舰 · Mythos级最强模型)", "claude-opus-5-5 (Opus 5.5 - 深度复杂推理)", "claude-sonnet-5 (Sonnet 5 - 默认主力高敏捷)", "claude-haiku-4-5-20251001 (Haiku 4.5 - 轻量极速)"]},
+        "claude": {"current_default": "claude-sonnet-5 (Sonnet 5)", "available": ["claude-fable-5-1[1m] (Fable 5.1)", "claude-opus-5-5 (Opus 5.5)", "claude-sonnet-5 (Sonnet 5)", "claude-haiku-4-5-20251001 (Haiku 4.5)"]},
         "codex": {"current_default": "gpt-6-astra", "available": []},
         "agy": {"current_default": "Gemini 3.8 Flash / Pro", "available": ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-pro", "gemini-ultra"]},
         "muse": {"current_default": "Meta Provider (Default Llama / Code Preset)", "available": ["native-basic", "miniswe"]},
@@ -125,7 +142,7 @@ def discover_available_models() -> Dict[str, Any]:
 
     # Discover Claude models from official catalog cache (~/.claude/cache/model-catalog/*.json) and ~/.claude.json
     try:
-        cat_dir = Path.home() / ".claude" / "cache" / "model-catalog"
+        cat_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "cache" / "model-catalog"
         if cat_dir.exists():
             json_files = sorted(cat_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
             if json_files:
@@ -133,20 +150,13 @@ def discover_available_models() -> Dict[str, Any]:
                 cfg_models = cat_data.get("catalog", {}).get("config", {}).get("models", [])
                 catalog_found = []
                 for m in cfg_models:
+                    if not isinstance(m, dict):
+                        continue
                     mid = m.get("id")
                     mname = m.get("name")
-                    mdesc = m.get("description", "")
-                    notice = m.get("notice", {}).get("text", "") if m.get("notice") else ""
-                    if "most capable" in notice.lower() or "toughest" in mdesc.lower():
-                        lbl = f"{mid} ({mname} - 官方最高旗舰 · Mythos级最强)"
-                    elif "opus" in mname.lower():
-                        lbl = f"{mid} ({mname} - 深度复杂推理)"
-                    elif "sonnet" in mname.lower():
-                        lbl = f"{mid} ({mname} - 默认主力高敏捷)"
-                    elif "haiku" in mname.lower():
-                        lbl = f"{mid} ({mname} - 轻量极速)"
-                    else:
-                        lbl = f"{mid} ({mname})"
+                    if not _valid_model_id(mid):
+                        continue
+                    lbl = f"{mid} ({mname})" if isinstance(mname, str) and mname.strip() else mid
                     catalog_found.append(lbl)
                 if catalog_found:
                     models["claude"]["available"] = catalog_found
@@ -163,11 +173,12 @@ def discover_available_models() -> Dict[str, Any]:
             # never mix the builtin reference list into "detected" results.
             found = set(models["claude"]["available"]) if models["claude"]["source"] == "detected" else set()
             for m in re.findall(r'"model":\s*"([^"]+)"', raw):
-                found.add(m)
+                if _valid_model_id(m):
+                    found.add(m.strip())
             for m in data.get("additionalModelOptionsCache", []):
                 val = m.get("value")
                 lbl = m.get("label")
-                if val and str(val).startswith("claude-"):
+                if _valid_model_id(val) and val.startswith("claude-"):
                     found.add(f"{val} ({lbl})" if lbl else str(val))
             detected = sorted([m for m in found if m.startswith("claude-")], reverse=True)
             if detected:
@@ -180,8 +191,9 @@ def discover_available_models() -> Dict[str, Any]:
     try:
         codex_bases = []
         if os.environ.get("CODEX_HOME"):
-            codex_bases.append(Path(os.environ["CODEX_HOME"]))
-        codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
+            codex_bases.append(Path(os.environ["CODEX_HOME"]).expanduser())
+        else:
+            codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
 
         found = set()
         configured_model = None
@@ -196,9 +208,11 @@ def discover_available_models() -> Dict[str, Any]:
                 try:
                     cdata = json.loads(cache_file.read_text(encoding="utf-8"))
                     for m in cdata.get("models", []):
+                        if not isinstance(m, dict):
+                            continue
                         slug = m.get("slug") or m.get("id")
                         desc = m.get("description", "")
-                        if slug:
+                        if _valid_model_id(slug):
                             if desc:
                                 found.add(f"{slug} ({desc})")
                             else:
@@ -215,12 +229,14 @@ def discover_available_models() -> Dict[str, Any]:
                         for line in m.splitlines():
                             if "=" in line:
                                 name = line.split("=")[0].strip().strip('"')
-                                found.add(name)
+                                if _valid_model_id(name):
+                                    found.add(name)
                     for m in re.findall(r'model\s*=\s*"([^"]+)"', raw):
-                        found.add(m)
+                        if _valid_model_id(m):
+                            found.add(m.strip())
                     if not configured_model:
                         cfg_m = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
-                        if cfg_m:
+                        if cfg_m and _valid_model_id(cfg_m.group(1)):
                             configured_model = cfg_m.group(1).strip()
                 except Exception:
                     pass
@@ -248,8 +264,8 @@ def discover_available_models() -> Dict[str, Any]:
         muse_settings = Path.home() / ".config" / "muse" / "settings.json"
         if muse_settings.exists():
             data = json.loads(muse_settings.read_text(encoding="utf-8"))
-            if "model" in data:
-                models["muse"]["current_default"] = data["model"]
+            if _valid_model_id(data.get("model")):
+                models["muse"]["current_default"] = data["model"].strip()
                 models["muse"]["default_source"] = "detected"
     except Exception:
         pass
@@ -260,7 +276,7 @@ def discover_available_models() -> Dict[str, Any]:
         if grok_cache.exists():
             g_data = json.loads(grok_cache.read_text(encoding="utf-8"))
             if "models" in g_data and isinstance(g_data["models"], dict):
-                discovered = list(g_data["models"].keys())
+                discovered = [model for model in g_data["models"] if _valid_model_id(model)]
                 if discovered:
                     models["grok"]["available"] = sorted(
                         discovered,
@@ -289,7 +305,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
     if provider == "claude":
         # Check Anthropic official model catalog
         try:
-            cat_dir = Path.home() / ".claude" / "cache" / "model-catalog"
+            cat_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "cache" / "model-catalog"
             if cat_dir.exists():
                 files = sorted(cat_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
                 if files:
@@ -298,13 +314,18 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                     claude_catalog = []
                     efforts_map = {}
                     for m in cfg_models:
+                        if not isinstance(m, dict):
+                            continue
                         mid = m.get("id", "")
-                        if not mid:
+                        if not _valid_model_id(mid):
                             continue
                         mname = m.get("name", "")
                         mdesc = m.get("description", "")
                         notice = (m.get("notice", {}).get("text") or "") if m.get("notice") else ""
-                        efforts = [o.get("id") for o in m.get("thinking", {}).get("effort_options", [])]
+                        thinking = m.get("thinking") if isinstance(m.get("thinking"), dict) else {}
+                        efforts = [o.get("id") for o in thinking.get("effort_options", [])
+                                   if isinstance(o, dict) and isinstance(o.get("id"), str)
+                                   and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", o["id"])]
                         efforts_map[mid] = efforts
                         claude_catalog.append((mid, f"{mname} {mdesc} {notice}"))
 
@@ -312,7 +333,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                         ranked = rank_models_for_tier(claude_catalog, tier)
                         if ranked:
                             top_id = ranked[0][1]
-                            alias = "fable" if "fable" in top_id else ("haiku" if "haiku" in top_id else ("sonnet" if "sonnet" in top_id else top_id))
+                            alias = top_id  # Do not invent an alias absent from the selected catalog.
                             efforts = efforts_map.get(top_id, [])
                             if tier == "deep":
                                 effort = efforts[-1] if efforts else "max"
@@ -320,17 +341,22 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                                 effort = "low"
                             else:
                                 effort = "medium" if "medium" in efforts else ("high" if "high" in efforts else "medium")
-                            return {"model": alias, "effort": effort, "is_dynamic": True, "full_id": top_id}
+                            # Only a listed effort is detected. A static tier
+                            # preference never implies a model capability.
+                            if efforts and effort not in efforts:
+                                effort = efforts[0] if tier == "fast" else efforts[-1]
+                            return _tier_resolution(alias, effort, is_dynamic=True, full_id=top_id,
+                                                    effort_source="detected" if efforts else "builtin")
         except Exception:
             pass
 
         # Default fallback if catalog unavailable
         if tier == "deep":
-            return {"model": "fable", "effort": "max", "is_dynamic": False, "full_id": "claude-fable-5-1"}
+            return _tier_resolution("fable", "max", is_dynamic=False, full_id="claude-fable-5-1")
         elif tier == "fast":
-            return {"model": "haiku", "effort": "low", "is_dynamic": False, "full_id": "claude-haiku-4-5-20251001"}
+            return _tier_resolution("haiku", "low", is_dynamic=False, full_id="claude-haiku-4-5-20251001")
         else:
-            return {"model": "sonnet", "effort": "medium", "is_dynamic": False, "full_id": "claude-sonnet-5"}
+            return _tier_resolution("sonnet", "medium", is_dynamic=False, full_id="claude-sonnet-5")
 
     elif provider == "codex":
         discovered_models = []
@@ -338,8 +364,9 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
         codex_bases = []
         if os.environ.get("CODEX_HOME"):
-            codex_bases.append(Path(os.environ["CODEX_HOME"]))
-        codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
+            codex_bases.append(Path(os.environ["CODEX_HOME"]).expanduser())
+        else:
+            codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
 
         for base in codex_bases:
             if not base.exists():
@@ -349,8 +376,10 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 try:
                     cdata = json.loads(cache_file.read_text(encoding="utf-8"))
                     for m in cdata.get("models", []):
+                        if not isinstance(m, dict):
+                            continue
                         slug = m.get("slug") or m.get("id")
-                        if slug:
+                        if _valid_model_id(slug):
                             discovered_models.append((slug, m.get("description", "")))
                 except Exception:
                     pass
@@ -359,7 +388,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 try:
                     raw = cfg_file.read_text(encoding="utf-8")
                     m = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
-                    if m:
+                    if m and _valid_model_id(m.group(1)):
                         configured_default = m.group(1).strip()
                 except Exception:
                     pass
@@ -368,19 +397,19 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
         # If user explicitly configured a model in config.toml and requested standard tier, honor it
         if tier == "standard" and configured_default:
-            return {"model": configured_default, "effort": effort, "is_dynamic": True}
+            return _tier_resolution(configured_default, effort, is_dynamic=True)
 
         if discovered_models:
             ranked = rank_models_for_tier(discovered_models, tier)
             if ranked:
-                return {"model": ranked[0][1], "effort": effort, "is_dynamic": True}
+                return _tier_resolution(ranked[0][1], effort, is_dynamic=True)
 
         fallback_models = {
             "fast": "gpt-6-luna",
             "deep": "gpt-6-astra",
             "standard": configured_default or "gpt-6.1-sol"
         }
-        return {"model": fallback_models.get(tier, "gpt-6.1-sol"), "effort": effort, "is_dynamic": False}
+        return _tier_resolution(fallback_models.get(tier, "gpt-6.1-sol"), effort, is_dynamic=False)
 
     elif provider == "grok":
         discovered_grok = []
@@ -390,6 +419,8 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 g_data = json.loads(grok_cache.read_text(encoding="utf-8"))
                 models_dict = g_data.get("models", {})
                 for k, v in models_dict.items():
+                    if not _valid_model_id(k):
+                        continue
                     desc = v.get("description", "") if isinstance(v, dict) else ""
                     discovered_grok.append((k, desc))
         except Exception:
@@ -399,27 +430,29 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         if discovered_grok:
             ranked = rank_models_for_tier(discovered_grok, tier)
             if ranked:
-                return {"model": ranked[0][1], "effort": effort, "is_dynamic": True}
+                return _tier_resolution(ranked[0][1], effort, is_dynamic=True)
 
         fallback = "grok-4.7-build-fast" if tier == "fast" else "grok-4.7"
-        return {"model": fallback, "effort": effort, "is_dynamic": False}
+        return _tier_resolution(fallback, effort, is_dynamic=False)
 
     elif provider == "muse":
         model_name = "muse-spark-1.3-contributor"
+        detected = False
         try:
             muse_settings = Path.home() / ".config" / "muse" / "settings.json"
             if muse_settings.exists():
                 data = json.loads(muse_settings.read_text(encoding="utf-8"))
-                if "model" in data:
-                    model_name = data["model"]
+                if _valid_model_id(data.get("model")):
+                    model_name = data["model"].strip()
+                    detected = True
         except Exception:
             pass
         effort = "xhigh" if tier == "deep" else ("high" if tier == "standard" else "low")
-        return {"model": model_name, "effort": effort, "is_dynamic": True}
+        return _tier_resolution(model_name, effort, is_dynamic=detected)
 
     elif provider == "agy":
         model_name = "gemini-3.1-pro-high" if tier == "deep" else "gemini-3.8-flash-high"
         effort = "high" if tier in ("deep", "standard") else "low"
-        return {"model": model_name, "effort": effort, "is_dynamic": True}
+        return _tier_resolution(model_name, effort, is_dynamic=False)
 
-    return {"model": "default", "effort": "medium", "is_dynamic": False}
+    return _tier_resolution("default", "medium", is_dynamic=False)

@@ -274,6 +274,11 @@ def format_review_diff(diff: str, max_chars: int = 15000) -> str:
         f"{tail}"
     )
 
+class LocalTestsUnavailable(str):
+    """Detected acceptance cannot run; this is not a tested failure or pass."""
+    execution_status = "UNVERIFIED"
+
+
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
     Deterministically detects and runs local unit test suites in cwd inside Bubblewrap sandbox.
@@ -335,21 +340,31 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         test_suites.append(("Python", py_cmd, py_env))
 
     # 2. Go test suites
-    if (p / "go.mod").exists() and shutil.which("go"):
+    if (p / "go.mod").exists():
+        if not shutil.which("go"):
+            return False, LocalTestsUnavailable("检测到 Go 项目，但缺少 go 测试工具，验收未执行")
         test_suites.append(("Go", ["go", "test", "./..."], {}))
 
     # 3. Node / npm test suites
-    if (p / "package.json").exists() and shutil.which("npm"):
+    if (p / "package.json").exists():
         try:
             with open(p / "package.json", "r", encoding="utf-8") as f:
                 pkg_data = json.load(f)
+                if not isinstance(pkg_data, dict) or not isinstance(pkg_data.get("scripts", {}), dict):
+                    raise ValueError("package.json scripts must be an object")
                 if "test" in pkg_data.get("scripts", {}):
+                    if not isinstance(pkg_data["scripts"]["test"], str) or not pkg_data["scripts"]["test"].strip():
+                        raise ValueError("npm test script must be a nonempty string")
+                    if not shutil.which("npm"):
+                        return False, LocalTestsUnavailable("检测到 Node 测试脚本，但缺少 npm 测试工具，验收未执行")
                     test_suites.append(("Node", ["npm", "test"], {}))
-        except Exception:
-            pass
+        except (OSError, ValueError, TypeError) as exc:
+            return False, LocalTestsUnavailable(f"无法读取 Node 测试配置，验收未执行: {exc}")
 
     # 4. Cargo / Rust
-    if (p / "Cargo.toml").exists() and shutil.which("cargo"):
+    if (p / "Cargo.toml").exists():
+        if not shutil.which("cargo"):
+            return False, LocalTestsUnavailable("检测到 Rust 项目，但缺少 cargo 测试工具，验收未执行")
         test_suites.append(("Rust", ["cargo", "test"], {}))
 
     if not test_suites:
@@ -405,6 +420,9 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             all_passed = False
             details.append(f"[{name} Tests Failed]: 本地测试总时间预算已耗尽")
             break
+
+        if code == 0 and name == "Python" and "unittest" in cmd and re.search(r"\bRan 0 tests?\b", stdout + "\n" + stderr):
+            return False, LocalTestsUnavailable("unittest 未执行任何测试，不能作为通过的验收证据")
 
         if code != 0:
             all_passed = False
@@ -1815,7 +1833,10 @@ def _run_pipeline_impl(
 
     # Step 3: Red-team review (Cross-model verification)
     worktree_for_diff = getattr(shadow_res, "worktree_root", cwd) if is_shadow_active else cwd
-    diff_out = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
+    try:
+        diff_out = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
+    except OSError as exc:
+        return fail_and_cleanup(f"无法提取待审查 Git 差异: {exc}", "UNVERIFIED")
     if not diff_out or not diff_out.strip():
         print(c("ℹ 本次任务未产生相对于基线的有效代码改动 (git diff 为空)，无需启动红队复审与自愈流水线。", COLOR_CYAN))
         return fail_and_cleanup("❌ [Makewand Quality Gate] 任务未产生任何有效代码改动，终止交付。")
@@ -1829,6 +1850,8 @@ def _run_pipeline_impl(
     test_ok, test_err = _stage_call("test", run_local_tests, cwd, timeout=get_remaining_timeout(60))
     if not protection_check():
         return False
+    if getattr(test_err, "execution_status", None) == "UNVERIFIED" or (test_ok and test_err is None):
+        return fail_and_cleanup(str(test_err or "未发现可执行的本地测试，验收未验证"), "UNVERIFIED")
     try:
         reviewed_inputs = workspace_snapshot(worktree_for_diff)
         if reviewed_inputs != tested_inputs:
@@ -2004,6 +2027,8 @@ def _run_pipeline_impl(
             test_ok, test_err = _stage_call("test", run_local_tests, cwd, timeout=get_remaining_timeout(60))
             if not protection_check():
                 return False
+            if getattr(test_err, "execution_status", None) == "UNVERIFIED" or (test_ok and test_err is None):
+                return fail_and_cleanup(str(test_err or "修复后未发现可执行的本地测试，验收未验证"), "UNVERIFIED")
             if not test_ok:
                 print(c(f"❌ [Makewand Test Gate] 修复后本地单元测试仍未通过：\n{test_err[:400]}", COLOR_RED))
                 try:

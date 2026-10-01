@@ -36,6 +36,9 @@ class TestCandidateLifecycle(unittest.TestCase):
         ensure_git_worktree(str(self.base_ws))
         (self.base_ws / "main.py").write_text("print('version 1')\n", encoding="utf-8")
         run_git_cmd("git add -A && git commit -m 'initial main.py'", cwd=str(self.base_ws))
+        code, revision, error = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(self.base_ws))
+        self.assertEqual(code, 0, error)
+        self.baseline = revision.strip()
 
     def tearDown(self):
         config.CONFIG_DIR = self.orig_config_dir
@@ -49,12 +52,14 @@ class TestCandidateLifecycle(unittest.TestCase):
         wt_b = config.CANDIDATES_DIR / race_id / "agent_b"
         wt_a.mkdir(parents=True, exist_ok=True)
         wt_b.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(self.base_ws, wt_a, dirs_exist_ok=True)
+        shutil.copytree(self.base_ws, wt_b, dirs_exist_ok=True)
 
         CandidateManager.save_race(
             race_id=race_id,
             prompt="优化主程序",
             base_cwd=str(self.base_ws),
-            baseline_commit="abc1234",
+            baseline_commit=self.baseline,
             agent_a={"model": "Codex", "path": str(wt_a), "duration": 10.2, "success": True, "diff": "+print(2)"},
             agent_b={"model": "Claude", "path": str(wt_b), "duration": 8.1, "success": True, "diff": "+print(3)"},
             judge_report="推荐采纳选手 B",
@@ -76,6 +81,7 @@ class TestCandidateLifecycle(unittest.TestCase):
         wt_b.mkdir(parents=True, exist_ok=True)
 
         # Candidate modifies main.py and creates helper.py
+        shutil.copytree(self.base_ws, wt_b, dirs_exist_ok=True)
         ensure_git_worktree(str(wt_b))
         (wt_b / "main.py").write_text("print('version 2 from candidate B')\n", encoding="utf-8")
         (wt_b / "helper.py").write_text("def help(): pass\n", encoding="utf-8")
@@ -84,9 +90,9 @@ class TestCandidateLifecycle(unittest.TestCase):
             race_id=race_id,
             prompt="升级代码",
             base_cwd=str(self.base_ws),
-            baseline_commit="def5678",
+            baseline_commit=self.baseline,
             agent_a={"model": "Codex", "path": "", "duration": 10.0, "success": False, "diff": ""},
-            agent_b={"model": "Claude", "path": str(wt_b), "duration": 8.0, "success": True, "diff": "..."},
+            agent_b={"model": "Claude", "path": str(wt_b), "duration": 8.0, "success": True, "test_passed": True, "review_passed": True, "diff": "..."},
             judge_report="推荐选手 B",
             winner="B"
         )
@@ -119,7 +125,7 @@ class TestCandidateLifecycle(unittest.TestCase):
             base_cwd=str(self.base_ws),
             baseline_commit="",
             agent_a={},
-            agent_b={"model": "Claude", "path": str(wt_b)},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True, "test_passed": True, "review_passed": True},
             winner="B"
         )
 
@@ -154,7 +160,7 @@ class TestCandidateLifecycle(unittest.TestCase):
             base_cwd=str(self.base_ws),
             baseline_commit="",
             agent_a={},
-            agent_b={"model": "Claude", "path": str(wt_b), "success": True},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True, "test_passed": True, "review_passed": True},
             winner="B"
         )
 
@@ -177,7 +183,7 @@ class TestCandidateLifecycle(unittest.TestCase):
             base_cwd=str(self.base_ws),
             baseline_commit="",
             agent_a={},
-            agent_b={"model": "Claude", "path": str(wt_b), "success": True},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True, "test_passed": True, "review_passed": True},
             winner="B"
         )
 
@@ -198,7 +204,7 @@ class TestCandidateLifecycle(unittest.TestCase):
             base_cwd=str(self.base_ws),
             baseline_commit="",
             agent_a={},
-            agent_b={"model": "Claude", "path": str(wt_b), "success": True},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True, "test_passed": True, "review_passed": True},
             winner="B"
         )
 
@@ -308,7 +314,7 @@ class TestCandidateLifecycle(unittest.TestCase):
             base_cwd=str(self.base_ws),
             baseline_commit="",
             agent_a={},
-            agent_b={"model": "Claude", "path": str(wt_b), "success": True},
+            agent_b={"model": "Claude", "path": str(wt_b), "success": True, "test_passed": True, "review_passed": True},
             winner="B"
         )
         # 1. Test empty manifest bypass prevention:
@@ -361,6 +367,8 @@ class TestCandidateLifecycle(unittest.TestCase):
                 "model": "Claude",
                 "path": str(wt_b),
                 "success": True,
+                "test_passed": True,
+                "review_passed": True,
                 "baseline_commit": cand_base
             },
             winner="B"
@@ -370,6 +378,21 @@ class TestCandidateLifecycle(unittest.TestCase):
         self.assertTrue(ok, f"apply failed: {msg}")
         self.assertTrue((self.base_ws / "new_file.txt").exists())
         self.assertEqual((self.base_ws / "code.txt").read_text(encoding="utf-8"), "v2 from committed candidate\n")
+
+    def test_missing_acceptance_evidence_never_becomes_an_implicit_pass(self):
+        for missing in ("success", "test_passed", "review_passed"):
+            with self.subTest(missing=missing):
+                race_id = "missing-" + missing
+                workspace = config.CANDIDATES_DIR / race_id / "agent_a"
+                shutil.copytree(self.base_ws, workspace)
+                (workspace / "main.py").write_text("changed\n")
+                agent = {"path": str(workspace), "success": True, "test_passed": True, "review_passed": True}
+                agent.pop(missing)
+                CandidateManager.save_race(race_id, "edit", str(self.base_ws), self.baseline, agent, {}, winner="A")
+                self.assertIsNone(CandidateManager.get_race(race_id)["candidates"]["A"].get(missing))
+                ok, _, _ = CandidateManager.apply_candidate(race_id)
+                self.assertFalse(ok)
+                self.assertEqual((self.base_ws / "main.py").read_text(), "print('version 1')\n")
 
     def test_candidate_rename_parsing(self):
         wt = Path(self.test_dir) / "wt_rename"
@@ -389,4 +412,3 @@ class TestCandidateLifecycle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

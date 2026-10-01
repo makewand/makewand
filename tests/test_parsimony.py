@@ -101,6 +101,9 @@ diff --git a/b.py b/b.py
                 wt_b = config.CANDIDATES_DIR / race_id / "agent_b"
                 wt_a.mkdir(parents=True, exist_ok=True)
                 wt_b.mkdir(parents=True, exist_ok=True)
+                from makewand.git_helper import ensure_git_worktree
+                self.assertTrue(ensure_git_worktree(str(wt_a)))
+                self.assertTrue(ensure_git_worktree(str(wt_b)))
 
                 pars_a = compute_patch_parsimony("diff --git a/a.py b/a.py\n+x=1\n")
                 pars_b = compute_patch_parsimony("diff --git a/b.py b/b.py\n+y=2\n+z=3\n")
@@ -173,6 +176,9 @@ Binary files a/assets/icon.png and b/assets/icon.png differ
                 wt_b = config.CANDIDATES_DIR / race_id / "agent_b"
                 wt_a.mkdir(parents=True, exist_ok=True)
                 wt_b.mkdir(parents=True, exist_ok=True)
+                from makewand.git_helper import ensure_git_worktree
+                self.assertTrue(ensure_git_worktree(str(wt_a)))
+                self.assertTrue(ensure_git_worktree(str(wt_b)))
 
                 # Notice: "parsimony" key is deliberately omitted from agent_a and agent_b
                 CandidateManager.save_race(
@@ -208,4 +214,3 @@ Binary files a/assets/icon.png and b/assets/icon.png differ
 
 if __name__ == "__main__":
     unittest.main()
-

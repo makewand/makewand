@@ -29,7 +29,7 @@ from makewand.config import (
     COLOR_RESET,
 )
 import hashlib
-from makewand.git_helper import run_git_cmd, get_git_diff, WorkspaceLock, WorkspaceLockError
+from makewand.git_helper import run_git_cmd, get_git_diff, _read_workspace_diff, WorkspaceLock, WorkspaceLockError
 from makewand.protected_files import ProtectedFiles, ProtectionError
 
 
@@ -337,16 +337,15 @@ def get_candidate_files_changed(candidate_dir: Path, baseline_commit: Optional[s
     Uses NUL-delimited parsing (--no-renames --name-status -z) and os.fsdecode to safely handle
     spaces, tabs, renames, and binary paths.
     """
-    run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=str(candidate_dir))
     changes = {}
 
     # 1. Compare directly against baseline_commit (covers both committed changes and working tree changes)
-    ref = baseline_commit if baseline_commit else "HEAD"
-    code, out_b, _ = run_git_cmd(["git", "diff", "--no-renames", "--name-status", "-z", ref], cwd=str(candidate_dir), binary=True)
-    if code != 0 and not baseline_commit:
-        code, out_b, _ = run_git_cmd(["git", "diff", "--no-renames", "--name-status", "-z"], cwd=str(candidate_dir), binary=True)
+    out_b, error = _read_workspace_diff(str(candidate_dir), baseline_commit,
+                                      arguments=("--no-renames", "--name-status", "-z"), binary=True)
+    if error:
+        raise OSError(error)
 
-    if code == 0 and out_b:
+    if out_b:
         tokens = out_b.split(b"\0")
         i = 0
         while i < len(tokens) - 1:
@@ -368,7 +367,12 @@ def get_candidate_files_changed(candidate_dir: Path, baseline_commit: Optional[s
                 changes[path] = "M"
 
     # 2. Also incorporate uncommitted worktree changes with safe 2-token rename parsing
-    code, out_b, _ = run_git_cmd(["git", "status", "-z", "--porcelain"], cwd=str(candidate_dir), binary=True)
+    code, out_b, error = run_git_cmd(
+        ["git", "status", "-z", "--porcelain", "--untracked-files=all"],
+        cwd=str(candidate_dir), binary=True,
+    )
+    if code != 0:
+        raise OSError(f"Cannot read candidate Git status: {error}")
     if code == 0 and out_b:
         tokens = [t for t in out_b.split(b"\0") if t]
         idx = 0
@@ -477,10 +481,9 @@ class CandidateManager:
         baseline_manifest = baseline_manifest if baseline_manifest is not None else build_manifest(base_path)
 
         # Attach frozen candidate manifests and ensure test_passed is explicitly set
-        if "test_passed" not in agent_a:
-            agent_a["test_passed"] = agent_a.get("success", True)
-        if "test_passed" not in agent_b:
-            agent_b["test_passed"] = agent_b.get("success", True)
+        for agent in (agent_a, agent_b):
+            agent.setdefault("test_passed", None)
+            agent.setdefault("review_passed", None)
 
         # Auto-populate patch parsimony metrics if missing
         for agent in (agent_a, agent_b):
@@ -855,7 +858,11 @@ class CandidateManager:
             else:
                 test_ok, test_detail = False, "无效的本地测试结果协议"
             tests_available = _hybrid_tests_available(base_path)
-            tests_passed = test_ok if tests_available else None
+            test_evidence_available = (
+                tests_available and test_detail is not None
+                and getattr(test_detail, "execution_status", None) != "UNVERIFIED"
+            )
+            tests_passed = test_ok if test_evidence_available else None
             if (build_manifest(cand_m_dir) != sealed_manifest or _input_manifest(cand_m_dir) != sealed_inputs
                     or get_candidate_files_changed(cand_m_dir, baseline_commit) != merged_changes):
                 return False, None, "合并测试改变了已封存内容、权限或变更计划，拒绝保存候选 M"
@@ -1058,13 +1065,13 @@ class CandidateManager:
             return False, [], f"候选选手 {label} 的工作区目录已丢失: {cand_path_str}"
 
         # Prevent applying failed candidate unless forced
-        if not cand_info.get("success", True) and not force:
+        if cand_info.get("success") is not True and not force:
             return False, [], f"候选选手 {label} 任务执行状态为失败/未完成，已阻止应用未就绪的方案 (如需强制应用请使用 --force)"
 
         if cand_info.get("test_passed") is not True and not force:
             return False, [], f"候选选手 {label} 本地单元测试未通过或未完成测试验证 (test_passed != True)，已阻止应用存在缺陷的方案 (如需强制应用请使用 --force)"
 
-        if cand_info.get("review_passed") is False and not force:
+        if label != "M" and cand_info.get("review_passed") is not True and not force:
             return False, [], f"候选选手 {label} 未获裁判批准，已阻止应用 (人工确认后可使用 --force)"
         if label == "M" and cand_info.get("review_passed") is not True and not force:
             return False, [], "候选 M 尚未获独立复审批准；测试通过不能代替复审 (人工确认后可使用 --force)"

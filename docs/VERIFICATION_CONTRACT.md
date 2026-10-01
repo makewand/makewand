@@ -110,6 +110,14 @@ result and require a new test and review pass. Before the first race seal, only
 new, untracked bytecode that exactly matches trusted compilation of its source
 may be removed; existing files and arbitrary cache-directory source remain inputs.
 
+Missing detected Go/npm/Cargo test tools or malformed Node test configuration
+produce `UNVERIFIED`; they are never silently skipped. A pipeline without
+executed local test evidence stops before review and delivery. Python's
+unittest fallback reporting zero tests is also unverified.
+Saved candidates require explicit generation, test and review passes for normal
+application. Missing SDK metadata remains unknown; it is never inferred from
+generation success. An explicit human `--force` decision remains supported.
+
 A race verdict must use the structured `MAKEWAND_RACE_VERDICT` protocol. Rejection,
 missing verdicts and malformed verdicts cannot select a fastest candidate as a
 fallback. Candidates without detected tests remain unverified and cannot obtain

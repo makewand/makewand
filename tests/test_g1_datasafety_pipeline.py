@@ -108,7 +108,7 @@ class PipelineHarness(unittest.TestCase):
         self._tmp.cleanup()
 
     def run_pipeline(self, cwd, coder, review_pass=False, intent="code", isolation=(True, None),
-                     route=None, git_intercept=None, prompt=QUESTION):
+                     route=None, git_intercept=None, prompt=QUESTION, test_result=(True, "fixture tests passed")):
         self.dispatch_calls = []
 
         def dispatch(engine, prompt_text, cwd=None, readonly=False, **kwargs):
@@ -129,7 +129,7 @@ class PipelineHarness(unittest.TestCase):
             if route != "real":
                 stack.enter_context(patch.object(orch, "select_optimal_engine_pair", return_value=route))
             stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
-            stack.enter_context(patch.object(orch, "run_local_tests", return_value=(True, None)))
+            stack.enter_context(patch.object(orch, "run_local_tests", return_value=test_result))
             stack.enter_context(patch("makewand.memory.format_memory_hints_for_prompt", return_value=""))
             if git_intercept is not None:
                 real = git_helper.run_git_cmd

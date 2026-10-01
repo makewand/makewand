@@ -13,6 +13,7 @@ import tempfile
 import subprocess
 import json
 import shlex
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Union
@@ -23,6 +24,7 @@ from makewand.config import c, COLOR_YELLOW, COLOR_RED, ensure_private_dir
 # reported as rc=-1; callers that establish baselines or restore state must
 # treat any non-zero rc as a hard failure (see HostWorkspaceTransaction).
 DEFAULT_GIT_TIMEOUT = 300.0
+_diff_index = ContextVar("makewand_diff_index", default=None)
 
 
 def get_git_timeout() -> float:
@@ -129,6 +131,9 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             for k in list(git_env.keys()):
                 if k in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES") or k.startswith("GIT_CONFIG_"):
                     git_env.pop(k, None)
+            if _diff_index.get() is not None:
+                git_env["GIT_INDEX_FILE"] = _diff_index.get()
+            git_env["GIT_OPTIONAL_LOCKS"] = "0"
 
             # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees
             ia_targets = _get_git_info_attributes_paths(cwd)
@@ -148,8 +153,8 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                         shield_file = ia_target.parent / (ia_target.name + f".makewand_shield_{os.getpid()}_{len(shielded_infos)}")
                         ia_target.rename(shield_file)
                         shielded_infos.append((ia_target, shield_file))
-                    except Exception:
-                        pass
+                    except OSError as exc:
+                        raise OSError(f"Cannot shield Git attributes at {ia_target}: {exc}") from exc
 
         res = subprocess.run(
             exec_cmd,
@@ -320,7 +325,9 @@ def get_submodule_paths(repo_dir: str) -> List[str]:
 
     paths = []
     # 1. Read .gitmodules paths via git config (preserves spaces in path values)
-    code, out, _ = run_git_cmd(["git", "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], cwd=str(r_path))
+    code, out, error = run_git_cmd(["git", "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], cwd=str(r_path))
+    if code not in (0, 1):
+        raise OSError(f"Cannot read Git submodule configuration: {error}")
     if code == 0 and out:
         for line in out.splitlines():
             line = line.strip()
@@ -331,7 +338,9 @@ def get_submodule_paths(repo_dir: str) -> List[str]:
                 paths.append(parts[1].strip())
 
     # 2. Also parse git submodule status --recursive with regex to capture nested submodules
-    st_code, st_out, _ = run_git_cmd(["git", "submodule", "status", "--recursive"], cwd=str(r_path))
+    st_code, st_out, error = run_git_cmd(["git", "submodule", "status", "--recursive"], cwd=str(r_path))
+    if st_code != 0:
+        raise OSError(f"Cannot read Git submodule status: {error}")
     if st_code == 0 and st_out:
         import re
         for line in st_out.splitlines():
@@ -341,6 +350,69 @@ def get_submodule_paths(repo_dir: str) -> List[str]:
 
     # Sort descending by directory depth so nested submodules appear first
     return sorted(list(dict.fromkeys(paths)), key=lambda s: len(Path(s).parts), reverse=True)
+
+def _resolve_diff_head(cwd):
+    code, head, error = run_git_cmd(["git", "rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
+    if code == 0 and head.strip():
+        return head.strip(), None
+    # An unborn branch has a symbolic HEAD whose ref does not exist. A broken
+    # object, detached HEAD or unreadable ref must never become an empty tree.
+    sym_code, branch, _ = run_git_cmd(["git", "symbolic-ref", "-q", "HEAD"], cwd=cwd)
+    if sym_code == 0 and branch.strip():
+        ref_code, _, _ = run_git_cmd(["git", "show-ref", "--verify", "--quiet", branch.strip()], cwd=cwd)
+        if ref_code == 1:
+            return None, None
+    return None, f"Cannot resolve Git HEAD: {error.strip()}"
+
+
+def _read_workspace_diff(cwd, base_rev=None, arguments=(), binary=False):
+    """Read working-tree changes using a private index and a fixed commit.
+
+    Neither review nor candidate inspection stages files into the user's index.
+    Every index construction and diff error is returned, including in submodules.
+    """
+    empty = b"" if binary else ""
+    code, inside, error = run_git_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd)
+    if code != 0 or inside.strip() != "true":
+        return empty, f"Not inside a valid git working tree ({error.strip()})"
+    head, error = _resolve_diff_head(cwd)
+    if error:
+        return empty, error
+    ref = head
+    if base_rev:
+        code, resolved, error = run_git_cmd(
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{base_rev}^{{commit}}"], cwd=cwd)
+        if code != 0 or not resolved.strip():
+            return empty, f"Cannot resolve Git diff baseline: {error.strip()}"
+        ref = resolved.strip()
+    try:
+        with tempfile.TemporaryDirectory(prefix="makewand-diff-index-") as directory:
+            token = _diff_index.set(str(Path(directory) / "index"))
+            try:
+                seed = ["git", "read-tree", head] if head else ["git", "read-tree", "--empty"]
+                code, _, error = run_git_cmd(seed, cwd=cwd)
+                if code != 0:
+                    return empty, f"git read-tree failed with exit code {code}: {error.strip()}"
+                add = ["git", "add", "-A"]
+                if ref:
+                    add.append("--intent-to-add")
+                code, _, error = run_git_cmd(add, cwd=cwd)
+                if code != 0:
+                    return empty, f"git add failed with exit code {code}: {error.strip()}"
+                command = ["git", "diff", *arguments]
+                if ref:
+                    command.append(ref)
+                else:
+                    command.extend(["--cached", "4b825dc642cb6eb9a060e54bf8d69288fbee4904"])
+                code, output, error = run_git_cmd(command, cwd=cwd, binary=binary)
+                if code != 0:
+                    return empty, f"git diff failed with exit code {code}: {error.strip()}"
+                return output, None
+            finally:
+                _diff_index.reset(token)
+    except OSError as exc:
+        return empty, f"Cannot construct private Git diff index: {exc}"
+
 
 def get_git_diff_status(cwd: str, base_rev: Optional[str] = None, sub_baselines: Optional[Dict[str, str]] = None) -> Tuple[str, Optional[str]]:
     """
@@ -352,51 +424,32 @@ def get_git_diff_status(cwd: str, base_rev: Optional[str] = None, sub_baselines:
     if not cwd:
         cwd = os.getcwd()
 
-    chk_code, _, chk_err = run_git_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd)
-    if chk_code != 0:
-        return "", f"Not inside a valid git working tree ({chk_err.strip()})"
-
-    has_head, _, _ = run_git_cmd(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd)
-    if has_head != 0 and not base_rev:
-        # Repository has no commits yet: stage untracked files and diff against empty tree hash
-        add_code, _, add_err = run_git_cmd(["git", "add", "-A"], cwd=cwd)
-        if add_code != 0:
-            return "", f"git add failed with exit code {add_code}: {add_err.strip()}"
-        ref = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-        code, diff_out, err = run_git_cmd(["git", "diff", "--cached", ref], cwd=cwd)
-    else:
-        # New files must be visible in the diff; a failed intent-to-add would hide them.
-        ita_code, _, ita_err = run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=cwd)
-        if ita_code != 0:
-            return "", f"git add --intent-to-add failed with exit code {ita_code}: {ita_err.strip()}"
-        ref = base_rev if base_rev else "HEAD"
-        code, diff_out, err = run_git_cmd(["git", "diff", ref], cwd=cwd)
-        if code != 0 and not base_rev:
-            code, diff_out, err = run_git_cmd(["git", "diff"], cwd=cwd)
-
-    if code != 0:
-        return "", f"git diff failed with exit code {code}: {err.strip()}"
+    diff_out, error = _read_workspace_diff(cwd, base_rev)
+    if error:
+        return "", error
 
     main_diff = diff_out.strip() if diff_out else ""
 
     # Recursively extract actual submodule diffs against sub_baselines
     sub_diffs = []
-    sub_paths = get_submodule_paths(cwd)
+    try:
+        sub_paths = get_submodule_paths(cwd)
+    except OSError as exc:
+        return "", str(exc)
     for sub_rel in sub_paths:
         sub_p = Path(cwd) / sub_rel
         if sub_p.exists() and (sub_p / ".git").exists():
-            run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=str(sub_p))
             sub_base = sub_baselines.get(sub_rel) if sub_baselines else None
             if not sub_base:
                 rev_code, gitlink_out, _ = run_git_cmd(["git", "rev-parse", f"HEAD:{sub_rel}"], cwd=cwd)
                 if rev_code == 0 and gitlink_out and gitlink_out.strip():
                     sub_base = gitlink_out.strip()
             sub_ref = sub_base if sub_base else "HEAD"
-            s_code, s_diff, s_err = run_git_cmd(["git", "diff", "--binary", sub_ref], cwd=str(sub_p))
-            if s_code == 0 and s_diff and s_diff.strip():
+            s_diff, s_err = _read_workspace_diff(str(sub_p), sub_ref, arguments=("--binary",))
+            if not s_err and s_diff and s_diff.strip():
                 sub_diffs.append(f"\n--- [Submodule: {sub_rel}] (diff against {sub_ref}) ---\n{s_diff.strip()}")
-            elif s_code != 0:
-                return "", f"Submodule {sub_rel} diff extraction failed with code {s_code}: {s_err.strip()}"
+            elif s_err:
+                return "", f"Submodule {sub_rel} diff extraction failed: {s_err}"
 
     full_diff = main_diff
     if sub_diffs:
@@ -405,7 +458,9 @@ def get_git_diff_status(cwd: str, base_rev: Optional[str] = None, sub_baselines:
     return full_diff.strip(), None
 
 def get_git_diff(cwd: str, base_rev: Optional[str] = None, sub_baselines: Optional[Dict[str, str]] = None) -> str:
-    diff_text, _ = get_git_diff_status(cwd, base_rev=base_rev, sub_baselines=sub_baselines)
+    diff_text, error = get_git_diff_status(cwd, base_rev=base_rev, sub_baselines=sub_baselines)
+    if error:
+        raise OSError(error)
     return diff_text
 
 
