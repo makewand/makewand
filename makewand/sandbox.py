@@ -1328,7 +1328,8 @@ def audit_unsafe_host_exec(context: str, cmd, cwd: str, source: Optional[str]) -
         audit_path = cfg_dir / UNSAFE_HOST_EXEC_AUDIT_FILE
         if audit_path.is_symlink():
             raise PermissionError("refusing symlinked host execution audit file")
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags = (os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
         fd = os.open(str(audit_path), flags, 0o600)
         try:
             info = os.fstat(fd)

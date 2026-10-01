@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -129,6 +130,32 @@ func TestApplyRecoveryCleanupUsesHeldRoot(t *testing.T) {
 	}
 	defer root.Close()
 	moved := p.Path + "-original"
+	if runtime.GOOS == "windows" {
+		// Windows holds this directory against rename while os.Root is open.
+		// Exercise that real kernel protection, cleanup through the held root,
+		// and a separate intact tree instead of requiring a POSIX rename.
+		external := p.Path + "-external"
+		if err := os.MkdirAll(filepath.Join(external, "nested"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(p.Path, moved); err == nil {
+			t.Fatal("workspace was renamed while its root handle was open")
+		}
+		removeApplyCreatedDirs(root, []string{"nested"})
+		if _, err := os.Stat(filepath.Join(p.Path, "nested")); !os.IsNotExist(err) {
+			t.Fatalf("held root's directory was not removed: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(external, "nested")); err != nil {
+			t.Fatalf("external tree changed: %v", err)
+		}
+		if err := root.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(p.Path, moved); err != nil {
+			t.Fatalf("workspace remained pinned after closing the root: %v", err)
+		}
+		return
+	}
 	if err := os.Rename(p.Path, moved); err != nil {
 		t.Fatal(err)
 	}

@@ -96,4 +96,17 @@ func TestPendingApprovalWindowsPrivateDirectoryBindsCurrentUser(t *testing.T) {
 	if err != nil || owner == nil || !owner.Equals(user.User.Sid) {
 		t.Fatalf("default group owner was not bound to current user: %v", err)
 	}
+	actual, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + user.User.Sid.String() + ")(A;OICI;FA;;;SY)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both values use the OS's canonical SID representation (an administrative
+	// user's SID can be abbreviated LA), while binding the same exact accounts.
+	if actual.String() != expected.String() {
+		t.Fatalf("private directory DACL differs: %s, want %s", actual.String(), expected.String())
+	}
 }

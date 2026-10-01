@@ -164,7 +164,7 @@ class NativeWindowsFileTests(unittest.TestCase):
         target = self.workspace / "audit.log"
         target.write_bytes(b"original")
         before = application_security(target)
-        fd = os.open(target, os.O_WRONLY | os.O_APPEND)
+        fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_BINARY)
         try:
             ensure_private_file_descriptor(fd)
             os.write(fd, b"\nentry")
@@ -175,7 +175,7 @@ class NativeWindowsFileTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"original\nentry")
         outside = self.root / "outside-hardlink.log"
         os.link(target, outside)
-        fd = os.open(target, os.O_WRONLY | os.O_APPEND)
+        fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_BINARY)
         try:
             with self.assertRaises(ValueError):
                 ensure_private_file_descriptor(fd)
@@ -298,7 +298,7 @@ class NativeWindowsCandidateTests(unittest.TestCase):
 
         def injected_copy(workspace, relative, source, expected=None, **kwargs):
             nonlocal calls
-            if Path(workspace) == self.workspace and expected is not None:
+            if os.path.samefile(workspace, self.workspace) and expected is not None:
                 calls += 1
                 if calls == 2:
                     raise OSError("injected Windows apply failure")

@@ -97,9 +97,22 @@ func TestContextCannotDropInheritedBudgetOrSwitchLedger(t *testing.T) {
 	if _, err := Reserve(other, Metadata{Engine: "synthetic", Tier: "standard"}); err == nil {
 		t.Fatal("different ledger escaped inherited budget")
 	}
-	_, cfg, err := EnsureContext(ContextWithConfig(context.Background(), Config{MaxCalls: 20}))
-	if err != nil || cfg.MaxCalls != 1 || cfg.LedgerPath != path {
+	largerContext, cfg, err := EnsureContext(ContextWithConfig(context.Background(), Config{MaxCalls: 20}))
+	if err != nil || cfg.MaxCalls != 1 {
 		t.Fatalf("larger explicit cap relaxed inheritance: %+v %v", cfg, err)
+	}
+	// EvalSymlinks expands Windows 8.3 ancestors, so preserved ledger identity
+	// must be checked on the actual file rather than its original spelling.
+	inherited, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := os.Stat(cfg.LedgerPath)
+	if err != nil || !os.SameFile(inherited, resolved) {
+		t.Fatalf("larger explicit cap switched ledger identity: %q -> %q, %v", path, cfg.LedgerPath, err)
+	}
+	if _, err := Reserve(largerContext, Metadata{Engine: "synthetic", Tier: "standard"}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("larger explicit cap admitted a call past the inherited maximum: %v", err)
 	}
 }
 

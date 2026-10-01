@@ -45,18 +45,22 @@ func applyPrivateOpenHandle(handle windows.Handle, directory bool) error {
 		}
 		access |= windows.WRITE_OWNER
 	}
-	flags := uintptr(0)
-	if directory {
-		flags = windows.FILE_FLAG_BACKUP_SEMANTICS
+	privateHandle := handle
+	if !directory {
+		// A regular database handle from os.OpenFile needs additional security
+		// rights. ReOpenFile keeps that same object; no pathname is resolved.
+		reopened, _, callErr := windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile").Call(
+			uintptr(handle), uintptr(access), uintptr(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE), 0)
+		if windows.Handle(reopened) == windows.InvalidHandle {
+			return fmt.Errorf("open fixed state file for privacy: %w", callErr)
+		}
+		privateHandle = windows.Handle(reopened)
+		defer func() { _ = windows.CloseHandle(privateHandle) }()
 	}
-	reopened, _, callErr := windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile").Call(
-		uintptr(handle), uintptr(access), uintptr(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE), flags)
-	if windows.Handle(reopened) == windows.InvalidHandle {
-		return fmt.Errorf("open fixed state object for privacy: %w", callErr)
-	}
-	defer func() { _ = windows.CloseHandle(windows.Handle(reopened)) }()
+	// Directory callers already acquired WRITE_OWNER/WRITE_DAC on their fixed,
+	// non-reparse handle while every ancestor was pinned against replacement.
 	if normalizeOwner {
-		if err := windows.SetSecurityInfo(windows.Handle(reopened), windows.SE_FILE_OBJECT,
+		if err := windows.SetSecurityInfo(privateHandle, windows.SE_FILE_OBJECT,
 			windows.OWNER_SECURITY_INFORMATION, user.User.Sid, nil, nil, nil); err != nil {
 			return fmt.Errorf("normalize authorized default owner: %w", err)
 		}
@@ -69,7 +73,7 @@ func applyPrivateOpenHandle(handle windows.Handle, directory bool) error {
 	if err != nil {
 		return err
 	}
-	return windows.SetSecurityInfo(windows.Handle(reopened), windows.SE_FILE_OBJECT,
+	return windows.SetSecurityInfo(privateHandle, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
 }
 

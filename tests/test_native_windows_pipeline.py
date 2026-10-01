@@ -186,8 +186,10 @@ class NativeWindowsPipelineTests(unittest.TestCase):
                 exported = self.root / ("patch-export-git" if git_workspace else "patch-export-plain")
                 shutil.copytree(self.workspace, exported, ignore=shutil.ignore_patterns(".git"))
                 for arguments in (("--check", "--binary"), ("--binary",)):
-                    applied = subprocess.run(["git", "apply", *arguments, str(patch)],
-                                             cwd=exported, capture_output=True, text=True)
+                    # Reviewed Git blobs preserve literal LF/CRLF bytes; Git's
+                    # global Windows checkout preference must not alter them.
+                    applied = subprocess.run(["git", "-c", "core.autocrlf=false", "apply", *arguments, str(patch)],
+                                             cwd=exported, capture_output=True, encoding="utf-8", errors="surrogateescape")
                     self.assertEqual(applied.returncode, 0, applied.stderr)
                 self.assertEqual(build_manifest(exported), candidate["manifest"])
                 ok, paths, message = CandidateManager.apply_candidate(race_id, "A")

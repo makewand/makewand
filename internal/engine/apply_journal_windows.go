@@ -17,7 +17,10 @@ func privateApplyDirectory(path string) error {
 		return err
 	}
 	defer pins.close()
-	handle, err := openApplyWindowsHandle(path, true, windows.READ_CONTROL|windows.WRITE_DAC|windows.FILE_READ_ATTRIBUTES)
+	// Obtain ownership and DACL rights on this pinned directory identity up
+	// front. ReOpenFile on an administrative-token directory can refuse the
+	// requested WRITE_OWNER even when CreateFile grants it on the fixed path.
+	handle, err := openApplyWindowsHandle(path, true, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER|windows.FILE_READ_ATTRIBUTES)
 	if err != nil {
 		return err
 	}

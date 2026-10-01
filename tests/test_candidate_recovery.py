@@ -77,7 +77,7 @@ real_write=candidate._write_private_json
 count=0
 def crash_copy(workspace,relative,source,expected=None,**kwargs):
     global count
-    application=Path(workspace)==Path({str(self.workspace)!r})
+    application=Path(workspace).samefile(Path({str(self.workspace)!r}))
     if application and expected is not None and 'preimages' not in Path(source).parts:
         count+=1
         if {during_rollback!r} and count==2:
@@ -145,12 +145,12 @@ class CrashWriter:
 def crash_fdopen(fd,mode='r',*args,**kwargs):
     stream=real_fdopen(fd,mode,*args,**kwargs)
     if mode=='wb' and (not {during_rollback!r} or rollback_started):
-        if any(path.parent==desired_parent for path in workspace.rglob('.makewand-*')):
+        if desired_parent.is_dir() and any(path.parent.samefile(desired_parent) for path in workspace.rglob('.makewand-*')):
             return CrashWriter(stream)
     return stream
 def trigger_rollback(root,relative,source,expected=None,**kwargs):
     global rollback_started,mutations
-    if Path(root)==workspace and 'preimages' not in Path(source).parts:
+    if Path(root).samefile(workspace) and 'preimages' not in Path(source).parts:
         mutations+=1
         if {during_rollback!r} and mutations==2:
             rollback_started=True
@@ -227,7 +227,7 @@ os._exit(87)
         real_copy = candidate_module._atomic_copy
         def edit_later(workspace, relative, source, expected=None, **kwargs):
             result = real_copy(workspace, relative, source, expected, **kwargs)
-            if Path(workspace) == self.workspace and relative == "a.txt" and "preimages" not in Path(source).parts:
+            if Path(workspace).samefile(self.workspace) and relative == "a.txt" and "preimages" not in Path(source).parts:
                 (self.workspace / "b.txt").write_bytes(b"later user edit\n")
             return result
         with mock.patch.object(candidate_module, "_atomic_copy", side_effect=edit_later):
@@ -242,7 +242,7 @@ os._exit(87)
         real_copy = candidate_module._atomic_copy
         def edit_later(workspace, relative, source, expected=None, **kwargs):
             result = real_copy(workspace, relative, source, expected, **kwargs)
-            if Path(workspace) == self.workspace and relative == "a.txt" and "preimages" not in Path(source).parts:
+            if Path(workspace).samefile(self.workspace) and relative == "a.txt" and "preimages" not in Path(source).parts:
                 (self.workspace / "b.txt").write_bytes(b"new unapproved edit\n")
             return result
         with mock.patch.object(candidate_module, "_atomic_copy", side_effect=edit_later):
@@ -269,7 +269,7 @@ os._exit(87)
         real_copy = candidate_module._atomic_copy
         def edit_first_after_final_copy(workspace, relative, source, expected=None, **kwargs):
             result = real_copy(workspace, relative, source, expected, **kwargs)
-            if Path(workspace) == self.workspace and relative == "new.txt":
+            if Path(workspace).samefile(self.workspace) and relative == "new.txt":
                 (self.workspace / "a.txt").write_bytes(b"user edit before commit\n")
             return result
         with mock.patch.object(candidate_module, "_atomic_copy", side_effect=edit_first_after_final_copy):
@@ -332,7 +332,7 @@ os._exit(87)
         real_copy = candidate_module._atomic_copy
         def move_after_first_copy(workspace, relative, source, expected=None, **kwargs):
             result = real_copy(workspace, relative, source, expected, **kwargs)
-            if Path(workspace) == self.workspace and relative == "a.txt" and "preimages" not in Path(source).parts:
+            if Path(workspace).samefile(self.workspace) and relative == "a.txt" and "preimages" not in Path(source).parts:
                 self.workspace.rename(moved)
                 self.workspace.mkdir()
                 (self.workspace / "a.txt").write_bytes(b"replacement workspace\n")

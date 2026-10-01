@@ -2432,9 +2432,9 @@ def _run_pipeline_impl(
                         script_lines.append(f'SUB_SHA_{idx}={sub_sha}')
                         if sp.get("sha256"):
                             script_lines.append(f'if [ "$(sha256sum "$SUB_PATCH_{idx}" | cut -d" " -f1)" != "$SUB_SHA_{idx}" ]; then echo "❌ 子模块补丁校验和不匹配 ($SUB_REL_{idx})，拒绝应用" >&2; exit 1; fi')
-                        script_lines.append(f'git -C "$REPO_ROOT/$SUB_REL_{idx}" apply --check --binary "$SUB_PATCH_{idx}"')
+                        script_lines.append(f'git -c core.autocrlf=false -C "$REPO_ROOT/$SUB_REL_{idx}" apply --check --binary "$SUB_PATCH_{idx}"')
 
-                    script_lines.append('git -C "$REPO_ROOT" apply --check --binary "$MAIN_PATCH"')
+                    script_lines.append('git -c core.autocrlf=false -C "$REPO_ROOT" apply --check --binary "$MAIN_PATCH"')
                     script_lines.append('echo "✔ 预检通过，未检测到补丁冲突。"')
                     script_lines.append("")
                     script_lines.append("# 2. Transactional application with auto-rollback on error")
@@ -2448,7 +2448,7 @@ def _run_pipeline_impl(
                     script_lines.append("    ROLLBACK_FAILED=0")
                     script_lines.append('    if [ "$MAIN_APPLIED" -eq 1 ]; then')
                     script_lines.append('        echo "  → 正在回滚主仓库改动..." >&2')
-                    script_lines.append('        if ! git -C "$REPO_ROOT" apply --reverse --binary "$MAIN_PATCH"; then')
+                    script_lines.append('        if ! git -c core.autocrlf=false -C "$REPO_ROOT" apply --reverse --binary "$MAIN_PATCH"; then')
                     script_lines.append('            echo "  ❌ 主仓库回滚失败！" >&2')
                     script_lines.append('            ROLLBACK_FAILED=1')
                     script_lines.append('        fi')
@@ -2458,7 +2458,7 @@ def _run_pipeline_impl(
                     script_lines.append('        eval "sub_rel=\\$SUB_REL_${sub_idx}"')
                     script_lines.append('        eval "sub_patch=\\$SUB_PATCH_${sub_idx}"')
                     script_lines.append('        echo "  → 正在回滚子模块改动: $sub_rel..." >&2')
-                    script_lines.append('        if ! git -C "$REPO_ROOT/$sub_rel" apply --reverse --binary "$sub_patch"; then')
+                    script_lines.append('        if ! git -c core.autocrlf=false -C "$REPO_ROOT/$sub_rel" apply --reverse --binary "$sub_patch"; then')
                     script_lines.append('            echo "  ❌ 子模块 ($sub_rel) 回滚失败！" >&2')
                     script_lines.append('            ROLLBACK_FAILED=1')
                     script_lines.append('        fi')
@@ -2475,11 +2475,11 @@ def _run_pipeline_impl(
 
                     for idx, sp in enumerate(sub_patches):
                         script_lines.append(f'printf "→ 应用子模块改动: %s...\\n" "$SUB_REL_{idx}"')
-                        script_lines.append(f'git -C "$REPO_ROOT/$SUB_REL_{idx}" apply --binary "$SUB_PATCH_{idx}"')
+                        script_lines.append(f'git -c core.autocrlf=false -C "$REPO_ROOT/$SUB_REL_{idx}" apply --binary "$SUB_PATCH_{idx}"')
                         script_lines.append(f'APPLIED_SUB_INDICES+=({idx})')
 
                     script_lines.append('printf "→ 应用主仓库改动...\\n"')
-                    script_lines.append('git -C "$REPO_ROOT" apply --binary "$MAIN_PATCH"')
+                    script_lines.append('git -c core.autocrlf=false -C "$REPO_ROOT" apply --binary "$MAIN_PATCH"')
                     script_lines.append('MAIN_APPLIED=1')
                     if protected.paths:
                         script_lines.append(protected.shell_guard(original_task_cwd, rollback_on_error=True))
@@ -2513,7 +2513,7 @@ def _run_pipeline_impl(
                     if sub_patches:
                         print(f"  子模块补丁数量: {len(sub_patches)} (清单存放在 {c(str(manifest_file), COLOR_CYAN)})")
                     print(f"  一键应用交付补丁 (推荐): {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}")
-                    print(f"  手动应用: git -C {apply_root_esc} apply {patch_file_esc}\n")
+                    print(f"  手动应用: git -c core.autocrlf=false -C {apply_root_esc} apply --binary {patch_file_esc}\n")
                 else:
                     print(f"  宿主机仓库可直接合并独立审查通过的改动: git -C {apply_root_esc} merge {impl_commit}")
                     print(f"  独立补丁备用存档: {c(str(patch_file), COLOR_CYAN)}")

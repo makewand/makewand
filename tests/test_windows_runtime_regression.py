@@ -7,7 +7,6 @@ except ImportError:
 import ctypes
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
@@ -80,6 +79,7 @@ class GitRuntimeRegressionTests(unittest.TestCase):
             git_helper.clone_isolated_worktree(str(source), shadow)
             self.repo = shadow
             self.assertEqual(self.git(["git", "show", "HEAD:protected.txt"], binary=True), protected)
+            baseline = self.git(["git", "rev-parse", "HEAD"]).strip()
             (shadow / "app.py").write_bytes(b"answer = 42\n")
             expected = orchestrator._freeze_delivery_inputs(str(shadow), workspace_snapshot(shadow))[""]
             self.git(["git", "add", "-A"])
@@ -90,6 +90,22 @@ class GitRuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(self.git(["git", "show", "HEAD:protected.txt"], binary=True), protected)
             self.assertEqual((shadow / "protected.txt").read_bytes(), protected)
             self.assertEqual((source / "protected.txt").read_bytes(), protected)
+            patch = self.git(["git", "diff", "--binary", "--full-index", baseline, commit], binary=True)
+            exported = self.root / "exported"
+            shutil.copytree(source, exported)
+            # The delivery shell script and native patch export use this exact
+            # invocation, independently of run_git_cmd's safe configuration.
+            for arguments in (("--check", "--binary"), ("--binary",)):
+                result = subprocess.run(["git", "-c", "core.autocrlf=false", "apply", *arguments, "-"],
+                                        cwd=exported, input=patch, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((exported / "app.py").read_bytes(), b"answer = 42\n")
+            self.assertEqual((exported / "protected.txt").read_bytes(), protected)
+            reversed_patch = subprocess.run(["git", "-c", "core.autocrlf=false", "apply", "--reverse", "--binary", "-"],
+                                            cwd=exported, input=patch, capture_output=True, check=False)
+            self.assertEqual(reversed_patch.returncode, 0, reversed_patch.stderr)
+            self.assertEqual((exported / "app.py").read_bytes(), b"answer = 0\n")
+            self.assertEqual((exported / "protected.txt").read_bytes(), protected)
 
 
 class HostAuditRuntimeRegressionTests(unittest.TestCase):
@@ -150,6 +166,11 @@ class HostAuditRuntimeRegressionTests(unittest.TestCase):
         advapi.GetTokenInformation.restype = wintypes.BOOL
         advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
         advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
+        advapi.GetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+                                                    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
+        advapi.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+        advapi.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+        advapi.GetAce.restype = wintypes.BOOL
         kernel.GetCurrentProcess.restype = wintypes.HANDLE
         token, sid_text = wintypes.HANDLE(), wintypes.LPWSTR()
         self.assertTrue(advapi.OpenProcessToken(kernel.GetCurrentProcess(), 8, ctypes.byref(token)))
@@ -167,6 +188,7 @@ class HostAuditRuntimeRegressionTests(unittest.TestCase):
             kernel.CloseHandle(token)
         protected = native_windows.ensure_private_file_descriptor
         captured = []
+        actual_accounts = []
 
         def protect_and_inspect(fd):
             self.assertEqual(os.fstat(fd).st_size, 0, "privacy must be set before audit bytes are appended")
@@ -178,6 +200,25 @@ class HostAuditRuntimeRegressionTests(unittest.TestCase):
                 captured.append(text.value)
             finally:
                 kernel.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+            # SDDL may render the actual user as "LA" (local Administrator).
+            # Compare the SID values in the real ACEs, preserving exact owner
+            # and SYSTEM authority rather than depending on that presentation.
+            present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+            self.assertTrue(advapi.GetSecurityDescriptorDacl(descriptor, ctypes.byref(present),
+                                                             ctypes.byref(acl), ctypes.byref(defaulted)))
+            self.assertTrue(present.value and acl.value)
+            for index in range(ctypes.c_ushort.from_address(acl.value + 4).value):
+                ace = ctypes.c_void_p()
+                self.assertTrue(advapi.GetAce(acl, index, ctypes.byref(ace)))
+                self.assertEqual(ctypes.c_ubyte.from_address(ace.value).value, 0, "ACE must allow access")
+                self.assertEqual(ctypes.c_ubyte.from_address(ace.value + 1).value, 0, "ACE must not inherit access")
+                self.assertEqual(ctypes.c_uint32.from_address(ace.value + 4).value, 0x1F01FF, "ACE must grant file full access")
+                account = wintypes.LPWSTR()
+                self.assertTrue(advapi.ConvertSidToStringSidW(ace.value + 8, ctypes.byref(account)))
+                try:
+                    actual_accounts.append(account.value)
+                finally:
+                    kernel.LocalFree(ctypes.cast(account, ctypes.c_void_p))
 
         with mock.patch.object(native_windows, "ensure_private_file_descriptor", side_effect=protect_and_inspect), \
                 mock.patch("makewand.sandbox._warn") as warning:
@@ -185,9 +226,8 @@ class HostAuditRuntimeRegressionTests(unittest.TestCase):
         warning.assert_not_called()
         self.assertEqual(len(captured), 1)
         self.assertTrue(captured[0].startswith("D:P"), captured[0])
-        accounts = re.findall(r"\(A;;FA;;;([^)]*)\)", captured[0])
-        self.assertEqual(len(accounts), 2, captured[0])
-        self.assertEqual(set(accounts), {"SY", user_sid}, captured[0])
+        self.assertEqual(len(actual_accounts), 2, captured[0])
+        self.assertEqual(set(actual_accounts), {"S-1-5-18", user_sid}, captured[0])
         record = json.loads((self.config_dir / sandbox.UNSAFE_HOST_EXEC_AUDIT_FILE).read_text(encoding="utf-8"))
         self.assertEqual(record["args"], ["中文"])
 
