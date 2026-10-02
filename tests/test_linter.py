@@ -105,3 +105,25 @@ class TestLinter(unittest.TestCase):
         ok, out = run_local_tests(self.cwd)
         self.assertFalse(ok)
         self.assertIn("Fast Syntax Gate", out)
+
+    def test_prettier_passes_no_config(self):
+        """Regression test for P1-S3: prettier must receive --no-config to avoid code execution."""
+        from unittest.mock import patch, MagicMock
+        js_file = Path(self.cwd) / "index.js"
+        js_file.write_text("const a = 1;\n", encoding="utf-8")
+
+        def mock_which(cmd):
+            if cmd == "prettier":
+                return "/usr/bin/prettier"
+            return None
+
+        with patch("shutil.which", side_effect=mock_which), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            res = auto_format_files(self.cwd, ["index.js"])
+            self.assertTrue(res.get("index.js"))
+            self.assertTrue(mock_run.called)
+            called_cmd = mock_run.call_args[0][0]
+            self.assertEqual(called_cmd[0], "prettier")
+            self.assertIn("--no-config", called_cmd)
+            self.assertIn("--write", called_cmd)

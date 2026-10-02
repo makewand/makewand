@@ -98,7 +98,7 @@ def auto_format_files(cwd: str, file_paths: Sequence[str]) -> Dict[str, bool]:
             elif shutil.which("prettier"):
                 try:
                     p = subprocess.run(
-                        ["prettier", "--write", full_path],
+                        ["prettier", "--no-config", "--write", full_path],
                         cwd=clean_cwd,
                         capture_output=True,
                         timeout=5

@@ -20,6 +20,8 @@ from makewand.providers.api_client import (
     _make_http_request,
     call_api_chat,
     DEFAULT_SYSTEM_PROMPTS,
+    apply_agentic_code_output,
+    execute_agentic_tool_batch,
 )
 
 
@@ -667,6 +669,67 @@ class TestCallApiChat(unittest.TestCase):
         ok, out, err = call_api_chat(provider="qwen", prompt="test", tier="balanced")
         self.assertTrue(ok)
         self.assertEqual(mock_req.call_args[0][2]["model"], "qwen2.5-coder-32b-instruct")
+
+
+class TestApiClientRegressions(unittest.TestCase):
+    """Regression tests for P2-1 (repo_trust priority inversion) and P2-2 (.github path safety)."""
+
+    def test_repo_trust_parent_untrusted_precedence_over_defaults(self):
+        """Regression test for P2-1: parent untrusted status must not be overridden by default trusted."""
+        from makewand.execution_contract import ExecutionRequest
+        from makewand.execution_runtime import _request_scope
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            parent_req = ExecutionRequest(
+                task_id="test-task",
+                stage="coder",
+                engine="codex",
+                repo_trust="untrusted",
+                readonly=False,
+            )
+            with _request_scope(parent_req, deadline=None):
+                # Call call_api_chat without explicit repo_trust: default is "trusted" in signature
+                # But parent.repo_trust is "untrusted", so req_trust MUST be "untrusted"
+                res = call_api_chat(
+                    provider="codex",
+                    prompt="test write",
+                    cwd=td,
+                    role="coder",
+                    readonly=False,
+                )
+                self.assertFalse(res[0])
+                self.assertIn("不可信仓库", str(res[2]))
+
+    def test_github_path_allowed_while_git_tampering_blocked(self):
+        """Regression test for P2-2: .github paths must be allowed while .git tampering is blocked."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            # 1. .github workflow file should succeed
+            github_output = "```filepath: .github/workflows/ci.yml\nname: CI\n```"
+            mod_files = apply_agentic_code_output(github_output, td, repo_trust="trusted")
+            self.assertIn(".github/workflows/ci.yml", mod_files)
+            self.assertTrue((Path(td) / ".github" / "workflows" / "ci.yml").exists())
+
+            # 2. .git directory tampering must be rejected
+            git_output = "```filepath: .git/config\n[core]\nrepositoryformatversion = 0\n```"
+            mod_git = apply_agentic_code_output(git_output, td, repo_trust="trusted")
+            self.assertEqual(mod_git, [])
+            self.assertFalse((Path(td) / ".git" / "config").exists())
+
+            # 3. execute_agentic_tool_batch allows .github and blocks .git
+            tools = [
+                {"action": "write_file", "path": ".github/dependabot.yml", "content": "version: 2"},
+                {"action": "write_file", "path": ".git/hooks/pre-commit", "content": "#!/bin/sh"},
+            ]
+            batch_res = execute_agentic_tool_batch(tools, td)
+            self.assertEqual(batch_res[0]["status"], "ok")
+            self.assertEqual(batch_res[1]["status"], "error")
+            self.assertIn("unsafe", batch_res[1]["error"].lower())
+            self.assertTrue((Path(td) / ".github" / "dependabot.yml").exists())
+            self.assertFalse((Path(td) / ".git" / "hooks" / "pre-commit").exists())
 
 
 if __name__ == "__main__":

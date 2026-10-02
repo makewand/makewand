@@ -135,8 +135,8 @@ SAFE_HOME_BIN_DIRS = [
 # empty form is equivalent to "absent" (empty CLAUDE.md, "{}" settings, empty
 # directory) we first create that empty placeholder on the host and then mount
 # it read-only. Paths whose empty form is NOT known to be equivalent to absence
-# (e.g. codex AGENTS.override.md, which would shadow AGENTS.md) are only
-# protected when they already exist.
+# (e.g. codex AGENTS.override.md, which would shadow AGENTS.md) are masked with
+# /dev/null or empty tmpfs inside the sandbox without host placeholder creation.
 #
 # "ephemeral" entries are live per-session IPC / execution state of concurrently
 # running host sessions (shell snapshots that host sessions source, session
@@ -703,6 +703,10 @@ def _provider_mounts(
                 continue
             if not os.path.lexists(p):
                 if placeholder is None:
+                    if kind == "file":
+                        args.extend(["--ro-bind", "/dev/null", p])
+                    elif kind == "dir":
+                        args.extend(["--tmpfs", p])
                     continue
                 _create_placeholder(p, kind, placeholder)
             args.extend(["--ro-bind", p, p])

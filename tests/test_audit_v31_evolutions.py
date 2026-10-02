@@ -280,6 +280,58 @@ class TestCmdCleanEnhancement(unittest.TestCase):
                     mock_exit.assert_called_with(0)
                     self.assertFalse(os.path.lexists(broken_link))
 
+    def test_cmd_clean_cache_roots_symlink_does_not_delete_target(self):
+        """Regression test for P1-S1: cache_roots symlink to external dir must be unlinked without deleting target."""
+        with tempfile.TemporaryDirectory() as td:
+            external_dir = os.path.join(td, "external_user_files")
+            os.makedirs(external_dir, exist_ok=True)
+            sentinel_file = os.path.join(external_dir, "important_data.txt")
+            with open(sentinel_file, "w") as f:
+                f.write("critical host data")
+
+            cache_base = os.path.join(td, "cache")
+            os.makedirs(cache_base, exist_ok=True)
+            symlink_cache = os.path.join(cache_base, "makewand")
+            os.symlink(external_dir, symlink_cache)
+            self.assertTrue(os.path.islink(symlink_cache))
+
+            mock_args = MagicMock()
+            mock_args.all = True
+
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache_base, "MAKEWAND_TEST_ISOLATION_ROOT": ""}):
+                with patch("glob.glob", return_value=[]):
+                    with patch("sys.exit") as mock_exit:
+                        cmd_clean(mock_args)
+                        mock_exit.assert_called_with(0)
+
+            # The symlink itself must have been unlinked
+            self.assertFalse(os.path.lexists(symlink_cache))
+            # The target directory and its contents must remain completely intact!
+            self.assertTrue(os.path.exists(sentinel_file))
+            with open(sentinel_file, "r") as f:
+                self.assertEqual(f.read(), "critical host data")
+
+    def test_cmd_clean_cache_roots_broken_symlink_is_safely_unlinked(self):
+        """Regression test for P1-S1: broken symlinks in cache_roots must be unlinked safely."""
+        with tempfile.TemporaryDirectory() as td:
+            cache_base = os.path.join(td, "cache")
+            os.makedirs(cache_base, exist_ok=True)
+            broken_symlink = os.path.join(cache_base, "makewand")
+            os.symlink(os.path.join(td, "nonexistent_target"), broken_symlink)
+            self.assertTrue(os.path.islink(broken_symlink))
+            self.assertFalse(os.path.exists(broken_symlink))
+
+            mock_args = MagicMock()
+            mock_args.all = True
+
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache_base, "MAKEWAND_TEST_ISOLATION_ROOT": ""}):
+                with patch("glob.glob", return_value=[]):
+                    with patch("sys.exit") as mock_exit:
+                        cmd_clean(mock_args)
+                        mock_exit.assert_called_with(0)
+
+            self.assertFalse(os.path.lexists(broken_symlink))
+
 
 if __name__ == "__main__":
     unittest.main()

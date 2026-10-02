@@ -909,6 +909,13 @@ def cmd_clean(args):
             cache_roots.append(Path(iso_root).expanduser() / ".cache" / "trio")
 
         for c_dir in cache_roots:
+            if c_dir.is_symlink():
+                try:
+                    c_dir.unlink()
+                    removed_count += 1
+                except Exception:
+                    pass
+                continue
             if c_dir.exists() and c_dir.is_dir():
                 for item in c_dir.iterdir():
                     try:

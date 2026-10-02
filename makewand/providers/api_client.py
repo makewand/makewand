@@ -62,7 +62,7 @@ def apply_agentic_code_output(output: str, cwd: str, repo_trust: str = "trusted"
             return None
         norm = os.path.normpath(p)
         parts = Path(norm).parts
-        if ".." in parts or any(part.startswith(".git") for part in parts):
+        if ".." in parts or any(part.lower() == ".git" for part in parts):
             return None
         full = os.path.realpath(os.path.abspath(os.path.join(clean_cwd, norm)))
         if not full.startswith(clean_cwd + os.sep) and full != clean_cwd:
@@ -201,7 +201,7 @@ def execute_agentic_tool_batch(
             return None
         norm = os.path.normpath(p)
         parts = Path(norm).parts
-        if ".." in parts or any(part.startswith(".git") for part in parts):
+        if ".." in parts or any(part.lower() == ".git" for part in parts):
             return None
         full = os.path.realpath(os.path.abspath(os.path.join(clean_cwd, norm)))
         if not full.startswith(clean_cwd + os.sep) and full != clean_cwd:
@@ -760,12 +760,26 @@ def call_api_chat(*args, **kwargs):
     from makewand.config import get_api_policy, is_api_allowed, api_policy_error, normalize_provider_name
 
     arguments = _API_SIGNATURE.bind(*args, **kwargs)
+    explicit_args = dict(arguments.arguments)
     arguments.apply_defaults()
     options = dict(arguments.arguments)
     context = current_context()
     parent = context.get("_request")
-    req_trust = options.get("repo_trust") or (parent.repo_trust if parent else context.get("repo_trust", "trusted"))
-    readonly = (parent.readonly if parent else context.get("readonly", False)) or options.get("readonly", False) or options["role"] == "reviewer"
+    parent_trust = parent.get("repo_trust") if isinstance(parent, dict) else (getattr(parent, "repo_trust", None) if parent is not None else context.get("repo_trust"))
+    parent_ro = parent.get("readonly", False) if isinstance(parent, dict) else (getattr(parent, "readonly", False) if parent is not None else context.get("readonly", False))
+    if parent_trust == "untrusted":
+        req_trust = "untrusted"
+    elif "repo_trust" in explicit_args and explicit_args["repo_trust"] is not None:
+        req_trust = explicit_args["repo_trust"]
+    else:
+        req_trust = parent_trust or options.get("repo_trust", "trusted")
+    readonly = (
+        parent_ro
+        or options.get("readonly", False)
+        or options["role"] == "reviewer"
+        or (parent is not None and getattr(parent, "stage", None) in ("review", "judge", "audit"))
+        or (context.get("stage") in ("review", "judge", "audit"))
+    )
     if readonly:
         options["role"] = "reviewer"
     options["readonly"] = readonly

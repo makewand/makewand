@@ -243,6 +243,25 @@ class TestSandbox(unittest.TestCase):
             res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f"rlimits test failed: {res.stderr}")
 
+    def test_sandbox_codex_uncreated_override_masked_with_dev_null(self):
+        """Regression test for P1-S2: AGENTS.override.md must be masked with /dev/null if not present on host."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_codex = fake_home / ".codex"
+            fake_codex.mkdir(parents=True)
+            ws = Path(tmpdir) / "ws"
+            ws.mkdir()
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), is_provider=True, provider_name="codex")
+
+            override_path = str(fake_codex / "AGENTS.override.md")
+            # Must contain --ro-bind /dev/null <override_path>
+            ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
+            ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
+            self.assertIn(("/dev/null", override_path), ro_bind_pairs)
+
 
 if __name__ == "__main__":
     unittest.main()
