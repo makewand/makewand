@@ -217,6 +217,7 @@ def execute_task_dag(
     architect_engine: Optional[str] = None,
     worker_engine: Optional[str] = None,
     local_only: bool = False,
+    effort: Optional[str] = None,
 ) -> Tuple[bool, str, List[Dict[str, Any]]]:
     """
     Executes a TaskDAG in topological stages with optional Architect-Worker tiered dispatch.
@@ -283,6 +284,7 @@ def execute_task_dag(
                 task_prompt,
                 cwd=cwd,
                 tier=task_tier,
+                effort=effort,
                 forced_engine=task_forced_engine,
                 stream=stream,
                 auto_fix=auto_fix,

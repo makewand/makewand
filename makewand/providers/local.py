@@ -150,6 +150,12 @@ def execute_local_task(
     from makewand.workflow import provider_outcome
     from makewand.config import COLOR_YELLOW, is_provider_enabled
 
+    # Untrusted repo enforcement
+    if repo_trust == "untrusted":
+        allow_network = False
+        if not readonly:
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务"
+
     if not is_provider_enabled("local"):
         return False, None, "本地大模型 (Local AI) 当前已被用户在配置中手动禁用。运行 'makewand enable local' 重新开启"
 
@@ -195,7 +201,9 @@ def execute_local_task(
             cwd=cwd,
             role=role,
             print_prefix=c(f"[Local AI ({active_model}) Live]", COLOR_GREEN + COLOR_BOLD) if stream else "",
-            extra_params=extra_params
+            extra_params=extra_params,
+            repo_trust=repo_trust,
+            readonly=readonly,
         )
 
         return provider_outcome(result)

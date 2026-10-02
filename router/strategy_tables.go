@@ -295,6 +295,18 @@ func (t *strategyTables) mergeOverrides(raw rawDefaults) error {
 		t.costs[id] = entry
 	}
 
+	// Ensure any newly added model IDs in models have a fallback zero cost entry
+	// if not explicitly defined in costs or built-in defaults.
+	for _, tiers := range t.models {
+		for _, modelID := range tiers {
+			if modelID != "" {
+				if _, ok := t.costs[modelID]; !ok {
+					t.costs[modelID] = costEntry{Input: 0, Output: 0}
+				}
+			}
+		}
+	}
+
 	// Strategies: field-level merge per (mode, task). Overriding only the
 	// providers keeps the existing tier, and vice versa.
 	for modeName, tasks := range raw.Strategies {

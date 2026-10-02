@@ -46,16 +46,18 @@ class TestRoutingSync(unittest.TestCase):
                 self.assertIn("mid", tiers)
                 self.assertIn("premium", tiers)
 
-            # Crucial Go router invariant: every model ID in models must have a costs entry
+            # Pricing table protection: unconfigured models must NOT be populated with 0.0
+            # so the Go router's built-in benchmark price table is preserved.
             for prov, tiers in models.items():
                 for tier, model_id in tiers.items():
-                    if model_id:
-                        self.assertIn(model_id, costs, f"Model {model_id} for {prov}/{tier} missing from costs")
+                    if model_id and model_id in costs:
                         cost = costs[model_id]
                         self.assertIn("input", cost)
                         self.assertIn("output", cost)
                         self.assertIsInstance(cost["input"], (int, float))
                         self.assertIsInstance(cost["output"], (int, float))
+            # In an unconfigured environment, unconfigured model IDs should not be forced to 0.0
+            self.assertEqual(len(costs), 0)
 
     def test_export_routing_overrides_preserves_custom_tables(self):
         """Verify existing user-configured strategies and costs are preserved."""

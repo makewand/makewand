@@ -33,7 +33,8 @@ def provider_outcome(value):
           or re.match(r"^\[Errno (?:32|104)\]", error)
           or error.startswith(("Network/URL Error:", "Execution Exception:", "JSON parse error:", "Truncated stream:", "Stream ended without terminal event:"))):
         status = "UNKNOWN"
-    elif ("Bubblewrap" in error or "bwrap" in error or "沙箱构建失败" in error) and ("拒绝执行" in error or "未检测到" in error):
+    elif (("Bubblewrap" in error or "bwrap" in error or "沙箱构建失败" in error or "不可信仓库" in error)
+          and ("拒绝执行" in error or "未检测到" in error or "禁止执行" in error)):
         status = "SANDBOX_UNAVAILABLE"
     return ExecutionResult(False, value[1], str(error), status=status, outcome_known=status in ("FAILED", "SANDBOX_UNAVAILABLE")) if status else value
 

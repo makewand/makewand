@@ -118,14 +118,14 @@ def execute_muse_task(
         if has_api_configured("muse"):
             import sys
             print(c("[Makewand -> Muse] (纯 API 模式) 派发任务至 Meta API...", COLOR_PURPLE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, "未找到 Muse CLI 订阅，且未配置 META_API_KEY"
 
     if cache.get("muse", {}).get("status") in ["limited", "needs_auth"]:
         if has_api_configured("muse"):
             import sys
             print(c("[Makewand -> Muse] 订阅不可用或受限，无缝自动降级为 Meta API 模式接力执行...", COLOR_PURPLE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Muse Code 当前不可用: {cache['muse'].get('reason')} (可配置 META_API_KEY 作为备用 API 自动接力)"
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
@@ -222,7 +222,7 @@ def execute_muse_task(
         if has_api_configured("muse"):
             import sys
             print(c(f"[Makewand -> Muse] 订阅触发限流 ({reason})，无缝切换为 Meta API Key 模式接力执行...", COLOR_PURPLE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Muse Code 执行中检测到限制: {reason} (可配置 META_API_KEY 实现自动接力)"
 
     return model_process_failure("muse", code, combined, err, ex, readonly)

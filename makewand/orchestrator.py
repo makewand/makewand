@@ -425,7 +425,8 @@ def dispatch_task(
             from makewand.providers.api_client import call_api_chat
             return provider_outcome(call_api_chat(provider=engine, prompt=provider_prompt, cwd=cwd,
                                  timeout=effective_timeout, tier=tier, model=model,
-                                 stream=stream, role="reviewer" if readonly else "coder"))
+                                 stream=stream, role="reviewer" if readonly else "coder",
+                                 repo_trust=repo_trust, readonly=readonly))
         options = dict(cwd=cwd, timeout=effective_timeout, tier=tier, model=model,
                        stream=stream, readonly=readonly, repo_root=repo_root,
                        repo_trust=repo_trust, allow_network=allow_network)
@@ -580,6 +581,7 @@ def _run_pipeline_impl(
     cwd: Optional[str] = None,
     tier: str = "auto",
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     stream: bool = False,
     auto_fix: bool = True,
     max_fix: int = 2,
@@ -777,7 +779,7 @@ def _run_pipeline_impl(
                 return False
             result = _stage_call("review", dispatch_task,
                 eng, prompt, cwd=cwd, timeout=step_timeout, tier=tier,
-                model=model, stream=stream, readonly=True, repo_trust=repo_trust
+                model=model, effort=effort, stream=stream, readonly=True, repo_trust=repo_trust
             )
             ok, out, err = result
             if _outcome is not None and not ok:
@@ -935,7 +937,7 @@ def _run_pipeline_impl(
 
         print(c(f"→ 派发代码编写与实现任务给 {eng.upper()} (Tier: {tier})...", COLOR_BLUE + COLOR_BOLD))
         result = _stage_call("implementation", dispatch_task, eng, coder_prompt, engine=eng,
-                             cwd=cwd, timeout=step_timeout, tier=tier, model=model, stream=stream,
+                             cwd=cwd, timeout=step_timeout, tier=tier, model=model, effort=effort, stream=stream,
                              readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
         success, out, err = result
         if not protection_check():
@@ -1067,7 +1069,7 @@ def _run_pipeline_impl(
         print(c(f"→ 派发给 {r_eng.upper()} {rev_mode_str}...", COLOR_CYAN + COLOR_BOLD))
         curr_prompt = ("【单工具自审要求】当前为单工具自审闭环模式，请务必完全转换角色为严苛的代码审计员，对以上代码修改持最高怀疑态度，进行无情审查与边界挑刺：\n" + review_prompt) if is_self_review else review_prompt
         res = _stage_call("review", dispatch_task, r_eng, curr_prompt, engine=r_eng,
-                          cwd=cwd, timeout=step_timeout, tier="deep", stream=stream,
+                          cwd=cwd, timeout=step_timeout, tier="deep", effort=effort, stream=stream,
                           readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
         if _outcome is not None and not res[0]:
             _outcome.update(status=getattr(res, "status", "UNVERIFIED"), error=res[2])
@@ -1135,7 +1137,7 @@ def _run_pipeline_impl(
             step_timeout = get_remaining_timeout(timeout)
             if coder_engine and step_timeout > 0:
                 print(c(f"→ 由主力编码引擎 {coder_engine.upper()} 执行缺陷修复...", COLOR_YELLOW))
-                fix_result = _stage_call("repair", dispatch_task, coder_engine, fix_prompt, engine=coder_engine, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                fix_result = _stage_call("repair", dispatch_task, coder_engine, fix_prompt, engine=coder_engine, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
                 ok, _, _ = fix_result
                 if not protection_check():
                     return False
@@ -1152,7 +1154,7 @@ def _run_pipeline_impl(
                         if step_timeout <= 0:
                             break
                         print(c(f"→ 自动切换备用引擎 {alt_c.upper()} 执行修复...", COLOR_YELLOW))
-                        fix_result = _stage_call("repair", dispatch_task, alt_c, fix_prompt, engine=alt_c, cwd=cwd, timeout=step_timeout, tier=tier, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                        fix_result = _stage_call("repair", dispatch_task, alt_c, fix_prompt, engine=alt_c, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
                         ok, _, _ = fix_result
                         if not protection_check():
                             return False
@@ -1265,7 +1267,7 @@ def _run_pipeline_impl(
                 rev_mode_str = "进行独立沙箱自审与边界复审 (单工具自审闭环)" if is_self_re_review else f"进行第 {current_fix_iter} 轮独立跨模型红队复审 (Tier: deep, 只读隔离)"
                 print(c(f"→ 派发给 {alt_r.upper()} {rev_mode_str}...", COLOR_CYAN))
                 curr_re_prompt = ("【单工具自审要求】当前为单工具自审闭环模式，请务必完全转换角色为严苛的代码审计员，对以上修复后的代码持最高怀疑态度，进行无情审查与边界挑刺：\n" + re_review_prompt) if is_self_re_review else re_review_prompt
-                res = _stage_call("review", dispatch_task, alt_r, curr_re_prompt, engine=alt_r, cwd=cwd, timeout=step_timeout, tier="deep", stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                res = _stage_call("review", dispatch_task, alt_r, curr_re_prompt, engine=alt_r, cwd=cwd, timeout=step_timeout, tier="deep", effort=effort, stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
                 if isinstance(res, (tuple, list)) and len(res) == 3:
                     ok, out, _ = res[0], res[1], res[2]
                 else:
@@ -1691,6 +1693,7 @@ def run_pipeline(*args, **kwargs) -> bool:
                         repo_trust=bound.arguments["repo_trust"], risk="high" if plan.risk == "high" else "auto",
                         engine_a=bound.arguments["forced_engine"], judge_reserve_seconds=judge_reserve_seconds,
                         tier="deep" if bound.arguments["boost"] else bound.arguments["tier"],
+                        effort=bound.arguments.get("effort"),
                         **({"protected_paths": bound.arguments["protected_paths"]}
                            if bound.arguments["protected_paths"] is not None else {}))
         return code == EXIT_PASSED
@@ -1739,7 +1742,7 @@ def run_workflow(prompt, **kwargs):
 
 
 def run_review(cwd=None, stream=False, timeout=300, user_prompt=None, output_json=False,
-               repo_trust="trusted", local_only=False, base_rev=None):
+               repo_trust="trusted", local_only=False, base_rev=None, effort=None):
     from makewand.execution_runtime import execution_context, task_id
     from makewand.execution_contract import ExecutionResult, STATUS_CODES
     from makewand.workflow import remember_result
@@ -1747,7 +1750,7 @@ def run_review(cwd=None, stream=False, timeout=300, user_prompt=None, output_jso
     deadline = _deadline(timeout)
     with execution_context(deadline_unix_ms=deadline, workflow="review", readonly=True):
         with stage("review", readonly=True) as span:
-            code = _run_review_impl(cwd, stream, timeout, user_prompt, output_json, repo_trust, local_only, base_rev)
+            code = _run_review_impl(cwd, stream, timeout, user_prompt, output_json, repo_trust, local_only, base_rev, effort=effort)
             status = next((name for name, value in STATUS_CODES.items() if value == code), "UNKNOWN")
             remember_result(ExecutionResult(status == "PASSED", None, None, status=status,
                             task_id=task_id(), stage="review", engine="orchestrator", readonly=True))
@@ -1755,7 +1758,7 @@ def run_review(cwd=None, stream=False, timeout=300, user_prompt=None, output_jso
             return code
 
 
-def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted", local_only: bool = False, base_rev: Optional[str] = None) -> int:
+def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted", local_only: bool = False, base_rev: Optional[str] = None, effort: Optional[str] = None) -> int:
     from makewand.execution_runtime import current_context
     from makewand.execution_contract import EXIT_TIMEOUT
     def timed_out():
@@ -1858,7 +1861,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         attempted.append(eng)
         if not output_json:
             print(c(banner, color))
-        result = dispatch_task(eng, prompt, cwd=cwd, timeout=timeout, tier="deep",
+        result = dispatch_task(eng, prompt, cwd=cwd, timeout=timeout, tier="deep", effort=effort,
                                stream=stream and not output_json, readonly=True, repo_trust=repo_trust)
         success, out, err = result
         if success and out and out.strip():
@@ -1938,14 +1941,14 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
 
 
 def review_saved_hybrid(race_id, stream=False, timeout=300, output_json=False,
-                        repo_trust="trusted", local_only=False):
+                        repo_trust="trusted", local_only=False, effort=None):
     from makewand.execution_runtime import execution_context, task_id
     from makewand.execution_contract import ExecutionResult, STATUS_CODES
     from makewand.workflow import remember_result
     from makewand.telemetry import stage
     with execution_context(deadline_unix_ms=_deadline(timeout), workflow="review", readonly=True):
         with stage("review", readonly=True) as span:
-            code = _review_saved_hybrid_impl(race_id, stream, timeout, output_json, repo_trust, local_only)
+            code = _review_saved_hybrid_impl(race_id, stream, timeout, output_json, repo_trust, local_only, effort=effort)
             status = next((name for name, value in STATUS_CODES.items() if value == code), "UNKNOWN")
             remember_result(ExecutionResult(status == "PASSED", None, None, status=status,
                 task_id=task_id(), stage="review", engine="orchestrator", readonly=True))
@@ -1955,7 +1958,7 @@ def review_saved_hybrid(race_id, stream=False, timeout=300, output_json=False,
 
 def _review_saved_hybrid_impl(race_id: str, stream: bool = False, timeout: int = 300,
                         output_json: bool = False, repo_trust: str = "trusted",
-                        local_only: bool = False) -> int:
+                        local_only: bool = False, effort: Optional[str] = None) -> int:
     """Approve only the same sealed, tested artifact independently reviewed."""
     import contextlib
     import io
@@ -1989,7 +1992,7 @@ def _review_saved_hybrid_impl(race_id: str, stream: bool = False, timeout: int =
             with contextlib.redirect_stdout(captured):
                 code = run_review(cwd=str(path), stream=False, timeout=timeout,
                                   output_json=True, repo_trust=repo_trust, local_only=local_only,
-                                  base_rev=hybrid.get("baseline_commit"))
+                                  base_rev=hybrid.get("baseline_commit"), effort=effort)
             try:
                 report = json.loads(captured.getvalue())
                 if not isinstance(report, dict):
@@ -2031,7 +2034,7 @@ def _review_saved_hybrid_impl(race_id: str, stream: bool = False, timeout: int =
 
 def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
              engine_b=None, synthesize_hybrid=False, *, total_timeout=None,
-             judge_reserve_seconds=None, risk="auto", tier="standard", protected_paths=None):
+             judge_reserve_seconds=None, risk="auto", tier="standard", protected_paths=None, effort=None):
     """Reserve adjudication capacity and time before either contestant starts."""
     from makewand.workflow import choose_workflow, judge_reserve, remember_result
     from makewand.execution_runtime import execution_context, task_id
@@ -2059,6 +2062,7 @@ def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
                 code = _run_race_impl(prompt, cwd=cwd, timeout=total, repo_trust=repo_trust,
                     engine_a=engine_a, engine_b=engine_b, synthesize_hybrid=synthesize_hybrid,
                     _leases=tuple(leases), judge_reserve_seconds=reserve_seconds, tier=tier,
+                    effort=effort,
                     **({"protected_paths": protected_paths} if protected_paths is not None else {}))
                 status = next((name for name, value in STATUS_CODES.items() if value == code), "UNKNOWN")
                 from makewand.execution_runtime import current_context
@@ -2100,6 +2104,7 @@ def _run_race_impl(
     judge_reserve_seconds=0,
     tier="standard",
     protected_paths=None,
+    effort: Optional[str] = None,
 ):
     race_deadline = time.monotonic() + max(0, timeout)
     from makewand.execution_runtime import current_context, execution_context, task_id
@@ -2274,7 +2279,7 @@ def _run_race_impl(
                                    workflow="race", risk=parent_context.get("risk"), lease_id=lease):
                 result = _stage_call("implementation", dispatch_task,
                     engine, full_p, engine=engine, cwd=str(wt), timeout=step_timeout,
-                    tier=tier, repo_root=cwd, repo_trust=repo_trust)
+                    tier=tier, effort=effort, repo_root=cwd, repo_trust=repo_trust)
                 ok, out, err = result
                 protected.verify(wt)
                 protected.verify(cwd)
@@ -2403,7 +2408,7 @@ def _run_race_impl(
             print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
             with execution_context(lease_id=_leases[2]):
                 judge_result = _stage_call("judge", dispatch_task,
-                    "agy", judge_prompt, engine="agy", cwd=cwd, tier="deep", timeout=judge_timeout,
+                    "agy", judge_prompt, engine="agy", cwd=cwd, tier="deep", effort=effort, timeout=judge_timeout,
                     readonly=True, repo_root=cwd, repo_trust=repo_trust)
                 ok, judge_report, _ = judge_result
                 judge_status = getattr(judge_result, "status", "PASSED" if ok else "FAILED")
@@ -2412,7 +2417,7 @@ def _run_race_impl(
             with execution_context(lease_id=_leases[2]):
                 judge_result = _stage_call("judge", dispatch_task,
                     judge_engine, judge_prompt, engine=judge_engine, cwd=cwd, timeout=judge_timeout,
-                    tier="deep", readonly=True, repo_root=cwd, repo_trust=repo_trust)
+                    tier="deep", effort=effort, readonly=True, repo_root=cwd, repo_trust=repo_trust)
                 ok, judge_report, _ = judge_result
                 judge_status = getattr(judge_result, "status", "PASSED" if ok else "FAILED")
         if judge_report:

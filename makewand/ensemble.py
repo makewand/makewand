@@ -24,6 +24,7 @@ from makewand.review_verdict import extract_review_verdict_dict
 
 
 FRONTIER_ENSEMBLE_PROVIDERS: List[str] = ["claude", "codex", "agy", "muse", "grok"]
+ALL_ENSEMBLE_PROVIDERS: List[str] = ["claude", "codex", "agy", "muse", "grok", "local"]
 
 
 def resolve_ensemble_providers(
@@ -39,12 +40,19 @@ def resolve_ensemble_providers(
 
     if requested:
         if isinstance(requested, str):
-            if requested.strip().lower() in ("all", "frontier", "default"):
+            req_parts = [p.strip().lower() for p in requested.split(",") if p.strip()]
+            if "all" in req_parts:
+                candidates = list(ALL_ENSEMBLE_PROVIDERS)
+            elif requested.strip().lower() in ("frontier", "default"):
                 candidates = list(FRONTIER_ENSEMBLE_PROVIDERS)
             else:
-                candidates = [p.strip().lower() for p in requested.split(",") if p.strip()]
+                candidates = req_parts
         else:
-            candidates = [str(p).strip().lower() for p in requested if str(p).strip()]
+            req_parts = [str(p).strip().lower() for p in requested if str(p).strip()]
+            if "all" in req_parts:
+                candidates = list(ALL_ENSEMBLE_PROVIDERS)
+            else:
+                candidates = req_parts
     else:
         candidates = list(FRONTIER_ENSEMBLE_PROVIDERS)
 
@@ -56,8 +64,16 @@ def resolve_ensemble_providers(
     for p in candidates:
         if not is_provider_enabled(p):
             continue
+        if p in ("local", "ollama"):
+            from makewand.providers.local import is_local_model_available
+            avail, _, _ = is_local_model_available()
+            if not avail:
+                continue
+            if p not in selected:
+                selected.append(p)
+            continue
         # Check if subscription or API is available
-        if has_subscription_configured(p) or has_api_configured(p) or p in ("local", "ollama"):
+        if has_subscription_configured(p) or has_api_configured(p):
             # Check if limited
             p_status = cache.get(p, {}).get("status")
             if p_status != "limited" or has_api_configured(p):
@@ -205,10 +221,12 @@ def run_ensemble(
 
     def _invoke_single_expert(prov: str) -> Tuple[str, bool, Optional[str], Optional[str], float, str]:
         start = time.time()
-        # Resolve exact display model name
+        # Resolve exact display model name and target model ID
+        resolved_model = None
         try:
             m_info = get_provider_model_tier(prov, tier)
-            model_display = f"{prov.upper()} ({m_info.get('model') or 'default'})"
+            resolved_model = m_info.get("model")
+            model_display = f"{prov.upper()} ({resolved_model or 'default'})"
         except Exception:
             model_display = prov.upper()
 
@@ -220,6 +238,7 @@ def run_ensemble(
             cwd=work_dir,
             timeout=timeout,
             tier=tier,
+            model=resolved_model,
             effort=effort_str,
             readonly=True,
             repo_trust=repo_trust,

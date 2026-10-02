@@ -114,7 +114,7 @@ def execute_agy_task(
         if has_api_configured("agy"):
             import sys
             print(c("[Makewand -> Antigravity] (纯 API 模式) 派发任务至 Google Gemini API...", COLOR_GREEN), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, "未找到 agy CLI 订阅，且未配置 GEMINI_API_KEY"
 
     cache = load_status_cache()
@@ -122,7 +122,7 @@ def execute_agy_task(
         if has_api_configured("agy"):
             import sys
             print(c("[Makewand -> Antigravity] 订阅当前受限，无缝自动降级为 Gemini API 模式接力执行...", COLOR_GREEN), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Antigravity 当前不可用: {cache['agy'].get('reason')} (可配置 GEMINI_API_KEY 作为备用 API 自动接力)"
 
     # Fail-closed enforcement: if writable, sandbox is mandatory
@@ -222,6 +222,6 @@ def execute_agy_task(
         if has_api_configured("agy"):
             import sys
             print(c(f"[Makewand -> Antigravity] 订阅触发配额限制 ({reason})，无缝切换为 Gemini API Key 模式接力执行...", COLOR_GREEN), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Antigravity 配额受限: {reason} (可配置 GEMINI_API_KEY 实现自动接力)"
     return model_process_failure("agy", code, combined, err, ex, readonly)

@@ -96,14 +96,14 @@ def execute_grok_task(
         if has_api_configured("grok"):
             import sys
             print(c("[Makewand -> Grok] (纯 API 模式) 派发任务至 xAI API...", COLOR_YELLOW), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, "未找到 Grok Build CLI 订阅，且未配置 XAI_API_KEY"
 
     if cache.get("grok", {}).get("status") in ["limited", "needs_auth"]:
         if has_api_configured("grok"):
             import sys
             print(c("[Makewand -> Grok] 订阅当前受限，无缝自动降级为 xAI API 模式接力执行...", COLOR_YELLOW), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Grok Build 当前不可用: {cache['grok'].get('reason')} (可配置 XAI_API_KEY 作为备用 API 自动接力)"
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
@@ -192,7 +192,7 @@ def execute_grok_task(
         if has_api_configured("grok"):
             import sys
             print(c(f"[Makewand -> Grok] 订阅触发限制 ({reason})，无缝切换为 xAI API Key 模式接力执行...", COLOR_YELLOW), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="grok", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Grok Build 执行中检测到限制: {reason} (可配置 XAI_API_KEY 实现自动接力)"
 
     return model_process_failure("grok", code, combined, err, ex, readonly)

@@ -574,6 +574,7 @@ def cmd_plan(args):
             dag,
             cwd=cwd,
             tier=tier,
+            effort=getattr(args, "effort", None),
             repo_trust=repo_trust,
             tiered=getattr(args, "tiered", False),
             architect_engine=getattr(args, "architect", None),
@@ -864,28 +865,70 @@ def cmd_ensemble(args):
 def cmd_clean(args):
     import glob
     import shutil
+    from pathlib import Path
     patterns = [
         "/tmp/makewand-restore-*",
         "/tmp/makewand-drill-*",
         "/tmp/makewand-agy-*",
         "/tmp/makewand-muse-*",
     ]
+    if getattr(args, "all", False):
+        patterns.append("/tmp/makewand-test-isolation-*")
+
     removed_count = 0
     freed_bytes = 0
     for pat in patterns:
         for path in glob.glob(pat):
             try:
-                size = sum(os.path.getsize(os.path.join(dirpath, filename))
-                           for dirpath, dirnames, filenames in os.walk(path)
-                           for filename in filenames) if os.path.isdir(path) else os.path.getsize(path)
-                if os.path.isdir(path):
+                is_link = os.path.islink(path)
+                if is_link:
+                    size = 0
+                    os.unlink(path)
+                elif os.path.isdir(path):
+                    size = sum(os.path.getsize(os.path.join(dirpath, filename))
+                               for dirpath, dirnames, filenames in os.walk(path)
+                               for filename in filenames)
                     shutil.rmtree(path, ignore_errors=True)
                 else:
+                    size = os.path.getsize(path)
                     os.remove(path)
                 removed_count += 1
                 freed_bytes += size
             except Exception:
                 pass
+
+    if getattr(args, "all", False):
+        cache_roots = []
+        xdg_cache = os.environ.get("XDG_CACHE_HOME")
+        base_cache = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
+        cache_roots.append(base_cache / "makewand")
+        cache_roots.append(base_cache / "trio")
+        iso_root = os.environ.get("MAKEWAND_TEST_ISOLATION_ROOT")
+        if iso_root:
+            cache_roots.append(Path(iso_root).expanduser() / ".cache" / "makewand")
+            cache_roots.append(Path(iso_root).expanduser() / ".cache" / "trio")
+
+        for c_dir in cache_roots:
+            if c_dir.exists() and c_dir.is_dir():
+                for item in c_dir.iterdir():
+                    try:
+                        if item.is_symlink():
+                            size = 0
+                            item.unlink()
+                        elif item.is_dir():
+                            p_str = str(item)
+                            size = sum(os.path.getsize(os.path.join(dirpath, filename))
+                                       for dirpath, dirnames, filenames in os.walk(p_str)
+                                       for filename in filenames)
+                            shutil.rmtree(p_str, ignore_errors=True)
+                        else:
+                            size = item.stat().st_size
+                            item.unlink()
+                        removed_count += 1
+                        freed_bytes += size
+                    except Exception:
+                        pass
+
     print(c(f"🧹 Makewand 临时文件清理完成: 已回收 {removed_count} 个临时目录/文件 (释放约 {freed_bytes / 1024:.1f} KB)。", COLOR_GREEN))
     sys.exit(0)
 
@@ -1591,6 +1634,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             cwd=args.cwd,
             tier=normalize_tier(args.tier),
             model=args.model,
+            effort=getattr(args, "effort", None),
             stream=args.stream,
             auto_fix=args.auto_fix,
             max_fix=getattr(args, "max_fix", 2),
@@ -1623,13 +1667,14 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             **review_options,
             stream=args.stream,
             timeout=args.timeout,
+            effort=getattr(args, "effort", None),
             output_json=getattr(args, "json", False),
             repo_trust=getattr(args, "repo_trust", "trusted"),
             local_only=getattr(args, "local_only", False)
         )
         sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand == "race":
-        exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout, repo_trust=getattr(args, "repo_trust", "trusted"), synthesize_hybrid=getattr(args, "hybrid", False), total_timeout=args.total_timeout, judge_reserve_seconds=args.judge_reserve_seconds, risk=args.risk, **({"protected_paths": args.protected_paths} if args.protected_paths is not None else {}))
+        exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout, effort=getattr(args, "effort", None), repo_trust=getattr(args, "repo_trust", "trusted"), synthesize_hybrid=getattr(args, "hybrid", False), total_timeout=args.total_timeout, judge_reserve_seconds=args.judge_reserve_seconds, risk=args.risk, **({"protected_paths": args.protected_paths} if args.protected_paths is not None else {}))
         sys.exit(exit_code if exit_code is not None else 0)
     elif args.subcommand in ("ensemble", "panel"):
         cmd_ensemble(args)
@@ -1741,7 +1786,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand in ("deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
         from makewand.orchestrator import dispatch_task
         from makewand.workflow import remember_result
-        ok, out, err = remember_result(dispatch_task(args.subcommand, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted")))
+        ok, out, err = remember_result(dispatch_task(args.subcommand, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted")))
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")

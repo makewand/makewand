@@ -84,14 +84,14 @@ def execute_codex_task(
         if has_api_configured("codex"):
             import sys
             print(c("[Makewand -> Codex] (纯 API 模式) 派发任务至 OpenAI API...", COLOR_CYAN), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, "未找到 Codex CLI 订阅，且未配置 OPENAI_API_KEY"
 
     if cache.get("codex", {}).get("status") == "limited":
         if has_api_configured("codex"):
             import sys
             print(c("[Makewand -> Codex] 订阅配额已耗尽，无缝自动降级为 OpenAI API 模式接力执行...", COLOR_CYAN), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Codex CLI 当前额度受限: {cache['codex'].get('reason')} (可配置 OPENAI_API_KEY 作为备用 API 自动接力)"
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
@@ -165,7 +165,7 @@ def execute_codex_task(
         if has_api_configured("codex"):
             import sys
             print(c(f"[Makewand -> Codex] 订阅触发限流 ({reason})，无缝切换为 OpenAI API Key 模式接力执行...", COLOR_CYAN), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder"))
+            return provider_outcome(call_api_chat(provider="codex", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Codex CLI 执行中触发额度限制: {reason} (可配置 OPENAI_API_KEY 实现自动接力)"
 
     return model_process_failure("codex", code, combined, err, ex, readonly)

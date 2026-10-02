@@ -40,7 +40,7 @@ DEFAULT_SYSTEM_PROMPTS = {
     )
 }
 
-def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
+def apply_agentic_code_output(output: str, cwd: str, repo_trust: str = "trusted") -> List[str]:
     """
     Parses LLM code generation output and applies file modifications to cwd.
     Supports:
@@ -50,7 +50,7 @@ def apply_agentic_code_output(output: str, cwd: str) -> List[str]:
     Returns list of modified relative file paths.
     Enforces strict security containment: no path traversal, no .git tampering, no symlink escape.
     """
-    if not output or not cwd:
+    if not output or not cwd or repo_trust == "untrusted":
         return []
 
     clean_cwd = os.path.realpath(os.path.abspath(cwd))
@@ -513,6 +513,8 @@ def _call_api_chat(
     extra_params: Optional[Dict[str, Any]] = None,
     max_retries: int = 2,
     backoff_factor: float = 0.5,
+    repo_trust: str = "trusted",
+    readonly: bool = False,
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Dispatches a task via API to OpenAI, Anthropic, Gemini, xAI, or Local (Ollama/vLLM).
@@ -521,6 +523,8 @@ def _call_api_chat(
     from makewand.config import is_api_allowed, api_policy_error
     if not is_api_allowed(provider):
         return False, "", api_policy_error()
+    if repo_trust == "untrusted" and not readonly:
+        return False, "", "不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务"
     if extra_params:
         extra_params = dict(extra_params)
         if "max_retries" in extra_params:
@@ -542,9 +546,11 @@ def _call_api_chat(
             system_prompt += f"\nTarget working directory: {cwd}"
 
     def _apply_code_if_coder(text: str) -> None:
+        if repo_trust == "untrusted" or readonly:
+            return
         if role == "coder" and cwd and text:
             try:
-                mod_files = apply_agentic_code_output(text, cwd)
+                mod_files = apply_agentic_code_output(text, cwd, repo_trust=repo_trust)
                 if mod_files:
                     print(c(f"✔ [{p.upper()} Agentic] 成功提取并落地 {len(mod_files)} 个修改文件: {', '.join(mod_files[:4])}", COLOR_GREEN), file=sys.stderr)
             except Exception:
@@ -758,9 +764,16 @@ def call_api_chat(*args, **kwargs):
     options = dict(arguments.arguments)
     context = current_context()
     parent = context.get("_request")
-    readonly = (parent.readonly if parent else context.get("readonly", False)) or options["role"] == "reviewer"
+    req_trust = options.get("repo_trust") or (parent.repo_trust if parent else context.get("repo_trust", "trusted"))
+    readonly = (parent.readonly if parent else context.get("readonly", False)) or options.get("readonly", False) or options["role"] == "reviewer"
     if readonly:
         options["role"] = "reviewer"
+    options["readonly"] = readonly
+    options["repo_trust"] = req_trust
+    if req_trust == "untrusted" and not readonly:
+        from makewand.execution_contract import ExecutionResult
+        from makewand.providers.base import ProcessExecutionError
+        return ExecutionResult(False, "", ProcessExecutionError("不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务", "SANDBOX_UNAVAILABLE"))
     if (not is_api_allowed(options["provider"])
             or parent is not None and parent.api_policy == "subscription_only" and normalize_provider_name(options["provider"]) != "local"):
         return False, "", api_policy_error()
@@ -784,6 +797,7 @@ def call_api_chat(*args, **kwargs):
         return invoke(remaining)
     request = ExecutionRequest(task_id=task_id(), stage=context.get("stage") or "api",
         engine=options["provider"], tier=options["tier"], model=options["model"], readonly=bool(readonly),
+        repo_trust=req_trust,
         api_policy=parent.api_policy if parent else get_api_policy(), timeout_ms=max(1, int(timeout * 1000)),
         prompt=options["prompt"], cwd=options["cwd"])
     with execution_context(lease_id=None):

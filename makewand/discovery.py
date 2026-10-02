@@ -1013,14 +1013,17 @@ def export_routing_overrides(config_dir: Optional[Path] = None) -> Optional[Path
         except Exception:
             pass
 
-    # 3. Ensure every model ID in models has a cost entry (crucial for Go router validation)
-    for prov_name, tier_dict in models_map.items():
-        if isinstance(tier_dict, dict):
-            for tier_name, model_id in tier_dict.items():
-                if model_id and isinstance(model_id, str):
-                    clean_id = model_id.strip()
-                    if clean_id and clean_id not in costs_map:
-                        costs_map[clean_id] = {"input": 0.0, "output": 0.0}
+    # 3. Pricing table protection: do not overwrite missing/unconfigured model costs with 0.0,
+    # which wipes out the Go router's built-in benchmark price table. Only set prices when
+    # positive explicit values are configured, or preserve existing table values.
+    filtered_costs: Dict[str, Any] = {}
+    for mid, c_val in costs_map.items():
+        if isinstance(c_val, dict):
+            inp = c_val.get("input", 0.0)
+            out = c_val.get("output", 0.0)
+            if (isinstance(inp, (int, float)) and inp > 0) or (isinstance(out, (int, float)) and out > 0):
+                filtered_costs[mid] = c_val
+    costs_map = filtered_costs
 
     # 4. Construct payload strictly conforming to rawDefaults
     payload: Dict[str, Any] = {
