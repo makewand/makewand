@@ -311,11 +311,15 @@ def select_optimal_engine_pair(
     # 2.5 Dynamic Quota Pacing & Calendar Progression Alignment
     pacings = {}
     try:
+        from makewand.config import has_api_configured
         from makewand.pacing import get_all_providers_pacing
         pacings = get_all_providers_pacing(cache=cache)
         for model_name, p_data in pacings.items():
             if model_name in scores and scores[model_name] > -500:
                 p_boost = p_data.get("routing_boost", 0.0)
+                model_status = (cache or {}).get(model_name, {}).get("status", "unknown")
+                if p_boost <= -500.0 and model_status == "limited" and has_api_configured(model_name):
+                    continue
                 if p_boost != 0.0 and not boost:
                     scores[model_name] += p_boost
                 p_reason = p_data.get("reason")
@@ -375,6 +379,9 @@ def select_optimal_engine_pair(
                 scores[model_name] = -999.0
                 if status == "needs_auth":
                     reasons.append(get_reauth_hint(model_name))
+        elif status == "error":
+            scores[model_name] = -999.0
+            reasons.append(f"{model_name} 最近一次探活失败 (error)")
     if stale_engines:
         reasons.append(f"引擎状态缓存已超过 6 小时未刷新 ({', '.join(sorted(stale_engines))})，按中性处理；建议运行 'makewand probe'")
 
@@ -452,6 +459,8 @@ def select_optimal_engine_pair(
                 reviewer_base_scores[model_name] -= 0.8
             else:
                 reviewer_base_scores[model_name] = -999.0
+        elif status == "error":
+            reviewer_base_scores[model_name] = -999.0
         else:
             if model_name in ENGINES_WITHOUT_EXECUTOR:
                 reviewer_base_scores[model_name] = -999.0

@@ -167,6 +167,26 @@ class DiscoveryProvenanceTests(unittest.TestCase):
         self.assertTrue(res_std["is_dynamic"])
         self.assertEqual(res_std["model"], "gemini-3.8-flash")
 
+    def test_discover_local_agy_models_helper(self):
+        from makewand.discovery import _discover_local_agy_models
+        self.write(".gemini/models_cache.json", {"models": [
+            {"id": "gemini-3.8-pro", "description": "frontier deep"}
+        ]})
+        self.write(".gemini/antigravity-cli/settings.json", {
+            "model": "Gemini 3.8 Flash (High)",
+            "reasoning_effort": "high"
+        })
+        res = _discover_local_agy_models()
+        self.assertEqual(res.configured_default, "gemini-3.8-flash")
+        self.assertEqual(res.configured_effort, "high")
+        self.assertEqual(res["configured_default"], "gemini-3.8-flash")
+        models, default, effort = res
+        self.assertEqual(default, "gemini-3.8-flash")
+        self.assertEqual(effort, "high")
+        self.assertIn(("gemini-3.8-pro", "frontier deep"), models)
+        with self.assertRaises(KeyError):
+            _ = res["unknown_key"]
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -324,11 +325,17 @@ func TestSanitizeGitExecEnv(t *testing.T) {
 		"GIT_DIR=/evil/git/dir",
 		"GIT_WORK_TREE=/evil/wt",
 		"GIT_INDEX_FILE=/evil/index",
+		"GIT_COMMON_DIR=/evil/common",
+		"GIT_HOOKS_PATH=/evil/hooks",
+		"GIT_EXEC_PATH=/evil/libexec",
 		"GIT_EXTERNAL_DIFF=/tmp/evil_diff",
+		"GIT_EDITOR=/evil/editor",
+		"GIT_SEQUENCE_EDITOR=/evil/seq_editor",
 		"GIT_CONFIG_COUNT=1",
 		"GIT_CONFIG_KEY_0=core.fsmonitor",
 		"GIT_CONFIG_VALUE_0=evil.sh",
 		"GIT_SSH_COMMAND=ssh -o ProxyCommand=evil",
+		"GIT_OPTIONAL_LOCKS=1",
 		"USER=testuser",
 	}
 	cleaned := sanitizeGitExecEnv(inputEnv)
@@ -342,8 +349,17 @@ func TestSanitizeGitExecEnv(t *testing.T) {
 			t.Errorf("dangerous git env %q not stripped: %s", k, entry)
 		}
 	}
-	if !hasEnvKey(cleaned, "GIT_OPTIONAL_LOCKS") {
-		t.Errorf("GIT_OPTIONAL_LOCKS=0 was not added")
+	if !slices.Contains(cleaned, "GIT_OPTIONAL_LOCKS=0") {
+		t.Errorf("GIT_OPTIONAL_LOCKS=0 was not set or overridden")
+	}
+	lockCount := 0
+	for _, entry := range cleaned {
+		if strings.HasPrefix(entry, "GIT_OPTIONAL_LOCKS=") {
+			lockCount++
+		}
+	}
+	if lockCount != 1 {
+		t.Errorf("expected exactly 1 GIT_OPTIONAL_LOCKS entry, found %d", lockCount)
 	}
 	if !hasEnvKey(cleaned, "USER") {
 		t.Errorf("USER was improperly stripped")

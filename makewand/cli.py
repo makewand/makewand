@@ -1079,7 +1079,8 @@ def main():
     p_status.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # probe
-    subparsers.add_parser("probe", help="Perform live probing on all AIs and update status cache", parents=[sub_common_parser])
+    p_probe = subparsers.add_parser("probe", help="Perform live probing on all AIs and update status cache", parents=[sub_common_parser])
+    p_probe.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # quota
     p_quota = subparsers.add_parser("quota", help="Show quota indicators (Python: local call-count estimates, not official quota)", parents=[sub_common_parser])

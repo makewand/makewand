@@ -651,9 +651,14 @@ var dangerousGitEnvs = map[string]bool{
 	"GIT_INDEX_FILE":                   true,
 	"GIT_OBJECT_DIRECTORY":             true,
 	"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+	"GIT_COMMON_DIR":                   true,
+	"GIT_HOOKS_PATH":                   true,
+	"GIT_EXEC_PATH":                    true,
 	"GIT_EXTERNAL_DIFF":                true,
 	"GIT_DIFF_OPTS":                    true,
 	"GIT_PAGER":                        true,
+	"GIT_EDITOR":                       true,
+	"GIT_SEQUENCE_EDITOR":              true,
 	"GIT_SSH":                          true,
 	"GIT_SSH_COMMAND":                  true,
 	"GIT_ASKPASS":                      true,
@@ -674,14 +679,12 @@ func sanitizeGitExecEnv(env []string) []string {
 			continue
 		}
 		key := entry[:eq]
-		if isDangerousGitEnv(key) {
+		if isDangerousGitEnv(key) || key == "GIT_OPTIONAL_LOCKS" {
 			continue
 		}
 		out = append(out, entry)
 	}
-	if !hasEnvKey(out, "GIT_OPTIONAL_LOCKS") {
-		out = append(out, "GIT_OPTIONAL_LOCKS=0")
-	}
+	out = append(out, "GIT_OPTIONAL_LOCKS=0")
 	return out
 }
 

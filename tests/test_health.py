@@ -177,5 +177,23 @@ class TestHealth(unittest.TestCase):
             if os.path.exists(cache_file):
                 os.remove(cache_file)
 
+    def test_grok_probe_non_zero_exit_returns_warning(self):
+        from makewand.health import probe_model, check_grok_health
+        from unittest.mock import patch
+
+        with patch("makewand.config.has_subscription_configured", return_value=True), \
+             patch("makewand.config.has_api_configured", return_value=False), \
+             patch("makewand.health._run_model_probe", return_value=(1, "", "connection refused", None)):
+            res = probe_model("grok")
+            self.assertEqual(res["status"], "warning")
+            self.assertIn("connection refused", res["reason"])
+            self.assertNotEqual(res["reason"], "Unknown model")
+
+            res_alias = check_grok_health()
+            self.assertEqual(res_alias["status"], "warning")
+            self.assertIn("connection refused", res_alias["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

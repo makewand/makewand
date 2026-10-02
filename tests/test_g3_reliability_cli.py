@@ -146,6 +146,14 @@ class TestQuotaHonesty(_CliCase):
         self.assertNotIn("剩余额度:", out)
         self.assertIn("muse login", out)
 
+    def test_probe_json_flag(self):
+        with patch("makewand.cli.get_or_update_status", return_value=self.cache()), \
+             patch("makewand.config.get_provider_execution_mode", return_value="subscription"):
+            code, out, _ = self.run_main("probe", "--json")
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertIn("providers", data)
+
 
 class TestProviderCommands(_CliCase):
     """arch-product#6."""

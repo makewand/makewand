@@ -69,6 +69,141 @@ def _normalize_agy_model(raw: str) -> Tuple[str, Optional[str]]:
     return slug, effort
 
 
+class DiscoveredAgyModels(tuple):
+    """Container for discovered Antigravity / Gemini model catalog."""
+
+    def __new__(cls, models: List[Tuple[str, str]], configured_default: Optional[str], configured_effort: Optional[str]):
+        return super().__new__(cls, (models, configured_default, configured_effort))
+
+    @property
+    def models(self) -> List[Tuple[str, str]]:
+        return self[0]
+
+    @property
+    def configured_default(self) -> Optional[str]:
+        return self[1]
+
+    @property
+    def configured_effort(self) -> Optional[str]:
+        return self[2]
+
+    def __getitem__(self, item):
+        if item == "models":
+            return self[0]
+        if item == "configured_default":
+            return self[1]
+        if item == "configured_effort":
+            return self[2]
+        if isinstance(item, str):
+            raise KeyError(item)
+        return super().__getitem__(item)
+
+    def get(self, key, default=None):
+        if key == "models":
+            return self[0]
+        if key == "configured_default":
+            return self[1]
+        if key == "configured_effort":
+            return self[2]
+        return default
+
+
+def _discover_local_agy_models() -> DiscoveredAgyModels:
+    """
+    Scans local Gemini / Antigravity config and cache directories.
+    Returns DiscoveredAgyModels(models, configured_default, configured_effort).
+    """
+    discovered_agy: List[Tuple[str, str]] = []
+    seen = set()
+    configured_default = None
+    configured_effort = None
+
+    gemini_bases = []
+    if os.environ.get("GEMINI_CONFIG_DIR"):
+        gemini_bases.append(Path(os.environ["GEMINI_CONFIG_DIR"]).expanduser())
+    elif os.environ.get("AGY_CONFIG_DIR"):
+        gemini_bases.append(Path(os.environ["AGY_CONFIG_DIR"]).expanduser())
+    else:
+        gemini_bases.extend([
+            Path.home() / ".gemini",
+            Path.home() / ".config" / "gemini",
+            Path.home() / ".config" / "antigravity",
+        ])
+
+    for base in gemini_bases:
+        if not base.exists():
+            continue
+
+        for cache_name in ("models_cache.json", "model_catalog.json"):
+            cache_file = base / cache_name
+            if not cache_file.exists():
+                cache_file = base / "antigravity-cli" / cache_name
+            if cache_file.exists():
+                try:
+                    cdata = json.loads(cache_file.read_text(encoding="utf-8"))
+                    items = cdata.get("models") or cdata.get("catalog", {}).get("models", [])
+                    if isinstance(items, list):
+                        for m in items:
+                            if isinstance(m, dict):
+                                slug = m.get("id") or m.get("slug")
+                                desc = m.get("description") or m.get("name") or ""
+                                norm_slug, _ = _normalize_agy_model(slug or "")
+                                if norm_slug and (norm_slug, desc) not in seen:
+                                    seen.add((norm_slug, desc))
+                                    discovered_agy.append((norm_slug, desc))
+                            elif isinstance(m, str):
+                                norm_slug, _ = _normalize_agy_model(m)
+                                if norm_slug and (norm_slug, "") not in seen:
+                                    seen.add((norm_slug, ""))
+                                    discovered_agy.append((norm_slug, ""))
+                    elif isinstance(items, dict):
+                        for k, v in items.items():
+                            norm_slug, _ = _normalize_agy_model(k)
+                            if norm_slug:
+                                desc = v.get("description", "") if isinstance(v, dict) else ""
+                                if (norm_slug, desc) not in seen:
+                                    seen.add((norm_slug, desc))
+                                    discovered_agy.append((norm_slug, desc))
+                except Exception:
+                    pass
+
+        for s_path in [
+            base / "antigravity-cli" / "settings.json",
+            base / "settings.json",
+            base / "config" / "config.json",
+        ]:
+            if s_path.exists():
+                try:
+                    sdata = json.loads(s_path.read_text(encoding="utf-8"))
+                    raw_model = sdata.get("model") or sdata.get("default_model")
+                    if raw_model and isinstance(raw_model, str):
+                        norm_model, eff_extracted = _normalize_agy_model(raw_model)
+                        if norm_model:
+                            if not configured_default:
+                                configured_default = norm_model
+                            if eff_extracted and not configured_effort:
+                                configured_effort = eff_extracted
+                    raw_eff = sdata.get("reasoning_effort") or sdata.get("effort")
+                    if raw_eff and isinstance(raw_eff, str) and raw_eff.strip():
+                        eff_val = raw_eff.strip().lower()
+                        if eff_val in ("low", "medium", "high", "max") and not configured_effort:
+                            configured_effort = eff_val
+                    # Also check model lists if present in settings.json
+                    for key in ("available_models", "models", "additionalModelOptionsCache"):
+                        m_list = sdata.get(key)
+                        if isinstance(m_list, list):
+                            for item in m_list:
+                                val = item.get("value") or item.get("id") or item.get("slug") if isinstance(item, dict) else item
+                                desc = item.get("description") or item.get("name") or "" if isinstance(item, dict) else ""
+                                if isinstance(val, str):
+                                    norm_val, _ = _normalize_agy_model(val)
+                                    if norm_val and (norm_val, desc) not in seen:
+                                        seen.add((norm_val, desc))
+                                        discovered_agy.append((norm_val, desc))
+                except Exception:
+                    pass
+
+    return DiscoveredAgyModels(discovered_agy, configured_default, configured_effort)
 
 
 def _tier_resolution(model, effort, *, is_dynamic, full_id=None, effort_source="builtin"):
@@ -335,83 +470,10 @@ def discover_available_models() -> Dict[str, Any]:
 
     # Discover Antigravity / Gemini models from ~/.gemini
     try:
-        gemini_bases = []
-        if os.environ.get("GEMINI_CONFIG_DIR"):
-            gemini_bases.append(Path(os.environ["GEMINI_CONFIG_DIR"]).expanduser())
-        elif os.environ.get("AGY_CONFIG_DIR"):
-            gemini_bases.append(Path(os.environ["AGY_CONFIG_DIR"]).expanduser())
-        else:
-            gemini_bases.extend([
-                Path.home() / ".gemini",
-                Path.home() / ".config" / "gemini",
-                Path.home() / ".config" / "antigravity",
-            ])
-
+        agy_res = _discover_local_agy_models()
         found_agy = set()
-        configured_agy_default = None
-
-        for base in gemini_bases:
-            if not base.exists():
-                continue
-
-            # 1. Official / catalog caches
-            for cache_name in ("models_cache.json", "model_catalog.json"):
-                cache_file = base / cache_name
-                if not cache_file.exists():
-                    cache_file = base / "antigravity-cli" / cache_name
-                if cache_file.exists():
-                    try:
-                        cdata = json.loads(cache_file.read_text(encoding="utf-8"))
-                        items = cdata.get("models") or cdata.get("catalog", {}).get("models", [])
-                        if isinstance(items, list):
-                            for m in items:
-                                if isinstance(m, dict):
-                                    slug = m.get("id") or m.get("slug")
-                                    desc = m.get("description") or m.get("name") or ""
-                                    norm_slug, _ = _normalize_agy_model(slug or "")
-                                    if norm_slug:
-                                        found_agy.add(f"{norm_slug} ({desc})" if desc else norm_slug)
-                                elif isinstance(m, str):
-                                    norm_slug, _ = _normalize_agy_model(m)
-                                    if norm_slug:
-                                        found_agy.add(norm_slug)
-                        elif isinstance(items, dict):
-                            for k, v in items.items():
-                                norm_slug, _ = _normalize_agy_model(k)
-                                if norm_slug:
-                                    desc = v.get("description", "") if isinstance(v, dict) else ""
-                                    found_agy.add(f"{norm_slug} ({desc})" if desc else norm_slug)
-                    except Exception:
-                        pass
-
-            # 2. Config files
-            for s_path in [
-                base / "antigravity-cli" / "settings.json",
-                base / "settings.json",
-                base / "config" / "config.json"
-            ]:
-                if s_path.exists():
-                    try:
-                        sdata = json.loads(s_path.read_text(encoding="utf-8"))
-                        raw_m = sdata.get("model") or sdata.get("default_model")
-                        if raw_m and isinstance(raw_m, str):
-                            norm_m, _ = _normalize_agy_model(raw_m)
-                            if norm_m:
-                                if not configured_agy_default:
-                                    configured_agy_default = norm_m
-                                found_agy.add(norm_m)
-                        # Also check model lists if present
-                        for key in ("available_models", "models", "additionalModelOptionsCache"):
-                            m_list = sdata.get(key)
-                            if isinstance(m_list, list):
-                                for item in m_list:
-                                    val = item.get("value") or item.get("id") if isinstance(item, dict) else item
-                                    if isinstance(val, str):
-                                        norm_val, _ = _normalize_agy_model(val)
-                                        if norm_val:
-                                            found_agy.add(norm_val)
-                    except Exception:
-                        pass
+        for norm_slug, desc in agy_res.models:
+            found_agy.add(f"{norm_slug} ({desc})" if desc else norm_slug)
 
         if found_agy:
             models["agy"]["available"] = sorted(
@@ -420,8 +482,8 @@ def discover_available_models() -> Dict[str, Any]:
                 reverse=True
             )
             models["agy"]["source"] = "detected"
-        if configured_agy_default:
-            models["agy"]["current_default"] = configured_agy_default
+        if agy_res.configured_default:
+            models["agy"]["current_default"] = agy_res.configured_default
             models["agy"]["default_source"] = "detected"
         elif found_agy:
             ranked_std = rank_models_for_tier(list(found_agy), "standard")
@@ -600,89 +662,10 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         return _tier_resolution(model_name, effort, is_dynamic=detected)
 
     elif provider == "agy":
-        discovered_agy = []
-        configured_default = None
-        configured_effort = None
-
-        gemini_bases = []
-        if os.environ.get("GEMINI_CONFIG_DIR"):
-            gemini_bases.append(Path(os.environ["GEMINI_CONFIG_DIR"]).expanduser())
-        elif os.environ.get("AGY_CONFIG_DIR"):
-            gemini_bases.append(Path(os.environ["AGY_CONFIG_DIR"]).expanduser())
-        else:
-            gemini_bases.extend([
-                Path.home() / ".gemini",
-                Path.home() / ".config" / "gemini",
-                Path.home() / ".config" / "antigravity",
-            ])
-
-        for base in gemini_bases:
-            if not base.exists():
-                continue
-
-            for cache_name in ("models_cache.json", "model_catalog.json"):
-                cache_file = base / cache_name
-                if not cache_file.exists():
-                    cache_file = base / "antigravity-cli" / cache_name
-                if cache_file.exists() and not discovered_agy:
-                    try:
-                        cdata = json.loads(cache_file.read_text(encoding="utf-8"))
-                        items = cdata.get("models") or cdata.get("catalog", {}).get("models", [])
-                        if isinstance(items, list):
-                            for m in items:
-                                if isinstance(m, dict):
-                                    slug = m.get("id") or m.get("slug")
-                                    desc = m.get("description") or m.get("name") or ""
-                                    norm_slug, _ = _normalize_agy_model(slug or "")
-                                    if norm_slug:
-                                        discovered_agy.append((norm_slug, desc))
-                                elif isinstance(m, str):
-                                    norm_slug, _ = _normalize_agy_model(m)
-                                    if norm_slug:
-                                        discovered_agy.append((norm_slug, ""))
-                        elif isinstance(items, dict):
-                            for k, v in items.items():
-                                norm_slug, _ = _normalize_agy_model(k)
-                                if norm_slug:
-                                    desc = v.get("description", "") if isinstance(v, dict) else ""
-                                    discovered_agy.append((norm_slug, desc))
-                    except Exception:
-                        pass
-
-            for s_path in [
-                base / "antigravity-cli" / "settings.json",
-                base / "settings.json",
-                base / "config" / "config.json"
-            ]:
-                if s_path.exists():
-                    try:
-                        sdata = json.loads(s_path.read_text(encoding="utf-8"))
-                        raw_model = sdata.get("model") or sdata.get("default_model")
-                        if raw_model and isinstance(raw_model, str):
-                            norm_model, eff_extracted = _normalize_agy_model(raw_model)
-                            if norm_model:
-                                if not configured_default:
-                                    configured_default = norm_model
-                                if eff_extracted and not configured_effort:
-                                    configured_effort = eff_extracted
-                        raw_eff = sdata.get("reasoning_effort") or sdata.get("effort")
-                        if raw_eff and isinstance(raw_eff, str) and raw_eff.strip():
-                            eff_val = raw_eff.strip().lower()
-                            if eff_val in ("low", "medium", "high", "max"):
-                                configured_effort = eff_val
-                        # Also check model lists if present in settings.json
-                        for key in ("available_models", "models", "additionalModelOptionsCache"):
-                            m_list = sdata.get(key)
-                            if isinstance(m_list, list):
-                                for item in m_list:
-                                    val = item.get("value") or item.get("id") or item.get("slug") if isinstance(item, dict) else item
-                                    desc = item.get("description") or item.get("name") or "" if isinstance(item, dict) else ""
-                                    if isinstance(val, str):
-                                        norm_val, _ = _normalize_agy_model(val)
-                                        if norm_val:
-                                            discovered_agy.append((norm_val, desc))
-                    except Exception:
-                        pass
+        agy_res = _discover_local_agy_models()
+        discovered_agy = agy_res.models
+        configured_default = agy_res.configured_default
+        configured_effort = agy_res.configured_effort
 
         effort = configured_effort if (tier == "standard" and configured_effort) else ("max" if tier == "deep" else ("low" if tier == "fast" else "high"))
 

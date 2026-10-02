@@ -34,7 +34,7 @@ class TaskNode:
         self.title = str(title).strip()
         self.description = str(description).strip()
         self.target_files = list(target_files or [])
-        self.dependencies = [str(d).strip() for d in (dependencies or []) if str(d).strip()]
+        self.dependencies = list(dict.fromkeys(str(d).strip() for d in (dependencies or []) if str(d).strip()))
         self.status = status
         self.result_patch: Optional[str] = None
         self.verdict: Optional[Dict[str, Any]] = None

@@ -45,6 +45,17 @@ class TestTaskDAG(unittest.TestCase):
         self.assertEqual(stage2_ids, ["t2", "t3"])
         self.assertEqual([t.task_id for t in stages[2]], ["t4"])
 
+    def test_task_node_dependency_deduplication(self):
+        t1 = TaskNode("t1", "Init", dependencies=[])
+        t2 = TaskNode("t2", "Work", dependencies=["t1", "t1", "t1"])
+        self.assertEqual(t2.dependencies, ["t1"])
+
+        dag = TaskDAG("Feature", [t1, t2])
+        stages = dag.topological_stages()
+        self.assertEqual(len(stages), 2)
+        self.assertEqual([t.task_id for t in stages[0]], ["t1"])
+        self.assertEqual([t.task_id for t in stages[1]], ["t2"])
+
     def test_decompose_itemized_prompt(self):
         prompt = "1. 重构数据结构 `makewand/model.py` 2. 编写核心逻辑 3. 补充单元测试"
         dag = decompose_task_to_dag(prompt)

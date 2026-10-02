@@ -684,6 +684,7 @@ def probe_model(
             return {"status": "warning", "reason": f"Grok 探活超时 ({t}s，可能正处于推理中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
         if ex:
             return {"status": "error", "reason": ex, "resets_at": None, "updated_at": now, "mode": mode}
+        return {"status": "warning", "reason": combined.strip()[:120] or "Grok 探活异常退出", "resets_at": None, "updated_at": now, "mode": mode}
     elif model_name == "aider":
         with tempfile.TemporaryDirectory(prefix="makewand-version-") as neutral:
             code, out, err, ex = run_subprocess(["aider", "--version"], timeout=5, cwd=neutral)
@@ -711,6 +712,12 @@ def probe_model(
         }
 
     return {"status": "unknown", "reason": "Unknown model", "resets_at": None, "updated_at": now, "mode": "none"}
+
+
+def check_grok_health(*args, **kwargs) -> Dict[str, Any]:
+    """Helper alias to probe Grok health status."""
+    return probe_model("grok", *args, **kwargs)
+
 
 PROBE_REUSE_SECONDS = 120
 

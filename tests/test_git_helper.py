@@ -519,6 +519,38 @@ except OSError:
                 self.assertEqual(dst.read_text(), "read only content")
                 self.assertEqual(dst.stat().st_mode & 0o777, 0o444)
 
+    def test_sanitize_git_env(self):
+        from makewand.git_helper import _sanitize_git_env
+        input_env = {
+            "PATH": "/usr/bin:/bin",
+            "USER": "tester",
+            "GIT_DIR": "/evil/dir",
+            "GIT_WORK_TREE": "/evil/wt",
+            "GIT_INDEX_FILE": "/evil/index",
+            "GIT_COMMON_DIR": "/evil/common",
+            "GIT_HOOKS_PATH": "/evil/hooks",
+            "GIT_EXEC_PATH": "/evil/libexec",
+            "GIT_EXTERNAL_DIFF": "/evil/diff",
+            "GIT_DIFF_OPTS": "-u",
+            "GIT_PAGER": "cat",
+            "GIT_EDITOR": "/evil/editor",
+            "GIT_SEQUENCE_EDITOR": "/evil/seq_editor",
+            "GIT_SSH": "evil_ssh",
+            "GIT_SSH_COMMAND": "evil_ssh_cmd",
+            "GIT_ASKPASS": "evil_askpass",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "evil.sh",
+            "GIT_OPTIONAL_LOCKS": "1",
+        }
+        sanitized = _sanitize_git_env(input_env)
+        self.assertEqual(sanitized["PATH"], "/usr/bin:/bin")
+        self.assertEqual(sanitized["USER"], "tester")
+        self.assertEqual(sanitized["GIT_OPTIONAL_LOCKS"], "0")
+        for k in input_env:
+            if k not in ("PATH", "USER", "GIT_OPTIONAL_LOCKS"):
+                self.assertNotIn(k, sanitized, f"Dangerous var {k} should have been filtered")
+
 
 if __name__ == "__main__":
     unittest.main()

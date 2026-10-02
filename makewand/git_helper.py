@@ -48,6 +48,38 @@ SAFE_GIT_SECURITY_FLAGS = [
     "-c", "commit.gpgsign=false",
 ]
 
+_DANGEROUS_GIT_ENVS = {
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_HOOKS_PATH",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+}
+
+
+def _sanitize_git_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Sanitize environment variables for safe git execution."""
+    src = os.environ if env is None else env
+    clean = {}
+    for k, v in src.items():
+        if k in _DANGEROUS_GIT_ENVS or k.startswith("GIT_CONFIG_") or k == "GIT_OPTIONAL_LOCKS":
+            continue
+        clean[k] = v
+    clean["GIT_OPTIONAL_LOCKS"] = "0"
+    return clean
+
+
 def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path]:
     paths: List[Path] = []
     seen_dirs = set()
@@ -147,14 +179,10 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             exec_cmd = cmd
             use_shell = False
 
-        git_env = os.environ.copy()
+        git_env = _sanitize_git_env() if safe else os.environ.copy()
         if safe:
-            for k in list(git_env.keys()):
-                if k in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES") or k.startswith("GIT_CONFIG_"):
-                    git_env.pop(k, None)
             if _diff_index.get() is not None:
                 git_env["GIT_INDEX_FILE"] = _diff_index.get()
-            git_env["GIT_OPTIONAL_LOCKS"] = "0"
 
             # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees.
             # Use deterministic sorting and attributes.lock file locking to avoid multi-session collisions.
