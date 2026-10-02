@@ -474,14 +474,18 @@ def format_collision_warning(report: Dict[str, Any]) -> str:
     if same_wt:
         lines.append(c(f"• 冲突会话列表 (共 {len(same_wt)} 个并发会话活跃在当前工作区):", COLOR_BOLD))
         for s in same_wt:
+            loc = s.get("location", "独立终端/后台")
+            cwd = s.get("cwd", "未知")
             lines.append(f"  - 进程 PID {c(str(s['pid']), COLOR_BOLD + COLOR_YELLOW)}: 工具 {c(s['ai_type'], COLOR_CYAN)} "
-                         f"位于 [{c(s['location'], COLOR_PURPLE)}] (目录: {s['cwd']})")
+                         f"位于 [{c(loc, COLOR_PURPLE)}] (目录: {cwd})")
 
     if same_repo:
         lines.append(c(f"• 关联 Worktree 会话 (共 {len(same_repo)} 个会话在同仓库其他独立 worktree 运行):", COLOR_CYAN))
         for s in same_repo:
+            loc = s.get("location", "独立终端/后台")
+            cwd = s.get("cwd", "未知")
             lines.append(f"  - 进程 PID {c(str(s['pid']), COLOR_YELLOW)}: 工具 {c(s['ai_type'], COLOR_CYAN)} "
-                         f"位于 [{c(s['location'], COLOR_PURPLE)}] (目录: {s['cwd']})")
+                         f"位于 [{c(loc, COLOR_PURPLE)}] (目录: {cwd})")
 
     if report.get("git_locked"):
         lines.append(c(f"• Git 状态: 检测到活跃的 .git/index.lock ({report.get('index_lock_path')})，有写操作正在进行！", COLOR_RED + COLOR_BOLD))

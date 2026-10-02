@@ -277,7 +277,11 @@ class SchedulingTests(unittest.TestCase):
 
 class CLIWorkflowTests(unittest.TestCase):
     def run_cli(self, arguments):
-        with patch.object(sys, "argv", ["makewand", *arguments]), patch.object(sys, "stdin", io.StringIO()), contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(sys, "argv", ["makewand", *arguments]), \
+             patch("makewand.collision.detect_cross_session_collisions", return_value={}), \
+             patch.object(sys, "stdin", io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()), \
+             contextlib.redirect_stdout(io.StringIO()):
             try:
                 cli.main()
                 return 0

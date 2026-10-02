@@ -347,3 +347,40 @@ class TestCollisionHardening(unittest.TestCase):
             self.assertIn("has_collision", rep)
             self.assertIn("collisions", rep)
 
+    def test_cli_collision_guard_fails_closed_on_same_worktree(self):
+        """Verify CLI blocks execution with EXIT_FAILED when same_worktree_sessions is detected."""
+        from makewand.cli import main
+        from makewand.execution_contract import EXIT_FAILED
+
+        col_rep = {
+            "has_collision": True,
+            "git_locked": False,
+            "same_worktree_sessions": [{"pid": 9999, "ai_type": "claude", "cwd": "/tmp/test"}],
+            "same_repo_sessions": [],
+        }
+        with patch("sys.argv", ["makewand", "run", "do task"]), \
+             patch("makewand.collision.detect_cross_session_collisions", return_value=col_rep), \
+             patch("makewand.observer.mark_process_as_dispatcher"):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(cm.exception.code, EXIT_FAILED)
+
+    def test_cli_collision_guard_bypassed_with_allow_collision(self):
+        """Verify CLI proceeds past collision guard when --allow-collision is passed."""
+        from makewand.cli import main
+
+        col_rep = {
+            "has_collision": True,
+            "git_locked": False,
+            "same_worktree_sessions": [{"pid": 9999, "ai_type": "claude", "cwd": "/tmp/test"}],
+            "same_repo_sessions": [],
+        }
+        with patch("sys.argv", ["makewand", "run", "--allow-collision", "do task"]), \
+             patch("makewand.collision.detect_cross_session_collisions", return_value=col_rep), \
+             patch("makewand.cli._resolve_cli_prompt", return_value="do task"), \
+             patch("makewand.cli.run_pipeline", return_value=True), \
+             patch("makewand.observer.mark_process_as_dispatcher"):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(cm.exception.code, 0)
+

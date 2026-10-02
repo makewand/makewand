@@ -27,7 +27,7 @@ from makewand.config import (
     tier_to_go_mode,
 )
 from makewand.health import get_or_update_status
-from makewand.discovery import discover_available_models
+from makewand.discovery import discover_available_models, export_routing_overrides
 from makewand.execution_contract import (
     EXIT_PASSED, EXIT_FAILED, EXIT_UNVERIFIED, EXIT_USAGE_ERROR, EXIT_APPLY_CONFLICT,
 )
@@ -139,6 +139,11 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
 def _status_cache(args):
     import json
     from makewand.health import ProbePolicyError
+    if getattr(args, "probe", False):
+        try:
+            export_routing_overrides()
+        except Exception:
+            pass
     try:
         return get_or_update_status(force_probe=getattr(args, "probe", False),
             repo_trust=getattr(args, "repo_trust", "trusted"), cwd=getattr(args, "cwd", None))
@@ -454,6 +459,11 @@ def cmd_models(args):
     print(c("\n============================================================", COLOR_BOLD))
     print(c("       Makewand 多模型生态与动态发现矩阵 (Model Discovery)", COLOR_BOLD + COLOR_CYAN))
     print(c("============================================================\n", COLOR_BOLD))
+
+    try:
+        export_routing_overrides()
+    except Exception:
+        pass
 
     models = discover_available_models()
 
@@ -1421,7 +1431,7 @@ def main():
 
     # Pre-flight cross-session collision check for engineering commands
     if args.subcommand in ("run", "race", "apply"):
-        if not getattr(args, "allow_collision", False) and not getattr(args, "force", False):
+        if not getattr(args, "allow_collision", False) and not getattr(args, "force", False) and not os.environ.get("MAKEWAND_DISABLE_COLLISION_GUARD"):
             try:
                 from makewand.collision import detect_cross_session_collisions, format_collision_warning
                 col_rep = detect_cross_session_collisions(args.cwd)
@@ -1430,6 +1440,11 @@ def main():
                     if col_rep.get("git_locked"):
                         print(c("❌ [Makewand Collision Guard] Git 索引锁已被占用，终止执行以防止写坏 Git 仓库。", COLOR_RED + COLOR_BOLD), file=sys.stderr)
                         sys.exit(EXIT_FAILED)
+                    if col_rep.get("same_worktree_sessions"):
+                        print(c("❌ [Makewand Collision Guard] 检测到其他活动会话正在同个工作区运行，终止执行以防止互相踩踏冲突 (加 --allow-collision 强制执行)。", COLOR_RED + COLOR_BOLD), file=sys.stderr)
+                        sys.exit(EXIT_FAILED)
+            except SystemExit:
+                raise
             except Exception:
                 pass
 

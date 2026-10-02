@@ -1583,6 +1583,13 @@ class WorkspaceLock:
         finally:
             handle.close()
 
+    def __enter__(self) -> "WorkspaceLock":
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
 
 # ---------------------------------------------------------------------------
 # Host-mode transaction: the task-start snapshot is taken before any git init,

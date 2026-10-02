@@ -954,3 +954,91 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
 # Backward-compatible and convenience alias
 resolve_model_and_effort = get_provider_model_tier
+
+
+def export_routing_overrides(config_dir: Optional[Path] = None) -> Optional[Path]:
+    """
+    Exports dynamically detected models to Go router's <config_dir>/routing.json.
+    Ensures single source of truth across Python CLI, Go server, and TUI.
+    Strictly conforms to Go router's rawDefaults JSON schema with valid cost entries.
+    Uses atomic write via temporary file replacement.
+    """
+    if config_dir is None:
+        env_dir = os.environ.get("MAKEWAND_CONFIG_DIR")
+        config_dir = Path(env_dir).expanduser() if env_dir else Path.home() / ".config" / "makewand"
+    else:
+        config_dir = Path(config_dir).expanduser()
+
+    # If in test isolation mode and config_dir was not explicitly given, use test root
+    if "MAKEWAND_TEST_ISOLATION_ROOT" in os.environ and not os.environ.get("MAKEWAND_CONFIG_DIR") and config_dir == Path.home() / ".config" / "makewand":
+        iso_root = Path(os.environ["MAKEWAND_TEST_ISOLATION_ROOT"]).expanduser()
+        config_dir = iso_root / ".config" / "makewand"
+
+    target_file = config_dir / "routing.json"
+
+    # 1. Read existing routing.json if present to preserve custom strategies/costs
+    existing_data: Dict[str, Any] = {}
+    if target_file.exists():
+        try:
+            existing_data = json.loads(target_file.read_text(encoding="utf-8"))
+            if not isinstance(existing_data, dict):
+                existing_data = {}
+        except Exception:
+            existing_data = {}
+
+    models_map = existing_data.get("models") if isinstance(existing_data.get("models"), dict) else {}
+    costs_map = existing_data.get("costs") if isinstance(existing_data.get("costs"), dict) else {}
+
+    # 2. Map provider tier resolutions
+    # Tier mapping: cheap -> fast, mid -> standard, premium -> deep
+    providers_to_sync = ["claude", "codex", "gemini", "agy", "muse", "grok", "local"]
+    for prov in providers_to_sync:
+        prov_key = prov
+        lookup_prov = "agy" if prov == "gemini" else prov
+        try:
+            cheap_m = get_provider_model_tier(lookup_prov, "fast").get("model")
+            mid_m = get_provider_model_tier(lookup_prov, "standard").get("model")
+            prem_m = get_provider_model_tier(lookup_prov, "deep").get("model")
+
+            p_models = models_map.get(prov_key, {})
+            if not isinstance(p_models, dict):
+                p_models = {}
+            if cheap_m:
+                p_models["cheap"] = cheap_m
+            if mid_m:
+                p_models["mid"] = mid_m
+            if prem_m:
+                p_models["premium"] = prem_m
+            models_map[prov_key] = p_models
+        except Exception:
+            pass
+
+    # 3. Ensure every model ID in models has a cost entry (crucial for Go router validation)
+    for prov_name, tier_dict in models_map.items():
+        if isinstance(tier_dict, dict):
+            for tier_name, model_id in tier_dict.items():
+                if model_id and isinstance(model_id, str):
+                    clean_id = model_id.strip()
+                    if clean_id and clean_id not in costs_map:
+                        costs_map[clean_id] = {"input": 0.0, "output": 0.0}
+
+    # 4. Construct payload strictly conforming to rawDefaults
+    payload: Dict[str, Any] = {
+        "models": models_map,
+        "costs": costs_map,
+    }
+    # Preserve optional tables if present in existing_data
+    for opt_key in ("strategies", "build_strategies", "context_budgets", "power_ensemble"):
+        if opt_key in existing_data and isinstance(existing_data[opt_key], dict):
+            payload[opt_key] = existing_data[opt_key]
+
+    # 5. Atomic write
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = config_dir / f".routing.json.tmp.{os.getpid()}"
+        tmp_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp_file.replace(target_file)
+        return target_file
+    except Exception:
+        return None
+
