@@ -108,3 +108,4 @@ status:
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	rm -rf /tmp/makewand-restore-* /tmp/makewand-drill-* /tmp/makewand-agy-* /tmp/makewand-muse-* 2>/dev/null || true

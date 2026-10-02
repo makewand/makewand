@@ -831,6 +831,65 @@ def cmd_sessions(args):
             print(f"    工作目录: {cwd}")
         print()
 
+
+def cmd_ensemble(args):
+    prompt = _resolve_cli_prompt(args)
+    if not prompt:
+        print(c("❌ 缺少任务提示词。请通过参数指定、管道输入或通过 -f / --prompt-file 提供。", COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_USAGE_ERROR)
+    from makewand.ensemble import run_ensemble
+    result = run_ensemble(
+        prompt=prompt,
+        providers=getattr(args, "providers", "all"),
+        cwd=args.cwd,
+        timeout=getattr(args, "timeout", 900),
+        tier=getattr(args, "tier", "deep"),
+        effort=getattr(args, "effort", "high") or "high",
+        output_dir=getattr(args, "output_dir", None),
+        prefix=getattr(args, "prefix", "review"),
+        matrix=getattr(args, "matrix", True),
+        stream=getattr(args, "stream", False),
+        local_only=getattr(args, "local_only", False),
+        repo_trust=getattr(args, "repo_trust", "trusted"),
+    )
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        if result.get("summary_matrix") and not getattr(args, "output_dir", None):
+            print("\n" + result["summary_matrix"])
+    sys.exit(0 if result.get("ok") else EXIT_FAILED)
+
+
+def cmd_clean(args):
+    import glob
+    import shutil
+    patterns = [
+        "/tmp/makewand-restore-*",
+        "/tmp/makewand-drill-*",
+        "/tmp/makewand-agy-*",
+        "/tmp/makewand-muse-*",
+    ]
+    removed_count = 0
+    freed_bytes = 0
+    for pat in patterns:
+        for path in glob.glob(pat):
+            try:
+                size = sum(os.path.getsize(os.path.join(dirpath, filename))
+                           for dirpath, dirnames, filenames in os.walk(path)
+                           for filename in filenames) if os.path.isdir(path) else os.path.getsize(path)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                removed_count += 1
+                freed_bytes += size
+            except Exception:
+                pass
+    print(c(f"🧹 Makewand 临时文件清理完成: 已回收 {removed_count} 个临时目录/文件 (释放约 {freed_bytes / 1024:.1f} KB)。", COLOR_GREEN))
+    sys.exit(0)
+
+
 def _normalize_version(text: str) -> str:
     return text.strip().lstrip("vV")
 
@@ -1049,6 +1108,7 @@ def main():
     common_parser.add_argument("--max-model-calls", type=int, default=None, help="Maximum attempted Makewand model tasks, including retries and reviewers")
     common_parser.add_argument("--call-budget-file", default=None, help="Shared admission ledger for model task budgets")
     common_parser.add_argument("--protect", dest="global_protected_paths", action="append", default=None, metavar="PATH", help="Preserve a task-relative file; repeat for multiple files")
+    common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "max"], default=None, help="Set reasoning effort across AI models (low, medium, high, max)")
 
     sub_common_parser = argparse.ArgumentParser(add_help=False)
     sub_common_parser.add_argument("-C", "--cwd", dest="cwd", default=argparse.SUPPRESS, help="Target working directory (default: current directory)")
@@ -1060,6 +1120,7 @@ def main():
     sub_common_parser.add_argument("--max-model-calls", type=int, default=argparse.SUPPRESS, help="Maximum attempted Makewand model tasks")
     sub_common_parser.add_argument("--call-budget-file", default=argparse.SUPPRESS, help="Shared model task admission ledger")
     sub_common_parser.add_argument("--protect", dest="protected_paths", action="append", default=None, metavar="PATH", help="Preserve file content and permissions; repeat for multiple files")
+    sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "max"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, max)")
 
     for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
         options.add_argument("--workflow", choices=["auto", "single", "pipeline", "race"],
@@ -1129,6 +1190,19 @@ def main():
     p_race.add_argument("prompt", nargs="?", default=None, help="Prompt for race comparison")
     p_race.add_argument("--timeout", type=int, default=300)
     p_race.add_argument("--hybrid", action="store_true", help="Also synthesize a sealed hybrid candidate; requires separate review before apply")
+
+    # ensemble (multi-model brain trust panel review)
+    p_ens = subparsers.add_parser("ensemble", help="Run multi-model brain trust panel review concurrently and synthesize verdicts", parents=[sub_common_parser])
+    p_ens.add_argument("prompt", nargs="?", default=None, help="Prompt or task description to review")
+    p_ens.add_argument("--providers", default="all", help="Comma-separated providers (e.g. claude,codex,muse,grok,agy or 'all')")
+    p_ens.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="deep", help="Model tier (default: deep)")
+    p_ens.add_argument("--output-dir", default=None, help="Directory to save individual markdown review files")
+    p_ens.add_argument("--prefix", default="review", help="Filename prefix for output review files (default: review)")
+    p_ens.add_argument("--no-matrix", dest="matrix", action="store_false", default=True, help="Disable generation of comparison synthesis matrix")
+    p_ens.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
+    p_ens.add_argument("--stream", action="store_true", default=False, help="Stream review outputs")
+    p_ens.add_argument("--timeout", type=int, default=900, help="Per-model timeout in seconds (default: 900)")
+    p_ens.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Run only local/offline models")
 
     # search (budgeted search guardrail)
     p_search = subparsers.add_parser("search", help="Budgeted fast search excluding cold archives and databases", parents=[sub_common_parser])
@@ -1259,6 +1333,10 @@ def main():
     # sessions (Host-wide AI session observer and worktree collision detector)
     p_sessions = subparsers.add_parser("sessions", help="Show active AI sessions across tmux/terminals and worktree allocation map", parents=[sub_common_parser])
     p_sessions.add_argument("--json", action="store_true", default=False, help="Output sessions report in JSON format")
+
+    # clean (cleanup stale /tmp restore, drill, and temporary artifact directories)
+    p_clean = subparsers.add_parser("clean", help="Clean up stale /tmp restore, drill, and temporary artifact directories", parents=[sub_common_parser])
+    p_clean.add_argument("--all", action="store_true", default=False, help="Clean all temporary makewand caches and artifacts")
 
     from makewand.config import get_all_supported_providers
     all_supported = get_all_supported_providers()
@@ -1553,6 +1631,10 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "race":
         exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout, repo_trust=getattr(args, "repo_trust", "trusted"), synthesize_hybrid=getattr(args, "hybrid", False), total_timeout=args.total_timeout, judge_reserve_seconds=args.judge_reserve_seconds, risk=args.risk, **({"protected_paths": args.protected_paths} if args.protected_paths is not None else {}))
         sys.exit(exit_code if exit_code is not None else 0)
+    elif args.subcommand in ("ensemble", "panel"):
+        cmd_ensemble(args)
+    elif args.subcommand == "clean":
+        cmd_clean(args)
     elif args.subcommand == "candidates":
         cmd_candidates(args)
     elif args.subcommand == "inspect":
@@ -1578,7 +1660,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "sandbox":
         cmd_sandbox(args)
     elif args.subcommand == "claude":
-        ok, out, err = _execute_direct_task("claude", execute_claude_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("claude", execute_claude_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("claude", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1589,7 +1671,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "codex":
-        ok, out, err = _execute_direct_task("codex", execute_codex_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("codex", execute_codex_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("codex", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1600,7 +1682,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "agy":
-        ok, out, err = _execute_direct_task("agy", execute_agy_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("agy", execute_agy_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("agy", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1611,7 +1693,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "muse":
-        ok, out, err = _execute_direct_task("muse", execute_muse_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("muse", execute_muse_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("muse", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1622,7 +1704,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "grok":
-        ok, out, err = _execute_direct_task("grok", execute_grok_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("grok", execute_grok_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("grok", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
@@ -1634,7 +1716,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             sys.exit(_execution_exit_code())
     elif args.subcommand == "local":
         from makewand.providers.local import execute_local_task
-        ok, out, err = _execute_direct_task("local", execute_local_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
+        ok, out, err = _execute_direct_task("local", execute_local_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
         try:
             from makewand.usage import record_engine_usage
             record_engine_usage("local", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)

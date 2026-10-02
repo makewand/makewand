@@ -200,7 +200,7 @@ func TestRestoreCrashJournalProcessRecovery(t *testing.T) {
 	}
 	//nolint:gosec // This launches the trusted current test binary with fixed arguments.
 	command := exec.Command(os.Args[0], "-test.run=^TestRestoreCrashJournalProcessRecovery$")
-	command.Env = append(os.Environ(), "MAKEWAND_RESTORE_CRASH_CHILD=1", "MAKEWAND_RESTORE_CRASH_ARCHIVE="+archive, "MAKEWAND_RESTORE_CRASH_DB="+target, "MAKEWAND_RESTORE_CRASH_AUTH="+targetAuth)
+	command.Env = append(os.Environ(), "MAKEWAND_RESTORE_CRASH_CHILD=1", "MAKEWAND_RESTORE_CRASH_ARCHIVE="+archive, "MAKEWAND_RESTORE_CRASH_DB="+target, "MAKEWAND_RESTORE_CRASH_AUTH="+targetAuth, "TMPDIR="+t.TempDir())
 	err := command.Run()
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 73 {

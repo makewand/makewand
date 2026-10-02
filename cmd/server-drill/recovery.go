@@ -390,6 +390,7 @@ func restoreCrashDrill(ctx context.Context, o options, archive string, r *report
 	}
 	ready := filepath.Join(dir, "crash-ready")
 	command := exec.CommandContext(ctx, executable, "--child-restore", "--state-dir", dir, "--archive", archive, "--ready-file", ready)
+	command.Env = append(os.Environ(), "TMPDIR="+dir)
 	if err = command.Start(); err != nil {
 		return err
 	}

@@ -143,6 +143,8 @@ from makewand.review_verdict import (
     parse_race_verdict,
     compute_patch_parsimony,
 )
+from makewand.ensemble import run_ensemble
+
 
 
 class LocalTestsUnavailable(str):

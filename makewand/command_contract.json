@@ -38,7 +38,9 @@
     "mcp",
     "daemon",
     "sessions",
-    "merge"
+    "merge",
+    "ensemble",
+    "clean"
   ],
   "native_go_commands": [
     "serve",
@@ -67,7 +69,9 @@
     "--risk",
     "--total-timeout",
     "--judge-reserve-seconds",
-    "--protect"
+    "--protect",
+    "--effort",
+    "--reasoning-effort"
   ],
   "shared_value_flags": [
     "-C",
