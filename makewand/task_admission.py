@@ -318,7 +318,7 @@ def get_identity_message() -> str:
         f"  {COLOR_BLUE}• Claude Code (Anthropic){COLOR_RESET}: 高敏捷代码编写、多文件重构与实现\n"
         f"  {COLOR_CYAN}• Codex CLI (OpenAI / gpt-6-astra){COLOR_RESET}: 独立红队代码审查与算法攻防\n"
         f"  {COLOR_RED}• Grok Build CLI (xAI / grok-4.7){COLOR_RESET}: 前沿深度推理、大上下文架构与快速原型开发\n"
-        f"  {COLOR_PURPLE}• Muse Code (Meta / Llama){COLOR_RESET}: 辅助生成、沙箱验证与备用编码\n"
+        f"  {COLOR_PURPLE}• Muse Code (Meta / Muse Spark){COLOR_RESET}: 辅助生成、沙箱验证与备用编码\n"
         f"  {COLOR_GREEN}• Aider / Cursor / Copilot{COLOR_RESET}: 结对编程命令行与代码辅助生成\n"
         f"  {COLOR_CYAN}• DeepSeek / Qwen / GLM / Kimi{COLOR_RESET}: 主流商业云端 API 动态接入\n"
         f"  {COLOR_PURPLE}• Local Self-Hosted (Ollama / vLLM){COLOR_RESET}: 本地私有离线大模型 (0 成本/安全)\n\n"

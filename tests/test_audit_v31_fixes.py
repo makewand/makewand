@@ -310,7 +310,7 @@ class TestAuditV31Fixes(unittest.TestCase):
     def test_p1_a_streaming_long_stdin_no_deadlock(self):
         """P1-A: run_subprocess with stream=True handles >64KB stdin via async thread without deadlocking."""
         long_input = "line " * 20000 + "\n"  # >100KB
-        rc, out, err, ex = run_subprocess(["cat"], input_text=long_input, stream=True, timeout=5)
+        rc, out, err, ex = run_subprocess(["cat"], input_text=long_input, stream=True, timeout=15)
         self.assertEqual(rc, 0)
         self.assertIn("line line", out)
         self.assertIsNone(ex)

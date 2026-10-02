@@ -509,7 +509,7 @@ const IDENTITY_EXPLANATION = `✨ 我是 Makewand (v3.0) —— 零成本多模�
 • 🟢 Google AI Pro (Antigravity / AGY): 全局架构设计、复杂推理与闭环兜底
 • 🔵 Claude Code (Anthropic): 高敏捷代码编写、多文件重构与实现
 • 🔷 Codex CLI (OpenAI / gpt-6-astra): 独立红队代码审查与算法攻防
-• 🟣 Muse Code (Meta / Llama): 辅助生成、沙箱验证与备用编码
+• 🟣 Muse Code (Meta / Muse Spark): 辅助生成、沙箱验证与备用编码
 
 核心能力与架构设计：
 1. 智能意图路由：精准区分闲聊/问答（直接响应）与工程开发任务（多模型流水线），杜绝误触发程序检查或缺陷修复！

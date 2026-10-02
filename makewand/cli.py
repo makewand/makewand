@@ -199,13 +199,24 @@ def cmd_status(args):
     }
 
     from makewand.discovery import get_provider_model_tier
-    codex_active_model = get_provider_model_tier("codex", "standard").get("model", "gpt-6-astra")
+    codex_active_model = get_provider_model_tier("codex", "standard").get("model", "gpt-6.1-sol")
+    claude_active_model = get_provider_model_tier("claude", "standard").get("model", "claude-sonnet-5")
+    agy_active_model = get_provider_model_tier("agy", "standard").get("model", "gemini-3.8-flash")
+    grok_active_model = get_provider_model_tier("grok", "standard").get("model", "grok-4.7")
+    muse_active_model = get_provider_model_tier("muse", "standard").get("model", "muse-spark-1.3-contributor")
+    try:
+        from makewand.providers.local import get_default_local_model
+        local_active_model = get_default_local_model()
+    except Exception:
+        local_active_model = "qwen2.5-coder:7b"
+
     display_names = {
-        "agy": "Antigravity (Google AI Pro / Gemini 3.8)",
-        "claude": "Claude Code (Anthropic Subscription)",
+        "agy": f"Antigravity (Google AI Pro / {agy_active_model})",
+        "claude": f"Claude Code (Anthropic Subscription / {claude_active_model})",
         "codex": f"Codex CLI (OpenAI Subscription / {codex_active_model})",
-        "grok": "Grok Build CLI (xAI Subscription / grok-4.7)",
-        "muse": "Muse Code (Meta Subscription / Llama 4)",
+        "grok": f"Grok Build CLI (xAI Subscription / {grok_active_model})",
+        "muse": f"Muse Code (Meta Subscription / {muse_active_model})",
+        "local": f"Local Self-Hosted (本地大模型 / Ollama / {local_active_model})",
         "aider": "Aider CLI (Pair Programmer CLI)",
         "cursor": "Cursor Agent (Cursor Subscription CLI)",
         "copilot": "GitHub Copilot (CLI / gh copilot)",
@@ -215,7 +226,6 @@ def cmd_status(args):
         "kimi": "Moonshot Kimi API (moonshot-v1)",
         "openrouter": "OpenRouter API (Multi-model Gateway)",
         "siliconflow": "SiliconFlow API (硅基流动 / SiliconCloud)",
-        "local": "Local Self-Hosted (本地大模型 / Ollama / vLLM)"
     }
 
     tool_setup_hints = {
@@ -468,29 +478,20 @@ def cmd_models(args):
     print("   调用方式: 自动读取 models_cache.json 与 config.toml 动态映射档位 (--tier fast/standard/deep)。\n")
 
     print(c("3. Antigravity (Google AI Pro):", COLOR_BOLD + COLOR_GREEN))
-    _model_lines("agy", "~/.gemini/antigravity-cli/settings.json / 模型缓存")
-    print("   调用方式: 自动读取 settings.json 与模型缓存动态映射档位 (--tier fast/standard/deep)。\n")
+    _model_lines("agy", "~/.gemini/antigravity-cli/settings.json / 官方在线模型列表")
+    print("   调用方式: 自动读取 settings.json 与官方在线目录动态映射档位 (--tier fast/standard/deep)。\n")
 
     print(c("4. Muse Code (Meta 订阅):", COLOR_BOLD + COLOR_PURPLE))
-    _model_lines("muse", "~/.config/muse/settings.json")
-    print("   调用方式: 支持 --preset 与 --reasoning-effort。\n")
+    _model_lines("muse", "~/.local/share/muse/model-catalog / ~/.config/muse/settings.json")
+    print("   调用方式: 支持动态模型识别 (--model) 与思考等级 (--reasoning-effort)。\n")
 
     print(c("5. Grok Build CLI (xAI 订阅):", COLOR_BOLD + COLOR_RED))
     _model_lines("grok", "~/.grok/models_cache.json")
     print("   调用方式: 读取 models_cache.json，否则使用内置默认。\n")
 
     print(c("6. Local Self-Hosted (本地大模型 / Ollama / vLLM):", COLOR_BOLD + COLOR_PURPLE))
-    try:
-        from makewand.providers.local import is_local_model_available, get_default_local_model, list_local_models
-        avail, _, _ = is_local_model_available()
-        if avail:
-            print(f"   当前默认: {c(get_default_local_model(), COLOR_GREEN + COLOR_BOLD)}")
-            print(f"   检测到可用模型: {', '.join(list_local_models())}")
-            print("   自适应机制: 使用配置的本地模型端点；数据去向取决于该端点配置。\n")
-        else:
-            print("   状态: 未检测到本地 Ollama / vLLM 服务 (http://localhost:11434 未响应)\n")
-    except Exception as e:
-        print(f"   状态: 检测异常 ({e})\n")
+    _model_lines("local", "本地 Ollama / vLLM 守护服务 (http://localhost:11434)")
+    print("   自适应机制: 实时动态探测本地端点可用标签；数据 100% 离线隐私零 Token。\n")
 
     print(c("--- 模型选择规则 ---", COLOR_BOLD))
     print("  • 优先使用本机 CLI 缓存/配置中检测到的模型；未检测到时使用 makewand 内置的默认模型名 (硬编码兜底，可能过时)。")

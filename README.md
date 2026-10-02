@@ -48,7 +48,7 @@ flowchart TD
         Router --> AGY["Antigravity CLI<br>Google AI Pro / Gemini 3.8"]
         Router --> Claude["Claude Code CLI<br>Anthropic 订阅"]
         Router --> Codex["Codex CLI<br>OpenAI / gpt-6-astra"]
-        Router --> Muse["Muse Code CLI<br>Meta 订阅 / Llama"]
+        Router --> Muse["Muse Code CLI<br>Meta 订阅 / Muse Spark"]
     end
 
     subgraph Pipeline ["协同流水线 Pipeline"]

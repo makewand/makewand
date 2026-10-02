@@ -54,7 +54,7 @@ class TestCollisionHardening(unittest.TestCase):
         # Simulated ps output containing zombies, defunct, and active processes
         fake_ps = (
             "PID PPID TT ELAPSED S COMMAND COMMAND\n"
-            "1001 1000 pts/1 00:10:00 S python3 /home/user/bin/makewand status\n"
+            "1001 1000 pts/1 00:10:00 S python3 /home/alice/bin/makewand status\n"
             "1002 1000 pts/1 00:10:00 Z codex [codex] <defunct>\n"
             "1003 1000 pts/1 00:10:00 Z+ claude <defunct>\n"
             "1004 1000 pts/1 00:10:00 S node /path/to/bin/codex\n"
@@ -83,7 +83,7 @@ class TestCollisionHardening(unittest.TestCase):
             "2002 1 pts/2 01:00:00 S tmux tmux attach -t codex\n"
             "2003 1 pts/2 01:00:00 S git git commit -m 'update makewand collision'\n"
             "2004 1 pts/2 01:00:00 S grep grep -rn makewand .\n"
-            "2005 1 pts/2 01:00:00 S vim vim /mnt/data/makewand/cli.py\n"
+            "2005 1 pts/2 01:00:00 S vim vim /srv/projects/makewand/cli.py\n"
             "2006 1 pts/2 01:00:00 S strategy /usr/local/bin/strategy-app\n"
             "2007 1 pts/2 01:00:00 S agy agy --verbose\n"
             "2008 1 pts/2 01:00:00 S python3 python3 -m makewand plan\n"
@@ -144,9 +144,9 @@ class TestCollisionHardening(unittest.TestCase):
 
     def test_cross_worktree_collision_detection(self):
         """Verify cross-worktree sessions are recognized as same_repo_concurrent."""
-        target_wt = "/mnt/data/repo-main"
-        other_wt = "/mnt/data/repo-wt-feature"
-        unrelated_dir = "/mnt/data/unrelated-repo"
+        target_wt = "/srv/projects/repo-main"
+        other_wt = "/srv/projects/repo-wt-feature"
+        unrelated_dir = "/srv/projects/unrelated-repo"
 
         fake_worktrees = [
             {"path": target_wt, "head": "abc", "branch": "master"},
@@ -191,7 +191,7 @@ class TestCollisionHardening(unittest.TestCase):
 
         with patch("os.path.realpath", side_effect=lambda p: p), \
              patch("makewand.collision.get_git_repo_toplevel", return_value=target_wt), \
-             patch("makewand.collision.get_git_common_dir", return_value="/mnt/data/repo-main/.git"), \
+             patch("makewand.collision.get_git_common_dir", return_value="/srv/projects/repo-main/.git"), \
              patch("makewand.collision.get_git_worktrees", return_value=fake_worktrees), \
              patch("makewand.collision.get_all_active_tmux_panes", return_value=[]), \
              patch("makewand.collision.get_active_ai_processes", return_value=fake_procs), \
@@ -200,7 +200,7 @@ class TestCollisionHardening(unittest.TestCase):
             rep = detect_cross_session_collisions(target_wt)
 
             self.assertTrue(rep["has_collision"])
-            self.assertEqual(rep["git_common_dir"], "/mnt/data/repo-main/.git")
+            self.assertEqual(rep["git_common_dir"], "/srv/projects/repo-main/.git")
             self.assertEqual(len(rep["same_worktree_sessions"]), 1)
             self.assertEqual(rep["same_worktree_sessions"][0]["pid"], 3001)
 
@@ -218,9 +218,9 @@ class TestCollisionHardening(unittest.TestCase):
 
     def test_get_all_active_sessions_report_with_worktrees(self):
         """Verify host-wide session reporting groups worktrees correctly."""
-        main_wt = "/mnt/data/repo-main"
-        other_wt = "/mnt/data/repo-wt-feature"
-        common_git = "/mnt/data/repo-main/.git"
+        main_wt = "/srv/projects/repo-main"
+        other_wt = "/srv/projects/repo-wt-feature"
+        common_git = "/srv/projects/repo-main/.git"
 
         fake_procs = [
             {"pid": 4001, "cwd": main_wt, "ai_type": "claude", "comm": "claude"},
@@ -253,10 +253,10 @@ class TestCollisionHardening(unittest.TestCase):
         """Verify background daemons (app-server, pid-updater, lsp) are filtered out."""
         fake_ps = (
             "PID PPID TT ELAPSED S COMMAND COMMAND\n"
-            "5001 1 ? 06:00:00 S codex /home/user/.codex/packages/app-server-daemon/releases/0.160.0/bin/codex app-server daemon pid-update-loop\n"
-            "5002 5001 ? 06:00:00 S codex /home/user/.codex/packages/app-server-daemon/releases/0.160.0/bin/codex app-server --listen unix:// --managed-daemon\n"
-            "5003 5002 ? 06:00:00 S codex-code-mode /home/user/.codex/packages/app-server-daemon/releases/0.160.0/bin/codex-code-mode-host\n"
-            "5004 1 pts/1 01:00:00 S codex /home/user/.local/bin/codex\n"
+            "5001 1 ? 06:00:00 S codex /home/alice/.codex/packages/app-server-daemon/releases/0.160.0/bin/codex app-server daemon pid-update-loop\n"
+            "5002 5001 ? 06:00:00 S codex /home/alice/.codex/packages/app-server-daemon/releases/0.160.0/bin/codex app-server --listen unix:// --managed-daemon\n"
+            "5003 5002 ? 06:00:00 S codex-code-mode /home/alice/.codex/packages/app-server-daemon/releases/0.160.0/bin/codex-code-mode-host\n"
+            "5004 1 pts/1 01:00:00 S codex /home/alice/.local/bin/codex\n"
         )
         with patch("subprocess.check_output", return_value=fake_ps.encode("utf-8")), \
              patch("os.readlink", return_value="/tmp/test"):
@@ -272,8 +272,8 @@ class TestCollisionHardening(unittest.TestCase):
         """Verify launcher wrapper (node) is pruned when child engine (codex) is present."""
         fake_ps = (
             "PID PPID TT ELAPSED S COMMAND COMMAND\n"
-            "6001 1 pts/9 02:00:00 S node node /home/user/.nvm/versions/node/v20/bin/codex\n"
-            "6002 6001 pts/9 02:00:00 S codex /home/user/.codex/vendor/bin/codex\n"
+            "6001 1 pts/9 02:00:00 S node node /home/alice/.nvm/versions/node/v20/bin/codex\n"
+            "6002 6001 pts/9 02:00:00 S codex /home/alice/.codex/vendor/bin/codex\n"
         )
         with patch("subprocess.check_output", return_value=fake_ps.encode("utf-8")), \
              patch("os.readlink", return_value="/tmp/test"):
@@ -329,7 +329,7 @@ class TestCollisionHardening(unittest.TestCase):
                     "pid": 7001,
                     "ai_type": "claude",
                     "location": "main:0.0",
-                    "cwd": "/mnt/data/repo-other-wt",
+                    "cwd": "/srv/projects/repo-other-wt",
                 }
             ],
             "suggested_worktree_cmd": "git worktree add ...",

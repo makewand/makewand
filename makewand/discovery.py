@@ -203,7 +203,191 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
                 except Exception:
                     pass
 
+    # Check makewand agy models cache if no static models found yet
+    if not discovered_agy:
+        agy_cache_file = Path.home() / ".cache" / "makewand" / "agy_models_cache.json"
+        if not agy_cache_file.exists():
+            _sync_agy_models_cache(cache_file=agy_cache_file)
+        if agy_cache_file.exists():
+            try:
+                cdata = json.loads(agy_cache_file.read_text(encoding="utf-8"))
+                for m in cdata.get("models", []):
+                    if isinstance(m, dict):
+                        slug = m.get("id") or m.get("slug")
+                        desc = m.get("description") or m.get("name") or ""
+                        norm_slug, _ = _normalize_agy_model(slug or "")
+                        if norm_slug and (norm_slug, desc) not in seen:
+                            seen.add((norm_slug, desc))
+                            discovered_agy.append((norm_slug, desc))
+            except Exception:
+                pass
+
     return DiscoveredAgyModels(discovered_agy, configured_default, configured_effort)
+
+
+def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4.0, max_age: float = 43200) -> Optional[Path]:
+    """
+    Syncs available models from `agy models` CLI if cache is absent or older than max_age (12h).
+    Never executes in test isolation mode (MAKEWAND_TEST_ISOLATION_ROOT).
+    """
+    if "MAKEWAND_TEST_ISOLATION_ROOT" in os.environ:
+        return None
+    import shutil
+    import subprocess
+    import time
+    if not shutil.which("agy"):
+        return None
+
+    if cache_file is None:
+        cache_file = Path.home() / ".cache" / "makewand" / "agy_models_cache.json"
+
+    try:
+        if cache_file.exists():
+            age = time.time() - cache_file.stat().st_mtime
+            if age < max_age and cache_file.stat().st_size > 30:
+                return cache_file
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=timeout)
+        if res.returncode == 0 and res.stdout:
+            models_data = []
+            for line in res.stdout.splitlines():
+                line = re.sub(r'^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+Fetching available models\.\.\.', '', line).strip()
+                line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
+                if not line:
+                    continue
+                parts = line.split(None, 1)
+                if parts:
+                    slug = parts[0]
+                    desc = parts[1] if len(parts) > 1 else ""
+                    if _valid_model_id(slug):
+                        models_data.append({"id": slug, "description": desc})
+            if models_data:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp_file = cache_file.with_suffix(".tmp")
+                tmp_file.write_text(json.dumps({"updated_at": time.time(), "models": models_data}, indent=2), encoding="utf-8")
+                tmp_file.replace(cache_file)
+                return cache_file
+    except Exception:
+        pass
+    return None
+
+
+class DiscoveredMuseModels(tuple):
+    """Container for discovered Muse Code model catalog."""
+
+    def __new__(cls, models: List[Tuple[str, str]], configured_default: Optional[str], configured_effort: Optional[str]):
+        return super().__new__(cls, (models, configured_default, configured_effort))
+
+    @property
+    def models(self) -> List[Tuple[str, str]]:
+        return self[0]
+
+    @property
+    def configured_default(self) -> Optional[str]:
+        return self[1]
+
+    @property
+    def configured_effort(self) -> Optional[str]:
+        return self[2]
+
+    def __getitem__(self, item):
+        if item == "models":
+            return self[0]
+        if item == "configured_default":
+            return self[1]
+        if item == "configured_effort":
+            return self[2]
+        if isinstance(item, str):
+            raise KeyError(item)
+        return super().__getitem__(item)
+
+    def get(self, key, default=None):
+        if key == "models":
+            return self[0]
+        if key == "configured_default":
+            return self[1]
+        if key == "configured_effort":
+            return self[2]
+        return default
+
+
+def _discover_local_muse_models() -> DiscoveredMuseModels:
+    """
+    Scans local Muse model-catalog and config directories.
+    Returns DiscoveredMuseModels(models, configured_default, configured_effort).
+    """
+    discovered_muse: List[Tuple[str, str]] = []
+    seen = set()
+    configured_default = None
+    configured_effort = None
+    catalog_default = None
+
+    # 1. Check official model catalog cache
+    muse_cat_bases = []
+    if os.environ.get("MUSE_DATA_DIR"):
+        muse_cat_bases.append(Path(os.environ["MUSE_DATA_DIR"]).expanduser() / "model-catalog")
+    if os.environ.get("XDG_DATA_HOME"):
+        muse_cat_bases.append(Path(os.environ["XDG_DATA_HOME"]).expanduser() / "muse" / "model-catalog")
+    muse_cat_bases.extend([
+        Path.home() / ".local" / "share" / "muse" / "model-catalog",
+        Path.home() / ".config" / "muse" / "model-catalog",
+        Path.home() / ".muse" / "model-catalog",
+    ])
+
+    for cat_dir in muse_cat_bases:
+        if not cat_dir.exists():
+            continue
+        try:
+            for json_file in sorted(cat_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
+                try:
+                    cdata = json.loads(json_file.read_text(encoding="utf-8"))
+                    rows = cdata.get("rows", [])
+                    if isinstance(rows, list):
+                        for r in rows:
+                            if not isinstance(r, dict):
+                                continue
+                            if r.get("visibility") == "hidden":
+                                continue
+                            mid = r.get("model_id") or r.get("id") or r.get("slug")
+                            if not _valid_model_id(mid):
+                                continue
+                            desc = r.get("description") or r.get("display_label") or ""
+                            if (mid, desc) not in seen:
+                                seen.add((mid, desc))
+                                discovered_muse.append((mid, desc))
+                            if (r.get("is_default") or r.get("is_current")) and not catalog_default:
+                                catalog_default = mid
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 2. Check settings.json for user-configured model and effort
+    for s_path in [
+        Path.home() / ".config" / "muse" / "settings.json",
+        Path.home() / ".muse" / "settings.json",
+    ]:
+        if s_path.exists():
+            try:
+                sdata = json.loads(s_path.read_text(encoding="utf-8"))
+                raw_model = sdata.get("model") or sdata.get("default_model")
+                if _valid_model_id(raw_model):
+                    configured_default = raw_model.strip()
+                raw_eff = sdata.get("reasoning_effort") or sdata.get("effort")
+                if raw_eff and isinstance(raw_eff, str) and raw_eff.strip():
+                    eff_val = raw_eff.strip().lower()
+                    if eff_val in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+                        configured_effort = eff_val
+            except Exception:
+                pass
+
+    if not configured_default and catalog_default:
+        configured_default = catalog_default
+
+    return DiscoveredMuseModels(discovered_muse, configured_default, configured_effort)
 
 
 def _tier_resolution(model, effort, *, is_dynamic, full_id=None, effort_source="builtin"):
@@ -234,7 +418,8 @@ def parse_semver(slug: str) -> tuple:
     """
     clean = re.sub(r"\b20\d{6}\b", "", slug)
     clean = re.sub(r"\[\w+\]", "", clean)
-    matches = re.findall(r"(?<![a-zA-Z0-9])(\d+)(?:[.\-_](\d+))?(?:[.\-_](\d+))?(?![a-zA-Z0-9])", clean)
+    clean_no_params = re.sub(r"[:\-]\d+[bB]\b", "", clean)
+    matches = re.findall(r"(?:(?<=[a-zA-Z])|(?<![a-zA-Z0-9]))(\d+)(?:[.\-_](\d+))?(?:[.\-_](\d+))?(?![a-zA-Z0-9])", clean_no_params)
     best_ver = (0, 0, 0)
     for m in matches:
         v = tuple(int(x) if x else 0 for x in m)
@@ -310,8 +495,9 @@ def discover_available_models() -> Dict[str, Any]:
         "claude": {"current_default": "claude-sonnet-5 (Sonnet 5)", "available": ["claude-fable-5-1[1m] (Fable 5.1)", "claude-opus-5-5 (Opus 5.5)", "claude-sonnet-5 (Sonnet 5)", "claude-haiku-4-5-20251001 (Haiku 4.5)"]},
         "codex": {"current_default": "gpt-6-astra", "available": []},
         "agy": {"current_default": "Gemini 3.8 Flash / Pro", "available": ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-pro", "gemini-ultra"]},
-        "muse": {"current_default": "Meta Provider (Default Llama / Code Preset)", "available": ["native-basic", "miniswe"]},
-        "grok": {"current_default": "grok-4.7", "available": ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]}
+        "muse": {"current_default": "muse-spark-1.3-contributor", "available": ["muse-spark-1.3-contributor", "muse-spark-1.3", "muse-spark-1.2-contributor", "muse-spark-1.2"]},
+        "grok": {"current_default": "grok-4.7", "available": ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]},
+        "local": {"current_default": "qwen2.5-coder:7b", "available": ["qwen2.5-coder:7b", "gemma4:31b", "gemma4:26b", "gemma4:e4b"]}
     }
     for entry in models.values():
         entry["source"] = "builtin"
@@ -361,6 +547,24 @@ def discover_available_models() -> Dict[str, Any]:
             if detected:
                 models["claude"]["available"] = detected
                 models["claude"]["source"] = "detected"
+        if models["claude"]["source"] == "detected":
+            cfg_default = None
+            try:
+                if claude_json.exists():
+                    raw_cfg = json.loads(claude_json.read_text(encoding="utf-8"))
+                    m_val = raw_cfg.get("model")
+                    if _valid_model_id(m_val) and m_val.startswith("claude-"):
+                        cfg_default = m_val
+            except Exception:
+                pass
+            if cfg_default:
+                models["claude"]["current_default"] = cfg_default
+                models["claude"]["default_source"] = "detected"
+            elif models["claude"]["available"]:
+                ranked_std = rank_models_for_tier(models["claude"]["available"], "standard")
+                if ranked_std:
+                    models["claude"]["current_default"] = ranked_std[0][1]
+                    models["claude"]["default_source"] = "detected"
     except Exception:
         pass
 
@@ -436,13 +640,28 @@ def discover_available_models() -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Discover Muse settings from ~/.config/muse/settings.json
+    # Discover Muse models from official model catalog (~/.local/share/muse/model-catalog/*.json) and ~/.config/muse/settings.json
     try:
-        muse_settings = Path.home() / ".config" / "muse" / "settings.json"
-        if muse_settings.exists():
-            data = json.loads(muse_settings.read_text(encoding="utf-8"))
-            if _valid_model_id(data.get("model")):
-                models["muse"]["current_default"] = data["model"].strip()
+        muse_res = _discover_local_muse_models()
+        if muse_res.models:
+            muse_available = []
+            for mid, desc in muse_res.models:
+                lbl = f"{mid} ({desc})" if desc else mid
+                muse_available.append(lbl)
+            models["muse"]["available"] = sorted(
+                muse_available,
+                key=lambda x: (parse_semver(x.split()[0]), x),
+                reverse=True
+            )
+            models["muse"]["source"] = "detected"
+
+        if muse_res.configured_default:
+            models["muse"]["current_default"] = muse_res.configured_default
+            models["muse"]["default_source"] = "detected"
+        elif muse_res.models:
+            ranked_std = rank_models_for_tier(muse_res.models, "standard")
+            if ranked_std:
+                models["muse"]["current_default"] = ranked_std[0][1]
                 models["muse"]["default_source"] = "detected"
     except Exception:
         pass
@@ -490,6 +709,19 @@ def discover_available_models() -> Dict[str, Any]:
             if ranked_std:
                 models["agy"]["current_default"] = ranked_std[0][1]
                 models["agy"]["default_source"] = "detected"
+    except Exception:
+        pass
+
+    # Discover Local Self-Hosted (Ollama / vLLM) models
+    try:
+        from makewand.providers.local import is_local_model_available
+        avail, active, local_models = is_local_model_available(timeout=0.8)
+        if avail and local_models:
+            models["local"]["available"] = local_models
+            models["local"]["source"] = "detected"
+            if active:
+                models["local"]["current_default"] = active
+                models["local"]["default_source"] = "detected"
     except Exception:
         pass
 
@@ -643,23 +875,35 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         return _tier_resolution(fallback, effort, is_dynamic=False)
 
     elif provider == "muse":
-        model_name = "muse-spark-1.3-contributor"
-        detected = False
-        configured_effort = None
-        try:
-            muse_settings = Path.home() / ".config" / "muse" / "settings.json"
-            if muse_settings.exists():
-                data = json.loads(muse_settings.read_text(encoding="utf-8"))
-                if _valid_model_id(data.get("model")):
-                    model_name = data["model"].strip()
-                    detected = True
-                cfg_effort = data.get("reasoning_effort") or data.get("effort")
-                if cfg_effort and isinstance(cfg_effort, str):
-                    configured_effort = cfg_effort.strip()
-        except Exception:
-            pass
-        effort = configured_effort if (tier == "standard" and configured_effort) else ("xhigh" if tier == "deep" else ("high" if tier == "standard" else "low"))
-        return _tier_resolution(model_name, effort, is_dynamic=detected)
+        muse_res = _discover_local_muse_models()
+        discovered_muse = muse_res.models
+        configured_default = muse_res.configured_default
+        configured_effort = muse_res.configured_effort
+
+        effort = configured_effort if (tier == "standard" and configured_effort) else ("max" if tier == "deep" else ("low" if tier == "fast" else "high"))
+
+        # If user explicitly configured a model in settings.json and requested standard tier, honor it
+        if tier == "standard" and configured_default:
+            return _tier_resolution(configured_default, effort, is_dynamic=True,
+                                    effort_source="detected" if configured_effort else "builtin")
+
+        if discovered_muse:
+            ranked = rank_models_for_tier(discovered_muse, tier)
+            if ranked:
+                return _tier_resolution(ranked[0][1], effort, is_dynamic=True,
+                                        effort_source="detected" if configured_effort else "builtin")
+
+        if configured_default:
+            return _tier_resolution(configured_default, effort, is_dynamic=True,
+                                    effort_source="detected" if configured_effort else "builtin")
+
+        # Static fallback when no dynamic catalog is detected
+        fallback_models = {
+            "fast": "muse-spark-1.2",
+            "deep": "muse-spark-1.3",
+            "standard": "muse-spark-1.3-contributor",
+        }
+        return _tier_resolution(fallback_models.get(tier, "muse-spark-1.3-contributor"), effort, is_dynamic=False)
 
     elif provider == "agy":
         agy_res = _discover_local_agy_models()
@@ -687,6 +931,23 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         }
         fallback_effort = "high" if tier in ("deep", "standard") else "low"
         return _tier_resolution(fallback_models.get(tier, "gemini-3.8-flash-high"), fallback_effort, is_dynamic=False)
+
+    elif provider in ("local", "ollama"):
+        try:
+            from makewand.providers.local import is_local_model_available
+            avail, active, models_list = is_local_model_available(timeout=0.8)
+            if avail:
+                if tier == "standard" and active:
+                    return _tier_resolution(active, "medium", is_dynamic=True, effort_source="builtin")
+                if models_list:
+                    ranked = rank_models_for_tier(models_list, tier)
+                    target = ranked[0][1] if ranked else (active or models_list[0])
+                    return _tier_resolution(target, "medium", is_dynamic=True, effort_source="builtin")
+                if active:
+                    return _tier_resolution(active, "medium", is_dynamic=True, effort_source="builtin")
+        except Exception:
+            pass
+        return _tier_resolution("qwen2.5-coder:7b", "medium", is_dynamic=False, effort_source="builtin")
 
     return _tier_resolution("default", "medium", is_dynamic=False)
 

@@ -32,7 +32,7 @@ class DiscoveryProvenanceTests(unittest.TestCase):
         return path
 
     def test_absent_caches_and_static_agy_presets_are_not_dynamic(self):
-        for provider in ("claude", "codex", "grok", "muse", "agy"):
+        for provider in ("claude", "codex", "grok", "muse", "agy", "local"):
             for tier in ("fast", "standard", "deep"):
                 with self.subTest(provider=provider, tier=tier):
                     result = get_provider_model_tier(provider, tier)
@@ -186,6 +186,82 @@ class DiscoveryProvenanceTests(unittest.TestCase):
         self.assertIn(("gemini-3.8-pro", "frontier deep"), models)
         with self.assertRaises(KeyError):
             _ = res["unknown_key"]
+
+    def test_muse_catalog_discovery(self):
+        self.write(".local/share/muse/model-catalog/catalog.json", {
+            "rows": [
+                {
+                    "model_id": "muse-spark-1.4",
+                    "display_label": "Muse Spark 1.4 Next",
+                    "description": "Frontier next gen coding agent",
+                    "is_default": True,
+                    "reasoning_effort_variants": ["low", "high", "max"]
+                },
+                {
+                    "model_id": "muse-spark-1.3",
+                    "display_label": "Muse Spark 1.3",
+                    "description": "Standard workhorse coding agent",
+                    "is_default": False
+                }
+            ]
+        })
+        models = discover_available_models()
+        self.assertEqual(models["muse"]["source"], "detected")
+        self.assertEqual(models["muse"]["current_default"], "muse-spark-1.4")
+        self.assertEqual(models["muse"]["default_source"], "detected")
+        self.assertIn("muse-spark-1.4 (Frontier next gen coding agent)", models["muse"]["available"])
+
+        res_deep = get_provider_model_tier("muse", "deep")
+        self.assertTrue(res_deep["is_dynamic"])
+        self.assertEqual(res_deep["model"], "muse-spark-1.4")
+        self.assertEqual(res_deep["effort"], "max")
+
+    def test_claude_dynamic_default_source(self):
+        self.write(".claude/cache/model-catalog/catalog.json", {"catalog": {"config": {"models": [
+            {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5", "description": "Workhorse"},
+            {"id": "claude-haiku-4-5", "name": "Haiku 4.5", "description": "Fast"}
+        ]}}})
+        self.write(".claude.json", {"model": "claude-sonnet-5-5"})
+        models = discover_available_models()
+        self.assertEqual(models["claude"]["source"], "detected")
+        self.assertEqual(models["claude"]["current_default"], "claude-sonnet-5-5")
+        self.assertEqual(models["claude"]["default_source"], "detected")
+
+    @patch("makewand.providers.local.is_local_model_available")
+    def test_local_model_mock_discovery(self, mock_is_avail):
+        mock_is_avail.return_value = (True, "gemma4:31b", ["gemma4:31b", "qwen2.5-coder:7b"])
+        models = discover_available_models()
+        self.assertEqual(models["local"]["source"], "detected")
+        self.assertEqual(models["local"]["current_default"], "gemma4:31b")
+        self.assertEqual(models["local"]["default_source"], "detected")
+        self.assertEqual(models["local"]["available"], ["gemma4:31b", "qwen2.5-coder:7b"])
+
+        res = get_provider_model_tier("local", "standard")
+        self.assertTrue(res["is_dynamic"])
+        self.assertEqual(res["model"], "gemma4:31b")
+
+    def test_discover_local_muse_models_helper(self):
+        from makewand.discovery import _discover_local_muse_models
+        self.write(".local/share/muse/model-catalog/cat.json", {
+            "rows": [
+                {"model_id": "muse-spark-1.3", "description": "Standard workhorse", "is_default": True}
+            ]
+        })
+        self.write(".config/muse/settings.json", {
+            "model": "muse-spark-1.3",
+            "reasoning_effort": "max"
+        })
+        res = _discover_local_muse_models()
+        self.assertEqual(res.configured_default, "muse-spark-1.3")
+        self.assertEqual(res.configured_effort, "max")
+        self.assertEqual(res["configured_default"], "muse-spark-1.3")
+        models, default, effort = res
+        self.assertEqual(default, "muse-spark-1.3")
+        self.assertEqual(effort, "max")
+        self.assertIn(("muse-spark-1.3", "Standard workhorse"), models)
+        with self.assertRaises(KeyError):
+            _ = res["unknown_key"]
+
 
 
 if __name__ == "__main__":
