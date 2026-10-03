@@ -196,7 +196,10 @@ func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string)
 	layout.goVersion = goVersion
 
 	if info, err := os.Stat(home); err != nil || !info.IsDir() {
-		// Nothing to hide (and nothing could have been installed under it).
+		// If home does not exist or is not a directory, still re-bind toolchains.
+		for _, root := range roots {
+			layout.beforeWorkspace = append(layout.beforeWorkspace, "--ro-bind", root, root)
+		}
 		return layout
 	}
 
@@ -206,6 +209,11 @@ func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string)
 		// the workspace itself: mask the known-sensitive entries individually,
 		// after the workspace bind so the bind cannot re-expose them.
 		layout.afterWorkspace = sandboxMaskSensitiveEntries(home, workspace)
+		for _, root := range roots {
+			if !pathWithin(home, root) {
+				layout.beforeWorkspace = append(layout.beforeWorkspace, "--ro-bind", root, root)
+			}
+		}
 	case pathWithin(workspace, home):
 		// HOME lives inside the workspace: hide it after the workspace bind.
 		layout.afterWorkspace = sandboxHideHomeArgs(home, roots)
@@ -229,9 +237,10 @@ func sandboxHideHomeArgs(home string, roots []string) []string {
 // has to be created. Entries containing keep (the workspace) are left alone.
 func sandboxMaskSensitiveEntries(home, keep string) []string {
 	var out []string
+	cleanKeep := filepath.Clean(keep)
 	for _, entry := range sandboxSensitiveHomeEntries {
 		target := filepath.Join(home, filepath.FromSlash(entry))
-		if pathWithin(target, keep) {
+		if target == cleanKeep || pathWithin(target, cleanKeep) {
 			continue
 		}
 		info, err := os.Lstat(target)
@@ -239,10 +248,29 @@ func sandboxMaskSensitiveEntries(home, keep string) []string {
 			continue
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			// bwrap follows the destination symlink; mask whatever it resolves to.
+			real, statErr := filepath.EvalSymlinks(target)
+			if statErr != nil {
+				continue // dangling symlink: nothing readable behind it
+			}
+			if real == cleanKeep || pathWithin(real, cleanKeep) {
+				continue
+			}
+			// If real is already under a masked host root and not within keep,
+			// it is already hidden wholesale.
+			alreadyMasked := false
+			for _, m := range sandboxMaskedHostRoots {
+				if pathWithin(m, real) && !pathWithin(cleanKeep, real) {
+					alreadyMasked = true
+					break
+				}
+			}
+			if alreadyMasked {
+				continue
+			}
+			target = real
 			resolved, statErr := os.Stat(target)
 			if statErr != nil {
-				continue // dangling: nothing readable behind it
+				continue
 			}
 			info = resolved
 		}
@@ -257,7 +285,7 @@ func sandboxMaskSensitiveEntries(home, keep string) []string {
 
 // sandboxMaskedHostRoots lists host root prefixes that should be masked with tmpfs
 // to prevent cross-project and credential inspection.
-var sandboxMaskedHostRoots = []string{"/root", "/mnt", "/media", "/srv"}
+var sandboxMaskedHostRoots = []string{"/root", "/home", "/mnt", "/media", "/srv"}
 
 func sandboxMaskedRoots(workspace string) []string {
 	var out []string
@@ -269,9 +297,6 @@ func sandboxMaskedRoots(workspace string) []string {
 	for _, r := range sandboxMaskedHostRoots {
 		r = filepath.Clean(r)
 		if r == "/" || r == cleanWS || (home != "" && r == home) {
-			continue
-		}
-		if pathWithin(r, cleanWS) || (home != "" && pathWithin(r, home)) {
 			continue
 		}
 		fi, err := os.Stat(r)
@@ -310,6 +335,32 @@ func sandboxWorkspaceSocketMasks(workspace string) []string {
 	return out
 }
 
+func isMaskedHostRoot(p string) bool {
+	p = filepath.Clean(p)
+	if p == "/" {
+		return true
+	}
+	for _, m := range sandboxMaskedHostRoots {
+		if p == filepath.Clean(m) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPathHiddenBySandbox(home, p string) bool {
+	p = filepath.Clean(p)
+	if home != "" && pathWithin(home, p) {
+		return true
+	}
+	for _, m := range sandboxMaskedHostRoots {
+		if pathWithin(m, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveSandboxToolchains resolves the host toolchains the sandbox needs:
 // the read-only HOME subtrees to re-bind, extra environment, and the host Go
 // version.
@@ -317,7 +368,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	candidates := map[string]struct{}{}
 	addRoot := func(root string) {
 		root = filepath.Clean(root)
-		if root == home || !pathWithin(home, root) || pathWithin(workspace, root) {
+		if root == home || isMaskedHostRoot(root) || !isPathHiddenBySandbox(home, root) || pathWithin(workspace, root) {
 			return
 		}
 		if sandboxPathTouchesSensitive(home, root) {
@@ -337,7 +388,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 		}
 		resolved[name] = bin
 		for _, hop := range symlinkChain(bin) {
-			if !pathWithin(home, hop) {
+			if !isPathHiddenBySandbox(home, hop) {
 				continue
 			}
 			if root := sandboxToolchainRoot(home, hop); root != "" {
@@ -361,7 +412,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 		}
 		if hostEnv, err := sandboxGoEnvProbe(goBin); err == nil {
 			goVersion = strings.TrimSpace(hostEnv.GOVERSION)
-			if goroot := strings.TrimSpace(hostEnv.GOROOT); goroot != "" && filepath.IsAbs(goroot) && pathWithin(home, goroot) {
+			if goroot := strings.TrimSpace(hostEnv.GOROOT); goroot != "" && filepath.IsAbs(goroot) && isPathHiddenBySandbox(home, goroot) {
 				addRoot(goroot)
 			}
 			var proxies []string
@@ -371,7 +422,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 					// The host module cache doubles as a read-only offline
 					// proxy, so network-isolated test runs reuse modules the
 					// host already has instead of failing to download them.
-					if pathWithin(home, download) {
+					if isPathHiddenBySandbox(home, download) {
 						addRoot(download)
 					}
 					proxies = append(proxies, "file://"+filepath.ToSlash(download))
@@ -403,7 +454,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 			rustupHome = filepath.Join(home, ".rustup")
 		}
 		if info, err := os.Stat(rustupHome); err == nil && info.IsDir() {
-			if pathWithin(home, rustupHome) {
+			if isPathHiddenBySandbox(home, rustupHome) {
 				addRoot(rustupHome)
 			}
 			// The sandbox HOME differs from the host one, so rustup proxies
@@ -416,19 +467,19 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 }
 
 // sandboxToolchainRoot picks the directory to re-bind for a toolchain binary
-// under HOME: the installation root (parent of bin/ or shims/) when that root
-// holds no sensitive entries, otherwise the containing directory, otherwise
-// the binary alone. It never returns HOME itself.
+// under HOME or masked host roots: the installation root (parent of bin/ or shims/)
+// when that root holds no sensitive entries, otherwise the containing directory,
+// otherwise the binary alone. It never returns HOME or masked roots themselves.
 func sandboxToolchainRoot(home, bin string) string {
 	dir := filepath.Dir(bin)
 	switch filepath.Base(dir) {
 	case "bin", "sbin", "shims":
 		root := filepath.Dir(dir)
-		if root != home && pathWithin(home, root) && !sandboxPathTouchesSensitive(home, root) {
+		if root != home && !isMaskedHostRoot(root) && !sandboxPathTouchesSensitive(home, root) {
 			return root
 		}
 	}
-	if dir != home && pathWithin(home, dir) && !sandboxPathTouchesSensitive(home, dir) {
+	if dir != home && !isMaskedHostRoot(dir) && !sandboxPathTouchesSensitive(home, dir) {
 		return dir
 	}
 	if !sandboxPathTouchesSensitive(home, bin) {
@@ -440,9 +491,24 @@ func sandboxToolchainRoot(home, bin string) string {
 // sandboxPathTouchesSensitive reports whether exposing p would expose a
 // sensitive HOME entry: p contains one, or lies inside one.
 func sandboxPathTouchesSensitive(home, p string) bool {
+	p = filepath.Clean(p)
+	if home != "" && pathWithin(home, p) {
+		for _, entry := range sandboxSensitiveHomeEntries {
+			sensitive := filepath.Join(home, filepath.FromSlash(entry))
+			if pathWithin(p, sensitive) || pathWithin(sensitive, p) {
+				return true
+			}
+		}
+		return false
+	}
+	pSlash := filepath.ToSlash(p)
 	for _, entry := range sandboxSensitiveHomeEntries {
-		sensitive := filepath.Join(home, filepath.FromSlash(entry))
-		if pathWithin(p, sensitive) || pathWithin(sensitive, p) {
+		entrySlash := "/" + entry
+		if strings.Contains(pSlash, entrySlash+"/") || strings.HasSuffix(pSlash, entrySlash) || pSlash == entrySlash {
+			return true
+		}
+		candidate := filepath.Join(p, filepath.FromSlash(entry))
+		if fi, err := os.Stat(candidate); err == nil && (fi.IsDir() || fi.Mode().IsRegular()) {
 			return true
 		}
 	}

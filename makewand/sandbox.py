@@ -38,6 +38,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from contextlib import contextmanager
 
 from makewand.providers.base import run_subprocess
 
@@ -1398,7 +1399,7 @@ def apply_posix_sandbox_rlimits():
     try:
         nproc_limit = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_NPROC", 65536))
         cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_NPROC)
-        effective_limit = max(nproc_limit, cur_soft) if cur_soft > 0 else nproc_limit
+        effective_limit = min(nproc_limit, cur_soft) if cur_soft > 0 else nproc_limit
         if cur_hard == resource.RLIM_INFINITY or cur_hard < 0:
             soft = effective_limit
         else:
@@ -1509,6 +1510,28 @@ def _cleanup_uncreated_sensitive_files(paths: List[str]) -> None:
                 pass
 
 
+@contextmanager
+def sandbox_lifecycle(
+    is_provider: bool = False,
+    provider_name: Optional[str] = None,
+    cmd: Optional[List[str]] = None,
+):
+    """
+    Manages safe provider sandbox lifecycle.
+    Tracks uncreated sensitive provider files before execution and ensures any that
+    are created during execution are cleanly removed on completion.
+    """
+    tracked = _collect_uncreated_sensitive_files(
+        is_provider=is_provider,
+        provider_name=provider_name,
+        cmd=cmd,
+    )
+    try:
+        yield tracked
+    finally:
+        _cleanup_uncreated_sensitive_files(tracked)
+
+
 def run_in_sandbox(
     cmd: List[str],
     workspace: str,
@@ -1535,81 +1558,77 @@ def run_in_sandbox(
     exec_cmd = cmd
     seccomp_r = None
     pass_fds: tuple = ()
-    tracked_uncreated = _collect_uncreated_sensitive_files(
-        is_provider=is_provider,
-        provider_name=provider_name,
-        cmd=cmd,
-    )
-    try:
-        if is_bwrap_available():
-            if enable_seccomp:
-                bpf_filter = generate_seccomp_bpf_filter()
-                if bpf_filter:
-                    try:
-                        r, w = os.pipe()
-                        os.write(w, bpf_filter)
-                        os.close(w)
-                        seccomp_r = r
-                        pass_fds = (seccomp_r,)
-                    except Exception:
-                        seccomp_r = None
-                        pass_fds = ()
-
-            try:
-                exec_cmd = wrap_bwrap(
-                    cmd,
-                    workspace=workspace,
-                    allow_network=allow_network,
-                    readonly=readonly,
-                    repo_root=repo_root,
-                    is_provider=is_provider,
-                    worktree_root=worktree_root,
-                    extra_env=extra_env,
-                    provider_name=provider_name,
-                    extra_ro_binds=extra_ro_binds,
-                    seccomp_fd=seccomp_r,
-                )
-            except SandboxConfigError as exc:
-                _warn(str(exc))
-                return -1, "", str(exc), "SandboxConfigError"
-        else:
-            authorized, source = resolve_unsafe_host_exec()
-            if not authorized:
-                msg = (
-                    "Bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged "
-                    "(MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
-                )
-                _warn(msg)
-                return -1, "", msg, "SandboxUnavailable"
-            audit_unsafe_host_exec(audit_context, cmd, os.path.abspath(workspace), source)
-
-        # Dynamic backpressure: when host load is elevated, deprioritize background sandbox task
+    with sandbox_lifecycle(is_provider=is_provider, provider_name=provider_name, cmd=cmd):
         try:
-            load_1m = os.getloadavg()[0]
-            if load_1m > 10.0:
-                nice_bin = shutil.which("nice")
-                if nice_bin:
-                    nice_val = "15" if load_1m > 18.0 else "10"
-                    exec_cmd = [nice_bin, "-n", nice_val] + exec_cmd
-                ionice_bin = shutil.which("ionice")
-                if ionice_bin and load_1m > 12.0:
-                    exec_cmd = [ionice_bin, "-c2", "-n7"] + exec_cmd
-        except Exception:
-            pass
+            if is_bwrap_available():
+                if enable_seccomp:
+                    bpf_filter = generate_seccomp_bpf_filter()
+                    if bpf_filter:
+                        try:
+                            r, w = os.pipe()
+                            os.write(w, bpf_filter)
+                            os.close(w)
+                            seccomp_r = r
+                            pass_fds = (seccomp_r,)
+                        except Exception:
+                            seccomp_r = None
+                            pass_fds = ()
 
-        return run_subprocess(
-            exec_cmd,
-            timeout=timeout,
-            cwd=workspace,
-            stream=stream,
-            print_prefix=print_prefix,
-            pass_fds=pass_fds,
-            preexec_fn=apply_posix_sandbox_rlimits,
-        )
-    finally:
-        _cleanup_uncreated_sensitive_files(tracked_uncreated)
-        if seccomp_r is not None:
+                try:
+                    exec_cmd = wrap_bwrap(
+                        cmd,
+                        workspace=workspace,
+                        allow_network=allow_network,
+                        readonly=readonly,
+                        repo_root=repo_root,
+                        is_provider=is_provider,
+                        worktree_root=worktree_root,
+                        extra_env=extra_env,
+                        provider_name=provider_name,
+                        extra_ro_binds=extra_ro_binds,
+                        seccomp_fd=seccomp_r,
+                    )
+                except SandboxConfigError as exc:
+                    _warn(str(exc))
+                    return -1, "", str(exc), "SandboxConfigError"
+            else:
+                authorized, source = resolve_unsafe_host_exec()
+                if not authorized:
+                    msg = (
+                        "Bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged "
+                        "(MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
+                    )
+                    _warn(msg)
+                    return -1, "", msg, "SandboxUnavailable"
+                audit_unsafe_host_exec(audit_context, cmd, os.path.abspath(workspace), source)
+
+            # Dynamic backpressure: when host load is elevated, deprioritize background sandbox task
             try:
-                os.close(seccomp_r)
+                load_1m = os.getloadavg()[0]
+                if load_1m > 10.0:
+                    nice_bin = shutil.which("nice")
+                    if nice_bin:
+                        nice_val = "15" if load_1m > 18.0 else "10"
+                        exec_cmd = [nice_bin, "-n", nice_val] + exec_cmd
+                    ionice_bin = shutil.which("ionice")
+                    if ionice_bin and load_1m > 12.0:
+                        exec_cmd = [ionice_bin, "-c2", "-n7"] + exec_cmd
             except Exception:
+                pass
+
+            return run_subprocess(
+                exec_cmd,
+                timeout=timeout,
+                cwd=workspace,
+                stream=stream,
+                print_prefix=print_prefix,
+                pass_fds=pass_fds,
+                preexec_fn=apply_posix_sandbox_rlimits,
+            )
+        finally:
+            if seccomp_r is not None:
+                try:
+                    os.close(seccomp_r)
+                except Exception:
+                    pass
                 pass

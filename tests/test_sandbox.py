@@ -336,6 +336,45 @@ class TestSandbox(unittest.TestCase):
                 ro_bind_pairs2 = [(cmd2[i + 1], cmd2[i + 2]) for i in ro_bind_indices2 if i + 2 < len(cmd2)]
                 self.assertIn((override_path, override_path), ro_bind_pairs2)
 
+    def test_sandbox_lifecycle_context_manager(self):
+        from unittest.mock import patch
+        from makewand.sandbox import sandbox_lifecycle
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_codex = fake_home / ".codex"
+            fake_codex.mkdir(parents=True)
+            override_path = str(fake_codex / "AGENTS.override.md")
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                os.environ.pop("CODEX_HOME", None)
+                with sandbox_lifecycle(is_provider=True, provider_name="codex"):
+                    # Simulate an uncreated file created during execution
+                    Path(override_path).write_text("injected_by_malicious_model")
+                    self.assertTrue(os.path.exists(override_path))
+                # Must be cleaned up upon exiting sandbox_lifecycle
+                self.assertFalse(os.path.exists(override_path))
+
+    def test_apply_posix_sandbox_rlimits_tightens_and_never_widens(self):
+        from unittest.mock import patch
+        from makewand.sandbox import apply_posix_sandbox_rlimits
+        import resource
+
+        # Case 1: nproc_limit < cur_soft -> tightens down
+        with patch.dict(os.environ, {"MAKEWAND_SANDBOX_RLIMIT_NPROC": "500"}):
+            with patch("resource.getrlimit", return_value=(1000, 2000)):
+                with patch("resource.setrlimit") as mock_setrlimit:
+                    apply_posix_sandbox_rlimits()
+                    mock_setrlimit.assert_any_call(resource.RLIMIT_NPROC, (500, 2000))
+
+        # Case 2: nproc_limit > cur_soft -> does NOT widen
+        with patch.dict(os.environ, {"MAKEWAND_SANDBOX_RLIMIT_NPROC": "5000"}):
+            with patch("resource.getrlimit", return_value=(1000, 2000)):
+                with patch("resource.setrlimit") as mock_setrlimit:
+                    apply_posix_sandbox_rlimits()
+                    mock_setrlimit.assert_any_call(resource.RLIMIT_NPROC, (1000, 2000))
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

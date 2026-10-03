@@ -87,14 +87,16 @@ def execute_aider_task(
         print(c(f"[Makewand -> Aider] 派发{log_desc}至 Aider Pair Programmer (沙箱隔离)...", COLOR_GREEN), file=sys.stderr)
 
         from makewand.execution_runtime import mark_provider_invocation
+        from makewand.sandbox import sandbox_lifecycle
         mark_provider_invocation()
-        code, out, err, ex = run_subprocess(
-            cmd,
-            timeout=timeout,
-            cwd=work_dir,
-            stream=stream,
-            print_prefix=c("[Aider Live]", COLOR_GREEN)
-        )
+        with sandbox_lifecycle(is_provider=True, provider_name="aider", cmd=cmd):
+            code, out, err, ex = run_subprocess(
+                cmd,
+                timeout=timeout,
+                cwd=work_dir,
+                stream=stream,
+                print_prefix=c("[Aider Live]", COLOR_GREEN)
+            )
     finally:
         if p_file and os.path.exists(p_file):
             try:

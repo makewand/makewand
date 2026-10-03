@@ -158,14 +158,16 @@ def execute_grok_task(
         import sys
         print(c(f"[Makewand -> Grok] 派发{log_desc} (Tier: {tier}, xAI Provider)...", COLOR_YELLOW), file=sys.stderr)
         from makewand.execution_runtime import mark_provider_invocation
+        from makewand.sandbox import sandbox_lifecycle
         mark_provider_invocation()
-        code, out, err, ex = run_subprocess(
-            cmd,
-            timeout=timeout,
-            cwd=cwd,
-            stream=stream,
-            print_prefix=c("[Grok Live]", COLOR_YELLOW)
-        )
+        with sandbox_lifecycle(is_provider=True, provider_name="grok", cmd=cmd):
+            code, out, err, ex = run_subprocess(
+                cmd,
+                timeout=timeout,
+                cwd=cwd,
+                stream=stream,
+                print_prefix=c("[Grok Live]", COLOR_YELLOW)
+            )
     finally:
         if p_file and os.path.exists(p_file):
             try:

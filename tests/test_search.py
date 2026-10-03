@@ -10,6 +10,7 @@ except ImportError:  # python3 -m unittest tests.<module>
 import os
 import unittest
 import tempfile
+import subprocess
 from pathlib import Path
 from makewand.search import safe_search
 
@@ -114,6 +115,54 @@ class TestSearchGuardrail(unittest.TestCase):
                 results = safe_search("symlink_token_secret", root_path=str(code_dir))
                 # Must skip the symlink inside code_dir
                 self.assertEqual(len(results), 0)
+
+    def test_safe_search_rg_includes_max_count(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "doc.txt").write_text("match\nmatch\nmatch\n")
+            captured_cmd = []
+
+            original_popen = subprocess.Popen
+            def fake_popen(cmd, *args, **kwargs):
+                captured_cmd.extend(cmd)
+                return original_popen(cmd, *args, **kwargs)
+
+            with patch("makewand.search.subprocess.Popen", side_effect=fake_popen):
+                results = safe_search("match", root_path=tmpdir, max_results=2)
+                self.assertIn("--max-count", captured_cmd)
+                self.assertIn("2", captured_cmd)
+                self.assertEqual(len(results), 2)
+
+    def test_safe_search_walk_limits_files_and_bytes(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for i in range(10):
+                (root / f"f{i}.txt").write_text("walk_guard_test\n")
+
+            with patch("makewand.search.find_ripgrep", return_value=None):
+                with patch("makewand.search.MAX_WALK_VISITED_FILES", 3):
+                    results = safe_search("walk_guard_test", root_path=tmpdir)
+                    self.assertLessEqual(len(results), 3)
+
+    def test_safe_search_rg_timeout(self):
+        from unittest.mock import patch, MagicMock
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Simulate infinite lines from stdout
+            mock_proc = MagicMock()
+            def infinite_lines():
+                while True:
+                    yield '{"type":"match","data":{"path":{"text":"f.txt"},"line_number":1,"lines":{"text":"match"}}}\n'
+            mock_proc.stdout = infinite_lines()
+            mock_proc.terminate = MagicMock()
+            mock_proc.wait = MagicMock()
+
+            with patch("makewand.search.find_ripgrep", return_value="/usr/bin/rg"):
+                with patch("makewand.search.subprocess.Popen", return_value=mock_proc):
+                    with patch("makewand.search.MAX_RG_TIME_SECONDS", 0.05):
+                        results = safe_search("match", root_path=tmpdir, max_results=1000000)
+                        mock_proc.terminate.assert_called()
 
 
 if __name__ == "__main__":

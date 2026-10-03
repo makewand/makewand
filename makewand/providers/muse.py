@@ -188,14 +188,16 @@ def execute_muse_task(
         import sys
         print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
         from makewand.execution_runtime import mark_provider_invocation
+        from makewand.sandbox import sandbox_lifecycle
         mark_provider_invocation()
-        code, out, err, ex = run_subprocess(
-            cmd,
-            timeout=timeout,
-            cwd=cwd,
-            stream=stream,
-            print_prefix=c("[Muse Live]", COLOR_PURPLE)
-        )
+        with sandbox_lifecycle(is_provider=True, provider_name="muse", cmd=cmd):
+            code, out, err, ex = run_subprocess(
+                cmd,
+                timeout=timeout,
+                cwd=cwd,
+                stream=stream,
+                print_prefix=c("[Muse Live]", COLOR_PURPLE)
+            )
     finally:
         if p_file and os.path.exists(p_file):
             try:

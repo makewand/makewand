@@ -181,10 +181,16 @@ def execute_local_task(
         "keep_alive": "0"
     }
 
-    if is_training or (free_vram is not None and free_vram < 12288):
-        reason = f"检测到重要计算任务在运行: {train_info}" if is_training else f"显存仅余 {free_vram}MB"
+    if is_training or free_vram is None or free_vram < 12288:
+        if is_training:
+            reason = f"检测到重要计算任务在运行: {train_info}"
+        elif free_vram is None:
+            reason = "GPU 显存状态探测不可用 (fail-closed)"
+        else:
+            reason = f"显存仅余 {free_vram}MB"
         print(c(f"🛡️ [GPU 保护与低优先级调度] {reason}。为绝对保证训练任务零 OOM 风险，编程模型 ({active_model}) 已降权并强制卸载至 CPU+RAM 伴随运行 (0 显存争抢)...", COLOR_YELLOW), file=sys.stderr)
-        extra_params["options"] = {"num_gpu": 0, "num_thread": 16}
+        threads = min(16, max(1, os.cpu_count() or 4))
+        extra_params["options"] = {"num_gpu": 0, "num_thread": threads}
     else:
         print(c(f"⚡ [GPU 加速运行] 当前显存充裕 ({free_vram}MB 可用，无正在进行的重型训练任务)，启用本地 GPU 加速运行...", COLOR_GREEN), file=sys.stderr)
 

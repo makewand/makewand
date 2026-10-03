@@ -550,6 +550,13 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 	}
 	cmd := buildCmd(ctx, prompt)
 	applyCLIWorkDir(ctx, cmd, scratchDir)
+	wrappedCmd, err := wrapCLICommandWithSandbox(ctx, c.provider, cmd)
+	if err != nil {
+		cancel()
+		cleanupWorkDir()
+		return nil, err
+	}
+	cmd = wrappedCmd
 	setCLIProcessGroup(cmd)
 	// Let exec own the OS pipes so WaitDelay can bound inherited descriptors
 	// after leader exit. Waiting only after Scanner sees EOF leaves that bound
@@ -1044,6 +1051,11 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt, validationPrompt,
 func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validationPrompt, scratchDir string) (string, *Usage, error) {
 	cmd := c.buildCmd(ctx, prompt)
 	applyCLIWorkDir(ctx, cmd, scratchDir)
+	wrappedCmd, err := wrapCLICommandWithSandbox(ctx, c.provider, cmd)
+	if err != nil {
+		return "", nil, err
+	}
+	cmd = wrappedCmd
 	setCLIProcessGroup(cmd)
 
 	capture := processjob.NewCapture(processjob.MaxOutputBytes, func() { killCLIProcess(cmd) })

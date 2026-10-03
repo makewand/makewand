@@ -138,15 +138,17 @@ def execute_claude_task(
     import sys
     print(c(f"[Makewand -> Claude] 派发{log_desc} (Tier: {tier})...", COLOR_BLUE), file=sys.stderr)
     from makewand.execution_runtime import mark_provider_invocation
+    from makewand.sandbox import sandbox_lifecycle
     mark_provider_invocation()
-    code, out, err, ex = run_subprocess(
-        cmd,
-        timeout=timeout,
-        cwd=cwd,
-        input_text=input_text,
-        stream=stream,
-        print_prefix=c("[Claude Live]", COLOR_BLUE)
-    )
+    with sandbox_lifecycle(is_provider=True, provider_name="claude", cmd=cmd):
+        code, out, err, ex = run_subprocess(
+            cmd,
+            timeout=timeout,
+            cwd=cwd,
+            input_text=input_text,
+            stream=stream,
+            print_prefix=c("[Claude Live]", COLOR_BLUE)
+        )
     combined = f"{out}\n{err}" if not stream else out
 
     if code == 0:

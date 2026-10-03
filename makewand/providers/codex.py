@@ -142,15 +142,17 @@ def execute_codex_task(
     import sys
     print(c(f"[Makewand -> Codex] 派发任务 (Tier: {tier}, {target_model})...", COLOR_CYAN), file=sys.stderr)
     from makewand.execution_runtime import mark_provider_invocation
+    from makewand.sandbox import sandbox_lifecycle
     mark_provider_invocation()
-    code, out, err, ex = run_subprocess(
-        cmd,
-        timeout=timeout,
-        cwd=cwd,
-        input_text=input_text,
-        stream=stream,
-        print_prefix=c("[Codex Live]", COLOR_CYAN)
-    )
+    with sandbox_lifecycle(is_provider=True, provider_name="codex", cmd=cmd):
+        code, out, err, ex = run_subprocess(
+            cmd,
+            timeout=timeout,
+            cwd=cwd,
+            input_text=input_text,
+            stream=stream,
+            print_prefix=c("[Codex Live]", COLOR_CYAN)
+        )
     combined = f"{out}\n{err}" if not stream else out
 
     if code == 0:

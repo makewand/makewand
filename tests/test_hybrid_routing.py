@@ -150,6 +150,22 @@ class TestHybridRouting(unittest.TestCase):
         self.assertEqual(extra.get("keep_alive"), "0")
         self.assertEqual(extra.get("options", {}).get("num_gpu"), 0)
 
+    @patch("makewand.providers.local.get_free_gpu_vram_mb")
+    @patch("makewand.providers.local.is_local_model_available")
+    @patch("makewand.providers.api_client.call_api_chat")
+    def test_local_vram_fail_closed_when_probe_none(self, mock_api, mock_avail, mock_vram):
+        mock_avail.return_value = (True, "gemma4:31b", ["gemma4:31b"])
+        # Mock free VRAM is None (fail-closed)
+        mock_vram.return_value = None
+        mock_api.return_value = (True, "CPU execution result", None)
+
+        ok, out, err = execute_local_task("Write script", model="gemma4:31b")
+        self.assertTrue(ok)
+        kwargs = mock_api.call_args[1]
+        extra = kwargs.get("extra_params", {})
+        self.assertEqual(extra.get("options", {}).get("num_gpu"), 0)
+
+
     def test_orchestrator_hybrid_and_local_selection(self):
         # 1. Test local preference
         cache = {

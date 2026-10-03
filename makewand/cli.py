@@ -1376,7 +1376,7 @@ def main():
     p_discard.add_argument("--all", action="store_true", default=False, help="Discard all candidate workspaces")
 
     # daemon (Resident Daemon / IPC Socket Fast-Path)
-    p_daemon = subparsers.add_parser("daemon", help="Manage resident daemon for <15ms IPC socket fast-path", parents=[sub_common_parser])
+    p_daemon = subparsers.add_parser("daemon", help="Manage resident daemon for IPC socket execution (no <15ms latency guarantee)", parents=[sub_common_parser])
     p_daemon.add_argument("action", choices=["start", "stop", "restart", "status"], help="Daemon lifecycle action")
     p_daemon.add_argument("--foreground", action="store_true", default=False, help="Run daemon in foreground (debug mode)")
 

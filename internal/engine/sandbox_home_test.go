@@ -365,3 +365,65 @@ func TestSanitizeGitExecEnv(t *testing.T) {
 		t.Errorf("USER was improperly stripped")
 	}
 }
+
+func TestSandboxMaskedRoots_MasksMntAndHomeEvenWhenNested(t *testing.T) {
+	foundHome := false
+	for _, r := range sandboxMaskedHostRoots {
+		if r == "/home" {
+			foundHome = true
+			break
+		}
+	}
+	if !foundHome {
+		t.Fatal("expected /home to be in sandboxMaskedHostRoots")
+	}
+
+	ws := "/mnt/ext/project"
+	roots := sandboxMaskedRoots(ws)
+	if fi, err := os.Stat("/mnt"); err == nil && fi.IsDir() {
+		if !containsArgPair(roots, "--tmpfs", "/mnt") {
+			t.Errorf("expected /mnt to be masked with --tmpfs even when workspace is %s: got %v", ws, roots)
+		}
+	}
+	if fi, err := os.Stat("/home"); err == nil && fi.IsDir() {
+		if !containsArgPair(roots, "--tmpfs", "/home") {
+			t.Errorf("expected /home to be masked with --tmpfs even when workspace is %s: got %v", ws, roots)
+		}
+	}
+
+	fakeWorkingBwrap(t)
+	_, args := wrapVerificationCommand("/usr/bin/bwrap", ws, "go", []string{"test", "./..."}, false, nil)
+	mntIdx := argPairIndex(args, "--tmpfs", "/mnt")
+	bindIdx := argPairIndex(args, "--bind", ws)
+	if mntIdx >= 0 && bindIdx >= 0 {
+		if mntIdx > bindIdx {
+			t.Fatalf("/mnt tmpfs (idx %d) must precede workspace bind (idx %d): %v", mntIdx, bindIdx, args)
+		}
+	}
+}
+
+func TestSandboxMaskSensitiveEntries_SymlinkResolution(t *testing.T) {
+	fakeHome := t.TempDir()
+	realSSH := t.TempDir()
+	symSSH := filepath.Join(fakeHome, ".ssh")
+	if err := os.Symlink(realSSH, symSSH); err != nil {
+		t.Fatal(err)
+	}
+
+	canonicalReal, err := filepath.EvalSymlinks(realSSH)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ws := t.TempDir()
+	masks := sandboxMaskSensitiveEntries(fakeHome, ws)
+
+	// Must NOT contain the symlink path as a --tmpfs destination (which causes bwrap failure)
+	if containsArgPair(masks, "--tmpfs", symSSH) {
+		t.Errorf("masks should not target symlink %s directly: %v", symSSH, masks)
+	}
+	// Must target the canonical real destination
+	if !containsArgPair(masks, "--tmpfs", canonicalReal) {
+		t.Errorf("masks should target canonical destination %s: %v", canonicalReal, masks)
+	}
+}
