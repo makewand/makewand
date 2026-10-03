@@ -10,6 +10,8 @@ import json
 import shutil
 import subprocess
 import time
+import select
+import codecs
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 
@@ -97,16 +99,24 @@ def _safe_search_rg(
         results = []
         start_time = time.monotonic()
         if proc.stdout is not None:
-            for line in proc.stdout:
-                if time.monotonic() - start_time > MAX_RG_TIME_SECONDS:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
+            has_native_fd = False
+            if hasattr(proc.stdout, "fileno"):
                 try:
-                    item = json.loads(line)
+                    fd = proc.stdout.fileno()
+                    if isinstance(fd, int) and fd >= 0:
+                        has_native_fd = True
                 except Exception:
-                    continue
+                    has_native_fd = False
+
+            def _handle_line(line_str: str) -> bool:
+                nonlocal results
+                line_str = line_str.strip()
+                if not line_str:
+                    return False
+                try:
+                    item = json.loads(line_str)
+                except Exception:
+                    return False
                 if item.get("type") == "match":
                     data = item.get("data", {})
                     path_obj = data.get("path", {})
@@ -118,7 +128,7 @@ def _safe_search_rg(
                         except Exception:
                             raw_path = None
                     if not raw_path:
-                        continue
+                        return False
                     try:
                         rel_p = os.path.relpath(raw_path, str(root))
                     except Exception:
@@ -139,12 +149,83 @@ def _safe_search_rg(
                         "content": line_text.strip()[:200]
                     })
                     if len(results) >= max_results:
+                        return True
+                return False
+
+            if has_native_fd:
+                buf = ""
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                fd = proc.stdout.fileno()
+                while True:
+                    remaining = MAX_RG_TIME_SECONDS - (time.monotonic() - start_time)
+                    if remaining <= 0:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=0.2)
+                        except Exception:
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=0.2)
+                            except Exception:
+                                pass
+                        break
+                    rlist, _, _ = select.select([fd], [], [], max(0.0, remaining))
+                    if not rlist:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=0.2)
+                        except Exception:
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=0.2)
+                            except Exception:
+                                pass
+                        break
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        # EOF
+                        break
+                    buf += decoder.decode(chunk)
+                    stop = False
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        if _handle_line(line):
+                            stop = True
+                            break
+                    if stop or len(results) >= max_results:
+                        break
+                if buf and len(results) < max_results:
+                    buf += decoder.decode(b"", final=True)
+                    if buf:
+                        _handle_line(buf)
+            else:
+                for line in proc.stdout:
+                    if time.monotonic() - start_time > MAX_RG_TIME_SECONDS:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=0.2)
+                        except Exception:
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=0.2)
+                            except Exception:
+                                pass
+                        break
+                    if _handle_line(line):
                         break
         return results
     except Exception:
         return None
     finally:
         if proc is not None:
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
             try:
                 proc.terminate()
                 proc.wait(timeout=0.2)

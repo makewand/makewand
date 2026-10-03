@@ -8,6 +8,7 @@ except ImportError:  # python3 -m unittest tests.<module>
     from tests import _isolation  # noqa: F401
 
 import os
+import json
 import unittest
 import tempfile
 import subprocess
@@ -163,6 +164,59 @@ class TestSearchGuardrail(unittest.TestCase):
                     with patch("makewand.search.MAX_RG_TIME_SECONDS", 0.05):
                         results = safe_search("match", root_path=tmpdir, max_results=1000000)
                         mock_proc.terminate.assert_called()
+
+    def test_safe_search_rg_silent_blocked_process_hard_timeout(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import time
+            # Real subprocess that blocks silently without producing output
+            cmd = ["python3", "-c", "import time; time.sleep(10)"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            try:
+                with patch("makewand.search.find_ripgrep", return_value="/usr/bin/rg"):
+                    with patch("makewand.search.subprocess.Popen", return_value=proc):
+                        with patch("makewand.search.MAX_RG_TIME_SECONDS", 0.1):
+                            start = time.monotonic()
+                            results = safe_search("match", root_path=tmpdir)
+                            elapsed = time.monotonic() - start
+                            # Should terminate quickly near 0.1s, far below 10s
+                            self.assertLess(elapsed, 1.5)
+            finally:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=0.2)
+                except Exception:
+                    pass
+
+    def test_safe_search_rg_buffered_multiline_output_preserved(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import time
+            file1 = os.path.join(tmpdir, "file1.txt")
+            file2 = os.path.join(tmpdir, "file2.txt")
+            for f in (file1, file2):
+                with open(f, "w", encoding="utf-8") as fp:
+                    fp.write("match here\n")
+
+            match1 = json.dumps({"type": "match", "data": {"path": {"text": file1}, "line_number": 1, "submatches": [{"match": {"text": "match"}}]}})
+            match2 = json.dumps({"type": "match", "data": {"path": {"text": file2}, "line_number": 1, "submatches": [{"match": {"text": "match"}}]}})
+            # Output both matches in a single chunk, then sleep briefly
+            py_code = f"import sys, time; sys.stdout.write({repr(match1 + chr(10) + match2 + chr(10))}); sys.stdout.flush(); time.sleep(5)"
+            proc = subprocess.Popen(["python3", "-c", py_code], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            try:
+                with patch("makewand.search.find_ripgrep", return_value="/usr/bin/rg"):
+                    with patch("makewand.search.subprocess.Popen", return_value=proc):
+                        with patch("makewand.search.MAX_RG_TIME_SECONDS", 0.5):
+                            results = safe_search("match", root_path=tmpdir)
+                            # Both matches must be preserved despite sleep/timeout
+                            self.assertIsNotNone(results)
+                            self.assertEqual(len(results), 2)
+            finally:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=0.2)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

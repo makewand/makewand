@@ -39,6 +39,9 @@ func TestWrapCLICommandWithSandbox_WrapsWithBwrap(t *testing.T) {
 	if !strings.Contains(args, "--die-with-parent") {
 		t.Errorf("missing --die-with-parent in %v", wrapped.Args)
 	}
+	if !strings.Contains(args, "--tmpfs /tmp") {
+		t.Errorf("missing --tmpfs /tmp in %v", wrapped.Args)
+	}
 }
 
 func TestWrapCLICommandWithSandbox_ReviewTaskReadOnly(t *testing.T) {
@@ -110,11 +113,17 @@ func TestWrapCLICommandWithSandbox_ActiveProviderCredentialsPreserved(t *testing
 	if !strings.Contains(args, "--tmpfs "+geminiPath) {
 		t.Errorf("expected .gemini to be masked for claude provider: %v", wrapped.Args)
 	}
-	if strings.Contains(args, claudePath) {
-		t.Errorf("active provider credentials (%s) should NOT be masked: %v", claudePath, wrapped.Args)
+	if strings.Contains(args, "--tmpfs "+claudePath) {
+		t.Errorf("active provider credentials (%s) should NOT be masked with tmpfs: %v", claudePath, wrapped.Args)
 	}
-	if strings.Contains(args, claudeJSONPath) {
-		t.Errorf("active provider credentials (%s) should NOT be masked: %v", claudeJSONPath, wrapped.Args)
+	if strings.Contains(args, "--tmpfs "+claudeJSONPath) {
+		t.Errorf("active provider credentials (%s) should NOT be masked with tmpfs: %v", claudeJSONPath, wrapped.Args)
+	}
+	if !strings.Contains(args, "--bind "+claudePath+" "+claudePath) {
+		t.Errorf("expected active provider credentials (%s) to be bound: %v", claudePath, wrapped.Args)
+	}
+	if !strings.Contains(args, "--bind "+claudeJSONPath+" "+claudeJSONPath) {
+		t.Errorf("expected active provider credentials (%s) to be bound: %v", claudeJSONPath, wrapped.Args)
 	}
 }
 
@@ -277,5 +286,132 @@ func TestWrapCLICommandWithSandbox_RemoteOriginBypassAttempt(t *testing.T) {
 	_, err := wrapCLICommandWithSandbox(remoteCtx, "claude", cmd)
 	if err == nil {
 		t.Fatal("expected fail-close for remote origin even when MAKEWAND_UNSAFE_HOST_EXEC=1")
+	}
+}
+
+func TestWrapCLICommandWithSandbox_HomeMasking(t *testing.T) {
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	fakeUserHome := "/home/testuser"
+	t.Setenv("HOME", fakeUserHome)
+
+	ws := t.TempDir()
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+
+	args := strings.Join(wrapped.Args, " ")
+	if !strings.Contains(args, "--tmpfs /home") {
+		t.Errorf("expected /home to be masked with --tmpfs /home, got: %v", wrapped.Args)
+	}
+	if !strings.Contains(args, "--tmpfs "+fakeUserHome) {
+		t.Errorf("expected user home %s to be masked with --tmpfs, got: %v", fakeUserHome, wrapped.Args)
+	}
+}
+
+func TestSanitizeCLIEnv(t *testing.T) {
+	rawEnv := []string{
+		"PATH=/usr/bin:/bin",
+		"LANG=en_US.UTF-8",
+		"TERM=xterm-256color",
+		"AWS_ACCESS_KEY_ID=fake-access-key-id",
+		"AWS_SECRET_ACCESS_KEY=fake-secret-key",
+		"GITHUB_TOKEN=fake-github-token",
+		"DATABASE_URL=postgres://demo:dummy@localhost:5432/db",
+		"MY_CUSTOM_PASSWORD=secret",
+		"ANTHROPIC_API_KEY=sk-ant-testkey",
+		"CLAUDE_CODE_ENTRYPOINT=cli",
+		"OPENAI_API_KEY=sk-openaikey",
+		"CODEX_HOME=/custom/codex_home",
+		"GEMINI_API_KEY=aizageminikey",
+	}
+
+	// 1. For claude: ANTHROPIC_API_KEY and CLAUDE_CODE_ENTRYPOINT should be preserved,
+	// foreign secrets/keys filtered out.
+	claudeEnv := sanitizeCLIEnv("claude", rawEnv)
+	claudeStr := strings.Join(claudeEnv, "\n")
+	if !strings.Contains(claudeStr, "ANTHROPIC_API_KEY=sk-ant-testkey") {
+		t.Errorf("expected ANTHROPIC_API_KEY preserved for claude, got:\n%s", claudeStr)
+	}
+	if !strings.Contains(claudeStr, "CLAUDE_CODE_ENTRYPOINT=cli") {
+		t.Errorf("expected CLAUDE_CODE_ENTRYPOINT preserved for claude, got:\n%s", claudeStr)
+	}
+	if !strings.Contains(claudeStr, "PATH=/usr/bin:/bin") || !strings.Contains(claudeStr, "LANG=en_US.UTF-8") {
+		t.Errorf("expected system variables preserved, got:\n%s", claudeStr)
+	}
+	if strings.Contains(claudeStr, "AWS_") || strings.Contains(claudeStr, "GITHUB_TOKEN") || strings.Contains(claudeStr, "DATABASE_URL") || strings.Contains(claudeStr, "PASSWORD") {
+		t.Errorf("secrets not filtered: %s", claudeStr)
+	}
+	if strings.Contains(claudeStr, "OPENAI_API_KEY") || strings.Contains(claudeStr, "CODEX_HOME") || strings.Contains(claudeStr, "GEMINI_API_KEY") {
+		t.Errorf("foreign provider keys not filtered for claude: %s", claudeStr)
+	}
+
+	// 2. For codex: OPENAI_API_KEY and CODEX_HOME should be preserved, ANTHROPIC filtered out.
+	codexEnv := sanitizeCLIEnv("codex", rawEnv)
+	codexStr := strings.Join(codexEnv, "\n")
+	if !strings.Contains(codexStr, "OPENAI_API_KEY=sk-openaikey") || !strings.Contains(codexStr, "CODEX_HOME=/custom/codex_home") {
+		t.Errorf("expected OPENAI_API_KEY and CODEX_HOME preserved for codex, got:\n%s", codexStr)
+	}
+	if strings.Contains(codexStr, "ANTHROPIC_API_KEY") {
+		t.Errorf("ANTHROPIC_API_KEY not filtered for codex: %s", codexStr)
+	}
+
+	// 3. For gemini / agy / antigravity: GEMINI_API_KEY should be preserved, OPENAI and ANTHROPIC filtered out.
+	geminiEnv := sanitizeCLIEnv("gemini", rawEnv)
+	geminiStr := strings.Join(geminiEnv, "\n")
+	if !strings.Contains(geminiStr, "GEMINI_API_KEY=aizageminikey") {
+		t.Errorf("expected GEMINI_API_KEY preserved for gemini, got:\n%s", geminiStr)
+	}
+	if strings.Contains(geminiStr, "OPENAI_API_KEY") || strings.Contains(geminiStr, "ANTHROPIC_API_KEY") {
+		t.Errorf("foreign provider keys not filtered for gemini: %s", geminiStr)
+	}
+
+	// 4. For antigravity: GEMINI_API_KEY should be preserved, foreign keys filtered out.
+	agyEnv := sanitizeCLIEnv("antigravity", rawEnv)
+	agyStr := strings.Join(agyEnv, "\n")
+	if !strings.Contains(agyStr, "GEMINI_API_KEY=aizageminikey") {
+		t.Errorf("expected GEMINI_API_KEY preserved for antigravity, got:\n%s", agyStr)
+	}
+	if strings.Contains(agyStr, "OPENAI_API_KEY") || strings.Contains(agyStr, "ANTHROPIC_API_KEY") {
+		t.Errorf("foreign provider keys not filtered for antigravity: %s", agyStr)
+	}
+}
+
+func TestWrapCLICommandWithSandbox_SanitizesEnv(t *testing.T) {
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	ws := t.TempDir()
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+	cmd.Env = []string{
+		"PATH=/usr/bin:/bin",
+		"AWS_SECRET_ACCESS_KEY=leak-me",
+		"OPENAI_API_KEY=sk-foreign-key",
+		"ANTHROPIC_API_KEY=sk-ant-valid",
+	}
+
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+
+	envStr := strings.Join(wrapped.Env, "\n")
+	if !strings.Contains(envStr, "ANTHROPIC_API_KEY=sk-ant-valid") {
+		t.Errorf("expected active provider key preserved, got:\n%s", envStr)
+	}
+	if strings.Contains(envStr, "AWS_SECRET_ACCESS_KEY") || strings.Contains(envStr, "OPENAI_API_KEY") {
+		t.Errorf("expected secrets and foreign keys removed from wrapped.Env, got:\n%s", envStr)
 	}
 }

@@ -373,7 +373,34 @@ class TestSandbox(unittest.TestCase):
                     apply_posix_sandbox_rlimits()
                     mock_setrlimit.assert_any_call(resource.RLIMIT_NPROC, (1000, 2000))
 
+    def test_collect_uncreated_sensitive_files_scope_isolation(self):
+        from makewand.sandbox import _collect_uncreated_sensitive_files
+        # When is_provider=False, must return empty list (never tracks ~/.codex or other provider files)
+        tracked_non_provider = _collect_uncreated_sensitive_files(is_provider=False)
+        self.assertEqual(tracked_non_provider, [])
 
+        tracked_cmd_non_provider = _collect_uncreated_sensitive_files(is_provider=False, cmd=["python3", "-m", "unittest"])
+        self.assertEqual(tracked_cmd_non_provider, [])
+
+        # When is_provider=False, even if provider_name is given, must return empty list
+        self.assertEqual(_collect_uncreated_sensitive_files(is_provider=False, provider_name="codex"), [])
+        self.assertEqual(_collect_uncreated_sensitive_files(is_provider=False, provider_name="claude"), [])
+
+        # When is_provider=True, only the active provider is tracked
+        tracked_claude = _collect_uncreated_sensitive_files(is_provider=True, provider_name="claude")
+        for p in tracked_claude:
+            self.assertIn(".claude", p)
+            self.assertNotIn(".codex", p)
+
+        tracked_codex = _collect_uncreated_sensitive_files(is_provider=True, provider_name="codex")
+        for p in tracked_codex:
+            self.assertIn(".codex", p)
+            self.assertNotIn(".claude", p)
+
+        tracked_cmd_claude = _collect_uncreated_sensitive_files(is_provider=True, cmd=["claude", "-p", "hello"])
+        for p in tracked_cmd_claude:
+            self.assertIn(".claude", p)
+            self.assertNotIn(".codex", p)
 
 
 if __name__ == "__main__":

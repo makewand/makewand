@@ -1434,8 +1434,6 @@ def _collect_uncreated_sensitive_files(
                         break
         if p:
             p_names.append(p)
-    if "codex" not in p_names:
-        p_names.append("codex")
 
     for p_name in p_names:
         prof = PROVIDER_PROFILES.get(p_name)

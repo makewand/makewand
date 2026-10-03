@@ -321,6 +321,92 @@ def _abort_response(resp: Any) -> None:
             pass
 
 
+MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024  # 10MB limit aligned with Go router maxOutputBytes
+
+
+def _stream_post_sse(
+    resp: Any,
+    deadline: Optional[float] = None,
+    abort: Optional["threading.Event"] = None,
+    partial: Optional[List[str]] = None,
+    print_prefix: str = "",
+) -> str:
+    """Streams SSE responses from resp, enforcing MAX_API_RESPONSE_BYTES."""
+    if partial is None:
+        partial = []
+    if abort is None:
+        abort = threading.Event()
+    if deadline is None:
+        deadline = float("inf")
+
+    total_bytes = 0
+    terminal = False
+    for line in resp:
+        if abort.is_set() or time.monotonic() >= deadline:
+            raise _DeadlineExceeded()
+        line_bytes = len(line) if isinstance(line, (bytes, bytearray)) else len(line.encode("utf-8", errors="replace"))
+        total_bytes += line_bytes
+        if total_bytes > MAX_API_RESPONSE_BYTES:
+            raise RuntimeError("API stream exceeded maximum 10MB limit")
+        line_str = line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+        if line_str.startswith("data:"):
+            data_part = line_str[5:].strip()
+            if data_part == "[DONE]":
+                terminal = True
+                break
+            try:
+                delta_json = json.loads(data_part)
+                if not isinstance(delta_json, dict):
+                    raise ValueError("stream frame must be an object")
+                delta_content = ""
+                choices = delta_json.get("choices")
+                if delta_json.get("type") == "message_stop":
+                    terminal = True
+                if isinstance(choices, list) and any(isinstance(item, dict) and item.get("finish_reason") is not None for item in choices):
+                    terminal = True
+                if choices and isinstance(choices, list) and len(choices) > 0:
+                    delta_content = choices[0].get("delta", {}).get("content", "")
+                elif "delta" in delta_json:
+                    delta_content = delta_json["delta"].get("text", "")
+                if delta_content:
+                    partial.append(delta_content)
+                    if print_prefix:
+                        sys.stdout.write(delta_content)
+                        sys.stdout.flush()
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise _IncompleteStream("Malformed API stream frame") from exc
+            if terminal:
+                break
+    if abort.is_set():
+        raise _DeadlineExceeded()
+    if not terminal:
+        raise _IncompleteStream("API stream ended without a terminal response")
+    if print_prefix:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    return "".join(partial)
+
+
+def _post_json(
+    resp: Any,
+    abort: Optional["threading.Event"] = None,
+) -> str:
+    """Reads non-streaming response body, enforcing MAX_API_RESPONSE_BYTES."""
+    if abort is None:
+        abort = threading.Event()
+    try:
+        raw_bytes = resp.read(MAX_API_RESPONSE_BYTES + 1)
+    except Exception:
+        if abort.is_set():
+            raise _DeadlineExceeded()
+        raise
+    if abort.is_set():
+        raise _DeadlineExceeded()
+    if len(raw_bytes) > MAX_API_RESPONSE_BYTES:
+        raise RuntimeError("API response exceeded maximum 10MB limit")
+    return raw_bytes.decode("utf-8", errors="replace") if isinstance(raw_bytes, (bytes, bytearray)) else str(raw_bytes)
+
+
 def _perform_request(req, per_read_timeout: float, stream: bool, print_prefix: str,
                      deadline: float, abort: "threading.Event", holder: List[Any],
                      partial: List[str]) -> Tuple[int, str, Optional[str]]:
@@ -328,57 +414,10 @@ def _perform_request(req, per_read_timeout: float, stream: bool, print_prefix: s
         holder.append(resp)
         code = resp.status
         if stream:
-            # Simple SSE / chunk streaming
-            terminal = False
-            for line in resp:
-                if abort.is_set() or time.monotonic() >= deadline:
-                    raise _DeadlineExceeded()
-                line_str = line.decode("utf-8", errors="replace")
-                if line_str.startswith("data:"):
-                    data_part = line_str[5:].strip()
-                    if data_part == "[DONE]":
-                        terminal = True
-                        break
-                    try:
-                        delta_json = json.loads(data_part)
-                        if not isinstance(delta_json, dict):
-                            raise ValueError("stream frame must be an object")
-                        delta_content = ""
-                        choices = delta_json.get("choices")
-                        if delta_json.get("type") == "message_stop":
-                            terminal = True
-                        if isinstance(choices, list) and any(isinstance(item, dict) and item.get("finish_reason") is not None for item in choices):
-                            terminal = True
-                        if choices and isinstance(choices, list) and len(choices) > 0:
-                            delta_content = choices[0].get("delta", {}).get("content", "")
-                        elif "delta" in delta_json:
-                            delta_content = delta_json["delta"].get("text", "")
-                        if delta_content:
-                            partial.append(delta_content)
-                            if print_prefix:
-                                sys.stdout.write(delta_content)
-                                sys.stdout.flush()
-                    except (ValueError, TypeError, AttributeError) as exc:
-                        raise _IncompleteStream("Malformed API stream frame") from exc
-                    if terminal:
-                        break
-            if abort.is_set():
-                raise _DeadlineExceeded()
-            if not terminal:
-                raise _IncompleteStream("API stream ended without a terminal response")
-            if print_prefix:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-            return code, "".join(partial), None
-        try:
-            raw_response = resp.read().decode("utf-8", errors="replace")
-        except Exception:
-            if abort.is_set():
-                raise _DeadlineExceeded()
-            raise
-        if abort.is_set():
-            raise _DeadlineExceeded()
-        return code, raw_response, None
+            content = _stream_post_sse(resp, deadline=deadline, abort=abort, partial=partial, print_prefix=print_prefix)
+            return code, content, None
+        content = _post_json(resp, abort=abort)
+        return code, content, None
 
 
 def _make_http_request(

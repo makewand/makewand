@@ -18,6 +18,9 @@ from unittest.mock import patch, MagicMock, call
 
 from makewand.providers.api_client import (
     _make_http_request,
+    _stream_post_sse,
+    _post_json,
+    MAX_API_RESPONSE_BYTES,
     call_api_chat,
     DEFAULT_SYSTEM_PROMPTS,
     apply_agentic_code_output,
@@ -730,6 +733,83 @@ class TestApiClientRegressions(unittest.TestCase):
             self.assertIn("unsafe", batch_res[1]["error"].lower())
             self.assertTrue((Path(td) / ".github" / "dependabot.yml").exists())
             self.assertFalse((Path(td) / ".git" / "hooks" / "pre-commit").exists())
+
+
+class TestApiResponseSizeLimits(unittest.TestCase):
+    """Tests for HTTP response 10MB size limit enforcement."""
+
+    def test_non_streaming_post_json_exceeds_limit(self):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"x" * (MAX_API_RESPONSE_BYTES + 1)
+        with self.assertRaises(RuntimeError) as cm:
+            _post_json(mock_resp)
+        self.assertIn("10MB", str(cm.exception))
+
+    def test_non_streaming_post_json_within_limit(self):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status": "ok"}'
+        result = _post_json(mock_resp)
+        self.assertEqual(result, '{"status": "ok"}')
+
+    def test_streaming_post_sse_exceeds_limit(self):
+        def chunk_gen():
+            chunk = b'data: {"choices": [{"delta": {"content": "' + (b"A" * 1024 * 1024) + b'"}}]}\n'
+            for _ in range(11):
+                yield chunk
+            yield b"data: [DONE]\n"
+
+        with self.assertRaises(RuntimeError) as cm:
+            _stream_post_sse(chunk_gen())
+        self.assertIn("10MB", str(cm.exception))
+
+    def test_streaming_post_sse_within_limit(self):
+        chunks = [
+            b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n',
+            b'data: [DONE]\n',
+        ]
+        result = _stream_post_sse(chunks)
+        self.assertEqual(result, "Hello")
+
+    @patch("urllib.request.urlopen")
+    def test_make_http_request_enforces_limit_non_streaming(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"x" * (MAX_API_RESPONSE_BYTES + 1)
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        code, body, err = _make_http_request(
+            url="https://api.example.com",
+            headers={},
+            data={},
+            stream=False,
+        )
+        self.assertEqual(code, -1)
+        self.assertIn("10MB", str(err))
+
+    @patch("urllib.request.urlopen")
+    def test_make_http_request_enforces_limit_streaming(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.__enter__.return_value = mock_resp
+
+        def chunk_gen():
+            chunk = b'data: {"choices": [{"delta": {"content": "' + (b"A" * 1024 * 1024) + b'"}}]}\n'
+            for _ in range(11):
+                yield chunk
+            yield b"data: [DONE]\n"
+
+        mock_resp.__iter__.return_value = chunk_gen()
+        mock_urlopen.return_value = mock_resp
+
+        code, body, err = _make_http_request(
+            url="https://api.example.com",
+            headers={},
+            data={},
+            stream=True,
+        )
+        self.assertEqual(code, -1)
+        self.assertIn("10MB", str(err))
 
 
 if __name__ == "__main__":
