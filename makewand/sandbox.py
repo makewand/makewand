@@ -135,8 +135,9 @@ SAFE_HOME_BIN_DIRS = [
 # empty form is equivalent to "absent" (empty CLAUDE.md, "{}" settings, empty
 # directory) we first create that empty placeholder on the host and then mount
 # it read-only. Paths whose empty form is NOT known to be equivalent to absence
-# (e.g. codex AGENTS.override.md, which would shadow AGENTS.md) are masked with
-# /dev/null or empty tmpfs inside the sandbox without host placeholder creation.
+# (e.g. codex AGENTS.override.md, which would shadow AGENTS.md) are only
+# protected when they already exist; mounting /dev/null over an uncreated path
+# inside a writable bind mount causes Bubblewrap to creat(0444) the file on the host.
 #
 # "ephemeral" entries are live per-session IPC / execution state of concurrently
 # running host sessions (shell snapshots that host sessions source, session
@@ -703,10 +704,6 @@ def _provider_mounts(
                 continue
             if not os.path.lexists(p):
                 if placeholder is None:
-                    if kind == "file":
-                        args.extend(["--ro-bind", "/dev/null", p])
-                    elif kind == "dir":
-                        args.extend(["--tmpfs", p])
                     continue
                 _create_placeholder(p, kind, placeholder)
             args.extend(["--ro-bind", p, p])
@@ -848,12 +845,17 @@ def wrap_bwrap(
 
     # Identify provider strictly from explicit provider_name or first command argument binary name
     p_name = (provider_name or "").lower().strip()
+    if p_name == "gemini":
+        p_name = "agy"
     if not p_name and command_args:
         first_bin = os.path.basename(str(command_args[0])).lower()
-        for candidate in ["claude", "codex", "agy", "muse", "grok", "aider"]:
-            if first_bin == candidate or first_bin.startswith(candidate + "-") or first_bin.startswith(candidate + "."):
-                p_name = candidate
-                break
+        if first_bin == "gemini" or first_bin.startswith("gemini-") or first_bin.startswith("gemini."):
+            p_name = "agy"
+        else:
+            for candidate in ["claude", "codex", "agy", "muse", "grok", "aider"]:
+                if first_bin == candidate or first_bin.startswith(candidate + "-") or first_bin.startswith(candidate + "."):
+                    p_name = candidate
+                    break
     if not is_provider:
         p_name = ""
 
@@ -1406,6 +1408,107 @@ def apply_posix_sandbox_rlimits():
         pass
 
 
+def _collect_uncreated_sensitive_files(
+    is_provider: bool = False,
+    provider_name: Optional[str] = None,
+    cmd: Optional[List[str]] = None,
+) -> List[str]:
+    """Find sensitive provider files that currently do not exist on the host."""
+    user_home = _norm(str(Path.home()))
+    targets: List[str] = []
+
+    p_names: List[str] = []
+    if is_provider:
+        p = (provider_name or "").lower().strip()
+        if p == "gemini":
+            p = "agy"
+        if not p and cmd:
+            first_bin = os.path.basename(str(cmd[0])).lower()
+            if first_bin == "gemini" or first_bin.startswith("gemini-") or first_bin.startswith("gemini."):
+                p = "agy"
+            else:
+                for cand in ["claude", "codex", "agy", "muse", "grok", "aider"]:
+                    if first_bin == cand or first_bin.startswith(cand + "-") or first_bin.startswith(cand + "."):
+                        p = cand
+                        break
+        if p:
+            p_names.append(p)
+    if "codex" not in p_names:
+        p_names.append("codex")
+
+    for p_name in p_names:
+        prof = PROVIDER_PROFILES.get(p_name)
+        if not prof:
+            continue
+        roots: List[Tuple[str, str]] = []
+        if p_name == "codex":
+            codex_home = os.environ.get("CODEX_HOME")
+            selected = os.path.realpath(_norm(os.path.expanduser(codex_home or os.path.join(user_home, ".codex"))))
+            if os.path.isdir(selected):
+                roots.append((".codex", selected))
+            c2 = os.path.realpath(os.path.join(user_home, ".codex-2"))
+            if os.path.isdir(c2):
+                roots.append((".codex-2", c2))
+        else:
+            for r in prof.get("roots", []):
+                rp = os.path.realpath(os.path.join(user_home, r))
+                if os.path.isdir(rp):
+                    roots.append((r, rp))
+
+        for root_rel, real_root in roots:
+            for entry in prof.get("protected", []):
+                e_root, sub, _, placeholder = entry[0], entry[1], entry[2], entry[3]
+                if e_root == root_rel or (p_name == "codex" and e_root == ".codex"):
+                    if placeholder is None:
+                        p = os.path.join(real_root, sub)
+                        if not os.path.lexists(p):
+                            targets.append(p)
+
+    return list(dict.fromkeys(targets))
+
+
+def _robust_force_remove(path: str) -> None:
+    """Recursively removes a file or directory, adjusting read-only permissions if needed."""
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return
+    try:
+        os.chmod(path, stat.S_IRWXU)
+    except OSError:
+        pass
+    if os.path.isdir(path):
+        try:
+            entries = os.listdir(path)
+        except OSError:
+            entries = []
+        for entry in entries:
+            _robust_force_remove(os.path.join(path, entry))
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+    else:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _cleanup_uncreated_sensitive_files(paths: List[str]) -> None:
+    """Removes sensitive files that were created during sandbox execution."""
+    for p in paths:
+        if os.path.lexists(p):
+            try:
+                _robust_force_remove(p)
+            except OSError:
+                pass
+
+
 def run_in_sandbox(
     cmd: List[str],
     workspace: str,
@@ -1421,6 +1524,7 @@ def run_in_sandbox(
     audit_context: str = "sandbox",
     extra_ro_binds: Optional[List[str]] = None,
     enable_seccomp: bool = True,
+    provider_name: Optional[str] = None,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command inside the bubblewrap sandbox with optional Seccomp-BPF filtering.
@@ -1431,6 +1535,11 @@ def run_in_sandbox(
     exec_cmd = cmd
     seccomp_r = None
     pass_fds: tuple = ()
+    tracked_uncreated = _collect_uncreated_sensitive_files(
+        is_provider=is_provider,
+        provider_name=provider_name,
+        cmd=cmd,
+    )
     try:
         if is_bwrap_available():
             if enable_seccomp:
@@ -1456,6 +1565,7 @@ def run_in_sandbox(
                     is_provider=is_provider,
                     worktree_root=worktree_root,
                     extra_env=extra_env,
+                    provider_name=provider_name,
                     extra_ro_binds=extra_ro_binds,
                     seccomp_fd=seccomp_r,
                 )
@@ -1497,6 +1607,7 @@ def run_in_sandbox(
             preexec_fn=apply_posix_sandbox_rlimits,
         )
     finally:
+        _cleanup_uncreated_sensitive_files(tracked_uncreated)
         if seccomp_r is not None:
             try:
                 os.close(seccomp_r)

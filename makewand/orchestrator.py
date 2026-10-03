@@ -304,6 +304,22 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             return False, LocalTestsUnavailable("Node 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
 
         if code != 0:
+            out = output
+            if (
+                err_category in ("SandboxUnavailable", "SandboxConfigError")
+                or (stderr and stderr.strip().startswith("bwrap:"))
+                or (out and out.strip().startswith("bwrap:"))
+            ):
+                if stderr and stderr.strip().startswith("bwrap:"):
+                    infra_err = stderr
+                elif out and out.strip().startswith("bwrap:"):
+                    infra_err = out
+                else:
+                    infra_err = stderr or out
+                if err_category == "SandboxUnavailable" and "Bubblewrap 沙箱不可用" not in infra_err:
+                    infra_err = f"Bubblewrap 沙箱不可用: {infra_err}"
+                return False, LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
+
             all_passed = False
             # Protect LLM context from giant test failure dumps via folded truncation
             try:
@@ -311,9 +327,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
                 output = truncate_output_folded(output, max_lines=60, max_bytes=8192)
             except Exception:
                 pass
-            if err_category == "SandboxUnavailable":
-                details.append(f"[{name} Tests Failed (exit {code})]:\nBubblewrap 沙箱不可用 (bwrap not available)，根据安全防御原则阻断本地测试执行: {stderr or output}")
-            elif err_category:
+            if err_category:
                 details.append(f"[{name} Tests Failed (exit {code})]:\n本地单元测试执行异常 ({err_category}):\n{output}")
             else:
                 details.append(f"[{name} Tests Failed (exit {code})]:\n{output}")

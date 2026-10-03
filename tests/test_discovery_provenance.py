@@ -262,6 +262,20 @@ class DiscoveryProvenanceTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             _ = res["unknown_key"]
 
+    def test_refresh_agy_models_cache_isolates_cwd(self):
+        from makewand.discovery import _refresh_agy_models_cache
+        from unittest.mock import MagicMock
+        env_patch = {k: v for k, v in os.environ.items() if k != "MAKEWAND_TEST_ISOLATION_ROOT"}
+        with patch.dict(os.environ, env_patch, clear=True), \
+             patch("shutil.which", return_value="/bin/agy"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="gemini-3.8-flash Fast model\n")
+            target_cache = self.root / "agy_cache.json"
+            res = _refresh_agy_models_cache(max_age=0, cache_file=target_cache)
+            self.assertEqual(res, target_cache)
+            mock_run.assert_called_once()
+            _, kwargs = mock_run.call_args
+            self.assertEqual(kwargs.get("cwd"), tempfile.gettempdir())
 
 
 if __name__ == "__main__":

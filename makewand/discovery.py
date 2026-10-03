@@ -234,6 +234,7 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
         return None
     import shutil
     import subprocess
+    import tempfile
     import time
     if not shutil.which("agy"):
         return None
@@ -250,7 +251,13 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
         pass
 
     try:
-        res = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=timeout)
+        res = subprocess.run(
+            ["agy", "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=tempfile.gettempdir(),
+        )
         if res.returncode == 0 and res.stdout:
             models_data = []
             for line in res.stdout.splitlines():
@@ -273,6 +280,9 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
     except Exception:
         pass
     return None
+
+
+_refresh_agy_models_cache = _sync_agy_models_cache
 
 
 class DiscoveredMuseModels(tuple):

@@ -73,6 +73,29 @@ class LocalTestAvailabilityTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertEqual(details.execution_status, "UNVERIFIED")
 
+    def test_sandbox_infrastructure_failures_fuse_as_unverified(self):
+        (self.root / "test_app.py").write_text("def test_app(): pass\n")
+        cases = [
+            (-1, "", "bwrap not available", "SandboxUnavailable"),
+            (-1, "", "config invalid", "SandboxConfigError"),
+            (1, "", "bwrap: Can't bind mount: No such file", None),
+            (1, "bwrap: initialization failed", "", None),
+            (1, "bwrap: initialization failed", "warning: non-bwrap secondary stderr", None),
+        ]
+        for code, out, err, cat in cases:
+            with self.subTest(code=code, cat=cat, err=err):
+                with patch("makewand.git_helper.get_dirty_files", return_value=[]), \
+                     patch.dict(sys.modules, {"pytest": None}), patch("shutil.which", return_value=None), \
+                     patch("makewand.sandbox.run_in_sandbox", return_value=(code, out, err, cat)):
+                    passed, details = orch.run_local_tests(str(self.root))
+                self.assertFalse(passed)
+                self.assertEqual(getattr(details, "execution_status", None), "UNVERIFIED")
+                self.assertIn("沙箱容器基础设施故障，本地测试阻断", str(details))
+                if out and out.strip().startswith("bwrap:"):
+                    self.assertIn(out.strip(), str(details))
+                elif err and err.strip().startswith("bwrap:"):
+                    self.assertIn(err.strip(), str(details))
+
 
 class PipelineMissingEvidenceTests(PipelineHarness):
     def test_missing_test_evidence_stops_before_review_and_restores_user_files(self):

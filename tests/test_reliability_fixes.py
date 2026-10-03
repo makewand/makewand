@@ -306,6 +306,10 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
         ]
         from makewand.orchestrator import run_pipeline
         with patch("makewand.orchestrator.execute_claude_task") as mock_claude, \
+             patch("makewand.orchestrator.execute_codex_task") as mock_codex, \
+             patch("makewand.orchestrator.execute_agy_task") as mock_agy, \
+             patch("makewand.orchestrator.execute_muse_task") as mock_muse, \
+             patch("makewand.orchestrator.execute_grok_task") as mock_grok, \
              patch("makewand.orchestrator.get_or_update_status") as mock_status:
             mock_status.return_value = {
                 "claude": {"status": "ready", "tier": "standard"},
@@ -313,13 +317,23 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
                 "agy": {"status": "ready", "tier": "deep"},
                 "muse": {"status": "ready", "tier": "standard"}
             }
-            mock_claude.return_value = (True, "Analysis complete", None)
+            mock_resp = (True, "Analysis complete", None)
+            mock_claude.return_value = mock_resp
+            mock_codex.return_value = mock_resp
+            mock_agy.return_value = mock_resp
+            mock_muse.return_value = mock_resp
+            mock_grok.return_value = mock_resp
 
             for p in explain_prompts:
                 mock_claude.reset_mock()
+                mock_codex.reset_mock()
+                mock_agy.reset_mock()
+                mock_muse.reset_mock()
+                mock_grok.reset_mock()
                 run_pipeline(p, force_code=True)
-                mock_claude.assert_called()
-                _, kwargs = mock_claude.call_args
+                called = [m for m in [mock_claude, mock_codex, mock_agy, mock_muse, mock_grok] if m.called]
+                self.assertTrue(called, f"Expected at least one provider to be called for prompt: {p}")
+                _, kwargs = called[0].call_args
                 self.assertTrue(kwargs.get("readonly", False), f"Failed to preserve readonly=True for prompt: {p}")
 
         # Review prompt with read-only constraint

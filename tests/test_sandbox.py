@@ -244,7 +244,8 @@ class TestSandbox(unittest.TestCase):
             self.assertEqual(res.returncode, 0, f"rlimits test failed: {res.stderr}")
 
     def test_sandbox_codex_uncreated_override_masked_with_dev_null(self):
-        """Regression test for P1-S2: AGENTS.override.md must be masked with /dev/null if not present on host."""
+        """Regression test for P0/P1-S2: AGENTS.override.md and uncreated files must not trigger /dev/null mount,
+        must not leave touch traces on host, and must be cleaned up if created during sandbox execution."""
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_home = Path(tmpdir) / "home"
@@ -253,14 +254,87 @@ class TestSandbox(unittest.TestCase):
             ws = Path(tmpdir) / "ws"
             ws.mkdir()
 
-            with patch.dict(os.environ, {"HOME": str(fake_home)}):
-                cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), is_provider=True, provider_name="codex")
-
             override_path = str(fake_codex / "AGENTS.override.md")
-            # Must contain --ro-bind /dev/null <override_path>
-            ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
-            ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
-            self.assertIn(("/dev/null", override_path), ro_bind_pairs)
+            hooks_json_path = str(fake_codex / "hooks.json")
+
+            policy_path = str(fake_codex / "policy")
+            canary_outside = Path(tmpdir) / "canary.txt"
+            canary_outside.write_text("precious host data", encoding="utf-8")
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+                # Ensure CODEX_HOME does not interfere with fake_home/.codex
+                os.environ.pop("CODEX_HOME", None)
+
+                # 1. wrap_bwrap must NOT generate --ro-bind /dev/null for uncreated override files
+                cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), is_provider=True, provider_name="codex")
+                ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
+                ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
+                self.assertNotIn(("/dev/null", override_path), ro_bind_pairs)
+                self.assertNotIn(("/dev/null", hooks_json_path), ro_bind_pairs)
+                self.assertNotIn((override_path, override_path), ro_bind_pairs)
+
+                # 2. Executing run_in_sandbox must not create the uncreated files on host
+                ret, out, err, _ = run_in_sandbox(
+                    ["bash", "-c", "echo sandbox_ran"],
+                    workspace=str(ws),
+                    is_provider=True,
+                    provider_name="codex",
+                )
+                self.assertEqual(ret, 0)
+                self.assertFalse(os.path.lexists(override_path), f"{override_path} was touched/created on host")
+                self.assertFalse(os.path.lexists(hooks_json_path), f"{hooks_json_path} was touched/created on host")
+
+                # 3a. If an uncreated file was created during execution, run_in_sandbox cleans it up in finally
+                ret, out, err, _ = run_in_sandbox(
+                    ["python3", "-c", f"open({override_path!r}, 'w').write('malicious')"],
+                    workspace=str(ws),
+                    is_provider=True,
+                    provider_name="codex",
+                )
+                self.assertEqual(ret, 0)
+                self.assertFalse(os.path.lexists(override_path), f"{override_path} was not cleaned up after sandbox run")
+
+                # 3b. If a protected directory was created with read-only permissions (0555 dir + 0444 file),
+                # robust cleanup must properly remove it without failing silently
+                cleanup_code = (
+                    f"import os\n"
+                    f"os.mkdir({policy_path!r})\n"
+                    f"fp = os.path.join({policy_path!r}, 'sub.txt')\n"
+                    f"open(fp, 'w').write('sub')\n"
+                    f"os.chmod(fp, 0o444)\n"
+                    f"os.chmod({policy_path!r}, 0o555)\n"
+                )
+                ret, out, err, _ = run_in_sandbox(
+                    ["python3", "-c", cleanup_code],
+                    workspace=str(ws),
+                    is_provider=True,
+                    provider_name="codex",
+                )
+                self.assertEqual(ret, 0)
+                self.assertFalse(os.path.lexists(policy_path), f"{policy_path} read-only directory was not cleaned up")
+
+                # 3c. If a symlink was planted pointing to outside files, the symlink is removed but the target is intact
+                symlink_code = (
+                    f"import os\n"
+                    f"os.symlink({str(canary_outside)!r}, {override_path!r})\n"
+                )
+                ret, out, err, _ = run_in_sandbox(
+                    ["python3", "-c", symlink_code],
+                    workspace=str(ws),
+                    is_provider=True,
+                    provider_name="codex",
+                )
+                self.assertEqual(ret, 0)
+                self.assertFalse(os.path.lexists(override_path), f"{override_path} symlink was not cleaned up")
+                self.assertTrue(canary_outside.exists(), "Outside canary file was mistakenly removed")
+                self.assertEqual(canary_outside.read_text(encoding="utf-8"), "precious host data")
+
+                # 4. If an override file already existed on host, it must be protected read-only
+                Path(override_path).write_text("user override content", encoding="utf-8")
+                cmd2 = wrap_bwrap(["codex", "exec"], workspace=str(ws), is_provider=True, provider_name="codex")
+                ro_bind_indices2 = [i for i, x in enumerate(cmd2) if x == "--ro-bind"]
+                ro_bind_pairs2 = [(cmd2[i + 1], cmd2[i + 2]) for i in ro_bind_indices2 if i + 2 < len(cmd2)]
+                self.assertIn((override_path, override_path), ro_bind_pairs2)
 
 
 if __name__ == "__main__":
