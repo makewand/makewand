@@ -63,7 +63,8 @@ def run_command(name, argv, output, env, timeout):
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=30, check=False)
             proc.wait(timeout=30)
             status = -1
-    safe_argv = ["python" if value == sys.executable else value.replace(str(ROOT), "<checkout>").replace(str(output), "<output>") for value in argv]
+    private_state = str(Path(env["HOME"]).parent)
+    safe_argv = ["python" if value == sys.executable else value.replace(str(ROOT), "<checkout>").replace(str(output), "<output>").replace(private_state, "<private-state>") for value in argv]
     return {"argv": safe_argv, "exit": status, "elapsed_seconds": round(time.monotonic() - started, 3),
             "stdout_sha256": digest(output / (name + ".stdout.log")), "stderr_sha256": digest(output / (name + ".stderr.log"))}
 
@@ -77,14 +78,22 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     summary = {"state": "running", "expected_sha": args.expected_sha, "groups": [], "desktop_interaction": "not_tested"}
     write_json(output / "summary.json", summary)
+    private_state = None
     try:
         if os.name != "nt":
             raise ValueError("native Windows is required")
         if not re.fullmatch(r"[0-9a-fA-F]{40}", args.expected_sha):
             raise ValueError("expected SHA must be an exact Git commit")
-        state = output / "isolated-state"
+        # Keep test projects and Go caches outside this Git checkout. Otherwise
+        # non-Git fixtures discover its .git ancestor and ./... discovers cached
+        # legacy modules, so neither test namespace is the intended one.
+        private_state = tempfile.TemporaryDirectory(prefix="makewand-windows-verification-")
+        state = Path(private_state.name).resolve()
+        if state == ROOT or ROOT in state.parents:
+            raise ValueError("private test state must be outside the verification checkout")
         env = isolated_env(state)
-        env.update(CGO_ENABLED="1", CC="gcc")
+        env.update(CGO_ENABLED="1", CC="gcc", GOCACHE=str(state / "go-build"),
+                   GOMODCACHE=str(state / "go-mod"), GOPATH=str(state / "go"))
         head = clean_checkout(ROOT, args.expected_sha, env)
         compiler = run_command("compiler", ["gcc", "-v"], output, env, 60)
         if compiler["exit"]:
@@ -92,21 +101,33 @@ def main():
         synchronization = subprocess.check_output(["gcc", "-print-file-name=libsynchronization.a"], env=env).decode().strip()
         if not Path(synchronization).is_absolute() or not Path(synchronization).is_file():
             raise ValueError("MinGW-w64 runtime 8+ synchronization library is missing")
-        go_env = json.loads(subprocess.check_output(["go", "env", "-json", "GOOS", "GOARCH", "CGO_ENABLED", "CC", "GOVERSION"], cwd=ROOT, env=env))
+        go_env = json.loads(subprocess.check_output(["go", "env", "-json", "GOOS", "GOARCH", "CGO_ENABLED", "CC", "GOVERSION", "GOCACHE", "GOMODCACHE", "GOPATH"], cwd=ROOT, env=env))
         if go_env["GOOS"] != "windows" or go_env["GOARCH"] != "amd64" or go_env["CGO_ENABLED"] != "1":
             raise ValueError("race requires the native Windows/amd64 CGO toolchain")
+        cache_outside = {}
+        for key in ("GOCACHE", "GOMODCACHE", "GOPATH"):
+            configured = go_env.pop(key)
+            paths = configured.split(os.pathsep) if key == "GOPATH" else [configured]
+            if not paths or any(not value or Path(value).resolve() == ROOT or ROOT in Path(value).resolve().parents for value in paths):
+                raise ValueError("actual " + key + " must be outside the verification checkout")
+            cache_outside[key.lower() + "_outside_checkout"] = True
         build = run_command("proof_build", ["go", "build", "-o", str(output / "runtime-proof.exe"), "scripts/windows_runtime_proof.go"], output, env, 300)
         if build["exit"]:
             raise ValueError("runtime proof build failed")
-        proof = run_command("runtime", [str(output / "runtime-proof.exe"), "--storage", str(output)], output, env, 60)
+        proof = run_command("runtime", [str(output / "runtime-proof.exe"), "--storage", str(state), "--outside-checkout", str(ROOT)], output, env, 60)
         if proof["exit"]:
             raise ValueError("native NTFS/actual Go temp proof failed")
         summary.update(commit=head, go=go_env, compiler=compiler, native=json.loads((output / "runtime.stdout.log").read_bytes()), python={"version": sys.version, "stdout_encoding": sys.stdout.encoding, "preferred_encoding": locale.getpreferredencoding(False)})
         with tempfile.TemporaryDirectory(dir=state / "tmp") as temp:
+            python_temp = Path(temp).resolve()
+            if python_temp == ROOT or ROOT in python_temp.parents:
+                raise ValueError("actual Python temp must be outside the verification checkout")
             # The same volume proof applies to the actual Python-created temp.
-            py_proof = run_command("python_temp", [str(output / "runtime-proof.exe"), "--storage", temp], output, env, 60)
+            py_proof = run_command("python_temp", [str(output / "runtime-proof.exe"), "--storage", temp, "--outside-checkout", str(ROOT)], output, env, 60)
             if py_proof["exit"]:
                 raise ValueError("actual Python temp NTFS proof failed")
+        summary["private_state"] = {"storage_outside_checkout": summary["native"]["storage_outside_checkout"], "actual_python_temp_outside_checkout": True,
+                                    "actual_go_temp_outside_checkout": summary["native"]["actual_go_temp_outside_checkout"], **cache_outside}
         listed = run_command("packages", ["go", "list", "-json", "./..."], output, env, 300)
         if listed["exit"]:
             raise ValueError("complete package discovery failed")
@@ -142,6 +163,12 @@ def main():
         clean_checkout(ROOT, head, env)
     except Exception as error:
         summary.update(state="failed", error=str(error))
+    finally:
+        if private_state is not None:
+            try:
+                private_state.cleanup()
+            except Exception as error:
+                summary.update(state="failed", error="private test state cleanup failed: " + type(error).__name__)
     write_json(output / "summary.json", summary)
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if step_summary:
