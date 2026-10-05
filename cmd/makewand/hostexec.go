@@ -13,6 +13,7 @@ import (
 	"github.com/makewand/makewand/internal/diag"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/i18n"
+	"github.com/makewand/makewand/internal/privatefile"
 )
 
 // unsafeHostExecAuditFile is the JSONL audit log (under the config dir) that
@@ -152,19 +153,16 @@ func auditUnsafeHostExec(ev engine.UnsafeHostExecEvent) {
 		return
 	}
 	path := filepath.Join(dir, unsafeHostExecAuditFile)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := openUnsafeHostExecAudit(path)
 	if err != nil {
 		diag.Stderr().WarnErr("unsafe host exec audit write failed", err)
 		return
 	}
-	// The 0600 in OpenFile only applies on creation; tighten a pre-existing
-	// wider-permission file so the audit log stays private as documented.
-	if info, statErr := f.Stat(); statErr != nil {
-		diag.Stderr().WarnErr("unsafe host exec audit stat failed", statErr)
-	} else if info.Mode().Perm() != 0o600 {
-		if chErr := f.Chmod(0o600); chErr != nil {
-			diag.Stderr().WarnErr("unsafe host exec audit chmod failed", chErr)
-		}
+	// Protect the opened file before appending, including its actual Windows DACL.
+	if err := privatefile.Tighten(f); err != nil {
+		_ = f.Close()
+		diag.Stderr().WarnErr("unsafe host exec audit protection failed", err)
+		return
 	}
 	if _, writeErr := f.Write(append(data, '\n')); writeErr != nil {
 		diag.Stderr().WarnErr("unsafe host exec audit write failed", writeErr)

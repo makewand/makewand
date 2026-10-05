@@ -47,6 +47,9 @@ func (p *rawCLIProvider) Chat(ctx context.Context, _ []model.Message, _ string, 
 	started := time.Now()
 	cleanupProcess, startErr := processjob.Start(cmd)
 	if startErr != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StderrString(), startErr, errors.Join(contextErr, startErr), time.Since(started))
+		}
 		return "", usage, fmt.Errorf("start raw CLI: %w", startErr)
 	}
 	defer cleanupProcess()

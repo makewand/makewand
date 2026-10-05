@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/testfixture"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,15 +16,7 @@ import (
 )
 
 func TestCLIProvider_ChatStream_ReturnsErrorOnExitFailure(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "fail-cli.sh")
-	body := "#!/bin/sh\n" +
-		"echo stream-start\n" +
-		"echo boom-on-stderr 1>&2\n" +
-		"exit 1\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "output", Stdout: "stream-start\n", Stderr: "boom-on-stderr\n", ExitCode: 1})
 
 	p := NewClaudeCLI(script)
 	ch, err := p.ChatStream(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
@@ -50,13 +44,7 @@ func TestCLIProvider_ChatStream_ReturnsErrorOnExitFailure(t *testing.T) {
 }
 
 func TestCLIProvider_Chat_TimeoutErrorIsReadable(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "sleep-cli.sh")
-	body := "#!/bin/sh\n" +
-		"sleep 2\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 2 * time.Second})
 
 	p := NewClaudeCLI(script)
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -119,13 +107,7 @@ func TestContainsLikelyCode_DoesNotTreatNaturalLanguageSemicolonAsCode(t *testin
 }
 
 func TestCLIProvider_Chat_ValidationIgnoresSystemFileInstructions(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "echo-provider.sh")
-	body := "#!/bin/sh\n" +
-		"printf 'provider:reviewer\\n'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Stdout: "provider:reviewer\n"})
 
 	p := NewCommandCLI("reviewer", script, nil, PromptModeStdin)
 	system := "When creating or modifying files, use this format:\n--- FILE: path/to/file ---\n```\nfile content here\n```"
@@ -145,53 +127,102 @@ func TestCLIProvider_Chat_ValidationIgnoresSystemFileInstructions(t *testing.T) 
 }
 
 func TestCLIProvider_ChatStream_EmitsTimeoutErrorOnDeadline(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "sleep-stream-cli.sh")
-	body := "#!/bin/sh\n" +
-		"sleep 2\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
-
-	p := NewClaudeCLI(script)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	ch, err := p.ChatStream(ctx, []Message{{Role: "user", Content: "hi"}}, "", 256)
-	if err != nil {
-		t.Fatalf("ChatStream() start error = %v", err)
-	}
-
-	timeout := time.After(3 * time.Second)
-	for {
-		select {
-		case chunk, ok := <-ch:
-			if !ok {
-				t.Fatal("stream closed without emitting timeout error")
+	t.Run("deadline_before_readiness", func(t *testing.T) {
+		script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 2 * time.Second})
+		p := NewClaudeCLI(script)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		deadline, _ := ctx.Deadline()
+		ch, startErr := p.ChatStream(ctx, []Message{{Role: "user", Content: "hi"}}, "", 256)
+		checkTimeout := func(err error) {
+			if ctx.Err() != context.DeadlineExceeded || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, execution.ErrUnknownOutcome) || ErrorKindOf(err) != ErrorKindTimeout {
+				t.Fatalf("early stream deadline lost its typed timeout/unknown: err=%v ctx=%v", err, ctx.Err())
 			}
-			if chunk.Error != nil {
-				if !strings.Contains(chunk.Error.Error(), "timeout") {
-					t.Fatalf("stream error = %q, want timeout message", chunk.Error.Error())
+			if time.Since(deadline) > 3*time.Second {
+				t.Fatal("stream cleanup exceeded its existing bound after the real deadline")
+			}
+		}
+		if startErr != nil {
+			if ch != nil {
+				t.Fatal("failed start returned a live stream")
+			}
+			// A genuine deadline may expire during native process initialization.
+			// The synchronous path must preserve exactly the same typed outcome.
+			checkTimeout(startErr)
+			return
+		}
+		timer := time.NewTimer(max(0, time.Until(deadline.Add(3*time.Second))))
+		defer timer.Stop()
+		for {
+			select {
+			case chunk, ok := <-ch:
+				if !ok {
+					t.Fatal("stream closed without emitting timeout error")
 				}
+				if chunk.Error != nil {
+					checkTimeout(chunk.Error)
+					return
+				}
+			case <-timer.C:
+				t.Fatal("timed out waiting for stream timeout error")
+			}
+		}
+	})
+	t.Run("cancel_after_real_readiness", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "active-descendant")
+		p := cliProcessProvider(t, "quiet", marker)
+		ctx, cancel := context.WithTimeout(context.Background(), cliProcessFixtureStartupTimeout)
+		completed := make(chan struct{})
+		var streamErr error
+		go func() {
+			defer close(completed)
+			stream, err := p.ChatStream(ctx, []Message{{Role: "user", Content: "fixture"}}, "", 0)
+			if err != nil {
+				streamErr = err
 				return
 			}
-		case <-timeout:
-			t.Fatal("timed out waiting for stream timeout error")
+			for chunk := range stream {
+				if chunk.Error != nil {
+					streamErr = chunk.Error
+				}
+			}
+		}()
+		defer func() {
+			cancel()
+			select {
+			case <-completed:
+			case <-time.After(2 * time.Second):
+				t.Error("active stream did not finish after fixture cancellation")
+			}
+		}()
+		if err := waitCLIProcessFixtureReady(ctx, marker, completed); err != nil {
+			t.Fatalf("actual child did not reach readiness: %v", err)
 		}
-	}
+		readyAt := time.Now()
+		// Initialization has completed: exercise a real active stream for the
+		// original short interval, then cancel its genuine parent context.
+		time.Sleep(100 * time.Millisecond)
+		cancelledAt := time.Now()
+		cancel()
+		select {
+		case <-completed:
+		case <-time.After(1800 * time.Millisecond):
+			t.Fatal("ready stream exceeded its cancellation/pipe cleanup bound")
+		}
+		if time.Since(cancelledAt) > 1800*time.Millisecond || ctx.Err() != context.Canceled || (streamErr != nil && !errors.Is(streamErr, context.Canceled)) {
+			t.Fatalf("ready stream lost cancellation: error=%v ctx=%v cleanup=%v", streamErr, ctx.Err(), time.Since(cancelledAt))
+		}
+		if remaining := time.Until(readyAt.Add(2300 * time.Millisecond)); remaining > 0 {
+			time.Sleep(remaining)
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("actual descendant survived stream cancellation: %v", err)
+		}
+	})
 }
 
 func TestGeminiCLI_ChatStream_ParsesStreamJSON(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "gemini-stream.sh")
-	body := "#!/bin/sh\n" +
-		"printf '%s\\n' '{\"type\":\"init\",\"session_id\":\"s\",\"model\":\"gemini\"}'\n" +
-		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Hello\"}'\n" +
-		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\" world\"}'\n" +
-		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Stdout: "{\"type\":\"init\",\"session_id\":\"s\",\"model\":\"gemini\"}\n{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Hello\"}\n{\"type\":\"message\",\"role\":\"assistant\",\"content\":\" world\"}\n{\"type\":\"result\",\"status\":\"success\"}\n"})
 
 	p := NewGeminiCLI(script)
 	ch, err := p.ChatStream(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
@@ -224,15 +255,7 @@ func TestGeminiCLI_ChatStream_ParsesStreamJSON(t *testing.T) {
 }
 
 func TestGeminiCLI_ChatStream_IgnoresPlaintextPrelude(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "gemini-stream-prelude.sh")
-	body := "#!/bin/sh\n" +
-		"printf '%s\\n' 'Loaded cached credentials.'\n" +
-		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"OK\"}'\n" +
-		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Stdout: "Loaded cached credentials.\n{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"OK\"}\n{\"type\":\"result\",\"status\":\"success\"}\n"})
 
 	p := NewGeminiCLI(script)
 	ch, err := p.ChatStream(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
@@ -263,15 +286,7 @@ func TestGeminiCLI_ChatStream_IgnoresPlaintextPrelude(t *testing.T) {
 }
 
 func TestNewCommandCLI_PromptPlaceholderReplacement(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "echo-args.sh")
-	body := "#!/bin/sh\n" +
-		"for arg in \"$@\"; do\n" +
-		"  printf '%s\\n' \"$arg\"\n" +
-		"done\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "echo-args"})
 
 	p := NewCommandCLI("private", script, []string{"--prompt", "{{prompt}}"}, "legacy")
 	content, usage, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello custom provider"}}, "", 256)
@@ -293,15 +308,7 @@ func TestNewCommandCLI_PromptPlaceholderReplacement(t *testing.T) {
 }
 
 func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "echo-last.sh")
-	body := "#!/bin/sh\n" +
-		"for arg in \"$@\"; do\n" +
-		"  printf '%s\\n' \"$arg\"\n" +
-		"done\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "echo-args"})
 
 	p := NewCommandCLI("private", script, []string{"--flag"}, "legacy")
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello appended prompt"}}, "", 256)
@@ -317,14 +324,7 @@ func TestNewCommandCLI_AppendsPromptWhenNoPlaceholder(t *testing.T) {
 }
 
 func TestNewCommandCLI_WritesPromptToStdinWhenConfigured(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "echo-stdin.sh")
-	body := "#!/bin/sh\n" +
-		"printf 'mode:%s\\n' \"$1\"\n" +
-		"cat\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "echo-stdin"})
 
 	p := NewCommandCLI("private", script, []string{"stdin"}, "stdin")
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello via stdin"}}, "", 256)
@@ -340,26 +340,8 @@ func TestNewCommandCLI_WritesPromptToStdinWhenConfigured(t *testing.T) {
 }
 
 func TestCLIProvider_Chat_RetriesExplicitQuotaRejection(t *testing.T) {
-	dir := t.TempDir()
-	stateFile := filepath.Join(dir, "attempts.txt")
-	script := filepath.Join(dir, "flaky-cli.sh")
-	body := "#!/bin/sh\n" +
-		"state_file=\"$1\"\n" +
-		"if [ -f \"$state_file\" ]; then\n" +
-		"  n=$(cat \"$state_file\")\n" +
-		"else\n" +
-		"  n=0\n" +
-		"fi\n" +
-		"n=$((n+1))\n" +
-		"echo \"$n\" > \"$state_file\"\n" +
-		"if [ \"$n\" -eq 1 ]; then\n" +
-		"  echo \"quota exceeded\" 1>&2\n" +
-		"  exit 1\n" +
-		"fi\n" +
-		"echo \"ok after retry\"\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	stateFile := filepath.Join(t.TempDir(), "attempts.txt")
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "counter", StateFile: stateFile, FirstError: "quota exceeded", Stdout: "ok after retry\n", Stderr: "", ExitCode: 0})
 
 	p := NewCommandCLI("private", script, []string{stateFile}, "legacy")
 	content, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
@@ -384,23 +366,8 @@ func TestCLIProvider_Chat_RetriesExplicitQuotaRejection(t *testing.T) {
 }
 
 func TestCLIProvider_Chat_DoesNotRetryNonTransientError(t *testing.T) {
-	dir := t.TempDir()
-	stateFile := filepath.Join(dir, "attempts.txt")
-	script := filepath.Join(dir, "fail-permanent-cli.sh")
-	body := "#!/bin/sh\n" +
-		"state_file=\"$1\"\n" +
-		"if [ -f \"$state_file\" ]; then\n" +
-		"  n=$(cat \"$state_file\")\n" +
-		"else\n" +
-		"  n=0\n" +
-		"fi\n" +
-		"n=$((n+1))\n" +
-		"echo \"$n\" > \"$state_file\"\n" +
-		"echo \"invalid_api_key\" 1>&2\n" +
-		"exit 1\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	stateFile := filepath.Join(t.TempDir(), "attempts.txt")
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "counter", StateFile: stateFile, FirstError: "", Stdout: "", Stderr: "invalid_api_key\n", ExitCode: 1})
 
 	p := NewCommandCLI("private", script, []string{stateFile}, "legacy")
 	_, _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, "", 256)
@@ -425,17 +392,7 @@ func TestCLIProvider_Chat_DoesNotRetryNonTransientError(t *testing.T) {
 }
 
 func TestCLIProvider_IsAvailable_UsesHealthProbe(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "probe-ok.sh")
-	body := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"--version\" ]; then\n" +
-		"  echo ok\n" +
-		"  exit 0\n" +
-		"fi\n" +
-		"exit 1\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "probe", Stdout: "ok\n"})
 
 	p := NewClaudeCLI(script)
 	if !p.IsAvailable() {
@@ -444,13 +401,7 @@ func TestCLIProvider_IsAvailable_UsesHealthProbe(t *testing.T) {
 }
 
 func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "probe-hang.sh")
-	body := "#!/bin/sh\n" +
-		"sleep 10\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 10 * time.Second})
 
 	p := &CLIProvider{
 		name:     "hang-cli",
@@ -472,13 +423,7 @@ func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
 }
 
 func TestCLIProvider_IsAvailable_SoftPassesTimeoutForGemini(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "probe-hang-gemini.sh")
-	body := "#!/bin/sh\n" +
-		"sleep 10\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 10 * time.Second})
 
 	p := &CLIProvider{
 		name:     "gemini-cli",
@@ -785,13 +730,7 @@ func TestParseGeminiCLIJSON_InvalidJSON(t *testing.T) {
 func TestCLIProvider_Chat_JSONFallbackToText(t *testing.T) {
 	// Simulate a CLI that returns plain text even though jsonOutput is enabled.
 	// The provider should fall back to text parsing gracefully.
-	dir := t.TempDir()
-	script := filepath.Join(dir, "plain-text-cli.sh")
-	body := "#!/bin/sh\n" +
-		"echo 'Hello from plain text'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Stdout: "Hello from plain text\n"})
 
 	p := &CLIProvider{
 		name:              "test-json-fallback",
@@ -821,13 +760,7 @@ func TestCLIProvider_Chat_JSONFallbackToText(t *testing.T) {
 }
 
 func TestCLIProvider_Chat_JSONUsageUsedWhenAvailable(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "json-cli.sh")
-	body := "#!/bin/sh\n" +
-		`printf '{"result":"JSON hello","total_cost_usd":0.05,"usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"test-model":{"inputTokens":10,"outputTokens":5,"costUSD":0.05}}}'` + "\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Stdout: "{\"result\":\"JSON hello\",\"total_cost_usd\":0.05,\"usage\":{\"input_tokens\":10,\"output_tokens\":5},\"modelUsage\":{\"test-model\":{\"inputTokens\":10,\"outputTokens\":5,\"costUSD\":0.05}}}\n"})
 
 	p := &CLIProvider{
 		name:              "test-json-cli",
@@ -1067,18 +1000,7 @@ func TestNewAgyCLI_ArgumentOrder(t *testing.T) {
 func TestAgyCLI_ChatPassesActualUserPrompt(t *testing.T) {
 	t.Setenv("MAKEWAND_AGY_MODEL", "")
 
-	dir := t.TempDir()
-	script := filepath.Join(dir, "fake-agy.sh")
-	body := "#!/bin/sh\n" +
-		"if [ \"$#\" -ne 3 ] || [ \"$1\" != \"--sandbox\" ] || [ \"$2\" != \"--print\" ]; then\n" +
-		"  printf 'unexpected argv: %s\\n' \"$*\" >&2\n" +
-		"  exit 64\n" +
-		"fi\n" +
-		"printf '%s\\n' \"$3\"\n"
-	//nolint:gosec // The temporary fixture must be executable to emulate the Agy CLI.
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(fake agy): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "agy-prompt"})
 
 	p := NewAgyCLI(script)
 	want := "MW_AGY_PROMPT_SENTINEL"
@@ -1130,13 +1052,7 @@ func TestNewClaudeCLI_SystemPromptFlag(t *testing.T) {
 }
 
 func TestClaudeCLI_Chat_SystemPromptSeparation(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "claude-sys.sh")
-	// Script that echoes all args so we can verify --append-system-prompt is present
-	body := "#!/bin/sh\necho \"$@\"\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile: %v", err)
-	}
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "echo-args"})
 
 	p := NewClaudeCLI(script)
 	content, _, err := p.Chat(context.Background(),

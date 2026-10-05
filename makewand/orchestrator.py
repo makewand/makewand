@@ -47,6 +47,7 @@ from makewand.git_helper import (
     run_git_cmd,
     check_working_tree_isolation,
     create_ephemeral_shadow_worktree,
+    find_git_root,
     get_submodule_paths,
 )
 from makewand.candidate import CandidateManager, build_manifest, get_candidate_files_changed, remove_new_generated_bytecode
@@ -514,6 +515,44 @@ def _freeze_delivery_inputs(root: str, reviewed_inputs: Dict[str, Any]) -> Dict[
     return frozen
 
 
+def _delivery_patch_changes(root, baseline, commit, inputs, sub_baselines, sub_commits):
+    """Bind exported patch paths to the immutable, reviewed payload records."""
+    changes = {}
+    groups = {}
+    for repo, revision in {"": commit, **sub_commits}.items():
+        group = groups[repo] = {}
+        before = sub_baselines.get(repo) if repo else baseline
+        if not before:
+            continue
+        code, listing, error = run_git_cmd(
+            ["git", "diff", "--no-renames", "--name-status", "-z", before, revision],
+            cwd=str(Path(root) / repo), binary=True)
+        if code:
+            raise OSError(f"cannot freeze delivery patch changes: {error}")
+        fields = listing.split(b"\0")
+        if fields[-1:] != [b""] or (len(fields) - 1) % 2:
+            raise OSError("invalid delivery patch change listing")
+        for status, raw_name in zip(fields[:-1:2], fields[1:-1:2]):
+            name = os.fsdecode(raw_name)
+            if not name or Path(name).is_absolute() or any(part in (".", "..", ".git") for part in name.split("/")):
+                raise OSError("invalid delivery patch change path")
+            relative = repo + "/" + name if repo else name
+            # Gitlinks are represented by separately verified child patches.
+            if relative in sub_commits:
+                continue
+            record = inputs[repo].get(name)
+            if status == b"D":
+                if record is not None:
+                    raise OSError("delivery deletion still has a reviewed payload")
+                changes[relative] = None
+            elif status in (b"A", b"M", b"T") and record is not None:
+                changes[relative] = list(record)
+            else:
+                raise OSError("delivery patch change lacks a reviewed payload: " + relative)
+            group[relative] = changes[relative]
+    return changes, groups
+
+
 def _verify_delivery_commit(repo: str, commit: str, expected: Dict[str, Any], gitlinks: Dict[str, str]) -> str:
     """Compare immutable Git blobs/modes against the reviewed source records.
 
@@ -681,6 +720,7 @@ def _run_pipeline_impl(
     cleanup_shadow = None
     host_txn: Optional[HostWorkspaceTransaction] = None
     native_delivery = None
+    delivery_baseline = None
 
     if intent not in ("identity", "explain", "review"):
         # One makewand code task per repository: a second task would otherwise
@@ -724,10 +764,21 @@ def _run_pipeline_impl(
                     from makewand.native_delivery import create_native_shadow_worktree
                     shadow_res = create_native_shadow_worktree(cwd, prefix="guard")
                 else:
+                    from makewand.delivery import capture_delivery_baseline, check_delivery_state, snapshot_limits
+                    target_root = Path(find_git_root(original_task_cwd) or original_task_cwd).resolve()
+                    delivery_limits = snapshot_limits()
+                    delivery_baseline = capture_delivery_baseline(str(target_root),
+                                                                  timeout=get_remaining_timeout(delivery_limits["max_seconds"]),
+                                                                  limits=delivery_limits)
                     shadow_res = create_ephemeral_shadow_worktree(cwd, prefix="guard")
                 shadow_worktree_dir, shadow_branch, cleanup_shadow = shadow_res[0], shadow_res[1], shadow_res[2]
                 if not shadow_worktree_dir or not Path(shadow_worktree_dir).exists():
                     raise RuntimeError("Shadow worktree directory could not be established")
+                if os.name != "nt":
+                    actual_root = Path(getattr(shadow_res, "repo_root", None) or original_task_cwd).resolve()
+                    if str(actual_root) != delivery_baseline["root"]:
+                        raise OSError("shadow source differs from the frozen delivery destination")
+                    check_delivery_state(delivery_baseline, timeout=get_remaining_timeout(delivery_baseline["snapshot_limits"]["max_seconds"]))
                 cwd = shadow_worktree_dir
                 is_shadow_active = True
                 protected.prepare_workspace(cwd)
@@ -1379,6 +1430,12 @@ def _run_pipeline_impl(
                 repo_root = getattr(shadow_res, "repo_root", None)
                 sub_baselines = getattr(shadow_res, "sub_baselines", {}) or {}
                 worktree_root = getattr(shadow_res, "worktree_root", shadow_worktree_dir)
+                if native_delivery is None:
+                    from makewand.delivery import check_delivery_state
+                    if delivery_baseline is None:
+                        raise OSError("delivery destination baseline was not frozen")
+                    check_delivery_state(delivery_baseline, timeout=get_remaining_timeout(delivery_baseline["snapshot_limits"]["max_seconds"]))
+                    from makewand.delivery import check_delivery_patch
 
                 art_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 # Private 0700 directory with an unpredictable name (never shared /tmp).
@@ -1506,6 +1563,16 @@ def _run_pipeline_impl(
                 if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
                     return fail_and_cleanup("❌ [Makewand Quality Gate] 导出期间工作区发生变化，拒绝交付。")
 
+                if native_delivery is None:
+                    # A clone may have normalized links or other baseline inputs.
+                    # Check the real, frozen destination before publishing refs.
+                    check_delivery_state(delivery_baseline, timeout=get_remaining_timeout(delivery_baseline["snapshot_limits"]["max_seconds"]))
+                    patch_targets = [(delivery_baseline["root"], patch_file)] + [
+                        (str(Path(delivery_baseline["root"]) / item["rel_path"]), item["patch_file"])
+                        for item in sub_patches]
+                    for target, exported_patch in patch_targets:
+                        check_delivery_patch(target, exported_patch, timeout=get_remaining_timeout(timeout))
+
                 # Publish immutable, verified objects only. Moving HEAD between
                 # validation and push/export cannot replace approved content.
                 for sub_repo, destination, sub_commit in submodule_pushes:
@@ -1523,7 +1590,7 @@ def _run_pipeline_impl(
                 has_baseline_conflict = bool(tree_b_code == 0 and tree_h_code == 0 and tree_b.strip() != tree_h.strip())
 
                 # Generate apply_delivery.sh and delivery_manifest.json
-                repo_apply_root = str(repo_root) if repo_root else worktree_root
+                repo_apply_root = delivery_baseline["root"] if native_delivery is None else str(repo_root or worktree_root)
                 manifest_data = {
                     "timestamp": art_ts,
                     "delivered_branch": delivered_branch,
@@ -1536,6 +1603,12 @@ def _run_pipeline_impl(
                     "main_patch": str(patch_file),
                     "submodule_patches": sub_patches
                 }
+                patch_changes = None
+                if native_delivery is None:
+                    patch_changes, patch_groups = _delivery_patch_changes(worktree_root, baseline_commit, impl_commit,
+                                                                         delivery_inputs, sub_baselines, verified_submodules)
+                    manifest_data["destination_baseline"] = delivery_baseline
+                    manifest_data["expected_patch_changes"] = patch_changes
                 if protected.paths:
                     manifest_data["protected_files"] = protected.to_dict()
                     manifest_data["protected_base_cwd"] = original_task_cwd
@@ -1548,10 +1621,14 @@ def _run_pipeline_impl(
 
                 apply_script_file = None
                 if native_delivery is None:
+                    from makewand.delivery import delivery_shell_setup
                     script_lines = [
                         "#!/usr/bin/env bash",
-                        "# Auto-generated by Makewand Quality Gate Delivery (Transactional)",
+                        "# Auto-generated by Makewand Quality Gate Delivery (checked Git patches)",
                         "set -euo pipefail",
+                        'for MAKEWAND_GIT_ENV in "${!GIT_@}"; do unset "$MAKEWAND_GIT_ENV"; done',
+                        "export GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null",
+                        'delivery_git() { local MAKEWAND_DELIVERY_ROOT="$1"; shift; git --no-replace-objects -c core.fsmonitor= -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.autocrlf=false -c core.pager=cat -C "$MAKEWAND_DELIVERY_ROOT" --work-tree="$MAKEWAND_DELIVERY_ROOT" "$@"; }',
                         f'REPO_ROOT={shlex.quote(repo_apply_root)}',
                         'echo "============================================================"',
                         'echo "      📦 [Makewand Delivery Applier] 开始应用代码改动"',
@@ -1560,8 +1637,10 @@ def _run_pipeline_impl(
                         "# 1. Pre-flight verification (atomic test without modifying files)",
                         'echo "→ [阶段 1/2] 补丁完整性与冲突预检 (Pre-flight check)..."'
                     ]
+                    script_lines.append(delivery_shell_setup(delivery_baseline, patch_changes, patch_groups))
                     if protected.paths:
                         script_lines.append(protected.shell_guard(original_task_cwd))
+                    script_lines.append('delivery_check preflight || exit "$?"')
                     main_patch_esc = shlex.quote(str(patch_file))
                     main_sha = hashlib.sha256(p_diff_b).hexdigest()
                     script_lines.append(f'MAIN_PATCH={main_patch_esc}')
@@ -1577,24 +1656,30 @@ def _run_pipeline_impl(
                         script_lines.append(f'SUB_SHA_{idx}={sub_sha}')
                         if sp.get("sha256"):
                             script_lines.append(f'if [ "$(sha256sum "$SUB_PATCH_{idx}" | cut -d" " -f1)" != "$SUB_SHA_{idx}" ]; then echo "❌ 子模块补丁校验和不匹配 ($SUB_REL_{idx})，拒绝应用" >&2; exit 1; fi')
-                        script_lines.append(f'git -c core.autocrlf=false -C "$REPO_ROOT/$SUB_REL_{idx}" apply --check --binary "$SUB_PATCH_{idx}"')
+                        script_lines.append(f'delivery_git "$REPO_ROOT/$SUB_REL_{idx}" apply --check --binary "$SUB_PATCH_{idx}"')
 
-                    script_lines.append('git -c core.autocrlf=false -C "$REPO_ROOT" apply --check --binary "$MAIN_PATCH"')
+                    script_lines.append('delivery_git "$REPO_ROOT" apply --check --binary "$MAIN_PATCH"')
                     script_lines.append('echo "✔ 预检通过，未检测到补丁冲突。"')
                     script_lines.append("")
-                    script_lines.append("# 2. Transactional application with auto-rollback on error")
-                    script_lines.append('echo "→ [阶段 2/2] 执行事务性应用..."')
+                    script_lines.append("# 2. Apply checked patches and verify their postimages; reverse on error")
+                    script_lines.append('echo "→ [阶段 2/2] 应用补丁并校验交付内容..."')
                     script_lines.append("APPLIED_SUB_INDICES=()")
                     script_lines.append("MAIN_APPLIED=0")
                     script_lines.append("")
                     script_lines.append("rollback() {")
                     script_lines.append("    set +e")
-                    script_lines.append('    echo "❌ 补丁应用遭遇错误，触发原子回滚..." >&2')
+                    script_lines.append('    echo "❌ 补丁应用遭遇错误，尝试回滚本次已应用补丁..." >&2')
                     script_lines.append("    ROLLBACK_FAILED=0")
                     script_lines.append('    if [ "$MAIN_APPLIED" -eq 1 ]; then')
                     script_lines.append('        echo "  → 正在回滚主仓库改动..." >&2')
-                    script_lines.append('        if ! git -c core.autocrlf=false -C "$REPO_ROOT" apply --reverse --binary "$MAIN_PATCH"; then')
+                    script_lines.append('        if delivery_check rollback "" "$DELIVERY_STATE_DIR/main.json"')
+                    script_lines.append('        then')
+                    script_lines.append('          if ! delivery_git "$REPO_ROOT" apply --reverse --binary "$MAIN_PATCH"; then')
                     script_lines.append('            echo "  ❌ 主仓库回滚失败！" >&2')
+                    script_lines.append('            ROLLBACK_FAILED=1')
+                    script_lines.append('          fi')
+                    script_lines.append('        else')
+                    script_lines.append('            echo "  ⚠ 主仓库交付路径已有外部修改，保留现场并停止自动逆转该补丁。" >&2')
                     script_lines.append('            ROLLBACK_FAILED=1')
                     script_lines.append('        fi')
                     script_lines.append('    fi')
@@ -1603,13 +1688,25 @@ def _run_pipeline_impl(
                     script_lines.append('        eval "sub_rel=\\$SUB_REL_${sub_idx}"')
                     script_lines.append('        eval "sub_patch=\\$SUB_PATCH_${sub_idx}"')
                     script_lines.append('        echo "  → 正在回滚子模块改动: $sub_rel..." >&2')
-                    script_lines.append('        if ! git -c core.autocrlf=false -C "$REPO_ROOT/$sub_rel" apply --reverse --binary "$sub_patch"; then')
+                    script_lines.append('        case "$sub_idx" in')
+                    for idx, sp in enumerate(sub_patches):
+                        script_lines.append(f'          {idx})')
+                        script_lines.append(f'            if delivery_check rollback {shlex.quote(sp["rel_path"])} "$DELIVERY_STATE_DIR/sub_{idx}.json"')
+                        script_lines.append('            then')
+                        script_lines.append('                :')
+                        script_lines.append('            else')
+                        script_lines.append('                echo "  ⚠ 子模块交付路径已有外部修改，保留现场并停止自动逆转该补丁。" >&2')
+                        script_lines.append('                ROLLBACK_FAILED=1')
+                        script_lines.append('                continue')
+                        script_lines.append('            fi ;;')
+                    script_lines.append('        esac')
+                    script_lines.append('        if ! delivery_git "$REPO_ROOT/$sub_rel" apply --reverse --binary "$sub_patch"; then')
                     script_lines.append('            echo "  ❌ 子模块 ($sub_rel) 回滚失败！" >&2')
                     script_lines.append('            ROLLBACK_FAILED=1')
                     script_lines.append('        fi')
                     script_lines.append('    done')
                     script_lines.append('    if [ "$ROLLBACK_FAILED" -eq 0 ]; then')
-                    script_lines.append('        echo "✔ 目标仓库已安全回滚至未修改状态。" >&2')
+                    script_lines.append('        echo "✔ 本次已应用补丁已撤销。" >&2')
                     script_lines.append('    else')
                     script_lines.append('        echo "⚠️ 回滚过程中遇到错误，目标仓库存在未完全回滚的残留修改！请执行 git status 检查。" >&2')
                     script_lines.append('    fi')
@@ -1620,16 +1717,19 @@ def _run_pipeline_impl(
 
                     for idx, sp in enumerate(sub_patches):
                         script_lines.append(f'printf "→ 应用子模块改动: %s...\\n" "$SUB_REL_{idx}"')
-                        script_lines.append(f'git -c core.autocrlf=false -C "$REPO_ROOT/$SUB_REL_{idx}" apply --binary "$SUB_PATCH_{idx}"')
+                        script_lines.append(f'delivery_git "$REPO_ROOT/$SUB_REL_{idx}" apply --binary "$SUB_PATCH_{idx}"')
                         script_lines.append(f'APPLIED_SUB_INDICES+=({idx})')
+                        script_lines.append(f'delivery_check checkpoint {shlex.quote(sp["rel_path"])} "$DELIVERY_STATE_DIR/sub_{idx}.json"')
 
                     script_lines.append('printf "→ 应用主仓库改动...\\n"')
-                    script_lines.append('git -c core.autocrlf=false -C "$REPO_ROOT" apply --binary "$MAIN_PATCH"')
+                    script_lines.append('delivery_git "$REPO_ROOT" apply --binary "$MAIN_PATCH"')
                     script_lines.append('MAIN_APPLIED=1')
+                    script_lines.append('delivery_check checkpoint "" "$DELIVERY_STATE_DIR/main.json"')
                     if protected.paths:
                         script_lines.append(protected.shell_guard(original_task_cwd, rollback_on_error=True))
+                    script_lines.append('delivery_check postflight || rollback')
                     script_lines.append('trap - ERR')
-                    script_lines.append('printf "✔ 所有补丁已原子应用成功，目标仓库改动就绪。\\n"')
+                    script_lines.append('printf "✔ 所有补丁已应用并校验交付内容，目标仓库改动就绪。\\n"')
 
                     apply_script_file = artifacts_dir / "apply_delivery.sh"
                     write_private_file(apply_script_file, "\n".join(script_lines) + "\n", mode=0o700)
@@ -1637,7 +1737,7 @@ def _run_pipeline_impl(
             except Exception as e:
                 return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子分支交付发生异常 ({e})，拒绝交付。")
 
-            repo_apply_root = str(repo_root) if repo_root else worktree_root
+            repo_apply_root = delivery_baseline["root"] if native_delivery is None else str(repo_root or worktree_root)
             apply_root_esc = shlex.quote(repo_apply_root)
             patch_file_esc = shlex.quote(str(patch_file))
             apply_script_esc = shlex.quote(str(apply_script_file)) if apply_script_file is not None else ""
@@ -2120,6 +2220,7 @@ def _run_race_impl(
     protected_paths=None,
     effort: Optional[str] = None,
 ):
+    from makewand.telemetry import stage
     race_deadline = time.monotonic() + max(0, timeout)
     from makewand.execution_runtime import current_context, execution_context, task_id
     parent_context = dict(current_context())
@@ -2219,7 +2320,8 @@ def _run_race_impl(
     wt_a = session_dir / "agent_a"
     wt_b = session_dir / "agent_b"
     wt_baseline = session_dir / "baseline"
-    host_baseline_manifest = build_manifest(Path(cwd))
+    with stage("prepare", engine="race-host-manifest", readonly=True):
+        host_baseline_manifest = build_manifest(Path(cwd))
 
     saved_successfully = False
     try:
@@ -2230,16 +2332,18 @@ def _run_race_impl(
         wt_b.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         try:
-            clone_isolated_worktree(cwd, wt_baseline)
+            _stage_call("copy", clone_isolated_worktree, cwd, wt_baseline, engine="race-baseline")
             protected.prepare_workspace(wt_baseline)
-            frozen_baseline_manifest = build_manifest(wt_baseline)
-            clone_isolated_worktree(str(wt_baseline), wt_a)
-            clone_isolated_worktree(str(wt_baseline), wt_b)
+            with stage("prepare", engine="race-baseline-manifest", readonly=True):
+                frozen_baseline_manifest = build_manifest(wt_baseline)
+            _stage_call("copy", clone_isolated_worktree, str(wt_baseline), wt_a, engine="race-candidate-a")
+            _stage_call("copy", clone_isolated_worktree, str(wt_baseline), wt_b, engine="race-candidate-b")
             protected.prepare_workspace(wt_a)
             protected.prepare_workspace(wt_b)
             protected.verify(cwd)
-            if build_manifest(Path(cwd)) != host_baseline_manifest:
-                raise OSError("host workspace changed while freezing race baseline")
+            with stage("prepare", engine="race-host-check", readonly=True):
+                if build_manifest(Path(cwd)) != host_baseline_manifest:
+                    raise OSError("host workspace changed while freezing race baseline")
         except OSError as exc:
             print(c(f"❌ [Makewand Race] 无法建立候选隔离副本，已中止竞速: {exc}", COLOR_RED + COLOR_BOLD))
             return EXIT_FAILED

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/diag"
 	"time"
 
 	"github.com/makewand/makewand/internal/model"
@@ -37,7 +39,15 @@ func quotaCmd() *cobra.Command {
 			// skips quota sources whose Read execs a local CLI, so `makewand quota`
 			// never runs a local CLI (e.g. `agy models`) inside an untrusted repo.
 			// The trust must be set before Refresh so the sync refresh sees it.
+			cfg, err := config.LoadWithOptions(config.LoadOptions{SkipCLIDetection: true})
+			if err != nil {
+				if config.IsFatalLoadError(err) {
+					return fmt.Errorf("load quota configuration: %w", err)
+				}
+				diag.Stderr().WarnErr("could not load optional credentials", err)
+			}
 			snap := router.NewDefaultQuotaSnapshotter(0).
+				WithProviderFilter(cfg.IsProviderEnabled).
 				SetRepoTrust(resolvedRepoTrust).
 				Refresh(ctx)
 			pol := router.DefaultQuotaPolicy()

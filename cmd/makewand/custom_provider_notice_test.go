@@ -1,12 +1,11 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/makewand/makewand/internal/config"
+	"github.com/makewand/makewand/internal/testfixture"
 )
 
 func TestCustomProviderSafetyWarning_ShellAdapterLegacy(t *testing.T) {
@@ -23,11 +22,7 @@ func TestCustomProviderSafetyWarning_ShellAdapterLegacy(t *testing.T) {
 }
 
 func TestCustomProviderDoctorCheck_PassForStdin(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "provider.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "provider", testfixture.Spec{Mode: "echo-stdin", Stdout: "ok\n"})
 
 	cfg := config.DefaultConfig()
 	cfg.CustomProviders = []config.CustomProvider{
@@ -51,11 +46,7 @@ func TestCustomProviderDoctorCheck_PassForStdin(t *testing.T) {
 }
 
 func TestCustomProviderDoctorCheck_WarnsForArgMode(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "provider.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "provider", testfixture.Spec{Mode: "output", Stdout: "ok\n"})
 
 	cfg := config.DefaultConfig()
 	cfg.CustomProviders = []config.CustomProvider{

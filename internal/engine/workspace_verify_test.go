@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -268,6 +269,14 @@ func TestCheckpointFiles_LargeFilesPreservedOnRestore(t *testing.T) {
 	if err := os.Chmod(fullPath, 0755); err != nil {
 		t.Fatalf("Chmod large file: %v", err)
 	}
+	before, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatalf("Stat large file before checkpoint: %v", err)
+	}
+	expectedMode := before.Mode().Perm()
+	if runtime.GOOS != "windows" && expectedMode != 0755 {
+		t.Fatalf("executable fixture mode=%o, want 0755", expectedMode)
+	}
 
 	files := []ExtractedFile{
 		{
@@ -291,7 +300,7 @@ func TestCheckpointFiles_LargeFilesPreservedOnRestore(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 
-	// Verify large file still exists, was restored to 11 MiB, AND preserved 0755 permissions!
+	// Verify size, bytes, and the original mode supported by this host.
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		t.Fatalf("Large file was deleted or cannot be stated: %v", err)
@@ -299,8 +308,8 @@ func TestCheckpointFiles_LargeFilesPreservedOnRestore(t *testing.T) {
 	if info.Size() != 11*1024*1024 {
 		t.Fatalf("Large file size was corrupted: got %d, expected %d", info.Size(), 11*1024*1024)
 	}
-	if info.Mode().Perm() != 0755 {
-		t.Fatalf("Large file permissions corrupted: got %v, expected 0755", info.Mode().Perm())
+	if info.Mode().Perm() != expectedMode {
+		t.Fatalf("Large file permissions corrupted: got %v, expected %v", info.Mode().Perm(), expectedMode)
 	}
 
 	restoredFile, err := os.Open(fullPath)
@@ -351,14 +360,30 @@ func TestCheckpointFiles_RestoreFailurePreservesBackup(t *testing.T) {
 	}
 	bakFile := bPaths[0]
 
-	// Make subDir read-only so Restore fails when creating temp restore file
-	if err := os.Chmod(subDir, 0555); err != nil {
+	movedDir := subDir + "-preimage"
+	if runtime.GOOS == "windows" {
+		// Chmod on a Windows directory does not deny creation. Block the
+		// parent with a real non-directory so restore must fail there too.
+		if err := os.Rename(subDir, movedDir); err != nil {
+			t.Fatalf("Move original directory: %v", err)
+		}
+		if err := os.WriteFile(subDir, []byte("restore blocked"), 0600); err != nil {
+			t.Fatalf("Create blocking parent: %v", err)
+		}
+		t.Cleanup(func() {
+			if _, err := os.Stat(movedDir); err == nil {
+				_ = os.Remove(subDir)
+				_ = os.Rename(movedDir, subDir)
+			}
+		})
+	} else if err := os.Chmod(subDir, 0555); err != nil {
+		// POSIX: retain the original read-only-directory failure scenario.
 		t.Fatalf("Chmod subDir: %v", err)
 	}
 
 	restoreErr := checkpoint.Restore()
 	if restoreErr == nil {
-		t.Fatalf("expected Restore to fail in read-only dir, but succeeded")
+		t.Fatalf("expected Restore to fail with blocked parent, but succeeded")
 	}
 
 	// Verify backup file still exists on disk!
@@ -366,13 +391,25 @@ func TestCheckpointFiles_RestoreFailurePreservesBackup(t *testing.T) {
 		t.Fatalf("Backup file was deleted on restore failure: %v", err)
 	}
 
-	// Restore permissions and clean up
-	if err := os.Chmod(subDir, 0755); err != nil {
+	// Remove the real blocker and prove the preserved backup can be used.
+	if runtime.GOOS == "windows" {
+		if err := os.Remove(subDir); err != nil {
+			t.Fatalf("Remove blocking parent: %v", err)
+		}
+		if err := os.Rename(movedDir, subDir); err != nil {
+			t.Fatalf("Restore parent directory: %v", err)
+		}
+	} else if err := os.Chmod(subDir, 0755); err != nil {
 		t.Fatalf("restore directory permissions: %v", err)
 	}
-	checkpoint.Cleanup()
+	if err := checkpoint.Restore(); err != nil {
+		t.Fatalf("Retry Restore from retained backup: %v", err)
+	}
+	if restored, err := os.Stat(fullPath); err != nil || restored.Size() != 11*1024*1024 {
+		t.Fatalf("Retained backup did not restore the whole file: %v, %v", restored, err)
+	}
 	if _, err := os.Stat(bakFile); !os.IsNotExist(err) {
-		t.Fatalf("expected backup to be removed after explicit Cleanup, got: %v", err)
+		t.Fatalf("expected backup to be removed after successful Restore, got: %v", err)
 	}
 }
 

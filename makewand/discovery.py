@@ -230,7 +230,8 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
     Syncs available models from `agy models` CLI if cache is absent or older than max_age (12h).
     Never executes in test isolation mode (MAKEWAND_TEST_ISOLATION_ROOT).
     """
-    if "MAKEWAND_TEST_ISOLATION_ROOT" in os.environ:
+    from makewand.config import is_provider_enabled
+    if "MAKEWAND_TEST_ISOLATION_ROOT" in os.environ or not is_provider_enabled("agy"):
         return None
     import shutil
     import subprocess
@@ -725,7 +726,8 @@ def discover_available_models() -> Dict[str, Any]:
     # Discover Local Self-Hosted (Ollama / vLLM) models
     try:
         from makewand.providers.local import is_local_model_available
-        avail, active, local_models = is_local_model_available(timeout=0.8)
+        from makewand.config import is_provider_enabled
+        avail, active, local_models = is_local_model_available(timeout=0.8) if is_provider_enabled("local") else (False, None, [])
         if avail and local_models:
             models["local"]["available"] = local_models
             models["local"]["source"] = "detected"
@@ -945,7 +947,8 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
     elif provider in ("local", "ollama"):
         try:
             from makewand.providers.local import is_local_model_available
-            avail, active, models_list = is_local_model_available(timeout=0.8)
+            from makewand.config import is_provider_enabled
+            avail, active, models_list = is_local_model_available(timeout=0.8) if is_provider_enabled("local") else (False, None, [])
             if avail:
                 if tier == "standard" and active:
                     return _tier_resolution(active, "medium", is_dynamic=True, effort_source="builtin")

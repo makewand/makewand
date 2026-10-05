@@ -96,6 +96,21 @@ calls hold their slot until terminal completion or cancellation. Independent
 server processes have separate provider slots; persistent currency reservations
 still coordinate their monetary admission through SQLite.
 
+### Remote Session Recovery
+
+Session saves replace complete private files atomically. Cooperating writers hold
+a shared store lock through the replacement; cleanup takes the exclusive lock.
+Opening an existing store attempts cleanup without waiting and skips it while a
+writer is active. `Store.Cleanup()` waits for writers when explicit maintenance
+is needed. Cleanup removes regular `session-*.tmp` files left by interrupted
+saves, preserving stored sessions, directories and symbolic links. Keep the
+stable `.session.lock` file in place while the store is running.
+
+Unix saves, deletions and cleanup also sync the directory after changing entries.
+These guarantees require a local filesystem with working file locks and atomic
+replacement. Native Windows uses the corresponding OS file lock; process-crash
+recovery tests do not establish a hardware or power-loss durability guarantee.
+
 ### Login and User Storage
 
 - User and browser-admin login share per-source and global admission limits:

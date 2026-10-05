@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -37,6 +38,9 @@ func TestSavePreservesPythonFieldsAndLatestDiskUpdates(t *testing.T) {
 	// Model a Python frontend update after the Go frontend loaded its config.
 	disk := readSharedConfig(t, path)
 	disk["local_model"] = json.RawMessage(`"changed-by-python"`)
+	disk["enabled_providers"] = json.RawMessage(`{"local":true,"claude":false}`)
+	disk["active_providers"] = json.RawMessage(`["codex"]`)
+	disk["local_model_enabled"] = json.RawMessage(`true`)
 	disk["python_only_new_field"] = json.RawMessage(`{"enabled":true}`)
 	updated, _ := json.Marshal(disk)
 	if err := os.WriteFile(path, updated, 0600); err != nil {
@@ -48,7 +52,7 @@ func TestSavePreservesPythonFieldsAndLatestDiskUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := readSharedConfig(t, path)
-	for _, key := range []string{"enabled_providers", "local_model", "api", "future_config", "python_only_new_field"} {
+	for _, key := range []string{"enabled_providers", "active_providers", "local_model_enabled", "local_model", "api", "future_config", "python_only_new_field"} {
 		var want, got bytes.Buffer
 		if err := json.Compact(&want, disk[key]); err != nil {
 			t.Fatal(err)
@@ -72,7 +76,9 @@ func TestSavePreservesPythonFieldsAndLatestDiskUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0600 {
+	// Unix mode bits are a POSIX contract. Windows private ACLs are verified
+	// separately on the native owned QA root; retain the file/type check here.
+	if err != nil || !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) {
 		t.Fatalf("private config permissions: %v %v", info, err)
 	}
 }

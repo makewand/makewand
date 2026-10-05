@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,11 @@ func TestVerificationRejectsInputMutation(t *testing.T) {
 		{"baseline test", `os.WriteFile("math_test.go", []byte("package verify"), 0600)`},
 	} {
 		t.Run(change.name, func(t *testing.T) {
+			if change.name == "permissions" && runtime.GOOS == "windows" {
+				// Windows Chmod changes the read-only attribute, not POSIX
+				// execute bits. Exercise a real permission mutation there.
+				change.source = `os.Chmod("math.go", 0444)`
+			}
 			p := newVerificationProject(t)
 			report, err := p.EvaluateCandidateFiles(context.Background(), []ExtractedFile{{
 				Path: "math.go", Content: "package verify\nimport \"os\"\nfunc Add(a,b int) int { _ = " + change.source + "; return a+b }\n",
@@ -117,12 +123,22 @@ func TestCandidateSealedPermissionsSurviveApplyAndRollback(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\ntrue\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Preserve the permissions the host actually supports: POSIX executable
+	// bits on Unix and the real writable/read-only mode on Windows.
+	expectedMode := before.Mode().Perm()
+	if runtime.GOOS != "windows" && expectedMode != 0755 {
+		t.Fatalf("executable fixture mode=%o, want 0755", expectedMode)
+	}
 	files := []ExtractedFile{{Path: "run.sh", Content: "#!/bin/sh\necho changed\n"}}
 	report, err := p.EvaluateCandidateFiles(context.Background(), files)
 	if err != nil || !report.Passed {
 		t.Fatalf("verification: %v %+v", err, report)
 	}
-	if !report.VerifiedFiles[0].ModeKnown || report.VerifiedFiles[0].Mode != 0755 {
+	if !report.VerifiedFiles[0].ModeKnown || report.VerifiedFiles[0].Mode != expectedMode {
 		t.Fatalf("mode not sealed: %+v", report.VerifiedFiles)
 	}
 	checkpoint, err := p.CheckpointFiles(report.VerifiedFiles)
@@ -133,8 +149,11 @@ func TestCandidateSealedPermissionsSurviveApplyAndRollback(t *testing.T) {
 	if err := p.WriteFiles(report.VerifiedFiles); err != nil {
 		t.Fatal(err)
 	}
-	info, _ := os.Stat(path)
-	if info.Mode().Perm() != 0755 {
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != expectedMode {
 		t.Fatalf("apply mode=%o", info.Mode().Perm())
 	}
 	tampered := append([]ExtractedFile(nil), report.VerifiedFiles...)
@@ -145,9 +164,15 @@ func TestCandidateSealedPermissionsSurviveApplyAndRollback(t *testing.T) {
 	if err := checkpoint.Restore(); err != nil {
 		t.Fatal(err)
 	}
-	info, _ = os.Stat(path)
-	data, _ := os.ReadFile(path)
-	if info.Mode().Perm() != 0755 || string(data) != "#!/bin/sh\ntrue\n" {
+	info, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != expectedMode || string(data) != "#!/bin/sh\ntrue\n" {
 		t.Fatal("rollback did not restore content and mode")
 	}
 }

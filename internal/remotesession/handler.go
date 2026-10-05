@@ -3,7 +3,6 @@ package remotesession
 import (
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -247,9 +246,10 @@ func sessionIDFromPath(path string) (string, bool) {
 	if raw == "" {
 		return "", false
 	}
-	workspaceID, err := url.PathUnescape(raw)
-	if err != nil || strings.TrimSpace(workspaceID) == "" {
+	// net/http has already decoded URL.Path. Decoding it again aliases literal
+	// percent sequences (for example "repo%2Fmain") to another workspace ID.
+	if strings.TrimSpace(raw) == "" {
 		return "", false
 	}
-	return workspaceID, true
+	return raw, true
 }

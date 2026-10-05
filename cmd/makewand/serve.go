@@ -93,7 +93,10 @@ func serveCmd() *cobra.Command {
 			}
 
 			serverauth.ConfigurePasswordHashConcurrency(registrationLimits.MaxConcurrent)
-			cfg := loadConfigWithWarning()
+			cfg, err := loadConfigWithWarning()
+			if err != nil {
+				return err
+			}
 			if !cfg.HasAnyModel() {
 				return serveNoModelsError(cfg)
 			}

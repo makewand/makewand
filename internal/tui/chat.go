@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
 	"github.com/mattn/go-runewidth"
@@ -474,7 +475,7 @@ func (c *ChatPanel) updateViewportForceBottom() {
 
 func (c *ChatPanel) renderMessages() string {
 	var b strings.Builder
-	maxWidth := c.width - 4
+	maxWidth := maxInt(c.width-4, minViewportWidth)
 
 	for _, msg := range c.messages {
 		switch msg.Role {
@@ -527,7 +528,9 @@ func (c *ChatPanel) renderMessages() string {
 		}
 	}
 
-	return b.String()
+	// Wrap the complete styled output, including labels and system/status
+	// prefixes. The viewport clips long lines instead of reflowing them.
+	return ansi.Hardwrap(ansi.Wrap(b.String(), maxWidth, ""), maxWidth, true)
 }
 
 // Init implements tea.Model.

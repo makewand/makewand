@@ -34,8 +34,14 @@ from makewand.git_helper import (
     workspace_lock_root,
 )
 from makewand.protected_files import ProtectedFiles, ProtectionError
+from makewand.windows_paths import filesystem_path
 
 _NO_SECURITY_EXPECTATION = object()
+
+
+def _fs_path(path):
+    """An API call path; keep journal and workspace identities ordinary."""
+    return Path(filesystem_path(path))
 
 
 def get_scoped_apply_lock_path(base_cwd: Optional[Union[str, Path]] = None) -> Path:
@@ -341,7 +347,7 @@ def _application_workspace_identity(root, expected):
 
 def _application_target_record(root, relative):
     target = _verify_safe_target_path(root, relative)
-    if not os.path.lexists(target):
+    if not os.path.lexists(_fs_path(target)):
         return None
     record = file_record(target)
     if record is None:
@@ -354,7 +360,7 @@ def _application_target_security(root, relative):
     if os.name != "nt":
         return None
     target = _verify_safe_target_path(root, relative)
-    if not os.path.lexists(target):
+    if not os.path.lexists(_fs_path(target)):
         return None
     from makewand.native_windows import application_security
     return application_security(target)
@@ -399,17 +405,18 @@ def _validate_application_temp(root, item, folder):
             or any(character not in "0123456789abcdef" for character in name[len(".makewand-"):])):
         raise ValueError("Invalid interrupted application temporary path")
     target = _verify_safe_target_path(root, relative)
-    if not os.path.lexists(target):
+    api_target = _fs_path(target)
+    if not os.path.lexists(api_target):
         return target
-    if target.is_symlink() or not target.is_file() or target.stat().st_size > 512 * 1024 * 1024:
+    if api_target.is_symlink() or not api_target.is_file() or api_target.stat().st_size > 512 * 1024 * 1024:
         raise ValueError("Interrupted application temporary path changed")
-    size = target.stat().st_size
+    size = api_target.stat().st_size
     current = file_sha256(target)
     for bucket, record in (("preimages", item.get("before")), ("postimages", item.get("after"))):
         if record is None:
             continue
         source = folder / bucket / item["path"]
-        if not source.exists():
+        if not _fs_path(source).exists():
             continue
         digest = hashlib.sha256()
         remaining = size
@@ -432,7 +439,7 @@ def _validate_application_temp(root, item, folder):
 
 def _remove_application_temp(root, item, folder, *, workspace_identity=None):
     target = _validate_application_temp(root, item, folder)
-    if target is not None and os.path.lexists(target):
+    if target is not None and os.path.lexists(_fs_path(target)):
         _atomic_remove(root, item["temp"], workspace_identity=workspace_identity)
 
 
@@ -440,7 +447,7 @@ def _missing_application_dirs(root, relative):
     result = []
     parent = Path(relative).parent
     while parent != Path("."):
-        if os.path.lexists(Path(root) / parent):
+        if os.path.lexists(_fs_path(Path(root) / parent)):
             break
         result.append(parent.as_posix())
         parent = parent.parent
@@ -1149,7 +1156,7 @@ class CandidateManager:
         if baseline_manifest:
             for changed_file in candidate_changes:
                 target = Path(base_cwd) / changed_file
-                cur_hash = file_record(target) if target.exists() else None
+                cur_hash = file_record(target)
                 base_hash = baseline_manifest.get(changed_file)
                 if cur_hash != base_hash and changed_file not in conflicts:
                     conflicts.append(changed_file)
@@ -1685,11 +1692,11 @@ class CandidateManager:
                     postimage = "postimages/" + rel_path
 
                 # Backup existing
-                if target_file.exists():
+                if _fs_path(target_file).exists():
                     if os.path.islink(target_file) or target_file.is_symlink():
                         raise ValueError(f"安全越界风险: 目标文件 {rel_path} 为符号链接")
                     bak_file = backup_dir / "preimages" / rel_path
-                    bak_file.parent.mkdir(parents=True, exist_ok=True)
+                    _fs_path(bak_file.parent).mkdir(parents=True, exist_ok=True)
                     if os.name == "nt":
                         from makewand.native_windows import copy_backup
                         copy_backup(target_file, bak_file)
@@ -1722,7 +1729,7 @@ class CandidateManager:
 
                 # Apply Change
                 if status in ("M", "A"):
-                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    _fs_path(target_file.parent).mkdir(parents=True, exist_ok=True)
                     _verify_safe_target_path(base_cwd, rel_path)
 
                     before_replace = None
@@ -1744,7 +1751,7 @@ class CandidateManager:
                                  workspace_identity=workspace_identity, before_replace=before_replace)
                     applied_files.append(f"A/M {rel_path}")
                 elif status == "D":
-                    if target_file.exists():
+                    if _fs_path(target_file).exists():
                         _verify_safe_target_path(base_cwd, rel_path)
                         _atomic_remove(base_cwd, rel_path, workspace_identity=workspace_identity,
                                        expected_security=before_security[rel_path] if os.name == "nt" else _NO_SECURITY_EXPECTATION)

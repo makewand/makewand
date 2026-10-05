@@ -48,6 +48,48 @@ root, not an assertion of account identity. Neither telemetry nor the admission
 ledger stores prompts or credentials. API policy retains `subscription_only`
 and `allow_paid`; library users supply their application's policy explicitly.
 
+## Shared provider configuration
+
+The Go and Python entry points read provider enablement from the same
+`config.json`. `enabled_providers` overrides the legacy `active_providers`
+allowlist. Local models require opt-in. Provider aliases use the same policy;
+for example, the native `gemini` slot follows the Python `agy` setting.
+`MAKEWAND_DISABLE_<PROVIDER>` and `MAKEWAND_ENABLE_<PROVIDER>` override the file,
+then `MAKEWAND_ENABLE_PROVIDERS` replaces the result with its final allowlist.
+Disabled providers are excluded from discovery probes, routing, API fallback
+and quota probes. Native custom providers follow the same setting by name.
+Saving Go preferences preserves the latest Python-owned enablement fields.
+
+A missing optional configuration file uses the defaults. An existing
+`config.json` that cannot be read, parsed or interpreted as a JSON object stops
+execution and provider discovery. Neither frontend restores the default enabled
+providers after such an error, and `doctor` reports a failing configuration check.
+Provider controls also require their declared types: `enabled_providers` maps
+names to JSON booleans, `active_providers` is a list of strings, and
+`local_model_enabled` is a boolean. An entire field set to `null` retains the
+missing-field behavior. Other invalid authorization types stop execution;
+for example, use `false`, not the string `"false"`.
+Python saves configuration and credentials by syncing a private temporary file
+and replacing the destination atomically, so readers see complete JSON documents.
+
+For Claude, Gemini and OpenAI, API settings use this precedence:
+nonempty environment variables, `api_keys.json`, `config.json`, then provider
+defaults. Shared configuration accepts the native flat fields, such as
+`claude_api_key` and `claude_model`, and the nested `api` provider records.
+The API key, model and base URL are resolved independently; an explicit model
+or endpoint override does not discard a key supplied by a lower-priority source.
+An explicit per-call model or a native routing mode's selected model takes
+precedence over the provider default model. This configuration does not authorize
+paid API use: `allow_paid` remains an explicit requirement.
+An unreadable or malformed lower-priority `api_keys.json` produces a diagnostic;
+valid environment and `config.json` fields remain available. It cannot override
+the execution policy or authorize paid calls.
+
+The native headless entry point and `chat`/`new` return `UNVERIFIED` (exit 11) when
+no permitted backend can execute the task. Invalid mode/tier arguments return
+`INVALID_REQUEST` (exit 2) before backend availability is checked. These failures
+do not emit a successful model response.
+
 ## Admission and deadlines
 
 Use the same absolute ledger path to share a maximum across native and Python

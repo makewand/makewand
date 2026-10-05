@@ -86,12 +86,28 @@ def _script_block(text):
 
 class WorkflowStructureTests(unittest.TestCase):
     def test_every_job_has_a_timeout(self):
-        for path in sorted(WORKFLOWS.glob("*.yml")):
+        def check_workflow(path, ancestors=()):
+            self.assertNotIn(path, ancestors, "reusable workflow call cycle")
             jobs = _job_blocks(_read(path))
             self.assertTrue(jobs, f"{path.name}: no jobs parsed")
             for name, block in jobs.items():
                 with self.subTest(workflow=path.name, job=name):
-                    self.assertRegex(block, r"(?m)^    timeout-minutes: [1-9][0-9]*\s*$")
+                    reusable = re.search(r"(?m)^    uses: (\S+)\s*$", block)
+                    if reusable:
+                        # GitHub rejects timeout-minutes on reusable callers.
+                        # Follow the same-commit local call to the actual jobs.
+                        reference = reusable[1]
+                        self.assertTrue(reference.startswith("./.github/workflows/"))
+                        callee = (ROOT / reference).resolve()
+                        self.assertEqual(callee.parent, WORKFLOWS.resolve())
+                        self.assertTrue(callee.is_file(), "missing reusable workflow")
+                        self.assertNotRegex(block, r"(?m)^    (timeout-minutes|runs-on|steps):")
+                        check_workflow(callee, (*ancestors, path))
+                    else:
+                        self.assertRegex(block, r"(?m)^    timeout-minutes: [1-9][0-9]*\s*$")
+
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            check_workflow(path.resolve())
 
     def test_workflows_parse_as_yaml_when_pyyaml_is_available(self):
         try:
@@ -158,6 +174,31 @@ class WorkflowStructureTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_publication_waits_for_all_three_gates(self):
+        jobs = _job_blocks(_read(RELEASE))
+        release = jobs["release"]
+        needs = re.search(r"(?m)^    needs: \[([^\]]+)\]\s*$", release)
+        self.assertIsNotNone(needs, "publication must explicitly depend on its gates")
+        self.assertEqual({part.strip() for part in needs[1].split(",")},
+                         {"test", "package-smoke", "native-windows"})
+        self.assertNotIn("always()", release, "a failed prerequisite must block publication")
+        self.assertNotIn("continue-on-error:", release)
+
+    def test_write_permissions_are_confined_to_publication(self):
+        text = _read(RELEASE)
+        global_block = text[:text.index("jobs:")]
+        self.assertIn("permissions:\n  contents: read", global_block)
+        self.assertNotIn(": write", global_block)
+        jobs = _job_blocks(text)
+        for name, block in jobs.items():
+            with self.subTest(job=name):
+                if name == "release":
+                    self.assertIn("    permissions:\n      contents: write\n", block)
+                    self.assertIn("      id-token: write", block)
+                    self.assertIn("      attestations: write", block)
+                else:
+                    self.assertNotIn(": write", block)
+
     def test_release_requires_tag_to_match_source_version(self):
         test_job = _job_blocks(_read(RELEASE))["test"]
         self.assertIn('bash scripts/check_version.sh --tag "${GITHUB_REF_NAME}"', test_job)
@@ -200,6 +241,36 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(notes.count("```") % 2, 0, "unbalanced code fences")
         self.assertNotIn("brew install", notes, "package managers are only advertised when published")
         self.assertIn("**Full Changelog**: https://github.com/acme/makewand/compare/v9.8.6...v9.8.7", notes)
+
+
+class NativeWindowsWorkflowTests(unittest.TestCase):
+    def test_release_and_architecture_use_the_same_local_gate(self):
+        for path in (RELEASE, WORKFLOWS / "architecture.yml"):
+            with self.subTest(workflow=path.name):
+                caller = _job_blocks(_read(path))["native-windows"]
+                self.assertIn("    uses: ./.github/workflows/native-windows.yml", caller)
+                self.assertIn("    permissions:\n      contents: read", caller)
+                self.assertNotIn("secrets:", caller)
+                self.assertNotIn("continue-on-error:", caller)
+                self.assertNotIn("if:", caller)
+
+    def test_native_gate_checks_out_the_caller_commit_and_retains_failures(self):
+        text = _read(WORKFLOWS / "native-windows.yml")
+        self.assertIn("  workflow_call:", text)
+        self.assertIn("  workflow_dispatch:", text)
+        self.assertIn("    runs-on: windows-latest", text)
+        self.assertIn("          ref: ${{ github.sha }}", text)
+        self.assertIn("          persist-credentials: false", text)
+        self.assertIn('--expected-sha "$env:GITHUB_SHA"', text)
+        self.assertIn("CGO_ENABLED: '1'", text)
+        self.assertIn("CC: gcc", text)
+        self.assertIn("install: mingw-w64-ucrt-x86_64-gcc", text)
+        self.assertNotIn("continue-on-error:", text)
+        self.assertNotIn("secrets:", text)
+        self.assertNotIn("concurrency:", text)
+        self.assertIn("if: always()", text)
+        self.assertIn("if-no-files-found: error", text)
+        self.assertIn("${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", text)
 
 
 @unittest.skipUnless(shutil.which("node"), "node required to execute the github-script body")

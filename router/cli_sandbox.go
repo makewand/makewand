@@ -80,6 +80,61 @@ func cliPathWithin(base, target string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
+// cliEnvValue uses the child environment, including an explicit empty
+// environment, so sandbox mounts and the provider select the same account.
+func cliEnvValue(env []string, key string) string {
+	var value string
+	for _, entry := range env {
+		if strings.HasPrefix(entry, key+"=") {
+			value = strings.TrimPrefix(entry, key+"=")
+		}
+	}
+	return value
+}
+
+func cliConfiguredCodexHome(env []string, workspace, home string) (string, string, error) {
+	selected := cliEnvValue(env, "CODEX_HOME")
+	if selected == "" {
+		return "", "", nil
+	}
+	if !filepath.IsAbs(selected) {
+		selected = filepath.Join(workspace, selected)
+	}
+	selected = filepath.Clean(selected)
+	real, err := filepath.EvalSymlinks(selected)
+	if err != nil {
+		return "", "", errors.New("configured CODEX_HOME is unavailable; refusing account fallback")
+	}
+	info, err := os.Stat(real) //nolint:gosec // G703: operator-selected provider state directory, validated below
+	if err != nil || !info.IsDir() {
+		return "", "", errors.New("configured CODEX_HOME is not a provider state directory")
+	}
+	for _, broad := range []string{"/", "/home", "/root", "/mnt", "/media", "/srv", "/tmp", "/var", home} {
+		if broad != "" && (real == filepath.Clean(broad) || cliPathWithin(real, broad)) {
+			return "", "", errors.New("CODEX_HOME must be a dedicated provider state directory")
+		}
+	}
+	for _, path := range []string{selected, real} {
+		if cliPathWithin(path, workspace) || cliPathWithin(workspace, path) {
+			return "", "", errors.New("CODEX_HOME must be separate from the workspace")
+		}
+	}
+	if home != "" {
+		protected := append([]string(nil), cliSensitiveHomeEntries...)
+		for provider, entries := range cliProviderCredentials {
+			if provider != "codex" {
+				protected = append(protected, entries...)
+			}
+		}
+		for _, sensitive := range protected {
+			if cliPathWithin(filepath.Join(home, filepath.FromSlash(sensitive)), real) {
+				return "", "", errors.New("CODEX_HOME must be a dedicated provider state directory")
+			}
+		}
+	}
+	return selected, real, nil
+}
+
 func maskSensitivePath(args []string, target, workspace string) []string {
 	info, err := os.Lstat(target) //nolint:gosec // G703: sensitive target path is probed on host for sandbox masking
 	if err != nil {
@@ -237,15 +292,25 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		bwrapArgs = append(bwrapArgs, "--tmpfs", "/home")
 	}
 
-	home := os.Getenv("HOME")
-	var p string
+	childEnv := sanitizeCLIEnv(provider, cmd.Env)
+	home := cliEnvValue(childEnv, "HOME")
+	p := strings.TrimSuffix(strings.ToLower(provider), "-cli")
+	var selectedCodexHome, realCodexHome string
+	if p == "codex" {
+		var err error
+		selectedCodexHome, realCodexHome, err = cliConfiguredCodexHome(childEnv, workspace, home)
+		if err != nil {
+			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+		}
+	}
 	var allowedCreds []string
 	homeMaskedWithTmpfs := false
 	if home != "" {
 		home = filepath.Clean(home)
-		p = strings.ToLower(provider)
-		p = strings.TrimSuffix(p, "-cli")
 		allowedCreds = cliProviderCredentials[p]
+		if selectedCodexHome != "" {
+			allowedCreds = nil // Explicit account selection does not expose the default account.
+		}
 
 		if cliPathWithin("/home", home) && home != "/home" {
 			if workspace != home && !cliPathWithin(workspace, home) {
@@ -360,7 +425,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			var toMask []string
 			toMask = append(toMask, cliSensitiveHomeEntries...)
 			for prov, creds := range cliProviderCredentials {
-				if prov == p {
+				if prov == p && selectedCodexHome == "" {
 					continue
 				}
 				for _, c := range creds {
@@ -377,6 +442,23 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 				}
 				bwrapArgs = maskSensitivePath(bwrapArgs, target, workspace)
 			}
+		}
+	}
+	if selectedCodexHome != "" {
+		// Mount only the selected account after masking host roots and other
+		// credentials. Use its canonical path inside the sandbox: a destination
+		// symlink may point into a masked root and cannot serve as a mount point.
+		bwrapArgs = append(bwrapArgs, "--bind", realCodexHome, realCodexHome,
+			"--setenv", "CODEX_HOME", realCodexHome)
+	} else if p != "codex" {
+		// A custom Codex account may be outside a masked host root. Other
+		// providers must not gain access to it through the root read-only mount.
+		sourceEnv := cmd.Env
+		if sourceEnv == nil {
+			sourceEnv = os.Environ()
+		}
+		if _, foreignHome, err := cliConfiguredCodexHome(sourceEnv, workspace, home); err == nil && foreignHome != "" {
+			bwrapArgs = maskSensitivePath(bwrapArgs, foreignHome, workspace)
 		}
 	}
 
@@ -400,7 +482,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 
 	wrapped := exec.CommandContext(ctx, bwrapPath, bwrapArgs...) //nolint:gosec // G702: bwrap invocation wrapping CLI command
 	wrapped.Dir = cmd.Dir
-	wrapped.Env = sanitizeCLIEnv(provider, cmd.Env)
+	wrapped.Env = childEnv
 	wrapped.Stdin = cmd.Stdin
 	wrapped.Stdout = cmd.Stdout
 	wrapped.Stderr = cmd.Stderr

@@ -8,9 +8,11 @@ import json
 import os
 import contextlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -19,6 +21,100 @@ from unittest import mock
 from makewand import config
 from makewand import candidate as candidate_module
 from makewand.candidate import CandidateManager, build_manifest
+
+
+_CRASH_PHASE_PRELUDE = """import sys,time
+_fixture_started=time.monotonic()
+def _fixture_phase(name):
+    print('CRASH_PHASE '+name+' elapsed=%.3f' % (time.monotonic()-_fixture_started),file=sys.stderr,flush=True)
+_fixture_phase('child-start')
+"""
+
+
+def _wait_crash_job_empty(job, timeout=10):
+    """Do not let a killed Git descendant retain handles into the next test."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_int64) for name in
+                    ("user_time", "kernel_time", "period_user_time", "period_kernel_time")] + [
+                    (name, wintypes.DWORD) for name in
+                    ("page_faults", "total_processes", "active_processes", "terminated_processes")]
+
+    query = job.kernel.QueryInformationJobObject
+    query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                      wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    query.restype = wintypes.BOOL
+    deadline = time.monotonic() + timeout
+    while True:
+        accounting = Accounting()
+        if not query(job.handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if accounting.active_processes == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("crash fixture job still has active descendants after cleanup")
+        time.sleep(.05)
+
+
+def _run_crash_fixture(code, timeout=120):
+    """Bound fixture initialization and application, retaining the real exit code.
+
+    This guard is independent of business execution deadlines. A suspended
+    Windows child joins its job before importing code or starting Git, and the
+    whole owned tree is stopped before TemporaryDirectory cleanup can run.
+    """
+    command = [sys.executable, "-I", "-X", "utf8", "-c", _CRASH_PHASE_PRELUDE + code]
+    started = time.monotonic()
+    job = None
+    proc = None
+
+    def cleanup_tree():
+        if job is not None and job.handle:
+            try:
+                job.terminate()
+                _wait_crash_job_empty(job)
+            finally:
+                job.close()
+        elif job is None and proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        if proc is not None:
+            proc.wait(timeout=10)
+
+    try:
+        options = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                       encoding="utf-8", errors="replace")
+        if os.name == "nt":
+            from makewand.windows_process import WindowsJob
+            job = WindowsJob()
+            proc = job.start(command, **options)
+        else:
+            proc = subprocess.Popen(command, start_new_session=True, **options)
+        try:
+            stdout, stderr = proc.communicate(timeout=max(.001, timeout - (time.monotonic() - started)))
+        except subprocess.TimeoutExpired:
+            cleanup_tree()
+            stdout, stderr = proc.communicate(timeout=10)
+            # Retain both the failure and the last completed ASCII phase in
+            # unittest's traceback instead of turning a timeout into exit 86.
+            error = subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+            diagnostic = ("crash fixture phase tail:\n" + stderr[-4096:]).encode("ascii", "backslashreplace").decode("ascii")
+            if hasattr(error, "add_note"):
+                error.add_note(diagnostic)
+            else:
+                print(diagnostic, file=sys.stderr, flush=True)
+            raise error from None
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    finally:
+        try:
+            cleanup_tree()
+        finally:
+            if proc is not None:
+                for pipe in (proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
 
 
 class CandidateRecoveryTests(unittest.TestCase):
@@ -67,10 +163,12 @@ from pathlib import Path
 sys.path.insert(0,{str(Path(__file__).resolve().parent.parent)!r})
 from makewand import config
 from makewand import candidate
+_fixture_phase('imports-ready')
 config.CONFIG_DIR=Path({str(config.CONFIG_DIR)!r})
 config.CANDIDATES_DIR=Path({str(config.CANDIDATES_DIR)!r})
 config.BACKUPS_DIR=Path({str(config.BACKUPS_DIR)!r})
 config.ARTIFACTS_DIR=Path({str(config.ARTIFACTS_DIR)!r})
+_fixture_phase('config-ready')
 real_copy=candidate._atomic_copy
 real_restore=candidate._restore_application_entry
 real_write=candidate._write_private_json
@@ -81,28 +179,34 @@ def crash_copy(workspace,relative,source,expected=None,**kwargs):
     if application and expected is not None and 'preimages' not in Path(source).parts:
         count+=1
         if {during_rollback!r} and count==2:
+            _fixture_phase('rollback-injected')
             raise OSError('injected second mutation failure')
     result=real_copy(workspace,relative,source,expected,**kwargs)
     if application and not {all_changes!r} and not {during_rollback!r}:
+        _fixture_phase('crash-after-mutation')
         os._exit(86)
     return result
 def crash_restore(workspace,item,folder,**kwargs):
     result=real_restore(workspace,item,folder,**kwargs)
     if {during_rollback!r}:
+        _fixture_phase('crash-after-restore')
         os._exit(86)
     return result
 def crash_commit(path,data):
     if data.get('state')=='committed':
+        _fixture_phase('crash-before-commit')
         os._exit(86)
     return real_write(path,data)
 candidate._atomic_copy=crash_copy
 candidate._restore_application_entry=crash_restore
 if {all_changes!r}:
     candidate._write_private_json=crash_commit
+_fixture_phase('apply-start')
 candidate.CandidateManager.apply_candidate('recovery-fixture','B')
+_fixture_phase('apply-returned-without-crash')
 os._exit(87)
 """
-        result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=20)
+        result = _run_crash_fixture(code)
         self.assertEqual(result.returncode, 86, result.stdout + result.stderr)
         journal = next(config.BACKUPS_DIR.glob("*/journal.json"))
         record = json.loads(journal.read_text(encoding="utf-8"))
@@ -122,10 +226,12 @@ os._exit(87)
 from pathlib import Path
 sys.path.insert(0,{str(Path(__file__).resolve().parent.parent)!r})
 from makewand import config,candidate
+_fixture_phase('imports-ready')
 config.CONFIG_DIR=Path({str(config.CONFIG_DIR)!r})
 config.CANDIDATES_DIR=Path({str(config.CANDIDATES_DIR)!r})
 config.BACKUPS_DIR=Path({str(config.BACKUPS_DIR)!r})
 config.ARTIFACTS_DIR=Path({str(config.ARTIFACTS_DIR)!r})
+_fixture_phase('config-ready')
 workspace=Path({str(self.workspace)!r})
 desired_parent=workspace / {'nested/deep' if nested else '.'!r}
 real_fdopen=os.fdopen
@@ -141,6 +247,7 @@ class CrashWriter:
         self.stream.write(data[:max(1,len(data)//2)])
         self.stream.flush()
         os.fsync(self.stream.fileno())
+        _fixture_phase('crash-after-temp-flush')
         os._exit(86)
 def crash_fdopen(fd,mode='r',*args,**kwargs):
     stream=real_fdopen(fd,mode,*args,**kwargs)
@@ -154,14 +261,17 @@ def trigger_rollback(root,relative,source,expected=None,**kwargs):
         mutations+=1
         if {during_rollback!r} and mutations==2:
             rollback_started=True
+            _fixture_phase('rollback-injected')
             raise OSError('injected failure requiring rollback')
     return real_copy(root,relative,source,expected,**kwargs)
 os.fdopen=crash_fdopen
 candidate._atomic_copy=trigger_rollback
+_fixture_phase('apply-start')
 candidate.CandidateManager.apply_candidate('recovery-fixture','B')
+_fixture_phase('apply-returned-without-crash')
 os._exit(87)
 """
-        result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=20)
+        result = _run_crash_fixture(code)
         self.assertEqual(result.returncode, 86, result.stdout + result.stderr)
         journal = next(config.BACKUPS_DIR.glob("*/journal.json"))
         record = json.loads(journal.read_text(encoding="utf-8"))
@@ -610,4 +720,3 @@ os._exit(87)
 
 if __name__ == "__main__":
     unittest.main()
-

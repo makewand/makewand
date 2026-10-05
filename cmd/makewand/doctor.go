@@ -245,11 +245,20 @@ func runDoctor(cfg *config.Config, loadErr error, opts doctorOptions) (doctorRep
 	}
 
 	if loadErr != nil {
+		status := doctorWarn
+		if config.IsFatalLoadError(loadErr) {
+			status = doctorFail
+		}
 		report.Checks = append(report.Checks, doctorCheck{
 			Name:    "config load",
-			Status:  doctorWarn,
+			Status:  status,
 			Details: loadErr.Error(),
 		})
+		if status == doctorFail {
+			// An unreadable execution policy must not start routing, background
+			// quota sources, local CLI discovery or optional live probes.
+			return report, 1, 0
+		}
 	} else {
 		report.Checks = append(report.Checks, doctorCheck{
 			Name:   "config load",

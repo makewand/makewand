@@ -237,9 +237,10 @@ type QuotaSource interface {
 // QuotaSnapshotter maintains the latest QuotaSnapshot, refreshing it in the
 // background. Routing reads the last-known snapshot without blocking on I/O.
 type QuotaSnapshotter struct {
-	sources  []QuotaSource
-	interval time.Duration
-	current  atomic.Pointer[QuotaSnapshot]
+	sources         []QuotaSource
+	providerAllowed func(string) bool
+	interval        time.Duration
+	current         atomic.Pointer[QuotaSnapshot]
 
 	// Optional read-through/write-through disk cache, shared across processes so
 	// that repeated short-lived invocations (e.g. `makewand quota`) don't re-hit
@@ -278,6 +279,42 @@ func (s *QuotaSnapshotter) SetRepoTrust(t RepoTrust) *QuotaSnapshotter {
 	}
 	s.repoTrust.Store(int32(t))
 	return s
+}
+
+// WithProviderFilter excludes disabled pools before any source reads or CLI
+// probes. Configure it before Start. Cached entries obey the same filter.
+func (s *QuotaSnapshotter) WithProviderFilter(allowed func(string) bool) *QuotaSnapshotter {
+	if s == nil {
+		return s
+	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	s.providerAllowed = allowed
+	if allowed != nil {
+		sources := make([]QuotaSource, 0, len(s.sources))
+		for _, source := range s.sources {
+			if allowed(source.Provider()) {
+				sources = append(sources, source)
+			}
+		}
+		s.sources = sources
+		previous := s.Snapshot()
+		s.current.Store(&QuotaSnapshot{byProvider: s.filterCachedProviders(previous.byProvider), takenAt: previous.takenAt})
+	}
+	return s
+}
+
+func (s *QuotaSnapshotter) filterCachedProviders(cached map[string]ProviderQuota) map[string]ProviderQuota {
+	if s.providerAllowed == nil {
+		return cached
+	}
+	filtered := make(map[string]ProviderQuota)
+	for name, value := range cached {
+		if s.providerAllowed(name) {
+			filtered[name] = value
+		}
+	}
+	return filtered
 }
 
 // repoTrustLevel returns the snapshotter's current repository trust level.
@@ -351,6 +388,7 @@ func (s *QuotaSnapshotter) LoadCache() {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	if cached, takenAt, ok := loadQuotaCache(s.cachePath, 0); ok {
+		cached = s.filterCachedProviders(cached)
 		s.applySeals(cached)
 		s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
 	}
@@ -404,6 +442,7 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 	var diskPrev map[string]ProviderQuota
 	if s.cachePath != "" {
 		if cached, takenAt, ok := loadQuotaCache(s.cachePath, s.cacheTTL); ok {
+			cached = s.filterCachedProviders(cached)
 			s.applySeals(cached)
 			s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
 			return

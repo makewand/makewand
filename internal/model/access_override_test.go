@@ -1,9 +1,13 @@
 package model
 
 import (
-	"os"
-	"path/filepath"
+	"context"
+	"os/exec"
 	"testing"
+	"time"
+
+	"github.com/makewand/makewand/internal/processjob"
+	"github.com/makewand/makewand/internal/testfixture"
 
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/router"
@@ -11,11 +15,30 @@ import (
 
 func writeFixtureCLI(t *testing.T, name string) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), name)
-	//nolint:gosec // G306: this fixture must be executable so CLI detection treats it as installed.
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho fixture\n"), 0755); err != nil {
-		t.Fatal(err)
+	bin := testfixture.WriteCLI(t, name, testfixture.Spec{Stdout: "fixture\n"})
+	// Load the owned fixture once before production's bounded availability probe.
+	// This reports real startup/version errors without changing policy or probe
+	// timeouts; a first Windows PE load under race can include scanner work.
+	warmCtx, warmCancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer warmCancel()
+	warmCmd := exec.CommandContext(warmCtx, bin, "--version") // #nosec G204 G702 -- fixed argument to the test-owned native fixture.
+	warmCapture := processjob.NewCapture(4096, func() { _ = processjob.Kill(warmCmd) })
+	warmCmd.Stdout = warmCapture.Stdout()
+	warmCmd.Stderr = warmCapture.Stderr()
+	warmStarted := time.Now()
+	warmCleanup, err := processjob.Start(warmCmd)
+	if err != nil {
+		t.Fatalf("owned fixture version start failed after %v: %v (context=%v)", time.Since(warmStarted), err, warmCtx.Err())
 	}
+	defer warmCleanup()
+	warmErr := warmCmd.Wait()
+	warmElapsed := time.Since(warmStarted)
+	warmStdout, warmStderr := warmCapture.StdoutString(), warmCapture.StderrString()
+	if warmErr != nil || warmCtx.Err() != nil || warmCapture.Exceeded() || warmStdout != "fixture\n" || warmStderr != "" {
+		t.Fatalf("owned fixture version failed after %v: error=%v context=%v exceeded=%t stdout=%q stderr=%q", warmElapsed, warmErr, warmCtx.Err(), warmCapture.Exceeded(), warmStdout, warmStderr)
+	}
+	t.Logf("owned fixture --version exit=0 elapsed=%v stdout=%q stderr=%q; production availability probe unchanged", warmElapsed, warmStdout, warmStderr)
+	warmCancel()
 	return bin
 }
 

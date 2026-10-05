@@ -226,8 +226,11 @@ class HostAuditRuntimeRegressionTests(unittest.TestCase):
         warning.assert_not_called()
         self.assertEqual(len(captured), 1)
         self.assertTrue(captured[0].startswith("D:P"), captured[0])
-        self.assertEqual(len(actual_accounts), 2, captured[0])
-        self.assertEqual(set(actual_accounts), {"S-1-5-18", user_sid}, captured[0])
+        expected_accounts = {"S-1-5-18", user_sid}
+        # The SYSTEM token and the fallback SYSTEM trustee are the same SID.
+        # Its one full-access ACE must remain exact; ordinary users require two.
+        self.assertEqual(len(actual_accounts), len(expected_accounts), captured[0])
+        self.assertEqual(set(actual_accounts), expected_accounts, captured[0])
         record = json.loads((self.config_dir / sandbox.UNSAFE_HOST_EXEC_AUDIT_FILE).read_text(encoding="utf-8"))
         self.assertEqual(record["args"], ["中文"])
 

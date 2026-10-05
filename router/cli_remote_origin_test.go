@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +37,19 @@ func TestRemoteOriginCLIHonorsExplicitWorkDir(t *testing.T) {
 	work := t.TempDir()
 	p := NewCodexCLI(codex)
 	ctx := ContextWithWorkDir(ContextWithRemoteOrigin(context.Background()), work)
+	if runtime.GOOS == "windows" {
+		_, _, err := p.Chat(ctx, []Message{{Role: "user", Content: "hello"}}, "", 256)
+		if err == nil || !strings.Contains(err.Error(), "bubblewrap") {
+			t.Fatalf("Windows remote CLI must refuse unavailable Linux isolation: %v", err)
+		}
+		if calls := readFakeCodexInvocations(t, logDir); len(calls) != 0 {
+			t.Fatalf("rejected remote request executed %d fixture calls", len(calls))
+		}
+		if _, err := os.Stat(work); err != nil {
+			t.Fatalf("rejected request removed explicit workdir: %v", err)
+		}
+		return
+	}
 	if _, _, err := p.Chat(ctx, []Message{{Role: "user", Content: "hello"}}, "", 256); err != nil {
 		t.Fatalf("Chat: %v", err)
 	}

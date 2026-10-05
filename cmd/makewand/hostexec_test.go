@@ -6,8 +6,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/makewand/makewand/internal/privatefile"
 	"time"
 
 	"github.com/makewand/makewand/internal/config"
@@ -222,8 +225,16 @@ func TestAuditUnsafeHostExecTightensLoosePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat(audit): %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("audit perms = %o, want 0600 after tightening", info.Mode().Perm())
+	if !info.Mode().IsRegular() {
+		t.Fatal("private state is not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := privatefile.Validate(f); err != nil {
+		t.Fatalf("private state permissions: %v", err)
 	}
 }
 
@@ -285,4 +296,37 @@ func splitNonEmptyLines(s string) []string {
 		}
 	}
 	return out
+}
+
+func TestAuditUnsafeHostExecRejectsSymlinkWithoutChangingTarget(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MAKEWAND_CONFIG_DIR", dir)
+	outside := filepath.Join(t.TempDir(), "outside-audit")
+	original := []byte("outside bytes\n")
+	//nolint:gosec // G306: intentionally broad fixture permissions must remain unchanged when the audit leaf is a symlink.
+	if err := os.WriteFile(outside, original, 0644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, unsafeHostExecAuditFile)); err != nil {
+		if runtime.GOOS == "windows" && errors.Is(err, os.ErrPermission) {
+			t.Skip("creating a Windows symbolic link requires a user privilege")
+		}
+		t.Fatal(err)
+	}
+	auditUnsafeHostExec(engine.UnsafeHostExecEvent{Context: "verification", Command: "synthetic", Source: "test"})
+	after, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(original) || before.Mode() != after.Mode() {
+		t.Fatal("audit followed a symbolic link and changed the outside target")
+	}
 }

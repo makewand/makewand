@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/privatefile"
 	"github.com/spf13/cobra"
 )
 
@@ -52,6 +53,11 @@ func configureExecutionBudget(cmd *cobra.Command) error {
 			return fmt.Errorf("create model call budget: %w", err)
 		}
 		path = file.Name()
+		if err := privatefile.Tighten(file); err != nil {
+			_ = file.Close()
+			_ = os.Remove(path)
+			return fmt.Errorf("protect model call budget: %w", err)
+		}
 		encodeErr := json.NewEncoder(file).Encode(map[string]any{"schema": execution.Schema, "maximum": maximum, "attempts": []any{}})
 		if encodeErr == nil {
 			encodeErr = file.Sync()

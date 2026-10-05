@@ -1,10 +1,12 @@
 package router
 
 import (
+	"github.com/makewand/makewand/internal/testfixture"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -22,19 +24,7 @@ const fakeCodexArgSep = "\n----ARG----\n"
 // codex `exec --json` agent_message. It never contacts a real model.
 func writeRecordingCodexCLI(t *testing.T, logDir string) string {
 	t.Helper()
-	binDir := t.TempDir()
-	script := filepath.Join(binDir, "codex")
-	body := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"--version\" ]; then echo codex-fake; exit 0; fi\n" +
-		"f=$(mktemp \"" + logDir + "/call.XXXXXX\")\n" +
-		"pwd -P > \"$f.dir\"\n" +
-		"for a in \"$@\"; do printf '%s" + strings.ReplaceAll(fakeCodexArgSep, "\n", "\\n") + "' \"$a\" >> \"$f.args\"; done\n" +
-		"rm -f \"$f\"\n" +
-		"echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"FAKE-CODEX-ANSWER\"}}'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(fake codex): %v", err)
-	}
-	return script
+	return testfixture.WriteCLI(t, "codex", testfixture.Spec{Mode: "record-codex", LogDir: logDir})
 }
 
 func readFakeCodexInvocations(t *testing.T, logDir string) []fakeCodexInvocation {
@@ -137,6 +127,9 @@ func TestHTTPFacadeReviewNeverRunsCodexReviewUncommittedInServerCwd(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			tmpBase := t.TempDir()
 			t.Setenv("TMPDIR", tmpBase)
+			t.Setenv("TMP", tmpBase)
+			t.Setenv("TEMP", tmpBase)
+			t.Setenv("SystemTemp", tmpBase)
 			logDir := t.TempDir()
 			codex := writeRecordingCodexCLI(t, logDir)
 			r := newCodexOnlyHTTPRouter(t, codex)
@@ -144,6 +137,15 @@ func TestHTTPFacadeReviewNeverRunsCodexReviewUncommittedInServerCwd(t *testing.T
 			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
 			rec := httptest.NewRecorder()
 			r.HTTPHandler().ServeHTTP(rec, req)
+			if runtime.GOOS == "windows" {
+				if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "bubblewrap") {
+					t.Fatalf("Windows remote CLI must refuse unavailable Linux isolation: status=%d body=%s", rec.Code, rec.Body.String())
+				}
+				if calls := readFakeCodexInvocations(t, logDir); len(calls) != 0 {
+					t.Fatalf("rejected remote request executed %d fixture calls", len(calls))
+				}
+				return
+			}
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 			}

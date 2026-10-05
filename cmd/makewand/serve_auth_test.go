@@ -52,7 +52,7 @@ func TestResolveServeAuditPath(t *testing.T) {
 	}
 
 	t.Setenv("MAKEWAND_SERVER_AUDIT_LOG", "1")
-	if got := resolveServeAuditPath("", "/tmp/server"); got != "/tmp/server/audit.jsonl" {
+	if got := resolveServeAuditPath("", "/tmp/server"); got != filepath.Join("/tmp/server", "audit.jsonl") {
 		t.Fatalf("resolveServeAuditPath(env=1) = %q", got)
 	}
 

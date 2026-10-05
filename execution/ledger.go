@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/makewand/makewand/internal/privatefile"
 )
 
 var ErrBudgetExhausted = errors.New("model call budget exhausted")
@@ -172,6 +174,10 @@ func saveLedger(path string, data map[string]any) error {
 	}
 	temp := file.Name()
 	defer func() { _ = os.Remove(temp) }()
+	if err := privatefile.Tighten(file); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("protect model call ledger: %w", err)
+	}
 	if _, err = file.Write(append(encoded, '\n')); err == nil {
 		err = file.Sync()
 	}

@@ -2,15 +2,16 @@ package model
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
+
+	"github.com/makewand/makewand/internal/testfixture"
 
 	"github.com/makewand/makewand/internal/config"
 )
 
 func policyConfig(t *testing.T) *config.Config {
 	t.Helper()
+	testfixture.ClearProviderEnv(t)
 	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
 	t.Setenv("MAKEWAND_REMOTE_URL", "")
 	t.Setenv("MAKEWAND_REMOTE_TOKEN", "")
@@ -67,11 +68,7 @@ func TestPaidAPIRequiresExplicitOptIn(t *testing.T) {
 func TestSubscriptionOnlyKeepsCLIAndOmitsPaidSiblingAndCustomAdapter(t *testing.T) {
 	t.Setenv("MAKEWAND_API_POLICY", "subscription_only")
 	cfg := policyConfig(t)
-	bin := filepath.Join(t.TempDir(), "provider")
-	//nolint:gosec // G306: this fixture must be executable to verify permission preservation or CLI availability.
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho fixture\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	bin := writeFixtureCLI(t, "provider")
 	cfg.CLIs = []config.CLITool{{Name: "claude", BinPath: bin}}
 	cfg.CustomProviders = []config.CustomProvider{{Name: "paid-custom", Command: bin, Access: "api"}, {Name: "local-custom", Command: bin, Access: "local"}}
 	r, err := NewRouter(cfg)
