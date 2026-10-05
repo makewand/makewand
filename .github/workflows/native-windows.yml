@@ -15,6 +15,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 75
     steps:
+      - name: Preserve LF source bytes before checkout
+        # Git for Windows enables autocrlf in runner configuration. The gate
+        # disables ambient Git configuration, so checkout must already preserve
+        # committed LF bytes. Configure this ephemeral runner before checkout;
+        # keep all subsequent clean-source checks strict.
+        shell: pwsh
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
