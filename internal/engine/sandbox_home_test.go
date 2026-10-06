@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -112,6 +113,9 @@ func fakeToolchainHome(t *testing.T) (home, pathEnv string) {
 }
 
 func TestSandboxHomeLayout_RebindsToolchainsReadOnlyWithoutCredentials(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap toolchain mounts require POSIX executable and symlink semantics")
+	}
 	home, pathEnv := fakeToolchainHome(t)
 	stubGoEnv(t, hostGoEnv{
 		GOROOT:     filepath.Join(home, "sdk", "go1.27"),

@@ -1,0 +1,2800 @@
+{
+  "schema": 3,
+  "state": "assembled_complete_formal_report",
+  "prepared_utc": "2026-10-05T16:27:29.415448+00:00",
+  "source": {
+    "files": 802,
+    "mapping_sha256": "0376ec3f18dade7347d66b859a9f05ded19790fcc44fca351772d55a0024ce3a",
+    "head_sha": "55da959a4acdb97d5dbaf23ffa330c4bcdb9fec9",
+    "merge_sha": "ebfe797ee2654d9285f7e3a32a7d2b49d6f36374",
+    "tree": "f1c33148bac44bde3ad2ce507a51676d936c1f5d",
+    "draft_pr_url": "https://github.com/makewand/makewand/pull/46"
+  },
+  "ci": {
+    "state": "passed",
+    "runs": [
+      {
+        "name": "Architecture runtime",
+        "id": 37315300803,
+        "conclusion": "success",
+        "url": "https://github.com/makewand/makewand/actions/runs/37315300803"
+      },
+      {
+        "name": "CI",
+        "id": 37315299799,
+        "conclusion": "success",
+        "url": "https://github.com/makewand/makewand/actions/runs/37315299799"
+      },
+      {
+        "name": "CodeQL",
+        "id": 37315299863,
+        "conclusion": "success",
+        "url": "https://github.com/makewand/makewand/actions/runs/37315299863"
+      }
+    ],
+    "prior_failed_epochs": [
+      {
+        "epoch": "initial",
+        "state": "completed_with_failures",
+        "head_sha": "d3f172d6a79e7ee827b7e258a0bf361b861722d4",
+        "source_mapping_sha256": "da8155d8ba33aca8ae6b6a3b708b2dc2cc4db034e32c782d7a6608847606f3e9",
+        "runs": [
+          {
+            "name": "Architecture runtime",
+            "id": 37309980038,
+            "conclusion": "failure",
+            "url": "https://github.com/makewand/makewand/actions/runs/37309980038"
+          },
+          {
+            "name": "CodeQL",
+            "id": 37309979546,
+            "conclusion": "success",
+            "url": "https://github.com/makewand/makewand/actions/runs/37309979546"
+          },
+          {
+            "name": "CI",
+            "id": 37309979539,
+            "conclusion": "failure",
+            "url": "https://github.com/makewand/makewand/actions/runs/37309979539"
+          }
+        ],
+        "preserved_as_failed_history": true,
+        "input": "observations-corrective/001.json"
+      },
+      {
+        "epoch": "second",
+        "state": "failed",
+        "head_sha": "ea6dbc0452010ffd0431b6634a39b4ef0af1ad05",
+        "source_mapping_sha256": "8e05c6d81cd83a09c137f58ac024699bab468a859a42cb15661ade771c070076",
+        "runs": [
+          {
+            "name": "Architecture runtime",
+            "id": 37311716092,
+            "conclusion": "failure",
+            "url": "https://github.com/makewand/makewand/actions/runs/37311716092"
+          },
+          {
+            "name": "CI",
+            "id": 37311715804,
+            "conclusion": "success",
+            "url": "https://github.com/makewand/makewand/actions/runs/37311715804"
+          },
+          {
+            "name": "CodeQL",
+            "id": 37311715723,
+            "conclusion": "success",
+            "url": "https://github.com/makewand/makewand/actions/runs/37311715723"
+          }
+        ],
+        "preserved_as_failed_history": true,
+        "input": "epoch2/hosted-ci-report.json"
+      }
+    ],
+    "native_group_results": [
+      {
+        "name": "python_native",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 127.015,
+        "error": null,
+        "total": 82,
+        "passed": 74,
+        "skipped": 8
+      },
+      {
+        "name": "engine",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 42.953,
+        "error": null,
+        "packages": 1,
+        "passed_including_subtests": 83,
+        "skipped_including_subtests": 0,
+        "passed_top_level": 61,
+        "skipped_top_level": 0
+      },
+      {
+        "name": "tui",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 10.86,
+        "error": null,
+        "packages": 1,
+        "passed_including_subtests": 19,
+        "skipped_including_subtests": 0,
+        "passed_top_level": 11,
+        "skipped_top_level": 0
+      },
+      {
+        "name": "processjob",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 8.469,
+        "error": null,
+        "packages": 1,
+        "passed_including_subtests": 15,
+        "skipped_including_subtests": 0,
+        "passed_top_level": 9,
+        "skipped_top_level": 0
+      },
+      {
+        "name": "remotesession",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 8.094,
+        "error": null,
+        "packages": 1,
+        "passed_including_subtests": 27,
+        "skipped_including_subtests": 2,
+        "passed_top_level": 23,
+        "skipped_top_level": 2
+      },
+      {
+        "name": "router_raw",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 29.015,
+        "error": null,
+        "packages": 2,
+        "passed_including_subtests": 32,
+        "skipped_including_subtests": 0,
+        "passed_top_level": 18,
+        "skipped_top_level": 0
+      },
+      {
+        "name": "execution",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 1.906,
+        "error": null,
+        "packages": 1,
+        "passed_including_subtests": 12,
+        "skipped_including_subtests": 0,
+        "passed_top_level": 9,
+        "skipped_top_level": 0
+      },
+      {
+        "name": "race_all",
+        "state": "passed",
+        "exit": 0,
+        "elapsed_seconds": 180.797,
+        "error": null,
+        "packages": 33,
+        "passed_including_subtests": 1628,
+        "skipped_including_subtests": 44,
+        "passed_top_level": 1161,
+        "skipped_top_level": 41
+      }
+    ],
+    "private_state_proof": {
+      "storage_outside_checkout": true,
+      "actual_python_temp_outside_checkout": true,
+      "actual_go_temp_outside_checkout": true,
+      "gocache_outside_checkout": true,
+      "gomodcache_outside_checkout": true,
+      "gopath_outside_checkout": true
+    },
+    "ordinary_windows_desktop": "pending_actual_ordinary_user_workstation",
+    "release_merged_or_published": false
+  },
+  "observed_environment_constraints": {
+    "scope": "One independently verified closed trial; not an aggregate count or controlled parallel performance baseline.",
+    "race_arm_interpretation": "Observed adaptive race workflow, including dynamic serial backpressure fallback.",
+    "example_trial": "0037-deep-config-race-and-apply-0",
+    "source_mapping_sha256": "0376ec3f18dade7347d66b859a9f05ded19790fcc44fca351772d55a0024ce3a",
+    "example_original_quality_outcome": "quality_failure",
+    "example_original_acceptance_exit": 1,
+    "actual_generation_provider_spans": [
+      {
+        "engine": "codex",
+        "start_unix_ms": 1791210871755,
+        "end_unix_ms": 1791210941292,
+        "duration_ms": 69537
+      },
+      {
+        "engine": "claude",
+        "start_unix_ms": 1791210941316,
+        "end_unix_ms": 1791210958446,
+        "duration_ms": 17130
+      }
+    ],
+    "observed_generator_overlap_ms": 0,
+    "provider_span_gap_ms": 24,
+    "earlier_logged_load_1m_rounded": 26.0,
+    "fixed_load_threshold": 24.0,
+    "exact_load_at_race_branch": null,
+    "exact_branch_sample_was_not_saved": true,
+    "all_race_trials_serial_claimed": false,
+    "uniform_hard_max_inflight_1_established": false,
+    "total_logical_dispatch_budget": 320,
+    "budget_is_a_parallel_slot_limit": false,
+    "physical_cpu_count_used_to_infer_load_or_constraint": false,
+    "parallel_speedup_claimed": false,
+    "quality_failure_reclassified_due_to_backpressure": false,
+    "formal_statistics_changed": false,
+    "evidence": [
+      "matrix-deep-config-first-race-backpressure-independent-review.json",
+      "matrix-deep-config-first-race-closed-failure-independent-review.json"
+    ],
+    "limitation": "Arm name alone does not prove concurrent generation. Earlier rounded load26.0 exceeds24.0; the serial branch samples load again and its exact sample is unknown. Do not infer scheduling for every race, host cause from physical CPU counts, or pure parallel speedup."
+  },
+  "observer_v1_side_effect": {
+    "scope": "Early observerV1 setup side effect; subsequent corrected observer trial configuration is private.",
+    "default_home_config_write_occurred": true,
+    "cause": "Configuration initialized before HOME isolation in the early observer.",
+    "default_config_and_directory_preexisted": true,
+    "creation_unix_seconds": 1772424946,
+    "creation_utc": "2026-03-02T04:15:46Z",
+    "prior_configuration_content_known": false,
+    "prewrite_content_snapshot_available": false,
+    "restored_to_original": false,
+    "configuration_contents_read_for_this_report": false,
+    "observed_file_metadata_unchanged_since_impact_review": true,
+    "currently_observed_file_bytes": 35,
+    "metadata_observed_utc": "2026-10-05T13:44:43.050246+00:00",
+    "directory_metadata_unmodified_claimed": false,
+    "corrected_observer_default_home_regression": "passed",
+    "limitation": "The original content is unknown. This report does not claim restoration or that default HOME was never written. Directory metadata changed; its source is not inferred.",
+    "evidence": [
+      "observer-v1-default-home-metadata-impact-review.json",
+      "final-report-preparation-v2/default-home-metadata-followup.json"
+    ]
+  },
+  "formal96": {
+    "state": "complete_measured_comparison",
+    "planned_trials": 96,
+    "completed_trials": 96,
+    "phase_run_id": "979ae83efb974c699e99addda3b00234",
+    "arm_metrics": {
+      "single-claude": {
+        "completed_trials": 24,
+        "accepted": 22,
+        "acceptance_rate": 0.9166666666666666,
+        "outcomes": {
+          "quality_failure": 2,
+          "successful_delivery": 22
+        },
+        "total_wall_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 24.43091173702851,
+          "p95": 36.08189856202807
+        },
+        "generation_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 23.49976901698392,
+          "p95": 33.91718554205727
+        },
+        "accepted_total_wall_seconds": {
+          "observed": 22,
+          "missing": 0,
+          "p50": 24.43091173702851,
+          "p95": 36.08189856202807
+        },
+        "accepted_generation_seconds": {
+          "observed": 22,
+          "missing": 0,
+          "p50": 23.49976901698392,
+          "p95": 33.91718554205727
+        },
+        "logical_dispatch_reservations": 24,
+        "dispatches_per_accepted_delivery": 1.0909090909090908,
+        "total_wall_seconds_per_accepted_delivery": 27.687925392618954,
+        "observed_cli_invocations": 24,
+        "expected_dispatches_by_engine": {
+          "claude": 24
+        },
+        "observed_cli_records_by_engine": {
+          "claude": 24
+        },
+        "token_coverage": {
+          "expected_dispatches": 24,
+          "observed_cli_records": 24,
+          "measured_cli_records": 24,
+          "full_reservation_coverage": true
+        },
+        "observed_token_subtotals": {
+          "input_total": 3383198,
+          "uncached_input": 166,
+          "cached_input": 2827175,
+          "cache_creation": 555857,
+          "output": 35562
+        },
+        "fully_measured_token_totals": {
+          "input_total": 3383198,
+          "uncached_input": 166,
+          "cached_input": 2827175,
+          "cache_creation": 555857,
+          "output": 35562
+        },
+        "model_groups": [
+          {
+            "engine": "claude",
+            "model_identity_kind": "reported",
+            "model": "claude-sonnet-5-5",
+            "cli_records": 24,
+            "token_totals": {
+              "inputTokens": 166,
+              "outputTokens": 35562,
+              "cacheReadInputTokens": 2827175,
+              "cacheCreationInputTokens": 555857
+            }
+          }
+        ],
+        "claude_client_reported_api_estimate": {
+          "total_usd": 5.724195,
+          "observed_subtotal_usd": 5.724195,
+          "expected_claude_dispatches": 24,
+          "measured_cli_records": 24,
+          "complete": true,
+          "usd_per_accepted_delivery": 0.26019068181818183
+        },
+        "codex_conditional_api_estimates": {
+          "short": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": null,
+            "expected_codex_dispatches": 0,
+            "measured_codex_records": 0,
+            "missing_records": 0,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          },
+          "long": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": null,
+            "expected_codex_dispatches": 0,
+            "measured_codex_records": 0,
+            "missing_records": 0,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          }
+        },
+        "actual_subscription_cash_cost_usd": null,
+        "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+      },
+      "single-codex": {
+        "completed_trials": 24,
+        "accepted": 22,
+        "acceptance_rate": 0.9166666666666666,
+        "outcomes": {
+          "quality_failure": 2,
+          "successful_delivery": 22
+        },
+        "total_wall_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 60.48925178695936,
+          "p95": 90.70905837009195
+        },
+        "generation_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 59.73934398998972,
+          "p95": 88.97421935200691
+        },
+        "accepted_total_wall_seconds": {
+          "observed": 22,
+          "missing": 0,
+          "p50": 60.23446143500041,
+          "p95": 90.70905837009195
+        },
+        "accepted_generation_seconds": {
+          "observed": 22,
+          "missing": 0,
+          "p50": 59.283281296957284,
+          "p95": 88.97421935200691
+        },
+        "logical_dispatch_reservations": 24,
+        "dispatches_per_accepted_delivery": 1.0909090909090908,
+        "total_wall_seconds_per_accepted_delivery": 68.32819824827179,
+        "observed_cli_invocations": 24,
+        "expected_dispatches_by_engine": {
+          "codex": 24
+        },
+        "observed_cli_records_by_engine": {
+          "codex": 24
+        },
+        "token_coverage": {
+          "expected_dispatches": 24,
+          "observed_cli_records": 24,
+          "measured_cli_records": 24,
+          "full_reservation_coverage": true
+        },
+        "observed_token_subtotals": {
+          "input_total": 2126511,
+          "uncached_input": 204207,
+          "cached_input": 1922304,
+          "cache_creation": null,
+          "output": 52876
+        },
+        "fully_measured_token_totals": {
+          "input_total": 2126511,
+          "uncached_input": 204207,
+          "cached_input": 1922304,
+          "cache_creation": null,
+          "output": 52876
+        },
+        "model_groups": [
+          {
+            "engine": "codex",
+            "model_identity_kind": "requested_not_reported",
+            "model": "gpt-6.1-sol",
+            "cli_records": 24,
+            "token_totals": {
+              "input_tokens": 2126511,
+              "cached_input_tokens": 1922304,
+              "output_tokens": 52876
+            }
+          }
+        ],
+        "claude_client_reported_api_estimate": {
+          "total_usd": null,
+          "observed_subtotal_usd": null,
+          "expected_claude_dispatches": 0,
+          "measured_cli_records": 0,
+          "complete": false,
+          "usd_per_accepted_delivery": null
+        },
+        "codex_conditional_api_estimates": {
+          "short": {
+            "estimated_total_usd": 1.1294044,
+            "observed_estimate_subtotal_usd": 1.1294044,
+            "expected_codex_dispatches": 24,
+            "measured_codex_records": 24,
+            "missing_records": 0,
+            "complete": true,
+            "estimated_usd_per_accepted_delivery": 0.05133656363636364
+          },
+          "long": {
+            "estimated_total_usd": 1.9944288,
+            "observed_estimate_subtotal_usd": 1.9944288,
+            "expected_codex_dispatches": 24,
+            "measured_codex_records": 24,
+            "missing_records": 0,
+            "complete": true,
+            "estimated_usd_per_accepted_delivery": 0.09065585454545454
+          }
+        },
+        "actual_subscription_cash_cost_usd": null,
+        "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+      },
+      "pipeline-cross-review": {
+        "completed_trials": 24,
+        "accepted": 20,
+        "acceptance_rate": 0.8333333333333334,
+        "outcomes": {
+          "quality_failure": 2,
+          "successful_delivery": 20,
+          "timeout": 2
+        },
+        "total_wall_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 114.71421349293087,
+          "p95": 240.89778329292312
+        },
+        "generation_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 113.92248066607863,
+          "p95": 240.49113085202407
+        },
+        "accepted_total_wall_seconds": {
+          "observed": 20,
+          "missing": 0,
+          "p50": 109.71031312900595,
+          "p95": 218.43078961002175
+        },
+        "accepted_generation_seconds": {
+          "observed": 20,
+          "missing": 0,
+          "p50": 108.76088826102205,
+          "p95": 217.25785441102926
+        },
+        "logical_dispatch_reservations": 56,
+        "dispatches_per_accepted_delivery": 2.8,
+        "total_wall_seconds_per_accepted_delivery": 156.88967561588507,
+        "observed_cli_invocations": 54,
+        "expected_dispatches_by_engine": {
+          "claude": 28,
+          "codex": 28
+        },
+        "observed_cli_records_by_engine": {
+          "claude": 28,
+          "codex": 26
+        },
+        "token_coverage": {
+          "expected_dispatches": 56,
+          "observed_cli_records": 54,
+          "measured_cli_records": 54,
+          "full_reservation_coverage": false
+        },
+        "observed_token_subtotals": {
+          "input_total": 6344039,
+          "uncached_input": 275298,
+          "cached_input": 5413722,
+          "cache_creation": null,
+          "output": 118790
+        },
+        "fully_measured_token_totals": null,
+        "model_groups": [
+          {
+            "engine": "claude",
+            "model_identity_kind": "reported",
+            "model": "claude-sonnet-5-5",
+            "cli_records": 28,
+            "token_totals": {
+              "inputTokens": 210,
+              "outputTokens": 48495,
+              "cacheReadInputTokens": 3691354,
+              "cacheCreationInputTokens": 655019
+            }
+          },
+          {
+            "engine": "codex",
+            "model_identity_kind": "requested_not_reported",
+            "model": "gpt-6-astra",
+            "cli_records": 26,
+            "token_totals": {
+              "input_tokens": 1997456,
+              "cached_input_tokens": 1722368,
+              "output_tokens": 70295
+            }
+          }
+        ],
+        "claude_client_reported_api_estimate": {
+          "total_usd": 6.9491628,
+          "observed_subtotal_usd": 6.9491628,
+          "expected_claude_dispatches": 28,
+          "measured_cli_records": 28,
+          "complete": true,
+          "usd_per_accepted_delivery": 0.34745813999999997
+        },
+        "codex_conditional_api_estimates": {
+          "short": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 7.987998,
+            "expected_codex_dispatches": 28,
+            "measured_codex_records": 26,
+            "missing_records": 2,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          },
+          "long": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 14.218621,
+            "expected_codex_dispatches": 28,
+            "measured_codex_records": 26,
+            "missing_records": 2,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          }
+        },
+        "actual_subscription_cash_cost_usd": null,
+        "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+      },
+      "race-and-apply": {
+        "completed_trials": 24,
+        "accepted": 16,
+        "acceptance_rate": 0.6666666666666666,
+        "outcomes": {
+          "quality_failure": 1,
+          "timeout": 7,
+          "successful_delivery": 16
+        },
+        "total_wall_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 215.67340729106218,
+          "p95": 241.43072775006294
+        },
+        "generation_seconds": {
+          "observed": 24,
+          "missing": 0,
+          "p50": 214.54358011402655,
+          "p95": 240.59412364498712
+        },
+        "accepted_total_wall_seconds": {
+          "observed": 16,
+          "missing": 0,
+          "p50": 197.371617399971,
+          "p95": 238.7220907220617
+        },
+        "accepted_generation_seconds": {
+          "observed": 16,
+          "missing": 0,
+          "p50": 196.5871546700364,
+          "p95": 238.03420080197975
+        },
+        "logical_dispatch_reservations": 72,
+        "dispatches_per_accepted_delivery": 4.5,
+        "total_wall_seconds_per_accepted_delivery": 309.4070194727028,
+        "observed_cli_invocations": 65,
+        "expected_dispatches_by_engine": {
+          "codex": 48,
+          "claude": 24
+        },
+        "observed_cli_records_by_engine": {
+          "codex": 41,
+          "claude": 24
+        },
+        "token_coverage": {
+          "expected_dispatches": 72,
+          "observed_cli_records": 65,
+          "measured_cli_records": 65,
+          "full_reservation_coverage": false
+        },
+        "observed_token_subtotals": {
+          "input_total": 6555983,
+          "uncached_input": 329401,
+          "cached_input": 5659583,
+          "cache_creation": null,
+          "output": 166136
+        },
+        "fully_measured_token_totals": null,
+        "model_groups": [
+          {
+            "engine": "claude",
+            "model_identity_kind": "reported",
+            "model": "claude-sonnet-5-5",
+            "cli_records": 24,
+            "token_totals": {
+              "inputTokens": 166,
+              "outputTokens": 36635,
+              "cacheReadInputTokens": 2845631,
+              "cacheCreationInputTokens": 566999
+            }
+          },
+          {
+            "engine": "codex",
+            "model_identity_kind": "requested_not_reported",
+            "model": "gpt-6-astra",
+            "cli_records": 17,
+            "token_totals": {
+              "input_tokens": 1042837,
+              "cached_input_tokens": 903168,
+              "output_tokens": 75489
+            }
+          },
+          {
+            "engine": "codex",
+            "model_identity_kind": "requested_not_reported",
+            "model": "gpt-6.1-sol",
+            "cli_records": 24,
+            "token_totals": {
+              "input_tokens": 2100350,
+              "cached_input_tokens": 1910784,
+              "output_tokens": 54012
+            }
+          }
+        ],
+        "claude_client_reported_api_estimate": {
+          "total_usd": 5.8384822,
+          "observed_subtotal_usd": 5.8384822,
+          "expected_claude_dispatches": 24,
+          "measured_cli_records": 24,
+          "complete": true,
+          "usd_per_accepted_delivery": 0.3649051375
+        },
+        "codex_conditional_api_estimates": {
+          "short": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 7.1846384,
+            "expected_codex_dispatches": 48,
+            "measured_codex_records": 41,
+            "missing_records": 7,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          },
+          "long": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 12.2119918,
+            "expected_codex_dispatches": 48,
+            "measured_codex_records": 41,
+            "missing_records": 7,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          }
+        },
+        "actual_subscription_cash_cost_usd": null,
+        "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+      }
+    },
+    "risk_metrics": {
+      "single-claude": {
+        "low": {
+          "completed_trials": 8,
+          "accepted": 8,
+          "acceptance_rate": 1.0,
+          "outcomes": {
+            "successful_delivery": 8
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 22.528342342935503,
+            "p95": 26.15135366190225
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 21.84726218599826,
+            "p95": 24.720105263055302
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 22.528342342935503,
+            "p95": 26.15135366190225
+          },
+          "accepted_generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 21.84726218599826,
+            "p95": 24.720105263055302
+          },
+          "logical_dispatch_reservations": 8,
+          "dispatches_per_accepted_delivery": 1.0,
+          "total_wall_seconds_per_accepted_delivery": 22.990475724975113,
+          "observed_cli_invocations": 8,
+          "expected_dispatches_by_engine": {
+            "claude": 8
+          },
+          "observed_cli_records_by_engine": {
+            "claude": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 8,
+            "observed_cli_records": 8,
+            "measured_cli_records": 8,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 1096226,
+            "uncached_input": 54,
+            "cached_input": 912263,
+            "cache_creation": 183909,
+            "output": 9835
+          },
+          "fully_measured_token_totals": {
+            "input_total": 1096226,
+            "uncached_input": 54,
+            "cached_input": 912263,
+            "cache_creation": 183909,
+            "output": 9835
+          },
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 54,
+                "outputTokens": 9835,
+                "cacheReadInputTokens": 912263,
+                "cacheCreationInputTokens": 183909
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 1.8506406,
+            "observed_subtotal_usd": 1.8506406,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.231330075
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": null,
+              "expected_codex_dispatches": 0,
+              "measured_codex_records": 0,
+              "missing_records": 0,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            },
+            "long": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": null,
+              "expected_codex_dispatches": 0,
+              "measured_codex_records": 0,
+              "missing_records": 0,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "medium": {
+          "completed_trials": 8,
+          "accepted": 6,
+          "acceptance_rate": 0.75,
+          "outcomes": {
+            "quality_failure": 2,
+            "successful_delivery": 6
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 23.95481786795426,
+            "p95": 28.205529800034128
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 23.013832417083904,
+            "p95": 27.29241937806364
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 23.95481786795426,
+            "p95": 28.06632411701139
+          },
+          "accepted_generation_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 23.013832417083904,
+            "p95": 27.111885663005523
+          },
+          "logical_dispatch_reservations": 8,
+          "dispatches_per_accepted_delivery": 1.3333333333333333,
+          "total_wall_seconds_per_accepted_delivery": 32.59233798047838,
+          "observed_cli_invocations": 8,
+          "expected_dispatches_by_engine": {
+            "claude": 8
+          },
+          "observed_cli_records_by_engine": {
+            "claude": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 8,
+            "observed_cli_records": 8,
+            "measured_cli_records": 8,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 1056661,
+            "uncached_input": 52,
+            "cached_input": 872955,
+            "cache_creation": 183654,
+            "output": 10760
+          },
+          "fully_measured_token_totals": {
+            "input_total": 1056661,
+            "uncached_input": 52,
+            "cached_input": 872955,
+            "cache_creation": 183654,
+            "output": 10760
+          },
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 52,
+                "outputTokens": 10760,
+                "cacheReadInputTokens": 872955,
+                "cacheCreationInputTokens": 183654
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 1.859231,
+            "observed_subtotal_usd": 1.859231,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.30987183333333335
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": null,
+              "expected_codex_dispatches": 0,
+              "measured_codex_records": 0,
+              "missing_records": 0,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            },
+            "long": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": null,
+              "expected_codex_dispatches": 0,
+              "measured_codex_records": 0,
+              "missing_records": 0,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "high": {
+          "completed_trials": 8,
+          "accepted": 8,
+          "acceptance_rate": 1.0,
+          "outcomes": {
+            "successful_delivery": 8
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 25.350348460953683,
+            "p95": 36.300287609919906
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 24.539144427981228,
+            "p95": 34.75174849003088
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 25.350348460953683,
+            "p95": 36.300287609919906
+          },
+          "accepted_generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 24.539144427981228,
+            "p95": 34.75174849003088
+          },
+          "logical_dispatch_reservations": 8,
+          "dispatches_per_accepted_delivery": 1.0,
+          "total_wall_seconds_per_accepted_delivery": 28.707065619368223,
+          "observed_cli_invocations": 8,
+          "expected_dispatches_by_engine": {
+            "claude": 8
+          },
+          "observed_cli_records_by_engine": {
+            "claude": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 8,
+            "observed_cli_records": 8,
+            "measured_cli_records": 8,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 1230311,
+            "uncached_input": 60,
+            "cached_input": 1041957,
+            "cache_creation": 188294,
+            "output": 14967
+          },
+          "fully_measured_token_totals": {
+            "input_total": 1230311,
+            "uncached_input": 60,
+            "cached_input": 1041957,
+            "cache_creation": 188294,
+            "output": 14967
+          },
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 60,
+                "outputTokens": 14967,
+                "cacheReadInputTokens": 1041957,
+                "cacheCreationInputTokens": 188294
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 2.0143234,
+            "observed_subtotal_usd": 2.0143234,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.251790425
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": null,
+              "expected_codex_dispatches": 0,
+              "measured_codex_records": 0,
+              "missing_records": 0,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            },
+            "long": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": null,
+              "expected_codex_dispatches": 0,
+              "measured_codex_records": 0,
+              "missing_records": 0,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        }
+      },
+      "single-codex": {
+        "low": {
+          "completed_trials": 8,
+          "accepted": 8,
+          "acceptance_rate": 1.0,
+          "outcomes": {
+            "successful_delivery": 8
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 50.01542795507703,
+            "p95": 75.18873453803826
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 49.016787008033134,
+            "p95": 74.37765761802439
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 50.01542795507703,
+            "p95": 75.18873453803826
+          },
+          "accepted_generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 49.016787008033134,
+            "p95": 74.37765761802439
+          },
+          "logical_dispatch_reservations": 8,
+          "dispatches_per_accepted_delivery": 1.0,
+          "total_wall_seconds_per_accepted_delivery": 56.64066460049071,
+          "observed_cli_invocations": 8,
+          "expected_dispatches_by_engine": {
+            "codex": 8
+          },
+          "observed_cli_records_by_engine": {
+            "codex": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 8,
+            "observed_cli_records": 8,
+            "measured_cli_records": 8,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 661614,
+            "uncached_input": 63854,
+            "cached_input": 597760,
+            "cache_creation": null,
+            "output": 13798
+          },
+          "fully_measured_token_totals": {
+            "input_total": 661614,
+            "uncached_input": 63854,
+            "cached_input": 597760,
+            "cache_creation": null,
+            "output": 13798
+          },
+          "model_groups": [
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6.1-sol",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 661614,
+                "cached_input_tokens": 597760,
+                "output_tokens": 13798
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": null,
+            "observed_subtotal_usd": null,
+            "expected_claude_dispatches": 0,
+            "measured_cli_records": 0,
+            "complete": false,
+            "usd_per_accepted_delivery": null
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": 0.325464,
+              "observed_estimate_subtotal_usd": 0.325464,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.040683
+            },
+            "long": {
+              "estimated_total_usd": 0.581938,
+              "observed_estimate_subtotal_usd": 0.581938,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.07274225
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "medium": {
+          "completed_trials": 8,
+          "accepted": 6,
+          "acceptance_rate": 0.75,
+          "outcomes": {
+            "quality_failure": 2,
+            "successful_delivery": 6
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 60.23446143500041,
+            "p95": 80.48212033696473
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 59.283281296957284,
+            "p95": 79.60287665296346
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 54.23422122106422,
+            "p95": 75.03001626394689
+          },
+          "accepted_generation_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 53.25866458902601,
+            "p95": 74.01366888300981
+          },
+          "logical_dispatch_reservations": 8,
+          "dispatches_per_accepted_delivery": 1.3333333333333333,
+          "total_wall_seconds_per_accepted_delivery": 84.1333361673557,
+          "observed_cli_invocations": 8,
+          "expected_dispatches_by_engine": {
+            "codex": 8
+          },
+          "observed_cli_records_by_engine": {
+            "codex": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 8,
+            "observed_cli_records": 8,
+            "measured_cli_records": 8,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 760076,
+            "uncached_input": 69772,
+            "cached_input": 690304,
+            "cache_creation": null,
+            "output": 18033
+          },
+          "fully_measured_token_totals": {
+            "input_total": 760076,
+            "uncached_input": 69772,
+            "cached_input": 690304,
+            "cache_creation": null,
+            "output": 18033
+          },
+          "model_groups": [
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6.1-sol",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 760076,
+                "cached_input_tokens": 690304,
+                "output_tokens": 18033
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": null,
+            "observed_subtotal_usd": null,
+            "expected_claude_dispatches": 0,
+            "measured_cli_records": 0,
+            "complete": false,
+            "usd_per_accepted_delivery": null
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": 0.3889044,
+              "observed_estimate_subtotal_usd": 0.3889044,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.0648174
+            },
+            "long": {
+              "estimated_total_usd": 0.6876438,
+              "observed_estimate_subtotal_usd": 0.6876438,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.11460730000000001
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "high": {
+          "completed_trials": 8,
+          "accepted": 8,
+          "acceptance_rate": 1.0,
+          "outcomes": {
+            "successful_delivery": 8
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 61.517403599922545,
+            "p95": 94.759775579907
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 60.94534386298619,
+            "p95": 93.36980646301527
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 61.517403599922545,
+            "p95": 94.759775579907
+          },
+          "accepted_generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 60.94534386298619,
+            "p95": 93.36980646301527
+          },
+          "logical_dispatch_reservations": 8,
+          "dispatches_per_accepted_delivery": 1.0,
+          "total_wall_seconds_per_accepted_delivery": 68.16187845673994,
+          "observed_cli_invocations": 8,
+          "expected_dispatches_by_engine": {
+            "codex": 8
+          },
+          "observed_cli_records_by_engine": {
+            "codex": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 8,
+            "observed_cli_records": 8,
+            "measured_cli_records": 8,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 704821,
+            "uncached_input": 70581,
+            "cached_input": 634240,
+            "cache_creation": null,
+            "output": 21045
+          },
+          "fully_measured_token_totals": {
+            "input_total": 704821,
+            "uncached_input": 70581,
+            "cached_input": 634240,
+            "cache_creation": null,
+            "output": 21045
+          },
+          "model_groups": [
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6.1-sol",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 704821,
+                "cached_input_tokens": 634240,
+                "output_tokens": 21045
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": null,
+            "observed_subtotal_usd": null,
+            "expected_claude_dispatches": 0,
+            "measured_cli_records": 0,
+            "complete": false,
+            "usd_per_accepted_delivery": null
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": 0.415036,
+              "observed_estimate_subtotal_usd": 0.415036,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.0518795
+            },
+            "long": {
+              "estimated_total_usd": 0.724847,
+              "observed_estimate_subtotal_usd": 0.724847,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.090605875
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        }
+      },
+      "pipeline-cross-review": {
+        "low": {
+          "completed_trials": 8,
+          "accepted": 8,
+          "acceptance_rate": 1.0,
+          "outcomes": {
+            "successful_delivery": 8
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 99.14853844593745,
+            "p95": 134.81531256402377
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 98.47324294201098,
+            "p95": 133.98037253401708
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 99.14853844593745,
+            "p95": 134.81531256402377
+          },
+          "accepted_generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 98.47324294201098,
+            "p95": 133.98037253401708
+          },
+          "logical_dispatch_reservations": 16,
+          "dispatches_per_accepted_delivery": 2.0,
+          "total_wall_seconds_per_accepted_delivery": 103.62350443286414,
+          "observed_cli_invocations": 16,
+          "expected_dispatches_by_engine": {
+            "claude": 8,
+            "codex": 8
+          },
+          "observed_cli_records_by_engine": {
+            "claude": 8,
+            "codex": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 16,
+            "observed_cli_records": 16,
+            "measured_cli_records": 16,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 1762109,
+            "uncached_input": 72779,
+            "cached_input": 1499039,
+            "cache_creation": null,
+            "output": 30977
+          },
+          "fully_measured_token_totals": {
+            "input_total": 1762109,
+            "uncached_input": 72779,
+            "cached_input": 1499039,
+            "cache_creation": null,
+            "output": 30977
+          },
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 58,
+                "outputTokens": 11586,
+                "cacheReadInputTokens": 1000223,
+                "cacheCreationInputTokens": 190291
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6-astra",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 571537,
+                "cached_input_tokens": 498816,
+                "output_tokens": 19391
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 1.9543246,
+            "observed_subtotal_usd": 1.9543246,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.244290575
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": 2.195576,
+              "observed_estimate_subtotal_usd": 2.195576,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.274447
+            },
+            "long": {
+              "estimated_total_usd": 3.906377,
+              "observed_estimate_subtotal_usd": 3.906377,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.488297125
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "medium": {
+          "completed_trials": 8,
+          "accepted": 6,
+          "acceptance_rate": 0.75,
+          "outcomes": {
+            "quality_failure": 2,
+            "successful_delivery": 6
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 109.71031312900595,
+            "p95": 155.90869788394775
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 108.76088826102205,
+            "p95": 154.4826348600909
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 108.17815767298453,
+            "p95": 144.67272549297195
+          },
+          "accepted_generation_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 107.17767156707123,
+            "p95": 143.90993058495224
+          },
+          "logical_dispatch_reservations": 16,
+          "dispatches_per_accepted_delivery": 2.6666666666666665,
+          "total_wall_seconds_per_accepted_delivery": 155.8139814294797,
+          "observed_cli_invocations": 16,
+          "expected_dispatches_by_engine": {
+            "claude": 8,
+            "codex": 8
+          },
+          "observed_cli_records_by_engine": {
+            "claude": 8,
+            "codex": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 16,
+            "observed_cli_records": 16,
+            "measured_cli_records": 16,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 1812575,
+            "uncached_input": 73660,
+            "cached_input": 1549519,
+            "cache_creation": null,
+            "output": 34062
+          },
+          "fully_measured_token_totals": {
+            "input_total": 1812575,
+            "uncached_input": 73660,
+            "cached_input": 1549519,
+            "cache_creation": null,
+            "output": 34062
+          },
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 60,
+                "outputTokens": 12474,
+                "cacheReadInputTokens": 1047247,
+                "cacheCreationInputTokens": 189396
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6-astra",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 575872,
+                "cached_input_tokens": 502272,
+                "output_tokens": 21588
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 1.9743374,
+            "observed_subtotal_usd": 1.9743374,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.32905623333333334
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": 2.317672,
+              "observed_estimate_subtotal_usd": 2.317672,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.38627866666666666
+            },
+            "long": {
+              "estimated_total_usd": 4.095644,
+              "observed_estimate_subtotal_usd": 4.095644,
+              "expected_codex_dispatches": 8,
+              "measured_codex_records": 8,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.6826073333333333
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "high": {
+          "completed_trials": 8,
+          "accepted": 6,
+          "acceptance_rate": 0.75,
+          "outcomes": {
+            "timeout": 2,
+            "successful_delivery": 6
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 122.61254578700755,
+            "p95": 240.96869609097484
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 122.00523796398193,
+            "p95": 240.5932327240007
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 118.79903364600614,
+            "p95": 219.50460694602225
+          },
+          "accepted_generation_seconds": {
+            "observed": 6,
+            "missing": 0,
+            "p50": 118.00438292499166,
+            "p95": 218.4155025880318
+          },
+          "logical_dispatch_reservations": 24,
+          "dispatches_per_accepted_delivery": 4.0,
+          "total_wall_seconds_per_accepted_delivery": 228.98693137965165,
+          "observed_cli_invocations": 22,
+          "expected_dispatches_by_engine": {
+            "claude": 12,
+            "codex": 12
+          },
+          "observed_cli_records_by_engine": {
+            "claude": 12,
+            "codex": 10
+          },
+          "token_coverage": {
+            "expected_dispatches": 24,
+            "observed_cli_records": 22,
+            "measured_cli_records": 22,
+            "full_reservation_coverage": false
+          },
+          "observed_token_subtotals": {
+            "input_total": 2769355,
+            "uncached_input": 128859,
+            "cached_input": 2365164,
+            "cache_creation": null,
+            "output": 53751
+          },
+          "fully_measured_token_totals": null,
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 12,
+              "token_totals": {
+                "inputTokens": 92,
+                "outputTokens": 24435,
+                "cacheReadInputTokens": 1643884,
+                "cacheCreationInputTokens": 275332
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6-astra",
+              "cli_records": 10,
+              "token_totals": {
+                "input_tokens": 850047,
+                "cached_input_tokens": 721280,
+                "output_tokens": 29316
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 3.0205007999999998,
+            "observed_subtotal_usd": 3.0205007999999998,
+            "expected_claude_dispatches": 12,
+            "measured_cli_records": 12,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.5034168
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": 3.47475,
+              "expected_codex_dispatches": 12,
+              "measured_codex_records": 10,
+              "missing_records": 2,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            },
+            "long": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": 6.2166,
+              "expected_codex_dispatches": 12,
+              "measured_codex_records": 10,
+              "missing_records": 2,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        }
+      },
+      "race-and-apply": {
+        "low": {
+          "completed_trials": 8,
+          "accepted": 8,
+          "acceptance_rate": 1.0,
+          "outcomes": {
+            "successful_delivery": 8
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 186.340086324024,
+            "p95": 238.7220907220617
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 185.6417298070155,
+            "p95": 238.03420080197975
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 186.340086324024,
+            "p95": 238.7220907220617
+          },
+          "accepted_generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 185.6417298070155,
+            "p95": 238.03420080197975
+          },
+          "logical_dispatch_reservations": 24,
+          "dispatches_per_accepted_delivery": 3.0,
+          "total_wall_seconds_per_accepted_delivery": 184.07132271039882,
+          "observed_cli_invocations": 24,
+          "expected_dispatches_by_engine": {
+            "codex": 16,
+            "claude": 8
+          },
+          "observed_cli_records_by_engine": {
+            "codex": 16,
+            "claude": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 24,
+            "observed_cli_records": 24,
+            "measured_cli_records": 24,
+            "full_reservation_coverage": true
+          },
+          "observed_token_subtotals": {
+            "input_total": 2263435,
+            "uncached_input": 118067,
+            "cached_input": 1956842,
+            "cache_creation": null,
+            "output": 57714
+          },
+          "fully_measured_token_totals": {
+            "input_total": 2263435,
+            "uncached_input": 118067,
+            "cached_input": 1956842,
+            "cache_creation": null,
+            "output": 57714
+          },
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 56,
+                "outputTokens": 10894,
+                "cacheReadInputTokens": 960874,
+                "cacheCreationInputTokens": 188526
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6-astra",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 477360,
+                "cached_input_tokens": 418944,
+                "output_tokens": 32861
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6.1-sol",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 636619,
+                "cached_input_tokens": 577024,
+                "output_tokens": 13959
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 1.9184868,
+            "observed_subtotal_usd": 1.9184868,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.23981085
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": 2.9626364,
+              "observed_estimate_subtotal_usd": 2.9626364,
+              "expected_codex_dispatches": 16,
+              "measured_codex_records": 16,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.37032955
+            },
+            "long": {
+              "estimated_total_usd": 5.0339528,
+              "observed_estimate_subtotal_usd": 5.0339528,
+              "expected_codex_dispatches": 16,
+              "measured_codex_records": 16,
+              "missing_records": 0,
+              "complete": true,
+              "estimated_usd_per_accepted_delivery": 0.6292441
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "medium": {
+          "completed_trials": 8,
+          "accepted": 4,
+          "acceptance_rate": 0.5,
+          "outcomes": {
+            "quality_failure": 1,
+            "timeout": 3,
+            "successful_delivery": 4
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 224.73468721297104,
+            "p95": 241.4500623010099
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 223.85560937400442,
+            "p95": 240.83603246801067
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 4,
+            "missing": 0,
+            "p50": 197.371617399971,
+            "p95": 228.39228644000832
+          },
+          "accepted_generation_seconds": {
+            "observed": 4,
+            "missing": 0,
+            "p50": 196.5871546700364,
+            "p95": 227.60045525501482
+          },
+          "logical_dispatch_reservations": 24,
+          "dispatches_per_accepted_delivery": 6.0,
+          "total_wall_seconds_per_accepted_delivery": 443.6400320070097,
+          "observed_cli_invocations": 21,
+          "expected_dispatches_by_engine": {
+            "codex": 16,
+            "claude": 8
+          },
+          "observed_cli_records_by_engine": {
+            "codex": 13,
+            "claude": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 24,
+            "observed_cli_records": 21,
+            "measured_cli_records": 21,
+            "full_reservation_coverage": false
+          },
+          "observed_token_subtotals": {
+            "input_total": 2155602,
+            "uncached_input": 112009,
+            "cached_input": 1856265,
+            "cache_creation": null,
+            "output": 55836
+          },
+          "fully_measured_token_totals": null,
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 52,
+                "outputTokens": 11133,
+                "cacheReadInputTokens": 878217,
+                "cacheCreationInputTokens": 187328
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6-astra",
+              "cli_records": 5,
+              "token_totals": {
+                "input_tokens": 370250,
+                "cached_input_tokens": 322176,
+                "output_tokens": 26322
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6.1-sol",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 719755,
+                "cached_input_tokens": 655872,
+                "output_tokens": 18381
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 1.8971354,
+            "observed_subtotal_usd": 1.8971354,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.47428385
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": 2.4961792,
+              "expected_codex_dispatches": 16,
+              "measured_codex_records": 13,
+              "missing_records": 3,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            },
+            "long": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": 4.2424034,
+              "expected_codex_dispatches": 16,
+              "measured_codex_records": 13,
+              "missing_records": 3,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        },
+        "high": {
+          "completed_trials": 8,
+          "accepted": 4,
+          "acceptance_rate": 0.5,
+          "outcomes": {
+            "timeout": 4,
+            "successful_delivery": 4
+          },
+          "total_wall_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 215.67340729106218,
+            "p95": 241.0015596000012
+          },
+          "generation_seconds": {
+            "observed": 8,
+            "missing": 0,
+            "p50": 214.54358011402655,
+            "p95": 240.59412364498712
+          },
+          "accepted_total_wall_seconds": {
+            "observed": 4,
+            "missing": 0,
+            "p50": 180.22709954401944,
+            "p95": 215.67340729106218
+          },
+          "accepted_generation_seconds": {
+            "observed": 4,
+            "missing": 0,
+            "p50": 179.418175791041,
+            "p95": 214.54358011402655
+          },
+          "logical_dispatch_reservations": 24,
+          "dispatches_per_accepted_delivery": 6.0,
+          "total_wall_seconds_per_accepted_delivery": 425.8454004630039,
+          "observed_cli_invocations": 20,
+          "expected_dispatches_by_engine": {
+            "codex": 16,
+            "claude": 8
+          },
+          "observed_cli_records_by_engine": {
+            "codex": 12,
+            "claude": 8
+          },
+          "token_coverage": {
+            "expected_dispatches": 24,
+            "observed_cli_records": 20,
+            "measured_cli_records": 20,
+            "full_reservation_coverage": false
+          },
+          "observed_token_subtotals": {
+            "input_total": 2136946,
+            "uncached_input": 99325,
+            "cached_input": 1846476,
+            "cache_creation": null,
+            "output": 52586
+          },
+          "fully_measured_token_totals": null,
+          "model_groups": [
+            {
+              "engine": "claude",
+              "model_identity_kind": "reported",
+              "model": "claude-sonnet-5-5",
+              "cli_records": 8,
+              "token_totals": {
+                "inputTokens": 58,
+                "outputTokens": 14608,
+                "cacheReadInputTokens": 1006540,
+                "cacheCreationInputTokens": 191145
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6-astra",
+              "cli_records": 4,
+              "token_totals": {
+                "input_tokens": 195227,
+                "cached_input_tokens": 162048,
+                "output_tokens": 16306
+              }
+            },
+            {
+              "engine": "codex",
+              "model_identity_kind": "requested_not_reported",
+              "model": "gpt-6.1-sol",
+              "cli_records": 8,
+              "token_totals": {
+                "input_tokens": 743976,
+                "cached_input_tokens": 677888,
+                "output_tokens": 21672
+              }
+            }
+          ],
+          "claude_client_reported_api_estimate": {
+            "total_usd": 2.02286,
+            "observed_subtotal_usd": 2.02286,
+            "expected_claude_dispatches": 8,
+            "measured_cli_records": 8,
+            "complete": true,
+            "usd_per_accepted_delivery": 0.505715
+          },
+          "codex_conditional_api_estimates": {
+            "short": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": 1.7258228,
+              "expected_codex_dispatches": 16,
+              "measured_codex_records": 12,
+              "missing_records": 4,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            },
+            "long": {
+              "estimated_total_usd": null,
+              "observed_estimate_subtotal_usd": 2.9356356,
+              "expected_codex_dispatches": 16,
+              "measured_codex_records": 12,
+              "missing_records": 4,
+              "complete": false,
+              "estimated_usd_per_accepted_delivery": null
+            }
+          },
+          "actual_subscription_cash_cost_usd": null,
+          "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+        }
+      }
+    },
+    "paired_comparisons": [
+      {
+        "arm_a": "pipeline-cross-review",
+        "arm_b": "race-and-apply",
+        "planned_pairs": 24,
+        "paired_trials": 24,
+        "both_passed": 16,
+        "a_only_passed": 4,
+        "b_only_passed": 0,
+        "neither_passed": 4,
+        "success_rate_difference_b_minus_a": -0.16666666666666666,
+        "both_passed_wall_seconds": {
+          "pairs": 16,
+          "measured_pairs": 16,
+          "median_a": 105.27033069200115,
+          "median_b": 200.62866363150533,
+          "median_difference_b_minus_a": 86.1908494575182
+        },
+        "fixture_cluster_bootstrap": {
+          "unit": "fixture",
+          "repetitions": 0,
+          "seed": 20261005,
+          "fixture_clusters": 12,
+          "wall_fixture_clusters": 8,
+          "interpretation": "Descriptive comparison of this preregistered fixed sample only. Repeats share fixtures; fixture-cluster bootstrap intervals do not establish general model superiority or population confidence.",
+          "success_rate_difference_b_minus_a_95pct": null,
+          "median_wall_difference_b_minus_a_95pct": null,
+          "wall_effective_repetitions": 0
+        }
+      },
+      {
+        "arm_a": "pipeline-cross-review",
+        "arm_b": "single-claude",
+        "planned_pairs": 24,
+        "paired_trials": 24,
+        "both_passed": 20,
+        "a_only_passed": 0,
+        "b_only_passed": 2,
+        "neither_passed": 2,
+        "success_rate_difference_b_minus_a": 0.08333333333333333,
+        "both_passed_wall_seconds": {
+          "pairs": 20,
+          "measured_pairs": 20,
+          "median_a": 109.8051932050148,
+          "median_b": 24.298768754000776,
+          "median_difference_b_minus_a": -85.69213975802995
+        },
+        "fixture_cluster_bootstrap": {
+          "unit": "fixture",
+          "repetitions": 0,
+          "seed": 20261005,
+          "fixture_clusters": 12,
+          "wall_fixture_clusters": 10,
+          "interpretation": "Descriptive comparison of this preregistered fixed sample only. Repeats share fixtures; fixture-cluster bootstrap intervals do not establish general model superiority or population confidence.",
+          "success_rate_difference_b_minus_a_95pct": null,
+          "median_wall_difference_b_minus_a_95pct": null,
+          "wall_effective_repetitions": 0
+        }
+      },
+      {
+        "arm_a": "pipeline-cross-review",
+        "arm_b": "single-codex",
+        "planned_pairs": 24,
+        "paired_trials": 24,
+        "both_passed": 20,
+        "a_only_passed": 0,
+        "b_only_passed": 2,
+        "neither_passed": 2,
+        "success_rate_difference_b_minus_a": 0.08333333333333333,
+        "both_passed_wall_seconds": {
+          "pairs": 20,
+          "measured_pairs": 20,
+          "median_a": 109.8051932050148,
+          "median_b": 59.90542245999677,
+          "median_difference_b_minus_a": -49.787657560023945
+        },
+        "fixture_cluster_bootstrap": {
+          "unit": "fixture",
+          "repetitions": 0,
+          "seed": 20261005,
+          "fixture_clusters": 12,
+          "wall_fixture_clusters": 10,
+          "interpretation": "Descriptive comparison of this preregistered fixed sample only. Repeats share fixtures; fixture-cluster bootstrap intervals do not establish general model superiority or population confidence.",
+          "success_rate_difference_b_minus_a_95pct": null,
+          "median_wall_difference_b_minus_a_95pct": null,
+          "wall_effective_repetitions": 0
+        }
+      },
+      {
+        "arm_a": "race-and-apply",
+        "arm_b": "single-claude",
+        "planned_pairs": 24,
+        "paired_trials": 24,
+        "both_passed": 16,
+        "a_only_passed": 0,
+        "b_only_passed": 6,
+        "neither_passed": 2,
+        "success_rate_difference_b_minus_a": 0.25,
+        "both_passed_wall_seconds": {
+          "pairs": 16,
+          "measured_pairs": 16,
+          "median_a": 200.62866363150533,
+          "median_b": 24.150842375471257,
+          "median_difference_b_minus_a": -178.21106367453467
+        },
+        "fixture_cluster_bootstrap": {
+          "unit": "fixture",
+          "repetitions": 0,
+          "seed": 20261005,
+          "fixture_clusters": 12,
+          "wall_fixture_clusters": 8,
+          "interpretation": "Descriptive comparison of this preregistered fixed sample only. Repeats share fixtures; fixture-cluster bootstrap intervals do not establish general model superiority or population confidence.",
+          "success_rate_difference_b_minus_a_95pct": null,
+          "median_wall_difference_b_minus_a_95pct": null,
+          "wall_effective_repetitions": 0
+        }
+      },
+      {
+        "arm_a": "race-and-apply",
+        "arm_b": "single-codex",
+        "planned_pairs": 24,
+        "paired_trials": 24,
+        "both_passed": 16,
+        "a_only_passed": 0,
+        "b_only_passed": 6,
+        "neither_passed": 2,
+        "success_rate_difference_b_minus_a": 0.25,
+        "both_passed_wall_seconds": {
+          "pairs": 16,
+          "measured_pairs": 16,
+          "median_a": 200.62866363150533,
+          "median_b": 54.03113762056455,
+          "median_difference_b_minus_a": -143.31004104140447
+        },
+        "fixture_cluster_bootstrap": {
+          "unit": "fixture",
+          "repetitions": 0,
+          "seed": 20261005,
+          "fixture_clusters": 12,
+          "wall_fixture_clusters": 8,
+          "interpretation": "Descriptive comparison of this preregistered fixed sample only. Repeats share fixtures; fixture-cluster bootstrap intervals do not establish general model superiority or population confidence.",
+          "success_rate_difference_b_minus_a_95pct": null,
+          "median_wall_difference_b_minus_a_95pct": null,
+          "wall_effective_repetitions": 0
+        }
+      },
+      {
+        "arm_a": "single-claude",
+        "arm_b": "single-codex",
+        "planned_pairs": 24,
+        "paired_trials": 24,
+        "both_passed": 22,
+        "a_only_passed": 0,
+        "b_only_passed": 0,
+        "neither_passed": 2,
+        "success_rate_difference_b_minus_a": 0,
+        "both_passed_wall_seconds": {
+          "pairs": 22,
+          "measured_pairs": 22,
+          "median_a": 24.75147968553938,
+          "median_b": 60.361856610979885,
+          "median_difference_b_minus_a": 36.30113479151623
+        },
+        "fixture_cluster_bootstrap": {
+          "unit": "fixture",
+          "repetitions": 0,
+          "seed": 20261005,
+          "fixture_clusters": 12,
+          "wall_fixture_clusters": 11,
+          "interpretation": "Descriptive comparison of this preregistered fixed sample only. Repeats share fixtures; fixture-cluster bootstrap intervals do not establish general model superiority or population confidence.",
+          "success_rate_difference_b_minus_a_95pct": null,
+          "median_wall_difference_b_minus_a_95pct": null,
+          "wall_effective_repetitions": 0
+        }
+      }
+    ],
+    "input_binding": {
+      "phase_run_id": "979ae83efb974c699e99addda3b00234",
+      "plan_sha256": "8b8f7e7dad98ab5d8b7188ad1fa55d2795d67dc72ea24a19194463c4e7c57943",
+      "original_summary_sha256": "3b78c09c9a66e150e9d1789db4e3f7fb4ac34a2059fb2bed473ad041cbeadf94",
+      "result_hashes_exactly_match_all96_strict_trials": true,
+      "per_arm_strict_reconciliation": true,
+      "all_time_token_model_cost_risk_and_paired_fields_match_deterministic_raw_recomputation": true
+    },
+    "metrics_sha256": "1bd40b4dea6a24c9648e72c046bea979f34762be7ed361e061855cbaf48fa5d8",
+    "strict_validation_sha256": "2c3f1ca0f5b94abf7670fa91dba4fbdf360804ce0223543103f154106781c70f",
+    "scope": "Only96 formal trials; descriptive fixed fixtures, not general model superiority or a subscription invoice."
+  },
+  "calibrations": [
+    {
+      "phase": "initial",
+      "run_id": "51ba1a3ff4b544a9a7cdcaeb0c4c31f4",
+      "scope": "calibration_only_excluded_from_formal_comparison",
+      "metrics": {
+        "completed_trials": 3,
+        "accepted": 0,
+        "acceptance_rate": 0.0,
+        "outcomes": {
+          "other_failure": 3
+        },
+        "total_wall_seconds": {
+          "observed": 3,
+          "missing": 0,
+          "p50": 20.03414177300874,
+          "p95": 23.596285462961532
+        },
+        "generation_seconds": {
+          "observed": 3,
+          "missing": 0,
+          "p50": 19.58313480298966,
+          "p95": 23.176134377950802
+        },
+        "accepted_total_wall_seconds": {
+          "observed": 0,
+          "missing": 0,
+          "p50": null,
+          "p95": null
+        },
+        "accepted_generation_seconds": {
+          "observed": 0,
+          "missing": 0,
+          "p50": null,
+          "p95": null
+        },
+        "logical_dispatch_reservations": 3,
+        "dispatches_per_accepted_delivery": null,
+        "total_wall_seconds_per_accepted_delivery": null,
+        "observed_cli_invocations": 3,
+        "expected_dispatches_by_engine": {
+          "claude": 3
+        },
+        "observed_cli_records_by_engine": {
+          "claude": 3
+        },
+        "token_coverage": {
+          "expected_dispatches": 3,
+          "observed_cli_records": 3,
+          "measured_cli_records": 3,
+          "full_reservation_coverage": true
+        },
+        "observed_token_subtotals": {
+          "input_total": 193582,
+          "uncached_input": 24,
+          "cached_input": 161460,
+          "cache_creation": 32098,
+          "output": 4914
+        },
+        "fully_measured_token_totals": {
+          "input_total": 193582,
+          "uncached_input": 24,
+          "cached_input": 161460,
+          "cache_creation": 32098,
+          "output": 4914
+        },
+        "model_groups": [
+          {
+            "engine": "claude",
+            "model_identity_kind": "reported",
+            "model": "claude-sonnet-5-5",
+            "cli_records": 3,
+            "token_totals": {
+              "inputTokens": 24,
+              "outputTokens": 4914,
+              "cacheReadInputTokens": 161460,
+              "cacheCreationInputTokens": 32098
+            }
+          }
+        ],
+        "claude_client_reported_api_estimate": {
+          "total_usd": 0.387452,
+          "observed_subtotal_usd": 0.387452,
+          "expected_claude_dispatches": 3,
+          "measured_cli_records": 3,
+          "complete": true,
+          "usd_per_accepted_delivery": null
+        },
+        "codex_conditional_api_estimates": {
+          "short": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": null,
+            "expected_codex_dispatches": 0,
+            "measured_codex_records": 0,
+            "missing_records": 0,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          },
+          "long": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": null,
+            "expected_codex_dispatches": 0,
+            "measured_codex_records": 0,
+            "missing_records": 0,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          }
+        },
+        "actual_subscription_cash_cost_usd": null,
+        "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+      },
+      "input": "pilot-epoch2-independent-metrics/analysis.json"
+    },
+    {
+      "phase": "v2",
+      "run_id": "f96ada9a5a7e4edbb5b7e1cc8bb2928a",
+      "scope": "calibration_only_excluded_from_formal_comparison",
+      "metrics": {
+        "completed_trials": 3,
+        "accepted": 0,
+        "acceptance_rate": 0.0,
+        "outcomes": {
+          "unknown": 1,
+          "timeout": 1,
+          "other_failure": 1
+        },
+        "total_wall_seconds": {
+          "observed": 3,
+          "missing": 0,
+          "p50": 154.1745492129121,
+          "p95": 241.001570265973
+        },
+        "generation_seconds": {
+          "observed": 3,
+          "missing": 0,
+          "p50": 153.73037076706532,
+          "p95": 240.61783635395113
+        },
+        "accepted_total_wall_seconds": {
+          "observed": 0,
+          "missing": 0,
+          "p50": null,
+          "p95": null
+        },
+        "accepted_generation_seconds": {
+          "observed": 0,
+          "missing": 0,
+          "p50": null,
+          "p95": null
+        },
+        "logical_dispatch_reservations": 8,
+        "dispatches_per_accepted_delivery": null,
+        "total_wall_seconds_per_accepted_delivery": null,
+        "observed_cli_invocations": 7,
+        "expected_dispatches_by_engine": {
+          "claude": 4,
+          "codex": 4
+        },
+        "observed_cli_records_by_engine": {
+          "claude": 4,
+          "codex": 3
+        },
+        "token_coverage": {
+          "expected_dispatches": 8,
+          "observed_cli_records": 7,
+          "measured_cli_records": 7,
+          "full_reservation_coverage": false
+        },
+        "observed_token_subtotals": {
+          "input_total": 785688,
+          "uncached_input": 23880,
+          "cached_input": 672043,
+          "cache_creation": null,
+          "output": 16048
+        },
+        "fully_measured_token_totals": null,
+        "model_groups": [
+          {
+            "engine": "claude",
+            "model_identity_kind": "reported",
+            "model": "claude-sonnet-5-5",
+            "cli_records": 4,
+            "token_totals": {
+              "inputTokens": 26,
+              "outputTokens": 6097,
+              "cacheReadInputTokens": 444459,
+              "cacheCreationInputTokens": 89765
+            }
+          },
+          {
+            "engine": "codex",
+            "model_identity_kind": "requested_not_reported",
+            "model": "gpt-6-astra",
+            "cli_records": 3,
+            "token_totals": {
+              "input_tokens": 251438,
+              "cached_input_tokens": 227584,
+              "output_tokens": 9951
+            }
+          }
+        ],
+        "claude_client_reported_api_estimate": {
+          "total_usd": 0.9290558,
+          "observed_subtotal_usd": 0.9290558,
+          "expected_claude_dispatches": 4,
+          "measured_cli_records": 4,
+          "complete": true,
+          "usd_per_accepted_delivery": null
+        },
+        "codex_conditional_api_estimates": {
+          "short": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 0.9636739999999999,
+            "expected_codex_dispatches": 4,
+            "measured_codex_records": 3,
+            "missing_records": 1,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          },
+          "long": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 1.678573,
+            "expected_codex_dispatches": 4,
+            "measured_codex_records": 3,
+            "missing_records": 1,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          }
+        },
+        "actual_subscription_cash_cost_usd": null,
+        "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+      },
+      "input": "pilot-v2-independent-metrics/analysis.json"
+    },
+    {
+      "phase": "v3",
+      "run_id": "2aebfa6a27604f94ac5b3dba135673b7",
+      "scope": "calibration_only_excluded_from_formal_comparison",
+      "metrics": {
+        "completed_trials": 3,
+        "accepted": 1,
+        "acceptance_rate": 0.3333333333333333,
+        "outcomes": {
+          "timeout": 2,
+          "successful_delivery": 1
+        },
+        "total_wall_seconds": {
+          "observed": 3,
+          "missing": 0,
+          "p50": 240.9528729210142,
+          "p95": 241.08835069090128
+        },
+        "generation_seconds": {
+          "observed": 3,
+          "missing": 0,
+          "p50": 240.51465666899458,
+          "p95": 240.58243815600872
+        },
+        "accepted_total_wall_seconds": {
+          "observed": 1,
+          "missing": 0,
+          "p50": 211.8692435208941,
+          "p95": 211.8692435208941
+        },
+        "accepted_generation_seconds": {
+          "observed": 1,
+          "missing": 0,
+          "p50": 210.4657039529411,
+          "p95": 210.4657039529411
+        },
+        "logical_dispatch_reservations": 12,
+        "dispatches_per_accepted_delivery": 12.0,
+        "total_wall_seconds_per_accepted_delivery": 693.9104671328096,
+        "observed_cli_invocations": 10,
+        "expected_dispatches_by_engine": {
+          "claude": 6,
+          "codex": 6
+        },
+        "observed_cli_records_by_engine": {
+          "claude": 6,
+          "codex": 4
+        },
+        "token_coverage": {
+          "expected_dispatches": 12,
+          "observed_cli_records": 10,
+          "measured_cli_records": 10,
+          "full_reservation_coverage": false
+        },
+        "observed_token_subtotals": {
+          "input_total": 1151993,
+          "uncached_input": 42706,
+          "cached_input": 981629,
+          "cache_creation": null,
+          "output": 23184
+        },
+        "fully_measured_token_totals": null,
+        "model_groups": [
+          {
+            "engine": "claude",
+            "model_identity_kind": "reported",
+            "model": "claude-sonnet-5-5",
+            "cli_records": 6,
+            "token_totals": {
+              "inputTokens": 38,
+              "outputTokens": 8270,
+              "cacheReadInputTokens": 659581,
+              "cacheCreationInputTokens": 127658
+            }
+          },
+          {
+            "engine": "codex",
+            "model_identity_kind": "requested_not_reported",
+            "model": "gpt-6-astra",
+            "cli_records": 4,
+            "token_totals": {
+              "input_tokens": 364716,
+              "cached_input_tokens": 322048,
+              "output_tokens": 14914
+            }
+          }
+        ],
+        "claude_client_reported_api_estimate": {
+          "total_usd": 1.3187322,
+          "observed_subtotal_usd": 1.3187322,
+          "expected_claude_dispatches": 6,
+          "measured_cli_records": 6,
+          "complete": true,
+          "usd_per_accepted_delivery": 1.3187322
+        },
+        "codex_conditional_api_estimates": {
+          "short": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 1.494428,
+            "expected_codex_dispatches": 6,
+            "measured_codex_records": 4,
+            "missing_records": 2,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          },
+          "long": {
+            "estimated_total_usd": null,
+            "observed_estimate_subtotal_usd": 2.616006,
+            "expected_codex_dispatches": 6,
+            "measured_codex_records": 4,
+            "missing_records": 2,
+            "complete": false,
+            "estimated_usd_per_accepted_delivery": null
+          }
+        },
+        "actual_subscription_cash_cost_usd": null,
+        "actual_subscription_cash_cost_per_accepted_delivery_usd": null
+      },
+      "input": "pilot-v3-independent-metrics/analysis.json"
+    }
+  ],
+  "cost_accounting": {
+    "scope": "Accounting only across calibration and formal phases; quality/time populations remain separate. Failed dispatches remain included.",
+    "logical_dispatches_observed_phases": 199,
+    "observed_cli_records": 187,
+    "claude_cli_reported_api_estimate_observed_subtotal_usd": 21.14708,
+    "codex_conditional_api_estimate_observed_subtotals_usd": {
+      "short": 18.7601428,
+      "long": 32.7196206
+    },
+    "entire_session_api_equivalent_total_usd": null,
+    "actual_subscription_cash_cost_usd": null,
+    "actual_subscription_cash_cost_per_delivery_usd": null,
+    "complete_session_cost_known": false,
+    "uninstrumented_go_tokens": null,
+    "uninstrumented_go_cost_usd": null,
+    "reason": "Go CLI usage/cost is uninstrumented; missed CLI records remain unknown. Claude client estimates and Codex scenario estimates are different sources, never added into a measured bill."
+  },
+  "go_cli_demonstration": {
+    "scope": "Both Go demonstrations are excluded from96 and calibration comparison. Current V4 uses600seconds and no-auto-fix, different from formal240seconds.",
+    "prior_v3": {
+      "workflow_status": "timeout",
+      "actual_workflow_seconds": 240.5934169649845,
+      "applied_delivery_passed": false,
+      "posthoc_candidate_passed": true,
+      "posthoc_is_not_applied_acceptance": true,
+      "logical_dispatches_this_task": 4
+    },
+    "current_v4": {
+      "applied_delivery_passed": true,
+      "workflow_including_actual_apply_seconds": 116.04577357391827,
+      "external_acceptance_seconds": 0.8608523060102016,
+      "workflow_guard_seconds": 600,
+      "auto_fix": false,
+      "new_logical_dispatches": 2
+    },
+    "shared_go_ledger": {
+      "reserved": 7,
+      "maximum": 8,
+      "old_unknown_preserved": 1
+    },
+    "tokens": null,
+    "actual_subscription_cash_cost_usd": null,
+    "api_equivalent_cost_usd": null
+  },
+  "definitions": {
+    "time": "WallP50/P95 use nearest-rank quantiles, not the arithmetic midpoint median for an even sample. All-trial and accepted-only populations differ; adapter workflow and external acceptance are not nested-span sums.",
+    "paired_time": "Paired wall medians use statistics.median only on matched cases/repeats that both arms passed, not all trials; this survivor subset is not an overall speedup estimate.",
+    "uncertainty": "Twelve fixed fixtures with two repeats per arm support descriptive comparisons only. The analyzer uses bootstrap_repetitions=0, so bootstrap interval fields remain null; no population confidence interval is claimed.",
+    "cost": "All failed attempts remain in numerators. Zero accepted deliveries yields null cost-per-delivery.",
+    "coverage": "Complete token totals stay null unless coverage is complete; observed subtotals and missing counts remain visible.",
+    "estimates": "Claude CLI reported API estimate and Codex short/long conditional API tariffs are not subscription or marginal cash bills.",
+    "race_scheduling": "The observed race arm includes load-driven serial fallback. Its name does not establish uniform concurrent generation or pure parallel acceleration; total dispatch capacity is not an in-flight slot limit.",
+    "comparison": "Only96 fixed trials are compared; pilot stages and separate Go demonstrations with a600-second workflow guard are excluded, with no pooled success/latency statistic."
+  },
+  "inputs": {
+    "matrix-deep-config-first-race-backpressure-independent-review.json": {
+      "sha256": "6625db76f7029a2faca904fabd17aee7e383345eefcc30d4a42964e3be92e8ff",
+      "bytes": 18029
+    },
+    "matrix-deep-config-first-race-closed-failure-independent-review.json": {
+      "sha256": "1128d224d293c3603f4d79e7546cca9a2cf08634fb7e8a11a8047b8148228be0",
+      "bytes": 17753
+    },
+    "observer-v1-default-home-metadata-impact-review.json": {
+      "sha256": "46d6f4adc445eecf6ce127c98a40e609b14f2301bd127fa28739b88646b1c76e",
+      "bytes": 2925
+    },
+    "final-report-preparation-v2/default-home-metadata-followup.json": {
+      "sha256": "f348c3f0dc620b46a76299009db6b6e5513438620534a9e2044b8e2767be0ead",
+      "bytes": 1748
+    },
+    "observations-corrective/001.json": {
+      "sha256": "655dd872b59d63e6799ea8150f1a5add64ed84c0fcf3f1bb78ac1fd4c2db1dcc",
+      "bytes": 17032
+    },
+    "epoch2/hosted-ci-report.json": {
+      "sha256": "2801fdcc5d346af411eda10cc676484a40ae5e2e429b56670a5185fb78834688",
+      "bytes": 9975
+    },
+    "epoch3/source-inputs.json": {
+      "sha256": "3d07772c096b6753a81459d5e47cda396c36454f883650a2cdea8f9b21964ce5",
+      "bytes": 85508
+    },
+    "repo/benchmarks/analyze_results.py": {
+      "sha256": "27d38e838156f26e1d2e4ef22da69d4e289db300ec02673af1919362a060ba04",
+      "bytes": 24925
+    },
+    "epoch3/hosted-ci-report.json": {
+      "sha256": "176bc6f789fb5c6979aa98c6a02d73725c6e8e4dd66a29ba67917892bb572f81",
+      "bytes": 4653
+    },
+    "epoch3/hosted-closed-evidence-independent-review.json": {
+      "sha256": "2ec0be42676643f268205ee350b79ddc39472643f19facd948993c33ad2a9e4d",
+      "bytes": 28532
+    },
+    "analyze_live_metrics.py": {
+      "sha256": "e3eda9b7f5fa74d9884b600b12e22b02841cb2c8a81f42efe2bb3db0942aea69",
+      "bytes": 18299
+    },
+    "evaluation-plan/observed-precommit-v6.json": {
+      "sha256": "8ec708d24050c83be252806a39743947730fbb7cce7ee541674a2540d036b855",
+      "bytes": 7807
+    },
+    "api-tariff-scenarios.json": {
+      "sha256": "e8fc38033ce5567cadd9be7bad1bf86c9a90fc47f15704ccaddea6c9624481e9",
+      "bytes": 1756
+    },
+    "pilot-epoch2-independent-metrics/analysis.json": {
+      "sha256": "5cb9e5c9398c762f4b0e10f6ce44bf8ec8a91893c7f17b767d9923fa696d8c34",
+      "bytes": 18286
+    },
+    "pilot-v2-independent-metrics/analysis.json": {
+      "sha256": "0db22be25e212fcd95e35bacb6ef43fa19edf56c7cdb6d87a7f20c450c8b9b7b",
+      "bytes": 21026
+    },
+    "pilot-v3-independent-metrics/analysis.json": {
+      "sha256": "79be645b51e38d6d1ac563c92547b58f005ea3f2d038c86879a4a45486a4c595",
+      "bytes": 22163
+    },
+    "go-cli-e2e-v3-posthoc-analysis/verdict-and-budget-analysis.json": {
+      "sha256": "331d01b123b0a69ad37407f98efec956a36e1e41f70112f8f02745142669ae5a",
+      "bytes": 3653
+    },
+    "go-cli-e2e-final-v4/workflow-report.json": {
+      "sha256": "c69b78e9aa0250a462863bc1789668c168b4177eff31f063a5a3ff371ecb407b",
+      "bytes": 507389
+    },
+    "go-cli-final-v4-independent-actual-complete-task-review.json": {
+      "sha256": "39db7ec865f557770885f6f98480e6d64d5e54cdb3d0ef1cf4d59dbeac7471a1",
+      "bytes": 3166
+    },
+    "evaluation-plan/observed-matrix-protocol-v3-dry-plan.json": {
+      "sha256": "573b8263b0d11b19812b2bfddcae6c59e03aa5dbb4300059aad0dff923d308ab",
+      "bytes": 36668
+    },
+    "formal_phase_plan": {
+      "sha256": "8b8f7e7dad98ab5d8b7188ad1fa55d2795d67dc72ea24a19194463c4e7c57943",
+      "bytes": 37006
+    },
+    "formal_original_summary": {
+      "sha256": "3b78c09c9a66e150e9d1789db4e3f7fb4ac34a2059fb2bed473ad041cbeadf94",
+      "bytes": 6488
+    },
+    "formal_metrics": {
+      "sha256": "1bd40b4dea6a24c9648e72c046bea979f34762be7ed361e061855cbaf48fa5d8",
+      "bytes": 150517
+    },
+    "formal_strict_validation": {
+      "sha256": "2c3f1ca0f5b94abf7670fa91dba4fbdf360804ce0223543103f154106781c70f",
+      "bytes": 196615
+    }
+  },
+  "raw_prompts_or_responses_included": false,
+  "new_model_or_account_calls": 0
+}

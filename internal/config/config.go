@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -19,10 +20,13 @@ type Config struct {
 	APIPolicy string `json:"api_policy,omitempty"`
 
 	// Model API keys
-	ClaudeAPIKey string `json:"claude_api_key,omitempty"`
-	GeminiAPIKey string `json:"gemini_api_key,omitempty"`
-	OpenAIAPIKey string `json:"openai_api_key,omitempty"`
-	OllamaURL    string `json:"ollama_url,omitempty"`
+	ClaudeAPIKey  string `json:"claude_api_key,omitempty"`
+	GeminiAPIKey  string `json:"gemini_api_key,omitempty"`
+	OpenAIAPIKey  string `json:"openai_api_key,omitempty"`
+	ClaudeBaseURL string `json:"claude_base_url,omitempty"`
+	GeminiBaseURL string `json:"gemini_base_url,omitempty"`
+	OpenAIBaseURL string `json:"openai_base_url,omitempty"`
+	OllamaURL     string `json:"ollama_url,omitempty"`
 
 	// Default model for different tasks
 	DefaultModel  string `json:"default_model,omitempty"`
@@ -71,9 +75,19 @@ type Config struct {
 	// command-line adapters without changing makewand source code.
 	CustomProviders []CustomProvider `json:"custom_providers,omitempty"`
 
-	// envSourcedKeys tracks which API keys came from environment variables
-	// so they are not persisted to disk.
-	envSourcedKeys map[string]bool
+	// Provider controls are read by both engines but owned by the Python
+	// frontend. Save preserves the latest disk values instead of this snapshot.
+	EnabledProviders  map[string]bool `json:"-"`
+	ActiveProviders   []string        `json:"-"`
+	LocalModelEnabled *bool           `json:"-"`
+
+	// envSourcedKeys tracks keys resolved from the environment or api_keys.json
+	// so they are not copied into config.json.
+	envSourcedKeys    map[string]bool
+	externalAPIFields map[string]apiFieldSource
+	// An invalid policy remains locked even if a caller ignores Load's error or
+	// environment switches otherwise enable a provider.
+	policyLoadErr error
 }
 
 // CLITool represents a detected subscription CLI tool.
@@ -147,6 +161,9 @@ func NormalizeAPIPolicy(policy string) string {
 // EffectiveAPIPolicy gives an explicit environment override precedence over
 // configuration. Even a misspelled/empty override disables direct API spend.
 func (c *Config) EffectiveAPIPolicy() string {
+	if c != nil && c.policyLoadErr != nil {
+		return APIPolicySubscriptionOnly
+	}
 	if policy, present := os.LookupEnv("MAKEWAND_API_POLICY"); present {
 		return NormalizeAPIPolicy(policy)
 	}
@@ -273,12 +290,12 @@ func ConfigPath() (string, error) {
 // LoadOptions controls optional behavior of config loading.
 type LoadOptions struct {
 	// SkipCLIDetection disables probing the system for installed subscription
-	// CLI tools (the `claude/gemini/codex/agy --version` execs in detectCLIs).
+	// CLI tools (the `claude/gemini/codex/agy --version` execs in detectEnabledCLIs).
 	// Untrusted-repository mode sets this: those probes inherit the process
 	// working directory (the untrusted repo) where a CLI may load project
 	// config, and untrusted mode only ever uses direct API providers anyway, so
 	// probing local CLIs is both unnecessary and unsafe. The trusted default
-	// (Load) leaves detection on and is byte-for-byte unchanged.
+	// (Load) leaves detection on when the execution policy is valid.
 	SkipCLIDetection bool
 }
 
@@ -292,44 +309,34 @@ func Load() (*Config, error) {
 // LoadOptions for the available knobs. Load() is LoadWithOptions(LoadOptions{}).
 func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	cfg := DefaultConfig()
-	var loadErr error
 
 	path, err := ConfigPath()
-	if err == nil {
-		data, readErr := os.ReadFile(path)
-		if readErr == nil {
-			if err := json.Unmarshal(data, cfg); err != nil {
-				// Keep defaults on parse failure, but continue with env/CLI discovery.
-				cfg = DefaultConfig()
-				loadErr = fmt.Errorf("parse config: %w", err)
-			}
-		} else if !os.IsNotExist(readErr) {
-			loadErr = fmt.Errorf("read config: %w", readErr)
+	if err != nil {
+		return invalidPolicyConfig(fmt.Errorf("resolve config path: %w", err))
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr == nil {
+		if err := validateJSONObject(data); err != nil {
+			return invalidPolicyConfig(fmt.Errorf("parse config: %w", err))
 		}
-	} else {
-		loadErr = fmt.Errorf("resolve config path: %w", err)
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return invalidPolicyConfig(fmt.Errorf("parse config: %w", err))
+		}
+		if err := cfg.loadProviderControls(data); err != nil {
+			return invalidPolicyConfig(fmt.Errorf("invalid provider controls: %w", err))
+		}
+	} else if !os.IsNotExist(readErr) {
+		return invalidPolicyConfig(fmt.Errorf("read config: %w", readErr))
 	}
 
-	// Override with environment variables (track which keys came from env)
-	cfg.envSourcedKeys = make(map[string]bool)
-	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-		cfg.ClaudeAPIKey = key
-		cfg.envSourcedKeys["claude"] = true
-	}
-	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
-		cfg.GeminiAPIKey = key
-		cfg.envSourcedKeys["gemini"] = true
-	}
-	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-		cfg.OpenAIAPIKey = key
-		cfg.envSourcedKeys["openai"] = true
-	}
+	// Shared precedence: explicit environment > api_keys.json > config.json.
+	loadErr := cfg.loadSharedAPIConfig(path)
 
 	// Auto-detect installed CLI tools. Skipped in untrusted-repository mode so we
 	// never exec a local CLI (its `--version` probe) inside an untrusted working
 	// directory; only direct API providers are used in that mode.
 	if !opts.SkipCLIDetection {
-		cfg.CLIs = detectCLIs()
+		cfg.CLIs = detectEnabledCLIs(cfg)
 	}
 	cfg.APIPolicy = NormalizeAPIPolicy(cfg.APIPolicy)
 	cfg.UsageMode = NormalizeUsageMode(cfg.UsageMode)
@@ -362,6 +369,9 @@ func Save(cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("cannot save nil config")
 	}
+	if cfg.policyLoadErr != nil {
+		return fmt.Errorf("cannot save invalid configuration: %w", cfg.policyLoadErr)
+	}
 	path, err := ConfigPath()
 	if err != nil {
 		return err
@@ -369,6 +379,7 @@ func Save(cfg *Config) error {
 
 	// Create a copy that strips env-sourced keys
 	toSave := *cfg
+	toSave.restoreExternalAPIFields()
 	toSave.APIPolicy = NormalizeAPIPolicy(toSave.APIPolicy)
 	toSave.UsageMode = NormalizeUsageMode(toSave.UsageMode)
 	toSave.ApprovalMode = NormalizeApprovalMode(toSave.ApprovalMode)
@@ -388,6 +399,9 @@ func Save(cfg *Config) error {
 	// frontend may have changed its own fields while this Go process was open.
 	merged := make(map[string]json.RawMessage)
 	if existing, err := os.ReadFile(path); err == nil {
+		if err := validateJSONObject(existing); err != nil {
+			return fmt.Errorf("preserve existing config: %w", err)
+		}
 		if err := json.Unmarshal(existing, &merged); err != nil {
 			return fmt.Errorf("preserve existing config: %w", err)
 		}
@@ -437,6 +451,9 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	if err := validateProviderControls(data); err != nil {
+		return fmt.Errorf("cannot save invalid provider controls: %w", err)
+	}
 
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.json")
 	if err != nil {
@@ -455,10 +472,18 @@ func Save(cfg *Config) error {
 
 // HasAnyModel returns true if at least one model is configured (API key or CLI tool).
 func (c *Config) HasAnyModel() bool {
-	if len(c.CLIs) > 0 || c.PaidAPIAllowed() && (c.ClaudeAPIKey != "" || c.GeminiAPIKey != "" || c.OpenAIAPIKey != "") {
+	for _, cli := range c.CLIs {
+		if c.IsProviderEnabled(cli.Name) {
+			return true
+		}
+	}
+	if c.PaidAPIAllowed() && (c.IsProviderEnabled("claude") && c.ClaudeAPIKey != "" || c.IsProviderEnabled("gemini") && c.GeminiAPIKey != "" || c.IsProviderEnabled("openai") && c.OpenAIAPIKey != "") {
 		return true
 	}
 	for _, cp := range c.CustomProviders {
+		if !c.IsProviderEnabled(cp.Name) {
+			continue
+		}
 		if strings.EqualFold(strings.TrimSpace(cp.Access), "api") && !c.PaidAPIAllowed() {
 			continue
 		}
@@ -486,12 +511,47 @@ func IsCustomProviderUsable(cp CustomProvider) bool {
 		if err != nil || info.IsDir() {
 			return false
 		}
+		// Windows does not expose POSIX execute bits. Apply its native
+		// executable-extension lookup without executing a provider probe.
+		if runtime.GOOS == "windows" {
+			resolved, err := exec.LookPath(command)
+			return err == nil && hasWindowsExecutableExtension(resolved)
+		}
 		return info.Mode()&0o111 != 0
 	}
 
 	// Bare executable name must resolve from PATH.
-	_, err := exec.LookPath(command)
-	return err == nil
+	resolved, err := exec.LookPath(command)
+	if err != nil {
+		return false
+	}
+	return runtime.GOOS != "windows" || hasWindowsExecutableExtension(resolved)
+}
+
+// LookPath also returns an existing ordinary file when its name already has
+// an extension on Windows. Check PATHEXT separately before advertising it as
+// a usable command, without executing a provider availability probe.
+func hasWindowsExecutableExtension(path string) bool {
+	ext := filepath.Ext(path)
+	if ext == "" {
+		return false
+	}
+	pathExt := os.Getenv("PATHEXT")
+	if pathExt == "" {
+		pathExt = ".COM;.EXE;.BAT;.CMD"
+	}
+	for _, allowed := range strings.Split(pathExt, ";") {
+		if allowed == "" {
+			continue
+		}
+		if !strings.HasPrefix(allowed, ".") {
+			allowed = "." + allowed
+		}
+		if strings.EqualFold(ext, allowed) {
+			return true
+		}
+	}
+	return false
 }
 
 // EffectiveCustomProviderPromptMode normalizes prompt delivery mode.
@@ -530,6 +590,9 @@ func CustomProviderUsesShellAdapter(cp CustomProvider) bool {
 
 // HasCLI returns true if a specific CLI tool was detected.
 func (c *Config) HasCLI(name string) bool {
+	if !c.IsProviderEnabled(name) {
+		return false
+	}
 	for _, cli := range c.CLIs {
 		if cli.Name == name {
 			return true
@@ -540,6 +603,9 @@ func (c *Config) HasCLI(name string) bool {
 
 // GetCLI returns the CLI info for a given name, or nil if not found.
 func (c *Config) GetCLI(name string) *CLITool {
+	if !c.IsProviderEnabled(name) {
+		return nil
+	}
 	for i := range c.CLIs {
 		if c.CLIs[i].Name == name {
 			return &c.CLIs[i]
@@ -548,8 +614,9 @@ func (c *Config) GetCLI(name string) *CLITool {
 	return nil
 }
 
-// detectCLIs probes the system for installed subscription CLI tools.
-func detectCLIs() []CLITool {
+// detectEnabledCLIs probes enabled subscription CLI tools, skipping disabled
+// providers before PATH lookup or execution of their version commands.
+func detectEnabledCLIs(cfg *Config) []CLITool {
 	type probe struct {
 		name    string
 		bin     string
@@ -566,6 +633,9 @@ func detectCLIs() []CLITool {
 
 	var results []CLITool
 	for _, p := range probes {
+		if !cfg.IsProviderEnabled(p.name) {
+			continue
+		}
 		binPath, err := exec.LookPath(p.bin)
 		if err != nil {
 			continue

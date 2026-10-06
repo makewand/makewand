@@ -5,14 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 func readTestLedger(t *testing.T, path string) map[string]any {
@@ -180,6 +184,13 @@ func TestLedgerRejectsOversizedFileBeforeDispatch(t *testing.T) {
 
 func pythonCommand(t *testing.T, code string, args ...string) *exec.Cmd {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	t.Cleanup(cancel)
+	return pythonCommandWithContext(t, ctx, code, args...)
+}
+
+func pythonCommandWithContext(t *testing.T, ctx context.Context, code string, args ...string) *exec.Cmd {
+	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skip("Python 3 unavailable")
@@ -189,8 +200,6 @@ func pythonCommand(t *testing.T, code string, args ...string) *exec.Cmd {
 		t.Fatal(err)
 	}
 	argv := append([]string{"-I", "-c", "import sys; sys.path.insert(0,sys.argv[1]); " + code, repo}, args...)
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	t.Cleanup(cancel)
 	// #nosec G204 G702 -- executable is the local Python interpreter; program text is fixed by this synthetic test, never model/user code.
 	return exec.CommandContext(ctx, python, argv...)
 }
@@ -199,7 +208,14 @@ func TestLedgerProcessHelper(t *testing.T) {
 	if os.Getenv("MAKEWAND_LEDGER_TEST_HELPER") != "1" {
 		return
 	}
+	admissionCtx := t.Context()
 	if barrier := os.Getenv("MAKEWAND_LEDGER_TEST_BARRIER"); barrier != "" {
+		if ready := os.Getenv("MAKEWAND_LEDGER_TEST_READY"); ready != "" {
+			// #nosec G703 -- parent-created fixture handshake path, never external input.
+			if err := os.WriteFile(ready, []byte("ready"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		for {
 			// #nosec G703 -- barrier is a parent test-created temporary synchronization file inherited only by this fixed self-test helper.
 			if _, err := os.Stat(barrier); err == nil {
@@ -210,20 +226,49 @@ func TestLedgerProcessHelper(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-	}
-	for range 20 {
-		attempt, err := Reserve(context.Background(), Metadata{Engine: "go-synthetic", Tier: "standard"})
-		if errors.Is(err, ErrBudgetExhausted) {
-			continue
-		}
+		// Both languages derive their admission context from this same release
+		// deadline. Completion still uses its independent production 5s bound.
+		deadlinePath := os.Getenv("MAKEWAND_LEDGER_TEST_DEADLINE")
+		// #nosec G703 -- parent-created deadline file inherited only by this owned helper.
+		deadlineBytes, err := os.ReadFile(deadlinePath)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := attempt.Complete(Outcome{Status: Unknown, Known: false}); err != nil {
+		deadlineMS, err := strconv.ParseInt(strings.TrimSpace(string(deadlineBytes)), 10, 64)
+		if err != nil {
 			t.Fatal(err)
 		}
+		var stopAdmission context.CancelFunc
+		admissionCtx, stopAdmission = context.WithDeadline(t.Context(), time.UnixMilli(deadlineMS))
+		defer stopAdmission()
+	}
+	workerStarted := time.Now()
+	var maxReserve, maxComplete time.Duration
+	admitted, exhausted := 0, 0
+	for step := range 20 {
+		reserveStarted := time.Now()
+		attempt, err := Reserve(admissionCtx, Metadata{Engine: "go-synthetic", Tier: "standard"})
+		reserveElapsed := time.Since(reserveStarted)
+		maxReserve = max(maxReserve, reserveElapsed)
+		if errors.Is(err, ErrBudgetExhausted) {
+			exhausted++
+			// All competing fixture attempts yield equally, including rejections;
+			// the test asserts shared accounting, rather than hot-loop throughput.
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatalf("worker reserve step=%d elapsed=%v workflow_elapsed=%v context=%v: %v", step, reserveElapsed, time.Since(workerStarted), admissionCtx.Err(), err)
+		}
+		admitted++
+		completeStarted := time.Now()
+		if err := attempt.Complete(Outcome{Status: Unknown, Known: false}); err != nil {
+			t.Fatalf("worker complete step=%d elapsed=%v workflow_elapsed=%v: %v", step, time.Since(completeStarted), time.Since(workerStarted), err)
+		}
+		maxComplete = max(maxComplete, time.Since(completeStarted))
 		time.Sleep(5 * time.Millisecond)
 	}
+	fmt.Printf("mixed-ledger-worker operations=20 admitted=%d exhausted=%d max_reserve=%v max_complete=%v workflow_elapsed=%v\n", admitted, exhausted, maxReserve, maxComplete, time.Since(workerStarted))
 }
 
 func TestMixedGoPythonProcessesShareHardLimit(t *testing.T) {
@@ -233,39 +278,123 @@ func TestMixedGoPythonProcessesShareHardLimit(t *testing.T) {
 	t.Setenv("MAKEWAND_TASK_ID", "mixed-process-test")
 	t.Setenv("MAKEWAND_EXECUTION_EVENTS_FILE", "")
 	t.Setenv("MAKEWAND_CALL_BUDGET_LEASE_ID", "")
-	initial, err := Reserve(context.Background(), Metadata{Engine: "go-synthetic", Tier: "standard"})
+	initialCtx, stopInitial := context.WithTimeout(t.Context(), 30*time.Second)
+	defer stopInitial()
+	initial, err := Reserve(initialCtx, Metadata{Engine: "go-synthetic", Tier: "standard"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := initial.Complete(Outcome{Status: Unknown, Known: false}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pythonCommand(t, "from makewand import call_budget as b; a=b.reserve('python-synthetic','standard'); b.complete(a,False,0,result_status='UNKNOWN',outcome_known=False)").Output(); err != nil {
+	if _, err := pythonCommand(t, "import time; from makewand import call_budget as b; a=b.reserve('python-synthetic','standard',deadline_monotonic=time.monotonic()+30); b.complete(a,False,0,result_status='UNKNOWN',outcome_known=False)").Output(); err != nil {
 		t.Fatal(err)
 	}
 	var commands []*exec.Cmd
 	barrier := filepath.Join(t.TempDir(), "start")
-	for range 4 {
-		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-		t.Cleanup(cancel)
+	deadlinePath := filepath.Join(filepath.Dir(barrier), "deadline-unix-ms")
+	pythonWorker := `import json,os,time
+from makewand import call_budget as b
+with open(sys.argv[3],'w') as ready: ready.write('ready')
+while not os.path.exists(sys.argv[2]): time.sleep(.005)
+with open(sys.argv[4]) as deadline_file: deadline_unix_ms=int(deadline_file.read())
+deadline=time.monotonic()+max(0,deadline_unix_ms/1000-time.time())
+started=time.monotonic()
+admitted=exhausted=0
+max_reserve=max_complete=0
+for step in range(20):
+ reserve_started=time.monotonic()
+ try:
+  a=b.reserve('python-synthetic','standard',deadline_monotonic=deadline)
+ except b.BudgetError as error:
+  reserve_elapsed=time.monotonic()-reserve_started
+  if not str(error).startswith('model task budget exhausted ('):
+   raise RuntimeError(f'worker reserve step={step} elapsed={time.monotonic()-reserve_started:.6f} workflow_elapsed={time.monotonic()-started:.6f} deadline_remaining={deadline-time.monotonic():.6f}') from error
+  exhausted+=1
+ else:
+  reserve_elapsed=time.monotonic()-reserve_started
+  admitted+=1
+  complete_started=time.monotonic()
+  try:
+   b.complete(a,False,0,result_status='UNKNOWN',outcome_known=False)
+  except Exception as error:
+   raise RuntimeError(f'worker complete step={step} elapsed={time.monotonic()-complete_started:.6f} workflow_elapsed={time.monotonic()-started:.6f}') from error
+  max_complete=max(max_complete,time.monotonic()-complete_started)
+ max_reserve=max(max_reserve,reserve_elapsed)
+ time.sleep(.005)
+print('mixed-ledger-worker '+json.dumps(dict(operations=20,admitted=admitted,exhausted=exhausted,max_reserve_seconds=max_reserve,max_complete_seconds=max_complete,workflow_elapsed_seconds=time.monotonic()-started)),flush=True)
+`
+	// This bounds initialization plus 160 competing ledger operations. It is
+	// a fixture guard, not a model-call deadline or a throughput requirement.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	var readyFiles []string
+	for i := range 4 {
+		goReady := filepath.Join(filepath.Dir(barrier), fmt.Sprintf("go-%d.ready", i))
+		pythonReady := filepath.Join(filepath.Dir(barrier), fmt.Sprintf("python-%d.ready", i))
 		// #nosec G204 G702 -- runs this Go test binary with a fixed helper test, never an arbitrary repository/model executable.
 		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLedgerProcessHelper$")
-		cmd.Env = append(os.Environ(), "MAKEWAND_LEDGER_TEST_HELPER=1", "MAKEWAND_LEDGER_TEST_BARRIER="+barrier)
-		commands = append(commands, cmd, pythonCommand(t, "import os,time\nfrom makewand import call_budget as b\nwhile not os.path.exists(sys.argv[2]): time.sleep(.005)\nfor _ in range(20):\n try:\n  a=b.reserve('python-synthetic','standard'); b.complete(a,False,0,result_status='UNKNOWN',outcome_known=False); time.sleep(.005)\n except b.BudgetError:\n  pass", barrier))
+		cmd.Env = append(os.Environ(), "MAKEWAND_LEDGER_TEST_HELPER=1", "MAKEWAND_LEDGER_TEST_BARRIER="+barrier, "MAKEWAND_LEDGER_TEST_READY="+goReady, "MAKEWAND_LEDGER_TEST_DEADLINE="+deadlinePath)
+		commands = append(commands, cmd, pythonCommandWithContext(t, ctx, pythonWorker, barrier, pythonReady, deadlinePath))
+		readyFiles = append(readyFiles, goReady, pythonReady)
 	}
+	var diagnostics []*processjob.Capture
+	startedCommands := 0
+	waited := make(map[*exec.Cmd]bool)
+	defer func() {
+		cancel()
+		for _, cmd := range commands[:startedCommands] {
+			if !waited[cmd] {
+				_ = cmd.Wait()
+			}
+		}
+	}()
 	for _, cmd := range commands {
+		capture := processjob.NewCapture(16<<10, nil)
+		cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
+		diagnostics = append(diagnostics, capture)
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
+		startedCommands++
 	}
-	time.Sleep(200 * time.Millisecond)
+	readyCtx, stopReady := context.WithTimeout(ctx, 30*time.Second)
+	defer stopReady()
+	for i, ready := range readyFiles {
+		for {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			select {
+			case <-readyCtx.Done():
+				t.Fatalf("worker %d did not reach the shared start barrier: %v stdout=%q stderr=%q", i, readyCtx.Err(), diagnostics[i].StdoutString(), diagnostics[i].StderrString())
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}
+	stopReady()
+	// The 160 operations share an actual caller deadline starting after all
+	// eight workers are ready; this is separate from the 30s initialization
+	// and 2min outer process guards. No worker is serialized by the fixture.
+	admissionDeadline := time.Now().Add(30 * time.Second)
+	if err := os.WriteFile(deadlinePath, []byte(strconv.FormatInt(admissionDeadline.UnixMilli(), 10)), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(barrier, []byte("start"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	for _, cmd := range commands {
-		if err := cmd.Wait(); err != nil {
-			t.Fatal(err)
+	for i, cmd := range commands {
+		err := cmd.Wait()
+		waited[cmd] = true
+		t.Logf("worker %d finished with error=%v guard=%v stdout=%q stderr=%q", i, err, ctx.Err(), diagnostics[i].StdoutString(), diagnostics[i].StderrString())
+		if err != nil {
+			t.Fatalf("worker %d failed: %v guard=%v stdout=%q stderr=%q", i, err, ctx.Err(), diagnostics[i].StdoutString(), diagnostics[i].StderrString())
 		}
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("mixed-language workload depended on the fixture guard: %v", ctx.Err())
 	}
 	ledger := readTestLedger(t, path)
 	if attempts := ledger["attempts"].([]any); len(attempts) != 13 {
@@ -273,7 +402,11 @@ func TestMixedGoPythonProcessesShareHardLimit(t *testing.T) {
 	}
 	engines := make(map[string]bool)
 	for _, raw := range ledger["attempts"].([]any) {
-		engines[raw.(map[string]any)["engine"].(string)] = true
+		entry := raw.(map[string]any)
+		engines[entry["engine"].(string)] = true
+		if entry["status"] != "completed" || entry["result_status"] != "UNKNOWN" || entry["outcome_known"] != false {
+			t.Fatalf("mixed-language attempt lost its terminal outcome: %+v", entry)
+		}
 	}
 	if !engines["go-synthetic"] || !engines["python-synthetic"] {
 		t.Fatalf("mixed test did not dispatch both languages: %v", engines)

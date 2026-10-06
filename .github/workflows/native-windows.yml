@@ -1,0 +1,69 @@
+name: Native Windows release gate
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A local reusable call uses the caller's commit, including a release tag.
+# No secrets, artifacts from another run, or elevated token permissions enter it.
+# Do not add caller-derived concurrency here: it can cancel the calling job.
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - name: Preserve LF source bytes before checkout
+        # Git for Windows enables autocrlf in runner configuration. The gate
+        # disables ambient Git configuration, so checkout must already preserve
+        # committed LF bytes. Configure this ephemeral runner before checkout;
+        # keep all subsequent clean-source checks strict.
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install MinGW-w64 compiler for the real Windows race detector
+        id: msys2
+        # Official MSYS2 action, immutable v2 revision.
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Expose the native compiler and real Python alias
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compilerDir = Join-Path $env:MSYS2_LOCATION 'ucrt64\bin'
+          if (!(Test-Path (Join-Path $compilerDir 'gcc.exe'))) { throw 'Native MinGW-w64 GCC is missing' }
+          $compilerDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $pythonExe = (Get-Command python).Source
+          $pythonAlias = Join-Path (Split-Path $pythonExe) 'python3.exe'
+          if (!(Test-Path $pythonAlias)) { Copy-Item $pythonExe $pythonAlias }
+          if ((Get-FileHash $pythonExe).Hash -ne (Get-FileHash $pythonAlias).Hash) { throw 'python3 must be the same real interpreter' }
+      - name: Native contracts and every Windows Go package under race
+        shell: pwsh
+        env:
+          CGO_ENABLED: '1'
+          CC: gcc
+        run: python -I scripts/windows_test_gate.py --output build/native-windows-verification --expected-sha "$env:GITHUB_SHA"
+      - name: Preserve raw logs, explicit skips and commit-bound results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/native-windows-verification
+          if-no-files-found: error
+          retention-days: 14

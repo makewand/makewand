@@ -1137,6 +1137,15 @@ def _plan_native_go_delegation(argv: List[str]) -> Optional[List[str]]:
 
 
 def main():
+    from makewand.config import ConfigError
+    try:
+        return _main()
+    except ConfigError as error:
+        print(f"makewand: configuration error: {error}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE_ERROR) from None
+
+
+def _main():
     original_cwd = os.getcwd()
     inherited_budget_file = os.environ.get("MAKEWAND_CALL_BUDGET_FILE")
     inherited_maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
@@ -1465,6 +1474,11 @@ def main():
             is_auto_routed_run = True
 
     args = parser.parse_args()
+    # Validate policy before discovery, daemon dispatch or orchestration.
+    # Those paths may catch transport errors, so policy validity must already
+    # be established before any provider can be started.
+    from makewand.config import load_user_config
+    load_user_config()
     declared_protection = (getattr(args, "global_protected_paths", None) or []) + (getattr(args, "protected_paths", None) or [])
     args.protected_paths = declared_protection or None
     if args.protected_paths and args.subcommand not in ("run", "race", "apply"):

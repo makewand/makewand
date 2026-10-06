@@ -29,14 +29,15 @@ func TestHeadlessSelectionNotices(t *testing.T) {
 	}
 }
 
-// arch-product#10: the root help must not advertise autopilot as automatic.
+// Automatic application requires configured independent acceptance; local
+// checks alone still require approval.
 func TestRootHelpExplainsAutopilotLimit(t *testing.T) {
 	root := newRootCmd()
-	if !strings.Contains(root.Long, "Strength 2") || !strings.Contains(root.Long, "always asks before writing") {
-		t.Fatalf("root help does not explain that autopilot still asks before applying:\n%s", root.Long)
+	if !strings.Contains(root.Long, "MAKEWAND_TRUSTED_ACCEPTANCE_FILE") || !strings.Contains(root.Long, "Strength 1 and still ask") {
+		t.Fatalf("root help does not explain independent acceptance and local approval:\n%s", root.Long)
 	}
 	flag := root.PersistentFlags().Lookup("approval")
-	if flag == nil || !strings.Contains(flag.Usage, "still asks") {
+	if flag == nil || !strings.Contains(flag.Usage, "configured independent Strength-2 acceptance") || !strings.Contains(flag.Usage, "otherwise still asks") {
 		t.Fatalf("--approval usage does not explain the autopilot limit: %+v", flag)
 	}
 }

@@ -100,146 +100,173 @@ def ensure_config_dir():
 API_KEYS_FILE = CONFIG_DIR / "api_keys.json"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+class ConfigError(ValueError):
+    """An existing execution-policy or credentials file cannot be decoded."""
+
+
+def _load_json_object(path: Path) -> dict:
+    import json
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            value = json.load(stream)
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ConfigError(f"could not load {path.name}: {error}") from error
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path.name} must contain a JSON object")
+    return value
+
+
+def _validate_provider_controls(value: dict) -> None:
+    """Authorization fields accept only their declared types or whole-field null."""
+    enabled = value.get("enabled_providers")
+    if enabled is not None and (not isinstance(enabled, dict)
+                                or any(not isinstance(name, str) or not isinstance(flag, bool)
+                                       for name, flag in enabled.items())):
+        raise ConfigError("enabled_providers must be an object of booleans")
+    active = value.get("active_providers")
+    if active is not None and (not isinstance(active, list)
+                               or any(not isinstance(name, str) for name in active)):
+        raise ConfigError("active_providers must be an array of strings")
+    local = value.get("local_model_enabled")
+    if local is not None and not isinstance(local, bool):
+        raise ConfigError("local_model_enabled must be a boolean")
+
+
 def load_user_config() -> dict:
-    """Loads ~/.config/makewand/config.json."""
-    if CONFIG_FILE.exists():
-        try:
-            import json
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    """Load policy; only a missing optional file permits normal defaults."""
+    value = _load_json_object(CONFIG_FILE)
+    _validate_provider_controls(value)
+    return value
+
+
+_credential_warnings = set()
 
 def load_api_keys() -> dict:
-    """Loads ~/.config/makewand/api_keys.json."""
-    if API_KEYS_FILE.exists():
+    """An invalid optional source warns, while environment fields still resolve."""
+    try:
         try:
-            try:
-                os.chmod(API_KEYS_FILE, 0o600)
-            except Exception:
-                pass
-            import json
-            with open(API_KEYS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+            os.chmod(API_KEYS_FILE, 0o600)
+        except OSError:
             pass
-    return {}
+        return _load_json_object(API_KEYS_FILE)
+    except ConfigError as error:
+        warning = (str(API_KEYS_FILE), str(error))
+        if warning not in _credential_warnings:
+            print(f"Warning: {error}; ignoring this optional credentials source", file=sys.stderr)
+            _credential_warnings.add(warning)
+        return {}
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    """Replace a complete private file; every pre-replace failure preserves it."""
+    import json
+    import tempfile
+    data = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            if os.name != "nt":
+                os.fchmod(stream.fileno(), 0o600)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 def save_api_key(provider: str, api_key: str, base_url: str = None, model: str = None) -> bool:
     """Saves API configuration for a provider into api_keys.json."""
-    ensure_config_dir()
-    keys = load_api_keys()
-    p = provider.lower().strip()
-    if p not in keys:
-        keys[p] = {}
-    keys[p]["api_key"] = api_key
-    if base_url:
-        keys[p]["base_url"] = base_url
-    if model:
-        keys[p]["model"] = model
     try:
-        import json
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        mode = 0o600
-        fd = os.open(API_KEYS_FILE, flags, mode)
-        with open(fd, "w", encoding="utf-8") as f:
-            json.dump(keys, f, ensure_ascii=False, indent=2)
-        try:
-            os.chmod(API_KEYS_FILE, 0o600)
-        except Exception:
-            pass
+        # Saving is stricter than optional-source reads: never replace an
+        # unreadable old credentials document with an empty fallback.
+        keys = _load_json_object(API_KEYS_FILE)
+        p = provider.lower().strip()
+        fields = keys.get(p)
+        keys[p] = dict(fields) if isinstance(fields, dict) else {}
+        keys[p]["api_key"] = api_key
+        if base_url:
+            keys[p]["base_url"] = base_url
+        if model:
+            keys[p]["model"] = model
+        ensure_config_dir()
+        _atomic_write_json(API_KEYS_FILE, keys)
         return True
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return False
 
+def _provider_aliases(provider: str) -> list:
+    """Alias order is stable; a canonical entry wins conflicting aliases."""
+    canonical = normalize_provider_name(provider)
+    aliases = sorted(alias for alias, target in PROVIDER_ALIASES.items() if target == canonical)
+    return aliases + [canonical]
+
+
+def _api_entry(document, provider: str) -> dict:
+    result = {}
+    if isinstance(document, dict):
+        for name in _provider_aliases(provider):
+            fields = document.get(name)
+            if isinstance(fields, dict):
+                result.update(fields)
+    return result
+
+
 def get_api_config(provider: str) -> dict:
+    """Resolve each field: nonempty environment > api_keys.json > config.json.
+
+    Go flat fields take precedence over config.json's legacy nested ``api``
+    entries. Aliases share one API configuration (notably openai/codex).
+    Reading credentials never authorizes paid API use; is_api_allowed remains
+    the separate admission gate.
     """
-    Returns API configuration for provider.
-    Priority: Environment variables -> api_keys.json -> config.json.
-    """
-    import os
-    p = provider.lower().strip()
-    file_keys = load_api_keys().get(p, {})
+    p = normalize_provider_name(provider)
     cfg = load_user_config()
-
-    res = {
-        "api_key": None,
-        "base_url": None,
-        "model": None
+    file_keys = _api_entry(load_api_keys(), p)
+    nested = _api_entry(cfg.get("api", {}), p)
+    specs = {
+        "codex": ("openai", ["OPENAI_API_KEY"], ["OPENAI_BASE_URL"], ["OPENAI_MODEL"], "https://api.openai.com/v1", "gpt-4o"),
+        "claude": ("claude", ["ANTHROPIC_API_KEY"], ["ANTHROPIC_BASE_URL"], ["ANTHROPIC_MODEL"], "https://api.anthropic.com", "claude-sonnet-4-20250514"),
+        "agy": ("gemini", ["GEMINI_API_KEY", "GOOGLE_API_KEY"], ["GEMINI_BASE_URL"], ["GEMINI_MODEL"], "https://generativelanguage.googleapis.com", "gemini-2.5-flash"),
+        "grok": ("grok", ["XAI_API_KEY", "GROK_API_KEY"], ["XAI_BASE_URL"], ["GROK_MODEL"], "https://api.x.ai/v1", "grok-2-latest"),
+        "muse": ("muse", ["META_API_KEY", "MUSE_API_KEY"], ["META_BASE_URL"], ["META_MODEL"], None, "llama-3.3-70b-instruct"),
+        "deepseek": ("deepseek", ["DEEPSEEK_API_KEY"], ["DEEPSEEK_BASE_URL"], ["DEEPSEEK_MODEL"], "https://api.deepseek.com/v1", "deepseek-chat"),
+        "qwen": ("qwen", ["DASHSCOPE_API_KEY", "QWEN_API_KEY"], ["DASHSCOPE_BASE_URL"], ["QWEN_MODEL"], "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen2.5-coder-32b-instruct"),
+        "openrouter": ("openrouter", ["OPENROUTER_API_KEY"], ["OPENROUTER_BASE_URL"], ["OPENROUTER_MODEL"], "https://openrouter.ai/api/v1", "auto"),
+        "siliconflow": ("siliconflow", ["SILICONFLOW_API_KEY"], ["SILICONFLOW_BASE_URL"], ["SILICONFLOW_MODEL"], "https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V3"),
+        "kimi": ("kimi", ["MOONSHOT_API_KEY", "KIMI_API_KEY"], ["MOONSHOT_BASE_URL"], ["MOONSHOT_MODEL"], "https://api.moonshot.cn/v1", "kimi-latest"),
+        "glm": ("glm", ["ZHIPU_API_KEY", "GLM_API_KEY", "ZHIPUAI_API_KEY"], ["ZHIPU_BASE_URL", "GLM_BASE_URL"], ["GLM_MODEL", "ZHIPU_MODEL"], "https://open.bigmodel.cn/api/paas/v4", "glm-4-plus"),
+        "aider": ("aider", ["AIDER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"], [], ["AIDER_MODEL"], None, None),
+        "local": ("ollama", ["LOCAL_MODEL_API_KEY"], ["LOCAL_MODEL_ENDPOINT", "OLLAMA_ENDPOINT", "OLLAMA_HOST"], ["LOCAL_MODEL_NAME", "OLLAMA_MODEL"], "http://localhost:11434/v1", None),
     }
+    prefix, key_envs, url_envs, model_envs, default_url, default_model = specs.get(p, (p, [], [], [], None, None))
 
-    # 1. Environment Variable Checks
-    if p in ("codex", "openai"):
-        res["api_key"] = os.environ.get("OPENAI_API_KEY")
-        res["base_url"] = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        res["model"] = os.environ.get("OPENAI_MODEL", "gpt-4o")
-    elif p in ("claude", "anthropic"):
-        res["api_key"] = os.environ.get("ANTHROPIC_API_KEY")
-        res["base_url"] = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-        res["model"] = os.environ.get("ANTHROPIC_MODEL", "claude-3-7-sonnet-20250219")
-    elif p in ("agy", "gemini", "google"):
-        res["api_key"] = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        res["base_url"] = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")
-        res["model"] = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-    elif p in ("grok", "xai"):
-        res["api_key"] = os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
-        res["base_url"] = os.environ.get("XAI_BASE_URL", "https://api.x.ai/v1")
-        res["model"] = os.environ.get("GROK_MODEL", "grok-2-latest")
-    elif p in ("muse", "meta"):
-        res["api_key"] = os.environ.get("META_API_KEY") or os.environ.get("MUSE_API_KEY")
-        res["base_url"] = os.environ.get("META_BASE_URL")
-        res["model"] = os.environ.get("META_MODEL", "llama-3.3-70b-instruct")
-    elif p in ("deepseek", "deepseek-coder", "deepseek-chat"):
-        res["api_key"] = os.environ.get("DEEPSEEK_API_KEY")
-        res["base_url"] = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        res["model"] = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-    elif p in ("qwen", "dashscope", "aliyun"):
-        res["api_key"] = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
-        res["base_url"] = os.environ.get("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-        res["model"] = os.environ.get("QWEN_MODEL", "qwen2.5-coder-32b-instruct")
-    elif p in ("openrouter",):
-        res["api_key"] = os.environ.get("OPENROUTER_API_KEY")
-        res["base_url"] = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        res["model"] = os.environ.get("OPENROUTER_MODEL", "auto")
-    elif p in ("siliconflow", "silicon"):
-        res["api_key"] = os.environ.get("SILICONFLOW_API_KEY")
-        res["base_url"] = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
-        res["model"] = os.environ.get("SILICONFLOW_MODEL", "deepseek-ai/DeepSeek-V3")
-    elif p in ("kimi", "moonshot"):
-        res["api_key"] = os.environ.get("MOONSHOT_API_KEY") or os.environ.get("KIMI_API_KEY")
-        res["base_url"] = os.environ.get("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1")
-        res["model"] = os.environ.get("MOONSHOT_MODEL", "kimi-latest")
-    elif p in ("glm", "zhipu"):
-        res["api_key"] = os.environ.get("ZHIPU_API_KEY") or os.environ.get("GLM_API_KEY")
-        res["base_url"] = os.environ.get("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
-        res["model"] = os.environ.get("GLM_MODEL", "glm-4-plus")
-    elif p in ("aider",):
-        res["api_key"] = os.environ.get("AIDER_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
-        res["model"] = os.environ.get("AIDER_MODEL")
-    elif p in ("local", "ollama"):
-        res["api_key"] = os.environ.get("LOCAL_MODEL_API_KEY", "ollama")
-        res["base_url"] = os.environ.get("LOCAL_MODEL_ENDPOINT") or os.environ.get("OLLAMA_ENDPOINT") or os.environ.get("OLLAMA_HOST") or cfg.get("ollama_url", "http://localhost:11434/v1")
-        res["model"] = os.environ.get("LOCAL_MODEL_NAME") or os.environ.get("OLLAMA_MODEL") or cfg.get("local_model_name") or cfg.get("local_model")
+    def nonempty(value):
+        return value.strip() if isinstance(value, str) and value.strip() else None
 
-
-
-    # 2. File keys fallback / override
-    if file_keys:
-        if file_keys.get("api_key") and not res["api_key"]:
-            res["api_key"] = file_keys["api_key"]
-        if file_keys.get("base_url"):
-            res["base_url"] = file_keys["base_url"]
-        if file_keys.get("model"):
-            res["model"] = file_keys["model"]
-
-    # Normalize local base_url to ensure it has /v1 if using OpenAI compatibility
-    if p in ("local", "ollama") and res["base_url"]:
-        b = res["base_url"].rstrip("/")
-        if not b.endswith("/v1") and not b.endswith("/api"):
-            res["base_url"] = f"{b}/v1"
-
-    return res
+    result = {}
+    for field, envs, default in (("api_key", key_envs, "ollama" if p == "local" else None),
+                                 ("base_url", url_envs, default_url), ("model", model_envs, default_model)):
+        value = nonempty(cfg.get(f"{prefix}_{field}")) or nonempty(nested.get(field)) or default
+        if p == "local":
+            value = (nonempty(cfg.get("ollama_url")) or value) if field == "base_url" else value
+            if field == "model":
+                value = nonempty(cfg.get("ollama_model")) or nonempty(cfg.get("local_model_name")) or nonempty(cfg.get("local_model")) or value
+        value = nonempty(file_keys.get(field)) or value
+        for env in envs:
+            override = nonempty(os.environ.get(env))
+            if override:
+                value = override
+                break
+        result[field] = value
+    if p == "local" and result["base_url"]:
+        base = result["base_url"].rstrip("/")
+        result["base_url"] = base if base.endswith(("/v1", "/api")) else f"{base}/v1"
+    return result
 
 def has_api_configured(provider: str) -> bool:
     """Returns True if provider has valid API key or endpoint configured."""
@@ -264,16 +291,21 @@ def api_policy_error() -> str:
 
 def save_user_config(cfg: dict) -> bool:
     """Saves dictionary to ~/.config/makewand/config.json."""
-    ensure_config_dir()
     try:
-        import json
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        if not isinstance(cfg, dict):
+            return False
+        # Keep other frontends' fields when this caller supplies only its own
+        # updates, and refuse to destroy an invalid existing policy document.
+        merged = load_user_config()
+        merged.update(cfg)
+        _validate_provider_controls(merged)
+        ensure_config_dir()
+        _atomic_write_json(CONFIG_FILE, merged)
         return True
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return False
 
-def get_enabled_providers() -> dict:
+def get_enabled_providers(extra_names=()) -> dict:
     """
     Returns dict of provider -> bool.
     Default: cloud/CLI providers enabled; local models require opt-in.
@@ -283,6 +315,9 @@ def get_enabled_providers() -> dict:
     import os
     cfg = load_user_config()
     enabled = {p: p != "local" for p in ALL_SUPPORTED_PROVIDERS}
+    for name in extra_names:
+        provider = normalize_provider_name(name)
+        enabled[provider] = provider != "local"
     # Read the previous website installer schema during upgrades. Canonical
     # enabled_providers and explicit environment settings still take precedence.
     legacy_active = cfg.get("active_providers")
@@ -293,27 +328,24 @@ def get_enabled_providers() -> dict:
         enabled["local"] = cfg["local_model_enabled"]
     user_settings = cfg.get("enabled_providers", {})
     if isinstance(user_settings, dict):
-        for k, v in user_settings.items():
-            k_clean = normalize_provider_name(k)
-            if k_clean in enabled and isinstance(v, bool):
-                enabled[k_clean] = v
+        names = sorted(user_settings, key=lambda name: (normalize_provider_name(name) == name.lower().strip(), name))
+        for name in names:
+            if isinstance(user_settings[name], bool):
+                enabled[normalize_provider_name(name)] = user_settings[name]
 
-    # Check env overrides
-    # 1. MAKEWAND_DISABLE_<PROVIDER>=1
-    for k in list(enabled.keys()):
-        env_dis = os.environ.get(f"MAKEWAND_DISABLE_{k.upper()}")
-        if env_dis in ("1", "true", "yes"):
-            enabled[k] = False
-        env_en = os.environ.get(f"MAKEWAND_ENABLE_{k.upper()}")
-        if env_en in ("1", "true", "yes"):
-            enabled[k] = True
-
-    # 2. MAKEWAND_ENABLE_PROVIDERS=agy,claude,...
+    # Aliases resolve before canonical names, then ENABLE wins DISABLE for the
+    # same name. The final allowlist remains the highest-priority override.
+    for provider in list(enabled):
+        for name in _provider_aliases(provider):
+            if os.environ.get(f"MAKEWAND_DISABLE_{name.upper()}") in ("1", "true", "yes"):
+                enabled[provider] = False
+            if os.environ.get(f"MAKEWAND_ENABLE_{name.upper()}") in ("1", "true", "yes"):
+                enabled[provider] = True
     whitelist = os.environ.get("MAKEWAND_ENABLE_PROVIDERS")
     if whitelist:
-        wl_set = set(normalize_provider_name(x.strip()) for x in whitelist.split(","))
-        for k in list(enabled.keys()):
-            enabled[k] = k in wl_set
+        allowed = {normalize_provider_name(name) for name in whitelist.split(",")}
+        for provider in list(enabled):
+            enabled[provider] = provider in allowed
 
     return enabled
 
@@ -326,30 +358,21 @@ def get_all_supported_providers() -> list:
     """Returns copy of all supported provider names."""
     return list(ALL_SUPPORTED_PROVIDERS)
 
+PROVIDER_ALIASES = {
+    "ollama": "local", "gemini": "agy", "google": "agy", "anthropic": "claude",
+    "openai": "codex", "xai": "grok", "meta": "muse", "dashscope": "qwen", "aliyun": "qwen",
+    "zhipu": "glm", "moonshot": "kimi", "silicon": "siliconflow",
+    "deepseek-coder": "deepseek", "deepseek-chat": "deepseek",
+}
+
+
 def normalize_provider_name(provider: str) -> str:
-    """Normalizes aliases to standard canonical provider name."""
-    p = provider.lower().strip()
-    if p in ("ollama",):
-        return "local"
-    elif p in ("gemini", "google"):
-        return "agy"
-    elif p in ("anthropic",):
-        return "claude"
-    elif p in ("openai",):
-        return "codex"
-    elif p in ("xai",):
-        return "grok"
-    elif p in ("meta",):
-        return "muse"
-    elif p in ("dashscope", "aliyun"):
-        return "qwen"
-    elif p in ("zhipu",):
-        return "glm"
-    elif p in ("moonshot",):
-        return "kimi"
-    elif p in ("silicon",):
-        return "siliconflow"
-    return p
+    """Normalize provider aliases and API siblings to one enablement identity."""
+    name = provider.lower().strip()
+    if name.endswith("-api"):
+        name = name[:-4]
+    return PROVIDER_ALIASES.get(name, name)
+
 
 def normalize_tier(tier: Optional[str]) -> str:
     """
@@ -381,7 +404,7 @@ def tier_to_go_mode(tier: Optional[str]) -> str:
 def is_provider_enabled(provider: str) -> bool:
     """Returns True if provider is enabled."""
     p = normalize_provider_name(provider)
-    enabled_map = get_enabled_providers()
+    enabled_map = get_enabled_providers((p,))
     return enabled_map.get(p, True)
 
 def set_provider_enabled(provider: str, enabled: bool) -> bool:
@@ -401,6 +424,8 @@ def has_subscription_configured(provider: str) -> bool:
     import shutil
     import subprocess
     p = normalize_provider_name(provider)
+    if not is_provider_enabled(p):
+        return False
     if p in ("local", "aider", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
         return False
     if p == "copilot":

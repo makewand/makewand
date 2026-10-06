@@ -26,6 +26,14 @@ func TestEngineProcessChild(t *testing.T) {
 		if err := os.WriteFile(marker+".ready", []byte("ready"), 0o600); err != nil {
 			os.Exit(3)
 		}
+		if !waitEngineProcessChildMarker(marker, ".armed") {
+			os.Exit(7)
+		}
+		// The escape window belongs to the real running phase after startup.
+		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+		if err := os.WriteFile(marker+".armed-ready", []byte("armed"), 0o600); err != nil {
+			os.Exit(3)
+		}
 		time.Sleep(2 * time.Second)
 		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
 		if err := os.WriteFile(marker, []byte("escaped"), 0o600); err != nil {
@@ -44,22 +52,39 @@ func TestEngineProcessChild(t *testing.T) {
 		if err := child.Start(); err != nil {
 			os.Exit(4)
 		}
-		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) {
-			// #nosec G703 -- marker is in the parent-created temporary fixture directory.
-			if _, err := os.Stat(marker + ".ready"); err == nil {
-				fmt.Print("leader\n")
-				if mode == "preview" {
-					time.Sleep(10 * time.Second)
-				}
-				if mode == "preview-leader" {
-					time.Sleep(100 * time.Millisecond)
-				}
-				os.Exit(0)
-			}
-			time.Sleep(5 * time.Millisecond)
+		if !waitEngineProcessChildMarker(marker, ".ready") {
+			os.Exit(5)
 		}
-		os.Exit(5)
+		if n, err := fmt.Print("leader\n"); n != len("leader\n") || err != nil {
+			os.Exit(6)
+		}
+		// This acknowledgment follows the successful write to the real pipe.
+		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+		if err := os.WriteFile(marker+".leader-output", []byte("leader\n"), 0o600); err != nil {
+			os.Exit(3)
+		}
+		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+		if err := os.WriteFile(marker+".leader-ready", []byte("ready"), 0o600); err != nil {
+			os.Exit(3)
+		}
+		if !waitEngineProcessChildMarker(marker, ".armed-ready") {
+			os.Exit(7)
+		}
+		if mode == "preview" {
+			time.Sleep(10 * time.Second)
+		} else {
+			if !waitEngineProcessChildMarker(marker, ".exit") {
+				os.Exit(7)
+			}
+			if mode == "preview-leader" {
+				time.Sleep(100 * time.Millisecond)
+			}
+			// #nosec G703 -- marker records the real leader's final exit path.
+			if err := os.WriteFile(marker+".leader-exit", []byte("0"), 0o600); err != nil {
+				os.Exit(3)
+			}
+		}
+		os.Exit(0)
 	}
 	block := bytes.Repeat([]byte("x"), 32<<10)
 	for _, stream := range []*os.File{os.Stdout, os.Stderr} {
@@ -70,6 +95,55 @@ func TestEngineProcessChild(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func waitEngineProcessChildMarker(marker, suffix string) bool {
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+		if _, err := os.Stat(marker + suffix); err == nil {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+func waitEngineProcessFixtureMarker(t *testing.T, ctx context.Context, marker, suffix string, done <-chan struct{}) {
+	t.Helper()
+	for {
+		if _, err := os.Stat(marker + suffix); err == nil {
+			return
+		}
+		select {
+		case <-done:
+			t.Fatalf("owned process exited before real fixture readiness %s", suffix)
+		case <-ctx.Done():
+			t.Fatalf("fixture never reached %s within startup guard: %v", suffix, ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func armEngineProcessFixture(t *testing.T, ctx context.Context, marker string, done <-chan struct{}) time.Time {
+	t.Helper()
+	if err := os.WriteFile(marker+".armed", []byte("armed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitEngineProcessFixtureMarker(t, ctx, marker, ".armed-ready", done)
+	return time.Now()
+}
+
+func assertEngineProcessDidNotEscape(t *testing.T, marker string, armedReadyAt time.Time) {
+	t.Helper()
+	// The descendant began its real two-second timer before this acknowledgment
+	// was observed, so this probe cannot succeed merely because startup was slow.
+	if remaining := time.Until(armedReadyAt.Add(2300 * time.Millisecond)); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("owned descendant survived process completion: %v", err)
+	}
 }
 
 func TestPreviewProcessOverflowPublishesUnknown(t *testing.T) {
@@ -101,38 +175,75 @@ func TestPreviewProcessStopAndLeaderExitClearDescendants(t *testing.T) {
 			marker := filepath.Join(t.TempDir(), "descendant")
 			configurePreviewProcessFixture(t, mode, marker, true)
 			p := &Project{Path: t.TempDir()}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			started := time.Now()
 			server, err := p.StartPreview(ctx, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer server.Stop()
-			if mode == "preview" {
+			defer func() {
+				cancel()
 				stopped := make(chan struct{})
 				go func() { server.Stop(); close(stopped) }()
-				server.Stop()
-				<-stopped
+				select {
+				case <-stopped:
+				case <-time.After(2 * time.Second):
+					t.Error("owned preview did not finish after guard cancellation")
+				}
+			}()
+			waitEngineProcessFixtureMarker(t, ctx, marker, ".ready", server.Done())
+			armedReadyAt := armEngineProcessFixture(t, ctx, marker, server.Done())
+			started := time.Now()
+			var finishedAt time.Time
+			timer := time.NewTimer(1800 * time.Millisecond)
+			defer timer.Stop()
+			if mode == "preview" {
+				stopped := make(chan time.Time, 2)
+				for range 2 {
+					go func() { server.Stop(); stopped <- time.Now() }()
+				}
+				for range 2 {
+					select {
+					case completedAt := <-stopped:
+						if completedAt.After(finishedAt) {
+							finishedAt = completedAt
+						}
+						if completedAt.Sub(started) > 1800*time.Millisecond {
+							t.Fatalf("real preview Stop exceeded bound: %v", completedAt.Sub(started))
+						}
+					case <-timer.C:
+						t.Fatal("real preview Stop or inherited pipes exceeded 1800ms")
+					}
+				}
 			} else {
+				if err := os.WriteFile(marker+".exit", []byte("exit"), 0o600); err != nil {
+					t.Fatal(err)
+				}
 				select {
 				case <-server.Done():
-				case <-ctx.Done():
-					t.Fatal("exited preview leader was not reaped")
+					finishedAt = time.Now()
+				case <-timer.C:
+					t.Fatal("released preview leader or inherited pipes exceeded 1800ms")
 				}
 				if err := server.Err(); err != nil && !errors.Is(err, execution.ErrUnknownOutcome) {
 					t.Fatalf("inherited preview pipes lost UNKNOWN: %v", err)
 				}
+				if server.cmd.ProcessState == nil || server.cmd.ProcessState.ExitCode() != 0 {
+					t.Fatalf("real preview leader did not exit zero: %v", server.cmd.ProcessState)
+				}
+				data, err := os.ReadFile(marker + ".leader-exit")
+				if err != nil || string(data) != "0" {
+					t.Fatalf("preview leader did not reach the released exit-zero path: %q %v", data, err)
+				}
 			}
-			if time.Since(started) > 1800*time.Millisecond {
-				t.Fatalf("preview stop/exit exceeded bound: %v", time.Since(started))
+			if ctx.Err() != nil || finishedAt.Sub(started) > 1800*time.Millisecond {
+				t.Fatalf("preview stop/exit exceeded running bound: ctx=%v elapsed=%v", ctx.Err(), finishedAt.Sub(started))
 			}
-			if remaining := time.Until(started.Add(2300 * time.Millisecond)); remaining > 0 {
-				time.Sleep(remaining)
+			data, err := os.ReadFile(marker + ".leader-output")
+			if err != nil || string(data) != "leader\n" {
+				t.Fatalf("real inherited stdout write did not complete: %q %v", data, err)
 			}
-			if _, err := os.Stat(marker); !os.IsNotExist(err) {
-				t.Fatalf("preview descendant survived: %v", err)
-			}
+			assertEngineProcessDidNotEscape(t, marker, armedReadyAt)
 		})
 	}
 }
@@ -156,7 +267,7 @@ func configurePreviewProcessFixture(t *testing.T, mode, marker string, waitReady
 			return nil
 		}
 		for {
-			if _, err := os.Stat(marker + ".ready"); err == nil {
+			if _, err := os.Stat(marker + ".leader-ready"); err == nil {
 				return nil
 			}
 			select {
@@ -183,26 +294,83 @@ func TestEngineProcessCombinedOutputOverflowIsUnknown(t *testing.T) {
 	}
 }
 
+func TestEngineProcessStartFailureHonorsContext(t *testing.T) {
+	for _, mode := range []string{"canceled", "deadline", "missing"} {
+		t.Run(mode, func(t *testing.T) {
+			p := &Project{Path: t.TempDir()}
+			missing := filepath.Join(p.Path, "missing-fixture.exe")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var contextErr error
+			switch mode {
+			case "canceled":
+				cancel()
+				contextErr = context.Canceled
+			case "deadline":
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+				contextErr = context.DeadlineExceeded
+			}
+			// execWithPolicy uses a real exec.Cmd: this absent private path
+			// reaches Start and cannot dispatch any tool or child process.
+			result, err := p.execWithPolicy(ctx, missing, nil, execPolicy{allowAnyCommand: true, allowCommandPath: true})
+			if result != nil || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("fixture did not reach the actual missing-executable Start: result=%+v err=%v", result, err)
+			}
+			if contextErr != nil {
+				if !errors.Is(err, contextErr) || !errors.Is(err, execution.ErrUnknownOutcome) {
+					t.Fatalf("interrupted Start lost context or conservative unknown: %v", err)
+				}
+			} else if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, execution.ErrUnknownOutcome) {
+				t.Fatalf("ordinary missing executable became interruption: %v", err)
+			}
+		})
+	}
+}
+
 func TestEngineProcessLeaderExitClearsDescendantsAndPipes(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "descendant")
 	t.Setenv("MAKEWAND_ENGINE_PROCESS_CHILD", "leader")
 	t.Setenv("MAKEWAND_ENGINE_PROCESS_MARKER", marker)
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
 	p := &Project{Path: t.TempDir()}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	var result *ExecResult
+	var err error
+	var completedAt time.Time
+	done := make(chan struct{})
+	go func() {
+		result, err = p.execWithPolicy(ctx, os.Args[0], []string{"-test.run=^TestEngineProcessChild$"}, execPolicy{allowAnyCommand: true, allowCommandPath: true})
+		completedAt = time.Now()
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("owned engine process did not finish after guard cancellation")
+		}
+	}()
+	waitEngineProcessFixtureMarker(t, ctx, marker, ".leader-ready", done)
+	waitEngineProcessFixtureMarker(t, ctx, marker, ".ready", done)
+	armedReadyAt := armEngineProcessFixture(t, ctx, marker, done)
 	started := time.Now()
-	_, err := p.execWithPolicy(ctx, os.Args[0], []string{"-test.run=^TestEngineProcessChild$"}, execPolicy{allowAnyCommand: true, allowCommandPath: true})
-	if time.Since(started) > 1800*time.Millisecond || (err != nil && !errors.Is(err, execution.ErrUnknownOutcome)) {
-		t.Fatalf("leader/stdio was not bounded: err=%v elapsed=%v", err, time.Since(started))
+	if err := os.WriteFile(marker+".exit", []byte("exit"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(marker + ".ready"); err != nil {
-		t.Fatalf("real descendant was not started: %v", err)
+	select {
+	case <-done:
+	case <-time.After(1800 * time.Millisecond):
+		t.Fatal("released engine leader or inherited pipes exceeded 1800ms")
 	}
-	if remaining := time.Until(started.Add(2300 * time.Millisecond)); remaining > 0 {
-		time.Sleep(remaining)
+	if ctx.Err() != nil || completedAt.Sub(started) > 1800*time.Millisecond || (err != nil && !errors.Is(err, execution.ErrUnknownOutcome)) || result == nil || result.Stdout != "leader\n" || (err == nil && result.ExitCode != 0) {
+		t.Fatalf("leader/stdio was not bounded after readiness: err=%v ctx=%v elapsed=%v result=%+v", err, ctx.Err(), completedAt.Sub(started), result)
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("descendant survived leader completion: %v", err)
+	data, readErr := os.ReadFile(marker + ".leader-exit")
+	if readErr != nil || string(data) != "0" {
+		t.Fatalf("engine leader did not reach the released exit-zero path: %q %v", data, readErr)
 	}
+	assertEngineProcessDidNotEscape(t, marker, armedReadyAt)
 }

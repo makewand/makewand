@@ -78,6 +78,31 @@ func TestPendingApprovalWindowsSidecarHardlinkRefusesWithoutChangingOutsideACL(t
 	}
 }
 
+func TestApplyWindowsPrivateDACLIncludesUserAndSystemOnce(t *testing.T) {
+	for _, tc := range []struct{ name, sid, expected string }{
+		{"system", "S-1-5-18", "D:P(A;OICI;FA;;;SY)"},
+		{"ordinary_user", "S-1-5-21-123-456-789-1001", "D:P(A;OICI;FA;;;S-1-5-21-123-456-789-1001)(A;OICI;FA;;;SY)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, err := windows.StringToSid(tc.sid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			private, err := privateApplyDACL(user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual, err := applySecurityValue(private)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if expected := windowsSecurityValueFixture(t, tc.expected); actual != expected {
+				t.Fatalf("private DACL rights, identities, inheritance, or protection differ: %s, want %s", actual, expected)
+			}
+		})
+	}
+}
+
 func TestPendingApprovalWindowsPrivateDirectoryBindsCurrentUser(t *testing.T) {
 	path := t.TempDir()
 	if err := privateApplyDirectory(path); err != nil {
@@ -104,7 +129,11 @@ func TestPendingApprovalWindowsPrivateDirectoryBindsCurrentUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + user.User.Sid.String() + ")(A;OICI;FA;;;SY)")
+	expectedValueText := "D:P(A;OICI;FA;;;" + user.User.Sid.String() + ")"
+	if !user.User.Sid.IsWellKnown(windows.WinLocalSystemSid) {
+		expectedValueText += "(A;OICI;FA;;;SY)"
+	}
+	expected, err := windows.SecurityDescriptorFromString(expectedValueText)
 	if err != nil {
 		t.Fatal(err)
 	}

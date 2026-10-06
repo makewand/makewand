@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +130,28 @@ func TestStartPreview_ReturnsErrorWhenPortNeverBecomesReady(t *testing.T) {
 }
 
 func TestStartPreview_IncludesStartupStderrOnReadinessFailure(t *testing.T) {
+	const stderrMessage = "uid map denied\n"
+	if os.Getenv("MAKEWAND_PREVIEW_STDERR_CHILD") == "1" {
+		if n, err := fmt.Fprint(os.Stderr, stderrMessage); err != nil || n != len(stderrMessage) {
+			os.Exit(3)
+		}
+		marker := os.Getenv("MAKEWAND_PREVIEW_STDERR_MARKER")
+		// Publish only after the complete acknowledgment is written and closed.
+		// #nosec G703 -- marker belongs to the parent-created private fixture directory.
+		if err := os.WriteFile(marker+".pending", []byte(stderrMessage), 0o600); err != nil {
+			os.Exit(4)
+		}
+		// #nosec G703 -- both names are inside the same parent-owned fixture directory.
+		if err := os.Rename(marker+".pending", marker); err != nil {
+			os.Exit(4)
+		}
+		// Stay alive after the real pipe write until StartPreview stops this child.
+		// The release marker is never sent by this readiness-failure fixture.
+		if !waitEngineProcessChildMarker(marker, ".release") {
+			os.Exit(5)
+		}
+		os.Exit(0)
+	}
 	oldCmd := previewCommandContext
 	oldFindPort := previewFindFreePort
 	oldWaitPort := previewWaitForPort
@@ -147,17 +171,52 @@ func TestStartPreview_IncludesStartupStderrOnReadinessFailure(t *testing.T) {
 		t.Fatalf("WriteFile(package.json): %v", err)
 	}
 
+	marker := filepath.Join(t.TempDir(), "stderr-written")
+	t.Setenv("MAKEWAND_PREVIEW_STDERR_CHILD", "1")
+	t.Setenv("MAKEWAND_PREVIEW_STDERR_MARKER", marker)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	previewFindFreePort = func() (int, error) { return 45678, nil }
 	previewWaitForPort = func(ctx context.Context, port int, timeout time.Duration) error {
-		time.Sleep(50 * time.Millisecond)
-		return fmt.Errorf("timed out after %s: connection refused", timeout)
+		if port != 45678 || timeout != 12*time.Second {
+			t.Fatalf("preview readiness port=%d timeout=%s, want 45678 and unchanged 12s", port, timeout)
+		}
+		readyCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			content, readErr := os.ReadFile(marker)
+			if readErr == nil {
+				if string(content) != stderrMessage {
+					return fmt.Errorf("fixture stderr acknowledgment = %q, want %q", content, stderrMessage)
+				}
+				// Acknowledgment follows the successful write to the real stderr pipe.
+				return fmt.Errorf("timed out after %s: connection refused", timeout)
+			}
+			if !os.IsNotExist(readErr) {
+				return fmt.Errorf("read fixture stderr acknowledgment: %w", readErr)
+			}
+			select {
+			case <-readyCtx.Done():
+				return fmt.Errorf("fixture never wrote real startup stderr: %w", readyCtx.Err())
+			case <-ticker.C:
+			}
+		}
 	}
 	previewWrapProjectCmd = func(projectPath, command string, args []string, auth UnsafeHostExecAuthorization) (string, []string, error) {
-		return "sh", []string{"-c", "echo uid map denied >&2; sleep 5"}, nil
+		return executable, []string{"-test.run=^TestStartPreview_IncludesStartupStderrOnReadinessFailure$"}, nil
 	}
 	previewCommandContext = exec.CommandContext
 
-	server, err := proj.StartPreview(context.Background(), true)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	server, err := proj.StartPreview(ctx, true)
+	if ctx.Err() != nil {
+		t.Fatalf("preview fixture exhausted its startup guard: %v", ctx.Err())
+	}
 	if err == nil {
 		t.Fatal("StartPreview() error = nil, want readiness failure")
 	}

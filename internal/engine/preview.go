@@ -150,7 +150,11 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 
 	cleanupProcess, err := processjob.Start(cmd)
 	if err != nil {
+		contextErr := ctx.Err()
 		cancel()
+		if contextErr != nil {
+			return nil, fmt.Errorf("start preview server: %w", errors.Join(contextErr, err))
+		}
 		return nil, fmt.Errorf("start preview server: %w", err)
 	}
 	go func() {

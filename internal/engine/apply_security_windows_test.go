@@ -90,7 +90,11 @@ func TestApplyWindowsInheritedDACLExactCommitAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := "D:(A;ID;FA;;;" + user.User.Sid.String() + ")(A;ID;FA;;;SY)(A;ID;FR;;;WD)"
+	expected := "D:(A;ID;FA;;;" + user.User.Sid.String() + ")"
+	if !user.User.Sid.IsWellKnown(windows.WinLocalSystemSid) {
+		expected += "(A;ID;FA;;;SY)"
+	}
+	expected += "(A;ID;FR;;;WD)"
 	file, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)

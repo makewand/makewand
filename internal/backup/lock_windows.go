@@ -11,7 +11,7 @@ import (
 )
 
 func acquireRestoreLock(path string) (*os.File, error) {
-	name, err := windows.UTF16PtrFromString(path)
+	name, err := restoreWindowsName(path)
 	if err != nil {
 		return nil, err
 	}
@@ -21,7 +21,7 @@ func acquireRestoreLock(path string) (*os.File, error) {
 	}
 	var info windows.ByHandleFileInformation
 	if err = windows.GetFileInformationByHandle(handle, &info); err != nil || info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || info.NumberOfLinks != 1 {
-		windows.CloseHandle(handle)
+		_ = windows.CloseHandle(handle)
 		return nil, fmt.Errorf("unsafe restore lock")
 	}
 	file := os.NewFile(uintptr(handle), path)

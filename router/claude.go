@@ -16,6 +16,7 @@ const maxResponseBytes = 10 << 20
 // Claude implements the Provider interface for Anthropic's Claude API.
 type Claude struct {
 	apiKey       string
+	baseURL      string
 	model        string
 	chatClient   *http.Client
 	streamClient *http.Client
@@ -24,11 +25,25 @@ type Claude struct {
 
 // NewClaude creates a new Claude provider.
 func NewClaude(apiKey, model string) *Claude {
+	return NewClaudeWithBaseURL(apiKey, model, "")
+}
+
+// NewClaudeWithBaseURL uses an explicitly configured API endpoint. The existing
+// constructor retains the official endpoint and is source-compatible.
+func NewClaudeWithBaseURL(apiKey, model, baseURL string) *Claude {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = claudeAPIURL
+	}
+	if !strings.HasSuffix(baseURL, "/messages") {
+		baseURL += "/v1/messages"
+	}
 	if model == "" {
 		model = claudeDefaultModel
 	}
 	return &Claude{
 		apiKey:       apiKey,
+		baseURL:      baseURL,
 		model:        model,
 		chatClient:   newAPIClient(),
 		streamClient: newStreamClient(),
@@ -110,7 +125,7 @@ func (c *Claude) chatUnaccounted(ctx context.Context, messages []Message, system
 	if err != nil {
 		return "", Usage{}, err
 	}
-	req, err := newProviderJSONRequest(ctx, "claude", http.MethodPost, claudeAPIURL, body, map[string]string{
+	req, err := newProviderJSONRequest(ctx, "claude", http.MethodPost, c.baseURL, body, map[string]string{
 		"Content-Type":      "application/json",
 		"x-api-key":         c.apiKey,
 		"anthropic-version": "2023-06-01",
@@ -179,7 +194,7 @@ func (c *Claude) chatStreamUnaccounted(ctx context.Context, messages []Message, 
 	if err != nil {
 		return nil, err
 	}
-	req, err := newProviderJSONRequest(ctx, "claude", http.MethodPost, claudeAPIURL, body, map[string]string{
+	req, err := newProviderJSONRequest(ctx, "claude", http.MethodPost, c.baseURL, body, map[string]string{
 		"Content-Type":      "application/json",
 		"x-api-key":         c.apiKey,
 		"anthropic-version": "2023-06-01",

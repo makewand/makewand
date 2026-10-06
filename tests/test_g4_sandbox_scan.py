@@ -35,7 +35,9 @@ def ro_bound(cmd):
 def home_outside_tmp():
     # Argument-only tests: HOME must not be /tmp or below it, otherwise /tmp
     # itself would be an ancestor of HOME and a writable /tmp workspace refused.
-    home = str(Path(__file__).resolve().parent)
+    # This nonexistent argument-only HOME is independent of the checkout's
+    # location; a source copy under /tmp must not turn /tmp into HOME's parent.
+    home = "/makewand-test-argument-home"
     with patch.dict(os.environ, {"HOME": home}):
         yield home
 
@@ -113,7 +115,8 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
                 entries = real_scandir(path)
                 return FixtureRootEntries(entries) if os.fspath(path) == "/tmp" else entries
 
-            with home_outside_tmp(), patch("makewand.sandbox.os.scandir", side_effect=fixture_scandir):
+            with home_outside_tmp() as home, patch("makewand.sandbox.os.scandir", side_effect=fixture_scandir):
+                self.assertFalse(Path(home).is_relative_to("/tmp"))
                 t0 = time.monotonic()
                 cmd = wrap_bwrap(["true"], workspace="/tmp")
                 elapsed = time.monotonic() - t0
@@ -124,6 +127,9 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
                 if p.startswith("/tmp/") and p.endswith("/.git"):
                     self.assertLessEqual(len(Path(p).relative_to("/tmp").parts), sandbox.BROAD_SCAN_DEPTH, p)
             self.assertLess(elapsed, 30.0)
+            with patch.dict(os.environ, {"HOME": str(base / "home")}):
+                with self.assertRaises(sandbox.SandboxConfigError):
+                    wrap_bwrap(["true"], workspace="/tmp")
         finally:
             shutil.rmtree(base, ignore_errors=True)
 

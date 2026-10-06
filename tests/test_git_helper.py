@@ -29,6 +29,21 @@ class TestGitHelper(unittest.TestCase):
         self.assertTrue(inited)
         self.assertTrue((self.test_dir / ".git").exists())
 
+    def test_git_longpaths_is_command_local_without_rewriting_repository_config(self):
+        from makewand.git_helper import run_git_cmd
+        import subprocess
+        self.assertTrue(ensure_git_worktree(str(self.test_dir)))
+        code, _, error = run_git_cmd(["git", "config", "--local", "core.longpaths", "false"],
+                                     cwd=str(self.test_dir))
+        self.assertEqual(code, 0, error)
+        code, value, error = run_git_cmd(["git", "config", "--get", "core.longpaths"],
+                                        cwd=str(self.test_dir))
+        self.assertEqual(code, 0, error)
+        self.assertEqual(value.strip(), "true")
+        persisted = subprocess.check_output(["git", "config", "--local", "--get", "core.longpaths"],
+                                            cwd=str(self.test_dir), text=True)
+        self.assertEqual(persisted.strip(), "false")
+
     def test_get_git_diff(self):
         ensure_git_worktree(str(self.test_dir))
         sample_file = self.test_dir / "sample.py"
@@ -554,4 +569,3 @@ except OSError:
 
 if __name__ == "__main__":
     unittest.main()
-

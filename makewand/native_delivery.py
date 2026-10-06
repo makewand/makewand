@@ -5,6 +5,8 @@ Only the reviewed filesystem payload is copied into that trusted repository;
 candidate-controlled Git administration is never copied into the delivery.
 """
 import shutil
+import os
+import sys
 import uuid
 from pathlib import Path
 
@@ -14,12 +16,23 @@ from makewand.candidate import CandidateManager, build_manifest, _atomic_copy, _
 from makewand.git_helper import (ShadowWorktreeResult, clone_isolated_worktree,
     create_private_shadow_dir, find_git_root, run_git_cmd, get_git_diff)
 from makewand.protected_files import ProtectedFiles
+from makewand.windows_paths import filesystem_path
 
 
 def create_native_shadow_worktree(base_dir, prefix="shadow"):
     base = Path(base_dir).resolve()
     repo = Path(find_git_root(base) or base).resolve()
     shadow = create_private_shadow_dir(repo.name)
+    if os.name == "nt":
+        from makewand.native_windows import private_tree_identity, remove_private_tree
+        identity = private_tree_identity(shadow)
+
+    def cleanup():
+        if os.name == "nt":
+            remove_private_tree(shadow, identity)
+        else:
+            shutil.rmtree(filesystem_path(shadow), ignore_errors=True)
+
     try:
         clone_isolated_worktree(str(repo), shadow)
         code, baseline, error = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(shadow))
@@ -27,11 +40,20 @@ def create_native_shadow_worktree(base_dir, prefix="shadow"):
             raise OSError(error)
         head_code, head, _ = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(repo))
         effective = shadow / base.relative_to(repo)
-        return ShadowWorktreeResult(str(effective), None, lambda: shutil.rmtree(shadow, ignore_errors=True),
+        return ShadowWorktreeResult(str(effective), None, cleanup,
             baseline_commit=baseline.strip(), repo_head=head.strip() if head_code == 0 else None,
             repo_root=str(repo), worktree_root=str(shadow))
-    except BaseException:
-        shutil.rmtree(shadow, ignore_errors=True)
+    except BaseException as error:
+        try:
+            cleanup()
+        except BaseException as cleanup_error:
+            detail = "Native shadow cleanup failed: " + type(cleanup_error).__name__
+            if hasattr(BaseException, "add_note"):
+                BaseException.add_note(error, detail)
+            try:
+                print("warning: " + detail, file=sys.stderr)
+            except BaseException:
+                pass  # A diagnostic sink cannot replace the original failure.
         raise
 
 

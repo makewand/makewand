@@ -17,7 +17,38 @@ func TestHasUsableBackend_AllowsRemote(t *testing.T) {
 	}
 }
 
+func TestHasUsableBackend_HonorsRemoteProviderPolicy(t *testing.T) {
+	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
+	t.Setenv("MAKEWAND_REMOTE_TOKEN", "offline-fixture")
+	t.Setenv("MAKEWAND_ENABLE_REMOTE", "")
+	t.Setenv("MAKEWAND_DISABLE_REMOTE", "")
+	t.Setenv("MAKEWAND_ENABLE_PROVIDERS", "")
+
+	cfg := config.DefaultConfig()
+	cfg.EnabledProviders = map[string]bool{"remote": false}
+	if hasUsableBackend(cfg) {
+		t.Fatal("disabled remote provider counted as a usable backend")
+	}
+	cfg.EnabledProviders = nil
+	cfg.ActiveProviders = []string{}
+	if hasUsableBackend(cfg) {
+		t.Fatal("empty provider allowlist counted remote as a usable backend")
+	}
+	cfg.EnabledProviders = map[string]bool{"remote": true}
+	if !hasUsableBackend(cfg) {
+		t.Fatal("explicitly enabled remote provider was unavailable")
+	}
+	t.Setenv("MAKEWAND_DISABLE_REMOTE", "1")
+	if hasUsableBackend(cfg) {
+		t.Fatal("environment-disabled remote provider counted as a usable backend")
+	}
+}
+
 func TestServeRouter_IgnoresRemoteBackendEnv(t *testing.T) {
+	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
+	t.Setenv("MAKEWAND_API_POLICY", config.APIPolicyAllowPaid)
+	t.Setenv("MAKEWAND_DISABLE_OPENAI", "")
+	t.Setenv("MAKEWAND_ENABLE_PROVIDERS", "")
 	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
 	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
 

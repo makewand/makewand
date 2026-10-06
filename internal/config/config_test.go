@@ -1,8 +1,10 @@
 package config
 
 import (
+	"github.com/makewand/makewand/internal/testfixture"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -41,7 +43,7 @@ func TestLoad_EnvOverridesWhenConfigMissing(t *testing.T) {
 	}
 }
 
-func TestLoad_ParseErrorStillAppliesEnvOverrides(t *testing.T) {
+func TestLoad_ParseErrorLocksProviderPolicy(t *testing.T) {
 	home := t.TempDir()
 	useTempHome(t, home)
 	t.Setenv("OPENAI_API_KEY", "openai-env-key")
@@ -59,8 +61,8 @@ func TestLoad_ParseErrorStillAppliesEnvOverrides(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() error = nil, want parse error")
 	}
-	if cfg.OpenAIAPIKey != "openai-env-key" {
-		t.Fatalf("OpenAIAPIKey = %q, want %q", cfg.OpenAIAPIKey, "openai-env-key")
+	if !IsFatalLoadError(err) || cfg.OpenAIAPIKey != "" || cfg.IsProviderEnabled("codex") {
+		t.Fatal("invalid policy must reject environment keys and provider enablement")
 	}
 	if cfg.DefaultModel != "claude" {
 		t.Fatalf("DefaultModel = %q, want %q", cfg.DefaultModel, "claude")
@@ -124,11 +126,8 @@ func TestConfigDir_UsesEnvOverride(t *testing.T) {
 }
 
 func TestHasAnyModel_WithCustomProvider(t *testing.T) {
-	bin := filepath.Join(t.TempDir(), "private-llm.sh")
-	//nolint:gosec // G306: test fixture script must be executable.
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile(%s): %v", bin, err)
-	}
+	testfixture.ClearProviderEnv(t)
+	bin := testfixture.WriteCLI(t, "private-provider", testfixture.Spec{Stdout: "ok\n"})
 
 	cfg := DefaultConfig()
 	cfg.ClaudeAPIKey = ""
@@ -160,11 +159,7 @@ func TestHasAnyModel_InvalidCustomProviderNotCounted(t *testing.T) {
 }
 
 func TestIsCustomProviderUsable_WithExecutablePath(t *testing.T) {
-	bin := filepath.Join(t.TempDir(), "provider.sh")
-	//nolint:gosec // G306: test fixture script must be executable.
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile(%s): %v", bin, err)
-	}
+	bin := testfixture.WriteCLI(t, "private-provider", testfixture.Spec{Stdout: "ok\n"})
 
 	if !IsCustomProviderUsable(CustomProvider{Name: "private", Command: bin}) {
 		t.Fatal("IsCustomProviderUsable() = false, want true for executable file")
@@ -272,17 +267,14 @@ func TestLoad_LegacyUsageModeDefaultsToBalanced(t *testing.T) {
 // config load (LoadOptions{SkipCLIDetection:true}) never execs a subscription
 // CLI's `--version` probe, while the trusted default (Load) still detects it.
 func TestLoadWithOptions_SkipCLIDetection(t *testing.T) {
+	testfixture.ClearProviderEnv(t)
 	binDir := t.TempDir()
 
 	// Fake `claude` on PATH: writes a sentinel when its --version probe runs.
 	// The probe inherits the (restricted) test PATH, so create the sentinel via a
 	// shell builtin + redirection rather than an external command like `touch`.
 	sentinel := filepath.Join(binDir, "claude_probe_ran")
-	script := filepath.Join(binDir, "claude")
-	body := "#!/bin/sh\nprintf 'probe\\n' > \"" + sentinel + "\"\nprintf 'claude 1.2.3\\n'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	testfixture.WriteCLIAt(t, binDir, "claude", testfixture.Spec{Mode: "probe", Sentinel: sentinel, Stdout: "claude 1.2.3\n"})
 
 	t.Run("skip does not exec probe", func(t *testing.T) {
 		t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
@@ -336,5 +328,74 @@ func TestNormalizeApprovalMode(t *testing.T) {
 		if got := NormalizeApprovalMode(tt.input); got != tt.want {
 			t.Fatalf("NormalizeApprovalMode(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+// Explicit paths follow the actual platform executable rules. Windows has no
+// POSIX executable permission bits, but still rejects non-PATHEXT text files.
+func TestCustomProviderExplicitPathUsesPlatformExecutableRules(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+	}
+	bin := testfixture.WriteCLI(t, "native-provider", testfixture.Spec{Stdout: "fixture\n"})
+	if !IsCustomProviderUsable(CustomProvider{Name: "private", Command: bin}) {
+		t.Fatal("native fixture executable rejected")
+	}
+	// Exercise both public lookup branches against the same controlled PATH;
+	// no provider process or availability probe is executed.
+	t.Setenv("PATH", filepath.Dir(bin))
+	if !IsCustomProviderUsable(CustomProvider{Name: "private", Command: filepath.Base(bin)}) {
+		t.Fatal("bare native fixture executable rejected")
+	}
+	text := filepath.Join(filepath.Dir(bin), "not-executable.txt")
+	if err := os.WriteFile(text, []byte("controlled fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if IsCustomProviderUsable(CustomProvider{Name: "private", Command: text}) {
+		t.Fatal("non-executable text file accepted")
+	}
+	if IsCustomProviderUsable(CustomProvider{Name: "private", Command: filepath.Base(text)}) {
+		t.Fatal("bare non-executable text file accepted")
+	}
+	if IsCustomProviderUsable(CustomProvider{Name: "private", Command: filepath.Dir(bin)}) {
+		t.Fatal("directory accepted as executable")
+	}
+}
+
+func TestWindowsExecutableExtensionRequiresPATHEXT(t *testing.T) {
+	for _, test := range []struct {
+		name, path, pathExt string
+		want                bool
+	}{
+		{"default native executable", "fixture.exe", "", true},
+		{"case insensitive extension", "fixture.ExE", ".COM;.EXE", true},
+		{"ordinary text rejected", "fixture.txt", ".COM;.EXE;.BAT;.CMD", false},
+		{"no extension rejected", "fixture", ".EXE", false},
+		{"explicit extension membership", "fixture.custom", ".EXE;.CUSTOM", true},
+		{"dotless environment entry", "fixture.exe", "EXE", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PATHEXT", test.pathExt)
+			if got := hasWindowsExecutableExtension(test.path); got != test.want {
+				t.Fatalf("extension availability = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadSyntheticPolicyIgnoresInheritedNativeGatePolicy(t *testing.T) {
+	t.Setenv("MAKEWAND_API_POLICY", APIPolicySubscriptionOnly)
+	useTempHome(t, t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "synthetic-offline-key")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, inherited := os.LookupEnv("MAKEWAND_API_POLICY"); inherited {
+		t.Fatal("synthetic policy fixture retained the outer native policy")
+	}
+	cfg.APIPolicy = APIPolicyAllowPaid
+	if !cfg.HasAnyModel() {
+		t.Fatal("synthetic explicit paid policy was shadowed by inherited verification settings")
 	}
 }

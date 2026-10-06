@@ -1,8 +1,10 @@
 package config
 
 import (
+	"github.com/makewand/makewand/internal/testfixture"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -23,13 +25,23 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// useTempHome points HOME at home and clears MAKEWAND_CONFIG_DIR for one test,
-// so ConfigDir resolves to home/.config/makewand whatever the caller's
-// environment sets.
+// useTempHome pins all platform home/config locations for one test. ConfigDir
+// resolves to home/.config/makewand regardless of inherited Windows or Unix
+// environment settings.
 func useTempHome(t *testing.T, home string) {
 	t.Helper()
 	t.Setenv("HOME", home)
-	t.Setenv("MAKEWAND_CONFIG_DIR", "")
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	t.Setenv("MAKEWAND_CONFIG_DIR", filepath.Join(home, ".config", "makewand"))
+	testfixture.ClearProviderEnv(t)
+	// Synthetic policy tests choose their own policy, rather than inheriting
+	// the outer native gate's deliberately disabled provider configuration.
+	t.Setenv("MAKEWAND_API_POLICY", "")
+	if err := os.Unsetenv("MAKEWAND_API_POLICY"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestConfigTestsAreHermetic guards the TestMain isolation: no inherited

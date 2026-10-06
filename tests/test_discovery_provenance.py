@@ -228,6 +228,7 @@ class DiscoveryProvenanceTests(unittest.TestCase):
         self.assertEqual(models["claude"]["default_source"], "detected")
 
     @patch("makewand.providers.local.is_local_model_available")
+    @patch.dict(os.environ, {"MAKEWAND_ENABLE_LOCAL": "1"})
     def test_local_model_mock_discovery(self, mock_is_avail):
         mock_is_avail.return_value = (True, "gemma4:31b", ["gemma4:31b", "qwen2.5-coder:7b"])
         models = discover_available_models()

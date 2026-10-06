@@ -42,20 +42,24 @@ In makewand v3.1+, the **generation** stage is strongly sandboxed. When a subscr
 ### Acceptance and billing boundaries / 验收与费用边界
 
 Local test output is diagnostic evidence, not an independent acceptance certificate.
-Go local checks do not grant Strength 2 or authorize automatic application; a person
-must approve the sealed candidate. See [the verification contract](docs/VERIFICATION_CONTRACT.md)
+Go local checks alone do not grant Strength 2 or authorize automatic application;
+a person must approve the sealed candidate unless configured independent trusted
+acceptance passes for that same artifact and grants Strength 2. See
+[the verification contract](docs/VERIFICATION_CONTRACT.md)
 and [server credential invalidation](docs/SERVER_AUTHORIZATION.md) for the exact guarantees.
-本地测试结果不能证明候选进程没有伪造输出；Go 的本地验证通过后仍需人工批准封存产物。
+本地测试结果不能证明候选进程没有伪造输出；Go 仅通过本地验证时仍需人工批准封存产物。配置的独立可信验收通过并达到 Strength 2 后，autopilot 才可自动应用。
 
 Direct cloud APIs and API fallback are disabled by default, including in untrusted
 repository mode. Explicitly set `MAKEWAND_API_POLICY=allow_paid` or `api_policy` to
 `allow_paid` to enable them. A remote server and third-party CLIs retain their own
 billing policies. 环境中存在 API key 本身不再授权 Makewand 发起云 API 调用。
 
-Python candidate application requires POSIX directory handles for safe atomic
-replacement. Use WSL2 on Windows; native Windows package smoke tests cover loading
-and command help, not the complete execution and application workflow.
-Python 候选应用在 Windows 原生环境会明确拒绝；完整执行流程请使用 WSL2。
+Python candidate application uses fixed POSIX directory handles or native Windows
+handles for replacement and recovery. Native Windows execution requires explicit
+unsafe-host consent and cannot grant Strength 2; Windows Job Objects manage
+resources and process trees without providing Linux sandbox isolation. See
+[the native Windows contract](docs/VERIFICATION_CONTRACT.md#python-pipeline-and-race-candidates).
+Python 候选应用支持 POSIX 和原生 Windows 固定句柄。Windows 执行生成代码仍需显式宿主执行授权，不能达到 Strength 2；Job Object 不提供 Linux 沙箱的文件、凭据或网络隔离。
 
 ## Supported Versions
 

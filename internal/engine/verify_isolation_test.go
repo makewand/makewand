@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -210,6 +211,9 @@ func TestWrapVerificationCommand_NetworkIsolationByStep(t *testing.T) {
 }
 
 func TestWrapVerificationCommand_SandboxLayout(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout requires POSIX absolute path semantics")
+	}
 	fakeWorkingBwrap(t)
 	home := t.TempDir()
 	verifyUserHome = func() (string, error) { return home, nil }

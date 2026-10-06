@@ -7,13 +7,13 @@ try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI �
 except ImportError:  # python3 -m unittest tests.<module>
     from tests import _isolation  # noqa: F401
 
-import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from makewand.candidate import CandidateManager
+from makewand.candidate import CandidateManager, file_record
 from makewand.git_helper import ensure_git_worktree, run_git_cmd
 import makewand.config as config
 
@@ -143,6 +143,38 @@ class TestCandidateLifecycle(unittest.TestCase):
         ok, applied, msg = CandidateManager.apply_candidate(race_id, candidate_label="B", force=True)
         self.assertTrue(ok)
         self.assertEqual((self.base_ws / "main.py").read_text(encoding="utf-8"), "candidate change\n")
+
+    def test_conflict_check_reads_secure_record_without_existence_gate(self):
+        candidate = Path(self.test_dir) / "candidate"
+        shutil.copytree(self.base_ws, candidate)
+        (candidate / "main.py").write_text("reviewed candidate\n", encoding="utf-8")
+        target = self.base_ws / "main.py"
+        baseline = {"main.py": file_record(target)}
+        actual_exists = Path.exists
+
+        def ordinary_exists(path):
+            # Windows' ordinary MAX_PATH query can say absent while the native
+            # pinned reader can inspect the same complete long-path file.
+            return False if path == target else actual_exists(path)
+
+        with mock.patch.object(Path, "exists", ordinary_exists):
+            conflicts = CandidateManager.detect_conflicts(str(self.base_ws), candidate,
+                baseline_manifest=baseline, candidate_baseline_commit=self.baseline)
+        self.assertEqual(conflicts, [])
+        self.assertEqual(target.read_text(encoding="utf-8"), "print('version 1')\n")
+
+        target.write_text("external user edit\n", encoding="utf-8")
+        with mock.patch.object(Path, "exists", ordinary_exists):
+            conflicts = CandidateManager.detect_conflicts(str(self.base_ws), candidate,
+                baseline_manifest=baseline, candidate_baseline_commit=self.baseline)
+        self.assertEqual(conflicts, ["main.py"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "external user edit\n")
+
+        target.unlink()
+        conflicts = CandidateManager.detect_conflicts(str(self.base_ws), candidate,
+            baseline_manifest=baseline, candidate_baseline_commit=self.baseline)
+        self.assertEqual(conflicts, ["main.py"])
+        self.assertFalse(target.exists())
 
     def test_apply_symlink_defense(self):
         race_id = "rc_symlink_test"

@@ -202,6 +202,52 @@ IDs, so a later change to HEAD cannot substitute unreviewed content. The manifes
 records `verified_commit` and `verified_tree` for the main repository and exported
 submodule patches.
 
+For exported POSIX `apply_delivery.sh` scripts, the destination is frozen before
+copying the shadow workspace and checked again before publishing the delivery.
+Every exported patch must also pass Git's applicability check against that
+destination before the delivery is published.
+The snapshot binds the root directory identity and mode, file contents and modes,
+symlink targets, directory entries, and repository/submodule HEAD and marker
+identities. It includes ignored files and empty directories, excluding Git
+administrative contents. The generated script embeds one copy of the same
+standard-library checker and baseline, extracts them into a private directory,
+and verifies their hashes before use. It needs only Python 3 and Git, without an
+installed Makewand SDK.
+Caller-supplied Git redirection and configuration variables are cleared.
+Git's work tree is fixed explicitly to the approved destination.
+
+Before any patch is applied, the script rejects destination drift, including
+changes outside patch hunks, new files, permission changes, branch switches and
+directory replacement. After application it checks the expected patch postimage
+over the frozen destination. Git patches preserve executable/non-executable mode
+semantics for changed regular files; unchanged entries retain exact modes.
+Inspection defaults to 100,000 entries, 512 MiB of file content and ten seconds.
+Larger projects can explicitly set `MAKEWAND_DELIVERY_MAX_ENTRIES`,
+`MAKEWAND_DELIVERY_MAX_BYTES` and `MAKEWAND_DELIVERY_MAX_SECONDS` before starting
+the task. Their upper bounds are 1,000,000 entries, 16 GiB and 300 seconds.
+For example, the following allows a 1 GiB, 120-second inspection:
+
+```bash
+MAKEWAND_DELIVERY_MAX_BYTES=1073741824 MAKEWAND_DELIVERY_MAX_SECONDS=120 makewand run --timeout 300 "your task"
+```
+
+The SDK's remaining task deadline can shorten this time. These limits are frozen
+into the delivery, so later environment
+changes cannot weaken its checks. Embedded metadata remains limited to 32 MiB.
+Exceeding a limit stops delivery and reports the limit and scan progress.
+
+These checks do not lock external editors. Stop other writes while applying a
+delivery. The exported shell script applies and reverses patches sequentially;
+it does not provide simultaneous multi-file visibility or durable crash recovery.
+After each patch, a checkpoint records only its touched paths, their ancestors
+and the relevant root/repository identities and HEAD. Rollback checks their full
+content, types and exact permissions against that postimage. The complete
+destination checks still run before and after delivery, but an unrelated large
+cache cannot exhaust the patch checkpoint or rollback scan. If the postimage or
+its bound identities have changed, or a checkpoint cannot be established, the
+script preserves it for manual recovery instead of reversing over newer edits.
+Saved candidates use the separate persistent application journal described above.
+
 ## Python daemon execution contract
 
 The optional Unix daemon supervises one independent Python process per request.

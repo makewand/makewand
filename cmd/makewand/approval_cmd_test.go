@@ -129,7 +129,10 @@ func TestApprovalOverrideIsRuntimeOnly(t *testing.T) {
 	resolvedApprovalOverride = config.ApprovalModeAuto
 	t.Cleanup(func() { resolvedApprovalOverride = "" })
 
-	cfg := loadConfigWithWarning()
+	cfg, loadErr := loadConfigWithWarning()
+	if loadErr != nil {
+		t.Fatalf("loadConfigWithWarning: %v", loadErr)
+	}
 	if cfg.ApprovalMode != config.ApprovalModeAuto {
 		t.Fatalf("cfg.ApprovalMode = %q, want runtime override %q", cfg.ApprovalMode, config.ApprovalModeAuto)
 	}

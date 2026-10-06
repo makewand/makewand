@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 const openaiAPIURL = "https://api.openai.com/v1/chat/completions"
@@ -12,6 +13,7 @@ const openaiDefaultModel = "gpt-4o"
 // OpenAI implements the Provider interface for OpenAI's API.
 type OpenAI struct {
 	apiKey       string
+	baseURL      string
 	model        string
 	chatClient   *http.Client
 	streamClient *http.Client
@@ -20,11 +22,25 @@ type OpenAI struct {
 
 // NewOpenAI creates a new OpenAI provider.
 func NewOpenAI(apiKey, model string) *OpenAI {
+	return NewOpenAIWithBaseURL(apiKey, model, "")
+}
+
+// NewOpenAIWithBaseURL uses an explicitly configured API endpoint. The existing
+// constructor retains the official endpoint and is source-compatible.
+func NewOpenAIWithBaseURL(apiKey, model, baseURL string) *OpenAI {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = openaiAPIURL
+	}
+	if !strings.HasSuffix(baseURL, "/chat/completions") {
+		baseURL += "/chat/completions"
+	}
 	if model == "" {
 		model = openaiDefaultModel
 	}
 	return &OpenAI{
 		apiKey:       apiKey,
+		baseURL:      baseURL,
 		model:        model,
 		chatClient:   newAPIClient(),
 		streamClient: newStreamClient(),
@@ -102,7 +118,7 @@ func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system
 	if err != nil {
 		return "", Usage{}, err
 	}
-	req, err := newProviderJSONRequest(ctx, "openai", http.MethodPost, openaiAPIURL, body, map[string]string{
+	req, err := newProviderJSONRequest(ctx, "openai", http.MethodPost, o.baseURL, body, map[string]string{
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer " + o.apiKey,
 	})
@@ -169,7 +185,7 @@ func (o *OpenAI) chatStreamUnaccounted(ctx context.Context, messages []Message, 
 	if err != nil {
 		return nil, err
 	}
-	req, err := newProviderJSONRequest(ctx, "openai", http.MethodPost, openaiAPIURL, body, map[string]string{
+	req, err := newProviderJSONRequest(ctx, "openai", http.MethodPost, o.baseURL, body, map[string]string{
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer " + o.apiKey,
 	})

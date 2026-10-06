@@ -1,0 +1,217 @@
+[
+  {
+    "name": "defaults",
+    "config": {},
+    "env": {},
+    "expected": {
+      "claude": true,
+      "codex": true,
+      "agy": true,
+      "local": false,
+      "custom": true
+    }
+  },
+  {
+    "name": "legacy-whitelist",
+    "config": {
+      "active_providers": [
+        "anthropic",
+        "gemini"
+      ],
+      "local_model_enabled": false
+    },
+    "env": {},
+    "expected": {
+      "claude": true,
+      "codex": false,
+      "agy": true,
+      "local": false,
+      "custom": false
+    }
+  },
+  {
+    "name": "empty-legacy-whitelist",
+    "config": {
+      "active_providers": []
+    },
+    "env": {},
+    "expected": {
+      "claude": false,
+      "agy": false,
+      "local": false
+    }
+  },
+  {
+    "name": "canonical-over-alias",
+    "config": {
+      "enabled_providers": {
+        "anthropic": false,
+        "claude": true,
+        "gemini": true,
+        "agy": false
+      }
+    },
+    "env": {},
+    "expected": {
+      "claude": true,
+      "anthropic": true,
+      "agy": false,
+      "gemini": false
+    }
+  },
+  {
+    "name": "api-siblings",
+    "config": {
+      "enabled_providers": {
+        "claude-api": false,
+        "openai": false,
+        "ollama": true,
+        "custom": false
+      }
+    },
+    "env": {},
+    "expected": {
+      "claude": false,
+      "claude-api": false,
+      "codex": false,
+      "openai": false,
+      "local": true,
+      "ollama": true,
+      "custom-api": false
+    }
+  },
+  {
+    "name": "invalid-values",
+    "config": {
+      "enabled_providers": {
+        "claude": "false",
+        "local": 1
+      },
+      "local_model_enabled": "false"
+    },
+    "env": {},
+    "expect_error": true
+  },
+  {
+    "name": "invalid-legacy-whitelist-entry",
+    "config": {"active_providers": ["claude", 3]},
+    "env": {},
+    "expect_error": true
+  },
+  {
+    "name": "invalid-enabled-field-type",
+    "config": {"enabled_providers": []},
+    "env": {},
+    "expect_error": true
+  },
+  {
+    "name": "invalid-enabled-null-entry",
+    "config": {"enabled_providers": {"claude": null}},
+    "env": {"MAKEWAND_ENABLE_CLAUDE": "1"},
+    "expect_error": true
+  },
+  {
+    "name": "invalid-active-field-type",
+    "config": {"active_providers": "claude"},
+    "env": {},
+    "expect_error": true
+  },
+  {
+    "name": "invalid-active-null-entry",
+    "config": {"active_providers": [null]},
+    "env": {},
+    "expect_error": true
+  },
+  {
+    "name": "invalid-local-field-type",
+    "config": {"local_model_enabled": 1},
+    "env": {},
+    "expect_error": true
+  },
+  {
+    "name": "null-controls-retain-defaults",
+    "config": {"enabled_providers": null, "active_providers": null, "local_model_enabled": null},
+    "env": {},
+    "expected": {"claude": true, "codex": true, "agy": true, "local": false, "custom": true}
+  },
+  {
+    "name": "alias-environment",
+    "config": {},
+    "env": {
+      "MAKEWAND_DISABLE_GEMINI": "1",
+      "MAKEWAND_DISABLE_OPENAI": "true",
+      "MAKEWAND_ENABLE_OLLAMA": "yes"
+    },
+    "expected": {
+      "agy": false,
+      "gemini": false,
+      "codex": false,
+      "local": true
+    }
+  },
+  {
+    "name": "canonical-environment-wins",
+    "config": {},
+    "env": {
+      "MAKEWAND_DISABLE_GEMINI": "1",
+      "MAKEWAND_ENABLE_AGY": "1",
+      "MAKEWAND_DISABLE_LOCAL": "1",
+      "MAKEWAND_ENABLE_OLLAMA": "1"
+    },
+    "expected": {
+      "agy": true,
+      "local": false
+    }
+  },
+  {
+    "name": "enable-after-disable",
+    "config": {},
+    "env": {
+      "MAKEWAND_DISABLE_CLAUDE": "1",
+      "MAKEWAND_ENABLE_CLAUDE": "1"
+    },
+    "expected": {
+      "claude": true
+    }
+  },
+  {
+    "name": "final-whitelist",
+    "config": {
+      "enabled_providers": {
+        "agy": false,
+        "local": true
+      }
+    },
+    "env": {
+      "MAKEWAND_ENABLE_PROVIDERS": " gemini,custom ",
+      "MAKEWAND_ENABLE_CLAUDE": "1"
+    },
+    "expected": {
+      "claude": false,
+      "agy": true,
+      "local": false,
+      "custom": true,
+      "custom-api": true
+    }
+  },
+  {
+    "name": "mixed-case-conflicts",
+    "config": {
+      "enabled_providers": {
+        "AnThRoPiC": false,
+        "CLAUDE": false,
+        "CLAUDE-API": false,
+        "GEMINI": true,
+        "AGY": false,
+        "claude": true
+      }
+    },
+    "env": {},
+    "expected": {
+      "claude": true,
+      "claude-api": true,
+      "gemini": false,
+      "agy": false
+    }
+  }
+]

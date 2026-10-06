@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Union
 import makewand.config as config
 from makewand.config import c, COLOR_YELLOW, COLOR_RED, ensure_private_dir
+from makewand.windows_paths import filesystem_path, windows_git_directory
 
 # Every git subprocess shares one generous, configurable timeout. A timeout is
 # reported as rc=-1; callers that establish baselines or restore state must
@@ -44,6 +45,9 @@ SAFE_GIT_SECURITY_FLAGS = [
     # Delivery is bound to the exact reviewed bytes, including CRLF files.
     # A user's global Windows Git setting must not normalize those blobs.
     "-c", "core.autocrlf=false",
+    # A command-local setting supports deep private state on Windows without
+    # changing a user's repository, global Git config or system long-path policy.
+    "-c", "core.longpaths=true",
     "-c", "core.pager=cat",
     "-c", "commit.gpgsign=false",
 ]
@@ -68,6 +72,28 @@ _DANGEROUS_GIT_ENVS = {
 }
 
 
+def _fs_path(path):
+    """Filesystem-call representation, never a saved workspace identity."""
+    return Path(filesystem_path(path))
+
+
+def _is_reparse_path(path):
+    if os.name != "nt":
+        return False
+    try:
+        return bool(getattr(_fs_path(path).lstat(), "st_file_attributes", 0) & 0x400)
+    except FileNotFoundError:
+        return False
+
+
+def _walk_filesystem(root):
+    api_root = _fs_path(root)
+    for current, dirs, files in os.walk(api_root, followlinks=False):
+        # scandir/realpath may return the extended API representation. Keep
+        # relative paths, symlink policy and metadata in the original namespace.
+        yield Path(root) / Path(current).relative_to(api_root), dirs, files
+
+
 def _sanitize_git_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Sanitize environment variables for safe git execution."""
     src = os.environ if env is None else env
@@ -88,19 +114,19 @@ def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path
         for cur in [p] + list(p.parents):
             gp = cur / ".git"
             git_dirs: List[Path] = []
-            if gp.is_dir():
+            if _fs_path(gp).is_dir():
                 git_dirs.append(gp)
-            elif gp.is_file():
+            elif _fs_path(gp).is_file():
                 try:
-                    txt = gp.read_text(encoding="utf-8").strip()
+                    txt = _fs_path(gp).read_text(encoding="utf-8").strip()
                     if txt.startswith("gitdir:"):
                         gd = Path(txt[7:].strip())
                         if not gd.is_absolute():
                             gd = (gp.parent / gd).resolve()
                         git_dirs.append(gd)
                         commondir_file = gd / "commondir"
-                        if commondir_file.exists():
-                            cd_txt = commondir_file.read_text(encoding="utf-8").strip()
+                        if _fs_path(commondir_file).exists():
+                            cd_txt = _fs_path(commondir_file).read_text(encoding="utf-8").strip()
                             cd_path = Path(cd_txt)
                             if not cd_path.is_absolute():
                                 cd_path = (gd / cd_path).resolve()
@@ -114,7 +140,7 @@ def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path
                     resolved_dir = gdir
                 if resolved_dir not in seen_dirs:
                     seen_dirs.add(resolved_dir)
-                    info_dir = resolved_dir / "info"
+                    info_dir = _fs_path(resolved_dir / "info")
                     ia = info_dir / "attributes"
                     gate_file = info_dir / "attributes.mw_gate"
                     needs_shield = False
@@ -128,7 +154,7 @@ def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path
                             pass
                     if needs_shield:
                         paths.append(ia)
-            if gp.exists():
+            if _fs_path(gp).exists():
                 break
     except Exception:
         pass
@@ -179,6 +205,12 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             exec_cmd = cmd
             use_shell = False
 
+        process_cwd = filesystem_path(cwd) if cwd is not None else None
+        if (os.name == "nt" and cwd is not None and isinstance(exec_cmd, list)
+                and exec_cmd and exec_cmd[0] == "git"):
+            # Avoid CreateProcess's extended-CWD limit and Git's fixed getcwd
+            # buffers. Check before shielding attributes or launching Git.
+            process_cwd = windows_git_directory(cwd)
         git_env = _sanitize_git_env() if safe else os.environ.copy()
         if safe:
             if _diff_index.get() is not None:
@@ -277,7 +309,7 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             stderr=subprocess.PIPE,
             text=not is_bytes,
             **text_options,
-            cwd=cwd,
+            cwd=process_cwd,
             timeout=timeout,
             env=git_env
         )
@@ -314,6 +346,7 @@ def _is_git_marker(marker: Path) -> bool:
     and must not be treated as one either.
     """
     try:
+        marker = _fs_path(marker)
         if marker.is_dir():
             return (marker / "HEAD").is_file()
         if marker.is_file():
@@ -644,6 +677,8 @@ def list_workspace_copy_paths(src_dir: Union[str, Path]) -> List[str]:
     throw-away git directory outside the workspace. Raises OSError when the
     rules cannot be evaluated, so callers never fall back to copying secrets.
     """
+    if os.name == "nt":
+        windows_git_directory(src_dir)
     src = Path(src_dir).resolve()
     if find_git_root(src):
         code, out, err = run_git_cmd(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=str(src), binary=True)
@@ -760,7 +795,7 @@ def _copy_file_with_reflink(src_item: Path, dst_item: Path):
     """
     if _copy_file_range(src_item, dst_item):
         return
-    shutil.copy2(src_item, dst_item, follow_symlinks=False)
+    shutil.copy2(filesystem_path(src_item), filesystem_path(dst_item), follow_symlinks=False)
 
 
 def clone_isolated_worktree(src_dir: str, target_dir: Path):
@@ -774,10 +809,15 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
     Enforces fail-closed protection against write-through external symlinks when bwrap is unavailable.
     Raises OSError when the copy or its git baseline cannot be established.
     """
+    if os.name == "nt":
+        # Refuse unsupported roots before target creation, ignore evaluation or
+        # copying any workspace bytes. Long nested file paths remain supported.
+        windows_git_directory(src_dir)
+        windows_git_directory(target_dir)
     target_dir = Path(target_dir)
-    if target_dir.is_symlink():
+    if _fs_path(target_dir).is_symlink() or _is_reparse_path(target_dir):
         raise OSError("isolated workspace target must not be a symlink")
-    target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _fs_path(target_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
     resolved = Path(src_dir).resolve()
     from makewand.sandbox import is_bwrap_available
     has_bwrap = is_bwrap_available()
@@ -810,21 +850,25 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
                 for root_path, item in ((source_root, src_item), (target_dir, dst_item)):
                     parent = item.parent
                     while parent != root_path:
-                        if parent.is_symlink():
+                        if _fs_path(parent).is_symlink() or _is_reparse_path(parent):
                             raise OSError(f"workspace path crosses directory symlink: {item}")
                         parent = parent.parent
-                if not os.path.lexists(src_item):
+                if not os.path.lexists(filesystem_path(src_item)):
                     continue
-                dst_item.parent.mkdir(parents=True, exist_ok=True)
-                if src_item.is_symlink():
-                    os.symlink(os.readlink(src_item), dst_item)
+                dst_api = _fs_path(dst_item)
+                src_api = _fs_path(src_item)
+                dst_api.parent.mkdir(parents=True, exist_ok=True)
+                if os.name == "nt" and bool(getattr(src_api.lstat(), "st_file_attributes", 0) & 0x400):
+                    raise OSError("Windows isolated workspaces cannot contain reparse points")
+                if src_api.is_symlink():
+                    os.symlink(os.readlink(src_api), dst_api)
                     copied_paths.add(dst_item.relative_to(target_dir).as_posix())
-                elif src_item.is_dir():
+                elif src_api.is_dir():
                     # Gitlinks and nested repositories have their own ignore
                     # rules. Re-enumerate there; never copy the directory whole.
-                    dst_item.mkdir(parents=True, exist_ok=True)
+                    dst_api.mkdir(parents=True, exist_ok=True)
                     copy_inputs(src_item, dst_item)
-                elif src_item.is_file():
+                elif src_api.is_file():
                     _copy_file_with_reflink(src_item, dst_item)
                     copied_paths.add(dst_item.relative_to(target_dir).as_posix())
             except OSError as exc:
@@ -846,26 +890,28 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
             except Exception:
                 pass
 
-    # Initialize isolated git baseline in target_dir so all existing files are committed
-    for cmd in (["git", "init", "-q"],
-                ["git", "config", "user.name", "Makewand"],
-                ["git", "config", "user.email", "makewand@local"],
-                ["git", "add", "-A"]):
-        code, _, err = run_git_cmd(cmd, cwd=str(target_dir))
+    from makewand.telemetry import stage
+    with stage("prepare", engine="git-baseline"):
+        # Initialize isolated git baseline in target_dir so all existing files are committed
+        for cmd in (["git", "init", "-q"],
+                    ["git", "config", "user.name", "Makewand"],
+                    ["git", "config", "user.email", "makewand@local"],
+                    ["git", "add", "-A"]):
+            code, _, err = run_git_cmd(cmd, cwd=str(target_dir))
+            if code != 0:
+                raise OSError(f"隔离副本基线建立失败 ({' '.join(cmd[1:3])}, rc={code}): {(err or '').strip()[:200]}")
+        # Only force-add the exact safely enumerated files. A source file that was
+        # tracked before a later .gitignore rule must remain tracked in the clone.
+        # Literal pathspecs prevent a copied filename containing '*' from admitting
+        # other ignored files. Sanitized, removed links are not staged.
+        copied = sorted(path for path in copied_paths if os.path.lexists(filesystem_path(target_dir / path)))
+        for offset in range(0, len(copied), 256):
+            code, _, err = run_git_cmd(["git", "--literal-pathspecs", "add", "-f", "--", *copied[offset:offset + 256]], cwd=str(target_dir))
+            if code != 0:
+                raise OSError(f"隔离副本安全基线暂存失败: {(err or '').strip()[:200]}")
+        code, _, err = run_git_cmd(["git", "commit", "-q", "--no-verify", "-m", "Makewand isolated baseline", "--allow-empty"], cwd=str(target_dir))
         if code != 0:
-            raise OSError(f"隔离副本基线建立失败 ({' '.join(cmd[1:3])}, rc={code}): {(err or '').strip()[:200]}")
-    # Only force-add the exact safely enumerated files. A source file that was
-    # tracked before a later .gitignore rule must remain tracked in the clone.
-    # Literal pathspecs prevent a copied filename containing '*' from admitting
-    # other ignored files. Sanitized, removed links are not staged.
-    copied = sorted(path for path in copied_paths if os.path.lexists(target_dir / path))
-    for offset in range(0, len(copied), 256):
-        code, _, err = run_git_cmd(["git", "--literal-pathspecs", "add", "-f", "--", *copied[offset:offset + 256]], cwd=str(target_dir))
-        if code != 0:
-            raise OSError(f"隔离副本安全基线暂存失败: {(err or '').strip()[:200]}")
-    code, _, err = run_git_cmd(["git", "commit", "-q", "--no-verify", "-m", "Makewand isolated baseline", "--allow-empty"], cwd=str(target_dir))
-    if code != 0:
-        raise OSError(f"隔离副本基线提交失败: {(err or '').strip()[:200]}")
+            raise OSError(f"隔离副本基线提交失败: {(err or '').strip()[:200]}")
 
 def get_active_interactive_working_trees():
     """
@@ -1029,13 +1075,13 @@ def find_external_symlinks(worktree_dir: Path, repo_root: Optional[Path] = None,
     except Exception:
         return []
 
-    for root, dirs, files in os.walk(worktree_dir, followlinks=False):
+    for root, dirs, files in _walk_filesystem(worktree_dir):
         items = [(f, False) for f in files] + [(d, True) for d in dirs]
         for name, is_dir in items:
             p = Path(root) / name
-            if p.is_symlink():
+            if _fs_path(p).is_symlink():
                 try:
-                    raw_target = os.readlink(p)
+                    raw_target = os.readlink(_fs_path(p))
                     resolved = p.resolve()
                     is_in_wt = resolved.is_relative_to(wt_resolved)
                     is_in_repo = (repo_resolved is not None and resolved.is_relative_to(repo_resolved))
@@ -1067,11 +1113,11 @@ def sanitize_shadow_symlinks(worktree_dir: Path, repo_root: Path):
     if has_bwrap:
         return
 
-    for root, dirs, files in os.walk(worktree_dir, followlinks=False):
+    for root, dirs, files in _walk_filesystem(worktree_dir):
         items = [(f, False) for f in files] + [(d, True) for d in dirs]
         for name, is_dir in items:
             p = Path(root) / name
-            if p.is_symlink():
+            if _fs_path(p).is_symlink():
                 try:
                     resolved = p.resolve()
                     # If it resolves inside repo_root and NOT inside worktree_dir, remap to worktree_dir
@@ -1079,14 +1125,14 @@ def sanitize_shadow_symlinks(worktree_dir: Path, repo_root: Path):
                         rel = resolved.relative_to(repo_resolved)
                         new_target = wt_resolved / rel
                         rel_target = os.path.relpath(new_target, p.parent)
-                        p.unlink()
-                        os.symlink(rel_target, p)
+                        _fs_path(p).unlink()
+                        os.symlink(rel_target, _fs_path(p))
                     elif resolved.is_relative_to(wt_resolved):
-                        raw_target = os.readlink(p)
+                        raw_target = os.readlink(_fs_path(p))
                         if Path(raw_target).is_absolute():
                             rel_target = os.path.relpath(resolved, p.parent)
-                            p.unlink()
-                            os.symlink(rel_target, p)
+                            _fs_path(p).unlink()
+                            os.symlink(rel_target, _fs_path(p))
                 except Exception:
                     pass
 
@@ -1451,7 +1497,7 @@ def _positive_int_env(name: str, default: int) -> int:
 def _prune_old_entries(root: Path, keep: int, prefixes: Tuple[str, ...], young_protected: Tuple[str, ...]) -> List[str]:
     """Keeps the newest ``keep`` entries with the given prefixes; returns removed names."""
     entries = []
-    with os.scandir(root) as iterator:
+    with os.scandir(filesystem_path(root)) as iterator:
         for entry in iterator:
             if entry.name.startswith(prefixes):
                 try:
@@ -1496,10 +1542,11 @@ def create_private_shadow_dir(base_name: str) -> Path:
         _prune_old_entries(root, _positive_int_env("MAKEWAND_SHADOW_KEEP", DEFAULT_SHADOW_RETENTION), ("wt_",), ("wt_",))
     except OSError as exc:
         print(c(f"⚠ [Makewand Shadow] 影子工作树保留策略执行失败: {exc}", COLOR_YELLOW), file=sys.stderr)
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (base_name or "workspace"))[:40] or "workspace"
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = Path(tempfile.mkdtemp(prefix=f"wt_{safe}_{stamp}_", dir=str(root)))
-    os.chmod(path, 0o700)
+    # The logical repository name is metadata, not part of a filesystem budget.
+    # An unpredictable short leaf leaves room for .git/objects and nested inputs.
+    created = Path(tempfile.mkdtemp(prefix="wt_", dir=filesystem_path(root)))
+    path = root / created.name
+    os.chmod(filesystem_path(path), 0o700)
     return path
 
 
