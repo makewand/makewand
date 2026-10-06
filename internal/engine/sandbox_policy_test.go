@@ -36,6 +36,7 @@ func TestDetectPlans_FromPackageJSON(t *testing.T) {
 	}
 	if testsPlan == nil {
 		t.Fatal("DetectTestPlan: got nil plan")
+		return
 	}
 	if testsPlan.Command != "npm" || strings.Join(testsPlan.Args, " ") != "test" {
 		t.Fatalf("tests plan = %+v, want npm test", testsPlan)

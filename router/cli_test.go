@@ -670,6 +670,7 @@ func TestParseClaudeCLIJSON_ValidResponse(t *testing.T) {
 	}
 	if usage == nil {
 		t.Fatal("usage = nil, want non-nil")
+		return
 	}
 	if usage.InputTokens != 3 {
 		t.Fatalf("InputTokens = %d, want 3", usage.InputTokens)
@@ -753,6 +754,7 @@ func TestParseGeminiCLIJSON_ValidResponse(t *testing.T) {
 	}
 	if usage == nil {
 		t.Fatal("usage = nil, want non-nil")
+		return
 	}
 	// Aggregated across both models: 3280 + 7346 = 10626
 	if usage.InputTokens != 10626 {
