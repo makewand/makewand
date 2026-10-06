@@ -5,6 +5,8 @@ Health probing, quota monitoring, and status cache management.
 import os
 import re
 import json
+import math
+import warnings
 from makewand import filelock as fcntl
 import uuid
 import tempfile
@@ -45,6 +47,61 @@ STATUS_TTL_SECONDS = {
 }
 # Geographic/account-level blocks rarely change within minutes; re-check later.
 REGION_BLOCK_TTL_SECONDS = 6 * 3600
+
+
+QUOTA_RESERVE_ENV = "MAKEWAND_QUOTA_RESERVE_PERCENT"
+DEFAULT_QUOTA_RESERVE_PERCENT = 8.0
+QUOTA_RESERVE_ERROR = (
+    "MAKEWAND_QUOTA_RESERVE_PERCENT must be a finite number between 0 and 100; "
+    "using the default 8% reserve"
+)
+
+
+def _quota_reserve_setting():
+    """An explicit per-process buffer; invalid input cannot lower the default."""
+    raw = os.environ.get(QUOTA_RESERVE_ENV)
+    if raw is None:
+        return DEFAULT_QUOTA_RESERVE_PERCENT, None
+    try:
+        reserve = float(raw)
+        if not math.isfinite(reserve) or not 0 <= reserve <= 100:
+            raise ValueError("invalid reserve")
+    except (TypeError, ValueError, OverflowError):
+        # Never echo the environment value, which need not be safe to log.
+        warnings.warn(QUOTA_RESERVE_ERROR, RuntimeWarning, stacklevel=2)
+        return DEFAULT_QUOTA_RESERVE_PERCENT, QUOTA_RESERVE_ERROR
+    return reserve, None
+
+
+def _quota_status(remaining, reserve, *, healthy_at=25, inclusive=True):
+    # Disabling the buffer never treats actually exhausted quota as usable.
+    if remaining <= 0 or remaining < reserve:
+        return "limited"
+    healthy = remaining >= healthy_at if inclusive else remaining > healthy_at
+    return "healthy" if healthy else "warning"
+
+
+def _quota_reserve_metadata(reserve, error):
+    return {"reserve_percent": reserve, "reserve_error": error}
+
+
+def _quota_reserve_description(description, reserve, error):
+    # Keep the unset/default description intact; explicit policy is visible.
+    if QUOTA_RESERVE_ENV in os.environ:
+        description += f" · 配额保留阈值: {reserve:g}%"
+    if error:
+        description += f" · {error}"
+    return description
+
+
+def _is_quota_reserve_gate(info):
+    # Migrate only our exact legacy buffer verdict, never a provider 429/auth
+    # verdict. Subsequent real dispatch/probe updates replace the whole entry.
+    reason = str(info.get("reason") or "")
+    return info.get("quota_reserve_gate") is True or bool(
+        re.match(r"^保护阈值拦截 \(剩余 \d+(?:\.\d+)?% < 8%\):", reason)
+        or re.fullmatch(r"配额保护阈值拦截 \((?:剩余 \d+(?:\.\d+)?% < \d+(?:\.\d+)?%|剩余额度耗尽或无法确认)\)", reason)
+    )
 
 REAUTH_HINTS = {
     "claude": "运行 'claude' 并在会话内执行 /login",
@@ -242,14 +299,30 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                 info["resets_at"] = None
                 info.pop("ttl_seconds", None)
                 info["updated_at"] = now_dt.isoformat()
-        # Circuit breaker: protect provider from auto-exhaustion when official quota < 8%
-        if isinstance(info, dict) and info.get("status") in ("healthy", "warning", "unknown") and model_name in ("codex", "claude"):
-            off_q = _get_official_subscription_quota(model_name)
-            if off_q and off_q.get("status") == "limited":
-                info["status"] = "limited"
-                info["reason"] = f"保护阈值拦截 (剩余 {off_q.get('percentage')}% < 8%): {off_q.get('desc')}"
-                info["resets_at"] = off_q.get("resets_at")
-                info["updated_at"] = now_dt.isoformat()
+        # Only fresh, account-bound official evidence can re-evaluate a
+        # buffer verdict. Real provider limits and authentication TTLs remain.
+        if isinstance(info, dict) and model_name in ("codex", "claude"):
+            reserve_gate = _is_quota_reserve_gate(info)
+            if info.get("status") in ("healthy", "warning", "unknown") or (info.get("status") == "limited" and reserve_gate):
+                off_q = _get_official_subscription_quota(model_name)
+                if off_q and off_q.get("source") == "official":
+                    if off_q.get("status") == "limited":
+                        reserve = off_q["reserve_percent"]
+                        remaining = off_q["percentage"]
+                        condition = (f"剩余 {remaining}% < {reserve:g}%" if remaining > 0
+                                     else "官方额度已耗尽，剩余 0%")
+                        info["status"] = "limited"
+                        info["reason"] = f"保护阈值拦截 ({condition}): {off_q.get('desc')}"
+                        info["resets_at"] = off_q.get("resets_at")
+                        info["updated_at"] = now_dt.isoformat()
+                        info["quota_reserve_gate"] = True
+                    elif reserve_gate and info.get("status") == "limited":
+                        # Sufficient quota is not a new successful health probe.
+                        info["status"] = "unknown"
+                        info["reason"] = f"官方额度达到当前保护阈值；可用性待实际派发验证: {off_q.get('desc')}"
+                        info["resets_at"] = None
+                        info["updated_at"] = now_dt.isoformat()
+                        info["quota_reserve_gate"] = True
         if isinstance(info, dict):
             age = status_age_seconds(info)
             info["stale"] = bool(
@@ -840,6 +913,7 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
     import time
     from datetime import timezone
 
+    reserve, reserve_error = _quota_reserve_setting()
     now = time.time()
     ttl = 15 * 60
     evidence = []
@@ -994,8 +1068,9 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
     scoped_message = ""
     if isinstance(scoped, (int, float)) and not isinstance(scoped, bool) and scoped >= 99:
         scoped_message = " · 顶配模型周限额已达 100%（仅提示）"
-    return {"percentage": remaining, "status": "healthy" if remaining >= 25 else "warning" if remaining >= 8 else "limited",
-            "desc": f"官方报告{worst['window']}剩余额度: {remaining:g}% (已用 {worst['used_percent']:g}%){scoped_message}",
+    return {"percentage": remaining, "status": _quota_status(remaining, reserve),
+            **_quota_reserve_metadata(reserve, reserve_error),
+            "desc": _quota_reserve_description(f"官方报告{worst['window']}剩余额度: {remaining:g}% (已用 {worst['used_percent']:g}%){scoped_message}", reserve, reserve_error),
             "resets_at": worst["resets_at"], "is_unlimited": False, "source": "official",
             "selected_source": worst["selected_source"], "window": worst["window"],
             "window_minutes": worst["window_minutes"], "ttl_seconds": ttl,
@@ -1023,8 +1098,18 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
     resets_at = info.get("resets_at")
     updated_at = info.get("updated_at", "")
 
+    reserve, reserve_error = _quota_reserve_setting()
+    reserve_quota = None
+    if _is_quota_reserve_gate(info) and status in ("limited", "unknown", "healthy", "warning"):
+        official = _get_official_subscription_quota(provider, resets_at=resets_at)
+        if official and official.get("source") == "official":
+            reserve_quota = official
+
+    # A buffer verdict must display the real remaining quota, not a fake 0%.
+    if reserve_quota is not None:
+        res = reserve_quota
     # 1. Limited / Exhausted (0%)
-    if status == "limited":
+    elif status == "limited":
         reset_desc = f" (预计解封: {resets_at})" if resets_at else " (已达当前限额)"
         res = {
             "percentage": 0,
@@ -1081,8 +1166,9 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
         pct = int(pct_match.group(1))
         res = {
             "percentage": max(0, min(100, pct)),
-            "status": "healthy" if pct > 20 else ("warning" if pct >= 8 else "limited"),
-            "desc": f"官方报告剩余额度: {pct}%",
+            "status": _quota_status(pct, reserve, healthy_at=20, inclusive=False),
+            **_quota_reserve_metadata(reserve, reserve_error),
+            "desc": _quota_reserve_description(f"官方报告剩余额度: {pct}%", reserve, reserve_error),
             "resets_at": resets_at,
             "is_unlimited": False,
             "source": "official",
@@ -1137,6 +1223,10 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
                     "source": "local_estimate",
                 }
 
+    res.setdefault("reserve_percent", reserve)
+    res.setdefault("reserve_error", reserve_error)
+    if reserve_error and reserve_error not in res["desc"]:
+        res["desc"] += f" · {reserve_error}"
     res["updated_at"] = updated_at
     res["source_label"] = QUOTA_SOURCE_LABELS.get(res.get("source"), "")
     try:
