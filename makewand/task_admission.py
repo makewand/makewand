@@ -173,7 +173,8 @@ _EN_POLITE_IMPERATIVE = re.compile(
 )
 _EN_CLAUSE_IMPERATIVE = re.compile(
     r"^" + _EN_CODE_VERBS + r"\s+(?:a|an|the|this|that|these|those|it|them|some|all|any|new|missing|proper|"
-    r"unit|tests?|support|logging|docs?|documentation|comments?|type|types|error|errors|retries|--?\w+|`)\b"
+    r"unit|tests?|support|logging|docs?|documentation|comments?|type|types|error|errors|retries|"
+    r"bugs?|issues?|problems?|defects?|vulnerabilities?|features?|functions?|methods?|classes?|files?|code|--?\w+|`)\b"
 )
 _EN_LEADING_CONNECTORS = re.compile(
     r"^(?:(?:and\s+then|and|then|also|so|next|finally|afterwards|after\s+that|if\s+so|if\s+not|otherwise|"
@@ -181,6 +182,107 @@ _EN_LEADING_CONNECTORS = re.compile(
 )
 _EXPLICIT_WRITE_DIRECTIVES = ("并在当前目录落盘", "并落盘", "直接落盘", "落盘到", "写入文件并保存")
 _CLAUSE_SPLIT_RE = re.compile(r"[。！!；;\n，,：:]|\.(?=\s|$)|(?<=[？?])")
+
+LOCALIZED_NEGATION_RE = re.compile(
+    r"""(?ix)
+    (?:
+        # English: do not edit [modifiers] [specific targets]
+        \b(?:do\s+not|don'?t|without|never|please\s+do\s+not|please\s+don'?t)\s+
+        (?:edit(?:ing)?|modify(?:ing)?|chang(?:e|ing)|touch(?:ing)?|alter(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|delet(?:e|ing)|remov(?:e|ing)|break(?:ing)?|tamper(?:ing)?(?:\s+with)?|affect(?:ing)?)\s+
+        (?:the\s+|existing\s+|unit\s+|any\s+|current\s+|original\s+|these\s+|those\s+|all\s+)*
+        (?:test\s+cases?|test\s+files?|test\s+suites?|unit\s+tests?|tests?|spec\s+files?|specs?|fixtures?|configs?|configurations?|env|\.env|package\.json|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|requirements\.txt|README(?:\.md)?|\S+\.(?:py|go|rs|js|ts|json|md|txt|yml|yaml|toml))\b
+    |
+        # English: do not edit other files / other code / existing logic / behavior / functionality
+        \b(?:do\s+not|don'?t|without|never|please\s+do\s+not|please\s+don'?t)\s+
+        (?:edit(?:ing)?|modify(?:ing)?|chang(?:e|ing)|touch(?:ing)?|alter(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|delet(?:e|ing)|remov(?:e|ing)|break(?:ing)?|tamper(?:ing)?(?:\s+with)?|affect(?:ing)?)\s+
+        (?:the\s+|any\s+|all\s+)?
+        (?:
+            (?:other|another|external)\s+(?:files?|code)
+            |
+            (?:existing|original|current|business|core|base)\s+(?:logic|behavior|behaviour|code|functionality|features?|implementation|structure|architecture|api|apis?|interfaces?|signatures?|contracts?)
+            |
+            (?:code|project|directory)\s+structure
+            |
+            (?:function|api)\s+signatures?
+            |
+            (?:the\s+)?(?:build|ci|pipeline)
+        )\b
+    |
+        # English: do not edit [anything/files/code] except / other than ...
+        \b(?:do\s+not|don'?t|without|never|please\s+do\s+not|please\s+don'?t)\s+
+        (?:edit(?:ing)?|modify(?:ing)?|chang(?:e|ing)|touch(?:ing)?|alter(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|delet(?:e|ing)|remov(?:e|ing)|break(?:ing)?)\s+
+        (?:(?:any\s+)?(?:files?|code|anything)|any\s+other\s+files?|any\s+other\s+code)\s+(?:other\s+than|except|outside(?:\s+of)?)\s+\S+
+    |
+        # English: except / other than [targets] , do not edit [files/code]
+        \b(?:except|other\s+than|outside(?:\s+of)?)\s+\S+(?:,\s*|\s+)
+        (?:do\s+not|don'?t|never|please\s+do\s+not|please\s+don'?t)\s+
+        (?:edit(?:ing)?|modify(?:ing)?|chang(?:e|ing)|touch(?:ing)?|alter(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|delet(?:e|ing)|remov(?:e|ing))\s+
+        (?:any\s+)?(?:other\s+)?(?:files?|code|anything)\b
+    |
+        # Chinese Structure 1A: 除了 [目标] [之/以外] [其他文件...] [不要修改...]
+        除了\s*[^\s，,。；;]+(?:\s*(?:之?外|以?外))?(?:的?(?:任何|其他|其它|其余|别的)?(?:文件|代码))?\s*
+        (?:不要|不用|别|严禁|不可|禁止|切勿|请勿|无需|不能|不得)\s*
+        (?:修改|改动|改|动|碰|变动|更新|删除|删掉|破坏|触碰)
+    |
+        # Chinese Structure 1B: 除 [目标] [之外/以外] [其他文件...] [不要修改...]
+        除\s*[^\s，,。；;]+\s*(?:之?外|以?外)(?:的?(?:任何|其他|其它|其余|别的)?(?:文件|代码))?\s*
+        (?:不要|不用|别|严禁|不可|禁止|切勿|请勿|无需|不能|不得)\s*
+        (?:修改|改动|改|动|碰|变动|更新|删除|删掉|破坏|触碰)
+    |
+        # Chinese Structure 2: 不要修改 [任何/其他] [文件/代码] [除了/除...之外]
+        (?:不要|不用|别|严禁|不可|禁止|切勿|请勿|无需|不能|不得)
+        \s*
+        (?:修改|改动|改|动|碰|变动|更新|删除|删掉|破坏|触碰)
+        (?:任何|其他|其它|其余|别的)?(?:文件|代码)?\s*
+        (?:除了|除\s*[^\s，,。；;]+\s*(?:之?外|以?外))
+    |
+        # Chinese Structure 3: 不要修改 [修饰词] [目标]
+        (?:不要|不用|别|严禁|不可|禁止|切勿|请勿|无需|不能|不得)
+        (?:修改|改动|改|动|碰|变动|更新|删除|删掉|破坏|触碰|影响)?
+        (?:任何|现有|原有的?|原|已有的?|现存|本有的?|其它|其他|其余|别的|这些|那些|当前的?)?
+        (?:
+            测试用例|测试代码|测试文件|测试套件|单元测试|原测试|单测|用例|测试|样例
+            |配置文件|配置代码|配置|环境文件|环境|说明文档|说明|文档|依赖文件|依赖
+            |\S+\.(?:py|go|rs|js|ts|json|md|txt|yml|yaml|toml|lock|sum|mod|html|css|sh)
+            |其他文件|其它文件|其余文件|别的文件|其他代码|其它代码|其余代码|别的代码
+            |业务逻辑|核心逻辑|原有逻辑|现有逻辑|原逻辑|现逻辑|已有逻辑
+            |原有代码|现有代码|已有代码|原代码|现代码
+            |代码结构|工程结构|目录结构|架构
+            |已有功能|现有功能|原有功能|原功能|现功能
+            |函数签名|接口|api|契约
+            |构建|ci|流水线
+            |除[^\s，,。；;]+之?外
+        )
+    |
+        # Chinese Structure 4: [修饰词] [目标] [不要修改/别动]
+        (?:任何|现有|原有的?|原|已有的?|现存|本有的?|其它|其他|其余|别的|这些|那些|当前的?)?
+        (?:
+            测试用例|测试代码|测试文件|测试套件|单元测试|原测试|单测|用例|测试|样例
+            |配置文件|配置代码|配置|环境文件|环境|说明文档|说明|文档|依赖文件|依赖
+            |\S+\.(?:py|go|rs|js|ts|json|md|txt|yml|yaml|toml|lock|sum|mod|html|css|sh)
+            |其他文件|其它文件|其余文件|别的文件|其他代码|其它代码|其余代码|别的代码
+            |业务逻辑|核心逻辑|原有逻辑|现有逻辑|原逻辑|现逻辑|已有逻辑
+            |原有代码|现有代码|已有代码|原代码|现代码
+            |代码结构|工程结构|目录结构|架构
+            |已有功能|现有功能|原有功能|原功能|现功能
+            |函数签名|接口|api|契约
+            |构建|ci|流水线
+        )
+        \s*
+        (?:不要|不用|别|严禁|不可|禁止|切勿|请勿|无需|不能|不得)
+        \s*
+        (?:修改|改动|改|动|碰|变动|更新|删除|删掉|破坏|触碰|影响)
+    )
+    """
+)
+
+
+def strip_localized_negatives(text: str) -> str:
+    """
+    Strips scoped/localized negative constraints (e.g. 'do not edit tests', '不要修改测试用例')
+    so they are not misclassified as global read-only directives for the whole task.
+    """
+    return LOCALIZED_NEGATION_RE.sub(" ", text)
 
 
 def _split_prompt_clauses(lower: str) -> List[str]:
@@ -197,6 +299,14 @@ def _is_question_clause(clause: str) -> bool:
         return True
     if any(clause.endswith(p) for p in _ZH_FINAL_PARTICLES):
         return True
+    # An imperative negative constraint (e.g. "do not edit tests", "don't modify code")
+    # starts with "do not" / "don't" or matches localized negation, and should not be
+    # misclassified as a question just because it starts with "do"/"don't".
+    if re.match(r"^(?:do\s+not|don'?t|never|please\s+do\s+not|please\s+don'?t)\s+(?:edit|modify|change|touch|alter|overwrite|update|delete|remove|break|write|add|create|revert)\b", clause, re.IGNORECASE):
+        return False
+    if LOCALIZED_NEGATION_RE.search(clause):
+        if not any(m in clause for m in _ZH_QUESTION_MARKERS) and not _ZH_A_NOT_A.search(clause):
+            return False
     if any(m in clause for m in _ZH_QUESTION_MARKERS):
         return True
     if _ZH_A_NOT_A.search(clause):
@@ -255,6 +365,7 @@ def classify_prompt_intent(prompt: str) -> str:
     also carries an explicit imperative coding instruction; when unsure, prefer read-only.
     """
     lower = prompt.lower().strip()
+    cleaned_lower = strip_localized_negatives(prompt).lower().strip()
 
     # 1. Action verbs for Chinese (expanded to include incremental creation words)
     chinese_coding_triggers = [
@@ -281,9 +392,10 @@ def classify_prompt_intent(prompt: str) -> str:
         "只看不改", "只解释", "无需修改", "不要写代码", "别写代码", "不用写代码",
         "只分析", "只做分析", "只读",
         "don't modify", "do not modify", "without modifying", "don't edit", "do not edit",
+        "don't write code", "do not write code", "never write code",
         "read only", "readonly", "explain only", "just explain"
     ]
-    has_negation = any(n in lower for n in negation_patterns)
+    has_negation = any(n in cleaned_lower for n in negation_patterns)
 
     has_chinese_coding = any(k in lower for k in chinese_coding_triggers)
     has_english_coding = any(re.search(pat, lower) for pat in english_coding_patterns)
@@ -292,7 +404,7 @@ def classify_prompt_intent(prompt: str) -> str:
 
     # Questions ("这个项目支持 Windows 吗？", "Should I add a lockfile?") stay read-only unless an explicit
     # imperative instruction is present ("…？如果不支持，请添加支持", "Could you please add …?").
-    if has_coding_action and (explicit_imperative or not is_inquiry_prompt(lower)):
+    if has_coding_action and (explicit_imperative or not is_inquiry_prompt(cleaned_lower or lower)):
         return "code"
 
     # If user asked for review without coding actions (or with explicit read-only negation)
@@ -353,10 +465,14 @@ def check_load_backpressure(load_threshold: float = 24.0) -> bool:
 def _explicit_readonly_request(prompt: str) -> bool:
     # Reuse the pipeline's existing negative-instruction boundary when an
     # explicit workflow is selected; workflow selection cannot grant writes.
+    # Scoped / localized negative phrases (e.g. "do not edit tests") are
+    # negative constraints on specific scopes, not whole-task read-only requests.
+    cleaned = strip_localized_negatives(prompt).lower()
     triggers = (
         "不要修改", "不用修改", "别修改", "不要改", "别改", "不用改",
         "只看不改", "只解释", "无需修改", "不要写代码", "别写代码", "不用写代码",
         "只分析", "只做分析", "只读", "don't modify", "do not modify", "without modifying",
-        "don't edit", "do not edit", "read only", "readonly", "explain only", "just explain",
+        "don't edit", "do not edit", "don't write code", "do not write code", "never write code",
+        "read only", "readonly", "explain only", "just explain",
     )
-    return any(value in prompt.lower() for value in triggers)
+    return any(value in cleaned for value in triggers)

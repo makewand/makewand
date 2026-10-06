@@ -217,7 +217,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     if (p / "go.mod").exists():
         if not shutil.which("go"):
             return False, LocalTestsUnavailable("检测到 Go 项目，但缺少 go 测试工具，验收未执行")
-        test_suites.append(("Go", ["go", "test", "./..."], {}))
+        test_suites.append(("Go", ["go", "test", "-v", "./..."], {}))
 
     # 3. Node / npm test suites
     if (p / "package.json").exists():
@@ -298,7 +298,9 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         if code == 0 and name == "Python" and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", stdout + "\n" + stderr) or "Exit:" in (stdout + "\n" + stderr)):
             return False, LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
 
-        if code == 0 and name == "Go" and "[no test files]" in (stdout + stderr) and "PASS" not in stdout:
+        # A package-level PASS also appears when every test was skipped. Require
+        # one verbose test/example PASS; dependencies with no tests are harmless.
+        if code == 0 and name == "Go" and not re.search(r"(?m)^--- PASS: \S+", stdout):
             return False, LocalTestsUnavailable("Go 测试套件未发现任何有效测试用例，不能作为通过的验收证据")
 
         if code == 0 and name == "Node" and re.search(r"\b(No tests found|0 passing)\b", stdout + "\n" + stderr):
@@ -696,6 +698,8 @@ def _run_pipeline_impl(
         return max(0, min(requested, pipeline_deadline - time.monotonic()))
 
     # Explicit read-only / negative patterns strictly override force_code
+    # when the task itself is explicitly read-only. Localized negative phrases
+    # (e.g. "do not edit tests") do not hijack force_code.
     has_explicit_readonly = _explicit_readonly_request(prompt)
 
     if has_explicit_readonly:
@@ -1421,7 +1425,7 @@ def _run_pipeline_impl(
             _outcome["status"] = "TIMEOUT"
         return reject_unverified("全局截止时间已到，拒绝开始交付")
     if is_shadow_active:
-        if shadow_branch or native_delivery is not None:
+        if shadow_branch or native_delivery is not None or delivery_baseline is not None:
             delivered_branch = shadow_branch
             has_baseline_conflict = False
             try:
@@ -1764,7 +1768,9 @@ def _run_pipeline_impl(
                     print(f"  独立补丁备用存档: {c(str(patch_file), COLOR_CYAN)}")
                     print(f"  一键应用脚本备用: {c(apply_script_esc, COLOR_CYAN)}\n")
             else:
-                print("  已在独立隔离副本保存所有产物，原工作区未受任何修改污染。\n")
+                print("  已封存非 Git 隔离副本的交付补丁，原工作区未受任何修改污染。")
+                print(f"  固定提交与补丁清单: {manifest_file}")
+                print(f"  一键应用交付补丁: {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}\n")
 
     if get_remaining_timeout(timeout) <= 0:
         if _outcome is not None:

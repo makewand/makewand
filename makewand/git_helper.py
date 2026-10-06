@@ -1454,6 +1454,10 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
     # Fallback to standalone isolated copy (no git branch) for non-git directories
     try:
         clone_isolated_worktree(str(base_path), worktree_dir)
+        baseline_code, baseline, baseline_error = run_git_cmd(
+            ["git", "rev-parse", "HEAD"], cwd=str(worktree_dir))
+        if baseline_code or not baseline.strip():
+            raise OSError(f"cannot identify isolated copy baseline: {baseline_error}")
         def clone_cleanup():
             shutil.rmtree(worktree_dir, ignore_errors=True)
 
@@ -1461,7 +1465,7 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
             str(worktree_dir),
             None,
             clone_cleanup,
-            baseline_commit=None,
+            baseline_commit=baseline.strip(),
             repo_head=None,
             repo_root=str(base_path),
             worktree_root=str(worktree_dir)

@@ -348,6 +348,143 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
             run_pipeline("审查当前改动，不要修改文件", force_code=True)
             mock_review.assert_called()
 
+    def test_localized_negative_phrases_do_not_override_force_code(self):
+        """Regression test for Priority 3: localized negative phrases (e.g. 'do not edit tests') must not hijack force_code."""
+        from makewand.orchestrator import run_pipeline, classify_prompt_intent, _explicit_readonly_request
+        # 1. Intent classification must preserve code intent when negative phrase is localized to tests/specs
+        self.assertEqual(classify_prompt_intent("Fix the bug, do not edit tests"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not edit existing test cases"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not touch test files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not modify files other than foo.py"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not edit anything except bar.py"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not edit other files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not modify other files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not change other files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not touch other files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not edit any other files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not modify existing logic"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not alter existing logic"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not touch existing logic"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not change existing logic"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not modify existing code"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not edit existing code"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not touch existing code"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, do not modify existing behavior"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, without modifying other files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, without modifying existing code"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, without modifying existing logic"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, please do not edit other files"), "code")
+        self.assertEqual(classify_prompt_intent("Fix bug, please do not modify other files"), "code")
+        self.assertEqual(classify_prompt_intent("Implement feature, without modifying existing tests"), "code")
+        self.assertEqual(classify_prompt_intent("实现修复逻辑并写单测，不要修改测试用例"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，测试不要改"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，测试文件不要改"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，单测不要修改"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要改动任何文件除了 main.py"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改除了main.py之外的文件"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，除了main.py其他文件不要修改"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，除main.py外不要修改任何文件"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改其他文件"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改任何其他文件"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要改其他文件"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，其他文件不要修改"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改原有逻辑"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要改动业务逻辑"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改现有代码结构"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改已有功能"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改任何已有代码"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要破坏已有功能"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，切勿破坏已有功能"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要改动接口"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要修改函数签名"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要改动任何单测"), "code")
+        self.assertEqual(classify_prompt_intent("修复这个bug，不要改任何测试"), "code")
+        self.assertEqual(classify_prompt_intent("重构函数，配置文件切勿变动"), "code")
+
+        # 2. _explicit_readonly_request must be False for localized negative phrases
+        self.assertFalse(_explicit_readonly_request("Fix the bug, do not edit tests"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not edit existing test cases"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not touch test files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not modify files other than foo.py"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not edit anything except bar.py"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not edit other files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not modify other files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not change other files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not touch other files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not edit any other files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not modify existing logic"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not alter existing logic"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not touch existing logic"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not change existing logic"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not modify existing code"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not edit existing code"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not touch existing code"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, do not modify existing behavior"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, without modifying other files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, without modifying existing code"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, without modifying existing logic"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, please do not edit other files"))
+        self.assertFalse(_explicit_readonly_request("Fix bug, please do not modify other files"))
+        self.assertFalse(_explicit_readonly_request("do not edit tests"))
+        self.assertFalse(_explicit_readonly_request("不要修改测试用例"))
+        self.assertFalse(_explicit_readonly_request("without modifying tests"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，测试不要改"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，测试文件不要改"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，单测不要修改"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要改动任何文件除了 main.py"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，除了main.py其他文件不要修改"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，除main.py外不要修改任何文件"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要修改其他文件"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要修改任何其他文件"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要改其他文件"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，其他文件不要修改"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要修改原有逻辑"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要改动业务逻辑"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要修改现有代码结构"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要修改已有功能"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要修改任何已有代码"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要破坏已有功能"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，切勿破坏已有功能"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要改动接口"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要修改函数签名"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要改动任何单测"))
+        self.assertFalse(_explicit_readonly_request("修复这个bug，不要改任何测试"))
+        self.assertFalse(_explicit_readonly_request("重构函数，配置文件切勿变动"))
+
+        # 3. Pipeline execution must keep writable coding mode when force_code=True or coding task contains localized negative phrase
+        with patch("makewand.orchestrator.execute_claude_task") as mock_claude, \
+             patch("makewand.orchestrator.get_or_update_status") as mock_status, \
+             patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
+             patch("makewand.git_helper.PipelineWorkspaceGuard.acquire_workspace_lock", return_value=None), \
+             patch("makewand.orchestrator.run_local_tests", return_value=(True, "OK")):
+            mock_status.return_value = {
+                "claude": {"status": "ready", "tier": "standard"},
+                "codex": {"status": "ready", "tier": "deep"},
+                "agy": {"status": "ready", "tier": "deep"},
+                "muse": {"status": "ready", "tier": "standard"}
+            }
+            mock_claude.return_value = (True, "Code updated successfully", None)
+
+            # Case A: Prompt contains 'do not edit tests' with force_code=True -> must NOT be readonly
+            run_pipeline("Fix the bug, do not edit tests", force_code=True, auto_fix=False)
+            self.assertTrue(mock_claude.called)
+            _, kwargs = mock_claude.call_args
+            self.assertFalse(kwargs.get("readonly", False), "force_code=True was wrongly hijacked into readonly=True!")
+
+            # Case B: Prompt contains only 'do not edit tests' with force_code=True -> must respect force_code=True
+            mock_claude.reset_mock()
+            run_pipeline("do not edit tests", force_code=True, auto_fix=False)
+            self.assertTrue(mock_claude.called)
+            _, kwargs = mock_claude.call_args
+            self.assertFalse(kwargs.get("readonly", False), "force_code=True was wrongly hijacked for 'do not edit tests'!")
+
+            # Case C: Prompt contains localized negative without force_code, but has coding action -> code mode
+            mock_claude.reset_mock()
+            run_pipeline("Fix the bug, do not edit tests", force_code=False, auto_fix=False)
+            self.assertTrue(mock_claude.called)
+            _, kwargs = mock_claude.call_args
+            self.assertFalse(kwargs.get("readonly", False), "Coding action with localized negative phrase was wrongly downgraded to readonly!")
+
 
 if __name__ == "__main__":
     unittest.main()

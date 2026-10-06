@@ -13,14 +13,6 @@ from makewand.workflow import provider_outcome
 def parse_codex_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     lower = output.lower()
 
-    # 1. Proactive weekly exhaustion warnings (e.g., "weekly limit: 7% left" or "less than 10% of your weekly limit left")
-    pct_left_match = re.search(r"weekly\s*limit:\s*(\d+)%\s*left", lower) or re.search(r"less\s*than\s*(\d+)%\s*of\s*(?:your\s+)?weekly\s*limit\s*left", lower)
-    if pct_left_match:
-        pct_val = int(pct_left_match.group(1))
-        if pct_val <= 10:
-            iso_reset = (datetime.now() + timedelta(hours=3)).isoformat()
-            return True, f"每周额度濒临耗尽 (剩余 {pct_val}%)", iso_reset
-
     # 2. Hard quota / usage limit reached
     if any(k in lower for k in [
         "hit your usage limit",
@@ -43,6 +35,31 @@ def parse_codex_quota(output: str) -> Tuple[bool, str, Optional[str]]:
             reset_match = re.search(r"(?:try\s+again\s+(?:at|in)|resets\s+(?:at|in)?)\s+([^·.\n]+)", output, re.IGNORECASE)
             reset_time = reset_match.group(1).strip().rstrip(". ") if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
             return True, f"请求频率受限 (429 · 重置时间: {reset_time})", reset_time
+
+    # Warnings are not hard 429/exhaustion evidence. Preserve the legacy
+    # <=10% policy unless a valid reserve was explicitly selected.
+    exact = re.search(r"weekly\s*limit:\s*(\d+(?:\.\d+)?)%\s*left", lower)
+    upper = re.search(r"less\s*than\s*(\d+)%\s*of\s*(?:your\s+)?weekly\s*limit\s*left", lower)
+    if exact or upper:
+        from makewand.health import QUOTA_RESERVE_ENV, _quota_reserve_setting, _get_official_subscription_quota
+        reserve, error = _quota_reserve_setting()
+        if QUOTA_RESERVE_ENV not in os.environ or error:
+            pct_val = float((exact or upper).group(1))
+            if pct_val <= 10:
+                return True, f"每周额度濒临耗尽 (剩余 {pct_val:g}%)", (datetime.now() + timedelta(hours=3)).isoformat()
+        else:
+            if exact:
+                remaining = float(exact.group(1))
+                known = 0 <= remaining <= 100
+            else:
+                # "less than 10%" is only an upper bound. Do not turn it into
+                # assumed capacity; consult the unchanged account/TTL reader.
+                quota = _get_official_subscription_quota("codex")
+                remaining = quota.get("percentage") if quota and quota.get("source") == "official" else None
+                known = isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
+            if not known or remaining <= 0 or remaining < reserve:
+                detail = f"剩余 {remaining:g}% < {reserve:g}%" if known and remaining > 0 else "剩余额度耗尽或无法确认"
+                return True, f"配额保护阈值拦截 ({detail})", (datetime.now() + timedelta(hours=3)).isoformat()
 
     return False, "", None
 
