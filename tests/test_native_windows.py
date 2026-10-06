@@ -27,6 +27,121 @@ from makewand.protected_files import ProtectedFiles, ProtectionError
 from makewand.providers.base import run_subprocess
 
 
+@unittest.skipUnless(os.name == "nt", "requires real native Windows accounting handles")
+class NativeWindowsAccountingTests(unittest.TestCase):
+    """Required by the native gate, using kernel sharing and real hardlinks."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="makewand-accounting-")
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        self.parent = self.root / "chosen"
+        self.parent.mkdir()
+        self.ledger = self.parent / "calls.json"
+
+    def reserve(self, path=None):
+        from makewand import call_budget
+        return call_budget.reserve("synthetic", "fast", budget_file=path or self.ledger,
+                                   max_model_calls=4, deadline_monotonic=time.monotonic() + 2)
+
+    def test_entire_parent_chain_cannot_be_renamed_during_accounting(self):
+        from makewand import call_budget
+        nested = self.parent / "nested"
+        nested.mkdir()
+        self.ledger = nested / "calls.json"
+        with call_budget._ledger(self.ledger, 4) as (files, data):
+            for parent in (nested, self.parent):
+                with self.subTest(parent=parent.name), self.assertRaises(OSError):
+                    parent.rename(self.root / (parent.name + "-moved"))
+            call_budget._save(files, data)
+        self.assertEqual(json.loads(self.ledger.read_bytes()), data)
+
+    def test_hardlinked_lock_and_ledger_are_refused_before_bytes_or_acl_change(self):
+        from makewand import call_budget
+        from makewand.native_windows import application_security
+        for name in ("calls.json.lock", "calls.json"):
+            with self.subTest(name=name):
+                target = self.root / (name + ".outside")
+                target.write_bytes(b"outside-sentinel\n")
+                before = application_security(target)
+                entry = self.parent / name
+                os.link(target, entry)
+                try:
+                    with self.assertRaises(call_budget.BudgetError):
+                        self.reserve()
+                    self.assertEqual(target.read_bytes(), b"outside-sentinel\n")
+                    self.assertEqual(application_security(target), before)
+                finally:
+                    entry.unlink()
+
+    def test_shared_lock_and_atomic_publication_preserve_completion(self):
+        from makewand import accounting_files, call_budget, filelock
+        identifier = self.reserve()
+        with accounting_files.pin(self.ledger) as files:
+            fd = files.open(files.lock_name, writable=True)
+            try:
+                filelock.flock(fd, filelock.LOCK_EX | filelock.LOCK_NB)
+                began = time.monotonic()
+                with self.assertRaises(call_budget.BudgetDeadlineError):
+                    call_budget.reserve("synthetic", "fast", budget_file=self.ledger,
+                                        max_model_calls=4, deadline_monotonic=began + .05)
+                self.assertGreaterEqual(time.monotonic() - began, .04)
+                with self.assertRaises(OSError):
+                    Path(str(self.ledger) + ".lock").unlink()
+            finally:
+                filelock.flock(fd, filelock.LOCK_UN)
+                os.close(fd)
+        call_budget.complete(identifier, False, 0, result_status="UNKNOWN", outcome_known=False,
+                             budget_file=self.ledger, max_model_calls=4)
+        entry = json.loads(self.ledger.read_bytes())["attempts"][0]
+        self.assertEqual(entry["id"], identifier)
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["result_status"], "UNKNOWN")
+        self.assertFalse(entry["outcome_known"])
+        self.assertEqual(list(self.parent.glob(".call-budget-*")), [])
+
+    def test_initial_junction_alias_and_operator_git_parent_remain_supported(self):
+        from makewand import call_budget
+        nested = self.parent / ".git" / "operator-accounting"
+        self.ledger = nested / "calls.json"
+        first = self.reserve()
+        alias = self.root / "parent-alias"
+        result = subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "mklink", "/J", str(alias), str(self.parent)],
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        try:
+            second = self.reserve(alias / ".git" / "operator-accounting" / "calls.json")
+            call_budget.complete(first, True, 0, result_status="PASSED",
+                                 budget_file=self.ledger, max_model_calls=4)
+            self.assertEqual([entry["id"] for entry in json.loads(self.ledger.read_bytes())["attempts"]],
+                             [first, second])
+            self.assertFalse((alias / ".git" / "operator-accounting" / "calls.json").is_symlink())
+        finally:
+            # Remove only the junction, leaving its real target for TempDir.
+            os.rmdir(alias)
+
+    def test_replaced_temporary_cleanup_deletes_only_its_original_handle(self):
+        from makewand import accounting_files, call_budget
+        original_replace = accounting_files.AccountingFiles.replace
+        moved = self.root / "original-created-temporary"
+        replacements = []
+
+        def substitute(files, name, fd):
+            source = files.path.parent / name
+            source.rename(moved)
+            source.write_bytes(b"replacement-sentinel\n")
+            replacements.append(source)
+            return original_replace(files, name, fd)
+
+        with mock.patch.object(accounting_files.AccountingFiles, "replace", substitute):
+            with self.assertRaises(call_budget.BudgetError):
+                self.reserve()
+        self.assertEqual(len(replacements), 1)
+        self.assertEqual(replacements[0].read_bytes(), b"replacement-sentinel\n")
+        self.assertFalse(self.ledger.exists())
+        self.assertFalse(moved.exists())
+
+
 class WindowsPathTests(unittest.TestCase):
     def test_original_components_are_checked_before_normalization(self):
         from makewand.windows_paths import extended_local_path, windows_git_directory

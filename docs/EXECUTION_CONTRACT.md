@@ -119,6 +119,14 @@ directory handle, so a concurrent directory rename cannot redirect the write.
 Existing accounting files must be single-link regular files owned by the current
 user. Explicit absolute, relative and home-relative paths remain supported.
 
+The Python SDK resolves operator-selected aliases at the start of each locked
+transaction and keeps its canonical parent directory pinned through lock, read,
+temporary write and atomic replacement. POSIX operations use that directory
+file descriptor; Windows holds the canonical ancestor chain without delete
+sharing. Unsafe file types, owners or multiple links are rejected before
+permission changes or writes. The shared ledger and sidecar-lock protocol stays
+the same for native and SDK callers.
+
 Only `--max-model-calls` creates a task-specific ledger at the CLI entry point.
 The execution library requires a ledger path when a maximum is set; it cannot
 silently start a second independent budget. With neither option, admission is
