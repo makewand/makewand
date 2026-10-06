@@ -9,8 +9,10 @@ import shutil
 import subprocess
 import sys
 import json
+import tempfile
 from pathlib import Path
 from typing import List, Sequence, Dict, Tuple, Optional
+from makewand.sandbox import run_in_sandbox, is_bwrap_available
 
 def auto_format_files(cwd: str, file_paths: Sequence[str]) -> Dict[str, bool]:
     """
@@ -145,17 +147,37 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
         elif ext == ".go":
             if shutil.which("go"):
                 try:
-                    # go vet checks syntax and common mistakes on specific package/file
-                    p = subprocess.run(
-                        ["go", "vet", f"./{os.path.dirname(rel) or '.'}"],
-                        cwd=clean_cwd,
-                        capture_output=True,
-                        text=True,
-                        timeout=8
-                    )
-                    if p.returncode != 0:
-                        err = p.stderr.strip() or f"Go 代码检查失败: {rel}"
-                        errors.append(f"[{rel}] {err}")
+                    rel_dir = os.path.dirname(rel) or "."
+                    has_mod = os.path.exists(os.path.join(clean_cwd, "go.mod"))
+                    pkg_target = f"./{rel_dir}" if has_mod else rel
+                    if is_bwrap_available():
+                        code, out, err_out, _ = run_in_sandbox(
+                            ["go", "vet", pkg_target],
+                            workspace=clean_cwd,
+                            timeout=8,
+                            allow_network=False,
+                            readonly=True,
+                            audit_context="linter_syntax_check",
+                        )
+                        if code != 0:
+                            err = (err_out or out).strip() or f"Go 代码检查失败: {rel}"
+                            errors.append(f"[{rel}] {err}")
+                    else:
+                        with tempfile.TemporaryDirectory() as td:
+                            dest = os.path.join(td, os.path.basename(rel))
+                            shutil.copy2(full_path, dest)
+                            if has_mod:
+                                shutil.copy2(os.path.join(clean_cwd, "go.mod"), os.path.join(td, "go.mod"))
+                            p = subprocess.run(
+                                ["go", "vet", os.path.basename(rel)],
+                                cwd=td,
+                                capture_output=True,
+                                text=True,
+                                timeout=8,
+                            )
+                            if p.returncode != 0:
+                                err = (p.stderr or p.stdout).strip() or f"Go 代码检查失败: {rel}"
+                                errors.append(f"[{rel}] {err}")
                 except Exception as e:
                     errors.append(f"[{rel}] Go vet 检查异常: {e}")
 
@@ -169,32 +191,72 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
         elif ext in (".js", ".mjs", ".cjs"):
             if shutil.which("node"):
                 try:
-                    p = subprocess.run(
-                        ["node", "-c", full_path],
-                        cwd=clean_cwd,
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    if p.returncode != 0:
-                        err = p.stderr.strip() or f"JavaScript 语法错误: {rel}"
-                        errors.append(f"[{rel}] {err}")
+                    if is_bwrap_available():
+                        code, out, err_out, _ = run_in_sandbox(
+                            ["node", "-c", rel],
+                            workspace=clean_cwd,
+                            timeout=5,
+                            allow_network=False,
+                            readonly=True,
+                            audit_context="linter_syntax_check",
+                        )
+                        if code != 0:
+                            err = (err_out or out).strip() or f"JavaScript 语法错误: {rel}"
+                            errors.append(f"[{rel}] {err}")
+                    else:
+                        with tempfile.TemporaryDirectory() as td:
+                            dest = os.path.join(td, os.path.basename(rel))
+                            shutil.copy2(full_path, dest)
+                            p = subprocess.run(
+                                ["node", "-c", os.path.basename(rel)],
+                                cwd=td,
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                            )
+                            if p.returncode != 0:
+                                err = (p.stderr or p.stdout).strip() or f"JavaScript 语法错误: {rel}"
+                                errors.append(f"[{rel}] {err}")
                 except Exception as e:
                     errors.append(f"[{rel}] Node.js 语法检查异常: {e}")
 
         elif ext == ".rs":
             if shutil.which("rustc"):
                 try:
-                    p = subprocess.run(
-                        ["rustc", "--emit=metadata", "-o", "/dev/null", full_path],
-                        cwd=clean_cwd,
-                        capture_output=True,
-                        text=True,
-                        timeout=8
-                    )
-                    if p.returncode != 0:
-                        err = p.stderr.strip().splitlines()[0] if p.stderr.strip() else f"Rust 编译检查失败: {rel}"
-                        errors.append(f"[{rel}] {err}")
+                    if is_bwrap_available():
+                        extra_ro: List[str] = []
+                        rustup_dir = os.path.expanduser("~/.rustup")
+                        if os.path.exists(rustup_dir):
+                            real_rustup = os.path.realpath(rustup_dir)
+                            extra_ro.append(real_rustup)
+                            if real_rustup != rustup_dir:
+                                extra_ro.append(rustup_dir)
+                        code, out, err_out, _ = run_in_sandbox(
+                            ["rustc", "--emit=metadata", "--out-dir", "/tmp", rel],
+                            workspace=clean_cwd,
+                            timeout=8,
+                            allow_network=False,
+                            readonly=True,
+                            extra_ro_binds=extra_ro if extra_ro else None,
+                            audit_context="linter_syntax_check",
+                        )
+                        if code != 0:
+                            err = err_out.strip().splitlines()[0] if err_out.strip() else f"Rust 编译检查失败: {rel}"
+                            errors.append(f"[{rel}] {err}")
+                    else:
+                        with tempfile.TemporaryDirectory() as td:
+                            dest = os.path.join(td, os.path.basename(rel))
+                            shutil.copy2(full_path, dest)
+                            p = subprocess.run(
+                                ["rustc", "--emit=metadata", "-o", os.devnull, os.path.basename(rel)],
+                                cwd=td,
+                                capture_output=True,
+                                text=True,
+                                timeout=8,
+                            )
+                            if p.returncode != 0:
+                                err = p.stderr.strip().splitlines()[0] if p.stderr.strip() else f"Rust 编译检查失败: {rel}"
+                                errors.append(f"[{rel}] {err}")
                 except Exception as e:
                     errors.append(f"[{rel}] Rustc 语法检查异常: {e}")
 

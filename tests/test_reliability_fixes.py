@@ -348,6 +348,54 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
             run_pipeline("审查当前改动，不要修改文件", force_code=True)
             mock_review.assert_called()
 
+    def test_localized_negative_phrases_do_not_override_force_code(self):
+        """Regression test for Priority 3: localized negative phrases (e.g. 'do not edit tests') must not hijack force_code."""
+        from makewand.orchestrator import run_pipeline, classify_prompt_intent, _explicit_readonly_request
+        # 1. Intent classification must preserve code intent when negative phrase is localized to tests/specs
+        self.assertEqual(classify_prompt_intent("Fix the bug, do not edit tests"), "code")
+        self.assertEqual(classify_prompt_intent("Implement feature, without modifying existing tests"), "code")
+        self.assertEqual(classify_prompt_intent("实现修复逻辑并写单测，不要修改测试用例"), "code")
+
+        # 2. _explicit_readonly_request must be False for localized negative phrases
+        self.assertFalse(_explicit_readonly_request("Fix the bug, do not edit tests"))
+        self.assertFalse(_explicit_readonly_request("do not edit tests"))
+        self.assertFalse(_explicit_readonly_request("不要修改测试用例"))
+        self.assertFalse(_explicit_readonly_request("without modifying tests"))
+
+        # 3. Pipeline execution must keep writable coding mode when force_code=True or coding task contains localized negative phrase
+        with patch("makewand.orchestrator.execute_claude_task") as mock_claude, \
+             patch("makewand.orchestrator.get_or_update_status") as mock_status, \
+             patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
+             patch("makewand.git_helper.PipelineWorkspaceGuard.acquire_workspace_lock", return_value=None), \
+             patch("makewand.orchestrator.run_local_tests", return_value=(True, "OK")):
+            mock_status.return_value = {
+                "claude": {"status": "ready", "tier": "standard"},
+                "codex": {"status": "ready", "tier": "deep"},
+                "agy": {"status": "ready", "tier": "deep"},
+                "muse": {"status": "ready", "tier": "standard"}
+            }
+            mock_claude.return_value = (True, "Code updated successfully", None)
+
+            # Case A: Prompt contains 'do not edit tests' with force_code=True -> must NOT be readonly
+            run_pipeline("Fix the bug, do not edit tests", force_code=True, auto_fix=False)
+            self.assertTrue(mock_claude.called)
+            _, kwargs = mock_claude.call_args
+            self.assertFalse(kwargs.get("readonly", False), "force_code=True was wrongly hijacked into readonly=True!")
+
+            # Case B: Prompt contains only 'do not edit tests' with force_code=True -> must respect force_code=True
+            mock_claude.reset_mock()
+            run_pipeline("do not edit tests", force_code=True, auto_fix=False)
+            self.assertTrue(mock_claude.called)
+            _, kwargs = mock_claude.call_args
+            self.assertFalse(kwargs.get("readonly", False), "force_code=True was wrongly hijacked for 'do not edit tests'!")
+
+            # Case C: Prompt contains localized negative without force_code, but has coding action -> code mode
+            mock_claude.reset_mock()
+            run_pipeline("Fix the bug, do not edit tests", force_code=False, auto_fix=False)
+            self.assertTrue(mock_claude.called)
+            _, kwargs = mock_claude.call_args
+            self.assertFalse(kwargs.get("readonly", False), "Coding action with localized negative phrase was wrongly downgraded to readonly!")
+
 
 if __name__ == "__main__":
     unittest.main()

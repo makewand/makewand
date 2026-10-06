@@ -698,12 +698,14 @@ def _run_pipeline_impl(
         return max(0, min(requested, pipeline_deadline - time.monotonic()))
 
     # Explicit read-only / negative patterns strictly override force_code
+    # when the task itself is explicitly read-only. Localized negative phrases
+    # (e.g. "do not edit tests") do not hijack force_code.
     has_explicit_readonly = _explicit_readonly_request(prompt)
 
     if has_explicit_readonly:
         intent = classify_prompt_intent(prompt)
         if intent == "code":
-            intent = "explain"
+            intent = "code" if force_code else "explain"
     elif force_code:
         intent = "code"
     else:

@@ -127,3 +127,42 @@ class TestLinter(unittest.TestCase):
             self.assertEqual(called_cmd[0], "prettier")
             self.assertIn("--no-config", called_cmd)
             self.assertIn("--write", called_cmd)
+
+    def test_fast_syntax_check_routes_through_sandbox(self):
+        """Regression test for Priority 1: fast_syntax_check must execute compilers inside sandbox."""
+        from unittest.mock import patch
+        js_file = Path(self.cwd) / "sample.js"
+        js_file.write_text("console.log(1);\n", encoding="utf-8")
+
+        with patch("makewand.linter.is_bwrap_available", return_value=True), \
+             patch("makewand.linter.run_in_sandbox", return_value=(0, "", "", None)) as mock_sandbox:
+            ok, errors = fast_syntax_check(self.cwd, ["sample.js"])
+            self.assertTrue(ok)
+            self.assertEqual(errors, [])
+            self.assertTrue(mock_sandbox.called)
+            cmd = mock_sandbox.call_args[0][0]
+            self.assertEqual(cmd[0], "node")
+            self.assertEqual(cmd[1], "-c")
+            kwargs = mock_sandbox.call_args[1]
+            self.assertTrue(kwargs.get("readonly"))
+            self.assertFalse(kwargs.get("allow_network"))
+            self.assertEqual(kwargs.get("audit_context"), "linter_syntax_check")
+
+    def test_fast_syntax_check_non_bwrap_isolated_temp_env(self):
+        """Regression test for Priority 1: when bwrap is absent, syntax checks must run in an isolated temp environment."""
+        from unittest.mock import patch, MagicMock
+        js_file = Path(self.cwd) / "script.js"
+        js_file.write_text("const x = 1;\n", encoding="utf-8")
+
+        with patch("makewand.linter.is_bwrap_available", return_value=False), \
+             patch("subprocess.run") as mock_subproc:
+            mock_subproc.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            ok, errors = fast_syntax_check(self.cwd, ["script.js"])
+            self.assertTrue(ok)
+            self.assertEqual(errors, [])
+            self.assertTrue(mock_subproc.called)
+            # The cwd must NOT be the host workspace
+            run_cwd = mock_subproc.call_args[1].get("cwd")
+            self.assertNotEqual(run_cwd, self.cwd)
+            self.assertTrue(os.path.isdir(run_cwd) or "/tmp" in run_cwd)
+

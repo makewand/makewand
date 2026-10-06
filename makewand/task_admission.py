@@ -243,6 +243,39 @@ def has_explicit_coding_imperative(prompt: str) -> bool:
     return False
 
 
+LOCALIZED_NEGATION_RE = re.compile(
+    r"""(?ix)
+    (?:
+        \b(?:do\s+not|don'?t|without|never)\s+
+        (?:edit(?:ing)?|modify(?:ing)?|chang(?:e|ing)|touch(?:ing)?|alter(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing))\s+
+        (?:the\s+|existing\s+|unit\s+|any\s+|current\s+|original\s+|these\s+|those\s+)?
+        (?:tests?|test\s+cases?|test\s+files?|test\s+suites?|specs?|spec\s+files?|fixtures?|cases?|examples?|configs?|configurations?|env|\.env|package\.json|go\.mod|Cargo\.toml|README(?:\.md)?|\S+\.(?:py|go|rs|js|ts|json|md|txt|yml|yaml|toml))\b
+    |
+        \b(?:do\s+not|don'?t|without|never)\s+
+        (?:edit(?:ing)?|modify(?:ing)?|chang(?:e|ing)|touch(?:ing)?|alter(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing))\s+
+        (?:any\s+)?(?:files?|code)\s+(?:other\s+than|except|outside(?:\s+of)?)\b
+    |
+        (?:不要|不用|别|严禁|不可|禁止|切勿)
+        (?:修改|改动|改|动|碰|变动|更新)?
+        (?:现有|原有的?|原|已有的?|现存|本有的?)?
+        (?:测试|测试用例|用例|单测|原测试|单元测试|测试代码|测试文件|配置文件|配置|环境|说明|除[^\s，,。；;]+之?外)
+    |
+        (?:不要|不用|别|严禁|不可|禁止|切勿)
+        (?:修改|改动|改|动|碰|变动|更新)
+        (?:其他|其它)?(?:文件|代码)?(?:除了|除)
+    )
+    """
+)
+
+
+def strip_localized_negatives(text: str) -> str:
+    """
+    Strips scoped/localized negative constraints (e.g. 'do not edit tests', '不要修改测试用例')
+    so they are not misclassified as global read-only directives for the whole task.
+    """
+    return LOCALIZED_NEGATION_RE.sub(" ", text)
+
+
 def classify_prompt_intent(prompt: str) -> str:
     """
     Classify user prompt into:
@@ -255,6 +288,7 @@ def classify_prompt_intent(prompt: str) -> str:
     also carries an explicit imperative coding instruction; when unsure, prefer read-only.
     """
     lower = prompt.lower().strip()
+    cleaned_lower = strip_localized_negatives(prompt).lower().strip()
 
     # 1. Action verbs for Chinese (expanded to include incremental creation words)
     chinese_coding_triggers = [
@@ -283,7 +317,7 @@ def classify_prompt_intent(prompt: str) -> str:
         "don't modify", "do not modify", "without modifying", "don't edit", "do not edit",
         "read only", "readonly", "explain only", "just explain"
     ]
-    has_negation = any(n in lower for n in negation_patterns)
+    has_negation = any(n in cleaned_lower for n in negation_patterns)
 
     has_chinese_coding = any(k in lower for k in chinese_coding_triggers)
     has_english_coding = any(re.search(pat, lower) for pat in english_coding_patterns)
@@ -353,10 +387,13 @@ def check_load_backpressure(load_threshold: float = 24.0) -> bool:
 def _explicit_readonly_request(prompt: str) -> bool:
     # Reuse the pipeline's existing negative-instruction boundary when an
     # explicit workflow is selected; workflow selection cannot grant writes.
+    # Scoped / localized negative phrases (e.g. "do not edit tests") are
+    # negative constraints on specific scopes, not whole-task read-only requests.
+    cleaned = strip_localized_negatives(prompt).lower()
     triggers = (
         "不要修改", "不用修改", "别修改", "不要改", "别改", "不用改",
         "只看不改", "只解释", "无需修改", "不要写代码", "别写代码", "不用写代码",
         "只分析", "只做分析", "只读", "don't modify", "do not modify", "without modifying",
         "don't edit", "do not edit", "read only", "readonly", "explain only", "just explain",
     )
-    return any(value in prompt.lower() for value in triggers)
+    return any(value in cleaned for value in triggers)
