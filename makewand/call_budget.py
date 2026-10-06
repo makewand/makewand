@@ -6,14 +6,11 @@ CLI internal turns and token usage remain separately measured or unknown.
 import json
 import math
 import errno
-import stat
 import os
-import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
-from makewand import filelock
+from makewand import accounting_files, filelock
 
 
 class BudgetError(RuntimeError):
@@ -44,51 +41,48 @@ def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None):
             raise BudgetError("model call maximum requires a shared ledger path")
         yield None, None
         return
-    path = Path(value).expanduser().resolve()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    acquired = False
-    # Accounting/cleanup uses its own bounded deadline after cancellation.
-    lock_deadline = time.monotonic() + 5 if lock_deadline is None else lock_deadline
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise BudgetError("model call budget lock must be a regular file")
-        while True:
-            if time.monotonic() >= lock_deadline:
-                raise BudgetDeadlineError("execution deadline expired while acquiring the model call budget")
-            try:
-                filelock.flock(descriptor, filelock.LOCK_EX | filelock.LOCK_NB)
-                acquired = True
-                break
-            except OSError as error:
-                if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK) and getattr(error, "winerror", None) not in (33, 158):
-                    raise
-                time.sleep(min(.01, max(0, lock_deadline - time.monotonic())))
+    with accounting_files.pin(value) as path:
+        descriptor = path.open(path.lock_name, create=True, writable=True)
+        path.lock_fd = descriptor
+        acquired = False
+        # Accounting/cleanup uses its own bounded deadline after cancellation.
+        lock_deadline = time.monotonic() + 5 if lock_deadline is None else lock_deadline
         try:
-            ledger_fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
-        except FileNotFoundError:
-            limit = int(max_model_calls if max_model_calls is not None else os.environ.get("MAKEWAND_MAX_MODEL_CALLS", "0"))
-            if limit <= 0:
-                raise BudgetError("model call budget requires a positive maximum")
-            data = {"schema": 1, "maximum": limit, "attempts": []}
-        else:
-            with os.fdopen(ledger_fd, "rb") as stream:
-                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                    raise BudgetError("model call budget ledger must be a regular file")
-                raw = stream.read(MAX_LEDGER_BYTES + 1)
-                if len(raw) > MAX_LEDGER_BYTES:
-                    raise BudgetError("model call budget ledger exceeds 16 MiB")
-            data = json.loads(raw.decode("utf-8"), parse_constant=_reject_nonfinite_json)
-        _validate(data)
-        maximum = _maximum(data, max_model_calls)
-        if maximum < data["maximum"]:
-            data["maximum"] = maximum
-            _save(path, data)
-        yield path, data
-    finally:
-        if acquired:
-            filelock.flock(descriptor, filelock.LOCK_UN)
-        os.close(descriptor)
+            while True:
+                if time.monotonic() >= lock_deadline:
+                    raise BudgetDeadlineError("execution deadline expired while acquiring the model call budget")
+                try:
+                    filelock.flock(descriptor, filelock.LOCK_EX | filelock.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK) and getattr(error, "winerror", None) not in (33, 158):
+                        raise
+                    time.sleep(min(.01, max(0, lock_deadline - time.monotonic())))
+            path.assert_named(path.lock_name, descriptor)
+            try:
+                ledger_fd = path.open(path.name)
+            except FileNotFoundError:
+                limit = int(max_model_calls if max_model_calls is not None else os.environ.get("MAKEWAND_MAX_MODEL_CALLS", "0"))
+                if limit <= 0:
+                    raise BudgetError("model call budget requires a positive maximum")
+                data = {"schema": 1, "maximum": limit, "attempts": []}
+            else:
+                with os.fdopen(ledger_fd, "rb") as stream:
+                    raw = stream.read(MAX_LEDGER_BYTES + 1)
+                    if len(raw) > MAX_LEDGER_BYTES:
+                        raise BudgetError("model call budget ledger exceeds 16 MiB")
+                data = json.loads(raw.decode("utf-8"), parse_constant=_reject_nonfinite_json)
+            _validate(data)
+            maximum = _maximum(data, max_model_calls)
+            if maximum < data["maximum"]:
+                data["maximum"] = maximum
+                _save(path, data)
+            yield path, data
+        finally:
+            if acquired:
+                filelock.flock(descriptor, filelock.LOCK_UN)
+            os.close(descriptor)
 
 
 def _validate(data):
@@ -138,22 +132,7 @@ def _save(path, data):
     encoded = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode("utf-8")
     if len(encoded) > MAX_LEDGER_BYTES:
         raise BudgetError("model call budget ledger exceeds 16 MiB")
-    descriptor, name = tempfile.mkstemp(prefix=".call-budget-", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(name, path)
-        if os.name != "nt":
-            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
+    path.save(encoded, path.lock_fd)
 
 
 def reserve(engine, tier, model=None, readonly=False, *, lease_id=None, task_id=None,
