@@ -53,8 +53,8 @@ func (a *Attempt) emit(kind string, outcome Outcome, duration *int64) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	return withLockedFile(ctx, a.config.EventsPath, func() error {
-		file, err := openEventFile(a.config.EventsPath)
+	return withLockedFile(ctx, a.config.EventsPath, a.config.eventsDirectory, func(path *accountingPath) error {
+		file, err := openExecutionFile(path.root, path.name, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 		if err != nil {
 			return err
 		}

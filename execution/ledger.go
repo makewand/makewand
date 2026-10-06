@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -62,11 +61,13 @@ type Attempt struct {
 }
 
 // withLockedFile uses the same sidecar byte lock as Python's filelock module.
-func withLockedFile(ctx context.Context, path string, fn func() error) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn func(*accountingPath) error) error {
+	p, _, err := accountingPathForIdentity(path, expected)
+	if err != nil {
 		return err
 	}
-	f, err := openLockFile(path + ".lock")
+	defer p.close()
+	f, err := openExecutionFile(p.root, p.name+".lock", os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return err
 	}
@@ -91,11 +92,11 @@ func withLockedFile(ctx context.Context, path string, fn func() error) error {
 		}
 	}
 	defer func() { _ = unlock(f) }()
-	return fn()
+	return fn(p)
 }
 
-func readLedger(path string, maximum int) (map[string]any, error) {
-	file, err := openLedgerFile(path)
+func readLedger(path *accountingPath, maximum int) (map[string]any, error) {
+	file, err := openExecutionFile(path.root, path.name, os.O_RDONLY)
 	if errors.Is(err, os.ErrNotExist) {
 		if maximum <= 0 {
 			return nil, fmt.Errorf("new model call ledger requires a positive maximum")
@@ -160,7 +161,7 @@ func jsonInteger(value any) (int, bool) {
 	return result, err == nil
 }
 
-func saveLedger(path string, data map[string]any) error {
+func saveLedger(path *accountingPath, data map[string]any) error {
 	encoded, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
@@ -168,12 +169,12 @@ func saveLedger(path string, data map[string]any) error {
 	if len(encoded)+1 > maximumLedgerBytes {
 		return fmt.Errorf("model call ledger exceeds 16 MiB")
 	}
-	file, err := os.CreateTemp(filepath.Dir(path), ".call-budget-*")
+	temp := ".call-budget-" + NewID()
+	file, err := path.root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	temp := file.Name()
-	defer func() { _ = os.Remove(temp) }()
+	defer func() { _ = path.root.Remove(temp) }()
 	if err := privatefile.Tighten(file); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("protect model call ledger: %w", err)
@@ -188,11 +189,10 @@ func saveLedger(path string, data map[string]any) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	// #nosec G703 -- both paths belong to the explicit ledger directory; replacement is protected by its sidecar lock.
-	if err := os.Rename(temp, path); err != nil {
+	if err := path.root.Rename(temp, path.name); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(path))
+	return syncDirectory(path.root)
 }
 
 // Reserve permanently counts a dispatch before it starts. Failed, canceled, or
@@ -213,8 +213,8 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 	}
 	attempt := &Attempt{ID: NewID(), TaskID: cfg.TaskID, config: cfg, metadata: metadata, started: time.Now(), spanID: NewID(), provider: true}
 	if cfg.LedgerPath != "" {
-		err = withLockedFile(ctx, cfg.LedgerPath, func() error {
-			data, err := readLedger(cfg.LedgerPath, cfg.MaxCalls)
+		err = withLockedFile(ctx, cfg.LedgerPath, cfg.ledgerDirectory, func(path *accountingPath) error {
+			data, err := readLedger(path, cfg.MaxCalls)
 			if err != nil {
 				return err
 			}
@@ -222,7 +222,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 			if cfg.MaxCalls > 0 && cfg.MaxCalls < maximum {
 				maximum = cfg.MaxCalls
 				data["maximum"] = maximum
-				if err := saveLedger(cfg.LedgerPath, data); err != nil {
+				if err := saveLedger(path, data); err != nil {
 					return err
 				}
 			}
@@ -281,7 +281,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 				"status": "started", "tokens": nil, "monetary_cost": nil, "task_id": cfg.TaskID, "stage": metadata.Stage,
 				"account_ref": cfg.AccountRef, "api_policy": nullableString(cfg.APIPolicy), "result_status": nil, "outcome_known": false,
 			})
-			return saveLedger(cfg.LedgerPath, data)
+			return saveLedger(path, data)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("cannot reserve model task: %w", err)
@@ -311,8 +311,8 @@ func (a *Attempt) Complete(outcome Outcome) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if a.config.LedgerPath != "" {
-		if err := withLockedFile(ctx, a.config.LedgerPath, func() error {
-			data, err := readLedger(a.config.LedgerPath, a.config.MaxCalls)
+		if err := withLockedFile(ctx, a.config.LedgerPath, a.config.ledgerDirectory, func(path *accountingPath) error {
+			data, err := readLedger(path, a.config.MaxCalls)
 			if err != nil {
 				return err
 			}
@@ -328,7 +328,7 @@ func (a *Attempt) Complete(outcome Outcome) error {
 				entry["outcome_known"] = outcome.Known
 				entry["tokens"] = outcome.Tokens
 				entry["monetary_cost"] = outcome.MonetaryCost
-				return saveLedger(a.config.LedgerPath, data)
+				return saveLedger(path, data)
 			}
 			return fmt.Errorf("model task reservation disappeared")
 		}); err != nil {

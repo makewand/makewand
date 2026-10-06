@@ -526,6 +526,11 @@ func extractTarGz(archivePath, destDir string) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		return fmt.Errorf("open extraction root: %w", err)
+	}
+	defer root.Close()
 
 	var (
 		totalExtracted int64
@@ -544,20 +549,24 @@ func extractTarGz(archivePath, destDir string) error {
 		if entryCount > maxArchiveEntryCount {
 			return fmt.Errorf("archive entry count exceeds limit of %d", maxArchiveEntryCount)
 		}
-		// Flat archive only: reject any path separators or traversal (zip-slip).
+		// Only canonical basenames or paths within the sessions tree are allowed.
 		name := hdr.Name
 		if !safeArchiveName(name) || seen[name] {
+			return fmt.Errorf("unsafe archive entry: %q", hdr.Name)
+		}
+		localName := filepath.FromSlash(name)
+		if !filepath.IsLocal(localName) {
 			return fmt.Errorf("unsafe archive entry: %q", hdr.Name)
 		}
 		seen[name] = true
 		if hdr.Typeflag != tar.TypeReg {
 			return fmt.Errorf("unsupported archive entry type: %q", name)
 		}
-		dst := filepath.Join(destDir, filepath.FromSlash(name)) //nolint:gosec // G305: name is validated above to be a bare basename (no separators or "..").
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		// Root confines every operation even if an existing parent is a symlink.
+		if err := root.MkdirAll(filepath.Dir(localName), 0o700); err != nil {
 			return err
 		}
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // Canonical allowlisted archive name under the new private staging directory.
+		out, err := root.OpenFile(localName, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 		if err != nil {
 			return fmt.Errorf("create %s: %w", name, err)
 		}
@@ -570,13 +579,13 @@ func extractTarGz(archivePath, destDir string) error {
 		}
 		if written > maxArchiveEntrySize {
 			out.Close()
-			_ = os.Remove(dst) //nolint:gosec // Only the just-created, validated private staging path is removed.
+			_ = root.Remove(localName)
 			return fmt.Errorf("extract %s: entry exceeds max allowed size of %d bytes", name, maxArchiveEntrySize)
 		}
 		totalExtracted += written
 		if totalExtracted > maxArchiveTotalSize {
 			out.Close()
-			_ = os.Remove(dst) //nolint:gosec // Only the just-created, validated private staging path is removed.
+			_ = root.Remove(localName)
 			return fmt.Errorf("archive exceeds total uncompressed size limit of %d bytes", maxArchiveTotalSize)
 		}
 		if err := out.Close(); err != nil {

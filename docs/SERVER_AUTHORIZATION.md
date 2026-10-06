@@ -64,6 +64,13 @@ including across server restarts. Existing cookies created before this binding
 was introduced require a new login. Membership changes do not affect a global
 administrator's browser session, whose authority is the global account role.
 
+Admin browser cookies always use `Secure`, `HttpOnly`, and `SameSite=Lax`,
+including when clearing a session at logout. Use an HTTPS endpoint for browser
+administration, such as a TLS-terminating reverse proxy. The cookie remains
+secure when the proxy forwards HTTP to the server; forwarded request headers
+cannot downgrade its transport protection. Token-authenticated API clients
+retain their existing SSH-tunnel and TLS-proxy deployment options.
+
 Each browser session is also registered in server memory. A signed cookie is
 accepted only while its session is registered, so:
 

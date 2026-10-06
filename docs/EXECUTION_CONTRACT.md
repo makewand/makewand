@@ -110,6 +110,15 @@ JSON and nonfinite values are rejected before invoking a provider. Budget lock
 acquisition obeys the admission deadline. Accounting has a separate bounded
 cleanup deadline so expired work cannot discard the record of a sent attempt.
 
+Native accounting resolves existing operator-selected directory or file aliases
+to their canonical path when creating an execution context. It remembers the
+parent directory's file identity. Later admissions reject a replaced directory
+or a newly inserted alias. Within each locked transaction, ledger reads,
+temporary writes, atomic replacement and directory sync use the same open
+directory handle, so a concurrent directory rename cannot redirect the write.
+Existing accounting files must be single-link regular files owned by the current
+user. Explicit absolute, relative and home-relative paths remain supported.
+
 Only `--max-model-calls` creates a task-specific ledger at the CLI entry point.
 The execution library requires a ledger path when a maximum is set; it cannot
 silently start a second independent budget. With neither option, admission is
