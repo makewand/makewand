@@ -212,7 +212,7 @@ func (m *SessionManager) HandleSessionLogin(w http.ResponseWriter, req *http.Req
 		writeError(w, http.StatusInternalServerError, "login_failed", err.Error())
 		return
 	}
-	m.setCookie(w, req, cookieValue, session.ExpiresAt)
+	m.setCookie(w, cookieValue, session.ExpiresAt)
 	writeJSON(w, http.StatusOK, adminSessionLoginResponse{
 		Authenticated: true,
 		User:          session.User,
@@ -314,15 +314,14 @@ func (m *SessionManager) ValidateCSRF(req *http.Request, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
-func (m *SessionManager) ClearCookie(w http.ResponseWriter, req *http.Request) {
-	//nolint:gosec // G124: HttpOnly+SameSite set; Secure is intentionally conditional on TLS (loopback/tunnel deployments), which gosec cannot prove constant.
+func (m *SessionManager) ClearCookie(w http.ResponseWriter, _ *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   requestUsesTLS(req),
+		Secure:   true,
 		Expires:  time.Unix(0, 0).UTC(),
 		MaxAge:   -1,
 	})
@@ -395,15 +394,14 @@ func (m *SessionManager) parseCookie(value string) (*sessionClaims, bool) {
 	return &claims, true
 }
 
-func (m *SessionManager) setCookie(w http.ResponseWriter, req *http.Request, value string, expiresAt time.Time) {
-	//nolint:gosec // G124: HttpOnly+SameSite set; Secure is intentionally conditional on TLS (loopback/tunnel deployments), which gosec cannot prove constant.
+func (m *SessionManager) setCookie(w http.ResponseWriter, value string, expiresAt time.Time) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   requestUsesTLS(req),
+		Secure:   true,
 		Expires:  expiresAt.UTC(),
 	})
 }
@@ -433,14 +431,4 @@ func requiresCSRFAuthorization(method string) bool {
 	default:
 		return true
 	}
-}
-
-func requestUsesTLS(req *http.Request) bool {
-	if req == nil {
-		return false
-	}
-	if req.TLS != nil {
-		return true
-	}
-	return strings.EqualFold(strings.TrimSpace(req.Header.Get("X-Forwarded-Proto")), "https")
 }

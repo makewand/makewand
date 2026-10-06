@@ -275,36 +275,160 @@ func cliResolveCodexDirectory(path string, validate func(string) error) (string,
 	return "", errors.New("configured CODEX_HOME has too many symbolic links; refusing account fallback")
 }
 
-func maskSensitivePath(args []string, target, workspace string) []string {
-	info, err := os.Lstat(target) //nolint:gosec // G703: sensitive target path is probed on host for sandbox masking
-	if err != nil {
-		return args
+// Construct mask targets only from a fixed credential entry in HOME or from
+// cliConfiguredCodexHome's dedicated-account authorization, never directly from
+// a request pathname.
+type cliCredentialMaskTarget struct{ path string }
+
+func cliHomeMaskTarget(home, entry string) (cliCredentialMaskTarget, error) {
+	local := filepath.FromSlash(entry)
+	if !filepath.IsLocal(local) {
+		return cliCredentialMaskTarget{}, errors.New("invalid credential mask entry")
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		real, statErr := filepath.EvalSymlinks(target)
-		if statErr != nil {
-			return args // dangling symlink: nothing readable behind it
+	allowed := false
+	for _, candidate := range cliSensitiveHomeEntries {
+		allowed = allowed || entry == candidate
+	}
+	for _, entries := range cliProviderCredentials {
+		for _, candidate := range entries {
+			allowed = allowed || entry == candidate
 		}
-		// If real target is under a masked host root and not within workspace,
-		// it is already hidden by the root's tmpfs mount, leaving target dangling inside sandbox.
-		for _, m := range []string{"/home", "/mnt", "/root", "/media", "/srv"} {
-			if cliPathWithin(m, real) && !cliPathWithin(workspace, real) {
-				return args
-			}
+	}
+	if !allowed {
+		return cliCredentialMaskTarget{}, errors.New("invalid credential mask entry")
+	}
+	return cliCredentialMaskTarget{filepath.Join(home, local)}, nil
+}
+
+func cliMaskLinkIsUnambiguous(link string) bool {
+	if os.PathSeparator != '\\' || filepath.IsAbs(link) {
+		return true
+	}
+	// A Windows drive-relative or rooted-but-not-absolute target cannot be
+	// interpreted relative to the pinned parent without selecting another path.
+	return filepath.VolumeName(link) == "" && (len(link) == 0 || !os.IsPathSeparator(link[0]))
+}
+
+// cliInspectMaskTarget follows authorized credential aliases through pinned
+// parents. The volume root is a namespace anchor, not an account allowlist.
+// Every filesystem operation receives a single local component; symlink target
+// navigation is handled physically rather than cleaned across another symlink.
+func cliInspectMaskTarget(target cliCredentialMaskTarget) (string, os.FileInfo, error) {
+	path, err := filepath.Abs(target.path)
+	if err != nil {
+		return "", nil, err
+	}
+	var roots []*os.Root
+	var paths []string
+	closeRoots := func() {
+		for _, root := range roots {
+			_ = root.Close()
 		}
-		target = real
-		info, err = os.Stat(target) //nolint:gosec // G703: real path after symlink evaluation
+		roots, paths = nil, nil
+	}
+	defer closeRoots()
+	openAnchor := func(path string) ([]string, error) {
+		closeRoots()
+		anchor := filepath.VolumeName(path) + string(os.PathSeparator)
+		root, err := os.OpenRoot(anchor)
 		if err != nil {
-			return args
+			return nil, err
+		}
+		roots, paths = []*os.Root{root}, []string{anchor}
+		return strings.Split(strings.TrimPrefix(path, anchor), string(os.PathSeparator)), nil
+	}
+	parts, err := openAnchor(path)
+	if err != nil {
+		return "", nil, err
+	}
+	links := 0
+	for len(parts) != 0 {
+		component := parts[0]
+		parts = parts[1:]
+		switch component {
+		case "", ".":
+			continue
+		case "..":
+			if len(roots) > 1 {
+				_ = roots[len(roots)-1].Close()
+				roots, paths = roots[:len(roots)-1], paths[:len(paths)-1]
+			}
+			continue
+		}
+		if !filepath.IsLocal(component) || filepath.Base(component) != component {
+			return "", nil, errors.New("invalid credential path component")
+		}
+		parent := roots[len(roots)-1]
+		info, err := parent.Lstat(component)
+		if err != nil {
+			return "", nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			links++
+			if links > 40 {
+				return "", nil, errors.New("too many credential symbolic links")
+			}
+			link, err := parent.Readlink(component)
+			if err != nil {
+				return "", nil, err
+			}
+			if !cliMaskLinkIsUnambiguous(link) {
+				return "", nil, errors.New("ambiguous credential symbolic link target")
+			}
+			var linkParts []string
+			if filepath.IsAbs(link) {
+				linkParts, err = openAnchor(link)
+				if err != nil {
+					return "", nil, err
+				}
+			} else {
+				linkParts = strings.Split(link, string(os.PathSeparator))
+			}
+			parts = append(linkParts, parts...)
+			continue
+		}
+		resolved := filepath.Join(paths[len(paths)-1], component)
+		if len(parts) == 0 {
+			return resolved, info, nil
+		}
+		if !info.IsDir() {
+			return "", nil, errors.New("credential path parent is not a directory")
+		}
+		next, err := parent.OpenRoot(component)
+		if err != nil {
+			return "", nil, err
+		}
+		opened, err := next.Stat(".")
+		if err != nil || !os.SameFile(info, opened) {
+			_ = next.Close()
+			return "", nil, errors.New("credential path changed during inspection")
+		}
+		roots, paths = append(roots, next), append(paths, resolved)
+	}
+	info, err := roots[len(roots)-1].Stat(".")
+	return paths[len(paths)-1], info, err
+}
+
+func maskSensitivePath(args []string, authorized cliCredentialMaskTarget, workspace string) ([]string, error) {
+	target, info, err := cliInspectMaskTarget(authorized)
+	if errors.Is(err, os.ErrNotExist) {
+		return args, nil // A missing file or dangling alias exposes no credential.
+	}
+	if err != nil {
+		return nil, errors.New("credential mask target cannot be safely inspected")
+	}
+	for _, masked := range []string{"/home", "/mnt", "/root", "/media", "/srv"} {
+		if cliPathWithin(masked, target) && !cliPathWithin(workspace, target) {
+			return args, nil
 		}
 	}
 	if target == workspace || cliPathWithin(target, workspace) {
-		return args
+		return args, nil
 	}
 	if info.IsDir() {
-		return append(args, "--tmpfs", target)
+		return append(args, "--tmpfs", target), nil
 	}
-	return append(args, "--ro-bind", os.DevNull, target)
+	return append(args, "--ro-bind", os.DevNull, target), nil
 }
 
 // rebindToolchainUnderMaskedRoot ensures that targetBin and any of its symlink hops
@@ -576,11 +700,18 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			}
 
 			for _, entry := range toMask {
-				target := filepath.Join(home, filepath.FromSlash(entry))
+				authorized, err := cliHomeMaskTarget(home, entry)
+				if err != nil {
+					return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+				}
+				target := authorized.path
 				if target == workspace || cliPathWithin(target, workspace) {
 					continue
 				}
-				bwrapArgs = maskSensitivePath(bwrapArgs, target, workspace)
+				bwrapArgs, err = maskSensitivePath(bwrapArgs, authorized, workspace)
+				if err != nil {
+					return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+				}
 			}
 		}
 	}
@@ -604,7 +735,10 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
 		}
 		if foreignHome != "" {
-			bwrapArgs = maskSensitivePath(bwrapArgs, foreignHome, workspace)
+			bwrapArgs, err = maskSensitivePath(bwrapArgs, cliCredentialMaskTarget{foreignHome}, workspace)
+			if err != nil {
+				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+			}
 		}
 	}
 

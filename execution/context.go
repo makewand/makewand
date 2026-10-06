@@ -12,16 +12,19 @@ import (
 )
 
 type Config struct {
-	LedgerPath     string
-	MaxCalls       int
-	TaskID         string
-	EventsPath     string
-	LeaseID        string
-	AccountRef     *string
-	APIPolicy      string
-	EventError     func(error)
-	enforcedLedger string
-	enforcedMax    int
+	LedgerPath        string
+	MaxCalls          int
+	TaskID            string
+	EventsPath        string
+	LeaseID           string
+	AccountRef        *string
+	APIPolicy         string
+	EventError        func(error)
+	enforcedLedger    string
+	enforcedMax       int
+	ledgerDirectory   os.FileInfo
+	eventsDirectory   os.FileInfo
+	enforcedDirectory os.FileInfo
 }
 
 type configKey struct{}
@@ -31,8 +34,10 @@ func ContextWithConfig(ctx context.Context, config Config) context.Context {
 	if previous, ok := ctx.Value(configKey{}).(Config); ok {
 		if previous.enforcedLedger != "" {
 			config.enforcedLedger = previous.enforcedLedger
+			config.enforcedDirectory = previous.enforcedDirectory
 		} else if previous.LedgerPath != "" {
 			config.enforcedLedger = previous.LedgerPath
+			config.enforcedDirectory = previous.ledgerDirectory
 		}
 		if previous.enforcedMax > 0 {
 			config.enforcedMax = previous.enforcedMax
@@ -41,6 +46,12 @@ func ContextWithConfig(ctx context.Context, config Config) context.Context {
 		}
 		if config.LedgerPath == "" {
 			config.LedgerPath = previous.LedgerPath
+		}
+		if config.LedgerPath == previous.LedgerPath {
+			config.ledgerDirectory = previous.ledgerDirectory
+		}
+		if config.EventsPath == previous.EventsPath {
+			config.eventsDirectory = previous.eventsDirectory
 		}
 		if config.MaxCalls == 0 || config.enforcedMax > 0 && config.MaxCalls > config.enforcedMax {
 			config.MaxCalls = config.enforcedMax
@@ -123,7 +134,11 @@ func EnsureContext(ctx context.Context) (context.Context, Config, error) {
 		if *path == "" {
 			continue
 		}
-		resolved, err := resolvePath(*path)
+		expected := cfg.ledgerDirectory
+		if path == &cfg.EventsPath {
+			expected = cfg.eventsDirectory
+		}
+		resolved, directory, err := resolvePathIdentity(*path, expected)
 		if err != nil {
 			if path == &cfg.EventsPath {
 				continue
@@ -131,12 +146,21 @@ func EnsureContext(ctx context.Context) (context.Context, Config, error) {
 			return ctx, cfg, err
 		}
 		*path = resolved
+		if path == &cfg.EventsPath {
+			cfg.eventsDirectory = directory
+		} else {
+			cfg.ledgerDirectory = directory
+		}
 	}
-	for _, inherited := range []string{inheritedLedger, cfg.enforcedLedger} {
+	for index, inherited := range []string{inheritedLedger, cfg.enforcedLedger} {
 		if inherited == "" {
 			continue
 		}
-		resolved, err := resolvePath(inherited)
+		var expected os.FileInfo
+		if index == 1 {
+			expected = cfg.enforcedDirectory
+		}
+		resolved, _, err := resolvePathIdentity(inherited, expected)
 		if err != nil {
 			return ctx, cfg, err
 		}
@@ -149,36 +173,22 @@ func EnsureContext(ctx context.Context) (context.Context, Config, error) {
 	}
 	if cfg.LedgerPath != "" {
 		cfg.enforcedLedger = cfg.LedgerPath
+		cfg.enforcedDirectory = cfg.ledgerDirectory
 	}
 	if cfg.MaxCalls > 0 {
 		cfg.enforcedMax = cfg.MaxCalls
 	}
-	return ContextWithConfig(ctx, cfg), cfg, nil
+	// cfg already contains the inherited limits and the canonical directory
+	// identities. Reapplying ContextWithConfig here would overwrite those with
+	// an unresolved alias from the original context.
+	return context.WithValue(ctx, configKey{}, cfg), cfg, nil
 }
 
-func resolvePath(path string) (string, error) {
-	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		path = filepath.Join(home, path[2:])
-	}
-	absolute, err := filepath.Abs(path)
+func resolvePathIdentity(path string, expected os.FileInfo) (string, os.FileInfo, error) {
+	p, directory, err := accountingPathForIdentity(path, expected)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
-		return resolved, nil
-	} else if !os.IsNotExist(err) {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0700); err != nil {
-		return "", err
-	}
-	directory, err := filepath.EvalSymlinks(filepath.Dir(absolute))
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(directory, filepath.Base(absolute)), nil
+	defer p.close()
+	return filepath.Join(p.root.Name(), p.name), directory, nil
 }
