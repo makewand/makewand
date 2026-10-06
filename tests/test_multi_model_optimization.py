@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -692,7 +693,7 @@ class TestCliOptimizationsAndCircuitBreaker(unittest.TestCase):
                     "Provider": "codex",
                     "HasData": True,
                     "WeeklyPct": 94,
-                    "ResetAt": "2026-10-04T10:40:00"
+                    "ResetAt": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
                 }
             ]
         }
@@ -717,7 +718,7 @@ class TestCliOptimizationsAndCircuitBreaker(unittest.TestCase):
                     "Provider": "claude",
                     "HasData": True,
                     "WeeklyPct": 85,
-                    "ResetAt": "2026-10-04T11:59:00"
+                    "ResetAt": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
                 }
             ]
         }

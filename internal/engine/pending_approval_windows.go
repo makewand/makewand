@@ -71,7 +71,7 @@ func applyPrivateOpenHandle(handle windows.Handle, directory bool) error {
 			return fmt.Errorf("normalize authorized default owner: %w", err)
 		}
 	}
-	private, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + user.User.Sid.String() + ")(A;OICI;FA;;;SY)")
+	private, err := privateApplyDACL(user.User.Sid)
 	if err != nil {
 		return err
 	}
@@ -87,6 +87,16 @@ func applyPrivateOpenHandle(handle windows.Handle, directory bool) error {
 		return fmt.Errorf("private state owner differs from current user")
 	}
 	return nil
+}
+
+func privateApplyDACL(user *windows.SID) (*windows.SECURITY_DESCRIPTOR, error) {
+	value := "D:P(A;OICI;FA;;;" + user.String() + ")"
+	// SYSTEM is also the current user in WinPE and service processes. Windows
+	// merges duplicate ACEs, so express this exact private ACL only once.
+	if !user.IsWellKnown(windows.WinLocalSystemSid) {
+		value += "(A;OICI;FA;;;SY)"
+	}
+	return windows.SecurityDescriptorFromString(value)
 }
 
 func privatePendingFile(file *os.File) error {

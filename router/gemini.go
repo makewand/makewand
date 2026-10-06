@@ -14,6 +14,7 @@ const geminiDefaultModel = "gemini-2.5-flash"
 // Gemini implements the Provider interface for Google's Gemini API.
 type Gemini struct {
 	apiKey       string
+	baseURL      string
 	model        string
 	chatClient   *http.Client
 	streamClient *http.Client
@@ -22,11 +23,22 @@ type Gemini struct {
 
 // NewGemini creates a new Gemini provider.
 func NewGemini(apiKey, model string) *Gemini {
+	return NewGeminiWithBaseURL(apiKey, model, "")
+}
+
+// NewGeminiWithBaseURL uses an explicitly configured API endpoint. The existing
+// constructor retains the official endpoint and is source-compatible.
+func NewGeminiWithBaseURL(apiKey, model, baseURL string) *Gemini {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = "https://generativelanguage.googleapis.com"
+	}
 	if model == "" {
 		model = geminiDefaultModel
 	}
 	return &Gemini{
 		apiKey:       apiKey,
+		baseURL:      baseURL,
 		model:        model,
 		chatClient:   newAPIClient(),
 		streamClient: newStreamClient(),
@@ -88,8 +100,8 @@ func (g *Gemini) chatUnaccounted(ctx context.Context, messages []Message, system
 		model = requested
 	}
 	apiURL := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent",
-		url.PathEscape(model),
+		"%s/v1beta/models/%s:generateContent",
+		g.baseURL, url.PathEscape(model),
 	)
 
 	var contents []geminiContent
@@ -174,8 +186,8 @@ func (g *Gemini) chatStreamUnaccounted(ctx context.Context, messages []Message, 
 		model = requested
 	}
 	apiURL := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse",
-		url.PathEscape(model),
+		"%s/v1beta/models/%s:streamGenerateContent?alt=sse",
+		g.baseURL, url.PathEscape(model),
 	)
 
 	var contents []geminiContent

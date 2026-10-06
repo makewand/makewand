@@ -330,6 +330,64 @@ int calculateChecksum(const char* buffer, size_t length_of_data) {
         self.assertEqual(lines[:-1], full_map.splitlines()[:line_budget])
 
 
+    def test_core_package_remains_visible_with_custom_checkout_name(self):
+        # A renamed checkout must keep its own Python package in the scan pool.
+        # More than 150 core Go files would otherwise consume that whole pool.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for checkout_name in ("makewand", "custom-checkout-name"):
+                with self.subTest(checkout_name=checkout_name):
+                    root = Path(tmpdir) / checkout_name
+                    package = root / "makewand"
+                    auxiliary = root / "internal" / "auxiliary"
+                    package.mkdir(parents=True)
+                    auxiliary.mkdir(parents=True)
+                    (package / "engine.py").write_text(
+                        "class ProjectEngine:\n    def run(self):\n        return True\n",
+                        encoding="utf-8",
+                    )
+                    for index in range(160):
+                        (auxiliary / f"helper_{index:03}.go").write_text(
+                            f"package auxiliary\n// ProjectEngine coordinates this helper.\n"
+                            f"func Helper{index}() {{}}\n",
+                            encoding="utf-8",
+                        )
+                    full_map = generate_repo_map(str(root), max_lines=361, max_files=40)
+                    short_map = generate_repo_map(str(root), max_lines=60, max_files=40)
+                    self.assertIn("makewand/engine.py:", full_map)
+                    self.assertIn("  class ProjectEngine:", full_map)
+                    self.assertIn("    def run()", full_map)
+                    self.assertLessEqual(len(short_map.splitlines()), 61)
+                    self.assertEqual(short_map.splitlines()[-1], "  ... (more symbols truncated)")
+                    self.assertEqual(short_map.splitlines()[:-1], full_map.splitlines()[:60])
+
+    def test_generate_repo_map_header_budget_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self.assertEqual(generate_repo_map(str(root), max_lines=1), "")
+            (root / "empty.py").write_text("# No public symbols.\n", encoding="utf-8")
+            self.assertEqual(generate_repo_map(str(root), max_lines=1), "")
+            (root / "a.py").write_text(
+                "def header_one():\n    pass\ndef header_two():\n    pass\n",
+                encoding="utf-8",
+            )
+            for index in range(30):
+                (root / f"z_{index:02}.py").write_text(
+                    f"def symbol_{index}():\n    pass\n", encoding="utf-8"
+                )
+            full_map = generate_repo_map(str(root), max_lines=361, max_files=40)
+            full_lines = full_map.splitlines()
+            self.assertGreater(len(full_lines), 60)
+            self.assertEqual(full_lines[0], "a.py:")
+            self.assertTrue(full_lines[59].endswith(":"))
+            for budget in (1, 2, 60):
+                with self.subTest(budget=budget):
+                    short_lines = generate_repo_map(
+                        str(root), max_lines=budget, max_files=40
+                    ).splitlines()
+                    self.assertEqual(len(short_lines), budget + 1)
+                    self.assertEqual(short_lines[-1], "  ... (more symbols truncated)")
+                    self.assertEqual(short_lines[:-1], full_lines[:budget])
+
     def test_compute_symbol_pagerank_promotes_central_files(self):
         from makewand.repomap import compute_symbol_pagerank, extract_file_symbols
         with tempfile.TemporaryDirectory() as tmpdir:

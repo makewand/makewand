@@ -27,7 +27,10 @@ func TestApplyWindowsReadonlyReplacementAndACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	security := "D:P(A;;FA;;;" + user.User.Sid.String() + ")(A;;FA;;;SY)"
+	security := "D:P(A;;FA;;;" + user.User.Sid.String() + ")"
+	if !user.User.Sid.IsWellKnown(windows.WinLocalSystemSid) {
+		security += "(A;;FA;;;SY)"
+	}
 	if err := applySetOpenFileSecurity(file, security); err != nil {
 		_ = file.Close()
 		t.Fatal(err)

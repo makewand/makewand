@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/makewand/makewand/internal/privatefile"
+
 	"github.com/makewand/makewand/execution"
 	"github.com/makewand/makewand/router"
 	"github.com/spf13/cobra"
@@ -44,8 +46,38 @@ func TestNativeBudgetFlagsInitializePrivateSharedLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0077 != 0 {
-		t.Fatalf("ledger mode=%o", info.Mode().Perm())
+	if !info.Mode().IsRegular() {
+		t.Fatal("private state is not a regular file")
+	}
+	// #nosec G703 -- inspect only the private temporary ledger created by this test command.
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := privatefile.Validate(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("private state permissions: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Atomic replacement on the first reservation keeps the initial privacy.
+	ctx := execution.ContextWithConfig(context.Background(), execution.Config{LedgerPath: path, MaxCalls: 2, TaskID: "private-ledger-test"})
+	attempt, err := execution.Reserve(ctx, execution.Metadata{Engine: "synthetic", Tier: "standard", Stage: "private-ledger-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := attempt.Complete(execution.Outcome{Status: execution.Passed, Known: true}); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G703 -- inspect the same test-owned ledger after its atomic replacement.
+	updated, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer updated.Close()
+	if err := privatefile.Validate(updated); err != nil {
+		t.Fatalf("updated ledger privacy: %v", err)
 	}
 	if !execution.ValidIdentifier(os.Getenv("MAKEWAND_TASK_ID")) {
 		t.Fatal("task identity not initialized")

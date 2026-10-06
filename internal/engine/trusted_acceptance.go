@@ -324,6 +324,9 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	started := time.Now()
 	cleanupProcess, err := processjob.Start(cmd)
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, errors.Join(contextErr, err)
+		}
 		return nil, err
 	}
 	defer cleanupProcess()

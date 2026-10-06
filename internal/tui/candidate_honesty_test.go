@@ -62,8 +62,8 @@ func TestCandidateSelectionNote_NoTestsExecuted(t *testing.T) {
 	}
 }
 
-// arch-product#10: autopilot can never auto-apply today (Strength 2 required,
-// local checks give at most 1). Help and approval text must say so.
+// Local checks alone give Strength 1; configured independent acceptance is
+// required for automatic application at Strength 2.
 func TestAutopilotDescriptionsAreHonest(t *testing.T) {
 	for _, s := range approvalSlashCommandSuggestions {
 		if s.Command == "/approval autopilot" && strings.Contains(strings.ToLower(s.Description), "auto-select verified") {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -290,6 +291,9 @@ func TestWrapCLICommandWithSandbox_RemoteOriginBypassAttempt(t *testing.T) {
 }
 
 func TestWrapCLICommandWithSandbox_HomeMasking(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout; Windows required-sandbox refusal is exercised separately")
+	}
 	oldLookup := cliBwrapLookup
 	defer func() { cliBwrapLookup = oldLookup }()
 	cliBwrapLookup = func(file string) (string, error) {

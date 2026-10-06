@@ -411,8 +411,8 @@ Flags:
       configured value). Persist a default with 'makewand setup --approval ...'.
       autopilot generates and ranks several candidates, but it only applies one
       automatically at verification Strength 2 (an independent acceptance
-      check). Local checks top out at Strength 1 because test results come from
-      candidate code, so autopilot currently always asks before writing.`,
+      check configured with MAKEWAND_TRUSTED_ACCEPTANCE_FILE). Local checks
+      alone give Strength 1 and still ask for approval before writing.`,
 		Args: cobra.ArbitraryArgs,
 		// Validate --repo-trust once, globally, before any subcommand's RunE and
 		// before any backend check. This is a persistent flag, so a bad value must
@@ -441,19 +441,25 @@ Flags:
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigWithWarning()
-
-			if !hasUsableBackend(cfg) {
-				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
-				return nil
-			}
-
+			var selectedMode model.UsageMode
 			if rootModeFlag != "" {
 				m, ok := model.ParseUsageMode(rootModeFlag)
 				if !ok {
-					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", rootModeFlag)
+					return &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true,
+						Err: fmt.Errorf("invalid mode %q: must be fast, balanced, or power", rootModeFlag)}
 				}
-				cfg.UsageMode = m.String()
+				selectedMode = m
+			}
+
+			cfg, err := loadConfigWithWarning()
+			if err != nil {
+				return err
+			}
+			if rootModeFlag != "" {
+				cfg.UsageMode = selectedMode.String()
+			}
+			if !hasUsableBackend(cfg) {
+				return noUsableBackendError()
 			}
 
 			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
@@ -504,7 +510,7 @@ Flags:
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable routing debug trace logging to ~/.config/makewand/trace.jsonl")
 	rootCmd.PersistentFlags().StringVarP(&workingDir, "cwd", "C", "", "target working directory")
 	rootCmd.PersistentFlags().StringVar(&repoTrustFlag, "repo-trust", "trusted", "repository trust level: trusted (default) or untrusted (only direct API providers, fail closed)")
-	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`; autopilot still asks before applying until Strength-2 verification exists)")
+	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`; autopilot auto-applies only with configured independent Strength-2 acceptance, otherwise still asks)")
 	rootCmd.PersistentFlags().IntVar(&rootMaxModelCallsFlag, "max-model-calls", 0, "maximum attempted model dispatches shared by Go and Python (failed and canceled calls count)")
 	rootCmd.PersistentFlags().StringVar(&rootCallBudgetFileFlag, "call-budget-file", "", "persistent process-safe model call budget ledger")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
@@ -523,7 +529,17 @@ func newCmd() *cobra.Command {
 		Short: "Create a new project with guided wizard",
 		Long:  "Start the interactive wizard to create a new project from templates or your own description.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigWithWarning()
+			cfg, err := loadConfigWithWarning()
+			if err != nil {
+				return err
+			}
+			if modeFlag != "" {
+				m, ok := model.ParseUsageMode(modeFlag)
+				if !ok {
+					return &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true, Err: fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)}
+				}
+				cfg.UsageMode = m.String()
+			}
 
 			if !hasUsableBackend(cfg) {
 				fmt.Println("Welcome to makewand!")
@@ -540,15 +556,7 @@ func newCmd() *cobra.Command {
 				fmt.Println("    export MAKEWAND_REMOTE_TOKEN=...")
 				fmt.Println()
 				fmt.Println("Run 'makewand setup' to check your configuration.")
-				return nil
-			}
-
-			if modeFlag != "" {
-				m, ok := model.ParseUsageMode(modeFlag)
-				if !ok {
-					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
-				}
-				cfg.UsageMode = m.String()
+				return noUsableBackendError()
 			}
 
 			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
@@ -574,19 +582,20 @@ func chatCmd() *cobra.Command {
 		Long:  "Open an interactive chat to modify and improve your project using natural language.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigWithWarning()
-
-			if !hasUsableBackend(cfg) {
-				fmt.Println("No AI models or remote backend configured. Run 'makewand setup' or set MAKEWAND_REMOTE_URL/MAKEWAND_REMOTE_TOKEN.")
-				return nil
+			cfg, err := loadConfigWithWarning()
+			if err != nil {
+				return err
 			}
-
 			if modeFlag != "" {
 				m, ok := model.ParseUsageMode(modeFlag)
 				if !ok {
-					return fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)
+					return &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true, Err: fmt.Errorf("invalid mode %q: must be fast, balanced, or power", modeFlag)}
 				}
 				cfg.UsageMode = m.String()
+			}
+
+			if !hasUsableBackend(cfg) {
+				return noUsableBackendError()
 			}
 
 			repoTrust, trustErr := resolveRepoTrust(repoTrustFlag)
@@ -633,6 +642,9 @@ func previewCmd() *cobra.Command {
 			if unsafeHostExecRequested() {
 				previewCfg, cfgErr := config.LoadWithOptions(config.LoadOptions{SkipCLIDetection: true})
 				if cfgErr != nil {
+					if config.IsFatalLoadError(cfgErr) {
+						return &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true, Err: cfgErr}
+					}
 					diag.Stderr().WarnErr("could not load config", cfgErr)
 				}
 				proj.SetUnsafeHostExecAuthorization(resolveUnsafeHostExecAuth(previewCfg))
@@ -677,12 +689,16 @@ balanced. Use --mode to save a different preference without starting the chat UI
 Use the global --approval flag to persist an approval mode (manual/safe/autopilot):
 setup saves its configuration, so 'makewand setup --approval safe' makes the
 override permanent while '--approval' on other commands applies to that run only.
-Note: autopilot only auto-applies candidates verified at Strength 2, which local
-checks cannot reach yet (maximum Strength 1), so it currently asks before writing.
+Note: autopilot only auto-applies candidates verified at Strength 2 by a configured
+independent check (MAKEWAND_TRUSTED_ACCEPTANCE_FILE). Local checks alone give
+Strength 1 and still require approval before writing.
 When MAKEWAND_UNSAFE_HOST_EXEC=1 is set, setup also offers the one-time host
 execution acknowledgment required before that opt-in takes effect.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigWithWarning()
+			cfg, err := loadConfigWithWarning()
+			if err != nil {
+				return err
+			}
 			if err := applySetupUsageMode(cfg, modeFlag); err != nil {
 				return err
 			}
@@ -815,9 +831,12 @@ func accessDisplay(configured, defaultValue string) string {
 	return defaultValue + " (default)"
 }
 
-func loadConfigWithWarning() *config.Config {
+func loadConfigWithWarning() (*config.Config, error) {
 	cfg, err := config.LoadWithOptions(configLoadOptions())
 	if err != nil {
+		if config.IsFatalLoadError(err) {
+			return cfg, &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true, Err: err}
+		}
 		diag.Stderr().WarnErr("could not load config", err)
 	}
 	// Apply the --approval runtime override AFTER load so the flag wins for this
@@ -826,7 +845,7 @@ func loadConfigWithWarning() *config.Config {
 	if resolvedApprovalOverride != "" {
 		cfg.ApprovalMode = resolvedApprovalOverride
 	}
-	return cfg
+	return cfg, nil
 }
 
 // configLoadOptions derives config.LoadOptions from the resolved repository

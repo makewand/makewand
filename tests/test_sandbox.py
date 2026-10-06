@@ -123,9 +123,15 @@ class TestSandbox(unittest.TestCase):
             # Set core.worktree to parent directory
             run_git_cmd(["git", "config", "core.worktree", str(parent_dir)], cwd=str(ws))
 
-            # Attempt to write to parent_secret.txt inside sandbox
-            ret, out, err, _ = run_in_sandbox(["bash", "-c", f"echo overwritten > {secret}"], workspace=str(ws))
-            # Must fail with read-only filesystem error, and protected parent data must remain intact!
+            import shlex
+            # A hidden parent below /tmp may be a writable tmpfs directory;
+            # only attempt to overwrite the existing host target.
+            command = ["bash", "-c", f"test -f {shlex.quote(str(secret))} && echo overwritten > {shlex.quote(str(secret))}"]
+            wrapped = wrap_bwrap(command, workspace=str(ws))
+            writable_mounts = [wrapped[i + 1:i + 3] for i, arg in enumerate(wrapped) if arg == "--bind"]
+            self.assertEqual(writable_mounts, [[str(ws.resolve()), str(ws.resolve())]])
+            ret, out, err, _ = run_in_sandbox(command, workspace=str(ws))
+            # The attempt must fail and protected host data must remain intact.
             self.assertNotEqual(ret, 0)
             self.assertEqual(secret.read_text(), "protected parent data\n")
         finally:
@@ -405,6 +411,5 @@ class TestSandbox(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 
 

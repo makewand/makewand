@@ -8,11 +8,13 @@ import contextlib
 import io
 import json
 import os
+import queue
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -26,6 +28,62 @@ from makewand.providers.base import run_subprocess
 
 
 class WindowsPathTests(unittest.TestCase):
+    def test_original_components_are_checked_before_normalization(self):
+        from makewand.windows_paths import extended_local_path, windows_git_directory
+        from makewand.native_windows import _absolute_components
+        for path in (r"C:\workspace\trailing.", "C:\\workspace\\trailing ",
+                     r"C:\bad.\..\safe", r"relative.\safe", "relative \\safe",
+                     r"C:\workspace\file:stream", r"C:\workspace\NUL.txt"):
+            with self.subTest(path=path), mock.patch("makewand.windows_paths.ntpath.abspath") as normalize:
+                with self.assertRaises(ValueError):
+                    extended_local_path(path)
+                with self.assertRaises(ValueError):
+                    _absolute_components(path)
+                normalize.assert_not_called()
+        # Legal relative navigation keeps its meaning; it is not trimmed or
+        # reinterpreted as a differently named component to pass validation.
+        with mock.patch("makewand.windows_paths.ntpath.abspath", return_value=r"C:\workspace\safe") as normalize:
+            self.assertEqual(extended_local_path(r".\child\..\safe"), r"\\?\C:\workspace\safe")
+            normalize.assert_called_once_with(r".\child\..\safe")
+        with mock.patch("makewand.windows_paths.ntpath.abspath", return_value=r"C:\workspace\bad."):
+            with self.assertRaises(ValueError):
+                extended_local_path(r"C:\workspace\safe")
+        with self.assertRaises(ValueError):
+            _absolute_components(r"C:\workspace\.git\objects")
+        long_root = "C:\\workspace\\" + "long-segment\\" * 30
+        with self.assertRaisesRegex(OSError, "canonical workspace root"):
+            windows_git_directory(long_root)
+        with mock.patch("makewand.windows_paths.ntpath.realpath", return_value=long_root):
+            with self.assertRaisesRegex(OSError, "canonical workspace root"):
+                windows_git_directory(r"C:\SHORT~1")
+
+    def test_extended_call_paths_preserve_names_and_reject_device_namespaces(self):
+        from makewand.windows_paths import extended_local_path
+        logical = "C:\\workspace\\" + ("deep-name\\" * 35) + "中文 file.txt"
+        self.assertGreater(len(logical), 300)
+        self.assertEqual(extended_local_path(logical), "\\\\?\\" + logical)
+        self.assertEqual(extended_local_path("C:/workspace/.git/objects"),
+                         "\\\\?\\C:\\workspace\\.git\\objects")
+        for path in ("\\\\server\\share\\file", "\\\\?\\C:\\workspace\\file",
+                     "\\\\.\\C:\\workspace\\file", "C:\\workspace\\NUL.txt",
+                     "C:\\workspace\\trailing.", "C:\\workspace\\trailing ",
+                     "C:\\workspace\\file:stream", "C:\\workspace\\a\0b"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                extended_local_path(path)
+
+    def test_private_state_policy_does_not_duplicate_system_permissions(self):
+        from makewand.native_windows import _private_state_sddl
+        user = "S-1-5-21-1-2-3-1001"
+        for directory in (False, True):
+            for sid, expected_grants in (("S-1-5-18", 1), (user, 2)):
+                with self.subTest(directory=directory, system=sid == "S-1-5-18"):
+                    policy = _private_state_sddl(sid, directory=directory)
+                    self.assertTrue(policy.startswith("D:P"))
+                    self.assertEqual(policy.count("(A;"), expected_grants)
+                    self.assertEqual(policy.count(";;;SY)"), 1)
+                    self.assertEqual(policy.count(";;;" + user + ")"), int(sid == user))
+                    self.assertEqual("OICI" in policy, directory)
+
     def test_npm_shim_launches_node_with_literal_prompt_arguments(self):
         from makewand.windows_process import resolve_windows_command
         with tempfile.TemporaryDirectory() as temporary:
@@ -108,6 +166,108 @@ class NativeWindowsFileTests(unittest.TestCase):
         _atomic_remove(str(self.workspace), "nested/file.txt")
         self.assertFalse(target.exists())
 
+    def test_deep_local_paths_keep_native_copy_security_and_manifest_identity(self):
+        from makewand.native_windows import inspect_file, manifest, application_security
+        from makewand.windows_paths import filesystem_path
+        deep_root = self.root / "deep"
+        deep = deep_root
+        while len(str(deep)) < 310:
+            deep /= "long-path-component-0123456789"
+        Path(filesystem_path(deep)).mkdir(parents=True)
+        source, workspace = deep / "source.txt", deep / "workspace"
+        Path(filesystem_path(source)).write_bytes(b"exact deep payload\r\n")
+        Path(filesystem_path(workspace)).mkdir()
+        try:
+            expected = inspect_file(source)
+            _atomic_copy(str(workspace), "nested/protected.txt", source, expected)
+            target = workspace / "nested/protected.txt"
+            Path(filesystem_path(target)).chmod(stat.S_IREAD)
+            protection = ProtectedFiles.capture(workspace, ["nested/protected.txt"])
+            original_security = application_security(target)
+            protection.verify(workspace)
+            records = manifest(workspace)
+            self.assertEqual(set(records), {"nested/protected.txt"})
+            self.assertEqual(records["nested/protected.txt"], inspect_file(target))
+            self.assertEqual(Path(filesystem_path(target)).read_bytes(), b"exact deep payload\r\n")
+            self.assertEqual(application_security(target), original_security)
+            _atomic_remove(str(workspace), "nested/protected.txt")
+            self.assertFalse(Path(filesystem_path(target)).exists())
+        finally:
+            for child in Path(filesystem_path(deep)).rglob("*"):
+                if child.is_file():
+                    child.chmod(stat.S_IWRITE)
+            shutil.rmtree(filesystem_path(deep_root))
+
+    def test_private_cleanup_binds_original_root_and_is_idempotent(self):
+        from makewand.native_windows import private_tree_identity, remove_private_tree, application_security
+        original = config.ensure_private_dir(self.root / "owned-private")
+        saved = original / "original.txt"
+        saved.write_bytes(b"complete original private bytes\r\n")
+        saved.chmod(stat.S_IREAD)
+        original_identity = private_tree_identity(original)
+        retired = self.root / "retired-private"
+        original.rename(retired)
+        replacement = config.ensure_private_dir(original)
+        replacement_file = replacement / "replacement.txt"
+        replacement_file.write_bytes(b"replacement must remain unchanged\r\n")
+        before = (replacement_file.read_bytes(), stat.S_IMODE(replacement_file.stat().st_mode),
+                  application_security(replacement_file))
+        replacement_identity = private_tree_identity(replacement)
+        try:
+            with self.assertRaisesRegex(ValueError, "root identity changed"):
+                remove_private_tree(original, original_identity)
+            self.assertEqual((replacement_file.read_bytes(), stat.S_IMODE(replacement_file.stat().st_mode),
+                              application_security(replacement_file)), before)
+            self.assertEqual((retired / "original.txt").read_bytes(), b"complete original private bytes\r\n")
+            self.assertEqual(private_tree_identity(retired), original_identity)
+            remove_private_tree(retired, original_identity)
+            self.assertFalse(retired.exists())
+            remove_private_tree(retired, original_identity)
+            self.assertEqual((replacement_file.read_bytes(), stat.S_IMODE(replacement_file.stat().st_mode),
+                              application_security(replacement_file)), before)
+        finally:
+            remove_private_tree(retired, original_identity)
+            remove_private_tree(replacement, replacement_identity)
+
+    def test_private_cleanup_preflight_preserves_outside_links_and_readonly_files(self):
+        from makewand.native_windows import private_tree_identity, remove_private_tree, application_security
+        outside = self.root / "outside-cleanup"
+        outside.mkdir()
+        sentinel = outside / "sentinel.txt"
+        sentinel.write_bytes(b"complete outside protected bytes\r\n")
+        sentinel.chmod(stat.S_IREAD)
+        before = (sentinel.read_bytes(), stat.S_IMODE(sentinel.stat().st_mode), application_security(sentinel))
+        for kind in ("hardlink", "junction"):
+            with self.subTest(kind=kind):
+                owned = config.ensure_private_dir(self.root / ("owned-" + kind))
+                legitimate = owned / "00-legitimate-readonly.txt"
+                legitimate.write_bytes(b"legitimate private bytes\r\n")
+                legitimate.chmod(stat.S_IREAD)
+                legitimate_before = (legitimate.read_bytes(), stat.S_IMODE(legitimate.stat().st_mode),
+                                     application_security(legitimate))
+                identity = private_tree_identity(owned)
+                link = owned / "outside-link"
+                if kind == "hardlink":
+                    os.link(sentinel, link)
+                else:
+                    self.junction(link, outside)
+                try:
+                    with self.assertRaises(ValueError):
+                        remove_private_tree(owned, identity)
+                    self.assertEqual((legitimate.read_bytes(), stat.S_IMODE(legitimate.stat().st_mode),
+                                      application_security(legitimate)), legitimate_before)
+                    self.assertEqual((sentinel.read_bytes(), stat.S_IMODE(sentinel.stat().st_mode),
+                                      application_security(sentinel)), before)
+                finally:
+                    if kind == "hardlink":
+                        _atomic_remove(owned, link.name)
+                    else:
+                        link.rmdir()
+                    remove_private_tree(owned, identity)
+                self.assertFalse(owned.exists())
+                self.assertEqual((sentinel.read_bytes(), stat.S_IMODE(sentinel.stat().st_mode),
+                                  application_security(sentinel)), before)
+
     def test_junction_parent_and_workspace_are_rejected_without_external_write(self):
         outside = self.root / "outside"
         outside.mkdir()
@@ -158,6 +318,28 @@ class NativeWindowsFileTests(unittest.TestCase):
         getter.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)]
         self.assertTrue(getter(descriptor, ctypes.byref(control), ctypes.byref(revision)))
         self.assertTrue(control.value & 0x1000, "DACL must be protected against inherited broad access")
+
+    def test_exact_dacl_preserves_aces_across_protection_transitions(self):
+        import ctypes
+        from ctypes import wintypes
+        from makewand.native_windows import _application_security_descriptor, _application_security_value, _set_dacl
+        descriptor = _application_security_descriptor(self.source)
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        set_control = advapi.SetSecurityDescriptorControl
+        set_control.argtypes = [ctypes.c_void_p, wintypes.WORD, wintypes.WORD]
+        set_control.restype = wintypes.BOOL
+        get_control = advapi.GetSecurityDescriptorControl
+        get_control.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)]
+        get_control.restype = wintypes.BOOL
+        for protected in (True, False, True):
+            with self.subTest(protected=protected):
+                self.assertTrue(set_control(descriptor, 0x1000, 0x1000 if protected else 0))
+                _set_dacl(self.source, descriptor, protected=protected)
+                actual = _application_security_descriptor(self.source)
+                self.assertEqual(_application_security_value(actual), _application_security_value(descriptor))
+                control, revision = wintypes.WORD(), wintypes.DWORD()
+                self.assertTrue(get_control(actual, ctypes.byref(control), ctypes.byref(revision)))
+                self.assertEqual(bool(control.value & 0x1000), protected)
 
     def test_private_open_file_acl_is_bound_to_the_handle_and_rejects_hardlinks(self):
         from makewand.native_windows import application_security, ensure_private_file_descriptor
@@ -382,25 +564,37 @@ class NativeWindowsCandidateTests(unittest.TestCase):
         self.assertEqual({name: application_security_descriptor(self.workspace / name) for name in before}, before_descriptors)
 
     def crash_before_commit(self):
+        try:
+            from test_candidate_recovery import _run_crash_fixture
+        except ImportError:
+            from tests.test_candidate_recovery import _run_crash_fixture
+
         repository = Path(__file__).resolve().parent.parent
         code = "\n".join([
             "import os,sys",
             "from pathlib import Path",
             "sys.path.insert(0," + repr(str(repository)) + ")",
             "from makewand import config,candidate",
+            "_fixture_phase('imports-ready')",
             "config.CONFIG_DIR=Path(" + repr(str(config.CONFIG_DIR)) + ")",
             "config.CANDIDATES_DIR=Path(" + repr(str(config.CANDIDATES_DIR)) + ")",
             "config.BACKUPS_DIR=Path(" + repr(str(config.BACKUPS_DIR)) + ")",
             "config.ARTIFACTS_DIR=Path(" + repr(str(config.ARTIFACTS_DIR)) + ")",
+            "_fixture_phase('config-ready')",
             "real_write=candidate._write_application_journal",
             "def stop_at_commit(path,journal):",
-            " if journal.get('state')=='committed': os._exit(86)",
+            " _fixture_phase('journal-'+str(journal.get('state','none')))",
+            " if journal.get('state')=='committed':",
+            "  _fixture_phase('crash-before-commit')",
+            "  os._exit(86)",
             " return real_write(path,journal)",
             "candidate._write_application_journal=stop_at_commit",
+            "_fixture_phase('apply-start')",
             "print(candidate.CandidateManager.apply_candidate('windows-runtime','B'),flush=True)",
+            "_fixture_phase('apply-returned-without-crash')",
             "os._exit(87)",
         ])
-        result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30)
+        result = _run_crash_fixture(code)
         self.assertEqual(result.returncode, 86, result.stdout + result.stderr)
         self.assertEqual((self.workspace / "a.txt").read_bytes(), b"after\n")
         self.assertFalse((self.workspace / "b.txt").exists())
@@ -483,19 +677,89 @@ class NativeWindowsProcessTests(unittest.TestCase):
                                              input_text="input", timeout=5)
         self.assertEqual((code, out, err, error), (0, "input\n", "stderr\n", None))
 
-    def test_deadline_and_child_cleanup(self):
+    def test_deadline_before_child_readiness(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / "escaped.txt"
-            child = "import pathlib,time; time.sleep(1.5); pathlib.Path(" + repr(str(marker)) + ").write_text('escaped')"
-            parent = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-I','-c'," + repr(child) + "]); print('started',flush=True); time.sleep(10)"
+            ready = Path(temporary) / "ready.txt"
+            parent = ("import pathlib,time; time.sleep(10); pathlib.Path(" + repr(str(ready))
+                      + ").write_text('ready'); pathlib.Path(" + repr(str(marker)) + ").write_text('escaped')")
             started = time.monotonic()
             code, out, _, error = run_subprocess([sys.executable, "-I", "-c", parent], timeout=.3)
             self.assertEqual(code, -1)
             self.assertEqual(error.execution_status, "TIMEOUT")
             self.assertLess(time.monotonic() - started, 2)
-            self.assertIn("started", out)
+            self.assertEqual(out, "")
+            self.assertFalse(ready.exists(), "The real short deadline must apply during initialization")
             time.sleep(1.7)
             self.assertFalse(marker.exists(), "Job teardown must terminate descendants")
+
+    def test_ready_descendant_termination_and_pipe_cleanup(self):
+        from makewand.windows_process import WindowsJob
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "escaped.txt"
+            ready = Path(temporary) / "ready.txt"
+            armed = Path(temporary) / "armed.txt"
+            child = "\n".join([
+                "import pathlib,time",
+                "ready=pathlib.Path(" + repr(str(ready)) + ")",
+                "armed=pathlib.Path(" + repr(str(armed)) + ")",
+                "ready.write_text('ready')",
+                "deadline=time.monotonic()+30",
+                "while not armed.exists():",
+                " if time.monotonic()>=deadline: raise SystemExit(7)",
+                " time.sleep(.005)",
+                "time.sleep(1.5)",
+                "pathlib.Path(" + repr(str(marker)) + ").write_text('escaped')",
+            ])
+            parent = "\n".join([
+                "import pathlib,subprocess,sys,time",
+                "subprocess.Popen([sys.executable,'-I','-c'," + repr(child) + "])",
+                "ready=pathlib.Path(" + repr(str(ready)) + ")",
+                "deadline=time.monotonic()+30",
+                "while not ready.exists():",
+                " if time.monotonic()>=deadline: raise SystemExit(8)",
+                " time.sleep(.005)",
+                "print('started',flush=True)",
+                "time.sleep(10)",
+            ])
+            job = WindowsJob()
+            proc = None
+            reader = None
+            timer = None
+            try:
+                startup_deadline = time.monotonic() + 30
+                proc = job.start([sys.executable, "-I", "-c", parent], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                first_line = queue.Queue(maxsize=1)
+                reader = threading.Thread(target=lambda: first_line.put(proc.stdout.readline()), daemon=True)
+                reader.start()
+                line = first_line.get(timeout=max(.001, startup_deadline - time.monotonic()))
+                reader.join(timeout=2)
+                self.assertFalse(reader.is_alive(), "Readiness pipe reader must finish before collection")
+                self.assertEqual(line, b"started\r\n")
+                self.assertTrue(ready.exists(), "A real descendant must be ready before termination is timed")
+                started = time.monotonic()
+                timer = threading.Timer(.3, job.terminate)
+                timer.start()
+                armed.write_text("armed")
+                output, error = proc.communicate(timeout=2)
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertNotEqual(proc.returncode, 0, error)
+                self.assertEqual(line + output, b"started\r\n")
+                time.sleep(1.7)
+                self.assertFalse(marker.exists(), "Ready descendants must not escape the terminated Job")
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                    timer.join(timeout=2)
+                job.close()
+                if proc is not None:
+                    proc.wait(timeout=2)
+                    if reader is not None:
+                        reader.join(timeout=2)
+                    for pipe in (proc.stdout, proc.stderr):
+                        if pipe is not None:
+                            pipe.close()
 
     def test_successful_parent_exit_also_cleans_descendants(self):
         with tempfile.TemporaryDirectory() as temporary:

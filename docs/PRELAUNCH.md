@@ -54,6 +54,13 @@ before pushing.
 Before tagging, also run `bash scripts/check_version.sh --tag vX.Y.Z`: the
 Release workflow refuses a tag that differs from `v` + `makewand.__version__`.
 
+The Release workflow also requires the same-commit reusable native Windows
+gate, including all Windows Go packages under `-race`, complete native Python
+modules, and raw result artifacts. Interactive ordinary-user desktop acceptance
+remains a separate human check: follow [Windows desktop verification](WINDOWS_DESKTOP_VERIFICATION.md)
+and preserve its commit/binary-bound result. Neither hosted CI nor WinPE alone
+certifies terminal interaction or a real provider.
+
 ## 2) Run live provider probe (recommended before production)
 
 ```bash

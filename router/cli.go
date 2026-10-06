@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/makewand/makewand/execution"
@@ -566,12 +568,17 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 	cmd.Stdout = io.MultiWriter(capture.Stdout(), stdoutWriter)
 	cmd.Stderr = capture.Stderr()
 
+	started := time.Now()
 	cleanupProcess, err := processjob.Start(cmd)
 	if err != nil {
+		contextErr := ctx.Err()
 		_ = stdoutPipe.Close()
 		_ = stdoutWriter.Close()
 		cancel()
 		cleanupWorkDir()
+		if contextErr != nil {
+			return nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), err, errors.Join(contextErr, err), time.Since(started))
+		}
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 
@@ -608,6 +615,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		scanner := bufio.NewScanner(stdoutPipe)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		var parseFailure error
+		var claudeFailureJSON []byte
 	streamLoop:
 		for scanner.Scan() {
 			select {
@@ -618,6 +626,12 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 			}
 			line := stripANSI(scanner.Text())
 			if line == "" {
+				continue
+			}
+			if c.name == "claude-cli" && claudeCLIErrorMessage([]byte(line)) != "" {
+				// Never stream the failure envelope's session/account metadata.
+				// Wait for the process outcome before classifying the error.
+				claudeFailureJSON = []byte(line)
 				continue
 			}
 
@@ -691,8 +705,15 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 			return
 		}
 
-		if waitErr != nil {
-			ch <- StreamChunk{Error: formatCLIExecutionError(c.provider, capture.StderrString(), waitErr, nil, duration)}
+		if waitErr != nil || claudeFailureJSON != nil {
+			stdout := capture.StdoutBytes()
+			if claudeFailureJSON != nil {
+				stdout = claudeFailureJSON
+				if waitErr == nil {
+					waitErr = errors.New("CLI reported an error")
+				}
+			}
+			ch <- StreamChunk{Error: c.formatExecutionError(stdout, capture.StderrString(), waitErr, nil, duration)}
 			return
 		}
 
@@ -1065,6 +1086,9 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	start := time.Now()
 	cleanupProcess, err := processjob.Start(cmd)
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), err, errors.Join(contextErr, err), time.Since(start))
+		}
 		return "", nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 	defer cleanupProcess()
@@ -1088,10 +1112,13 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 		return "", nil, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
 	}
 	if runErr != nil {
-		return "", nil, formatCLIExecutionError(c.provider, capture.StderrString(), runErr, ctx.Err(), duration)
+		return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), runErr, ctx.Err(), duration)
 	}
 
 	raw := capture.StdoutBytes()
+	if c.name == "claude-cli" && claudeCLIErrorMessage(raw) != "" {
+		return "", nil, c.formatExecutionError(raw, capture.StderrString(), errors.New("CLI reported an error"), ctx.Err(), duration)
+	}
 
 	// Try structured JSON parsing when the CLI was invoked with a JSON output flag.
 	if c.jsonOutput && c.parseJSONResponse != nil {
@@ -1277,6 +1304,102 @@ func ClassifyCLIExecutionError(provider, stderr string, runErr error, ctxErr err
 	return formatCLIExecutionError(provider, stderr, runErr, ctxErr, duration)
 }
 
+const claudeCLIErrorJSONLimit = 64 << 10
+const claudeCLIErrorMessageLimit = 2 << 10
+const claudeCLIErrorEnvelopeLimit = processjob.MaxOutputBytes // Complete captured Chat output is also bounded.
+const claudeCLIErrorFallback = "Claude CLI reported an error"
+
+var claudeCLIErrorSecrets = regexp.MustCompile(`(?i)\b(?:bearer\s+[^\s"']+|sk-[a-z0-9_-]{8,}|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|password|secret|session[_-]?id|account[_-]?(?:id|ref))["']?\s*[:=]\s*["']?[^\s"',;]+|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})`)
+
+// isClaudeCLIErrorEnvelope does not decode diagnostic fields: an oversized or
+// wrongly typed result/errors field must not make stream metadata visible.
+func isClaudeCLIErrorEnvelope(raw []byte) bool {
+	if len(raw) == 0 || len(raw) > claudeCLIErrorEnvelopeLimit {
+		return false
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return false
+	}
+	var failure struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+		IsError *bool  `json:"is_error"`
+	}
+	if json.Unmarshal(raw, &failure) != nil || (failure.Type != "result" && failure.Type != "error") {
+		return false
+	}
+	if failure.IsError != nil && !*failure.IsError {
+		return false
+	}
+	return failure.IsError != nil || failure.Type == "error" || strings.HasPrefix(failure.Subtype, "error_")
+}
+
+// claudeCLIErrorMessage reads only explicit failure envelopes. Claude can put
+// these on stdout despite a nonzero exit; the complete envelope also contains
+// session/account/usage metadata that must never become an error message.
+func claudeCLIErrorMessage(raw []byte) string {
+	if !isClaudeCLIErrorEnvelope(raw) {
+		return ""
+	}
+	if len(raw) > claudeCLIErrorJSONLimit {
+		return claudeCLIErrorFallback
+	}
+	var failure struct {
+		Result string   `json:"result"`
+		Errors []string `json:"errors"`
+	}
+	if json.Unmarshal(raw, &failure) != nil {
+		return claudeCLIErrorFallback
+	}
+	parts := append([]string{failure.Result}, failure.Errors...)
+	var message strings.Builder
+	for _, part := range parts {
+		part = strings.TrimSpace(strings.Map(func(r rune) rune {
+			if r != '\n' && r != '\t' && (unicode.IsControl(r) || unicode.Is(unicode.Cf, r)) {
+				return -1
+			}
+			return r
+		}, stripANSI(part)))
+		part = claudeCLIErrorSecrets.ReplaceAllString(part, "[redacted]")
+		if part == "" {
+			continue
+		}
+		if message.Len() > 0 {
+			message.WriteByte('\n')
+		}
+		remaining := claudeCLIErrorMessageLimit - message.Len()
+		if len(part) > remaining {
+			part = part[:remaining]
+			for !utf8.ValidString(part) {
+				part = part[:len(part)-1]
+			}
+		}
+		message.WriteString(part)
+		if message.Len() >= claudeCLIErrorMessageLimit {
+			break
+		}
+	}
+	if result := strings.TrimSpace(message.String()); result != "" {
+		return result
+	}
+	return claudeCLIErrorFallback
+}
+
+func (c *CLIProvider) formatExecutionError(stdout []byte, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+	if c.name == "claude-cli" {
+		message := claudeCLIErrorMessage(stdout)
+		if strings.TrimSpace(stderr) == "" {
+			stderr = message
+		} else if looksLikeQuotaExhaustion(message) && !looksLikeQuotaExhaustion(stderr) {
+			// Keep stderr first, but retain an explicit limit from the failure
+			// envelope so a generic CLI warning cannot hide an exhausted pool.
+			stderr = strings.TrimSpace(stderr) + "\n" + message
+		}
+	}
+	return formatCLIExecutionError(c.provider, stderr, runErr, ctxErr, duration)
+}
+
 func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
 	if ctxErr != nil {
 		return formatCLIContextError(provider, ctxErr, duration)
@@ -1313,6 +1436,7 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 // (e.g. a user prompt that merely contains "quota").
 var quotaExhaustionHints = []string{
 	"usage limit",
+	"monthly spend limit",
 	"rate limit",
 	"quota exceeded",
 	"quota exhausted",

@@ -3,8 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +11,7 @@ import (
 	"github.com/makewand/makewand/internal/config"
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/model"
+	"github.com/makewand/makewand/internal/testfixture"
 )
 
 type chatFlowStubProvider struct {
@@ -464,21 +463,15 @@ func TestSubmitChatInput_ExplainUsesStreamPathForGeminiCLI(t *testing.T) {
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
 
-	dir := t.TempDir()
-	script := filepath.Join(dir, "gemini-stream.sh")
-	body := "#!/bin/sh\n" +
-		"printf '%s\\n' '{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"repo summary\"}'\n" +
-		"printf '%s\\n' '{\"type\":\"result\",\"status\":\"success\"}'\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
-	if err := os.Chmod(script, 0o755); err != nil {
-		t.Fatalf("Chmod(script): %v", err)
-	}
+	cli := testfixture.WriteCLI(t, "gemini-stream", testfixture.Spec{
+		Mode: "output",
+		Stdout: "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"repo summary\"}\n" +
+			"{\"type\":\"result\",\"status\":\"success\"}\n",
+	})
 
 	router := mustNewRouterFromConfig(t, model.RouterConfig{
 		Providers: map[string]model.ProviderEntry{
-			"gemini": {Provider: model.NewGeminiCLI(script), Access: model.AccessSubscription},
+			"gemini": {Provider: model.NewGeminiCLI(cli), Access: model.AccessSubscription},
 		},
 		DefaultModel:  "gemini",
 		AnalysisModel: "gemini",

@@ -33,10 +33,38 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	// factory closures. Later config mutations cannot turn a subscription-only
 	// router into a paid API router through dynamic model resolution.
 	resolved := *cfg
+	resolved.EnabledProviders = make(map[string]bool, len(cfg.EnabledProviders))
+	for name, enabled := range cfg.EnabledProviders {
+		resolved.EnabledProviders[name] = enabled
+	}
+	if cfg.ActiveProviders != nil {
+		resolved.ActiveProviders = append([]string{}, cfg.ActiveProviders...)
+	}
+	if cfg.LocalModelEnabled != nil {
+		value := *cfg.LocalModelEnabled
+		resolved.LocalModelEnabled = &value
+	}
 	allowPaid := cfg.PaidAPIAllowed()
 	if !allowPaid {
 		resolved.ClaudeAPIKey = ""
 		resolved.GeminiAPIKey = ""
+		resolved.OpenAIAPIKey = ""
+	}
+	// Snapshot enablement before registering static providers or factories.
+	// Do not let API siblings or alias-named custom commands re-enable a pool.
+	resolved.CLIs = nil
+	for _, cli := range cfg.CLIs {
+		if cfg.IsProviderEnabled(cli.Name) {
+			resolved.CLIs = append(resolved.CLIs, cli)
+		}
+	}
+	if !cfg.IsProviderEnabled("claude") {
+		resolved.ClaudeAPIKey = ""
+	}
+	if !cfg.IsProviderEnabled("gemini") {
+		resolved.GeminiAPIKey = ""
+	}
+	if !cfg.IsProviderEnabled("codex") {
 		resolved.OpenAIAPIKey = ""
 	}
 	cfg = &resolved
@@ -67,7 +95,7 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	rc.Providers = make(map[string]ProviderEntry)
 
 	// An explicitly connected gateway applies its own server-side spend policy.
-	if config.HasRemoteBackend() {
+	if config.HasRemoteBackend() && cfg.IsProviderEnabled("remote") {
 		rc.Providers["remote"] = ProviderEntry{
 			Provider: NewRemoteHTTP(config.RemoteBaseURL(), config.RemoteToken()),
 			Access:   AccessAPI,
@@ -92,32 +120,32 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 		switch cli.Name {
 		case "claude":
 			if strings.EqualFold(cfg.ClaudeAccess, "api") && cfg.ClaudeAPIKey != "" {
-				rc.Providers["claude"] = ProviderEntry{Provider: NewClaude(cfg.ClaudeAPIKey, cfg.ClaudeModel), Access: AccessAPI}
+				rc.Providers["claude"] = ProviderEntry{Provider: NewClaudeWithBaseURL(cfg.ClaudeAPIKey, cfg.ClaudeModel, cfg.ClaudeBaseURL), Access: AccessAPI}
 				continue
 			}
 			rc.Providers["claude"] = ProviderEntry{Provider: NewClaudeCLI(cli.BinPath), Access: AccessSubscription}
 			if cfg.ClaudeAPIKey != "" {
-				rc.Providers["claude-api"] = ProviderEntry{Provider: NewClaude(cfg.ClaudeAPIKey, cfg.ClaudeModel), Access: AccessAPI}
+				rc.Providers["claude-api"] = ProviderEntry{Provider: NewClaudeWithBaseURL(cfg.ClaudeAPIKey, cfg.ClaudeModel, cfg.ClaudeBaseURL), Access: AccessAPI}
 			}
 		case "gemini":
 			if !hasAgy {
 				if strings.EqualFold(cfg.GeminiAccess, "api") && cfg.GeminiAPIKey != "" {
-					rc.Providers["gemini"] = ProviderEntry{Provider: NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel), Access: AccessAPI}
+					rc.Providers["gemini"] = ProviderEntry{Provider: NewGeminiWithBaseURL(cfg.GeminiAPIKey, cfg.GeminiModel, cfg.GeminiBaseURL), Access: AccessAPI}
 					continue
 				}
 				rc.Providers["gemini"] = ProviderEntry{Provider: NewGeminiCLI(cli.BinPath), Access: AccessSubscription}
 				if cfg.GeminiAPIKey != "" {
-					rc.Providers["gemini-api"] = ProviderEntry{Provider: NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel), Access: AccessAPI}
+					rc.Providers["gemini-api"] = ProviderEntry{Provider: NewGeminiWithBaseURL(cfg.GeminiAPIKey, cfg.GeminiModel, cfg.GeminiBaseURL), Access: AccessAPI}
 				}
 			}
 		case "agy":
 			if strings.EqualFold(cfg.GeminiAccess, "api") && cfg.GeminiAPIKey != "" {
-				rc.Providers["gemini"] = ProviderEntry{Provider: NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel), Access: AccessAPI}
+				rc.Providers["gemini"] = ProviderEntry{Provider: NewGeminiWithBaseURL(cfg.GeminiAPIKey, cfg.GeminiModel, cfg.GeminiBaseURL), Access: AccessAPI}
 				continue
 			}
 			rc.Providers["gemini"] = ProviderEntry{Provider: NewAgyCLI(cli.BinPath), Access: AccessSubscription}
 			if cfg.GeminiAPIKey != "" {
-				rc.Providers["gemini-api"] = ProviderEntry{Provider: NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel), Access: AccessAPI}
+				rc.Providers["gemini-api"] = ProviderEntry{Provider: NewGeminiWithBaseURL(cfg.GeminiAPIKey, cfg.GeminiModel, cfg.GeminiBaseURL), Access: AccessAPI}
 			}
 		case "codex":
 			rc.Providers["codex"] = ProviderEntry{Provider: NewCodexCLI(cli.BinPath), Access: AccessSubscription}
@@ -128,23 +156,23 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	// If a CLI is present, the `*-api` sibling above keeps API fallback available.
 	if cfg.ClaudeAPIKey != "" {
 		if _, exists := rc.Providers["claude"]; !exists {
-			rc.Providers["claude"] = ProviderEntry{Provider: NewClaude(cfg.ClaudeAPIKey, cfg.ClaudeModel), Access: AccessAPI}
+			rc.Providers["claude"] = ProviderEntry{Provider: NewClaudeWithBaseURL(cfg.ClaudeAPIKey, cfg.ClaudeModel, cfg.ClaudeBaseURL), Access: AccessAPI}
 		}
 	}
 	if cfg.GeminiAPIKey != "" {
 		if _, exists := rc.Providers["gemini"]; !exists {
-			rc.Providers["gemini"] = ProviderEntry{Provider: NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel), Access: AccessAPI}
+			rc.Providers["gemini"] = ProviderEntry{Provider: NewGeminiWithBaseURL(cfg.GeminiAPIKey, cfg.GeminiModel, cfg.GeminiBaseURL), Access: AccessAPI}
 		}
 	}
 	if cfg.OpenAIAPIKey != "" {
 		if _, exists := rc.Providers["openai"]; !exists {
-			rc.Providers["openai"] = ProviderEntry{Provider: NewOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIModel), Access: AccessAPI}
+			rc.Providers["openai"] = ProviderEntry{Provider: NewOpenAIWithBaseURL(cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAIBaseURL), Access: AccessAPI}
 		}
 	}
 
 	// Register custom command providers.
 	for _, cp := range cfg.CustomProviders {
-		if !config.IsCustomProviderUsable(cp) {
+		if !cfg.IsProviderEnabled(cp.Name) || !config.IsCustomProviderUsable(cp) {
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(cp.Name))
@@ -171,7 +199,7 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	// Subscription-quota awareness: attach a snapshotter so routing can steer by
 	// remaining headroom. NewRouterFromConfig — used by tests and library
 	// embedders — stays quota-free unless they opt in.
-	snap := NewDefaultQuotaSnapshotter(0)
+	snap := NewDefaultQuotaSnapshotter(0).WithProviderFilter(cfg.IsProviderEnabled)
 	rc.Quota = snap
 
 	r, err := NewRouterFromConfig(rc)
@@ -213,44 +241,50 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 	// while the router accounts for it as API access.
 	claudeExplicitAPI := strings.EqualFold(strings.TrimSpace(cfg.ClaudeAccess), "api") && cfg.ClaudeAPIKey != ""
 	geminiExplicitAPI := strings.EqualFold(strings.TrimSpace(cfg.GeminiAccess), "api") && cfg.GeminiAPIKey != ""
-	_ = r.RegisterProviderFactory("claude", func(modelID string) (Provider, error) {
-		if claudeExplicitAPI {
-			return NewClaude(cfg.ClaudeAPIKey, modelID), nil
-		}
-		if cli := cfg.GetCLI("claude"); cli != nil {
-			return NewClaudeCLI(cli.BinPath), nil
-		}
-		if cfg.ClaudeAPIKey != "" {
-			return NewClaude(cfg.ClaudeAPIKey, modelID), nil
-		}
-		return nil, fmt.Errorf("claude not configured")
-	})
-	_ = r.RegisterProviderFactory("codex", func(modelID string) (Provider, error) {
-		if cli := cfg.GetCLI("codex"); cli != nil {
-			return NewCodexCLI(cli.BinPath), nil
-		}
-		if cfg.OpenAIAPIKey != "" {
-			return NewOpenAI(cfg.OpenAIAPIKey, modelID), nil
-		}
-		return nil, fmt.Errorf("codex not configured")
-	})
-	_ = r.RegisterProviderFactory("gemini", func(modelID string) (Provider, error) {
-		if geminiExplicitAPI {
-			return NewGemini(cfg.GeminiAPIKey, modelID), nil
-		}
-		// Prefer agy (Antigravity) — the current transport for personal Gemini
-		// subscriptions — over the metered `gemini -p` / API key paths.
-		if cli := cfg.GetCLI("agy"); cli != nil {
-			return NewAgyCLI(cli.BinPath), nil
-		}
-		if cli := cfg.GetCLI("gemini"); cli != nil {
-			return NewGeminiCLI(cli.BinPath), nil
-		}
-		if cfg.GeminiAPIKey != "" {
-			return NewGemini(cfg.GeminiAPIKey, modelID), nil
-		}
-		return nil, fmt.Errorf("gemini not configured")
-	})
+	if cfg.IsProviderEnabled("claude") {
+		_ = r.RegisterProviderFactory("claude", func(modelID string) (Provider, error) {
+			if claudeExplicitAPI {
+				return NewClaudeWithBaseURL(cfg.ClaudeAPIKey, modelID, cfg.ClaudeBaseURL), nil
+			}
+			if cli := cfg.GetCLI("claude"); cli != nil {
+				return NewClaudeCLI(cli.BinPath), nil
+			}
+			if cfg.ClaudeAPIKey != "" {
+				return NewClaudeWithBaseURL(cfg.ClaudeAPIKey, modelID, cfg.ClaudeBaseURL), nil
+			}
+			return nil, fmt.Errorf("claude not configured")
+		})
+	}
+	if cfg.IsProviderEnabled("codex") {
+		_ = r.RegisterProviderFactory("codex", func(modelID string) (Provider, error) {
+			if cli := cfg.GetCLI("codex"); cli != nil {
+				return NewCodexCLI(cli.BinPath), nil
+			}
+			if cfg.OpenAIAPIKey != "" {
+				return NewOpenAIWithBaseURL(cfg.OpenAIAPIKey, modelID, cfg.OpenAIBaseURL), nil
+			}
+			return nil, fmt.Errorf("codex not configured")
+		})
+	}
+	if cfg.IsProviderEnabled("gemini") {
+		_ = r.RegisterProviderFactory("gemini", func(modelID string) (Provider, error) {
+			if geminiExplicitAPI {
+				return NewGeminiWithBaseURL(cfg.GeminiAPIKey, modelID, cfg.GeminiBaseURL), nil
+			}
+			// Prefer agy (Antigravity) — the current transport for personal Gemini
+			// subscriptions — over the metered `gemini -p` / API key paths.
+			if cli := cfg.GetCLI("agy"); cli != nil {
+				return NewAgyCLI(cli.BinPath), nil
+			}
+			if cli := cfg.GetCLI("gemini"); cli != nil {
+				return NewGeminiCLI(cli.BinPath), nil
+			}
+			if cfg.GeminiAPIKey != "" {
+				return NewGeminiWithBaseURL(cfg.GeminiAPIKey, modelID, cfg.GeminiBaseURL), nil
+			}
+			return nil, fmt.Errorf("gemini not configured")
+		})
+	}
 
 	return r, nil
 }

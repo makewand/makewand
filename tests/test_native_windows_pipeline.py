@@ -78,8 +78,10 @@ class NativeWindowsPipelineTests(unittest.TestCase):
              mock.patch("makewand.orchestrator.dispatch_task", side_effect=self.dispatch_fixture), \
              mock.patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
              contextlib.redirect_stdout(output):
+            # This positive fixture includes three real Git baselines; software
+            # emulation needs a bounded startup budget beyond the child limits.
             result = orchestrator.run_race("修复 answer 并保证测试通过", cwd=str(self.workspace),
-                engine_a="claude", engine_b="codex", timeout=90, judge_reserve_seconds=10,
+                engine_a="claude", engine_b="codex", timeout=600, judge_reserve_seconds=10,
                 protected_paths=["protected.txt"])
         self.race_output = output.getvalue()
         return result

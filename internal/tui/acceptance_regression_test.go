@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/makewand/makewand/internal/engine"
@@ -37,6 +38,15 @@ func TestSealedCandidatePayloadRetainsModeAndRejectsTampering(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\ntrue\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Windows does not expose POSIX executable bits; seal its actual mode.
+	expectedMode := before.Mode().Perm()
+	if runtime.GOOS != "windows" && expectedMode != 0755 {
+		t.Fatalf("executable fixture mode=%o, want 0755", expectedMode)
+	}
 	report, err := app.project.EvaluateCandidateFiles(context.Background(), []engine.ExtractedFile{{Path: "run.sh", Content: "#!/bin/sh\necho checked\n"}})
 	if err != nil || !report.Passed {
 		t.Fatalf("verification: %v %+v", err, report)
@@ -47,8 +57,13 @@ func TestSealedCandidatePayloadRetainsModeAndRejectsTampering(t *testing.T) {
 		t.Fatal("missing file payload")
 	}
 	extracted := cmd().(filesExtractedMsg)
-	if !extracted.files[0].ModeKnown || extracted.files[0].Mode != 0755 {
+	if !extracted.files[0].ModeKnown || extracted.files[0].Mode != expectedMode {
 		t.Fatal("file metadata lost in UI")
+	}
+	tamperedMode := append([]engine.ExtractedFile(nil), extracted.files...)
+	tamperedMode[0].Mode = 0600
+	if engine.VerifiedFilesMatch(tamperedMode, report.VerifiedDigest) {
+		t.Fatal("file permission tampering preserved the UI attestation")
 	}
 	app.pendingFiles = append([]engine.ExtractedFile(nil), extracted.files...)
 	app.pendingFiles[0].Content = "unverified replacement"

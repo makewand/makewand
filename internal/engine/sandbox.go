@@ -523,6 +523,9 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 	start := time.Now()
 	cleanupProcess, err := processjob.Start(cmd)
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, errors.Join(contextErr, err))}
+		}
 		return nil, fmt.Errorf("exec %s: %w", command, err)
 	}
 	defer cleanupProcess()

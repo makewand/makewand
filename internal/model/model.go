@@ -94,8 +94,11 @@ var (
 	ChatStreamProvider         = router.ChatStreamProvider
 	NewRouterFromConfig        = router.NewRouterFromConfig
 	NewClaude                  = router.NewClaude
+	NewClaudeWithBaseURL       = router.NewClaudeWithBaseURL
 	NewGemini                  = router.NewGemini
+	NewGeminiWithBaseURL       = router.NewGeminiWithBaseURL
 	NewOpenAI                  = router.NewOpenAI
+	NewOpenAIWithBaseURL       = router.NewOpenAIWithBaseURL
 	NewClaudeCLI               = router.NewClaudeCLI
 	NewGeminiCLI               = router.NewGeminiCLI
 	NewAgyCLI                  = router.NewAgyCLI

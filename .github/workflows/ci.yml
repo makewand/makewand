@@ -65,7 +65,8 @@ jobs:
           # bubblewrap so the live sandbox isolation test (verify_isolation_live_test.go)
           # actually runs instead of skipping — the generation/verification trust
           # boundary is security-critical and must be exercised end-to-end in CI.
-          sudo apt-get install -y expect bubblewrap
+          sudo apt-get install -y expect bubblewrap ripgrep
+          rg --version
 
       - name: Allow unprivileged user namespaces for bubblewrap
         # Ubuntu 24.04 runners ship kernel.apparmor_restrict_unprivileged_userns=1:

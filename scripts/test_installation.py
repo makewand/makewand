@@ -214,7 +214,7 @@ class InstallationTests(unittest.TestCase):
                             "-o", str(bundle / executable), "./cmd/makewand"], cwd=frozen,
                            env=dict(os.environ, GOWORK="off"), check=True)
             installer.verify_frozen_source(frozen, expected_inputs)
-            (frozen / "scripts").mkdir()
+            (frozen / "scripts").mkdir(exist_ok=True)
             shutil.copy2(ROOT / "scripts/stage_python_engine.py", frozen / "scripts/stage_python_engine.py")
             subprocess.run(["python3", "-I", str(frozen / "scripts/stage_python_engine.py"), str(bundle), version], check=True)
             archive = shutil.make_archive(str(temp / "release"), "gztar", bundle.parent, bundle.name)

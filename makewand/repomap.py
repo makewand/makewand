@@ -357,7 +357,7 @@ def _score_candidate_file(rel_p: str, root_name: str) -> Tuple[int, int, int, st
     elif len(parts) == 1:
         tier = 0
         sub_tier = 0
-    elif first == root_name:
+    elif first in (root_name, "makewand"):
         tier = 0
         sub_tier = 0
     elif first in ("src", "internal", "core", "app", "pkg", "router", "lib"):
@@ -636,6 +636,9 @@ def generate_repo_map(cwd: str, max_lines: int = 80, max_files: int = 40, use_pa
     for rel_path in ranked_files:
         syms = file_symbols[rel_path]
         output_lines.append(f"{rel_path}:")
+        if len(output_lines) >= max_lines:
+            output_lines.append("  ... (more symbols truncated)")
+            return "\n".join(output_lines)
         for sym in syms[:8]:  # Limit top 8 symbols per file
             output_lines.append(sym)
             if len(output_lines) >= max_lines:

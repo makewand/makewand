@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/makewand/makewand/internal/privatefile"
 )
 
 const restoreJournalName = ".makewand-restore-journal.json"
@@ -60,6 +62,10 @@ func writeRestoreJournal(path string, j *restoreJournal) (published bool, err er
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
+	if err = privatefile.Tighten(f); err != nil {
+		f.Close()
+		return false, fmt.Errorf("protect restore journal: %w", err)
+	}
 	if _, err = f.Write(data); err != nil {
 		f.Close()
 		return false, err
@@ -241,7 +247,7 @@ func recoverRestoreLocked(opts Options) error {
 		return nil
 	}
 	path := filepath.Join(dir, restoreJournalName)
-	f, err := os.Open(path)
+	f, err := openRestoreJournal(path)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -249,12 +255,8 @@ func recoverRestoreLocked(opts Options) error {
 		return err
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("unsafe restore journal permissions")
+	if err := privatefile.Validate(f); err != nil {
+		return fmt.Errorf("unsafe restore journal permissions: %w", err)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, 16*1024*1024+1))
 	if err != nil {
@@ -262,6 +264,11 @@ func recoverRestoreLocked(opts Options) error {
 	}
 	if len(data) > 16*1024*1024 {
 		return fmt.Errorf("restore journal too large")
+	}
+	// The restore lock serializes recovery. Close this validated fixed reader
+	// before rollback/publication/cleanup so Windows sharing cannot block them.
+	if err := f.Close(); err != nil {
+		return err
 	}
 	var journal restoreJournal
 	if err = json.Unmarshal(data, &journal); err != nil {

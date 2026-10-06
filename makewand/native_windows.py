@@ -42,6 +42,13 @@ def _api():
     return kernel
 
 
+def _private_state_sddl(user_sid, *, directory=False):
+    """Grant this user and SYSTEM once each, including a SYSTEM caller."""
+    flags = "OICI" if directory else ""
+    principals = ("SY",) if user_sid == "S-1-5-18" else (user_sid, "SY")
+    return "D:P" + "".join("(A;" + flags + ";FA;;;" + sid + ")" for sid in principals)
+
+
 def _security_descriptor(path, information):
     from ctypes import wintypes
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -49,11 +56,12 @@ def _security_descriptor(path, information):
     get.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
     get.restype = wintypes.BOOL
     needed = wintypes.DWORD()
-    get(str(path), information, None, 0, ctypes.byref(needed))
+    api_path = _api_path(path)
+    get(api_path, information, None, 0, ctypes.byref(needed))
     if not needed.value:
         raise ctypes.WinError(ctypes.get_last_error())
     descriptor = ctypes.create_string_buffer(needed.value)
-    if not get(str(path), information, descriptor, needed.value, ctypes.byref(needed)):
+    if not get(api_path, information, descriptor, needed.value, ctypes.byref(needed)):
         raise ctypes.WinError(ctypes.get_last_error())
     return descriptor
 
@@ -82,7 +90,7 @@ def _set_dacl(path, descriptor, *, protected=None):
         if not set_control(owned, 0x1000, 0x1000 if protected else 0):
             raise ctypes.WinError(ctypes.get_last_error())
     with pinned_directory(path.parent):
-        handle = _open(path, directory=path.is_dir(), access=0x40000 | 0x20000 | 0x80)
+        handle = _open(path, directory=os.path.isdir(_api_path(path)), access=0x40000 | 0x20000 | 0x80)
         try:
             ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
             setter = ntdll.NtSetSecurityObject
@@ -331,7 +339,7 @@ def ensure_private_file_descriptor(fd):
         if not advapi.ConvertSidToStringSidW(user, ctypes.byref(sid_text)):
             raise ctypes.WinError(ctypes.get_last_error())
         if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                "D:P(A;;FA;;;" + sid_text.value + ")(A;;FA;;;SY)", 1, ctypes.byref(private_descriptor), None):
+                _private_state_sddl(sid_text.value), 1, ctypes.byref(private_descriptor), None):
             raise ctypes.WinError(ctypes.get_last_error())
         present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
         if not advapi.GetSecurityDescriptorDacl(private_descriptor, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted)):
@@ -410,7 +418,7 @@ def ensure_private_directory(path):
                         raise ctypes.WinError(error)
                 finally:
                     kernel.CloseHandle(private_handle)
-            sddl = "D:P(A;OICI;FA;;;" + sid_text.value + ")(A;OICI;FA;;;SY)"
+            sddl = _private_state_sddl(sid_text.value, directory=True)
             if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
                 raise ctypes.WinError(ctypes.get_last_error())
             _set_dacl(pinned, descriptor, protected=True)
@@ -448,7 +456,7 @@ def _open(path, *, directory=False, read=False, create=False, access=None):
     # checks. Request actual read/traverse access so omitting SHARE_DELETE
     # really prevents an ancestor from being renamed while it is pinned.
     desired = access if access is not None else (0x80000000 if read else (0x40000000 if create else (0x20 | 0x80 if directory else 0x80)))
-    handle = kernel.CreateFileW(str(path), desired,
+    handle = kernel.CreateFileW(_api_path(path), desired,
                                1 if read else (0 if create else 3), None, 1 if create else 3,
                                0x00200000 | (0x02000000 if directory else 0), None)
     if handle == ctypes.c_void_p(-1).value:
@@ -464,7 +472,8 @@ def _open(path, *, directory=False, read=False, create=False, access=None):
 
 
 def _absolute_components(path):
-    absolute = os.path.abspath(os.fspath(path))
+    from makewand.windows_paths import ordinary_local_abspath
+    absolute = ordinary_local_abspath(path)
     drive, tail = ntpath.splitdrive(absolute)
     # Local drive roots only: network shares and device namespaces cannot supply
     # the local locking and identity guarantees required by this backend.
@@ -474,6 +483,13 @@ def _absolute_components(path):
     for part in parts:
         relative_parts(part)
     return drive + "\\", parts
+
+
+def _api_path(path):
+    """Validate the original namespace, then extend only the Win32 call path."""
+    from makewand.windows_paths import extended_local_path
+    root, parts = _absolute_components(path)
+    return extended_local_path(ntpath.join(root, *parts))
 
 
 @contextlib.contextmanager
@@ -488,7 +504,7 @@ def pinned_directory(path, *, create=False):
             current = ntpath.join(current, part)
             if create:
                 try:
-                    os.mkdir(current)
+                    os.mkdir(_api_path(current))
                 except FileExistsError:
                     pass
             handles.append(_open(current, directory=True))
@@ -547,7 +563,7 @@ def manifest(workspace, *, input_snapshot=False):
     def scan(directory):
         nonlocal total_bytes
         with pinned_directory(directory):
-            for child in os.scandir(directory):
+            for child in os.scandir(_api_path(directory)):
                 if child.name == ".git":
                     continue
                 info = child.stat(follow_symlinks=False)
@@ -555,17 +571,18 @@ def manifest(workspace, *, input_snapshot=False):
                 is_dir = stat.S_ISDIR(info.st_mode)
                 if (is_dir or is_reparse) and child.name in PROJECT_IGNORE_DIRS:
                     continue
-                relative = Path(child.path).relative_to(root).as_posix()
+                logical_child = directory / child.name
+                relative = logical_child.relative_to(root).as_posix()
                 relative_parts(relative)
                 if is_reparse:
                     raise ValueError("Windows workspace contains a reparse point: " + relative)
                 if is_dir:
-                    scan(Path(child.path))
+                    scan(logical_child)
                 elif stat.S_ISREG(info.st_mode):
                     total_bytes += info.st_size
                     if total_bytes > 512 * 1024 * 1024 or len(result) >= 100000 or time.monotonic() - started > 10:
                         raise OSError("Windows manifest exceeded its input budget")
-                    record = inspect_file(child.path)
+                    record = inspect_file(logical_child)
                     result[relative] = ("file", record["sha256"], record["mode"]) if input_snapshot else record
                 else:
                     raise ValueError("Windows workspace contains a nonregular input: " + relative)
@@ -581,9 +598,9 @@ def validate_target(workspace, relative):
         current = root
         for part in parts:
             current /= part
-            if not os.path.lexists(current):
+            if not os.path.lexists(_api_path(current)):
                 break
-            handle = _open(current, directory=current.is_dir())
+            handle = _open(current, directory=os.path.isdir(_api_path(current)))
             _api().CloseHandle(handle)
     return root.joinpath(*parts)
 
@@ -621,14 +638,14 @@ def atomic_copy(workspace, relative, source, expected=None, *, restore_acl=False
                 os.fsync(dst.fileno())
             # chmod on Windows preserves its supported readonly attribute. ACLs
             # come from the target directory, never from the model's file.
-            os.chmod(temporary, mode)
+            os.chmod(_api_path(temporary), mode)
             if restore_security is not None:
                 _set_dacl(temporary, _restore_security_descriptor(restore_security))
             elif _copy_source_acl and (expected is None or restore_acl):
                 # Legacy host copies retain source ACLs. Transaction rollback
                 # supplies its separately sealed original security descriptor.
                 _set_dacl(temporary, _open_file_security_descriptor(msvcrt.get_osfhandle(src.fileno())))
-            elif os.path.lexists(destination):
+            elif os.path.lexists(_api_path(destination)):
                 handle = _open(destination, access=0x20000 | 0x80)
                 try:
                     # Preserve the original file DACL. A replacement must not
@@ -642,8 +659,8 @@ def atomic_copy(workspace, relative, source, expected=None, *, restore_acl=False
             created = False
         finally:
             if created:
-                os.chmod(temporary, stat.S_IWRITE)
-                os.unlink(temporary)
+                os.chmod(_api_path(temporary), stat.S_IWRITE)
+                os.unlink(_api_path(temporary))
 
 
 def atomic_remove(workspace, relative, *, directory=False, expected_security=_NO_SECURITY_CHECK):
@@ -663,6 +680,117 @@ def atomic_remove(workspace, relative, *, directory=False, expected_security=_NO
             _set_file_information(handle, 21, ctypes.byref(flags), ctypes.sizeof(flags))
         finally:
             _api().CloseHandle(handle)
+
+
+def private_tree_identity(path):
+    """Bind an owned private tree before any untrusted work can change it."""
+    path = Path(path)
+    with pinned_directory(path.parent):
+        handle = _open(path, directory=True)
+        try:
+            info = _info(handle)
+            return (info.volume, info.index_high, info.index_low)
+        finally:
+            _api().CloseHandle(handle)
+
+
+def remove_private_tree(path, expected_identity):
+    """Remove one bound private tree, including readonly Git administration.
+
+    Business workspace paths still reject .git. Only this owned-tree cleanup
+    opens its Git entries, with every ancestor pinned and every object checked.
+    No ACL or readonly attribute is widened, and reparse points are refused.
+    """
+    from makewand.windows_paths import extended_local_path, ordinary_local_abspath
+    root = Path(ordinary_local_abspath(path))
+    _absolute_components(root)  # Private root itself uses the ordinary policy.
+    if (not isinstance(expected_identity, (tuple, list)) or len(expected_identity) != 3
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                   for value in expected_identity)):
+        raise ValueError("Invalid private tree identity")
+    expected_identity = tuple(expected_identity)
+    kernel = _api()
+
+    def identity(info):
+        return (info.volume, info.index_high, info.index_low)
+
+    def open_entry(entry, directory, *, delete=False):
+        # This internal API permits .git only below the already pinned root.
+        access = 0x80 | (0x20 if directory else 0) | (0x10000 | 0x100 if delete else 0)
+        handle = kernel.CreateFileW(extended_local_path(entry), access, 3, None, 3,
+                                   0x00200000 | (0x02000000 if directory else 0), None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            info = _info(handle)
+            if bool(info.attributes & 0x10) != directory or (not directory and info.links != 1):
+                raise ValueError("Private cleanup requires a non-reparse directory or single-link regular file")
+            return handle, identity(info)
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+
+    def dispose(handle):
+        flags = ctypes.c_uint32(1 | 2 | 0x10)  # DELETE | POSIX | IGNORE_READONLY
+        _set_file_information(handle, 21, ctypes.byref(flags), ctypes.sizeof(flags))
+
+    records = {}
+
+    def walk(directory, deleting):
+        with os.scandir(extended_local_path(directory)) as entries:
+            children = list(entries)
+        for child in children:
+            info = child.stat(follow_symlinks=False)
+            if getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("Private cleanup refuses reparse points")
+            directory_entry = stat.S_ISDIR(info.st_mode)
+            if not directory_entry and not stat.S_ISREG(info.st_mode):
+                raise ValueError("Private cleanup refuses nonregular entries")
+            target = directory / child.name
+            handle, actual = open_entry(target, directory_entry, delete=deleting and not directory_entry)
+            try:
+                if deleting:
+                    if records.get(target) != (actual, directory_entry):
+                        raise ValueError("Private cleanup object identity changed")
+                else:
+                    records[target] = (actual, directory_entry)
+                if directory_entry:
+                    walk(target, deleting)
+                elif deleting:
+                    dispose(handle)
+            finally:
+                kernel.CloseHandle(handle)
+            if deleting and directory_entry:
+                # Release this directory's pin before opening DELETE access;
+                # its parent remains pinned and the reopened identity is exact.
+                handle, actual = open_entry(target, True, delete=True)
+                try:
+                    if records[target] != (actual, True):
+                        raise ValueError("Private cleanup directory identity changed")
+                    dispose(handle)
+                finally:
+                    kernel.CloseHandle(handle)
+
+    with pinned_directory(root.parent):
+        try:
+            handle, actual = open_entry(root, True)
+        except FileNotFoundError:
+            return  # A successful callback can safely be called again.
+        try:
+            if actual != expected_identity:
+                raise ValueError("Private cleanup root identity changed")
+            # Preflight the complete tree before deleting even one entry.
+            walk(root, False)
+            walk(root, True)
+        finally:
+            kernel.CloseHandle(handle)
+        handle, actual = open_entry(root, True, delete=True)
+        try:
+            if actual != expected_identity:
+                raise ValueError("Private cleanup root identity changed")
+            dispose(handle)
+        finally:
+            kernel.CloseHandle(handle)
 
 
 def copy_backup(source, destination):
@@ -686,7 +814,7 @@ def replace_file(temporary, destination):
     with pinned_directory(temporary.parent), pinned_directory(destination.parent):
         # The source is exclusively created by the caller; validation ensures
         # reparse points cannot enter either endpoint before publication.
-        if os.path.lexists(destination):
+        if os.path.lexists(_api_path(destination)):
             handle = _open(destination)
             kernel.CloseHandle(handle)
         source = _open(temporary, access=0x10000 | 0x80)

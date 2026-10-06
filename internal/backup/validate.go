@@ -18,7 +18,13 @@ func validateSQLite(path string) (map[string]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	uri := url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}
+	uriPath := filepath.ToSlash(abs)
+	// A Windows drive is a path component, not a URI authority. The leading
+	// slash also preserves URL escaping for filenames containing %, ? or #.
+	if !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	uri := url.URL{Scheme: "file", Path: uriPath}
 	db, err := sql.Open("sqlite", uri.String()+"?mode=ro&immutable=1")
 	if err != nil {
 		return nil, err

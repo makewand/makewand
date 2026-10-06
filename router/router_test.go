@@ -3,8 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"github.com/makewand/makewand/internal/testfixture"
 	"strings"
 	"testing"
 	"time"
@@ -603,15 +602,7 @@ func TestChatStream_FallbackOnStartError(t *testing.T) {
 }
 
 func TestNewRouterFromConfig_LoadsCustomProvider(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "echo-custom.sh")
-	body := "#!/bin/sh\n" +
-		"for arg in \"$@\"; do\n" +
-		"  printf '%s\\n' \"$arg\"\n" +
-		"done\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil { //nolint:gosec // G306: test fixture script must be executable.
-		t.Fatalf("WriteFile(script): %v", err)
-	}
+	script := testfixture.WriteCLI(t, "echo-custom", testfixture.Spec{Mode: "echo-args"})
 
 	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
@@ -649,10 +640,11 @@ func TestNewRouterFromConfig_LoadsCustomProvider(t *testing.T) {
 }
 
 func TestRouteByMode_CustomProviderAccessAPIAllowedInFastMode_Router(t *testing.T) {
+	script := testfixture.WriteCLI(t, "private-api", testfixture.Spec{Stdout: "ok\n"})
 	r := mustNewRouter(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"private-api": {
-				Provider: NewCommandCLI("private-api", "/bin/sh", []string{"-c", "echo ok", "{{prompt}}"}, "legacy"),
+				Provider: NewCommandCLI("private-api", script, nil, "legacy"),
 				Access:   AccessAPI,
 			},
 		},

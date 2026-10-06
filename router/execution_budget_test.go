@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/makewand/makewand/internal/testfixture"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -179,19 +179,8 @@ func TestBuiltinDirectAPIAdmissionDoesNotDoubleCountRouter(t *testing.T) {
 
 func countingSyntheticCLI(t *testing.T, firstError string) (*CLIProvider, string) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX fake CLI fixture")
-	}
-	dir := t.TempDir()
-	state := filepath.Join(dir, "count")
-	script := filepath.Join(dir, "synthetic.sh")
-	body := "#!/bin/sh\nn=0\nif [ -f \"$1\" ]; then n=$(cat \"$1\"); fi\nn=$((n+1))\necho $n > \"$1\"\nif [ $n -eq 1 ]; then echo '" + firstError + "' >&2; exit 1; fi\necho 'synthetic response'\n"
-	if err := os.WriteFile(script, []byte(body), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(script, 0700); err != nil {
-		t.Fatal(err)
-	}
+	state := filepath.Join(t.TempDir(), "count")
+	script := testfixture.WriteCLI(t, "synthetic", testfixture.Spec{Mode: "counter", StateFile: state, FirstError: firstError, Stdout: "synthetic response\n"})
 	return NewCommandCLI("synthetic", script, []string{state}, PromptModeStdin), state
 }
 

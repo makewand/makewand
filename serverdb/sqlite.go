@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,10 @@ func Open(path string) (*sql.DB, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, fmt.Errorf("sqlite path is empty")
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -44,8 +49,7 @@ func Open(path string) (*sql.DB, error) {
 	// modernc.org/sqlite applies `_pragma` DSN options to every connection it opens,
 	// so encode them there instead of single db.Exec. journal_mode=WAL is a
 	// persistent database-level setting, configured via Exec below.
-	dsn := path + "?_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, err
 	}
@@ -56,6 +60,22 @@ func Open(path string) (*sql.DB, error) {
 	// Serialize connections to 1 to eliminate write-lock contention under concurrent goroutines.
 	db.SetMaxOpenConns(1)
 	return db, nil
+}
+
+// sqliteDSN treats path as a filename, so URI delimiters and percent escapes
+// cannot change which file SQLite opens. Absolute Windows drive paths need a
+// leading slash in the URI path; UNC paths retain their two leading slashes.
+func sqliteDSN(path string) string {
+	uriPath := filepath.ToSlash(path)
+	if !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout(30000)")
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "synchronous(NORMAL)")
+	uri := url.URL{Scheme: "file", Path: uriPath, RawQuery: query.Encode()}
+	return uri.String()
 }
 
 // Checkpoint performs a passive WAL checkpoint (PRAGMA wal_checkpoint(PASSIVE)).

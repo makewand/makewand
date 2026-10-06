@@ -47,6 +47,7 @@ scratch/
 
 # Local test/work directories
 /benchmarks/*
+!/benchmarks/profile_workspace.py
 !/benchmarks/README.md
 !/benchmarks/run.sh
 !/benchmarks/runner.py

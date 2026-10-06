@@ -100,6 +100,9 @@ func TestExecTrace_DepsDeclineIncludesPlanAndDecision(t *testing.T) {
 }
 
 func TestExecTrace_TestsApprovalAndSuccessIncludesResult(t *testing.T) {
+	// This injects a successful result and tests trace/UI behavior. Pin the
+	// isolation probe as in the other approval unit tests, including Windows.
+	stubRestrictedExecIsolation(t, true, nil)
 	app := newBuildAppForDepsTest(t)
 
 	tracePath := filepath.Join(t.TempDir(), "trace.jsonl")

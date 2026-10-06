@@ -148,8 +148,16 @@ def stage(name, engine=None, readonly=False, *, attempt_id=None, account_ref=Non
         try:
             yield span
         except BaseException as error:
-            span.finish("CANCELLED" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "FAILED",
-                        error_kind="interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "stage_exception")
+            interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
+            try:
+                status = getattr(error, "execution_status", None) or getattr(error, "status", None)
+            except BaseException:
+                status = None
+            # Preserve typed failures without copying raw exception text into
+            # events or allowing malformed metadata to replace the exception.
+            if not isinstance(status, str) or status not in STATUS_CODES or status == "PASSED":
+                status = "CANCELLED" if interrupted else "FAILED"
+            span.finish(status, error_kind="interrupted" if interrupted else "stage_exception")
             raise
         finally:
             span.close()
