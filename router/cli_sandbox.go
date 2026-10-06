@@ -97,42 +97,182 @@ func cliConfiguredCodexHome(env []string, workspace, home string) (string, strin
 	if selected == "" {
 		return "", "", nil
 	}
+	if !cliUnambiguousAccountPath(selected) {
+		return "", "", errors.New("configured CODEX_HOME has ambiguous path traversal; refusing account fallback")
+	}
 	if !filepath.IsAbs(selected) {
 		selected = filepath.Join(workspace, selected)
 	}
 	selected = filepath.Clean(selected)
-	real, err := filepath.EvalSymlinks(selected)
+	// Reject forbidden lexical paths before inspecting any selected account path.
+	// In particular, a workspace symlink cannot select an outside account.
+	homes := []string{home}
+	workspaces := []string{workspace}
+	protected := cliCodexProtectedPaths(homes)
+	if err := cliValidateCodexHome(selected, workspaces, homes, protected); err != nil {
+		return "", "", err
+	}
+	for _, base := range []string{home, workspace} {
+		if base == "" {
+			continue
+		}
+		if realBase, err := filepath.EvalSymlinks(base); err == nil {
+			if base == home {
+				homes = append(homes, realBase)
+			} else {
+				workspaces = append(workspaces, realBase)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", "", errors.New("configured CODEX_HOME boundary is unavailable; refusing account fallback")
+		}
+	}
+	protected = cliCodexProtectedPaths(homes)
+	// A foreign credential directory can itself be a symlink to an outside path.
+	// Its canonical target must remain hidden when the selected account is bound.
+	for _, path := range append([]string(nil), protected...) {
+		if realPath, err := filepath.EvalSymlinks(path); err == nil {
+			protected = append(protected, realPath)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", "", errors.New("configured CODEX_HOME boundary is unavailable; refusing account fallback")
+		}
+	}
+	real, err := cliResolveCodexDirectory(selected, func(path string) error {
+		return cliValidateCodexHome(path, workspaces, homes, protected)
+	})
 	if err != nil {
-		return "", "", errors.New("configured CODEX_HOME is unavailable; refusing account fallback")
-	}
-	info, err := os.Stat(real) //nolint:gosec // G703: operator-selected provider state directory, validated below
-	if err != nil || !info.IsDir() {
-		return "", "", errors.New("configured CODEX_HOME is not a provider state directory")
-	}
-	for _, broad := range []string{"/", "/home", "/root", "/mnt", "/media", "/srv", "/tmp", "/var", home} {
-		if broad != "" && (real == filepath.Clean(broad) || cliPathWithin(real, broad)) {
-			return "", "", errors.New("CODEX_HOME must be a dedicated provider state directory")
-		}
-	}
-	for _, path := range []string{selected, real} {
-		if cliPathWithin(path, workspace) || cliPathWithin(workspace, path) {
-			return "", "", errors.New("CODEX_HOME must be separate from the workspace")
-		}
-	}
-	if home != "" {
-		protected := append([]string(nil), cliSensitiveHomeEntries...)
-		for provider, entries := range cliProviderCredentials {
-			if provider != "codex" {
-				protected = append(protected, entries...)
-			}
-		}
-		for _, sensitive := range protected {
-			if cliPathWithin(filepath.Join(home, filepath.FromSlash(sensitive)), real) {
-				return "", "", errors.New("CODEX_HOME must be a dedicated provider state directory")
-			}
-		}
+		return "", "", err
 	}
 	return selected, real, nil
+}
+
+func cliCodexProtectedPaths(homes []string) []string {
+	entries := append([]string(nil), cliSensitiveHomeEntries...)
+	for provider, credentials := range cliProviderCredentials {
+		if provider != "codex" {
+			entries = append(entries, credentials...)
+		}
+	}
+	var protected []string
+	for _, home := range homes {
+		if home != "" {
+			for _, entry := range entries {
+				protected = append(protected, filepath.Join(home, filepath.FromSlash(entry)))
+			}
+		}
+	}
+	return protected
+}
+
+func cliValidateCodexHome(path string, workspaces, homes, protected []string) error {
+	if !filepath.IsAbs(path) || filepath.VolumeName(path) != "" && strings.HasPrefix(filepath.VolumeName(path), `\\`) {
+		return errors.New("CODEX_HOME must be a dedicated local provider state directory")
+	}
+	for _, broad := range append([]string{"/", "/home", "/root", "/mnt", "/media", "/srv", "/tmp", "/var"}, homes...) {
+		if broad != "" && cliPathWithin(path, broad) {
+			return errors.New("CODEX_HOME must be a dedicated provider state directory")
+		}
+	}
+	for _, workspace := range workspaces {
+		if cliPathWithin(path, workspace) || cliPathWithin(workspace, path) {
+			return errors.New("CODEX_HOME must be separate from the workspace")
+		}
+	}
+	for _, sensitive := range protected {
+		if cliPathWithin(sensitive, path) || cliPathWithin(path, sensitive) {
+			return errors.New("CODEX_HOME must be a dedicated provider state directory")
+		}
+	}
+	return nil
+}
+
+func cliUnambiguousAccountPath(path string) bool {
+	seenDirectory := false
+	for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+		if component == ".." && seenDirectory {
+			return false
+		}
+		if component != "" && component != "." && component != ".." {
+			seenDirectory = true
+		}
+	}
+	return true
+}
+
+// cliResolveCodexDirectory checks each complete path before looking it up. The
+// filesystem root is only a namespace anchor: validate supplies the account
+// authorization boundary. Each lookup is a local component in a pinned parent,
+// and a link target is authorized before following it. The final directory is
+// verified through its handle rather than a second unrestricted pathname Stat.
+func cliResolveCodexDirectory(path string, validate func(string) error) (string, error) {
+	for links := 0; links <= 40; links++ {
+		if err := validate(path); err != nil {
+			return "", err
+		}
+		anchor := filepath.VolumeName(path) + string(os.PathSeparator)
+		rel, err := filepath.Rel(anchor, path)
+		if err != nil || !filepath.IsLocal(rel) {
+			return "", errors.New("CODEX_HOME must be a dedicated local provider state directory")
+		}
+		parent, err := os.OpenRoot(anchor)
+		if err != nil {
+			return "", errors.New("configured CODEX_HOME is unavailable; refusing account fallback")
+		}
+		parts := strings.Split(rel, string(os.PathSeparator))
+		resolved := anchor
+		var nextPath string
+		for i, component := range parts {
+			if !filepath.IsLocal(component) || component == "." || strings.ContainsAny(component, `/\`) {
+				_ = parent.Close()
+				return "", errors.New("CODEX_HOME contains an invalid directory component")
+			}
+			info, err := parent.Lstat(component)
+			if err != nil {
+				_ = parent.Close()
+				return "", errors.New("configured CODEX_HOME is unavailable; refusing account fallback")
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				target, err := parent.Readlink(component)
+				_ = parent.Close()
+				if err != nil {
+					return "", errors.New("configured CODEX_HOME is unavailable; refusing account fallback")
+				}
+				// Cleaning "dir/link/../account" would skip the physical link
+				// traversal and can select a different account. Only leading
+				// parent navigation is safe to resolve against our pinned parent.
+				if !cliUnambiguousAccountPath(target) {
+					return "", errors.New("configured CODEX_HOME has ambiguous symbolic link traversal; refusing account fallback")
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(resolved, target)
+				}
+				nextPath = filepath.Join(append([]string{target}, parts[i+1:]...)...)
+				break
+			}
+			if !info.IsDir() {
+				_ = parent.Close()
+				return "", errors.New("configured CODEX_HOME is not a provider state directory")
+			}
+			next, err := parent.OpenRoot(component)
+			_ = parent.Close()
+			if err != nil {
+				return "", errors.New("configured CODEX_HOME is unavailable; refusing account fallback")
+			}
+			opened, err := next.Stat(".")
+			if err != nil || !os.SameFile(info, opened) {
+				_ = next.Close()
+				return "", errors.New("configured CODEX_HOME changed during validation; refusing account fallback")
+			}
+			parent = next
+			resolved = filepath.Join(resolved, component)
+		}
+		if nextPath != "" {
+			path = filepath.Clean(nextPath)
+			continue
+		}
+		_ = parent.Close()
+		return resolved, nil
+	}
+	return "", errors.New("configured CODEX_HOME has too many symbolic links; refusing account fallback")
 }
 
 func maskSensitivePath(args []string, target, workspace string) []string {
@@ -457,7 +597,13 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		if sourceEnv == nil {
 			sourceEnv = os.Environ()
 		}
-		if _, foreignHome, err := cliConfiguredCodexHome(sourceEnv, workspace, home); err == nil && foreignHome != "" {
+		_, foreignHome, err := cliConfiguredCodexHome(sourceEnv, workspace, home)
+		if err != nil {
+			// Without a verified target, the root read-only mount can expose
+			// an explicitly selected account to a different provider.
+			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+		}
+		if foreignHome != "" {
 			bwrapArgs = maskSensitivePath(bwrapArgs, foreignHome, workspace)
 		}
 	}
