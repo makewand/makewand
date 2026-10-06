@@ -34,6 +34,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
+          archive: true
           name: server-drill-${{ github.sha }}
           path: build/server-drill.json
           if-no-files-found: error

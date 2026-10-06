@@ -63,6 +63,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
+          archive: true
           name: native-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: build/native-windows-verification
           if-no-files-found: error
