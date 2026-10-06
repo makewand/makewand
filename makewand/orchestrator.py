@@ -1421,7 +1421,7 @@ def _run_pipeline_impl(
             _outcome["status"] = "TIMEOUT"
         return reject_unverified("全局截止时间已到，拒绝开始交付")
     if is_shadow_active:
-        if shadow_branch or native_delivery is not None:
+        if shadow_branch or native_delivery is not None or delivery_baseline is not None:
             delivered_branch = shadow_branch
             has_baseline_conflict = False
             try:
@@ -1764,7 +1764,9 @@ def _run_pipeline_impl(
                     print(f"  独立补丁备用存档: {c(str(patch_file), COLOR_CYAN)}")
                     print(f"  一键应用脚本备用: {c(apply_script_esc, COLOR_CYAN)}\n")
             else:
-                print("  已在独立隔离副本保存所有产物，原工作区未受任何修改污染。\n")
+                print("  已封存非 Git 隔离副本的交付补丁，原工作区未受任何修改污染。")
+                print(f"  固定提交与补丁清单: {manifest_file}")
+                print(f"  一键应用交付补丁: {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}\n")
 
     if get_remaining_timeout(timeout) <= 0:
         if _outcome is not None:
