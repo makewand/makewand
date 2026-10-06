@@ -166,3 +166,108 @@ class TestLinter(unittest.TestCase):
             self.assertNotEqual(run_cwd, self.cwd)
             self.assertTrue(os.path.isdir(run_cwd) or "/tmp" in run_cwd)
 
+    def test_fast_syntax_check_rust_fallback_no_bwrap_uses_out_dir(self):
+        """Regression test for Priority 1: rustc fallback must use --out-dir instead of -o /dev/null to prevent OS error 13."""
+        from unittest.mock import patch
+        import shutil
+        if not shutil.which("rustc"):
+            self.skipTest("rustc not installed on host")
+
+        rs_valid = Path(self.cwd) / "valid.rs"
+        rs_valid.write_text("fn main() {}\n", encoding="utf-8")
+        rs_invalid = Path(self.cwd) / "invalid.rs"
+        rs_invalid.write_text("fn main() { let x = ; }\n", encoding="utf-8")
+
+        with patch("makewand.linter.is_bwrap_available", return_value=False):
+            # Valid Rust must succeed without permission denied on /dev/null
+            ok, errors = fast_syntax_check(self.cwd, ["valid.rs"])
+            self.assertTrue(ok, f"Expected valid.rs to succeed in fallback, got: {errors}")
+            self.assertEqual(errors, [])
+
+            # Invalid Rust must fail with compilation error, not /dev/null OS error 13
+            ok, errors = fast_syntax_check(self.cwd, ["invalid.rs"])
+            self.assertFalse(ok)
+            self.assertEqual(len(errors), 1)
+            self.assertNotIn("Permission denied", errors[0])
+            self.assertIn("error", errors[0].lower())
+
+    def test_fast_syntax_check_go_package_and_fallback(self):
+        """Regression test for Priority 1: Go syntax check must support multi-file packages and offline sandbox without network errors."""
+        import shutil
+        if not shutil.which("go") and not shutil.which("gofmt"):
+            self.skipTest("Neither go nor gofmt installed on host")
+
+        foo_go = Path(self.cwd) / "foo.go"
+        foo_go.write_text("package main\nfunc main() { helper() }\n", encoding="utf-8")
+        bar_go = Path(self.cwd) / "bar.go"
+        bar_go.write_text("package main\nfunc helper() {}\n", encoding="utf-8")
+        bad_go = Path(self.cwd) / "bad.go"
+        bad_go.write_text("package main\nfunc main() { syntax error }\n", encoding="utf-8")
+
+        # 1. Fallback mode without bwrap
+        from unittest.mock import patch
+        with patch("makewand.linter.is_bwrap_available", return_value=False):
+            ok, errors = fast_syntax_check(self.cwd, ["foo.go"])
+            self.assertTrue(ok, f"Expected multi-file package foo.go to pass in fallback, got: {errors}")
+
+            ok, errors = fast_syntax_check(self.cwd, ["bad.go"])
+            self.assertFalse(ok)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("bad.go", errors[0])
+
+        # 2. Live sandbox mode (if bwrap is available)
+        from makewand.sandbox import is_bwrap_available
+        if is_bwrap_available():
+            ok, errors = fast_syntax_check(self.cwd, ["foo.go"])
+            self.assertTrue(ok, f"Expected foo.go to pass in sandbox, got: {errors}")
+
+            ok, errors = fast_syntax_check(self.cwd, ["bad.go"])
+            self.assertFalse(ok)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("bad.go", errors[0])
+
+    def test_fast_syntax_check_go_gofmt_only(self):
+        """Regression test: Go syntax check must succeed using gofmt when go binary is missing."""
+        from unittest.mock import patch
+        import shutil
+
+        foo_go = Path(self.cwd) / "only_gofmt.go"
+        foo_go.write_text("package main\nfunc main() {}\n", encoding="utf-8")
+
+        # 1. Fallback mode: go is missing, gofmt is available
+        with patch("makewand.linter.is_bwrap_available", return_value=False), \
+             patch("shutil.which", side_effect=lambda x: "/usr/bin/gofmt" if x == "gofmt" else None):
+            ok, errors = fast_syntax_check(self.cwd, ["only_gofmt.go"])
+            self.assertTrue(ok, f"Expected gofmt fallback without go binary to succeed, got {errors}")
+            self.assertEqual(errors, [])
+
+        # 2. Sandbox mode: go is missing, gofmt is available
+        with patch("makewand.linter.is_bwrap_available", return_value=True), \
+             patch("shutil.which", side_effect=lambda x: "/usr/bin/gofmt" if x == "gofmt" else None), \
+             patch("makewand.linter.run_in_sandbox", return_value=(0, "", "", None)) as mock_sandbox:
+            ok, errors = fast_syntax_check(self.cwd, ["only_gofmt.go"])
+            self.assertTrue(ok)
+            self.assertEqual(errors, [])
+            self.assertTrue(mock_sandbox.called)
+            cmd = mock_sandbox.call_args[0][0]
+            self.assertEqual(cmd[0], "/usr/bin/gofmt")
+
+    def test_fast_syntax_check_bwrap_runtime_error_fallback(self):
+        """Regression test: when run_in_sandbox fails with bwrap runtime/namespace error, fall back to isolated tempdir."""
+        from unittest.mock import patch, MagicMock
+        js_file = Path(self.cwd) / "fallback.js"
+        js_file.write_text("const a = 10;\n", encoding="utf-8")
+
+        with patch("makewand.linter.is_bwrap_available", return_value=True), \
+             patch("makewand.linter.run_in_sandbox", return_value=(1, "", "bwrap: Can't create user namespace: Operation not permitted\n", None)), \
+             patch("subprocess.run") as mock_subproc:
+            mock_subproc.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            ok, errors = fast_syntax_check(self.cwd, ["fallback.js"])
+            self.assertTrue(ok)
+            self.assertEqual(errors, [])
+            self.assertTrue(mock_subproc.called)
+            run_cwd = mock_subproc.call_args[1].get("cwd")
+            self.assertNotEqual(run_cwd, self.cwd)
+
+
+

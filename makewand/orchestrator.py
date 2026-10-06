@@ -705,7 +705,7 @@ def _run_pipeline_impl(
     if has_explicit_readonly:
         intent = classify_prompt_intent(prompt)
         if intent == "code":
-            intent = "code" if force_code else "explain"
+            intent = "explain"
     elif force_code:
         intent = "code"
     else:
