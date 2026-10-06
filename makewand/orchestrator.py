@@ -217,7 +217,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     if (p / "go.mod").exists():
         if not shutil.which("go"):
             return False, LocalTestsUnavailable("检测到 Go 项目，但缺少 go 测试工具，验收未执行")
-        test_suites.append(("Go", ["go", "test", "./..."], {}))
+        test_suites.append(("Go", ["go", "test", "-v", "./..."], {}))
 
     # 3. Node / npm test suites
     if (p / "package.json").exists():
@@ -298,7 +298,9 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         if code == 0 and name == "Python" and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", stdout + "\n" + stderr) or "Exit:" in (stdout + "\n" + stderr)):
             return False, LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
 
-        if code == 0 and name == "Go" and "[no test files]" in (stdout + stderr) and "PASS" not in stdout:
+        # A package-level PASS also appears when every test was skipped. Require
+        # one verbose test/example PASS; dependencies with no tests are harmless.
+        if code == 0 and name == "Go" and not re.search(r"(?m)^--- PASS: \S+", stdout):
             return False, LocalTestsUnavailable("Go 测试套件未发现任何有效测试用例，不能作为通过的验收证据")
 
         if code == 0 and name == "Node" and re.search(r"\b(No tests found|0 passing)\b", stdout + "\n" + stderr):

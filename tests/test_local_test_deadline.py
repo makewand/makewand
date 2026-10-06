@@ -48,7 +48,8 @@ class LocalTestDeadlineTests(unittest.TestCase):
         def execute(**kwargs):
             timeouts.append(kwargs["timeout"])
             self.clock += .3
-            return 0, "passed", "", None
+            output = "--- PASS: TestFixture (0.00s)\nPASS\n" if kwargs["cmd"][0] == "go" else "passed"
+            return 0, output, "", None
         ok, details, run = self.invoke(execute, composite=True)
         self.assertTrue(ok)
         self.assertEqual(run.call_count, 2)
