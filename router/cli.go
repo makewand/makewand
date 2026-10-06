@@ -408,19 +408,29 @@ func (c *CLIProvider) healthCheck() bool {
 		done <- cmd.Wait()
 	}()
 
+	return c.waitHealthProbe(ctx, done, capture, func() { killCLIProcess(cmd) })
+}
+
+// waitHealthProbe joins the supervised probe before classifying its outcome.
+// Wait and the deadline can become ready together; availability must not depend
+// on which select arm wins that race.
+func (c *CLIProvider) waitHealthProbe(ctx context.Context, done <-chan error, capture *processjob.Capture, stop func()) bool {
+	var err error
 	select {
-	case err := <-done:
-		return err == nil && !capture.Exceeded()
+	case err = <-done:
 	case <-ctx.Done():
-		killCLIProcess(cmd)
-		<-done
-		if !capture.Exceeded() && errors.Is(ctx.Err(), context.DeadlineExceeded) && c.softPassProbeTimeout() {
-			// Some subscription CLIs can stall on --version probes when network/auth is slow.
-			// Treat timeout as "unknown but likely available" and let request-time retries decide.
-			return true
-		}
+		stop()
+		err = <-done
+	}
+	if capture.Exceeded() {
 		return false
 	}
+	if ctx.Err() != nil {
+		// Some subscription CLIs stall on version/auth probes. Their deadline is
+		// unknown availability, while custom probes and cancellation fail closed.
+		return errors.Is(ctx.Err(), context.DeadlineExceeded) && c.softPassProbeTimeout()
+	}
+	return err == nil
 }
 
 func (c *CLIProvider) softPassProbeTimeout() bool {

@@ -185,6 +185,10 @@ jobs:
           # whole codebase (not just changed lines) to keep it there. Flip back to
           # only-new-issues only if an intentional, tracked backlog is reintroduced.
           only-new-issues: false
+          # Report all diagnostics, including repeated findings.
+          args: --max-issues-per-linter=0 --max-same-issues=0
+          # Skip action cache restore/save so each runner starts analysis fresh.
+          skip-cache: true
 
       - name: Build CLI
         run: go build -trimpath -o build/makewand ./cmd/makewand

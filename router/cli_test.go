@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/processjob"
 	"github.com/makewand/makewand/internal/testfixture"
 	"os"
 	"os/exec"
@@ -400,6 +401,13 @@ func TestCLIProvider_IsAvailable_UsesHealthProbe(t *testing.T) {
 	}
 }
 
+func TestCLIProvider_IsAvailable_RejectsNonzeroProbe(t *testing.T) {
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "probe", Stderr: "probe failed\n", ExitCode: 1})
+	if p := NewCodexCLI(script); p.IsAvailable() {
+		t.Fatal("IsAvailable() = true, want false for a completed nonzero probe")
+	}
+}
+
 func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
 	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 10 * time.Second})
 
@@ -441,6 +449,83 @@ func TestCLIProvider_IsAvailable_SoftPassesTimeoutForGemini(t *testing.T) {
 	elapsed := time.Since(start)
 	if elapsed > cliAvailProbeTimeout+2*time.Second {
 		t.Fatalf("IsAvailable() took too long: %s", elapsed)
+	}
+}
+
+func TestCLIProvider_HealthProbeDeadlineAndCompletionReady(t *testing.T) {
+	// A real expired context and a buffered Wait result are both ready before
+	// the production wait starts. The result must hold regardless of select's
+	// scheduling, and every iteration must consume the completion result.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	for _, provider := range []string{"claude", "codex", "gemini", "muse", "grok", "custom"} {
+		t.Run(provider, func(t *testing.T) {
+			p := &CLIProvider{provider: provider}
+			want := provider != "custom"
+			for attempt := 0; attempt < 128; attempt++ {
+				done := make(chan error, 1)
+				done <- errors.New("probe killed at deadline")
+				capture := processjob.NewCapture(64, nil)
+				stops := 0
+				got := p.waitHealthProbe(ctx, done, capture, func() { stops++ })
+				if got != want {
+					t.Fatalf("both-ready attempt %d availability = %t, want %t", attempt, got, want)
+				}
+				if len(done) != 0 || stops > 1 {
+					t.Fatalf("probe completion was not consumed once: pending=%d stops=%d", len(done), stops)
+				}
+			}
+		})
+	}
+}
+
+func TestCLIProvider_HealthProbeWaitPreservesFailureCases(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		provider string
+		end      string
+		err      error
+		overflow bool
+		want     bool
+	}{
+		{name: "healthy", provider: "codex", want: true},
+		{name: "real nonzero exit", provider: "codex", err: errors.New("exit status 1")},
+		{name: "canceled subscription", provider: "codex", end: "cancel", err: context.Canceled},
+		{name: "custom deadline", provider: "custom", end: "deadline", err: context.DeadlineExceeded},
+		{name: "deadline output overflow", provider: "codex", end: "deadline", err: context.DeadlineExceeded, overflow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			switch tc.end {
+			case "deadline":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+			case "cancel":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			capture := processjob.NewCapture(1, nil)
+			if tc.overflow {
+				if _, err := capture.Stdout().Write([]byte("xx")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			done := make(chan error, 1)
+			if ctx.Err() == nil {
+				done <- tc.err
+			}
+			stopped := false
+			p := &CLIProvider{provider: tc.provider}
+			got := p.waitHealthProbe(ctx, done, capture, func() {
+				stopped = true
+				done <- tc.err
+			})
+			if got != tc.want || len(done) != 0 || stopped != (ctx.Err() != nil) {
+				t.Fatalf("availability=%t want=%t pending=%d stopped=%t ctx=%v", got, tc.want, len(done), stopped, ctx.Err())
+			}
+		})
 	}
 }
 
@@ -585,6 +670,7 @@ func TestParseClaudeCLIJSON_ValidResponse(t *testing.T) {
 	}
 	if usage == nil {
 		t.Fatal("usage = nil, want non-nil")
+		return
 	}
 	if usage.InputTokens != 3 {
 		t.Fatalf("InputTokens = %d, want 3", usage.InputTokens)
@@ -668,6 +754,7 @@ func TestParseGeminiCLIJSON_ValidResponse(t *testing.T) {
 	}
 	if usage == nil {
 		t.Fatal("usage = nil, want non-nil")
+		return
 	}
 	// Aggregated across both models: 3280 + 7346 = 10626
 	if usage.InputTokens != 10626 {

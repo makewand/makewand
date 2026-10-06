@@ -226,6 +226,7 @@ with open("main.py", "w") as f:
 	result, err := project.RunRestrictedPlan(context.Background(), ExecPlan{Kind: "tests", Command: "python3", Args: []string{"-c", script}})
 	if result == nil {
 		t.Fatalf("RunRestrictedPlan returned no result: %v", err)
+		return
 	}
 	if strings.Contains(result.Stdout, "WROTE") {
 		t.Fatalf("protected path writable inside the sandbox:\n%s", result.Stdout)

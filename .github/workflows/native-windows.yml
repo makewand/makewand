@@ -61,8 +61,9 @@ jobs:
         run: python -I scripts/windows_test_gate.py --output build/native-windows-verification --expected-sha "$env:GITHUB_SHA"
       - name: Preserve raw logs, explicit skips and commit-bound results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
+          archive: true
           name: native-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: build/native-windows-verification
           if-no-files-found: error

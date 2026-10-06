@@ -32,8 +32,9 @@ jobs:
         run: go run ./cmd/server-drill --output build/server-drill.json --requests 400 --concurrency 32 --tenants 4 --router-calls 100000
       - name: Archive measured drill report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
+          archive: true
           name: server-drill-${{ github.sha }}
           path: build/server-drill.json
           if-no-files-found: error

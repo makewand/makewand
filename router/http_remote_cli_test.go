@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -51,11 +52,20 @@ func readFakeCodexInvocations(t *testing.T, logDir string) []fakeCodexInvocation
 
 func newCodexOnlyHTTPRouter(t *testing.T, codexBin string) *Router {
 	t.Helper()
+	configDir := t.TempDir()
+	// This fixture registers only Codex. Make it an actual review generator,
+	// rather than the default ensemble's judge, and keep adaptive fallback in
+	// the same registered-provider scope. A sole result needs no judge call.
+	overrides := `{"build_strategies":{"power":{"review":{"primary":"codex","fallbacks":[]}}},"power_ensemble":{"review":{"generators":["codex"],"judge":"claude"}}}`
+	if err := os.WriteFile(filepath.Join(configDir, "routing.json"), []byte(overrides), 0o600); err != nil {
+		t.Fatalf("WriteFile(routing.json): %v", err)
+	}
 	r, err := NewRouterFromConfig(RouterConfig{
 		Providers: map[string]ProviderEntry{
 			"codex": {Provider: NewCodexCLI(codexBin), Access: AccessSubscription},
 		},
 		UsageMode: "balanced",
+		ConfigDir: configDir,
 	})
 	if err != nil {
 		t.Fatalf("NewRouterFromConfig: %v", err)
@@ -133,10 +143,40 @@ func TestHTTPFacadeReviewNeverRunsCodexReviewUncommittedInServerCwd(t *testing.T
 			logDir := t.TempDir()
 			codex := writeRecordingCodexCLI(t, logDir)
 			r := newCodexOnlyHTTPRouter(t, codex)
+			var traceMu sync.Mutex
+			var traces []TraceEvent
+			r.SetTraceSink(TraceSinkFunc(func(event TraceEvent) {
+				traceMu.Lock()
+				traces = append(traces, event)
+				traceMu.Unlock()
+			}))
 
 			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
 			rec := httptest.NewRecorder()
 			r.HTTPHandler().ServeHTTP(rec, req)
+			if tc.name == "power mode ensemble without explicit model" {
+				traceMu.Lock()
+				started, codexAttempt := false, false
+				for _, event := range traces {
+					if event.Event == "ensemble_start" && event.Phase == "review" {
+						started = true
+					}
+					if event.Event == "ensemble_generator_success" && event.Selected == "codex" {
+						codexAttempt = runtime.GOOS != "windows"
+					}
+					if event.Event == "ensemble_generator_error" && event.Selected == "codex" && strings.Contains(event.Error, "bubblewrap") {
+						codexAttempt = runtime.GOOS == "windows"
+					}
+					if strings.HasPrefix(event.Event, "judge_") && event.Event != "judge_skipped_single_result" {
+						traceMu.Unlock()
+						t.Fatalf("single-provider fixture invoked an ensemble judge: %+v", event)
+					}
+				}
+				traceMu.Unlock()
+				if !started || !codexAttempt {
+					t.Fatalf("power review did not exercise the Codex ensemble: started=%t codexAttempt=%t traces=%+v", started, codexAttempt, traces)
+				}
+			}
 			if runtime.GOOS == "windows" {
 				if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "bubblewrap") {
 					t.Fatalf("Windows remote CLI must refuse unavailable Linux isolation: status=%d body=%s", rec.Code, rec.Body.String())
