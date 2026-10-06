@@ -21,6 +21,7 @@ func TestDetectPlans_FromPackageJSON(t *testing.T) {
 	}
 	if depsPlan == nil {
 		t.Fatal("DetectInstallPlan: got nil plan")
+		return
 	}
 	if depsPlan.Command != "npm" || strings.Join(depsPlan.Args, " ") != "install --ignore-scripts" {
 		t.Fatalf("deps plan = %+v, want npm install --ignore-scripts", depsPlan)

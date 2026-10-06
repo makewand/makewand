@@ -46,6 +46,7 @@ func TestRunRestrictedPlan_RunsOnHostWithOptIn(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("RunRestrictedPlan result = nil, want host execution result")
+		return
 	}
 	if result.ExitCode != 0 {
 		t.Fatalf("RunRestrictedPlan exit = %d (stderr=%s), want 0", result.ExitCode, result.Stderr)
