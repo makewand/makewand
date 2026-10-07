@@ -288,6 +288,7 @@ def execute_task_dag(
                 forced_engine=task_forced_engine,
                 stream=stream,
                 auto_fix=auto_fix,
+                force_code=True,
                 repo_trust=repo_trust,
                 local_only=local_only,
             )

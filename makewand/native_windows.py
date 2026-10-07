@@ -555,10 +555,12 @@ def manifest(workspace, *, input_snapshot=False):
     """Scan through pinned directories and refuse every reparse entry."""
     import time
     from makewand.constants import PROJECT_IGNORE_DIRS
+    from makewand.artifact import _get_snapshot_limits
     root = Path(os.path.abspath(workspace))
     result = {}
     started = time.monotonic()
     total_bytes = 0
+    max_bytes, timeout_secs, max_files = _get_snapshot_limits()
 
     def scan(directory):
         nonlocal total_bytes
@@ -580,8 +582,8 @@ def manifest(workspace, *, input_snapshot=False):
                     scan(logical_child)
                 elif stat.S_ISREG(info.st_mode):
                     total_bytes += info.st_size
-                    if total_bytes > 512 * 1024 * 1024 or len(result) >= 100000 or time.monotonic() - started > 10:
-                        raise OSError("Windows manifest exceeded its input budget")
+                    if total_bytes > max_bytes or len(result) >= max_files or time.monotonic() - started > timeout_secs:
+                        raise OSError(f"Windows manifest exceeded its input budget ({total_bytes} bytes, {len(result)} files).")
                     record = inspect_file(logical_child)
                     result[relative] = ("file", record["sha256"], record["mode"]) if input_snapshot else record
                 else:

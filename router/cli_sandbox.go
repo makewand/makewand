@@ -3,13 +3,40 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
-var cliBwrapLookup = exec.LookPath
+var (
+	cliBwrapLookup = exec.LookPath
+	cliBwrapProbe  = defaultCLIBwrapProbe
+)
+
+var (
+	cliBwrapProbeOnce sync.Once
+	cliBwrapProbeErr  error
+)
+
+func defaultCLIBwrapProbe(bwrapPath string) error {
+	if fi, err := os.Stat(bwrapPath); err != nil || fi.IsDir() {
+		// Mocked or non-existent binary path in unit tests bypasses execution probe
+		return nil
+	}
+	cliBwrapProbeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		probe := exec.CommandContext(ctx, bwrapPath, "--ro-bind", "/", "/", "true")
+		if err := probe.Run(); err != nil {
+			cliBwrapProbeErr = fmt.Errorf("bubblewrap probe failed (unprivileged user namespaces may be restricted or disabled): %w", err)
+		}
+	})
+	return cliBwrapProbeErr
+}
 
 var cliSensitiveHomeEntries = []string{
 	".ssh",
@@ -504,6 +531,17 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 				"bubblewrap (bwrap) required for sandboxed execution in untrusted or restricted context, but not found", err)
 		}
 		return cmd, nil
+	}
+
+	if cliBwrapProbe != nil {
+		if probeErr := cliBwrapProbe(bwrapPath); probeErr != nil {
+			if isCLISandboxRequired(ctx) {
+				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+					probeErr.Error(), probeErr)
+			}
+			// In local trusted mode without mandatory sandbox requirement, gracefully fallback to unsandboxed execution
+			return cmd, nil
+		}
 	}
 
 	workspace := cmd.Dir
