@@ -61,6 +61,116 @@ from makewand.providers.muse import execute_muse_task
 from makewand.providers.grok import execute_grok_task
 from makewand.providers.local import execute_local_task
 from makewand.providers.aider import execute_aider_task
+from makewand.providers.base import contestant_scope, cancel_contestant, get_current_contestant_scope
+
+AUTO_FIX_MIN_ROUND_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_ROUND_SECONDS", "30.0"))
+AUTO_FIX_MIN_REVIEW_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_REVIEW_SECONDS", "15.0"))
+
+
+def _get_git_dirty_entries(root_path: Path) -> List[Tuple[str, str]]:
+    """Return list of (xy_status, relative_path) using git status -z to preserve special chars and spaces."""
+    code, out, _ = run_git_cmd(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=str(root_path),
+        binary=True,
+    )
+    if code != 0 or not out:
+        return []
+    entries = []
+    tokens = out.split(b"\0")
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        idx += 1
+        if len(token) < 4:
+            continue
+        xy = token[:2].decode("ascii", errors="replace")
+        rel = os.fsdecode(token[3:])
+        if xy[0] in ("R", "C") and idx < len(tokens):
+            dest = os.fsdecode(tokens[idx])
+            idx += 1
+            entries.append((xy, dest))
+            entries.append((xy, rel))
+        else:
+            entries.append((xy, rel))
+    return entries
+
+
+def _clean_empty_parent_dirs(path: Path, root: Path) -> None:
+    """Recursively delete empty parent directories up to root."""
+    curr = path
+    while curr != root and curr.is_relative_to(root):
+        try:
+            curr.rmdir()
+        except OSError:
+            break
+        curr = curr.parent
+
+
+def capture_dirty_files(root: Any) -> Dict[str, Optional[bytes]]:
+    """Capture snapshot of currently modified and untracked files in workspace for rollback."""
+    root_path = Path(root).resolve()
+    saved: Dict[str, Optional[bytes]] = {}
+    entries = _get_git_dirty_entries(root_path)
+    for _, rel in entries:
+        p = root_path / rel
+        if p.is_file():
+            try:
+                saved[rel] = p.read_bytes()
+            except OSError:
+                pass
+        else:
+            saved[rel] = None
+    return saved
+
+
+def restore_dirty_files(root: Any, saved: Dict[str, Optional[bytes]]) -> None:
+    """Restore workspace back to the state captured by capture_dirty_files."""
+    root_path = Path(root).resolve()
+    # 1. Revert all modified tracked files to Git HEAD
+    run_git_cmd(["git", "checkout", "--", "."], cwd=str(root_path))
+
+    # 2. Inspect remaining dirty / untracked files and delete any that were created after capture
+    entries = _get_git_dirty_entries(root_path)
+    for _, rel in entries:
+        if rel not in saved:
+            p = root_path / rel
+            if p.is_file() or p.is_symlink():
+                try:
+                    p.unlink()
+                    _clean_empty_parent_dirs(p.parent, root_path)
+                except OSError:
+                    pass
+            elif p.is_dir():
+                try:
+                    shutil.rmtree(p)
+                    _clean_empty_parent_dirs(p.parent, root_path)
+                except OSError:
+                    pass
+
+    # 3. Restore all captured dirty file contents (or remove if they were deleted before)
+    for rel, content in saved.items():
+        p = root_path / rel
+        if content is None:
+            if p.is_file() or p.is_symlink():
+                try:
+                    p.unlink()
+                    _clean_empty_parent_dirs(p.parent, root_path)
+                except OSError:
+                    pass
+            elif p.is_dir():
+                try:
+                    shutil.rmtree(p)
+                    _clean_empty_parent_dirs(p.parent, root_path)
+                except OSError:
+                    pass
+        else:
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(content)
+            except OSError:
+                pass
+
 
 from makewand.execution_contract import (
     EXIT_PASSED,
@@ -378,6 +488,9 @@ def dispatch_task(
     def rejected(status, message):
         return ExecutionResult(False, None, message, status=status, task_id=task_id,
                                stage=stage_name, engine=engine)
+    scope = get_current_contestant_scope()
+    if scope and scope.cancel_event.is_set():
+        return rejected("CANCELLED", "cancelled by competitor win")
     if not is_provider_enabled(engine):
         return rejected("UNVERIFIED", f"引擎 '{engine}' 当前已被用户在配置中手动禁用。运行 'makewand enable {engine}' 重新开启")
     adapters = {
@@ -1189,14 +1302,27 @@ def _run_pipeline_impl(
     # Step 4: Auto-Fix Loop (only for a well-formed FAILED verdict; UNVERIFIED never reaches here)
     if auto_fix and review_verdict["status"] == REVIEW_FAILED:
         current_fix_iter = 0
+        last_fix_round_duration = 0.0
         while current_fix_iter < max_fix and review_verdict["status"] == REVIEW_FAILED:
             current_fix_iter += 1
+            iter_start = time.monotonic()
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout <= 0:
                 print(c("❌ [Makewand Budget] 全局流水线预算耗尽，终止 Auto-Fix 自愈轮次。", COLOR_RED + COLOR_BOLD))
                 break
+            min_needed = max(AUTO_FIX_MIN_ROUND_SECONDS, last_fix_round_duration)
+            if current_fix_iter > 1 and step_timeout < min_needed:
+                print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成新一轮修复与复审（预估至少需 {min_needed:.1f}s），触发智能提前终止。", COLOR_YELLOW + COLOR_BOLD))
+                break
 
             print(c(f"\n⚡ [Makewand Auto-Fix] 独立审计检测到高/中危缺陷，自动启动第 {current_fix_iter}/{max_fix} 轮修复闭环...", COLOR_YELLOW + COLOR_BOLD))
+
+            # Snapshot state before fix attempt
+            pre_fix_test_ok = test_ok
+            pre_fix_test_err = test_err
+            pre_fix_diff = diff_out
+            pre_fix_parsimony = compute_patch_parsimony(pre_fix_diff)
+            pre_fix_dirty_files = capture_dirty_files(worktree_for_diff)
 
             fix_prompt = build_autofix_prompt(cwd, review_output, task_prompt=prompt)
 
@@ -1248,6 +1374,15 @@ def _run_pipeline_impl(
                 return False
             if getattr(test_err, "execution_status", None) == "UNVERIFIED" or (test_ok and test_err is None):
                 return fail_and_cleanup(str(test_err or "修复后未发现可执行的本地测试，验收未验证"), "UNVERIFIED")
+
+            # Check 1: Regression failure detection
+            if pre_fix_test_ok and not test_ok:
+                print(c("🛑 [Makewand Auto-Fix Early-Stop] 修复尝试引入了新单测退化/破损 (regression failure)，触发自愈熔断回滚！", COLOR_RED + COLOR_BOLD))
+                restore_dirty_files(worktree_for_diff, pre_fix_dirty_files)
+                test_ok, test_err = pre_fix_test_ok, pre_fix_test_err
+                diff_out = pre_fix_diff
+                break
+
             if not test_ok:
                 print(c(f"❌ [Makewand Test Gate] 修复后本地单元测试仍未通过：\n{test_err[:400]}", COLOR_RED))
                 try:
@@ -1263,10 +1398,44 @@ def _run_pipeline_impl(
             else:
                 print(c("✔ [Makewand Test Gate] 修复后本地单元测试执行全通！", COLOR_GREEN))
 
-            step_timeout = get_remaining_timeout(timeout)
-            if step_timeout <= 0:
-                print(c("❌ [Makewand Budget] 预算已耗尽，终止复审。", COLOR_RED + COLOR_BOLD))
+            # Check 2: Diff explosion / churn explosion / file sprawl detection
+            new_diff = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
+            curr_parsimony = compute_patch_parsimony(new_diff)
+            diff_bytes = len(new_diff.encode("utf-8"))
+            pre_churn = pre_fix_parsimony.get("total_churn", 0)
+            curr_churn = curr_parsimony.get("total_churn", 0)
+            pre_files = pre_fix_parsimony.get("files_touched", 0)
+            curr_files = curr_parsimony.get("files_touched", 0)
+
+            diff_exploded = False
+            diff_explode_reason = ""
+            if diff_bytes > 64 * 1024:
+                diff_exploded = True
+                diff_explode_reason = f"diff 大小 ({diff_bytes} 字节) 超过 64KB 阈值"
+            elif (curr_churn > max(60, 3 * pre_churn)) and (curr_churn - pre_churn > 100):
+                diff_exploded = True
+                diff_explode_reason = f"代码改动量剧烈膨胀 (+{curr_churn - pre_churn} lines, 当前 churn={curr_churn} vs 修复前 {pre_churn})"
+            elif (curr_files > pre_files + 3) and (curr_files >= 5):
+                diff_exploded = True
+                diff_explode_reason = f"修改文件过多发散 (从 {pre_files} 个文件激增至 {curr_files} 个文件)"
+
+            if diff_exploded:
+                print(c(f"🛑 [Makewand Auto-Fix Early-Stop] 修复尝试导致代码改动急剧发散膨胀 ({diff_explode_reason})，触发自愈熔断回滚！", COLOR_RED + COLOR_BOLD))
+                restore_dirty_files(worktree_for_diff, pre_fix_dirty_files)
+                test_ok, test_err = pre_fix_test_ok, pre_fix_test_err
+                diff_out = pre_fix_diff
                 break
+
+            # Check 3: Anti-timeout check before launching review
+            step_timeout = get_remaining_timeout(timeout)
+            if step_timeout < AUTO_FIX_MIN_REVIEW_SECONDS:
+                print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成复审 (需至少 {AUTO_FIX_MIN_REVIEW_SECONDS:.1f}s)，终止复审并回滚未复审修复。", COLOR_YELLOW + COLOR_BOLD))
+                restore_dirty_files(worktree_for_diff, pre_fix_dirty_files)
+                test_ok, test_err = pre_fix_test_ok, pre_fix_test_err
+                diff_out = pre_fix_diff
+                break
+
+            diff_out = new_diff
 
             print(c(f"▶ [Makewand Auto-Fix] 修复已落盘，重新发起第 {current_fix_iter} 轮红队复审 (只读安全隔离)...", COLOR_CYAN))
             try:
@@ -1358,6 +1527,8 @@ def _run_pipeline_impl(
             # Deterministic test gate override: if local tests failed, pass CANNOT be True under any circumstances
             if not test_ok:
                 re_output = _test_gate_verdict_text(test_err, re_output)
+
+            last_fix_round_duration = time.monotonic() - iter_start
 
             if re_output:
                 # Capture the flagged defects from the prior round BEFORE overwriting review_output
@@ -2227,6 +2398,7 @@ def _run_race_impl(
     effort: Optional[str] = None,
 ):
     from makewand.telemetry import stage
+    from makewand.call_budget import BudgetError
     race_deadline = time.monotonic() + max(0, timeout)
     from makewand.execution_runtime import current_context, execution_context, task_id
     parent_context = dict(current_context())
@@ -2411,13 +2583,28 @@ def _run_race_impl(
             duration = round(time.time() - start, 2)
             return name, ok, out, duration, wt
 
-        run_agent_a = lambda: run_single_racer(engine_a, name_a, wt_a, _leases[0])
-        run_agent_b = lambda: run_single_racer(engine_b, name_b, wt_b, _leases[1])
+        scope_a_id = f"{race_id}_A"
+        scope_b_id = f"{race_id}_B"
+
+        def _exec_racer_a():
+            with contestant_scope(scope_a_id):
+                return run_single_racer(engine_a, name_a, wt_a, _leases[0])
+
+        def _exec_racer_b():
+            with contestant_scope(scope_b_id):
+                return run_single_racer(engine_b, name_b, wt_b, _leases[1])
+
+        run_agent_a = _exec_racer_a
+        run_agent_b = _exec_racer_b
 
         try:
             high_load = os.getloadavg()[0] > 24.0
         except Exception:
             high_load = False
+
+        early_winner = None
+        gate_eval_a = None
+        gate_eval_b = None
 
         if high_load:
             print(c("⏳ [Makewand Backpressure] 主机负载偏高，动态降为串行分时执行以避免竞争系统资源...", COLOR_YELLOW))
@@ -2425,10 +2612,57 @@ def _run_race_impl(
             res_b = run_agent_b()
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                f_a = executor.submit(run_agent_a)
-                f_b = executor.submit(run_agent_b)
-                res_a = f_a.result()
-                res_b = f_b.result()
+                fut_a = executor.submit(run_agent_a)
+                fut_b = executor.submit(run_agent_b)
+                pending = {fut_a: "A", fut_b: "B"}
+                results_map = {}
+                while pending:
+                    done, _ = concurrent.futures.wait(pending.keys(), timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
+                    if not done:
+                        continue
+                    for fut in done:
+                        side = pending.pop(fut)
+                        try:
+                            racer_res = fut.result()
+                        except (ProtectionError, BudgetError):
+                            raise
+                        except Exception as exc:
+                            racer_res = (name_a if side == "A" else name_b, False, str(exc), 0.0, wt_a if side == "A" else wt_b)
+                        results_map[side] = racer_res
+
+                        # Winner-Take-All Fast Cancellation Gate:
+                        # As soon as one contestant finishes and passes verification gates,
+                        # immediately cancel the running competitor!
+                        if early_winner is None and racer_res[1]:
+                            wt_curr = racer_res[4]
+                            try:
+                                remove_new_generated_bytecode(wt_curr, frozen_baseline_manifest)
+                            except OSError:
+                                pass
+                            base_c = base_a_commit if side == "A" else base_b_commit
+                            try:
+                                diff_c, diff_err_c = get_git_diff_status(str(wt_curr), base_rev=base_c.strip() if base_c else None)
+                            except Exception:
+                                diff_c, diff_err_c = "", "failed to inspect diff"
+                            if not diff_err_c and bool(diff_c.strip()) and len(diff_c.encode("utf-8")) <= 64 * 1024:
+                                t_ok, t_detail = _stage_call("test", run_local_tests, str(wt_curr), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
+                                if t_ok is True and t_detail is None:
+                                    t_pass = None
+                                else:
+                                    t_pass = t_ok
+                                if side == "A":
+                                    gate_eval_a = (t_pass, t_detail)
+                                else:
+                                    gate_eval_b = (t_pass, t_detail)
+                                if t_pass is True:
+                                    early_winner = side
+                                    other_scope = scope_b_id if side == "A" else scope_a_id
+                                    other_name = name_b if side == "A" else name_a
+                                    print(c(f"⚡ [Makewand Race Winner-Take-All] 选手 {racer_res[0]} 率先完成且通过验证门禁！立即向竞争对手 {other_name} 发送取消信号...", COLOR_GREEN + COLOR_BOLD))
+                                    cancel_contestant(other_scope)
+
+                res_a = results_map.get("A", (name_a, False, "racer A did not complete", 0.0, wt_a))
+                res_b = results_map.get("B", (name_b, False, "racer B did not complete", 0.0, wt_b))
 
         # Discard only reproducible new bytecode before binding any test or
         # review evidence. Baseline/tracked inputs and arbitrary cache source
@@ -2446,15 +2680,27 @@ def _run_race_impl(
         print(c("🧪 正在对两位候选人的产出分别执行本地确定性测试套件验证...", COLOR_CYAN))
         tested_a = workspace_snapshot(wt_a)
         tested_b = workspace_snapshot(wt_b)
-        test_pass_a, test_detail_a = _stage_call("test", run_local_tests, str(wt_a), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
-        test_pass_b, test_detail_b = _stage_call("test", run_local_tests, str(wt_b), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
+        if gate_eval_a is not None:
+            test_pass_a, test_detail_a = gate_eval_a
+        elif res_a[1]:
+            test_pass_a, test_detail_a = _stage_call("test", run_local_tests, str(wt_a), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
+            if test_pass_a is True and test_detail_a is None:
+                test_pass_a = None
+        else:
+            test_pass_a, test_detail_a = False, "候选执行未成功或已取消"
+
+        if gate_eval_b is not None:
+            test_pass_b, test_detail_b = gate_eval_b
+        elif res_b[1]:
+            test_pass_b, test_detail_b = _stage_call("test", run_local_tests, str(wt_b), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
+            if test_pass_b is True and test_detail_b is None:
+                test_pass_b = None
+        else:
+            test_pass_b, test_detail_b = False, "候选执行未成功或已取消"
+
         protected.verify(wt_a)
         protected.verify(wt_b)
         protected.verify(cwd)
-        if test_pass_a is True and test_detail_a is None:
-            test_pass_a = None
-        if test_pass_b is True and test_detail_b is None:
-            test_pass_b = None
 
         reviewed_a = workspace_snapshot(wt_a)
         reviewed_b = workspace_snapshot(wt_b)
@@ -2487,74 +2733,93 @@ def _run_race_impl(
         print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={test_state(test_pass_a)}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节, 精简度={parsimony_a['summary']}")
         print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={test_state(test_pass_b)}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节, 精简度={parsimony_b['summary']}\n")
 
-        # A verdict must cover complete diffs. Large candidates stay inspectable
-        # but cannot obtain approval from a truncated review prompt.
-        oversized_diffs = any(len(diff.encode("utf-8")) > 64 * 1024 for diff in (diff_a, diff_b))
-        fmt_diff_a = diff_a if diff_a and not oversized_diffs else "差异过大，拒绝自动裁判" if oversized_diffs else "无代码改动 (空 diff)"
-        fmt_diff_b = diff_b if diff_b and not oversized_diffs else "差异过大，拒绝自动裁判" if oversized_diffs else "无代码改动 (空 diff)"
-
-        # Chief Referee evaluation with Antigravity (strictly read-only, TRUE BLIND REVIEW)
-        judge_kibitzer = ""
-        try:
-            from makewand.memory import format_kibitzer_guidance
-            judge_kibitzer = format_kibitzer_guidance(prompt, stage="review")
-        except Exception:
-            pass
-
-        judge_prompt = (
-            f"请作为资深软件架构裁判，以客观中立的双盲评审视角对比以下两位候选方案对同一任务的实现，指出各自优势与缺陷，并评定胜出者：\n\n"
-            f"--- 原始任务 ---\n{prompt}\n\n"
-            f"--- 自动化测试与工程指标 ---\n"
-            f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={test_state(test_pass_a)}, 补丁精简度(Parsimony)={parsimony_a['summary']}\n"
-            f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={test_state(test_pass_b)}, 补丁精简度(Parsimony)={parsimony_b['summary']}\n\n"
-            f"【评审准则（Agentless 极简补丁偏好）】在两方案均通过单元测试且实现正确的前提下，优先奖励修改紧凑、聚焦、无多余大面积重构或无关格式修改的高精简度方案 (High Parsimony)。\n"
-            f"{judge_kibitzer}\n"
-            f"--- 候选方案 A 的代码实现 ---\n{fmt_diff_a}\n\n"
-            f"--- 候选方案 B 的代码实现 ---\n{fmt_diff_b}\n\n"
-            f"请给出两套方案的架构、可维护性与测试质量对比及采纳理由。"
-            f'最后单独一行输出 MAKEWAND_RACE_VERDICT: {{"pass": true, "winner": "A", "defects": []}}，winner 仅可为 A 或 B。'
-            f'若两个方案均不可采纳，输出 MAKEWAND_RACE_VERDICT: {{"pass": false, "winner": null, "defects": ["原因"]}}。不得强行选出胜者。'
-        )
-        judge_engine = _select_race_judge(cache, (engine_a, engine_b))
-        judge_timeout = remaining_timeout()
-        judge_status = "UNVERIFIED"
-        if oversized_diffs:
-            print(c("候选完整 diff 超过 64 KiB 审查上限，保留供 inspect；不调用裁判、不推荐候选。", COLOR_YELLOW))
-            ok, judge_report = False, "完整候选 diff 超过 64 KiB 审查上限，结论未验证"
-        elif judge_timeout <= 0:
-            judge_status = "TIMEOUT"
-            print(c("竞速总时间预算已耗尽，保留候选但不调用裁判或自动应用。", COLOR_YELLOW))
-            ok, judge_report = False, None
-        elif judge_engine is None:
-            print(c("❌ [Makewand Race] 没有已启用且健康的裁判引擎，无法评定胜者 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD))
-            ok, judge_report = False, None
-        elif judge_engine == "agy":
-            print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
-            with execution_context(lease_id=_leases[2]):
-                judge_result = _stage_call("judge", dispatch_task,
-                    "agy", judge_prompt, engine="agy", cwd=cwd, tier="deep", effort=effort, timeout=judge_timeout,
-                    readonly=True, repo_root=cwd, repo_trust=repo_trust)
-                ok, judge_report, _ = judge_result
-                judge_status = getattr(judge_result, "status", "PASSED" if ok else "FAILED")
-        else:
-            print(c(f"Antigravity 不可用，由 {judge_engine.upper()} 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
-            with execution_context(lease_id=_leases[2]):
-                judge_result = _stage_call("judge", dispatch_task,
-                    judge_engine, judge_prompt, engine=judge_engine, cwd=cwd, timeout=judge_timeout,
-                    tier="deep", effort=effort, readonly=True, repo_root=cwd, repo_trust=repo_trust)
-                ok, judge_report, _ = judge_result
-                judge_status = getattr(judge_result, "status", "PASSED" if ok else "FAILED")
-        if judge_report:
-            print(c("\n【裁判裁决报告】", COLOR_BOLD))
-            print(judge_report.strip())
-
-        # Determine winner with strict deterministic test gate
+        # Determine winner eligibility with strict deterministic test gate
         eligible_a = res_a[1] and test_pass_a is True and not diff_err_a and bool(diff_a.strip())
         eligible_b = res_b[1] and test_pass_b is True and not diff_err_b and bool(diff_b.strip())
 
-        # A rejected, missing or malformed verdict never turns into a winner.
-        verdict = parse_race_verdict(judge_report) if ok else None
-        winner = verdict.get("winner") if verdict and verdict["pass"] else None
+        judge_status = "UNVERIFIED"
+        judge_report = None
+        ok = False
+        verdict = None
+        winner = None
+
+        if early_winner == "A" and eligible_a and not eligible_b:
+            print(c(f"★ [Makewand Race Winner-Take-All] 选手 A ({name_a}) 凭借先发优势并通过全部门禁胜出，熔断取消竞争选手！", COLOR_GREEN + COLOR_BOLD))
+            winner = "A"
+            verdict = {"pass": True, "winner": "A", "defects": []}
+            judge_report = f"MAKEWAND_RACE_VERDICT: {{\"pass\": true, \"winner\": \"A\", \"defects\": []}}\n[Winner-Take-All] 选手 A ({name_a}) 率先完成并通过所有质量验证门禁，选手 B 已被快速熔断取消。直接裁定选手 A 胜出。"
+            ok = True
+            judge_status = "PASSED"
+        elif early_winner == "B" and eligible_b and not eligible_a:
+            print(c(f"★ [Makewand Race Winner-Take-All] 选手 B ({name_b}) 凭借先发优势并通过全部门禁胜出，熔断取消竞争选手！", COLOR_GREEN + COLOR_BOLD))
+            winner = "B"
+            verdict = {"pass": True, "winner": "B", "defects": []}
+            judge_report = f"MAKEWAND_RACE_VERDICT: {{\"pass\": true, \"winner\": \"B\", \"defects\": []}}\n[Winner-Take-All] 选手 B ({name_b}) 率先完成并通过所有质量验证门禁，选手 A 已被快速熔断取消。直接裁定选手 B 胜出。"
+            ok = True
+            judge_status = "PASSED"
+        else:
+            # A verdict must cover complete diffs. Large candidates stay inspectable
+            # but cannot obtain approval from a truncated review prompt.
+            oversized_diffs = any(len(diff.encode("utf-8")) > 64 * 1024 for diff in (diff_a, diff_b))
+            fmt_diff_a = diff_a if diff_a and not oversized_diffs else "差异过大，拒绝自动裁判" if oversized_diffs else "无代码改动 (空 diff)"
+            fmt_diff_b = diff_b if diff_b and not oversized_diffs else "差异过大，拒绝自动裁判" if oversized_diffs else "无代码改动 (空 diff)"
+
+            # Chief Referee evaluation with Antigravity (strictly read-only, TRUE BLIND REVIEW)
+            judge_kibitzer = ""
+            try:
+                from makewand.memory import format_kibitzer_guidance
+                judge_kibitzer = format_kibitzer_guidance(prompt, stage="review")
+            except Exception:
+                pass
+
+            judge_prompt = (
+                f"请作为资深软件架构裁判，以客观中立的双盲评审视角对比以下两位候选方案对同一任务的实现，指出各自优势与缺陷，并评定胜出者：\n\n"
+                f"--- 原始任务 ---\n{prompt}\n\n"
+                f"--- 自动化测试与工程指标 ---\n"
+                f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={test_state(test_pass_a)}, 补丁精简度(Parsimony)={parsimony_a['summary']}\n"
+                f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={test_state(test_pass_b)}, 补丁精简度(Parsimony)={parsimony_b['summary']}\n\n"
+                f"【评审准则（Agentless 极简补丁偏好）】在两方案均通过单元测试且实现正确的前提下，优先奖励修改紧凑、聚焦、无多余大面积重构或无关格式修改的高精简度方案 (High Parsimony)。\n"
+                f"{judge_kibitzer}\n"
+                f"--- 候选方案 A 的代码实现 ---\n{fmt_diff_a}\n\n"
+                f"--- 候选方案 B 的代码实现 ---\n{fmt_diff_b}\n\n"
+                f"请给出两套方案的架构、可维护性与测试质量对比及采纳理由。"
+                f'最后单独一行输出 MAKEWAND_RACE_VERDICT: {{"pass": true, "winner": "A", "defects": []}}，winner 仅可为 A 或 B。'
+                f'若两个方案均不可采纳，输出 MAKEWAND_RACE_VERDICT: {{"pass": false, "winner": null, "defects": ["原因"]}}。不得强行选出胜者。'
+            )
+            judge_engine = _select_race_judge(cache, (engine_a, engine_b))
+            judge_timeout = remaining_timeout()
+            if oversized_diffs:
+                print(c("候选完整 diff 超过 64 KiB 审查上限，保留供 inspect；不调用裁判、不推荐候选。", COLOR_YELLOW))
+                ok, judge_report = False, "完整候选 diff 超过 64 KiB 审查上限，结论未验证"
+            elif judge_timeout <= 0:
+                judge_status = "TIMEOUT"
+                print(c("竞速总时间预算已耗尽，保留候选但不调用裁判或自动应用。", COLOR_YELLOW))
+                ok, judge_report = False, None
+            elif judge_engine is None:
+                print(c("❌ [Makewand Race] 没有已启用且健康的裁判引擎，无法评定胜者 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD))
+                ok, judge_report = False, None
+            elif judge_engine == "agy":
+                print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
+                with execution_context(lease_id=_leases[2]):
+                    judge_result = _stage_call("judge", dispatch_task,
+                        "agy", judge_prompt, engine="agy", cwd=cwd, tier="deep", effort=effort, timeout=judge_timeout,
+                        readonly=True, repo_root=cwd, repo_trust=repo_trust)
+                    ok, judge_report, _ = judge_result
+                    judge_status = getattr(judge_result, "status", "PASSED" if ok else "FAILED")
+            else:
+                print(c(f"Antigravity 不可用，由 {judge_engine.upper()} 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
+                with execution_context(lease_id=_leases[2]):
+                    judge_result = _stage_call("judge", dispatch_task,
+                        judge_engine, judge_prompt, engine=judge_engine, cwd=cwd, timeout=judge_timeout,
+                        tier="deep", effort=effort, readonly=True, repo_root=cwd, repo_trust=repo_trust)
+                    ok, judge_report, _ = judge_result
+                    judge_status = getattr(judge_result, "status", "PASSED" if ok else "FAILED")
+            if judge_report:
+                print(c("\n【裁判裁决报告】", COLOR_BOLD))
+                print(judge_report.strip())
+
+            verdict = parse_race_verdict(judge_report) if ok else None
+            winner = verdict.get("winner") if verdict and verdict["pass"] else None
         if remaining_timeout() <= 0:
             winner, verdict, judge_status = None, None, "TIMEOUT"
             print(c("裁判返回后的会计或日志处理耗尽总截止时间；候选保留但不认可胜者。", COLOR_YELLOW))

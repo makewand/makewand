@@ -12,7 +12,9 @@ import codecs
 import math
 import selectors
 import subprocess
-from typing import Callable, Optional, Tuple
+import threading
+from contextlib import contextmanager
+from typing import Callable, Optional, Tuple, Dict, List
 
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024  # 10 MB output guardrail
 MAX_STREAM_QUEUE_BYTES = 256 * 1024
@@ -127,6 +129,88 @@ def kill_process_tree(proc: subprocess.Popen, timeout_grace: float = 0.3):
     except Exception:
         pass
 
+
+_scope_local = threading.local()
+_active_scopes: Dict[str, "RaceCancellationScope"] = {}
+_scopes_lock = threading.Lock()
+
+
+class RaceCancellationScope:
+    """Thread-scoped process group manager for Winner-Take-All fast cancellation."""
+    def __init__(self, scope_id: str):
+        self.scope_id = scope_id
+        self.cancel_event = threading.Event()
+        self.procs: List[subprocess.Popen] = []
+        self.lock = threading.Lock()
+
+    def register_proc(self, proc: subprocess.Popen):
+        if proc is None:
+            return
+        with self.lock:
+            self.procs.append(proc)
+            if self.cancel_event.is_set():
+                kill_process_tree(proc)
+
+    def unregister_proc(self, proc: subprocess.Popen):
+        if proc is None:
+            return
+        with self.lock:
+            if proc in self.procs:
+                self.procs.remove(proc)
+
+    def cancel(self):
+        """Immediately send SIGTERM to all registered processes and set cancel event."""
+        self.cancel_event.set()
+        with self.lock:
+            for proc in list(self.procs):
+                try:
+                    if os.name == "nt":
+                        kill_process_tree(proc)
+                    else:
+                        pgid = proc.pid
+                        if pgid is not None:
+                            try:
+                                os.killpg(pgid, signal.SIGTERM)
+                            except (ProcessLookupError, OSError):
+                                pass
+                        else:
+                            try:
+                                proc.terminate()
+                            except (ProcessLookupError, OSError):
+                                pass
+                except Exception:
+                    pass
+
+
+@contextmanager
+def contestant_scope(scope_id: str):
+    """Context manager binding a contestant thread to a cancellation scope."""
+    scope = RaceCancellationScope(scope_id)
+    _scope_local.current = scope
+    with _scopes_lock:
+        _active_scopes[scope_id] = scope
+    try:
+        yield scope
+    finally:
+        _scope_local.current = None
+        with _scopes_lock:
+            _active_scopes.pop(scope_id, None)
+
+
+def cancel_contestant(scope_id: str) -> bool:
+    """Immediately send SIGTERM / cancellation to the contestant registered under scope_id."""
+    with _scopes_lock:
+        scope = _active_scopes.get(scope_id)
+    if scope:
+        scope.cancel()
+        return True
+    return False
+
+
+def get_current_contestant_scope() -> Optional[RaceCancellationScope]:
+    return getattr(_scope_local, "current", None)
+
+
 def run_subprocess(
     cmd,
     timeout: int = 180,
@@ -152,6 +236,9 @@ def run_subprocess(
         from makewand.windows_process import run_windows_subprocess
         return run_windows_subprocess(cmd, timeout, cwd, input_text, stream, print_prefix, pass_fds,
                                       output_limit=MAX_OUTPUT_BYTES, stream_queue_limit=MAX_STREAM_QUEUE_BYTES)
+    scope = get_current_contestant_scope()
+    if scope and scope.cancel_event.is_set():
+        return -1, "", "", ProcessExecutionError("Command cancelled by competitor win", "CANCELLED")
     proc = None
     selector = None
     cleaned_group = False
@@ -250,6 +337,8 @@ def run_subprocess(
             start_new_session=True,
             **popen_kwargs
         )
+        if scope:
+            scope.register_proc(proc)
         selector = selectors.DefaultSelector()
         for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
             if pipe is not None:
@@ -265,6 +354,10 @@ def run_subprocess(
                 close_pipe(proc.stdin)
 
         while True:
+            if scope and scope.cancel_event.is_set():
+                cleanup_group()
+                return result(-1, ProcessExecutionError("Command cancelled by competitor win", "CANCELLED"),
+                              flush_display=False)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 provider_finished = proc.poll() is not None
@@ -338,6 +431,8 @@ def run_subprocess(
         return result(-1, ProcessExecutionError(str(e), "UNKNOWN" if proc is not None else "FAILED"),
                       flush_display=False)
     finally:
+        if scope and proc is not None:
+            scope.unregister_proc(proc)
         cleanup_group()
         cleanup_display()
         if selector is not None:

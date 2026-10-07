@@ -162,7 +162,13 @@ class AssessmentFixtures(unittest.TestCase):
         with patch("makewand.sandbox.run_in_sandbox", side_effect=fixture_process) as runner:
             ok, details = orch.run_local_tests(str(repo))
         self.assertTrue(ok, details)
-        self.assertEqual(len(runner.call_args_list), 1)
+        test_commands = [
+            (c.args[0] if c.args else c.kwargs.get("cmd", []))
+            for c in runner.call_args_list
+        ]
+        test_suites_invoked = [cmd for cmd in test_commands if not (len(cmd) >= 2 and cmd[0] == "node" and cmd[1] == "-c")]
+        self.assertEqual(test_suites_invoked, [["npm", "test"]])
+        self.assertFalse(any("pytest" in cmd or "unittest" in cmd for cmd in test_commands))
 
     def test_successful_test_that_rewrites_source_is_rejected(self):
         repo = self.root / "python"

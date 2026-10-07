@@ -15,6 +15,12 @@ func setProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
+func terminateProcessGroup(cmd *exec.Cmd) {
+	if cmd != nil {
+		_ = processjob.Kill(cmd)
+	}
+}
+
 func killProcessGroup(cmd *exec.Cmd) {
 	_ = processjob.Kill(cmd)
 }

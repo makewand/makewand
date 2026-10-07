@@ -274,6 +274,10 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
         return code, out, err, error
 
     try:
+        from makewand.providers.base import get_current_contestant_scope
+        scope = get_current_contestant_scope()
+        if scope and scope.cancel_event.is_set():
+            return result(-1, ProcessExecutionError("Command cancelled by competitor win", "CANCELLED"))
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Command timeout must be finite and positive")
         if pass_fds:
@@ -284,6 +288,8 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
                          stdin=subprocess.PIPE if input_text is not None else None,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT if stream else subprocess.PIPE,
                          text=False, bufsize=0)
+        if scope:
+            scope.register_proc(proc)
         pending = {"stdout"}
         spawn_thread(read_pipe, "stdout", proc.stdout)
         if proc.stderr is not None:
@@ -294,6 +300,9 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
             spawn_thread(write_input, proc.stdin, payload)
         group_cleaned = False
         while True:
+            if scope and scope.cancel_event.is_set():
+                job.terminate()
+                return result(-1, ProcessExecutionError("Command cancelled by competitor win", "CANCELLED"))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 finished = proc.poll() is not None
@@ -338,6 +347,8 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
     except Exception as error:
         return result(-1, ProcessExecutionError(str(error), "UNKNOWN" if proc is not None else "FAILED"))
     finally:
+        if scope and proc is not None:
+            scope.unregister_proc(proc)
         stop.set()
         for active_job in (job, display_job):
             if active_job:

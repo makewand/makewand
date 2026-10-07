@@ -513,3 +513,47 @@ func TestRawCLIPrechecksNeverReserveOrSpawn(t *testing.T) {
 		}
 	}
 }
+
+func TestRunParallelRaceWinnerTakeAllFastCancellation(t *testing.T) {
+	bin, _, _, _ := setupRawStub(t, 5, "success")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Contestant A: default mode (fast success generating fixture.txt)
+	envA := append(os.Environ(), "MAKEWAND_VERSUS_CHILD_MODE=default")
+	// Contestant B: sleep mode (simulates 30s running process)
+	envB := append(os.Environ(), "MAKEWAND_VERSUS_CHILD_MODE=sleep")
+
+	specs := []ParallelSpec{
+		{Name: "contestant-fast", Bin: bin, Args: rawStubArgs(), Timeout: 10 * time.Second, Env: envA},
+		{Name: "contestant-slow", Bin: bin, Args: rawStubArgs(), Timeout: 30 * time.Second, Env: envB},
+	}
+
+	start := time.Now()
+	results, winner := RunParallelRace(ctx, specs, nil)
+	elapsed := time.Since(start)
+
+	if winner == nil {
+		t.Fatal("expected a winner from parallel race, got nil")
+	}
+	if winner.name != "contestant-fast" {
+		t.Fatalf("expected contestant-fast to win, got %s", winner.name)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].err != nil {
+		t.Fatalf("contestant-fast should have succeeded without error, got: %v", results[0].err)
+	}
+	if len(results[0].files) == 0 {
+		t.Fatal("contestant-fast should have extracted files")
+	}
+
+	// Contestant B should have been cancelled promptly (well under 5 seconds, not waiting 30s)
+	if elapsed > 5*time.Second {
+		t.Fatalf("parallel race took too long (%.2fs); fast cancellation did not trigger promptly", elapsed.Seconds())
+	}
+	if !errors.Is(results[1].err, context.Canceled) {
+		t.Fatalf("expected contestant-slow to be canceled, got: %v", results[1].err)
+	}
+}
