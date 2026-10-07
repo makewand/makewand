@@ -37,7 +37,7 @@ func (p *rawCLIProvider) Chat(ctx context.Context, _ []model.Message, _ string, 
 	cmd.Env = p.env
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error {
-		killProcessGroup(cmd)
+		terminateProcessGroup(cmd)
 		return nil
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
@@ -75,6 +75,10 @@ func (p *rawCLIProvider) Chat(ctx context.Context, _ []model.Message, _ string, 
 }
 
 func runCLIWithTimeout(parent context.Context, name, bin string, args []string, timeout time.Duration) result {
+	return runCLIWithTimeoutAndEnv(parent, name, bin, args, timeout, os.Environ())
+}
+
+func runCLIWithTimeoutAndEnv(parent context.Context, name, bin string, args []string, timeout time.Duration, customEnv []string) result {
 	r := result{name: name}
 	// A missing executable or invalid command configuration never reserves a
 	// provider slot. Races after admission conservatively keep their reservation.
@@ -104,7 +108,11 @@ func runCLIWithTimeout(parent context.Context, name, bin string, args []string, 
 	// The historical raw commands can write in their working directory. Record
 	// that capability instead of labeling them as the routed read-only CLI mode.
 	ctx = model.ContextWithWorkDir(ctx, ".")
-	provider := &rawCLIProvider{name: filepath.Base(bin), path: binPath, args: args, env: os.Environ()}
+	env := customEnv
+	if env == nil {
+		env = os.Environ()
+	}
+	provider := &rawCLIProvider{name: filepath.Base(bin), path: binPath, args: args, env: env}
 	if bin == "claude" {
 		filtered := make([]string, 0, len(provider.env))
 		for _, entry := range provider.env {
@@ -135,3 +143,64 @@ func runCLIWithTimeout(parent context.Context, name, bin string, args []string, 
 	fmt.Printf("✓ %.0fs, %d files, %d lines\n\n", r.elapsed.Seconds(), len(r.files), r.totalLines)
 	return r
 }
+
+// ParallelSpec defines a contestant configuration for concurrent dispatch.
+type ParallelSpec struct {
+	Name    string
+	Bin     string
+	Args    []string
+	Timeout time.Duration
+	Env     []string
+}
+
+// VerificationGate checks whether a contestant result passes verification.
+type VerificationGate func(r result) bool
+
+// DefaultVerificationGate accepts results with no error and at least one extracted file.
+func DefaultVerificationGate(r result) bool {
+	return r.err == nil && len(r.files) > 0
+}
+
+// RunParallelRace executes contestant specs concurrently in a Winner-Take-All race.
+// As soon as any candidate completes successfully and passes the verification gate,
+// cancellation (SIGTERM) is immediately sent to all remaining running contestants.
+func RunParallelRace(parent context.Context, specs []ParallelSpec, gate VerificationGate) ([]result, *result) {
+	if gate == nil {
+		gate = DefaultVerificationGate
+	}
+	raceCtx, cancelAll := context.WithCancel(parent)
+	defer cancelAll()
+
+	results := make([]result, len(specs))
+	type contestantOutcome struct {
+		index int
+		res   result
+	}
+	ch := make(chan contestantOutcome, len(specs))
+
+	for i, spec := range specs {
+		go func(idx int, sp ParallelSpec) {
+			r := runCLIWithTimeoutAndEnv(raceCtx, sp.Name, sp.Bin, sp.Args, sp.Timeout, sp.Env)
+			ch <- contestantOutcome{index: idx, res: r}
+		}(i, spec)
+	}
+
+	var winner *result
+	received := 0
+	for received < len(specs) {
+		out := <-ch
+		results[out.index] = out.res
+		received++
+
+		if winner == nil && gate(out.res) {
+			// Winning candidate completed and passed all verification gates!
+			w := out.res
+			winner = &w
+			// Winner-Take-All: immediately send SIGTERM / cancellation to remaining running contestants!
+			cancelAll()
+		}
+	}
+
+	return results, winner
+}
+

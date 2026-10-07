@@ -69,21 +69,45 @@ func main() {
 
 	var results []result
 
-	// 1. Gemini CLI raw
-	fmt.Println("━━━ [1/4] gemini CLI (raw) ━━━")
-	results = append(results, runCLI(ctx, "gemini (raw)", "gemini", []string{"-p", fullPrompt, "--sandbox", "false"}))
+	parallelMode := false
+	for _, arg := range os.Args[1:] {
+		if arg == "--parallel" || arg == "--race" {
+			parallelMode = true
+			break
+		}
+	}
 
-	// 2. Codex CLI raw
-	fmt.Println("━━━ [2/4] codex CLI (raw) ━━━")
-	results = append(results, runCLI(ctx, "codex (raw)", "codex", []string{"exec", "--skip-git-repo-check", fullPrompt}))
+	if parallelMode {
+		fmt.Println("━━━ 并发竞速模式 (Winner-Take-All Concurrent Race) ━━━")
+		specs := []ParallelSpec{
+			{Name: "gemini (raw)", Bin: "gemini", Args: []string{"-p", fullPrompt, "--sandbox", "false"}, Timeout: 5 * time.Minute},
+			{Name: "codex (raw)", Bin: "codex", Args: []string{"exec", "--skip-git-repo-check", fullPrompt}, Timeout: 90 * time.Second},
+			{Name: "claude (raw)", Bin: "claude", Args: []string{"-p", fullPrompt}, Timeout: 5 * time.Minute},
+		}
+		parallelResults, winningResult := RunParallelRace(ctx, specs, nil)
+		results = append(results, parallelResults...)
+		if winningResult != nil {
+			fmt.Printf("🏆 Winner-Take-All 胜出者: %s (耗时 %.0fs)\n\n", winningResult.name, winningResult.elapsed.Seconds())
+		}
+		fmt.Println("━━━ makewand balanced (multi-model) ━━━")
+		results = append(results, runMakewand(ctx))
+	} else {
+		// 1. Gemini CLI raw
+		fmt.Println("━━━ [1/4] gemini CLI (raw) ━━━")
+		results = append(results, runCLI(ctx, "gemini (raw)", "gemini", []string{"-p", fullPrompt, "--sandbox", "false"}))
 
-	// 3. Claude CLI raw
-	fmt.Println("━━━ [3/4] claude CLI (raw) ━━━")
-	results = append(results, runCLI(ctx, "claude (raw)", "claude", []string{"-p", fullPrompt}))
+		// 2. Codex CLI raw
+		fmt.Println("━━━ [2/4] codex CLI (raw) ━━━")
+		results = append(results, runCLI(ctx, "codex (raw)", "codex", []string{"exec", "--skip-git-repo-check", fullPrompt}))
 
-	// 4. makewand balanced pipeline
-	fmt.Println("━━━ [4/4] makewand balanced (multi-model) ━━━")
-	results = append(results, runMakewand(ctx))
+		// 3. Claude CLI raw
+		fmt.Println("━━━ [3/4] claude CLI (raw) ━━━")
+		results = append(results, runCLI(ctx, "claude (raw)", "claude", []string{"-p", fullPrompt}))
+
+		// 4. makewand balanced pipeline
+		fmt.Println("━━━ [4/4] makewand balanced (multi-model) ━━━")
+		results = append(results, runMakewand(ctx))
+	}
 
 	// Summary table
 	fmt.Println()

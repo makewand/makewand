@@ -297,6 +297,13 @@ class TestGoDelegationUntrustedModuleIsolation(unittest.TestCase):
 class TestPreserveReadOnlyIntent(unittest.TestCase):
     """Problem 4: Explicit read-only constraints must never be converted to writable coding mode."""
 
+    def setUp(self):
+        self._usage_patch = patch("makewand.usage.record_engine_usage")
+        self._usage_patch.start()
+
+    def tearDown(self):
+        self._usage_patch.stop()
+
     def test_explicit_readonly_triggers_override_force_code(self):
         explain_prompts = [
             "解释代码，不要修改文件",
