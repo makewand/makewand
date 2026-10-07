@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Makewand Fair12 Real-Repository Benchmark Evaluation</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --border: #334155;
+      --accent: #38bdf8;
+      --success: #34d399;
+      --danger: #f87171;
+      --warning: #fbbf24;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      margin: 0;
+      padding: 2rem;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    h1 {
+      margin: 0 0 0.5rem 0;
+      font-size: 2rem;
+      color: var(--accent);
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.6rem;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      margin-right: 0.5rem;
+    }
+    .badge-success { background: rgba(52, 211, 153, 0.15); color: var(--success); border: 1px solid var(--success); }
+    .badge-danger { background: rgba(248, 113, 113, 0.15); color: var(--danger); border: 1px solid var(--danger); }
+    .badge-warning { background: rgba(251, 191, 36, 0.15); color: var(--warning); border: 1px solid var(--warning); }
+    .badge-info { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid var(--accent); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 1.25rem;
+      color: var(--accent);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.5rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+      font-size: 0.95rem;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: rgba(255, 255, 255, 0.03);
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+    ul {
+      padding-left: 1.5rem;
+      color: var(--text-muted);
+    }
+    li {
+      margin-bottom: 0.5rem;
+    }
+    li strong {
+      color: var(--text);
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Makewand Fair12 Real-Repository Benchmark Evaluation</h1>
+      <p style="color: var(--text-muted); margin-bottom: 1rem;">
+        Evaluation Date: <strong>2026-10-07</strong> | Evidence Kind: <strong>live_real_repo_benchmark</strong> | State: <span class="badge badge-success">completed</span>
+      </p>
+      <div>
+        <span class="badge badge-success">Cash Cost: $0.00 USD</span>
+        <span class="badge badge-info">Codex CLI: 0.160.1</span>
+        <span class="badge badge-info">Claude CLI: 2.1.280</span>
+        <span class="badge badge-warning">Bubblewrap Sandboxed</span>
+      </div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Lifetime Budget Accounting</h2>
+        <p><strong>Authorized Maximum:</strong> 352 dispatches</p>
+        <p><strong>Cumulative Dispatches:</strong> 347 / 352</p>
+        <p><strong>Fair12 Consumption:</strong> 20 dispatches</p>
+        <p><strong>Remaining Dispatches:</strong> <span class="badge badge-success">5 remaining</span> (formal: 4, go: 1)</p>
+      </div>
+
+      <div class="card">
+        <h2>Key Takeaways</h2>
+        <ul>
+          <li><strong>Single Models:</strong> 100% delivery rate, 2-4x faster (67s–289s), but hidden oracle reveals 75%–100% subtle defect rate.</li>
+          <li><strong>Pipeline Auto-Fix:</strong> Multi-round self-healing oscillated on complex tasks, hitting 600s timeout ceilings.</li>
+          <li><strong>PR #53 Remediation:</strong> Early-stopping on regression, divergence, and deadline starvation prevents runaway loops.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom: 2rem;">
+      <h2>Arm-by-Arm Comparative Summary</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Arm</th>
+            <th>Trials</th>
+            <th>Delivered</th>
+            <th>Oracle Pass</th>
+            <th>Defect Rate</th>
+            <th>P50 Seconds</th>
+            <th>Min / Max Sec</th>
+            <th>Model Calls</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono"><strong>pipeline</strong></td>
+            <td>4</td>
+            <td>2/4 (50%)</td>
+            <td>0/4 (0%)</td>
+            <td>2/4 (50%)</td>
+            <td>441.4s</td>
+            <td>224.7s / 644.2s</td>
+            <td>12</td>
+          </tr>
+          <tr>
+            <td class="mono"><strong>single-claude</strong></td>
+            <td>4</td>
+            <td>4/4 (100%)</td>
+            <td>1/4 (25%)</td>
+            <td>3/4 (75%)</td>
+            <td>115.3s</td>
+            <td>67.3s / 174.9s</td>
+            <td>4</td>
+          </tr>
+          <tr>
+            <td class="mono"><strong>single-codex</strong></td>
+            <td>4</td>
+            <td>4/4 (100%)</td>
+            <td>0/4 (0%)</td>
+            <td>4/4 (100%)</td>
+            <td>182.4s</td>
+            <td>97.7s / 289.8s</td>
+            <td>4</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-bottom: 2rem;">
+      <h2>Individual Trial Details (Fair12 Live Log)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Fixture</th>
+            <th>Arm</th>
+            <th>Repeat</th>
+            <th>Delivered</th>
+            <th>Oracle Pass</th>
+            <th>Defect</th>
+            <th>Wall Time</th>
+            <th>Provider Calls</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">repomap</td>
+            <td class="mono">pipeline</td>
+            <td>#1</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>240.6s</td>
+            <td>2</td>
+          </tr>
+          <tr>
+            <td class="mono">repomap</td>
+            <td class="mono">pipeline</td>
+            <td>#0</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>224.7s</td>
+            <td>2</td>
+          </tr>
+          <tr>
+            <td class="mono">tui-wrap</td>
+            <td class="mono">pipeline</td>
+            <td>#1</td>
+            <td><span class="badge badge-danger">TIMEOUT</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-success">CLEAN</span></td>
+            <td>642.1s</td>
+            <td>4</td>
+          </tr>
+          <tr>
+            <td class="mono">repomap</td>
+            <td class="mono">single-claude</td>
+            <td>#0</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>67.3s</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td class="mono">tui-wrap</td>
+            <td class="mono">single-codex</td>
+            <td>#1</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>248.0s</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td class="mono">tui-wrap</td>
+            <td class="mono">pipeline</td>
+            <td>#0</td>
+            <td><span class="badge badge-danger">TIMEOUT</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-success">CLEAN</span></td>
+            <td>644.2s</td>
+            <td>4</td>
+          </tr>
+          <tr>
+            <td class="mono">tui-wrap</td>
+            <td class="mono">single-claude</td>
+            <td>#0</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-success">PASS</span></td>
+            <td><span class="badge badge-success">CLEAN</span></td>
+            <td>159.4s</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td class="mono">repomap</td>
+            <td class="mono">single-claude</td>
+            <td>#1</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>71.1s</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td class="mono">tui-wrap</td>
+            <td class="mono">single-claude</td>
+            <td>#1</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>174.9s</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td class="mono">repomap</td>
+            <td class="mono">single-codex</td>
+            <td>#1</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>116.7s</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td class="mono">repomap</td>
+            <td class="mono">single-codex</td>
+            <td>#0</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>97.7s</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td class="mono">tui-wrap</td>
+            <td class="mono">single-codex</td>
+            <td>#0</td>
+            <td><span class="badge badge-success">YES</span></td>
+            <td><span class="badge badge-danger">FAIL</span></td>
+            <td><span class="badge badge-danger">DEFECT</span></td>
+            <td>289.8s</td>
+            <td>1</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Architectural Remediations Implemented (PR #53)</h2>
+      <ul>
+        <li><strong>Pipeline Auto-Fix Regression Detection & Immediate Rollback</strong></li>
+        <li><strong>Pipeline Auto-Fix Diff Divergence Guard (>500 lines or 3x baseline diff)</strong></li>
+        <li><strong>Pipeline Auto-Fix Anti-Timeout Starvation Guard (<30s remaining before deadline)</strong></li>
+        <li><strong>Winner-Take-All Fast Cancellation for Concurrent Multi-Provider Races</strong></li>
+        <li><strong>Porcelain NUL-delimited Git Status parsing and Empty Parent Directory Pruning</strong></li>
+      </ul>
+      <p style="margin-top: 1rem; color: var(--text-muted);">
+        Machine-readable data available in <a href="report.json" style="color: var(--accent);">report.json</a>. Protocol SHA256: <code class="mono">f7da8b495f2947a4f66b9307712cb7f6ab699a7eccc3da310ba9ee89de4d1651</code>
+      </p>
+    </div>
+  </div>
+</body>
+</html>
