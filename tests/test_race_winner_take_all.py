@@ -186,6 +186,57 @@ class TestRaceWinnerTakeAll(unittest.TestCase):
             self.assertFalse(race["candidates"]["A"]["test_passed"])
             self.assertTrue(race["candidates"]["B"]["test_passed"])
 
+    def test_cancelled_competitor_skips_wasteful_tests(self):
+        """
+        When contestant A wins early, contestant B is cancelled.
+        The system must NOT execute run_local_tests on the cancelled contestant's worktree.
+        """
+        candidates = self.root / "candidates"
+        tested_cwds = []
+
+        def mock_tests(cwd, **_):
+            tested_cwds.append(str(cwd))
+            return True, "1 passed"
+
+        def mock_provider(engine):
+            def execute(prompt, **kwargs):
+                ws = Path(kwargs["cwd"])
+                if engine == "claude":
+                    # Fast candidate A
+                    (ws / "app.py").write_text("VALUE = 42\n")
+                    return True, "implemented A", None
+                else:
+                    # Slow candidate B: simulate work
+                    scope = get_current_contestant_scope()
+                    for _ in range(50):
+                        if scope and scope.cancel_event.is_set():
+                            return False, None, "cancelled"
+                        time.sleep(0.05)
+                    (ws / "app.py").write_text("VALUE = 99\n")
+                    return True, "implemented B", None
+            return execute
+
+        with self.fixtures(), \
+             patch.object(orch, "CANDIDATES_DIR", candidates), \
+             patch.object(config, "CANDIDATES_DIR", candidates), \
+             patch.object(orch, "execute_claude_task", side_effect=mock_provider("claude")), \
+             patch.object(orch, "execute_codex_task", side_effect=mock_provider("codex")), \
+             patch.object(orch, "run_local_tests", side_effect=mock_tests):
+
+            code = orch.run_race(
+                "Implement value 42",
+                cwd=str(self.repo),
+                engine_a="claude",
+                engine_b="codex",
+                timeout=30,
+            )
+
+            self.assertEqual(code, 0)
+            # Candidate A was tested
+            self.assertTrue(any("agent_a" in p for p in tested_cwds), "Contestant A should be tested")
+            # Candidate B was cancelled and MUST NOT be tested
+            self.assertFalse(any("agent_b" in p for p in tested_cwds), "Cancelled contestant B must NOT be tested")
+
 
 if __name__ == "__main__":
     unittest.main()

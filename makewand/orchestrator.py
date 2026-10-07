@@ -67,25 +67,60 @@ AUTO_FIX_MIN_ROUND_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_ROUND_SE
 AUTO_FIX_MIN_REVIEW_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_REVIEW_SECONDS", "15.0"))
 
 
+def _get_git_dirty_entries(root_path: Path) -> List[Tuple[str, str]]:
+    """Return list of (xy_status, relative_path) using git status -z to preserve special chars and spaces."""
+    code, out, _ = run_git_cmd(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=str(root_path),
+        binary=True,
+    )
+    if code != 0 or not out:
+        return []
+    entries = []
+    tokens = out.split(b"\0")
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        idx += 1
+        if len(token) < 4:
+            continue
+        xy = token[:2].decode("ascii", errors="replace")
+        rel = os.fsdecode(token[3:])
+        if xy[0] in ("R", "C") and idx < len(tokens):
+            dest = os.fsdecode(tokens[idx])
+            idx += 1
+            entries.append((xy, dest))
+            entries.append((xy, rel))
+        else:
+            entries.append((xy, rel))
+    return entries
+
+
+def _clean_empty_parent_dirs(path: Path, root: Path) -> None:
+    """Recursively delete empty parent directories up to root."""
+    curr = path
+    while curr != root and curr.is_relative_to(root):
+        try:
+            curr.rmdir()
+        except OSError:
+            break
+        curr = curr.parent
+
+
 def capture_dirty_files(root: Any) -> Dict[str, Optional[bytes]]:
     """Capture snapshot of currently modified and untracked files in workspace for rollback."""
     root_path = Path(root).resolve()
     saved: Dict[str, Optional[bytes]] = {}
-    code, out, _ = run_git_cmd(["git", "status", "--porcelain", "-uall"], cwd=str(root_path))
-    if code == 0 and out:
-        for line in out.splitlines():
-            if len(line) > 3:
-                rel = line[3:].strip()
-                if " -> " in rel:
-                    rel = rel.split(" -> ")[-1].strip()
-                p = root_path / rel
-                if p.is_file():
-                    try:
-                        saved[rel] = p.read_bytes()
-                    except OSError:
-                        pass
-                else:
-                    saved[rel] = None
+    entries = _get_git_dirty_entries(root_path)
+    for _, rel in entries:
+        p = root_path / rel
+        if p.is_file():
+            try:
+                saved[rel] = p.read_bytes()
+            except OSError:
+                pass
+        else:
+            saved[rel] = None
     return saved
 
 
@@ -96,28 +131,37 @@ def restore_dirty_files(root: Any, saved: Dict[str, Optional[bytes]]) -> None:
     run_git_cmd(["git", "checkout", "--", "."], cwd=str(root_path))
 
     # 2. Inspect remaining dirty / untracked files and delete any that were created after capture
-    code, out, _ = run_git_cmd(["git", "status", "--porcelain", "-uall"], cwd=str(root_path))
-    if code == 0 and out:
-        for line in out.splitlines():
-            if len(line) > 3:
-                rel = line[3:].strip()
-                if " -> " in rel:
-                    rel = rel.split(" -> ")[-1].strip()
-                if rel not in saved:
-                    p = root_path / rel
-                    if p.is_file() or p.is_symlink():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
+    entries = _get_git_dirty_entries(root_path)
+    for _, rel in entries:
+        if rel not in saved:
+            p = root_path / rel
+            if p.is_file() or p.is_symlink():
+                try:
+                    p.unlink()
+                    _clean_empty_parent_dirs(p.parent, root_path)
+                except OSError:
+                    pass
+            elif p.is_dir():
+                try:
+                    shutil.rmtree(p)
+                    _clean_empty_parent_dirs(p.parent, root_path)
+                except OSError:
+                    pass
 
     # 3. Restore all captured dirty file contents (or remove if they were deleted before)
     for rel, content in saved.items():
         p = root_path / rel
         if content is None:
-            if p.exists():
+            if p.is_file() or p.is_symlink():
                 try:
                     p.unlink()
+                    _clean_empty_parent_dirs(p.parent, root_path)
+                except OSError:
+                    pass
+            elif p.is_dir():
+                try:
+                    shutil.rmtree(p)
+                    _clean_empty_parent_dirs(p.parent, root_path)
                 except OSError:
                     pass
         else:
@@ -1385,8 +1429,13 @@ def _run_pipeline_impl(
             # Check 3: Anti-timeout check before launching review
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout < AUTO_FIX_MIN_REVIEW_SECONDS:
-                print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成复审 (需至少 {AUTO_FIX_MIN_REVIEW_SECONDS:.1f}s)，终止复审。", COLOR_YELLOW + COLOR_BOLD))
+                print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成复审 (需至少 {AUTO_FIX_MIN_REVIEW_SECONDS:.1f}s)，终止复审并回滚未复审修复。", COLOR_YELLOW + COLOR_BOLD))
+                restore_dirty_files(worktree_for_diff, pre_fix_dirty_files)
+                test_ok, test_err = pre_fix_test_ok, pre_fix_test_err
+                diff_out = pre_fix_diff
                 break
+
+            diff_out = new_diff
 
             print(c(f"▶ [Makewand Auto-Fix] 修复已落盘，重新发起第 {current_fix_iter} 轮红队复审 (只读安全隔离)...", COLOR_CYAN))
             try:
@@ -2586,6 +2635,10 @@ def _run_race_impl(
                         # immediately cancel the running competitor!
                         if early_winner is None and racer_res[1]:
                             wt_curr = racer_res[4]
+                            try:
+                                remove_new_generated_bytecode(wt_curr, frozen_baseline_manifest)
+                            except OSError:
+                                pass
                             base_c = base_a_commit if side == "A" else base_b_commit
                             try:
                                 diff_c, diff_err_c = get_git_diff_status(str(wt_curr), base_rev=base_c.strip() if base_c else None)
@@ -2629,17 +2682,21 @@ def _run_race_impl(
         tested_b = workspace_snapshot(wt_b)
         if gate_eval_a is not None:
             test_pass_a, test_detail_a = gate_eval_a
-        else:
+        elif res_a[1]:
             test_pass_a, test_detail_a = _stage_call("test", run_local_tests, str(wt_a), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
             if test_pass_a is True and test_detail_a is None:
                 test_pass_a = None
+        else:
+            test_pass_a, test_detail_a = False, "候选执行未成功或已取消"
 
         if gate_eval_b is not None:
             test_pass_b, test_detail_b = gate_eval_b
-        else:
+        elif res_b[1]:
             test_pass_b, test_detail_b = _stage_call("test", run_local_tests, str(wt_b), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
             if test_pass_b is True and test_detail_b is None:
                 test_pass_b = None
+        else:
+            test_pass_b, test_detail_b = False, "候选执行未成功或已取消"
 
         protected.verify(wt_a)
         protected.verify(wt_b)

@@ -38,28 +38,33 @@ class TestAutoFixEarlyStop(unittest.TestCase):
         scheduling.SchedulingTests.tearDown(self)
 
     def test_capture_and_restore_dirty_files(self):
-        """Test capture_dirty_files and restore_dirty_files clean rollback."""
+        """Test capture_dirty_files and restore_dirty_files clean rollback with spaces, unicode, and directory trees."""
         repo_dir = self.repo
         app_py = repo_dir / "app.py"
         app_py.write_text("VALUE = 100\n")
 
-        # Untracked file existing before repair
-        pre_untracked = repo_dir / "pre.txt"
+        # Untracked files with spaces and unicode existing before repair
+        pre_untracked = repo_dir / "pre space.txt"
         pre_untracked.write_text("pre-existing untracked\n")
+        pre_unicode = repo_dir / "测试_模块.py"
+        pre_unicode.write_text("# 初始中文代码\n")
 
         # Capture snapshot
         saved = capture_dirty_files(repo_dir)
         self.assertIn("app.py", saved)
-        self.assertIn("pre.txt", saved)
+        self.assertIn("pre space.txt", saved)
+        self.assertIn("测试_模块.py", saved)
         self.assertEqual(saved["app.py"], b"VALUE = 100\n")
-        self.assertEqual(saved["pre.txt"], b"pre-existing untracked\n")
+        self.assertEqual(saved["pre space.txt"], b"pre-existing untracked\n")
+        self.assertEqual(saved["测试_模块.py"], "# 初始中文代码\n".encode("utf-8"))
 
         # Simulate broken repair that mutates files and creates new rogue files
         app_py.write_text("VALUE = BROKEN_DIVERGED\n")
         pre_untracked.write_text("mutated pre\n")
-        rogue_1 = repo_dir / "rogue1.py"
+        pre_unicode.write_text("# 损坏的中文代码\n")
+        rogue_1 = repo_dir / "rogue space 1.py"
         rogue_1.write_text("rogue 1\n")
-        rogue_2 = repo_dir / "sub" / "rogue2.py"
+        rogue_2 = repo_dir / "sub" / "nested" / "rogue2.py"
         rogue_2.parent.mkdir(parents=True, exist_ok=True)
         rogue_2.write_text("rogue 2\n")
 
@@ -69,8 +74,10 @@ class TestAutoFixEarlyStop(unittest.TestCase):
         # Verify exact restoration
         self.assertEqual(app_py.read_text(), "VALUE = 100\n")
         self.assertEqual(pre_untracked.read_text(), "pre-existing untracked\n")
-        self.assertFalse(rogue_1.exists(), "Rogue file created during repair must be deleted")
+        self.assertEqual(pre_unicode.read_text(), "# 初始中文代码\n")
+        self.assertFalse(rogue_1.exists(), "Rogue file with spaces created during repair must be deleted")
         self.assertFalse(rogue_2.exists(), "Rogue nested file must be deleted")
+        self.assertFalse((repo_dir / "sub").exists(), "Empty rogue directory tree must be pruned on rollback")
 
     def test_regression_failure_triggers_early_stop_and_rollback(self):
         """
@@ -192,6 +199,44 @@ class TestAutoFixEarlyStop(unittest.TestCase):
         # Iteration 2 should be skipped by anti-timeout. Total calls should be 4 (not 5+).
         self.assertEqual(len(self.calls), 4)
         self.assertFalse(res.success)
+
+    def test_anti_timeout_before_review_rolls_back(self):
+        """
+        When remaining time before re-review is insufficient (< AUTO_FIX_MIN_REVIEW_SECONDS),
+        auto-fix must abort and roll back unreviewed repair changes.
+        """
+        def mock_tests(cwd, **_):
+            return True, "1 passed"
+
+        def mock_provider(engine, kwargs):
+            if kwargs.get("readonly"):
+                return True, 'MAKEWAND_VERDICT: {"pass": false, "defects": ["P1: flaw"]}', None
+            if len(self.calls) == 1:
+                (Path(kwargs["cwd"]) / "app.py").write_text("VALUE = INITIAL\n")
+                return True, "initial", None
+            if len(self.calls) >= 3:
+                (Path(kwargs["cwd"]) / "app.py").write_text("VALUE = UNREVIEWED_MUTATION\n")
+                (Path(kwargs["cwd"]) / "rogue_timeout.py").write_text("rogue\n")
+                return True, "repaired", None
+            return True, "ok", None
+
+        with self.fixtures(callback=mock_provider), \
+             patch.object(orch, "run_local_tests", side_effect=mock_tests), \
+             patch.object(orch, "AUTO_FIX_MIN_REVIEW_SECONDS", 9999.0):
+            res = orch.run_workflow(
+                "Short timeout task",
+                cwd=str(self.repo),
+                auto_fix=True,
+                max_fix=3,
+                total_timeout=60,
+                force_code=True,
+            )
+
+        # Call 1: coder, Call 2: review, Call 3: repair. NO Call 4 (re-review skipped due to anti-timeout)!
+        self.assertEqual(len(self.calls), 3)
+        self.assertFalse(res.success)
+        # Rogue file created during unreviewed repair must be rolled back
+        self.assertFalse((self.repo / "rogue_timeout.py").exists())
 
 
 if __name__ == "__main__":
