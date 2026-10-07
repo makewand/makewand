@@ -203,4 +203,3 @@ func RunParallelRace(parent context.Context, specs []ParallelSpec, gate Verifica
 
 	return results, winner
 }
-
