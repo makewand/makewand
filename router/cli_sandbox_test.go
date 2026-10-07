@@ -419,3 +419,47 @@ func TestWrapCLICommandWithSandbox_SanitizesEnv(t *testing.T) {
 		t.Errorf("expected secrets and foreign keys removed from wrapped.Env, got:\n%s", envStr)
 	}
 }
+
+func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testing.T) {
+	oldLookup := cliBwrapLookup
+	oldProbe := cliBwrapProbe
+	defer func() {
+		cliBwrapLookup = oldLookup
+		cliBwrapProbe = oldProbe
+	}()
+
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+	cliBwrapProbe = func(path string) error {
+		return errors.New("simulated userns restricted: permission denied")
+	}
+
+	ws := t.TempDir()
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+
+	// 1. Untrusted / remote context (sandbox required) -> must fail closed with ErrorKindConfig
+	untrustedCtx := ContextWithRemoteOrigin(context.Background())
+	_, err := wrapCLICommandWithSandbox(untrustedCtx, "claude", cmd)
+	if err == nil {
+		t.Fatalf("expected error when sandbox probe fails in untrusted context, got nil")
+	}
+	var pe *ProviderError
+	if !errors.As(err, &pe) || pe.Kind != ErrorKindConfig {
+		t.Errorf("expected ErrorKindConfig, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "simulated userns restricted") {
+		t.Errorf("expected error message to contain probe failure details, got %v", err)
+	}
+
+	// 2. Trusted local context (sandbox optional) -> graceful fallback to unsandboxed command
+	trustedCtx := context.Background()
+	fallbackCmd, err := wrapCLICommandWithSandbox(trustedCtx, "claude", cmd)
+	if err != nil {
+		t.Fatalf("expected nil error on trusted fallback, got %v", err)
+	}
+	if fallbackCmd != cmd {
+		t.Errorf("expected direct execution cmd returned on fallback, got %v", fallbackCmd)
+	}
+}

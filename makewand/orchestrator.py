@@ -449,8 +449,12 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             if stdout.strip():
                 details.append(stdout.strip()[:500])
 
+    EPHEMERAL_TEST_ARTIFACTS = {
+        ".coverage", "coverage.xml", "pytest.log", "test-results",
+        ".hypothesis", "htmlcov", ".pytest_cache", ".tox", ".nox"
+    }
     try:
-        changed = changed_inputs(tested_inputs, workspace_snapshot(cwd))
+        changed = changed_inputs(tested_inputs, workspace_snapshot(cwd), ignore_names=EPHEMERAL_TEST_ARTIFACTS)
     except OSError as exc:
         return False, f"无法复核测试输入: {exc}"
     if changed:
