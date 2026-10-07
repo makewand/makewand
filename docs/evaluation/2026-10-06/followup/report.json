@@ -8,7 +8,7 @@
   "environment": {
     "claude_cli": "2.1.280",
     "codex_cli": "0.160.1",
-    "codex_home": "/home/user/.codex-3",
+    "codex_home": "~/.codex-3",
     "isolation": "bubblewrap_sandbox",
     "subscription_policy": "subscription_only (0 cash usd)"
   },
