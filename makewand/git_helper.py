@@ -103,7 +103,56 @@ def _sanitize_git_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
             continue
         clean[k] = v
     clean["GIT_OPTIONAL_LOCKS"] = "0"
+    clean["NoDefaultCurrentDirectoryInExePath"] = "1"
     return clean
+
+
+_RESOLVED_GIT_BINARY: Optional[str] = None
+
+
+def resolve_safe_git_binary(cwd: Optional[Union[str, Path]] = None) -> str:
+    """Resolve the git binary securely, rejecting cwd or relative paths to prevent binary hijacking."""
+    global _RESOLVED_GIT_BINARY
+    if _RESOLVED_GIT_BINARY:
+        if cwd is not None:
+            try:
+                if Path(_RESOLVED_GIT_BINARY).resolve().is_relative_to(Path(cwd).resolve()):
+                    raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
+            except (ValueError, RuntimeError):
+                pass
+        return _RESOLVED_GIT_BINARY
+
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    clean_entries = []
+    cwd_resolved = Path(cwd).resolve() if cwd else None
+    for entry in path_entries:
+        if not entry or entry == ".":
+            continue
+        try:
+            entry_p = Path(entry).resolve()
+            if cwd_resolved and entry_p.is_relative_to(cwd_resolved):
+                continue
+        except (ValueError, RuntimeError):
+            pass
+        clean_entries.append(entry)
+
+    clean_path = os.pathsep.join(clean_entries)
+    found = shutil.which("git", path=clean_path)
+    if not found:
+        found = shutil.which("git")
+    if not found:
+        return "git"
+
+    found_path = Path(found).resolve()
+    if cwd_resolved:
+        try:
+            if found_path.is_relative_to(cwd_resolved):
+                raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
+        except (ValueError, RuntimeError):
+            pass
+
+    _RESOLVED_GIT_BINARY = str(found_path)
+    return _RESOLVED_GIT_BINARY
 
 
 def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path]:
@@ -188,6 +237,8 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                 else:
                     cmd = shlex.split(cmd)
 
+        process_cwd = filesystem_path(cwd) if cwd is not None else None
+        resolve_safe_git_binary(cwd=process_cwd)
         if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "git" and safe:
             subcmd = cmd[1] if len(cmd) > 1 else ""
             extra_global = ["--no-pager"]
@@ -205,7 +256,6 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             exec_cmd = cmd
             use_shell = False
 
-        process_cwd = filesystem_path(cwd) if cwd is not None else None
         if (os.name == "nt" and cwd is not None and isinstance(exec_cmd, list)
                 and exec_cmd and exec_cmd[0] == "git"):
             # Avoid CreateProcess's extended-CWD limit and Git's fixed getcwd

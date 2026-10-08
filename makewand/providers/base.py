@@ -14,7 +14,8 @@ import selectors
 import subprocess
 import threading
 from contextlib import contextmanager
-from typing import Callable, Optional, Tuple, Dict, List
+from pathlib import Path
+from typing import Callable, Optional, Tuple, Dict, List, Union
 
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024  # 10 MB output guardrail
 MAX_STREAM_QUEUE_BYTES = 256 * 1024
@@ -64,8 +65,50 @@ def model_process_failure(engine, code, output, stderr=None, exception=None, rea
         readonly=readonly, outcome_known=status == "FAILED",
         error_kind="deadline" if status == "TIMEOUT" else "process_start" if status == "FAILED" else "process_exit")
 
-def check_cli_installed(bin_name: str) -> bool:
-    return shutil.which(bin_name) is not None
+def safe_which(bin_name: str, cwd: Optional[Union[str, Path]] = None) -> Optional[str]:
+    """Resolve an executable binary safely without searching cwd on Windows.
+
+    Aligns with Go 1.19+ exec.ErrDot behavior by refusing to execute binaries
+    located in the current working directory or relative to it.
+    """
+    raw = os.fspath(bin_name)
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    clean_entries = []
+    cwd_resolved = Path(cwd).resolve() if cwd else None
+    for entry in path_entries:
+        if not entry or entry == ".":
+            continue
+        try:
+            entry_p = Path(entry).resolve()
+            if cwd_resolved and entry_p.is_relative_to(cwd_resolved):
+                continue
+        except (ValueError, RuntimeError):
+            pass
+        clean_entries.append(entry)
+    clean_path = os.pathsep.join(clean_entries)
+
+    resolved = shutil.which(raw, path=clean_path)
+    if resolved:
+        try:
+            resolved_p = Path(resolved).resolve()
+            if cwd_resolved and resolved_p.is_relative_to(cwd_resolved):
+                return None
+        except (ValueError, RuntimeError):
+            pass
+    if cwd_resolved:
+        is_abs = Path(raw).is_absolute() or bool(os.path.splitdrive(raw)[0])
+        if not is_abs:
+            candidates = [cwd_resolved / raw]
+            if not raw.lower().endswith((".exe", ".cmd", ".bat", ".com")):
+                candidates.extend(cwd_resolved / f"{raw}{ext}" for ext in (".exe", ".cmd", ".bat"))
+            for cand in candidates:
+                if cand.is_file() and (not resolved or Path(resolved).resolve() == cand.resolve()):
+                    return None
+    return resolved
+
+
+def check_cli_installed(bin_name: str, cwd: Optional[Union[str, Path]] = None) -> bool:
+    return safe_which(bin_name, cwd=cwd) is not None
 
 def kill_process_tree(proc: subprocess.Popen, timeout_grace: float = 0.3):
     """
@@ -325,6 +368,13 @@ def run_subprocess(
         if preexec_fn is not None and os.name != "nt":
             popen_kwargs["preexec_fn"] = preexec_fn
         deadline = time.monotonic() + timeout
+        sub_env = os.environ.copy()
+        sub_env["NoDefaultCurrentDirectoryInExePath"] = "1"
+        popen_kwargs["env"] = sub_env
+        if isinstance(cmd, (list, tuple)) and cmd:
+            safe_exe = safe_which(cmd[0], cwd=cwd)
+            if safe_exe:
+                cmd = [safe_exe, *cmd[1:]]
         proc = subprocess.Popen(
             cmd,
             shell=isinstance(cmd, str),

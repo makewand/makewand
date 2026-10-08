@@ -148,11 +148,13 @@ func (c *Claude) chatUnaccounted(ctx context.Context, messages []Message, system
 		b.WriteString(block.Text)
 	}
 
+	cost, measuredCost := c.priceForCtxWithStatus(ctx, model, result.Usage.InputTokens, result.Usage.OutputTokens)
 	usage := Usage{
 		MeasuredTokens: result.Usage.InputTokens > 0 || result.Usage.OutputTokens > 0,
+		MeasuredCost:   measuredCost,
 		InputTokens:    result.Usage.InputTokens,
 		OutputTokens:   result.Usage.OutputTokens,
-		Cost:           c.priceForCtx(ctx, model, result.Usage.InputTokens, result.Usage.OutputTokens),
+		Cost:           cost,
 		Model:          model,
 		Provider:       "claude",
 	}

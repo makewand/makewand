@@ -125,6 +125,44 @@ func TestProtectedWritePathIncludesProjectRules(t *testing.T) {
 	}
 }
 
+func TestProtectedWritePath_CaseInsensitiveVariants(t *testing.T) {
+	cases := []string{
+		".GIT/config",
+		".Git/hooks/pre-commit",
+		"sub/.GIT/config",
+		"sub/nested/.Git/HEAD",
+		".GITHUB/workflows/ci.yml",
+		".GitHub/dependabot.yml",
+		".CIRCLECI/config.yml",
+		".BUILDKITE/pipeline.yml",
+		"MAKEFILE",
+		"makefile",
+		"Makefile",
+		"GNUMAKEFILE",
+		"GNUmakefile",
+		"scripts/TEST_GATE.SH",
+		"SCRIPTS/test.sh",
+		"scripts/sub/HOOK.sh",
+		".makewand/RULES.MD",
+		".MAKEWAND/rules.md",
+		".GITLAB-CI.YML",
+		".TRAVIS.YML",
+		"JENKINSFILE",
+		"AZURE-PIPELINES.YML",
+	}
+	for _, path := range cases {
+		if !isProtectedWritePath(path) {
+			t.Errorf("isProtectedWritePath(%q) = false, want true", path)
+		}
+	}
+	project := newProtectedProject(t)
+	for _, path := range []string{".GIT/config", ".GitHub/workflows/ci.yml", "MAKEFILE", "scripts/test.SH"} {
+		if err := project.WriteFile(path, "malicious payload"); err == nil {
+			t.Errorf("generated write to %s was unexpectedly accepted", path)
+		}
+	}
+}
+
 func TestProtectedSnapshotReadOnlyBindsSkipSymlinks(t *testing.T) {
 	project := newProtectedProject(t)
 	if err := os.Symlink("/etc/hostname", filepath.Join(project.Path, "GNUmakefile")); err != nil {

@@ -44,20 +44,40 @@ const (
 	TierPremium                  // Best quality
 )
 
+// Conservative fallback rates for unpriced models (mid-tier rate $3.00/1M input, $15.00/1M output).
+const (
+	conservativeInputCostPer1M  = 3.0
+	conservativeOutputCostPer1M = 15.0
+)
+
+// priceCompletionWithStatus returns the USD cost for a completion priced from table t,
+// along with whether the cost was measured (authoritative entry in table) or estimated
+// (conservative fallback rate for unpriced API models).
+func priceCompletionWithStatus(t *strategyTables, modelID string, inputTokens, outputTokens int) (float64, bool) {
+	if t == nil {
+		t = defaultTables
+	}
+	entry, ok := t.costFor(modelID)
+	if !ok {
+		if inputTokens == 0 && outputTokens == 0 {
+			return 0, false
+		}
+		// Fallback conservative pricing for unpriced API models:
+		cost := float64(inputTokens)/1_000_000*conservativeInputCostPer1M + float64(outputTokens)/1_000_000*conservativeOutputCostPer1M
+		return cost, false
+	}
+	cost := float64(inputTokens)/1_000_000*entry.Input + float64(outputTokens)/1_000_000*entry.Output
+	return cost, true
+}
+
 // priceCompletion returns the USD cost for a completion priced from table t.
 // A nil t falls back to the package-level default tables, so providers created
 // outside a Router (for example a direct NewClaude caller) still get a
 // best-effort price. Reads are lock-guarded by costFor, so a live Router
 // snapshot swapped in by a hot-reload is picked up automatically.
 func priceCompletion(t *strategyTables, modelID string, inputTokens, outputTokens int) float64 {
-	if t == nil {
-		t = defaultTables
-	}
-	entry, ok := t.costFor(modelID)
-	if !ok {
-		return 0
-	}
-	return float64(inputTokens)/1_000_000*entry.Input + float64(outputTokens)/1_000_000*entry.Output
+	cost, _ := priceCompletionWithStatus(t, modelID, inputTokens, outputTokens)
+	return cost
 }
 
 // EstimateCost returns the estimated cost in USD for the given model and token
@@ -110,10 +130,15 @@ func (c *instanceCostTable) useCostTable(t *strategyTables) { c.tables.Store(t) 
 // the package defaults. Providers call this from Chat so pricing follows the
 // calling Router even when the provider instance is shared across Routers.
 func (c *instanceCostTable) priceForCtx(ctx context.Context, modelID string, inputTokens, outputTokens int) float64 {
+	cost, _ := c.priceForCtxWithStatus(ctx, modelID, inputTokens, outputTokens)
+	return cost
+}
+
+func (c *instanceCostTable) priceForCtxWithStatus(ctx context.Context, modelID string, inputTokens, outputTokens int) (float64, bool) {
 	if t, ok := costTableFromContext(ctx); ok {
-		return priceCompletion(t, modelID, inputTokens, outputTokens)
+		return priceCompletionWithStatus(t, modelID, inputTokens, outputTokens)
 	}
-	return priceCompletion(c.tables.Load(), modelID, inputTokens, outputTokens)
+	return priceCompletionWithStatus(c.tables.Load(), modelID, inputTokens, outputTokens)
 }
 
 // priceFor prices a completion from the registration-time snapshot, or the

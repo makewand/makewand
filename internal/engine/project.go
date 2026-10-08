@@ -80,24 +80,27 @@ var protectedWriteFiles = map[string]bool{
 
 // isProtectedWritePath reports whether a cleaned project-relative path is
 // write-protected against generated content. Applies to both verification
-// clones and real project applies.
+// clones and real project applies. Compared case-insensitively for safety
+// across case-insensitive filesystems (macOS APFS, Windows NTFS).
 func isProtectedWritePath(cleaned string) bool {
 	slashed := filepath.ToSlash(cleaned)
 	parts := strings.Split(slashed, "/")
 	// .git is protected at any depth: hooks in nested repositories execute on
 	// the host too.
 	for _, part := range parts {
-		if part == ".git" {
+		if strings.EqualFold(part, ".git") {
 			return true
 		}
 	}
-	if protectedWriteDirs[parts[0]] {
-		return true
+	for dir := range protectedWriteDirs {
+		if strings.EqualFold(parts[0], dir) {
+			return true
+		}
 	}
 	// Shell scripts under scripts/ are the project's CI/verification entry
 	// points (test_gate.sh, test_race.sh, ...). Protect them without over-
 	// blocking non-shell project source that may also live under scripts/.
-	if len(parts) > 1 && parts[0] == "scripts" && strings.HasSuffix(strings.ToLower(slashed), ".sh") {
+	if len(parts) > 1 && strings.EqualFold(parts[0], "scripts") && strings.HasSuffix(strings.ToLower(slashed), ".sh") {
 		return true
 	}
 	// .makewand/rules.md is injected into every trusted-mode system prompt as
@@ -107,7 +110,12 @@ func isProtectedWritePath(cleaned string) bool {
 	if strings.EqualFold(slashed, protectedRulesPath) {
 		return true
 	}
-	return protectedWriteFiles[slashed]
+	for file := range protectedWriteFiles {
+		if strings.EqualFold(slashed, file) {
+			return true
+		}
+	}
+	return false
 }
 
 // protectedRulesPath is the trusted project-rules file loaded by LoadRepoContext.

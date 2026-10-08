@@ -162,11 +162,13 @@ func (g *Gemini) chatUnaccounted(ctx context.Context, messages []Message, system
 		}
 	}
 
+	cost, measuredCost := g.priceForCtxWithStatus(ctx, model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount)
 	usage := Usage{
 		MeasuredTokens: result.UsageMetadata.PromptTokenCount > 0 || result.UsageMetadata.CandidatesTokenCount > 0,
+		MeasuredCost:   measuredCost,
 		InputTokens:    result.UsageMetadata.PromptTokenCount,
 		OutputTokens:   result.UsageMetadata.CandidatesTokenCount,
-		Cost:           g.priceForCtx(ctx, model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount),
+		Cost:           cost,
 		Model:          model,
 		Provider:       "gemini",
 	}

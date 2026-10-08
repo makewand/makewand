@@ -17,19 +17,53 @@ import time
 from ctypes import wintypes
 
 
-def resolve_windows_command(cmd):
+def resolve_windows_command(cmd, cwd=None):
     """Launch npm's Windows Node shims without interpreting model arguments.
 
     Passing a prompt through cmd.exe would expand %, &, pipes and redirections.
     Only the normal fixed npm JS entry is extracted; unknown batch launchers
     require a real executable rather than an implicit command shell.
+    Explicitly filters cwd out of PATH search to prevent binary hijacking.
     """
     if isinstance(cmd, str) or not isinstance(cmd, (list, tuple)) or not cmd:
         return cmd
-    executable = shutil.which(os.fspath(cmd[0])) or os.fspath(cmd[0])
+    from pathlib import Path
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    clean_entries = []
+    cwd_resolved = Path(cwd).resolve() if cwd else None
+    for entry in path_entries:
+        if not entry or entry == ".":
+            continue
+        try:
+            entry_p = Path(entry).resolve()
+            if cwd_resolved and entry_p.is_relative_to(cwd_resolved):
+                continue
+        except (ValueError, RuntimeError):
+            pass
+        clean_entries.append(entry)
+    clean_path = os.pathsep.join(clean_entries)
+
+    raw_exe = os.fspath(cmd[0])
+    executable = shutil.which(raw_exe, path=clean_path) or raw_exe
+    if cwd_resolved:
+        is_abs = Path(raw_exe).is_absolute() or bool(os.path.splitdrive(raw_exe)[0])
+        if not is_abs:
+            candidates = [cwd_resolved / raw_exe]
+            if not raw_exe.lower().endswith((".exe", ".cmd", ".bat", ".com")):
+                candidates.extend(cwd_resolved / f"{raw_exe}{ext}" for ext in (".exe", ".cmd", ".bat"))
+            for cand in candidates:
+                if cand.is_file():
+                    if not Path(executable).is_absolute() or Path(executable).resolve() == cand.resolve():
+                        raise PermissionError(f"Refusing to execute binary found inside workspace cwd on Windows: {cand}")
+        try:
+            exe_p = Path(executable).resolve()
+            if exe_p.is_relative_to(cwd_resolved):
+                raise PermissionError(f"Refusing to execute binary found inside workspace cwd on Windows: {executable}")
+        except (ValueError, RuntimeError):
+            pass
+
     if not executable.lower().endswith((".cmd", ".bat")):
         return [executable, *cmd[1:]]
-    from pathlib import Path
     launcher = Path(executable)
     if launcher.stat().st_size > 65536:
         raise ValueError("Windows batch launcher exceeds the trusted shim limit")
@@ -45,7 +79,7 @@ def resolve_windows_command(cmd):
         raise OSError("Windows npm shim JS entry is unavailable: " + str(entry))
     node = launcher.parent / "node.exe"
     if not node.is_file():
-        resolved = shutil.which("node.exe")
+        resolved = shutil.which("node.exe", path=clean_path)
         if not resolved:
             raise OSError("Windows npm shim requires node.exe")
         node = Path(resolved)
@@ -121,7 +155,7 @@ class WindowsJob:
         # Python closes the primary thread handle inside Popen. Toolhelp opens
         # that still-suspended thread after assignment; no child code can run
         # before its job membership is established.
-        proc = subprocess.Popen(resolve_windows_command(cmd), creationflags=0x4, **kwargs)  # CREATE_SUSPENDED
+        proc = subprocess.Popen(resolve_windows_command(cmd, cwd=kwargs.get("cwd")), creationflags=0x4, **kwargs)  # CREATE_SUSPENDED
         try:
             if not self.kernel.AssignProcessToJobObject(self.handle, int(proc._handle)):
                 raise ctypes.WinError(ctypes.get_last_error())
@@ -284,7 +318,9 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
             raise ValueError("POSIX pass_fds cannot be used on native Windows")
         deadline = time.monotonic() + timeout
         job = WindowsJob()
-        proc = job.start(cmd, shell=isinstance(cmd, str), cwd=cwd,
+        win_env = os.environ.copy()
+        win_env["NoDefaultCurrentDirectoryInExePath"] = "1"
+        proc = job.start(cmd, shell=isinstance(cmd, str), cwd=cwd, env=win_env,
                          stdin=subprocess.PIPE if input_text is not None else None,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT if stream else subprocess.PIPE,
                          text=False, bufsize=0)
