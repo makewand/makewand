@@ -329,7 +329,7 @@ class GitHostModeTests(PipelineHarness):
         self.assertEqual(after, before)
 
     def test_successful_task_reports_ignored_file_changes(self):
-        """py-orchestrator#2 F2: ignored changes are not in the reviewed diff, so delivery warns."""
+        """py-orchestrator#2: unreviewed ignored file changes trigger security blocking and rollback."""
         project = make_git_project(self.base / "repo_ok")
 
         def coder(cwd):
@@ -338,11 +338,13 @@ class GitHostModeTests(PipelineHarness):
             (cwd / "venv" / "lib" / "evil.pth").write_text("import os\n")
             return True, "done", None
 
-        self.assertTrue(self.run_pipeline(project, coder, review_pass=True))
-        self.assertIn("不在审查 diff 中", self.output)
+        self.assertFalse(self.run_pipeline(project, coder, review_pass=True))
+        self.assertIn("交付核验触发安全阻断", self.output)
         self.assertIn(".env", self.output)
         self.assertIn("venv/lib/evil.pth", self.output)
         self.assertTrue((project / ".git").exists(), "a user's own repository is never removed")
+        self.assertEqual((project / ".env").read_text(), "SECRET=original\n")
+        self.assertFalse((project / "venv" / "lib" / "evil.pth").exists())
 
     def test_git_status_failure_at_baseline_deletes_nothing(self):
         """py-orchestrator#5: a failed/timed-out git status aborts before dispatch with zero deletions."""

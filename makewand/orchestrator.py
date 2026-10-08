@@ -1957,6 +1957,12 @@ def _run_pipeline_impl(
         # Report ignored-file changes that the reviewed diff cannot show, archive
         # the delivery patch and remove a temporary .git for non-git directories.
         _stage_call("apply", host_txn.finalize_success)
+        if not host_txn.succeeded:
+            if _outcome is not None:
+                _outcome["status"] = "FAILED"
+                _outcome["error"] = "交付核验触发安全阻断并已执行回滚"
+            print(c("❌ [Makewand Transaction] 交付核验未通过安全核查，改动已回滚，拒绝确认交付。", COLOR_RED + COLOR_BOLD))
+            return False
     print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
     return True
 
