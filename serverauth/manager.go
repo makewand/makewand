@@ -2,22 +2,27 @@ package serverauth
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Manager provides live token administration backed by an auth config file.
 type Manager struct {
 	path string
 
-	mu   sync.RWMutex
-	cfg  Config
-	auth *Authorizer
+	mu       sync.RWMutex
+	cfg      Config
+	auth     *Authorizer
+	lastMod  time.Time
+	lastSize int64
 }
 
 // LoadManager loads a live token manager from path.
 func LoadManager(path string) (*Manager, error) {
-	cfg, err := LoadConfigFile(path)
+	trimmed := strings.TrimSpace(path)
+	cfg, err := LoadConfigFile(trimmed)
 	if err != nil {
 		return nil, err
 	}
@@ -25,18 +30,73 @@ func LoadManager(path string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{
-		path: strings.TrimSpace(path),
+	mgr := &Manager{
+		path: trimmed,
 		cfg:  cfg,
 		auth: authz,
-	}, nil
+	}
+	if fi, err := os.Stat(trimmed); err == nil {
+		mgr.lastMod = fi.ModTime()
+		mgr.lastSize = fi.Size()
+	}
+	return mgr, nil
 }
 
-// AuthenticateRequest authenticates a request using the current in-memory authorizer.
+// ReloadIfChanged reloads the on-disk auth config file if its modtime or size changed,
+// carrying over active grant usage counters to prevent losing in-flight quotas.
+func (m *Manager) ReloadIfChanged() error {
+	if m == nil || m.path == "" {
+		return nil
+	}
+	fi, err := os.Stat(m.path)
+	if err != nil {
+		return err
+	}
+
+	m.mu.RLock()
+	unchanged := fi.ModTime().Equal(m.lastMod) && fi.Size() == m.lastSize
+	m.mu.RUnlock()
+	if unchanged {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Double-check under write lock
+	fi, err = os.Stat(m.path)
+	if err != nil {
+		return err
+	}
+	if fi.ModTime().Equal(m.lastMod) && fi.Size() == m.lastSize {
+		return nil
+	}
+
+	cfg, err := LoadConfigFile(m.path)
+	if err != nil {
+		return err
+	}
+	authz, err := NewAuthorizer(cfg)
+	if err != nil {
+		return err
+	}
+	if m.auth != nil {
+		carryOverGrantUsage(authz.grants, m.auth.grants)
+	}
+	m.cfg = cfg
+	m.auth = authz
+	m.lastMod = fi.ModTime()
+	m.lastSize = fi.Size()
+	return nil
+}
+
+// AuthenticateRequest authenticates a request using the current in-memory authorizer,
+// reloading from disk if the auth config was modified offline.
 func (m *Manager) AuthenticateRequest(req *http.Request) (*Grant, bool) {
 	if m == nil {
 		return nil, false
 	}
+	_ = m.ReloadIfChanged()
 	m.mu.RLock()
 	authz := m.auth
 	m.mu.RUnlock()
@@ -51,11 +111,13 @@ func (m *Manager) Path() string {
 	return m.path
 }
 
-// TokenRules returns the current sanitized token rules.
+// TokenRules returns the current sanitized token rules,
+// reloading from disk if the auth config was modified offline.
 func (m *Manager) TokenRules() []TokenRuleView {
 	if m == nil {
 		return nil
 	}
+	_ = m.ReloadIfChanged()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return SanitizedRules(m.cfg.Tokens)
@@ -74,13 +136,21 @@ func (m *Manager) Issue(rule TokenRule) (TokenRuleView, string, error) {
 		rule.Token = token
 	}
 
+	unlock, err := LockConfigFile(m.path, true)
+	if err != nil {
+		return TokenRuleView{}, "", err
+	}
+	defer unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Work on a copy: the shared Tokens backing array must not be mutated
-	// unless the change is persisted, or a failed save would leave the
-	// listing and the live authorizer disagreeing.
-	cfg := cloneConfig(m.cfg)
+	// Read-modify-write: load fresh state from disk under lock
+	diskCfg, err := LoadConfigFile(m.path)
+	if err != nil {
+		diskCfg = cloneConfig(m.cfg)
+	}
+	cfg := cloneConfig(diskCfg)
 	tokenValue := rule.Token
 	finalID, err := IssueTokenRule(&cfg, rule)
 	if err != nil {
@@ -93,15 +163,15 @@ func (m *Manager) Issue(rule TokenRule) (TokenRuleView, string, error) {
 	if err != nil {
 		return TokenRuleView{}, "", err
 	}
-	// Carry over (share) usage counters and swap the authorizer while holding
-	// m.mu, so no window exists during which the new authorizer is visible with
-	// reset counters. Sharing the underlying usage state (rather than copying)
-	// also means an increment in flight against the previous grant is not lost.
 	if m.auth != nil {
 		carryOverGrantUsage(authz.grants, m.auth.grants)
 	}
 	m.cfg = cfg
 	m.auth = authz
+	if fi, err := os.Stat(m.path); err == nil {
+		m.lastMod = fi.ModTime()
+		m.lastSize = fi.Size()
+	}
 
 	views := SanitizedRules([]TokenRule{cfg.Tokens[len(cfg.Tokens)-1]})
 	if len(views) == 0 {
@@ -117,13 +187,20 @@ func (m *Manager) Revoke(tokenID string) error {
 		return http.ErrServerClosed
 	}
 
+	unlock, err := LockConfigFile(m.path, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Work on a copy: the shared Tokens backing array must not be mutated
-	// unless the change is persisted, or a failed save would leave the
-	// listing and the live authorizer disagreeing.
-	cfg := cloneConfig(m.cfg)
+	diskCfg, err := LoadConfigFile(m.path)
+	if err != nil {
+		diskCfg = cloneConfig(m.cfg)
+	}
+	cfg := cloneConfig(diskCfg)
 	if err := RevokeTokenRule(&cfg, tokenID); err != nil {
 		return err
 	}
@@ -134,13 +211,15 @@ func (m *Manager) Revoke(tokenID string) error {
 	if err != nil {
 		return err
 	}
-	// Share usage counters and swap under m.mu (see Issue): no reset window and
-	// no lost in-flight increment on the previous grant.
 	if m.auth != nil {
 		carryOverGrantUsage(authz.grants, m.auth.grants)
 	}
 	m.cfg = cfg
 	m.auth = authz
+	if fi, err := os.Stat(m.path); err == nil {
+		m.lastMod = fi.ModTime()
+		m.lastSize = fi.Size()
+	}
 	return nil
 }
 
@@ -154,13 +233,20 @@ func (m *Manager) RevokeByUserID(userID string) error {
 		return nil
 	}
 
+	unlock, err := LockConfigFile(m.path, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Work on a copy: the shared Tokens backing array must not be mutated
-	// unless the change is persisted, or a failed save would leave the
-	// listing and the live authorizer disagreeing.
-	cfg := cloneConfig(m.cfg)
+	diskCfg, err := LoadConfigFile(m.path)
+	if err != nil {
+		diskCfg = cloneConfig(m.cfg)
+	}
+	cfg := cloneConfig(diskCfg)
 	changed := false
 	for i := range cfg.Tokens {
 		if strings.TrimSpace(cfg.Tokens[i].UserID) == userID && !cfg.Tokens[i].Revoked {
@@ -183,6 +269,10 @@ func (m *Manager) RevokeByUserID(userID string) error {
 	}
 	m.cfg = cfg
 	m.auth = authz
+	if fi, err := os.Stat(m.path); err == nil {
+		m.lastMod = fi.ModTime()
+		m.lastSize = fi.Size()
+	}
 	return nil
 }
 
