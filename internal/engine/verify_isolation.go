@@ -13,9 +13,10 @@ import (
 // installs). By default those commands must run inside a bubblewrap sandbox:
 // read-only root, writable workspace bind, cleared environment, tmpfs /tmp,
 // masked sensitive HOME entries, and - unlike the preview sandbox - no network
-// for test/build/compile steps. Dependency installs keep network access (they
-// have to reach package registries) but run with the same filesystem isolation.
-// Without working isolation, verification fails closed: no command executes
+// access for any candidate verification steps (including dependency installs,
+// to prevent candidate build scripts from reaching host loopback or abstract
+// AF_UNIX sockets). Bubblewrap brings up loopback in the isolated network
+// namespace for internal mock services. Without working isolation, verification fails closed: no command executes
 // unless the user explicitly opts into host execution with
 // MAKEWAND_UNSAFE_HOST_EXEC=1 (the same escape hatch the preview path uses)
 // AND has completed the one-time acknowledgment the app layer resolves into an

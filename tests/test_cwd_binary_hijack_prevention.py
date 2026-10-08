@@ -94,3 +94,33 @@ def test_absolute_binary_outside_and_inside_cwd():
         assert safe_which(str(inside_bin), cwd=str(ws)) is None
         with pytest.raises(PermissionError, match="Refusing to execute binary found inside workspace cwd"):
             resolve_windows_command([str(inside_bin), "arg"], cwd=str(ws))
+
+
+def test_run_git_cmd_substitutes_safe_git_binary(monkeypatch):
+    import makewand.git_helper as gh
+    intercepted_cmd = []
+
+    def fake_run(exec_cmd, **kwargs):
+        intercepted_cmd.extend(exec_cmd)
+        import subprocess
+        return subprocess.CompletedProcess(args=exec_cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    safe_path = "/usr/bin/custom_git"
+    monkeypatch.setattr(gh, "resolve_safe_git_binary", lambda cwd=None: safe_path)
+
+    # 1. safe=True with list
+    intercepted_cmd.clear()
+    gh.run_git_cmd(["git", "status"], safe=True)
+    assert intercepted_cmd[0] == safe_path
+
+    # 2. safe=True with str
+    intercepted_cmd.clear()
+    gh.run_git_cmd("git status", safe=True)
+    assert intercepted_cmd[0] == safe_path
+
+    # 3. safe=False with list
+    intercepted_cmd.clear()
+    gh.run_git_cmd(["git", "status"], safe=False)
+    assert intercepted_cmd[0] == safe_path
+

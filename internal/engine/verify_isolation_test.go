@@ -266,7 +266,8 @@ func TestVerificationPlanAllowsNetwork(t *testing.T) {
 		plan ExecPlan
 		want bool
 	}{
-		{name: "deps install", plan: ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install", "--ignore-scripts"}}, want: true},
+		{name: "deps install", plan: ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install", "--ignore-scripts"}}, want: false},
+		{name: "go mod tidy", plan: ExecPlan{Kind: "deps", Command: "go", Args: []string{"mod", "tidy"}}, want: false},
 		{name: "tests", plan: ExecPlan{Kind: "tests", Command: "go", Args: []string{"test", "./..."}}, want: false},
 		{name: "quick check", plan: ExecPlan{Kind: "quickcheck", Command: "python3", Args: []string{"-m", "py_compile"}}, want: false},
 	}
