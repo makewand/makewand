@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -119,34 +120,47 @@ func start(cmd *exec.Cmd, options Options) (func(), error) {
 }
 
 func resumePrimaryThread(pid uint32) error {
-	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = windows.CloseHandle(snapshot) }()
-	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
-	for err = windows.Thread32First(snapshot, &entry); err == nil; err = windows.Thread32Next(snapshot, &entry) {
-		if entry.OwnerProcessID != pid {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+		if err != nil {
+			lastErr = err
 			continue
 		}
-		thread, openErr := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
-		if openErr != nil {
-			return openErr
+		entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+		found := false
+		for err = windows.Thread32First(snapshot, &entry); err == nil; err = windows.Thread32Next(snapshot, &entry) {
+			if entry.OwnerProcessID != pid {
+				continue
+			}
+			found = true
+			thread, openErr := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+			if openErr != nil {
+				_ = windows.CloseHandle(snapshot)
+				return openErr
+			}
+			previous, resumeErr := windows.ResumeThread(thread)
+			_ = windows.CloseHandle(thread)
+			_ = windows.CloseHandle(snapshot)
+			if resumeErr != nil {
+				return resumeErr
+			}
+			if previous != 1 {
+				return fmt.Errorf("unexpected primary-thread suspend count %d", previous)
+			}
+			return nil
 		}
-		previous, resumeErr := windows.ResumeThread(thread)
-		_ = windows.CloseHandle(thread)
-		if resumeErr != nil {
-			return resumeErr
+		_ = windows.CloseHandle(snapshot)
+		if err != nil && !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+			lastErr = err
+		} else if !found {
+			lastErr = fmt.Errorf("suspended subprocess primary thread is unavailable")
 		}
-		if previous != 1 {
-			return fmt.Errorf("unexpected primary-thread suspend count %d", previous)
-		}
-		return nil
 	}
-	if err != nil && !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
-		return err
-	}
-	return fmt.Errorf("suspended subprocess primary thread is unavailable")
+	return lastErr
 }
 
 // Kill terminates the captured Job rather than using taskkill against a PID.

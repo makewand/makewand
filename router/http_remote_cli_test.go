@@ -56,7 +56,7 @@ func newCodexOnlyHTTPRouter(t *testing.T, codexBin string) *Router {
 	// This fixture registers only Codex. Make it an actual review generator,
 	// rather than the default ensemble's judge, and keep adaptive fallback in
 	// the same registered-provider scope. A sole result needs no judge call.
-	overrides := `{"build_strategies":{"power":{"review":{"primary":"codex","fallbacks":[]}}},"power_ensemble":{"review":{"generators":["codex"],"judge":"claude"}}}`
+	overrides := `{"strategies":{"balanced":{"review":{"tier":"mid","providers":["codex"]}}},"build_strategies":{"balanced":{"review":{"primary":"codex","fallbacks":[]}},"power":{"review":{"primary":"codex","fallbacks":[]}}},"power_ensemble":{"review":{"generators":["codex"],"judge":"claude"}}}`
 	if err := os.WriteFile(filepath.Join(configDir, "routing.json"), []byte(overrides), 0o600); err != nil {
 		t.Fatalf("WriteFile(routing.json): %v", err)
 	}
