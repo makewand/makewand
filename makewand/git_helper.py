@@ -238,13 +238,13 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                     cmd = shlex.split(cmd)
 
         process_cwd = filesystem_path(cwd) if cwd is not None else None
-        resolve_safe_git_binary(cwd=process_cwd)
+        safe_git = resolve_safe_git_binary(cwd=process_cwd)
         if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "git" and safe:
             subcmd = cmd[1] if len(cmd) > 1 else ""
             extra_global = ["--no-pager"]
             if subcmd not in ["apply", "clone"]:
                 extra_global.append("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904")
-            exec_cmd = [cmd[0]] + extra_global + SAFE_GIT_SECURITY_FLAGS + cmd[1:]
+            exec_cmd = [safe_git] + extra_global + SAFE_GIT_SECURITY_FLAGS + cmd[1:]
             if subcmd == "diff":
                 diff_idx = exec_cmd.index("diff")
                 if "--no-ext-diff" not in exec_cmd:
@@ -254,10 +254,12 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             use_shell = False
         elif not use_shell:
             exec_cmd = cmd
+            if isinstance(exec_cmd, list) and len(exec_cmd) > 0 and exec_cmd[0] == "git":
+                exec_cmd = [safe_git] + exec_cmd[1:]
             use_shell = False
 
         if (os.name == "nt" and cwd is not None and isinstance(exec_cmd, list)
-                and exec_cmd and exec_cmd[0] == "git"):
+                and exec_cmd and (exec_cmd[0] in ("git", safe_git) or exec_cmd[0].lower().endswith(("git", "git.exe")))):
             # Avoid CreateProcess's extended-CWD limit and Git's fixed getcwd
             # buffers. Check before shielding attributes or launching Git.
             process_cwd = windows_git_directory(cwd)

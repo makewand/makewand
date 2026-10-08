@@ -484,7 +484,7 @@ class TestCatalogDrivenTierResolutionAndSandboxWhitelist(unittest.TestCase):
             mock_sub.return_value = MagicMock(returncode=0, stdout="test", stderr="")
             run_git_cmd(["git", "diff", "HEAD"])
             called_cmd = mock_sub.call_args[0][0]
-            self.assertEqual(called_cmd[0], "git")
+            self.assertTrue(called_cmd[0] == "git" or called_cmd[0].endswith("git") or called_cmd[0].endswith("git.exe"))
             for flag in SAFE_GIT_SECURITY_FLAGS:
                 self.assertIn(flag, called_cmd)
 
