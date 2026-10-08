@@ -222,7 +222,10 @@ func TestWizardBuild_AvoidsCollidingProjectDirectory(t *testing.T) {
 	app = runWizardCmds(t, app, cmd)
 
 	// Plan -> Confirm
-	app, cmd = updateWizardApp(t, app, enter)
+	app, planConfirmCmd := updateWizardApp(t, app, enter)
+	if planConfirmCmd != nil {
+		t.Fatal("plan confirmation should not return a command")
+	}
 
 	// Confirm -> Build
 	app, cmd = updateWizardApp(t, app, enter)
