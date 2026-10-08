@@ -46,13 +46,15 @@ def resolve_windows_command(cmd, cwd=None):
     raw_exe = os.fspath(cmd[0])
     executable = shutil.which(raw_exe, path=clean_path) or raw_exe
     if cwd_resolved:
-        candidates = [cwd_resolved / raw_exe]
-        if not raw_exe.lower().endswith((".exe", ".cmd", ".bat", ".com")):
-            candidates.extend(cwd_resolved / f"{raw_exe}{ext}" for ext in (".exe", ".cmd", ".bat"))
-        for cand in candidates:
-            if cand.is_file():
-                if not Path(executable).is_absolute() or Path(executable).resolve() == cand.resolve():
-                    raise PermissionError(f"Refusing to execute binary found inside workspace cwd on Windows: {cand}")
+        is_abs = Path(raw_exe).is_absolute() or bool(os.path.splitdrive(raw_exe)[0])
+        if not is_abs:
+            candidates = [cwd_resolved / raw_exe]
+            if not raw_exe.lower().endswith((".exe", ".cmd", ".bat", ".com")):
+                candidates.extend(cwd_resolved / f"{raw_exe}{ext}" for ext in (".exe", ".cmd", ".bat"))
+            for cand in candidates:
+                if cand.is_file():
+                    if not Path(executable).is_absolute() or Path(executable).resolve() == cand.resolve():
+                        raise PermissionError(f"Refusing to execute binary found inside workspace cwd on Windows: {cand}")
         try:
             exe_p = Path(executable).resolve()
             if exe_p.is_relative_to(cwd_resolved):

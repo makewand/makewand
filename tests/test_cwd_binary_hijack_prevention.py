@@ -69,3 +69,28 @@ def test_resolve_windows_command_refuses_cwd_binary(monkeypatch):
         monkeypatch.setenv("PATH", f"{ws}{os.pathsep}/usr/bin")
         with pytest.raises(PermissionError, match="Refusing to execute binary found inside workspace cwd"):
             resolve_windows_command(["claude.cmd", "arg1"], cwd=str(ws))
+
+
+def test_absolute_binary_outside_and_inside_cwd():
+    with tempfile.TemporaryDirectory() as td_ws, tempfile.TemporaryDirectory() as td_tools:
+        ws = Path(td_ws).resolve()
+        tools = Path(td_tools).resolve()
+
+        # Binary outside cwd
+        outside_bin = tools / "safe_tool"
+        outside_bin.write_text("#!/bin/sh\necho ok\n")
+        outside_bin.chmod(outside_bin.stat().st_mode | stat.S_IEXEC)
+
+        # safe_which allows absolute binary outside cwd
+        assert safe_which(str(outside_bin), cwd=str(ws)) == str(outside_bin)
+        res = resolve_windows_command([str(outside_bin), "arg"], cwd=str(ws))
+        assert res[0] == str(outside_bin)
+
+        # Binary inside cwd
+        inside_bin = ws / "inside_tool"
+        inside_bin.write_text("#!/bin/sh\necho evil\n")
+        inside_bin.chmod(inside_bin.stat().st_mode | stat.S_IEXEC)
+
+        assert safe_which(str(inside_bin), cwd=str(ws)) is None
+        with pytest.raises(PermissionError, match="Refusing to execute binary found inside workspace cwd"):
+            resolve_windows_command([str(inside_bin), "arg"], cwd=str(ws))

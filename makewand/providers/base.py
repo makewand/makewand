@@ -96,12 +96,14 @@ def safe_which(bin_name: str, cwd: Optional[Union[str, Path]] = None) -> Optiona
         except (ValueError, RuntimeError):
             pass
     if cwd_resolved:
-        candidates = [cwd_resolved / raw]
-        if not raw.lower().endswith((".exe", ".cmd", ".bat", ".com")):
-            candidates.extend(cwd_resolved / f"{raw}{ext}" for ext in (".exe", ".cmd", ".bat"))
-        for cand in candidates:
-            if cand.is_file() and (not resolved or Path(resolved).resolve() == cand.resolve()):
-                return None
+        is_abs = Path(raw).is_absolute() or bool(os.path.splitdrive(raw)[0])
+        if not is_abs:
+            candidates = [cwd_resolved / raw]
+            if not raw.lower().endswith((".exe", ".cmd", ".bat", ".com")):
+                candidates.extend(cwd_resolved / f"{raw}{ext}" for ext in (".exe", ".cmd", ".bat"))
+            for cand in candidates:
+                if cand.is_file() and (not resolved or Path(resolved).resolve() == cand.resolve()):
+                    return None
     return resolved
 
 
