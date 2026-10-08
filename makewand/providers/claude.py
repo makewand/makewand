@@ -51,7 +51,13 @@ def execute_claude_task(
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache
-    from makewand.sandbox import is_bwrap_available, wrap_bwrap, SandboxConfigError
+    from makewand.sandbox import (
+        is_bwrap_available,
+        wrap_bwrap,
+        SandboxConfigError,
+        verify_writable_sandbox_or_authorized,
+        audit_unsafe_host_exec,
+    )
     from makewand.git_helper import find_git_root
     # Untrusted repo enforcement
     if repo_trust == "untrusted":
@@ -89,10 +95,12 @@ def execute_claude_task(
         repo_root = find_git_root(cwd) or cwd
     repo_root = os.path.abspath(repo_root)
 
-    # Fail-closed enforcement: if writable, sandbox is mandatory
+    # Fail-closed enforcement: if writable, sandbox is mandatory unless explicitly authorized
+    host_auth_source = None
     if not readonly:
-        if not is_bwrap_available():
-            return False, None, "Claude 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        ok, host_auth_source, err = verify_writable_sandbox_or_authorized("claude", repo_trust=repo_trust)
+        if not ok:
+            return False, None, err
 
     input_text = None
     if len(prompt.encode("utf-8")) > 32 * 1024:
@@ -133,6 +141,8 @@ def execute_claude_task(
             return False, None, f"Claude 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     elif repo_trust == "untrusted":
         return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+    elif not readonly:
+        audit_unsafe_host_exec("provider:claude", cmd, cwd, host_auth_source)
 
     log_desc = "只读解析任务 (工具只读约束)" if readonly else "代码任务 (无头权限自动穿透)"
     import sys

@@ -1120,6 +1120,16 @@ def _run_pipeline_impl(
     print(c(f"  • 主力实现引擎: {primary_c.upper()} (候选梯队: {' -> '.join([c.upper() for c in coder_candidates])})", COLOR_BOLD + COLOR_BLUE))
     print(c(f"  • 独立盲审引擎: {primary_r.upper()} (候选梯队: {' -> '.join([r.upper() for r in reviewer_candidates])})\n", COLOR_BOLD + COLOR_PURPLE))
 
+    cli_engines = {"claude", "codex", "grok", "muse", "agy", "aider"}
+    all_cli = all(eng in cli_engines for eng in coder_candidates)
+    if all_cli:
+        from makewand.sandbox import verify_writable_sandbox_or_authorized
+        sb_ok, _, sb_err = verify_writable_sandbox_or_authorized(repo_trust=repo_trust)
+        if not sb_ok:
+            if _outcome is not None:
+                _outcome.update(status="UNVERIFIED", error=sb_err)
+            return fail_and_cleanup(sb_err, "UNVERIFIED")
+
     # Record task baseline commit before dispatching implementation
     # For shadow worktrees, baseline_commit preserves forwarded active session dirty state.
     # For normal worktrees, recording current HEAD captures intermediate commits + uncommitted modifications.
@@ -2581,6 +2591,14 @@ def _run_race_impl(
     if engine_a.lower() == engine_b.lower():
         print(c("竞速需要两个不同的已启用提供者 (UNVERIFIED)。", COLOR_RED))
         return EXIT_UNVERIFIED
+
+    cli_engines = {"claude", "codex", "grok", "muse", "agy", "aider"}
+    if engine_a.lower() in cli_engines or engine_b.lower() in cli_engines:
+        from makewand.sandbox import verify_writable_sandbox_or_authorized
+        sb_ok, _, sb_err = verify_writable_sandbox_or_authorized(repo_trust=repo_trust)
+        if not sb_ok:
+            print(c(sb_err, COLOR_RED + COLOR_BOLD), file=sys.stderr)
+            return EXIT_UNVERIFIED
 
     ensure_config_dir()
     race_id = f"rc_{uuid.uuid4().hex[:8]}"

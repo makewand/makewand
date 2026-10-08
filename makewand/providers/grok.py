@@ -76,7 +76,12 @@ def execute_grok_task(
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
-    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.sandbox import (
+        is_bwrap_available,
+        wrap_bwrap,
+        verify_writable_sandbox_or_authorized,
+        audit_unsafe_host_exec,
+    )
     from makewand.git_helper import find_git_root
 
     # Untrusted repo enforcement
@@ -115,10 +120,12 @@ def execute_grok_task(
         repo_root = find_git_root(cwd) or cwd
     repo_root = os.path.abspath(repo_root)
 
-    # Fail-closed enforcement: if writable, sandbox is mandatory
+    # Fail-closed enforcement: if writable, sandbox is mandatory unless explicitly authorized
+    host_auth_source = None
     if not readonly:
-        if not is_bwrap_available():
-            return False, None, "Grok 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        ok, host_auth_source, err = verify_writable_sandbox_or_authorized("grok", repo_trust=repo_trust)
+        if not ok:
+            return False, None, err
 
     p_file = None
     p_dir = None
@@ -153,6 +160,8 @@ def execute_grok_task(
             cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="grok", extra_ro_binds=[p_file] if p_file else None)
         elif repo_trust == "untrusted":
             return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        elif not readonly:
+            audit_unsafe_host_exec("provider:grok", cmd, cwd, host_auth_source)
 
         log_desc = "只读解析/审查任务 (Plan 模式)" if readonly else "代码任务 (自动审批执行)"
         import sys

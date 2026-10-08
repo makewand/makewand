@@ -27,7 +27,7 @@ curl -fsSL https://makewand.org/install.sh | bash
 - **🏁 双模型并发隔离竞速 (Race Mode)**：
   - `makewand race "<任务>"` 在临时隔离沙箱中并行派发两组模型，统计耗时与代码质量，由可用裁判输出结构化采纳裁决。默认保留 A/B 候选，显式 `merge` 才生成混合候选 M。
 - **🌲 非 Git 目录弹性容灾**：未初始化 Git 的工程自动构建轻量级影子跟踪树，彻底解决常规工具依赖 Git 导致的崩溃。
-- **🚀 无头执行**：写入任务在必需的 Bubblewrap 沙箱内运行官方 CLI；沙箱不可用时拒绝执行。Go 的 Strength1 候选仍需人工确认。
+- **🚀 无头执行与跨平台沙箱约束**：写入任务在必需的 Bubblewrap (bwrap) 沙箱内运行官方 CLI；沙箱不可用时遵循 fail-closed 拒绝执行。bwrap 沙箱依赖 Linux 内核命名空间，macOS 支持开箱即用的只读分析与审查（`makewand review`）；在 macOS 上运行代码生成写入任务时，建议通过 Linux 容器/VM 或远端执行器（`--remote-url`）运行，或显式配置 `MAKEWAND_UNSAFE_HOST_EXEC=1` 并完成交互确认授权宿主执行（所有宿主执行将审计至 `unsafe_exec_audit.jsonl`）。Go 的 Strength1 候选仍需人工确认。
 - **📡 实时流式输出**：支持 `--stream` 参数，带模型专属色彩前缀逐行流式呈现。
 
 ---
@@ -147,6 +147,7 @@ makewand sandbox python3 -m pytest tests/
 # 阻断外网访问执行构建/测试
 makewand sandbox --no-net go test ./...
 ```
+> **跨平台隔离说明**：Bubblewrap 物理沙箱依赖 Linux 内核命名空间。macOS 环境下，只读审查（`makewand review`）开箱即用；对于代码生成与写入任务，系统遵循 fail-closed 拦截，并给出清晰指引（容器/远端运行，或显式 `MAKEWAND_UNSAFE_HOST_EXEC=1` 确认授权与审计记录）。
 
 ### 8. 单模型直接透传调用
 ```bash

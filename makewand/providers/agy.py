@@ -85,7 +85,12 @@ def execute_agy_task(
     If readonly=True, enforces read-only instructions and constraints.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
-    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.sandbox import (
+        is_bwrap_available,
+        wrap_bwrap,
+        verify_writable_sandbox_or_authorized,
+        audit_unsafe_host_exec,
+    )
     from makewand.git_helper import find_git_root
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
@@ -125,10 +130,12 @@ def execute_agy_task(
             return provider_outcome(call_api_chat(provider="agy", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
         return False, None, f"Antigravity 当前不可用: {cache['agy'].get('reason')} (可配置 GEMINI_API_KEY 作为备用 API 自动接力)"
 
-    # Fail-closed enforcement: if writable, sandbox is mandatory
+    # Fail-closed enforcement: if writable, sandbox is mandatory unless explicitly authorized
+    host_auth_source = None
     if not readonly:
-        if not is_bwrap_available():
-            return False, None, "Antigravity 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        ok, host_auth_source, err = verify_writable_sandbox_or_authorized("agy", repo_trust=repo_trust)
+        if not ok:
+            return False, None, err
 
     p_file = None
     p_dir = None
@@ -167,6 +174,8 @@ def execute_agy_task(
             cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="agy", extra_ro_binds=[p_file] if p_file else None)
         elif repo_trust == "untrusted":
             return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        elif not readonly:
+            audit_unsafe_host_exec("provider:agy", cmd, cwd, host_auth_source)
 
         log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
         import sys

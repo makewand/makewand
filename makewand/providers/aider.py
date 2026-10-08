@@ -37,7 +37,12 @@ def execute_aider_task(
     if not is_aider_available():
         return False, None, "未在 PATH 中找到 'aider' 命令。请先运行 'pip install aider-chat' 或使用其他活跃模型"
 
-    from makewand.sandbox import is_bwrap_available, wrap_bwrap
+    from makewand.sandbox import (
+        is_bwrap_available,
+        wrap_bwrap,
+        verify_writable_sandbox_or_authorized,
+        audit_unsafe_host_exec,
+    )
     from makewand.git_helper import find_git_root
     from makewand.providers.base import run_subprocess, model_process_failure
 
@@ -54,10 +59,12 @@ def execute_aider_task(
         if not readonly:
             return False, None, "不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务"
 
-    # Fail-closed enforcement: if writable, sandbox is mandatory
+    # Fail-closed enforcement: if writable, sandbox is mandatory unless explicitly authorized
+    host_auth_source = None
     if not readonly:
-        if not is_bwrap_available():
-            return False, None, "Aider 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        ok, host_auth_source, err = verify_writable_sandbox_or_authorized("aider", repo_trust=repo_trust)
+        if not ok:
+            return False, None, err
 
     p_file = None
     p_dir = None
@@ -82,6 +89,10 @@ def execute_aider_task(
 
         if is_bwrap_available():
             cmd = wrap_bwrap(cmd, workspace=work_dir, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="aider", extra_ro_binds=[p_file] if p_file else None)
+        elif repo_trust == "untrusted":
+            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        elif not readonly:
+            audit_unsafe_host_exec("provider:aider", cmd, work_dir, host_auth_source)
 
         log_desc = "只读解析任务" if readonly else "代码编写任务"
         print(c(f"[Makewand -> Aider] 派发{log_desc}至 Aider Pair Programmer (沙箱隔离)...", COLOR_GREEN), file=sys.stderr)
