@@ -739,3 +739,128 @@ func TestWrapCLICommandWithSandbox_ServerDataAndSecretMasking(t *testing.T) {
 		t.Errorf("expected MAKEWAND_SERVER_AUTH_CONFIG %s to be masked with /dev/null, got: %v", fakeAuthFile, wrapped.Args)
 	}
 }
+
+func TestWrapCLICommandWithSandbox_ProviderStateShielding(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout test")
+	}
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	// Set up claude directory with protected, ephemeral, and project memory paths
+	claudeDir := filepath.Join(fakeHome, ".claude")
+	_ = os.MkdirAll(filepath.Join(claudeDir, "commands"), 0o700)
+	_ = os.MkdirAll(filepath.Join(claudeDir, "skills"), 0o700)
+	_ = os.MkdirAll(filepath.Join(claudeDir, "hooks"), 0o700)
+	_ = os.MkdirAll(filepath.Join(claudeDir, "chrome"), 0o700)
+	_ = os.MkdirAll(filepath.Join(claudeDir, "session-env"), 0o700)
+	_ = os.WriteFile(filepath.Join(claudeDir, "CLAUDE.md"), []byte("prompt"), 0o600)
+	_ = os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte("{}"), 0o600)
+
+	ws := t.TempDir()
+	// Set up workspace-specific project memory
+	var sb strings.Builder
+	for _, r := range filepath.Clean(ws) {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteByte('-')
+		}
+	}
+	memDir := filepath.Join(claudeDir, "projects", sb.String(), "memory")
+	_ = os.MkdirAll(memDir, 0o700)
+
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+
+	args := strings.Join(wrapped.Args, " ")
+
+	// Base provider dir is bound
+	if !strings.Contains(args, "--bind "+claudeDir+" "+claudeDir) {
+		t.Errorf("expected base claude dir to be bound: %v", wrapped.Args)
+	}
+
+	// Protected subpaths overlayed read-only
+	for _, sub := range []string{
+		filepath.Join(claudeDir, "CLAUDE.md"),
+		filepath.Join(claudeDir, "settings.json"),
+		filepath.Join(claudeDir, "commands"),
+		filepath.Join(claudeDir, "skills"),
+		filepath.Join(claudeDir, "hooks"),
+		filepath.Join(claudeDir, "chrome"),
+		memDir,
+	} {
+		if !strings.Contains(args, "--ro-bind "+sub+" "+sub) {
+			t.Errorf("expected protected subpath %s to be mounted --ro-bind, got args: %v", sub, wrapped.Args)
+		}
+	}
+
+	// Ephemeral session dirs overlayed tmpfs
+	sessionEnv := filepath.Join(claudeDir, "session-env")
+	if !strings.Contains(args, "--tmpfs "+sessionEnv) {
+		t.Errorf("expected ephemeral subpath %s to be mounted --tmpfs, got args: %v", sessionEnv, wrapped.Args)
+	}
+}
+
+func TestWrapCLICommandWithSandbox_CodexStateShielding(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout test")
+	}
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	codexDir := filepath.Join(fakeHome, ".codex")
+	_ = os.MkdirAll(filepath.Join(codexDir, "rules"), 0o700)
+	_ = os.MkdirAll(filepath.Join(codexDir, "hooks"), 0o700)
+	_ = os.MkdirAll(filepath.Join(codexDir, "shell_snapshots"), 0o700)
+	_ = os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(""), 0o600)
+	_ = os.WriteFile(filepath.Join(codexDir, "AGENTS.md"), []byte("agent"), 0o600)
+
+	ws := t.TempDir()
+	cmd := exec.Command("codex", "exec")
+	cmd.Dir = ws
+
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "codex", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+
+	args := strings.Join(wrapped.Args, " ")
+
+	if !strings.Contains(args, "--bind "+codexDir+" "+codexDir) {
+		t.Errorf("expected base codex dir to be bound: %v", wrapped.Args)
+	}
+
+	for _, sub := range []string{
+		filepath.Join(codexDir, "config.toml"),
+		filepath.Join(codexDir, "AGENTS.md"),
+		filepath.Join(codexDir, "rules"),
+		filepath.Join(codexDir, "hooks"),
+	} {
+		if !strings.Contains(args, "--ro-bind "+sub+" "+sub) {
+			t.Errorf("expected protected subpath %s to be mounted --ro-bind, got args: %v", sub, wrapped.Args)
+		}
+	}
+
+	snapDir := filepath.Join(codexDir, "shell_snapshots")
+	if !strings.Contains(args, "--tmpfs "+snapDir) {
+		t.Errorf("expected ephemeral subpath %s to be mounted --tmpfs, got args: %v", snapDir, wrapped.Args)
+	}
+}

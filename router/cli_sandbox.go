@@ -83,6 +83,102 @@ var cliProviderCredentials = map[string][]string{
 	"aider":       {".aider"},
 }
 
+type cliProtectedSubpath struct {
+	subpath     string
+	isDir       bool
+	placeholder string // if non-empty, default placeholder content or "dir"
+}
+
+var cliProviderProtected = map[string][]cliProtectedSubpath{
+	"claude": {
+		{subpath: "CLAUDE.md", isDir: false, placeholder: ""},
+		{subpath: "settings.json", isDir: false, placeholder: "{}\n"},
+		{subpath: "settings.local.json", isDir: false, placeholder: "{}\n"},
+		{subpath: "commands", isDir: true, placeholder: "dir"},
+		{subpath: "agents", isDir: true, placeholder: "dir"},
+		{subpath: "skills", isDir: true, placeholder: "dir"},
+		{subpath: "plugins", isDir: true, placeholder: "dir"},
+		{subpath: "hooks", isDir: true, placeholder: "dir"},
+		{subpath: "output-styles", isDir: true, placeholder: "dir"},
+		{subpath: "rules", isDir: true, placeholder: "dir"},
+		{subpath: "workflows", isDir: true, placeholder: "dir"},
+		{subpath: "themes", isDir: true, placeholder: ""},
+		{subpath: "keybindings.json", isDir: false, placeholder: ""},
+		{subpath: "remote-settings.json", isDir: false, placeholder: ""},
+		{subpath: "policy-limits.json", isDir: false, placeholder: ""},
+		{subpath: "chrome", isDir: true, placeholder: "dir"},
+		{subpath: "local", isDir: true, placeholder: ""},
+	},
+	"codex": {
+		{subpath: "config.toml", isDir: false, placeholder: ""},
+		{subpath: "AGENTS.md", isDir: false, placeholder: ""},
+		{subpath: "prompts", isDir: true, placeholder: "dir"},
+		{subpath: "skills", isDir: true, placeholder: "dir"},
+		{subpath: "rules", isDir: true, placeholder: "dir"},
+		{subpath: "hooks", isDir: true, placeholder: "dir"},
+		{subpath: "AGENTS.override.md", isDir: false, placeholder: ""},
+		{subpath: "hooks.json", isDir: false, placeholder: ""},
+		{subpath: "policy", isDir: true, placeholder: ""},
+		{subpath: "plugins", isDir: true, placeholder: ""},
+		{subpath: "packages", isDir: true, placeholder: ""},
+		{subpath: "memories", isDir: true, placeholder: ""},
+	},
+	"gemini": {
+		{subpath: "settings.json", isDir: false, placeholder: "{}\n"},
+		{subpath: "GEMINI.md", isDir: false, placeholder: ""},
+		{subpath: "commands", isDir: true, placeholder: "dir"},
+		{subpath: "extensions", isDir: true, placeholder: "dir"},
+		{subpath: "trustedFolders.json", isDir: false, placeholder: ""},
+		{subpath: "policies", isDir: true, placeholder: ""},
+		{subpath: "skills", isDir: true, placeholder: ""},
+		{subpath: "config", isDir: true, placeholder: ""},
+		{subpath: "antigravity/mcp_config.json", isDir: false, placeholder: ""},
+		{subpath: "antigravity/browserAllowlist.txt", isDir: false, placeholder: ""},
+		{subpath: "antigravity/user_settings.pb", isDir: false, placeholder: ""},
+		{subpath: "antigravity-cli/bin", isDir: true, placeholder: ""},
+		{subpath: "antigravity-cli/builtin", isDir: true, placeholder: ""},
+		{subpath: "antigravity-cli/updater", isDir: true, placeholder: ""},
+		{subpath: "antigravity-cli/knowledge", isDir: true, placeholder: ""},
+		{subpath: "antigravity-cli/hooks.json", isDir: false, placeholder: ""},
+		{subpath: "antigravity-cli/settings.json", isDir: false, placeholder: ""},
+		{subpath: "antigravity-cli/mcp_config.json", isDir: false, placeholder: ""},
+	},
+	"grok": {
+		{subpath: "config.toml", isDir: false, placeholder: ""},
+		{subpath: "bin", isDir: true, placeholder: ""},
+		{subpath: "hooks", isDir: true, placeholder: "dir"},
+		{subpath: "hooks-paths", isDir: false, placeholder: ""},
+		{subpath: "installed-plugins", isDir: true, placeholder: ""},
+		{subpath: "bundled", isDir: true, placeholder: ""},
+		{subpath: "vendor", isDir: true, placeholder: ""},
+		{subpath: "completions", isDir: true, placeholder: ""},
+		{subpath: "marketplace-cache", isDir: true, placeholder: ""},
+		{subpath: "memory-v2", isDir: true, placeholder: ""},
+		{subpath: "sandbox.toml", isDir: false, placeholder: ""},
+		{subpath: "trusted_folders.toml", isDir: false, placeholder: ""},
+	},
+	"muse": {
+		{subpath: "settings.json", isDir: false, placeholder: ""},
+		{subpath: "env", isDir: false, placeholder: ""},
+		{subpath: "trust.json", isDir: false, placeholder: ""},
+		{subpath: "plugins", isDir: true, placeholder: ""},
+		{subpath: "skills", isDir: true, placeholder: ""},
+		{subpath: "feature-config", isDir: true, placeholder: ""},
+	},
+}
+
+var cliProviderEphemeral = map[string][]string{
+	"claude": {
+		"shell-snapshots", "session-env", "sessions", "ide", "daemon", "jobs", "bridge-spawn",
+	},
+	"codex": {
+		"shell_snapshots", "app-server-control", "app-server-daemon",
+	},
+	"muse": {
+		"runtime",
+	},
+}
+
 // UnsafeHostExecAuth carries authorization for running unsandboxed on the host
 // when bubblewrap is unavailable.
 type UnsafeHostExecAuth struct {
@@ -843,6 +939,105 @@ func rebindToolchainUnderMaskedRoot(args []string, targetBin, workspace, home st
 	return args
 }
 
+// cliShieldProviderState overlays read-only binds for agent instructions, MCP configs,
+// hooks, skills, and settings, and mounts ephemeral session directories with tmpfs.
+// This prevents prompt-injection attacks from modifying host configurations or planting
+// malicious hooks for host RCE (remediating [P1] redteam-1).
+func cliShieldProviderState(args []string, providerKey, rootPath, workspace string, isReadOnly bool) []string {
+	if isReadOnly {
+		// In read-only mode, the whole provider root is already mounted with --ro-bind.
+		return args
+	}
+
+	normKey := strings.ToLower(providerKey)
+	if normKey == "agy" || normKey == "antigravity" {
+		normKey = "gemini"
+	}
+
+	protectedList := cliProviderProtected[normKey]
+	for _, entry := range protectedList {
+		subPath := filepath.Join(rootPath, filepath.FromSlash(entry.subpath))
+		fi, err := os.Lstat(subPath)
+		if err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				target, err := filepath.EvalSymlinks(subPath)
+				if err == nil {
+					args = cliAppendRoBindIfNotPresent(args, target)
+				}
+			} else {
+				args = cliAppendRoBindIfNotPresent(args, subPath)
+			}
+		} else if entry.placeholder != "" {
+			if entry.isDir {
+				// #nosec G301 -- directory placeholder for provider protection inside host home
+				if err := os.MkdirAll(subPath, 0o700); err == nil {
+					args = cliAppendRoBindIfNotPresent(args, subPath)
+				}
+			} else {
+				dir := filepath.Dir(subPath)
+				// #nosec G301 -- directory placeholder for provider protection inside host home
+				if err := os.MkdirAll(dir, 0o700); err == nil {
+					// #nosec G304, G703 -- fixed subpath under user's provider state directory
+					//nolint:gosec // G304, G703: fixed subpath under user's provider state directory
+					if err := os.WriteFile(subPath, []byte(entry.placeholder), 0o600); err == nil {
+						args = cliAppendRoBindIfNotPresent(args, subPath)
+					}
+				}
+			}
+		}
+	}
+
+	if normKey == "claude" && workspace != "" {
+		projectsDir := filepath.Join(rootPath, "projects")
+		var sb strings.Builder
+		for _, r := range filepath.Clean(workspace) {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+				sb.WriteRune(r)
+			} else {
+				sb.WriteByte('-')
+			}
+		}
+		key := sb.String()
+		memDir := filepath.Join(projectsDir, key, "memory")
+		if fi, err := os.Lstat(memDir); err == nil && fi.IsDir() {
+			args = cliAppendRoBindIfNotPresent(args, memDir)
+		}
+	}
+
+	ephemeralList := cliProviderEphemeral[normKey]
+	for _, eph := range ephemeralList {
+		subPath := filepath.Join(rootPath, filepath.FromSlash(eph))
+		fi, err := os.Lstat(subPath)
+		if err == nil && fi.IsDir() {
+			args = cliAppendTmpfsIfNotPresent(args, subPath)
+		}
+	}
+
+	return args
+}
+
+func cliAppendRoBindIfNotPresent(args []string, target string) []string {
+	target = filepath.Clean(target)
+	for i := 0; i+1 < len(args); i++ {
+		if (args[i] == "--ro-bind" || args[i] == "--bind" || args[i] == "--tmpfs") && filepath.Clean(args[i+1]) == target {
+			if args[i] == "--ro-bind" {
+				return args
+			}
+		}
+	}
+	return append(args, "--ro-bind", target, target)
+}
+
+func cliAppendTmpfsIfNotPresent(args []string, target string) []string {
+	target = filepath.Clean(target)
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--tmpfs" && filepath.Clean(args[i+1]) == target {
+			return args
+		}
+	}
+	return append(args, "--tmpfs", target)
+}
+
 // wrapCLICommandWithSandbox wraps a CLI provider command with bubblewrap (bwrap).
 // It isolates the execution by mounting the workspace (read-write or read-only
 // for review tasks), masking host roots (/root, /mnt, /media, /srv), and masking
@@ -1089,12 +1284,13 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		if isReview || RemoteOriginFromContext(ctx) {
 			bindFlag = "--ro-bind"
 		}
+		isReadOnlyProvider := isReview || RemoteOriginFromContext(ctx)
 		for _, cred := range allowedCreds {
 			target := filepath.Join(home, filepath.FromSlash(cred))
 			if target == workspace || cliPathWithin(target, workspace) {
 				continue
 			}
-			if _, err := os.Stat(target); err == nil { //nolint:gosec // G703: checking existence of provider credentials in host home
+			if fi, err := os.Stat(target); err == nil { //nolint:gosec // G703: checking existence of provider credentials in host home
 				already := false
 				for i := 0; i+1 < len(bwrapArgs); i++ {
 					if (bwrapArgs[i] == "--bind" || bwrapArgs[i] == "--ro-bind") && bwrapArgs[i+1] == target {
@@ -1104,6 +1300,9 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 				}
 				if !already {
 					bwrapArgs = append(bwrapArgs, bindFlag, target, target)
+				}
+				if fi.IsDir() {
+					bwrapArgs = cliShieldProviderState(bwrapArgs, p, target, workspace, isReadOnlyProvider)
 				}
 			}
 		}
@@ -1157,6 +1356,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		}
 		bwrapArgs = append(bwrapArgs, bindFlag, realCodexHome, realCodexHome,
 			"--setenv", "CODEX_HOME", realCodexHome)
+		bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, isReview || RemoteOriginFromContext(ctx))
 	} else if p != "codex" {
 		// A custom Codex account may be outside a masked host root. Other
 		// providers must not gain access to it through the root read-only mount.

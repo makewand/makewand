@@ -175,6 +175,7 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".claude", "keybindings.json", "file", None),
             (".claude", "remote-settings.json", "file", None),
             (".claude", "policy-limits.json", "file", None),
+            (".claude", "chrome", "dir", True),
             # npm "local" installation of the claude binary
             (".claude", "local", "dir", None),
         ],
