@@ -535,7 +535,7 @@ func TestWrapCLICommandWithSandbox_LocalAndHomeBinLayoutsDoNotExposeSecrets(t *t
 	ws := t.TempDir()
 
 	// Layout A: ~/.local/bin/claude
-	cmdA := exec.Command(filepath.Join(fakeHome, ".local", "bin", "claude"), "-p", "hi")
+	cmdA := exec.Command(filepath.Join(fakeHome, ".local", "bin", "claude"), "-p", "hi") //nolint:gosec // G204: test-only fake command path
 	cmdA.Dir = ws
 	wrappedA, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmdA)
 	if err != nil {
@@ -554,7 +554,7 @@ func TestWrapCLICommandWithSandbox_LocalAndHomeBinLayoutsDoNotExposeSecrets(t *t
 	}
 
 	// Layout B: ~/bin/claude
-	cmdB := exec.Command(filepath.Join(fakeHome, "bin", "claude"), "-p", "hi")
+	cmdB := exec.Command(filepath.Join(fakeHome, "bin", "claude"), "-p", "hi") //nolint:gosec // G204: test-only fake command path
 	cmdB.Dir = ws
 	wrappedB, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmdB)
 	if err != nil {
