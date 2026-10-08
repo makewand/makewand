@@ -325,11 +325,6 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".grok", "trusted_folders.toml", "file", None),
         ],
         "ephemeral": [],
-        "readonly_state": [
-            (".grok", "logs"),
-            (".grok", "cache"),
-            (".grok", "tmp"),
-        ],
     },
     "muse": {
         "roots": [".config/muse", ".local/share/muse"],
