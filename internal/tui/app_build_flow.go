@@ -158,19 +158,23 @@ func (a App) handleFilesExtracted(msg filesExtractedMsg) (tea.Model, tea.Cmd) {
 
 	if msg.phase == pendingPhaseBuild {
 		a.progress.SetStepDetail(stepCode, fmt.Sprintf(m.ProgressFilesFound, len(msg.files)))
-		if !a.shouldUseAutopilotCandidates() || a.shouldAutoApproveFileWrites(msg.phase) {
-			// Build phase: auto-confirm file writing unless autopilot verification failed.
+		hasOverwrites := a.project != nil && a.project.HasExistingFiles(msg.files)
+		if !hasOverwrites && (!a.shouldUseAutopilotCandidates() || a.shouldAutoApproveFileWrites(msg.phase)) {
+			// Build phase: auto-confirm file writing only if no existing files would be overwritten,
+			// unless autopilot verification failed.
 			return a, func() tea.Msg {
 				return confirmFileWriteMsg{confirmed: true, automatic: true}
 			}
 		}
-		// Autopilot needs configured independent acceptance at Strength 2;
-		// explain why approval is needed instead of claiming no candidate
-		// passed (candidates may well have passed local checks).
-		a.chat.AddMessage(ChatMessage{
-			Role:    "system",
-			Content: m.AutopilotApprovalRequired,
-		})
+		if !hasOverwrites {
+			// Autopilot needs configured independent acceptance at Strength 2;
+			// explain why approval is needed instead of claiming no candidate
+			// passed (candidates may well have passed local checks).
+			a.chat.AddMessage(ChatMessage{
+				Role:    "system",
+				Content: m.AutopilotApprovalRequired,
+			})
+		}
 	}
 
 	if a.shouldAutoApproveFileWrites(msg.phase) {

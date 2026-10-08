@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/makewand/makewand/internal/engine"
@@ -98,6 +100,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 		if tpl != nil {
 			projectName = tpl.ID + "-project"
 		}
+		projectName = disambiguateProjectName(cwd, projectName)
 
 		proj, err := engine.NewProject(projectName, cwd)
 		if err != nil {
@@ -277,4 +280,35 @@ func retryWizardBuildForMissingFiles(
 	}
 
 	return retryContent, total
+}
+
+// disambiguateProjectName returns baseName if no non-empty directory or file of that name
+// exists in parentDir. If a non-empty directory or file already exists, it appends a numeric
+// suffix (-2, -3, ...) to avoid collisions and silent data overwrites.
+func disambiguateProjectName(parentDir, baseName string) string {
+	safeBase := engine.SanitizeDirName(baseName)
+	if isAvailableProjectDir(parentDir, safeBase) {
+		return baseName
+	}
+	for i := 2; i <= 10000; i++ {
+		candidate := fmt.Sprintf("%s-%d", baseName, i)
+		safeCandidate := engine.SanitizeDirName(candidate)
+		if isAvailableProjectDir(parentDir, safeCandidate) {
+			return candidate
+		}
+	}
+	return fmt.Sprintf("%s-%d", baseName, time.Now().UnixNano())
+}
+
+func isAvailableProjectDir(parentDir, safeName string) bool {
+	target := filepath.Join(parentDir, safeName)
+	entries, err := os.ReadDir(target)
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil {
+		// Not a directory, or permission denied: cannot safely use it as an empty project dir.
+		return false
+	}
+	return len(entries) == 0
 }

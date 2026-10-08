@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -215,5 +216,73 @@ func TestGitCommit_OrphanShieldSelfHealing(t *testing.T) {
 	}
 	if _, err := os.Stat(orphanFile); err == nil {
 		t.Fatal("orphan shield file still exists after healing!")
+	}
+}
+
+func TestGitInit_PreservesExistingGitignore(t *testing.T) {
+	// Case 1: Fresh repository with no .gitignore creates default
+	p1, err := NewProject("git-fresh", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p1.GitInit(context.Background()); err != nil {
+		t.Fatalf("GitInit fresh: %v", err)
+	}
+	content1, err := p1.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatalf("ReadFile(.gitignore): %v", err)
+	}
+	if !strings.Contains(content1, "node_modules/") || !strings.Contains(content1, ".env") {
+		t.Fatalf("default .gitignore missing expected entries: %s", content1)
+	}
+
+	// Case 2: Existing .gitignore with custom user entries preserves them and appends missing defaults
+	p2, err := NewProject("git-existing", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	customContent := "# Custom user ignores\nmy_secret_data/\n*.myextension\n.env\n"
+	if err := p2.WriteFile(".gitignore", customContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := p2.GitInit(context.Background()); err != nil {
+		t.Fatalf("GitInit existing: %v", err)
+	}
+	content2, err := p2.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatalf("ReadFile(.gitignore): %v", err)
+	}
+	if !strings.HasPrefix(content2, customContent) {
+		t.Fatalf("existing custom content was overwritten or altered: got %q, want prefix %q", content2, customContent)
+	}
+	if !strings.Contains(content2, "node_modules/") || !strings.Contains(content2, "credentials.json") {
+		t.Fatalf("missing defaults were not appended: %s", content2)
+	}
+	// Verify .env was not duplicated
+	if strings.Count(content2, ".env") != 1 {
+		t.Fatalf(".env was duplicated in .gitignore: %s", content2)
+	}
+
+	// Case 3: Calling GitInit when all defaults are present does not mutate the file
+	p3, err := NewProject("git-complete", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p3.GitInit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	beforeContent, err := p3.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p3.GitInit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	afterContent, err := p3.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeContent != afterContent {
+		t.Fatalf("second GitInit mutated complete .gitignore: got %q, want %q", afterContent, beforeContent)
 	}
 }
