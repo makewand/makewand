@@ -971,7 +971,7 @@ func RevokeTokenRule(cfg *Config, tokenID string) error {
 	return fmt.Errorf("token %q not found", tokenID)
 }
 
-// SaveConfigFile validates and writes cfg to path with restrictive permissions.
+// SaveConfigFile validates and atomically writes cfg to path with restrictive permissions (0600).
 func SaveConfigFile(path string, cfg Config) error {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -980,7 +980,8 @@ func SaveConfigFile(path string, cfg Config) error {
 	if _, err := NewAuthorizer(cfg); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -988,7 +989,35 @@ func SaveConfigFile(path string, cfg Config) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
+
+	f, err := os.CreateTemp(dir, ".auth-config-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() {
+		_ = os.Remove(tmp)
+	}()
+
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncAuthDirectory(dir)
 }
 
 // GenerateToken creates a random bearer token suitable for auth config issuance.

@@ -215,6 +215,12 @@ func tokenIssueCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			unlock, err := serverauth.LockConfigFile(path, true)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+
 			cfg, err := loadOrCreateAuthConfig(path)
 			if err != nil {
 				return err
@@ -317,6 +323,12 @@ func tokenRevokeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			unlock, err := serverauth.LockConfigFile(path, true)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+
 			cfg, err := serverauth.LoadConfigFile(path)
 			if err != nil {
 				return err
