@@ -1149,14 +1149,17 @@ def wrap_bwrap(
         if var in os.environ:
             bwrap_cmd.extend(["--setenv", var, os.environ[var]])
 
-    # Strip any D-Bus environment variables to prevent host escape / privilege escalation
+    # Strip any D-Bus and GUI display environment variables to prevent host escape / privilege escalation
     for k in list(os.environ.keys()):
-        if "DBUS" in k:
+        if "DBUS" in k or k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
             bwrap_cmd.extend(["--unsetenv", k])
 
     if extra_env:
         for k, v in extra_env.items():
             bwrap_cmd.extend(["--setenv", str(k), str(v)])
+
+    if os.environ.get("MAKEWAND_SANDBOX_UNSHARE_NET", "").lower() in ("1", "true", "yes"):
+        allow_network = False
 
     if not allow_network:
         bwrap_cmd.append("--unshare-net")

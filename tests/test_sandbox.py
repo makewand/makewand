@@ -558,6 +558,36 @@ class TestSandbox(unittest.TestCase):
                 sessions_path = str(custom_codex / "sessions")
                 self.assertIn((sessions_path, sessions_path), bind_pairs)
 
+    def test_makewand_sandbox_unshare_net_env_override(self):
+        """[P1] py-sec-1: MAKEWAND_SANDBOX_UNSHARE_NET=1 forces --unshare-net even when allow_network=True."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from unittest.mock import patch
+            # By default allow_network=True has no --unshare-net
+            cmd1 = wrap_bwrap(["echo", "hi"], workspace=tmpdir, allow_network=True)
+            self.assertNotIn("--unshare-net", cmd1)
+
+            # With MAKEWAND_SANDBOX_UNSHARE_NET=1, --unshare-net is enforced
+            with patch.dict(os.environ, {"MAKEWAND_SANDBOX_UNSHARE_NET": "1"}):
+                cmd2 = wrap_bwrap(["echo", "hi"], workspace=tmpdir, allow_network=True)
+                self.assertIn("--unshare-net", cmd2)
+
+    def test_gui_display_and_dbus_env_unsetting(self):
+        """[P1] py-sec-1: DISPLAY, XAUTHORITY, WAYLAND_DISPLAY, and DBUS_* are explicitly unset."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from unittest.mock import patch
+            env = {
+                "DISPLAY": ":0",
+                "XAUTHORITY": "/tmp/fake-xauth",
+                "WAYLAND_DISPLAY": "wayland-0",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/fake-dbus",
+            }
+            with patch.dict(os.environ, env):
+                cmd = wrap_bwrap(["echo", "hi"], workspace=tmpdir)
+                unset_indices = [i for i, x in enumerate(cmd) if x == "--unsetenv"]
+                unset_vars = {cmd[i + 1] for i in unset_indices if i + 1 < len(cmd)}
+                for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
+                    self.assertIn(var, unset_vars)
+
 
 if __name__ == "__main__":
     unittest.main()
