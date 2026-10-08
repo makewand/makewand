@@ -121,10 +121,24 @@ func isProtectedWritePath(cleaned string) bool {
 // protectedRulesPath is the trusted project-rules file loaded by LoadRepoContext.
 const protectedRulesPath = ".makewand/rules.md"
 
+// ErrProjectDirNotEmpty is returned by NewProject when the target directory
+// already exists and contains files.
+var ErrProjectDirNotEmpty = errors.New("project directory already exists and is not empty")
+
 // NewProject creates a new project in the given directory.
 func NewProject(name, parentDir string) (*Project, error) {
 	safeName := sanitizeDirName(name)
 	path := filepath.Join(parentDir, safeName)
+
+	if fi, err := os.Lstat(path); err == nil {
+		if !fi.IsDir() {
+			return nil, fmt.Errorf("project path already exists and is not a directory: %s", path)
+		}
+		entries, readErr := os.ReadDir(path)
+		if readErr == nil && len(entries) > 0 {
+			return nil, fmt.Errorf("%w: %s", ErrProjectDirNotEmpty, path)
+		}
+	}
 
 	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, fmt.Errorf("create project directory: %w", err)
@@ -517,6 +531,11 @@ func (p *Project) FileTree() string {
 	return b.String()
 }
 
+// SanitizeDirName sanitizes a string for use as a project directory name.
+func SanitizeDirName(name string) string {
+	return sanitizeDirName(name)
+}
+
 func sanitizeDirName(name string) string {
 	name = strings.ReplaceAll(name, "\x00", "")
 	name = strings.ToLower(name)
@@ -535,6 +554,24 @@ func sanitizeDirName(name string) string {
 	}
 
 	return name
+}
+
+// HasExistingFiles reports whether any of the specified file paths already exist
+// within the project directory.
+func (p *Project) HasExistingFiles(files []ExtractedFile) bool {
+	if p == nil {
+		return false
+	}
+	for _, f := range files {
+		fullPath, err := p.validatePath(f.Path, true)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Lstat(fullPath); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldIgnore(path string) bool {

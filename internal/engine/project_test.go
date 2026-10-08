@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -230,5 +231,101 @@ func TestProjectIgnoreDirs(t *testing.T) {
 	}
 	if IsProjectIgnoredDir("src") {
 		t.Errorf("IsProjectIgnoredDir(\"src\") = true, want false")
+	}
+}
+
+func TestNewProject_CollisionDefense(t *testing.T) {
+	parent := t.TempDir()
+
+	// 1. Success on new directory
+	p1, err := NewProject("my-project", parent)
+	if err != nil {
+		t.Fatalf("NewProject(my-project): unexpected error: %v", err)
+	}
+	if p1.Name != "my-project" {
+		t.Errorf("p1.Name = %q, want %q", p1.Name, "my-project")
+	}
+
+	// 2. Fails when directory already exists and contains files
+	if err := os.WriteFile(filepath.Join(p1.Path, "important.txt"), []byte("data"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err = NewProject("my-project", parent)
+	if err == nil {
+		t.Fatal("NewProject should fail on non-empty existing directory, got nil")
+	}
+	if !errors.Is(err, ErrProjectDirNotEmpty) {
+		t.Errorf("NewProject error = %v, want ErrProjectDirNotEmpty", err)
+	}
+
+	// 3. Succeeds on an existing empty directory
+	emptyDir := filepath.Join(parent, "empty-dir")
+	if err := os.Mkdir(emptyDir, 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	pEmpty, err := NewProject("empty-dir", parent)
+	if err != nil {
+		t.Fatalf("NewProject on empty directory failed: %v", err)
+	}
+	if pEmpty.Path != emptyDir {
+		t.Errorf("pEmpty.Path = %q, want %q", pEmpty.Path, emptyDir)
+	}
+
+	// 4. Fails when path is an existing regular file
+	regularFile := filepath.Join(parent, "regular-file")
+	if err := os.WriteFile(regularFile, []byte("file"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err = NewProject("regular-file", parent)
+	if err == nil {
+		t.Fatal("NewProject should fail when path exists and is not a directory, got nil")
+	}
+}
+
+func TestProject_HasExistingFiles(t *testing.T) {
+	parent := t.TempDir()
+	p, err := NewProject("has-files", parent)
+	if err != nil {
+		t.Fatalf("NewProject: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(p.Path, "exists.txt"), []byte("content"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Check with non-existing file
+	if p.HasExistingFiles([]ExtractedFile{{Path: "missing.txt"}}) {
+		t.Errorf("HasExistingFiles(missing.txt) = true, want false")
+	}
+
+	// Check with existing file
+	if !p.HasExistingFiles([]ExtractedFile{{Path: "exists.txt"}}) {
+		t.Errorf("HasExistingFiles(exists.txt) = false, want true")
+	}
+
+	// Check with mixed files
+	if !p.HasExistingFiles([]ExtractedFile{{Path: "missing.txt"}, {Path: "exists.txt"}}) {
+		t.Errorf("HasExistingFiles(mixed) = false, want true")
+	}
+}
+
+func TestSanitizeDirName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"my project", "my-project"},
+		{"My Project", "my-project"},
+		{"../../evil", "evil"},
+		{"", "project"},
+		{"...---", "project"},
+		{"cool:name*test?id", "cool-nametestid"},
+	}
+
+	for _, tt := range tests {
+		got := SanitizeDirName(tt.input)
+		if got != tt.want {
+			t.Errorf("SanitizeDirName(%q) = %q, want %q", tt.input, got, tt.want)
+		}
 	}
 }

@@ -20,7 +20,7 @@ func (p *Project) GitInit(ctx context.Context) error {
 		return fmt.Errorf("git init failed: %s", result.Stderr)
 	}
 
-	gitignore := `node_modules/
+	defaultGitignore := `node_modules/
 __pycache__/
 .venv/
 venv/
@@ -36,8 +36,43 @@ service-account*.json
 *.pem
 *.key
 `
-	if err := p.WriteFile(".gitignore", gitignore); err != nil {
-		return fmt.Errorf("write .gitignore: %w", err)
+	gitignorePath := filepath.Join(p.Path, ".gitignore")
+	existing, err := os.ReadFile(gitignorePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := p.WriteFile(".gitignore", defaultGitignore); err != nil {
+				return fmt.Errorf("write .gitignore: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("read existing .gitignore: %w", err)
+	}
+
+	existingStr := string(existing)
+	lines := strings.Split(existingStr, "\n")
+	seen := make(map[string]bool, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, "\r")
+		seen[strings.TrimSpace(trimmed)] = true
+	}
+
+	var missing []string
+	for _, entry := range strings.Split(strings.TrimSpace(defaultGitignore), "\n") {
+		entry = strings.TrimSpace(strings.TrimRight(entry, "\r"))
+		if entry != "" && !seen[entry] {
+			missing = append(missing, entry)
+		}
+	}
+
+	if len(missing) > 0 {
+		merged := existingStr
+		if len(merged) > 0 && !strings.HasSuffix(merged, "\n") {
+			merged += "\n"
+		}
+		merged += strings.Join(missing, "\n") + "\n"
+		if err := p.WriteFile(".gitignore", merged); err != nil {
+			return fmt.Errorf("update .gitignore: %w", err)
+		}
 	}
 
 	return nil
