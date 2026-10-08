@@ -569,4 +569,3 @@ func TestWrapCLICommandWithSandbox_LocalAndHomeBinLayoutsDoNotExposeSecrets(t *t
 		}
 	}
 }
-
