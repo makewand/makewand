@@ -801,11 +801,11 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
         # Default fallback if catalog unavailable
         if tier == "deep":
-            return _tier_resolution("opus", "max", is_dynamic=False, full_id="claude-opus-4-20250514")
+            return _tier_resolution("fable", "max", is_dynamic=False, full_id="claude-fable-5-1")
         elif tier == "fast":
             return _tier_resolution("haiku", "low", is_dynamic=False, full_id="claude-haiku-4-5-20251001")
         else:
-            return _tier_resolution("sonnet", "medium", is_dynamic=False, full_id="claude-sonnet-4-20250514")
+            return _tier_resolution("sonnet", "medium", is_dynamic=False, full_id="claude-sonnet-5")
 
     elif provider == "codex":
         discovered_models = []
@@ -947,15 +947,6 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         fallback_effort = "high" if tier in ("deep", "standard") else "low"
         return _tier_resolution(fallback_models.get(tier, "gemini-3.8-flash-high"), fallback_effort, is_dynamic=False)
 
-    elif provider == "gemini":
-        gemini_models = {
-            "fast": "gemini-2.5-flash",
-            "standard": "gemini-2.5-flash",
-            "deep": "gemini-2.5-pro",
-        }
-        effort = "high" if tier == "deep" else ("low" if tier == "fast" else "medium")
-        return _tier_resolution(gemini_models.get(tier, "gemini-2.5-flash"), effort, is_dynamic=False, full_id=gemini_models.get(tier, "gemini-2.5-flash"))
-
     elif provider in ("local", "ollama"):
         try:
             from makewand.providers.local import is_local_model_available
@@ -1023,13 +1014,24 @@ def export_routing_overrides(config_dir: Optional[Path] = None, target_filename:
     for prov in providers_to_sync:
         prov_key = prov
         try:
-            res_cheap = get_provider_model_tier(prov, "fast")
-            res_mid = get_provider_model_tier(prov, "standard")
-            res_prem = get_provider_model_tier(prov, "deep")
+            if prov == "claude":
+                # For API provider 'claude', do not write CLI shortcuts ('sonnet', 'fable').
+                # Use canonical priced API model IDs from Go router's cost table.
+                cheap_m = "claude-haiku-4-5-20251001"
+                mid_m = "claude-sonnet-4-20250514"
+                prem_m = "claude-opus-4-20250514"
+            elif prov == "gemini":
+                cheap_m = "gemini-2.5-flash"
+                mid_m = "gemini-2.5-flash"
+                prem_m = "gemini-2.5-pro"
+            else:
+                res_cheap = get_provider_model_tier(prov, "fast")
+                res_mid = get_provider_model_tier(prov, "standard")
+                res_prem = get_provider_model_tier(prov, "deep")
 
-            cheap_m = res_cheap.get("full_id") or res_cheap.get("model")
-            mid_m = res_mid.get("full_id") or res_mid.get("model")
-            prem_m = res_prem.get("full_id") or res_prem.get("model")
+                cheap_m = res_cheap.get("full_id") or res_cheap.get("model")
+                mid_m = res_mid.get("full_id") or res_mid.get("model")
+                prem_m = res_prem.get("full_id") or res_prem.get("model")
 
             p_models = models_map.get(prov_key, {})
             if not isinstance(p_models, dict):
