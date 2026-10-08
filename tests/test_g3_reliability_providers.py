@@ -13,7 +13,7 @@ import socketserver
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, mock_open, MagicMock
 
 from makewand.providers.api_client import _make_http_request
 from makewand.providers.local import execute_local_task
@@ -120,22 +120,24 @@ class TestApiTotalDeadline(unittest.TestCase):
 
 
 class TestMuseSandboxPassthrough(unittest.TestCase):
-    def test_muse_sandboxed_direct_passthrough(self):
+    def test_muse_sandboxed_direct_passthrough_no_disable_sandbox(self):
         from makewand.providers.muse import get_muse_executable
-        with patch("os.path.isfile", return_value=True), \
+        wrapper_content = '#!/usr/bin/env bash\n# muse-guard\nREAL="/home/alice/.local/libexec/muse-bin/muse"\n'
+        with patch("builtins.open", mock_open(read_data=wrapper_content)), \
+             patch("os.path.isfile", return_value=True), \
              patch("os.access", return_value=True), \
-             patch("shutil.which", return_value="/home/alice/.local/bin/muse"), \
-             patch("makewand.providers.muse._is_dbus_systemd_available", return_value=False):
+             patch("shutil.which", return_value="/home/alice/.local/bin/muse"):
             exe, flags = get_muse_executable(sandboxed=True)
             self.assertTrue(exe.endswith("muse-bin/muse"))
-            self.assertIn("--disable-sandbox", flags)
+            self.assertNotIn("--disable-sandbox", flags)
+            self.assertEqual(flags, [])
 
     def test_muse_host_with_dbus_returns_default(self):
         from makewand.providers.muse import get_muse_executable
-        with patch("makewand.providers.muse._is_dbus_systemd_available", return_value=True), \
+        with patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
              patch("shutil.which", return_value="/home/alice/.local/bin/muse"):
             exe, flags = get_muse_executable(sandboxed=False)
-            self.assertEqual(exe, "muse")
+            self.assertEqual(exe, "/home/alice/.local/bin/muse")
             self.assertEqual(flags, [])
 
     def test_dbus_check_detects_dead_socket_path(self):
@@ -144,20 +146,60 @@ class TestMuseSandboxPassthrough(unittest.TestCase):
              patch("shutil.which", return_value="/usr/bin/systemd-run"):
             self.assertFalse(_is_dbus_systemd_available())
 
-    def test_muse_finds_real_bin_with_isolated_home(self):
-        from makewand.providers.muse import get_muse_executable
-        from unittest.mock import MagicMock
-        fake_pwd = MagicMock()
-        fake_pwd.pw_dir = "/real/home/alice"
-        with patch.dict("os.environ", {"HOME": "/tmp/isolated-home"}, clear=False), \
-             patch("pwd.getpwuid", return_value=fake_pwd), \
-             patch("os.path.isfile", side_effect=lambda p: p == "/real/home/alice/.local/libexec/muse-bin/muse"), \
-             patch("os.access", return_value=True), \
-             patch("shutil.which", return_value="/tmp/isolated-home/bin/muse"), \
-             patch("makewand.providers.muse._is_dbus_systemd_available", return_value=False):
-            exe, flags = get_muse_executable(sandboxed=True)
-            self.assertEqual(exe, "/real/home/alice/.local/libexec/muse-bin/muse")
-            self.assertEqual(flags, ["--disable-sandbox"])
+    def test_muse_guard_fail_closed_when_inactive(self):
+        from makewand.providers.muse import verify_muse_guard
+        import subprocess
+        mock_res = MagicMock()
+        mock_res.returncode = 3
+        with patch.dict("os.environ", {"MUSE_ALLOW_UNGUARDED": "0"}, clear=False), \
+             patch("shutil.which", return_value="/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_res):
+            ok, reason = verify_muse_guard()
+            self.assertFalse(ok)
+            self.assertIn("muse-guard", reason)
+
+    def test_muse_guard_bypassed_with_env_flag(self):
+        from makewand.providers.muse import verify_muse_guard
+        with patch.dict("os.environ", {"MUSE_ALLOW_UNGUARDED": "1"}, clear=False):
+            ok, _ = verify_muse_guard()
+            self.assertTrue(ok)
+
+    def test_execute_muse_task_wrapped_in_systemd_run_slice(self):
+        from makewand.providers.muse import execute_muse_task
+        with patch("makewand.config.has_subscription_configured", return_value=True), \
+             patch("makewand.health.load_status_cache", return_value={}), \
+             patch("makewand.sandbox.is_bwrap_available", return_value=True), \
+             patch("makewand.providers.muse._is_dbus_systemd_available", return_value=True), \
+             patch("makewand.providers.muse.detect_muse_guard", return_value=(True, "/home/alice/.local/libexec/muse-bin/muse")), \
+             patch("makewand.providers.muse.verify_muse_guard", return_value=(True, "")), \
+             patch("makewand.sandbox.wrap_bwrap", side_effect=lambda cmd, **kwargs: ["bwrap"] + cmd), \
+             patch("makewand.providers.muse.run_subprocess", return_value=(0, "ok", "", None)) as mock_run:
+            success, out, err = execute_muse_task("echo test", cwd="/tmp", readonly=True)
+            self.assertTrue(success)
+            self.assertTrue(mock_run.called)
+            called_cmd = mock_run.call_args[0][0]
+            # Verify systemd-run in muse.slice wraps bwrap
+            self.assertEqual(called_cmd[0], "systemd-run")
+            self.assertIn("--slice=muse", called_cmd)
+            self.assertIn("-p", called_cmd)
+            self.assertIn("MemoryMax=16G", called_cmd)
+            self.assertIn("-p", called_cmd)
+            self.assertIn("MemorySwapMax=0", called_cmd)
+            self.assertIn("bwrap", called_cmd)
+            # Verify no --disable-sandbox
+            self.assertNotIn("--disable-sandbox", called_cmd)
+
+    def test_execute_muse_task_fails_closed_when_guard_down(self):
+        from makewand.providers.muse import execute_muse_task
+        with patch("makewand.config.has_subscription_configured", return_value=True), \
+             patch("makewand.health.load_status_cache", return_value={}), \
+             patch("makewand.providers.muse.detect_muse_guard", return_value=(True, "/home/alice/.local/libexec/muse-bin/muse")), \
+             patch("makewand.providers.muse.verify_muse_guard", return_value=(False, "guard inactive")), \
+             patch("makewand.providers.muse.run_subprocess") as mock_run:
+            success, out, err = execute_muse_task("echo test", cwd="/tmp", readonly=True)
+            self.assertFalse(success)
+            self.assertIn("fail-closed", str(err))
+            self.assertFalse(mock_run.called)
 
 
 if __name__ == "__main__":

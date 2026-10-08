@@ -41,44 +41,120 @@ def _is_dbus_systemd_available() -> bool:
             return False
     return True
 
+def is_muse_guard_installed() -> bool:
+    """Detects whether muse-guard egress filter is active or configured on the system."""
+    import shutil
+    if os.path.exists("/etc/nftables-muse-guard.nft") or os.path.exists("/etc/systemd/system/muse-guard.service"):
+        return True
+    if shutil.which("systemctl"):
+        try:
+            import subprocess
+            res = subprocess.run(
+                ["systemctl", "is-active", "--quiet", "muse-guard"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+def detect_muse_guard(muse_bin: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    """
+    Detects whether muse is wrapped by muse-guard (enforcing muse.slice cgroup and proxy).
+    Returns (is_guard, real_bin_path).
+    """
+    import shutil
+    if not muse_bin:
+        muse_bin = shutil.which("muse") or "muse"
+
+    real_bin = os.environ.get("MUSE_REAL_BIN")
+    is_guard = False
+
+    if os.path.isfile(muse_bin):
+        try:
+            with open(muse_bin, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read(4096)
+                if "muse-guard" in content or "muse.slice" in content:
+                    is_guard = True
+                    if not real_bin:
+                        match = re.search(r'REAL=["\']?([^"\'\n]+)["\']?', content)
+                        if match:
+                            candidate_real = match.group(1).strip()
+                            candidate_real = os.path.expanduser(candidate_real.replace("$HOME", "~"))
+                            if os.path.isfile(candidate_real) and os.access(candidate_real, os.X_OK):
+                                real_bin = candidate_real
+        except Exception:
+            pass
+
+    if not is_guard and is_muse_guard_installed():
+        is_guard = True
+
+    return is_guard, real_bin
+
+def verify_muse_guard() -> Tuple[bool, str]:
+    """
+    Verifies that muse-guard egress control is active and muse.slice is running.
+    Fails closed if the guard is not verified, unless MUSE_ALLOW_UNGUARDED=1.
+    """
+    if os.environ.get("MUSE_ALLOW_UNGUARDED") == "1":
+        return True, ""
+    import shutil
+    import subprocess
+    if not shutil.which("systemctl"):
+        return False, "系统未找到 systemctl，无法确保 muse.slice / muse-guard 出网管控生效"
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "start", "muse.slice"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "muse-guard"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        if res.returncode != 0:
+            return False, "muse-guard 出网管控服务未运行 (systemctl is-active muse-guard 返回非 0)"
+    except Exception as e:
+        return False, f"检查 muse-guard 状态异常: {e}"
+    return True, ""
+
 def get_muse_executable(sandboxed: bool = False) -> Tuple[str, List[str]]:
     """
     Resolves the muse binary path and extra flags.
-    In sandboxed environments (e.g. Bubblewrap, containers) or where D-Bus/systemd
-    is unavailable, detects if 'muse' is a wrapper and directly invokes the real
-    underlying binary (~/.local/libexec/muse-bin/muse) with --disable-sandbox to
-    eliminate D-Bus Exit 17 crashes.
+    When wrapped by muse-guard and running under a sandbox where systemd-run cannot be
+    called inside the sandbox, directly invokes the real underlying binary while the
+    outer caller places the execution into muse.slice.
+    Never passes --disable-sandbox by default (#runtime-host-1).
     """
     import shutil
 
-    candidates = [
-        os.environ.get("MUSE_REAL_BIN"),
-        os.path.expanduser("~/.local/libexec/muse-bin/muse"),
-    ]
-    try:
-        import pwd
-        real_user_home = pwd.getpwuid(os.getuid()).pw_dir
-        candidates.append(os.path.join(real_user_home, ".local/libexec/muse-bin/muse"))
-    except Exception:
-        pass
-
-    real_bin = None
-    for cand in candidates:
-        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-            real_bin = cand
-            break
-
     muse_bin = shutil.which("muse") or "muse"
+    is_guard, real_bin = detect_muse_guard(muse_bin)
 
-    needs_direct_passthrough = False
-    if sandboxed or not _is_dbus_systemd_available():
-        if real_bin:
-            if muse_bin != real_bin or sandboxed:
-                needs_direct_passthrough = True
+    if not real_bin:
+        candidates = [
+            os.environ.get("MUSE_REAL_BIN"),
+            os.path.expanduser("~/.local/libexec/muse-bin/muse"),
+        ]
+        for cand in candidates:
+            if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+                real_bin = cand
+                break
 
-    if needs_direct_passthrough and real_bin:
-        return real_bin, ["--disable-sandbox"]
-    return "muse", []
+    if sandboxed and is_guard and real_bin:
+        return real_bin, []
+
+    return muse_bin, []
 
 def execute_muse_task(
     prompt: str,
@@ -142,7 +218,17 @@ def execute_muse_task(
         if not is_bwrap_available():
             return False, None, "Muse 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
 
-    sandboxed = is_bwrap_available() or not _is_dbus_systemd_available()
+    import shutil
+    raw_muse_bin = shutil.which("muse") or "muse"
+    is_guard, _ = detect_muse_guard(raw_muse_bin)
+
+    # If muse-guard is detected, enforce egress self-check (fail closed)
+    if is_guard:
+        guard_ok, guard_reason = verify_muse_guard()
+        if not guard_ok:
+            return False, None, f"Muse 出网管控自检失败 (fail-closed): {guard_reason} (如需临时跳过请设 MUSE_ALLOW_UNGUARDED=1)"
+
+    sandboxed = is_bwrap_available()
     muse_bin, extra_flags = get_muse_executable(sandboxed=sandboxed)
 
     cmd = [muse_bin, "exec", "--no-session-log"]
@@ -179,11 +265,45 @@ def execute_muse_task(
 
         if is_bwrap_available():
             try:
-                cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="muse", extra_ro_binds=[p_file] if p_file else None)
+                extra_env = {}
+                if is_guard:
+                    default_proxy = "http://127.0.0.1:7890"
+                    for var in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
+                        if not os.environ.get(var):
+                            extra_env[var] = default_proxy
+                cmd = wrap_bwrap(
+                    cmd,
+                    workspace=cwd,
+                    allow_network=allow_network,
+                    readonly=readonly,
+                    repo_root=repo_root,
+                    is_provider=True,
+                    provider_name="muse",
+                    extra_ro_binds=[p_file] if p_file else None,
+                    extra_env=extra_env if extra_env else None,
+                )
+                if is_guard and _is_dbus_systemd_available():
+                    muse_mem = os.environ.get("MUSE_MEM", "16G")
+                    cmd = [
+                        "systemd-run", "--user", "--scope", "--quiet",
+                        "--slice=muse", "--collect",
+                        f"-p", f"MemoryMax={muse_mem}",
+                        "-p", "MemorySwapMax=0",
+                        "--",
+                    ] + cmd
             except SandboxConfigError as exc:
                 return False, None, f"Muse 沙箱构建失败，拒绝执行 (fail closed): {exc}"
         elif repo_trust == "untrusted":
             return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+        elif is_guard and _is_dbus_systemd_available():
+            muse_mem = os.environ.get("MUSE_MEM", "16G")
+            cmd = [
+                "systemd-run", "--user", "--scope", "--quiet",
+                "--slice=muse", "--collect",
+                f"-p", f"MemoryMax={muse_mem}",
+                "-p", "MemorySwapMax=0",
+                "--",
+            ] + cmd
 
         import sys
         print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
