@@ -42,6 +42,10 @@ type (
 	// are safe to use against an untrusted repository. A provider that does not
 	// implement it is unsafe in untrusted mode (fail closed).
 	UntrustedRepoCapable = router.UntrustedRepoCapable
+
+	UnsafeHostExecAuth = router.UnsafeHostExecAuth
+	CLIExecRecord      = router.CLIExecRecord
+	CLIExecObserver    = router.CLIExecObserver
 )
 
 // Re-export constants.
@@ -133,6 +137,10 @@ var (
 	DetectCLIsJSON             = router.DetectCLIsJSON
 	ParseAccessType            = router.ParseAccessType
 	ParseRepoTrust             = router.ParseRepoTrust
+
+	ContextWithUnsafeHostExecAuth = router.ContextWithUnsafeHostExecAuth
+	UnsafeHostExecAuthFromContext = router.UnsafeHostExecAuthFromContext
+	ContextWithCLIExecObserver    = router.ContextWithCLIExecObserver
 
 	// ErrNoUntrustedSafeProvider is returned when untrusted-repo mode is active
 	// but no untrusted-repo-safe (direct API) provider is available.

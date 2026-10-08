@@ -949,8 +949,27 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, r
 	if timeout <= 0 {
 		timeout = headlessTimeoutForMode(router.Mode())
 	}
+	obs := &model.CLIExecObserver{}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	ctx = model.ContextWithCLIExecObserver(ctx, obs)
+	if hostAuth.Acknowledged {
+		ctx = model.ContextWithUnsafeHostExecAuth(ctx, model.UnsafeHostExecAuth{
+			Acknowledged: hostAuth.Acknowledged,
+			Source:       hostAuth.Source,
+			Audit: func(cmdPath string, args []string, dir string) {
+				if hostAuth.Audit != nil {
+					hostAuth.Audit(engine.UnsafeHostExecEvent{
+						Context: "cli-provider",
+						Command: cmdPath,
+						Args:    args,
+						Dir:     dir,
+						Source:  hostAuth.Source,
+					})
+				}
+			},
+		})
+	}
 
 	var (
 		content string
@@ -1036,7 +1055,12 @@ func runSinglePrompt(cfg *config.Config, prompt string, timeout time.Duration, r
 			if wdErr != nil || wd == "" {
 				wd = "."
 			}
-			fmt.Fprintf(os.Stderr, "[makewand] %s\n", fmt.Sprintf(i18n.Msg().HostCLIExecNotice, provider, wd))
+			rec := obs.Record()
+			if rec.UnsafeHost {
+				fmt.Fprintf(os.Stderr, "[makewand] %s\n", fmt.Sprintf(i18n.Msg().HostCLIUnsandboxedNotice, provider, wd))
+			} else {
+				fmt.Fprintf(os.Stderr, "[makewand] %s\n", fmt.Sprintf(i18n.Msg().HostCLISandboxedNotice, provider, wd))
+			}
 		}
 	}
 

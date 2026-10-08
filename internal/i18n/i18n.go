@@ -118,6 +118,8 @@ type Messages struct {
 	AutopilotApprovalRequired               string
 	ApprovalModeAutopilotNote               string
 	HostCLIExecNotice                       string
+	HostCLISandboxedNotice                  string
+	HostCLIUnsandboxedNotice                string
 
 	UnsafeHostExecAckPrompt         string
 	UnsafeHostExecAckConfirmed      string
@@ -351,6 +353,8 @@ var en = Messages{
 	AutopilotApprovalRequired:               "Autopilot requires Strength 2 from a configured independent acceptance check to apply automatically. Local checks alone give Strength 1 and require your approval.",
 	ApprovalModeAutopilotNote:               "Note: autopilot ranks candidates using local checks (Strength 1). Automatic application requires a successful configured independent acceptance check (Strength 2); other writes ask for your approval.",
 	HostCLIExecNotice:                       "Note: the %s CLI ran on this host (in %s) with your environment and credentials — generation is not sandboxed. Treat untrusted repos accordingly (see SECURITY.md).",
+	HostCLISandboxedNotice:                  "Note: the %s CLI ran inside bubblewrap sandbox (in %s) with isolated environment.",
+	HostCLIUnsandboxedNotice:                "WARNING: the %s CLI ran unsandboxed directly on this host (in %s) under MAKEWAND_UNSAFE_HOST_EXEC — generation is not sandboxed. Generation was audited.",
 
 	UnsafeHostExecAckPrompt:         "MAKEWAND_UNSAFE_HOST_EXEC=1 is set.\n\nThis disables sandbox isolation: AI-generated commands (dependency installs, tests, auto-fix retries, preview scripts) will run DIRECTLY on this machine with your user account and environment. A malicious or buggy generated command can read or modify your files and use your credentials. You accept full responsibility for what those commands do.\n\nThis one-time acknowledgment is recorded in your makewand config for this machine (risk statement v%d). Every host execution is written to the audit log.\n\nType \"yes\" to accept, anything else to decline: ",
 	UnsafeHostExecAckConfirmed:      "Unsafe host execution acknowledged and recorded. Every host execution will be audited.",
@@ -594,6 +598,8 @@ var zh = Messages{
 	AutopilotApprovalRequired:               "自动驾驶需要配置独立验收并达到验证强度 2 才能自动应用。本地检查只有强度 1，仍需要你确认。",
 	ApprovalModeAutopilotNote:               "说明：自动驾驶会根据本地检查（强度 1）对候选排序。配置的独立验收通过并达到强度 2 后才会自动应用，其余写入仍请求你批准。",
 	HostCLIExecNotice:                       "提示：%s CLI 在本机（%s）以你的环境和凭据运行——生成阶段没有沙箱。处理不可信仓库请注意（详见 SECURITY.md）。",
+	HostCLISandboxedNotice:                  "提示：%s CLI 在 Bubblewrap 沙箱内运行（%s），已隔离环境变量与宿主凭据。",
+	HostCLIUnsandboxedNotice:                "警告：%s CLI 在 MAKEWAND_UNSAFE_HOST_EXEC 授权下直接在宿主机（%s）未沙箱化运行——生成阶段没有沙箱。已记录审计日志。",
 
 	UnsafeHostExecAckPrompt:         "检测到 MAKEWAND_UNSAFE_HOST_EXEC=1。\n\n这会关闭沙箱隔离：AI 生成的命令（依赖安装、测试、自动修复重试、预览脚本）将以你的用户账户和环境【直接在本机执行】。恶意或有缺陷的生成命令可以读写你的文件、使用你的凭据。你需要对这些命令的行为承担全部责任。\n\n本次一次性确认将记录在本机的 makewand 配置中（风险声明 v%d）。每一次宿主执行都会写入审计日志。\n\n输入 \"yes\" 接受，输入其他内容拒绝：",
 	UnsafeHostExecAckConfirmed:      "已确认并记录不安全宿主执行授权。每次宿主执行都会被审计。",

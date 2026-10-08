@@ -93,6 +93,7 @@ func (a App) submitChatInput(input string) (tea.Model, tea.Cmd) {
 	task := classifyTask(input)
 
 	ctx, cancel := context.WithTimeout(context.Background(), chatStreamTimeout)
+	ctx = a.contextWithHostExecAuth(ctx)
 	a.cancelAI = cancel
 
 	if a.shouldUseAutopilotChatCandidates(task) {

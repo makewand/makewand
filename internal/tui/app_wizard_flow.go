@@ -25,6 +25,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 			a = a.applyBudgetRoutingPolicy()
 
 			ctx, cancel := context.WithCancel(context.Background())
+			ctx = a.contextWithHostExecAuth(ctx)
 			a.cancelAI = cancel
 			router := a.router
 
@@ -141,6 +142,7 @@ func (a App) handleWizardEnter() (tea.Model, tea.Cmd) {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
+		ctx = a.contextWithHostExecAuth(ctx)
 		a.cancelAI = cancel
 		router := a.router
 

@@ -139,9 +139,13 @@ func (a App) noteHostCLIExec(provider string) App {
 	if a.project != nil && strings.TrimSpace(a.project.Path) != "" {
 		wd = a.project.Path
 	}
+	notice := fmt.Sprintf(i18n.Msg().HostCLISandboxedNotice, provider, wd)
+	if a.hostExecAuth.Acknowledged {
+		notice = fmt.Sprintf(i18n.Msg().HostCLIUnsandboxedNotice, provider, wd)
+	}
 	a.chat.AddMessage(ChatMessage{
 		Role:    "system",
-		Content: fmt.Sprintf(i18n.Msg().HostCLIExecNotice, provider, wd),
+		Content: notice,
 	})
 	return a
 }
@@ -391,6 +395,7 @@ func (a App) startCodeReview() (tea.Model, tea.Cmd) {
 	proj := a.project
 	router := a.router
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx = a.contextWithHostExecAuth(ctx)
 	a.cancelAI = cancel
 	cmds = append(cmds, func() tea.Msg {
 		defer cancel()
@@ -976,6 +981,7 @@ func (a App) handleAutoFix(msg autoFixMsg) (tea.Model, tea.Cmd) {
 	codeProvider := a.pipeline.CodeProvider()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx = a.contextWithHostExecAuth(ctx)
 	a.cancelAI = cancel
 	return a, func() tea.Msg {
 		defer cancel()
