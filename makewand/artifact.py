@@ -8,7 +8,11 @@ from pathlib import Path
 
 # Tool caches are not source inputs or candidate deliverables. Existing source
 # files elsewhere, new files, deletions, links and mode changes are all checked.
-CACHE_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".makewand", ".venv", "venv", "target"}
+CACHE_DIRS = {
+    ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "node_modules", ".makewand", ".venv", "venv", "target", ".hypothesis",
+    ".tox", ".nox", ".nyc_output", "htmlcov",
+}
 
 try:
     from makewand.constants import PROJECT_IGNORE_DIRS
@@ -18,7 +22,7 @@ except ImportError:
         ".git", "node_modules", "vendor", "target", "dist", "build",
         ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv",
         "env", ".coverage", ".tox", ".idea", ".vscode", "site-packages",
-        ".makewand_sandbox_home"
+        ".makewand_sandbox_home", ".hypothesis", ".nox", ".nyc_output", "htmlcov",
     }
 
 # Stat cache to avoid re-reading and re-hashing unmodified files across repeated snapshots:
