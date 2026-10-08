@@ -295,18 +295,6 @@ func (t *strategyTables) mergeOverrides(raw rawDefaults) error {
 		t.costs[id] = entry
 	}
 
-	// Ensure any newly added model IDs in models have a fallback zero cost entry
-	// if not explicitly defined in costs or built-in defaults.
-	for _, tiers := range t.models {
-		for _, modelID := range tiers {
-			if modelID != "" {
-				if _, ok := t.costs[modelID]; !ok {
-					t.costs[modelID] = costEntry{Input: 0, Output: 0}
-				}
-			}
-		}
-	}
-
 	// Strategies: field-level merge per (mode, task). Overriding only the
 	// providers keeps the existing tier, and vice versa.
 	for modeName, tasks := range raw.Strategies {
@@ -458,25 +446,59 @@ func (t *strategyTables) replace(candidate *strategyTables) {
 	t.mu.Unlock()
 }
 
-// loadUserOverrides loads user-customized routing tables from configDir/routing.json.
+// loadUserOverrides loads user-customized routing tables from configDir/routing.json
+// and dynamically discovered models from configDir/discovered.json over built-in defaults.
 // Missing file is not an error (the snapshot is left unchanged). Fields present
-// in the override file are deep-merged over a fresh copy of the immutable
-// built-in defaults (see applyOverrides) and the result replaces the snapshot,
-// so overrides applied by an earlier call are discarded; absent fields keep
-// their built-in defaults. Invalid overrides leave the snapshot unchanged and
-// return the error.
+// in the override files are deep-merged over a fresh copy of the immutable
+// built-in defaults (discovered.json first, then routing.json taking precedence)
+// and the result replaces the snapshot, so overrides applied by an earlier call
+// are discarded; absent fields keep their built-in defaults. Invalid overrides
+// leave the snapshot unchanged and return the error.
 func (t *strategyTables) loadUserOverrides(configDir string) error {
-	path := filepath.Join(configDir, "routing.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	discPath := filepath.Join(configDir, "discovered.json")
+	discData, discErr := os.ReadFile(discPath)
+	userPath := filepath.Join(configDir, "routing.json")
+	userData, userErr := os.ReadFile(userPath)
+
+	if os.IsNotExist(discErr) && os.IsNotExist(userErr) {
+		return nil
+	}
+	if discErr != nil && !os.IsNotExist(discErr) {
+		return discErr
+	}
+	if userErr != nil && !os.IsNotExist(userErr) {
+		return userErr
+	}
+
+	candidate := baseTables.copy()
+
+	// 1. Merge discovered.json first if present (lower priority than user routing.json)
+	if discErr == nil {
+		discRaw, err := decodeRawDefaults(discData)
+		if err == nil {
+			_ = candidate.mergeOverrides(discRaw)
 		}
-		return err
 	}
-	if err := t.applyOverrides(data); err != nil {
-		return fmt.Errorf("routing.json: %w", err)
+
+	// 2. Merge routing.json second if present (user manual overrides take precedence)
+	if userErr == nil {
+		userRaw, err := decodeRawDefaults(userData)
+		if err != nil {
+			return fmt.Errorf("routing.json: %w", err)
+		}
+		if err := candidate.mergeOverrides(userRaw); err != nil {
+			return fmt.Errorf("routing.json: %w", err)
+		}
 	}
+
+	if err := candidate.validate(); err != nil {
+		if userErr == nil {
+			return fmt.Errorf("routing.json: %w", err)
+		}
+		return fmt.Errorf("discovered.json: %w", err)
+	}
+
+	t.replace(candidate)
 	return nil
 }
 
@@ -656,8 +678,12 @@ func (t *strategyTables) validateLocked() error {
 		}
 	}
 
-	// 3. Every model ID in models must have a costs entry.
+	// 3. Every model ID in models for API providers (claude, gemini, openai) must have a costs entry.
+	apiProviders := map[string]bool{"claude": true, "gemini": true, "openai": true}
 	for prov, tiers := range t.models {
+		if !apiProviders[prov] {
+			continue
+		}
 		for tier, modelID := range tiers {
 			if modelID == "" {
 				continue
