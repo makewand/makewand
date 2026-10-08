@@ -80,6 +80,52 @@ class DeliveryLimitsTests(unittest.TestCase):
         with patch.dict(os.environ, {"MAKEWAND_DELIVERY_MAX_BYTES": "invalid"}):
             self.assertTrue(check_delivery_state(frozen))
 
+    def test_heavy_dependency_dir_pruned_and_does_not_hit_entry_limit(self):
+        nm = self.root / "node_modules"
+        for i in range(15):
+            pkg = nm / f"pkg_{i}"
+            pkg.mkdir(parents=True)
+            (pkg / "index.js").write_text("console.log(1);\n")
+        # max_entries is 5, but node_modules contains 30+ items.
+        # Pruning should ensure only "app.txt" and "node_modules" are counted.
+        frozen = capture_delivery_baseline(self.root, limits={"max_entries": 5, "max_bytes": 1024 * 1024, "max_seconds": 10})
+        self.assertIn("node_modules", frozen["entries"])
+        self.assertEqual(frozen["entries"]["node_modules"][0], "dir")
+        self.assertNotIn("node_modules/pkg_0", frozen["entries"])
+        self.assertTrue(check_delivery_state(frozen))
+
+    def test_unreadable_ignored_directory_does_not_crash_baseline(self):
+        unreadable = self.root / "unreadable_dir"
+        unreadable.mkdir()
+        try:
+            unreadable.chmod(0o000)
+            frozen = capture_delivery_baseline(self.root)
+            self.assertIn("unreadable_dir", frozen["entries"])
+            self.assertEqual(frozen["entries"]["unreadable_dir"][0], "dir")
+            self.assertEqual(frozen["entries"]["unreadable_dir"][1], 0)
+            self.assertTrue(check_delivery_state(frozen))
+        finally:
+            unreadable.chmod(0o755)
+
+    def test_unreadable_git_ignored_directory_does_not_crash_baseline(self):
+        from makewand.git_helper import run_git_cmd
+        run_git_cmd(["git", "init"], cwd=str(self.root))
+        run_git_cmd(["git", "config", "user.name", "Test"], cwd=str(self.root))
+        run_git_cmd(["git", "config", "user.email", "test@example.invalid"], cwd=str(self.root))
+        (self.root / ".gitignore").write_text("data/\n")
+        run_git_cmd(["git", "add", "app.txt", ".gitignore"], cwd=str(self.root))
+        run_git_cmd(["git", "commit", "-m", "init"], cwd=str(self.root))
+        postgres = self.root / "data/postgres"
+        postgres.mkdir(parents=True)
+        try:
+            postgres.chmod(0o000)
+            frozen = capture_delivery_baseline(self.root)
+            self.assertIn("data/postgres", frozen["entries"])
+            self.assertEqual(frozen["entries"]["data/postgres"][0], "dir")
+            self.assertTrue(check_delivery_state(frozen))
+        finally:
+            postgres.chmod(0o755)
+
 
 class DeliveryScopedCheckpointTests(unittest.TestCase):
     def setUp(self):

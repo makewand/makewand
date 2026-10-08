@@ -996,16 +996,19 @@ def _run_pipeline_impl(
 
     task_baseline = None
 
-    def fail_and_cleanup(msg: str, status="FAILED") -> bool:
+    def fail_and_cleanup(msg: str, status="FAILED", preserve_shadow: bool = False) -> bool:
         if native_delivery is not None:
             shutil.rmtree(native_delivery["folder"], ignore_errors=True)
         if _outcome is not None:
             _outcome.update(status=status, error=msg)
         if is_shadow_active and cleanup_shadow:
-            try:
-                cleanup_shadow()
-            except Exception as exc:
-                print(c(f"⚠️ [Makewand Shadow] 影子工作树清理失败，请手动检查: {exc}", COLOR_YELLOW))
+            if preserve_shadow:
+                print(c(f"🛡️ [Makewand Shadow] 任务已完成代码实现或进入交付阶段，已保留独立工作树以防代码丢失: {cwd}", COLOR_YELLOW))
+            else:
+                try:
+                    cleanup_shadow()
+                except Exception as exc:
+                    print(c(f"⚠️ [Makewand Shadow] 影子工作树清理失败，请手动检查: {exc}", COLOR_YELLOW))
         elif host_txn is not None and host_txn.is_active:
             # Host mode: roll back only this task's changes (task-created paths are
             # removed, tracked files come from the baseline commit, pre-existing
@@ -2004,7 +2007,7 @@ def _run_pipeline_impl(
                     write_private_file(apply_script_file, "\n".join(script_lines) + "\n", mode=0o700)
 
             except Exception as e:
-                return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子分支交付发生异常 ({e})，拒绝交付。")
+                return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子分支交付发生异常 ({e})，拒绝交付。", preserve_shadow=True)
 
             repo_apply_root = delivery_baseline["root"] if native_delivery is None else str(repo_root or worktree_root)
             apply_root_esc = shlex.quote(repo_apply_root)
