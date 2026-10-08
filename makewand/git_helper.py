@@ -1709,7 +1709,7 @@ HEAVY_DIR_NAMES = frozenset({
     ".terraform",
 })
 # Regenerable caches that tests create; not worth a delivery warning.
-REGENERABLE_CACHE_NAMES = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+REGENERABLE_CACHE_NAMES = frozenset({".pytest_cache", ".mypy_cache", ".ruff_cache"})
 DEFAULT_BACKUP_FILE_LIMIT = 1024 * 1024
 DEFAULT_BACKUP_TOTAL_LIMIT = 50 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_ENTRIES = 300000
@@ -1935,9 +1935,30 @@ def _summarize_paths(paths: List[str], limit: int = 20) -> str:
     return shown + (f" …（另有 {len(paths) - limit} 项）" if len(paths) > limit else "")
 
 
-def _is_regenerable_cache(rel: str) -> bool:
+EXECUTABLE_OR_BINARY_EXTS = frozenset({".pyc", ".pyo", ".pyd", ".so", ".dylib", ".dll", ".exe", ".bin"})
+
+
+def _is_regenerable_cache(rel: str, root: Optional[str] = None) -> bool:
+    """
+    Determines whether rel is a legitimate regenerable compiler/test cache.
+    .pyc / .pyo files are ONLY considered regenerable cache if:
+      1. They reside directly inside a __pycache__ directory, AND
+      2. There is a matching .py source file in the directory containing __pycache__.
+    Loose .pyc files outside __pycache__ or orphan .pyc files with no matching source
+    are NOT regenerable cache and represent potential payload injection (#py-orch-2).
+    """
+    rel = rel.replace("\\", "/")
     parts = rel.split("/")
-    return any(part in REGENERABLE_CACHE_NAMES for part in parts[:-1]) or rel.endswith((".pyc", ".pyo"))
+    if len(parts) >= 2 and parts[-2] == "__pycache__" and rel.endswith((".pyc", ".pyo")):
+        filename = parts[-1]
+        stem = filename.split(".", 1)[0]
+        parent_parts = parts[:-2]
+        py_rel = "/".join(parent_parts + [f"{stem}.py"]) if parent_parts else f"{stem}.py"
+        if root:
+            py_path = os.path.join(root, py_rel)
+            return os.path.isfile(py_path)
+        return True
+    return any(part in REGENERABLE_CACHE_NAMES for part in parts[:-1])
 
 
 class HostWorkspaceTransaction:
@@ -2439,6 +2460,22 @@ class HostWorkspaceTransaction:
             if code != 0 or head.strip() != self.baseline_commit:
                 problems.append("HEAD 未能回到任务基线提交")
 
+    def _purge_transient_pyc_files(self, current: Dict[str, FsEntry], problems: List[str]) -> None:
+        """
+        Purges legitimate transient .pyc / .pyo files generated during task execution/tests.
+        Only purges files that qualify as regenerable cache (in __pycache__ with matching .py source).
+        Orphan or loose .pyc files remain in current to trigger security blocking (#py-orch-2).
+        """
+        for rel, entry in list(current.items()):
+            if rel.endswith((".pyc", ".pyo")) and _is_regenerable_cache(rel, self.root):
+                pre_entry = self.pre.get(rel)
+                if pre_entry is None or not _same_entry(entry, pre_entry):
+                    try:
+                        _unlink_at(self.root, rel)
+                        current.pop(rel, None)
+                    except OSError as exc:
+                        problems.append(f"无法清除任务生成的字节码缓存 {rel}: {exc}")
+
     # -- success path -------------------------------------------------------
     def finalize_success(self) -> None:
         if self.state != "active":
@@ -2451,8 +2488,12 @@ class HostWorkspaceTransaction:
             scan_errors: List[str] = []
             current = scan_workspace_tree(self.root, strict=False, errors=scan_errors)
             notes.extend(f"交付核查扫描: {msg}" for msg in scan_errors)
+
+            # Purge transient .pyc/.pyo generated during task execution/tests
+            self._purge_transient_pyc_files(current, problems)
+
             changed = [rel for rel, entry in sorted(self.pre.items())
-                       if entry.kind != "dir" and rel not in self.tracked and not _is_regenerable_cache(rel)
+                       if entry.kind != "dir" and rel not in self.tracked and not _is_regenerable_cache(rel, self.root)
                        and not _same_entry(current.get(rel), entry)]
             new_paths = [rel for rel, entry in current.items() if rel not in self.pre and entry.kind != "dir"]
             reviewed: set = set()
@@ -2464,12 +2505,32 @@ class HostWorkspaceTransaction:
                 else:
                     notes.append("无法判定文件是否被 .gitignore 忽略，以下文件均按未审查处理")
             changed = [rel for rel in changed if rel not in reviewed]
-            new_ignored = sorted(rel for rel in new_paths if rel not in reviewed and not _is_regenerable_cache(rel))
+            new_ignored = sorted(rel for rel in new_paths if rel not in reviewed and not _is_regenerable_cache(rel, self.root))
             if changed:
                 detail = [f"{p}（未备份: {self.unbacked[p]}）" if p in self.unbacked else p for p in changed]
-                warnings_out.append(f"任务前已存在、被 .gitignore 忽略的文件被修改或删除: {_summarize_paths(detail)}")
+                problems.append(f"安全阻断：任务前已存在但被 .gitignore 忽略的文件被篡改或删除（未纳入审查）: {_summarize_paths(detail)}")
             if new_ignored:
-                warnings_out.append(f"本次任务新建了被 .gitignore 忽略的文件: {_summarize_paths(new_ignored)}")
+                problems.append(f"安全阻断：本次任务新建了被 .gitignore 忽略的文件（未纳入审查）: {_summarize_paths(new_ignored)}")
+
+            # Check for any remaining rogue binary/executable artifacts in current workspace not in reviewed diff
+            rogue_executables = [
+                rel for rel in current
+                if any(rel.endswith(ext) for ext in EXECUTABLE_OR_BINARY_EXTS) and rel not in reviewed
+            ]
+            if rogue_executables:
+                problems.append(f"安全阻断：工作区存在未审查的可执行或二进制产物: {_summarize_paths(sorted(rogue_executables))}")
+
+            if problems:
+                self.state = "rolling_back"
+                rollback_problems: List[str] = []
+                try:
+                    self._rollback_steps("安全阻断交付并回滚: " + "; ".join(problems), rollback_problems, notes)
+                except Exception as exc:  # noqa: BLE001
+                    rollback_problems.append(f"安全阻断回滚异常: {type(exc).__name__}: {exc}")
+                problems.extend(rollback_problems)
+                self._finish(False, problems, notes, rollback=True)
+                return
+
             if self.created_git:
                 self._save_nongit_delivery(problems, notes)
             keep_backups = any(p in self.backups for p in changed)
@@ -2479,6 +2540,16 @@ class HostWorkspaceTransaction:
                 self._discard_backups()
         except Exception as exc:  # noqa: BLE001 - reported below
             problems.append(f"交付收尾发生异常: {type(exc).__name__}: {exc}")
+            self.state = "rolling_back"
+            rollback_problems = []
+            try:
+                self._rollback_steps("交付异常中断并回滚: " + str(exc), rollback_problems, notes)
+            except Exception as r_exc:  # noqa: BLE001
+                rollback_problems.append(f"交付异常回滚出错: {type(r_exc).__name__}: {r_exc}")
+            problems.extend(rollback_problems)
+            self._finish(False, problems, notes, rollback=True)
+            return
+
         if warnings_out:
             print(c("⚠️ [Makewand Transaction] 以下改动不在审查 diff 中（被 .gitignore 忽略），请人工核查：", COLOR_YELLOW))
             for line in warnings_out:
@@ -2536,7 +2607,10 @@ class HostWorkspaceTransaction:
         if rollback and not problems:
             print(c("🛡️ [Makewand Transaction] 已回滚本次任务的全部改动并逐项核验，工作区已恢复基线。", COLOR_YELLOW))
         elif problems:
-            title = "回滚未能完全恢复任务前状态" if rollback else "交付收尾存在问题"
+            if rollback:
+                title = "交付核验触发安全阻断并已执行回滚" if any("安全阻断" in p for p in problems) else "回滚未能完全恢复任务前状态"
+            else:
+                title = "交付收尾存在问题"
             print(c(f"⚠️ [Makewand Transaction] {title}，请人工检查：", COLOR_RED))
             for line in problems[:30]:
                 print(c(f"   • {line}", COLOR_RED))
