@@ -118,13 +118,11 @@ func LoadRepoContextWithOptions(projectDir string, files []FileEntry, opts RepoC
 		if !keyFileNames[base] {
 			continue
 		}
-		// In untrusted mode, never read through a symlink or non-regular file, and
-		// never read a file whose resolved path escapes the project root. An
-		// attacker's repo could ship a key file symlinked to .makewand/rules.md
-		// (bypassing the untrusted rules ban) or to a host secret such as
-		// ~/.ssh/id_rsa; its first lines would otherwise be injected verbatim into
-		// the system prompt (instruction injection + host-file exfiltration).
-		if opts.UntrustedRepo && !isSafeRegularFile(projectDir, f.Path) {
+		// Reject non-regular files and symlinks that escape the project directory.
+		// In untrusted mode, symlinks are strictly rejected (must be a regular file).
+		// In trusted mode, symlinks are permitted only if their fully resolved target
+		// stays strictly within the project directory, preventing host secret exfiltration (~/.ssh/id_rsa, /etc/passwd).
+		if !isSafeContextFile(projectDir, f.Path, opts.UntrustedRepo) {
 			continue
 		}
 		if hint := readFirstLines(filepath.Join(projectDir, f.Path), fileHintLines); hint != "" {
@@ -132,20 +130,17 @@ func LoadRepoContextWithOptions(projectDir string, files []FileEntry, opts RepoC
 		}
 	}
 
-	// Extract symbols. In untrusted mode, restrict extraction to safe regular
-	// in-root files so it never reads through an attacker's symlink either.
-	symbolFiles := files
-	if opts.UntrustedRepo {
-		symbolFiles = make([]FileEntry, 0, len(files))
-		for _, f := range files {
-			if f.IsDir {
-				continue
-			}
-			if !isSafeRegularFile(projectDir, f.Path) {
-				continue
-			}
-			symbolFiles = append(symbolFiles, f)
+	// Extract symbols. Restrict extraction to safe in-root regular files (or in-root
+	// symlinks in trusted mode) so symbol extraction never reads through an escaping symlink.
+	symbolFiles := make([]FileEntry, 0, len(files))
+	for _, f := range files {
+		if f.IsDir {
+			continue
 		}
+		if !isSafeContextFile(projectDir, f.Path, opts.UntrustedRepo) {
+			continue
+		}
+		symbolFiles = append(symbolFiles, f)
 	}
 	rc.Symbols = ExtractSymbols(projectDir, symbolFiles)
 
@@ -176,6 +171,45 @@ func isSafeRegularFile(projectDir, relPath string) bool {
 		return false
 	}
 	return isWithinDir(projectAbs, resolved)
+}
+
+// isSafeContextFile reports whether relPath within projectDir is safe to read
+// for repo context and symbol extraction.
+// In untrusted mode, symlinks and non-regular entries are strictly rejected.
+// In trusted mode, symlinks are followed only if their fully-resolved target is a regular file
+// that stays strictly within projectDir, preventing planted symlinks from exfiltrating host secrets
+// (~/.ssh/id_rsa, /etc/passwd) into the prompt context in any mode.
+func isSafeContextFile(projectDir, relPath string, untrusted bool) bool {
+	if untrusted {
+		return isSafeRegularFile(projectDir, relPath)
+	}
+
+	fullPath := filepath.Join(projectDir, relPath)
+	info, err := os.Lstat(fullPath)
+	if err != nil {
+		return false
+	}
+	// Direct device, socket, pipe, or directory entries are never context files.
+	if info.Mode()&(os.ModeDevice|os.ModeNamedPipe|os.ModeSocket|os.ModeDir) != 0 {
+		return false
+	}
+
+	resolved, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		return false
+	}
+	projectAbs, err := filepath.Abs(projectDir)
+	if err != nil {
+		return false
+	}
+	if !isWithinDir(projectAbs, resolved) {
+		return false
+	}
+	resolvedInfo, err := os.Stat(resolved)
+	if err != nil || !resolvedInfo.Mode().IsRegular() {
+		return false
+	}
+	return true
 }
 
 // readFirstLines reads the first n lines from a file, returning them joined.
