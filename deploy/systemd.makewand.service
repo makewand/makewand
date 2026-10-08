@@ -17,7 +17,8 @@ StateDirectoryMode=0700
 WorkingDirectory=/srv/makewand
 # ProtectHome=true hides /home, so keep HOME and the makewand config directory
 # (config.json, routing stats, provider CLI logins) in the state directory too.
-Environment=HOME=/var/lib/makewand
+# Keep CLI agent HOME in a distinct subdirectory from the server data-dir.
+Environment=HOME=/var/lib/makewand/home
 Environment=MAKEWAND_CONFIG_DIR=/var/lib/makewand/config
 # Secrets such as provider API keys; readable only, never written by the server.
 EnvironmentFile=/etc/makewand/makewand.env

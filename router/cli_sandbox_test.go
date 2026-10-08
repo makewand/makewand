@@ -387,6 +387,32 @@ func TestSanitizeCLIEnv(t *testing.T) {
 	if strings.Contains(agyStr, "OPENAI_API_KEY") || strings.Contains(agyStr, "ANTHROPIC_API_KEY") {
 		t.Errorf("foreign provider keys not filtered for antigravity: %s", agyStr)
 	}
+
+	// 5. Server environment variables must be filtered out for all providers.
+	serverEnv := []string{
+		"PATH=/usr/bin:/bin",
+		"MAKEWAND_SERVER_AUTH_CONFIG=/var/lib/makewand/server_auth.json",
+		"MAKEWAND_DATA_DIR=/var/lib/makewand",
+		"MAKEWAND_CONFIG_DIR=/var/lib/makewand/config",
+		"MAKEWAND_AUTH_CONFIG=/etc/makewand/server_auth.json",
+		"MAKEWAND_ADMIN_SESSION_SECRET=supersecret",
+		"MAKEWAND_STATE_DB=/var/lib/makewand/state.db",
+		"ANTHROPIC_API_KEY=sk-ant-testkey",
+	}
+	filteredServerEnv := sanitizeCLIEnv("claude", serverEnv)
+	filteredStr := strings.Join(filteredServerEnv, "\n")
+	for _, secretKey := range []string{
+		"MAKEWAND_SERVER_AUTH_CONFIG",
+		"MAKEWAND_DATA_DIR",
+		"MAKEWAND_CONFIG_DIR",
+		"MAKEWAND_AUTH_CONFIG",
+		"MAKEWAND_ADMIN_SESSION_SECRET",
+		"MAKEWAND_STATE_DB",
+	} {
+		if strings.Contains(filteredStr, secretKey) {
+			t.Errorf("expected %s to be filtered from CLI environment, got:\n%s", secretKey, filteredStr)
+		}
+	}
 }
 
 func TestWrapCLICommandWithSandbox_SanitizesEnv(t *testing.T) {
@@ -567,5 +593,110 @@ func TestWrapCLICommandWithSandbox_LocalAndHomeBinLayoutsDoNotExposeSecrets(t *t
 				t.Errorf("CLI sandbox re-bound HOME in ~/bin layout: %v", wrappedB.Args)
 			}
 		}
+	}
+}
+
+func TestWrapCLICommandWithSandbox_SystemdServiceLayout_HomeOutsideHome(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout test")
+	}
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	// Service layout where data-dir is /var/lib/makewand, and HOME is /var/lib/makewand/cli-home
+	serviceDataDir := filepath.Join("/var", "lib", "makewand")
+	serviceHome := filepath.Join(serviceDataDir, "cli-home")
+	t.Setenv("HOME", serviceHome)
+
+	ws := t.TempDir()
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+
+	args := strings.Join(wrapped.Args, " ")
+	if !strings.Contains(args, "--tmpfs "+serviceHome) {
+		t.Errorf("expected service home %s outside /home to be masked with --tmpfs, got: %v", serviceHome, wrapped.Args)
+	}
+}
+
+func TestWrapCLICommandWithSandbox_RemoteOriginReadOnlyCredentials(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout test")
+	}
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	claudeDir := filepath.Join(fakeHome, ".claude")
+	_ = os.MkdirAll(claudeDir, 0o700)
+	_ = os.WriteFile(filepath.Join(fakeHome, ".claude.json"), []byte("{}"), 0o600)
+
+	ws := t.TempDir()
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+
+	remoteCtx := ContextWithRemoteOrigin(context.Background())
+	wrapped, err := wrapCLICommandWithSandbox(remoteCtx, "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+
+	args := strings.Join(wrapped.Args, " ")
+	// In remote origin, HOME must be masked with tmpfs even if under /tmp
+	if !strings.Contains(args, "--tmpfs "+fakeHome) {
+		t.Errorf("expected remote origin to mask fakeHome with --tmpfs, got: %v", wrapped.Args)
+	}
+	// Provider credentials must be bound with --ro-bind, not --bind
+	if !strings.Contains(args, "--ro-bind "+claudeDir+" "+claudeDir) {
+		t.Errorf("expected active provider credentials to be bound read-only in remote origin, got: %v", wrapped.Args)
+	}
+	if strings.Contains(args, "--bind "+claudeDir+" "+claudeDir) {
+		t.Errorf("expected active provider credentials NOT to be bound read-write in remote origin: %v", wrapped.Args)
+	}
+}
+
+func TestWrapCLICommandWithSandbox_ServerDataAndSecretMasking(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout test")
+	}
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	fakeDataDir := t.TempDir()
+	fakeAuthFile := filepath.Join(t.TempDir(), "server_auth.json")
+	_ = os.WriteFile(fakeAuthFile, []byte(`{"tokens":[]}`), 0o600)
+
+	t.Setenv("MAKEWAND_DATA_DIR", fakeDataDir)
+	t.Setenv("MAKEWAND_SERVER_AUTH_CONFIG", fakeAuthFile)
+
+	ws := t.TempDir()
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+
+	args := strings.Join(wrapped.Args, " ")
+	if !strings.Contains(args, "--tmpfs "+fakeDataDir) {
+		t.Errorf("expected MAKEWAND_DATA_DIR %s to be masked with --tmpfs, got: %v", fakeDataDir, wrapped.Args)
+	}
+	if !strings.Contains(args, "--ro-bind /dev/null "+fakeAuthFile) {
+		t.Errorf("expected MAKEWAND_SERVER_AUTH_CONFIG %s to be masked with /dev/null, got: %v", fakeAuthFile, wrapped.Args)
 	}
 }
