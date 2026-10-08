@@ -263,6 +263,89 @@ class LocalTestsUnavailable(str):
     execution_status = "UNVERIFIED"
 
 
+def _filter_non_deliverable_test_changes(paths: List[str], cwd: str) -> List[str]:
+    """Filters out test output files, transient caches, and .gitignore-covered paths (#py-orch-5)."""
+    if not paths:
+        return []
+
+    ephemeral_names = frozenset({
+        ".coverage", "coverage.xml", "coverage.json", "coverage.lcov", "lcov.info",
+        "pytest.log", "test.log", "test-results", "test-reports", "test_reports",
+        "junit.xml", "report.xml", ".hypothesis", "htmlcov", "cov_html",
+        ".pytest_cache", ".tox", ".nox", ".mypy_cache", ".ruff_cache",
+        ".nyc_output", ".jest-cache", ".vitest-cache",
+    })
+    ephemeral_exts = frozenset({".log", ".tmp", ".coverage", ".pyc", ".pyo", ".cache"})
+
+    candidates = []
+    for p in paths:
+        parts = Path(p).parts
+        name = Path(p).name
+        if any(ign in parts for ign in ephemeral_names) or name in ephemeral_names:
+            continue
+        if any(name.startswith(ign) for ign in (".coverage", "coverage.", "pytest.", "test-results", "test_results", "test-report", "test_report")):
+            continue
+        if any(name.endswith(ext) for ext in ephemeral_exts):
+            continue
+        candidates.append(p)
+
+    if not candidates:
+        return []
+
+    # Check git check-ignore if inside git repository
+    try:
+        from makewand.git_helper import run_git_cmd
+        code, out, _ = run_git_cmd(
+            ["git", "check-ignore", "-z", "--stdin"],
+            cwd=cwd,
+            input_data=b"\0".join(os.fsencode(p) for p in candidates),
+            binary=True
+        )
+        if code == 0 and out:
+            ignored = {os.fsdecode(name) for name in out.split(b"\0") if name}
+            candidates = [p for p in candidates if p not in ignored]
+    except Exception:
+        pass
+
+    if not candidates:
+        return []
+
+    # Check .gitignore file directly (useful for non-git workspaces or shadow dirs)
+    gitignore_file = Path(cwd) / ".gitignore"
+    if gitignore_file.is_file():
+        try:
+            import fnmatch
+            patterns = []
+            for line in gitignore_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+            if patterns:
+                filtered = []
+                for p in candidates:
+                    p_name = Path(p).name
+                    p_posix = Path(p).as_posix()
+                    parts = Path(p).parts
+                    matched = False
+                    for pat in patterns:
+                        clean_pat = pat.rstrip("/")
+                        if (
+                            clean_pat in parts
+                            or fnmatch.fnmatch(p_name, pat)
+                            or fnmatch.fnmatch(p_posix, pat)
+                            or fnmatch.fnmatch(p_posix, f"*{clean_pat}*")
+                        ):
+                            matched = True
+                            break
+                    if not matched:
+                        filtered.append(p)
+                candidates = filtered
+        except Exception:
+            pass
+
+    return candidates
+
+
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
     Deterministically detects and runs local unit test suites in cwd inside Bubblewrap sandbox.
@@ -449,12 +532,9 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             if stdout.strip():
                 details.append(stdout.strip()[:500])
 
-    EPHEMERAL_TEST_ARTIFACTS = {
-        ".coverage", "coverage.xml", "pytest.log", "test-results",
-        ".hypothesis", "htmlcov", ".pytest_cache", ".tox", ".nox"
-    }
     try:
-        changed = changed_inputs(tested_inputs, workspace_snapshot(cwd), ignore_names=EPHEMERAL_TEST_ARTIFACTS)
+        raw_changed = changed_inputs(tested_inputs, workspace_snapshot(cwd))
+        changed = _filter_non_deliverable_test_changes(raw_changed, cwd)
     except OSError as exc:
         return False, f"无法复核测试输入: {exc}"
     if changed:

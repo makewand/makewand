@@ -25,6 +25,10 @@ PROJECT_IGNORE_DIRS: Set[str] = {
     ".vscode",
     "site-packages",
     ".makewand_sandbox_home",
+    ".hypothesis",
+    ".nox",
+    ".nyc_output",
+    "htmlcov",
 }
 
 # Directories ignored by repository map parsing (including bytecode caches)
