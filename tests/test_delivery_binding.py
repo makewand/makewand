@@ -596,6 +596,25 @@ class DeliveryBindingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((child / "module.txt").read_text(), "reviewed module\n")
 
+    def test_delivery_exception_preserves_shadow_worktree(self):
+        cleaned_up = []
+
+        def shadow_cleanup():
+            cleaned_up.append(True)
+
+        shadow = ShadowWorktreeResult(
+            str(self.shadow), self.branch, shadow_cleanup,
+            baseline_commit=self.baseline, repo_head=git(self.base, "rev-parse", "HEAD"),
+            repo_root=str(self.base), worktree_root=str(self.shadow),
+            sub_baselines=self.sub_baselines)
+
+        with patch("makewand.delivery.capture_delivery_baseline", side_effect=RuntimeError("delivery baseline exploded")), \
+             patch.object(orch, "create_ephemeral_shadow_worktree", return_value=shadow):
+            success = self.run_pipeline()
+            self.assertFalse(success)
+            self.assertEqual(cleaned_up, [], "Shadow worktree cleanup must NOT be invoked when delivery raises an exception")
+
+
 
 def _has_pytest():
     try:

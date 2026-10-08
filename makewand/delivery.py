@@ -187,6 +187,39 @@ def _git_state(path, budget):
             os.fsdecode(symbolic.stdout).strip() if symbolic.returncode == 0 else None]
 
 
+HEAVY_DEPENDENCY_DIRS = frozenset({
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    "target",
+    "build",
+    "dist",
+    ".tox",
+})
+
+
+def _ignored_entries(root, budget):
+    """Query git for ignored directories under root."""
+    try:
+        command = _git_command(root) + ["ls-files", "-z", "--others", "-i", "--exclude-standard", "--directory"]
+        env = _git_environment()
+        timeout = budget.remaining() if hasattr(budget, "remaining") else MAX_SECONDS
+        result = subprocess.run(command, env=env, capture_output=True, timeout=timeout)
+        if result.returncode != 0:
+            return set()
+        ignored_dirs = set()
+        for item in result.stdout.split(b"\0"):
+            if not item:
+                continue
+            decoded = os.fsdecode(item)
+            if decoded.endswith("/") and decoded != "/":
+                ignored_dirs.add(decoded.rstrip("/"))
+        return ignored_dirs
+    except Exception:
+        return set()
+
+
 def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
     """Freeze all destination entries, including ignored files and empty dirs."""
     if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW")
@@ -196,13 +229,23 @@ def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
     entries, repositories = {}, {}
     limits = snapshot_limits(limits)
     budget = _SnapshotBudget(limits, timeout)
+    ignored_dirs = _ignored_entries(root, budget)
+
+    def _is_ignored(rel_path):
+        return rel_path in ignored_dirs or any(d and rel_path.startswith(d + "/") for d in ignored_dirs)
 
     def scan(directory, prefix):
         before_directory = os.fstat(directory)
         for name in sorted(os.listdir(directory)):
             budget.entry()
             relative = prefix + name
-            before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            try:
+                before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except PermissionError:
+                if _is_ignored(relative) or name in HEAVY_DEPENDENCY_DIRS:
+                    entries[relative] = ["dir", 0]
+                    continue
+                raise
             mode = stat.S_IMODE(before.st_mode)
             if name == ".git":
                 if not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)):
@@ -213,8 +256,25 @@ def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
                     "head": _git_state(os.path.join(root, repo), budget.remaining),
                 }
             elif stat.S_ISDIR(before.st_mode):
-                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                dir_fd=directory)
+                if name in HEAVY_DEPENDENCY_DIRS and (
+                    _is_ignored(relative) or name in ("node_modules", ".venv", "venv", ".tox")
+                ):
+                    entries[relative] = ["dir", mode]
+                    after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if _signature(after) != _signature(before):
+                        raise OSError("Delivery entry changed during inspection: " + relative)
+                    continue
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=directory)
+                except PermissionError:
+                    if _is_ignored(relative) or (before.st_mode & 0o400 == 0):
+                        entries[relative] = ["dir", mode]
+                        after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                        if _signature(after) != _signature(before):
+                            raise OSError("Delivery entry changed during inspection: " + relative)
+                        continue
+                    raise
                 try:
                     if _signature(os.fstat(child)) != _signature(before):
                         raise OSError("Delivery directory changed: " + relative)
