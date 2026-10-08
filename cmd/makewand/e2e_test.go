@@ -281,8 +281,8 @@ func TestE2EPrintUnsafeHostExecWithoutAckRefusesHostExecution(t *testing.T) {
 	}
 
 	stdout, stderr, err := runMakewandInDir(t, projectDir, bin, cfgDir, "--print", "--timeout=30s", "修复 calc.go，让 go test ./... 通过。只修改必要文件。")
-	if err != nil {
-		t.Fatalf("runMakewand(no-ack --print) error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	if err == nil {
+		t.Fatalf("runMakewand(no-ack --print) expected error due to fail-closed refusal, got nil\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
 	}
 	if !strings.Contains(stderr, "acknowledg") {
 		t.Fatalf("stderr = %q, want non-interactive acknowledgment refusal notice", stderr)

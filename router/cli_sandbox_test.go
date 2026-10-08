@@ -129,6 +129,9 @@ func TestWrapCLICommandWithSandbox_ActiveProviderCredentialsPreserved(t *testing
 }
 
 func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap fail-close; Windows required-sandbox refusal is exercised separately")
+	}
 	oldLookup := cliBwrapLookup
 	defer func() { cliBwrapLookup = oldLookup }()
 	cliBwrapLookup = func(file string) (string, error) {
@@ -137,14 +140,41 @@ func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
 
 	cmd := exec.Command("claude", "-p", "test")
 
-	// 1. Normal trusted context -> fallback gracefully
-	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	// 1. Normal trusted context (unspecified task or TaskCode) -> must fail closed when bwrap is missing
+	_, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err == nil {
+		t.Fatal("expected error in default writing context when bwrap is missing, got nil")
+	}
+
+	// 1b. Informational task (TaskExplain) -> falls back gracefully with sanitized env
+	explainCtx := ContextWithTask(context.Background(), TaskExplain)
+	wrappedExplain, err := wrapCLICommandWithSandbox(explainCtx, "claude", cmd)
 	if err != nil {
-		t.Fatalf("trusted context should fallback without error: %v", err)
+		t.Fatalf("TaskExplain context should fallback without error: %v", err)
 	}
-	if wrapped != cmd {
-		t.Errorf("expected original cmd on fallback, got %v", wrapped)
+	if wrappedExplain != cmd {
+		t.Errorf("expected original cmd on TaskExplain fallback, got %v", wrappedExplain)
 	}
+
+	// 1c. Authorized host execution (MAKEWAND_UNSAFE_HOST_EXEC=1 + ack) -> fallback allowed
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
+	authCtx := ContextWithUnsafeHostExecAuth(context.Background(), UnsafeHostExecAuth{Acknowledged: true, Source: "test"})
+	wrappedAuth, err := wrapCLICommandWithSandbox(authCtx, "claude", cmd)
+	if err != nil {
+		t.Fatalf("authorized host exec context should fallback without error: %v", err)
+	}
+	if wrappedAuth != cmd {
+		t.Errorf("expected original cmd on authorized host exec fallback, got %v", wrappedAuth)
+	}
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "")
+
+	// 1d. MAKEWAND_UNSAFE_HOST_EXEC=1 WITHOUT acknowledgment -> must fail closed
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
+	_, err = wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err == nil {
+		t.Fatal("expected error when MAKEWAND_UNSAFE_HOST_EXEC=1 without ack, got nil")
+	}
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "")
 
 	// 2. Remote origin -> fail close
 	remoteCtx := ContextWithRemoteOrigin(context.Background())
@@ -447,6 +477,9 @@ func TestWrapCLICommandWithSandbox_SanitizesEnv(t *testing.T) {
 }
 
 func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap probe failure; Windows required-sandbox refusal is exercised separately")
+	}
 	oldLookup := cliBwrapLookup
 	oldProbe := cliBwrapProbe
 	defer func() {
@@ -479,14 +512,20 @@ func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testi
 		t.Errorf("expected error message to contain probe failure details, got %v", err)
 	}
 
-	// 2. Trusted local context (sandbox optional) -> graceful fallback to unsandboxed command
-	trustedCtx := context.Background()
-	fallbackCmd, err := wrapCLICommandWithSandbox(trustedCtx, "claude", cmd)
+	// 2. Informational task (TaskExplain) -> graceful fallback to unsandboxed command
+	explainCtx := ContextWithTask(context.Background(), TaskExplain)
+	fallbackCmd, err := wrapCLICommandWithSandbox(explainCtx, "claude", cmd)
 	if err != nil {
-		t.Fatalf("expected nil error on trusted fallback, got %v", err)
+		t.Fatalf("expected nil error on TaskExplain fallback, got %v", err)
 	}
 	if fallbackCmd != cmd {
 		t.Errorf("expected direct execution cmd returned on fallback, got %v", fallbackCmd)
+	}
+
+	// 3. Default writing context without auth -> fails closed on probe failure
+	_, err = wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err == nil {
+		t.Fatalf("expected error on probe failure in default writing context, got nil")
 	}
 }
 

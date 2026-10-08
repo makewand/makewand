@@ -29,8 +29,8 @@ In makewand v3.1+, the **generation** stage is strongly sandboxed. When a subscr
   - 临时会话环境（如 `shell-snapshots`、`session-env`、`daemon`、`ide`）隔离在专属临时 tmpfs 中。
   - 认证凭据与日志只读提供订阅鉴权，禁止写入或覆盖篡改。
   - 其他 Provider 凭据、宿主 SSH 密钥（`~/.ssh`）、GPG（`~/.gnupg`）、云凭据（`~/.aws`、`~/.kube`）以及 Unix domain socket（Docker、ssh-agent）完全屏蔽不可见。
-- **Fail-Closed Sandbox Enforcement**: For writable generation tasks, bubblewrap is mandatory (`is_bwrap_available()` fail-closed check). If bwrap is unavailable, makewand refuses execution.
-  **失败即停沙箱契约**：对于有写入需求的代码生成任务，Bubblewrap 为强制依赖（`is_bwrap_available()` 校验失败即停）。若系统无可用 bwrap，拒绝执行。
+- **Fail-Closed Sandbox Enforcement**: For writable generation and code review tasks across both Python and Go router entrypoints (`makewand [prompt]`, `chat`, `--print`, `new`), bubblewrap sandbox isolation is mandatory. If `bwrap` is missing or probe fails, makewand fails closed and refuses execution unless `MAKEWAND_UNSAFE_HOST_EXEC=1` is explicitly set AND authenticated via a recorded one-time host acknowledgment. When authorized to fall back to the host, the process environment is strictly sanitized of foreign credentials/tokens and all host executions are audited to `unsafe_exec_audit.jsonl`.
+  **失败即停沙箱契约**：对于代码生成与审查任务，无论 Python 调度引擎还是 Go 路由入口（`makewand [prompt]`、`chat`、`--print`、`new`），Bubblewrap 沙箱物理隔离均为强制约束。若系统无可用 `bwrap` 或探测失败，除非显式设置 `MAKEWAND_UNSAFE_HOST_EXEC=1` 且已完成记录的一次性本机授权确认，否则一律失败即停（fail-closed）拒绝执行。即使经授权降级至宿主执行，也对环境变量执行严格凭据脱敏剥离，并将命令写入 `unsafe_exec_audit.jsonl` 审计日志。
 
 ### Guidance / 使用建议
 

@@ -2,11 +2,13 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -81,8 +83,170 @@ var cliProviderCredentials = map[string][]string{
 	"aider":       {".aider"},
 }
 
+// UnsafeHostExecAuth carries authorization for running unsandboxed on the host
+// when bubblewrap is unavailable.
+type UnsafeHostExecAuth struct {
+	Acknowledged bool
+	Source       string
+	Audit        func(command string, args []string, dir string)
+}
+
+type unsafeHostExecAuthKey struct{}
+
+// ContextWithUnsafeHostExecAuth returns a new context carrying UnsafeHostExecAuth.
+func ContextWithUnsafeHostExecAuth(ctx context.Context, auth UnsafeHostExecAuth) context.Context {
+	return context.WithValue(ctx, unsafeHostExecAuthKey{}, auth)
+}
+
+// UnsafeHostExecAuthFromContext retrieves the UnsafeHostExecAuth carried in ctx, if any.
+func UnsafeHostExecAuthFromContext(ctx context.Context) (UnsafeHostExecAuth, bool) {
+	if ctx == nil {
+		return UnsafeHostExecAuth{}, false
+	}
+	auth, ok := ctx.Value(unsafeHostExecAuthKey{}).(UnsafeHostExecAuth)
+	return auth, ok
+}
+
+// CLIExecRecord records whether an invocation was sandboxed or executed on the host.
+type CLIExecRecord struct {
+	Sandboxed  bool
+	UnsafeHost bool
+	Provider   string
+	Workspace  string
+}
+
+type cliExecObserverKey struct{}
+
+// CLIExecObserver observes whether a CLI invocation ran sandboxed or unsandboxed.
+type CLIExecObserver struct {
+	mu     sync.Mutex
+	record CLIExecRecord
+}
+
+func (o *CLIExecObserver) Record() CLIExecRecord {
+	if o == nil {
+		return CLIExecRecord{}
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.record
+}
+
+func (o *CLIExecObserver) set(r CLIExecRecord) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.record = r
+}
+
+// ContextWithCLIExecObserver attaches a CLIExecObserver to ctx.
+func ContextWithCLIExecObserver(ctx context.Context, obs *CLIExecObserver) context.Context {
+	return context.WithValue(ctx, cliExecObserverKey{}, obs)
+}
+
+func recordCLIExec(ctx context.Context, r CLIExecRecord) {
+	if ctx == nil {
+		return
+	}
+	if obs, ok := ctx.Value(cliExecObserverKey{}).(*CLIExecObserver); ok && obs != nil {
+		obs.set(r)
+	}
+}
+
+// isUnsafeHostExecAuthorized checks whether the caller has explicitly requested
+// and completed the one-time acknowledgment for MAKEWAND_UNSAFE_HOST_EXEC.
+// Remote origin contexts NEVER allow host execution (fail closed).
+func isUnsafeHostExecAuthorized(ctx context.Context) (bool, UnsafeHostExecAuth) {
+	if RemoteOriginFromContext(ctx) {
+		return false, UnsafeHostExecAuth{}
+	}
+	if os.Getenv("MAKEWAND_UNSAFE_HOST_EXEC") != "1" {
+		return false, UnsafeHostExecAuth{}
+	}
+	if auth, ok := UnsafeHostExecAuthFromContext(ctx); ok && auth.Acknowledged {
+		return true, auth
+	}
+	if valid, auth := checkDiskConfigHostExecAck(); valid {
+		return true, auth
+	}
+	return false, UnsafeHostExecAuth{}
+}
+
+func checkDiskConfigHostExecAck() (bool, UnsafeHostExecAuth) {
+	configDir := os.Getenv("MAKEWAND_CONFIG_DIR")
+	if configDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return false, UnsafeHostExecAuth{}
+		}
+		configDir = filepath.Join(home, ".config", "makewand")
+	}
+	cfgFile := filepath.Join(configDir, "config.json")
+	// #nosec G304, G703 -- configDir is operator/user local configuration, never an HTTP path or user identifier.
+	//nolint:gosec // G304, G703: configDir is operator/user local configuration, not request input.
+	data, err := os.ReadFile(cfgFile)
+	if err != nil {
+		return false, UnsafeHostExecAuth{}
+	}
+	var cfg struct {
+		UnsafeHostExecAckVersion int    `json:"unsafe_host_exec_ack_version"`
+		UnsafeHostExecAckHost    string `json:"unsafe_host_exec_ack_host"`
+		UnsafeHostExecAckAt      string `json:"unsafe_host_exec_ack_at"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return false, UnsafeHostExecAuth{}
+	}
+	if cfg.UnsafeHostExecAckVersion < 1 || strings.TrimSpace(cfg.UnsafeHostExecAckHost) == "" {
+		return false, UnsafeHostExecAuth{}
+	}
+	host, err := os.Hostname()
+	if err != nil || host != cfg.UnsafeHostExecAckHost {
+		return false, UnsafeHostExecAuth{}
+	}
+	return true, UnsafeHostExecAuth{
+		Acknowledged: true,
+		Source:       "config-ack",
+		Audit:        auditHostExecToConfigDir(configDir),
+	}
+}
+
+func auditHostExecToConfigDir(configDir string) func(command string, args []string, dir string) {
+	return func(command string, args []string, dir string) {
+		entry := struct {
+			Time    string   `json:"time"`
+			Context string   `json:"context"`
+			Command string   `json:"command"`
+			Args    []string `json:"args,omitempty"`
+			Dir     string   `json:"dir"`
+			Source  string   `json:"source"`
+		}{
+			Time:    time.Now().UTC().Format(time.RFC3339),
+			Context: "cli-provider",
+			Command: command,
+			Args:    args,
+			Dir:     dir,
+			Source:  "config-ack",
+		}
+		data, err := json.Marshal(entry)
+		if err != nil {
+			return
+		}
+		auditPath := filepath.Join(configDir, "unsafe_exec_audit.jsonl")
+		// #nosec G304, G703 -- configDir is operator/user local configuration, never an HTTP path or user identifier.
+		//nolint:gosec // G304, G703: configDir is operator/user local configuration, not request input.
+		f, err := os.OpenFile(auditPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return
+		}
+		_, _ = f.Write(append(data, '\n'))
+		_ = f.Close()
+	}
+}
+
 // isCLISandboxRequired reports whether execution MUST be sandboxed because the
-// context is untrusted or restricted.
+// context is untrusted, restricted, or performing a review/writing task.
 func isCLISandboxRequired(ctx context.Context) bool {
 	if RemoteOriginFromContext(ctx) {
 		return true
@@ -90,13 +254,24 @@ func isCLISandboxRequired(ctx context.Context) bool {
 	if os.Getenv("MAKEWAND_RESTRICTED") == "1" || os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
 		return true
 	}
-	if os.Getenv("MAKEWAND_UNSAFE_HOST_EXEC") == "1" {
+	// If unsafe host execution has been explicitly authorized (MAKEWAND_UNSAFE_HOST_EXEC=1 + ack),
+	// the mandatory sandbox gate is relaxed.
+	if authorized, _ := isUnsafeHostExecAuthorized(ctx); authorized {
 		return false
 	}
 	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
 		return true
 	}
-	return false
+	// Writing / code generation tasks require sandbox by default
+	if task, ok := TaskFromContext(ctx); ok {
+		if task == TaskCode || task == TaskFix {
+			return true
+		}
+		// Read-only analysis or explain may fall back to host with sanitized environment
+		return false
+	}
+	// Unspecified task defaults to TaskCode (writing/generation) -> fail closed
+	return true
 }
 
 func cliPathWithin(base, target string) bool {
@@ -678,24 +853,80 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		return nil, errors.New("cannot sandbox nil command")
 	}
 
+	bwrapMissing := false
+	var bwrapErr error
+
 	bwrapPath, err := cliBwrapLookup("bwrap")
 	if err != nil || os.Getenv("MAKEWAND_NO_BWRAP") == "1" {
-		if isCLISandboxRequired(ctx) {
-			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
-				"bubblewrap (bwrap) required for sandboxed execution in untrusted or restricted context, but not found", err)
+		bwrapMissing = true
+		bwrapErr = err
+		if bwrapErr == nil && os.Getenv("MAKEWAND_NO_BWRAP") == "1" {
+			bwrapErr = errors.New("bubblewrap disabled by MAKEWAND_NO_BWRAP=1")
 		}
-		return cmd, nil
+	} else if cliBwrapProbe != nil {
+		if probeErr := cliBwrapProbe(bwrapPath); probeErr != nil {
+			bwrapMissing = true
+			bwrapErr = probeErr
+		}
 	}
 
-	if cliBwrapProbe != nil {
-		if probeErr := cliBwrapProbe(bwrapPath); probeErr != nil {
-			if isCLISandboxRequired(ctx) {
+	if bwrapMissing {
+		if runtime.GOOS == "windows" {
+			if RemoteOriginFromContext(ctx) || os.Getenv("MAKEWAND_RESTRICTED") == "1" || os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
 				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
-					probeErr.Error(), probeErr)
+					"bubblewrap (bwrap) required for sandboxed execution in untrusted or restricted context, but not found", errors.New("bubblewrap not supported on windows"))
 			}
-			// In local trusted mode without mandatory sandbox requirement, gracefully fallback to unsandboxed execution
+			// Bubblewrap is Linux-only. On Windows, process tree management and bounded resources
+			// are enforced via Windows Job Objects (processjob). We sanitize credentials and audit
+			// as required by the native Windows contract.
+			cmd.Env = sanitizeCLIEnv(provider, cmd.Env)
+			if _, auth := isUnsafeHostExecAuthorized(ctx); auth.Audit != nil {
+				cmdPath := cmd.Path
+				if cmdPath == "" && len(cmd.Args) > 0 {
+					cmdPath = cmd.Args[0]
+				}
+				auth.Audit(cmdPath, cmd.Args, cmd.Dir)
+			}
+			recordCLIExec(ctx, CLIExecRecord{
+				Sandboxed:  false,
+				UnsafeHost: true,
+				Provider:   provider,
+				Workspace:  cmd.Dir,
+			})
 			return cmd, nil
 		}
+
+		if isCLISandboxRequired(ctx) {
+			msg := "bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged (MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
+			if bwrapErr != nil {
+				msg = fmt.Sprintf("%s: %v", msg, bwrapErr)
+			}
+			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, msg, bwrapErr)
+		}
+
+		// When falling back to host execution (either authorized via MAKEWAND_UNSAFE_HOST_EXEC
+		// or for non-writing informational tasks):
+		// 1. Sanitize the command environment so foreign credentials and host secrets are not leaked
+		cmd.Env = sanitizeCLIEnv(provider, cmd.Env)
+
+		// 2. Audit host execution if an audit hook is registered
+		if _, auth := isUnsafeHostExecAuthorized(ctx); auth.Audit != nil {
+			cmdPath := cmd.Path
+			if cmdPath == "" && len(cmd.Args) > 0 {
+				cmdPath = cmd.Args[0]
+			}
+			auth.Audit(cmdPath, cmd.Args, cmd.Dir)
+		}
+
+		// 3. Record execution state as unsandboxed
+		recordCLIExec(ctx, CLIExecRecord{
+			Sandboxed:  false,
+			UnsafeHost: true,
+			Provider:   provider,
+			Workspace:  cmd.Dir,
+		})
+
+		return cmd, nil
 	}
 
 	workspace := cmd.Dir
@@ -972,6 +1203,12 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	wrapped.Stdout = cmd.Stdout
 	wrapped.Stderr = cmd.Stderr
 	wrapped.ExtraFiles = cmd.ExtraFiles
+	recordCLIExec(ctx, CLIExecRecord{
+		Sandboxed:  true,
+		UnsafeHost: false,
+		Provider:   provider,
+		Workspace:  workspace,
+	})
 
 	return wrapped, nil
 }

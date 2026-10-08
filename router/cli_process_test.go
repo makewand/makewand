@@ -265,12 +265,14 @@ func TestCLIProcessStartFailureHonorsContextAndBudget(t *testing.T) {
 	// These cases exercise the direct exec Start boundary. A bwrap wrapper
 	// would start successfully and report its missing inner executable at Wait.
 	t.Setenv("MAKEWAND_NO_BWRAP", "1")
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
 	t.Setenv("MAKEWAND_RESTRICTED", "")
 	t.Setenv("MAKEWAND_REQUIRE_BWRAP", "")
 	for _, streaming := range []bool{false, true} {
 		for _, mode := range []string{"canceled", "deadline", "missing"} {
 			t.Run(fmt.Sprintf("stream=%t/%s", streaming, mode), func(t *testing.T) {
 				base, ledger := budgetTestContext(t, 1)
+				base = ContextWithUnsafeHostExecAuth(base, UnsafeHostExecAuth{Acknowledged: true, Source: "test"})
 				ctx, cancel := context.WithCancel(base)
 				if mode == "deadline" {
 					cancel()

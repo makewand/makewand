@@ -900,3 +900,27 @@ func RunWithPrompt(mode Mode, cfg *config.Config, projectPath, initialPrompt str
 
 	return err
 }
+
+func (a App) contextWithHostExecAuth(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !a.hostExecAuth.Acknowledged {
+		return ctx
+	}
+	return model.ContextWithUnsafeHostExecAuth(ctx, model.UnsafeHostExecAuth{
+		Acknowledged: a.hostExecAuth.Acknowledged,
+		Source:       a.hostExecAuth.Source,
+		Audit: func(cmdPath string, args []string, dir string) {
+			if a.hostExecAuth.Audit != nil {
+				a.hostExecAuth.Audit(engine.UnsafeHostExecEvent{
+					Context: "cli-provider",
+					Command: cmdPath,
+					Args:    args,
+					Dir:     dir,
+					Source:  a.hostExecAuth.Source,
+				})
+			}
+		},
+	})
+}
