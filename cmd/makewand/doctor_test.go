@@ -76,6 +76,7 @@ func TestDetectConfiguredProviders_IncludesRemote(t *testing.T) {
 }
 
 func TestRunDoctor_AllowsRemoteOnlyConfiguration(t *testing.T) {
+	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
 	t.Setenv("MAKEWAND_REMOTE_URL", "http://127.0.0.1:8080")
 	t.Setenv("MAKEWAND_REMOTE_TOKEN", "secret")
 

@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -87,3 +89,111 @@ func TestLoadUserOverridesDocMatchesReplaceSemantics(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadUserOverrides_DiscoveredAndUserPrecedence(t *testing.T) {
+	r := mustNewRouter(RouterConfig{})
+	dir := t.TempDir()
+
+	// 1. Write discovered.json with dynamically discovered models
+	disc := `{
+		"models": {
+			"claude": {"mid": "claude-discovered"},
+			"codex": {"mid": "codex-discovered"}
+		},
+		"costs": {
+			"claude-discovered": {"input": 3.0, "output": 15.0},
+			"codex-discovered": {"input": 0.0, "output": 0.0}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "discovered.json"), []byte(disc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.LoadUserOverrides(dir); err != nil {
+		t.Fatalf("LoadUserOverrides with discovered.json failed: %v", err)
+	}
+	if got := r.routingTables().modelID("claude", TierMid); got != "claude-discovered" {
+		t.Errorf("claude/mid = %q, want claude-discovered", got)
+	}
+	if got := r.routingTables().modelID("codex", TierMid); got != "codex-discovered" {
+		t.Errorf("codex/mid = %q, want codex-discovered", got)
+	}
+	// Explicit zero pricing for codex-discovered preserved
+	rate, ok := r.routingTables().costFor("codex-discovered")
+	if !ok || rate.Input != 0 || rate.Output != 0 {
+		t.Errorf("codex-discovered rate = %+v (ok=%v), want explicit 0", rate, ok)
+	}
+
+	// 2. Now user writes routing.json with pinned claude model. routing.json must override discovered.json!
+	user := `{
+		"models": {
+			"claude": {"mid": "claude-pinned-by-user"}
+		},
+		"costs": {
+			"claude-pinned-by-user": {"input": 4.0, "output": 20.0}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "routing.json"), []byte(user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.LoadUserOverrides(dir); err != nil {
+		t.Fatalf("LoadUserOverrides with routing.json failed: %v", err)
+	}
+	// claude overridden by user's routing.json
+	if got := r.routingTables().modelID("claude", TierMid); got != "claude-pinned-by-user" {
+		t.Errorf("claude/mid = %q, want user pinned %q", got, "claude-pinned-by-user")
+	}
+	// codex still has discovered model from discovered.json
+	if got := r.routingTables().modelID("codex", TierMid); got != "codex-discovered" {
+		t.Errorf("codex/mid = %q, want discovered %q", got, "codex-discovered")
+	}
+
+	// 3. Invalid routing.json fails closed and leaves current tables intact
+	if err := os.WriteFile(filepath.Join(dir, "routing.json"), []byte(`{invalid json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.LoadUserOverrides(dir); err == nil {
+		t.Fatal("LoadUserOverrides with malformed routing.json should return error, got nil")
+	}
+	// Tables must remain intact after failed reload
+	if got := r.routingTables().modelID("claude", TierMid); got != "claude-pinned-by-user" {
+		t.Errorf("claude/mid mutated after failed reload: got %q", got)
+	}
+}
+
+func TestLoadUserOverrides_CLISubscriptionDiscoveredWithoutCostTableEntry(t *testing.T) {
+	r := mustNewRouter(RouterConfig{})
+	dir := t.TempDir()
+
+	// discovered.json with CLI subscription models (codex, agy, muse, grok, local) and no cost entries
+	disc := `{
+		"models": {
+			"codex": {"cheap": "gpt-6-luna", "mid": "gpt-6.1-sol", "premium": "gpt-6-astra"},
+			"agy": {"cheap": "gemini-3.8-flash-high", "mid": "gemini-3.8-flash-high", "premium": "gemini-3.1-pro-high"},
+			"muse": {"cheap": "muse-spark-1.2", "mid": "muse-spark-1.3-contributor", "premium": "muse-spark-1.3"},
+			"grok": {"cheap": "grok-4.7-build-fast", "mid": "grok-4.7", "premium": "grok-4.7"},
+			"local": {"cheap": "qwen2.5-coder:7b", "mid": "qwen2.5-coder:7b", "premium": "qwen2.5-coder:7b"}
+		},
+		"costs": {}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "discovered.json"), []byte(disc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.LoadUserOverrides(dir); err != nil {
+		t.Fatalf("LoadUserOverrides with CLI subscription models failed: %v", err)
+	}
+
+	if got := r.routingTables().modelID("codex", TierPremium); got != "gpt-6-astra" {
+		t.Errorf("codex/premium = %q, want gpt-6-astra", got)
+	}
+	if got := r.routingTables().modelID("local", TierMid); got != "qwen2.5-coder:7b" {
+		t.Errorf("local/mid = %q, want qwen2.5-coder:7b", got)
+	}
+	// Must not have injected 0 cost entries into cost table
+	if _, ok := r.routingTables().costFor("gpt-6-astra"); ok {
+		t.Errorf("gpt-6-astra should not have an injected cost table entry")
+	}
+}
+

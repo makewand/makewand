@@ -8,11 +8,14 @@ Each provider entry reports where its data came from:
 Callers must not present builtin values as detected versions.
 """
 
+import logging
 import os
 import re
 import json
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
+
+logger = logging.getLogger(__name__)
 
 # Generic capability & family keywords for zero-hardcoding model ranking
 FAST_FAMILIES = ["haiku", "luna", "flash", "mini", "nano", "reserve"]
@@ -798,11 +801,11 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
         # Default fallback if catalog unavailable
         if tier == "deep":
-            return _tier_resolution("fable", "max", is_dynamic=False, full_id="claude-fable-5-1")
+            return _tier_resolution("opus", "max", is_dynamic=False, full_id="claude-opus-4-20250514")
         elif tier == "fast":
             return _tier_resolution("haiku", "low", is_dynamic=False, full_id="claude-haiku-4-5-20251001")
         else:
-            return _tier_resolution("sonnet", "medium", is_dynamic=False, full_id="claude-sonnet-5")
+            return _tier_resolution("sonnet", "medium", is_dynamic=False, full_id="claude-sonnet-4-20250514")
 
     elif provider == "codex":
         discovered_models = []
@@ -944,6 +947,15 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         fallback_effort = "high" if tier in ("deep", "standard") else "low"
         return _tier_resolution(fallback_models.get(tier, "gemini-3.8-flash-high"), fallback_effort, is_dynamic=False)
 
+    elif provider == "gemini":
+        gemini_models = {
+            "fast": "gemini-2.5-flash",
+            "standard": "gemini-2.5-flash",
+            "deep": "gemini-2.5-pro",
+        }
+        effort = "high" if tier == "deep" else ("low" if tier == "fast" else "medium")
+        return _tier_resolution(gemini_models.get(tier, "gemini-2.5-flash"), effort, is_dynamic=False, full_id=gemini_models.get(tier, "gemini-2.5-flash"))
+
     elif provider in ("local", "ollama"):
         try:
             from makewand.providers.local import is_local_model_available
@@ -969,10 +981,11 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 resolve_model_and_effort = get_provider_model_tier
 
 
-def export_routing_overrides(config_dir: Optional[Path] = None) -> Optional[Path]:
+def export_routing_overrides(config_dir: Optional[Path] = None, target_filename: str = "discovered.json") -> Optional[Path]:
     """
-    Exports dynamically detected models to Go router's <config_dir>/routing.json.
+    Exports dynamically detected models to Go router's <config_dir>/discovered.json.
     Ensures single source of truth across Python CLI, Go server, and TUI.
+    Never overwrites user-managed routing.json.
     Strictly conforms to Go router's rawDefaults JSON schema with valid cost entries.
     Uses atomic write via temporary file replacement.
     """
@@ -987,31 +1000,36 @@ def export_routing_overrides(config_dir: Optional[Path] = None) -> Optional[Path
         iso_root = Path(os.environ["MAKEWAND_TEST_ISOLATION_ROOT"]).expanduser()
         config_dir = iso_root / ".config" / "makewand"
 
-    target_file = config_dir / "routing.json"
+    target_file = config_dir / target_filename
 
-    # 1. Read existing routing.json if present to preserve custom strategies/costs
+    # 1. Read existing target_file if present to preserve custom strategies/costs.
+    # Refuse to overwrite if target_file is corrupt/malformed to prevent data loss.
     existing_data: Dict[str, Any] = {}
     if target_file.exists():
         try:
             existing_data = json.loads(target_file.read_text(encoding="utf-8"))
             if not isinstance(existing_data, dict):
-                existing_data = {}
-        except Exception:
-            existing_data = {}
+                logger.warning("Existing %s is not a dictionary; aborting export to prevent data loss", target_file)
+                return None
+        except Exception as e:
+            logger.warning("Failed to parse existing %s (%s); aborting export to prevent data loss", target_file, e)
+            return None
 
     models_map = existing_data.get("models") if isinstance(existing_data.get("models"), dict) else {}
     costs_map = existing_data.get("costs") if isinstance(existing_data.get("costs"), dict) else {}
 
-    # 2. Map provider tier resolutions
-    # Tier mapping: cheap -> fast, mid -> standard, premium -> deep
+    # 2. Map provider tier resolutions using canonical model IDs rather than CLI shortcuts
     providers_to_sync = ["claude", "codex", "gemini", "agy", "muse", "grok", "local"]
     for prov in providers_to_sync:
         prov_key = prov
-        lookup_prov = "agy" if prov == "gemini" else prov
         try:
-            cheap_m = get_provider_model_tier(lookup_prov, "fast").get("model")
-            mid_m = get_provider_model_tier(lookup_prov, "standard").get("model")
-            prem_m = get_provider_model_tier(lookup_prov, "deep").get("model")
+            res_cheap = get_provider_model_tier(prov, "fast")
+            res_mid = get_provider_model_tier(prov, "standard")
+            res_prem = get_provider_model_tier(prov, "deep")
+
+            cheap_m = res_cheap.get("full_id") or res_cheap.get("model")
+            mid_m = res_mid.get("full_id") or res_mid.get("model")
+            prem_m = res_prem.get("full_id") or res_prem.get("model")
 
             p_models = models_map.get(prov_key, {})
             if not isinstance(p_models, dict):
@@ -1026,15 +1044,14 @@ def export_routing_overrides(config_dir: Optional[Path] = None) -> Optional[Path
         except Exception:
             pass
 
-    # 3. Pricing table protection: do not overwrite missing/unconfigured model costs with 0.0,
-    # which wipes out the Go router's built-in benchmark price table. Only set prices when
-    # positive explicit values are configured, or preserve existing table values.
+    # 3. Pricing table protection: preserve explicit valid costs (including explicit 0.0),
+    # but do NOT inject unconfigured models at 0.0 which would wipe out Go router's price table.
     filtered_costs: Dict[str, Any] = {}
     for mid, c_val in costs_map.items():
         if isinstance(c_val, dict):
-            inp = c_val.get("input", 0.0)
-            out = c_val.get("output", 0.0)
-            if (isinstance(inp, (int, float)) and inp > 0) or (isinstance(out, (int, float)) and out > 0):
+            inp = c_val.get("input")
+            out = c_val.get("output")
+            if isinstance(inp, (int, float)) and isinstance(out, (int, float)) and inp >= 0 and out >= 0:
                 filtered_costs[mid] = c_val
     costs_map = filtered_costs
 
@@ -1051,10 +1068,11 @@ def export_routing_overrides(config_dir: Optional[Path] = None) -> Optional[Path
     # 5. Atomic write
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
-        tmp_file = config_dir / f".routing.json.tmp.{os.getpid()}"
+        tmp_file = config_dir / f".{target_filename}.tmp.{os.getpid()}"
         tmp_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         tmp_file.replace(target_file)
         return target_file
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to atomically write %s: %s", target_file, e)
         return None
 
