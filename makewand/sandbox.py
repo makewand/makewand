@@ -1407,6 +1407,59 @@ def audit_unsafe_host_exec(context: str, cmd, cwd: str, source: Optional[str]) -
         _warn(f"unsafe host exec audit write failed: {exc}")
 
 
+def get_writable_sandbox_guidance(provider_name: str = "") -> str:
+    """
+    Returns platform-specific actionable guidance when a writable task cannot run in sandbox.
+    """
+    prov_label = f"{provider_name.capitalize()} " if provider_name else ""
+    if sys.platform == "darwin":
+        return (
+            f"❌ [{prov_label}沙箱不可用] {prov_label}写入任务强制要求隔离沙箱，但 Bubblewrap (bwrap) 依赖 Linux 内核命名空间，macOS 无法运行 bwrap。\n"
+            "在 macOS 上继续使用 Makewand 的建议途径：\n"
+            "  1. [只读审查与设计] 使用只读模式运行代码审查或方案设计：makewand review 或在提示词中显式指定只读分析；\n"
+            "  2. [Linux 容器/远端运行] 在 Linux Docker 容器、虚拟机或指定远端服务中运行：--remote-url <URL>；\n"
+            "  3. [受权宿主执行（自担风险）] 若当前工作区完全受信任且知晓安全风险，可显式授权直接在宿主机执行：\n"
+            "     配置 MAKEWAND_UNSAFE_HOST_EXEC=1 并通过终端交互输入 'yes' 授权确认（或预置 config.json 授权）；\n"
+            "     所有无沙箱宿主执行操作均将被永久记入 ~/.config/makewand/unsafe_exec_audit.jsonl 审计日志。"
+        )
+    else:
+        return (
+            f"❌ [{prov_label}沙箱未就绪] {prov_label}写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到可用 bwrap 环境 (fail closed)。\n"
+            "解决建议：\n"
+            "  1. [安装沙箱] 安装 Bubblewrap 并启用非特权用户命名空间 (例如: sudo apt install bubblewrap，sysctl kernel.unprivileged_userns_clone=1)；\n"
+            "  2. [只读审查] 使用只读模式运行代码审查与方案设计：makewand review；\n"
+            "  3. [受权宿主执行（自担风险）] 若当前工作区受信任且知晓安全风险，可配置 MAKEWAND_UNSAFE_HOST_EXEC=1 并通过交互确认授权（所有执行将记入审计日志）。"
+        )
+
+
+def verify_writable_sandbox_or_authorized(
+    provider_name: str = "",
+    repo_trust: str = "trusted",
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Validates whether a writable / code-modifying execution is permitted.
+    Returns (ok, auth_source, error_message).
+    - If bwrap is available: returns (True, None, None).
+    - If untrusted repo: fail closed (returns False, None, error_message).
+    - If bwrap unavailable on trusted repo:
+      - If MAKEWAND_UNSAFE_HOST_EXEC=1 is authorized (config-ack or interactive-ack):
+        returns (True, auth_source, None).
+      - Otherwise:
+        returns (False, None, get_writable_sandbox_guidance(provider_name)).
+    """
+    if is_bwrap_available():
+        return True, None, None
+
+    if repo_trust == "untrusted":
+        return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+
+    authorized, source = resolve_unsafe_host_exec()
+    if authorized:
+        return True, source, None
+
+    return False, None, get_writable_sandbox_guidance(provider_name)
+
+
 def apply_posix_sandbox_rlimits():
     """Apply POSIX rlimits (RLIMIT_AS, RLIMIT_NPROC, RLIMIT_FSIZE) on child processes where supported."""
     if os.name != "posix":

@@ -175,7 +175,13 @@ def execute_muse_task(
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
-    from makewand.sandbox import is_bwrap_available, wrap_bwrap, SandboxConfigError
+    from makewand.sandbox import (
+        is_bwrap_available,
+        wrap_bwrap,
+        SandboxConfigError,
+        verify_writable_sandbox_or_authorized,
+        audit_unsafe_host_exec,
+    )
     from makewand.git_helper import find_git_root
     # Untrusted repo enforcement
     if repo_trust == "untrusted":
@@ -213,10 +219,12 @@ def execute_muse_task(
         repo_root = find_git_root(cwd) or cwd
     repo_root = os.path.abspath(repo_root)
 
-    # Fail-closed enforcement: if writable, sandbox is mandatory
+    # Fail-closed enforcement: if writable, sandbox is mandatory unless explicitly authorized
+    host_auth_source = None
     if not readonly:
-        if not is_bwrap_available():
-            return False, None, "Muse 写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到 bwrap，拒绝执行"
+        ok, host_auth_source, err = verify_writable_sandbox_or_authorized("muse", repo_trust=repo_trust)
+        if not ok:
+            return False, None, err
 
     import shutil
     raw_muse_bin = shutil.which("muse") or "muse"
@@ -295,15 +303,18 @@ def execute_muse_task(
                 return False, None, f"Muse 沙箱构建失败，拒绝执行 (fail closed): {exc}"
         elif repo_trust == "untrusted":
             return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
-        elif is_guard and _is_dbus_systemd_available():
-            muse_mem = os.environ.get("MUSE_MEM", "16G")
-            cmd = [
-                "systemd-run", "--user", "--scope", "--quiet",
-                "--slice=muse", "--collect",
-                f"-p", f"MemoryMax={muse_mem}",
-                "-p", "MemorySwapMax=0",
-                "--",
-            ] + cmd
+        else:
+            if not readonly:
+                audit_unsafe_host_exec("provider:muse", cmd, cwd, host_auth_source)
+            if is_guard and _is_dbus_systemd_available():
+                muse_mem = os.environ.get("MUSE_MEM", "16G")
+                cmd = [
+                    "systemd-run", "--user", "--scope", "--quiet",
+                    "--slice=muse", "--collect",
+                    f"-p", f"MemoryMax={muse_mem}",
+                    "-p", "MemorySwapMax=0",
+                    "--",
+                ] + cmd
 
         import sys
         print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
