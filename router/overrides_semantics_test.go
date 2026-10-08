@@ -196,4 +196,3 @@ func TestLoadUserOverrides_CLISubscriptionDiscoveredWithoutCostTableEntry(t *tes
 		t.Errorf("gpt-6-astra should not have an injected cost table entry")
 	}
 }
-
