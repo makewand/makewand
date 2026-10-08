@@ -61,6 +61,7 @@ class SystemdUnitTests(unittest.TestCase):
         for key in ("HOME", "MAKEWAND_CONFIG_DIR"):
             self.assertIn(key, env, f"unit must set {key}: ProtectHome hides /home")
             self.assertTrue(_within(env[key], self.writable), f"{key}={env[key]}")
+        self.assertNotEqual(env["HOME"], self._flag("--data-dir"), "HOME and --data-dir must not share the exact same root")
 
     def test_deploy_guide_matches_unit(self):
         guide = (DOCS / "DEPLOY_PRODUCTION.md").read_text(encoding="utf-8")

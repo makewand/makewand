@@ -60,6 +60,15 @@ var cliSensitiveHomeEntries = []string{
 	".local/share/keyrings",
 	".local/share/muse",
 	".local/share/credentials",
+	"server_auth.json",
+	"state.db",
+	"state.db-wal",
+	"state.db-shm",
+	"admin_session_secret",
+	"users.json",
+	"audit.jsonl",
+	"usage.jsonl",
+	".config/makewand",
 }
 
 var cliProviderCredentials = map[string][]string{
@@ -460,9 +469,83 @@ func maskSensitivePath(args []string, authorized cliCredentialMaskTarget, worksp
 	return append(args, "--ro-bind", os.DevNull, target), nil
 }
 
+func cliMaskServerPaths(args []string, workspace string, env []string) []string {
+	candidateDirs := []string{
+		"/var/lib/makewand",
+		"/etc/makewand",
+	}
+	for _, key := range []string{"MAKEWAND_DATA_DIR", "MAKEWAND_CONFIG_DIR"} {
+		if val := cliEnvValue(env, key); val != "" {
+			candidateDirs = append(candidateDirs, val)
+		} else if val := os.Getenv(key); val != "" {
+			candidateDirs = append(candidateDirs, val)
+		}
+	}
+
+	for _, d := range candidateDirs {
+		d = filepath.Clean(d)
+		if d == "" || d == "/" {
+			continue
+		}
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			if workspace != d && !cliPathWithin(workspace, d) {
+				already := false
+				for i := 0; i+1 < len(args); i++ {
+					if args[i] == "--tmpfs" && args[i+1] == d {
+						already = true
+						break
+					}
+				}
+				if !already {
+					args = append(args, "--tmpfs", d)
+				}
+			}
+		}
+	}
+
+	candidateFiles := []string{}
+	for _, key := range []string{
+		"MAKEWAND_SERVER_AUTH_CONFIG",
+		"MAKEWAND_AUTH_CONFIG",
+		"MAKEWAND_STATE_DB",
+		"MAKEWAND_SERVER_STATE_DB",
+		"MAKEWAND_SERVER_AUDIT_LOG",
+		"MAKEWAND_SERVER_USAGE_LOG",
+	} {
+		if val := cliEnvValue(env, key); val != "" {
+			candidateFiles = append(candidateFiles, val)
+		} else if val := os.Getenv(key); val != "" {
+			candidateFiles = append(candidateFiles, val)
+		}
+	}
+
+	for _, f := range candidateFiles {
+		f = filepath.Clean(f)
+		if f == "" || f == "/" {
+			continue
+		}
+		if fi, err := os.Stat(f); err == nil && !fi.IsDir() {
+			if workspace != f && !cliPathWithin(workspace, f) {
+				already := false
+				for i := 0; i+2 < len(args); i++ {
+					if args[i] == "--ro-bind" && args[i+1] == os.DevNull && filepath.Clean(args[i+2]) == f {
+						already = true
+						break
+					}
+				}
+				if !already {
+					args = append(args, "--ro-bind", os.DevNull, f)
+				}
+			}
+		}
+	}
+
+	return args
+}
+
 func cliIsMaskedHostRoot(p string) bool {
 	p = filepath.Clean(p)
-	for _, m := range []string{"/", "/home", "/root", "/mnt", "/media", "/srv", "/tmp", "/var"} {
+	for _, m := range []string{"/", "/home", "/root", "/mnt", "/media", "/srv", "/tmp", "/var", "/etc", "/var/lib/makewand", "/etc/makewand"} {
 		if p == m {
 			return true
 		}
@@ -665,6 +748,9 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		bwrapArgs = append(bwrapArgs, "--tmpfs", "/home")
 	}
 
+	// Mask server state directories and config files (/var/lib/makewand, /etc/makewand, MAKEWAND_DATA_DIR, etc.)
+	bwrapArgs = cliMaskServerPaths(bwrapArgs, workspace, cmd.Env)
+
 	childEnv := sanitizeCLIEnv(provider, cmd.Env)
 	home := cliEnvValue(childEnv, "HOME")
 	p := strings.TrimSuffix(strings.ToLower(provider), "-cli")
@@ -685,12 +771,14 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			allowedCreds = nil // Explicit account selection does not expose the default account.
 		}
 
-		if cliPathWithin("/home", home) && home != "/home" {
+		isRemote := RemoteOriginFromContext(ctx)
+		isTempHome := cliPathWithin("/tmp", home) || cliPathWithin(os.TempDir(), home)
+		if isRemote || (!isTempHome && home != "/") {
 			if workspace != home && !cliPathWithin(workspace, home) {
 				bwrapArgs = append(bwrapArgs, "--tmpfs", home)
 				homeMaskedWithTmpfs = true
 			}
-		} else if cliPathWithin("/tmp", home) && home != "/tmp" {
+		} else if isTempHome && home != "/tmp" && home != filepath.Clean(os.TempDir()) {
 			if workspace != home && !cliPathWithin(workspace, home) {
 				bwrapArgs = append(bwrapArgs, "--bind", home, home)
 			}
@@ -766,6 +854,10 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 
 	// Bind active provider credentials within home and mask sensitive credentials
 	if home != "" {
+		bindFlag := "--bind"
+		if isReview || RemoteOriginFromContext(ctx) {
+			bindFlag = "--ro-bind"
+		}
 		for _, cred := range allowedCreds {
 			target := filepath.Join(home, filepath.FromSlash(cred))
 			if target == workspace || cliPathWithin(target, workspace) {
@@ -774,13 +866,13 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			if _, err := os.Stat(target); err == nil { //nolint:gosec // G703: checking existence of provider credentials in host home
 				already := false
 				for i := 0; i+1 < len(bwrapArgs); i++ {
-					if bwrapArgs[i] == "--bind" && bwrapArgs[i+1] == target {
+					if (bwrapArgs[i] == "--bind" || bwrapArgs[i] == "--ro-bind") && bwrapArgs[i+1] == target {
 						already = true
 						break
 					}
 				}
 				if !already {
-					bwrapArgs = append(bwrapArgs, "--bind", target, target)
+					bwrapArgs = append(bwrapArgs, bindFlag, target, target)
 				}
 			}
 		}
@@ -828,7 +920,11 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		// Mount only the selected account after masking host roots and other
 		// credentials. Use its canonical path inside the sandbox: a destination
 		// symlink may point into a masked root and cannot serve as a mount point.
-		bwrapArgs = append(bwrapArgs, "--bind", realCodexHome, realCodexHome,
+		bindFlag := "--bind"
+		if isReview || RemoteOriginFromContext(ctx) {
+			bindFlag = "--ro-bind"
+		}
+		bwrapArgs = append(bwrapArgs, bindFlag, realCodexHome, realCodexHome,
 			"--setenv", "CODEX_HOME", realCodexHome)
 	} else if p != "codex" {
 		// A custom Codex account may be outside a masked host root. Other
@@ -941,6 +1037,14 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 
 	isSecretKey := func(key string) bool {
 		upper := strings.ToUpper(key)
+		if strings.HasPrefix(upper, "MAKEWAND_SERVER_") ||
+			upper == "MAKEWAND_AUTH_CONFIG" ||
+			upper == "MAKEWAND_DATA_DIR" ||
+			upper == "MAKEWAND_CONFIG_DIR" ||
+			upper == "MAKEWAND_ADMIN_SESSION_SECRET" ||
+			upper == "MAKEWAND_STATE_DB" {
+			return true
+		}
 		if strings.HasPrefix(upper, "AWS_") || strings.HasPrefix(upper, "AZURE_") {
 			return true
 		}
