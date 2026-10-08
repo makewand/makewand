@@ -140,11 +140,13 @@ func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system
 		text = result.Choices[0].Message.Content
 	}
 
+	cost, measuredCost := o.priceForCtxWithStatus(ctx, model, result.Usage.PromptTokens, result.Usage.CompletionTokens)
 	usage := Usage{
 		MeasuredTokens: result.Usage.PromptTokens > 0 || result.Usage.CompletionTokens > 0,
+		MeasuredCost:   measuredCost,
 		InputTokens:    result.Usage.PromptTokens,
 		OutputTokens:   result.Usage.CompletionTokens,
-		Cost:           o.priceForCtx(ctx, model, result.Usage.PromptTokens, result.Usage.CompletionTokens),
+		Cost:           cost,
 		Model:          model,
 		Provider:       "openai",
 	}

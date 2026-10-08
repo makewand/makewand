@@ -71,7 +71,7 @@ func snapshotProtectedPaths(root string) (*protectedPathSnapshot, error) {
 			return err
 		}
 		name := d.Name()
-		if d.IsDir() && name == ".git" {
+		if d.IsDir() && strings.EqualFold(name, ".git") {
 			info, err := d.Info()
 			if err != nil {
 				return err
@@ -79,8 +79,8 @@ func snapshotProtectedPaths(root string) (*protectedPathSnapshot, error) {
 			snap.entries[filepath.ToSlash(rel)] = protectedPathEntry{mode: info.Mode(), opaque: true}
 			return filepath.SkipDir
 		}
-		if d.IsDir() && shouldIgnoreSet[name] {
-			if rel == ".makewand" {
+		if d.IsDir() && (shouldIgnoreSet[name] || strings.EqualFold(name, ".makewand")) {
+			if strings.EqualFold(rel, ".makewand") {
 				if err := snap.record(tree, ".makewand/rules.md"); err != nil {
 					return err
 				}
