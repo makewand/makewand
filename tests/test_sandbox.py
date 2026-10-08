@@ -7,7 +7,7 @@ import sys
 import unittest
 import tempfile
 from pathlib import Path
-from makewand.sandbox import is_bwrap_available, wrap_bwrap, run_in_sandbox
+from makewand.sandbox import is_bwrap_available, wrap_bwrap, run_in_sandbox, sandbox_lifecycle
 
 class TestSandbox(unittest.TestCase):
     def test_bwrap_availability(self):
@@ -407,6 +407,156 @@ class TestSandbox(unittest.TestCase):
         for p in tracked_cmd_claude:
             self.assertIn(".claude", p)
             self.assertNotIn(".codex", p)
+
+    def test_sandbox_codex_readonly_mode_state_root_mounted_ro(self):
+        """Regression test for [P1] commits-review-1: in readonly=True mode,
+        provider state root must be mounted --ro-bind and uncreated sensitive files
+        must be shielded pre-execution with EROFS inside the sandbox."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_codex = fake_home / ".codex"
+            fake_codex.mkdir(parents=True)
+            (fake_codex / "sessions").mkdir()
+            (fake_codex / "history.jsonl").write_text("history", encoding="utf-8")
+            ws = Path(tmpdir) / "ws"
+            ws.mkdir()
+            override_path = str(fake_codex / "AGENTS.override.md")
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                os.environ.pop("CODEX_HOME", None)
+                # 1. wrap_bwrap in readonly mode must mount .codex with --ro-bind
+                cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), readonly=True, is_provider=True, provider_name="codex")
+                ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
+                ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
+                bind_indices = [i for i, x in enumerate(cmd) if x == "--bind"]
+                bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in bind_indices if i + 2 < len(cmd)]
+
+                # Entire fake_codex root is mounted --ro-bind
+                self.assertIn((str(fake_codex), str(fake_codex)), ro_bind_pairs)
+                self.assertNotIn((str(fake_codex), str(fake_codex)), bind_pairs)
+
+                # Whitelisted readonly_state entries are mounted --bind
+                sessions_path = str(fake_codex / "sessions")
+                self.assertIn((sessions_path, sessions_path), bind_pairs)
+
+                # 2. Inside the sandbox, writing to uncreated override_path must fail with EROFS (Read-only filesystem)
+                ret, out, err, _ = run_in_sandbox(
+                    ["python3", "-c", f"open({override_path!r}, 'w').write('malicious')"],
+                    workspace=str(ws),
+                    readonly=True,
+                    is_provider=True,
+                    provider_name="codex",
+                )
+                self.assertNotEqual(ret, 0)
+                self.assertIn("Read-only file system", err)
+                self.assertFalse(os.path.exists(override_path))
+
+    def test_sandbox_agy_readonly_mode_state_root_mounted_ro(self):
+        """Regression test for [P1] commits-review-1: agy and other providers in readonly mode mount root --ro-bind."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_gemini = fake_home / ".gemini"
+            fake_gemini.mkdir(parents=True)
+            ws = Path(tmpdir) / "ws"
+            ws.mkdir()
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                cmd = wrap_bwrap(["agy", "exec"], workspace=str(ws), readonly=True, is_provider=True, provider_name="agy")
+                ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
+                ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
+                bind_indices = [i for i, x in enumerate(cmd) if x == "--bind"]
+                bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in bind_indices if i + 2 < len(cmd)]
+
+                self.assertIn((str(fake_gemini), str(fake_gemini)), ro_bind_pairs)
+                self.assertNotIn((str(fake_gemini), str(fake_gemini)), bind_pairs)
+
+    def test_sandbox_cleanup_does_not_delete_preexisting_files(self):
+        """Regression test for [P1] commits-review-1: files that existed before sandbox execution must never be deleted."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_codex = fake_home / ".codex"
+            fake_codex.mkdir(parents=True)
+            memories_dir = fake_codex / "memories"
+            memories_dir.mkdir()
+            user_note = memories_dir / "user_memory.json"
+            user_note.write_text('{"user": "data"}', encoding="utf-8")
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                os.environ.pop("CODEX_HOME", None)
+                with sandbox_lifecycle(is_provider=True, provider_name="codex", readonly=False):
+                    pass
+                # Memories directory and user memory must remain completely intact
+                self.assertTrue(memories_dir.exists())
+                self.assertTrue(user_note.exists())
+                self.assertEqual(user_note.read_text(encoding="utf-8"), '{"user": "data"}')
+
+    def test_sandbox_cleanup_does_not_delete_concurrent_host_files_in_readonly(self):
+        """Regression test for [P1] commits-review-1: files created by concurrent host sessions
+        during readonly tasks must never be deleted on sandbox exit."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_codex = fake_home / ".codex"
+            fake_codex.mkdir(parents=True)
+            memories_dir = fake_codex / "memories"
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                os.environ.pop("CODEX_HOME", None)
+                with sandbox_lifecycle(is_provider=True, provider_name="codex", readonly=True):
+                    # Simulate host user creating memories directory concurrently outside sandbox
+                    memories_dir.mkdir()
+                    (memories_dir / "note.txt").write_text("host note", encoding="utf-8")
+                # On exiting readonly sandbox, host files must NOT be deleted
+                self.assertTrue(memories_dir.exists())
+                self.assertTrue((memories_dir / "note.txt").exists())
+
+    def test_sandbox_signal_termination_executes_cleanup(self):
+        """Regression test for [P1] commits-review-1: SIGTERM triggers finally cleanup."""
+        import signal
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_codex = fake_home / ".codex"
+            fake_codex.mkdir(parents=True)
+            override_path = fake_codex / "AGENTS.override.md"
+
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                os.environ.pop("CODEX_HOME", None)
+                try:
+                    with sandbox_lifecycle(is_provider=True, provider_name="codex", readonly=False):
+                        override_path.write_text("malicious override", encoding="utf-8")
+                        self.assertTrue(override_path.exists())
+                        # Simulate SIGTERM signal delivery to the process
+                        os.kill(os.getpid(), signal.SIGTERM)
+                except KeyboardInterrupt:
+                    pass
+                # Must be cleaned up in finally block despite SIGTERM
+                self.assertFalse(override_path.exists())
+
+    def test_sandbox_codex_home_remaps_readonly_state(self):
+        """Regression test for [P1] commits-review-1: CODEX_HOME remaps readonly_state properly."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            custom_codex = Path(tmpdir) / "custom_codex"
+            custom_codex.mkdir(parents=True)
+            (custom_codex / "sessions").mkdir()
+            ws = Path(tmpdir) / "ws"
+            ws.mkdir()
+
+            with patch.dict(os.environ, {"HOME": str(fake_home), "CODEX_HOME": str(custom_codex)}):
+                cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), readonly=True, is_provider=True, provider_name="codex")
+                ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
+                ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
+                bind_indices = [i for i, x in enumerate(cmd) if x == "--bind"]
+                bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in bind_indices if i + 2 < len(cmd)]
+
+                self.assertIn((str(custom_codex), str(custom_codex)), ro_bind_pairs)
+                sessions_path = str(custom_codex / "sessions")
+                self.assertIn((sessions_path, sessions_path), bind_pairs)
 
 
 if __name__ == "__main__":
