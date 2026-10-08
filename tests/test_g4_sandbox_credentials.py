@@ -69,7 +69,7 @@ def mounts(cmd, flag):
 class TestClaudeStateDirectory(unittest.TestCase):
     def _make_claude(self, home):
         c = home / ".claude"
-        for d in ("commands", "agents", "skills/x", "plugins", "hooks", "projects/-proj"):
+        for d in ("commands", "agents", "skills/x", "plugins", "hooks", "chrome", "projects/-proj"):
             (c / d).mkdir(parents=True, exist_ok=True)
         (c / "CLAUDE.md").write_text("orig-global\n")
         (c / "commands" / "keep.md").write_text("keep\n")
@@ -92,6 +92,7 @@ class TestClaudeStateDirectory(unittest.TestCase):
                 + attempt("mkdir -p ~/.claude/agents && echo x > ~/.claude/agents/a.md", "agents")
                 + attempt("echo x > ~/.claude/skills/x/SKILL.md", "skills")
                 + attempt("echo x > ~/.claude/hooks/h.sh", "hooks")
+                + attempt("mkdir -p ~/.claude/chrome/evil && echo x > ~/.claude/chrome/evil/h.sh", "chrome")
                 + attempt("mkdir -p ~/.claude/output-styles/o", "output-styles")
                 + attempt("echo '{}' > ~/.claude/settings.json", "settings.json")
                 + attempt("echo '{\"hooks\":1}' > ~/.claude/settings.local.json", "settings.local.json")
@@ -105,7 +106,7 @@ class TestClaudeStateDirectory(unittest.TestCase):
             res = run_payload("claude", ws, payload)
             out = res.stdout
             self.assertEqual(res.returncode, 0, res.stderr)
-            for label in ("CLAUDE.md", "commands", "plugins", "agents", "skills", "hooks", "output-styles",
+            for label in ("CLAUDE.md", "commands", "plugins", "agents", "skills", "hooks", "chrome", "output-styles",
                           "settings.json", "settings.local.json", ".claude.json", "memory"):
                 self.assertIn(f"RO {label}", out, f"{label} must be read-only inside the sandbox\n{out}")
             # session and credential state stay writable (user decision c)
@@ -117,6 +118,7 @@ class TestClaudeStateDirectory(unittest.TestCase):
             self.assertEqual((c / "CLAUDE.md").read_text(), "orig-global\n")
             self.assertFalse((c / "commands" / "pwn.md").exists())
             self.assertFalse((c / "plugins" / "evil").exists())
+            self.assertFalse((c / "chrome" / "evil").exists())
             self.assertEqual((c / "skills" / "x" / "SKILL.md").read_text(), "skill\n")
             self.assertEqual((c / "settings.json").read_text(), '{"model": "x"}\n')
             self.assertTrue((c / "shell-snapshots" / "snapshot-bash-host.sh").exists())
