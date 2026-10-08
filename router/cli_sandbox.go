@@ -58,6 +58,8 @@ var cliSensitiveHomeEntries = []string{
 	".histfile",
 	".python_history",
 	".local/share/keyrings",
+	".local/share/muse",
+	".local/share/credentials",
 }
 
 var cliProviderCredentials = map[string][]string{
@@ -458,31 +460,100 @@ func maskSensitivePath(args []string, authorized cliCredentialMaskTarget, worksp
 	return append(args, "--ro-bind", os.DevNull, target), nil
 }
 
+func cliIsMaskedHostRoot(p string) bool {
+	p = filepath.Clean(p)
+	for _, m := range []string{"/", "/home", "/root", "/mnt", "/media", "/srv", "/tmp", "/var"} {
+		if p == m {
+			return true
+		}
+	}
+	return false
+}
+
+func cliPathTouchesSensitive(home, p string) bool {
+	p = filepath.Clean(p)
+	allSensitive := append([]string(nil), cliSensitiveHomeEntries...)
+	for _, creds := range cliProviderCredentials {
+		allSensitive = append(allSensitive, creds...)
+	}
+
+	if home != "" && cliPathWithin(home, p) {
+		for _, entry := range allSensitive {
+			sensitive := filepath.Join(home, filepath.FromSlash(entry))
+			if cliPathWithin(p, sensitive) || cliPathWithin(sensitive, p) || p == sensitive {
+				return true
+			}
+		}
+		return false
+	}
+	pSlash := filepath.ToSlash(p)
+	for _, entry := range allSensitive {
+		entrySlash := "/" + entry
+		if strings.Contains(pSlash, entrySlash+"/") || strings.HasSuffix(pSlash, entrySlash) || pSlash == entrySlash {
+			return true
+		}
+		candidate := filepath.Join(p, filepath.FromSlash(entry))
+		if fi, err := os.Stat(candidate); err == nil && (fi.IsDir() || fi.Mode().IsRegular()) {
+			return true
+		}
+	}
+	return false
+}
+
+// cliToolchainRoot picks the directory to re-bind for a toolchain binary
+// under HOME or masked host roots: the installation root (parent of bin/, sbin/ or shims/)
+// when that root holds no sensitive entries, otherwise the containing directory,
+// otherwise the binary alone. It never returns HOME or masked roots themselves.
+func cliToolchainRoot(home, bin string) string {
+	bin = filepath.Clean(bin)
+	dir := filepath.Dir(bin)
+	switch filepath.Base(dir) {
+	case "bin", "sbin", "shims":
+		root := filepath.Dir(dir)
+		if root != home && !cliIsMaskedHostRoot(root) && !cliPathTouchesSensitive(home, root) {
+			return root
+		}
+	}
+	if dir != home && !cliIsMaskedHostRoot(dir) && !cliPathTouchesSensitive(home, dir) {
+		return dir
+	}
+	if !cliPathTouchesSensitive(home, bin) {
+		return bin
+	}
+	return ""
+}
+
 // rebindToolchainUnderMaskedRoot ensures that targetBin and any of its symlink hops
 // or containing environment directories that reside under masked roots (like /mnt, /home, or /tmp)
 // are re-bound read-only so they remain executable inside the sandbox.
-func rebindToolchainUnderMaskedRoot(args []string, targetBin, workspace string) []string {
+// It uses cliToolchainRoot to guarantee that HOME, ~/.local, or any directory containing
+// sensitive credentials are NEVER re-bound.
+func rebindToolchainUnderMaskedRoot(args []string, targetBin, workspace, home string) []string {
 	if targetBin == "" {
 		return args
 	}
 	targetBin = filepath.Clean(targetBin)
 
-	paths := []string{targetBin}
-	dir := filepath.Dir(targetBin)
-	paths = append(paths, dir)
-	if base := filepath.Base(dir); base == "bin" || base == "sbin" || base == "shims" {
-		paths = append(paths, filepath.Dir(dir))
+	bins := []string{targetBin}
+	curr := targetBin
+	for i := 0; i < 16; i++ {
+		target, err := os.Readlink(curr)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(curr), target)
+		}
+		target = filepath.Clean(target)
+		bins = append(bins, target)
+		curr = target
 	}
 
 	var toRebind []string
-	for _, p := range paths {
-		if real, err := filepath.EvalSymlinks(p); err == nil {
-			real = filepath.Clean(real)
-			if real != p {
-				toRebind = append(toRebind, real)
-			}
+	for _, b := range bins {
+		if root := cliToolchainRoot(home, b); root != "" {
+			toRebind = append(toRebind, root)
 		}
-		toRebind = append(toRebind, p)
 	}
 
 	for _, p := range toRebind {
@@ -691,7 +762,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	}
 
 	// Re-bind target binary and any symlink targets (essential if binary or its environment is under /tmp, /mnt, or /home)
-	bwrapArgs = rebindToolchainUnderMaskedRoot(bwrapArgs, targetBin, workspace)
+	bwrapArgs = rebindToolchainUnderMaskedRoot(bwrapArgs, targetBin, workspace, home)
 
 	// Bind active provider credentials within home and mask sensitive credentials
 	if home != "" {

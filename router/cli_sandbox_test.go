@@ -463,3 +463,109 @@ func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testi
 		t.Errorf("expected direct execution cmd returned on fallback, got %v", fallbackCmd)
 	}
 }
+
+func TestRebindToolchainUnderMaskedRoot_NeverExposesHomeOrLocalShare(t *testing.T) {
+	fakeHome := filepath.Join("/home", "testuser")
+	ws := filepath.Join("/tmp", "workspace")
+
+	// 1. ~/.local/bin/claude layout
+	localBin := filepath.Join(fakeHome, ".local", "bin", "claude")
+	localRoot := filepath.Join(fakeHome, ".local")
+	localBinDir := filepath.Join(fakeHome, ".local", "bin")
+
+	// cliToolchainRoot must return ~/.local/bin, NEVER ~/.local
+	root := cliToolchainRoot(fakeHome, localBin)
+	if root == localRoot {
+		t.Fatalf("cliToolchainRoot returned ~/.local (%s), want %s", root, localBinDir)
+	}
+	if root != localBinDir && root != localBin {
+		t.Fatalf("cliToolchainRoot = %s, want %s or %s", root, localBinDir, localBin)
+	}
+
+	// 2. ~/bin/claude layout
+	homeBin := filepath.Join(fakeHome, "bin", "claude")
+	homeBinDir := filepath.Join(fakeHome, "bin")
+
+	// cliToolchainRoot must return ~/bin or ~/bin/claude, NEVER fakeHome
+	root = cliToolchainRoot(fakeHome, homeBin)
+	if root == fakeHome {
+		t.Fatalf("cliToolchainRoot returned fakeHome (%s), want %s", root, homeBinDir)
+	}
+	if root != homeBinDir && root != homeBin {
+		t.Fatalf("cliToolchainRoot = %s, want %s or %s", root, homeBinDir, homeBin)
+	}
+
+	// 3. Verify rebindToolchainUnderMaskedRoot never introduces --ro-bind fakeHome or --ro-bind ~/.local
+	var args []string
+	args = rebindToolchainUnderMaskedRoot(args, localBin, ws, fakeHome)
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--ro-bind" {
+			bound := args[i+1]
+			if bound == fakeHome {
+				t.Fatalf("rebindToolchainUnderMaskedRoot bound fakeHome: %v", args)
+			}
+			if bound == localRoot {
+				t.Fatalf("rebindToolchainUnderMaskedRoot bound ~/.local: %v", args)
+			}
+		}
+	}
+
+	args = nil
+	args = rebindToolchainUnderMaskedRoot(args, homeBin, ws, fakeHome)
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--ro-bind" {
+			bound := args[i+1]
+			if bound == fakeHome {
+				t.Fatalf("rebindToolchainUnderMaskedRoot bound fakeHome: %v", args)
+			}
+		}
+	}
+}
+
+func TestWrapCLICommandWithSandbox_LocalAndHomeBinLayoutsDoNotExposeSecrets(t *testing.T) {
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	fakeHome := filepath.Join("/home", "secuser")
+	t.Setenv("HOME", fakeHome)
+
+	ws := t.TempDir()
+
+	// Layout A: ~/.local/bin/claude
+	cmdA := exec.Command(filepath.Join(fakeHome, ".local", "bin", "claude"), "-p", "hi") //nolint:gosec // G204: test-only fake command path
+	cmdA.Dir = ws
+	wrappedA, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmdA)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox (local layout): %v", err)
+	}
+	for i := 0; i+1 < len(wrappedA.Args); i++ {
+		if wrappedA.Args[i] == "--ro-bind" {
+			bound := wrappedA.Args[i+1]
+			if bound == fakeHome {
+				t.Errorf("CLI sandbox re-bound HOME in ~/.local layout: %v", wrappedA.Args)
+			}
+			if bound == filepath.Join(fakeHome, ".local") {
+				t.Errorf("CLI sandbox re-bound ~/.local in ~/.local layout: %v", wrappedA.Args)
+			}
+		}
+	}
+
+	// Layout B: ~/bin/claude
+	cmdB := exec.Command(filepath.Join(fakeHome, "bin", "claude"), "-p", "hi") //nolint:gosec // G204: test-only fake command path
+	cmdB.Dir = ws
+	wrappedB, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmdB)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox (bin layout): %v", err)
+	}
+	for i := 0; i+1 < len(wrappedB.Args); i++ {
+		if wrappedB.Args[i] == "--ro-bind" {
+			bound := wrappedB.Args[i+1]
+			if bound == fakeHome {
+				t.Errorf("CLI sandbox re-bound HOME in ~/bin layout: %v", wrappedB.Args)
+			}
+		}
+	}
+}
