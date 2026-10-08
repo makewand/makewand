@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -183,6 +184,8 @@ func checkDiskConfigHostExecAck() (bool, UnsafeHostExecAuth) {
 		configDir = filepath.Join(home, ".config", "makewand")
 	}
 	cfgFile := filepath.Join(configDir, "config.json")
+	// #nosec G304, G703 -- configDir is operator/user local configuration, never an HTTP path or user identifier.
+	//nolint:gosec // G304, G703: configDir is operator/user local configuration, not request input.
 	data, err := os.ReadFile(cfgFile)
 	if err != nil {
 		return false, UnsafeHostExecAuth{}
@@ -231,6 +234,8 @@ func auditHostExecToConfigDir(configDir string) func(command string, args []stri
 			return
 		}
 		auditPath := filepath.Join(configDir, "unsafe_exec_audit.jsonl")
+		// #nosec G304, G703 -- configDir is operator/user local configuration, never an HTTP path or user identifier.
+		//nolint:gosec // G304, G703: configDir is operator/user local configuration, not request input.
 		f, err := os.OpenFile(auditPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			return
@@ -866,6 +871,31 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	}
 
 	if bwrapMissing {
+		if runtime.GOOS == "windows" {
+			if RemoteOriginFromContext(ctx) || os.Getenv("MAKEWAND_RESTRICTED") == "1" || os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
+				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+					"bubblewrap (bwrap) required for sandboxed execution in untrusted or restricted context, but not found", errors.New("bubblewrap not supported on windows"))
+			}
+			// Bubblewrap is Linux-only. On Windows, process tree management and bounded resources
+			// are enforced via Windows Job Objects (processjob). We sanitize credentials and audit
+			// as required by the native Windows contract.
+			cmd.Env = sanitizeCLIEnv(provider, cmd.Env)
+			if _, auth := isUnsafeHostExecAuthorized(ctx); auth.Audit != nil {
+				cmdPath := cmd.Path
+				if cmdPath == "" && len(cmd.Args) > 0 {
+					cmdPath = cmd.Args[0]
+				}
+				auth.Audit(cmdPath, cmd.Args, cmd.Dir)
+			}
+			recordCLIExec(ctx, CLIExecRecord{
+				Sandboxed:  false,
+				UnsafeHost: true,
+				Provider:   provider,
+				Workspace:  cmd.Dir,
+			})
+			return cmd, nil
+		}
+
 		if isCLISandboxRequired(ctx) {
 			msg := "bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged (MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
 			if bwrapErr != nil {
