@@ -949,6 +949,12 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 		return args
 	}
 
+	cleanRoot := filepath.Clean(rootPath)
+	if cleanRoot == "" || cleanRoot == "." || cleanRoot == "/" || strings.Contains(cleanRoot, "..") {
+		return args
+	}
+	rootPrefix := cleanRoot + string(os.PathSeparator)
+
 	normKey := strings.ToLower(providerKey)
 	if normKey == "agy" || normKey == "antigravity" {
 		normKey = "gemini"
@@ -956,7 +962,14 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 
 	protectedList := cliProviderProtected[normKey]
 	for _, entry := range protectedList {
-		subPath := filepath.Join(rootPath, filepath.FromSlash(entry.subpath))
+		rel := filepath.FromSlash(entry.subpath)
+		if !filepath.IsLocal(rel) || strings.Contains(rel, "..") {
+			continue
+		}
+		subPath := filepath.Clean(filepath.Join(cleanRoot, rel))
+		if strings.Contains(subPath, "..") || !strings.HasPrefix(subPath, rootPrefix) {
+			continue
+		}
 		fi, err := os.Lstat(subPath)
 		if err == nil {
 			if fi.Mode()&os.ModeSymlink != 0 {
@@ -974,7 +987,10 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 					args = cliAppendRoBindIfNotPresent(args, subPath)
 				}
 			} else {
-				dir := filepath.Dir(subPath)
+				dir := filepath.Clean(filepath.Dir(subPath))
+				if strings.Contains(dir, "..") || !strings.HasPrefix(dir, rootPrefix) {
+					continue
+				}
 				// #nosec G301 -- directory placeholder for provider protection inside host home
 				if err := os.MkdirAll(dir, 0o700); err == nil {
 					// #nosec G304, G703 -- fixed subpath under user's provider state directory
@@ -988,25 +1004,38 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 	}
 
 	if normKey == "claude" && workspace != "" {
-		projectsDir := filepath.Join(rootPath, "projects")
-		var sb strings.Builder
-		for _, r := range filepath.Clean(workspace) {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-				sb.WriteRune(r)
-			} else {
-				sb.WriteByte('-')
+		projectsDir := filepath.Clean(filepath.Join(cleanRoot, "projects"))
+		if !strings.Contains(projectsDir, "..") && strings.HasPrefix(projectsDir, rootPrefix) {
+			var sb strings.Builder
+			for _, r := range filepath.Clean(workspace) {
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+					sb.WriteRune(r)
+				} else {
+					sb.WriteByte('-')
+				}
 			}
-		}
-		key := sb.String()
-		memDir := filepath.Join(projectsDir, key, "memory")
-		if fi, err := os.Lstat(memDir); err == nil && fi.IsDir() {
-			args = cliAppendRoBindIfNotPresent(args, memDir)
+			key := sb.String()
+			if key != "" && !strings.Contains(key, "..") {
+				memDir := filepath.Clean(filepath.Join(projectsDir, key, "memory"))
+				if !strings.Contains(memDir, "..") && strings.HasPrefix(memDir, rootPrefix) {
+					if fi, err := os.Lstat(memDir); err == nil && fi.IsDir() {
+						args = cliAppendRoBindIfNotPresent(args, memDir)
+					}
+				}
+			}
 		}
 	}
 
 	ephemeralList := cliProviderEphemeral[normKey]
 	for _, eph := range ephemeralList {
-		subPath := filepath.Join(rootPath, filepath.FromSlash(eph))
+		rel := filepath.FromSlash(eph)
+		if !filepath.IsLocal(rel) || strings.Contains(rel, "..") {
+			continue
+		}
+		subPath := filepath.Clean(filepath.Join(cleanRoot, rel))
+		if strings.Contains(subPath, "..") || !strings.HasPrefix(subPath, rootPrefix) {
+			continue
+		}
 		fi, err := os.Lstat(subPath)
 		if err == nil && fi.IsDir() {
 			args = cliAppendTmpfsIfNotPresent(args, subPath)
