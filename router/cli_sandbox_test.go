@@ -129,6 +129,9 @@ func TestWrapCLICommandWithSandbox_ActiveProviderCredentialsPreserved(t *testing
 }
 
 func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap fail-close; Windows required-sandbox refusal is exercised separately")
+	}
 	oldLookup := cliBwrapLookup
 	defer func() { cliBwrapLookup = oldLookup }()
 	cliBwrapLookup = func(file string) (string, error) {
@@ -474,6 +477,9 @@ func TestWrapCLICommandWithSandbox_SanitizesEnv(t *testing.T) {
 }
 
 func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap probe failure; Windows required-sandbox refusal is exercised separately")
+	}
 	oldLookup := cliBwrapLookup
 	oldProbe := cliBwrapProbe
 	defer func() {
