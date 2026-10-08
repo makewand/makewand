@@ -1181,13 +1181,18 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		"--unshare-pid",
 		"--unshare-ipc",
 		"--unshare-uts",
-		// Network is NOT unshared: external API access is required by CLI providers.
+		// Network is NOT unshared by default: external API access is required by CLI providers.
+		// MAKEWAND_SANDBOX_UNSHARE_NET explicitly isolates the network namespace to block abstract sockets & loopback.
 		"--ro-bind", "/", "/",
 		"--proc", "/proc",
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
 		"--tmpfs", "/var/tmp",
 		"--tmpfs", "/run",
+	}
+
+	if os.Getenv("MAKEWAND_SANDBOX_UNSHARE_NET") == "1" || strings.ToLower(os.Getenv("MAKEWAND_SANDBOX_UNSHARE_NET")) == "true" {
+		bwrapArgs = append(bwrapArgs, "--unshare-net")
 	}
 
 	// Mask host roots (/root, /media, /srv, /mnt, /home)
@@ -1503,6 +1508,9 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 
 	isSecretKey := func(key string) bool {
 		upper := strings.ToUpper(key)
+		if strings.HasPrefix(upper, "DBUS_") || upper == "DISPLAY" || upper == "XAUTHORITY" || upper == "WAYLAND_DISPLAY" {
+			return true
+		}
 		if strings.HasPrefix(upper, "MAKEWAND_SERVER_") ||
 			upper == "MAKEWAND_AUTH_CONFIG" ||
 			upper == "MAKEWAND_DATA_DIR" ||

@@ -864,3 +864,59 @@ func TestWrapCLICommandWithSandbox_CodexStateShielding(t *testing.T) {
 		t.Errorf("expected ephemeral subpath %s to be mounted --tmpfs, got args: %v", snapDir, wrapped.Args)
 	}
 }
+
+func TestWrapCLICommandWithSandbox_DisplayAndDBusSanitized(t *testing.T) {
+	env := []string{
+		"PATH=/bin:/usr/bin",
+		"DISPLAY=:0",
+		"XAUTHORITY=/tmp/fake.xauth",
+		"WAYLAND_DISPLAY=wayland-0",
+		"DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus",
+		"SAFE_VAR=hello",
+	}
+	sanitized := sanitizeCLIEnv("claude", env)
+	joined := strings.Join(sanitized, " ")
+	for _, forbidden := range []string{"DISPLAY=:0", "XAUTHORITY=", "WAYLAND_DISPLAY=", "DBUS_SESSION_BUS_ADDRESS="} {
+		if strings.Contains(joined, forbidden) {
+			t.Errorf("expected %s to be sanitized, got: %v", forbidden, sanitized)
+		}
+	}
+	if !strings.Contains(joined, "SAFE_VAR=hello") {
+		t.Errorf("expected SAFE_VAR to be preserved, got: %v", sanitized)
+	}
+}
+
+func TestWrapCLICommandWithSandbox_UnshareNetEnv(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux bubblewrap mount layout test")
+	}
+	oldLookup := cliBwrapLookup
+	defer func() { cliBwrapLookup = oldLookup }()
+	cliBwrapLookup = func(file string) (string, error) {
+		return "/usr/bin/bwrap", nil
+	}
+
+	ws := t.TempDir()
+	cmd := exec.Command("claude", "-p", "test")
+	cmd.Dir = ws
+
+	// Without MAKEWAND_SANDBOX_UNSHARE_NET, --unshare-net is not present
+	t.Setenv("MAKEWAND_SANDBOX_UNSHARE_NET", "")
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+	if strings.Contains(strings.Join(wrapped.Args, " "), "--unshare-net") {
+		t.Errorf("expected --unshare-net NOT to be present by default, got args: %v", wrapped.Args)
+	}
+
+	// With MAKEWAND_SANDBOX_UNSHARE_NET=1, --unshare-net is appended
+	t.Setenv("MAKEWAND_SANDBOX_UNSHARE_NET", "1")
+	wrapped2, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	}
+	if !strings.Contains(strings.Join(wrapped2.Args, " "), "--unshare-net") {
+		t.Errorf("expected --unshare-net to be present when MAKEWAND_SANDBOX_UNSHARE_NET=1, got args: %v", wrapped2.Args)
+	}
+}
