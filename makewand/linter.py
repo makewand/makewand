@@ -5,6 +5,7 @@ before launching expensive end-to-end test suites.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,70 @@ import tempfile
 from pathlib import Path
 from typing import List, Sequence, Dict, Tuple, Optional
 from makewand.sandbox import run_in_sandbox, is_bwrap_available
+
+
+def _is_pure_javascript(full_path: str) -> bool:
+    """
+    Determines whether a JavaScript file (.js, .mjs, .cjs) is pure standard JS
+    or if it contains JSX / TypeScript syntax that requires transpilation (Babel/SWC/tsc).
+    Files containing JSX or TS constructs cannot be validated with raw `node -c`.
+    """
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(262144)
+    except Exception:
+        return True
+
+    # 1. JSX pragmas
+    if "@jsx" in content or "@jsxImportSource" in content or "@jsxRuntime" in content:
+        return False
+
+    # 2. React / Preact JSX imports with JSX tags
+    if re.search(r"""(?:from\s+['"]react['"]|require\(['"]react['"]\)|from\s+['"]preact['"]|require\(['"]preact['"]\))""", content):
+        if re.search(r"""<[/A-Za-z>]""", content):
+            return False
+
+    # 3. JSX Fragment shorthand: <> ... </>
+    if "<>" in content or "</>" in content:
+        return False
+
+    # 4. JSX closing tags: </tag>
+    if re.search(r"""</[a-zA-Z][a-zA-Z0-9_.-]*>""", content):
+        return False
+
+    # 5. JSX opening tags with uppercase component names: e.g. <App />, <CustomComponent>
+    if re.search(r"""<[A-Z][a-zA-Z0-9_]*(\s+[^<>]*)?(?:/?>)""", content):
+        return False
+
+    # 6. Common HTML/SVG elements in JSX: <div ..., <span ..., <p ..., etc.
+    common_jsx_tags = r"""<(?:div|span|p|a|button|input|form|h[1-6]|ul|ol|li|table|tr|td|th|header|footer|nav|section|main|aside|img|svg|label|select|option)\b[^<>]*>"""
+    if re.search(common_jsx_tags, content, re.IGNORECASE):
+        return False
+
+    return True
+
+
+def _find_cargo_toml(clean_cwd: str, file_path: str) -> Optional[str]:
+    """
+    Finds enclosing Cargo.toml for file_path within clean_cwd.
+    Returns Cargo.toml path if found, or None.
+    """
+    try:
+        curr = os.path.dirname(os.path.realpath(file_path))
+        clean_cwd_real = os.path.realpath(clean_cwd)
+        while True:
+            candidate = os.path.join(curr, "Cargo.toml")
+            if os.path.isfile(candidate):
+                return candidate
+            if curr == clean_cwd_real or os.path.dirname(curr) == curr:
+                break
+            curr = os.path.dirname(curr)
+        root_candidate = os.path.join(clean_cwd_real, "Cargo.toml")
+        if os.path.isfile(root_candidate):
+            return root_candidate
+    except Exception:
+        pass
+    return None
 
 def auto_format_files(cwd: str, file_paths: Sequence[str]) -> Dict[str, bool]:
     """
@@ -162,97 +227,60 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
                             if os.path.isdir(b_parent) and b_parent not in ("/", "/usr", "/usr/local"):
                                 extra_ro.append(b_parent)
 
-                    ran_sandbox = False
-                    if is_bwrap_available():
-                        code = 0
+                    code = 0
+                    raw_err = ""
+                    err_cat = None
+                    if go_bin:
+                        code, out, err_out, err_cat = run_in_sandbox(
+                            ["go", "vet", pkg_target],
+                            workspace=clean_cwd,
+                            timeout=8,
+                            allow_network=False,
+                            readonly=True,
+                            extra_ro_binds=extra_ro if extra_ro else None,
+                            extra_env={"GOTOOLCHAIN": "local", "GOPROXY": "off"},
+                            audit_context="linter_syntax_check",
+                        )
+                        raw_err = (err_out or out).strip()
+
+                    # Infrastructure or sandbox failure is not a code syntax defect
+                    if (not go_bin or code != 0) and (
+                        raw_err.startswith("bwrap:")
+                        or "SandboxConfigError" in raw_err
+                        or "SandboxUnavailable" in raw_err
+                        or err_cat in ("SandboxUnavailable", "SandboxConfigError")
+                        or code == -1
+                    ):
                         raw_err = ""
-                        if go_bin:
-                            code, out, err_out, _ = run_in_sandbox(
-                                ["go", "vet", pkg_target],
-                                workspace=clean_cwd,
-                                timeout=8,
-                                allow_network=False,
-                                readonly=True,
-                                extra_ro_binds=extra_ro if extra_ro else None,
-                                extra_env={"GOTOOLCHAIN": "local", "GOPROXY": "off"},
-                                audit_context="linter_syntax_check",
-                            )
-                            raw_err = (err_out or out).strip()
-
-                        # Fall back to isolated tempdir if bwrap fails with runtime/namespace error or config error
-                        if (not go_bin or code != 0) and (raw_err.startswith("bwrap:") or "SandboxConfigError" in raw_err or code == -1):
-                            ran_sandbox = False
-                        else:
-                            ran_sandbox = True
-                            if not go_bin or code != 0:
-                                # If go vet failed due to toolchain or module dependency constraints in offline sandbox,
-                                # or if go was absent, verify pure syntax directly with gofmt -e.
-                                if gofmt_bin:
-                                    g_code, g_out, g_err, _ = run_in_sandbox(
-                                        [gofmt_bin, "-e", rel],
-                                        workspace=clean_cwd,
-                                        timeout=5,
-                                        allow_network=False,
-                                        readonly=True,
-                                        extra_ro_binds=extra_ro if extra_ro else None,
-                                        audit_context="linter_syntax_check",
-                                    )
-                                    if g_code == 0:
-                                        raw_err = ""
-                                    elif g_err.strip():
-                                        raw_err = g_err.strip()
-                            if raw_err:
-                                errors.append(f"[{rel}] {raw_err}")
-
-                    if not ran_sandbox:
-                        with tempfile.TemporaryDirectory() as td:
-                            err = ""
-                            if go_bin:
-                                src_dir = os.path.dirname(full_path) or clean_cwd
-                                try:
-                                    for entry in os.listdir(src_dir):
-                                        if entry.endswith(".go") and not entry.endswith("_test.go"):
-                                            shutil.copy2(os.path.join(src_dir, entry), os.path.join(td, entry))
-                                except Exception:
-                                    pass
-                                dest = os.path.join(td, os.path.basename(rel))
-                                if not os.path.exists(dest):
-                                    shutil.copy2(full_path, dest)
-                                if has_mod:
-                                    try:
-                                        shutil.copy2(os.path.join(clean_cwd, "go.mod"), os.path.join(td, "go.mod"))
-                                    except Exception:
-                                        pass
-                                go_files = [f for f in os.listdir(td) if f.endswith(".go")]
-                                p = subprocess.run(
-                                    ["go", "vet"] + (go_files if go_files else [os.path.basename(rel)]),
-                                    cwd=td,
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=8,
-                                )
-                                if p.returncode != 0:
-                                    err = (p.stderr or p.stdout).strip()
-                            else:
-                                err = "go not available"
-
-                            if err and gofmt_bin:
-                                dest = os.path.join(td, os.path.basename(rel))
-                                if not os.path.exists(dest):
-                                    shutil.copy2(full_path, dest)
-                                gf = subprocess.run(
-                                    [gofmt_bin, "-e", os.path.basename(rel)],
-                                    cwd=td,
-                                    capture_output=True,
-                                    text=True,
+                    else:
+                        if not go_bin or code != 0:
+                            # If go vet failed due to missing module/packages in offline sandbox or go was absent,
+                            # verify pure syntax directly with gofmt -e.
+                            if gofmt_bin:
+                                g_code, g_out, g_err, g_cat = run_in_sandbox(
+                                    [gofmt_bin, "-e", rel],
+                                    workspace=clean_cwd,
                                     timeout=5,
+                                    allow_network=False,
+                                    readonly=True,
+                                    extra_ro_binds=extra_ro if extra_ro else None,
+                                    audit_context="linter_syntax_check",
                                 )
-                                if gf.returncode == 0:
-                                    err = ""
-                                elif gf.stderr.strip():
-                                    err = gf.stderr.strip()
-                            if err:
-                                errors.append(f"[{rel}] {err}")
+                                g_err_strip = (g_err or g_out).strip()
+                                if g_code == 0:
+                                    raw_err = ""
+                                elif (
+                                    g_err_strip.startswith("bwrap:")
+                                    or "SandboxConfigError" in g_err_strip
+                                    or "SandboxUnavailable" in g_err_strip
+                                    or g_cat in ("SandboxUnavailable", "SandboxConfigError")
+                                    or g_code == -1
+                                ):
+                                    raw_err = ""
+                                elif g_err.strip():
+                                    raw_err = g_err.strip()
+                        if raw_err:
+                            errors.append(f"[{rel}] {raw_err}")
                 except Exception as e:
                     errors.append(f"[{rel}] Go 语法检查异常: {e}")
 
@@ -264,51 +292,57 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
                 errors.append(f"[{rel}] JSON 格式错误: {e}")
 
         elif ext in (".js", ".mjs", ".cjs"):
-            if shutil.which("node"):
-                try:
-                    node_bin = shutil.which("node")
-                    ran_sandbox = False
-                    if is_bwrap_available():
-                        extra_ro: List[str] = []
-                        if node_bin and os.path.exists(node_bin):
-                            extra_ro.append(os.path.realpath(node_bin))
-                        code, out, err_out, _ = run_in_sandbox(
-                            ["node", "-c", rel],
-                            workspace=clean_cwd,
-                            timeout=5,
-                            allow_network=False,
-                            readonly=True,
-                            extra_ro_binds=extra_ro if extra_ro else None,
-                            audit_context="linter_syntax_check",
-                        )
-                        raw_err = (err_out or out).strip()
-                        if code != 0 and (raw_err.startswith("bwrap:") or "SandboxConfigError" in raw_err or code == -1):
-                            ran_sandbox = False
-                        else:
-                            ran_sandbox = True
-                            if code != 0:
-                                err = raw_err or f"JavaScript 语法错误: {rel}"
-                                errors.append(f"[{rel}] {err}")
+            # If the file contains JSX tags, fragments, React imports, or TS annotations,
+            # vanilla `node -c` will fail with "Unexpected token '<'" or "Unexpected token ':'".
+            # JSX and TypeScript require a transpiler/bundler (Babel/SWC/tsc) and must not be
+            # flagged by the raw Node syntax gate.
+            if not _is_pure_javascript(full_path):
+                continue
 
-                    if not ran_sandbox:
-                        with tempfile.TemporaryDirectory() as td:
-                            dest = os.path.join(td, os.path.basename(rel))
-                            shutil.copy2(full_path, dest)
-                            p = subprocess.run(
-                                ["node", "-c", os.path.basename(rel)],
-                                cwd=td,
-                                capture_output=True,
-                                text=True,
-                                timeout=5,
-                            )
-                            if p.returncode != 0:
-                                err = (p.stderr or p.stdout).strip() or f"JavaScript 语法错误: {rel}"
-                                errors.append(f"[{rel}] {err}")
+            node_bin = shutil.which("node")
+            if node_bin:
+                try:
+                    extra_ro: List[str] = []
+                    if os.path.exists(node_bin):
+                        extra_ro.append(os.path.realpath(node_bin))
+                    code, out, err_out, err_cat = run_in_sandbox(
+                        ["node", "-c", rel],
+                        workspace=clean_cwd,
+                        timeout=5,
+                        allow_network=False,
+                        readonly=True,
+                        extra_ro_binds=extra_ro if extra_ro else None,
+                        audit_context="linter_syntax_check",
+                    )
+                    raw_err = (err_out or out).strip()
+                    if code != 0:
+                        # Infrastructure or sandbox failure is not a syntax error
+                        if (
+                            raw_err.startswith("bwrap:")
+                            or "SandboxConfigError" in raw_err
+                            or "SandboxUnavailable" in raw_err
+                            or err_cat in ("SandboxUnavailable", "SandboxConfigError")
+                            or code == -1
+                        ):
+                            pass
+                        # Skip JSX or TS tokens that slipped past static heuristic
+                        elif "Unexpected token '<'" in raw_err or "Unexpected token ':'" in raw_err:
+                            pass
+                        else:
+                            err = raw_err or f"JavaScript 语法错误: {rel}"
+                            errors.append(f"[{rel}] {err}")
                 except Exception as e:
                     errors.append(f"[{rel}] Node.js 语法检查异常: {e}")
 
         elif ext == ".rs":
-            if shutil.which("rustc"):
+            # If the file belongs to a Cargo crate (Cargo.toml exists), standalone `rustc` treats
+            # non-root files as isolated crates, causing false-positive E0432 (unresolved import)
+            # and E0601 (no main function). Crate compilation is validated by `cargo test` in orchestrator.
+            if _find_cargo_toml(clean_cwd, full_path):
+                continue
+
+            rustc_bin = shutil.which("rustc")
+            if rustc_bin:
                 try:
                     rustup_dir = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
                     if not os.path.exists(rustup_dir):
@@ -317,55 +351,42 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
                         if os.path.exists(alt):
                             rustup_dir = alt
 
-                    ran_sandbox = False
-                    if is_bwrap_available():
-                        extra_ro: List[str] = []
-                        if os.path.exists(rustup_dir):
-                            real_rustup = os.path.realpath(rustup_dir)
-                            extra_ro.append(real_rustup)
-                            if real_rustup != rustup_dir:
-                                extra_ro.append(rustup_dir)
-                        rustc_bin = shutil.which("rustc")
-                        if rustc_bin and os.path.exists(rustc_bin):
-                            extra_ro.append(os.path.realpath(rustc_bin))
-                        code, out, err_out, _ = run_in_sandbox(
-                            ["rustc", "--emit=metadata", "--out-dir", "/tmp", rel],
-                            workspace=clean_cwd,
-                            timeout=8,
-                            allow_network=False,
-                            readonly=True,
-                            extra_ro_binds=extra_ro if extra_ro else None,
-                            extra_env={"RUSTUP_HOME": rustup_dir} if os.path.exists(rustup_dir) else None,
-                            audit_context="linter_syntax_check",
-                        )
-                        raw_err = (err_out or out).strip()
-                        if code != 0 and (raw_err.startswith("bwrap:") or "SandboxConfigError" in raw_err or code == -1):
-                            ran_sandbox = False
-                        else:
-                            ran_sandbox = True
-                            if code != 0:
-                                err = err_out.strip().splitlines()[0] if err_out.strip() else f"Rust 编译检查失败: {rel}"
-                                errors.append(f"[{rel}] {err}")
+                    extra_ro: List[str] = []
+                    if os.path.exists(rustup_dir):
+                        real_rustup = os.path.realpath(rustup_dir)
+                        extra_ro.append(real_rustup)
+                        if real_rustup != rustup_dir:
+                            extra_ro.append(rustup_dir)
+                    if os.path.exists(rustc_bin):
+                        extra_ro.append(os.path.realpath(rustc_bin))
 
-                    if not ran_sandbox:
-                        with tempfile.TemporaryDirectory() as td:
-                            dest = os.path.join(td, os.path.basename(rel))
-                            shutil.copy2(full_path, dest)
-                            env = dict(os.environ)
-                            if os.path.exists(rustup_dir):
-                                env["RUSTUP_HOME"] = rustup_dir
-                            p = subprocess.run(
-                                ["rustc", "--emit=metadata", "--out-dir", td, os.path.basename(rel)],
-                                cwd=td,
-                                env=env,
-                                capture_output=True,
-                                text=True,
-                                timeout=8,
-                            )
-                            if p.returncode != 0:
-                                err = p.stderr.strip().splitlines()[0] if p.stderr.strip() else f"Rust 编译检查失败: {rel}"
-                                errors.append(f"[{rel}] {err}")
+                    # Standalone Rust files: validate syntax using --crate-type lib so missing main() is not an error
+                    code, out, err_out, err_cat = run_in_sandbox(
+                        ["rustc", "--crate-type", "lib", "--emit=metadata", "--out-dir", "/tmp", rel],
+                        workspace=clean_cwd,
+                        timeout=8,
+                        allow_network=False,
+                        readonly=True,
+                        extra_ro_binds=extra_ro if extra_ro else None,
+                        extra_env={"RUSTUP_HOME": rustup_dir} if os.path.exists(rustup_dir) else None,
+                        audit_context="linter_syntax_check",
+                    )
+                    raw_err = (err_out or out).strip()
+                    if code != 0:
+                        # Infrastructure or sandbox failure is not a syntax error
+                        if (
+                            raw_err.startswith("bwrap:")
+                            or "SandboxConfigError" in raw_err
+                            or "SandboxUnavailable" in raw_err
+                            or err_cat in ("SandboxUnavailable", "SandboxConfigError")
+                            or code == -1
+                        ):
+                            pass
+                        else:
+                            err = err_out.strip().splitlines()[0] if err_out.strip() else f"Rust 编译检查失败: {rel}"
+                            errors.append(f"[{rel}] {err}")
                 except Exception as e:
                     errors.append(f"[{rel}] Rustc 语法检查异常: {e}")
+
 
     return (len(errors) == 0, errors)

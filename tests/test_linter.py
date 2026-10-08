@@ -148,51 +148,43 @@ class TestLinter(unittest.TestCase):
             self.assertFalse(kwargs.get("allow_network"))
             self.assertEqual(kwargs.get("audit_context"), "linter_syntax_check")
 
-    def test_fast_syntax_check_non_bwrap_isolated_temp_env(self):
-        """Regression test for Priority 1: when bwrap is absent, syntax checks must run in an isolated temp environment."""
-        from unittest.mock import patch, MagicMock
+    def test_fast_syntax_check_non_bwrap_no_unsandboxed_host_exec(self):
+        """Regression test for P1 commits-review-6 / P0 py-orch-1: when sandbox is unavailable, compilers must not run unsandboxed on host."""
+        from unittest.mock import patch
         js_file = Path(self.cwd) / "script.js"
         js_file.write_text("const x = 1;\n", encoding="utf-8")
 
-        with patch("makewand.linter.is_bwrap_available", return_value=False), \
+        with patch("makewand.linter.run_in_sandbox", return_value=(-1, "", "Bubblewrap (bwrap) sandbox is not available", "SandboxUnavailable")), \
              patch("subprocess.run") as mock_subproc:
-            mock_subproc.return_value = MagicMock(returncode=0, stdout="", stderr="")
             ok, errors = fast_syntax_check(self.cwd, ["script.js"])
             self.assertTrue(ok)
             self.assertEqual(errors, [])
-            self.assertTrue(mock_subproc.called)
-            # The cwd must NOT be the host workspace
-            run_cwd = mock_subproc.call_args[1].get("cwd")
-            self.assertNotEqual(run_cwd, self.cwd)
-            self.assertTrue(os.path.isdir(run_cwd) or "/tmp" in run_cwd)
+            mock_subproc.assert_not_called()
 
-    def test_fast_syntax_check_rust_fallback_no_bwrap_uses_out_dir(self):
-        """Regression test for Priority 1: rustc fallback must use --out-dir instead of -o /dev/null to prevent OS error 13."""
-        from unittest.mock import patch
+    def test_fast_syntax_check_rust_standalone_sandboxed(self):
+        """Regression test for P1 commits-review-6: standalone Rust files (without Cargo.toml) validate using --crate-type lib inside sandbox."""
         import shutil
         if not shutil.which("rustc"):
             self.skipTest("rustc not installed on host")
 
         rs_valid = Path(self.cwd) / "valid.rs"
-        rs_valid.write_text("fn main() {}\n", encoding="utf-8")
+        rs_valid.write_text("fn helper() {}\n", encoding="utf-8")
         rs_invalid = Path(self.cwd) / "invalid.rs"
-        rs_invalid.write_text("fn main() { let x = ; }\n", encoding="utf-8")
+        rs_invalid.write_text("fn helper() { let x = ; }\n", encoding="utf-8")
 
-        with patch("makewand.linter.is_bwrap_available", return_value=False):
-            # Valid Rust must succeed without permission denied on /dev/null
-            ok, errors = fast_syntax_check(self.cwd, ["valid.rs"])
-            self.assertTrue(ok, f"Expected valid.rs to succeed in fallback, got: {errors}")
-            self.assertEqual(errors, [])
+        # Valid standalone Rust without main() must succeed due to --crate-type lib
+        ok, errors = fast_syntax_check(self.cwd, ["valid.rs"])
+        self.assertTrue(ok, f"Expected valid.rs to succeed in sandbox, got: {errors}")
+        self.assertEqual(errors, [])
 
-            # Invalid Rust must fail with compilation error, not /dev/null OS error 13
-            ok, errors = fast_syntax_check(self.cwd, ["invalid.rs"])
-            self.assertFalse(ok)
-            self.assertEqual(len(errors), 1)
-            self.assertNotIn("Permission denied", errors[0])
-            self.assertIn("error", errors[0].lower())
+        # Invalid Rust must fail with compilation error
+        ok, errors = fast_syntax_check(self.cwd, ["invalid.rs"])
+        self.assertFalse(ok)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("invalid.rs", errors[0])
 
     def test_fast_syntax_check_go_package_and_fallback(self):
-        """Regression test for Priority 1: Go syntax check must support multi-file packages and offline sandbox without network errors."""
+        """Regression test: Go syntax check must support multi-file packages and sandbox execution."""
         import shutil
         if not shutil.which("go") and not shutil.which("gofmt"):
             self.skipTest("Neither go nor gofmt installed on host")
@@ -204,46 +196,30 @@ class TestLinter(unittest.TestCase):
         bad_go = Path(self.cwd) / "bad.go"
         bad_go.write_text("package main\nfunc main() { syntax error }\n", encoding="utf-8")
 
-        # 1. Fallback mode without bwrap
+        # 1. Live sandbox mode
+        ok, errors = fast_syntax_check(self.cwd, ["foo.go"])
+        self.assertTrue(ok, f"Expected foo.go to pass in sandbox, got: {errors}")
+
+        ok, errors = fast_syntax_check(self.cwd, ["bad.go"])
+        self.assertFalse(ok)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("bad.go", errors[0])
+
+        # 2. When sandbox is unavailable, skip gracefully without false syntax errors
         from unittest.mock import patch
-        with patch("makewand.linter.is_bwrap_available", return_value=False):
-            ok, errors = fast_syntax_check(self.cwd, ["foo.go"])
-            self.assertTrue(ok, f"Expected multi-file package foo.go to pass in fallback, got: {errors}")
-
-            ok, errors = fast_syntax_check(self.cwd, ["bad.go"])
-            self.assertFalse(ok)
-            self.assertEqual(len(errors), 1)
-            self.assertIn("bad.go", errors[0])
-
-        # 2. Live sandbox mode (if bwrap is available)
-        from makewand.sandbox import is_bwrap_available
-        if is_bwrap_available():
-            ok, errors = fast_syntax_check(self.cwd, ["foo.go"])
-            self.assertTrue(ok, f"Expected foo.go to pass in sandbox, got: {errors}")
-
-            ok, errors = fast_syntax_check(self.cwd, ["bad.go"])
-            self.assertFalse(ok)
-            self.assertEqual(len(errors), 1)
-            self.assertIn("bad.go", errors[0])
+        with patch("makewand.linter.run_in_sandbox", return_value=(-1, "", "SandboxUnavailable", "SandboxUnavailable")):
+            ok, errors = fast_syntax_check(self.cwd, ["foo.go", "bad.go"])
+            self.assertTrue(ok)
+            self.assertEqual(errors, [])
 
     def test_fast_syntax_check_go_gofmt_only(self):
         """Regression test: Go syntax check must succeed using gofmt when go binary is missing."""
         from unittest.mock import patch
-        import shutil
 
         foo_go = Path(self.cwd) / "only_gofmt.go"
         foo_go.write_text("package main\nfunc main() {}\n", encoding="utf-8")
 
-        # 1. Fallback mode: go is missing, gofmt is available
-        with patch("makewand.linter.is_bwrap_available", return_value=False), \
-             patch("shutil.which", side_effect=lambda x: "/usr/bin/gofmt" if x == "gofmt" else None):
-            ok, errors = fast_syntax_check(self.cwd, ["only_gofmt.go"])
-            self.assertTrue(ok, f"Expected gofmt fallback without go binary to succeed, got {errors}")
-            self.assertEqual(errors, [])
-
-        # 2. Sandbox mode: go is missing, gofmt is available
-        with patch("makewand.linter.is_bwrap_available", return_value=True), \
-             patch("shutil.which", side_effect=lambda x: "/usr/bin/gofmt" if x == "gofmt" else None), \
+        with patch("shutil.which", side_effect=lambda x: "/usr/bin/gofmt" if x == "gofmt" else None), \
              patch("makewand.linter.run_in_sandbox", return_value=(0, "", "", None)) as mock_sandbox:
             ok, errors = fast_syntax_check(self.cwd, ["only_gofmt.go"])
             self.assertTrue(ok)
@@ -252,22 +228,98 @@ class TestLinter(unittest.TestCase):
             cmd = mock_sandbox.call_args[0][0]
             self.assertEqual(cmd[0], "/usr/bin/gofmt")
 
-    def test_fast_syntax_check_bwrap_runtime_error_fallback(self):
-        """Regression test: when run_in_sandbox fails with bwrap runtime/namespace error, fall back to isolated tempdir."""
-        from unittest.mock import patch, MagicMock
+    def test_fast_syntax_check_bwrap_runtime_error_skipped_safely(self):
+        """Regression test for P1 commits-review-6: when run_in_sandbox fails with bwrap runtime/namespace error, skip without failing or running unsandboxed."""
+        from unittest.mock import patch
         js_file = Path(self.cwd) / "fallback.js"
         js_file.write_text("const a = 10;\n", encoding="utf-8")
 
-        with patch("makewand.linter.is_bwrap_available", return_value=True), \
-             patch("makewand.linter.run_in_sandbox", return_value=(1, "", "bwrap: Can't create user namespace: Operation not permitted\n", None)), \
+        with patch("makewand.linter.run_in_sandbox", return_value=(1, "", "bwrap: Can't create user namespace: Operation not permitted\n", None)), \
              patch("subprocess.run") as mock_subproc:
-            mock_subproc.return_value = MagicMock(returncode=0, stdout="", stderr="")
             ok, errors = fast_syntax_check(self.cwd, ["fallback.js"])
             self.assertTrue(ok)
             self.assertEqual(errors, [])
-            self.assertTrue(mock_subproc.called)
-            run_cwd = mock_subproc.call_args[1].get("cwd")
-            self.assertNotEqual(run_cwd, self.cwd)
+            mock_subproc.assert_not_called()
+
+    def test_fast_syntax_check_react_jsx_in_js_passes(self):
+        """Regression test for P1 commits-review-6: React .js files containing JSX syntax must not fail syntax gate."""
+        js_file = Path(self.cwd) / "App.js"
+        js_file.write_text(
+            "import React from 'react';\n"
+            "export const App = () => {\n"
+            "    return (\n"
+            "        <div className=\"container\">\n"
+            "            <h1>Hello World</h1>\n"
+            "        </div>\n"
+            "    );\n"
+            "};\n"
+            "export default App;\n",
+            encoding="utf-8"
+        )
+        ok, errors = fast_syntax_check(self.cwd, ["App.js"])
+        self.assertTrue(ok, f"Expected React JSX file App.js to pass syntax check, got: {errors}")
+        self.assertEqual(errors, [])
+
+    def test_fast_syntax_check_react_fragment_in_js_passes(self):
+        """Regression test for P1 commits-review-6: React .js files with JSX fragments <>...</> must not fail syntax gate."""
+        js_file = Path(self.cwd) / "FragmentComponent.js"
+        js_file.write_text(
+            "const FragmentComponent = () => (\n"
+            "    <>\n"
+            "        <span>First</span>\n"
+            "        <span>Second</span>\n"
+            "    </>\n"
+            ");\n"
+            "export default FragmentComponent;\n",
+            encoding="utf-8"
+        )
+        ok, errors = fast_syntax_check(self.cwd, ["FragmentComponent.js"])
+        self.assertTrue(ok, f"Expected fragment JSX to pass syntax check, got: {errors}")
+        self.assertEqual(errors, [])
+
+    def test_fast_syntax_check_react_component_tags_in_js_passes(self):
+        """Regression test for P1 commits-review-6: React .js files with custom <Component /> tags must not fail."""
+        js_file = Path(self.cwd) / "Dashboard.js"
+        js_file.write_text(
+            "const Dashboard = () => <UserProfile id={123} />;\n"
+            "export default Dashboard;\n",
+            encoding="utf-8"
+        )
+        ok, errors = fast_syntax_check(self.cwd, ["Dashboard.js"])
+        self.assertTrue(ok, f"Expected custom JSX tag to pass syntax check, got: {errors}")
+        self.assertEqual(errors, [])
+
+    def test_fast_syntax_check_rust_cargo_crate_module_passes(self):
+        """Regression test for P1 commits-review-6: Rust multi-file crate submodules referencing crate/super must not fail."""
+        cargo_toml = Path(self.cwd) / "Cargo.toml"
+        cargo_toml.write_text(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            encoding="utf-8"
+        )
+        src_dir = Path(self.cwd) / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        lib_rs = src_dir / "lib.rs"
+        lib_rs.write_text("pub mod parser;\npub fn helper() {}\n", encoding="utf-8")
+        parser_rs = src_dir / "parser.rs"
+        parser_rs.write_text("use crate::helper;\npub fn parse() { helper(); }\n", encoding="utf-8")
+
+        ok, errors = fast_syntax_check(self.cwd, ["src/parser.rs", "src/lib.rs"])
+        self.assertTrue(ok, f"Expected Cargo crate modules to pass syntax gate without standalone rustc errors, got: {errors}")
+        self.assertEqual(errors, [])
+
+    def test_fast_syntax_check_rust_cargo_crate_nested_submodule_passes(self):
+        """Regression test for P1 commits-review-6: Deeply nested modules in Cargo crates must be recognized."""
+        cargo_toml = Path(self.cwd) / "Cargo.toml"
+        cargo_toml.write_text("[package]\nname = \"nested\"\nversion = \"0.1.0\"\n", encoding="utf-8")
+        nested_dir = Path(self.cwd) / "src" / "ast" / "tokens"
+        nested_dir.mkdir(parents=True, exist_ok=True)
+        token_rs = nested_dir / "token.rs"
+        token_rs.write_text("use super::super::types;\npub struct Token;\n", encoding="utf-8")
+
+        ok, errors = fast_syntax_check(self.cwd, ["src/ast/tokens/token.rs"])
+        self.assertTrue(ok, f"Expected nested module to pass syntax check, got: {errors}")
+        self.assertEqual(errors, [])
+
 
 
 
