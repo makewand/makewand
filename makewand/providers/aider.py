@@ -89,7 +89,7 @@ def execute_aider_task(
         from makewand.execution_runtime import mark_provider_invocation
         from makewand.sandbox import sandbox_lifecycle
         mark_provider_invocation()
-        with sandbox_lifecycle(is_provider=True, provider_name="aider", cmd=cmd):
+        with sandbox_lifecycle(is_provider=True, provider_name="aider", cmd=cmd, readonly=readonly):
             code, out, err, ex = run_subprocess(
                 cmd,
                 timeout=timeout,

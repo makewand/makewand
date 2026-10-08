@@ -28,16 +28,19 @@ starts inside a writable workspace are not masked.
 import json
 import os
 import platform
+import signal
 import socket
 import stat
 import struct
 import sys
 import shutil
 import tempfile
+import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from contextlib import contextmanager
 
 from makewand.providers.base import run_subprocess
@@ -145,12 +148,12 @@ SAFE_HOME_BIN_DIRS = [
 # keys, daemon control keys, runtime sockets). The sandbox gets an empty tmpfs
 # instead, so it can neither read nor poison them.
 #
-# "readonly_state" (optional) lists the state entries a *read-only* task may
-# still write. When present, a read-only task mounts the whole state root
-# read-only and re-binds only these entries writable. Providers without it keep
-# the writable-root + read-only-config layout for read-only tasks as well,
-# relying on their own CLI read-only mode, because their on-disk state (SQLite
-# WAL/journal files created next to the databases) needs a writable root.
+# "readonly_state" lists the state entries a *read-only* task may still write
+# (e.g. session logs, credential caches). When present and readonly=True, wrap_bwrap
+# mounts the entire provider state root read-only and re-binds only these whitelisted
+# subpaths writable. This ensures that uncreated sensitive files (like AGENTS.override.md,
+# hooks.json, policy/) cannot be created by a sandboxed process, eliminating the need
+# for dangerous post-execution cleanup during read-only tasks.
 # ---------------------------------------------------------------------------
 PROVIDER_PROFILES: Dict[str, dict] = {
     "claude": {
@@ -247,6 +250,30 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".codex-2", "app-server-control"),
             (".codex-2", "app-server-daemon"),
         ],
+        "readonly_state": [
+            (".codex", "sessions"),
+            (".codex", "history.jsonl"),
+            (".codex", "log"),
+            (".codex", "logs"),
+            (".codex", "cache"),
+            (".codex", "tmp"),
+            (".codex", ".tmp"),
+            (".codex", "version.json"),
+            (".codex", "session_index.jsonl"),
+            (".codex", "models_cache.json"),
+            (".codex", "archived_sessions"),
+            (".codex-2", "sessions"),
+            (".codex-2", "history.jsonl"),
+            (".codex-2", "log"),
+            (".codex-2", "logs"),
+            (".codex-2", "cache"),
+            (".codex-2", "tmp"),
+            (".codex-2", ".tmp"),
+            (".codex-2", "version.json"),
+            (".codex-2", "session_index.jsonl"),
+            (".codex-2", "models_cache.json"),
+            (".codex-2", "archived_sessions"),
+        ],
     },
     "agy": {
         "roots": [".gemini"],
@@ -271,6 +298,14 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".gemini", "antigravity-cli/mcp_config.json", "file", None),
         ],
         "ephemeral": [],
+        "readonly_state": [
+            (".gemini", "history"),
+            (".gemini", "tmp"),
+            (".gemini", "state.json"),
+            (".gemini", "projects.json"),
+            (".gemini", "antigravity-cli/brain"),
+            (".gemini", "antigravity-cli/scratch"),
+        ],
     },
     "grok": {
         "roots": [".grok"],
@@ -290,6 +325,11 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".grok", "trusted_folders.toml", "file", None),
         ],
         "ephemeral": [],
+        "readonly_state": [
+            (".grok", "logs"),
+            (".grok", "cache"),
+            (".grok", "tmp"),
+        ],
     },
     "muse": {
         "roots": [".config/muse", ".local/share/muse"],
@@ -304,12 +344,21 @@ PROVIDER_PROFILES: Dict[str, dict] = {
         "ephemeral": [
             (".local/share/muse", "runtime"),
         ],
+        "readonly_state": [
+            (".config/muse", "cache"),
+            (".local/share/muse", "logs"),
+            (".local/share/muse", "cache"),
+        ],
     },
     "aider": {
         "roots": [".aider"],
         "home_ro_files": [".aider.conf.yml"],
         "protected": [],
         "ephemeral": [],
+        "readonly_state": [
+            (".aider", "caches"),
+            (".aider", "analytics.json"),
+        ],
     },
 }
 
@@ -651,7 +700,7 @@ def _provider_mounts(
             raise SandboxConfigError("configured CODEX_HOME does not exist; refusing account fallback")
         profile = dict(profile)
         profile["roots"] = [selected]
-        for category in ("protected", "ephemeral"):
+        for category in ("protected", "ephemeral", "readonly_state"):
             profile[category] = [(selected, *entry[1:]) for entry in profile.get(category, [])
                                  if entry[0] == ".codex"]
     args: List[str] = []
@@ -1466,9 +1515,48 @@ def _collect_uncreated_sensitive_files(
     return list(dict.fromkeys(targets))
 
 
-def _robust_force_remove(path: str) -> None:
-    """Recursively removes a file or directory, adjusting read-only permissions if needed."""
+@dataclass
+class _SensitiveFileSnapshot:
+    paths: List[str]
+    initial_inodes: Dict[str, Optional[Tuple[int, int]]]
+    start_time: float
+    readonly: bool = False
+
+
+def _create_sensitive_snapshot(
+    paths: Sequence[str],
+    readonly: bool = False,
+) -> _SensitiveFileSnapshot:
+    initial_inodes: Dict[str, Optional[Tuple[int, int]]] = {}
+    for p in paths:
+        if os.path.lexists(p):
+            try:
+                st = os.lstat(p)
+                initial_inodes[p] = (st.st_dev, st.st_ino)
+            except OSError:
+                initial_inodes[p] = None
+        else:
+            initial_inodes[p] = None
+    return _SensitiveFileSnapshot(
+        paths=list(paths),
+        initial_inodes=initial_inodes,
+        start_time=time.time(),
+        readonly=readonly,
+    )
+
+
+def _robust_force_remove_inode_tracked(
+    path: str,
+    expected_dev_ino: Optional[Tuple[int, int]] = None,
+) -> None:
+    """Recursively removes a file or directory, checking dev/ino and adjusting permissions."""
     if not os.path.lexists(path):
+        return
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if expected_dev_ino is not None and (st.st_dev, st.st_ino) != expected_dev_ino:
         return
     if os.path.islink(path):
         try:
@@ -1486,7 +1574,7 @@ def _robust_force_remove(path: str) -> None:
         except OSError:
             entries = []
         for entry in entries:
-            _robust_force_remove(os.path.join(path, entry))
+            _robust_force_remove_inode_tracked(os.path.join(path, entry), None)
         try:
             os.rmdir(path)
         except OSError:
@@ -1498,14 +1586,53 @@ def _robust_force_remove(path: str) -> None:
             pass
 
 
-def _cleanup_uncreated_sensitive_files(paths: List[str]) -> None:
-    """Removes sensitive files that were created during sandbox execution."""
-    for p in paths:
-        if os.path.lexists(p):
-            try:
-                _robust_force_remove(p)
-            except OSError:
-                pass
+def _robust_force_remove(path: str) -> None:
+    """Recursively removes a file or directory, adjusting read-only permissions if needed."""
+    _robust_force_remove_inode_tracked(path, None)
+
+
+def _cleanup_uncreated_sensitive_files(
+    target: Union[Sequence[str], _SensitiveFileSnapshot],
+) -> None:
+    """
+    Removes sensitive files that were created during sandbox execution.
+    Guards against deleting files that existed before sandbox execution, files created
+    by concurrent host sessions in readonly tasks, or inodes replaced after creation.
+    """
+    if isinstance(target, _SensitiveFileSnapshot):
+        snapshot = target
+    else:
+        snapshot = _create_sensitive_snapshot(target, readonly=False)
+
+    # In readonly mode with whole-root ro-bind, Bubblewrap mounted the state root read-only,
+    # so the sandboxed process could never create or write to any sensitive provider file.
+    # Any sensitive path present on host was created by an external/concurrent host session;
+    # never delete in readonly mode.
+    if snapshot.readonly:
+        return
+
+    for p in snapshot.paths:
+        # Pre-existing paths must NEVER be deleted
+        if snapshot.initial_inodes.get(p) is not None:
+            continue
+
+        if not os.path.lexists(p):
+            continue
+
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+
+        # Files created before the sandbox started must not be deleted
+        if snapshot.start_time > 0 and st.st_ctime < snapshot.start_time - 1.0:
+            continue
+
+        expected_dev_ino = (st.st_dev, st.st_ino)
+        try:
+            _robust_force_remove_inode_tracked(p, expected_dev_ino)
+        except OSError:
+            pass
 
 
 @contextmanager
@@ -1513,21 +1640,47 @@ def sandbox_lifecycle(
     is_provider: bool = False,
     provider_name: Optional[str] = None,
     cmd: Optional[List[str]] = None,
+    readonly: bool = False,
 ):
     """
     Manages safe provider sandbox lifecycle.
     Tracks uncreated sensitive provider files before execution and ensures any that
     are created during execution are cleanly removed on completion.
+    Guards against concurrent host file deletion and abnormal signal termination.
     """
     tracked = _collect_uncreated_sensitive_files(
         is_provider=is_provider,
         provider_name=provider_name,
         cmd=cmd,
     )
+    snapshot = _create_sensitive_snapshot(tracked, readonly=readonly)
+
+    sig_handlers: Dict[int, Any] = {}
+    sig_fired: List[int] = []
+
+    def _sig_handler(signum: int, frame: Any) -> None:
+        sig_fired.append(signum)
+        raise KeyboardInterrupt(f"Sandbox terminated by signal {signum}")
+
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                sig_handlers[sig] = signal.signal(sig, _sig_handler)
+            except (ValueError, OSError):
+                pass
+
     try:
         yield tracked
     finally:
-        _cleanup_uncreated_sensitive_files(tracked)
+        try:
+            _cleanup_uncreated_sensitive_files(snapshot)
+        finally:
+            if threading.current_thread() is threading.main_thread():
+                for sig, old_h in sig_handlers.items():
+                    try:
+                        signal.signal(sig, old_h)
+                    except (ValueError, OSError):
+                        pass
 
 
 def run_in_sandbox(
@@ -1556,7 +1709,7 @@ def run_in_sandbox(
     exec_cmd = cmd
     seccomp_r = None
     pass_fds: tuple = ()
-    with sandbox_lifecycle(is_provider=is_provider, provider_name=provider_name, cmd=cmd):
+    with sandbox_lifecycle(is_provider=is_provider, provider_name=provider_name, cmd=cmd, readonly=readonly):
         try:
             if is_bwrap_available():
                 if enable_seccomp:
