@@ -1658,7 +1658,8 @@ def sandbox_lifecycle(
         raise KeyboardInterrupt(f"Sandbox terminated by signal {signum}")
 
     if threading.current_thread() is threading.main_thread():
-        for sig in (signal.SIGTERM, signal.SIGHUP):
+        signals_to_catch = [sig for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if sig is not None]
+        for sig in signals_to_catch:
             try:
                 sig_handlers[sig] = signal.signal(sig, _sig_handler)
             except (ValueError, OSError):
