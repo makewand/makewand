@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -245,8 +246,24 @@ func approvalWorkspaceManifest(workspace string) (map[string]PendingFileRecord, 
 			return nil
 		}
 		info, err := root.Lstat(relative)
-		if err != nil || !info.Mode().IsRegular() {
-			return fmt.Errorf("pending approval input must be regular: %s", relative)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("readlink pending approval symlink: %w", err)
+			}
+			sum := sha256.Sum256([]byte("symlink:" + target))
+			manifest[filepath.ToSlash(relative)] = PendingFileRecord{
+				Hash: hex.EncodeToString(sum[:]),
+				Size: int64(len(target)),
+				Mode: info.Mode().Perm(),
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("pending approval input must be regular or symlink: %s", relative)
 		}
 		file, err := root.Open(relative)
 		if err != nil {
@@ -271,6 +288,20 @@ func approvalWorkspaceManifest(workspace string) (map[string]PendingFileRecord, 
 		return nil
 	})
 	return manifest, err
+}
+
+func approvalBaselineDigest(baseline map[string]PendingFileRecord) string {
+	paths := make([]string, 0, len(baseline))
+	for p := range baseline {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	h := sha256.New()
+	for _, p := range paths {
+		r := baseline[p]
+		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%03o\n", p, r.Hash, r.Size, r.Mode)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func pendingPayloadDigest(files []ExtractedFile, plan *ExecPlan) string {
@@ -302,14 +333,11 @@ func (p *Project) SavePendingApproval(ctx context.Context, files []ExtractedFile
 	if err != nil {
 		return nil, err
 	}
-	digest, err := AcceptanceInputDigest(workspace)
-	if err != nil {
-		return nil, err
-	}
 	baseline, err := approvalWorkspaceManifest(workspace)
 	if err != nil {
 		return nil, err
 	}
+	digest := approvalBaselineDigest(baseline)
 	expected := make(map[string]PendingFileRecord, len(baseline)+len(files))
 	for path, value := range baseline {
 		expected[path] = value
@@ -337,8 +365,8 @@ func (p *Project) SavePendingApproval(ctx context.Context, files []ExtractedFile
 	if err := checkApplyWorkspace(workspace, rootID); err != nil {
 		return nil, err
 	}
-	after, err := AcceptanceInputDigest(workspace)
-	if err != nil || after != digest {
+	afterBaseline, err := approvalWorkspaceManifest(workspace)
+	if err != nil || approvalBaselineDigest(afterBaseline) != digest {
 		return nil, fmt.Errorf("workspace changed while sealing pending approval")
 	}
 	record := &PendingApproval{Schema: 1, ID: rand.Text(), Workspace: workspace, RootID: rootID,
@@ -495,8 +523,8 @@ func (p *Project) ValidatePendingApproval(ctx context.Context, record *PendingAp
 	if pendingPayloadDigest(files, record.Plan) != record.PayloadDigest {
 		return fmt.Errorf("pending approval payload changed after sealing")
 	}
-	digest, err := AcceptanceInputDigest(workspace)
-	if err != nil || digest != record.BaselineDigest {
+	currentBaseline, err := approvalWorkspaceManifest(workspace)
+	if err != nil || approvalBaselineDigest(currentBaseline) != record.BaselineDigest {
 		return fmt.Errorf("pending approval baseline changed; inspect preserved recovery evidence")
 	}
 	return nil

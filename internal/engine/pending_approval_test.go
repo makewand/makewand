@@ -288,3 +288,60 @@ func TestPendingApprovalPriorCommandAuthorizationIsNeverReplayed(t *testing.T) {
 		t.Fatalf("prior command decision was reused: %+v, %v", recovered, err)
 	}
 }
+
+func TestPendingApprovalWorkspaceWithSymlinks(t *testing.T) {
+	p := pendingApprovalFixture(t)
+	// Create node_modules/.bin/tool -> ../tool/bin.js
+	toolDir := filepath.Join(p.Path, "node_modules", "tool")
+	binDir := filepath.Join(p.Path, "node_modules", ".bin")
+	if err := os.MkdirAll(toolDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(toolDir, "bin.js"), []byte("console.log('hi');\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "tool", "bin.js"), filepath.Join(binDir, "tool")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	// Create an in-repo symlink docs/link.txt -> ../answer.txt
+	docsDir := filepath.Join(p.Path, "docs")
+	if err := os.MkdirAll(docsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "answer.txt"), filepath.Join(docsDir, "link.txt")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	// 1. SavePendingApproval must succeed even with symlinks present in workspace
+	files := []ExtractedFile{{Path: "answer.txt", Content: "updated answer"}}
+	record, err := p.SavePendingApproval(context.Background(), files, "file_write", 1, "Edit answer", "details", nil)
+	if err != nil {
+		t.Fatalf("SavePendingApproval with symlinks failed: %v", err)
+	}
+
+	// 2. ValidatePendingApproval must succeed
+	if err := p.ValidatePendingApproval(context.Background(), record, files); err != nil {
+		t.Fatalf("ValidatePendingApproval failed: %v", err)
+	}
+
+	// 3. Attempting to write a file targeting an existing symlink path must be refused by validatePath
+	symlinkWrite := []ExtractedFile{{Path: "docs/link.txt", Content: "overwriting symlink"}}
+	if _, err := p.SavePendingApproval(context.Background(), symlinkWrite, "file_write", 1, "Overwrite symlink", "bad", nil); err == nil {
+		t.Fatal("SavePendingApproval targeting a symlink path should be rejected")
+	}
+
+	// 4. Modifying a symlink target triggers baseline invalidation
+	if err := os.Remove(filepath.Join(docsDir, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "new_target.txt"), filepath.Join(docsDir, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ValidatePendingApproval(context.Background(), record, files); err == nil || !strings.Contains(err.Error(), "baseline changed") {
+		t.Fatalf("ValidatePendingApproval should detect symlink baseline change, got: %v", err)
+	}
+}

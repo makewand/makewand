@@ -211,6 +211,52 @@ func TestLoadRepoContext_UntrustedRepoSkipsSymlinkOutsideRoot(t *testing.T) {
 	}
 }
 
+// TestLoadRepoContext_TrustedModeSkipsSymlinkOutsideRoot verifies that even in
+// default trusted mode, a key file or symbol file symlinked to a host file
+// OUTSIDE the project root (e.g. ~/.ssh/id_rsa, /etc/passwd) is never read into
+// FileHints or Symbols.
+func TestLoadRepoContext_TrustedModeSkipsSymlinkOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "repo")
+	outsideDir := filepath.Join(root, "host")
+	if err := os.MkdirAll(projectDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(project): %v", err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(outside): %v", err)
+	}
+	const secret = "TRUSTED-PRIVATE-KEY-DO-NOT-EXFILTRATE"
+	secretPath := filepath.Join(outsideDir, "id_rsa")
+	if err := os.WriteFile(secretPath, []byte(secret+"\nmore\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(secret): %v", err)
+	}
+	// go.mod is a key file; point it at the out-of-root host secret.
+	if err := os.Symlink(secretPath, filepath.Join(projectDir, "go.mod")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	// Also create an in-project regular file to ensure normal hints work.
+	if err := os.WriteFile(filepath.Join(projectDir, "main.go"), []byte("package main\nfunc Hello() {}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(main.go): %v", err)
+	}
+
+	files := []FileEntry{{Path: "go.mod", IsDir: false}, {Path: "main.go", IsDir: false}}
+	// Default / trusted mode call
+	rc, err := LoadRepoContext(projectDir, files)
+	if err != nil {
+		t.Fatalf("LoadRepoContext: %v", err)
+	}
+	if _, ok := rc.FileHints["go.mod"]; ok {
+		t.Error("trusted mode read an out-of-root symlinked key file, want it skipped")
+	}
+	if strings.Contains(rc.ForPrompt(10000), secret) {
+		t.Error("assembled trusted prompt leaked an out-of-root host secret via symlink")
+	}
+	// Regular in-project file should still be present
+	if _, ok := rc.FileHints["main.go"]; !ok {
+		t.Error("trusted mode should still read normal in-project file main.go")
+	}
+}
+
 // TestLoadRepoContext_UntrustedRepoReadsNormalFilesBesideSymlink verifies the
 // guard is not over-broad: a normal regular key file is still read for hints and
 // symbols in untrusted mode even when a sibling symlinked entry is skipped.
