@@ -37,7 +37,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y expect bubblewrap
+          sudo apt-get install -y expect bubblewrap ripgrep
+          rg --version
 
       - name: Allow unprivileged user namespaces for bubblewrap
         # Ubuntu 24.04 runners ship kernel.apparmor_restrict_unprivileged_userns=1,
@@ -78,6 +79,9 @@ jobs:
           MAKEWAND_REQUIRE_BWRAP: "1"
         run: go test ./internal/engine -run '^TestEvaluateCandidateFiles_LiveBwrapIsolation$' -count=1 -v
 
+      - name: Run tests
+        run: bash ./scripts/test_gate.sh
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -86,15 +90,23 @@ jobs:
       - name: Install Python test dependencies
         run: pip install pytest
 
-      - name: Python, dispatch and installer tests
-        run: |
-          python3 -I scripts/test_python.py
-          bash dispatch/test.sh
-          python3 -I scripts/test_installation.py
-          python3 -I benchmarks/test_runner.py
+      - name: Run Python unit tests
+        run: python3 -I scripts/test_python.py
 
-      - name: Run tests
-        run: bash ./scripts/test_gate.sh
+      - name: Dispatch regression tests
+        run: bash dispatch/test.sh
+
+      - name: Offline benchmark harness
+        run: |
+          python3 -I benchmarks/test_runner.py
+          python3 -I benchmarks/test_deep_config_acceptance_v4.py
+          python3 -I benchmarks/test_analyze_results.py
+
+      - name: Installer and unpacked release contract
+        run: python3 -I scripts/test_installation.py
+
+      - name: Run race tests
+        run: bash ./scripts/test_race.sh
 
       - name: Run vet
         run: go vet ./...
