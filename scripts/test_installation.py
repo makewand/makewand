@@ -35,6 +35,21 @@ def installer_module():
     return module
 
 
+def find_bash():
+    if os.name == "nt":
+        git = shutil.which("git")
+        if git:
+            git_root = Path(git).resolve().parent.parent
+            for sub in ("bin/bash.exe", "usr/bin/bash.exe"):
+                candidate = git_root / sub
+                if candidate.is_file():
+                    return str(candidate)
+        for p in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"):
+            if os.path.isfile(p):
+                return p
+    return "bash"
+
+
 class InstallationTests(unittest.TestCase):
     def test_failed_upgrade_preserves_complete_previous_version(self):
         with tempfile.TemporaryDirectory(prefix="makewand-upgrade-") as directory:
@@ -53,7 +68,7 @@ class InstallationTests(unittest.TestCase):
             env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}",
                        MAKEWAND_INSTALL_ROOT=str(temp / "installed"), MAKEWAND_BIN_DIR=str(temp / "bin"),
                        MAKEWAND_SKILLS_DIR=str(temp / "skills"), MAKEWAND_CONFIG_DIR=str(temp / "config"))
-            command = ["bash", str(source / "scripts/install.sh")]
+            command = [find_bash(), str(source / "scripts/install.sh")]
             subprocess.run(command, env=env, check=True, capture_output=True)
             current = temp / "installed/current"
             previous_target = current.resolve()
@@ -176,7 +191,7 @@ class InstallationTests(unittest.TestCase):
                        MAKEWAND_INSTALL_ROOT=str(app), MAKEWAND_SOURCE_DIR=str(app), MAKEWAND_BIN_DIR=str(binaries),
                        MAKEWAND_SKILLS_DIR=str(temp / "skills"), MAKEWAND_CONFIG_DIR=str(temp / "config"),
                        PYTHONPATH=str(hostile))
-            subprocess.run(["bash", str(ROOT / "site" / "install.sh")], cwd=hostile, env=env,
+            subprocess.run([find_bash(), str(ROOT / "site" / "install.sh")], cwd=hostile, env=env,
                            check=True, capture_output=True, text=True)
             self.assertFalse((binaries / "makewand").is_symlink())
             self.assertEqual(before, hashlib.sha256((app / "bin" / "makewand").read_bytes()).hexdigest())
@@ -226,7 +241,7 @@ class InstallationTests(unittest.TestCase):
                 else:
                     packed.extractall(extracted)
             shutil.rmtree(bundle.parent)
-            subprocess.run(["bash", str(ROOT / "scripts" / "release_contract.sh"),
+            subprocess.run([find_bash(), str(ROOT / "scripts" / "release_contract.sh"),
                             str(extracted / "makewand" / executable), version], check=True)
             if os.name != "nt":
                 # Homebrew retains both engines under libexec and exposes a bin entry.
@@ -238,7 +253,7 @@ class InstallationTests(unittest.TestCase):
                                cwd=temp, check=True, capture_output=True)
             # Incomplete artifacts must fail even if the developer has another install.
             shutil.rmtree(extracted / "makewand" / "lib")
-            result = subprocess.run(["bash", str(ROOT / "scripts" / "release_contract.sh"),
+            result = subprocess.run([find_bash(), str(ROOT / "scripts" / "release_contract.sh"),
                                      str(extracted / "makewand" / executable), version], capture_output=True)
             self.assertNotEqual(result.returncode, 0)
 

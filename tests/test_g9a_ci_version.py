@@ -5,6 +5,7 @@
   v3.0.2 were tagged while __version__ still said 3.0.0);
 - CHANGELOG.md documents every 3.x release.
 """
+import os
 import re
 import shutil
 import subprocess
@@ -38,10 +39,25 @@ def _git(*args):
     return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
 
 
-@unittest.skipUnless(shutil.which("bash"), "bash required")
+def _find_bash():
+    if os.name == "nt":
+        git = shutil.which("git")
+        if git:
+            git_root = Path(git).resolve().parent.parent
+            for sub in ("bin/bash.exe", "usr/bin/bash.exe"):
+                candidate = git_root / sub
+                if candidate.is_file():
+                    return str(candidate)
+        for p in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"):
+            if os.path.isfile(p):
+                return p
+    return shutil.which("bash")
+
+
+@unittest.skipUnless(_find_bash(), "bash required")
 class CheckVersionTests(unittest.TestCase):
     def _run(self, *args, root=None):
-        cmd = ["bash", str(CHECK_VERSION)]
+        cmd = [_find_bash(), str(CHECK_VERSION)]
         if root is not None:
             cmd += ["--root", str(root)]
         return subprocess.run(cmd + list(args), capture_output=True, text=True)
