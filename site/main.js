@@ -70,7 +70,7 @@ const terminalScenarios = {
 | <span class="term-cmd">demo-service</span> | /workspace/demo-service | server_daemon | 零售仪表盘后台服务正常监听 (8765) | <span class="term-success">🟢 运行中</span> |
 | <span class="term-cmd">demo-app</span> | /workspace/demo-app | quota_exhausted | 模型配额已见底 (0% left)，AGY接管 | <span class="term-warn">⚠️ 额度已见底</span> |
 | <span class="term-cmd">project-b</span> | /workspace/project-b | test_ci | 单元与端到端自动化测试进行中 | <span class="term-info">🔵 测试中</span> |
-| <span class="term-cmd">makewand</span> | /workspace/makewand | idle_ready | v3.1.0 已发布，工作区干净待命 | <span class="term-success">🟢 就绪空闲</span> |
+| <span class="term-cmd">makewand</span> | /workspace/makewand | idle_ready | v3.2.0 已发布，工作区干净待命 | <span class="term-success">🟢 就绪空闲</span> |
 `
 };
 

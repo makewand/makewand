@@ -67,8 +67,8 @@ Python 候选应用支持 POSIX 和原生 Windows 固定句柄。Windows 执行�
 
 | Version | Supported |
 | --- | --- |
-| `v3.1.x` | Yes |
-| `< v3.1.0` | No |
+| `v3.2.x` | Yes |
+| `< v3.2.0` | No |
 
 ## Reporting a Vulnerability
 

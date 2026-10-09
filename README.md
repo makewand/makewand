@@ -1,4 +1,4 @@
-# Makewand (魔杖) v3.1.0
+# Makewand (魔杖) v3.2.0
 
 > **多模型编程订阅联合调度与红队自愈体系** (Unified Multi-Model Subscription Orchestrator)  
 > 官方网站：[https://makewand.org](https://makewand.org) · 备用镜像：[https://makewand.com](https://makewand.com)  

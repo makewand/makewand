@@ -37,7 +37,7 @@ class TestInteractiveConsole(unittest.TestCase):
         self.assertIn("╭", card)
         self.assertIn("╰", card)
         self.assertIn("│", card)
-        self.assertIn("Makewand (v3.1.0)", card)
+        self.assertIn("Makewand (v3.2.0)", card)
         self.assertIn("/help", card)
 
     def test_get_git_branch(self):

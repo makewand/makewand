@@ -9,8 +9,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-Evaluation remediation through 2026-09-30; changes remain unreleased.
-评估修复截至 2026-09-30，以下变更尚未发布。
+## [3.2.0] - 2026-10-09
+
+### Security & Hardening
+
+- **Bubblewrap 物理沙箱全线加固与跨平台支持**：
+  - 解决 Codex 0.162+ 在 `readonly=True` 审查模式下写 SQLite WAL/SHM 锁文件的只读文件系统报错（`os error 30 EROFS`），引入 tmpfs 内存写层并安全只读绑定宿主配置凭据。
+  - 影子工作树使用 `git clone --shared --dissociate` 解耦克隆，消除宿主仓库根目录挂载泄露风险。
+  - 非信任仓库更新子模块时严格封锁 `protocol.file.allow=always`，阻断本地文件窃取风险（CVE-2022-39253）。
+  - 宿主工作区事务备份区分纯依赖缓存与构建产物，感知 gitignore 状态，确保未被忽略的代码文件在事务回滚中完整保全。
+  - 家目录逃逸防护：`find_git_root` 终止于用户家目录和文件系统根边界；提供多账号凭据变体（如 `.codex-2`, `.codex-3` 等）动态掩码屏蔽。
+  - 环境隔离与宿主脱敏：自动剥离桌面 GUI/DBus 环境变量，防止进程通过 IPC 逃逸；支持 `MAKEWAND_DISABLE_UNSHARE_NET` 便携适配无 CAP_NET_ADMIN 容器环境。
+  - macOS 与无 bwrap 宿主友好降级：提供安全执行提示与 `--approval` 显式授权门禁。
+- **发布与 CI 流水线解封**：
+  - 修复 GitHub Actions runner 限制（relax `kernel.apparmor_restrict_unprivileged_userns`），打通端到端 live sandbox smoke 验证。
+  - 升级 Go 工具链指令至 `1.26.9`，全面消除 Go 标准库已知 CVE 漏洞。
 
 ### Fixed
 
@@ -215,7 +228,8 @@ Evaluation remediation through 2026-09-30; changes remain unreleased.
 0.1.x releases (last: v0.1.10, 2026-03-06) are described in their
 [GitHub release notes](https://github.com/makewand/makewand/releases).
 
-[Unreleased]: https://github.com/makewand/makewand/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/makewand/makewand/compare/v3.2.0...HEAD
+[3.2.0]: https://github.com/makewand/makewand/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/makewand/makewand/compare/v3.0.2...v3.1.0
 [3.0.2]: https://github.com/makewand/makewand/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/makewand/makewand/compare/v3.0.0...v3.0.1

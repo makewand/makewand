@@ -161,7 +161,7 @@ def render_welcome_card(cwd: str, repo_trust: str = "trusted", width: int = 66) 
     badges = get_model_status_badges()
 
     lines = [
-        f"{COLOR_BOLD}{COLOR_CYAN}🪄 Makewand (v3.1.0){COLOR_RESET}",
+        f"{COLOR_BOLD}{COLOR_CYAN}🪄 Makewand (v3.2.0){COLOR_RESET}",
         f"多模型智能调度 · {short_cwd}{branch_str}",
         f"模型状态: {badges}",
     ]
