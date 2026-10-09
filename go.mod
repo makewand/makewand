@@ -1,6 +1,6 @@
 module github.com/makewand/makewand
 
-go 1.26.7
+go 1.26.9
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0

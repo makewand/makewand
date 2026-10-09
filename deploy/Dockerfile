@@ -7,7 +7,7 @@
 #
 # The Go version must be at least the `go` directive in go.mod. GOTOOLCHAIN=local
 # makes a mismatch fail the build instead of downloading a toolchain.
-FROM golang:1.26.7 AS build
+FROM golang:1.26.9 AS build
 ENV GOTOOLCHAIN=local
 WORKDIR /src
 COPY . .

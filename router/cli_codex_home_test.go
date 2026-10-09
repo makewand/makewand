@@ -344,6 +344,10 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 }
 
 func TestWrapCodexHomeReviewReadonlyTmpfsMountAndMultiAccountMasking(t *testing.T) {
+	oldLookup := cliBwrapLookup
+	t.Cleanup(func() { cliBwrapLookup = oldLookup })
+	cliBwrapLookup = func(string) (string, error) { return "/usr/bin/bwrap", nil }
+
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
 	workspace := filepath.Join(root, "workspace")
