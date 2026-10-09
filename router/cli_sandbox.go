@@ -74,8 +74,8 @@ var cliSensitiveHomeEntries = []string{
 }
 
 var cliProviderCredentials = map[string][]string{
-	"claude":      {".claude", ".claude.json"},
-	"codex":       {".codex"},
+	"claude":      {".claude", ".claude.json", ".claude-2", ".claude-3"},
+	"codex":       {".codex", ".codex-2", ".codex-3"},
 	"gemini":      {".gemini", ".agy", ".antigravity"},
 	"agy":         {".gemini", ".agy", ".antigravity"},
 	"antigravity": {".gemini", ".agy", ".antigravity"},
@@ -603,6 +603,11 @@ func cliHomeMaskTarget(home, entry string) (cliCredentialMaskTarget, error) {
 			allowed = allowed || entry == candidate
 		}
 	}
+	for _, pfx := range []string{".codex", ".claude", ".gemini", ".openai", ".anthropic"} {
+		if strings.HasPrefix(entry, pfx) {
+			allowed = true
+		}
+	}
 	if !allowed {
 		return cliCredentialMaskTarget{}, errors.New("invalid credential mask entry")
 	}
@@ -944,11 +949,6 @@ func rebindToolchainUnderMaskedRoot(args []string, targetBin, workspace, home st
 // This prevents prompt-injection attacks from modifying host configurations or planting
 // malicious hooks for host RCE (remediating [P1] redteam-1).
 func cliShieldProviderState(args []string, providerKey, rootPath, workspace string, isReadOnly bool) []string {
-	if isReadOnly {
-		// In read-only mode, the whole provider root is already mounted with --ro-bind.
-		return args
-	}
-
 	cleanRoot := filepath.Clean(rootPath)
 	if cleanRoot == "" || cleanRoot == "." || cleanRoot == "/" || strings.Contains(cleanRoot, "..") {
 		return args
@@ -958,6 +958,38 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 	normKey := strings.ToLower(providerKey)
 	if normKey == "agy" || normKey == "antigravity" {
 		normKey = "gemini"
+	}
+
+	if isReadOnly {
+		if normKey == "codex" {
+			// In tmpfs readonly mode for codex: ro-bind essential config and protected paths into the tmpfs
+			for _, sub := range []string{"auth.json", "config.toml", "version.json", "models_cache.json"} {
+				subPath := filepath.Clean(filepath.Join(cleanRoot, sub))
+				if _, err := os.Stat(subPath); err == nil {
+					args = cliAppendRoBindIfNotPresent(args, subPath)
+				}
+			}
+			for _, entry := range cliProviderProtected["codex"] {
+				rel := filepath.FromSlash(entry.subpath)
+				if !filepath.IsLocal(rel) || strings.Contains(rel, "..") {
+					continue
+				}
+				subPath := filepath.Clean(filepath.Join(cleanRoot, rel))
+				if strings.Contains(subPath, "..") || !strings.HasPrefix(subPath, rootPrefix) {
+					continue
+				}
+				if fi, err := os.Lstat(subPath); err == nil {
+					if fi.Mode()&os.ModeSymlink != 0 {
+						if target, err := filepath.EvalSymlinks(subPath); err == nil {
+							args = cliAppendRoBindIfNotPresent(args, target)
+						}
+					} else {
+						args = cliAppendRoBindIfNotPresent(args, subPath)
+					}
+				}
+			}
+		}
+		return args
 	}
 
 	protectedList := cliProviderProtected[normKey]
@@ -1363,6 +1395,18 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 					}
 				}
 			}
+			if homeEntries, err := os.ReadDir(home); err == nil {
+				for _, de := range homeEntries {
+					name := de.Name()
+					for _, pfx := range []string{".codex", ".claude", ".gemini", ".openai", ".anthropic"} {
+						if strings.HasPrefix(name, pfx) {
+							if !isAllowed(name) {
+								toMask = append(toMask, name)
+							}
+						}
+					}
+				}
+			}
 
 			for _, entry := range toMask {
 				authorized, err := cliHomeMaskTarget(home, entry)
@@ -1384,13 +1428,16 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		// Mount only the selected account after masking host roots and other
 		// credentials. Use its canonical path inside the sandbox: a destination
 		// symlink may point into a masked root and cannot serve as a mount point.
-		bindFlag := "--bind"
-		if isReview || RemoteOriginFromContext(ctx) {
-			bindFlag = "--ro-bind"
+		isRO := isReview || RemoteOriginFromContext(ctx)
+		if isRO {
+			bwrapArgs = append(bwrapArgs, "--tmpfs", realCodexHome,
+				"--setenv", "CODEX_HOME", realCodexHome)
+			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, true)
+		} else {
+			bwrapArgs = append(bwrapArgs, "--bind", realCodexHome, realCodexHome,
+				"--setenv", "CODEX_HOME", realCodexHome)
+			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, false)
 		}
-		bwrapArgs = append(bwrapArgs, bindFlag, realCodexHome, realCodexHome,
-			"--setenv", "CODEX_HOME", realCodexHome)
-		bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, isReview || RemoteOriginFromContext(ctx))
 	} else if p != "codex" {
 		// A custom Codex account may be outside a masked host root. Other
 		// providers must not gain access to it through the root read-only mount.

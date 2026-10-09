@@ -971,7 +971,7 @@ def _run_pipeline_impl(
                     delivery_baseline = capture_delivery_baseline(str(target_root),
                                                                   timeout=get_remaining_timeout(delivery_limits["max_seconds"]),
                                                                   limits=delivery_limits)
-                    shadow_res = create_ephemeral_shadow_worktree(cwd, prefix="guard")
+                    shadow_res = create_ephemeral_shadow_worktree(cwd, prefix="guard", repo_trust=repo_trust)
                 shadow_worktree_dir, shadow_branch, cleanup_shadow = shadow_res[0], shadow_res[1], shadow_res[2]
                 if not shadow_worktree_dir or not Path(shadow_worktree_dir).exists():
                     raise RuntimeError("Shadow worktree directory could not be established")
@@ -1135,8 +1135,9 @@ def _run_pipeline_impl(
 
     # Record task baseline commit before dispatching implementation
     # For shadow worktrees, baseline_commit preserves forwarded active session dirty state.
-    # For normal worktrees, recording current HEAD captures intermediate commits + uncommitted modifications.
-    shadow_repo_root = getattr(shadow_res, "repo_root", None) if is_shadow_active else None
+    # Dissociated shadow clones are self-contained. Setting shadow_repo_root = None ensures
+    # the host repo root is never mounted into the sandbox, eliminating credential/.env leaks.
+    shadow_repo_root = None
     if is_shadow_active:
         task_baseline = getattr(shadow_res, "baseline_commit", None)
         active_sub_baselines = getattr(shadow_res, "sub_baselines", {}) or {}

@@ -342,3 +342,66 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 		}
 	}
 }
+
+func TestWrapCodexHomeReviewReadonlyTmpfsMountAndMultiAccountMasking(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	workspace := filepath.Join(root, "workspace")
+	for _, dir := range []string{home, workspace} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(selected, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authPath := filepath.Join(selected, "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"token":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(selected, "config.toml")
+	if err := os.WriteFile(configPath, []byte(`model = "gpt-5"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Multi-home sibling accounts:
+	codex2 := filepath.Join(home, ".codex-2")
+	if err := os.MkdirAll(codex2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codex3 := filepath.Join(home, ".codex-3")
+	if err := os.MkdirAll(codex3, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("codex", "exec")
+	cmd.Dir = workspace
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + home, "CODEX_HOME=" + selected}
+
+	// In review (read-only) mode:
+	ctx := ContextWithTask(context.Background(), TaskReview)
+	wrapped, err := wrapCLICommandWithSandbox(ctx, "codex", cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	args := strings.Join(wrapped.Args, " ")
+	// 1. Selected codex home must be mounted with --tmpfs to allow SQLite WAL writes
+	if !strings.Contains(args, "--tmpfs "+selected) {
+		t.Fatalf("expected --tmpfs %s in wrapped args, got:\n%s", selected, args)
+	}
+	// 2. Auth and config must be mounted with --ro-bind
+	if !strings.Contains(args, "--ro-bind "+authPath+" "+authPath) {
+		t.Fatalf("expected --ro-bind %s in wrapped args, got:\n%s", authPath, args)
+	}
+	if !strings.Contains(args, "--ro-bind "+configPath+" "+configPath) {
+		t.Fatalf("expected --ro-bind %s in wrapped args, got:\n%s", configPath, args)
+	}
+	// 3. Multi-home siblings .codex-2 and .codex-3 must be masked
+	if !strings.Contains(args, "--tmpfs "+codex2) {
+		t.Fatalf("expected unselected account %s to be masked with --tmpfs, got:\n%s", codex2, args)
+	}
+	if !strings.Contains(args, "--tmpfs "+codex3) {
+		t.Fatalf("expected unselected account %s to be masked with --tmpfs, got:\n%s", codex3, args)
+	}
+}
