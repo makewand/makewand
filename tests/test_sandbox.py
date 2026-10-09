@@ -409,47 +409,74 @@ class TestSandbox(unittest.TestCase):
             self.assertNotIn(".codex", p)
 
     def test_sandbox_codex_readonly_mode_state_root_mounted_ro(self):
-        """Regression test for [P1] commits-review-1: in readonly=True mode,
-        provider state root must be mounted --ro-bind and uncreated sensitive files
-        must be shielded pre-execution with EROFS inside the sandbox."""
+        """Regression test for [P1] codex-ro-erofs: in readonly=True mode,
+        provider state root must be mounted with isolated tmpfs and host config
+        mounted read-only, allowing SQLite WAL writes while protecting host files."""
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_home = Path(tmpdir) / "home"
             fake_codex = fake_home / ".codex"
             fake_codex.mkdir(parents=True)
-            (fake_codex / "sessions").mkdir()
-            (fake_codex / "history.jsonl").write_text("history", encoding="utf-8")
+            (fake_codex / "auth.json").write_text('{"token": "test"}', encoding="utf-8")
+            (fake_codex / "config.toml").write_text('model = "test"', encoding="utf-8")
             ws = Path(tmpdir) / "ws"
             ws.mkdir()
             override_path = str(fake_codex / "AGENTS.override.md")
+            auth_path = str(fake_codex / "auth.json")
 
             with patch.dict(os.environ, {"HOME": str(fake_home)}):
                 os.environ.pop("CODEX_HOME", None)
-                # 1. wrap_bwrap in readonly mode must mount .codex with --ro-bind
+                # 1. wrap_bwrap in readonly mode must mount .codex with --tmpfs
                 cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), readonly=True, is_provider=True, provider_name="codex")
+                tmpfs_indices = [i for i, x in enumerate(cmd) if x == "--tmpfs"]
+                tmpfs_targets = [cmd[i + 1] for i in tmpfs_indices if i + 1 < len(cmd)]
+                self.assertIn(str(fake_codex), tmpfs_targets)
+
+                # Essential auth/config files are mounted --ro-bind
                 ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
                 ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
-                bind_indices = [i for i, x in enumerate(cmd) if x == "--bind"]
-                bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in bind_indices if i + 2 < len(cmd)]
+                self.assertIn((auth_path, auth_path), ro_bind_pairs)
 
-                # Entire fake_codex root is mounted --ro-bind
-                self.assertIn((str(fake_codex), str(fake_codex)), ro_bind_pairs)
-                self.assertNotIn((str(fake_codex), str(fake_codex)), bind_pairs)
+                # 2. Inside the sandbox:
+                # A. Host auth.json must be read-only (fails with EROFS)
+                ret_auth, _, err_auth, _ = run_in_sandbox(
+                    ["python3", "-c", f"open({auth_path!r}, 'w').write('malicious')"],
+                    workspace=str(ws),
+                    readonly=True,
+                    is_provider=True,
+                    provider_name="codex",
+                )
+                self.assertNotEqual(ret_auth, 0)
+                self.assertIn("Read-only file system", err_auth)
+                self.assertEqual((fake_codex / "auth.json").read_text(encoding="utf-8"), '{"token": "test"}')
 
-                # Whitelisted readonly_state entries are mounted --bind
-                sessions_path = str(fake_codex / "sessions")
-                self.assertIn((sessions_path, sessions_path), bind_pairs)
+                # B. SQLite WAL creation inside .codex must succeed without os error 30
+                db_script = f"""
+import sqlite3
+conn = sqlite3.connect({str(fake_codex / 'state_5.sqlite')!r})
+conn.execute('PRAGMA journal_mode=WAL')
+conn.execute('CREATE TABLE t (x int)')
+conn.execute('INSERT INTO t VALUES (42)')
+conn.commit()
+conn.close()
+"""
+                ret_wal, _, err_wal, _ = run_in_sandbox(
+                    ["python3", "-c", db_script],
+                    workspace=str(ws),
+                    readonly=True,
+                    is_provider=True,
+                    provider_name="codex",
+                )
+                self.assertEqual(ret_wal, 0, f"SQLite WAL in readonly sandbox failed: {err_wal}")
 
-                # 2. Inside the sandbox, writing to uncreated override_path must fail with EROFS (Read-only filesystem)
-                ret, out, err, _ = run_in_sandbox(
+                # C. Uncreated sensitive file in fake_codex does NOT poison the host
+                ret_over, _, _, _ = run_in_sandbox(
                     ["python3", "-c", f"open({override_path!r}, 'w').write('malicious')"],
                     workspace=str(ws),
                     readonly=True,
                     is_provider=True,
                     provider_name="codex",
                 )
-                self.assertNotEqual(ret, 0)
-                self.assertIn("Read-only file system", err)
                 self.assertFalse(os.path.exists(override_path))
 
     def test_sandbox_agy_readonly_mode_state_root_mounted_ro(self):
@@ -549,14 +576,9 @@ class TestSandbox(unittest.TestCase):
 
             with patch.dict(os.environ, {"HOME": str(fake_home), "CODEX_HOME": str(custom_codex)}):
                 cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), readonly=True, is_provider=True, provider_name="codex")
-                ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
-                ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
-                bind_indices = [i for i, x in enumerate(cmd) if x == "--bind"]
-                bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in bind_indices if i + 2 < len(cmd)]
-
-                self.assertIn((str(custom_codex), str(custom_codex)), ro_bind_pairs)
-                sessions_path = str(custom_codex / "sessions")
-                self.assertIn((sessions_path, sessions_path), bind_pairs)
+                tmpfs_indices = [i for i, x in enumerate(cmd) if x == "--tmpfs"]
+                tmpfs_targets = [cmd[i + 1] for i in tmpfs_indices if i + 1 < len(cmd)]
+                self.assertIn(str(custom_codex), tmpfs_targets)
 
     def test_makewand_sandbox_unshare_net_env_override(self):
         """[P1] py-sec-1: MAKEWAND_SANDBOX_UNSHARE_NET=1 forces --unshare-net even when allow_network=True."""

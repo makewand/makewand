@@ -69,8 +69,12 @@ SENSITIVE_HOME_DIRS = [
     ".azure",
     ".kube",
     ".claude",
+    ".claude-2",
+    ".claude-3",
     ".claude.json",
     ".codex",
+    ".codex-2",
+    ".codex-3",
     ".gemini",
     ".anthropic",
     ".openai",
@@ -216,7 +220,8 @@ PROVIDER_PROFILES: Dict[str, dict] = {
         "project_memory_root": (".claude", "projects"),
     },
     "codex": {
-        "roots": [".codex", ".codex-2"],
+        "roots": [".codex"],
+        "tmpfs_readonly_root": True,
         "protected": [
             (".codex", "config.toml", "file", ""),
             (".codex", "AGENTS.md", "file", ""),
@@ -230,26 +235,11 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".codex", "plugins", "dir", None),
             (".codex", "packages", "dir", None),
             (".codex", "memories", "dir", None),
-            (".codex-2", "config.toml", "file", ""),
-            (".codex-2", "AGENTS.md", "file", ""),
-            (".codex-2", "prompts", "dir", True),
-            (".codex-2", "skills", "dir", True),
-            (".codex-2", "rules", "dir", True),
-            (".codex-2", "hooks", "dir", True),
-            (".codex-2", "AGENTS.override.md", "file", None),
-            (".codex-2", "hooks.json", "file", None),
-            (".codex-2", "policy", "dir", None),
-            (".codex-2", "plugins", "dir", None),
-            (".codex-2", "packages", "dir", None),
-            (".codex-2", "memories", "dir", None),
         ],
         "ephemeral": [
             (".codex", "shell_snapshots"),
             (".codex", "app-server-control"),
             (".codex", "app-server-daemon"),
-            (".codex-2", "shell_snapshots"),
-            (".codex-2", "app-server-control"),
-            (".codex-2", "app-server-daemon"),
         ],
         "readonly_state": [
             (".codex", "sessions"),
@@ -263,17 +253,6 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".codex", "session_index.jsonl"),
             (".codex", "models_cache.json"),
             (".codex", "archived_sessions"),
-            (".codex-2", "sessions"),
-            (".codex-2", "history.jsonl"),
-            (".codex-2", "log"),
-            (".codex-2", "logs"),
-            (".codex-2", "cache"),
-            (".codex-2", "tmp"),
-            (".codex-2", ".tmp"),
-            (".codex-2", "version.json"),
-            (".codex-2", "session_index.jsonl"),
-            (".codex-2", "models_cache.json"),
-            (".codex-2", "archived_sessions"),
         ],
     },
     "agy": {
@@ -708,7 +687,8 @@ def _provider_mounts(
         if os.path.exists(p):
             args.extend(["--ro-bind", p, p])
 
-    whole_root_ro = readonly and bool(profile.get("readonly_state"))
+    tmpfs_root_ro = readonly and bool(profile.get("tmpfs_readonly_root"))
+    whole_root_ro = readonly and bool(profile.get("readonly_state")) and not tmpfs_root_ro
 
     real_roots: Dict[str, str] = {}
     for root_rel in profile.get("roots", []):
@@ -717,14 +697,39 @@ def _provider_mounts(
             continue
         real = os.path.realpath(root_path)
         real_roots[root_rel] = real
-        args.extend(["--ro-bind" if whole_root_ro else "--bind", real, real])
+        if tmpfs_root_ro:
+            args.extend(["--tmpfs", real])
+        elif whole_root_ro:
+            args.extend(["--ro-bind", real, real])
+        else:
+            args.extend(["--bind", real, real])
         if real != _norm(root_path):
             # Keep the host layout: ~/.gemini -> /mnt/.../gemini. Only the real
             # directory is mounted, so every protection below applies once.
             args.extend(["--symlink", real, root_path])
         scan_roots.append(real)
 
-    if whole_root_ro:
+    if tmpfs_root_ro:
+        for root_rel in profile.get("roots", []):
+            real = real_roots.get(root_rel)
+            if not real:
+                continue
+            for sub in ("auth.json", "config.toml", "version.json", "models_cache.json"):
+                p = os.path.join(real, sub)
+                if os.path.exists(p):
+                    args.extend(["--ro-bind", p, p])
+        for root_rel, sub, kind, placeholder in profile.get("protected", []):
+            real = real_roots.get(root_rel)
+            if not real:
+                continue
+            p = os.path.join(real, sub)
+            if os.path.islink(p):
+                target = os.path.realpath(p)
+                if os.path.exists(target):
+                    args.extend(["--ro-bind", target, p])
+            elif os.path.exists(p):
+                args.extend(["--ro-bind", p, p])
+    elif whole_root_ro:
         for root_rel, sub in profile.get("readonly_state", []):
             real = real_roots.get(root_rel)
             if not real:
@@ -1076,6 +1081,15 @@ def wrap_bwrap(
             sp = os.path.join(user_home, rel)
             if os.path.lexists(sp):
                 bwrap_cmd.extend(_mask_mount_args(sp))
+        try:
+            for entry in os.listdir(user_home):
+                if any(entry.startswith(pfx) for pfx in (".codex", ".claude", ".gemini", ".anthropic", ".openai")):
+                    if entry not in SENSITIVE_HOME_DIRS:
+                        sp = os.path.join(user_home, entry)
+                        if os.path.lexists(sp):
+                            bwrap_cmd.extend(_mask_mount_args(sp))
+        except OSError:
+            pass
 
     # Active provider's state directory (after the workspace so it always wins)
     provider_scan_roots: List[str] = []
@@ -1514,6 +1528,7 @@ def _collect_uncreated_sensitive_files(
     is_provider: bool = False,
     provider_name: Optional[str] = None,
     cmd: Optional[List[str]] = None,
+    readonly: bool = False,
 ) -> List[str]:
     """Find sensitive provider files that currently do not exist on the host."""
     user_home = _norm(str(Path.home()))
@@ -1540,15 +1555,14 @@ def _collect_uncreated_sensitive_files(
         prof = PROVIDER_PROFILES.get(p_name)
         if not prof:
             continue
+        if readonly and prof.get("tmpfs_readonly_root"):
+            continue
         roots: List[Tuple[str, str]] = []
         if p_name == "codex":
             codex_home = os.environ.get("CODEX_HOME")
             selected = os.path.realpath(_norm(os.path.expanduser(codex_home or os.path.join(user_home, ".codex"))))
             if os.path.isdir(selected):
                 roots.append((".codex", selected))
-            c2 = os.path.realpath(os.path.join(user_home, ".codex-2"))
-            if os.path.isdir(c2):
-                roots.append((".codex-2", c2))
         else:
             for r in prof.get("roots", []):
                 rp = os.path.realpath(os.path.join(user_home, r))
@@ -1704,6 +1718,7 @@ def sandbox_lifecycle(
         is_provider=is_provider,
         provider_name=provider_name,
         cmd=cmd,
+        readonly=readonly,
     )
     snapshot = _create_sensitive_snapshot(tracked, readonly=readonly)
 

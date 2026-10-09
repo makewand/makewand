@@ -412,14 +412,28 @@ def _is_git_marker(marker: Path) -> bool:
 def find_git_root(path: Union[str, Path]) -> Optional[str]:
     """
     Traverses upward from path to find the enclosing git repository root.
+    Stops before escaping past $HOME or filesystem root boundary, and refuses
+    to return $HOME, /, or /tmp as a repository root.
     """
     if not path:
         return None
     try:
         curr = Path(path).resolve()
+        refused = set(_refused_init_roots())
+        home = None
+        try:
+            home = Path.home().resolve()
+            refused.add(home)
+        except Exception:
+            pass
+
         while curr != curr.parent:
+            if curr in refused:
+                break
             if _is_git_marker(curr / ".git"):
                 return str(curr)
+            if home and curr == home:
+                break
             curr = curr.parent
     except Exception:
         pass
@@ -1188,7 +1202,7 @@ def sanitize_shadow_symlinks(worktree_dir: Path, repo_root: Path):
                 except Exception:
                     pass
 
-def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
+def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow", repo_trust: str = "trusted"):
     """
     Creates an isolated ephemeral git worktree or shadow copy for base_dir.
     Carries forward uncommitted tracked and untracked changes into a clean baseline commit
@@ -1235,8 +1249,10 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
         except ValueError:
             rel_sub = Path(".")
 
-        # Create lightweight independent clone with shared objects (decoupled git metadata for sandbox writeability)
-        cmd = ["git", "-c", "protocol.file.allow=always", "clone", "--shared", str(repo_root), str(worktree_dir)]
+        # Create lightweight independent clone with dissociated objects (self-contained, decoupled git metadata)
+        cmd = ["git", "clone", "--shared", "--dissociate", str(repo_root), str(worktree_dir)]
+        if repo_trust != "untrusted":
+            cmd = ["git", "-c", "protocol.file.allow=always", "clone", "--shared", "--dissociate", str(repo_root), str(worktree_dir)]
         wt_code, wt_out, wt_err = run_git_cmd(cmd)
         if wt_code != 0:
             # A failed or timed-out clone leaves a partial directory; never fall
@@ -1258,7 +1274,10 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow"):
             # 0. Submodule recursion & dirty state forwarding
             sub_baselines = {}
             if (repo_root / ".gitmodules").exists():
-                sub_code, _, sub_err = run_git_cmd(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"], cwd=str(worktree_dir))
+                sub_cmd = ["git", "submodule", "update", "--init", "--recursive"]
+                if repo_trust != "untrusted":
+                    sub_cmd = ["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"]
+                sub_code, _, sub_err = run_git_cmd(sub_cmd, cwd=str(worktree_dir))
                 if sub_code != 0:
                     import sys
                     print(c(f"❌ [Makewand Guard] 影子工作树子模块初始化失败 ({sub_err})，拒绝以残缺快照作为基线。", COLOR_RED), file=sys.stderr)
@@ -1702,12 +1721,16 @@ class WorkspaceLock:
 # ---------------------------------------------------------------------------
 
 EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-# Large dependency/build directories: contents are recorded as metadata only.
-HEAVY_DIR_NAMES = frozenset({
-    "node_modules", "venv", ".venv", "env", ".tox", "__pycache__", ".mypy_cache", ".pytest_cache",
-    ".ruff_cache", "target", "dist", "build", ".cache", ".gradle", ".next", ".nuxt", "bower_components",
-    ".terraform",
+# Pure dependency and regenerable cache directories: contents are skipped from file backup
+PURE_DEPENDENCY_OR_CACHE_DIRS = frozenset({
+    "node_modules", "venv", ".venv", ".tox", "__pycache__", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".cache", ".gradle", "bower_components", ".terraform",
 })
+# Build and artifact directories: only skipped from backup if genuinely ignored by git
+BUILD_OR_ENV_DIRS = frozenset({
+    "target", "dist", "build", "env", ".next", ".nuxt",
+})
+HEAVY_DIR_NAMES = PURE_DEPENDENCY_OR_CACHE_DIRS | BUILD_OR_ENV_DIRS
 # Regenerable caches that tests create; not worth a delivery warning.
 REGENERABLE_CACHE_NAMES = frozenset({".pytest_cache", ".mypy_cache", ".ruff_cache"})
 DEFAULT_BACKUP_FILE_LIMIT = 1024 * 1024
@@ -2120,12 +2143,39 @@ class HostWorkspaceTransaction:
         total_limit = _positive_int_env("MAKEWAND_BACKUP_TOTAL_LIMIT", DEFAULT_BACKUP_TOTAL_LIMIT)
         total = 0
         index = []
+
+        # Collect git-ignored directories under root
+        ignored_dirs = set()
+        code, ig_out, _ = run_git_cmd(["git", "ls-files", "-z", "--others", "-i", "--exclude-standard", "--directory"], cwd=self.root, binary=True)
+        if code == 0 and ig_out:
+            for item in ig_out.split(b"\0"):
+                if item:
+                    decoded = os.fsdecode(item)
+                    if decoded.endswith("/") and decoded != "/":
+                        ignored_dirs.add(decoded.rstrip("/"))
+
+        def _is_dir_ignored(rel_path: str) -> bool:
+            return rel_path in ignored_dirs or any(d and rel_path.startswith(d + "/") for d in ignored_dirs)
+
         for rel, entry in sorted(self.pre.items()):
             if entry.kind != "file" or (rel in self.tracked and rel not in self.dirty_tracked):
                 continue
-            if any(part in HEAVY_DIR_NAMES for part in rel.split("/")[:-1]):
-                self.unbacked[rel] = "位于依赖/构建大目录，只记录元数据"
+            parent_parts = rel.split("/")[:-1]
+            if any(part in PURE_DEPENDENCY_OR_CACHE_DIRS for part in parent_parts):
+                self.unbacked[rel] = "位于依赖/缓存大目录，只记录元数据"
                 continue
+            if any(part in BUILD_OR_ENV_DIRS for part in parent_parts):
+                dir_ignored = False
+                cum = []
+                for p in parent_parts:
+                    cum.append(p)
+                    cum_path = "/".join(cum)
+                    if p in BUILD_OR_ENV_DIRS and _is_dir_ignored(cum_path):
+                        dir_ignored = True
+                        break
+                if dir_ignored:
+                    self.unbacked[rel] = "位于被忽略的构建大目录，只记录元数据"
+                    continue
             if entry.size > per_file:
                 self.unbacked[rel] = f"超过单文件备份上限 {per_file} 字节"
                 continue

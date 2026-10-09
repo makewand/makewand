@@ -566,6 +566,102 @@ except OSError:
             if k not in ("PATH", "USER", "GIT_OPTIONAL_LOCKS"):
                 self.assertNotIn(k, sanitized, f"Dangerous var {k} should have been filtered")
 
+    def test_backup_untracked_files_backs_up_unignored_build_dir(self):
+        """Regression test for [P1] backup-skip-heavy-data-loss: unignored build/ files must be backed up."""
+        from makewand.git_helper import HostWorkspaceTransaction, run_git_cmd
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            run_git_cmd(["git", "init"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=str(repo))
+            (repo / "README.md").write_text("initial")
+            run_git_cmd(["git", "add", "README.md"], cwd=str(repo))
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=str(repo))
+
+            # Case 1: unignored build directory containing uncommitted file
+            build_dir = repo / "build"
+            build_dir.mkdir()
+            dockerfile = build_dir / "Dockerfile"
+            dockerfile.write_text("FROM alpine\nRUN echo hello\n")
+
+            txn = HostWorkspaceTransaction(str(repo))
+            txn.capture_pre_snapshot()
+            txn.begin()
+
+            self.assertIn("build/Dockerfile", txn.backups)
+            self.assertNotIn("build/Dockerfile", txn.unbacked)
+            txn.rollback()
+
+            # Case 2: build directory ignored via .gitignore
+            (repo / ".gitignore").write_text("build/\n")
+            run_git_cmd(["git", "add", ".gitignore"], cwd=str(repo))
+            run_git_cmd(["git", "commit", "-m", "ignore build"], cwd=str(repo))
+
+            txn2 = HostWorkspaceTransaction(str(repo))
+            txn2.capture_pre_snapshot()
+            txn2.begin()
+
+            self.assertNotIn("build/Dockerfile", txn2.backups)
+            self.assertIn("build/Dockerfile", txn2.unbacked)
+            self.assertIn("被忽略", txn2.unbacked["build/Dockerfile"])
+            txn2.rollback()
+
+    def test_find_git_root_refuses_home_and_root(self):
+        """Regression test for [P1] codex3-multihome-and-home-escape: find_git_root stops at HOME and root."""
+        from makewand.git_helper import find_git_root
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "home"
+            fake_home.mkdir()
+            (fake_home / ".git").mkdir()
+            project_dir = fake_home / "Downloads" / "unpacked_project"
+            project_dir.mkdir(parents=True)
+            (project_dir / "file.txt").write_text("code")
+
+            with patch("pathlib.Path.home", return_value=fake_home):
+                # find_git_root from project_dir must NOT return fake_home
+                root = find_git_root(project_dir)
+                self.assertIsNone(root)
+                # find_git_root for fake_home itself must be refused
+                self.assertIsNone(find_git_root(fake_home))
+
+    def test_shadow_worktree_dissociate_and_untrusted_repo_safety(self):
+        """Regression tests for [P1] shadow-host-repo-leak & [P1] untrusted-submodule-local-clone."""
+        from makewand.git_helper import create_ephemeral_shadow_worktree, run_git_cmd
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            run_git_cmd(["git", "init"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(repo))
+            run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=str(repo))
+            (repo / "app.py").write_text("x = 1\n")
+            run_git_cmd(["git", "add", "."], cwd=str(repo))
+            run_git_cmd(["git", "commit", "-m", "init"], cwd=str(repo))
+
+            # 1. Verify shadow worktree is created with dissociated objects
+            res = create_ephemeral_shadow_worktree(str(repo), prefix="dissoc_test")
+            self.assertIsNotNone(res[0])
+            wt_path = Path(res.worktree_root)
+            alternates_path = wt_path / ".git" / "objects" / "info" / "alternates"
+            self.assertFalse(alternates_path.exists(), "Dissociated shadow clone must not have alternates file")
+            res[2]()
+
+            # 2. Verify untrusted mode omits protocol.file.allow=always
+            recorded_cmds = []
+            real_run_git_cmd = run_git_cmd
+            def spy_run_git_cmd(cmd, *args, **kwargs):
+                recorded_cmds.append(list(cmd))
+                return real_run_git_cmd(cmd, *args, **kwargs)
+
+            with patch("makewand.git_helper.run_git_cmd", side_effect=spy_run_git_cmd):
+                res_untrusted = create_ephemeral_shadow_worktree(str(repo), prefix="untrust_test", repo_trust="untrusted")
+                self.assertIsNotNone(res_untrusted[0])
+                for c in recorded_cmds:
+                    self.assertNotIn("protocol.file.allow=always", c, f"Untrusted mode must not specify protocol.file.allow=always, got: {c}")
+                res_untrusted[2]()
+
 
 if __name__ == "__main__":
     unittest.main()
