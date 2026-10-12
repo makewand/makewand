@@ -79,6 +79,26 @@ class TestAgyFailureClassification(unittest.TestCase):
         self.assertEqual(classify_agy_failure("UNAUTHENTICATED: request had invalid authentication credentials")[0], "needs_auth")
         self.assertIsNone(classify_agy_failure("AssertionError: expected 3 got 4"))
 
+    def test_agy_argument_rejection_is_recognized(self):
+        msg = ('error: invalid model selection (--model "gemini-3.1-pro" --effort "max"): '
+               'gemini-3.1-pro has no "max" effort (available: low, high)')
+        self.assertTrue(agy._AGY_INVALID_INVOCATION_RE.search(agy._agy_user_facing(msg)))
+        self.assertIsNone(agy._AGY_INVALID_INVOCATION_RE.search("AssertionError: expected 3 got 4"))
+
+    def test_agy_startup_glog_is_not_an_auth_failure(self):
+        # Every agy start logs this before silent keyring auth succeeds; a task
+        # failure carrying it in stderr must not mark agy as needing re-login.
+        stderr = (
+            "E1012 08:11:57.633062     188 errorreport.go:224] error getting token source: You are not logged into Antigravity.\n"
+            "I1012 08:11:57.843790       1 printmode.go:403] Print mode: not authenticated, trying silent auth\n"
+            "I1012 08:11:57.965555       1 auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)\n"
+            "W1012 08:12:30.100000     188 retry.go:88] got 429 RESOURCE_EXHAUSTED, retrying\n"
+            "Task failed: timed out waiting for model\n"
+        )
+        self.assertIsNone(agy.classify_agy_failure(stderr))
+        self.assertFalse(parse_agy_quota(stderr)[0])
+        self.assertEqual(agy.classify_agy_failure("Error: You are not logged in. Run agy to sign in.")[0], "needs_auth")
+
 
 if __name__ == "__main__":
     unittest.main()

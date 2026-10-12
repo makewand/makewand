@@ -201,7 +201,10 @@ func TestTrustedAcceptanceWrapperProtectsAssetsAndWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command, args := wrapTrustedAcceptanceCommand("/usr/bin/bwrap", "/tmp/candidate", policy)
+	command, args, err := wrapTrustedAcceptanceCommand("/usr/bin/bwrap", "/tmp/candidate", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if command != "/usr/bin/bwrap" || !containsArg(args, "--unshare-pid") || !containsArg(args, "--unshare-net") || !containsArg(args, "--new-session") {
 		t.Fatalf("independent namespaces missing: %v", args)
 	}

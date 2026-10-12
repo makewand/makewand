@@ -273,12 +273,15 @@ def _collect_candidate_files(root: Path) -> List[str]:
     """
     # 1. Fast path: git ls-files if inside a git repo
     try:
+        from makewand.git_helper import resolve_safe_git_binary, _sanitize_git_env
+        git_bin = resolve_safe_git_binary(cwd=root)
         res = subprocess.run(
-            ["git", "ls-files", "-z"],
+            [git_bin, "ls-files", "-z"],
             cwd=str(root),
             capture_output=True,
             text=False,
             timeout=5,
+            env=_sanitize_git_env(),
         )
         if res.returncode == 0 and res.stdout:
             raw_entries = res.stdout.split(b"\x00")

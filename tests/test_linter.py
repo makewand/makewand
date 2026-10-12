@@ -75,6 +75,22 @@ class TestLinter(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("bad.rs", errors[0])
 
+    def test_fast_syntax_check_rust_diagnostic_survives_timeout(self):
+        """A rustc that prints its error then lingers past the timeout must not pass the gate."""
+        from unittest.mock import patch
+        (Path(self.cwd) / "bad.rs").write_text("fn main( {", encoding="utf-8")
+        diag = "error: this file contains an unclosed delimiter\n --> bad.rs:1:10\n"
+        with patch("makewand.linter.shutil.which", return_value="/usr/bin/rustc"), \
+             patch("makewand.linter.run_in_sandbox", return_value=(-1, "", diag, "Command timed out after 20 seconds")):
+            ok, errors = fast_syntax_check(self.cwd, ["bad.rs"])
+        self.assertFalse(ok)
+        self.assertIn("unclosed delimiter", errors[0])
+        # A bare timeout with no rustc diagnostic stays an infrastructure skip.
+        with patch("makewand.linter.shutil.which", return_value="/usr/bin/rustc"), \
+             patch("makewand.linter.run_in_sandbox", return_value=(-1, "", "", "Command timed out after 20 seconds")):
+            ok, errors = fast_syntax_check(self.cwd, ["bad.rs"])
+        self.assertTrue(ok)
+
     def test_fast_syntax_check_py_compile_shadowing_defense(self):
         """
         Ensures a malicious py_compile.py placed in the workspace cannot hijack execution,

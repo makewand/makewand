@@ -184,6 +184,13 @@ type HTTPHandlerOptions struct {
 	// request, the amount its realized cost exceeds this estimate — so set it at
 	// or above a typical per-request cost to keep overshoot small or zero. Zero
 	// disables reservation (a headroom-only check).
+	//
+	// When a reachable API model is priced, the actual reservation is the larger
+	// of this floor and the request's worst-case spend (prompt estimate × input
+	// price + per-call max output × output price, multiplied across every
+	// attempt, including Power-mode generators, judge and fallback); streams
+	// are stopped once their estimated spend exceeds that reservation. See
+	// Router.httpReservationUSD.
 	BudgetReservationUSD float64
 	// BudgetReserver enables SQLite-backed, cross-process token and team budget
 	// admission. UsageLogger must settle reservations in the same durable store.
@@ -401,7 +408,8 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry)
+	reservationUSD := prepared.Router.httpReservationUSD(opt.BudgetReservationUSD, prepared)
+	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry, reservationUSD)
 	if rejected {
 		return
 	}
@@ -422,7 +430,7 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
 			return
 		}
-		r.handleResponsesStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, responsesReq.Metadata, &auditEvent, &usageEntry, opt)
+		r.handleResponsesStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, responsesReq.Metadata, &auditEvent, &usageEntry, opt, reservationUSD)
 		return
 	}
 
@@ -606,7 +614,8 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry)
+	reservationUSD := prepared.Router.httpReservationUSD(opt.BudgetReservationUSD, prepared)
+	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry, reservationUSD)
 	if rejected {
 		return
 	}
@@ -616,7 +625,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	defer prepared.Router.persistHTTPStats(opt.StatsDir)
 
 	if chatReq.Stream {
-		r.handleChatCompletionsStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, &auditEvent, &usageEntry, opt)
+		r.handleChatCompletionsStream(w, req, prepared.Router, grant, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System, &auditEvent, &usageEntry, opt, reservationUSD)
 		return
 	}
 
@@ -718,7 +727,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry, opt HTTPHandlerOptions) {
+func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry, opt HTTPHandlerOptions, reservationUSD float64) {
 	if auditEvent == nil {
 		return
 	}
@@ -730,7 +739,11 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		return
 	}
 
-	ctx := req.Context()
+	// The stream context is cancelled when this handler returns or when the
+	// spend guard stops the stream, so the provider stops generating (and
+	// billing) instead of running to completion unobserved.
+	ctx, cancelStream := context.WithCancel(req.Context())
+	defer cancelStream()
 	var (
 		stream <-chan StreamChunk
 		result RouteResult
@@ -769,6 +782,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		responseModel = result.Actual
 	}
 	applyHTTPUsage(nil, usage, result, auditEvent, usageEntry)
+	spendGuard := newHTTPStreamSpendGuard(activeRouter, reservationUSD, result, messages, system, usage)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -824,6 +838,21 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 				return
 			}
 			flusher.Flush()
+			if spendGuard.add(chunk.Content) {
+				cancelStream()
+				auditEvent.Status = http.StatusOK
+				auditEvent.Error = errHTTPStreamReservationExceeded
+				_ = writeSSEData(w, map[string]any{
+					"error": map[string]any{
+						"message": errHTTPStreamReservationExceeded,
+						"type":    "error",
+						"code":    "budget_reservation_exceeded",
+					},
+				})
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
 		}
 
 		if chunk.Done {
@@ -856,7 +885,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	}
 }
 
-func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, metadata map[string]string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry, opt HTTPHandlerOptions) {
+func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request, activeRouter *Router, grant *serverauth.Grant, requestedModel string, task TaskType, messages []Message, system string, metadata map[string]string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry, opt HTTPHandlerOptions, reservationUSD float64) {
 	if auditEvent == nil {
 		return
 	}
@@ -868,7 +897,11 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	ctx := req.Context()
+	// The stream context is cancelled when this handler returns or when the
+	// spend guard stops the stream, so the provider stops generating (and
+	// billing) instead of running to completion unobserved.
+	ctx, cancelStream := context.WithCancel(req.Context())
+	defer cancelStream()
 	var (
 		stream <-chan StreamChunk
 		result RouteResult
@@ -907,6 +940,7 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 		responseModel = result.Actual
 	}
 	applyHTTPUsage(nil, usage, result, auditEvent, usageEntry)
+	spendGuard := newHTTPStreamSpendGuard(activeRouter, reservationUSD, result, messages, system, usage)
 
 	responseID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -957,6 +991,17 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 				"delta":        chunk.Content,
 			})
 			flusher.Flush()
+			if spendGuard.add(chunk.Content) {
+				cancelStream()
+				auditEvent.Status = http.StatusOK
+				auditEvent.Error = errHTTPStreamReservationExceeded
+				_ = writeSSEEvent(w, "response.error", map[string]any{
+					"type":  "response.error",
+					"error": map[string]any{"message": errHTTPStreamReservationExceeded, "code": "budget_reservation_exceeded"},
+				})
+				flusher.Flush()
+				return
+			}
 		}
 		if chunk.Done {
 			finalText := contentBuilder.String()
@@ -1387,9 +1432,10 @@ func (opt HTTPHandlerOptions) recordUsageStrict(w http.ResponseWriter, usageEntr
 	return true, true
 }
 
-func (r *Router) applyBudgetReservation(ctx context.Context, w http.ResponseWriter, opt HTTPHandlerOptions, grant *serverauth.Grant, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) (func(float64), bool) {
-	if opt.BudgetReserver != nil && opt.BudgetReservationUSD > 0 {
-		err := opt.reserveDurableBudget(ctx, grant, usageEntry)
+func (r *Router) applyBudgetReservation(ctx context.Context, w http.ResponseWriter, opt HTTPHandlerOptions, grant *serverauth.Grant, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry, estimate float64) (func(float64), bool) {
+	estimate = sanitizeCost(estimate)
+	if opt.BudgetReserver != nil && estimate > 0 {
+		err := opt.reserveDurableBudget(ctx, grant, usageEntry, estimate)
 		if err == nil {
 			return func(float64) {}, false
 		}
@@ -1406,9 +1452,9 @@ func (r *Router) applyBudgetReservation(ctx context.Context, w http.ResponseWrit
 		return func(float64) {}, true
 	}
 	var grantRelease func(float64)
-	if grant != nil && opt.BudgetReservationUSD > 0 {
+	if grant != nil && estimate > 0 {
 		var err error
-		grantRelease, err = grant.ReserveCostAt(time.Now(), opt.BudgetReservationUSD)
+		grantRelease, err = grant.ReserveCostAt(time.Now(), estimate)
 		if err != nil {
 			var httpErr *httpStatusError
 			if !errors.As(err, &httpErr) {
@@ -1421,7 +1467,7 @@ func (r *Router) applyBudgetReservation(ctx context.Context, w http.ResponseWrit
 		}
 	}
 
-	settle, err := r.reserveTeamBudget(opt.TeamStore, opt.UsageReader, grant, opt.BudgetReservationUSD, usageEntry)
+	settle, err := r.reserveTeamBudget(opt.TeamStore, opt.UsageReader, grant, estimate, usageEntry)
 	if err != nil {
 		if grantRelease != nil {
 			grantRelease(0)

@@ -84,10 +84,8 @@ def execute_codex_task(
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
-        wrap_bwrap,
         SandboxConfigError,
         verify_writable_sandbox_or_authorized,
-        audit_unsafe_host_exec,
     )
     from makewand.git_helper import find_git_root
     # Untrusted repo enforcement
@@ -141,11 +139,11 @@ def execute_codex_task(
 
     if cwd:
         cmd.extend(["-C", str(cwd)])
-    from makewand.discovery import get_provider_model_tier
+    from makewand.discovery import get_provider_model_tier, normalize_provider_effort
     resolved = get_provider_model_tier("codex", tier)
     target_model = model or resolved["model"]
     cmd.extend(["-c", f"model=\"{target_model}\""])
-    target_effort = effort or resolved.get("effort")
+    target_effort = normalize_provider_effort("codex", effort or resolved.get("effort"))
     if target_effort and target_effort != "none":
         cmd.extend(["-c", f"model_reasoning_effort=\"{target_effort}\""])
 
@@ -156,30 +154,33 @@ def execute_codex_task(
     else:
         cmd.append(prompt)
 
-    if is_bwrap_available():
-        try:
-            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="codex")
-        except SandboxConfigError as exc:
-            return False, None, f"Codex 沙箱构建失败，拒绝执行 (fail closed): {exc}"
-    elif repo_trust == "untrusted":
-        return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
-    elif not readonly:
-        audit_unsafe_host_exec("provider:codex", cmd, cwd, host_auth_source)
-
-    import sys
-    print(c(f"[Makewand -> Codex] 派发任务 (Tier: {tier}, {target_model})...", COLOR_CYAN), file=sys.stderr)
+    from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError
     from makewand.execution_runtime import mark_provider_invocation
-    from makewand.sandbox import sandbox_lifecycle
-    mark_provider_invocation()
-    with sandbox_lifecycle(is_provider=True, provider_name="codex", cmd=cmd, readonly=readonly):
-        code, out, err, ex = run_subprocess(
-            cmd,
-            timeout=timeout,
-            cwd=cwd,
-            input_text=input_text,
-            stream=stream,
-            print_prefix=c("[Codex Live]", COLOR_CYAN)
-        )
+    try:
+        with provider_sandbox_launch(
+            "codex", cmd, cwd,
+            readonly=readonly,
+            repo_root=repo_root,
+            repo_trust=repo_trust,
+            allow_network=allow_network,
+            host_auth_source=host_auth_source,
+        ) as launch:
+            import sys
+            print(c(f"[Makewand -> Codex] 派发任务 (Tier: {tier}, {target_model})...", COLOR_CYAN), file=sys.stderr)
+            mark_provider_invocation()
+            code, out, err, ex = run_subprocess(
+                launch.cmd,
+                timeout=timeout,
+                cwd=cwd,
+                input_text=input_text,
+                stream=stream,
+                print_prefix=c("[Codex Live]", COLOR_CYAN),
+                pass_fds=launch.pass_fds,
+            )
+    except SandboxUnavailableError as exc:
+        return False, None, str(exc)
+    except SandboxConfigError as exc:
+        return False, None, f"Codex 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     combined = f"{out}\n{err}" if not stream else out
 
     if code == 0:

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -57,8 +58,12 @@ func Open(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	// Serialize connections to 1 to eliminate write-lock contention under concurrent goroutines.
-	db.SetMaxOpenConns(1)
+	// In WAL mode, concurrent readers do not block writers and vice versa.
+	// Allow a connection pool for concurrent read aggregations while busy_timeout(30000)
+	// handles write serialization without starving readers.
+	maxConns := max(4, min(32, runtime.NumCPU()*2))
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 	return db, nil
 }
 
@@ -73,9 +78,28 @@ func sqliteDSN(path string) string {
 	query := url.Values{}
 	query.Add("_pragma", "busy_timeout(30000)")
 	query.Add("_pragma", "foreign_keys(1)")
-	query.Add("_pragma", "synchronous(NORMAL)")
+	query.Add("_pragma", "synchronous("+sqliteSynchronousMode()+")")
+	// Every read-write database/sql transaction begins with BEGIN IMMEDIATE so
+	// it takes the write lock upfront. A deferred transaction that reads and
+	// then writes can otherwise interleave with another pool connection's
+	// check-then-write and fail with SQLITE_BUSY mid-transaction (busy_timeout
+	// cannot retry a lock upgrade). Read-only transactions stay deferred.
+	query.Add("_txlock", "immediate")
 	uri := url.URL{Scheme: "file", Path: uriPath, RawQuery: query.Encode()}
 	return uri.String()
+}
+
+// sqliteSynchronousMode defaults to FULL: the store holds token revocations,
+// usage reservations and billing, and WAL+NORMAL may drop the latest commits on
+// power loss. MAKEWAND_SQLITE_SYNCHRONOUS may select EXTRA, or explicitly opt
+// down to NORMAL; OFF and unknown values are ignored.
+func sqliteSynchronousMode() string {
+	switch v := strings.ToUpper(strings.TrimSpace(os.Getenv("MAKEWAND_SQLITE_SYNCHRONOUS"))); v {
+	case "FULL", "EXTRA", "NORMAL":
+		return v
+	default:
+		return "FULL"
+	}
 }
 
 // Checkpoint performs a passive WAL checkpoint (PRAGMA wal_checkpoint(PASSIVE)).

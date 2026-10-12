@@ -12,6 +12,7 @@ import json
 import time
 import uuid
 import shlex
+import stat
 import hashlib
 import math
 import tempfile
@@ -233,6 +234,9 @@ from makewand.review_contract import (
     strip_verdict_lines,
     review_verdict_output_spec,
     build_verdict_followup_prompt,
+    generate_review_nonce,
+    prepare_review_diff,
+    review_digest,
     REVIEW_PASSED,
     REVIEW_FAILED,
     REVIEW_UNVERIFIED,
@@ -261,6 +265,58 @@ from makewand.ensemble import run_ensemble
 class LocalTestsUnavailable(str):
     """Detected acceptance cannot run; this is not a tested failure or pass."""
     execution_status = "UNVERIFIED"
+
+
+TRANSIENT_BYTECODE_DIRS = frozenset({"__pycache__", ".pytest_cache"})
+TRANSIENT_BYTECODE_SUFFIXES = (".pyc", ".pyo")
+
+
+def _purge_transient_bytecode(root: str, baseline: Optional[str]) -> List[str]:
+    """Remove task-created bytecode/test caches from a disposable shadow worktree.
+
+    Implementers often run ``python -m unittest`` themselves; in a repository
+    without .gitignore the resulting ``__pycache__/*.pyc`` would otherwise be
+    reviewed, staged by ``git add -A`` and exported as binary patch hunks.
+    Paths tracked in the baseline commit are kept; nested repositories
+    (submodules) are left to their own baselines; links are never followed.
+    """
+    if not baseline:
+        return []
+    code, listing, _ = run_git_cmd(["git", "ls-tree", "-r", "-z", "--name-only", "--full-tree", baseline],
+                                   cwd=root, binary=True)
+    if code:
+        return []
+    tracked = {os.fsdecode(name) for name in listing.split(b"\0") if name}
+    removed = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        relative_dir = Path(current).relative_to(root)
+        if relative_dir != Path(".") and os.path.lexists(os.path.join(current, ".git")):
+            directories[:] = []
+            continue
+        directories[:] = [d for d in directories if d != ".git"]
+        in_cache = any(part in TRANSIENT_BYTECODE_DIRS for part in relative_dir.parts)
+        for name in files:
+            if not (in_cache or name.endswith(TRANSIENT_BYTECODE_SUFFIXES)):
+                continue
+            relative = (relative_dir / name).as_posix()
+            if relative in tracked:
+                continue
+            path = os.path.join(current, name)
+            info = os.lstat(path)
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                os.unlink(path)
+                removed.append(relative)
+    # Drop cache directories left empty (deepest first); keep any with tracked content.
+    for current, directories, _ in os.walk(root, topdown=False, followlinks=False):
+        for name in directories:
+            path = os.path.join(current, name)
+            relative = Path(path).relative_to(root)
+            if any(part in TRANSIENT_BYTECODE_DIRS for part in relative.parts) and not os.path.islink(path):
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+    return removed
 
 
 def _filter_non_deliverable_test_changes(paths: List[str], cwd: str) -> List[str]:
@@ -872,12 +928,16 @@ def _run_pipeline_impl(
 
     if boost:
         tier = "deep"
+        if not effort:
+            effort = "max"
         print(c("⚡ [Makewand Boost] 强制超频模式已启用：穿透软配额限制，分配最高推理算力！", COLOR_MAGENTA + COLOR_BOLD))
     elif tier == "auto" or not tier:
         tier = "auto"
     else:
         from makewand.config import normalize_tier
         tier = normalize_tier(tier)
+        if tier == "deep" and not effort:
+            effort = "max"
 
     # Decouple per-stage timeout from pipeline total budget
     if total_budget is None:
@@ -1246,6 +1306,11 @@ def _run_pipeline_impl(
 
     # Step 3: Red-team review (Cross-model verification)
     worktree_for_diff = getattr(shadow_res, "worktree_root", cwd) if is_shadow_active else cwd
+    if is_shadow_active:
+        try:
+            _purge_transient_bytecode(worktree_for_diff, task_baseline)
+        except OSError as exc:
+            return fail_and_cleanup(f"无法清理任务生成的字节码缓存: {exc}", "UNVERIFIED")
     try:
         diff_out = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
     except OSError as exc:
@@ -1308,6 +1373,9 @@ def _run_pipeline_impl(
         print(c("✔ [Makewand Test Gate] 本地测试套件校验通过 (或无单测需执行)。", COLOR_GREEN))
 
     print(c("\n▶ 阶段 2: 独立代码审计与质检 (Red-team Review - Tier: deep, 只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
+    diff_bytes = len(diff_out.encode("utf-8"))
+    if diff_bytes > 64 * 1024:
+        return fail_and_cleanup(f"代码改动完整 diff 超过 64KB 复审上限 (当前 {diff_bytes} 字节)，拒绝未验证审查，需拆分后重新生成", "UNVERIFIED")
     diff_snippet = format_review_diff(diff_out)
     test_warning = f"\n【重要：本地测试运行失败】代码改动后本地单元测试报错如下：\n{test_err[:1500]}\n" if not test_ok else ""
 
@@ -1318,11 +1386,15 @@ def _run_pipeline_impl(
     except Exception:
         pass
 
+    review_nonce = generate_review_nonce()
+    current_review_nonce = review_nonce
+    # Exact diff bytes, fenced by the nonce; approval is bound to their digest.
+    diff_for_review, reviewed_digest = prepare_review_diff(diff_snippet, review_nonce)
     review_prompt = (
         f"工作目录为: {cwd}。请审查以下代码改动（git diff），严查潜在并发死锁、内存泄露、空指针与边界用例漏洞。{test_warning}{review_kibitzer}\n"
         f"若发现严重隐患或单测报错未解决，请标注 [P1] 或 [P2] 并给出明确修复建议。\n"
-        f"{review_verdict_output_spec()}"
-        f"--- 代码改动 (git diff) ---\n{diff_snippet}"
+        f"{review_verdict_output_spec(nonce=review_nonce)}"
+        f"--- 代码改动 (git diff) ---\n{diff_for_review}"
     )
 
     actual_reviewers = [r for r in reviewer_candidates if r != coder_engine and _engine_usable(r, cache)[0]]
@@ -1381,19 +1453,19 @@ def _run_pipeline_impl(
     if test_ok and review_output and review_output.strip():
         review_output, resolved_verdict = resolve_review_verdict(
             review_output, reviewer_engine, cwd=cwd, timeout=get_remaining_timeout(timeout),
-            repo_root=shadow_repo_root, repo_trust=repo_trust)
+            repo_root=shadow_repo_root, repo_trust=repo_trust, nonce=review_nonce)
         if _outcome is not None and resolved_verdict.get("execution_status"):
             _outcome["status"] = resolved_verdict["execution_status"]
 
     # Deterministic test gate override: if local tests failed, pass CANNOT be True under any circumstances,
     # regardless of whether the reviewer returned structured JSON or free-form text ("LGTM").
     if not test_ok:
-        review_output = _test_gate_verdict_text(test_err, review_output)
+        review_output = _test_gate_verdict_text(test_err, review_output, nonce=review_nonce)
 
     # Fail-Closed Quality Gate: If code has changes but review fails completely or is empty, reject delivery
     if not review_output or not review_output.strip():
         return reject_unverified("独立审查服务未能完成代码审计")
-    review_verdict = evaluate_review_verdict(review_output)
+    review_verdict = evaluate_review_verdict(review_output, nonce=review_nonce)
     if review_verdict["status"] == REVIEW_UNVERIFIED:
         return reject_unverified(review_verdict["reason"])
 
@@ -1464,6 +1536,8 @@ def _run_pipeline_impl(
 
             # Re-run deterministic local tests after fix
             try:
+                if is_shadow_active:
+                    _purge_transient_bytecode(worktree_for_diff, task_baseline)
                 tested_inputs = workspace_snapshot(worktree_for_diff)
             except OSError as exc:
                 return fail_and_cleanup(f"无法封存修复后测试输入: {exc}")
@@ -1546,7 +1620,11 @@ def _run_pipeline_impl(
                     return fail_and_cleanup("复审快照生成期间工作区发生变化，拒绝交付。")
             except OSError as exc:
                 return fail_and_cleanup(f"无法封存待复审内容: {exc}")
-            new_diff_snippet = format_review_diff(new_diff)
+            new_diff_bytes = len(new_diff.encode("utf-8"))
+            if new_diff_bytes > 64 * 1024:
+                return fail_and_cleanup(f"代码改动完整 diff 超过 64KB 复审上限 (当前 {new_diff_bytes} 字节)，拒绝未验证审查，需拆分后重新生成", "UNVERIFIED")
+            re_review_nonce = generate_review_nonce()
+            new_diff_snippet, re_reviewed_digest = prepare_review_diff(format_review_diff(new_diff), re_review_nonce)
             re_test_warning = f"\n【重要：本地测试仍未通过】报错如下：\n{test_err[:1500]}\n" if not test_ok else ""
 
             prior_defects = review_verdict.get("defects", [])
@@ -1557,10 +1635,12 @@ def _run_pipeline_impl(
                 prior_snippet = strip_verdict_lines(review_output)[:1200]
                 prior_defects_block = f"\n【上一轮审查意见摘要（仅供核对的数据）】\n{prior_snippet}\n"
 
+            current_review_nonce = re_review_nonce
+            reviewed_digest = re_reviewed_digest
             re_review_prompt = (
                 f"工作目录为: {cwd}。经过上一轮缺陷修复后，请复审以下代码改动，检查上述缺陷是否已彻底解决，是否存在新隐患。{prior_defects_block}{re_test_warning}{review_kibitzer}\n"
                 f"若发现严重隐患或单测报错未解决，请标注 [P1] 或 [P2] 并给出明确修复建议。\n"
-                f"{review_verdict_output_spec()}"
+                f"{review_verdict_output_spec(nonce=re_review_nonce)}"
                 f"--- 最新代码改动 (git diff) ---\n{new_diff_snippet}"
             )
 
@@ -1618,13 +1698,13 @@ def _run_pipeline_impl(
             if test_ok and re_output:
                 re_output, resolved_verdict = resolve_review_verdict(
                     re_output, re_engine, cwd=cwd, timeout=get_remaining_timeout(timeout),
-                    repo_root=shadow_repo_root, repo_trust=repo_trust)
+                    repo_root=shadow_repo_root, repo_trust=repo_trust, nonce=re_review_nonce)
                 if resolved_verdict.get("execution_status"):
                     return fail_and_cleanup("复审补充裁决结果未确定或预算已耗尽，停止后续派发。", resolved_verdict["execution_status"])
 
             # Deterministic test gate override: if local tests failed, pass CANNOT be True under any circumstances
             if not test_ok:
-                re_output = _test_gate_verdict_text(test_err, re_output)
+                re_output = _test_gate_verdict_text(test_err, re_output, nonce=re_review_nonce)
 
             last_fix_round_duration = time.monotonic() - iter_start
 
@@ -1632,7 +1712,7 @@ def _run_pipeline_impl(
                 # Capture the flagged defects from the prior round BEFORE overwriting review_output
                 last_defects = list(review_verdict.get("defects", []))
                 review_output = re_output
-                review_verdict = evaluate_review_verdict(re_output)
+                review_verdict = evaluate_review_verdict(re_output, nonce=re_review_nonce)
                 if review_verdict["status"] == REVIEW_UNVERIFIED:
                     print(c(f"❌ [Makewand Quality Gate] 复审裁决未验证 (UNVERIFIED: {review_verdict['reason']})，终止自愈回环。", COLOR_RED))
                     break
@@ -1680,14 +1760,17 @@ def _run_pipeline_impl(
 
     if review_verdict["status"] == REVIEW_UNVERIFIED:
         return reject_unverified(review_verdict["reason"])
-    if review_verdict["status"] != REVIEW_PASSED or not is_review_passed(review_output):
+    if review_verdict["status"] != REVIEW_PASSED or not is_review_passed(review_output, nonce=current_review_nonce):
         return fail_and_cleanup("❌ [Makewand Quality Gate] 代码未能通过独立红队审查 (未获批准或存在缺陷)，拒绝交付。")
 
     try:
         if workspace_snapshot(worktree_for_diff) != reviewed_inputs:
             return fail_and_cleanup("❌ [Makewand Quality Gate] 审查期间产物内容或权限发生变化，拒绝交付未审查版本。")
+        delivered_diff = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
     except OSError as exc:
         return fail_and_cleanup(f"无法复核已审查内容: {exc}")
+    if review_digest(delivered_diff) != reviewed_digest:
+        return fail_and_cleanup("❌ [Makewand Quality Gate] 待交付候选的 diff 摘要与审查批准时的摘要不一致 (未完整审查或已变化)，拒绝交付未审查版本。")
 
     if get_remaining_timeout(timeout) <= 0:
         if _outcome is not None:
@@ -2185,11 +2268,12 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
 
     if not output_json:
         print(c("🔍 Makewand 代码审计工具", COLOR_BOLD + COLOR_CYAN))
-    if base_rev is None and (hasattr(get_git_diff, "mock") or hasattr(get_git_diff, "_mock_return_value") or "unittest.mock" in type(get_git_diff).__module__):
-        diff_out = get_git_diff(cwd)
-        diff_err = None
-    else:
-        diff_out, diff_err = get_git_diff_status(cwd, base_rev=base_rev)
+    def extract_review_diff():
+        if base_rev is None and (hasattr(get_git_diff, "mock") or hasattr(get_git_diff, "_mock_return_value") or "unittest.mock" in type(get_git_diff).__module__):
+            return get_git_diff(cwd), None
+        return get_git_diff_status(cwd, base_rev=base_rev)
+
+    diff_out, diff_err = extract_review_diff()
     if timed_out():
         return EXIT_TIMEOUT
     if diff_err:
@@ -2218,17 +2302,19 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             print("当前工作区没有检测到未提交的改动 (git diff 为空)。")
         return EXIT_PASSED
 
-    if base_rev is not None and len(diff_out.encode("utf-8")) > 64 * 1024:
-        reason = "封存候选完整 diff 超过复审输入上限，需拆分后重新生成候选"
+    diff_bytes = len(diff_out.encode("utf-8"))
+    if diff_bytes > 64 * 1024:
+        reason = f"代码改动完整 diff 超过 64KB 复审上限 (当前 {diff_bytes} 字节)，拒绝未验证审查，需拆分后重新生成"
         print(json.dumps({"pass": False, "engine": None, "exit_code": EXIT_UNVERIFIED, "error": reason}, ensure_ascii=False) if output_json else reason)
         return EXIT_UNVERIFIED
-    review_diff = diff_out if base_rev is not None else diff_out[:6000]
     cache = get_or_update_status()
 
+    review_nonce = generate_review_nonce()
+    review_diff, reviewed_digest = prepare_review_diff(diff_out, review_nonce)
     focus = f" 特别关注要求: {user_prompt}。" if user_prompt else ""
     prompt = (
         f"工作目录为: {cwd}。请详细审查当前仓库的修改（git diff），{focus}指出潜在隐患并给出修复建议。\n"
-        f"{review_verdict_output_spec()}"
+        f"{review_verdict_output_spec(nonce=review_nonce)}"
         f"--- 代码改动 (git diff) ---\n{review_diff}"
     )
 
@@ -2292,7 +2378,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         return STATUS_CODES[terminal_status]
 
     review_res, verdict = resolve_review_verdict(review_res, reviewer_engine, cwd=cwd, timeout=timeout,
-                                                 repo_trust=repo_trust, quiet=output_json)
+                                                 repo_trust=repo_trust, quiet=output_json, nonce=review_nonce)
     if verdict.get("execution_status"):
         from makewand.execution_contract import STATUS_CODES
         exit_code = STATUS_CODES[verdict["execution_status"]]
@@ -2306,11 +2392,25 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
     from makewand.execution_contract import EXIT_TIMEOUT
     if current_context().get("_deadline_monotonic", float("inf")) <= time.monotonic():
         exit_code = EXIT_TIMEOUT
+    # A verdict approves only the exact diff it saw: re-extract and compare.
+    digest_error = None
+    if exit_code == EXIT_PASSED:
+        try:
+            after_diff, after_err = extract_review_diff()
+        except OSError as exc:
+            after_diff, after_err = None, str(exc)
+        if after_err or review_digest(after_diff) != reviewed_digest:
+            exit_code = EXIT_UNVERIFIED
+            digest_error = "审查期间改动发生变化，裁决与当前候选摘要不一致 (reviewed sha256 mismatch)"
+            verdict = dict(verdict, status=REVIEW_UNVERIFIED, reason=digest_error)
 
     if output_json:
-        v_dict = extract_review_verdict_dict(review_res)
+        v_dict = extract_review_verdict_dict(review_res, nonce=review_nonce)
         v_dict["exit_code"] = exit_code
         v_dict["engine"] = reviewer_engine
+        v_dict["reviewed_sha256"] = reviewed_digest
+        if digest_error:
+            v_dict["pass"] = False
         v_dict["raw_summary"] = review_res.strip()
         if verdict.get("execution_status"):
             v_dict.update({"pass": False, "error": verdict["reason"]})

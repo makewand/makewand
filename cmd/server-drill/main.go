@@ -167,7 +167,12 @@ type localProvider struct {
 	Delay           time.Duration
 }
 
-func (p *localProvider) Name() string      { return "claude" }
+// drillProviderName is deliberately absent from the pricing tables, so HTTP
+// budget reservations use the flat BudgetReservationUSD floor the drill's
+// per-call budgets are sized against.
+const drillProviderName = "drill-local"
+
+func (p *localProvider) Name() string      { return drillProviderName }
 func (p *localProvider) IsAvailable() bool { return true }
 func (p *localProvider) enter() {
 	active := p.active.Add(1)
@@ -210,7 +215,7 @@ func (p *localProvider) Chat(ctx context.Context, messages []router.Message, _ s
 		return "", router.Usage{MeasuredCost: true}, ctx.Err()
 	case <-time.After(delay):
 	}
-	return p.Identity + content, router.Usage{Provider: "claude", Model: "local-drill", InputTokens: 4, OutputTokens: 4, Cost: .01}, nil
+	return p.Identity + content, router.Usage{Provider: drillProviderName, Model: "local-drill", InputTokens: 4, OutputTokens: 4, Cost: .01}, nil
 }
 func (p *localProvider) ChatStream(ctx context.Context, messages []router.Message, _ string, _ int) (<-chan router.StreamChunk, error) {
 	out := make(chan router.StreamChunk, 1)
@@ -292,7 +297,7 @@ func serveChild(o options) error {
 	defer teams.Close()
 	defer usage.Close()
 	provider := &localProvider{Delay: 2 * time.Millisecond, bulkheadRelease: make(chan struct{})}
-	rtr, err := router.NewRouterFromConfig(router.RouterConfig{Providers: map[string]router.ProviderEntry{"claude": {Provider: provider, Access: router.AccessAPI}}, DefaultModel: "claude", CodingModel: "claude"})
+	rtr, err := router.NewRouterFromConfig(router.RouterConfig{Providers: map[string]router.ProviderEntry{drillProviderName: {Provider: provider, Access: router.AccessAPI}}, DefaultModel: drillProviderName, CodingModel: drillProviderName})
 	if err != nil {
 		return err
 	}
@@ -475,7 +480,7 @@ func waitActive(ctx context.Context, client *http.Client, url string) error {
 }
 
 func post(ctx context.Context, client *http.Client, url, token, content string, stream bool, requestID ...string) (int, string, error) {
-	payload, _ := json.Marshal(map[string]any{"model": "claude", "messages": []map[string]string{{"role": "user", "content": content}}, "stream": stream})
+	payload, _ := json.Marshal(map[string]any{"model": drillProviderName, "messages": []map[string]string{{"role": "user", "content": content}}, "stream": stream})
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return 0, "", err
@@ -844,7 +849,7 @@ func routerIsolation(ctx context.Context, calls int) error {
 	routers := make([]*router.Router, count)
 	for i := range routers {
 		identity := fmt.Sprintf("router-%d:", i)
-		r, err := router.NewRouterFromConfig(router.RouterConfig{Providers: map[string]router.ProviderEntry{"claude": {Provider: &localProvider{Identity: identity}, Access: router.AccessAPI}}, DefaultModel: "claude"})
+		r, err := router.NewRouterFromConfig(router.RouterConfig{Providers: map[string]router.ProviderEntry{drillProviderName: {Provider: &localProvider{Identity: identity}, Access: router.AccessAPI}}, DefaultModel: drillProviderName})
 		if err != nil {
 			return err
 		}
@@ -860,7 +865,7 @@ func routerIsolation(ctx context.Context, calls int) error {
 			for job := range jobs {
 				index := job % count
 				message := fmt.Sprintf("call-%d", job)
-				content, _, _, err := routers[index].ChatWith(ctx, "claude", router.PhaseCode, []router.Message{{Role: "user", Content: message}}, "")
+				content, _, _, err := routers[index].ChatWith(ctx, drillProviderName, router.PhaseCode, []router.Message{{Role: "user", Content: message}}, "")
 				want := fmt.Sprintf("router-%d:%s", index, message)
 				if err != nil || content != want {
 					select {

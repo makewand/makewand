@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package processjob
 
@@ -6,6 +6,10 @@ import (
 	"os"
 	"os/exec"
 )
+
+// MemoryEnforcement reports how Options.MemoryBytes is enforced: never on
+// non-Linux Unix systems (documented limitation).
+func MemoryEnforcement() string { return "none" }
 
 func start(cmd *exec.Cmd, _ Options) (func(), error) {
 	if err := prepare(cmd); err != nil {

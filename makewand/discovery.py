@@ -21,15 +21,76 @@ logger = logging.getLogger(__name__)
 FAST_FAMILIES = ["haiku", "luna", "flash", "mini", "nano", "reserve"]
 FAST_KEYWORDS = ["fast", "fastest", "speed", "rapid", "lightweight", "affordable", "easier", "quick", "turbo", "efficient"]
 
-DEEP_FAMILIES = ["opus", "fable", "mythos", "astra", "ultra", "frontier"]
-DEEP_KEYWORDS = ["demanding", "toughest", "most capable", "complex", "flagship", "pro-high", "deep"]
+DEEP_FAMILIES = ["opus", "fable", "mythos", "astra", "ultra", "frontier", "pro"]
+DEEP_KEYWORDS = ["demanding", "toughest", "most capable", "complex", "flagship", "pro-high", "deep", "thinking", "reasoning", "max-effort"]
 
 STANDARD_FAMILIES = ["sonnet", "sol", "standard"]
 STANDARD_KEYWORDS = ["workhorse", "balanced", "everyday", "general"]
 
 
+def _matches_token(word: str, text: str) -> bool:
+    """Matches a keyword only on token/word boundaries to avoid false positives (e.g. 'mini' inside 'gemini')."""
+    return bool(re.search(r'(?<![a-z0-9])' + re.escape(word.lower()) + r'(?![a-z0-9])', text.lower()))
+
+
+def normalize_provider_effort(provider: str, effort: Optional[str]) -> Optional[str]:
+    """
+    Translates canonical effort ('low', 'medium', 'high', 'xhigh', 'max')
+    into the specific parameter dialect accepted by the target CLI provider.
+    """
+    if not effort or effort in ("none", "default"):
+        return None
+    eff = str(effort).strip().lower()
+
+    if provider == "codex":
+        # Codex config model_reasoning_effort accepts: low, medium, high
+        if eff in ("max", "ultra", "xhigh", "high"):
+            return "high"
+        elif eff in ("minimal", "low"):
+            return "low"
+        else:
+            return "medium"
+
+    elif provider == "grok":
+        # Grok CLI accepts: low, medium, high, xhigh
+        if eff in ("max", "ultra", "xhigh"):
+            return "xhigh"
+        elif eff == "high":
+            return "high"
+        elif eff in ("minimal", "low"):
+            return "low"
+        else:
+            return "medium"
+
+    elif provider == "agy":
+        # Antigravity efforts are model-specific (gemini-3.1-pro: low, high only;
+        # xhigh/max are rejected outright). Medium is left to the CLI default.
+        if eff in ("minimal", "low"):
+            return "low"
+        if eff in ("high", "xhigh", "max", "ultra"):
+            return "high"
+        return None
+
+    elif provider == "claude":
+        # Claude accepts: low, medium, high, xhigh, max
+        if eff in ("ultra", "max"):
+            return "max"
+        elif eff in ("xhigh", "high", "medium", "low"):
+            return eff
+        elif eff == "minimal":
+            return "low"
+        return "medium"
+
+    elif provider == "muse":
+        # Muse CLI accepts: none, minimal, low, medium, high, xhigh, max, ultra
+        return eff
+
+    return eff
+
+
 def _valid_model_id(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,199}", value.strip()) is not None
+
 
 
 def _normalize_agy_model(raw: str) -> Tuple[str, Optional[str]]:
@@ -224,6 +285,14 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
                             discovered_agy.append((norm_slug, desc))
             except Exception:
                 pass
+
+    # Filter out foreign proxy models (e.g. claude-*, gpt-*) if native gemini/google models are present
+    native_gemini = [
+        item for item in discovered_agy
+        if item[0].startswith("gemini-") or item[0].startswith("google-") or item[0] in ("gemini", "gemini-pro", "gemini-ultra", "gemini-flash")
+    ]
+    if native_gemini:
+        discovered_agy = native_gemini
 
     return DiscoveredAgyModels(discovered_agy, configured_default, configured_effort)
 
@@ -452,14 +521,14 @@ def score_model_for_tier(slug: str, desc: str = "", tier: str = "standard") -> i
     ver = parse_semver(slug)
     ver_score = ver[0] * 100000 + ver[1] * 1000 + ver[2]
 
-    fast_fam = sum(1 for k in FAST_FAMILIES if k in text)
-    fast_kw = sum(1 for k in FAST_KEYWORDS if k in text)
+    fast_fam = sum(1 for k in FAST_FAMILIES if _matches_token(k, text))
+    fast_kw = sum(1 for k in FAST_KEYWORDS if _matches_token(k, text))
 
-    deep_fam = sum(1 for k in DEEP_FAMILIES if k in text)
-    deep_kw = sum(1 for k in DEEP_KEYWORDS if k in text)
+    deep_fam = sum(1 for k in DEEP_FAMILIES if _matches_token(k, text))
+    deep_kw = sum(1 for k in DEEP_KEYWORDS if _matches_token(k, text))
 
-    std_fam = sum(1 for k in STANDARD_FAMILIES if k in text)
-    std_kw = sum(1 for k in STANDARD_KEYWORDS if k in text)
+    std_fam = sum(1 for k in STANDARD_FAMILIES if _matches_token(k, text))
+    std_kw = sum(1 for k in STANDARD_KEYWORDS if _matches_token(k, text))
 
     tier = tier.lower()
     score = ver_score
@@ -944,7 +1013,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
             "deep": "gemini-3.1-pro-high",
             "standard": configured_default or "gemini-3.8-flash-high",
         }
-        fallback_effort = "high" if tier in ("deep", "standard") else "low"
+        fallback_effort = "max" if tier == "deep" else ("high" if tier == "standard" else "low")
         return _tier_resolution(fallback_models.get(tier, "gemini-3.8-flash-high"), fallback_effort, is_dynamic=False)
 
     elif provider in ("local", "ollama"):
@@ -1014,24 +1083,21 @@ def export_routing_overrides(config_dir: Optional[Path] = None, target_filename:
     for prov in providers_to_sync:
         prov_key = prov
         try:
-            if prov == "claude":
-                # For API provider 'claude', do not write CLI shortcuts ('sonnet', 'fable').
-                # Use canonical priced API model IDs from Go router's cost table.
-                cheap_m = "claude-haiku-4-5-20251001"
-                mid_m = "claude-sonnet-4-20250514"
-                prem_m = "claude-opus-4-20250514"
-            elif prov == "gemini":
-                cheap_m = "gemini-2.5-flash"
-                mid_m = "gemini-2.5-flash"
-                prem_m = "gemini-2.5-pro"
-            else:
-                res_cheap = get_provider_model_tier(prov, "fast")
-                res_mid = get_provider_model_tier(prov, "standard")
-                res_prem = get_provider_model_tier(prov, "deep")
+            lookup_prov = "agy" if prov == "gemini" else prov
+            res_cheap = get_provider_model_tier(lookup_prov, "fast")
+            res_mid = get_provider_model_tier(lookup_prov, "standard")
+            res_prem = get_provider_model_tier(lookup_prov, "deep")
 
-                cheap_m = res_cheap.get("full_id") or res_cheap.get("model")
-                mid_m = res_mid.get("full_id") or res_mid.get("model")
-                prem_m = res_prem.get("full_id") or res_prem.get("model")
+            cheap_m = res_cheap.get("full_id") or res_cheap.get("model")
+            mid_m = res_mid.get("full_id") or res_mid.get("model")
+            prem_m = res_prem.get("full_id") or res_prem.get("model")
+
+            # Clean any effort suffix from agy/gemini model names if present (e.g. gemini-3.1-pro-high -> gemini-3.1-pro)
+            if lookup_prov == "agy":
+                cheap_m, _ = _normalize_agy_model(cheap_m) if cheap_m else (cheap_m, None)
+                mid_m, _ = _normalize_agy_model(mid_m) if mid_m else (mid_m, None)
+                prem_m, _ = _normalize_agy_model(prem_m) if prem_m else (prem_m, None)
+
 
             p_models = models_map.get(prov_key, {})
             if not isinstance(p_models, dict):

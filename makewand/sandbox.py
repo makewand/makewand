@@ -26,6 +26,7 @@ starts inside a writable workspace are not masked.
 """
 
 import json
+import logging
 import os
 import platform
 import signal
@@ -41,6 +42,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+import atexit
+import contextlib
+import hashlib
+import re
 from contextlib import contextmanager
 
 from makewand.providers.base import run_subprocess
@@ -49,6 +54,11 @@ from makewand.providers.base import run_subprocess
 class SandboxConfigError(RuntimeError):
     """A safe bubblewrap command line cannot be constructed; callers must fail closed."""
 
+
+# System and generic root directories that must never be bound writable in sandbox (VUL-01/02/06)
+FORBIDDEN_WRITABLE_ROOTS = (
+    "/", "/home", "/etc", "/usr", "/var", "/tmp", "/root", "/boot", "/opt", "/sys", "/dev", "/proc"
+)
 
 # Host prefixes that hold user data (other projects, other users' homes, data
 # disks). They are hidden behind an empty tmpfs; required paths are re-bound.
@@ -107,9 +117,31 @@ SENSITIVE_HOME_DIRS = [
     ".oci",
     ".m2/settings.xml",
     ".gradle/gradle.properties",
+    ".pgpass",
+    ".agy",
+    ".antigravity",
     ".bash_history",
     ".zsh_history",
+    ".histfile",
     ".python_history",
+    ".node_repl_history",
+    ".psql_history",
+    ".mysql_history",
+    ".sqlite_history",
+    ".lesshst",
+    ".viminfo",
+    ".local/share/credentials",
+    ".local/share/makewand",
+    ".local/share/fish",
+    ".local/state",
+    "server_auth.json",
+    "state.db",
+    "state.db-wal",
+    "state.db-shm",
+    "admin_session_secret",
+    "users.json",
+    "audit.jsonl",
+    "usage.jsonl",
     ".mozilla",
     ".config/google-chrome",
     ".config/chromium",
@@ -129,40 +161,33 @@ SAFE_HOME_BIN_DIRS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Provider state-directory policy.
+# Provider state-directory policy (per-run private provider home, H3).
 #
-# "protected" entries are (root, relative path, kind, placeholder):
-#   kind        "file" or "dir"
-#   placeholder None  -> re-mount read-only only when it already exists
-#               str   -> file content of a host placeholder created when missing
-#               True  -> create an empty host directory when missing
-# A protected path that does not exist on the host could otherwise be created
-# by the sandboxed model inside the writable state directory and would then be
-# loaded by the next host session (persistent instruction / hook / extension
-# injection). A read-only bind needs an existing mount point, so for paths whose
-# empty form is equivalent to "absent" (empty CLAUDE.md, "{}" settings, empty
-# directory) we first create that empty placeholder on the host and then mount
-# it read-only. Paths whose empty form is NOT known to be equivalent to absence
-# (e.g. codex AGENTS.override.md, which would shadow AGENTS.md) are only
-# protected when they already exist; mounting /dev/null over an uncreated path
-# inside a writable bind mount causes Bubblewrap to creat(0444) the file on the host.
-#
-# "ephemeral" entries are live per-session IPC / execution state of concurrently
-# running host sessions (shell snapshots that host sessions source, session
-# keys, daemon control keys, runtime sockets). The sandbox gets an empty tmpfs
-# instead, so it can neither read nor poison them.
-#
-# "readonly_state" lists the state entries a *read-only* task may still write
-# (e.g. session logs, credential caches). When present and readonly=True, wrap_bwrap
-# mounts the entire provider state root read-only and re-binds only these whitelisted
-# subpaths writable. This ensures that uncreated sensitive files (like AGENTS.override.md,
-# hooks.json, policy/) cannot be created by a sandboxed process, eliminating the need
-# for dangerous post-execution cleanup during read-only tasks.
+# The host provider state directory (~/.claude, ~/.codex or $CODEX_HOME,
+# ~/.gemini -> its real path, ~/.grok, ~/.config/muse, ~/.local/share/muse,
+# ~/.aider) is NEVER bound writable. Every sandboxed provider run gets a fresh
+# private directory (0700, below $XDG_RUNTIME_DIR or the user cache dir) that is
+# bound writable at the provider's expected path. Into it we copy only:
+#   "credentials"  auth/token files; after the run a changed copy is written
+#                  back to the host (regular file only, no symlinks, atomic
+#                  replace, skipped when the host copy changed concurrently)
+#   "seed"         harmless caches/ids the CLI expects; never written back
+# "protected" entries (root, relative path, kind, placeholder) — instruction,
+# extension, configuration and executable paths — are read-only binds of the
+# host originals (a symlinked entry binds its resolved target). Missing
+# protected paths get no mount: anything the model creates there lands in the
+# private directory and is deleted after the run, so nothing is ever created on
+# or removed from the host. (placeholder is only used by the legacy
+# sandbox_lifecycle helper.)
+# Session transcripts, history, sockets and daemon state of host sessions are
+# simply absent from the private directory.
 # ---------------------------------------------------------------------------
 PROVIDER_PROFILES: Dict[str, dict] = {
     "claude": {
         "roots": [".claude"],
         "home_ro_files": [".claude.json"],
+        "credentials": [(".claude", ".credentials.json")],
+        "seed": [],
         "protected": [
             (".claude", "CLAUDE.md", "file", ""),
             (".claude", "settings.json", "file", "{}\n"),
@@ -183,45 +208,18 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             # npm "local" installation of the claude binary
             (".claude", "local", "dir", None),
         ],
-        "ephemeral": [
-            (".claude", "shell-snapshots"),
-            (".claude", "session-env"),
-            (".claude", "sessions"),
-            (".claude", "ide"),
-            (".claude", "daemon"),
-            (".claude", "jobs"),
-            (".claude", "bridge-spawn"),
-        ],
-        "readonly_state": [
-            (".claude", ".credentials.json"),
-            (".claude", "active-time.json"),
-            (".claude", "backups"),
-            (".claude", "cache"),
-            (".claude", "debug"),
-            (".claude", "file-history"),
-            (".claude", "history.jsonl"),
-            (".claude", "image-cache"),
-            (".claude", "logs"),
-            (".claude", "mcp-needs-auth-cache.json"),
-            (".claude", "paste-cache"),
-            (".claude", "plans"),
-            (".claude", "startup-perf"),
-            (".claude", "stats-cache.json"),
-            (".claude", "statsig"),
-            (".claude", "state"),
-            (".claude", "tasks"),
-            (".claude", "telemetry"),
-            (".claude", "todos"),
-            (".claude", "traces"),
-            (".claude", "usage-data"),
-        ],
-        # auto-memory: ~/.claude/projects/<key>/memory/*.md is injected into
-        # later sessions of that project.
+        # auto-memory: ~/.claude/projects/<key>/memory/*.md (read-only for the
+        # current project)
         "project_memory_root": (".claude", "projects"),
     },
     "codex": {
         "roots": [".codex"],
-        "tmpfs_readonly_root": True,
+        "credentials": [(".codex", "auth.json")],
+        "seed": [
+            (".codex", "version.json"),
+            (".codex", "models_cache.json"),
+            (".codex", "installation_id"),
+        ],
         "protected": [
             (".codex", "config.toml", "file", ""),
             (".codex", "AGENTS.md", "file", ""),
@@ -236,27 +234,20 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".codex", "packages", "dir", None),
             (".codex", "memories", "dir", None),
         ],
-        "ephemeral": [
-            (".codex", "shell_snapshots"),
-            (".codex", "app-server-control"),
-            (".codex", "app-server-daemon"),
-        ],
-        "readonly_state": [
-            (".codex", "sessions"),
-            (".codex", "history.jsonl"),
-            (".codex", "log"),
-            (".codex", "logs"),
-            (".codex", "cache"),
-            (".codex", "tmp"),
-            (".codex", ".tmp"),
-            (".codex", "version.json"),
-            (".codex", "session_index.jsonl"),
-            (".codex", "models_cache.json"),
-            (".codex", "archived_sessions"),
-        ],
     },
     "agy": {
         "roots": [".gemini"],
+        "credentials": [
+            (".gemini", "oauth_creds.json"),
+            (".gemini", "google_accounts.json"),
+            (".gemini", "flow_auth.json"),
+            (".gemini", "antigravity-cli/antigravity-oauth-token"),
+        ],
+        "seed": [
+            (".gemini", "installation_id"),
+            (".gemini", "antigravity/installation_id"),
+            (".gemini", "antigravity-cli/installation_id"),
+        ],
         "protected": [
             (".gemini", "settings.json", "file", "{}\n"),
             (".gemini", "GEMINI.md", "file", ""),
@@ -277,18 +268,16 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".gemini", "antigravity-cli/settings.json", "file", None),
             (".gemini", "antigravity-cli/mcp_config.json", "file", None),
         ],
-        "ephemeral": [],
-        "readonly_state": [
-            (".gemini", "history"),
-            (".gemini", "tmp"),
-            (".gemini", "state.json"),
-            (".gemini", "projects.json"),
-            (".gemini", "antigravity-cli/brain"),
-            (".gemini", "antigravity-cli/scratch"),
-        ],
     },
     "grok": {
         "roots": [".grok"],
+        "credentials": [(".grok", "auth.json")],
+        "seed": [
+            (".grok", "agent_id"),
+            (".grok", "version.json"),
+            (".grok", "models_cache.json"),
+            (".grok", ".metadata_version"),
+        ],
         "protected": [
             (".grok", "config.toml", "file", ""),
             # bin/ must stay read-only: replacing ~/.grok/bin/grok = host RCE
@@ -304,36 +293,30 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".grok", "sandbox.toml", "file", None),
             (".grok", "trusted_folders.toml", "file", None),
         ],
-        "ephemeral": [],
     },
     "muse": {
         "roots": [".config/muse", ".local/share/muse"],
+        "credentials": [(".config/muse", "auth.json")],
+        "seed": [],
         "protected": [
             (".config/muse", "settings.json", "file", None),
             (".config/muse", "env", "file", None),
             (".config/muse", "trust.json", "file", None),
+            (".config/muse", "approval-policy.json", "file", None),
             (".local/share/muse", "plugins", "dir", None),
             (".local/share/muse", "skills", "dir", None),
             (".local/share/muse", "feature-config", "dir", None),
-        ],
-        "ephemeral": [
-            (".local/share/muse", "runtime"),
-        ],
-        "readonly_state": [
-            (".config/muse", "cache"),
-            (".local/share/muse", "logs"),
-            (".local/share/muse", "cache"),
         ],
     },
     "aider": {
         "roots": [".aider"],
         "home_ro_files": [".aider.conf.yml"],
-        "protected": [],
-        "ephemeral": [],
-        "readonly_state": [
-            (".aider", "caches"),
+        "credentials": [],
+        "seed": [
             (".aider", "analytics.json"),
+            (".aider", "installs.json"),
         ],
+        "protected": [],
     },
 }
 
@@ -343,13 +326,15 @@ PROVIDER_HOME_BIN_DIRS = {
     "muse": [".local/libexec"],
 }
 
-# Bounds for build-time tree scans (eng-delivery#7).
-SCAN_ENTRY_LIMIT = 100_000
+# Bounds for build-time tree scans (eng-delivery#7). The workspace socket scan
+# walks everything (node_modules, .git internals included, H5); a truncated scan
+# fails closed for writable sessions.
+SCAN_ENTRY_LIMIT = 300_000
 BROAD_SCAN_DEPTH = 3
 PROVIDER_SCAN_DEPTH = 3
 PROVIDER_SCAN_ENTRY_LIMIT = 20_000
 PROJECT_MEMORY_LIMIT = 2_000
-SCAN_SKIP_DIRS = frozenset({".git", "node_modules"})
+SCAN_SKIP_DIRS: frozenset = frozenset()
 HOST_VAR_ROOT = "/var"
 HOST_VAR_SCAN_DEPTH = 8
 HOST_VAR_SCAN_ENTRY_LIMIT = 100_000
@@ -419,8 +404,14 @@ def generate_seccomp_bpf_filter() -> Optional[bytes]:
         # 3. Load syscall number: [BPF_LD | BPF_W | BPF_ABS, offset 0]
         stmt(BPF_LD | BPF_W | BPF_ABS, 0)
 
-        # 4. Filter blocked syscalls: jump to errno block if matched
         n = len(blocked_syscalls)
+        # Block X32 ABI syscalls (nr >= 0x40000000) on x86_64 to prevent seccomp filter bypass
+        if machine in ("x86_64", "amd64"):
+            BPF_JGE = 0x30
+            X32_SYSCALL_BIT = 0x40000000
+            jmp(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, n + 1, 0)
+
+        # 4. Filter blocked syscalls: jump to errno block if matched
         for i, sc in enumerate(blocked_syscalls):
             remaining = n - 1 - i
             jmp(BPF_JMP | BPF_JEQ | BPF_K, sc, remaining + 1, 0)
@@ -435,8 +426,153 @@ def generate_seccomp_bpf_filter() -> Optional[bytes]:
         return None
 
 
+SECCOMP_REQUIRE_ENV = "MAKEWAND_REQUIRE_SECCOMP"
+SECCOMP_OPT_OUT_ENV = "MAKEWAND_ALLOW_NO_SECCOMP"
+_seccomp_warned: Dict[str, bool] = {"opt_out": False}
+
+
+@contextlib.contextmanager
+def seccomp_filter_context(enabled: bool = True, required: bool = False):
+    """
+    Context manager that prepares a seccomp BPF filter pipe if enabled.
+    Yields (seccomp_fd, pass_fds) tuple for passing into wrap_bwrap and run_subprocess.
+    Guarantees the read descriptor is closed after process launch.
+
+    enabled=True means a bwrap launch is being prepared: the filter is then
+    mandatory (supported: Linux x86_64/aarch64) and any failure raises
+    SandboxConfigError. MAKEWAND_ALLOW_NO_SECCOMP=1 is the only opt-out (warned,
+    the filter is skipped). required=True / MAKEWAND_REQUIRE_SECCOMP=1 also
+    refuse enabled=False and override the opt-out.
+    """
+    explicit = required or (os.environ.get(SECCOMP_REQUIRE_ENV) == "1")
+    if not enabled:
+        if explicit:
+            raise SandboxConfigError("Seccomp-BPF is strictly required but was disabled")
+        yield None, ()
+        return
+    if not explicit and os.environ.get(SECCOMP_OPT_OUT_ENV) == "1":
+        if not _seccomp_warned["opt_out"]:
+            _seccomp_warned["opt_out"] = True
+            _warn(f"警告：{SECCOMP_OPT_OUT_ENV}=1——沙箱进程将不加载 seccomp 过滤器"
+                  "（ptrace/bpf/keyctl/process_vm_*/userfaultfd 未被拦截）。")
+        yield None, ()
+        return
+    bpf = generate_seccomp_bpf_filter()
+    if not bpf:
+        raise SandboxConfigError(
+            f"无法为当前架构 ({platform.system()} {platform.machine()}) 生成 Seccomp-BPF 过滤器，"
+            f"拒绝启动沙箱 (fail closed)。仅支持 Linux x86_64/aarch64；"
+            f"如确需在无 seccomp 的情况下运行，请显式设置 {SECCOMP_OPT_OUT_ENV}=1。"
+        )
+    r, w = None, None
+    try:
+        r, w = os.pipe()
+        os.write(w, bpf)
+        os.close(w)
+        w = None
+    except Exception as exc:
+        if w is not None:
+            try:
+                os.close(w)
+            except Exception:
+                pass
+        if r is not None:
+            try:
+                os.close(r)
+            except Exception:
+                pass
+        raise SandboxConfigError(
+            f"Seccomp-BPF pipe setup failed: {exc} (fail closed; opt out with {SECCOMP_OPT_OUT_ENV}=1)"
+        ) from exc
+
+    try:
+        yield r, (r,)
+    finally:
+        try:
+            os.close(r)
+        except Exception:
+            pass
+
+
+# bwrap is resolved only from fixed system directories, never $PATH: a
+# repository-controlled PATH entry (activated .venv, node_modules/.bin, direnv)
+# could otherwise shadow it and run on the host before confinement exists.
+# Mirrors internal/trustedbin on the Go side.
+TRUSTED_BWRAP_DIRS = (
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/run/current-system/sw/bin",  # NixOS system profile (symlinks into /nix/store)
+)
+BWRAP_OVERRIDE_ENV = "MAKEWAND_BWRAP_PATH"
+# Marks provider CLI children; makewand/cli.py refuses model dispatch under it.
+PROVIDER_WORKER_ENV = "MAKEWAND_PROVIDER_WORKER"
+
+
+def _trusted_launcher_ok(path: str, allow_current_user: bool) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if stat.S_IMODE(st.st_mode) & 0o022:
+        return False
+    if st.st_uid == 0:
+        return True
+    # Inside a user namespace (nested bwrap, containers, sandboxed agent shells)
+    # root-owned host files appear as the kernel overflow uid; such unmapped
+    # owners are equally out of the current user's reach.
+    if st.st_uid == _overflow_uid() and st.st_uid != os.geteuid() and _in_user_namespace():
+        return True
+    return allow_current_user and st.st_uid == os.geteuid()
+
+
+def _in_user_namespace() -> bool:
+    """False for the initial namespace, whose uid_map is the identity map."""
+    try:
+        with open("/proc/self/uid_map", encoding="ascii") as fh:
+            return fh.read().split() != ["0", "0", "4294967295"]
+    except OSError:
+        return False
+
+
+def _overflow_uid() -> int:
+    try:
+        with open("/proc/sys/kernel/overflowuid", encoding="ascii") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return 65534
+
+
+def resolve_trusted_bwrap() -> Optional[str]:
+    """Return the resolved path of a trusted bwrap, or None.
+
+    Accepts only root-owned, non-group/world-writable files in root-owned,
+    non-group/world-writable directories. MAKEWAND_BWRAP_PATH may name an
+    absolute path also owned by the current user. The returned path is
+    symlink-free so the probe and the real launch execute the same file.
+    """
+    if not hasattr(os, "geteuid"):
+        return None
+    override = os.environ.get(BWRAP_OVERRIDE_ENV, "").strip()
+    if override:
+        candidates, allow_user = [override] if os.path.isabs(override) else [], True
+    else:
+        candidates, allow_user = [os.path.join(d, "bwrap") for d in TRUSTED_BWRAP_DIRS], False
+    for candidate in candidates:
+        if not os.path.lexists(candidate):
+            continue
+        real = os.path.realpath(candidate)
+        if not os.path.isfile(real) or not os.access(real, os.X_OK):
+            continue
+        if _trusted_launcher_ok(real, allow_user) and _trusted_launcher_ok(os.path.dirname(real), allow_user):
+            return real
+    return None
+
+
 def is_bwrap_available() -> bool:
-    bwrap = shutil.which("bwrap")
+    bwrap = resolve_trusted_bwrap()
     if not bwrap:
         return False
     # Quick self-test
@@ -527,21 +663,24 @@ def _scan_tree(
     collect_git: bool,
     skip_dirs: frozenset = SCAN_SKIP_DIRS,
     skip_paths: Iterable[str] = (),
+    descend_git: bool = False,
 ) -> Tuple[Set[str], Set[str], bool]:
     """
     Iteratively scans roots without following symlinks.
-    Returns (git_entries, socket_paths, truncated). `.git` entries are recorded
-    but never descended into; directories named in skip_dirs are skipped; the
-    total number of entries visited is capped by entry_limit.
+    Returns (git_entries, socket_paths, truncated). `.git` entries are recorded;
+    a `.git` directory is descended into (for sockets only, e.g. the fsmonitor
+    daemon socket) when descend_git is set; directories named in skip_dirs are
+    skipped; the total number of entries visited is capped by entry_limit.
     """
     git_paths: Set[str] = set()
     sockets: Set[str] = set()
     skip_abs = {_norm(p) for p in skip_paths}
     seen = 0
     truncated = False
-    stack: List[Tuple[str, int]] = [(_norm(r), 0) for r in roots if r and os.path.isdir(r)]
+    # (path, depth, inside_git): .git entries below a .git directory are not recorded
+    stack: List[Tuple[str, int, bool]] = [(_norm(r), 0, False) for r in roots if r and os.path.isdir(r)]
     while stack:
-        cur, depth = stack.pop()
+        cur, depth, in_git = stack.pop()
         try:
             it = os.scandir(cur)
         except OSError:
@@ -554,16 +693,17 @@ def _scan_tree(
                     break
                 name = entry.name
                 path = entry.path
-                if name == ".git":
-                    if collect_git:
-                        git_paths.add(path)
+                is_git = name == ".git" and not in_git
+                if is_git and collect_git:
+                    git_paths.add(path)
+                if is_git and not descend_git:
                     continue
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         if name in skip_dirs or path in skip_abs:
                             continue
                         if max_depth is None or depth + 1 < max_depth:
-                            stack.append((path, depth + 1))
+                            stack.append((path, depth + 1, in_git or is_git))
                         continue
                     if entry.is_file(follow_symlinks=False) or entry.is_symlink():
                         continue
@@ -648,178 +788,419 @@ def _mask_mount_args(path: str) -> List[str]:
     return ["--ro-bind", "/dev/null", path]
 
 
+PRIVATE_HOME_SUBDIR = os.path.join("makewand", "provider-homes")
+CREDENTIAL_MAX_BYTES = 4 * 1024 * 1024
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+
+def _private_home_base() -> str:
+    """0700 per-user directory holding per-run private provider homes."""
+    candidates: List[str] = []
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if runtime and os.path.isabs(runtime):
+        candidates.append(os.path.join(runtime, PRIVATE_HOME_SUBDIR))
+    cache = os.environ.get("XDG_CACHE_HOME", "")
+    if not (cache and os.path.isabs(cache)):
+        cache = os.path.join(str(Path.home()), ".cache")
+    candidates.append(os.path.join(cache, PRIVATE_HOME_SUBDIR))
+    for base in candidates:
+        try:
+            os.makedirs(base, mode=0o700, exist_ok=True)
+            st = os.lstat(base)
+            if not stat.S_ISDIR(st.st_mode) or (hasattr(os, "geteuid") and st.st_uid != os.geteuid()):
+                continue
+            if stat.S_IMODE(st.st_mode) & 0o077:
+                os.chmod(base, 0o700)
+            return base
+        except OSError:
+            continue
+    raise SandboxConfigError("无法创建私有 provider 状态目录（XDG_RUNTIME_DIR / 用户缓存目录均不可用），拒绝挂载 provider 状态")
+
+
+def _sweep_stale_private_homes(base: str) -> None:
+    """Removes private homes left behind by makewand processes that no longer exist."""
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return
+    for name in names:
+        pid_s = name.split("-", 1)[0]
+        if not pid_s.isdigit() or int(pid_s) == os.getpid():
+            continue
+        try:
+            os.kill(int(pid_s), 0)
+            continue
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        _robust_force_remove(os.path.join(base, name))
+
+
+def _read_host_regular(path: str) -> Optional[Tuple[bytes, int]]:
+    """(content, mode) of a host file (dotfile symlinks followed), None when absent/not a bounded regular file."""
+    try:
+        real = os.path.realpath(path)
+        fd = os.open(real, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > CREDENTIAL_MAX_BYTES:
+            return None
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks), stat.S_IMODE(st.st_mode)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _read_private_nofollow(base: str, rel: str) -> Optional[bytes]:
+    """Reads base/rel without following any symlink below base; None unless a bounded regular file."""
+    parts = [p for p in rel.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        return None
+    fds: List[int] = []
+    try:
+        fds.append(os.open(base, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC))
+        for comp in parts[:-1]:
+            fds.append(os.open(comp, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=fds[-1]))
+        fds.append(os.open(parts[-1], os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0),
+                           dir_fd=fds[-1]))
+        st = os.fstat(fds[-1])
+        if not stat.S_ISREG(st.st_mode) or st.st_size > CREDENTIAL_MAX_BYTES:
+            return None
+        chunks = []
+        while True:
+            b = os.read(fds[-1], 65536)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        for fd in reversed(fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _atomic_write_host(path: str, data: bytes, mode: int) -> None:
+    parent = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".makewand-wb-", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode & 0o777 or 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _digest(data: Optional[bytes]) -> Optional[str]:
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+@dataclass
+class _CredentialCopy:
+    private_root: str
+    rel: str
+    host_path: str
+    initial_digest: Optional[str]
+    mode: int = 0o600
+
+
+def _resolve_provider_profile(p_name: str, user_home: str, project_paths: Sequence[str]) -> Optional[dict]:
+    profile = PROVIDER_PROFILES.get(p_name)
+    if not profile:
+        return None
+    if p_name != "codex":
+        return profile
+    # A configured Codex home selects one account. Never silently switch
+    # accounts after --clearenv, or expose another account's state as well.
+    selected = _norm(os.path.expanduser(os.environ.get("CODEX_HOME") or
+                                       os.path.join(user_home, ".codex")))
+    real_selected = os.path.realpath(selected)
+    if (_broad_workspace(real_selected, user_home) or _home_exposed(real_selected, user_home)
+            or any(_is_within(os.path.realpath(path), real_selected) or
+                   _is_within(real_selected, os.path.realpath(path)) for path in project_paths if path)):
+        raise SandboxConfigError("CODEX_HOME must be a dedicated provider state directory")
+    if os.environ.get("CODEX_HOME") and not os.path.isdir(selected):
+        raise SandboxConfigError("configured CODEX_HOME does not exist; refusing account fallback")
+    profile = dict(profile)
+    profile["roots"] = [selected]
+    for category in ("protected", "credentials", "seed"):
+        profile[category] = [(selected, *entry[1:]) for entry in profile.get(category, [])
+                             if entry[0] == ".codex"]
+    return profile
+
+
+class ProviderHome:
+    """
+    Per-run private provider home (H3). Created lazily by wrap_bwrap via
+    materialize(); finalize() writes changed credential files back to the host
+    and deletes the private directory. Use provider_home_session().
+    """
+
+    def __init__(self, provider: str, user_home: Optional[str] = None, project_paths: Sequence[str] = ()):
+        p = (provider or "").lower().strip()
+        self.provider = "agy" if p == "gemini" else p
+        self.user_home = _norm(user_home or str(Path.home()))
+        self.project_paths = [p for p in project_paths if p]
+        self.private_dir: Optional[str] = None
+        self.bwrap_args: List[str] = []
+        self.state_roots: List[str] = []
+        self.scan_roots: List[str] = []
+        self.credentials: List[_CredentialCopy] = []
+        self._materialized = False
+        self._lock = threading.Lock()
+
+    def materialize(self, project_paths: Sequence[str] = ()) -> List[str]:
+        with self._lock:
+            if self._materialized:
+                return list(self.bwrap_args)
+            paths = list(self.project_paths) + [p for p in project_paths if p]
+            profile = _resolve_provider_profile(self.provider, self.user_home, paths)
+            if not profile:
+                self._materialized = True
+                return []
+            try:
+                self._build(profile, paths)
+            except BaseException:
+                self._remove_private_dir()
+                raise
+            self._materialized = True
+            return list(self.bwrap_args)
+
+    def _ensure_private_dir(self) -> str:
+        if self.private_dir is None:
+            base = _private_home_base()
+            _sweep_stale_private_homes(base)
+            try:
+                self.private_dir = tempfile.mkdtemp(prefix=f"{os.getpid()}-{self.provider}-", dir=base)
+                os.chmod(self.private_dir, 0o700)
+            except OSError as exc:
+                raise SandboxConfigError(f"无法创建私有 provider 状态目录 ({exc})，拒绝启动 (fail closed)") from exc
+        return self.private_dir
+
+    def _copy_in(self, src: str, priv_root: str, rel: str) -> Optional[Tuple[bytes, int]]:
+        found = _read_host_regular(src)
+        if found is None:
+            return None
+        dst = os.path.join(priv_root, rel)
+        try:
+            os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC, 0o600)
+            try:
+                os.write(fd, found[0])
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise SandboxConfigError(f"无法复制 provider 凭据到私有目录 ({exc})，拒绝启动 (fail closed)") from exc
+        return found
+
+    def _build(self, profile: dict, project_paths: Sequence[str]) -> None:
+        args: List[str] = []
+        for rel in profile.get("home_ro_files", []):
+            p = os.path.join(self.user_home, rel)
+            if os.path.exists(p):
+                args.extend(["--ro-bind", p, p])
+
+        real_roots: Dict[str, str] = {}
+        for idx, root_rel in enumerate(profile.get("roots", [])):
+            root_path = _norm(os.path.join(self.user_home, root_rel))
+            if not os.path.isdir(root_path):
+                continue  # never create or expose a missing provider root
+            real = os.path.realpath(root_path)
+            priv = os.path.join(self._ensure_private_dir(), f"root{idx}")
+            try:
+                os.mkdir(priv, 0o700)
+            except OSError as exc:
+                raise SandboxConfigError(f"无法创建私有 provider 状态目录 ({exc})，拒绝启动 (fail closed)") from exc
+            real_roots[root_rel] = real
+            self.state_roots.append(real)
+            args.extend(["--bind", priv, real])
+            if real != root_path:
+                # Keep the host layout: ~/.gemini -> /mnt/.../gemini.
+                args.extend(["--symlink", real, root_path])
+
+            for kind in ("credentials", "seed"):
+                for e_root, rel in profile.get(kind, []):
+                    if e_root != root_rel:
+                        continue
+                    host_p = os.path.join(real, rel)
+                    found = self._copy_in(host_p, priv, rel)
+                    if kind == "credentials":
+                        self.credentials.append(_CredentialCopy(
+                            private_root=priv, rel=rel, host_path=host_p,
+                            initial_digest=_digest(found[0]) if found else None,
+                            mode=found[1] if found else 0o600,
+                        ))
+
+        for root_rel, sub, _kind, _placeholder in profile.get("protected", []):
+            real = real_roots.get(root_rel)
+            if not real:
+                continue
+            p = os.path.join(real, sub)
+            if os.path.islink(p):
+                # dotfile-managed symlink: bind its resolved target read-only at
+                # the expected path (the link itself is not exposed)
+                target = os.path.realpath(p)
+                if os.path.exists(target):
+                    args.extend(["--ro-bind", target, p])
+                    if os.path.isdir(target):
+                        self.scan_roots.append(target)
+                continue
+            if os.path.exists(p):
+                args.extend(["--ro-bind", p, p])
+                if os.path.isdir(p):
+                    self.scan_roots.append(p)
+
+        pm = profile.get("project_memory_root")
+        if pm and real_roots.get(pm[0]):
+            projects_dir = os.path.join(real_roots[pm[0]], pm[1])
+            for proj in project_paths:
+                key = _claude_project_key(proj)
+                if not key:
+                    continue
+                mem = os.path.join(projects_dir, key, "memory")
+                if os.path.isdir(mem) and not os.path.islink(mem):
+                    pair = ["--ro-bind", mem, mem]
+                    if mem not in args:
+                        args.extend(pair)
+        self.bwrap_args = args
+
+    def write_back(self) -> List[str]:
+        """Writes changed credential copies back to the host. Returns the written host paths."""
+        written: List[str] = []
+        for cred in self.credentials:
+            data = _read_private_nofollow(cred.private_root, cred.rel)
+            if data is None:
+                continue  # deleted / replaced by a non-regular file: host copy untouched
+            if _digest(data) == cred.initial_digest:
+                continue
+            target = cred.host_path
+            if os.path.islink(target):
+                target = os.path.realpath(target)
+            if os.path.lexists(target) and not os.path.isfile(target):
+                _warn(f"宿主凭据 {cred.host_path} 不是普通文件，跳过回写")
+                continue
+            current = _read_host_regular(target)
+            if _digest(current[0] if current else None) != cred.initial_digest:
+                _warn(f"宿主凭据 {cred.host_path} 在运行期间被其他会话修改，保留宿主版本，跳过回写")
+                continue
+            try:
+                _atomic_write_host(target, data, cred.mode)
+                written.append(target)
+            except OSError as exc:
+                _warn(f"凭据回写失败 {cred.host_path}: {exc}")
+        return written
+
+    def _remove_private_dir(self) -> None:
+        if self.private_dir:
+            _robust_force_remove(self.private_dir)
+            self.private_dir = None
+
+    def finalize(self, write_back: bool = True) -> None:
+        with self._lock:
+            try:
+                if write_back and self._materialized:
+                    self.write_back()
+            finally:
+                self._remove_private_dir()
+
+
+_ORPHAN_HOMES: List[ProviderHome] = []
+_ORPHAN_LOCK = threading.Lock()
+
+
+def _cleanup_orphan_homes() -> None:
+    with _ORPHAN_LOCK:
+        homes = list(_ORPHAN_HOMES)
+        _ORPHAN_HOMES.clear()
+    for home in homes:
+        try:
+            home.finalize(write_back=False)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_orphan_homes)
+
+
+def _orphan_provider_home(p_name: str, user_home: str) -> ProviderHome:
+    """wrap_bwrap without a session: private home without credential write-back, removed at exit."""
+    home = ProviderHome(p_name, user_home)
+    with _ORPHAN_LOCK:
+        _ORPHAN_HOMES.append(home)
+    return home
+
+
+@contextmanager
+def provider_home_session(provider_name: str, project_paths: Sequence[str] = ()):
+    """Yields a ProviderHome for one sandboxed provider run (pass it to wrap_bwrap)."""
+    home = ProviderHome(provider_name, None, project_paths)
+    try:
+        yield home
+    finally:
+        home.finalize()
+
+
 def _provider_mounts(
     p_name: str,
     user_home: str,
     readonly: bool,
     project_paths: Sequence[str],
+    provider_home: Optional[ProviderHome] = None,
 ) -> Tuple[List[str], List[str], List[str]]:
     """
-    Builds the provider state-directory mounts.
-    Returns (bwrap_args, scan_roots, scan_skip_paths).
+    Builds the provider state mounts (private home, see PROVIDER_PROFILES).
+    Returns (bwrap_args, state_roots, socket_scan_roots). readonly is accepted for
+    compatibility: read-only and writable runs both get a private home.
     """
-    profile = PROVIDER_PROFILES.get(p_name)
-    if not profile:
+    if p_name not in PROVIDER_PROFILES:
         return [], [], []
-    if p_name == "codex":
-        # A configured Codex home selects one account. Never silently switch
-        # accounts after --clearenv, or expose another account's state as well.
-        selected = _norm(os.path.expanduser(os.environ.get("CODEX_HOME") or
-                                           os.path.join(user_home, ".codex")))
-        real_selected = os.path.realpath(selected)
-        if (_broad_workspace(real_selected, user_home) or _home_exposed(real_selected, user_home)
-                or any(_is_within(os.path.realpath(path), real_selected) or
-                       _is_within(real_selected, os.path.realpath(path)) for path in project_paths)):
-            raise SandboxConfigError("CODEX_HOME must be a dedicated provider state directory")
-        if os.environ.get("CODEX_HOME") and not os.path.isdir(selected):
-            raise SandboxConfigError("configured CODEX_HOME does not exist; refusing account fallback")
-        profile = dict(profile)
-        profile["roots"] = [selected]
-        for category in ("protected", "ephemeral", "readonly_state"):
-            profile[category] = [(selected, *entry[1:]) for entry in profile.get(category, [])
-                                 if entry[0] == ".codex"]
-    args: List[str] = []
-    scan_roots: List[str] = []
-    scan_skip: List[str] = []
-
-    for rel in profile.get("home_ro_files", []):
-        p = os.path.join(user_home, rel)
-        if os.path.exists(p):
-            args.extend(["--ro-bind", p, p])
-
-    tmpfs_root_ro = readonly and bool(profile.get("tmpfs_readonly_root"))
-    whole_root_ro = readonly and bool(profile.get("readonly_state")) and not tmpfs_root_ro
-
-    real_roots: Dict[str, str] = {}
-    for root_rel in profile.get("roots", []):
-        root_path = os.path.join(user_home, root_rel)
-        if not os.path.isdir(root_path):
-            continue
-        real = os.path.realpath(root_path)
-        real_roots[root_rel] = real
-        if tmpfs_root_ro:
-            args.extend(["--tmpfs", real])
-        elif whole_root_ro:
-            args.extend(["--ro-bind", real, real])
-        else:
-            args.extend(["--bind", real, real])
-        if real != _norm(root_path):
-            # Keep the host layout: ~/.gemini -> /mnt/.../gemini. Only the real
-            # directory is mounted, so every protection below applies once.
-            args.extend(["--symlink", real, root_path])
-        scan_roots.append(real)
-
-    if tmpfs_root_ro:
-        for root_rel in profile.get("roots", []):
-            real = real_roots.get(root_rel)
-            if not real:
-                continue
-            for sub in ("auth.json", "config.toml", "version.json", "models_cache.json"):
-                p = os.path.join(real, sub)
-                if os.path.exists(p):
-                    args.extend(["--ro-bind", p, p])
-        for root_rel, sub, kind, placeholder in profile.get("protected", []):
-            real = real_roots.get(root_rel)
-            if not real:
-                continue
-            p = os.path.join(real, sub)
-            if os.path.islink(p):
-                target = os.path.realpath(p)
-                if os.path.exists(target):
-                    args.extend(["--ro-bind", target, p])
-            elif os.path.exists(p):
-                args.extend(["--ro-bind", p, p])
-    elif whole_root_ro:
-        for root_rel, sub in profile.get("readonly_state", []):
-            real = real_roots.get(root_rel)
-            if not real:
-                continue
-            p = os.path.join(real, sub)
-            if os.path.lexists(p) and not os.path.islink(p):
-                args.extend(["--bind", p, p])
-    else:
-        for root_rel, sub, kind, placeholder in profile.get("protected", []):
-            real = real_roots.get(root_rel)
-            if not real:
-                continue
-            p = os.path.join(real, sub)
-            if os.path.islink(p):
-                # A dotfile-managed symlink: a bind on it would land on its
-                # target anyway, so expose the target read-only at its real
-                # location (the link itself stays replaceable, see SECURITY.md).
-                target = os.path.realpath(p)
-                if os.path.exists(target):
-                    args.extend(["--ro-bind", target, target])
-                else:
-                    _warn(f"受保护路径 {p} 是悬空符号链接，未能只读挂载")
-                continue
-            if not os.path.lexists(p):
-                if placeholder is None:
-                    continue
-                _create_placeholder(p, kind, placeholder)
-            args.extend(["--ro-bind", p, p])
-
-        pm = profile.get("project_memory_root")
-        if pm and real_roots.get(pm[0]):
-            projects_dir = os.path.join(real_roots[pm[0]], pm[1])
-            args.extend(_claude_project_memory_mounts(projects_dir, project_paths))
-
-    for root_rel, sub in profile.get("ephemeral", []):
-        real = real_roots.get(root_rel)
-        if not real:
-            continue
-        p = os.path.join(real, sub)
-        if os.path.islink(p):
-            target = os.path.realpath(p)
-            if os.path.isdir(target):
-                args.extend(["--tmpfs", target])
-                scan_skip.append(target)
-            continue
-        if whole_root_ro and not os.path.lexists(p):
-            continue  # cannot create a mount point inside a read-only root
-        if os.path.lexists(p) and not os.path.isdir(p):
-            args.extend(["--ro-bind", "/dev/null", p])
-        else:
-            args.extend(["--tmpfs", p])
-        scan_skip.append(p)
-
-    return args, scan_roots, scan_skip
-
-
-def _claude_project_memory_mounts(projects_dir: str, project_paths: Sequence[str]) -> List[str]:
-    """Read-only auto-memory directories for every known Claude project (+ the current one)."""
-    args: List[str] = []
-    candidates: List[str] = []
-    try:
-        if os.path.isdir(projects_dir):
-            with os.scandir(projects_dir) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        candidates.append(entry.path)
-    except OSError:
-        pass
-    for p in project_paths:
-        key = _claude_project_key(p) if p else None
-        if key:
-            cand = os.path.join(projects_dir, key)
-            if cand not in candidates:
-                candidates.append(cand)
-    if len(candidates) > PROJECT_MEMORY_LIMIT:
-        _warn(f"Claude 项目目录超过 {PROJECT_MEMORY_LIMIT} 个，仅保护前 {PROJECT_MEMORY_LIMIT} 个项目的 auto-memory")
-        candidates = candidates[:PROJECT_MEMORY_LIMIT]
-    for proj in sorted(candidates):
-        mem = os.path.join(proj, "memory")
-        if os.path.islink(mem):
-            continue
-        if not os.path.lexists(mem):
-            _create_placeholder(mem, "dir", True)
-        args.extend(["--ro-bind", mem, mem])
-    return args
+    home = provider_home or _orphan_provider_home(p_name, user_home)
+    args = home.materialize(project_paths)
+    return args, list(home.state_roots), list(home.scan_roots)
 
 
 # ---------------------------------------------------------------------------
 # command builder
 # ---------------------------------------------------------------------------
+def _detect_provider(provider_name: Optional[str], command_args: Optional[Sequence]) -> str:
+    """Provider from the explicit name, else from the first argv binary name."""
+    p_name = (provider_name or "").lower().strip()
+    if p_name == "gemini":
+        p_name = "agy"
+    if not p_name and command_args:
+        first_bin = os.path.basename(str(command_args[0])).lower()
+        if first_bin == "gemini" or first_bin.startswith("gemini-") or first_bin.startswith("gemini."):
+            p_name = "agy"
+        else:
+            for candidate in ["claude", "codex", "agy", "muse", "grok", "aider"]:
+                if first_bin == candidate or first_bin.startswith(candidate + "-") or first_bin.startswith(candidate + "."):
+                    p_name = candidate
+                    break
+    return p_name
+
+
 def wrap_bwrap(
     command_args: List[str],
     workspace: str,
@@ -831,19 +1212,23 @@ def wrap_bwrap(
     extra_env: Optional[dict] = None,
     provider_name: Optional[str] = None,
     extra_ro_binds: Optional[List[str]] = None,
-    seccomp_fd: Optional[int] = None
+    seccomp_fd: Optional[int] = None,
+    provider_home: Optional[ProviderHome] = None,
 ) -> List[str]:
     """
     Wraps command with bubblewrap isolating host filesystem, IPC, PID, and credentials.
     Workspace (or entire worktree root if workspace is a subdirectory) is mounted.
     Workspace is mounted read-only if readonly=True, otherwise writable.
-    If is_provider=True, only the active provider's state directory is mounted:
-    writable for session/credential state, with instruction/extension/config
-    paths read-only (see PROVIDER_PROFILES).
+    If is_provider=True, the active provider gets a private per-run home at its
+    expected path (copied credentials, read-only instruction/extension/config
+    binds, see PROVIDER_PROFILES); pass provider_home (provider_home_session)
+    to get changed credentials written back after the run.
     HOME is always an empty tmpfs; /home, /root, /mnt, /media, /srv are hidden.
     Raises SandboxConfigError when no safe command line can be built (fail closed).
     """
-    bwrap = shutil.which("bwrap") or "/usr/bin/bwrap"
+    bwrap = resolve_trusted_bwrap()
+    if not bwrap:
+        raise SandboxConfigError("未找到可信的 Bubblewrap (bwrap)（仅接受系统目录中 root 所有且不可被组/其他用户写入的 bwrap），拒绝构建沙箱命令 (fail closed)")
     ws = _norm(workspace)
     user_home = _norm(str(Path.home()))
 
@@ -884,31 +1269,34 @@ def wrap_bwrap(
     mount_root = _norm(mount_root)
     repo_abs = _norm(repo_root) if repo_root else None
 
-    # A writable mount of / or of HOME (or an ancestor of HOME) would expose the
+    # A writable mount of forbidden roots, / or of HOME (or an ancestor of HOME) would expose the
     # whole host / every credential read-write: refuse (fail closed).
     if not readonly:
+        forbidden_candidates = set(FORBIDDEN_WRITABLE_ROOTS)
+        for r in FORBIDDEN_WRITABLE_ROOTS:
+            try:
+                forbidden_candidates.add(_norm(os.path.realpath(r)))
+            except Exception:
+                pass
         for cand in {ws, mount_root}:
-            if cand == "/" or _home_exposed(cand, user_home):
+            cand_norm = _norm(cand)
+            try:
+                cand_real = _norm(os.path.realpath(cand))
+            except Exception:
+                cand_real = cand_norm
+            if cand_norm in forbidden_candidates or cand_real in forbidden_candidates:
                 raise SandboxConfigError(
-                    f"拒绝以 {cand} 作为可写沙箱工作区：它是 / 或 HOME（或 HOME 的上级目录），"
+                    f"拒绝以 {cand} 作为可写沙箱工作区：它是受保护的系统根目录或受限路径 ({cand_real})，"
+                    "可写挂载会破坏宿主系统隔离。请在具体项目目录中运行。"
+                )
+            if _home_exposed(cand_norm, user_home) or _home_exposed(cand_real, user_home):
+                raise SandboxConfigError(
+                    f"拒绝以 {cand} 作为可写沙箱工作区：它是 HOME（或 HOME 的上级目录），"
                     "可写挂载会暴露全部宿主文件与凭据。请在具体项目目录中运行。"
                 )
 
     # Identify provider strictly from explicit provider_name or first command argument binary name
-    p_name = (provider_name or "").lower().strip()
-    if p_name == "gemini":
-        p_name = "agy"
-    if not p_name and command_args:
-        first_bin = os.path.basename(str(command_args[0])).lower()
-        if first_bin == "gemini" or first_bin.startswith("gemini-") or first_bin.startswith("gemini."):
-            p_name = "agy"
-        else:
-            for candidate in ["claude", "codex", "agy", "muse", "grok", "aider"]:
-                if first_bin == candidate or first_bin.startswith(candidate + "-") or first_bin.startswith(candidate + "."):
-                    p_name = candidate
-                    break
-    if not is_provider:
-        p_name = ""
+    p_name = _detect_provider(provider_name, command_args) if is_provider else ""
 
     masked_roots = _effective_masked_roots()
 
@@ -919,6 +1307,8 @@ def wrap_bwrap(
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
+        "--unshare-user",
+        "--disable-userns",
         "--clearenv",
         # Read-only host root filesystem
         "--ro-bind", "/", "/",
@@ -1061,9 +1451,16 @@ def wrap_bwrap(
         max_depth=BROAD_SCAN_DEPTH if broad else None,
         entry_limit=SCAN_ENTRY_LIMIT,
         collect_git=not readonly,
+        skip_dirs=frozenset(),
+        descend_git=True,
     )
     if truncated:
-        _warn(f"工作区条目超过 {SCAN_ENTRY_LIMIT}，.git 保护与套接字遮蔽扫描已截断（更深处的嵌套 .git/套接字未被保护）")
+        if not readonly:
+            raise SandboxConfigError(
+                f"工作区条目超过 {SCAN_ENTRY_LIMIT}，.git 保护与套接字遮蔽扫描无法完成，拒绝可写沙箱 (fail closed)。"
+                "请在更小的项目目录中运行或清理工作区。"
+            )
+        _warn(f"工作区条目超过 {SCAN_ENTRY_LIMIT}，套接字遮蔽扫描已截断（只读会话，更深处的套接字未被遮蔽）")
 
     # In writable sessions, protect all root .git directories AND submodule .git gitfiles from tampering
     if not readonly:
@@ -1093,10 +1490,11 @@ def wrap_bwrap(
 
     # Active provider's state directory (after the workspace so it always wins)
     provider_scan_roots: List[str] = []
-    provider_scan_skip: List[str] = []
     if is_provider and p_name:
-        p_args, provider_scan_roots, provider_scan_skip = _provider_mounts(
-            p_name, user_home, readonly, [ws, mount_root]
+        if provider_home is not None and provider_home.provider != p_name:
+            raise SandboxConfigError(f"provider home 属于 {provider_home.provider}，不能用于 {p_name}")
+        p_args, _, provider_scan_roots = _provider_mounts(
+            p_name, user_home, readonly, [ws, mount_root], provider_home=provider_home
         )
         bwrap_cmd.extend(p_args)
 
@@ -1109,7 +1507,6 @@ def wrap_bwrap(
             entry_limit=PROVIDER_SCAN_ENTRY_LIMIT,
             collect_git=False,
             skip_dirs=frozenset(),
-            skip_paths=provider_scan_skip,
         )
         sockets |= p_socks
     for entry_path in sorted(sockets):
@@ -1126,6 +1523,9 @@ def wrap_bwrap(
 
     if readonly:
         bwrap_cmd.extend(["--setenv", "MAKEWAND_READONLY", "1"])
+    if is_provider:
+        # Lets the CLI refuse makewand -> provider CLI -> makewand recursion.
+        bwrap_cmd.extend(["--setenv", PROVIDER_WORKER_ENV, "1"])
 
     # Strict environment whitelist: only pass safe system variables to general sandbox,
     # pass provider API variables ONLY tailored to the active provider when is_provider is True
@@ -1477,8 +1877,230 @@ def verify_writable_sandbox_or_authorized(
     return False, None, get_writable_sandbox_guidance(provider_name)
 
 
+class SandboxUnavailableError(SandboxConfigError):
+    """bwrap is unavailable and unsandboxed host execution is not authorized (fail closed)."""
+
+
+_UNTRUSTED_NO_BWRAP = "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
+
+
+def get_readonly_sandbox_guidance(provider_name: str = "") -> str:
+    """Guidance when a read-only provider task cannot run in the sandbox."""
+    prov_label = f"{provider_name.capitalize()} " if provider_name else ""
+    reason = ("macOS 无法运行 Bubblewrap (bwrap)" if sys.platform == "darwin"
+              else "系统未检测到可用 Bubblewrap (bwrap) 环境")
+    return (
+        f"❌ [{prov_label}沙箱未就绪] {prov_label}只读任务同样要求沙箱隔离：provider CLI 以宿主用户权限运行，"
+        f"只读约束只是 CLI 自身的工具策略，{reason} (fail closed)。\n"
+        "解决建议：\n"
+        "  1. [安装沙箱] Linux 上安装 Bubblewrap 并启用非特权用户命名空间；\n"
+        "  2. [API 模式] 配置对应 provider 的 API Key，由无工具的 API 调用完成审查；\n"
+        "  3. [受权宿主执行（自担风险）] 配置 MAKEWAND_UNSAFE_HOST_EXEC=1 并通过交互确认授权（所有执行将记入审计日志）。"
+    )
+
+
+def authorize_unsandboxed_launch(
+    provider: str,
+    cmd,
+    cwd: str,
+    readonly: bool,
+    repo_trust: str = "trusted",
+    auth_source: Optional[str] = None,
+    context: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Gate for EVERY launch that runs without bubblewrap, read-only included (H1).
+    Requires the MAKEWAND_UNSAFE_HOST_EXEC=1 + one-time acknowledgment
+    authorization (auth_source when the caller already resolved it) and audits
+    the execution. Returns the auth source; raises SandboxUnavailableError.
+    """
+    if repo_trust == "untrusted":
+        raise SandboxUnavailableError(_UNTRUSTED_NO_BWRAP)
+    if not auth_source:
+        authorized, auth_source = resolve_unsafe_host_exec()
+        if not authorized:
+            raise SandboxUnavailableError(
+                get_readonly_sandbox_guidance(provider) if readonly else get_writable_sandbox_guidance(provider)
+            )
+    audit_unsafe_host_exec(context or (f"provider:{provider}" if provider else "sandbox"), cmd, cwd, auth_source)
+    return auth_source
+
+
+# ---------------------------------------------------------------------------
+# resource limits for sandboxed launches (no preexec_fn: CON-01 fork safety)
+# ---------------------------------------------------------------------------
+SANDBOX_MEMORY_MAX_ENV = "MAKEWAND_SANDBOX_MEMORY_MAX"
+SANDBOX_TASKS_MAX_ENV = "MAKEWAND_SANDBOX_TASKS_MAX"
+DEFAULT_SANDBOX_MEMORY_MAX = "8G"
+DEFAULT_SANDBOX_TASKS_MAX = "512"
+DEFAULT_SANDBOX_NOFILE = 4096
+TRUSTED_SYSTEM_BIN_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/run/current-system/sw/bin")
+_MEM_RE = re.compile(r"^(\d+[KMGT]?|infinity)$")
+_TASKS_RE = re.compile(r"^(\d+|infinity)$")
+_limits_probe: Dict[str, Any] = {"systemd": None, "warned": False}
+
+
+def _trusted_system_binary(name: str) -> Optional[str]:
+    """Root-owned system binary (never resolved from $PATH)."""
+    for d in TRUSTED_SYSTEM_BIN_DIRS:
+        cand = os.path.join(d, name)
+        if not os.path.lexists(cand):
+            continue
+        real = os.path.realpath(cand)
+        if os.path.isfile(real) and os.access(real, os.X_OK) and _trusted_launcher_ok(real, False) \
+                and _trusted_launcher_ok(os.path.dirname(real), False):
+            return real
+    return None
+
+
+def _env_limit(env: str, default: str, pattern) -> str:
+    val = os.environ.get(env, "").strip() or default
+    if not pattern.match(val):
+        _warn(f"{env}={val!r} 格式无效，使用默认值 {default}")
+        return default
+    return val
+
+
+def _systemd_scope_usable(systemd_run: str) -> bool:
+    cached = _limits_probe.get("systemd")
+    if cached is not None:
+        return bool(cached)
+    ok = False
+    try:
+        import subprocess
+        res = subprocess.run(
+            [systemd_run, "--user", "--scope", "--quiet", "--collect", "-p", "TasksMax=16", "--", "true"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+        ok = res.returncode == 0
+    except Exception:
+        ok = False
+    _limits_probe["systemd"] = ok
+    return ok
+
+
+def _user_process_count() -> int:
+    uid = os.getuid() if hasattr(os, "getuid") else -1
+    n = 0
+    try:
+        for name in os.listdir("/proc"):
+            if name.isdigit():
+                try:
+                    if os.stat(f"/proc/{name}").st_uid == uid:
+                        n += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return n
+
+
+def _rlimit_arg(resource_mod, which: int, want: int) -> str:
+    """soft:hard with hard kept at the current hard limit (an unprivileged prlimit cannot raise it)."""
+    _soft, hard = resource_mod.getrlimit(which)
+    unlimited = hard == resource_mod.RLIM_INFINITY or hard < 0
+    cap = want if unlimited else min(want, hard)
+    return f"{cap}:{'unlimited' if unlimited else hard}"
+
+
+def sandbox_resource_limit_prefix() -> List[str]:
+    """
+    Launcher prefix that bounds a sandboxed process tree: a transient systemd
+    user scope (MemoryMax / MemorySwapMax=0 / TasksMax) when available, else
+    prlimit --nproc/--nofile/--fsize (never --as: torch/BLAS reserve huge
+    virtual ranges), else nothing (warned once).
+    """
+    if os.name != "posix":
+        return []
+    mem = _env_limit(SANDBOX_MEMORY_MAX_ENV, DEFAULT_SANDBOX_MEMORY_MAX, _MEM_RE)
+    tasks = _env_limit(SANDBOX_TASKS_MAX_ENV, DEFAULT_SANDBOX_TASKS_MAX, _TASKS_RE)
+    systemd_run = _trusted_system_binary("systemd-run")
+    if systemd_run and _systemd_scope_usable(systemd_run):
+        return [systemd_run, "--user", "--scope", "--quiet", "--collect",
+                "-p", f"MemoryMax={mem}", "-p", "MemorySwapMax=0", "-p", f"TasksMax={tasks}", "--"]
+    if systemd_run:
+        logging.getLogger(__name__).debug("systemd user scope unavailable; falling back to prlimit")
+    prlimit = _trusted_system_binary("prlimit")
+    if prlimit:
+        try:
+            import resource
+            fsize = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_FSIZE", 1024 * 1024 * 1024))
+            prefix = [prlimit]
+            if tasks != "infinity":
+                # RLIMIT_NPROC counts every process of the uid: budget = current + TasksMax
+                budget = _user_process_count() + int(tasks)
+                prefix.append(f"--nproc={_rlimit_arg(resource, resource.RLIMIT_NPROC, budget)}")
+            prefix.append(f"--nofile={_rlimit_arg(resource, resource.RLIMIT_NOFILE, DEFAULT_SANDBOX_NOFILE)}")
+            prefix.append(f"--fsize={_rlimit_arg(resource, resource.RLIMIT_FSIZE, fsize)}")
+            return prefix + ["--"]
+        except Exception as exc:
+            logging.getLogger(__name__).debug("prlimit prefix unavailable: %s", exc)
+    if not _limits_probe["warned"]:
+        _limits_probe["warned"] = True
+        _warn("systemd-run 与 prlimit 均不可用，沙箱进程未施加内存/进程数资源上限")
+    return []
+
+
+@dataclass
+class ProviderLaunch:
+    cmd: List[str]
+    pass_fds: tuple
+    sandboxed: bool
+    auth_source: Optional[str] = None
+    home: Optional["ProviderHome"] = None
+
+
+@contextmanager
+def provider_sandbox_launch(
+    provider: str,
+    cmd: List[str],
+    cwd: str,
+    *,
+    readonly: bool,
+    repo_root: Optional[str] = None,
+    repo_trust: str = "trusted",
+    allow_network: bool = True,
+    extra_ro_binds: Optional[List[str]] = None,
+    extra_env: Optional[dict] = None,
+    host_auth_source: Optional[str] = None,
+    apply_limits: bool = True,
+):
+    """
+    Single launch path for provider CLIs. With bwrap: mandatory seccomp, private
+    provider home (credentials written back on exit) and resource limits.
+    Without bwrap: authorize_unsandboxed_launch (read-only too) + audit.
+    Yields ProviderLaunch; raises SandboxConfigError / SandboxUnavailableError.
+    """
+    if not is_bwrap_available():
+        source = authorize_unsandboxed_launch(provider, cmd, cwd, readonly, repo_trust, host_auth_source)
+        yield ProviderLaunch(["env", f"{PROVIDER_WORKER_ENV}=1", *cmd], (), False, source)
+        return
+    with seccomp_filter_context(enabled=True) as (seccomp_fd, pass_fds):
+        with provider_home_session(provider, [cwd, repo_root or ""]) as home:
+            exec_cmd = wrap_bwrap(
+                cmd,
+                workspace=cwd,
+                allow_network=allow_network,
+                readonly=readonly,
+                repo_root=repo_root,
+                is_provider=True,
+                provider_name=provider,
+                extra_ro_binds=extra_ro_binds,
+                extra_env=extra_env,
+                seccomp_fd=seccomp_fd,
+                provider_home=home,
+            )
+            if apply_limits:
+                exec_cmd = sandbox_resource_limit_prefix() + list(exec_cmd)
+            yield ProviderLaunch(list(exec_cmd), pass_fds, True, None, home)
+
+
 def apply_posix_sandbox_rlimits():
-    """Apply POSIX rlimits (RLIMIT_AS, RLIMIT_NPROC, RLIMIT_FSIZE) on child processes where supported."""
+    """
+    In-process POSIX rlimits (RLIMIT_AS, RLIMIT_NPROC, RLIMIT_FSIZE) for code
+    already running inside a sandbox. Launchers must not call it via
+    preexec_fn (fork safety, CON-01); they use sandbox_resource_limit_prefix().
+    """
     if os.name != "posix":
         return
     try:
@@ -1767,6 +2389,7 @@ def run_in_sandbox(
     extra_ro_binds: Optional[List[str]] = None,
     enable_seccomp: bool = True,
     provider_name: Optional[str] = None,
+    input_text: Optional[str] = None,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command inside the bubblewrap sandbox with optional Seccomp-BPF filtering.
@@ -1775,79 +2398,68 @@ def run_in_sandbox(
     (shared with the Go engine); every such execution is audited.
     """
     exec_cmd = cmd
-    seccomp_r = None
-    pass_fds: tuple = ()
-    with sandbox_lifecycle(is_provider=is_provider, provider_name=provider_name, cmd=cmd, readonly=readonly):
-        try:
-            if is_bwrap_available():
-                if enable_seccomp:
-                    bpf_filter = generate_seccomp_bpf_filter()
-                    if bpf_filter:
-                        try:
-                            r, w = os.pipe()
-                            os.write(w, bpf_filter)
-                            os.close(w)
-                            seccomp_r = r
-                            pass_fds = (seccomp_r,)
-                        except Exception:
-                            seccomp_r = None
-                            pass_fds = ()
-
-                try:
-                    exec_cmd = wrap_bwrap(
-                        cmd,
-                        workspace=workspace,
-                        allow_network=allow_network,
-                        readonly=readonly,
-                        repo_root=repo_root,
-                        is_provider=is_provider,
-                        worktree_root=worktree_root,
-                        extra_env=extra_env,
-                        provider_name=provider_name,
-                        extra_ro_binds=extra_ro_binds,
-                        seccomp_fd=seccomp_r,
-                    )
-                except SandboxConfigError as exc:
-                    _warn(str(exc))
-                    return -1, "", str(exc), "SandboxConfigError"
-            else:
-                authorized, source = resolve_unsafe_host_exec()
-                if not authorized:
-                    msg = (
-                        "Bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged "
-                        "(MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
-                    )
-                    _warn(msg)
-                    return -1, "", msg, "SandboxUnavailable"
-                audit_unsafe_host_exec(audit_context, cmd, os.path.abspath(workspace), source)
-
-            # Dynamic backpressure: when host load is elevated, deprioritize background sandbox task
+    bwrap_avail = is_bwrap_available()
+    req_seccomp = os.environ.get(SECCOMP_REQUIRE_ENV) == "1"
+    with contextlib.ExitStack() as stack:
+        if bwrap_avail:
             try:
-                load_1m = os.getloadavg()[0]
-                if load_1m > 10.0:
-                    nice_bin = shutil.which("nice")
-                    if nice_bin:
-                        nice_val = "15" if load_1m > 18.0 else "10"
-                        exec_cmd = [nice_bin, "-n", nice_val] + exec_cmd
-                    ionice_bin = shutil.which("ionice")
-                    if ionice_bin and load_1m > 12.0:
-                        exec_cmd = [ionice_bin, "-c2", "-n7"] + exec_cmd
-            except Exception:
-                pass
+                seccomp_r, pass_fds = stack.enter_context(
+                    seccomp_filter_context(enabled=enable_seccomp, required=req_seccomp))
+                home = None
+                p_name = _detect_provider(provider_name, cmd) if is_provider else ""
+                if p_name in PROVIDER_PROFILES:
+                    home = stack.enter_context(provider_home_session(p_name, [workspace, repo_root or ""]))
+                exec_cmd = wrap_bwrap(
+                    cmd,
+                    workspace=workspace,
+                    allow_network=allow_network,
+                    readonly=readonly,
+                    repo_root=repo_root,
+                    is_provider=is_provider,
+                    worktree_root=worktree_root,
+                    extra_env=extra_env,
+                    provider_name=provider_name,
+                    extra_ro_binds=extra_ro_binds,
+                    seccomp_fd=seccomp_r,
+                    provider_home=home,
+                )
+            except SandboxConfigError as exc:
+                _warn(str(exc))
+                return -1, "", str(exc), "SandboxConfigError"
+            exec_cmd = sandbox_resource_limit_prefix() + list(exec_cmd)
+        else:
+            pass_fds = ()
+            try:
+                authorize_unsandboxed_launch(provider_name or "", cmd, os.path.abspath(workspace),
+                                             readonly, context=audit_context)
+            except SandboxUnavailableError:
+                msg = (
+                    "Bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged "
+                    "(MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
+                )
+                _warn(msg)
+                return -1, "", msg, "SandboxUnavailable"
 
-            return run_subprocess(
-                exec_cmd,
-                timeout=timeout,
-                cwd=workspace,
-                stream=stream,
-                print_prefix=print_prefix,
-                pass_fds=pass_fds,
-                preexec_fn=apply_posix_sandbox_rlimits,
-            )
-        finally:
-            if seccomp_r is not None:
-                try:
-                    os.close(seccomp_r)
-                except Exception:
-                    pass
-                pass
+        # Dynamic backpressure: when host load is elevated, deprioritize background sandbox task
+        try:
+            load_1m = os.getloadavg()[0]
+            if load_1m > 10.0:
+                nice_bin = shutil.which("nice")
+                if nice_bin:
+                    nice_val = "15" if load_1m > 18.0 else "10"
+                    exec_cmd = [nice_bin, "-n", nice_val] + exec_cmd
+                ionice_bin = shutil.which("ionice")
+                if ionice_bin and load_1m > 12.0:
+                    exec_cmd = [ionice_bin, "-c2", "-n7"] + exec_cmd
+        except Exception:
+            pass
+
+        return run_subprocess(
+            exec_cmd,
+            timeout=timeout,
+            cwd=workspace,
+            input_text=input_text,
+            stream=stream,
+            print_prefix=print_prefix,
+            pass_fds=pass_fds,
+        )

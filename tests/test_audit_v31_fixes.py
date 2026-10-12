@@ -131,7 +131,11 @@ class TestAuditV31Fixes(unittest.TestCase):
     def test_p0_3_long_prompt_uses_stdin_or_file(self):
         """P0-3: Prompts > 32KB must NOT be passed as plain argv strings to avoid E2BIG."""
         long_prompt = "x" * (65 * 1024)  # 65KB string
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # No bwrap: every launch (read-only included) needs the recorded
+        # host-exec authorization (H1); grant it so the argv can be inspected.
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+             patch("makewand.sandbox.audit_unsafe_host_exec") as host_audit:
             # 1. Claude
             with patch("makewand.health.load_status_cache", return_value={}), \
                  patch("makewand.sandbox.is_bwrap_available", return_value=False), \
@@ -140,6 +144,7 @@ class TestAuditV31Fixes(unittest.TestCase):
                 execute_claude_task(long_prompt, cwd=tmpdir, readonly=True)
                 called_cmd = mock_sub.call_args[0][0]
                 self.assertNotIn(long_prompt, called_cmd)
+                self.assertEqual(list(called_cmd[:3]), ["env", "MAKEWAND_PROVIDER_WORKER=1", "claude"])
                 self.assertEqual(mock_sub.call_args[1].get("input_text"), long_prompt)
 
             # 2. Codex
@@ -172,6 +177,9 @@ class TestAuditV31Fixes(unittest.TestCase):
                 called_cmd = mock_sub.call_args[0][0]
                 self.assertNotIn(long_prompt, called_cmd)
                 self.assertIn("--prompt-file", called_cmd)
+
+            # every host launch was audited
+            self.assertEqual(host_audit.call_count, 4)
 
     def test_p0_4_race_mode_symmetric_dispatch_and_usage(self):
         """P0-4: Race mode must symmetrically handle Claude, Codex, Grok, Muse, AGY with dispatch_task."""
@@ -419,9 +427,11 @@ class TestAuditV31Fixes(unittest.TestCase):
                 save_api_key("claude", "test-key")
                 self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
 
-        # 2. AGY --mode plan in readonly
+        # 2. AGY --mode plan in readonly (authorized host run, H1)
         with patch("makewand.health.load_status_cache", return_value={}), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+             patch("makewand.sandbox.audit_unsafe_host_exec"), \
              patch("makewand.providers.agy.run_subprocess") as mock_sub:
             mock_sub.return_value = (0, "ok", "", None)
             execute_agy_task("plan prompt", readonly=True)

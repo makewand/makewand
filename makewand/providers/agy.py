@@ -44,8 +44,25 @@ _AGY_AUTH_RE = re.compile(
 )
 
 
+# agy writes glog diagnostics to stderr ("I1012 08:11:57.843790  1 file.go:403] ...").
+# Every start logs "You are not logged into Antigravity" before silent keyring
+# auth succeeds, and transient retries may log 429s, so these lines must not
+# drive provider-health classification.
+_AGY_GLOG_LINE_RE = re.compile(r"^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\S+:\d+\]")
+# Argument rejections such as: error: invalid model selection (--model "gemini-3.1-pro"
+# --effort "max"): gemini-3.1-pro has no "max" effort (available: low, high)
+_AGY_INVALID_INVOCATION_RE = re.compile(
+    r"invalid model selection|unknown (?:flag|option|shorthand flag)|has no \"[^\"]+\" effort",
+    re.IGNORECASE)
+_AGY_AUTH_OK_RE = re.compile(r"authenticated (?:successfully|via )", re.IGNORECASE)
+
+
+def _agy_user_facing(output: str) -> str:
+    return "\n".join(ln for ln in (output or "").splitlines() if not _AGY_GLOG_LINE_RE.match(ln.lstrip()))
+
+
 def parse_agy_quota(output: str) -> Tuple[bool, str, Optional[str]]:
-    lower = (output or "").lower()
+    lower = _agy_user_facing(output).lower()
     if _AGY_RATE_LIMIT_RE.search(lower):
         return True, "Google AI 配额暂时耗尽", "待重置"
     return False, "", None
@@ -56,13 +73,13 @@ def classify_agy_failure(output: str) -> Optional[Tuple[str, str, Optional[float
     Classifies a non-quota agy failure that says something about the provider
     itself (not about the task). Returns (status, reason, ttl_seconds) or None.
     """
-    lower = (output or "").lower()
+    lower = _agy_user_facing(output).lower()
     if _AGY_REGION_RE.search(lower):
         from makewand.health import REGION_BLOCK_TTL_SECONDS
         return ("error",
                 "Antigravity 在当前地区/账号不可用 (真实派发返回地区限制)，暂停派发并在有效期后自动复查",
                 REGION_BLOCK_TTL_SECONDS)
-    if _AGY_AUTH_RE.search(lower):
+    if _AGY_AUTH_RE.search(lower) and not _AGY_AUTH_OK_RE.search(output or ""):
         from makewand.health import get_reauth_hint
         return "needs_auth", f"Antigravity 认证失败 (真实派发) · {get_reauth_hint('agy')}", None
     return None
@@ -87,9 +104,7 @@ def execute_agy_task(
     """
     from makewand.sandbox import (
         is_bwrap_available,
-        wrap_bwrap,
         verify_writable_sandbox_or_authorized,
-        audit_unsafe_host_exec,
     )
     from makewand.git_helper import find_git_root
 
@@ -161,36 +176,43 @@ def execute_agy_task(
         else:
             cmd = ["agy", "-p", final_prompt] + base_flags
 
-        from makewand.discovery import get_provider_model_tier
+        from makewand.discovery import get_provider_model_tier, normalize_provider_effort
         resolved = get_provider_model_tier("agy", tier)
         target_model = model or resolved.get("model")
         if target_model and target_model != "default":
             cmd.extend(["--model", target_model])
-        target_effort = effort or resolved.get("effort")
+        target_effort = normalize_provider_effort("agy", effort or resolved.get("effort"))
         if target_effort and target_effort != "none":
             cmd.extend(["--effort", target_effort])
 
-        if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="agy", extra_ro_binds=[p_file] if p_file else None)
-        elif repo_trust == "untrusted":
-            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
-        elif not readonly:
-            audit_unsafe_host_exec("provider:agy", cmd, cwd, host_auth_source)
-
-        log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
-        import sys
-        print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN), file=sys.stderr)
+        from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError
         from makewand.execution_runtime import mark_provider_invocation
-        from makewand.sandbox import sandbox_lifecycle
-        mark_provider_invocation()
-        with sandbox_lifecycle(is_provider=True, provider_name="agy", cmd=cmd, readonly=readonly):
-            code, out, err, ex = run_subprocess(
-                cmd,
-                timeout=timeout,
-                cwd=cwd,
-                stream=stream,
-                print_prefix=c("[AGY Live]", COLOR_GREEN)
-            )
+        try:
+            with provider_sandbox_launch(
+                "agy", cmd, cwd,
+                readonly=readonly,
+                repo_root=repo_root,
+                repo_trust=repo_trust,
+                allow_network=allow_network,
+                extra_ro_binds=[p_file] if p_file else None,
+                host_auth_source=host_auth_source,
+            ) as launch:
+                log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
+                import sys
+                print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN), file=sys.stderr)
+                mark_provider_invocation()
+                code, out, err, ex = run_subprocess(
+                    launch.cmd,
+                    timeout=timeout,
+                    cwd=cwd,
+                    stream=stream,
+                    print_prefix=c("[AGY Live]", COLOR_GREEN),
+                    pass_fds=launch.pass_fds,
+                )
+        except SandboxUnavailableError as exc:
+            return False, None, str(exc)
+        except SandboxConfigError as exc:
+            return False, None, f"Antigravity 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     finally:
         if p_file and os.path.exists(p_file):
             try:
@@ -216,6 +238,15 @@ def execute_agy_task(
 
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("agy", code, combined, err, ex, readonly)
+
+    invalid = _AGY_INVALID_INVOCATION_RE.search(_agy_user_facing(combined))
+    if invalid:
+        # The CLI rejected its arguments before running anything: a known,
+        # side-effect-free failure, so the caller may try the next provider.
+        from makewand.execution_contract import ExecutionResult
+        line = next((ln.strip() for ln in _agy_user_facing(combined).splitlines() if invalid.group(0) in ln), invalid.group(0))
+        return ExecutionResult(False, combined, f"Antigravity 拒绝调用参数: {line}", status="FAILED", engine="agy",
+                               readonly=readonly, outcome_known=True, error_kind="provider_configuration")
 
     is_limited, reason, resets_at = parse_agy_quota(combined)
     if not is_limited:

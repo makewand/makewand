@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/version"
 	"os"
@@ -43,9 +44,19 @@ var sandboxSensitiveHomeEntries = []string{
 	".gnupg",
 	".kube",
 	".config",
+	".config/gcloud",
+	".config/gh",
+	".config/hub",
+	".config/git/credentials",
+	".config/makewand",
+	".config/rclone",
+	".config/muse",
+	".config/google-chrome",
+	".config/chromium",
 	".docker",
 	".netrc",
 	".npmrc",
+	".yarnrc",
 	".pypirc",
 	".pgpass",
 	".gitconfig",
@@ -57,18 +68,31 @@ var sandboxSensitiveHomeEntries = []string{
 	".gradle/gradle.properties",
 	".cargo/credentials",
 	".cargo/credentials.toml",
+	".cargo/config.toml",
+	".s3cfg",
+	".boto",
+	".oci",
 	// AI CLI subscription credentials and session state (the providers
 	// makewand itself drives).
 	".claude",
+	".claude-2",
+	".claude-3",
 	".claude.json",
 	".codex",
+	".codex-2",
+	".codex-3",
 	".gemini",
 	".agy",
 	".antigravity",
+	".anthropic",
+	".openai",
 	".grok",
 	".aider",
+	".aider.conf.yml",
 	".local/share/makewand",
+	".local/share/muse",
 	".local/share/keyrings",
+	".local/share/credentials",
 	".local/share/fish",
 	".local/state",
 	// Shell and REPL history.
@@ -82,6 +106,16 @@ var sandboxSensitiveHomeEntries = []string{
 	".sqlite_history",
 	".lesshst",
 	".viminfo",
+	".mozilla",
+	".pki",
+	"server_auth.json",
+	"state.db",
+	"state.db-wal",
+	"state.db-shm",
+	"admin_session_secret",
+	"users.json",
+	"audit.jsonl",
+	"usage.jsonl",
 }
 
 // sandboxToolchainCommands are the executables whose host installation is
@@ -307,32 +341,49 @@ func sandboxMaskedRoots(workspace string) []string {
 	return out
 }
 
+// maxSandboxSocketMasks bounds the bwrap argv built from workspace sockets.
+const maxSandboxSocketMasks = 512
+
+// ErrSandboxSocketScan reports that the workspace could not be fully scanned
+// for AF_UNIX sockets (too many sockets or an unreadable directory). Writable
+// sandbox sessions fail closed rather than leave a host socket connectable.
+var ErrSandboxSocketScan = errors.New("sandbox workspace socket scan incomplete")
+
 // sandboxWorkspaceSocketMasks scans the workspace for pre-existing AF_UNIX domain sockets
 // and masks them with /dev/null so sandboxed commands cannot connect to host daemons.
 // Note: It intentionally does NOT skip ignored directories (like .git, node_modules, .cache),
 // because sockets placed in those subdirectories are still connectable from the sandbox.
-func sandboxWorkspaceSocketMasks(workspace string) []string {
+// Every caller binds the workspace writable, so an incomplete scan (more than
+// maxSandboxSocketMasks sockets, or a directory that cannot be read — the
+// sandbox runs as the same uid and could chmod it back) is an error wrapping
+// ErrSandboxSocketScan instead of a silently truncated mask list.
+func sandboxWorkspaceSocketMasks(workspace string) ([]string, error) {
 	var out []string
 	cleanWS := filepath.Clean(workspace)
 	count := 0
-	_ = filepath.WalkDir(cleanWS, func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(cleanWS, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			if os.IsNotExist(err) {
+				// Removed during the scan (or a workspace that does not exist,
+				// which bwrap's --bind rejects): nothing left to connect to.
+				return nil
+			}
+			return fmt.Errorf("%w: %s: %v", ErrSandboxSocketScan, path, err)
+		}
+		if d.IsDir() || d.Type()&os.ModeSocket == 0 {
 			return nil
 		}
-		if d.IsDir() {
-			return nil
+		if count >= maxSandboxSocketMasks {
+			return fmt.Errorf("%w: more than %d AF_UNIX sockets under %s; remove them or run outside a writable sandbox", ErrSandboxSocketScan, maxSandboxSocketMasks, cleanWS)
 		}
-		if count >= 512 {
-			return filepath.SkipAll
-		}
-		info, err := d.Info()
-		if err == nil && info.Mode()&os.ModeSocket != 0 {
-			out = append(out, "--ro-bind", os.DevNull, path)
-			count++
-		}
+		out = append(out, "--ro-bind", os.DevNull, path)
+		count++
 		return nil
 	})
-	return out
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func isMaskedHostRoot(p string) bool {

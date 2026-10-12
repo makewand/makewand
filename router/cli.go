@@ -396,10 +396,11 @@ func (c *CLIProvider) healthCheck() bool {
 	setCLIProcessGroup(cmd)
 	capture := processjob.NewCapture(processjob.MaxOutputBytes, func() { killCLIProcess(cmd) })
 	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
-	cleanupProcess, err := processjob.Start(cmd)
+	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
 		return false
 	}
+	cliAfterStart(cmd)
 	defer cleanupProcess()
 	defer killCLIProcess(cmd)
 
@@ -579,7 +580,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 	cmd.Stderr = capture.Stderr()
 
 	started := time.Now()
-	cleanupProcess, err := processjob.Start(cmd)
+	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
 		contextErr := ctx.Err()
 		_ = stdoutPipe.Close()
@@ -591,6 +592,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		}
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
+	cliAfterStart(cmd)
 
 	ch := make(chan StreamChunk, 64)
 	go func() {
@@ -1094,13 +1096,14 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	cmd.Stderr = capture.Stderr()
 
 	start := time.Now()
-	cleanupProcess, err := processjob.Start(cmd)
+	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
 			return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), err, errors.Join(contextErr, err), time.Since(start))
 		}
 		return "", nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
+	cliAfterStart(cmd)
 	defer cleanupProcess()
 	defer killCLIProcess(cmd)
 

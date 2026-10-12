@@ -165,7 +165,31 @@ func allowedRestoreDestination(dst string, opts Options) bool {
 	return safeArchiveName(filepath.ToSlash(relative)) && filepath.Base(absolute) != restoreJournalName && !strings.HasPrefix(filepath.Base(absolute), ".makewand-")
 }
 
+// cleanupRestoreJournal removes recovery images, then the journal. A journal
+// still saying "prepared" (after a successful rollback) is first durably
+// rewritten as "rolled_back": otherwise a crash after deleting preimages would
+// leave a prepared journal whose rollback can never succeed again. Parent
+// directories of removed images are synced before the journal is removed so an
+// image cannot resurrect without a journal that owns it.
 func cleanupRestoreJournal(path string, j *restoreJournal) error {
+	if j.State == "prepared" {
+		j.State = "rolled_back"
+		if _, err := persistRestoreJournal(path, j); err != nil {
+			j.State = "prepared"
+			return fmt.Errorf("mark restore rolled back: %w", err)
+		}
+	}
+	directories := map[string]bool{}
+	for _, original := range j.Originals {
+		if original.Backup != "" {
+			directories[filepath.Dir(original.Backup)] = true
+		}
+	}
+	for _, install := range j.Installs {
+		if install.Tmp != "" {
+			directories[filepath.Dir(install.Tmp)] = true
+		}
+	}
 	for _, original := range j.Originals {
 		if original.Backup != "" {
 			if err := os.Remove(original.Backup); err != nil && !os.IsNotExist(err) {
@@ -178,6 +202,11 @@ func cleanupRestoreJournal(path string, j *restoreJournal) error {
 			continue
 		}
 		if err := os.Remove(install.Tmp); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	for directory := range directories {
+		if err := syncDirectory(directory); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -198,12 +227,9 @@ func rollbackRestore(j *restoreJournal) error {
 	}
 	for _, original := range j.Originals {
 		if original.Existed {
-			tmp, err := stageBeside(original.Backup, original.Destination)
+			// Mode is applied before the staged copy's fsync (durable with it).
+			tmp, err := stageBesideMode(original.Backup, original.Destination, os.FileMode(original.Mode))
 			if err != nil {
-				return err
-			}
-			if err = os.Chmod(tmp, os.FileMode(original.Mode)); err != nil {
-				os.Remove(tmp)
 				return err
 			}
 			if err = os.Rename(tmp, original.Destination); err != nil {
@@ -274,7 +300,7 @@ func recoverRestoreLocked(opts Options) error {
 	if err = json.Unmarshal(data, &journal); err != nil {
 		return err
 	}
-	if journal.Version != 1 || (journal.State != "prepared" && journal.State != "committed") {
+	if journal.Version != 1 || (journal.State != "prepared" && journal.State != "committed" && journal.State != "rolled_back") {
 		return fmt.Errorf("unsupported restore journal")
 	}
 	if opts.StateDBPath != "" {

@@ -13,6 +13,7 @@ const (
 
 type breakerState struct {
 	consecutiveFailures int
+	probeFailures       int
 	openUntil           time.Time
 	halfOpen            bool
 	// halfOpenProbeAt records when the current half-open trial call was
@@ -89,7 +90,7 @@ func (cb *providerCircuitBreaker) Admit(provider string) (bool, time.Duration, b
 	state := cb.stateLocked(provider)
 	now := cb.now()
 	if state.openUntil.After(now) {
-		return false, time.Until(state.openUntil), breakerTicket{}
+		return false, state.openUntil.Sub(now), breakerTicket{}
 	}
 	if !state.openUntil.IsZero() && !state.openUntil.After(now) {
 		// Cooldown elapsed: allow one trial call in half-open.
@@ -160,6 +161,7 @@ func (cb *providerCircuitBreaker) RecordAdmittedSuccess(provider string, ticket 
 		}
 		state.halfOpen = false
 		state.halfOpenProbeAt = time.Time{}
+		state.probeFailures = 0
 	}
 	state.consecutiveFailures = 0
 }
@@ -182,7 +184,15 @@ func (cb *providerCircuitBreaker) RecordFailureWeighted(provider string, weight 
 		state.halfOpen = false
 		state.halfOpenProbeAt = time.Time{}
 		state.consecutiveFailures = 0
-		state.openUntil = now.Add(cb.cooldown)
+		state.probeFailures++
+		backoffShift := min(state.probeFailures-1, 6)
+		backoff := time.Duration(1 << backoffShift)
+		cooldown := cb.cooldown * backoff
+		const maxCooldown = 30 * time.Minute
+		if cooldown > maxCooldown {
+			cooldown = maxCooldown
+		}
+		state.openUntil = now.Add(cooldown)
 		state.epoch++
 		return true, state.openUntil
 	}
@@ -190,6 +200,7 @@ func (cb *providerCircuitBreaker) RecordFailureWeighted(provider string, weight 
 	state.consecutiveFailures += weight
 	if state.consecutiveFailures >= cb.failureThreshold {
 		state.consecutiveFailures = 0
+		state.probeFailures = 0
 		if state.openUntil.IsZero() {
 			// closed -> open: a new episode; tickets issued before it are stale.
 			state.epoch++
@@ -217,7 +228,7 @@ func (cb *providerCircuitBreaker) peekOpenLocked(provider string) (bool, time.Du
 	}
 	now := cb.now()
 	if s.openUntil.After(now) {
-		return true, time.Until(s.openUntil)
+		return true, s.openUntil.Sub(now)
 	}
 	return false, 0
 }

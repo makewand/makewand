@@ -74,43 +74,42 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 }
 
 func providerOutcome(err error, usage Usage) execution.Outcome {
+	var outcome execution.Outcome
 	if err == nil {
-		outcome := execution.Outcome{Status: execution.Passed, Known: true}
-		if usage.MeasuredTokens && usage.InputTokens >= 0 && usage.OutputTokens >= 0 {
-			tokens := int64(usage.InputTokens) + int64(usage.OutputTokens)
-			outcome.Tokens = &tokens
-		}
-		if usage.MeasuredCost && usage.Cost >= 0 && !math.IsNaN(usage.Cost) && !math.IsInf(usage.Cost, 0) {
-			cost := usage.Cost
-			outcome.MonetaryCost = &cost
-		}
-		return outcome
-	}
-	kind := string(ErrorKindOf(err))
-	outcome := execution.Outcome{Status: execution.Failed, Known: true, ErrorKind: &kind}
-	switch {
-	case errors.Is(err, execution.ErrBudgetExhausted):
-		outcome.Status = execution.BudgetExhausted
-	case errors.Is(err, context.Canceled):
-		outcome.Status, outcome.Known = execution.Cancelled, false
-	case errors.Is(err, context.DeadlineExceeded):
-		outcome.Status, outcome.Known = execution.Timeout, false
-	case errors.Is(err, execution.ErrUnknownOutcome):
-		outcome.Status, outcome.Known = execution.Unknown, false
-	default:
-		var providerErr *ProviderError
-		if errors.As(err, &providerErr) && providerErr.StatusCode != 0 {
-			return outcome
-		}
-		if errors.As(err, &providerErr) && (strings.Contains(providerErr.Op, "response") || strings.Contains(providerErr.Op, "parse") || strings.Contains(providerErr.Op, "stream")) && providerErr.Kind == ErrorKindProvider {
-			outcome.Status, outcome.Known = execution.Unknown, false
-		}
-		if ErrorKindOf(err) == ErrorKindTimeout {
+		outcome = execution.Outcome{Status: execution.Passed, Known: true}
+	} else {
+		kind := string(ErrorKindOf(err))
+		outcome = execution.Outcome{Status: execution.Failed, Known: true, ErrorKind: &kind}
+		switch {
+		case errors.Is(err, execution.ErrBudgetExhausted):
+			outcome.Status = execution.BudgetExhausted
+		case errors.Is(err, context.Canceled):
+			outcome.Status, outcome.Known = execution.Cancelled, false
+		case errors.Is(err, context.DeadlineExceeded):
 			outcome.Status, outcome.Known = execution.Timeout, false
-		}
-		if ErrorKindOf(err) == ErrorKindNetwork {
+		case errors.Is(err, execution.ErrUnknownOutcome):
 			outcome.Status, outcome.Known = execution.Unknown, false
+		default:
+			var providerErr *ProviderError
+			if errors.As(err, &providerErr) && (strings.Contains(providerErr.Op, "response") || strings.Contains(providerErr.Op, "parse") || strings.Contains(providerErr.Op, "stream")) && providerErr.Kind == ErrorKindProvider {
+				outcome.Status, outcome.Known = execution.Unknown, false
+			}
+			if ErrorKindOf(err) == ErrorKindTimeout {
+				outcome.Status, outcome.Known = execution.Timeout, false
+			}
+			if ErrorKindOf(err) == ErrorKindNetwork {
+				outcome.Status, outcome.Known = execution.Unknown, false
+			}
 		}
+	}
+
+	if usage.MeasuredTokens && usage.InputTokens >= 0 && usage.OutputTokens >= 0 {
+		tokens := int64(usage.InputTokens) + int64(usage.OutputTokens)
+		outcome.Tokens = &tokens
+	}
+	if usage.MeasuredCost && usage.Cost >= 0 && !math.IsNaN(usage.Cost) && !math.IsInf(usage.Cost, 0) {
+		cost := usage.Cost
+		outcome.MonetaryCost = &cost
 	}
 	return outcome
 }

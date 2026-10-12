@@ -118,13 +118,13 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
                 "desc": quota.get("desc"),
             },
         }
-    import shutil
+    from makewand.sandbox import resolve_trusted_bwrap
     return {
         "engine": "python",
         "version": __version__,
         "api_policy": get_api_policy(),
         "privacy_attestation": {
-            "sandbox_available": bool(shutil.which("bwrap")),
+            "sandbox_available": bool(resolve_trusted_bwrap()),
             "local_only_supported": True,
             "offline_flags": ["--local-only", "--offline", "--provider local"],
             "repo_trust_levels": ["trusted", "untrusted"],
@@ -1136,6 +1136,12 @@ def _plan_native_go_delegation(argv: List[str]) -> Optional[List[str]]:
     return list(argv)
 
 
+# Set by makewand in the environment of every provider CLI it launches.
+from makewand.sandbox import PROVIDER_WORKER_ENV  # noqa: E402
+# Read-only commands that never dispatch a model; allowed inside a provider worker.
+WORKER_SAFE_SUBCOMMANDS = frozenset({"status", "quota", "search", "repomap", "inspect", "candidates", "sessions"})
+
+
 def main():
     from makewand.config import ConfigError
     try:
@@ -1474,6 +1480,14 @@ def _main():
             is_auto_routed_run = True
 
     args = parser.parse_args()
+
+    # A provider CLI that makewand launched (claude/codex/agy/...) can read its own
+    # global instructions or skills telling it to call makewand. Refuse anything
+    # that would dispatch models again so nested dispatch can never loop.
+    if os.environ.get(PROVIDER_WORKER_ENV) == "1" and args.subcommand and args.subcommand not in WORKER_SAFE_SUBCOMMANDS:
+        print(c(f"❌ makewand 正作为另一 makewand 任务派发的 AI 子进程运行，已拒绝递归调用 `makewand {args.subcommand}`。"
+                "请直接完成当前分配的任务。", COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_USAGE_ERROR)
     # Validate policy before discovery, daemon dispatch or orchestration.
     # Those paths may catch transport errors, so policy validity must already
     # be established before any provider can be started.

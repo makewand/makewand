@@ -86,12 +86,15 @@ SLASH_COMMANDS = [
 def get_git_branch(cwd: str) -> Optional[str]:
     """Retrieves current git branch name if cwd is inside a git worktree."""
     try:
+        from makewand.git_helper import resolve_safe_git_binary, _sanitize_git_env
+        git_bin = resolve_safe_git_binary(cwd=cwd)
         res = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            [git_bin, "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=2,
+            env=_sanitize_git_env(),
         )
         if res.returncode == 0:
             branch = res.stdout.strip()

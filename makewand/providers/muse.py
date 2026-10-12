@@ -177,10 +177,8 @@ def execute_muse_task(
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
-        wrap_bwrap,
         SandboxConfigError,
         verify_writable_sandbox_or_authorized,
-        audit_unsafe_host_exec,
     )
     from makewand.git_helper import find_git_root
     # Untrusted repo enforcement
@@ -249,12 +247,12 @@ def execute_muse_task(
         cmd.extend(["--trust-workspace", "--disable-approval", "--disable-write"])
     if cwd:
         cmd.extend(["--workspace", str(cwd)])
-    from makewand.discovery import get_provider_model_tier
+    from makewand.discovery import get_provider_model_tier, normalize_provider_effort
     resolved = get_provider_model_tier("muse", tier)
     target_model = model or resolved.get("model")
     if target_model and target_model != "default":
         cmd.extend(["--model", target_model])
-    target_effort = effort or resolved.get("effort")
+    target_effort = normalize_provider_effort("muse", effort or resolved.get("effort"))
     if target_effort and target_effort != "none":
         cmd.extend(["--reasoning-effort", target_effort])
 
@@ -271,64 +269,56 @@ def execute_muse_task(
         else:
             cmd.append(prompt)
 
-        if is_bwrap_available():
-            try:
-                extra_env = {}
-                if is_guard:
-                    default_proxy = "http://127.0.0.1:7890"
-                    for var in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
-                        if not os.environ.get(var):
-                            extra_env[var] = default_proxy
-                cmd = wrap_bwrap(
-                    cmd,
-                    workspace=cwd,
-                    allow_network=allow_network,
-                    readonly=readonly,
-                    repo_root=repo_root,
-                    is_provider=True,
-                    provider_name="muse",
-                    extra_ro_binds=[p_file] if p_file else None,
-                    extra_env=extra_env if extra_env else None,
-                )
-                if is_guard and _is_dbus_systemd_available():
-                    muse_mem = os.environ.get("MUSE_MEM", "16G")
-                    cmd = [
-                        "systemd-run", "--user", "--scope", "--quiet",
-                        "--slice=muse", "--collect",
-                        f"-p", f"MemoryMax={muse_mem}",
-                        "-p", "MemorySwapMax=0",
-                        "--",
-                    ] + cmd
-            except SandboxConfigError as exc:
-                return False, None, f"Muse 沙箱构建失败，拒绝执行 (fail closed): {exc}"
-        elif repo_trust == "untrusted":
-            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
-        else:
-            if not readonly:
-                audit_unsafe_host_exec("provider:muse", cmd, cwd, host_auth_source)
-            if is_guard and _is_dbus_systemd_available():
-                muse_mem = os.environ.get("MUSE_MEM", "16G")
-                cmd = [
-                    "systemd-run", "--user", "--scope", "--quiet",
-                    "--slice=muse", "--collect",
-                    f"-p", f"MemoryMax={muse_mem}",
-                    "-p", "MemorySwapMax=0",
-                    "--",
-                ] + cmd
-
-        import sys
-        print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
+        from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError
         from makewand.execution_runtime import mark_provider_invocation
-        from makewand.sandbox import sandbox_lifecycle
-        mark_provider_invocation()
-        with sandbox_lifecycle(is_provider=True, provider_name="muse", cmd=cmd, readonly=readonly):
-            code, out, err, ex = run_subprocess(
-                cmd,
-                timeout=timeout,
-                cwd=cwd,
-                stream=stream,
-                print_prefix=c("[Muse Live]", COLOR_PURPLE)
-            )
+        extra_env = {}
+        if is_guard:
+            default_proxy = "http://127.0.0.1:7890"
+            for var in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
+                if not os.environ.get(var):
+                    extra_env[var] = default_proxy
+        # muse-guard confines muse in its own slice; it then carries the limits itself.
+        from makewand.sandbox import _trusted_system_binary
+        systemd_run = _trusted_system_binary("systemd-run")
+        use_muse_slice = bool(systemd_run) and is_guard and _is_dbus_systemd_available()
+        try:
+            with provider_sandbox_launch(
+                "muse", cmd, cwd,
+                readonly=readonly,
+                repo_root=repo_root,
+                repo_trust=repo_trust,
+                allow_network=allow_network,
+                extra_ro_binds=[p_file] if p_file else None,
+                extra_env=extra_env or None,
+                host_auth_source=host_auth_source,
+                apply_limits=not use_muse_slice,
+            ) as launch:
+                exec_cmd = launch.cmd
+                if use_muse_slice:
+                    muse_mem = os.environ.get("MUSE_MEM", "16G")
+                    exec_cmd = [
+                        systemd_run, "--user", "--scope", "--quiet",
+                        "--slice=muse", "--collect",
+                        "-p", f"MemoryMax={muse_mem}",
+                        "-p", "MemorySwapMax=0",
+                        "-p", f"TasksMax={os.environ.get('MAKEWAND_SANDBOX_TASKS_MAX', '512')}",
+                        "--",
+                    ] + list(exec_cmd)
+                import sys
+                print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
+                mark_provider_invocation()
+                code, out, err, ex = run_subprocess(
+                    exec_cmd,
+                    timeout=timeout,
+                    cwd=cwd,
+                    stream=stream,
+                    print_prefix=c("[Muse Live]", COLOR_PURPLE),
+                    pass_fds=launch.pass_fds,
+                )
+        except SandboxUnavailableError as exc:
+            return False, None, str(exc)
+        except SandboxConfigError as exc:
+            return False, None, f"Muse 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     finally:
         if p_file and os.path.exists(p_file):
             try:

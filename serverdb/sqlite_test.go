@@ -16,6 +16,7 @@ import (
 // once forces database/sql to open distinct connections; each must report the
 // configured values.
 func TestOpenPragmasApplyToEveryConnection(t *testing.T) {
+	t.Setenv("MAKEWAND_SQLITE_SYNCHRONOUS", "")
 	db, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -48,13 +49,29 @@ func TestOpenPragmasApplyToEveryConnection(t *testing.T) {
 
 func assertConnectionPragmas(t *testing.T, conn *sql.Conn) {
 	t.Helper()
-	for pragma, want := range map[string]int{"foreign_keys": 1, "busy_timeout": 30000, "synchronous": 1} {
+	for pragma, want := range map[string]int{"foreign_keys": 1, "busy_timeout": 30000, "synchronous": 2} {
 		var got int
 		if err := conn.QueryRowContext(context.Background(), "PRAGMA "+pragma).Scan(&got); err != nil {
 			t.Fatalf("read %s: %v", pragma, err)
 		}
 		if got != want {
 			t.Errorf("%s=%d, want %d", pragma, got, want)
+		}
+	}
+}
+
+func TestSQLiteSynchronousModeDefaultsToFull(t *testing.T) {
+	for env, want := range map[string]string{
+		"":        "FULL",
+		"off":     "FULL",
+		"bogus":   "FULL",
+		" extra ": "EXTRA", //nolint:gocritic // mapKey: surrounding whitespace is the trimming case under test
+		"normal":  "NORMAL",
+		"FULL":    "FULL",
+	} {
+		t.Setenv("MAKEWAND_SQLITE_SYNCHRONOUS", env)
+		if got := sqliteSynchronousMode(); got != want {
+			t.Errorf("MAKEWAND_SQLITE_SYNCHRONOUS=%q: got %s, want %s", env, got, want)
 		}
 	}
 }

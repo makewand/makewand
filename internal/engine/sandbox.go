@@ -55,6 +55,9 @@ type execPolicy struct {
 	// wrapped inner command must already be validated against the restricted
 	// allowlist before this policy is used.
 	allowCommandPath bool
+	// sandboxed applies the processjob sandbox limits (memory cap) and, for a
+	// bwrap argv led by `--seccomp 3`, supplies the syscall filter descriptor.
+	sandboxed bool
 }
 
 var restrictedAllowedCommands = map[string]struct{}{
@@ -102,6 +105,7 @@ func restrictedExecPolicy() execPolicy {
 		allowAnyCommand: false,
 		stripSensitive:  true,
 		allowedCommands: restrictedAllowedCommands,
+		sandboxed:       true,
 	}
 }
 
@@ -112,6 +116,7 @@ func isolatedExecPolicy() execPolicy {
 		allowAnyCommand:  true,
 		stripSensitive:   true, // defense in depth; bwrap --clearenv rebuilds the env anyway
 		allowCommandPath: true,
+		sandboxed:        true,
 	}
 }
 
@@ -224,7 +229,10 @@ func (p *Project) execVerification(ctx context.Context, command string, args []s
 		return nil, fmt.Errorf("create sandbox home: %w", err)
 	}
 
-	wrappedCmd, wrappedArgs := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, allowNetwork, readOnly)
+	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, allowNetwork, readOnly)
+	if err != nil {
+		return nil, fmt.Errorf("verification sandbox: %w", err)
+	}
 	if acceptancePolicy(ctx) != nil {
 		// Local diagnostics must not introduce undeclared cache files into the
 		// execution tree later sealed by independent acceptance.
@@ -522,8 +530,19 @@ func (p *Project) execWithPolicy(ctx context.Context, command string, args []str
 	cmd.Stdout = capture.Stdout()
 	cmd.Stderr = capture.Stderr()
 
+	startProcess := processjob.Start
+	closeSeccomp := func() {}
+	if policy.sandboxed {
+		startProcess = processjob.StartSandboxed
+		if policy.allowCommandPath {
+			if closeSeccomp, err = attachSandboxSeccomp(cmd, args); err != nil {
+				return nil, err
+			}
+		}
+	}
 	start := time.Now()
-	cleanupProcess, err := processjob.Start(cmd)
+	cleanupProcess, err := startProcess(cmd)
+	closeSeccomp()
 	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, errors.Join(contextErr, err))}

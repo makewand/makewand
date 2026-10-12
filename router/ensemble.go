@@ -143,6 +143,16 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 					}
 					terminalMu.Unlock()
 				}
+				modelID := res.route.ModelID
+				if modelID == "" {
+					modelID = sl.modelID
+				}
+				results[idx] = EnsembleResult{
+					Provider: sl.name,
+					ModelID:  modelID,
+					Content:  "",
+					Usage:    res.usage,
+				}
 				return
 			}
 			results[idx] = EnsembleResult{sl.name, res.route.ModelID, res.content, res.usage}
@@ -256,10 +266,12 @@ func (r *Router) judgeSelectForRequestWithError(ctx context.Context, phase Build
 		provider: judgeP,
 	})
 	if judgeResult.err != nil || judgeResult.skipped {
+		winner := selectedWithoutJudgeUsage(results[0])
+		winner.Usage = judgeResult.usage
 		if stopExecutionReplay(judgeResult.err) {
-			return selectedWithoutJudgeUsage(results[0]), judgeResult.err
+			return winner, judgeResult.err
 		}
-		return selectedWithoutJudgeUsage(results[0]), nil
+		return winner, nil
 	}
 	content := judgeResult.content
 	usage := judgeResult.usage
@@ -302,6 +314,23 @@ func (r *Router) judgeSelectForRequestWithError(ctx context.Context, phase Build
 		Content:  winner.Content,  // original generator output, not judge's reproduction
 		Usage:    usage,           // judge's usage (for cost tracking)
 	}, nil
+}
+
+// accumulateAttemptUsage folds one call's usage into an aggregate using the
+// same semantics as mergeAttemptUsage: token and cost totals include every
+// call (failed or successful), and the aggregate is "measured" only when every
+// call that consumed anything was measured. A zero-spend aggregate carries no
+// measurement information of its own, so the first spending part seeds the
+// flags instead of being ANDed with the zero value's false flags. The
+// aggregate's Provider/Model attribution is always preserved.
+func accumulateAttemptUsage(total, part Usage) Usage {
+	if total.InputTokens == 0 && total.OutputTokens == 0 && sanitizeCost(total.Cost) == 0 {
+		merged := mergeAttemptUsage(part, total)
+		merged.Provider = total.Provider
+		merged.Model = total.Model
+		return merged
+	}
+	return mergeAttemptUsage(total, part)
 }
 
 func selectedWithoutJudgeUsage(result EnsembleResult) EnsembleResult {
@@ -425,9 +454,7 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	if ensembleErr != nil {
 		var total Usage
 		for _, attempt := range attempts {
-			total.InputTokens += attempt.Usage.InputTokens
-			total.OutputTokens += attempt.Usage.OutputTokens
-			total.Cost += attempt.Usage.Cost
+			total = accumulateAttemptUsage(total, attempt.Usage)
 		}
 		return "", total, RouteResult{}, ensembleErr
 	}
@@ -446,9 +473,7 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 		})
 		content, fallbackUsage, route, err := r.ChatWith(ctx, r.BuildProviderForAdaptive(phase), phase, messages, system, exclude...)
 		for _, attempt := range attempts {
-			fallbackUsage.InputTokens += attempt.Usage.InputTokens
-			fallbackUsage.OutputTokens += attempt.Usage.OutputTokens
-			fallbackUsage.Cost += attempt.Usage.Cost
+			fallbackUsage = accumulateAttemptUsage(fallbackUsage, attempt.Usage)
 		}
 		if err != nil && fallbackUsage.Provider == "" && len(attempts) > 0 {
 			// There is no winning provider to attribute an all-empty ensemble to.
@@ -464,14 +489,10 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	// Accumulate usage across all ensemble calls: generators + judge.
 	var total Usage
 	for _, res := range attempts {
-		total.InputTokens += res.Usage.InputTokens
-		total.OutputTokens += res.Usage.OutputTokens
-		total.Cost += res.Usage.Cost
+		total = accumulateAttemptUsage(total, res.Usage)
 	}
-	// Add judge's usage (previously missing).
-	total.InputTokens += best.Usage.InputTokens
-	total.OutputTokens += best.Usage.OutputTokens
-	total.Cost += best.Usage.Cost
+	// Add judge's usage (including a failed judge call's spend).
+	total = accumulateAttemptUsage(total, best.Usage)
 	total.Provider = best.Provider // winning generator
 	total.Model = best.ModelID
 	if judgeErr != nil {

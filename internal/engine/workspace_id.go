@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -57,7 +56,11 @@ func digestWorkspaceID(prefix, value string) string {
 
 func gitOutput(projectPath string, args ...string) (string, error) {
 	cmdArgs := append([]string{"-C", projectPath}, args...)
-	out, err := exec.Command("git", cmdArgs...).Output()
+	cmd, err := safeGitCmd(projectPath, cmdArgs...)
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}

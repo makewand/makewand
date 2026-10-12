@@ -1,7 +1,9 @@
 package router
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,15 +11,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/makewand/makewand/internal/trustedbin"
 )
 
 var (
-	cliBwrapLookup = exec.LookPath
+	cliBwrapLookup = trustedbin.LookPath
 	cliBwrapProbe  = defaultCLIBwrapProbe
 )
+
+// cliTestExtraBinds lets _test.go files add bubblewrap mounts for go test
+// fixtures (the test binary and t.TempDir roots under the sandbox's /tmp
+// tmpfs). It is nil in production: no code outside _test.go files sets it.
+var cliTestExtraBinds func(targetBin string, env []string) []string
+
+// cliTestEnvAllowed lets _test.go files pass fixture-control variables
+// through sanitizeCLIEnv. It is nil in production.
+var cliTestEnvAllowed func(key string) bool
 
 var (
 	cliBwrapProbeOnce sync.Once
@@ -49,9 +63,22 @@ var cliSensitiveHomeEntries = []string{
 	".docker",
 	".netrc",
 	".npmrc",
+	".yarnrc",
 	".pypirc",
 	".pgpass",
+	".gitconfig",
 	".git-credentials",
+	".cargo/credentials",
+	".cargo/credentials.toml",
+	".cargo/config.toml",
+	".m2/settings.xml",
+	".gradle/gradle.properties",
+	".s3cfg",
+	".boto",
+	".oci",
+	".aider.conf.yml",
+	".anthropic",
+	".openai",
 	".vault-token",
 	".password-store",
 	".terraform.d",
@@ -59,9 +86,20 @@ var cliSensitiveHomeEntries = []string{
 	".zsh_history",
 	".histfile",
 	".python_history",
+	".node_repl_history",
+	".psql_history",
+	".mysql_history",
+	".sqlite_history",
+	".lesshst",
+	".viminfo",
 	".local/share/keyrings",
 	".local/share/muse",
 	".local/share/credentials",
+	".local/share/makewand",
+	".local/share/fish",
+	".local/state",
+	".mozilla",
+	".pki",
 	"server_auth.json",
 	"state.db",
 	"state.db-wal",
@@ -71,6 +109,167 @@ var cliSensitiveHomeEntries = []string{
 	"audit.jsonl",
 	"usage.jsonl",
 	".config/makewand",
+	".config/gcloud",
+	".config/gh",
+	".config/hub",
+	".config/git/credentials",
+	".config/rclone",
+	".config/muse",
+	".config/google-chrome",
+	".config/chromium",
+}
+
+// cliForbiddenWritableRoots defines system and sensitive roots that must never
+// be used as a sandbox workspace (VUL-01/02/06). Mirrors the Python sandbox's
+// FORBIDDEN_WRITABLE_ROOTS plus its _broad_workspace roots (/var/tmp) and the
+// masked host roots (/mnt, /srv, /media), whose masks a workspace bind would undo.
+var cliForbiddenWritableRoots = []string{
+	"/", "/tmp", "/var/tmp", "/home", "/etc", "/usr", "/var", "/root", "/boot", "/opt",
+	"/sys", "/dev", "/proc", "/mnt", "/srv", "/media",
+}
+
+// cliCleanAndReal returns the cleaned path and, when it resolves, its
+// symlink-free form.
+func cliCleanAndReal(p string) []string {
+	clean := filepath.Clean(p)
+	out := []string{clean}
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		if real := filepath.Clean(resolved); real != clean {
+			out = append(out, real)
+		}
+	}
+	return out
+}
+
+// isForbiddenWritableWorkspace reports whether workspace is a protected root,
+// HOME itself, or an ancestor of HOME. HOME is taken from the process
+// environment, os.UserHomeDir, and any extraHomes (the child's HOME); every
+// comparison is repeated after symlink resolution.
+func isForbiddenWritableWorkspace(workspace string, extraHomes ...string) bool {
+	wsForms := cliCleanAndReal(workspace)
+	for _, root := range cliForbiddenWritableRoots {
+		for _, rootForm := range cliCleanAndReal(root) {
+			for _, wsForm := range wsForms {
+				if wsForm == rootForm {
+					return true
+				}
+			}
+		}
+	}
+	homes := append([]string{os.Getenv("HOME")}, extraHomes...)
+	if h, err := os.UserHomeDir(); err == nil {
+		homes = append(homes, h)
+	}
+	for _, home := range homes {
+		if strings.TrimSpace(home) == "" || !filepath.IsAbs(home) {
+			continue
+		}
+		for _, homeForm := range cliCleanAndReal(home) {
+			for _, wsForm := range wsForms {
+				// HOME itself or any ancestor of HOME would expose every
+				// credential directory the sandbox masks.
+				if cliPathWithin(wsForm, homeForm) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// generateSeccompBPFFilter generates a strict Seccomp-BPF filter blocking high-risk Linux syscalls
+// (ptrace, bpf, keyctl, process_vm_readv, process_vm_writev, userfaultfd) and X32 ABI bypasses.
+func generateSeccompBPFFilter() []byte {
+	const (
+		bpfLd           = 0x00
+		bpfW            = 0x00
+		bpfAbs          = 0x20
+		bpfJmp          = 0x05
+		bpfJeq          = 0x10
+		bpfJge          = 0x30
+		bpfK            = 0x00
+		bpfRet          = 0x06
+		seccompRetErrno = 0x00050000
+		seccompRetAllow = 0x7fff0000
+		eperm           = 1
+
+		auditArchX86_64  = 0xc000003e
+		auditArchAarch64 = 0xc00000b7
+	)
+
+	var expectedArch uint32
+	var blockedSyscalls []uint32
+	isX86_64 := false
+
+	switch runtime.GOARCH {
+	case "amd64":
+		expectedArch = auditArchX86_64
+		blockedSyscalls = []uint32{
+			101, // ptrace
+			321, // bpf
+			250, // keyctl
+			310, // process_vm_readv
+			311, // process_vm_writev
+			323, // userfaultfd
+		}
+		isX86_64 = true
+	case "arm64":
+		expectedArch = auditArchAarch64
+		blockedSyscalls = []uint32{
+			117, // ptrace
+			280, // bpf
+			219, // keyctl
+			270, // process_vm_readv
+			271, // process_vm_writev
+			282, // userfaultfd
+		}
+	default:
+		return nil
+	}
+
+	buf := new(bytes.Buffer)
+	stmt := func(code uint16, k uint32) {
+		_ = binary.Write(buf, binary.LittleEndian, code)
+		_ = binary.Write(buf, binary.LittleEndian, uint8(0))
+		_ = binary.Write(buf, binary.LittleEndian, uint8(0))
+		_ = binary.Write(buf, binary.LittleEndian, k)
+	}
+	jmp := func(code uint16, k uint32, jt, jf uint8) {
+		_ = binary.Write(buf, binary.LittleEndian, code)
+		_ = binary.Write(buf, binary.LittleEndian, jt)
+		_ = binary.Write(buf, binary.LittleEndian, jf)
+		_ = binary.Write(buf, binary.LittleEndian, k)
+	}
+
+	// 1. Load architecture: [BPF_LD | BPF_W | BPF_ABS, offset 4]
+	stmt(bpfLd|bpfW|bpfAbs, 4)
+	// 2. Check architecture matches expectedArch, otherwise jump to errno
+	jmp(bpfJmp|bpfJeq|bpfK, expectedArch, 1, 0)
+	stmt(bpfRet|bpfK, seccompRetErrno|eperm)
+
+	// 3. Load syscall number: [BPF_LD | BPF_W | BPF_ABS, offset 0]
+	stmt(bpfLd|bpfW|bpfAbs, 0)
+
+	if len(blockedSyscalls) > 200 {
+		return nil // jump offsets below are 8-bit
+	}
+	n := uint8(len(blockedSyscalls)) //nolint:gosec // G115: bounded above
+	if isX86_64 {
+		const x32SyscallBit = 0x40000000
+		jmp(bpfJmp|bpfJge|bpfK, x32SyscallBit, n+1, 0)
+	}
+
+	for i, sc := range blockedSyscalls {
+		remaining := n - 1 - uint8(i)
+		jmp(bpfJmp|bpfJeq|bpfK, sc, remaining+1, 0)
+	}
+
+	// 5. Default allow
+	stmt(bpfRet|bpfK, seccompRetAllow)
+	// 6. Blocked errno (EPERM = 1)
+	stmt(bpfRet|bpfK, seccompRetErrno|eperm)
+
+	return buf.Bytes()
 }
 
 var cliProviderCredentials = map[string][]string{
@@ -341,8 +540,12 @@ func auditHostExecToConfigDir(configDir string) func(command string, args []stri
 	}
 }
 
-// isCLISandboxRequired reports whether execution MUST be sandboxed because the
-// context is untrusted, restricted, or performing a review/writing task.
+// isCLISandboxRequired reports whether execution MUST be sandboxed. Every
+// launch requires the sandbox unless unsafe host execution has been explicitly
+// authorized (MAKEWAND_UNSAFE_HOST_EXEC=1 plus acknowledgment); the task type
+// never relaxes it, because analysis and review prompts carry the same
+// untrusted repository content as writing tasks. Remote, restricted, and
+// MAKEWAND_REQUIRE_BWRAP contexts require the sandbox even when authorized.
 func isCLISandboxRequired(ctx context.Context) bool {
 	if RemoteOriginFromContext(ctx) {
 		return true
@@ -350,24 +553,24 @@ func isCLISandboxRequired(ctx context.Context) bool {
 	if os.Getenv("MAKEWAND_RESTRICTED") == "1" || os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
 		return true
 	}
-	// If unsafe host execution has been explicitly authorized (MAKEWAND_UNSAFE_HOST_EXEC=1 + ack),
-	// the mandatory sandbox gate is relaxed.
-	if authorized, _ := isUnsafeHostExecAuthorized(ctx); authorized {
-		return false
+	authorized, _ := isUnsafeHostExecAuthorized(ctx)
+	return !authorized
+}
+
+// cliAuditHostExec records an unsandboxed host launch. Authorized callers
+// supply an audit sink; without one the launch is still reported on stderr so
+// no host execution goes unrecorded.
+func cliAuditHostExec(auth UnsafeHostExecAuth, provider string, cmd *exec.Cmd) {
+	cmdPath := cmd.Path
+	if cmdPath == "" && len(cmd.Args) > 0 {
+		cmdPath = cmd.Args[0]
 	}
-	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
-		return true
+	if auth.Audit != nil {
+		auth.Audit(cmdPath, cmd.Args, cmd.Dir)
+		return
 	}
-	// Writing / code generation tasks require sandbox by default
-	if task, ok := TaskFromContext(ctx); ok {
-		if task == TaskCode || task == TaskFix {
-			return true
-		}
-		// Read-only analysis or explain may fall back to host with sanitized environment
-		return false
-	}
-	// Unspecified task defaults to TaskCode (writing/generation) -> fail closed
-	return true
+	fmt.Fprintf(os.Stderr, "makewand: WARNING: running %s CLI unsandboxed on the host (source=%s, command=%s, dir=%s)\n",
+		provider, auth.Source, cmdPath, cmd.Dir)
 }
 
 func cliPathWithin(base, target string) bool {
@@ -941,6 +1144,22 @@ func rebindToolchainUnderMaskedRoot(args []string, targetBin, workspace, home st
 			}
 		}
 	}
+	// /tmp is a fresh tmpfs inside the sandbox. A provider binary (or symlink
+	// target) living below it is re-exposed read-only together with its own
+	// directory (side files such as bundled resources), never writable, and
+	// never /tmp itself or a world-writable directory.
+	for _, b := range bins {
+		dir := filepath.Dir(b)
+		if b == workspace || cliPathWithin(workspace, b) || !cliPathWithin("/tmp", dir) || dir == "/tmp" {
+			continue
+		}
+		fi, err := os.Lstat(b)
+		di, derr := os.Stat(dir)
+		if err != nil || derr != nil || !fi.Mode().IsRegular() || di.Mode().Perm()&0o002 != 0 {
+			continue
+		}
+		args = append(args, "--ro-bind", dir, dir)
+	}
 	return args
 }
 
@@ -948,7 +1167,12 @@ func rebindToolchainUnderMaskedRoot(args []string, targetBin, workspace, home st
 // hooks, skills, and settings, and mounts ephemeral session directories with tmpfs.
 // This prevents prompt-injection attacks from modifying host configurations or planting
 // malicious hooks for host RCE (remediating [P1] redteam-1).
-func cliShieldProviderState(args []string, providerKey, rootPath, workspace string, isReadOnly bool) []string {
+//
+// In private mode rootPath is the sandbox path of a per-run private provider
+// directory: existing host entries are bound read-only onto their place in it
+// (a symlinked entry's target is bound at the entry's path), and nothing is
+// created on the host because writes already land in the discarded private copy.
+func cliShieldProviderState(args []string, providerKey, rootPath, workspace string, isReadOnly, private bool) []string {
 	cleanRoot := filepath.Clean(rootPath)
 	if cleanRoot == "" || cleanRoot == "." || cleanRoot == "/" || strings.Contains(cleanRoot, "..") {
 		return args
@@ -1007,12 +1231,16 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 			if fi.Mode()&os.ModeSymlink != 0 {
 				target, err := filepath.EvalSymlinks(subPath)
 				if err == nil {
-					args = cliAppendRoBindIfNotPresent(args, target)
+					if private {
+						args = cliAppendRoBindToIfNotPresent(args, target, subPath)
+					} else {
+						args = cliAppendRoBindIfNotPresent(args, target)
+					}
 				}
 			} else {
 				args = cliAppendRoBindIfNotPresent(args, subPath)
 			}
-		} else if entry.placeholder != "" {
+		} else if entry.placeholder != "" && !private {
 			if entry.isDir {
 				// #nosec G301 -- directory placeholder for provider protection inside host home
 				if err := os.MkdirAll(subPath, 0o700); err == nil {
@@ -1058,6 +1286,11 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 		}
 	}
 
+	if private {
+		// Session state already lands in the discarded private copy.
+		return args
+	}
+
 	ephemeralList := cliProviderEphemeral[normKey]
 	for _, eph := range ephemeralList {
 		rel := filepath.FromSlash(eph)
@@ -1087,6 +1320,18 @@ func cliAppendRoBindIfNotPresent(args []string, target string) []string {
 		}
 	}
 	return append(args, "--ro-bind", target, target)
+}
+
+// cliAppendRoBindToIfNotPresent read-only binds source at dest unless dest
+// already has a read-only bind.
+func cliAppendRoBindToIfNotPresent(args []string, source, dest string) []string {
+	dest = filepath.Clean(dest)
+	for i := 0; i+2 < len(args); i++ {
+		if args[i] == "--ro-bind" && filepath.Clean(args[i+2]) == dest {
+			return args
+		}
+	}
+	return append(args, "--ro-bind", filepath.Clean(source), dest)
 }
 
 func cliAppendTmpfsIfNotPresent(args []string, target string) []string {
@@ -1127,61 +1372,32 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	}
 
 	if bwrapMissing {
-		if runtime.GOOS == "windows" {
-			if RemoteOriginFromContext(ctx) || os.Getenv("MAKEWAND_RESTRICTED") == "1" || os.Getenv("MAKEWAND_REQUIRE_BWRAP") == "1" {
-				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
-					"bubblewrap (bwrap) required for sandboxed execution in untrusted or restricted context, but not found", errors.New("bubblewrap not supported on windows"))
-			}
-			// Bubblewrap is Linux-only. On Windows, process tree management and bounded resources
-			// are enforced via Windows Job Objects (processjob). We sanitize credentials and audit
-			// as required by the native Windows contract.
-			cmd.Env = sanitizeCLIEnv(provider, cmd.Env)
-			if _, auth := isUnsafeHostExecAuthorized(ctx); auth.Audit != nil {
-				cmdPath := cmd.Path
-				if cmdPath == "" && len(cmd.Args) > 0 {
-					cmdPath = cmd.Args[0]
-				}
-				auth.Audit(cmdPath, cmd.Args, cmd.Dir)
-			}
-			recordCLIExec(ctx, CLIExecRecord{
-				Sandboxed:  false,
-				UnsafeHost: true,
-				Provider:   provider,
-				Workspace:  cmd.Dir,
-			})
-			return cmd, nil
-		}
-
-		if isCLISandboxRequired(ctx) {
+		// Every unsandboxed launch, whatever the task type, needs explicit
+		// host-exec authorization and is audited (H1). Bubblewrap is Linux-only;
+		// on Windows, process trees and resources are bounded by Job Objects
+		// (processjob) but the filesystem is not isolated, so the same gate applies.
+		authorized, auth := isUnsafeHostExecAuthorized(ctx)
+		if isCLISandboxRequired(ctx) || !authorized {
 			msg := "bubblewrap (bwrap) sandbox is not available and unsafe host execution is not acknowledged (MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
+			if runtime.GOOS == "windows" {
+				msg = "bubblewrap (bwrap) sandbox is not available on windows and unsafe host execution is not acknowledged (MAKEWAND_UNSAFE_HOST_EXEC=1 alone never enables it). Execution blocked for security."
+			}
 			if bwrapErr != nil {
 				msg = fmt.Sprintf("%s: %v", msg, bwrapErr)
 			}
 			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, msg, bwrapErr)
 		}
 
-		// When falling back to host execution (either authorized via MAKEWAND_UNSAFE_HOST_EXEC
-		// or for non-writing informational tasks):
-		// 1. Sanitize the command environment so foreign credentials and host secrets are not leaked
-		cmd.Env = sanitizeCLIEnv(provider, cmd.Env)
-
-		// 2. Audit host execution if an audit hook is registered
-		if _, auth := isUnsafeHostExecAuthorized(ctx); auth.Audit != nil {
-			cmdPath := cmd.Path
-			if cmdPath == "" && len(cmd.Args) > 0 {
-				cmdPath = cmd.Args[0]
-			}
-			auth.Audit(cmdPath, cmd.Args, cmd.Dir)
-		}
-
-		// 3. Record execution state as unsandboxed
+		// Authorized host execution: sanitize the environment so foreign
+		// credentials and host secrets are not leaked, audit, and record.
+		cmd.Env = cliWithProviderWorkerEnv(sanitizeCLIEnv(provider, cmd.Env))
+		cliAuditHostExec(auth, provider, cmd)
 		recordCLIExec(ctx, CLIExecRecord{
 			Sandboxed:  false,
 			UnsafeHost: true,
 			Provider:   provider,
 			Workspace:  cmd.Dir,
 		})
-
 		return cmd, nil
 	}
 
@@ -1206,6 +1422,62 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
 		isReview = true
 	}
+	readOnlyProvider := isReview || RemoteOriginFromContext(ctx)
+
+	childEnv := cliWithProviderWorkerEnv(sanitizeCLIEnv(provider, cmd.Env))
+	home := cliEnvValue(childEnv, "HOME")
+	if home != "" {
+		home = filepath.Clean(home)
+	}
+
+	// Broad roots, HOME, and HOME's ancestors are refused for every task: even
+	// a read-only bind of such a root would re-expose the host roots and
+	// credential directories the masks below hide.
+	if isForbiddenWritableWorkspace(workspace, home) {
+		return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+			fmt.Sprintf("refusing to use %s as writable sandbox workspace: protected root or restricted path (system root, HOME, or an ancestor of HOME)", workspace), nil)
+	}
+
+	// Scan the workspace before building the plan: .git metadata and unix
+	// sockets inside a writable bind must be protected, and a truncated scan
+	// cannot prove that, so it fails closed.
+	scan := cliScanWorkspace(workspace)
+	if scan.truncated && !isReview {
+		return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+			fmt.Sprintf("workspace %s is too large to verify (.git metadata and unix socket scan exceeded %d entries); refusing writable sandbox", workspace, cliWorkspaceScanLimit), nil)
+	}
+	protectArgs, err := cliWorkspaceProtectionArgs(workspace, scan, !isReview)
+	if err != nil {
+		return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+	}
+
+	var seccompPipe *os.File
+	var seccompArgs []string
+	seccompRequired, seccompOptedOut := cliSeccompPolicy()
+	seccompUnavailable := func(reason string, cause error) error {
+		if seccompRequired {
+			return newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+				reason+" (set MAKEWAND_ALLOW_NO_SECCOMP=1 to run without the syscall filter)", cause)
+		}
+		if seccompOptedOut {
+			fmt.Fprintf(os.Stderr, "makewand: WARNING: running %s CLI sandbox without seccomp filter (MAKEWAND_ALLOW_NO_SECCOMP=1): %s\n", provider, reason)
+		}
+		return nil
+	}
+	if bpf := generateSeccompBPFFilter(); len(bpf) > 0 {
+		rPipe, wPipe, pipeErr := os.Pipe()
+		if pipeErr == nil {
+			_, _ = wPipe.Write(bpf)
+			_ = wPipe.Close()
+			seccompPipe = rPipe
+			targetFD := 3 + len(cmd.ExtraFiles)
+			seccompArgs = []string{"--seccomp", strconv.Itoa(targetFD)}
+		} else if err := seccompUnavailable("failed to create seccomp pipe: "+pipeErr.Error(), pipeErr); err != nil {
+			return nil, err
+		}
+	} else if err := seccompUnavailable("seccomp bpf unsupported on this architecture", nil); err != nil {
+		return nil, err
+	}
 
 	bwrapArgs := []string{
 		"--die-with-parent",
@@ -1213,6 +1485,9 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		"--unshare-pid",
 		"--unshare-ipc",
 		"--unshare-uts",
+		"--unshare-user",
+		"--disable-userns",
+		"--clearenv",
 		// Network is NOT unshared by default: external API access is required by CLI providers.
 		// MAKEWAND_SANDBOX_UNSHARE_NET explicitly isolates the network namespace to block abstract sockets & loopback.
 		"--ro-bind", "/", "/",
@@ -1223,28 +1498,33 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		"--tmpfs", "/run",
 	}
 
+	if len(seccompArgs) > 0 {
+		bwrapArgs = append(bwrapArgs, seccompArgs...)
+	}
+
+	for _, entry := range childEnv {
+		if parts := strings.SplitN(entry, "=", 2); len(parts) == 2 {
+			bwrapArgs = append(bwrapArgs, "--setenv", parts[0], parts[1])
+		}
+	}
+
 	if os.Getenv("MAKEWAND_SANDBOX_UNSHARE_NET") == "1" || strings.ToLower(os.Getenv("MAKEWAND_SANDBOX_UNSHARE_NET")) == "true" {
 		bwrapArgs = append(bwrapArgs, "--unshare-net")
 	}
 
-	// Mask host roots (/root, /media, /srv, /mnt, /home)
-	for _, r := range []string{"/root", "/media", "/srv"} {
-		if fi, err := os.Stat(r); err == nil && fi.IsDir() && workspace != r {
+	var readonlyMasks []string
+
+	// Mask host roots (/root, /media, /srv, /mnt, /home). A workspace equal to
+	// one of them was refused above, so the masks always apply.
+	for _, r := range []string{"/root", "/media", "/srv", "/mnt", "/home"} {
+		if fi, err := os.Stat(r); err == nil && fi.IsDir() {
 			bwrapArgs = append(bwrapArgs, "--tmpfs", r)
+			readonlyMasks = append(readonlyMasks, r)
 		}
-	}
-	if fi, err := os.Stat("/mnt"); err == nil && fi.IsDir() && workspace != "/mnt" {
-		bwrapArgs = append(bwrapArgs, "--tmpfs", "/mnt")
-	}
-	if fi, err := os.Stat("/home"); err == nil && fi.IsDir() && workspace != "/home" {
-		bwrapArgs = append(bwrapArgs, "--tmpfs", "/home")
 	}
 
 	// Mask server state directories and config files (/var/lib/makewand, /etc/makewand, MAKEWAND_DATA_DIR, etc.)
 	bwrapArgs = cliMaskServerPaths(bwrapArgs, workspace, cmd.Env)
-
-	childEnv := sanitizeCLIEnv(provider, cmd.Env)
-	home := cliEnvValue(childEnv, "HOME")
 	p := strings.TrimSuffix(strings.ToLower(provider), "-cli")
 	var selectedCodexHome, realCodexHome string
 	if p == "codex" {
@@ -1254,25 +1534,45 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
 		}
 	}
+
+	// Writable sessions get a per-run private provider home (H3): HOME is a
+	// fresh 0700 directory holding copies of allowlisted credential files,
+	// and only changed credential files are written back after the sandbox
+	// exits. Host provider directories are never bound writable.
+	var privHome *cliPrivateHome
+	planned := false
+	defer func() {
+		if !planned && privHome != nil {
+			privHome.cleanup()
+		}
+	}()
+	ensurePrivHome := func() error {
+		if privHome != nil {
+			return nil
+		}
+		var err error
+		privHome, err = newCLIPrivateHome(workspace)
+		if err != nil {
+			return newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+				"failed to create private provider home: "+err.Error(), err)
+		}
+		return nil
+	}
+
 	var allowedCreds []string
-	homeMaskedWithTmpfs := false
 	if home != "" {
-		home = filepath.Clean(home)
 		allowedCreds = cliProviderCredentials[p]
 		if selectedCodexHome != "" {
 			allowedCreds = nil // Explicit account selection does not expose the default account.
 		}
-
-		isRemote := RemoteOriginFromContext(ctx)
-		isTempHome := cliPathWithin("/tmp", home) || cliPathWithin(os.TempDir(), home)
-		if isRemote || (!isTempHome && home != "/") {
-			if workspace != home && !cliPathWithin(workspace, home) {
+		if home != "/" {
+			if readOnlyProvider {
 				bwrapArgs = append(bwrapArgs, "--tmpfs", home)
-				homeMaskedWithTmpfs = true
-			}
-		} else if isTempHome && home != "/tmp" && home != filepath.Clean(os.TempDir()) {
-			if workspace != home && !cliPathWithin(workspace, home) {
-				bwrapArgs = append(bwrapArgs, "--bind", home, home)
+			} else {
+				if err := ensurePrivHome(); err != nil {
+					return nil, err
+				}
+				bwrapArgs = append(bwrapArgs, "--bind", privHome.home, home)
 			}
 		}
 	}
@@ -1288,50 +1588,8 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		}
 	}
 
-	// In test environments (go test), test binaries, scripts, or fixtures may reside under /tmp.
-	// Ensure test roots under /tmp are bound so test fixtures continue to work with --tmpfs /tmp.
-	bindTmpTestFixture := func(targetPath string) {
-		if !cliPathWithin("/tmp", targetPath) || targetPath == "/tmp" {
-			return
-		}
-		rel, err := filepath.Rel("/tmp", targetPath)
-		if err != nil {
-			return
-		}
-		parts := strings.Split(rel, string(os.PathSeparator))
-		if len(parts) == 0 {
-			return
-		}
-		top := parts[0]
-		fixtureRoot := filepath.Join("/tmp", top)
-		if strings.HasPrefix(top, "Test") || strings.HasPrefix(top, "go-build") {
-			if _, err := os.Stat(fixtureRoot); err == nil {
-				already := false
-				for i := 0; i+1 < len(bwrapArgs); i++ {
-					if (bwrapArgs[i] == "--bind" || bwrapArgs[i] == "--ro-bind") && bwrapArgs[i+1] == fixtureRoot {
-						already = true
-						break
-					}
-				}
-				if !already {
-					if strings.HasPrefix(top, "go-build") {
-						bwrapArgs = append(bwrapArgs, "--ro-bind", fixtureRoot, fixtureRoot)
-					} else {
-						bwrapArgs = append(bwrapArgs, "--bind", fixtureRoot, fixtureRoot)
-					}
-				}
-			}
-		}
-	}
-
-	bindTmpTestFixture(targetBin)
-	for _, arg := range cmd.Args {
-		bindTmpTestFixture(arg)
-	}
-	for _, envEntry := range cmd.Env {
-		if parts := strings.SplitN(envEntry, "=", 2); len(parts) == 2 {
-			bindTmpTestFixture(parts[1])
-		}
+	if cliTestExtraBinds != nil {
+		bwrapArgs = append(bwrapArgs, cliTestExtraBinds(targetBin, cmd.Env)...)
 	}
 
 	// Mount workspace (after host roots /tmpfs mounts so it overlays correctly)
@@ -1344,36 +1602,34 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	// Re-bind target binary and any symlink targets (essential if binary or its environment is under /tmp, /mnt, or /home)
 	bwrapArgs = rebindToolchainUnderMaskedRoot(bwrapArgs, targetBin, workspace, home)
 
-	// Bind active provider credentials within home and mask sensitive credentials
+	// Expose active provider credentials within home and mask sensitive credentials
 	if home != "" {
-		bindFlag := "--bind"
-		if isReview || RemoteOriginFromContext(ctx) {
-			bindFlag = "--ro-bind"
-		}
-		isReadOnlyProvider := isReview || RemoteOriginFromContext(ctx)
 		for _, cred := range allowedCreds {
 			target := filepath.Join(home, filepath.FromSlash(cred))
 			if target == workspace || cliPathWithin(target, workspace) {
 				continue
 			}
-			if fi, err := os.Stat(target); err == nil { //nolint:gosec // G703: checking existence of provider credentials in host home
-				already := false
-				for i := 0; i+1 < len(bwrapArgs); i++ {
-					if (bwrapArgs[i] == "--bind" || bwrapArgs[i] == "--ro-bind") && bwrapArgs[i+1] == target {
-						already = true
-						break
-					}
+			fi, err := os.Stat(target) //nolint:gosec // G703: checking existence of provider credentials in host home
+			if err != nil {
+				continue
+			}
+			if privHome != nil {
+				bwrapArgs, err = privHome.addProviderEntry(bwrapArgs, p, home, cred, target, fi, workspace)
+				if err != nil {
+					return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
 				}
-				if !already {
-					bwrapArgs = append(bwrapArgs, bindFlag, target, target)
-				}
-				if fi.IsDir() {
-					bwrapArgs = cliShieldProviderState(bwrapArgs, p, target, workspace, isReadOnlyProvider)
-				}
+				continue
+			}
+			bwrapArgs = cliAppendRoBindIfNotPresent(bwrapArgs, target)
+			if fi.IsDir() {
+				bwrapArgs = cliShieldProviderState(bwrapArgs, p, target, workspace, true, false)
 			}
 		}
 
-		if !homeMaskedWithTmpfs {
+		// Masks apply even though HOME itself is hidden: a sensitive entry
+		// may be a symlink whose target lies outside HOME and outside the
+		// masked host roots, where the read-only root bind would expose it.
+		{
 			isAllowed := func(entry string) bool {
 				for _, allowed := range allowedCreds {
 					if entry == allowed || strings.HasPrefix(entry, allowed+"/") {
@@ -1428,15 +1684,21 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		// Mount only the selected account after masking host roots and other
 		// credentials. Use its canonical path inside the sandbox: a destination
 		// symlink may point into a masked root and cannot serve as a mount point.
-		isRO := isReview || RemoteOriginFromContext(ctx)
-		if isRO {
+		if readOnlyProvider {
 			bwrapArgs = append(bwrapArgs, "--tmpfs", realCodexHome,
 				"--setenv", "CODEX_HOME", realCodexHome)
-			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, true)
+			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, true, false)
 		} else {
-			bwrapArgs = append(bwrapArgs, "--bind", realCodexHome, realCodexHome,
+			if err := ensurePrivHome(); err != nil {
+				return nil, err
+			}
+			privCodex, err := privHome.addCodexHome(realCodexHome)
+			if err != nil {
+				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+			}
+			bwrapArgs = append(bwrapArgs, "--bind", privCodex, realCodexHome,
 				"--setenv", "CODEX_HOME", realCodexHome)
-			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, false)
+			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, false, true)
 		}
 	} else if p != "codex" {
 		// A custom Codex account may be outside a masked host root. Other
@@ -1457,6 +1719,31 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
 			}
 		}
+	}
+
+	// Protect workspace .git metadata (read-only) and mask unix sockets last,
+	// so no later mount can re-expose them (H4/H5).
+	bwrapArgs = append(bwrapArgs, protectArgs...)
+
+	for _, mask := range readonlyMasks {
+		bwrapArgs = append(bwrapArgs, "--remount-ro", mask)
+	}
+
+	var statusRead, statusWrite *os.File
+	if privHome != nil {
+		// bwrap reports container status on this descriptor; it reaches EOF
+		// only once every sandbox process has exited, which triggers the
+		// credential write-back.
+		statusRead, statusWrite, err = os.Pipe()
+		if err != nil {
+			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+				"failed to create sandbox status pipe: "+err.Error(), err)
+		}
+		statusFD := 3 + len(cmd.ExtraFiles)
+		if seccompPipe != nil {
+			statusFD++
+		}
+		bwrapArgs = append(bwrapArgs, "--json-status-fd", strconv.Itoa(statusFD))
 	}
 
 	bwrapArgs = append(bwrapArgs, "--chdir", workspace)
@@ -1483,7 +1770,16 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	wrapped.Stdin = cmd.Stdin
 	wrapped.Stdout = cmd.Stdout
 	wrapped.Stderr = cmd.Stderr
-	wrapped.ExtraFiles = cmd.ExtraFiles
+	wrapped.ExtraFiles = append([]*os.File(nil), cmd.ExtraFiles...)
+	if seccompPipe != nil {
+		wrapped.ExtraFiles = append(wrapped.ExtraFiles, seccompPipe)
+		runtime.SetFinalizer(seccompPipe, func(f *os.File) { _ = f.Close() })
+	}
+	if privHome != nil {
+		wrapped.ExtraFiles = append(wrapped.ExtraFiles, statusWrite)
+		privHome.watch(wrapped, statusRead, statusWrite)
+	}
+	planned = true
 	recordCLIExec(ctx, CLIExecRecord{
 		Sandboxed:  true,
 		UnsafeHost: false,
@@ -1492,6 +1788,62 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	})
 
 	return wrapped, nil
+}
+
+// cliChildMakewandEnvKeys is the explicit set of MAKEWAND_* variables a
+// provider CLI child may see. Child CLIs do not read makewand's control or
+// server variables; only non-secret run identifiers are forwarded so nested
+// makewand invocations keep their task/workspace attribution.
+var cliChildMakewandEnvKeys = map[string]bool{
+	"MAKEWAND_TASK_ID":      true,
+	"MAKEWAND_WORKSPACE_ID": true,
+	cliProviderWorkerEnvKey: true,
+}
+
+// cliProviderWorkerEnvKey marks every provider CLI child launched by the
+// router. The makewand Python CLI refuses model-dispatching subcommands when it
+// is "1", preventing makewand -> provider CLI -> makewand recursion.
+const cliProviderWorkerEnvKey = "MAKEWAND_PROVIDER_WORKER"
+
+// cliWithProviderWorkerEnv sets MAKEWAND_PROVIDER_WORKER=1 in a sanitized
+// child environment, replacing any inherited value.
+func cliWithProviderWorkerEnv(env []string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, cliProviderWorkerEnvKey+"=") {
+			out = append(out, entry)
+		}
+	}
+	return append(out, cliProviderWorkerEnvKey+"=1")
+}
+
+// cliCodeInjectionEnvKeys are runtime/loader variables that inject code into
+// the child process and are dropped regardless of allowlisted prefixes.
+var cliCodeInjectionEnvKeys = map[string]bool{
+	"LD_PRELOAD":                true,
+	"LD_LIBRARY_PATH":           true,
+	"LD_AUDIT":                  true,
+	"NODE_OPTIONS":              true,
+	"NODE_REPL_EXTERNAL_MODULE": true,
+	"PYTHONSTARTUP":             true,
+	"PYTHONINSPECT":             true,
+}
+
+// cliSeccompPolicy reports whether the seccomp filter is mandatory and whether
+// the operator explicitly opted out. The filter is required by default on
+// linux/amd64 and linux/arm64, where it is always generated; elsewhere it is
+// required only with MAKEWAND_REQUIRE_SECCOMP=1. MAKEWAND_ALLOW_NO_SECCOMP=1
+// lets a launch proceed (with a stderr warning) when the filter cannot be
+// installed; MAKEWAND_REQUIRE_SECCOMP=1 overrides that opt-out.
+func cliSeccompPolicy() (required, optedOut bool) {
+	defaultRequired := runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")
+	if os.Getenv("MAKEWAND_REQUIRE_SECCOMP") == "1" {
+		return true, false
+	}
+	if defaultRequired && os.Getenv("MAKEWAND_ALLOW_NO_SECCOMP") == "1" {
+		return false, true
+	}
+	return defaultRequired, false
 }
 
 // sanitizeCLIEnv filters out foreign credentials, tokens, and secrets
@@ -1558,6 +1910,9 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 		if strings.HasPrefix(upper, "DBUS_") || upper == "DISPLAY" || upper == "XAUTHORITY" || upper == "WAYLAND_DISPLAY" {
 			return true
 		}
+		if strings.HasPrefix(upper, "SSH_") || strings.HasPrefix(upper, "GPG_") {
+			return true
+		}
 		if strings.HasPrefix(upper, "MAKEWAND_SERVER_") ||
 			upper == "MAKEWAND_AUTH_CONFIG" ||
 			upper == "MAKEWAND_DATA_DIR" ||
@@ -1566,11 +1921,12 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 			upper == "MAKEWAND_STATE_DB" {
 			return true
 		}
-		if strings.HasPrefix(upper, "AWS_") || strings.HasPrefix(upper, "AZURE_") {
-			return true
-		}
-		for _, t := range []string{"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GITLAB_TOKEN", "GL_TOKEN", "GITEA_TOKEN"} {
-			if upper == t {
+		for _, prefix := range []string{
+			"AWS_", "AZURE_", "GCP_", "SENDGRID_", "STRIPE_", "SLACK_", "TWILIO_",
+			"MAILGUN_", "GITHUB_", "GITLAB_", "GITEA_", "BITBUCKET_", "VAULT_",
+			"POSTGRES_", "MYSQL_", "MONGO_", "REDIS_", "SENTRY_", "DATADOG_",
+		} {
+			if strings.HasPrefix(upper, prefix) {
 				return true
 			}
 		}
@@ -1579,17 +1935,53 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 				return true
 			}
 		}
-		for _, s := range []string{"VAULT_TOKEN", "STRIPE_API_KEY", "STRIPE_SECRET_KEY", "SLACK_BOT_TOKEN", "SLACK_TOKEN", "SENTRY_AUTH_TOKEN", "DATADOG_API_KEY", "DD_API_KEY", "NPM_TOKEN"} {
+		for _, s := range []string{"GH_TOKEN", "GL_TOKEN", "DD_API_KEY", "NPM_TOKEN"} {
 			if upper == s {
 				return true
 			}
 		}
-		for _, pattern := range []string{"_SECRET", "_PASSWORD", "_PASSWD", "_TOKEN", "_PRIVATE_KEY"} {
+		for _, pattern := range []string{
+			"_SECRET", "_PASSWORD", "_PASSWD", "_TOKEN", "_PRIVATE_KEY",
+			"_API_KEY", "_APIKEY", "_KEY", "_AUTH", "_CREDENTIAL", "_SIGNING",
+		} {
 			if strings.Contains(upper, pattern) {
 				return true
 			}
 		}
 		return false
+	}
+
+	isAllowedSystemKey := func(key string) bool {
+		upper := strings.ToUpper(key)
+		switch {
+		case upper == "PATH" || upper == "HOME" || upper == "USER" || upper == "LOGNAME" || upper == "SHELL" ||
+			upper == "TERM" || upper == "TMPDIR" || upper == "TMP" || upper == "TEMP" || upper == "TZ" ||
+			upper == "PWD" || upper == "SHLVL" || upper == "_" || upper == "LANG" || upper == "CI" || upper == "HOSTNAME":
+			return true
+		case strings.HasPrefix(upper, "LC_"):
+			return true
+		case upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY":
+			return true
+		case key == "http_proxy" || key == "https_proxy" || key == "all_proxy" || key == "no_proxy":
+			return true
+		case strings.HasPrefix(upper, "GIT_") || upper == "EDITOR" || upper == "VISUAL":
+			return true
+		case cliCodeInjectionEnvKeys[upper]:
+			// Variables that make the child's runtime load attacker-chosen code
+			// (NODE_OPTIONS=--require, PYTHONSTARTUP, ...) never pass, even
+			// under an allowed prefix.
+			return false
+		case strings.HasPrefix(upper, "NODE_") || strings.HasPrefix(upper, "PYTHON") ||
+			strings.HasPrefix(upper, "GO") || strings.HasPrefix(upper, "CARGO_") ||
+			strings.HasPrefix(upper, "RUST"):
+			return true
+		case cliChildMakewandEnvKeys[upper]:
+			return true
+		case cliTestEnvAllowed != nil && cliTestEnvAllowed(key):
+			return true
+		default:
+			return false
+		}
 	}
 
 	sanitized := make([]string, 0, len(env))
@@ -1610,6 +2002,10 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 		}
 
 		if isSecretKey(key) {
+			continue
+		}
+
+		if !isAllowedSystemKey(key) {
 			continue
 		}
 

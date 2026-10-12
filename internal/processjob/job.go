@@ -23,7 +23,7 @@ type Options struct {
 // must be called after Wait, or on any path abandoning supervision. Windows
 // initialization fails closed: a child never runs outside its required job.
 func Start(cmd *exec.Cmd) (func(), error) {
-	return start(cmd, Options{MaxProcesses: 256})
+	return start(cmd, Options{MaxProcesses: DefaultMaxProcesses})
 }
 
 func StartWithOptions(cmd *exec.Cmd, options Options) (func(), error) {
