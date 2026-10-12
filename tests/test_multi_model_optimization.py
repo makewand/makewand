@@ -65,6 +65,15 @@ def _pairs(cmd, flag):
     return [(cmd[i + 1], cmd[i + 2]) for i, x in enumerate(cmd[:-2]) if x == flag]
 
 
+def _assert_private_state_root(test, cmd, state_dir):
+    """H3: state_dir is backed by a private per-run directory, never bound from the host."""
+    binds = _pairs(cmd, "--bind")
+    sources = [src for src, dst in binds if dst == state_dir]
+    test.assertEqual(len(sources), 1, binds)
+    test.assertIn("provider-homes", sources[0])
+    test.assertNotIn(state_dir, [src for src, _ in binds + _pairs(cmd, "--ro-bind")])
+
+
 class TestProviderPromptContaminationImmunity(unittest.TestCase):
     """
     Validates that user prompts containing provider names (e.g. 'muse', 'claude', 'codex')
@@ -88,13 +97,19 @@ class TestProviderPromptContaminationImmunity(unittest.TestCase):
             cmd = ["claude", "-p", "review muse architecture"]
             bwrap_cmd = wrap_bwrap(cmd, workspace=str(fh.workspace), is_provider=True, provider_name="claude")
 
-            # Claude state dir is mounted (writable state), its instruction/config paths read-only
+            # Claude state dir is a private per-run home, its instruction/config paths read-only
             claude_config = fh.path(".claude")
-            self.assertIn((claude_config, claude_config), _pairs(bwrap_cmd, "--bind"))
+            _assert_private_state_root(self, bwrap_cmd, claude_config)
             ro = _pairs(bwrap_cmd, "--ro-bind")
-            for rel in ("CLAUDE.md", "settings.json", "commands", "hooks", "skills", "plugins", "agents"):
+            # existing host entries are read-only binds; missing ones get no mount
+            # (the private home absorbs them and is deleted after the run)
+            for rel in ("CLAUDE.md", "settings.json", "commands"):
                 p = os.path.join(claude_config, rel)
                 self.assertIn((p, p), ro, rel)
+            for rel in ("hooks", "skills", "plugins", "agents"):
+                p = os.path.join(claude_config, rel)
+                self.assertNotIn(p, bwrap_cmd, rel)
+                self.assertFalse(os.path.exists(p), rel)
 
             # Other providers' auth dirs MUST NOT be mounted (isolated by HOME tmpfs)
             self.assertIn(("--tmpfs", user_home), list(zip(bwrap_cmd, bwrap_cmd[1:])))
@@ -344,9 +359,9 @@ class TestGrokProviderIntegration(unittest.TestCase):
                 grok_dir = fh.path(".grok")
                 binds = _pairs(bwrap_cmd, "--bind")
                 ro = _pairs(bwrap_cmd, "--ro-bind")
-                self.assertIn((grok_dir, grok_dir), binds)
+                _assert_private_state_root(self, bwrap_cmd, grok_dir)
                 # bin/ and config.toml are re-mounted read-only AFTER the ~/.grok bind
-                root_idx = bwrap_cmd.index(grok_dir)
+                root_idx = [i for i, x in enumerate(bwrap_cmd) if x == grok_dir and bwrap_cmd[i - 2] == "--bind"][0]
                 for rel in ("bin", "config.toml"):
                     p = os.path.join(grok_dir, rel)
                     self.assertIn((p, p), ro, rel)
@@ -440,14 +455,17 @@ class TestCatalogDrivenTierResolutionAndSandboxWhitelist(unittest.TestCase):
             cmd = wrap_bwrap(["claude", "-p", "test"], str(fh.workspace), is_provider=True, provider_name="claude")
             self.assertIn(("--tmpfs", user_home), list(zip(cmd, cmd[1:])))
             claude_dir = fh.path(".claude")
-            self.assertIn((claude_dir, claude_dir), _pairs(cmd, "--bind"))
+            _assert_private_state_root(self, cmd, claude_dir)
             self.assertNotIn(fh.path(".codex"), cmd)
 
-            # read-only tasks mount the whole claude state root read-only
+            # read-only tasks get a private home as well (never the host root);
+            # instruction files stay read-only binds of the host originals
             cmd_ro = wrap_bwrap(["claude", "-p", "test"], str(fh.workspace), is_provider=True,
                                 provider_name="claude", readonly=True)
-            self.assertIn((claude_dir, claude_dir), _pairs(cmd_ro, "--ro-bind"))
-            self.assertNotIn((claude_dir, claude_dir), _pairs(cmd_ro, "--bind"))
+            _assert_private_state_root(self, cmd_ro, claude_dir)
+            claude_md = os.path.join(claude_dir, "CLAUDE.md")
+            self.assertIn((claude_md, claude_md), _pairs(cmd_ro, "--ro-bind"))
+            self.assertNotIn(fh.path(".codex"), cmd_ro)
 
     def test_pipeline_transactional_rollback_on_test_failure(self):
         from makewand.git_helper import run_git_cmd

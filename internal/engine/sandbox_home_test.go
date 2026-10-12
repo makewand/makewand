@@ -184,7 +184,7 @@ func TestSandboxHomeLayout_WorkspaceUnderHomeIsBoundAfterHomeIsHidden(t *testing
 	// .netrc is a file, .aws is missing: both broke the old per-entry masks.
 	writeFile(t, filepath.Join(home, ".netrc"), "machine x")
 
-	_, args := wrapVerificationCommand("/usr/bin/bwrap", workspace, "go", []string{"test", "./..."}, false, nil)
+	_, args := mustWrapVerification(t, "/usr/bin/bwrap", workspace, "go", []string{"test", "./..."}, false, nil)
 	tmpfsIdx := argPairIndex(args, "--tmpfs", home)
 	bindIdx := argPairIndex(args, "--bind", workspace)
 	if tmpfsIdx < 0 || bindIdx < 0 || tmpfsIdx > bindIdx {
@@ -304,7 +304,10 @@ func TestSandboxWorkspaceSocketMasks_IncludesIgnoredDirectories(t *testing.T) {
 	}
 	defer l2.Close()
 
-	masks := sandboxWorkspaceSocketMasks(ws)
+	masks, err := sandboxWorkspaceSocketMasks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
 	foundGit := false
 	foundNode := false
 	for i, arg := range masks {
@@ -396,7 +399,7 @@ func TestSandboxMaskedRoots_MasksMntAndHomeEvenWhenNested(t *testing.T) {
 	}
 
 	fakeWorkingBwrap(t)
-	_, args := wrapVerificationCommand("/usr/bin/bwrap", ws, "go", []string{"test", "./..."}, false, nil)
+	_, args := mustWrapVerification(t, "/usr/bin/bwrap", ws, "go", []string{"test", "./..."}, false, nil)
 	mntIdx := argPairIndex(args, "--tmpfs", "/mnt")
 	bindIdx := argPairIndex(args, "--bind", ws)
 	if mntIdx >= 0 && bindIdx >= 0 {

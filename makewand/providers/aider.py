@@ -39,9 +39,7 @@ def execute_aider_task(
 
     from makewand.sandbox import (
         is_bwrap_available,
-        wrap_bwrap,
         verify_writable_sandbox_or_authorized,
-        audit_unsafe_host_exec,
     )
     from makewand.git_helper import find_git_root
     from makewand.providers.base import run_subprocess, model_process_failure
@@ -87,27 +85,34 @@ def execute_aider_task(
         if active_model:
             cmd += ["--model", active_model]
 
-        if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=work_dir, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="aider", extra_ro_binds=[p_file] if p_file else None)
-        elif repo_trust == "untrusted":
-            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
-        elif not readonly:
-            audit_unsafe_host_exec("provider:aider", cmd, work_dir, host_auth_source)
-
-        log_desc = "只读解析任务" if readonly else "代码编写任务"
-        print(c(f"[Makewand -> Aider] 派发{log_desc}至 Aider Pair Programmer (沙箱隔离)...", COLOR_GREEN), file=sys.stderr)
-
+        from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError
         from makewand.execution_runtime import mark_provider_invocation
-        from makewand.sandbox import sandbox_lifecycle
-        mark_provider_invocation()
-        with sandbox_lifecycle(is_provider=True, provider_name="aider", cmd=cmd, readonly=readonly):
-            code, out, err, ex = run_subprocess(
-                cmd,
-                timeout=timeout,
-                cwd=work_dir,
-                stream=stream,
-                print_prefix=c("[Aider Live]", COLOR_GREEN)
-            )
+        try:
+            with provider_sandbox_launch(
+                "aider", cmd, work_dir,
+                readonly=readonly,
+                repo_root=repo_root,
+                repo_trust=repo_trust,
+                allow_network=allow_network,
+                extra_ro_binds=[p_file] if p_file else None,
+                host_auth_source=host_auth_source,
+            ) as launch:
+                log_desc = "只读解析任务" if readonly else "代码编写任务"
+                print(c(f"[Makewand -> Aider] 派发{log_desc}至 Aider Pair Programmer (沙箱隔离)...", COLOR_GREEN), file=sys.stderr)
+                mark_provider_invocation()
+                code, out, err, ex = run_subprocess(
+                    launch.cmd,
+                    timeout=timeout,
+                    cwd=work_dir,
+                    stream=stream,
+                    print_prefix=c("[Aider Live]", COLOR_GREEN),
+                    pass_fds=launch.pass_fds,
+                    extra_env=launch.env,
+                )
+        except SandboxUnavailableError as exc:
+            return False, None, str(exc)
+        except SandboxConfigError as exc:
+            return False, None, f"Aider 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     finally:
         if p_file and os.path.exists(p_file):
             try:

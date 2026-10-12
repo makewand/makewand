@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -334,4 +336,128 @@ func (p *Project) GitDiff(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("git diff: %w", err)
 	}
 	return result.Stdout, nil
+}
+
+func isInsideDir(path, parent string) bool {
+	if parent == "" {
+		return false
+	}
+	p := filepath.Clean(path)
+	par := filepath.Clean(parent)
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+		par = strings.ToLower(par)
+	}
+	if p == par {
+		return true
+	}
+	rel, err := filepath.Rel(par, p)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func isExecutable(path string) bool {
+	info, err := os.Stat(path) //nolint:gosec // G703: stat of a fixed PATH candidate, never opened
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return info.Mode().Perm()&0o111 != 0
+}
+
+// resolveSafeGitBinary resolves the git executable safely, ensuring that it is
+// not located inside the specified workspace directory (to prevent cwd binary hijacking).
+func resolveSafeGitBinary(workspace string) (string, error) {
+	cleanWS := filepath.Clean(workspace)
+	if realWS, err := filepath.EvalSymlinks(cleanWS); err == nil {
+		cleanWS = realWS
+	}
+
+	pathEnv := os.Getenv("PATH")
+	var cleanEntries []string
+	for _, entry := range filepath.SplitList(pathEnv) {
+		if entry == "" || !filepath.IsAbs(entry) {
+			continue
+		}
+		entryClean := filepath.Clean(entry)
+		if realEntry, err := filepath.EvalSymlinks(entryClean); err == nil {
+			entryClean = realEntry
+		}
+		if workspace != "" && isInsideDir(entryClean, cleanWS) {
+			continue
+		}
+		cleanEntries = append(cleanEntries, entry)
+	}
+
+	var found string
+	for _, dir := range cleanEntries {
+		candidate := filepath.Join(dir, "git")
+		if runtime.GOOS == "windows" {
+			for _, ext := range []string{".exe", ".cmd", ".bat"} {
+				target := candidate + ext
+				if isExecutable(target) {
+					found = target
+					break
+				}
+			}
+			if found == "" && isExecutable(candidate) {
+				found = candidate
+			}
+		} else if isExecutable(candidate) {
+			found = candidate
+			break
+		}
+		if found != "" {
+			break
+		}
+	}
+
+	if found == "" {
+		if rawFound, err := exec.LookPath("git"); err == nil {
+			rawClean := filepath.Clean(rawFound)
+			if realRaw, err := filepath.EvalSymlinks(rawClean); err == nil {
+				rawClean = realRaw
+			}
+			if workspace != "" && isInsideDir(rawClean, cleanWS) {
+				return "", fmt.Errorf("refusing to execute git binary found inside workspace cwd: %s", rawFound)
+			}
+		}
+		return "", fmt.Errorf("safe git binary not found in PATH")
+	}
+
+	foundClean := filepath.Clean(found)
+	if realFound, err := filepath.EvalSymlinks(foundClean); err == nil {
+		foundClean = realFound
+	}
+	if workspace != "" && isInsideDir(foundClean, cleanWS) {
+		return "", fmt.Errorf("refusing to execute git binary found inside workspace cwd: %s", found)
+	}
+
+	return foundClean, nil
+}
+
+func safeGitCmd(workspace string, args ...string) (*exec.Cmd, error) {
+	gitBin, err := resolveSafeGitBinary(workspace)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(gitBin, args...)
+	cmd.Dir = workspace
+	env := os.Environ()
+	hasNoDefault := false
+	for _, e := range env {
+		if strings.HasPrefix(strings.ToLower(e), "nodefaultcurrentdirectoryinexepath=") {
+			hasNoDefault = true
+			break
+		}
+	}
+	if !hasNoDefault {
+		env = append(env, "NoDefaultCurrentDirectoryInExePath=1")
+	}
+	cmd.Env = env
+	return cmd, nil
 }

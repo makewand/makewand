@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/makewand/makewand/internal/trustedbin"
 )
 
 var (
-	previewLookPath      = exec.LookPath
+	previewLookPath      = trustedbin.LookPath
 	previewGOOS          = runtime.GOOS
 	previewUserHome      = os.UserHomeDir
 	previewGetenv        = os.Getenv
@@ -80,7 +82,13 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 
 	layout := buildSandboxHomeLayout(previewHome(), projectPath, pathEnv, previewGetenv)
 
-	wrapped := []string{
+	socketMasks, err := sandboxWorkspaceSocketMasks(projectPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("project script preview: %w", err)
+	}
+
+	// `--seccomp 3` (when applicable) leads the argv; StartPreview attaches it.
+	wrapped := append(sandboxSeccompArgs(),
 		"--die-with-parent",
 		"--new-session",
 		"--unshare-pid",
@@ -97,7 +105,7 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		// S05 defense: Mask system Unix domain sockets and host IPC runtimes
 		"--tmpfs", "/var/tmp",
 		"--tmpfs", "/run",
-	}
+	)
 	// Hide sensitive host roots (/root, /mnt, /media, /srv) before project bind.
 	wrapped = append(wrapped, sandboxMaskedRoots(projectPath)...)
 	// Hide the host HOME (re-binding only toolchains, read-only) before the
@@ -109,7 +117,7 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		wrapped = append(wrapped, "--ro-bind", gitDir, gitDir)
 	}
 	// Mask existing domain sockets in project with /dev/null (must come after .git bind to prevent shadowing)
-	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(projectPath)...)
+	wrapped = append(wrapped, socketMasks...)
 	wrapped = append(wrapped,
 		"--chdir", projectPath,
 		"--clearenv",

@@ -176,14 +176,13 @@ func (s *SQLiteStore) CreateProject(project Project) (*Project, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.GetOrganization(project.OrganizationID); err != nil {
-		return nil, fmt.Errorf("organization %q not found", project.OrganizationID)
-	}
-	_, err = s.db.Exec(`
+	// The organization existence check and the insert are a single statement so
+	// they cannot interleave with another connection's writes.
+	result, err := s.db.Exec(`
 INSERT INTO projects (id, organization_id, name, slug, description, monthly_budget_usd, created_at, updated_at, is_active)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+SELECT ?, o.id, ?, ?, ?, ?, ?, ?, ?
+FROM organizations o WHERE o.id = ?`,
 		project.ID,
-		project.OrganizationID,
 		project.Name,
 		project.Slug,
 		project.Description,
@@ -191,9 +190,15 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		project.CreatedAt.Format(time.RFC3339Nano),
 		project.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(project.IsActive),
+		project.OrganizationID,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return nil, err
+	} else if affected == 0 {
+		return nil, fmt.Errorf("organization %q not found", project.OrganizationID)
 	}
 	return &project, nil
 }
@@ -243,25 +248,30 @@ func (s *SQLiteStore) UpsertOrganizationMembership(membership OrganizationMember
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.GetOrganization(membership.OrganizationID); err != nil {
-		return nil, fmt.Errorf("organization %q not found", membership.OrganizationID)
-	}
-	_, err = s.db.Exec(`
+	// Existence check + upsert in one statement (SQLite requires a WHERE on an
+	// INSERT ... SELECT used with ON CONFLICT to disambiguate the parse).
+	result, err := s.db.Exec(`
 INSERT INTO organization_memberships (organization_id, user_id, role, created_at, updated_at, is_active)
-VALUES (?, ?, ?, ?, ?, ?)
+SELECT o.id, ?, ?, ?, ?, ?
+FROM organizations o WHERE o.id = ?
 ON CONFLICT(organization_id, user_id) DO UPDATE SET
   role = excluded.role,
   updated_at = excluded.updated_at,
   is_active = excluded.is_active`,
-		membership.OrganizationID,
 		membership.UserID,
 		membership.Role,
 		membership.CreatedAt.Format(time.RFC3339Nano),
 		membership.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(membership.IsActive),
+		membership.OrganizationID,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return nil, err
+	} else if affected == 0 {
+		return nil, fmt.Errorf("organization %q not found", membership.OrganizationID)
 	}
 	return s.GetOrganizationMembership(membership.OrganizationID, membership.UserID)
 }
@@ -317,34 +327,39 @@ func (s *SQLiteStore) UpsertProjectMembership(membership ProjectMembership) (*Pr
 	if err != nil {
 		return nil, err
 	}
-	project, err := s.GetProject(membership.ProjectID)
-	if err != nil {
-		return nil, fmt.Errorf("project %q not found", membership.ProjectID)
-	}
-	if membership.OrganizationID == "" {
-		membership.OrganizationID = project.OrganizationID
-	}
-	if membership.OrganizationID != project.OrganizationID {
-		return nil, fmt.Errorf("project %q belongs to organization %q", membership.ProjectID, project.OrganizationID)
-	}
-	_, err = s.db.Exec(`
+	// The project lookup, organization ownership check and upsert run as one
+	// statement; the organization is taken from the project row itself so a
+	// concurrent change cannot produce a membership with a mismatched org.
+	result, err := s.db.Exec(`
 INSERT INTO project_memberships (project_id, organization_id, user_id, role, created_at, updated_at, is_active)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+SELECT p.id, p.organization_id, ?, ?, ?, ?, ?
+FROM projects p WHERE p.id = ? AND (? = '' OR p.organization_id = ?)
 ON CONFLICT(project_id, user_id) DO UPDATE SET
   organization_id = excluded.organization_id,
   role = excluded.role,
   updated_at = excluded.updated_at,
   is_active = excluded.is_active`,
-		membership.ProjectID,
-		membership.OrganizationID,
 		membership.UserID,
 		membership.Role,
 		membership.CreatedAt.Format(time.RFC3339Nano),
 		membership.UpdatedAt.Format(time.RFC3339Nano),
 		boolToInt(membership.IsActive),
+		membership.ProjectID,
+		membership.OrganizationID,
+		membership.OrganizationID,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return nil, err
+	} else if affected == 0 {
+		// Nothing was written; classify the rejection for the caller.
+		project, getErr := s.GetProject(membership.ProjectID)
+		if getErr != nil {
+			return nil, fmt.Errorf("project %q not found", membership.ProjectID)
+		}
+		return nil, fmt.Errorf("project %q belongs to organization %q", membership.ProjectID, project.OrganizationID)
 	}
 	return s.GetProjectMembership(membership.ProjectID, membership.UserID)
 }

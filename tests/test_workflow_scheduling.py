@@ -181,6 +181,14 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(dispatch.call_count, 1)
         self.assertIs(json.loads(output.getvalue())["pass"], False)
 
+    def test_readonly_review_known_failure_tries_next_provider(self):
+        # e.g. agy rejecting its arguments before running: outcome known, nothing executed.
+        rejected = ExecutionResult(False, "", "Antigravity 拒绝调用参数: invalid model selection", status="FAILED",
+                                   engine="agy", readonly=True, outcome_known=True, error_kind="provider_configuration")
+        with patch.object(orch, "get_git_diff", return_value="changed"), patch.object(orch, "get_or_update_status", return_value={}), patch.object(orch, "_engine_usable", return_value=(True, "")), patch.object(orch, "dispatch_task", side_effect=[rejected, (True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None)]) as dispatch, contextlib.redirect_stdout(io.StringIO()):
+            orch.run_review(cwd=str(self.repo), output_json=True)
+        self.assertEqual(dispatch.call_count, 2)
+
     def test_unknown_verdict_followup_stays_unknown_and_stops(self):
         unknown = ExecutionResult(False, None, "outcome unavailable", status="UNKNOWN", outcome_known=False)
         with patch.object(orch, "get_git_diff", return_value="changed"), patch.object(orch, "get_or_update_status", return_value={}), patch.object(orch, "_engine_usable", return_value=(True, "")), patch.object(orch, "dispatch_task", side_effect=[(True, "Looks good", None), unknown]) as dispatch, contextlib.redirect_stdout(io.StringIO()) as output:

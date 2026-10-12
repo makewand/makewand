@@ -78,9 +78,7 @@ def execute_grok_task(
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
-        wrap_bwrap,
         verify_writable_sandbox_or_authorized,
-        audit_unsafe_host_exec,
     )
     from makewand.git_helper import find_git_root
 
@@ -148,35 +146,43 @@ def execute_grok_task(
         if cwd:
             cmd.extend(["--cwd", str(cwd)])
 
-        from makewand.discovery import get_provider_model_tier
+        from makewand.discovery import get_provider_model_tier, normalize_provider_effort
         resolved = get_provider_model_tier("grok", tier)
         target_model = model or resolved["model"]
         cmd.extend(["--model", target_model])
-        target_effort = effort or resolved.get("effort")
+        target_effort = normalize_provider_effort("grok", effort or resolved.get("effort"))
         if target_effort and target_effort != "none":
             cmd.extend(["--reasoning-effort", target_effort])
 
-        if is_bwrap_available():
-            cmd = wrap_bwrap(cmd, workspace=cwd, allow_network=allow_network, readonly=readonly, repo_root=repo_root, is_provider=True, provider_name="grok", extra_ro_binds=[p_file] if p_file else None)
-        elif repo_trust == "untrusted":
-            return False, None, "不可信仓库 (--repo-trust=untrusted) 强制要求 Bubblewrap 物理沙箱隔离，未检测到 bwrap，拒绝执行"
-        elif not readonly:
-            audit_unsafe_host_exec("provider:grok", cmd, cwd, host_auth_source)
-
-        log_desc = "只读解析/审查任务 (Plan 模式)" if readonly else "代码任务 (自动审批执行)"
-        import sys
-        print(c(f"[Makewand -> Grok] 派发{log_desc} (Tier: {tier}, xAI Provider)...", COLOR_YELLOW), file=sys.stderr)
+        from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError
         from makewand.execution_runtime import mark_provider_invocation
-        from makewand.sandbox import sandbox_lifecycle
-        mark_provider_invocation()
-        with sandbox_lifecycle(is_provider=True, provider_name="grok", cmd=cmd, readonly=readonly):
-            code, out, err, ex = run_subprocess(
-                cmd,
-                timeout=timeout,
-                cwd=cwd,
-                stream=stream,
-                print_prefix=c("[Grok Live]", COLOR_YELLOW)
-            )
+        try:
+            with provider_sandbox_launch(
+                "grok", cmd, cwd,
+                readonly=readonly,
+                repo_root=repo_root,
+                repo_trust=repo_trust,
+                allow_network=allow_network,
+                extra_ro_binds=[p_file] if p_file else None,
+                host_auth_source=host_auth_source,
+            ) as launch:
+                log_desc = "只读解析/审查任务 (Plan 模式)" if readonly else "代码任务 (自动审批执行)"
+                import sys
+                print(c(f"[Makewand -> Grok] 派发{log_desc} (Tier: {tier}, xAI Provider)...", COLOR_YELLOW), file=sys.stderr)
+                mark_provider_invocation()
+                code, out, err, ex = run_subprocess(
+                    launch.cmd,
+                    timeout=timeout,
+                    cwd=cwd,
+                    stream=stream,
+                    print_prefix=c("[Grok Live]", COLOR_YELLOW),
+                    pass_fds=launch.pass_fds,
+                    extra_env=launch.env,
+                )
+        except SandboxUnavailableError as exc:
+            return False, None, str(exc)
+        except SandboxConfigError as exc:
+            return False, None, f"Grok 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     finally:
         if p_file and os.path.exists(p_file):
             try:

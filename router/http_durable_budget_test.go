@@ -74,19 +74,21 @@ func TestHTTPDurableUnknownCostCannotBeRefunded(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					provider := &billedFailureProvider{stubProvider: stubProvider{name: "claude", available: true}, failure: tc.failure}
+					// "custom" has no priced models, so the reservation is exactly the
+					// configured floor; priced scaling is covered in http_reservation_test.go.
+					provider := &billedFailureProvider{stubProvider: stubProvider{name: "custom", available: true}, failure: tc.failure}
 					ctx := context.Background()
 					if tc.corrupt {
 						var path string
 						ctx, path = budgetTestContext(t, 2)
 						provider.before = func() error { return os.WriteFile(path, []byte("injected corrupt completion ledger"), 0o600) }
 					}
-					r := mustNewRouter(RouterConfig{Providers: map[string]ProviderEntry{"claude": {Provider: provider, Access: AccessAPI}}, DefaultModel: "claude"})
+					r := mustNewRouter(RouterConfig{Providers: map[string]ProviderEntry{"custom": {Provider: provider, Access: AccessAPI}}, DefaultModel: "custom"})
 					handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: auth, UsageLogger: store, UsageReader: store, BudgetReserver: store, BudgetReservationUSD: .01, StrictAccounting: true})
 					invoke := func() int {
-						payload := fmt.Sprintf(`{"model":"claude","messages":[{"role":"user","content":"hi"}],"stream":%t}`, streaming)
+						payload := fmt.Sprintf(`{"model":"custom","messages":[{"role":"user","content":"hi"}],"stream":%t}`, streaming)
 						if endpoint == "/v1/responses" {
-							payload = fmt.Sprintf(`{"model":"claude","input":"hi","stream":%t}`, streaming)
+							payload = fmt.Sprintf(`{"model":"custom","input":"hi","stream":%t}`, streaming)
 						}
 						request := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewBufferString(payload))
 						request = request.WithContext(ctx)

@@ -9,6 +9,33 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+修复 2026-10-10 安全审计的全部未闭环项（Python 与 Go 两个引擎）：
+
+- **启动器完整性**：`bwrap`、`systemd-run`、`prlimit` 只从 root 拥有、不可写的系统目录解析，不再经 `$PATH`（仓库内的 `.venv/bin`、`node_modules/.bin` 无法再冒充 bwrap）。
+- **私有 provider 家目录**：宿主 `~/.claude`、`~/.codex`、`~/.gemini` 等不再可写挂载；每次调用使用私有副本，只把变化的凭据文件经校验后写回。
+- **无沙箱时一律需要确认**：没有 bwrap 时，只读审查也需要 `MAKEWAND_UNSAFE_HOST_EXEC=1` 加确认并写入审计日志（Python 与 Go 一致）。
+- **seccomp 默认强制**，Go 的 engine 启动器也已接入；Go 沙箱内 `.git` 元数据只读；工作区内的 Unix 套接字（含 `node_modules` 下）全部屏蔽；扫描不完整时可写会话 fail-closed。
+- **应用与审查完整性**：候选应用改用 `renameat2` 交换/不覆盖，并发保存不再被覆盖；审查的 diff 原样传入并与交付绑定 sha256；AST 合并拒绝冲突的 import 绑定；交付指纹覆盖 `.makewand_*` 与依赖目录；任务产生的 `__pycache__`/`.pyc` 不再进入交付补丁。
+- **计费与服务端**：组合调用计入失败尝试的花费；可选开启 `MAKEWAND_SCALED_BUDGET_RESERVATION=1`，让 HTTP 预算预留按定价、输出上限和扇出放大，并在流式输出超出预留时停止（默认仍为固定预留）；SSE 事件总量有上限；SQLite 默认 `synchronous=FULL` 与 `_txlock=immediate`。
+
+### Added
+
+- 递归保护：makewand 启动的 provider CLI 带 `MAKEWAND_PROVIDER_WORKER=1`，在其中再调用会派发模型的 makewand 命令会被拒绝。
+- 新环境变量：`MAKEWAND_BWRAP_PATH`（非系统目录安装的 bwrap）、`MAKEWAND_ALLOW_NO_SECCOMP=1`（显式关闭 seccomp）、`MAKEWAND_SANDBOX_MEMORY_MAX`（默认 `8G`）、`MAKEWAND_SANDBOX_TASKS_MAX`（默认 `512`）、`MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT`（工作区扫描上限，默认 1,000,000）、`MAKEWAND_SQLITE_SYNCHRONOUS`（`FULL`/`EXTRA`/`NORMAL`）、`MAKEWAND_SCALED_BUDGET_RESERVATION=1`（`makewand serve` 按定价放大预算预留）。
+
+### Changed
+
+- 行为变化：拒绝以 `/`、`/tmp`、`/home`、系统根目录、`$HOME` 或其上级目录作为可写工作区；provider 的会话历史不再持久化到宿主；Go 沙箱内的 agent 不能再修改 `.git`。
+- 重写 agent skill `makewand-orchestrator`：按 CLI 实际行为说明命令、退出码 0–17、影子工作树交付与递归规则，收紧触发条件。
+
+### Fixed
+
+- agy：启动时的 glog 行 "not logged into Antigravity" 不再被误判为需要重新登录（此前 agy 任意一次失败后都会被停用 30 分钟）；深度档不再传 agy 不支持的 `--effort max`；参数被拒按"结果已知的失败"处理，审查会换下一个审查方。
+- 无沙箱的宿主路径改用环境变量传递 provider 标记，Windows 上不再依赖不存在的 `env` 命令。
+- 3.2.0 的说明中网络隔离开关应为 `MAKEWAND_SANDBOX_UNSHARE_NET=1`（并无 `MAKEWAND_DISABLE_UNSHARE_NET`）。
+
 ## [3.2.0] - 2026-10-09
 
 ### Security & Hardening

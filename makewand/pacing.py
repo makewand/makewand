@@ -169,8 +169,12 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str], updated_at: O
         except Exception:
             pass
 
-    # Pattern 3: Month-day date support (e.g. "Sep 27th, 2026 10:58 AM", "Oct 3 at 2pm")
-    date_match = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,\s*(\d{4}))?(?:\s+at\s+|\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s, re.IGNORECASE)
+    # Pattern 3: Month-day date support (e.g. "Sep 27th, 2026 10:58 AM", "Oct 3 at 2pm", "Oct 11, 8pm")
+    date_match = re.search(
+        r"([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,\s*(\d{4}))?(?:,\s*|\s+at\s+|\s+)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+        s,
+        re.IGNORECASE,
+    )
     if date_match:
         try:
             month_str = date_match.group(1).capitalize()[:3]
@@ -187,6 +191,8 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str], updated_at: O
             if month_str in months:
                 month_val = months.index(month_str) + 1
                 reset_dt = datetime(year_val, month_val, day_val, hour_val, min_val)
+                if not date_match.group(3) and reset_dt < now:
+                    reset_dt = datetime(year_val + 1, month_val, day_val, hour_val, min_val)
                 diff = (reset_dt - now).total_seconds()
                 return max(0.0, diff)
         except Exception:

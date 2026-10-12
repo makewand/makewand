@@ -44,15 +44,17 @@ def line_level_3way_merge(
         f_a.write_text(text_a, encoding="utf-8", errors="replace")
         f_b.write_text(text_b, encoding="utf-8", errors="replace")
 
-        cmd = [
-            "git", "merge-file", "-p",
-            "-L", label_a,
-            "-L", label_base,
-            "-L", label_b,
-            str(f_a), str(f_base), str(f_b)
-        ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            from makewand.git_helper import resolve_safe_git_binary, _sanitize_git_env
+            git_bin = resolve_safe_git_binary(cwd=tmp_path)
+            cmd = [
+                git_bin, "merge-file", "-p",
+                "-L", label_a,
+                "-L", label_base,
+                "-L", label_b,
+                str(f_a), str(f_base), str(f_b)
+            ]
+            res = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, timeout=10, env=_sanitize_git_env())
             merged_out = res.stdout
             has_conflict_markers = "<<<<<<<" in merged_out and "=======" in merged_out
             if res.returncode == 0 and not has_conflict_markers:
@@ -214,6 +216,43 @@ def _merge_disjoint_text(base_code: str, code_a: str, code_b: str):
     return True, "".join(result)
 
 
+def _import_binding_conflicts(source_code: str) -> Dict[str, set]:
+    """Top-level names bound by imports to more than one distinct source."""
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return {}
+    bindings: Dict[str, set] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    bindings.setdefault(alias.asname, set()).add("import " + alias.name)
+                else:
+                    top = alias.name.split(".", 1)[0]
+                    bindings.setdefault(top, set()).add("import " + top)
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * (node.level or 0) + (node.module or "")
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                bindings.setdefault(alias.asname or alias.name, set()).add(f"from {module} import {alias.name}")
+    return {name: sources for name, sources in bindings.items() if len(sources) > 1}
+
+
+def _merge_introduces_import_conflict(merged: str, code_a: str, code_b: str) -> bool:
+    """True when the merge binds one name to two imports that neither side did alone."""
+    merged_conflicts = _import_binding_conflicts(merged)
+    if not merged_conflicts:
+        return False
+    conflicts_a = _import_binding_conflicts(code_a)
+    conflicts_b = _import_binding_conflicts(code_b)
+    for name, sources in merged_conflicts.items():
+        if not (sources <= conflicts_a.get(name, set()) or sources <= conflicts_b.get(name, set())):
+            return True
+    return False
+
+
 def ast_merge_python_file(base_code: str, code_a: str, code_b: str) -> Tuple[bool, str, str]:
     """Use a complete text three-way merge, with conservative AST assistance."""
     if code_a == code_b:
@@ -249,6 +288,10 @@ def ast_merge_python_file(base_code: str, code_a: str, code_b: str) -> Tuple[boo
             ast.parse(merged)
         except SyntaxError:
             return False, merged, "conflict"
+        # e.g. "import json as codec" + "import pickle as codec": textually
+        # disjoint, but the later import silently wins the binding.
+        if _merge_introduces_import_conflict(merged, code_a, code_b):
+            return False, merged, "import_binding_conflict"
     return ok, merged, strategy
 
 

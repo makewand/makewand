@@ -392,6 +392,13 @@ func Restore(archivePath string, opts Options) (*Manifest, error) {
 // stageBeside copies src into a new uniquely named temporary file in dst's
 // directory (so the final rename stays on one filesystem) and returns its path.
 func stageBeside(src, dst string) (string, error) {
+	return stageBesideMode(src, dst, 0o600)
+}
+
+// stageBesideMode is stageBeside with an explicit mode. The mode is applied
+// before fsync so content and permissions are durable together; callers then
+// fsync the parent directory before any journal references the new name.
+func stageBesideMode(src, dst string, mode os.FileMode) (string, error) {
 	out, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".restore-*")
 	if err != nil {
 		return "", err
@@ -405,15 +412,17 @@ func stageBeside(src, dst string) (string, error) {
 	}
 	_, copyErr := io.Copy(out, in)
 	in.Close()
-	syncErr := out.Sync()
+	var chmodErr, syncErr error
+	if copyErr == nil {
+		chmodErr = out.Chmod(mode.Perm())
+	}
+	if copyErr == nil && chmodErr == nil {
+		syncErr = out.Sync()
+	}
 	closeErr := out.Close()
-	if err := errors.Join(copyErr, syncErr, closeErr); err != nil {
+	if err := errors.Join(copyErr, chmodErr, syncErr, closeErr); err != nil {
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("stage %s: %w", dst, err)
-	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		_ = os.Remove(tmp)
-		return "", err
 	}
 	return tmp, nil
 }

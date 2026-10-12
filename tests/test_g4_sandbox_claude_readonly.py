@@ -46,11 +46,30 @@ class TestClaudeReadonlyFlags(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
         shutil.rmtree(self.ws, ignore_errors=True)
 
+    LIMIT_PREFIX = ["/usr/bin/systemd-run", "--user", "--scope", "--"]
+
     def _cmd(self, readonly, bwrap):
-        with patch("makewand.sandbox.is_bwrap_available", return_value=bwrap):
+        # bwrap=False: the host run is only allowed with the recorded
+        # MAKEWAND_UNSAFE_HOST_EXEC authorization (H1), read-only included.
+        self.audit = None
+        with patch("makewand.sandbox.is_bwrap_available", return_value=bwrap), \
+             patch("makewand.sandbox.resolve_trusted_bwrap", return_value="/usr/bin/bwrap"), \
+             patch("makewand.sandbox.sandbox_resource_limit_prefix", return_value=list(self.LIMIT_PREFIX)), \
+             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+             patch("makewand.sandbox.audit_unsafe_host_exec") as audit:
             ok, out, err = execute_claude_task("review this", cwd=self.ws, readonly=readonly)
+            self.audit = audit
         self.assertTrue(ok, err)
         return list(self.run_mock.call_args[0][0])
+
+    def _assert_bwrap_after_limits(self, cmd):
+        # resource-limit launcher first, then the trusted bwrap
+        self.assertEqual(cmd[:len(self.LIMIT_PREFIX)], self.LIMIT_PREFIX)
+        self.assertEqual(cmd[len(self.LIMIT_PREFIX)], "/usr/bin/bwrap")
+        self.assertIn("--seccomp", cmd)
+        i = cmd.index("MAKEWAND_PROVIDER_WORKER")
+        self.assertEqual(cmd[i - 1:i + 2], ["--setenv", "MAKEWAND_PROVIDER_WORKER", "1"])
+        self.audit.assert_not_called()
 
     def _assert_readonly_flags(self, cmd):
         self.assertNotIn("--dangerously-skip-permissions", cmd)
@@ -66,14 +85,28 @@ class TestClaudeReadonlyFlags(unittest.TestCase):
 
     def test_readonly_task_never_bypasses_permissions_inside_bwrap(self):
         cmd = self._cmd(readonly=True, bwrap=True)
-        self.assertEqual(os.path.basename(cmd[0]), "bwrap")
+        self._assert_bwrap_after_limits(cmd)
         self._assert_readonly_flags(cmd)
 
     def test_readonly_task_without_bwrap_is_still_tool_restricted(self):
-        # trusted + no bwrap runs the CLI on the host: the tool restriction is the only guard
+        # authorized host run (no bwrap): the tool restriction is the only guard,
+        # the launch is audited and marked as a provider worker
         cmd = self._cmd(readonly=True, bwrap=False)
         self.assertEqual(cmd[0], "claude")
+        self.assertEqual(self.run_mock.call_args[1].get("extra_env"), {"MAKEWAND_PROVIDER_WORKER": "1"})
         self._assert_readonly_flags(cmd)
+        self.audit.assert_called_once()
+        self.assertEqual(self.audit.call_args[0][3], "config-ack")
+
+    def test_readonly_task_without_bwrap_or_authorization_is_refused(self):
+        with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(False, None)), \
+             patch("makewand.sandbox.audit_unsafe_host_exec") as audit:
+            ok, out, err = execute_claude_task("review this", cwd=self.ws, readonly=True)
+        self.assertFalse(ok)
+        self.assertIn("沙箱", err)
+        self.run_mock.assert_not_called()
+        audit.assert_not_called()
 
     def test_variadic_tool_flags_are_not_followed_by_positional_prompt(self):
         cmd = self._cmd(readonly=True, bwrap=False)
@@ -85,7 +118,7 @@ class TestClaudeReadonlyFlags(unittest.TestCase):
 
     def test_writable_task_keeps_bypass_only_inside_bwrap(self):
         cmd = self._cmd(readonly=False, bwrap=True)
-        self.assertEqual(os.path.basename(cmd[0]), "bwrap")
+        self._assert_bwrap_after_limits(cmd)
         self.assertIn("--dangerously-skip-permissions", cmd)
         self.assertNotIn("--tools", cmd)
 

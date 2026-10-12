@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from makewand.sandbox import _provider_mounts, wrap_bwrap, SandboxConfigError
+from makewand.sandbox import _provider_mounts, wrap_bwrap, SandboxConfigError, ProviderHome
 
 
 class CodexHomeTests(unittest.TestCase):
@@ -19,14 +19,35 @@ class CodexHomeTests(unittest.TestCase):
             default, selected = home / ".codex", home / ".codex-2"
             default.mkdir(parents=True)
             selected.mkdir()
+            (default / "auth.json").write_text('{"account": "default"}')
+            (selected / "auth.json").write_text('{"account": "selected"}')
+            for name in ("config.toml", "AGENTS.md"):
+                (selected / name).write_text("x\n")
+            for name in ("hooks", "skills"):
+                (selected / name).mkdir()
             with patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
-                args, roots, skips = _provider_mounts("codex", str(home), False, [str(Path(directory) / "project")])
-            self.assertEqual(roots, [str(selected)])
-            self.assertNotIn(str(default), args)
-            for protected in ("config.toml", "AGENTS.md", "hooks", "skills"):
-                target = str(selected / protected)
-                index = args.index(target)
-                self.assertEqual(args[index - 1], "--ro-bind")
+                home_obj = ProviderHome("codex", str(home))
+                try:
+                    args = home_obj.materialize([str(Path(directory) / "project")])
+                    roots = list(home_obj.state_roots)
+                    self.assertEqual(roots, [os.path.realpath(selected)])
+                    self.assertNotIn(str(default), args)
+                    # the selected account root is backed by a private 0700 copy, never bound itself
+                    index = args.index(str(selected))
+                    self.assertEqual(args[index - 2], "--bind")
+                    private_root = args[index - 1]
+                    self.assertTrue(private_root.startswith(home_obj.private_dir + os.sep))
+                    self.assertEqual(os.stat(home_obj.private_dir).st_mode & 0o777, 0o700)
+                    self.assertNotIn(("--bind", str(selected)), list(zip(args, args[1:])))
+                    # only the selected account's credential was copied
+                    self.assertEqual(Path(private_root, "auth.json").read_text(), '{"account": "selected"}')
+                    for protected in ("config.toml", "AGENTS.md", "hooks", "skills"):
+                        target = str(selected / protected)
+                        index = args.index(target)
+                        self.assertEqual(args[index - 1:index + 2], ["--ro-bind", target, target])
+                finally:
+                    home_obj.finalize(write_back=False)
+            self.assertFalse(os.path.exists(home_obj.private_dir or private_root))
 
     def test_selected_home_environment_is_preserved_only_for_codex(self):
         with tempfile.TemporaryDirectory() as directory:

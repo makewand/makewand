@@ -409,9 +409,10 @@ class TestSandbox(unittest.TestCase):
             self.assertNotIn(".codex", p)
 
     def test_sandbox_codex_readonly_mode_state_root_mounted_ro(self):
-        """Regression test for [P1] codex-ro-erofs: in readonly=True mode,
-        provider state root must be mounted with isolated tmpfs and host config
-        mounted read-only, allowing SQLite WAL writes while protecting host files."""
+        """Regression test for [P1] codex-ro-erofs + H3: in readonly=True mode the
+        provider state root is a private per-run directory (never the host root),
+        host config is mounted read-only, SQLite WAL writes work and nothing but
+        the allowlisted credential reaches the host."""
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_home = Path(tmpdir) / "home"
@@ -426,29 +427,33 @@ class TestSandbox(unittest.TestCase):
 
             with patch.dict(os.environ, {"HOME": str(fake_home)}):
                 os.environ.pop("CODEX_HOME", None)
-                # 1. wrap_bwrap in readonly mode must mount .codex with --tmpfs
+                config_path = str(fake_codex / "config.toml")
+                # 1. .codex is backed by a private directory; the host root is never bound
                 cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), readonly=True, is_provider=True, provider_name="codex")
-                tmpfs_indices = [i for i, x in enumerate(cmd) if x == "--tmpfs"]
-                tmpfs_targets = [cmd[i + 1] for i in tmpfs_indices if i + 1 < len(cmd)]
-                self.assertIn(str(fake_codex), tmpfs_targets)
-
-                # Essential auth/config files are mounted --ro-bind
-                ro_bind_indices = [i for i, x in enumerate(cmd) if x == "--ro-bind"]
-                ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in ro_bind_indices if i + 2 < len(cmd)]
-                self.assertIn((auth_path, auth_path), ro_bind_pairs)
+                bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i, x in enumerate(cmd[:-2]) if x == "--bind"]
+                ro_bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i, x in enumerate(cmd[:-2]) if x == "--ro-bind"]
+                private_sources = [src for src, dst in bind_pairs if dst == str(fake_codex)]
+                self.assertEqual(len(private_sources), 1)
+                self.assertIn("provider-homes", private_sources[0])
+                self.assertFalse(any(src == str(fake_codex) or src.startswith(str(fake_codex) + os.sep)
+                                     for src, _ in bind_pairs))
+                # config is a read-only bind of the host original; auth.json is a private copy
+                self.assertIn((config_path, config_path), ro_bind_pairs)
+                self.assertNotIn(auth_path, [src for src, _ in ro_bind_pairs + bind_pairs])
+                self.assertEqual(Path(private_sources[0], "auth.json").read_text(encoding="utf-8"), '{"token": "test"}')
 
                 # 2. Inside the sandbox:
-                # A. Host auth.json must be read-only (fails with EROFS)
-                ret_auth, _, err_auth, _ = run_in_sandbox(
-                    ["python3", "-c", f"open({auth_path!r}, 'w').write('malicious')"],
+                # A. Host config.toml must be read-only (fails with EROFS)
+                ret_cfg, _, err_cfg, _ = run_in_sandbox(
+                    ["python3", "-c", f"open({config_path!r}, 'w').write('malicious')"],
                     workspace=str(ws),
                     readonly=True,
                     is_provider=True,
                     provider_name="codex",
                 )
-                self.assertNotEqual(ret_auth, 0)
-                self.assertIn("Read-only file system", err_auth)
-                self.assertEqual((fake_codex / "auth.json").read_text(encoding="utf-8"), '{"token": "test"}')
+                self.assertNotEqual(ret_cfg, 0)
+                self.assertIn("Read-only file system", err_cfg)
+                self.assertEqual((fake_codex / "config.toml").read_text(encoding="utf-8"), 'model = "test"')
 
                 # B. SQLite WAL creation inside .codex must succeed without os error 30
                 db_script = f"""
@@ -468,6 +473,8 @@ conn.close()
                     provider_name="codex",
                 )
                 self.assertEqual(ret_wal, 0, f"SQLite WAL in readonly sandbox failed: {err_wal}")
+                # the database lived in the private home only
+                self.assertFalse((fake_codex / "state_5.sqlite").exists())
 
                 # C. Uncreated sensitive file in fake_codex does NOT poison the host
                 ret_over, _, _, _ = run_in_sandbox(
@@ -496,8 +503,12 @@ conn.close()
                 bind_indices = [i for i, x in enumerate(cmd) if x == "--bind"]
                 bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i in bind_indices if i + 2 < len(cmd)]
 
-                self.assertIn((str(fake_gemini), str(fake_gemini)), ro_bind_pairs)
-                self.assertNotIn((str(fake_gemini), str(fake_gemini)), bind_pairs)
+                # H3: the host state root is never bound (neither writable nor as a whole);
+                # a private per-run directory is bound at its path instead
+                self.assertNotIn(str(fake_gemini), [src for src, _ in bind_pairs + ro_bind_pairs])
+                private_sources = [src for src, dst in bind_pairs if dst == str(fake_gemini)]
+                self.assertEqual(len(private_sources), 1)
+                self.assertIn("provider-homes", private_sources[0])
 
     def test_sandbox_cleanup_does_not_delete_preexisting_files(self):
         """Regression test for [P1] commits-review-1: files that existed before sandbox execution must never be deleted."""
@@ -576,9 +587,15 @@ conn.close()
 
             with patch.dict(os.environ, {"HOME": str(fake_home), "CODEX_HOME": str(custom_codex)}):
                 cmd = wrap_bwrap(["codex", "exec"], workspace=str(ws), readonly=True, is_provider=True, provider_name="codex")
-                tmpfs_indices = [i for i, x in enumerate(cmd) if x == "--tmpfs"]
-                tmpfs_targets = [cmd[i + 1] for i in tmpfs_indices if i + 1 < len(cmd)]
-                self.assertIn(str(custom_codex), tmpfs_targets)
+                bind_pairs = [(cmd[i + 1], cmd[i + 2]) for i, x in enumerate(cmd[:-2]) if x == "--bind"]
+                # CODEX_HOME's account root gets the private per-run directory; the default
+                # ~/.codex and the host CODEX_HOME are never bound
+                private_sources = [src for src, dst in bind_pairs if dst == str(custom_codex)]
+                self.assertEqual(len(private_sources), 1)
+                self.assertIn("provider-homes", private_sources[0])
+                self.assertNotIn(str(custom_codex), [src for src, _ in bind_pairs])
+                self.assertNotIn(str(fake_home / ".codex"), cmd)
+                self.assertEqual(cmd[cmd.index("CODEX_HOME") + 1], str(custom_codex))
 
     def test_makewand_sandbox_unshare_net_env_override(self):
         """[P1] py-sec-1: MAKEWAND_SANDBOX_UNSHARE_NET=1 forces --unshare-net even when allow_network=True."""

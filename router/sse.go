@@ -18,9 +18,21 @@ func readSSE(ctx context.Context, r io.Reader, ch chan<- string) error {
 	return err
 }
 
+// maxSSELineBytes bounds a single SSE line; maxSSEEventBytes bounds the
+// aggregate data payload of one event, which may span many "data:" lines.
+// Without the aggregate bound a peer could stream an arbitrarily large event
+// made of individually-small lines and exhaust memory.
+const (
+	maxSSELineBytes  = 2 * 1024 * 1024
+	maxSSEEventBytes = 4 * 1024 * 1024
+)
+
+// errSSEEventTooLarge reports an SSE event whose aggregate data exceeds maxSSEEventBytes.
+var errSSEEventTooLarge = fmt.Errorf("SSE event exceeds %d bytes", maxSSEEventBytes)
+
 func readSSEState(ctx context.Context, r io.Reader, ch chan<- string) (bool, error) {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxSSELineBytes)
 	var dataBuilder strings.Builder
 
 	for scanner.Scan() {
@@ -53,10 +65,18 @@ func readSSEState(ctx context.Context, r io.Reader, ch chan<- string) (bool, err
 		}
 
 		if strings.HasPrefix(line, "data: ") {
+			payload := strings.TrimPrefix(line, "data: ")
+			sep := 0
 			if dataBuilder.Len() > 0 {
+				sep = 1
+			}
+			if dataBuilder.Len()+sep+len(payload) > maxSSEEventBytes {
+				return false, errSSEEventTooLarge
+			}
+			if sep == 1 {
 				dataBuilder.WriteByte('\n')
 			}
-			dataBuilder.WriteString(strings.TrimPrefix(line, "data: "))
+			dataBuilder.WriteString(payload)
 		}
 	}
 
@@ -117,19 +137,27 @@ func streamSSE(ctx context.Context, r io.Reader, handler SSEEventHandler, cleanu
 			case data, ok := <-dataCh:
 				if !ok {
 					result := <-resultCh
+					terminal := StreamChunk{Done: true}
 					if result.err != nil || !result.completed {
 						if result.err == nil {
 							result.err = fmt.Errorf("SSE stream ended before its completion marker")
 						}
-						ch <- StreamChunk{Done: true, Error: &execution.UnknownOutcomeError{Err: result.err}}
-					} else {
-						ch <- StreamChunk{Done: true}
+						terminal.Error = &execution.UnknownOutcomeError{Err: result.err}
+					}
+					// A consumer that stopped reading must not pin this
+					// goroutine (and the response body) after cancellation.
+					select {
+					case ch <- terminal:
+					case <-ctx.Done():
 					}
 					return
 				}
 				for _, chunk := range handler(data) {
 					if chunk.Done || chunk.Error != nil {
-						ch <- chunk
+						select {
+						case ch <- chunk:
+						case <-ctx.Done():
+						}
 						return
 					}
 					if chunk.Content != "" {

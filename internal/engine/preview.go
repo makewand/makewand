@@ -148,7 +148,16 @@ func (p *Project) StartPreview(ctx context.Context, allowProjectScripts bool) (*
 	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
 	server.cmd = cmd
 
-	cleanupProcess, err := processjob.Start(cmd)
+	closeSeccomp := func() {}
+	if kind != previewStatic {
+		// A bwrap argv led by `--seccomp 3` needs the filter descriptor.
+		if closeSeccomp, err = attachSandboxSeccomp(cmd, args); err != nil {
+			cancel()
+			return nil, fmt.Errorf("start preview server: %w", err)
+		}
+	}
+	cleanupProcess, err := processjob.StartSandboxed(cmd)
+	closeSeccomp()
 	if err != nil {
 		contextErr := ctx.Err()
 		cancel()

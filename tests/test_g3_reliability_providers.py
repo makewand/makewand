@@ -179,7 +179,9 @@ class TestMuseSandboxPassthrough(unittest.TestCase):
             self.assertTrue(mock_run.called)
             called_cmd = mock_run.call_args[0][0]
             # Verify systemd-run in muse.slice wraps bwrap
-            self.assertEqual(called_cmd[0], "systemd-run")
+            # systemd-run comes from a trusted system dir, never from $PATH
+            self.assertTrue(os.path.isabs(called_cmd[0]), called_cmd[0])
+            self.assertEqual(os.path.basename(called_cmd[0]), "systemd-run")
             self.assertIn("--slice=muse", called_cmd)
             self.assertIn("-p", called_cmd)
             self.assertIn("MemoryMax=16G", called_cmd)

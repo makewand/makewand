@@ -50,10 +50,27 @@ def temp_workspace():
         shutil.rmtree(ws, ignore_errors=True)
 
 
-def run_payload(provider, workspace, payload, readonly=False):
-    cmd = wrap_bwrap(["bash", "-c", payload], workspace=str(workspace), is_provider=True,
-                     provider_name=provider, readonly=readonly, allow_network=False)
-    return subprocess.run(cmd, cwd=str(workspace), capture_output=True, text=True, timeout=60)
+def run_payload(provider, workspace, payload, readonly=False, state_roots=()):
+    """Runs payload like provider_sandbox_launch does: one private provider home
+    per run (credentials copied in, changed credentials written back on exit)."""
+    with sandbox.provider_home_session(provider, [str(workspace)]) as home:
+        cmd = wrap_bwrap(["bash", "-c", payload], workspace=str(workspace), is_provider=True,
+                         provider_name=provider, readonly=readonly, allow_network=False,
+                         provider_home=home)
+        assert_private_state_binds(cmd, state_roots, home.private_dir)
+        res = subprocess.run(cmd, cwd=str(workspace), capture_output=True, text=True, timeout=60)
+    return res
+
+
+def assert_private_state_binds(cmd, state_roots, private_dir):
+    """H3: the host provider state root is never a writable --bind source; the
+    private per-run directory is bound at the provider's expected path."""
+    binds = mounts(cmd, "--bind")
+    for root in state_roots:
+        root = os.path.realpath(str(root))
+        assert all(src != root and not src.startswith(root + os.sep) for src, _ in binds), (root, binds)
+        sources = [src for src, dst in binds if dst == root]
+        assert len(sources) == 1 and private_dir and sources[0].startswith(private_dir + os.sep), (root, binds)
 
 
 def attempt(path_expr, label):
@@ -103,16 +120,19 @@ class TestClaudeStateDirectory(unittest.TestCase):
                 + attempt("echo s > ws_file", "workspace")
                 + "ls ~/.claude/shell-snapshots | wc -l | sed 's/^/SNAPSHOTS=/'\n"
             )
-            res = run_payload("claude", ws, payload)
+            res = run_payload("claude", ws, payload, state_roots=[c])
             out = res.stdout
             self.assertEqual(res.returncode, 0, res.stderr)
-            for label in ("CLAUDE.md", "commands", "plugins", "agents", "skills", "hooks", "chrome", "output-styles",
-                          "settings.json", "settings.local.json", ".claude.json", "memory"):
+            # existing host instruction/extension/config entries are read-only binds
+            for label in ("CLAUDE.md", "commands", "plugins", "agents", "skills", "hooks", "chrome",
+                          "settings.json", ".claude.json"):
                 self.assertIn(f"RO {label}", out, f"{label} must be read-only inside the sandbox\n{out}")
-            # session and credential state stay writable (user decision c)
-            for label in ("credentials", "session", "workspace"):
+            # missing protected paths, the session and credentials live in the
+            # private per-run home: writable inside, never persisted (except the
+            # allowlisted credential file, written back below)
+            for label in ("output-styles", "settings.local.json", "memory", "credentials", "session", "workspace"):
                 self.assertIn(f"W {label}", out, out)
-            # host-sessions' shell snapshots are hidden behind an empty tmpfs
+            # host-sessions' shell snapshots are absent from the private home
             self.assertIn("SNAPSHOTS=0", out)
 
             self.assertEqual((c / "CLAUDE.md").read_text(), "orig-global\n")
@@ -122,10 +142,12 @@ class TestClaudeStateDirectory(unittest.TestCase):
             self.assertEqual((c / "skills" / "x" / "SKILL.md").read_text(), "skill\n")
             self.assertEqual((c / "settings.json").read_text(), '{"model": "x"}\n')
             self.assertTrue((c / "shell-snapshots" / "snapshot-bash-host.sh").exists())
-            # missing protected paths became empty, harmless host placeholders
-            self.assertEqual(list((c / "output-styles").iterdir()), [])
-            self.assertEqual((c / "settings.local.json").read_text(), "{}\n")
-            self.assertEqual(list((c / "projects" / "-proj" / "memory").iterdir()), [])
+            # nothing created inside the private home reaches the host (no placeholders either)
+            self.assertFalse((c / "output-styles").exists())
+            self.assertFalse((c / "settings.local.json").exists())
+            self.assertFalse((c / "projects" / "-proj" / "memory").exists())
+            self.assertFalse((c / "projects" / "-proj" / "session.jsonl").exists())
+            # the allowlisted credential file is written back after the run
             self.assertEqual((c / ".credentials.json").read_text().strip(), '{"tok": "NEW"}')
 
     def test_readonly_task_mounts_whole_state_root_readonly_except_state(self):
@@ -140,16 +162,23 @@ class TestClaudeStateDirectory(unittest.TestCase):
                 + attempt("echo b > ~/.claude/backups/b.json", "backups")
                 + attempt("echo s > ws_file", "workspace")
             )
-            res = run_payload("claude", ws, payload, readonly=True)
+            res = run_payload("claude", ws, payload, readonly=True, state_roots=[c])
             out = res.stdout
             self.assertEqual(res.returncode, 0, res.stderr)
-            for label in ("new-file", "CLAUDE.md", "projects", "workspace"):
+            # instructions and the workspace are read-only; host state that is
+            # not allowlisted (projects, backups) is simply absent
+            for label in ("CLAUDE.md", "projects", "backups", "workspace"):
                 self.assertIn(f"RO {label}", out, out)
-            for label in ("credentials", "backups"):
+            # the private home itself is writable (CLI caches, token refresh)
+            for label in ("new-file", "credentials"):
                 self.assertIn(f"W {label}", out, out)
             self.assertFalse((c / "new-top-level-file").exists())
+            self.assertEqual(list((c / "backups").iterdir()), [])
+            self.assertEqual((c / "CLAUDE.md").read_text(), "orig-global\n")
             # read-only tasks never create host placeholders
             self.assertFalse((c / "output-styles").exists())
+            # credential refresh is written back in read-only runs too (allowlisted file only)
+            self.assertEqual((c / ".credentials.json").read_text().strip(), '{"tok": "R"}')
 
     def test_symlinked_protected_file_is_readonly_and_sandbox_still_starts(self):
         with fake_home() as home, temp_workspace() as ws:
@@ -193,14 +222,20 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                     + attempt("mkdir -p ~/.grok/hooks && echo x > ~/.grok/hooks/h.sh", "hooks")
                     + attempt("echo '{\"t\":1}' > ~/.grok/auth.json", "auth")
                 )
-                res = run_payload("grok", ws, payload, readonly=readonly)
+                res = run_payload("grok", ws, payload, readonly=readonly, state_roots=[g])
                 self.assertEqual(res.returncode, 0, res.stderr)
-                for label in ("bin", "config", "hooks"):
+                for label in ("bin", "config"):
                     self.assertIn(f"RO {label}", res.stdout, res.stdout)
-                self.assertIn("W auth", res.stdout)
+                # missing hooks/ is created only inside the private home
+                for label in ("hooks", "auth"):
+                    self.assertIn(f"W {label}", res.stdout, res.stdout)
+                self.assertFalse((g / "hooks").exists())
                 self.assertEqual((g / "bin" / "grok").read_text(), "#!/bin/sh\necho real-grok\n")
+                self.assertEqual((g / "config.toml").read_text(), "model = 'x'\n")
+                self.assertEqual((g / "auth.json").read_text().strip(), '{"t":1}')
                 cmd = wrap_bwrap(["grok"], workspace=str(ws), is_provider=True, provider_name="grok", readonly=readonly)
-                root_bind = cmd.index(str(g))
+                root_bind = [i for i, x in enumerate(cmd) if x == str(g) and cmd[i - 2] == "--bind"][0]
+                self.assertNotEqual(cmd[root_bind - 1], str(g))
                 bin_ro = [i for i, x in enumerate(cmd) if x == str(g / "bin") and cmd[i - 1] == "--ro-bind"]
                 self.assertTrue(bin_ro and bin_ro[0] > root_bind, "grok bin/ ro-bind must come after the ~/.grok bind")
 
@@ -224,15 +259,21 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                 + attempt("echo s > ~/.codex/sessions/r.jsonl", "sessions")
                 + "ls ~/.codex/shell_snapshots | wc -l | sed 's/^/SNAP=/'\n"
             )
-            res = run_payload("codex", ws, payload)
+            res = run_payload("codex", ws, payload, state_roots=[x])
             self.assertEqual(res.returncode, 0, res.stderr)
-            for label in ("config.toml", "AGENTS.md", "prompts", "skills", "rules"):
+            # existing protected entries are read-only binds; host sessions are absent
+            for label in ("config.toml", "skills", "sessions"):
                 self.assertIn(f"RO {label}", res.stdout, res.stdout)
-            for label in ("auth", "sessions"):
+            # missing protected entries exist only in the private home
+            for label in ("AGENTS.md", "prompts", "rules", "auth"):
                 self.assertIn(f"W {label}", res.stdout, res.stdout)
             self.assertIn("SNAP=0", res.stdout)
-            self.assertEqual((x / "AGENTS.md").read_text(), "")
+            for missing in ("AGENTS.md", "prompts", "rules"):
+                self.assertFalse((x / missing).exists(), missing)
+            self.assertEqual(list((x / "sessions").iterdir()), [])
             self.assertEqual((x / "config.toml").read_text(), "model = 'gpt'\n")
+            self.assertEqual((x / "skills" / "s" / "SKILL.md").read_text(), "skill\n")
+            self.assertEqual((x / "auth.json").read_text().strip(), '{"t":2}')
             self.assertTrue((x / "shell_snapshots" / "host.sh").exists())
 
     def test_agy_gemini_dir_symlinked_elsewhere_is_protected_via_real_path(self):
@@ -250,12 +291,19 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                 + attempt("mkdir -p ~/.gemini/commands && echo x > ~/.gemini/commands/c.toml", "commands")
                 + attempt("echo '{\"t\":1}' > ~/.gemini/oauth_creds.json", "oauth")
             )
-            res = run_payload("agy", ws, payload)
+            res = run_payload("agy", ws, payload, state_roots=[real])
             self.assertEqual(res.returncode, 0, res.stderr)
-            for label in ("settings", "settings-real-path", "GEMINI.md", "extensions", "commands"):
+            for label in ("settings", "settings-real-path"):
                 self.assertIn(f"RO {label}", res.stdout, res.stdout)
-            self.assertIn("W oauth", res.stdout)
+            # missing protected entries land in the private home only
+            for label in ("GEMINI.md", "extensions", "commands", "oauth"):
+                self.assertIn(f"W {label}", res.stdout, res.stdout)
             self.assertEqual((real / "settings.json").read_text(), '{"mcpServers": {}}\n')
+            for missing in ("GEMINI.md", "extensions", "commands"):
+                self.assertFalse((real / missing).exists(), missing)
+            # ~/.gemini stays a symlink; the credential is written back through its real path
+            self.assertTrue((home / ".gemini").is_symlink())
+            self.assertEqual((real / "oauth_creds.json").read_text().strip(), '{"t":1}')
 
     def test_muse_config_readonly_and_runtime_sockets_unreachable(self):
         with fake_home() as home, temp_workspace() as ws:
@@ -326,10 +374,23 @@ class TestProviderMountArgv(unittest.TestCase):
             self.assertNotIn(str(home / ".claude"), cmd)
             self.assertFalse((home / ".claude" / "CLAUDE.md").exists())
 
-    def test_placeholder_failure_fails_closed(self):
+    def test_private_home_failure_fails_closed(self):
+        # No usable private-home base (XDG dirs point at a regular file): the
+        # host state root must never be bound instead -> SandboxConfigError.
         with fake_home() as home, temp_workspace() as ws:
             (home / ".claude").mkdir()
-            with patch("makewand.sandbox.os.open", side_effect=PermissionError("denied")):
+            blocker = home / "not-a-dir"
+            blocker.write_text("x")
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(blocker), "XDG_CACHE_HOME": str(blocker)}), \
+                 patch("makewand.sandbox.resolve_trusted_bwrap", return_value="/usr/bin/bwrap"):
+                with self.assertRaises(sandbox.SandboxConfigError):
+                    wrap_bwrap(["claude"], workspace=str(ws), is_provider=True, provider_name="claude")
+
+    def test_private_dir_creation_error_is_sandbox_config_error(self):
+        with fake_home() as home, temp_workspace() as ws:
+            (home / ".claude").mkdir()
+            with patch("makewand.sandbox.tempfile.mkdtemp", side_effect=PermissionError("denied")), \
+                 patch("makewand.sandbox.resolve_trusted_bwrap", return_value="/usr/bin/bwrap"):
                 with self.assertRaises(sandbox.SandboxConfigError):
                     wrap_bwrap(["claude"], workspace=str(ws), is_provider=True, provider_name="claude")
 

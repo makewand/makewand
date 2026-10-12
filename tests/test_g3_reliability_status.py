@@ -152,8 +152,13 @@ class TestAgyDispatchWriteBack(_IsolatedStatus):
         with patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
-             patch("makewand.providers.agy.run_subprocess", return_value=(1, "", stderr_text, None)):
-            return execute_agy_task("审查这段代码", cwd=self._tmp.name, readonly=True)
+             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+             patch("makewand.sandbox.audit_unsafe_host_exec"), \
+             patch("makewand.providers.agy.run_subprocess", return_value=(1, "", stderr_text, None)) as run:
+            # no bwrap: the read-only host run needs the recorded authorization (H1)
+            result = execute_agy_task("审查这段代码", cwd=self._tmp.name, readonly=True)
+            run.assert_called_once()
+            return result
 
     def test_region_block_is_written_back_with_ttl(self):
         ok, _, err = self._dispatch("Error: Gemini Code Assist is not currently available in your location.")

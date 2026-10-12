@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,7 +27,7 @@ SNAPSHOT_LIMIT_CAPS = {"max_entries": 1000000, "max_bytes": 16 * 1024 * 1024 * 1
                        "max_seconds": 300}
 
 
-def snapshot_limits(limits=None):
+def snapshot_limits(limits=None, workspace=None):
     """Validate an explicit policy, or read initial user limits exactly once.
 
     Later checks pass the frozen policy rather than consulting the environment.
@@ -34,6 +35,41 @@ def snapshot_limits(limits=None):
     """
     defaults = {"max_entries": MAX_ENTRIES, "max_bytes": MAX_BYTES, "max_seconds": MAX_SECONDS}
     if limits is None:
+        env_timeout = (
+            os.environ.get("MAKEWAND_DELIVERY_TIMEOUT")
+            or os.environ.get("MAKEWAND_SNAPSHOT_TIMEOUT")
+            or os.environ.get("MAKEWAND_SNAPSHOT_SECONDS")
+            or os.environ.get("MAKEWAND_DELIVERY_MAX_SECONDS")
+        )
+        if env_timeout:
+            try:
+                val = float(env_timeout)
+                if 0 < val <= SNAPSHOT_LIMIT_CAPS["max_seconds"]:
+                    defaults["max_seconds"] = val
+            except ValueError:
+                pass
+        else:
+            try:
+                check_root = workspace or os.getcwd()
+                cand = Path(check_root).resolve()
+                git_index = None
+                for parent in [cand, *cand.parents]:
+                    idx_path = parent / ".git" / "index"
+                    if idx_path.exists():
+                        git_index = idx_path
+                        break
+                if git_index and git_index.exists():
+                    idx_size = git_index.stat().st_size
+                    if idx_size > 500_000:
+                        defaults["max_seconds"] = 180.0
+                    elif idx_size > 100_000:
+                        defaults["max_seconds"] = 150.0
+                    elif idx_size > 20_000:
+                        defaults["max_seconds"] = 120.0
+                    else:
+                        defaults["max_seconds"] = 60.0
+            except Exception:
+                pass
         limits = {name: os.environ.get("MAKEWAND_DELIVERY_" + name.upper(), value)
                   for name, value in defaults.items()}
     if not isinstance(limits, dict) or set(limits) != set(defaults):
@@ -153,8 +189,40 @@ def _git_environment():
     return env
 
 
+def _resolve_git_for_delivery(path):
+    try:
+        from makewand.git_helper import resolve_safe_git_binary
+        return resolve_safe_git_binary(cwd=path)
+    except (ImportError, ModuleNotFoundError):
+        pass
+    try:
+        from git_helper import resolve_safe_git_binary
+        return resolve_safe_git_binary(cwd=path)
+    except (ImportError, ModuleNotFoundError):
+        pass
+    found = shutil.which("git")
+    if found:
+        found_p = Path(found).resolve()
+        if path:
+            cwd_p = Path(path).resolve()
+            if os.name == "nt":
+                cwd_s = os.path.normcase(str(cwd_p))
+                found_s = os.path.normcase(str(found_p))
+                if found_s == cwd_s or found_s.startswith(cwd_s + os.sep):
+                    raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
+            else:
+                try:
+                    if found_p.is_relative_to(cwd_p):
+                        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
+                except (ValueError, RuntimeError):
+                    pass
+        return str(found_p)
+    raise FileNotFoundError("Safe git binary not found in PATH")
+
+
 def _git_command(path):
-    return ["git", "--no-replace-objects", "-c", "core.fsmonitor=",
+    safe_git = _resolve_git_for_delivery(path)
+    return [safe_git, "--no-replace-objects", "-c", "core.fsmonitor=",
             "-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null",
             "-c", "core.autocrlf=false", "-c", "core.pager=cat",
             "-C", path, "--work-tree=" + path]
@@ -199,6 +267,90 @@ HEAVY_DEPENDENCY_DIRS = frozenset({
 })
 
 
+# Makewand-owned scratch directories at the destination root whose contents are
+# not delivery state. Anything git tracks below them fails the snapshot.
+MAKEWAND_INTERNAL_DIRS = frozenset({".makewand_sandbox_home"})
+# Opaque directories (``.makewand_*``, non-ignored dependency trees) are bound
+# by one aggregate digest with their own bounds; exceeding them fails closed.
+TREE_DIGEST_MAX_ENTRIES = 200000
+TREE_DIGEST_MAX_BYTES = 1024 * 1024 * 1024
+
+
+class _TreeBudget:
+    """Separate size bounds for one opaque directory; time stays shared."""
+
+    def __init__(self, outer, relative):
+        self.outer = outer
+        self.relative = relative
+        self.entries = 0
+        self.bytes = 0
+
+    def fail(self, name):
+        raise OSError(f"Delivery opaque directory {self.relative!r} exceeded its digest {name} limit; "
+                      "destination cannot be verified")
+
+    def remaining(self):
+        if self.bytes > TREE_DIGEST_MAX_BYTES:
+            self.fail("bytes")
+        return self.outer.remaining()
+
+    def entry(self):
+        self.entries += 1
+        if self.entries > TREE_DIGEST_MAX_ENTRIES:
+            self.fail("entries")
+        self.outer.remaining()
+
+    def file_size(self, size):
+        if self.bytes + size > TREE_DIGEST_MAX_BYTES:
+            self.fail("bytes")
+
+
+def _tree_digest(parent, name, before, relative, budget):
+    """Bind an opaque directory's complete contents (names, types, modes, bytes)."""
+    tree_budget = _TreeBudget(budget, relative)
+    digest = hashlib.sha256()
+
+    def walk(directory, prefix, directory_before):
+        for child in sorted(os.listdir(directory)):
+            tree_budget.entry()
+            path = prefix + child
+            info = os.stat(child, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                descriptor = os.open(child, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                try:
+                    if _signature(os.fstat(descriptor)) != _signature(info):
+                        raise OSError("Delivery directory changed: " + relative + "/" + path)
+                    digest.update(json.dumps([path, ["dir", stat.S_IMODE(info.st_mode)]]).encode() + b"\0")
+                    walk(descriptor, path + "/", info)
+                finally:
+                    os.close(descriptor)
+            else:
+                record = _entry_record(directory, child, info, relative + "/" + path, tree_budget)
+                digest.update(json.dumps([path, record]).encode() + b"\0")
+            if _signature(os.stat(child, dir_fd=directory, follow_symlinks=False)) != _signature(info):
+                raise OSError("Delivery entry changed during inspection: " + relative + "/" + path)
+        if _signature(os.fstat(directory)) != _signature(directory_before):
+            raise OSError("Delivery directory changed during inspection: " + relative + "/" + prefix)
+
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        if _signature(os.fstat(descriptor)) != _signature(before):
+            raise OSError("Delivery directory changed: " + relative)
+        walk(descriptor, "", before)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _refuse_tracked_internal(root, relative, budget):
+    """An excluded makewand directory must not hide tracked (delivered) files."""
+    command = _git_command(root) + ["ls-files", "-z", "--", relative]
+    result = subprocess.run(command, env=_git_environment(), capture_output=True,
+                            timeout=budget.remaining())
+    if result.returncode == 0 and result.stdout.strip(b"\0"):
+        raise OSError("Delivery destination tracks files inside makewand-internal directory: " + relative)
+
+
 def _ignored_entries(root, budget):
     """Query git for ignored directories under root."""
     try:
@@ -228,6 +380,17 @@ def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
     root = os.path.abspath(os.fspath(workspace))
     entries, repositories = {}, {}
     limits = snapshot_limits(limits)
+    if timeout is None and not (os.environ.get("MAKEWAND_DELIVERY_TIMEOUT") or os.environ.get("MAKEWAND_SNAPSHOT_TIMEOUT") or os.environ.get("MAKEWAND_DELIVERY_MAX_SECONDS")):
+        try:
+            git_index = os.path.join(root, ".git", "index")
+            if os.path.exists(git_index):
+                index_size = os.path.getsize(git_index)
+                if index_size > 500_000:
+                    limits["max_seconds"] = min(float(SNAPSHOT_LIMIT_CAPS["max_seconds"]), max(limits["max_seconds"], 60.0))
+                elif index_size > 100_000:
+                    limits["max_seconds"] = min(float(SNAPSHOT_LIMIT_CAPS["max_seconds"]), max(limits["max_seconds"], 30.0))
+        except Exception:
+            pass
     budget = _SnapshotBudget(limits, timeout)
     ignored_dirs = _ignored_entries(root, budget)
 
@@ -256,10 +419,18 @@ def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
                     "head": _git_state(os.path.join(root, repo), budget.remaining),
                 }
             elif stat.S_ISDIR(before.st_mode):
-                if name in HEAVY_DEPENDENCY_DIRS and (
-                    _is_ignored(relative) or name in ("node_modules", ".venv", "venv", ".tox")
-                ):
-                    entries[relative] = ["dir", mode]
+                record = None
+                if not prefix and name in MAKEWAND_INTERNAL_DIRS:
+                    _refuse_tracked_internal(root, relative, budget)
+                    record = ["dir", mode, "internal"]
+                elif name.startswith(".makewand_") or (
+                        name in ("node_modules", ".venv", "venv", ".tox") and not _is_ignored(relative)):
+                    # Not pruned blindly: changes below must still fail validation.
+                    record = ["dir", mode, "tree", _tree_digest(directory, name, before, relative, budget)]
+                elif name in HEAVY_DEPENDENCY_DIRS and _is_ignored(relative):
+                    record = ["dir", mode]
+                if record is not None:
+                    entries[relative] = record
                     after = os.stat(name, dir_fd=directory, follow_symlinks=False)
                     if _signature(after) != _signature(before):
                         raise OSError("Delivery entry changed during inspection: " + relative)
@@ -343,6 +514,10 @@ def _check_delivery_snapshot(frozen, current, changes, *, only_changes=False):
                 expected[name] = list(record)
         for name in parent_dirs:
             before_dir, after_dir = expected.get(name), actual.get(name)
+            if any(record and record[0] == "dir" and len(record) > 2 for record in (before_dir, after_dir)):
+                # Opaque records bind a whole subtree; a patch below one cannot
+                # be checked entry-by-entry, so it is never accepted.
+                raise OSError("Delivery patch path lies inside an opaque directory: " + repr(name))
             if (before_dir and after_dir and before_dir[0] == after_dir[0] == "dir"
                     and before_dir != after_dir):
                 raise OSError("Delivery parent directory permissions changed: " + repr(name))

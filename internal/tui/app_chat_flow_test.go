@@ -2,7 +2,11 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -460,6 +464,11 @@ func TestSubmitChatInput_ExplainUsesUnaryChatPath(t *testing.T) {
 }
 
 func TestSubmitChatInput_ExplainUsesStreamPathForGeminiCLI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// No bubblewrap on Windows: the fixture CLI runs on the host behind
+		// the same acknowledged authorization production requires.
+		writeHostExecAckForTest(t)
+	}
 	cfg := config.DefaultConfig()
 	app := *NewApp(ModeChat, cfg, "")
 
@@ -822,4 +831,28 @@ func TestSubmitChatInput_IdentityQueryHandledLocally(t *testing.T) {
 	if last.Role != "assistant" || !strings.Contains(last.Content, "makewand") {
 		t.Fatalf("unexpected assistant reply: %v", last)
 	}
+}
+
+// writeHostExecAckForTest installs a valid host-exec acknowledgement in a
+// temporary MAKEWAND_CONFIG_DIR and enables MAKEWAND_UNSAFE_HOST_EXEC.
+func writeHostExecAckForTest(t *testing.T) {
+	t.Helper()
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	raw, err := json.Marshal(map[string]any{
+		"unsafe_host_exec_ack_version": 1,
+		"unsafe_host_exec_ack_host":    host,
+		"unsafe_host_exec_ack_at":      time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAKEWAND_CONFIG_DIR", dir)
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
 }

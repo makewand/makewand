@@ -199,7 +199,7 @@ func TestWrapVerificationCommand_NetworkIsolationByStep(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd, args := wrapVerificationCommand("/usr/bin/bwrap", "/tmp/demo", "go", []string{"test", "./..."}, tt.allowNetwork, nil)
+			cmd, args := mustWrapVerification(t, "/usr/bin/bwrap", "/tmp/demo", "go", []string{"test", "./..."}, tt.allowNetwork, nil)
 			if cmd != "/usr/bin/bwrap" {
 				t.Fatalf("cmd = %q, want /usr/bin/bwrap", cmd)
 			}
@@ -219,7 +219,7 @@ func TestWrapVerificationCommand_SandboxLayout(t *testing.T) {
 	verifyUserHome = func() (string, error) { return home, nil }
 
 	workspace := "/tmp/makewand-candidate-123"
-	_, args := wrapVerificationCommand("/usr/bin/bwrap", workspace, "go", []string{"test", "./..."}, false, nil)
+	_, args := mustWrapVerification(t, "/usr/bin/bwrap", workspace, "go", []string{"test", "./..."}, false, nil)
 
 	if !containsArg(args, "--clearenv") {
 		t.Fatalf("args should clear inherited environment; got %v", args)

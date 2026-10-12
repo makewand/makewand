@@ -263,6 +263,7 @@ def run_subprocess(
     print_prefix: str = "",
     pass_fds: tuple = (),
     preexec_fn: Optional[Callable[[], None]] = None,
+    extra_env: Optional[dict] = None,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command with one deadline and a shared raw stdout/stderr byte limit.
@@ -370,6 +371,8 @@ def run_subprocess(
         deadline = time.monotonic() + timeout
         sub_env = os.environ.copy()
         sub_env["NoDefaultCurrentDirectoryInExePath"] = "1"
+        if extra_env:
+            sub_env.update({str(k): str(v) for k, v in extra_env.items()})
         popen_kwargs["env"] = sub_env
         if isinstance(cmd, (list, tuple)) and cmd:
             safe_exe = safe_which(cmd[0], cwd=cwd)

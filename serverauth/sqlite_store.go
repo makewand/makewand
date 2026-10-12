@@ -303,23 +303,36 @@ func (s *SQLiteStore) authenticateToken(token string) (*Grant, bool) {
 	if grant.revoked || grant.IsExpiredAt(time.Now()) {
 		return nil, false
 	}
-	if s.db != nil {
-		var isRevoked int
-		if err := s.db.QueryRow(`SELECT revoked FROM auth_tokens WHERE token_hash = ?`, hash).Scan(&isRevoked); err != nil || isRevoked != 0 {
-			return nil, false
-		}
-	}
-	if grant.UserID() != "" && s.db != nil {
-		var isActive int
-		var role string
-		err := s.db.QueryRow(`SELECT is_active, role FROM users WHERE id = ?`, grant.UserID()).Scan(&isActive, &role)
-		if err == nil {
-			if isActive == 0 {
-				return nil, false
-			}
-		}
+	if s.db != nil && !s.tokenStillAuthorized(hash, grant.UserID()) {
+		return nil, false
 	}
 	return grant, true
+}
+
+// tokenStillAuthorized re-checks durable revocation and user activation in a
+// single statement so both facts come from one consistent snapshot. Separate
+// queries could run on different pool connections and observe a revocation and
+// a user deactivation from different points in time. A grant bound to a user
+// that has been deactivated is rejected; a missing users table (standalone
+// token store) or missing user row keeps the historical token-only behavior.
+func (s *SQLiteStore) tokenStillAuthorized(hash, userID string) bool {
+	var revoked int
+	if userID == "" {
+		err := s.db.QueryRow(`SELECT revoked FROM auth_tokens WHERE token_hash = ?`, hash).Scan(&revoked)
+		return err == nil && revoked == 0
+	}
+	var userActive sql.NullInt64
+	err := s.db.QueryRow(`
+SELECT t.revoked, (SELECT u.is_active FROM users u WHERE u.id = ?)
+FROM auth_tokens t WHERE t.token_hash = ?`, userID, hash).Scan(&revoked, &userActive)
+	if err != nil && strings.Contains(err.Error(), "no such table: users") {
+		userActive = sql.NullInt64{}
+		err = s.db.QueryRow(`SELECT revoked FROM auth_tokens WHERE token_hash = ?`, hash).Scan(&revoked)
+	}
+	if err != nil || revoked != 0 {
+		return false
+	}
+	return !userActive.Valid || userActive.Int64 != 0
 }
 
 // TokenRules returns the current non-secret token views.

@@ -250,8 +250,11 @@ func TestWrapCodexHomeUsesSelectedAccountWithoutDefaultAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := strings.Join(wrapped.Args, " ")
-	if !strings.Contains(args, "--bind "+selected+" "+selected) || !strings.Contains(args, "--setenv CODEX_HOME "+selected) {
-		t.Fatalf("selected account missing: %v", wrapped.Args)
+	// The selected account is exposed as a private per-run copy, never bound
+	// writable from the host.
+	cliPrivateHomeSource(t, wrapped.Args, selected)
+	if strings.Contains(args, "--bind "+selected+" "+selected) || !strings.Contains(args, "--setenv CODEX_HOME "+selected) {
+		t.Fatalf("selected account missing or host-writable: %v", wrapped.Args)
 	}
 	if strings.Contains(args, "--bind "+defaultAccount+" "+defaultAccount) || !strings.Contains(args, "--tmpfs "+defaultAccount) {
 		t.Fatalf("default account was exposed: %v", wrapped.Args)
@@ -295,7 +298,7 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 	if runtime.GOOS != "linux" {
 		t.Skip("native bubblewrap regression requires Linux")
 	}
-	bwrap, err := exec.LookPath("bwrap")
+	bwrap, err := cliBwrapLookup("bwrap")
 	if err != nil {
 		t.Skip("bubblewrap unavailable")
 	}
@@ -313,10 +316,11 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(account, "marker"), []byte("SELECTED"), 0o600); err != nil {
+	// auth.json is the credential file copied into the private account copy.
+	if err := os.WriteFile(filepath.Join(account, "auth.json"), []byte("SELECTED"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(other, "marker"), []byte("OTHER_ACCOUNT"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(other, "auth.json"), []byte("OTHER_ACCOUNT"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	link := filepath.Join(home, ".codex-selected")
@@ -324,16 +328,16 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 		t.Fatal(err)
 	}
 	for _, provider := range []string{"codex", "claude"} {
-		script := `if test -r "$CODEX_HOME/marker"; then cat "$CODEX_HOME/marker"; fi; if test -r "$HOME/.codex/marker"; then echo DEFAULT_LEAK; fi; if test -r "$1"; then echo FOREIGN_LEAK; fi`
+		script := `if test -r "$CODEX_HOME/auth.json"; then cat "$CODEX_HOME/auth.json"; fi; if test -r "$HOME/.codex/auth.json"; then echo DEFAULT_LEAK; fi; if test -r "$1"; then echo FOREIGN_LEAK; fi`
 		//nolint:gosec // G204: fixed fixture program; only test-owned paths are passed as positional arguments, never shell source.
-		cmd := exec.Command("/bin/sh", "-c", script, "fixture", filepath.Join(account, "marker"))
+		cmd := exec.Command("/bin/sh", "-c", script, "fixture", filepath.Join(account, "auth.json"))
 		cmd.Dir = workspace
 		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + home, "CODEX_HOME=" + link}
 		wrapped, err := wrapCLICommandWithSandbox(context.Background(), provider, cmd)
 		if err != nil {
 			t.Fatal(err)
 		}
-		out, err := wrapped.CombinedOutput()
+		out, err := runWrappedCLIForTest(wrapped)
 		if err != nil {
 			t.Fatalf("%s sandbox: %v %s", provider, err, out)
 		}

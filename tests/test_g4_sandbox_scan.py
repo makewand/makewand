@@ -4,9 +4,10 @@ G4 regression tests: bounded build-time scans in wrap_bwrap (eng-delivery#7).
 wrap_bwrap used to os.walk the whole workspace twice without any limit — for a
 workspace of /tmp that meant walking every other session's repository and
 binding all of their .git directories into the command line (minutes under
-strace, cross-tenant paths in logs). Scans are now bounded: no descent into .git
-internals or node_modules, an entry cap, and a shallow depth for broad
-workspaces (/, /tmp, /var/tmp, HOME or its ancestors).
+strace, cross-tenant paths in logs). Scans are now bounded: an entry cap and a
+shallow depth for broad workspaces (/, /tmp, /var/tmp, HOME or its ancestors).
+H5: node_modules and .git internals ARE walked (a pathname socket there must be
+masked); a truncated scan refuses writable sessions and warns in read-only ones.
 """
 
 import contextlib
@@ -43,7 +44,7 @@ def home_outside_tmp():
 
 
 class TestBoundedWorkspaceScan(unittest.TestCase):
-    def test_git_internals_and_node_modules_are_not_walked(self):
+    def test_git_internals_and_node_modules_are_walked_for_sockets(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)
             (root / ".git" / "objects" / "aa").mkdir(parents=True)
@@ -66,9 +67,13 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
             bound = ro_bound(cmd)
             self.assertIn(str(root / ".git"), bound)
             self.assertIn(str(root / "src" / "sub" / ".git"), bound)
-            self.assertNotIn(str(nested / ".git"), bound)
-            self.assertFalse(any("/.git/" in p or p.endswith("/.git") for p in seen if p.startswith(ws)), seen)
-            self.assertFalse(any("node_modules" in p for p in seen if p.startswith(ws)), seen)
+            # a nested repository below node_modules is protected as well
+            self.assertIn(str(nested / ".git"), bound)
+            # .git internals are walked (sockets only): no .git entries recorded below .git
+            self.assertIn(str(root / ".git" / "objects" / "aa"), seen)
+            self.assertFalse(any(p.startswith(str(root / ".git") + "/") and p.endswith("/.git") for p in bound), bound)
+            self.assertIn(str(root / "node_modules"), seen)
+            self.assertIn(str(nested), seen)
 
     def test_entry_limit_truncates_scan_with_warning(self):
         with tempfile.TemporaryDirectory() as ws:
@@ -81,18 +86,29 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
             (deep / ".git").mkdir()
             err = io.StringIO()
             with patch.object(sandbox, "SCAN_ENTRY_LIMIT", 100, create=True), patch("sys.stderr", err):
-                cmd = wrap_bwrap(["true"], workspace=ws)
+                # writable: .git protection would be incomplete -> fail closed
+                with self.assertRaisesRegex(sandbox.SandboxConfigError, "100"):
+                    wrap_bwrap(["true"], workspace=ws)
+                # read-only: no .git binds needed; the socket scan is truncated with a warning
+                cmd = wrap_bwrap(["true"], workspace=ws, readonly=True)
             bound = ro_bound(cmd)
+            self.assertIn(ws, bound)
             self.assertNotIn(str(deep / ".git"), bound)
-            self.assertIn("截断", err.getvalue())
+            self.assertIn("工作区扫描未能完成", err.getvalue())
 
     def test_tmp_workspace_scan_is_shallow_and_fast(self):
         base = Path(tempfile.mkdtemp(prefix="g4-scan-"))  # /tmp/g4-scan-xxx
+        socks = []
         try:
-            (base / ".git").mkdir()  # depth 2 below /tmp
+            # Writable /tmp is a forbidden root, so exercise the bounded broad
+            # scan through the read-only path, where it masks pathname sockets.
             deep = base / "a" / "b" / "c"
             deep.mkdir(parents=True)
-            (deep / ".git").mkdir()  # depth 5 below /tmp
+            shallow_sock, deep_sock = base / "s.sock", deep / "s.sock"  # depth 2 / 5 below /tmp
+            for sp in (shallow_sock, deep_sock):
+                sk = socket.socket(socket.AF_UNIX)
+                sk.bind(str(sp))
+                socks.append(sk)
             real_scandir = os.scandir
 
             class FixtureRootEntries:
@@ -118,19 +134,20 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
             with home_outside_tmp() as home, patch("makewand.sandbox.os.scandir", side_effect=fixture_scandir):
                 self.assertFalse(Path(home).is_relative_to("/tmp"))
                 t0 = time.monotonic()
-                cmd = wrap_bwrap(["true"], workspace="/tmp")
+                cmd = wrap_bwrap(["true"], workspace="/tmp", readonly=True)
                 elapsed = time.monotonic() - t0
-            bound = ro_bound(cmd)
-            self.assertIn(str(base / ".git"), bound)
-            self.assertNotIn(str(deep / ".git"), bound)
-            for p in bound:
-                if p.startswith("/tmp/") and p.endswith("/.git"):
+                with self.assertRaisesRegex(sandbox.SandboxConfigError, "/tmp"):
+                    wrap_bwrap(["true"], workspace="/tmp")
+            masked = {cmd[i + 2] for i, x in enumerate(cmd[:-2]) if x == "--ro-bind" and cmd[i + 1] == "/dev/null"}
+            self.assertIn(str(shallow_sock), masked)
+            self.assertNotIn(str(deep_sock), masked)
+            for p in masked:
+                if p.startswith("/tmp/"):
                     self.assertLessEqual(len(Path(p).relative_to("/tmp").parts), sandbox.BROAD_SCAN_DEPTH, p)
             self.assertLess(elapsed, 30.0)
-            with patch.dict(os.environ, {"HOME": str(base / "home")}):
-                with self.assertRaises(sandbox.SandboxConfigError):
-                    wrap_bwrap(["true"], workspace="/tmp")
         finally:
+            for sk in socks:
+                sk.close()
             shutil.rmtree(base, ignore_errors=True)
 
     def test_workspace_sockets_still_masked(self):

@@ -77,6 +77,7 @@ class TestReviewVerdictDecoupling(unittest.TestCase):
         self.assertIn("Makewand Diff Truncated", formatted)
         self.assertTrue(formatted.startswith("a" * 10000))
         self.assertTrue(formatted.endswith("a" * 4000))
+        self.assertEqual(format_review_diff(large_diff), large_diff)
 
     def test_compute_patch_parsimony(self):
         """Verify patch parsimony calculation."""

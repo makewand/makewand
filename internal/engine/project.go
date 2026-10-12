@@ -387,10 +387,13 @@ func (p *Project) writeFileMode(relPath, content string, requestedMode *fs.FileM
 
 func writeFileModeRoot(root *os.Root, relPath, content string, requestedMode *fs.FileMode) error {
 	tempPath := filepath.Join(filepath.Dir(filepath.Clean(relPath)), ".makewand-write-"+rand.Text())
-	return writeFileModeAt(root, relPath, content, requestedMode, tempPath, "")
+	return writeFileModeAt(root, relPath, content, requestedMode, tempPath, "", nil, nil)
 }
 
-func writeFileModeAt(root *os.Root, relPath, content string, requestedMode *fs.FileMode, tempPath, security string, beforeRename ...func(*os.File) error) error {
+// writeFileModeAt writes content beside relPath and renames it into place. A
+// non-nil guard makes the replacement conditional on the target still holding
+// the expected image (see guardedReplaceApplyFile).
+func writeFileModeAt(root *os.Root, relPath, content string, requestedMode *fs.FileMode, tempPath, security string, guard *applyReplaceGuard, beforeRename func(*os.File) error) (resultErr error) {
 	relPath = filepath.Clean(relPath)
 	mode := fs.FileMode(0o600)
 	if info, err := root.Lstat(relPath); err == nil {
@@ -414,7 +417,13 @@ func writeFileModeAt(root *os.Root, relPath, content string, requestedMode *fs.F
 	if err != nil {
 		return fmt.Errorf("create temporary file: %w", err)
 	}
-	defer func() { _ = root.Remove(tempPath) }()
+	defer func() {
+		// After a failed conflict swap-back the temp may hold an external
+		// version; never delete it.
+		if !applyConflictKeepsTemp(resultErr) {
+			_ = root.Remove(tempPath)
+		}
+	}()
 	if _, err := tmp.WriteString(content); err != nil {
 		tmp.Close()
 		return err
@@ -431,18 +440,16 @@ func writeFileModeAt(root *os.Root, relPath, content string, requestedMode *fs.F
 		tmp.Close()
 		return err
 	}
-	for _, prepare := range beforeRename {
-		if prepare != nil {
-			if err := prepare(tmp); err != nil {
-				tmp.Close()
-				return err
-			}
+	if beforeRename != nil {
+		if err := beforeRename(tmp); err != nil {
+			tmp.Close()
+			return err
 		}
 	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := replaceApplyFile(root, tempPath, relPath); err != nil {
+	if err := guardedReplaceApplyFile(root, tempPath, relPath, guard); err != nil {
 		return fmt.Errorf("replace file: %w", err)
 	}
 	return nil

@@ -364,7 +364,7 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
                     code, out, err_out, err_cat = run_in_sandbox(
                         ["rustc", "--crate-type", "lib", "--emit=metadata", "--out-dir", "/tmp", rel],
                         workspace=clean_cwd,
-                        timeout=8,
+                        timeout=20,
                         allow_network=False,
                         readonly=True,
                         extra_ro_binds=extra_ro if extra_ro else None,
@@ -372,7 +372,15 @@ def fast_syntax_check(cwd: str, file_paths: Sequence[str]) -> Tuple[bool, List[s
                         audit_context="linter_syntax_check",
                     )
                     raw_err = (err_out or out).strip()
-                    if code != 0:
+                    # rustc can emit its diagnostic and then linger past the timeout
+                    # under load; a printed error is still a syntax error, not an
+                    # infrastructure failure that lets the gate pass.
+                    rustc_diag = ""
+                    if re.search(r"(?m)^\s*--> ", raw_err):  # rustc source-location line
+                        rustc_diag = next((ln for ln in raw_err.splitlines() if ln.startswith("error")), "")
+                    if code == -1 and rustc_diag:
+                        errors.append(f"[{rel}] {rustc_diag}")
+                    elif code != 0:
                         # Infrastructure or sandbox failure is not a syntax error
                         if (
                             raw_err.startswith("bwrap:")

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -101,7 +102,8 @@ func writeApplyEntry(root *os.Root, state *applyJournalState, journal *applyJour
 			return state.write(journal)
 		}
 	}
-	return writeFileModeAt(root, entry.Path, content, &entry.AfterMode, entry.Temp, entry.BeforeSecurity, beforeRename)
+	guard := &applyReplaceGuard{existed: entry.Existed, accept: []string{entry.BeforeHash}}
+	return writeFileModeAt(root, entry.Path, content, &entry.AfterMode, entry.Temp, entry.BeforeSecurity, guard, beforeRename)
 }
 
 // ApplyFilesTransactional seals preimages before any workspace writes, serializes
@@ -109,7 +111,10 @@ func writeApplyEntry(root *os.Root, state *applyJournalState, journal *applyJour
 // validate runs under the same lock before sealing (for trusted acceptance and
 // baseline checks). A crash before commit is rolled back on project reopening.
 // Ordinary external editors do not join this advisory lock; conflicting edits
-// are preserved and stop recovery rather than being silently overwritten.
+// are preserved and stop recovery rather than being silently overwritten. Each
+// replacement is conditional on the sealed preimage (guardedReplaceApplyFile):
+// a save racing the final rename yields an *ApplyConflictError that keeps the
+// external version at the target and the candidate at a sibling conflict path.
 func (p *Project) ApplyFilesTransactional(ctx context.Context, files []ExtractedFile, validate func() error) error {
 	if len(files) == 0 {
 		return nil
@@ -240,8 +245,58 @@ func (p *Project) applyStatePath() (string, string, error) {
 	return filepath.Join(base, hex.EncodeToString(hash[:])), workspace, nil
 }
 
+func workspaceLockPath(workspace string) (string, error) {
+	key := workspace
+	if canonicalWS, err := canonicalApplyPath(workspace); err == nil {
+		key = canonicalWS
+	}
+	if cmd, err := safeGitCmd(workspace, "rev-parse", "--show-toplevel"); err == nil {
+		if out, err := cmd.Output(); err == nil && len(bytes.TrimSpace(out)) > 0 {
+			if top, err := canonicalApplyPath(string(bytes.TrimSpace(out))); err == nil {
+				key = top
+			}
+		}
+	}
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(filepath.Clean(key))
+	}
+	hash := sha256.Sum256([]byte(key))
+	lockKey := hex.EncodeToString(hash[:])[:32]
+
+	artifactsDir := strings.TrimSpace(os.Getenv("MAKEWAND_ARTIFACTS_DIR"))
+	if artifactsDir == "" {
+		xdg := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+		if xdg != "" && filepath.IsAbs(xdg) {
+			artifactsDir = filepath.Join(xdg, "makewand", "artifacts")
+		} else {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+			artifactsDir = filepath.Join(home, ".local", "state", "makewand", "artifacts")
+		}
+	}
+	if err := os.MkdirAll(artifactsDir, 0o700); err != nil { //nolint:gosec // G703: makewand state dir, not request input
+		return "", err
+	}
+	if canonicalArtifacts, err := canonicalApplyPath(artifactsDir); err == nil {
+		artifactsDir = canonicalArtifacts
+	}
+	if err := privateApplyDirectory(artifactsDir); err != nil {
+		return "", err
+	}
+	locksDir := filepath.Join(artifactsDir, ".locks")
+	if err := os.MkdirAll(locksDir, 0o700); err != nil { //nolint:gosec // G703: fixed subpath of the makewand state dir
+		return "", err
+	}
+	if err := privateApplyDirectory(locksDir); err != nil {
+		return "", err
+	}
+	return filepath.Join(locksDir, lockKey+".lock"), nil
+}
+
 func (p *Project) openApplyState(ctx context.Context, create bool) (*applyJournalState, error) {
-	path, _, err := p.applyStatePath()
+	path, workspace, err := p.applyStatePath()
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +331,12 @@ func (p *Project) openApplyState(ctx context.Context, create bool) (*applyJourna
 	if err != nil {
 		return nil, err
 	}
-	lock, err := openApplyLock(filepath.Join(path, "workspace.lock"))
+	lockPath, err := workspaceLockPath(workspace)
+	if err != nil {
+		root.Close()
+		return nil, err
+	}
+	lock, err := openApplyLock(lockPath)
 	if err != nil {
 		root.Close()
 		return nil, err
@@ -837,7 +897,12 @@ func (p *Project) restoreApplyEntry(root *os.Root, s *applyJournalState, entry a
 	if err != nil {
 		return err
 	}
-	defer func() { _ = root.Remove(name) }()
+	var replaceErr error
+	defer func() {
+		if !applyConflictKeepsTemp(replaceErr) {
+			_ = root.Remove(name)
+		}
+	}()
 	if _, err = io.Copy(dst, source); err == nil {
 		err = dst.Chmod(entry.BeforeMode)
 	}
@@ -857,8 +922,11 @@ func (p *Project) restoreApplyEntry(root *os.Root, s *applyJournalState, entry a
 	if err != nil {
 		return err
 	}
-	if err := replaceApplyFile(root, name, entry.Path); err != nil {
-		return err
+	// The target was validated as the postimage (or already the preimage);
+	// an external save made since then is swapped back and preserved.
+	guard := &applyReplaceGuard{existed: true, accept: []string{entry.AfterHash, entry.BeforeHash}}
+	if replaceErr = guardedReplaceApplyFile(root, name, entry.Path, guard); replaceErr != nil {
+		return replaceErr
 	}
 	return syncApplyDirectory(filepath.Dir(filepath.Join(p.Path, entry.Path)))
 }

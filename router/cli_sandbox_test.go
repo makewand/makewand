@@ -120,11 +120,17 @@ func TestWrapCLICommandWithSandbox_ActiveProviderCredentialsPreserved(t *testing
 	if strings.Contains(args, "--tmpfs "+claudeJSONPath) {
 		t.Errorf("active provider credentials (%s) should NOT be masked with tmpfs: %v", claudeJSONPath, wrapped.Args)
 	}
-	if !strings.Contains(args, "--bind "+claudePath+" "+claudePath) {
-		t.Errorf("expected active provider credentials (%s) to be bound: %v", claudePath, wrapped.Args)
+	// Host provider state is never bound writable: HOME is a per-run private
+	// directory holding copies of the active provider's credential files.
+	if strings.Contains(args, "--bind "+claudePath+" ") || strings.Contains(args, "--bind "+claudeJSONPath+" ") {
+		t.Errorf("host provider credentials must not be bound writable: %v", wrapped.Args)
 	}
-	if !strings.Contains(args, "--bind "+claudeJSONPath+" "+claudeJSONPath) {
-		t.Errorf("expected active provider credentials (%s) to be bound: %v", claudeJSONPath, wrapped.Args)
+	priv := cliPrivateHomeSource(t, wrapped.Args, fakeHome)
+	if data, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err != nil || string(data) != "{}" {
+		t.Errorf("expected private copy of .claude.json, got %q %v", data, err)
+	}
+	if fi, err := os.Stat(filepath.Join(priv, ".claude")); err != nil || !fi.IsDir() {
+		t.Errorf("expected private .claude directory: %v", err)
 	}
 }
 
@@ -132,6 +138,7 @@ func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux bubblewrap fail-close; Windows required-sandbox refusal is exercised separately")
 	}
+	cliTestWithoutHostExecAck(t)
 	oldLookup := cliBwrapLookup
 	defer func() { cliBwrapLookup = oldLookup }()
 	cliBwrapLookup = func(file string) (string, error) {
@@ -146,25 +153,30 @@ func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
 		t.Fatal("expected error in default writing context when bwrap is missing, got nil")
 	}
 
-	// 1b. Informational task (TaskExplain) -> falls back gracefully with sanitized env
-	explainCtx := ContextWithTask(context.Background(), TaskExplain)
-	wrappedExplain, err := wrapCLICommandWithSandbox(explainCtx, "claude", cmd)
-	if err != nil {
-		t.Fatalf("TaskExplain context should fallback without error: %v", err)
-	}
-	if wrappedExplain != cmd {
-		t.Errorf("expected original cmd on TaskExplain fallback, got %v", wrappedExplain)
+	// 1b. Informational tasks (explain/analyze) never run on the host without
+	// host-exec authorization (H1).
+	for _, task := range []TaskType{TaskExplain, TaskAnalyze} {
+		if _, err := wrapCLICommandWithSandbox(ContextWithTask(context.Background(), task), "claude", cmd); err == nil {
+			t.Fatalf("task %v must fail closed without host-exec authorization when bwrap is missing", task)
+		}
 	}
 
-	// 1c. Authorized host execution (MAKEWAND_UNSAFE_HOST_EXEC=1 + ack) -> fallback allowed
+	// 1c. Authorized host execution (MAKEWAND_UNSAFE_HOST_EXEC=1 + ack) -> fallback allowed and audited
 	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
-	authCtx := ContextWithUnsafeHostExecAuth(context.Background(), UnsafeHostExecAuth{Acknowledged: true, Source: "test"})
-	wrappedAuth, err := wrapCLICommandWithSandbox(authCtx, "claude", cmd)
-	if err != nil {
-		t.Fatalf("authorized host exec context should fallback without error: %v", err)
+	var audited []string
+	authCtx := ContextWithUnsafeHostExecAuth(context.Background(), UnsafeHostExecAuth{Acknowledged: true, Source: "test",
+		Audit: func(command string, _ []string, _ string) { audited = append(audited, command) }})
+	for _, task := range []TaskType{TaskExplain, TaskReview, TaskCode} {
+		wrappedAuth, err := wrapCLICommandWithSandbox(ContextWithTask(authCtx, task), "claude", cmd)
+		if err != nil {
+			t.Fatalf("authorized host exec context should fallback without error: %v", err)
+		}
+		if wrappedAuth != cmd {
+			t.Errorf("expected original cmd on authorized host exec fallback, got %v", wrappedAuth)
+		}
 	}
-	if wrappedAuth != cmd {
-		t.Errorf("expected original cmd on authorized host exec fallback, got %v", wrappedAuth)
+	if len(audited) != 3 {
+		t.Errorf("every authorized host launch must be audited, got %v", audited)
 	}
 	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "")
 
@@ -207,7 +219,7 @@ func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
 }
 
 func TestWrapCLICommandWithSandbox_LiveExecution(t *testing.T) {
-	bwrapPath, err := exec.LookPath("bwrap")
+	bwrapPath, err := cliBwrapLookup("bwrap")
 	if err != nil {
 		t.Skip("bwrap not installed")
 	}
@@ -263,15 +275,13 @@ func TestWrapCLICommandWithSandbox_WorkspaceIsHome(t *testing.T) {
 	cmd := exec.Command("claude", "-p", "test")
 	cmd.Dir = fakeHome
 
-	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
-	if err != nil {
-		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
-	}
-
-	args := strings.Join(wrapped.Args, " ")
-	sshPath := filepath.Join(fakeHome, ".ssh")
-	if !strings.Contains(args, "--tmpfs "+sshPath) {
-		t.Fatalf("expected .ssh to be masked even when workspace is HOME, got args: %v", wrapped.Args)
+	// HOME as workspace would expose every credential directory: refused for
+	// writable and review sessions alike (M-broad).
+	for _, ctx := range []context.Context{context.Background(), ContextWithTask(context.Background(), TaskReview)} {
+		wrapped, err := wrapCLICommandWithSandbox(ctx, "claude", cmd)
+		if err == nil || wrapped != nil || !strings.Contains(err.Error(), "refusing to use") {
+			t.Fatalf("workspace == HOME must be refused, got %v %v", wrapped, err)
+		}
 	}
 }
 
@@ -346,8 +356,15 @@ func TestWrapCLICommandWithSandbox_HomeMasking(t *testing.T) {
 	if !strings.Contains(args, "--tmpfs /home") {
 		t.Errorf("expected /home to be masked with --tmpfs /home, got: %v", wrapped.Args)
 	}
-	if !strings.Contains(args, "--tmpfs "+fakeUserHome) {
-		t.Errorf("expected user home %s to be masked with --tmpfs, got: %v", fakeUserHome, wrapped.Args)
+	// Writable sessions replace HOME with a private per-run directory.
+	cliPrivateHomeSource(t, wrapped.Args, fakeUserHome)
+
+	review, err := wrapCLICommandWithSandbox(ContextWithTask(context.Background(), TaskReview), "claude", cmd)
+	if err != nil {
+		t.Fatalf("wrapCLICommandWithSandbox(review): %v", err)
+	}
+	if !strings.Contains(strings.Join(review.Args, " "), "--tmpfs "+fakeUserHome) {
+		t.Errorf("expected user home %s to be masked with --tmpfs in review, got: %v", fakeUserHome, review.Args)
 	}
 }
 
@@ -480,6 +497,7 @@ func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testi
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux bubblewrap probe failure; Windows required-sandbox refusal is exercised separately")
 	}
+	cliTestWithoutHostExecAck(t)
 	oldLookup := cliBwrapLookup
 	oldProbe := cliBwrapProbe
 	defer func() {
@@ -512,14 +530,10 @@ func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testi
 		t.Errorf("expected error message to contain probe failure details, got %v", err)
 	}
 
-	// 2. Informational task (TaskExplain) -> graceful fallback to unsandboxed command
+	// 2. Informational task (TaskExplain) without host-exec authorization -> fails closed (H1)
 	explainCtx := ContextWithTask(context.Background(), TaskExplain)
-	fallbackCmd, err := wrapCLICommandWithSandbox(explainCtx, "claude", cmd)
-	if err != nil {
-		t.Fatalf("expected nil error on TaskExplain fallback, got %v", err)
-	}
-	if fallbackCmd != cmd {
-		t.Errorf("expected direct execution cmd returned on fallback, got %v", fallbackCmd)
+	if fallbackCmd, err := wrapCLICommandWithSandbox(explainCtx, "claude", cmd); err == nil || fallbackCmd != nil {
+		t.Fatalf("expected TaskExplain to fail closed on probe failure without authorization, got %v %v", fallbackCmd, err)
 	}
 
 	// 3. Default writing context without auth -> fails closed on probe failure
@@ -659,10 +673,8 @@ func TestWrapCLICommandWithSandbox_SystemdServiceLayout_HomeOutsideHome(t *testi
 		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
 	}
 
-	args := strings.Join(wrapped.Args, " ")
-	if !strings.Contains(args, "--tmpfs "+serviceHome) {
-		t.Errorf("expected service home %s outside /home to be masked with --tmpfs, got: %v", serviceHome, wrapped.Args)
-	}
+	// The service home is replaced by a private per-run home, never exposed.
+	cliPrivateHomeSource(t, wrapped.Args, serviceHome)
 }
 
 func TestWrapCLICommandWithSandbox_RemoteOriginReadOnlyCredentials(t *testing.T) {
@@ -786,10 +798,11 @@ func TestWrapCLICommandWithSandbox_ProviderStateShielding(t *testing.T) {
 
 	args := strings.Join(wrapped.Args, " ")
 
-	// Base provider dir is bound
-	if !strings.Contains(args, "--bind "+claudeDir+" "+claudeDir) {
-		t.Errorf("expected base claude dir to be bound: %v", wrapped.Args)
+	// The base provider dir is a private copy, never the host dir.
+	if strings.Contains(args, "--bind "+claudeDir+" ") {
+		t.Errorf("host claude dir must not be bound writable: %v", wrapped.Args)
 	}
+	cliPrivateHomeSource(t, wrapped.Args, fakeHome)
 
 	// Protected subpaths overlayed read-only
 	for _, sub := range []string{
@@ -806,10 +819,11 @@ func TestWrapCLICommandWithSandbox_ProviderStateShielding(t *testing.T) {
 		}
 	}
 
-	// Ephemeral session dirs overlayed tmpfs
+	// Ephemeral session dirs are not taken from the host: they live in the
+	// discarded private copy.
 	sessionEnv := filepath.Join(claudeDir, "session-env")
-	if !strings.Contains(args, "--tmpfs "+sessionEnv) {
-		t.Errorf("expected ephemeral subpath %s to be mounted --tmpfs, got args: %v", sessionEnv, wrapped.Args)
+	if strings.Contains(args, " "+sessionEnv+" ") {
+		t.Errorf("ephemeral subpath %s must not be bound from the host, got args: %v", sessionEnv, wrapped.Args)
 	}
 }
 
@@ -844,9 +858,10 @@ func TestWrapCLICommandWithSandbox_CodexStateShielding(t *testing.T) {
 
 	args := strings.Join(wrapped.Args, " ")
 
-	if !strings.Contains(args, "--bind "+codexDir+" "+codexDir) {
-		t.Errorf("expected base codex dir to be bound: %v", wrapped.Args)
+	if strings.Contains(args, "--bind "+codexDir+" ") {
+		t.Errorf("host codex dir must not be bound writable: %v", wrapped.Args)
 	}
+	cliPrivateHomeSource(t, wrapped.Args, fakeHome)
 
 	for _, sub := range []string{
 		filepath.Join(codexDir, "config.toml"),
@@ -860,8 +875,8 @@ func TestWrapCLICommandWithSandbox_CodexStateShielding(t *testing.T) {
 	}
 
 	snapDir := filepath.Join(codexDir, "shell_snapshots")
-	if !strings.Contains(args, "--tmpfs "+snapDir) {
-		t.Errorf("expected ephemeral subpath %s to be mounted --tmpfs, got args: %v", snapDir, wrapped.Args)
+	if strings.Contains(args, " "+snapDir+" ") {
+		t.Errorf("ephemeral subpath %s must not be bound from the host, got args: %v", snapDir, wrapped.Args)
 	}
 }
 
@@ -881,8 +896,8 @@ func TestWrapCLICommandWithSandbox_DisplayAndDBusSanitized(t *testing.T) {
 			t.Errorf("expected %s to be sanitized, got: %v", forbidden, sanitized)
 		}
 	}
-	if !strings.Contains(joined, "SAFE_VAR=hello") {
-		t.Errorf("expected SAFE_VAR to be preserved, got: %v", sanitized)
+	if strings.Contains(joined, "SAFE_VAR=hello") || !strings.Contains(joined, "PATH=/bin:/usr/bin") {
+		t.Errorf("expected only allowlisted variables (no SAFE_* prefix), got: %v", sanitized)
 	}
 }
 

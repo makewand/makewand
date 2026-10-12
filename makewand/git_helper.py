@@ -115,41 +115,75 @@ def resolve_safe_git_binary(cwd: Optional[Union[str, Path]] = None) -> str:
     global _RESOLVED_GIT_BINARY
     if _RESOLVED_GIT_BINARY:
         if cwd is not None:
-            try:
-                if Path(_RESOLVED_GIT_BINARY).resolve().is_relative_to(Path(cwd).resolve()):
+            cwd_resolved = Path(cwd).resolve()
+            bin_path = Path(_RESOLVED_GIT_BINARY).resolve()
+            if os.name == "nt":
+                cwd_s = os.path.normcase(str(cwd_resolved))
+                bin_s = os.path.normcase(str(bin_path))
+                if bin_s == cwd_s or bin_s.startswith(cwd_s + os.sep):
                     raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
-            except (ValueError, RuntimeError):
-                pass
+            else:
+                try:
+                    if bin_path.is_relative_to(cwd_resolved):
+                        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
+                except (ValueError, RuntimeError):
+                    pass
         return _RESOLVED_GIT_BINARY
 
     path_entries = os.environ.get("PATH", "").split(os.pathsep)
     clean_entries = []
     cwd_resolved = Path(cwd).resolve() if cwd else None
     for entry in path_entries:
-        if not entry or entry == ".":
+        if not entry or not os.path.isabs(entry):
             continue
         try:
             entry_p = Path(entry).resolve()
-            if cwd_resolved and entry_p.is_relative_to(cwd_resolved):
-                continue
+            if cwd_resolved:
+                if os.name == "nt":
+                    cwd_s = os.path.normcase(str(cwd_resolved))
+                    entry_s = os.path.normcase(str(entry_p))
+                    if entry_s == cwd_s or entry_s.startswith(cwd_s + os.sep):
+                        continue
+                else:
+                    if entry_p.is_relative_to(cwd_resolved):
+                        continue
         except (ValueError, RuntimeError):
-            pass
+            continue
         clean_entries.append(entry)
 
     clean_path = os.pathsep.join(clean_entries)
     found = shutil.which("git", path=clean_path)
     if not found:
-        found = shutil.which("git")
-    if not found:
-        return "git"
+        if cwd_resolved:
+            raw_found = shutil.which("git")
+            if raw_found:
+                raw_path = Path(raw_found).resolve()
+                if os.name == "nt":
+                    cwd_s = os.path.normcase(str(cwd_resolved))
+                    raw_s = os.path.normcase(str(raw_path))
+                    if raw_s == cwd_s or raw_s.startswith(cwd_s + os.sep):
+                        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
+                else:
+                    try:
+                        if raw_path.is_relative_to(cwd_resolved):
+                            raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
+                    except (ValueError, RuntimeError):
+                        pass
+        raise FileNotFoundError("Safe git binary not found in PATH")
 
     found_path = Path(found).resolve()
     if cwd_resolved:
-        try:
-            if found_path.is_relative_to(cwd_resolved):
+        if os.name == "nt":
+            cwd_s = os.path.normcase(str(cwd_resolved))
+            found_s = os.path.normcase(str(found_path))
+            if found_s == cwd_s or found_s.startswith(cwd_s + os.sep):
                 raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
-        except (ValueError, RuntimeError):
-            pass
+        else:
+            try:
+                if found_path.is_relative_to(cwd_resolved):
+                    raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
+            except (ValueError, RuntimeError):
+                pass
 
     _RESOLVED_GIT_BINARY = str(found_path)
     return _RESOLVED_GIT_BINARY
@@ -1185,20 +1219,50 @@ def sanitize_shadow_symlinks(worktree_dir: Path, repo_root: Path):
             p = Path(root) / name
             if _fs_path(p).is_symlink():
                 try:
+                    # Guard against modifying files outside worktree_dir (e.g., if p.parent traverses a symlink into readonly repo_root)
+                    try:
+                        p_parent_resolved = p.parent.resolve()
+                        if not p_parent_resolved.is_relative_to(wt_resolved):
+                            continue
+                    except Exception:
+                        continue
+
                     resolved = p.resolve()
                     # If it resolves inside repo_root and NOT inside worktree_dir, remap to worktree_dir
                     if resolved.is_relative_to(repo_resolved) and not resolved.is_relative_to(wt_resolved):
                         rel = resolved.relative_to(repo_resolved)
                         new_target = wt_resolved / rel
                         rel_target = os.path.relpath(new_target, p.parent)
-                        _fs_path(p).unlink()
-                        os.symlink(rel_target, _fs_path(p))
+                        tmp_link = p.parent / f".tmp_link_{os.getpid()}_{name}"
+                        try:
+                            os.symlink(rel_target, _fs_path(tmp_link))
+                            os.replace(_fs_path(tmp_link), _fs_path(p))
+                        except OSError as e:
+                            if tmp_link.exists() or tmp_link.is_symlink():
+                                try:
+                                    tmp_link.unlink()
+                                except OSError:
+                                    pass
+                            if getattr(e, "errno", None) == errno.EROFS:
+                                continue
+                            raise
                     elif resolved.is_relative_to(wt_resolved):
                         raw_target = os.readlink(_fs_path(p))
                         if Path(raw_target).is_absolute():
                             rel_target = os.path.relpath(resolved, p.parent)
-                            _fs_path(p).unlink()
-                            os.symlink(rel_target, _fs_path(p))
+                            tmp_link = p.parent / f".tmp_link_{os.getpid()}_{name}"
+                            try:
+                                os.symlink(rel_target, _fs_path(tmp_link))
+                                os.replace(_fs_path(tmp_link), _fs_path(p))
+                            except OSError as e:
+                                if tmp_link.exists() or tmp_link.is_symlink():
+                                    try:
+                                        tmp_link.unlink()
+                                    except OSError:
+                                        pass
+                                if getattr(e, "errno", None) == errno.EROFS:
+                                    continue
+                                raise
                 except Exception:
                     pass
 
@@ -1559,6 +1623,7 @@ DEFAULT_SHADOW_RETENTION = 20
 # Rollback backups and shadow worktrees may belong to a task that is still
 # running; they are never pruned while young.
 PROTECTED_YOUNG_SECONDS = 24 * 3600
+SHADOW_YOUNG_SECONDS = 1800
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -1569,7 +1634,13 @@ def _positive_int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _prune_old_entries(root: Path, keep: int, prefixes: Tuple[str, ...], young_protected: Tuple[str, ...]) -> List[str]:
+def _prune_old_entries(
+    root: Path,
+    keep: int,
+    prefixes: Tuple[str, ...],
+    young_protected: Tuple[str, ...],
+    young_seconds: Optional[int] = None,
+) -> List[str]:
     """Keeps the newest ``keep`` entries with the given prefixes; returns removed names."""
     entries = []
     with os.scandir(filesystem_path(root)) as iterator:
@@ -1582,8 +1653,9 @@ def _prune_old_entries(root: Path, keep: int, prefixes: Tuple[str, ...], young_p
     entries.sort(reverse=True)
     removed = []
     now = time.time()
+    barrier = PROTECTED_YOUNG_SECONDS if young_seconds is None else young_seconds
     for mtime, name, entry in entries[keep:]:
-        if name.startswith(young_protected) and now - mtime < PROTECTED_YOUNG_SECONDS:
+        if name.startswith(young_protected) and now - mtime < barrier:
             continue
         if entry.is_dir(follow_symlinks=False):
             errors = _rmtree_collect(Path(entry.path))
@@ -1613,8 +1685,10 @@ def create_private_artifact_dir(kind: str) -> Path:
 def create_private_shadow_dir(base_name: str) -> Path:
     """Creates an empty private directory for a shadow worktree under SHADOW_WORKTREES_DIR."""
     root = ensure_private_dir(config.SHADOW_WORKTREES_DIR)
+    shadow_keep = _positive_int_env("MAKEWAND_SHADOW_KEEP", DEFAULT_SHADOW_RETENTION)
+    shadow_young = _positive_int_env("MAKEWAND_SHADOW_YOUNG_SECONDS", SHADOW_YOUNG_SECONDS)
     try:
-        _prune_old_entries(root, _positive_int_env("MAKEWAND_SHADOW_KEEP", DEFAULT_SHADOW_RETENTION), ("wt_",), ("wt_",))
+        _prune_old_entries(root, shadow_keep, ("wt_",), ("wt_",), young_seconds=shadow_young)
     except OSError as exc:
         print(c(f"⚠ [Makewand Shadow] 影子工作树保留策略执行失败: {exc}", COLOR_YELLOW), file=sys.stderr)
     # The logical repository name is metadata, not part of a filesystem budget.
@@ -1654,10 +1728,15 @@ def workspace_lock_root(cwd: Union[str, Path]) -> str:
     if git_root:
         code, out, _ = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=real)
         if code == 0 and out and out.strip():
-            return os.path.realpath(out.strip())
-        # A git failure must never disable locking: fall back to the filesystem root.
-        return os.path.realpath(git_root)
-    return real
+            root_path = os.path.realpath(out.strip())
+        else:
+            # A git failure must never disable locking: fall back to the filesystem root.
+            root_path = os.path.realpath(git_root)
+    else:
+        root_path = real
+    if sys.platform == "win32":
+        root_path = os.path.normcase(root_path)
+    return root_path
 
 
 class WorkspaceLock:

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/makewand/makewand/internal/trustedbin"
 )
 
 // Candidate verification executes AI-generated code (tests, builds, dependency
@@ -24,7 +26,7 @@ import (
 // without the acknowledgment it never enables host execution.
 
 var (
-	verifyLookPath      = exec.LookPath
+	verifyLookPath      = trustedbin.LookPath
 	verifyGOOS          = runtime.GOOS
 	verifyUserHome      = os.UserHomeDir
 	verifyGetenv        = os.Getenv
@@ -151,7 +153,11 @@ const sandboxHomeRelPath = ".makewand/sandbox-home"
 // verification scripts) that are re-bound read-only on top of the writable
 // workspace. When allowNetwork is false the sandbox additionally unshares the
 // network namespace, which is the default for test/build/compile steps.
-func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string) (string, []string) {
+//
+// The returned argv starts with `--seccomp 3` when the syscall filter applies
+// (see sandboxSeccompArgs); the launcher must supply it via
+// attachSandboxSeccomp. An incomplete workspace socket scan is an error.
+func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string) (string, []string, error) {
 	workspacePath = filepath.Clean(workspacePath)
 	pathEnv := strings.TrimSpace(verifyGetenv("PATH"))
 	if pathEnv == "" {
@@ -160,7 +166,12 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	sandboxHome := filepath.Join(workspacePath, filepath.FromSlash(sandboxHomeRelPath))
 	layout := verifyHomeLayout(workspacePath, pathEnv)
 
-	wrapped := []string{
+	socketMasks, err := sandboxWorkspaceSocketMasks(workspacePath)
+	if err != nil {
+		return "", nil, err
+	}
+
+	wrapped := append(sandboxSeccompArgs(),
 		"--die-with-parent",
 		"--new-session",
 		"--unshare-pid",
@@ -177,7 +188,7 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		// S05 defense: Mask system Unix domain sockets and host IPC runtimes
 		"--tmpfs", "/var/tmp",
 		"--tmpfs", "/run",
-	}
+	)
 	// Hide sensitive host roots (/root, /mnt, /media, /srv) before workspace bind.
 	wrapped = append(wrapped, sandboxMaskedRoots(workspacePath)...)
 	// Hide HOME (and re-bind toolchains) before the workspace bind so a
@@ -189,7 +200,7 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		wrapped = append(wrapped, "--ro-bind", path, path)
 	}
 	// Mask existing domain sockets in workspace with /dev/null (must come after readOnly binds to prevent shadowing)
-	wrapped = append(wrapped, sandboxWorkspaceSocketMasks(workspacePath)...)
+	wrapped = append(wrapped, socketMasks...)
 	wrapped = append(wrapped,
 		"--chdir", workspacePath,
 		"--clearenv",
@@ -211,7 +222,7 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	}
 	wrapped = append(wrapped, command)
 	wrapped = append(wrapped, args...)
-	return bwrapPath, wrapped
+	return bwrapPath, wrapped, nil
 }
 
 // verifyHomeLayout resolves the sandbox HOME layout for a workspace from the

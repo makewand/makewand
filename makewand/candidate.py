@@ -37,6 +37,12 @@ from makewand.protected_files import ProtectedFiles, ProtectionError
 from makewand.windows_paths import filesystem_path
 
 _NO_SECURITY_EXPECTATION = object()
+# Default for callers that do not bind a target preimage (sealing/restore).
+# ``None`` explicitly means "the target must not exist".
+_PREIMAGE_UNCHECKED = object()
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_RENAMEAT2 = []
 
 
 def _fs_path(path):
@@ -243,12 +249,76 @@ def remove_new_generated_bytecode(workspace: Union[str, Path], baseline_manifest
     return sorted(removed)
 
 
+def _renameat2_function():
+    """Linux renameat2 through libc, or None where the platform lacks it."""
+    if not _RENAMEAT2:
+        function = None
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes
+                libc = ctypes.CDLL(None, use_errno=True)
+                function = libc.renameat2
+                function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+                function.restype = ctypes.c_int
+            except (OSError, AttributeError):
+                function = None
+        _RENAMEAT2.append(function)
+    return _RENAMEAT2[0]
+
+
+def _renameat2(directory, source, target, flags):
+    """Rename within one directory handle; False means "unsupported here".
+
+    ENOSYS (old kernel) and EINVAL/EOPNOTSUPP (filesystem without the flag)
+    leave both names untouched, so callers may fall back safely.
+    """
+    function = _renameat2_function()
+    if function is None:
+        return False
+    import ctypes
+    if function(directory, os.fsencode(source), directory, os.fsencode(target), flags) == 0:
+        return True
+    error = ctypes.get_errno()
+    if error in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        return False
+    raise OSError(error, os.strerror(error), target)
+
+
+def _record_at(directory, name):
+    """file_record for a name under an open directory handle, without links."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    with os.fdopen(fd, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            return {"type": "non-regular"}
+        digest = hashlib.sha256()
+        while chunk := stream.read(65536):
+            digest.update(chunk)
+    return {"sha256": digest.hexdigest(), "mode": stat.S_IMODE(opened.st_mode)}
+
+
+def _fsync_directory(path):
+    """Durably publish directory entries; only platforms without O_DIRECTORY skip."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None, *, temporary_name=None,
-                 workspace_identity=None, before_replace=None):
+                 workspace_identity=None, before_replace=None, expected_preimage=_PREIMAGE_UNCHECKED):
     """Write through directory handles and atomically replace, preserving mode.
 
     The source is checked while copying, so a changed candidate cannot win the
     gap between manifest validation and application. No shared inode is edited.
+
+    With ``expected_preimage`` the publication itself is the check on Linux:
+    a new file uses RENAME_NOREPLACE, and an existing one is exchanged and the
+    displaced file verified afterwards; a mismatch exchanges back, leaving the
+    newer user file in place and the candidate at a reported conflict path.
     """
     if os.name == "nt":
         from makewand.native_windows import atomic_copy
@@ -274,6 +344,7 @@ def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None, *, 
         for component in parts[:-1]:
             try:
                 os.mkdir(component, 0o755, dir_fd=directory)
+                os.fsync(directory)
             except FileExistsError:
                 pass
             child = os.open(component, directory_flags, dir_fd=directory)
@@ -299,7 +370,43 @@ def _atomic_copy(workspace: str, rel_path: str, source: Path, expected=None, *, 
                 dst.flush()
                 os.fchmod(dst.fileno(), mode)
                 os.fsync(dst.fileno())
-        os.replace(temp_name, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
+        if before_replace is not None:
+            before_replace()
+        conflict = "Application target changed concurrently before atomic replacement: " + rel_path
+        published = False
+        if expected_preimage is None:
+            try:
+                published = _renameat2(directory, temp_name, parts[-1], _RENAME_NOREPLACE)
+            except FileExistsError:
+                raise ValueError(conflict) from None
+        elif expected_preimage is not _PREIMAGE_UNCHECKED:
+            try:
+                published = _renameat2(directory, temp_name, parts[-1], _RENAME_EXCHANGE)
+            except FileNotFoundError:
+                raise ValueError(conflict) from None
+            if published:
+                # temp_name now holds the displaced target: never unlink it
+                # unless it is exactly the frozen (and backed-up) preimage.
+                created = False
+                try:
+                    displaced = _record_at(directory, temp_name)
+                except OSError:
+                    displaced = None
+                if displaced != expected_preimage:
+                    _renameat2(directory, temp_name, parts[-1], _RENAME_EXCHANGE)
+                    conflict_name = ".makewand-conflict-" + uuid.uuid4().hex
+                    os.rename(temp_name, conflict_name, src_dir_fd=directory, dst_dir_fd=directory)
+                    os.fsync(directory)
+                    conflict_path = Path(rel_path).parent / conflict_name
+                    raise ValueError(conflict + "; newer workspace content kept, candidate preserved at "
+                                     + conflict_path.as_posix())
+                os.unlink(temp_name, dir_fd=directory)
+        if not published:
+            # No renameat2 here: best-effort verify-then-replace.
+            if expected_preimage is not _PREIMAGE_UNCHECKED:
+                if _application_target_record(workspace, rel_path) != expected_preimage:
+                    raise ValueError(conflict)
+            os.replace(temp_name, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
         created = False
         os.fsync(directory)
     finally:
@@ -1654,6 +1761,8 @@ class CandidateManager:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_dir = config.BACKUPS_DIR / f"{r_id}_{ts}_{uuid.uuid4().hex[:8]}"
         backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            _fsync_directory(str(config.BACKUPS_DIR))
 
         journal = []
         durable_journal = {"schema": 1, "workspace": os.path.realpath(base_cwd), "race_id": r_id,
@@ -1663,6 +1772,7 @@ class CandidateManager:
             durable_journal["security_schema"] = 1
         journal_path = backup_dir / "journal.json"
         applied_files = []
+        synced_backup_parents = set()
 
         try:
             _write_application_journal(journal_path, durable_journal)
@@ -1696,12 +1806,28 @@ class CandidateManager:
                     if os.path.islink(target_file) or target_file.is_symlink():
                         raise ValueError(f"安全越界风险: 目标文件 {rel_path} 为符号链接")
                     bak_file = backup_dir / "preimages" / rel_path
+                    created_backup_dirs = []
+                    ancestor = bak_file.parent
+                    while ancestor != backup_dir and not os.path.lexists(_fs_path(ancestor)):
+                        created_backup_dirs.append(ancestor)
+                        ancestor = ancestor.parent
                     _fs_path(bak_file.parent).mkdir(parents=True, exist_ok=True)
                     if os.name == "nt":
                         from makewand.native_windows import copy_backup
                         copy_backup(target_file, bak_file)
                     else:
                         shutil.copy2(target_file, bak_file)
+                        with open(bak_file, "rb") as bf:
+                            os.fsync(bf.fileno())
+                        # The file entry, and every directory entry created for
+                        # it up to the backup root, must be durable before the
+                        # journal claims this backup can restore user data.
+                        pending = [bak_file.parent] + [created.parent for created in created_backup_dirs]
+                        for parent in pending:
+                            parent_str = str(parent)
+                            if parent_str not in synced_backup_parents:
+                                _fsync_directory(parent_str)
+                                synced_backup_parents.add(parent_str)
                     if file_record(bak_file) != preimages[rel_path]:
                         raise ValueError("Application preimage changed during backup: " + rel_path)
                     journal.append({"path": rel_path, "action": "restore", "bak": str(bak_file),
@@ -1748,7 +1874,8 @@ class CandidateManager:
                         before_replace = record_after_security
                     _atomic_copy(base_cwd, rel_path, src_file, expected_manifest.get(rel_path),
                                  temporary_name=Path(entry["temp"]).name,
-                                 workspace_identity=workspace_identity, before_replace=before_replace)
+                                 workspace_identity=workspace_identity, before_replace=before_replace,
+                                 expected_preimage=preimages[rel_path])
                     applied_files.append(f"A/M {rel_path}")
                 elif status == "D":
                     if _fs_path(target_file).exists():

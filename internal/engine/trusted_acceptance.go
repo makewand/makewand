@@ -236,8 +236,11 @@ func acceptancePolicy(ctx context.Context) *frozenTrustedAcceptance {
 // asset. Expected results remain solely in the parent process. HOME/tool caches
 // use a private tmpfs so a candidate cannot leave host-visible state for the next
 // case. No host-execution escape hatch can authorize this driver.
-func wrapTrustedAcceptanceCommand(bwrapPath, workspace string, policy *frozenTrustedAcceptance) (string, []string) {
-	command, args := wrapVerificationCommand(bwrapPath, workspace, policy.commandPath, policy.spec.Args, false, nil)
+func wrapTrustedAcceptanceCommand(bwrapPath, workspace string, policy *frozenTrustedAcceptance) (string, []string, error) {
+	command, args, err := wrapVerificationCommand(bwrapPath, workspace, policy.commandPath, policy.spec.Args, false, nil)
+	if err != nil {
+		return "", nil, err
+	}
 	// Existing wrapper args end with the command and its arguments. Inserting
 	// before that suffix retains all namespace, HOME and credential masks.
 	cut := len(args) - len(policy.spec.Args) - 1
@@ -254,7 +257,7 @@ func wrapTrustedAcceptanceCommand(bwrapPath, workspace string, policy *frozenTru
 		wrapped = append(wrapped, "--ro-bind", os.DevNull, policy.hiddenFile)
 	}
 	wrapped = append(wrapped, args[cut:]...)
-	return command, wrapped
+	return command, wrapped, nil
 }
 
 func (p *Project) runTrustedAcceptance(ctx context.Context, policy *frozenTrustedAcceptance, workspaceDigest, artifactDigest string) (*TrustedAcceptanceRecord, string, bool) {
@@ -310,7 +313,10 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 			return nil, err
 		}
 	}
-	command, args := wrapTrustedAcceptanceCommand(bwrapPath, p.Path, policy)
+	command, args, err := wrapTrustedAcceptanceCommand(bwrapPath, p.Path, policy)
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.Command(command, args...)
 	cmd.Dir = p.Path
 	// bwrap --clearenv constructs the candidate environment. No expected
@@ -321,8 +327,13 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	cmd.WaitDelay = time.Second
 	capture := processjob.NewCapture(policy.spec.MaxOutputBytes, func() { killProcessGroup(cmd) })
 	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
+	closeSeccomp, err := attachSandboxSeccomp(cmd, args)
+	if err != nil {
+		return nil, err
+	}
 	started := time.Now()
-	cleanupProcess, err := processjob.Start(cmd)
+	cleanupProcess, err := processjob.StartSandboxed(cmd)
+	closeSeccomp()
 	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, errors.Join(contextErr, err)

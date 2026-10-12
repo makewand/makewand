@@ -38,11 +38,11 @@ def has_critical_defects(review_text: str) -> bool:
     return evaluate_review_verdict(review_text)["status"] != REVIEW_PASSED
 
 
-def extract_review_verdict_dict(review_text: str) -> Dict[str, Any]:
+def extract_review_verdict_dict(review_text: str, nonce: Optional[str] = None) -> Dict[str, Any]:
     """
     Extract structured review verdict and defects list from review output.
     """
-    verdict = evaluate_review_verdict(review_text)
+    verdict = evaluate_review_verdict(review_text, nonce=nonce)
     passed = verdict["status"] == REVIEW_PASSED
     defects: List[str] = list(verdict["defects"])
 
@@ -76,19 +76,21 @@ def resolve_review_verdict(
     quiet: bool = False,
     dispatch_fn: Optional[Any] = None,
     stage_call_fn: Optional[Any] = None,
+    nonce: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Evaluates a review; if the structured verdict is missing or malformed, asks the same reviewer
     exactly once for the verdict line only. Returns (review_text_for_downstream, verdict).
     """
     text = review_text or ""
-    verdict = evaluate_review_verdict(text)
+    verdict = evaluate_review_verdict(text, nonce=nonce)
     if verdict["status"] != REVIEW_UNVERIFIED or not text.strip() or not engine or timeout <= 0:
         return text, verdict
+    tag = f"MAKEWAND_VERDICT_{nonce}" if nonce else "MAKEWAND_VERDICT"
     if not quiet:
-        print(c(f"⚠ [Makewand Verdict] {engine.upper()} 的审查缺少有效裁决 ({verdict['reason']})，追问一次仅要求输出 MAKEWAND_VERDICT 裁决行...", COLOR_YELLOW))
+        print(c(f"⚠ [Makewand Verdict] {engine.upper()} 的审查缺少有效裁决 ({verdict['reason']})，追问一次仅要求输出 {tag} 裁决行...", COLOR_YELLOW))
 
-    prompt = build_verdict_followup_prompt(text, verdict["reason"])
+    prompt = build_verdict_followup_prompt(text, verdict["reason"], nonce=nonce)
     if dispatch_fn is not None and stage_call_fn is not None:
         res = stage_call_fn("review", dispatch_fn, engine, prompt, engine=engine,
                             cwd=cwd, timeout=timeout, tier=tier, stream=False, readonly=True, repo_root=repo_root, repo_trust=repo_trust)
@@ -103,17 +105,17 @@ def resolve_review_verdict(
         return text, dict(verdict, execution_status=res.status,
                           reason="审查补充裁决结果未确定或预算已耗尽，停止后续派发")
     followup = res[1] if isinstance(res, (tuple, list)) and len(res) == 3 and res[0] else None
-    followup_verdict = evaluate_review_verdict(followup)
+    followup_verdict = evaluate_review_verdict(followup, nonce=nonce)
     if followup_verdict["status"] == REVIEW_UNVERIFIED:
         verdict = dict(verdict)
         verdict["reason"] = f"{verdict['reason']}；追问后仍未获得有效裁决 ({followup_verdict['reason']})"
         if not quiet:
             print(c("❌ [Makewand Verdict] 追问后仍未获得有效裁决，判定为 UNVERIFIED。", COLOR_RED))
         return text, verdict
-    combined = f"{strip_verdict_lines(text).rstrip()}\n\n【审查者追问补充裁决】\n{canonical_verdict_line(followup_verdict)}"
+    combined = f"{strip_verdict_lines(text).rstrip()}\n\n【审查者追问补充裁决】\n{canonical_verdict_line(followup_verdict, nonce=nonce)}"
     if not quiet:
-        print(c(f"✔ [Makewand Verdict] 已获得 {engine.upper()} 的补充裁决: {canonical_verdict_line(followup_verdict)}", COLOR_GREEN))
-    return combined, evaluate_review_verdict(combined)
+        print(c(f"✔ [Makewand Verdict] 已获得 {engine.upper()} 的补充裁决: {canonical_verdict_line(followup_verdict, nonce=nonce)}", COLOR_GREEN))
+    return combined, evaluate_review_verdict(combined, nonce=nonce)
 
 
 def build_autofix_prompt(
@@ -146,11 +148,11 @@ def build_autofix_prompt(
     )
 
 
-def _test_gate_verdict_text(test_err: Optional[str], review_output: Optional[str]) -> str:
+def _test_gate_verdict_text(test_err: Optional[str], review_output: Optional[str], nonce: Optional[str] = None) -> str:
     """Deterministic FAILED verdict for failing local tests; embedded texts cannot smuggle verdict lines."""
     err_snippet = strip_verdict_lines((test_err or "Unknown test failure")[:200])
     return (
-        f"{canonical_verdict_line({'pass': False, 'defects': [f'本地单元测试执行失败: {err_snippet}']})}\n\n"
+        f"{canonical_verdict_line({'pass': False, 'defects': [f'本地单元测试执行失败: {err_snippet}']}, nonce=nonce)}\n\n"
         f"本地单测报错详情如下：\n{strip_verdict_lines((test_err or '')[:2000])}\n\n"
         f"=== 原始审查意见 (已被单元测试硬防线否决) ===\n{strip_verdict_lines(review_output)}"
     )
@@ -202,25 +204,27 @@ def _save_unverified_artifacts(
         return None, str(exc)
 
 
-def format_review_diff(diff: str, max_chars: int = 15000) -> str:
+def format_review_diff(diff: str, max_chars: Optional[int] = None) -> str:
     """
-    Formats git diff for review prompts without silent full-truncation.
-    For small-to-medium diffs, preserves full content.
-    For large diffs (>max_chars), retains head & tail and emits clear truncation notice.
+    Formats git diff for review prompts without silent truncation.
+    Preserves full content up to 64KB without excising the middle slice.
+    If max_chars is explicitly specified, retains head & tail and emits clear truncation notice.
     """
     if not diff:
         return ""
-    if len(diff) <= max_chars:
-        return diff
-    head_len = 10000
-    tail_len = 4000
-    head = diff[:head_len]
-    tail = diff[-tail_len:]
-    return (
-        f"{head}\n\n"
-        f"=== [Makewand Diff Truncated: 变更总长度为 {len(diff)} 字符，已展示前 {head_len} 字符及后 {tail_len} 字符核心片段。请审查模型结合只读文件读取工具审阅全貌] ===\n\n"
-        f"{tail}"
-    )
+    if max_chars is not None:
+        if len(diff) <= max_chars:
+            return diff
+        head_len = 10000 if max_chars >= 14000 else max(1, max_chars // 2)
+        tail_len = 4000 if max_chars >= 14000 else max(1, max_chars // 3)
+        head = diff[:head_len]
+        tail = diff[-tail_len:]
+        return (
+            f"{head}\n\n"
+            f"=== [Makewand Diff Truncated: 变更总长度为 {len(diff)} 字符，已展示前 {head_len} 字符及后 {tail_len} 字符核心片段。请审查模型结合只读文件读取工具审阅全貌] ===\n\n"
+            f"{tail}"
+        )
+    return diff
 
 
 def parse_race_verdict(report: Optional[str]) -> Optional[Dict[str, Any]]:
