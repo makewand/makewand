@@ -298,7 +298,7 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 	if runtime.GOOS != "linux" {
 		t.Skip("native bubblewrap regression requires Linux")
 	}
-	bwrap, err := exec.LookPath("bwrap")
+	bwrap, err := cliBwrapLookup("bwrap")
 	if err != nil {
 		t.Skip("bubblewrap unavailable")
 	}

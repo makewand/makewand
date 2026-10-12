@@ -53,12 +53,24 @@ class TestModelDiscoveryRootFix(unittest.TestCase):
 
     def test_effort_dialect_normalization(self):
         """Verify effort dialects are accurately translated for each provider CLI."""
-        # Codex accepts: low, medium, high (max/ultra -> high)
-        self.assertEqual(normalize_provider_effort("codex", "max"), "high")
-        self.assertEqual(normalize_provider_effort("codex", "xhigh"), "high")
-        self.assertEqual(normalize_provider_effort("codex", "high"), "high")
-        self.assertEqual(normalize_provider_effort("codex", "medium"), "medium")
+        # Codex: model-specific levels from models_cache.json; unknown -> pass through
+        import json, os, tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as codex_home:
+            with open(os.path.join(codex_home, "models_cache.json"), "w", encoding="utf-8") as fh:
+                json.dump({"models": [
+                    {"slug": "gpt-6-astra", "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh", "max", "ultra")]},
+                    {"slug": "gpt-5.5", "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh")]},
+                ]}, fh)
+            with patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                self.assertEqual(normalize_provider_effort("codex", "max", model="gpt-6-astra"), "max")
+                self.assertEqual(normalize_provider_effort("codex", "max", model="gpt-5.5"), "xhigh")
+                self.assertEqual(normalize_provider_effort("codex", "ultra", model="gpt-5.5"), "xhigh")
+                self.assertEqual(normalize_provider_effort("codex", "high", model="gpt-5.5"), "high")
+                self.assertEqual(normalize_provider_effort("codex", "max", model="unlisted-model"), "max")
+                self.assertEqual(normalize_provider_effort("codex", "medium", model="gpt-6-astra"), "medium")
         self.assertEqual(normalize_provider_effort("codex", "low"), "low")
+        self.assertEqual(normalize_provider_effort("codex", "bogus"), "medium")
 
         # Grok accepts: low, medium, high, xhigh (max/ultra -> xhigh)
         self.assertEqual(normalize_provider_effort("grok", "max"), "xhigh")

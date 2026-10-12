@@ -1,8 +1,14 @@
 # Antigravity (AGY) 接入指南
 
-Antigravity 搭载 Google AI Pro 订阅（Gemini 3.8 Flash & Pro），具备 100 万+ Token 超长上下文与强大的架构设计和思维推理能力。
+推荐把 Antigravity 作为调用 makewand 的中心工具：它的额度通常最充裕，可以把 Claude 与 Codex 的额度留给 makewand 派发的实际实现和审查。
 
-## 在 Antigravity 中使用 Makewand
-Antigravity 已全局配置 `makewand-orchestrator` Skill 与全局行为准则：
-- 当遇到复杂多文件重构、高难度算法、并发死锁排查或跨模型独立盲审时，Antigravity 可直接调用 `makewand` CLI。
-- 在提示词中提及多模型协作或直接执行 `makewand run` 即可激活联动流水线。
+## 安装 skill
+
+源码安装会把 `skills/makewand-orchestrator/SKILL.md` 复制到 `~/.gemini/config/skills/makewand-orchestrator/`（可用 `MAKEWAND_SKILLS_DIR` 改目录）。手动更新时直接覆盖该文件即可。
+
+skill 规定了何时调用、各命令的成本、如何按退出码判断结果、影子工作树交付需要征得用户同意后再应用补丁，以及禁止递归调用。agy 自己的全局准则（`GEMINI.md`）不要再写"优先激活 makewand"之类会让 agy 自动发起多模型任务的规则。
+
+## 注意
+
+- 在 agy 交互界面中调用时，agy 自身会被识别为同目录的交互式 AI 会话，`makewand run` 通常走影子工作树，只生成补丁。
+- makewand 派发 agy 时会带 `MAKEWAND_PROVIDER_WORKER=1`；被派发的 agy 不能再调用 makewand。

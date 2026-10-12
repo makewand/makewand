@@ -1,14 +1,11 @@
 # Codex CLI 接入指南
 
-Codex CLI 搭载 OpenAI 订阅（gpt-6-astra 模型），具备出色的底层指令排查、并发死锁分析与安全审计能力。
-
-## 在 Codex CLI 中使用 Makewand
-可在 `~/.codex/rules/default.rules` 或项目 `AGENTS.md` 中集成：
+Codex 在这套体系里主要是被 makewand 派发的实现者和审查者，不需要安装完整 skill。只在你自己用 Codex 工作、偶尔想要跨模型审查时，在 `~/.codex/AGENTS.md`（或项目的 `AGENTS.md`）加入下面这段。注意不要写进 `~/.codex/rules/`，那里是 Codex 的命令执行策略文件，不是说明文档。
 
 ```markdown
-## 多模型联合调度工具 (Makewand)
-当需要发起跨模型联合编码或方案对比时：
-- 使用 `makewand status` 查看各模型健康度与限流状态。
-- 使用 `makewand run "<任务>"` 自动编排 Antigravity 与 Claude 协同开发。
-- 使用 `makewand race "<任务>"` 进行方案并发竞速对比。
+## Makewand（多模型调度，仅在用户明确要求时使用）
+- 只有当用户明确提出"用 makewand""跨模型审查""让别的模型看看"时才调用，不要自行发起。
+- 审查当前未提交的改动：`makewand review`（只读，耗时数分钟，请在后台运行并等待结束）。退出码：0=通过，10=发现缺陷（见 `MAKEWAND_VERDICT_*` 行），11=未能验证。
+- 查看各订阅的额度与健康状态：`makewand status`。
+- 如果环境变量 `MAKEWAND_PROVIDER_WORKER=1`，说明你正被 makewand 派发执行子任务：不要调用 makewand，直接完成分配的任务。
 ```

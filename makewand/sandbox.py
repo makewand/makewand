@@ -329,7 +329,7 @@ PROVIDER_HOME_BIN_DIRS = {
 # Bounds for build-time tree scans (eng-delivery#7). The workspace socket scan
 # walks everything (node_modules, .git internals included, H5); a truncated scan
 # fails closed for writable sessions.
-SCAN_ENTRY_LIMIT = 300_000
+SCAN_ENTRY_LIMIT = 1_000_000  # MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT overrides
 BROAD_SCAN_DEPTH = 3
 PROVIDER_SCAN_DEPTH = 3
 PROVIDER_SCAN_ENTRY_LIMIT = 20_000
@@ -655,6 +655,24 @@ def _warn(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # bounded scans
 # ---------------------------------------------------------------------------
+def _untraversable_foreign_dir(path: str) -> bool:
+    """A directory another user owns that the current user cannot enter."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode) or not hasattr(os, "geteuid") or st.st_uid == os.geteuid():
+        return False
+    return not os.access(path, os.X_OK)
+
+
+def _workspace_scan_limit() -> int:
+    raw = os.environ.get("MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return SCAN_ENTRY_LIMIT
+
+
 def _scan_tree(
     roots: Iterable[str],
     *,
@@ -676,13 +694,20 @@ def _scan_tree(
     sockets: Set[str] = set()
     skip_abs = {_norm(p) for p in skip_paths}
     seen = 0
-    truncated = False
+    truncated = False   # entry budget exhausted: stop walking
+    incomplete = False  # an unreadable directory we own was skipped: keep walking
     # (path, depth, inside_git): .git entries below a .git directory are not recorded
     stack: List[Tuple[str, int, bool]] = [(_norm(r), 0, False) for r in roots if r and os.path.isdir(r)]
     while stack:
         cur, depth, in_git = stack.pop()
         try:
             it = os.scandir(cur)
+        except PermissionError:
+            # Another user's directory we cannot enter is out of the sandbox's
+            # reach too; one we own could be chmod-ed back from inside.
+            if not _untraversable_foreign_dir(cur):
+                incomplete = True
+            continue
         except OSError:
             continue
         with it:
@@ -714,7 +739,7 @@ def _scan_tree(
                     continue
         if truncated:
             break
-    return git_paths, sockets, truncated
+    return git_paths, sockets, truncated or incomplete
 
 
 def _host_var_socket_masks() -> List[str]:
@@ -1308,7 +1333,8 @@ def wrap_bwrap(
         "--unshare-ipc",
         "--unshare-uts",
         "--unshare-user",
-        "--disable-userns",
+        # No --disable-userns (bubblewrap >= 0.8 only; provider CLIs such as
+        # codex also run their own bubblewrap sandbox inside this one).
         "--clearenv",
         # Read-only host root filesystem
         "--ro-bind", "/", "/",
@@ -1446,10 +1472,11 @@ def wrap_bwrap(
         if not any(_is_within(r, s) for s in scan_roots):
             scan_roots.append(r)
     broad = any(_broad_workspace(r, user_home) for r in scan_roots)
+    scan_limit = _workspace_scan_limit()
     git_paths, ws_sockets, truncated = _scan_tree(
         scan_roots,
         max_depth=BROAD_SCAN_DEPTH if broad else None,
-        entry_limit=SCAN_ENTRY_LIMIT,
+        entry_limit=scan_limit,
         collect_git=not readonly,
         skip_dirs=frozenset(),
         descend_git=True,
@@ -1457,10 +1484,11 @@ def wrap_bwrap(
     if truncated:
         if not readonly:
             raise SandboxConfigError(
-                f"工作区条目超过 {SCAN_ENTRY_LIMIT}，.git 保护与套接字遮蔽扫描无法完成，拒绝可写沙箱 (fail closed)。"
-                "请在更小的项目目录中运行或清理工作区。"
+                f"工作区扫描未能完成（条目超过 {scan_limit}，或含有当前用户自己的不可读目录），"
+                ".git 保护与套接字遮蔽无法确认，拒绝可写沙箱 (fail closed)。"
+                "可用 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT 调高上限，或恢复相关目录的读取权限。"
             )
-        _warn(f"工作区条目超过 {SCAN_ENTRY_LIMIT}，套接字遮蔽扫描已截断（只读会话，更深处的套接字未被遮蔽）")
+        _warn(f"工作区扫描未能完成（条目超过 {scan_limit} 或有不可读目录），套接字遮蔽不完整（只读会话）")
 
     # In writable sessions, protect all root .git directories AND submodule .git gitfiles from tampering
     if not readonly:
@@ -1832,10 +1860,9 @@ def get_writable_sandbox_guidance(provider_name: str = "") -> str:
     if sys.platform == "darwin":
         return (
             f"❌ [{prov_label}沙箱不可用] {prov_label}写入任务强制要求隔离沙箱，但 Bubblewrap (bwrap) 依赖 Linux 内核命名空间，macOS 无法运行 bwrap。\n"
-            "在 macOS 上继续使用 Makewand 的建议途径：\n"
-            "  1. [只读审查与设计] 使用只读模式运行代码审查或方案设计：makewand review 或在提示词中显式指定只读分析；\n"
-            "  2. [Linux 容器/远端运行] 在 Linux Docker 容器、虚拟机或指定远端服务中运行：--remote-url <URL>；\n"
-            "  3. [受权宿主执行（自担风险）] 若当前工作区完全受信任且知晓安全风险，可显式授权直接在宿主机执行：\n"
+            "在 macOS 上继续使用 Makewand 的建议途径（没有沙箱时，只读审查 makewand review 同样需要下面的授权）：\n"
+            "  1. [Linux 容器/虚拟机] 在装有 Bubblewrap 的 Linux Docker 容器或虚拟机中运行 makewand；\n"
+            "  2. [受权宿主执行（自担风险）] 若当前工作区完全受信任且知晓安全风险，可显式授权直接在宿主机执行：\n"
             "     配置 MAKEWAND_UNSAFE_HOST_EXEC=1 并通过终端交互输入 'yes' 授权确认（或预置 config.json 授权）；\n"
             "     所有无沙箱宿主执行操作均将被永久记入 ~/.config/makewand/unsafe_exec_audit.jsonl 审计日志。"
         )
@@ -1843,9 +1870,9 @@ def get_writable_sandbox_guidance(provider_name: str = "") -> str:
         return (
             f"❌ [{prov_label}沙箱未就绪] {prov_label}写入任务强制要求 Bubblewrap (bwrap) 沙箱隔离，系统未检测到可用 bwrap 环境 (fail closed)。\n"
             "解决建议：\n"
-            "  1. [安装沙箱] 安装 Bubblewrap 并启用非特权用户命名空间 (例如: sudo apt install bubblewrap，sysctl kernel.unprivileged_userns_clone=1)；\n"
-            "  2. [只读审查] 使用只读模式运行代码审查与方案设计：makewand review；\n"
-            "  3. [受权宿主执行（自担风险）] 若当前工作区受信任且知晓安全风险，可配置 MAKEWAND_UNSAFE_HOST_EXEC=1 并通过交互确认授权（所有执行将记入审计日志）。"
+            "  1. [安装沙箱] 安装 Bubblewrap 并启用非特权用户命名空间 (例如: sudo apt install bubblewrap，sysctl kernel.unprivileged_userns_clone=1)；"
+            "bwrap 只从 root 拥有的系统目录解析，装在其他位置时用 MAKEWAND_BWRAP_PATH 指定绝对路径；\n"
+            "  2. [受权宿主执行（自担风险）] 若当前工作区受信任且知晓安全风险，可配置 MAKEWAND_UNSAFE_HOST_EXEC=1 并通过交互确认授权（所有执行将记入审计日志；没有沙箱时只读审查同样需要此授权）。"
         )
 
 
@@ -1894,7 +1921,7 @@ def get_readonly_sandbox_guidance(provider_name: str = "") -> str:
         f"只读约束只是 CLI 自身的工具策略，{reason} (fail closed)。\n"
         "解决建议：\n"
         "  1. [安装沙箱] Linux 上安装 Bubblewrap 并启用非特权用户命名空间；\n"
-        "  2. [API 模式] 配置对应 provider 的 API Key，由无工具的 API 调用完成审查；\n"
+        "  2. [API 模式] 配置对应 provider 的 API Key 并设置 MAKEWAND_API_POLICY=allow_paid（按量计费），由无工具的 API 调用完成审查；\n"
         "  3. [受权宿主执行（自担风险）] 配置 MAKEWAND_UNSAFE_HOST_EXEC=1 并通过交互确认授权（所有执行将记入审计日志）。"
     )
 
@@ -1955,6 +1982,13 @@ def _trusted_system_binary(name: str) -> Optional[str]:
 
 def _env_limit(env: str, default: str, pattern) -> str:
     val = os.environ.get(env, "").strip() or default
+    # Same contract as the Go engine (internal/processjob): 0/off/none mean no
+    # cap, and 8g / 8GiB style sizes are accepted.
+    if val.lower() in ("0", "off", "none", "infinity"):
+        return "infinity"
+    size = re.match(r"^(\d+)\s*([kmgt])(?:i?b)?$", val, re.IGNORECASE)
+    if size:
+        val = size.group(1) + size.group(2).upper()
     if not pattern.match(val):
         _warn(f"{env}={val!r} 格式无效，使用默认值 {default}")
         return default
@@ -1979,22 +2013,6 @@ def _systemd_scope_usable(systemd_run: str) -> bool:
     return ok
 
 
-def _user_process_count() -> int:
-    uid = os.getuid() if hasattr(os, "getuid") else -1
-    n = 0
-    try:
-        for name in os.listdir("/proc"):
-            if name.isdigit():
-                try:
-                    if os.stat(f"/proc/{name}").st_uid == uid:
-                        n += 1
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return n
-
-
 def _rlimit_arg(resource_mod, which: int, want: int) -> str:
     """soft:hard with hard kept at the current hard limit (an unprivileged prlimit cannot raise it)."""
     _soft, hard = resource_mod.getrlimit(which)
@@ -2007,8 +2025,9 @@ def sandbox_resource_limit_prefix() -> List[str]:
     """
     Launcher prefix that bounds a sandboxed process tree: a transient systemd
     user scope (MemoryMax / MemorySwapMax=0 / TasksMax) when available, else
-    prlimit --nproc/--nofile/--fsize (never --as: torch/BLAS reserve huge
-    virtual ranges), else nothing (warned once).
+    prlimit --nofile/--fsize (never --as: torch/BLAS reserve huge virtual
+    ranges; never --nproc: RLIMIT_NPROC counts every thread of the uid, so
+    any relative budget breaks bwrap on busy hosts), else nothing (warned once).
     """
     if os.name != "posix":
         return []
@@ -2026,10 +2045,6 @@ def sandbox_resource_limit_prefix() -> List[str]:
             import resource
             fsize = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_FSIZE", 1024 * 1024 * 1024))
             prefix = [prlimit]
-            if tasks != "infinity":
-                # RLIMIT_NPROC counts every process of the uid: budget = current + TasksMax
-                budget = _user_process_count() + int(tasks)
-                prefix.append(f"--nproc={_rlimit_arg(resource, resource.RLIMIT_NPROC, budget)}")
             prefix.append(f"--nofile={_rlimit_arg(resource, resource.RLIMIT_NOFILE, DEFAULT_SANDBOX_NOFILE)}")
             prefix.append(f"--fsize={_rlimit_arg(resource, resource.RLIMIT_FSIZE, fsize)}")
             return prefix + ["--"]
@@ -2048,6 +2063,8 @@ class ProviderLaunch:
     sandboxed: bool
     auth_source: Optional[str] = None
     home: Optional["ProviderHome"] = None
+    # Extra environment for the launched process (run_subprocess extra_env).
+    env: Dict[str, str] = field(default_factory=dict)
 
 
 @contextmanager
@@ -2073,7 +2090,9 @@ def provider_sandbox_launch(
     """
     if not is_bwrap_available():
         source = authorize_unsandboxed_launch(provider, cmd, cwd, readonly, repo_trust, host_auth_source)
-        yield ProviderLaunch(["env", f"{PROVIDER_WORKER_ENV}=1", *cmd], (), False, source)
+        # Passed through the process environment rather than an `env` prefix,
+        # which does not exist on Windows.
+        yield ProviderLaunch(list(cmd), (), False, source, env={PROVIDER_WORKER_ENV: "1"})
         return
     with seccomp_filter_context(enabled=True) as (seccomp_fd, pass_fds):
         with provider_home_session(provider, [cwd, repo_root or ""]) as home:

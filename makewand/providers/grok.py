@@ -177,6 +177,7 @@ def execute_grok_task(
                     stream=stream,
                     print_prefix=c("[Grok Live]", COLOR_YELLOW),
                     pass_fds=launch.pass_fds,
+                    extra_env=launch.env,
                 )
         except SandboxUnavailableError as exc:
             return False, None, str(exc)

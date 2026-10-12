@@ -155,6 +155,7 @@ def execute_claude_task(
                 stream=stream,
                 print_prefix=c("[Claude Live]", COLOR_BLUE),
                 pass_fds=launch.pass_fds,
+                extra_env=launch.env,
             )
     except SandboxUnavailableError as exc:
         return False, None, str(exc)

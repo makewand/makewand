@@ -94,7 +94,7 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
             bound = ro_bound(cmd)
             self.assertIn(ws, bound)
             self.assertNotIn(str(deep / ".git"), bound)
-            self.assertIn("截断", err.getvalue())
+            self.assertIn("工作区扫描未能完成", err.getvalue())
 
     def test_tmp_workspace_scan_is_shallow_and_fast(self):
         base = Path(tempfile.mkdtemp(prefix="g4-scan-"))  # /tmp/g4-scan-xxx

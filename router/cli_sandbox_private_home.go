@@ -197,6 +197,11 @@ func (h *cliPrivateHome) copyIn(hostRoot, privRoot string, f cliPrivateCredFile)
 	}
 	hostFile := filepath.Join(hostRoot, rel)
 	privFile := filepath.Join(privRoot, rel)
+	// Credential paths are absolute host paths built by makewand; refuse
+	// anything relative or carrying parent references outright.
+	if !filepath.IsAbs(hostFile) || strings.Contains(hostFile, "..") {
+		return fmt.Errorf("invalid credential path %q", hostFile)
+	}
 
 	canonical := ""
 	var data []byte
@@ -374,6 +379,9 @@ func cliReadPrivateRegular(root, path string) ([]byte, bool) {
 
 // cliReadRegularFile reads a bounded regular file.
 func cliReadRegularFile(path string) ([]byte, error) {
+	if !filepath.IsAbs(path) || strings.Contains(path, "..") {
+		return nil, fmt.Errorf("invalid credential path %q", path)
+	}
 	f, err := os.Open(path) //nolint:gosec // G304: provider credential path chosen by makewand, not request input
 	if err != nil {
 		return nil, err
@@ -397,6 +405,9 @@ func cliReadRegularFile(path string) ([]byte, error) {
 }
 
 func cliAtomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	if !filepath.IsAbs(path) || strings.Contains(path, "..") {
+		return fmt.Errorf("invalid credential path %q", path)
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".makewand-*")
 	if err != nil {
 		return err

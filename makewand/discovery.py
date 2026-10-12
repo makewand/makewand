@@ -33,7 +33,27 @@ def _matches_token(word: str, text: str) -> bool:
     return bool(re.search(r'(?<![a-z0-9])' + re.escape(word.lower()) + r'(?![a-z0-9])', text.lower()))
 
 
-def normalize_provider_effort(provider: str, effort: Optional[str]) -> Optional[str]:
+_EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _codex_model_efforts(model: Optional[str]) -> Optional[List[str]]:
+    """Reasoning efforts Codex lists for `model` in its own models_cache.json."""
+    if not model:
+        return None
+    base = Path(os.environ["CODEX_HOME"]).expanduser() if os.environ.get("CODEX_HOME") else Path.home() / ".codex"
+    try:
+        data = json.loads((base / "models_cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    for m in data.get("models", []) if isinstance(data, dict) else []:
+        if isinstance(m, dict) and (m.get("slug") or m.get("id")) == model:
+            levels = m.get("supported_reasoning_levels") or []
+            found = [str(lv.get("effort") if isinstance(lv, dict) else lv).strip().lower() for lv in levels]
+            return [e for e in found if e in _EFFORT_ORDER] or None
+    return None
+
+
+def normalize_provider_effort(provider: str, effort: Optional[str], model: Optional[str] = None) -> Optional[str]:
     """
     Translates canonical effort ('low', 'medium', 'high', 'xhigh', 'max')
     into the specific parameter dialect accepted by the target CLI provider.
@@ -43,13 +63,19 @@ def normalize_provider_effort(provider: str, effort: Optional[str]) -> Optional[
     eff = str(effort).strip().lower()
 
     if provider == "codex":
-        # Codex config model_reasoning_effort accepts: low, medium, high
-        if eff in ("max", "ultra", "xhigh", "high"):
-            return "high"
-        elif eff in ("minimal", "low"):
-            return "low"
-        else:
+        # Codex efforts are model-specific (models_cache.json: gpt-6-astra
+        # low..ultra, gpt-5.5 up to xhigh). Clamp to the highest level the model
+        # lists that does not exceed the request; pass through when unknown.
+        if eff not in _EFFORT_ORDER:
             return "medium"
+        supported = _codex_model_efforts(model)
+        if not supported:
+            return eff
+        rank = _EFFORT_ORDER.index(eff)
+        allowed = [e for e in supported if _EFFORT_ORDER.index(e) <= rank]
+        if allowed:
+            return max(allowed, key=_EFFORT_ORDER.index)
+        return min(supported, key=_EFFORT_ORDER.index)
 
     elif provider == "grok":
         # Grok CLI accepts: low, medium, high, xhigh

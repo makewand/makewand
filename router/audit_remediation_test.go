@@ -75,6 +75,11 @@ func TestAuditRemediation_ForbiddenWritableRoots(t *testing.T) {
 		t.Errorf("normal project %s should NOT be forbidden", normalWS)
 	}
 
+	if runtime.GOOS != "linux" {
+		return // the refusals below belong to the Linux bubblewrap mount plan
+	}
+	auditFixMockBwrap(t)
+
 	// wrapCLICommandWithSandbox must fail closed when workspace is forbidden and not review
 	cmd := exec.Command("echo", "hi")
 	cmd.Dir = "/"

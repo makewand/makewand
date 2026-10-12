@@ -185,13 +185,19 @@ type HTTPHandlerOptions struct {
 	// or above a typical per-request cost to keep overshoot small or zero. Zero
 	// disables reservation (a headroom-only check).
 	//
-	// When a reachable API model is priced, the actual reservation is the larger
-	// of this floor and the request's worst-case spend (prompt estimate × input
-	// price + per-call max output × output price, multiplied across every
-	// attempt, including Power-mode generators, judge and fallback); streams
-	// are stopped once their estimated spend exceeds that reservation. See
-	// Router.httpReservationUSD.
+	// With ScaleBudgetReservation, the actual reservation is the larger of this
+	// floor and the request's worst-case spend; see ScaleBudgetReservation.
 	BudgetReservationUSD float64
+
+	// ScaleBudgetReservation sizes each reservation from the router's pricing
+	// (prompt estimate × input price + per-call max output × output price,
+	// across every attempt, including Power-mode generators, judge and
+	// fallback; see Router.httpReservationUSD) and stops streams whose
+	// estimated spend exceeds it. The ceiling is the most expensive reachable
+	// model and uncertain outcomes settle at the reservation, so small budgets
+	// are consumed much faster than actual spend; it is therefore opt-in
+	// (makewand serve: MAKEWAND_SCALED_BUDGET_RESERVATION=1).
+	ScaleBudgetReservation bool
 	// BudgetReserver enables SQLite-backed, cross-process token and team budget
 	// admission. UsageLogger must settle reservations in the same durable store.
 	BudgetReserver serverusage.BudgetReserver
@@ -408,7 +414,10 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	reservationUSD := prepared.Router.httpReservationUSD(opt.BudgetReservationUSD, prepared)
+	reservationUSD := sanitizeCost(opt.BudgetReservationUSD)
+	if opt.ScaleBudgetReservation {
+		reservationUSD = prepared.Router.httpReservationUSD(opt.BudgetReservationUSD, prepared)
+	}
 	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry, reservationUSD)
 	if rejected {
 		return
@@ -614,7 +623,10 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		writeHTTPError(w, httpErr.Status, httpErr.Code, httpErr.Message)
 		return
 	}
-	reservationUSD := prepared.Router.httpReservationUSD(opt.BudgetReservationUSD, prepared)
+	reservationUSD := sanitizeCost(opt.BudgetReservationUSD)
+	if opt.ScaleBudgetReservation {
+		reservationUSD = prepared.Router.httpReservationUSD(opt.BudgetReservationUSD, prepared)
+	}
 	settle, rejected := r.applyBudgetReservation(req.Context(), w, opt, grant, &auditEvent, &usageEntry, reservationUSD)
 	if rejected {
 		return
@@ -782,7 +794,10 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		responseModel = result.Actual
 	}
 	applyHTTPUsage(nil, usage, result, auditEvent, usageEntry)
-	spendGuard := newHTTPStreamSpendGuard(activeRouter, reservationUSD, result, messages, system, usage)
+	var spendGuard *httpStreamSpendGuard
+	if opt.ScaleBudgetReservation {
+		spendGuard = newHTTPStreamSpendGuard(activeRouter, reservationUSD, result, messages, system, usage)
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -940,7 +955,10 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 		responseModel = result.Actual
 	}
 	applyHTTPUsage(nil, usage, result, auditEvent, usageEntry)
-	spendGuard := newHTTPStreamSpendGuard(activeRouter, reservationUSD, result, messages, system, usage)
+	var spendGuard *httpStreamSpendGuard
+	if opt.ScaleBudgetReservation {
+		spendGuard = newHTTPStreamSpendGuard(activeRouter, reservationUSD, result, messages, system, usage)
+	}
 
 	responseID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
 	w.Header().Set("Content-Type", "text/event-stream")

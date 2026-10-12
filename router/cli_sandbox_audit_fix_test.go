@@ -18,11 +18,15 @@ import (
 	"time"
 )
 
+// auditFixMockBwrap makes the mount plan think a working bwrap exists without
+// executing one, so mount-plan tests also run where bwrap is missing or
+// restricted (e.g. AppArmor user-namespace limits).
 func auditFixMockBwrap(t *testing.T) {
 	t.Helper()
-	oldLookup := cliBwrapLookup
-	t.Cleanup(func() { cliBwrapLookup = oldLookup })
+	oldLookup, oldProbe := cliBwrapLookup, cliBwrapProbe
+	t.Cleanup(func() { cliBwrapLookup, cliBwrapProbe = oldLookup, oldProbe })
 	cliBwrapLookup = func(string) (string, error) { return "/usr/bin/bwrap", nil }
+	cliBwrapProbe = func(string) error { return nil }
 }
 
 func auditFixMissingBwrap(t *testing.T) {
@@ -37,7 +41,7 @@ func auditFixRequireLiveBwrap(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("native bubblewrap requires Linux")
 	}
-	bwrap, err := exec.LookPath("bwrap")
+	bwrap, err := cliBwrapLookup("bwrap")
 	if err != nil {
 		t.Skip("bubblewrap unavailable")
 	}
@@ -135,6 +139,9 @@ func TestAuditFix_HostExecRequiresAuthorizationForEveryTask(t *testing.T) {
 
 // H3: host provider directories are never bound writable.
 func TestAuditFix_ProviderStateNeverBoundWritable(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("private provider homes are part of the Linux bubblewrap mount plan")
+	}
 	auditFixMockBwrap(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -469,7 +476,7 @@ func TestAuditFix_TruncatedWorkspaceScanFailsClosed(t *testing.T) {
 	}
 	cmd := exec.Command("/usr/bin/true")
 	cmd.Dir = ws
-	if _, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd); err == nil || !strings.Contains(err.Error(), "too large to verify") {
+	if _, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd); err == nil || !strings.Contains(err.Error(), "could not be fully scanned") {
 		t.Fatalf("truncated scan did not fail closed: %v", err)
 	}
 	if _, err := wrapCLICommandWithSandbox(ContextWithTask(context.Background(), TaskReview), "claude", cmd); err != nil {
@@ -747,4 +754,22 @@ func cliHasMount(args []string, flag, path string) bool {
 		}
 	}
 	return false
+}
+
+// An unreadable directory the current user owns leaves the workspace scan
+// incomplete (a sandboxed process could chmod it back); writable sessions then
+// fail closed.
+func TestAuditFix_OwnUnreadableDirTruncatesScan(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("POSIX permissions as a non-root user")
+	}
+	ws := t.TempDir()
+	locked := filepath.Join(ws, "locked")
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	if scan := cliScanWorkspace(ws); !scan.truncated {
+		t.Fatal("own unreadable directory did not mark the scan incomplete")
+	}
 }

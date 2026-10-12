@@ -314,6 +314,7 @@ def execute_muse_task(
                     stream=stream,
                     print_prefix=c("[Muse Live]", COLOR_PURPLE),
                     pass_fds=launch.pass_fds,
+                    extra_env=launch.env,
                 )
         except SandboxUnavailableError as exc:
             return False, None, str(exc)

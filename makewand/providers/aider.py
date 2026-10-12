@@ -107,6 +107,7 @@ def execute_aider_task(
                     stream=stream,
                     print_prefix=c("[Aider Live]", COLOR_GREEN),
                     pass_fds=launch.pass_fds,
+                    extra_env=launch.env,
                 )
         except SandboxUnavailableError as exc:
             return False, None, str(exc)

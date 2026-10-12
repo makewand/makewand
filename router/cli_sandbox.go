@@ -1,9 +1,7 @@
 package router
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/makewand/makewand/internal/seccompbpf"
 	"github.com/makewand/makewand/internal/trustedbin"
 )
 
@@ -177,99 +176,10 @@ func isForbiddenWritableWorkspace(workspace string, extraHomes ...string) bool {
 	return false
 }
 
-// generateSeccompBPFFilter generates a strict Seccomp-BPF filter blocking high-risk Linux syscalls
-// (ptrace, bpf, keyctl, process_vm_readv, process_vm_writev, userfaultfd) and X32 ABI bypasses.
+// generateSeccompBPFFilter returns the shared seccomp filter (see
+// internal/seccompbpf), nil on unsupported architectures.
 func generateSeccompBPFFilter() []byte {
-	const (
-		bpfLd           = 0x00
-		bpfW            = 0x00
-		bpfAbs          = 0x20
-		bpfJmp          = 0x05
-		bpfJeq          = 0x10
-		bpfJge          = 0x30
-		bpfK            = 0x00
-		bpfRet          = 0x06
-		seccompRetErrno = 0x00050000
-		seccompRetAllow = 0x7fff0000
-		eperm           = 1
-
-		auditArchX86_64  = 0xc000003e
-		auditArchAarch64 = 0xc00000b7
-	)
-
-	var expectedArch uint32
-	var blockedSyscalls []uint32
-	isX86_64 := false
-
-	switch runtime.GOARCH {
-	case "amd64":
-		expectedArch = auditArchX86_64
-		blockedSyscalls = []uint32{
-			101, // ptrace
-			321, // bpf
-			250, // keyctl
-			310, // process_vm_readv
-			311, // process_vm_writev
-			323, // userfaultfd
-		}
-		isX86_64 = true
-	case "arm64":
-		expectedArch = auditArchAarch64
-		blockedSyscalls = []uint32{
-			117, // ptrace
-			280, // bpf
-			219, // keyctl
-			270, // process_vm_readv
-			271, // process_vm_writev
-			282, // userfaultfd
-		}
-	default:
-		return nil
-	}
-
-	buf := new(bytes.Buffer)
-	stmt := func(code uint16, k uint32) {
-		_ = binary.Write(buf, binary.LittleEndian, code)
-		_ = binary.Write(buf, binary.LittleEndian, uint8(0))
-		_ = binary.Write(buf, binary.LittleEndian, uint8(0))
-		_ = binary.Write(buf, binary.LittleEndian, k)
-	}
-	jmp := func(code uint16, k uint32, jt, jf uint8) {
-		_ = binary.Write(buf, binary.LittleEndian, code)
-		_ = binary.Write(buf, binary.LittleEndian, jt)
-		_ = binary.Write(buf, binary.LittleEndian, jf)
-		_ = binary.Write(buf, binary.LittleEndian, k)
-	}
-
-	// 1. Load architecture: [BPF_LD | BPF_W | BPF_ABS, offset 4]
-	stmt(bpfLd|bpfW|bpfAbs, 4)
-	// 2. Check architecture matches expectedArch, otherwise jump to errno
-	jmp(bpfJmp|bpfJeq|bpfK, expectedArch, 1, 0)
-	stmt(bpfRet|bpfK, seccompRetErrno|eperm)
-
-	// 3. Load syscall number: [BPF_LD | BPF_W | BPF_ABS, offset 0]
-	stmt(bpfLd|bpfW|bpfAbs, 0)
-
-	if len(blockedSyscalls) > 200 {
-		return nil // jump offsets below are 8-bit
-	}
-	n := uint8(len(blockedSyscalls)) //nolint:gosec // G115: bounded above
-	if isX86_64 {
-		const x32SyscallBit = 0x40000000
-		jmp(bpfJmp|bpfJge|bpfK, x32SyscallBit, n+1, 0)
-	}
-
-	for i, sc := range blockedSyscalls {
-		remaining := n - 1 - uint8(i)
-		jmp(bpfJmp|bpfJeq|bpfK, sc, remaining+1, 0)
-	}
-
-	// 5. Default allow
-	stmt(bpfRet|bpfK, seccompRetAllow)
-	// 6. Blocked errno (EPERM = 1)
-	stmt(bpfRet|bpfK, seccompRetErrno|eperm)
-
-	return buf.Bytes()
+	return seccompbpf.GenerateFilter()
 }
 
 var cliProviderCredentials = map[string][]string{
@@ -1444,7 +1354,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	scan := cliScanWorkspace(workspace)
 	if scan.truncated && !isReview {
 		return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
-			fmt.Sprintf("workspace %s is too large to verify (.git metadata and unix socket scan exceeded %d entries); refusing writable sandbox", workspace, cliWorkspaceScanLimit), nil)
+			fmt.Sprintf("workspace %s could not be fully scanned (more than %d entries, or an unreadable directory owned by you); .git metadata and unix sockets cannot be verified, refusing writable sandbox (raise MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT or fix the directory permissions)", workspace, cliWorkspaceScanLimitValue()), nil)
 	}
 	protectArgs, err := cliWorkspaceProtectionArgs(workspace, scan, !isReview)
 	if err != nil {
@@ -1486,8 +1396,10 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		"--unshare-ipc",
 		"--unshare-uts",
 		"--unshare-user",
-		"--disable-userns",
-		"--clearenv",
+		// No --disable-userns (bubblewrap >= 0.8; Ubuntu 22.04 ships 0.6, RHEL 9
+		// and Debian 11 0.4) and no --clearenv (>= 0.5): wrapped.Env already
+		// carries only the sanitized allowlist, and provider CLIs such as codex
+		// run their own bubblewrap sandbox, which needs nested user namespaces.
 		// Network is NOT unshared by default: external API access is required by CLI providers.
 		// MAKEWAND_SANDBOX_UNSHARE_NET explicitly isolates the network namespace to block abstract sockets & loopback.
 		"--ro-bind", "/", "/",

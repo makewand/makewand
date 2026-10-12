@@ -138,6 +138,7 @@ func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux bubblewrap fail-close; Windows required-sandbox refusal is exercised separately")
 	}
+	cliTestWithoutHostExecAck(t)
 	oldLookup := cliBwrapLookup
 	defer func() { cliBwrapLookup = oldLookup }()
 	cliBwrapLookup = func(file string) (string, error) {
@@ -218,7 +219,7 @@ func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
 }
 
 func TestWrapCLICommandWithSandbox_LiveExecution(t *testing.T) {
-	bwrapPath, err := exec.LookPath("bwrap")
+	bwrapPath, err := cliBwrapLookup("bwrap")
 	if err != nil {
 		t.Skip("bwrap not installed")
 	}
@@ -496,6 +497,7 @@ func TestWrapCLICommandWithSandbox_ProbeFailure_GracefulFallbackOrError(t *testi
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux bubblewrap probe failure; Windows required-sandbox refusal is exercised separately")
 	}
+	cliTestWithoutHostExecAck(t)
 	oldLookup := cliBwrapLookup
 	oldProbe := cliBwrapProbe
 	defer func() {

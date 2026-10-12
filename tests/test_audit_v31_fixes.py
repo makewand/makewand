@@ -144,7 +144,8 @@ class TestAuditV31Fixes(unittest.TestCase):
                 execute_claude_task(long_prompt, cwd=tmpdir, readonly=True)
                 called_cmd = mock_sub.call_args[0][0]
                 self.assertNotIn(long_prompt, called_cmd)
-                self.assertEqual(list(called_cmd[:3]), ["env", "MAKEWAND_PROVIDER_WORKER=1", "claude"])
+                self.assertEqual(list(called_cmd[:1]), ["claude"])
+                self.assertEqual(mock_sub.call_args[1].get("extra_env"), {"MAKEWAND_PROVIDER_WORKER": "1"})
                 self.assertEqual(mock_sub.call_args[1].get("input_text"), long_prompt)
 
             # 2. Codex

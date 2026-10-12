@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -127,13 +128,37 @@ func TestHTTPReservationRejectsWhenScaledEstimateExceedsTokenBudget(t *testing.T
 	if err != nil {
 		t.Fatalf("authorizer: %v", err)
 	}
-	h := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, BudgetReservationUSD: 0.01})
+	h := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, BudgetReservationUSD: 0.01, ScaleBudgetReservation: true})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"claude","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer tok")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 (scaled reservation exceeds cap); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// Without ScaleBudgetReservation the fixed floor is reserved and streams are
+// never cut by a price estimate: a cap that fits the floor admits the request.
+func TestHTTPReservationDefaultsToFixedFloor(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		prov := &reservationStreamProvider{name: "claude"}
+		r := reservationRouter(AccessAPI, prov)
+		authz, err := serverauth.NewAuthorizer(serverauth.Config{Tokens: []serverauth.TokenRule{{
+			Token: "tok", Scopes: []string{serverauth.ScopeChatInvoke}, MaxCostUSDPerDay: 0.02,
+		}}})
+		if err != nil {
+			t.Fatalf("authorizer: %v", err)
+		}
+		h := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, BudgetReservationUSD: 0.01})
+		body := fmt.Sprintf(`{"model":"claude","stream":%t,"messages":[{"role":"user","content":"hi"}]}`, stream)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code == http.StatusTooManyRequests || strings.Contains(rec.Body.String(), "budget_reservation_exceeded") {
+			t.Fatalf("stream=%t: default reservation was scaled; status=%d body tail=%q", stream, rec.Code, reservationTail(rec.Body.String(), 300))
+		}
 	}
 }
 
@@ -148,7 +173,7 @@ func TestHTTPStreamStopsWhenEstimatedSpendExceedsReservation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("authorizer: %v", err)
 			}
-			h := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, BudgetReservationUSD: 0.01})
+			h := r.HTTPHandler(HTTPHandlerOptions{Authorizer: authz, BudgetReservationUSD: 0.01, ScaleBudgetReservation: true})
 			body := `{"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 			if path == "/v1/responses" {
 				body = `{"model":"claude","stream":true,"input":"hi"}`
@@ -204,7 +229,7 @@ func TestHTTPDurableReservationUsesScaledEstimate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: auth, UsageLogger: store, UsageReader: store, BudgetReserver: store, BudgetReservationUSD: .01, StrictAccounting: true})
+	handler := r.HTTPHandler(HTTPHandlerOptions{Authorizer: auth, UsageLogger: store, UsageReader: store, BudgetReserver: store, BudgetReservationUSD: .01, ScaleBudgetReservation: true, StrictAccounting: true})
 	invoke := func() int {
 		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"claude","messages":[{"role":"user","content":"hi"}]}`))
 		request.Header.Set("Authorization", "Bearer secret")

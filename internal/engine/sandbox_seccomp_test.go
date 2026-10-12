@@ -203,3 +203,20 @@ func TestSocketMaskUnreadableDirectoryFailsClosed(t *testing.T) {
 		t.Fatalf("unreadable directory hid a socket silently: %v", err)
 	}
 }
+
+// An unreadable directory the current user owns could be chmod-ed back from
+// inside the sandbox, so it keeps the scan incomplete (fail closed).
+func TestSocketMaskOwnUnreadableDirFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("POSIX permissions as a non-root user")
+	}
+	ws := t.TempDir()
+	locked := filepath.Join(ws, "locked")
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	if _, err := sandboxWorkspaceSocketMasks(ws); !errors.Is(err, ErrSandboxSocketScan) {
+		t.Fatalf("own unreadable directory did not fail closed: %v", err)
+	}
+}

@@ -1140,6 +1140,20 @@ def _plan_native_go_delegation(argv: List[str]) -> Optional[List[str]]:
 from makewand.sandbox import PROVIDER_WORKER_ENV  # noqa: E402
 # Read-only commands that never dispatch a model; allowed inside a provider worker.
 WORKER_SAFE_SUBCOMMANDS = frozenset({"status", "quota", "search", "repomap", "inspect", "candidates", "sessions"})
+# Go-native commands that never dispatch a model.
+GO_WORKER_SAFE_COMMANDS = frozenset({"quota", "usage", "state", "audit", "token", "user"})
+
+
+def _provider_worker_refusal(command: Optional[str], argv: List[str]) -> Optional[str]:
+    """Error text when a provider CLI launched by makewand tries to dispatch models again."""
+    if os.environ.get(PROVIDER_WORKER_ENV) != "1":
+        return None
+    if command in (WORKER_SAFE_SUBCOMMANDS | GO_WORKER_SAFE_COMMANDS) and not any(
+            a == "--probe" or a.startswith("--probe=") for a in argv):
+        return None
+    shown = f"makewand {command}" if command else "makewand"
+    return (f"❌ makewand 正作为另一 makewand 任务派发的 AI 子进程运行，已拒绝递归调用 `{shown}`。"
+            "请直接完成当前分配的任务。")
 
 
 def main():
@@ -1161,6 +1175,10 @@ def _main():
         print(f"makewand: error: {error}", file=sys.stderr)
         sys.exit(EXIT_USAGE_ERROR)
     if native_argv is not None:
+        refusal = _provider_worker_refusal(next((a for a in native_argv if a in NATIVE_GO_COMMANDS), None), native_argv)
+        if refusal:
+            print(c(refusal, COLOR_RED), file=sys.stderr)
+            sys.exit(EXIT_USAGE_ERROR)
         return delegate_to_go_server(native_argv)
 
     common_parser = argparse.ArgumentParser(add_help=False)
@@ -1484,9 +1502,9 @@ def _main():
     # A provider CLI that makewand launched (claude/codex/agy/...) can read its own
     # global instructions or skills telling it to call makewand. Refuse anything
     # that would dispatch models again so nested dispatch can never loop.
-    if os.environ.get(PROVIDER_WORKER_ENV) == "1" and args.subcommand and args.subcommand not in WORKER_SAFE_SUBCOMMANDS:
-        print(c(f"❌ makewand 正作为另一 makewand 任务派发的 AI 子进程运行，已拒绝递归调用 `makewand {args.subcommand}`。"
-                "请直接完成当前分配的任务。", COLOR_RED), file=sys.stderr)
+    refusal = _provider_worker_refusal(args.subcommand, sys.argv[1:])
+    if refusal:
+        print(c(refusal, COLOR_RED), file=sys.stderr)
         sys.exit(EXIT_USAGE_ERROR)
     # Validate policy before discovery, daemon dispatch or orchestration.
     # Those paths may catch transport errors, so policy validity must already

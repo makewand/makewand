@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"go/version"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/makewand/makewand/internal/fsperm"
 )
 
 // Sandbox HOME policy (verification, restricted project plans and preview):
@@ -367,6 +370,12 @@ func sandboxWorkspaceSocketMasks(workspace string) ([]string, error) {
 				// Removed during the scan (or a workspace that does not exist,
 				// which bwrap's --bind rejects): nothing left to connect to.
 				return nil
+			}
+			if d != nil && d.IsDir() && path != cleanWS && errors.Is(err, fs.ErrPermission) && fsperm.UntraversableForeignDir(path) {
+				// Another user's directory we cannot enter (e.g. a database
+				// volume): the sandbox, running as this uid, can neither enter
+				// nor chmod it, so no socket below it is reachable.
+				return filepath.SkipDir
 			}
 			return fmt.Errorf("%w: %s: %v", ErrSandboxSocketScan, path, err)
 		}

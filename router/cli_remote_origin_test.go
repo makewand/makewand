@@ -32,6 +32,11 @@ func TestLocalReviewTaskKeepsCodexReviewUncommitted(t *testing.T) {
 // TestRemoteOriginCLIHonorsExplicitWorkDir keeps an embedder-provided WorkDir:
 // only requests WITHOUT an explicit WorkDir get the per-request scratch dir.
 func TestRemoteOriginCLIHonorsExplicitWorkDir(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		if _, err := cliBwrapLookup("bwrap"); err != nil {
+			t.Skip("remote-origin CLI execution requires bubblewrap")
+		}
+	}
 	logDir := t.TempDir()
 	codex := writeRecordingCodexCLI(t, logDir)
 	work := t.TempDir()

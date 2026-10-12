@@ -143,7 +143,7 @@ def execute_codex_task(
     resolved = get_provider_model_tier("codex", tier)
     target_model = model or resolved["model"]
     cmd.extend(["-c", f"model=\"{target_model}\""])
-    target_effort = normalize_provider_effort("codex", effort or resolved.get("effort"))
+    target_effort = normalize_provider_effort("codex", effort or resolved.get("effort"), model=target_model)
     if target_effort and target_effort != "none":
         cmd.extend(["-c", f"model_reasoning_effort=\"{target_effort}\""])
 
@@ -176,6 +176,7 @@ def execute_codex_task(
                 stream=stream,
                 print_prefix=c("[Codex Live]", COLOR_CYAN),
                 pass_fds=launch.pass_fds,
+                extra_env=launch.env,
             )
     except SandboxUnavailableError as exc:
         return False, None, str(exc)

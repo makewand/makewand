@@ -1,17 +1,29 @@
 package router
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"github.com/makewand/makewand/internal/fsperm"
 )
 
-// cliWorkspaceScanLimit bounds the workspace walk. A writable session whose
-// scan hits it fails closed instead of silently leaving entries unchecked.
-var cliWorkspaceScanLimit = 200000
+// cliWorkspaceScanLimit bounds the workspace walk (MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT
+// overrides it). A writable session whose scan hits it fails closed instead of
+// silently leaving entries unchecked.
+var cliWorkspaceScanLimit = 1000000
+
+func cliWorkspaceScanLimitValue() int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT"))); err == nil && v > 0 {
+		return v
+	}
+	return cliWorkspaceScanLimit
+}
 
 const cliGitPointerMaxBytes = 4096
 
@@ -33,15 +45,22 @@ type cliWorkspaceScan struct {
 func cliScanWorkspace(workspace string) cliWorkspaceScan {
 	var scan cliWorkspaceScan
 	count := 0
+	limit := cliWorkspaceScanLimitValue()
 	_ = filepath.WalkDir(workspace, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if d != nil && d.IsDir() && path != workspace {
+				// A directory another user owns and we cannot enter is out of
+				// the sandbox's reach too; one we own could be chmod-ed back
+				// from inside, so skipping it leaves the scan incomplete.
+				if errors.Is(err, fs.ErrPermission) && !fsperm.UntraversableForeignDir(path) {
+					scan.truncated = true
+				}
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		count++
-		if count > cliWorkspaceScanLimit {
+		if count > limit {
 			scan.truncated = true
 			return filepath.SkipAll
 		}

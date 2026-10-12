@@ -65,8 +65,10 @@ class TestWritableSandboxVerification(unittest.TestCase):
             self.assertIsNone(source)
             self.assertIn("macOS", err)
             self.assertIn("Bubblewrap", err)
-            self.assertIn("makewand review", err)
-            self.assertIn("--remote-url", err)
+            self.assertIn("Linux Docker", err)
+            # review needs the same authorization without a sandbox; no nonexistent flags
+            self.assertIn("只读审查 makewand review 同样需要", err)
+            self.assertNotIn("--remote-url", err)
             self.assertIn("MAKEWAND_UNSAFE_HOST_EXEC=1", err)
             self.assertIn("unsafe_exec_audit.jsonl", err)
 
@@ -78,7 +80,8 @@ class TestWritableSandboxVerification(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIsNone(source)
             self.assertIn("sudo apt install bubblewrap", err)
-            self.assertIn("makewand review", err)
+            self.assertIn("MAKEWAND_BWRAP_PATH", err)
+            self.assertIn("只读审查同样需要此授权", err)
             self.assertIn("MAKEWAND_UNSAFE_HOST_EXEC=1", err)
 
     def test_authorized_host_exec_allows_execution(self):

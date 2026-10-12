@@ -420,6 +420,9 @@ Flags:
 		// on the paths that later resolve it. The resolved value is stored for
 		// reuse so commands that apply the trust do not re-parse it.
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if err := refuseProviderWorkerDispatch(cmd); err != nil {
+				return err
+			}
 			trust, err := resolveRepoTrust(repoTrustFlag)
 			if err != nil {
 				return err
@@ -1413,4 +1416,31 @@ func looksLikeCodeLine(line string) bool {
 		return true
 	}
 	return strings.Contains(l, "=>") || strings.Contains(l, ";") || strings.Contains(l, "{") || strings.Contains(l, "}")
+}
+
+// providerWorkerSafeCommands never dispatch a model, so a provider CLI that
+// makewand launched may still run them.
+var providerWorkerSafeCommands = map[string]bool{
+	"quota": true, "usage": true, "state": true, "audit": true, "token": true, "user": true,
+	"help": true, "completion": true,
+}
+
+// refuseProviderWorkerDispatch stops makewand -> provider CLI -> makewand
+// recursion: provider CLIs launched by makewand carry MAKEWAND_PROVIDER_WORKER=1,
+// and under it every model-dispatching command (bare prompt, --print, chat,
+// new, serve, doctor --probe, ...) is refused.
+func refuseProviderWorkerDispatch(cmd *cobra.Command) error {
+	if os.Getenv("MAKEWAND_PROVIDER_WORKER") != "1" {
+		return nil
+	}
+	top := cmd
+	for top.HasParent() && top.Parent().HasParent() {
+		top = top.Parent()
+	}
+	probe := cmd.Flags().Lookup("probe")
+	if top.HasParent() && providerWorkerSafeCommands[top.Name()] && (probe == nil || !probe.Changed) {
+		return nil
+	}
+	return &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true,
+		Err: fmt.Errorf("refusing %q inside a provider CLI launched by makewand (MAKEWAND_PROVIDER_WORKER=1); finish the assigned task directly", cmd.CommandPath())}
 }

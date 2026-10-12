@@ -92,7 +92,8 @@ class TestClaudeReadonlyFlags(unittest.TestCase):
         # authorized host run (no bwrap): the tool restriction is the only guard,
         # the launch is audited and marked as a provider worker
         cmd = self._cmd(readonly=True, bwrap=False)
-        self.assertEqual(cmd[:3], ["env", "MAKEWAND_PROVIDER_WORKER=1", "claude"])
+        self.assertEqual(cmd[0], "claude")
+        self.assertEqual(self.run_mock.call_args[1].get("extra_env"), {"MAKEWAND_PROVIDER_WORKER": "1"})
         self._assert_readonly_flags(cmd)
         self.audit.assert_called_once()
         self.assertEqual(self.audit.call_args[0][3], "config-ack")

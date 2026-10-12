@@ -326,18 +326,19 @@ func serveCmd() *cobra.Command {
 			}
 
 			httpOpts := router.HTTPHandlerOptions{
-				Authorizer:           authz,
-				StatsDir:             statsDir,
-				AuditLogger:          auditLogger,
-				UsageLogger:          usageLogger,
-				UsageReader:          usageStore,
-				TeamStore:            teamStore,
-				BudgetReservationUSD: budgetReservation,
-				BudgetReserver:       budgetStore,
-				StrictAccounting:     strictAccounting || (budgetStore != nil && budgetReservation > 0),
-				UserTokenManager:     tokenManager,
-				UserLoginLimiter:     loginLimiter,
-				Observer:             metrics.ObserveError,
+				Authorizer:             authz,
+				StatsDir:               statsDir,
+				AuditLogger:            auditLogger,
+				UsageLogger:            usageLogger,
+				UsageReader:            usageStore,
+				TeamStore:              teamStore,
+				BudgetReservationUSD:   budgetReservation,
+				ScaleBudgetReservation: os.Getenv("MAKEWAND_SCALED_BUDGET_RESERVATION") == "1",
+				BudgetReserver:         budgetStore,
+				StrictAccounting:       strictAccounting || (budgetStore != nil && budgetReservation > 0),
+				UserTokenManager:       tokenManager,
+				UserLoginLimiter:       loginLimiter,
+				Observer:               metrics.ObserveError,
 				ReadinessCheck: func(ctx context.Context) error {
 					if draining.Load() {
 						return fmt.Errorf("server is draining")

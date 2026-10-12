@@ -1,11 +1,16 @@
 package router
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // cliTestPrivateHomeBase holds the private provider homes created by tests so
@@ -30,11 +35,66 @@ func TestMain(m *testing.M) {
 	cliTestExtraBinds = cliTestFixtureBinds
 	cliTestEnvAllowed = cliTestFixtureEnvAllowed
 	cliPrivateHomeBaseDir = cliTestPrivateHomeBaseDir
+	// Without bubblewrap (always on Windows) every provider launch needs an
+	// acknowledged host-exec authorization, exactly as in production. Process
+	// tests then run their fixtures through that real config-ack path.
+	// MAKEWAND_TEST_SIMULATE_NO_BWRAP=1 reproduces that mode on Linux.
+	ackDir := ""
+	if runtime.GOOS == "windows" || os.Getenv("MAKEWAND_TEST_SIMULATE_NO_BWRAP") == "1" {
+		if runtime.GOOS != "windows" {
+			cliBwrapLookup = func(string) (string, error) { return "", exec.ErrNotFound }
+		}
+		var err error
+		if ackDir, err = cliTestWriteHostExecAck(); err != nil {
+			fmt.Fprintln(os.Stderr, "host-exec ack fixture:", err)
+			os.Exit(1)
+		}
+	}
 	code := m.Run()
 	if cliTestPrivateHomeBase != "" {
 		_ = os.RemoveAll(cliTestPrivateHomeBase)
 	}
+	if ackDir != "" {
+		_ = os.RemoveAll(ackDir)
+	}
 	os.Exit(code)
+}
+
+// cliTestWriteHostExecAck writes a valid host-exec acknowledgement into a
+// temporary MAKEWAND_CONFIG_DIR and enables MAKEWAND_UNSAFE_HOST_EXEC. Tests
+// asserting refusal without an acknowledgement point MAKEWAND_CONFIG_DIR at
+// an empty directory (cliTestWithoutHostExecAck).
+func cliTestWriteHostExecAck() (string, error) {
+	host, err := os.Hostname()
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp("", "makewand-router-ack-")
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(map[string]any{
+		"unsafe_host_exec_ack_version": 1,
+		"unsafe_host_exec_ack_host":    host,
+		"unsafe_host_exec_ack_at":      time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return dir, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0o600); err != nil {
+		return dir, err
+	}
+	if err := os.Setenv("MAKEWAND_CONFIG_DIR", dir); err != nil {
+		return dir, err
+	}
+	return dir, os.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
+}
+
+// cliTestWithoutHostExecAck removes any process-wide acknowledgement for the
+// rest of the test.
+func cliTestWithoutHostExecAck(t *testing.T) {
+	t.Helper()
+	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
 }
 
 // cliTestFixtureBinds exposes go test fixtures under /tmp, which the sandbox

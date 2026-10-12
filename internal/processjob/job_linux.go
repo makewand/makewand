@@ -145,6 +145,9 @@ func scopeTarget(cmd *exec.Cmd) (string, bool) {
 		}
 		target = filepath.Join(base, target)
 	}
+	if !filepath.IsAbs(target) || strings.Contains(target, "..") {
+		return "", false
+	}
 	info, err := os.Stat(target) //nolint:gosec // G703: stat of the caller-chosen executable, never opened
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return "", false

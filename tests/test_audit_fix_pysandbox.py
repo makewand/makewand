@@ -182,9 +182,9 @@ class TestH1UnsandboxedLaunchAuthorization(unittest.TestCase):
                 self.assertTrue(ok, err)
                 run_mock.assert_called_once()
                 cmd = list(run_mock.call_args[0][0])
-                # host launch carries the provider-worker marker
-                self.assertEqual(cmd[:2], ["env", f"{PROVIDER_WORKER_ENV}=1"])
-                self.assertEqual(os.path.basename(cmd[2]), PROVIDER_BIN[name])
+                # host launch carries the provider-worker marker in its environment
+                self.assertEqual(os.path.basename(cmd[0]), PROVIDER_BIN[name])
+                self.assertEqual(run_mock.call_args[1].get("extra_env"), {PROVIDER_WORKER_ENV: "1"})
                 audit.assert_called_once()
                 context, audited_cmd, _cwd, source = audit.call_args[0]
                 self.assertEqual(context, f"provider:{name}")
@@ -455,10 +455,37 @@ class TestResourceLimitPrefix(unittest.TestCase):
             prefix = sandbox.sandbox_resource_limit_prefix()
         self.assertEqual(prefix[0], "/usr/bin/prlimit")
         self.assertEqual(prefix[-1], "--")
-        self.assertTrue(any(a.startswith("--nproc=") for a in prefix))
+        # RLIMIT_NPROC counts every thread of the uid; a relative budget broke
+        # bwrap ("Creating new namespace failed") on busy hosts, so it is never set.
+        self.assertFalse(any(a.startswith("--nproc") for a in prefix), prefix)
         self.assertTrue(any(a.startswith("--nofile=") for a in prefix))
         self.assertTrue(any(a.startswith("--fsize=") for a in prefix))
         self.assertFalse(any(a.startswith("--as") for a in prefix), prefix)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() != 0, "POSIX non-root permissions")
+    def test_unreadable_dirs_scan_rule(self):
+        # own unreadable dir: could be chmod-ed back from inside -> incomplete;
+        # another user's untraversable dir: unreachable from inside -> skipped.
+        with tempfile.TemporaryDirectory() as ws:
+            locked = os.path.join(ws, "locked")
+            os.mkdir(locked, 0o000)
+            try:
+                _, _, truncated = sandbox._scan_tree([ws], max_depth=None, entry_limit=1000, collect_git=True)
+                self.assertTrue(truncated)
+                with patch("makewand.sandbox._untraversable_foreign_dir", return_value=True):
+                    _, _, truncated = sandbox._scan_tree([ws], max_depth=None, entry_limit=1000, collect_git=True)
+                self.assertFalse(truncated)
+            finally:
+                os.chmod(locked, 0o700)
+
+    def test_memory_limit_values_follow_the_go_contract(self):
+        # 0/off/none mean no cap; 8g and 8GiB are accepted (internal/processjob).
+        for value, want in (("0", "MemoryMax=infinity"), ("off", "MemoryMax=infinity"),
+                            ("8g", "MemoryMax=8G"), ("8GiB", "MemoryMax=8G"), ("512M", "MemoryMax=512M")):
+            with self.subTest(value=value), patch.dict(os.environ, {sandbox.SANDBOX_MEMORY_MAX_ENV: value}), \
+                    patch("makewand.sandbox._trusted_system_binary", side_effect=self._binary({"systemd-run"})), \
+                    patch("makewand.sandbox._systemd_scope_usable", return_value=True):
+                self.assertIn(want, sandbox.sandbox_resource_limit_prefix())
 
     def test_invalid_limit_values_cannot_inject_properties(self):
         with patch.dict(os.environ, {sandbox.SANDBOX_MEMORY_MAX_ENV: "1G -p Delegate=yes"}), \
@@ -529,7 +556,9 @@ class TestProviderWorkerMarker(unittest.TestCase):
             with provider_sandbox_launch("codex", ["codex", "exec", "x"], str(ws), readonly=True,
                                          host_auth_source="config-ack") as launch:
                 self.assertFalse(launch.sandboxed)
-                self.assertEqual(launch.cmd, ["env", f"{PROVIDER_WORKER_ENV}=1", "codex", "exec", "x"])
+                # no `env` prefix: it does not exist on Windows
+                self.assertEqual(launch.cmd, ["codex", "exec", "x"])
+                self.assertEqual(launch.env, {PROVIDER_WORKER_ENV: "1"})
             audit.assert_called_once()
 
     def test_non_provider_run_in_sandbox_has_no_marker(self):

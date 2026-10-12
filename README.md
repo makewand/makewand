@@ -27,7 +27,7 @@ curl -fsSL https://makewand.org/install.sh | bash
 - **🏁 双模型并发隔离竞速 (Race Mode)**：
   - `makewand race "<任务>"` 在临时隔离沙箱中并行派发两组模型，统计耗时与代码质量，由可用裁判输出结构化采纳裁决。默认保留 A/B 候选，显式 `merge` 才生成混合候选 M。
 - **🌲 非 Git 目录弹性容灾**：未初始化 Git 的工程自动构建轻量级影子跟踪树，彻底解决常规工具依赖 Git 导致的崩溃。
-- **🚀 无头执行与跨平台沙箱约束**：写入任务在必需的 Bubblewrap (bwrap) 沙箱内运行官方 CLI；沙箱不可用时遵循 fail-closed 拒绝执行。bwrap 沙箱依赖 Linux 内核命名空间，macOS 支持开箱即用的只读分析与审查（`makewand review`）；在 macOS 上运行代码生成写入任务时，建议通过 Linux 容器/VM 或远端执行器（`--remote-url`）运行，或显式配置 `MAKEWAND_UNSAFE_HOST_EXEC=1` 并完成交互确认授权宿主执行（所有宿主执行将审计至 `unsafe_exec_audit.jsonl`）。Go 的 Strength1 候选仍需人工确认。
+- **🚀 无头执行与跨平台沙箱约束**：写入任务在必需的 Bubblewrap (bwrap) 沙箱内运行官方 CLI；沙箱不可用时遵循 fail-closed 拒绝执行。bwrap 沙箱依赖 Linux 内核命名空间。没有沙箱时（如 macOS），**包括只读审查 `makewand review` 在内的所有 provider 调用**都需要显式配置 `MAKEWAND_UNSAFE_HOST_EXEC=1` 并完成一次交互确认（所有宿主执行审计至 `unsafe_exec_audit.jsonl`），或改在装有 bwrap 的 Linux 容器/虚拟机中运行。Go 的 Strength1 候选仍需人工确认。
 - **📡 实时流式输出**：支持 `--stream` 参数，带模型专属色彩前缀逐行流式呈现。
 
 ---
@@ -147,7 +147,7 @@ makewand sandbox python3 -m pytest tests/
 # 阻断外网访问执行构建/测试
 makewand sandbox --no-net go test ./...
 ```
-> **跨平台隔离说明**：Bubblewrap 物理沙箱依赖 Linux 内核命名空间。macOS 环境下，只读审查（`makewand review`）开箱即用；对于代码生成与写入任务，系统遵循 fail-closed 拦截，并给出清晰指引（容器/远端运行，或显式 `MAKEWAND_UNSAFE_HOST_EXEC=1` 确认授权与审计记录）。
+> **跨平台隔离说明**：Bubblewrap 物理沙箱依赖 Linux 内核命名空间。没有沙箱时（如 macOS），所有 provider 调用（包括只读审查）都遵循 fail-closed 拦截，并给出指引：在装有 bwrap 的 Linux 容器/虚拟机中运行，或显式 `MAKEWAND_UNSAFE_HOST_EXEC=1` 确认授权（附审计记录）。bwrap 只从 root 拥有的系统目录解析，装在其他位置时用 `MAKEWAND_BWRAP_PATH` 指定。
 
 ### 8. 单模型直接透传调用
 ```bash
@@ -207,9 +207,10 @@ Daemon 为每次请求启动独立 Python worker，使用相同的 CLI 参数解
 ## 🤖 主流 AI 协同接入 (AI Integrations)
 
 Makewand 原生设计为不仅面向人类终端开发者，更作为所有 AI 代理的“外挂魔杖”：
-- **Antigravity (AGY)**：内置 `makewand-orchestrator` Skill，在处理复杂架构任务时自主调用。
-- **Claude Code**：在 `CLAUDE.md` 中指引调用 `makewand review` 实现外部交叉审计。
-- **Codex CLI**：在 `default.rules` 中支持调度 `makewand race` 与 `makewand run`。
+- **Antigravity (AGY)**：推荐作为调用中心，安装 `makewand-orchestrator` skill；skill 规定只有用户明确要求时才运行 `run`/`race`/`ensemble`，高风险改动可主动运行只读 `review`。
+- **Claude Code**：在 `CLAUDE.md` 中加入简短说明，用户明确要求时运行 `makewand review` 做跨模型审查。
+- **Codex CLI**：在 `AGENTS.md` 中加入同样的简短说明。
+- 被 makewand 派发的 CLI 带有 `MAKEWAND_PROVIDER_WORKER=1`，不能再调用 makewand，嵌套调用不会递归。
 - **Muse Code**：支持在 Meta 生态中联动调度其它模型。
 
 详细指引见 [integrations/](integrations/) 目录。
