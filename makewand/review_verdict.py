@@ -23,6 +23,8 @@ from makewand.review_contract import (
     canonical_verdict_line,
     strip_verdict_lines,
     build_verdict_followup_prompt,
+    reviewer_prompt_limit,
+    reviewer_receives_whole_prompt,
     _VERDICT_ANY_RE,
     _VERDICT_TRAILER_OK_RE,
 )
@@ -91,6 +93,13 @@ def resolve_review_verdict(
         print(c(f"⚠ [Makewand Verdict] {engine.upper()} 的审查缺少有效裁决 ({verdict['reason']})，追问一次仅要求输出 {tag} 裁决行...", COLOR_YELLOW))
 
     prompt = build_verdict_followup_prompt(text, verdict["reason"], nonce=nonce)
+    if not reviewer_receives_whole_prompt(engine, prompt):
+        # The verdict must rest on the reviewer's complete review, not on part of it.
+        verdict = dict(verdict, reason=f"{verdict['reason']}；追问提示超过 {engine.upper()} 可完整接收的 "
+                                       f"{reviewer_prompt_limit(engine)} 字节上限，未追问")
+        if not quiet:
+            print(c(f"❌ [Makewand Verdict] {verdict['reason']}，判定为 UNVERIFIED。", COLOR_RED))
+        return text, verdict
     if dispatch_fn is not None and stage_call_fn is not None:
         res = stage_call_fn("review", dispatch_fn, engine, prompt, engine=engine,
                             cwd=cwd, timeout=timeout, tier=tier, stream=False, readonly=True, repo_root=repo_root, repo_trust=repo_trust)
@@ -182,6 +191,28 @@ def _ensure_private_artifacts_dir(path: Path) -> Path:
     return path
 
 
+def _unverified_patch_repos(worktree: str, base_rev: Optional[str],
+                            sub_baselines: Optional[Dict[str, str]]) -> List[Tuple[str, str, Optional[str]]]:
+    """(relative path, directory, baseline) of the repository and of each checked-out
+    submodule, found the way get_git_diff_status() finds them for the review diff:
+    from the top level of the repository, with root-relative paths (the keys of
+    sub_baselines), also when worktree is one of its subdirectories."""
+    from makewand.git_helper import get_submodule_paths, run_git_cmd
+    repos: List[Tuple[str, str, Optional[str]]] = [("", worktree, base_rev)]
+    code, top, _ = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=worktree)
+    repo_root = top.strip() if code == 0 and top.strip() else worktree
+    for sub_rel in get_submodule_paths(repo_root):
+        directory = Path(repo_root) / sub_rel
+        if not (directory.exists() and (directory / ".git").exists()):
+            continue
+        base = (sub_baselines or {}).get(sub_rel)
+        if not base:
+            code, gitlink, _ = run_git_cmd(["git", "rev-parse", f"HEAD:{sub_rel}"], cwd=repo_root)
+            base = gitlink.strip() if code == 0 and gitlink.strip() else "HEAD"
+        repos.append((sub_rel, str(directory), base))
+    return repos
+
+
 def _save_unverified_artifacts(
     worktree: Optional[str],
     base_rev: Optional[str],
@@ -189,16 +220,51 @@ def _save_unverified_artifacts(
     review_text: Optional[str],
     reason: str,
 ) -> Tuple[Optional[Path], Optional[str]]:
-    """Persists the undelivered (unverified) patch and review text into the private artifacts dir."""
+    """Persists the undelivered (unverified) change and its review into the private artifacts dir.
+
+    unverified.patch holds every reviewable change against the task baseline
+    (tracked edits, task commits, new files git does not ignore) exactly as
+    ``git diff`` writes it with git_helper.PATCH_EXPORT_FLAGS (binary, full index
+    and three context lines whatever diff.context says), like the host rollback
+    and delivery patches: git writes the bytes itself, nothing decodes, strips or
+    re-terminates them, so plain ``git apply`` reproduces new and binary files,
+    deletions, mode changes and trailing blank lines. In shadow mode it is the
+    only copy of the work once the worktree is removed. A checked-out submodule's
+    change goes to its own unverified.submodule-<n>.patch, listed in manifest.json.
+    Returns (unverified.patch, None), or (None, error) when the change could not
+    be saved completely.
+    """
     try:
-        from makewand.git_helper import get_git_diff
-        diff_text = get_git_diff(worktree, base_rev=base_rev, sub_baselines=sub_baselines) if worktree else ""
+        from makewand.git_helper import PATCH_EXPORT_FLAGS, _printable, _read_workspace_diff
         root = _ensure_private_artifacts_dir(_unverified_artifacts_root())
         target = root / f"unverified_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         target.mkdir(mode=0o700)
         patch_path = target / "unverified.patch"
-        patch_path.write_text((diff_text or "") + "\n", encoding="utf-8")
-        (target / "review.txt").write_text(f"UNVERIFIED: {reason}\n\n{review_text or ''}", encoding="utf-8")
+        patches: Dict[str, str] = {}
+        submodules: Dict[str, Optional[str]] = {}
+        for index, (rel, repo, base) in enumerate(_unverified_patch_repos(worktree, base_rev, sub_baselines) if worktree else []):
+            name = f"unverified.submodule-{index}.patch" if rel else patch_path.name
+            _, error = _read_workspace_diff(repo, base, arguments=(*PATCH_EXPORT_FLAGS, f"--output={target / name}"),
+                                            binary=True)
+            if error:
+                raise OSError(f"子模块 {rel} 补丁导出失败: {error}" if rel else f"补丁导出失败: {error}")
+            if rel and not (target / name).stat().st_size:
+                (target / name).unlink()
+                continue
+            os.chmod(target / name, 0o600)
+            patches[rel or "."] = name
+            if rel:
+                submodules[rel] = base
+        if not patch_path.exists():
+            patch_path.write_bytes(b"")
+        if submodules:
+            manifest = {"baseline_commit": base_rev, "reason": reason, "patches": patches,
+                        "submodule_baselines": submodules}
+            text = json.dumps(manifest, ensure_ascii=False, indent=2)
+            if _printable(text) != text:  # a submodule path with undecodable bytes: \udcNN round-trips
+                text = json.dumps(manifest, ensure_ascii=True, indent=2)
+            (target / "manifest.json").write_text(text, encoding="utf-8")
+        (target / "review.txt").write_text(_printable(f"UNVERIFIED: {reason}\n\n{review_text or ''}"), encoding="utf-8")
         return patch_path, None
     except Exception as exc:
         return None, str(exc)
@@ -207,8 +273,10 @@ def _save_unverified_artifacts(
 def format_review_diff(diff: str, max_chars: Optional[int] = None) -> str:
     """
     Formats git diff for review prompts without silent truncation.
-    Preserves full content up to 64KB without excising the middle slice.
-    If max_chars is explicitly specified, retains head & tail and emits clear truncation notice.
+    Returns the complete diff: a verdict approves only the exact diff it saw, so
+    callers reject a diff over the review cap (orchestrator.review_diff_max_bytes,
+    256 KiB by default) as UNVERIFIED instead of shortening it. Only an explicit
+    max_chars keeps head & tail with a clear truncation notice (display only).
     """
     if not diff:
         return ""

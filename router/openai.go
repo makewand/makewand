@@ -54,6 +54,17 @@ func (o *OpenAI) IsAvailable() bool { return o.apiKey != "" }
 // is a pure HTTP call to the OpenAI API and runs no local repo-aware agent.
 func (o *OpenAI) SafeForUntrustedRepo() bool { return true }
 
+// ReportedModelID names the model a call sends upstream: the router-requested
+// model or, when routing requests none (OpenAI has no model table entry), the
+// configured one. Stream routes, which carry no usage, are then reported and
+// billed at the model actually called.
+func (o *OpenAI) ReportedModelID(requestedModelID string) string {
+	if requestedModelID != "" {
+		return requestedModelID
+	}
+	return o.model
+}
+
 type openaiRequest struct {
 	Model     string          `json:"model"`
 	Messages  []openaiMessage `json:"messages"`
@@ -140,12 +151,19 @@ func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system
 		text = result.Choices[0].Message.Content
 	}
 
-	cost, measuredCost := o.priceForCtxWithStatus(ctx, model, result.Usage.PromptTokens, result.Usage.CompletionTokens)
+	inputTokens, outputTokens := result.Usage.PromptTokens, result.Usage.CompletionTokens
+	measured := inputTokens > 0 || outputTokens > 0
+	if !measured {
+		// A reply without a usage block is estimated like a stream, not
+		// recorded as a measured $0.
+		inputTokens, outputTokens = estimateCallTokens(messages, system, text, maxTokens)
+	}
+	cost, measuredCost := o.priceForCtxWithStatus(ctx, model, inputTokens, outputTokens)
 	usage := Usage{
-		MeasuredTokens: result.Usage.PromptTokens > 0 || result.Usage.CompletionTokens > 0,
-		MeasuredCost:   measuredCost,
-		InputTokens:    result.Usage.PromptTokens,
-		OutputTokens:   result.Usage.CompletionTokens,
+		MeasuredTokens: measured,
+		MeasuredCost:   measured && measuredCost,
+		InputTokens:    inputTokens,
+		OutputTokens:   outputTokens,
 		Cost:           cost,
 		Model:          model,
 		Provider:       "openai",

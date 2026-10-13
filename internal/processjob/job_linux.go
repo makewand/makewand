@@ -24,7 +24,7 @@ import (
 
 var (
 	scopeProbeOnce sync.Once
-	scopeTools     struct{ systemdRun, env string }
+	scopeTools     struct{ systemdRun, env, nice string }
 	scopeAvailable bool
 
 	// lookTrusted and probeScope are test seams.
@@ -54,6 +54,9 @@ func memoryScopeTools() (string, string, bool) {
 			return
 		}
 		scopeTools.systemdRun, scopeTools.env = systemdRun, env
+		if nice, err := lookTrusted("nice"); err == nil {
+			scopeTools.nice = nice // only needed for targets containing '='
+		}
 		scopeAvailable = probeScope(systemdRun)
 	})
 	return scopeTools.systemdRun, scopeTools.env, scopeAvailable
@@ -80,6 +83,10 @@ func envHas(env []string, key string) bool {
 // wrapMemoryScope rewrites an unstarted command to run under a memory-capped
 // scope. Bus variables the child would not otherwise receive are passed to
 // systemd-run only and removed again by env(1) before the real command runs.
+// env(1) takes every operand containing '=' before the command for a variable
+// assignment, so a target path with '=' is not named to it directly: env runs
+// `nice -n 0` instead, which execs its operands verbatim and leaves the
+// scheduling priority unchanged.
 func wrapMemoryScope(cmd *exec.Cmd, memoryBytes uintptr) {
 	if memoryBytes == 0 || cmd.Err != nil || cmd.Path == "" {
 		return
@@ -91,6 +98,13 @@ func wrapMemoryScope(cmd *exec.Cmd, memoryBytes uintptr) {
 	systemdRun, envPath, ok := memoryScopeTools()
 	if !ok {
 		return
+	}
+	command := []string{target}
+	if strings.Contains(target, "=") {
+		if scopeTools.nice == "" {
+			return // no unambiguous way to name the target to env(1)
+		}
+		command = []string{scopeTools.nice, "-n", "0", target}
 	}
 	base := cmd.Env
 	if base == nil {
@@ -114,7 +128,8 @@ func wrapMemoryScope(cmd *exec.Cmd, memoryBytes uintptr) {
 		"-p", "MemoryMax=" + strconv.FormatUint(uint64(memoryBytes), 10),
 		"-p", "MemorySwapMax=0", "--", envPath}
 	args = append(args, unset...)
-	args = append(args, "--", target)
+	args = append(args, "--")
+	args = append(args, command...)
 	if len(cmd.Args) > 1 {
 		args = append(args, cmd.Args[1:]...)
 	}

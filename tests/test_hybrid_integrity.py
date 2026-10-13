@@ -226,11 +226,12 @@ class HybridIntegrityTests(unittest.TestCase):
         self.assertIn("VISIBLE_REVIEW_TAIL", review_prompt)
 
     def test_oversized_race_diff_is_inspectable_without_judge_or_recommendation(self):
-        _, race, code = self._run_race_fixture(size=70 * 1024)
+        # The review cap is MAKEWAND_REVIEW_DIFF_MAX_BYTES (256 KiB by default).
+        _, race, code = self._run_race_fixture(size=orch.REVIEW_DIFF_MAX_BYTES_DEFAULT + 1024)
         self.assertEqual(code, 11)
         self.assertFalse(any(readonly for readonly, _, _ in self.race_calls))
         self.assertIsNone(race["winner"])
-        self.assertGreater(len(race["candidates"]["A"]["diff"].encode()), 64 * 1024)
+        self.assertGreater(len(race["candidates"]["A"]["diff"].encode()), orch.REVIEW_DIFF_MAX_BYTES_DEFAULT)
         self.assertFalse(race["candidates"]["A"]["review_passed"])
 
     def test_race_without_tests_never_marks_candidates_passed_or_applies_normally(self):

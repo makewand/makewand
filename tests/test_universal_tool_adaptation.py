@@ -283,11 +283,14 @@ class TestUniversalToolAdaptation(unittest.TestCase):
 
     def test_local_only_and_provider_override(self):
         """Tests local_only and forced_engine routing behavior."""
+        import tempfile
         from makewand.orchestrator import _run_pipeline_impl
         with patch("makewand.orchestrator.dispatch_task") as mock_dispatch, \
-             patch("makewand.orchestrator.PipelineWorkspaceGuard.acquire_workspace_lock", return_value=None):
+             patch("makewand.orchestrator.PipelineWorkspaceGuard.acquire_workspace_lock", return_value=None), \
+             tempfile.TemporaryDirectory() as workspace:
             mock_dispatch.return_value = (True, "mock explanation", None)
-            ok = _run_pipeline_impl("只解释原理，不用修改文件", local_only=True)
+            # A temporary cwd: the pipeline must never default to the checkout under test.
+            ok = _run_pipeline_impl("只解释原理，不用修改文件", cwd=workspace, local_only=True)
             self.assertTrue(ok)
             mock_dispatch.assert_called()
             args, kwargs = mock_dispatch.call_args

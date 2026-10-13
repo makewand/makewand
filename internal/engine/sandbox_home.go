@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -475,25 +476,11 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 			if goroot := strings.TrimSpace(hostEnv.GOROOT); goroot != "" && filepath.IsAbs(goroot) && isPathHiddenBySandbox(home, goroot) {
 				addRoot(goroot)
 			}
-			var proxies []string
-			if modcache := strings.TrimSpace(hostEnv.GOMODCACHE); modcache != "" && filepath.IsAbs(modcache) {
-				download := filepath.Join(modcache, "cache", "download")
-				if info, err := os.Stat(download); err == nil && info.IsDir() {
-					// The host module cache doubles as a read-only offline
-					// proxy, so network-isolated test runs reuse modules the
-					// host already has instead of failing to download them.
-					if isPathHiddenBySandbox(home, download) {
-						addRoot(download)
-					}
-					proxies = append(proxies, "file://"+filepath.ToSlash(download))
-				}
+			goproxy, download := sandboxGoProxy(hostEnv)
+			if download != "" && isPathHiddenBySandbox(home, download) {
+				addRoot(download)
 			}
-			upstream := sanitizeGoProxyList(hostEnv.GOPROXY)
-			if upstream == "" {
-				upstream = "https://proxy.golang.org,direct"
-			}
-			proxies = append(proxies, upstream)
-			env = append(env, "GOPROXY", strings.Join(proxies, ","))
+			env = append(env, "GOPROXY", goproxy)
 			for _, kv := range [][2]string{
 				{"GOPRIVATE", hostEnv.GOPRIVATE},
 				{"GONOPROXY", hostEnv.GONOPROXY},
@@ -642,6 +629,67 @@ func symlinkChain(p string) []string {
 		chain = append(chain, real)
 	}
 	return chain
+}
+
+// sandboxGoProxy returns the GOPROXY value of the sandboxed go command and the
+// host module cache download directory it serves as a local proxy ("" when
+// there is none): that directory first, so network-isolated runs reuse the
+// modules the host already has instead of failing to download them, then the
+// host's proxies without credentials (proxy.golang.org and direct by default).
+func sandboxGoProxy(hostEnv hostGoEnv) (value, download string) {
+	var proxies []string
+	if modcache := strings.TrimSpace(hostEnv.GOMODCACHE); modcache != "" && filepath.IsAbs(modcache) {
+		dir := filepath.Join(modcache, "cache", "download")
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			download = dir
+			proxies = append(proxies, "file://"+filepath.ToSlash(dir))
+		}
+	}
+	upstream := sanitizeGoProxyList(hostEnv.GOPROXY)
+	if upstream == "" {
+		upstream = "https://proxy.golang.org,direct"
+	}
+	return strings.Join(append(proxies, upstream), ","), download
+}
+
+// goProxySpec is one entry of a GOPROXY list as the go command reads it
+// (cmd/go/internal/modfetch proxyList).
+type goProxySpec struct {
+	// url is a proxy URL (https:// added to a bare host name, as the go
+	// command adds it), or "direct" or "off".
+	url string
+	// fallBackOnError is set for an entry followed by '|': the go command
+	// moves on to the next entry after any error from it. After an entry
+	// followed by ',' (or the last one) it moves on only after a "not found"
+	// (404 or 410 from a proxy, a missing file in a local one).
+	fallBackOnError bool
+}
+
+// parseGoProxyList parses a GOPROXY value like the go command: entries are
+// separated by ',' or '|', empty ones are skipped, and "direct" or "off" ends
+// the list (the go command ignores what follows either).
+func parseGoProxyList(value string) []goProxySpec {
+	var specs []goProxySpec
+	for value != "" {
+		entry, fallBackOnError := value, false
+		if i := strings.IndexAny(value, ",|"); i >= 0 {
+			entry, fallBackOnError, value = value[:i], value[i] == '|', value[i+1:]
+		} else {
+			value = ""
+		}
+		entry = strings.TrimSpace(entry)
+		switch {
+		case entry == "":
+			continue
+		case entry == "direct" || entry == "off":
+			return append(specs, goProxySpec{url: entry})
+		case strings.ContainsAny(entry, ".:/") && !strings.Contains(entry, ":/") && !filepath.IsAbs(entry) && !path.IsAbs(entry):
+			// A bare host such as goproxy.cn: the go command implies https://.
+			entry = "https://" + entry
+		}
+		specs = append(specs, goProxySpec{url: entry, fallBackOnError: fallBackOnError})
+	}
+	return specs
 }
 
 // sanitizeGoProxyList drops proxy entries that embed credentials: the sandbox

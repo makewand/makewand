@@ -192,8 +192,9 @@ type HTTPHandlerOptions struct {
 	// ScaleBudgetReservation sizes each reservation from the router's pricing
 	// (prompt estimate × input price + per-call max output × output price,
 	// across every attempt, including Power-mode generators, judge and
-	// fallback; see Router.httpReservationUSD) and stops streams whose
-	// estimated spend exceeds it. The ceiling is the most expensive reachable
+	// fallback; see Router.httpReservationUSD) and stops a stream once even a
+	// lower estimate of its spend exceeds it, i.e. a provider ignoring its output
+	// cap (see httpStreamSpendGuard). The ceiling is the most expensive reachable
 	// model and uncertain outcomes settle at the reservation, so small budgets
 	// are consumed much faster than actual spend; it is therefore opt-in
 	// (makewand serve: MAKEWAND_SCALED_BUDGET_RESERVATION=1).
@@ -458,6 +459,10 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		}
 	}
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
+	if err == nil {
+		// A transport that reported no usage is estimated as streams are.
+		usage = prepared.Router.estimateUnreportedHTTPUsage(usage, result, prepared.Messages, prepared.System, content, prepared.Router.httpCallMaxTokens(prepared.RequestedModel, prepared.Task))
+	}
 	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
 	if err != nil && errors.Is(err, execution.ErrUnknownOutcome) && !usage.MeasuredCost {
 		usageEntry.UncertainCost = true
@@ -656,6 +661,10 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		}
 	}
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
+	if err == nil {
+		// A transport that reported no usage is estimated as streams are.
+		usage = prepared.Router.estimateUnreportedHTTPUsage(usage, result, prepared.Messages, prepared.System, content, prepared.Router.httpCallMaxTokens(prepared.RequestedModel, prepared.Task))
+	}
 	applyHTTPUsage(grant, usage, result, &auditEvent, &usageEntry)
 	if err != nil && errors.Is(err, execution.ErrUnknownOutcome) && !usage.MeasuredCost {
 		usageEntry.UncertainCost = true
@@ -810,7 +819,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 	sentRole := false
 	var contentBuilder strings.Builder
 	defer func() {
-		finalizeHTTPStreamUsage(activeRouter, grant, usage, result, messages, system, contentBuilder.String(), auditEvent, usageEntry)
+		finalizeHTTPStreamUsage(activeRouter, grant, usage, result, messages, system, contentBuilder.String(), activeRouter.httpCallMaxTokens(requestedModel, task), auditEvent, usageEntry)
 	}()
 	for chunk := range stream {
 		if chunk.Error != nil {
@@ -983,7 +992,7 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 	itemID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	var contentBuilder strings.Builder
 	defer func() {
-		finalizeHTTPStreamUsage(activeRouter, grant, usage, result, messages, system, contentBuilder.String(), auditEvent, usageEntry)
+		finalizeHTTPStreamUsage(activeRouter, grant, usage, result, messages, system, contentBuilder.String(), activeRouter.httpCallMaxTokens(requestedModel, task), auditEvent, usageEntry)
 	}()
 	for chunk := range stream {
 		if chunk.Error != nil {
@@ -1134,37 +1143,66 @@ func applyHTTPUsage(grant *serverauth.Grant, usage Usage, result RouteResult, au
 		usageEntry.PromptTokens = usage.InputTokens
 		usageEntry.CompletionTokens = usage.OutputTokens
 		usageEntry.CostUSD = usage.Cost
+		// A cost no transport measured - an unpriced model's fallback rate, a
+		// stream's token estimate - is recorded as estimated.
+		usageEntry.EstimatedCost = usage.Cost > 0 && !usage.MeasuredCost
 	}
 	if grant != nil && usage.Cost > 0 {
 		grant.RecordCostAt(time.Now(), usage.Cost)
 	}
 }
 
-func finalizeHTTPStreamUsage(r *Router, grant *serverauth.Grant, usage Usage, result RouteResult, messages []Message, system, output string, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
+func finalizeHTTPStreamUsage(r *Router, grant *serverauth.Grant, usage Usage, result RouteResult, messages []Message, system, output string, maxTokens int, auditEvent *serveraudit.Event, usageEntry *serverusage.Entry) {
 	// Most streaming transports cannot report token usage. Estimate it at the
 	// terminal boundary so streamed API calls cannot bypass usage logs and team
-	// budgets entirely. Subscription calls retain zero dollar cost; the estimate
-	// is priced only for providers configured as API access.
-	estimated := r.EstimateUsageForRoute(result, messages, system, output)
-	if usage.InputTokens == 0 {
-		usage.InputTokens = estimated.InputTokens
+	// budgets entirely.
+	usage = r.estimateUnreportedHTTPUsage(usage, result, messages, system, output, maxTokens)
+	applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
+	if usageEntry != nil && auditEvent != nil && auditEvent.Error != "" && !usage.MeasuredCost {
+		usageEntry.UncertainCost = true
 	}
-	if usage.OutputTokens == 0 {
-		usage.OutputTokens = estimated.OutputTokens
-	}
+}
+
+// estimateUnreportedHTTPUsage fills in what the transport serving a request
+// did not report: token counts are estimated from the prompt and the output
+// delivered, the output estimate capped at the provider call's max_tokens
+// (estimateOutputTokens), and a missing cost is priced from them and not
+// marked measured. Only providers configured as API access get a dollar
+// estimate; subscription calls retain zero dollar cost.
+func (r *Router) estimateUnreportedHTTPUsage(usage Usage, result RouteResult, messages []Message, system, output string, maxTokens int) Usage {
 	if usage.Provider == "" {
 		usage.Provider = result.Actual
 	}
 	if usage.Model == "" {
 		usage.Model = result.ModelID
 	}
-	if usage.Cost == 0 {
+	if usage.InputTokens != 0 && usage.OutputTokens != 0 && (usage.Cost != 0 || r == nil || r.getAccessType(result.Actual) != AccessAPI) {
+		return usage // reported in full
+	}
+	estimated := r.estimateUsageForCall(result, messages, system, output, maxTokens)
+	if usage.InputTokens == 0 {
+		usage.InputTokens = estimated.InputTokens
+	}
+	if usage.OutputTokens == 0 {
+		usage.OutputTokens = estimated.OutputTokens
+	}
+	if usage.Cost == 0 && estimated.Cost > 0 {
 		usage.Cost = estimated.Cost
+		usage.MeasuredCost = false
 	}
-	applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
-	if usageEntry != nil && auditEvent != nil && auditEvent.Error != "" && !usage.MeasuredCost {
-		usageEntry.UncertainCost = true
+	return usage
+}
+
+// httpCallMaxTokens is the max_tokens of the provider calls serving an HTTP
+// request: the build phase's output cap for a pinned provider (ChatWith,
+// ChatStreamWith) and for each call of a Power-mode ensemble (ChatBest), the
+// task's otherwise (Chat, ChatStream). A client-supplied max_tokens is not
+// forwarded to providers, so it does not change it.
+func (r *Router) httpCallMaxTokens(requestedModel string, task TaskType) int {
+	if requestedModel != "" || r.effectiveMode() == ModePower {
+		return maxTokensForPhase(taskToBuildPhase(task))
 	}
+	return MaxTokensForTask(task)
 }
 
 func writeSSEEvent(w http.ResponseWriter, event string, payload any) error {

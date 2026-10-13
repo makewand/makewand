@@ -80,9 +80,15 @@ class TestEnsemble(unittest.TestCase):
     @patch("makewand.ensemble.has_api_configured", return_value=False)
     @patch("makewand.health.load_status_cache", return_value={})
     def test_resolve_ensemble_providers_fallback(self, mock_cache, mock_api, mock_sub, mock_enabled):
-        # All disabled and unconfigured -> falls back to local
-        providers = resolve_ensemble_providers()
-        self.assertEqual(providers, ["local"])
+        # All disabled and unconfigured (local too) -> nothing can run, nothing is dispatched
+        unavailable = {}
+        providers = resolve_ensemble_providers(unavailable=unavailable)
+        self.assertEqual(providers, [])
+        self.assertIn("local", unavailable)
+        # An enabled, answering local model is still the fallback
+        mock_enabled.side_effect = lambda p: p == "local"
+        with patch("makewand.providers.local.is_local_model_available", return_value=(True, "", ["qwen2.5-coder"])):
+            self.assertEqual(resolve_ensemble_providers(), ["local"])
 
     def test_extract_summary_bullet_empty(self):
         self.assertEqual(extract_summary_bullet(""), "无输出")

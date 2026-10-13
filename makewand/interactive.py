@@ -47,6 +47,7 @@ from makewand.health import (
     calculate_provider_quota,
 )
 from makewand.discovery import discover_available_models
+from makewand.engine_selection import _print_no_provider_guidance
 from makewand.orchestrator import (
     run_pipeline,
     run_review,
@@ -278,8 +279,13 @@ def handle_conversational_turn(
     else:
         cache = get_or_update_status(force_probe=False)
         available_coders, _, route_meta = select_optimal_engine_pair(user_input, tier=tier, cache=cache)
-        primary = route_meta.get("primary_coder") or (available_coders[0] if available_coders else "agy")
-        sorted_engines = available_coders if available_coders else [primary, "agy", "claude", "codex", "local"]
+        if not available_coders:
+            # Nothing can run right now: dispatch nothing and say why for each engine.
+            _print_no_provider_guidance(route_meta)
+            print()
+            return
+        primary = route_meta.get("primary_coder") or available_coders[0]
+        sorted_engines = list(available_coders)
         if primary not in sorted_engines:
             sorted_engines.insert(0, primary)
 

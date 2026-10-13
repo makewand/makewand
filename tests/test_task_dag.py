@@ -9,13 +9,31 @@ except ImportError:
 
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from makewand.git_helper import run_git_cmd
 from makewand.orchestrator import TaskNode, TaskDAG, decompose_task_to_dag, execute_task_dag
 
 
 class TestTaskDAG(unittest.TestCase):
+    def setUp(self):
+        # A multi-task DAG stages its tasks in a private copy of the workspace, so
+        # execution tests use a throwaway repository instead of the process cwd.
+        temp = tempfile.TemporaryDirectory(prefix="makewand-dag-")
+        self.addCleanup(temp.cleanup)
+        self.repo = Path(temp.name) / "repo"
+        self.repo.mkdir()
+        (self.repo / "app.py").write_text("VALUE = 1\n")
+        for arguments in (["init", "-q"], ["config", "user.name", "Fixture"],
+                          ["config", "user.email", "fixture@example.invalid"], ["add", "."], ["commit", "-qm", "base"]):
+            self.assertEqual(run_git_cmd(["git", *arguments], cwd=str(self.repo))[0], 0)
+        sessions = patch("makewand.git_helper.get_active_interactive_working_trees", return_value={})
+        sessions.start()
+        self.addCleanup(sessions.stop)
+
     def test_topological_stages_sequential(self):
         t1 = TaskNode("t1", "Task 1", dependencies=[])
         t2 = TaskNode("t2", "Task 2", dependencies=["t1"])
@@ -80,7 +98,7 @@ class TestTaskDAG(unittest.TestCase):
         dag = TaskDAG("Goal", [t1, t2])
 
         with patch("makewand.orchestrator.run_pipeline", return_value=True):
-            ok, summary, results = execute_task_dag(dag)
+            ok, summary, results = execute_task_dag(dag, cwd=str(self.repo))
             self.assertTrue(ok)
             self.assertEqual(len(results), 2)
             self.assertEqual(dag.tasks["t1"].status, "passed")
@@ -92,7 +110,7 @@ class TestTaskDAG(unittest.TestCase):
         dag = TaskDAG("Goal", [t1, t2])
 
         with patch("makewand.orchestrator.run_pipeline", return_value=False):
-            ok, summary, results = execute_task_dag(dag)
+            ok, summary, results = execute_task_dag(dag, cwd=str(self.repo))
             self.assertFalse(ok)
             self.assertEqual(dag.tasks["t1"].status, "failed")
             self.assertEqual(dag.tasks["t2"].status, "pending")
@@ -110,6 +128,7 @@ class TestTaskDAG(unittest.TestCase):
         with patch("makewand.orchestrator.run_pipeline", side_effect=mock_run_pipeline):
             ok, summary, results = execute_task_dag(
                 dag,
+                cwd=str(self.repo),
                 tiered=True,
                 architect_engine="claude",
                 worker_engine="local"
@@ -137,6 +156,7 @@ class TestTaskDAG(unittest.TestCase):
         with patch("makewand.orchestrator.run_pipeline", side_effect=mock_run_pipeline):
             ok, summary, results = execute_task_dag(
                 dag,
+                cwd=str(self.repo),
                 tiered=True,
                 architect_engine="claude",
                 worker_engine="local"
@@ -166,6 +186,7 @@ class TestTaskDAG(unittest.TestCase):
         with patch("makewand.orchestrator.run_pipeline", side_effect=mock_run_pipeline):
             ok, summary, results = execute_task_dag(
                 dag,
+                cwd=str(self.repo),
                 local_only=True
             )
             self.assertTrue(ok)

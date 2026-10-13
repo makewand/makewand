@@ -202,8 +202,14 @@ class WindowsJob:
 
 
 def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=False,
-                           print_prefix="", pass_fds=(), *, output_limit, stream_queue_limit):
-    from makewand.providers.base import ProcessExecutionError
+                           print_prefix="", pass_fds=(), *, output_limit, stream_queue_limit,
+                           separate_stderr=False):
+    """run_subprocess on native Windows: both pipes are read concurrently by
+    their own threads. Stream mode merges stderr into stdout unless
+    `separate_stderr` is set: then stdout is displayed as it arrives, stderr
+    whole lines at a time, and both are captured apart (CapturedStderr says
+    which contract applied, as on POSIX)."""
+    from makewand.providers.base import ProcessExecutionError, CapturedStderr
     from makewand.providers.base import _STREAM_WRITER
     import codecs
     proc = None
@@ -217,7 +223,10 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     total = 0
     target = sys.stdout
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace") if stream else None
+    merge_stderr = stream and not separate_stderr
+    decoders = ({name: codecs.getincrementaldecoder("utf-8")(errors="replace") for name in ("stdout", "stderr")}
+                if stream else None)
+    pending_stderr = []  # an unfinished stderr line, displayed once complete
 
     def enqueue(kind, value):
         while not stop.is_set():
@@ -268,11 +277,22 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
         threads.append(thread)
         thread.start()
 
-    def display(data, final=False):
+    def display(data, *, source="stdout", final=False):
         nonlocal display_job, display_proc
-        if decoder is None:
+        if decoders is None:
             return
-        text = decoder.decode(data, final=final)
+        if final:
+            text = (decoders["stdout"].decode(data, final=True) + "".join(pending_stderr)
+                    + decoders["stderr"].decode(b"", final=True))
+            pending_stderr.clear()
+        elif source == "stderr":
+            # Whole stderr lines only, so a CLI message is not cut into the answer.
+            joined = "".join(pending_stderr) + decoders["stderr"].decode(data)
+            cut = joined.rfind("\n") + 1
+            text = joined[:cut]
+            pending_stderr[:] = [joined[cut:]] if cut < len(joined) else []
+        else:
+            text = decoders["stdout"].decode(data)
         if not text:
             return
         if print_prefix:
@@ -305,7 +325,7 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
         err = captured["stderr"].decode("utf-8", errors="replace")
         if not stream:
             out, err = (value.replace("\r\n", "\n").replace("\r", "\n") for value in (out, err))
-        return code, out, err, error
+        return code, out, CapturedStderr(err, not merge_stderr), error
 
     try:
         from makewand.providers.base import get_current_contestant_scope
@@ -322,7 +342,7 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
         win_env["NoDefaultCurrentDirectoryInExePath"] = "1"
         proc = job.start(cmd, shell=isinstance(cmd, str), cwd=cwd, env=win_env,
                          stdin=subprocess.PIPE if input_text is not None else None,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT if stream else subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
                          text=False, bufsize=0)
         if scope:
             scope.register_proc(proc)
@@ -375,7 +395,7 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
             accepted = value[:available]
             captured[kind].extend(accepted)
             total += len(accepted)
-            display(accepted)
+            display(accepted, source=kind)
             if len(value) > available:
                 return result(-1, ProcessExecutionError(f"Command output exceeded shared {output_limit}-byte stdout/stderr limit", "UNKNOWN"))
     except KeyboardInterrupt:

@@ -16,6 +16,7 @@ import (
 const depsInstallSkippedDetail = "skipped for safety"
 const testsSkippedDetail = "skipped (dependency install not approved)"
 const testsRunSkippedDetail = "skipped by user"
+const testsDepsUnavailableDetail = "skipped (dependencies could not be downloaded)"
 
 // --- AI response handling ---
 
@@ -791,6 +792,9 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 			Role:    "status",
 			Content: execFinishedMessage(m.ExecDepsLabel, commandDetails, execResultSummary(msg.result)),
 		})
+		if errors.Is(msg.err, engine.ErrDependencyNetworkUnavailable) {
+			return a.skipTestsWithoutDependencies()
+		}
 		// Still try tests
 	case msg.result != nil && msg.result.ExitCode != 0:
 		emitExecTrace(a.router, "pipeline.exec.failed", "deps", plan, nil, msg.result, nil, "dependency install command exited non-zero")
@@ -834,6 +838,19 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 
 	// Next step: ask/execute tests
 	return a.startTestsPhase()
+}
+
+// skipTestsWithoutDependencies finishes the build after a dependency install
+// could not reach its registry (an environment problem). The tests would run
+// without their dependencies and fail for a reason no code change can fix, so
+// they are skipped rather than penalised and handed to auto-fix.
+func (a App) skipTestsWithoutDependencies() (tea.Model, tea.Cmd) {
+	emitExecTrace(a.router, "pipeline.exec.skipped", "tests", a.pendingTestsPlan, nil, nil, nil, testsDepsUnavailableDetail)
+	a.progress.SetStepStatus(stepTests, StepDone)
+	a.progress.SetStepDetail(stepTests, testsDepsUnavailableDetail)
+	a.pendingDepsPlan = nil
+	a.pendingTestsPlan = nil
+	return a.buildComplete()
 }
 
 func (a App) handleTestsRunConfirm(msg confirmTestsRunMsg) (tea.Model, tea.Cmd) {
@@ -880,6 +897,17 @@ func (a App) handleTestRun(msg testRunMsg) (tea.Model, tea.Cmd) {
 		a.progress.SetStepDetail(stepTests, m.ProgressNoTests)
 		a.pendingTestsPlan = nil
 		return a.buildComplete()
+	}
+
+	if errors.Is(msg.err, engine.ErrDependencyNetworkUnavailable) {
+		// The auto-fix retry reports its dependency install error here.
+		a.progress.SetStepStatus(stepDeps, StepFailed)
+		a.progress.SetStepDetail(stepDeps, msg.err.Error())
+		a.chat.AddMessage(ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf(m.BuildDepsExecError, msg.err),
+		})
+		return a.skipTestsWithoutDependencies()
 	}
 
 	if msg.err != nil {

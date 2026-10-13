@@ -57,6 +57,17 @@ func (c *Claude) IsAvailable() bool { return c.apiKey != "" }
 // is a pure HTTP call to the Anthropic API and runs no local repo-aware agent.
 func (c *Claude) SafeForUntrustedRepo() bool { return true }
 
+// ReportedModelID names the model a call sends upstream: the router-requested
+// model or, when routing requests none (e.g. a pinned "claude-api" sibling),
+// the configured one. Stream routes, which carry no usage, are then reported
+// and billed at the model actually called.
+func (c *Claude) ReportedModelID(requestedModelID string) string {
+	if requestedModelID != "" {
+		return requestedModelID
+	}
+	return c.model
+}
+
 type claudeRequest struct {
 	Model     string          `json:"model"`
 	MaxTokens int             `json:"max_tokens"`
@@ -148,18 +159,26 @@ func (c *Claude) chatUnaccounted(ctx context.Context, messages []Message, system
 		b.WriteString(block.Text)
 	}
 
-	cost, measuredCost := c.priceForCtxWithStatus(ctx, model, result.Usage.InputTokens, result.Usage.OutputTokens)
+	text := b.String()
+	inputTokens, outputTokens := result.Usage.InputTokens, result.Usage.OutputTokens
+	measured := inputTokens > 0 || outputTokens > 0
+	if !measured {
+		// A reply without a usage block is estimated like a stream, not
+		// recorded as a measured $0.
+		inputTokens, outputTokens = estimateCallTokens(messages, system, text, maxTokens)
+	}
+	cost, measuredCost := c.priceForCtxWithStatus(ctx, model, inputTokens, outputTokens)
 	usage := Usage{
-		MeasuredTokens: result.Usage.InputTokens > 0 || result.Usage.OutputTokens > 0,
-		MeasuredCost:   measuredCost,
-		InputTokens:    result.Usage.InputTokens,
-		OutputTokens:   result.Usage.OutputTokens,
+		MeasuredTokens: measured,
+		MeasuredCost:   measured && measuredCost,
+		InputTokens:    inputTokens,
+		OutputTokens:   outputTokens,
 		Cost:           cost,
 		Model:          model,
 		Provider:       "claude",
 	}
 
-	return b.String(), usage, nil
+	return text, usage, nil
 }
 
 func (c *Claude) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {

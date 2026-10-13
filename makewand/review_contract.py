@@ -60,6 +60,48 @@ def generate_review_nonce() -> str:
     return secrets.token_hex(4)
 
 
+def legacy_verdict_allowed() -> bool:
+    """Whether a verdict line without the per-task nonce may still count.
+
+    Never in production, where it would let a verdict echoed from candidate
+    content approve it: only MAKEWAND_ALLOW_LEGACY_VERDICT=1 or the isolated test
+    harness (MAKEWAND_TEST_ISOLATION_ROOT) allow it, and MAKEWAND_STRICT_NONCE=1
+    always forbids it.
+    """
+    if os.environ.get("MAKEWAND_STRICT_NONCE") == "1":
+        return False
+    return os.environ.get("MAKEWAND_ALLOW_LEGACY_VERDICT") == "1" or bool(os.environ.get("MAKEWAND_TEST_ISOLATION_ROOT"))
+
+
+# Largest review prompt (UTF-8 bytes) a reviewer is known to receive whole. The
+# agy adapter passes a prompt over 32 KiB as a file that its agent reads with
+# its own file tools, which show a large file in truncated, paged views: a
+# verdict could cover part of the diff. Every other reviewer gets the complete
+# prompt (argv, stdin, the CLI's own --prompt-file/--message-file option or an
+# API request body), and an API that could shorten it processes it whole or
+# fails closed instead (local Ollama: a context window sized for the prompt and
+# checked against its token counts; OpenRouter: prompt transforms disabled).
+# The margin covers the adapter's read-only prefix.
+WHOLE_PROMPT_LIMITS = {"agy": 31 * 1024}
+
+
+def reviewer_prompt_limit(engine: Optional[str]) -> Optional[int]:
+    """The whole-prompt limit for engine, or None when it receives any prompt whole."""
+    return WHOLE_PROMPT_LIMITS.get((engine or "").lower())
+
+
+def reviewer_receives_whole_prompt(engine: Optional[str], prompt: Optional[str]) -> bool:
+    """A verdict counts only from a reviewer that received the complete review prompt.
+
+    The prompt is measured as dispatched (orchestrator.dispatch_task), with any
+    undecodable byte of a file name shown as \\xNN (git_helper._printable)."""
+    limit = reviewer_prompt_limit(engine)
+    if limit is None:
+        return True
+    from makewand.git_helper import _printable
+    return len(_printable(prompt or "").encode("utf-8")) <= limit
+
+
 def _build_verdict_tag_re(nonce: Optional[str] = None) -> re.Pattern:
     if nonce:
         return re.compile(rf"^[ \t>*_`#\-]*MAKEWAND_VERDICT_{re.escape(nonce)}[ \t*_`]*[:：]", re.IGNORECASE | re.MULTILINE)
@@ -134,16 +176,7 @@ def _scan_verdict_lines(text: str, nonce: Optional[str] = None, allow_legacy: Op
     if nonce and not entries:
         # Legacy un-nonced fallback is strictly forbidden in production to prevent verdict echo hijacking,
         # and only permitted when explicitly enabled or within isolated test harness environments.
-        should_allow = allow_legacy
-        if should_allow is None:
-            if os.environ.get("MAKEWAND_STRICT_NONCE") == "1":
-                should_allow = False
-            elif os.environ.get("MAKEWAND_ALLOW_LEGACY_VERDICT") == "1":
-                should_allow = True
-            elif os.environ.get("MAKEWAND_TEST_ISOLATION_ROOT"):
-                should_allow = True
-            else:
-                should_allow = False
+        should_allow = legacy_verdict_allowed() if allow_legacy is None else allow_legacy
         if should_allow:
             entries = _scan_verdict_entries_for_re(text, _VERDICT_TAG_RE)
     return entries

@@ -20,21 +20,52 @@ All notable changes to this project are documented here. The format is based on
 - **应用与审查完整性**：候选应用改用 `renameat2` 交换/不覆盖，并发保存不再被覆盖；审查的 diff 原样传入并与交付绑定 sha256；AST 合并拒绝冲突的 import 绑定；交付指纹覆盖 `.makewand_*` 与依赖目录；任务产生的 `__pycache__`/`.pyc` 不再进入交付补丁。
 - **计费与服务端**：组合调用计入失败尝试的花费；可选开启 `MAKEWAND_SCALED_BUDGET_RESERVATION=1`，让 HTTP 预算预留按定价、输出上限和扇出放大，并在流式输出超出预留时停止（默认仍为固定预留）；SSE 事件总量有上限；SQLite 默认 `synchronous=FULL` 与 `_txlock=immediate`。
 
+2026-10-12 P1 修复批次（Python 与 Go 两个引擎；行为细节与残余风险见 SECURITY.md、docs/VERIFICATION_CONTRACT.md 与 docs/EXECUTION_CONTRACT.md）：
+
+- **凭据回写只合并同账号的令牌刷新**：两引擎使用同一套规则和共享测试向量（`_credential_writeback_merge` / `cliMergeCredential`），以宿主文档为基础只拷入令牌刷新字段。登出、换账号或重定向（删除/清空令牌，改动邮箱、API key、端点、认证方式、账号 ID 等受保护字段）、JWT 换成他人账号或不透明令牌、更换 Google refresh token、时间倒退、令牌类型除大小写外的变化、非严格 JSON（含孤立的 UTF-16 代理转义）都整份拒绝，并提示一次（指明文件和字段，不显示值）。muse 只有 OAuth 登录记录中的 `api_key` 视为其自行铸造、可单独写回，保存或粘贴的 key 受保护；`flow_auth.json` 只拷入。写回在宿主文件旁的 `.<文件名>.makewand-lock` 上取 `flock`（最多等 10 秒）并在重命名前复核宿主文件；副本被删除/替换/超过 4 MiB/不可读、沙箱内新建登录（含宿主缺少整个 provider 目录）都会提示，不再静默跳过。Go 的审查与远端（`makewand serve`）会话也使用私有副本并经同一合并写回，`Chat` 与正常结束的流式调用等写回完成才返回（最多 15 秒）。不透明令牌无法离线绑定账号、JWT 签名不校验、登出无法防止等残余风险见 SECURITY.md。
+- **依赖安装网络**：Go 候选验证的每个步骤都在独立网络命名空间中运行。依赖安装（及 Rust 检查前的 `cargo fetch`）在有可信的 `slirp4netns`、`nsenter`、`ip` 时获得只能访问公网的用户态网络：私网、回环、链路本地（云元数据）、CGNAT、组播、保留网段与本机地址在命令运行前即被路由屏蔽，不启用 IPv6，可选的 `tc`/`nft` 再丢弃组播与 IPv6；网络配置失败时沙箱在命令运行前被终止，步骤改为仅回环重跑。安装失败只有经 makewand 确认才算环境问题：联网时由 makewand 自身可执行文件在全新沙箱中探测默认注册表（go 按 go 命令的 `,`/`|` 规则遍历 `GOPROXY` 与校验和数据库），离线时须由项目文件证明确有未安装的注册表依赖（go 依据宿主工具链 `go mod edit -json` 解析的 go.mod、go.sum、imports 与两处模块缓存）。候选代码打印的文字不能再伪造环境错误。
+- **宿主模式交付**：只核查本次任务新建、修改或删除的路径（按类型、权限与内容判断，单纯 ctime/inode 变化不算修改）。审查 diff 之外的改动——被忽略文件的新建或改动、二进制/可执行产物、`.env*`/`.envrc`/`*.pth`/`sitecustomize.py`/`.husky`/`.githooks`、子模块或嵌套仓库中的文件、本检出及其子模块私有 hooks 目录中的新 hook——阻断交付并回滚。新 hook 移入 `rejected_*/quarantine/git-hooks/` 并附 `mv` 恢复命令，不再删除；链接工作树或仓库外 `core.hooksPath` 等共享 hooks 目录只报告、不阻断。用户的 diff 配置（外部 diff 与 textconv、颜色、`diff.relative`、路径前缀、`diff.context` 等）不再影响审查 diff、交付核查与导出补丁；回滚改用字面路径（`[ab].txt` 不再连带恢复 `a.txt`）。未备份的既有文件按 SHA-256 摘要与抽样指纹核对，内容无法确认时按“无法确认”阻断。
+- **审查完整性**：竞速裁决行绑定本任务 nonce（`MAKEWAND_RACE_VERDICT_<nonce>`），候选 diff 中回显的裁决行无效；Winner-Take-All 胜者以及裁判选中的与其同一提供方的候选，都须经其他提供方只读复审通过，并优先选择独立于双方选手的裁判。只采纳收到完整提示的裁决：超过 31 KiB 的提示不交给 agy（流水线改由下一位可用审查方接替），占位引擎（cursor、copilot）从不审查，本地模型的只读回答须由 token 计数证明读到了完整提示，OpenRouter 请求关闭提示压缩（`transforms: []`）。
+- **测试不再改动源码树**：设置 `MAKEWAND_TEST_ISOLATION_ROOT`（测试环境）时，宿主事务、流水线、竞速、DAG（含单任务）与 `apply` 一律拒绝以 makewand 源码树、其子目录或上级目录为工作区（单一定义 `git_helper.harness_source_tree_conflict`）；测试只能连接自身绑定的回环端口，代理变量被清除，pytest 结束时列出被拦截的连接。
+
 ### Added
 
 - 递归保护：makewand 启动的 provider CLI 带 `MAKEWAND_PROVIDER_WORKER=1`，在其中再调用会派发模型的 makewand 命令会被拒绝。
 - 新环境变量：`MAKEWAND_BWRAP_PATH`（非系统目录安装的 bwrap）、`MAKEWAND_ALLOW_NO_SECCOMP=1`（显式关闭 seccomp）、`MAKEWAND_SANDBOX_MEMORY_MAX`（默认 `8G`）、`MAKEWAND_SANDBOX_TASKS_MAX`（默认 `512`）、`MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT`（工作区扫描上限，默认 1,000,000）、`MAKEWAND_SQLITE_SYNCHRONOUS`（`FULL`/`EXTRA`/`NORMAL`）、`MAKEWAND_SCALED_BUDGET_RESERVATION=1`（`makewand serve` 按定价放大预算预留）。
+- 新环境变量（2026-10-12 批次）：`MAKEWAND_REVIEW_DIFF_MAX_BYTES`（复审 diff 上限，默认 262144 字节，原固定为 64 KiB；无效值回退默认并警告一次）；`MAKEWAND_FINGERPRINT_FILE_LIMIT`、`MAKEWAND_FINGERPRINT_TOTAL_LIMIT`、`MAKEWAND_FINGERPRINT_SECONDS`（宿主模式摘要与抽样指纹上限，默认 64 MiB、512 MiB、20 秒）；`MAKEWAND_SLIRP4NETNS_PATH`、`MAKEWAND_NSENTER_PATH`、`MAKEWAND_IP_PATH`、`MAKEWAND_TC_PATH`、`MAKEWAND_NFT_PATH`（依赖安装网络工具不在 root 拥有的系统目录时，指定可信的绝对路径）。
+- `makewand/cli_message_catalog.json`：各 CLI 自己打印的限额、限流、过载、登录与地区消息目录；Go 路由器内嵌字节相同的 `router/cli_message_catalog.json`，两侧共用对照语料 `tests/testdata/cli_message_parity.json`。
+- Go SDK `ExecResult.Note`：makewand 自己的说明（例如输出疑似注册表故障但未被确认的原因），也附在候选验证的 `DepsError`/`QuickCheckError` 之后。
+- 使用账本记录 `route`（`cli`/`api`），API 路由的成功不再清除 CLI 的失败记录。
 
 ### Changed
 
 - 行为变化：拒绝以 `/`、`/tmp`、`/home`、系统根目录、`$HOME` 或其上级目录作为可写工作区；provider 的会话历史不再持久化到宿主；Go 沙箱内的 agent 不能再修改 `.git`。
 - 重写 agent skill `makewand-orchestrator`：按 CLI 实际行为说明命令、退出码 0–17、影子工作树交付与递归规则，收紧触发条件。
+- 宿主模式交付被阻断时返回 UNVERIFIED（退出码 11，原为 10），失败原因列出未能恢复的文件；有文件无法复核时，回滚标题不再声称已恢复基线。
+- 复审 diff 上限提高到 256 KiB；超出时不截断审查，结论为 UNVERIFIED，完整补丁保存为可直接 `git apply` 的 `unverified.patch`（`--binary --full-index --unified=3`，子模块补丁列入 `manifest.json`）。审查 diff 与导出补丁总带三行上下文。
+- 测试产物只有一个定义（`git_helper.is_test_output_path`），测试关卡与交付核查共用：`coverage/`、`playwright-report/` 只在仓库根、任务目录或包根计，被 Git 跟踪的文件永远是测试输入。`run_local_tests` 删除本次运行在默认位置生成的测试产物（不进入审查与交付）；可作为代码执行的产物或链接使关卡失败并写明原因；测试前已存在的目录（含空目录）保留；被重写的既有测试产物只在是纯数据（含 Playwright 的 `.zip`/`.webm`）或字节不变时保留。
+- 多阶段 DAG（`makewand plan`）在一份私有暂存副本中逐阶段执行，累积结果作为候选 `dg_…` 的 `A` 只交付一次；只读子任务审查此前的累积改动，其写入一律丢弃；原生 Windows 上多阶段 DAG 拒绝执行（请用 WSL2）。
+- 候选封存清单覆盖 Git 跟踪或会添加的全部文件（含依赖/构建目录名下的文件），旧记录仍可应用。候选新建而工作区已有的条目视为冲突（确认后才用 `--force`）；apply 无法写入的工作区条目（目录、符号链接、特殊文件等）即使加 `--force` 也报告冲突（退出码 14）。`makewand candidates`/`inspect` 按实际情况标注主裁推荐、Winner-Take-All 胜出、旧版记录与 DAG 结果，只列出可行的操作。
+- 没有可用引擎时，流水线、解释/问答、REPL 与 `ensemble` 都不派发任何任务并逐个列出原因，结果为 UNVERIFIED（退出码 11，错误为 `No usable execution provider: <引擎>: <原因>; …`）；`makewand race` 列出每个引擎的状态。claude/codex 登录失效（needs_auth）时与限额一样可转已配置的 API key（仍受 `MAKEWAND_API_POLICY` 约束）。
+- `status --probe`、`probe`、`quota --probe` 在 agy 有未过期的失败记录或额度限制时做一次真实的 `agy -p "echo ok" --mode plan` 调用，只有成功或新的明确结论才替换旧记录。
+- 限额与登录判定只依据各 CLI 自己的消息（上述目录）：两引擎读取相同的输出流与行，跳过 glog、代码块、缩进行、codex 的提示回显与转发的命令输出；流式模式（含原生 Windows）把 stderr 与回答分开捕获。Go 只读 stderr 末尾 8192 行/1 MiB；目录中没有的自定义 CLI 使用通用锚定模式，`token limit exceeded` 之类的措辞也可能把它封停 30 分钟。
+- 依赖安装：没有锁文件的 npm 加 `--no-package-lock`；含 `pyproject.toml` 或 `setup.py` 的 pip 安装加 `--use-pep517`，egg-info 写到工作树外；有 `Cargo.lock` 时所有 cargo 步骤带 `--locked`，没有时删除 cargo 生成的 `Cargo.lock`；声明了依赖的 Rust 项目先 `cargo fetch`。TUI 在依赖无法下载时跳过测试，不扣分、不自动修复。
+- 安装器只安装一份 `makewand-orchestrator` 技能；仍声明同名的旧 `trio-orchestrator` 副本会保持更新并提示删除。
 
 ### Fixed
 
 - agy：启动时的 glog 行 "not logged into Antigravity" 不再被误判为需要重新登录（此前 agy 任意一次失败后都会被停用 30 分钟）；深度档不再传 agy 不支持的 `--effort max`；参数被拒按"结果已知的失败"处理，审查会换下一个审查方。
 - 无沙箱的宿主路径改用环境变量传递 provider 标记，Windows 上不再依赖不存在的 `env` 命令。
 - 3.2.0 的说明中网络隔离开关应为 `MAKEWAND_SANDBOX_UNSHARE_NET=1`（并无 `MAKEWAND_DISABLE_UNSHARE_NET`）。
+- 计费（`makewand serve`）：流式 API 调用按实际调用的模型计价（OpenAI、Claude、Gemini API provider 报告所调模型，SSE `model` 字段改为模型 ID）；没有价目的 API 模型按每百万 token $3/$15 的保守价计费，不再为 $0；不返回 usage 的非流式回复按估算计费；未测得的费用记为 `cost_estimated=1`；估算输出不超过该次调用的 `max_tokens`，除非文本可证明更长。`MAKEWAND_SCALED_BUDGET_RESERVATION=1` 的预留按所有已注册 API 模型中的最高价计算（固定 provider 的请求也可能回退到它们），流式守卫按 token 下界计数，`max_tokens` 之内的回复不再被截断；上游忽略 `max_tokens` 时的超支残余见 SECURITY.md。
+- 健康状态：重置时间解析支持带时区的日期、周限额与时长；`error`/`needs_auth` 记录缺少有效时间戳（缺失、无法解析或超前 5 分钟以上）时立即过期，`ttl_seconds` 最多 24 小时；处于 error 状态的引擎不再被选为裁判或审查方。
+- agy：地区封锁、登录失效与参数错误只按 agy 自己的输出判定（提示与警告取自其二进制中的格式串），退出码 0 却没有回答算失败；`agy models` 刷新失败后 1 小时内不重试，缓存目录不可写时不刷新，不含 gemini-/google- 模型的输出不覆盖旧目录。Muse 不再因回答中的通用 429 行被判限流；codex 自己的 ERROR 事件、退出时的致命错误与额度警告，Claude 的组织额度消息，以及 Gemini CLI 的错误报告都能被识别。
+- 模型发现：grok 快速档不再默认 2 倍计价的 build-fast 变体，价格措辞只在价格语境中解析。
+- 非 UTF-8 文件名：消息、审查提示与产物中显示为 `\xNN`，不再抛出异常；影子交付脚本与打印的 apply 命令使用 `$'\xNN'` 写法并按字节写出；含此类文件名的候选元数据可封存并按原字节应用。
+- 从子目录启动时，子模块改动纳入审查与交付。
+- 单个凭据文件写回出错只提示，不影响其他文件与本次运行；私有 provider 目录的清理不再因极深目录树抛出异常。
+- Go：内存作用域包装器不再把含 `=` 的目标路径当作 `env` 赋值（此前退出码 127）。
+- Homebrew 公式不再把构建时的 `PATH` 写死进 `bin/makewand`（下一次发布生成的公式生效）。
 
 ## [3.2.0] - 2026-10-09
 

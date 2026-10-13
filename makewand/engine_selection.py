@@ -27,8 +27,33 @@ RELIABILITY_MIN_FACTOR = 0.5
 ENGINES_WITHOUT_EXECUTOR = frozenset({"cursor", "copilot"})
 NON_AGENTIC_CHAT_MODELS = frozenset({"local", "ollama", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"})
 
-_UNUSABLE_ENGINE_STATUSES = ("limited", "needs_auth", "missing", "disabled")
+_UNUSABLE_ENGINE_STATUSES = ("limited", "needs_auth", "error", "missing", "disabled")
+# Statuses whose work the provider adapters relay to the provider's cloud API
+# when an API key is configured. An "error" verdict is not relayed: the CLI runs.
+_API_RELAY_STATUSES = ("limited", "needs_auth", "missing")
 _RACE_JUDGE_ORDER = ("agy", "codex", "claude", "grok", "muse", "local")
+
+
+def _failure_verdict_expired(info: Dict[str, Any]) -> bool:
+    """A failure verdict past its TTL is neutral, exactly as load_status_cache treats it
+    (health.failure_verdict_expired): one without a usable timestamp (missing,
+    unparseable or far in the future) is expired too."""
+    from makewand.health import failure_verdict_expired
+    return failure_verdict_expired(info)
+
+
+def _without_expired_failures(cache: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The cache as load_status_cache leaves it: an expired failure verdict reads as
+    "unknown", so scoring, pacing and the usability checks agree on it."""
+    if not isinstance(cache, dict):
+        return cache
+    expired = [engine for engine, info in cache.items() if _failure_verdict_expired(info)]
+    if not expired:
+        return cache
+    neutral = dict(cache)
+    for engine in expired:
+        neutral[engine] = dict(cache[engine], status="unknown", expired_from=cache[engine].get("status"))
+    return neutral
 
 
 def _match_domain_keywords(keywords: List[str], text: str) -> List[str]:
@@ -96,12 +121,39 @@ def _engine_usable(engine: str, cache: Optional[Dict[str, Any]], require_healthy
     from makewand.config import is_provider_enabled
     if not is_provider_enabled(engine):
         return False, f"已被用户禁用 (makewand enable {engine} 可重新开启)"
-    status = ((cache or {}).get(engine) or {}).get("status")
+    info = (cache or {}).get(engine) or {}
+    status = info.get("status") if isinstance(info, dict) else None
     if require_healthy and status != "healthy":
         return False, f"健康状态为 {status or 'unknown'}"
-    if status in _UNUSABLE_ENGINE_STATUSES:
-        return False, f"健康状态为 {status}"
+    if status in _UNUSABLE_ENGINE_STATUSES and not _failure_verdict_expired(info):
+        reason = str(info.get("reason") or "").strip()
+        if status == "needs_auth":
+            from makewand.health import get_reauth_hint
+            hint = get_reauth_hint(engine)
+            reason = reason.replace(f" · {hint}", "").strip()
+            detail = f"：{reason[:80]}" if reason else ""
+            return False, f"健康状态为 needs_auth{detail}（{hint}）"
+        detail = f"：{reason[:80]}" if reason else ""
+        if status == "error":
+            return False, f"健康状态为 error{detail}（有效期过后自动恢复，可运行 'makewand probe' 立即复查）"
+        resets = info.get("resets_at")
+        if status == "limited" and resets and str(resets) not in detail:
+            return False, f"健康状态为 limited{detail}（预计 {resets} 重置）"
+        return False, f"健康状态为 {status}{detail}"
     return True, ""
+
+
+def _usable_or_api_relay(engine: str, cache: Optional[Dict[str, Any]], usable_fn=None) -> bool:
+    """Usable as cached, or its limited / needs_auth / missing CLI is relayed to a
+    configured API key (as the provider adapters do)."""
+    if (usable_fn or _engine_usable)(engine, cache)[0]:
+        return True
+    if engine in ("local", "ollama"):
+        return False
+    from makewand.config import has_api_configured, is_provider_enabled
+    info = (cache or {}).get(engine)
+    status = info.get("status") if isinstance(info, dict) else None
+    return status in _API_RELAY_STATUSES and is_provider_enabled(engine) and has_api_configured(engine)
 
 
 def _select_race_judge(cache: Optional[Dict[str, Any]], contestants: Tuple[Optional[str], ...]) -> Optional[str]:
@@ -125,7 +177,10 @@ def _select_race_judge(cache: Optional[Dict[str, Any]], contestants: Tuple[Optio
 
 
 def _no_provider_detected(forced_engine: Optional[str], route_meta: Dict[str, Any]) -> bool:
-    """True when routing fell back to a placeholder engine with zero active providers (N=0)."""
+    """True when routing has nothing to dispatch: zero active providers (N=0), or
+    none of them usable right now and no caller override chose an engine pair."""
+    if route_meta.get("no_usable_engines") and not route_meta.get("primary_reviewer"):
+        return True
     if forced_engine and forced_engine != "auto":
         return False
     if route_meta.get("no_active_providers"):
@@ -139,7 +194,50 @@ def _no_provider_detected(forced_engine: Optional[str], route_meta: Dict[str, An
         return False
 
 
-def _print_no_provider_guidance() -> None:
+def _unusable_engines(active, cache: Optional[Dict[str, Any]], usable_fn=None) -> Dict[str, str]:
+    """Why each active engine with an executor cannot be selected right now; empty
+    when at least one of them can be."""
+    reasons = {}
+    for engine in sorted(active):
+        if engine in ENGINES_WITHOUT_EXECUTOR:
+            continue
+        if _usable_or_api_relay(engine, cache, usable_fn):
+            return {}
+        reasons[engine] = (usable_fn or _engine_usable)(engine, cache)[1] or "当前不可用"
+    return reasons
+
+
+def _routing_unusable_engines(route_meta: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Why each active engine cannot run: from routing, else from the status cache."""
+    unusable = (route_meta or {}).get("unusable_engines")
+    if unusable is None:
+        try:
+            from makewand.config import get_active_providers
+            from makewand.health import load_status_cache
+            active = get_active_providers()
+            unusable = _unusable_engines(active, load_status_cache()) if active else {}
+        except Exception:
+            unusable = {}
+    return unusable
+
+
+def _no_provider_error(route_meta: Optional[Dict[str, Any]] = None) -> str:
+    """The run outcome's error when _no_provider_detected stops it, with each engine's reason."""
+    unusable = _routing_unusable_engines(route_meta)
+    if not unusable:
+        return "No enabled execution provider"
+    return "No usable execution provider: " + "; ".join(f"{engine}: {why}" for engine, why in unusable.items())
+
+
+def _print_no_provider_guidance(route_meta: Optional[Dict[str, Any]] = None) -> None:
+    unusable = _routing_unusable_engines(route_meta)
+    if unusable:
+        print(c(f"❌ [Makewand Routing] 已接入的 {len(unusable)} 个 AI 工具当前都不可用，任务未执行，工作区未做任何改动。",
+                COLOR_RED + COLOR_BOLD))
+        for engine, why in unusable.items():
+            print(f"   • {engine}: {why}")
+        print("   运行 'makewand probe' 立即复查；失败状态在有效期过后自动恢复为中性，额度受限在重置后自动恢复。")
+        return
     print(c("❌ [Makewand Setup] 未检测到任何可用的 AI 编码工具 (0 个)，任务未执行，工作区未做任何改动。", COLOR_RED + COLOR_BOLD))
     print("   接入引导：")
     print("   • 安装并登录任一订阅 CLI：claude / codex / agy (Gemini) / grok / muse；")
@@ -174,6 +272,7 @@ def select_optimal_engine_pair(
             from makewand.health import get_or_update_status
             status_fn = get_or_update_status
         cache = status_fn(force_probe=False)
+    cache = _without_expired_failures(cache)
 
     p_lower = prompt.lower()
     reasons = []
@@ -413,13 +512,32 @@ def select_optimal_engine_pair(
     if not available_coders:
         available_coders = sorted(
             (m for m in active_pool if is_provider_enabled(m) and m not in ENGINES_WITHOUT_EXECUTOR
-             and (_usable_fn(m, cache)[0] or has_api_configured(m))),
+             and _usable_or_api_relay(m, cache, _usable_fn)),
             key=lambda m: (-scores.get(m, -999.0), m),
-        ) or ["agy"]
+        )
         if require_file_editing:
             filtered_coders = [m for m in available_coders if m not in NON_AGENTIC_CHAT_MODELS]
             if filtered_coders:
                 available_coders = filtered_coders
+
+    if not available_coders:
+        # Never name an engine that is not installed or known to fail: report
+        # that nothing can run (callers stop via _no_provider_detected).
+        unusable = _unusable_engines(active_pool, cache, _usable_fn)
+        if unusable:
+            reasons.append("所有已接入的引擎当前都不可用 ("
+                           + "; ".join(f"{m}: {why}" for m, why in unusable.items())
+                           + ")，未选择任何引擎；运行 'makewand probe' 复查，或等待失败状态有效期过后自动恢复")
+        return [], [], {
+            "scores": scores,
+            "reasons": reasons,
+            "primary_coder": None,
+            "primary_reviewer": None,
+            "single_tool_mode": False,
+            "pacings": pacings,
+            "no_usable_engines": True,
+            "unusable_engines": unusable,
+        }
 
     primary_coder = available_coders[0]
 
@@ -488,7 +606,7 @@ def select_optimal_engine_pair(
     elif not available_reviewers:
         other_active = [m for m in active_pool if m != primary_coder and is_provider_enabled(m)
                         and m not in ENGINES_WITHOUT_EXECUTOR
-                        and (_usable_fn(m, cache)[0] or has_api_configured(m))]
+                        and _usable_or_api_relay(m, cache, _usable_fn)]
         if other_active:
             available_reviewers = sorted(other_active, key=lambda m: (-reviewer_base_scores.get(m, -999.0), m))
             reasons.append(f"由于削峰保护，备用审查员降级由活跃工具接管: {available_reviewers[0]}")

@@ -41,12 +41,18 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import atexit
 import contextlib
+import errno
 import hashlib
 import re
 from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # Windows: no bubblewrap, so no private provider homes
+    fcntl = None
 
 from makewand.providers.base import run_subprocess
 
@@ -168,10 +174,18 @@ SAFE_HOME_BIN_DIRS = [
 # ~/.aider) is NEVER bound writable. Every sandboxed provider run gets a fresh
 # private directory (0700, below $XDG_RUNTIME_DIR or the user cache dir) that is
 # bound writable at the provider's expected path. Into it we copy only:
-#   "credentials"  auth/token files; after the run a changed copy is written
-#                  back to the host (regular file only, no symlinks, atomic
-#                  replace, skipped when the host copy changed concurrently)
+#   "credentials"  auth/token files; after the run a changed copy is merged
+#                  into the host file (regular file only, no symlinks, atomic
+#                  replace under makewand's credential lock, skipped when the
+#                  host copy changed concurrently, re-checked right before the
+#                  rename; only the token-refresh fields of a same-account
+#                  refresh, see _credential_writeback_merge and
+#                  _atomic_write_host)
 #   "seed"         harmless caches/ids the CLI expects; never written back
+# A root missing on the host that holds credential files gets an empty private
+# directory at its path inside the sandbox (nothing is created on the host), so
+# a login made in the sandbox is reported after the run instead of vanishing;
+# it is never written back.
 # "protected" entries (root, relative path, kind, placeholder) — instruction,
 # extension, configuration and executable paths — are read-only binds of the
 # host originals (a symlinked entry binds its resolved target). Missing
@@ -240,10 +254,14 @@ PROVIDER_PROFILES: Dict[str, dict] = {
         "credentials": [
             (".gemini", "oauth_creds.json"),
             (".gemini", "google_accounts.json"),
-            (".gemini", "flow_auth.json"),
             (".gemini", "antigravity-cli/antigravity-oauth-token"),
         ],
         "seed": [
+            # A browser cookie jar (a JSON array of name/value/domain/path/
+            # expires/... cookies): its values are opaque session cookies that
+            # cannot be tied to the host account, and no provider CLI refreshes
+            # it, so it is copied in only.
+            (".gemini", "flow_auth.json"),
             (".gemini", "installation_id"),
             (".gemini", "antigravity/installation_id"),
             (".gemini", "antigravity-cli/installation_id"),
@@ -297,6 +315,12 @@ PROVIDER_PROFILES: Dict[str, dict] = {
     "muse": {
         "roots": [".config/muse", ".local/share/muse"],
         "credentials": [(".config/muse", "auth.json")],
+        # muse mints the api_key of its auth.json itself from the OAuth login
+        # (its "startup mint" and the "401 re-mint lane"), so a changed api_key
+        # of a record in that login shape is a re-mint that is written back
+        # (_credential_writeback_merge, _cred_mint_shape); a key saved with
+        # `muse auth set --api-key-stdin` or pasted stays protected.
+        "minted_keys": {(".config/muse", "auth.json"): ("api_key",)},
         "seed": [],
         "protected": [
             (".config/muse", "settings.json", "file", None),
@@ -864,11 +888,14 @@ def _sweep_stale_private_homes(base: str) -> None:
         _robust_force_remove(os.path.join(base, name))
 
 
-def _read_host_regular(path: str) -> Optional[Tuple[bytes, int]]:
-    """(content, mode) of a host file (dotfile symlinks followed), None when absent/not a bounded regular file."""
+def _read_host_state(path: str) -> Optional[Tuple[bytes, int, tuple]]:
+    """
+    (content, mode, identity) of the bounded regular file at path (a symlink
+    there is not followed), None otherwise. identity is (st_dev, st_ino,
+    st_size, st_mtime_ns, sha256 of the content).
+    """
     try:
-        real = os.path.realpath(path)
-        fd = os.open(real, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0))
     except OSError:
         return None
     try:
@@ -881,18 +908,30 @@ def _read_host_regular(path: str) -> Optional[Tuple[bytes, int]]:
             if not b:
                 break
             chunks.append(b)
-        return b"".join(chunks), stat.S_IMODE(st.st_mode)
+        data = b"".join(chunks)
+        return data, stat.S_IMODE(st.st_mode), (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, _digest(data))
     except OSError:
         return None
     finally:
         os.close(fd)
 
 
-def _read_private_nofollow(base: str, rel: str) -> Optional[bytes]:
-    """Reads base/rel without following any symlink below base; None unless a bounded regular file."""
+def _read_host_regular(path: str) -> Optional[Tuple[bytes, int]]:
+    """(content, mode) of a host file (dotfile symlinks followed), None when absent/not a bounded regular file."""
+    state = _read_host_state(os.path.realpath(path))
+    return None if state is None else state[:2]
+
+
+def _read_private_nofollow(base: str, rel: str) -> Tuple[Optional[bytes], str]:
+    """
+    Reads base/rel without following any symlink below base. Returns (content,
+    "") for a bounded regular file, else (None, why): "missing", "not-regular"
+    (a symlink, FIFO, directory, ... at the file or on its path), "oversized" or
+    "unreadable" (_PRIVATE_COPY_PROBLEM_TEXT).
+    """
     parts = [p for p in rel.split("/") if p]
     if not parts or any(p in (".", "..") for p in parts):
-        return None
+        return None, "unreadable"
     fds: List[int] = []
     try:
         fds.append(os.open(base, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC))
@@ -901,17 +940,25 @@ def _read_private_nofollow(base: str, rel: str) -> Optional[bytes]:
         fds.append(os.open(parts[-1], os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0),
                            dir_fd=fds[-1]))
         st = os.fstat(fds[-1])
-        if not stat.S_ISREG(st.st_mode) or st.st_size > CREDENTIAL_MAX_BYTES:
-            return None
-        chunks = []
+        if not stat.S_ISREG(st.st_mode):
+            return None, "not-regular"
+        if st.st_size > CREDENTIAL_MAX_BYTES:
+            return None, "oversized"
+        chunks, size = [], 0
         while True:
             b = os.read(fds[-1], 65536)
             if not b:
                 break
             chunks.append(b)
-        return b"".join(chunks)
-    except OSError:
-        return None
+            size += len(b)
+            if size > CREDENTIAL_MAX_BYTES:
+                return None, "oversized"
+        return b"".join(chunks), ""
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError as exc:
+        # ELOOP: a symlink; ENOTDIR: a non-directory on the path; ENXIO: a socket.
+        return None, "not-regular" if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENXIO) else "unreadable"
     finally:
         for fd in reversed(fds):
             try:
@@ -920,26 +967,533 @@ def _read_private_nofollow(base: str, rel: str) -> Optional[bytes]:
                 pass
 
 
-def _atomic_write_host(path: str, data: bytes, mode: int) -> None:
+# Why a private credential copy cannot be read at write-back (_read_private_nofollow).
+_PRIVATE_COPY_PROBLEM_TEXT = {
+    "missing": "已被删除",
+    "not-regular": "是符号链接、FIFO、目录等非普通文件",
+    "oversized": f"超过 {CREDENTIAL_MAX_BYTES >> 20} MiB 上限",
+    "unreadable": "无法读取",
+}
+
+
+# Seconds a write-back waits for another makewand write-back of the same host
+# credential file (_credential_lock).
+_CRED_LOCK_WAIT = 10.0
+
+
+def _credential_lock_path(path: str) -> str:
+    """Sidecar lock file of the host credential file path, never renamed or
+    removed (the Go engine uses the same one, cliCredentialLockPath)."""
+    return os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".makewand-lock")
+
+
+@contextmanager
+def _credential_lock(path: str):
+    """
+    Serializes makewand's own write-backs of the host credential file path
+    across processes and both engines: an exclusive flock(2) on its sidecar
+    lock file, which the Go engine takes as well (cliLockCredential). Yields
+    False when another write-back held it for _CRED_LOCK_WAIT seconds. Where no
+    lock can be taken (no fcntl, a filesystem without flock) it yields True
+    unlocked; the identity re-check before the rename still applies.
+    """
+    fd = None
+    if fcntl is not None:
+        try:
+            fd = os.open(_credential_lock_path(path), os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_CLOEXEC, 0o600)
+        except OSError:
+            fd = None
+    acquired = True
+    if fd is not None:
+        deadline = time.monotonic() + _CRED_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    acquired = False
+                    break
+                time.sleep(0.05)
+            except OSError:
+                break  # this filesystem cannot lock
+    try:
+        yield acquired
+    finally:
+        if fd is not None:
+            os.close(fd)  # releases the lock
+
+
+def _atomic_write_host(path: str, data: bytes, mode: int, expect: tuple) -> str:
+    """
+    Atomically replaces the host file path with data, unless it is no longer
+    the file the merge read. The data is written and synced to a temporary
+    file first; then, holding the credential lock (_credential_lock), the host
+    file's identity (_read_host_state: device, inode, size, mtime_ns, digest)
+    is compared with expect immediately before the rename. Returns "written",
+    "changed" (replaced or rewritten meanwhile) or "locked" (another makewand
+    write-back held the lock); nothing is written unless "written".
+    """
     parent = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(prefix=".makewand-wb-", dir=parent)
+    status = "changed"
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, mode & 0o777 or 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+        with _credential_lock(path) as locked:
+            current = _read_host_state(path) if locked else None
+            if not locked:
+                status = "locked"
+            elif current is not None and current[2] == expect:
+                os.replace(tmp, path)
+                status = "written"
+    finally:
+        if status != "written":
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return status
 
 
 def _digest(data: Optional[bytes]) -> Optional[str]:
     return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+# Credential write-back merge (_credential_writeback_merge).
+_CRED_JSON_MAX_DEPTH = 64
+_CRED_MISSING = object()
+_CRED_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+# Keys are compared in ASCII lower case without "_" and "-" (expires_at == expiresAt).
+_CRED_KEY_NORM = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", "_-")
+# Normalized keys of fields a token refresh never changes: e-mails, API keys and
+# other secrets, credentials outside the refresh allowlist, endpoints, auth modes
+# and account identifiers.
+_CRED_PROTECTED_KEY = re.compile(
+    r"email|apikey|secret|passw|privatekey|clientid|\Akey\Z|token|cookie|credential"
+    r"|url\Z|uri\Z|issuer|endpoint|audience|\A(?:iss|aud|host|hostname|domain)\Z"
+    r"|mode\Z|method\Z|mechanism|obtainedvia|granttype|authtype"
+    r"|\A(?:sub|subject|uid|id|uuid|user|account|org|organization|team|tenant|principal|owner)\Z"
+    r"|(?:account|user|org|organization|team|tenant|principal|owner|subject)(?:id|uuid|guid)\Z")
+# Metadata that is never protected, even where its name says token or URL:
+# scopes, profile pictures, times.
+_CRED_BENIGN_KEY = re.compile(r"scope|avatar|image|picture|photo|icon|expir|lastrefresh")
+_CRED_EMAIL_VALUE = re.compile(r"[^@\x00-\x20]+@[^@\x00-\x20]+\.[^@\x00-\x20]+")
+_CRED_URL_VALUE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\x00-\x20]+")
+_CRED_JWT_VALUE = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+_CRED_SURROGATE = re.compile("[\ud800-\udfff]")
+_CRED_RFC3339 = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})"
+                           r"(?:\.([0-9]{1,9}))?(?:[Zz]|([+-])([0-9]{2}):([0-9]{2}))")
+# JWT claims naming the account, compared at any depth of the claims (e.g.
+# inside the https://api.openai.com/auth object).
+_CRED_ACCOUNT_CLAIMS = frozenset({"sub", "email", "user_id", "principal_id", "team_id", "account_id",
+                                  "chatgpt_account_id", "chatgpt_user_id", "chatgpt_account_user_id"})
+# Refresh tokens a refresh never rotates: Google's (golang.org/x/oauth2 and
+# google-auth-library keep the old one), so a different one comes from a new login.
+_CRED_STATIC_REFRESH_PREFIXES = ("1//",)
+# Refusal codes -> warning text ({0}: field path, {1}: detail).
+_CRED_PROBLEM_TEXT = {
+    "absent": "启动时宿主没有该凭据，沙箱内新建的登录凭据不回写（请在宿主直接登录）",
+    "host-not-object": "宿主版本不是 JSON 对象，无法核验是否同一账号",
+    "sandbox-not-object": "沙箱内版本不是有效的 JSON 对象",
+    "remove": "沙箱内版本删除了 {0}（疑似登出/篡改）",
+    "clear": "沙箱内版本清空或改变了 {0} 的类型（疑似登出/篡改）",
+    "protected": "沙箱内版本更改了令牌刷新从不改变的字段 {0}（疑似账号替换/重定向）",
+    "jwt-shape": "沙箱内版本把 {0} 在 JWT 与不透明令牌之间替换",
+    "jwt-account": "沙箱内版本的 {0} 属于其他账号（声明 {1} 不同）",
+    "token-type": "沙箱内版本更改了令牌类型 {0}",
+    "bad-expiry": "沙箱内版本的时间 {0} 无法解析",
+    "backwards": "沙箱内版本把 {0} 改到更早的时间（疑似旧凭据回放）",
+    "refresh-only": "沙箱内版本只更换了刷新令牌 {0}，没有新的访问令牌（疑似令牌替换）",
+    "no-refresh-token": "沙箱内版本更换了访问令牌 {0}，但该凭据没有刷新令牌（这是新登录而不是刷新）",
+    "google-refresh": "沙箱内版本更换了 Google 刷新令牌 {0}，刷新从不轮换它（这是新登录）",
+}
+
+
+class _JsonNumber(str):
+    """A JSON number kept as its literal text, so identifiers compare exactly."""
+
+
+def _cred_json_object(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate object key {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _cred_json_constant(name):
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def _cred_load_json(data: bytes):
+    """
+    One strict JSON value: UTF-8, no duplicate keys, no NaN/Infinity, no lone
+    surrogate escapes, bounded depth. Raises ValueError.
+    """
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=_cred_json_object,
+                           parse_int=_JsonNumber, parse_float=_JsonNumber, parse_constant=_cred_json_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting too deep") from exc
+    stack = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _CRED_JSON_MAX_DEPTH:
+            raise ValueError("JSON nesting too deep")
+        # json reads "\ud800" without its pair as a lone surrogate, which no
+        # UTF-8 encoder accepts (and Go's decoder reads as U+FFFD).
+        texts = node.keys() if isinstance(node, dict) else (node,) if isinstance(node, str) else ()
+        if any(_CRED_SURROGATE.search(text) for text in texts):
+            raise ValueError("lone surrogate escape")
+        children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else ()
+        stack.extend((child, depth + 1) for child in children)
+    return value
+
+
+def _cred_load_object(data: bytes) -> Optional[dict]:
+    try:
+        value = _cred_load_json(data)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _cred_jwt_claims(value: str) -> Optional[dict]:
+    """Claims of a JWT-shaped string. The signature is NOT verified: the claims
+    are only compared with the host copy."""
+    if not _CRED_JWT_VALUE.fullmatch(value):
+        return None
+    import base64
+    header_seg, payload_seg, _sig = value.split(".")
+    try:
+        header, claims = (_cred_load_json(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+                          for seg in (header_seg, payload_seg))
+    except ValueError:  # binascii.Error and UnicodeDecodeError included
+        return None
+    if not isinstance(header, dict) or "alg" not in header or not isinstance(claims, dict):
+        return None
+    return claims
+
+
+def _cred_same(a, b) -> bool:
+    """Decoded JSON values equal in type and value."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_cred_same(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_cred_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _cred_text(value) -> bool:
+    """A non-empty JSON string."""
+    return isinstance(value, str) and not isinstance(value, _JsonNumber) and value != ""
+
+
+def _cred_kind(key: str, value) -> Optional[str]:
+    """The token-refresh role of a host leaf: "access", "refresh", "id", "type"
+    (token type) or "time" (expiry or last refresh), None for every other field."""
+    nk = key.translate(_CRED_KEY_NORM)
+    if nk in ("expiry", "expirydate", "lastrefresh") or nk.endswith("expiresat"):
+        return "time" if isinstance(value, _JsonNumber) or _cred_text(value) else None
+    if not _cred_text(value):
+        return None
+    if nk == "accesstoken" or (nk == "key" and _cred_jwt_claims(value) is not None):
+        return "access"
+    return {"refreshtoken": "refresh", "idtoken": "id", "tokentype": "type"}.get(nk)
+
+
+def _cred_protected(key: str, *values) -> bool:
+    """Whether a field holds something a token refresh never changes
+    (_CRED_PROTECTED_KEY); e-mail and URL values and nested protected fields
+    count as well."""
+    nk = key.translate(_CRED_KEY_NORM)
+    if _CRED_BENIGN_KEY.search(nk):
+        return False
+    return bool(_CRED_PROTECTED_KEY.search(nk)) or any(_cred_protected_value(v) for v in values)
+
+
+def _cred_protected_value(value) -> bool:
+    if isinstance(value, dict):
+        return any(_cred_protected(k, v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_cred_protected_value(v) for v in value)
+    return _cred_text(value) and bool(_CRED_EMAIL_VALUE.fullmatch(value) or _CRED_URL_VALUE.fullmatch(value))
+
+
+def _cred_holds_tokens(obj: dict) -> bool:
+    """Whether a host object holds an access or refresh token at any depth."""
+    return any(_cred_kind(k, v) in ("access", "refresh") or (isinstance(v, dict) and _cred_holds_tokens(v))
+               for k, v in obj.items())
+
+
+def _cred_mint_shape(obj: dict) -> bool:
+    """
+    Whether the host object obj is in the login shape in which the provider
+    CLI mints its keys itself (muse's OAuth record): it holds an OAuth access
+    token, and neither its mechanism nor obtained_via names a key. A key saved
+    with `muse auth set --api-key-stdin` or pasted in the pasted_key lane
+    (mechanism api_key, obtained_via pasted_key) is the user's own and stays
+    protected.
+    """
+    has_access = False
+    for key, value in obj.items():
+        nk = key.translate(_CRED_KEY_NORM)
+        if nk == "accesstoken":
+            has_access = has_access or _cred_text(value)
+        elif nk in ("mechanism", "obtainedvia") and (not _cred_text(value) or "key" in value.translate(_CRED_KEY_NORM)):
+            return False
+    return has_access
+
+
+def _cred_account_mismatch(old: dict, new: dict, prefix: str = "") -> Optional[str]:
+    """The first account claim of old (at any depth) that new lacks or changes, None for the same account."""
+    for key in sorted(old):
+        value = old[key]
+        if key in _CRED_ACCOUNT_CLAIMS:
+            if key not in new or not _cred_same(value, new[key]):
+                return prefix + key
+        elif isinstance(value, dict):
+            nested = new.get(key)
+            claim = _cred_account_mismatch(value, nested if isinstance(nested, dict) else {}, prefix + key + ".")
+            if claim:
+                return claim
+    return None
+
+
+def _cred_instant(value) -> Optional[tuple]:
+    """A comparable expiry or last-refresh time: a JSON number, or an RFC 3339
+    string (with "T", at most nanosecond precision, "Z" or a numeric offset)."""
+    if isinstance(value, _JsonNumber):
+        number = float(value)
+        return None if number in (float("inf"), float("-inf")) else (number,)
+    match = _CRED_RFC3339.fullmatch(value)
+    if not match:
+        return None
+    year, month, day, hour, minute, second = (int(g) for g in match.groups()[:6])
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    month_days = (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+    if not (year >= 1 and 1 <= month <= 12 and 1 <= day <= month_days[month - 1]
+            and hour <= 23 and minute <= 59 and second <= 59):
+        return None
+    offset = 0
+    if match.group(8):
+        if int(match.group(9)) > 23 or int(match.group(10)) > 59:
+            return None
+        offset = (int(match.group(9)) * 60 + int(match.group(10))) * 60 * (-1 if match.group(8) == "-" else 1)
+    # Days since 1970-01-01 (H. Hinnant's days_from_civil).
+    y, mp = (year - 1, month + 9) if month <= 2 else (year, month - 3)
+    era = y // 400
+    yoe = y - era * 400
+    days = era * 146097 + yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp + 2) // 5 + day - 1 - 719468
+    nanos = int((match.group(7) or "").ljust(9, "0"))
+    return days * 86400 + hour * 3600 + minute * 60 + second - offset, nanos
+
+
+def _cred_copy(value):
+    if isinstance(value, dict):
+        return {k: _cred_copy(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_cred_copy(v) for v in value]
+    return value
+
+
+def _cred_dump(node, indent: Optional[str], level: int = 0) -> str:
+    """JSON text of a decoded credential document (numbers keep their literal)."""
+    if isinstance(node, (dict, list)):
+        if isinstance(node, dict):
+            sep = ": " if indent else ":"
+            items = [json.dumps(k, ensure_ascii=False) + sep + _cred_dump(v, indent, level + 1)
+                     for k, v in node.items()]
+            brackets = "{}"
+        else:
+            items = [_cred_dump(v, indent, level + 1) for v in node]
+            brackets = "[]"
+        if not items:
+            return brackets
+        if indent is None:
+            return brackets[0] + ",".join(items) + brackets[1]
+        pad = "\n" + indent * (level + 1)
+        return brackets[0] + pad + ("," + pad).join(items) + "\n" + indent * level + brackets[1]
+    if isinstance(node, _JsonNumber):
+        return str(node)
+    if isinstance(node, bool) or node is None:
+        return {True: "true", False: "false", None: "null"}[node]
+    return json.dumps(node, ensure_ascii=False)
+
+
+def _cred_field_list(fields: List[str]) -> str:
+    """At most five field paths for a warning."""
+    return ", ".join(fields[:5]) + (", ..." if len(fields) > 5 else "")
+
+
+class _CredMerge:
+    """Outcome of _credential_writeback_merge."""
+
+    def __init__(self) -> None:
+        self.data: Optional[bytes] = None  # bytes to write to the host; None: nothing to write
+        self.problems: List[Tuple[str, str, str]] = []  # (field path, code, detail): nothing may be written
+        self.ignored: List[str] = []  # protected fields added or removed in the sandbox copy
+
+    def problem_text(self) -> str:
+        texts = [_CRED_PROBLEM_TEXT[code].format(path, detail) for path, code, detail in self.problems[:5]]
+        return "；".join(texts) + ("；……" if len(self.problems) > 5 else "")
+
+
+class _CredWalk:
+    """Differences between the host and sandbox credential documents."""
+
+    def __init__(self, minted_keys: Iterable[str] = ()) -> None:
+        self.minted = frozenset(k.translate(_CRED_KEY_NORM) for k in minted_keys)
+        self.changes: list = []  # (host object path, key, kind, host value, sandbox value or _CRED_MISSING)
+        self.groups: Dict[tuple, dict] = {}  # host objects holding access or refresh tokens
+        self.problems: List[Tuple[str, str, str]] = []
+        self.ignored: List[str] = []
+
+    def problem(self, path, code: str, detail: str = "") -> None:
+        self.problems.append((path if isinstance(path, str) else ".".join(path), code, detail))
+
+    def walk(self, old: dict, new: dict, path: tuple) -> None:
+        for key in sorted(old):
+            value, current, p = old[key], new.get(key, _CRED_MISSING), path + (key,)
+            kind = _cred_kind(key, value)
+            if (kind is None and _cred_text(value) and key.translate(_CRED_KEY_NORM) in self.minted
+                    and _cred_mint_shape(old)):
+                kind = "minted"
+            if kind is None:
+                if isinstance(value, dict) and isinstance(current, dict):
+                    self.walk(value, current, p)
+                elif isinstance(value, dict) and _cred_holds_tokens(value):
+                    self.problem(p, "remove")
+                elif current is _CRED_MISSING:
+                    if _cred_protected(key, value):
+                        self.ignored.append(".".join(p))
+                elif not _cred_same(value, current) and _cred_protected(key, value, current):
+                    self.problem(p, "protected")
+                continue
+            changed = not _cred_same(value, current)
+            if kind in ("access", "refresh"):
+                group = self.groups.setdefault(path, {"refresh": False, "static": False,
+                                                      "access_changed": "", "refresh_changed": ""})
+                group["refresh"] = group["refresh"] or kind == "refresh"
+                if changed:
+                    group[kind + "_changed"] = group[kind + "_changed"] or ".".join(p)
+                    if kind == "refresh" and value.startswith(_CRED_STATIC_REFRESH_PREFIXES):
+                        group["static"] = True
+            if changed:
+                self.changes.append((path, key, kind, value, current))
+        for key in sorted(new):
+            if key not in old and _cred_protected(key, new[key]):
+                self.ignored.append(".".join(path + (key,)))
+
+    def check(self, path: tuple, kind: str, value, current) -> None:
+        """Records the problems of one changed token-refresh leaf."""
+        if current is _CRED_MISSING and kind not in ("access", "refresh"):
+            return  # dropped: the host value is kept
+        if kind == "id" and (current is None or current == ""):
+            return  # a refresh without an id token keeps the host's
+        if kind == "time":
+            if type(current) is not type(value) or current == "":
+                self.problem(path, "clear")
+                return
+            before, after = _cred_instant(value), _cred_instant(current)
+            if before is None or after is None:
+                self.problem(path, "bad-expiry")
+            elif after < before:
+                self.problem(path, "backwards")
+            return
+        if not _cred_text(current):
+            self.problem(path, "clear")
+        elif kind == "type":
+            if current.translate(_CRED_ASCII_LOWER) != value.translate(_CRED_ASCII_LOWER):
+                self.problem(path, "token-type")
+        else:
+            old_claims, new_claims = _cred_jwt_claims(value), _cred_jwt_claims(current)
+            if (old_claims is None) != (new_claims is None):
+                self.problem(path, "jwt-shape")
+            elif old_claims is not None:
+                claim = _cred_account_mismatch(old_claims, new_claims)
+                if claim:
+                    self.problem(path, "jwt-account", claim)
+
+
+def _credential_writeback_merge(old: Optional[bytes], new: bytes, minted_keys: Iterable[str] = ()) -> _CredMerge:
+    """
+    Merges the sandbox copy `new` of a credential into the host document `old`
+    (None: absent at launch). Only token-refresh leaves of host objects that hold
+    tokens are copied: access, refresh and id tokens (grok's access JWT "key"
+    included) and, as part of a refresh of their object or of an object below
+    it, the token type and the expiry and last-refresh times. The merge has
+    problems, and nothing is written, unless the change is a same-account refresh:
+      * either document is not a strict JSON object, or the host had none;
+      * a token or an object holding tokens is removed, emptied or retyped;
+      * a protected field (_CRED_PROTECTED_KEY: e-mail, key, endpoint, auth mode,
+        account id; e-mail and URL values) changes value;
+      * a JWT-shaped token becomes opaque or vice versa, or a JWT's account
+        claims (_CRED_ACCOUNT_CLAIMS) change;
+      * a time moves backwards or is unreadable, or the token type changes;
+      * a refresh token changes without the access token next to it, an access
+        token changes in an object without a refresh token (a new login), or a
+        Google refresh token, which a refresh never rotates, changes.
+    minted_keys names keys whose value the provider CLI mints itself from the
+    login (muse's api_key, see PROVIDER_PROFILES). Only inside a host object in
+    the login shape (_cred_mint_shape: an OAuth access token, no key mechanism)
+    is such a key minted: a changed one is a re-mint and is copied on its own,
+    under the token rules (a non-empty string, same JWT shape and account
+    claims); a removed one keeps the host value. Anywhere else (a saved or
+    pasted API key) it stays a protected field.
+    Other fields keep their host value: benign metadata (plan, rate tier,
+    profile, scopes) silently, protected fields the sandbox adds or removes are
+    listed in `ignored`. Opaque tokens cannot be tied to an account offline.
+    The Go engine implements the same rules (cliMergeCredential).
+    """
+    result = _CredMerge()
+    old_doc = _cred_load_object(old) if old is not None else None
+    new_doc = _cred_load_object(new)
+    if old is None or old_doc is None or new_doc is None:
+        code = "absent" if old is None else "host-not-object" if old_doc is None else "sandbox-not-object"
+        result.problems.append(("", code, ""))
+        return result
+    walk = _CredWalk(minted_keys)
+    walk.walk(old_doc, new_doc, ())
+    for path, key, kind, value, current in walk.changes:
+        walk.check(path + (key,), kind, value, current)
+    in_refresh = set()  # objects refreshed, or above a refreshed one
+    for path, group in walk.groups.items():
+        if group["refresh_changed"] and not group["access_changed"]:
+            walk.problem(group["refresh_changed"], "refresh-only")
+        if group["access_changed"] and not group["refresh"]:
+            walk.problem(group["access_changed"], "no-refresh-token")
+        if group["static"]:
+            walk.problem(group["refresh_changed"], "google-refresh")
+        if group["access_changed"]:
+            in_refresh.update(path[:i] for i in range(len(path) + 1))
+    result.ignored = sorted(set(walk.ignored))
+    if walk.problems:
+        result.problems = sorted(walk.problems)
+        return result
+    merged = _cred_copy(old_doc)
+    for path, key, kind, value, current in walk.changes:
+        if kind in ("access", "refresh") or (current is not _CRED_MISSING and (
+                kind == "minted" or (path in in_refresh and (kind != "id" or _cred_text(current))))):
+            node = merged
+            for k in path:
+                node = node[k]
+            node[key] = current
+    if _cred_same(merged, old_doc):
+        return result
+    if _cred_same(merged, new_doc):
+        result.data = new  # keep the provider's own formatting
+    else:
+        indent = "  " if b"\n" in old.rstrip(b" \t\r\n") else None
+        result.data = _cred_dump(merged, indent).encode("utf-8") + (b"\n" if old.endswith(b"\n") else b"")
+    return result
 
 
 @dataclass
@@ -949,6 +1503,7 @@ class _CredentialCopy:
     host_path: str
     initial_digest: Optional[str]
     mode: int = 0o600
+    minted: Tuple[str, ...] = ()  # minted keys of this file (_credential_writeback_merge)
 
 
 def _resolve_provider_profile(p_name: str, user_home: str, project_paths: Sequence[str]) -> Optional[dict]:
@@ -979,8 +1534,9 @@ def _resolve_provider_profile(p_name: str, user_home: str, project_paths: Sequen
 class ProviderHome:
     """
     Per-run private provider home (H3). Created lazily by wrap_bwrap via
-    materialize(); finalize() writes changed credential files back to the host
-    and deletes the private directory. Use provider_home_session().
+    materialize(); finalize() merges same-account token refreshes from changed
+    credential files into the host files (see write_back) and deletes the
+    private directory. Use provider_home_session().
     """
 
     def __init__(self, provider: str, user_home: Optional[str] = None, project_paths: Sequence[str] = ()):
@@ -996,7 +1552,14 @@ class ProviderHome:
         self._materialized = False
         self._lock = threading.Lock()
 
-    def materialize(self, project_paths: Sequence[str] = ()) -> List[str]:
+    def materialize(self, project_paths: Sequence[str] = (),
+                    absent_root_ok: Optional[Callable[[str], bool]] = None) -> List[str]:
+        """
+        Builds the private home and returns its bwrap arguments (cached).
+        absent_root_ok(path) tells whether a provider root missing on the host
+        may get a private directory mounted at path (_bind_absent_root); None
+        allows it everywhere.
+        """
         with self._lock:
             if self._materialized:
                 return list(self.bwrap_args)
@@ -1006,7 +1569,7 @@ class ProviderHome:
                 self._materialized = True
                 return []
             try:
-                self._build(profile, paths)
+                self._build(profile, paths, absent_root_ok)
             except BaseException:
                 self._remove_private_dir()
                 raise
@@ -1040,7 +1603,35 @@ class ProviderHome:
             raise SandboxConfigError(f"无法复制 provider 凭据到私有目录 ({exc})，拒绝启动 (fail closed)") from exc
         return found
 
-    def _build(self, profile: dict, project_paths: Sequence[str]) -> None:
+    def _private_root(self, idx: int) -> str:
+        priv = os.path.join(self._ensure_private_dir(), f"root{idx}")
+        try:
+            os.mkdir(priv, 0o700)
+        except OSError as exc:
+            raise SandboxConfigError(f"无法创建私有 provider 状态目录 ({exc})，拒绝启动 (fail closed)") from exc
+        return priv
+
+    def _bind_absent_root(self, profile: dict, idx: int, root_rel: str, root_path: str, args: List[str]) -> None:
+        """
+        A provider root missing on the host that holds credential files gets an
+        empty private directory at its path inside the sandbox, where HOME is an
+        empty tmpfs: nothing is created on the host, and a login made inside the
+        sandbox lands in the private copy, so write_back reports it instead of it
+        vanishing with the tmpfs (it is never written back: there is no host
+        account to verify it against).
+        """
+        rels = [rel for e_root, rel in profile.get("credentials", []) if e_root == root_rel]
+        if not rels:
+            return
+        priv = self._private_root(idx)
+        args.extend(["--bind", priv, root_path])
+        minted = profile.get("minted_keys", {})
+        for rel in rels:
+            self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=os.path.join(root_path, rel),
+                                                    initial_digest=None, minted=tuple(minted.get((root_rel, rel), ()))))
+
+    def _build(self, profile: dict, project_paths: Sequence[str],
+               absent_root_ok: Optional[Callable[[str], bool]] = None) -> None:
         args: List[str] = []
         for rel in profile.get("home_ro_files", []):
             p = os.path.join(self.user_home, rel)
@@ -1051,13 +1642,12 @@ class ProviderHome:
         for idx, root_rel in enumerate(profile.get("roots", [])):
             root_path = _norm(os.path.join(self.user_home, root_rel))
             if not os.path.isdir(root_path):
-                continue  # never create or expose a missing provider root
+                # Never create or expose a missing provider root on the host.
+                if absent_root_ok is None or absent_root_ok(root_path):
+                    self._bind_absent_root(profile, idx, root_rel, root_path, args)
+                continue
             real = os.path.realpath(root_path)
-            priv = os.path.join(self._ensure_private_dir(), f"root{idx}")
-            try:
-                os.mkdir(priv, 0o700)
-            except OSError as exc:
-                raise SandboxConfigError(f"无法创建私有 provider 状态目录 ({exc})，拒绝启动 (fail closed)") from exc
+            priv = self._private_root(idx)
             real_roots[root_rel] = real
             self.state_roots.append(real)
             args.extend(["--bind", priv, real])
@@ -1076,6 +1666,7 @@ class ProviderHome:
                             private_root=priv, rel=rel, host_path=host_p,
                             initial_digest=_digest(found[0]) if found else None,
                             mode=found[1] if found else 0o600,
+                            minted=tuple(profile.get("minted_keys", {}).get((e_root, rel), ())),
                         ))
 
         for root_rel, sub, _kind, _placeholder in profile.get("protected", []):
@@ -1112,29 +1703,74 @@ class ProviderHome:
         self.bwrap_args = args
 
     def write_back(self) -> List[str]:
-        """Writes changed credential copies back to the host. Returns the written host paths."""
+        """
+        Merges changed credential copies into the host files: only the
+        token-refresh fields of a same-account refresh are written
+        (_credential_writeback_merge), so a sandboxed agent can neither swap the
+        host account nor redirect it or log it out. A failure for one file is
+        reported and never stops the others or escapes finalize(). Returns the
+        written host paths.
+        """
         written: List[str] = []
         for cred in self.credentials:
-            data = _read_private_nofollow(cred.private_root, cred.rel)
-            if data is None:
-                continue  # deleted / replaced by a non-regular file: host copy untouched
-            if _digest(data) == cred.initial_digest:
-                continue
-            target = cred.host_path
-            if os.path.islink(target):
-                target = os.path.realpath(target)
-            if os.path.lexists(target) and not os.path.isfile(target):
-                _warn(f"宿主凭据 {cred.host_path} 不是普通文件，跳过回写")
-                continue
-            current = _read_host_regular(target)
-            if _digest(current[0] if current else None) != cred.initial_digest:
-                _warn(f"宿主凭据 {cred.host_path} 在运行期间被其他会话修改，保留宿主版本，跳过回写")
-                continue
             try:
-                _atomic_write_host(target, data, cred.mode)
+                target = self._write_back_one(cred)
+            except Exception as exc:  # noqa: BLE001 - see docstring
+                _warn(f"凭据回写失败 {cred.host_path}: {type(exc).__name__}，保留宿主版本")
+                continue
+            if target:
                 written.append(target)
+        return written
+
+    def _write_back_one(self, cred: _CredentialCopy) -> Optional[str]:
+        """Merges one changed credential copy into its host file; returns the written host path."""
+        data, why = _read_private_nofollow(cred.private_root, cred.rel)
+        if data is None:
+            # The host copy stays untouched. A copy that existed at launch and
+            # is gone, replaced or unreadable may have held a rotated refresh
+            # token, so the user learns why the host login can stop working.
+            problem = _PRIVATE_COPY_PROBLEM_TEXT[why]
+            if cred.initial_digest is not None:
+                _warn(f"沙箱内的凭据副本 {cred.host_path} 在运行结束时{problem}，无法核对其中的令牌刷新，保留宿主版本"
+                      "（若提供方已在沙箱内轮换令牌，宿主登录可能已失效，请在宿主重新登录）")
+            elif why != "missing":
+                _warn(f"沙箱内新建的凭据 {cred.host_path} {problem}，不回写（请在宿主直接登录）")
+            return None
+        if _digest(data) == cred.initial_digest:
+            return None
+        target = cred.host_path
+        if os.path.islink(target):
+            target = os.path.realpath(target)
+        if os.path.lexists(target) and not os.path.isfile(target):
+            _warn(f"宿主凭据 {cred.host_path} 不是普通文件，跳过回写")
+            return None
+        changed = f"宿主凭据 {cred.host_path} 在运行期间被其他会话修改，保留宿主版本，跳过回写"
+        state = _read_host_state(target)
+        current = state[0] if state else None
+        if _digest(current) != cred.initial_digest:
+            _warn(changed)
+            return None
+        # The host copy still equals the launch snapshot, so it is the original.
+        merge = _credential_writeback_merge(current, data, cred.minted)
+        if merge.problems:
+            _warn(f"宿主凭据 {cred.host_path} 未回写：{merge.problem_text()}，保留宿主版本")
+            return None
+        outcome, written = "保留宿主版本", None
+        if merge.data is not None:
+            try:
+                status = _atomic_write_host(target, merge.data, cred.mode, state[2])
             except OSError as exc:
                 _warn(f"凭据回写失败 {cred.host_path}: {exc}")
+            else:
+                if status == "written":
+                    outcome, written = "已回写刷新后的令牌", target
+                elif status == "locked":
+                    _warn(f"宿主凭据 {cred.host_path} 正由另一个 makewand 进程回写（等待锁超时），保留宿主版本，跳过回写")
+                else:
+                    _warn(changed)
+        if merge.ignored:
+            _warn(f"宿主凭据 {cred.host_path}：沙箱内新增或删除的字段 {_cred_field_list(merge.ignored)} "
+                  f"未回写（只回写令牌刷新），{outcome}")
         return written
 
     def _remove_private_dir(self) -> None:
@@ -1193,17 +1829,44 @@ def _provider_mounts(
     readonly: bool,
     project_paths: Sequence[str],
     provider_home: Optional[ProviderHome] = None,
+    absent_root_ok: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[List[str], List[str], List[str]]:
     """
     Builds the provider state mounts (private home, see PROVIDER_PROFILES).
     Returns (bwrap_args, state_roots, socket_scan_roots). readonly is accepted for
     compatibility: read-only and writable runs both get a private home.
+    absent_root_ok: see ProviderHome.materialize.
     """
     if p_name not in PROVIDER_PROFILES:
         return [], [], []
     home = provider_home or _orphan_provider_home(p_name, user_home)
-    args = home.materialize(project_paths)
+    args = home.materialize(project_paths, absent_root_ok)
     return args, list(home.state_roots), list(home.scan_roots)
+
+
+def _mount_point_creatable(bwrap_args: Sequence[str], path: str) -> bool:
+    """
+    Whether bubblewrap can create the missing mount point path after the
+    mounts in bwrap_args: the last of them covering its parent directory is a
+    tmpfs (the empty sandbox HOME), not a read-only or host bind (a HOME made
+    visible by the workspace, a toolchain directory such as ~/.local).
+    """
+    parent = os.path.dirname(_norm(path))
+    covering = ""
+    i = 0
+    while i < len(bwrap_args):
+        op = bwrap_args[i]
+        if op in ("--bind", "--ro-bind", "--dev-bind", "--symlink", "--setenv") and i + 2 < len(bwrap_args):
+            if op != "--setenv" and _is_within(parent, bwrap_args[i + 2]):
+                covering = op
+            i += 3
+        elif op in ("--tmpfs", "--proc", "--dev") and i + 1 < len(bwrap_args):
+            if _is_within(parent, bwrap_args[i + 1]):
+                covering = op
+            i += 2
+        else:
+            i += 1
+    return covering == "--tmpfs"
 
 
 # ---------------------------------------------------------------------------
@@ -1522,7 +2185,8 @@ def wrap_bwrap(
         if provider_home is not None and provider_home.provider != p_name:
             raise SandboxConfigError(f"provider home 属于 {provider_home.provider}，不能用于 {p_name}")
         p_args, _, provider_scan_roots = _provider_mounts(
-            p_name, user_home, readonly, [ws, mount_root], provider_home=provider_home
+            p_name, user_home, readonly, [ws, mount_root], provider_home=provider_home,
+            absent_root_ok=lambda path: _mount_point_creatable(bwrap_cmd, path),
         )
         bwrap_cmd.extend(p_args)
 
@@ -2256,41 +2920,49 @@ def _robust_force_remove_inode_tracked(
     path: str,
     expected_dev_ino: Optional[Tuple[int, int]] = None,
 ) -> None:
-    """Recursively removes a file or directory, checking dev/ino and adjusting permissions."""
-    if not os.path.lexists(path):
-        return
+    """
+    Removes a file or a directory tree, checking dev/ino of path and making
+    directories accessible first; symlinks are removed, never followed. The
+    walk is iterative: a tree nested deeper than the recursion limit (a
+    sandboxed process can create one in its private home) cannot make the
+    caller raise.
+    """
     try:
         st = os.lstat(path)
     except OSError:
         return
     if expected_dev_ino is not None and (st.st_dev, st.st_ino) != expected_dev_ino:
         return
-    if os.path.islink(path):
+    stack = [(path, stat.S_ISDIR(st.st_mode), False)]  # (path, is a directory, children queued)
+    while stack:
+        p, is_dir, queued = stack.pop()
+        if not is_dir:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            continue
+        if queued:
+            try:
+                os.rmdir(p)
+            except OSError:
+                pass
+            continue
         try:
-            os.unlink(path)
+            os.chmod(p, stat.S_IRWXU)
         except OSError:
             pass
-        return
-    try:
-        os.chmod(path, stat.S_IRWXU)
-    except OSError:
-        pass
-    if os.path.isdir(path):
+        stack.append((p, True, True))
         try:
-            entries = os.listdir(path)
+            entries = os.listdir(p)
         except OSError:
-            entries = []
+            continue
         for entry in entries:
-            _robust_force_remove_inode_tracked(os.path.join(path, entry), None)
-        try:
-            os.rmdir(path)
-        except OSError:
-            pass
-    else:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+            child = os.path.join(p, entry)
+            try:
+                stack.append((child, stat.S_ISDIR(os.lstat(child).st_mode), False))
+            except OSError:
+                continue
 
 
 def _robust_force_remove(path: str) -> None:

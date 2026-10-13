@@ -29,11 +29,14 @@ ALL_ENSEMBLE_PROVIDERS: List[str] = ["claude", "codex", "agy", "muse", "grok", "
 
 def resolve_ensemble_providers(
     requested: Optional[Union[str, List[str]]] = None,
-    local_only: bool = False
+    local_only: bool = False,
+    unavailable: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """
     Resolves and validates the active list of providers for an ensemble panel.
-    Filters to configured, enabled, and healthy providers.
+    Filters to configured, enabled, and healthy providers; empty when none of
+    them (nor the Antigravity / local fallback) can run now. `unavailable`, when
+    given, receives why each skipped candidate cannot take part.
     """
     if local_only:
         return ["local"]
@@ -59,33 +62,53 @@ def resolve_ensemble_providers(
     # Validate availability of each candidate
     selected: List[str] = []
     from makewand.health import load_status_cache
+    from makewand.engine_selection import _API_RELAY_STATUSES, _engine_usable
     cache = load_status_cache()
 
-    for p in candidates:
+    skipped: Dict[str, str] = {} if unavailable is None else unavailable
+    local_state: List[Tuple[bool, str]] = []
+
+    def usable(p: str) -> bool:
+        # Not known to fail (error, needs_auth, limited), unless the adapter
+        # relays that state to a configured API key.
+        info = cache.get(p)
+        status = info.get("status") if isinstance(info, dict) else None
+        return _engine_usable(p, cache)[0] or (status in _API_RELAY_STATUSES and has_api_configured(p))
+
+    def why_not(p: str) -> Optional[str]:
+        """None when `p` can run now, otherwise why not."""
         if not is_provider_enabled(p):
-            continue
+            return f"已被用户禁用 (makewand enable {p} 可重新开启)"
         if p in ("local", "ollama"):
-            from makewand.providers.local import is_local_model_available
-            avail, _, _ = is_local_model_available()
-            if not avail:
-                continue
-            if p not in selected:
-                selected.append(p)
-            continue
-        # Check if subscription or API is available
-        if has_subscription_configured(p) or has_api_configured(p):
-            # Check if limited
-            p_status = cache.get(p, {}).get("status")
-            if p_status != "limited" or has_api_configured(p):
-                if p not in selected:
-                    selected.append(p)
+            if not local_state:
+                from makewand.providers.local import is_local_model_available
+                avail, reason, _ = is_local_model_available()
+                local_state.append((bool(avail), str(reason or "").strip()))
+            avail, reason = local_state[0]
+            return None if avail else (reason or "本地模型服务未响应或没有可用模型")
+        if not (has_subscription_configured(p) or has_api_configured(p)):
+            return "未安装订阅 CLI，且未配置 API Key"
+        if not usable(p):
+            return _engine_usable(p, cache)[1] or "当前不可用"
+        return None
+
+    for p in candidates:
+        why = why_not(p)
+        if why is not None:
+            skipped.setdefault(p, why)
+        elif p not in selected:
+            selected.append(p)
 
     if not selected:
-        # Fallback to local or agy
-        if has_subscription_configured("agy") or has_api_configured("agy"):
-            selected = ["agy"]
-        else:
-            selected = ["local"]
+        # Fall back to Antigravity or the local model, but only to one that can
+        # run now: with nothing usable the panel is empty and nothing is dispatched.
+        for fallback in ("agy", "local"):
+            why = why_not(fallback)
+            if why is None:
+                selected = [fallback]
+                break
+            if fallback not in candidates:
+                skipped.setdefault(fallback, why)
 
     return selected
 
@@ -189,12 +212,20 @@ def run_ensemble(
     """
     from makewand.orchestrator import dispatch_task
 
-    selected = resolve_ensemble_providers(providers, local_only=local_only)
+    unavailable: Dict[str, str] = {}
+    selected = resolve_ensemble_providers(providers, local_only=local_only, unavailable=unavailable)
     if not selected:
+        error = "未找到任何可用的 AI 评审引擎，请确认订阅登录状态或配置 API 密钥。"
+        if unavailable:
+            error += " " + "; ".join(f"{p}: {why}" for p, why in unavailable.items())
+        print(c("❌ [Makewand Ensemble] 没有可参与评审的 AI 引擎，未派发任何任务。", COLOR_RED + COLOR_BOLD), file=sys.stderr)
+        for p, why in unavailable.items():
+            print(f"   • {p}: {why}", file=sys.stderr)
         return {
             "timestamp": time.time(),
             "ok": False,
-            "error": "未找到任何可用的 AI 评审引擎，请确认订阅登录状态或配置 API 密钥。",
+            "error": error,
+            "unavailable": dict(unavailable),
             "results": {},
             "summary_matrix": "",
         }

@@ -103,17 +103,21 @@ class TestOrchestrator(unittest.TestCase):
         self.assertFalse(is_identity_or_chit_chat("修复这个bug"))
 
     def test_run_pipeline_identity_query(self):
-        # Must return True immediately without triggering code generation or auto-fix loop
-        self.assertTrue(run_pipeline("你是谁", auto_fix=True))
-        self.assertTrue(run_pipeline("who are you", auto_fix=True))
+        # Must return True immediately without triggering code generation or auto-fix loop.
+        # A temporary cwd: run_pipeline must never default to the checkout under test.
+        with tempfile.TemporaryDirectory() as workspace:
+            self.assertTrue(run_pipeline("你是谁", cwd=workspace, auto_fix=True))
+            self.assertTrue(run_pipeline("who are you", cwd=workspace, auto_fix=True))
 
     @patch("makewand.orchestrator.run_review")
     def test_run_pipeline_review_query(self, mock_review):
         mock_review.return_value = 0
         # Review request must call run_review and NOT trigger code file writing
-        res = run_pipeline("审查当前git diff中的并发死锁", auto_fix=True)
-        self.assertTrue(res)
-        mock_review.assert_called_once()
+        with tempfile.TemporaryDirectory() as workspace:
+            res = run_pipeline("审查当前git diff中的并发死锁", cwd=workspace, auto_fix=True)
+            self.assertTrue(res)
+            mock_review.assert_called_once()
+            self.assertEqual(mock_review.call_args.kwargs["cwd"], workspace)
 
     def test_has_critical_defects(self):
         # Critical defects

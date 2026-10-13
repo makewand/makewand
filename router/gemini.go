@@ -53,6 +53,17 @@ func (g *Gemini) IsAvailable() bool { return g.apiKey != "" }
 // repo-aware agent.
 func (g *Gemini) SafeForUntrustedRepo() bool { return true }
 
+// ReportedModelID names the model a call sends upstream: the router-requested
+// model or, when routing requests none (e.g. a pinned "gemini-api" sibling),
+// the configured one. Stream routes, which carry no usage, are then reported
+// and billed at the model actually called.
+func (g *Gemini) ReportedModelID(requestedModelID string) string {
+	if requestedModelID != "" {
+		return requestedModelID
+	}
+	return g.model
+}
+
 type geminiRequest struct {
 	Contents          []geminiContent         `json:"contents"`
 	SystemInstruction *geminiContent          `json:"systemInstruction,omitempty"`
@@ -162,18 +173,26 @@ func (g *Gemini) chatUnaccounted(ctx context.Context, messages []Message, system
 		}
 	}
 
-	cost, measuredCost := g.priceForCtxWithStatus(ctx, model, result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount)
+	text := b.String()
+	inputTokens, outputTokens := result.UsageMetadata.PromptTokenCount, result.UsageMetadata.CandidatesTokenCount
+	measured := inputTokens > 0 || outputTokens > 0
+	if !measured {
+		// A reply without usage metadata is estimated like a stream, not
+		// recorded as a measured $0.
+		inputTokens, outputTokens = estimateCallTokens(messages, system, text, maxTokens)
+	}
+	cost, measuredCost := g.priceForCtxWithStatus(ctx, model, inputTokens, outputTokens)
 	usage := Usage{
-		MeasuredTokens: result.UsageMetadata.PromptTokenCount > 0 || result.UsageMetadata.CandidatesTokenCount > 0,
-		MeasuredCost:   measuredCost,
-		InputTokens:    result.UsageMetadata.PromptTokenCount,
-		OutputTokens:   result.UsageMetadata.CandidatesTokenCount,
+		MeasuredTokens: measured,
+		MeasuredCost:   measured && measuredCost,
+		InputTokens:    inputTokens,
+		OutputTokens:   outputTokens,
 		Cost:           cost,
 		Model:          model,
 		Provider:       "gemini",
 	}
 
-	return b.String(), usage, nil
+	return text, usage, nil
 }
 
 func (g *Gemini) ChatStream(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {

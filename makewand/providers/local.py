@@ -6,6 +6,8 @@ Completely free, 0 Token cost, 100% offline privacy.
 import os
 import sys
 import json
+import time
+import urllib.error
 import urllib.request
 from typing import Tuple, List, Optional, Dict, Any
 from makewand.config import c, COLOR_GREEN, COLOR_BOLD, COLOR_CYAN, get_api_config
@@ -118,6 +120,305 @@ def parse_local_quota(output: str) -> Tuple[bool, str, Optional[str]]:
     """Local models are 100% free and have no commercial rate limits."""
     return False, "", None
 
+
+# Ollama silently drops the start of a prompt that does not fit the model's context
+# window (num_ctx, by default far below what the model supports), and its
+# OpenAI-compatible endpoint can neither set num_ctx nor report what it dropped: a
+# verdict could rest on part of a diff. A read-only dispatch (review, judging,
+# question) therefore runs on the native /api/chat endpoint with a window sized for
+# the whole prompt and counts only when the token counts show that nothing was cut
+# (ollama_whole_prompt_chat). An endpoint that only offers the OpenAI-compatible API
+# (vLLM, llama.cpp, LM Studio) answers one when its reported prompt token count is
+# plausible for the whole prompt.
+OLLAMA_TEMPLATE_TOKENS = 512   # chat template and special tokens around the messages
+OLLAMA_ANSWER_TOKENS = 8192    # answer budget (num_predict) inside the window
+# No tokenizer averages more than about six bytes a token over a whole prompt of code
+# and prose: a prompt processed into fewer tokens than its UTF-8 size divided by this
+# lost part of itself. A prompt that really does (long runs of one character) fails closed.
+OLLAMA_MAX_BYTES_PER_TOKEN = 6
+# The smallest context window of a chat model. When the server reports no context
+# length, a silent cap at that unknown length is ruled out only for a prompt and an
+# answer that fit this window.
+OLLAMA_MIN_CONTEXT_TOKENS = 2048
+OLLAMA_SHOW_MAX_BYTES = 16 * 1024 * 1024
+OLLAMA_SHOW_ERROR_MAX_BYTES = 64 * 1024
+
+
+def _utf8_size(text: str) -> int:
+    """UTF-8 size of a message; a lone surrogate (an undecodable byte) never raises."""
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def estimate_prompt_tokens(text: str) -> int:
+    """A generous token count of text, for sizing a context window: half its UTF-8
+    size, each ASCII digit counted as a whole token.
+
+    Code and prose average three to four bytes a token, a CJK character (three
+    bytes) takes about one token, and tokenizers that split numbers spend a token
+    on each digit. A prompt whose tokenizer needs more tokens than this (base64 or
+    hex blobs at about 1.5 bytes a token) overflows that window; Ollama then reports
+    a full window or refuses the prompt, and ollama_whole_prompt_chat asks once more
+    with room for one token per byte (ceiling_prompt_tokens). It never accepts a cut
+    prompt (whole_prompt_error).
+    """
+    digits = sum(text.count(digit) for digit in "0123456789")
+    return (_utf8_size(text) + digits + 1) // 2
+
+
+def ceiling_prompt_tokens(text: str) -> int:
+    """The most tokens text can take: its UTF-8 size. No tokenizer spends more than a
+    token on a byte - byte-level BPE merges bytes, SentencePiece falls back to one
+    token per byte - so a window of this size plus the template always holds it."""
+    return _utf8_size(text)
+
+
+def _fills_window(response: Dict[str, Any], window: int, system_bytes: int) -> bool:
+    """Whether a response with valid token counts shows the prompt filling the window
+    (whole_prompt_error's window conditions): a larger window may hold all of it."""
+    prompt_tokens = response.get("prompt_eval_count")
+    answer_tokens = response.get("eval_count")
+    if type(prompt_tokens) is not int or prompt_tokens <= 0 or type(answer_tokens) is not int or answer_tokens < 0:
+        return False
+    return (prompt_tokens + system_bytes + OLLAMA_TEMPLATE_TOKENS > window
+            or prompt_tokens + answer_tokens >= window)
+
+
+def ollama_native_root(base_url: Optional[str]) -> str:
+    """Root URL of Ollama's native API for the configured OpenAI-compatible base URL."""
+    base = (base_url or "http://localhost:11434/v1").rstrip("/")
+    for suffix in ("/v1", "/api"):
+        if base.endswith(suffix):
+            return base[:-len(suffix)]
+    return base
+
+
+def ollama_context_length(root: str, model: Optional[str], headers: Optional[Dict[str, str]] = None,
+                          timeout: float = 4.0) -> Tuple[Optional[bool], Optional[int], Optional[str]]:
+    """(the endpoint is Ollama, the model's trained context length or None, error) from /api/show.
+
+    The first value is True for Ollama, False for an endpoint that answered without
+    Ollama's native API (HTTP 404/405/501, or a reply that is no Ollama model
+    information: vLLM, llama.cpp, LM Studio), and None when the probe itself failed
+    (no connection, timeout, server error), which proves neither.
+    """
+    request_headers = dict(headers or {})
+    request_headers["content-type"] = "application/json"
+    try:
+        # "name" is the field older servers read.
+        req = urllib.request.Request(f"{root}/api/show", data=json.dumps({"model": model, "name": model}).encode("utf-8"),
+                                     headers=request_headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(OLLAMA_SHOW_MAX_BYTES + 1)
+        if len(body) > OLLAMA_SHOW_MAX_BYTES:
+            return None, None, f"响应超过 {OLLAMA_SHOW_MAX_BYTES} 字节"
+        info = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(OLLAMA_SHOW_ERROR_MAX_BYTES).decode("utf-8", "replace").strip()
+        except Exception:
+            detail = ""
+        finally:
+            exc.close()
+        error = f"HTTP {exc.code}" + (f": {detail[:200]}" if detail else "")
+        return (False if exc.code in (404, 405, 501) else None), None, error
+    except ValueError:
+        return False, None, "响应不是 Ollama 模型信息"
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(info, dict) or not {"model_info", "details", "modelfile"} & set(info):
+        return False, None, "响应不是 Ollama 模型信息"
+    model_info = info.get("model_info") if isinstance(info.get("model_info"), dict) else {}
+    lengths = [value for key, value in model_info.items()
+               if str(key).endswith(".context_length") and type(value) is int and value > 0]
+    # The language model's own entry; other components (a vision encoder) may list one too.
+    trained = model_info.get(f"{model_info.get('general.architecture')}.context_length")
+    if type(trained) is int and trained > 0:
+        return True, trained, None
+    return True, (min(lengths) if lengths else None), None
+
+
+def prompt_token_floor_error(prompt_tokens: int, prompt_bytes: int) -> Optional[str]:
+    """Why prompt_tokens is too few for a whole prompt of prompt_bytes, or None."""
+    if prompt_tokens * OLLAMA_MAX_BYTES_PER_TOKEN < prompt_bytes:
+        return f"处理的提示只有 {prompt_tokens} tokens，远少于 {prompt_bytes} 字节的提示应有的数量，可能已被截断"
+    return None
+
+
+def whole_prompt_error(response: Dict[str, Any], window: int, system_bytes: int,
+                       prompt_bytes: int = 0) -> Optional[str]:
+    """Why an Ollama /api/chat answer may rest on part of its prompt, or None.
+
+    A prompt over the window loses its system message or, when the last message
+    alone is too long, all but a few tokens of its start, and then fills the
+    window: the processed prompt (prompt_eval_count) takes more than the window
+    minus the system message's share, which the message's UTF-8 bytes plus
+    OLLAMA_TEMPLATE_TOKENS bound. A smaller count proves nothing was cut, and
+    prompt plus answer below the window proves the context was never shifted
+    (prompt tokens discarded) while answering; without both counts neither is
+    proven. A count too small for the prompt's prompt_bytes
+    (prompt_token_floor_error) means it was cut some other way, e.g. by a server
+    that truncates to half the window or caps it below what was requested.
+    """
+    prompt_tokens = response.get("prompt_eval_count")
+    answer_tokens = response.get("eval_count")
+    if type(prompt_tokens) is not int or prompt_tokens <= 0 or type(answer_tokens) is not int or answer_tokens < 0:
+        return "未报告有效的提示/回答 token 数 (prompt_eval_count/eval_count)"
+    floor_error = prompt_token_floor_error(prompt_tokens, prompt_bytes)
+    if floor_error:
+        return floor_error
+    if prompt_tokens + system_bytes + OLLAMA_TEMPLATE_TOKENS > window:
+        return f"处理的提示 ({prompt_tokens} tokens) 没有为系统消息留出余量，可能已被 {window} tokens 的上下文窗口截断"
+    if prompt_tokens + answer_tokens >= window:
+        return (f"提示与回答 ({prompt_tokens}+{answer_tokens} tokens) 占满 {window} tokens 的上下文窗口，"
+                "回答期间可能已丢弃部分提示")
+    return None
+
+
+def openai_compatible_whole_prompt_chat(base_url: Optional[str], headers: Dict[str, str], request: Dict[str, Any],
+                                        timeout: float, max_retries: int = 2,
+                                        backoff_factor: float = 0.5) -> Tuple[bool, str, Optional[str]]:
+    """Read-only chat on an endpoint that only offers the OpenAI-compatible API.
+
+    Such a server (vLLM, llama.cpp, LM Studio) cannot be given a context window,
+    and refuses a prompt over its own one (vLLM, recent llama.cpp) or shortens it
+    (older llama.cpp, LM Studio's truncating overflow policies). The answer counts
+    only when the response reports how many prompt tokens were processed
+    (usage.prompt_tokens) and that count is plausible for the whole prompt
+    (prompt_token_floor_error); a refusal or a missing or too small count is
+    UNVERIFIED. A cut that leaves at least one token per OLLAMA_MAX_BYTES_PER_TOKEN
+    bytes cannot be told from a whole prompt by its count.
+    """
+    from makewand.providers.api_client import CONTEXT_LIMIT_ERROR_RE, _make_http_request
+    from makewand.providers.base import ProcessExecutionError
+    model = request.get("model")
+    endpoint = (base_url or "http://localhost:11434/v1").rstrip("/")
+    if not endpoint.endswith("/chat/completions"):
+        endpoint = f"{endpoint}/chat/completions"
+    prompt_bytes = sum(_utf8_size(str(m.get("content") or "")) for m in request.get("messages") or [])
+    code, raw, error = _make_http_request(endpoint, headers, dict(request, stream=False), timeout=timeout,
+                                          stream=False, max_retries=max_retries, backoff_factor=backoff_factor)
+    if code != 200:
+        if code in (400, 413) and CONTEXT_LIMIT_ERROR_RE.search(f"{raw or ''} {error or ''}"):
+            return False, raw, ProcessExecutionError(
+                f"本地模型 {model} 拒绝了超过其上下文长度的提示，结论未验证 (UNVERIFIED): {str(raw or error)[:200]}",
+                "UNVERIFIED")
+        return False, raw, error or f"LOCAL API returned status {code}"
+    try:
+        response = json.loads(raw)
+    except ValueError as exc:
+        return False, raw, f"JSON parse error: {exc}"
+    choices = response.get("choices") if isinstance(response, dict) else None
+    message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+    answer = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(answer, str):
+        return False, raw, "JSON parse error: OpenAI 兼容接口响应缺少回答 (choices[0].message.content)"
+    usage = response.get("usage")
+    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    if type(prompt_tokens) is not int or prompt_tokens <= 0:
+        cut = "未报告有效的提示 token 数 (usage.prompt_tokens)"
+    else:
+        cut = prompt_token_floor_error(prompt_tokens, prompt_bytes)
+    if cut:
+        return False, answer, ProcessExecutionError(
+            f"本地模型 {model} {cut}，不能确认模型读到了完整提示，结论未验证 (UNVERIFIED)", "UNVERIFIED")
+    return True, answer, None
+
+
+def ollama_whole_prompt_chat(base_url: Optional[str], headers: Dict[str, str], request: Dict[str, Any],
+                             timeout: float, max_retries: int = 2,
+                             backoff_factor: float = 0.5) -> Tuple[bool, str, Optional[str]]:
+    """Sends an OpenAI-style chat request to Ollama's native /api/chat for the whole prompt.
+
+    The context window is a generous token estimate of the messages
+    (estimate_prompt_tokens) plus OLLAMA_TEMPLATE_TOKENS and OLLAMA_ANSWER_TOKENS,
+    capped at the model's trained context length, the cap Ollama would otherwise
+    apply silently. A prompt denser than the estimate (base64, hex) fills that window
+    - the reported prompt_eval_count reaches it - or a newer Ollama refuses it: then,
+    once, the request is sent again with a window of one token per byte of the
+    messages (ceiling_prompt_tokens), still capped at the trained length, and that
+    answer is judged the same way. When /api/show reports no context length (a server without
+    model_info, or none of its keys), that cap is unknown, nothing is retried and the
+    answer counts only when prompt and answer fit OLLAMA_MIN_CONTEXT_TOKENS. An endpoint without Ollama's native API
+    gets the request on its OpenAI-compatible API instead
+    (openai_compatible_whole_prompt_chat). Returns (ok, answer, error); the error
+    is UNVERIFIED when the native API cannot be probed, when the server refuses a
+    prompt over the window, or when whole_prompt_error() finds the prompt may be cut.
+    """
+    from makewand.providers.api_client import CONTEXT_LIMIT_ERROR_RE, _make_http_request
+    from makewand.providers.base import ProcessExecutionError
+    started = time.monotonic()
+    root = ollama_native_root(base_url)
+    model = request.get("model")
+    native, trained, probe_error = ollama_context_length(root, model, headers, timeout=min(4.0, max(0.1, timeout)))
+    if native is False:
+        return openai_compatible_whole_prompt_chat(base_url, headers, request,
+                                                   timeout=max(0.001, timeout - (time.monotonic() - started)),
+                                                   max_retries=max_retries, backoff_factor=backoff_factor)
+    if not native:
+        return False, "", ProcessExecutionError(
+            f"无法确认本地模型端点 {root} 是否提供 Ollama 原生接口 (/api/show: {probe_error})，无法为提示设置上下文窗口并核对 token 数，"
+            "不能确认模型读到了完整提示，只读结论不予采纳 (UNVERIFIED)", "UNVERIFIED")
+    messages = request.get("messages") or []
+    contents = [(m.get("role"), str(m.get("content") or "")) for m in messages]
+    system_bytes = sum(_utf8_size(text) for role, text in contents if role == "system")
+    prompt_bytes = sum(_utf8_size(text) for _, text in contents)
+    window = sum(estimate_prompt_tokens(text) for _, text in contents) + OLLAMA_TEMPLATE_TOKENS + OLLAMA_ANSWER_TOKENS
+    # The retry's window: room for one token per byte, which no tokenizer exceeds.
+    ceiling = sum(ceiling_prompt_tokens(text) for _, text in contents) + OLLAMA_TEMPLATE_TOKENS + OLLAMA_ANSWER_TOKENS
+    if trained:
+        window = min(window, trained)
+        ceiling = min(ceiling, trained)
+    while True:
+        # Only with a known trained length can a larger window be asked for without Ollama capping it silently.
+        can_grow = bool(trained) and ceiling > window
+        options = dict(request.get("options") or {})  # num_gpu / num_thread of the GPU guard
+        options.update(num_ctx=window, num_predict=OLLAMA_ANSWER_TOKENS, temperature=request.get("temperature", 0.2))
+        body = {"model": model, "messages": messages, "stream": False, "keep_alive": request.get("keep_alive", "0"),
+                # Newer Ollama then refuses a prompt over the window instead of shortening
+                # it, and stops instead of shifting the context when the window is full.
+                "truncate": False, "shift": False, "options": options}
+        code, raw, error = _make_http_request(f"{root}/api/chat", headers, body,
+                                              timeout=max(0.001, timeout - (time.monotonic() - started)),
+                                              stream=False, max_retries=max_retries, backoff_factor=backoff_factor)
+        if code != 200:
+            if code in (400, 413) and CONTEXT_LIMIT_ERROR_RE.search(f"{raw or ''} {error or ''}"):
+                if can_grow:
+                    window = ceiling
+                    continue
+                return False, raw, ProcessExecutionError(
+                    f"本地模型 {model} 拒绝了超过 {window} tokens 上下文窗口的提示，结论未验证 (UNVERIFIED): {str(raw or error)[:200]}",
+                    "UNVERIFIED")
+            if code in (404, 405, 501):
+                # /api/show without /api/chat (a server imitating part of Ollama's API).
+                return openai_compatible_whole_prompt_chat(base_url, headers, request,
+                                                           timeout=max(0.001, timeout - (time.monotonic() - started)),
+                                                           max_retries=max_retries, backoff_factor=backoff_factor)
+            return False, raw, error or f"LOCAL API returned status {code}"
+        try:
+            response = json.loads(raw)
+        except ValueError as exc:
+            return False, raw, f"JSON parse error: {exc}"
+        message = response.get("message") if isinstance(response, dict) else None
+        answer = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(answer, str) or response.get("done") is not True:
+            return False, raw, "JSON parse error: Ollama /api/chat 响应缺少已完成的回答"
+        cut = whole_prompt_error(response, window, system_bytes, prompt_bytes)
+        if (cut and can_grow and _fills_window(response, window, system_bytes)
+                and not prompt_token_floor_error(response["prompt_eval_count"], prompt_bytes)):
+            window = ceiling  # the prompt filled the estimated window: ask once more with room for all of it
+            continue
+        break
+    if not cut and not trained and whole_prompt_error(response, min(window, OLLAMA_MIN_CONTEXT_TOKENS),
+                                                      system_bytes, prompt_bytes):
+        # Both counts are valid here: whole_prompt_error() above checked them.
+        cut = (f"的上下文长度未由服务端报告 (/api/show 中没有 context_length)，无法排除提示被静默截断到该长度："
+               f"处理的提示与回答 ({response['prompt_eval_count']}+{response['eval_count']} tokens) "
+               f"超出任何模型都有的 {OLLAMA_MIN_CONTEXT_TOKENS} tokens 窗口；请升级 Ollama")
+    if cut:
+        return False, answer, ProcessExecutionError(f"本地模型 {model} {cut}，结论未验证 (UNVERIFIED)", "UNVERIFIED")
+    return True, answer, None
+
+
 def execute_local_task(
     prompt: str,
     cwd: Optional[str] = None,
@@ -145,6 +446,10 @@ def execute_local_task(
 
     The endpoint is a chat completion API: it returns text and never edits files.
     Callers that need file changes must verify the diff (run_pipeline/run_race do).
+    A read-only dispatch (review, judging, question) must rest on the whole prompt:
+    it runs on Ollama's native API with a sufficient context window, or on an
+    OpenAI-compatible-only endpoint with its reported prompt token count checked,
+    and fails closed (UNVERIFIED) otherwise (ollama_whole_prompt_chat).
     """
     from makewand.providers.api_client import call_api_chat
     from makewand.workflow import provider_outcome

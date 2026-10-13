@@ -185,11 +185,21 @@ class TestAgyDispatchWriteBack(_IsolatedStatus):
 
     def test_version_probe_is_unverified_and_keeps_dispatch_failure(self):
         self._dispatch("Error: this service is not available in your country")
+
+        # `makewand probe` now adds one real agy call while a dispatch failure is
+        # live (py-rel-21); here that call still hits the block, so the failure
+        # must survive. A successful real call clearing it is covered in
+        # tests/test_fix_health_probe_clears.py.
+        def fake_run(cmd, *args, **kwargs):
+            if list(cmd)[:2] == ["agy", "--version"]:
+                return 0, "agy 9.9.9", "", None
+            return 1, "", "Error: this service is not available in your country", None
+
         with patch("makewand.config.get_all_supported_providers", return_value=["agy"]), \
              patch("makewand.config.is_provider_enabled", return_value=True), \
              patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=False), \
-             patch("makewand.health.run_subprocess", return_value=(0, "agy 9.9.9", "", None)):
+             patch("makewand.health.run_subprocess", side_effect=fake_run):
             fresh = probe_model("agy")
             cache = get_or_update_status(force_probe=True)
         self.assertEqual(fresh["status"], "healthy")

@@ -17,8 +17,7 @@ Scope, stated honestly:
 """
 
 import os
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 
 from makewand.config import (
@@ -31,7 +30,8 @@ from makewand.config import (
     COLOR_PURPLE,
     COLOR_RESET,
 )
-from makewand.health import load_status_cache, calculate_provider_quota, get_reauth_hint, STATUS_STALE_SECONDS
+from makewand.health import (load_status_cache, calculate_provider_quota, get_reauth_hint, STATUS_STALE_SECONDS,
+                             parse_reset_datetime)
 from makewand.discovery import get_provider_model_tier
 
 # Pacing States
@@ -118,129 +118,22 @@ def _local_burn_penalty(provider: str) -> Tuple[float, Optional[str]]:
 
 def parse_reset_time_to_seconds_left(resets_at_str: Optional[str], updated_at: Optional[str] = None) -> Optional[float]:
     """
-    Parses resets_at string (e.g., '2026-09-28 07:53', '10:58 (2026-09-27)', 'Sep 27th, 2026 10:58 AM', '8pm (Asia/Shanghai)', 'in 2 hours')
-    into seconds remaining from now, subtracting elapsed time if updated_at is provided.
+    Seconds from now until a provider's reset string (e.g. '2026-09-28 07:53',
+    '10:58 (2026-09-27)', 'Sep 27th, 2026 10:58 AM', 'Oct 20, 8pm (Asia/Shanghai)',
+    '8pm', 'in 2 hours'), 0 when it already passed, None when unparseable.
+
+    Uses the same parser as health.is_reset_time_passed: clock times, durations
+    and year-less dates are anchored on the observation (updated_at), so a reset
+    that passed an hour ago is 0, not tomorrow or next year.
     """
     if not resets_at_str or not isinstance(resets_at_str, str):
         return None
-
-    s = resets_at_str.strip()
     now = datetime.now()
-
-    elapsed = 0.0
-    if updated_at:
-        try:
-            clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
-            up_dt = datetime.fromisoformat(clean_up)
-            now_comp = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else now
-            elapsed = max(0.0, (now_comp - up_dt).total_seconds())
-        except Exception:
-            elapsed = 0.0
-
-    # Pattern 1: ISO or standard YYYY-MM-DD HH:MM (with timezone support)
-    try:
-        clean_s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(clean_s)
-        now_tz = datetime.now(dt.tzinfo) if dt.tzinfo is not None else now
-        diff = (dt - now_tz).total_seconds()
-        return max(0.0, diff)
-    except Exception:
-        pass
-
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?", s)
-    if m:
-        try:
-            year, month, day, hour, minute = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
-            second = int(m.group(6)) if m.group(6) else 0
-            dt = datetime(year, month, day, hour, minute, second)
-            diff = (dt - now).total_seconds()
-            return max(0.0, diff)
-        except Exception:
-            pass
-
-    # Pattern 2: HH:MM (YYYY-MM-DD)
-    m2 = re.search(r"(\d{1,2}):(\d{2})\s*\((?:.+)?(\d{4})-(\d{2})-(\d{2})\)", s)
-    if m2:
-        try:
-            hour, minute, year, month, day = int(m2.group(1)), int(m2.group(2)), int(m2.group(3)), int(m2.group(4)), int(m2.group(5))
-            dt = datetime(year, month, day, hour, minute)
-            diff = (dt - now).total_seconds()
-            return max(0.0, diff)
-        except Exception:
-            pass
-
-    # Pattern 3: Month-day date support (e.g. "Sep 27th, 2026 10:58 AM", "Oct 3 at 2pm", "Oct 11, 8pm")
-    date_match = re.search(
-        r"([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,\s*(\d{4}))?(?:,\s*|\s+at\s+|\s+)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
-        s,
-        re.IGNORECASE,
-    )
-    if date_match:
-        try:
-            month_str = date_match.group(1).capitalize()[:3]
-            day_val = int(date_match.group(2))
-            year_val = int(date_match.group(3)) if date_match.group(3) else now.year
-            hour_val = int(date_match.group(4))
-            min_val = int(date_match.group(5)) if date_match.group(5) else 0
-            ampm = date_match.group(6).lower() if date_match.group(6) else ""
-            if ampm == "pm" and hour_val < 12:
-                hour_val += 12
-            elif ampm == "am" and hour_val == 12:
-                hour_val = 0
-            months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            if month_str in months:
-                month_val = months.index(month_str) + 1
-                reset_dt = datetime(year_val, month_val, day_val, hour_val, min_val)
-                if not date_match.group(3) and reset_dt < now:
-                    reset_dt = datetime(year_val + 1, month_val, day_val, hour_val, min_val)
-                diff = (reset_dt - now).total_seconds()
-                return max(0.0, diff)
-        except Exception:
-            pass
-
-    # Pattern 4: Relative hours/minutes e.g. "3h 20m" or "45m" or "in 2 hours"
-    m_hours = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hours?|小时)", s, re.IGNORECASE)
-    m_mins = re.search(r"(\d+)\s*(?:m|min|minutes?|分钟)", s, re.IGNORECASE)
-    if m_hours or m_mins:
-        secs = 0.0
-        if m_hours:
-            secs += float(m_hours.group(1)) * 3600
-        if m_mins:
-            secs += float(m_mins.group(1)) * 60
-        secs = max(0.0, secs - elapsed)
-        return secs
-
-    # Pattern 5: Time of day with stripped timezone e.g. "8pm (Asia/Shanghai)", "10:58 AM", "at 2:00 PM"
-    # The clock time refers to the first such moment *after the observation*
-    # (updated_at), exactly like health.is_reset_time_passed. Anchoring on
-    # "now" instead would push an already-passed reset to tomorrow.
-    clean_time = re.sub(r"\(.*?\)", "", s).strip().rstrip(".,")
-    clean_time = re.sub(r"^(?:at|in)\s+", "", clean_time, flags=re.IGNORECASE).strip().rstrip(".,")
-    anchor = None
-    if updated_at:
-        try:
-            clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
-            anchor = datetime.fromisoformat(clean_up)
-            if anchor.tzinfo is not None:
-                anchor = anchor.astimezone().replace(tzinfo=None)
-        except Exception:
-            anchor = None
-    for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
-        try:
-            t = datetime.strptime(clean_time, fmt).time()
-        except Exception:
-            continue
-        if anchor is not None:
-            reset_dt = datetime.combine(anchor.date(), t)
-            if reset_dt < anchor:
-                reset_dt += timedelta(days=1)
-        else:
-            reset_dt = datetime.combine(now.date(), t)
-            if reset_dt < now:
-                reset_dt += timedelta(days=1)
-        return max(0.0, (reset_dt - now).total_seconds())
-
-    return None
+    reset = parse_reset_datetime(resets_at_str, observed_at=updated_at, now=now)
+    if reset is None:
+        return None
+    current = now.astimezone() if now.tzinfo is None else now
+    return max(0.0, (reset - current).total_seconds())
 
 
 def calculate_dynamic_pacing(
@@ -319,6 +212,13 @@ def calculate_dynamic_pacing(
         return _neutral(provider, f"{provider.upper()} 无云端额度约束", percentage=percentage)
 
     cycle_total = PROVIDER_DEFAULT_CYCLES.get(provider, CYCLE_7_DAYS)
+    # Official evidence names its window (5-hour or weekly): pace against that
+    # window, not the provider's default cycle, or 15% left of a 5-hour window
+    # one hour before its reset reads as a week of unused quota.
+    window_minutes = quota_data.get("window_minutes")
+    if (source == "official" and isinstance(window_minutes, (int, float)) and not isinstance(window_minutes, bool)
+            and window_minutes > 0):
+        cycle_total = float(window_minutes) * 60
     updated_at = quota_data.get("updated_at") or info.get("updated_at")
     seconds_left = parse_reset_time_to_seconds_left(resets_at, updated_at=updated_at) if resets_at else None
     has_official_pct = source == "official" and percentage is not None

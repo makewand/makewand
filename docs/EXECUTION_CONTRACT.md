@@ -17,7 +17,7 @@ tests exercise the same fixtures and share a real ledger across processes.
 | UNVERIFIED | 11 | Missing tests, eligible engines or approval |
 | CANCELLED | 12 | Cancelled execution |
 | BUDGET_EXHAUSTED | 13 | Admission refused by the shared budget |
-| APPLY_CONFLICT | 14 | Destination no longer matches its frozen baseline |
+| APPLY_CONFLICT | 14 | Destination no longer matches its frozen baseline, already has an entry the candidate adds, or has an entry apply cannot write |
 | SANDBOX_UNAVAILABLE | 15 | Required isolation is unavailable |
 | TIMEOUT | 16 | Requested deadline expired |
 | UNKNOWN | 17 | Result cannot be established after dispatch |
@@ -145,7 +145,11 @@ Unused workflow capacity is stored as expiring `holds`, separate from attempts.
 Ordinary dispatches cannot consume it. Claiming a hold decrements its remaining
 capacity and creates exactly one attempt. Race reserves two contestant calls and
 one judge call before either contestant begins; partial holds are released on
-failure. An unused hold can expire; an actual attempt cannot be refunded.
+failure. The Winner-Take-All review uses the judge's hold, while a verdict
+follow-up and the review of a judge's own-provider pick are admitted as ordinary
+dispatches, so a tight `--max-model-calls` can end such a race
+`BUDGET_EXHAUSTED`; it never approves without the review. An unused hold can
+expire; an actual attempt cannot be refunded.
 
 `--total-timeout` bounds the Python workflow, including verification and review.
 Child scopes can shorten a parent deadline, never extend it. Native Go propagates
@@ -171,9 +175,69 @@ sensitive interfaces or external effects. An explicit low-risk single workflow
 uses one coder and a separate read-only review call, possibly through the same
 provider. It retains the local tests, complete diff and artifact binding.
 High-risk work requires distinct-provider review; a high-risk single request is
-invalid. Race contestants must be distinct; a third provider is preferred for
-judging but an independent read-only call through a contestant's provider is
-allowed. Missing eligible engines or evidence produces `UNVERIFIED`.
+invalid. Race contestants must be distinct. The judge must receive the whole
+judge prompt, and a provider other than both contestants is preferred; a judge's
+pick of its own provider's candidate is approved only after a read-only,
+nonce-bound review by another provider. A Winner-Take-All win (the first
+candidate to pass its tests) needs the same review, which asks once more for a
+missing verdict line; `FAILED` exits 10, a missing reviewer or verdict 11.
+Missing eligible engines or evidence produces `UNVERIFIED`.
+
+When no enabled engine is usable (each is in an error state, or limited, logged
+out or missing without an API key to relay to), nothing is dispatched: no
+pipeline, explain or question prompt, REPL turn or `ensemble`. Each engine's
+reason is printed, and the outcome is `UNVERIFIED` (exit 11) with the error
+`No usable execution provider: <engine>: <reason>; …`; with no enabled engine at
+all it remains `No enabled execution provider`. `race` likewise dispatches
+nothing and lists each engine's state.
+
+## Reviewer capacity
+
+A review verdict counts only from a reviewer that received the complete prompt
+with the complete diff. A diff over the review cap (`MAKEWAND_REVIEW_DIFF_MAX_BYTES`,
+default 262,144 bytes; an invalid value falls back with one warning) is never
+reviewed truncated, in the pipeline (first review, re-review, the auto-fix growth
+check), `makewand review`, the Winner-Take-All review or the race judge. The
+outcome is `UNVERIFIED` and the complete patch is saved as `unverified.patch`
+(`git diff --binary --full-index --unified=3`) with one
+`unverified.submodule-<n>.patch` per checked-out submodule, listed in
+`manifest.json`; when it cannot be saved completely, the shadow worktree is kept.
+
+The agy adapter passes a prompt over 32 KiB as a file that its agent reads in
+paged views, so no review, judge or Winner-Take-All prompt over 31 KiB goes to
+agy. The pipeline's
+first review and the auto-fix re-review then append the next usable stand-in:
+planned reviewers first, then active providers, never the coder (for a re-review,
+nor the fixer); the coder only as a last resort where the plan allows
+self-review; none in a single-tool run, `--local-only` included. A stand-in that
+fails with a non-terminal status is replaced by the next allowed one; `UNKNOWN`,
+`TIMEOUT`, `CANCELLED` and `BUDGET_EXHAUSTED` stop the review. Placeholder engines
+without an executor (`cursor`, `copilot`) never review or stand in.
+`makewand review` keeps its codex → grok → agy ladder (`local` with
+`--local-only`), so when agy is the only usable engine there an oversized prompt
+ends `UNVERIFIED`.
+
+Read-only local model calls (review, judging, questions) go to Ollama's native
+`/api/chat` with `truncate: false` and `shift: false`. `num_ctx` is a token
+estimate of the messages (half their UTF-8 size, each ASCII digit one token)
+plus 512 template and 8,192 answer tokens, capped at the model's trained context
+length from `/api/show`. The answer counts only when `prompt_eval_count` and
+`eval_count` show that the prompt fitted with room for the system message and
+the answer, and that at least one token per 6 bytes was processed. A prompt that
+fills that window, or that Ollama refuses as too long, is sent once more with room
+for one token per byte (`num_ctx` up to the prompt's bytes + 8,704, capped at the
+trained length); when `/api/show` reports no context length nothing is retried
+and only a prompt and answer within 2,048 tokens count. An endpoint without
+Ollama's native API (vLLM, llama.cpp, LM Studio) is asked through its
+OpenAI-compatible API and counts only when `usage.prompt_tokens` is at least the
+prompt's bytes / 6. A context-length refusal, a missing count or a failed
+`/api/show` probe is `UNVERIFIED`. Coding dispatches keep the OpenAI-compatible
+path. OpenRouter requests send `transforms: []`, and its context-length refusals
+are `UNVERIFIED`. Residual: a server that cuts a prompt yet reports at least one
+token per 6 bytes (an Ollama that over-reports its trained length, a truncating
+llama.cpp or LM Studio overflow policy, an OpenAI-compatible proxy in front of
+Ollama) cannot be told from a whole prompt; prompts made of long runs of one
+character can fail closed, and a retried window can need a large KV cache.
 
 ## Protected task files
 

@@ -7,17 +7,22 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional, List
 from makewand.config import c, COLOR_PURPLE
-from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 from makewand.workflow import provider_outcome
 
-def parse_muse_quota(output: str) -> Tuple[bool, str, Optional[str]]:
-    lower = output.lower()
-    if any(k in lower for k in ["missing meta credentials", "open this page to sign in", "oauth/device", "auth required", "press enter to open"]):
+def parse_muse_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
+    """Login prompts and limit refusals Muse Code prints itself
+    (health.CLI_MESSAGE_CATALOG["muse"]); a "429" or "rate limit" elsewhere in
+    the transcript ("429 passed", "line 429", "added a rate limit") is task
+    content. `stderr` is passed when the streams were captured apart."""
+    from makewand.health import find_cli_messages, extract_reset_phrase
+    found = find_cli_messages("muse", ("auth", "quota", "rate"), output, stderr)
+    if "auth" in found:
         return True, "未登录或需配置凭据 (运行 'muse login' 或在 ~/.config/muse/env 中配置 META_API_KEY)", "需登录授权"
-    if "rate limit" in lower or "usage limit" in lower or re.search(r"\b(?:429|http\s+429|too\s*many\s*requests)\b", lower):
-        reset_match = re.search(r"resets?\s+(?:in|at)\s+([^.\n,]+)", output, re.IGNORECASE)
-        if reset_match:
-            reset_time = reset_match.group(1).strip()
+    line = next((line for kind, line in found.items() if kind != "auth"), None)
+    if line is not None:
+        reset_time = extract_reset_phrase(line)
+        if reset_time:
             return True, f"Meta 订阅额度耗尽或频次受限 ({reset_time})", reset_time
         iso_reset = (datetime.now() + timedelta(hours=2)).isoformat()
         return True, "Meta 订阅额度耗尽或频次受限", iso_reset
@@ -315,6 +320,7 @@ def execute_muse_task(
                     print_prefix=c("[Muse Live]", COLOR_PURPLE),
                     pass_fds=launch.pass_fds,
                     extra_env=launch.env,
+                    separate_stderr=True,
                 )
         except SandboxUnavailableError as exc:
             return False, None, str(exc)
@@ -332,7 +338,8 @@ def execute_muse_task(
                 shutil.rmtree(p_dir, ignore_errors=True)
             except Exception:
                 pass
-    combined = f"{out}\n{err}" if not stream else out
+    apart = stderr_captured_apart(err, stream)
+    combined = f"{out}\n{err}" if apart else out
 
     if code == 0:
         return True, out, None
@@ -340,7 +347,7 @@ def execute_muse_task(
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("muse", code, combined, err, ex, readonly)
 
-    is_limited, reason, resets = parse_muse_quota(combined)
+    is_limited, reason, resets = parse_muse_quota(out, err if apart else None)
     if is_limited:
         record_engine_limit("muse", reason, resets)
         if has_api_configured("muse"):

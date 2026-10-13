@@ -323,6 +323,12 @@ def _abort_response(resp: Any) -> None:
 
 MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024  # 10MB limit aligned with Go router maxOutputBytes
 
+# An API refusing a prompt longer than the model's context window (HTTP 400/413):
+# the prompt was not processed whole, so no answer exists and the outcome is UNVERIFIED.
+CONTEXT_LIMIT_ERROR_RE = re.compile(
+    r"context[ _-]?(?:length|window|size)|maximum context|too many tokens|prompt is too long"
+    r"|exceeds? the (?:context|maximum)", re.IGNORECASE)
+
 
 def _stream_post_sse(
     resp: Any,
@@ -764,12 +770,33 @@ def _call_api_chat(
             data.update(extra_params)
         if p in ("local", "ollama") and "keep_alive" not in data:
             data["keep_alive"] = "0"
+        if p == "openrouter":
+            # OpenRouter compresses a prompt over the model's context ("middle-out",
+            # its default for models with up to 8k context) instead of refusing it:
+            # an answer, such as a review verdict, would rest on part of the prompt.
+            data["transforms"] = []
+
+        if p in ("local", "ollama") and readonly:
+            # A read-only answer (review verdict, judgement) must rest on the whole
+            # prompt, which Ollama's OpenAI-compatible endpoint may silently shorten.
+            from makewand.providers.local import ollama_whole_prompt_chat
+            ok, text, err = ollama_whole_prompt_chat(base_url, headers, data, timeout=timeout,
+                                                     max_retries=max_retries, backoff_factor=backoff_factor)
+            if ok and stream and print_prefix:
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
+            return ok, text, err
 
         code, raw, err = _make_http_request(
             endpoint, headers, data, timeout=timeout, stream=stream,
             print_prefix=print_prefix, max_retries=max_retries, backoff_factor=backoff_factor
         )
         if code != 200:
+            if p == "openrouter" and code in (400, 413) and CONTEXT_LIMIT_ERROR_RE.search(f"{raw or ''} {err or ''}"):
+                from makewand.providers.base import ProcessExecutionError
+                return False, raw, ProcessExecutionError(
+                    f"OPENROUTER 拒绝了超过模型上下文长度的提示 (HTTP {code})，提示未被完整处理，结论未验证 (UNVERIFIED): "
+                    f"{str(raw or err)[:200]}", "UNVERIFIED")
             return False, raw, err or f"{p.upper()} API returned status {code}"
         if stream:
             _apply_code_if_coder(raw)

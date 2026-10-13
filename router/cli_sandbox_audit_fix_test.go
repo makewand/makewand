@@ -62,12 +62,24 @@ func auditFixHasTriple(args []string, flag, src, dest string) bool {
 	return false
 }
 
-// auditFixWaitPrivateHome runs cmd and waits for the private provider home
-// to be written back and removed.
+// auditFixRunAndWaitPrivateHome runs wrapped and waits until its private
+// provider home (bound at the sandbox HOME) has been written back and
+// removed. The finished hook also fires for unrelated private homes
+// (unstarted commands of earlier mount-plan tests are cleaned up when garbage
+// collected), so only this run's directory counts, and the hook never blocks.
 func auditFixRunAndWaitPrivateHome(t *testing.T, wrapped *exec.Cmd) string {
 	t.Helper()
-	finished := make(chan string, 4)
-	hook := func(dir string) { finished <- dir }
+	home := filepath.Clean(cliEnvValue(wrapped.Env, "HOME"))
+	dir := filepath.Dir(cliPrivateHomeSource(t, wrapped.Args, home))
+	done := make(chan struct{}, 1)
+	hook := func(finished string) {
+		if finished == dir {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+	}
 	old := cliPrivateHomeFinished.Swap(&hook)
 	t.Cleanup(func() { cliPrivateHomeFinished.Store(old) })
 	out, err := runWrappedCLIForTest(wrapped)
@@ -75,12 +87,12 @@ func auditFixRunAndWaitPrivateHome(t *testing.T, wrapped *exec.Cmd) string {
 		t.Fatalf("sandbox run failed: %v %s (args=%v)", err, out, wrapped.Args)
 	}
 	select {
-	case dir := <-finished:
-		if _, err := os.Stat(dir); !os.IsNotExist(err) {
-			t.Fatalf("private home %s was not removed: %v", dir, err)
-		}
+	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("private home write-back did not run after the sandbox exited")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("private home %s was not removed: %v", dir, err)
 	}
 	return string(out)
 }
@@ -205,13 +217,13 @@ func TestAuditFix_PrivateHomeLiveWriteBack(t *testing.T) {
 	creds := filepath.Join(claudeDir, ".credentials.json")
 	settings := filepath.Join(claudeDir, "settings.json")
 	claudeJSON := filepath.Join(home, ".claude.json")
-	for path, content := range map[string]string{creds: `{"token":"old"}`, //nolint:gosec // G101: fake fixture token
+	for path, content := range map[string]string{creds: `{"claudeAiOauth":{"accessToken":"old","refreshToken":"r","expiresAt":1}}`, //nolint:gosec // G101: fake fixture token
 		settings: `{"hooks":{}}`, claudeJSON: `{"mcpServers":{}}`} {
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	script := `printf '{"token":"new"}' > "$HOME/.claude/.credentials.json"
+	script := `printf '{"claudeAiOauth":{"accessToken":"new","refreshToken":"r","expiresAt":2}}' > "$HOME/.claude/.credentials.json"
 printf '{"mcpServers":{"evil":{}}}' > "$HOME/.claude.json"
 echo planted > "$HOME/.claude/hooks.sh"
 if printf x > "$HOME/.claude/settings.json" 2>/dev/null; then echo SETTINGS_WRITABLE; fi
@@ -227,7 +239,7 @@ echo done`
 	if strings.Contains(out, "SETTINGS_WRITABLE") || !strings.Contains(out, "done") {
 		t.Fatalf("unexpected sandbox output: %q", out)
 	}
-	if data, _ := os.ReadFile(creds); string(data) != `{"token":"new"}` {
+	if data, _ := os.ReadFile(creds); string(data) != `{"claudeAiOauth":{"accessToken":"new","refreshToken":"r","expiresAt":2}}` {
 		t.Fatalf("refreshed token not written back: %q", data)
 	}
 	if fi, err := os.Stat(creds); err != nil || fi.Mode().Perm() != 0o600 {
@@ -247,11 +259,12 @@ echo done`
 // H3: write-back validation rejects symlinks, invalid JSON, oversized data and
 // a host file that changed since launch.
 func TestAuditFix_PrivateHomeWriteBackValidation(t *testing.T) {
+	const hostOrig = `{"access_token":"a1","refresh_token":"r1"}` // a token refresh changes only access_token
 	newHome := func(t *testing.T) (*cliPrivateHome, string, string) {
 		t.Helper()
 		hostRoot := t.TempDir()
 		hostFile := filepath.Join(hostRoot, "auth.json")
-		if err := os.WriteFile(hostFile, []byte(`{"v":1}`), 0o600); err != nil {
+		if err := os.WriteFile(hostFile, []byte(hostOrig), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		h, err := newCLIPrivateHome(t.TempDir())
@@ -272,35 +285,37 @@ func TestAuditFix_PrivateHomeWriteBackValidation(t *testing.T) {
 
 	t.Run("changed", func(t *testing.T) {
 		h, host, priv := newHome(t)
-		_ = os.WriteFile(priv, []byte(`{"v":2}`), 0o600)
+		_ = os.WriteFile(priv, []byte(`{"access_token":"a2","refresh_token":"r1"}`), 0o600)
 		h.writeBack()
-		if read(host) != `{"v":2}` {
+		if read(host) != `{"access_token":"a2","refresh_token":"r1"}` {
 			t.Fatalf("valid change not written back: %q", read(host))
 		}
 	})
 	t.Run("symlink", func(t *testing.T) {
 		h, host, priv := newHome(t)
+		// The target is a valid refresh the merge would accept, so only
+		// refusing the symlink keeps the host copy.
 		secret := filepath.Join(t.TempDir(), "secret.json")
-		_ = os.WriteFile(secret, []byte(`{"secret":true}`), 0o600)
+		_ = os.WriteFile(secret, []byte(`{"access_token":"a9","refresh_token":"r1"}`), 0o600)
 		_ = os.Remove(priv)
 		if err := os.Symlink(secret, priv); err != nil {
 			t.Fatal(err)
 		}
 		h.writeBack()
-		if read(host) != `{"v":1}` {
+		if read(host) != hostOrig {
 			t.Fatalf("symlinked private credential was followed: %q", read(host))
 		}
 	})
 	t.Run("symlinked parent", func(t *testing.T) {
 		h, host, priv := newHome(t)
 		other := t.TempDir()
-		_ = os.WriteFile(filepath.Join(other, "auth.json"), []byte(`{"v":9}`), 0o600)
+		_ = os.WriteFile(filepath.Join(other, "auth.json"), []byte(`{"access_token":"a9","refresh_token":"r1"}`), 0o600)
 		_ = os.RemoveAll(filepath.Dir(priv))
 		if err := os.Symlink(other, filepath.Dir(priv)); err != nil {
 			t.Fatal(err)
 		}
 		h.writeBack()
-		if read(host) != `{"v":1}` {
+		if read(host) != hostOrig {
 			t.Fatalf("symlinked private parent was followed: %q", read(host))
 		}
 	})
@@ -308,7 +323,7 @@ func TestAuditFix_PrivateHomeWriteBackValidation(t *testing.T) {
 		h, host, priv := newHome(t)
 		_ = os.WriteFile(priv, []byte(`not json`), 0o600)
 		h.writeBack()
-		if read(host) != `{"v":1}` {
+		if read(host) != hostOrig {
 			t.Fatalf("invalid JSON written back: %q", read(host))
 		}
 	})
@@ -316,16 +331,16 @@ func TestAuditFix_PrivateHomeWriteBackValidation(t *testing.T) {
 		h, host, priv := newHome(t)
 		_ = os.WriteFile(priv, []byte(`"`+strings.Repeat("x", cliPrivateCredMaxBytes)+`"`), 0o600)
 		h.writeBack()
-		if read(host) != `{"v":1}` {
+		if read(host) != hostOrig {
 			t.Fatal("oversized credential written back")
 		}
 	})
 	t.Run("host changed concurrently", func(t *testing.T) {
 		h, host, priv := newHome(t)
-		_ = os.WriteFile(host, []byte(`{"v":"host"}`), 0o600)
-		_ = os.WriteFile(priv, []byte(`{"v":2}`), 0o600)
+		_ = os.WriteFile(host, []byte(`{"access_token":"host","refresh_token":"r1"}`), 0o600)
+		_ = os.WriteFile(priv, []byte(`{"access_token":"a2","refresh_token":"r1"}`), 0o600)
 		h.writeBack()
-		if read(host) != `{"v":"host"}` {
+		if read(host) != `{"access_token":"host","refresh_token":"r1"}` {
 			t.Fatalf("concurrent host refresh clobbered: %q", read(host))
 		}
 	})
@@ -704,7 +719,8 @@ func TestAuditFix_ProviderWorkerEnvSet(t *testing.T) {
 }
 
 // runWrappedCLIForTest mirrors the production start sequence: Start, then
-// cliAfterStart on the same goroutine, then Wait.
+// cliAfterStart on the same goroutine, then Wait, then cliAfterWait, so the
+// credential write-back has finished when it returns.
 func runWrappedCLIForTest(cmd *exec.Cmd) ([]byte, error) {
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -714,6 +730,7 @@ func runWrappedCLIForTest(cmd *exec.Cmd) ([]byte, error) {
 	}
 	cliAfterStart(cmd)
 	err := cmd.Wait()
+	cliAfterWait(cmd)
 	return buf.Bytes(), err
 }
 

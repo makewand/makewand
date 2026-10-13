@@ -38,6 +38,24 @@ class ProcessExecutionError(str):
         return value
 
 
+class CapturedStderr(str):
+    """A process's stderr text; `apart` is False when stream mode merged it into stdout."""
+    def __new__(cls, text, apart=True):
+        value = super().__new__(cls, text)
+        value.apart = apart
+        return value
+
+
+def stderr_captured_apart(stderr, stream: bool) -> bool:
+    """Whether run_subprocess kept stderr apart from stdout for this result.
+
+    run_subprocess says so itself (CapturedStderr). For other runners and test
+    doubles the historical contract holds: stream mode merges stderr into stdout.
+    """
+    apart = getattr(stderr, "apart", None)
+    return not stream if apart is None else bool(apart)
+
+
 def is_process_timeout(error):
     """Timeout evidence belongs to the runner, never partial model output."""
     import re
@@ -264,6 +282,7 @@ def run_subprocess(
     pass_fds: tuple = (),
     preexec_fn: Optional[Callable[[], None]] = None,
     extra_env: Optional[dict] = None,
+    separate_stderr: bool = False,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command with one deadline and a shared raw stdout/stderr byte limit.
@@ -274,21 +293,29 @@ def run_subprocess(
     Cleanup has a bounded termination grace after the deadline. Bytes already
     written cannot be undone; uninterruptible kernel I/O is not a hard-real-time
     cancellation guarantee.
+    Stream mode merges stderr into stdout unless `separate_stderr` is set: then
+    both are displayed live (stderr whole lines at a time) and captured apart,
+    so a caller can tell the CLI's own stderr lines from the answer on stdout.
+    Native Windows (windows_process) honours the same contract. The returned
+    stderr is a CapturedStderr (see stderr_captured_apart).
     Returns: (returncode, stdout, stderr, exception_or_timeout_msg)
     """
     if os.name == "nt":
         from makewand.windows_process import run_windows_subprocess
         return run_windows_subprocess(cmd, timeout, cwd, input_text, stream, print_prefix, pass_fds,
-                                      output_limit=MAX_OUTPUT_BYTES, stream_queue_limit=MAX_STREAM_QUEUE_BYTES)
+                                      output_limit=MAX_OUTPUT_BYTES, stream_queue_limit=MAX_STREAM_QUEUE_BYTES,
+                                      separate_stderr=separate_stderr)
     scope = get_current_contestant_scope()
+    merge_stderr = stream and not separate_stderr
     if scope and scope.cancel_event.is_set():
-        return -1, "", "", ProcessExecutionError("Command cancelled by competitor win", "CANCELLED")
+        return -1, "", CapturedStderr("", not merge_stderr), ProcessExecutionError("Command cancelled by competitor win", "CANCELLED")
     proc = None
     selector = None
     cleaned_group = False
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     total_bytes = 0
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace") if stream else None
+    decoders = {name: codecs.getincrementaldecoder("utf-8")(errors="replace") for name in ("stdout", "stderr")} if stream else None
+    pending_stderr = []  # an unfinished stderr line, displayed once complete
     display_target = sys.stdout
     display_proc = None
     display_queue = bytearray()
@@ -318,14 +345,25 @@ def run_subprocess(
         if pipe is not None and not pipe.closed:
             pipe.close()
 
-    def display(data, *, final=False):
+    def display(data, *, source="stdout", final=False):
         nonlocal display_proc, display_finalized
-        if decoder is None:
+        if decoders is None:
             return
         if display_finalized:
             return
-        text = decoder.decode(data, final=final)
-        display_finalized = final
+        if final:
+            text = (decoders["stdout"].decode(data, final=True) + "".join(pending_stderr)
+                    + decoders["stderr"].decode(b"", final=True))
+            pending_stderr.clear()
+            display_finalized = True
+        elif source == "stderr":
+            # Whole stderr lines only, so a CLI message is not cut into the answer.
+            joined = "".join(pending_stderr) + decoders["stderr"].decode(data)
+            cut = joined.rfind("\n") + 1
+            text = joined[:cut]
+            pending_stderr[:] = [joined[cut:]] if cut < len(joined) else []
+        else:
+            text = decoders["stdout"].decode(data)
         if text:
             text = text.replace("\n", f"\n{print_prefix} ") if print_prefix else text
             if type(display_target) is io.StringIO:
@@ -360,7 +398,7 @@ def run_subprocess(
         if not stream:  # Preserve the former text-mode universal-newline behavior.
             out = out.replace("\r\n", "\n").replace("\r", "\n")
             err = err.replace("\r\n", "\n").replace("\r", "\n")
-        return code, out, err, error
+        return code, out, CapturedStderr(err, not merge_stderr), error
 
     try:
         if not math.isfinite(timeout) or timeout <= 0:
@@ -383,7 +421,7 @@ def run_subprocess(
             shell=isinstance(cmd, str),
             stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT if stream else subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             text=False,
             bufsize=0,
             cwd=cwd,
@@ -470,7 +508,7 @@ def run_subprocess(
                 accepted = chunk[:available]
                 captured[key.data].extend(accepted)
                 total_bytes += len(accepted)
-                display(accepted)
+                display(accepted, source=key.data)
                 if len(chunk) > available:
                     cleanup_group()
                     return result(-1, ProcessExecutionError(

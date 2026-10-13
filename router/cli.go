@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -398,6 +400,7 @@ func (c *CLIProvider) healthCheck() bool {
 	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
+		cliAfterWait(cmd) // nothing ran: a private home is removed at once
 		return false
 	}
 	cliAfterStart(cmd)
@@ -409,7 +412,12 @@ func (c *CLIProvider) healthCheck() bool {
 		done <- cmd.Wait()
 	}()
 
-	return c.waitHealthProbe(ctx, done, capture, func() { killCLIProcess(cmd) })
+	available := c.waitHealthProbe(ctx, done, capture, func() { killCLIProcess(cmd) })
+	// A probe run in a sandbox with a private provider home (a probe command
+	// wrapped by wrapCLICommandWithSandbox) may refresh tokens too: they are
+	// on the host before the probe reports (bounded, see cliAfterWait).
+	cliAfterWait(cmd)
+	return available
 }
 
 // waitHealthProbe joins the supervised probe before classifying its outcome.
@@ -582,13 +590,14 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 	started := time.Now()
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
+		cliAfterWait(cmd) // nothing ran: the private home is removed at once
 		contextErr := ctx.Err()
 		_ = stdoutPipe.Close()
 		_ = stdoutWriter.Close()
 		cancel()
 		cleanupWorkDir()
 		if contextErr != nil {
-			return nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), err, errors.Join(contextErr, err), time.Since(started))
+			return nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, err, errors.Join(contextErr, err), time.Since(started))
 		}
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
@@ -621,6 +630,10 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 			waitErr := cmd.Wait()
 			killCLIProcess(cmd)
 			_ = stdoutWriter.Close()
+			// The outcome, and with it the terminal chunk, waits for the
+			// sandbox's credential write-back (bounded, see cliAfterWait):
+			// a refreshed token is on the host before the stream ends.
+			cliAfterWait(cmd)
 			waitDone <- waitErr
 		}()
 
@@ -725,7 +738,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 					waitErr = errors.New("CLI reported an error")
 				}
 			}
-			ch <- StreamChunk{Error: c.formatExecutionError(stdout, capture.StderrString(), waitErr, nil, duration)}
+			ch <- StreamChunk{Error: c.formatExecutionError(stdout, capture.StderrString(), prompt, waitErr, nil, duration)}
 			return
 		}
 
@@ -1098,8 +1111,9 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	start := time.Now()
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
+		cliAfterWait(cmd) // nothing ran: the private home is removed at once
 		if contextErr := ctx.Err(); contextErr != nil {
-			return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), err, errors.Join(contextErr, err), time.Since(start))
+			return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, err, errors.Join(contextErr, err), time.Since(start))
 		}
 		return "", nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
@@ -1121,16 +1135,21 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	}
 
 	duration := time.Since(start)
+	// The sandbox has exited: its credential write-back lands on the host
+	// before the attempt returns (bounded, see cliAfterWait), so the caller,
+	// a retry and the next run all see a refreshed token.
+	cliAfterWait(cmd)
+
 	if capture.Exceeded() {
 		return "", nil, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
 	}
 	if runErr != nil {
-		return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), runErr, ctx.Err(), duration)
+		return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, runErr, ctx.Err(), duration)
 	}
 
 	raw := capture.StdoutBytes()
 	if c.name == "claude-cli" && claudeCLIErrorMessage(raw) != "" {
-		return "", nil, c.formatExecutionError(raw, capture.StderrString(), errors.New("CLI reported an error"), ctx.Err(), duration)
+		return "", nil, c.formatExecutionError(raw, capture.StderrString(), prompt, errors.New("CLI reported an error"), ctx.Err(), duration)
 	}
 
 	// Try structured JSON parsing when the CLI was invoked with a JSON output flag.
@@ -1399,21 +1418,38 @@ func claudeCLIErrorMessage(raw []byte) string {
 	return claudeCLIErrorFallback
 }
 
-func (c *CLIProvider) formatExecutionError(stdout []byte, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+// formatExecutionError classifies a failed run of c's CLI. prompt is the
+// prompt as sent: codex echoes it into its transcript, and the echo is never
+// its own message.
+func (c *CLIProvider) formatExecutionError(stdout []byte, stderr, prompt string, runErr error, ctxErr error, duration time.Duration) error {
+	if err := cliOutcomeError(c.provider, runErr, ctxErr, duration); err != nil {
+		return err
+	}
+	cli := c.messageCatalogName()
+	quota := cliQuotaRefusal(cli, stderr, prompt)
 	if c.name == "claude-cli" {
 		message := claudeCLIErrorMessage(stdout)
 		if strings.TrimSpace(stderr) == "" {
-			stderr = message
-		} else if looksLikeQuotaExhaustion(message) && !looksLikeQuotaExhaustion(stderr) {
+			stderr, quota = message, cliQuotaRefusal(cli, message, prompt)
+		} else if !quota && cliQuotaRefusal(cli, message, prompt) {
 			// Keep stderr first, but retain an explicit limit from the failure
 			// envelope so a generic CLI warning cannot hide an exhausted pool.
-			stderr = strings.TrimSpace(stderr) + "\n" + message
+			stderr, quota = strings.TrimSpace(stderr)+"\n"+message, true
 		}
 	}
-	return formatCLIExecutionError(c.provider, stderr, runErr, ctxErr, duration)
+	return cliFailureError(c.provider, stderr, quota, runErr)
 }
 
 func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+	if err := cliOutcomeError(provider, runErr, ctxErr, duration); err != nil {
+		return err
+	}
+	return cliFailureError(provider, stderr, looksLikeQuotaExhaustion(provider, stderr), runErr)
+}
+
+// cliOutcomeError is the error of a run that ended without a complete exit
+// result (context done, killed, pipes held open), nil for a CLI failure.
+func cliOutcomeError(provider string, runErr error, ctxErr error, duration time.Duration) error {
 	if ctxErr != nil {
 		return formatCLIContextError(provider, ctxErr, duration)
 	}
@@ -1421,7 +1457,12 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 	if errors.Is(runErr, exec.ErrWaitDelay) || (errors.As(runErr, &exitErr) && exitErr.ExitCode() < 0) {
 		return &execution.UnknownOutcomeError{Err: fmt.Errorf("%s CLI terminated without a complete exit/output result: %w", provider, runErr)}
 	}
+	return nil
+}
 
+// cliFailureError is the error of a CLI that exited with a failure; quota
+// tells whether stderr carries the CLI's own quota or rate-limit refusal.
+func cliFailureError(provider, stderr string, quota bool, runErr error) error {
 	errMsg := strings.TrimSpace(stderr)
 	if errMsg == "" {
 		errMsg = runErr.Error()
@@ -1430,8 +1471,9 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 	// usage-limit message on stderr, not an HTTP 429 (that path only exists for
 	// the API transports). Classify these as ErrorKindRateLimit so the quota
 	// layer seals the pool until its window resets, instead of only tripping the
-	// circuit breaker after repeated failures.
-	if looksLikeQuotaExhaustion(errMsg) {
+	// circuit breaker after repeated failures. Only provider's own message
+	// counts, read from stderr as the CLI wrote it (indentation included).
+	if quota {
 		return newProviderError(provider, "CLI", ErrorKindRateLimit, true, 429, errMsg, runErr)
 	}
 	base := newProviderError(provider, "CLI", ErrorKindProvider, false, 0, errMsg, runErr)
@@ -1441,37 +1483,1502 @@ func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error
 	return base
 }
 
-// quotaExhaustionHints are substrings (lower-cased) that subscription CLIs emit
-// when a session/weekly limit is hit. Kept broad on purpose: the exact wording
-// is vendor-controlled and undocumented, and a false positive only costs a
-// temporary reroute to another pool (recoverable), whereas a miss leaves the
-// exhausted pool active. Word-boundary-ish phrases avoid matching unrelated text
-// (e.g. a user prompt that merely contains "quota").
-var quotaExhaustionHints = []string{
-	"usage limit",
-	"monthly spend limit",
-	"rate limit",
-	"quota exceeded",
-	"quota exhausted",
-	"out of quota",
-	"insufficient_quota",
-	"too many requests",
-	"resets at",
-	"limit reached",
-	"429",
+// --- Provider CLI messages ---
+//
+// A quota or rate-limit refusal seals a pool only when the provider CLI printed
+// it itself, at the start of a line that CLI writes. The same words in the
+// model's answer, in tool output a codex transcript relays ("Error: 429 Too Many
+// Requests", "HTTP/2 429", "429 passed") or in prose are task content: sealing a
+// pool on them would reroute healthy work until the pool's window resets.
+//
+// What each CLI prints, and which of its lines count, is data:
+// makewand/cli_message_catalog.json (its "_doc" describes the format), which
+// makewand/health.py reads and cli_message_catalog.json here mirrors byte for
+// byte. findCLIMessages is health.py's find_cli_messages with the same line
+// selection, and cliCatalogRegexp compiles each pattern to match what Python's
+// re matches, so both sides reach the same verdict on the same output
+// (tests/testdata/cli_message_parity.json, checked by Go and Python tests).
+
+//go:embed cli_message_catalog.json
+var cliMessageCatalogJSON []byte
+
+var cliMessages = mustLoadCLIMessageCatalog(cliMessageCatalogJSON)
+
+// quotaExhaustionKinds are the catalog kinds that seal a pool: a hard usage,
+// spend or credit limit ("quota") and a request-rate refusal ("rate"). Server
+// capacity refusals ("overload", Claude's 529) are transient, not exhaustion.
+var quotaExhaustionKinds = []string{"quota", "rate"}
+
+// looksLikeQuotaExhaustion reports whether stderr, captured apart from the
+// answer, carries a quota, usage-limit or request-rate refusal that provider's
+// CLI printed itself (see cliQuotaRefusal). Another CLI's formats never count.
+func looksLikeQuotaExhaustion(provider, stderr string) bool {
+	return cliQuotaRefusal(cliCatalogName(provider), stderr, "")
 }
 
-// looksLikeQuotaExhaustion reports whether a CLI error message indicates the
-// subscription's quota/rate limit was hit (as opposed to a generic failure).
-func looksLikeQuotaExhaustion(msg string) bool {
-	lower := strings.ToLower(msg)
-	for _, hint := range quotaExhaustionHints {
-		if strings.Contains(lower, hint) {
+// cliQuotaRefusal reports whether stderr carries a quota or rate refusal of
+// cli: health.py's find_cli_messages(<cli>, ("quota", "rate"), "", stderr,
+// prompt=prompt). A CLI the catalog does not know is read with the generic
+// entry (cliGenericEntry).
+func cliQuotaRefusal(cli, stderr, prompt string) bool {
+	entry := cliMessages.providers[cli]
+	if entry == nil {
+		entry = cliGenericEntry(cli)
+	}
+	streams := cliStreams{stderr: stderr, apart: true}
+	return len(cliMessages.find(entry, quotaExhaustionKinds, streams, prompt)) > 0
+}
+
+// cliCatalogName is the catalog entry of a router provider or CLI name: the
+// entry of that name or of the CLI that prints that name for itself
+// ("antigravity"). Any other name is returned as is.
+func cliCatalogName(provider string) string {
+	if _, ok := cliMessages.providers[provider]; ok {
+		return provider
+	}
+	if name, ok := cliMessages.names[provider]; ok {
+		return name
+	}
+	return provider
+}
+
+// messageCatalogName is the catalog entry of the CLI c runs. A built-in
+// transport reads its own CLI's entry: agy (NewAgyCLI) and the older Gemini
+// CLI (NewGeminiCLI) both serve the router name "gemini" and print different
+// messages. A custom command reads the entry of its provider name.
+func (c *CLIProvider) messageCatalogName() string {
+	if cli, ok := strings.CutSuffix(c.name, "-cli"); ok {
+		if _, known := cliMessages.providers[cli]; known {
+			return cli
+		}
+	}
+	return cliCatalogName(c.provider)
+}
+
+// cliGenericKinds are the refusals of a CLI the catalog does not know (a
+// custom command): the phrases a quota or rate-limit error starts with, in
+// the catalog's dialect. As for a catalog CLI they count only at the start of
+// a message, and only in the error report the CLI ends with.
+var cliGenericKinds = map[string][]string{
+	"quota": {
+		`(?:(?:usage|spend|spending|credit|token|request|hourly|daily|weekly|monthly|session|5-hour|five-hour|plan|account|api) ){1,2}limit (?:reached|exceeded)\b`,
+		`limit (?:reached|exceeded)(?:$|[.!:;,·•∙|(]| -)`,
+		`(?:(?:usage|api|hourly|daily|weekly|monthly|project|individual|account|plan|token|request) )?quota (?:exceeded|exhausted|reached)\b`,
+		`insufficient[_ ]quota\b`,
+		`(?:you(?:'re| are) )?out of (?:quota|credits?|usage(?: credits)?)\b`,
+		`you(?:'ve| have) (?:hit|reached|exceeded|exhausted|used up) (?:your|the) (?:[\w'$-]+ ){0,4}?(?:limit|quota|budget|cap|credits)\b`,
+		`resource[_ ]?exhausted\b`,
+	},
+	"rate": {
+		`(?:[\w-]+\.)*rate[ _-]?limit(?:ed\b|[ _-]?(?:exceeded|reached|hit|error)\b)`,
+		`too many requests\b`,
+		`(?:http|status|error)(?: code)?[ :]+429\b`,
+		`429(?:$|:| too many requests\b)`,
+	},
+}
+
+// cliGeneric is the compiled generic entry, without a CLI name.
+var cliGeneric = mustCompileCLIGenericEntry()
+
+func mustCompileCLIGenericEntry() *cliCatalogEntry {
+	entry := &cliCatalogEntry{
+		ownStreams: []string{"stderr"},
+		selection:  map[string]string{"apart": "final_report", "merged": "final_report"},
+		kinds:      map[string]*regexp.Regexp{},
+	}
+	for kind, patterns := range cliGenericKinds {
+		re, err := cliCatalogRegexp(cliAlternation(patterns))
+		if err != nil {
+			panic("router: generic CLI messages: " + err.Error())
+		}
+		entry.kinds[kind] = re
+	}
+	return entry
+}
+
+// cliGenericEntry is the generic entry for the CLI named name, which it may
+// print in front of its lines ("name: quota exceeded").
+func cliGenericEntry(name string) *cliCatalogEntry {
+	entry := *cliGeneric
+	if name != "" {
+		entry.own, _ = cliCatalogRegexp("(?:" + regexp.QuoteMeta(name) + ")" + cliMessages.nameSeparator)
+	}
+	return &entry
+}
+
+// cliStreams is what a CLI printed: one merged stream (output), or stdout
+// (output) and stderr captured apart.
+type cliStreams struct {
+	output, stderr string
+	apart          bool
+}
+
+// cliLine is a line a CLI may have written itself (health.py _cli_lines).
+type cliLine struct {
+	message string // where its message starts
+	line    string // the normalized line
+	marked  bool   // an error marker leads the message
+	chain   bool   // an entry of an anyhow "Caused by:" chain
+}
+
+// cliMessageCatalog is the compiled catalog.
+type cliMessageCatalog struct {
+	glogHeader, tracing, causedBy, causedByEntry, topLevel, marker, markedBracket, leadIn *regexp.Regexp
+
+	nameSeparator                           string
+	tracingLevel, tracingTarget             int // subexpressions of tracing
+	markerGlyph, markerBracket, markerError int // subexpressions of marker
+
+	providers map[string]*cliCatalogEntry
+	names     map[string]string // a name a CLI prints in front of its lines -> its entry
+}
+
+// cliCatalogEntry is one provider CLI of the catalog.
+type cliCatalogEntry struct {
+	ownStreams  []string
+	selection   map[string]string // "apart"/"merged" -> "lines", "final_report" or "transcript"
+	transcript  *cliTranscript
+	kinds       map[string]*regexp.Regexp // "quota", "quota.marked", ...: one alternation each
+	own         *regexp.Regexp            // its names as it prints them in front of its lines
+	jsonReports bool                      // a JSON object it prints over several lines is one line
+}
+
+// cliTranscript is codex exec's transcript structure (providers.codex.transcript).
+type cliTranscript struct {
+	banner, section, promptEcho, execResult, errorEvent, ownError, tracingTarget *regexp.Regexp
+	fatalError, fatalAfter                                                       *regexp.Regexp // nil: no fatal report
+}
+
+func mustLoadCLIMessageCatalog(data []byte) *cliMessageCatalog {
+	catalog, err := loadCLIMessageCatalog(data)
+	if err != nil {
+		panic("router: cli_message_catalog.json: " + err.Error())
+	}
+	return catalog
+}
+
+func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
+	var file struct {
+		Lines     map[string]string `json:"lines"`
+		Providers map[string]struct {
+			Names      []string          `json:"names"`
+			OwnStreams []string          `json:"own_streams"`
+			Selection  map[string]string `json:"selection"`
+			Transcript *struct {
+				Banner        string   `json:"banner"`
+				Section       string   `json:"section"`
+				PromptEcho    string   `json:"prompt_echo"`
+				ExecResult    string   `json:"exec_result"`
+				ErrorEvent    string   `json:"error_event"`
+				OwnError      []string `json:"own_error"`
+				TracingTarget string   `json:"tracing_target"`
+				FatalError    string   `json:"fatal_error"`
+				FatalAfter    string   `json:"fatal_after"`
+			} `json:"transcript"`
+			Kinds       map[string][]string `json:"kinds"`
+			JSONReports any                 `json:"json_reports"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		return nil, err
+	}
+	var firstErr error
+	fail := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	compile := func(name, pattern string) *regexp.Regexp {
+		if pattern == "" {
+			fail(fmt.Errorf("%s: missing", name))
+			return nil
+		}
+		re, err := cliCatalogRegexp(pattern)
+		if err != nil {
+			fail(fmt.Errorf("%s: %w", name, err))
+		}
+		return re
+	}
+	line := func(name string) *regexp.Regexp { return compile("lines."+name, file.Lines[name]) }
+	c := &cliMessageCatalog{
+		glogHeader:    line("glog_header"),
+		tracing:       line("tracing"),
+		causedBy:      line("caused_by"),
+		causedByEntry: line("caused_by_entry"),
+		topLevel:      line("top_level"),
+		marker:        line("marker"),
+		markedBracket: line("marked_bracket"),
+		leadIn:        line("lead_in"),
+		nameSeparator: file.Lines["name_separator"],
+		providers:     map[string]*cliCatalogEntry{},
+		names:         map[string]string{},
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	subexp := func(re *regexp.Regexp, name string) int {
+		index := re.SubexpIndex(name)
+		if index < 0 {
+			fail(fmt.Errorf("lines: no (?P<%s>...) group", name))
+		}
+		return index
+	}
+	c.tracingLevel, c.tracingTarget = subexp(c.tracing, "level"), subexp(c.tracing, "target")
+	c.markerGlyph, c.markerBracket, c.markerError = subexp(c.marker, "glyph"), subexp(c.marker, "bracket"), subexp(c.marker, "error")
+	// optional compiles a pattern the catalog may leave out.
+	optional := func(name, pattern string) *regexp.Regexp {
+		if pattern == "" {
+			return nil
+		}
+		return compile(name, pattern)
+	}
+	for name, spec := range file.Providers {
+		prefix := "providers." + name + "."
+		entry := &cliCatalogEntry{ownStreams: spec.OwnStreams, selection: spec.Selection, kinds: map[string]*regexp.Regexp{},
+			jsonReports: spec.JSONReports == true} // health.py: entry.get("json_reports") is True
+		for kind, patterns := range spec.Kinds {
+			if len(patterns) > 0 {
+				entry.kinds[kind] = compile(prefix+"kinds."+kind, cliAlternation(patterns))
+			}
+		}
+		if t := spec.Transcript; t != nil {
+			entry.transcript = &cliTranscript{
+				banner:        compile(prefix+"transcript.banner", t.Banner),
+				section:       compile(prefix+"transcript.section", t.Section),
+				promptEcho:    compile(prefix+"transcript.prompt_echo", t.PromptEcho),
+				execResult:    compile(prefix+"transcript.exec_result", t.ExecResult),
+				errorEvent:    compile(prefix+"transcript.error_event", t.ErrorEvent),
+				ownError:      compile(prefix+"transcript.own_error", cliAlternation(t.OwnError)),
+				tracingTarget: compile(prefix+"transcript.tracing_target", t.TracingTarget),
+				fatalError:    optional(prefix+"transcript.fatal_error", t.FatalError),
+				fatalAfter:    optional(prefix+"transcript.fatal_after", t.FatalAfter),
+			}
+		}
+		if len(spec.Names) > 0 {
+			// health.py _cli_name_regex: (?:<name>|...)<name_separator>.
+			quoted := make([]string, len(spec.Names))
+			for i, cliName := range spec.Names {
+				quoted[i] = regexp.QuoteMeta(cliName)
+				if other, taken := c.names[cliName]; taken && other != name {
+					fail(fmt.Errorf("%snames: %q is also %s's", prefix, cliName, other))
+				}
+				c.names[cliName] = name
+			}
+			entry.own = compile(prefix+"names", "(?:"+strings.Join(quoted, "|")+")"+c.nameSeparator)
+		}
+		c.providers[name] = entry
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return c, nil
+}
+
+// cliAlternation joins patterns the way health.py does: (?:p1)|(?:p2)|...
+func cliAlternation(patterns []string) string {
+	if len(patterns) == 0 {
+		return ""
+	}
+	return "(?:" + strings.Join(patterns, ")|(?:") + ")"
+}
+
+// findCLIMessages returns, for each of kinds, the first (normalized) line on
+// which provider's CLI prints one of its own messages of that kind: health.py
+// find_cli_messages. provider is a catalog entry; an unknown CLI prints none.
+// prompt, the prompt as sent, lets a codex transcript skip its echo.
+func findCLIMessages(provider string, kinds []string, streams cliStreams, prompt string) map[string]string {
+	entry := cliMessages.providers[provider]
+	if entry == nil {
+		return map[string]string{}
+	}
+	return cliMessages.find(entry, kinds, streams, prompt)
+}
+
+// find is findCLIMessages for the CLI of entry.
+func (c *cliMessageCatalog) find(entry *cliCatalogEntry, kinds []string, streams cliStreams, prompt string) map[string]string {
+	found := map[string]string{}
+	type kindPatterns struct {
+		kind               string
+		standalone, marked *regexp.Regexp
+	}
+	patterns := make([]kindPatterns, len(kinds))
+	for i, kind := range kinds {
+		patterns[i] = kindPatterns{kind, entry.kinds[kind], entry.kinds[kind+".marked"]}
+	}
+	for _, selected := range c.selectedLines(entry, streams, prompt) {
+		complete := !c.messageStarts(selected.message, selected.marked, entry.own, func(start string, marked bool) bool {
+			for _, p := range patterns {
+				if _, ok := found[p.kind]; ok {
+					continue
+				}
+				if (p.standalone != nil && p.standalone.MatchString(start)) ||
+					(marked && p.marked != nil && p.marked.MatchString(start)) {
+					found[p.kind] = selected.line
+				}
+			}
+			return len(found) < len(patterns)
+		})
+		if complete {
+			break
+		}
+	}
+	return found
+}
+
+// selectedLines picks the lines of streams that entry's CLI wrote itself, by
+// the catalog's selection for how the streams were captured (health.py
+// _cli_selected_lines).
+func (c *cliMessageCatalog) selectedLines(entry *cliCatalogEntry, streams cliStreams, prompt string) []cliLine {
+	mode := "merged"
+	if streams.apart {
+		mode = "apart"
+	}
+	selection, ok := entry.selection[mode]
+	if !ok {
+		selection = "lines"
+	}
+	if selection == "final_report" {
+		// Every stream ends with its own last lines: with the streams captured
+		// apart, the report each of the CLI's own streams ends with counts.
+		parts := []string{streams.output}
+		if streams.apart {
+			parts = parts[:0]
+			if slices.Contains(entry.ownStreams, "stdout") {
+				parts = append(parts, streams.output)
+			}
+			if slices.Contains(entry.ownStreams, "stderr") {
+				parts = append(parts, streams.stderr)
+			}
+		}
+		var report []cliLine
+		for _, part := range parts {
+			report = append(report, c.finalReport(c.lines(c.tail(part, nil, ""), entry, nil, ""), entry.own)...)
+		}
+		return report
+	}
+	var transcript *cliTranscript
+	echo := "" // only a transcript echoes the prompt
+	if selection == "transcript" {
+		transcript, echo = entry.transcript, prompt
+	}
+	return c.lines(c.tail(entry.ownOutput(streams), transcript, echo), entry, transcript, prompt)
+}
+
+// ownOutput is the text in which the CLI prints its own messages (health.py
+// cli_own_output): a merged stream whole; with the streams captured apart only
+// its own streams, so the model's answer on stdout is never its verdict.
+func (e *cliCatalogEntry) ownOutput(streams cliStreams) string {
+	if !streams.apart {
+		return streams.output
+	}
+	var parts []string
+	if streams.output != "" && slices.Contains(e.ownStreams, "stdout") {
+		parts = append(parts, streams.output)
+	}
+	if streams.stderr != "" && slices.Contains(e.ownStreams, "stderr") {
+		parts = append(parts, streams.stderr)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// cliText is the part of a CLI's output that lines reads: all of it, or the
+// tail of a long output (tail) with what comes before it carried over.
+type cliText struct {
+	text string
+	// before: the output before text, when text is the tail of a longer
+	// output. A transcript may then be inside a section whose header the tail
+	// does not show.
+	before string
+	// openFence: a markdown fence opened before text is still open.
+	openFence bool
+	// glog: before has glog lines, so glog entries are skipped in text too;
+	// glogFollow: text may start inside a glog entry whose header is too far
+	// back to read (its lines up to the entry's end are skipped).
+	glog, glogFollow bool
+}
+
+// lines returns every line of output the CLI may have written itself
+// (health.py _cli_lines). Skipped as diagnostics or task content: glog
+// entries, lines inside closed markdown fences, indented lines (code, tool
+// results) and tracing lines below ERROR. The indented entries of an anyhow
+// "Caused by:" chain and ERROR tracing lines count as marked. With
+// entry.jsonReports a JSON object printed over several lines is one line
+// (cliJSONReports). With transcript (codex exec), a text with transcript
+// structure keeps only the CLI's marked lines outside the sections, plus its
+// own error events, which end a section, and the fatal report the text ends
+// with; the echo of prompt is skipped whatever it contains. The tail of a
+// longer output is a transcript when it or the output's first lines show that
+// structure, and it starts inside a section it does not name: up to its first
+// section header only codex's own error events count, and no fatal report
+// follows that section. What a section longer than the tail ends with may so
+// be missed, never task content taken for a refusal.
+func (c *cliMessageCatalog) lines(output cliText, entry *cliCatalogEntry, transcript *cliTranscript, prompt string) []cliLine {
+	lines := pySplitLines(output.text)
+	skipped := map[int]bool{}
+	if output.glog || cliHasGlog(output.text) {
+		skipped = c.glogEntryLines(lines, output.glogFollow)
+	}
+	// Markdown code fences belong to the model's answer: what it quotes inside a
+	// closed fence is task content. An unclosed (truncated) fence hides nothing.
+	var fences []int
+	if output.openFence {
+		fences = append(fences, -1)
+	}
+	for i, raw := range lines {
+		if trimmed := pyLStrip(raw); strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			fences = append(fences, i)
+		}
+	}
+	for i := 0; i+1 < len(fences); i += 2 {
+		for j := max(fences[i], 0); j <= fences[i+1]; j++ {
+			skipped[j] = true
+		}
+	}
+	var reports map[int]string
+	if entry.jsonReports {
+		reports = cliJSONReports(lines, skipped)
+	}
+	normalized := make([]string, len(lines)) // "" for a skipped line, like health.py's None
+	for i, raw := range lines {
+		if skipped[i] {
+			continue
+		}
+		if report, ok := reports[i]; ok {
+			normalized[i] = normalizeCLIText(truncateRunes(report, 4*cliMessageMaxChars))
+		} else {
+			normalized[i] = normalizeCLILine(raw)
+		}
+	}
+	section := false
+	if transcript != nil {
+		if slices.ContainsFunc(normalized, func(line string) bool { return line != "" && transcript.startsSection(line) }) ||
+			(output.before != "" && transcript.headStartsSection(output.before)) {
+			section = output.before != ""
+		} else {
+			transcript = nil
+		}
+	}
+	var echoes map[int]int
+	fatal := len(lines)
+	if transcript != nil {
+		echoes = transcript.promptEchoes(lines, normalized, prompt)
+		fatal = transcript.fatalReportStart(c, lines, normalized)
+	}
+	var selected []cliLine
+	chain := false
+	header := "" // the header of the current section
+	skipUntil := 0
+	for i, raw := range lines {
+		line := normalized[i]
+		if i < skipUntil {
+			continue
+		}
+		if i == fatal && section && transcript.fatalAfter.MatchString(header) {
+			section = false // the fatal report the text ends with is the CLI's own
+		}
+		if line == "" {
+			chain = false
+			continue
+		}
+		bare := cliBareStart(raw)
+		indented := strings.HasPrefix(bare, "\t") || strings.HasPrefix(bare, "  ")
+		if chain && indented {
+			message := line
+			if m := c.causedByEntry.FindStringIndex(line); m != nil {
+				message = line[m[1]:]
+			}
+			selected = append(selected, cliLine{message: message, line: line, marked: true, chain: true})
+			continue
+		}
+		chain = false
+		var tracing []int
+		if '0' <= line[0] && line[0] <= '9' { // tracing lines start with a timestamp
+			tracing = c.tracing.FindStringSubmatchIndex(line)
+		}
+		errorTracing := tracing != nil && cliSubmatch(line, tracing, c.tracingLevel) == "ERROR"
+		if transcript != nil {
+			if end, ok := echoes[i]; ok {
+				skipUntil, section = end, false
+				continue
+			}
+			if transcript.startsSection(line) {
+				section, header = true, line
+				continue
+			}
+			if section {
+				// codex prints its events unindented; an indented copy is content.
+				message, event := "", false
+				if first, _ := utf8.DecodeRuneInString(bare); bare == "" || !pyIsSpace(first) {
+					message, event = transcript.ownErrorMessage(line)
+				}
+				if !event {
+					if errorTracing && transcript.tracingTarget.MatchString(cliSubmatch(line, tracing, c.tracingTarget)) {
+						selected = append(selected, cliLine{message: line[tracing[1]:], line: line, marked: true})
+					}
+					continue
+				}
+				section = false
+				selected = append(selected, cliLine{message: message, line: line, marked: true})
+				continue
+			}
+		}
+		if indented {
+			continue
+		}
+		if c.causedBy.MatchString(line) {
+			chain = true
+			continue
+		}
+		if tracing != nil {
+			if errorTracing {
+				selected = append(selected, cliLine{message: line[tracing[1]:], line: line, marked: true})
+			}
+			continue
+		}
+		if transcript != nil && !c.startsMarked(line, entry.own) {
+			continue // codex's own lines outside the sections carry its markers
+		}
+		selected = append(selected, cliLine{message: line, line: line})
+	}
+	return selected
+}
+
+// finalReport is the error report a CLI ends with: its last line and its last
+// marked line, each with the "Caused by:" chain entries that follow it
+// (health.py _final_report). The answer, and the tool output it quotes, comes
+// before the CLI's verdict.
+func (c *cliMessageCatalog) finalReport(selected []cliLine, own *regexp.Regexp) []cliLine {
+	if len(selected) == 0 {
+		return nil
+	}
+	last := len(selected) - 1
+	for last > 0 && selected[last].chain { // a chain entry: the report starts at its head
+		last--
+	}
+	heads := []int{last}
+	marked := -1
+	for i, s := range selected {
+		if !s.chain && (s.marked || c.startsMarked(s.message, own)) {
+			marked = i
+		}
+	}
+	if marked >= 0 && marked != last {
+		heads = append(heads, marked)
+		slices.Sort(heads)
+	}
+	var report []cliLine
+	for _, head := range heads {
+		end := head + 1
+		for end < len(selected) && selected[end].chain {
+			end++
+		}
+		report = append(report, selected[head:end]...)
+	}
+	return report
+}
+
+// messageStarts calls yield(start, marked) for every place in message a CLI
+// message may start (health.py _message_starts) until yield returns false,
+// and reports whether it ran to the end: message itself, then what follows
+// each element the CLI prints in front of its own messages (its name, an error
+// glyph, a bracketed timestamp or level, an error marker, a gRPC status code),
+// at most 8 times; behind an error marker (marked) also what follows the first
+// lead-in clause ("Error: turn failed: <message>").
+func (c *cliMessageCatalog) messageStarts(message string, marked bool, own *regexp.Regexp, yield func(start string, marked bool) bool) bool {
+	rest := message
+	for range 8 {
+		if rest == "" {
+			return true
+		}
+		if !yield(rest, marked) {
+			return false
+		}
+		var m []int
+		if own != nil {
+			m = own.FindStringIndex(rest)
+		}
+		if m == nil {
+			if m = c.marker.FindStringSubmatchIndex(rest); m != nil {
+				marked = marked || m[2*c.markerGlyph] >= 0 || m[2*c.markerError] >= 0 ||
+					(m[2*c.markerBracket] >= 0 && c.markedBracket.MatchString(cliSubmatch(rest, m, c.markerBracket)))
+			} else if !marked {
+				return true
+			} else if m = c.leadIn.FindStringIndex(rest); m == nil {
+				return true
+			}
+		}
+		rest = rest[m[1]:]
+	}
+	return true
+}
+
+// startsMarked reports whether an error marker (glyph, "Error:", "[ERROR]"
+// ...) leads message (health.py _starts_marked).
+func (c *cliMessageCatalog) startsMarked(message string, own *regexp.Regexp) bool {
+	marked := false
+	c.messageStarts(message, false, own, func(_ string, startMarked bool) bool {
+		marked = startMarked
+		return !marked
+	})
+	return marked
+}
+
+// glogEntryLines marks the glog diagnostics in lines: each header and its
+// continuation (health.py glog_entry_lines, continuation="colon"): a logged
+// JSON body while its brackets are open, on lines shaped like JSON, and after
+// a header ending in ":" the plain lines up to the next blank, glog or
+// top-level line ("Error:", "warning:", "Caused by:"). follow starts the
+// lines inside such a continuation.
+func (c *cliMessageCatalog) glogEntryLines(lines []string, follow bool) map[int]bool {
+	skipped := map[int]bool{}
+	depth := 0
+	for i, raw := range lines {
+		line := pyRStrip(stripCLIANSI(raw))
+		stripped := pyStrip(line)
+		header := c.glogHeaderIndex(stripped)
+		switch {
+		case header != nil:
+			message := stripped[header[1]:]
+			depth, follow = max(0, cliBracketDepth(message)), strings.HasSuffix(message, ":")
+			skipped[i] = true
+		case depth > 0 && cliJSONBodyLine(stripped):
+			depth = max(0, depth+cliBracketDepth(line))
+			skipped[i] = true
+		case follow && stripped != "" && !c.topLevel.MatchString(normalizeCLIText(stripped)):
+			depth = max(0, depth+cliBracketDepth(line))
+			skipped[i] = true
+		default:
+			depth, follow = 0, false
+		}
+	}
+	return skipped
+}
+
+// glogHeaderIndex locates the glog header that starts stripped (a line with
+// ANSI escapes and surrounding whitespace removed), nil if none.
+func (c *cliMessageCatalog) glogHeaderIndex(stripped string) []int {
+	if stripped == "" || strings.IndexByte("IWEF", stripped[0]) < 0 {
+		return nil
+	}
+	return c.glogHeader.FindStringIndex(stripped)
+}
+
+// setsGlogState reports whether line (raw) sets glogEntryLines' state
+// whatever precedes it: a glog header, or a top-level line, which no entry
+// continues into.
+func (c *cliMessageCatalog) setsGlogState(line string) bool {
+	stripped := pyStrip(stripCLIANSI(line))
+	return c.glogHeaderIndex(stripped) != nil || (stripped != "" && c.topLevel.MatchString(normalizeCLIText(stripped)))
+}
+
+func (t *cliTranscript) startsSection(line string) bool {
+	return t.banner.MatchString(line) || t.section.MatchString(line) || t.execResult.MatchString(line)
+}
+
+// ownErrorMessage returns the message of a line that is codex's own error
+// event ("ERROR: <own error>"). error_event ends in a space, so matching
+// own_error on the rest is Python's own_error.match(line, event.end()).
+func (t *cliTranscript) ownErrorMessage(line string) (string, bool) {
+	event := t.errorEvent.FindStringIndex(line)
+	if event == nil || !t.ownError.MatchString(line[event[1]:]) {
+		return "", false
+	}
+	return line[event[1]:], true
+}
+
+// promptEchoes maps each prompt echo header followed by the prompt as sent to
+// the index after the echo.
+func (t *cliTranscript) promptEchoes(lines, normalized []string, prompt string) map[int]int {
+	var wanted []string
+	for _, line := range pySplitLines(prompt) {
+		wanted = append(wanted, pyRStrip(line))
+	}
+	echoes := map[int]int{}
+	if len(wanted) == 0 {
+		return echoes
+	}
+	for i, line := range normalized {
+		if line == "" || !t.promptEcho.MatchString(line) || i+1+len(wanted) > len(lines) {
+			continue
+		}
+		echoed := true
+		for j, want := range wanted {
+			if pyRStrip(stripCLIANSI(lines[i+1+j])) != want {
+				echoed = false
+				break
+			}
+		}
+		if echoed {
+			echoes[i] = i + 1 + len(wanted)
+		}
+	}
+	return echoes
+}
+
+// startsSectionRaw is startsSection for a line as the CLI printed it.
+func (t *cliTranscript) startsSectionRaw(raw string) bool {
+	line := normalizeCLILine(raw)
+	return line != "" && t.startsSection(line)
+}
+
+// headStartsSection reports whether one of the first lines of output starts
+// a section: whether a long output, of which only the tail is read, is a
+// transcript (codex exec prints its banner first).
+func (t *cliTranscript) headStartsSection(output string) bool {
+	head := output[:min(len(output), cliTailHeadBytes)]
+	end := 0 // the end of its first complete lines
+	for i, lines := 1, 0; i <= len(head) && lines < cliTailHeadLines; i++ {
+		if cliTerminatorBefore(head, i) > 0 {
+			end, lines = i, lines+1
+		}
+	}
+	for _, raw := range pySplitLines(head[:end]) {
+		if line := normalizeCLILine(raw); line != "" && t.startsSection(line) {
 			return true
 		}
 	}
 	return false
 }
+
+// fatalReportStart is the index of the fatal report the text ends with,
+// len(lines) without one (health.py fatal_report_start). A Rust program's
+// main prints the error it returns after everything else: "Error: <message>",
+// for an anyhow error followed by a blank line, "Caused by:" and the indented
+// chain entries; codex exec ends a failed run with it.
+func (t *cliTranscript) fatalReportStart(c *cliMessageCatalog, lines, normalized []string) int {
+	if t.fatalError == nil || t.fatalAfter == nil {
+		return len(lines)
+	}
+	indented := func(i int) bool {
+		bare := cliBareStart(lines[i])
+		return strings.HasPrefix(bare, "\t") || strings.HasPrefix(bare, "  ")
+	}
+	index := len(lines) - 1
+	for index >= 0 && normalized[index] == "" {
+		index--
+	}
+	entry := index
+	for entry >= 0 && normalized[entry] != "" && indented(entry) {
+		entry--
+	}
+	if entry < index {
+		// The text ends with indented lines: only an anyhow chain qualifies.
+		if entry < 0 || !c.causedBy.MatchString(normalized[entry]) {
+			return len(lines)
+		}
+		index = entry - 1
+		if index < 0 || normalized[index] != "" {
+			return len(lines) // anyhow puts a blank line before "Caused by:"
+		}
+		for index >= 0 && normalized[index] == "" {
+			index--
+		}
+	}
+	if index >= 0 && normalized[index] != "" && !indented(index) && t.fatalError.MatchString(normalized[index]) {
+		return index
+	}
+	return len(lines)
+}
+
+func cliSubmatch(text string, m []int, group int) string {
+	if m[2*group] < 0 {
+		return ""
+	}
+	return text[m[2*group]:m[2*group+1]]
+}
+
+// cliMessageMaxChars bounds, in characters, the part of one line that is
+// classified (health.py CLI_MESSAGE_MAX_CHARS).
+const cliMessageMaxChars = 2000
+
+var (
+	cliANSIEscape      = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|\x1b[@-Z\\\\-_]")
+	cliANSIEscapeStart = regexp.MustCompile("^(?:" + cliANSIEscape.String() + ")")
+	cliApostrophe      = strings.NewReplacer("’", "'", "‘", "'", "ʼ", "'", "′", "'")
+	// health.py _GLOG_ANYWHERE_RE (after its "(?m)^\s*") and
+	// _JSON_SCALAR_LINE_RE are str patterns without re.ASCII: Unicode \d.
+	cliGlogLineStart  = regexp.MustCompile(`^(?:\x1b\[[0-9;]*m)?[IWEF]\p{Nd}{4} +\p{Nd}{2}:\p{Nd}{2}:\p{Nd}{2}\.`)
+	cliJSONScalarLine = regexp.MustCompile(`^(?:-?\p{Nd}[\p{Nd}.eE+-]*|true|false|null),?$`)
+)
+
+// cliTailMaxLines and cliTailMaxBytes bound the part of a CLI's output that
+// is classified: its last lines, which hold the report the CLI ends with.
+// What precedes them is only scanned for the state it leaves (tail), so
+// even the largest capture (processjob.MaxOutputBytes of short lines) costs
+// little time and memory.
+const (
+	cliTailMaxLines = 8192
+	cliTailMaxBytes = 1 << 20
+	// The output a tail is cut from is a transcript when one of its first
+	// lines starts a section (headStartsSection).
+	cliTailHeadLines = 64
+	cliTailHeadBytes = 64 << 10
+	// An echo of the prompt is at most four times as long as the prompt and
+	// this much more (a CLI may decorate the lines it echoes).
+	cliEchoSlackBytes = 64 << 10
+)
+
+// tail is the part of output that is classified: all of it, or its last
+// lines, at most cliTailMaxLines lines and cliTailMaxBytes bytes but at least
+// one line. What comes before the tail is carried over where it decides what
+// is task content: a markdown fence it leaves open, a glog entry that runs
+// into it and, for a transcript, the section it starts in. The tail starts
+// early enough to read the last section header and the last line that sets
+// the glog state when they are at most cliTailMaxLines lines and
+// cliTailMaxBytes bytes further back, and with prompt (an echo of it in the
+// transcript) to hold an echo that reaches into it.
+func (c *cliMessageCatalog) tail(output string, transcript *cliTranscript, prompt string) cliText {
+	start := cliTailStart(output, cliTailMaxLines, cliTailMaxBytes)
+	if start == 0 {
+		return cliText{text: output}
+	}
+	if transcript != nil {
+		if header := cliLastLineBefore(output, start, transcript.startsSectionRaw); header >= 0 {
+			start = header
+		}
+	}
+	if prompt != "" {
+		// An echo that reaches into the tail goes on there with a line of the
+		// prompt; it is its header and a line for each line of the prompt, and
+		// about as long as the prompt.
+		wanted := pySplitLines(prompt)
+		first := pyRStrip(stripCLIANSI(cliLineAt(output, start)))
+		if slices.ContainsFunc(wanted, func(line string) bool { return pyRStrip(line) == first }) {
+			if echo, ok := cliLinesBefore(output, start, len(wanted)+1, 4*len(prompt)+cliEchoSlackBytes); ok {
+				start = echo
+			}
+		}
+	}
+	glog, follow := cliHasGlog(output[:start]), false
+	if glog {
+		if anchor := cliLastLineBefore(output, start, c.setsGlogState); anchor >= 0 {
+			start = anchor
+		} else {
+			follow = true // the entry a glog line starts may run into the tail
+		}
+	}
+	if start == 0 {
+		return cliText{text: output}
+	}
+	return cliText{text: output[start:], before: output[:start], openFence: cliOpenFence(output[:start]), glog: glog, glogFollow: follow}
+}
+
+// cliLineAt returns the line of text that starts at start (a line start).
+func cliLineAt(text string, start int) string {
+	for end := start + 1; end <= len(text); end++ {
+		if size := cliTerminatorBefore(text, end); size > 0 {
+			return text[start : end-size]
+		}
+	}
+	return text[start:]
+}
+
+// cliLineBefore returns the line of text that ends where the line starting at
+// end starts, and where it starts. end > 0.
+func cliLineBefore(text string, end int) (string, int) {
+	lineEnd := end - cliTerminatorBefore(text, end)
+	start := lineEnd
+	for start > 0 && cliTerminatorBefore(text, start) == 0 {
+		start--
+	}
+	return text[start:lineEnd], start
+}
+
+// cliTailStart returns where the last lines of text start that together are
+// at most maxLines lines and maxBytes bytes long, or the last line when it
+// alone is longer; 0 when that is all of text. Lines end as in pySplitLines.
+func cliTailStart(text string, maxLines, maxBytes int) int {
+	start := len(text)
+	end := len(text) - cliTerminatorBefore(text, len(text)) // a final line ending adds no line
+	for lines := 0; start > 0; lines++ {
+		prev := end
+		for prev > 0 && cliTerminatorBefore(text, prev) == 0 {
+			prev--
+		}
+		if lines > 0 && (lines == maxLines || len(text)-prev > maxBytes) {
+			return start
+		}
+		start = prev
+		end = start - cliTerminatorBefore(text, start)
+	}
+	return 0
+}
+
+// cliLinesBefore moves start, where a line of text starts, n lines back
+// (fewer at the start of text); ok is false when that is more than maxBytes
+// back.
+func cliLinesBefore(text string, start, n, maxBytes int) (int, bool) {
+	floor := start - maxBytes
+	for ; n > 0 && start > 0; n-- {
+		_, start = cliLineBefore(text, start)
+		if start < floor {
+			return 0, false
+		}
+	}
+	return start, true
+}
+
+// cliLastLineBefore returns where the last line of text before end (a line
+// start) starts for which match (given the line) is true, looking back at
+// most cliTailMaxLines lines and cliTailMaxBytes bytes; -1 if there is none.
+func cliLastLineBefore(text string, end int, match func(line string) bool) int {
+	floor := end - cliTailMaxBytes
+	for lines := 0; lines < cliTailMaxLines && end > 0; lines++ {
+		line, start := cliLineBefore(text, end)
+		if start < floor {
+			return -1
+		}
+		if match(line) {
+			return start
+		}
+		end = start
+	}
+	return -1
+}
+
+// cliTerminatorBefore is the length of the line ending (a pySplitLines line
+// boundary) that ends text[:i], 0 if none.
+func cliTerminatorBefore(text string, i int) int {
+	if i == 0 {
+		return 0
+	}
+	switch text[i-1] {
+	case '\n':
+		if i >= 2 && text[i-2] == '\r' {
+			return 2
+		}
+		return 1
+	case '\r':
+		if i < len(text) && text[i] == '\n' {
+			return 0 // the first half of "\r\n"
+		}
+		return 1
+	case '\v', '\f', 0x1c, 0x1d, 0x1e:
+		return 1
+	case 0x85: // U+0085
+		if i >= 2 && text[i-2] == 0xc2 {
+			return 2
+		}
+	case 0xa8, 0xa9: // U+2028, U+2029
+		if i >= 3 && text[i-3] == 0xe2 && text[i-2] == 0x80 {
+			return 3
+		}
+	}
+	return 0
+}
+
+// cliOpenFence reports whether text leaves a markdown fence open: an odd
+// number of its lines start with ``` or ~~~ after whitespace, the fences
+// lines pairs. Only the marks are looked at, so the scan stays fast.
+func cliOpenFence(text string) bool {
+	open := false
+	for _, mark := range []string{"```", "~~~"} {
+		for i := 0; ; {
+			j := strings.Index(text[i:], mark)
+			if j < 0 {
+				break
+			}
+			if cliAtLineStart(text, i+j) {
+				open = !open
+			}
+			i += j + len(mark)
+		}
+	}
+	return open
+}
+
+// cliAtLineStart reports whether only whitespace precedes text[i] on its line.
+func cliAtLineStart(text string, i int) bool {
+	for i > 0 && cliTerminatorBefore(text, i) == 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:i])
+		if !pyIsSpace(r) {
+			return false
+		}
+		i -= size
+	}
+	return true
+}
+
+// cliHasGlog reports whether a glog line is anywhere in text: health.py
+// _GLOG_ANYWHERE_RE.search, "(?m)^\s*" followed by a glog header. Only the
+// characters a header can start with are visited, so the scan stays fast on
+// the longest output.
+func cliHasGlog(text string) bool {
+	for i := 0; ; i++ {
+		next := strings.IndexAny(text[i:], "\x1bIWEF")
+		if next < 0 {
+			return false
+		}
+		i += next
+		if cliGlogCandidate(text[i:]) && cliAfterLineStart(text, i) && cliGlogLineStart.MatchString(text[i:]) {
+			return true
+		}
+	}
+}
+
+// cliGlogCandidate reports whether text may start with a glog header
+// (cliGlogLineStart): after an optional color code, I, W, E or F and a byte a
+// digit may start with.
+func cliGlogCandidate(text string) bool {
+	i := 0
+	if strings.HasPrefix(text, "\x1b[") {
+		for i = 2; i < len(text) && ('0' <= text[i] && text[i] <= '9' || text[i] == ';'); i++ {
+		}
+		if i == len(text) || text[i] != 'm' {
+			return false
+		}
+		i++
+	}
+	return i+1 < len(text) && strings.IndexByte("IWEF", text[i]) >= 0 && ('0' <= text[i+1] && text[i+1] <= '9' || text[i+1] >= utf8.RuneSelf)
+}
+
+// cliAfterLineStart reports whether only whitespace precedes text[i] since
+// the start of text or a "\n": Python's (?m)^\s*.
+func cliAfterLineStart(text string, i int) bool {
+	for i > 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:i])
+		if r == '\n' {
+			return true
+		}
+		if !pyIsSpace(r) {
+			return false
+		}
+		i -= size
+	}
+	return true
+}
+
+// cliBareStart is the first two characters of stripCLIANSI(line), all that the
+// indentation of a line needs, without stripping the whole line.
+func cliBareStart(line string) string {
+	if strings.IndexByte(line, '\x1b') < 0 {
+		return truncateRunes(line, 2)
+	}
+	var b strings.Builder
+	for i, n := 0, 0; i < len(line) && n < 2; n++ {
+		for i < len(line) && line[i] == '\x1b' {
+			m := cliANSIEscapeStart.FindStringIndex(line[i:])
+			if m == nil {
+				break
+			}
+			i += m[1]
+		}
+		if i == len(line) {
+			break
+		}
+		_, size := utf8.DecodeRuneInString(line[i:])
+		b.WriteString(line[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// normalizeCLILine returns a line as the catalog patterns read it (health.py
+// normalize_cli_line): ANSI stripped, typographic apostrophes as "'",
+// whitespace runs collapsed to one space, at most cliMessageMaxChars long.
+func normalizeCLILine(line string) string {
+	return normalizeCLIText(stripCLIANSI(truncateRunes(line, 4*cliMessageMaxChars)))
+}
+
+// normalizeCLIText is health.py _normalize_bare.
+func normalizeCLIText(text string) string {
+	text = truncateRunes(text, cliMessageMaxChars)
+	if cliNormalizedText(text) {
+		return text
+	}
+	text = cliApostrophe.Replace(text)
+	var b strings.Builder
+	space := false
+	for _, r := range text {
+		if pyIsSpace(r) {
+			space = true
+			continue
+		}
+		if space && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		space = false
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// cliNormalizedText reports whether normalizeCLIText leaves text as it is (no
+// typographic apostrophe, no invalid UTF-8, no whitespace but single spaces
+// between other characters), which spares most lines an allocation.
+func cliNormalizedText(text string) bool {
+	space := true // a space here would lead the text
+	for _, r := range text {
+		switch {
+		case r == ' ' && !space:
+			space = true
+			continue
+		case pyIsSpace(r), r == utf8.RuneError, r == '’', r == '‘', r == 'ʼ', r == '′':
+			return false
+		}
+		space = false
+	}
+	return !space || text == ""
+}
+
+func stripCLIANSI(text string) string {
+	if strings.IndexByte(text, '\x1b') < 0 {
+		return text
+	}
+	return cliANSIEscape.ReplaceAllString(text, "")
+}
+
+// truncateRunes returns at most the first n characters of s, as Python's s[:n].
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
+}
+
+// pyIsSpace is Python's str.isspace for one character.
+func pyIsSpace(r rune) bool {
+	switch r {
+	case '\t', '\n', '\v', '\f', '\r', 0x1c, 0x1d, 0x1e, 0x1f, ' ', 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200a
+}
+
+func pyStrip(s string) string  { return strings.TrimFunc(s, pyIsSpace) }
+func pyLStrip(s string) string { return strings.TrimLeftFunc(s, pyIsSpace) }
+func pyRStrip(s string) string { return strings.TrimRightFunc(s, pyIsSpace) }
+
+// pySplitLines is Python's str.splitlines(): lines end at \n, \r, \r\n, \v,
+// \f, \x1c, \x1d, \x1e, U+0085, U+2028 and U+2029, and a final line ending
+// adds no empty line.
+func pySplitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch r {
+		case '\r':
+			lines = append(lines, s[start:i])
+			i += size
+			if i < len(s) && s[i] == '\n' {
+				i++
+			}
+			start = i
+			continue
+		case '\n', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
+			lines = append(lines, s[start:i])
+			start = i + size
+		}
+		i += size
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+// cliJSONBodyLine is health.py _json_body_line: a line a logged JSON body may
+// consist of (blank, bracket- or quote-led, or a bare scalar).
+func cliJSONBodyLine(stripped string) bool {
+	return stripped == "" || strings.IndexByte(`{}[]",`, stripped[0]) >= 0 || cliJSONScalarLine.MatchString(stripped)
+}
+
+// cliJSONReports is health.py _json_report_lines: the JSON objects a CLI
+// prints over several lines, each as one line. A report starts on a line that
+// does not start with whitespace, ends in "{" or "[" and leaves brackets open
+// ("[ERROR] {", "{"); the JSON-shaped lines after it belong to it until its
+// brackets close. It returns each report's first index -> its lines stripped
+// and joined by one space, and adds the report's other lines to skipped.
+func cliJSONReports(lines []string, skipped map[int]bool) map[int]string {
+	joined := map[int]string{}
+	for index := 0; index < len(lines); {
+		head := pyRStrip(stripCLIANSI(lines[index]))
+		depth := 0
+		if first, _ := utf8.DecodeRuneInString(head); !skipped[index] && !pyIsSpace(first) &&
+			(strings.HasSuffix(head, "{") || strings.HasSuffix(head, "[")) {
+			depth = cliBracketDepth(head)
+		}
+		end := index + 1
+		for depth > 0 && end < len(lines) && !skipped[end] {
+			stripped := pyStrip(stripCLIANSI(lines[end]))
+			if !cliJSONBodyLine(stripped) {
+				break
+			}
+			depth += cliBracketDepth(stripped)
+			end++
+		}
+		if end > index+1 {
+			parts := []string{head}
+			for i := index + 1; i < end; i++ {
+				parts = append(parts, pyStrip(stripCLIANSI(lines[i])))
+				skipped[i] = true
+			}
+			joined[index] = strings.Join(parts, " ")
+		}
+		index = end
+	}
+	return joined
+}
+
+// cliBracketDepth is the change in JSON bracket depth over text.
+func cliBracketDepth(text string) int {
+	depth, inString, escaped := 0, false, false
+	for _, r := range text {
+		switch {
+		case inString && escaped:
+			escaped = false
+		case inString && r == '\\':
+			escaped = true
+		case inString:
+			inString = r != '"'
+		case r == '"':
+			inString = true
+		case r == '{' || r == '[':
+			depth++
+		case r == '}' || r == ']':
+			depth--
+		}
+	}
+	return depth
+}
+
+// cliCatalogRegexp compiles a catalog pattern to match what health.py's
+// cli_catalog_regex(pattern).match matches (Python re, re.IGNORECASE |
+// re.ASCII): anchored at the start of the text, case-insensitive for ASCII
+// letters only. Go's (?i) would also fold the Kelvin sign into k, the long s
+// into s and Greek mu into µ, so asciiFoldPattern spells the cases out.
+func cliCatalogRegexp(pattern string) (*regexp.Regexp, error) {
+	folded, err := asciiFoldPattern(pattern)
+	if err != nil {
+		return nil, err
+	}
+	return regexp.Compile(`^(?:` + folded + `)`)
+}
+
+// asciiFoldPattern rewrites a pattern of the catalog's dialect (the syntax
+// Python's re and RE2 share) for Go's regexp without (?i): each ASCII letter
+// outside a (?-i:...) group matches both of its cases, in character classes
+// too, and \s and \S are Python's ASCII classes (Go's \s lacks \v). Syntax
+// whose meaning differs between the two engines is rejected.
+func asciiFoldPattern(pattern string) (string, error) {
+	var out strings.Builder
+	fold := true
+	var groups []bool // the fold state each open group restores
+	for i := 0; i < len(pattern); {
+		r, size := utf8.DecodeRuneInString(pattern[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			return "", fmt.Errorf("invalid UTF-8 at offset %d", i)
+		case r == '\\':
+			esc, err := foldEscape(pattern[i:], false)
+			if err != nil {
+				return "", err
+			}
+			out.WriteString(esc.text)
+			size = esc.size
+		case r == '[':
+			class, n, err := foldClass(pattern[i:], fold)
+			if err != nil {
+				return "", err
+			}
+			out.WriteString(class)
+			size = n
+		case r == '(' && strings.HasPrefix(pattern[i:], "(?P<"):
+			end := strings.IndexByte(pattern[i:], '>')
+			if end < 0 {
+				return "", fmt.Errorf("unterminated group name at offset %d", i)
+			}
+			groups = append(groups, fold)
+			out.WriteString(pattern[i : i+end+1])
+			size = end + 1
+		case r == '(' && strings.HasPrefix(pattern[i:], "(?"):
+			// (?:...), (?flags:...) or (?flags); only i, m and s mean the same
+			// in both engines, and i is spelled out instead.
+			end := strings.IndexAny(pattern[i+2:], ":)")
+			if end < 0 {
+				return "", fmt.Errorf("unterminated group at offset %d", i)
+			}
+			flags, scoped := pattern[i+2:i+2+end], pattern[i+2+end] == ':'
+			on, off, _ := strings.Cut(flags, "-")
+			if strings.Trim(on+off, "ims") != "" || strings.Count(flags, "-") > 1 || (!scoped && on+off == "") {
+				return "", fmt.Errorf("unsupported group %q at offset %d", pattern[i:i+3+end], i)
+			}
+			inner := fold
+			if strings.Contains(on, "i") {
+				inner = true
+			}
+			if strings.Contains(off, "i") {
+				inner = false
+			}
+			kept := strings.ReplaceAll(on, "i", "")
+			if off = strings.ReplaceAll(off, "i", ""); off != "" {
+				kept += "-" + off
+			}
+			if scoped {
+				groups = append(groups, fold)
+				out.WriteString("(?" + kept + ":")
+			} else if kept != "" {
+				out.WriteString("(?" + kept + ")")
+			}
+			fold = inner
+			size = 3 + end
+		case r == '(':
+			groups = append(groups, fold)
+			out.WriteByte('(')
+		case r == ')':
+			if len(groups) == 0 {
+				return "", fmt.Errorf("unbalanced ) at offset %d", i)
+			}
+			fold = groups[len(groups)-1]
+			groups = groups[:len(groups)-1]
+			out.WriteByte(')')
+		case fold && asciiLetter(r):
+			out.WriteString("[" + string(unicode.ToLower(r)) + string(unicode.ToUpper(r)) + "]")
+		default:
+			out.WriteString(pattern[i : i+size])
+		}
+		i += size
+	}
+	if len(groups) != 0 {
+		return "", errors.New("unbalanced (")
+	}
+	return out.String(), nil
+}
+
+// foldedEscape is an escape sequence of a pattern rewritten by foldEscape: its
+// RE2 text, the pattern bytes it spans and, for an escape of one character,
+// that character (-1 otherwise).
+type foldedEscape struct {
+	text string
+	size int
+	char rune
+}
+
+// foldEscape rewrites the escape sequence at the start of s.
+func foldEscape(s string, inClass bool) (foldedEscape, error) {
+	if len(s) < 2 {
+		return foldedEscape{}, errors.New("trailing backslash")
+	}
+	c := s[1]
+	switch {
+	case c == 's' && inClass:
+		return foldedEscape{text: `\t\n\v\f\r `, size: 2, char: -1}, nil
+	case c == 's':
+		return foldedEscape{text: `[\t\n\v\f\r ]`, size: 2, char: -1}, nil
+	case c == 'S' && !inClass:
+		return foldedEscape{text: `[^\t\n\v\f\r ]`, size: 2, char: -1}, nil
+	case c == 'd' || c == 'D' || c == 'w' || c == 'W' || (!inClass && (c == 'b' || c == 'B')):
+		return foldedEscape{text: s[:2], size: 2, char: -1}, nil
+	case strings.IndexByte("tnrfva", c) >= 0:
+		return foldedEscape{text: s[:2], size: 2, char: rune("\t\n\r\f\v\a"[strings.IndexByte("tnrfva", c)])}, nil
+	case c < utf8.RuneSelf && !asciiLetter(rune(c)) && (c < '0' || c > '9'):
+		return foldedEscape{text: s[:2], size: 2, char: rune(c)}, nil // escaped punctuation is itself
+	}
+	return foldedEscape{}, fmt.Errorf("unsupported escape %q", s[:2])
+}
+
+// foldClass rewrites the character class at the start of s and returns it with
+// the pattern bytes it spans. With fold, the other case of every ASCII letter
+// of the class joins it: Python's re compares a class and the character it
+// tests both lower-cased, so a negated class excludes both cases too.
+func foldClass(s string, fold bool) (string, int, error) {
+	var out strings.Builder
+	out.WriteByte('[')
+	i := 1
+	if i < len(s) && s[i] == '^' {
+		out.WriteByte('^')
+		i++
+	}
+	// member reads one character of the class (char >= 0) or a class escape.
+	member := func() (foldedEscape, error) {
+		if i >= len(s) {
+			return foldedEscape{}, errors.New("unterminated character class")
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			return foldedEscape{}, errors.New("invalid UTF-8 in a character class")
+		case r == '[':
+			return foldedEscape{}, errors.New("[ in a character class")
+		case r == '\\':
+			esc, err := foldEscape(s[i:], true)
+			i += esc.size
+			return esc, err
+		}
+		i += size
+		return foldedEscape{size: size, char: r}, nil
+	}
+	var ranges [][2]rune
+	for first := true; ; first = false {
+		if i >= len(s) {
+			return "", 0, errors.New("unterminated character class")
+		}
+		if s[i] == ']' && !first {
+			i++
+			break
+		}
+		lo, err := member()
+		if err != nil {
+			return "", 0, err
+		}
+		isRange := i+1 < len(s) && s[i] == '-' && s[i+1] != ']'
+		if lo.char < 0 {
+			if isRange {
+				return "", 0, errors.New("range from a class escape")
+			}
+			out.WriteString(lo.text)
+			continue
+		}
+		hi := lo
+		if isRange {
+			i++
+			if hi, err = member(); err != nil {
+				return "", 0, err
+			}
+			if hi.char < lo.char {
+				return "", 0, errors.New("invalid character class range")
+			}
+		}
+		ranges = append(ranges, [2]rune{lo.char, hi.char})
+		out.WriteString(classChar(lo.char))
+		if hi.char != lo.char {
+			out.WriteString("-" + classChar(hi.char))
+		}
+	}
+	if fold {
+		for _, r := range ranges {
+			if lo, hi := max(r[0], 'a'), min(r[1], 'z'); lo <= hi {
+				out.WriteString(classChar(lo-'a'+'A') + "-" + classChar(hi-'a'+'A'))
+			}
+			if lo, hi := max(r[0], 'A'), min(r[1], 'Z'); lo <= hi {
+				out.WriteString(classChar(lo-'A'+'a') + "-" + classChar(hi-'A'+'a'))
+			}
+		}
+	}
+	out.WriteByte(']')
+	return out.String(), i, nil
+}
+
+// classChar writes r as a member of an RE2 character class.
+func classChar(r rune) string {
+	switch {
+	case r < ' ' || r == 0x7f:
+		return fmt.Sprintf(`\x{%x}`, r)
+	case strings.ContainsRune(`\]-^[`, r):
+		return `\` + string(r)
+	}
+	return string(r)
+}
+
+func asciiLetter(r rune) bool { return 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' }
 
 // looksTransient checks if an error message matches known transient patterns.
 func looksTransient(msg string) bool {
