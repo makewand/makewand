@@ -14,8 +14,8 @@ import (
 // The credential lock is the sidecar file next to the host credential, the
 // path the Python engine locks too (_credential_lock_path).
 func TestWritebackFix_CredentialLockPathIsSidecar(t *testing.T) {
-	host := filepath.FromSlash("/home/u/.codex/auth.json")
-	if got, want := cliCredentialLockPath(host), filepath.FromSlash("/home/u/.codex/.auth.json.makewand-lock"); got != want {
+	host := filepath.FromSlash("/home/alice/.codex/auth.json")
+	if got, want := cliCredentialLockPath(host), filepath.FromSlash("/home/alice/.codex/.auth.json.makewand-lock"); got != want {
 		t.Fatalf("lock path = %q, want %q", got, want)
 	}
 }

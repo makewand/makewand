@@ -66,10 +66,12 @@ from makewand.providers.muse import execute_muse_task
 from makewand.providers.grok import execute_grok_task
 
 def _execute_direct_task(engine, execute, prompt, **kwargs):
-    """Direct commands share typed admission, deadlines and observation."""
+    """Direct commands share typed admission, deadlines and observation, and record
+    the dispatch in the usage ledger with the route (cli/api) the adapter took."""
     from makewand.execution_contract import ExecutionRequest
     from makewand import execution_runtime
     from makewand.config import get_api_policy
+    from makewand.usage import observe_dispatch_route, record_engine_usage
     from makewand.workflow import remember_result
     context = execution_runtime.current_context()
     maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
@@ -86,7 +88,14 @@ def _execute_direct_task(engine, execute, prompt, **kwargs):
     def callback(effective_timeout):
         from makewand.workflow import provider_outcome
         return provider_outcome(execute(prompt, **dict(kwargs, timeout=effective_timeout)))
-    return remember_result(execution_runtime.execute(request, callback))
+    with observe_dispatch_route() as route:
+        result = remember_result(execution_runtime.execute(request, callback))
+    try:
+        record_engine_usage(engine, tier=kwargs.get("tier", "standard"), success=result[0], task=prompt,
+                            route=route.route)
+    except Exception:
+        pass
+    return result
 
 
 def _execution_exit_code(fallback=EXIT_FAILED):
@@ -1340,7 +1349,7 @@ def _main():
 
     # status
     p_status = subparsers.add_parser("status", help="Show health, quota indicators (local estimates), and reset times of all AIs", parents=[sub_common_parser])
-    p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs (real model calls for claude/codex/muse/grok; agy makes one real call while a recorded agy dispatch failure is still live, otherwise only a version check)")
+    p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs (real model calls for claude/codex/muse/grok; agy makes one real call while an agy quota limit has not reset, or while a login/region failure that a real agy dispatch or an earlier real probe recorded is still live; otherwise only a version check)")
     p_status.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # probe
@@ -1869,55 +1878,30 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
         cmd_sandbox(args)
     elif args.subcommand == "claude":
         ok, out, err = _execute_direct_task("claude", execute_claude_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("claude", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "codex":
         ok, out, err = _execute_direct_task("codex", execute_codex_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("codex", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "agy":
         ok, out, err = _execute_direct_task("agy", execute_agy_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("agy", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "muse":
         ok, out, err = _execute_direct_task("muse", execute_muse_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("muse", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "grok":
         ok, out, err = _execute_direct_task("grok", execute_grok_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("grok", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
@@ -1925,11 +1909,6 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "local":
         from makewand.providers.local import execute_local_task
         ok, out, err = _execute_direct_task("local", execute_local_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("local", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
@@ -1937,11 +1916,6 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "aider":
         from makewand.providers.aider import execute_aider_task
         ok, out, err = _execute_direct_task("aider", execute_aider_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("aider", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")

@@ -16,6 +16,10 @@ import (
 const depsInstallSkippedDetail = "skipped for safety"
 const testsSkippedDetail = "skipped (dependency install not approved)"
 const testsRunSkippedDetail = "skipped by user"
+
+// testsDepsUnavailableDetail is the trace detail of tests skipped because the
+// dependencies could not be downloaded; the progress step shows the
+// translated i18n BuildTestsDepsMissing.
 const testsDepsUnavailableDetail = "skipped (dependencies could not be downloaded)"
 
 // --- AI response handling ---
@@ -847,7 +851,7 @@ func (a App) handleDepsInstall(msg depsInstallMsg) (tea.Model, tea.Cmd) {
 func (a App) skipTestsWithoutDependencies() (tea.Model, tea.Cmd) {
 	emitExecTrace(a.router, "pipeline.exec.skipped", "tests", a.pendingTestsPlan, nil, nil, nil, testsDepsUnavailableDetail)
 	a.progress.SetStepStatus(stepTests, StepDone)
-	a.progress.SetStepDetail(stepTests, testsDepsUnavailableDetail)
+	a.progress.SetStepDetail(stepTests, i18n.Msg().BuildTestsDepsMissing)
 	a.pendingDepsPlan = nil
 	a.pendingTestsPlan = nil
 	return a.buildComplete()

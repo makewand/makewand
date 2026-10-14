@@ -33,8 +33,10 @@ Round 4 pins live in test_fix_delivery_host_block_r4.py.
 
 try:
     import _isolation  # noqa: F401
+    from _verdicts import nonced
 except ImportError:
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import nonced
 
 import contextlib
 import errno
@@ -649,7 +651,7 @@ class PipelineHostModeTests(HostDeliveryCase):
             if readonly:
                 if review_prompts is not None:
                     review_prompts.append(prompt_text)
-                return True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None
+                return True, nonced(prompt_text, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'), None
             return coder(Path(cwd))
 
         route = (["codex"], ["claude"], {"primary_coder": "codex", "primary_reviewer": "claude", "reasons": []})

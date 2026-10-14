@@ -4,8 +4,10 @@ Unit tests for orchestrator logic: task tiering and defect detection.
 
 try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
     import _isolation  # noqa: F401
+    from _verdicts import answer_with_nonce
 except ImportError:  # python3 -m unittest tests.<module>
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import answer_with_nonce
 
 import unittest
 import tempfile
@@ -295,7 +297,7 @@ class TestOrchestrator(unittest.TestCase):
 
         mock_status.return_value = {"codex": {"status": "healthy"}}
         mock_diff.return_value = "diff --git a/test.py b/test.py\n+x = 1"
-        mock_codex.return_value = (True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None)
+        mock_codex.side_effect = answer_with_nonce((True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None))
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -404,7 +406,7 @@ class TestOrchestrator(unittest.TestCase):
                      patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                      patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
                      patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
-                     patch("makewand.orchestrator.execute_codex_task", return_value=(True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None)), \
+                     patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None))), \
                      patch("makewand.orchestrator.execute_claude_task", side_effect=mock_coder):
                     res = run_pipeline("实现测试任务", cwd=base_tmp, stream=False)
                     self.assertTrue(res)
@@ -458,7 +460,7 @@ class TestOrchestrator(unittest.TestCase):
                      patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                      patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
                      patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
-                     patch("makewand.orchestrator.execute_codex_task", return_value=(True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None)), \
+                     patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None))), \
                      patch("makewand.orchestrator.execute_claude_task", side_effect=mock_coder), \
                      patch("makewand.orchestrator.run_git_cmd", side_effect=mock_git_cmd):
                     res = run_pipeline("实现测试任务", cwd=base_tmp, stream=False)
@@ -493,7 +495,7 @@ class TestOrchestrator(unittest.TestCase):
                  patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=mock_coder_commit), \
-                 patch("makewand.orchestrator.execute_codex_task", side_effect=mock_reviewer):
+                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce(mock_reviewer)):
                 res = run_pipeline("实现并提交任务", cwd=base_tmp, stream=False)
                 self.assertTrue(res)
                 self.assertTrue(len(recorded_diff) > 0)
@@ -553,7 +555,7 @@ class TestOrchestrator(unittest.TestCase):
                  patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=mock_coder), \
-                 patch("makewand.orchestrator.execute_codex_task", return_value=(True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None)):
+                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None))):
                 res = run_pipeline("修改代码更新文件并落盘", cwd=str(injection_dir), stream=False)
                 self.assertTrue(res)
 
@@ -598,7 +600,7 @@ class TestOrchestrator(unittest.TestCase):
                  patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", return_value=(True, "code written", None)), \
-                 patch("makewand.orchestrator.execute_codex_task", side_effect=mock_reviewer), \
+                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce(mock_reviewer)), \
                  patch("makewand.orchestrator.get_git_diff", return_value="diff --git a/main.py b/main.py\n+print('fix')"), \
                  patch("makewand.memory.record_autofix_lesson", side_effect=mock_record_lesson):
                 res = run_pipeline("实现用户数据转换", cwd=base_tmp, auto_fix=True, stream=False)
@@ -691,7 +693,7 @@ class TestOrchestrator(unittest.TestCase):
                  patch("makewand.orchestrator.create_ephemeral_shadow_worktree", return_value=shadow_res), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}, "grok": {"status": "limited"}, "muse": {"status": "limited"}, "agy": {"status": "limited"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=mock_coder), \
-                 patch("makewand.orchestrator.execute_codex_task", return_value=(True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None)):
+                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "LGTM\nMAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None))):
                 res = run_pipeline("修改代码并实现功能提交交付", cwd=str(main_repo), stream=False)
                 self.assertTrue(res)
 

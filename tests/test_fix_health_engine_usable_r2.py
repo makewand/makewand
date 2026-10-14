@@ -19,6 +19,7 @@ except ImportError:  # python3 -m unittest tests.<module>
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -31,6 +32,7 @@ from makewand.engine_selection import (
     _engine_usable,
     _no_provider_detected,
     _print_no_provider_guidance,
+    forced_engine_refusal,
     select_optimal_engine_pair,
 )
 from makewand.ensemble import resolve_ensemble_providers
@@ -47,10 +49,12 @@ def live(status, **extra):
 
 
 class TestNoUsableEngine(unittest.TestCase):
-    def route(self, cache, pool=("claude", "codex"), api=()):
+    def route(self, cache, pool=("claude", "codex"), api=(), policy="subscription_only"):
+        self.cache = cache
         with patch("makewand.config.get_active_providers", return_value=list(pool)), \
              patch("makewand.config.is_provider_enabled", return_value=True), \
              patch("makewand.config.has_api_configured", side_effect=lambda e: e in api), \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": policy}), \
              patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
              patch("makewand.usage.get_engine_usage_stats", return_value={}), \
              patch("makewand.usage.get_all_engine_reliability", return_value={}):
@@ -69,7 +73,10 @@ class TestNoUsableEngine(unittest.TestCase):
             self.assertIn(engine, text)
         self.assertIn("makewand probe", text)
         self.assertTrue(_no_provider_detected(None, meta))
-        self.assertTrue(_no_provider_detected("claude", meta), "a forced engine has no usable reviewer either")
+        # A forced engine is decided before routing (forced-engine): an unusable one is
+        # refused with its own reason there; one that got this far runs.
+        self.assertFalse(_no_provider_detected("claude", meta))
+        self.assertIn(self.cache["claude"]["status"], forced_engine_refusal("claude", self.cache))
 
     def test_all_active_providers_in_live_error_never_fall_back_to_uninstalled_agy(self):
         self.assert_no_engine(self.route({"claude": live("error"), "codex": live("error"),
@@ -85,13 +92,20 @@ class TestNoUsableEngine(unittest.TestCase):
                               "claude", "codex")
 
     def test_relayed_states_with_api_key_stay_selectable(self):
+        # The adapters relay only with a key AND an API policy that allows paid calls.
         for status in ("needs_auth", "limited"):
             with self.subTest(status=status):
                 coders, reviewers, meta = self.route({"claude": live(status), "codex": live("error")},
-                                                     api=("claude",))
+                                                     api=("claude",), policy="allow_paid")
                 self.assertEqual(coders, ["claude"])
                 self.assertNotIn("codex", reviewers)
                 self.assertFalse(meta.get("no_usable_engines", False))
+
+    def test_relayed_states_with_a_key_the_policy_forbids_are_not_usable(self):
+        for status in ("needs_auth", "limited"):
+            with self.subTest(status=status):
+                self.assert_no_engine(self.route({"claude": live(status), "codex": live("error")}, api=("claude",)),
+                                      "claude", "codex")
 
     def test_single_usable_engine_reviews_itself(self):
         coders, reviewers, meta = self.route({"claude": live("healthy"), "codex": live("error")})
@@ -170,11 +184,12 @@ class TestTimestampRuleIsShared(unittest.TestCase):
 
 
 class TestEnsembleUsesEngineUsability(unittest.TestCase):
-    def resolve(self, cache, api=(), requested=("claude", "codex", "grok", "muse")):
+    def resolve(self, cache, api=(), requested=("claude", "codex", "grok", "muse"), policy="subscription_only"):
         with patch("makewand.ensemble.is_provider_enabled", return_value=True), \
              patch("makewand.config.is_provider_enabled", return_value=True), \
              patch("makewand.ensemble.has_subscription_configured", return_value=True), \
-             patch("makewand.ensemble.has_api_configured", side_effect=lambda e: e in api), \
+             patch("makewand.config.has_api_configured", side_effect=lambda e: e in api), \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": policy}), \
              patch("makewand.health.load_status_cache", return_value=cache):
             return resolve_ensemble_providers(list(requested))
 
@@ -186,7 +201,10 @@ class TestEnsembleUsesEngineUsability(unittest.TestCase):
     def test_api_key_relays_needs_auth_and_limited_but_not_error(self):
         cache = {"claude": live("error"), "codex": live("needs_auth"), "grok": live("limited"),
                  "muse": live("healthy")}
-        self.assertEqual(self.resolve(cache, api=("claude", "codex", "grok")), ["codex", "grok", "muse"])
+        self.assertEqual(self.resolve(cache, api=("claude", "codex", "grok"), policy="allow_paid"),
+                         ["codex", "grok", "muse"])
+        # Under the default subscription_only policy a key is no relay (api-policy-relay).
+        self.assertEqual(self.resolve(cache, api=("claude", "codex", "grok")), ["muse"])
 
     def test_expired_failure_is_neutral(self):
         cache = {"claude": {"status": "error", "reason": "probe timeout", "updated_at": ago(minutes=31)}}

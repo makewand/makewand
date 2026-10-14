@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 from typing import Tuple, List, Optional, Dict, Any
 from makewand.config import c, COLOR_GREEN, COLOR_BOLD, COLOR_CYAN, get_api_config
+# Message sizes are measured as dispatched, like every review prompt (one definition).
+from makewand.review_contract import dispatched_size
 
 def get_default_local_model() -> str:
     """Detects first available local model or returns configured name."""
@@ -144,14 +146,9 @@ OLLAMA_SHOW_MAX_BYTES = 16 * 1024 * 1024
 OLLAMA_SHOW_ERROR_MAX_BYTES = 64 * 1024
 
 
-def _utf8_size(text: str) -> int:
-    """UTF-8 size of a message; a lone surrogate (an undecodable byte) never raises."""
-    return len(text.encode("utf-8", "surrogatepass"))
-
-
 def estimate_prompt_tokens(text: str) -> int:
     """A generous token count of text, for sizing a context window: half its UTF-8
-    size, each ASCII digit counted as a whole token.
+    size as dispatched (dispatched_size), each ASCII digit counted as a whole token.
 
     Code and prose average three to four bytes a token, a CJK character (three
     bytes) takes about one token, and tokenizers that split numbers spend a token
@@ -162,14 +159,15 @@ def estimate_prompt_tokens(text: str) -> int:
     prompt (whole_prompt_error).
     """
     digits = sum(text.count(digit) for digit in "0123456789")
-    return (_utf8_size(text) + digits + 1) // 2
+    return (dispatched_size(text) + digits + 1) // 2
 
 
 def ceiling_prompt_tokens(text: str) -> int:
-    """The most tokens text can take: its UTF-8 size. No tokenizer spends more than a
+    """The most tokens text can take: its UTF-8 size as dispatched (dispatched_size,
+    which never counts less than the server receives). No tokenizer spends more than a
     token on a byte - byte-level BPE merges bytes, SentencePiece falls back to one
     token per byte - so a window of this size plus the template always holds it."""
-    return _utf8_size(text)
+    return dispatched_size(text)
 
 
 def _fills_window(response: Dict[str, Any], window: int, system_bytes: int) -> bool:
@@ -294,7 +292,7 @@ def openai_compatible_whole_prompt_chat(base_url: Optional[str], headers: Dict[s
     endpoint = (base_url or "http://localhost:11434/v1").rstrip("/")
     if not endpoint.endswith("/chat/completions"):
         endpoint = f"{endpoint}/chat/completions"
-    prompt_bytes = sum(_utf8_size(str(m.get("content") or "")) for m in request.get("messages") or [])
+    prompt_bytes = sum(dispatched_size(str(m.get("content") or "")) for m in request.get("messages") or [])
     code, raw, error = _make_http_request(endpoint, headers, dict(request, stream=False), timeout=timeout,
                                           stream=False, max_retries=max_retries, backoff_factor=backoff_factor)
     if code != 200:
@@ -360,8 +358,8 @@ def ollama_whole_prompt_chat(base_url: Optional[str], headers: Dict[str, str], r
             "不能确认模型读到了完整提示，只读结论不予采纳 (UNVERIFIED)", "UNVERIFIED")
     messages = request.get("messages") or []
     contents = [(m.get("role"), str(m.get("content") or "")) for m in messages]
-    system_bytes = sum(_utf8_size(text) for role, text in contents if role == "system")
-    prompt_bytes = sum(_utf8_size(text) for _, text in contents)
+    system_bytes = sum(dispatched_size(text) for role, text in contents if role == "system")
+    prompt_bytes = sum(dispatched_size(text) for _, text in contents)
     window = sum(estimate_prompt_tokens(text) for _, text in contents) + OLLAMA_TEMPLATE_TOKENS + OLLAMA_ANSWER_TOKENS
     # The retry's window: room for one token per byte, which no tokenizer exceeds.
     ceiling = sum(ceiling_prompt_tokens(text) for _, text in contents) + OLLAMA_TEMPLATE_TOKENS + OLLAMA_ANSWER_TOKENS

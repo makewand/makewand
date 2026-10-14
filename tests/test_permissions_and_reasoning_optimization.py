@@ -139,7 +139,9 @@ class TestPlaceholderAndNonAgenticHandlers(unittest.TestCase):
         # When coder is non-agentic (deepseek/local/cursor), empty diff should not crash pipeline
         with tempfile.TemporaryDirectory() as td:
             prompt = "在当前目录编写一个算法"
-            with patch.object(orch, "check_load_backpressure", return_value=True), \
+            # A forced API-only engine needs a key the API policy lets it use (forced-engine).
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test-not-a-real-key", "MAKEWAND_API_POLICY": "allow_paid"}), \
+                 patch.object(orch, "check_load_backpressure", return_value=True), \
                  patch.object(orch, "get_or_update_status", return_value={}), \
                  patch.object(orch, "select_optimal_engine_pair", return_value=(["deepseek"], ["codex"], {"primary_coder": "deepseek", "primary_reviewer": "codex"})), \
                  patch.object(orch, "dispatch_task", return_value=(True, "实现代码如下...", None)), \

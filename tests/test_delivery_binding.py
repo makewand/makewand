@@ -2,8 +2,10 @@
 
 try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
     import _isolation  # noqa: F401
+    from _verdicts import nonced
 except ImportError:  # python3 -m unittest tests.<module>
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import nonced
 
 import contextlib
 import io
@@ -98,7 +100,7 @@ class DeliveryBindingTests(unittest.TestCase):
         def dispatch(engine, prompt, cwd, readonly=False, **kwargs):
             if readonly:
                 self.reviewed = True
-                return True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None
+                return True, nonced(prompt, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'), None
             if coder is None:
                 (Path(cwd) / "app.txt").write_text("APPROVED\n")
             else:
@@ -225,7 +227,7 @@ class DeliveryBindingTests(unittest.TestCase):
             candidate = next(candidates.glob("*/agent_a"))
             git(candidate, "rm", "--cached", "app.txt")
             (candidate / ".git/info/exclude").write_text("app.txt\n")
-            return True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None
+            return True, nonced(args[1], 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}'), None
 
         with contextlib.ExitStack() as stack:
             for obj, name, value in [(orch, "CANDIDATES_DIR", candidates),

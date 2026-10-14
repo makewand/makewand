@@ -1,7 +1,6 @@
 """Structured review verdict contract shared by every execution entry point."""
 import hashlib
 import json
-import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -60,19 +59,6 @@ def generate_review_nonce() -> str:
     return secrets.token_hex(4)
 
 
-def legacy_verdict_allowed() -> bool:
-    """Whether a verdict line without the per-task nonce may still count.
-
-    Never in production, where it would let a verdict echoed from candidate
-    content approve it: only MAKEWAND_ALLOW_LEGACY_VERDICT=1 or the isolated test
-    harness (MAKEWAND_TEST_ISOLATION_ROOT) allow it, and MAKEWAND_STRICT_NONCE=1
-    always forbids it.
-    """
-    if os.environ.get("MAKEWAND_STRICT_NONCE") == "1":
-        return False
-    return os.environ.get("MAKEWAND_ALLOW_LEGACY_VERDICT") == "1" or bool(os.environ.get("MAKEWAND_TEST_ISOLATION_ROOT"))
-
-
 # Largest review prompt (UTF-8 bytes) a reviewer is known to receive whole. The
 # agy adapter passes a prompt over 32 KiB as a file that its agent reads with
 # its own file tools, which show a large file in truncated, paged views: a
@@ -90,16 +76,30 @@ def reviewer_prompt_limit(engine: Optional[str]) -> Optional[int]:
     return WHOLE_PROMPT_LIMITS.get((engine or "").lower())
 
 
-def reviewer_receives_whole_prompt(engine: Optional[str], prompt: Optional[str]) -> bool:
-    """A verdict counts only from a reviewer that received the complete review prompt.
+def dispatched_size(text: Optional[str]) -> int:
+    """UTF-8 size in bytes of text as a provider receives it; never raises.
 
-    The prompt is measured as dispatched (orchestrator.dispatch_task), with any
-    undecodable byte of a file name shown as \\xNN (git_helper._printable)."""
+    orchestrator.dispatch_task sends every prompt through git_helper._printable: an
+    undecodable byte of a file or workspace name (a surrogate escape from
+    os.fsdecode or git output) goes as its four-byte \\xNN escape, any other lone
+    surrogate as its \\uXXXX escape. The size of that text is what a review prompt
+    carries, so the review diff cap (orchestrator.review_diff_max_bytes), the
+    whole-prompt limits above and the local model's context window
+    (providers/local.py) all measure text this way. Text without surrogates
+    measures its plain UTF-8 size. A lone surrogate that reaches a provider
+    unescaped arrives as U+FFFD (three bytes), never more than this counts.
+    """
+    from makewand.git_helper import _printable
+    return len(_printable(text or "").encode("utf-8"))
+
+
+def reviewer_receives_whole_prompt(engine: Optional[str], prompt: Optional[str]) -> bool:
+    """A verdict counts only from a reviewer that received the complete review prompt,
+    measured as dispatched (dispatched_size)."""
     limit = reviewer_prompt_limit(engine)
     if limit is None:
         return True
-    from makewand.git_helper import _printable
-    return len(_printable(prompt or "").encode("utf-8")) <= limit
+    return dispatched_size(prompt) <= limit
 
 
 def _build_verdict_tag_re(nonce: Optional[str] = None) -> re.Pattern:
@@ -168,17 +168,17 @@ def _scan_verdict_lines(text: str, nonce: Optional[str] = None, allow_legacy: Op
     Collects every line-anchored MAKEWAND_VERDICT entry.
     Lines that carry extra prose after the JSON (typically an echo of the prompt template such as
     '... (若无严重缺陷)') are ignored instead of being trusted.
+
+    With a nonce only ``MAKEWAND_VERDICT_<nonce>`` lines count: an un-nonced line could be a
+    verdict echoed from the reviewed content. No setting changes that; only a caller that
+    reads the legacy format on purpose passes ``allow_legacy=True``.
     """
     if not text:
         return []
     tag_re = _build_verdict_tag_re(nonce)
     entries = _scan_verdict_entries_for_re(text, tag_re)
-    if nonce and not entries:
-        # Legacy un-nonced fallback is strictly forbidden in production to prevent verdict echo hijacking,
-        # and only permitted when explicitly enabled or within isolated test harness environments.
-        should_allow = legacy_verdict_allowed() if allow_legacy is None else allow_legacy
-        if should_allow:
-            entries = _scan_verdict_entries_for_re(text, _VERDICT_TAG_RE)
+    if nonce and not entries and allow_legacy:
+        entries = _scan_verdict_entries_for_re(text, _VERDICT_TAG_RE)
     return entries
 
 

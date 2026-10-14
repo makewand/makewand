@@ -144,7 +144,8 @@ class DensePromptTests(r4.LocalEndpointTestCase):
     def test_ceiling_is_one_token_per_byte(self):
         self.assertEqual(local.ceiling_prompt_tokens("abc"), 3)
         self.assertEqual(local.ceiling_prompt_tokens("审查"), 6)
-        self.assertEqual(local.ceiling_prompt_tokens("bad \udce9"), 7)  # an undecodable byte never raises
+        # An undecodable byte never raises; it counts as the \xNN escape it is sent as (dispatched_size).
+        self.assertEqual(local.ceiling_prompt_tokens("bad \udce9"), len(b"bad \\xe9"))
         self.assertGreaterEqual(local.ceiling_prompt_tokens(dense_review_prompt(4)), dense_tokens(dense_review_prompt(4)))
 
 

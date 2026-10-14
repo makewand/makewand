@@ -235,7 +235,7 @@ def _save_unverified_artifacts(
     be saved completely.
     """
     try:
-        from makewand.git_helper import PATCH_EXPORT_FLAGS, _printable, _read_workspace_diff
+        from makewand.git_helper import PATCH_EXPORT_FLAGS, _json_text, _printable, _read_workspace_diff
         root = _ensure_private_artifacts_dir(_unverified_artifacts_root())
         target = root / f"unverified_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         target.mkdir(mode=0o700)
@@ -260,10 +260,8 @@ def _save_unverified_artifacts(
         if submodules:
             manifest = {"baseline_commit": base_rev, "reason": reason, "patches": patches,
                         "submodule_baselines": submodules}
-            text = json.dumps(manifest, ensure_ascii=False, indent=2)
-            if _printable(text) != text:  # a submodule path with undecodable bytes: \udcNN round-trips
-                text = json.dumps(manifest, ensure_ascii=True, indent=2)
-            (target / "manifest.json").write_text(text, encoding="utf-8")
+            # A submodule path with undecodable bytes is escaped (\udcNN round-trips).
+            (target / "manifest.json").write_text(_json_text(manifest), encoding="utf-8")
         (target / "review.txt").write_text(_printable(f"UNVERIFIED: {reason}\n\n{review_text or ''}"), encoding="utf-8")
         return patch_path, None
     except Exception as exc:

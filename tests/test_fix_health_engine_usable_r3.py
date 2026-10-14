@@ -20,6 +20,7 @@ except ImportError:  # python3 -m unittest tests.<module>
 
 import argparse
 import contextlib
+import os
 import io
 import json
 import tempfile
@@ -132,7 +133,6 @@ class TestNothingIsDispatchedWithoutAUsableEngine(unittest.TestCase):
              patch("makewand.ensemble.is_provider_enabled", side_effect=enabled), \
              patch("makewand.config.is_provider_enabled", side_effect=enabled), \
              patch("makewand.ensemble.has_subscription_configured", side_effect=lambda name: name != "local"), \
-             patch("makewand.ensemble.has_api_configured", return_value=False), \
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.providers.local.is_local_model_available", return_value=local):
             yield
@@ -282,7 +282,7 @@ class TestStatusRecommendsOnlyUsableEngines(unittest.TestCase):
 class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
     ADAPTERS = {"claude": execute_claude_task, "codex": execute_codex_task}
 
-    def dispatch(self, engine, status, key=True):
+    def dispatch(self, engine, status, key=True, policy="allow_paid"):
         calls = []
 
         def api(**kwargs):
@@ -292,6 +292,7 @@ class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
         with patch("makewand.health.load_status_cache", return_value={engine: live(status)}), \
              patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=key), \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": policy}), \
              patch("makewand.providers.api_client.call_api_chat", side_effect=api), \
              patch("makewand.sandbox.provider_sandbox_launch", side_effect=SandboxUnavailableError("cli path")), \
              contextlib.redirect_stderr(io.StringIO()):
@@ -305,6 +306,13 @@ class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
                 self.assertEqual(calls, [engine])
                 self.assertEqual(result[:2], (True, "api answer"))
 
+    def test_needs_auth_with_a_key_the_api_policy_forbids_still_runs_the_cli(self):
+        for engine in self.ADAPTERS:
+            with self.subTest(engine=engine):
+                calls, result = self.dispatch(engine, "needs_auth", policy="subscription_only")
+                self.assertEqual(calls, [])
+                self.assertEqual(result[2], "cli path")
+
     def test_needs_auth_without_a_key_still_runs_the_cli(self):
         for engine in self.ADAPTERS:
             with self.subTest(engine=engine):
@@ -315,11 +323,13 @@ class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
     def test_selection_and_adapters_agree_on_what_is_relayed(self):
         for engine in self.ADAPTERS:
             for status in ("limited", "needs_auth", "error"):
-                with self.subTest(engine=engine, status=status):
-                    with routing(pool=(engine,), api=(engine,)):
-                        relayable = _usable_or_api_relay(engine, {engine: live(status)})
-                    calls, _ = self.dispatch(engine, status)
-                    self.assertEqual(bool(calls), relayable)
+                for policy in ("allow_paid", "subscription_only"):
+                    with self.subTest(engine=engine, status=status, policy=policy):
+                        with routing(pool=(engine,), api=(engine,)), \
+                             patch.dict(os.environ, {"MAKEWAND_API_POLICY": policy}):
+                            relayable = _usable_or_api_relay(engine, {engine: live(status)})
+                        calls, _ = self.dispatch(engine, status, policy=policy)
+                        self.assertEqual(bool(calls), relayable)
 
 
 if __name__ == "__main__":

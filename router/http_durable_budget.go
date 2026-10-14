@@ -102,7 +102,7 @@ func (r *Router) httpReservationUSD(floor float64, prepared *preparedHTTPChat) f
 	if floor <= 0 || r == nil || prepared == nil {
 		return floor
 	}
-	price, ok := r.httpPriceCeiling(prepared.RequestedModel)
+	price, ok := r.httpPriceCeiling()
 	if !ok {
 		return floor
 	}
@@ -132,16 +132,16 @@ func (r *Router) httpReservationUSD(floor float64, prepared *preparedHTTPChat) f
 // httpPriceCeiling returns the highest input and output prices ($/MTok) among
 // the models this Router's API-access providers are billed at: every model
 // routing can call through them, as the provider reports it (apiBilledModels).
-// The provider a client pinned (the argument) does not narrow it, because a
-// pinned request falls back to the other registered providers when its own is
-// unavailable or fails (RouteProvider, chatWithFallbackCandidates) - a client
-// asking for "claude-sonnet" pins the "claude" subscription CLI and is served
-// by its "claude-api" sibling. A model without a pricing entry, or one its
-// provider does not name, counts at the unpriced fallback rate its usage is
-// billed at, so the ceiling never falls below the price the estimate and the
-// stream spend guard apply to a route. ok is false only when no API provider
-// is reachable.
-func (r *Router) httpPriceCeiling(_ string) (costEntry, bool) {
+// It takes no provider a client pinned: a pinned request falls back to the
+// other registered providers when its own is unavailable or fails
+// (RouteProvider, chatWithFallbackCandidates) - a client asking for
+// "claude-sonnet" pins the "claude" subscription CLI and is served by its
+// "claude-api" sibling - so a pin cannot narrow the ceiling. A model without
+// a pricing entry, or one its provider does not name, counts at the unpriced
+// fallback rate its usage is billed at, so the ceiling never falls below the
+// price the estimate and the stream spend guard apply to a route. ok is false
+// only when no API provider is reachable.
+func (r *Router) httpPriceCeiling() (costEntry, bool) {
 	var ceiling costEntry
 	found := false
 	for _, name := range r.registeredProviderNames() {

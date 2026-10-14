@@ -163,14 +163,16 @@ class NonUtf8HelperTests(unittest.TestCase):
     def test_module_messages_escape_undecodable_bytes(self):
         out = strict_stream()
         with contextlib.redirect_stdout(out):
-            orch.print("name: lat\udce9n.txt", OSError("open(\"b\udcff\")"))
+            orch._print("name: lat\udce9n.txt", OSError("open(\"b\udcff\")"))
         self.assertEqual(out.buffer.getvalue().decode("utf-8"), 'name: lat\\xe9n.txt open("b\\xff")\n')
 
-    def test_sizes_count_the_byte_each_escape_stands_for(self):
-        self.assertEqual(orch._utf8_size("lat\udce9n.txt"), len(b"lat\xe9n.txt"))
-        self.assertEqual(orch._utf8_size("数据"), 6)
-        self.assertEqual(orch._utf8_size(None), 0)
-        self.assertEqual(orch._utf8_size("\ud800"), 3)  # a lone surrogate no file name produced
+    def test_sizes_count_text_as_it_is_dispatched(self):
+        # One definition (review_contract.dispatched_size): an undecodable byte is sent
+        # as its four-byte \xNN escape, any other lone surrogate as \uXXXX (py-cleanup-a).
+        self.assertEqual(orch.dispatched_size("lat\udce9n.txt"), len(b"lat\\xe9n.txt"))
+        self.assertEqual(orch.dispatched_size("数据"), 6)
+        self.assertEqual(orch.dispatched_size(None), 0)
+        self.assertEqual(orch.dispatched_size("\ud800"), len(b"\\ud800"))  # a lone surrogate no file name produced
 
     def test_whole_prompt_check_measures_the_dispatched_prompt(self):
         limit = orch.reviewer_prompt_limit("agy")

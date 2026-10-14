@@ -78,7 +78,7 @@ func TestWritebackFix_ReadOnlySessionsUsePrivateCredentialCopies(t *testing.T) {
 	const codexCred = `{"tokens":{"access_token":"a1","refresh_token":"r1"}}`                     //nolint:gosec // G101: fake fixture token
 	for _, ro := range readonlyFixContexts {
 		t.Run(ro.name, func(t *testing.T) {
-			home, ws := t.TempDir(), t.TempDir()
+			home, ws := canonicalTempDir(t), canonicalTempDir(t)
 			selected := filepath.Join(home, ".codex-selected")
 			for path, content := range map[string]string{
 				filepath.Join(home, ".claude", ".credentials.json"): claudeCred,
@@ -152,7 +152,7 @@ func TestWritebackFix_LiveReadOnlySessionsWriteBackRefresh(t *testing.T) {
 			t.Run(ro.name+": "+run.provider+" "+run.dir+": "+run.name, func(t *testing.T) {
 				tc := writebackFixCase1(t, run.name)
 				old, cur := writebackFixFile(t, tc.Host), writebackFixFile(t, tc.Sandbox)
-				home, ws := t.TempDir(), t.TempDir()
+				home, ws := canonicalTempDir(t), canonicalTempDir(t)
 				dir := filepath.Join(home, run.dir)
 				cred, config := filepath.Join(dir, filepath.FromSlash(run.rel)), filepath.Join(dir, run.config)
 				readonlyFixWrite(t, cred, string(old))
@@ -216,7 +216,7 @@ func TestWritebackFix_HostWriteFailureIsReported(t *testing.T) {
 	if data, _ := os.ReadFile(host); string(data) != old {
 		t.Fatalf("host credential changed: %q", data)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], host) || !strings.Contains(warnings[0], "failed to write back") {
+	if len(warnings) != 1 || !writebackFixNamesHost(warnings[0], host) || !strings.Contains(warnings[0], "failed to write back") {
 		t.Fatalf("failed host write not reported: %q", warnings)
 	}
 }

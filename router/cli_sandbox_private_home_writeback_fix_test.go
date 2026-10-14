@@ -207,7 +207,7 @@ func TestWritebackFix_SharedVectors(t *testing.T) {
 					t.Fatalf("credential created inside the sandbox reached the host: %q %v", got, err)
 				case old != nil && !bytes.Equal(got, old):
 					t.Fatalf("refused write-back changed the host: %q, want %q", got, old)
-				case len(warnings) != 1 || !strings.Contains(warnings[0], host) || !strings.Contains(warnings[0], "host copy kept"):
+				case len(warnings) != 1 || !writebackFixNamesHost(warnings[0], host) || !strings.Contains(warnings[0], "host copy kept"):
 					t.Fatalf("a refused write-back must be reported once: %q", warnings)
 				}
 				return
@@ -228,7 +228,7 @@ func TestWritebackFix_SharedVectors(t *testing.T) {
 			case !reflect.DeepEqual(writebackFixDecode(t, got), want):
 				t.Fatalf("host = %s, want %v", got, want)
 			}
-			if fi, err := os.Lstat(host); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+			if fi, err := os.Lstat(host); err != nil || !fi.Mode().IsRegular() || !writebackFixOwnerOnly(fi) {
 				t.Fatalf("written host credential: %v %v", fi, err)
 			}
 			if len(tc.Expect.Ignored) == 0 {

@@ -360,7 +360,7 @@ func TestWrapCodexHomeReviewReadonlyTmpfsMountAndMultiAccountMasking(t *testing.
 	}
 	auditFixMockBwrap(t)
 
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	home := filepath.Join(root, "home")
 	workspace := filepath.Join(root, "workspace")
 	for _, dir := range []string{home, workspace} {

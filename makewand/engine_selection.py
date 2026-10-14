@@ -29,9 +29,12 @@ NON_AGENTIC_CHAT_MODELS = frozenset({"local", "ollama", "deepseek", "qwen", "glm
 
 _UNUSABLE_ENGINE_STATUSES = ("limited", "needs_auth", "error", "missing", "disabled")
 # Statuses whose work the provider adapters relay to the provider's cloud API
-# when an API key is configured. An "error" verdict is not relayed: the CLI runs.
+# when an API key is configured and the API policy allows paid calls
+# (config.api_relay_available). An "error" verdict is not relayed: the CLI runs.
 _API_RELAY_STATUSES = ("limited", "needs_auth", "missing")
 _RACE_JUDGE_ORDER = ("agy", "codex", "claude", "grok", "muse", "local")
+# Engines that only have a cloud API (orchestrator.dispatch_task's api_engines).
+API_ONLY_ENGINES = frozenset({"deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"})
 
 
 def _failure_verdict_expired(info: Dict[str, Any]) -> bool:
@@ -144,16 +147,17 @@ def _engine_usable(engine: str, cache: Optional[Dict[str, Any]], require_healthy
 
 
 def _usable_or_api_relay(engine: str, cache: Optional[Dict[str, Any]], usable_fn=None) -> bool:
-    """Usable as cached, or its limited / needs_auth / missing CLI is relayed to a
-    configured API key (as the provider adapters do)."""
+    """Usable as cached, or its limited / needs_auth / missing CLI is relayed to the
+    cloud API, which the provider adapters do only with a configured key and an API
+    policy that allows paid calls (config.api_relay_available)."""
     if (usable_fn or _engine_usable)(engine, cache)[0]:
         return True
     if engine in ("local", "ollama"):
         return False
-    from makewand.config import has_api_configured, is_provider_enabled
+    from makewand.config import api_relay_available, is_provider_enabled
     info = (cache or {}).get(engine)
     status = info.get("status") if isinstance(info, dict) else None
-    return status in _API_RELAY_STATUSES and is_provider_enabled(engine) and has_api_configured(engine)
+    return status in _API_RELAY_STATUSES and is_provider_enabled(engine) and api_relay_available(engine)
 
 
 def _select_race_judge(cache: Optional[Dict[str, Any]], contestants: Tuple[Optional[str], ...]) -> Optional[str]:
@@ -176,13 +180,64 @@ def _select_race_judge(cache: Optional[Dict[str, Any]], contestants: Tuple[Optio
     return usable[0] if usable else None
 
 
+def forced_engine_name(forced_engine: Optional[str]) -> Optional[str]:
+    """The engine a caller forced (--provider, a race contestant), or None for none or "auto"."""
+    name = (forced_engine or "").strip().lower()
+    return name if name and name != "auto" else None
+
+
+def forced_engine_refusal(forced_engine: Optional[str], cache: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why the engine a caller forced cannot run now, in that engine's own words, or None.
+
+    Decided before routing, and alike on every path that takes a forced engine
+    (explain/Q&A, pipeline, review, race): the forced engine must pass what
+    routing requires of any engine - enabled and no live failure verdict, unless
+    the adapter relays that state to an allowed API (_usable_or_api_relay); an
+    engine that only has a cloud API needs a key the API policy lets it use. A
+    usable forced engine always runs; an unusable one is never dispatched.
+    """
+    name = forced_engine_name(forced_engine)
+    if name is None:
+        return None
+    from makewand.config import api_relay_available, api_relay_blocked_note, is_provider_enabled
+    if name in API_ONLY_ENGINES and is_provider_enabled(name) and not api_relay_available(name):
+        # Nothing but its cloud API can run it (orchestrator.dispatch_task calls the API directly).
+        return api_relay_blocked_note(name) or f"未配置 {name.upper()} API Key (设置环境变量即可激活)"
+    cache = _without_expired_failures(cache)
+    if _usable_or_api_relay(name, cache):
+        return None
+    why = _engine_usable(name, cache)[1] or "当前不可用"
+    info = (cache or {}).get(name)
+    status = info.get("status") if isinstance(info, dict) else None
+    if status in _API_RELAY_STATUSES and name not in ("local", "ollama") and is_provider_enabled(name):
+        blocked = api_relay_blocked_note(name)  # a key the API policy does not let the adapter use
+        if blocked:
+            why = f"{why}；{blocked}"
+    return why
+
+
+def forced_engine_error(forced_engine: str, why: str) -> str:
+    """The run outcome's error when forced_engine_refusal stops a task."""
+    return f"Requested engine {forced_engine_name(forced_engine) or forced_engine} is not usable: {why}"
+
+
+def forced_engine_refusal_lines(forced_engine: str, why: str) -> List[str]:
+    """What a path prints when forced_engine_refusal stops it (the same on every path)."""
+    name = forced_engine_name(forced_engine) or forced_engine
+    return [c(f"❌ [Makewand Routing] 指定的引擎 {name.upper()} 当前不可用: {why}；"
+              "任务未执行，工作区未做任何改动 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD),
+            "   运行 'makewand probe' 复查，或不指定引擎，由 Makewand 选择当前可用的引擎。"]
+
+
 def _no_provider_detected(forced_engine: Optional[str], route_meta: Dict[str, Any]) -> bool:
     """True when routing has nothing to dispatch: zero active providers (N=0), or
-    none of them usable right now and no caller override chose an engine pair."""
+    none of them usable right now and no caller override chose an engine pair.
+    A forced engine was decided before routing (forced_engine_refusal): when it
+    got here it is usable and runs, whatever routing found for the others."""
+    if forced_engine_name(forced_engine):
+        return False
     if route_meta.get("no_usable_engines") and not route_meta.get("primary_reviewer"):
         return True
-    if forced_engine and forced_engine != "auto":
-        return False
     if route_meta.get("no_active_providers"):
         return True
     if not route_meta.get("single_tool_mode"):
@@ -410,14 +465,14 @@ def select_optimal_engine_pair(
     # 2.5 Dynamic Quota Pacing & Calendar Progression Alignment
     pacings = {}
     try:
-        from makewand.config import has_api_configured
+        from makewand.config import api_relay_available
         from makewand.pacing import get_all_providers_pacing
         pacings = get_all_providers_pacing(cache=cache)
         for model_name, p_data in pacings.items():
             if model_name in scores and scores[model_name] > -500:
                 p_boost = p_data.get("routing_boost", 0.0)
                 model_status = (cache or {}).get(model_name, {}).get("status", "unknown")
-                if p_boost <= -500.0 and model_status == "limited" and has_api_configured(model_name):
+                if p_boost <= -500.0 and model_status == "limited" and api_relay_available(model_name):
                     continue
                 if p_boost != 0.0 and not boost:
                     scores[model_name] += p_boost
@@ -436,7 +491,7 @@ def select_optimal_engine_pair(
             pass
 
     # 3. Quota Health & Active Tool Filter
-    from makewand.config import has_api_configured, is_provider_enabled, get_active_providers
+    from makewand.config import api_relay_available, is_provider_enabled, get_active_providers
     active_pool = set(get_active_providers())
     _usable_fn = getattr(orch, "_engine_usable", None) if orch else None
     if _usable_fn is None or _usable_fn is _engine_usable:
@@ -462,7 +517,8 @@ def select_optimal_engine_pair(
             status = cache.get(model_name, {}).get("status", "unknown")
         if is_status_stale(cache.get(model_name) if cache else None):
             stale_engines.append(model_name)
-        api_ok = has_api_configured(model_name)
+        # The adapters relay to the API only when the policy allows paid calls.
+        api_ok = api_relay_available(model_name)
         if status == "limited":
             if api_ok:
                 scores[model_name] -= 1.0
@@ -571,7 +627,7 @@ def select_optimal_engine_pair(
             status = "missing"
         else:
             status = cache.get(model_name, {}).get("status", "unknown")
-        api_ok = has_api_configured(model_name)
+        api_ok = api_relay_available(model_name)
         if status in ("limited", "needs_auth", "missing"):
             if api_ok and model_name not in ("local", "ollama"):
                 reviewer_base_scores[model_name] -= 0.8

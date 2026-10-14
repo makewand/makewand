@@ -1531,10 +1531,12 @@ func cliCredentialLockPath(path string) string {
 // flock(2) (LockFileEx on Windows) on its sidecar lock file, which the Python
 // engine takes as well (_credential_lock). ok is false when another
 // write-back held it for cliCredentialLockWait. Where no lock can be taken
-// (the lock file cannot be created, a filesystem without flock) it returns
-// ok unlocked: the identity re-check before the rename still applies.
+// (the lock file cannot be created or is a symlink, which is never followed,
+// see openCredentialLock; a filesystem without flock) it returns ok unlocked,
+// as the Python engine does: the identity re-check before the rename still
+// applies.
 func cliLockCredential(path string) (unlock func(), ok bool) {
-	f, err := os.OpenFile(cliCredentialLockPath(path), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: sidecar of a provider credential path chosen by makewand
+	f, err := openCredentialLock(cliCredentialLockPath(path))
 	if err != nil {
 		return func() {}, true
 	}

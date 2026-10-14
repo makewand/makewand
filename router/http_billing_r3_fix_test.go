@@ -196,7 +196,7 @@ func TestHTTPGeminiAPISiblingStreamBilledAtTheModelItCalls_R3(t *testing.T) {
 func TestGeminiAPISiblingCeilingAndGuardPriceTheCalledModel_R3(t *testing.T) {
 	r := geminiFailoverRouter("gemini-2.5-flash", "http://127.0.0.1:1")
 	// The base provider's tiers (flash, pro) and the configured flash.
-	if got, ok := r.httpPriceCeiling("gemini"); !ok || got != tablePrice(t, "gemini-2.5-pro") {
+	if got, ok := r.httpPriceCeiling(); !ok || got != tablePrice(t, "gemini-2.5-pro") {
 		t.Fatalf("ceiling = %+v ok=%v, want gemini-2.5-pro's %+v", got, ok, tablePrice(t, "gemini-2.5-pro"))
 	}
 	provider, ok := r.getProvider("gemini-api")

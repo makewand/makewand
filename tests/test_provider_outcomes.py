@@ -8,6 +8,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -104,7 +105,9 @@ class ProviderOutcomeTests(unittest.TestCase):
             for mode in ("missing", "cached", "quota"):
                 raw = (1, "", QUOTA_REJECTION.get(engine, "HTTP 429 Too Many Requests"), None)
                 typed = ExecutionResult(False, "partial", "transport disconnected", status="UNKNOWN", outcome_known=False)
+                # The adapters relay only when the API policy allows paid calls (api-policy-relay).
                 with self.subTest(engine=engine, mode=mode), self.adapter(engine, raw) as (execute, process, api), \
+                        patch.dict(os.environ, {"MAKEWAND_API_POLICY": "allow_paid"}), \
                         patch("makewand.config.has_subscription_configured", return_value=mode != "missing"), \
                         patch("makewand.config.has_api_configured", return_value=True), \
                         patch("makewand.health.load_status_cache", return_value={engine: {"status": "limited"}} if mode == "cached" else {}):

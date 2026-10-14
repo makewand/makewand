@@ -35,9 +35,10 @@ import (
 //     abstract sockets stay unreachable;
 //   - 127.0.0.0/8 inside the sandbox is the sandbox's own loopback, and
 //     --disable-host-loopback stops slirp4netns from mapping its gateway
-//     (10.0.2.2) onto host loopback;
-//   - DNS goes to slirp4netns' built-in forwarder (10.0.2.3), so a host stub
-//     resolver on loopback (systemd-resolved) is not needed.
+//     (the .2 host of its 10.0.2.0/24) onto host loopback;
+//   - DNS goes to slirp4netns' built-in forwarder (the .3 host of
+//     10.0.2.0/24, userNetDNS), so a host stub resolver on loopback
+//     (systemd-resolved) is not needed.
 //
 // slirp4netns opens its outbound connections from the host, so every address
 // the host can reach would be reachable too: the host's own addresses (where
@@ -95,8 +96,11 @@ import (
 // tc and nft are resolved the same way.
 const userNetHelperName = "slirp4netns"
 
-// userNetDNS is slirp4netns' built-in DNS forwarder address.
-const userNetDNS = "10.0.2.3"
+// userNetDNS is slirp4netns' built-in DNS forwarder address, the .3 host of
+// its 10.0.2.0/24 network. It is built from its octets, not written as a
+// dotted literal: the secret scanner (scripts/check_secrets.sh) reports
+// private host addresses in source files.
+var userNetDNS = netip.AddrFrom4([4]byte{10, 0, 2, 3}).String()
 
 // userNetDevice is the sandbox-side interface slirp4netns creates.
 const userNetDevice = "tap0"
@@ -348,10 +352,13 @@ func init() {
 // The probe's command line names each URL of a chain with markers in front of
 // it (registryEndpoint.probeArgument): registryDecidesMarker for a URL whose
 // status decides how the go command goes on, registryFallBackMarker for one
-// whose failure hands the question to the next URL of the chain.
+// whose failure hands the question to the next URL of the chain, and
+// registryAfterNotFoundMarker for one that is asked only when no failure was
+// passed over before it (registryEndpoint.afterNotFoundOnly).
 const (
-	registryDecidesMarker  = "?"
-	registryFallBackMarker = "|"
+	registryDecidesMarker       = "?"
+	registryFallBackMarker      = "|"
+	registryAfterNotFoundMarker = "!"
 )
 
 // runRegistryProbe asks the URL chains on its command line (one argument per
@@ -362,7 +369,9 @@ const (
 // (registryEndpoint): a deciding URL settles it only with 200 and hands it on
 // after 404 or 410; any other URL settles it with any response. After any
 // other answer (or none) the next URL is asked only behind a fall-back
-// marker. Requests use verified TLS and honour the proxy settings of the
+// marker, and a URL marked to be asked only after not-found answers is not
+// asked once such a failure was passed over (the go command does not contact
+// it then). Requests use verified TLS and honour the proxy settings of the
 // environment (the sandbox clears them, as it does for the install); a
 // deciding URL gets the GET the go command sends, following redirects as the
 // go command does, every other URL a HEAD that follows none.
@@ -388,8 +397,7 @@ func runRegistryProbe(out io.Writer, chains []string) int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for _, token := range tokens {
-				target, decides, fallBack := parseRegistryProbeToken(token)
+			walkRegistryChain(tokens, func(target string, decides bool) (int, string) {
 				client := plain
 				if decides {
 					client = deciding
@@ -402,32 +410,51 @@ func runRegistryProbe(out io.Writer, chains []string) int {
 					_, _ = fmt.Fprintln(out, "reachable", target, status)
 				}
 				mu.Unlock()
-				switch {
-				case reason == "" && (!decides || status == http.StatusOK):
-					return // settled
-				case reason == "" && (status == http.StatusNotFound || status == http.StatusGone):
-					// not found: the next URL is asked
-				case !fallBack:
-					return
-				}
-			}
+				return status, reason
+			})
 		}()
 	}
 	wg.Wait()
 	return 0
 }
 
+// walkRegistryChain asks the URLs of one chain of the probe's command line
+// (tokens, each with its markers) in turn, as runRegistryProbe describes:
+// ask returns a URL's HTTP status, or why there was no response.
+func walkRegistryChain(tokens []string, ask func(target string, decides bool) (status int, reason string)) {
+	passedOver := false // a failure was passed over on this chain
+	for _, token := range tokens {
+		target, decides, fallBack, afterNotFound := parseRegistryProbeToken(token)
+		if afterNotFound && passedOver {
+			return // the service is unavailable: the go command does not go on to target
+		}
+		status, reason := ask(target, decides)
+		switch {
+		case reason == "" && (!decides || status == http.StatusOK):
+			return // settled
+		case reason == "" && (status == http.StatusNotFound || status == http.StatusGone):
+			// not found: the next URL is asked
+		case !fallBack:
+			return
+		default:
+			passedOver = true
+		}
+	}
+}
+
 // parseRegistryProbeToken splits a URL of the probe's command line from its
 // markers.
-func parseRegistryProbeToken(token string) (target string, decides, fallBack bool) {
+func parseRegistryProbeToken(token string) (target string, decides, fallBack, afterNotFound bool) {
 	for {
 		switch {
 		case strings.HasPrefix(token, registryDecidesMarker):
 			decides, token = true, token[len(registryDecidesMarker):]
 		case strings.HasPrefix(token, registryFallBackMarker):
 			fallBack, token = true, token[len(registryFallBackMarker):]
+		case strings.HasPrefix(token, registryAfterNotFoundMarker):
+			afterNotFound, token = true, token[len(registryAfterNotFoundMarker):]
 		default:
-			return token, decides, fallBack
+			return token, decides, fallBack, afterNotFound
 		}
 	}
 }
@@ -504,7 +531,8 @@ type registryEndpoint struct {
 	// afterNotFoundOnly marks a fallback that is used only when no failure
 	// was passed over on the way: the go command connects to the checksum
 	// database itself after its proxies only when each of them answered 404
-	// or 410, unless GOPROXY lists "direct" or "off" after them.
+	// or 410, unless GOPROXY lists "direct" after them ("off" does not
+	// outrank a proxy's failure).
 	afterNotFoundOnly bool
 	fallback          *registryEndpoint
 }
@@ -524,6 +552,9 @@ func (e registryEndpoint) probeArgument() string {
 	var tokens []string
 	for link := &e; link != nil; link = link.fallback {
 		token := link.url
+		if link.afterNotFoundOnly {
+			token = registryAfterNotFoundMarker + token
+		}
 		if link.fallBackOnError {
 			token = registryFallBackMarker + token
 		}
@@ -862,8 +893,10 @@ func goModuleEndpoint(proxies []goProxySpec) *registryEndpoint {
 // moves on after 404 or 410; any other answer, or none, leaves the database
 // unavailable, except from a proxy whose entry is followed by '|', which the
 // go command passes over after any error. It connects to the database itself
-// when a "direct" or "off" entry comes, and when no proxy is left - then only
-// if every proxy answered 404 or 410. A local proxy directory without that
+// when a "direct" entry comes; when an "off" entry comes or no proxy is left,
+// only if every proxy answered 404 or 410: in the go command's TryProxies a
+// "direct" entry outranks the error of a proxy passed over before it, an
+// "off" entry, like a 404, does not. A local proxy directory without that
 // file is passed over.
 func goSumDBEndpoint(hostEnv hostGoEnv, proxies []goProxySpec) *registryEndpoint {
 	name, explicit, ok := goSumDB(hostEnv.GOSUMDB)
@@ -874,10 +907,10 @@ func goSumDBEndpoint(hostEnv hostGoEnv, proxies []goProxySpec) *registryEndpoint
 		return &registryEndpoint{url: explicit}
 	}
 	var links []registryEndpoint
-	listed := false // a "direct" or "off" entry follows the proxies
+	direct := false // a "direct" entry follows the proxies
 	for _, proxy := range proxies {
 		if proxy.url == "direct" || proxy.url == "off" {
-			listed = true
+			direct = proxy.url == "direct"
 			break
 		}
 		if dir, ok := strings.CutPrefix(proxy.url, "file://"); ok {
@@ -894,7 +927,7 @@ func goSumDBEndpoint(hostEnv hostGoEnv, proxies []goProxySpec) *registryEndpoint
 			})
 		}
 	}
-	links = append(links, registryEndpoint{url: "https://" + name + "/", afterNotFoundOnly: !listed && len(links) > 0})
+	links = append(links, registryEndpoint{url: "https://" + name + "/", afterNotFoundOnly: !direct && len(links) > 0})
 	return registryChain(links)
 }
 

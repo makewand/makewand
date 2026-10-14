@@ -15,8 +15,10 @@ guard every caller delegates to.
 
 try:
     import _isolation  # noqa: F401
+    from _verdicts import nonced
 except ImportError:
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import nonced
 
 import contextlib
 import io
@@ -526,7 +528,7 @@ class ReviewContextTests(HostDeliveryCase):
         def dispatch(engine, prompt_text, cwd=None, readonly=False, **kwargs):
             if readonly:
                 prompts.append(prompt_text)
-                return True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None
+                return True, nonced(prompt_text, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'), None
             (Path(cwd) / "app.txt").write_text(SEVEN_LINES.replace("d\n", "D\n"))
             return True, "implemented", None
 

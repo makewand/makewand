@@ -1,8 +1,10 @@
 """Protected non-Git pipeline delivery uses real sealing and guarded apply."""
 try:
     import _isolation  # noqa: F401
+    from _verdicts import nonced
 except ImportError:
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import nonced
 
 import contextlib
 import io
@@ -52,7 +54,7 @@ class ProtectedNonGitPipelineDeliveryTests(unittest.TestCase):
             reviews.append(kwargs)
             self.assertTrue(kwargs["readonly"])
             verdict = {"pass": approved, "defects": [] if approved else ["[P2] fixture review rejection"]}
-            return True, "MAKEWAND_VERDICT: " + json.dumps(verdict), None
+            return True, nonced(prompt, "MAKEWAND_VERDICT: " + json.dumps(verdict)), None
 
         # Provider responses alone are controlled; copy/Git baseline, actual
         # local Python tests, frozen destination, commit/tree/patch validation,

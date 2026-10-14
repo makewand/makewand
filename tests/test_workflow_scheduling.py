@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _isolation  # noqa: F401
+from _verdicts import answer_with_nonce, nonced, nonced_result
 
 import contextlib
 import io
@@ -75,12 +76,12 @@ class SchedulingTests(unittest.TestCase):
                 if callback is not None:
                     value = callback(engine, kwargs)
                     if value is not None:
-                        return value
+                        return nonced_result(value, prompt)
                 if kwargs.get("readonly"):
                     verdict = ('MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}'
                                if current_context().get("workflow") == "race" else
                                'MAKEWAND_VERDICT: {"pass": true, "defects": []}')
-                    return True, verdict, None
+                    return True, nonced(prompt, verdict), None
                 (Path(kwargs["cwd"]) / "app.py").write_text("VALUE = 2\n")
                 return True, "implemented", None
             return execute
@@ -185,7 +186,7 @@ class SchedulingTests(unittest.TestCase):
         # e.g. agy rejecting its arguments before running: outcome known, nothing executed.
         rejected = ExecutionResult(False, "", "Antigravity 拒绝调用参数: invalid model selection", status="FAILED",
                                    engine="agy", readonly=True, outcome_known=True, error_kind="provider_configuration")
-        with patch.object(orch, "get_git_diff", return_value="changed"), patch.object(orch, "get_or_update_status", return_value={}), patch.object(orch, "_engine_usable", return_value=(True, "")), patch.object(orch, "dispatch_task", side_effect=[rejected, (True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None)]) as dispatch, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(orch, "get_git_diff", return_value="changed"), patch.object(orch, "get_or_update_status", return_value={}), patch.object(orch, "_engine_usable", return_value=(True, "")), patch.object(orch, "dispatch_task", side_effect=answer_with_nonce([rejected, (True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None)])) as dispatch, contextlib.redirect_stdout(io.StringIO()):
             orch.run_review(cwd=str(self.repo), output_json=True)
         self.assertEqual(dispatch.call_count, 2)
 

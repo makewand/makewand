@@ -329,24 +329,41 @@ class RaceApprovalTests(unittest.TestCase):
 
 
 class LegacyVerdictPolicyTests(unittest.TestCase):
+    # Environment variables that used to let an un-nonced verdict count (the test
+    # harness root among them); none of them changes the verdict any more.
     POLICY_ENV = ("MAKEWAND_STRICT_NONCE", "MAKEWAND_ALLOW_LEGACY_VERDICT", "MAKEWAND_TEST_ISOLATION_ROOT")
 
-    def test_race_and_review_verdicts_share_one_legacy_policy(self):
+    def test_no_environment_lets_an_unnonced_race_or_review_verdict_count(self):
         from makewand import review_contract
-        self.assertIs(orch._legacy_verdict_allowed, review_contract.legacy_verdict_allowed)
+        self.assertFalse(hasattr(review_contract, "legacy_verdict_allowed"))
+        self.assertFalse(hasattr(orch, "_legacy_verdict_allowed"))
         race_line = 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}'
         review_line = 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'
-        for env, allowed in (({}, False), ({"MAKEWAND_ALLOW_LEGACY_VERDICT": "1"}, True),
-                             ({"MAKEWAND_TEST_ISOLATION_ROOT": "/isolated"}, True),
-                             ({"MAKEWAND_ALLOW_LEGACY_VERDICT": "1", "MAKEWAND_STRICT_NONCE": "1"}, False)):
+        for env in ({}, {"MAKEWAND_ALLOW_LEGACY_VERDICT": "1"}, {"MAKEWAND_TEST_ISOLATION_ROOT": "/isolated"},
+                    {"MAKEWAND_ALLOW_LEGACY_VERDICT": "1", "MAKEWAND_STRICT_NONCE": "1"}):
             with self.subTest(env=env), patch.dict(os.environ, env, clear=False):
                 for key in self.POLICY_ENV:
                     if key not in env:
                         os.environ.pop(key, None)
-                self.assertIs(review_contract.legacy_verdict_allowed(), allowed)
-                self.assertEqual(orch.parse_nonced_race_verdict(race_line, "0a1b2c3d") is not None, allowed)
-                self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d")["status"]
-                                 == review_contract.REVIEW_PASSED, allowed)
+                self.assertIsNone(orch.parse_nonced_race_verdict(race_line, "0a1b2c3d"))
+                self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d")["status"],
+                                 review_contract.REVIEW_UNVERIFIED)
+                # The nonced lines count.
+                self.assertEqual(orch.parse_nonced_race_verdict(race_line.replace("VERDICT:", "VERDICT_0a1b2c3d:"),
+                                                                "0a1b2c3d")["winner"], "A")
+                self.assertEqual(review_contract.evaluate_review_verdict(
+                    review_line.replace("VERDICT:", "VERDICT_0a1b2c3d:"), nonce="0a1b2c3d")["status"],
+                    review_contract.REVIEW_PASSED)
+
+    def test_only_an_explicit_caller_reads_the_legacy_format(self):
+        from makewand import review_contract
+        review_line = 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'
+        self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d", allow_legacy=True)["status"],
+                         review_contract.REVIEW_PASSED)
+        self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d", allow_legacy=False)["status"],
+                         review_contract.REVIEW_UNVERIFIED)
+        self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d")["status"],
+                         review_contract.REVIEW_UNVERIFIED)
 
 
 if __name__ == "__main__":

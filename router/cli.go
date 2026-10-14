@@ -539,7 +539,9 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 	if err != nil {
 		return nil, completeProvider(attempt, Usage{}, err)
 	}
-	return observeDispatchStream(ctx, stream, attempt), nil
+	// A cancellation ends the stream once the CLI's own stream has ended,
+	// after its sandbox's credential write-back (streamEndWait).
+	return observeDispatchStream(ctx, stream, attempt, c.streamEndWait()), nil
 }
 
 func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
@@ -1559,6 +1561,13 @@ func (c *CLIProvider) messageCatalogName() string {
 // custom command): the phrases a quota or rate-limit error starts with, in
 // the catalog's dialect. As for a catalog CLI they count only at the start of
 // a message, and only in the error report the CLI ends with.
+//
+// They are not in cli_message_catalog.json, the source both engines share,
+// because only this engine needs them: custom commands (NewCommandCLI) are a
+// router feature, and the Python engine runs only the CLIs the catalog
+// describes (for any other name health.find_cli_messages finds nothing).
+// Patterns no Python code reads would be untested by the shared parity corpus
+// and would make the catalog say more than both engines do.
 var cliGenericKinds = map[string][]string{
 	"quota": {
 		`(?:(?:usage|spend|spending|credit|token|request|hourly|daily|weekly|monthly|session|5-hour|five-hour|plan|account|api) ){1,2}limit (?:reached|exceeded)\b`,
@@ -1661,10 +1670,11 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 	var file struct {
 		Lines     map[string]string `json:"lines"`
 		Providers map[string]struct {
-			Names      []string          `json:"names"`
-			OwnStreams []string          `json:"own_streams"`
-			Selection  map[string]string `json:"selection"`
-			Transcript *struct {
+			Names         []string          `json:"names"`
+			OwnStreams    []string          `json:"own_streams"`
+			AnswerStreams []string          `json:"answer_streams"`
+			Selection     map[string]string `json:"selection"`
+			Transcript    *struct {
 				Banner        string   `json:"banner"`
 				Section       string   `json:"section"`
 				PromptEcho    string   `json:"prompt_echo"`
@@ -1734,6 +1744,9 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 	}
 	for name, spec := range file.Providers {
 		prefix := "providers." + name + "."
+		if err := checkCLISelectionStreams(spec.OwnStreams, spec.AnswerStreams, spec.Selection); err != nil {
+			fail(fmt.Errorf("%s%w", prefix, err))
+		}
 		entry := &cliCatalogEntry{ownStreams: spec.OwnStreams, selection: spec.Selection, kinds: map[string]*regexp.Regexp{},
 			jsonReports: spec.JSONReports == true} // health.py: entry.get("json_reports") is True
 		for kind, patterns := range spec.Kinds {
@@ -1772,6 +1785,35 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 		return nil, firstErr
 	}
 	return c, nil
+}
+
+// checkCLISelectionStreams checks a catalog entry's streams against its
+// selection: own and answer streams are stdout or stderr, and the selection
+// 'lines' (every candidate line counts, also where a mode has no selection)
+// never reads a capture that holds the model's answer (answer streams): a
+// merged capture holds every stream, one captured apart the CLI's own
+// streams. A quota word in the answer would otherwise seal a pool.
+func checkCLISelectionStreams(own, answer []string, selection map[string]string) error {
+	for _, stream := range slices.Concat(own, answer) {
+		if stream != "stdout" && stream != "stderr" {
+			return fmt.Errorf("streams: unknown stream %q", stream)
+		}
+	}
+	lines := func(mode string) bool {
+		s, ok := selection[mode]
+		return !ok || s == "lines"
+	}
+	if lines("merged") && len(answer) > 0 {
+		return fmt.Errorf("selection.merged: 'lines' would read the model's answer (answer_streams %q)", answer)
+	}
+	if lines("apart") {
+		for _, stream := range own {
+			if slices.Contains(answer, stream) {
+				return fmt.Errorf("selection.apart: 'lines' would read the model's answer on %s, an own stream that is also an answer stream", stream)
+			}
+		}
+	}
+	return nil
 }
 
 // cliAlternation joins patterns the way health.py does: (?:p1)|(?:p2)|...
@@ -1920,6 +1962,8 @@ func (c *cliMessageCatalog) lines(output cliText, entry *cliCatalogEntry, transc
 	}
 	// Markdown code fences belong to the model's answer: what it quotes inside a
 	// closed fence is task content. An unclosed (truncated) fence hides nothing.
+	// The marks are markdown's, not catalog data: health.py's _FENCE_PREFIXES
+	// and cliOpenFence use the same two.
 	var fences []int
 	if output.openFence {
 		fences = append(fences, -1)

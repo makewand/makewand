@@ -1396,13 +1396,24 @@ func goTidyTagsMatch(x constraint.Expr, prefer bool) bool {
 // goProjectStringsLimit bounds the strings goProjectStrings returns.
 const goProjectStringsLimit = 1024
 
+// isSandboxHomeDir reports whether the directory path below root is the
+// sandbox HOME makewand creates in the project (sandboxHomeRelPath).
+func isSandboxHomeDir(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && strings.EqualFold(filepath.ToSlash(rel), sandboxHomeRelPath)
+}
+
 // goProjectStrings returns the strings of the project that the go command may
 // print as they are and that hold `Get "` - what a forged report of a failed
 // request needs: every token of each go.mod and go.work (string values
 // unquoted, raw tokens as written), and every string literal of the Go files.
-// It reads every such file in the project (but .git and makewand's own
-// directory), since a replacement directory can be anywhere in it; false
-// means not every file could be read.
+// It reads every such file in the project, since a replacement directory or
+// an imported package can be anywhere in it - in a directory named .makewand
+// too, which generated files may write. Skipped are only .git and the
+// sandbox HOME makewand creates (sandboxHomeRelPath: the tool caches of the
+// verification steps, the module cache among them), which generated files
+// cannot write (isProtectedWritePath). false means not every file could be
+// read.
 func (p *Project) goProjectStrings() ([]string, bool) {
 	root, err := p.execWorkingDir()
 	if err != nil {
@@ -1424,7 +1435,7 @@ func (p *Project) goProjectStrings() ([]string, bool) {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if path != root && (name == ".git" || name == ".makewand") {
+			if path != root && (name == ".git" || isSandboxHomeDir(root, path)) {
 				return filepath.SkipDir
 			}
 			return nil

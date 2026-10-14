@@ -166,7 +166,7 @@ func TestWritebackFix_R4_UnusablePrivateCopyIsReported(t *testing.T) {
 			if got, _ := os.ReadFile(host); string(got) != old {
 				t.Fatalf("host credential changed: %q", got)
 			}
-			if len(warnings) != 1 || !strings.Contains(warnings[0], host) || !strings.Contains(warnings[0], tc.want) ||
+			if len(warnings) != 1 || !writebackFixNamesHost(warnings[0], host) || !strings.Contains(warnings[0], tc.want) ||
 				!strings.Contains(warnings[0], "log in again on the host") {
 				t.Fatalf("an unusable private copy must be reported once, naming the file: %q", warnings)
 			}
@@ -187,7 +187,7 @@ func TestWritebackFix_R4_AbsentCredentialCopy(t *testing.T) {
 	if err := os.Mkdir(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if warnings := h.writeBack(); len(warnings) != 1 || !strings.Contains(warnings[0], host) ||
+	if warnings := h.writeBack(); len(warnings) != 1 || !writebackFixNamesHost(warnings[0], host) ||
 		!strings.Contains(warnings[0], "log in on the host") {
 		t.Fatalf("an unusable credential created in the sandbox must be reported: %q", warnings)
 	}

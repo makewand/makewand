@@ -133,12 +133,9 @@ func TestEstimateUsageForRouteUsesUnpricedFallbackAndStaysEstimated_Fix16(t *tes
 // fit the grant) instead of falling back to the fixed floor.
 func TestHTTPReservationCeilingIncludesUnpricedAPIModels_Fix16(t *testing.T) {
 	r := unpricedOpenAIRouter(t, "http://127.0.0.1:1")
-	price, ok := r.httpPriceCeiling("")
+	price, ok := r.httpPriceCeiling()
 	if !ok || price.Input < conservativeInputCostPer1M || price.Output < conservativeOutputCostPer1M {
 		t.Fatalf("price ceiling = %+v ok=%v, want at least the unpriced fallback rate", price, ok)
-	}
-	if pinned, ok := r.httpPriceCeiling("openai"); !ok || pinned != price {
-		t.Fatalf("pinned ceiling = %+v ok=%v, want %+v", pinned, ok, price)
 	}
 	prepared := &preparedHTTPChat{Router: r, Task: TaskCode, Messages: []Message{{Role: "user", Content: "hi"}}}
 	if got := r.httpReservationUSD(0.0001, prepared); got <= 0.0001 {

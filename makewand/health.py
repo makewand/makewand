@@ -386,8 +386,12 @@ def extract_reset_phrase(text: str) -> Optional[str]:
 #                   (gemini --output-format json): each is read as one line
 #   kinds           quota, rate, overload, auth and region patterns; a
 #                   "<kind>.marked" pattern counts only behind an error marker
-# Every pattern is RE2 compatible and matches case-insensitively at the start
-# of normalize_cli_line() text (Go: regexp.MustCompile(`(?i)^(?:` + p + `)`)).
+# Every pattern is RE2 compatible and matches at the start of normalize_cli_line()
+# text, case-insensitively for ASCII letters only: Python compiles it with
+# re.IGNORECASE | re.ASCII (cli_catalog_regex), Go with cliCatalogRegexp in
+# router/cli.go, which anchors it (`^(?:` + p + `)`) and spells out both cases of
+# each ASCII letter instead of using (?i), whose Unicode folding (the Kelvin sign
+# for k, the long s for s) Python's re.ASCII does not do.
 # ---------------------------------------------------------------------------
 CLI_MESSAGE_CATALOG_FILE = Path(__file__).with_name("cli_message_catalog.json")
 
@@ -411,8 +415,6 @@ CLI_MESSAGE_CATALOG: Dict[str, Dict[str, Tuple[str, ...]]] = {
 # Names a CLI prints in front of its own lines ("grok: ...", "muse: ...").
 CLI_NAMES = {provider: tuple(entry["names"]) for provider, entry in _CLI_PROVIDERS.items()}
 CLI_OWN_STREAMS = {provider: tuple(entry["own_streams"]) for provider, entry in _CLI_PROVIDERS.items()}
-# CLIs whose stderr is a transcript that relays the prompt, the answer and tool output (codex exec).
-CLI_TRANSCRIPT_PROVIDERS = tuple(provider for provider, entry in _CLI_PROVIDERS.items() if "transcript" in entry)
 
 CLI_MESSAGE_MAX_CHARS = 2000
 _APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'", "\u2032": "'"})
@@ -798,23 +800,6 @@ def _cli_selected_lines(provider: str, output: str, stderr: Optional[str], promp
                       json_reports=json_reports, warnings=warnings), own
 
 
-def cli_messages(output: str, cli_names: Tuple[str, ...] = (), *,
-                 transcript: bool = False) -> Iterator[Tuple[str, bool, str]]:
-    """Yields (message, marked, line) for every place a CLI message may start.
-
-    Each line the CLI may have written yields itself, then what follows every
-    leading element the CLI prints in front of its own messages: its name
-    ("grok:"), an error glyph, a bracketed timestamp or level, an error marker
-    or a gRPC status code. `marked` tells whether an error marker preceded the
-    message; behind one, the message after each lead-in clause is yielded too.
-    With `transcript`, codex exec's transcript rules apply (_cli_lines).
-    """
-    own = _cli_name_regex(cli_names)
-    rules = _transcript_rules("codex") if transcript else None
-    for message, marked, line, _chain in _cli_lines(output, rules, own):
-        yield from _message_starts(message, marked, line, own)
-
-
 @lru_cache(maxsize=64)
 def _catalog_patterns(provider: str, kind: str):
     entries = CLI_MESSAGE_CATALOG.get(provider, {})
@@ -958,11 +943,16 @@ _DEFINITE_FAILURE_SOURCES = ("dispatch", "probe")
 def _dispatch_failure_superseded(engine: str, info: Dict[str, Any]) -> bool:
     """A real CLI dispatch of `engine` succeeded after this failure verdict.
 
-    The usage ledger is written after every dispatch. A success served by the
-    cloud API ("route": "api") says nothing about the CLI. While a needs_auth
-    verdict is live the adapters may relay work to the API key, so with an API
-    key configured only a success recorded as a CLI run ("route": "cli") clears
-    it; ledger entries without a route count only without an API key.
+    The usage ledger is written after every dispatch, with the route its adapter
+    reported (usage.observe_dispatch_route) or, when the adapter reports none, the
+    one the configuration allowed at that time (usage.dispatch_route: "cli" when
+    no API relay was possible). A success served by the cloud API ("route":
+    "api") says nothing about the CLI. While a needs_auth verdict is live the
+    adapters may relay work to the API, so with an API key configured only a
+    success recorded as a CLI run ("route": "cli") clears it: an entry without a
+    route was written when a relay was possible (or by an older version) and
+    counts only without an API key. The current API policy does not decide
+    this; the policy at the time of the dispatch is in the entry's route.
     """
     if info.get("source") not in _DEFINITE_FAILURE_SOURCES:
         return False
@@ -1359,7 +1349,7 @@ def probe_model(
     timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
     now = datetime.now().isoformat()
-    from makewand.config import has_api_configured, has_subscription_configured, is_provider_enabled
+    from makewand.config import api_relay_available, api_relay_blocked_note, has_subscription_configured, is_provider_enabled
 
     if not is_provider_enabled(model_name):
         return {
@@ -1393,12 +1383,14 @@ def probe_model(
             "mode": "local"
         }
 
-    api_configured = has_api_configured(model_name)
+    # The adapters relay to the cloud API only with a key AND an API policy that
+    # allows paid calls; a key alone is no fallback (config.api_relay_available).
+    api_ready = api_relay_available(model_name)
     sub_configured = has_subscription_configured(model_name)
 
     # 2. Subscription CLI not installed
     if not sub_configured:
-        if api_configured:
+        if api_ready:
             return {
                 "status": "healthy",
                 "reason": f"未安装订阅 CLI，已启用纯 API Key 模式",
@@ -1406,16 +1398,18 @@ def probe_model(
                 "updated_at": now,
                 "mode": "api"
             }
+        blocked = api_relay_blocked_note(model_name)
         return {
             "status": "missing",
-            "reason": f"CLI 命令 '{model_name}' 未在系统 PATH 中找到，且未配置备用 API Key",
+            "reason": (f"CLI 命令 '{model_name}' 未在系统 PATH 中找到；{blocked}" if blocked
+                       else f"CLI 命令 '{model_name}' 未在系统 PATH 中找到，且未配置备用 API Key"),
             "resets_at": None,
             "updated_at": now,
             "mode": "none"
         }
 
     # 3. Subscription Probes
-    mode = "hybrid" if api_configured else "subscription"
+    mode = "hybrid" if api_ready else "subscription"
     if model_name in ("claude", "codex", "muse", "grok"):
         try:
             _validate_probe_policy(repo_trust)
@@ -1431,10 +1425,10 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_claude_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Claude Code 订阅运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Claude Code 订阅运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         if _probe_timed_out(code, ex):
             err_lower = (combined + " " + str(ex)).lower()
@@ -1452,10 +1446,10 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_codex_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Codex 订阅运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Codex 订阅运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         if _probe_timed_out(code, ex):
             err_lower = (combined + " " + str(ex)).lower()
@@ -1478,7 +1472,7 @@ def probe_model(
         if code == 0:
             version = out.strip() or "v1.x"
             sub_desc = (f"Antigravity 已安装 ({version})；仅版本检测，账号/地区可用性未经真实调用验证"
-                        + (" (已配置 API 备用兜底)" if api_configured else ""))
+                        + (" (已配置 API 备用兜底)" if api_ready else ""))
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now,
                     "mode": mode, "verified": False}
         return {"status": "warning", "reason": err.strip()[:100] or "agy 版本检测异常", "resets_at": None, "updated_at": now, "mode": mode}
@@ -1490,10 +1484,10 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_muse_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Muse Code (Meta 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Muse Code (Meta 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         if _probe_timed_out(code, ex):
             err_lower = (combined + " " + str(ex)).lower()
@@ -1509,10 +1503,10 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_grok_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Grok Build (xAI 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Grok Build (xAI 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         if _probe_timed_out(code, ex):
             err_lower = (combined + " " + str(ex)).lower()
@@ -1527,12 +1521,12 @@ def probe_model(
             code, out, err, ex = run_subprocess(["aider", "--version"], timeout=5, cwd=neutral)
         if code == 0:
             version = out.strip().replace("aider ", "v")
-            sub_desc = f"Aider AI Pair Programmer ({version}) 运行就绪" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = f"Aider AI Pair Programmer ({version}) 运行就绪" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         return {"status": "warning", "reason": err.strip()[:100] or "aider 版本检测异常", "resets_at": None, "updated_at": now, "mode": mode}
 
     elif model_name in ("deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
-        if api_configured:
+        if api_ready:
             return {
                 "status": "healthy",
                 "reason": f"{model_name.upper()} 云端 API 就绪",
@@ -1617,9 +1611,9 @@ def _probe_agy_for_real(*, repo_trust: str = "trusted", cwd: Optional[str] = Non
     Its verdicts carry "source": "probe".
     """
     from makewand.providers.agy import classify_agy_failure, _agy_user_facing
-    from makewand.config import has_api_configured
+    from makewand.config import api_relay_available
     now = datetime.now().isoformat()
-    mode = "hybrid" if has_api_configured("agy") else "subscription"
+    mode = "hybrid" if api_relay_available("agy") else "subscription"
     t = _resolve_probe_timeout("agy", timeout or 60, tier="fast", effort="low")
     command = ["agy", "-p", "echo ok", "--print-timeout", f"{t}s", "--disable-slash-commands", "--mode", "plan"]
     code, out, err, ex = _run_model_probe("agy", command, timeout=t, repo_trust=repo_trust, cwd=cwd)

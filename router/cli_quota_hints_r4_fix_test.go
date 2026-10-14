@@ -146,6 +146,13 @@ func TestGeminiCLIRefusalsSealTheLegacyTransport_R4(t *testing.T) {
 
 // Classifying even the largest stderr the capture keeps (10 MiB) is cheap,
 // and a refusal the CLI ends with is still found.
+//
+// The allocation bounds are checked in normal builds only. Under -race the
+// runtime drops part of what is put back into a sync.Pool, so a regexp match
+// may allocate afresh the matcher state the regexp package pools (about 40
+// KiB for each catalog pattern the tail's lines are tried against): hundreds
+// of MiB here, with the same work done and the same verdicts. A race build
+// still checks the verdicts and the time, with raceSlowdown more room.
 func TestCLIQuotaClassificationCostIsBounded_R4(t *testing.T) {
 	const size = 10 << 20
 	ends := map[string]string{
@@ -169,10 +176,10 @@ func TestCLIQuotaClassificationCostIsBounded_R4(t *testing.T) {
 			if fillerSealed || !refusalSealed {
 				t.Errorf("%s, %q filler: sealed=%t, with its refusal at the end sealed=%t", cli, unit, fillerSealed, refusalSealed)
 			}
-			if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 32<<20 {
+			if alloc := after.TotalAlloc - before.TotalAlloc; !raceEnabled && alloc > 32<<20 {
 				t.Errorf("%s, %q filler: classifying 2 x 10 MiB allocated %d MiB", cli, unit, alloc>>20)
 			}
-			if elapsed > 3*time.Second {
+			if elapsed > 3*raceSlowdown*time.Second {
 				t.Errorf("%s, %q filler: classifying 2 x 10 MiB took %v", cli, unit, elapsed)
 			}
 		}
@@ -190,7 +197,7 @@ func TestCLIQuotaClassificationCostIsBounded_R4(t *testing.T) {
 		cmd.Env = append(os.Environ(), "MAKEWAND_CLAUDE_ERROR_TEST_R4_STDERR_BYTES="+strconv.Itoa(size-1<<20), "GORACE=atexit_sleep_ms=0")
 		return cmd
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), raceSlowdown*time.Minute)
 	defer cancel()
 	var before, after runtime.MemStats
 	runtime.GC()
@@ -202,10 +209,10 @@ func TestCLIQuotaClassificationCostIsBounded_R4(t *testing.T) {
 	if !r4Sealed(err) {
 		t.Errorf("claude envelope refusal behind 9 MiB of stderr classified as %.200v", err)
 	}
-	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 256<<20 {
+	if alloc := after.TotalAlloc - before.TotalAlloc; !raceEnabled && alloc > 256<<20 {
 		t.Errorf("claude error path on 9 MiB of stderr allocated %d MiB", alloc>>20)
 	}
-	if elapsed > 15*time.Second {
+	if elapsed > 15*raceSlowdown*time.Second {
 		t.Errorf("claude error path on 9 MiB of stderr took %v", elapsed)
 	}
 }

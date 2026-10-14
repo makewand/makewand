@@ -105,14 +105,15 @@ class PreExistingDirectoryTests(GateTestCase):
         self.assertEqual(removed, changed)
         self.assertFalse((repo / "test-results").exists())
 
-    def test_directory_record_skips_git_metadata_links_and_ignored_trees(self):
+    def test_directory_record_skips_git_metadata_and_links_and_does_not_walk_ignored_trees(self):
         repo = self.make_repo([], gitignore="__pycache__/\nnode_modules/\n")
         for rel in ("node_modules/pkg/lib", "src/empty", "reports"):
             (repo / rel).mkdir(parents=True)
         (repo / "linked").symlink_to(repo / "src")
         found = orch._existing_directories(str(repo))
-        self.assertTrue({"src", "src/empty", "reports"} <= found, found)
-        self.assertFalse({"node_modules", "node_modules/pkg", "linked", ".git"} & found, found)
+        # An ignored tree is recorded as existing (ignored-dir-edge); its content is not walked.
+        self.assertTrue({"src", "src/empty", "reports", "node_modules"} <= found, found)
+        self.assertFalse({"node_modules/pkg", "node_modules/pkg/lib", "linked", ".git"} & found, found)
         self.assertFalse(any(rel.startswith(".git/") for rel in found))
 
 

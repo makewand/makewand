@@ -98,8 +98,15 @@ class NoUsableEngineTests(unittest.TestCase):
         self.explain(dict(UNUSABLE, codex=live("healthy", "ok")))
         self.assertEqual(self.calls, ["codex"])
         self.calls.clear()
-        self.explain(UNUSABLE, forced_engine="claude")
-        self.assertEqual(self.calls, ["claude"])  # an explicit choice is the user's, as before
+        # A usable forced engine runs even when nothing else is usable ...
+        self.explain(dict(UNUSABLE, claude=live("healthy", "ok")), forced_engine="claude")
+        self.assertEqual(self.calls, ["claude"])
+        self.calls.clear()
+        # ... an unusable one is refused with its own reason (forced-engine).
+        result, log = self.explain(UNUSABLE, forced_engine="claude")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(result.status, "UNVERIFIED")
+        self.assertIn("broken CLI", result.error)
 
     def test_explain_with_no_active_provider_points_to_setup(self):
         with self.routing({}, active=()) as out, patch.object(orch, "classify_prompt_intent", return_value="explain"):

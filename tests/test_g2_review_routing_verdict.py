@@ -22,6 +22,11 @@ import makewand.config as config
 import makewand.orchestrator as orch
 from makewand.git_helper import run_git_cmd
 
+try:
+    from _verdicts import nonced
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests._verdicts import nonced
+
 PASS_LINE = 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'
 FAIL_LINE = 'MAKEWAND_VERDICT: {"pass": false, "defects": ["[P1] off-by-one in reverse()"]}'
 
@@ -197,7 +202,7 @@ class PipelineFixture(unittest.TestCase):
                 elif fixer:
                     fixer(Path(cwd))
                 return True, "implemented", None
-            return True, reviews.pop(0) if reviews else "", None
+            return True, nonced(prompt, reviews.pop(0)) if reviews else "", None
 
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
@@ -308,7 +313,7 @@ class TestRunReviewVerdict(unittest.TestCase):
 
         def codex(prompt, **kwargs):
             seen.append(prompt)
-            return True, outputs.pop(0) if outputs else "", None
+            return True, nonced(prompt, outputs.pop(0)) if outputs else "", None
 
         buf = io.StringIO()
         with patch.object(orch, "get_git_diff", return_value=self.DIFF), \

@@ -17,7 +17,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 from makewand.config import (
     c, COLOR_BLUE, COLOR_CYAN, COLOR_GREEN, COLOR_PURPLE,
     COLOR_RED, COLOR_YELLOW, COLOR_BOLD, is_provider_enabled,
-    has_subscription_configured, has_api_configured
+    has_subscription_configured
 )
 from makewand.discovery import get_provider_model_tier
 from makewand.review_verdict import extract_review_verdict_dict
@@ -62,18 +62,12 @@ def resolve_ensemble_providers(
     # Validate availability of each candidate
     selected: List[str] = []
     from makewand.health import load_status_cache
-    from makewand.engine_selection import _API_RELAY_STATUSES, _engine_usable
+    from makewand.config import api_relay_available, api_relay_blocked_note
+    from makewand.engine_selection import _engine_usable, _usable_or_api_relay
     cache = load_status_cache()
 
     skipped: Dict[str, str] = {} if unavailable is None else unavailable
     local_state: List[Tuple[bool, str]] = []
-
-    def usable(p: str) -> bool:
-        # Not known to fail (error, needs_auth, limited), unless the adapter
-        # relays that state to a configured API key.
-        info = cache.get(p)
-        status = info.get("status") if isinstance(info, dict) else None
-        return _engine_usable(p, cache)[0] or (status in _API_RELAY_STATUSES and has_api_configured(p))
 
     def why_not(p: str) -> Optional[str]:
         """None when `p` can run now, otherwise why not."""
@@ -86,10 +80,16 @@ def resolve_ensemble_providers(
                 local_state.append((bool(avail), str(reason or "").strip()))
             avail, reason = local_state[0]
             return None if avail else (reason or "本地模型服务未响应或没有可用模型")
-        if not (has_subscription_configured(p) or has_api_configured(p)):
-            return "未安装订阅 CLI，且未配置 API Key"
-        if not usable(p):
-            return _engine_usable(p, cache)[1] or "当前不可用"
+        if not (has_subscription_configured(p) or api_relay_available(p)):
+            blocked = api_relay_blocked_note(p)
+            return f"未安装订阅 CLI；{blocked}" if blocked else "未安装订阅 CLI，且未配置 API Key"
+        # Not known to fail (error, needs_auth, limited), unless the adapter relays
+        # that state to the API, which it does only with a key and an API policy
+        # that allows paid calls (engine_selection._usable_or_api_relay).
+        if not _usable_or_api_relay(p, cache):
+            why = _engine_usable(p, cache)[1] or "当前不可用"
+            blocked = api_relay_blocked_note(p)
+            return f"{why}；{blocked}" if blocked else why
         return None
 
     for p in candidates:

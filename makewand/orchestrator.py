@@ -52,6 +52,7 @@ from makewand.git_helper import (
     find_git_root,
     get_submodule_paths,
     PATCH_EXPORT_FLAGS,
+    _json_text,
     _printable,
     _shell_quote,
 )
@@ -72,27 +73,13 @@ AUTO_FIX_MIN_ROUND_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_ROUND_SE
 AUTO_FIX_MIN_REVIEW_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_REVIEW_SECONDS", "15.0"))
 
 
-def print(*values, **kwargs):  # noqa: A001 - this module's messages only
-    """builtins.print for this module's messages. They carry workspace and file names,
-    git and provider errors and the user's prompt, any of which may hold undecodable
-    bytes (surrogate escapes from os.fsdecode or git output): those are shown as \\xNN
-    (git_helper._printable) instead of raising UnicodeEncodeError on a UTF-8 stream."""
+def _print(*values, **kwargs):
+    """print() for this module's messages, which every message here goes through. They
+    carry workspace and file names, git and provider errors and the user's prompt, any
+    of which may hold undecodable bytes (surrogate escapes from os.fsdecode or git
+    output): those are shown as \\xNN (git_helper._printable) instead of raising
+    UnicodeEncodeError on a UTF-8 stream."""
     builtins.print(*(_printable(value if isinstance(value, str) else str(value)) for value in values), **kwargs)
-
-
-def _utf8_size(text: Optional[str]) -> int:
-    """Size in bytes of text from git or the filesystem: an undecodable byte (a
-    surrogate escape) counts as the one byte it stands for, never raising."""
-    try:
-        return len((text or "").encode("utf-8", "surrogateescape"))
-    except UnicodeEncodeError:  # a lone surrogate that no file name produced
-        return len((text or "").encode("utf-8", "surrogatepass"))
-
-
-def _prompt_size(prompt: Optional[str]) -> int:
-    """Size in bytes of a prompt as dispatch_task sends it (undecodable bytes as \\xNN),
-    which is what reviewer_receives_whole_prompt measures."""
-    return len(_printable(prompt or "").encode("utf-8"))
 
 
 def _get_git_dirty_entries(root_path: Path) -> List[Tuple[str, str]]:
@@ -232,6 +219,7 @@ from makewand.engine_selection import (
     RELIABILITY_MIN_FACTOR,
     ENGINES_WITHOUT_EXECUTOR,
     NON_AGENTIC_CHAT_MODELS,
+    API_ONLY_ENGINES,
     _match_domain_keywords,
     burn_rate_factor,
     apply_burn_rate_penalty,
@@ -242,6 +230,10 @@ from makewand.engine_selection import (
     _no_provider_error,
     _engine_usable,
     _select_race_judge,
+    forced_engine_name,
+    forced_engine_refusal,
+    forced_engine_error,
+    forced_engine_refusal_lines,
 )
 from makewand import task_dag as _task_dag
 from makewand.task_dag import (
@@ -265,7 +257,7 @@ from makewand.review_contract import (
     generate_review_nonce,
     prepare_review_diff,
     review_digest,
-    legacy_verdict_allowed as _legacy_verdict_allowed,
+    dispatched_size,
     reviewer_prompt_limit,
     reviewer_receives_whole_prompt,
     REVIEW_PASSED,
@@ -312,8 +304,8 @@ def review_diff_max_bytes() -> int:
             return value
         if not _review_cap_warning_shown:
             _review_cap_warning_shown = True
-            print(c(f"⚠ {REVIEW_DIFF_MAX_BYTES_ENV}={raw!r} 不是正整数，复审 diff 上限使用默认值 "
-                    f"{REVIEW_DIFF_MAX_BYTES_DEFAULT} 字节。", COLOR_YELLOW), file=sys.stderr)
+            _print(c(f"⚠ {REVIEW_DIFF_MAX_BYTES_ENV}={raw!r} 不是正整数，复审 diff 上限使用默认值 "
+                     f"{REVIEW_DIFF_MAX_BYTES_DEFAULT} 字节。", COLOR_YELLOW), file=sys.stderr)
     return REVIEW_DIFF_MAX_BYTES_DEFAULT
 
 
@@ -327,12 +319,12 @@ def parse_nonced_race_verdict(report: Optional[str], nonce: str) -> Optional[Dic
     """Only one ``MAKEWAND_RACE_VERDICT_<nonce>:`` line can authorize a race candidate.
 
     Candidate content cannot predict the per-task nonce, so a verdict line that a
-    judge echoes from a candidate diff is inert. Validation is parse_race_verdict's.
+    judge echoes from a candidate diff is inert, and so is every un-nonced
+    ``MAKEWAND_RACE_VERDICT:`` line, whatever the environment. Validation is
+    parse_race_verdict's.
     """
     tag = f"MAKEWAND_RACE_VERDICT_{nonce}:"
     lines = [line.strip() for line in (report or "").splitlines() if line.strip().startswith(tag)]
-    if not lines:
-        return parse_race_verdict(report) if _legacy_verdict_allowed() else None
     if len(lines) != 1:
         return None
     return parse_race_verdict("MAKEWAND_RACE_VERDICT:" + lines[0][len(tag):])
@@ -368,30 +360,31 @@ def _select_wta_reviewer(cache, winner_engine: str, contestants, cross_review_re
     """Read-only reviewer for a race winner (a Winner-Take-All candidate, or a judge's pick
     when the judge shares the winner's provider).
 
-    With cross review required (always for a race) the winner's own provider
-    never reviews it. The configured race judge is preferred, then any other
-    non-contestant, then the other contestant; never a reviewer that cannot
-    receive the whole review_prompt.
+    Chosen by the race judge's rule (_select_independent_race_judge): the configured
+    judge first, then the judge order, and a provider independent of both
+    contestants is preferred, so that the approval is independent of the race -
+    never agy merely because it is the configured judge when agy was the losing
+    contestant. When no independent reviewer can take the review, the judge
+    picker's fallback applies (the first in that order, a contestant included),
+    except that with cross review required (always for a race) the winner's own
+    provider never reviews it. Never a reviewer that cannot receive the whole
+    review_prompt.
     """
     from makewand.engine_selection import _RACE_JUDGE_ORDER
     winner = (winner_engine or "").lower()
-
-    def eligible(engine):
-        return bool(engine) and engine.lower() != winner and reviewer_receives_whole_prompt(engine, review_prompt)
-
-    judge = _select_race_judge(cache, contestants)
-    if eligible(judge):
-        return judge
-    usable = [e for e in _RACE_JUDGE_ORDER if eligible(e) and _engine_usable(e, cache)[0]]
+    preferred = _select_race_judge(cache, contestants)
+    candidates = dict.fromkeys(([preferred] if preferred else [])
+                               + [e for e in _RACE_JUDGE_ORDER if _engine_usable(e, cache)[0]])
+    others = [e for e in candidates if e.lower() != winner and reviewer_receives_whole_prompt(e, review_prompt)]
     taken = {e.lower() for e in contestants if e}
-    for engine in usable:
-        if engine not in taken:
-            return engine
-    if usable:
-        return usable[0]
+    independent = [e for e in others if e.lower() not in taken]
+    if independent:
+        return independent[0]
+    if others:
+        return others[0]  # the judge picker's fallback: the other contestant
     if (not cross_review_required and winner and _engine_usable(winner, cache)[0]
             and reviewer_receives_whole_prompt(winner, review_prompt)):
-        return winner
+        return winner  # the last resort when cross review is not required
     return None
 
 
@@ -543,13 +536,15 @@ def _purge_transient_bytecode(root: str, baseline: Optional[str]) -> List[str]:
 
 
 def _existing_directories(root: str) -> Optional[set]:
-    """The directories below root (relative, '/' separated) that a test run can put
-    test output in, recorded before it runs so that _discard_created_test_output
-    keeps the ones that already existed, empty ones included: every directory except
-    .git, links and what no workspace snapshot lists files of - in a git work tree
-    the directories .gitignore covers (also inside nested repositories), elsewhere
-    those named in ALL_IGNORE_DIRS (workspace_snapshot). None when they cannot be
-    listed within the snapshot's time and entry limits; then no directory is removed."""
+    """The directories below root (relative, '/' separated) that exist before a test
+    run, so that _discard_created_test_output keeps them afterwards, empty ones
+    included: every directory except .git and links. What no workspace snapshot
+    lists files of - in a git work tree the directories .gitignore covers (also
+    inside nested repositories), elsewhere those named in ALL_IGNORE_DIRS
+    (workspace_snapshot) - is recorded as existing but not walked into: such a
+    directory that held only ignored files survives even when the tests delete
+    them. None when they cannot be listed within the snapshot's time and entry
+    limits; then no directory is removed."""
     if os.name == "nt":
         return set()
     from makewand.artifact import ALL_IGNORE_DIRS, _get_snapshot_limits
@@ -583,11 +578,12 @@ def _existing_directories(root: str) -> Optional[set]:
             rel = f"{relative}/{name}" if relative else name
             if name == ".git" or os.path.islink(os.path.join(current, name)):
                 continue
-            if (rel in pruned) if in_git else (name in ALL_IGNORE_DIRS):
-                continue
-            kept.append(name)
             found.add(rel)
+            if not ((rel in pruned) if in_git else (name in ALL_IGNORE_DIRS)):
+                kept.append(name)  # an ignored tree is recorded, its content never walked
         directories[:] = kept
+    if time.monotonic() - started > timeout_secs or len(found) > max_entries:
+        return None  # the limits also cover the last directories listed
     return found
 
 
@@ -679,32 +675,237 @@ def _snapshot_change_note(note: str, before: Dict[str, Any], after: Dict[str, An
     return f"{note}: {_printable(shown)}"
 
 
-def _gitignore_fallback_ignored(rel: str, patterns: List[str]) -> bool:
-    """Whether the root .gitignore patterns cover rel, for a directory where git
-    check-ignore cannot run: the last matching pattern decides (a "!" pattern
-    re-includes); a pattern without a slash matches a file name or a directory name
-    at any depth, one with a slash (or a leading one) the path or a leading
-    directory of it from the root, and one ending in "/" only directories. A name
-    merely containing a pattern (src/environment.js for env/) is not covered."""
-    import fnmatch
-    parts = rel.replace("\\", "/").split("/")
-    ignored = False
-    for pattern in patterns:
-        negated = pattern.startswith("!")
-        body = pattern[1:] if negated else pattern
-        directory_only = body.endswith("/")
-        anchored = "/" in body.rstrip("/")
-        body = body.strip("/")
-        if not body:
+# .gitignore matching for _gitignore_fallback_ignored: git's own rules (dir.c's
+# pattern parsing and last-match lookup, wildmatch.c with WM_PATHNAME), on the
+# bytes of the path and the patterns.
+_GLOB_STAR, _GLOB_QUESTION, _GLOB_OPEN, _GLOB_ESCAPE, _GLOB_SLASH = 42, 63, 91, 92, 47
+_GLOB_SPECIAL = frozenset((_GLOB_STAR, _GLOB_QUESTION, _GLOB_OPEN, _GLOB_ESCAPE))
+_WM_MATCH, _WM_NOMATCH, _WM_ABORT_ALL, _WM_ABORT_TO_STARSTAR = 0, 1, -1, -2
+_GLOB_PUNCT = frozenset(b"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_GLOB_CLASSES = {  # git's ASCII-only character classes
+    b"alnum": lambda ch: 48 <= ch <= 57 or 65 <= ch <= 90 or 97 <= ch <= 122,
+    b"alpha": lambda ch: 65 <= ch <= 90 or 97 <= ch <= 122,
+    b"blank": lambda ch: ch in (9, 32),
+    b"cntrl": lambda ch: ch < 32 or ch == 127,
+    b"digit": lambda ch: 48 <= ch <= 57,
+    b"graph": lambda ch: 33 <= ch <= 126,
+    b"lower": lambda ch: 97 <= ch <= 122,
+    b"print": lambda ch: 32 <= ch <= 126,
+    b"punct": lambda ch: ch in _GLOB_PUNCT,
+    b"space": lambda ch: ch in (9, 10, 13, 32),
+    b"upper": lambda ch: 65 <= ch <= 90,
+    b"xdigit": lambda ch: 48 <= ch <= 57 or 65 <= ch <= 70 or 97 <= ch <= 102,
+}
+
+
+def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool) -> int:
+    """git's dowild(): "*" and "?" never match "/" with pathname, a "**" between
+    slashes (or at an end) matches any number of directories, "[...]" is a set
+    ("!" or "^" negates, ranges, [:class:], "\\" escapes) and "\\" quotes a byte."""
+    start, np, nt = pi, len(p), len(t)
+    while pi < np:
+        p_ch = p[pi]
+        t_ch = t[ti] if ti < nt else None
+        if t_ch is None and p_ch != _GLOB_STAR:
+            return _WM_ABORT_ALL
+        if p_ch == _GLOB_ESCAPE:
+            pi += 1
+            if pi >= np or t_ch != p[pi]:
+                return _WM_NOMATCH
+        elif p_ch == _GLOB_QUESTION:
+            if pathname and t_ch == _GLOB_SLASH:
+                return _WM_NOMATCH
+        elif p_ch == _GLOB_STAR:
+            pi += 1
+            if pi < np and p[pi] == _GLOB_STAR:
+                before = pi - 2
+                pi += 1
+                while pi < np and p[pi] == _GLOB_STAR:
+                    pi += 1
+                following = p[pi] if pi < np else None
+                if ((before < start or p[before] == _GLOB_SLASH)
+                        and (following is None or following == _GLOB_SLASH
+                             or (following == _GLOB_ESCAPE and pi + 1 < np and p[pi + 1] == _GLOB_SLASH))):
+                    if following == _GLOB_SLASH and _wildmatch(p, pi + 1, t, ti, pathname) == _WM_MATCH:
+                        return _WM_MATCH
+                    match_slash = True
+                else:
+                    match_slash = False
+            else:
+                match_slash = not pathname
+            following = p[pi] if pi < np else None
+            if following is None:
+                if not match_slash and t.find(b"/", ti) >= 0:
+                    return _WM_NOMATCH
+                return _WM_MATCH
+            if not match_slash and following == _GLOB_SLASH:
+                slash = t.find(b"/", ti)
+                if slash < 0:
+                    return _WM_NOMATCH
+                pi, ti = pi + 1, slash + 1  # one "*" matches up to the next directory
+                continue
+            while t_ch is not None:
+                if following not in _GLOB_SPECIAL:
+                    while True:
+                        t_ch = t[ti] if ti < nt else None
+                        if t_ch is None or (not match_slash and t_ch == _GLOB_SLASH) or t_ch == following:
+                            break
+                        ti += 1
+                    if t_ch != following:
+                        return _WM_ABORT_TO_STARSTAR if match_slash else _WM_NOMATCH
+                matched = _wildmatch(p, pi, t, ti, pathname)
+                if matched != _WM_NOMATCH:
+                    if not match_slash or matched != _WM_ABORT_TO_STARSTAR:
+                        return matched
+                elif not match_slash and t_ch == _GLOB_SLASH:
+                    return _WM_ABORT_TO_STARSTAR
+                ti += 1
+                t_ch = t[ti] if ti < nt else None
+            return _WM_ABORT_ALL
+        elif p_ch == _GLOB_OPEN:
+            pi += 1
+            p_ch = p[pi] if pi < np else None
+            negated = p_ch in (33, 94)  # "!" or "^"
+            if negated:
+                pi += 1
+                p_ch = p[pi] if pi < np else None
+            previous = 0
+            matched = False
+            while True:  # the first member may be "]"
+                if p_ch is None:
+                    return _WM_ABORT_ALL
+                if p_ch == _GLOB_ESCAPE:
+                    pi += 1
+                    p_ch = p[pi] if pi < np else None
+                    if p_ch is None:
+                        return _WM_ABORT_ALL
+                    if t_ch == p_ch:
+                        matched = True
+                elif p_ch == 45 and previous and pi + 1 < np and p[pi + 1] != 93:  # a range "a-z"
+                    pi += 1
+                    p_ch = p[pi]
+                    if p_ch == _GLOB_ESCAPE:
+                        pi += 1
+                        p_ch = p[pi] if pi < np else None
+                        if p_ch is None:
+                            return _WM_ABORT_ALL
+                    if previous <= t_ch <= p_ch:
+                        matched = True
+                    p_ch = 0
+                elif p_ch == _GLOB_OPEN and pi + 1 < np and p[pi + 1] == 58:  # "[:class:]"
+                    name_start = pi = pi + 2
+                    while pi < np and p[pi] != 93:
+                        pi += 1
+                    if pi >= np:
+                        return _WM_ABORT_ALL
+                    if pi - name_start - 1 < 0 or p[pi - 1] != 58:
+                        pi = name_start - 2  # no ":]": the "[" is an ordinary member
+                        p_ch = _GLOB_OPEN
+                        if t_ch == p_ch:
+                            matched = True
+                    else:
+                        test = _GLOB_CLASSES.get(p[name_start:pi - 1])
+                        if test is None:
+                            return _WM_ABORT_ALL
+                        if test(t_ch):
+                            matched = True
+                        p_ch = 0
+                elif t_ch == p_ch:
+                    matched = True
+                previous = p_ch
+                pi += 1
+                p_ch = p[pi] if pi < np else None
+                if p_ch == 93:
+                    break
+            if matched == negated or (pathname and t_ch == _GLOB_SLASH):
+                return _WM_NOMATCH
+        elif t_ch != p_ch:
+            return _WM_NOMATCH
+        pi += 1
+        ti += 1
+    return _WM_MATCH if ti >= nt else _WM_NOMATCH
+
+
+def _gitignore_rules(lines: List[str]) -> List[Tuple[bool, bool, bool, bytes]]:
+    """(negated, directory_only, basename_only, pattern) for each pattern line, as git
+    parses them: blank lines and lines starting with "#" are skipped, a carriage
+    return before the newline is dropped, trailing spaces go unless escaped ("\\ "),
+    a leading "!" negates (a leading "\\!" or "\\#" is literal), one trailing "/"
+    limits it to directories, and a pattern without another "/" matches a name at
+    any depth."""
+    rules = []
+    for number, line in enumerate(lines):
+        raw = os.fsencode(line)
+        if number == 0 and raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        if not raw or raw.startswith(b"#"):
             continue
-        names = parts[:-1] if directory_only else parts
-        if anchored:
-            matched = any(fnmatch.fnmatchcase("/".join(parts[:depth]), body) for depth in range(1, len(names) + 1))
-        else:
-            matched = any(fnmatch.fnmatchcase(name, body) for name in names)
+        last_space, index = None, 0
+        while index < len(raw):  # dir.c trim_trailing_spaces()
+            if raw[index] == 32:
+                last_space = index if last_space is None else last_space
+            elif raw[index] == _GLOB_ESCAPE:
+                index += 1
+                if index >= len(raw):
+                    last_space = None
+                    break
+                last_space = None
+            else:
+                last_space = None
+            index += 1
+        if last_space is not None:
+            raw = raw[:last_space]
+        negated = raw.startswith(b"!")
+        if negated:
+            raw = raw[1:]
+        directory_only = raw.endswith(b"/")
+        if directory_only:
+            raw = raw[:-1]
+        if raw:
+            rules.append((negated, directory_only, b"/" not in raw, raw))
+    return rules
+
+
+def _gitignore_last_match(path: bytes, is_dir: bool, rules) -> Optional[bool]:
+    """True (ignored) or False (re-included) by the last rule that matches path, or None."""
+    basename = path.rsplit(b"/", 1)[-1]
+    for negated, directory_only, basename_only, pattern in reversed(rules):
+        if directory_only and not is_dir:
+            continue
+        if basename_only:
+            matched = _wildmatch(pattern, 0, basename, 0, False) == _WM_MATCH
+        else:  # anchored at the .gitignore's directory; one leading "/" only says so
+            matched = _wildmatch(pattern[1:] if pattern.startswith(b"/") else pattern, 0, path, 0, True) == _WM_MATCH
         if matched:
-            ignored = not negated
-    return ignored
+            return not negated
+    return None
+
+
+def _gitignore_fallback_ignored(rel: str, patterns: List[str]) -> bool:
+    """Whether the root .gitignore lines ``patterns`` cover the file rel, for a directory
+    where git check-ignore cannot run, by git's own rules: the last matching pattern
+    decides and "!" re-includes, but nothing inside an ignored directory can be
+    re-included (each leading directory is looked up first); "*" and "?" never
+    match "/", a leading "**/" matches any number of directories (none included),
+    a trailing "/**" everything inside, "a/**/b" any number of directories between;
+    "[...]" sets with ranges and [:class:]es, "\\" escapes, trailing spaces as in
+    _gitignore_rules. Matching works on the bytes of the names (os.fsencode), so
+    "?" is one byte as in git. A name merely containing a pattern
+    (src/environment.js for env/) is not covered."""
+    return _gitignore_rules_ignore(rel, _gitignore_rules(patterns))
+
+
+def _gitignore_rules_ignore(rel: str, rules) -> bool:
+    """_gitignore_fallback_ignored with the lines already parsed (_gitignore_rules)."""
+    if os.sep == "\\":
+        rel = rel.replace("\\", "/")
+    parts = os.fsencode(rel).split(b"/")
+    for depth in range(1, len(parts)):
+        if _gitignore_last_match(b"/".join(parts[:depth]), True, rules):
+            return True
+    return bool(_gitignore_last_match(b"/".join(parts), False, rules))
 
 
 def _filter_non_deliverable_test_changes(paths: List[str], cwd: str) -> List[str]:
@@ -752,14 +953,15 @@ def _filter_non_deliverable_test_changes(paths: List[str], cwd: str) -> List[str
     if not gitignore_file.is_file():
         return candidates
     try:
-        lines = gitignore_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        # Lines as git reads them: bytes split at "\n" (the names compare as bytes too).
+        lines = os.fsdecode(gitignore_file.read_bytes()).split("\n")
     except OSError:
         return candidates
-    patterns = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
-    if not patterns:
+    rules = _gitignore_rules(lines)
+    if not rules:
         return candidates
     tracked = tracked_paths(cwd)
-    return [p for p in candidates if p.replace("\\", "/") in tracked or not _gitignore_fallback_ignored(p, patterns)]
+    return [p for p in candidates if p.replace("\\", "/") in tracked or not _gitignore_rules_ignore(p, rules)]
 
 
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
@@ -791,7 +993,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             if not syntax_ok:
                 return False, "代码静态语法校验失败 (Fast Syntax Gate):\n" + "\n".join(syntax_errs)
     except Exception as e:
-        print(c(f"⚠️ [Fast Syntax Gate] 语法预检执行提示: {e}", COLOR_YELLOW), file=sys.stderr)
+        _print(c(f"⚠️ [Fast Syntax Gate] 语法预检执行提示: {e}", COLOR_YELLOW), file=sys.stderr)
 
     if remaining_timeout() <= 0:
         return False, "本地测试总时间预算已耗尽"
@@ -966,7 +1168,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         return False, f"无法复核测试输入: {exc}"
     if discarded:
         shown = ", ".join(discarded[:20]) + (f" 等 {len(discarded)} 个" if len(discarded) > 20 else "")
-        print(c(f"🧹 [Makewand Test Gate] 已移除本次测试运行生成的测试产物（不纳入审查与交付）: {shown}", COLOR_CYAN))
+        _print(c(f"🧹 [Makewand Test Gate] 已移除本次测试运行生成的测试产物（不纳入审查与交付）: {shown}", COLOR_CYAN))
     if changed:
         all_passed = False
         details.append("测试修改了待交付输入，必须重新生成并验证: " + _printable(", ".join(changed[:20])))
@@ -1022,14 +1224,14 @@ def dispatch_task(
         "agy": execute_agy_task, "local": execute_local_task,
         "ollama": execute_local_task, "aider": execute_aider_task,
     }
-    api_engines = {"deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"}
+    api_engines = API_ONLY_ENGINES
     placeholder_engines = {"cursor", "copilot"}
     if engine in placeholder_engines:
         notice = (
             f"引擎 '{engine}' 为交互式 IDE 扩展占位引擎，当前系统无独立无头命令行自主执行器。"
             f"已记录任务需求；在支持该插件的编辑器中协同完成，或选用 Claude/Codex/Antigravity 等自主 Agent 引擎。"
         )
-        print(c(f"ℹ️ [Placeholder Provider] {notice}", COLOR_YELLOW), file=sys.stderr)
+        _print(c(f"ℹ️ [Placeholder Provider] {notice}", COLOR_YELLOW), file=sys.stderr)
         return ExecutionResult(True, notice, None, status="PASSED", task_id=task_id,
                                stage=stage_name, engine=engine)
     if engine not in adapters and engine not in api_engines:
@@ -1069,6 +1271,8 @@ def dispatch_task(
         )
     except (TypeError, ValueError) as error:
         return rejected("INVALID_REQUEST", str(error))
+    from makewand.usage import note_dispatch_route, observe_dispatch_route
+
     def execute(effective_timeout):
         from makewand.workflow import provider_outcome
         provider_prompt = prompt
@@ -1079,6 +1283,7 @@ def dispatch_task(
         provider_prompt = _printable(provider_prompt)
         if engine in api_engines:
             from makewand.providers.api_client import call_api_chat
+            note_dispatch_route("api")
             return provider_outcome(call_api_chat(provider=engine, prompt=provider_prompt, cwd=cwd,
                                  timeout=effective_timeout, tier=tier, model=model,
                                  stream=stream, role="reviewer" if readonly else "coder",
@@ -1089,10 +1294,13 @@ def dispatch_task(
         if engine not in ("local", "ollama", "aider"):
             options["effort"] = effort
         return provider_outcome(adapters[engine](provider_prompt, **options))
-    result = execution_runtime.execute(request, execute)
+    # The route (cli/api) the adapter reports goes into the usage ledger
+    # (health._dispatch_failure_superseded reads it).
+    with observe_dispatch_route() as route:
+        result = execution_runtime.execute(request, execute)
     try:
         from makewand.usage import record_engine_usage
-        record_engine_usage(engine, tier=tier, success=result[0], task=prompt)
+        record_engine_usage(engine, tier=tier, success=result[0], task=prompt, route=route.route)
     except Exception:
         pass
     return result
@@ -1301,7 +1509,7 @@ def execute_task_dag(dag, cwd=None, *args, **kwargs):
         from makewand.execution_contract import ExecutionResult
         from makewand.execution_runtime import task_id
         from makewand.workflow import remember_result
-        print(c(f"❌ [Makewand Test Harness] {harness_conflict}，未执行任何子任务。", COLOR_RED + COLOR_BOLD))
+        _print(c(f"❌ [Makewand Test Harness] {harness_conflict}，未执行任何子任务。", COLOR_RED + COLOR_BOLD))
         remember_result(ExecutionResult(False, None, harness_conflict, status="UNVERIFIED", task_id=task_id(),
                                         stage="workflow", engine="dag"))
         return False, harness_conflict, []
@@ -1349,20 +1557,20 @@ def _run_pipeline_impl(
     except ProtectionError as error:
         if _outcome is not None:
             _outcome.update(status=error.status, error=str(error))
-        print(c(str(error), COLOR_RED))
+        _print(c(str(error), COLOR_RED))
         return False
 
     if repo_trust == "untrusted":
         from makewand.sandbox import is_bwrap_available
         if not is_bwrap_available() and os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
-            print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断执行。", COLOR_RED + COLOR_BOLD))
+            _print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断执行。", COLOR_RED + COLOR_BOLD))
             return False
 
     if boost:
         tier = "deep"
         if not effort:
             effort = "max"
-        print(c("⚡ [Makewand Boost] 强制超频模式已启用：穿透软配额限制，分配最高推理算力！", COLOR_MAGENTA + COLOR_BOLD))
+        _print(c("⚡ [Makewand Boost] 强制超频模式已启用：穿透软配额限制，分配最高推理算力！", COLOR_MAGENTA + COLOR_BOLD))
     elif tier == "auto" or not tier:
         tier = "auto"
     else:
@@ -1401,9 +1609,23 @@ def _run_pipeline_impl(
         intent = classify_prompt_intent(prompt)
 
     if intent == "identity":
-        print(c("💡 Makewand 意图识别: 身份/能力问答 (无需执行代码修改或程序检查)", COLOR_BOLD + COLOR_GREEN))
-        print(get_identity_message())
+        _print(c("💡 Makewand 意图识别: 身份/能力问答 (无需执行代码修改或程序检查)", COLOR_BOLD + COLOR_GREEN))
+        _print(get_identity_message())
         return True
+
+    # A forced engine (--provider) is decided first, the same way on the explain/Q&A,
+    # review and pipeline paths below and in the race (_run_race_impl): an unusable
+    # one is refused with its own reason before any workspace setup or dispatch; a
+    # usable one always runs, whatever routing finds for the other engines.
+    forced = None if local_only else forced_engine_name(forced_engine)
+    if forced:
+        refusal = forced_engine_refusal(forced, get_or_update_status(force_probe=False))
+        if refusal:
+            if _outcome is not None:
+                _outcome.update(status="UNVERIFIED", error=forced_engine_error(forced, refusal))
+            for line in forced_engine_refusal_lines(forced, refusal):
+                _print(line)
+            return False
 
     # Check multi-session working tree isolation guard for engineering tasks
     is_shadow_active = False
@@ -1420,13 +1642,13 @@ def _run_pipeline_impl(
         if harness_conflict:
             if _outcome is not None:
                 _outcome.update(status="UNVERIFIED", error=harness_conflict)
-            print(c(f"❌ [Makewand Test Harness] {harness_conflict}，未改动任何文件。", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand Test Harness] {harness_conflict}，未改动任何文件。", COLOR_RED + COLOR_BOLD))
             return False
         # One makewand code task per repository: a second task would otherwise
         # roll back or overwrite the first one's in-flight work.
         lock_error = _guard.acquire_workspace_lock(cwd)
         if lock_error:
-            print(c(f"❌ [Makewand Workspace Lock] {lock_error}", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand Workspace Lock] {lock_error}", COLOR_RED + COLOR_BOLD))
             return False
         if _private_workspace:
             # A private staging copy cannot overlap a user session and holds no
@@ -1453,7 +1675,7 @@ def _run_pipeline_impl(
             snapshot_error = host_txn.capture_pre_snapshot()
             if snapshot_error:
                 if not host_txn.is_git_repo or _private_workspace:
-                    print(c(f"❌ [Makewand Transaction] {snapshot_error}，为保护数据已中止，未改动任何文件。", COLOR_RED + COLOR_BOLD))
+                    _print(c(f"❌ [Makewand Transaction] {snapshot_error}，为保护数据已中止，未改动任何文件。", COLOR_RED + COLOR_BOLD))
                     return False
                 # A git repository can still be worked on safely in a shadow worktree.
                 host_txn = None
@@ -1464,13 +1686,13 @@ def _run_pipeline_impl(
             # A shadow delivery would not be visible to the next DAG stage.
             if _outcome is not None:
                 _outcome.update(status="UNVERIFIED", error=conflict_msg)
-            print(c(f"❌ [Makewand DAG Staging] 私有暂存工作区无法就地执行 ({conflict_msg})，"
-                    "后续阶段将看不到影子工作树中的结果，已中止且未改动任何文件。", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand DAG Staging] 私有暂存工作区无法就地执行 ({conflict_msg})，"
+                     "后续阶段将看不到影子工作树中的结果，已中止且未改动任何文件。", COLOR_RED + COLOR_BOLD))
             return False
 
         if not is_safe:
-            print(c(f"🛡️ [Makewand Multi-Session Guard] {conflict_msg}！", COLOR_YELLOW + COLOR_BOLD))
-            print(c("   依从多会话与脏工作区隔离安全策略，自动切换为独立影子工作树进行开发与审查...", COLOR_YELLOW))
+            _print(c(f"🛡️ [Makewand Multi-Session Guard] {conflict_msg}！", COLOR_YELLOW + COLOR_BOLD))
+            _print(c("   依从多会话与脏工作区隔离安全策略，自动切换为独立影子工作树进行开发与审查...", COLOR_YELLOW))
             try:
                 if os.name == "nt":
                     from makewand.native_delivery import create_native_shadow_worktree
@@ -1496,13 +1718,13 @@ def _run_pipeline_impl(
                 protected.prepare_workspace(cwd)
                 protected.verify(original_task_cwd)
                 branch_label = shadow_branch if shadow_branch else "独立隔离副本"
-                print(c(f"   ✔ 已自动建立影子工作树: {shadow_worktree_dir} (分支: {branch_label})", COLOR_GREEN))
+                _print(c(f"   ✔ 已自动建立影子工作树: {shadow_worktree_dir} (分支: {branch_label})", COLOR_GREEN))
             except Exception as e:
                 if cleanup_shadow:
                     cleanup_shadow()
                 if _outcome is not None and isinstance(e, ProtectionError):
                     _outcome.update(status=e.status, error=str(e))
-                print(c(f"❌ [Makewand Multi-Session Guard] 无法为活跃冲突会话建立安全影子工作树 ({e})，终止任务以防踩踏。", COLOR_RED + COLOR_BOLD))
+                _print(c(f"❌ [Makewand Multi-Session Guard] 无法为活跃冲突会话建立安全影子工作树 ({e})，终止任务以防踩踏。", COLOR_RED + COLOR_BOLD))
                 return False
 
     task_baseline = None
@@ -1515,18 +1737,18 @@ def _run_pipeline_impl(
             _outcome.update(status=status, error=msg)
         if is_shadow_active and cleanup_shadow:
             if preserve_shadow:
-                print(c(f"🛡️ [Makewand Shadow] 任务已完成代码实现或进入交付阶段，已保留独立工作树以防代码丢失: {cwd}", COLOR_YELLOW))
+                _print(c(f"🛡️ [Makewand Shadow] 任务已完成代码实现或进入交付阶段，已保留独立工作树以防代码丢失: {cwd}", COLOR_YELLOW))
             else:
                 try:
                     cleanup_shadow()
                 except Exception as exc:
-                    print(c(f"⚠️ [Makewand Shadow] 影子工作树清理失败，请手动检查: {exc}", COLOR_YELLOW))
+                    _print(c(f"⚠️ [Makewand Shadow] 影子工作树清理失败，请手动检查: {exc}", COLOR_YELLOW))
         elif host_txn is not None and host_txn.is_active:
             # Host mode: roll back only this task's changes (task-created paths are
             # removed, tracked files come from the baseline commit, pre-existing
             # untracked/ignored files from private backups) and verify the result.
             _stage_call("rollback", host_txn.rollback, msg)
-        print(c(msg, COLOR_RED + COLOR_BOLD))
+        _print(c(msg, COLOR_RED + COLOR_BOLD))
         return False
 
     def protection_check():
@@ -1538,14 +1760,14 @@ def _run_pipeline_impl(
             return fail_and_cleanup("受保护文件校验失败: " + str(error), error.status)
 
     if intent == "explain":
-        print(c(f"💡 Makewand 意图识别: 技术问答/解释模式 '{prompt}' (推理档位: {tier}, 只读安全隔离)", COLOR_BOLD + COLOR_GREEN))
+        _print(c(f"💡 Makewand 意图识别: 技术问答/解释模式 '{prompt}' (推理档位: {tier}, 只读安全隔离)", COLOR_BOLD + COLOR_GREEN))
         cache = get_or_update_status(force_probe=False)
         available_coders, _, route_meta = select_optimal_engine_pair(prompt, tier=tier, cache=cache, boost=boost)
         if local_only:
             primary_c = "local"
             sorted_engines = ["local"]
-        elif forced_engine and forced_engine != "auto":
-            primary_c = forced_engine.lower()
+        elif forced:  # usable: checked before any path started
+            primary_c = forced
             sorted_engines = [primary_c]
         elif not available_coders:
             # Nothing is usable right now: dispatch nothing and say why for each engine.
@@ -1556,13 +1778,13 @@ def _run_pipeline_impl(
         else:
             primary_c = route_meta.get("primary_coder") or available_coders[0]
             sorted_engines = available_coders
-        print(c(f"🎯 [Makewand Smart Routing] 技术解释优先指派引擎: {primary_c.upper()} (候选梯队: {' -> '.join(e.upper() for e in sorted_engines)})", COLOR_CYAN))
+        _print(c(f"🎯 [Makewand Smart Routing] 技术解释优先指派引擎: {primary_c.upper()} (候选梯队: {' -> '.join(e.upper() for e in sorted_engines)})", COLOR_CYAN))
 
         qa_output = None
         for eng in sorted_engines:
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout <= 0:
-                print(c("❌ [Makewand Budget] 全局流水线预算已耗尽，终止问答执行。", COLOR_RED + COLOR_BOLD))
+                _print(c("❌ [Makewand Budget] 全局流水线预算已耗尽，终止问答执行。", COLOR_RED + COLOR_BOLD))
                 return False
             result = _stage_call("review", dispatch_task,
                 eng, prompt, cwd=cwd, timeout=step_timeout, tier=tier,
@@ -1578,20 +1800,21 @@ def _run_pipeline_impl(
                 break
 
         if qa_output and not stream:
-            print(qa_output)
+            _print(qa_output)
 
         return qa_output is not None and protection_check()
 
     if intent == "review":
-        print(c(f"💡 Makewand 意图识别: 独立代码审计/审查模式 '{prompt}' (只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
-        exit_code = run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt, repo_trust=repo_trust, local_only=local_only)
+        _print(c(f"💡 Makewand 意图识别: 独立代码审计/审查模式 '{prompt}' (只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
+        exit_code = run_review(cwd=cwd, stream=stream, timeout=timeout, user_prompt=prompt, repo_trust=repo_trust,
+                               local_only=local_only, engine=forced)
         if _outcome is not None:
             from makewand.execution_contract import STATUS_CODES
             _outcome["status"] = next((name for name, number in STATUS_CODES.items() if number == exit_code), "UNKNOWN")
         return exit_code == EXIT_PASSED and protection_check()
 
-    print(c(f"🚀 Makewand 流水线启动: '{prompt}' (自适应模型档位: {tier})", COLOR_BOLD))
-    print(f"工作目录: {cwd}\n")
+    _print(c(f"🚀 Makewand 流水线启动: '{prompt}' (自适应模型档位: {tier})", COLOR_BOLD))
+    _print(f"工作目录: {cwd}\n")
 
     # Step 1: Health inspection
     cache = get_or_update_status(force_probe=False)
@@ -1607,13 +1830,18 @@ def _run_pipeline_impl(
         route_meta["primary_reviewer"] = "local"
         route_meta["single_tool_mode"] = True
         route_meta["reasons"] = ["用户指定 --local-only / --offline 模式：强制使用本机开源模型闭环 (100% 离线隐私零 Token)"]
-    elif forced_engine and forced_engine != "auto":
-        f_eng = forced_engine.lower()
-        if f_eng in coder_candidates:
-            coder_candidates.remove(f_eng)
-        coder_candidates.insert(0, f_eng)
-        primary_c = f_eng
-        route_meta["primary_coder"] = f_eng
+    elif forced:  # usable: checked before any path started
+        if forced in coder_candidates:
+            coder_candidates.remove(forced)
+        coder_candidates.insert(0, forced)
+        primary_c = forced
+        route_meta["primary_coder"] = forced
+        if not route_meta.get("primary_reviewer"):
+            # Routing found no other usable engine: the forced one is the only tool
+            # (the single-tool review rules below decide whether it may review itself).
+            reviewer_candidates = [forced]
+            route_meta["primary_reviewer"] = forced
+            route_meta["single_tool_mode"] = True
     else:
         primary_c = route_meta["primary_coder"]
     if _plan is not None and _plan.workflow == "single":
@@ -1623,7 +1851,7 @@ def _run_pipeline_impl(
     if local_only and _plan is not None and _plan.cross_review_required:
         if _outcome is not None:
             _outcome.update(status="UNVERIFIED", error="Local-only execution cannot provide distinct-provider review for unknown or high risk")
-        print(c("本地离线执行无法提供未知或高风险任务所需的跨提供者复审；请明确低风险或使用独立本地复审方案。", COLOR_YELLOW))
+        _print(c("本地离线执行无法提供未知或高风险任务所需的跨提供者复审；请明确低风险或使用独立本地复审方案。", COLOR_YELLOW))
         return False
 
     if _no_provider_detected(forced_engine, route_meta):
@@ -1634,12 +1862,12 @@ def _run_pipeline_impl(
             cleanup_shadow()
         return False
 
-    print(c("🎯 [Makewand Smart Routing] 智能专精匹配与配额削峰决策:", COLOR_BOLD + COLOR_GREEN))
+    _print(c("🎯 [Makewand Smart Routing] 智能专精匹配与配额削峰决策:", COLOR_BOLD + COLOR_GREEN))
     if route_meta.get("reasons"):
         for r_item in route_meta["reasons"]:
-            print(c(f"  • {r_item}", COLOR_CYAN))
-    print(c(f"  • 主力实现引擎: {primary_c.upper()} (候选梯队: {' -> '.join([c.upper() for c in coder_candidates])})", COLOR_BOLD + COLOR_BLUE))
-    print(c(f"  • 独立盲审引擎: {primary_r.upper()} (候选梯队: {' -> '.join([r.upper() for r in reviewer_candidates])})\n", COLOR_BOLD + COLOR_PURPLE))
+            _print(c(f"  • {r_item}", COLOR_CYAN))
+    _print(c(f"  • 主力实现引擎: {primary_c.upper()} (候选梯队: {' -> '.join([c.upper() for c in coder_candidates])})", COLOR_BOLD + COLOR_BLUE))
+    _print(c(f"  • 独立盲审引擎: {primary_r.upper()} (候选梯队: {' -> '.join([r.upper() for r in reviewer_candidates])})\n", COLOR_BOLD + COLOR_PURPLE))
 
     cli_engines = {"claude", "codex", "grok", "muse", "agy", "aider"}
     all_cli = all(eng in cli_engines for eng in coder_candidates)
@@ -1671,7 +1899,7 @@ def _run_pipeline_impl(
         # before the first model dispatch. Any failure aborts with no deletion.
         begin_error = host_txn.begin() if host_txn is not None else "内部错误: 宿主模式缺少任务事务"
         if begin_error:
-            print(c(f"❌ [Makewand Transaction] {begin_error}", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand Transaction] {begin_error}", COLOR_RED + COLOR_BOLD))
             return False
         task_baseline = host_txn.baseline_commit
         # Each checked-out submodule's task-start commit, keyed by its path from the
@@ -1681,14 +1909,14 @@ def _run_pipeline_impl(
         active_sub_baselines = dict(host_txn.sub_baselines)
 
     disp_tier = tier if tier != "auto" else "auto (自适应动态调步)"
-    print(c(f"▶ 阶段 1: 代码编写与实现 (Implementation - Tier: {disp_tier})", COLOR_BOLD + COLOR_BLUE))
+    _print(c(f"▶ 阶段 1: 代码编写与实现 (Implementation - Tier: {disp_tier})", COLOR_BOLD + COLOR_BLUE))
     # Retrieve codebase repo map for global architecture perception
     repo_map_snippet = ""
     try:
         from makewand.repomap import format_repo_map_for_prompt
         repo_map_snippet = format_repo_map_for_prompt(cwd, max_lines=80)
         if repo_map_snippet:
-            print(c("🗺️  [Makewand Repo-Map] 自动提取代码库全局架构拓扑并注入实现上下文...", COLOR_CYAN))
+            _print(c("🗺️  [Makewand Repo-Map] 自动提取代码库全局架构拓扑并注入实现上下文...", COLOR_CYAN))
     except Exception:
         pass
 
@@ -1698,7 +1926,7 @@ def _run_pipeline_impl(
         from makewand.memory import format_memory_hints_for_prompt
         memory_hints = format_memory_hints_for_prompt(prompt)
         if memory_hints:
-            print(c("🧠 [Makewand Kibitzer] 匹配并注入历史避坑与工程质量准则...", COLOR_PURPLE))
+            _print(c("🧠 [Makewand Kibitzer] 匹配并注入历史避坑与工程质量准则...", COLOR_PURPLE))
     except Exception:
         pass
 
@@ -1708,7 +1936,7 @@ def _run_pipeline_impl(
         from makewand.memory import format_playbook_for_prompt
         playbook_hints = format_playbook_for_prompt(cwd)
         if playbook_hints:
-            print(c("📘 [Makewand Playbook] 加载工程专属构建与测试指南...", COLOR_CYAN))
+            _print(c("📘 [Makewand Playbook] 加载工程专属构建与测试指南...", COLOR_CYAN))
     except Exception:
         pass
 
@@ -1729,7 +1957,7 @@ def _run_pipeline_impl(
         if step_timeout <= 0:
             return fail_and_cleanup("❌ [Makewand Budget] 全局流水线预算已耗尽，终止任务执行。", "TIMEOUT")
 
-        print(c(f"→ 派发代码编写与实现任务给 {eng.upper()} (Tier: {tier})...", COLOR_BLUE + COLOR_BOLD))
+        _print(c(f"→ 派发代码编写与实现任务给 {eng.upper()} (Tier: {tier})...", COLOR_BLUE + COLOR_BOLD))
         result = _stage_call("implementation", dispatch_task, eng, coder_prompt, engine=eng,
                              cwd=cwd, timeout=step_timeout, tier=tier, model=model, effort=effort, stream=stream,
                              readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
@@ -1739,7 +1967,7 @@ def _run_pipeline_impl(
         if _outcome is not None and not success:
             _outcome.update(status=getattr(result, "status", "FAILED"), error=err)
         if success:
-            print(c(f"✔ {eng.upper()} 完成代码编写与修改。", COLOR_GREEN))
+            _print(c(f"✔ {eng.upper()} 完成代码编写与修改。", COLOR_GREEN))
             coder_output = out
             coder_engine = eng
             if _outcome is not None:
@@ -1748,19 +1976,19 @@ def _run_pipeline_impl(
                 _outcome.update(status="FAILED", error=None)
             break
         else:
-            print(c(f"⚠ {eng.upper()} 遇到限制或故障: {err}", COLOR_YELLOW))
+            _print(c(f"⚠ {eng.upper()} 遇到限制或故障: {err}", COLOR_YELLOW))
             if getattr(result, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED", "INVALID_REQUEST"):
                 return fail_and_cleanup("编码结果未确定或预算已耗尽；已停止自动切换提供者。", result.status)
-            print(c("→ 自动切换下一顺位备用引擎接管实现...", COLOR_YELLOW))
+            _print(c("→ 自动切换下一顺位备用引擎接管实现...", COLOR_YELLOW))
 
     if coder_output is None:
         return fail_and_cleanup("❌ 所有可用模型均无法完成编码任务，流水线终止。",
                                 (_outcome or {}).get("status", "FAILED"))
 
     if coder_output and not stream:
-        print(c("【编码实现输出摘要】", COLOR_BOLD))
-        print(coder_output.strip()[:500])
-        print("...\n")
+        _print(c("【编码实现输出摘要】", COLOR_BOLD))
+        _print(coder_output.strip()[:500])
+        _print("...\n")
 
     # Step 3: Red-team review (Cross-model verification)
     worktree_for_diff = getattr(shadow_res, "worktree_root", cwd) if is_shadow_active else cwd
@@ -1776,13 +2004,13 @@ def _run_pipeline_impl(
     if not diff_out or not diff_out.strip():
         is_coding_task = (intent == "code")
         if not is_coding_task:
-            print(c("ℹ️ [Makewand Info] 本次任务为咨询/分析类意图，无需修改工作区文件，文本交付已完成。", COLOR_GREEN))
+            _print(c("ℹ️ [Makewand Info] 本次任务为咨询/分析类意图，无需修改工作区文件，文本交付已完成。", COLOR_GREEN))
             if is_shadow_active and cleanup_shadow:
                 cleanup_shadow()
             return True
 
         if coder_engine in ENGINES_WITHOUT_EXECUTOR or coder_engine in NON_AGENTIC_CHAT_MODELS:
-            print(c(
+            _print(c(
                 f"ℹ️ [Makewand Boundary Notice] 引擎 '{coder_engine}' 属于对话/辅助型非自主 Agent 引擎 (Non-agentic / Placeholder)，"
                 f"未在工作区产生直接代码落盘。\n已输出文本方案与实现建议，跳过文件交付门禁与红队代码复审。",
                 COLOR_YELLOW
@@ -1791,11 +2019,11 @@ def _run_pipeline_impl(
                 cleanup_shadow()
             return True
 
-        print(c("ℹ 本次任务未产生相对于基线的有效代码改动 (git diff 为空)，无需启动红队复审与自愈流水线。", COLOR_CYAN))
+        _print(c("ℹ 本次任务未产生相对于基线的有效代码改动 (git diff 为空)，无需启动红队复审与自愈流水线。", COLOR_CYAN))
         return fail_and_cleanup("❌ [Makewand Quality Gate] 任务未产生任何有效代码改动，终止交付。")
 
     # Run deterministic local test suite before review
-    print(c("🧪 [Makewand Test Gate] 正在执行本地确定性测试验证...", COLOR_CYAN))
+    _print(c("🧪 [Makewand Test Gate] 正在执行本地确定性测试验证...", COLOR_CYAN))
     try:
         tested_inputs = workspace_snapshot(worktree_for_diff)
     except OSError as exc:
@@ -1819,7 +2047,7 @@ def _run_pipeline_impl(
     except OSError as exc:
         return fail_and_cleanup(f"无法封存待审查内容: {exc}")
     if not test_ok:
-        print(c(f"❌ [Makewand Test Gate] 发现单元测试失败：\n{test_err[:400]}", COLOR_RED + COLOR_BOLD))
+        _print(c(f"❌ [Makewand Test Gate] 发现单元测试失败：\n{test_err[:400]}", COLOR_RED + COLOR_BOLD))
         try:
             from makewand.memory import record_failure_pattern
             clean_err = test_err.strip()
@@ -1831,9 +2059,9 @@ def _run_pipeline_impl(
         except Exception:
             pass
     else:
-        print(c("✔ [Makewand Test Gate] 本地测试套件校验通过 (或无单测需执行)。", COLOR_GREEN))
+        _print(c("✔ [Makewand Test Gate] 本地测试套件校验通过 (或无单测需执行)。", COLOR_GREEN))
 
-    print(c("\n▶ 阶段 2: 独立代码审计与质检 (Red-team Review - Tier: deep, 只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
+    _print(c("\n▶ 阶段 2: 独立代码审计与质检 (Red-team Review - Tier: deep, 只读安全隔离)", COLOR_BOLD + COLOR_CYAN))
     review_output = None
     reviewer_engine = None
 
@@ -1852,7 +2080,7 @@ def _run_pipeline_impl(
             status, preserve_shadow=patch_path is None)
 
     review_cap = review_diff_max_bytes()
-    diff_bytes = _utf8_size(diff_out)
+    diff_bytes = dispatched_size(diff_out)
     if diff_bytes > review_cap:
         return reject_unverified(_review_cap_exceeded(diff_bytes, review_cap)
                                  + ("；本地测试亦未通过" if not test_ok else ""), "UNVERIFIED")
@@ -1913,7 +2141,7 @@ def _run_pipeline_impl(
                                                  coder_engine if allow_self_review else None)
         stand_in = next((e for e in review_stand_ins if e not in review_ladder), None)
         if stand_in:
-            print(c(f"   ↪ 改由 {stand_in.upper()} 接替审查。", COLOR_CYAN))
+            _print(c(f"   ↪ 改由 {stand_in.upper()} 接替审查。", COLOR_CYAN))
             review_ladder.append(stand_in)
             appended_stand_ins.add(stand_in)
 
@@ -1925,12 +2153,12 @@ def _run_pipeline_impl(
         curr_prompt = ("【单工具自审要求】当前为单工具自审闭环模式，请务必完全转换角色为严苛的代码审计员，对以上代码修改持最高怀疑态度，进行无情审查与边界挑刺：\n" + review_prompt) if is_self_review else review_prompt
         if not reviewer_receives_whole_prompt(r_eng, curr_prompt):
             partial_reviewers.append(r_eng)
-            print(c(f"⚠ 跳过 {r_eng.upper()}: 审查提示 ({_prompt_size(curr_prompt)} 字节) 超过其可完整接收的 "
-                    f"{reviewer_prompt_limit(r_eng)} 字节上限，只读到部分 diff 的裁决不能采纳。", COLOR_YELLOW))
+            _print(c(f"⚠ 跳过 {r_eng.upper()}: 审查提示 ({dispatched_size(curr_prompt)} 字节) 超过其可完整接收的 "
+                     f"{reviewer_prompt_limit(r_eng)} 字节上限，只读到部分 diff 的裁决不能采纳。", COLOR_YELLOW))
             append_review_stand_in()
             continue
         rev_mode_str = "进行独立沙箱自审与边界复审 (单工具自审闭环)" if is_self_review else "进行独立跨模型红队审查 (Tier: deep, 只读隔离)"
-        print(c(f"→ 派发给 {r_eng.upper()} {rev_mode_str}...", COLOR_CYAN + COLOR_BOLD))
+        _print(c(f"→ 派发给 {r_eng.upper()} {rev_mode_str}...", COLOR_CYAN + COLOR_BOLD))
         res = _stage_call("review", dispatch_task, r_eng, curr_prompt, engine=r_eng,
                           cwd=cwd, timeout=step_timeout, tier="deep", effort=effort, stream=stream,
                           readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
@@ -1942,14 +2170,14 @@ def _run_pipeline_impl(
         else:
             success, out, err = False, "", "UNVERIFIED: 独立审查未产生有效响应或返回结构异常"
         if success and out and out.strip():
-            print(c(f"✔ {r_eng.upper()} 独立红队审查完成。", COLOR_GREEN))
+            _print(c(f"✔ {r_eng.upper()} 独立红队审查完成。", COLOR_GREEN))
             review_output = out
             reviewer_engine = r_eng
             if _outcome is not None:
                 _outcome.update(status="FAILED", error=None)  # an earlier reviewer's failure was recovered
             break
         else:
-            print(c(f"⚠ {r_eng.upper()} 审查未产生有效响应: {err}", COLOR_YELLOW))
+            _print(c(f"⚠ {r_eng.upper()} 审查未产生有效响应: {err}", COLOR_YELLOW))
             if getattr(res, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                 break
             if r_eng in appended_stand_ins:
@@ -1987,14 +2215,14 @@ def _run_pipeline_impl(
             iter_start = time.monotonic()
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout <= 0:
-                print(c("❌ [Makewand Budget] 全局流水线预算耗尽，终止 Auto-Fix 自愈轮次。", COLOR_RED + COLOR_BOLD))
+                _print(c("❌ [Makewand Budget] 全局流水线预算耗尽，终止 Auto-Fix 自愈轮次。", COLOR_RED + COLOR_BOLD))
                 break
             min_needed = max(AUTO_FIX_MIN_ROUND_SECONDS, last_fix_round_duration)
             if current_fix_iter > 1 and step_timeout < min_needed:
-                print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成新一轮修复与复审（预估至少需 {min_needed:.1f}s），触发智能提前终止。", COLOR_YELLOW + COLOR_BOLD))
+                _print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成新一轮修复与复审（预估至少需 {min_needed:.1f}s），触发智能提前终止。", COLOR_YELLOW + COLOR_BOLD))
                 break
 
-            print(c(f"\n⚡ [Makewand Auto-Fix] 独立审计检测到高/中危缺陷，自动启动第 {current_fix_iter}/{max_fix} 轮修复闭环...", COLOR_YELLOW + COLOR_BOLD))
+            _print(c(f"\n⚡ [Makewand Auto-Fix] 独立审计检测到高/中危缺陷，自动启动第 {current_fix_iter}/{max_fix} 轮修复闭环...", COLOR_YELLOW + COLOR_BOLD))
 
             # Snapshot state before fix attempt
             pre_fix_test_ok = test_ok
@@ -2010,7 +2238,7 @@ def _run_pipeline_impl(
             actual_fix_engine = None
             step_timeout = get_remaining_timeout(timeout)
             if coder_engine and step_timeout > 0:
-                print(c(f"→ 由主力编码引擎 {coder_engine.upper()} 执行缺陷修复...", COLOR_YELLOW))
+                _print(c(f"→ 由主力编码引擎 {coder_engine.upper()} 执行缺陷修复...", COLOR_YELLOW))
                 fix_result = _stage_call("repair", dispatch_task, coder_engine, fix_prompt, engine=coder_engine, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
                 ok, _, _ = fix_result
                 if not protection_check():
@@ -2027,7 +2255,7 @@ def _run_pipeline_impl(
                         step_timeout = get_remaining_timeout(timeout)
                         if step_timeout <= 0:
                             break
-                        print(c(f"→ 自动切换备用引擎 {alt_c.upper()} 执行修复...", COLOR_YELLOW))
+                        _print(c(f"→ 自动切换备用引擎 {alt_c.upper()} 执行修复...", COLOR_YELLOW))
                         fix_result = _stage_call("repair", dispatch_task, alt_c, fix_prompt, engine=alt_c, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
                         ok, _, _ = fix_result
                         if not protection_check():
@@ -2040,7 +2268,7 @@ def _run_pipeline_impl(
                             break
 
             if not fixed:
-                print(c("⚠ 缺陷自动修复未产生有效更新，维持当前审查结论。", COLOR_YELLOW))
+                _print(c("⚠ 缺陷自动修复未产生有效更新，维持当前审查结论。", COLOR_YELLOW))
                 break
 
             # Re-run deterministic local tests after fix
@@ -2058,14 +2286,14 @@ def _run_pipeline_impl(
 
             # Check 1: Regression failure detection
             if pre_fix_test_ok and not test_ok:
-                print(c("🛑 [Makewand Auto-Fix Early-Stop] 修复尝试引入了新单测退化/破损 (regression failure)，触发自愈熔断回滚！", COLOR_RED + COLOR_BOLD))
+                _print(c("🛑 [Makewand Auto-Fix Early-Stop] 修复尝试引入了新单测退化/破损 (regression failure)，触发自愈熔断回滚！", COLOR_RED + COLOR_BOLD))
                 restore_dirty_files(worktree_for_diff, pre_fix_dirty_files)
                 test_ok, test_err = pre_fix_test_ok, pre_fix_test_err
                 diff_out = pre_fix_diff
                 break
 
             if not test_ok:
-                print(c(f"❌ [Makewand Test Gate] 修复后本地单元测试仍未通过：\n{test_err[:400]}", COLOR_RED))
+                _print(c(f"❌ [Makewand Test Gate] 修复后本地单元测试仍未通过：\n{test_err[:400]}", COLOR_RED))
                 try:
                     from makewand.memory import record_failure_pattern
                     clean_err = test_err.strip()
@@ -2077,12 +2305,12 @@ def _run_pipeline_impl(
                 except Exception:
                     pass
             else:
-                print(c("✔ [Makewand Test Gate] 修复后本地单元测试执行全通！", COLOR_GREEN))
+                _print(c("✔ [Makewand Test Gate] 修复后本地单元测试执行全通！", COLOR_GREEN))
 
             # Check 2: Diff explosion / churn explosion / file sprawl detection
             new_diff = get_git_diff(worktree_for_diff, base_rev=task_baseline, sub_baselines=active_sub_baselines)
             curr_parsimony = compute_patch_parsimony(new_diff)
-            diff_bytes = _utf8_size(new_diff)
+            diff_bytes = dispatched_size(new_diff)
             pre_churn = pre_fix_parsimony.get("total_churn", 0)
             curr_churn = curr_parsimony.get("total_churn", 0)
             pre_files = pre_fix_parsimony.get("files_touched", 0)
@@ -2101,7 +2329,7 @@ def _run_pipeline_impl(
                 diff_explode_reason = f"修改文件过多发散 (从 {pre_files} 个文件激增至 {curr_files} 个文件)"
 
             if diff_exploded:
-                print(c(f"🛑 [Makewand Auto-Fix Early-Stop] 修复尝试导致代码改动急剧发散膨胀 ({diff_explode_reason})，触发自愈熔断回滚！", COLOR_RED + COLOR_BOLD))
+                _print(c(f"🛑 [Makewand Auto-Fix Early-Stop] 修复尝试导致代码改动急剧发散膨胀 ({diff_explode_reason})，触发自愈熔断回滚！", COLOR_RED + COLOR_BOLD))
                 restore_dirty_files(worktree_for_diff, pre_fix_dirty_files)
                 test_ok, test_err = pre_fix_test_ok, pre_fix_test_err
                 diff_out = pre_fix_diff
@@ -2110,7 +2338,7 @@ def _run_pipeline_impl(
             # Check 3: Anti-timeout check before launching review
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout < AUTO_FIX_MIN_REVIEW_SECONDS:
-                print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成复审 (需至少 {AUTO_FIX_MIN_REVIEW_SECONDS:.1f}s)，终止复审并回滚未复审修复。", COLOR_YELLOW + COLOR_BOLD))
+                _print(c(f"⏳ [Makewand Anti-Timeout] 剩余时间 ({step_timeout:.1f}s) 不足以完成复审 (需至少 {AUTO_FIX_MIN_REVIEW_SECONDS:.1f}s)，终止复审并回滚未复审修复。", COLOR_YELLOW + COLOR_BOLD))
                 restore_dirty_files(worktree_for_diff, pre_fix_dirty_files)
                 test_ok, test_err = pre_fix_test_ok, pre_fix_test_err
                 diff_out = pre_fix_diff
@@ -2118,7 +2346,7 @@ def _run_pipeline_impl(
 
             diff_out = new_diff
 
-            print(c(f"▶ [Makewand Auto-Fix] 修复已落盘，重新发起第 {current_fix_iter} 轮红队复审 (只读安全隔离)...", COLOR_CYAN))
+            _print(c(f"▶ [Makewand Auto-Fix] 修复已落盘，重新发起第 {current_fix_iter} 轮红队复审 (只读安全隔离)...", COLOR_CYAN))
             try:
                 reviewed_inputs = workspace_snapshot(worktree_for_diff)
                 if reviewed_inputs != tested_inputs:
@@ -2130,7 +2358,7 @@ def _run_pipeline_impl(
                     return fail_and_cleanup("复审快照生成期间工作区发生变化，拒绝交付。")
             except OSError as exc:
                 return fail_and_cleanup(f"无法封存待复审内容: {exc}")
-            new_diff_bytes = _utf8_size(new_diff)
+            new_diff_bytes = dispatched_size(new_diff)
             if new_diff_bytes > review_cap:
                 return reject_unverified(_review_cap_exceeded(new_diff_bytes, review_cap), "UNVERIFIED")
             re_review_nonce = generate_review_nonce()
@@ -2196,7 +2424,7 @@ def _run_pipeline_impl(
                                                      coder_engine if allow_self_review else None)
                 stand_in = next((e for e in re_stand_ins if e not in re_review_ladder), None)
                 if stand_in:
-                    print(c(f"   ↪ 改由 {stand_in.upper()} 接替复审。", COLOR_CYAN))
+                    _print(c(f"   ↪ 改由 {stand_in.upper()} 接替复审。", COLOR_CYAN))
                     re_review_ladder.append(stand_in)
                     appended_re_stand_ins.add(stand_in)
 
@@ -2208,12 +2436,12 @@ def _run_pipeline_impl(
                 curr_re_prompt = ("【单工具自审要求】当前为单工具自审闭环模式，请务必完全转换角色为严苛的代码审计员，对以上修复后的代码持最高怀疑态度，进行无情审查与边界挑刺：\n" + re_review_prompt) if is_self_re_review else re_review_prompt
                 if not reviewer_receives_whole_prompt(alt_r, curr_re_prompt):
                     partial_re_reviewers.append(alt_r)
-                    print(c(f"⚠ 跳过 {alt_r.upper()}: 复审提示 ({_prompt_size(curr_re_prompt)} 字节) 超过其可完整接收的 "
-                            f"{reviewer_prompt_limit(alt_r)} 字节上限，只读到部分 diff 的裁决不能采纳。", COLOR_YELLOW))
+                    _print(c(f"⚠ 跳过 {alt_r.upper()}: 复审提示 ({dispatched_size(curr_re_prompt)} 字节) 超过其可完整接收的 "
+                             f"{reviewer_prompt_limit(alt_r)} 字节上限，只读到部分 diff 的裁决不能采纳。", COLOR_YELLOW))
                     append_re_review_stand_in()
                     continue
                 rev_mode_str = "进行独立沙箱自审与边界复审 (单工具自审闭环)" if is_self_re_review else f"进行第 {current_fix_iter} 轮独立跨模型红队复审 (Tier: deep, 只读隔离)"
-                print(c(f"→ 派发给 {alt_r.upper()} {rev_mode_str}...", COLOR_CYAN))
+                _print(c(f"→ 派发给 {alt_r.upper()} {rev_mode_str}...", COLOR_CYAN))
                 res = _stage_call("review", dispatch_task, alt_r, curr_re_prompt, engine=alt_r, cwd=cwd, timeout=step_timeout, tier="deep", effort=effort, stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
                 if isinstance(res, (tuple, list)) and len(res) == 3:
                     ok, out, re_err = res[0], res[1], res[2]
@@ -2223,7 +2451,7 @@ def _run_pipeline_impl(
                     re_output = out
                     re_engine = alt_r
                     break
-                print(c(f"⚠ {alt_r.upper()} 复审未产生有效响应: {re_err}", COLOR_YELLOW))
+                _print(c(f"⚠ {alt_r.upper()} 复审未产生有效响应: {re_err}", COLOR_YELLOW))
                 if getattr(res, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                     return fail_and_cleanup("复审结果未确定或预算已耗尽；已停止自动切换提供者。", res.status)
                 if alt_r in appended_re_stand_ins:
@@ -2248,10 +2476,10 @@ def _run_pipeline_impl(
                 review_output = re_output
                 review_verdict = evaluate_review_verdict(re_output, nonce=re_review_nonce)
                 if review_verdict["status"] == REVIEW_UNVERIFIED:
-                    print(c(f"❌ [Makewand Quality Gate] 复审裁决未验证 (UNVERIFIED: {review_verdict['reason']})，终止自愈回环。", COLOR_RED))
+                    _print(c(f"❌ [Makewand Quality Gate] 复审裁决未验证 (UNVERIFIED: {review_verdict['reason']})，终止自愈回环。", COLOR_RED))
                     break
                 if review_verdict["status"] == REVIEW_PASSED:
-                    print(c("✔ [Makewand Auto-Fix] 经过自动修复，代码已通过红队复审！", COLOR_GREEN + COLOR_BOLD))
+                    _print(c("✔ [Makewand Auto-Fix] 经过自动修复，代码已通过红队复审！", COLOR_GREEN + COLOR_BOLD))
                     try:
                         from makewand.memory import record_autofix_lesson
                         defect_desc = "; ".join(last_defects[:3]) if last_defects else prompt[:120]
@@ -2263,12 +2491,12 @@ def _run_pipeline_impl(
                             issue=f"Defect flagged: {defect_desc}",
                             lesson=f"Remediated successfully in auto-fix iteration {current_fix_iter}."
                         )
-                        print(c("🧠 [Makewand Memory] 已自动固化避坑修复经验到模式记忆库。", COLOR_PURPLE))
+                        _print(c("🧠 [Makewand Memory] 已自动固化避坑修复经验到模式记忆库。", COLOR_PURPLE))
                     except Exception:
                         pass
                     break
             else:
-                print(c("❌ [Makewand Quality Gate] 独立复审服务未能完成代码审计 (UNVERIFIED)，出于安全防御原则终止自愈回环。", COLOR_RED))
+                _print(c("❌ [Makewand Quality Gate] 独立复审服务未能完成代码审计 (UNVERIFIED)，出于安全防御原则终止自愈回环。", COLOR_RED))
                 re_reason = "所有复审模型均超时或未能完成复审"
                 if partial_re_reviewers:
                     re_reason += f" ({'/'.join(e.upper() for e in partial_re_reviewers)} 无法完整接收复审提示)"
@@ -2276,13 +2504,13 @@ def _run_pipeline_impl(
                 review_verdict = {"status": REVIEW_UNVERIFIED, "pass": False, "defects": [], "reason": re_reason}
                 break
 
-    print(c("\n============================================================", COLOR_BOLD))
-    print(c("                   Makewand 联合调度完成报告", COLOR_BOLD + COLOR_GREEN))
-    print(c("============================================================\n", COLOR_BOLD))
+    _print(c("\n============================================================", COLOR_BOLD))
+    _print(c("                   Makewand 联合调度完成报告", COLOR_BOLD + COLOR_GREEN))
+    _print(c("============================================================\n", COLOR_BOLD))
     if review_output and not stream:
-        print(c("【最终审计意见与质量评估】", COLOR_BOLD))
-        print(review_output.strip()[:1000])
-        print("...\n")
+        _print(c("【最终审计意见与质量评估】", COLOR_BOLD))
+        _print(review_output.strip()[:1000])
+        _print("...\n")
 
     if not protection_check():
         return False
@@ -2510,12 +2738,9 @@ def _run_pipeline_impl(
                     manifest_data["native_candidate_race_id"] = seal_native_delivery(
                         native_delivery, prompt, reviewed_inputs, review_output, str(test_err))
                 manifest_file = artifacts_dir / "delivery_manifest.json"
-                manifest_text = json.dumps(manifest_data, indent=2, ensure_ascii=False)
-                if _printable(manifest_text) != manifest_text:
-                    # A path with undecodable bytes cannot be written as UTF-8: escape every
-                    # non-ASCII character instead (\udcNN round-trips through json.loads).
-                    manifest_text = json.dumps(manifest_data, indent=2, ensure_ascii=True)
-                write_private_file(manifest_file, manifest_text)
+                # A path with undecodable bytes is written with every non-ASCII character
+                # escaped (\udcNN round-trips through json.loads), like any private manifest.
+                write_private_file(manifest_file, _json_text(manifest_data))
 
                 apply_script_file = None
                 if native_delivery is None:
@@ -2645,31 +2870,31 @@ def _run_pipeline_impl(
             patch_file_esc = _shell_quote(str(patch_file))
             apply_script_esc = _shell_quote(str(apply_script_file)) if apply_script_file is not None else ""
 
-            print(c("\n============================================================", COLOR_BOLD))
-            print(c("       🛡️ [Makewand Multi-Session Guard] 隔离交付报告", COLOR_BOLD + COLOR_GREEN))
-            print(c("============================================================\n", COLOR_BOLD))
-            print(c("✔ 任务在独立工作树完成，零污染当前会话工作区！", COLOR_GREEN + COLOR_BOLD))
-            print(f"  工作树路径: {c(worktree_root, COLOR_CYAN)}")
+            _print(c("\n============================================================", COLOR_BOLD))
+            _print(c("       🛡️ [Makewand Multi-Session Guard] 隔离交付报告", COLOR_BOLD + COLOR_GREEN))
+            _print(c("============================================================\n", COLOR_BOLD))
+            _print(c("✔ 任务在独立工作树完成，零污染当前会话工作区！", COLOR_GREEN + COLOR_BOLD))
+            _print(f"  工作树路径: {c(worktree_root, COLOR_CYAN)}")
             if native_delivery is not None:
-                print(f"  原生封存交付: makewand apply {native_delivery['race_id']} --candidate A")
-                print(f"  固定提交与补丁清单: {manifest_file}")
+                _print(f"  原生封存交付: makewand apply {native_delivery['race_id']} --candidate A")
+                _print(f"  固定提交与补丁清单: {manifest_file}")
             elif delivered_branch:
-                print(f"  交付分支: {c(delivered_branch, COLOR_YELLOW)}")
+                _print(f"  交付分支: {c(delivered_branch, COLOR_YELLOW)}")
                 if has_baseline_conflict:
-                    print(c("  ⚠ 注意：本任务基于当前会话未提交快照开发并完成独立审查。交付分支保留该上下文以保证可运行性。", COLOR_YELLOW))
-                    print(f"  独立补丁文件 (仅包含本轮任务改动，二进制安全，零仓库污染): {c(str(patch_file), COLOR_CYAN)}")
+                    _print(c("  ⚠ 注意：本任务基于当前会话未提交快照开发并完成独立审查。交付分支保留该上下文以保证可运行性。", COLOR_YELLOW))
+                    _print(f"  独立补丁文件 (仅包含本轮任务改动，二进制安全，零仓库污染): {c(str(patch_file), COLOR_CYAN)}")
                     if sub_patches:
-                        print(f"  子模块补丁数量: {len(sub_patches)} (清单存放在 {c(str(manifest_file), COLOR_CYAN)})")
-                    print(f"  一键应用交付补丁 (推荐): {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}")
-                    print(f"  手动应用: git -c core.autocrlf=false -C {apply_root_esc} apply --binary {patch_file_esc}\n")
+                        _print(f"  子模块补丁数量: {len(sub_patches)} (清单存放在 {c(str(manifest_file), COLOR_CYAN)})")
+                    _print(f"  一键应用交付补丁 (推荐): {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}")
+                    _print(f"  手动应用: git -c core.autocrlf=false -C {apply_root_esc} apply --binary {patch_file_esc}\n")
                 else:
-                    print(f"  宿主机仓库可直接合并独立审查通过的改动: git -C {apply_root_esc} merge {impl_commit}")
-                    print(f"  独立补丁备用存档: {c(str(patch_file), COLOR_CYAN)}")
-                    print(f"  一键应用脚本备用: {c(apply_script_esc, COLOR_CYAN)}\n")
+                    _print(f"  宿主机仓库可直接合并独立审查通过的改动: git -C {apply_root_esc} merge {impl_commit}")
+                    _print(f"  独立补丁备用存档: {c(str(patch_file), COLOR_CYAN)}")
+                    _print(f"  一键应用脚本备用: {c(apply_script_esc, COLOR_CYAN)}\n")
             else:
-                print("  已封存非 Git 隔离副本的交付补丁，原工作区未受任何修改污染。")
-                print(f"  固定提交与补丁清单: {manifest_file}")
-                print(f"  一键应用交付补丁: {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}\n")
+                _print("  已封存非 Git 隔离副本的交付补丁，原工作区未受任何修改污染。")
+                _print(f"  固定提交与补丁清单: {manifest_file}")
+                _print(f"  一键应用交付补丁: {c(apply_script_esc, COLOR_GREEN + COLOR_BOLD)}\n")
 
     if get_remaining_timeout(timeout) <= 0:
         if _outcome is not None:
@@ -2691,9 +2916,9 @@ def _run_pipeline_impl(
             if _outcome is not None:
                 _outcome["status"] = host_txn.outcome_status or "FAILED"
                 _outcome["error"] = reason
-            print(c(f"❌ [Makewand Transaction] 交付核验未通过，拒绝确认交付: {reason}", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand Transaction] 交付核验未通过，拒绝确认交付: {reason}", COLOR_RED + COLOR_BOLD))
             return False
-    print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
+    _print(c("✔ 任务全链路自适应闭环完成并通过红队审查。", COLOR_GREEN + COLOR_BOLD))
     return True
 
 @functools.wraps(_run_pipeline_impl)
@@ -2722,7 +2947,8 @@ def run_pipeline(*args, **kwargs) -> bool:
         code = run_race(bound.arguments["prompt"], cwd=bound.arguments["cwd"],
                         timeout=bound.arguments["timeout"], total_timeout=total_timeout if total_timeout is not None else bound.arguments["total_budget"],
                         repo_trust=bound.arguments["repo_trust"], risk="high" if plan.risk == "high" else "auto",
-                        engine_a=bound.arguments["forced_engine"], judge_reserve_seconds=judge_reserve_seconds,
+                        engine_a=forced_engine_name(bound.arguments["forced_engine"]),
+                        judge_reserve_seconds=judge_reserve_seconds,
                         tier="deep" if bound.arguments["boost"] else bound.arguments["tier"],
                         effort=bound.arguments.get("effort"),
                         **({"protected_paths": bound.arguments["protected_paths"]}
@@ -2774,7 +3000,10 @@ def run_workflow(prompt, **kwargs):
 
 
 def run_review(cwd=None, stream=False, timeout=300, user_prompt=None, output_json=False,
-               repo_trust="trusted", local_only=False, base_rev=None, effort=None):
+               repo_trust="trusted", local_only=False, base_rev=None, effort=None, engine=None):
+    """Independent read-only review of the workspace diff. ``engine`` is a reviewer the
+    user forced (--provider): it is the only one asked, and an unusable one is refused
+    with its own reason (forced_engine_refusal), as on every other path."""
     from makewand.execution_runtime import execution_context, task_id
     from makewand.execution_contract import ExecutionResult, STATUS_CODES
     from makewand.workflow import remember_result
@@ -2782,7 +3011,8 @@ def run_review(cwd=None, stream=False, timeout=300, user_prompt=None, output_jso
     deadline = _deadline(timeout)
     with execution_context(deadline_unix_ms=deadline, workflow="review", readonly=True):
         with stage("review", readonly=True) as span:
-            code = _run_review_impl(cwd, stream, timeout, user_prompt, output_json, repo_trust, local_only, base_rev, effort=effort)
+            code = _run_review_impl(cwd, stream, timeout, user_prompt, output_json, repo_trust, local_only, base_rev,
+                                    effort=effort, engine=engine)
             status = next((name for name, value in STATUS_CODES.items() if value == code), "UNKNOWN")
             remember_result(ExecutionResult(status == "PASSED", None, None, status=status,
                             task_id=task_id(), stage="review", engine="orchestrator", readonly=True))
@@ -2790,15 +3020,16 @@ def run_review(cwd=None, stream=False, timeout=300, user_prompt=None, output_jso
             return code
 
 
-def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted", local_only: bool = False, base_rev: Optional[str] = None, effort: Optional[str] = None) -> int:
+def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: int = 300, user_prompt: Optional[str] = None, output_json: bool = False, repo_trust: str = "trusted", local_only: bool = False, base_rev: Optional[str] = None, effort: Optional[str] = None, engine: Optional[str] = None) -> int:
     from makewand.execution_runtime import current_context
     from makewand.execution_contract import EXIT_TIMEOUT
+    forced = None if local_only else forced_engine_name(engine)
     def timed_out():
         if current_context().get("_deadline_monotonic", float("inf")) > time.monotonic():
             return False
         if output_json:
-            print(json.dumps({"pass": False, "engine": None, "exit_code": EXIT_TIMEOUT,
-                              "error": "review task deadline expired"}))
+            _print(json.dumps({"pass": False, "engine": None, "exit_code": EXIT_TIMEOUT,
+                               "error": "review task deadline expired"}))
         return True
     if timed_out():
         return EXIT_TIMEOUT
@@ -2809,7 +3040,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         from makewand.sandbox import is_bwrap_available
         if not is_bwrap_available() and os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
             if output_json:
-                print(json.dumps({
+                _print(json.dumps({
                     "pass": False,
                     "exit_code": EXIT_UNVERIFIED,
                     "engine": None,
@@ -2817,11 +3048,22 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
                     "error": "Untrusted repository requires Bubblewrap sandbox"
                 }, ensure_ascii=False, indent=2))
             else:
-                print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断审查。", COLOR_RED + COLOR_BOLD))
+                _print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断审查。", COLOR_RED + COLOR_BOLD))
+            return EXIT_UNVERIFIED
+
+    if forced:
+        refusal = forced_engine_refusal(forced, get_or_update_status())
+        if refusal:
+            if output_json:
+                _print(json.dumps({"pass": False, "exit_code": EXIT_UNVERIFIED, "engine": None, "defects": [refusal],
+                                   "error": forced_engine_error(forced, refusal)}, ensure_ascii=False, indent=2))
+            else:
+                for line in forced_engine_refusal_lines(forced, refusal):
+                    _print(line)
             return EXIT_UNVERIFIED
 
     if not output_json:
-        print(c("🔍 Makewand 代码审计工具", COLOR_BOLD + COLOR_CYAN))
+        _print(c("🔍 Makewand 代码审计工具", COLOR_BOLD + COLOR_CYAN))
     def extract_review_diff():
         if base_rev is None and (hasattr(get_git_diff, "mock") or hasattr(get_git_diff, "_mock_return_value") or "unittest.mock" in type(get_git_diff).__module__):
             return get_git_diff(cwd), None
@@ -2832,7 +3074,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         return EXIT_TIMEOUT
     if diff_err:
         if output_json:
-            print(json.dumps({
+            _print(json.dumps({
                 "pass": False,
                 "exit_code": EXIT_UNVERIFIED,
                 "engine": None,
@@ -2840,12 +3082,12 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
                 "error": diff_err
             }, ensure_ascii=False, indent=2))
         else:
-            print(c(f"❌ [Makewand Review] 无法提取当前工作区改动 ({diff_err})，阻断审查。", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand Review] 无法提取当前工作区改动 ({diff_err})，阻断审查。", COLOR_RED + COLOR_BOLD))
         return EXIT_UNVERIFIED
 
     if not diff_out.strip():
         if output_json:
-            print(json.dumps({
+            _print(json.dumps({
                 "pass": True,
                 "exit_code": EXIT_PASSED,
                 "engine": None,
@@ -2853,14 +3095,14 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
                 "message": "当前工作区没有检测到未提交的改动 (git diff 为空)"
             }, ensure_ascii=False, indent=2))
         else:
-            print("当前工作区没有检测到未提交的改动 (git diff 为空)。")
+            _print("当前工作区没有检测到未提交的改动 (git diff 为空)。")
         return EXIT_PASSED
 
-    diff_bytes = _utf8_size(diff_out)
+    diff_bytes = dispatched_size(diff_out)
     review_cap = review_diff_max_bytes()
     if diff_bytes > review_cap:
         reason = _review_cap_exceeded(diff_bytes, review_cap)
-        print(json.dumps({"pass": False, "engine": None, "exit_code": EXIT_UNVERIFIED, "error": reason}, ensure_ascii=False) if output_json else reason)
+        _print(json.dumps({"pass": False, "engine": None, "exit_code": EXIT_UNVERIFIED, "error": reason}, ensure_ascii=False) if output_json else reason)
         return EXIT_UNVERIFIED
     cache = get_or_update_status()
 
@@ -2878,6 +3120,9 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         reviewer_ladder = [
             ("local", "派发给本地自托管模型进行独立红队审计 (Ollama / vLLM, 100% 离线隐私零 Token, 只读隔离)...", COLOR_CYAN),
         ]
+    elif forced:
+        # The reviewer the user forced, usable (checked above), and no other.
+        reviewer_ladder = [(forced, f"派发给指定的审查引擎 {forced.upper()} 进行红队审计 (只读隔离)...", COLOR_CYAN)]
     else:
         reviewer_ladder = [
             ("codex", "派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN),
@@ -2890,21 +3135,21 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
     partial = []
     terminal_status = "UNVERIFIED"
     for eng, banner, color in reviewer_ladder:
-        usable, why = _engine_usable(eng, cache)
+        usable, why = (True, "") if eng == forced else _engine_usable(eng, cache)
         if not usable:
             if not output_json:
-                print(c(f"跳过 {eng.upper()} 审查引擎: {why}", COLOR_YELLOW))
+                _print(c(f"跳过 {eng.upper()} 审查引擎: {why}", COLOR_YELLOW))
             continue
         if not reviewer_receives_whole_prompt(eng, prompt):
             # A verdict from a reviewer that saw only part of the diff never counts.
             partial.append(eng)
             if not output_json:
-                print(c(f"跳过 {eng.upper()} 审查引擎: 审查提示 ({_prompt_size(prompt)} 字节) 超过其可完整接收的 "
-                        f"{reviewer_prompt_limit(eng)} 字节上限", COLOR_YELLOW))
+                _print(c(f"跳过 {eng.upper()} 审查引擎: 审查提示 ({dispatched_size(prompt)} 字节) 超过其可完整接收的 "
+                         f"{reviewer_prompt_limit(eng)} 字节上限", COLOR_YELLOW))
             continue
         attempted.append(eng)
         if not output_json:
-            print(c(banner, color))
+            _print(c(banner, color))
         result = dispatch_task(eng, prompt, cwd=cwd, timeout=timeout, tier="deep", effort=effort,
                                stream=stream and not output_json, readonly=True, repo_trust=repo_trust)
         success, out, err = result
@@ -2916,7 +3161,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             terminal_status = result.status
             break
         if not output_json:
-            print(c(f"{eng.upper()} 审查失败 ({err or '输出内容为空'})，尝试下一审查引擎...", COLOR_YELLOW))
+            _print(c(f"{eng.upper()} 审查失败 ({err or '输出内容为空'})，尝试下一审查引擎...", COLOR_YELLOW))
 
     if not review_res:
         from makewand.execution_contract import STATUS_CODES
@@ -2924,14 +3169,17 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         if local_only:
             reason = ("本地审查引擎不可用或已被禁用 (根据 --local-only 隐私安全原则阻断向外部云端回退)" if no_engine
                       else "本地审查引擎未能产生有效输出 (根据 --local-only 隐私安全原则阻断向外部云端回退)")
+        elif forced:
+            reason = (f"指定的审查引擎 {forced.upper()} 无法完整接收审查提示" if no_engine
+                      else f"指定的审查引擎 {forced.upper()} 未能产生有效输出 (UNVERIFIED)")
         else:
             reason = ("没有可完整接收审查提示的已启用审查引擎" if no_engine and partial
                       else "没有已启用且健康的审查引擎 (codex/grok/agy 均被禁用或不可用)" if no_engine
                       else "独立审查服务未能产生有效输出 (UNVERIFIED)")
         if partial:
-            reason += f"；{'/'.join(e.upper() for e in partial)} 无法完整接收审查提示 ({_prompt_size(prompt)} 字节)，已跳过"
+            reason += f"；{'/'.join(e.upper() for e in partial)} 无法完整接收审查提示 ({dispatched_size(prompt)} 字节)，已跳过"
         if output_json:
-            print(json.dumps({
+            _print(json.dumps({
                 "pass": False,
                 "exit_code": STATUS_CODES[terminal_status],
                 "engine": None,
@@ -2940,7 +3188,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
                 "error": "No enabled and healthy review engine" if no_engine else "Independent review engine failed to produce valid output"
             }, ensure_ascii=False, indent=2))
         else:
-            print(c(f"❌ [Makewand Quality Gate] {reason}，拒绝交付。", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand Quality Gate] {reason}，拒绝交付。", COLOR_RED + COLOR_BOLD))
         return STATUS_CODES[terminal_status]
 
     review_res, verdict = resolve_review_verdict(review_res, reviewer_engine, cwd=cwd, timeout=timeout,
@@ -2984,18 +3232,18 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             v_dict.update({"pass": False, "error": "review task deadline expired"})
         if exit_code == EXIT_UNVERIFIED:
             v_dict["error"] = verdict["reason"]
-        print(json.dumps(v_dict, ensure_ascii=False, indent=2))
+        _print(json.dumps(v_dict, ensure_ascii=False, indent=2))
         return exit_code
 
     if not stream:
-        print(review_res)
+        _print(review_res)
 
     if exit_code == EXIT_PASSED:
-        print(c("✔ 代码审计通过，未发现严重缺陷 (PASSED)。", COLOR_GREEN + COLOR_BOLD))
+        _print(c("✔ 代码审计通过，未发现严重缺陷 (PASSED)。", COLOR_GREEN + COLOR_BOLD))
     elif exit_code == EXIT_FAILED:
-        print(c("❌ 代码审计检测到严重隐患，未达合并标准 (FAILED)。", COLOR_RED + COLOR_BOLD))
+        _print(c("❌ 代码审计检测到严重隐患，未达合并标准 (FAILED)。", COLOR_RED + COLOR_BOLD))
     else:
-        print(c(f"❌ 审查未给出有效的 MAKEWAND_VERDICT 裁决，结论未验证 (UNVERIFIED: {verdict['reason']})。", COLOR_RED + COLOR_BOLD))
+        _print(c(f"❌ 审查未给出有效的 MAKEWAND_VERDICT 裁决，结论未验证 (UNVERIFIED: {verdict['reason']})。", COLOR_RED + COLOR_BOLD))
     return exit_code
 
 
@@ -3038,7 +3286,7 @@ def _review_saved_hybrid_impl(race_id: str, stream: bool = False, timeout: int =
         report.update({"error": "候选 M 受保护文件校验失败: " + str(failure),
                        "exit_code": STATUS_CODES.get(failure.status, EXIT_UNVERIFIED),
                        "race_id": race_id, "candidate": "M"})
-        print(json.dumps(report, ensure_ascii=False, indent=2) if output_json else report["error"])
+        _print(json.dumps(report, ensure_ascii=False, indent=2) if output_json else report["error"])
         return report["exit_code"]
     if not hybrid or hybrid.get("test_passed") is not True:
         error = "候选 M 不存在或未通过本地测试"
@@ -3087,10 +3335,22 @@ def _review_saved_hybrid_impl(race_id: str, stream: bool = False, timeout: int =
     else:
         report["exit_code"] = EXIT_PASSED
     report.update({"race_id": race_id, "candidate": "M"})
-    print(json.dumps(report, ensure_ascii=False, indent=2) if output_json else report.get("error") or report.get("message"))
+    _print(json.dumps(report, ensure_ascii=False, indent=2) if output_json else report.get("error") or report.get("message"))
     return report["exit_code"]
 
 
+
+
+# The contestants a race picks by itself, in each slot's order of preference: the
+# OpenAI/xAI/Meta side for A and Anthropic for B, with the other engines after
+# them, so that any two different enabled, healthy racers form a pair (codex and
+# muse included). Engines outside these lists race only when named explicitly.
+_RACE_SLOT_A = (("codex", "Codex (gpt-6-astra)"), ("grok", "Grok Build CLI (grok-4.7)"), ("muse", "Muse Code"),
+                ("local", "Local Self-Hosted (本地大模型)"), ("agy", "Antigravity (Gemini Fast)"),
+                ("claude", "Claude Code"))
+_RACE_SLOT_B = (("claude", "Claude Code"), ("grok", "Grok Build CLI (grok-4.7)"),
+                ("local", "Local Self-Hosted (本地大模型)"), ("agy", "Antigravity (Gemini Deep)"),
+                ("muse", "Muse Code"), ("codex", "Codex (gpt-6-astra)"))
 
 
 def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
@@ -3138,13 +3398,13 @@ def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
             except ProtectionError as error:
                 result = remember_result(ExecutionResult(False, None, str(error), status=error.status,
                     task_id=task_id(), stage="workflow", engine="orchestrator"))
-                print(c(str(error), COLOR_RED))
+                _print(c(str(error), COLOR_RED))
                 span.finish(status=result.status, error_kind="protected_files")
                 return result.exit_code
             except BudgetError as error:
                 result = remember_result(ExecutionResult(False, None, str(error), status="BUDGET_EXHAUSTED",
                     task_id=task_id(), stage="workflow", engine="orchestrator"))
-                print(c(str(error), COLOR_RED))
+                _print(c(str(error), COLOR_RED))
                 span.finish(status=result.status, error_kind="budget_admission")
                 return result.exit_code
             finally:
@@ -3152,7 +3412,7 @@ def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
                     try:
                         release_capacity(lease)
                     except (BudgetError, OSError, ValueError, TypeError, RuntimeError):
-                        print("makewand: unused call capacity release unavailable; lease will expire", file=sys.stderr)
+                        _print("makewand: unused call capacity release unavailable; lease will expire", file=sys.stderr)
 
 
 def _run_race_impl(
@@ -3195,85 +3455,64 @@ def _run_race_impl(
         # Candidates are copies of cwd and an approved one is applied back into it.
         if _outcome is not None:
             _outcome["error"] = _printable(harness_conflict)
-        print(c(f"❌ [Makewand Test Harness] {harness_conflict}，未改动任何文件。", COLOR_RED + COLOR_BOLD))
+        _print(c(f"❌ [Makewand Test Harness] {harness_conflict}，未改动任何文件。", COLOR_RED + COLOR_BOLD))
         return EXIT_UNVERIFIED
     protected = ProtectedFiles.capture(cwd, protected_paths)
 
     if repo_trust == "untrusted":
         from makewand.sandbox import is_bwrap_available
         if not is_bwrap_available() and os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
-            print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断竞速。", COLOR_RED + COLOR_BOLD))
+            _print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断竞速。", COLOR_RED + COLOR_BOLD))
             return 1
 
+    cache = get_or_update_status(force_probe=False)
+    from makewand.config import get_active_providers, is_provider_enabled
+
+    # Explicitly requested contestants (run_pipeline's forced engine is contestant A)
+    # are decided first, as the forced engine is on every other path.
+    for explicit in (engine_a, engine_b):
+        refusal = forced_engine_refusal(explicit, cache)
+        if refusal:
+            if _outcome is not None:
+                _outcome["error"] = forced_engine_error(explicit, refusal)
+            for line in forced_engine_refusal_lines(explicit, refusal):
+                _print(line)
+            return EXIT_UNVERIFIED
+    engine_a, engine_b = forced_engine_name(engine_a), forced_engine_name(engine_b)
+
     if not (engine_a and engine_b):
-        from makewand.config import get_active_providers
         if not get_active_providers():
             _print_no_provider_guidance()
             return EXIT_FAILED
 
-    print(c(f"🏁 Makewand 双模型并发竞速模式启动: '{prompt}'", COLOR_BOLD + COLOR_CYAN))
+    _print(c(f"🏁 Makewand 双模型并发竞速模式启动: '{prompt}'", COLOR_BOLD + COLOR_CYAN))
 
     # Candidates are isolated copies with their own git baseline; the host
     # directory is never git-initialized by a race (apply works from manifests).
 
-    cache = get_or_update_status(force_probe=False)
-    from makewand.config import is_provider_enabled
-    c_ok = cache.get("claude", {}).get("status") == "healthy" and is_provider_enabled("claude")
-    x_ok = cache.get("codex", {}).get("status") == "healthy" and is_provider_enabled("codex")
-    g_ok = cache.get("grok", {}).get("status") == "healthy" and is_provider_enabled("grok")
-    m_ok = cache.get("muse", {}).get("status") == "healthy" and is_provider_enabled("muse")
-    l_ok = cache.get("local", {}).get("status") == "healthy" and is_provider_enabled("local")
-    # agy used to be an unconditional fallback; it must now also be enabled and not known-unhealthy.
-    agy_ok = _engine_usable("agy", cache)[0]
+    def racer_ok(engine: str) -> bool:
+        # An auto-picked contestant is enabled and healthy; agy, whose health check
+        # only proves the binary is installed, when it is not known to fail.
+        if engine == "agy":
+            return _engine_usable("agy", cache)[0]
+        info = cache.get(engine) if isinstance(cache, dict) else None
+        return isinstance(info, dict) and info.get("status") == "healthy" and is_provider_enabled(engine)
 
-    # Explicitly requested contestants must still be enabled and usable.
-    for explicit in (engine_a, engine_b):
-        if explicit:
-            usable, why = _engine_usable(explicit.lower(), cache)
-            if not usable:
-                print(c(f"❌ [Makewand Race] 指定的竞速引擎 {explicit.upper()} 不可用: {why}", COLOR_RED + COLOR_BOLD))
-                return EXIT_UNVERIFIED
-
-    # Pick Contestants
-    if engine_a:
-        name_a = engine_a.upper()
-    elif x_ok:
-        engine_a = "codex"
-        name_a = "Codex (gpt-6-astra)"
-    elif g_ok:
-        engine_a = "grok"
-        name_a = "Grok Build CLI (grok-4.7)"
-    elif m_ok:
-        engine_a = "muse"
-        name_a = "Muse Code"
-    elif l_ok:
-        engine_a = "local"
-        name_a = "Local Self-Hosted (本地大模型)"
-    elif agy_ok:
-        engine_a = "agy"
-        name_a = "Antigravity (Gemini Fast)"
-
-    if engine_b:
-        name_b = engine_b.upper()
-    elif c_ok and engine_a != "claude":
-        engine_b = "claude"
-        name_b = "Claude Code"
-    elif g_ok and engine_a != "grok":
-        engine_b = "grok"
-        name_b = "Grok Build CLI (grok-4.7)"
-    elif l_ok and engine_a != "local":
-        engine_b = "local"
-        name_b = "Local Self-Hosted (本地大模型)"
-    elif agy_ok:
-        engine_b = "agy"
-        name_b = "Antigravity (Gemini Deep)"
+    # Pick Contestants: each slot's preference order, any two different usable
+    # racers forming a pair (a racer the other slot prefers comes last).
+    name_a = engine_a.upper() if engine_a else None
+    name_b = engine_b.upper() if engine_b else None
+    if not engine_a:
+        engine_a, name_a = next(((e, n) for e, n in _RACE_SLOT_A if e != engine_b and racer_ok(e)), (None, None))
+    if not engine_b:
+        engine_b, name_b = next(((e, n) for e, n in _RACE_SLOT_B if e != engine_a and racer_ok(e)), (None, None))
 
     if not engine_a or not engine_b:
-        from makewand.config import get_active_providers
         picked = ", ".join(name.upper() for name in (engine_a, engine_b) if name)
-        print(c("❌ [Makewand Race] 没有足够的已启用且健康 (healthy) 的引擎参与竞速，未派发任何任务"
-                + (f" (可用: {picked})" if picked else "") + "：", COLOR_RED + COLOR_BOLD))
-        for name in get_active_providers():
+        _print(c("❌ [Makewand Race] 没有两个不同的已启用且健康 (healthy) 的引擎可参与竞速，未派发任何任务"
+                 + (f" (可用: {picked})" if picked else "") + "：", COLOR_RED + COLOR_BOLD))
+        racers = [e for e, _ in _RACE_SLOT_A]
+        for name in dict.fromkeys(racers + list(get_active_providers())):
             if name in ENGINES_WITHOUT_EXECUTOR or name in (engine_a, engine_b):
                 continue
             # Disabled, limited, needs_auth, error and missing engines give their own reason.
@@ -3281,13 +3520,18 @@ def _run_race_impl(
             if not why:
                 info = cache.get(name) if isinstance(cache, dict) else None
                 status = (info.get("status") if isinstance(info, dict) else None) or "unknown"
-                why = (f"健康状态为 {status}（竞速只派发 healthy 的引擎）" if status != "healthy"
-                       else "健康，但没有另一位可与它组成竞速的不同引擎")
-            print(f"   • {name}: {why}")
-        print("   运行 'makewand probe' 复查，或用 'makewand enable <engine>' 重新开启被禁用的引擎。")
+                if name not in racers:
+                    why = (f"竞速不会自动选用该引擎（可用 makewand run --workflow race --provider {name} "
+                           "指定它为选手）")
+                elif status != "healthy":
+                    why = f"健康状态为 {status}（竞速只自动选用 healthy 的引擎）"
+                else:
+                    why = "健康，但未被选为选手"
+            _print(f"   • {name}: {why}")
+        _print("   运行 'makewand probe' 复查，或用 'makewand enable <engine>' 重新开启被禁用的引擎。")
         return EXIT_UNVERIFIED
     if engine_a.lower() == engine_b.lower():
-        print(c("竞速需要两个不同的已启用提供者 (UNVERIFIED)。", COLOR_RED))
+        _print(c("竞速需要两个不同的已启用提供者 (UNVERIFIED)。", COLOR_RED))
         return EXIT_UNVERIFIED
 
     cli_engines = {"claude", "codex", "grok", "muse", "agy", "aider"}
@@ -3295,7 +3539,7 @@ def _run_race_impl(
         from makewand.sandbox import verify_writable_sandbox_or_authorized
         sb_ok, _, sb_err = verify_writable_sandbox_or_authorized(repo_trust=repo_trust)
         if not sb_ok:
-            print(c(sb_err, COLOR_RED + COLOR_BOLD), file=sys.stderr)
+            _print(c(sb_err, COLOR_RED + COLOR_BOLD), file=sys.stderr)
             return EXIT_UNVERIFIED
 
     ensure_config_dir()
@@ -3329,7 +3573,7 @@ def _run_race_impl(
                 if build_manifest(Path(cwd)) != host_baseline_manifest:
                     raise OSError("host workspace changed while freezing race baseline")
         except OSError as exc:
-            print(c(f"❌ [Makewand Race] 无法建立候选隔离副本，已中止竞速: {exc}", COLOR_RED + COLOR_BOLD))
+            _print(c(f"❌ [Makewand Race] 无法建立候选隔离副本，已中止竞速: {exc}", COLOR_RED + COLOR_BOLD))
             return EXIT_FAILED
 
         # Record baseline commit of host workspace
@@ -3338,9 +3582,9 @@ def _run_race_impl(
         _, base_a_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=str(wt_a))
         _, base_b_commit, _ = run_git_cmd("git rev-parse HEAD", cwd=str(wt_b))
 
-        print(c(f"  选手 A: {name_a} (独立工作区: {wt_a})", COLOR_CYAN + COLOR_BOLD))
-        print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
-        print(c("并发执行中，请稍候...\n", COLOR_YELLOW))
+        _print(c(f"  选手 A: {name_a} (独立工作区: {wt_a})", COLOR_CYAN + COLOR_BOLD))
+        _print(c(f"  选手 B: {name_b} (独立工作区: {wt_b})", COLOR_BLUE + COLOR_BOLD))
+        _print(c("并发执行中，请稍候...\n", COLOR_YELLOW))
 
         # Retrieve codebase repo map for global architecture perception
         repo_map_snippet = ""
@@ -3348,7 +3592,7 @@ def _run_race_impl(
             from makewand.repomap import format_repo_map_for_prompt
             repo_map_snippet = format_repo_map_for_prompt(cwd, max_lines=80)
             if repo_map_snippet:
-                print(c("🗺️  [Makewand Repo-Map] 自动提取代码库全局架构拓扑并注入竞速选手上下文...", COLOR_CYAN))
+                _print(c("🗺️  [Makewand Repo-Map] 自动提取代码库全局架构拓扑并注入竞速选手上下文...", COLOR_CYAN))
         except Exception:
             pass
 
@@ -3358,7 +3602,7 @@ def _run_race_impl(
             from makewand.memory import format_memory_hints_for_prompt
             memory_hints = format_memory_hints_for_prompt(prompt)
             if memory_hints:
-                print(c("🧠 [Makewand Kibitzer] 匹配并注入历史避坑与工程质量准则...", COLOR_PURPLE))
+                _print(c("🧠 [Makewand Kibitzer] 匹配并注入历史避坑与工程质量准则...", COLOR_PURPLE))
         except Exception:
             pass
 
@@ -3413,7 +3657,7 @@ def _run_race_impl(
         gate_eval_b = None
 
         if high_load:
-            print(c("⏳ [Makewand Backpressure] 主机负载偏高，动态降为串行分时执行以避免竞争系统资源...", COLOR_YELLOW))
+            _print(c("⏳ [Makewand Backpressure] 主机负载偏高，动态降为串行分时执行以避免竞争系统资源...", COLOR_YELLOW))
             res_a = run_agent_a()
             res_b = run_agent_b()
         else:
@@ -3450,7 +3694,7 @@ def _run_race_impl(
                                 diff_c, diff_err_c = get_git_diff_status(str(wt_curr), base_rev=base_c.strip() if base_c else None)
                             except Exception:
                                 diff_c, diff_err_c = "", "failed to inspect diff"
-                            if not diff_err_c and bool(diff_c.strip()) and _utf8_size(diff_c) <= review_cap:
+                            if not diff_err_c and bool(diff_c.strip()) and dispatched_size(diff_c) <= review_cap:
                                 t_ok, t_detail = _stage_call("test", run_local_tests, str(wt_curr), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
                                 if t_ok is True and t_detail is None:
                                     t_pass = None
@@ -3464,7 +3708,7 @@ def _run_race_impl(
                                     early_winner = side
                                     other_scope = scope_b_id if side == "A" else scope_a_id
                                     other_name = name_b if side == "A" else name_a
-                                    print(c(f"⚡ [Makewand Race Winner-Take-All] 选手 {racer_res[0]} 率先完成且通过本地测试门禁，立即向竞争对手 {other_name} 发送取消信号 (胜出前仍须通过独立只读复审)...", COLOR_GREEN + COLOR_BOLD))
+                                    _print(c(f"⚡ [Makewand Race Winner-Take-All] 选手 {racer_res[0]} 率先完成且通过本地测试门禁，立即向竞争对手 {other_name} 发送取消信号 (胜出前仍须通过独立只读复审)...", COLOR_GREEN + COLOR_BOLD))
                                     cancel_contestant(other_scope)
 
                 res_a = results_map.get("A", (name_a, False, "racer A did not complete", 0.0, wt_a))
@@ -3477,13 +3721,13 @@ def _run_race_impl(
             try:
                 removed = remove_new_generated_bytecode(candidate_path, frozen_baseline_manifest)
                 if removed:
-                    print(c(f"测试封存前移除 {len(removed)} 个新生成的 Python 字节码缓存。", COLOR_CYAN))
+                    _print(c(f"测试封存前移除 {len(removed)} 个新生成的 Python 字节码缓存。", COLOR_CYAN))
             except OSError as exc:
-                print(c(f"无法安全清理生成状态，拒绝封存候选: {exc}", COLOR_RED))
+                _print(c(f"无法安全清理生成状态，拒绝封存候选: {exc}", COLOR_RED))
                 return EXIT_UNVERIFIED
 
         # Deterministic local test gate validation on both candidate worktrees
-        print(c("🧪 正在对两位候选人的产出分别执行本地确定性测试套件验证...", COLOR_CYAN))
+        _print(c("🧪 正在对两位候选人的产出分别执行本地确定性测试套件验证...", COLOR_CYAN))
         tested_a = workspace_snapshot(wt_a)
         tested_b = workspace_snapshot(wt_b)
         if gate_eval_a is not None:
@@ -3512,10 +3756,10 @@ def _run_race_impl(
         reviewed_b = workspace_snapshot(wt_b)
         if reviewed_a != tested_a:
             test_pass_a = False
-            print(c("⚠ " + _snapshot_change_note("候选A在测试至审查之间发生变化，必须重新测试", tested_a, reviewed_a), COLOR_YELLOW))
+            _print(c("⚠ " + _snapshot_change_note("候选A在测试至审查之间发生变化，必须重新测试", tested_a, reviewed_a), COLOR_YELLOW))
         if reviewed_b != tested_b:
             test_pass_b = False
-            print(c("⚠ " + _snapshot_change_note("候选B在测试至审查之间发生变化，必须重新测试", tested_b, reviewed_b), COLOR_YELLOW))
+            _print(c("⚠ " + _snapshot_change_note("候选B在测试至审查之间发生变化，必须重新测试", tested_b, reviewed_b), COLOR_YELLOW))
         manifest_a = build_manifest(wt_a)
         manifest_b = build_manifest(wt_b)
         changes_a = get_candidate_files_changed(wt_a, baseline_commit=base_a_commit.strip() if base_a_commit else None)
@@ -3523,21 +3767,21 @@ def _run_race_impl(
         diff_a, diff_err_a = get_git_diff_status(str(wt_a), base_rev=base_a_commit.strip() if base_a_commit else None)
         diff_b, diff_err_b = get_git_diff_status(str(wt_b), base_rev=base_b_commit.strip() if base_b_commit else None)
         if diff_err_a:
-            print(c(f"⚠ 选手 A diff 提取警告: {diff_err_a}", COLOR_YELLOW))
+            _print(c(f"⚠ 选手 A diff 提取警告: {diff_err_a}", COLOR_YELLOW))
         if diff_err_b:
-            print(c(f"⚠ 选手 B diff 提取警告: {diff_err_b}", COLOR_YELLOW))
+            _print(c(f"⚠ 选手 B diff 提取警告: {diff_err_b}", COLOR_YELLOW))
 
 
         parsimony_a = compute_patch_parsimony(diff_a)
         parsimony_b = compute_patch_parsimony(diff_b)
 
-        print(c("\n============================================================", COLOR_BOLD))
-        print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
-        print(c("============================================================\n", COLOR_BOLD))
+        _print(c("\n============================================================", COLOR_BOLD))
+        _print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
+        _print(c("============================================================\n", COLOR_BOLD))
         def test_state(value):
             return "通过" if value is True else "未验证 (无测试套件)" if value is None else "失败"
-        print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={test_state(test_pass_a)}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节, 精简度={parsimony_a['summary']}")
-        print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={test_state(test_pass_b)}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节, 精简度={parsimony_b['summary']}\n")
+        _print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={test_state(test_pass_a)}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节, 精简度={parsimony_a['summary']}")
+        _print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={test_state(test_pass_b)}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节, 精简度={parsimony_b['summary']}\n")
 
         # Determine winner eligibility with strict deterministic test gate
         eligible_a = res_a[1] and test_pass_a is True and not diff_err_a and bool(diff_a.strip())
@@ -3560,9 +3804,9 @@ def _run_race_impl(
             wta_name, wta_engine = (name_a, engine_a) if wta_side == "A" else (name_b, engine_b)
             wta_diff = diff_a if wta_side == "A" else diff_b
             wta_path = wt_a if wta_side == "A" else wt_b
-            print(c(f"⚡ [Makewand Race Winner-Take-All] 选手 {wta_side} ({wta_name}) 率先通过本地测试门禁，竞争选手已取消；"
-                    "胜出前须通过独立只读复审...", COLOR_GREEN + COLOR_BOLD))
-            wta_diff_bytes = _utf8_size(wta_diff)
+            _print(c(f"⚡ [Makewand Race Winner-Take-All] 选手 {wta_side} ({wta_name}) 率先通过本地测试门禁，竞争选手已取消；"
+                     "胜出前须通过独立只读复审...", COLOR_GREEN + COLOR_BOLD))
+            wta_diff_bytes = dispatched_size(wta_diff)
             if wta_diff_bytes > review_cap:
                 review = {"status": REVIEW_UNVERIFIED, "reviewer": None, "report": "", "defects": [],
                           "reason": _review_cap_exceeded(wta_diff_bytes, review_cap), "execution_status": None}
@@ -3577,23 +3821,23 @@ def _run_race_impl(
                             f"独立只读复审 ({reviewer_label}) 结论: {review['status']}"
                             + (f" — {review['reason']}" if review["reason"] else "")
                             + (f"\n{review['report'].strip()}" if review["report"] else ""))
-            print(c("\n【Winner-Take-All 独立复审报告】", COLOR_BOLD))
-            print(judge_report.strip())
+            _print(c("\n【Winner-Take-All 独立复审报告】", COLOR_BOLD))
+            _print(judge_report.strip())
             if review["status"] == REVIEW_PASSED:
                 winner, approval, ok, judge_status = wta_side, "winner_take_all", True, "PASSED"
                 verdict = {"pass": True, "winner": wta_side, "defects": []}
-                print(c(f"✔ 选手 {wta_side} 已通过 {reviewer_label} 的独立只读复审。", COLOR_GREEN + COLOR_BOLD))
+                _print(c(f"✔ 选手 {wta_side} 已通过 {reviewer_label} 的独立只读复审。", COLOR_GREEN + COLOR_BOLD))
             elif review["status"] == REVIEW_FAILED:
                 judge_status = "FAILED"
                 verdict = {"pass": False, "winner": None, "defects": review["defects"]}
-                print(c(f"❌ 选手 {wta_side} 未通过独立复审，候选不予批准: {'; '.join(review['defects'])[:300]}", COLOR_RED + COLOR_BOLD))
+                _print(c(f"❌ 选手 {wta_side} 未通过独立复审，候选不予批准: {'; '.join(review['defects'])[:300]}", COLOR_RED + COLOR_BOLD))
             else:
                 judge_status = review["execution_status"] or "UNVERIFIED"
-                print(c(f"❌ 选手 {wta_side} 的独立复审未验证 ({review['reason']})，候选不予批准 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD))
+                _print(c(f"❌ 选手 {wta_side} 的独立复审未验证 ({review['reason']})，候选不予批准 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD))
         else:
             # A verdict must cover complete diffs. Large candidates stay inspectable
             # but cannot obtain approval from a truncated review prompt.
-            oversized_diffs = any(_utf8_size(diff) > review_cap for diff in (diff_a, diff_b))
+            oversized_diffs = any(dispatched_size(diff) > review_cap for diff in (diff_a, diff_b))
             # The judge sees each complete diff byte-for-byte inside nonce fences and
             # only a verdict line tagged with the same per-task nonce counts.
             race_nonce = generate_review_nonce()
@@ -3635,23 +3879,23 @@ def _run_race_impl(
                                                           _cross_review_required)
             judge_timeout = remaining_timeout()
             if oversized_diffs:
-                largest = max(_utf8_size(diff) for diff in (diff_a, diff_b))
-                print(c(f"候选完整 diff ({largest} 字节) 超过复审上限 {review_cap} 字节 (环境变量 {REVIEW_DIFF_MAX_BYTES_ENV} 可调整)，"
-                        "保留供 inspect；不调用裁判、不推荐候选。", COLOR_YELLOW))
+                largest = max(dispatched_size(diff) for diff in (diff_a, diff_b))
+                _print(c(f"候选完整 diff ({largest} 字节) 超过复审上限 {review_cap} 字节 (环境变量 {REVIEW_DIFF_MAX_BYTES_ENV} 可调整)，"
+                         "保留供 inspect；不调用裁判、不推荐候选。", COLOR_YELLOW))
                 ok, judge_report = False, _review_cap_exceeded(largest, review_cap)
             elif judge_timeout <= 0:
                 judge_status = "TIMEOUT"
-                print(c("竞速总时间预算已耗尽，保留候选但不调用裁判或自动应用。", COLOR_YELLOW))
+                _print(c("竞速总时间预算已耗尽，保留候选但不调用裁判或自动应用。", COLOR_YELLOW))
                 ok, judge_report = False, None
             elif judge_engine is None:
-                print(c(f"❌ [Makewand Race] 没有已启用且健康、能完整接收裁判提示 ({_prompt_size(judge_prompt)} 字节) 的裁判引擎，"
-                        "无法评定胜者 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD))
+                _print(c(f"❌ [Makewand Race] 没有已启用且健康、能完整接收裁判提示 ({dispatched_size(judge_prompt)} 字节) 的裁判引擎，"
+                         "无法评定胜者 (UNVERIFIED)。", COLOR_RED + COLOR_BOLD))
                 ok, judge_report = False, None
             else:
                 if judge_engine == "agy":
-                    print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
+                    _print(c("由 Antigravity (Google AI Pro) 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
                 else:
-                    print(c(f"由 {judge_engine.upper()} 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
+                    _print(c(f"由 {judge_engine.upper()} 担任主裁判进行方案综合评估 (只读安全隔离)...", COLOR_GREEN + COLOR_BOLD))
                 with execution_context(lease_id=_leases[2]):
                     judge_result = _stage_call("judge", dispatch_task,
                         judge_engine, judge_prompt, engine=judge_engine, cwd=cwd, timeout=judge_timeout,
@@ -3659,8 +3903,8 @@ def _run_race_impl(
                     ok, judge_report, _ = judge_result
                     judge_status = getattr(judge_result, "status", "PASSED" if ok else "FAILED")
             if judge_report:
-                print(c("\n【裁判裁决报告】", COLOR_BOLD))
-                print(judge_report.strip())
+                _print(c("\n【裁判裁决报告】", COLOR_BOLD))
+                _print(judge_report.strip())
 
             verdict = parse_nonced_race_verdict(judge_report, race_nonce) if ok else None
             winner = verdict.get("winner") if verdict and verdict["pass"] else None
@@ -3670,8 +3914,8 @@ def _run_race_impl(
                     and judge_engine.lower() == winner_engine.lower()):
                 # The judge picked its own provider's candidate: under cross review that
                 # approval counts only after a read-only review by another provider.
-                print(c(f"⚠ 裁判 {judge_engine.upper()} 与胜出选手 {winner} 属同一提供者，批准前须经其他提供者独立只读复审...",
-                        COLOR_YELLOW + COLOR_BOLD))
+                _print(c(f"⚠ 裁判 {judge_engine.upper()} 与胜出选手 {winner} 属同一提供者，批准前须经其他提供者独立只读复审...",
+                         COLOR_YELLOW + COLOR_BOLD))
                 review = _review_race_winner(
                     prompt, winner, winner_engine, (engine_a, engine_b), diff_a if winner == "A" else diff_b,
                     str(wt_a if winner == "A" else wt_b), cache, remaining_timeout(), effort=effort,
@@ -3683,22 +3927,22 @@ def _run_race_impl(
                                  + (f" — {review['reason']}" if review["reason"] else "")
                                  + (f"\n{review['report'].strip()}" if review["report"] else ""))
                 judge_report = f"{judge_report.rstrip()}\n\n{review_report}"
-                print(review_report.strip())
+                _print(review_report.strip())
                 if review["status"] == REVIEW_PASSED:
                     approval = "judge_reviewed"
-                    print(c(f"✔ 选手 {winner} 已通过 {reviewer_label} 的独立只读复审。", COLOR_GREEN + COLOR_BOLD))
+                    _print(c(f"✔ 选手 {winner} 已通过 {reviewer_label} 的独立只读复审。", COLOR_GREEN + COLOR_BOLD))
                 elif review["status"] == REVIEW_FAILED:
                     winner, approval, judge_status = None, None, "FAILED"
                     verdict = {"pass": False, "winner": None, "defects": review["defects"]}
-                    print(c(f"❌ 裁判推荐的候选未通过独立复审，不予批准: {'; '.join(review['defects'])[:300]}", COLOR_RED + COLOR_BOLD))
+                    _print(c(f"❌ 裁判推荐的候选未通过独立复审，不予批准: {'; '.join(review['defects'])[:300]}", COLOR_RED + COLOR_BOLD))
                 else:
                     winner, approval, verdict = None, None, None
                     judge_status = review["execution_status"] or "UNVERIFIED"
-                    print(c(f"❌ 裁判推荐的候选未获其他提供者的独立复审 ({review['reason']})，不予批准 (UNVERIFIED)。",
-                            COLOR_RED + COLOR_BOLD))
+                    _print(c(f"❌ 裁判推荐的候选未获其他提供者的独立复审 ({review['reason']})，不予批准 (UNVERIFIED)。",
+                             COLOR_RED + COLOR_BOLD))
         if remaining_timeout() <= 0:
             winner, verdict, judge_status = None, None, "TIMEOUT"
-            print(c("裁判返回后的会计或日志处理耗尽总截止时间；候选保留但不认可胜者。", COLOR_YELLOW))
+            _print(c("裁判返回后的会计或日志处理耗尽总截止时间；候选保留但不认可胜者。", COLOR_YELLOW))
         if winner == "A" and not eligible_a or winner == "B" and not eligible_b:
             if (winner == "A" and test_pass_a is None) or (winner == "B" and test_pass_b is None):
                 verdict = None
@@ -3706,11 +3950,11 @@ def _run_race_impl(
         if workspace_snapshot(wt_a) != reviewed_a or workspace_snapshot(wt_b) != reviewed_b:
             winner = None
             verdict = None
-            print(c("裁判审查期间候选内容发生变化，拒绝应用。", COLOR_RED))
+            _print(c("裁判审查期间候选内容发生变化，拒绝应用。", COLOR_RED))
 
         if not res_a[1] and not res_b[1] and not diff_a.strip() and not diff_b.strip():
             # Nothing to inspect or apply: do not archive empty candidate copies.
-            print(c("❌ 两位选手均未能成功完成任务且没有产生任何改动，不保留候选工作区。", COLOR_RED + COLOR_BOLD))
+            _print(c("❌ 两位选手均未能成功完成任务且没有产生任何改动，不保留候选工作区。", COLOR_RED + COLOR_BOLD))
             from makewand.execution_contract import STATUS_CODES
             for status in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                 if status in racer_outcomes.values():
@@ -3764,7 +4008,7 @@ def _run_race_impl(
                 **({"protected_files": protected.to_dict()} if protected.paths else {}),
             )
         except (ValueError, OSError) as exc:
-            print(c(f"候选封存完整性检查失败，拒绝交付 (UNVERIFIED): {exc}", COLOR_RED))
+            _print(c(f"候选封存完整性检查失败，拒绝交付 (UNVERIFIED): {exc}", COLOR_RED))
             return EXIT_UNVERIFIED
         saved_successfully = True
 
@@ -3776,35 +4020,35 @@ def _run_race_impl(
                 ok_m, cand_m_meta, msg_m = CandidateManager.create_hybrid_candidate(race_id=race_id, test_timeout=hybrid_timeout)
                 if ok_m and cand_m_meta and cand_m_meta.get("test_passed"):
                     hybrid_created = True
-                    print(c("✨ [Makewand 3-Way Merge] 成功融合选手 A 与选手 B 的互补代码并全量通过本地单测！", COLOR_GREEN + COLOR_BOLD))
-                    print(c(f"  • 合成方案: Candidate M (Hybrid) - {cand_m_meta.get('model')}", COLOR_CYAN + COLOR_BOLD))
-                    print(f"  • 审查混合方案: makewand inspect {race_id} --candidate M")
-                    print(f"  • 独立复审混合: makewand review --race-id {race_id} --candidate M\n")
+                    _print(c("✨ [Makewand 3-Way Merge] 成功融合选手 A 与选手 B 的互补代码并全量通过本地单测！", COLOR_GREEN + COLOR_BOLD))
+                    _print(c(f"  • 合成方案: Candidate M (Hybrid) - {cand_m_meta.get('model')}", COLOR_CYAN + COLOR_BOLD))
+                    _print(f"  • 审查混合方案: makewand inspect {race_id} --candidate M")
+                    _print(f"  • 独立复审混合: makewand review --race-id {race_id} --candidate M\n")
             except Exception:
                 pass
         elif synthesize_hybrid:
-            print(c("竞速总预算已耗尽，未启动混合候选合成或测试。", COLOR_YELLOW))
+            _print(c("竞速总预算已耗尽，未启动混合候选合成或测试。", COLOR_YELLOW))
 
-        print(c(f"\n💾 候选工作区已妥善封存 (Race ID: {race_id})", COLOR_GREEN + COLOR_BOLD))
+        _print(c(f"\n💾 候选工作区已妥善封存 (Race ID: {race_id})", COLOR_GREEN + COLOR_BOLD))
         if winner and approval == "winner_take_all":
-            print(c(f"  ★ Winner-Take-All 胜出方案 (已通过 {wta_reviewer.upper()} 独立只读复审): 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
-            print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {winner}")
-            print(f"  • 安全应用方案: makewand apply {race_id} --candidate {winner}")
+            _print(c(f"  ★ Winner-Take-All 胜出方案 (已通过 {wta_reviewer.upper()} 独立只读复审): 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
+            _print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {winner}")
+            _print(f"  • 安全应用方案: makewand apply {race_id} --candidate {winner}")
         elif winner and approval == "judge_reviewed":
-            print(c(f"  ★ 主裁推荐胜出方案 (已通过 {wta_reviewer.upper()} 独立只读复审): 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
-            print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {winner}")
-            print(f"  • 安全应用方案: makewand apply {race_id} --candidate {winner}")
+            _print(c(f"  ★ 主裁推荐胜出方案 (已通过 {wta_reviewer.upper()} 独立只读复审): 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
+            _print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {winner}")
+            _print(f"  • 安全应用方案: makewand apply {race_id} --candidate {winner}")
         elif winner:
-            print(c(f"  ★ 主裁推荐胜出方案: 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
-            print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {winner}")
-            print(f"  • 安全应用方案: makewand apply {race_id} --candidate {winner}")
+            _print(c(f"  ★ 主裁推荐胜出方案: 选手 {winner}", COLOR_GREEN + COLOR_BOLD))
+            _print(f"  • 审查改动差异: makewand inspect {race_id} --candidate {winner}")
+            _print(f"  • 安全应用方案: makewand apply {race_id} --candidate {winner}")
         else:
-            print(c("  ⚠ 未决出唯一胜出方案，请审查后显式指定方案:", COLOR_YELLOW))
-            print(f"  • 审查方案差异: makewand inspect {race_id} --candidate A|B")
-            print(f"  • 安全应用方案: makewand apply {race_id} --candidate A|B")
+            _print(c("  ⚠ 未决出唯一胜出方案，请审查后显式指定方案:", COLOR_YELLOW))
+            _print(f"  • 审查方案差异: makewand inspect {race_id} --candidate A|B")
+            _print(f"  • 安全应用方案: makewand apply {race_id} --candidate A|B")
         if hybrid_created:
-            print(c(f"  ★ 混合方案等待独立复审: makewand review --race-id {race_id} --candidate M", COLOR_GREEN + COLOR_BOLD))
-        print(f"  • 丢弃废弃候选: makewand discard {race_id}\n")
+            _print(c(f"  ★ 混合方案等待独立复审: makewand review --race-id {race_id} --candidate M", COLOR_GREEN + COLOR_BOLD))
+        _print(f"  • 丢弃废弃候选: makewand discard {race_id}\n")
 
         if remaining_timeout() <= 0:
             from makewand.execution_contract import EXIT_TIMEOUT
@@ -3816,12 +4060,12 @@ def _run_race_impl(
                     return STATUS_CODES[status]
         if test_pass_a is not True and test_pass_b is not True:
             if test_pass_a is None or test_pass_b is None:
-                print(c("没有候选获得明确的本地测试通过证据，结论未验证 (UNVERIFIED)。", COLOR_YELLOW))
+                _print(c("没有候选获得明确的本地测试通过证据，结论未验证 (UNVERIFIED)。", COLOR_YELLOW))
                 return EXIT_UNVERIFIED
-            print(c("❌ [Makewand Test Gate] 两套候选方案均未通过本地单元测试，拒绝交付。", COLOR_RED + COLOR_BOLD))
+            _print(c("❌ [Makewand Test Gate] 两套候选方案均未通过本地单元测试，拒绝交付。", COLOR_RED + COLOR_BOLD))
             return EXIT_FAILED
         if not res_a[1] and not res_b[1]:
-            print(c("❌ 两位选手均未能成功完成任务。", COLOR_RED + COLOR_BOLD))
+            _print(c("❌ 两位选手均未能成功完成任务。", COLOR_RED + COLOR_BOLD))
             return EXIT_FAILED
         if verdict is None and winner is None:
             if judge_status in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):

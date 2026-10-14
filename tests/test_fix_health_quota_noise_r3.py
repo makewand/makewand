@@ -401,7 +401,8 @@ class TestCatalogIsOneMirrorableDataFile(unittest.TestCase):
                 self.assertIn(entry.get("json_reports", False), (True, False))
                 for kind in entry["kinds"]:
                     self.assertIn(kind.replace(".marked", ""), {"quota", "rate", "overload", "auth", "region"})
-        self.assertEqual(health.CLI_TRANSCRIPT_PROVIDERS, ("codex",))
+        # Only codex exec writes a transcript (its rules are read by health._transcript_rules).
+        self.assertEqual([p for p, entry in providers.items() if "transcript" in entry], ["codex"])
 
     def test_every_pattern_is_re2_syntax_and_compiles(self):
         strings = list(_catalog_strings(self.catalog))

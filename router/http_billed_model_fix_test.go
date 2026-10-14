@@ -323,19 +323,19 @@ func TestHTTPPriceCeilingCoversTheModelsProvidersCall_Fix16(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		router *Router
-		pinned string
 		want   costEntry
 	}{
-		{"openai o1", openaiRouter("o1"), "", tablePrice(t, "o1")},
-		{"openai gpt-4o-mini", openaiRouter("gpt-4o-mini"), "openai", tablePrice(t, "gpt-4o-mini")},
-		{"openai unpriced", openaiRouter("gpt-unpriced-fixture"), "", unpricedFallbackCost()},
+		{"openai o1", openaiRouter("o1"), tablePrice(t, "o1")},
+		{"openai gpt-4o-mini", openaiRouter("gpt-4o-mini"), tablePrice(t, "gpt-4o-mini")},
+		{"openai unpriced", openaiRouter("gpt-unpriced-fixture"), unpricedFallbackCost()},
 		// claude-api calls its configured haiku when pinned, and the base
 		// provider's tier models when legacy or candidate routing reaches it.
-		{"claude-api haiku", cliFailoverRouter("claude-haiku-4-5-20251001", "http://127.0.0.1:1"), "", opus},
-		// The pinned "claude" CLI has no price, but its claude-api fallback does.
-		{"pinned claude CLI", cliFailoverRouter("claude-opus-4-20250514", "http://127.0.0.1:1"), "claude", opus},
+		{"claude-api haiku", cliFailoverRouter("claude-haiku-4-5-20251001", "http://127.0.0.1:1"), opus},
+		// A request pinned to the "claude" CLI, which has no price, falls back
+		// to its claude-api sibling, which has one.
+		{"claude CLI with an API sibling", cliFailoverRouter("claude-opus-4-20250514", "http://127.0.0.1:1"), opus},
 	} {
-		got, ok := tc.router.httpPriceCeiling(tc.pinned)
+		got, ok := tc.router.httpPriceCeiling()
 		if !ok || got != tc.want {
 			t.Errorf("%s: ceiling = %+v ok=%v, want %+v", tc.name, got, ok, tc.want)
 		}

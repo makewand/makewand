@@ -22,6 +22,11 @@ import makewand.orchestrator as orch
 from makewand import candidate
 from makewand.git_helper import run_git_cmd
 
+try:
+    from _verdicts import nonced
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests._verdicts import nonced
+
 
 def git(path, *args):
     code, out, err = run_git_cmd(["git", *args], cwd=str(path))
@@ -145,7 +150,7 @@ class ArtifactTests(StorageHarness):
 
         def dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):
             if readonly:
-                return True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None
+                return True, nonced(prompt, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'), None
             (Path(cwd) / "app.py").write_text("BASE = 2\n")
             return True, "done", None
 
@@ -290,7 +295,7 @@ class CandidateTests(StorageHarness):
 
         def dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):
             if readonly:
-                return True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None
+                return True, nonced(prompt, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}'), None
             (Path(cwd) / "app.py").write_text("CANDIDATE = 1\n")
             return True, "implemented", None
 
