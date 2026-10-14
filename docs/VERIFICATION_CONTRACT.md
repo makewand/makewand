@@ -182,15 +182,21 @@ generation success. An explicit human `--force` decision remains supported.
 
 A race verdict must use the structured line `MAKEWAND_RACE_VERDICT_<nonce>`, bound
 to a random per-task nonce and fenced diffs, so a verdict line a judge echoes from
-a candidate diff is inert (an un-nonced line counts only under
-`MAKEWAND_ALLOW_LEGACY_VERDICT=1` or the test harness, never with
-`MAKEWAND_STRICT_NONCE=1`). Rejection, missing verdicts and malformed verdicts
-cannot select a fastest candidate as a fallback. The judge must receive the whole
-prompt; one independent of both contestants is preferred, and a judge's pick of
-its own provider's candidate is approved only after a read-only, nonce-bound
-review by another provider. A Winner-Take-All win (the first candidate to pass
-its tests) needs the same review: `FAILED` exits 10, no reviewer or no verdict
-exits 11, and records saved before this review existed apply only with `--force`.
+a candidate diff is inert. An un-nonced `MAKEWAND_RACE_VERDICT:` line never counts,
+nor does an un-nonced review verdict where a `MAKEWAND_VERDICT_<nonce>` line was
+asked for; no environment setting or test harness re-enables them (the former
+`MAKEWAND_ALLOW_LEGACY_VERDICT` and `MAKEWAND_STRICT_NONCE` switches are gone).
+Rejection, missing verdicts and malformed verdicts cannot select a fastest
+candidate as a fallback. The judge must receive the whole prompt; one independent
+of both contestants is preferred, and a judge's pick of its own provider's
+candidate is approved only after a read-only, nonce-bound review by another
+provider. A Winner-Take-All win (the first candidate to pass its tests) needs the
+same review: `FAILED` exits 10, no reviewer or no verdict exits 11, and records
+saved before this review existed apply only with `--force`. That reviewer is
+chosen by the judge's rule: the first usable engine in the judge order (agy,
+codex, claude, grok, muse, local) that is neither contestant and can receive the
+whole review prompt, otherwise the other contestant, never the winner's own
+provider.
 Candidates without detected tests remain unverified and cannot obtain normal
 application approval. Race review includes each complete candidate diff; a diff
 over the review cap (`MAKEWAND_REVIEW_DIFF_MAX_BYTES`, 256 KiB by default) remains
@@ -205,10 +211,16 @@ every file Git tracks or would add, also below dependency or build directory
 names; pending records sealed by 3.2.0 (no `manifest_scope`) are still verified
 with the earlier scope. A candidate that adds a file the workspace already
 has (an ignored or untracked file its isolated copy never received) is a workspace
-conflict. `--force` can override a human decision about test/review failures or
-workspace conflicts, but cannot bypass artifact integrity, and an entry apply
-cannot write (a directory, symlink or special file at a target, a non-directory
-above one, an unwritable directory) is an `APPLY_CONFLICT` even with `--force`.
+conflict, and so is uncommitted work on a file the candidate changes as
+`git status` lists it: every untracked file counts, also one inside an untracked
+directory, and names compare byte for byte. A target that changes between the
+conflict check and the write is an `APPLY_CONFLICT` too, and nothing is written.
+`--force` can override a human decision about test/review failures or workspace
+conflicts, but cannot bypass artifact integrity, and an entry apply cannot write
+(a directory, symlink or special file at a target, a non-directory above one, an
+unwritable directory) is an `APPLY_CONFLICT` even with `--force`. `makewand apply`
+exits with the status of its typed result
+([outcomes](EXECUTION_CONTRACT.md#outcomes-and-compatibility)).
 Candidates saved by older versions must be regenerated. Replacement and rollback
 preserve supported permissions. POSIX uses directory handles; native Windows
 uses pinned, non-reparse Win32 directory/file handles and atomic handle-based
@@ -322,17 +334,22 @@ within `MAKEWAND_FINGERPRINT_FILE_LIMIT` (default 64 MiB per file),
 `MAKEWAND_FINGERPRINT_TOTAL_LIMIT` (512 MiB) and `MAKEWAND_FINGERPRINT_SECONDS`
 (20 s). Every file left without a digest then gets a sampled fingerprint, 16
 chunks of 64 KiB at fixed offsets (at most 1 MiB per file), in a separate budget
-with the same limits, taken in turns across file sizes. The same limits bound the
-delivery check and the rollback verification. A full digest decides, and so does
-a sample that covers the whole file; a partial sample clears a file only when a
-changed link count explains its stat change (a hard link added elsewhere). A
+with the same limits, taken in turns across file sizes. Files are read in that
+order, so running out of time leaves the same files without a digest or sample as
+running out of bytes would, never a file only because its path sorts late. The
+same limits bound the delivery check and the rollback verification, which re-hash
+a file only when its inode or change time moved and its size, mtime and mode did
+not. A full digest decides, and so does a sample that covers the whole file; a
+partial sample clears a file only when a changed link count explains its stat
+change (a hard link added elsewhere). A
 file whose re-hash the budget refuses, or that has neither, is unconfirmed: it
 blocks, naming the limit to raise, and is never reported as modified or
 unrestorable, and the rollback report says when the baseline could not be
 confirmed. Residual: an in-place patch of a file over 1 MiB placed between its
 sampled chunks, with the mtime restored and a hard link added outside the
-workspace, is delivered. When the time budget binds (slow disks), a large file
-late in path order may get no sample and block as unconfirmed.
+workspace, is delivered. When the time budget of the delivery check or the
+rollback verification binds (slow disks), the changed files it has not re-hashed
+yet block as unconfirmed.
 
 Test output has one definition, `git_helper.is_test_output_path`, shared by the
 test gate and the delivery check: reports, coverage data and tool caches at the
@@ -346,20 +363,32 @@ the suites, `run_local_tests` removes the test output its run created, except
 output that could run as code (an executable bit, Python source, a
 security-sensitive name) or a link, which fails the test gate, named with its
 reason. Directories that existed before the run, empty ones included, are not
-removed (except one that held only ignored files the tests themselves deleted);
-if recording them exceeds `MAKEWAND_WORKSPACE_SNAPSHOT_TIMEOUT_SECS` or
+removed. An ignored directory (in a work tree one a `.gitignore` covers, elsewhere
+a dependency or cache directory name) is recorded without being walked: it is kept
+even when it held only ignored files the tests deleted, but the directories inside
+it are not recorded, and one of them that held only such files is removed together
+with the test output the run wrote there. If recording the directories, the
+ignored ones included, exceeds `MAKEWAND_WORKSPACE_SNAPSHOT_TIMEOUT_SECS` or
 `MAKEWAND_WORKSPACE_SNAPSHOT_MAX_FILES`, no directory is removed. A pre-existing
 test-output file the run rewrote is kept only as plain data (JSON, XML, LCOV,
 logs, report HTML/CSS and images, Playwright `.zip`/`.webm` in `test-results/` or
 `playwright-report/`) or with identical bytes, and never inside `.tox`, `.nox` or
-`.jest-cache`. The gate also accepts other gitignored paths; its `.gitignore`
-fallback, used only where `git check-ignore` cannot run (outside a work tree, a
-path inside a submodule), approximates .gitignore rules (last match wins, `!`
-re-includes, anchored and directory-only patterns, no substring matches) and
-never treats a tracked file as ignored. A report at a custom ignored location
-(`--junitxml=results/pytest-junit.xml`) therefore passes the gate and then blocks
-the host delivery as `UNVERIFIED`. Notes about inputs that changed between the
-test run and the review snapshot name the files.
+`.jest-cache`. The gate also accepts other gitignored paths, so a report at a
+custom ignored location (`--junitxml=results/pytest-junit.xml`) passes the gate and
+then blocks the host delivery as `UNVERIFIED`. Its `.gitignore` fallback, used only
+where `git check-ignore` cannot run (outside a work tree, a path inside a
+submodule), reads the tested directory's `.gitignore` as git does (lines split at
+newlines, a UTF-8 BOM and a carriage return before the newline dropped, trailing
+spaces trimmed unless escaped, a leading `\#` or `\!` literal) and matches with
+git's own rules on the bytes of the path: the last matching pattern wins and `!`
+re-includes, but nothing inside an ignored directory can be re-included; a pattern
+with no slash but a trailing one matches a name at any depth, any other is
+anchored; `*` and `?` never match `/`, `**/`, `/**` and `/**/` span directories,
+and `[...]` sets take ranges, negation and `[:class:]`. It never treats a tracked
+file as ignored. Known issue: a pattern with many `**/` or `*` segments can make
+the fallback run for a very long time, or end the run with an internal error, on
+deep or long paths. Notes about inputs that changed between the test run and the
+review snapshot name the files.
 
 ## Multi-stage DAG delivery
 
@@ -374,17 +403,49 @@ candidate `A` of a sealed `dg_…` record: applied with the candidate transactio
 when the workspace is safe, otherwise left pending with the exact
 `makewand apply` command. The staging copy carries the repository's
 `.git/info/exclude` and `core.excludesFile`; like race copies it omits gitignored
-files such as `node_modules`, which a test-related stage failure lists. A result
-containing a symlink, a gitlink or an entry apply cannot write stops as blocked
-and is sealed for inspection and manual recovery only. A failed stage, a
+files such as `node_modules`, which a test-related stage failure lists.
+
+Every manifest the staging binds is limited by
+`MAKEWAND_WORKSPACE_SNAPSHOT_MAX_FILES` (100,000 files by default),
+`MAKEWAND_WORKSPACE_SNAPSHOT_MAX_BYTES` (512 MiB) and
+`MAKEWAND_WORKSPACE_SNAPSHOT_TIMEOUT_SECS` (10 s per manifest, which a first read
+on a slow disk can exceed). Files and bytes are counted before anything is hashed,
+so a repository over a limit is refused before any copy is made: the outcome is
+`UNVERIFIED`, no stage runs, and the message names the limit (for example
+`工作区 <root> 中需要计算摘要的文件超过 536870912 字节 (MAKEWAND_WORKSPACE_SNAPSHOT_MAX_BYTES)`).
+The freeze check of the workspace binds only what the copies receive: untracked
+files that are gitignored or lie below dependency or build directory names are left
+out, so a log written meanwhile in an ignored directory does not stop the DAG, while
+tracked files stay bound wherever they are. Within one run a file whose device,
+inode, size, mtime and change time are unchanged keeps its digest instead of being
+read again, unless it had changed less than 2 s before it was read.
+
+A result containing a symlink, a gitlink or an entry apply cannot write stops as
+blocked and is sealed for inspection and manual recovery only. A failed stage, a
 rejecting read-only review or an interrupt seals the verified part as a pending
 partial candidate. The guidance runs the checks apply will run: commit
 uncommitted work the DAG built on (stash cannot help), commit an uncommitted
 deletion the DAG re-created, and use `--force` only for targets the copy never
 had or files changed during the DAG; when a workspace entry blocks every apply,
-no apply is offered. Native Windows refuses multi-task DAGs (use WSL2). Known
-issue: when a global `init.templateDir` provides `info/exclude` as a symlink,
-preparing the staging copy writes the repository's exclude rules through it.
+no apply is offered. Native Windows refuses multi-task DAGs (use WSL2).
+
+Isolated copies (such as race candidates and the DAG staging copy) and ephemeral
+baseline repositories never write makewand's own metadata through links that
+`git init` copied from a global `init.templateDir`: right after `git init` a linked
+(or hard-linked) `config` becomes a regular file of the repository before makewand
+sets its identity there (and the DAG its `core.excludesFile`), and the staging
+copy's `info/exclude` and the ephemeral marker are written as new regular files,
+replacing a link at that name or at a directory on the way.
+`.git/info/attributes.mw_gate` is never created or opened through a link; one
+planted there makes makewand's git commands in that repository fail closed
+(`Cannot shield Git attributes`). Known issues: `git init` itself still writes its
+core settings through a template-linked `config` and changes that file's mode, as
+it does for every repository created from that template; and when the template's
+`info` directory is itself a link, the attribute shield of makewand's git commands
+in a copy that keeps it works inside the shared directory, creating
+`attributes.mw_gate` there and moving its `attributes` file aside while each
+command runs (an interrupted command leaves it moved until a later makewand git
+command restores it).
 
 ## Python daemon execution contract
 
