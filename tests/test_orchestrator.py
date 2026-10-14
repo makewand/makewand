@@ -196,7 +196,9 @@ class TestOrchestrator(unittest.TestCase):
         mock_status.return_value = {"claude": {"status": "healthy"}}
         mock_claude.return_value = (True, "Go channel explanation", None)
 
-        res = run_pipeline("解释一下Go语言channel原理", cwd="/tmp")
+        # A private workspace, never the shared temporary directory (it may hold the checkout).
+        with tempfile.TemporaryDirectory(prefix="makewand-explain-") as workspace:
+            res = run_pipeline("解释一下Go语言channel原理", cwd=workspace)
         self.assertTrue(res)
         # Must have passed readonly=True
         mock_claude.assert_called_once()

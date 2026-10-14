@@ -3,10 +3,11 @@ result names the refusal (guard-delegate).
 
 orchestrator._test_harness_source_tree_conflict kept its own copy of the rule that
 git_helper (host transaction) and candidate (apply) also had; it now delegates to
-git_helper.harness_source_tree_conflict, passing this module's source root, which
-tests replace with a stand-in checkout. run_race refused such a target with only a
-printed line: its typed result had status UNVERIFIED and error None. A stand-in
-checkout plays the source tree; the real one is never a target.
+git_helper.harness_source_tree_conflict, whose one source root
+(git_helper._makewand_source_root) tests replace with a stand-in checkout. run_race
+refused such a target with only a printed line: its typed result had status
+UNVERIFIED and error None. A stand-in checkout plays the source tree; the real one is
+never a target.
 """
 import sys
 from pathlib import Path
@@ -37,28 +38,28 @@ class GuardDelegateTests(unittest.TestCase):
                           ["config", "user.email", "fixture@example.invalid"], ["add", "."], ["commit", "-qm", "base"]):
             code, _, error = run_git_cmd(["git", *arguments], cwd=str(self.checkout))
             self.assertEqual(code, 0, error)
-        source = patch.object(orch, "_makewand_source_root", return_value=self.checkout.resolve())
+        source = patch.object(git_helper, "_makewand_source_root", return_value=self.checkout.resolve())
         source.start()
         self.addCleanup(source.stop)
 
     def test_guard_is_git_helpers_definition(self):
         asked = []
 
-        def shared(path, action="执行会修改文件的任务", source=None):
-            asked.append((path, source))
+        def shared(path, action="执行会修改文件的任务"):
+            asked.append(path)
             return "refused by the shared definition"
 
         with patch.object(git_helper, "harness_source_tree_conflict", side_effect=shared):
             self.assertEqual(orch._test_harness_source_tree_conflict(str(self.parent / "elsewhere")),
                              "refused by the shared definition")
-        self.assertEqual(asked, [(str(self.parent / "elsewhere"), self.checkout.resolve())])
+        self.assertEqual(asked, [str(self.parent / "elsewhere")])
 
     def test_guard_matches_git_helper_for_every_target(self):
         other = self.parent / "other"
         other.mkdir()
         for target in (self.checkout, self.checkout / "pkg", self.parent, other):
             with self.subTest(target=target.name):
-                expected = git_helper.harness_source_tree_conflict(str(target), source=self.checkout.resolve())
+                expected = git_helper.harness_source_tree_conflict(str(target))
                 self.assertEqual(orch._test_harness_source_tree_conflict(str(target)), expected)
                 self.assertEqual(expected is None, target == other)
 

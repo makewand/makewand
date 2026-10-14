@@ -21,7 +21,7 @@ import unittest
 from unittest.mock import patch
 
 import makewand
-from makewand import orchestrator as orch
+from makewand import git_helper, orchestrator as orch
 from makewand.execution_contract import EXIT_UNVERIFIED
 from makewand.git_helper import run_git_cmd
 
@@ -52,7 +52,8 @@ class SourceTreeGuardTests(unittest.TestCase):
     def run_task(self, target, isolation):
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch.object(orch, "_makewand_source_root", create=True,
+            # git_helper's source root is the one seam every guard reads (single-seam).
+            stack.enter_context(patch.object(git_helper, "_makewand_source_root",
                                              return_value=self.checkout.resolve()))
             stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
             stack.enter_context(patch.object(orch, "check_working_tree_isolation", return_value=isolation))
@@ -83,7 +84,8 @@ class SourceTreeGuardTests(unittest.TestCase):
 
     def test_guard_scope(self):
         real = Path(makewand.__file__).resolve().parent.parent
-        self.assertEqual(orch._makewand_source_root(), real)
+        self.assertEqual(git_helper._makewand_source_root(), real)
+        self.assertFalse(hasattr(orch, "_makewand_source_root"))  # no second seam to patch
         # The real checkout and anything inside or above it is protected under the harness.
         for target in (real, real / "tests", real.parent):
             self.assertIsNotNone(orch._test_harness_source_tree_conflict(str(target)), target)

@@ -116,6 +116,61 @@ class CandidateMessage(str):
         value.status = status
         return value
 
+    def __getnewargs__(self):
+        # copy and pickle rebuild the message through __new__, status included.
+        return (str(self), self.status)
+
+
+class ApplyResult(tuple):
+    """What CandidateManager.apply_candidate returns: the (ok, files, message) tuple every
+    caller unpacks, plus status, the outcome as an execution status (STATUS_CODES) that a
+    caller maps to an exit status without reading the message:
+
+    PASSED - applied, or a dry run, or nothing to apply;
+    APPLY_CONFLICT - the workspace no longer matches what the candidate was built on
+    (uncommitted or later changes, an entry where the candidate adds one) or holds an
+    entry apply never writes, also with --force; files lists those paths;
+    TIMEOUT - the execution deadline ran out before the application;
+    UNVERIFIED - the test harness refuses the workspace, or protected files could not
+    be verified; UNKNOWN - whether the application was committed cannot be established;
+    FAILED - anything else (no such candidate, not approved, integrity or write failure).
+
+    The status comes from the message when it carries one (CandidateMessage)."""
+
+    def __new__(cls, ok: bool, files: List[str], message: str, status: Optional[str] = None):
+        from makewand.execution_contract import STATUS_CODES
+        result = tuple.__new__(cls, (ok, files, message))
+        if ok:
+            status = "PASSED"
+        elif status is None:
+            status = getattr(message, "status", None)
+        result.status = status if ok or (status in STATUS_CODES and status != "PASSED") else "FAILED"
+        return result
+
+    def __getnewargs__(self):
+        # copy and pickle rebuild the result through __new__, status included.
+        return (self[0], self[1], self[2], self.status)
+
+    @property
+    def ok(self) -> bool:
+        return self[0]
+
+    @property
+    def files(self) -> List[str]:
+        return self[1]
+
+    @property
+    def message(self) -> str:
+        return self[2]
+
+
+class ApplicationTargetChanged(ValueError):
+    """A target of the application no longer matches the preimage apply froze for it."""
+
+    def __init__(self, message: str, path: str):
+        super().__init__(message)
+        self.path = path
+
 
 class CandidateDeadlineExceeded(TimeoutError):
     pass
@@ -129,24 +184,19 @@ def _check_apply_deadline():
     return deadline
 
 
-def _makewand_source_root() -> Path:
-    """The directory holding the makewand package (a source checkout's root)."""
-    return Path(__file__).resolve().parent.parent
-
-
 def harness_source_tree_conflict(path: Union[str, Path]) -> Optional[str]:
     """Under the test harness, a candidate is never applied to makewand's own source tree.
 
     The rule is git_helper.harness_source_tree_conflict, the one definition, for
     every caller of apply (the CLI, a race, a multi-task DAG): a test that forgot
     its temporary workspace would write candidate files into the checkout under
-    test. The source tree is this module's _makewand_source_root(), which tests
+    test. The source tree is git_helper._makewand_source_root(), the one seam tests
     replace with a stand-in checkout. Outside the harness
     (MAKEWAND_TEST_ISOLATION_ROOT unset) makewand may apply to its own repository
     like to any other.
     """
     from makewand.git_helper import harness_source_tree_conflict as guard
-    return guard(path, "把候选应用到工作区", source=_makewand_source_root())
+    return guard(path, "把候选应用到工作区")
 
 def file_sha256(path: Path) -> Optional[str]:
     """Computes SHA-256 hex digest of a regular file. Returns None for links/missing."""
@@ -193,10 +243,11 @@ def _uncopied_output_names() -> frozenset:
 
     git_helper.clone_isolated_worktree skips untracked files below these
     dependency and build output names (it keeps the deliverable files of the
-    cache directories among CLONE_EXCLUDED_DIRS).
+    cache directories among CLONE_EXCLUDED_DIRS): git_helper.CLONE_UNCOPIED_DIRS,
+    the one definition both use.
     """
-    from makewand.git_helper import CLONE_EXCLUDED_DIRS
-    return frozenset(CLONE_EXCLUDED_DIRS - {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache"})
+    from makewand.git_helper import CLONE_UNCOPIED_DIRS
+    return CLONE_UNCOPIED_DIRS
 
 
 def _project_files_below(dir_path: Path, directories: List[str], host: bool = False) -> List[str]:
@@ -235,8 +286,8 @@ def _project_files_below(dir_path: Path, directories: List[str], host: bool = Fa
     return found
 
 
-def _project_file_record(dir_path: Path, relative: str) -> Optional[Dict[str, Any]]:
-    """file_record of a path Git listed, never through a symlinked or missing directory."""
+def _project_file_stat(dir_path: Path, relative: str) -> Optional[os.stat_result]:
+    """lstat of a path Git listed, never through a symlinked or missing directory."""
     parts = relative.split("/")
     if any(part in ("", ".", "..") or part in _NEVER_PROJECT_DIRS for part in parts):
         return None
@@ -248,10 +299,139 @@ def _project_file_record(dir_path: Path, relative: str) -> Optional[Dict[str, An
                 return None
         except OSError:
             return None
-    return file_record(parent / parts[-1])
+    try:
+        return os.lstat(parent / parts[-1])
+    except OSError:
+        return None
 
 
-def build_manifest(dir_path: Path, project_files: bool = True, host: bool = False) -> Dict[str, Any]:
+class ManifestLimitExceeded(OSError):
+    """build_manifest stopped at a ManifestBudget limit: the tree is too large to bind."""
+
+
+class ManifestBudget:
+    """The workspace snapshot limits applied to one build_manifest call: at most
+    MAKEWAND_WORKSPACE_SNAPSHOT_MAX_FILES files and _MAX_BYTES bytes bound - counted
+    whether or not a digest is cached, so that the limit is a property of the tree -
+    and _TIMEOUT_SECS seconds (artifact._get_snapshot_limits, the limits
+    workspace_snapshot applies). The files and bytes are counted before anything is
+    hashed: a tree over the limits fails closed at once, with a message naming the
+    limit (ManifestLimitExceeded), instead of hashing for minutes. what names the tree."""
+
+    HINT = "；可用 .gitignore 忽略数据、依赖与构建输出，或调高该上限"
+
+    def __init__(self, what: str, clock=time.monotonic):
+        from makewand.artifact import _get_snapshot_limits
+        self.max_bytes, self.seconds, self.max_files = _get_snapshot_limits()
+        self.what = what
+        self.clock = clock
+        self.files = self.bytes = 0
+        self.deadline = clock() + self.seconds
+
+    def count(self, size: int) -> None:
+        self.files += 1
+        self.bytes += size
+        if self.files > self.max_files:
+            raise ManifestLimitExceeded(f"{self.what}中需要计算摘要的文件超过 {self.max_files} 个 "
+                                        f"(MAKEWAND_WORKSPACE_SNAPSHOT_MAX_FILES){self.HINT}")
+        if self.bytes > self.max_bytes:
+            raise ManifestLimitExceeded(f"{self.what}中需要计算摘要的文件超过 {self.max_bytes} 字节 "
+                                        f"(MAKEWAND_WORKSPACE_SNAPSHOT_MAX_BYTES){self.HINT}")
+
+    def check_time(self) -> None:
+        if self.clock() > self.deadline:
+            raise ManifestLimitExceeded(f"为{self.what}计算摘要超过 {self.seconds:g} 秒 "
+                                        f"(MAKEWAND_WORKSPACE_SNAPSHOT_TIMEOUT_SECS){self.HINT}")
+
+
+class ManifestCache:
+    """The file records of one multi-stage run (a DAG), which binds the same trees again
+    and again: a file's sha256 keyed by its stat identity (st_dev, st_ino, st_size,
+    st_mtime_ns, st_ctime_ns), its mode always taken from the current stat. Writing a
+    file, replacing it or changing its mode or links moves its inode change time, which
+    only the kernel sets, so a digest is reused only for the very same, unchanged inode.
+    A file whose timestamps were recent when it was read (within settle_ns, SETTLE_NS by
+    default) is not cached: a write within the same timestamp tick right after the read
+    would leave all five values unchanged. Holds at most MAX_ENTRIES digests."""
+
+    SETTLE_NS = 2 * 10 ** 9
+    MAX_ENTRIES = 200000
+
+    def __init__(self, settle_ns: int = SETTLE_NS):
+        self.settle_ns = settle_ns
+        self._digests: Dict[Tuple[int, int, int, int, int], str] = {}
+
+    @staticmethod
+    def _key(info: os.stat_result) -> Tuple[int, int, int, int, int]:
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def get(self, info: os.stat_result) -> Optional[str]:
+        return self._digests.get(self._key(info))
+
+    def put(self, info: os.stat_result, digest: str, read_started_ns: int) -> None:
+        if (max(info.st_mtime_ns, info.st_ctime_ns) < read_started_ns - self.settle_ns
+                and len(self._digests) < self.MAX_ENTRIES):
+            self._digests[self._key(info)] = digest
+
+    def __len__(self) -> int:
+        return len(self._digests)
+
+
+def _manifest_digest(path: str, budget: Optional[ManifestBudget]
+                     ) -> Optional[Tuple[str, os.stat_result, os.stat_result, int]]:
+    """(sha256, stat before and after reading, wall-clock ns when reading began) of the
+    regular file path, read through a no-follow handle (the stats are the opened
+    file's); None for a file that is no longer a regular file or cannot be read.
+    budget's time limit is checked while reading (ManifestLimitExceeded)."""
+    started = time.time_ns()
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        digest = hashlib.sha256()
+        while True:
+            if budget is not None:
+                budget.check_time()
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(fd)
+    except ManifestLimitExceeded:
+        raise
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return digest.hexdigest(), before, after, started
+
+
+def _manifest_record(path: str, info: os.stat_result, cache: Optional[ManifestCache],
+                     budget: Optional[ManifestBudget]) -> Optional[Dict[str, Any]]:
+    """file_record of the regular file path (info: its lstat), reusing cache's digest of
+    the same unchanged inode. A file that changed while it was read is not cached."""
+    if cache is not None:
+        digest = cache.get(info)
+        if digest is not None:
+            return {"sha256": digest, "mode": stat.S_IMODE(info.st_mode)}
+    if budget is not None:
+        budget.check_time()
+    result = _manifest_digest(path, budget)
+    if result is None:
+        return None
+    digest, before, after, started = result
+    if cache is not None and ManifestCache._key(before) == ManifestCache._key(after):
+        cache.put(after, digest, started)
+    return {"sha256": digest, "mode": stat.S_IMODE(after.st_mode)}
+
+
+def build_manifest(dir_path: Path, project_files: bool = True, host: bool = False,
+                   cache: Optional[ManifestCache] = None, budget: Optional[ManifestBudget] = None) -> Dict[str, Any]:
     """Bind regular file content AND permissions; old hash-only manifests fail closed.
 
     Directories named in PROJECT_IGNORE_DIRS (dependency, build and tool output)
@@ -262,11 +442,17 @@ def build_manifest(dir_path: Path, project_files: bool = True, host: bool = Fals
     manifests of records sealed before MANIFEST_SCOPE, which skipped those names.
 
     host=True is for the user's workspace that isolated copies are cloned from
-    (a freeze check): untracked files below dependency or build output names that
-    no copy receives (an un-ignored node_modules/ or dist/) are left out, since no
-    candidate can modify or delete them and hashing such a tree is most of the
-    cost. Tracked files there stay bound. A candidate copy's manifest (the
-    default) binds the files a stage created below those names.
+    (a freeze check): what no copy receives is left out - untracked files Git
+    ignores (data, logs, local secrets: git_helper.list_workspace_ignored_paths)
+    and untracked files below dependency or build output names (an un-ignored
+    node_modules/ or dist/) - since no candidate can modify or delete them and
+    hashing such a tree is most of the cost. Tracked files stay bound wherever they
+    are. A candidate copy's manifest (the default) binds the files a stage created
+    below those names.
+
+    A multi-stage run passes a ManifestCache it keeps across its stages and a
+    ManifestBudget per call: the snapshot limits, checked before anything is
+    hashed. Records are the same with or without them.
     """
     dir_path = Path(dir_path)
     if os.name == "nt":
@@ -276,29 +462,50 @@ def build_manifest(dir_path: Path, project_files: bool = True, host: bool = Fals
     if not dir_path.exists():
         return manifest
     from makewand.constants import PROJECT_IGNORE_DIRS
+    ignored = frozenset()
+    if host:
+        from makewand.git_helper import list_workspace_ignored_paths
+        ignored = frozenset(list_workspace_ignored_paths(dir_path) or ())
     skipped = []
+    found: List[Tuple[str, str, os.stat_result]] = []
+
+    def bind(relative: str, path: str, info: Optional[os.stat_result]) -> None:
+        if info is not None and stat.S_ISREG(info.st_mode):
+            if budget is not None:
+                budget.count(info.st_size)
+            found.append((relative, path, info))
+
     for root, directories, files in os.walk(str(dir_path)):
         rel_dir = Path(root).relative_to(dir_path)
         kept = []
         for directory in directories:
             if directory in _NEVER_PROJECT_DIRS:
                 continue
+            relative = (rel_dir / directory).as_posix()
             if directory in PROJECT_IGNORE_DIRS:
-                skipped.append((rel_dir / directory).as_posix())
+                skipped.append(relative)
+                continue
+            if relative + "/" in ignored:
                 continue
             kept.append(directory)
         directories[:] = kept
         for f in files:
-            p = Path(root) / f
-            if not os.path.islink(p):
-                record = file_record(p)
-                if record is not None:
-                    manifest[p.relative_to(dir_path).as_posix()] = record
+            relative = (rel_dir / f).as_posix()
+            if relative in ignored:
+                continue
+            path = os.path.join(root, f)
+            try:
+                info = os.lstat(path)
+            except OSError:
+                continue
+            bind(relative, path, info)  # never a link: only regular files are bound
     if project_files:
         for relative in _project_files_below(dir_path, skipped, host=host):
-            record = _project_file_record(dir_path, relative)
-            if record is not None:
-                manifest[relative] = record
+            bind(relative, str(dir_path / relative), _project_file_stat(dir_path, relative))
+    for relative, path, info in found:
+        record = _manifest_record(path, info, cache, budget)
+        if record is not None:
+            manifest[relative] = record
     return manifest
 
 
@@ -1188,16 +1395,14 @@ def get_candidate_files_changed(candidate_dir: Path, baseline_commit: Optional[s
     return changes
 
 def workspace_dirty_files(base_cwd: Union[str, Path]) -> set:
-    """Paths `git status` reports as changed in base_cwd (empty outside Git)."""
-    code, diff_out, _ = run_git_cmd(["git", "status", "-z", "--porcelain"], cwd=str(base_cwd), binary=True)
-    dirty = set()
-    if code == 0 and diff_out:
-        for token in diff_out.split(b"\0"):
-            if len(token) >= 3:
-                fpath = token[3:].decode("utf-8", errors="replace").strip()
-                if fpath:
-                    dirty.add(fpath)
-    return dirty
+    """Paths `git status` reports as changed in base_cwd (empty outside Git).
+
+    git_helper.git_status_paths, the parser get_dirty_files uses too: both sides of
+    a rename, every untracked file, and names byte-exact (leading or trailing spaces,
+    undecodable bytes) as get_candidate_files_changed reports them.
+    """
+    from makewand.git_helper import git_status_paths
+    return set(git_status_paths(base_cwd) or ())
 
 
 def committable_work_in_progress(base_cwd: Union[str, Path], conflicts: List[str],
@@ -1711,7 +1916,7 @@ class CandidateManager:
             c_code, c_out, _ = run_git_cmd(["git", "diff", "--no-renames", "--name-only", "-z", baseline_commit, "HEAD"], cwd=base_cwd, binary=True)
             if c_code == 0 and c_out:
                 for token in c_out.split(b"\0"):
-                    f = token.decode("utf-8", errors="replace").strip()
+                    f = os.fsdecode(token)  # byte-exact, as get_candidate_files_changed names it
                     if f and f in candidate_changes and f not in conflicts:
                         conflicts.append(f)
 
@@ -1908,12 +2113,26 @@ class CandidateManager:
         force: bool = False,
         merge: bool = False,
         protected_paths=None,
-    ) -> Tuple[bool, List[str], str]:
+    ) -> ApplyResult:
         """
         Safely applies candidate changes to base_cwd with conflict detection and rollback journal.
         Guarded with a file lock to serialize Makewand apply operations.
-        Returns (success, applied_files, message).
+        Returns (success, applied_files, message) as an ApplyResult, whose status types
+        the outcome (APPLY_CONFLICT, TIMEOUT, ...) for callers that map it to an exit status.
         """
+        return ApplyResult(*CandidateManager._apply_candidate(
+            race_id=race_id, candidate_label=candidate_label, dry_run=dry_run, force=force,
+            merge=merge, protected_paths=protected_paths))
+
+    @staticmethod
+    def _apply_candidate(
+        race_id: Optional[str] = None,
+        candidate_label: Optional[str] = None,
+        dry_run: bool = False,
+        force: bool = False,
+        merge: bool = False,
+        protected_paths=None,
+    ) -> Tuple[bool, List[str], str]:
         if os.name not in ("posix", "nt"):
             return False, [], "当前平台缺少安全候选应用后端。"
         ensure_config_dir()
@@ -2158,10 +2377,10 @@ class CandidateManager:
         obstacles = application_obstacles(base_cwd, changes)
         if obstacles:
             listed = ", ".join(f"{path} ({why})" for path, why in sorted(obstacles.items()))
-            return False, sorted(obstacles), (
+            return False, sorted(obstacles), CandidateMessage(
                 f"检测到工作区冲突: makewand apply 无法写入以下工作区条目: {listed}。"
                 "apply 只写入普通文件且从不经过符号链接，--force 也不例外；请先核对这些条目，"
-                f"需要采用候选内容时请从候选工作区人工恢复: {candidate_dir}")
+                f"需要采用候选内容时请从候选工作区人工恢复: {candidate_dir}", "APPLY_CONFLICT")
 
         # Conflict Detection (dirty files + baseline manifest + baseline commit)
         if not force:
@@ -2194,7 +2413,7 @@ class CandidateManager:
                 if reverted:
                     msg += (f"。其中 {', '.join(reverted)} 已回到基线提交时的内容，而候选基于当时未提交的修改生成 "
                             "(这些修改可能已被 stash 或撤销)：恢复这些修改 (如 git stash pop) 并提交后即可应用，无需 --force")
-                return False, conflicts, msg
+                return False, conflicts, CandidateMessage(msg, "APPLY_CONFLICT")
 
         try:
             for guard in (protection, additional):
@@ -2228,7 +2447,8 @@ class CandidateManager:
                         validate_application_security_descriptor(before_security_descriptors[relative], before_security[relative])
                     if (_application_target_record(base_cwd, relative) != current
                             or _application_target_security(base_cwd, relative) != before_security[relative]):
-                        raise ValueError("Application target changed while freezing file security: " + relative)
+                        raise ApplicationTargetChanged(
+                            "Application target changed while freezing file security: " + relative, relative)
             baseline = race.get("baseline_manifest")
             if not force:
                 for relative, current in preimages.items():
@@ -2240,7 +2460,11 @@ class CandidateManager:
                     else:
                         continue
                     if current != expected:
-                        raise ValueError("Application target changed since its baseline: " + relative)
+                        raise ApplicationTargetChanged("Application target changed since its baseline: " + relative,
+                                                       relative)
+        except ApplicationTargetChanged as error:
+            # The destination no longer matches its frozen baseline: nothing was written.
+            return False, [error.path], CandidateMessage(str(error), "APPLY_CONFLICT")
         except (OSError, ValueError) as error:
             return False, [], str(error)
 

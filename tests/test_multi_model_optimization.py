@@ -294,13 +294,16 @@ class TestUntrustedRepoSandboxEnforcement(unittest.TestCase):
 
     @patch("makewand.sandbox.is_bwrap_available", return_value=False)
     def test_untrusted_repo_fails_closed_in_orchestrator(self, mock_bwrap):
-        # run_pipeline in untrusted repo without bwrap must fail-closed immediately
-        res = run_pipeline("test task", cwd="/tmp", repo_trust="untrusted")
-        self.assertFalse(res)
+        # A private workspace: the shared temporary directory may hold the checkout under
+        # test, which the test harness refuses for a reason of its own.
+        with tempfile.TemporaryDirectory(prefix="makewand-untrusted-") as workspace:
+            # run_pipeline in untrusted repo without bwrap must fail-closed immediately
+            res = run_pipeline("test task", cwd=workspace, repo_trust="untrusted")
+            self.assertFalse(res)
 
-        # run_review in untrusted repo without bwrap must return EXIT_UNVERIFIED (11)
-        exit_code = run_review(cwd="/tmp", repo_trust="untrusted", output_json=True)
-        self.assertEqual(exit_code, 11)
+            # run_review in untrusted repo without bwrap must return EXIT_UNVERIFIED (11)
+            exit_code = run_review(cwd=workspace, repo_trust="untrusted", output_json=True)
+            self.assertEqual(exit_code, 11)
 
 
 class TestGrokProviderIntegration(unittest.TestCase):
