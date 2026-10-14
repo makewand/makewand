@@ -97,7 +97,9 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
             self.assertIn("工作区扫描未能完成", err.getvalue())
 
     def test_tmp_workspace_scan_is_shallow_and_fast(self):
-        base = Path(tempfile.mkdtemp(prefix="g4-scan-"))  # /tmp/g4-scan-xxx
+        # Directly in /tmp, the broad workspace scanned here, whatever TMPDIR says
+        # (a TMPDIR of /tmp/x would put it a level deeper, outside the fixture).
+        base = Path(tempfile.mkdtemp(prefix="g4-scan-", dir="/tmp"))  # /tmp/g4-scan-xxx
         socks = []
         try:
             # Writable /tmp is a forbidden root, so exercise the bounded broad

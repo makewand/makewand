@@ -194,7 +194,7 @@ def windows_cli(out, err, code=0, calls=None, *, stderr_first=False):
 class TestWindowsStreamDispatch(DispatchCase):
     def test_agy_notices_are_never_the_answer(self):
         for name, err in (("generic warning", KEYRING + "Warning: failed to record sidecar event: context canceled\n"),
-                          ("PATH warning", "Warning: /home/u/.local/bin is not present in your active PATH.\n"),
+                          ("PATH warning", "Warning: /home/alice/.local/bin is not present in your active PATH.\n"),
                           ("status line", "terminating 1 background task(s) on exit\n")):
             with self.subTest(case=name):
                 calls = []
@@ -245,7 +245,7 @@ class TestMergedFallback(DispatchCase):
 
     def test_notice_only_output_is_never_an_answer(self):
         for err in (KEYRING + "Warning: failed to record sidecar event: context canceled\n",
-                    "Warning: /home/u/.local/bin is not present in your active PATH.\n",
+                    "Warning: /home/alice/.local/bin is not present in your active PATH.\n",
                     "warning: run ended with no output and no recorded error\n"):
             with self.subTest(err=err[-50:]):
                 result, _status = self.dispatch("agy", lambda *args, **kwargs: (0, err, "", None))

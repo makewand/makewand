@@ -539,13 +539,11 @@ class SourceTreeGuardTests(DagFixture):
         self.assertTrue(os.environ.get("MAKEWAND_TEST_ISOLATION_ROOT"))
         self.outer = self.make_repo("outer", files={"README": "outer\n", "makewand-src/app.py": "A = 1\n"})
         self.source = self.outer / "makewand-src"
-        # Stand in for the checkout under test; never the real one. apply and the DAG's
-        # early refusal ask with candidate's source root (test_fix_final_guard_delegation
-        # replaces only that one), a host transaction with git_helper's.
-        for module in (candidate_module, git_helper):
-            patcher = patch.object(module, "_makewand_source_root", return_value=self.source.resolve(), create=True)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        # Stand in for the checkout under test; never the real one. apply, the DAG's early
+        # refusal and a host transaction all judge git_helper's source root, the one seam.
+        patcher = patch.object(git_helper, "_makewand_source_root", return_value=self.source.resolve())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def seal(self, race_id, base_cwd):
         workspace = self.candidates / race_id / "agent_a"

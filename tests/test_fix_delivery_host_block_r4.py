@@ -561,20 +561,22 @@ class SharedHarnessGuardTests(HostDeliveryCase):
 
     def test_guard_covers_the_path_and_the_repository_holding_it(self):
         guard = git_helper.harness_source_tree_conflict
-        for target in (self.source, self.source / "makewand", self.root, self.root / "other"):
-            with self.subTest(target=str(target)):
-                message = guard(str(target), "应用候选", source=self.source)
-                self.assertIn("测试环境中拒绝应用候选", message or "")
-                self.assertIn(str(self.source), message)
-        unrelated = self.base / "unrelated"
-        unrelated.mkdir()
-        self.assertIsNone(guard(str(unrelated), source=self.source))
+        # _makewand_source_root is the guard's one source root (single-seam).
         with patch.object(git_helper, "_makewand_source_root", return_value=self.source):
-            self.assertIsNotNone(guard(str(self.root / "other")))  # the default source tree
-        with patch.dict(os.environ):
-            os.environ.pop("MAKEWAND_TEST_ISOLATION_ROOT", None)
-            self.assertIsNone(guard(str(self.source), source=self.source))
-        self.assertIs(git_helper._test_harness_source_conflict, guard)
+            for target in (self.source, self.source / "makewand", self.root, self.root / "other"):
+                with self.subTest(target=str(target)):
+                    message = guard(str(target), "应用候选")
+                    self.assertIn("测试环境中拒绝应用候选", message or "")
+                    self.assertIn(str(self.source), message)
+            unrelated = self.base / "unrelated"
+            unrelated.mkdir()
+            self.assertIsNone(guard(str(unrelated)))
+            with patch.dict(os.environ):
+                os.environ.pop("MAKEWAND_TEST_ISOLATION_ROOT", None)
+                self.assertIsNone(guard(str(self.source)))
+        # The real source tree is not the fixture's.
+        self.assertIsNone(guard(str(self.root / "other")))
+        self.assertFalse(hasattr(git_helper, "_test_harness_source_conflict"))  # the dead alias is gone
 
     def test_host_transaction_refuses_a_directory_of_the_source_repository(self):
         with patch.object(git_helper, "_makewand_source_root", return_value=self.source):

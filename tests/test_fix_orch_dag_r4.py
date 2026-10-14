@@ -23,7 +23,7 @@ import re
 import shutil
 import tempfile
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 
 from makewand import candidate as candidate_module, cli, config, git_helper, orchestrator as orch, task_dag
 from makewand.candidate import CandidateManager
@@ -502,13 +502,13 @@ class HostManifestTests(DagFixture):
     def test_dag_start_hashes_no_untracked_dependency_tree(self):
         repo = self.dependency_repo(count=40).resolve()  # DagStaging hashes below the resolved root
         hashed = []
-        real = candidate_module.file_sha256
+        real = candidate_module._manifest_digest  # what build_manifest reads every file with
 
-        def spy(path):
+        def spy(path, budget):
             hashed.append(str(path))
-            return real(path)
+            return real(path, budget)
 
-        with patch.object(candidate_module, "file_sha256", side_effect=spy):
+        with patch.object(candidate_module, "_manifest_digest", side_effect=spy):
             staging = task_dag.DagStaging(str(repo))
         staging.discard()
         self.assertIn(str(repo / "node_modules" / "kept" / "index.js"), hashed)
@@ -521,14 +521,13 @@ class HarnessGuardTests(DagFixture):
     def setUp(self):
         super().setUp()
         self.assertTrue(os.environ.get("MAKEWAND_TEST_ISOLATION_ROOT"))
-        # Stand in for the checkout under test; never the real one. The DAG's early refusal
-        # asks git_helper's rule with candidate's source root, the one apply checks against
-        # (guard-delegation); a host transaction asks with git_helper's.
+        # Stand in for the checkout under test; never the real one. git_helper's source
+        # root is the one seam: the DAG's early refusal, apply and a host transaction all
+        # ask git_helper's rule, which reads only it (single-seam).
         self.source = self.make_repo("checkout", files={"app.py": "A = 1\n", "pkg/mod.py": "M = 1\n"})
-        for module in (candidate_module, git_helper):
-            patcher = patch.object(module, "_makewand_source_root", return_value=self.source.resolve())
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = patch.object(git_helper, "_makewand_source_root", return_value=self.source.resolve())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_single_task_dag_refuses_the_source_tree_before_running_it(self):
         single = TaskDAG("goal", [TaskNode("task-1", "only", "write a file")])
@@ -548,7 +547,7 @@ class HarnessGuardTests(DagFixture):
         repo = self.make_repo()
         asked = []
 
-        def shared(path, action="执行会修改文件的任务", source=None):
+        def shared(path, action="执行会修改文件的任务"):
             asked.append(path)
             return "测试环境中拒绝 (fixture)"
 
@@ -566,16 +565,16 @@ class HarnessGuardTests(DagFixture):
     def test_apply_guard_is_git_helpers_definition(self):
         asked = []
 
-        def shared(path, action="执行会修改文件的任务", source=None):
-            asked.append((str(path), action, source))
+        def shared(path, action="执行会修改文件的任务"):
+            asked.append((str(path), action))
             return "refused by the shared definition"
 
-        stand_in = self.root / "stand-in"
-        with patch.object(git_helper, "harness_source_tree_conflict", side_effect=shared), \
-                patch.object(candidate_module, "_makewand_source_root", return_value=stand_in):
+        with patch.object(git_helper, "harness_source_tree_conflict", side_effect=shared):
             self.assertEqual(candidate_module.harness_source_tree_conflict(str(self.source)),
                              "refused by the shared definition")
-        self.assertEqual(asked, [(str(self.source), ANY, stand_in)])
+        self.assertEqual(asked, [(str(self.source), "把候选应用到工作区")])
+        # The rule itself, with the one seam standing in: apply refuses the stand-in.
+        self.assertIn(str(self.source.resolve()), candidate_module.harness_source_tree_conflict(str(self.source)))
 
 
 if __name__ == "__main__":

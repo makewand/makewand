@@ -352,7 +352,7 @@ class DagStaging:
         import uuid
         from pathlib import Path
         from makewand import config
-        from makewand.candidate import CandidateClaim, build_manifest
+        from makewand.candidate import CandidateClaim, ManifestCache
         from makewand.git_helper import clone_isolated_worktree, find_git_root, run_git_cmd, _refused_init_roots
         from makewand.artifact import workspace_snapshot
         self.target = os.path.abspath(target)
@@ -379,19 +379,24 @@ class DagStaging:
         self.missing_inputs: List[str] = []
         self._readonly_entries: Optional[Dict[str, Tuple[Any, ...]]] = None
         self._claim = None
+        # The staging copy's file records, reused by every stage for unchanged files.
+        self._manifests = ManifestCache()
         self.base_commit = self.head_commit = ""
         try:
             # The candidate store is pruned by concurrent saves: claim this copy first.
             self._claim = CandidateClaim(self.session)
-            # Only what the copies receive needs to hold still: an untracked
-            # dependency tree (node_modules/) is never copied, nor hashed here.
-            self.host_manifest = build_manifest(Path(self.root), host=True)
+            # Only what the copies receive needs to hold still: ignored files and an
+            # untracked dependency tree (node_modules/) are never copied, nor hashed here.
+            # A repository over the snapshot limits fails here, before any copy is made.
+            # The host's records serve the freeze check below only; the baseline is bound once.
+            host_records = ManifestCache()
+            self.host_manifest = self._manifest(Path(self.root), host=True, cache=host_records)
             clone_isolated_worktree(self.root, self.baseline)
-            self.frozen_manifest = build_manifest(self.baseline)
+            self.frozen_manifest = self._manifest(self.baseline)
             clone_isolated_worktree(str(self.baseline), self.workspace)
             if git_root:
                 self._carry_ignore_rules(self.workspace)
-            if build_manifest(Path(self.root), host=True) != self.host_manifest:
+            if self._manifest(Path(self.root), host=True, cache=host_records) != self.host_manifest:
                 raise OSError("工作区在冻结 DAG 基线期间发生变化")
             code, head, error = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(self.workspace))
             if code or not head.strip():
@@ -410,10 +415,23 @@ class DagStaging:
                 self.stage_dir.mkdir(parents=True, exist_ok=True)
             self.missing_inputs = self._missing_inputs()
             self.verified_snapshot = workspace_snapshot(self.workspace)
-            self.verified_manifest = build_manifest(self.workspace)
+            self.verified_manifest = self._staging_manifest()
         except BaseException:
             self.discard()
             raise
+
+    def _manifest(self, path, host: bool = False, cache: Optional[Any] = None) -> Dict[str, Any]:
+        """build_manifest of path within the workspace snapshot limits (candidate.ManifestBudget):
+        a tree too large to bind fails closed with the limit named, before it is hashed,
+        instead of hashing for minutes. cache (a candidate.ManifestCache) supplies the records
+        of files unchanged since it saw them."""
+        from makewand.candidate import ManifestBudget, build_manifest
+        what = f"工作区 {self.root} " if host else "DAG 私有暂存区"
+        return build_manifest(path, host=host, cache=cache, budget=ManifestBudget(what))
+
+    def _staging_manifest(self) -> Dict[str, Any]:
+        """The staging copy's manifest; every stage reuses the records of its unchanged files."""
+        return self._manifest(self.workspace, cache=self._manifests)
 
     def _missing_inputs(self) -> List[str]:
         """Ignored files and skipped dependency/build directories the private copy lacks."""
@@ -448,9 +466,11 @@ class DagStaging:
         the user's repository ignores only there (a .venv/ in info/exclude) would be
         untracked and not ignored in the copy, so a checkpoint would commit it and
         apply would deliver it. The copy gets the repository's info/exclude and, when
-        the effective core.excludesFile differs, the repository's one.
+        the effective core.excludesFile differs, the repository's one. The copy's
+        info/exclude may be a link git init copied from init.templateDir: it is
+        replaced by a regular file, never written through (write_repository_file).
         """
-        from makewand.git_helper import run_git_cmd
+        from makewand.git_helper import run_git_cmd, write_repository_file
 
         def git_path(cwd: str, *arguments: str) -> Optional[str]:
             """A path Git prints, or None when it prints none; "" when the value is set empty."""
@@ -464,14 +484,16 @@ class DagStaging:
         source, target = (git_path(path, "rev-parse", "--git-path", "info/exclude") for path in (self.root, str(copy)))
         if not source or not target:
             raise OSError("无法定位仓库的 .git/info/exclude，私有暂存区无法沿用其忽略规则")
+        git_dir = os.path.join(str(copy), ".git")
+        relative = os.path.relpath(target, git_dir)
+        if os.path.isabs(relative) or relative.split(os.sep)[0] == os.pardir:
+            raise OSError(f"私有暂存区的 info/exclude ({target}) 不在其 .git 目录中，无法沿用仓库的忽略规则")
         try:
             with open(source, "rb") as stream:
                 rules = stream.read()
         except FileNotFoundError:
             rules = b""
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "wb") as stream:
-            stream.write(rules)
+        write_repository_file(git_dir, relative.replace(os.sep, "/"), rules)
         # Unset means the default excludes file, the same for both; set empty means none.
         excludes, current = (git_path(path, "config", "--type=path", "--get", "core.excludesFile")
                              for path in (self.root, str(copy)))
@@ -534,7 +556,6 @@ class DagStaging:
     def checkpoint(self, task_id: str) -> None:
         """Commit a passed code stage inside the private copy without changing its content."""
         from makewand.artifact import workspace_snapshot
-        from makewand.candidate import build_manifest
         from makewand.git_helper import run_git_cmd
         root = str(self.workspace)
         verified = workspace_snapshot(root)
@@ -560,7 +581,7 @@ class DagStaging:
             raise OSError(f"无法读取阶段 {task_id} 的提交: {error}")
         self.head_commit = head.strip()
         self.verified_snapshot = verified
-        self.verified_manifest = build_manifest(self.workspace)
+        self.verified_manifest = self._staging_manifest()
         self.passed.append(task_id)
         self.code_passed.append(task_id)
         if unsupported and self.blocked is None:
@@ -597,7 +618,6 @@ class DagStaging:
         restored (the copy keeps no backup of tool output); they are listed too.
         """
         from makewand.artifact import workspace_snapshot
-        from makewand.candidate import build_manifest
         from makewand.git_helper import run_git_cmd
         root = str(self.workspace)
         code, _, error = run_git_cmd(["git", "reset", "-q", head], cwd=root)
@@ -619,7 +639,7 @@ class DagStaging:
             reported = _entry_names(stray, after) + _entry_names(lost, before) + [path + "/" for path in modes]
             for path in stray:
                 self._discard_entry(path, "无法丢弃只读子任务写入的内容")
-        snapshot, manifest, drift = workspace_snapshot(root), build_manifest(self.workspace), self._content_drift(head)
+        snapshot, manifest, drift = workspace_snapshot(root), self._staging_manifest(), self._content_drift(head)
         if (not reported and not drift and snapshot == self.verified_snapshot
                 and manifest == self.verified_manifest):
             return []
@@ -657,7 +677,7 @@ class DagStaging:
         if self._content_drift(head) or workspace_snapshot(root) != self.verified_snapshot or leftover:
             raise OSError("只读子任务写入的内容无法完全还原到最后验收状态"
                           + (f" (仍残留: {_short_list(leftover)})" if leftover else ""))
-        self.verified_manifest = build_manifest(self.workspace)
+        self.verified_manifest = self._staging_manifest()
         return written
 
     def _discard_entry(self, relative: str, failure: str) -> None:
@@ -683,10 +703,9 @@ class DagStaging:
 
     def unchanged_since_last_checkpoint(self) -> bool:
         from makewand.artifact import workspace_snapshot
-        from makewand.candidate import build_manifest
         try:
             return (workspace_snapshot(self.workspace) == self.verified_snapshot
-                    and build_manifest(self.workspace) == self.verified_manifest)
+                    and self._staging_manifest() == self.verified_manifest)
         except OSError:
             return False
 
@@ -816,15 +835,20 @@ class DagStaging:
 
 
 def _dag_result(ok: bool, status: str, summary: str):
-    """Expose the DAG outcome to callers that map it to an exit status."""
-    try:
-        from makewand.execution_contract import ExecutionResult
-        from makewand.execution_runtime import task_id
-        from makewand.workflow import remember_result
-        remember_result(ExecutionResult(ok if status == "PASSED" else False, None, None if ok else summary,
-                                        status=status, task_id=task_id(), stage="workflow", engine="dag"))
-    except (ImportError, ValueError):
-        pass
+    """Expose the DAG outcome to callers that map it to an exit status.
+
+    Always recorded, or raised: the result a stage's pipeline left behind must never
+    stand for the DAG's own outcome. A NUL in the summary (which no result text may
+    carry) is escaped; an outcome the execution contract refuses otherwise (a status
+    it does not know, PASSED for a run that did not pass) is a defect and raises
+    ValueError.
+    """
+    from makewand.execution_contract import ExecutionResult
+    from makewand.execution_runtime import task_id
+    from makewand.workflow import remember_result
+    error = None if ok else summary.replace("\0", "\\0")
+    remember_result(ExecutionResult(ok if status == "PASSED" else False, None, error,
+                                    status=status, task_id=task_id(), stage="workflow", engine="dag"))
 
 
 def execute_task_dag(
@@ -867,13 +891,11 @@ def execute_task_dag(
     target = os.path.abspath(cwd or os.getcwd())
     # Every task writes to target, a multi-task result even outside any pipeline:
     # the test harness refuses makewand's own source tree before any staging copy
-    # is made or any task runs. The rule is git_helper's; the source tree is the one
-    # the final apply checks against (candidate._makewand_source_root, which tests
-    # replace with a stand-in), so the early refusal and the apply never disagree.
-    from makewand import candidate as candidate_module
+    # is made or any task runs. The rule and its one source root
+    # (git_helper._makewand_source_root, which tests replace with a stand-in) are
+    # those the final apply asks too, so the early refusal and the apply never disagree.
     from makewand.git_helper import harness_source_tree_conflict
-    harness_conflict = harness_source_tree_conflict(target, "执行 DAG 子任务",
-                                                    source=candidate_module._makewand_source_root())
+    harness_conflict = harness_source_tree_conflict(target, "执行 DAG 子任务")
     if harness_conflict:
         msg = f"{harness_conflict}，未执行任何子任务。"
         print(c(f"❌ [Makewand Test Harness] {msg}", COLOR_RED + COLOR_BOLD))
@@ -1286,13 +1308,17 @@ def _deliver_dag(staging: "DagStaging", goal: str, total: int, stage_results: Li
         _dag_result(True, "PASSED", msg)
         return True, msg, stage_results
     from makewand.candidate import CandidateManager, harness_source_tree_conflict
-    applied, files, detail = CandidateManager.apply_candidate(race_id=race_id, candidate_label="A")
+    from makewand.execution_contract import STATUS_CODES
+    result = CandidateManager.apply_candidate(race_id=race_id, candidate_label="A")
+    applied, files, detail = result
     if not applied:
-        conflict = "冲突" in str(detail)
+        # apply's typed outcome (ApplyResult.status), never words of its message.
+        status = getattr(result, "status", None)
+        if status not in STATUS_CODES or status == "PASSED":
+            status = "FAILED"
+        conflict = status == "APPLY_CONFLICT"
         # The test harness refuses this workspace whatever is done there.
-        refused = not conflict and harness_source_tree_conflict(staging.root) is not None
-        status = ("APPLY_CONFLICT" if conflict else "UNVERIFIED" if refused
-                  else "TIMEOUT" if getattr(detail, "status", None) == "TIMEOUT" else "FAILED")
+        refused = status == "UNVERIFIED" and harness_source_tree_conflict(staging.root) is not None
         if conflict:
             guidance = _apply_guidance(staging, race_id)
         elif refused:

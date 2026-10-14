@@ -1270,22 +1270,17 @@ def _verify_delivery_commit(repo: str, commit: str, expected: Dict[str, Any], gi
     return tree.strip()
 
 
-def _makewand_source_root() -> Path:
-    """The directory holding the makewand package (a source checkout's root)."""
-    return Path(__file__).resolve().parent.parent
-
-
 def _test_harness_source_tree_conflict(path: str) -> Optional[str]:
     """Under the test harness, a writing task never targets makewand's own source tree.
 
     The rule is git_helper.harness_source_tree_conflict, the one definition; the
     pipeline, the race (_run_race_impl: its candidates are copies of cwd) and the
     multi-task DAG (execute_task_dag: it applies its staged result to cwd) check
-    their target with it. The source tree is this module's _makewand_source_root(),
-    which tests replace with a stand-in checkout.
+    their target with it. The source tree is git_helper._makewand_source_root(),
+    the one seam tests replace with a stand-in checkout.
     """
     from makewand.git_helper import harness_source_tree_conflict
-    return harness_source_tree_conflict(path, source=_makewand_source_root())
+    return harness_source_tree_conflict(path)
 
 
 @functools.wraps(_task_dag.execute_task_dag)

@@ -862,7 +862,7 @@ def cmd_inspect(args):
 
 def cmd_apply(args):
     from makewand.candidate import CandidateManager
-    ok, files, msg = CandidateManager.apply_candidate(
+    result = CandidateManager.apply_candidate(
         race_id=args.race_id,
         candidate_label=args.candidate,
         dry_run=args.dry_run,
@@ -870,18 +870,21 @@ def cmd_apply(args):
         merge=getattr(args, "merge", False),
         **({"protected_paths": args.protected_paths} if getattr(args, "protected_paths", None) is not None else {})
     )
+    ok, files, msg = result
     if not ok:
         print(c(f"❌ {msg}", COLOR_RED + COLOR_BOLD))
-        if getattr(msg, "status", None) == "TIMEOUT":
-            from makewand.execution_contract import ExecutionResult, EXIT_TIMEOUT
-            from makewand.execution_runtime import task_id
-            from makewand.workflow import remember_result
-            remember_result(ExecutionResult(False, None, str(msg), status="TIMEOUT",
-                task_id=task_id(), stage="apply", engine="candidate"))
-            sys.exit(EXIT_TIMEOUT)
-        if "冲突" in msg:
-            sys.exit(EXIT_APPLY_CONFLICT)
-        sys.exit(EXIT_FAILED)
+        # apply's typed outcome (ApplyResult.status), never words of its message: the
+        # exit status is the one the execution contract gives that status (APPLY_CONFLICT
+        # 14, UNVERIFIED 11, TIMEOUT 16, UNKNOWN 17, FAILED 10), recorded as the typed result.
+        from makewand.execution_contract import ExecutionResult, STATUS_CODES
+        from makewand.execution_runtime import task_id
+        from makewand.workflow import remember_result
+        status = getattr(result, "status", None)
+        if status not in STATUS_CODES or status == "PASSED":
+            status = "FAILED"
+        remember_result(ExecutionResult(False, None, str(msg).replace("\0", "\\0"), status=status,
+            task_id=task_id(), stage="apply", engine="candidate"))
+        sys.exit(STATUS_CODES[status])
 
     print(c(f"✔ {msg}", COLOR_GREEN + COLOR_BOLD))
     if files:

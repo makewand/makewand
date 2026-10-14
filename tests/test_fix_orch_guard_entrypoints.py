@@ -19,7 +19,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from makewand import orchestrator as orch, task_dag
+from makewand import git_helper, orchestrator as orch, task_dag
 from makewand.execution_contract import EXIT_UNVERIFIED
 from makewand.git_helper import run_git_cmd
 from makewand.task_dag import TaskDAG, TaskNode
@@ -40,7 +40,8 @@ class GuardEntryPointTests(unittest.TestCase):
             self.assertEqual(code, 0, error)
         # Work in progress of another session in the checkout.
         (self.checkout / "app.py").write_text("VALUE = 2  # unsaved work\n")
-        source = patch.object(orch, "_makewand_source_root", return_value=self.checkout.resolve())
+        # git_helper's source root is the one seam every guard reads (single-seam).
+        source = patch.object(git_helper, "_makewand_source_root", return_value=self.checkout.resolve())
         source.start()
         self.addCleanup(source.stop)
 

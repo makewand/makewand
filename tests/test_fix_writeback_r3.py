@@ -190,8 +190,8 @@ class TestCredentialLockAndIdentityRecheck(unittest.TestCase):
         return fd
 
     def test_lock_path_is_the_sidecar_both_engines_use(self):
-        self.assertEqual(sandbox._credential_lock_path("/home/u/.codex/auth.json"),
-                         "/home/u/.codex/.auth.json.makewand-lock")
+        self.assertEqual(sandbox._credential_lock_path("/home/alice/.codex/auth.json"),
+                         "/home/alice/.codex/.auth.json.makewand-lock")
 
     def test_host_change_while_waiting_for_the_lock_is_kept(self):
         def refresh_in_place(host):

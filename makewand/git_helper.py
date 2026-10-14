@@ -352,7 +352,10 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                 lock_file = info_dir / "attributes.mw_gate"
                 lock_handle = None
                 try:
-                    lock_handle = open(lock_file, "a+", encoding="utf-8")
+                    # Never created or opened through a link (an init.templateDir can supply one).
+                    gate_flags = (os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+                                  | getattr(os, "O_CLOEXEC", 0))
+                    lock_handle = os.fdopen(os.open(lock_file, gate_flags, 0o666), "a+", encoding="utf-8")
                     from makewand import filelock
                     start_t = time.monotonic()
                     lock_timeout = timeout if timeout is not None else get_git_timeout()
@@ -579,12 +582,19 @@ def init_git_baseline(cwd: str, ephemeral: bool = False) -> Tuple[bool, Optional
     ]
     for cmd, label in steps:
         code, _, err = run_git_cmd(cmd, cwd=str(resolved))
+        if code == 0 and cmd[1] == "init":
+            # A config linked from init.templateDir must not receive makewand's identity.
+            try:
+                _own_repository_file(_fs_path(git_dir), "config")
+            except OSError as exc:
+                code, err = 1, f"无法确保仓库配置为本仓库的普通文件: {exc}"
         if code != 0:
             cleanup_err = _remove_git_dir(git_dir)
             return False, f"{label} 失败 (rc={code}): {(err or '').strip()[:200]}" + (f"；{cleanup_err}" if cleanup_err else "")
     if ephemeral:
         try:
-            (git_dir / EPHEMERAL_GIT_MARKER).write_text(json.dumps({"pid": os.getpid(), "created": datetime.now().isoformat()}), encoding="utf-8")
+            write_repository_file(_fs_path(git_dir), EPHEMERAL_GIT_MARKER,
+                                  json.dumps({"pid": os.getpid(), "created": datetime.now().isoformat()}).encode("utf-8"))
         except OSError as exc:
             cleanup_err = _remove_git_dir(git_dir)
             return False, f"无法写入临时仓库标记: {exc}" + (f"；{cleanup_err}" if cleanup_err else "")
@@ -777,6 +787,20 @@ def get_git_diff(cwd: str, base_rev: Optional[str] = None, sub_baselines: Option
     return diff_text
 
 
+def git_status_paths(cwd: Union[str, Path]) -> Optional[List[str]]:
+    """The paths `git status` reports in cwd (modified, staged, deleted, untracked - each
+    untracked file on its own), in git's order; None when git status cannot run there
+    (outside a work tree). The one parser of the user's dirty files: NUL-separated entries
+    are never quoted (core.quotePath) and, without rename pairs (--no-renames: a rename is
+    its deletion and its addition), each one is "XY <path>"; names are taken byte-exact
+    (os.fsdecode), spaces and undecodable bytes included."""
+    code, out, _ = run_git_cmd(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+                               cwd=str(cwd), binary=True)
+    if code != 0 or out is None:
+        return None
+    return list(dict.fromkeys(os.fsdecode(token[3:]) for token in out.split(b"\0") if len(token) > 3))
+
+
 def get_dirty_files(cwd: Optional[Union[str, Path]] = None) -> List[str]:
     """
     Returns relative paths of all dirty files (modified, untracked, staged, renamed)
@@ -786,18 +810,9 @@ def get_dirty_files(cwd: Optional[Union[str, Path]] = None) -> List[str]:
         cwd = os.getcwd()
     cwd_str = str(cwd)
 
-    # 1. git status: NUL-separated entries are never quoted (core.quotePath) and,
-    # without rename pairs, each one is "XY <path>".
-    code, out, _ = run_git_cmd(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
-                               cwd=cwd_str, binary=True)
-    if code == 0 and out is not None:
-        dirty: List[str] = []
-        for token in out.split(b"\0"):
-            if len(token) < 4:
-                continue
-            path_part = os.fsdecode(token[3:])
-            if path_part not in dirty:
-                dirty.append(path_part)
+    # 1. git status (git_status_paths).
+    dirty = git_status_paths(cwd_str)
+    if dirty is not None:
         return dirty
 
     # 2. Fallback for non-git directories: collect candidate source files in cwd
@@ -818,6 +833,12 @@ CLONE_EXCLUDED_DIRS = {
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     "node_modules", ".venv", "venv", "env", "benchmarks", ".tox", "dist", "build", ".cache"
 }
+# The directory names below which clone_isolated_worktree copies no untracked file:
+# CLONE_EXCLUDED_DIRS without the cache names, whose deliverable files it keeps (a
+# cache name is no evidence that the contents are disposable). The one definition:
+# candidate.build_manifest(host=True) leaves out exactly the files no copy receives.
+CLONE_UNCOPIED_DIRS = frozenset(CLONE_EXCLUDED_DIRS - {"__pycache__", ".pytest_cache", ".mypy_cache",
+                                                       ".ruff_cache", ".cache"})
 
 
 def list_workspace_copy_paths(src_dir: Union[str, Path]) -> List[str]:
@@ -847,6 +868,31 @@ def list_workspace_copy_paths(src_dir: Union[str, Path]) -> List[str]:
         detail = os.fsdecode(err).strip() if isinstance(err, bytes) else str(err or "").strip()
         raise OSError(_printable(f"无法按 .gitignore 规则枚举工作区文件 (rc={code}): {detail[:200]}"))
     return sorted({os.fsdecode(name) for name in out.split(b"\0") if name})
+
+
+def list_workspace_ignored_paths(src_dir: Union[str, Path]) -> Optional[set]:
+    """The untracked entries below src_dir that the ignore rules exclude - exactly what
+    list_workspace_copy_paths, and so every isolated copy, never receives: a directory
+    everything below which is ignored as "dir/", otherwise each ignored file (paths
+    relative to src_dir). The rules are those list_workspace_copy_paths honours
+    (.gitignore, $GIT_DIR/info/exclude and the global excludes file inside a work tree,
+    the .gitignore files elsewhere). None when Git cannot evaluate them."""
+    src = Path(src_dir).resolve()
+    listing = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"]
+    if find_git_root(src):
+        code, out, _ = run_git_cmd(["git", *listing], cwd=str(src), binary=True)
+    else:
+        probe = tempfile.mkdtemp(prefix="makewand-ignore-probe-")
+        try:
+            code, _, _ = run_git_cmd(["git", "init", "-q", probe])
+            if code == 0:
+                code, out, _ = run_git_cmd(["git", f"--git-dir={os.path.join(probe, '.git')}", f"--work-tree={src}",
+                                            *listing], cwd=str(src), binary=True)
+        finally:
+            shutil.rmtree(probe, ignore_errors=True)
+    if code != 0:
+        return None
+    return {os.fsdecode(name) for name in out.split(b"\0") if name}
 
 
 _REFLINK_SUPPORTED: Optional[bool] = None
@@ -976,7 +1022,7 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
     copied_paths = set()
     # A cache directory name is not evidence that its contents are disposable.
     # Preserve its deliverable files, and preserve tracked files everywhere.
-    excluded = CLONE_EXCLUDED_DIRS - {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache"}
+    excluded = CLONE_UNCOPIED_DIRS
     def copy_inputs(source_root: Path, destination_root: Path):
         tracked = set()
         if find_git_root(source_root):
@@ -1050,6 +1096,12 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
             code, _, err = run_git_cmd(cmd, cwd=str(target_dir))
             if code != 0:
                 raise OSError(_printable(f"隔离副本基线建立失败 ({' '.join(cmd[1:3])}, rc={code}): {(err or '').strip()[:200]}"))
+            if cmd[1] == "init":
+                # A config linked from init.templateDir must not receive the copy's settings.
+                try:
+                    _own_repository_file(_fs_path(Path(target_dir) / ".git"), "config")
+                except OSError as exc:
+                    raise OSError(_printable(f"隔离副本基线建立失败 (无法确保仓库配置为本仓库的普通文件): {exc}")) from exc
         # Only force-add the exact safely enumerated files. A source file that was
         # tracked before a later .gitignore rule must remain tracked in the clone.
         # Literal pathspecs prevent a copied filename containing '*' from admitting
@@ -2065,6 +2117,99 @@ def _open_parent(root: str, rel: str, create: bool = False) -> Tuple[int, str]:
     return fd, parts[-1]
 
 
+def _open_metadata_directory(parent_fd: int, name: str) -> int:
+    """Opens directory name in parent_fd (a new descriptor) to write repository metadata
+    below it. A link there is replaced by a new, empty directory, never followed."""
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        info = None
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        info = None
+    if info is None:
+        try:
+            os.mkdir(name, 0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    return os.open(name, _NOFOLLOW_DIR_FLAGS, dir_fd=parent_fd)
+
+
+def write_repository_file(git_dir: Union[str, Path], rel: str, data: bytes, mode: int = 0o644) -> None:
+    """Writes data to rel below git_dir - a file of a repository's own metadata, such as
+    info/exclude - as a regular file of its own, never through a link.
+
+    git init copies init.templateDir as it is, symbolic links included: a template's
+    info/exclude (or config) linked to a shared file arrives in every new repository as
+    that link, and writing through it would overwrite the shared file. A link (or a
+    hard-linked file) at rel is replaced by a new regular file and a link at a directory
+    between git_dir and rel by a real directory; no link target is ever written. git_dir
+    itself must be a directory, not a link (OSError otherwise)."""
+    parts = rel.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise OSError(errno.EINVAL, _printable(f"invalid repository metadata path: {rel}"))
+    if not HOST_TRANSACTION_SUPPORTED:
+        # No directory handles (native Windows): the same rule by path.
+        base = Path(git_dir)
+        if base.is_symlink() or not base.is_dir():
+            raise OSError(errno.ENOTDIR, _printable(f"repository metadata directory is not a directory: {base}"))
+        parent = base
+        for part in parts[:-1]:
+            parent = parent / part
+            if parent.is_symlink():
+                parent.unlink()
+            parent.mkdir(exist_ok=True)
+        target = parent / parts[-1]
+        if target.is_symlink() or (target.is_file() and target.stat().st_nlink > 1):
+            target.unlink()
+        with open(target, "wb") as stream:
+            stream.write(data)
+        return
+    fd = os.open(str(git_dir), _NOFOLLOW_DIR_FLAGS)
+    try:
+        for part in parts[:-1]:
+            child = _open_metadata_directory(fd, part)
+            os.close(fd)
+            fd = child
+        name = parts[-1]
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is not None and (not stat.S_ISREG(info.st_mode) or info.st_nlink > 1):
+            if stat.S_ISDIR(info.st_mode):
+                raise IsADirectoryError(errno.EISDIR, _printable(f"repository metadata path is a directory: {rel}"))
+            os.unlink(name, dir_fd=fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        with os.fdopen(os.open(name, flags, mode, dir_fd=fd), "wb") as stream:
+            stream.write(data)
+    finally:
+        os.close(fd)
+
+
+def _own_repository_file(git_dir: Union[str, Path], rel: str) -> None:
+    """Makes rel below git_dir a regular file of this repository before anything writes it:
+    a link git init copied from init.templateDir (or a hard-linked file) becomes a regular
+    copy of the content it led to, so that later writes (git config) stay in this
+    repository instead of rewriting the shared file. Nothing happens to a regular file or
+    a missing one."""
+    path = os.path.join(str(git_dir), *rel.split("/"))
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+        return
+    data = b""
+    try:
+        if stat.S_ISREG(os.stat(path).st_mode):  # the content a link or hard link leads to
+            with open(path, "rb") as stream:
+                data = stream.read()
+    except FileNotFoundError:
+        pass  # a dangling link: git saw no content there either
+    write_repository_file(git_dir, rel, data)
+
+
 def _lstat_at(root: str, rel: str) -> Optional[FsEntry]:
     try:
         fd, name = _open_parent(root, rel)
@@ -2203,6 +2348,10 @@ class _SampleBudget(_DigestBudget):
         if time.monotonic() > self.deadline:
             return f"超出抽样指纹时间预算 MAKEWAND_FINGERPRINT_SECONDS={self.seconds} 秒"
         return None
+
+
+# Directory handles HostWorkspaceTransaction._hash_pre_files keeps open at once.
+_HASH_DIRECTORY_HANDLES = 64
 
 
 def _fair_sample_order(sizes: Dict[str, int]) -> List[str]:
@@ -2724,12 +2873,16 @@ def _configured_hooks_path(repo: str) -> Optional[str]:
 
 
 def _makewand_source_root() -> Path:
-    """The directory holding the makewand package (a source checkout's root)."""
+    """The directory holding the makewand package (a source checkout's root).
+
+    The one source root the test-harness guard judges against: every writing entry
+    point (host transaction, pipeline, race, DAG, apply) asks
+    harness_source_tree_conflict, which reads only this function, so a test stands a
+    fixture checkout in for the source tree by replacing it here and nowhere else."""
     return Path(__file__).resolve().parent.parent
 
 
-def harness_source_tree_conflict(path: Union[str, Path], action: str = "执行会修改文件的任务",
-                                 source: Optional[Union[str, Path]] = None) -> Optional[str]:
+def harness_source_tree_conflict(path: Union[str, Path], action: str = "执行会修改文件的任务") -> Optional[str]:
     """The test-harness guard, the one definition for every caller: under the test
     harness (MAKEWAND_TEST_ISOLATION_ROOT set) makewand never writes to, snapshots or
     rolls back its own source tree. A host transaction snapshots everything below its
@@ -2737,15 +2890,14 @@ def harness_source_tree_conflict(path: Union[str, Path], action: str = "执行�
     candidate writes into it: a test that forgot its temporary workspace would revert
     edits and delete files that other sessions create meanwhile in the checkout under
     test. path, and the root of the git repository holding it, conflict when they are
-    the source tree, lie inside it or contain it.
+    the source tree (_makewand_source_root), lie inside it or contain it.
 
     Returns None, or why the target is refused, naming action (what the caller would
-    do, e.g. "建立宿主模式事务"). source is the source tree, _makewand_source_root() by
-    default; a caller whose tests substitute their own stand-in passes it. Outside the
-    harness makewand may work on its own repository like on any other."""
+    do, e.g. "建立宿主模式事务"). Outside the harness makewand may work on its own
+    repository like on any other."""
     if not os.environ.get("MAKEWAND_TEST_ISOLATION_ROOT"):
         return None
-    source = Path(os.path.realpath(source)) if source is not None else _makewand_source_root()
+    source = Path(os.path.realpath(_makewand_source_root()))
     roots = [Path(os.path.realpath(path))]
     git_root = find_git_root(roots[0])
     if git_root:
@@ -2755,10 +2907,6 @@ def harness_source_tree_conflict(path: Union[str, Path], action: str = "执行�
             return (f"测试环境中拒绝{action}: 目标工作区 {root} 与 makewand 源码目录 {source} 重叠，"
                     "测试必须以临时仓库作为工作区")
     return None
-
-
-# The name the guard had before it became the shared definition.
-_test_harness_source_conflict = harness_source_tree_conflict
 
 
 class HostWorkspaceTransaction:
@@ -2914,10 +3062,6 @@ class HostWorkspaceTransaction:
     def _hook_shared(self, directory: _HookDirectory) -> bool:
         """Whether other checkouts use directory now (a linked worktree added meanwhile counts)."""
         return directory.shared or (directory.common_dir is not None and _has_linked_worktrees(directory.common_dir))
-
-    @property
-    def hooks_shared(self) -> bool:
-        return any(self._hook_shared(directory) for directory in self.hook_dirs)
 
     def _hook_label(self, directory: str, name: str) -> str:
         path = os.path.join(directory, name)
@@ -3221,37 +3365,44 @@ class HostWorkspaceTransaction:
 
     def _hash_pre_files(self, paths: List[str], budget: _DigestBudget, sampled: bool) -> Dict[str, str]:
         """{path: sha256} of the pre-existing files paths (sampled: their sampled
-        fingerprints) that are still exactly as the snapshot recorded them, read directory
-        by directory through one no-follow directory handle each until budget's time runs
-        out. Why a full digest is missing goes to self.digest_gaps."""
+        fingerprints) that are still exactly as the snapshot recorded them, until budget's
+        time runs out. They are read in the order given - the order in which the caller's
+        size budget admitted them: smallest first for digests, _fair_sample_order for
+        samples - so that running out of time drops the same files running out of bytes
+        would, never a large file only because its path sorts late. Each is read through
+        a no-follow handle on its directory; the most recently used directory handles
+        stay open. Why a full digest is missing goes to self.digest_gaps."""
         hashes: Dict[str, str] = {}
-        ordered = sorted(paths, key=lambda path: path.rpartition("/")[::2])
-        parent_rel: Optional[str] = None
-        parent_fd: Optional[int] = None
+        parents: Dict[str, Optional[int]] = {}  # least recently used first
         try:
-            for index, rel in enumerate(ordered):
+            for index, rel in enumerate(paths):
                 expired = budget.expired()
                 if expired:
                     if not sampled:
-                        self.digest_gaps.update((rest, expired) for rest in ordered[index:])
+                        self.digest_gaps.update((rest, expired) for rest in paths[index:])
                     break
                 parent, _, name = rel.rpartition("/")
-                if parent != parent_rel:
-                    if parent_fd is not None:
-                        os.close(parent_fd)
-                    parent_rel, parent_fd = parent, None
+                if parent in parents:
+                    parent_fd = parents[parent] = parents.pop(parent)
+                else:
                     try:
                         parent_fd = _open_parent(self.root, rel)[0]
                     except OSError:
-                        pass
+                        parent_fd = None
+                    parents[parent] = parent_fd
+                    if len(parents) > _HASH_DIRECTORY_HANDLES:
+                        evicted = parents.pop(next(iter(parents)))
+                        if evicted is not None:
+                            os.close(evicted)
                 digest = None if parent_fd is None else _entry_digest(parent_fd, name, self.pre[rel], sampled=sampled)
                 if digest is not None:
                     hashes[rel] = digest
                 elif not sampled:
                     self.digest_gaps[rel] = "任务开始时无法读取，或读取期间发生变化"
         finally:
-            if parent_fd is not None:
-                os.close(parent_fd)
+            for parent_fd in parents.values():
+                if parent_fd is not None:
+                    os.close(parent_fd)
         return hashes
 
     def _discard_backups(self) -> None:
