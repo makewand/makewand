@@ -602,13 +602,17 @@ func TestRebindToolchainUnderMaskedRoot_NeverExposesHomeOrLocalShare(t *testing.
 }
 
 func TestWrapCLICommandWithSandbox_LocalAndHomeBinLayoutsDoNotExposeSecrets(t *testing.T) {
-	oldLookup := cliBwrapLookup
-	defer func() { cliBwrapLookup = oldLookup }()
+	oldLookup, oldProbe := cliBwrapLookup, cliBwrapProbe
+	t.Cleanup(func() { cliBwrapLookup, cliBwrapProbe = oldLookup, oldProbe })
 	cliBwrapLookup = func(file string) (string, error) {
 		return "/usr/bin/bwrap", nil
 	}
+	// This test inspects a mount plan without executing the mocked bwrap.
+	cliBwrapProbe = func(string) error { return nil }
 
-	fakeHome := filepath.Join("/home", "secuser")
+	// Use a native absolute path: /home/secuser has no volume on Windows
+	// and is correctly rejected by the credential path validation.
+	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
 
 	ws := t.TempDir()
@@ -677,43 +681,67 @@ func TestWrapCLICommandWithSandbox_SystemdServiceLayout_HomeOutsideHome(t *testi
 	cliPrivateHomeSource(t, wrapped.Args, serviceHome)
 }
 
+// Remote-origin sessions keep HOME an empty tmpfs and never bind a host
+// provider directory or credential file: the provider sees a writable per-run
+// private copy (so a token refresh it makes is not lost with a refresh token
+// the server already rotated), copy-only configuration such as ~/.claude.json
+// stays a read-only bind of the host file, and the host credential changes
+// only through the write-back merge: a logout is refused, a same-account
+// refresh is merged.
 func TestWrapCLICommandWithSandbox_RemoteOriginReadOnlyCredentials(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux bubblewrap mount layout test")
 	}
-	oldLookup := cliBwrapLookup
-	defer func() { cliBwrapLookup = oldLookup }()
-	cliBwrapLookup = func(file string) (string, error) {
-		return "/usr/bin/bwrap", nil
-	}
+	auditFixMockBwrap(t)
 
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
 	claudeDir := filepath.Join(fakeHome, ".claude")
-	_ = os.MkdirAll(claudeDir, 0o700)
-	_ = os.WriteFile(filepath.Join(fakeHome, ".claude.json"), []byte("{}"), 0o600)
+	credPath := filepath.Join(claudeDir, ".credentials.json")
+	claudeJSON := filepath.Join(fakeHome, ".claude.json")
+	const hostCred = `{"claudeAiOauth":{"accessToken":"a1","refreshToken":"r1","expiresAt":1}}` //nolint:gosec // G101: fake fixture token
+	readonlyFixWrite(t, credPath, hostCred)
+	readonlyFixWrite(t, claudeJSON, "{}")
 
-	ws := t.TempDir()
-	cmd := exec.Command("claude", "-p", "test")
-	cmd.Dir = ws
-
-	remoteCtx := ContextWithRemoteOrigin(context.Background())
-	wrapped, err := wrapCLICommandWithSandbox(remoteCtx, "claude", cmd)
-	if err != nil {
-		t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+	wrap := func() (*exec.Cmd, string) {
+		t.Helper()
+		cmd := exec.Command("claude", "-p", "test")
+		cmd.Dir = t.TempDir()
+		wrapped, err := wrapCLICommandWithSandbox(ContextWithRemoteOrigin(context.Background()), "claude", cmd)
+		if err != nil {
+			t.Fatalf("wrapCLICommandWithSandbox: %v", err)
+		}
+		return wrapped, filepath.Join(cliPrivateHomeSource(t, wrapped.Args, claudeDir), ".credentials.json")
 	}
 
-	args := strings.Join(wrapped.Args, " ")
-	// In remote origin, HOME must be masked with tmpfs even if under /tmp
-	if !strings.Contains(args, "--tmpfs "+fakeHome) {
-		t.Errorf("expected remote origin to mask fakeHome with --tmpfs, got: %v", wrapped.Args)
+	wrapped, priv := wrap()
+	args := wrapped.Args
+	// In remote origin, HOME must be masked with tmpfs even if under /tmp.
+	if !cliHasMount(args, "--tmpfs", fakeHome) {
+		t.Errorf("expected remote origin to mask fakeHome with --tmpfs, got: %v", args)
 	}
-	// Provider credentials must be bound with --ro-bind, not --bind
-	if !strings.Contains(args, "--ro-bind "+claudeDir+" "+claudeDir) {
-		t.Errorf("expected active provider credentials to be bound read-only in remote origin, got: %v", wrapped.Args)
+	if data, err := os.ReadFile(priv); err != nil || string(data) != hostCred {
+		t.Fatalf("credential not copied into the private copy: %q %v", data, err)
 	}
-	if strings.Contains(args, "--bind "+claudeDir+" "+claudeDir) {
-		t.Errorf("expected active provider credentials NOT to be bound read-write in remote origin: %v", wrapped.Args)
+	r4NoHostPathBoundWritable(t, args, fakeHome)
+	for i := 0; i+2 < len(args); i++ {
+		if (args[i] == "--bind" || args[i] == "--ro-bind") && (args[i+1] == claudeDir || args[i+1] == credPath) {
+			t.Fatalf("host credential path %s bound into the sandbox: %v", args[i+1], args)
+		}
+	}
+	if !auditFixHasTriple(args, "--ro-bind", claudeJSON, claudeJSON) {
+		t.Fatalf("~/.claude.json must stay a read-only bind of the host file: %v", args)
+	}
+
+	warnings := r4SimulateSandboxRun(t, wrapped, func() { readonlyFixWrite(t, priv, `{"claudeAiOauth":{}}`) })
+	if data, _ := os.ReadFile(credPath); string(data) != hostCred || len(warnings) != 1 {
+		t.Fatalf("a logout in the sandbox reached the host or was not reported: %q %q", data, warnings)
+	}
+	const refreshed = `{"claudeAiOauth":{"accessToken":"a2","refreshToken":"r2","expiresAt":2}}` //nolint:gosec // G101: fake fixture token
+	wrapped, priv = wrap()
+	warnings = r4SimulateSandboxRun(t, wrapped, func() { readonlyFixWrite(t, priv, refreshed) })
+	if data, _ := os.ReadFile(credPath); string(data) != refreshed || len(warnings) != 0 {
+		t.Fatalf("a same-account refresh was not merged into the host: %q %q", data, warnings)
 	}
 }
 

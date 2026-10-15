@@ -93,7 +93,7 @@ class TestClaudeStateDirectory(unittest.TestCase):
         (c / "skills" / "x" / "SKILL.md").write_text("skill\n")
         (c / "hooks" / "h.sh").write_text("#!/bin/sh\n")
         (c / "settings.json").write_text('{"model": "x"}\n')
-        (c / ".credentials.json").write_text('{"tok": "OLD"}\n')
+        (c / ".credentials.json").write_text('{"claudeAiOauth": {"accessToken": "OLD", "refreshToken": "R", "expiresAt": 1}}\n')
         (c / "shell-snapshots").mkdir()
         (c / "shell-snapshots" / "snapshot-bash-host.sh").write_text("echo host\n")
         (home / ".claude.json").write_text('{"mcpServers": {}}\n')
@@ -115,7 +115,8 @@ class TestClaudeStateDirectory(unittest.TestCase):
                 + attempt("echo '{\"hooks\":1}' > ~/.claude/settings.local.json", "settings.local.json")
                 + attempt("echo '{}' > ~/.claude.json", ".claude.json")
                 + attempt("mkdir -p ~/.claude/projects/-proj/memory/z && echo x > ~/.claude/projects/-proj/memory/MEMORY.md", "memory")
-                + attempt("echo '{\"tok\": \"NEW\"}' > ~/.claude/.credentials.json", "credentials")
+                + attempt("echo '{\"claudeAiOauth\": {\"accessToken\": \"NEW\", \"refreshToken\": \"R\", \"expiresAt\": 2}}'"
+                          " > ~/.claude/.credentials.json", "credentials")
                 + attempt("echo s > ~/.claude/projects/-proj/session.jsonl", "session")
                 + attempt("echo s > ws_file", "workspace")
                 + "ls ~/.claude/shell-snapshots | wc -l | sed 's/^/SNAPSHOTS=/'\n"
@@ -148,7 +149,8 @@ class TestClaudeStateDirectory(unittest.TestCase):
             self.assertFalse((c / "projects" / "-proj" / "memory").exists())
             self.assertFalse((c / "projects" / "-proj" / "session.jsonl").exists())
             # the allowlisted credential file is written back after the run
-            self.assertEqual((c / ".credentials.json").read_text().strip(), '{"tok": "NEW"}')
+            self.assertEqual((c / ".credentials.json").read_text().strip(),
+                             '{"claudeAiOauth": {"accessToken": "NEW", "refreshToken": "R", "expiresAt": 2}}')
 
     def test_readonly_task_mounts_whole_state_root_readonly_except_state(self):
         with fake_home() as home, temp_workspace() as ws:
@@ -158,7 +160,8 @@ class TestClaudeStateDirectory(unittest.TestCase):
                 attempt("echo x > ~/.claude/new-top-level-file", "new-file")
                 + attempt("echo x > ~/.claude/CLAUDE.md", "CLAUDE.md")
                 + attempt("echo x > ~/.claude/projects/-proj/s.jsonl", "projects")
-                + attempt("echo '{\"tok\": \"R\"}' > ~/.claude/.credentials.json", "credentials")
+                + attempt("echo '{\"claudeAiOauth\": {\"accessToken\": \"RO\", \"refreshToken\": \"R\", \"expiresAt\": 2}}'"
+                          " > ~/.claude/.credentials.json", "credentials")
                 + attempt("echo b > ~/.claude/backups/b.json", "backups")
                 + attempt("echo s > ws_file", "workspace")
             )
@@ -178,7 +181,8 @@ class TestClaudeStateDirectory(unittest.TestCase):
             # read-only tasks never create host placeholders
             self.assertFalse((c / "output-styles").exists())
             # credential refresh is written back in read-only runs too (allowlisted file only)
-            self.assertEqual((c / ".credentials.json").read_text().strip(), '{"tok": "R"}')
+            self.assertEqual((c / ".credentials.json").read_text().strip(),
+                             '{"claudeAiOauth": {"accessToken": "RO", "refreshToken": "R", "expiresAt": 2}}')
 
     def test_symlinked_protected_file_is_readonly_and_sandbox_still_starts(self):
         with fake_home() as home, temp_workspace() as ws:
@@ -215,12 +219,12 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                 (g / "bin").mkdir(parents=True)
                 (g / "bin" / "grok").write_text("#!/bin/sh\necho real-grok\n")
                 (g / "config.toml").write_text("model = 'x'\n")
-                (g / "auth.json").write_text("{}\n")
+                (g / "auth.json").write_text('{"access_token": "a1", "refresh_token": "r1"}\n')
                 payload = (
                     attempt("echo 'echo PWNED' > ~/.grok/bin/grok", "bin")
                     + attempt("echo x > ~/.grok/config.toml", "config")
                     + attempt("mkdir -p ~/.grok/hooks && echo x > ~/.grok/hooks/h.sh", "hooks")
-                    + attempt("echo '{\"t\":1}' > ~/.grok/auth.json", "auth")
+                    + attempt("echo '{\"access_token\": \"a2\", \"refresh_token\": \"r1\"}' > ~/.grok/auth.json", "auth")
                 )
                 res = run_payload("grok", ws, payload, readonly=readonly, state_roots=[g])
                 self.assertEqual(res.returncode, 0, res.stderr)
@@ -232,7 +236,7 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                 self.assertFalse((g / "hooks").exists())
                 self.assertEqual((g / "bin" / "grok").read_text(), "#!/bin/sh\necho real-grok\n")
                 self.assertEqual((g / "config.toml").read_text(), "model = 'x'\n")
-                self.assertEqual((g / "auth.json").read_text().strip(), '{"t":1}')
+                self.assertEqual((g / "auth.json").read_text().strip(), '{"access_token": "a2", "refresh_token": "r1"}')
                 cmd = wrap_bwrap(["grok"], workspace=str(ws), is_provider=True, provider_name="grok", readonly=readonly)
                 root_bind = [i for i, x in enumerate(cmd) if x == str(g) and cmd[i - 2] == "--bind"][0]
                 self.assertNotEqual(cmd[root_bind - 1], str(g))
@@ -245,7 +249,7 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
             (x / "skills" / "s").mkdir(parents=True)
             (x / "skills" / "s" / "SKILL.md").write_text("skill\n")
             (x / "config.toml").write_text("model = 'gpt'\n")
-            (x / "auth.json").write_text("{}\n")
+            (x / "auth.json").write_text('{"access_token": "a1", "refresh_token": "r1"}\n')
             (x / "sessions").mkdir()
             (x / "shell_snapshots").mkdir()
             (x / "shell_snapshots" / "host.sh").write_text("echo host\n")
@@ -255,7 +259,7 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                 + attempt("mkdir -p ~/.codex/prompts && echo x > ~/.codex/prompts/p.md", "prompts")
                 + attempt("echo x > ~/.codex/skills/s/SKILL.md", "skills")
                 + attempt("mkdir -p ~/.codex/rules && echo x > ~/.codex/rules/r.rules", "rules")
-                + attempt("echo '{\"t\":2}' > ~/.codex/auth.json", "auth")
+                + attempt("echo '{\"access_token\": \"a2\", \"refresh_token\": \"r1\"}' > ~/.codex/auth.json", "auth")
                 + attempt("echo s > ~/.codex/sessions/r.jsonl", "sessions")
                 + "ls ~/.codex/shell_snapshots | wc -l | sed 's/^/SNAP=/'\n"
             )
@@ -273,7 +277,7 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
             self.assertEqual(list((x / "sessions").iterdir()), [])
             self.assertEqual((x / "config.toml").read_text(), "model = 'gpt'\n")
             self.assertEqual((x / "skills" / "s" / "SKILL.md").read_text(), "skill\n")
-            self.assertEqual((x / "auth.json").read_text().strip(), '{"t":2}')
+            self.assertEqual((x / "auth.json").read_text().strip(), '{"access_token": "a2", "refresh_token": "r1"}')
             self.assertTrue((x / "shell_snapshots" / "host.sh").exists())
 
     def test_agy_gemini_dir_symlinked_elsewhere_is_protected_via_real_path(self):
@@ -281,7 +285,7 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
             real = home / "relocated" / "gemini"
             real.mkdir(parents=True)
             (real / "settings.json").write_text('{"mcpServers": {}}\n')
-            (real / "oauth_creds.json").write_text("{}\n")
+            (real / "oauth_creds.json").write_text('{"access_token": "a1", "refresh_token": "r1"}\n')
             (home / ".gemini").symlink_to(real)
             payload = (
                 attempt("echo '{\"mcpServers\":{\"x\":{}}}' > ~/.gemini/settings.json", "settings")
@@ -289,7 +293,7 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                 + attempt("echo PWNED > ~/.gemini/GEMINI.md", "GEMINI.md")
                 + attempt("mkdir -p ~/.gemini/extensions/evil", "extensions")
                 + attempt("mkdir -p ~/.gemini/commands && echo x > ~/.gemini/commands/c.toml", "commands")
-                + attempt("echo '{\"t\":1}' > ~/.gemini/oauth_creds.json", "oauth")
+                + attempt("echo '{\"access_token\": \"a2\", \"refresh_token\": \"r1\"}' > ~/.gemini/oauth_creds.json", "oauth")
             )
             res = run_payload("agy", ws, payload, state_roots=[real])
             self.assertEqual(res.returncode, 0, res.stderr)
@@ -303,7 +307,7 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
                 self.assertFalse((real / missing).exists(), missing)
             # ~/.gemini stays a symlink; the credential is written back through its real path
             self.assertTrue((home / ".gemini").is_symlink())
-            self.assertEqual((real / "oauth_creds.json").read_text().strip(), '{"t":1}')
+            self.assertEqual((real / "oauth_creds.json").read_text().strip(), '{"access_token": "a2", "refresh_token": "r1"}')
 
     def test_muse_config_readonly_and_runtime_sockets_unreachable(self):
         with fake_home() as home, temp_workspace() as ws:
@@ -361,11 +365,24 @@ class TestOtherProviderStateDirectories(unittest.TestCase):
 class TestProviderMountArgv(unittest.TestCase):
     """Argument-level checks that do not need a working bubblewrap."""
 
-    def test_missing_provider_root_is_not_created_or_mounted(self):
-        with fake_home() as home, temp_workspace() as ws:
-            cmd = wrap_bwrap(["claude", "-p", "x"], workspace=str(ws), is_provider=True, provider_name="claude")
-            self.assertFalse((home / ".claude").exists())
-            self.assertNotIn(str(home / ".claude"), cmd)
+    def test_missing_provider_root_is_not_created_and_gets_an_empty_private_directory(self):
+        # The missing root is never created on the host or bound from it; inside
+        # the sandbox (HOME is an empty tmpfs there) an empty private per-run
+        # directory takes its place, so a login made in it is reported after the
+        # run instead of vanishing.
+        with fake_home() as home, temp_workspace() as ws, \
+                patch("makewand.sandbox.resolve_trusted_bwrap", return_value="/usr/bin/bwrap"):
+            root = str(home / ".claude")
+            with sandbox.provider_home_session("claude", [str(ws)]) as session:
+                cmd = wrap_bwrap(["claude", "-p", "x"], workspace=str(ws), is_provider=True, provider_name="claude",
+                                 provider_home=session)
+                self.assertFalse(os.path.lexists(root))
+                sources = [src for src, dst in mounts(cmd, "--bind") if dst == root]
+                self.assertEqual(len(sources), 1, cmd)
+                self.assertTrue(sources[0].startswith(session.private_dir + os.sep), sources)
+                self.assertEqual(os.listdir(sources[0]), [])
+                self.assertNotIn(root, [src for src, _ in mounts(cmd, "--bind") + mounts(cmd, "--ro-bind")])
+            self.assertFalse(os.path.lexists(root))
 
     def test_non_provider_commands_never_mount_provider_state(self):
         with fake_home() as home, temp_workspace() as ws:

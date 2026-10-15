@@ -1207,7 +1207,13 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 	}
 	report.Isolated = execEnv.mode == verifyExecIsolated
 
-	if !p.runExternalQuickChecks(ctx, files, &report) {
+	cargoLocked, removeGeneratedCargoLock := p.cargoLockfile()
+	defer removeGeneratedCargoLock()
+
+	if !p.prefetchDependencies(ctx, files, contract, cargoLocked, &report) {
+		return report
+	}
+	if !p.runExternalQuickChecks(ctx, files, cargoLocked, &report) {
 		return report
 	}
 
@@ -1216,7 +1222,14 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		report.DepsPlan = depsPlan
 	}
 	if depsPlan != nil && shouldRunDependencyPlan(*depsPlan, files) {
-		result, err := p.RunVerificationPlan(ctx, *depsPlan)
+		runPlan, restoreEggBase, err := p.redirectSetuptoolsEggInfo(lockedCargoPlan(p.verificationDepsPlan(*depsPlan), cargoLocked), report.Isolated)
+		if err != nil {
+			report.DepsError = err.Error()
+			report.EnvironmentError = true
+			return report
+		}
+		result, err := p.RunVerificationPlan(ctx, runPlan)
+		restoreEggBase()
 		if result != nil {
 			report.DepsResult = result
 		}
@@ -1226,7 +1239,7 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 			return report
 		}
 		if result != nil && result.ExitCode != 0 {
-			report.DepsError = execFailureDetail(result)
+			report.DepsError = verificationFailureDetail(runPlan, result)
 			return report
 		}
 	} else if depsPlan != nil {
@@ -1239,7 +1252,7 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		report.HasTests = true
 	}
 	if testsPlan != nil {
-		runPlan := *testsPlan
+		runPlan := lockedCargoPlan(*testsPlan, cargoLocked)
 		if runPlan.Command == "go" && len(runPlan.Args) > 0 && runPlan.Args[0] == "test" {
 			// Disable cached results and require the tool's structured event stream.
 			runPlan.Args = append([]string{"test", "-json", "-count=1"}, runPlan.Args[1:]...)
@@ -1255,7 +1268,7 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 			return report
 		}
 		if result != nil && result.ExitCode != 0 {
-			report.TestsError = execFailureDetail(result)
+			report.TestsError = verificationFailureDetail(runPlan, result)
 			return report
 		}
 		report.Passed = true
@@ -1370,7 +1383,7 @@ func (p *Project) runInlineQuickChecks(files []ExtractedFile, report *CandidateV
 	return true
 }
 
-func (p *Project) runExternalQuickChecks(ctx context.Context, files []ExtractedFile, report *CandidateVerification) bool {
+func (p *Project) runExternalQuickChecks(ctx context.Context, files []ExtractedFile, cargoLocked bool, report *CandidateVerification) bool {
 	if report == nil {
 		return false
 	}
@@ -1386,7 +1399,8 @@ func (p *Project) runExternalQuickChecks(ctx context.Context, files []ExtractedF
 			continue
 		}
 		report.QuickCheckPlans = append(report.QuickCheckPlans, plan)
-		result, err := p.RunVerificationPlan(ctx, plan)
+		runPlan := lockedCargoPlan(plan, cargoLocked)
+		result, err := p.RunVerificationPlan(ctx, runPlan)
 		if result != nil {
 			report.QuickCheckResults = append(report.QuickCheckResults, *result)
 		}
@@ -1396,7 +1410,7 @@ func (p *Project) runExternalQuickChecks(ctx context.Context, files []ExtractedF
 			return false
 		}
 		if result != nil && result.ExitCode != 0 {
-			report.QuickCheckError = execFailureDetail(result)
+			report.QuickCheckError = verificationFailureDetail(runPlan, result)
 			return false
 		}
 	}
@@ -1451,6 +1465,251 @@ func detectQuickCheckPlans(files []ExtractedFile) []ExecPlan {
 	}
 
 	return plans
+}
+
+// verificationDepsPlan adapts the baseline dependency plan to a verification
+// run. Without a committed npm lockfile, `npm install` writes a new
+// package-lock.json into the workspace, which the integrity check rightly
+// treats as a changed input - but npm created it, not the candidate. With no
+// lockfile to honour, --no-package-lock resolves exactly as before and only
+// skips writing one.
+func (p *Project) verificationDepsPlan(plan ExecPlan) ExecPlan {
+	if plan.Command != "npm" || len(plan.Args) == 0 || plan.Args[0] != "install" || slices.Contains(plan.Args, "--no-package-lock") {
+		return plan
+	}
+	for _, lockfile := range []string{"package-lock.json", "npm-shrinkwrap.json"} {
+		full, err := p.validatePath(lockfile, false)
+		if err != nil {
+			return plan
+		}
+		if _, err := os.Lstat(full); !os.IsNotExist(err) {
+			return plan
+		}
+	}
+	plan.Args = append(slices.Clone(plan.Args), "--no-package-lock")
+	return plan
+}
+
+// redirectSetuptoolsEggInfo keeps setuptools from writing <name>.egg-info into
+// the workspace while verification installs a pyproject.toml or setup.py
+// project with pip. pip asks the build backend for its build requirements,
+// and setuptools runs egg_info in the source tree to answer; the new
+// directory is an input change the integrity check blames on the candidate,
+// like npm's generated lockfile. The editable install itself (PEP 660) builds
+// its metadata in a temporary directory, so nothing needs that egg-info. pip
+// is told to use PEP 517 (--use-pep517) for every project, setup.py-only ones
+// included (an editable "-e ." requirement, for example): the legacy
+// `setup.py develop` keeps the installed metadata in the egg-info inside the
+// source tree and cannot work with it redirected. A distutils configuration
+// points egg_base at a private temporary directory for the install: in the
+// sandbox, a user configuration in the sandbox HOME names the sandbox's own
+// /tmp; on the host (the acknowledged unsafe opt-in), where the install keeps
+// the user's HOME, DIST_EXTRA_CONFIG in the returned plan's environment names
+// a configuration in a fresh directory, which also receives the egg-info. The
+// returned function removes the configuration.
+func (p *Project) redirectSetuptoolsEggInfo(plan ExecPlan, isolated bool) (ExecPlan, func(), error) {
+	keep := func() {}
+	if (plan.Command != "pip" && plan.Command != "pip3") || !slices.Contains(plan.Args, "install") || slices.Contains(plan.Args, "--no-use-pep517") {
+		return plan, keep, nil
+	}
+	if _, err := p.ReadFile("pyproject.toml"); err != nil {
+		if _, err := p.ReadFile("setup.py"); err != nil {
+			return plan, keep, nil
+		}
+	}
+	if !slices.Contains(plan.Args, "--use-pep517") {
+		plan.Args = append(slices.Clone(plan.Args), "--use-pep517")
+	}
+	if !isolated {
+		dir, err := os.MkdirTemp("", "makewand-egg-base-*")
+		if err != nil {
+			return plan, nil, fmt.Errorf("configure setuptools for verification: %w", err)
+		}
+		config := filepath.Join(dir, "distutils.cfg")
+		if err := os.WriteFile(config, []byte("[egg_info]\negg_base = "+dir+"\n"), 0o600); err != nil {
+			_ = os.RemoveAll(dir)
+			return plan, nil, fmt.Errorf("configure setuptools for verification: %w", err)
+		}
+		plan.env = append(slices.Clone(plan.env), "DIST_EXTRA_CONFIG="+config)
+		return plan, func() { _ = os.RemoveAll(dir) }, nil
+	}
+	projectDir, err := p.execWorkingDir()
+	if err != nil {
+		return plan, nil, err
+	}
+	home := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return plan, nil, fmt.Errorf("create sandbox home: %w", err)
+	}
+	config := filepath.Join(home, ".pydistutils.cfg")
+	f, err := os.OpenFile(config, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return plan, keep, nil // leave a configuration that is already there alone
+	}
+	if err != nil {
+		return plan, nil, fmt.Errorf("configure setuptools for the sandbox: %w", err)
+	}
+	_, writeErr := f.WriteString("[egg_info]\negg_base = /tmp\n")
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		_ = os.Remove(config)
+		return plan, nil, fmt.Errorf("configure setuptools for the sandbox: %w", err)
+	}
+	return plan, func() { _ = os.Remove(config) }, nil
+}
+
+// cargoLockfile reports whether the Cargo workspace under verification has a
+// Cargo.lock; cargo steps then run with --locked (lockedCargoPlan). For a
+// Cargo workspace without one it returns a function that removes the
+// Cargo.lock cargo generates during verification: like npm's generated
+// lockfile (see verificationDepsPlan), it is cargo's doing, not a changed
+// input of the candidate.
+func (p *Project) cargoLockfile() (bool, func()) {
+	keep := func() {}
+	if _, err := p.ReadFile("Cargo.toml"); err != nil {
+		return false, keep
+	}
+	full, err := p.validatePath("Cargo.lock", false)
+	if err != nil {
+		return false, keep
+	}
+	if _, err := os.Lstat(full); !os.IsNotExist(err) {
+		return err == nil, keep
+	}
+	return false, func() {
+		if full, err := p.validatePath("Cargo.lock", false); err == nil {
+			_ = os.Remove(full)
+		}
+	}
+}
+
+// lockedCargoPlan adds --locked to a cargo plan when the workspace had a
+// Cargo.lock: a candidate that changes the dependencies without updating the
+// lockfile then fails with cargo's own explanation (verificationFailureDetail)
+// instead of cargo rewriting the lockfile, an input change the integrity check
+// could only report as such.
+func lockedCargoPlan(plan ExecPlan, locked bool) ExecPlan {
+	if !locked || plan.Command != "cargo" || len(plan.Args) == 0 || slices.Contains(plan.Args, "--locked") || slices.Contains(plan.Args, "--frozen") {
+		return plan
+	}
+	at := len(plan.Args)
+	if i := slices.Index(plan.Args, "--"); i >= 0 {
+		at = i
+	}
+	plan.Args = slices.Insert(slices.Clone(plan.Args), at, "--locked")
+	return plan
+}
+
+// cargoStaleLockfileRe matches cargo's refusal to update Cargo.lock in a
+// --locked run, as cargo 1.93 and as earlier releases word it.
+var cargoStaleLockfileRe = regexp.MustCompile(`(?:cannot update the lock file \S+ because|the lock file \S+ needs to be updated but) --locked was passed to prevent this`)
+
+// verificationFailureDetail describes a verification step that exited
+// non-zero: a cargo run that would have had to update a stale Cargo.lock says
+// so, any other failure is described by its output. makewand's own note on
+// the run (ExecResult.Note) follows.
+func verificationFailureDetail(plan ExecPlan, result *ExecResult) string {
+	detail := execFailureDetail(result)
+	if plan.Command == "cargo" && result != nil {
+		if refusal := cargoStaleLockfileRe.FindString(result.Stderr); refusal != "" {
+			detail = "dependencies changed but the lockfile was not updated: Cargo.lock does not match Cargo.toml (cargo: " + refusal + "); update Cargo.lock together with Cargo.toml"
+		}
+	}
+	if result != nil && result.Note != "" {
+		detail += "\n(makewand: " + result.Note + ")"
+	}
+	return detail
+}
+
+// prefetchDependencies downloads, before the network-isolated steps run, the
+// dependencies they resolve from a registry on every invocation. A
+// verification clone starts with an empty sandbox HOME, so cargo has neither
+// a registry index nor crates there and the offline `cargo check --tests`
+// quick check and `cargo test` cannot resolve crates.io dependencies. `cargo
+// fetch` runs as a dependency step - with outbound network when the
+// user-mode network is available - and fills the sandbox CARGO_HOME that the
+// offline steps then reuse. A registry outage is an environment error; any
+// other fetch failure (a dependency the candidate declared that does not
+// exist, for example) is reported like the quick check it precedes.
+func (p *Project) prefetchDependencies(ctx context.Context, files []ExtractedFile, contract verificationContract, cargoLocked bool, report *CandidateVerification) bool {
+	plan, ok := p.cargoFetchPlan(files, contract)
+	if !ok || !commandAvailable(plan.Command) {
+		return true
+	}
+	report.QuickCheckPlans = append(report.QuickCheckPlans, plan)
+	runPlan := lockedCargoPlan(plan, cargoLocked)
+	result, err := p.RunVerificationPlan(ctx, runPlan)
+	if result != nil {
+		report.QuickCheckResults = append(report.QuickCheckResults, *result)
+	}
+	if err != nil {
+		report.QuickCheckError = err.Error()
+		report.EnvironmentError = isEnvironmentExecError(err)
+		return false
+	}
+	if result != nil && result.ExitCode != 0 {
+		report.QuickCheckError = verificationFailureDetail(runPlan, result)
+		return false
+	}
+	return true
+}
+
+// cargoFetchPlan returns the dependency fetch for a Cargo workspace whose
+// offline steps run cargo: the Rust quick check or a cargo test plan. (The
+// cargo build dependency plan has network itself.) A manifest that declares
+// no dependencies needs nothing fetched; skipping the step saves the
+// dependency sandbox launch.
+func (p *Project) cargoFetchPlan(files []ExtractedFile, contract verificationContract) (ExecPlan, bool) {
+	manifest, err := p.ReadFile("Cargo.toml")
+	if err != nil || !cargoManifestDeclaresDependencies(manifest) {
+		return ExecPlan{}, false
+	}
+	offlineCargo := contract.tests != nil && contract.tests.Command == "cargo"
+	for _, plan := range detectQuickCheckPlans(files) {
+		offlineCargo = offlineCargo || plan.Command == "cargo"
+	}
+	if !offlineCargo {
+		return ExecPlan{}, false
+	}
+	return ExecPlan{Kind: "deps", Detector: "Cargo.toml", Command: "cargo", Args: []string{"fetch"}}, true
+}
+
+// cargoManifestDeclaresDependencies reports whether a Cargo.toml may declare
+// dependencies: a [dependencies], [dev-dependencies] or [build-dependencies]
+// table with entries (target-specific ones and underscore spellings
+// included), a dependency table such as [dependencies.serde], a dotted or
+// inline key such as dependencies.serde = "1", a [workspace] (its members
+// declare their own), or [patch] and [replace] sections. It errs towards
+// true: only a manifest certainly without dependencies makes the fetch
+// unnecessary.
+func cargoManifestDeclaresDependencies(manifest string) bool {
+	inDependencyTable := false
+	for _, raw := range strings.Split(manifest, "\n") {
+		line, _, _ := strings.Cut(raw, "#")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			name := strings.Map(func(r rune) rune {
+				if r == '[' || r == ']' || r == '"' || r == '\'' || r == ' ' || r == '\t' {
+					return -1
+				}
+				return r
+			}, line)
+			inDependencyTable = strings.HasSuffix(name, "dependencies")
+			if !inDependencyTable && (strings.Contains(name, "dependencies") || strings.HasPrefix(name, "workspace") ||
+				strings.HasPrefix(name, "patch") || name == "replace") {
+				return true
+			}
+			continue
+		}
+		key, _, _ := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if inDependencyTable || strings.Contains(line, "dependencies") || strings.HasPrefix(key, "workspace") {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldRunDependencyPlan(plan ExecPlan, files []ExtractedFile) bool {

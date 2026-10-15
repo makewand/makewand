@@ -193,8 +193,11 @@ class TestEffortForwarding(unittest.TestCase):
     def test_execute_task_dag_forwards_effort(self, mock_pipeline):
         mock_pipeline.return_value = True
         dag = TaskDAG("build goal", [TaskNode("task-1", "title", "desc")])
-        ok, msg, stages = execute_task_dag(dag, cwd="/tmp", effort="high")
-        self.assertTrue(ok)
+        # A private workspace: the shared temporary directory may hold the checkout under
+        # test, which the test harness refuses as a workspace.
+        with tempfile.TemporaryDirectory(prefix="makewand-effort-") as workspace:
+            ok, msg, stages = execute_task_dag(dag, cwd=workspace, effort="high")
+        self.assertTrue(ok, msg)
         self.assertTrue(mock_pipeline.called)
         self.assertEqual(mock_pipeline.call_args[1].get("effort"), "high")
 

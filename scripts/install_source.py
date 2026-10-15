@@ -17,6 +17,35 @@ EXCLUDED = {".git", ".makewand", "__pycache__", ".venv", "venv", "node_modules",
             "benchmarks", "dist", "build", ".cache", ".pytest_cache"}
 GO_INPUT_SUFFIXES = {".go", ".s", ".S", ".c", ".h", ".cc", ".cpp", ".cxx", ".m", ".mm", ".f", ".F", ".for", ".f90", ".syso"}
 SEMVER = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z")
+SKILL_NAME = "makewand-orchestrator"
+LEGACY_SKILL_DIR = "trio-orchestrator"
+
+
+def _declares_skill(skill_file, name):
+    """Report whether the YAML front matter of a SKILL.md declares `name: <name>`.
+
+    Only the leading `---` block counts (a skill body may quote another skill's
+    front matter); the value may be quoted and followed by a comment.
+    """
+    try:
+        if not skill_file.is_file():
+            return False
+        with skill_file.open(encoding="utf-8-sig", errors="replace") as handle:
+            if handle.readline(4096).rstrip() != "---":
+                return False
+            for _ in range(256):
+                line = handle.readline(4096)
+                if not line or line.rstrip() in ("---", "..."):
+                    return False
+                match = re.match(r"name:(?:[ \t]+(.*?))?[ \t]*$", line.rstrip("\r\n"))
+                if match:
+                    value = re.sub(r"[ \t]+#.*$", "", match.group(1) or "")
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                        value = value[1:-1]
+                    return value == name
+    except OSError:
+        return False
+    return False
 
 
 def atomic_link(target, destination):
@@ -210,8 +239,20 @@ def _install_locked(source, root, binaries):
             skills = destination / "skills/makewand-orchestrator"
             if skills.is_dir():
                 skills_root = Path(os.environ.get("MAKEWAND_SKILLS_DIR", str(Path.home() / ".gemini/config/skills")))
-                for name in ("makewand-orchestrator", "trio-orchestrator"):
-                    shutil.copytree(skills, skills_root / name, dirs_exist_ok=True)
+                # One directory per skill. Earlier versions also copied it to
+                # "trio-orchestrator" with the same `name:`, so agents listed it
+                # twice. Existing directories are never removed here.
+                shutil.copytree(skills, skills_root / SKILL_NAME, dirs_exist_ok=True)
+                legacy = skills_root / LEGACY_SKILL_DIR
+                if _declares_skill(legacy / "SKILL.md", SKILL_NAME):
+                    # While that old copy still claims the skill's name, agents may
+                    # load it instead: keep it current rather than stale. A user's
+                    # own trio skill declares another name and is never touched,
+                    # nor is a symlinked directory written through.
+                    if not legacy.is_symlink():
+                        shutil.copytree(skills, legacy, dirs_exist_ok=True)
+                    print(f"Note: {legacy} is an older duplicate of the {SKILL_NAME} skill; "
+                          "remove it so agents do not list the skill twice.", file=sys.stderr)
         except OSError as error:
             print(f"Installed engines; optional alias/skill integration failed: {error}", file=sys.stderr)
         print(f"Installed Makewand {version} in {destination}; current switched atomically.")

@@ -110,12 +110,36 @@ func isProtectedWritePath(cleaned string) bool {
 	if strings.EqualFold(slashed, protectedRulesPath) {
 		return true
 	}
+	// makewand's own sandbox HOME holds the tool caches and configuration of
+	// the verification steps, and the strings of its files are not collected
+	// as the project's (goProjectStrings): generated content never lands
+	// there.
+	if isSandboxHomePath(slashed) {
+		return true
+	}
 	for file := range protectedWriteFiles {
 		if strings.EqualFold(slashed, file) {
 			return true
 		}
 	}
 	return false
+}
+
+// isSandboxHomePath reports whether a slash-separated project-relative path
+// is makewand's sandbox HOME (sandboxHomeRelPath) or lies below it, compared
+// case-insensitively like isProtectedWritePath.
+func isSandboxHomePath(slashed string) bool {
+	home := strings.Split(sandboxHomeRelPath, "/")
+	parts := strings.Split(slashed, "/")
+	if len(parts) < len(home) {
+		return false
+	}
+	for i, part := range home {
+		if !strings.EqualFold(parts[i], part) {
+			return false
+		}
+	}
+	return true
 }
 
 // protectedRulesPath is the trusted project-rules file loaded by LoadRepoContext.

@@ -1,0 +1,361 @@
+{
+  "_doc": [
+    "Provider CLI messages: the quota, rate-limit, overload, login and region failures each provider CLI prints itself, and where in its output such a message counts. makewand/health.py reads this file; router/cli.go mirrors it byte for byte.",
+    "Dialect: every pattern is RE2 syntax (no lookaround, no backreference, no atomic or possessive group) and is matched case-insensitively at the start of a normalized line or message, never searched: Python re.compile(p, re.IGNORECASE | re.ASCII).match(text); Go compiles `^(?:` + p + `)` without (?i), with every ASCII letter outside a (?-i:...) group spelled in both of its cases (router/cli.go cliCatalogRegexp), because Go's (?i) would also fold the Kelvin sign into k and the long s into s, which Python's ASCII matching does not. \\w \\d \\s \\b are ASCII classes on both sides; (?-i:...) makes a part case-sensitive.",
+    "Normalized text: ANSI escapes removed, the typographic apostrophes U+2019 U+2018 U+02BC U+2032 replaced by \"'\", every whitespace run replaced by one space, leading/trailing space removed, at most 2000 characters.",
+    "providers.<cli>.kinds: quota (hard usage, spend or credit limit), rate (request-rate refusal, HTTP 429), overload (server capacity refusal, Claude 529), auth (login required or credentials rejected), region (service not offered where the user is). A '<kind>.marked' list counts only behind one of the CLI's error markers (lines.marker groups glyph, error, or a bracket containing err/fatal/crit).",
+    "Streams: with stdout and stderr captured apart only providers.<cli>.own_streams are read (stdout first, then stderr, joined by a newline); a merged capture (stream mode merged by the runner, probes, single-text callers) is read whole. providers.<cli>.answer_streams are the streams that carry the model's answer and the tool output it quotes: a capture that holds one of them (a merged one, or own streams captured apart that include one) never has selection 'lines', where every candidate line counts (router/cli.go refuses to load a catalog that does).",
+    "Candidate lines: lines inside a glog entry (lines.glog_header plus its continuation, see health.glog_entry_lines), inside a closed markdown fence (a line that starts with ``` or ~~~ after leading whitespace opens or closes one), indented lines (a tab or two spaces) and tracing lines (lines.tracing) below ERROR are skipped. The indented entries after a lines.caused_by line (an anyhow chain, lines.caused_by_entry prefix removed) and ERROR tracing lines (message after the prefix) count as marked. For a CLI with providers.<cli>.json_reports, a JSON object it prints over several lines is one candidate line: a line that does not start with whitespace, ends in '{' or '[' and leaves brackets open, with the JSON-shaped lines after it (blank, bracket- or quote-led, or a bare scalar) up to where its brackets close, each stripped and joined by one space.",
+    "selection.<apart|merged>: 'lines' = every candidate line counts; 'final_report' = only the error report the CLI ends with counts: the last candidate line and the last candidate line that starts with an error marker (or is an ERROR tracing line), each with the chain entries that directly follow it; with the streams captured apart, the final report of each own stream counts; 'transcript' = codex exec transcript rules (providers.codex.transcript): if any line is the banner, a section header or an exec result title, unmarked lines never count and the content of each section (prompt echo, agent message, reasoning, command and its relayed output) never counts except a line that starts, unindented, with an error_event followed by an own_error message, which ends the section and counts as marked; tracing lines inside a section count only with a tracing_target target. When the caller knows the prompt, the lines after a prompt_echo header that repeat it are skipped and the section ends there. The fatal report the text ends with ends a section whose header matches fatal_after (the banner, the agent's messages, reasoning, the token count; never the prompt echo or relayed command output) and then counts like a line outside the sections: its last non-blank line when that starts, unindented, with fatal_error (the error a Rust program's main returns), or a last block of indented lines after a lines.caused_by line, a blank line and such a fatal_error line (an anyhow chain). Without transcript structure every candidate line counts.",
+    "Message starts: each selected line yields itself, then what follows each element the CLI prints in front of its own messages, at most 8 times: one of providers.<cli>.names followed by ':' (lines.name_separator), or a lines.marker element; behind an error marker also what follows the first lead-in clause (lines.lead_in). Each start is matched against <kind> and, when marked, <kind>.marked.",
+    "providers.agy.notices / generic_notice / status_lines / invalid_invocation describe agy's own non-error lines and argument rejections (makewand/providers/agy.py): notices and status lines are never an answer or a verdict; on agy's own stream every generic_notice line is a notice (agy has generic 'warning: %s' formats); in a merged stream only the exact notices are removed from the answer.",
+    "providers.codex.transcript.own_error: the messages of codex's own ERROR events: its error formats (codex 0.162.1 prints an API error as 'unexpected status <status>: <the API's message>, url: ..., request id: ...', 'exceeded retry limit, last status: <status>' or 'stream disconnected before completion: <the API's message>', and its usage-limit and credit messages) and the API's rate-limit and quota messages it relays verbatim, with the short forms of its kinds. own_warning: codex's own usage warnings as whole lines; they are no refusal and no kind reads them: makewand/providers/codex.py reads them for its quota reserve gate, from codex's own lines plus every unindented line that is such a warning anywhere outside the prompt echo.",
+    "providers.gemini is Gemini CLI (gemini -p, the Go router's legacy gemini-cli transport): its own error report on stderr, the '[API Error: <message> (Status: <status>)]' text, the JSON error report of --output-format json and the Google API refusals it relays."
+  ],
+  "version": 1,
+  "lines": {
+    "glog_header": "(?-i:[IWEF])\\d{4} +\\d{2}:\\d{2}:\\d{2}\\.\\d+ +\\d+ +[^\\s\\]]+:\\d+\\]",
+    "tracing": "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:?\\d{2}) +(?P<level>(?-i:TRACE|DEBUG|INFO|WARN|ERROR)) +(?P<target>[\\w:-]+): ",
+    "caused_by": "caused by:$",
+    "caused_by_entry": "\\d+: ",
+    "top_level": "(?:error|warning|caused by) ?:",
+    "name_separator": " ?: ?",
+    "marker": "(?P<glyph>[✖✗✘×❌⛔⚠‼❗■🚫]️?) ?|(?P<bracket>\\[[^\\]]{1,64}\\]) ?|(?P<error>(?:(?:api|rpc|grpc|http|stream|request) )?(?:error|err)(?: ?\\((?:status )?\\d{3}\\))? ?:) ?|(?P<code>(?-i:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|UNAUTHENTICATED|UNAVAILABLE|INTERNAL|UNKNOWN|CANCELLED|ABORTED) ?:) ?",
+    "marked_bracket": "\\[[^\\]]*(?:err|fatal|crit)",
+    "lead_in": ".{0,198}?(?:: | desc = )"
+  },
+  "providers": {
+    "claude": {
+      "names": [
+        "claude"
+      ],
+      "own_streams": [
+        "stdout",
+        "stderr"
+      ],
+      "answer_streams": [],
+      "selection": {
+        "apart": "lines",
+        "merged": "lines"
+      },
+      "kinds": {
+        "quota": [
+          "you(?:'ve| have) (?:hit|reached) your (?:[\\w'$-]+ ){0,4}?(?:limit|budget|cap)\\b",
+          "you're out of (?:usage credits|extra usage)\\b",
+          "your org is out of usage\\b",
+          "your organization is out of usage credits\\b",
+          "your organization's usage credit cap is reached\\b",
+          "your seat type doesn't include (?:extra )?usage\\b",
+          "your usage allocation has been disabled by your admin\\b",
+          "your group's usage limit is set to \\$0\\b",
+          "(?:fable|haiku|mythos|opus|sonnet)(?: [^·]{1,40})? requires usage credits\\.",
+          "claude(?: ai| code)? usage limit reached\\b",
+          "(?:weekly|session|5-hour|five-hour|daily|monthly|opus|sonnet|fable|usage|spend(?:ing)?)(?: (?:weekly|daily|monthly|usage|spend(?:ing)?))? limit reached(?: ?[·•∙|]|\\.?$)"
+        ],
+        "rate": [
+          "api error: (?:request rejected \\()?429\\b",
+          "api error: (?:\\d{3} )?\\{.*\\\"type\\\": ?\\\"rate_limit_error\\\"",
+          "api error: rate limit exceeded\\b",
+          "rate limit exceeded\\.?$",
+          "rate_limit_error\\b",
+          "http 429 too many requests\\.?$"
+        ],
+        "overload": [
+          "api error: 529\\b",
+          "api error: (?:\\d{3} )?\\{.*\\\"type\\\": ?\\\"overloaded_error\\\"",
+          "overloaded_error\\b",
+          "(?:api error: )?repeated 529 overloaded errors\\b",
+          "(?:api error: )?server is temporarily limiting requests\\b",
+          "(?:opus|fable|sonnet) is experiencing high load\\b"
+        ]
+      }
+    },
+    "codex": {
+      "names": [
+        "codex"
+      ],
+      "own_streams": [
+        "stderr"
+      ],
+      "answer_streams": [
+        "stdout"
+      ],
+      "selection": {
+        "apart": "transcript",
+        "merged": "transcript"
+      },
+      "transcript": {
+        "banner": "(?:\\[[^\\]]{1,40}\\] )?openai codex v\\d",
+        "section": "(?:\\[[^\\]]{1,40}\\] )?(?:user|user instructions:|codex|thinking|exec|exec .+ in \\S+|tokens used|apply[ _]patch(?: .*)?|turn diff:|file update:?|patch:|context compacted|web search:.*|collab:.*)$",
+        "prompt_echo": "(?:\\[[^\\]]{1,40}\\] )?(?:user|user instructions:)$",
+        "exec_result": "(?:.* )?(?:succeeded in [\\d.,]+ ?[a-zµ]{1,3}|exited -?\\d+(?: in [\\d.,]+ ?[a-zµ]{1,3})?):$",
+        "error_event": "(?:\\[[^\\]]{1,40}\\] )?(?-i:ERROR): ",
+        "own_error": [
+          "you(?:'ve| have) (?:hit|reached) your usage limit\\b",
+          "usage limit reached\\. you've reached your usage limit\\b",
+          "you're out of credits\\b",
+          "your workspace is out of credits\\b",
+          "you've reached your workspace credit limit\\b",
+          "you hit your spend cap\\b",
+          "quota exceeded\\. check your plan and billing details\\b",
+          "unexpected status \\d{3}\\b",
+          "exceeded retry limit, last status: \\d{3}\\b",
+          "stream disconnected before completion:",
+          "turn error:",
+          "you(?:'ve| have)? exceeded your current quota\\b",
+          "rate limit reached for \\S+ (?:in organization|on)\\b",
+          "(?:weekly|daily|monthly|5-hour|five-hour|session|usage) limit reached(?: ?[·•∙|]|\\.?$)"
+        ],
+        "tracing_target": "codex(?:_\\w+)?(?:::[\\w-]+)*$",
+        "fatal_error": "(?-i:Error): ",
+        "fatal_after": "(?:\\[[^\\]]{1,40}\\] )?(?:openai codex v\\d|(?:codex|thinking|tokens used|context compacted)$)",
+        "own_warning": [
+          "(?:⚠️? ?)?heads up, you have less than \\d+(?:\\.\\d+)?% of your [\\w-]+(?: [\\w-]+)? limit left\\. run /status for a breakdown\\.?$",
+          "(?:⚠️? ?)?(?:weekly|daily|monthly|annual|5-hour|5h|five-hour|session|usage) limit: \\d+(?:\\.\\d+)?% left\\.?$"
+        ]
+      },
+      "kinds": {
+        "quota": [
+          "you(?:'ve| have) (?:hit|reached) your usage limit\\b",
+          "usage limit reached\\. you've reached your usage limit\\b",
+          "(?:weekly|daily|monthly|5-hour|five-hour|session|usage) limit reached(?: ?[·•∙|]|\\.?$)",
+          "you're out of credits\\b",
+          "your workspace is out of credits\\b",
+          "you've reached your workspace credit limit\\b",
+          "you hit your spend cap\\b",
+          "quota exceeded\\. check your plan and billing details\\b",
+          "you(?:'ve| have)? exceeded your current quota\\b"
+        ],
+        "rate": [
+          "unexpected status 429\\b",
+          "exceeded retry limit, last status: 429\\b",
+          "rate limit reached for \\S+ (?:in organization|on)\\b",
+          "http 429 too many requests\\.?$"
+        ],
+        "rate.marked": [
+          "429 too many requests\\.?$"
+        ]
+      }
+    },
+    "grok": {
+      "names": [
+        "grok"
+      ],
+      "own_streams": [
+        "stderr"
+      ],
+      "answer_streams": [
+        "stdout"
+      ],
+      "selection": {
+        "apart": "lines",
+        "merged": "final_report"
+      },
+      "kinds": {
+        "quota": [
+          "you've reached your free grok build usage limit\\b",
+          "you hit your (?:free usage|weekly) limit\\b",
+          "you've hit the credit limit for your plan\\b",
+          "you've hit your spending cap\\b",
+          "(?:your account is )?out of credits or over your spending limit\\b",
+          "subscription:free-usage-exhausted\\b",
+          "api error \\(status 402\\)",
+          "payment required \\(402\\)(?:$|:| from\\b)"
+        ],
+        "quota.marked": [
+          "(?:usage limit reached|spending limit reached|usage balance exhausted|usage[_ ]pool[_ ]exhausted|usage_limit_reached)\\b"
+        ],
+        "rate": [
+          "api error \\(status 429\\)",
+          "you've hit (?:your team's (?:api )?|the )rate limit\\b",
+          "(?:rate limited|too many requests) \\(429\\)(?:$|:| from\\b)",
+          "rate limit reached(?:$|[.:·] ?(?:resets?|try again|retry)\\b)",
+          "http 429 too many requests\\.?$"
+        ],
+        "auth": [
+          "(?:authentication failed|authentication required|session expired|not logged in|not signed in|token expired|authentication could not be refreshed|no cached credentials found)(?:\\.| —) run [`'\\\"]?grok login\\b",
+          "your session (?:has expired|expired and [^.]{1,40} could not renew it)\\b",
+          "your (?:auth token|grok_deployment_key) is invalid or expired\\b",
+          "your team sign-in was rejected\\b",
+          "authentication rejected by server\\b",
+          "auth recovery exhausted\\b",
+          "not authenticated\\.$",
+          "no credentials found: no login token\\b",
+          "headless mode requires a grok\\.com session\\b",
+          "authentication problem — re-authenticate using /login\\b",
+          "missing xai credentials\\b",
+          "api error \\(status 401\\)",
+          "responses api returned 401 unauthorized\\b",
+          "unauthorized \\(401\\)(?:$|:| from\\b)",
+          "please (?:sign|log) ?in (?:with|to|using) grok\\b"
+        ]
+      }
+    },
+    "muse": {
+      "names": [
+        "muse"
+      ],
+      "own_streams": [
+        "stdout",
+        "stderr"
+      ],
+      "answer_streams": [
+        "stdout"
+      ],
+      "selection": {
+        "apart": "final_report",
+        "merged": "final_report"
+      },
+      "kinds": {
+        "quota": [
+          "usage limit reached \\(http \\d{3} · attempt \\d+\\)"
+        ],
+        "rate": [
+          "rate limited \\(http \\d{3} · attempt \\d+\\)",
+          "request failed \\(http 429 · attempt \\d+\\)"
+        ],
+        "auth": [
+          "authentication failed \\(http \\d{3} · attempt \\d+\\)",
+          "invalid api key \\(http \\d{3}\\)",
+          "missing meta credentials?: ",
+          "not logged in: run /login to add an api key\\b",
+          "not logged in — run /login to get started\\b",
+          "not logged in\\. run [`'\\\"]?muse login\\b",
+          "no meta credentials were found\\b",
+          "your saved meta credentials are invalid\\b",
+          "still unauthorized after a token refresh\\b",
+          "muse code couldn't (?:read|access) your (?:saved )?meta credentials\\b",
+          "your meta account isn't set up for model api yet\\b",
+          "your (?:api key from meta_api_key|saved api key) was rejected\\b",
+          "the login request (?:expired before it was approved|was denied)\\b",
+          "open this page to sign in:(?: https?://\\S+)?$",
+          "press enter to open it in your browser:$"
+        ]
+      }
+    },
+    "agy": {
+      "names": [
+        "agy",
+        "antigravity"
+      ],
+      "own_streams": [
+        "stderr"
+      ],
+      "answer_streams": [
+        "stdout"
+      ],
+      "selection": {
+        "apart": "final_report",
+        "merged": "final_report"
+      },
+      "kinds": {
+        "quota": [
+          "you have exhausted your quota on this model\\b",
+          "individual quota reached\\b",
+          "resource has been exhausted\\b",
+          "quota exceeded for (?:quota metric\\b|[\\w.-]+\\.googleapis\\.com\\b)",
+          "rpc error: code = resourceexhausted\\b",
+          "error 429, message:",
+          "googleapi: error 429\\b",
+          "http 429 too many requests\\.?$"
+        ],
+        "quota.marked": [
+          "resource_?exhausted\\b"
+        ],
+        "auth": [
+          "authentication required\\. (?:run '[^']+' to log in|please (?:sign|log) ?in)\\b",
+          "you are not logged into antigravity\\b",
+          "authentication expired\\. please log back in\\b",
+          "stored credentials are expired or revoked\\b",
+          "print mode: not logged in\\b",
+          "please sign in to view available models\\b",
+          "authentication required\\. please visit the url to log in\\b",
+          "adc authentication failed\\b",
+          "request had invalid authentication credentials\\b",
+          "oauth2: (?:\\\"invalid_grant\\\"|cannot fetch token\\b|token expired and refresh token is not set\\b)",
+          "oauth2/google: status code 40[13]\\b",
+          "rpc error: code = unauthenticated\\b",
+          "error 401, message:",
+          "googleapi: error 401\\b",
+          "html response: unauthenticated\\b"
+        ],
+        "auth.marked": [
+          "unauthenticated\\b",
+          "authentication required\\b",
+          "401 unauthorized\\.?$"
+        ],
+        "region": [
+          "user location is not supported for the api use\\b",
+          "(?:gemini|antigravity|google)\\b[^:]{0,100}? (?:is|are) not (?:currently )?(?:available|supported) in your (?:location|region|country|area|territory)\\b"
+        ],
+        "region.marked": [
+          "(?:.{1,120}? )?(?:is |are )?not (?:currently )?(?:available|supported) in your (?:location|region|country|area|territory)\\b",
+          "(?:unsupported|not supported) (?:location|region|country)\\b"
+        ]
+      },
+      "notices": [
+        "warning: --mode \\S+ is not supported in print mode; continuing in the default mode\\.?$",
+        "warning: --mode \\S+ is not available for this account; continuing in the default mode\\.?$",
+        "warning: --mode \\S+ has no effect while slash command expansion is disabled\\.?$",
+        "warning: slash commands are unavailable for this run; the prompt was sent without expansion\\.?$",
+        "warning: unrecognized --mode value .+ \\(valid: .+\\)$",
+        "warning: ignoring --agent .+ because we are resuming an existing conversation$",
+        "warning: ignoring unsupported stream input message event .+$",
+        "warning: run ended with no output and no recorded error$",
+        "warning: both google_api_key and gemini_api_key are set\\. using google_api_key\\.$",
+        "warning: both google_genai_use_enterprise and google_genai_use_vertexai are set with conflicting values\\. .+$",
+        "warning: could not verify credentials \\(.*\\); continuing\\.$",
+        "warning: could not determine authenticated account: .+$",
+        "non-fatal environment configuration warning: .+$"
+      ],
+      "generic_notice": "(?:warning|non-fatal environment configuration warning) ?: ",
+      "status_lines": [
+        "root agent idle; waiting up to \\S+ for \\d+ background task\\(s\\)$",
+        "terminating \\d+ background task\\(s\\)(?: and \\d+ daemon task\\(s\\))? on exit$"
+      ],
+      "invalid_invocation": [
+        "error ?: invalid model selection \\(--model \\\"[^\\\"]*\\\"(?: --effort \\\"[^\\\"]*\\\")?\\)",
+        "error ?: unknown (?:flag|shorthand flag): \\S+(?: in \\S+)?$",
+        "error ?: unknown command \\\"[^\\\"]*\\\" for \\\"[^\\\"]*\\\"",
+        "error ?: [\\w.-]+ has no \\\"[^\\\"]+\\\" effort"
+      ]
+    },
+    "gemini": {
+      "names": [
+        "gemini"
+      ],
+      "own_streams": [
+        "stderr"
+      ],
+      "answer_streams": [
+        "stdout"
+      ],
+      "selection": {
+        "apart": "lines",
+        "merged": "final_report"
+      },
+      "json_reports": true,
+      "kinds": {
+        "quota": [
+          "usage limit reached for (?:all pro models|[\\w.-]+)\\.(?: |$)",
+          "(?:\\[api error: )?you have exhausted your (?:capacity|daily quota|quota)\\b",
+          "(?:an unexpected critical error occurred: ?)?terminalquotaerror\\b",
+          "\\{ (?:\\\"session_id\\\": \\\"(?:[^\\\"\\\\]|\\\\.)*\\\", )?\\\"error\\\": \\{ \\\"type\\\": \\\"terminalquotaerror\\\"",
+          "(?:\\[api error: )?resource has been exhausted\\b",
+          "(?:\\[api error: )?quota exceeded for (?:quota metric\\b|[\\w.-]+\\.googleapis\\.com\\b)",
+          "error 429, message:",
+          "googleapi: error 429\\b"
+        ],
+        "quota.marked": [
+          "resource_?exhausted\\b"
+        ],
+        "rate": [
+          "(?:an unexpected critical error occurred: ?)?retryablequotaerror\\b",
+          "\\{ (?:\\\"session_id\\\": \\\"(?:[^\\\"\\\\]|\\\\.)*\\\", )?\\\"error\\\": \\{ (?:\\\"type\\\": \\\"retryablequotaerror\\\"|.*\\\"code\\\": 429\\b)",
+          "\\[api error: .*\\(status: resource_exhausted\\)\\]",
+          "please wait and try again later\\. to increase your limits, request a quota increase through (?:ai studio|vertex)\\b"
+        ]
+      }
+    }
+  }
+}

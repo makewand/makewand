@@ -82,8 +82,8 @@ class TestHealth(unittest.TestCase):
         self.assertTrue(limited)
         self.assertEqual(resets, "需登录授权")
 
-        # 429 Rate limit
-        output_429 = "429 rate limit exceeded"
+        # 429 Rate limit, as Muse Code prints its failures: "<kind> (HTTP <status> · attempt <n>)"
+        output_429 = "rate limited (HTTP 429 · attempt 2)"
         limited_429, reason_429, resets_429 = parse_muse_quota(output_429)
         self.assertTrue(limited_429)
         self.assertIsNotNone(resets_429)

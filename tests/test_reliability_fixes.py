@@ -300,6 +300,19 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
     def setUp(self):
         self._usage_patch = patch("makewand.usage.record_engine_usage")
         self._usage_patch.start()
+        # A host-mode task snapshots and rolls back its cwd's whole repository, so
+        # every run_pipeline call here gets a temporary repository, never the
+        # process cwd (the makewand checkout under test).
+        temporary = tempfile.TemporaryDirectory(prefix="makewand-readonly-intent-")
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name) / "repo"
+        self.repo.mkdir()
+        (self.repo / "app.py").write_text("VALUE = 1\n")
+        from makewand.git_helper import run_git_cmd
+        for arguments in (["init", "-q"], ["config", "user.name", "Fixture"],
+                          ["config", "user.email", "fixture@example.invalid"], ["add", "."], ["commit", "-qm", "baseline"]):
+            code, _, error = run_git_cmd(["git", *arguments], cwd=str(self.repo))
+            self.assertEqual(code, 0, error)
 
     def tearDown(self):
         self._usage_patch.stop()
@@ -337,7 +350,7 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
                 mock_agy.reset_mock()
                 mock_muse.reset_mock()
                 mock_grok.reset_mock()
-                run_pipeline(p, force_code=True)
+                run_pipeline(p, cwd=str(self.repo), force_code=True)
                 called = [m for m in [mock_claude, mock_codex, mock_agy, mock_muse, mock_grok] if m.called]
                 self.assertTrue(called, f"Expected at least one provider to be called for prompt: {p}")
                 _, kwargs = called[0].call_args
@@ -352,8 +365,9 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
                 "agy": {"status": "ready", "tier": "deep"},
                 "muse": {"status": "ready", "tier": "standard"}
             }
-            run_pipeline("审查当前改动，不要修改文件", force_code=True)
+            run_pipeline("审查当前改动，不要修改文件", cwd=str(self.repo), force_code=True)
             mock_review.assert_called()
+            self.assertEqual(mock_review.call_args.kwargs["cwd"], str(self.repo))
 
     def test_localized_negative_phrases_do_not_override_force_code(self):
         """Regression test for Priority 3: localized negative phrases (e.g. 'do not edit tests') must not hijack force_code."""
@@ -473,24 +487,27 @@ class TestPreserveReadOnlyIntent(unittest.TestCase):
             mock_claude.return_value = (True, "Code updated successfully", None)
 
             # Case A: Prompt contains 'do not edit tests' with force_code=True -> must NOT be readonly
-            run_pipeline("Fix the bug, do not edit tests", force_code=True, auto_fix=False)
+            run_pipeline("Fix the bug, do not edit tests", cwd=str(self.repo), force_code=True, auto_fix=False)
             self.assertTrue(mock_claude.called)
             _, kwargs = mock_claude.call_args
             self.assertFalse(kwargs.get("readonly", False), "force_code=True was wrongly hijacked into readonly=True!")
+            self.assertEqual(kwargs.get("cwd"), str(self.repo))
 
             # Case B: Prompt contains only 'do not edit tests' with force_code=True -> must respect force_code=True
             mock_claude.reset_mock()
-            run_pipeline("do not edit tests", force_code=True, auto_fix=False)
+            run_pipeline("do not edit tests", cwd=str(self.repo), force_code=True, auto_fix=False)
             self.assertTrue(mock_claude.called)
             _, kwargs = mock_claude.call_args
             self.assertFalse(kwargs.get("readonly", False), "force_code=True was wrongly hijacked for 'do not edit tests'!")
 
             # Case C: Prompt contains localized negative without force_code, but has coding action -> code mode
             mock_claude.reset_mock()
-            run_pipeline("Fix the bug, do not edit tests", force_code=False, auto_fix=False)
+            run_pipeline("Fix the bug, do not edit tests", cwd=str(self.repo), force_code=False, auto_fix=False)
             self.assertTrue(mock_claude.called)
             _, kwargs = mock_claude.call_args
             self.assertFalse(kwargs.get("readonly", False), "Coding action with localized negative phrase was wrongly downgraded to readonly!")
+        # The rolled-back host transactions touched only the temporary repository.
+        self.assertEqual((self.repo / "app.py").read_text(), "VALUE = 1\n")
 
 
 if __name__ == "__main__":

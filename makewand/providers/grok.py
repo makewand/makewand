@@ -3,54 +3,29 @@ Grok Build CLI provider adapter (xAI subscription / Grok Build interactive codin
 """
 
 import os
-import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_YELLOW
-from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 from makewand.workflow import provider_outcome
 
-# Context-anchored patterns (aligned with codex/claude): a bare "429" token in
-# arbitrary output ("line 429", "429 errors", PIDs, hashes) is never a limit.
-_GROK_AUTH_RE = re.compile(
-    r"missing\s+xai\s+credentials"
-    r"|\b401\b[^\n]{0,40}\bunauthori[sz]ed\b"
-    r"|\bunauthori[sz]ed\b[^\n]{0,40}\b401\b"
-    r"|(?:^|[\s:\[(])unauthori[sz]ed(?:\s*[:.\])]|\s*$)"
-    r"|\bauth(?:entication)?\s+required\b"
-    r"|\blogin\s+required\b"
-    r"|\bplease\s+sign\s+in\b"
-    r"|\bsession\s+expired\b",
-    re.MULTILINE,
-)
-_GROK_RATE_LIMIT_RE = re.compile(
-    r"\b(?:"
-    r"rate[\s_-]*limit(?:ed|\s+exceeded)?"
-    r"|usage\s*limit"
-    r"|too\s*many\s*requests"
-    r"|insufficient\s+credits"
-    r"|quota\s*exceeded"
-    r"|resource[_\s]?exhausted"
-    r"|429\s+too\s*many"
-    r"|http(?:/[\d.]+)?\s+429"
-    r"|status(?:\s*code)?\s*[:=]?\s*429"
-    r"|code\s*[:=]\s*429"
-    r")\b"
-)
 
-
-def parse_grok_quota(output: str) -> Tuple[bool, str, Optional[str]]:
+def parse_grok_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
     """
-    Parses Grok CLI output for authentication errors and rate-limit / quota depletion markers.
+    Login and quota / rate-limit refusals Grok Build prints itself
+    (health.CLI_MESSAGE_CATALOG["grok"]). `stderr` is passed when the streams
+    were captured apart: grok -p then writes the answer to stdout and its own
+    errors to stderr. Otherwise `output` is the merged text.
     """
-    lower = (output or "").lower()
-    if _GROK_AUTH_RE.search(lower):
+    from makewand.health import find_cli_messages, extract_reset_phrase
+    found = find_cli_messages("grok", ("auth", "quota", "rate"), output, stderr)
+    if "auth" in found:
         return True, "未登录或需配置凭据 (请运行 'grok' 登录或在环境变量中配置 XAI_API_KEY)", "需登录授权"
 
-    if _GROK_RATE_LIMIT_RE.search(lower):
-        reset_match = re.search(r"resets?\s+(?:in|at)\s+([^.\n,]+)", output, re.IGNORECASE)
-        if reset_match:
-            reset_time = reset_match.group(1).strip()
+    line = next((line for kind, line in found.items() if kind != "auth"), None)
+    if line is not None:
+        reset_time = extract_reset_phrase(line)
+        if reset_time:
             return True, f"xAI 订阅额度耗尽或频次受限 (429 / {reset_time})", reset_time
         iso_reset = (datetime.now() + timedelta(hours=2)).isoformat()
         return True, "xAI 订阅额度耗尽或频次受限 (429)", iso_reset
@@ -178,6 +153,7 @@ def execute_grok_task(
                     print_prefix=c("[Grok Live]", COLOR_YELLOW),
                     pass_fds=launch.pass_fds,
                     extra_env=launch.env,
+                    separate_stderr=True,
                 )
         except SandboxUnavailableError as exc:
             return False, None, str(exc)
@@ -195,7 +171,10 @@ def execute_grok_task(
                 shutil.rmtree(p_dir, ignore_errors=True)
             except Exception:
                 pass
-    combined = f"{out}\n{err}" if not stream else out
+    # Grok Build's own lines are stderr, or the merged stream when the runner
+    # merged stderr into stdout.
+    apart = stderr_captured_apart(err, stream)
+    combined = f"{out}\n{err}" if apart else out
 
     if code == 0:
         return True, out, None
@@ -203,7 +182,7 @@ def execute_grok_task(
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("grok", code, combined, err, ex, readonly)
 
-    is_limited, reason, resets = parse_grok_quota(combined)
+    is_limited, reason, resets = parse_grok_quota(out, err if apart else None)
     if is_limited:
         record_engine_limit("grok", reason, resets)
         if has_api_configured("grok"):

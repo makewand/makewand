@@ -284,10 +284,26 @@ def get_api_policy() -> str:
 def is_api_allowed(provider: str) -> bool:
     return normalize_provider_name(provider) == "local" or get_api_policy() == "allow_paid"
 
+def api_relay_available(provider: str) -> bool:
+    """Whether work for provider may go to its cloud API: a key (or endpoint) is
+    configured AND the API policy allows the call. The adapters relay a limited,
+    logged-out or missing subscription CLI to the API only then, and engine
+    selection counts such an engine as usable only then; otherwise the CLI runs
+    or the engine is not usable. A configured key alone never authorizes paid use."""
+    return is_api_allowed(provider) and has_api_configured(provider)
+
 def api_policy_error() -> str:
     return ("当前 API 策略为 subscription_only，已阻止可能产生费用的云 API 调用；"
             "如需允许按量计费，请设置 MAKEWAND_API_POLICY=allow_paid "
             "或配置 api_policy=allow_paid。")
+
+def api_relay_blocked_note(provider: str) -> str:
+    """Why a provider's configured API key was not used: empty when no key is
+    configured or the API policy allows the relay."""
+    if not has_api_configured(provider) or is_api_allowed(provider):
+        return ""
+    return ("已配置 API Key，但当前 API 策略为 subscription_only，不会转用按量计费的云 API"
+            "（设置 MAKEWAND_API_POLICY=allow_paid 或配置 api_policy=allow_paid 可允许）")
 
 def save_user_config(cfg: dict) -> bool:
     """Saves dictionary to ~/.config/makewand/config.json."""
@@ -467,7 +483,7 @@ def get_provider_execution_mode(provider: str) -> str:
         avail, _, _ = is_local_model_available(timeout=0.5)
         return "local" if avail else "none"
     sub_ok = has_subscription_configured(p)
-    api_ok = is_api_allowed(p) and has_api_configured(p)
+    api_ok = api_relay_available(p)
     if sub_ok and api_ok:
         return "hybrid"
     elif sub_ok:

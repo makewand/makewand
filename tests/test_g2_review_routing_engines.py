@@ -21,6 +21,11 @@ import makewand.config as config
 import makewand.orchestrator as orch
 from makewand.git_helper import run_git_cmd
 
+try:
+    from _verdicts import answer_with_nonce, nonced
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests._verdicts import answer_with_nonce, nonced
+
 PASS_LINE = 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,7 +36,7 @@ def enabled_except(*disabled):
 
 class TestRunReviewHonoursDisableAndHealth(unittest.TestCase):
     def run_review(self, cache, disabled):
-        mocks = {name: MagicMock(return_value=(True, PASS_LINE, None))
+        mocks = {name: MagicMock(side_effect=answer_with_nonce((True, PASS_LINE, None)))
                  for name in ("execute_codex_task", "execute_grok_task", "execute_agy_task")}
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(orch, "get_git_diff", return_value="diff --git a/a b/a\n+x"))
@@ -62,9 +67,9 @@ class TestRunReviewHonoursDisableAndHealth(unittest.TestCase):
         self.assertEqual(calls, {"codex": 0, "grok": 0, "agy": 1})
 
     def test_local_only_review_routes_to_local_and_fails_closed_without_cloud_fallback(self):
-        cloud_mocks = {name: MagicMock(return_value=(True, PASS_LINE, None))
+        cloud_mocks = {name: MagicMock(side_effect=answer_with_nonce((True, PASS_LINE, None)))
                        for name in ("execute_codex_task", "execute_grok_task", "execute_agy_task")}
-        local_mock = MagicMock(return_value=(True, PASS_LINE, None))
+        local_mock = MagicMock(side_effect=answer_with_nonce((True, PASS_LINE, None)))
         cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}, "local": {"status": "healthy"}}
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(orch, "get_git_diff", return_value="diff --git a/a b/a\n+x"))
@@ -110,7 +115,7 @@ class TestRunRaceHonoursDisableAndHealth(unittest.TestCase):
         def dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):
             self.dispatched.append((engine, readonly))
             if readonly:
-                return True, verdict, None
+                return True, nonced(prompt, verdict), None
             (Path(cwd) / "app.py").write_text(f"CANDIDATE = '{engine}'\n", encoding="utf-8")
             return True, "implemented", None
 

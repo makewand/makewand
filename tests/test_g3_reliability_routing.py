@@ -288,11 +288,27 @@ class TestLimitedModelApiFallbackRouting(_IsolatedState):
         }
         with patch("makewand.config.get_active_providers", return_value=pool), \
              patch("makewand.config.has_api_configured", side_effect=lambda e: e == "claude"), \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": "allow_paid"}), \
              patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
             coders, reviewers, meta = select_optimal_engine_pair("编写Python脚本", tier="standard", cache=cache)
             # Claude base score is 2.0. With api_ok and limited, it should be 2.0 - 1.0 = 1.0 > 0, not -999
             self.assertIn("claude", coders)
             self.assertGreater(meta["scores"]["claude"], 0.0)
+
+    def test_limited_model_with_a_key_the_api_policy_forbids_is_excluded(self):
+        # The adapter relays only when the policy allows paid calls (api-policy-relay).
+        pool = ["claude", "codex"]
+        cache = {
+            "claude": {"status": "limited", "updated_at": datetime.now().isoformat()},
+            "codex": {"status": "healthy", "updated_at": datetime.now().isoformat()},
+        }
+        with patch("makewand.config.get_active_providers", return_value=pool), \
+             patch("makewand.config.has_api_configured", side_effect=lambda e: e == "claude"), \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": "subscription_only"}), \
+             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
+            coders, reviewers, meta = select_optimal_engine_pair("编写Python脚本", tier="standard", cache=cache)
+            self.assertNotIn("claude", coders)
+            self.assertEqual(meta["scores"]["claude"], -999.0)
 
     def test_limited_model_without_api_is_excluded(self):
         pool = ["claude", "codex"]

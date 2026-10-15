@@ -215,7 +215,7 @@ def _make_roots(home, name):
     for root_rel, rel in PROVIDER_PROFILES[name].get("credentials", []):
         p = home / root_rel / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text('{"tok": "host"}')
+        p.write_text('{"access_token": "host", "refresh_token": "r"}')
         os.chmod(p, 0o600)
     for root_rel, sub, kind, _ in PROVIDER_PROFILES[name].get("protected", [])[:2]:
         p = home / root_rel / sub
@@ -273,11 +273,11 @@ class TestH3CredentialWriteBack(unittest.TestCase):
         with fake_home() as home:
             h = self._home(home)
             priv, host = self._private(h, "auth.json")
-            self.assertEqual(priv.read_text(), '{"tok": "host"}')
+            self.assertEqual(priv.read_text(), '{"access_token": "host", "refresh_token": "r"}')
             self.assertEqual(stat.S_IMODE(priv.stat().st_mode), 0o600)
-            priv.write_text('{"tok": "refreshed"}')
+            priv.write_text('{"access_token": "refreshed", "refresh_token": "r"}')
             h.finalize()
-            self.assertEqual(host.read_text(), '{"tok": "refreshed"}')
+            self.assertEqual(host.read_text(), '{"access_token": "refreshed", "refresh_token": "r"}')
             self.assertFalse(host.is_symlink())
             self.assertEqual(stat.S_IMODE(host.stat().st_mode), 0o600)
 
@@ -295,30 +295,32 @@ class TestH3CredentialWriteBack(unittest.TestCase):
                 self.assertFalse((home / ".codex" / rel).exists(), rel)
             self.assertFalse(priv_root.exists())
 
+    # The symlink targets below hold valid refreshes the merge would accept, so
+    # only refusing the symlink keeps the host copy.
     def test_symlinked_private_credential_is_not_followed(self):
         with fake_home() as home:
             secret = home / "host-secret"
-            secret.write_text("SECRET")
+            secret.write_text('{"access_token": "followed", "refresh_token": "r"}')
             h = self._home(home)
             priv, host = self._private(h, "auth.json")
             priv.unlink()
             priv.symlink_to(secret)
             h.finalize()
-            self.assertEqual(host.read_text(), '{"tok": "host"}')
+            self.assertEqual(host.read_text(), '{"access_token": "host", "refresh_token": "r"}')
             self.assertFalse(host.is_symlink())
-            self.assertEqual(secret.read_text(), "SECRET")
+            self.assertEqual(secret.read_text(), '{"access_token": "followed", "refresh_token": "r"}')
 
     def test_symlinked_private_parent_directory_is_not_followed(self):
         with fake_home() as home:
             outside = home / "outside"
             outside.mkdir()
-            (outside / "antigravity-oauth-token").write_text("ATTACKER")
+            (outside / "antigravity-oauth-token").write_text('{"access_token": "followed", "refresh_token": "r"}')
             h = self._home(home, "agy")
             priv, host = self._private(h, "antigravity-cli/antigravity-oauth-token")
             shutil.rmtree(priv.parent)
             priv.parent.symlink_to(outside, target_is_directory=True)
             h.finalize()
-            self.assertEqual(host.read_text(), '{"tok": "host"}')
+            self.assertEqual(host.read_text(), '{"access_token": "host", "refresh_token": "r"}')
 
     def test_non_regular_private_credential_is_skipped(self):
         with fake_home() as home:
@@ -327,16 +329,16 @@ class TestH3CredentialWriteBack(unittest.TestCase):
             priv.unlink()
             priv.mkdir()
             h.finalize()
-            self.assertEqual(host.read_text(), '{"tok": "host"}')
+            self.assertEqual(host.read_text(), '{"access_token": "host", "refresh_token": "r"}')
 
     def test_write_back_skipped_when_host_copy_changed_concurrently(self):
         with fake_home() as home:
             h = self._home(home)
             priv, host = self._private(h, "auth.json")
-            priv.write_text('{"tok": "sandbox"}')
-            host.write_text('{"tok": "other-session"}')
+            priv.write_text('{"access_token": "sandbox", "refresh_token": "r"}')
+            host.write_text('{"access_token": "other-session", "refresh_token": "r"}')
             h.finalize()
-            self.assertEqual(host.read_text(), '{"tok": "other-session"}')
+            self.assertEqual(host.read_text(), '{"access_token": "other-session", "refresh_token": "r"}')
 
     def test_unchanged_credential_is_not_rewritten(self):
         with fake_home() as home:
@@ -345,7 +347,7 @@ class TestH3CredentialWriteBack(unittest.TestCase):
             with patch("makewand.sandbox._atomic_write_host") as writer:
                 h.finalize()
             writer.assert_not_called()
-            self.assertEqual(host.read_text(), '{"tok": "host"}')
+            self.assertEqual(host.read_text(), '{"access_token": "host", "refresh_token": "r"}')
 
 
 # ---------------------------------------------------------------------------

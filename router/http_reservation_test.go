@@ -82,7 +82,7 @@ func TestHTTPReservationUSDUsesFloorWhenUnpriced(t *testing.T) {
 
 func TestHTTPReservationUSDScalesWithMaxTokensPricingAndEnsembleFanout(t *testing.T) {
 	r := reservationRouter(AccessAPI, &reservationStreamProvider{name: "claude"})
-	price, ok := r.httpPriceCeiling("")
+	price, ok := r.httpPriceCeiling()
 	if !ok {
 		t.Fatal("API claude provider has no priced model in defaults")
 	}

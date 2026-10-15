@@ -8,6 +8,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,8 @@ from makewand.workflow import provider_outcome
 
 
 ENGINES = ("claude", "codex", "grok", "muse", "agy", "aider")
+# A CLI's own quota rejection: Muse Code prints its failures only as "<kind> (HTTP <status> · attempt <n>)".
+QUOTA_REJECTION = {"muse": "rate limited (HTTP 429 · attempt 2)"}
 
 
 class ProviderOutcomeTests(unittest.TestCase):
@@ -89,7 +92,8 @@ class ProviderOutcomeTests(unittest.TestCase):
 
     def test_explicit_quota_rejection_remains_known(self):
         for engine in ENGINES[:-1]:
-            with self.subTest(engine=engine), self.adapter(engine, (1, "", "HTTP 429 Too Many Requests", None)) as (execute, process, api):
+            rejection = QUOTA_REJECTION.get(engine, "HTTP 429 Too Many Requests")
+            with self.subTest(engine=engine), self.adapter(engine, (1, "", rejection, None)) as (execute, process, api):
                 result = execute("Review fixture", cwd=self.directory, readonly=True)
                 self.assertFalse(result[0])
                 self.assertEqual(getattr(provider_outcome(result), "status", "FAILED"), "FAILED")
@@ -99,9 +103,11 @@ class ProviderOutcomeTests(unittest.TestCase):
     def test_api_modes_keep_typed_outcome_and_readonly_role(self):
         for engine in ENGINES[:-1]:
             for mode in ("missing", "cached", "quota"):
-                raw = (1, "", "HTTP 429 Too Many Requests", None)
+                raw = (1, "", QUOTA_REJECTION.get(engine, "HTTP 429 Too Many Requests"), None)
                 typed = ExecutionResult(False, "partial", "transport disconnected", status="UNKNOWN", outcome_known=False)
+                # The adapters relay only when the API policy allows paid calls (api-policy-relay).
                 with self.subTest(engine=engine, mode=mode), self.adapter(engine, raw) as (execute, process, api), \
+                        patch.dict(os.environ, {"MAKEWAND_API_POLICY": "allow_paid"}), \
                         patch("makewand.config.has_subscription_configured", return_value=mode != "missing"), \
                         patch("makewand.config.has_api_configured", return_value=True), \
                         patch("makewand.health.load_status_cache", return_value={engine: {"status": "limited"}} if mode == "cached" else {}):

@@ -475,7 +475,10 @@ func (r *Router) recordStreamAttemptError(ac *attemptContext, id attemptIdentity
 // observeStreamAttempt forwards a stream after its first meaningful chunk has
 // committed the route. Provider health is updated before the terminal chunk is
 // exposed to the consumer, so callers observing completion also observe the
-// corresponding breaker and usage state.
+// corresponding breaker and usage state. A stream that ends before its source
+// did (a cancellation or deadline, a consumer that stopped reading) ends only
+// once the source has, for as long as the provider needs (streamDrainWaitFor,
+// drainStreamSource).
 func (r *Router) observeStreamAttempt(
 	ac *attemptContext,
 	id attemptIdentity,
@@ -491,7 +494,14 @@ func (r *Router) observeStreamAttempt(
 	go func() {
 		defer close(out)
 		defer release()
-		defer attemptCancel()
+		drainWait := streamDrainWaitFor(id.provider)
+		sourceEnded := false // the source sent its terminal chunk or closed
+		defer func() {
+			attemptCancel()
+			if !sourceEnded {
+				drainStreamSource(source, drainWait)
+			}
+		}()
 
 		forward := func(chunk StreamChunk) bool {
 			timer := time.NewTimer(streamForwardTimeout)
@@ -511,11 +521,13 @@ func (r *Router) observeStreamAttempt(
 		chunk := first
 		for {
 			if chunk.Error != nil {
+				sourceEnded = true
 				r.recordStreamAttemptError(ac, id, start, chunk.Error)
 				_ = forward(chunk)
 				return
 			}
 			if chunk.Done {
+				sourceEnded = true
 				r.recordStreamAttemptSuccess(ac, id, start)
 				_ = forward(chunk)
 				return
@@ -527,6 +539,7 @@ func (r *Router) observeStreamAttempt(
 			select {
 			case next, ok := <-source:
 				if !ok {
+					sourceEnded = true
 					streamErr := fmt.Errorf("%s stream closed before completion", id.name)
 					if err := attemptCtx.Err(); err != nil {
 						streamErr = err
@@ -537,6 +550,8 @@ func (r *Router) observeStreamAttempt(
 				}
 				chunk = next
 			case <-attemptCtx.Done():
+				drainStreamSource(source, drainWait)
+				sourceEnded = true // or it never will within the bound
 				streamErr := attemptCtx.Err()
 				r.recordStreamAttemptError(ac, id, start, streamErr)
 				_ = forward(StreamChunk{Error: streamErr, Done: true})
@@ -675,6 +690,9 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 			// do not commit the route; keep waiting so a following error can fall back.
 		case <-attemptCtx.Done():
 			attemptCancel()
+			// The attempt ends, and a fallback starts, once the stream's
+			// source has ended (drainStreamSource).
+			drainStreamSource(ch, streamDrainWaitFor(id.provider))
 			streamErr = attemptCtx.Err()
 			r.recordStreamAttemptError(ac, id, start, streamErr)
 			return tryStreamResult{err: streamErr}

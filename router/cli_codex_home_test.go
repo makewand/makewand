@@ -347,12 +347,20 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 	}
 }
 
+// A review (read-only) session with an explicitly selected CODEX_HOME mounts
+// a writable per-run private copy of that account at its path (SQLite state
+// can be written there, and a token refresh made during the review is merged
+// back instead of being lost), never the host directory: the host auth.json
+// is not bound at all, config.toml stays a read-only bind of the host file,
+// the sibling accounts stay masked, and the host credential changes only
+// through the write-back merge (a logout is refused, a refresh is merged).
 func TestWrapCodexHomeReviewReadonlyTmpfsMountAndMultiAccountMasking(t *testing.T) {
-	oldLookup := cliBwrapLookup
-	t.Cleanup(func() { cliBwrapLookup = oldLookup })
-	cliBwrapLookup = func(string) (string, error) { return "/usr/bin/bwrap", nil }
+	if runtime.GOOS != "linux" {
+		t.Skip("private provider homes are part of the Linux bubblewrap mount plan")
+	}
+	auditFixMockBwrap(t)
 
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	home := filepath.Join(root, "home")
 	workspace := filepath.Join(root, "workspace")
 	for _, dir := range []string{home, workspace} {
@@ -365,7 +373,8 @@ func TestWrapCodexHomeReviewReadonlyTmpfsMountAndMultiAccountMasking(t *testing.
 		t.Fatal(err)
 	}
 	authPath := filepath.Join(selected, "auth.json")
-	if err := os.WriteFile(authPath, []byte(`{"token":"secret"}`), 0o600); err != nil {
+	const hostAuth = `{"tokens":{"access_token":"a1","refresh_token":"r1"}}`
+	if err := os.WriteFile(authPath, []byte(hostAuth), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	configPath := filepath.Join(selected, "config.toml")
@@ -382,34 +391,49 @@ func TestWrapCodexHomeReviewReadonlyTmpfsMountAndMultiAccountMasking(t *testing.
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command("codex", "exec")
-	cmd.Dir = workspace
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + home, "CODEX_HOME=" + selected}
-
 	// In review (read-only) mode:
-	ctx := ContextWithTask(context.Background(), TaskReview)
-	wrapped, err := wrapCLICommandWithSandbox(ctx, "codex", cmd)
-	if err != nil {
-		t.Fatal(err)
+	wrap := func() (*exec.Cmd, string) {
+		t.Helper()
+		cmd := exec.Command("codex", "exec")
+		cmd.Dir = workspace
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + home, "CODEX_HOME=" + selected}
+		wrapped, err := wrapCLICommandWithSandbox(ContextWithTask(context.Background(), TaskReview), "codex", cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return wrapped, filepath.Join(cliPrivateHomeSource(t, wrapped.Args, selected), "auth.json")
 	}
-
-	args := strings.Join(wrapped.Args, " ")
-	// 1. Selected codex home must be mounted with --tmpfs to allow SQLite WAL writes
-	if !strings.Contains(args, "--tmpfs "+selected) {
-		t.Fatalf("expected --tmpfs %s in wrapped args, got:\n%s", selected, args)
+	wrapped, priv := wrap()
+	args := wrapped.Args
+	// 1. The selected codex home is a writable private copy holding the credential.
+	if data, err := os.ReadFile(priv); err != nil || string(data) != hostAuth {
+		t.Fatalf("credential not copied into the private copy: %q %v", data, err)
 	}
-	// 2. Auth and config must be mounted with --ro-bind
-	if !strings.Contains(args, "--ro-bind "+authPath+" "+authPath) {
-		t.Fatalf("expected --ro-bind %s in wrapped args, got:\n%s", authPath, args)
+	r4NoHostPathBoundWritable(t, args, home)
+	// 2. The host auth.json is never bound; config stays a read-only bind.
+	for i := 0; i+2 < len(args); i++ {
+		if (args[i] == "--bind" || args[i] == "--ro-bind") && args[i+1] == authPath {
+			t.Fatalf("host credential %s bound into the sandbox: %v", authPath, args)
+		}
 	}
-	if !strings.Contains(args, "--ro-bind "+configPath+" "+configPath) {
-		t.Fatalf("expected --ro-bind %s in wrapped args, got:\n%s", configPath, args)
+	if !auditFixHasTriple(args, "--ro-bind", configPath, configPath) {
+		t.Fatalf("expected --ro-bind %s in wrapped args, got:\n%v", configPath, args)
 	}
 	// 3. Multi-home siblings .codex-2 and .codex-3 must be masked
-	if !strings.Contains(args, "--tmpfs "+codex2) {
-		t.Fatalf("expected unselected account %s to be masked with --tmpfs, got:\n%s", codex2, args)
+	for _, sibling := range []string{codex2, codex3} {
+		if !cliHasMount(args, "--tmpfs", sibling) {
+			t.Fatalf("expected unselected account %s to be masked with --tmpfs, got:\n%v", sibling, args)
+		}
 	}
-	if !strings.Contains(args, "--tmpfs "+codex3) {
-		t.Fatalf("expected unselected account %s to be masked with --tmpfs, got:\n%s", codex3, args)
+	// 4. The host credential changes only through the write-back merge.
+	warnings := r4SimulateSandboxRun(t, wrapped, func() { readonlyFixWrite(t, priv, `{}`) })
+	if data, _ := os.ReadFile(authPath); string(data) != hostAuth || len(warnings) != 1 {
+		t.Fatalf("a logout in the review reached the host or was not reported: %q %q", data, warnings)
+	}
+	const refreshed = `{"tokens":{"access_token":"a2","refresh_token":"r2"}}`
+	wrapped, priv = wrap()
+	warnings = r4SimulateSandboxRun(t, wrapped, func() { readonlyFixWrite(t, priv, refreshed) })
+	if data, _ := os.ReadFile(authPath); string(data) != refreshed || len(warnings) != 0 {
+		t.Fatalf("a refresh made during the review was not merged into the host: %q %q", data, warnings)
 	}
 }

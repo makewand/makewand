@@ -23,6 +23,11 @@ import makewand.git_helper as git_helper
 import makewand.orchestrator as orch
 from makewand.git_helper import run_git_cmd
 
+try:
+    from _verdicts import nonced
+except ImportError:  # python3 -m unittest tests.<module>
+    from tests._verdicts import nonced
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QUESTION = "这个项目支持 Windows 吗？"
 
@@ -116,7 +121,7 @@ class PipelineHarness(unittest.TestCase):
             if readonly:
                 verdict = "true" if review_pass else "false"
                 defects = "[]" if review_pass else '["rejected"]'
-                return True, f'MAKEWAND_VERDICT: {{"pass": {verdict}, "defects": {defects}}}', None
+                return True, nonced(prompt_text, f'MAKEWAND_VERDICT: {{"pass": {verdict}, "defects": {defects}}}'), None
             return coder(Path(cwd))
 
         route = route or (["codex"], ["claude"], {"primary_coder": "codex", "primary_reviewer": "claude", "reasons": []})

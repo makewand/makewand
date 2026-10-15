@@ -38,7 +38,7 @@ class TestEnsemble(unittest.TestCase):
 
     @patch("makewand.ensemble.is_provider_enabled", return_value=True)
     @patch("makewand.ensemble.has_subscription_configured", return_value=True)
-    @patch("makewand.ensemble.has_api_configured", return_value=False)
+    @patch("makewand.config.has_api_configured", return_value=False)
     @patch("makewand.health.load_status_cache", return_value={})
     def test_resolve_ensemble_providers_default(self, mock_cache, mock_api, mock_sub, mock_enabled):
         providers = resolve_ensemble_providers()
@@ -46,7 +46,7 @@ class TestEnsemble(unittest.TestCase):
 
     @patch("makewand.ensemble.is_provider_enabled", return_value=True)
     @patch("makewand.ensemble.has_subscription_configured", return_value=True)
-    @patch("makewand.ensemble.has_api_configured", return_value=False)
+    @patch("makewand.config.has_api_configured", return_value=False)
     @patch("makewand.health.load_status_cache", return_value={})
     def test_resolve_ensemble_providers_custom_and_aliases(self, mock_cache, mock_api, mock_sub, mock_enabled):
         # Comma-separated string
@@ -63,7 +63,7 @@ class TestEnsemble(unittest.TestCase):
 
     @patch("makewand.ensemble.is_provider_enabled")
     @patch("makewand.ensemble.has_subscription_configured")
-    @patch("makewand.ensemble.has_api_configured", return_value=False)
+    @patch("makewand.config.has_api_configured", return_value=False)
     @patch("makewand.health.load_status_cache")
     def test_resolve_ensemble_providers_skips_disabled_and_limited(
         self, mock_cache, mock_api, mock_sub, mock_enabled
@@ -77,12 +77,18 @@ class TestEnsemble(unittest.TestCase):
 
     @patch("makewand.ensemble.is_provider_enabled", return_value=False)
     @patch("makewand.ensemble.has_subscription_configured", return_value=False)
-    @patch("makewand.ensemble.has_api_configured", return_value=False)
+    @patch("makewand.config.has_api_configured", return_value=False)
     @patch("makewand.health.load_status_cache", return_value={})
     def test_resolve_ensemble_providers_fallback(self, mock_cache, mock_api, mock_sub, mock_enabled):
-        # All disabled and unconfigured -> falls back to local
-        providers = resolve_ensemble_providers()
-        self.assertEqual(providers, ["local"])
+        # All disabled and unconfigured (local too) -> nothing can run, nothing is dispatched
+        unavailable = {}
+        providers = resolve_ensemble_providers(unavailable=unavailable)
+        self.assertEqual(providers, [])
+        self.assertIn("local", unavailable)
+        # An enabled, answering local model is still the fallback
+        mock_enabled.side_effect = lambda p: p == "local"
+        with patch("makewand.providers.local.is_local_model_available", return_value=(True, "", ["qwen2.5-coder"])):
+            self.assertEqual(resolve_ensemble_providers(), ["local"])
 
     def test_extract_summary_bullet_empty(self):
         self.assertEqual(extract_summary_bullet(""), "无输出")

@@ -4,82 +4,130 @@ Antigravity CLI provider adapter (Google AI Pro / Gemini 3.8 Flash & Pro).
 
 import os
 import re
+from functools import lru_cache
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_GREEN
-from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 from makewand.workflow import provider_outcome
 
-# Rate limiting must be recognised from its *context*, never from a bare "429"
-# (line counts, PIDs, hashes and test totals routinely contain 429). Aligned
-# with the codex/claude parsers.
-_AGY_RATE_LIMIT_RE = re.compile(
-    r"\b(?:"
-    r"resource[_\s]?exhausted"
-    r"|quota\s*exceeded"
-    r"|rate[\s_-]*limit(?:ed|\s+exceeded)?"
-    r"|too\s*many\s*requests"
-    r"|429\s+too\s*many"
-    r"|http(?:/[\d.]+)?\s+429"
-    r"|status(?:\s*code)?\s*[:=]?\s*429"
-    r"|code\s*[:=]\s*429"
-    r")\b"
-)
-
-_AGY_REGION_RE = re.compile(
-    r"not\s+(?:currently\s+)?(?:available|supported)\s+in\s+your\s+(?:location|region|country)"
-    r"|(?:user\s+)?location\s+is\s+not\s+supported"
-    r"|unsupported\s+(?:location|region|country)"
-    r"|not\s+available\s+in\s+your\s+(?:area|territory)"
-)
-
-_AGY_AUTH_RE = re.compile(
-    r"\bunauthenticated\b"
-    r"|authentication\s+(?:required|failed)"
-    r"|not\s+(?:logged|signed)\s+in"
-    r"|please\s+(?:log|sign)\s*in"
-    r"|login\s+required"
-    r"|invalid[_\s](?:credentials|grant|api[_\s]key)"
-    r"|(?:oauth|access)\s+token\s+(?:has\s+)?expired"
-    r"|\b401\s+unauthorized\b"
-)
-
-
-# agy writes glog diagnostics to stderr ("I1012 08:11:57.843790  1 file.go:403] ...").
-# Every start logs "You are not logged into Antigravity" before silent keyring
-# auth succeeds, and transient retries may log 429s, so these lines must not
-# drive provider-health classification.
-_AGY_GLOG_LINE_RE = re.compile(r"^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\S+:\d+\]")
-# Argument rejections such as: error: invalid model selection (--model "gemini-3.1-pro"
-# --effort "max"): gemini-3.1-pro has no "max" effort (available: low, high)
-_AGY_INVALID_INVOCATION_RE = re.compile(
-    r"invalid model selection|unknown (?:flag|option|shorthand flag)|has no \"[^\"]+\" effort",
-    re.IGNORECASE)
+# Quota, region and login failures count only where agy prints them itself: one
+# of agy's messages (health.CLI_MESSAGE_CATALOG["agy"]) on its own lines, which
+# are stderr when the streams are captured apart (stdout carries the answer);
+# in a merged stream only the error report agy ends with counts. The glog
+# diagnostics agy writes to stderr ("I1012 08:11:57.843790  1 file.go:403]
+# ...", entries may continue over lines) are never a verdict: every start logs
+# "You are not logged into Antigravity" before silent keyring auth succeeds,
+# and transient retries log 429s.
+#
+# agy's own status lines, notices and argument rejections are catalog data too
+# (cli_message_catalog.json providers.agy, format strings of the agy binary):
+# every read-only dispatch passes --mode plan with --disable-slash-commands, so
+# agy may warn about either before it works.
 _AGY_AUTH_OK_RE = re.compile(r"authenticated (?:successfully|via )", re.IGNORECASE)
+# The pre-authentication notice every start prints; moot once silent auth succeeded.
+_AGY_STARTUP_AUTH_NOTICE_RE = re.compile(
+    r"^(?:you are not logged into antigravity\.?|print mode: not authenticated, trying silent auth)$", re.IGNORECASE)
+
+
+@lru_cache(maxsize=None)
+def _agy_catalog_regex(key: str):
+    """One of catalog providers.agy's line lists as a single regex (None when empty)."""
+    from makewand.health import cli_catalog_entry, cli_catalog_regex
+    value = cli_catalog_entry("agy").get(key) or ()
+    patterns = (value,) if isinstance(value, str) else tuple(value)
+    return cli_catalog_regex("|".join("(?:%s)" % pattern for pattern in patterns)) if patterns else None
+
+
+def _agy_catalog_match(key: str, line: str) -> bool:
+    regex = _agy_catalog_regex(key)
+    return bool(regex is not None and regex.match(line))
+
+
+def _agy_own_line(raw: str, *, any_warning: bool = False) -> bool:
+    """A status line or notice agy prints itself (neither answer nor error).
+
+    With `any_warning` every "warning: ..." line counts too (agy has generic
+    "warning: %s" formats); only for agy's own lines, never for the answer.
+    """
+    from makewand.health import normalize_cli_line
+    line = normalize_cli_line(raw)
+    return (_agy_catalog_match("status_lines", line) or _agy_catalog_match("notices", line)
+            or (any_warning and _agy_catalog_match("generic_notice", line)))
 
 
 def _agy_user_facing(output: str) -> str:
-    return "\n".join(ln for ln in (output or "").splitlines() if not _AGY_GLOG_LINE_RE.match(ln.lstrip()))
+    """agy's output without its diagnostics: glog entries (with their continuation
+    lines), status lines and notices (any "warning: ..." line), ANSI stripped."""
+    from makewand.health import glog_entry_lines, _ANSI_ESCAPE_RE
+    lines = (output or "").splitlines()
+    skipped = glog_entry_lines(lines)
+    kept = [_ANSI_ESCAPE_RE.sub("", raw).rstrip() for index, raw in enumerate(lines)
+            if index not in skipped and not _agy_own_line(raw, any_warning=True)]
+    return "\n".join(kept).strip("\n")
 
 
-def parse_agy_quota(output: str) -> Tuple[bool, str, Optional[str]]:
-    lower = _agy_user_facing(output).lower()
-    if _AGY_RATE_LIMIT_RE.search(lower):
+def _agy_invocation_rejection(own: str) -> Optional[str]:
+    """agy's argument rejection, if it is agy's first own line (`own` from _agy_user_facing).
+
+    agy rejects its arguments before it runs anything: error: invalid model
+    selection (--model "gemini-3.1-pro" --effort "max"): gemini-3.1-pro has no
+    "max" effort (available: low, high), or cobra's "Error: unknown flag:
+    --effort". The same words in the answer or in a tool's output ("tar: unknown
+    option", "Error: unknown flag: --json -- ...") are not an invocation error.
+    """
+    from makewand.health import normalize_cli_line
+    first = normalize_cli_line(next((line for line in (own or "").splitlines() if line.strip()), ""))
+    return first if _agy_catalog_match("invalid_invocation", first) else None
+
+
+def _agy_stream_answer(output: str) -> str:
+    """The answer in agy's merged stream-mode output (stderr merged into stdout).
+
+    Only lines agy writes itself are removed, by their exact shape: glog
+    headers with the JSON body or the one value line they log, status lines and
+    agy's notices. Everything else stays as printed, including the model's code
+    right after a log line and its own "Warning: ..." prose.
+    """
+    from makewand.health import glog_entry_lines
+    lines = (output or "").splitlines()
+    skipped = glog_entry_lines(lines, continuation="value")
+    return "\n".join(raw for index, raw in enumerate(lines) if index not in skipped and not _agy_own_line(raw))
+
+
+def parse_agy_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
+    """Quota refusals agy prints itself; `stderr` is passed when the streams were captured apart."""
+    from makewand.health import find_cli_message
+    if find_cli_message("agy", ("quota",), output, stderr) is not None:
         return True, "Google AI 配额暂时耗尽", "待重置"
     return False, "", None
 
 
-def classify_agy_failure(output: str) -> Optional[Tuple[str, str, Optional[float]]]:
+def _without_startup_notice(text: Optional[str]) -> Optional[str]:
+    from makewand.health import normalize_cli_line
+    if text is None:
+        return None
+    return "\n".join(line for line in text.splitlines()
+                     if not _AGY_STARTUP_AUTH_NOTICE_RE.match(normalize_cli_line(line)))
+
+
+def classify_agy_failure(output: str, stderr: Optional[str] = None) -> Optional[Tuple[str, str, Optional[float]]]:
     """
     Classifies a non-quota agy failure that says something about the provider
     itself (not about the task). Returns (status, reason, ttl_seconds) or None.
+    `stderr` is passed when the streams were captured apart.
     """
-    lower = _agy_user_facing(output).lower()
-    if _AGY_REGION_RE.search(lower):
+    from makewand.health import find_cli_messages, cli_own_output
+    if _AGY_AUTH_OK_RE.search(cli_own_output("agy", output, stderr)):
+        # Only the start-up notice is moot once silent authentication succeeded;
+        # a backend rejection after the keyring load still is a login failure.
+        output, stderr = _without_startup_notice(output), _without_startup_notice(stderr)
+    found = find_cli_messages("agy", ("region", "auth"), output, stderr)
+    if "region" in found:
         from makewand.health import REGION_BLOCK_TTL_SECONDS
         return ("error",
                 "Antigravity 在当前地区/账号不可用 (真实派发返回地区限制)，暂停派发并在有效期后自动复查",
                 REGION_BLOCK_TTL_SECONDS)
-    if _AGY_AUTH_RE.search(lower) and not _AGY_AUTH_OK_RE.search(output or ""):
+    if "auth" in found:
         from makewand.health import get_reauth_hint
         return "needs_auth", f"Antigravity 认证失败 (真实派发) · {get_reauth_hint('agy')}", None
     return None
@@ -209,6 +257,7 @@ def execute_agy_task(
                     print_prefix=c("[AGY Live]", COLOR_GREEN),
                     pass_fds=launch.pass_fds,
                     extra_env=launch.env,
+                    separate_stderr=True,
                 )
         except SandboxUnavailableError as exc:
             return False, None, str(exc)
@@ -226,32 +275,36 @@ def execute_agy_task(
                 shutil.rmtree(p_dir, ignore_errors=True)
             except Exception:
                 pass
-    combined = f"{out}\n{err}" if not stream else out
+    # agy's own lines: stderr, or the merged stream when the runner merged stderr into stdout.
+    apart = stderr_captured_apart(err, stream)
+    combined = f"{out}\n{err}" if apart else out
+    own_err = err if apart else None
 
     if code == 0:
-        cleaned_out = out.strip() if out else ""
-        if cleaned_out:
-            return True, cleaned_out, None
-        cleaned_err = err.strip() if err else ""
-        if cleaned_err and not any(k in cleaned_err.lower() for k in ["error", "fatal", "timed out"]):
-            return True, cleaned_err, None
+        # The answer is stdout as printed (a merged stream without the lines agy
+        # writes itself); stderr never is. A run without an answer failed, and
+        # so did a merged stream left with nothing but agy's own notices: its
+        # generic "Warning: ..." lines cannot be told from the answer's there,
+        # so they stay in an answer but never are one.
+        answer = ((out if apart else _agy_stream_answer(out)) or "").strip()
+        if answer and (apart or _agy_user_facing(answer).strip()):
+            return True, answer, None
         return False, None, "Antigravity 执行完成但未能产生有效输出内容"
 
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("agy", code, combined, err, ex, readonly)
 
-    invalid = _AGY_INVALID_INVOCATION_RE.search(_agy_user_facing(combined))
-    if invalid:
+    rejection = _agy_invocation_rejection(_agy_user_facing(err if apart else out))
+    if rejection:
         # The CLI rejected its arguments before running anything: a known,
         # side-effect-free failure, so the caller may try the next provider.
         from makewand.execution_contract import ExecutionResult
-        line = next((ln.strip() for ln in _agy_user_facing(combined).splitlines() if invalid.group(0) in ln), invalid.group(0))
-        return ExecutionResult(False, combined, f"Antigravity 拒绝调用参数: {line}", status="FAILED", engine="agy",
+        return ExecutionResult(False, combined, f"Antigravity 拒绝调用参数: {rejection}", status="FAILED", engine="agy",
                                readonly=readonly, outcome_known=True, error_kind="provider_configuration")
 
-    is_limited, reason, resets_at = parse_agy_quota(combined)
+    is_limited, reason, resets_at = parse_agy_quota(out, own_err)
     if not is_limited:
-        failure = classify_agy_failure(combined)
+        failure = classify_agy_failure(out, own_err)
         if failure:
             status, fail_reason, ttl = failure
             from makewand.health import record_engine_failure

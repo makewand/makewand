@@ -25,13 +25,30 @@ NOT_RATE_LIMITS = [
     "test_rate_limit_middleware passed",
 ]
 
-RATE_LIMITS = [
-    "Error: 429 Too Many Requests",
-    "HTTP 429",
-    "status code: 429",
-    "google.api_core.exceptions.ResourceExhausted: RESOURCE_EXHAUSTED",
-    "rate limit exceeded, retry later",
-    "Too many requests",
+# Each CLI's own refusals (strings of the installed binaries, see
+# health.CLI_MESSAGE_CATALOG). A generic "Too many requests" or "status code: 429"
+# line is no longer enough: it is just as likely tool output relayed into the
+# transcript (tests/test_fix_health_quota_noise.py). A Python
+# "google.api_core.exceptions.ResourceExhausted" traceback line is tool output too:
+# agy and grok are not Python programs.
+AGY_LIMITS = [
+    "Error: RESOURCE_EXHAUSTED: Resource has been exhausted (e.g. check quota).",
+    "Error: You have exhausted your quota on this model.",
+    "Error: rpc error: code = ResourceExhausted desc = Resource has been exhausted (e.g. check quota).",
+    "Error: googleapi: Error 429: Quota exceeded for quota metric 'Generate Content API requests per minute', "
+    "rateLimitExceeded",
+    "Quota exceeded for aiplatform.googleapis.com",
+    "HTTP 429 Too Many Requests",
+]
+GROK_LIMITS = [
+    "API error (status 429): You\u2019ve hit your team\u2019s API rate limit. Ask a team admin to purchase more credits "
+    "for higher limits, or try again later.",
+    "Error: API error (status 429): request rejected",
+    "Error: You\u2019ve reached your free Grok Build usage limit for now. Get SuperGrok for much higher limits, or try "
+    "again later: https://grok.com/supergrok?referrer=grok-build",
+    "You hit your free usage limit.",
+    "Error: failed after 3 retries: request error: Rate limited (429)",
+    "HTTP 429 Too Many Requests",
 ]
 
 
@@ -42,7 +59,7 @@ class TestContextAnchored429(unittest.TestCase):
                 self.assertFalse(parse_agy_quota(text)[0])
 
     def test_agy_detects_real_limits(self):
-        for text in RATE_LIMITS + ["Quota exceeded for aiplatform.googleapis.com"]:
+        for text in AGY_LIMITS:
             with self.subTest(text=text):
                 self.assertTrue(parse_agy_quota(text)[0])
 
@@ -52,12 +69,13 @@ class TestContextAnchored429(unittest.TestCase):
                 self.assertFalse(parse_grok_quota(text)[0])
 
     def test_grok_detects_real_limits_and_auth(self):
-        for text in RATE_LIMITS + ["usage limit reached"]:
+        for text in GROK_LIMITS:
             with self.subTest(text=text):
                 limited, reason, _ = parse_grok_quota(text)
                 self.assertTrue(limited)
                 self.assertNotIn("登录", reason)
-        for text in ("Error: 401 Unauthorized", "missing xAI credentials", "login required"):
+        for text in ("Unauthorized (401)", "missing xAI credentials",
+                     "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml."):
             with self.subTest(text=text):
                 self.assertEqual(parse_grok_quota(text)[2], "需登录授权")
 
@@ -82,8 +100,8 @@ class TestAgyFailureClassification(unittest.TestCase):
     def test_agy_argument_rejection_is_recognized(self):
         msg = ('error: invalid model selection (--model "gemini-3.1-pro" --effort "max"): '
                'gemini-3.1-pro has no "max" effort (available: low, high)')
-        self.assertTrue(agy._AGY_INVALID_INVOCATION_RE.search(agy._agy_user_facing(msg)))
-        self.assertIsNone(agy._AGY_INVALID_INVOCATION_RE.search("AssertionError: expected 3 got 4"))
+        self.assertTrue(agy._agy_invocation_rejection(agy._agy_user_facing(msg)))
+        self.assertIsNone(agy._agy_invocation_rejection("AssertionError: expected 3 got 4"))
 
     def test_agy_startup_glog_is_not_an_auth_failure(self):
         # Every agy start logs this before silent keyring auth succeeds; a task
@@ -97,7 +115,7 @@ class TestAgyFailureClassification(unittest.TestCase):
         )
         self.assertIsNone(agy.classify_agy_failure(stderr))
         self.assertFalse(parse_agy_quota(stderr)[0])
-        self.assertEqual(agy.classify_agy_failure("Error: You are not logged in. Run agy to sign in.")[0], "needs_auth")
+        self.assertEqual(agy.classify_agy_failure("Error: authentication required. Run 'agy' to log in.")[0], "needs_auth")
 
 
 if __name__ == "__main__":

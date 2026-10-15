@@ -14,20 +14,21 @@ import (
 // is the linchpin: claude/codex/agy all run as CLI providers, so if this path
 // doesn't classify, the entire confirmed-exhaustion hard-block tier is dead.
 func TestCLIQuotaErrorClassifiedAsRateLimit(t *testing.T) {
-	// Representative stderr strings a subscription CLI emits at its cap. The
-	// exact vendor wording is undocumented, so the matcher is broad; these cover
-	// the shapes we expect.
-	quotaMsgs := []string{
-		"Claude usage limit reached. Your limit resets at 3pm.",
-		"Error: rate limit exceeded",
-		"You've hit your weekly quota exceeded for this model",
-		"429 Too Many Requests",
-		"insufficient_quota",
+	// Representative stderr strings each subscription CLI emits at its cap (the
+	// catalog itself is exercised in cli_quota_hints_fix_test.go). Each CLI's
+	// own formats count only for that CLI.
+	quotaMsgs := []struct{ cli, msg string }{
+		{"claude", "Claude usage limit reached. Your limit resets at 3pm."},
+		{"claude", "Error: rate limit exceeded"},
+		{"claude", "You've hit your weekly limit · resets Oct 20, 8pm"},
+		{"codex", "ERROR: exceeded retry limit, last status: 429 Too Many Requests, request id: req_1"},
+		{"codex", "ERROR: Quota exceeded. Check your plan and billing details."},
+		{"gemini", "Error: You have exhausted your quota on this model."},
 	}
-	for _, msg := range quotaMsgs {
-		err := formatCLIExecutionError("claude", msg, errors.New("exit status 1"), nil, time.Second)
+	for _, tc := range quotaMsgs {
+		err := formatCLIExecutionError(tc.cli, tc.msg, errors.New("exit status 1"), nil, time.Second)
 		if got := ErrorKindOf(err); got != ErrorKindRateLimit {
-			t.Errorf("quota stderr %q → kind %q, want rate_limit", msg, got)
+			t.Errorf("%s quota stderr %q → kind %q, want rate_limit", tc.cli, tc.msg, got)
 		}
 	}
 	// A generic failure must NOT be misclassified as a quota error.

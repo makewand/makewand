@@ -15,8 +15,14 @@ the isolation once per process:
   ``MAKEWAND_DISABLE_*``, local model settings) are removed from the environment;
 * a stub directory is prepended to ``PATH``: every AI CLI stub records its argv
   and exits 127, so a test can never start a real, quota-consuming agent;
-* the local model endpoint points to an unreachable port and in-process
-  connections to the Ollama port or to any non-loopback address are refused.
+* proxy settings (``HTTP_PROXY``, ``HTTPS_PROXY``, ``ALL_PROXY``, ``NO_PROXY``
+  and their lower-case forms) are removed: a loopback proxy would carry a
+  request on to the real endpoint;
+* the local model endpoint points to an unreachable port, and in-process name
+  resolution of non-local hosts and connections to the Ollama port, to any
+  non-loopback address or to a loopback port that no socket of this process
+  has bound (a test's own fake server) fail with ``IsolationNetworkError``,
+  which is logged, echoed to stderr and summarised at the end of a pytest run.
 
 The real ``~/.config/makewand``, ``~/.gemini`` and fixed ``/tmp/makewand-*``
 paths are therefore never touched by tests, whichever entry point is used.
@@ -34,6 +40,7 @@ import socket
 import stat
 import sys
 import tempfile
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -57,6 +64,11 @@ LEGACY_ARTIFACTS_ROOT = Path("/tmp/makewand-artifacts")
 
 _SCRUB_SUFFIXES = ("_API_KEY", "_AUTH_TOKEN", "_BASE_URL", "_MODEL")
 _SCRUB_PREFIXES = ("MAKEWAND_", "LOCAL_MODEL_", "OLLAMA_", "CODEX_")
+# Proxy settings, compared upper-case: urllib and the provider CLIs honour both
+# cases. Every other "*_PROXY" variable (NODE_USE_ENV_PROXY, npm_config_proxy's
+# https twin, PIP_PROXY, GLOBAL_AGENT_HTTP_PROXY) goes too.
+PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "FTP_PROXY", "SOCKS_PROXY")
+_LOCAL_HOST_NAMES = ("localhost", "ip6-localhost", "ip6-loopback", "localhost.localdomain")
 # Repository redirection variables (set e.g. inside git hooks) would make the
 # fixture repositories created by tests operate on the caller's repository.
 _SCRUB_GIT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -80,8 +92,17 @@ def _inside(path, root) -> bool:
         return False
 
 
-def _scrub_environment() -> List[str]:
+def _scrub_proxies() -> List[str]:
     removed = []
+    for key in list(os.environ):
+        if key.upper() in PROXY_ENV_VARS or key.upper().endswith("_PROXY"):
+            os.environ.pop(key, None)
+            removed.append(key)
+    return removed
+
+
+def _scrub_environment() -> List[str]:
+    removed = _scrub_proxies()
     for key in list(os.environ):
         if key in _KEEP_MAKEWAND_ENV:
             continue
@@ -123,6 +144,27 @@ def _write_stubs(bin_dir: Path, log_file: Path) -> None:
         script.chmod(0o755)
 
 
+class IsolationNetworkError(ConnectionRefusedError):
+    """A connection the test isolation refused: tests never reach the network."""
+
+
+class IsolationResolutionError(socket.gaierror):
+    """A host name the test isolation refused to resolve: tests never reach the network."""
+
+
+# Sockets of this process bound to an inet port (a test's own fake servers), with their port.
+_BOUND_SOCKETS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _owned_ports() -> set:
+    return {port for sock, port in list(_BOUND_SOCKETS.items()) if sock.fileno() != -1}
+
+
+def _is_local_name(host: str) -> bool:
+    name = host.lower().rstrip(".")
+    return name in _LOCAL_HOST_NAMES or name.endswith(".localhost")
+
+
 def _address_block_reason(family, address) -> Optional[str]:
     if family not in (socket.AF_INET, getattr(socket, "AF_INET6", None)):
         return None
@@ -131,48 +173,94 @@ def _address_block_reason(family, address) -> Optional[str]:
     host, port = str(address[0]), address[1]
     if port in BLOCKED_PORTS:
         return f"local model port {port}"
-    if host in ("localhost", "ip6-localhost", "localhost.localdomain"):
+    if not _is_local_name(host):
+        try:
+            ip = ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            return f"unresolved host {host!r}"
+        if not ip.is_loopback:
+            return f"non-loopback address {host}"
+    if port not in _owned_ports():
+        # A loopback proxy (this host exports one) would carry the request on.
+        return f"loopback port {port} that no socket of this test process has bound"
+    return None
+
+
+def _resolution_block_reason(host) -> Optional[str]:
+    if host is None:
+        return None
+    name = host.decode("ascii", "replace") if isinstance(host, (bytes, bytearray)) else str(host)
+    if not name or _is_local_name(name) or name.lower() == socket.gethostname().lower():
         return None
     try:
-        ip = ipaddress.ip_address(host.split("%", 1)[0])
+        ipaddress.ip_address(name.split("%", 1)[0])
+        return None  # an address literal: connect() decides
     except ValueError:
-        return f"unresolved host {host!r}"
-    if ip.is_loopback:
-        return None
-    return f"non-loopback address {host}"
+        return f"name resolution of non-local host {name!r}"
 
 
 def _install_network_guard(log_file: Path) -> None:
-    """Refuse in-process connections to Ollama and to anything off the loopback."""
+    """Refuse in-process name resolution and connections that could leave the test.
+
+    Allowed: loopback ports bound by a socket of this process (a test's own
+    server). Refused, logged and echoed to stderr: the Ollama port, every other
+    loopback port (a local proxy), non-loopback addresses and non-local names.
+    """
     if getattr(socket.socket, "_makewand_isolation_guard", False):
         return
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
+    real_bind = socket.socket.bind
+    real_getaddrinfo = socket.getaddrinfo
 
-    def _record(address, reason):
+    def _refuse(target, reason):
         try:
             with open(log_file, "a", encoding="utf-8") as handle:
-                handle.write(f"{address!r} {reason}\n")
+                handle.write(f"{target!r} {reason}\n")
         except OSError:
             pass
+        stream = sys.__stderr__
+        if stream is not None:
+            try:
+                stream.write(f"makewand test isolation: blocked {target!r}: {reason}\n")
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+    def bind(sock, address):
+        result = real_bind(sock, address)
+        if sock.family in (socket.AF_INET, getattr(socket, "AF_INET6", None)):
+            try:
+                _BOUND_SOCKETS[sock] = sock.getsockname()[1]
+            except (OSError, TypeError, IndexError):
+                pass
+        return result
 
     def connect(sock, address):
         reason = _address_block_reason(sock.family, address)
         if reason:
-            _record(address, reason)
-            raise ConnectionRefusedError(errno.ECONNREFUSED,
-                                         f"blocked by makewand test isolation: {reason}")
+            _refuse(address, reason)
+            raise IsolationNetworkError(errno.ECONNREFUSED, f"blocked by makewand test isolation: {reason}")
         return real_connect(sock, address)
 
     def connect_ex(sock, address):
         reason = _address_block_reason(sock.family, address)
         if reason:
-            _record(address, reason)
+            _refuse(address, reason)
             return errno.ECONNREFUSED
         return real_connect_ex(sock, address)
 
+    def getaddrinfo(host, *args, **kwargs):
+        reason = _resolution_block_reason(host)
+        if reason:
+            _refuse(host, reason)
+            raise IsolationResolutionError(socket.EAI_NONAME, f"blocked by makewand test isolation: {reason}")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    socket.socket.bind = bind
     socket.socket.connect = connect
     socket.socket.connect_ex = connect_ex
+    socket.getaddrinfo = getaddrinfo
     socket.socket._makewand_isolation_guard = True
 
 
@@ -355,6 +443,8 @@ def activate() -> SimpleNamespace:
         atexit.register(_cleanup, root, os.getpid())
         _install_sigterm_cleanup(root, os.getpid())
     else:
+        # A child started with proxy settings of its own must not inherit a way out either.
+        state.scrubbed_env = _scrub_proxies()
         if "PYTHONUSERBASE" not in os.environ:
             os.environ["PYTHONUSERBASE"] = user_base
         if str(state.bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):

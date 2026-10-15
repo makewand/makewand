@@ -94,7 +94,11 @@ class Makewand < Formula
   def install
     bundle = File.exist?("makewand") ? Pathname.pwd : Pathname(Dir["*/makewand"].first).dirname
     libexec.install bundle/"makewand", bundle/"lib"
-    (bin/"makewand").write_env_script libexec/"makewand", PATH: "#{Formula["python@3.12"].opt_libexec}/bin:#{ENV["PATH"]}"
+    # Prepend only the engine's Python. The wrapper expands the caller's PATH
+    # when it runs (brew's sanitized build-time PATH would hide provider CLIs
+    # in ~/.local/bin, npm globals and HOMEBREW_PREFIX/bin), and an empty PATH
+    # never turns into a current-directory entry.
+    (bin/"makewand").write_env_script libexec/"makewand", PATH: "#{Formula["python@3.12"].opt_libexec}/bin\${PATH:+:\$PATH}"
   end
 
   test do

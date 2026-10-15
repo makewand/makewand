@@ -4,6 +4,8 @@ Verifies:
 1. Low-level contestant_scope and cancel_contestant fast SIGTERM process cancellation.
 2. makewand race Winner-Take-All: contestant A completes and passes verification gates,
    immediately sending SIGTERM cancellation to competing contestant B to save weekly quota.
+   The early winner is approved only after an independent read-only review by another
+   provider with a nonce-bound verdict (passing tests first never approves it by itself).
 3. Verification gate filtering: a contestant that completes first but fails the test gate
    does NOT cancel the competitor.
 """
@@ -14,6 +16,7 @@ except ImportError:
     from tests import _isolation  # noqa: F401
 
 import os
+import re
 import sys
 import time
 import subprocess
@@ -31,6 +34,12 @@ from makewand.providers.base import (
     run_subprocess,
     get_current_contestant_scope,
 )
+
+
+def nonce_bound_pass(prompt):
+    """A reviewer that approves with the verdict tag (and nonce) its prompt asked for."""
+    tag = re.search(r"MAKEWAND_VERDICT_[0-9a-f]+(?=:)", prompt)
+    return True, (tag.group(0) if tag else "MAKEWAND_VERDICT") + ': {"pass": true, "defects": []}', None
 
 
 class TestRaceWinnerTakeAll(unittest.TestCase):
@@ -87,10 +96,14 @@ class TestRaceWinnerTakeAll(unittest.TestCase):
         """
         candidates = self.root / "candidates"
         b_was_cancelled = threading.Event()
+        reviews = []
 
         def mock_provider(engine):
             def execute(prompt, **kwargs):
                 self.calls.append(engine)
+                if kwargs.get("readonly"):
+                    reviews.append((engine, prompt))
+                    return nonce_bound_pass(prompt)
                 ws = Path(kwargs["cwd"])
                 if engine == "claude":
                     # Fast candidate A: finishes quickly with valid code
@@ -134,6 +147,10 @@ class TestRaceWinnerTakeAll(unittest.TestCase):
             self.assertIsNotNone(race)
             self.assertEqual(race["winner"], "A")
             self.assertTrue(race["candidates"]["A"]["success"])
+            # The early winner was approved by a real cross-provider read-only review.
+            self.assertEqual([engine for engine, _ in reviews], ["codex"])
+            self.assertIn(race["candidates"]["A"]["diff"], reviews[0][1])
+            self.assertTrue(race["candidates"]["A"]["review_passed"])
 
     def test_failed_gate_does_not_cancel_competitor(self):
         """
@@ -149,8 +166,13 @@ class TestRaceWinnerTakeAll(unittest.TestCase):
             # If checking candidate B (wt_b): pass!
             return True, "Agent B test pass"
 
+        reviews = []
+
         def mock_provider(engine):
             def execute(prompt, **kwargs):
+                if kwargs.get("readonly"):
+                    reviews.append(engine)
+                    return nonce_bound_pass(prompt)
                 ws = Path(kwargs["cwd"])
                 if engine == "claude":
                     # A finishes fast but writes buggy code
@@ -181,8 +203,9 @@ class TestRaceWinnerTakeAll(unittest.TestCase):
             self.assertEqual(code, 0)
             race = CandidateManager.get_race()
             self.assertIsNotNone(race)
-            # B should have won because A failed tests
+            # B should have won because A failed tests, after B's independent review
             self.assertEqual(race["winner"], "B")
+            self.assertEqual(reviews, ["claude"])
             self.assertFalse(race["candidates"]["A"]["test_passed"])
             self.assertTrue(race["candidates"]["B"]["test_passed"])
 
@@ -200,6 +223,8 @@ class TestRaceWinnerTakeAll(unittest.TestCase):
 
         def mock_provider(engine):
             def execute(prompt, **kwargs):
+                if kwargs.get("readonly"):
+                    return nonce_bound_pass(prompt)
                 ws = Path(kwargs["cwd"])
                 if engine == "claude":
                     # Fast candidate A

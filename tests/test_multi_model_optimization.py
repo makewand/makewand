@@ -294,13 +294,16 @@ class TestUntrustedRepoSandboxEnforcement(unittest.TestCase):
 
     @patch("makewand.sandbox.is_bwrap_available", return_value=False)
     def test_untrusted_repo_fails_closed_in_orchestrator(self, mock_bwrap):
-        # run_pipeline in untrusted repo without bwrap must fail-closed immediately
-        res = run_pipeline("test task", cwd="/tmp", repo_trust="untrusted")
-        self.assertFalse(res)
+        # A private workspace: the shared temporary directory may hold the checkout under
+        # test, which the test harness refuses for a reason of its own.
+        with tempfile.TemporaryDirectory(prefix="makewand-untrusted-") as workspace:
+            # run_pipeline in untrusted repo without bwrap must fail-closed immediately
+            res = run_pipeline("test task", cwd=workspace, repo_trust="untrusted")
+            self.assertFalse(res)
 
-        # run_review in untrusted repo without bwrap must return EXIT_UNVERIFIED (11)
-        exit_code = run_review(cwd="/tmp", repo_trust="untrusted", output_json=True)
-        self.assertEqual(exit_code, 11)
+            # run_review in untrusted repo without bwrap must return EXIT_UNVERIFIED (11)
+            exit_code = run_review(cwd=workspace, repo_trust="untrusted", output_json=True)
+            self.assertEqual(exit_code, 11)
 
 
 class TestGrokProviderIntegration(unittest.TestCase):
@@ -323,12 +326,13 @@ class TestGrokProviderIntegration(unittest.TestCase):
     def _grok_cli_argument_construction(self, mock_run, ws):
         mock_run.return_value = (0, "Grok response", "", None)
 
-        # 1. Fast tier: grok-4.7-build-fast, effort low, readonly=True -> plan mode
+        # 1. Fast tier without a model cache: grok-4.7 (never the 2x-priced
+        # grok-4.7-build-fast variant), effort low, readonly=True -> plan mode
         ok, out, err = execute_grok_task("analyze problem", cwd=ws, tier="fast", readonly=True)
         self.assertTrue(ok)
         cmd_args = mock_run.call_args[0][0]
         self.assertIn("--model", cmd_args)
-        self.assertEqual(cmd_args[cmd_args.index("--model") + 1], "grok-4.7-build-fast")
+        self.assertEqual(cmd_args[cmd_args.index("--model") + 1], "grok-4.7")
         self.assertIn("--reasoning-effort", cmd_args)
         self.assertEqual(cmd_args[cmd_args.index("--reasoning-effort") + 1], "low")
         self.assertIn("--permission-mode", cmd_args)

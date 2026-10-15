@@ -1,8 +1,10 @@
 """Hybrid candidates bind complete merged text, test evidence and saved plans."""
 try:
     import _isolation  # noqa: F401
+    from _verdicts import nonced
 except ImportError:
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import nonced
 
 import tempfile
 import unittest
@@ -150,7 +152,7 @@ class HybridIntegrityTests(unittest.TestCase):
             if readonly:
                 if clock is not None:
                     clock[0] = 10.0
-                return True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None
+                return True, nonced(prompt, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}'), None
             path = Path(cwd)
             (path / "module.py").write_text("VALUE = " + (repr("x" * size) if size else "2") + "\n# VISIBLE_REVIEW_TAIL\n")
             if generated:
@@ -226,11 +228,12 @@ class HybridIntegrityTests(unittest.TestCase):
         self.assertIn("VISIBLE_REVIEW_TAIL", review_prompt)
 
     def test_oversized_race_diff_is_inspectable_without_judge_or_recommendation(self):
-        _, race, code = self._run_race_fixture(size=70 * 1024)
+        # The review cap is MAKEWAND_REVIEW_DIFF_MAX_BYTES (256 KiB by default).
+        _, race, code = self._run_race_fixture(size=orch.REVIEW_DIFF_MAX_BYTES_DEFAULT + 1024)
         self.assertEqual(code, 11)
         self.assertFalse(any(readonly for readonly, _, _ in self.race_calls))
         self.assertIsNone(race["winner"])
-        self.assertGreater(len(race["candidates"]["A"]["diff"].encode()), 64 * 1024)
+        self.assertGreater(len(race["candidates"]["A"]["diff"].encode()), orch.REVIEW_DIFF_MAX_BYTES_DEFAULT)
         self.assertFalse(race["candidates"]["A"]["review_passed"])
 
     def test_race_without_tests_never_marks_candidates_passed_or_applies_normally(self):
@@ -317,7 +320,7 @@ class HybridIntegrityTests(unittest.TestCase):
         captured = []
         def review(engine, prompt, **kwargs):
             captured.append(prompt)
-            return True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None
+            return True, nonced(prompt, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'), None
         with patch("makewand.orchestrator.dispatch_task", side_effect=review), patch("makewand.orchestrator.get_or_update_status", return_value={}), patch("makewand.orchestrator._engine_usable", return_value=(True, "")), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(review_saved_hybrid("hybrid"), 0)
         self.assertEqual(len(captured), 1, "committing candidate changes must not create an empty review")
@@ -346,7 +349,7 @@ class HybridIntegrityTests(unittest.TestCase):
         captured = []
         def review(engine, prompt, **kwargs):
             captured.append(prompt)
-            return True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}', None
+            return True, nonced(prompt, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'), None
         with patch("makewand.orchestrator.dispatch_task", side_effect=review), patch("makewand.orchestrator.get_or_update_status", return_value={}), patch("makewand.orchestrator._engine_usable", return_value=(True, "")), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(review_saved_hybrid("hybrid"), 0)
         self.assertIn("+VALUE = 3", captured[0])

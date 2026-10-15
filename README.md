@@ -15,9 +15,10 @@ curl -fsSL https://makewand.org/install.sh | bash
 
 - **🌐 官方网站与文档中心**：托管于 Cloudflare Pages 全球边缘网络（[makewand.org](https://makewand.org) / [makewand.com](https://makewand.com)），提供交互式终端模拟器与完整手册。
 - **🔌 全生态工具自适应拓扑**：根据已安装工具、显式启用配置和健康缓存选择实现与审查引擎。只有一个工具时使用单独的只读复审调用，仍需测试及有效裁决。
-- **💰 明确的 API 费用策略**：默认 `subscription_only`，禁止 Makewand 直接调用云 API，即使环境中已有 API key 也不会自动转为付费回退。设置 `MAKEWAND_API_POLICY=allow_paid` 或配置 `"api_policy": "allow_paid"` 才允许按量计费的 API 与回退；`makewand status` 展示当前策略。官方 CLI 自身的计费模式、订阅配额和本机资源消耗仍由相应工具及配置决定。
+- **💰 明确的 API 费用策略**：默认 `subscription_only`，禁止 Makewand 直接调用云 API，即使环境中已有 API key 也不会自动转为付费回退。设置 `MAKEWAND_API_POLICY=allow_paid` 或配置 `"api_policy": "allow_paid"` 才允许按量计费的 API 与回退；订阅 CLI 限额、登录失效或未安装时，也只有在 `allow_paid` 下才转用已配置的 API key，否则这类引擎不算可用。`makewand status` 展示当前策略。官方 CLI 自身的计费模式、订阅配额和本机资源消耗仍由相应工具及配置决定。
 - **⚡ 额度感知与自适应降级 (Quota-Aware Routing)**：
   - Python 状态看板使用缓存、本地调用估算和 CLI 报告，不将估算当成官方剩余额度；Go `quota` 提供支持工具的官方额度读取。
+  - 限额与登录失效只依据各 CLI 自己打印的消息判定（`makewand/cli_message_catalog.json`，Go 路由器内嵌同一份），模型回答、工具输出或提示回显中的相同字样不算。
   - 在已启用且可用的候选引擎间回退；额度、认证或审查失败可能阻止交付。
 - **🛡️ 跨模型独立红队审查 (Cross-Model Review)**：
   - 审查在只读沙箱中运行，优先采用与实现者不同的引擎。
@@ -88,9 +89,11 @@ cd path/to/makewand
 makewand status
 makewand quota
 
-# 显式发起探活（部分工具消耗真实订阅调用）
+# 显式发起探活（claude/codex/muse/grok 消耗真实订阅调用；agy 只在有未过期的失败记录或额度限制时做一次真实调用）
 makewand probe
 ```
+
+已启用的引擎都处于错误状态，或处于限额、需重新登录、未安装且没有 API 策略允许转用的 API key 时（默认的 `subscription_only` 下 key 从不转用），任何任务都不派发，并逐个列出原因（退出码 11）。用 `--provider X` 指定的引擎在工作区准备与任何派发之前先检查：不可用时同样不派发（退出码 11，`Requested engine X is not usable: <原因>`）；可用时即使其他引擎都不可用也会运行，审查请求则只由它审查。
 
 ### 2. 动态模型发现
 ```bash
@@ -115,11 +118,17 @@ makewand run "修复解析器" --protect tests/test_parser.py
 
 `--protect` 可重复指定相对路径，也适用于 `race` 和 `apply`。成功的受保护流水线提供带校验的 `apply_delivery.sh`；候选应用的 `--force` 不能绕过文件保护。详见 [执行约定](docs/EXECUTION_CONTRACT.md#protected-task-files)。
 
+宿主模式下，审查 diff 之外的改动——新建或改动被忽略的文件、二进制或可执行产物、`.env*`/`.envrc`/`*.pth`/`sitecustomize.py`、子模块或嵌套仓库中的文件、本检出（及其子模块）私有 hooks 目录中的新 hook——会阻止交付并回滚（退出码 11）；新 hook 移入 `rejected_*/quarantine/git-hooks/` 并附 `mv` 恢复命令，链接工作树等共享的 hooks 目录只报告。测试运行在工具默认位置生成的测试产物会被删除，不进入审查与交付。没有备份的既有文件（依赖与缓存目录、超过备份上限的文件）在任务开始时计算 SHA-256 摘要与抽样指纹，上限为 `MAKEWAND_FINGERPRINT_FILE_LIMIT`（单文件，默认 64 MiB）、`MAKEWAND_FINGERPRINT_TOTAL_LIMIT`（总量，默认 512 MiB）与 `MAKEWAND_FINGERPRINT_SECONDS`（默认 20 秒），交付核查与回滚核验同样受这些上限约束；内容无法确认的文件按“无法确认”阻断，并提示应调高哪个上限。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#python-host-mode-delivery)。
+
+`makewand plan "<目标>"` 把目标拆成 DAG 子任务。多阶段 DAG 在一份私有暂存副本中逐阶段执行，累积结果作为候选 `dg_…` 的 `A` 只交付一次：工作区安全时自动应用，否则给出确切的 `makewand apply` 命令；只读子任务审查此前的累积改动，其写入一律丢弃。原生 Windows 上多阶段 DAG 拒绝执行（请用 WSL2）。暂存区绑定的清单受 `MAKEWAND_WORKSPACE_SNAPSHOT_MAX_FILES`、`MAKEWAND_WORKSPACE_SNAPSHOT_MAX_BYTES`、`MAKEWAND_WORKSPACE_SNAPSHOT_TIMEOUT_SECS`（默认 100,000 个文件、512 MiB、每份 10 秒）约束，超限的仓库在复制任何内容之前即被拒绝（未验证，退出码 11），并提示超出的上限；未跟踪且被 gitignore 的文件（数据、日志等）不计入。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#multi-stage-dag-delivery)。
+
 ### 4. 独立代码审查
 ```bash
 # 针对当前目录未提交的 git diff 实施红队安全审查
 makewand review
 ```
+
+审查 diff 超过 256 KiB（用 `MAKEWAND_REVIEW_DIFF_MAX_BYTES` 调整，单位字节）时不做截断审查，结论为未验证（退出码 11），完整补丁保存为可直接 `git apply` 的 `unverified.patch`。超过 31 KiB 的审查提示不交给 agy（它只能分页读取提示文件），流水线改由下一位可用的审查方接替；cursor、copilot 等占位引擎从不审查；本地模型的只读回答须由 token 计数证明读到了完整提示，否则为未验证。详见 [执行约定](docs/EXECUTION_CONTRACT.md#reviewer-capacity)。
 
 ### 5. 双模型并发竞速模式
 ```bash
@@ -133,6 +142,8 @@ makewand merge <race-id>
 makewand review --race-id <race-id> --candidate M
 makewand apply <race-id> --candidate M
 ```
+
+claude、codex、grok、muse、local、agy 中任意两个不同的已启用且健康的引擎都可组成一对选手（agy 只要不处于已知失败状态），`run --workflow race --provider X` 指定 X 为选手 A；无法组队时列出每个引擎的原因。裁决行必须带本任务的随机 nonce（`MAKEWAND_RACE_VERDICT_<nonce>`），候选 diff 中回显的裁决行无效，不带 nonce 的裁决行在任何环境下都无效。率先通过测试的选手（Winner-Take-All）须经另一提供方的只读复审通过才算胜出；裁判选中与自己同一提供方的候选时，同样需要另一提供方复审。裁判与复审方都优先选择与双方选手都不同的提供方，复审方没有这样的选择时由另一位选手担任，从不是胜者自己。
 
 ### 6. 带预算安全搜索 (避免冷归档与大库 I/O 卡死)
 ```bash
@@ -148,6 +159,8 @@ makewand sandbox python3 -m pytest tests/
 makewand sandbox --no-net go test ./...
 ```
 > **跨平台隔离说明**：Bubblewrap 物理沙箱依赖 Linux 内核命名空间。没有沙箱时（如 macOS），所有 provider 调用（包括只读审查）都遵循 fail-closed 拦截，并给出指引：在装有 bwrap 的 Linux 容器/虚拟机中运行，或显式 `MAKEWAND_UNSAFE_HOST_EXEC=1` 确认授权（附审计记录）。bwrap 只从 root 拥有的系统目录解析，装在其他位置时用 `MAKEWAND_BWRAP_PATH` 指定。
+
+> **依赖安装网络**：Go 候选验证的依赖安装（含 Rust 检查前的 `cargo fetch`）不共享宿主网络命名空间。找到可信的 `slirp4netns`、`nsenter`、`ip` 时只能访问公网（私网、回环、链路本地与云元数据、组播及本机地址在命令运行前即被路由屏蔽，可选的 `tc`/`nft` 再过滤组播与 IPv6），否则只有回环网络；这些工具不在 root 拥有的系统目录时，用 `MAKEWAND_SLIRP4NETNS_PATH`、`MAKEWAND_NSENTER_PATH`、`MAKEWAND_IP_PATH`、`MAKEWAND_TC_PATH`、`MAKEWAND_NFT_PATH` 指定。私网或本机回环上的镜像与代理按设计不可达。安装失败只有在 makewand 自己的连通性检查（离线时为项目文件）确认注册表不可达时才算环境问题，此时 TUI 跳过测试、不扣分。详见 [SECURITY.md](SECURITY.md#dependency-installs--依赖安装)。
 
 ### 8. 单模型直接透传调用
 ```bash

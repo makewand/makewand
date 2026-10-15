@@ -1447,10 +1447,14 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		}
 	}
 
-	// Writable sessions get a per-run private provider home (H3): HOME is a
-	// fresh 0700 directory holding copies of allowlisted credential files,
-	// and only changed credential files are written back after the sandbox
-	// exits. Host provider directories are never bound writable.
+	// Every session gets a per-run private provider home (H3) holding copies
+	// of allowlisted credential files, and only changed credential files are
+	// written back after the sandbox exits. Host provider directories are
+	// never bound writable. Writable sessions use it as a fresh 0700 HOME;
+	// read-only (review and remote-origin) sessions keep an empty tmpfs HOME
+	// with the private provider directories bound at their host paths, so a
+	// token refresh during a review is merged back instead of being lost
+	// with a refresh token the server already rotated.
 	var privHome *cliPrivateHome
 	planned := false
 	defer func() {
@@ -1478,12 +1482,13 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			allowedCreds = nil // Explicit account selection does not expose the default account.
 		}
 		if home != "/" {
+			if err := ensurePrivHome(); err != nil {
+				return nil, err
+			}
 			if readOnlyProvider {
 				bwrapArgs = append(bwrapArgs, "--tmpfs", home)
 			} else {
-				if err := ensurePrivHome(); err != nil {
-					return nil, err
-				}
+				privHome.homeBound = true
 				bwrapArgs = append(bwrapArgs, "--bind", privHome.home, home)
 			}
 		}
@@ -1523,6 +1528,13 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			}
 			fi, err := os.Stat(target) //nolint:gosec // G703: checking existence of provider credentials in host home
 			if err != nil {
+				// A login made inside the sandbox in a directory the host
+				// lacks is reported after the run, never written back.
+				if privHome != nil && errors.Is(err, os.ErrNotExist) {
+					if bwrapArgs, err = privHome.addAbsentProviderEntry(bwrapArgs, cred, target); err != nil {
+						return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+					}
+				}
 				continue
 			}
 			if privHome != nil {
@@ -1594,24 +1606,19 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	}
 	if selectedCodexHome != "" {
 		// Mount only the selected account after masking host roots and other
-		// credentials. Use its canonical path inside the sandbox: a destination
-		// symlink may point into a masked root and cannot serve as a mount point.
-		if readOnlyProvider {
-			bwrapArgs = append(bwrapArgs, "--tmpfs", realCodexHome,
-				"--setenv", "CODEX_HOME", realCodexHome)
-			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, true, false)
-		} else {
-			if err := ensurePrivHome(); err != nil {
-				return nil, err
-			}
-			privCodex, err := privHome.addCodexHome(realCodexHome)
-			if err != nil {
-				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
-			}
-			bwrapArgs = append(bwrapArgs, "--bind", privCodex, realCodexHome,
-				"--setenv", "CODEX_HOME", realCodexHome)
-			bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, false, true)
+		// credentials, as a private copy (read-only sessions too). Use its
+		// canonical path inside the sandbox: a destination symlink may point
+		// into a masked root and cannot serve as a mount point.
+		if err := ensurePrivHome(); err != nil {
+			return nil, err
 		}
+		privCodex, err := privHome.addCodexHome(realCodexHome)
+		if err != nil {
+			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
+		}
+		bwrapArgs = append(bwrapArgs, "--bind", privCodex, realCodexHome,
+			"--setenv", "CODEX_HOME", realCodexHome)
+		bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, false, true)
 	} else if p != "codex" {
 		// A custom Codex account may be outside a masked host root. Other
 		// providers must not gain access to it through the root read-only mount.

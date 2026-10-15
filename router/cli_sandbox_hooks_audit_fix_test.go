@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -97,44 +98,115 @@ func cliTestWithoutHostExecAck(t *testing.T) {
 	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
 }
 
-// cliTestFixtureBinds exposes go test fixtures under /tmp, which the sandbox
-// replaces with a tmpfs: the test binary (go-build*, read-only) and the
-// t.TempDir roots (Test*, writable) holding helper markers. Production builds
-// never install this hook.
+// cliTestFixtureBinds exposes the go test fixtures a sandboxed helper process
+// needs, which the sandbox would hide: it replaces /tmp, /var/tmp and /run
+// with empty tmpfs mounts and masks /home, /mnt, /root, /media and /srv, any
+// of which may hold the temporary directory go test works in (os.TempDir, so
+// TMPDIR). Exposed are, below that temporary directory, the build directory
+// holding the test binary (go-build*, read-only) and the t.TempDir roots
+// (Test*, writable) holding the fixture copies of the binary and the markers
+// and state files the helpers write; and the directory of the test binary
+// itself wherever it is (GOTMPDIR, go test -c -o), read-only. Production
+// builds never install this hook.
 func cliTestFixtureBinds(targetBin string, env []string) []string {
-	var args []string
-	bind := func(targetPath string) {
-		if !cliPathWithin("/tmp", targetPath) || targetPath == "/tmp" {
+	var args, roots []string
+	covered := func(path string) bool {
+		for _, root := range roots {
+			if path == root || cliPathWithin(root, path) {
+				return true
+			}
+		}
+		return false
+	}
+	add := func(flag, root string) {
+		if covered(root) {
 			return
 		}
-		rel, err := filepath.Rel("/tmp", targetPath)
-		if err != nil {
-			return
-		}
-		top := strings.Split(rel, string(os.PathSeparator))[0]
-		root := filepath.Join("/tmp", top)
 		if _, err := os.Stat(root); err != nil {
 			return
 		}
-		for i := 0; i+1 < len(args); i++ {
-			if args[i+1] == root {
-				return
-			}
+		roots = append(roots, root)
+		args = append(args, flag, root, root)
+	}
+	temps := cliTestTempDirs()
+	bind := func(targetPath string) {
+		if targetPath == "" || !filepath.IsAbs(targetPath) {
+			return
 		}
-		switch {
-		case strings.HasPrefix(top, "go-build"):
-			args = append(args, "--ro-bind", root, root)
-		case strings.HasPrefix(top, "Test"):
-			args = append(args, "--bind", root, root)
+		targetPath = filepath.Clean(targetPath)
+		for _, temp := range temps {
+			if targetPath == temp || !cliPathWithin(temp, targetPath) {
+				continue
+			}
+			rel, err := filepath.Rel(temp, targetPath)
+			if err != nil {
+				continue
+			}
+			top := strings.Split(rel, string(os.PathSeparator))[0]
+			root := filepath.Join(temp, top)
+			switch {
+			case strings.HasPrefix(top, "go-build"):
+				add("--ro-bind", root)
+			case strings.HasPrefix(top, "Test"):
+				add("--bind", root)
+			}
+			return
 		}
 	}
 	bind(targetBin)
+	if exe, err := os.Executable(); err == nil && cliTestSameFile(exe, targetBin) {
+		// The test binary itself runs as the helper: its build directory, or
+		// its own directory wherever go test built it.
+		bind(exe)
+		if dir := filepath.Dir(exe); dir != "/" && !covered(dir) && !covered(filepath.Dir(filepath.Clean(targetBin))) {
+			add("--ro-bind", dir)
+		}
+	}
 	for _, entry := range env {
 		if marker, ok := strings.CutPrefix(entry, "MAKEWAND_CLI_PROCESS_MARKER="); ok {
 			bind(marker)
 		}
 	}
 	return args
+}
+
+// cliTestSameFile reports whether a and b name the same existing file.
+func cliTestSameFile(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	return err == nil && os.SameFile(ai, bi)
+}
+
+// cliTestStartTempDir is the temporary directory go test started the test
+// binary with: it holds the build directory and every t.TempDir root, even
+// while a test points TMPDIR somewhere else.
+var cliTestStartTempDir = os.TempDir()
+
+// cliTestTempDirs returns the temporary directories fixtures live in: the
+// one the test binary started with and the current os.TempDir, each as given
+// and, when it differs, with its symbolic links resolved (paths from
+// t.TempDir carry the first form, os.Executable may return the second).
+func cliTestTempDirs() []string {
+	var dirs []string
+	for _, temp := range []string{cliTestStartTempDir, os.TempDir()} {
+		temp = filepath.Clean(temp)
+		if !filepath.IsAbs(temp) || temp == "/" {
+			continue
+		}
+		forms := []string{temp}
+		if resolved, err := filepath.EvalSymlinks(temp); err == nil && resolved != temp && resolved != "/" {
+			forms = append(forms, resolved)
+		}
+		for _, form := range forms {
+			if !slices.Contains(dirs, form) {
+				dirs = append(dirs, form)
+			}
+		}
+	}
+	return dirs
 }
 
 // cliTestFixtureEnvAllowed passes helper-process control variables used by

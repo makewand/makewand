@@ -133,6 +133,7 @@ type Messages struct {
 	BuildDepsExecFailed             string
 	BuildDepsSkipped                string
 	BuildTestsSkipped               string
+	BuildTestsDepsMissing           string
 	ExecDepsLabel                   string
 	ExecTestsLabel                  string
 	ExecStarted                     string
@@ -369,6 +370,7 @@ var en = Messages{
 	BuildDepsExecFailed:     "Dependency install failed:\n%s",
 	BuildDepsSkipped:        "Skipped dependency install and tests. Run them manually when you're ready.",
 	BuildTestsSkipped:       "Skipped tests. Run them manually when you're ready.",
+	BuildTestsDepsMissing:   "skipped (dependencies could not be downloaded)",
 	ExecDepsLabel:           "dependency install",
 	ExecTestsLabel:          "tests",
 	ExecStarted:             "Running %s",
@@ -614,6 +616,7 @@ var zh = Messages{
 	BuildDepsExecFailed:     "依赖安装失败：\n%s",
 	BuildDepsSkipped:        "已跳过依赖安装和测试。准备好后可手动运行。",
 	BuildTestsSkipped:       "已跳过测试。准备好后可手动运行。",
+	BuildTestsDepsMissing:   "已跳过（依赖无法下载）",
 	ExecDepsLabel:           "依赖安装",
 	ExecTestsLabel:          "测试",
 	ExecStarted:             "正在执行%s",

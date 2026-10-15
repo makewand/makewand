@@ -96,6 +96,15 @@ def _frozen_limits(frozen):
         "max_entries": MAX_ENTRIES, "max_bytes": MAX_BYTES, "max_seconds": MAX_SECONDS}))
 
 
+def _shown(text):
+    """text for a message: the undecodable bytes of a file name (surrogate escapes from
+    os.listdir or os.fsdecode) become \\xNN, so that no caller printing it can fail."""
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    except UnicodeEncodeError:  # a lone surrogate that no file name produced
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 class _SnapshotBudget:
     def __init__(self, limits, timeout=None):
         self.limits = limits
@@ -137,7 +146,7 @@ def _entry_record(directory, name, before, relative, budget):
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         try:
             if _signature(os.fstat(descriptor)) != _signature(before):
-                raise OSError("Delivery file changed: " + relative)
+                raise OSError("Delivery file changed: " + _shown(relative))
             digest = hashlib.sha256()
             while True:
                 budget.remaining()
@@ -148,7 +157,7 @@ def _entry_record(directory, name, before, relative, budget):
                 budget.remaining()
                 digest.update(chunk)
             if _signature(os.fstat(descriptor)) != _signature(before):
-                raise OSError("Delivery file changed while hashing: " + relative)
+                raise OSError("Delivery file changed while hashing: " + _shown(relative))
             return ["file", digest.hexdigest(), mode]
         finally:
             os.close(descriptor)
@@ -233,7 +242,7 @@ def check_delivery_patch(path, patch, timeout=MAX_SECONDS):
                             env=_git_environment(), capture_output=True, timeout=timeout)
     if result.returncode:
         raise OSError("exported patch does not match the frozen destination baseline "
-                      f"(exit {result.returncode}): " + os.fsdecode(result.stderr).strip())
+                      f"(exit {result.returncode}): " + _shown(os.fsdecode(result.stderr).strip()))
 
 
 def _git_state(path, budget):
@@ -247,10 +256,10 @@ def _git_state(path, budget):
             raise
     symbolic = run(["symbolic-ref", "-q", "HEAD"])
     if symbolic.returncode not in (0, 1):
-        raise OSError("Cannot inspect delivery repository HEAD: " + path)
+        raise OSError("Cannot inspect delivery repository HEAD: " + _shown(path))
     head = run(["rev-parse", "--verify", "HEAD"])
     if head.returncode and symbolic.returncode:
-        raise OSError("Cannot inspect delivery repository commit: " + path)
+        raise OSError("Cannot inspect delivery repository commit: " + _shown(path))
     return [head.stdout.decode("ascii").strip() if head.returncode == 0 else None,
             os.fsdecode(symbolic.stdout).strip() if symbolic.returncode == 0 else None]
 
@@ -319,7 +328,7 @@ def _tree_digest(parent, name, before, relative, budget):
                 descriptor = os.open(child, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
                 try:
                     if _signature(os.fstat(descriptor)) != _signature(info):
-                        raise OSError("Delivery directory changed: " + relative + "/" + path)
+                        raise OSError("Delivery directory changed: " + _shown(relative + "/" + path))
                     digest.update(json.dumps([path, ["dir", stat.S_IMODE(info.st_mode)]]).encode() + b"\0")
                     walk(descriptor, path + "/", info)
                 finally:
@@ -328,14 +337,14 @@ def _tree_digest(parent, name, before, relative, budget):
                 record = _entry_record(directory, child, info, relative + "/" + path, tree_budget)
                 digest.update(json.dumps([path, record]).encode() + b"\0")
             if _signature(os.stat(child, dir_fd=directory, follow_symlinks=False)) != _signature(info):
-                raise OSError("Delivery entry changed during inspection: " + relative + "/" + path)
+                raise OSError("Delivery entry changed during inspection: " + _shown(relative + "/" + path))
         if _signature(os.fstat(directory)) != _signature(directory_before):
-            raise OSError("Delivery directory changed during inspection: " + relative + "/" + prefix)
+            raise OSError("Delivery directory changed during inspection: " + _shown(relative + "/" + prefix))
 
     descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     try:
         if _signature(os.fstat(descriptor)) != _signature(before):
-            raise OSError("Delivery directory changed: " + relative)
+            raise OSError("Delivery directory changed: " + _shown(relative))
         walk(descriptor, "", before)
     finally:
         os.close(descriptor)
@@ -348,7 +357,7 @@ def _refuse_tracked_internal(root, relative, budget):
     result = subprocess.run(command, env=_git_environment(), capture_output=True,
                             timeout=budget.remaining())
     if result.returncode == 0 and result.stdout.strip(b"\0"):
-        raise OSError("Delivery destination tracks files inside makewand-internal directory: " + relative)
+        raise OSError("Delivery destination tracks files inside makewand-internal directory: " + _shown(relative))
 
 
 def _ignored_entries(root, budget):
@@ -433,7 +442,7 @@ def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
                     entries[relative] = record
                     after = os.stat(name, dir_fd=directory, follow_symlinks=False)
                     if _signature(after) != _signature(before):
-                        raise OSError("Delivery entry changed during inspection: " + relative)
+                        raise OSError("Delivery entry changed during inspection: " + _shown(relative))
                     continue
                 try:
                     child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -443,12 +452,12 @@ def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
                         entries[relative] = ["dir", mode]
                         after = os.stat(name, dir_fd=directory, follow_symlinks=False)
                         if _signature(after) != _signature(before):
-                            raise OSError("Delivery entry changed during inspection: " + relative)
+                            raise OSError("Delivery entry changed during inspection: " + _shown(relative))
                         continue
                     raise
                 try:
                     if _signature(os.fstat(child)) != _signature(before):
-                        raise OSError("Delivery directory changed: " + relative)
+                        raise OSError("Delivery directory changed: " + _shown(relative))
                     entries[relative] = ["dir", mode]
                     scan(child, relative + "/")
                 finally:
@@ -458,11 +467,11 @@ def capture_delivery_baseline(workspace, timeout=None, *, limits=None):
             after = os.stat(name, dir_fd=directory, follow_symlinks=False)
             if name == ".git":
                 if (after.st_dev, after.st_ino, after.st_mode) != (before.st_dev, before.st_ino, before.st_mode):
-                    raise OSError("Delivery repository marker changed: " + relative)
+                    raise OSError("Delivery repository marker changed: " + _shown(relative))
             elif _signature(after) != _signature(before):
-                raise OSError("Delivery entry changed during inspection: " + relative)
+                raise OSError("Delivery entry changed during inspection: " + _shown(relative))
         if _signature(os.fstat(directory)) != _signature(before_directory):
-            raise OSError("Delivery directory changed during inspection: " + prefix)
+            raise OSError("Delivery directory changed during inspection: " + _shown(prefix))
 
     descriptor = _open_root(root)
     try:
@@ -563,11 +572,11 @@ def _capture_patch_state(frozen, changes):
                 budget.remaining()
                 before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 if not stat.S_ISDIR(before.st_mode):
-                    raise OSError("Delivery patch ancestor must be a real directory: " + relative)
+                    raise OSError("Delivery patch ancestor must be a real directory: " + _shown(relative))
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
                 if _signature(os.fstat(child)) != _signature(before):
                     os.close(child)
-                    raise OSError("Delivery patch ancestor changed: " + relative)
+                    raise OSError("Delivery patch ancestor changed: " + _shown(relative))
                 os.close(descriptor)
                 descriptor = child
             return descriptor
@@ -605,7 +614,7 @@ def _capture_patch_state(frozen, changes):
                     }
                     after = os.stat(".git", dir_fd=descriptor, follow_symlinks=False)
                     if (after.st_dev, after.st_ino, after.st_mode) != (marker.st_dev, marker.st_ino, marker.st_mode):
-                        raise OSError("Delivery repository marker changed: " + relative)
+                        raise OSError("Delivery repository marker changed: " + _shown(relative))
             finally:
                 os.close(descriptor)
         for relative in sorted(changes):
@@ -624,7 +633,7 @@ def _capture_patch_state(frozen, changes):
                     continue
                 result["entries"][relative] = _entry_record(descriptor, name, before, relative, budget)
                 if _signature(os.stat(name, dir_fd=descriptor, follow_symlinks=False)) != _signature(before):
-                    raise OSError("Delivery entry changed during inspection: " + relative)
+                    raise OSError("Delivery entry changed during inspection: " + _shown(relative))
             finally:
                 os.close(descriptor)
         # Reopen ancestry to ensure each inspected descriptor still names the
@@ -634,11 +643,11 @@ def _capture_patch_state(frozen, changes):
                 descriptor = open_directory(relative)
             except FileNotFoundError:
                 if identity is not None:
-                    raise OSError("Delivery patch ancestor disappeared: " + relative)
+                    raise OSError("Delivery patch ancestor disappeared: " + _shown(relative))
                 continue
             try:
                 if directory_identity(os.fstat(descriptor)) != identity:
-                    raise OSError("Delivery patch ancestor identity or mode changed: " + relative)
+                    raise OSError("Delivery patch ancestor identity or mode changed: " + _shown(relative))
             finally:
                 os.close(descriptor)
         reopened = _open_root(root)

@@ -6,6 +6,8 @@ Maintains persistent rolling usage window for Claude, Codex, AGY, and Muse subsc
 import os
 import sys
 import json
+import contextvars
+from contextlib import contextmanager
 from makewand import filelock as fcntl
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
@@ -123,15 +125,97 @@ def _save_raw_usage_records(records: List[Dict[str, Any]]) -> None:
             except Exception:
                 pass
 
+# Routes a dispatch can take: the provider's own CLI, or its cloud API (the
+# adapters relay to the API key when the subscription is limited, the login is
+# missing or the CLI is not installed, and the API policy allows it).
+USAGE_ROUTES = ("cli", "api")
+# Engines that run a local agent CLI unless the adapter relays to an API.
+CLI_ENGINES = frozenset({"claude", "codex", "agy", "grok", "muse", "aider"})
+
+
+class DispatchRoute:
+    """The route one dispatch took, as its adapter reported it (None: not reported)."""
+
+    __slots__ = ("route",)
+
+    def __init__(self) -> None:
+        self.route: Optional[str] = None
+
+
+_DISPATCH_ROUTE: "contextvars.ContextVar[Optional[DispatchRoute]]" = contextvars.ContextVar(
+    "makewand_dispatch_route", default=None)
+
+
+@contextmanager
+def observe_dispatch_route():
+    """Collect the route an adapter takes inside this block (note_dispatch_route).
+
+    The dispatch site (orchestrator.dispatch_task, the direct CLI commands) wraps
+    one provider call in it and passes the result to record_engine_usage. The
+    holder is shared, not copied, so a report from a thread the adapter started
+    with a copy of this context still arrives.
+    """
+    holder = DispatchRoute()
+    token = _DISPATCH_ROUTE.set(holder)
+    try:
+        yield holder
+    finally:
+        _DISPATCH_ROUTE.reset(token)
+
+
+def note_dispatch_route(route: str) -> None:
+    """An adapter reports the route it takes: "cli" right before it starts the
+    provider's CLI, "api" right before it relays to the cloud API. The last report
+    wins (a CLI run that hit its limit and was then relayed is "api"); outside
+    observe_dispatch_route it does nothing."""
+    holder = _DISPATCH_ROUTE.get()
+    if holder is not None and route in USAGE_ROUTES:
+        holder.route = route
+
+
+def dispatch_route(engine: str) -> Optional[str]:
+    """The route a dispatch of `engine` took when the configuration allows only one.
+
+    An adapter relays to a cloud API only with an API key and an API policy that
+    allows paid calls (config.api_relay_available); without both, every outcome
+    came from the CLI. Otherwise either route was possible and None is returned.
+    """
+    name = (engine or "").lower().strip()
+    if name not in CLI_ENGINES:
+        return None
+    try:
+        from makewand.config import api_relay_available
+        if not api_relay_available(name):
+            return "cli"
+    except Exception:
+        pass
+    return None
+
+
+def get_dispatch_records(engine: Optional[str] = None, max_age_days: float = 7.0) -> List[Dict[str, Any]]:
+    """Copies of the ledger's dispatch records of the last `max_age_days`, oldest first.
+
+    Each record has "timestamp" (local ISO time), "engine", "tier", "success",
+    "task" and, when it is known, "route" ("cli" or "api").
+    """
+    name = engine.lower().strip() if engine else None
+    return [dict(record) for record in _load_raw_usage_records(max_age_days=max_age_days)
+            if name is None or record.get("engine") == name]
+
+
 def record_engine_usage(
     engine: str,
     tier: str = "standard",
     success: bool = True,
-    task: str = ""
+    task: str = "",
+    route: Optional[str] = None,
 ) -> None:
     """
     Atomically records an invocation event of an engine into the rolling usage window.
     Acquires an exclusive transactional flock across the entire Read-Modify-Write cycle.
+    `route` ("cli" or "api") is the route that served the dispatch, as its adapter
+    reported it (observe_dispatch_route); when the caller does not know it, it is
+    recorded only if the configuration allows a single one (dispatch_route).
     """
     engine_name = engine.lower().strip()
     record = {
@@ -141,6 +225,10 @@ def record_engine_usage(
         "success": success,
         "task": (task[:100] if task else "")
     }
+    if route not in USAGE_ROUTES:
+        route = dispatch_route(engine_name)
+    if route:
+        record["route"] = route
 
     ensure_config_dir()
     uf = _get_active_usage_file()

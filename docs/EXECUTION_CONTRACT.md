@@ -17,7 +17,7 @@ tests exercise the same fixtures and share a real ledger across processes.
 | UNVERIFIED | 11 | Missing tests, eligible engines or approval |
 | CANCELLED | 12 | Cancelled execution |
 | BUDGET_EXHAUSTED | 13 | Admission refused by the shared budget |
-| APPLY_CONFLICT | 14 | Destination no longer matches its frozen baseline |
+| APPLY_CONFLICT | 14 | Destination no longer matches its frozen baseline, already has an entry the candidate adds, or has an entry apply cannot write |
 | SANDBOX_UNAVAILABLE | 15 | Required isolation is unavailable |
 | TIMEOUT | 16 | Requested deadline expired |
 | UNKNOWN | 17 | Result cannot be established after dispatch |
@@ -40,6 +40,16 @@ with typed metadata and `to_dict()`. `run_pipeline()` keeps its boolean return;
 `run_workflow()` exposes the typed final outcome. IPC version 1 retains its
 accepted/query/cancel/output/exit protocol; result metadata is additive. Legacy
 IPC transport codes remain transport codes rather than delivery authorization.
+
+`CandidateManager.apply_candidate` returns an `ApplyResult`, which still unpacks
+as `(ok, files, message)` and adds `status`. `makewand apply` exits with that
+status's code, and a multi-task DAG's delivery reports it, never inferring it from
+the message's words: `APPLY_CONFLICT` for a workspace conflict, an entry apply
+cannot write, or a target that changed between the conflict check and the write;
+`UNVERIFIED` for the test harness's refusal and failed protected-file checks;
+`TIMEOUT`; `UNKNOWN` when whether the application was committed cannot be
+established; `FAILED` otherwise, a failed `--merge` synthesis included. Every
+failed apply records its typed result.
 
 Requests include task/stage/engine, tier/model, read-only and repository trust,
 API policy, selected account-root reference, deadline, timeout, budget and
@@ -80,7 +90,10 @@ The API key, model and base URL are resolved independently; an explicit model
 or endpoint override does not discard a key supplied by a lower-priority source.
 An explicit per-call model or a native routing mode's selected model takes
 precedence over the provider default model. This configuration does not authorize
-paid API use: `allow_paid` remains an explicit requirement.
+paid API use: `allow_paid` remains an explicit requirement. Nor does a configured
+key make an engine usable by itself: routing counts an engine whose CLI is limited,
+logged out or missing as usable, and the claude and codex adapters relay its work
+to the API, only under `allow_paid` (see [workflow selection](#workflow-selection)).
 An unreadable or malformed lower-priority `api_keys.json` produces a diagnostic;
 valid environment and `config.json` fields remain available. It cannot override
 the execution policy or authorize paid calls.
@@ -145,12 +158,20 @@ Unused workflow capacity is stored as expiring `holds`, separate from attempts.
 Ordinary dispatches cannot consume it. Claiming a hold decrements its remaining
 capacity and creates exactly one attempt. Race reserves two contestant calls and
 one judge call before either contestant begins; partial holds are released on
-failure. An unused hold can expire; an actual attempt cannot be refunded.
+failure. The Winner-Take-All review uses the judge's hold, while a verdict
+follow-up and the review of a judge's own-provider pick are admitted as ordinary
+dispatches, so a tight `--max-model-calls` can end such a race
+`BUDGET_EXHAUSTED`; it never approves without the review. An unused hold can
+expire; an actual attempt cannot be refunded.
 
 `--total-timeout` bounds the Python workflow, including verification and review.
 Child scopes can shorten a parent deadline, never extend it. Native Go propagates
 context deadlines through dispatch. Cancellation terminates local work where the
-adapter supports it; it cannot revoke a remote call already sent. Race leaves
+adapter supports it; it cannot revoke a remote call already sent. A native
+provider CLI's stream, also one that a cancellation or deadline ends, ends only
+after its sandbox's credential write-back (at most 15 s by default), and a Router
+fallback after an attempt's timeout starts once that stream has ended; streams of
+API providers end at once. Race leaves
 25% of its total duration, capped at 60 seconds, for judging unless overridden
 with `--judge-reserve-seconds`. This reserves opportunity, not successful review.
 
@@ -171,9 +192,96 @@ sensitive interfaces or external effects. An explicit low-risk single workflow
 uses one coder and a separate read-only review call, possibly through the same
 provider. It retains the local tests, complete diff and artifact binding.
 High-risk work requires distinct-provider review; a high-risk single request is
-invalid. Race contestants must be distinct; a third provider is preferred for
-judging but an independent read-only call through a contestant's provider is
-allowed. Missing eligible engines or evidence produces `UNVERIFIED`.
+invalid. Race contestants must be distinct; unless one is named
+(`run --workflow race --provider X` names contestant A), the race pairs any two
+different enabled, healthy engines among claude, codex, grok, muse and local, and
+agy when it is not known to fail, each slot in its own order of preference. The
+judge must receive the whole judge prompt, and a provider other than both
+contestants is preferred; a judge's pick of its own provider's candidate is
+approved only after a read-only, nonce-bound review by another provider. A
+Winner-Take-All win (the first candidate to pass its tests) needs the same review,
+which asks once more for a missing verdict line; `FAILED` exits 10, a missing
+reviewer or verdict 11. That reviewer follows the judge's rule: the first usable
+engine in the judge order (agy, codex, claude, grok, muse, local) that is neither
+contestant and receives the whole prompt, otherwise the other contestant, never
+the winner's own provider. Missing eligible engines or evidence produces
+`UNVERIFIED`.
+
+When no enabled engine is usable (each is in an error state, or limited, logged
+out or missing without an API key the API policy lets its adapter relay to; under
+the default `subscription_only` no key counts), nothing is dispatched: no
+pipeline, explain or question prompt, REPL turn or `ensemble`. Each engine's
+reason is printed, and the outcome is `UNVERIFIED` (exit 11) with the error
+`No usable execution provider: <engine>: <reason>; …`; with no enabled engine at
+all it remains `No enabled execution provider`. `race` likewise dispatches
+nothing when it cannot pair two engines, and lists every racer, disabled ones
+included, and the other active engines, each with its reason.
+
+A forced engine (`--provider X` of `run` and of the natural-language entry, or an
+explicitly named race contestant) is decided before any workspace setup, routing
+or dispatch, alike on the explain/question, pipeline, review and race paths. It
+must pass what routing requires of any engine: enabled and without a live failure
+verdict, unless its adapter relays that state to an API the policy allows; an
+API-only engine (deepseek, qwen, glm, kimi, openrouter, siliconflow) needs a key
+the policy lets it use. An unusable one is never dispatched: the outcome is
+`UNVERIFIED` (exit 11) with the error `Requested engine X is not usable: <reason>`.
+A usable one always runs, also when no other engine is usable (it is then the only
+tool, under the single-tool review rules), and on the review path it is the only
+reviewer. `auto` forces nothing. Limits: the check reads the recorded health, so an
+engine without a recorded status (one never probed, for example) passes it even
+when its CLI is missing, and its dispatch then fails; a question in the
+interactive REPL after `/model X` goes to X without this check.
+
+## Reviewer capacity
+
+A review verdict counts only from a reviewer that received the complete prompt
+with the complete diff. Diffs and prompts are measured as dispatched: an
+undecodable file-name byte counts as its four-byte `\xNN` escape, for the review
+cap, the whole-prompt limits and the local context window alike. A diff over the
+review cap (`MAKEWAND_REVIEW_DIFF_MAX_BYTES`, default 262,144 bytes; an invalid
+value falls back with one warning) is never reviewed truncated, in the pipeline
+(first review, re-review, the auto-fix growth check), `makewand review`, the
+Winner-Take-All review or the race judge. The
+outcome is `UNVERIFIED` and the complete patch is saved as `unverified.patch`
+(`git diff --binary --full-index --unified=3`) with one
+`unverified.submodule-<n>.patch` per checked-out submodule, listed in
+`manifest.json`; when it cannot be saved completely, the shadow worktree is kept.
+
+The agy adapter passes a prompt over 32 KiB as a file that its agent reads in
+paged views, so no review, judge or Winner-Take-All prompt over 31 KiB goes to
+agy. The pipeline's
+first review and the auto-fix re-review then append the next usable stand-in:
+planned reviewers first, then active providers, never the coder (for a re-review,
+nor the fixer); the coder only as a last resort where the plan allows
+self-review; none in a single-tool run, `--local-only` included. A stand-in that
+fails with a non-terminal status is replaced by the next allowed one; `UNKNOWN`,
+`TIMEOUT`, `CANCELLED` and `BUDGET_EXHAUSTED` stop the review. Placeholder engines
+without an executor (`cursor`, `copilot`) never review or stand in.
+`makewand review` keeps its codex → grok → agy ladder (`local` with
+`--local-only`; a review request through `run --provider X` asks X alone), so when
+agy is the only usable engine there an oversized prompt ends `UNVERIFIED`.
+
+Read-only local model calls (review, judging, questions) go to Ollama's native
+`/api/chat` with `truncate: false` and `shift: false`. `num_ctx` is a token
+estimate of the messages (half their dispatched UTF-8 size, each ASCII digit one
+token) plus 512 template and 8,192 answer tokens, capped at the model's trained context
+length from `/api/show`. The answer counts only when `prompt_eval_count` and
+`eval_count` show that the prompt fitted with room for the system message and
+the answer, and that at least one token per 6 bytes was processed. A prompt that
+fills that window, or that Ollama refuses as too long, is sent once more with room
+for one token per byte (`num_ctx` up to the prompt's bytes + 8,704, capped at the
+trained length); when `/api/show` reports no context length nothing is retried
+and only a prompt and answer within 2,048 tokens count. An endpoint without
+Ollama's native API (vLLM, llama.cpp, LM Studio) is asked through its
+OpenAI-compatible API and counts only when `usage.prompt_tokens` is at least the
+prompt's bytes / 6. A context-length refusal, a missing count or a failed
+`/api/show` probe is `UNVERIFIED`. Coding dispatches keep the OpenAI-compatible
+path. OpenRouter requests send `transforms: []`, and its context-length refusals
+are `UNVERIFIED`. Residual: a server that cuts a prompt yet reports at least one
+token per 6 bytes (an Ollama that over-reports its trained length, a truncating
+llama.cpp or LM Studio overflow policy, an OpenAI-compatible proxy in front of
+Ollama) cannot be told from a whole prompt; prompts made of long runs of one
+character can fail closed, and a retried window can need a large KV cache.
 
 ## Protected task files
 

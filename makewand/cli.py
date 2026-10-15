@@ -66,10 +66,12 @@ from makewand.providers.muse import execute_muse_task
 from makewand.providers.grok import execute_grok_task
 
 def _execute_direct_task(engine, execute, prompt, **kwargs):
-    """Direct commands share typed admission, deadlines and observation."""
+    """Direct commands share typed admission, deadlines and observation, and record
+    the dispatch in the usage ledger with the route (cli/api) the adapter took."""
     from makewand.execution_contract import ExecutionRequest
     from makewand import execution_runtime
     from makewand.config import get_api_policy
+    from makewand.usage import observe_dispatch_route, record_engine_usage
     from makewand.workflow import remember_result
     context = execution_runtime.current_context()
     maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
@@ -86,7 +88,14 @@ def _execute_direct_task(engine, execute, prompt, **kwargs):
     def callback(effective_timeout):
         from makewand.workflow import provider_outcome
         return provider_outcome(execute(prompt, **dict(kwargs, timeout=effective_timeout)))
-    return remember_result(execution_runtime.execute(request, callback))
+    with observe_dispatch_route() as route:
+        result = remember_result(execution_runtime.execute(request, callback))
+    try:
+        record_engine_usage(engine, tier=kwargs.get("tier", "standard"), success=result[0], task=prompt,
+                            route=route.route)
+    except Exception:
+        pass
+    return result
 
 
 def _execution_exit_code(fallback=EXIT_FAILED):
@@ -311,18 +320,31 @@ def cmd_status(args):
 
     # 3. Dynamic Topology Recommendation
     print(c("--- 当前自适应拓扑调度推荐策略 (Dynamic Topology) ---", COLOR_BOLD))
-    if len(active_tools) >= 2:
-        coders, reviewers, meta = select_optimal_engine_pair("general task")
-        coder = coders[0] if coders else active_tools[0]
+    coders, reviewers, meta = select_optimal_engine_pair("general task", cache=cache) if active_tools else ([], [], {})
+    if active_tools and not coders:
+        # Never recommend an engine that cannot run: say why each one is out.
+        unusable = meta.get("unusable_engines") or {}
+        print(c("  ❌ 已激活的工具当前都不可用，暂无可推荐的分工 (任务不会被派发):", COLOR_RED + COLOR_BOLD))
+        for engine, why in unusable.items():
+            print(f"     • {engine}: {why}")
+        if not unusable:
+            print("     • 已激活的工具均暂无执行适配 (cursor / copilot)")
+        print("     运行 'makewand probe' 立即复查；失败状态在有效期过后自动恢复为中性，额度受限在重置后自动恢复。")
+    elif len(active_tools) >= 2 and not meta.get("single_tool_mode"):
+        coder = coders[0]
         reviewer = reviewers[0] if reviewers else (coders[1] if len(coders) > 1 else coder)
         print(c(f"  🌟 多模型联合编排模式 (活跃工具数: N={len(active_tools)}):", COLOR_GREEN + COLOR_BOLD))
         print(f"     • 活跃工具池: {c(', '.join(active_tools), COLOR_CYAN)}")
         print(f"     • 推荐通用分工: 主力实现 [{c(coder, COLOR_BOLD)}] -> 独立跨模型红队盲审 [{c(reviewer, COLOR_BOLD)}]")
         print(f"     • 调度机制: 自动按任务类型 (代码/架构/审查/自愈) 进行领域自适应，零人工配置负担。")
-    elif len(active_tools) == 1:
-        single = active_tools[0]
-        print(c(f"  ⚡ 韧性单工具独立闭环模式 (活跃工具数: N=1):", COLOR_YELLOW + COLOR_BOLD))
-        print(f"     • 活跃唯一工具: {c(single, COLOR_BOLD + COLOR_GREEN)}")
+    elif active_tools:
+        single = coders[0]
+        if len(active_tools) == 1:
+            print(c(f"  ⚡ 韧性单工具独立闭环模式 (活跃工具数: N=1):", COLOR_YELLOW + COLOR_BOLD))
+            print(f"     • 活跃唯一工具: {c(single, COLOR_BOLD + COLOR_GREEN)}")
+        else:
+            print(c(f"  ⚡ 韧性单工具独立闭环模式 (活跃工具数: N={len(active_tools)}，当前仅 1 个可用):", COLOR_YELLOW + COLOR_BOLD))
+            print(f"     • 当前唯一可用工具: {c(single, COLOR_BOLD + COLOR_GREEN)} (其余工具的不可用原因见上方运行状态)")
         print(f"     • 闭环机制: 由 [{single}] 独立编码，并在独立影子沙箱 (Shadow Worktree) 中进行严格对抗性自我盲审验收。")
     else:
         print(c("  ❌ 当前未检测到任何已登录或已配置凭据的 AI 工具！", COLOR_RED + COLOR_BOLD))
@@ -583,9 +605,10 @@ def cmd_plan(args):
         )
         if not ok:
             print(c(f"\n❌ [Makewand DAG Engine] 流水线执行未完全通过: {summary}", COLOR_BOLD + COLOR_RED))
-            sys.exit(_execution_exit_code())
-        print(c(f"\n✔ [Makewand DAG Engine] 全部 DAG 拓扑阶段均已高质量交付验收！", COLOR_BOLD + COLOR_GREEN))
-        sys.exit(0)
+            code = _execution_exit_code()
+            sys.exit(code if code != EXIT_PASSED else EXIT_FAILED)
+        # execute_task_dag already printed what was applied to the workspace and what is pending.
+        sys.exit(EXIT_PASSED)
 
 def cmd_aci(args):
     """LLM-dedicated Agent-Computer Interface commands (SWE-agent inspired)."""
@@ -664,8 +687,55 @@ def cmd_sandbox(args):
             sys.stderr.write(f"Sandbox Error: {ex}\n")
         sys.exit(ret if ret > 0 else 1)
 
+def _obstacle_note(obstacles):
+    """Workspace entries apply cannot write (candidate.application_obstacles), for a listing."""
+    items = [f"{path} ({why})" for path, why in sorted(obstacles.items())]
+    return ", ".join(items[:6]) + (f" 等 {len(items)} 项" if len(items) > 6 else "")
+
+
+def _outcome_operations(race, kind):
+    """The inspect/apply/discard commands that work for this record as it is."""
+    from makewand.candidate import record_application_obstacles
+    r_id = race.get("race_id")
+    candidates = race.get("candidates", {})
+
+    def obstacles_of(label):
+        # Workspace entries that fail every apply of this candidate, also with --force.
+        return {} if race.get("applied_at") else record_application_obstacles(race, label)
+
+    if kind == "dag":
+        workspace = candidates.get("A", {}).get("path", "")
+        if (race.get("dag") or {}).get("blocked"):
+            return (f"makewand inspect {r_id} --candidate A | makewand discard {r_id} "
+                    f"(含符号链接/子模块条目，无法 apply；请从暂存区人工恢复: {workspace})")
+        obstacles = obstacles_of("A")
+        if obstacles:
+            return (f"makewand inspect {r_id} --candidate A | makewand discard {r_id} "
+                    f"(工作区中的 {_obstacle_note(obstacles)} 使 apply 无法交付，--force 也不例外；"
+                    f"请从暂存区人工恢复: {workspace})")
+        if candidates.get("A", {}).get("review_passed") is not True:
+            return (f"makewand inspect {r_id} --candidate A | 人工确认后: makewand apply {r_id} --candidate A --force"
+                    f" | makewand discard {r_id}")
+        return f"makewand inspect {r_id} --candidate A | makewand apply {r_id} --candidate A | makewand discard {r_id}"
+    merge = (f" | makewand apply {r_id} --merge"
+             if candidates.get("M", {}).get("review_passed") is True and not obstacles_of("M") else "")
+    blocked = {label: obstacles_of(label) for label in ("A", "B")}
+    notes = "".join(f" (工作区中的 {_obstacle_note(found)} 使 apply 选手 {label} 无法交付，--force 也不例外；"
+                    f"可从其候选工作区人工恢复: {candidates.get(label, {}).get('path', '')})"
+                    for label, found in blocked.items() if found)
+    if kind in ("judge", "winner_take_all"):
+        if blocked.get(race.get("winner")):
+            return f"makewand inspect {r_id}{merge} | makewand discard {r_id}{notes}"
+        return f"makewand inspect {r_id} | makewand apply {r_id}{merge} | makewand discard {r_id}"
+    usable = "|".join(label for label, found in blocked.items() if not found)
+    if not usable:
+        return f"makewand inspect {r_id} --candidate A|B{merge} | makewand discard {r_id}{notes}"
+    return (f"makewand inspect {r_id} --candidate A|B | 人工确认后: makewand apply {r_id} --candidate {usable} --force"
+            f"{merge} | makewand discard {r_id}{notes}")
+
+
 def cmd_candidates(args):
-    from makewand.candidate import CandidateManager
+    from makewand.candidate import CandidateManager, describe_race_outcome
     races = CandidateManager.list_races()
     if not races:
         print("当前没有任何封存的候选工作区。通过 'makewand race <任务>' 发起竞速即可产生候选。")
@@ -677,16 +747,62 @@ def cmd_candidates(args):
         r_id = r.get("race_id")
         created = r.get("created_at", "")[:19]
         prompt = r.get("prompt", "")
-        winner = r.get("winner") or "未决"
-        a_mod = r.get("candidates", {}).get("A", {}).get("model", "A")
-        b_mod = r.get("candidates", {}).get("B", {}).get("model", "B")
+        kind, label = describe_race_outcome(r)
+        color = COLOR_GREEN + COLOR_BOLD if kind in ("judge", "winner_take_all") else COLOR_YELLOW + COLOR_BOLD
         print(f"• ID: {c(r_id, COLOR_YELLOW + COLOR_BOLD)}  时间: {created}")
         print(f"  任务: {prompt}")
-        print(f"  对决: 选手 A ({a_mod}) vs 选手 B ({b_mod}) | 推荐胜出: {c(winner, COLOR_GREEN + COLOR_BOLD)}")
-        print(f"  操作: makewand inspect {r_id} | makewand apply {r_id} | makewand discard {r_id}\n")
+        if kind == "dag":
+            print(f"  类型: {c(label, color)}")
+        else:
+            a_mod = r.get("candidates", {}).get("A", {}).get("model", "A")
+            b_mod = r.get("candidates", {}).get("B", {}).get("model", "B")
+            print(f"  对决: 选手 A ({a_mod}) vs 选手 B ({b_mod}) | {c(label, color)}")
+        print(f"  操作: {_outcome_operations(r, kind)}\n")
+
+def _inspect_dag(race, cand):
+    """A DAG record holds one cumulative result (A), not two contestants."""
+    cand_a = race.get("candidates", {}).get("A", {})
+    dag = race.get("dag") if isinstance(race.get("dag"), dict) else {}
+    if cand == "A":
+        print(c(f"--- DAG 累积结果 A ({cand_a.get('model')}) 改动详情 (git diff) ---", COLOR_CYAN + COLOR_BOLD))
+        diff = cand_a.get("diff", "")
+        print(diff if diff else "无有效代码变更")
+        return
+    if cand in ("B", "M"):
+        print(c(f"DAG 记录只有一个累积结果，请使用 'makewand inspect {race.get('race_id')} --candidate A' 查看。", COLOR_YELLOW))
+        return
+    if dag.get("subdirectory") not in (None, "."):
+        print(f"启动目录: {dag['subdirectory']} (子任务在仓库根目录的该子目录中执行，改动路径相对仓库根目录)")
+    labels = {"code": "代码子任务 (本地测试 + 独立审查)", "review": "只读审查", "explain": "只读解释", "identity": "只读问答"}
+    stages = dag.get("stages") or []
+    if stages:
+        print(c("--- DAG 子任务 ---", COLOR_BOLD))
+        for stage in stages:
+            print(f"  • {stage.get('task')}: {labels.get(stage.get('kind'), stage.get('kind') or '未知')}")
+        if dag.get("total") and len(stages) < dag["total"]:
+            print(f"  (共 {dag['total']} 个子任务，其余未执行或未通过)")
+    changes = cand_a.get("changes") or {}
+    print(f"累积改动: {len(changes)} 个文件, Diff大小={len(cand_a.get('diff', ''))} 字节")
+    for task_id, paths in (dag.get("discarded") or {}).items():
+        print(c(f"只读子任务 {task_id} 运行期间写入的文件已丢弃 (未交付): {', '.join(paths)}", COLOR_YELLOW))
+    if dag.get("blocked"):
+        print(c(f"无法 apply: 含符号链接/子模块条目 ({', '.join(dag['blocked'].get('paths') or [])})；"
+                f"请从暂存区人工恢复: {cand_a.get('path')}", COLOR_YELLOW))
+    elif not race.get("applied_at"):
+        from makewand.candidate import record_application_obstacles
+        obstacles = record_application_obstacles(race, "A")
+        if obstacles:
+            print(c(f"当前无法 apply: 工作区中的 {_obstacle_note(obstacles)} 使 makewand apply 无法交付 "
+                    f"(--force 也不例外)；请从暂存区人工恢复: {cand_a.get('path')}", COLOR_YELLOW))
+    print()
+    if race.get("judge_report"):
+        print(c("--- DAG 交付说明 ---", COLOR_BOLD))
+        print(race.get("judge_report").strip())
+    print(f"\n提示: 使用 'makewand inspect {race.get('race_id')} --candidate A' 查看完整累积代码差异。")
+
 
 def cmd_inspect(args):
-    from makewand.candidate import CandidateManager
+    from makewand.candidate import CandidateManager, describe_race_outcome
     race = CandidateManager.get_race(args.race_id)
     if not race:
         print(c(f"未找到候选记录: {args.race_id or '最新'}", COLOR_RED))
@@ -698,12 +814,15 @@ def cmd_inspect(args):
     print(f"原始任务: {c(race.get('prompt', ''), COLOR_BOLD)}")
     print(f"工作目录: {race.get('base_cwd')}")
     print(f"创建时间: {race.get('created_at', '')[:19]}")
-    winner = race.get("winner")
-    if winner:
-        print(f"主裁推荐: {c(f'选手 {winner}', COLOR_GREEN + COLOR_BOLD)}")
+    kind, label = describe_race_outcome(race)
+    color = COLOR_GREEN + COLOR_BOLD if kind in ("judge", "winner_take_all") else COLOR_YELLOW + COLOR_BOLD
+    print(f"结果类型: {c(label, color)}" if kind == "dag" else c(label, color))
     print()
 
     cand = (args.candidate.upper() if args.candidate else None)
+    if kind == "dag":
+        _inspect_dag(race, cand)
+        return
     cand_a = race.get("candidates", {}).get("A", {})
     cand_b = race.get("candidates", {}).get("B", {})
     cand_m = race.get("candidates", {}).get("M", {})
@@ -752,7 +871,7 @@ def cmd_inspect(args):
 
 def cmd_apply(args):
     from makewand.candidate import CandidateManager
-    ok, files, msg = CandidateManager.apply_candidate(
+    result = CandidateManager.apply_candidate(
         race_id=args.race_id,
         candidate_label=args.candidate,
         dry_run=args.dry_run,
@@ -760,18 +879,21 @@ def cmd_apply(args):
         merge=getattr(args, "merge", False),
         **({"protected_paths": args.protected_paths} if getattr(args, "protected_paths", None) is not None else {})
     )
+    ok, files, msg = result
     if not ok:
         print(c(f"❌ {msg}", COLOR_RED + COLOR_BOLD))
-        if getattr(msg, "status", None) == "TIMEOUT":
-            from makewand.execution_contract import ExecutionResult, EXIT_TIMEOUT
-            from makewand.execution_runtime import task_id
-            from makewand.workflow import remember_result
-            remember_result(ExecutionResult(False, None, str(msg), status="TIMEOUT",
-                task_id=task_id(), stage="apply", engine="candidate"))
-            sys.exit(EXIT_TIMEOUT)
-        if "冲突" in msg:
-            sys.exit(EXIT_APPLY_CONFLICT)
-        sys.exit(EXIT_FAILED)
+        # apply's typed outcome (ApplyResult.status), never words of its message: the
+        # exit status is the one the execution contract gives that status (APPLY_CONFLICT
+        # 14, UNVERIFIED 11, TIMEOUT 16, UNKNOWN 17, FAILED 10), recorded as the typed result.
+        from makewand.execution_contract import ExecutionResult, STATUS_CODES
+        from makewand.execution_runtime import task_id
+        from makewand.workflow import remember_result
+        status = getattr(result, "status", None)
+        if status not in STATUS_CODES or status == "PASSED":
+            status = "FAILED"
+        remember_result(ExecutionResult(False, None, str(msg).replace("\0", "\\0"), status=status,
+            task_id=task_id(), stage="apply", engine="candidate"))
+        sys.exit(STATUS_CODES[status])
 
     print(c(f"✔ {msg}", COLOR_GREEN + COLOR_BOLD))
     if files:
@@ -1230,7 +1352,7 @@ def _main():
 
     # status
     p_status = subparsers.add_parser("status", help="Show health, quota indicators (local estimates), and reset times of all AIs", parents=[sub_common_parser])
-    p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs (real model calls for claude/codex/muse/grok)")
+    p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs (real model calls for claude/codex/muse/grok; agy makes one real call while an agy quota limit has not reset, or while a login/region failure that a real agy dispatch or an earlier real probe recorded is still live; otherwise only a version check)")
     p_status.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # probe
@@ -1759,55 +1881,30 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
         cmd_sandbox(args)
     elif args.subcommand == "claude":
         ok, out, err = _execute_direct_task("claude", execute_claude_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("claude", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "codex":
         ok, out, err = _execute_direct_task("codex", execute_codex_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("codex", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "agy":
         ok, out, err = _execute_direct_task("agy", execute_agy_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("agy", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "muse":
         ok, out, err = _execute_direct_task("muse", execute_muse_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("muse", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(_execution_exit_code())
     elif args.subcommand == "grok":
         ok, out, err = _execute_direct_task("grok", execute_grok_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("grok", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
@@ -1815,11 +1912,6 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "local":
         from makewand.providers.local import execute_local_task
         ok, out, err = _execute_direct_task("local", execute_local_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("local", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
@@ -1827,11 +1919,6 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "aider":
         from makewand.providers.aider import execute_aider_task
         ok, out, err = _execute_direct_task("aider", execute_aider_task, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted"))
-        try:
-            from makewand.usage import record_engine_usage
-            record_engine_usage("aider", tier=getattr(args, "tier", "standard"), success=ok, task=args.prompt)
-        except Exception:
-            pass
         if ok and not args.stream: print(out)
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")

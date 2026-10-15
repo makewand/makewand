@@ -14,8 +14,10 @@ Comprehensive Verification Tests for v3.1.0 Full Audit Remediations:
 
 try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
     import _isolation  # noqa: F401
+    from _verdicts import answer_with_nonce, nonced
 except ImportError:  # python3 -m unittest tests.<module>
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import answer_with_nonce, nonced
 
 import os
 import shutil
@@ -200,7 +202,7 @@ class TestAuditV31Fixes(unittest.TestCase):
 
             def fake_dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):
                 if readonly:
-                    return True, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}', None
+                    return True, nonced(prompt, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}'), None
                 (Path(cwd) / "app.py").write_text(f"ENGINE = {engine!r}\n", encoding="utf-8")
                 return True, "output code", None
 
@@ -228,7 +230,8 @@ class TestAuditV31Fixes(unittest.TestCase):
         with patch("makewand.orchestrator.execute_claude_task", return_value=(True, "ok", None)), \
              patch("makewand.usage.record_engine_usage") as mock_usage:
             dispatch_task("claude", "test prompt", tier="standard")
-            mock_usage.assert_called_once_with("claude", tier="standard", success=True, task="test prompt")
+            # The fake adapter reports no route (cli/api): the ledger then infers it (usage.dispatch_route).
+            mock_usage.assert_called_once_with("claude", tier="standard", success=True, task="test prompt", route=None)
 
     def test_p1_3_fail_and_cleanup_hard_reset_to_baseline(self):
         """P1-3: fail_and_cleanup in host mode resets hard to task_baseline when initial workspace is clean."""
@@ -254,7 +257,7 @@ class TestAuditV31Fixes(unittest.TestCase):
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=coder_advances_head), \
-                 patch("makewand.orchestrator.execute_codex_task", return_value=(True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"fatal bug\"]}", None)):
+                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"fatal bug\"]}", None))):
                 res = run_pipeline("写一段代码", cwd=tmpdir, stream=False, auto_fix=False, force_code=True)
                 self.assertFalse(res)
                 # Verify hard reset to initial baseline: app.py must be reverted and commit rolled back!
@@ -347,7 +350,7 @@ class TestAuditV31Fixes(unittest.TestCase):
             def fake_dispatch(eng, prompt, cwd=None, **kw):
                 call_args_list.append((eng, kw))
                 if kw.get("readonly"):
-                    return True, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None
+                    return True, nonced(prompt, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"), None
                 else:
                     (Path(cwd) / "app.py").write_text("print('updated')\n")
                     return True, "written", None
@@ -385,9 +388,9 @@ class TestAuditV31Fixes(unittest.TestCase):
                 call_count[0] += 1
                 if kw.get("readonly"):
                     if "经过上一轮缺陷修复后" in prompt:
-                        return True, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}", None
+                        return True, nonced(prompt, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"), None
                     else:
-                        return True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"typo bug\"]}", None
+                        return True, nonced(prompt, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"typo bug\"]}"), None
                 else:
                     (Path(cwd) / "app.py").write_text(f"new content {call_count[0]}\n")
                     return True, "code written", None
@@ -483,7 +486,7 @@ class TestAuditV31Fixes(unittest.TestCase):
             with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
                  patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
                  patch("makewand.orchestrator.execute_claude_task", side_effect=buggy_coder), \
-                 patch("makewand.orchestrator.execute_codex_task", return_value=(True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"bug\"]}", None)):
+                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"bug\"]}", None))):
                 art_base = _isolation.artifacts_root()
                 rej_before = {d: _patch_stamp(d) for d in art_base.glob("rejected_*")}
                 run_pipeline("fix code", cwd=td, stream=False, auto_fix=False, force_code=True)

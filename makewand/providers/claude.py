@@ -7,25 +7,37 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_BLUE
-from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout
+from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 from makewand.workflow import provider_outcome
 
 # Built-in tools available to read-only Claude tasks (review / analysis).
 CLAUDE_READONLY_TOOLS = "Read,Grep,Glob"
 
-def parse_claude_quota(output: str) -> Tuple[bool, str, Optional[str]]:
-    lower = output.lower()
-    if any(k in lower for k in ["hit your limit", "hit your monthly spend limit", "hit your usage limit", "usage limit reached", "5-hour limit", "weekly limit reached", "exceeded your current quota"]):
-        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit\s*(?:[·•\-\.]\s*)?resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
-        reset_time = reset_match.group(1).strip().rstrip(". ") if reset_match else (datetime.now() + timedelta(hours=3)).isoformat()
+# "Claude AI usage limit reached|<unix seconds>": the reset is the epoch suffix.
+_CLAUDE_EPOCH_RESET_RE = re.compile(r"usage\s+limit\s+reached\s*\|\s*(\d{10})\b", re.IGNORECASE)
+
+
+def parse_claude_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
+    """Limit refusals Claude Code prints itself (health.CLI_MESSAGE_CATALOG["claude"]).
+
+    `stderr` is passed when the streams were captured apart; otherwise
+    `output` is the merged text.
+    """
+    from makewand.health import find_cli_messages, extract_reset_phrase
+    found = find_cli_messages("claude", ("quota", "overload", "rate"), output, stderr)
+    line = found.get("quota")
+    if line is not None:
+        epoch = _CLAUDE_EPOCH_RESET_RE.search(line)
+        reset_time = (datetime.fromtimestamp(int(epoch.group(1))).isoformat() if epoch
+                      else extract_reset_phrase(line) or (datetime.now() + timedelta(hours=3)).isoformat())
         return True, f"限流 / 额度耗尽 (重置时间: {reset_time})", reset_time
-    if "overloaded_error" in lower or "server overloaded" in lower:
+    if "overload" in found:
         iso_reset = (datetime.now() + timedelta(minutes=3)).isoformat()
         return True, "Anthropic 服务端负载过高 (Overloaded)", iso_reset
-    if "rate_limit_error" in lower or (re.search(r"\b(?:rate\s*limit(?:ed)?|too\s*many\s*requests|http\s+429|status(?:\s*code)?\s*[:=]?\s*429)\b", lower) and "middleware" not in lower and "test_" not in lower):
-        reset_match = re.search(r"(?:session|weekly|monthly|daily)?\s*limit\s*(?:[·•\-\.]\s*)?resets\s+(?:at|in)?\s*([^·\n]+)", output, re.IGNORECASE)
-        if reset_match:
-            reset_time = reset_match.group(1).strip().rstrip(". ")
+    line = found.get("rate")
+    if line is not None:
+        reset_time = extract_reset_phrase(line)
+        if reset_time:
             return True, f"限流 / 额度耗尽 (重置时间: {reset_time})", reset_time
         iso_reset = (datetime.now() + timedelta(hours=3)).isoformat()
         return True, "API 并发或频次超限 (429)", iso_reset
@@ -66,23 +78,41 @@ def execute_claude_task(
             return False, None, "不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务"
 
     cache = load_status_cache()
-    from makewand.config import has_api_configured, has_subscription_configured
+    from makewand.config import api_relay_available, api_relay_blocked_note, has_subscription_configured
     from makewand.providers.api_client import call_api_chat
+    from makewand.usage import note_dispatch_route
+
+    def relay(notice):
+        # Only with a key AND an API policy that allows paid calls
+        # (config.api_relay_available): engine selection counts a limited,
+        # logged-out or missing CLI as usable by the same rule.
+        import sys
+        print(c(notice, COLOR_BLUE), file=sys.stderr)
+        note_dispatch_route("api")
+        return provider_outcome(call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
+
+    def no_relay(reason, hint):
+        blocked = api_relay_blocked_note("claude")
+        return f"{reason} ({blocked})" if blocked else f"{reason} ({hint})"
 
     # If subscription is missing or limited, fallback to Anthropic API
     if not has_subscription_configured("claude"):
-        if has_api_configured("claude"):
-            import sys
-            print(c("[Makewand -> Claude] (纯 API 模式) 派发任务至 Anthropic Claude API...", COLOR_BLUE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
-        return False, None, "未找到 Claude CLI 订阅，且未配置 ANTHROPIC_API_KEY"
+        if api_relay_available("claude"):
+            return relay("[Makewand -> Claude] (纯 API 模式) 派发任务至 Anthropic Claude API...")
+        blocked = api_relay_blocked_note("claude")
+        return False, None, (f"未找到 Claude CLI 订阅；{blocked}" if blocked
+                             else "未找到 Claude CLI 订阅，且未配置 ANTHROPIC_API_KEY")
+
+    # A live login failure is relayed like a quota limit (engine selection counts
+    # needs_auth as usable only with an allowed API relay); otherwise the CLI runs.
+    if cache.get("claude", {}).get("status") == "needs_auth" and api_relay_available("claude"):
+        return relay("[Makewand -> Claude] 订阅登录失效，自动降级为 Anthropic API 模式接力执行...")
 
     if cache.get("claude", {}).get("status") == "limited":
-        if has_api_configured("claude"):
-            import sys
-            print(c("[Makewand -> Claude] 订阅额度受限，无缝自动降级为 Anthropic API 模式接力执行...", COLOR_BLUE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
-        return False, None, f"Claude Code 当前额度受限: {cache['claude'].get('reason')} (可配置 ANTHROPIC_API_KEY 作为备用 API 自动接力)"
+        if api_relay_available("claude"):
+            return relay("[Makewand -> Claude] 订阅额度受限，无缝自动降级为 Anthropic API 模式接力执行...")
+        return False, None, no_relay(f"Claude Code 当前额度受限: {cache['claude'].get('reason')}",
+                                     "可配置 ANTHROPIC_API_KEY 作为备用 API 自动接力")
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:
@@ -146,6 +176,7 @@ def execute_claude_task(
             log_desc = "只读解析任务 (工具只读约束)" if readonly else "代码任务 (无头权限自动穿透)"
             import sys
             print(c(f"[Makewand -> Claude] 派发{log_desc} (Tier: {tier})...", COLOR_BLUE), file=sys.stderr)
+            note_dispatch_route("cli")
             mark_provider_invocation()
             code, out, err, ex = run_subprocess(
                 launch.cmd,
@@ -156,12 +187,14 @@ def execute_claude_task(
                 print_prefix=c("[Claude Live]", COLOR_BLUE),
                 pass_fds=launch.pass_fds,
                 extra_env=launch.env,
+                separate_stderr=True,
             )
     except SandboxUnavailableError as exc:
         return False, None, str(exc)
     except SandboxConfigError as exc:
         return False, None, f"Claude 沙箱构建失败，拒绝执行 (fail closed): {exc}"
-    combined = f"{out}\n{err}" if not stream else out
+    apart = stderr_captured_apart(err, stream)
+    combined = f"{out}\n{err}" if apart else out
 
     if code == 0:
         return True, out, None
@@ -169,14 +202,12 @@ def execute_claude_task(
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("claude", code, combined, err, ex, readonly)
 
-    is_limited, reason, resets = parse_claude_quota(combined)
+    is_limited, reason, resets = parse_claude_quota(out, err if apart else None)
     if is_limited:
         from makewand.health import record_engine_limit
         record_engine_limit("claude", reason, resets)
-        if has_api_configured("claude"):
-            import sys
-            print(c(f"[Makewand -> Claude] 订阅触发限流 ({reason})，无缝切换为 Anthropic API Key 模式接力执行...", COLOR_BLUE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="claude", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
-        return False, None, f"Claude Code 执行中触发额度限制: {reason} (可配置 ANTHROPIC_API_KEY 实现自动接力)"
+        if api_relay_available("claude"):
+            return relay(f"[Makewand -> Claude] 订阅触发限流 ({reason})，无缝切换为 Anthropic API Key 模式接力执行...")
+        return False, None, no_relay(f"Claude Code 执行中触发额度限制: {reason}", "可配置 ANTHROPIC_API_KEY 实现自动接力")
 
     return model_process_failure("claude", code, combined, err, ex, readonly)

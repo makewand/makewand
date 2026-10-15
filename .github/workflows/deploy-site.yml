@@ -1,0 +1,52 @@
+name: Deploy site
+
+# Publishes site/ (makewand.org, makewand.com) to Cloudflare Pages whenever it
+# changes on master, so the served install.sh cannot fall behind the repo again.
+# Needs the repository secrets CLOUDFLARE_API_TOKEN (Pages: Edit) and
+# CLOUDFLARE_ACCOUNT_ID; without them the job only prints a notice.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Skip without Cloudflare credentials
+        if: env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == ''
+        run: echo "::notice::CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is not set; the site was not deployed."
+      - uses: actions/checkout@v7
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+      - name: Deploy to Cloudflare Pages
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        run: npx --yes wrangler@4.148.0 pages deploy site --project-name=makewand --branch=master --commit-hash="$GITHUB_SHA"
+      - name: Check the served installer
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        run: |
+          for domain in makewand.org makewand.com; do
+            for attempt in $(seq 1 18); do
+              if curl -fsSL "https://$domain/install.sh" -o served.sh && cmp -s served.sh site/install.sh; then
+                echo "$domain serves the current install.sh"
+                continue 2
+              fi
+              sleep 10
+            done
+            echo "::error::$domain still serves a different install.sh three minutes after the deploy"
+            exit 1
+          done

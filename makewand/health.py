@@ -10,8 +10,9 @@ import warnings
 from makewand import filelock as fcntl
 import uuid
 import tempfile
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from typing import Dict, Any, Optional, Iterator, Tuple
 from pathlib import Path
 from makewand.config import (
     STATUS_CACHE_FILE,
@@ -39,6 +40,9 @@ STATUS_LOCK_FILE = STATUS_CACHE_FILE.parent / ".status.lock"
 # A cached "healthy"/"warning" verdict older than this is no longer evidence of
 # anything: it is treated as neutral and the user is asked to re-probe.
 STATUS_STALE_SECONDS = 6 * 3600
+# Cache writers share this host's clock; an updated_at further ahead of now than
+# this allowance is damaged, not a fresh observation, and counts as no timestamp.
+STATUS_CLOCK_SKEW_SECONDS = 5 * 60
 # Failure verdicts self-heal back to neutral ("unknown") after a TTL so that one
 # probe timeout or one failed login check can never exclude a provider forever.
 STATUS_TTL_SECONDS = {
@@ -47,6 +51,9 @@ STATUS_TTL_SECONDS = {
 }
 # Geographic/account-level blocks rarely change within minutes; re-check later.
 REGION_BLOCK_TTL_SECONDS = 6 * 3600
+# Upper bound on an entry's own "ttl_seconds" (the longest any writer sets is
+# REGION_BLOCK_TTL_SECONDS): a damaged value cannot exclude a provider forever.
+FAILURE_TTL_MAX_SECONDS = 24 * 3600
 
 
 QUOTA_RESERVE_ENV = "MAKEWAND_QUOTA_RESERVE_PERCENT"
@@ -129,133 +136,854 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Quota reset times. One parser serves the status cache (is_reset_time_passed)
+# and pacing (parse_reset_time_to_seconds_left), so both read a provider's
+# "resets ..." text the same way.
+# ---------------------------------------------------------------------------
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_RESET_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_RESET_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+                r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+# "Claude AI usage limit reached|1760000000": Unix seconds after a pipe.
+_RESET_EPOCH_RE = re.compile(r"(?:^|\|)\s*(\d{10})(?:\.\d+)?\s*$")
+_RESET_ISO_RE = re.compile(
+    r"(?<![\d.])(\d{4})-(\d{1,2})-(\d{1,2})"
+    r"(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,6})\d*)?)?\s*(Z|[+-]\d{2}(?::?\d{2})?)?)?(?![\d.])",
+    re.IGNORECASE)
+_RESET_NAMED_DATE_RE = re.compile(
+    rf"\b(?P<mon>{_RESET_MONTH})\.?\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\b(?:\s*,?\s*(?P<year>\d{{4}})\b)?"
+    rf"|\b(?P<day2>\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<mon2>{_RESET_MONTH})\b\.?(?:\s*,?\s*(?P<year2>\d{{4}})\b)?",
+    re.IGNORECASE)
+# "10-04 10:40": month-day in ISO order without the year; only with a clock time.
+_RESET_NUMERIC_DATE_RE = re.compile(r"(?<![\w/:.-])(\d{1,2})-(\d{1,2})(?![\w/:.-])")
+_RESET_CLOCK_RE = re.compile(
+    r"(?<![\w:.])(?P<h>\d{1,2})(?::(?P<m>\d{2}))?(?::(?P<s>\d{2}))?\s*(?P<ap>[ap])\.?\s?m\b\.?"
+    r"|(?<![\w:.])(?P<H>\d{1,2}):(?P<M>\d{2})(?::(?P<S>\d{2}))?(?![\d:])",
+    re.IGNORECASE)
+_RESET_DURATION_RE = re.compile(
+    r"(?<![\w.-])((?:\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s|天|小时|分钟|秒)"
+    r"(?![a-z])\s*,?\s*(?:and\s+)?)+)",
+    re.IGNORECASE)
+_RESET_ZONE_RE = re.compile(
+    r"\b(?P<iana>[A-Z][A-Za-z]+(?:/[A-Za-z][A-Za-z0-9_+-]*){1,2})"
+    r"|\b(?P<fixed>UTC|GMT)(?:\s*(?P<sign>[+-])\s*(?P<oh>\d{1,2})(?::?(?P<om>\d{2}))?)?\b")
+
+
+def _as_local_aware(value: datetime) -> datetime:
+    """Naive timestamps in the cache and in provider output are local wall-clock time."""
+    return value.astimezone() if value.tzinfo is None else value
+
+
+def _reset_zone(text: str):
+    """The zone a reset string names ("(Asia/Shanghai)", "UTC+8") and the text without it."""
+    for match in _RESET_ZONE_RE.finditer(text):
+        if match.group("iana"):
+            try:
+                from zoneinfo import ZoneInfo
+                zone = ZoneInfo(match.group("iana"))
+            except Exception:  # unknown key ("Pro/Max"), or no tz database (Windows without tzdata)
+                continue
+        else:
+            minutes = 0
+            if match.group("sign"):
+                minutes = int(match.group("oh")) * 60 + int(match.group("om") or 0)
+                if minutes > 14 * 60:
+                    continue
+                minutes = -minutes if match.group("sign") == "-" else minutes
+            zone = timezone(timedelta(minutes=minutes))
+        return zone, f"{text[:match.start()]} {text[match.end():]}"
+    return None, text
+
+
+def _reset_moment(year, month, day, hour, minute, second, zone) -> datetime:
+    naive = datetime(year, month, day, hour, minute, second)
+    return naive.replace(tzinfo=zone) if zone is not None else naive.astimezone()
+
+
+def _first_clock(text: str, exclude=None) -> Optional[Tuple[int, int, int]]:
+    for match in _RESET_CLOCK_RE.finditer(text):
+        if exclude and match.start() < exclude[1] and match.end() > exclude[0]:
+            continue
+        if match.group("ap"):
+            hour, minute, second = int(match.group("h")), int(match.group("m") or 0), int(match.group("s") or 0)
+            if not 1 <= hour <= 12:
+                continue
+            hour = hour % 12 + (12 if match.group("ap").lower() == "p" else 0)
+        else:
+            hour, minute, second = int(match.group("H")), int(match.group("M")), int(match.group("S") or 0)
+            if hour > 23:
+                continue
+        if minute <= 59 and second <= 59:
+            return hour, minute, second
+    return None
+
+
+def _nearest_occurrence(month, day, hour, minute, second, zone, anchor: datetime) -> Optional[datetime]:
+    """A month-day without a year is the occurrence closest to when it was observed.
+
+    Reset windows are days or weeks long, so the nearest candidate is the right
+    year: a reset that passed an hour ago is in the past, not 11 months ahead,
+    and "Jan 1" observed on Dec 31 is next year.
+    """
+    base_year = (anchor.astimezone(zone) if zone is not None else anchor.astimezone()).year
+    best = None
+    for year in (base_year - 1, base_year, base_year + 1):
+        try:
+            candidate = _reset_moment(year, month, day, hour, minute, second, zone)
+        except ValueError:  # Feb 29 outside leap years
+            continue
+        if best is None or abs((candidate - anchor).total_seconds()) < abs((best - anchor).total_seconds()):
+            best = candidate
+    return best
+
+
+def _next_clock_occurrence(hour, minute, second, zone, anchor: datetime) -> datetime:
+    """A bare clock time is its first occurrence at or after the observation."""
+    day = (anchor.astimezone(zone) if zone is not None else anchor.astimezone()).date()
+    candidate = anchor
+    for extra in (0, 1, 2):
+        current = day + timedelta(days=extra)
+        candidate = _reset_moment(current.year, current.month, current.day, hour, minute, second, zone)
+        if candidate >= anchor:
+            break
+    return candidate
+
+
+def _start_of_day(moment: datetime, zone) -> datetime:
+    day = (moment.astimezone(zone) if zone is not None else moment.astimezone()).date()
+    return _reset_moment(day.year, day.month, day.day, 0, 0, 0, zone)
+
+
+def parse_reset_datetime(text: Any, observed_at: Any = None, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Absolute, timezone-aware moment a quota window resets, or None.
+
+    Understands what the provider CLIs print: "Oct 20, 8pm (Asia/Shanghai)",
+    "Oct 20th, 2026 8:00 PM", "8:30pm", "20:00", "10-04 10:40", ISO-8601,
+    relative "in 3h 20m" / "2 hours", and "...limit reached|<unix seconds>". A
+    trailing "(Area/City)" or "UTC+8" zone is honoured (zoneinfo), otherwise
+    local time. Times without a date, durations, and dates without a year are
+    anchored on when the message was observed (observed_at, else now). Without
+    a usable observation (missing, unparseable, or outside the platform's time
+    range) a bare clock time is today's occurrence, so a limit stored without a
+    timestamp still heals once that time has passed.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    s = _ANSI_ESCAPE_RE.sub("", text).strip()
+    try:
+        now_dt = _as_local_aware(now if isinstance(now, datetime) else datetime.now())
+        observed = observed_at if isinstance(observed_at, datetime) else _parse_timestamp(observed_at)
+        try:
+            anchor = _as_local_aware(observed) if observed is not None else None
+        except (ValueError, OverflowError, OSError):  # "0001-01-01T00:00:00", "9999-12-31T23:59:59"
+            anchor = None
+        epoch = _RESET_EPOCH_RE.search(s)
+        if epoch:
+            return datetime.fromtimestamp(int(epoch.group(1)), timezone.utc)
+        zone, s = _reset_zone(s)
+
+        iso = _RESET_ISO_RE.search(s)
+        if iso:
+            year, month, day = int(iso.group(1)), int(iso.group(2)), int(iso.group(3))
+            if iso.group(4) is None:
+                # "10:58 (2026-09-27)": a date with the clock time elsewhere.
+                hour, minute, second = _first_clock(s, exclude=iso.span()) or (0, 0, 0)
+                return _reset_moment(year, month, day, hour, minute, second, zone)
+            naive = datetime(year, month, day, int(iso.group(4)), int(iso.group(5)), int(iso.group(6) or 0),
+                             int((iso.group(7) or "0").ljust(6, "0")))
+            offset = iso.group(8)
+            if offset and offset.upper() == "Z":
+                return naive.replace(tzinfo=timezone.utc)
+            if offset:
+                digits = offset[1:].replace(":", "")
+                delta = timedelta(hours=int(digits[:2]), minutes=int(digits[2:4] or 0))
+                return naive.replace(tzinfo=timezone(-delta if offset[0] == "-" else delta))
+            return naive.replace(tzinfo=zone) if zone is not None else naive.astimezone()
+
+        named = _RESET_NAMED_DATE_RE.search(s)
+        numeric = None if named else _RESET_NUMERIC_DATE_RE.search(s)
+        date_match = named or numeric
+        if date_match:
+            if named:
+                month = _RESET_MONTHS.index((named.group("mon") or named.group("mon2"))[:3].lower()) + 1
+                day = int(named.group("day") or named.group("day2"))
+                year_text = named.group("year") or named.group("year2")
+            else:
+                month, day, year_text = int(numeric.group(1)), int(numeric.group(2)), None
+            clock = _first_clock(s, exclude=date_match.span())
+            if named or clock is not None:
+                hour, minute, second = clock or (0, 0, 0)
+                if year_text:
+                    return _reset_moment(int(year_text), month, day, hour, minute, second, zone)
+                return _nearest_occurrence(month, day, hour, minute, second, zone, anchor or now_dt)
+
+        clock = _first_clock(s)
+        if clock is not None:
+            return _next_clock_occurrence(*clock, zone, anchor or _start_of_day(now_dt, zone))
+
+        duration = _RESET_DURATION_RE.search(s)
+        if duration:
+            seconds = 0.0
+            for amount, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]+|天|小时|分钟|秒)", duration.group(1), re.IGNORECASE):
+                unit = unit.lower()
+                factor = (86400 if unit[0] in "d天" else 3600 if unit[0] in "h小" else
+                          60 if unit[0] in "m分" else 1)
+                seconds += float(amount) * factor
+            return (anchor or now_dt) + timedelta(seconds=seconds)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return None
+
+
+_RESET_PHRASE_RE = re.compile(
+    r"\b(?:resets?|reset\s+time|renews?|try\s+again|retry|available\s+again)\b(?:\s+(?:at|on))?\s*:?\s*"
+    r"(?P<when>(?:in\s+)?[^·•∙|\n]+)",
+    re.IGNORECASE)
+
+
+def extract_reset_phrase(text: str) -> Optional[str]:
+    """The reset time a quota message announces, as printed.
+
+    "Weekly limit reached · resets Oct 20, 8pm (Asia/Shanghai)" -> "Oct 20, 8pm
+    (Asia/Shanghai)"; "Try again in 2 hours." -> "in 2 hours". The phrase ends
+    at the next separator or sentence; only text parse_reset_datetime
+    understands is returned, so callers can fall back to a default window.
+    """
+    for match in _RESET_PHRASE_RE.finditer(_ANSI_ESCAPE_RE.sub("", text or "")):
+        when = re.split(r"\.\s+(?=[A-Z])|;|\s+or\s+|,\s+(?:or|and)\s+|\s+-\s+", match.group("when"))[0]
+        when = when.strip().rstrip(".,;: ").strip()
+        if when and parse_reset_datetime(when) is not None:
+            return when
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Provider CLI messages. A quota, rate-limit, login or region failure is read
+# only from a message the provider CLI prints itself, at the start of a line
+# the CLI writes (find_cli_messages). The same words in the model's answer or
+# in tool output relayed into a transcript ("gh: API rate limit exceeded",
+# "npm ERR! 429", "429 passed", "expected 401 Unauthorized", "Too many requests
+# from a single IP are now rejected") are task content and never disable a
+# provider.
+#
+# The catalog is data, cli_message_catalog.json next to this module, which
+# router/cli.go mirrors byte for byte; its "_doc" describes the format. It
+# holds what each CLI really prints, taken from the strings of the installed
+# binaries and bundles (Claude Code 2.1.296, codex-linux-x64 0.162.1, Grok
+# Build 1.0.50, Muse Code 1.4.6, agy 1.3.2, Gemini CLI 0.63.0), plus the short
+# forms existing callers rely on, and how the lines a CLI writes itself are
+# told apart from the answer:
+#   own_streams     where the CLI writes its own messages when stdout and
+#                   stderr are captured apart (claude -p: its result text on
+#                   stdout; codex exec, grok -p, agy -p, gemini -p: stderr;
+#                   Muse Code's split is unknown, so both)
+#   selection       "lines" (every own line), "final_report" (the error report
+#                   the CLI ends with, for text that may also hold the answer)
+#                   or "transcript" (codex exec's transcript sections, and the
+#                   fatal error report its main ends with)
+#   json_reports    the CLI prints JSON error reports over several lines
+#                   (gemini --output-format json): each is read as one line
+#   kinds           quota, rate, overload, auth and region patterns; a
+#                   "<kind>.marked" pattern counts only behind an error marker
+# Every pattern is RE2 compatible and matches at the start of normalize_cli_line()
+# text, case-insensitively for ASCII letters only: Python compiles it with
+# re.IGNORECASE | re.ASCII (cli_catalog_regex), Go with cliCatalogRegexp in
+# router/cli.go, which anchors it (`^(?:` + p + `)`) and spells out both cases of
+# each ASCII letter instead of using (?i), whose Unicode folding (the Kelvin sign
+# for k, the long s for s) Python's re.ASCII does not do.
+# ---------------------------------------------------------------------------
+CLI_MESSAGE_CATALOG_FILE = Path(__file__).with_name("cli_message_catalog.json")
+
+
+def cli_catalog_regex(pattern: str):
+    """A catalog pattern as both readers compile it: case-insensitive, ASCII
+    character classes, anchored at the start of the text by match()."""
+    return re.compile(pattern, re.IGNORECASE | re.ASCII)
+
+
+def _load_cli_catalog() -> Dict[str, Any]:
+    with open(CLI_MESSAGE_CATALOG_FILE, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+_CLI_CATALOG = _load_cli_catalog()
+_CLI_PROVIDERS: Dict[str, Dict[str, Any]] = _CLI_CATALOG["providers"]
+CLI_MESSAGE_CATALOG: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    provider: {kind: tuple(patterns) for kind, patterns in entry["kinds"].items()}
+    for provider, entry in _CLI_PROVIDERS.items()}
+# Names a CLI prints in front of its own lines ("grok: ...", "muse: ...").
+CLI_NAMES = {provider: tuple(entry["names"]) for provider, entry in _CLI_PROVIDERS.items()}
+CLI_OWN_STREAMS = {provider: tuple(entry["own_streams"]) for provider, entry in _CLI_PROVIDERS.items()}
+
+CLI_MESSAGE_MAX_CHARS = 2000
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'", "\u2032": "'"})
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+_CLI_LINES = {name: cli_catalog_regex(pattern) for name, pattern in _CLI_CATALOG["lines"].items()}
+# Go glog diagnostics agy writes to stderr ("E1012 08:11:57.633062  188 errorreport.go:224] ...").
+GLOG_HEADER_RE = _CLI_LINES["glog_header"]
+_GLOG_ANYWHERE_RE = re.compile(r"(?m)^\s*(?:\x1b\[[0-9;]*m)?[IWEF]\d{4} +\d{2}:\d{2}:\d{2}\.")
+_JSON_LINE_START = tuple('{}[]",')
+_JSON_SCALAR_LINE_RE = re.compile(r"(?:-?\d[\d.eE+-]*|true|false|null),?$")
+_FENCE_PREFIXES = ("```", "~~~")
+
+
+def cli_catalog_entry(provider: str) -> Dict[str, Any]:
+    """`provider`'s entry of the CLI message catalog (empty for unknown CLIs)."""
+    return _CLI_PROVIDERS.get(provider, {})
+
+
+def _normalize_bare(text: str) -> str:
+    return _WHITESPACE_RUN_RE.sub(" ", text[:CLI_MESSAGE_MAX_CHARS].translate(_APOSTROPHES)).strip()
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text) if "\x1b" in text else text
+
+
+def normalize_cli_line(line: str) -> str:
+    """A line as the catalog patterns read it: ANSI stripped, typographic
+    apostrophes as "'", whitespace runs collapsed to one space."""
+    return _normalize_bare(_strip_ansi((line or "")[:4 * CLI_MESSAGE_MAX_CHARS]))
+
+
+def _bracket_depth_delta(text: str) -> int:
+    depth, in_string, escaped = 0, False, False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+    return depth
+
+
+def _json_body_line(stripped: str) -> bool:
+    """A line a logged JSON body may consist of: blank, bracket- or quote-led, or a bare scalar."""
+    return not stripped or stripped.startswith(_JSON_LINE_START) or bool(_JSON_SCALAR_LINE_RE.match(stripped))
+
+
+def glog_entry_lines(lines, *, continuation: str = "colon") -> set:
+    """Indexes of the glog diagnostics in `lines`: each header and its continuation.
+
+    A logged JSON body continues while its brackets are open, on lines shaped
+    like JSON (a bracket- or quote-led line, a bare scalar, a blank line). A
+    header ending in ":" logs an error whose %v starts on the next line: with
+    continuation="colon" (classification) the plain lines up to the next blank
+    line, glog header or top-level line ("Error:", "warning:", "Caused by:")
+    belong to it; with "value" (reading the answer) only the one line after it
+    does, so the model's text right after a log line is never dropped.
+    """
+    skipped = set()
+    depth, follow = 0, 0  # follow: continuation lines still allowed, -1 without limit
+    for index, raw in enumerate(lines):
+        line = _strip_ansi(raw).rstrip()
+        stripped = line.strip()
+        header = GLOG_HEADER_RE.match(stripped) if stripped[:1] in ("I", "W", "E", "F") else None
+        if header:
+            message = stripped[header.end():]
+            depth = max(0, _bracket_depth_delta(message))
+            follow = (-1 if continuation == "colon" else 1) if message.endswith(":") else 0
+            skipped.add(index)
+        elif depth > 0 and _json_body_line(stripped):
+            depth = max(0, depth + _bracket_depth_delta(line))
+            skipped.add(index)
+        elif follow and stripped and not _CLI_LINES["top_level"].match(_normalize_bare(stripped)):
+            depth = max(0, depth + _bracket_depth_delta(line))
+            follow -= follow > 0
+            skipped.add(index)
+        else:
+            depth, follow = 0, 0
+    return skipped
+
+
+def cli_own_output(provider: str, output: str, stderr: Optional[str] = None) -> str:
+    """The text in which `provider`'s CLI prints its own messages.
+
+    stderr=None means `output` is one merged stream (stream mode when the runner
+    merged stderr into stdout, probes): any of its lines may be the CLI's. With
+    stdout and stderr captured apart only the streams in CLI_OWN_STREAMS count,
+    so the model's answer on stdout is never read as the CLI's verdict.
+    """
+    if stderr is None:
+        return output or ""
+    streams = CLI_OWN_STREAMS.get(provider, ("stdout", "stderr"))
+    return "\n".join(part for name, part in (("stdout", output), ("stderr", stderr))
+                     if name in streams and part)
+
+
+def _cli_name_regex(cli_names: Tuple[str, ...]):
+    if not cli_names:
+        return None
+    return cli_catalog_regex("(?:%s)%s" % ("|".join(re.escape(name) for name in cli_names),
+                                           _CLI_CATALOG["lines"]["name_separator"]))
+
+
+def _message_starts(message: str, marked: bool, line: str, own) -> Iterator[Tuple[str, bool, str]]:
+    rest = message
+    for _ in range(8):
+        if not rest:
+            return
+        yield rest, marked, line
+        match = own.match(rest) if own is not None else None
+        if match is None:
+            match = _CLI_LINES["marker"].match(rest)
+            if match is not None:
+                bracket = match.group("bracket")
+                marked = marked or bool(match.group("glyph") or match.group("error")
+                                        or (bracket and _CLI_LINES["marked_bracket"].match(bracket)))
+            elif marked:
+                # Behind an error marker, a message may open with lead-in clauses:
+                # "Error: failed to send message: rpc error: code = X desc = <message>"
+                match = _CLI_LINES["lead_in"].match(rest)
+                if match is None:
+                    return
+            else:
+                return
+        rest = rest[match.end():]
+
+
+def _starts_marked(message: str, own) -> bool:
+    """Whether an error marker (glyph, "Error:", "[ERROR]" ...) leads the message."""
+    return any(marked for _rest, marked, _line in _message_starts(message, False, message, own))
+
+
+class _Transcript:
+    """codex exec's transcript structure (catalog providers.codex.transcript)."""
+
+    def __init__(self, spec: Dict[str, Any]):
+        self.banner = cli_catalog_regex(spec["banner"])
+        self.section = cli_catalog_regex(spec["section"])
+        self.prompt_echo = cli_catalog_regex(spec["prompt_echo"])
+        self.exec_result = cli_catalog_regex(spec["exec_result"])
+        self.error_event = cli_catalog_regex(spec["error_event"])
+        self.own_error = cli_catalog_regex("|".join("(?:%s)" % pattern for pattern in spec["own_error"]))
+        self.tracing_target = cli_catalog_regex(spec["tracing_target"])
+        self.fatal_error = cli_catalog_regex(spec["fatal_error"]) if spec.get("fatal_error") else None
+        self.fatal_after = cli_catalog_regex(spec["fatal_after"]) if spec.get("fatal_after") else None
+        own_warning = spec.get("own_warning") or ()
+        self.own_warning = (cli_catalog_regex("|".join("(?:%s)" % pattern for pattern in own_warning))
+                            if own_warning else None)
+
+    def starts_section(self, line: str) -> bool:
+        return bool(self.banner.match(line) or self.section.match(line) or self.exec_result.match(line))
+
+    def fatal_report_start(self, lines, normalized) -> int:
+        """Index of the fatal report the text ends with, len(lines) without one.
+
+        A Rust program's main prints the error it returns after everything
+        else: "Error: <message>", for an anyhow error followed by a blank line,
+        "Caused by:" and the indented chain entries. codex exec ends a failed
+        run with it, after the agent's last message or the "tokens used" count
+        (fatal_after says after which sections it may follow).
+        """
+        if self.fatal_error is None or self.fatal_after is None:
+            return len(lines)
+        index = len(lines) - 1
+        while index >= 0 and not normalized[index]:
+            index -= 1
+        entry = index
+        while entry >= 0 and normalized[entry] and _strip_ansi(lines[entry]).startswith(("\t", "  ")):
+            entry -= 1
+        if entry < index:
+            # The text ends with indented lines: only an anyhow chain qualifies.
+            if entry < 0 or not _CLI_LINES["caused_by"].match(normalized[entry] or ""):
+                return len(lines)
+            index = entry - 1
+            if index < 0 or normalized[index]:
+                return len(lines)  # anyhow puts a blank line before "Caused by:"
+            while index >= 0 and not normalized[index]:
+                index -= 1
+        if (index >= 0 and normalized[index] and not _strip_ansi(lines[index]).startswith(("\t", "  "))
+                and self.fatal_error.match(normalized[index])):
+            return index
+        return len(lines)
+
+    def own_error_message(self, line: str) -> Optional[str]:
+        """The message of a line that is codex's own error event ("ERROR: <own error>")."""
+        event = self.error_event.match(line)
+        if event and self.own_error.match(line, event.end()):
+            return line[event.end():]
+        return None
+
+    def prompt_echoes(self, lines, normalized, prompt: Optional[str]) -> Dict[int, int]:
+        """For each prompt echo header followed by the prompt as sent, the index after the echo."""
+        wanted = [line.rstrip() for line in (prompt or "").splitlines()]
+        echoes: Dict[int, int] = {}
+        if not wanted:
+            return echoes
+        for index, line in enumerate(normalized):
+            if line and self.prompt_echo.match(line):
+                block = [_strip_ansi(raw).rstrip() for raw in lines[index + 1:index + 1 + len(wanted)]]
+                if block == wanted:
+                    echoes[index] = index + 1 + len(wanted)
+        return echoes
+
+
+@lru_cache(maxsize=8)
+def _transcript_rules(provider: str) -> Optional[_Transcript]:
+    spec = cli_catalog_entry(provider).get("transcript")
+    return _Transcript(spec) if spec else None
+
+
+def _json_report_lines(lines, skipped: set) -> Dict[int, str]:
+    """The JSON objects a CLI prints over several lines, each as one line.
+
+    A report starts on a line that does not start with whitespace, ends in "{"
+    or "[" and leaves brackets open ("[ERROR] {", "{"); the JSON-shaped lines
+    after it belong to it until its brackets close. Returns, for each report,
+    its first index -> its lines stripped and joined by one space; the other
+    lines of a report are added to `skipped`.
+    """
+    joined: Dict[int, str] = {}
+    index = 0
+    while index < len(lines):
+        head = _strip_ansi(lines[index]).rstrip()
+        depth = 0
+        if index not in skipped and head.endswith(("{", "[")) and not head[:1].isspace():
+            depth = _bracket_depth_delta(head)
+        end = index + 1
+        while depth > 0 and end < len(lines) and end not in skipped:
+            stripped = _strip_ansi(lines[end]).strip()
+            if not _json_body_line(stripped):
+                break
+            depth += _bracket_depth_delta(stripped)
+            end += 1
+        if end > index + 1:
+            joined[index] = " ".join([head] + [_strip_ansi(raw).strip() for raw in lines[index + 1:end]])
+            skipped.update(range(index + 1, end))
+        index = end
+    return joined
+
+
+def _cli_lines(output: str, transcript: Optional[_Transcript] = None, own=None,
+               prompt: Optional[str] = None, *, json_reports: bool = False, warnings: bool = False) -> list:
+    """(message, marked, line, chain) for every line the CLI may have written itself.
+
+    Skipped as diagnostics or task content: glog entries, lines inside closed
+    markdown fences, indented lines (code, tool results) and tracing lines
+    below ERROR. The indented entries of an anyhow "Caused by:" chain (chain)
+    and ERROR tracing lines count as marked. With `json_reports` a JSON object
+    printed over several lines is one line (_json_report_lines). With
+    `transcript` (codex exec), a text with transcript structure keeps only
+    codex's marked lines outside the sections, plus codex's own error events,
+    which end a section, and the fatal report the text ends with; the echo of
+    `prompt` (the prompt as sent) is skipped whatever it contains. `warnings`
+    adds the lines that are one of codex's own warnings (transcript
+    own_warning) anywhere outside the prompt echo; find_cli_messages never
+    reads them.
+    """
+    lines = (output or "").splitlines()
+    skipped = glog_entry_lines(lines) if _GLOG_ANYWHERE_RE.search(output or "") else set()
+    # Markdown code fences belong to the model's answer: what it quotes inside a
+    # closed fence is task content. An unclosed (truncated) fence hides nothing.
+    fences = [index for index, raw in enumerate(lines) if raw.lstrip().startswith(_FENCE_PREFIXES)]
+    for opening, closing in zip(fences[0::2], fences[1::2]):
+        skipped.update(range(opening, closing + 1))
+    reports = _json_report_lines(lines, skipped) if json_reports else {}
+    normalized = [None if index in skipped else
+                  _normalize_bare(reports[index][:4 * CLI_MESSAGE_MAX_CHARS] if index in reports
+                                  else _strip_ansi(raw[:4 * CLI_MESSAGE_MAX_CHARS]))
+                  for index, raw in enumerate(lines)]
+    if transcript is not None and not any(line and transcript.starts_section(line) for line in normalized):
+        transcript = None
+    echoes = transcript.prompt_echoes(lines, normalized, prompt) if transcript is not None else {}
+    fatal = transcript.fatal_report_start(lines, normalized) if transcript is not None else len(lines)
+    own_warning = transcript.own_warning if warnings and transcript is not None else None
+    selected = []
+    chain = section = False
+    header = ""  # the header of the current section
+    skip_until = 0
+    for index, raw in enumerate(lines):
+        line = normalized[index]
+        if index < skip_until:
+            continue
+        if index == fatal and section and transcript.fatal_after.match(header):
+            section = False  # the fatal report the text ends with is the CLI's own
+        if not line:
+            chain = False
+            continue
+        indented = _strip_ansi(raw).startswith(("\t", "  "))
+        if chain and indented:
+            entry = _CLI_LINES["caused_by_entry"].match(line)
+            selected.append((line[entry.end():] if entry else line, True, line, True))
+            continue
+        chain = False
+        tracing = _CLI_LINES["tracing"].match(line) if line[:1].isdigit() else None
+        if transcript is not None:
+            if index in echoes:
+                skip_until, section = echoes[index], False
+                continue
+            if transcript.starts_section(line):
+                section, header = True, line
+                continue
+            if (own_warning is not None and not indented and own_warning.match(line)
+                    and not (section and transcript.prompt_echo.match(header))):
+                selected.append((line, False, line, False))
+                continue
+            if section:
+                # codex prints its events unindented; an indented copy is content.
+                message = None if _strip_ansi(raw)[:1].isspace() else transcript.own_error_message(line)
+                if message is None:
+                    if (tracing and tracing.group("level") == "ERROR"
+                            and transcript.tracing_target.match(tracing.group("target"))):
+                        selected.append((line[tracing.end():], True, line, False))
+                    continue
+                section = False
+                selected.append((message, True, line, False))
+                continue
+        if indented:
+            continue
+        if _CLI_LINES["caused_by"].match(line):
+            chain = True
+            continue
+        if tracing:
+            if tracing.group("level") == "ERROR":
+                selected.append((line[tracing.end():], True, line, False))
+            continue
+        if transcript is not None and not _starts_marked(line, own):
+            continue  # codex's own lines outside the sections carry its markers
+        selected.append((line, False, line, False))
+    return selected
+
+
+def _final_report(selected: list, own) -> list:
+    """The error report a CLI ends with: its last line and its last marked line,
+    each with the "Caused by:" chain entries that follow it.
+
+    The answer (and the tool output it quotes) comes before the CLI's verdict,
+    so a phrase earlier in the text is not the CLI's.
+    """
+    if not selected:
+        return []
+    last = len(selected) - 1
+    while last > 0 and selected[last][3]:  # a chain entry: the report starts at its head
+        last -= 1
+    heads = {last}
+    marked = [index for index, (message, is_marked, _line, chain) in enumerate(selected)
+              if not chain and (is_marked or _starts_marked(message, own))]
+    if marked:
+        heads.add(marked[-1])
+    report = []
+    for head in sorted(heads):
+        end = head + 1
+        while end < len(selected) and selected[end][3]:
+            end += 1
+        report.extend(selected[head:end])
+    return report
+
+
+def _cli_selected_lines(provider: str, output: str, stderr: Optional[str], prompt: Optional[str] = None,
+                        *, warnings: bool = False):
+    entry = cli_catalog_entry(provider)
+    own = _cli_name_regex(CLI_NAMES.get(provider, (provider,)))
+    json_reports = entry.get("json_reports") is True
+    selection = entry.get("selection", {}).get("merged" if stderr is None else "apart", "lines")
+    if selection == "final_report":
+        # Every stream ends with its own last lines: with the streams captured
+        # apart, the report each of the CLI's own streams ends with counts.
+        streams = CLI_OWN_STREAMS.get(provider, ("stdout", "stderr"))
+        parts = [output] if stderr is None else [part for name, part in (("stdout", output), ("stderr", stderr))
+                                                 if name in streams]
+        return [line for part in parts
+                for line in _final_report(_cli_lines(part, None, own, json_reports=json_reports), own)], own
+    transcript = _transcript_rules(provider) if selection == "transcript" else None
+    return _cli_lines(cli_own_output(provider, output, stderr), transcript, own, prompt,
+                      json_reports=json_reports, warnings=warnings), own
+
+
+@lru_cache(maxsize=64)
+def _catalog_patterns(provider: str, kind: str):
+    entries = CLI_MESSAGE_CATALOG.get(provider, {})
+
+    def build(name):
+        found = entries.get(name, ())
+        return cli_catalog_regex("|".join("(?:%s)" % pattern for pattern in found)) if found else None
+
+    return build(kind), build(kind + ".marked")
+
+
+def find_cli_messages(provider: str, kinds: Tuple[str, ...], output: str,
+                      stderr: Optional[str] = None, *, prompt: Optional[str] = None) -> Dict[str, str]:
+    """For each of `kinds`, the first line on which `provider`'s CLI prints one of
+    its own messages of that kind, in the order they were found.
+
+    `output` and `stderr` are the captured streams (see cli_own_output; stderr
+    None means one merged stream); the catalog's selection for `provider` picks
+    the lines. `prompt`, the prompt as sent, lets a transcript skip its echo.
+    Lines come back normalized (normalize_cli_line).
+    """
+    patterns = [(kind,) + _catalog_patterns(provider, kind) for kind in kinds]
+    found: Dict[str, str] = {}
+    selected, own = _cli_selected_lines(provider, output, stderr, prompt)
+    for message, marked, line, _chain in selected:
+        for start, start_marked, _line in _message_starts(message, marked, line, own):
+            for kind, standalone, marked_only in patterns:
+                if kind not in found and ((standalone is not None and standalone.match(start))
+                                          or (start_marked and marked_only is not None and marked_only.match(start))):
+                    found[kind] = line
+            if len(found) == len(patterns):
+                return found
+    return found
+
+
+def find_cli_message(provider: str, kinds: Tuple[str, ...], output: str,
+                     stderr: Optional[str] = None) -> Optional[str]:
+    """The first line on which `provider`'s CLI prints one of its own `kinds` messages."""
+    return next(iter(find_cli_messages(provider, kinds, output, stderr).values()), None)
+
+
+def cli_own_lines(provider: str, output: str, stderr: Optional[str] = None, *,
+                  prompt: Optional[str] = None, warnings: bool = False) -> Iterator[str]:
+    """The (normalized) lines of `provider`'s CLI that find_cli_messages reads;
+    with `warnings` also the CLI's own warning lines (transcript own_warning)."""
+    selected, _own = _cli_selected_lines(provider, output, stderr, prompt, warnings=warnings)
+    for _message, _marked, line, _chain in selected:
+        yield line
+
+
 def status_age_seconds(info: Dict[str, Any]) -> Optional[float]:
-    """Seconds since a cache entry was written, or None when unknown."""
+    """Seconds since a cache entry was written, or None when unknown: no
+    timestamp, an unparseable one, or one more than STATUS_CLOCK_SKEW_SECONDS
+    in the future."""
     if not isinstance(info, dict):
         return None
     stamp = _parse_timestamp(info.get("updated_at"))
     if stamp is None:
         return None
     now = datetime.now(stamp.tzinfo) if stamp.tzinfo is not None else datetime.now()
-    return (now - stamp).total_seconds()
+    age = (now - stamp).total_seconds()
+    return None if age < -STATUS_CLOCK_SKEW_SECONDS else age
+
+
+def _written_at(info: Any) -> Optional[datetime]:
+    """When a cache entry was written (timezone-aware), or None when its
+    updated_at is no evidence of that (see status_age_seconds)."""
+    if status_age_seconds(info) is None:
+        return None
+    try:
+        return _as_local_aware(_parse_timestamp(info.get("updated_at")))
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def _entry_ttl_seconds(info: Dict[str, Any]) -> Optional[float]:
     explicit = info.get("ttl_seconds")
-    if isinstance(explicit, (int, float)) and explicit > 0:
-        return float(explicit)
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit > 0:
+        try:
+            return min(float(explicit), FAILURE_TTL_MAX_SECONDS)
+        except OverflowError:  # an integer beyond float range
+            return FAILURE_TTL_MAX_SECONDS
     return STATUS_TTL_SECONDS.get(info.get("status"))
 
-def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool:
-    if not resets_at or resets_at == "待重置":
-        if updated_at:
-            try:
-                clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
-                up_dt = datetime.fromisoformat(clean_up)
-                now = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else datetime.now()
-                if up_dt.tzinfo is not None and getattr(now, "tzinfo", None) is None:
-                    try:
-                        now = now.astimezone()
-                    except Exception:
-                        now = now.replace(tzinfo=up_dt.tzinfo)
-                if (now - up_dt).total_seconds() > 2 * 3600:
-                    return True
-            except Exception:
-                pass
+
+def failure_verdict_expired(info: Any) -> bool:
+    """True once an error / needs_auth verdict has outlived its TTL.
+
+    load_status_cache and engine selection apply this same rule. A verdict
+    without a usable timestamp (missing, unparseable, or further in the future
+    than STATUS_CLOCK_SKEW_SECONDS) is damaged evidence and counts as expired,
+    so it can never exclude a provider forever.
+    """
+    if not isinstance(info, dict) or info.get("status") not in STATUS_TTL_SECONDS:
         return False
+    ttl = _entry_ttl_seconds(info)
+    age = status_age_seconds(info)
+    return ttl is not None and (age is None or age >= ttl)
 
-    # Relative time support (e.g. "in 3 hours", "in 15 minutes", "in 24 hours")
-    rel_match = re.search(r"in\s+(\d+(?:\.\d+)?)\s*(hour|minute|min|hr|h|m)", resets_at, re.IGNORECASE)
-    if rel_match and updated_at:
-        try:
-            val = float(rel_match.group(1))
-            unit = rel_match.group(2).lower()
-            delta = timedelta(hours=val) if unit.startswith("h") else timedelta(minutes=val)
-            clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
-            up_dt = datetime.fromisoformat(clean_up)
-            now = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else datetime.now()
-            return (now - up_dt) >= delta
-        except Exception:
-            pass
 
-    # Month-day date support (e.g. "Oct 3 at 2pm", "October 3, 2026, 2:00 PM")
-    date_match = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,\s*(\d{4}))?(?:\s+at\s+|\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", resets_at, re.IGNORECASE)
-    if date_match:
-        try:
-            month_str = date_match.group(1).capitalize()[:3]
-            day_val = int(date_match.group(2))
-            year_val = int(date_match.group(3)) if date_match.group(3) else datetime.now().year
-            hour_val = int(date_match.group(4))
-            min_val = int(date_match.group(5)) if date_match.group(5) else 0
-            ampm = date_match.group(6).lower() if date_match.group(6) else ""
-            if ampm == "pm" and hour_val < 12:
-                hour_val += 12
-            elif ampm == "am" and hour_val == 12:
-                hour_val = 0
-            months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            if month_str in months:
-                month_val = months.index(month_str) + 1
-                reset_dt = datetime(year_val, month_val, day_val, hour_val, min_val)
-                now = datetime.now()
-                return now >= reset_dt
-        except Exception:
-            pass
-
-    clean_resets = resets_at.replace("Z", "+00:00") if resets_at.endswith("Z") else resets_at
+def _observed_longer_than(updated_at: str, seconds: float) -> bool:
+    observed = _parse_timestamp(updated_at)
+    if observed is None:
+        return False
     try:
-        dt = datetime.fromisoformat(clean_resets)
-        now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.now()
-        if dt.tzinfo is not None and getattr(now, "tzinfo", None) is None:
-            try:
-                now = now.astimezone()
-            except Exception:
-                now = now.replace(tzinfo=dt.tzinfo)
-        return now >= dt
+        return (datetime.now().astimezone() - _as_local_aware(observed)).total_seconds() > seconds
+    except (ValueError, OverflowError, OSError):
+        # Outside the platform's time range ("0001-01-01T00:00:00"): compare wall-clock times.
+        try:
+            now = datetime.now(observed.tzinfo) if observed.tzinfo is not None else datetime.now()
+            return (now - observed).total_seconds() > seconds
+        except (ValueError, OverflowError, OSError):
+            return False
+
+
+def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool:
+    """True once a cached limit's reset moment has passed.
+
+    resets_at is parsed by parse_reset_datetime (the parser pacing uses too),
+    anchored on updated_at. A missing, placeholder or unparseable reset falls
+    back to two hours after the observation so a limit can never stick forever.
+    """
+    if not resets_at or resets_at == "待重置":
+        return bool(updated_at) and _observed_longer_than(updated_at, 2 * 3600)
+    reset = parse_reset_datetime(resets_at, observed_at=updated_at or None)
+    if reset is not None:
+        return datetime.now().astimezone() >= reset
+    return bool(updated_at) and _observed_longer_than(updated_at, 2 * 3600)
+
+
+_RELATIVE_RESET_RE = re.compile(
+    r"(?:in\s+|after\s+)?(?:\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\s*,?\s*(?:and\s+)?)+",
+    re.IGNORECASE)
+
+
+# Failure verdicts read from a real call's own output: a dispatch (the adapters
+# write region and login failures back) or the real agy probe.
+_DEFINITE_FAILURE_SOURCES = ("dispatch", "probe")
+
+
+def _dispatch_failure_superseded(engine: str, info: Dict[str, Any]) -> bool:
+    """A real CLI dispatch of `engine` succeeded after this failure verdict.
+
+    The usage ledger is written after every dispatch, with the route its adapter
+    reported (usage.observe_dispatch_route) or, when the adapter reports none, the
+    one the configuration allowed at that time (usage.dispatch_route: "cli" when
+    no API relay was possible). A success served by the cloud API ("route":
+    "api") says nothing about the CLI. While a needs_auth verdict is live the
+    adapters may relay work to the API, so with an API key configured only a
+    success recorded as a CLI run ("route": "cli") clears it: an entry without a
+    route was written when a relay was possible (or by an older version) and
+    counts only without an API key. The current API policy does not decide
+    this; the policy at the time of the dispatch is in the entry's route.
+    """
+    if info.get("source") not in _DEFINITE_FAILURE_SOURCES:
+        return False
+    try:
+        failed_at = _parse_timestamp(info.get("updated_at"))
+        if failed_at is None:
+            return False
+        failed_at = _as_local_aware(failed_at)
+    except (ValueError, OverflowError, OSError):
+        return False
+    try:
+        cli_only = False
+        if info.get("status") == "needs_auth":
+            from makewand.config import has_api_configured
+            cli_only = has_api_configured(engine)
+        from makewand.usage import get_dispatch_records
+        records = get_dispatch_records(engine, max_age_days=2.0)
     except Exception:
-        pass
-
-    clean = re.sub(r"\(.*?\)", "", resets_at).strip()
-    clean = re.sub(r"^(?:at|in)\s+", "", clean, flags=re.IGNORECASE).strip()
-    for fmt in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%I%p"):
-        try:
-            t = datetime.strptime(clean, fmt).time()
-            now = datetime.now()
-            if updated_at:
-                try:
-                    clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
-                    up_dt = datetime.fromisoformat(clean_up)
-                    reset_dt = datetime.combine(up_dt.date(), t)
-                    if up_dt.tzinfo is not None:
-                        now = datetime.now(up_dt.tzinfo)
-                        if getattr(now, "tzinfo", None) is None:
-                            try:
-                                now = now.astimezone()
-                            except Exception:
-                                now = now.replace(tzinfo=up_dt.tzinfo)
-                        reset_dt = reset_dt.replace(tzinfo=up_dt.tzinfo)
-                    if reset_dt < up_dt:
-                        reset_dt += timedelta(days=1)
-                    return now >= reset_dt
-                except Exception:
-                    pass
-            reset_dt = datetime.combine(now.date(), t)
-            return now >= reset_dt
-        except Exception:
+        return False
+    for record in reversed(records):
+        route = record.get("route")
+        if record.get("success") is not True or route == "api" or (cli_only and route != "cli"):
             continue
-
-    # Fallback TTL for any unparseable non-empty resets_at string (prevent sticky freeze)
-    # Strictly do NOT trigger for relative times that haven't arrived yet
-    if updated_at and not rel_match and not date_match:
         try:
-            clean_up = updated_at.replace("Z", "+00:00") if updated_at.endswith("Z") else updated_at
-            up_dt = datetime.fromisoformat(clean_up)
-            now = datetime.now(up_dt.tzinfo) if up_dt.tzinfo is not None else datetime.now()
-            if (now - up_dt).total_seconds() > 2 * 3600:
+            stamp = _parse_timestamp(record.get("timestamp"))
+            if stamp is not None and _as_local_aware(stamp) > failed_at:
                 return True
-        except Exception:
-            pass
-
+        except (ValueError, OverflowError, OSError):
+            continue
     return False
+
 
 def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
     now_dt = datetime.now()
@@ -266,19 +994,11 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
             # Normalize once to an absolute deadline. Rewriting the duration
             # without its reference time causes every read/save to subtract
             # the same elapsed interval again.
-            if resets_at and updated_at and re.match(r"^in\s+", str(resets_at), re.IGNORECASE):
-                relative = re.fullmatch(
-                    r"in\s+((?:\d+(?:\.\d+)?\s*(?:hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\s*)+)",
-                    str(resets_at).strip(), re.IGNORECASE)
-                if relative:
-                    try:
-                        parts = re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]+)", relative.group(1), re.IGNORECASE)
-                        seconds = sum(float(n) * (3600 if u.lower().startswith("h") else 60 if u.lower().startswith("m") else 1) for n, u in parts)
-                        observed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                        resets_at = (observed + timedelta(seconds=seconds)).isoformat()
-                        info["resets_at"] = resets_at
-                    except (TypeError, ValueError, OverflowError):
-                        pass
+            if resets_at and updated_at and _RELATIVE_RESET_RE.fullmatch(str(resets_at).strip()):
+                deadline = parse_reset_datetime(str(resets_at), observed_at=updated_at)
+                if deadline is not None:
+                    resets_at = deadline.isoformat()
+                    info["resets_at"] = resets_at
             if is_reset_time_passed(resets_at, updated_at):
                 info["status"] = "healthy"
                 info["reason"] = f"已过配额重置窗口 ({resets_at})，已自动恢复待命"
@@ -286,14 +1006,26 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                 info["updated_at"] = now_dt.isoformat()
         elif isinstance(info, dict) and info.get("status") in STATUS_TTL_SECONDS:
             ttl = _entry_ttl_seconds(info)
-            age = status_age_seconds(info)
-            if ttl is not None and (age is None or age >= ttl):
+            expired = failure_verdict_expired(info)
+            if not expired and _dispatch_failure_superseded(model_name, info):
+                previous = info.get("status")
+                info["status"] = "healthy"
+                info["verified"] = True
+                info["superseded"] = previous
+                info["reason"] = f"派发失败 ({previous}) 之后已有真实派发成功，失败记录已清除"
+                info["resets_at"] = None
+                info.pop("ttl_seconds", None)
+                info["source"] = "dispatch"
+                info["updated_at"] = now_dt.isoformat()
+            elif expired:
                 previous = info.get("status")
                 old_reason = str(info.get("reason") or "").strip()
+                why = (f"已超过 {int(ttl // 60)} 分钟有效期" if status_age_seconds(info) is not None
+                       else "缺少有效的记录时间")
                 info["status"] = "unknown"
                 info["expired_from"] = previous
                 info["reason"] = (
-                    f"上次状态 {previous}（{old_reason[:80] or '无详情'}）已超过 {int(ttl // 60)} 分钟有效期，"
+                    f"上次状态 {previous}（{old_reason[:80] or '无详情'}）{why}，"
                     "按中性处理；运行 'makewand probe' 重新探测"
                 )
                 info["resets_at"] = None
@@ -401,11 +1133,15 @@ def save_status_cache(cache: Dict[str, Any]):
                             # If incoming status is 'unknown' while disk has active status ('limited' or 'healthy'), preserve disk
                             if v.get("status") == "unknown" and disk_item.get("status") in ("limited", "healthy"):
                                 continue
-                            # If incoming has older timestamp, do not overwrite newer disk status
-                            inc_time = v.get("updated_at", "")
-                            disk_time = disk_item.get("updated_at", "")
-                            if inc_time and disk_time and disk_time > inc_time:
-                                continue
+                            # An older snapshot never overwrites a newer verdict. A disk
+                            # timestamp that is no evidence of when it was written (e.g.
+                            # far in the future) never blocks an update; an incoming one
+                            # that is present but no such evidence loses to a valid one.
+                            disk_time = _written_at(disk_item)
+                            if disk_time is not None and v.get("updated_at"):
+                                inc_time = _written_at(v)
+                                if inc_time is None or disk_time > inc_time:
+                                    continue
                         disk_data[k] = v
                     else:
                         disk_data[k] = v
@@ -520,7 +1256,13 @@ def _run_model_probe(engine: str, command: str, timeout: int, *, repo_trust="tru
                   "muse": parse_muse_quota, "grok": parse_grok_quota,
                   "agy": parse_agy_quota}.get(engine)
         if raw[0] > 0 and not is_process_timeout(raw[3]) and parser is not None:
-            if parser(f"{raw[1]}\n{raw[2]}")[0]:
+            text = f"{raw[1]}\n{raw[2]}"
+            refused = parser(text)[0]
+            if not refused and engine == "agy":
+                # A region block or login rejection is an explicit refusal too.
+                from makewand.providers.agy import classify_agy_failure
+                refused = classify_agy_failure(text) is not None
+            if refused:
                 return False, raw[1], raw[3] or raw[2] or "model probe explicitly refused"
         return model_process_failure(engine, raw[0], raw[1], raw[2], raw[3], readonly=True)
 
@@ -531,6 +1273,15 @@ def _run_model_probe(engine: str, command: str, timeout: int, *, repo_trust="tru
     if captured and result.status in ("PASSED", "FAILED"):
         return captured[0]
     return (124 if result.status == "TIMEOUT" else 127), "", "", result.error
+
+
+def _probe_timed_out(code: int, error: Any) -> bool:
+    """A probe that ran out of time: the runner's timeout evidence, or the shared
+    runtime's TIMEOUT outcome (_run_model_probe returns 124 with "execution
+    deadline expired" once the process outlives the deadline)."""
+    from makewand.providers.base import is_process_timeout
+    text = str(error or "").lower()
+    return is_process_timeout(error) or "timed out" in text or (code == 124 and "deadline expired" in text)
 
 
 def _resolve_probe_timeout(
@@ -598,7 +1349,7 @@ def probe_model(
     timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
     now = datetime.now().isoformat()
-    from makewand.config import has_api_configured, has_subscription_configured, is_provider_enabled
+    from makewand.config import api_relay_available, api_relay_blocked_note, has_subscription_configured, is_provider_enabled
 
     if not is_provider_enabled(model_name):
         return {
@@ -632,12 +1383,14 @@ def probe_model(
             "mode": "local"
         }
 
-    api_configured = has_api_configured(model_name)
+    # The adapters relay to the cloud API only with a key AND an API policy that
+    # allows paid calls; a key alone is no fallback (config.api_relay_available).
+    api_ready = api_relay_available(model_name)
     sub_configured = has_subscription_configured(model_name)
 
     # 2. Subscription CLI not installed
     if not sub_configured:
-        if api_configured:
+        if api_ready:
             return {
                 "status": "healthy",
                 "reason": f"未安装订阅 CLI，已启用纯 API Key 模式",
@@ -645,16 +1398,18 @@ def probe_model(
                 "updated_at": now,
                 "mode": "api"
             }
+        blocked = api_relay_blocked_note(model_name)
         return {
             "status": "missing",
-            "reason": f"CLI 命令 '{model_name}' 未在系统 PATH 中找到，且未配置备用 API Key",
+            "reason": (f"CLI 命令 '{model_name}' 未在系统 PATH 中找到；{blocked}" if blocked
+                       else f"CLI 命令 '{model_name}' 未在系统 PATH 中找到，且未配置备用 API Key"),
             "resets_at": None,
             "updated_at": now,
             "mode": "none"
         }
 
     # 3. Subscription Probes
-    mode = "hybrid" if api_configured else "subscription"
+    mode = "hybrid" if api_ready else "subscription"
     if model_name in ("claude", "codex", "muse", "grok"):
         try:
             _validate_probe_policy(repo_trust)
@@ -670,13 +1425,13 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_claude_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Claude Code 订阅运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Claude Code 订阅运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
-        if ex and "timed out" in ex.lower():
-            err_lower = (combined + " " + ex).lower()
+        if _probe_timed_out(code, ex):
+            err_lower = (combined + " " + str(ex)).lower()
             if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
                 return {"status": "needs_auth", "reason": "等待 OAuth 登录 (请运行 'claude login')", "resets_at": None, "updated_at": now, "mode": mode}
             return {"status": "warning", "reason": f"Claude 探活超时 ({t}s，可能正处于深度思考中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
@@ -691,13 +1446,13 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_codex_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Codex 订阅运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Codex 订阅运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
-        if ex and "timed out" in ex.lower():
-            err_lower = (combined + " " + ex).lower()
+        if _probe_timed_out(code, ex):
+            err_lower = (combined + " " + str(ex)).lower()
             if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
                 return {"status": "needs_auth", "reason": "等待 OAuth 浏览器授权登录 (请运行 'codex login')", "resets_at": None, "updated_at": now, "mode": mode}
             return {"status": "warning", "reason": f"Codex 探活超时 ({t}s，可能正处于深度推理中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
@@ -708,13 +1463,16 @@ def probe_model(
     elif model_name == "agy":
         # `agy --version` only proves the binary is installed. Account, region and
         # quota availability are learned from real dispatches (providers/agy.py
-        # writes region/auth failures back with a TTL) and the usage ledger.
+        # writes region/auth failures back with a TTL) and the usage ledger; while
+        # such a failure (or a quota limit) is live, get_or_update_status adds one
+        # real echo call (_probe_agy_for_real) so a re-login, a lifted block or a
+        # quota reset can clear it.
         with tempfile.TemporaryDirectory(prefix="makewand-version-") as neutral:
             code, out, err, ex = run_subprocess(["agy", "--version"], timeout=timeout or 5, cwd=neutral)
         if code == 0:
             version = out.strip() or "v1.x"
             sub_desc = (f"Antigravity 已安装 ({version})；仅版本检测，账号/地区可用性未经真实调用验证"
-                        + (" (已配置 API 备用兜底)" if api_configured else ""))
+                        + (" (已配置 API 备用兜底)" if api_ready else ""))
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now,
                     "mode": mode, "verified": False}
         return {"status": "warning", "reason": err.strip()[:100] or "agy 版本检测异常", "resets_at": None, "updated_at": now, "mode": mode}
@@ -726,13 +1484,13 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_muse_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Muse Code (Meta 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Muse Code (Meta 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
-        if ex and "timed out" in ex.lower():
-            err_lower = (combined + " " + ex).lower()
+        if _probe_timed_out(code, ex):
+            err_lower = (combined + " " + str(ex)).lower()
             if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
                 return {"status": "needs_auth", "reason": "等待 OAuth 浏览器授权登录 (请运行 'muse login')", "resets_at": None, "updated_at": now, "mode": mode}
             return {"status": "warning", "reason": f"Muse 探活超时 ({t}s，可能正处于深度推理中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
@@ -745,13 +1503,13 @@ def probe_model(
         combined = f"{out}\n{err}"
         is_limited, reason, resets = parse_grok_quota(combined)
         if is_limited:
-            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_configured else reason
-            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_configured}
+            reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
+            return {"status": "needs_auth" if "登录" in reason else "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
         if code == 0:
-            sub_desc = "Grok Build (xAI 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = "Grok Build (xAI 订阅) 运行正常" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
-        if ex and "timed out" in ex.lower():
-            err_lower = (combined + " " + ex).lower()
+        if _probe_timed_out(code, ex):
+            err_lower = (combined + " " + str(ex)).lower()
             if any(term in err_lower for term in ("login", "oauth", "auth", "授权", "登录")):
                 return {"status": "needs_auth", "reason": "等待授权登录", "resets_at": None, "updated_at": now, "mode": mode}
             return {"status": "warning", "reason": f"Grok 探活超时 ({t}s，可能正处于推理中，执行已延时放宽)", "resets_at": None, "updated_at": now, "mode": mode}
@@ -763,12 +1521,12 @@ def probe_model(
             code, out, err, ex = run_subprocess(["aider", "--version"], timeout=5, cwd=neutral)
         if code == 0:
             version = out.strip().replace("aider ", "v")
-            sub_desc = f"Aider AI Pair Programmer ({version}) 运行就绪" + (" (已配置 API 备用兜底)" if api_configured else "")
+            sub_desc = f"Aider AI Pair Programmer ({version}) 运行就绪" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         return {"status": "warning", "reason": err.strip()[:100] or "aider 版本检测异常", "resets_at": None, "updated_at": now, "mode": mode}
 
     elif model_name in ("deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
-        if api_configured:
+        if api_ready:
             return {
                 "status": "healthy",
                 "reason": f"{model_name.upper()} 云端 API 就绪",
@@ -793,32 +1551,112 @@ def check_grok_health(*args, **kwargs) -> Dict[str, Any]:
 
 
 PROBE_REUSE_SECONDS = 120
+# Joins a kept failure verdict's reason and what the latest probe saw.
+_PROBE_NOTE_MARK = " · 最近一次探活"
 
 
-def _is_live_dispatch_failure(info: Any) -> bool:
-    return (isinstance(info, dict) and info.get("source") == "dispatch"
-            and info.get("status") in STATUS_TTL_SECONDS)
+def _is_live_definite_failure(info: Any) -> bool:
+    """A live failure verdict that only a verified success or a new definite verdict replaces.
+
+    Quota limits stand until their reset; error / needs_auth verdicts read from a
+    real call's own output stand until their TTL, whether a dispatch or the real
+    agy probe recorded them.
+    """
+    if not isinstance(info, dict):
+        return False
+    if info.get("status") == "limited":
+        return not is_reset_time_passed(info.get("resets_at"), info.get("updated_at") or "")
+    return (info.get("source") in _DEFINITE_FAILURE_SOURCES and info.get("status") in STATUS_TTL_SECONDS
+            and not failure_verdict_expired(info))
+
+
+# Probe verdicts that are evidence on their own and replace an earlier failure.
+_DEFINITIVE_PROBE_STATUSES = ("limited", "needs_auth", "error", "missing", "disabled")
 
 
 def _merge_probe_result(model: str, previous: Any, probed: Dict[str, Any]) -> Dict[str, Any]:
-    """A version-only probe must not erase a still-valid failure seen by a real dispatch."""
-    if probed.get("verified") is False and probed.get("status") == "healthy" and _is_live_dispatch_failure(previous):
-        kept = dict(previous)
-        note = " (版本探测仅证明已安装，保留真实派发失败记录直到过期)"
-        reason = str(previous.get("reason", ""))
-        kept["reason"] = reason if note in reason else f"{reason}{note}"
-        return kept
-    return probed
+    """Only a verified success or a new definite verdict replaces a live failure verdict.
+
+    A version-only probe ("verified": False), a real probe that timed out or
+    failed in an unrecognised way, or another inconclusive verdict (warning)
+    proves nothing about the account, so the earlier failure is kept until it
+    expires; its reason then also says what the latest probe saw.
+    """
+    if not _is_live_definite_failure(previous):
+        return probed
+    status = probed.get("status")
+    if (status == "healthy" and probed.get("verified") is not False) or status in _DEFINITIVE_PROBE_STATUSES:
+        return probed
+    if status == "healthy":
+        seen = "仅为版本检测，只证明已安装"
+    else:
+        seen = "未能确认恢复：" + (str(probed.get("reason") or "").strip()[:160] or f"状态 {status or 'unknown'}")
+    if previous.get("status") == "limited":
+        keep = "保留额度受限记录直到重置"
+    else:
+        keep = f"保留{'真实探活' if previous.get('source') == 'probe' else '真实派发'}失败记录直到过期"
+    kept = dict(previous)
+    reason = str(previous.get("reason") or "").split(_PROBE_NOTE_MARK)[0]
+    kept["reason"] = f"{reason}{_PROBE_NOTE_MARK}{seen}，{keep}"
+    return kept
+
+
+def _probe_agy_for_real(*, repo_trust: str = "trusted", cwd: Optional[str] = None,
+                        timeout: Optional[int] = None) -> Dict[str, Any]:
+    """One real `agy -p` echo through the shared runtime, ledger and deadline.
+
+    `agy --version` cannot tell whether a re-login fixed an authentication
+    failure, a region block ended or a quota reset, so `makewand probe` runs this
+    whenever such a failure is live (the re-login hint tells users to probe).
+    Its verdicts carry "source": "probe".
+    """
+    from makewand.providers.agy import classify_agy_failure, _agy_user_facing
+    from makewand.config import api_relay_available
+    now = datetime.now().isoformat()
+    mode = "hybrid" if api_relay_available("agy") else "subscription"
+    t = _resolve_probe_timeout("agy", timeout or 60, tier="fast", effort="low")
+    command = ["agy", "-p", "echo ok", "--print-timeout", f"{t}s", "--disable-slash-commands", "--mode", "plan"]
+    code, out, err, ex = _run_model_probe("agy", command, timeout=t, repo_trust=repo_trust, cwd=cwd)
+    combined = f"{out}\n{err}"
+    limited, reason, resets = parse_agy_quota(combined)
+    if limited:
+        return {"status": "limited", "reason": reason, "resets_at": resets, "updated_at": now,
+                "mode": mode, "source": "probe", "verified": True}
+    failure = classify_agy_failure(combined)
+    if failure:
+        status, fail_reason, ttl = failure
+        entry = {"status": status, "reason": fail_reason.replace("真实派发", "真实探活"), "resets_at": None,
+                 "updated_at": now, "mode": mode, "source": "probe", "verified": True}
+        if ttl:
+            entry["ttl_seconds"] = float(ttl)
+        return entry
+    if code == 0 and _agy_user_facing(out).strip():
+        return {"status": "healthy", "reason": "Antigravity 真实探活成功 (账号/地区/登录可用)", "resets_at": None,
+                "updated_at": now, "mode": mode, "source": "probe", "verified": True}
+    # Inconclusive: neither clears nor replaces a more specific earlier failure.
+    if _probe_timed_out(code, ex):
+        reason = f"Antigravity 真实探活超时 ({t}s)，结果不确定"
+    elif code == 0:
+        reason = "Antigravity 真实探活执行完成但未返回有效输出，结果不确定"
+    else:
+        detail = str(ex or "").strip() or _agy_user_facing(err).strip()[:120] or f"exit code {code}"
+        reason = f"Antigravity 真实探活失败，原因未识别: {detail[:120]}"
+    return {"status": "warning", "reason": reason, "resets_at": None, "updated_at": now, "mode": mode,
+            "source": "probe", "verified": False}
 
 
 def _probed_since(info: Any, started: datetime) -> bool:
-    if not isinstance(info, dict):
+    # A timestamp far in the future is damaged, not the result of a fresh probe.
+    if status_age_seconds(info) is None:
         return False
     stamp = _parse_timestamp(info.get("updated_at"))
     if stamp is None:
         return False
-    if stamp.tzinfo is not None:
-        stamp = stamp.astimezone().replace(tzinfo=None)
+    try:
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone().replace(tzinfo=None)
+    except (ValueError, OverflowError, OSError):
+        return False
     return stamp >= started - timedelta(seconds=PROBE_REUSE_SECONDS)
 
 
@@ -851,9 +1689,16 @@ def get_or_update_status(force_probe: bool = False, *, repo_trust="trusted", cwd
                     return cache
         cache = load_status_cache()
         for model in get_all_supported_providers():
+            previous = cache.get(model)
             probed = (probe_model(model) if repo_trust == "trusted" and cwd is None
                       else probe_model(model, repo_trust=repo_trust, cwd=cwd))
-            cache[model] = _merge_probe_result(model, cache.get(model), probed)
+            if (model == "agy" and probed.get("status") == "healthy" and probed.get("verified") is False
+                    and _is_live_definite_failure(previous)):
+                # The installed CLI may have been fixed (re-login, region, quota
+                # reset): only a real call can retire the live failure, whether a
+                # dispatch or an earlier real probe recorded it.
+                probed = _probe_agy_for_real(repo_trust=repo_trust, cwd=cwd)
+            cache[model] = _merge_probe_result(model, previous, probed)
         save_status_cache(cache)
         return cache
     finally:

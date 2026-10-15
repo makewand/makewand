@@ -2,8 +2,10 @@
 
 try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
     import _isolation  # noqa: F401
+    from _verdicts import nonced
 except ImportError:  # python3 -m unittest tests.<module>
     from tests import _isolation  # noqa: F401
+    from tests._verdicts import nonced
 
 import contextlib
 import io
@@ -208,7 +210,7 @@ class AssessmentFixtures(unittest.TestCase):
 
         def dispatch(engine, prompt, cwd, readonly=False, **kwargs):
             (Path(cwd) / "app.py").write_text("UNREVIEWED = True\n" if readonly else "APPROVED = 2\n")
-            return True, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}' if readonly else "implemented", None
+            return True, nonced(prompt, 'MAKEWAND_VERDICT: {"pass": true, "defects": []}') if readonly else "implemented", None
 
         with contextlib.ExitStack() as s:
             s.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
@@ -233,7 +235,7 @@ class AssessmentFixtures(unittest.TestCase):
             if on_dispatch:
                 on_dispatch(engine, readonly, kwargs)
             if readonly:
-                return True, verdict, None
+                return True, nonced(prompt, verdict), None
             (Path(cwd) / "app.py").write_text("CANDIDATE = 1\n")
             return True, "implemented", None
 

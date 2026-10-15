@@ -171,10 +171,14 @@ func dispatchStream(ctx context.Context, p Provider, call func(context.Context) 
 	if source == nil {
 		return nil, completeProvider(attempt, Usage{}, &execution.UnknownOutcomeError{Err: fmt.Errorf("provider returned a nil stream")})
 	}
-	return observeDispatchStream(ctx, source, attempt), nil
+	return observeDispatchStream(ctx, source, attempt, streamDrainWaitFor(p)), nil
 }
 
-func observeDispatchStream(ctx context.Context, source <-chan StreamChunk, attempt *execution.Attempt) <-chan StreamChunk {
+// observeDispatchStream forwards source and completes attempt with its outcome.
+// A cancellation of ctx ends the stream with ctx's error; with drainWait > 0
+// only once source has ended too, waiting at most drainWait for it
+// (drainStreamSource).
+func observeDispatchStream(ctx context.Context, source <-chan StreamChunk, attempt *execution.Attempt, drainWait time.Duration) <-chan StreamChunk {
 	out := make(chan StreamChunk, 1)
 	go func() {
 		defer close(out)
@@ -210,6 +214,7 @@ func observeDispatchStream(ctx context.Context, source <-chan StreamChunk, attem
 					chunk = value
 				}
 			case <-ctx.Done():
+				drainStreamSource(source, drainWait)
 				chunk = StreamChunk{Done: true, Error: ctx.Err()}
 			}
 			if chunk.Done || chunk.Error != nil {
@@ -218,10 +223,67 @@ func observeDispatchStream(ctx context.Context, source <-chan StreamChunk, attem
 				return
 			}
 			if !forward(chunk) {
+				if ctx.Err() != nil {
+					drainStreamSource(source, drainWait)
+				}
 				_ = completeProvider(attempt, Usage{}, &execution.UnknownOutcomeError{Err: fmt.Errorf("stream consumer stopped reading")})
 				return
 			}
 		}
 	}()
 	return out
+}
+
+// streamEndWaiter is a provider whose stream, once a cancellation has ended
+// it, still does work a caller must not outrun: a provider CLI's stream ends
+// only after the credential write-back of its sandbox's private home
+// (cliAfterWait). streamEndWait bounds how long a wrapper ending such a stream
+// on a cancellation waits for it to end first.
+type streamEndWaiter interface {
+	streamEndWait() time.Duration
+}
+
+// streamEndWait is the limit cliAfterWait puts on the write-back
+// (cliWriteBackWait).
+func (c *CLIProvider) streamEndWait() time.Duration {
+	return cliWriteBackWait()
+}
+
+// streamDrainWaitFor returns how long a wrapper of p's streams waits for the
+// source to end before it ends its own stream on a cancellation: 0, at once,
+// for a provider whose stream does nothing after a cancellation that a caller
+// could outrun (an API provider), which is any but a streamEndWaiter.
+func streamDrainWaitFor(p Provider) time.Duration {
+	if w, ok := p.(streamEndWaiter); ok {
+		return w.streamEndWait()
+	}
+	return 0
+}
+
+// drainStreamSource discards what source still sends until it sends its
+// terminal chunk or closes, waiting at most wait (not at all for wait <= 0).
+// A wrapper that ends its own stream on a cancellation calls it before its
+// terminal chunk and close: the source is still ending then - a provider CLI
+// is being killed, and its sandbox's credential write-back runs before its
+// stream ends (cliAfterWait) - and a caller that returns, or a process that
+// exits, once the stream has ended would otherwise lose a token the provider
+// refreshed in the sandbox and rotated on its server. A source that takes
+// longer than wait (a stuck private home, see cliWriteBackWait) cannot hang
+// the cancellation.
+func drainStreamSource(source <-chan StreamChunk, wait time.Duration) {
+	if wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		select {
+		case chunk, ok := <-source:
+			if !ok || chunk.Done || chunk.Error != nil {
+				return
+			}
+		case <-timer.C:
+			return
+		}
+	}
 }

@@ -225,8 +225,8 @@ class TestAuditRemediations(unittest.TestCase):
         self.assertEqual(legacy_digest, review_contract.review_digest(legacy))
 
     def test_del_01_diff_budget_exceeded_returns_unverified(self):
-        """[DEL-01] Diff exceeding 64KB returns EXIT_UNVERIFIED without silent truncation."""
-        huge_diff = "diff --git a/big.py b/big.py\n+" + ("a" * 70000)
+        """[DEL-01] Diff exceeding the review cap (256 KiB default) returns EXIT_UNVERIFIED without silent truncation."""
+        huge_diff = "diff --git a/big.py b/big.py\n+" + ("a" * (orch.REVIEW_DIFF_MAX_BYTES_DEFAULT + 1))
         with tempfile.TemporaryDirectory() as tmpdir:
             buf = []
             with patch.object(orch, "get_git_diff", return_value=huge_diff), \
@@ -235,7 +235,8 @@ class TestAuditRemediations(unittest.TestCase):
                 code = orch.run_review(cwd=tmpdir, output_json=True)
                 self.assertEqual(code, orch.EXIT_UNVERIFIED)
                 output_str = "".join(buf)
-                self.assertIn("64KB", output_str)
+                self.assertIn(str(orch.REVIEW_DIFF_MAX_BYTES_DEFAULT), output_str)
+                self.assertIn("MAKEWAND_REVIEW_DIFF_MAX_BYTES", output_str)
 
     def test_arc_01_unified_sensitive_home_dirs(self):
         """[ARC-01] SENSITIVE_HOME_DIRS contains comprehensive sensitive profiles."""
@@ -359,10 +360,17 @@ class TestAuditRemediations(unittest.TestCase):
 
     def test_vul_07_pacing_date_regex(self):
         """[VUL-07] Date parsing regex handles double digit days without misattribution."""
-        sample = "Claude Code rate limit reached: reset Oct 11, 8pm (Asia/Shanghai)"
+        # The sample used to hard-code "Oct 11", which has passed by now: a passed
+        # reset is 0 seconds away (py-rel-25), not next year's Oct 11. Use an
+        # upcoming double-digit day and check the exact distance instead.
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        target = next(now + timedelta(days=d) for d in range(2, 40) if (now + timedelta(days=d)).day >= 10)
+        sample = f"Claude Code rate limit reached: reset {target:%b} {target.day}, 8pm"
+        expected = target.replace(hour=20, minute=0, second=0, microsecond=0).astimezone()
         secs = pacing.parse_reset_time_to_seconds_left(sample)
         self.assertIsNotNone(secs)
-        self.assertGreater(secs, 0)
+        self.assertAlmostEqual(secs, (expected - datetime.now().astimezone()).total_seconds(), delta=120)
 
     def test_vul_11_git_shadow_symlink_ro_repo(self):
         """[VUL-11] sanitize_shadow_symlinks does not error when repo_root is read-only."""

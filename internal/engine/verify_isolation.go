@@ -14,12 +14,15 @@ import (
 // Candidate verification executes AI-generated code (tests, builds, dependency
 // installs). By default those commands must run inside a bubblewrap sandbox:
 // read-only root, writable workspace bind, cleared environment, tmpfs /tmp,
-// masked sensitive HOME entries, and - unlike the preview sandbox - no network
-// access for any candidate verification steps (including dependency installs,
-// to prevent candidate build scripts from reaching host loopback or abstract
-// AF_UNIX sockets). Bubblewrap brings up loopback in the isolated network
-// namespace for internal mock services. Without working isolation, verification fails closed: no command executes
-// unless the user explicitly opts into host execution with
+// masked sensitive HOME entries, and - unlike the preview sandbox - never the
+// host network namespace, so candidate code (build scripts included) cannot
+// reach host loopback services or abstract AF_UNIX sockets. Every step gets a
+// fresh network namespace in which bubblewrap brings up loopback for internal
+// mock services; tests, builds and quick checks have no other network.
+// Dependency installs and fetches additionally get outbound-only access
+// through slirp4netns when it is installed, and run loopback-only otherwise
+// (see sandbox_net.go). Without working isolation, verification fails closed: no
+// command executes unless the user explicitly opts into host execution with
 // MAKEWAND_UNSAFE_HOST_EXEC=1 (the same escape hatch the preview path uses)
 // AND has completed the one-time acknowledgment the app layer resolves into an
 // UnsafeHostExecAuthorization. The environment variable is only the request;
@@ -152,7 +155,8 @@ const sandboxHomeRelPath = ".makewand/sandbox-home"
 // workspace paths (protected paths such as .git, CI definitions and
 // verification scripts) that are re-bound read-only on top of the writable
 // workspace. When allowNetwork is false the sandbox additionally unshares the
-// network namespace, which is the default for test/build/compile steps.
+// network namespace, as it does for every verification step
+// (verificationPlanAllowsNetwork).
 //
 // The returned argv starts with `--seccomp 3` when the syscall filter applies
 // (see sandboxSeccompArgs); the launcher must supply it via

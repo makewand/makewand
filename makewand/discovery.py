@@ -21,11 +21,92 @@ logger = logging.getLogger(__name__)
 FAST_FAMILIES = ["haiku", "luna", "flash", "mini", "nano", "reserve"]
 FAST_KEYWORDS = ["fast", "fastest", "speed", "rapid", "lightweight", "affordable", "easier", "quick", "turbo", "efficient"]
 
-DEEP_FAMILIES = ["opus", "fable", "mythos", "astra", "ultra", "frontier", "pro"]
-DEEP_KEYWORDS = ["demanding", "toughest", "most capable", "complex", "flagship", "pro-high", "deep", "thinking", "reasoning", "max-effort"]
+DEEP_FAMILIES = ["opus", "fable", "mythos", "astra", "ultra", "pro"]
+# "frontier" is marketing prose ("SpaceXAI's latest frontier model"), not a model
+# family: it may favour a model for deep work but must not push it out of the
+# standard tier the way a deep family name does.
+DEEP_KEYWORDS = ["demanding", "toughest", "most capable", "complex", "flagship", "frontier", "pro-high", "deep", "thinking", "reasoning", "max-effort"]
+# The deep wording that places a model at the top of its line (rather than saying
+# it can reason). In the cheap tier it marks the model as premium, like a family.
+PREMIUM_KEYWORDS = ["demanding", "toughest", "most capable", "flagship", "frontier", "max-effort"]
 
 STANDARD_FAMILIES = ["sonnet", "sol", "standard"]
 STANDARD_KEYWORDS = ["workhorse", "balanced", "everyday", "general"]
+
+# Price statements in a description ("Fast variant. 2x the price.") describe what
+# a model costs, not how capable it is. A surcharged variant is never the cheap
+# (fast) or everyday (standard) choice; a discounted one counts as affordable.
+# Price words carry the signal on their own. "Usage", "credits" and "rate" also
+# describe allowances ("4x the usage of sol", "2x the rate limits"), so they count
+# only where the model is said to consume them: "(2x usage)", "uses credits 2x
+# faster", "consumes credits at 2x the rate".
+_PRICE_FACTOR = r"(?:\d+(?:\.\d+)?\s*[x×](?!\w)|[x×]\s*\d+(?:\.\d+)?(?![\w.])|\d+(?:\.\d+)?\s+times\b|double|twice|triple|thrice|half)"
+_PRICE_FACTOR_RES = tuple(re.compile(p, re.IGNORECASE) for p in (
+    # "2x the price", "x2 price", "200% price", "+100% price", "2x per-token cost", "twice the standard price"
+    r"(?<![\w.+])(?P<factor>" + _PRICE_FACTOR + r"|\+?\d+(?:\.\d+)?\s*%)\s+"
+    r"(?:(?:the|per[-\s]?token|token|input|output|api|base|list|standard|normal|regular|usual)\s+){0,3}"
+    r"(?:prices?|pricing|costs?|billing)\b",
+    # "costs 2x", "priced at 2x", "billed at twice the rate", "costs twice as much", "price: 2x", "counts as 2x"
+    r"\b(?:costs|priced\s+at|billed\s+at|charged\s+at|counts?(?:\s+as)?|(?:price|pricing|cost)\s*:)\s*"
+    r"(?:about\s+|roughly\s+|around\s+|nearly\s+)?(?P<factor>" + _PRICE_FACTOR + r")(?!\s+(?:less|cheaper|lower|fewer)\b)",
+    # "(2x usage)", but not "4x the usage of", "5x more usage" or "2x usage limits"
+    r"(?<![\w.+])(?P<factor>" + _PRICE_FACTOR + r")\s+(?:usage|credits?)\b(?!\s+(?:limits?|caps?|allowance|quota)\b)",
+    # "uses 2x the credits", "burns twice as many tokens": the model consumes them
+    r"\b(?:uses?|consumes?|burns?)\s+(?:about\s+|roughly\s+|around\s+|nearly\s+)?(?P<factor>" + _PRICE_FACTOR + r")\s+"
+    r"(?:the\s+|as\s+many\s+|as\s+much\s+)?(?:usage|credits?|quota|tokens)\b",
+    # "consumes credits at 2x the rate", but not "2x the rate limits"
+    r"\b(?:uses?|consumes?|burns?|draws?|counts?)\b[^.;:]{0,40}?\bat\s+(?P<factor>" + _PRICE_FACTOR + r")\s+"
+    r"(?:the\s+)?(?:normal\s+|standard\s+|base\s+|usual\s+|regular\s+)?rate\b(?!\s+limits?\b)",
+))
+_PRICE_PREMIUM_RE = re.compile(
+    r"(?<!\bless\s)(?<!\bleast\s)(?<!\bnot\s)\bexpensive\b|\bpricier\b|\bcostlier\b|\bmore\s+costly\b"
+    r"|\bcosts\s+(?:\d+(?:\.\d+)?\s*%\s+)?more\b|\bpremium[-\s](?:price|pricing|rates?)\b"
+    r"|\b(?:higher|increased)[-\s](?:per[-\s]?token\s+|token\s+)?(?:price|cost|pricing)\b"
+    r"|\b(?:draws?|uses?|consumes?|burns?)\s+(?:down\s+|through\s+)?(?:your\s+)?(?:usage|quota|credits|limits?)\s+(?:\S+\s+){0,2}?faster\b"
+    r"|\bincreased\s+(?:usage|consumption)\b(?!\s+(?:limits?|caps?|allowance|quota)\b)",
+    re.IGNORECASE)
+_PRICE_DISCOUNT_RE = re.compile(
+    r"\bcheaper\b|\b(?:less|least)\s+expensive\b|\binexpensive\b|\bcosts\s+(?:\d+(?:\.\d+)?\s*%\s+)?less\b"
+    r"|\blower[-\s](?:price|cost|pricing)\b|\bdiscounted\b|(?<![\w.])\d+(?:\.\d+)?\s*%\s+off\b",
+    re.IGNORECASE)
+_PRICE_WORD_FACTORS = {"double": 2.0, "twice": 2.0, "triple": 3.0, "thrice": 3.0, "half": 0.5}
+# "Fast variant", "turbo version": a speed-tuned variant of another model, ranked
+# like a fast family (it is not the everyday or the strongest model). "Supports
+# fast mode" names a feature of the model, not a variant, and does not count.
+_SPEED_VARIANT_RE = re.compile(r"\b(?:fast|faster|turbo|speed|quick|lite|light)\s+(?:variant|version)\b",
+                               re.IGNORECASE)
+# Larger than any version or keyword score: in the cheap tier a premium model
+# ranks below every model that is not marked premium, however much newer it is.
+_PREMIUM_IN_FAST_TIER_PENALTY = 10 ** 9
+
+
+def _price_factor(expression: str) -> float:
+    """Multiplier named by a price expression: '2x', 'x2', '3 times', '200%', '+100%', 'twice', 'half'."""
+    expression = expression.strip().lower()
+    if expression in _PRICE_WORD_FACTORS:
+        return _PRICE_WORD_FACTORS[expression]
+    number = float(re.search(r"\d+(?:\.\d+)?", expression).group())
+    if expression.endswith("%"):
+        return 1 + number / 100 if expression.startswith("+") else number / 100
+    return number
+
+
+def _price_signal(text: str) -> int:
+    """+1 when the text says the model costs more than its peers, -1 when less, else 0."""
+    factors = [_price_factor(match.group("factor")) for regex in _PRICE_FACTOR_RES for match in regex.finditer(text)]
+    if any(factor > 1 for factor in factors) or _PRICE_PREMIUM_RE.search(text):
+        return 1
+    if any(factor < 1 for factor in factors) or _PRICE_DISCOUNT_RE.search(text):
+        return -1
+    return 0
+
+
+def _without_price_statements(text: str) -> str:
+    """The text with its price statements blanked out: the words of "2x the
+    standard price" describe a price, not a model family or tier."""
+    for regex in _PRICE_FACTOR_RES + (_PRICE_PREMIUM_RE, _PRICE_DISCOUNT_RE):
+        text = regex.sub(lambda match: " " * len(match.group(0)), text)
+    return text
 
 
 def _matches_token(word: str, text: str) -> bool:
@@ -296,8 +377,9 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
     # Check makewand agy models cache if no static models found yet
     if not discovered_agy:
         agy_cache_file = Path.home() / ".cache" / "makewand" / "agy_models_cache.json"
-        if not agy_cache_file.exists():
-            _sync_agy_models_cache(cache_file=agy_cache_file)
+        # Creates the cache when absent and refreshes it once older than its
+        # max_age; a failed refresh keeps serving the previous catalog.
+        _sync_agy_models_cache(cache_file=agy_cache_file)
         if agy_cache_file.exists():
             try:
                 cdata = json.loads(agy_cache_file.read_text(encoding="utf-8"))
@@ -313,19 +395,90 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
                 pass
 
     # Filter out foreign proxy models (e.g. claude-*, gpt-*) if native gemini/google models are present
-    native_gemini = [
-        item for item in discovered_agy
-        if item[0].startswith("gemini-") or item[0].startswith("google-") or item[0] in ("gemini", "gemini-pro", "gemini-ultra", "gemini-flash")
-    ]
+    native_gemini = [item for item in discovered_agy if _is_native_agy_model(item[0])]
     if native_gemini:
         discovered_agy = native_gemini
 
     return DiscoveredAgyModels(discovered_agy, configured_default, configured_effort)
 
 
+def _is_native_agy_model(slug: str) -> bool:
+    """Antigravity's own Gemini models, as opposed to the claude-*/gpt-* models it proxies."""
+    return slug.startswith(("gemini-", "google-")) or slug == "gemini"
+
+
+AGY_MODELS_RETRY_SECONDS = 3600
+# Refresh attempts of this process that left no new catalog, per cache file:
+# (time.monotonic() of the attempt, cache state it saw). Keeps `agy models` to one
+# run per process and back-off window even when the marker file misbehaves.
+_AGY_FAILED_REFRESHES: Dict[str, Tuple[float, str]] = {}
+
+
+def _agy_cache_state(cache_file: Path) -> str:
+    """Identifies the catalog a refresh attempt saw ("missing" when there was none)."""
+    try:
+        st = cache_file.stat()
+    except OSError:
+        return "missing"
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def _claim_agy_refresh(marker: Path, state: str, retry: float) -> bool:
+    """
+    Creates the attempt marker before `agy models` runs; False means do not run it.
+    A marker younger than `retry` written for the current cache state belongs to a
+    refresh that is running or failed recently. Older markers, markers dated in the
+    future and markers written for a cache that has changed since (deleted to force
+    a refresh, or replaced) are taken over. When no marker can be written, the
+    refreshed catalog could not be stored either, so there is no refresh.
+    """
+    import time
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    for _ in range(2):
+        try:
+            fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - marker.stat().st_mtime
+            except OSError:
+                continue  # removed meanwhile: create it again
+            try:
+                seen = marker.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                seen = ""
+            if 0 <= age < retry and seen in ("", state):  # "": its owner is still writing it
+                return False
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            continue
+        except OSError:
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(state)
+        except OSError:
+            pass
+        return True
+    return False
+
+
 def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4.0, max_age: float = 43200) -> Optional[Path]:
     """
     Syncs available models from `agy models` CLI if cache is absent or older than max_age (12h).
+    `agy models` runs only after the attempt marker next to the cache has been
+    created, so an unwritable cache directory never runs it for nothing. The marker
+    stays after a failed refresh: the next attempt for the same cache state waits
+    AGY_MODELS_RETRY_SECONDS (at most max_age), once per process at most, so a
+    broken or slow `agy models` cannot stall every lookup. Output that names no
+    gemini-/google- model ("No models available ...", "Error: ...") is a failed
+    refresh and never replaces the previous catalog.
     Never executes in test isolation mode (MAKEWAND_TEST_ISOLATION_ROOT).
     """
     from makewand.config import is_provider_enabled
@@ -341,14 +494,33 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
     if cache_file is None:
         cache_file = Path.home() / ".cache" / "makewand" / "agy_models_cache.json"
 
-    try:
-        if cache_file.exists():
-            age = time.time() - cache_file.stat().st_mtime
-            if age < max_age and cache_file.stat().st_size > 30:
-                return cache_file
-    except Exception:
-        pass
+    def is_fresh():
+        try:
+            st = cache_file.stat()
+        except OSError:
+            return False
+        return time.time() - st.st_mtime < max_age and st.st_size > 30
 
+    if is_fresh():
+        return cache_file
+
+    retry = min(max_age, AGY_MODELS_RETRY_SECONDS)
+    state = _agy_cache_state(cache_file)
+    failed = _AGY_FAILED_REFRESHES.get(str(cache_file))
+    if failed and failed[1] == state and time.monotonic() - failed[0] < retry:
+        return None
+    attempt_marker = cache_file.with_name(cache_file.name + ".attempt")
+    if not _claim_agy_refresh(attempt_marker, state, retry):
+        return None
+    if is_fresh():  # another process finished a refresh just before the claim
+        try:
+            attempt_marker.unlink()
+        except OSError:
+            pass
+        return cache_file
+    _AGY_FAILED_REFRESHES[str(cache_file)] = (time.monotonic(), state)  # until the refresh succeeds
+
+    tmp_name = None
     try:
         res = subprocess.run(
             ["agy", "models"],
@@ -357,8 +529,8 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
             timeout=timeout,
             cwd=tempfile.gettempdir(),
         )
+        models_data = []
         if res.returncode == 0 and res.stdout:
-            models_data = []
             for line in res.stdout.splitlines():
                 line = re.sub(r'^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+Fetching available models\.\.\.', '', line).strip()
                 line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
@@ -370,14 +542,28 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
                     desc = parts[1] if len(parts) > 1 else ""
                     if _valid_model_id(slug):
                         models_data.append({"id": slug, "description": desc})
-            if models_data:
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                tmp_file = cache_file.with_suffix(".tmp")
-                tmp_file.write_text(json.dumps({"updated_at": time.time(), "models": models_data}, indent=2), encoding="utf-8")
-                tmp_file.replace(cache_file)
-                return cache_file
+        if any(_is_native_agy_model(_normalize_agy_model(m["id"])[0]) for m in models_data):
+            # A private temporary file per writer: concurrent refreshers never
+            # replace the cache with each other's partial output.
+            fd, tmp_name = tempfile.mkstemp(prefix=cache_file.name + ".", suffix=".tmp", dir=str(cache_file.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"updated_at": time.time(), "models": models_data}, handle, indent=2)
+            os.replace(tmp_name, str(cache_file))
+            tmp_name = None
+            _AGY_FAILED_REFRESHES.pop(str(cache_file), None)
+            try:
+                attempt_marker.unlink()
+            except OSError:
+                pass
+            return cache_file
     except Exception:
         pass
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     return None
 
 
@@ -499,6 +685,31 @@ def _discover_local_muse_models() -> DiscoveredMuseModels:
     return DiscoveredMuseModels(discovered_muse, configured_default, configured_effort)
 
 
+def _discover_local_grok_models() -> List[Tuple[str, str]]:
+    """
+    (model id, description) pairs from the Grok CLI cache ~/.grok/models_cache.json.
+    Grok CLI 1.0.x nests each entry's metadata under "info"
+    ({"models": {"grok-4.7": {"info": {"description": ...}}}}); older caches kept
+    "description" directly in the entry. Both layouts are read.
+    """
+    discovered: List[Tuple[str, str]] = []
+    try:
+        data = json.loads((Path.home() / ".grok" / "models_cache.json").read_text(encoding="utf-8"))
+    except Exception:  # absent, unreadable or malformed cache
+        return discovered
+    entries = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(entries, dict):
+        return discovered
+    for model_id, entry in entries.items():
+        if not _valid_model_id(model_id):
+            continue
+        entry = entry if isinstance(entry, dict) else {}
+        info = entry.get("info") if isinstance(entry.get("info"), dict) else {}
+        desc = entry.get("description") or info.get("description") or ""
+        discovered.append((model_id, desc if isinstance(desc, str) else ""))
+    return discovered
+
+
 def _tier_resolution(model, effort, *, is_dynamic, full_id=None, effort_source="builtin"):
     """Model provenance and effort provenance are independent facts.
 
@@ -547,11 +758,18 @@ def score_model_for_tier(slug: str, desc: str = "", tier: str = "standard") -> i
     ver = parse_semver(slug)
     ver_score = ver[0] * 100000 + ver[1] * 1000 + ver[2]
 
-    fast_fam = sum(1 for k in FAST_FAMILIES if _matches_token(k, text))
+    # A price statement is not a capability: "2x the price" makes a variant the
+    # wrong cheap/everyday pick and says nothing for the deep tier, and its words
+    # ("2x the standard price") name no family.
+    price = _price_signal(text)
+    text = _without_price_statements(text)
+
+    fast_fam = sum(1 for k in FAST_FAMILIES if _matches_token(k, text)) + (1 if _SPEED_VARIANT_RE.search(text) else 0)
     fast_kw = sum(1 for k in FAST_KEYWORDS if _matches_token(k, text))
 
     deep_fam = sum(1 for k in DEEP_FAMILIES if _matches_token(k, text))
     deep_kw = sum(1 for k in DEEP_KEYWORDS if _matches_token(k, text))
+    premium_kw = sum(1 for k in PREMIUM_KEYWORDS if _matches_token(k, text))
 
     std_fam = sum(1 for k in STANDARD_FAMILIES if _matches_token(k, text))
     std_kw = sum(1 for k in STANDARD_KEYWORDS if _matches_token(k, text))
@@ -559,9 +777,21 @@ def score_model_for_tier(slug: str, desc: str = "", tier: str = "standard") -> i
     tier = tier.lower()
     score = ver_score
     if tier == "fast":
-        score += fast_fam * 200000 + fast_kw * 30000
+        # The cheap tier: a surcharged speed variant gains nothing from being fast.
+        if price <= 0:
+            score += fast_fam * 200000 + fast_kw * 30000
         score -= (deep_fam * 250000 + deep_kw * 40000)
         score -= (std_fam * 100000)
+        if price > 0:
+            score -= 250000
+        elif price < 0:
+            score += 30000
+        # A surcharge, or a deep family or top-of-line wording on a model that is
+        # not itself a fast family, marks it premium. Versions order models within
+        # the premium and the other class, never across them: a newer flagship
+        # ("grok-5.0", "latest frontier model") is not the cheap pick over grok-4.6.
+        if price > 0 or ((deep_fam or premium_kw) and not fast_fam):
+            score -= _PREMIUM_IN_FAST_TIER_PENALTY
     elif tier == "deep":
         score += deep_fam * 200000 + deep_kw * 30000
         score -= (fast_fam * 250000 + fast_kw * 40000)
@@ -569,9 +799,20 @@ def score_model_for_tier(slug: str, desc: str = "", tier: str = "standard") -> i
         score += std_fam * 200000 + std_kw * 30000
         score -= (fast_fam * 150000)
         score -= (deep_fam * 50000)
+        if price > 0:
+            score -= 150000
         if not fast_fam and not deep_fam and not std_fam:
             score += 15000
     return score
+
+
+_MODEL_SIZE_RE = re.compile(r"[:\-_](\d+(?:\.\d+)?)[bB](?![a-zA-Z0-9])")
+
+
+def _model_size(slug: str) -> float:
+    """Parameter count in billions an id names ("llama3.1:70b", "gpt-oss-120b"), 0 when it names none."""
+    match = _MODEL_SIZE_RE.search(slug)
+    return float(match.group(1)) if match else 0.0
 
 
 def rank_models_for_tier(models, tier: str = "standard") -> List[Tuple[int, str, str]]:
@@ -595,7 +836,13 @@ def rank_models_for_tier(models, tier: str = "standard") -> List[Tuple[int, str,
             continue
         s = score_model_for_tier(slug, desc, tier)
         scored.append((s, slug, desc))
-    scored.sort(key=lambda x: x[0], reverse=True)
+    # Equal scores go to the larger model for deep work and the smaller one for
+    # the fast tier ("llama3.1:70b" / "llama3.1:8b"), then to the shorter id, the
+    # base model rather than a variant of it ("grok-4.7" over
+    # "grok-4.7-build-fast"), then to the id itself: the pick never depends on
+    # the order a catalog happens to list models in.
+    size_order = {"deep": -1, "fast": 1}.get(tier.lower(), 0)
+    scored.sort(key=lambda x: (-x[0], size_order * _model_size(x[1]), len(x[1]), x[1]))
     return scored
 
 
@@ -777,22 +1024,19 @@ def discover_available_models() -> Dict[str, Any]:
 
     # Discover Grok models from ~/.grok/models_cache.json
     try:
-        grok_cache = Path.home() / ".grok" / "models_cache.json"
-        if grok_cache.exists():
-            g_data = json.loads(grok_cache.read_text(encoding="utf-8"))
-            if "models" in g_data and isinstance(g_data["models"], dict):
-                discovered = [model for model in g_data["models"] if _valid_model_id(model)]
-                if discovered:
-                    models["grok"]["available"] = sorted(
-                        discovered,
-                        key=lambda x: (parse_semver(x.split()[0]), x),
-                        reverse=True
-                    )
-                    models["grok"]["source"] = "detected"
-                    ranked_std = rank_models_for_tier(discovered, "standard")
-                    if ranked_std:
-                        models["grok"]["current_default"] = ranked_std[0][1]
-                        models["grok"]["default_source"] = "detected"
+        discovered_grok = _discover_local_grok_models()
+        if discovered_grok:
+            models["grok"]["available"] = sorted(
+                [model for model, _ in discovered_grok],
+                key=lambda x: (parse_semver(x.split()[0]), x),
+                reverse=True
+            )
+            models["grok"]["source"] = "detected"
+            # Ranked with descriptions, like get_provider_model_tier("grok", "standard").
+            ranked_std = rank_models_for_tier(discovered_grok, "standard")
+            if ranked_std:
+                models["grok"]["current_default"] = ranked_std[0][1]
+                models["grok"]["default_source"] = "detected"
     except Exception:
         pass
 
@@ -961,19 +1205,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         return _tier_resolution(fallback_models.get(tier, "gpt-6.1-sol"), effort, is_dynamic=False)
 
     elif provider == "grok":
-        discovered_grok = []
-        try:
-            grok_cache = Path.home() / ".grok" / "models_cache.json"
-            if grok_cache.exists():
-                g_data = json.loads(grok_cache.read_text(encoding="utf-8"))
-                models_dict = g_data.get("models", {})
-                for k, v in models_dict.items():
-                    if not _valid_model_id(k):
-                        continue
-                    desc = v.get("description", "") if isinstance(v, dict) else ""
-                    discovered_grok.append((k, desc))
-        except Exception:
-            pass
+        discovered_grok = _discover_local_grok_models()
 
         effort = "high" if tier == "deep" else ("low" if tier == "fast" else "medium")
         if discovered_grok:
@@ -981,8 +1213,10 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
             if ranked:
                 return _tier_resolution(ranked[0][1], effort, is_dynamic=True)
 
-        fallback = "grok-4.7-build-fast" if tier == "fast" else "grok-4.7"
-        return _tier_resolution(fallback, effort, is_dynamic=False)
+        # Without a catalog only the CLI's default model is known to exist. Its
+        # speed variant grok-4.7-build-fast costs twice as much, so it is never
+        # the cheap default; the fast tier runs grok-4.7 at low effort.
+        return _tier_resolution("grok-4.7", effort, is_dynamic=False)
 
     elif provider == "muse":
         muse_res = _discover_local_muse_models()
