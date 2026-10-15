@@ -295,6 +295,9 @@ func slicesContainString(values []string, want string) bool {
 // file (still in its first user namespace), and then waits on --block-fd,
 // where end-of-file releases it just as data does. Then it "runs" the
 // command. Every event carries the bwrap PID.
+// The uid-map log follows the write and can lag behind makewand observing it;
+// resolver consumption can run concurrently with network configuration. The
+// optional schedules force both orderings without relying on scheduler luck.
 func fakeUserNetBwrap(logPath, proc string, opts fakeUserNetOptions, tail string) string {
 	uidMap := opts.uidMap
 	if uidMap == "" {
@@ -306,6 +309,7 @@ proc=%q
 uidmap=%q
 ppid=%q
 sharednet=%s
+schedule=%q
 info=; block=; rfd=; rdst=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -326,10 +330,18 @@ if [ -n "$info" ]; then
   eval "printf '{\"child-pid\": %%d}\n' $$ >&$info"
   eval "exec $info>&-"
   echo "bwrap[$$]: info-sent" >> "$log"
-  ( eval "/bin/cat <&$rfd" > "$log.resolv"; printf '%%s' "$rdst" > "$log.resolvdst"; echo "bwrap[$$]: resolv-read" >> "$log" ) >/dev/null 2>&1 &
+  (
+    if [ "$schedule" = resolver-after-network ]; then
+      while [ ! -f "$log.nft-done" ]; do /bin/sleep 0.001; done
+    fi
+    eval "/bin/cat <&$rfd" > "$log.resolv"
+    printf '%%s' "$rdst" > "$log.resolvdst"
+    echo "bwrap[$$]: resolv-read" >> "$log"
+  ) >/dev/null 2>&1 &
   /bin/sleep 0.2
   if [ "$uidmap" != "-" ]; then
     printf '%%s\n' "$uidmap" > "$child/uid_map"
+    if [ "$schedule" = uid-map-log-after-resolver ]; then wait; fi
     echo "bwrap[$$]: uid-map-written" >> "$log"
   fi
   wait
@@ -341,12 +353,14 @@ fi
 echo "bwrap[$$]: ran" >> "$log"
 echo "sandboxed command ran"
 %s
-`, logPath, proc, uidMap, opts.childPPID, sharedNet, tail)
+`, logPath, proc, uidMap, opts.childPPID, sharedNet, opts.schedule, tail)
 }
 
 // fakeSlirp emulates slirp4netns: it logs its argv and the namespace it was
 // handed, reports readiness on --ready-fd and exits when --exit-fd is closed.
 // It runs with an empty environment, hence the absolute paths.
+// Log readiness before signaling it, so configuration events cannot overtake
+// the log entry after makewand receives the readiness byte.
 func fakeSlirp(logPath string) string {
 	return fmt.Sprintf(`log=%q
 echo "slirp: args $*" >> "$log"
@@ -357,8 +371,8 @@ for a in "$@"; do
     /proc/self/fd/*) echo "slirp: netns $(/bin/readlink "$a")" >> "$log" ;;
   esac
 done
-eval "printf 1 >&$ready"
 echo "slirp: ready-sent" >> "$log"
+eval "printf 1 >&$ready"
 eval "/bin/cat <&$exitfd >/dev/null"
 echo "slirp: exit-fd closed" >> "$log"
 `, logPath)
@@ -383,19 +397,25 @@ exec "$@"
 }
 
 // fakeNetConfigTool logs its argv and stdin (to log.<name>) and exits with
-// status after printing output.
+// status after printing output. Successful configuration is logged after all
+// input has been consumed, before the tool exits.
 func fakeNetConfigTool(logPath, name, output string, status int) string {
 	return fmt.Sprintf(`log=%q
 echo "%s: $*" >> "$log"
 /bin/cat > "$log.%s"
 [ -z %q ] || echo %q >&2
+if [ %d -eq 0 ]; then
+  echo "%s: configured" >> "$log"
+  : > "$log.%s-done"
+fi
 exit %d
-`, logPath, name, name, output, output, status)
+`, logPath, name, name, output, output, status, name, name, status)
 }
 
 type fakeUserNetOptions struct {
 	seccomp   bool
 	bwrapTail string // shell run after the command "ran"
+	schedule  string // force a late uid-map log or resolver read, using barriers rather than timing
 	slirpBody string // replaces the fake slirp4netns
 	uidMap    string // the child's uid map ("" maps root to the test user, "-" never writes one)
 	childPPID string // the parent PID in the child's stat ("" is the bwrap process)
@@ -557,62 +577,74 @@ func assertEventOrder(t *testing.T, events []string, prefixes ...string) {
 // in use.
 func TestDependencyInstallAttachesUserModeNetwork_FixN1(t *testing.T) {
 	for _, seccomp := range []bool{false, true} {
-		// Subtest names avoid "=": env(1) in the memory-scope wrapper would
-		// misread a temp path containing it as an assignment.
-		t.Run(map[bool]string{false: "seccomp-off", true: "seccomp-on"}[seccomp], func(t *testing.T) {
-			if seccomp && !seccompbpf.Supported() {
-				t.Skip("no seccomp filter for this architecture")
-			}
-			env := installFakeUserNet(t, fakeUserNetOptions{seccomp: seccomp, bwrapTail: "exit 0"})
-			project, err := NewProject("usernet-fake", t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install", "--ignore-scripts"}})
-			if err != nil || result == nil || result.ExitCode != 0 || !strings.Contains(result.Stdout, "sandboxed command ran") {
-				t.Fatalf("result=%+v err=%v", result, err)
-			}
-			events := eventLines(t, env.log)
-			pid := userNetLaunchPID(events)
-			child := filepath.Join(env.proc, pid, "ns")
-			bw := "bwrap[" + pid + "]: "
-			assertEventOrder(t, events, bw+"info-sent", bw+"uid-map-written", bw+"resolv-read")
-			assertEventOrder(t, events, bw+"uid-map-written",
-				"nsenter: --user="+filepath.Join(child, "user")+" --preserve-credentials -- "+env.tools[userNetHelperName]+" ",
-				"slirp: args", "slirp: ready-sent",
-				"nsenter: --user="+filepath.Join(child, "user")+" --preserve-credentials --net="+filepath.Join(child, "net")+" -- "+env.tools["ip"]+" -4 -batch -",
-				"ip: -4 -batch -", "nft: -f -",
-				bw+"released", bw+"ran", "slirp: exit-fd closed")
-			var slirpArgs string
-			for _, event := range events {
-				if rest, ok := strings.CutPrefix(event, "slirp: args "); ok {
-					slirpArgs = rest
+		for _, schedule := range []string{"normal", "uid-map-log-after-resolver", "resolver-after-network"} {
+			// Subtest names avoid "=": env(1) in the memory-scope wrapper would
+			// misread a temp path containing it as an assignment.
+			t.Run(map[bool]string{false: "seccomp-off", true: "seccomp-on"}[seccomp]+"/"+schedule, func(t *testing.T) {
+				if seccomp && !seccompbpf.Supported() {
+					t.Skip("no seccomp filter for this architecture")
 				}
-			}
-			for _, want := range []string{"--configure", "--disable-host-loopback", "--enable-sandbox", "--enable-seccomp", "--ready-fd=5", "--exit-fd=6", "--netns-type=path", "/proc/self/fd/4 " + userNetDevice} {
-				if !strings.Contains(" "+slirpArgs+" ", " "+want+" ") {
-					t.Fatalf("slirp4netns args %q lack %q", slirpArgs, want)
+				env := installFakeUserNet(t, fakeUserNetOptions{seccomp: seccomp, bwrapTail: "exit 0", schedule: schedule})
+				project, err := NewProject("usernet-fake", t.TempDir())
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-			if !eventLogged(events, "slirp: netns "+filepath.Join(child, "net")) {
-				t.Fatalf("slirp4netns was not handed the sandbox network namespace:\n%s", strings.Join(events, "\n"))
-			}
-			if got, want := readFixFile(t, env.log+".ip"), userNetRouteScript(userNetBlockedPrefixes(nil)); got != want {
-				t.Fatalf("ip batch:\n%s\nwant:\n%s", got, want)
-			}
-			if got, want := readFixFile(t, env.log+".nft"), userNetFilterRuleset(userNetBlockedPrefixes(nil)); got != want {
-				t.Fatalf("nft ruleset:\n%s\nwant:\n%s", got, want)
-			}
-			if got := readFixFile(t, env.log+".resolv"); got != "nameserver "+userNetDNS+"\n" {
-				t.Fatalf("sandbox resolv.conf = %q", got)
-			}
-			if got := readFixFile(t, env.log+".resolvdst"); got != env.resolv {
-				t.Fatalf("resolv.conf bound at %q, want %q", got, env.resolv)
-			}
-			if strings.Contains(strings.Join(events, "\n"), "npm_config_fetch_retries") {
-				t.Fatalf("offline npm settings applied although the network was attached:\n%s", strings.Join(events, "\n"))
-			}
-		})
+				result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install", "--ignore-scripts"}})
+				if err != nil || result == nil || result.ExitCode != 0 || !strings.Contains(result.Stdout, "sandboxed command ran") {
+					t.Fatalf("result=%+v err=%v", result, err)
+				}
+				events := eventLines(t, env.log)
+				pid := userNetLaunchPID(events)
+				child := filepath.Join(env.proc, pid, "ns")
+				bw := "bwrap[" + pid + "]: "
+				// The uid_map write precedes namespace validation, but its log can
+				// lag behind resolver consumption or helper startup. DNS setup and
+				// network setup may overlap; both must precede command execution.
+				assertEventOrder(t, events, bw+"info-sent", bw+"uid-map-written", bw+"released")
+				assertEventOrder(t, events, bw+"info-sent", bw+"resolv-read", bw+"released", bw+"ran")
+				assertEventOrder(t, events,
+					"nsenter: --user="+filepath.Join(child, "user")+" --preserve-credentials -- "+env.tools[userNetHelperName]+" ",
+					"slirp: args", "slirp: ready-sent",
+					"nsenter: --user="+filepath.Join(child, "user")+" --preserve-credentials --net="+filepath.Join(child, "net")+" -- "+env.tools["ip"]+" -4 -batch -",
+					"ip: -4 -batch -", "ip: configured", "nft: -f -", "nft: configured",
+					bw+"released", bw+"ran", "slirp: exit-fd closed")
+				switch schedule {
+				case "uid-map-log-after-resolver":
+					assertEventOrder(t, events, bw+"resolv-read", bw+"uid-map-written")
+				case "resolver-after-network":
+					assertEventOrder(t, events, "nft: configured", bw+"resolv-read")
+				}
+				var slirpArgs string
+				for _, event := range events {
+					if rest, ok := strings.CutPrefix(event, "slirp: args "); ok {
+						slirpArgs = rest
+					}
+				}
+				for _, want := range []string{"--configure", "--disable-host-loopback", "--enable-sandbox", "--enable-seccomp", "--ready-fd=5", "--exit-fd=6", "--netns-type=path", "/proc/self/fd/4 " + userNetDevice} {
+					if !strings.Contains(" "+slirpArgs+" ", " "+want+" ") {
+						t.Fatalf("slirp4netns args %q lack %q", slirpArgs, want)
+					}
+				}
+				if !eventLogged(events, "slirp: netns "+filepath.Join(child, "net")) {
+					t.Fatalf("slirp4netns was not handed the sandbox network namespace:\n%s", strings.Join(events, "\n"))
+				}
+				if got, want := readFixFile(t, env.log+".ip"), userNetRouteScript(userNetBlockedPrefixes(nil)); got != want {
+					t.Fatalf("ip batch:\n%s\nwant:\n%s", got, want)
+				}
+				if got, want := readFixFile(t, env.log+".nft"), userNetFilterRuleset(userNetBlockedPrefixes(nil)); got != want {
+					t.Fatalf("nft ruleset:\n%s\nwant:\n%s", got, want)
+				}
+				if got := readFixFile(t, env.log+".resolv"); got != "nameserver "+userNetDNS+"\n" {
+					t.Fatalf("sandbox resolv.conf = %q", got)
+				}
+				if got := readFixFile(t, env.log+".resolvdst"); got != env.resolv {
+					t.Fatalf("resolv.conf bound at %q, want %q", got, env.resolv)
+				}
+				if strings.Contains(strings.Join(events, "\n"), "npm_config_fetch_retries") {
+					t.Fatalf("offline npm settings applied although the network was attached:\n%s", strings.Join(events, "\n"))
+				}
+			})
+		}
 	}
 }
 
