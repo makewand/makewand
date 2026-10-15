@@ -602,13 +602,17 @@ func TestRebindToolchainUnderMaskedRoot_NeverExposesHomeOrLocalShare(t *testing.
 }
 
 func TestWrapCLICommandWithSandbox_LocalAndHomeBinLayoutsDoNotExposeSecrets(t *testing.T) {
-	oldLookup := cliBwrapLookup
-	defer func() { cliBwrapLookup = oldLookup }()
+	oldLookup, oldProbe := cliBwrapLookup, cliBwrapProbe
+	t.Cleanup(func() { cliBwrapLookup, cliBwrapProbe = oldLookup, oldProbe })
 	cliBwrapLookup = func(file string) (string, error) {
 		return "/usr/bin/bwrap", nil
 	}
+	// This test inspects a mount plan without executing the mocked bwrap.
+	cliBwrapProbe = func(string) error { return nil }
 
-	fakeHome := filepath.Join("/home", "secuser")
+	// Use a native absolute path: /home/secuser has no volume on Windows
+	// and is correctly rejected by the credential path validation.
+	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
 
 	ws := t.TempDir()
