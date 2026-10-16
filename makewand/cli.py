@@ -1303,7 +1303,7 @@ def _main():
             sys.exit(EXIT_USAGE_ERROR)
         return delegate_to_go_server(native_argv)
 
-    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     common_parser.add_argument("-C", "--cwd", dest="cwd", default=None, help="Target working directory (default: current directory)")
     common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=None, help="Read task prompt from file")
     common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default="trusted", help="Repository trust level: trusted or untrusted")
@@ -1543,6 +1543,28 @@ def _main():
     p_clean = subparsers.add_parser("clean", help="Clean up stale /tmp restore, drill, and temporary artifact directories", parents=[sub_common_parser])
     p_clean.add_argument("--all", action="store_true", default=False, help="Clean all temporary makewand caches and artifacts")
 
+    # route / mark / outcome (automatic dispatch bookkeeping; never call a model)
+    p_route = subparsers.add_parser("route", allow_abbrev=False, help="为子任务按档位选派活工具（只读账本，不调用模型）", parents=[sub_common_parser])
+    p_route.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
+    p_route.add_argument("difficulty", metavar="DIFFICULTY", help="难度：mechanical, normal, hard")
+    p_route.add_argument("--tier", dest="route_tier", type=int, default=None, metavar="N", help="直接指定档位（1, 2, 3），覆盖按难度推算的起始档")
+    p_route.add_argument("--self", dest="self_tool", default=None, metavar="T", help="你自己是哪家工具（codex, claude, agy, grok, muse），同家候选排最后")
+    p_route.add_argument("--not", dest="not_tool", default=None, metavar="T", help="排除与该工具同家族的候选")
+    p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
+
+    p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前不再派活", parents=[sub_common_parser])
+    p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
+    p_mark.add_argument("duration", metavar="DURATION", help="受限时长，d/h/m/s 组合，如 6h、93h17m、2d、45m")
+    p_mark.add_argument("--reason", default=None, help="受限原因（可选，路由跳过时会显示）")
+
+    p_outcome = subparsers.add_parser("outcome", allow_abbrev=False, help="记录一次派活的验收成绩", parents=[sub_common_parser])
+    p_outcome.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
+    p_outcome.add_argument("outcome_tier", metavar="TIER", type=int, help="档位（1, 2, 3）")
+    p_outcome.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
+    p_outcome.add_argument("result", choices=["pass", "fail"], help="验收结果：pass 或 fail")
+    p_outcome.add_argument("--seconds", type=float, default=None, help="这次派活耗时秒数（可选）")
+    p_outcome.add_argument("--calls", type=int, default=None, help="这次派活的模型调用次数（可选）")
+
     from makewand.config import get_all_supported_providers
     all_supported = get_all_supported_providers()
 
@@ -1598,7 +1620,7 @@ def _main():
         p_det = subparsers.add_parser(detect_only, help=f"{detect_only}: detected only, no execution adapter yet", parents=[sub_common_parser])
         p_det.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
 
-    known_subcommands = PYTHON_COMMANDS
+    known_subcommands = PYTHON_COMMANDS | {"route", "mark", "outcome"}
     # Auto-route to `makewand run ...` if user invokes `makewand "prompt"`, `makewand -C /dir -f task.txt`, or pipes stdin
     is_auto_routed_run = False
     try:
@@ -1786,7 +1808,16 @@ def _main():
 
 def _dispatch_parsed_command(args, is_auto_routed_run=False):
 
-    if args.subcommand == "daemon":
+    if args.subcommand == "route":
+        from makewand.route_cli import cmd_route
+        cmd_route(args)
+    elif args.subcommand == "mark":
+        from makewand.route_cli import cmd_mark
+        cmd_mark(args)
+    elif args.subcommand == "outcome":
+        from makewand.route_cli import cmd_outcome
+        cmd_outcome(args)
+    elif args.subcommand == "daemon":
         cmd_daemon(args)
     elif args.subcommand == "sessions":
         cmd_sessions(args)

@@ -33,6 +33,7 @@ from makewand.routing_catalog import candidates, escalate, family, starting_tier
 __all__ = [
     "DEFAULT_CLAUDE_MAX_WEEKLY",
     "DEFAULT_CODEX_MAX_WEEKLY",
+    "DEFAULT_REQUEST_BUDGET",
     "HALF_LIFE_DAYS",
     "QUOTA_ARGV",
     "QUOTA_TIMEOUT_SECONDS",
@@ -49,6 +50,7 @@ __all__ = [
 
 DEFAULT_CODEX_MAX_WEEKLY = 90
 DEFAULT_CLAUDE_MAX_WEEKLY = 85
+DEFAULT_REQUEST_BUDGET = 3
 HALF_LIFE_DAYS = 14
 
 # 与现有 mw-hub 相同的官方额度命令。文件不存在、超时或输出不可用时当作没有数据。
@@ -82,11 +84,13 @@ class Policy:
     codex_max_weekly: float = DEFAULT_CODEX_MAX_WEEKLY
     claude_max_weekly: float = DEFAULT_CLAUDE_MAX_WEEKLY
     paused: tuple = ()
+    request_budget: int = DEFAULT_REQUEST_BUDGET
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "codex_max_weekly", float(self.codex_max_weekly))
         object.__setattr__(self, "claude_max_weekly", float(self.claude_max_weekly))
         object.__setattr__(self, "paused", tuple(self.paused))
+        object.__setattr__(self, "request_budget", _coerce_budget(self.request_budget))
 
     def pause_for(self, provider: str) -> Optional[Pause]:
         key = provider.strip().lower()
@@ -144,6 +148,7 @@ def load_policy(path: Union[str, Path, None] = None) -> Policy:
         codex_max_weekly=_parse_limit(values.get("CODEX_MAX_WEEKLY"), DEFAULT_CODEX_MAX_WEEKLY),
         claude_max_weekly=_parse_limit(values.get("CLAUDE_MAX_WEEKLY"), DEFAULT_CLAUDE_MAX_WEEKLY),
         paused=_parse_pauses(values.get("PAUSED", "")),
+        request_budget=_parse_budget(values.get("REQUEST_BUDGET")),
     )
 
 
@@ -519,6 +524,25 @@ def _unquote(text: str, quote: str) -> str:
         chars.append(char)
         index += 1
     return "".join(chars)
+
+
+def _coerce_budget(value) -> int:
+    """每个请求默认最多调用次数。非法或非正数时用默认值。"""
+    if isinstance(value, bool):
+        return DEFAULT_REQUEST_BUDGET
+    try:
+        number = float(str(value).strip()) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_REQUEST_BUDGET
+    if not math.isfinite(number) or number <= 0:
+        return DEFAULT_REQUEST_BUDGET
+    return int(number)
+
+
+def _parse_budget(value: Optional[str]) -> int:
+    if value is None or value.strip() == "":
+        return DEFAULT_REQUEST_BUDGET
+    return _coerce_budget(value)
 
 
 def _parse_limit(value: Optional[str], default: float) -> float:
