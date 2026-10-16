@@ -1313,7 +1313,7 @@ def _main():
     common_parser.add_argument("--max-model-calls", type=int, default=None, help="Maximum attempted Makewand model tasks, including retries and reviewers")
     common_parser.add_argument("--call-budget-file", default=None, help="Shared admission ledger for model task budgets")
     common_parser.add_argument("--protect", dest="global_protected_paths", action="append", default=None, metavar="PATH", help="Preserve a task-relative file; repeat for multiple files")
-    common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "max"], default=None, help="Set reasoning effort across AI models (low, medium, high, max)")
+    common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=None, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
 
     sub_common_parser = argparse.ArgumentParser(add_help=False)
     sub_common_parser.add_argument("-C", "--cwd", dest="cwd", default=argparse.SUPPRESS, help="Target working directory (default: current directory)")
@@ -1325,7 +1325,7 @@ def _main():
     sub_common_parser.add_argument("--max-model-calls", type=int, default=argparse.SUPPRESS, help="Maximum attempted Makewand model tasks")
     sub_common_parser.add_argument("--call-budget-file", default=argparse.SUPPRESS, help="Shared model task admission ledger")
     sub_common_parser.add_argument("--protect", dest="protected_paths", action="append", default=None, metavar="PATH", help="Preserve file content and permissions; repeat for multiple files")
-    sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "max"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, max)")
+    sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
 
     for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
         options.add_argument("--workflow", choices=["auto", "single", "pipeline", "race"],

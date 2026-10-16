@@ -170,13 +170,17 @@ def normalize_provider_effort(provider: str, effort: Optional[str], model: Optio
             return "medium"
 
     elif provider == "agy":
-        # Antigravity efforts are model-specific (gemini-3.1-pro: low, high only;
-        # xhigh/max are rejected outright). Medium is left to the CLI default.
-        if eff in ("minimal", "low"):
+        # Antigravity CLI accepts --effort low|medium|high|xhigh|max; the
+        # reasoning depth is also encoded in model-id suffixes (see
+        # resolve_agy_model). Pass the requested level through, clamping
+        # only ultra -> max and minimal -> low.
+        if eff == "minimal":
             return "low"
-        if eff in ("high", "xhigh", "max", "ultra"):
-            return "high"
-        return None
+        if eff in ("low", "medium", "high", "xhigh", "max"):
+            return eff
+        if eff == "ultra":
+            return "max"
+        return "medium"
 
     elif provider == "claude":
         # Claude accepts: low, medium, high, xhigh, max
@@ -218,12 +222,12 @@ def _normalize_agy_model(raw: str) -> Tuple[str, Optional[str]]:
     m_eff = re.search(r"\((\w+)\)", val)
     if m_eff:
         eff_candidate = m_eff.group(1).lower()
-        if eff_candidate in ("low", "medium", "high", "max"):
+        if eff_candidate in ("low", "medium", "high", "xhigh", "max", "ultra"):
             effort = eff_candidate
         val = re.sub(r"\s*\(\w+\)\s*", "", val).strip()
 
     if effort is None:
-        for eff in ("high", "medium", "low", "max"):
+        for eff in ("xhigh", "ultra", "high", "medium", "low", "max"):
             if val.lower().endswith(f"-{eff}"):
                 effort = eff
                 val = val[:-len(eff) - 1]
@@ -238,6 +242,155 @@ def _normalize_agy_model(raw: str) -> Tuple[str, Optional[str]]:
         return "", None
 
     return slug, effort
+
+
+
+_AGY_SUFFIX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _split_agy_suffix(model_id: str) -> Tuple[str, Optional[str]]:
+    """Split an agy model id into (base, suffix-effort or None).
+
+    The suffix is a trailing -low/-medium/-high (also -xhigh/-max/-ultra)
+    segment: "gemini-4-argon-high" -> ("gemini-4-argon", "high"),
+    "gpt-oss-120b-medium" -> ("gpt-oss-120b", "medium"),
+    "gemini-3.8-flash" -> ("gemini-3.8-flash", None).
+    """
+    if not isinstance(model_id, str) or not model_id.strip():
+        return (model_id or ""), None
+    val = model_id.strip()
+    lower = val.lower()
+    for eff in ("xhigh", "ultra", "medium", "high", "low", "max", "minimal"):
+        if lower.endswith(f"-{eff}"):
+            return val[: -len(eff) - 1], eff
+    return val, None
+
+
+def _agy_full_model_id(raw: str) -> str:
+    """Full agy model id preserving a reasoning suffix.
+
+    Display strings ("Gemini 3.8 Flash (High)") become the suffixed id
+    ("gemini-3.8-flash-high"); already-suffixed ids stay as they are.
+    Returns "" for invalid input.
+    """
+    if not isinstance(raw, str):
+        return ""
+    val = raw.strip()
+    if not val or val.startswith("-") or re.search(r"[\r\n\t\x00-\x1f]", val):
+        return ""
+    if " " in val or "(" in val:
+        base, eff = _normalize_agy_model(val)
+        if not base:
+            return ""
+        return f"{base}-{eff}" if eff else base
+    slug = val.lower()
+    return slug if _valid_model_id(slug) else ""
+
+
+def parse_agy_models_output(text: str) -> List[Tuple[str, str]]:
+    """Parse `agy models` output into [(model_id, display_name)].
+
+    Each line is "model_id<TAB>display_name" (whitespace also accepted).
+    The parser is pure: callers inject fixture text in tests instead of
+    running a real CLI. Spinner/ANSI noise is stripped, invalid ids are
+    skipped, duplicates keep their first occurrence.
+    """
+    if not text:
+        return []
+    models: List[Tuple[str, str]] = []
+    seen = set()
+    for raw_line in str(text).splitlines():
+        line = re.sub(r"\x1b\[[0-9;]*m", "", raw_line)
+        line = re.sub(r"^[\u280b\u2809\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f\s]+Fetching available models\.\.\.", "", line).strip()
+        line = line.strip()
+        if not line:
+            continue
+        if "\t" in line:
+            slug, desc = line.split("\t", 1)
+            slug, desc = slug.strip(), desc.strip()
+        else:
+            parts = line.split(None, 1)
+            slug = parts[0].strip()
+            desc = parts[1].strip() if len(parts) > 1 else ""
+        slug = slug.lower()
+        if not _valid_model_id(slug):
+            continue
+        # English/error lines ("No models available ...", "Please sign in ...")
+        # start with a bare word; real model ids are hyphenated/dotted/digit-bearing.
+        if slug != "gemini" and not any(c in slug for c in "-.") and not any(c.isdigit() for c in slug):
+            continue
+        if slug.endswith(":"):
+            continue
+        key = (slug, desc)
+        if key in seen:
+            continue
+        seen.add(key)
+        models.append((slug, desc))
+    return models
+
+
+def resolve_agy_model(
+    model: Optional[str],
+    effort: Optional[str],
+    available_models=None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve an agy (model, effort) pair to what the CLI should receive.
+
+    Rules (task E1.2):
+    1. A model id that already carries a -low/-medium/-high suffix is
+       used verbatim and no --effort is added.
+    2. A bare base name (e.g. "gemini-4-argon") plus a requested effort
+       selects the highest available suffix variant that does not exceed
+       the request (using _EFFORT_ORDER); if none is <= the request the
+       lowest available variant is used. No --effort is added.
+    3. A model with no suffix variants falls back to --effort, translated
+       by normalize_provider_effort("agy", ...).
+
+    `available_models` is injectable for tests: an iterable of model ids
+    or (id, description) pairs. When omitted, the locally discovered
+    catalog (_discover_local_agy_models) is consulted.
+    Returns (final_model, effort_for_--effort_or_None).
+    """
+    if not model or not isinstance(model, str) or not model.strip():
+        # No model to resolve: keep the effort translation for the caller.
+        return model, normalize_provider_effort("agy", effort, model=model) if effort else None
+    model = model.strip()
+    _base, suffix = _split_agy_suffix(model)
+    if suffix is not None:
+        return model, None
+    if not effort or str(effort).strip().lower() in ("none", "default"):
+        return model, None
+    eff = str(effort).strip().lower()
+    if available_models is None:
+        try:
+            available_models = _discover_local_agy_models().models
+        except Exception:
+            available_models = []
+    variants: Dict[str, str] = {}
+    for item in available_models or []:
+        if isinstance(item, (tuple, list)):
+            slug = item[0] if item else ""
+        elif isinstance(item, dict):
+            slug = item.get("id") or item.get("slug") or ""
+        else:
+            slug = str(item).split(None, 1)[0] if str(item).strip() else ""
+        if not slug:
+            continue
+        base2, suff2 = _split_agy_suffix(str(slug).strip())
+        if suff2 is not None and base2.lower() == model.lower():
+            variants.setdefault(suff2, str(slug).strip())
+    if variants:
+        if eff in _EFFORT_ORDER:
+            rank = _EFFORT_ORDER.index(eff)
+        else:
+            rank = _EFFORT_ORDER.index("medium")
+        allowed = [s for s in variants if s in _EFFORT_ORDER and _EFFORT_ORDER.index(s) <= rank]
+        if allowed:
+            chosen = max(allowed, key=lambda s: _EFFORT_ORDER.index(s))
+        else:
+            chosen = min(variants, key=lambda s: _EFFORT_ORDER.index(s) if s in _EFFORT_ORDER else 99)
+        return variants[chosen], None
+    return model, normalize_provider_effort("agy", eff, model=model)
 
 
 class DiscoveredAgyModels(tuple):
@@ -318,18 +471,18 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
                             if isinstance(m, dict):
                                 slug = m.get("id") or m.get("slug")
                                 desc = m.get("description") or m.get("name") or ""
-                                norm_slug, _ = _normalize_agy_model(slug or "")
+                                norm_slug = _agy_full_model_id(slug or "")
                                 if norm_slug and (norm_slug, desc) not in seen:
                                     seen.add((norm_slug, desc))
                                     discovered_agy.append((norm_slug, desc))
                             elif isinstance(m, str):
-                                norm_slug, _ = _normalize_agy_model(m)
+                                norm_slug = _agy_full_model_id(m)
                                 if norm_slug and (norm_slug, "") not in seen:
                                     seen.add((norm_slug, ""))
                                     discovered_agy.append((norm_slug, ""))
                     elif isinstance(items, dict):
                         for k, v in items.items():
-                            norm_slug, _ = _normalize_agy_model(k)
+                            norm_slug = _agy_full_model_id(k)
                             if norm_slug:
                                 desc = v.get("description", "") if isinstance(v, dict) else ""
                                 if (norm_slug, desc) not in seen:
@@ -357,7 +510,7 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
                     raw_eff = sdata.get("reasoning_effort") or sdata.get("effort")
                     if raw_eff and isinstance(raw_eff, str) and raw_eff.strip():
                         eff_val = raw_eff.strip().lower()
-                        if eff_val in ("low", "medium", "high", "max") and not configured_effort:
+                        if eff_val in ("low", "medium", "high", "xhigh", "max", "ultra") and not configured_effort:
                             configured_effort = eff_val
                     # Also check model lists if present in settings.json
                     for key in ("available_models", "models", "additionalModelOptionsCache"):
@@ -367,38 +520,42 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
                                 val = item.get("value") or item.get("id") or item.get("slug") if isinstance(item, dict) else item
                                 desc = item.get("description") or item.get("name") or "" if isinstance(item, dict) else ""
                                 if isinstance(val, str):
-                                    norm_val, _ = _normalize_agy_model(val)
+                                    norm_val = _agy_full_model_id(val)
                                     if norm_val and (norm_val, desc) not in seen:
                                         seen.add((norm_val, desc))
                                         discovered_agy.append((norm_val, desc))
                 except Exception:
                     pass
 
-    # Check makewand agy models cache if no static models found yet
-    if not discovered_agy:
-        agy_cache_file = Path.home() / ".cache" / "makewand" / "agy_models_cache.json"
-        # Creates the cache when absent and refreshes it once older than its
-        # max_age; a failed refresh keeps serving the previous catalog.
-        _sync_agy_models_cache(cache_file=agy_cache_file)
-        if agy_cache_file.exists():
-            try:
-                cdata = json.loads(agy_cache_file.read_text(encoding="utf-8"))
-                for m in cdata.get("models", []):
-                    if isinstance(m, dict):
-                        slug = m.get("id") or m.get("slug")
-                        desc = m.get("description") or m.get("name") or ""
-                        norm_slug, _ = _normalize_agy_model(slug or "")
-                        if norm_slug and (norm_slug, desc) not in seen:
-                            seen.add((norm_slug, desc))
-                            discovered_agy.append((norm_slug, desc))
-            except Exception:
-                pass
+    # Merge the makewand `agy models` cache (refreshed at most once a day;
+    # a failed refresh keeps serving the previous catalog). This source
+    # carries the full suffixed ids (gemini-4-argon-high, claude-opus-5-5-low,
+    # ...) and is merged with any .gemini caches above, not only used when
+    # those are empty, so `makewand models` can show every agy model.
+    agy_cache_file = Path.home() / ".cache" / "makewand" / "agy_models_cache.json"
+    _sync_agy_models_cache(cache_file=agy_cache_file)
+    if agy_cache_file.exists():
+        try:
+            cdata = json.loads(agy_cache_file.read_text(encoding="utf-8"))
+            for m in cdata.get("models", []):
+                if isinstance(m, dict):
+                    slug = m.get("id") or m.get("slug")
+                    desc = m.get("description") or m.get("name") or ""
+                    norm_slug = _agy_full_model_id(slug or "")
+                    if norm_slug and (norm_slug, desc) not in seen:
+                        seen.add((norm_slug, desc))
+                        discovered_agy.append((norm_slug, desc))
+                elif isinstance(m, str):
+                    norm_slug = _agy_full_model_id(m)
+                    if norm_slug and (norm_slug, "") not in seen:
+                        seen.add((norm_slug, ""))
+                        discovered_agy.append((norm_slug, ""))
+        except Exception:
+            pass
 
-    # Filter out foreign proxy models (e.g. claude-*, gpt-*) if native gemini/google models are present
-    native_gemini = [item for item in discovered_agy if _is_native_agy_model(item[0])]
-    if native_gemini:
-        discovered_agy = native_gemini
-
+    # All discovered models are returned (including the claude-*/gpt-* models
+    # agy proxies); tier selection filters to native Gemini models itself
+    # (see get_provider_model_tier) so foreign models never hijack it.
     return DiscoveredAgyModels(discovered_agy, configured_default, configured_effort)
 
 
@@ -469,9 +626,9 @@ def _claim_agy_refresh(marker: Path, state: str, retry: float) -> bool:
     return False
 
 
-def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4.0, max_age: float = 43200) -> Optional[Path]:
+def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4.0, max_age: float = 86400, runner=None, output_text: Optional[str] = None) -> Optional[Path]:
     """
-    Syncs available models from `agy models` CLI if cache is absent or older than max_age (12h).
+    Syncs available models from `agy models` CLI if cache is absent or older than max_age (1 day, 86400s by default).
     `agy models` runs only after the attempt marker next to the cache has been
     created, so an unwritable cache directory never runs it for nothing. The marker
     stays after a failed refresh: the next attempt for the same cache state waits
@@ -482,13 +639,14 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
     Never executes in test isolation mode (MAKEWAND_TEST_ISOLATION_ROOT).
     """
     from makewand.config import is_provider_enabled
-    if "MAKEWAND_TEST_ISOLATION_ROOT" in os.environ or not is_provider_enabled("agy"):
+    _injected = output_text is not None or runner is not None
+    if not _injected and ("MAKEWAND_TEST_ISOLATION_ROOT" in os.environ or not is_provider_enabled("agy")):
         return None
     import shutil
     import subprocess
     import tempfile
     import time
-    if not shutil.which("agy"):
+    if not _injected and not shutil.which("agy"):
         return None
 
     if cache_file is None:
@@ -522,27 +680,29 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
 
     tmp_name = None
     try:
-        res = subprocess.run(
-            ["agy", "models"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=tempfile.gettempdir(),
-        )
-        models_data = []
-        if res.returncode == 0 and res.stdout:
-            for line in res.stdout.splitlines():
-                line = re.sub(r'^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+Fetching available models\.\.\.', '', line).strip()
-                line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if parts:
-                    slug = parts[0]
-                    desc = parts[1] if len(parts) > 1 else ""
-                    if _valid_model_id(slug):
-                        models_data.append({"id": slug, "description": desc})
-        if any(_is_native_agy_model(_normalize_agy_model(m["id"])[0]) for m in models_data):
+        # Injectable sources for tests: output_text is used verbatim, runner
+        # is called like subprocess.run; neither touches a real CLI.
+        if output_text is not None:
+            parsed = parse_agy_models_output(output_text)
+            models_data = [{"id": slug, "description": desc} for slug, desc in parsed]
+            fetch_ok = True
+        elif runner is not None:
+            res = runner(["agy", "models"], capture_output=True, text=True, timeout=timeout, cwd=tempfile.gettempdir())
+            parsed = parse_agy_models_output(res.stdout) if getattr(res, "returncode", 1) == 0 and getattr(res, "stdout", None) else []
+            models_data = [{"id": slug, "description": desc} for slug, desc in parsed]
+            fetch_ok = getattr(res, "returncode", 1) == 0
+        else:
+            res = subprocess.run(
+                ["agy", "models"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=tempfile.gettempdir(),
+            )
+            parsed = parse_agy_models_output(res.stdout) if res.returncode == 0 and res.stdout else []
+            models_data = [{"id": slug, "description": desc} for slug, desc in parsed]
+            fetch_ok = res.returncode == 0
+        if fetch_ok and any(_is_native_agy_model(_split_agy_suffix(m["id"])[0]) for m in models_data):
             # A private temporary file per writer: concurrent refreshers never
             # replace the cache with each other's partial output.
             fd, tmp_name = tempfile.mkstemp(prefix=cache_file.name + ".", suffix=".tmp", dir=str(cache_file.parent))
@@ -850,7 +1010,7 @@ def discover_available_models() -> Dict[str, Any]:
     models = {
         "claude": {"current_default": "claude-sonnet-5 (Sonnet 5)", "available": ["claude-fable-5-1[1m] (Fable 5.1)", "claude-opus-5-5 (Opus 5.5)", "claude-sonnet-5 (Sonnet 5)", "claude-haiku-4-5-20251001 (Haiku 4.5)"]},
         "codex": {"current_default": "gpt-6-astra", "available": []},
-        "agy": {"current_default": "Gemini 3.8 Flash / Pro", "available": ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-pro", "gemini-ultra"]},
+        "agy": {"current_default": "Gemini 3.8 Flash / Pro", "available": ["gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high", "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high", "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high", "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high", "gpt-oss-120b-medium"]},
         "muse": {"current_default": "muse-spark-1.3-contributor", "available": ["muse-spark-1.3-contributor", "muse-spark-1.3", "muse-spark-1.2-contributor", "muse-spark-1.2"]},
         "grok": {"current_default": "grok-4.7", "available": ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]},
         "local": {"current_default": "qwen2.5-coder:7b", "available": ["qwen2.5-coder:7b", "gemma4:31b", "gemma4:26b", "gemma4:e4b"]}
@@ -1058,7 +1218,15 @@ def discover_available_models() -> Dict[str, Any]:
             models["agy"]["current_default"] = agy_res.configured_default
             models["agy"]["default_source"] = "detected"
         elif found_agy:
-            ranked_std = rank_models_for_tier(list(found_agy), "standard")
+            _native_bases = []
+            _seen_bases = set()
+            for _slug, _desc in agy_res.models:
+                _base, _suf = _split_agy_suffix(_slug)
+                if not _is_native_agy_model(_base) or _base in _seen_bases:
+                    continue
+                _seen_bases.add(_base)
+                _native_bases.append((_base, _desc))
+            ranked_std = rank_models_for_tier(_native_bases, "standard") if _native_bases else []
             if ranked_std:
                 models["agy"]["current_default"] = ranked_std[0][1]
                 models["agy"]["default_source"] = "detected"
@@ -1262,7 +1430,18 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                                     effort_source="detected" if configured_effort else "builtin")
 
         if discovered_agy:
-            ranked = rank_models_for_tier(discovered_agy, tier)
+            # Tier picks stay on native Gemini bases: suffixed variants are
+            # collapsed to their base and foreign (claude-*/gpt-*) models
+            # never hijack the tier (they would spend credits).
+            _bases = []
+            _seen_b = set()
+            for _slug, _desc in discovered_agy:
+                _base, _suf = _split_agy_suffix(_slug)
+                if not _is_native_agy_model(_base) or _base in _seen_b:
+                    continue
+                _seen_b.add(_base)
+                _bases.append((_base, _desc))
+            ranked = rank_models_for_tier(_bases, tier) if _bases else []
             if ranked:
                 return _tier_resolution(ranked[0][1], effort, is_dynamic=True,
                                         effort_source="detected" if configured_effort else "builtin")
