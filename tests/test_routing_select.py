@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from makewand.outcome_ledger import OutcomeLedger
 from makewand.route_select import (
+    COST_WEIGHT_SPREAD,
     QUOTA_ARGV,
     QUOTA_TIMEOUT_SECONDS,
     Pause,
@@ -418,12 +419,36 @@ class SelectTests(unittest.TestCase):
             expected[item.provider] = replay.betavariate(float(stats.alpha), float(stats.beta))
         names = [item.provider for item in first.candidates]
         catalog = [item.provider for item in candidates(1)]
-        expected_order = sorted(catalog, key=lambda name: (-expected[name], catalog.index(name)))
+        last = len(catalog) - 1
+
+        def weighted(name):  # cheapest-first weighting by catalog position
+            return expected[name] * (1.0 - COST_WEIGHT_SPREAD * catalog.index(name) / last)
+
+        expected_order = sorted(catalog, key=lambda name: (-weighted(name), catalog.index(name)))
         self.assertEqual(names, expected_order)
         for item in first.candidates:
             self.assertEqual(item.sampled_score, expected[item.provider])
             self.assertFalse(item.is_self)
         self.assertLess(names.index("codex"), names.index("agy"))
+
+    def test_without_outcomes_cheaper_candidates_rank_first_more_often(self):
+        catalog = [item.provider for item in candidates(1)]
+        first_counts = {name: 0 for name in catalog}
+        for seed in range(2000):
+            result = self._select(rng=random.Random(seed))
+            first_counts[result.candidates[0].provider] += 1
+        # Equal priors: the cheapest catalog position wins clearly more often than the costliest.
+        self.assertGreater(first_counts[catalog[0]], first_counts[catalog[-1]] * 1.3, first_counts)
+
+    def test_strong_outcomes_still_overtake_the_cost_weight(self):
+        catalog = [item.provider for item in candidates(1)]
+        costly, cheap = catalog[-1], catalog[0]
+        for _ in range(50):
+            self.ledger.record(costly, 1, "implement", True, ts=self.now)
+            self.ledger.record(cheap, 1, "implement", False, ts=self.now)
+        for seed in range(50):
+            names = [item.provider for item in self._select(rng=random.Random(seed)).candidates]
+            self.assertLess(names.index(costly), names.index(cheap))
 
     def test_tier_override_and_escalate_tier(self):
         pressed = self._select("test", "normal")

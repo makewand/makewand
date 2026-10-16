@@ -58,6 +58,8 @@ DEFAULT_CODEX_MAX_WEEKLY = 90
 DEFAULT_CLAUDE_MAX_WEEKLY = 85
 DEFAULT_REQUEST_BUDGET = 3
 HALF_LIFE_DAYS = 14
+# Sample weight runs from 1.0 for the cheapest catalog position down to 1 - spread for the last.
+COST_WEIGHT_SPREAD = 0.2
 
 # 与现有 mw-hub 相同的官方额度命令。文件不存在、超时或输出不可用时当作没有数据。
 QUOTA_ARGV = ("/mnt/data/makewand/bin/makewand-server", "quota")
@@ -316,7 +318,12 @@ def select(
         beta = _positive_param(stats.beta)
         score = float(rng.betavariate(alpha, beta))
         is_self = _is_self(row.provider, self_tool)
-        scored.append((1 if is_self else 0, -score, index, row, score, is_self))
+        # Cheapest adequate first (owner, 2026-10-16): within a tier the catalog lists cheaper
+        # candidates first, so the sample is weighted down linearly with catalog position.
+        # Without outcomes cheaper candidates are tried more often; a costlier one that keeps
+        # passing still overtakes them.
+        weight = 1.0 - COST_WEIGHT_SPREAD * (index / (len(rows) - 1)) if len(rows) > 1 else 1.0
+        scored.append((1 if is_self else 0, -(score * weight), index, row, score, is_self))
     scored.sort()
 
     chosen = [
