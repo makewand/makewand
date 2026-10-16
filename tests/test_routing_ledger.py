@@ -150,6 +150,60 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(custom.avg_seconds, 10)
         self.assertEqual(custom.avg_calls, 2)
 
+
+    def test_stats_many_matches_individual_stats_and_reads_once(self):
+        now = 1_700_000_000.0
+        rows = [
+            ("codex", 1, "implement", True, 10, 2, now, "gpt-6-luna", "low"),
+            ("codex", 1, "implement", False, 30, 4, now - 14 * _DAY, "gpt-6-luna", "low"),
+            ("codex", 2, "implement", True, 5, 1, now, "gpt-6-luna", "high"),
+            ("codex", 1, "review", False, 7, 1, now, "gpt-6-luna", "low"),
+            ("agy", 1, "implement", True, 3, 1, now, None, None),
+            ("codex", 1, "implement", True, 99, 9, now + 1000, "gpt-6-luna", "low"),
+        ]
+        for provider, tier, task, passed, sec, calls, ts, model, effort in rows:
+            kwargs = {}
+            if model is not None:
+                kwargs = {"model": model, "effort": effort}
+            self.ledger.record(provider, tier, task, passed, seconds=sec, calls=calls, ts=ts, **kwargs)
+        requests = [
+            ("codex", 1, "implement"),
+            ("codex", 1, "implement", "gpt-6-luna", "low"),
+            ("codex", 1, "implement", "gpt-6-luna", "high"),
+            ("codex", 9, "implement", "gpt-6-luna", "low"),
+            ("agy", 1, "implement"),
+            ("claude", 1, "implement"),
+            {"provider": "codex", "tier": 1, "task_type": "implement", "model": "gpt-6-luna"},
+        ]
+        reads = []
+        real_read = self.ledger._read_rows
+
+        def counting():
+            reads.append(1)
+            return real_read()
+
+        with patch.object(self.ledger, "_read_rows", counting):
+            batch = self.ledger.stats_many(requests, now=now)
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(len(batch), len(requests))
+        for request, got in zip(requests, batch):
+            if isinstance(request, dict):
+                want = self.ledger.stats(
+                    request["provider"], request["tier"], request["task_type"], now,
+                    model=request.get("model"), effort=request.get("effort"))
+            elif len(request) == 3:
+                want = self.ledger.stats(request[0], request[1], request[2], now)
+            else:
+                want = self.ledger.stats(
+                    request[0], request[1], request[2], now,
+                    model=request[3], effort=request[4] if len(request) > 4 else None)
+            self.assertEqual(
+                (got.alpha, got.beta, got.n, got.count, got.avg_seconds, got.avg_calls),
+                (want.alpha, want.beta, want.n, want.count, want.avg_seconds, want.avg_calls),
+                request)
+        # alias is the same implementation
+        self.assertEqual(self.ledger.batch_stats(requests, now=now), batch)
+
     def test_bad_lines_are_skipped(self):
         good_pass = {
             "ts": 100,
@@ -192,6 +246,7 @@ class OutcomeLedgerTests(unittest.TestCase):
             json.dumps(other) + "\n",
             json.dumps(good_fail) + "\n",
         ]
+        self.ledger.directory.mkdir(parents=True, exist_ok=True)
         self.ledger.outcomes_path.write_text("".join(lines), encoding="utf-8")
         stats = self.ledger.stats("codex", 1, "implement", now=100)
         self.assertEqual(stats.alpha, 2)
@@ -210,6 +265,22 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(stats.n, 3)
         self.assertEqual(stats.avg_seconds, 4)
         self.assertEqual(stats.avg_calls, 3)
+
+
+    def test_append_after_truncated_tail_line_keeps_new_record(self):
+        self.ledger.record("codex", 1, "implement", True, seconds=1, calls=1, ts=100)
+        # Simulate a crash mid-append: a truncated line with no newline.
+        with open(self.ledger.outcomes_path, "ab") as stream:
+            stream.write(b'{"ts": 100, "provider": "codex", "truncated')
+        self.ledger.record("agy", 1, "implement", False, seconds=2, calls=1, ts=100)
+        rows = list(self.ledger.records())
+        self.assertEqual(
+            [(row["provider"], row["passed"]) for row in rows],
+            [("codex", True), ("agy", False)],
+        )
+        self.assertEqual(self.ledger.stats("agy", 1, "implement", now=100).count, 1)
+        self.assertEqual(self.ledger.stats("codex", 1, "implement", now=100).count, 1)
+        self.assertTrue(self.ledger.outcomes_path.read_bytes().endswith(b"\n"))
 
     def test_two_processes_append_four_hundred_intact_lines(self):
         directory = self.ledger.directory
@@ -395,6 +466,7 @@ class OutcomeLedgerTests(unittest.TestCase):
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
     def test_record_refuses_symlinked_outcomes_file(self):
         victim = self.base / "victim.txt"
+        self.ledger.directory.mkdir(parents=True, exist_ok=True)
         victim.write_text("keep\n", encoding="utf-8")
         os.chmod(victim, 0o644)
         os.symlink(victim, self.ledger.outcomes_path)
@@ -404,6 +476,7 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(_mode(victim), 0o644)
 
     def test_mark_tightens_preexisting_loose_lock_file(self):
+        self.ledger.directory.mkdir(parents=True, exist_ok=True)
         lock_path = self.ledger.directory / "marks.json.lock"
         lock_path.write_text("", encoding="utf-8")
         os.chmod(lock_path, 0o644)
@@ -447,13 +520,28 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertFalse((self.base / "routing" / "outcomes.jsonl").exists())
 
+
+    def test_read_only_ledger_needs_no_writable_directory(self):
+        missing = OutcomeLedger(self.base / "missing" / "routing")
+        self.assertFalse((self.base / "missing").exists())
+        self.assertEqual(missing.stats("codex", 1, "implement", now=0).count, 0)
+        self.assertEqual(list(missing.records()), [])
+        self.assertEqual(missing.active_marks(now=0), {})
+        self.assertFalse((self.base / "missing").exists())
+        # Writing creates the directory (and only then).
+        missing.record("codex", 1, "implement", True, seconds=1, calls=1, ts=1)
+        self.assertTrue(missing.outcomes_path.is_file())
+        self.assertEqual(missing.stats("codex", 1, "implement", now=1).count, 1)
+
     def test_state_dir_follows_xdg_and_is_private(self):
         loose = self.base / "loose"
         loose.mkdir()
         os.chmod(loose, 0o755)
         ledger = OutcomeLedger(loose)
-        self.assertEqual(_mode(loose), 0o700)
+        # Construction alone does not create/tighten: only writes do.
+        self.assertEqual(_mode(loose), 0o755)
         ledger.record("codex", 1, "doc", False, seconds=1.5, calls=0, ts=1)
+        self.assertEqual(_mode(loose), 0o700)
         self.assertEqual(_mode(ledger.outcomes_path), 0o600)
 
         xdg = self.base / "xdg"
@@ -475,10 +563,12 @@ class OutcomeLedgerTests(unittest.TestCase):
         with patch.dict(os.environ, {"HOME": str(home), "XDG_STATE_HOME": "relative"}, clear=False):
             os.environ.pop("MAKEWAND_ROUTING_DIR", None)
             fallback = OutcomeLedger()
+            # Reading a missing ledger is an empty ledger and creates nothing.
+            self.assertEqual(fallback.stats("codex", 1, "implement", now=0).count, 0)
+            self.assertEqual(fallback.active_marks(now=0), {})
         expected = home / ".local" / "state" / "makewand" / "routing"
         self.assertEqual(fallback.directory, expected)
-        self.assertEqual(_mode(expected), 0o700)
-        self.assertEqual(_mode(expected.parent), 0o700)
+        self.assertFalse(expected.exists())
 
 
 if __name__ == "__main__":

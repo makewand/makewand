@@ -462,13 +462,52 @@ class FullSelectTests(unittest.TestCase):
             )
             expected_score[item.candidate_id] = replay.betavariate(float(stats.alpha), float(stats.beta))
         order = [item.candidate_id for item in catalog]
-        expected_order = sorted(order, key=lambda cid: (-expected_score[cid], order.index(cid)))
+        # Same cheapest-first weighting as route_select.select (and as
+        # tests/test_routing_select.py's `weighted`): the raw Beta sample is
+        # weighted down linearly with catalog position before ranking.
+        from makewand.route_select import COST_WEIGHT_SPREAD
+
+        def weighted(cid):
+            index = order.index(cid)
+            weight = 1.0 - COST_WEIGHT_SPREAD * (index / (len(order) - 1)) if len(order) > 1 else 1.0
+            return expected_score[cid] * weight
+
+        expected_order = sorted(order, key=lambda cid: (-weighted(cid), order.index(cid)))
         self.assertEqual([item.candidate_id for item in first.candidates], expected_order)
         self.assertLess(
             [item.candidate_id for item in first.candidates].index("codex/gpt-6-luna/high"),
             [item.candidate_id for item in first.candidates].index("codex/gpt-6-luna/low"),
         )
         self.assertIsInstance(first.candidates[0], RouteCandidate)
+
+
+
+    def test_full_select_reads_the_ledger_once(self):
+        reads = []
+        real_read = self.ledger._read_rows
+
+        def counting():
+            reads.append(1)
+            return real_read()
+
+        with patch.object(self.ledger, "_read_rows", counting):
+            result = self._select(rng=_ScriptedRng())
+        self.assertTrue(result.candidates)
+        self.assertEqual(len(reads), 1)
+
+    def test_full_skipped_is_deduped_by_provider_keeping_first_reason(self):
+        from makewand.route_select import Pause
+        from datetime import datetime
+        text = "2026-10-20T12:00"
+        until = datetime.strptime(text, "%Y-%m-%dT%H:%M").timestamp()
+        policy = Policy(paused=(Pause("codex", until, text), Pause("agy", until, text)))
+        result = self._select(policy=policy, now=until - 1, rng=_ScriptedRng())
+        # Each provider has several model x effort combos in the full catalog,
+        # but its skip reason is listed once, in first-appearance order.
+        self.assertEqual(
+            result.skipped,
+            [("agy", f"暂停到 {text}"), ("codex", f"暂停到 {text}")],
+        )
 
     def test_slim_select_leaves_the_new_fields_empty_and_skips_discovery(self):
         class Constant:

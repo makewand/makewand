@@ -632,5 +632,72 @@ class TestRealCatalogPicksUnchanged(_TempHome):
                           "muse": "muse-spark-1.3-contributor", "agy": "gemini-3.8-flash"})
 
 
+
+class TestAgyProbeSandbox(unittest.TestCase):
+    """P1: the real agy probe goes through provider_sandbox_launch with a
+    pinned native Gemini model, and fails closed without a sandbox."""
+
+    def test_probe_command_pins_native_gemini_model(self):
+        import makewand.health as health
+        captured = {}
+
+        def fake_probe(engine, command, timeout, repo_trust="trusted", cwd=None):
+            captured["command"] = list(command)
+            return (0, "ok\n", "", None)
+
+        with patch.object(health, "_run_model_probe", side_effect=fake_probe), \
+             patch("makewand.config.api_relay_available", return_value=False):
+            entry = health._probe_agy_for_real()
+        self.assertEqual(entry["status"], "healthy")
+        cmd = captured["command"]
+        self.assertIn("--model", cmd)
+        self.assertEqual(cmd[cmd.index("--model") + 1], "gemini-3.8-flash-low")
+        self.assertNotIn("opus", " ".join(cmd).lower())
+        self.assertNotIn("sonnet", " ".join(cmd).lower())
+
+    def test_probe_runs_through_sandbox_launch_not_bare_host(self):
+        import makewand.health as health
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        calls = {}
+
+        @contextmanager
+        def fake_launch(provider, cmd, cwd, **kwargs):
+            calls["provider"] = provider
+            calls["cmd"] = list(cmd)
+            calls["kwargs"] = kwargs
+            yield SimpleNamespace(cmd=["wrapped"] + list(cmd), pass_fds=(), env={})
+
+        def fake_run(cmd, **kwargs):
+            calls["run_cmd"] = list(cmd)
+            return (0, "ok\n", "", None)
+
+        with patch("makewand.sandbox.provider_sandbox_launch", fake_launch), \
+             patch.object(health, "run_subprocess", side_effect=fake_run), \
+             patch("makewand.config.api_relay_available", return_value=False):
+            entry = health._probe_agy_for_real()
+        self.assertEqual(entry["status"], "healthy")
+        self.assertEqual(calls["provider"], "agy")
+        self.assertTrue(calls["kwargs"]["readonly"])
+        self.assertEqual(calls["run_cmd"][0], "wrapped")
+        self.assertIn("gemini-3.8-flash-low", calls["run_cmd"])
+
+    def test_probe_without_sandbox_fails_closed_and_never_runs_host_agy(self):
+        import makewand.health as health
+        from makewand.sandbox import SandboxUnavailableError
+        ran = []
+        with patch("makewand.sandbox.provider_sandbox_launch",
+                   side_effect=SandboxUnavailableError(
+                       "❌ [Agy 沙箱不可用] useG1Credits 未能证明均为 false，可能扣 credits")), \
+             patch.object(health, "run_subprocess",
+                          side_effect=lambda *a, **k: ran.append(a) or (0, "ok", "", None)), \
+             patch("makewand.config.api_relay_available", return_value=False):
+            entry = health._probe_agy_for_real()
+        self.assertEqual(ran, [])
+        self.assertEqual(entry["status"], "warning")
+        self.assertIs(entry["verified"], False)
+        self.assertIn("useG1Credits", entry["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

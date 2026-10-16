@@ -21,6 +21,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,8 @@ _DURATION_PART = re.compile(r"(\d+)([dhms])")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 _UNIT_ORDER = {"d": 0, "h": 1, "m": 2, "s": 3}
 _DURATION_HINT = "时长格式不对：只用 d/h/m/s 组合，例如 6h、93h17m、2d、45m"
+_MAX_DURATION_SECONDS = 365 * 86400
+_MAX_DURATION_HINT = "时长太长：最长支持 365 天（例如 365d、8760h）"
 
 
 def _fail(message: str):
@@ -80,6 +83,8 @@ def parse_duration(text) -> int:
         position = match.end()
     if total <= 0:
         raise ValueError(f"invalid duration {text!r}; duration must be positive; {_DURATION_HINT}")
+    if total > _MAX_DURATION_SECONDS:
+        raise ValueError(f"invalid duration {text!r}; {_MAX_DURATION_HINT}; {_DURATION_HINT}")
     return total
 
 
@@ -173,19 +178,26 @@ def cmd_route(args) -> None:
     simple = bool(getattr(args, "simple", False))
     try:
         policy = load_policy()
-        result = select(
-            task_type,
-            difficulty,
-            risk=risk,
-            self_tool=self_tool,
-            not_tool=not_tool,
-            tier_override=getattr(args, "route_tier", None),
-            policy=policy,
-            quota_reader=_quota_reader_from_env(),
-            ledger=OutcomeLedger(),
-            full=not simple,
-            include_legacy=bool(getattr(args, "legacy", False)) and not simple,
-        )
+    except ValueError as error:
+        _fail(f"错误：{error}")
+    options = dict(
+        risk=risk,
+        self_tool=self_tool,
+        not_tool=not_tool,
+        tier_override=getattr(args, "route_tier", None),
+        policy=policy,
+        quota_reader=_quota_reader_from_env(),
+        full=not simple,
+        include_legacy=bool(getattr(args, "legacy", False)) and not simple,
+    )
+    try:
+        try:
+            result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
+        except PermissionError:
+            # Read-only state directory: fall back to an empty ledger and still
+            # produce a normal route answer instead of a traceback.
+            with tempfile.TemporaryDirectory(prefix="makewand-route-empty-") as empty:
+                result = select(task_type, difficulty, ledger=OutcomeLedger(Path(empty) / "routing"), **options)
     except ValueError as error:
         _fail(f"错误：{error}")
     budget = int(getattr(policy, "request_budget", 3) or 3)
@@ -229,9 +241,21 @@ def cmd_route(args) -> None:
         else:
             lines.append("  没有可用候选：已是最高档，等额度恢复、暂停结束后再试。")
     if result.escalate_tier is not None:
-        lines.append(
-            f"验收不过就升一档：makewand route {task_type} {difficulty} --tier {result.escalate_tier}"
-        )
+        # Carry the constraints that shaped this answer, so following the
+        # hint re-runs the same selection one tier up instead of silently
+        # dropping --risk/--self/--not/--simple/--legacy.
+        escalate_cmd = f"makewand route {task_type} {difficulty} --tier {result.escalate_tier}"
+        if risk == "high":
+            escalate_cmd += " --risk high"
+        if self_tool:
+            escalate_cmd += f" --self {self_tool}"
+        if not_tool and str(not_tool).strip():
+            escalate_cmd += f" --not {str(not_tool).strip()}"
+        if simple:
+            escalate_cmd += " --simple"
+        elif bool(getattr(args, "legacy", False)):
+            escalate_cmd += " --legacy"
+        lines.append(f"验收不过就升一档：{escalate_cmd}")
     lines.append(
         "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
         + _OUTCOME_HINT
@@ -243,12 +267,16 @@ def cmd_mark(args) -> None:
     try:
         provider = _validate_provider(args.provider)
         seconds = parse_duration(args.duration)
+        reason = getattr(args, "reason", None) or ""
+        until = time.time() + seconds
+        OutcomeLedger().mark(provider, until, reason)
+        when = datetime.fromtimestamp(until).strftime("%m-%d %H:%M")
     except ValueError as error:
         _fail(f"错误：{error}")
-    reason = getattr(args, "reason", None) or ""
-    until = time.time() + seconds
-    OutcomeLedger().mark(provider, until, reason)
-    when = datetime.fromtimestamp(until).strftime("%m-%d %H:%M")
+    except OverflowError:
+        _fail(f"错误：{_MAX_DURATION_HINT}")
+    except OSError as error:
+        _fail(f"错误：写入额度标记失败：{error}")
     print(f"已记录：{provider} 约 {when} 前不再派活")
 
 

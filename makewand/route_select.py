@@ -290,6 +290,7 @@ def select(
     quota = _read_quota(rows, blocked_early, quota_reader)
 
     skipped = []
+    seen_skipped = set()
     available = []
     for index, row in enumerate(rows):
         reason = (
@@ -299,21 +300,35 @@ def select(
             or _family_reason(row.provider, not_tool)
         )
         if reason:
-            skipped.append((row.provider, reason))
+            # 完整目录里同一 provider 有多个模型×推理深度组合：跳过原因
+            # 按 provider 只记第一条，顺序保持目录里第一次出现的顺序。
+            if row.provider not in seen_skipped:
+                seen_skipped.add(row.provider)
+                skipped.append((row.provider, reason))
             continue
         available.append((index, row))
 
+    # 一次读出账本快照批量算统计，避免每个候选都全量读 outcomes.jsonl。
+    batch_requests = [
+        (row.provider, tier, task_type,
+         getattr(row, "model", None), getattr(row, "effort", None))
+        for _index, row in available
+    ]
+    stats_many = getattr(ledger, "stats_many", None)
+    if callable(stats_many):
+        batch_stats = stats_many(batch_requests, now=moment, half_life_days=HALF_LIFE_DAYS)
+    else:
+        batch_stats = [
+            ledger.stats(
+                provider, req_tier, req_task,
+                now=moment, half_life_days=HALF_LIFE_DAYS,
+                model=req_model, effort=req_effort,
+            )
+            for provider, req_tier, req_task, req_model, req_effort in batch_requests
+        ]
+
     scored = []
-    for index, row in available:
-        stats = ledger.stats(
-            row.provider,
-            tier,
-            task_type,
-            now=moment,
-            half_life_days=HALF_LIFE_DAYS,
-            model=getattr(row, "model", None),
-            effort=getattr(row, "effort", None),
-        )
+    for (index, row), stats in zip(available, batch_stats):
         alpha = _positive_param(stats.alpha)
         beta = _positive_param(stats.beta)
         score = float(rng.betavariate(alpha, beta))

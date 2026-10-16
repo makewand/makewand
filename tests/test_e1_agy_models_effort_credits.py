@@ -231,14 +231,27 @@ class TestNormalizeAndCliEffort(unittest.TestCase):
 
 
 class TestAgyProviderCommandConstruction(_HomeCase):
+    def _write_host_settings(self, cli_value, root_value):
+        cli = self.home / ".gemini" / "antigravity-cli" / "settings.json"
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        root = self.home / ".gemini" / "settings.json"
+        if cli_value is not None:
+            cli.write_text(json.dumps({"useG1Credits": cli_value}), encoding="utf-8")
+        if root_value is not None:
+            root.write_text(json.dumps({"useG1Credits": root_value}), encoding="utf-8")
+
     def _dispatch_cmd(self, model, effort):
         from makewand.providers import agy as agy_provider
         discovered = DiscoveredAgyModels(AVAILABLE, None, None)
         workspace = Path(self._tmp.name) / "ws"
         workspace.mkdir(exist_ok=True)
+        # No-bwrap direct runs are only allowed when both host settings
+        # already prove useG1Credits is false (see TestAgyNoSandboxCredits).
+        self._write_host_settings(False, False)
         with patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec"), \
              patch.object(discovery, "_discover_local_agy_models", return_value=discovered), \
@@ -332,6 +345,86 @@ class TestAgyCreditsOff(unittest.TestCase):
             finally:
                 ph.finalize(write_back=False)
             self.assertFalse((home / ".gemini").exists())
+
+
+
+class TestAgyNoSandboxCredits(_HomeCase):
+    """P0: without bwrap, agy must fail closed unless both host settings
+    already prove useG1Credits is false."""
+
+    def _write(self, rel, value):
+        path = self.home / ".gemini" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(value, str):
+            path.write_text(value, encoding="utf-8")
+        else:
+            path.write_text(json.dumps({"useG1Credits": value}), encoding="utf-8")
+
+    def _execute(self):
+        from makewand.providers import agy as agy_provider
+        workspace = Path(self._tmp.name) / "ws"
+        workspace.mkdir(exist_ok=True)
+        discovered = DiscoveredAgyModels(AVAILABLE, None, None)
+        with patch("makewand.config.has_subscription_configured", return_value=True), \
+             patch("makewand.config.has_api_configured", return_value=False), \
+             patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+             patch("makewand.sandbox.audit_unsafe_host_exec"), \
+             patch.object(discovery, "_discover_local_agy_models", return_value=discovered), \
+             patch.object(agy_provider, "run_subprocess", return_value=(0, "ok", "", None)) as run:
+            result = agy_provider.execute_agy_task(
+                "hello", cwd=str(workspace), model="gemini-4-argon-low", readonly=True)
+        return result, run
+
+    def test_host_true_blocks_and_never_runs_agy(self):
+        self._write("settings.json", True)
+        self._write("antigravity-cli/settings.json", True)
+        (ok, _out, err), run = self._execute()
+        self.assertFalse(ok)
+        self.assertIn("useG1Credits", err)
+        self.assertIn("沙箱", err)
+        self.assertIn("credits", err)
+        run.assert_not_called()
+
+    def test_one_true_or_missing_or_malformed_still_blocks(self):
+        cases = [
+            (False, True), (True, False), (False, None), (None, False),
+            ("not json", False), (False, "false"),
+        ]
+        for cli_value, root_value in cases:
+            with self.subTest(cli=cli_value, root=root_value):
+                for rel in ("settings.json", "antigravity-cli/settings.json"):
+                    path = self.home / ".gemini" / rel
+                    if path.exists():
+                        path.unlink()
+                if root_value is not None:
+                    self._write("settings.json", root_value)
+                if cli_value is not None:
+                    self._write("antigravity-cli/settings.json", cli_value)
+                (ok, _out, err), run = self._execute()
+                self.assertFalse(ok)
+                self.assertIn("useG1Credits", err)
+                run.assert_not_called()
+
+    def test_both_false_allows_authorized_direct_run(self):
+        self._write("settings.json", False)
+        self._write("antigravity-cli/settings.json", False)
+        (ok, out, err), run = self._execute()
+        self.assertTrue(ok, err)
+        self.assertEqual(out, "ok")
+        run.assert_called_once()
+
+    def test_other_providers_are_not_blocked_by_agy_settings(self):
+        from makewand.sandbox import provider_sandbox_launch
+        self._write("settings.json", True)
+        self._write("antigravity-cli/settings.json", True)
+        with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+        patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
+             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+             patch("makewand.sandbox.audit_unsafe_host_exec"):
+            with provider_sandbox_launch("codex", ["codex", "exec", "hi"], str(self.home), readonly=True) as launch:
+                self.assertEqual(launch.cmd, ["codex", "exec", "hi"])
+                self.assertFalse(launch.sandboxed)
 
 
 if __name__ == "__main__":

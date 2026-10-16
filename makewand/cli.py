@@ -1311,7 +1311,7 @@ def _main():
             sys.exit(EXIT_USAGE_ERROR)
         return delegate_to_go_server(native_argv)
 
-    common_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("-C", "--cwd", dest="cwd", default=None, help="Target working directory (default: current directory)")
     common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=None, help="Read task prompt from file")
     common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default="trusted", help="Repository trust level: trusted or untrusted")
@@ -1636,7 +1636,34 @@ def _main():
     # Auto-route to `makewand run ...` if user invokes `makewand "prompt"`, `makewand -C /dir -f task.txt`, or pipes stdin
     is_auto_routed_run = False
     try:
-        common_opts, remaining = common_parser.parse_known_args(sys.argv[1:])
+        # Only the options in front of the subcommand are global: parsing the
+        # whole argv here would consume a subcommand's own options as
+        # abbreviations of global ones (mark --reason -> --reasoning-effort).
+        argv_tail = list(sys.argv[1:])
+        _value_flags = {"-C", "--cwd", "-f", "-F", "--file", "--prompt-file", "--repo-trust",
+                        "--max-model-calls", "--call-budget-file", "--protect",
+                        "--effort", "--reasoning-effort", "--workflow", "--risk",
+                        "--total-timeout", "--judge-reserve-seconds"}
+        _sub_at = None
+        _i = 0
+        while _i < len(argv_tail):
+            _tok = argv_tail[_i]
+            if _tok == "--":
+                break
+            if _tok.startswith("-") and _tok != "-":
+                _i += 2 if _tok in _value_flags else 1
+                continue
+            # Only the first positional can be the subcommand, as in argparse.
+            # Anything else starts a prompt, and later tokens are its options
+            # (makewand "fix it" --provider agy must not stop at "agy").
+            if _tok in known_subcommands:
+                _sub_at = _i
+            break
+        if _sub_at is not None:
+            common_opts, _ignored = common_parser.parse_known_args(argv_tail[:_sub_at])
+            remaining = argv_tail[_sub_at:]
+        else:
+            common_opts, remaining = common_parser.parse_known_args(argv_tail)
     except Exception:
         common_opts, remaining = None, []
 

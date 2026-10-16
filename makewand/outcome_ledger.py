@@ -242,7 +242,9 @@ class OutcomeLedger:
             self._dir = routing_dir()
             override = os.environ.get("MAKEWAND_ROUTING_DIR", "")
             self._state_root = None if override else self._dir.parent
-        self._ensure_dir()
+        # Deliberately do not create the directory here: read-only callers
+        # (e.g. `makewand route`) must work when the state directory is
+        # missing or read-only. Only writes (record/mark) create it.
 
     @property
     def directory(self) -> Path:
@@ -317,7 +319,7 @@ class OutcomeLedger:
         if not _O_NOFOLLOW and os.path.islink(self.outcomes_path):
             raise PermissionError(f"refusing symlinked outcomes file: {self.outcomes_path}")
         created = not os.path.lexists(self.outcomes_path)
-        fd = os.open(self.outcomes_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW, 0o600)
+        fd = os.open(self.outcomes_path, os.O_RDWR | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW, 0o600)
         try:
             if os.name != "nt":
                 try:
@@ -326,7 +328,25 @@ class OutcomeLedger:
                     pass
             filelock.flock(fd, filelock.LOCK_EX)
             try:
-                view = memoryview(payload)
+                # A truncated tail line without a trailing newline (crash
+                # mid-append, hand-truncated file) must not swallow this
+                # record: terminate that line first, under the write lock.
+                # The truncated line itself stays unreadable and is skipped
+                # by readers, exactly like any other bad line.
+                prefix = b""
+                try:
+                    size = os.fstat(fd).st_size
+                    if size > 0:
+                        if hasattr(os, "pread"):
+                            last = os.pread(fd, 1, size - 1)
+                        else:
+                            os.lseek(fd, size - 1, os.SEEK_SET)
+                            last = os.read(fd, 1)
+                        if last != b"\n":
+                            prefix = b"\n"
+                except OSError:
+                    prefix = b""
+                view = memoryview(prefix + payload)
                 while view:
                     written = os.write(fd, view)
                     if written <= 0:
@@ -344,7 +364,8 @@ class OutcomeLedger:
     def _read_rows(self) -> List[Dict[str, Any]]:
         try:
             stream = open(self.outcomes_path, "r", encoding="utf-8", errors="replace")
-        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        except OSError:
+            # Missing or unreadable (e.g. read-only state dir): empty ledger.
             return []
         rows: List[Dict[str, Any]] = []
         with stream:
@@ -406,6 +427,13 @@ class OutcomeLedger:
         want_effort = _normalize_optional_text(effort, "effort", lower=True)
         candidate_query = want_model is not None or want_effort is not None
         half_life_seconds = float(half_life_days) * _SECONDS_PER_DAY
+        return self._stats_from_rows(
+            self._read_rows(), provider, wanted_tier, task_type, moment,
+            half_life_seconds, want_model, want_effort, candidate_query)
+
+    @staticmethod
+    def _stats_from_rows(rows, provider, wanted_tier, task_type, moment,
+                         half_life_seconds, want_model, want_effort, candidate_query) -> Stats:
         alpha = _PRIOR_ALPHA
         beta = _PRIOR_BETA
         n = 0.0
@@ -414,7 +442,7 @@ class OutcomeLedger:
         seconds_weights = 0.0
         calls_weighted = 0.0
         calls_weights = 0.0
-        for row in self._read_rows():
+        for row in rows:
             if row["provider"] != provider or row["task_type"] != task_type:
                 continue
             if candidate_query:
@@ -449,10 +477,64 @@ class OutcomeLedger:
             avg_calls=(calls_weighted / calls_weights) if calls_weights > 0 else None,
         )
 
+    def stats_many(
+        self,
+        requests,
+        now: Any = None,
+        half_life_days: float = 14,
+    ) -> List[Stats]:
+        """批量统计：只读一次账本快照，在内存里算出每个请求的统计。
+
+        每个请求可以是 dict（provider/tier/task_type，可选 model/effort）
+        或元组 (provider, tier, task_type[, model[, effort]])。返回与请求
+        同序的 Stats 列表，结果与逐个调用 stats() 完全一致。
+        """
+        if isinstance(half_life_days, bool) or not isinstance(half_life_days, (int, float)):
+            raise TypeError("half_life_days must be a number")
+        if not math.isfinite(float(half_life_days)) or float(half_life_days) <= 0:
+            raise ValueError("half_life_days must be a positive finite number")
+        moment = time.time() if now is None else _coerce_ts(now, "now")
+        half_life_seconds = float(half_life_days) * _SECONDS_PER_DAY
+        prepared = []
+        for request in requests:
+            if isinstance(request, dict):
+                provider = request.get("provider")
+                tier = request.get("tier")
+                task_type = request.get("task_type")
+                model = request.get("model")
+                effort = request.get("effort")
+            else:
+                parts = tuple(request)
+                if len(parts) == 3:
+                    provider, tier, task_type = parts
+                    model = effort = None
+                elif len(parts) == 4:
+                    provider, tier, task_type, model = parts
+                    effort = None
+                elif len(parts) == 5:
+                    provider, tier, task_type, model, effort = parts
+                else:
+                    raise ValueError("each request must have provider, tier, task_type[, model[, effort]]")
+            wanted_tier = _normalize_tier(tier)
+            want_model = _normalize_optional_text(model, "model")
+            want_effort = _normalize_optional_text(effort, "effort", lower=True)
+            candidate_query = want_model is not None or want_effort is not None
+            prepared.append((provider, wanted_tier, task_type, want_model, want_effort, candidate_query))
+        rows = self._read_rows()
+        return [
+            self._stats_from_rows(
+                rows, provider, wanted_tier, task_type, moment,
+                half_life_seconds, want_model, want_effort, candidate_query)
+            for provider, wanted_tier, task_type, want_model, want_effort, candidate_query in prepared
+        ]
+
+    # 批量统计的别名（同一实现）。
+    batch_stats = stats_many
+
     def _read_marks(self) -> Dict[str, Mark]:
         try:
             raw = self.marks_path.read_bytes()
-        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        except OSError:
             return {}
         try:
             parsed = json.loads(raw.decode("utf-8"))

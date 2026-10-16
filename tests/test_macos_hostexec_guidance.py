@@ -58,6 +58,7 @@ class TestWritableSandboxVerification(unittest.TestCase):
 
     def test_darwin_guidance_when_bwrap_unavailable_and_unauthorized(self):
         with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+        patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("sys.platform", "darwin"), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(False, None)):
             ok, source, err = verify_writable_sandbox_or_authorized("claude", repo_trust="trusted")
@@ -74,6 +75,7 @@ class TestWritableSandboxVerification(unittest.TestCase):
 
     def test_linux_guidance_when_bwrap_unavailable_and_unauthorized(self):
         with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+        patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("sys.platform", "linux"), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(False, None)):
             ok, source, err = verify_writable_sandbox_or_authorized("codex", repo_trust="trusted")
@@ -86,6 +88,7 @@ class TestWritableSandboxVerification(unittest.TestCase):
 
     def test_authorized_host_exec_allows_execution(self):
         with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+        patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")):
             ok, source, err = verify_writable_sandbox_or_authorized("claude", repo_trust="trusted")
             self.assertTrue(ok)
@@ -103,6 +106,7 @@ class TestProvidersHostExecution(unittest.TestCase):
         self._patches = [
             patch.object(mw_config, "CONFIG_DIR", self.cfg_dir),
             patch("makewand.sandbox.is_bwrap_available", return_value=False),
+            patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
             patch.dict(sandbox._host_exec_session, {"warned": False, "declined": False}),
         ]
         for p in self._patches:
@@ -184,6 +188,7 @@ class TestOrchestratorUpfrontFailFast(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+            patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                  patch("sys.platform", "darwin"), \
                  patch.dict(os.environ, {}, clear=True), \
                  patch("makewand.health.get_or_update_status", return_value={
@@ -203,6 +208,7 @@ class TestOrchestratorUpfrontFailFast(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+            patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                  patch("sys.platform", "darwin"), \
                  patch.dict(os.environ, {}, clear=True), \
                  patch("makewand.health.get_or_update_status", return_value={

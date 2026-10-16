@@ -1561,6 +1561,44 @@ def _sanitized_agy_settings_bytes(host_path) -> bytes:
     return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
+def _agy_host_credits_disabled(user_home=None) -> bool:
+    """True only when both host agy settings files prove useG1Credits is false.
+
+    A missing, unreadable, non-object or otherwise unproven file does not
+    count: without a sandbox agy would read the host settings (or its own
+    default-true behaviour) and could spend G1 credits once quota runs out.
+    """
+    home = _norm(str(user_home)) if user_home else _norm(str(Path.home()))
+    gemini_root = os.path.join(home, ".gemini")
+    for rel in AGY_SETTINGS_RELS:
+        found = _read_host_regular(os.path.join(gemini_root, rel))
+        if found is None:
+            return False
+        try:
+            parsed = json.loads(found[0].decode("utf-8"))
+        except Exception:
+            return False
+        if not isinstance(parsed, dict) or parsed.get("useG1Credits") is not False:
+            return False
+    return True
+
+
+def _agy_no_sandbox_credits_message() -> str:
+    return (
+        "❌ [Agy 沙箱不可用] 没有可信 Bubblewrap (bwrap) 沙箱时，拒绝在宿主直接运行 agy："
+        "宿主 ~/.gemini/settings.json 与 ~/.gemini/antigravity-cli/settings.json 的 "
+        "\"useG1Credits\" 未能证明均为 false，agy 在订阅额度用完后可能扣 G1 credits (fail closed)。\n"
+        "解决建议：\n"
+        "  1. [安装沙箱] 在 Linux 上安装 Bubblewrap 并启用非特权用户命名空间，让 agy 读取私有 home 里的净化设置；\n"
+        "  2. [关闭 credits 后直跑] 把上面两个宿主设置文件里的 \"useG1Credits\" 都明确设为 false，"
+        "再按无沙箱宿主执行的授权流程运行。"
+    )
+
+
+def _is_agy_provider(provider) -> bool:
+    return (provider or "").lower().strip() in ("agy", "gemini")
+
+
 def _write_agy_sanitized_settings(priv_root: str, host_real_root: str) -> list:
     """Write sanitized agy settings into a private root; return the dst paths.
 
@@ -2849,6 +2887,8 @@ def provider_sandbox_launch(
     Yields ProviderLaunch; raises SandboxConfigError / SandboxUnavailableError.
     """
     if not is_bwrap_available():
+        if _is_agy_provider(provider) and not _agy_host_credits_disabled():
+            raise SandboxUnavailableError(_agy_no_sandbox_credits_message())
         source = authorize_unsandboxed_launch(provider, cmd, cwd, readonly, repo_trust, host_auth_source)
         # Passed through the process environment rather than an `env` prefix,
         # which does not exist on Windows.

@@ -152,6 +152,7 @@ class TestH1UnsandboxedLaunchAuthorization(unittest.TestCase):
             with self.subTest(provider=name), workspace() as ws, \
                     patch.dict(os.environ, {}, clear=False), \
                     patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                    patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                     patch("makewand.sandbox.audit_unsafe_host_exec") as audit:
                 os.environ.pop(sandbox.UNSAFE_HOST_EXEC_ENV, None)
                 (ok, out, err), run_mock = _run_provider(name, ws)
@@ -177,6 +178,7 @@ class TestH1UnsandboxedLaunchAuthorization(unittest.TestCase):
         for name in PROVIDERS:
             with self.subTest(provider=name), workspace() as ws, recorded_host_exec_ack() as audit_path, \
                     patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                    patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                     patch("makewand.sandbox.audit_unsafe_host_exec", wraps=sandbox.audit_unsafe_host_exec) as audit:
                 (ok, out, err), run_mock = _run_provider(name, ws)
                 self.assertTrue(ok, err)
@@ -554,6 +556,7 @@ class TestProviderWorkerMarker(unittest.TestCase):
 
     def test_provider_host_launch_sets_marker(self):
         with workspace() as ws, patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                 patch("makewand.sandbox.audit_unsafe_host_exec") as audit:
             with provider_sandbox_launch("codex", ["codex", "exec", "x"], str(ws), readonly=True,
                                          host_auth_source="config-ack") as launch:
@@ -576,6 +579,7 @@ class TestProviderWorkerMarker(unittest.TestCase):
 
     def test_non_provider_host_run_has_no_marker(self):
         with workspace() as ws, patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                 patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
                 patch("makewand.sandbox.audit_unsafe_host_exec") as audit, \
                 patch("makewand.sandbox.run_subprocess", return_value=(0, "", "", None)) as run:
@@ -586,6 +590,7 @@ class TestProviderWorkerMarker(unittest.TestCase):
 
     def test_non_provider_host_run_without_authorization_is_blocked(self):
         with workspace() as ws, patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                 patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(False, None)), \
                 patch("makewand.sandbox.run_subprocess") as run:
             code, _, _, cat = run_in_sandbox(["python3", "-c", "pass"], workspace=str(ws), readonly=True)

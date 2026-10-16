@@ -105,7 +105,7 @@ class RoutingCliTests(unittest.TestCase):
         agy_line = next(line for line in candidates if " agy " in line)
         self.assertIn("--model gemini-3.8-flash-medium", agy_line)
         self.assertNotIn("跳过：", result.stdout)
-        self.assertIn("验收不过就升一档：makewand route implement mechanical --tier 2", lines)
+        self.assertIn("验收不过就升一档：makewand route implement mechanical --tier 2 --simple", lines)
         self.assertEqual(lines[-1], FOOTER)
         self.assertNotIn("还有", result.stdout)
         # route 只读：不写成绩和标记文件。
@@ -222,13 +222,97 @@ class RoutingCliTests(unittest.TestCase):
         result = self.run_cli("route", "implement", "mechanical", "--simple", quota={}, policy=paused_all)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("没有可用候选", result.stdout)
-        self.assertIn("验收不过就升一档：makewand route implement mechanical --tier 2",
+        self.assertIn("验收不过就升一档：makewand route implement mechanical --tier 2 --simple",
                       result.stdout.splitlines())
         top = 'PAUSED="codex:2099-01-01T00:00 agy:2099-01-01T00:00 claude:2099-01-01T00:00 grok:2099-01-01T00:00"\n'
         strong = self.run_cli("route", "review", "hard", "--simple", quota={}, policy=top)
         self.assertIn("没有可用候选", strong.stdout)
         self.assertIn("后再试", strong.stdout)
         self.assertNotIn("验收不过就升一档", strong.stdout)
+
+
+    def test_route_full_skipped_list_is_complete_and_deduped(self):
+        future = "2099-01-01T00:00"
+        payload = self.route_json(
+            "implement", "mechanical", quota={},
+            policy=f'PAUSED="codex:{future} agy:{future}"\n')
+        # Full catalog: codex/agy each have many model x effort combos, but
+        # the skipped list holds exactly one entry per provider, in order.
+        self.assertEqual(payload["skipped"], [
+            {"provider": "agy", "reason": f"暂停到 {future}"},
+            {"provider": "codex", "reason": f"暂停到 {future}"},
+        ])
+        self.assertTrue(all(item["provider"] not in ("codex", "agy")
+                            for item in payload["candidates"]))
+
+
+    def test_route_works_when_routing_dir_is_unusable(self):
+        # State location is a regular file: the routing directory can never
+        # be created there. route is read-only, so it must still answer
+        # from an empty ledger instead of tracebacking on PermissionError.
+        blocker = self.base / "state-file"
+        blocker.write_text("not a directory", encoding="utf-8")
+        result = self.run_cli(
+            "route", "implement", "mechanical", "--simple", quota={},
+            extra_env={"MAKEWAND_ROUTING_DIR": str(blocker / "routing")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("子任务：implement / mechanical", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+    def test_escalate_hint_keeps_effective_constraints(self):
+        result = self.run_cli(
+            "route", "implement", "mechanical", "--tier", "1", "--risk", "high",
+            "--self", "agy", "--not", "codex", "--legacy", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "验收不过就升一档：makewand route implement mechanical --tier 2"
+            " --risk high --self agy --not codex --legacy",
+            result.stdout.splitlines())
+        simple = self.run_cli(
+            "route", "implement", "mechanical", "--simple", "--legacy", quota={})
+        self.assertEqual(simple.returncode, 0, simple.stderr)
+        # --legacy has no effect together with --simple, so only --simple is carried.
+        self.assertIn(
+            "验收不过就升一档：makewand route implement mechanical --tier 2 --simple",
+            simple.stdout.splitlines())
+        plain = self.run_cli("route", "implement", "mechanical", "--simple", quota={})
+        self.assertIn(
+            "验收不过就升一档：makewand route implement mechanical --tier 2 --simple",
+            plain.stdout.splitlines())
+
+    def test_prescan_only_treats_the_first_positional_as_a_subcommand(self):
+        # A prompt's own options may carry a value that is also a subcommand
+        # name (--provider agy); the auto-route must still insert "run".
+        from unittest import mock
+        sys.path.insert(0, str(REPO_ROOT))
+        try:
+            import makewand.cli as cli
+        finally:
+            sys.path.remove(str(REPO_ROOT))
+
+        class Parsed(Exception):
+            pass
+
+        def fake_parse_args(parser, args=None, namespace=None):
+            raise Parsed(list(sys.argv[1:]))
+
+        cases = (
+            (["fix the bug", "--provider", "agy"], ["run", "fix the bug", "--provider", "agy"]),
+            (["-C", str(self.work), "fix the route", "--provider", "codex"],
+             ["run", "-C", str(self.work), "fix the route", "--provider", "codex"]),
+            (["-C", str(self.work), "mark", "codex", "6h", "--reason", "x"],
+             ["-C", str(self.work), "mark", "codex", "6h", "--reason", "x"]),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv), \
+                    mock.patch.object(sys, "argv", ["makewand", *argv]), \
+                    mock.patch.dict(os.environ, {"MAKEWAND_NO_DAEMON": "1"}), \
+                    mock.patch.object(cli.argparse.ArgumentParser, "parse_args", fake_parse_args):
+                os.environ.pop(WORKER_ENV, None)
+                with self.assertRaises(Parsed) as caught:
+                    cli._main()
+                self.assertEqual(caught.exception.args[0], expected)
 
     # ---------- mark ----------
 
@@ -263,6 +347,18 @@ class RoutingCliTests(unittest.TestCase):
         self.assertIn("legal values", bad_provider.stderr)
         bad_duration = self.run_cli("mark", "codex", "6x", quota={})
         self.assertIn("d/h/m/s", bad_duration.stderr)
+
+
+    def test_mark_huge_duration_fails_cleanly_without_traceback(self):
+        for duration in ("999999999999999999999d", "366d", "10000d"):
+            with self.subTest(duration=duration):
+                result = self.run_cli("mark", "codex", duration, quota={})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("365", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        ok = self.run_cli("mark", "codex", "365d", quota={})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("已记录：codex 约 ", ok.stdout)
 
     # ---------- outcome ----------
 
@@ -324,6 +420,29 @@ class RoutingCliTests(unittest.TestCase):
                 self.assertTrue(result.stderr.strip())
                 if hint:
                     self.assertIn(hint, result.stderr)
+
+
+    # ---------- 缩写解析（新命令拒绝，旧命令保持 master 行为） ----------
+
+    def test_new_commands_reject_abbreviated_options(self):
+        for args in (("route", "implement", "mechanical", "--jso"),
+                     ("mark", "codex", "6h", "--reas", "x"),
+                     ("outcome", "codex", "1", "implement", "pass", "--mod", "m")):
+            with self.subTest(args=args):
+                result = self.run_cli(*args, quota={})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertTrue(result.stderr.strip())
+
+    def test_old_commands_keep_abbreviated_options(self):
+        # status is an old command: --jso still resolves to --json.
+        result = self.run_cli("status", "--jso", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["engine"], "python")
+        # Global options in front of a subcommand keep abbreviated form too.
+        routed = self.run_cli("--repo-tr", "trusted", "route", "implement",
+                              "mechanical", "--simple", quota={})
+        self.assertEqual(routed.returncode, 0, routed.stderr)
+        self.assertIn("子任务：implement / mechanical", routed.stdout)
 
     def write_discovery_cache(self):
         """把只有这次测试才有的模型写进 discovery 会读的本地缓存。"""
