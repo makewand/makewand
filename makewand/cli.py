@@ -478,6 +478,14 @@ def cmd_disable(args):
 
 
 def cmd_models(args):
+    if getattr(args, "refresh", False):
+        # Explicit agy refresh: 60s, ignores a fresh cache and the .attempt back-off.
+        # The listing below still reads the cache and does not refresh again.
+        from makewand.discovery import (
+            AGY_MODELS_REFRESH_TIMEOUT_SECONDS,
+            refresh_agy_models_cache,
+        )
+        refresh_agy_models_cache(timeout=AGY_MODELS_REFRESH_TIMEOUT_SECONDS)
     print(c("\n============================================================", COLOR_BOLD))
     print(c("       Makewand 多模型生态与动态发现矩阵 (Model Discovery)", COLOR_BOLD + COLOR_CYAN))
     print(c("============================================================\n", COLOR_BOLD))
@@ -1348,7 +1356,8 @@ def _main():
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     # models
-    subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems", parents=[sub_common_parser])
+    p_models = subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems", parents=[sub_common_parser])
+    p_models.add_argument("--refresh", action="store_true", default=False, help="Refresh the agy model cache now (60s timeout, ignores back-off) before listing")
 
     # status
     p_status = subparsers.add_parser("status", help="Show health, quota indicators (local estimates), and reset times of all AIs", parents=[sub_common_parser])
@@ -1544,12 +1553,14 @@ def _main():
     p_clean.add_argument("--all", action="store_true", default=False, help="Clean all temporary makewand caches and artifacts")
 
     # route / mark / outcome (automatic dispatch bookkeeping; never call a model)
-    p_route = subparsers.add_parser("route", allow_abbrev=False, help="为子任务按档位选派活工具（只读账本，不调用模型）", parents=[sub_common_parser])
+    p_route = subparsers.add_parser("route", allow_abbrev=False, help="为子任务在完整模型目录里选派活工具（只读账本和本地缓存，不调用模型）", parents=[sub_common_parser])
     p_route.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
     p_route.add_argument("difficulty", metavar="DIFFICULTY", help="难度：mechanical, normal, hard")
     p_route.add_argument("--tier", dest="route_tier", type=int, default=None, metavar="N", help="直接指定档位（1, 2, 3），覆盖按难度推算的起始档")
     p_route.add_argument("--self", dest="self_tool", default=None, metavar="T", help="你自己是哪家工具（codex, claude, agy, grok, muse），同家候选排最后")
     p_route.add_argument("--not", dest="not_tool", default=None, metavar="T", help="排除与该工具同家族的候选")
+    p_route.add_argument("--simple", action="store_true", default=False, help="只用精简三档表，不展开全部模型和推理深度")
+    p_route.add_argument("--legacy", action="store_true", default=False, help="完整目录里把旧版本模型也纳入排序（与 --simple 一起用时无效）")
     p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
 
     p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前不再派活", parents=[sub_common_parser])
@@ -1564,6 +1575,7 @@ def _main():
     p_outcome.add_argument("result", choices=["pass", "fail"], help="验收结果：pass 或 fail")
     p_outcome.add_argument("--seconds", type=float, default=None, help="这次派活耗时秒数（可选）")
     p_outcome.add_argument("--calls", type=int, default=None, help="这次派活的模型调用次数（可选）")
+    p_outcome.add_argument("--model", default=None, metavar="M", help="记入账本的模型名，供候选级统计（可选）")
 
     from makewand.config import get_all_supported_providers
     all_supported = get_all_supported_providers()
