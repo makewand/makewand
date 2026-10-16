@@ -190,12 +190,12 @@ class TestAgyModelCacheRefresh(_TempHome):
                 discovery._AGY_FAILED_REFRESHES.clear()
                 if self.marker.exists():
                     self.marker.unlink()
-                cache = self.write(self.CACHE, good, age_seconds=13 * 3600)
+                cache = self.write(self.CACHE, good, age_seconds=25 * 3600)
                 before = cache.read_text(encoding="utf-8")
                 models, run = self.discover(stdout=stdout)
                 run.assert_called_once()
                 self.assertEqual(cache.read_text(encoding="utf-8"), before)
-                self.assertEqual(sorted(set(models)), ["gemini-3.1-pro", "gemini-3.8-flash"])
+                self.assertEqual(sorted(set(models)), ["gemini-3.1-pro-high", "gemini-3.8-flash-high"])
                 self.assertIn(self.standard, ("gemini-3.1-pro", "gemini-3.8-flash"))
                 self.assertTrue(self.marker.exists())  # a failed refresh: back off
                 models, run = self.discover()

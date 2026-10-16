@@ -1531,6 +1531,64 @@ def _resolve_provider_profile(p_name: str, user_home: str, project_paths: Sequen
     return profile
 
 
+
+# agy must never spend G1 credits: every agy process makewand launches reads
+# its settings from the private provider home (see PROVIDER_PROFILES["agy"]),
+# where both settings files are forced to useG1Credits=false. The host files
+# (~/.gemini/settings.json and ~/.gemini/antigravity-cli/settings.json, the
+# latter being the one the Antigravity CLI actually reads) are only read,
+# never written.
+AGY_SETTINGS_RELS = ("settings.json", "antigravity-cli/settings.json")
+
+
+def _sanitized_agy_settings_bytes(host_path) -> bytes:
+    """Host agy settings content with useG1Credits forced to false.
+
+    Preserves every other key; a missing, unreadable or non-object file
+    yields a minimal {"useG1Credits": false} document.
+    """
+    data = {}
+    if host_path:
+        found = _read_host_regular(str(host_path))
+        if found is not None:
+            try:
+                parsed = json.loads(found[0].decode("utf-8"))
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                data = dict(parsed)
+    data["useG1Credits"] = False
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _write_agy_sanitized_settings(priv_root: str, host_real_root: str) -> list:
+    """Write sanitized agy settings into a private root; return the dst paths.
+
+    Covers both settings locations agy may read. Existing private files are
+    replaced (they are inside the per-run private directory, never the host).
+    """
+    written = []
+    for rel in AGY_SETTINGS_RELS:
+        host_p = os.path.join(host_real_root, rel) if host_real_root else None
+        content = _sanitized_agy_settings_bytes(host_p)
+        dst = os.path.join(priv_root, rel)
+        try:
+            os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW | _O_CLOEXEC, 0o600)
+            try:
+                os.write(fd, content)
+            finally:
+                os.close(fd)
+            try:
+                os.chmod(dst, 0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            raise SandboxConfigError(f"无法写私有 agy 设置 ({exc})，拒绝启动 (fail closed)") from exc
+        written.append(dst)
+    return written
+
+
 class ProviderHome:
     """
     Per-run private provider home (H3). Created lazily by wrap_bwrap via
@@ -1551,6 +1609,7 @@ class ProviderHome:
         self.credentials: List[_CredentialCopy] = []
         self._materialized = False
         self._lock = threading.Lock()
+        self._private_roots: Dict[str, str] = {}
 
     def materialize(self, project_paths: Sequence[str] = (),
                     absent_root_ok: Optional[Callable[[str], bool]] = None) -> List[str]:
@@ -1621,10 +1680,20 @@ class ProviderHome:
         account to verify it against).
         """
         rels = [rel for e_root, rel in profile.get("credentials", []) if e_root == root_rel]
-        if not rels:
+        if not rels and self.provider != "agy":
             return
         priv = self._private_root(idx)
+        self._private_roots[root_rel] = priv
         args.extend(["--bind", priv, root_path])
+        if self.provider == "agy":
+            # No host settings exist: the private home must still present
+            # useG1Credits=false so a default-true CLI cannot spend credits.
+            for _dst in _write_agy_sanitized_settings(priv, root_path):
+                pass
+            # Bind each sanitized file read-only at its expected location.
+            for rel in AGY_SETTINGS_RELS:
+                dst = os.path.join(priv, rel)
+                args.extend(["--ro-bind", dst, os.path.join(root_path, rel)])
         minted = profile.get("minted_keys", {})
         for rel in rels:
             self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=os.path.join(root_path, rel),
@@ -1648,6 +1717,7 @@ class ProviderHome:
                 continue
             real = os.path.realpath(root_path)
             priv = self._private_root(idx)
+            self._private_roots[root_rel] = priv
             real_roots[root_rel] = real
             self.state_roots.append(real)
             args.extend(["--bind", priv, real])
@@ -1674,6 +1744,27 @@ class ProviderHome:
             if not real:
                 continue
             p = os.path.join(real, sub)
+            if self.provider == "agy" and sub in AGY_SETTINGS_RELS:
+                # Force useG1Credits=false in the private home: write a
+                # sanitized copy (host file only read) and bind it read-only
+                # at the path agy reads. The host original is first bound
+                # read-only (the protected-file invariant other providers
+                # rely on) and then shadowed by the sanitized copy, so the
+                # file agy actually sees is the sanitized one and the host
+                # file is never writable or modified.
+                priv = self._private_roots.get(root_rel)
+                if priv is None:
+                    continue
+                if os.path.islink(p):
+                    _target = os.path.realpath(p)
+                    if os.path.exists(_target):
+                        args.extend(["--ro-bind", _target, p])
+                elif os.path.exists(p):
+                    args.extend(["--ro-bind", p, p])
+                _write_agy_sanitized_settings(priv, real)
+                dst = os.path.join(priv, sub)
+                args.extend(["--ro-bind", dst, p])
+                continue
             if os.path.islink(p):
                 # dotfile-managed symlink: bind its resolved target read-only at
                 # the expected path (the link itself is not exposed)

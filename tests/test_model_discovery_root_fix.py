@@ -82,11 +82,13 @@ class TestModelDiscoveryRootFix(unittest.TestCase):
         # Claude & AGY accept: low, medium, high, xhigh, max
         self.assertEqual(normalize_provider_effort("claude", "max"), "max")
         self.assertEqual(normalize_provider_effort("claude", "high"), "high")
-        # agy rejects xhigh/max (gemini-3.1-pro supports only low/high)
-        self.assertEqual(normalize_provider_effort("agy", "max"), "high")
-        self.assertEqual(normalize_provider_effort("agy", "xhigh"), "high")
-        self.assertIsNone(normalize_provider_effort("agy", "medium"))
+        # agy accepts low|medium|high|xhigh|max (--effort and model suffixes); ultra clamps to max
+        self.assertEqual(normalize_provider_effort("agy", "max"), "max")
+        self.assertEqual(normalize_provider_effort("agy", "xhigh"), "xhigh")
+        self.assertEqual(normalize_provider_effort("agy", "medium"), "medium")
         self.assertEqual(normalize_provider_effort("agy", "high"), "high")
+        self.assertEqual(normalize_provider_effort("agy", "low"), "low")
+        self.assertEqual(normalize_provider_effort("agy", "ultra"), "max")
 
         # Muse accepts: none, minimal, low, medium, high, xhigh, max, ultra
         self.assertEqual(normalize_provider_effort("muse", "max"), "max")
