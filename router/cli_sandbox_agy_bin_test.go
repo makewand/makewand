@@ -69,7 +69,7 @@ func agyBinSeed(t *testing.T, home string) string {
 	if err := os.WriteFile(filepath.Join(bin, "webm_encoder"), webm, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "helper.sh"), []byte("#!/bin/sh\necho hi\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "helper.sh"), []byte("#!/bin/sh\necho hi\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// #nosec G306 -- fixture must keep its executable bit
