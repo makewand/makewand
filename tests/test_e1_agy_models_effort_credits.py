@@ -47,7 +47,7 @@ class _HomeCase(unittest.TestCase):
         self.home = Path(self._tmp.name) / "home"
         self.home.mkdir(parents=True)
         env = {k: v for k, v in os.environ.items()
-               if k not in ("GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "MUSE_DATA_DIR")}
+               if k not in ("GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "MUSE_DATA_DIR")}
         env["HOME"] = str(self.home)
         for p in (patch.dict(os.environ, env, clear=True),
                   patch("pathlib.Path.home", return_value=self.home),
@@ -404,6 +404,17 @@ class TestAgyNoSandboxCredits(_HomeCase):
                 (ok, _out, err), run = self._execute()
                 self.assertFalse(ok)
                 self.assertIn("useG1Credits", err)
+                run.assert_not_called()
+
+    def test_config_dir_variable_blocks_even_with_both_false(self):
+        # agy could read settings elsewhere than the ~/.gemini files checked.
+        self._write("settings.json", False)
+        self._write("antigravity-cli/settings.json", False)
+        for name in ("GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR"):
+            with self.subTest(name=name), patch.dict(os.environ, {name: str(self.home / "alt")}):
+                (ok, _out, err), run = self._execute()
+                self.assertFalse(ok)
+                self.assertIn(name, err)
                 run.assert_not_called()
 
     def test_both_false_allows_authorized_direct_run(self):

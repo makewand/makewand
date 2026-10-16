@@ -305,6 +305,8 @@ def cmd_outcome(args) -> None:
         )
     except ValueError as error:
         _fail(f"错误：{error}")
+    except OSError as error:
+        _fail(f"错误：写入成绩失败：{error}")
     detail = ""
     if model or effort:
         detail = f"（model={model or '-'} effort={effort or '-'}）"

@@ -1561,13 +1561,22 @@ def _sanitized_agy_settings_bytes(host_path) -> bytes:
     return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
+# Variables that could point agy at settings other than the ~/.gemini files
+# checked below (discovery honours the first two).
+AGY_CONFIG_DIR_ENVS = ("GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR")
+
+
 def _agy_host_credits_disabled(user_home=None) -> bool:
     """True only when both host agy settings files prove useG1Credits is false.
 
     A missing, unreadable, non-object or otherwise unproven file does not
     count: without a sandbox agy would read the host settings (or its own
     default-true behaviour) and could spend G1 credits once quota runs out.
+    A set config-dir variable does not count either: agy could read other
+    settings than the ones checked here.
     """
+    if any(os.environ.get(name) for name in AGY_CONFIG_DIR_ENVS):
+        return False
     home = _norm(str(user_home)) if user_home else _norm(str(Path.home()))
     gemini_root = os.path.join(home, ".gemini")
     for rel in AGY_SETTINGS_RELS:
@@ -1591,6 +1600,7 @@ def _agy_no_sandbox_credits_message() -> str:
         "解决建议：\n"
         "  1. [安装沙箱] 在 Linux 上安装 Bubblewrap 并启用非特权用户命名空间，让 agy 读取私有 home 里的净化设置；\n"
         "  2. [关闭 credits 后直跑] 把上面两个宿主设置文件里的 \"useG1Credits\" 都明确设为 false，"
+        "并取消 GEMINI_CONFIG_DIR / AGY_CONFIG_DIR / ANTIGRAVITY_CONFIG_DIR（它们会让 agy 改读别处的设置），"
         "再按无沙箱宿主执行的授权流程运行。"
     )
 

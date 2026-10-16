@@ -259,6 +259,18 @@ class RoutingCliTests(unittest.TestCase):
         self.assertIn("子任务：implement / mechanical", result.stdout)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_writes_to_an_unusable_routing_dir_fail_cleanly(self):
+        blocker = self.base / "state-file"
+        blocker.write_text("not a directory", encoding="utf-8")
+        env = {"MAKEWAND_ROUTING_DIR": str(blocker / "routing")}
+        for args, wanted in ((("mark", "codex", "6h"), "写入额度标记失败"),
+                             (("outcome", "agy", "1", "review", "pass"), "写入成绩失败")):
+            with self.subTest(command=args[0]):
+                result = self.run_cli(*args, quota={}, extra_env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(wanted, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
 
     def test_escalate_hint_keeps_effective_constraints(self):
         result = self.run_cli(
