@@ -298,11 +298,10 @@ func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T
 	if runtime.GOOS != "linux" {
 		t.Skip("native bubblewrap regression requires Linux")
 	}
-	bwrap, err := cliBwrapLookup("bwrap")
-	if err != nil {
+	if _, err := cliBwrapLookup("bwrap"); err != nil {
 		t.Skip("bubblewrap unavailable")
 	}
-	if probe := exec.Command(bwrap, "--ro-bind", "/", "/", "--", "/usr/bin/true"); probe.Run() != nil {
+	if !cliLiveBwrapWorks() {
 		if os.Getenv("MAKEWAND_TEST_REQUIRE_BWRAP") == "1" {
 			t.Fatal("required bubblewrap probe failed")
 		}

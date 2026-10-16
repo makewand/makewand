@@ -50,7 +50,10 @@ var (
 // Configuration (settings, hooks, MCP servers, instructions) is never copied
 // or written back: cliShieldProviderState binds the host copies read-only, so
 // a sandboxed agent cannot plant configuration that a later host run trusts.
-// Credential directories absent from this map are bound read-only.
+// agy settings are the exception, handled by writeAgySanitizedSettings: a
+// sanitized copy is written into the private home and bound read-only, and
+// the host file is only read. Credential directories absent from this map
+// are bound read-only.
 var cliPrivateCredentialFiles = map[string][]cliPrivateCredFile{
 	".claude":   cliPrivateClaudeFiles,
 	".claude-2": cliPrivateClaudeFiles,
@@ -84,6 +87,14 @@ var cliPrivateCredentialFiles = map[string][]cliPrivateCredFile{
 	},
 }
 
+// cliAgySettingsRels are the agy settings files forced to useG1Credits=false.
+// Python keeps the same pair (AGY_SETTINGS_RELS): ~/.gemini/settings.json and
+// the antigravity-cli file the CLI actually reads.
+var cliAgySettingsRels = []string{
+	"settings.json",
+	"antigravity-cli/settings.json",
+}
+
 // cliPrivateFileEntries are top-level credential files copied into the
 // private home without write-back. ~/.claude.json mixes account metadata with
 // MCP server and per-project trust configuration, so sandbox edits to it must
@@ -103,6 +114,10 @@ var cliPrivateHomeBaseDir = func() string {
 	}
 	return filepath.Join(dir, "makewand", "cli-homes")
 }
+
+// cliWritePrivateNoFollowFn writes one file inside a private home. Tests
+// replace it to force the fail-closed path.
+var cliWritePrivateNoFollowFn = cliWritePrivateNoFollow
 
 // cliPrivateHomeFinished is a test hook called after write-back and cleanup.
 var cliPrivateHomeFinished atomic.Pointer[func(dir string)]
@@ -130,6 +145,9 @@ type cliPrivateHome struct {
 	homeBound bool
 	creds     []*cliPrivateCred
 	once      sync.Once
+	// agySettingsMounted records that sanitized agy settings were written
+	// and bound; an agy launch without them is refused.
+	agySettingsMounted bool
 }
 
 func newCLIPrivateHome(workspace string) (*cliPrivateHome, error) {
@@ -188,8 +206,11 @@ func (h *cliPrivateHome) addProviderEntry(args []string, provider, home, entry, 
 		if !h.homeBound {
 			args = append(args, "--bind", privRoot, hostPath)
 		}
-		// hostPath is also the sandbox path of the private copy.
-		return cliShieldProviderState(args, provider, hostPath, workspace, false, true), nil
+		// hostPath is also the sandbox path of the private copy. The host
+		// settings file is bound read-only first; an agy launch then shadows
+		// it with the sanitized copy.
+		args = cliShieldProviderState(args, provider, hostPath, workspace, false, true)
+		return h.overlayAgySanitizedSettings(args, provider, entry, privRoot, hostPath)
 	case !fi.IsDir() && cliPrivateFileEntries[entry]:
 		if !h.homeBound {
 			return cliAppendRoBindIfNotPresent(args, hostPath), nil
@@ -223,14 +244,22 @@ func (h *cliPrivateHome) addCodexHome(realCodexHome string) (string, error) {
 // host. Writable runs find the directory in the private HOME; read-only runs
 // bind an empty private directory at hostPath, where bwrap can create that
 // mount point inside the HOME tmpfs (cliMountPointCreatable).
-func (h *cliPrivateHome) addAbsentProviderEntry(args []string, entry, hostPath string) ([]string, error) {
+//
+// An agy launch whose .gemini directory is absent still gets sanitized
+// settings (useG1Credits=false). If those files cannot be mounted where the
+// CLI reads them, the launch is refused.
+func (h *cliPrivateHome) addAbsentProviderEntry(args []string, provider, entry, hostPath string) ([]string, error) {
 	files := cliPrivateCredentialFiles[entry]
-	if !slices.ContainsFunc(files, func(f cliPrivateCredFile) bool { return f.writeBack }) {
+	sanitize := cliProviderForcesAgyCreditsOff(provider) && entry == ".gemini"
+	if !sanitize && !slices.ContainsFunc(files, func(f cliPrivateCredFile) bool { return f.writeBack }) {
 		return args, nil
 	}
 	privRoot := filepath.Join(h.home, filepath.FromSlash(entry))
 	if !h.homeBound {
 		if !cliMountPointCreatable(args, hostPath) {
+			if sanitize {
+				return args, fmt.Errorf("refusing to start: cannot mount sanitized agy settings at %s", hostPath)
+			}
 			return args, nil
 		}
 		if err := os.MkdirAll(privRoot, 0o700); err != nil {
@@ -246,7 +275,10 @@ func (h *cliPrivateHome) addAbsentProviderEntry(args []string, entry, hostPath s
 			return args, err
 		}
 	}
-	return args, nil
+	if !sanitize {
+		return args, nil
+	}
+	return h.overlayAgySanitizedSettings(args, provider, entry, privRoot, hostPath)
 }
 
 // cliMountPointCreatable reports whether bwrap can create the missing mount
@@ -344,6 +376,223 @@ func (h *cliPrivateHome) copyIn(hostRoot, privRoot string, f cliPrivateCredFile)
 		})
 	}
 	return nil
+}
+
+// cliProviderForcesAgyCreditsOff reports whether this launch reads agy
+// settings and must see useG1Credits=false. Python's ProviderHome aliases
+// gemini to agy; antigravity uses the same ~/.gemini directory here.
+func cliProviderForcesAgyCreditsOff(provider string) bool {
+	switch strings.TrimSuffix(strings.ToLower(strings.TrimSpace(provider)), "-cli") {
+	case "agy", "gemini", "antigravity":
+		return true
+	default:
+		return false
+	}
+}
+
+// overlayAgySanitizedSettings writes sanitized settings into privRoot and
+// read-only binds them at hostRoot. A non-agy provider or a different entry
+// is left unchanged. A write failure refuses the launch; the host file is
+// never opened for writing.
+func (h *cliPrivateHome) overlayAgySanitizedSettings(args []string, provider, entry, privRoot, hostRoot string) ([]string, error) {
+	if !cliProviderForcesAgyCreditsOff(provider) || entry != ".gemini" {
+		return args, nil
+	}
+	if err := h.writeAgySanitizedSettings(privRoot, hostRoot); err != nil {
+		return args, err
+	}
+	h.agySettingsMounted = true
+	return cliRoBindAgySanitizedSettings(args, privRoot, hostRoot), nil
+}
+
+// cliAgyHostCreditsDisabled returns nil only when both host agy settings
+// files under every home an unsandboxed agy may read prove useG1Credits is
+// false. Without a sandbox there is no sanitized copy, and a missing,
+// unreadable or unproven file could let agy spend G1 credits.
+func cliAgyHostCreditsDisabled(childEnv []string) error {
+	var homes []string
+	if h := cliEnvValue(childEnv, "HOME"); h != "" {
+		homes = append(homes, filepath.Clean(h))
+	}
+	if h, err := os.UserHomeDir(); err == nil && h != "" && !slices.Contains(homes, filepath.Clean(h)) {
+		homes = append(homes, filepath.Clean(h))
+	}
+	if len(homes) == 0 {
+		return errors.New("cannot locate the home directory holding agy settings")
+	}
+	for _, home := range homes {
+		for _, rel := range cliAgySettingsRels {
+			path := filepath.Join(home, ".gemini", filepath.FromSlash(rel))
+			raw, ok := cliReadAgyHostSettings(path)
+			if !ok {
+				return fmt.Errorf("%s is missing or unreadable", path)
+			}
+			obj, ok := cliParseAgySettingsObject(raw)
+			if !ok {
+				return fmt.Errorf("%s is not a JSON object", path)
+			}
+			if on, isBool := obj["useG1Credits"].(bool); !isBool || on {
+				return fmt.Errorf("%s does not set \"useG1Credits\": false", path)
+			}
+		}
+	}
+	return nil
+}
+
+// writeAgySanitizedSettings writes both agy settings files into privRoot.
+// Missing, unreadable, or non-object host files become a minimal
+// {"useG1Credits": false} document. Other keys of a JSON object are kept.
+func (h *cliPrivateHome) writeAgySanitizedSettings(privRoot, hostRoot string) error {
+	if h == nil || h.dir == "" || !cliPathWithin(h.dir, privRoot) {
+		return fmt.Errorf("refusing to start: private agy settings path is outside the private home")
+	}
+	if hostRoot != "" && cliPathWithin(hostRoot, privRoot) {
+		return fmt.Errorf("refusing to start: private agy settings path is inside the host provider directory")
+	}
+	for _, rel := range cliAgySettingsRels {
+		relPath := filepath.FromSlash(rel)
+		if !filepath.IsLocal(relPath) {
+			return fmt.Errorf("refusing to start: invalid agy settings path %q", rel)
+		}
+		dst := filepath.Join(privRoot, relPath)
+		if !cliPathWithin(privRoot, dst) {
+			return fmt.Errorf("refusing to start: agy settings path %q escapes the private root", rel)
+		}
+		hostFile := ""
+		if hostRoot != "" {
+			hostFile = filepath.Join(hostRoot, relPath)
+			if dst == hostFile {
+				return fmt.Errorf("refusing to start: agy settings destination is the host file")
+			}
+		}
+		content, err := cliSanitizedAgySettingsBytes(hostFile)
+		if err != nil {
+			return fmt.Errorf("refusing to start: cannot prepare private agy settings (%s): %w", rel, err)
+		}
+		if err := cliWritePrivateNoFollowFn(dst, content); err != nil {
+			return fmt.Errorf("refusing to start: cannot write private agy settings (%s): %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// cliSanitizedAgySettingsBytes is the host agy settings document with
+// useG1Credits forced to false. A missing, unreadable, or non-object file
+// yields a minimal document. The host file is not modified.
+func cliSanitizedAgySettingsBytes(hostPath string) ([]byte, error) {
+	doc := map[string]any{}
+	if raw, ok := cliReadAgyHostSettings(hostPath); ok {
+		if obj, ok := cliParseAgySettingsObject(raw); ok {
+			doc = obj
+		}
+	}
+	doc["useG1Credits"] = false
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(doc); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// cliReadAgyHostSettings reads a host settings file, following a symlink the
+// way Python's _read_host_regular does. Missing, non-regular, oversized, and
+// unreadable files return ok=false so the caller writes a minimal document.
+func cliReadAgyHostSettings(path string) ([]byte, bool) {
+	if path == "" {
+		return nil, false
+	}
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, false
+	}
+	data, err := cliReadRegularFile(real)
+	if err != nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil, false
+	}
+	return data, true
+}
+
+// cliParseAgySettingsObject parses one JSON object. Trailing junk and any
+// non-object value are rejected so the caller falls back to a minimal document.
+func cliParseAgySettingsObject(raw []byte) (map[string]any, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var parsed any
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, false
+	}
+	if dec.More() {
+		return nil, false
+	}
+	obj, ok := parsed.(map[string]any)
+	if !ok || obj == nil {
+		return nil, false
+	}
+	return obj, true
+}
+
+// cliWritePrivateNoFollow writes content to path inside a directory makewand
+// created. A symlink or other non-regular file at path is refused. The bytes
+// are written to a new temp file and renamed into place, so the write does
+// not follow a symlink at path.
+func cliWritePrivateNoFollow(path string, content []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", path)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".agy-settings-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	done := false
+	defer func() {
+		if !done {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+	if err := cliReplacePrivateFile(tmpName, path); err != nil {
+		return err
+	}
+	done = true
+	_ = os.Chmod(path, 0o600)
+	return nil
+}
+
+// cliReplacePrivateFile moves src onto dst. Windows will not rename onto an
+// existing file, so a regular file already at dst is removed first. A symlink
+// at dst is never followed.
+func cliReplacePrivateFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	} else if fi, statErr := os.Lstat(dst); statErr != nil {
+		return err
+	} else if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", dst)
+	} else if rmErr := os.Remove(dst); rmErr != nil {
+		return rmErr
+	}
+	return os.Rename(src, dst)
 }
 
 // cliPendingStatusWrites maps a wrapped (not yet started) command to the

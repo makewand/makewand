@@ -40,8 +40,16 @@ func TestMain(m *testing.M) {
 	// acknowledged host-exec authorization, exactly as in production. Process
 	// tests then run their fixtures through that real config-ack path.
 	// MAKEWAND_TEST_SIMULATE_NO_BWRAP=1 reproduces that mode on Linux.
+	// A bwrap binary that cannot mount /proc under --unshare-pid cannot run
+	// the sandbox these tests launch, so it is treated as missing too.
+	// MAKEWAND_TEST_REQUIRE_BWRAP=1 keeps the real binary and lets live tests
+	// fail instead of skipping.
 	ackDir := ""
-	if runtime.GOOS == "windows" || os.Getenv("MAKEWAND_TEST_SIMULATE_NO_BWRAP") == "1" {
+	bwrapUnusable := runtime.GOOS == "linux" &&
+		os.Getenv("MAKEWAND_TEST_SIMULATE_NO_BWRAP") != "1" &&
+		os.Getenv("MAKEWAND_TEST_REQUIRE_BWRAP") != "1" &&
+		!cliLiveBwrapWorks()
+	if runtime.GOOS == "windows" || os.Getenv("MAKEWAND_TEST_SIMULATE_NO_BWRAP") == "1" || bwrapUnusable {
 		if runtime.GOOS != "windows" {
 			cliBwrapLookup = func(string) (string, error) { return "", exec.ErrNotFound }
 		}

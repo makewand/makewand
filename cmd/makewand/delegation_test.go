@@ -29,6 +29,10 @@ func TestPlanPythonDelegation_GlobalFlagsBeforeSubcommand(t *testing.T) {
 		{name: "plan delegation", args: []string{"plan", "build feature"}, subcmd: "plan", forward: []string{"plan", "build feature"}},
 		{name: "aci delegation", args: []string{"aci", "view", "file.go"}, subcmd: "aci", forward: []string{"aci", "view", "file.go"}},
 		{name: "mcp delegation", args: []string{"mcp", "list", "npx"}, subcmd: "mcp", forward: []string{"mcp", "list", "npx"}},
+		{name: "route delegation", args: []string{"route", "review", "normal"}, subcmd: "route", forward: []string{"route", "review", "normal"}},
+		{name: "mark delegation", args: []string{"mark", "codex", "6h"}, subcmd: "mark", forward: []string{"mark", "codex", "6h"}},
+		{name: "outcome delegation", args: []string{"outcome", "codex", "1", "review", "pass"}, subcmd: "outcome", forward: []string{"outcome", "codex", "1", "review", "pass"}},
+		{name: "repo-trust before route", args: []string{"--repo-trust", "untrusted", "route", "implement", "hard"}, subcmd: "route", forward: []string{"--repo-trust", "untrusted", "route", "implement", "hard"}},
 		{name: "approval before subcommand", args: []string{"--approval", "safe", "status"}, errHas: "--approval"},
 		{name: "approval equals before run", args: []string{"--approval=manual", "run", "x"}, errHas: "cannot be honored"},
 		{name: "invalid approval", args: []string{"--approval", "autopilto", "status"}, errHas: "invalid --approval"},
@@ -130,5 +134,62 @@ func TestE2EGlobalFlagsBeforePythonSubcommandNeverReachAModel(t *testing.T) {
 	}
 	if strings.Contains(stdout, "provider:") {
 		t.Fatalf("subcommand was sent to a model as a prompt: %q", stdout)
+	}
+}
+
+// TestE2ERouteMarkOutcomeDelegateToPythonNotPrompt is the installed-binary
+// reproduction of the auto-route commands being missing from the Go contract:
+// `makewand route …` must reach the Python orchestrator. Before the contract
+// listed them, the Go entry treated the words as a chat prompt and dispatched
+// a model (the provider fixture replied "provider:claude", exit 0).
+func TestE2ERouteMarkOutcomeDelegateToPythonNotPrompt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based E2E fixtures are Unix-only")
+	}
+	for _, command := range []string{"route", "mark", "outcome"} {
+		if !pythonOrchestratorCmds[command] {
+			t.Fatalf("%s is not a delegated Python command", command)
+		}
+		if nativeGoCommands[command] {
+			t.Fatalf("%s is registered as a native Go command", command)
+		}
+	}
+	bin := buildMakewandBinary(t)
+	script := writeProviderScript(t)
+	cfg := config.DefaultConfig()
+	cfg.CustomProviders = []config.CustomProvider{
+		{Name: "claude", Command: script, Args: []string{"claude"}, Access: "subscription", PromptMode: config.CustomPromptModeStdin},
+	}
+	cfgDir := t.TempDir()
+	writeTestConfig(t, cfgDir, cfg)
+
+	// A real prompt still reaches the fixture, so a delegated command that
+	// was misread as a prompt would print the same line.
+	stdout, stderr, err := runMakewand(t, bin, cfgDir, "hello from the prompt")
+	if err != nil || !strings.Contains(stdout, "provider:claude") {
+		t.Fatalf("prompt fixture did not run: err=%v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+
+	cases := [][]string{
+		{"route", "review", "normal"},
+		{"--repo-trust", "untrusted", "route", "implement", "hard"},
+		{"mark", "codex", "6h"},
+		{"outcome", "codex", "1", "review", "pass"},
+	}
+	for _, args := range cases {
+		stdout, stderr, err := runMakewand(t, bin, cfgDir, args...)
+		command := args[0]
+		if command == "--repo-trust" {
+			command = "route"
+		}
+		if err == nil || !strings.Contains(stderr, "python3 runtime is required to execute "+command) {
+			t.Fatalf("%q was not delegated to Python: err=%v\nstdout:\n%s\nstderr:\n%s", args, err, stdout, stderr)
+		}
+		if strings.Contains(stdout, "provider:") {
+			t.Fatalf("%q was sent to a model as a prompt: %q", args, stdout)
+		}
 	}
 }

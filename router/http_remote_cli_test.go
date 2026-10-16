@@ -79,10 +79,8 @@ func newCodexOnlyHTTPRouter(t *testing.T, codexBin string) *Router {
 // prompt) in the serve process cwd, returning a review of the host's
 // uncommitted diff to the remote caller.
 func TestHTTPFacadeReviewNeverRunsCodexReviewUncommittedInServerCwd(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		if _, err := cliBwrapLookup("bwrap"); err != nil {
-			t.Skip("remote-origin CLI execution requires bubblewrap")
-		}
+	if runtime.GOOS != "windows" && !cliLiveBwrapWorks() {
+		t.Skip("remote-origin CLI execution requires bubblewrap")
 	}
 	serverCwd, err := os.Getwd()
 	if err != nil {

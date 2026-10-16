@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,11 +198,11 @@ func TestWritebackFix_R4_AbsentCredentialCopy(t *testing.T) {
 }
 
 // A provider directory the host lacks gets a private copy too, so a login
-// made inside the sandbox can be reported: read-only sessions bind an empty
-// private directory at its path inside the HOME tmpfs, writable sessions find
-// it in the private HOME, and nothing is created on the host. Where bwrap
-// could not create the mount point (HOME covered by another bind), nothing is
-// bound there.
+// made inside the sandbox can be reported. An agy launch plants sanitized
+// settings (useG1Credits=false) in that copy: read-only sessions bind the
+// copy inside the HOME tmpfs, writable sessions find it in the private HOME,
+// and nothing is created on the host. Where those settings cannot be mounted
+// (HOME covered by another bind), the launch is refused.
 func TestWritebackFix_R4_AbsentProviderDirectoryMountPlan(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("private provider homes are part of the Linux bubblewrap mount plan")
@@ -225,12 +226,10 @@ func TestWritebackFix_R4_AbsentProviderDirectoryMountPlan(t *testing.T) {
 			gemini := filepath.Join(home, ".gemini")
 			r4NoHostPathBoundWritable(t, args, home)
 			if s.readOnly {
-				priv := cliPrivateHomeSource(t, args, gemini)
-				if entries, err := os.ReadDir(priv); err != nil || len(entries) != 0 {
-					t.Fatalf("the private copy of a missing provider directory must start empty: %v %v", entries, err)
-				}
+				r4AssertOnlySanitizedAgySettings(t, cliPrivateHomeSource(t, args, gemini))
 			} else {
-				cliPrivateHomeSource(t, args, home)
+				privHome := cliPrivateHomeSource(t, args, home)
+				r4AssertOnlySanitizedAgySettings(t, filepath.Join(privHome, ".gemini"))
 				if src := r4BindAt(args, gemini); src != "" {
 					t.Fatalf("writable sessions need no extra bind for a missing provider directory: %v", args)
 				}
@@ -245,11 +244,42 @@ func TestWritebackFix_R4_AbsentProviderDirectoryMountPlan(t *testing.T) {
 		old := cliTestExtraBinds
 		cliTestExtraBinds = func(string, []string) []string { return []string{"--ro-bind", home, home} }
 		t.Cleanup(func() { cliTestExtraBinds = old })
-		args := wrap(t, ContextWithTask(context.Background(), TaskReview), home)
-		if src := r4BindAt(args, filepath.Join(home, ".gemini")); src != "" {
-			t.Fatalf("mount point below a read-only bind must not be bound: %v", args)
+		cmd := exec.Command("/usr/bin/true")
+		cmd.Dir = t.TempDir()
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + home}
+		if _, err := wrapCLICommandWithSandbox(ContextWithTask(context.Background(), TaskReview), "agy", cmd); err == nil || !strings.Contains(err.Error(), "cannot mount sanitized agy settings") {
+			t.Fatalf("agy launch must be refused when sanitized settings cannot be mounted: %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(home, ".gemini")); !os.IsNotExist(err) {
+			t.Fatalf("refused launch created a host provider directory: %v", err)
 		}
 	})
+}
+
+// r4AssertOnlySanitizedAgySettings checks that a private .gemini created for
+// a missing host directory holds only the minimal credits-off documents.
+func r4AssertOnlySanitizedAgySettings(t *testing.T, priv string) {
+	t.Helper()
+	for _, rel := range cliAgySettingsRels {
+		data, err := os.ReadFile(filepath.Join(priv, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("sanitized %s: %v", rel, err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatalf("sanitized %s: %v (%s)", rel, err, data)
+		}
+		if len(doc) != 1 || doc["useG1Credits"] != false {
+			t.Fatalf("sanitized %s = %s, want only useG1Credits false", rel, data)
+		}
+	}
+	entries, err := os.ReadDir(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("private .gemini entries = %v, want settings.json and antigravity-cli", entries)
+	}
 }
 
 func TestWritebackFix_R4_MountPointCreatable(t *testing.T) {

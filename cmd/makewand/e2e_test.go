@@ -501,6 +501,18 @@ func writeTestConfigWithoutHostExecAck(t *testing.T, cfgDir string, cfg *config.
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile(config): %v", err)
 	}
+	// cfgDir is also the subprocess HOME, and the harness runs providers on
+	// the host. A gemini/agy provider starts there only when both agy
+	// settings files prove useG1Credits=false.
+	for _, rel := range []string{".gemini/settings.json", ".gemini/antigravity-cli/settings.json"} {
+		settings := filepath.Join(cfgDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
+			t.Fatalf("MkdirAll(agy settings): %v", err)
+		}
+		if err := os.WriteFile(settings, []byte("{\"useG1Credits\": false}\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile(agy settings): %v", err)
+		}
+	}
 }
 
 func runMakewand(t *testing.T, bin, cfgDir string, args ...string) (string, string, error) {
@@ -535,8 +547,12 @@ func runMakewandInDir(t *testing.T, workdir, bin, cfgDir string, args ...string)
 }
 
 func isolatedCLIEnv(cfgDir string) []string {
-	env := make([]string, 0, len(os.Environ())+4)
+	env := make([]string, 0, len(os.Environ())+5)
+	gocacheSet := false
 	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "GOCACHE=") {
+			gocacheSet = true
+		}
 		// HOME/XDG must be isolated too: quota-aware routing reads the real
 		// user's ~/.claude, ~/.codex, and agy login state (via os.UserHomeDir)
 		// to compute per-provider quota bands. Leaking the host's live quota
@@ -550,6 +566,9 @@ func isolatedCLIEnv(cfgDir string) []string {
 		if strings.HasPrefix(entry, "PATH=") ||
 			strings.HasPrefix(entry, "MAKEWAND_CONFIG_DIR=") ||
 			strings.HasPrefix(entry, "MAKEWAND_UNSAFE_HOST_EXEC=") ||
+			// A parent provider worker must not make the e2e binary refuse
+			// to start; the subprocess is the makewand under test.
+			strings.HasPrefix(entry, "MAKEWAND_PROVIDER_WORKER=") ||
 			strings.HasPrefix(entry, "HOME=") ||
 			strings.HasPrefix(entry, "XDG_CONFIG_HOME=") ||
 			strings.HasPrefix(entry, "XDG_CACHE_HOME=") ||
@@ -572,6 +591,15 @@ func isolatedCLIEnv(cfgDir string) []string {
 		// instead of weakening the production fail-closed logic.
 		"MAKEWAND_UNSAFE_HOST_EXEC=1",
 	)
+	// HOME is the empty config dir, so an unset GOCACHE would rebuild the
+	// standard library under that directory. Two parallel candidate
+	// verifications then fork enough compilers to hit a process limit and
+	// both candidates fail, which makes autopilot keep the first one.
+	if !gocacheSet {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			env = append(env, "GOCACHE="+filepath.Join(home, ".cache", "go-build"))
+		}
+	}
 	return env
 }
 
