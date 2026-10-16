@@ -43,6 +43,7 @@ class ProviderOutcomeTests(unittest.TestCase):
             stack.enter_context(patch("makewand.health.record_engine_limit"))
             stack.enter_context(patch("makewand.health.record_engine_failure"))
             stack.enter_context(patch("makewand.sandbox.is_bwrap_available", return_value=False))
+            stack.enter_context(patch("makewand.sandbox._agy_host_credits_disabled", return_value=True))
             # no bwrap: every launch needs the recorded host-exec authorization (H1)
             stack.enter_context(patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")))
             stack.enter_context(patch("makewand.sandbox.audit_unsafe_host_exec"))

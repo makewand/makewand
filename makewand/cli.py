@@ -478,6 +478,14 @@ def cmd_disable(args):
 
 
 def cmd_models(args):
+    if getattr(args, "refresh", False):
+        # Explicit agy refresh: 60s, ignores a fresh cache and the .attempt back-off.
+        # The listing below still reads the cache and does not refresh again.
+        from makewand.discovery import (
+            AGY_MODELS_REFRESH_TIMEOUT_SECONDS,
+            refresh_agy_models_cache,
+        )
+        refresh_agy_models_cache(timeout=AGY_MODELS_REFRESH_TIMEOUT_SECONDS)
     print(c("\n============================================================", COLOR_BOLD))
     print(c("       Makewand 多模型生态与动态发现矩阵 (Model Discovery)", COLOR_BOLD + COLOR_CYAN))
     print(c("============================================================\n", COLOR_BOLD))
@@ -1313,7 +1321,7 @@ def _main():
     common_parser.add_argument("--max-model-calls", type=int, default=None, help="Maximum attempted Makewand model tasks, including retries and reviewers")
     common_parser.add_argument("--call-budget-file", default=None, help="Shared admission ledger for model task budgets")
     common_parser.add_argument("--protect", dest="global_protected_paths", action="append", default=None, metavar="PATH", help="Preserve a task-relative file; repeat for multiple files")
-    common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "max"], default=None, help="Set reasoning effort across AI models (low, medium, high, max)")
+    common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=None, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
 
     sub_common_parser = argparse.ArgumentParser(add_help=False)
     sub_common_parser.add_argument("-C", "--cwd", dest="cwd", default=argparse.SUPPRESS, help="Target working directory (default: current directory)")
@@ -1325,7 +1333,7 @@ def _main():
     sub_common_parser.add_argument("--max-model-calls", type=int, default=argparse.SUPPRESS, help="Maximum attempted Makewand model tasks")
     sub_common_parser.add_argument("--call-budget-file", default=argparse.SUPPRESS, help="Shared model task admission ledger")
     sub_common_parser.add_argument("--protect", dest="protected_paths", action="append", default=None, metavar="PATH", help="Preserve file content and permissions; repeat for multiple files")
-    sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "max"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, max)")
+    sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
 
     for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
         options.add_argument("--workflow", choices=["auto", "single", "pipeline", "race"],
@@ -1348,7 +1356,8 @@ def _main():
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     # models
-    subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems", parents=[sub_common_parser])
+    p_models = subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems", parents=[sub_common_parser])
+    p_models.add_argument("--refresh", action="store_true", default=False, help="Refresh the agy model cache now (60s timeout, ignores back-off) before listing")
 
     # status
     p_status = subparsers.add_parser("status", help="Show health, quota indicators (local estimates), and reset times of all AIs", parents=[sub_common_parser])
@@ -1543,6 +1552,31 @@ def _main():
     p_clean = subparsers.add_parser("clean", help="Clean up stale /tmp restore, drill, and temporary artifact directories", parents=[sub_common_parser])
     p_clean.add_argument("--all", action="store_true", default=False, help="Clean all temporary makewand caches and artifacts")
 
+    # route / mark / outcome (automatic dispatch bookkeeping; never call a model)
+    p_route = subparsers.add_parser("route", allow_abbrev=False, help="为子任务在完整模型目录里选派活工具（只读账本和本地缓存，不调用模型）", parents=[sub_common_parser])
+    p_route.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
+    p_route.add_argument("difficulty", metavar="DIFFICULTY", help="难度：mechanical, normal, hard")
+    p_route.add_argument("--tier", dest="route_tier", type=int, default=None, metavar="N", help="直接指定档位（1, 2, 3），覆盖按难度推算的起始档")
+    p_route.add_argument("--self", dest="self_tool", default=None, metavar="T", help="你自己是哪家工具（codex, claude, agy, grok, muse），同家候选排最后")
+    p_route.add_argument("--not", dest="not_tool", default=None, metavar="T", help="排除与该工具同家族的候选")
+    p_route.add_argument("--simple", action="store_true", default=False, help="只用精简三档表，不展开全部模型和推理深度")
+    p_route.add_argument("--legacy", action="store_true", default=False, help="完整目录里把旧版本模型也纳入排序（与 --simple 一起用时无效）")
+    p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
+
+    p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前不再派活", parents=[sub_common_parser])
+    p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
+    p_mark.add_argument("duration", metavar="DURATION", help="受限时长，d/h/m/s 组合，如 6h、93h17m、2d、45m")
+    p_mark.add_argument("--reason", default=None, help="受限原因（可选，路由跳过时会显示）")
+
+    p_outcome = subparsers.add_parser("outcome", allow_abbrev=False, help="记录一次派活的验收成绩", parents=[sub_common_parser])
+    p_outcome.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
+    p_outcome.add_argument("outcome_tier", metavar="TIER", type=int, help="档位（1, 2, 3）")
+    p_outcome.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
+    p_outcome.add_argument("result", choices=["pass", "fail"], help="验收结果：pass 或 fail")
+    p_outcome.add_argument("--seconds", type=float, default=None, help="这次派活耗时秒数（可选）")
+    p_outcome.add_argument("--calls", type=int, default=None, help="这次派活的模型调用次数（可选）")
+    p_outcome.add_argument("--model", default=None, metavar="M", help="记入账本的模型名，供候选级统计（可选）")
+
     from makewand.config import get_all_supported_providers
     all_supported = get_all_supported_providers()
 
@@ -1598,11 +1632,42 @@ def _main():
         p_det = subparsers.add_parser(detect_only, help=f"{detect_only}: detected only, no execution adapter yet", parents=[sub_common_parser])
         p_det.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
 
-    known_subcommands = PYTHON_COMMANDS
+    known_subcommands = PYTHON_COMMANDS | {"route", "mark", "outcome"}
     # Auto-route to `makewand run ...` if user invokes `makewand "prompt"`, `makewand -C /dir -f task.txt`, or pipes stdin
     is_auto_routed_run = False
     try:
-        common_opts, remaining = common_parser.parse_known_args(sys.argv[1:])
+        # Only the options in front of the subcommand are global: parsing the
+        # whole argv here would consume a subcommand's own options as
+        # abbreviations of global ones (mark --reason -> --reasoning-effort).
+        argv_tail = list(sys.argv[1:])
+        # option string -> whether it takes a value, for the shared global options
+        _global_flags = {opt: action.nargs != 0
+                         for action in common_parser._actions for opt in action.option_strings}
+        _sub_at = None
+        _i = 0
+        while _i < len(argv_tail):
+            _tok = argv_tail[_i]
+            if _tok == "--":
+                break
+            if _tok.startswith("-") and _tok != "-":
+                _name = _tok.split("=", 1)[0]
+                if _name not in _global_flags:
+                    # A run option in front of the prompt (makewand --provider agy "fix"):
+                    # its value may look like a subcommand, so keep the whole-argv parse.
+                    break
+                _i += 2 if _global_flags[_name] and "=" not in _tok else 1
+                continue
+            # Only the first positional can be the subcommand, as in argparse.
+            # Anything else starts a prompt, and later tokens are its options
+            # (makewand "fix it" --provider agy must not stop at "agy").
+            if _tok in known_subcommands:
+                _sub_at = _i
+            break
+        if _sub_at is not None:
+            common_opts, _ignored = common_parser.parse_known_args(argv_tail[:_sub_at])
+            remaining = argv_tail[_sub_at:]
+        else:
+            common_opts, remaining = common_parser.parse_known_args(argv_tail)
     except Exception:
         common_opts, remaining = None, []
 
@@ -1786,7 +1851,16 @@ def _main():
 
 def _dispatch_parsed_command(args, is_auto_routed_run=False):
 
-    if args.subcommand == "daemon":
+    if args.subcommand == "route":
+        from makewand.route_cli import cmd_route
+        cmd_route(args)
+    elif args.subcommand == "mark":
+        from makewand.route_cli import cmd_mark
+        cmd_mark(args)
+    elif args.subcommand == "outcome":
+        from makewand.route_cli import cmd_outcome
+        cmd_outcome(args)
+    elif args.subcommand == "daemon":
         cmd_daemon(args)
     elif args.subcommand == "sessions":
         cmd_sessions(args)

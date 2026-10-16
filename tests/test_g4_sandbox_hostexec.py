@@ -42,6 +42,7 @@ class HostExecCase(unittest.TestCase):
         self._patches = [
             patch.object(mw_config, "CONFIG_DIR", self.cfg_dir),
             patch("makewand.sandbox.is_bwrap_available", return_value=False),
+            patch("makewand.sandbox._agy_host_credits_disabled", return_value=True),
             patch.dict(sandbox._host_exec_session, {"warned": False, "declined": False}),
         ]
         for p in self._patches:

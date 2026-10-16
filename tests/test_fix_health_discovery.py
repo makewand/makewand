@@ -27,6 +27,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import makewand.discovery as discovery
@@ -190,12 +191,12 @@ class TestAgyModelCacheRefresh(_TempHome):
                 discovery._AGY_FAILED_REFRESHES.clear()
                 if self.marker.exists():
                     self.marker.unlink()
-                cache = self.write(self.CACHE, good, age_seconds=13 * 3600)
+                cache = self.write(self.CACHE, good, age_seconds=25 * 3600)
                 before = cache.read_text(encoding="utf-8")
                 models, run = self.discover(stdout=stdout)
                 run.assert_called_once()
                 self.assertEqual(cache.read_text(encoding="utf-8"), before)
-                self.assertEqual(sorted(set(models)), ["gemini-3.1-pro", "gemini-3.8-flash"])
+                self.assertEqual(sorted(set(models)), ["gemini-3.1-pro-high", "gemini-3.8-flash-high"])
                 self.assertIn(self.standard, ("gemini-3.1-pro", "gemini-3.8-flash"))
                 self.assertTrue(self.marker.exists())  # a failed refresh: back off
                 models, run = self.discover()
@@ -229,6 +230,105 @@ class TestAgyModelCacheRefresh(_TempHome):
         run.assert_called_once()
         self.assertEqual(models, ["gemini-9.9-pro"])
         self.assertEqual(sorted(p.name for p in cache.parent.iterdir()), [cache.name])
+
+    def test_slow_runner_times_out_implicitly_and_explicit_refresh_waits(self):
+        # A networked `agy models` is slower than the 4s implicit budget. The
+        # fake runner raises TimeoutExpired below 30s and succeeds at 60s, so
+        # the test does not actually sleep.
+        cache = self.write(self.CACHE, self.OLD, age_seconds=3 * 86400)
+        cache_file = self.home / self.CACHE
+        calls = []
+
+        def runner(argv, **kwargs):
+            timeout = kwargs["timeout"]
+            calls.append(timeout)
+            if timeout < 30:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return SimpleNamespace(
+                returncode=0,
+                stdout="gemini-4-argon-high\tGemini 4 Argon (High)\n",
+            )
+
+        self.assertIsNone(discovery._sync_agy_models_cache(cache_file=cache_file, runner=runner))
+        self.assertEqual(calls, [discovery.AGY_MODELS_TIMEOUT_SECONDS])
+        self.assertEqual(cache.read_text(encoding="utf-8"), json.dumps(self.OLD))
+        self.assertTrue(self.marker.exists())
+        # The .attempt marker and the in-process back-off must hold the next
+        # implicit lookup, and must not hold an explicit refresh.
+        self.assertIsNone(discovery._sync_agy_models_cache(cache_file=cache_file, runner=runner))
+        self.assertEqual(calls, [discovery.AGY_MODELS_TIMEOUT_SECONDS])
+
+        refreshed = discovery.refresh_agy_models_cache(cache_file=cache_file, runner=runner)
+        self.assertEqual(refreshed, cache_file)
+        self.assertEqual(calls, [discovery.AGY_MODELS_TIMEOUT_SECONDS, discovery.AGY_MODELS_REFRESH_TIMEOUT_SECONDS])
+        stored = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertEqual([item["id"] for item in stored["models"]], ["gemini-4-argon-high"])
+        self.assertFalse(self.marker.exists())
+        self.assertNotIn(str(cache_file), discovery._AGY_FAILED_REFRESHES)
+
+    def test_explicit_refresh_ignores_a_fresh_cache_and_a_young_marker(self):
+        cache = self.write(self.CACHE, self.OLD, age_seconds=60)
+        cache_file = self.home / self.CACHE
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(kwargs["timeout"])
+            return SimpleNamespace(
+                returncode=0,
+                stdout="gemini-4-argon-high\tGemini 4 Argon (High)\n",
+            )
+
+        self.assertEqual(discovery._sync_agy_models_cache(cache_file=cache_file, runner=runner), cache_file)
+        self.assertEqual(calls, [])
+        self.marker.write_text(discovery._agy_cache_state(cache_file), encoding="utf-8")
+        discovery._AGY_FAILED_REFRESHES[str(cache_file)] = (
+            time.monotonic(),
+            discovery._agy_cache_state(cache_file),
+        )
+        refreshed = discovery.refresh_agy_models_cache(cache_file=cache_file, runner=runner)
+        self.assertEqual(refreshed, cache_file)
+        self.assertEqual(calls, [discovery.AGY_MODELS_REFRESH_TIMEOUT_SECONDS])
+        stored = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertEqual(stored["models"][0]["id"], "gemini-4-argon-high")
+        self.assertFalse(self.marker.exists())
+
+    def test_subprocess_timeout_is_4s_implicit_and_60s_explicit(self):
+        self.write(self.CACHE, self.OLD, age_seconds=3 * 86400)
+        cache_file = self.home / self.CACHE
+        with patch("shutil.which", return_value="/usr/local/bin/agy"), \
+             patch("subprocess.run", return_value=MagicMock(
+                 returncode=0, stdout="gemini-9.9-pro  Gemini 9.9 Pro (High)\n")) as run:
+            discovery._discover_local_agy_models()
+        run.assert_called_once()
+        self.assertEqual(run.call_args[1]["timeout"], discovery.AGY_MODELS_TIMEOUT_SECONDS)
+        self.marker.write_text("", encoding="utf-8")
+        with patch("shutil.which", return_value="/usr/local/bin/agy"), \
+             patch("subprocess.run", return_value=MagicMock(
+                 returncode=0, stdout="gemini-4-argon-high\tGemini 4 Argon (High)\n")) as run:
+            discovery.refresh_agy_models_cache(cache_file=cache_file)
+        run.assert_called_once()
+        self.assertEqual(run.call_args[1]["timeout"], discovery.AGY_MODELS_REFRESH_TIMEOUT_SECONDS)
+        self.assertEqual(run.call_args[1]["cwd"], tempfile.gettempdir())
+        stored = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(stored["models"][0]["id"], "gemini-4-argon-high")
+
+    def test_discover_model_efforts_reads_a_stale_cache_without_running_agy(self):
+        cache = self.write(self.CACHE, {
+            "updated_at": 0,
+            "models": [
+                {"id": "gemini-4-argon-high", "description": "Gemini 4 Argon (High)"},
+                {"id": "gemini-3.8-flash-low", "description": "Gemini 3.8 Flash (Low)"},
+            ],
+        }, age_seconds=3 * 86400)
+        before = cache.read_text(encoding="utf-8")
+        with patch("shutil.which", return_value="/usr/local/bin/agy"), \
+             patch("subprocess.run") as run:
+            found = discovery.discover_model_efforts()
+        run.assert_not_called()
+        self.assertEqual(found["agy"]["gemini-4-argon-high"], ["high"])
+        self.assertEqual(found["agy"]["gemini-3.8-flash-low"], ["low"])
+        self.assertEqual(cache.read_text(encoding="utf-8"), before)
+        self.assertFalse(self.marker.exists())
 
 
 @unittest.skipIf(os.name == "nt", "uses a POSIX shell script as the fake agy")
@@ -530,6 +630,73 @@ class TestRealCatalogPicksUnchanged(_TempHome):
         self.assertEqual({p: defaults[p]["current_default"] for p in expected},
                          {"claude": "claude-sonnet-5-5", "codex": "gpt-6.1-sol",
                           "muse": "muse-spark-1.3-contributor", "agy": "gemini-3.8-flash"})
+
+
+
+class TestAgyProbeSandbox(unittest.TestCase):
+    """P1: the real agy probe goes through provider_sandbox_launch with a
+    pinned native Gemini model, and fails closed without a sandbox."""
+
+    def test_probe_command_pins_native_gemini_model(self):
+        import makewand.health as health
+        captured = {}
+
+        def fake_probe(engine, command, timeout, repo_trust="trusted", cwd=None):
+            captured["command"] = list(command)
+            return (0, "ok\n", "", None)
+
+        with patch.object(health, "_run_model_probe", side_effect=fake_probe), \
+             patch("makewand.config.api_relay_available", return_value=False):
+            entry = health._probe_agy_for_real()
+        self.assertEqual(entry["status"], "healthy")
+        cmd = captured["command"]
+        self.assertIn("--model", cmd)
+        self.assertEqual(cmd[cmd.index("--model") + 1], "gemini-3.8-flash-low")
+        self.assertNotIn("opus", " ".join(cmd).lower())
+        self.assertNotIn("sonnet", " ".join(cmd).lower())
+
+    def test_probe_runs_through_sandbox_launch_not_bare_host(self):
+        import makewand.health as health
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        calls = {}
+
+        @contextmanager
+        def fake_launch(provider, cmd, cwd, **kwargs):
+            calls["provider"] = provider
+            calls["cmd"] = list(cmd)
+            calls["kwargs"] = kwargs
+            yield SimpleNamespace(cmd=["wrapped"] + list(cmd), pass_fds=(), env={})
+
+        def fake_run(cmd, **kwargs):
+            calls["run_cmd"] = list(cmd)
+            return (0, "ok\n", "", None)
+
+        with patch("makewand.sandbox.provider_sandbox_launch", fake_launch), \
+             patch.object(health, "run_subprocess", side_effect=fake_run), \
+             patch("makewand.config.api_relay_available", return_value=False):
+            entry = health._probe_agy_for_real()
+        self.assertEqual(entry["status"], "healthy")
+        self.assertEqual(calls["provider"], "agy")
+        self.assertTrue(calls["kwargs"]["readonly"])
+        self.assertEqual(calls["run_cmd"][0], "wrapped")
+        self.assertIn("gemini-3.8-flash-low", calls["run_cmd"])
+
+    def test_probe_without_sandbox_fails_closed_and_never_runs_host_agy(self):
+        import makewand.health as health
+        from makewand.sandbox import SandboxUnavailableError
+        ran = []
+        with patch("makewand.sandbox.provider_sandbox_launch",
+                   side_effect=SandboxUnavailableError(
+                       "❌ [Agy 沙箱不可用] useG1Credits 未能证明均为 false，可能扣 credits")), \
+             patch.object(health, "run_subprocess",
+                          side_effect=lambda *a, **k: ran.append(a) or (0, "ok", "", None)), \
+             patch("makewand.config.api_relay_available", return_value=False):
+            entry = health._probe_agy_for_real()
+        self.assertEqual(ran, [])
+        self.assertEqual(entry["status"], "warning")
+        self.assertIs(entry["verified"], False)
+        self.assertIn("useG1Credits", entry["reason"])
 
 
 if __name__ == "__main__":

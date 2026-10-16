@@ -51,6 +51,10 @@ STATUS_TTL_SECONDS = {
 }
 # Geographic/account-level blocks rarely change within minutes; re-check later.
 REGION_BLOCK_TTL_SECONDS = 6 * 3600
+# The real agy probe is pinned to a native Gemini model: probing with an
+# Opus/Sonnet proxy model would spend the wrong quota and prove nothing
+# about the native Gemini path.
+AGY_PROBE_MODEL = "gemini-3.8-flash-low"
 # Upper bound on an entry's own "ttl_seconds" (the longest any writer sets is
 # REGION_BLOCK_TTL_SECONDS): a damaged value cannot exclude a provider forever.
 FAILURE_TTL_MAX_SECONDS = 24 * 3600
@@ -1243,12 +1247,37 @@ def _run_model_probe(engine: str, command: str, timeout: int, *, repo_trust="tru
 
     def invoke(remaining):
         from makewand.execution_runtime import mark_provider_invocation
-        from makewand.providers.base import model_process_failure, is_process_timeout
+        from makewand.providers.base import model_process_failure, is_process_timeout, ProcessExecutionError
         mark_provider_invocation()
         # Generated echo probes do not need project files or project hooks.
         # Give even trusted probes a disposable neutral working directory.
         with tempfile.TemporaryDirectory(prefix="makewand-probe-") as neutral:
-            raw = run_subprocess(command, timeout=remaining, cwd=neutral)
+            if engine == "agy" and isinstance(command, (list, tuple)):
+                # The agy probe must read the sanitized private-home settings
+                # (useG1Credits=false), never the host settings: go through
+                # the same sandbox launch as real dispatches. Without a
+                # sandbox that launch fails closed (see sandbox.P0 guard).
+                from makewand.sandbox import (
+                    SandboxConfigError,
+                    SandboxUnavailableError,
+                    provider_sandbox_launch,
+                )
+                try:
+                    with provider_sandbox_launch(
+                        "agy", list(command), neutral,
+                        readonly=True, repo_root=neutral, repo_trust=repo_trust,
+                    ) as launch:
+                        raw = run_subprocess(
+                            launch.cmd, timeout=remaining, cwd=neutral,
+                            pass_fds=launch.pass_fds, extra_env=launch.env,
+                            separate_stderr=True,
+                        )
+                except (SandboxUnavailableError, SandboxConfigError) as exc:
+                    raw = (127, "", "", ProcessExecutionError(str(exc), "FAILED"))
+                    captured.append(raw)
+                    return model_process_failure(engine, raw[0], raw[1], raw[2], raw[3], readonly=True)
+            else:
+                raw = run_subprocess(command, timeout=remaining, cwd=neutral)
         captured.append(raw)
         if raw[0] == 0:
             return True, raw[1], None
@@ -1615,7 +1644,8 @@ def _probe_agy_for_real(*, repo_trust: str = "trusted", cwd: Optional[str] = Non
     now = datetime.now().isoformat()
     mode = "hybrid" if api_relay_available("agy") else "subscription"
     t = _resolve_probe_timeout("agy", timeout or 60, tier="fast", effort="low")
-    command = ["agy", "-p", "echo ok", "--print-timeout", f"{t}s", "--disable-slash-commands", "--mode", "plan"]
+    command = ["agy", "-p", "echo ok", "--print-timeout", f"{t}s", "--disable-slash-commands", "--mode", "plan",
+               "--model", AGY_PROBE_MODEL]
     code, out, err, ex = _run_model_probe("agy", command, timeout=t, repo_trust=repo_trust, cwd=cwd)
     combined = f"{out}\n{err}"
     limited, reason, resets = parse_agy_quota(combined)
@@ -1630,6 +1660,12 @@ def _probe_agy_for_real(*, repo_trust: str = "trusted", cwd: Optional[str] = Non
         if ttl:
             entry["ttl_seconds"] = float(ttl)
         return entry
+    sandbox_detail = str(ex or "").strip()
+    if sandbox_detail and ("useG1Credits" in sandbox_detail or "沙箱" in sandbox_detail):
+        # No usable sandbox (and host credits not proven off): the probe did
+        # not run on the host at all (fail closed). Report that, unverified.
+        return {"status": "warning", "reason": sandbox_detail[:300], "resets_at": None, "updated_at": now,
+                "mode": mode, "source": "probe", "verified": False}
     if code == 0 and _agy_user_facing(out).strip():
         return {"status": "healthy", "reason": "Antigravity 真实探活成功 (账号/地区/登录可用)", "resets_at": None,
                 "updated_at": now, "mode": mode, "source": "probe", "verified": True}

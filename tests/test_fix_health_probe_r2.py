@@ -42,6 +42,10 @@ REGION_REASON = "Antigravity 在当前地区/账号不可用 (真实派发返回
 AUTH_REASON = f"Antigravity 认证失败 (真实派发) · {health.get_reauth_hint('agy')}"
 
 
+def _is_real_agy_call(cmd):
+    seq = list(cmd)
+    return any(seq[i] == "agy" and i + 1 < len(seq) and seq[i + 1] == "-p" for i in range(len(seq)))
+
 class _Isolated(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="mw-fix-probe-r2-")
@@ -72,7 +76,7 @@ class _Isolated(unittest.TestCase):
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.health.run_subprocess", side_effect=fake_run):
             cache = health.get_or_update_status(force_probe=True)
-        return cache["agy"], [c for c in calls if c[:2] == ["agy", "-p"]]
+        return cache["agy"], [c for c in calls if _is_real_agy_call(c)]
 
     @staticmethod
     def usable(cache_entry):
@@ -265,6 +269,7 @@ class FakeAgyDispatch(_Isolated):
         self.agy.chmod(self.agy.stat().st_mode | stat.S_IXUSR)
         from makewand import orchestrator
         with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec"), \
              contextlib.redirect_stderr(io.StringIO()):

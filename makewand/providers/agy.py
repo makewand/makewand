@@ -224,14 +224,24 @@ def execute_agy_task(
         else:
             cmd = ["agy", "-p", final_prompt] + base_flags
 
-        from makewand.discovery import get_provider_model_tier, normalize_provider_effort
+        from makewand.discovery import get_provider_model_tier, resolve_agy_model, _discover_local_agy_models
         resolved = get_provider_model_tier("agy", tier)
         target_model = model or resolved.get("model")
+        requested_effort = effort or resolved.get("effort")
         if target_model and target_model != "default":
-            cmd.extend(["--model", target_model])
-        target_effort = normalize_provider_effort("agy", effort or resolved.get("effort"))
-        if target_effort and target_effort != "none":
-            cmd.extend(["--effort", target_effort])
+            try:
+                _avail = _discover_local_agy_models().models
+            except Exception:
+                _avail = None
+            final_model, final_effort = resolve_agy_model(target_model, requested_effort, _avail)
+            cmd.extend(["--model", final_model])
+            if final_effort and final_effort != "none":
+                cmd.extend(["--effort", final_effort])
+        else:
+            from makewand.discovery import normalize_provider_effort
+            target_effort = normalize_provider_effort("agy", requested_effort)
+            if target_effort and target_effort != "none":
+                cmd.extend(["--effort", target_effort])
 
         from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError
         from makewand.execution_runtime import mark_provider_invocation

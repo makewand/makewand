@@ -152,6 +152,7 @@ class TestAgyDispatchWriteBack(_IsolatedStatus):
         with patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec"), \
              patch("makewand.providers.agy.run_subprocess", return_value=(1, "", stderr_text, None)) as run:

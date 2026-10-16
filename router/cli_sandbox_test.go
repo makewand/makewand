@@ -219,6 +219,9 @@ func TestWrapCLICommandWithSandbox_FailCloseWhenBwrapMissing(t *testing.T) {
 }
 
 func TestWrapCLICommandWithSandbox_LiveExecution(t *testing.T) {
+	if !cliLiveBwrapWorks() {
+		t.Skip("bwrap not installed or cannot isolate")
+	}
 	bwrapPath, err := cliBwrapLookup("bwrap")
 	if err != nil {
 		t.Skip("bwrap not installed")

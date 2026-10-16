@@ -141,6 +141,7 @@ class TestAuditV31Fixes(unittest.TestCase):
             # 1. Claude
             with patch("makewand.health.load_status_cache", return_value={}), \
                  patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                 patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                  patch("makewand.providers.claude.run_subprocess") as mock_sub:
                 mock_sub.return_value = (0, "ok", "", None)
                 execute_claude_task(long_prompt, cwd=tmpdir, readonly=True)
@@ -153,6 +154,7 @@ class TestAuditV31Fixes(unittest.TestCase):
             # 2. Codex
             with patch("makewand.health.load_status_cache", return_value={}), \
                  patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                 patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                  patch("makewand.providers.codex.run_subprocess") as mock_sub:
                 mock_sub.return_value = (0, "ok", "", None)
                 execute_codex_task(long_prompt, cwd=tmpdir, readonly=True)
@@ -164,6 +166,7 @@ class TestAuditV31Fixes(unittest.TestCase):
             # 3. Muse
             with patch("makewand.health.load_status_cache", return_value={}), \
                  patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                 patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                  patch("makewand.providers.muse.run_subprocess") as mock_sub:
                 mock_sub.return_value = (0, "ok", "", None)
                 execute_muse_task(long_prompt, cwd=tmpdir, readonly=True)
@@ -174,6 +177,7 @@ class TestAuditV31Fixes(unittest.TestCase):
             # 4. Grok
             with patch("makewand.health.load_status_cache", return_value={}), \
                  patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                 patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                  patch("makewand.providers.grok.run_subprocess") as mock_sub:
                 mock_sub.return_value = (0, "ok", "", None)
                 execute_grok_task(long_prompt, cwd=tmpdir, readonly=True)
@@ -434,6 +438,7 @@ class TestAuditV31Fixes(unittest.TestCase):
         # 2. AGY --mode plan in readonly (authorized host run, H1)
         with patch("makewand.health.load_status_cache", return_value={}), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+             patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec"), \
              patch("makewand.providers.agy.run_subprocess") as mock_sub:

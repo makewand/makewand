@@ -1531,6 +1531,112 @@ def _resolve_provider_profile(p_name: str, user_home: str, project_paths: Sequen
     return profile
 
 
+
+# agy must never spend G1 credits: every agy process makewand launches reads
+# its settings from the private provider home (see PROVIDER_PROFILES["agy"]),
+# where both settings files are forced to useG1Credits=false. The host files
+# (~/.gemini/settings.json and ~/.gemini/antigravity-cli/settings.json, the
+# latter being the one the Antigravity CLI actually reads) are only read,
+# never written.
+AGY_SETTINGS_RELS = ("settings.json", "antigravity-cli/settings.json")
+
+
+def _sanitized_agy_settings_bytes(host_path) -> bytes:
+    """Host agy settings content with useG1Credits forced to false.
+
+    Preserves every other key; a missing, unreadable or non-object file
+    yields a minimal {"useG1Credits": false} document.
+    """
+    data = {}
+    if host_path:
+        found = _read_host_regular(str(host_path))
+        if found is not None:
+            try:
+                parsed = json.loads(found[0].decode("utf-8"))
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                data = dict(parsed)
+    data["useG1Credits"] = False
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+# Variables that could point agy at settings other than the ~/.gemini files
+# checked below (discovery honours the first two).
+AGY_CONFIG_DIR_ENVS = ("GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR")
+
+
+def _agy_host_credits_disabled(user_home=None) -> bool:
+    """True only when both host agy settings files prove useG1Credits is false.
+
+    A missing, unreadable, non-object or otherwise unproven file does not
+    count: without a sandbox agy would read the host settings (or its own
+    default-true behaviour) and could spend G1 credits once quota runs out.
+    A set config-dir variable does not count either: agy could read other
+    settings than the ones checked here.
+    """
+    if any(os.environ.get(name) for name in AGY_CONFIG_DIR_ENVS):
+        return False
+    home = _norm(str(user_home)) if user_home else _norm(str(Path.home()))
+    gemini_root = os.path.join(home, ".gemini")
+    for rel in AGY_SETTINGS_RELS:
+        found = _read_host_regular(os.path.join(gemini_root, rel))
+        if found is None:
+            return False
+        try:
+            parsed = json.loads(found[0].decode("utf-8"))
+        except Exception:
+            return False
+        if not isinstance(parsed, dict) or parsed.get("useG1Credits") is not False:
+            return False
+    return True
+
+
+def _agy_no_sandbox_credits_message() -> str:
+    return (
+        "❌ [Agy 沙箱不可用] 没有可信 Bubblewrap (bwrap) 沙箱时，拒绝在宿主直接运行 agy："
+        "宿主 ~/.gemini/settings.json 与 ~/.gemini/antigravity-cli/settings.json 的 "
+        "\"useG1Credits\" 未能证明均为 false，agy 在订阅额度用完后可能扣 G1 credits (fail closed)。\n"
+        "解决建议：\n"
+        "  1. [安装沙箱] 在 Linux 上安装 Bubblewrap 并启用非特权用户命名空间，让 agy 读取私有 home 里的净化设置；\n"
+        "  2. [关闭 credits 后直跑] 把上面两个宿主设置文件里的 \"useG1Credits\" 都明确设为 false，"
+        "并取消 GEMINI_CONFIG_DIR / AGY_CONFIG_DIR / ANTIGRAVITY_CONFIG_DIR（它们会让 agy 改读别处的设置），"
+        "再按无沙箱宿主执行的授权流程运行。"
+    )
+
+
+def _is_agy_provider(provider) -> bool:
+    return (provider or "").lower().strip() in ("agy", "gemini")
+
+
+def _write_agy_sanitized_settings(priv_root: str, host_real_root: str) -> list:
+    """Write sanitized agy settings into a private root; return the dst paths.
+
+    Covers both settings locations agy may read. Existing private files are
+    replaced (they are inside the per-run private directory, never the host).
+    """
+    written = []
+    for rel in AGY_SETTINGS_RELS:
+        host_p = os.path.join(host_real_root, rel) if host_real_root else None
+        content = _sanitized_agy_settings_bytes(host_p)
+        dst = os.path.join(priv_root, rel)
+        try:
+            os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW | _O_CLOEXEC, 0o600)
+            try:
+                os.write(fd, content)
+            finally:
+                os.close(fd)
+            try:
+                os.chmod(dst, 0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            raise SandboxConfigError(f"无法写私有 agy 设置 ({exc})，拒绝启动 (fail closed)") from exc
+        written.append(dst)
+    return written
+
+
 class ProviderHome:
     """
     Per-run private provider home (H3). Created lazily by wrap_bwrap via
@@ -1551,6 +1657,7 @@ class ProviderHome:
         self.credentials: List[_CredentialCopy] = []
         self._materialized = False
         self._lock = threading.Lock()
+        self._private_roots: Dict[str, str] = {}
 
     def materialize(self, project_paths: Sequence[str] = (),
                     absent_root_ok: Optional[Callable[[str], bool]] = None) -> List[str]:
@@ -1621,10 +1728,20 @@ class ProviderHome:
         account to verify it against).
         """
         rels = [rel for e_root, rel in profile.get("credentials", []) if e_root == root_rel]
-        if not rels:
+        if not rels and self.provider != "agy":
             return
         priv = self._private_root(idx)
+        self._private_roots[root_rel] = priv
         args.extend(["--bind", priv, root_path])
+        if self.provider == "agy":
+            # No host settings exist: the private home must still present
+            # useG1Credits=false so a default-true CLI cannot spend credits.
+            for _dst in _write_agy_sanitized_settings(priv, root_path):
+                pass
+            # Bind each sanitized file read-only at its expected location.
+            for rel in AGY_SETTINGS_RELS:
+                dst = os.path.join(priv, rel)
+                args.extend(["--ro-bind", dst, os.path.join(root_path, rel)])
         minted = profile.get("minted_keys", {})
         for rel in rels:
             self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=os.path.join(root_path, rel),
@@ -1648,6 +1765,7 @@ class ProviderHome:
                 continue
             real = os.path.realpath(root_path)
             priv = self._private_root(idx)
+            self._private_roots[root_rel] = priv
             real_roots[root_rel] = real
             self.state_roots.append(real)
             args.extend(["--bind", priv, real])
@@ -1674,6 +1792,27 @@ class ProviderHome:
             if not real:
                 continue
             p = os.path.join(real, sub)
+            if self.provider == "agy" and sub in AGY_SETTINGS_RELS:
+                # Force useG1Credits=false in the private home: write a
+                # sanitized copy (host file only read) and bind it read-only
+                # at the path agy reads. The host original is first bound
+                # read-only (the protected-file invariant other providers
+                # rely on) and then shadowed by the sanitized copy, so the
+                # file agy actually sees is the sanitized one and the host
+                # file is never writable or modified.
+                priv = self._private_roots.get(root_rel)
+                if priv is None:
+                    continue
+                if os.path.islink(p):
+                    _target = os.path.realpath(p)
+                    if os.path.exists(_target):
+                        args.extend(["--ro-bind", _target, p])
+                elif os.path.exists(p):
+                    args.extend(["--ro-bind", p, p])
+                _write_agy_sanitized_settings(priv, real)
+                dst = os.path.join(priv, sub)
+                args.extend(["--ro-bind", dst, p])
+                continue
             if os.path.islink(p):
                 # dotfile-managed symlink: bind its resolved target read-only at
                 # the expected path (the link itself is not exposed)
@@ -1724,6 +1863,11 @@ class ProviderHome:
 
     def _write_back_one(self, cred: _CredentialCopy) -> Optional[str]:
         """Merges one changed credential copy into its host file; returns the written host path."""
+        if self.provider == "agy" and cred.rel in AGY_SETTINGS_RELS:
+            # The sanitized agy settings in the private home are generated by
+            # makewand itself (useG1Credits=false): never a user login, never
+            # written back to the host, never warned about.
+            return None
         data, why = _read_private_nofollow(cred.private_root, cred.rel)
         if data is None:
             # The host copy stays untouched. A copy that existed at launch and
@@ -2753,11 +2897,16 @@ def provider_sandbox_launch(
     Yields ProviderLaunch; raises SandboxConfigError / SandboxUnavailableError.
     """
     if not is_bwrap_available():
+        if _is_agy_provider(provider) and not _agy_host_credits_disabled():
+            raise SandboxUnavailableError(_agy_no_sandbox_credits_message())
         source = authorize_unsandboxed_launch(provider, cmd, cwd, readonly, repo_trust, host_auth_source)
         # Passed through the process environment rather than an `env` prefix,
         # which does not exist on Windows.
         yield ProviderLaunch(list(cmd), (), False, source, env={PROVIDER_WORKER_ENV: "1"})
         return
+    if _is_agy_provider(provider) and extra_env:
+        # Never point agy away from the sanitized ~/.gemini settings.
+        extra_env = {k: v for k, v in extra_env.items() if k.upper() not in AGY_CONFIG_DIR_ENVS}
     with seccomp_filter_context(enabled=True) as (seccomp_fd, pass_fds):
         with provider_home_session(provider, [cwd, repo_root or ""]) as home:
             exec_cmd = wrap_bwrap(

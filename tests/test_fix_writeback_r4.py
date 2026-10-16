@@ -237,7 +237,14 @@ class TestLoginWithoutHostRoot(unittest.TestCase):
                     privs = [src for src, dst in _binds(args) if dst == str(root)]
                     self.assertEqual(len(privs), 1, args)
                     self.assertTrue(privs[0].startswith(h.private_dir + os.sep), privs)
-                    self.assertEqual(os.listdir(privs[0]), [])
+                    if provider == "agy":
+                        found = sorted(str(f.relative_to(privs[0]))
+                                       for f in Path(privs[0]).rglob("*") if f.is_file())
+                        self.assertEqual(found, ["antigravity-cli/settings.json", "settings.json"])
+                        for srel in found:
+                            self.assertIs(json.loads(Path(privs[0], srel).read_text(encoding="utf-8"))["useG1Credits"], False)
+                    else:
+                        self.assertEqual(os.listdir(privs[0]), [])
                     if logged_in:
                         target = Path(privs[0], rel)
                         target.parent.mkdir(parents=True, exist_ok=True)
@@ -299,6 +306,46 @@ class TestLoginWithoutHostRoot(unittest.TestCase):
             self.assertNotIn(str(home / ".config/muse"), [dst for _, dst in _binds(cmd)])
             self.assertFalse(os.path.lexists(home / ".claude"))
             self.assertFalse(os.path.lexists(home / ".config/muse"))
+
+
+@unittest.skipIf(os.name != "posix", "private provider homes need bubblewrap (POSIX)")
+class TestAgySyntheticSettingsNeverWrittenBack(unittest.TestCase):
+    """The sanitized agy settings copies in the private home are makewand's own
+    artifacts: tampering with them is not a login, is never written back to the
+    host (also through a symlinked ~/.gemini) and never warns."""
+
+    HOST_FILES = {
+        "settings.json": b'{"useG1Credits": true, "theme": "dark"}\n',
+        "antigravity-cli/settings.json": b'{"useG1Credits": true, "model": "x"}\n',
+    }
+
+    def test_tampered_private_settings_never_reach_the_host(self):
+        for symlinked in (False, True):
+            with self.subTest(symlinked=symlinked), vectors.fake_home() as home:
+                real = home / "relocated" / "gemini" if symlinked else home / ".gemini"
+                real.mkdir(parents=True)
+                for rel, content in self.HOST_FILES.items():
+                    target = real / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(content)
+                if symlinked:
+                    (home / ".gemini").symlink_to(real, target_is_directory=True)
+                h = ProviderHome("agy", str(home))
+                h.materialize([])
+                priv = Path(h._private_roots[".gemini"])
+                (priv / "settings.json").write_bytes(b'{"useG1Credits": true, "pwned": 1}\n')
+                (priv / "antigravity-cli" / "settings.json").write_bytes(b'{"useG1Credits": true, "pwned": 2}\n')
+                with patch("makewand.sandbox._warn") as warn:
+                    written = h.write_back()
+                self.assertEqual(written, [])
+                warn.assert_not_called()
+                private_dir = h.private_dir
+                with patch("makewand.sandbox._warn") as warn:
+                    h.finalize()
+                warn.assert_not_called()
+                self.assertFalse(os.path.exists(private_dir))
+                for rel, content in self.HOST_FILES.items():
+                    self.assertEqual((real / rel).read_bytes(), content)
 
 
 @unittest.skipUnless(BWRAP_OK, "bubblewrap not usable on this host")

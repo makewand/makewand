@@ -33,6 +33,12 @@ def isolated_env(directory, source=None, *, stub_codex=False):
     overridden = {key.upper() for key in overrides}
     env = {key: value for key, value in env.items() if key.upper() not in overridden}
     env.update(overrides)
+    # Without bubblewrap agy runs on the host only when both settings files
+    # prove useG1Credits=false; the verification home is set up like that.
+    for rel in (".gemini/settings.json", ".gemini/antigravity-cli/settings.json"):
+        settings = directory / "home" / rel
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text('{"useG1Credits": false}\n', encoding="utf-8")
     disabled = {name: False for name in PROVIDERS}
     if stub_codex:
         disabled["codex"] = True

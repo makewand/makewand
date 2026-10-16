@@ -24,6 +24,10 @@ KEYRING_OK = "I1012 08:11:57.965555       1 auth.go:157] ChainedAuth: authentica
 REGION_REASON = "Antigravity 在当前地区/账号不可用 (真实派发返回地区限制)"
 
 
+def _is_real_agy_call(cmd):
+    seq = list(cmd)
+    return any(seq[i] == "agy" and i + 1 < len(seq) and seq[i + 1] == "-p" for i in range(len(seq)))
+
 class _Isolated(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="mw-fix-probe-")
@@ -62,7 +66,7 @@ class TestProbeRetiresDispatchFailures(_Isolated):
         entry, calls = self.probe((0, "ok\n", KEYRING_OK, None))
         self.assertEqual(entry["status"], "healthy")
         self.assertIs(entry["verified"], True)
-        real = [c for c in calls if c[:2] == ["agy", "-p"]]
+        real = [c for c in calls if _is_real_agy_call(c)]
         self.assertEqual(len(real), 1, calls)
         self.assertIn("plan", real[0])  # read-only probe
         self.assertEqual(health.load_status_cache()["agy"]["status"], "healthy")
@@ -88,7 +92,7 @@ class TestProbeRetiresDispatchFailures(_Isolated):
     def test_no_real_call_without_a_dispatch_failure(self):
         entry, calls = self.probe((0, "ok\n", "", None))
         self.assertIs(entry["verified"], False)
-        self.assertEqual([c for c in calls if c[:2] == ["agy", "-p"]], [])
+        self.assertEqual([c for c in calls if _is_real_agy_call(c)], [])
 
 
 class TestSuccessfulDispatchRetiresFailures(_Isolated):

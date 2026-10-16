@@ -1232,6 +1232,20 @@ func cliAppendRoBindIfNotPresent(args []string, target string) []string {
 	return append(args, "--ro-bind", target, target)
 }
 
+// cliRoBindAgySanitizedSettings mounts the private sanitized agy settings
+// read-only at the paths the CLI reads. The host file is already bound
+// read-only at the same destination; this later mount is the one the process
+// sees, so useG1Credits=false wins and the host file stays untouched.
+func cliRoBindAgySanitizedSettings(args []string, privRoot, sandboxRoot string) []string {
+	for _, rel := range cliAgySettingsRels {
+		relPath := filepath.FromSlash(rel)
+		src := filepath.Join(privRoot, relPath)
+		dest := filepath.Join(sandboxRoot, relPath)
+		args = append(args, "--ro-bind", src, dest)
+	}
+	return args
+}
+
 // cliAppendRoBindToIfNotPresent read-only binds source at dest unless dest
 // already has a read-only bind.
 func cliAppendRoBindToIfNotPresent(args []string, source, dest string) []string {
@@ -1282,6 +1296,15 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	}
 
 	if bwrapMissing {
+		// Without a sandbox agy reads the host settings: refuse unless both
+		// files already prove useG1Credits=false, so it can never spend credits.
+		// A custom provider wrapping the agy binary under another name counts.
+		if cliProviderForcesAgyCreditsOff(provider) || cliCommandRunsAgy(cmd) {
+			if err := cliAgyHostCreditsDisabled(cliWithProviderWorkerEnv(sanitizeCLIEnv(provider, cmd.Env))); err != nil {
+				msg := fmt.Sprintf("bubblewrap (bwrap) sandbox is not available and agy could spend G1 credits on the host (%v). Set \"useG1Credits\": false in both ~/.gemini/settings.json and ~/.gemini/antigravity-cli/settings.json, or install bubblewrap. Execution blocked.", err)
+				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, msg, err)
+			}
+		}
 		// Every unsandboxed launch, whatever the task type, needs explicit
 		// host-exec authorization and is audited (H1). Bubblewrap is Linux-only;
 		// on Windows, process trees and resources are bounded by Job Objects
@@ -1531,7 +1554,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 				// A login made inside the sandbox in a directory the host
 				// lacks is reported after the run, never written back.
 				if privHome != nil && errors.Is(err, os.ErrNotExist) {
-					if bwrapArgs, err = privHome.addAbsentProviderEntry(bwrapArgs, cred, target); err != nil {
+					if bwrapArgs, err = privHome.addAbsentProviderEntry(bwrapArgs, p, cred, target); err != nil {
 						return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
 					}
 				}
@@ -1603,6 +1626,13 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 				}
 			}
 		}
+	}
+	// agy must read useG1Credits=false. Refuse every launch where the sanitized
+	// settings were not mounted: no usable HOME, an unreadable ~/.gemini, or a
+	// workspace overlapping it.
+	if cliProviderForcesAgyCreditsOff(provider) && (privHome == nil || !privHome.agySettingsMounted) {
+		msg := "refusing to start agy: its settings could not be forced to useG1Credits=false inside the sandbox"
+		return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, msg, errors.New(msg))
 	}
 	if selectedCodexHome != "" {
 		// Mount only the selected account after masking host roots and other
@@ -1912,6 +1942,11 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 		key := parts[0]
 
 		if isProviderKey(key, p) {
+			// A config-dir variable would point agy away from the ~/.gemini
+			// settings the credit guards check and sanitize.
+			if (p == "gemini" || p == "agy") && cliIsAgyConfigDirEnv(key) {
+				continue
+			}
 			sanitized = append(sanitized, entry)
 			continue
 		}

@@ -155,6 +155,9 @@ class WindowsVerificationBoundaryTests(unittest.TestCase):
             self.assertFalse(cfg['allow_paid'])
             cfg = json.loads((Path(directory) / 'config/config.json').read_text())
             self.assertEqual(cfg['api_policy'], 'subscription_only')
+            # agy runs on the host without bubblewrap only when both files turn credits off.
+            for rel in ('.gemini/settings.json', '.gemini/antigravity-cli/settings.json'):
+                self.assertEqual(json.loads((Path(env['HOME']) / rel).read_text()), {'useG1Credits': False})
 
     @unittest.skipUnless(shutil.which('git'), 'Git required for checkout-bound verification')
     def test_checkout_rejects_dirty_untracked_and_wrong_commit(self):

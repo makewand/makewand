@@ -100,6 +100,7 @@ class TestClaudeReadonlyFlags(unittest.TestCase):
 
     def test_readonly_task_without_bwrap_or_authorization_is_refused(self):
         with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+        patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(False, None)), \
              patch("makewand.sandbox.audit_unsafe_host_exec") as audit:
             ok, out, err = execute_claude_task("review this", cwd=self.ws, readonly=True)
