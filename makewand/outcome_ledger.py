@@ -1,12 +1,17 @@
 """成绩账本与额度标记：makewand 私有状态目录下 routing/ 的持久化。
 
 outcomes.jsonl 只追加，每行一条 JSON（ts、provider、tier、task_type、
-passed、seconds、calls），写入时用 makewand.filelock 的跨进程文件锁，
+passed、seconds、calls）。给了 model / effort 时再在行尾追加这两个字段，
+不给则保持原来的字段顺序。写入时用 makewand.filelock 的跨进程文件锁，
 保证多进程并发追加不会交错损坏。坏行在读取时跳过，不让整个账本失效。
 records() 在锁内读完即释放锁，再产出快照迭代器，慢消费者不会堵住写入。
 
 stats() 按指数时间衰减加权计算 Beta 后验（先验 1/1）、有效样本数
 与加权平均耗时/调用次数，now 与 half_life_days 均可注入。
+不给 model / effort 时按 provider/tier/task_type 统计（旧记录，以及带
+model/effort 的新记录，只要档位相同都算进去）。给了其中之一就按
+provider/model/effort/task_type 统计，不再用 tier 做过滤；没有这两个
+字段的旧记录不会混进候选级统计。
 观察时刻之后的记录不计入，因此注入的历史 now 不会读到“未来”样本。
 
 marks.json 记 provider -> {until, reason}，写入时在锁内读-改-写并
@@ -142,7 +147,7 @@ def _validate_row(row: Any) -> Optional[Dict[str, Any]]:
             calls = int(calls)
         if int(calls) < 0:
             return None
-    return {
+    normalized = {
         "ts": float(row["ts"]),
         "provider": row["provider"],
         "tier": int(tier),
@@ -151,6 +156,16 @@ def _validate_row(row: Any) -> Optional[Dict[str, Any]]:
         "seconds": None if seconds is None else float(seconds),
         "calls": None if calls is None else int(calls),
     }
+    # model / effort 是后加的可选字段。缺了是旧记录；在了但不是非空字符串则整行作废。
+    if "model" in row and row["model"] is not None:
+        if not isinstance(row["model"], str) or not row["model"].strip():
+            return None
+        normalized["model"] = row["model"].strip()
+    if "effort" in row and row["effort"] is not None:
+        if not isinstance(row["effort"], str) or not row["effort"].strip():
+            return None
+        normalized["effort"] = row["effort"].strip().lower()
+    return normalized
 
 
 def _normalize_tier(tier: Any) -> int:
@@ -190,6 +205,16 @@ def _normalize_seconds(seconds: Any) -> Optional[float]:
     if value < 0:
         raise ValueError("seconds must be >= 0")
     return value
+
+
+def _normalize_optional_text(value: Any, name: str, *, lower: bool = False) -> Optional[str]:
+    """None 表示“不按这个字段统计/不写入”。空字符串和其他类型拒绝。"""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string or None")
+    text = value.strip()
+    return text.lower() if lower else text
 
 
 def _normalize_calls(calls: Any) -> Optional[int]:
@@ -259,8 +284,14 @@ class OutcomeLedger:
         seconds: Any = None,
         calls: Any = None,
         ts: Any = None,
+        model: Any = None,
+        effort: Any = None,
     ) -> Dict[str, Any]:
-        """追加一条成绩记录。ts 可注入（epoch 秒或 datetime），默认真实时钟。"""
+        """追加一条成绩记录。ts 可注入（epoch 秒或 datetime），默认真实时钟。
+
+        model / effort 可选。不给就不写入，行的字段和旧账本一致；给了就记在行尾，
+        供候选级 stats 使用。
+        """
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("provider must be a non-empty string")
         if not isinstance(task_type, str) or not task_type.strip():
@@ -275,6 +306,12 @@ class OutcomeLedger:
             "seconds": _normalize_seconds(seconds),
             "calls": _normalize_calls(calls),
         }
+        model_text = _normalize_optional_text(model, "model")
+        effort_text = _normalize_optional_text(effort, "effort", lower=True)
+        if model_text is not None:
+            row["model"] = model_text
+        if effort_text is not None:
+            row["effort"] = effort_text
         payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
         self._ensure_dir()
         if not _O_NOFOLLOW and os.path.islink(self.outcomes_path):
@@ -345,6 +382,8 @@ class OutcomeLedger:
         task_type: str,
         now: Any = None,
         half_life_days: float = 14,
+        model: Any = None,
+        effort: Any = None,
     ) -> Stats:
         """带指数时间衰减的 Beta 后验统计。
 
@@ -352,6 +391,10 @@ class OutcomeLedger:
         alpha = 1 + Σ w(通过)，beta = 1 + Σ w(失败)，n = Σ w（有效样本数），
         平均耗时/调用次数为同一组权重下的加权平均（没有计入的数据时为 None）。
         ts 晚于 now 的记录视为尚未发生，直接跳过。
+
+        model 和 effort 都不给时，按 provider/tier/task_type 过滤（旧行为）。
+        给了其中任何一个，就按 provider/model/effort/task_type 过滤，tier 不参与；
+        只给了一个字段时，另一个字段不作为条件。
         """
         if isinstance(half_life_days, bool) or not isinstance(half_life_days, (int, float)):
             raise TypeError("half_life_days must be a number")
@@ -359,6 +402,9 @@ class OutcomeLedger:
             raise ValueError("half_life_days must be a positive finite number")
         moment = time.time() if now is None else _coerce_ts(now, "now")
         wanted_tier = _normalize_tier(tier)
+        want_model = _normalize_optional_text(model, "model")
+        want_effort = _normalize_optional_text(effort, "effort", lower=True)
+        candidate_query = want_model is not None or want_effort is not None
         half_life_seconds = float(half_life_days) * _SECONDS_PER_DAY
         alpha = _PRIOR_ALPHA
         beta = _PRIOR_BETA
@@ -369,7 +415,14 @@ class OutcomeLedger:
         calls_weighted = 0.0
         calls_weights = 0.0
         for row in self._read_rows():
-            if row["provider"] != provider or row["tier"] != wanted_tier or row["task_type"] != task_type:
+            if row["provider"] != provider or row["task_type"] != task_type:
+                continue
+            if candidate_query:
+                if want_model is not None and row.get("model") != want_model:
+                    continue
+                if want_effort is not None and row.get("effort") != want_effort:
+                    continue
+            elif row["tier"] != wanted_tier:
                 continue
             age = moment - row["ts"]
             if age < 0:
