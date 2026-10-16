@@ -1298,7 +1298,8 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	if bwrapMissing {
 		// Without a sandbox agy reads the host settings: refuse unless both
 		// files already prove useG1Credits=false, so it can never spend credits.
-		if cliProviderForcesAgyCreditsOff(provider) {
+		// A custom provider wrapping the agy binary under another name counts.
+		if cliProviderForcesAgyCreditsOff(provider) || cliCommandRunsAgy(cmd) {
 			if err := cliAgyHostCreditsDisabled(cliWithProviderWorkerEnv(sanitizeCLIEnv(provider, cmd.Env))); err != nil {
 				msg := fmt.Sprintf("bubblewrap (bwrap) sandbox is not available and agy could spend G1 credits on the host (%v). Set \"useG1Credits\": false in both ~/.gemini/settings.json and ~/.gemini/antigravity-cli/settings.json, or install bubblewrap. Execution blocked.", err)
 				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, msg, err)
@@ -1941,6 +1942,11 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 		key := parts[0]
 
 		if isProviderKey(key, p) {
+			// A config-dir variable would point agy away from the ~/.gemini
+			// settings the credit guards check and sanitize.
+			if (p == "gemini" || p == "agy") && cliIsAgyConfigDirEnv(key) {
+				continue
+			}
 			sanitized = append(sanitized, entry)
 			continue
 		}

@@ -578,3 +578,69 @@ func TestAgySandboxRefusedWithoutMountedSettings(t *testing.T) {
 		}
 	}
 }
+
+// Config-dir variables could point agy away from the ~/.gemini settings the
+// credit guards check, so agy launches drop them and keep other keys.
+func TestAgyLaunchDropsConfigDirEnv(t *testing.T) {
+	env := []string{
+		"PATH=/usr/bin", "HOME=/home/u", "GEMINI_API_KEY=k", "GOOGLE_CLOUD_PROJECT=p",
+		"GEMINI_CONFIG_DIR=/home/u/alt", "AGY_CONFIG_DIR=/home/u/alt", "antigravity_config_dir=/home/u/alt",
+	}
+	for _, provider := range []string{"agy", "gemini", "antigravity", "agy-cli"} {
+		got := strings.Join(sanitizeCLIEnv(provider, env), "\n")
+		for _, dropped := range []string{"GEMINI_CONFIG_DIR=", "AGY_CONFIG_DIR=", "antigravity_config_dir="} {
+			if strings.Contains(got, dropped) {
+				t.Fatalf("%s kept %s: %q", provider, dropped, got)
+			}
+		}
+		for _, kept := range []string{"GEMINI_API_KEY=k", "GOOGLE_CLOUD_PROJECT=p", "HOME=/home/u"} {
+			if !strings.Contains(got, kept) {
+				t.Fatalf("%s dropped %s: %q", provider, kept, got)
+			}
+		}
+	}
+}
+
+// A custom provider wrapping the agy binary under another name gets the
+// same host guard; other binaries under that name are unaffected.
+func TestAgyHostGuardRecognizesAgyBinaryUnderCustomName(t *testing.T) {
+	auditFixMissingBwrap(t)
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "1")
+	auth := UnsafeHostExecAuth{Acknowledged: true, Source: "test", Audit: func(string, []string, string) {}}
+	ctx := ContextWithUnsafeHostExecAuth(context.Background(), auth)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	for _, bin := range []string{"agy", "/opt/bin/agy", "agy.exe", `C:\Tools\Antigravity.EXE`, "gemini-cli"} {
+		cmd := exec.Command(bin, "-p", "x")
+		cmd.Args[0] = bin
+		if _, err := wrapCLICommandWithSandbox(ctx, "myagent", cmd); err == nil || !strings.Contains(err.Error(), "useG1Credits") {
+			t.Fatalf("%s under a custom name ran on the host without the credits guard: %v", bin, err)
+		}
+	}
+	for _, bin := range []string{"my-agent", "/usr/bin/agyfoo", "geminiish"} {
+		cmd := exec.Command(bin, "-p", "x")
+		cmd.Args[0] = bin
+		if _, err := wrapCLICommandWithSandbox(ctx, "myagent", cmd); err != nil {
+			t.Fatalf("%s is not agy but was refused: %v", bin, err)
+		}
+	}
+}
+
+// A non-absolute HOME (Git Bash on Windows, or a relative value) is skipped;
+// the guard then reads the real user home directory.
+func TestAgyHostGuardSkipsNonAbsoluteHome(t *testing.T) {
+	home := t.TempDir()
+	agyWriteHostSettings(t, home, [2]string{`{"useG1Credits": false}`, `{"useG1Credits": false}`})
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	for _, childHome := range []string{"relative/home", "c/Users/u"} {
+		if err := cliAgyHostCreditsDisabled([]string{"HOME=" + childHome}); err != nil {
+			t.Fatalf("HOME=%q: %v", childHome, err)
+		}
+	}
+	other := t.TempDir()
+	if err := cliAgyHostCreditsDisabled([]string{"HOME=" + other}); err == nil || !strings.Contains(err.Error(), other) {
+		t.Fatalf("an absolute child HOME without settings must still be checked: %v", err)
+	}
+}
