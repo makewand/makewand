@@ -12,6 +12,12 @@
 
 可用候选按目录顺序各采样一次 Beta(alpha, beta)，采样值大的排前面。
 ``is_self`` 的整体排在所有非 self 之后。采样值相同则保持目录顺序。
+
+``full=True`` 时候选来自完整目录（``candidates(tier, full=True)``），
+Thompson 采样用候选级统计（provider/model/effort/task_type）。
+默认不含 legacy；``include_legacy=True`` 才把旧模型放进排序。
+``discovered`` 可注入；不注入就读 discovery 的本地缓存，读不到用内置默认。
+``full=False``（默认）仍走精简三档表和 provider/tier/task_type 统计。
 """
 
 from __future__ import annotations
@@ -102,13 +108,20 @@ class Policy:
 
 @dataclass(frozen=True)
 class RouteCandidate:
-    """一个排好序的可用候选。``args`` 是传给 makewand 的参数。"""
+    """一个排好序的可用候选。``args`` 是传给 makewand 的参数。
+
+    model、effort、candidate_id 只在完整目录（``select(..., full=True)``）里有值。
+    精简三档表的候选这三个字段是 None，原有字段的含义不变。
+    """
 
     provider: str
     args: tuple
     label: str
     is_self: bool
     sampled_score: float
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    candidate_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -230,11 +243,17 @@ def select(
     ledger: Optional[OutcomeLedger] = None,
     rng: Optional[random.Random] = None,
     now: Optional[Union[float, datetime]] = None,
+    *,
+    full: bool = False,
+    include_legacy: bool = False,
+    discovered: Optional[Mapping] = None,
 ) -> RouteResult:
     """选择这一档要派的候选。
 
     采样用 ``rng.betavariate(alpha, beta)``，只对还可用的候选、按目录顺序
     各调用一次。``rng`` 用 ``random.Random(seed)`` 时排序可以复现。
+
+    ``full=True`` 在完整目录里选，并用候选级账本统计做 Thompson 采样。
     """
     if policy is None:
         policy = load_policy()
@@ -250,7 +269,12 @@ def select(
     _validate_self_tool(self_tool)
     _validate_not_tool(not_tool)
     tier = _resolve_tier(task_type, difficulty, risk, tier_override)
-    rows = candidates(tier)
+    if full:
+        if discovered is None:
+            discovered = _load_discovered_efforts()
+        rows = candidates(tier, full=True, include_legacy=include_legacy, discovered=discovered)
+    else:
+        rows = candidates(tier)
 
     marks = {}
     for name, mark in ledger.active_marks(moment).items():
@@ -279,7 +303,15 @@ def select(
 
     scored = []
     for index, row in available:
-        stats = ledger.stats(row.provider, tier, task_type, now=moment, half_life_days=HALF_LIFE_DAYS)
+        stats = ledger.stats(
+            row.provider,
+            tier,
+            task_type,
+            now=moment,
+            half_life_days=HALF_LIFE_DAYS,
+            model=getattr(row, "model", None),
+            effort=getattr(row, "effort", None),
+        )
         alpha = _positive_param(stats.alpha)
         beta = _positive_param(stats.beta)
         score = float(rng.betavariate(alpha, beta))
@@ -294,6 +326,9 @@ def select(
             label=row.label,
             is_self=is_self,
             sampled_score=score,
+            model=getattr(row, "model", None),
+            effort=getattr(row, "effort", None),
+            candidate_id=getattr(row, "candidate_id", None),
         )
         for _self_flag, _neg_score, _index, row, score, is_self in scored
     ]
@@ -303,6 +338,22 @@ def select(
         skipped=skipped,
         escalate_tier=escalate(tier),
     )
+
+
+def _load_discovered_efforts():
+    """本地缓存里的模型 → 推理深度。读不到或为空时返回 None，目录用内置默认。
+
+    只读已经落盘的缓存，不跑 ``agy models``，也不走网络。
+    """
+    try:
+        from makewand.discovery import discover_model_efforts
+
+        found = discover_model_efforts()
+    except Exception:
+        return None
+    if not isinstance(found, Mapping) or not found:
+        return None
+    return found
 
 
 def _resolve_now(now: Optional[Union[float, datetime]]) -> float:

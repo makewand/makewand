@@ -432,7 +432,7 @@ class DiscoveredAgyModels(tuple):
         return default
 
 
-def _discover_local_agy_models() -> DiscoveredAgyModels:
+def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
     """
     Scans local Gemini / Antigravity config and cache directories.
     Returns DiscoveredAgyModels(models, configured_default, configured_effort).
@@ -533,7 +533,9 @@ def _discover_local_agy_models() -> DiscoveredAgyModels:
     # ...) and is merged with any .gemini caches above, not only used when
     # those are empty, so `makewand models` can show every agy model.
     agy_cache_file = Path.home() / ".cache" / "makewand" / "agy_models_cache.json"
-    _sync_agy_models_cache(cache_file=agy_cache_file)
+    # sync=False reads a cache that is already on disk and does not run `agy models`.
+    if sync:
+        _sync_agy_models_cache(cache_file=agy_cache_file)
     if agy_cache_file.exists():
         try:
             cdata = json.loads(agy_cache_file.read_text(encoding="utf-8"))
@@ -565,6 +567,12 @@ def _is_native_agy_model(slug: str) -> bool:
 
 
 AGY_MODELS_RETRY_SECONDS = 3600
+# Implicit lookups stay short so a slow `agy models` cannot stall routing.
+# An explicit refresh (refresh_agy_models_cache / discover_available_models(refresh=True))
+# waits long enough for the networked command, which regularly exceeds 4s and
+# was falling back to the stale 10-02 cache.
+AGY_MODELS_TIMEOUT_SECONDS = 4.0
+AGY_MODELS_REFRESH_TIMEOUT_SECONDS = 60.0
 # Refresh attempts of this process that left no new catalog, per cache file:
 # (time.monotonic() of the attempt, cache state it saw). Keeps `agy models` to one
 # run per process and back-off window even when the marker file misbehaves.
@@ -626,7 +634,7 @@ def _claim_agy_refresh(marker: Path, state: str, retry: float) -> bool:
     return False
 
 
-def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4.0, max_age: float = 86400, runner=None, output_text: Optional[str] = None) -> Optional[Path]:
+def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = AGY_MODELS_TIMEOUT_SECONDS, max_age: float = 86400, runner=None, output_text: Optional[str] = None, force: bool = False) -> Optional[Path]:
     """
     Syncs available models from `agy models` CLI if cache is absent or older than max_age (1 day, 86400s by default).
     `agy models` runs only after the attempt marker next to the cache has been
@@ -636,6 +644,9 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
     broken or slow `agy models` cannot stall every lookup. Output that names no
     gemini-/google- model ("No models available ...", "Error: ...") is a failed
     refresh and never replaces the previous catalog.
+    The implicit path keeps the short timeout (4s). ``force=True`` is the explicit
+    refresh: it ignores a fresh cache, the in-process back-off and a young
+    ``.attempt`` marker, and the caller passes the 60s timeout.
     Never executes in test isolation mode (MAKEWAND_TEST_ISOLATION_ROOT).
     """
     from makewand.config import is_provider_enabled
@@ -659,23 +670,36 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
             return False
         return time.time() - st.st_mtime < max_age and st.st_size > 30
 
-    if is_fresh():
+    if not force and is_fresh():
         return cache_file
 
     retry = min(max_age, AGY_MODELS_RETRY_SECONDS)
     state = _agy_cache_state(cache_file)
-    failed = _AGY_FAILED_REFRESHES.get(str(cache_file))
-    if failed and failed[1] == state and time.monotonic() - failed[0] < retry:
-        return None
     attempt_marker = cache_file.with_name(cache_file.name + ".attempt")
-    if not _claim_agy_refresh(attempt_marker, state, retry):
-        return None
-    if is_fresh():  # another process finished a refresh just before the claim
+    if not force:
+        failed = _AGY_FAILED_REFRESHES.get(str(cache_file))
+        if failed and failed[1] == state and time.monotonic() - failed[0] < retry:
+            return None
+        if not _claim_agy_refresh(attempt_marker, state, retry):
+            return None
+        if is_fresh():  # another process finished a refresh just before the claim
+            try:
+                attempt_marker.unlink()
+            except OSError:
+                pass
+            return cache_file
+    else:
+        # Explicit refresh must not be held by a young .attempt marker. The
+        # directory still has to be writable, otherwise the new catalog could
+        # not be stored and running `agy models` would only block the caller.
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
         try:
             attempt_marker.unlink()
         except OSError:
             pass
-        return cache_file
     _AGY_FAILED_REFRESHES[str(cache_file)] = (time.monotonic(), state)  # until the refresh succeeds
 
     tmp_name = None
@@ -728,6 +752,25 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = 4
 
 
 _refresh_agy_models_cache = _sync_agy_models_cache
+
+
+def refresh_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = AGY_MODELS_REFRESH_TIMEOUT_SECONDS, max_age: float = 86400, runner=None, output_text: Optional[str] = None) -> Optional[Path]:
+    """Explicit ``agy models`` refresh for ``makewand models --refresh``.
+
+    Waits up to 60 seconds. A fresh cache does not skip the run, and a young
+    ``.attempt`` marker (or this process's failed-refresh window) does not
+    block it. The daily implicit lookup keeps the 4 second timeout.
+    ``runner`` / ``output_text`` are the same test injections as
+    ``_sync_agy_models_cache``: neither starts a real CLI by itself.
+    """
+    return _sync_agy_models_cache(
+        cache_file=cache_file,
+        timeout=timeout,
+        max_age=max_age,
+        runner=runner,
+        output_text=output_text,
+        force=True,
+    )
 
 
 class DiscoveredMuseModels(tuple):
@@ -1006,7 +1049,154 @@ def rank_models_for_tier(models, tier: str = "standard") -> List[Tuple[int, str,
     return scored
 
 
-def discover_available_models() -> Dict[str, Any]:
+def _effort_names(levels) -> List[str]:
+    """Pull canonical effort ids out of a catalog's level list. Unknown names are dropped."""
+    found: List[str] = []
+    seen = set()
+    for level in levels or []:
+        if isinstance(level, dict):
+            raw = level.get("effort") or level.get("id") or level.get("value")
+        else:
+            raw = level
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip().lower()
+        if name in _EFFORT_ORDER and name not in seen:
+            seen.add(name)
+            found.append(name)
+    return found
+
+
+def _iter_codex_bases():
+    if os.environ.get("CODEX_HOME"):
+        yield Path(os.environ["CODEX_HOME"]).expanduser()
+        return
+    yield Path.home() / ".codex"
+    yield Path.home() / ".codex-2"
+
+
+def _codex_effort_map() -> Dict[str, List[str]]:
+    found: Dict[str, List[str]] = {}
+    for base in _iter_codex_bases():
+        try:
+            data = json.loads((base / "models_cache.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for entry in data.get("models", []) if isinstance(data, dict) else []:
+            if not isinstance(entry, dict) or entry.get("visibility") == "hide":
+                continue
+            slug = entry.get("slug") or entry.get("id")
+            if not _valid_model_id(slug) or slug in found:
+                continue
+            found[str(slug)] = _effort_names(entry.get("supported_reasoning_levels") or [])
+    return found
+
+
+def _claude_effort_map() -> Dict[str, List[str]]:
+    found: Dict[str, List[str]] = {}
+    cat_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "cache" / "model-catalog"
+    try:
+        files = sorted(cat_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return found
+    if not files:
+        return found
+    try:
+        cat_data = json.loads(files[0].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return found
+    cfg_models = cat_data.get("catalog", {}).get("config", {}).get("models", []) if isinstance(cat_data, dict) else []
+    for entry in cfg_models if isinstance(cfg_models, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        mid = entry.get("id")
+        if not _valid_model_id(mid) or mid in found:
+            continue
+        thinking = entry.get("thinking") if isinstance(entry.get("thinking"), dict) else {}
+        found[str(mid)] = _effort_names(thinking.get("effort_options") or [])
+    return found
+
+
+def _grok_effort_map() -> Dict[str, List[str]]:
+    found: Dict[str, List[str]] = {}
+    try:
+        data = json.loads((Path.home() / ".grok" / "models_cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return found
+    entries = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(entries, dict):
+        return found
+    for model_id, entry in entries.items():
+        if not _valid_model_id(model_id):
+            continue
+        entry = entry if isinstance(entry, dict) else {}
+        info = entry.get("info") if isinstance(entry.get("info"), dict) else {}
+        levels = info.get("reasoning_efforts") or entry.get("reasoning_efforts") or []
+        found[str(model_id)] = _effort_names(levels)
+    return found
+
+
+def _muse_effort_map() -> Dict[str, List[str]]:
+    found: Dict[str, List[str]] = {}
+    try:
+        discovered = _discover_local_muse_models()
+    except Exception:
+        return found
+    for mid, _desc in discovered.models:
+        if _valid_model_id(mid) and mid not in found:
+            # The muse catalog names models, not per-model efforts. Empty means
+            # "use the built-in effort list for this id".
+            found[str(mid)] = []
+    return found
+
+
+def _agy_effort_map() -> Dict[str, List[str]]:
+    found: Dict[str, List[str]] = {}
+    try:
+        discovered = _discover_local_agy_models(sync=False)
+    except Exception:
+        return found
+    for slug, _desc in discovered.models:
+        if not _valid_model_id(slug):
+            continue
+        _base, suffix = _split_agy_suffix(slug)
+        if suffix:
+            found[str(slug)] = [suffix]
+        elif slug not in found:
+            found[str(slug)] = []
+    return found
+
+
+def discover_model_efforts() -> Dict[str, Dict[str, List[str]]]:
+    """Local model → reasoning efforts for agy, claude, codex, muse and grok.
+
+    Reads the same on-disk catalogs ``discover_available_models`` already uses.
+    Does not run a provider CLI and does not refresh the agy cache (that stays
+    on the short implicit timeout). A provider with nothing on disk is omitted
+    so the routing catalog keeps its built-in default for that provider.
+    """
+    found: Dict[str, Dict[str, List[str]]] = {}
+    for provider, reader in (
+        ("codex", _codex_effort_map),
+        ("claude", _claude_effort_map),
+        ("grok", _grok_effort_map),
+        ("muse", _muse_effort_map),
+        ("agy", _agy_effort_map),
+    ):
+        try:
+            models = reader()
+        except Exception:
+            continue
+        if models:
+            found[provider] = models
+    return found
+
+
+def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
+    if refresh:
+        # Explicit path only. The lookup below still uses the short implicit
+        # sync, which no-ops once this refresh has written a fresh cache.
+        refresh_agy_models_cache()
     models = {
         "claude": {"current_default": "claude-sonnet-5 (Sonnet 5)", "available": ["claude-fable-5-1[1m] (Fable 5.1)", "claude-opus-5-5 (Opus 5.5)", "claude-sonnet-5 (Sonnet 5)", "claude-haiku-4-5-20251001 (Haiku 4.5)"]},
         "codex": {"current_default": "gpt-6-astra", "available": []},
