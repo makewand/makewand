@@ -14,6 +14,7 @@ import multiprocessing
 import os
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -82,9 +83,11 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(stats.n, 2)
         self.assertEqual(stats.avg_seconds, 20)
         self.assertEqual(stats.avg_calls, 3)
+        self.assertEqual(stats.count, 2)
         # 其它 provider / 档位 / 类型不混入，没有匹配行时仍是先验和 None。
         other = self.ledger.stats("claude", 1, "implement", now)
         self.assertEqual((other.alpha, other.beta, other.n), (1, 1, 0))
+        self.assertEqual(other.count, 0)
         self.assertIsNone(other.avg_seconds)
         self.assertIsNone(other.avg_calls)
 
@@ -124,6 +127,9 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertGreater(before.n, 0.5)
 
         # 正好一个半衰期：旧样本权重 1/2，新样本权重 1。
+        self.assertEqual(untouched.count, 0)
+        self.assertEqual(before.count, 1)
+        self.assertEqual(at_half.count, 2)
         self.assertEqual(at_half.n, 1.5)
         self.assertEqual(at_half.alpha, 1.5)
         self.assertEqual(at_half.beta, 2)
@@ -176,6 +182,10 @@ class OutcomeLedgerTests(unittest.TestCase):
             json.dumps(dict(good_pass, seconds="2")) + "\n",
             json.dumps(dict(good_pass, calls=1.5)) + "\n",
             json.dumps(dict(good_pass, provider="")) + "\n",
+            json.dumps(dict(good_pass, tier=0)) + "\n",
+            json.dumps(dict(good_pass, tier=-2)) + "\n",
+            json.dumps(dict(good_pass, seconds=-1)) + "\n",
+            json.dumps(dict(good_pass, calls=-2)) + "\n",
             "[]\n",
             json.dumps(good_pass, ensure_ascii=False) + "\n",
             "{truncated\n",
@@ -189,6 +199,8 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(stats.n, 2)
         self.assertEqual(stats.avg_seconds, 3)
         self.assertEqual(stats.avg_calls, 2)
+        self.assertEqual(stats.count, 2)
+        self.assertEqual(len(list(self.ledger.records())), 3)
 
         # 坏行不挡住后续追加。
         self.ledger.record("codex", 1, "implement", True, seconds=6, calls=5, ts=100)
@@ -248,8 +260,8 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(created.until, 1_000)
         self.assertEqual(created.reason, "周额度")
         self.assertEqual(set(active), {"agy"})
-        self.assertEqual(active["agy"]["until"], 2_000)
-        self.assertEqual(active["agy"]["reason"], "paused")
+        self.assertEqual(active["agy"].until, 2_000)
+        self.assertEqual(active["agy"].reason, "paused")
         self.assertEqual(set(still), {"codex", "agy"})
         self.assertNotIn("codex", expired)
         self.assertIn("agy", expired)
@@ -316,6 +328,124 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertNotIn("grok", body)
         self.assertIn("codex", body)
         self.assertEqual(list(self.ledger.directory.glob(".marks-*")), [])
+
+    def test_public_interface_has_no_legacy_aliases(self):
+        import makewand.outcome_ledger as ledger_module
+
+        stats = self.ledger.stats("codex", 1, "implement", now=0)
+        self.assertEqual((stats.alpha, stats.beta, stats.n, stats.count), (1, 1, 0, 0))
+        for name in ("record_outcome", "append", "get_stats", "base_dir", "dir"):
+            self.assertFalse(hasattr(self.ledger, name), name)
+        for name in ("record", "record_outcome", "stats", "get_stats", "mark", "active_marks"):
+            self.assertFalse(hasattr(ledger_module, name), name)
+        self.assertTrue(hasattr(ledger_module, "default_ledger"))
+        self.assertTrue(hasattr(ledger_module, "routing_dir"))
+        for name in (
+            "mean_seconds",
+            "average_seconds",
+            "mean_calls",
+            "average_calls",
+            "effective_n",
+            "to_dict",
+            "keys",
+            "items",
+            "get",
+        ):
+            self.assertFalse(hasattr(stats, name), name)
+        with self.assertRaises(TypeError):
+            stats["alpha"]  # noqa: B018 - Stats 不再冒充 dict
+        created = self.ledger.mark("codex", 100, "quota")
+        self.assertEqual((created.until, created.reason), (100, "quota"))
+        self.assertNotIsInstance(created, dict)
+        self.assertFalse(hasattr(created, "until_ts"))
+        with self.assertRaises(TypeError):
+            created["until"]  # noqa: B018 - Mark 不再是 dict
+        with self.assertRaises(TypeError):
+            self.ledger.record("codex", 1, "implement", True, duration=1)
+        with self.assertRaises(TypeError):
+            self.ledger.record("codex", 1, "implement", True, duration_seconds=1)
+        with self.assertRaises(TypeError):
+            self.ledger.record("codex", 1, "implement", True, elapsed=1)
+        with self.assertRaises(TypeError):
+            self.ledger.record("codex", 1, "implement", True, call_count=1)
+        with self.assertRaises(TypeError):
+            self.ledger.record("codex", 1, "implement", True, timestamp=1)
+        with self.assertRaises(TypeError):
+            self.ledger.stats("codex", 1, "implement", now_ts=0)
+        with self.assertRaises(TypeError):
+            OutcomeLedger(self.base / "other", directory=self.base / "other")
+
+    def test_records_snapshot_does_not_block_append(self):
+        self.ledger.record("codex", 1, "implement", True, seconds=1, calls=1, ts=100)
+        iterator = self.ledger.records()
+        self.assertEqual(next(iterator)["provider"], "codex")
+        done = []
+
+        def append_one():
+            self.ledger.record("codex", 1, "implement", False, seconds=2, calls=2, ts=101)
+            done.append(True)
+
+        worker = threading.Thread(target=append_one, daemon=True)
+        worker.start()
+        worker.join(10)
+        self.assertFalse(worker.is_alive(), "records() 持锁堵住了并发追加")
+        self.assertEqual(done, [True])
+        self.assertEqual(self.ledger.stats("codex", 1, "implement", now=101).count, 2)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
+    def test_record_refuses_symlinked_outcomes_file(self):
+        victim = self.base / "victim.txt"
+        victim.write_text("keep\n", encoding="utf-8")
+        os.chmod(victim, 0o644)
+        os.symlink(victim, self.ledger.outcomes_path)
+        with self.assertRaises(OSError):
+            self.ledger.record("codex", 1, "implement", True, seconds=1, calls=1, ts=1)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")
+        self.assertEqual(_mode(victim), 0o644)
+
+    def test_mark_tightens_preexisting_loose_lock_file(self):
+        lock_path = self.ledger.directory / "marks.json.lock"
+        lock_path.write_text("", encoding="utf-8")
+        os.chmod(lock_path, 0o644)
+        self.ledger.mark("codex", 100, "quota")
+        self.assertEqual(_mode(lock_path), 0o600)
+        self.assertEqual(_mode(self.ledger.marks_path), 0o600)
+
+    def test_record_fsyncs_directory_when_creating_outcomes_file(self):
+        fresh = OutcomeLedger(self.base / "fresh-routing")
+        self.assertFalse(fresh.outcomes_path.exists())
+        calls = []
+        real_fsync = os.fsync
+
+        def spy(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch("makewand.outcome_ledger.os.fsync", spy):
+            fresh.record("codex", 1, "implement", True, seconds=1, calls=1, ts=1)
+        # 文件本身一次 fsync + 新建文件时目录一次 fsync。
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_record_raises_instead_of_spinning_on_zero_write(self):
+        with patch("makewand.outcome_ledger.os.write", return_value=0):
+            with self.assertRaises(OSError):
+                self.ledger.record("codex", 1, "implement", True, seconds=1, calls=1, ts=1)
+
+    def test_relative_base_dir_stays_anchored_after_chdir(self):
+        work = self.base / "relwork"
+        work.mkdir()
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(work)
+            ledger = OutcomeLedger(Path("routing"))
+            ledger.record("codex", 1, "implement", True, seconds=1, calls=1, ts=1)
+            os.chdir(self.base)
+            ledger.record("codex", 1, "implement", True, seconds=1, calls=1, ts=2)
+        finally:
+            os.chdir(original_cwd)
+        lines = (work / "routing" / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertFalse((self.base / "routing" / "outcomes.jsonl").exists())
 
     def test_state_dir_follows_xdg_and_is_private(self):
         loose = self.base / "loose"
