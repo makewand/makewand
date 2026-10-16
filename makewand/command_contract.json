@@ -40,7 +40,10 @@
     "sessions",
     "merge",
     "ensemble",
-    "clean"
+    "clean",
+    "route",
+    "mark",
+    "outcome"
   ],
   "native_go_commands": [
     "serve",

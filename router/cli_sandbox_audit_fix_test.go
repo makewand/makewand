@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/parser"
@@ -36,16 +37,31 @@ func auditFixMissingBwrap(t *testing.T) {
 	cliBwrapLookup = func(string) (string, error) { return "", errors.New("exec: not found") }
 }
 
+// cliLiveBwrapWorks reports whether this process can launch the isolation the
+// CLI sandbox actually uses. A bare --ro-bind can succeed where --unshare-pid
+// cannot mount /proc, and those runs fail closed instead of exercising the
+// credential path.
+func cliLiveBwrapWorks() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	bwrap, err := cliBwrapLookup("bwrap")
+	if err != nil {
+		return false
+	}
+	probe := exec.Command(bwrap, "--die-with-parent", "--unshare-user", "--unshare-pid", "--ro-bind", "/", "/", "--proc", "/proc", "--", "/usr/bin/true")
+	return probe.Run() == nil
+}
+
 func auditFixRequireLiveBwrap(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("native bubblewrap requires Linux")
 	}
-	bwrap, err := cliBwrapLookup("bwrap")
-	if err != nil {
+	if _, err := cliBwrapLookup("bwrap"); err != nil {
 		t.Skip("bubblewrap unavailable")
 	}
-	if probe := exec.Command(bwrap, "--ro-bind", "/", "/", "--", "/usr/bin/true"); probe.Run() != nil {
+	if !cliLiveBwrapWorks() {
 		if os.Getenv("MAKEWAND_TEST_REQUIRE_BWRAP") == "1" {
 			t.Fatal("required bubblewrap probe failed")
 		}
@@ -191,6 +207,10 @@ func TestAuditFix_ProviderStateNeverBoundWritable(t *testing.T) {
 			}
 		case "gemini", "agy":
 			settings := filepath.Join(home, ".gemini", "settings.json")
+			hostBefore, err := os.ReadFile(settings)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if !auditFixHasTriple(wrapped.Args, "--ro-bind", settings, settings) {
 				t.Fatalf("%s: gemini settings must be bound read-only: %v", provider, wrapped.Args)
 			}
@@ -198,8 +218,25 @@ func TestAuditFix_ProviderStateNeverBoundWritable(t *testing.T) {
 			if !auditFixHasTriple(wrapped.Args, "--ro-bind", agy, agy) {
 				t.Fatalf("%s: config-only provider dir must be bound read-only: %v", provider, wrapped.Args)
 			}
-			if _, err := os.Stat(filepath.Join(priv, ".gemini", "settings.json")); err == nil {
-				t.Fatalf("%s: configuration must not be copied into the writable private home", provider)
+			// The private file is a sanitized copy, not the host bytes, and it
+			// is what the sandbox reads. The host file stays byte-for-byte.
+			privSettings := filepath.Join(priv, ".gemini", "settings.json")
+			if !auditFixHasTriple(wrapped.Args, "--ro-bind", privSettings, settings) {
+				t.Fatalf("%s: sanitized settings must be bound read-only over the host file", provider)
+			}
+			data, err := os.ReadFile(privSettings)
+			if err != nil {
+				t.Fatalf("%s: sanitized settings missing: %v", provider, err)
+			}
+			var doc map[string]any
+			if err := json.Unmarshal(data, &doc); err != nil || doc["useG1Credits"] != false {
+				t.Fatalf("%s: sandbox settings = %s (%v)", provider, data, err)
+			}
+			if bytes.Equal(data, hostBefore) {
+				t.Fatalf("%s: private settings are the host file, not a sanitized copy", provider)
+			}
+			if hostAfter, err := os.ReadFile(settings); err != nil || !bytes.Equal(hostBefore, hostAfter) {
+				t.Fatalf("%s: host settings changed: %q", provider, hostAfter)
 			}
 		}
 	}
@@ -462,19 +499,17 @@ func TestAuditFix_WorkspaceSocketsMasked(t *testing.T) {
 			t.Fatalf("workspace socket %s not masked: %v", sock, wrapped.Args)
 		}
 	}
-	if runtime.GOOS == "linux" {
-		if bwrap, err := exec.LookPath("bwrap"); err == nil && exec.Command(bwrap, "--ro-bind", "/", "/", "--", "/usr/bin/true").Run() == nil {
-			cliBwrapLookup = exec.LookPath
-			cmd := exec.Command("/bin/sh", "-c", `if test -S node_modules/p/s.sock; then echo SOCKET_VISIBLE; else echo MASKED; fi`)
-			cmd.Dir = ws
-			cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()}
-			wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if out := auditFixRunAndWaitPrivateHome(t, wrapped); !strings.Contains(out, "MASKED") {
-				t.Fatalf("socket reachable inside sandbox: %q", out)
-			}
+	if cliLiveBwrapWorks() {
+		cliBwrapLookup = exec.LookPath
+		cmd := exec.Command("/bin/sh", "-c", `if test -S node_modules/p/s.sock; then echo SOCKET_VISIBLE; else echo MASKED; fi`)
+		cmd.Dir = ws
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()}
+		wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out := auditFixRunAndWaitPrivateHome(t, wrapped); !strings.Contains(out, "MASKED") {
+			t.Fatalf("socket reachable inside sandbox: %q", out)
 		}
 	}
 }

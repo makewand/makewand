@@ -1,10 +1,19 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/spf13/cobra"
 )
+
+// TestMain drops a parent provider-worker marker. The guard itself is covered
+// by TestRefuseProviderWorkerDispatch; leaving MAKEWAND_PROVIDER_WORKER=1 set
+// makes every in-process command refuse to start.
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("MAKEWAND_PROVIDER_WORKER")
+	os.Exit(m.Run())
+}
 
 func TestRefuseProviderWorkerDispatch(t *testing.T) {
 	root := newRootCmd()
