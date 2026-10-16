@@ -1136,6 +1136,14 @@ func cliShieldProviderState(args []string, providerKey, rootPath, workspace stri
 		if strings.Contains(subPath, "..") || !strings.HasPrefix(subPath, rootPrefix) {
 			continue
 		}
+		if normKey == "gemini" && entry.subpath == cliAgyBinRel && cliAgyBinIsOverlayDir(subPath) {
+			// Writable overlay for agy's helper-script directory: a tmpfs
+			// at the directory with the shipped host files re-bound
+			// read-only, agentapi left for agy itself. It vanishes with
+			// the sandbox, so the host directory is never written.
+			args = cliShieldAgyBinDir(args, subPath)
+			continue
+		}
 		fi, err := os.Lstat(subPath)
 		if err == nil {
 			if fi.Mode()&os.ModeSymlink != 0 {

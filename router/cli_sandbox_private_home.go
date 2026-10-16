@@ -99,6 +99,59 @@ var cliAgySettingsRels = []string{
 // than the ~/.gemini files the credit guards check; agy launches drop them.
 var cliAgyConfigDirEnv = []string{"GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR"}
 
+// cliAgyBinRel is the agy helper-script directory below ~/.gemini. agy writes
+// a small script here before every run_command (BIN/agentapi), so it cannot
+// stay a read-only bind: cliShieldAgyBinDir overlays it with a tmpfs while
+// keeping the shipped host files visible read-only.
+const cliAgyBinRel = "antigravity-cli/bin"
+
+// cliAgyBinWritableEntry is the helper script agy creates itself inside
+// cliAgyBinRel. It is never bound from the host: a stale host copy stays
+// invisible and a sandboxed copy never reaches the host.
+const cliAgyBinWritableEntry = "agentapi"
+
+// cliAgyBinIsOverlayDir reports whether binPath gets the writable tmpfs
+// overlay: it is missing (an empty writable tmpfs) or a real directory. A
+// symlink or a non-directory keeps the previous read-only bind.
+func cliAgyBinIsOverlayDir(binPath string) bool {
+	fi, err := os.Lstat(binPath)
+	if err != nil {
+		return true
+	}
+	return fi.IsDir() && fi.Mode()&os.ModeSymlink == 0
+}
+
+// cliShieldAgyBinDir overlays the agy helper-script directory with a tmpfs
+// and re-binds every regular host file inside it read-only, except
+// cliAgyBinWritableEntry, which agy writes itself. Symlinks, directories and
+// other non-regular entries are never re-bound. The tmpfs dies with the
+// sandbox: host bytes and modes are unchanged and agentapi never reaches the
+// host. Callers only use it where cliAgyBinIsOverlayDir holds.
+func cliShieldAgyBinDir(args []string, binPath string) []string {
+	args = cliAppendTmpfsIfNotPresent(args, binPath)
+	entries, err := os.ReadDir(binPath)
+	if err != nil {
+		return args
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if name == cliAgyBinWritableEntry {
+			continue
+		}
+		full := filepath.Join(binPath, name)
+		fi, err := os.Lstat(full)
+		if err != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+			continue
+		}
+		args = cliAppendRoBindIfNotPresent(args, full)
+	}
+	return args
+}
+
 func cliIsAgyConfigDirEnv(key string) bool {
 	return slices.Contains(cliAgyConfigDirEnv, strings.ToUpper(key))
 }
@@ -309,7 +362,14 @@ func (h *cliPrivateHome) addAbsentProviderEntry(args []string, provider, entry, 
 	if !sanitize {
 		return args, nil
 	}
-	return h.overlayAgySanitizedSettings(args, provider, entry, privRoot, hostPath)
+	var err error
+	args, err = h.overlayAgySanitizedSettings(args, provider, entry, privRoot, hostPath)
+	if err != nil {
+		return args, err
+	}
+	// agy still needs a writable helper-script directory: an empty tmpfs at
+	// the bin path (nothing exists on the host to seed it).
+	return cliAppendTmpfsIfNotPresent(args, filepath.Join(hostPath, filepath.FromSlash(cliAgyBinRel))), nil
 }
 
 // cliMountPointCreatable reports whether bwrap can create the missing mount

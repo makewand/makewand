@@ -1565,6 +1565,54 @@ def _sanitized_agy_settings_bytes(host_path) -> bytes:
 # checked below (discovery honours the first two).
 AGY_CONFIG_DIR_ENVS = ("GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR")
 
+# agy writes a helper script below this directory before every run_command
+# (BIN/agentapi, `exec ".../agy" agentapi "$@"`). It was protected read-only
+# like every other executable path, so every sandboxed agy command failed with
+# "read-only file system". The directory is therefore overlaid with a tmpfs
+# (see _agy_bin_mount_args): shipped host files stay visible read-only, the
+# agentapi entry is left for agy itself, and everything vanishes with the
+# sandbox — the host directory is never written.
+AGY_BIN_REL = "antigravity-cli/bin"
+AGY_BIN_WRITABLE_ENTRY = "agentapi"
+
+
+def _agy_bin_mount_args(host_bin: str, sandbox_bin: str) -> List[str]:
+    """bwrap mounts for agy's writable helper-script directory.
+
+    Always overlays sandbox_bin with a tmpfs, then re-binds every regular
+    host file inside it read-only — except AGY_BIN_WRITABLE_ENTRY, which agy
+    creates itself. Symlinks, directories and other non-regular entries are
+    never re-bound, so nothing outside the host directory can be pulled in.
+    A missing host directory yields an empty writable tmpfs. A host path
+    that is a symlink or not a directory keeps the previous read-only bind.
+    """
+    if os.path.islink(host_bin):
+        # A dangling link gets no mount (as before); its target is bound
+        # read-only otherwise.
+        target = os.path.realpath(host_bin)
+        if os.path.exists(target):
+            return ["--ro-bind", target, sandbox_bin]
+        return []
+    if os.path.lexists(host_bin) and not os.path.isdir(host_bin):
+        return ["--ro-bind", host_bin, sandbox_bin]
+    args = ["--tmpfs", sandbox_bin]
+    try:
+        names = sorted(os.listdir(host_bin))
+    except OSError:
+        return args
+    for name in names:
+        if name == AGY_BIN_WRITABLE_ENTRY:
+            continue
+        full = os.path.join(host_bin, name)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        args.extend(["--ro-bind", full, os.path.join(sandbox_bin, name)])
+    return args
+
 
 def _agy_host_credits_disabled(user_home=None) -> bool:
     """True only when both host agy settings files prove useG1Credits is false.
@@ -1742,6 +1790,9 @@ class ProviderHome:
             for rel in AGY_SETTINGS_RELS:
                 dst = os.path.join(priv, rel)
                 args.extend(["--ro-bind", dst, os.path.join(root_path, rel)])
+            # agy still needs a writable helper-script directory: an empty
+            # tmpfs at the bin path (nothing exists on the host to seed it).
+            args.extend(["--tmpfs", os.path.join(root_path, AGY_BIN_REL)])
         minted = profile.get("minted_keys", {})
         for rel in rels:
             self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=os.path.join(root_path, rel),
@@ -1812,6 +1863,23 @@ class ProviderHome:
                 _write_agy_sanitized_settings(priv, real)
                 dst = os.path.join(priv, sub)
                 args.extend(["--ro-bind", dst, p])
+                continue
+            if self.provider == "agy" and sub == AGY_BIN_REL:
+                # Writable overlay for agy's helper-script directory (both
+                # read-only and writable runs use this private home): a tmpfs
+                # at the directory, shipped host files re-bound read-only,
+                # agentapi left for agy itself. The tmpfs dies with the
+                # sandbox, so the host directory keeps its bytes and modes
+                # and agentapi is never written back.
+                priv = self._private_roots.get(root_rel)
+                if priv is not None:
+                    try:
+                        os.makedirs(os.path.join(priv, os.path.dirname(sub)), mode=0o700, exist_ok=True)
+                    except OSError:
+                        pass
+                args.extend(_agy_bin_mount_args(p, p))
+                if os.path.isdir(p) and not os.path.islink(p):
+                    self.scan_roots.append(p)
                 continue
             if os.path.islink(p):
                 # dotfile-managed symlink: bind its resolved target read-only at
