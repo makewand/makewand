@@ -22,7 +22,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "bin" / "makewand"
 WORKER_ENV = "MAKEWAND_PROVIDER_WORKER"
 FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
-          "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail")
+          "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
+          " --model <模型> --effort <推理深度>")
 CANDIDATE_LINE = re.compile(
     r"^  (\d+)\. makewand (\S+) (.*) -C <目录> -f <子任务文件> --max-model-calls 1   # (.+)$"
 )
@@ -42,20 +43,28 @@ class RoutingCliTests(unittest.TestCase):
         self.missing_policy = self.base / "policy-absent"
         self.quota_file = self.base / "quota.json"
         self.missing_quota = self.base / "quota-absent.json"
+        self.stub_log = self.base / "stub.log"
 
     @property
     def routing_dir(self) -> Path:
         return self.state_home / "makewand" / "routing"
 
-    def run_cli(self, *args, quota=None, policy=None, worker=False):
+    def run_cli(self, *args, quota=None, policy=None, worker=False, extra_env=None):
         env = dict(os.environ)
         env.update({
             "HOME": str(self.home),
             "XDG_STATE_HOME": str(self.state_home),
+            "XDG_CACHE_HOME": str(self.base / "xdg-cache"),
+            "XDG_DATA_HOME": str(self.base / "xdg-data"),
+            "XDG_CONFIG_HOME": str(self.base / "xdg-config"),
             "MAKEWAND_CONFIG_DIR": str(self.base / "config"),
             "MAKEWAND_NO_DAEMON": "1",
             "MW_HUB_POLICY": str(self.policy_file if policy is not None else self.missing_policy),
+            "MAKEWAND_TEST_STUB_LOG": str(self.stub_log),
         })
+        # 路由只认这次测试写进 HOME 的缓存，不读调用者或隔离根里的目录。
+        for key in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "MUSE_DATA_DIR"):
+            env.pop(key, None)
         if policy is not None:
             self.policy_file.write_text(policy, encoding="utf-8")
         if quota is None:
@@ -66,6 +75,8 @@ class RoutingCliTests(unittest.TestCase):
         env.pop(WORKER_ENV, None)
         if worker:
             env[WORKER_ENV] = "1"
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             [sys.executable, "-I", str(LAUNCHER), *args],
             env=env, cwd=self.work, capture_output=True, text=True,
@@ -80,7 +91,7 @@ class RoutingCliTests(unittest.TestCase):
     # ---------- route 文本输出 ----------
 
     def test_route_text_format(self):
-        result = self.run_cli("route", "implement", "mechanical", quota={})
+        result = self.run_cli("route", "implement", "mechanical", "--simple", quota={})
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
         self.assertEqual(
@@ -96,6 +107,7 @@ class RoutingCliTests(unittest.TestCase):
         self.assertNotIn("跳过：", result.stdout)
         self.assertIn("验收不过就升一档：makewand route implement mechanical --tier 2", lines)
         self.assertEqual(lines[-1], FOOTER)
+        self.assertNotIn("还有", result.stdout)
         # route 只读：不写成绩和标记文件。
         self.assertFalse((self.routing_dir / "outcomes.jsonl").exists())
         self.assertFalse((self.routing_dir / "marks.json").exists())
@@ -129,33 +141,33 @@ class RoutingCliTests(unittest.TestCase):
         self.assertEqual(payload["budget"], 7)
 
     def test_route_self_goes_last(self):
-        result = self.run_cli("route", "implement", "mechanical", "--self", "agy", quota={})
+        result = self.run_cli("route", "implement", "mechanical", "--self", "agy", "--simple", quota={})
         self.assertEqual(result.returncode, 0, result.stderr)
         candidates = [line for line in result.stdout.splitlines() if CANDIDATE_LINE.match(line)]
         self.assertIn(" agy ", candidates[-1])
         self.assertTrue(candidates[-1].endswith("（和你同一家，尽量不用）"))
         for line in candidates[:-1]:
             self.assertNotIn("和你同一家", line)
-        payload = self.route_json("implement", "mechanical", "--self", "claude", quota={})
+        payload = self.route_json("implement", "mechanical", "--self", "claude", "--simple", quota={})
         self.assertEqual(payload["candidates"][-1]["provider"], "claude")
         self.assertTrue(payload["candidates"][-1]["is_self"])
         self.assertTrue(all(not item["is_self"] for item in payload["candidates"][:-1]))
 
     def test_route_not_skips_same_family(self):
-        result = self.run_cli("route", "implement", "mechanical", "--not", "codex", quota={})
+        result = self.run_cli("route", "implement", "mechanical", "--not", "codex", "--simple", quota={})
         self.assertEqual(result.returncode, 0, result.stderr)
         providers = [CANDIDATE_LINE.match(line).group(2)
                      for line in result.stdout.splitlines() if CANDIDATE_LINE.match(line)]
         self.assertNotIn("codex", providers)
         self.assertIn("跳过：codex（与 codex 同属 openai 家族）", result.stdout)
-        payload = self.route_json("implement", "mechanical", "--not", "claude", quota={})
+        payload = self.route_json("implement", "mechanical", "--not", "claude", "--simple", quota={})
         self.assertEqual(payload["skipped"],
                          [{"provider": "claude", "reason": "与 claude 同属 anthropic 家族"}])
 
     # ---------- route 的 --json ----------
 
     def test_route_json_structure(self):
-        payload = self.route_json("implement", "mechanical", quota={})
+        payload = self.route_json("implement", "mechanical", "--simple", quota={})
         self.assertEqual(payload["tier"], 1)
         self.assertEqual(payload["escalate_tier"], 2)
         self.assertEqual(payload["budget"], 3)
@@ -164,12 +176,15 @@ class RoutingCliTests(unittest.TestCase):
         for item in payload["candidates"]:
             self.assertIsInstance(item["args"], list)
             self.assertIsInstance(item["is_self"], bool)
+            self.assertIsNone(item["model"])
+            self.assertIsNone(item["effort"])
+            self.assertIsNone(item["candidate_id"])
             self.assertEqual(
                 item["command"],
                 f"makewand {item['provider']} {' '.join(item['args'])}"
                 " -C <目录> -f <子任务文件> --max-model-calls 1",
             )
-        strong = self.route_json("review", "hard", quota={})
+        strong = self.route_json("review", "hard", "--simple", quota={})
         self.assertEqual(strong["tier"], 3)
         self.assertIsNone(strong["escalate_tier"])
 
@@ -186,14 +201,14 @@ class RoutingCliTests(unittest.TestCase):
         self.assertNotIn("跳过：", expired.stdout)
 
     def test_route_quota_over_threshold(self):
-        over = self.run_cli("route", "implement", "mechanical",
+        over = self.run_cli("route", "implement", "mechanical", "--simple",
                             quota={"codex": [95, "10-20 15:04"], "claude": [10, ""]})
         self.assertEqual(over.returncode, 0, over.stderr)
         self.assertIn("跳过：codex（周额度已用 95%，达到阈值 90%（10-20 15:04））", over.stdout)
-        under = self.run_cli("route", "implement", "mechanical",
+        under = self.run_cli("route", "implement", "mechanical", "--simple",
                              quota={"codex": [10, ""], "claude": [84, ""]})
         self.assertNotIn("跳过：", under.stdout)
-        payload = self.route_json("implement", "mechanical",
+        payload = self.route_json("implement", "mechanical", "--simple",
                                   quota={"claude": [91, "10-18 20:00"]})
         self.assertEqual([item["provider"] for item in payload["skipped"]], ["claude"])
 
@@ -204,13 +219,13 @@ class RoutingCliTests(unittest.TestCase):
 
     def test_route_no_candidates(self):
         paused_all = 'PAUSED="agy:2099-01-01T00:00 codex:2099-01-01T00:00 grok:2099-01-01T00:00 claude:2099-01-01T00:00"\n'
-        result = self.run_cli("route", "implement", "mechanical", quota={}, policy=paused_all)
+        result = self.run_cli("route", "implement", "mechanical", "--simple", quota={}, policy=paused_all)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("没有可用候选", result.stdout)
         self.assertIn("验收不过就升一档：makewand route implement mechanical --tier 2",
                       result.stdout.splitlines())
         top = 'PAUSED="codex:2099-01-01T00:00 agy:2099-01-01T00:00 claude:2099-01-01T00:00 grok:2099-01-01T00:00"\n'
-        strong = self.run_cli("route", "review", "hard", quota={}, policy=top)
+        strong = self.run_cli("route", "review", "hard", "--simple", quota={}, policy=top)
         self.assertIn("没有可用候选", strong.stdout)
         self.assertIn("后再试", strong.stdout)
         self.assertNotIn("验收不过就升一档", strong.stdout)
@@ -310,16 +325,238 @@ class RoutingCliTests(unittest.TestCase):
                 if hint:
                     self.assertIn(hint, result.stderr)
 
+    def write_discovery_cache(self):
+        """把只有这次测试才有的模型写进 discovery 会读的本地缓存。"""
+        codex = self.home / ".codex" / "models_cache.json"
+        codex.parent.mkdir(parents=True)
+        codex.write_text(json.dumps({"models": [
+            {"slug": "gpt-6-luna-fixture", "visibility": "list",
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+            {"slug": "gpt-5.6", "visibility": "list",
+             "supported_reasoning_levels": [{"effort": "low"}]},
+        ]}), encoding="utf-8")
+        agy = self.home / ".cache" / "makewand" / "agy_models_cache.json"
+        agy.parent.mkdir(parents=True)
+        agy.write_text(json.dumps({"updated_at": 0, "models": [
+            {"id": "gemini-4-flash-low", "description": "Flash low"},
+            {"id": "gemini-4-flash-high", "description": "Flash high"},
+            {"id": "gemini-3.8-flash-medium", "description": "legacy flash"},
+        ]}), encoding="utf-8")
+
+    def stub_lines(self):
+        if not self.stub_log.exists():
+            return []
+        return [line for line in self.stub_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def assert_full_candidate_line(self, line):
+        match = CANDIDATE_LINE.match(line)
+        self.assertIsNotNone(match, line)
+        provider, args, label = match.group(2), match.group(3), match.group(4)
+        self.assertIn(provider, label)
+        self.assertIn("--model ", args)
+        model = args.split("--model ", 1)[1].split()[0]
+        self.assertIn(model, label)
+        if provider == "agy":
+            self.assertNotIn("--effort", args)
+            self.assertIn("-", model)
+            effort = model.rsplit("-", 1)[-1]
+        else:
+            self.assertIn("--effort ", args)
+            effort = args.split("--effort ", 1)[1].split()[0]
+        self.assertIn(effort, label)
+        return provider, model, effort
+
+    # ---------- 完整目录 ----------
+
+    def test_route_default_uses_discovery_cache_not_the_network(self):
+        self.write_discovery_cache()
+        payload = self.route_json("implement", "mechanical", quota={})
+        self.assertEqual(payload["tier"], 1)
+        ids = {item["candidate_id"] for item in payload["candidates"]}
+        self.assertIn("codex/gpt-6-luna-fixture/low", ids)
+        self.assertIn("codex/gpt-6-luna-fixture/high", ids)
+        self.assertNotIn("codex/gpt-6-luna/low", ids)
+        self.assertNotIn("codex/gpt-5.6/low", ids)
+        self.assertIn("agy/gemini-4-flash-low/low", ids)
+        self.assertNotIn("agy/gemini-4-argon-low/low", ids)
+        self.assertNotIn("agy/gemini-3.8-flash-medium/medium", ids)
+        self.assertNotIn("agy/gemini-4-flash-high/high", ids)
+        agy = next(item for item in payload["candidates"]
+                   if item["candidate_id"] == "agy/gemini-4-flash-low/low")
+        self.assertEqual(agy["provider"], "agy")
+        self.assertEqual(agy["model"], "gemini-4-flash-low")
+        self.assertEqual(agy["effort"], "low")
+        self.assertEqual(agy["args"], ["--model", "gemini-4-flash-low"])
+        codex = next(item for item in payload["candidates"]
+                     if item["candidate_id"] == "codex/gpt-6-luna-fixture/low")
+        self.assertEqual(codex["model"], "gpt-6-luna-fixture")
+        self.assertEqual(codex["effort"], "low")
+        self.assertEqual(codex["args"], ["--model", "gpt-6-luna-fixture", "--effort", "low"])
+        for item in payload["candidates"]:
+            self.assertEqual(item["candidate_id"], f"{item['provider']}/{item['model']}/{item['effort']}")
+            self.assertIn("--model", item["command"])
+        self.assertFalse(any(line.split()[0] == "agy" for line in self.stub_lines()), self.stub_lines())
+
+    def test_route_simple_keeps_the_slim_table_when_a_cache_exists(self):
+        self.write_discovery_cache()
+        result = self.run_cli("route", "implement", "mechanical", "--simple", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidates = [line for line in result.stdout.splitlines() if CANDIDATE_LINE.match(line)]
+        self.assertEqual(len(candidates), 4)
+        self.assertIn("--model gemini-3.8-flash-medium", result.stdout)
+        self.assertNotIn("gpt-6-luna-fixture", result.stdout)
+        self.assertNotIn("gemini-4-flash-low", result.stdout)
+        self.assertNotIn("还有", result.stdout)
+        self.assertEqual(result.stdout.splitlines()[-1], FOOTER)
+        both = self.run_cli("route", "implement", "mechanical", "--simple", "--legacy", quota={})
+        self.assertEqual(both.returncode, 0, both.stderr)
+
+        def commands(stdout):
+            found = set()
+            for line in stdout.splitlines():
+                match = CANDIDATE_LINE.match(line)
+                if match:
+                    found.add(match.group(2) + " " + match.group(3))
+            return found
+
+        self.assertEqual(commands(result.stdout), commands(both.stdout))
+
+    def test_route_legacy_includes_old_models_from_the_cache(self):
+        self.write_discovery_cache()
+        payload = self.route_json("implement", "mechanical", "--legacy", quota={})
+        ids = {item["candidate_id"] for item in payload["candidates"]}
+        self.assertIn("codex/gpt-5.6/low", ids)
+        self.assertIn("agy/gemini-3.8-flash-medium/medium", ids)
+        old = next(item for item in payload["candidates"]
+                   if item["candidate_id"] == "agy/gemini-3.8-flash-medium/medium")
+        self.assertEqual(old["args"], ["--model", "gemini-3.8-flash-medium"])
+        self.assertNotIn("--effort", old["args"])
+        self.assertEqual(old["effort"], "medium")
+
+    def test_route_text_lists_five_and_points_at_json_for_the_rest(self):
+        result = self.run_cli("route", "implement", "mechanical", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shown = [line for line in result.stdout.splitlines() if CANDIDATE_LINE.match(line)]
+        self.assertEqual(len(shown), 5)
+        for line in shown:
+            self.assert_full_candidate_line(line)
+        payload = self.route_json("implement", "mechanical", quota={})
+        hidden = len(payload["candidates"]) - 5
+        self.assertGreater(hidden, 0)
+        self.assertIn(f"还有 {hidden} 个，用 --json 看全部", result.stdout)
+        self.assertEqual(result.stdout.count("还有"), 1)
+        self.assertGreater(len(payload["candidates"]), 5)
+        self.assertEqual(result.stdout.splitlines()[-1], FOOTER)
+        self.assertFalse(any(line.split()[0] == "agy" for line in self.stub_lines()), self.stub_lines())
+
+    def test_outcome_model_and_effort_are_visible_to_candidate_stats(self):
+        from makewand.outcome_ledger import OutcomeLedger
+
+        passed = self.run_cli(
+            "outcome", "codex", "2", "implement", "pass",
+            "--model", "gpt-6.1-sol", "--effort", "medium",
+            "--seconds", "4", "--calls", "1", quota={},
+        )
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertIn("model=gpt-6.1-sol", passed.stdout)
+        self.assertIn("effort=medium", passed.stdout)
+        failed = self.run_cli(
+            "outcome", "codex", "2", "implement", "fail",
+            "--model", "gpt-6-astra", "--effort", "high", quota={},
+        )
+        self.assertEqual(failed.returncode, 0, failed.stderr)
+        ledger = OutcomeLedger(self.routing_dir)
+        sol = ledger.stats("codex", 2, "implement", model="gpt-6.1-sol", effort="medium")
+        self.assertEqual(sol.count, 1)
+        self.assertGreater(sol.alpha, 1.9)
+        self.assertAlmostEqual(sol.avg_seconds, 4.0, delta=0.5)
+        astra = ledger.stats("codex", 2, "implement", model="gpt-6-astra", effort="high")
+        self.assertEqual(astra.count, 1)
+        self.assertGreater(astra.beta, 1.9)
+        self.assertEqual(ledger.stats("codex", 2, "implement").count, 2)
+        self.assertEqual(ledger.stats("codex", 2, "implement", model="gpt-6.1-sol").count, 1)
+        rows = [json.loads(line) for line in
+                (self.routing_dir / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[0]["model"], "gpt-6.1-sol")
+        self.assertEqual(rows[0]["effort"], "medium")
+        self.assertEqual(rows[1]["model"], "gpt-6-astra")
+        self.assertEqual(rows[1]["effort"], "high")
+
+    def test_models_refresh_calls_explicit_refresh_with_fake_runner(self):
+        import io
+        import time
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import makewand.cli as cli
+        import makewand.discovery as discovery
+
+        cache = self.home / ".cache" / "makewand" / "agy_models_cache.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text(json.dumps({
+            "updated_at": time.time(),
+            "models": [{"id": "gemini-3-old", "description": "old"}],
+        }), encoding="utf-8")
+        self.assertGreater(cache.stat().st_size, 30)
+        marker = cache.with_name(cache.name + ".attempt")
+        state = discovery._agy_cache_state(cache)
+        marker.write_text(state, encoding="utf-8")
+        discovery._AGY_FAILED_REFRESHES[str(cache)] = (time.monotonic(), state)
+        self.addCleanup(discovery._AGY_FAILED_REFRESHES.pop, str(cache), None)
+
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((list(argv), kwargs.get("timeout")))
+            return SimpleNamespace(
+                returncode=0,
+                stdout="gemini-4-argon-high\tGemini 4 Argon (High)\n",
+            )
+
+        real = discovery.refresh_agy_models_cache
+
+        def spy(*args, **kwargs):
+            self.assertIsNone(kwargs.get("runner"))
+            self.assertEqual(kwargs.get("timeout"), discovery.AGY_MODELS_REFRESH_TIMEOUT_SECONDS)
+            forwarded = dict(kwargs)
+            forwarded["runner"] = runner
+            return real(*args, **forwarded)
+
+        env = {
+            "HOME": str(self.home),
+            "MAKEWAND_CONFIG_DIR": str(self.base / "config"),
+            "XDG_DATA_HOME": str(self.base / "xdg-data"),
+            "XDG_CACHE_HOME": str(self.base / "xdg-cache"),
+            "MAKEWAND_TEST_STUB_LOG": str(self.stub_log),
+        }
+        with patch.dict(os.environ, env, clear=False), \
+             patch("makewand.discovery.refresh_agy_models_cache", side_effect=spy) as refresh, \
+             redirect_stdout(io.StringIO()) as captured:
+            cli.cmd_models(SimpleNamespace(refresh=True))
+
+        refresh.assert_called_once()
+        self.assertEqual(calls, [(["agy", "models"], discovery.AGY_MODELS_REFRESH_TIMEOUT_SECONDS)])
+        self.assertEqual(discovery.AGY_MODELS_REFRESH_TIMEOUT_SECONDS, 60.0)
+        stored = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertEqual([item["id"] for item in stored["models"]], ["gemini-4-argon-high"])
+        self.assertFalse(marker.exists())
+        self.assertNotIn(str(cache), discovery._AGY_FAILED_REFRESHES)
+        self.assertIn("gemini-4-argon-high", captured.getvalue())
+        self.assertNotIn("gemini-3-old", captured.getvalue())
+        self.assertFalse(any(line.split()[0] == "agy" for line in self.stub_lines()), self.stub_lines())
+
     # ---------- worker 拒绝与帮助 ----------
 
     def test_worker_environment_refuses_all_three(self):
         import makewand.cli as cli
 
-        for name in ("route", "mark", "outcome"):
+        for name in ("route", "mark", "outcome", "models"):
             self.assertNotIn(name, cli.WORKER_SAFE_SUBCOMMANDS)
         for args in (("route", "implement", "mechanical"),
                      ("mark", "codex", "6h"),
-                     ("outcome", "codex", "1", "implement", "pass")):
+                     ("outcome", "codex", "1", "implement", "pass"),
+                     ("models", "--refresh")):
             with self.subTest(args=args):
                 result = self.run_cli(*args, quota={}, worker=True)
                 self.assertEqual(result.returncode, 2, result.stdout)
@@ -330,6 +567,17 @@ class RoutingCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in ("route", "mark", "outcome"):
             self.assertIn(name, result.stdout)
+        route_help = self.run_cli("route", "--help")
+        self.assertEqual(route_help.returncode, 0, route_help.stderr)
+        self.assertIn("--simple", route_help.stdout)
+        self.assertIn("--legacy", route_help.stdout)
+        outcome_help = self.run_cli("outcome", "--help")
+        self.assertEqual(outcome_help.returncode, 0, outcome_help.stderr)
+        self.assertIn("--model", outcome_help.stdout)
+        self.assertIn("--effort", outcome_help.stdout)
+        models_help = self.run_cli("models", "--help")
+        self.assertEqual(models_help.returncode, 0, models_help.stderr)
+        self.assertIn("--refresh", models_help.stdout)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
 """route / mark / outcome 子命令的实现。
 
-- ``route`` 只读账本和策略，给出这一档的派活命令，不写状态，不调用模型；
+- ``route`` 默认在完整目录里选（``select(full=True)``）。候选来自 discovery
+  已经落盘的缓存，不跑 ``agy models``，也不写状态、不调用模型。
+  ``--simple`` 退回精简三档表；``--legacy`` 把旧版本模型纳入完整目录的排序。
+  文本最多列这一档的前 5 个候选。
 - ``mark`` 把一家工具标记为额度受限，到期前路由跳过它；
 - ``outcome`` 追加一条验收成绩，供之后的 Thompson 采样使用。
+  ``--model`` / ``--effort`` 可选，写进账本后按候选统计。
 
 额度默认走 route_select 的官方读取。环境变量 MAKEWAND_ROUTE_QUOTA_FILE
 指向一个 JSON 文件时改用文件内容，格式如
@@ -34,6 +38,11 @@ __all__ = [
 
 EXIT_USAGE_ERROR = 2
 _QUOTA_FILE_ENV = "MAKEWAND_ROUTE_QUOTA_FILE"
+_TEXT_CANDIDATE_LIMIT = 5
+_OUTCOME_HINT = (
+    "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
+    " --model <模型> --effort <推理深度>"
+)
 _DURATION_PART = re.compile(r"(\d+)([dhms])")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 _UNIT_ORDER = {"d": 0, "h": 1, "m": 2, "s": 3}
@@ -136,6 +145,19 @@ def _command_for(candidate) -> str:
     return " ".join(parts)
 
 
+def _candidate_payload(item) -> dict:
+    return {
+        "provider": item.provider,
+        "model": item.model,
+        "effort": item.effort,
+        "candidate_id": item.candidate_id,
+        "args": list(item.args),
+        "label": item.label,
+        "is_self": bool(item.is_self),
+        "command": _command_for(item),
+    }
+
+
 def cmd_route(args) -> None:
     task_type = args.task_type
     difficulty = args.difficulty
@@ -148,6 +170,7 @@ def cmd_route(args) -> None:
             self_tool = _validate_provider(self_tool)
         except ValueError as error:
             _fail(f"错误：--self {error}")
+    simple = bool(getattr(args, "simple", False))
     try:
         policy = load_policy()
         result = select(
@@ -160,6 +183,8 @@ def cmd_route(args) -> None:
             policy=policy,
             quota_reader=_quota_reader_from_env(),
             ledger=OutcomeLedger(),
+            full=not simple,
+            include_legacy=bool(getattr(args, "legacy", False)) and not simple,
         )
     except ValueError as error:
         _fail(f"错误：{error}")
@@ -168,16 +193,7 @@ def cmd_route(args) -> None:
     if getattr(args, "json", False):
         payload = {
             "tier": result.tier,
-            "candidates": [
-                {
-                    "provider": item.provider,
-                    "args": list(item.args),
-                    "label": item.label,
-                    "is_self": bool(item.is_self),
-                    "command": _command_for(item),
-                }
-                for item in result.candidates
-            ],
+            "candidates": [_candidate_payload(item) for item in result.candidates],
             "skipped": [
                 {"provider": provider, "reason": reason}
                 for provider, reason in result.skipped
@@ -188,15 +204,22 @@ def cmd_route(args) -> None:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
+    shown = result.candidates
+    hidden = 0
+    if len(shown) > _TEXT_CANDIDATE_LIMIT:
+        hidden = len(shown) - _TEXT_CANDIDATE_LIMIT
+        shown = shown[:_TEXT_CANDIDATE_LIMIT]
     lines = [
         f"子任务：{task_type} / {difficulty} → 第 {result.tier} 档"
         f"（1 便宜快，3 强且推理深）；每个请求默认最多 {budget} 次调用"
     ]
-    for index, item in enumerate(result.candidates, 1):
+    for index, item in enumerate(shown, 1):
         line = f"  {index}. {_command_for(item)}   # {item.label}"
         if item.is_self:
             line += "（和你同一家，尽量不用）"
         lines.append(line)
+    if hidden:
+        lines.append(f"  还有 {hidden} 个，用 --json 看全部")
     if result.skipped:
         skipped = "；".join(f"{provider}（{reason}）" for provider, reason in result.skipped)
         lines.append(f"  跳过：{skipped}")
@@ -211,7 +234,7 @@ def cmd_route(args) -> None:
         )
     lines.append(
         "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
-        "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
+        + _OUTCOME_HINT
     )
     print("\n".join(lines))
 
@@ -245,8 +268,16 @@ def cmd_outcome(args) -> None:
         calls = getattr(args, "calls", None)
         if calls is not None and calls < 0:
             raise ValueError("invalid --calls: must be a non-negative integer")
+        model = getattr(args, "model", None)
+        effort = getattr(args, "effort", None)
+        passed = args.result == "pass"
+        OutcomeLedger().record(
+            provider, tier, task_type, passed,
+            seconds=seconds, calls=calls, model=model, effort=effort,
+        )
     except ValueError as error:
         _fail(f"错误：{error}")
-    passed = args.result == "pass"
-    OutcomeLedger().record(provider, tier, task_type, passed, seconds=seconds, calls=calls)
-    print(f"已记录：{provider} 第 {tier} 档 {task_type} {args.result}")
+    detail = ""
+    if model or effort:
+        detail = f"（model={model or '-'} effort={effort or '-'}）"
+    print(f"已记录：{provider} 第 {tier} 档 {task_type} {args.result}{detail}")
