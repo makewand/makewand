@@ -41,7 +41,7 @@ __all__ = [
     "DEFAULT_CODEX_MAX_WEEKLY",
     "DEFAULT_REQUEST_BUDGET",
     "HALF_LIFE_DAYS",
-    "QUOTA_ARGV",
+    "quota_argv",
     "QUOTA_TIMEOUT_SECONDS",
     "Pause",
     "Policy",
@@ -61,8 +61,8 @@ HALF_LIFE_DAYS = 14
 # Sample weight runs from 1.0 for the cheapest catalog position down to 1 - spread for the last.
 COST_WEIGHT_SPREAD = 0.2
 
-# 与现有 mw-hub 相同的官方额度命令。文件不存在、超时或输出不可用时当作没有数据。
-QUOTA_ARGV = ("/mnt/data/makewand/bin/makewand-server", "quota")
+# 官方额度命令是已安装 Go 组件的 `quota` 子命令（与 cli._find_go_binary 同样查找）。
+# 找不到组件、超时或输出不可用时当作没有数据。
 QUOTA_TIMEOUT_SECONDS = 60
 
 _QUOTA_PROVIDERS = ("codex", "claude")
@@ -211,11 +211,21 @@ def _header_provider(line: str) -> Optional[str]:
     return match.group(1).strip().lower()
 
 
+def quota_argv():
+    """官方额度命令的 argv；找不到 Go 组件时返回 None。"""
+    from makewand.cli import _find_go_binary
+    binary = _find_go_binary()
+    return (binary, "quota") if binary else None
+
+
 def default_quota_reader() -> dict:
     """运行官方 quota 命令并解析。失败时返回空 dict，不抛异常。"""
+    argv = quota_argv()
+    if argv is None:
+        return {}
     try:
         completed = subprocess.run(
-            QUOTA_ARGV,
+            argv,
             capture_output=True,
             text=True,
             encoding="utf-8",

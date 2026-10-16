@@ -562,6 +562,9 @@ func TestAgyHostExecWithoutBwrapNeedsCreditsOff(t *testing.T) {
 // With bubblewrap but no usable HOME there is no private home to hold the
 // sanitized settings, so agy must not start.
 func TestAgySandboxRefusedWithoutMountedSettings(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("private provider homes are part of the Linux bubblewrap mount plan")
+	}
 	auditFixMockBwrap(t)
 	workspace := t.TempDir()
 	for _, home := range []string{"/", ""} {
@@ -583,8 +586,8 @@ func TestAgySandboxRefusedWithoutMountedSettings(t *testing.T) {
 // credit guards check, so agy launches drop them and keep other keys.
 func TestAgyLaunchDropsConfigDirEnv(t *testing.T) {
 	env := []string{
-		"PATH=/usr/bin", "HOME=/home/u", "GEMINI_API_KEY=k", "GOOGLE_CLOUD_PROJECT=p",
-		"GEMINI_CONFIG_DIR=/home/u/alt", "AGY_CONFIG_DIR=/home/u/alt", "antigravity_config_dir=/home/u/alt",
+		"PATH=/usr/bin", "HOME=/home/alice", "GEMINI_API_KEY=k", "GOOGLE_CLOUD_PROJECT=p",
+		"GEMINI_CONFIG_DIR=/home/alice/alt", "AGY_CONFIG_DIR=/home/alice/alt", "antigravity_config_dir=/home/alice/alt",
 	}
 	for _, provider := range []string{"agy", "gemini", "antigravity", "agy-cli"} {
 		got := strings.Join(sanitizeCLIEnv(provider, env), "\n")
@@ -593,7 +596,7 @@ func TestAgyLaunchDropsConfigDirEnv(t *testing.T) {
 				t.Fatalf("%s kept %s: %q", provider, dropped, got)
 			}
 		}
-		for _, kept := range []string{"GEMINI_API_KEY=k", "GOOGLE_CLOUD_PROJECT=p", "HOME=/home/u"} {
+		for _, kept := range []string{"GEMINI_API_KEY=k", "GOOGLE_CLOUD_PROJECT=p", "HOME=/home/alice"} {
 			if !strings.Contains(got, kept) {
 				t.Fatalf("%s dropped %s: %q", provider, kept, got)
 			}

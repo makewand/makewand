@@ -19,7 +19,6 @@ from unittest.mock import patch
 from makewand.outcome_ledger import OutcomeLedger
 from makewand.route_select import (
     COST_WEIGHT_SPREAD,
-    QUOTA_ARGV,
     QUOTA_TIMEOUT_SECONDS,
     Pause,
     Policy,
@@ -29,10 +28,12 @@ from makewand.route_select import (
     default_quota_reader,
     load_policy,
     parse_quota_text,
+    quota_argv as _REAL_QUOTA_ARGV,
     select,
 )
 from makewand.routing_catalog import candidates, starting_tier
 
+FAKE_QUOTA_ARGV = ("/opt/makewand/bin/makewand-server", "quota")
 _BAR = "\u2500\u2500"
 _QUOTA_SAMPLE = f"""{_BAR} agy
    subscription: signed in (no usage percentage available)
@@ -202,24 +203,42 @@ class QuotaTextTests(unittest.TestCase):
         first_only = f"{_BAR} codex\n   weekly      10% used\n   weekly      99% used  (resets 01-01 00:00)\n"
         self.assertEqual(parse_quota_text(first_only), {"codex": (10.0, "")})
 
+    def setUp(self):
+        argv = patch("makewand.route_select.quota_argv", return_value=FAKE_QUOTA_ARGV)
+        argv.start()
+        self.addCleanup(argv.stop)
+
+    def test_quota_argv_uses_the_installed_go_component(self):
+        # setUp replaces route_select.quota_argv; _REAL_QUOTA_ARGV is the real one.
+        with patch("makewand.cli._find_go_binary", return_value="/opt/mw/bin/makewand-server"):
+            self.assertEqual(_REAL_QUOTA_ARGV(), ("/opt/mw/bin/makewand-server", "quota"))
+        with patch("makewand.cli._find_go_binary", return_value=None):
+            self.assertIsNone(_REAL_QUOTA_ARGV())
+
+    def test_default_reader_runs_nothing_without_the_go_component(self):
+        with patch("makewand.route_select.quota_argv", return_value=None), \
+                patch("makewand.route_select.subprocess.run") as run:
+            self.assertEqual(default_quota_reader(), {})
+        run.assert_not_called()
+
     def test_default_reader_returns_empty_when_the_command_fails(self):
         with patch("makewand.route_select.subprocess.run", side_effect=FileNotFoundError("missing")):
             self.assertEqual(default_quota_reader(), {})
-        timeout = subprocess.TimeoutExpired(QUOTA_ARGV, QUOTA_TIMEOUT_SECONDS)
+        timeout = subprocess.TimeoutExpired(FAKE_QUOTA_ARGV, QUOTA_TIMEOUT_SECONDS)
         with patch("makewand.route_select.subprocess.run", side_effect=timeout):
             self.assertEqual(default_quota_reader(), {})
         with patch("makewand.route_select.subprocess.run", side_effect=OSError("boom")):
             self.assertEqual(default_quota_reader(), {})
-        garbage = subprocess.CompletedProcess(QUOTA_ARGV, 1, stdout="not quota output", stderr="err")
+        garbage = subprocess.CompletedProcess(FAKE_QUOTA_ARGV, 1, stdout="not quota output", stderr="err")
         with patch("makewand.route_select.subprocess.run", return_value=garbage) as run:
             self.assertEqual(default_quota_reader(), {})
         argv, kwargs = run.call_args
-        self.assertEqual(tuple(argv[0]), QUOTA_ARGV)
+        self.assertEqual(tuple(argv[0]), FAKE_QUOTA_ARGV)
         self.assertEqual(kwargs["timeout"], QUOTA_TIMEOUT_SECONDS)
         self.assertFalse(kwargs["check"])
 
     def test_default_reader_parses_stdout(self):
-        completed = subprocess.CompletedProcess(QUOTA_ARGV, 0, stdout=_QUOTA_SAMPLE, stderr="")
+        completed = subprocess.CompletedProcess(FAKE_QUOTA_ARGV, 0, stdout=_QUOTA_SAMPLE, stderr="")
         with patch("makewand.route_select.subprocess.run", return_value=completed):
             parsed = default_quota_reader()
         self.assertEqual(parsed["codex"], (91.0, "resets 10-21 08:00"))
@@ -341,8 +360,9 @@ class SelectTests(unittest.TestCase):
         self.assertEqual(garbage.skipped, [])
 
         stdout = f"{_BAR} codex\n   weekly      95% used  (resets 10-20 15:04)\n{_BAR} claude\n   weekly      10% used\n"
-        completed = subprocess.CompletedProcess(QUOTA_ARGV, 0, stdout=stdout, stderr="")
-        with patch("makewand.route_select.subprocess.run", return_value=completed) as run:
+        completed = subprocess.CompletedProcess(FAKE_QUOTA_ARGV, 0, stdout=stdout, stderr="")
+        with patch("makewand.route_select.quota_argv", return_value=FAKE_QUOTA_ARGV), \
+                patch("makewand.route_select.subprocess.run", return_value=completed) as run:
             wired = self._select(quota_reader=None)
         self.assertTrue(run.called)
         self.assertEqual(
