@@ -95,6 +95,37 @@ var cliAgySettingsRels = []string{
 	"antigravity-cli/settings.json",
 }
 
+// cliAgyConfigDirEnv are variables that could point agy at settings other
+// than the ~/.gemini files the credit guards check; agy launches drop them.
+var cliAgyConfigDirEnv = []string{"GEMINI_CONFIG_DIR", "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR"}
+
+func cliIsAgyConfigDirEnv(key string) bool {
+	return slices.Contains(cliAgyConfigDirEnv, strings.ToUpper(key))
+}
+
+// cliCommandRunsAgy reports whether cmd starts an agy binary under any
+// provider name (a custom provider may wrap it), matching Python's
+// first-argv detection: agy, gemini or antigravity, optionally followed by
+// "-" or "." and a suffix such as .exe.
+func cliCommandRunsAgy(cmd *exec.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	names := []string{cmd.Path}
+	if len(cmd.Args) > 0 {
+		names = append(names, cmd.Args[0])
+	}
+	for _, name := range names {
+		base := strings.ToLower(filepath.Base(strings.ReplaceAll(name, `\`, "/")))
+		for _, bin := range []string{"agy", "gemini", "antigravity"} {
+			if base == bin || strings.HasPrefix(base, bin+"-") || strings.HasPrefix(base, bin+".") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // cliPrivateFileEntries are top-level credential files copied into the
 // private home without write-back. ~/.claude.json mixes account metadata with
 // MCP server and per-project trust configuration, so sandbox edits to it must
@@ -411,7 +442,9 @@ func (h *cliPrivateHome) overlayAgySanitizedSettings(args []string, provider, en
 // unreadable or unproven file could let agy spend G1 credits.
 func cliAgyHostCreditsDisabled(childEnv []string) error {
 	var homes []string
-	if h := cliEnvValue(childEnv, "HOME"); h != "" {
+	// A non-absolute HOME (Git Bash's /c/Users/u on Windows, or a relative
+	// value) is not a directory agy reads; os.UserHomeDir covers that case.
+	if h := cliEnvValue(childEnv, "HOME"); h != "" && filepath.IsAbs(h) {
 		homes = append(homes, filepath.Clean(h))
 	}
 	if h, err := os.UserHomeDir(); err == nil && h != "" && !slices.Contains(homes, filepath.Clean(h)) {
@@ -425,7 +458,7 @@ func cliAgyHostCreditsDisabled(childEnv []string) error {
 			path := filepath.Join(home, ".gemini", filepath.FromSlash(rel))
 			raw, ok := cliReadAgyHostSettings(path)
 			if !ok {
-				return fmt.Errorf("%s is missing or unreadable", path)
+				return fmt.Errorf("%s is missing, unreadable, empty or larger than %d MiB", path, cliPrivateCredMaxBytes>>20)
 			}
 			obj, ok := cliParseAgySettingsObject(raw)
 			if !ok {
