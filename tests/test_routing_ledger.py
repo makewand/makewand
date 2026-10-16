@@ -282,6 +282,7 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.stats("codex", 1, "implement", now=100).count, 1)
         self.assertTrue(self.ledger.outcomes_path.read_bytes().endswith(b"\n"))
 
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "needs the fork start method")
     def test_two_processes_append_four_hundred_intact_lines(self):
         directory = self.ledger.directory
         ctx = multiprocessing.get_context("fork")

@@ -2904,6 +2904,9 @@ def provider_sandbox_launch(
         # which does not exist on Windows.
         yield ProviderLaunch(list(cmd), (), False, source, env={PROVIDER_WORKER_ENV: "1"})
         return
+    if _is_agy_provider(provider) and extra_env:
+        # Never point agy away from the sanitized ~/.gemini settings.
+        extra_env = {k: v for k, v in extra_env.items() if k.upper() not in AGY_CONFIG_DIR_ENVS}
     with seccomp_filter_context(enabled=True) as (seccomp_fd, pass_fds):
         with provider_home_session(provider, [cwd, repo_root or ""]) as home:
             exec_cmd = wrap_bwrap(

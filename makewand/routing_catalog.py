@@ -383,6 +383,9 @@ def _parse_candidate(item, where: str) -> TierCandidate:
 # Effort bands used by the tier table. Order is also the canonical listing order.
 _EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_COST = {name: index for index, name in enumerate(_EFFORT_ORDER)}
+# The efforts `makewand <provider> --effort` and `makewand outcome --effort` accept.
+# A discovered "none"/"minimal" would produce a command the CLI rejects.
+_CLI_EFFORTS = frozenset(("low", "medium", "high", "xhigh", "max", "ultra"))
 _LOW_BAND = {"none", "minimal", "low"}
 _HIGH_BAND = {"high", "xhigh", "max", "ultra"}
 
@@ -663,7 +666,7 @@ def _clean_efforts(efforts) -> tuple:
         if not isinstance(item, str):
             continue
         name = item.strip().lower()
-        if name in _EFFORT_COST and name != "default":
+        if name in _CLI_EFFORTS:
             found.add(name)
     return tuple(name for name in _EFFORT_ORDER if name in found)
 

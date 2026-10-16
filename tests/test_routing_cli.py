@@ -311,6 +311,11 @@ class RoutingCliTests(unittest.TestCase):
 
         cases = (
             (["fix the bug", "--provider", "agy"], ["run", "fix the bug", "--provider", "agy"]),
+            # run options in front of the prompt, with values that are subcommand names
+            (["--provider", "agy", "fix the bug"], ["run", "--provider", "agy", "fix the bug"]),
+            (["-C", str(self.work), "--provider", "codex", "fix it"],
+             ["run", "-C", str(self.work), "--provider", "codex", "fix it"]),
+            (["--risk", "high", "mark", "codex", "6h"], ["--risk", "high", "mark", "codex", "6h"]),
             (["-C", str(self.work), "fix the route", "--provider", "codex"],
              ["run", "-C", str(self.work), "fix the route", "--provider", "codex"]),
             (["-C", str(self.work), "mark", "codex", "6h", "--reason", "x"],

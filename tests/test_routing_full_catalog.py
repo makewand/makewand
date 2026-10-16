@@ -249,6 +249,16 @@ class FullCatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_full_catalog(["not-a-mapping"])
 
+    def test_discovered_efforts_the_cli_rejects_are_dropped(self):
+        # A cache listing "none"/"minimal" must not yield `--effort minimal`,
+        # which `makewand codex` and `makewand outcome` reject.
+        catalog = build_full_catalog({"codex": {"gpt-6-luna": ["none", "minimal", "low", "high"]}})
+        codex = [item for rows in catalog.values() for item in rows if item.provider == "codex"]
+        self.assertEqual([item.candidate_id for item in codex], ["codex/gpt-6-luna/low", "codex/gpt-6-luna/high"])
+        for item in codex:
+            self.assertNotIn("minimal", item.args)
+            self.assertNotIn("none", item.args)
+
     def test_discover_model_efforts_reads_fixtures_and_feeds_the_catalog(self):
         home = Path(tempfile.mkdtemp(prefix="mw-e2-discover-"))
         self.addCleanup(shutil.rmtree, home, True)

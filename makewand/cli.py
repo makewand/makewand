@@ -1640,10 +1640,9 @@ def _main():
         # whole argv here would consume a subcommand's own options as
         # abbreviations of global ones (mark --reason -> --reasoning-effort).
         argv_tail = list(sys.argv[1:])
-        _value_flags = {"-C", "--cwd", "-f", "-F", "--file", "--prompt-file", "--repo-trust",
-                        "--max-model-calls", "--call-budget-file", "--protect",
-                        "--effort", "--reasoning-effort", "--workflow", "--risk",
-                        "--total-timeout", "--judge-reserve-seconds"}
+        # option string -> whether it takes a value, for the shared global options
+        _global_flags = {opt: action.nargs != 0
+                         for action in common_parser._actions for opt in action.option_strings}
         _sub_at = None
         _i = 0
         while _i < len(argv_tail):
@@ -1651,7 +1650,12 @@ def _main():
             if _tok == "--":
                 break
             if _tok.startswith("-") and _tok != "-":
-                _i += 2 if _tok in _value_flags else 1
+                _name = _tok.split("=", 1)[0]
+                if _name not in _global_flags:
+                    # A run option in front of the prompt (makewand --provider agy "fix"):
+                    # its value may look like a subcommand, so keep the whole-argv parse.
+                    break
+                _i += 2 if _global_flags[_name] and "=" not in _tok else 1
                 continue
             # Only the first positional can be the subcommand, as in argparse.
             # Anything else starts a prompt, and later tokens are its options

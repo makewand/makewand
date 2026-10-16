@@ -429,13 +429,44 @@ class TestAgyNoSandboxCredits(_HomeCase):
         from makewand.sandbox import provider_sandbox_launch
         self._write("settings.json", True)
         self._write("antigravity-cli/settings.json", True)
+        # The real agy check runs (and would fail on these settings): codex must not use it.
         with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
-        patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec"):
             with provider_sandbox_launch("codex", ["codex", "exec", "hi"], str(self.home), readonly=True) as launch:
                 self.assertEqual(launch.cmd, ["codex", "exec", "hi"])
                 self.assertFalse(launch.sandboxed)
+
+    def test_sandboxed_agy_drops_config_dir_variables_from_extra_env(self):
+        from contextlib import contextmanager
+        from makewand.sandbox import provider_sandbox_launch
+        captured = {}
+
+        @contextmanager
+        def fake_seccomp(enabled=True):
+            yield None, ()
+
+        @contextmanager
+        def fake_home(provider, roots):
+            yield None
+
+        def fake_wrap(cmd, **kwargs):
+            captured.update(kwargs)
+            return list(cmd)
+
+        extra = {"AGY_CONFIG_DIR": "/elsewhere", "gemini_config_dir": "/elsewhere",
+                 "ANTIGRAVITY_CONFIG_DIR": "/elsewhere", "KEEP_ME": "1"}
+        for provider, kept in (("agy", {"KEEP_ME": "1"}), ("codex", extra)):
+            captured.clear()
+            with self.subTest(provider=provider), \
+                    patch("makewand.sandbox.is_bwrap_available", return_value=True), \
+                    patch("makewand.sandbox.seccomp_filter_context", fake_seccomp), \
+                    patch("makewand.sandbox.provider_home_session", fake_home), \
+                    patch("makewand.sandbox.wrap_bwrap", fake_wrap):
+                with provider_sandbox_launch(provider, [provider, "-p", "x"], str(self.home), readonly=True,
+                                             extra_env=dict(extra), apply_limits=False):
+                    pass
+                self.assertEqual(captured["extra_env"], kept)
 
 
 if __name__ == "__main__":
