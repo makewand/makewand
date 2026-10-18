@@ -24,7 +24,7 @@ makewand 是本机的命令行调度器：把任务派给已登录的编码 CLI�
 
 1. **先看额度再派重活**：`run`/`race`/`ensemble` 之前可运行 `makewand status`。多个订阅显示限流或削峰时，告诉用户并建议改用 `review` 或稍后再试。
 2. **始终指定目录**：`--cwd <项目目录>`。
-3. **后台运行并等待结束**：这些命令常需数分钟到十余分钟。不要因为等待而中断，也不要重复派发同一任务。`--timeout` 是单个阶段的时限（默认 300 秒），整体时限默认为 max(900, 3×单阶段时限) 秒；要直接限定总时长，用 `--total-timeout <秒>`。
+3. **后台运行并等待结束**：这些命令常需数分钟到十余分钟。不要因为等待而中断，也不要重复派发同一任务。`--timeout` 限定单次调用或阶段，`--total-timeout` 限定整体；省略前者时继承后者，同时指定时取较小值。都省略时，直接派活、review、run、race 为 300 秒，ensemble 为 900 秒；仅 run 的默认整体预算为 max(900, 3×阶段时限)。
 4. **控制花费**：可用 `--max-model-calls <N>` 给本次任务设调用上限。
 5. **同一仓库同时只跑一个** makewand 写任务。
 6. **以下开关只能由用户决定，你不要自行添加**：`MAKEWAND_UNSAFE_HOST_EXEC`（无沙箱宿主执行）、`apply --force`、`--allow-collision`、`--boost`（无视削峰保护）。处理不可信的第三方仓库时加 `--repo-trust untrusted`。
@@ -44,6 +44,17 @@ makewand 是本机的命令行调度器：把任务派给已登录的编码 CLI�
 | 1 / 2 | 内部错误 / 用法错误 | 检查命令参数 |
 
 不要只凭文字摘要判断成败。`review --json` 输出机器可读结果。`ensemble` 的 0 只表示至少有一个模型给出了意见，不代表结论一致。
+
+## route 派活命令的时限
+
+`makewand route <review|implement|test|research|doc> <mechanical|normal|hard> --self codex` 输出的候选命令自带 `--max-model-calls 1 --timeout N --total-timeout N`，review 任务还带 `--readonly`。照抄时保留这些参数；JSON 顶层及候选也提供 `timeout`、`total_timeout`、`readonly` 字段。
+
+| 任务类型 | mechanical | normal | hard |
+|---|---:|---:|---:|
+| implement | 1200 秒 | 3600 秒 | 10800 秒 |
+| review / test / research / doc | 900 秒 | 1800 秒 | 5400 秒 |
+
+直接派给工具的命令及 `run`、`review`、`race`、`ensemble` 省略 `--timeout` 时继承 `--total-timeout`；两者都省略时为 300 秒（ensemble 为 900 秒），两者都指定时取较小值。`sandbox` 保持独立的 120 秒默认值。route 按难度和实际档位中较高者给时限，`--risk high`/升档会相应提高；route 自己的 `--total-timeout` 可覆盖表中预算，升档提示也保留它。守护进程跟随请求整体预算并加 30 秒启动收尾余量，上限 6 小时，超限默认改走独立进程；要求守护进程时明确报错。观察器在任务截止时间内不将长任务列为挂起或清理候选。
 
 ## 交付：改动不一定已经落到用户的工作区
 

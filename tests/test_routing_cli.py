@@ -25,7 +25,7 @@ FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时�
           "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
           " --model <模型> --effort <推理深度>")
 CANDIDATE_LINE = re.compile(
-    r"^  (\d+)\. makewand (\S+) (.*) -C <目录> -f <子任务文件> --max-model-calls 1   # (.+)$"
+    r"^  (\d+)\. makewand (\S+) (.*) -C <目录> -f <子任务文件> --max-model-calls 1 --timeout \d+ --total-timeout \d+(?: --readonly)?   # (.+)$"
 )
 
 
@@ -112,6 +112,56 @@ class RoutingCliTests(unittest.TestCase):
         self.assertFalse((self.routing_dir / "outcomes.jsonl").exists())
         self.assertFalse((self.routing_dir / "marks.json").exists())
 
+    def test_route_execution_limits_text_and_json(self):
+        for task_type in ("review", "test", "research", "doc", "implement"):
+            limits = (1200, 3600, 10800) if task_type == "implement" else (900, 1800, 5400)
+            for difficulty, timeout in zip(("mechanical", "normal", "hard"), limits):
+                with self.subTest(task_type=task_type, difficulty=difficulty):
+                    text = self.run_cli("route", task_type, difficulty, "--simple", quota={})
+                    self.assertEqual(text.returncode, 0, text.stderr)
+                    commands = [line for line in text.stdout.splitlines()
+                                if CANDIDATE_LINE.match(line)]
+                    self.assertTrue(commands)
+                    payload = self.route_json(task_type, difficulty, "--simple", quota={})
+                    self.assertTrue(payload["candidates"])
+                    for item in [payload, *payload["candidates"]]:
+                        self.assertEqual(item["timeout"], timeout)
+                        self.assertEqual(item["total_timeout"], timeout)
+                        self.assertEqual(item["readonly"], task_type == "review")
+                    commands += [item["command"] for item in payload["candidates"]]
+                    for command in commands:
+                        self.assertIn(f"--timeout {timeout} --total-timeout {timeout}", command)
+                        self.assertEqual("--readonly" in command, task_type == "review")
+
+    def test_route_timeout_tracks_tier_risk_and_explicit_total(self):
+        for options in (("--tier", "3"), ("--risk", "high")):
+            payload = self.route_json("implement", "mechanical", *options, quota={})
+            self.assertEqual(payload["timeout"], 10800)
+        overridden = self.route_json("review", "hard", "--total-timeout", "600", quota={})
+        self.assertEqual(overridden["timeout"], 600)
+        self.assertTrue(all(item["total_timeout"] == 600 for item in overridden["candidates"]))
+        result = self.run_cli("route", "implement", "mechanical", "--total-timeout", "600", quota={})
+        self.assertIn("--tier 2 --total-timeout 600", result.stdout)
+        fractional = self.route_json("review", "hard", "--total-timeout", "0.5", quota={})
+        self.assertEqual(fractional["timeout"], 0.5)
+        self.assertTrue(fractional["candidates"])
+        from makewand import cli
+        import shlex
+        from unittest.mock import patch
+        class Parsed(Exception):
+            pass
+        resolve = cli._resolve_direct_timeout
+        def capture(args):
+            resolve(args)
+            self.assertEqual(args.timeout, 0.5)
+            raise Parsed()
+        for item in fractional["candidates"]:
+            self.assertIn("--timeout 1 --total-timeout 0.5", item["command"])
+            with patch.object(sys, "argv", shlex.split(item["command"])), \
+                    patch.object(cli, "_resolve_direct_timeout", capture):
+                with self.assertRaises(Parsed):
+                    cli._main()
+
     def test_route_starting_tiers_and_risk(self):
         pressed = self.run_cli("route", "test", "normal", quota={})
         self.assertIn("→ 第 1 档", pressed.stdout.splitlines()[0])
@@ -182,7 +232,7 @@ class RoutingCliTests(unittest.TestCase):
             self.assertEqual(
                 item["command"],
                 f"makewand {item['provider']} {' '.join(item['args'])}"
-                " -C <目录> -f <子任务文件> --max-model-calls 1",
+                " -C <目录> -f <子任务文件> --max-model-calls 1 --timeout 1200 --total-timeout 1200",
             )
         strong = self.route_json("review", "hard", "--simple", quota={})
         self.assertEqual(strong["tier"], 3)

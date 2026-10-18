@@ -144,13 +144,27 @@ def _quota_entry(entry):
     return number, resets
 
 
-def _command_for(candidate) -> str:
+def _execution_options(task_type, difficulty, tier=1, total_timeout=None) -> dict:
+    timeouts = (1200, 3600, 10800) if task_type == "implement" else (900, 1800, 5400)
+    timeout = timeouts[max(("mechanical", "normal", "hard").index(difficulty), tier - 1)]
+    if total_timeout is not None:
+        timeout = total_timeout
+    if float(timeout).is_integer():
+        timeout = int(timeout)
+    return {"timeout": timeout, "total_timeout": timeout, "readonly": task_type == "review"}
+
+
+def _command_for(candidate, execution_options) -> str:
     parts = ["makewand", candidate.provider, *candidate.args,
              "-C", "<目录>", "-f", "<子任务文件>", "--max-model-calls", "1"]
+    parts += ["--timeout", str(math.ceil(execution_options["timeout"])),
+              "--total-timeout", str(execution_options["total_timeout"])]
+    if execution_options["readonly"]:
+        parts.append("--readonly")
     return " ".join(parts)
 
 
-def _candidate_payload(item) -> dict:
+def _candidate_payload(item, execution_options) -> dict:
     return {
         "provider": item.provider,
         "model": item.model,
@@ -159,7 +173,8 @@ def _candidate_payload(item) -> dict:
         "args": list(item.args),
         "label": item.label,
         "is_self": bool(item.is_self),
-        "command": _command_for(item),
+        "command": _command_for(item, execution_options),
+        **execution_options,
     }
 
 
@@ -201,11 +216,13 @@ def cmd_route(args) -> None:
     except ValueError as error:
         _fail(f"错误：{error}")
     budget = int(getattr(policy, "request_budget", 3) or 3)
+    execution_options = _execution_options(task_type, difficulty, result.tier, getattr(args, "total_timeout", None))
 
     if getattr(args, "json", False):
         payload = {
             "tier": result.tier,
-            "candidates": [_candidate_payload(item) for item in result.candidates],
+            "candidates": [_candidate_payload(item, execution_options) for item in result.candidates],
+            **execution_options,
             "skipped": [
                 {"provider": provider, "reason": reason}
                 for provider, reason in result.skipped
@@ -226,7 +243,7 @@ def cmd_route(args) -> None:
         f"（1 便宜快，3 强且推理深）；每个请求默认最多 {budget} 次调用"
     ]
     for index, item in enumerate(shown, 1):
-        line = f"  {index}. {_command_for(item)}   # {item.label}"
+        line = f"  {index}. {_command_for(item, execution_options)}   # {item.label}"
         if item.is_self:
             line += "（和你同一家，尽量不用）"
         lines.append(line)
@@ -245,6 +262,8 @@ def cmd_route(args) -> None:
         # hint re-runs the same selection one tier up instead of silently
         # dropping --risk/--self/--not/--simple/--legacy.
         escalate_cmd = f"makewand route {task_type} {difficulty} --tier {result.escalate_tier}"
+        if getattr(args, "total_timeout", None) is not None:
+            escalate_cmd += f" --total-timeout {args.total_timeout:g}"
         if risk == "high":
             escalate_cmd += " --risk high"
         if self_tool:

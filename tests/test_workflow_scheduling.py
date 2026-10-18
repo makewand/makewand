@@ -217,6 +217,17 @@ class SchedulingTests(unittest.TestCase):
         self.assertTrue(all(context.get("deadline_unix_ms") for _, _, context, _ in self.calls))
         self.assertEqual([entry["stage"] for entry in data["attempts"]].count("review"), 1)
 
+    def test_race_total_budget_does_not_raise_explicit_call_timeout(self):
+        def callback(engine, kwargs):
+            self.assertLessEqual(kwargs["timeout"], 2)
+            return None
+        with self.fixtures(callback=callback):
+            result = orch.run_race("Implement value", cwd=str(self.repo), timeout=2,
+                                   total_timeout=8, judge_reserve_seconds=1,
+                                   engine_a="claude", engine_b="codex")
+        self.assertEqual(result, EXIT_PASSED)
+        self.assertTrue(self.calls)
+
     def test_race_insufficient_budget_dispatches_nothing_and_releases_partial_holds(self):
         ledger = self.root / "ledger.json"
         with self.fixtures(), patch.dict(os.environ, {

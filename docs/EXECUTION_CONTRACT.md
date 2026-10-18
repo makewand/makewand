@@ -165,6 +165,16 @@ dispatches, so a tight `--max-model-calls` can end such a race
 expire; an actual attempt cannot be refunded.
 
 `--total-timeout` bounds the Python workflow, including verification and review.
+For direct provider commands and `run`, `review`, `race`, `ensemble`, an omitted
+`--timeout` inherits `--total-timeout`. With neither option, the per-call default
+is 300 seconds (900 for ensemble). With both options, the per-call limit is their
+minimum. Run without an explicit total budget uses max(900, 3 * per-stage limit);
+sandbox retains its independent 120-second default.
+The daemon follows the workflow budget with 30 seconds for startup/teardown. Its
+six-hour safety cap bounds abandoned workers while covering three-hour routes.
+Larger requests run standalone, or fail clearly with MAKEWAND_DAEMON_REQUIRE=1.
+Dispatched children inherit their task deadline; the observer excludes tasks
+within that deadline from hung classification, cleanup candidates and termination.
 Child scopes can shorten a parent deadline, never extend it. Native Go propagates
 context deadlines through dispatch. Cancellation terminates local work where the
 adapter supports it; it cannot revoke a remote call already sent. A native

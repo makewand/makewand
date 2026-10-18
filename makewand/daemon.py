@@ -27,7 +27,7 @@ from makewand import filelock
 from makewand.config import (CONFIG_DIR, ensure_config_dir, ensure_private_dir,
                              c, COLOR_BOLD, COLOR_GREEN, COLOR_YELLOW)
 from makewand.daemon_context import (PROTOCOL_VERSION, MAX_REQUEST_BYTES,
-    MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT,
+    MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT, MAX_TIMEOUT,
     REQUEST_READ_TIMEOUT, SEND_TIMEOUT, OUTPUT_CHUNK_BYTES, EXIT_IPC_ERROR,
     EXIT_BUSY, EXIT_TIMEOUT, EXIT_CANCELLED, validate_request, worker_environment,
     terminate_worker)
@@ -458,6 +458,14 @@ def try_dispatch_via_daemon(argv: List[str], cwd: Optional[str] = None,
     if not sock_path.exists():
         return None
     duration = DEFAULT_TIMEOUT if timeout is None else timeout
+    if duration > MAX_TIMEOUT:
+        if os.environ.get("MAKEWAND_DAEMON_REQUIRE") == "1":
+            print(f"Makewand daemon: requested timeout exceeds {MAX_TIMEOUT:g}s; use --no-daemon",
+                  file=sys.stderr)
+            return 2
+        print(f"Makewand daemon: requested timeout exceeds {MAX_TIMEOUT:g}s; running standalone",
+              file=sys.stderr)
+        return None
     overall_deadline = time.monotonic() + duration
 
     if max_retries is None:
