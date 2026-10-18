@@ -404,7 +404,7 @@ class PipelineTests(LocalEndpointTestCase):
             stack.enter_context(patch.object(local, "has_active_gpu_training", return_value=(False, "")))
             stack.enter_context(patch.object(local, "get_free_gpu_vram_mb", return_value=20000))
             stack.enter_context(patch.dict(os.environ, {"LOCAL_MODEL_ENDPOINT": f"{self.server.url}/v1",
-                                                        "LOCAL_MODEL_NAME": MODEL, "MAKEWAND_STRICT_NONCE": "1"}))
+                                                        "LOCAL_MODEL_NAME": MODEL}))
             stack.enter_context(patch.object(orch, "check_load_backpressure", return_value=True))
             stack.enter_context(patch("makewand.git_helper.get_active_interactive_working_trees", return_value={}))
             stack.enter_context(patch("makewand.sandbox.verify_writable_sandbox_or_authorized", return_value=(True, None, None)))

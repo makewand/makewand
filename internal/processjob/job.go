@@ -19,6 +19,9 @@ type Options struct {
 	MemoryBytes  uintptr
 }
 
+// DefaultWaitDelay bounds pipe draining after cancellation or process exit.
+const DefaultWaitDelay = time.Second
+
 // Start creates the process and returns an idempotent cleanup function that
 // must be called after Wait, or on any path abandoning supervision. Windows
 // initialization fails closed: a child never runs outside its required job.
@@ -37,7 +40,7 @@ func prepare(cmd *exec.Cmd) error {
 	if cmd.WaitDelay == 0 {
 		// Bound inherited pipes after leader exit even if an OS or an external
 		// executable violates the normal descendant cleanup assumptions.
-		cmd.WaitDelay = time.Second
+		cmd.WaitDelay = DefaultWaitDelay
 	}
 	return nil
 }

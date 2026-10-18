@@ -1411,9 +1411,10 @@ func isSandboxHomeDir(root, path string) bool {
 // an imported package can be anywhere in it - in a directory named .makewand
 // too, which generated files may write. Skipped are only .git and the
 // sandbox HOME makewand creates (sandboxHomeRelPath: the tool caches of the
-// verification steps, the module cache among them), which generated files
-// cannot write (isProtectedWritePath). false means not every file could be
-// read.
+// verification steps, the module cache among them). Direct generated-file
+// writes there are blocked by isProtectedWritePath; test and auto-fix processes
+// still run with that HOME and may write its caches. false means not every file
+// could be read.
 func (p *Project) goProjectStrings() ([]string, bool) {
 	root, err := p.execWorkingDir()
 	if err != nil {

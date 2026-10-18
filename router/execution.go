@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 var errExecutionAccounting = errors.New("execution accounting failed")
+var errExecutionAdmission = errors.New("execution admission interrupted")
 
 type providerAttemptKey struct{}
+type providerLifecycleKey struct{}
 type providerAttemptSlot struct {
 	mu      sync.Mutex
 	attempt *execution.Attempt
@@ -23,6 +26,7 @@ type providerAttemptSlot struct {
 // Private transport handoff prevents external callers from forging a budget
 // voucher while still avoiding duplicate admission at the Router/builtin seam.
 func contextWithProviderAttempt(ctx context.Context, attempt *execution.Attempt) context.Context {
+	ctx = context.WithValue(ctx, providerLifecycleKey{}, attempt)
 	return context.WithValue(ctx, providerAttemptKey{}, &providerAttemptSlot{attempt: attempt})
 }
 func takeProviderAttempt(ctx context.Context) *execution.Attempt {
@@ -49,12 +53,39 @@ func (r *Router) executionContext(ctx context.Context) (context.Context, error) 
 }
 
 func reserveProvider(ctx context.Context, provider Provider) (context.Context, *execution.Attempt, error) {
-	ctx, _, err := execution.EnsureContext(ctx)
+	ctx, cfg, err := execution.EnsureContext(ctx)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("%w: %w", errExecutionAccounting, err)
 	}
 	if inherited := takeProviderAttempt(ctx); inherited != nil {
-		return ctx, inherited, nil
+		return context.WithValue(ctx, providerLifecycleKey{}, inherited), inherited, nil
+	}
+	switch provider.(type) {
+	case *OpenAI, *Claude, *Gemini:
+		// API credentials do not identify the subscription login. Tag the
+		// actual transport before admission so native Gemini competes with
+		// Python agy API calls in the same canonical API namespace.
+		account := provider.Name() + ":api:unknown"
+		cfg.AccountRef = &account
+		ctx = execution.ContextWithConfig(ctx, cfg)
+	default:
+		ctx, err = bindCredentialAdmission(ctx, provider.Name())
+		if err != nil {
+			return ctx, nil, fmt.Errorf("%w: %w", errExecutionAccounting, err)
+		}
+		if provider.Name() == "codex" || provider.Name() == "claude" {
+			identity := readQuotaIdentity(provider.Name(), selectedQuotaRoot(provider.Name()))
+			if cfg.AccountRef != nil && identity.IdentityKnown && *cfg.AccountRef != identity.AccountRef {
+				return ctx, nil, errors.New("admission account differs from selected login")
+			}
+			if cfg.AccountRef == nil {
+				cfg.AccountRef = &identity.AccountRef
+				ctx = execution.ContextWithConfig(ctx, cfg)
+			}
+		}
+		if err := verifyCredentialBinding(ctx, provider.Name()); err != nil {
+			return ctx, nil, err
+		}
 	}
 	modelID, _ := ModelFromContext(ctx)
 	var requestedModel *string
@@ -66,11 +97,32 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 	if mode, ok := UsageModeFromContext(ctx); ok {
 		tier = UsageModeToPythonTier(mode)
 	}
-	attempt, err := execution.Reserve(ctx, execution.Metadata{Engine: provider.Name(), Tier: tier, Model: requestedModel, Readonly: !workspace})
+	attempt, err := execution.Reserve(ctx, execution.Metadata{Engine: provider.Name(), Tier: tier, Model: requestedModel, Readonly: !workspace, Pending: true})
 	if err != nil {
+		if errors.Is(err, execution.ErrConcurrencyBusy) {
+			return ctx, nil, err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return ctx, nil, fmt.Errorf("%w: %w", errExecutionAdmission, err)
+		}
 		return ctx, nil, fmt.Errorf("%w: %w", errExecutionAccounting, err)
 	}
-	return ctx, attempt, nil
+	if err := ctx.Err(); err != nil {
+		admissionErr := fmt.Errorf("%w: %w", errExecutionAdmission, err)
+		if releaseErr := attempt.ReleaseUnstarted(); releaseErr != nil {
+			return ctx, nil, errors.Join(admissionErr, fmt.Errorf("%w: %w", errExecutionAccounting, releaseErr))
+		}
+		return ctx, nil, admissionErr
+	}
+	// CLI account validation/copy happens before its launch boundary.
+	_, cli := provider.(*CLIProvider)
+	if !cli {
+		if err := attempt.Start(); err != nil {
+			releaseErr := attempt.ReleaseUnstarted()
+			return ctx, nil, fmt.Errorf("%w: %w", errExecutionAccounting, errors.Join(err, releaseErr))
+		}
+	}
+	return context.WithValue(ctx, providerLifecycleKey{}, attempt), attempt, nil
 }
 
 func providerOutcome(err error, usage Usage) execution.Outcome {
@@ -81,6 +133,8 @@ func providerOutcome(err error, usage Usage) execution.Outcome {
 		kind := string(ErrorKindOf(err))
 		outcome = execution.Outcome{Status: execution.Failed, Known: true, ErrorKind: &kind}
 		switch {
+		case errors.Is(err, execution.ErrConcurrencyBusy):
+			kind = "concurrency_busy"
 		case errors.Is(err, execution.ErrBudgetExhausted):
 			outcome.Status = execution.BudgetExhausted
 		case errors.Is(err, context.Canceled):
@@ -92,6 +146,11 @@ func providerOutcome(err error, usage Usage) execution.Outcome {
 		default:
 			var providerErr *ProviderError
 			if errors.As(err, &providerErr) && (strings.Contains(providerErr.Op, "response") || strings.Contains(providerErr.Op, "parse") || strings.Contains(providerErr.Op, "stream")) && providerErr.Kind == ErrorKindProvider {
+				outcome.Status, outcome.Known = execution.Unknown, false
+			}
+			// An ordinary CLI exit only proves the local process stopped. It
+			// does not prove whether the upstream model finished the request.
+			if errors.As(err, &providerErr) && providerErr.Op == "CLI" && providerErr.Kind == ErrorKindProvider {
 				outcome.Status, outcome.Known = execution.Unknown, false
 			}
 			if ErrorKindOf(err) == ErrorKindTimeout {
@@ -243,10 +302,10 @@ type streamEndWaiter interface {
 	streamEndWait() time.Duration
 }
 
-// streamEndWait is the limit cliAfterWait puts on the write-back
-// (cliWriteBackWait).
+// Cancellation first kills and drains the CLI, then cliAfterWait starts its
+// write-back timer. Cover both intervals from the wrapper's cancellation time.
 func (c *CLIProvider) streamEndWait() time.Duration {
-	return cliWriteBackWait()
+	return processjob.DefaultWaitDelay + cliWriteBackWait()
 }
 
 // streamDrainWaitFor returns how long a wrapper of p's streams waits for the

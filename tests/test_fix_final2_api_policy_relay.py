@@ -29,8 +29,13 @@ from makewand.ensemble import resolve_ensemble_providers
 from makewand.git_helper import run_git_cmd
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
+from makewand.providers.agy import execute_agy_task
+from makewand.providers.grok import execute_grok_task
+from makewand.providers.muse import execute_muse_task
 
-ADAPTERS = {"claude": (execute_claude_task, "ANTHROPIC_API_KEY"), "codex": (execute_codex_task, "OPENAI_API_KEY")}
+ADAPTERS = {"claude": (execute_claude_task, "ANTHROPIC_API_KEY"), "codex": (execute_codex_task, "OPENAI_API_KEY"),
+            "agy": (execute_agy_task, "GEMINI_API_KEY"), "grok": (execute_grok_task, "XAI_API_KEY"),
+            "muse": (execute_muse_task, "META_API_KEY")}
 
 
 def live(status, reason=""):
@@ -67,17 +72,25 @@ def fake_cli(calls, code=0, out="cli answer", err=""):
         return code, out, err, None
 
     with patch("makewand.sandbox.provider_sandbox_launch", side_effect=launch), \
+         patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
+         patch("makewand.providers.muse.get_muse_executable", return_value=("muse", [])), \
          patch("makewand.providers.claude.run_subprocess", side_effect=run), \
-         patch("makewand.providers.codex.run_subprocess", side_effect=run):
+         patch("makewand.providers.codex.run_subprocess", side_effect=run), \
+         patch("makewand.providers.agy.run_subprocess", side_effect=run), \
+         patch("makewand.providers.grok.run_subprocess", side_effect=run), \
+         patch("makewand.providers.muse.run_subprocess", side_effect=run):
         yield
 
 
 class AdapterTests(unittest.TestCase):
-    def dispatch(self, engine, status, key, policy, subscribed=True, cli=None):
+    def dispatch(self, engine, status, key, policy, subscribed=True, cli=None, cwd=tempfile.gettempdir()):
         execute, key_env = ADAPTERS[engine]
         calls = []
+        self.routes = []
+        self.api_requests = []
 
         def api(**kwargs):
+            self.api_requests.append(kwargs)
             calls.append(("api", kwargs.get("provider")))
             return True, "api answer", None
 
@@ -85,8 +98,9 @@ class AdapterTests(unittest.TestCase):
              patch("makewand.health.load_status_cache", return_value={engine: live(status, "login expired")}), \
              patch("makewand.config.has_subscription_configured", return_value=subscribed), \
              patch("makewand.providers.api_client.call_api_chat", side_effect=api), \
+             patch("makewand.usage.note_dispatch_route", side_effect=self.routes.append), \
              fake_cli(calls, **(cli or {})), contextlib.redirect_stderr(io.StringIO()):
-            result = execute("审查这段代码", readonly=True, cwd=tempfile.gettempdir())
+            result = execute("审查这段代码", readonly=True, cwd=cwd)
         return calls, tuple(result)
 
     def test_logged_out_cli_with_a_key_the_policy_forbids_runs_the_cli(self):
@@ -102,6 +116,17 @@ class AdapterTests(unittest.TestCase):
                 calls, result = self.dispatch(engine, "needs_auth", key=True, policy="allow_paid")
                 self.assertEqual(calls, [("api", engine)])
                 self.assertEqual(result[:2], (True, "api answer"))
+
+    def test_post_cli_relay_keeps_the_normalized_working_directory(self):
+        for engine in ADAPTERS:
+            with self.subTest(engine=engine), \
+                    patch(f'makewand.providers.{engine}.parse_{engine}_quota', return_value=(True, 'fixture quota', None)), \
+                    patch('makewand.health.record_engine_limit'):
+                calls, result = self.dispatch(engine, 'healthy', key=True, policy='allow_paid', cwd=None,
+                                               cli={'code': 1, 'out': '', 'err': 'fixture quota'})
+                self.assertEqual(calls, [('cli', engine), ('api', engine)])
+                self.assertEqual(self.api_requests[0]['cwd'], os.getcwd())
+                self.assertTrue(result[0])
 
     def test_without_a_key_the_cli_runs_under_either_policy(self):
         for engine in ADAPTERS:
@@ -123,13 +148,18 @@ class AdapterTests(unittest.TestCase):
     def test_a_quota_refusal_is_relayed_only_under_an_allowing_policy(self):
         limit = {"code": 1, "out": "", "err": "Claude AI usage limit reached|1999999999\n"}
         codex_limit = {"code": 1, "out": "", "err": "ERROR: You've hit your usage limit. Try again in 3 hours.\n"}
-        for engine, cli in (("claude", limit), ("codex", codex_limit)):
+        limits = {"claude": limit, "codex": codex_limit,
+                  "agy": {"code": 1, "out": "", "err": "Error: You have exhausted your quota on this model.\n"},
+                  "grok": {"code": 1, "out": "", "err": "API Error (status 429)\n"},
+                  "muse": {"code": 1, "out": "", "err": "Error: Rate limited (HTTP 429 · attempt 1)\n"}}
+        for engine, cli in limits.items():
             with self.subTest(engine=engine), patch("makewand.health.record_engine_limit"):
                 calls, result = self.dispatch(engine, "healthy", key=True, policy=None, cli=cli)
                 self.assertEqual(calls, [("cli", engine)])
                 self.assertIn("subscription_only", result[2])
                 calls, result = self.dispatch(engine, "healthy", key=True, policy="allow_paid", cli=cli)
                 self.assertEqual(calls, [("cli", engine), ("api", engine)])
+                self.assertEqual(self.routes, ["cli", "api"])
 
 
 class SelectionTests(unittest.TestCase):

@@ -333,7 +333,10 @@ def safe_search(
     """
     root = Path(root_path or os.getcwd()).resolve()
 
-    rg_bin = find_ripgrep()
+    # A user's RIPGREP_CONFIG_PATH can configure --pre to execute arbitrary
+    # processes. Worker queries use bounded file reads, with no external CLI.
+    from makewand.sandbox import PROVIDER_WORKER_ENV
+    rg_bin = None if os.environ.get(PROVIDER_WORKER_ENV) == "1" else find_ripgrep()
     if rg_bin:
         rg_results = _safe_search_rg(rg_bin, pattern, root, max_results, max_depth, ignore_case)
         if rg_results is not None:

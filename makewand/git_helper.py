@@ -586,6 +586,7 @@ def init_git_baseline(cwd: str, ephemeral: bool = False) -> Tuple[bool, Optional
             # A config linked from init.templateDir must not receive makewand's identity.
             try:
                 _own_repository_file(_fs_path(git_dir), "config")
+                _own_repository_directory(_fs_path(git_dir), "info")
             except OSError as exc:
                 code, err = 1, f"无法确保仓库配置为本仓库的普通文件: {exc}"
         if code != 0:
@@ -1100,6 +1101,7 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
                 # A config linked from init.templateDir must not receive the copy's settings.
                 try:
                     _own_repository_file(_fs_path(Path(target_dir) / ".git"), "config")
+                    _own_repository_directory(_fs_path(Path(target_dir) / ".git"), "info")
                 except OSError as exc:
                     raise OSError(_printable(f"隔离副本基线建立失败 (无法确保仓库配置为本仓库的普通文件): {exc}")) from exc
         # Only force-add the exact safely enumerated files. A source file that was
@@ -2135,6 +2137,33 @@ def _open_metadata_directory(parent_fd: int, name: str) -> int:
     return os.open(name, _NOFOLLOW_DIR_FLAGS, dir_fd=parent_fd)
 
 
+def _unlink_repository_link(path: Path) -> None:
+    """Remove a metadata link itself, including a Windows directory junction."""
+    if _is_reparse_path(path) and path.is_dir() and not path.is_symlink():
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _own_repository_directory(git_dir: Union[str, Path], name: str) -> None:
+    """Detach a template-linked metadata directory before any later git command."""
+    if HOST_TRANSACTION_SUPPORTED:
+        fd = os.open(str(git_dir), _NOFOLLOW_DIR_FLAGS)
+        try:
+            child = _open_metadata_directory(fd, name)
+            os.close(child)
+        finally:
+            os.close(fd)
+        return
+    base = Path(git_dir)
+    if base.is_symlink() or _is_reparse_path(base) or not base.is_dir():
+        raise OSError(errno.ENOTDIR, "repository metadata root must be a real directory")
+    target = base / name
+    if target.is_symlink() or _is_reparse_path(target):
+        _unlink_repository_link(target)
+    target.mkdir(exist_ok=True)
+
+
 def write_repository_file(git_dir: Union[str, Path], rel: str, data: bytes, mode: int = 0o644) -> None:
     """Writes data to rel below git_dir - a file of a repository's own metadata, such as
     info/exclude - as a regular file of its own, never through a link.
@@ -2151,17 +2180,17 @@ def write_repository_file(git_dir: Union[str, Path], rel: str, data: bytes, mode
     if not HOST_TRANSACTION_SUPPORTED:
         # No directory handles (native Windows): the same rule by path.
         base = Path(git_dir)
-        if base.is_symlink() or not base.is_dir():
+        if base.is_symlink() or _is_reparse_path(base) or not base.is_dir():
             raise OSError(errno.ENOTDIR, _printable(f"repository metadata directory is not a directory: {base}"))
         parent = base
         for part in parts[:-1]:
             parent = parent / part
-            if parent.is_symlink():
-                parent.unlink()
+            if parent.is_symlink() or _is_reparse_path(parent):
+                _unlink_repository_link(parent)
             parent.mkdir(exist_ok=True)
         target = parent / parts[-1]
-        if target.is_symlink() or (target.is_file() and target.stat().st_nlink > 1):
-            target.unlink()
+        if target.is_symlink() or _is_reparse_path(target) or (target.is_file() and target.stat().st_nlink > 1):
+            _unlink_repository_link(target)
         with open(target, "wb") as stream:
             stream.write(data)
         return

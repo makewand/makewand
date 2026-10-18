@@ -43,10 +43,10 @@ class TestDynamicQuotaPacing(unittest.TestCase):
         self.assertIsNone(parse_reset_time_to_seconds_left(None))
         self.assertIsNone(parse_reset_time_to_seconds_left(""))
 
-    def test_unlimited_provider_pacing(self):
+    def test_unknown_agy_quota_and_unlimited_local_pacing(self):
         p_agy = calculate_dynamic_pacing("agy", {"status": "healthy"})
         self.assertEqual(p_agy["pacing_state"], PACING_BALANCED)
-        self.assertEqual(p_agy["quota_percentage"], 100)
+        self.assertIsNone(p_agy["quota_percentage"])
         self.assertEqual(p_agy["recommended_tier"], "deep")
 
         p_loc = calculate_dynamic_pacing("local", {"status": "healthy"})

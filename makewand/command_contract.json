@@ -57,7 +57,9 @@
     "usage",
     "user",
     "state",
-    "quota"
+    "quota",
+    "help",
+    "completion"
   ],
   "python_value_flags": [
     "-C",
@@ -88,5 +90,81 @@
     "--daemon",
     "--no-daemon",
     "--allow-collision"
-  ]
+  ],
+  "worker_static_args": [
+    "-h",
+    "--help",
+    "-v",
+    "--version"
+  ],
+  "worker_query_commands": {
+    "search": {
+      "engine": "python",
+      "max_args": 1,
+      "flags": {
+        "-h": false,
+        "--help": false,
+        "-C": true,
+        "--cwd": true,
+        "--max-results": true,
+        "--max-depth": true
+      }
+    },
+    "repomap": {
+      "engine": "python",
+      "max_args": 0,
+      "flags": {
+        "-h": false,
+        "--help": false,
+        "-C": true,
+        "--cwd": true,
+        "--json": false,
+        "--max-lines": true,
+        "--max-files": true
+      }
+    },
+    "help": {
+      "engine": "go",
+      "max_args": 0,
+      "flags": {
+        "-h": false,
+        "--help": false
+      }
+    },
+    "completion bash": {
+      "engine": "go",
+      "max_args": 0,
+      "flags": {
+        "-h": false,
+        "--help": false
+      }
+    },
+    "completion fish": {
+      "engine": "go",
+      "max_args": 0,
+      "flags": {
+        "-h": false,
+        "--help": false,
+        "--no-descriptions": false
+      }
+    },
+    "completion powershell": {
+      "engine": "go",
+      "max_args": 0,
+      "flags": {
+        "-h": false,
+        "--help": false,
+        "--no-descriptions": false
+      }
+    },
+    "completion zsh": {
+      "engine": "go",
+      "max_args": 0,
+      "flags": {
+        "-h": false,
+        "--help": false,
+        "--no-descriptions": false
+      }
+    }
+  }
 }

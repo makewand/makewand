@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/makewand/makewand/internal/processjob"
 )
 
 // Final round 2 (stream-cancel-writeback): a stream that a cancellation or a
@@ -225,14 +227,37 @@ func TestCancelledAPIStreamEndsAtOnce_Final2(t *testing.T) {
 }
 
 // Provider CLIs are the providers whose streams are waited for, for the limit
-// of their credential write-back.
-func TestCLIProviderStreamEndWaitIsTheWriteBackLimit_Final2(t *testing.T) {
-	if got, want := streamDrainWaitFor(NewCommandCLI("custom", "/bin/true", nil, PromptModeArg)), cliWriteBackWait(); got != want || got <= 0 {
-		t.Fatalf("CLI stream end wait = %v, want the write-back limit %v", got, want)
+// of process teardown followed by their credential write-back.
+func TestCLIProviderStreamEndWaitCoversTeardownAndWriteBack(t *testing.T) {
+	if got, want := streamDrainWaitFor(NewCommandCLI("custom", "/bin/true", nil, PromptModeArg)), processjob.DefaultWaitDelay+cliWriteBackWait(); got != want || got <= 0 {
+		t.Fatalf("CLI stream end wait = %v, want teardown plus write-back %v", got, want)
 	}
 	for _, p := range []Provider{NewClaude("", ""), NewOpenAI("", ""), NewGemini("", ""), NewRemoteHTTP("http://127.0.0.1:1", "")} {
 		if got := streamDrainWaitFor(p); got != 0 {
 			t.Fatalf("%T stream end wait = %v, want none", p, got)
 		}
+	}
+}
+
+func TestCancelledCLIWrapperWaitsPastWriteBackOnlyLimit(t *testing.T) {
+	oldLock, oldSlack := cliCredentialLockWait, cliWriteBackSlack
+	cliCredentialLockWait, cliWriteBackSlack = 20*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { cliCredentialLockWait, cliWriteBackSlack = oldLock, oldSlack })
+	// Simulate teardown taking longer than the write-back allowance, then the
+	// write-back completing. A wrapper using only that allowance ends too early.
+	p := newSlowEndingWaiterProvider(t, true, 150*time.Millisecond,
+		NewCommandCLI("custom", "/bin/true", nil, PromptModeArg).streamEndWait())
+	r := slowEndingRouter(p)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, _, err := r.ChatStream(ctx, TaskCode, []Message{{Role: "user", Content: "hi"}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-stream
+	cancel()
+	readStreamToClose(t, stream, 3*time.Second)
+	if !p.ended.Load() {
+		t.Fatal("stream ended before teardown and write-back finished")
 	}
 }

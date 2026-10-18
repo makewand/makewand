@@ -57,8 +57,7 @@ class RaceApprovalTests(unittest.TestCase):
     def setUp(self):
         scheduling.SchedulingTests.setUp(self)
         self.candidates = self.root / "candidates"
-        for patcher in (patch.dict(os.environ, {"MAKEWAND_STRICT_NONCE": "1"}),
-                        patch("makewand.usage.record_engine_usage"),
+        for patcher in (patch("makewand.usage.record_engine_usage"),
                         patch.object(config, "CANDIDATES_DIR", self.candidates),
                         patch.object(orch, "CANDIDATES_DIR", self.candidates)):
             patcher.start()

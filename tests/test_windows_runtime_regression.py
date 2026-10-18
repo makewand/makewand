@@ -54,6 +54,13 @@ class GitRuntimeRegressionTests(unittest.TestCase):
         self.git(["git", "commit", "-qm", "binary baseline"])
         self.assertEqual(self.git(["git", "show", "HEAD:protected.bin"], binary=True), payload)
 
+    def test_non_utf8_gitignore_in_a_plain_workspace_does_not_need_fsdecode(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        (plain / ".gitignore").write_bytes(b"# \xd6\xd0\xce\xc4\n*.log\n")
+        self.assertEqual(orchestrator._filter_non_deliverable_test_changes(
+            ["app.py", "server.log"], str(plain)), ["app.py"])
+
     def test_text_pipe_preserves_non_utf8_bytes_without_reader_failure(self):
         code, output, error = git_helper.run_git_cmd(
             [sys.executable, "-c", "import os; os.write(1, b'\\xff\\x8d')"], cwd=self.repo)
@@ -233,6 +240,48 @@ class HostAuditRuntimeRegressionTests(unittest.TestCase):
         self.assertEqual(set(actual_accounts), expected_accounts, captured[0])
         record = json.loads((self.config_dir / sandbox.UNSAFE_HOST_EXEC_AUDIT_FILE).read_text(encoding="utf-8"))
         self.assertEqual(record["args"], ["中文"])
+
+
+@unittest.skipUnless(os.name == "nt", "requires native Windows junctions")
+class MetadataJunctionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="makewand-metadata-junction-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.shared = self.root / "shared"
+        self.shared.mkdir()
+        (self.shared / "keep").write_bytes(b"shared template\n")
+        self.git_dir = self.root / "repo.git"
+        self.git_dir.mkdir()
+
+    def junction(self, path):
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(path), str(self.shared)],
+                                capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(git_helper._is_reparse_path(path))
+
+    def test_junction_metadata_root_is_refused(self):
+        linked = self.root / "linked.git"
+        self.junction(linked)
+        with self.assertRaises(OSError):
+            git_helper.write_repository_file(linked, "marker", b"new")
+        self.assertEqual(list(self.shared.iterdir()), [self.shared / "keep"])
+
+    def test_junction_metadata_parent_is_replaced_without_writing_its_target(self):
+        info = self.git_dir / "info"
+        self.junction(info)
+        git_helper.write_repository_file(self.git_dir, "info/exclude", b"local/\n")
+        self.assertFalse(git_helper._is_reparse_path(info))
+        self.assertEqual((info / "exclude").read_bytes(), b"local/\n")
+        self.assertEqual(list(self.shared.iterdir()), [self.shared / "keep"])
+
+    def test_junction_at_metadata_file_becomes_a_regular_file(self):
+        marker = self.git_dir / "marker"
+        self.junction(marker)
+        git_helper.write_repository_file(self.git_dir, "marker", b"new")
+        self.assertFalse(git_helper._is_reparse_path(marker))
+        self.assertEqual(marker.read_bytes(), b"new")
+        self.assertEqual((self.shared / "keep").read_bytes(), b"shared template\n")
 
 
 if __name__ == "__main__":

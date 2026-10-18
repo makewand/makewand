@@ -12,8 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/makewand/makewand/execution"
+	"github.com/makewand/makewand/internal/proxyconfig"
 	"github.com/makewand/makewand/internal/seccompbpf"
 	"github.com/makewand/makewand/internal/trustedbin"
 )
@@ -515,7 +518,16 @@ func cliEnvValue(env []string, key string) string {
 }
 
 func cliConfiguredCodexHome(env []string, workspace, home string) (string, string, error) {
-	selected := cliEnvValue(env, "CODEX_HOME")
+	return cliConfiguredAccountHome("codex", "CODEX_HOME", env, workspace, home)
+}
+
+func cliConfiguredAccountHome(provider, variable string, env []string, workspace, home string) (selectedPath, realPath string, resultErr error) {
+	defer func() {
+		if resultErr != nil && variable != "CODEX_HOME" {
+			resultErr = errors.New(strings.ReplaceAll(resultErr.Error(), "CODEX_HOME", variable))
+		}
+	}()
+	selected := cliEnvValue(env, variable)
 	if selected == "" {
 		return "", "", nil
 	}
@@ -530,7 +542,7 @@ func cliConfiguredCodexHome(env []string, workspace, home string) (string, strin
 	// In particular, a workspace symlink cannot select an outside account.
 	homes := []string{home}
 	workspaces := []string{workspace}
-	protected := cliCodexProtectedPaths(homes)
+	protected := cliAccountProtectedPaths(provider, homes)
 	if err := cliValidateCodexHome(selected, workspaces, homes, protected); err != nil {
 		return "", "", err
 	}
@@ -548,7 +560,7 @@ func cliConfiguredCodexHome(env []string, workspace, home string) (string, strin
 			return "", "", errors.New("configured CODEX_HOME boundary is unavailable; refusing account fallback")
 		}
 	}
-	protected = cliCodexProtectedPaths(homes)
+	protected = cliAccountProtectedPaths(provider, homes)
 	// A foreign credential directory can itself be a symlink to an outside path.
 	// Its canonical target must remain hidden when the selected account is bound.
 	for _, path := range append([]string(nil), protected...) {
@@ -568,9 +580,13 @@ func cliConfiguredCodexHome(env []string, workspace, home string) (string, strin
 }
 
 func cliCodexProtectedPaths(homes []string) []string {
+	return cliAccountProtectedPaths("codex", homes)
+}
+
+func cliAccountProtectedPaths(active string, homes []string) []string {
 	entries := append([]string(nil), cliSensitiveHomeEntries...)
 	for provider, credentials := range cliProviderCredentials {
-		if provider != "codex" {
+		if provider != active {
 			entries = append(entries, credentials...)
 		}
 	}
@@ -1286,6 +1302,15 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		return nil, errors.New("cannot sandbox nil command")
 	}
 
+	defaults, err := proxyconfig.Load()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Env = proxyconfig.Apply(cmd.Environ(), defaults)
+	if provider == "gemini" || provider == "agy" {
+		cmd.Env = applyGeminiProxyPolicy(cmd.Env)
+	}
+
 	bwrapMissing := false
 	var bwrapErr error
 
@@ -1332,6 +1357,9 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		// Authorized host execution: sanitize the environment so foreign
 		// credentials and host secrets are not leaked, audit, and record.
 		cmd.Env = cliWithProviderWorkerEnv(sanitizeCLIEnv(provider, cmd.Env))
+		if err := freezeDirectCLIAccount(ctx, provider, cmd); err != nil {
+			return nil, err
+		}
 		cliAuditHostExec(auth, provider, cmd)
 		recordCLIExec(ctx, CLIExecRecord{
 			Sandboxed:  false,
@@ -1470,9 +1498,13 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	bwrapArgs = cliMaskServerPaths(bwrapArgs, workspace, cmd.Env)
 	p := strings.TrimSuffix(strings.ToLower(provider), "-cli")
 	var selectedCodexHome, realCodexHome string
-	if p == "codex" {
+	accountVariable := "CODEX_HOME"
+	if p == "claude" {
+		accountVariable = "CLAUDE_CONFIG_DIR"
+	}
+	if p == "codex" || p == "claude" {
 		var err error
-		selectedCodexHome, realCodexHome, err = cliConfiguredCodexHome(childEnv, workspace, home)
+		selectedCodexHome, realCodexHome, err = cliConfiguredAccountHome(p, accountVariable, childEnv, workspace, home)
 		if err != nil {
 			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
 		}
@@ -1499,6 +1531,9 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		}
 		var err error
 		privHome, err = newCLIPrivateHome(workspace)
+		if privHome != nil {
+			privHome.binding, _ = ctx.Value(credentialBindingKey{}).(*credentialBinding)
+		}
 		if err != nil {
 			return newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
 				"failed to create private provider home: "+err.Error(), err)
@@ -1506,9 +1541,18 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		return nil
 	}
 
+	if err := verifyCredentialBinding(ctx, p); err != nil {
+		return nil, err
+	}
 	var allowedCreds []string
 	if home != "" {
 		allowedCreds = cliProviderCredentials[p]
+		if ctx.Value(credentialBindingKey{}) != nil {
+			allowedCreds = []string{"." + p}
+			if p == "claude" {
+				allowedCreds = append(allowedCreds, ".claude.json")
+			}
+		}
 		if selectedCodexHome != "" {
 			allowedCreds = nil // Explicit account selection does not expose the default account.
 		}
@@ -1559,6 +1603,9 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			}
 			fi, err := os.Stat(target) //nolint:gosec // G703: checking existence of provider credentials in host home
 			if err != nil {
+				if bindingErr := verifyCredentialBinding(ctx, p); bindingErr != nil {
+					return nil, bindingErr
+				}
 				// A login made inside the sandbox in a directory the host
 				// lacks is reported after the run, never written back.
 				if privHome != nil && errors.Is(err, os.ErrNotExist) {
@@ -1650,21 +1697,46 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 		if err := ensurePrivHome(); err != nil {
 			return nil, err
 		}
-		privCodex, err := privHome.addCodexHome(realCodexHome)
+		privCodex, err := privHome.addAccountHome(p, realCodexHome)
 		if err != nil {
 			return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0, err.Error(), err)
 		}
 		bwrapArgs = append(bwrapArgs, "--bind", privCodex, realCodexHome,
-			"--setenv", "CODEX_HOME", realCodexHome)
-		bwrapArgs = cliShieldProviderState(bwrapArgs, "codex", realCodexHome, workspace, false, true)
-	} else if p != "codex" {
-		// A custom Codex account may be outside a masked host root. Other
-		// providers must not gain access to it through the root read-only mount.
+			"--setenv", accountVariable, realCodexHome)
+		bwrapArgs = cliShieldProviderState(bwrapArgs, p, realCodexHome, workspace, false, true)
+	}
+	// Selected-account mounting and foreign-account masking are independent.
+	for _, foreign := range []struct{ provider, variable string }{
+		{"codex", "CODEX_HOME"}, {"claude", "CLAUDE_CONFIG_DIR"},
+	} {
+		if p == foreign.provider {
+			continue
+		}
 		sourceEnv := cmd.Env
 		if sourceEnv == nil {
 			sourceEnv = os.Environ()
 		}
-		_, foreignHome, err := cliConfiguredCodexHome(sourceEnv, workspace, home)
+		selectedForeign := cliEnvValue(sourceEnv, foreign.variable)
+		if selectedForeign != "" {
+			if !cliUnambiguousAccountPath(selectedForeign) {
+				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+					"configured "+foreign.variable+" has ambiguous path traversal; refusing account fallback", nil)
+			}
+			if !filepath.IsAbs(selectedForeign) {
+				// Join without Clean: a symlink must be followed before a later "..".
+				selectedForeign = workspace + string(filepath.Separator) + selectedForeign
+			}
+			if _, statErr := os.Stat(selectedForeign); statErr != nil {
+				// A missing root beneath a writable bind can be populated with
+				// config or hooks for the next run. Only skip isolated roots.
+				if (errors.Is(statErr, os.ErrNotExist) || errors.Is(statErr, syscall.ENOTDIR) || errors.Is(statErr, syscall.EACCES)) && !cliForeignRootCreatable(selectedForeign, home, bwrapArgs) {
+					continue
+				}
+				return nil, newProviderError(provider, "sandbox", ErrorKindConfig, false, 0,
+					"cannot inspect configured "+foreign.variable+": "+statErr.Error(), statErr)
+			}
+		}
+		_, foreignHome, err := cliConfiguredAccountHome(foreign.provider, foreign.variable, sourceEnv, workspace, home)
 		if err != nil {
 			// Without a verified target, the root read-only mount can expose
 			// an explicitly selected account to a different provider.
@@ -1734,6 +1806,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	}
 	if privHome != nil {
 		wrapped.ExtraFiles = append(wrapped.ExtraFiles, statusWrite)
+		privHome.attempt, _ = ctx.Value(providerLifecycleKey{}).(*execution.Attempt)
 		privHome.watch(wrapped, statusRead, statusWrite)
 	}
 	planned = true
@@ -1975,4 +2048,109 @@ func sanitizeCLIEnv(provider string, env []string) []string {
 	}
 
 	return sanitized
+}
+
+// cliForeignRootCreatable checks every writable destination already assembled
+// for this sandbox, including private HOME and provider-state binds.
+func cliForeignRootCreatable(path, home string, args []string) bool {
+	roots := []string{home}
+	for i := 0; i+2 < len(args); i++ {
+		if args[i] == "--bind" || args[i] == "--bind-try" {
+			roots = append(roots, args[i+2])
+		}
+	}
+	resolvedPath, err := cliRealPathMissing(path)
+	if err != nil {
+		return true // unreadable links and loops cannot prove isolation
+	}
+	ancestor := resolvedPath
+	for {
+		if _, err := os.Stat(ancestor); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) && !errors.Is(err, syscall.EACCES) {
+			return true
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return true
+		}
+		ancestor = parent
+	}
+	resolved, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return true
+	}
+	for _, root := range roots {
+		realRoot, err := cliRealPathMissing(root)
+		if err != nil {
+			return true
+		}
+		for _, candidate := range []string{filepath.Clean(path), resolvedPath, ancestor, resolved} {
+			if cliPathWithin(root, candidate) || cliPathWithin(realRoot, candidate) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cliRealPathMissing resolves components in filesystem order, including links
+// whose targets do not exist. Unlike Clean/Abs it follows a link before "..".
+// Missing/inaccessible tails retain the nearest resolvable prefix, matching
+// Python os.path.realpath(strict=False). A link we found but cannot read is an
+// error: callers must never silently discard its unknown target.
+func cliRealPathMissing(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		path = cwd + string(filepath.Separator) + path
+	}
+	volume := filepath.VolumeName(path)
+	resolved := volume + string(filepath.Separator)
+	split := func(value string) []string {
+		return strings.FieldsFunc(value, func(r rune) bool { return r == '/' || r == '\\' && runtime.GOOS == "windows" })
+	}
+	pending := split(strings.TrimPrefix(path, volume))
+	links := 0
+	for len(pending) > 0 {
+		part := pending[0]
+		pending = pending[1:]
+		switch part {
+		case ".":
+			continue
+		case "..":
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+		next := filepath.Join(resolved, part)
+		info, err := os.Lstat(next)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) && !errors.Is(err, syscall.EACCES) {
+				return "", err
+			}
+			resolved = next
+			continue
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			resolved = next
+			continue
+		}
+		links++
+		if links > 255 {
+			return "", fmt.Errorf("too many symlinks in foreign account path")
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(target) {
+			volume = filepath.VolumeName(target)
+			resolved = volume + string(filepath.Separator)
+			target = strings.TrimPrefix(target, volume)
+		}
+		pending = append(split(target), pending...)
+	}
+	return resolved, nil
 }

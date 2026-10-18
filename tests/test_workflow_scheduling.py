@@ -338,7 +338,7 @@ class CLIWorkflowTests(unittest.TestCase):
                     self.assertEqual(self.run_cli(["run", "task", "--max-model-calls", "3"]), 0)
                     paths.append(os.environ["MAKEWAND_CALL_BUDGET_FILE"])
                     self.assertEqual(os.environ["MAKEWAND_MAX_MODEL_CALLS"], "3")
-            self.assertNotEqual(*paths)
+            self.assertEqual(*paths)  # independent entries share the machine ledger
 
     def test_incompatible_choices_and_nonfinite_deadlines_are_usage_errors(self):
         for arguments in (["run", "task", "--workflow", "single"],

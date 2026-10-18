@@ -17,7 +17,8 @@ from pathlib import Path
 from makewand.config import (
     STATUS_CACHE_FILE,
     LEGACY_TRIO_CACHE,
-    ensure_config_dir
+    ensure_config_dir,
+    API_ONLY_ENGINES,
 )
 from makewand.providers.base import check_cli_installed, run_subprocess
 from makewand.providers.agy import parse_agy_quota
@@ -408,7 +409,17 @@ def cli_catalog_regex(pattern: str):
 
 def _load_cli_catalog() -> Dict[str, Any]:
     with open(CLI_MESSAGE_CATALOG_FILE, encoding="utf-8") as handle:
-        return json.load(handle)
+        catalog = json.load(handle)
+    for provider, entry in catalog["providers"].items():
+        own, answer = entry["own_streams"], entry["answer_streams"]
+        if any(stream not in ("stdout", "stderr") for stream in (*own, *answer)):
+            raise ValueError(f"{provider}: unknown stream")
+        selection = entry.get("selection", {})
+        if selection.get("merged", "lines") == "lines" and answer:
+            raise ValueError(f"{provider}: selection.merged 'lines' reads answer_streams")
+        if selection.get("apart", "lines") == "lines" and set(own).intersection(answer):
+            raise ValueError(f"{provider}: selection.apart 'lines' reads answer_streams")
+    return catalog
 
 
 _CLI_CATALOG = _load_cli_catalog()
@@ -1041,6 +1052,14 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
             reserve_gate = _is_quota_reserve_gate(info)
             if info.get("status") in ("healthy", "warning", "unknown") or (info.get("status") == "limited" and reserve_gate):
                 off_q = _get_official_subscription_quota(model_name)
+                if reserve_gate and (not off_q or off_q.get("source") != "official"):
+                    # A derived gate is valid only while its account-bound
+                    # source can still authorize it. Re-read also enforces TTL.
+                    info["status"] = "unknown"
+                    info["reason"] = "原账号额度证据已失效；可用性待实际派发验证"
+                    info["resets_at"] = None
+                    info["updated_at"] = now_dt.isoformat()
+                    info.pop("quota_gate_evidence", None)
                 if off_q and off_q.get("source") == "official":
                     if off_q.get("status") == "limited":
                         reserve = off_q["reserve_percent"]
@@ -1052,6 +1071,8 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                         info["resets_at"] = off_q.get("resets_at")
                         info["updated_at"] = now_dt.isoformat()
                         info["quota_reserve_gate"] = True
+                        info["quota_gate_evidence"] = {key: off_q.get(key) for key in
+                            ("account_ref", "pool_ref", "observed_at", "credential_root")}
                     elif reserve_gate and info.get("status") == "limited":
                         # Sufficient quota is not a new successful health probe.
                         info["status"] = "unknown"
@@ -1415,6 +1436,16 @@ def probe_model(
     # The adapters relay to the cloud API only with a key AND an API policy that
     # allows paid calls; a key alone is no fallback (config.api_relay_available).
     api_ready = api_relay_available(model_name)
+    if model_name in API_ONLY_ENGINES:
+        blocked = api_relay_blocked_note(model_name)
+        return {
+            "status": "healthy" if api_ready else "missing",
+            "reason": (f"{model_name.upper()} 云端 API 就绪" if api_ready else
+                       blocked or f"未配置 {model_name.upper()} API Key (设置环境变量即可激活)"),
+            "resets_at": None,
+            "updated_at": now,
+            "mode": "api" if api_ready else "none",
+        }
     sub_configured = has_subscription_configured(model_name)
 
     # 2. Subscription CLI not installed
@@ -1553,23 +1584,6 @@ def probe_model(
             sub_desc = f"Aider AI Pair Programmer ({version}) 运行就绪" + (" (已配置 API 备用兜底)" if api_ready else "")
             return {"status": "healthy", "reason": sub_desc, "resets_at": None, "updated_at": now, "mode": mode}
         return {"status": "warning", "reason": err.strip()[:100] or "aider 版本检测异常", "resets_at": None, "updated_at": now, "mode": mode}
-
-    elif model_name in ("deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
-        if api_ready:
-            return {
-                "status": "healthy",
-                "reason": f"{model_name.upper()} 云端 API 就绪",
-                "resets_at": None,
-                "updated_at": now,
-                "mode": "api"
-            }
-        return {
-            "status": "missing",
-            "reason": f"未配置 {model_name.upper()} API Key (设置环境变量即可激活)",
-            "resets_at": None,
-            "updated_at": now,
-            "mode": "none"
-        }
 
     return {"status": "unknown", "reason": "Unknown model", "resets_at": None, "updated_at": now, "mode": "none"}
 
@@ -1786,9 +1800,9 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
     """Read recent quota evidence for the CLI's selected account root.
 
     Windows expire at their reset or after 15 minutes without an observation.
-    Newer evidence replaces only the same window, so a weekly sample cannot
-    erase a fresh 5-hour limit. Unbound snapshots cannot identify a custom
-    CODEX_HOME account. No cache, authentication state or provider is changed.
+    Newer evidence replaces only the same account/model window. Unbound
+    history is never current admission evidence, including at the default root.
+    No cache, authentication state or provider is changed.
     """
     import math
     import time
@@ -1817,9 +1831,11 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
         # Event timestamps prevent an unrelated log append or file touch from
         # renewing old data; mtime bounds legacy records without timestamps.
         parsed = [timestamp(value) for value in values]
+        if any(value is not None and value > now + 60 for value in parsed):
+            return now + ttl + 60
         return min([now, modified] + [value for value in parsed if value is not None])
 
-    def add(used, minutes, reset, observed, origin, window_key, scoped=None):
+    def add(used, minutes, reset, observed, origin, window_key, scoped=None, model=""):
         try:
             if isinstance(used, bool):
                 return
@@ -1837,18 +1853,22 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
             if now - observed > ttl:
                 reasons.add("stale_observation")
                 return
+            if observed > now + 60:
+                reasons.add("future_observation")
+                return
             label = ("每周窗口" if minutes == 10080 else "5 小时滚动窗口" if minutes == 300
-                     else f"{minutes} 分钟窗口" if minutes else "未知时间窗口")
+                     else "30 天窗口" if minutes == 43200 else f"{minutes} 分钟窗口" if minutes else "未知时间窗口")
             evidence.append({"used_percent": used, "window_minutes": minutes,
                              "window": label, "window_key": window_key,
                              "resets_at": datetime.fromtimestamp(reset_time, timezone.utc).isoformat() if reset_time else None,
                              "observed": observed, "selected_source": origin,
-                             "scoped_percent": scoped})
+                             "scoped_percent": scoped, "model": model, "pool_ref": identity["pool_ref"]})
         except (ValueError, TypeError, OverflowError, OSError):
             reasons.add("invalid_window")
 
-    default_codex_home = os.path.abspath(os.path.expanduser("~/.codex"))
-    codex_home = os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"))
+    from makewand.account_identity import account_identity, evidence_matches, event_account_ref
+    identity = account_identity(provider)
+    codex_home = identity["credential_root"] if provider == "codex" else None
     cache_path = os.path.expanduser("~/.cache/makewand/quota-snapshot.json")
     try:
         with open(cache_path, "r", encoding="utf-8") as stream:
@@ -1860,20 +1880,36 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
         for entry in snapshot.get("providers", []):
             if not isinstance(entry, dict) or str(entry.get("Provider", "")).lower() != provider or not entry.get("HasData"):
                 continue
-            if provider == "codex" and codex_home != default_codex_home:
-                bound_home = entry.get("CodexHome") or snapshot.get("codex_home")
-                if not isinstance(bound_home, str) or os.path.abspath(os.path.expanduser(bound_home)) != codex_home:
-                    reasons.add("unbound_account_root")
-                    continue
+            if snapshot.get("version") != 2 or not evidence_matches(entry, identity):
+                reasons.add("unbound_account_identity")
+                continue
+            if timestamp(entry.get("SourceAt")) is None:
+                reasons.add("missing_observation_time")
+                continue
             observed = observed_at(modified, snapshot.get("taken_at"), entry.get("SourceAt"))
-            for key, minutes, reset_key in (("WeeklyPct", 10080, "WeeklyResetAt"),
-                                           ("FiveHourPct", 300, "FiveHourResetAt")):
-                if entry.get(key) is None:
-                    continue
-                reset = entry.get(reset_key)
-                if not reset or str(reset).startswith("0001"):
-                    reset = entry.get("ResetAt") if key == "WeeklyPct" or entry.get("WeeklyPct") is None else None
-                add(entry[key], minutes, reset, observed, "quota_snapshot", str(minutes), entry.get("ScopedPct"))
+            if entry.get("Windows"):
+                for window in entry["Windows"]:
+                    if not isinstance(window, dict) or window.get("PoolRef") != identity["pool_ref"]:
+                        reasons.add("unbound_pool")
+                        continue
+                    if timestamp(window.get("SourceAt")) is None:
+                        reasons.add("missing_observation_time")
+                        continue
+                    minutes = window.get("WindowMinutes") or None
+                    model = window.get("Model") or ""
+                    add(window.get("UsedPercent"), minutes, window.get("ResetAt"),
+                        observed_at(modified, window.get("SourceAt"), snapshot.get("taken_at")),
+                        "quota_snapshot", window.get("WindowKey") or model + "|" + str(minutes), model=model)
+            else:
+                for key, minutes, reset_key in (("WeeklyPct", 10080, "WeeklyResetAt"),
+                                               ("FiveHourPct", 300, "FiveHourResetAt"),
+                                               ("ThirtyDayPct", 43200, "ThirtyDayResetAt")):
+                    if entry.get(key) is None:
+                        continue
+                    reset = entry.get(reset_key)
+                    if not reset or str(reset).startswith("0001"):
+                        reset = entry.get("ResetAt") if key == "WeeklyPct" or entry.get("WeeklyPct") is None else None
+                    add(entry[key], minutes, reset, observed, "quota_snapshot", "|" + str(minutes), entry.get("ScopedPct"))
     except FileNotFoundError:
         pass
     except (OSError, ValueError, TypeError, AttributeError):
@@ -1899,16 +1935,32 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                     if start:
                         stream.readline()
                     lines = stream.read(4 * 1024 * 1024).splitlines()
-                for line in reversed(lines):
-                    if b"rate_limits" not in line:
+                session_ref = None
+                for line in lines:
+                    if b"rate_limits" not in line and b"session_meta" not in line:
                         continue
                     try:
                         record = json.loads(line)
                         payload = record.get("payload") or {}
+                        explicit_ref = event_account_ref(record)
+                        if record.get("type") == "session_meta":
+                            session_ref = explicit_ref
+                            continue
+                        if not identity["identity_known"] or (explicit_ref or session_ref) != identity["account_ref"]:
+                            if b"rate_limits" in line:
+                                reasons.add("unbound_account_identity")
+                            continue
                         limits = payload.get("rate_limits") or record.get("rate_limits")
                         if not isinstance(limits, dict):
                             continue
+                        if timestamp(record.get("timestamp")) is None:
+                            reasons.add("missing_observation_time")
+                            continue
                         observed = observed_at(modified, record.get("timestamp"), payload.get("timestamp"))
+                        model = limits.get("model") or ""
+                        limit_id = limits.get("limit_id")
+                        if not model and limit_id and limit_id != "codex":
+                            model = limit_id
                         for slot in ("primary", "secondary"):
                             window = limits.get(slot)
                             if not isinstance(window, dict) or "used_percent" not in window:
@@ -1921,31 +1973,58 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                             except (TypeError, ValueError, OverflowError):
                                 duration = None
                             add(window["used_percent"], duration, window.get("resets_at"), observed,
-                                "codex_session", str(duration) if duration else "unknown_" + slot)
-                        # The latest complete event, rather than the first one,
-                        # describes this session's current quota observation.
-                        break
+                                "codex_session", model + "|" + (str(duration) if duration else "unknown_" + slot), model=model)
+                        # Merge each independently observed account/model window.
                     except (ValueError, TypeError, AttributeError):
                         continue
             except OSError:
                 continue
 
+    # Private provider homes are gone by this point; consume their sanitized
+    # observations only when bound to the selected actual account and pool.
+    from makewand.execution_evidence import read_recent
+    for record in read_recent():
+        if (not identity or not identity["identity_known"] or record.get("engine") != provider
+                or record.get("identity_known") is not True or record.get("account_ref") != identity["account_ref"]
+                or record.get("pool_ref") != identity["pool_ref"]):
+            continue
+        for window in record.get("windows") or []:
+            try:
+                at = window["observed_at_ms"] / 1000
+                if at <= 0:
+                    continue
+                add(window.get("used_percent"), window.get("window_minutes"),
+                    window.get("reset_at_ms", 0) / 1000 or None, at,
+                    "execution_evidence", window.get("window_key"), model=window.get("model") or "")
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+
+    latest_identity = account_identity(provider)
+    if identity and latest_identity and identity["account_ref"] != latest_identity["account_ref"]:
+        evidence.clear()
+        reasons.add("account_changed_during_read")
+    identity = latest_identity or identity
     if not evidence:
         if reasons:
             return {"percentage": None, "status": "unknown", "desc": "官方额度数据陈旧、过期或无法关联当前认证目录；按未知处理",
                     "resets_at": None, "is_unlimited": False, "source": "unknown",
                     "selected_source": None, "windows": [], "ttl_seconds": ttl,
-                    "unverified_reasons": sorted(reasons)}
+                    "unverified_reasons": sorted(reasons), **(identity or {})}
         return None
     windows = {}
     for candidate in evidence:
         key = candidate["window_key"]
         previous = windows.get(key)
-        if previous is None or (candidate["observed"], candidate["selected_source"] == "codex_session") > (previous["observed"], previous["selected_source"] == "codex_session"):
+        if previous is None or (candidate["observed"], candidate["selected_source"] == "codex_session") >= (previous["observed"], previous["selected_source"] == "codex_session"):
             windows[key] = candidate
-    worst = max(windows.values(), key=lambda entry: entry["used_percent"])
+    shared = [entry for entry in windows.values() if not entry["model"]]
+    if not shared:
+        return {"percentage": None, "status": "unknown", "source": "unknown",
+                "desc": "只有模型子限额，账号共享额度未知", "is_unlimited": False,
+                "resets_at": None, "windows": list(windows.values()), **identity}
+    worst = max(shared, key=lambda entry: entry["used_percent"])
     remaining = round(100 - worst["used_percent"], 2)
-    scoped = worst.get("scoped_percent")
+    scoped = max([entry["used_percent"] for entry in windows.values() if entry["model"]] + [worst.get("scoped_percent") or 0])
     scoped_message = ""
     if isinstance(scoped, (int, float)) and not isinstance(scoped, bool) and scoped >= 99:
         scoped_message = " · 顶配模型周限额已达 100%（仅提示）"
@@ -1953,7 +2032,7 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
             **_quota_reserve_metadata(reserve, reserve_error),
             "desc": _quota_reserve_description(f"官方报告{worst['window']}剩余额度: {remaining:g}% (已用 {worst['used_percent']:g}%){scoped_message}", reserve, reserve_error),
             "resets_at": worst["resets_at"], "is_unlimited": False, "source": "official",
-            "selected_source": worst["selected_source"], "window": worst["window"],
+            **identity, "selected_source": worst["selected_source"], "window": worst["window"],
             "window_minutes": worst["window_minutes"], "ttl_seconds": ttl,
             "observed_at": datetime.fromtimestamp(worst["observed"], timezone.utc).isoformat(),
             "age_seconds": max(0, now - worst["observed"]),
@@ -1986,8 +2065,15 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
         if official and official.get("source") == "official":
             reserve_quota = official
 
+    # CLI health/version checks establish availability, never a quota percentage.
+    if provider == "agy":
+        res = {
+            "percentage": None, "status": status, "resets_at": resets_at,
+            "is_unlimited": False, "source": "unknown",
+            "desc": f"额度未知 · 来源: agy 无额度查询接口 · 观察时间: {updated_at or '未知'}",
+        }
     # A buffer verdict must display the real remaining quota, not a fake 0%.
-    if reserve_quota is not None:
+    elif reserve_quota is not None:
         res = reserve_quota
     # 1. Limited / Exhausted (0%)
     elif status == "limited":
@@ -2029,15 +2115,6 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
             "percentage": 100,
             "status": "healthy",
             "desc": "本地私有模型 · 无云端额度 · 0 Token 成本",
-            "resets_at": None,
-            "is_unlimited": True,
-            "source": "assumed",
-        }
-    elif provider == "agy":
-        res = {
-            "percentage": 100,
-            "status": "healthy",
-            "desc": "无额度查询接口，未做估算 (可用性以真实派发结果为准)",
             "resets_at": None,
             "is_unlimited": True,
             "source": "assumed",

@@ -57,6 +57,14 @@ elif mode in ('long', 'background'):
     print('ready', flush=True)
     if mode == 'long':
         time.sleep(30)
+elif mode == 'budget':
+    from makewand.execution_contract import ExecutionRequest
+    from makewand.execution_runtime import execute
+    call = ExecutionRequest(engine='fake', task_id=argv[1], stage=argv[2], readonly=True)
+    def provider(timeout):
+        print('FAKE_PROVIDER_STARTED', flush=True)
+        return True, 'ok', None
+    print(execute(call, provider).status, flush=True)
 elif mode == 'output':
     print('x' * 32768, flush=True)
     time.sleep(30)
@@ -262,6 +270,21 @@ class DaemonSocketTests(unittest.TestCase):
         self.assertEqual(os.getcwd(), original_cwd)
         self.assertIs(sys.stdout, original_stdout)
         self.assertEqual(sys.argv, original_argv)
+
+    def test_daemon_workers_share_daily_budget_and_refusal_never_starts_provider(self):
+        self.start_server()
+        ledger = self.root / "calls.json"
+        env = dict(os.environ, MAKEWAND_CALL_BUDGET_FILE=str(ledger),
+                   MAKEWAND_LAYERED_BUDGET="1", MAKEWAND_MAX_MODEL_CALLS="10",
+                   MAKEWAND_PROJECT_DAILY_CALLS="10", MAKEWAND_MACHINE_DAILY_CALLS="1",
+                   MAKEWAND_PROJECT_ROOT=str(self.root))
+        first = self.execute(_request(["budget", "daemon-a", "provider"], self.root, env=env))
+        second = self.execute(_request(["budget", "daemon-b", "review"], self.root, env=env))
+        self.assertIn("PASSED", _output(first))
+        self.assertIn("FAKE_PROVIDER_STARTED", _output(first))
+        self.assertIn("BUDGET_EXHAUSTED", _output(second))
+        self.assertNotIn("FAKE_PROVIDER_STARTED", _output(second))
+        self.assertEqual(len(json.loads(ledger.read_text())["attempts"]), 1)
 
     def test_client_fee_policy_does_not_inherit_daemon_startup(self):
         self.start_server()

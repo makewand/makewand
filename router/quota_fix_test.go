@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -100,6 +101,11 @@ func TestSoonestReset(t *testing.T) {
 	if got := q2.SoonestReset(); got != q2.WeeklyResetAt {
 		t.Fatalf("want weekly (5h is past), got %v", got)
 	}
+	q3 := ProviderQuota{WeeklyResetAt: now.Add(48 * time.Hour),
+		Windows: []QuotaWindow{{WindowMinutes: 0, ResetAt: now.Add(time.Hour)}}}
+	if got := q3.SoonestReset(); got != q3.Windows[0].ResetAt {
+		t.Fatal("unknown-duration window reset was lost")
+	}
 }
 
 // Bug #4: an agy probe timeout must retain last-good (return error), and an
@@ -126,11 +132,12 @@ func TestAgyProbeFailureStaysNeutral(t *testing.T) {
 // Bug #6 / codex parsing: window classification handles a missing window_minutes
 // and both windows populate their own reset.
 func TestCodexBothWindowsResets(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "sessions")
+	writeQuotaTestAuth(t, filepath.Dir(dir), "fixture")
 	fp := dir + "/rollout-x.jsonl"
 	reset5h := time.Now().Add(3 * time.Hour).Unix()
 	resetWeekly := time.Now().Add(5 * 24 * time.Hour).Unix()
-	content := fmt.Sprintf(`{"timestamp":"%s","payload":{"rate_limits":{"primary":{"used_percent":30.0,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":90.0,"window_minutes":10080,"resets_at":%d}}}}
+	content := fmt.Sprintf(`{"account_id":"fixture","timestamp":"%s","payload":{"rate_limits":{"primary":{"used_percent":30.0,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":90.0,"window_minutes":10080,"resets_at":%d}}}}
 `, time.Now().Format(time.RFC3339), reset5h, resetWeekly)
 	if err := os.WriteFile(fp, []byte(content), 0600); err != nil {
 		t.Fatal(err)

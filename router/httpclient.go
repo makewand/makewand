@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/makewand/makewand/internal/proxyconfig"
 )
 
 // noRedirectToForeignHost returns a CheckRedirect policy that blocks
@@ -34,6 +36,7 @@ func newAPIClient() *http.Client {
 		Timeout:       5 * time.Minute,
 		CheckRedirect: noRedirectToForeignHost(),
 		Transport: &http.Transport{
+			Proxy:                 proxyconfig.Proxy,
 			DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 			TLSHandshakeTimeout:   10 * time.Second,
 			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
@@ -51,6 +54,7 @@ func newStreamClient() *http.Client {
 	return &http.Client{
 		CheckRedirect: noRedirectToForeignHost(),
 		Transport: &http.Transport{
+			Proxy:                 proxyconfig.Proxy,
 			DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 			TLSHandshakeTimeout:   10 * time.Second,
 			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},

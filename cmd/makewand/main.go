@@ -23,6 +23,7 @@ import (
 	"github.com/makewand/makewand/internal/engine"
 	"github.com/makewand/makewand/internal/i18n"
 	"github.com/makewand/makewand/internal/model"
+	"github.com/makewand/makewand/internal/proxyconfig"
 	"github.com/makewand/makewand/internal/tui"
 	"github.com/spf13/cobra"
 )
@@ -367,6 +368,10 @@ func findPythonLauncher(exePath, explicitHome, userHome string) string {
 }
 
 func main() {
+	if err := refuseProviderWorkerArgs(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(execution.ErrorStatus(err).ExitCode())
+	}
 	if len(os.Args) > 1 {
 		tryDelegateToPythonOrchestrator(os.Args[1:])
 	}
@@ -422,6 +427,10 @@ Flags:
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			if err := refuseProviderWorkerDispatch(cmd); err != nil {
 				return err
+			}
+			if os.Getenv("MAKEWAND_PROVIDER_WORKER") == "1" {
+				// Static worker queries must not initialize an inherited budget ledger.
+				return nil
 			}
 			trust, err := resolveRepoTrust(repoTrustFlag)
 			if err != nil {
@@ -741,6 +750,7 @@ execution acknowledgment required before that opt-in takes effect.`,
 
 			// Show API key status
 			fmt.Printf("API policy: %s (keys alone do not enable paid API use)\n", cfg.EffectiveAPIPolicy())
+			fmt.Printf("Proxy source: %s\n", proxyconfig.Status(os.Environ(), cfg.Proxy)["source"])
 			fmt.Println("API keys:")
 			if cfg.ClaudeAPIKey != "" {
 				fmt.Println("  [x] Claude API key configured")
@@ -1416,31 +1426,4 @@ func looksLikeCodeLine(line string) bool {
 		return true
 	}
 	return strings.Contains(l, "=>") || strings.Contains(l, ";") || strings.Contains(l, "{") || strings.Contains(l, "}")
-}
-
-// providerWorkerSafeCommands never dispatch a model, so a provider CLI that
-// makewand launched may still run them.
-var providerWorkerSafeCommands = map[string]bool{
-	"quota": true, "usage": true, "state": true, "audit": true, "token": true, "user": true,
-	"help": true, "completion": true,
-}
-
-// refuseProviderWorkerDispatch stops makewand -> provider CLI -> makewand
-// recursion: provider CLIs launched by makewand carry MAKEWAND_PROVIDER_WORKER=1,
-// and under it every model-dispatching command (bare prompt, --print, chat,
-// new, serve, doctor --probe, ...) is refused.
-func refuseProviderWorkerDispatch(cmd *cobra.Command) error {
-	if os.Getenv("MAKEWAND_PROVIDER_WORKER") != "1" {
-		return nil
-	}
-	top := cmd
-	for top.HasParent() && top.Parent().HasParent() {
-		top = top.Parent()
-	}
-	probe := cmd.Flags().Lookup("probe")
-	if top.HasParent() && providerWorkerSafeCommands[top.Name()] && (probe == nil || !probe.Changed) {
-		return nil
-	}
-	return &execution.StatusError{Status: execution.InvalidRequest, OutcomeKnown: true,
-		Err: fmt.Errorf("refusing %q inside a provider CLI launched by makewand (MAKEWAND_PROVIDER_WORKER=1); finish the assigned task directly", cmd.CommandPath())}
 }

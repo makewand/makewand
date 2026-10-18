@@ -22,6 +22,14 @@ def render():
         lines.append(f"var {name} = map[string]bool{{")
         lines.extend(f"\t{json.dumps(value)}: true," for value in sorted(values))
         lines.extend(["}", ""])
+    lines.append("var providerWorkerStaticArgs = map[string]bool{")
+    lines.extend(f"\t{json.dumps(value)}: true," for value in sorted(contract["worker_static_args"]))
+    lines.extend(["}", "", "var providerWorkerQueries = map[string]providerWorkerQuery{"])
+    for path, rule in sorted(contract["worker_query_commands"].items()):
+        lines.append(f"\t{json.dumps(path)}: {{Engine: {json.dumps(rule['engine'])}, MaxArgs: {rule['max_args']}, Flags: map[string]bool{{")
+        lines.extend(f"\t\t{json.dumps(flag)}: {str(takes_value).lower()}," for flag, takes_value in sorted(rule["flags"].items()))
+        lines.append("\t}},")
+    lines.extend(["}", ""])
     return subprocess.run(["gofmt"], input="\n".join(lines), text=True,
                           capture_output=True, check=True).stdout
 

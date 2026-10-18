@@ -14,6 +14,7 @@ try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI �
 except ImportError:  # python3 -m unittest tests.<module>
     from tests import _isolation  # noqa: F401
 
+import os
 import re
 import tempfile
 import unittest
@@ -309,10 +310,11 @@ class TestDispatchWriteBack(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         (root / "cfg").mkdir(parents=True)
 
-    def dispatch(self, engine, out, err, *, api=False, stream=False):
+    def dispatch(self, engine, out, err, *, api=False, stream=False, policy="subscription_only"):
         module = self.MODULES[engine]
         with patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=api), \
+             patch.dict(os.environ, {"MAKEWAND_API_POLICY": policy}), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
              patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
@@ -331,8 +333,15 @@ class TestDispatchWriteBack(unittest.TestCase):
                 self.assertEqual(status, "limited")
                 relay.assert_not_called()
                 health.STATUS_CACHE_FILE.unlink()
-                # With an API key the refusal itself hands the task to the xAI API.
+                # A key alone cannot authorize paid fallback, including when
+                # the CLI itself has just returned an explicit quota refusal.
                 result, status, relay = self.dispatch("grok", "", message + "\n", api=True)
+                self.assertEqual(status, "limited")
+                relay.assert_not_called()
+                self.assertIn("subscription_only", result[2])
+                health.STATUS_CACHE_FILE.unlink()
+                # With a key AND permission, the same refusal is relayed.
+                result, status, relay = self.dispatch("grok", "", message + "\n", api=True, policy="allow_paid")
                 self.assertEqual(status, "limited")
                 relay.assert_called_once()
                 self.assertEqual(result[1], "relayed")

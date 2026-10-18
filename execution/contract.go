@@ -27,6 +27,8 @@ func ErrorStatus(err error) Status {
 		return statusError.Status
 	}
 	switch {
+	case errors.Is(err, ErrConcurrencyBusy):
+		return Failed
 	case errors.Is(err, ErrBudgetExhausted):
 		return BudgetExhausted
 	case errors.Is(err, context.DeadlineExceeded):

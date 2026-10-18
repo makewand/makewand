@@ -1,0 +1,76 @@
+package execution
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestR4DefaultBusyWaitLeavesDeadlineForFallback(t *testing.T) {
+	path := layeredFixture(t)
+	t.Setenv("MAKEWAND_ACCOUNT_CONCURRENCY", "1")
+	t.Setenv("MAKEWAND_POOL_CONCURRENCY", "1")
+	t.Setenv("MAKEWAND_LEASE_WAIT_SECONDS", "")
+	ctx := ContextWithConfig(t.Context(), Config{LedgerPath: path, TaskID: "holder", MaxCalls: 10})
+	holder, err := Reserve(ctx, Metadata{Engine: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Complete(Outcome{Status: Passed, Known: true})
+	waitCtx, cancel := context.WithTimeout(ctx, 240*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = Reserve(waitCtx, Metadata{Engine: "codex"})
+	if !errors.Is(err, ErrConcurrencyBusy) || errors.Is(err, ErrBudgetExhausted) || waitCtx.Err() != nil {
+		t.Fatalf("busy wait consumed deadline or became terminal: %v, ctx=%v", err, waitCtx.Err())
+	}
+	if elapsed := time.Since(started); elapsed < 30*time.Millisecond || elapsed > 220*time.Millisecond {
+		t.Fatalf("unexpected bounded wait: %v", elapsed)
+	}
+	fallback, err := Reserve(waitCtx, Metadata{Engine: "grok"})
+	if err != nil {
+		t.Fatalf("fallback admission failed: %v", err)
+	}
+	defer fallback.Complete(Outcome{Status: Passed, Known: true})
+	if len(readTestLedger(t, path)["attempts"].([]any)) != 2 {
+		t.Fatal("busy admission was charged")
+	}
+}
+
+// Looking for alternatives can probe CLI availability. Do it only on busy,
+// never when the primary can dispatch or the real budget is exhausted.
+func TestR4CapacityFallbackInspectedOnlyAfterBusy(t *testing.T) {
+	path := layeredFixture(t)
+	t.Setenv("MAKEWAND_ACCOUNT_CONCURRENCY", "1")
+	t.Setenv("MAKEWAND_POOL_CONCURRENCY", "1")
+	t.Setenv("MAKEWAND_LEASE_WAIT_SECONDS", "10")
+	ctx := ContextWithConfig(t.Context(), Config{LedgerPath: path, TaskID: "holder", MaxCalls: 10})
+	checks := 0
+	ctx = ContextWithCapacityFallback(ctx, func() bool {
+		checks++
+		return true
+	})
+	holder, err := Reserve(ctx, Metadata{Engine: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Complete(Outcome{Status: Passed, Known: true})
+	if checks != 0 {
+		t.Fatal("successful admission probed fallbacks")
+	}
+	started := time.Now()
+	if _, err := Reserve(ctx, Metadata{Engine: "codex"}); !errors.Is(err, ErrConcurrencyBusy) {
+		t.Fatalf("busy admission: %v", err)
+	}
+	if checks != 1 || time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("did not immediately use fallback: checks=%d", checks)
+	}
+	t.Setenv("MAKEWAND_MACHINE_DAILY_CALLS", "1")
+	if _, err := Reserve(ctx, Metadata{Engine: "codex"}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("real exhaustion: %v", err)
+	}
+	if checks != 1 {
+		t.Fatal("exhausted budget probed fallbacks")
+	}
+}

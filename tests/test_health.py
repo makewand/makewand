@@ -130,12 +130,23 @@ class TestHealth(unittest.TestCase):
         now = datetime.now(timezone.utc)
         claude_reset = (now + timedelta(days=4)).isoformat().replace("+00:00", "Z")
         codex_reset = (now + timedelta(days=5)).isoformat().replace("+00:00", "Z")
+        from makewand.account_identity import account_identity
+        from pathlib import Path
+        Path(codex_home).mkdir(parents=True, exist_ok=True)
+        (Path(codex_home) / "auth.json").write_text(json.dumps({"tokens": {"account_id": "health-fixture"}}))
+        claude_home = Path(cache_dir) / "official-quota-test-claude"
+        claude_home.mkdir(parents=True, exist_ok=True)
+        (claude_home / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "health-fixture"}}))
+        codex_identity = account_identity("codex", codex_home)
+        claude_identity = account_identity("claude", claude_home)
         sample_snapshot = {
-            "version": 1,
+            "version": 2,
             "taken_at": now.isoformat().replace("+00:00", "Z"),
             "providers": [
                 {
                     "Provider": "claude",
+                    "AccountRef": claude_identity["account_ref"], "IdentityKnown": True,
+                    "PoolRef": claude_identity["pool_ref"], "SourceAt": now.isoformat(),
                     "FiveHourPct": 10,
                     "WeeklyPct": 75,
                     "ScopedPct": 100,
@@ -146,6 +157,8 @@ class TestHealth(unittest.TestCase):
                 },
                 {
                     "Provider": "codex",
+                    "AccountRef": codex_identity["account_ref"], "IdentityKnown": True,
+                    "PoolRef": codex_identity["pool_ref"], "SourceAt": now.isoformat(),
                     "FiveHourPct": None,
                     "WeeklyPct": 92,
                     "ScopedPct": None,
@@ -161,7 +174,8 @@ class TestHealth(unittest.TestCase):
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(sample_snapshot, f)
 
-            q_claude = calculate_provider_quota("claude", {"status": "healthy"})
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude_home)}):
+                q_claude = calculate_provider_quota("claude", {"status": "healthy"})
             self.assertEqual(q_claude["source"], "official")
             self.assertEqual(q_claude["percentage"], 25)
             self.assertIn("官方报告", q_claude["desc"])

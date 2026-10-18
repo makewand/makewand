@@ -375,7 +375,7 @@ func TestRawCLIFailureAndUnknownEachConsumeOneAttemptWithoutRetry(t *testing.T) 
 		mode   string
 		status execution.Status
 		known  bool
-	}{{"quota", execution.Failed, true}, {"unknown", execution.Unknown, false}} {
+	}{{"quota", execution.Unknown, false}, {"unknown", execution.Unknown, false}} {
 		t.Run(test.mode, func(t *testing.T) {
 			bin, state, ledger, _ := setupRawStub(t, 3, test.mode)
 			r := runCLIWithTimeout(context.Background(), "offline", bin, rawStubArgs(), 3*time.Second)
@@ -383,7 +383,7 @@ func TestRawCLIFailureAndUnknownEachConsumeOneAttemptWithoutRetry(t *testing.T) 
 			if r.err == nil || execution.ErrorStatus(r.err) != test.status || rawDispatchCount(t, state) != 1 || len(attempts) != 1 || attempts[0].Status != test.status || attempts[0].Known != test.known {
 				t.Fatalf("raw outcome=%v attempts=%+v dispatches=%d", r.err, attempts, rawDispatchCount(t, state))
 			}
-			if test.mode == "unknown" && !errors.Is(r.err, execution.ErrUnknownOutcome) {
+			if !errors.Is(r.err, execution.ErrUnknownOutcome) {
 				t.Fatal("uncertain raw failure became replayable")
 			}
 		})

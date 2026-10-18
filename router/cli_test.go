@@ -618,14 +618,14 @@ func TestApplyGeminiProxyPolicy_DefaultRespectsConfiguredProxy(t *testing.T) {
 	}
 }
 
-func TestApplyGeminiProxyPolicy_DefaultBypassesWhenNoProxyConfigured(t *testing.T) {
+func TestApplyGeminiProxyPolicy_DefaultKeepsNoProxyUnchanged(t *testing.T) {
 	t.Setenv("MAKEWAND_GEMINI_USE_PROXY", "")
 	t.Setenv("MAKEWAND_GEMINI_BYPASS_PROXY", "")
 
 	got := applyGeminiProxyPolicy([]string{"PATH=/usr/bin"})
 	joined := strings.Join(got, "\n")
-	if !strings.Contains(joined, "NO_PROXY=googleapis.com") && !strings.Contains(joined, "no_proxy=googleapis.com") {
-		t.Fatalf("applyGeminiProxyPolicy() should append NO_PROXY when no proxy is configured; got %q", joined)
+	if strings.Contains(joined, "NO_PROXY=") || strings.Contains(joined, "no_proxy=") {
+		t.Fatalf("applyGeminiProxyPolicy() should preserve NO_PROXY without explicit bypass; got %q", joined)
 	}
 }
 

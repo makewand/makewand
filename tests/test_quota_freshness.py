@@ -12,6 +12,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from makewand.account_identity import account_identity
 from makewand.health import _get_official_subscription_quota, _sanitize_cache
 
 
@@ -28,12 +29,18 @@ class QuotaFreshnessTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.codex = self.home / ".codex"
+        self.codex.mkdir()
+        (self.codex / "auth.json").write_text(json.dumps({"tokens": {"account_id": "freshness-fixture"}}))
         self.now = time.time()
 
     def snapshot(self, provider="codex", age=0, **fields):
         path = self.home / ".cache/makewand/quota-snapshot.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"taken_at": iso(self.now - age), "providers": [{"Provider": provider, "HasData": True, **fields}]}
+        identity = account_identity(provider)
+        data = {"version": 2, "taken_at": iso(self.now - age), "providers": [{
+            "Provider": provider, "HasData": True, "AccountRef": identity["account_ref"],
+            "IdentityKnown": identity["identity_known"], "PoolRef": identity["pool_ref"],
+            "CredentialRoot": identity["credential_root"], "SourceAt": iso(self.now - age), **fields}]}
         path.write_text(json.dumps(data))
         os.utime(path, (self.now - age, self.now - age))
         return path
@@ -41,8 +48,15 @@ class QuotaFreshnessTests(unittest.TestCase):
     def session(self, windows, age=0, root=None, name="events", events=None):
         path = (root or self.codex) / "sessions" / (name + ".jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
+        credential_root = root or self.codex
+        auth = credential_root / "auth.json"
+        if not auth.exists():
+            auth.write_text(json.dumps({"tokens": {"account_id": "fixture-" + credential_root.name}}))
         if events is None:
             events = [{"timestamp": iso(self.now - age), "payload": {"rate_limits": windows}}]
+        ref = account_identity("codex", credential_root)["account_ref"]
+        for event in events:
+            event.setdefault("account_ref", ref)
         path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
         os.utime(path, (self.now - age, self.now - age))
         return path

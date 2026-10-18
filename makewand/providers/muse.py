@@ -7,8 +7,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional, List
 from makewand.config import c, COLOR_PURPLE
-from makewand.providers.base import run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
-from makewand.workflow import provider_outcome
+from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 
 def parse_muse_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
     """Login prompts and limit refusals Muse Code prints itself
@@ -195,23 +194,28 @@ def execute_muse_task(
             return False, None, "不可信仓库 (--repo-trust=untrusted) 仅允许只读审计与分析，禁止执行写入或修改任务"
 
     cache = load_status_cache()
-    from makewand.config import has_api_configured, has_subscription_configured
-    from makewand.providers.api_client import call_api_chat
+    from makewand.config import has_subscription_configured
+    from makewand.usage import note_dispatch_route
+
+    relay = ProviderAPIRelay(
+        "muse", color=COLOR_PURPLE, prompt=prompt, model=model, tier=tier, stream=stream,
+        timeout=timeout, role="reviewer" if readonly else "coder",
+        repo_trust=repo_trust, readonly=readonly,
+    )
 
     # If subscription is limited or missing, fallback to API
     if not has_subscription_configured("muse"):
-        if has_api_configured("muse"):
-            import sys
-            print(c("[Makewand -> Muse] (纯 API 模式) 派发任务至 Meta API...", COLOR_PURPLE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
-        return False, None, "未找到 Muse CLI 订阅，且未配置 META_API_KEY"
+        if relay.available:
+            return relay("[Makewand -> Muse] (纯 API 模式) 派发任务至 Meta API...", cwd=cwd)
+        return False, None, relay.unavailable("未找到 Muse CLI 订阅", "未配置 META_API_KEY")
 
-    if cache.get("muse", {}).get("status") in ["limited", "needs_auth"]:
-        if has_api_configured("muse"):
-            import sys
-            print(c("[Makewand -> Muse] 订阅不可用或受限，无缝自动降级为 Meta API 模式接力执行...", COLOR_PURPLE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
-        return False, None, f"Muse Code 当前不可用: {cache['muse'].get('reason')} (可配置 META_API_KEY 作为备用 API 自动接力)"
+    if cache.get("muse", {}).get("status") == "needs_auth" and relay.available:
+        return relay("[Makewand -> Muse] 订阅不可用或受限，无缝自动降级为 Meta API 模式接力执行...", cwd=cwd)
+
+    if cache.get("muse", {}).get("status") == "limited":
+        if relay.available:
+            return relay("[Makewand -> Muse] 订阅不可用或受限，无缝自动降级为 Meta API 模式接力执行...", cwd=cwd)
+        return False, None, relay.unavailable(f"Muse Code 当前不可用: {cache['muse'].get('reason')}", "可配置 META_API_KEY 作为备用 API 自动接力")
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:
@@ -276,12 +280,6 @@ def execute_muse_task(
 
         from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError
         from makewand.execution_runtime import mark_provider_invocation
-        extra_env = {}
-        if is_guard:
-            default_proxy = "http://127.0.0.1:7890"
-            for var in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
-                if not os.environ.get(var):
-                    extra_env[var] = default_proxy
         # muse-guard confines muse in its own slice; it then carries the limits itself.
         from makewand.sandbox import _trusted_system_binary
         systemd_run = _trusted_system_binary("systemd-run")
@@ -294,7 +292,6 @@ def execute_muse_task(
                 repo_trust=repo_trust,
                 allow_network=allow_network,
                 extra_ro_binds=[p_file] if p_file else None,
-                extra_env=extra_env or None,
                 host_auth_source=host_auth_source,
                 apply_limits=not use_muse_slice,
             ) as launch:
@@ -311,6 +308,7 @@ def execute_muse_task(
                     ] + list(exec_cmd)
                 import sys
                 print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
+                note_dispatch_route("cli")
                 mark_provider_invocation()
                 code, out, err, ex = run_subprocess(
                     exec_cmd,
@@ -350,10 +348,8 @@ def execute_muse_task(
     is_limited, reason, resets = parse_muse_quota(out, err if apart else None)
     if is_limited:
         record_engine_limit("muse", reason, resets)
-        if has_api_configured("muse"):
-            import sys
-            print(c(f"[Makewand -> Muse] 订阅触发限流 ({reason})，无缝切换为 Meta API Key 模式接力执行...", COLOR_PURPLE), file=sys.stderr)
-            return provider_outcome(call_api_chat(provider="muse", prompt=prompt, model=model, tier=tier, stream=stream, timeout=timeout, cwd=cwd, role="reviewer" if readonly else "coder", repo_trust=repo_trust, readonly=readonly))
-        return False, None, f"Muse Code 执行中检测到限制: {reason} (可配置 META_API_KEY 实现自动接力)"
+        if relay.available:
+            return relay(f"[Makewand -> Muse] 订阅触发限流 ({reason})，无缝切换为 Meta API Key 模式接力执行...", cwd=cwd)
+        return False, None, relay.unavailable(f"Muse Code 执行中检测到限制: {reason}", "可配置 META_API_KEY 实现自动接力")
 
     return model_process_failure("muse", code, combined, err, ex, readonly)

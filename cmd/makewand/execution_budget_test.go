@@ -17,6 +17,8 @@ import (
 )
 
 func TestNativeBudgetFlagsInitializePrivateSharedLedger(t *testing.T) {
+	t.Setenv("MAKEWAND_CONFIG_DIR", t.TempDir())
+	t.Setenv("MAKEWAND_LAYERED_BUDGET", "")
 	for _, name := range []string{"MAKEWAND_CALL_BUDGET_FILE", "MAKEWAND_MAX_MODEL_CALLS", "MAKEWAND_TASK_ID"} {
 		t.Setenv(name, "")
 	}
@@ -38,7 +40,7 @@ func TestNativeBudgetFlagsInitializePrivateSharedLedger(t *testing.T) {
 	if err := json.Unmarshal(data, &ledger); err != nil {
 		t.Fatal(err)
 	}
-	if ledger["schema"] != float64(1) || ledger["maximum"] != float64(2) || len(ledger["attempts"].([]any)) != 0 {
+	if ledger["schema"] != float64(1) || ledger["maximum"] != float64(1000) || ledger["scopes"] == nil || len(ledger["attempts"].([]any)) != 0 {
 		t.Fatalf("ledger incorrectly initialized: %s", data)
 	}
 	// #nosec G703 -- path is the same private temporary test ledger created above.
@@ -85,6 +87,7 @@ func TestNativeBudgetFlagsInitializePrivateSharedLedger(t *testing.T) {
 }
 
 func TestNativeChildCannotReplaceInheritedBudgetOrRaiseMaximum(t *testing.T) {
+	t.Setenv("MAKEWAND_LAYERED_BUDGET", "")
 	path := filepath.Join(t.TempDir(), "parent.json")
 	t.Setenv("MAKEWAND_CALL_BUDGET_FILE", path)
 	t.Setenv("MAKEWAND_MAX_MODEL_CALLS", "2")
@@ -107,6 +110,7 @@ func TestNativeChildCannotReplaceInheritedBudgetOrRaiseMaximum(t *testing.T) {
 }
 
 func TestNativeBudgetErrorKeepsTypedExitStatus(t *testing.T) {
+	t.Setenv("MAKEWAND_LAYERED_BUDGET", "")
 	t.Setenv("MAKEWAND_MAX_MODEL_CALLS", "")
 	t.Setenv("MAKEWAND_CALL_BUDGET_FILE", "")
 	cmd := newRootCmd()

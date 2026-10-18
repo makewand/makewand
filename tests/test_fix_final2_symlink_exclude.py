@@ -127,6 +127,26 @@ class TemplateLinkTests(DagFixture):
         self.assertTrue(self.regular(marker))
         self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["pid"], os.getpid())
 
+    def test_template_info_directory_is_detached_before_the_attributes_shield(self):
+        info = self.root / "template" / "info"
+        (info / "exclude").unlink()
+        info.rmdir()
+        (self.shared / "attributes").write_bytes(b"*.py text\n")
+        os.symlink(self.shared, info)
+        before = {p.name: p.read_bytes() for p in self.shared.iterdir()}
+        copy = self.root / "copy"
+        clone_isolated_worktree(str(self.repo), copy)
+        plain = self.root / "plain"
+        plain.mkdir()
+        (plain / "notes.txt").write_text("notes\n")
+        created, error = init_git_baseline(str(plain), ephemeral=True)
+        self.assertTrue(created, error)
+        for repo in (copy, plain):
+            self.assertFalse((repo / ".git" / "info").is_symlink())
+            self.assertTrue((repo / ".git" / "info").is_dir())
+        self.assertEqual({p.name: p.read_bytes() for p in self.shared.iterdir()}, before)
+        self.assert_shared_files_untouched()
+
 
 @unittest.skipUnless(git_helper.HOST_TRANSACTION_SUPPORTED, "POSIX directory handles")
 class WriteRepositoryFileTests(DagFixture):

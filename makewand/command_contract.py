@@ -12,3 +12,5 @@ DELEGATED_PYTHON_COMMANDS = PYTHON_COMMANDS - NATIVE_GO_COMMANDS
 PYTHON_VALUE_FLAGS = frozenset(_CONTRACT["python_value_flags"])
 SHARED_VALUE_FLAGS = frozenset(_CONTRACT["shared_value_flags"])
 PYTHON_BOOLEAN_FLAGS = frozenset(_CONTRACT["python_boolean_flags"])
+WORKER_QUERY_COMMANDS = _CONTRACT["worker_query_commands"]
+WORKER_STATIC_ARGS = frozenset(_CONTRACT["worker_static_args"])

@@ -903,10 +903,14 @@ def _read_host_state(path: str) -> Optional[Tuple[bytes, int, tuple]]:
         if not stat.S_ISREG(st.st_mode) or st.st_size > CREDENTIAL_MAX_BYTES:
             return None
         chunks = []
+        size = 0
         while True:
-            b = os.read(fd, 65536)
+            b = os.read(fd, min(65536, CREDENTIAL_MAX_BYTES + 1 - size))
             if not b:
                 break
+            size += len(b)
+            if size > CREDENTIAL_MAX_BYTES:
+                return None
             chunks.append(b)
         data = b"".join(chunks)
         return data, stat.S_IMODE(st.st_mode), (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, _digest(data))
@@ -1506,28 +1510,54 @@ class _CredentialCopy:
     minted: Tuple[str, ...] = ()  # minted keys of this file (_credential_writeback_merge)
 
 
+ACCOUNT_DIR_VARS = {"codex": "CODEX_HOME", "claude": "CLAUDE_CONFIG_DIR"}
+
+
+def _unambiguous_account_path(path: str) -> bool:
+    """Allow leading parents, but never erase a possibly retargetable entry."""
+    seen_directory = False
+    for component in path.replace(os.sep, "/").split("/"):
+        if component == ".." and seen_directory:
+            return False
+        if component not in ("", ".", ".."):
+            seen_directory = True
+    return True
+
+
 def _resolve_provider_profile(p_name: str, user_home: str, project_paths: Sequence[str]) -> Optional[dict]:
     profile = PROVIDER_PROFILES.get(p_name)
     if not profile:
         return None
-    if p_name != "codex":
+    if p_name not in ("codex", "claude"):
         return profile
-    # A configured Codex home selects one account. Never silently switch
-    # accounts after --clearenv, or expose another account's state as well.
-    selected = _norm(os.path.expanduser(os.environ.get("CODEX_HOME") or
-                                       os.path.join(user_home, ".codex")))
+    variable = ACCOUNT_DIR_VARS[p_name]
+    value = os.environ.get(variable)
+    if value and not _unambiguous_account_path(value):
+        raise SandboxConfigError(f"configured {variable} has ambiguous path traversal; refusing account fallback")
+    default_root = "." + p_name
+    if p_name == "claude" and not os.environ.get(variable):
+        return profile
+    selected = _norm(os.path.expanduser(os.environ.get(variable) or
+                                       os.path.join(user_home, default_root)))
     real_selected = os.path.realpath(selected)
     if (_broad_workspace(real_selected, user_home) or _home_exposed(real_selected, user_home)
             or any(_is_within(os.path.realpath(path), real_selected) or
                    _is_within(real_selected, os.path.realpath(path)) for path in project_paths if path)):
-        raise SandboxConfigError("CODEX_HOME must be a dedicated provider state directory")
-    if os.environ.get("CODEX_HOME") and not os.path.isdir(selected):
-        raise SandboxConfigError("configured CODEX_HOME does not exist; refusing account fallback")
+        raise SandboxConfigError(f"{variable} must be a dedicated provider state directory")
+    if os.environ.get(variable) and not os.path.isdir(selected):
+        raise SandboxConfigError(f"configured {variable} does not exist; refusing account fallback")
     profile = dict(profile)
     profile["roots"] = [selected]
     for category in ("protected", "credentials", "seed"):
         profile[category] = [(selected, *entry[1:]) for entry in profile.get(category, [])
-                             if entry[0] == ".codex"]
+                             if entry[0] == default_root]
+    if p_name == "claude":
+        is_default = real_selected == os.path.realpath(os.path.join(user_home, ".claude"))
+        profile["home_ro_files"] = [".claude.json"] if is_default else []
+        profile["seed"] = [] if is_default else [(selected, ".claude.json")]
+        profile["project_memory_root"] = (selected, "projects")
+        profile["minted_keys"] = {(selected, entry[1]): value for entry, value in
+                                  profile.get("minted_keys", {}).items() if entry[0] == default_root}
     return profile
 
 
@@ -1703,6 +1733,7 @@ class ProviderHome:
         self.state_roots: List[str] = []
         self.scan_roots: List[str] = []
         self.credentials: List[_CredentialCopy] = []
+        self.identity_file: Optional[Tuple[str, str]] = None
         self._materialized = False
         self._lock = threading.Lock()
         self._private_roots: Dict[str, str] = {}
@@ -1718,6 +1749,11 @@ class ProviderHome:
         with self._lock:
             if self._materialized:
                 return list(self.bwrap_args)
+            from makewand.execution_runtime import current_context
+            from makewand.account_identity import credential_binding, refuse_credential_launch
+            binding = current_context().get("_credential_binding")
+            if binding is not None and binding != credential_binding(self.provider):
+                refuse_credential_launch("selected login changed after admission; refusing account switch")
             paths = list(self.project_paths) + [p for p in project_paths if p]
             profile = _resolve_provider_profile(self.provider, self.user_home, paths)
             if not profile:
@@ -1744,6 +1780,11 @@ class ProviderHome:
 
     def _copy_in(self, src: str, priv_root: str, rel: str) -> Optional[Tuple[bytes, int]]:
         found = _read_host_regular(src)
+        from makewand.account_identity import verify_credential_copy
+        verify_credential_copy(src, found[0] if found else None)
+        if (self.provider == "claude" and rel == ".claude.json" or
+                self.provider == "codex" and rel == "auth.json"):
+            self.identity_file = (priv_root, rel)
         if found is None:
             return None
         dst = os.path.join(priv_root, rel)
@@ -1780,6 +1821,9 @@ class ProviderHome:
             return
         priv = self._private_root(idx)
         self._private_roots[root_rel] = priv
+        if self.provider == "codex":
+            # Also observe a login created in an initially empty private root.
+            self.identity_file = (priv, "auth.json")
         args.extend(["--bind", priv, root_path])
         if self.provider == "agy":
             # No host settings exist: the private home must still present
@@ -1803,13 +1847,24 @@ class ProviderHome:
         args: List[str] = []
         for rel in profile.get("home_ro_files", []):
             p = os.path.join(self.user_home, rel)
-            if os.path.exists(p):
-                args.extend(["--ro-bind", p, p])
+            if not os.path.exists(p):
+                from makewand.account_identity import verify_credential_copy
+                verify_credential_copy(p, None)
+                continue
+            private = self._ensure_private_dir()
+            if self._copy_in(p, private, rel) is not None:
+                args.extend(["--ro-bind", os.path.join(private, rel), p])
 
         real_roots: Dict[str, str] = {}
         for idx, root_rel in enumerate(profile.get("roots", [])):
             root_path = _norm(os.path.join(self.user_home, root_rel))
             if not os.path.isdir(root_path):
+                # The root can disappear after materialize's admission check.
+                from makewand.account_identity import verify_credential_copy
+                for kind in ("credentials", "seed"):
+                    for e_root, rel in profile.get(kind, []):
+                        if e_root == root_rel:
+                            verify_credential_copy(os.path.join(root_path, rel), None)
                 # Never create or expose a missing provider root on the host.
                 if absent_root_ok is None or absent_root_ok(root_path):
                     self._bind_absent_root(profile, idx, root_rel, root_path, args)
@@ -1837,6 +1892,12 @@ class ProviderHome:
                             mode=found[1] if found else 0o600,
                             minted=tuple(profile.get("minted_keys", {}).get((e_root, rel), ())),
                         ))
+
+            # An explicit CLAUDE_CONFIG_DIR makes Claude read its metadata
+            # inside that directory, even when it names the default root.
+            if (self.provider == "claude" and os.environ.get("CLAUDE_CONFIG_DIR")
+                    and real == os.path.realpath(os.path.join(self.user_home, ".claude"))):
+                self._copy_in(os.path.join(self.user_home, ".claude.json"), priv, ".claude.json")
 
         for root_rel, sub, _kind, _placeholder in profile.get("protected", []):
             real = real_roots.get(root_rel)
@@ -1993,6 +2054,16 @@ class ProviderHome:
     def finalize(self, write_back: bool = True) -> None:
         with self._lock:
             try:
+                if self._materialized:
+                    from makewand.execution_runtime import current_context
+                    evidence = current_context().get("_evidence")
+                    if evidence is not None:
+                        from makewand import execution_evidence
+                        try:
+                            execution_evidence.private_home(evidence, self)
+                            execution_evidence.save(evidence)
+                        except (OSError, ValueError, RuntimeError):
+                            evidence["persistence_failed"] = True
                 if write_back and self._materialized:
                     self.write_back()
             finally:
@@ -2402,6 +2473,72 @@ def wrap_bwrap(
         )
         bwrap_cmd.extend(p_args)
 
+    # Missing foreign roots are safe only outside every writable bind. Check
+    # both the spelling and the resolved nearest existing ancestor: an alias
+    # into a writable workspace must not permit planting next-run config.
+    writable_roots = [user_home]
+    for index, argument in enumerate(bwrap_cmd[:-2]):
+        if argument in ("--bind", "--bind-try"):
+            writable_roots.append(bwrap_cmd[index + 2])
+
+    def foreign_root_creatable(path):
+        ancestor = path
+        while True:
+            try:
+                os.stat(ancestor)
+                break
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.EACCES):
+                    return True  # cannot prove isolation
+                parent = os.path.dirname(ancestor)
+                if parent == ancestor:
+                    return True
+                ancestor = parent
+        return any(_is_within(candidate, root) for candidate in
+                   (path, os.path.realpath(path), ancestor, os.path.realpath(ancestor))
+                   for writable in writable_roots
+                   for root in (writable, os.path.realpath(writable)))
+
+    # The read-only root bind otherwise exposes other accounts stored outside
+    # HOME / the masked prefixes. General sandbox commands need these masks too.
+    active_root = None
+    if p_name in ACCOUNT_DIR_VARS:
+        active_root = _norm(os.path.realpath(os.path.expanduser(
+            os.environ.get(ACCOUNT_DIR_VARS[p_name]) or os.path.join(user_home, "." + p_name))))
+    for owner, variable in ACCOUNT_DIR_VARS.items():
+        value = os.environ.get(variable)
+        if owner == p_name or not value:
+            continue
+        if not _unambiguous_account_path(value):
+            raise SandboxConfigError(f"configured {variable} has ambiguous path traversal; refusing account fallback")
+        # The child starts in ws. Preserve components until realpath has
+        # followed symlinks: abspath/normpath would erase a meaningful "..".
+        selected = os.path.expanduser(value)
+        if not os.path.isabs(selected):
+            selected = os.path.join(ws, selected)
+        real_selected = os.path.realpath(selected)
+        protected = [ws, mount_root, repo_abs, active_root]
+        for path in dict.fromkeys((selected, real_selected)):
+            # Skip stale foreign roots only when a sandbox cannot plant state
+            # there. Writable HOME/workspace paths remain fail-closed.
+            try:
+                os.stat(path)
+            except OSError as error:
+                if (error.errno in (errno.ENOENT, errno.ENOTDIR, errno.EACCES)
+                        and not foreign_root_creatable(path)):
+                    continue
+                raise SandboxConfigError(f"cannot inspect configured {variable}: {error}") from error
+            if (_broad_workspace(path, user_home) or
+                    any(_is_within(path, os.path.realpath(root)) or
+                        _is_within(os.path.realpath(root), path) for root in protected if root)):
+                raise SandboxConfigError(f"{variable} must be a dedicated provider state directory")
+            if _hidden_on_host_view(path, user_home, masked_roots):
+                continue
+            mask_args = _mask_mount_args(path)
+            bwrap_cmd.extend(mask_args)
+            if mask_args[0] == "--tmpfs":
+                readonly_masks.append(path)
+
     # Mask pre-existing pathname AF_UNIX sockets in workspace / provider state to prevent host breakout
     sockets = set(ws_sockets)
     if provider_scan_roots:
@@ -2431,6 +2568,9 @@ def wrap_bwrap(
         # Lets the CLI refuse makewand -> provider CLI -> makewand recursion.
         bwrap_cmd.extend(["--setenv", PROVIDER_WORKER_ENV, "1"])
 
+    if os.environ.get("MAKEWAND_SANDBOX_UNSHARE_NET", "").lower() in ("1", "true", "yes"):
+        allow_network = False
+
     # Strict environment whitelist: only pass safe system variables to general sandbox,
     # pass provider API variables ONLY tailored to the active provider when is_provider is True
     SAFE_PASSTHROUGH_ENVS = [
@@ -2445,6 +2585,9 @@ def wrap_bwrap(
     if is_provider:
         if p_name == "claude":
             SAFE_PASSTHROUGH_ENVS.extend(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"])
+            if os.environ.get("CLAUDE_CONFIG_DIR"):
+                bwrap_cmd.extend(["--setenv", "CLAUDE_CONFIG_DIR",
+                                  _norm(os.path.expanduser(os.environ["CLAUDE_CONFIG_DIR"]))])
         elif p_name == "codex":
             SAFE_PASSTHROUGH_ENVS.extend(["OPENAI_API_KEY", "CODEX_API_KEY"])
             if os.environ.get("CODEX_HOME"):
@@ -2463,9 +2606,13 @@ def wrap_bwrap(
                 "OPENAI_API_BASE", "OLLAMA_API_BASE"
             ])
 
+    passthrough_env = os.environ
+    if allow_network:
+        from makewand.proxy import proxy_environment
+        passthrough_env = proxy_environment(provider=p_name if is_provider else None)
     for var in SAFE_PASSTHROUGH_ENVS:
-        if var in os.environ:
-            bwrap_cmd.extend(["--setenv", var, os.environ[var]])
+        if var in passthrough_env:
+            bwrap_cmd.extend(["--setenv", var, passthrough_env[var]])
 
     # Strip any D-Bus and GUI display environment variables to prevent host escape / privilege escalation
     for k in list(os.environ.keys()):
@@ -2475,9 +2622,6 @@ def wrap_bwrap(
     if extra_env:
         for k, v in extra_env.items():
             bwrap_cmd.extend(["--setenv", str(k), str(v)])
-
-    if os.environ.get("MAKEWAND_SANDBOX_UNSHARE_NET", "").lower() in ("1", "true", "yes"):
-        allow_network = False
 
     if not allow_network:
         bwrap_cmd.append("--unshare-net")
@@ -2943,6 +3087,10 @@ class ProviderLaunch:
     env: Dict[str, str] = field(default_factory=dict)
 
 
+class ProviderAccountChangedError(RuntimeError):
+    """A dispatched host CLI changed login; its remote outcome is unknown."""
+
+
 @contextmanager
 def provider_sandbox_launch(
     provider: str,
@@ -2964,13 +3112,52 @@ def provider_sandbox_launch(
     Without bwrap: authorize_unsandboxed_launch (read-only too) + audit.
     Yields ProviderLaunch; raises SandboxConfigError / SandboxUnavailableError.
     """
+    from makewand.proxy import proxy_environment
+    proxy_env = proxy_environment(provider=provider) if allow_network else dict(os.environ)
+    launch_env = {key: value for key, value in proxy_env.items() if os.environ.get(key) != value}
+    launch_env.update(extra_env or {})
     if not is_bwrap_available():
         if _is_agy_provider(provider) and not _agy_host_credits_disabled():
             raise SandboxUnavailableError(_agy_no_sandbox_credits_message())
         source = authorize_unsandboxed_launch(provider, cmd, cwd, readonly, repo_trust, host_auth_source)
         # Passed through the process environment rather than an `env` prefix,
         # which does not exist on Windows.
-        yield ProviderLaunch(list(cmd), (), False, source, env={PROVIDER_WORKER_ENV: "1"})
+        if provider in ("claude", "codex"):
+            # Keep the user's configuration, instructions and hooks (and
+            # Claude's Keychain namespace). Check account attribution on exit.
+            from makewand.account_identity import credential_binding, account_identity, refuse_credential_launch
+            from makewand.execution_runtime import current_context
+            binding = current_context().get("_credential_binding")
+            selected_binding = credential_binding(provider)
+            if binding is not None and binding != selected_binding:
+                refuse_credential_launch("selected login changed after admission; refusing account switch")
+            selected_account = account_identity(provider)
+            variable = ACCOUNT_DIR_VARS[provider]
+            child_home = launch_env.get("HOME") or str(Path.home())
+            child_root = (launch_env.get(variable) if variable in launch_env else os.environ.get(variable))
+            child_root = child_root or os.path.join(child_home, "." + provider)
+            if not _unambiguous_account_path(child_root):
+                refuse_credential_launch(f"configured {variable} has ambiguous path traversal; refusing account fallback")
+            child_root = os.path.expanduser(child_root)
+            if not os.path.isabs(child_root):
+                child_root = os.path.join(cwd, child_root)
+            if (os.path.realpath(child_root) != selected_account["credential_root"] or
+                    os.path.realpath(child_home) != os.path.realpath(str(Path.home()))):
+                refuse_credential_launch("credential source differs from admitted account")
+            try:
+                yield ProviderLaunch(list(cmd), (), False, source,
+                    env={**launch_env, PROVIDER_WORKER_ENV: "1"})
+            finally:
+                try:
+                    changed = selected_account != account_identity(provider)
+                    if not selected_account["identity_known"]:
+                        changed = changed or selected_binding != credential_binding(provider)
+                except (OSError, ValueError, RuntimeError):
+                    changed = True
+                if changed:
+                    raise ProviderAccountChangedError("selected login changed during direct execution")
+        else:
+            yield ProviderLaunch(list(cmd), (), False, source, env={**launch_env, PROVIDER_WORKER_ENV: "1"})
         return
     if _is_agy_provider(provider) and extra_env:
         # Never point agy away from the sanitized ~/.gemini settings.

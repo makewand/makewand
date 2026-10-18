@@ -119,6 +119,13 @@ class ForcedEngineTests(unittest.TestCase):
         self.assertEqual(self.calls, ["claude"], "the review path used to ignore the forced engine")
         self.assertIn("指定的审查引擎 CLAUDE", log)
 
+    def test_local_only_does_not_treat_the_ignored_provider_as_a_forced_engine(self):
+        with patch.object(orch, '_no_provider_detected', wraps=orch._no_provider_detected) as guard:
+            result, _ = self.run_task({}, active=(), local_only=True, forced_engine='grok', force_code=True, risk='low')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(result.status, 'UNVERIFIED')
+        self.assertIsNone(guard.call_args.args[0])
+
     def test_auto_is_no_forced_engine(self):
         self.run_task(CACHE, forced_engine="auto", intent="explain")
         self.assertEqual(self.calls, ["codex"])

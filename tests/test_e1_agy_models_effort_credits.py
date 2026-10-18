@@ -433,7 +433,7 @@ class TestAgyNoSandboxCredits(_HomeCase):
         with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec"):
-            with provider_sandbox_launch("codex", ["codex", "exec", "hi"], str(self.home), readonly=True) as launch:
+            with provider_sandbox_launch("codex", ["codex", "exec", "hi"], str(Path(self._tmp.name) / "workspace"), readonly=True) as launch:
                 self.assertEqual(launch.cmd, ["codex", "exec", "hi"])
                 self.assertFalse(launch.sandboxed)
 

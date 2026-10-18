@@ -271,6 +271,11 @@ def _collect_candidate_files(root: Path) -> List[str]:
     Collects code file paths relative to root, prioritizing git-tracked files
     if available, otherwise falling back to filesystem walk.
     """
+    # Even git ls-files can execute core.fsmonitor hooks. An inherited provider
+    # worker must use the pure filesystem path, with no repo-configured process.
+    from makewand.sandbox import PROVIDER_WORKER_ENV
+    if os.environ.get(PROVIDER_WORKER_ENV) == "1":
+        return _walk_candidate_files(root)
     # 1. Fast path: git ls-files if inside a git repo
     try:
         from makewand.git_helper import resolve_safe_git_binary, _sanitize_git_env
@@ -300,7 +305,11 @@ def _collect_candidate_files(root: Path) -> List[str]:
     except Exception:
         pass
 
-    # 2. Fallback: os.walk
+    return _walk_candidate_files(root)
+
+
+def _walk_candidate_files(root: Path) -> List[str]:
+    """Read repository paths without executing Git or refreshing its index."""
     collected = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in DEFAULT_IGNORE_DIRS and not d.startswith(".")]

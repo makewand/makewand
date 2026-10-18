@@ -199,7 +199,7 @@ var cliTestStartTempDir = os.TempDir()
 // t.TempDir carry the first form, os.Executable may return the second).
 func cliTestTempDirs() []string {
 	var dirs []string
-	for _, temp := range []string{cliTestStartTempDir, os.TempDir()} {
+	for _, temp := range []string{os.Getenv("GOTMPDIR"), cliTestStartTempDir, os.TempDir()} {
 		temp = filepath.Clean(temp)
 		if !filepath.IsAbs(temp) || temp == "/" {
 			continue
@@ -214,6 +214,9 @@ func cliTestTempDirs() []string {
 			}
 		}
 	}
+	// A test may set TMPDIR inside GOTMPDIR (or the reverse). Match the
+	// most specific namespace before a broader parent hides its layout.
+	slices.SortFunc(dirs, func(a, b string) int { return len(b) - len(a) })
 	return dirs
 }
 
@@ -252,4 +255,17 @@ func cliPrivateHomeSource(t *testing.T, args []string, dest string) string {
 	}
 	t.Fatalf("no private writable bind at %s: %v", dest, args)
 	return ""
+}
+
+func TestFixtureBindsNestedGoTempDirWritable(t *testing.T) {
+	nested := filepath.Join(t.TempDir(), "gotmp")
+	fixture := filepath.Join(nested, "TestNestedFixture123")
+	if err := os.MkdirAll(fixture, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOTMPDIR", nested)
+	args := cliTestFixtureBinds(filepath.Join(fixture, "fake-cli"), nil)
+	if !strings.Contains(strings.Join(args, " "), "--bind "+fixture+" "+fixture) {
+		t.Fatalf("Go fixture has no writable bind: %v", args)
+	}
 }

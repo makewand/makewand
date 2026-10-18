@@ -172,6 +172,12 @@ result and require a new test and review pass. Before the first race seal, only
 new, untracked bytecode that exactly matches trusted compilation of its source
 may be removed; existing files and arbitrary cache-directory source remain inputs.
 
+Race baseline freezing uses the same host manifest policy as DAG staging: ignored
+untracked logs/data and uncopied dependency trees are omitted, tracked files stay
+bound, and both host checks share one digest cache. Each check enforces the
+workspace snapshot file, byte and time limits before dispatch. A hash error,
+limit violation or copied-input change aborts with `FAILED` and no provider call.
+
 Missing detected Go/npm/Cargo test tools or malformed Node test configuration
 produce `UNVERIFIED`; they are never silently skipped. A pipeline without
 executed local test evidence stops before review and delivery. Python's
@@ -385,10 +391,12 @@ re-includes, but nothing inside an ignored directory can be re-included; a patte
 with no slash but a trailing one matches a name at any depth, any other is
 anchored; `*` and `?` never match `/`, `**/`, `/**` and `/**/` span directories,
 and `[...]` sets take ranges, negation and `[:class:]`. It never treats a tracked
-file as ignored. Known issue: a pattern with many `**/` or `*` segments can make
-the fallback run for a very long time, or end the run with an internal error, on
-deep or long paths. Notes about inputs that changed between the test run and the
-review snapshot name the files.
+file as ignored. Matching uses memoized iterative frames and at most 100,000
+work steps per candidate path (shared across its leading directories and rules).
+If that bound is exhausted, or a name cannot be encoded, the path stays a tested
+input. `.gitignore` lines remain bytes, so a non-UTF-8 comment cannot crash the
+fallback on native Windows. Notes about inputs that changed between the test run
+and the review snapshot name the files.
 
 ## Multi-stage DAG delivery
 
@@ -438,14 +446,13 @@ copy's `info/exclude` and the ephemeral marker are written as new regular files,
 replacing a link at that name or at a directory on the way.
 `.git/info/attributes.mw_gate` is never created or opened through a link; one
 planted there makes makewand's git commands in that repository fail closed
-(`Cannot shield Git attributes`). Known issues: `git init` itself still writes its
-core settings through a template-linked `config` and changes that file's mode, as
-it does for every repository created from that template; and when the template's
-`info` directory is itself a link, the attribute shield of makewand's git commands
-in a copy that keeps it works inside the shared directory, creating
-`attributes.mw_gate` there and moving its `attributes` file aside while each
-command runs (an interrupted command leaves it moved until a later makewand git
-command restores it).
+(`Cannot shield Git attributes`). A template-linked `info` directory is replaced
+with an empty repository-owned directory immediately after `git init`, before
+another git command can run its attribute shield. Windows metadata writes also
+reject reparse roots and replace child junctions without writing their targets.
+Known issue: `git init` itself still writes its core settings through a
+template-linked `config` and changes that file's mode, as it does for every
+repository created from that template.
 
 ## Python daemon execution contract
 

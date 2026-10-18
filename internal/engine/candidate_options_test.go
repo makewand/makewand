@@ -14,11 +14,17 @@ import (
 	"github.com/makewand/makewand/internal/model"
 )
 
+type candidateResourceBarrier struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
 type resourceCandidateProvider struct {
 	name                string
 	calls, active, peak *atomic.Int32
 	cost                float64
 	wait                bool
+	barrier             *candidateResourceBarrier
 }
 
 func (p *resourceCandidateProvider) Name() string      { return p.name }
@@ -36,10 +42,17 @@ func (p *resourceCandidateProvider) Chat(ctx context.Context, _ []model.Message,
 		<-ctx.Done()
 		return "", model.Usage{Provider: p.name}, ctx.Err()
 	}
-	select {
-	case <-time.After(5 * time.Millisecond):
-	case <-ctx.Done():
-		return "", model.Usage{Provider: p.name}, ctx.Err()
+	if p.barrier != nil {
+		select {
+		case p.barrier.entered <- struct{}{}:
+		case <-ctx.Done():
+			return "", model.Usage{Provider: p.name}, ctx.Err()
+		}
+		select {
+		case <-p.barrier.release:
+		case <-ctx.Done():
+			return "", model.Usage{Provider: p.name}, ctx.Err()
+		}
 	}
 	return "candidate output", model.Usage{Provider: p.name, Cost: p.cost}, nil
 }
@@ -49,12 +62,12 @@ func (p *resourceCandidateProvider) ChatStream(context.Context, []model.Message,
 	return ch, nil
 }
 
-func candidateResourceRouter(t *testing.T, cost float64, wait bool) (*model.Router, *atomic.Int32, *atomic.Int32) {
+func candidateResourceRouter(t *testing.T, cost float64, wait bool, barrier *candidateResourceBarrier) (*model.Router, *atomic.Int32, *atomic.Int32) {
 	t.Helper()
 	calls, active, peak := &atomic.Int32{}, &atomic.Int32{}, &atomic.Int32{}
 	providers := map[string]model.ProviderEntry{}
 	for _, name := range []string{"claude", "codex", "gemini"} {
-		providers[name] = model.ProviderEntry{Provider: &resourceCandidateProvider{name: name, calls: calls, active: active, peak: peak, cost: cost, wait: wait}, Access: model.AccessSubscription}
+		providers[name] = model.ProviderEntry{Provider: &resourceCandidateProvider{name: name, calls: calls, active: active, peak: peak, cost: cost, wait: wait, barrier: barrier}, Access: model.AccessSubscription}
 	}
 	r, err := model.NewRouterFromConfig(model.RouterConfig{Providers: providers, UsageMode: "balanced"})
 	if err != nil {
@@ -71,9 +84,48 @@ func TestCandidateCountConcurrencyAndSoftBudget(t *testing.T) {
 		peak    int32
 	}{{"single", CandidateSelectionOptions{MaxCandidates: 1}, 1, 1}, {"sequential", CandidateSelectionOptions{MaxConcurrent: 1}, 3, 1}, {"concurrency-two", CandidateSelectionOptions{MaxConcurrent: 2}, 3, 2}, {"budget", CandidateSelectionOptions{MaxCostUSD: .2}, 1, 1}} {
 		t.Run(test.name, func(t *testing.T) {
-			r, calls, peak := candidateResourceRouter(t, .3, false)
-			ctx := ContextWithCandidateSelectionOptions(context.Background(), test.options)
-			selection := RunCandidateSelection(ctx, r, nil, model.PhaseCode, nil, "", nil)
+			var barrier *candidateResourceBarrier
+			if test.peak == 2 {
+				barrier = &candidateResourceBarrier{entered: make(chan struct{}, 3), release: make(chan struct{})}
+			}
+			r, calls, peak := candidateResourceRouter(t, .3, false, barrier)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ctx = ContextWithCandidateSelectionOptions(ctx, test.options)
+			finished := make(chan CandidateSelection, 1)
+			go func() {
+				defer close(finished)
+				finished <- RunCandidateSelection(ctx, r, nil, model.PhaseCode, nil, "", nil)
+			}()
+			defer func() {
+				cancel()
+				select {
+				case <-finished:
+				case <-time.After(5 * time.Second):
+					t.Error("candidate selection did not stop after cancellation")
+				}
+			}()
+			if barrier != nil {
+				// Neither of the first two calls can return before both have
+				// entered Chat. Scheduling delays cannot serialize this probe.
+				for range 2 {
+					select {
+					case <-barrier.entered:
+					case <-ctx.Done():
+						t.Fatal("two candidate calls did not reach the barrier")
+					}
+				}
+				if calls.Load() != 2 || peak.Load() != 2 {
+					t.Fatalf("barrier calls/peak=%d/%d", calls.Load(), peak.Load())
+				}
+				close(barrier.release)
+			}
+			var selection CandidateSelection
+			select {
+			case selection = <-finished:
+			case <-ctx.Done():
+				t.Fatal("candidate selection did not finish")
+			}
 			if calls.Load() != test.calls || peak.Load() != test.peak {
 				t.Fatalf("calls/peak=%d/%d", calls.Load(), peak.Load())
 			}
@@ -180,7 +232,7 @@ func TestCandidateEnvironmentAndTimeout(t *testing.T) {
 	t.Setenv("MAKEWAND_CANDIDATE_CONCURRENCY", "1")
 	t.Setenv("MAKEWAND_CANDIDATE_TIMEOUT", "20ms")
 	t.Setenv("MAKEWAND_CANDIDATE_BUDGET_USD", "0")
-	r, calls, peak := candidateResourceRouter(t, 0, true)
+	r, calls, peak := candidateResourceRouter(t, 0, true, nil)
 	started := time.Now()
 	selection := RunCandidateSelection(context.Background(), r, nil, model.PhaseCode, nil, "", nil)
 	if time.Since(started) > time.Second || calls.Load() != 1 || peak.Load() != 1 || selection.Verified {

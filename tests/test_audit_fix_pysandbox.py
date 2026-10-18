@@ -186,7 +186,11 @@ class TestH1UnsandboxedLaunchAuthorization(unittest.TestCase):
                 cmd = list(run_mock.call_args[0][0])
                 # host launch carries the provider-worker marker in its environment
                 self.assertEqual(os.path.basename(cmd[0]), PROVIDER_BIN[name])
-                self.assertEqual(run_mock.call_args[1].get("extra_env"), {PROVIDER_WORKER_ENV: "1"})
+                child_env = run_mock.call_args[1]["extra_env"]
+                self.assertEqual(child_env[PROVIDER_WORKER_ENV], "1")
+                if name in ("codex", "claude"):
+                    variable = "CODEX_HOME" if name == "codex" else "CLAUDE_CONFIG_DIR"
+                    self.assertNotIn(variable, child_env)
                 audit.assert_called_once()
                 context, audited_cmd, _cwd, source = audit.call_args[0]
                 self.assertEqual(context, f"provider:{name}")
@@ -563,7 +567,9 @@ class TestProviderWorkerMarker(unittest.TestCase):
                 self.assertFalse(launch.sandboxed)
                 # no `env` prefix: it does not exist on Windows
                 self.assertEqual(launch.cmd, ["codex", "exec", "x"])
-                self.assertEqual(launch.env, {PROVIDER_WORKER_ENV: "1"})
+                self.assertEqual(launch.env[PROVIDER_WORKER_ENV], "1")
+                self.assertNotIn("CODEX_HOME", launch.env)
+                self.assertIsNone(launch.home)
             audit.assert_called_once()
 
     def test_non_provider_run_in_sandbox_has_no_marker(self):

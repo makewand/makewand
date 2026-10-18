@@ -37,6 +37,9 @@ from makewand.engine_selection import _engine_usable, _usable_or_api_relay, sele
 from makewand.ensemble import resolve_ensemble_providers, run_ensemble
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
+from makewand.providers.muse import execute_muse_task
+from makewand.providers.grok import execute_grok_task
+from makewand.providers.agy import execute_agy_task
 from makewand.sandbox import SandboxUnavailableError
 
 FAR_FUTURE = "9999-12-31T23:59:59"
@@ -280,7 +283,8 @@ class TestStatusRecommendsOnlyUsableEngines(unittest.TestCase):
 
 
 class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
-    ADAPTERS = {"claude": execute_claude_task, "codex": execute_codex_task}
+    ADAPTERS = {"claude": execute_claude_task, "codex": execute_codex_task,
+                "agy": execute_agy_task, "grok": execute_grok_task, "muse": execute_muse_task}
 
     def dispatch(self, engine, status, key=True, policy="allow_paid"):
         calls = []
@@ -294,6 +298,7 @@ class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
              patch("makewand.config.has_api_configured", return_value=key), \
              patch.dict(os.environ, {"MAKEWAND_API_POLICY": policy}), \
              patch("makewand.providers.api_client.call_api_chat", side_effect=api), \
+             patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
              patch("makewand.sandbox.provider_sandbox_launch", side_effect=SandboxUnavailableError("cli path")), \
              contextlib.redirect_stderr(io.StringIO()):
             result = self.ADAPTERS[engine]("审查这段代码", readonly=True, cwd=tempfile.gettempdir())
