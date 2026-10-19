@@ -40,6 +40,7 @@ from makewand.config import (
 # sessions never carry the marker or own a controlling terminal.
 # ---------------------------------------------------------------------------
 DISPATCH_ENV_VAR = "MAKEWAND_DISPATCH_ID"
+DEADLINE_ENV_VAR = "MAKEWAND_DISPATCH_DEADLINE_UNIX_MS"
 HUNG_MIN_AGE_SECONDS = 1800
 PROTECTED_COMMS = frozenset({
     # shells
@@ -58,10 +59,14 @@ def new_dispatch_id() -> str:
     return f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
 
 
-def mark_process_as_dispatcher() -> str:
+def mark_process_as_dispatcher(*, deadline_unix_ms=None) -> str:
     """Give this makewand process a fresh dispatch id inherited by its children."""
     dispatch_id = new_dispatch_id()
     os.environ[DISPATCH_ENV_VAR] = dispatch_id
+    if deadline_unix_ms is None:
+        os.environ.pop(DEADLINE_ENV_VAR, None)
+    else:
+        os.environ[DEADLINE_ENV_VAR] = str(deadline_unix_ms)
     return dispatch_id
 
 
@@ -76,6 +81,15 @@ def _read_proc_environ(pid: int) -> Optional[Dict[str, str]]:
             k, _, v = item.partition(b"=")
             env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
     return env
+
+
+def _within_task_deadline(pid: int) -> bool:
+    """A dispatched child inherits its workflow deadline in its initial env."""
+    env = _read_proc_environ(pid) or {}
+    try:
+        return time.time() * 1000 <= float(env.get(DEADLINE_ENV_VAR, "0"))
+    except ValueError:
+        return False
 
 
 def _read_proc_stat(pid: int) -> Optional[Dict[str, Any]]:
@@ -173,7 +187,7 @@ def find_makewand_dispatched_processes(min_age_seconds: int = HUNG_MIN_AGE_SECON
         if comm.lower() in PROTECTED_COMMS:
             continue
         age = _process_age_seconds(stat["starttime"])
-        if age is None or age < min_age_seconds:
+        if age is None or age < min_age_seconds or _within_task_deadline(pid):
             continue
         dispatcher_pid = None
         head = mark.split("-", 1)[0]
@@ -202,7 +216,7 @@ def terminate_dispatched_processes(candidates: List[Dict[str, Any]], confirm_pid
     cleaned = []
     for cand in candidates:
         pid = cand["pid"]
-        if pid not in confirmed:
+        if pid not in confirmed or _within_task_deadline(pid):
             continue
         stat = _read_proc_stat(pid)
         if not stat or stat["starttime"] != cand["starttime"] or get_dispatch_id(pid) != cand["dispatch_id"]:
@@ -580,7 +594,9 @@ def classify_operation(session_name, lines, metrics, long_proc=None):
         elif any(k in args_str for k in ("serve", "server", "uvicorn", "gunicorn", "dashboard", "http.server", "flask", "fastapi", "streamlit", "gradio", "webpack", "vite")) or \
              any(k in long_proc["comm"].lower() for k in ("uvicorn", "gunicorn", "caddy", "nginx")):
             return "server_daemon", f"后台服务/仪表盘运行中已持续 {elapsed_min} 分钟 (PID {long_proc['pid']})"
-        elif elapsed_min >= 30 and long_proc.get("makewand_dispatched"):
+        elif long_proc.get("makewand_dispatched") and _within_task_deadline(long_proc["pid"]):
+            return "long_running", f"makewand 任务仍在自己的时限内 (PID {long_proc['pid']}, {elapsed_min} 分钟)"
+        elif long_proc["etimes"] >= HUNG_MIN_AGE_SECONDS and long_proc.get("makewand_dispatched"):
             return "hung_anomaly", f"makewand 派发的子进程 (PID {long_proc['pid']}, {long_proc['comm']}) 持续运行达 {elapsed_min} 分钟，疑似挂起"
         elif elapsed_min >= 30:
             return "long_running", f"长时运行进程 (PID {long_proc['pid']}, {long_proc['comm']}, {elapsed_min} 分钟)；非 makewand 派发，仅观察不处理"

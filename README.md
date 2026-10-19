@@ -201,6 +201,10 @@ makewand race "比较两种实现" --total-timeout 180 --judge-reserve-seconds 4
 MAKEWAND_CANDIDATES=1 MAKEWAND_CANDIDATE_CONCURRENCY=1 makewand new
 ```
 
+`run`、`review`、`race`、`ensemble` 以及直接派活命令（`codex`、`claude`、`agy`、`grok`、`muse`、`local`、`aider` 及直接 API 命令）未指定 `--timeout` 时继承 `--total-timeout`；两者都未指定时为 300 秒（ensemble 为 900 秒），均指定时取较小值。
+
+`makewand route <类型> <难度> --self codex` 输出的每条派活命令包含 `--max-model-calls 1 --timeout N --total-timeout N`；review 任务还包含 `--readonly`。按 mechanical / normal / hard，implement 的 N 为 1200 / 3600 / 10800 秒，其余 review / test / research / doc 为 900 / 1800 / 5400 秒。时限按难度和实际档位中较高者选取，route 的 `--total-timeout` 可覆盖该值，升档提示保留此覆盖。JSON 顶层及每个候选包含 `timeout`、`total_timeout`、`readonly` 字段，候选的 `command` 可直接照抄。
+
 Go 原生调用、Python 流水线、直接工具命令、比赛裁判及真实模型探活共享调用账本，失败和裁决补问也占一次。`--call-budget-file` 让多个进程共享上限；只指定 `--max-model-calls` 时，入口创建本次任务的独立账本。账本的最大值只能降低，已开始的调用不退还额度。发送后无法确定结果时返回 `UNKNOWN`，停止自动切换提供者或重派。统计单位是 Makewand 派发尝试，无法限制供应商 CLI 内部工具轮次或代替 Token/费用计量。
 
 `--workflow auto` 对风险未知的任务采用跨提供商流水线；明确的低风险任务可使用 `--workflow single --risk low`，仍需单独的只读审查和本地测试。`--risk high` 要求跨提供商验证，不足时返回未验证。Race 提前预留两次实现和一次裁判调用，并默认留出总期限的 25%（最多 60 秒）供裁判使用；资源不足会停止派发。混合候选仍通过显式 `merge` 和独立审查交付。

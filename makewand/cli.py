@@ -68,6 +68,39 @@ from makewand.providers.codex import execute_codex_task
 from makewand.providers.muse import execute_muse_task
 from makewand.providers.grok import execute_grok_task
 
+DIRECT_TASK_COMMANDS = frozenset({
+    "claude", "codex", "agy", "muse", "grok", "local", "aider",
+    "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow",
+})
+
+
+TIMEOUT_DEFAULTS = {**dict.fromkeys(DIRECT_TASK_COMMANDS, 300),
+                    "run": 300, "review": 300, "race": 300, "ensemble": 900}
+PROMPT_COMMANDS = DIRECT_TASK_COMMANDS | {"run", "race", "plan"}
+
+
+def _resolve_direct_timeout(args):
+    """Resolve task limits before discovery, daemon dispatch or ledger access."""
+    total = args.total_timeout
+    if total is not None and (not math.isfinite(total) or total <= 0):
+        raise ValueError("--total-timeout must be a finite positive number")
+    if args.subcommand in TIMEOUT_DEFAULTS:
+        if args.timeout is None:
+            args.timeout = total if total is not None else TIMEOUT_DEFAULTS[args.subcommand]
+        elif total is not None:
+            args.timeout = min(args.timeout, total)
+
+
+def _command_wall_timeout(args):
+    """Workflow budget, also used by the daemon and process observer."""
+    if args.total_timeout is not None:
+        return args.total_timeout
+    timeout = getattr(args, "timeout", None)
+    if args.subcommand == "run":
+        return max(900, timeout * 3)
+    return timeout
+
+
 def _execute_direct_task(engine, execute, prompt, **kwargs):
     """Direct commands share typed admission, deadlines and observation, and record
     the dispatch in the usage ledger with the route (cli/api) the adapter took."""
@@ -1455,7 +1488,7 @@ def _main():
     p_run.add_argument("--boost", action="store_true", default=False, help="Force boost/overclock mode: bypass soft burn rate penalty and allocate highest reasoning power")
     p_run.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: use local self-hosted models for both coding and review")
     p_run.add_argument("--provider", dest="provider", default=None, help="Explicit primary provider override (e.g. deepseek, qwen, local, claude, codex, agy, grok, muse)")
-    p_run.add_argument("--timeout", type=int, default=300, help="Pipeline execution timeout in seconds (default: 300)")
+    p_run.add_argument("--timeout", type=int, default=None, help="Per-stage timeout in seconds (default: --total-timeout, otherwise 300)")
 
     # review
     p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity", parents=[sub_common_parser])
@@ -1463,7 +1496,7 @@ def _main():
     p_rev.add_argument("--candidate", choices=["M"], default=None, help="Saved candidate to review (requires --race-id)")
     p_rev.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_rev.add_argument("--stream", action="store_true", default=False, help="Stream review output line-by-line")
-    p_rev.add_argument("--timeout", type=int, default=300)
+    p_rev.add_argument("--timeout", type=int, default=None)
     p_rev.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: review diff using only local self-hosted model")
 
     p_merge = subparsers.add_parser("merge", help="Synthesize and test a saved hybrid candidate", parents=[sub_common_parser])
@@ -1472,7 +1505,7 @@ def _main():
     # race
     p_race = subparsers.add_parser("race", help="Run prompt on two models in parallel worktrees and compare", parents=[sub_common_parser])
     p_race.add_argument("prompt", nargs="?", default=None, help="Prompt for race comparison")
-    p_race.add_argument("--timeout", type=int, default=300)
+    p_race.add_argument("--timeout", type=int, default=None)
     p_race.add_argument("--hybrid", action="store_true", help="Also synthesize a sealed hybrid candidate; requires separate review before apply")
 
     # ensemble (multi-model brain trust panel review)
@@ -1485,7 +1518,7 @@ def _main():
     p_ens.add_argument("--no-matrix", dest="matrix", action="store_false", default=True, help="Disable generation of comparison synthesis matrix")
     p_ens.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_ens.add_argument("--stream", action="store_true", default=False, help="Stream review outputs")
-    p_ens.add_argument("--timeout", type=int, default=900, help="Per-model timeout in seconds (default: 900)")
+    p_ens.add_argument("--timeout", type=int, default=None, help="Per-model timeout in seconds (default: --total-timeout, otherwise 900)")
     p_ens.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Run only local/offline models")
 
     # search (budgeted search guardrail)
@@ -1536,7 +1569,8 @@ def _main():
     p_claude.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_claude.add_argument("--model", help="Specific model name")
     p_claude.add_argument("--stream", action="store_true", default=False)
-    p_claude.add_argument("--timeout", type=int, default=300)
+    p_claude.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_claude.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_codex = subparsers.add_parser("codex", help="Run prompt directly with Codex CLI subscription", parents=[sub_common_parser])
@@ -1545,7 +1579,8 @@ def _main():
     p_codex.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_codex.add_argument("--model", help="Specific model name")
     p_codex.add_argument("--stream", action="store_true", default=False)
-    p_codex.add_argument("--timeout", type=int, default=300)
+    p_codex.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_codex.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_agy = subparsers.add_parser("agy", help="Run prompt directly with Antigravity CLI subscription", parents=[sub_common_parser])
@@ -1554,7 +1589,8 @@ def _main():
     p_agy.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_agy.add_argument("--model", help="Specific model name")
     p_agy.add_argument("--stream", action="store_true", default=False)
-    p_agy.add_argument("--timeout", type=int, default=300)
+    p_agy.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_agy.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_muse = subparsers.add_parser("muse", help="Run prompt directly with Muse Code subscription", parents=[sub_common_parser])
@@ -1563,7 +1599,8 @@ def _main():
     p_muse.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_muse.add_argument("--model", help="Specific model name")
     p_muse.add_argument("--stream", action="store_true", default=False)
-    p_muse.add_argument("--timeout", type=int, default=300)
+    p_muse.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_muse.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_grok = subparsers.add_parser("grok", help="Run prompt directly with Grok Build CLI (xAI subscription)", parents=[sub_common_parser])
@@ -1572,7 +1609,8 @@ def _main():
     p_grok.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_grok.add_argument("--model", help="Specific model name")
     p_grok.add_argument("--stream", action="store_true", default=False)
-    p_grok.add_argument("--timeout", type=int, default=300)
+    p_grok.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_grok.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_local = subparsers.add_parser("local", help="Run prompt directly with local self-hosted model (Ollama / vLLM, 0 token cost)", parents=[sub_common_parser])
@@ -1581,7 +1619,8 @@ def _main():
     p_local.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_local.add_argument("--model", help="Specific model name (e.g. gemma4:31b, llama3.2)")
     p_local.add_argument("--stream", action="store_true", default=False)
-    p_local.add_argument("--timeout", type=int, default=300)
+    p_local.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_local.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_observe = subparsers.add_parser("observe", help="Inspect all running AI sessions, classify behavior, and report makewand optimizations", parents=[sub_common_parser])
@@ -1666,7 +1705,8 @@ def _main():
     p_aider.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_aider.add_argument("--model", help="Specific model name")
     p_aider.add_argument("--stream", action="store_true", default=False)
-    p_aider.add_argument("--timeout", type=int, default=300)
+    p_aider.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_aider.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_deepseek = subparsers.add_parser("deepseek", help="Run prompt directly with DeepSeek API", parents=[sub_common_parser])
@@ -1675,7 +1715,8 @@ def _main():
     p_deepseek.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_deepseek.add_argument("--model", help="Specific model name (e.g. deepseek-chat, deepseek-reasoner)")
     p_deepseek.add_argument("--stream", action="store_true", default=False)
-    p_deepseek.add_argument("--timeout", type=int, default=300)
+    p_deepseek.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_deepseek.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     p_qwen = subparsers.add_parser("qwen", help="Run prompt directly with Aliyun Qwen API", parents=[sub_common_parser])
@@ -1684,7 +1725,8 @@ def _main():
     p_qwen.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
     p_qwen.add_argument("--model", help="Specific model name (e.g. qwen2.5-coder-32b-instruct, qwen-max)")
     p_qwen.add_argument("--stream", action="store_true", default=False)
-    p_qwen.add_argument("--timeout", type=int, default=300)
+    p_qwen.add_argument("--timeout", type=int, default=None,
+                             help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
     p_qwen.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     for api_provider, label in (("glm", "Zhipu GLM API"), ("kimi", "Moonshot Kimi API"),
@@ -1695,7 +1737,8 @@ def _main():
         p_api.add_argument("--mode", dest="tier", choices=["fast", "standard", "deep", "balanced", "power"], help="Alias for --tier")
         p_api.add_argument("--model", help="Specific model name")
         p_api.add_argument("--stream", action="store_true", default=False)
-        p_api.add_argument("--timeout", type=int, default=300)
+        p_api.add_argument("--timeout", type=int, default=None,
+                                 help="Per-call timeout in seconds (default: --total-timeout, otherwise 300)")
         p_api.add_argument("--readonly", action="store_true", default=False, help="Enforce read-only analysis without modifications")
 
     for detect_only in ("cursor", "copilot"):
@@ -1755,6 +1798,10 @@ def _main():
             is_auto_routed_run = True
 
     args = parser.parse_args()
+    try:
+        _resolve_direct_timeout(args)
+    except ValueError as error:
+        parser.error(str(error))
 
     # A provider CLI that makewand launched (claude/codex/agy/...) can read its own
     # global instructions or skills telling it to call makewand. Refuse anything
@@ -1846,20 +1893,15 @@ def _main():
         if os.environ.get("MAKEWAND_INSIDE_DAEMON") != "1":
             from makewand.daemon import try_dispatch_via_daemon
             stdin_text = None
-            if args.subcommand in {"run", "race", "plan", "claude", "codex", "agy", "muse", "grok", "local", "aider", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"}:
+            if args.subcommand in PROMPT_COMMANDS:
                 if not getattr(args, "prompt", None) and not getattr(args, "prompt_file", None) and not sys.stdin.isatty():
                     stdin_text = sys.stdin.read()
-            daemon_code = try_dispatch_via_daemon(sys.argv[1:], cwd=original_cwd, stdin=stdin_text)
+            duration = _command_wall_timeout(args)
+            daemon_code = try_dispatch_via_daemon(
+                sys.argv[1:], cwd=original_cwd, stdin=stdin_text,
+                timeout=duration + 30 if duration is not None else None)
             if daemon_code is not None:
                 sys.exit(daemon_code)
-
-    # Mark this process as a makewand dispatcher: every provider CLI, sandbox and
-    # test process it spawns inherits MAKEWAND_DISPATCH_ID, which is how
-    # `observe --clean-hung` tells makewand's own processes apart from the
-    # user's sessions. `sandbox` runs a user-chosen command, so it is not marked.
-    if args.subcommand != "sandbox":
-        from makewand.observer import mark_process_as_dispatcher
-        mark_process_as_dispatcher()
 
     # Handle directory redirection (-C / --cwd) across all commands
     if hasattr(args, "cwd") and args.cwd:
@@ -1892,16 +1934,16 @@ def _main():
                 pass
 
     if not args.subcommand:
+        # Interactive sessions dispatch pipelines too; mark them (no deadline) as master did,
+        # so `makewand observe` attributes their provider children to makewand.
+        from makewand.observer import mark_process_as_dispatcher
+        mark_process_as_dispatcher()
         from makewand.interactive import start_interactive_session
         start_interactive_session(repo_trust=getattr(args, "repo_trust", "trusted"))
         sys.exit(0)
 
     # Subcommands that consume prompt text (from argument, -f file, or stdin pipe)
-    prompt_subcommands = {
-        "run", "race", "plan", "claude", "codex", "agy", "muse", "grok",
-        "local", "aider", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"
-    }
-    if args.subcommand in prompt_subcommands:
+    if args.subcommand in PROMPT_COMMANDS:
         args.prompt = _resolve_cli_prompt(args, original_cwd=original_cwd, required=True)
 
     from makewand.execution_runtime import execution_context
@@ -1911,6 +1953,16 @@ def _main():
     deadline = math.ceil(time.time() * 1000 + args.total_timeout * 1000) if args.total_timeout is not None else None
     workflow = selected.workflow if args.subcommand in ("run", "race") else "review" if args.subcommand == "review" else "direct"
     with execution_context(deadline_unix_ms=deadline, workflow=workflow, risk=selected.risk):
+        # Publish the deadline after preflight/prompt reads, immediately before
+        # dispatch. With no total budget, allow 30s for workflow startup/teardown.
+        if args.subcommand != "sandbox":
+            from makewand.observer import mark_process_as_dispatcher
+            from makewand.execution_runtime import current_context
+            observed_deadline = current_context().get("deadline_unix_ms")
+            duration = _command_wall_timeout(args)
+            if observed_deadline is None and duration is not None:
+                observed_deadline = math.ceil((time.time() + duration + 30) * 1000)
+            mark_process_as_dispatcher(deadline_unix_ms=observed_deadline)
         exit_signal = None
         with stage("command") as span:
             try:

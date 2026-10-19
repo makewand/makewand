@@ -3482,6 +3482,7 @@ def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
                 outcome = {"error": None}
                 code = _run_race_impl(prompt, cwd=cwd, timeout=total, repo_trust=repo_trust,
                     engine_a=engine_a, engine_b=engine_b, synthesize_hybrid=synthesize_hybrid,
+                    **({"_call_timeout": min(timeout, total)} if timeout != total else {}),
                     _leases=tuple(leases), judge_reserve_seconds=reserve_seconds, tier=tier,
                     effort=effort, _cross_review_required=plan.cross_review_required, _outcome=outcome,
                     **({"protected_paths": protected_paths} if protected_paths is not None else {}))
@@ -3529,6 +3530,7 @@ def _run_race_impl(
     effort: Optional[str] = None,
     _cross_review_required: bool = True,
     _outcome: Optional[Dict[str, Any]] = None,
+    _call_timeout: Optional[float] = None,
 ):
     """The race behind run_race; ``_outcome["error"]`` receives the reason of a refusal
     that run_race reports in its typed result."""
@@ -3545,7 +3547,7 @@ def _run_race_impl(
         race_deadline = min(race_deadline, parent_context["_deadline_monotonic"])
     def remaining_timeout(cap=timeout, generation=False):
         remaining = race_deadline - time.monotonic() - (judge_reserve_seconds if generation else 0)
-        return max(0, min(cap, remaining))
+        return max(0, min(cap, remaining, _call_timeout if _call_timeout is not None else timeout))
     check_load_backpressure()
     if not cwd:
         cwd = os.getcwd()
