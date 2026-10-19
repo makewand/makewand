@@ -327,9 +327,11 @@ if [ -n "$info" ]; then
   if [ "$sharednet" = 1 ]; then /bin/ln "$proc/self/ns/net" "$child/ns/net"; else echo net > "$child/ns/net"; fi
   echo "$$ (bwrap) S ${ppid:-$$} 0 0" > "$child/stat"
   : > "$child/uid_map"
+  # Log before publishing the PID: namespace rejection can kill this process
+  # immediately after the reader receives it (before any subsequent command).
+  echo "bwrap[$$]: info-sent" >> "$log"
   eval "printf '{\"child-pid\": %%d}\n' $$ >&$info"
   eval "exec $info>&-"
-  echo "bwrap[$$]: info-sent" >> "$log"
   (
     if [ "$schedule" = resolver-after-network ]; then
       while [ ! -f "$log.nft-done" ]; do /bin/sleep 0.001; done

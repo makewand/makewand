@@ -26,12 +26,18 @@ func TestRawCLIChildStub(t *testing.T) {
 	if os.Getenv("MAKEWAND_VERSUS_CHILD_STUB") != "1" {
 		return
 	}
-	if os.Getenv("MAKEWAND_VERSUS_CHILD_MODE") == "initialization-delay" {
-		// The true parent deadline must apply before any provider dispatch marker,
-		// even when the Go runtime starts promptly on a fast host.
-		time.Sleep(10 * time.Second)
-	}
 	path := os.Getenv("MAKEWAND_VERSUS_CHILD_STATE")
+	if os.Getenv("MAKEWAND_VERSUS_CHILD_MODE") == "initialization-delay" {
+		// Readiness is before the dispatch marker. Only a parent-controlled gate
+		// may release initialization; elapsed startup time cannot release it.
+		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
+		if err := os.WriteFile(path+".initialization-ready", []byte("ready"), 0o600); err != nil {
+			os.Exit(4)
+		}
+		if !waitRawStubMarker(path, ".release") {
+			os.Exit(7)
+		}
+	}
 	// #nosec G703 -- child state is a parent-test-created temporary fixture path.
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
 	if err != nil {
@@ -41,6 +47,11 @@ func TestRawCLIChildStub(t *testing.T) {
 	closeErr := file.Close()
 	if err != nil || closeErr != nil {
 		os.Exit(3)
+	}
+	if mode := os.Getenv("MAKEWAND_VERSUS_CHILD_MODE"); mode == "quota" || mode == "unknown" {
+		if !waitRawStubMarker(path, ".respond") {
+			os.Exit(7)
+		}
 	}
 	switch os.Getenv("MAKEWAND_VERSUS_CHILD_MODE") {
 	case "quota":
@@ -372,13 +383,23 @@ func TestRawCLIEventRecorderFailureKeepsKnownOutcomeAndBudget(t *testing.T) {
 
 func TestRawCLIFailureAndUnknownEachConsumeOneAttemptWithoutRetry(t *testing.T) {
 	for _, test := range []struct {
-		mode   string
-		status execution.Status
-		known  bool
-	}{{"quota", execution.Unknown, false}, {"unknown", execution.Unknown, false}} {
+		mode    string
+		status  execution.Status
+		known   bool
+		message string
+	}{{"quota", execution.Unknown, false, "synthetic quota exceeded"}, {"unknown", execution.Unknown, false, "Transport error (1007)"}} {
 		t.Run(test.mode, func(t *testing.T) {
 			bin, state, ledger, _ := setupRawStub(t, 3, test.mode)
-			r := runCLIWithTimeout(context.Background(), "offline", bin, rawStubArgs(), 3*time.Second)
+			guard, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			done := startRawTimingRun(t, guard, bin, time.Minute)
+			waitRawTimingReady(t, guard, done, state, "")
+			// The error is released after actual dispatch. Neither admission nor
+			// Windows race runtime startup competes with a short outcome timeout.
+			if err := os.WriteFile(state+".respond", []byte("respond"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			r := waitRawTimingResult(t, guard, done)
 			attempts := readRawAttempts(t, ledger)
 			if r.err == nil || execution.ErrorStatus(r.err) != test.status || rawDispatchCount(t, state) != 1 || len(attempts) != 1 || attempts[0].Status != test.status || attempts[0].Known != test.known {
 				t.Fatalf("raw outcome=%v attempts=%+v dispatches=%d", r.err, attempts, rawDispatchCount(t, state))
@@ -386,37 +407,111 @@ func TestRawCLIFailureAndUnknownEachConsumeOneAttemptWithoutRetry(t *testing.T) 
 			if !errors.Is(r.err, execution.ErrUnknownOutcome) {
 				t.Fatal("uncertain raw failure became replayable")
 			}
+			if guard.Err() != nil || errors.Is(r.err, context.DeadlineExceeded) || errors.Is(r.err, context.Canceled) || !strings.Contains(r.err.Error(), test.message) {
+				t.Fatalf("startup guard masked the synthetic failure: %v (guard %v)", r.err, guard.Err())
+			}
 		})
 	}
 }
 
 func TestRawCLIHonorsEarlierParentDeadlineAndAccountsTimeout(t *testing.T) {
 	bin, state, ledger, _ := setupRawStub(t, 2, "initialization-delay")
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	guard, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	started := time.Now()
-	deadline, _ := ctx.Deadline()
-	doneObserved := make(chan time.Time, 1)
-	stopObserve := context.AfterFunc(ctx, func() { doneObserved <- time.Now() })
-	defer stopObserve()
-	r := runCLIWithTimeout(ctx, "offline", bin, rawStubArgs(), 5*time.Second)
-	terminalAt := time.Now()
-	var contextDoneAt time.Time
-	select {
-	case contextDoneAt = <-doneObserved:
-	case <-time.After(time.Second):
-		t.Fatal("parent deadline completion was not observed")
-	}
+	// Inject the parent's deadline event only after the real process is held
+	// in initialization. Its advertised deadline is earlier than the raw arm's
+	// timeout; no production hook or sub-200ms filesystem budget is needed.
+	ctx := &rawTimingDeadlineContext{Context: context.Background(), deadline: time.Now().Add(time.Minute), done: make(chan struct{})}
+	done := startRawTimingRun(t, ctx, bin, 2*time.Minute)
+	waitRawTimingReady(t, guard, done, state, ".initialization-ready")
+	ctx.expire()
+	r := waitRawTimingResult(t, guard, done)
 	attempts := readRawAttempts(t, ledger)
-	// The genuine 200ms parent deadline is unchanged. Measure the termination
-	// bound (up to 2 seconds under heavy Windows race detector load) from its deadline,
-	// rather than counting initialization and the wait until the deadline as termination time.
-	// The absolute deadline also prevents a delayed observation callback from
-	// making a late termination look timely under the race scheduler.
-	if !errors.Is(r.err, context.DeadlineExceeded) || !errors.Is(r.err, execution.ErrUnknownOutcome) || terminalAt.Sub(deadline) > 2*time.Second || rawDispatchCount(t, state) != 0 || len(attempts) != 1 || attempts[0].Status != execution.Timeout || attempts[0].Known {
-		t.Fatalf("parent deadline not honored: total=%v after_deadline=%v done_observer_delay=%v error=%v attempts=%+v dispatches=%d", terminalAt.Sub(started), terminalAt.Sub(deadline), contextDoneAt.Sub(deadline), r.err, attempts, rawDispatchCount(t, state))
+	if guard.Err() != nil || !errors.Is(r.err, context.DeadlineExceeded) || !errors.Is(r.err, execution.ErrUnknownOutcome) || rawDispatchCount(t, state) != 0 || len(attempts) != 1 || attempts[0].Status != execution.Timeout || attempts[0].Known {
+		t.Fatalf("parent deadline not honored: error=%v guard=%v attempts=%+v dispatches=%d", r.err, guard.Err(), attempts, rawDispatchCount(t, state))
 	}
-	t.Logf("real parent deadline=200ms total=%v after_deadline=%v done_observer_delay=%v dispatches=0", terminalAt.Sub(started), terminalAt.Sub(deadline), contextDoneAt.Sub(deadline))
+}
+
+// rawTimingDeadlineContext injects a parent's deadline notification. expire
+// supplies that event without making real process startup race a wall-clock
+// timer. The advertised deadline precedes the raw timeout; a separate real-time
+// guard detects ignored cancellation or stuck accounting.
+type rawTimingDeadlineContext struct {
+	context.Context
+	deadline time.Time
+	done     chan struct{}
+	once     sync.Once
+}
+
+func (c *rawTimingDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *rawTimingDeadlineContext) Done() <-chan struct{}       { return c.done }
+func (c *rawTimingDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+func (c *rawTimingDeadlineContext) expire() { c.once.Do(func() { close(c.done) }) }
+
+// These guards only bound hangs. Readiness and completion events, rather than
+// a throughput target, drive the timing tests on both Windows race and Unix.
+func startRawTimingRun(t *testing.T, parent context.Context, bin string, timeout time.Duration) <-chan result {
+	t.Helper()
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan result, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		done <- runCLIWithTimeout(ctx, "offline", bin, rawStubArgs(), timeout)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Error("raw timing fixture did not stop after cleanup cancellation")
+		}
+	})
+	return done
+}
+
+func waitRawTimingReady(t *testing.T, guard context.Context, done <-chan result, state, suffix string) {
+	t.Helper()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if suffix == "" {
+			if rawDispatchCount(t, state) > 0 {
+				return
+			}
+		} else {
+			if _, err := os.Stat(state + suffix); err == nil {
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		}
+		select {
+		case r := <-done:
+			t.Fatalf("raw command exited before readiness %q: %v", suffix, r.err)
+		case <-guard.Done():
+			t.Fatalf("raw command did not reach readiness %q: %v", suffix, guard.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitRawTimingResult(t *testing.T, guard context.Context, done <-chan result) result {
+	t.Helper()
+	select {
+	case r := <-done:
+		return r
+	case <-guard.Done():
+		t.Fatalf("raw command did not complete within hang guard: %v", guard.Err())
+		return result{}
+	}
 }
 
 func TestRawCLIStartFailureHonorsContext(t *testing.T) {

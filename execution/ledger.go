@@ -32,6 +32,10 @@ func ContextWithCapacityFallback(ctx context.Context, available func() bool) con
 
 const maximumLedgerBytes = 16 << 20
 
+// Durable evidence and ledger settlement use the same bounded, independent
+// lock budget, including Windows ACL/filter I/O before the lock is acquired.
+const accountingWriteTimeout = 5 * time.Second
+
 type UnknownOutcomeError struct{ Err error }
 
 func (e *UnknownOutcomeError) Error() string {
@@ -74,6 +78,7 @@ type Attempt struct {
 	startCommitted    bool
 	evidence          *ProviderEvidence
 	evidenceError     error
+	evidenceContext   context.Context // optional per-attempt context for driving evidence writes in tests
 	leaseStop         chan struct{}
 	leaseStopOnce     sync.Once
 	releaseRetryOnce  sync.Once
@@ -598,7 +603,7 @@ func (a *Attempt) complete(outcome Outcome) error {
 			evidenceErr = fmt.Errorf("provider evidence unavailable: %w", evidenceErr)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), accountingWriteTimeout)
 	defer cancel()
 	if a.config.LedgerPath != "" {
 		if err := withLockedFile(ctx, a.config.LedgerPath, a.config.ledgerDirectory, func(path *accountingPath) error {
@@ -706,7 +711,7 @@ func (a *Attempt) transition(release, beforeDispatch bool) error {
 	if a == nil || a.config.LedgerPath == "" {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), accountingWriteTimeout)
 	defer cancel()
 	return withLockedFile(ctx, a.config.LedgerPath, a.config.ledgerDirectory, func(path *accountingPath) error {
 		data, err := readLedger(path, a.config.MaxCalls)
