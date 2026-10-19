@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
+from makewand.discovery import independent_models
 from makewand.config import (
     c,
     COLOR_BOLD,
@@ -56,7 +57,7 @@ from makewand.git_helper import (
     _printable,
     _shell_quote,
 )
-from makewand.candidate import CandidateManager, build_manifest, get_candidate_files_changed, remove_new_generated_bytecode
+from makewand.candidate import CandidateManager, ManifestBudget, ManifestCache, build_manifest, get_candidate_files_changed, remove_new_generated_bytecode
 from makewand.protected_files import ProtectedFiles, ProtectionError
 from makewand.artifact import workspace_snapshot
 from makewand.health import get_or_update_status
@@ -80,6 +81,11 @@ def _print(*values, **kwargs):
     output): those are shown as \\xNN (git_helper._printable) instead of raising
     UnicodeEncodeError on a UTF-8 stream."""
     builtins.print(*(_printable(value if isinstance(value, str) else str(value)) for value in values), **kwargs)
+
+
+def _print_json(value):
+    """Serialize before printing: diagnostic \\xNN escapes are not JSON escapes."""
+    builtins.print(_json_text(value))
 
 
 def _get_git_dirty_entries(root_path: Path) -> List[Tuple[str, str]]:
@@ -337,7 +343,7 @@ def _dispatchable_reviewer(engine: Optional[str], cache) -> bool:
     return bool(engine) and engine not in ENGINES_WITHOUT_EXECUTOR and _engine_usable(engine, cache)[0]
 
 
-def _review_stand_ins(planned, excluded, cache, self_reviewer: Optional[str] = None) -> List[str]:
+def _review_stand_ins(planned, excluded, cache, self_reviewer: Optional[str] = None, *, independent_fn=None) -> List[str]:
     """Pipeline reviewers that may replace one unable to receive the whole review
     prompt, or a stand-in that then failed.
 
@@ -349,14 +355,17 @@ def _review_stand_ins(planned, excluded, cache, self_reviewer: Optional[str] = N
     """
     from makewand.config import get_active_providers
     pool = dict.fromkeys(list(planned) + list(get_active_providers()))
-    stand_ins = [e for e in pool if e and e not in excluded and _dispatchable_reviewer(e, cache)]
+    if independent_fn is None:
+        independent_fn = lambda engine: all(independent_models(engine, author) for author in excluded)
+    stand_ins = [e for e in pool if e and e not in excluded and _dispatchable_reviewer(e, cache)
+                 and independent_fn(e)]
     if self_reviewer and self_reviewer not in stand_ins:
         stand_ins.append(self_reviewer)
     return stand_ins
 
 
 def _select_wta_reviewer(cache, winner_engine: str, contestants, cross_review_required: bool = True,
-                         review_prompt: Optional[str] = None) -> Optional[str]:
+                         review_prompt: Optional[str] = None, *, winner_tier="standard") -> Optional[str]:
     """Read-only reviewer for a race winner (a Winner-Take-All candidate, or a judge's pick
     when the judge shares the winner's provider).
 
@@ -367,29 +376,23 @@ def _select_wta_reviewer(cache, winner_engine: str, contestants, cross_review_re
     contestant. When no independent reviewer can take the review, the judge
     picker's fallback applies (the first in that order, a contestant included),
     except that with cross review required (always for a race) the winner's own
-    provider never reviews it. Never a reviewer that cannot receive the whole
+    provider or model family never reviews it. Never a reviewer that cannot receive the whole
     review_prompt.
     """
-    from makewand.engine_selection import _RACE_JUDGE_ORDER
     winner = (winner_engine or "").lower()
-    preferred = _select_race_judge(cache, contestants)
-    candidates = dict.fromkeys(([preferred] if preferred else [])
-                               + [e for e in _RACE_JUDGE_ORDER if _engine_usable(e, cache)[0]])
-    others = [e for e in candidates if e.lower() != winner and reviewer_receives_whole_prompt(e, review_prompt)]
-    taken = {e.lower() for e in contestants if e}
-    independent = [e for e in others if e.lower() not in taken]
-    if independent:
-        return independent[0]
-    if others:
-        return others[0]  # the judge picker's fallback: the other contestant
+    reviewer = _select_independent_race_judge(
+        cache, contestants, review_prompt, exclude=(winner,), cross_review_required=True,
+        contestant_tier=winner_tier)
+    if reviewer:
+        return reviewer
     if (not cross_review_required and winner and _engine_usable(winner, cache)[0]
             and reviewer_receives_whole_prompt(winner, review_prompt)):
-        return winner  # the last resort when cross review is not required
+        return winner
     return None
 
 
-def _select_independent_race_judge(cache, contestants, judge_prompt: str,
-                                   cross_review_required: bool = True) -> Optional[str]:
+def _select_independent_race_judge(cache, contestants, judge_prompt: Optional[str],
+                                   cross_review_required: bool = True, exclude=(), *, contestant_tier="standard") -> Optional[str]:
     """Judge for a two-candidate race that receives the whole judge prompt.
 
     With cross review required (always for a race) a provider different from
@@ -403,10 +406,14 @@ def _select_independent_race_judge(cache, contestants, judge_prompt: str,
     preferred = _select_race_judge(cache, contestants)
     candidates = ([preferred] if preferred else []) + [
         e for e in _RACE_JUDGE_ORDER if e != preferred and _engine_usable(e, cache)[0]]
-    able = [e for e in candidates if reviewer_receives_whole_prompt(e, judge_prompt)]
+    excluded = {e.lower() for e in exclude if e}
+    able = [e for e in candidates if e.lower() not in excluded
+            and all(independent_models(e, author, author_tier=contestant_tier) for author in excluded)
+            and reviewer_receives_whole_prompt(e, judge_prompt)]
     if cross_review_required:
         taken = {e.lower() for e in contestants if e}
-        independent = [e for e in able if e.lower() not in taken]
+        independent = [e for e in able if e.lower() not in taken
+                       and all(independent_models(e, author, author_tier=contestant_tier) for author in taken)]
         if independent:
             return independent[0]
     return able[0] if able else None
@@ -414,7 +421,7 @@ def _select_independent_race_judge(cache, contestants, judge_prompt: str,
 
 def _review_race_winner(prompt: str, label: str, engine: str, contestants, diff: str,
                         workspace: str, cache, timeout: float, *, lease=None, effort=None,
-                        repo_trust: str = "trusted", cross_review_required: bool = True) -> Dict[str, Any]:
+                        repo_trust: str = "trusted", cross_review_required: bool = True, winner_tier="standard") -> Dict[str, Any]:
     """Independent, read-only, nonce-bound review of a race winner.
 
     Passing the local tests first never approves a candidate by itself, and a
@@ -447,9 +454,10 @@ def _review_race_winner(prompt: str, label: str, engine: str, contestants, diff:
         f"{review_verdict_output_spec(nonce=nonce)}"
         f"--- 候选方案 {label} 的代码改动 (git diff) ---\n{diff_block}"
     )
-    reviewer = _select_wta_reviewer(cache, engine, contestants, cross_review_required, review_prompt)
+    reviewer = _select_wta_reviewer(cache, engine, contestants, cross_review_required, review_prompt,
+                                    winner_tier=winner_tier)
     if reviewer is None:
-        result["reason"] = "没有与胜出选手不同提供者、且能完整接收复审提示的已启用只读复审引擎"
+        result["reason"] = "没有模型家族独立、且能完整接收复审提示的已启用只读复审引擎"
         return result
     result["reviewer"] = reviewer
     if timeout <= 0:
@@ -698,12 +706,52 @@ _GLOB_CLASSES = {  # git's ASCII-only character classes
 }
 
 
-def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool) -> int:
+_WILDMATCH_MAX_WORK = 100_000
+
+
+class _WildmatchLimit(Exception):
+    pass
+
+
+def _wildmatch_tick(work):
+    work[0] -= 1
+    if work[0] < 0:
+        raise _WildmatchLimit
+
+
+def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool, work=None) -> int:
+    """Memoized git wildmatch on an explicit stack; bounded even on hostile patterns."""
+    work = [_WILDMATCH_MAX_WORK] if work is None else work
+    key = (pi, ti)
+    stack = [(key, _wildmatch_steps(p, pi, t, ti, pathname, work))]
+    memo = {}
+    result = None
+    while stack:
+        _wildmatch_tick(work)
+        key, frame = stack[-1]
+        try:
+            child = frame.send(result)
+        except StopIteration as done:
+            result = memo[key] = done.value
+            stack.pop()
+        else:
+            if child in memo:
+                result = memo[child]
+            else:
+                stack.append((child, _wildmatch_steps(p, child[0], t, child[1], pathname, work)))
+                result = None
+    return result
+
+
+def _wildmatch_steps(p: bytes, pi: int, t: bytes, ti: int, pathname: bool, work):
     """git's dowild(): "*" and "?" never match "/" with pathname, a "**" between
     slashes (or at an end) matches any number of directories, "[...]" is a set
-    ("!" or "^" negates, ranges, [:class:], "\\" escapes) and "\\" quotes a byte."""
+    ("!" or "^" negates, ranges, [:class:], "\\" escapes) and "\\" quotes a byte.
+    A frame yields a child (pattern offset, text offset) and receives its verdict;
+    _wildmatch drives the stack, so even long patterns use no Python recursion."""
     start, np, nt = pi, len(p), len(t)
     while pi < np:
+        _wildmatch_tick(work)
         p_ch = p[pi]
         t_ch = t[ti] if ti < nt else None
         if t_ch is None and p_ch != _GLOB_STAR:
@@ -721,12 +769,13 @@ def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool) -> int:
                 before = pi - 2
                 pi += 1
                 while pi < np and p[pi] == _GLOB_STAR:
+                    _wildmatch_tick(work)
                     pi += 1
                 following = p[pi] if pi < np else None
                 if ((before < start or p[before] == _GLOB_SLASH)
                         and (following is None or following == _GLOB_SLASH
                              or (following == _GLOB_ESCAPE and pi + 1 < np and p[pi + 1] == _GLOB_SLASH))):
-                    if following == _GLOB_SLASH and _wildmatch(p, pi + 1, t, ti, pathname) == _WM_MATCH:
+                    if following == _GLOB_SLASH and (yield (pi + 1, ti)) == _WM_MATCH:
                         return _WM_MATCH
                     match_slash = True
                 else:
@@ -745,15 +794,17 @@ def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool) -> int:
                 pi, ti = pi + 1, slash + 1  # one "*" matches up to the next directory
                 continue
             while t_ch is not None:
+                _wildmatch_tick(work)
                 if following not in _GLOB_SPECIAL:
                     while True:
+                        _wildmatch_tick(work)
                         t_ch = t[ti] if ti < nt else None
                         if t_ch is None or (not match_slash and t_ch == _GLOB_SLASH) or t_ch == following:
                             break
                         ti += 1
                     if t_ch != following:
                         return _WM_ABORT_TO_STARSTAR if match_slash else _WM_NOMATCH
-                matched = _wildmatch(p, pi, t, ti, pathname)
+                matched = (yield (pi, ti))
                 if matched != _WM_NOMATCH:
                     if not match_slash or matched != _WM_ABORT_TO_STARSTAR:
                         return matched
@@ -772,6 +823,7 @@ def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool) -> int:
             previous = 0
             matched = False
             while True:  # the first member may be "]"
+                _wildmatch_tick(work)
                 if p_ch is None:
                     return _WM_ABORT_ALL
                 if p_ch == _GLOB_ESCAPE:
@@ -795,6 +847,7 @@ def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool) -> int:
                 elif p_ch == _GLOB_OPEN and pi + 1 < np and p[pi + 1] == 58:  # "[:class:]"
                     name_start = pi = pi + 2
                     while pi < np and p[pi] != 93:
+                        _wildmatch_tick(work)
                         pi += 1
                     if pi >= np:
                         return _WM_ABORT_ALL
@@ -826,7 +879,7 @@ def _wildmatch(p: bytes, pi: int, t: bytes, ti: int, pathname: bool) -> int:
     return _WM_MATCH if ti >= nt else _WM_NOMATCH
 
 
-def _gitignore_rules(lines: List[str]) -> List[Tuple[bool, bool, bool, bytes]]:
+def _gitignore_rules(lines) -> List[Tuple[bool, bool, bool, bytes]]:
     """(negated, directory_only, basename_only, pattern) for each pattern line, as git
     parses them: blank lines and lines starting with "#" are skipped, a carriage
     return before the newline is dropped, trailing spaces go unless escaped ("\\ "),
@@ -835,7 +888,7 @@ def _gitignore_rules(lines: List[str]) -> List[Tuple[bool, bool, bool, bytes]]:
     any depth."""
     rules = []
     for number, line in enumerate(lines):
-        raw = os.fsencode(line)
+        raw = line if isinstance(line, bytes) else os.fsencode(line)
         if number == 0 and raw.startswith(b"\xef\xbb\xbf"):
             raw = raw[3:]
         if raw.endswith(b"\r"):
@@ -868,16 +921,17 @@ def _gitignore_rules(lines: List[str]) -> List[Tuple[bool, bool, bool, bytes]]:
     return rules
 
 
-def _gitignore_last_match(path: bytes, is_dir: bool, rules) -> Optional[bool]:
+def _gitignore_last_match(path: bytes, is_dir: bool, rules, work) -> Optional[bool]:
     """True (ignored) or False (re-included) by the last rule that matches path, or None."""
     basename = path.rsplit(b"/", 1)[-1]
     for negated, directory_only, basename_only, pattern in reversed(rules):
+        _wildmatch_tick(work)
         if directory_only and not is_dir:
             continue
         if basename_only:
-            matched = _wildmatch(pattern, 0, basename, 0, False) == _WM_MATCH
+            matched = _wildmatch(pattern, 0, basename, 0, False, work) == _WM_MATCH
         else:  # anchored at the .gitignore's directory; one leading "/" only says so
-            matched = _wildmatch(pattern[1:] if pattern.startswith(b"/") else pattern, 0, path, 0, True) == _WM_MATCH
+            matched = _wildmatch(pattern[1:] if pattern.startswith(b"/") else pattern, 0, path, 0, True, work) == _WM_MATCH
         if matched:
             return not negated
     return None
@@ -901,11 +955,17 @@ def _gitignore_rules_ignore(rel: str, rules) -> bool:
     """_gitignore_fallback_ignored with the lines already parsed (_gitignore_rules)."""
     if os.sep == "\\":
         rel = rel.replace("\\", "/")
-    parts = os.fsencode(rel).split(b"/")
-    for depth in range(1, len(parts)):
-        if _gitignore_last_match(b"/".join(parts[:depth]), True, rules):
-            return True
-    return bool(_gitignore_last_match(b"/".join(parts), False, rules))
+    work = [_WILDMATCH_MAX_WORK]
+    try:
+        parts = os.fsencode(rel).split(b"/")
+        for depth in range(1, len(parts)):
+            if _gitignore_last_match(b"/".join(parts[:depth]), True, rules, work):
+                return True
+        return bool(_gitignore_last_match(b"/".join(parts), False, rules, work))
+    except (_WildmatchLimit, UnicodeError, RecursionError):
+        # Incomplete evidence must retain the path as a tested input, even if a
+        # previous positive rule would have ignored it without this negation.
+        return False
 
 
 def _filter_non_deliverable_test_changes(paths: List[str], cwd: str) -> List[str]:
@@ -954,7 +1014,7 @@ def _filter_non_deliverable_test_changes(paths: List[str], cwd: str) -> List[str
         return candidates
     try:
         # Lines as git reads them: bytes split at "\n" (the names compare as bytes too).
-        lines = os.fsdecode(gitignore_file.read_bytes()).split("\n")
+        lines = gitignore_file.read_bytes().split(b"\n")
     except OSError:
         return candidates
     rules = _gitignore_rules(lines)
@@ -1298,6 +1358,9 @@ def dispatch_task(
     # (health._dispatch_failure_superseded reads it).
     with observe_dispatch_route() as route:
         result = execution_runtime.execute(request, execute)
+    if getattr(result, "error_kind", None) == "concurrency_busy":
+        # Capacity refused admission; no provider dispatch took place.
+        return result
     try:
         from makewand.usage import record_engine_usage
         record_engine_usage(engine, tier=tier, success=result[0], task=prompt, route=route.route)
@@ -1306,11 +1369,20 @@ def dispatch_task(
     return result
 
 
-def _stage_call(name, callback, *args, engine=None, **kwargs):
+def _has_capacity_fallback(engines, cache, prompt=None):
+    """Only usable candidates that can receive the prompt justify skipping a wait."""
+    return any(_engine_usable(engine, cache)[0] and
+               (prompt is None or reviewer_receives_whole_prompt(engine, prompt))
+               for engine in engines)
+
+
+def _stage_call(name, callback, *args, engine=None, wait_for_capacity=None, **kwargs):
     """Name the stage while retaining the callback's legacy return type."""
     from makewand.telemetry import stage
+    from makewand.execution_runtime import execution_context
     with stage(name, engine=engine, readonly=kwargs.get("readonly", False)) as span:
-        result = callback(*args, **kwargs)
+        with execution_context(wait_for_capacity=wait_for_capacity):
+            result = callback(*args, **kwargs)
         status = getattr(result, "status", None)
         if name == "test" and isinstance(result, tuple) and len(result) == 2 and result[0] is True and result[1] is None:
             status = "UNVERIFIED"
@@ -1776,13 +1848,14 @@ def _run_pipeline_impl(
         _print(c(f"🎯 [Makewand Smart Routing] 技术解释优先指派引擎: {primary_c.upper()} (候选梯队: {' -> '.join(e.upper() for e in sorted_engines)})", COLOR_CYAN))
 
         qa_output = None
-        for eng in sorted_engines:
+        for candidate_index, eng in enumerate(sorted_engines):
             step_timeout = get_remaining_timeout(timeout)
             if step_timeout <= 0:
                 _print(c("❌ [Makewand Budget] 全局流水线预算已耗尽，终止问答执行。", COLOR_RED + COLOR_BOLD))
                 return False
             result = _stage_call("review", dispatch_task,
                 eng, prompt, cwd=cwd, timeout=step_timeout, tier=tier,
+                wait_for_capacity=not _has_capacity_fallback(sorted_engines[candidate_index + 1:], cache, prompt),
                 model=model, effort=effort, stream=stream, readonly=True, repo_trust=repo_trust
             )
             ok, out, err = result
@@ -1831,7 +1904,7 @@ def _run_pipeline_impl(
         coder_candidates.insert(0, forced)
         primary_c = forced
         route_meta["primary_coder"] = forced
-        if not route_meta.get("primary_reviewer"):
+        if not route_meta.get("primary_reviewer") and route_meta.get("single_tool_mode"):
             # Routing found no other usable engine: the forced one is the only tool
             # (the single-tool review rules below decide whether it may review itself).
             reviewer_candidates = [forced]
@@ -1849,7 +1922,7 @@ def _run_pipeline_impl(
         _print(c("本地离线执行无法提供未知或高风险任务所需的跨提供者复审；请明确低风险或使用独立本地复审方案。", COLOR_YELLOW))
         return False
 
-    if _no_provider_detected(forced_engine, route_meta):
+    if _no_provider_detected(forced, route_meta):
         if _outcome is not None:
             _outcome.update(status="UNVERIFIED", error=_no_provider_error(route_meta))
         _print_no_provider_guidance(route_meta)
@@ -1862,7 +1935,7 @@ def _run_pipeline_impl(
         for r_item in route_meta["reasons"]:
             _print(c(f"  • {r_item}", COLOR_CYAN))
     _print(c(f"  • 主力实现引擎: {primary_c.upper()} (候选梯队: {' -> '.join([c.upper() for c in coder_candidates])})", COLOR_BOLD + COLOR_BLUE))
-    _print(c(f"  • 独立盲审引擎: {primary_r.upper()} (候选梯队: {' -> '.join([r.upper() for r in reviewer_candidates])})\n", COLOR_BOLD + COLOR_PURPLE))
+    _print(c(f"  • 独立盲审引擎: {primary_r.upper() if primary_r else '无独立模型'} (候选梯队: {' -> '.join([r.upper() for r in reviewer_candidates])})\n", COLOR_BOLD + COLOR_PURPLE))
 
     cli_engines = {"claude", "codex", "grok", "muse", "agy", "aider"}
     all_cli = all(eng in cli_engines for eng in coder_candidates)
@@ -1947,7 +2020,7 @@ def _run_pipeline_impl(
     coder_output = None
     coder_engine = None
 
-    for eng in coder_candidates:
+    for candidate_index, eng in enumerate(coder_candidates):
         step_timeout = get_remaining_timeout(timeout)
         if step_timeout <= 0:
             return fail_and_cleanup("❌ [Makewand Budget] 全局流水线预算已耗尽，终止任务执行。", "TIMEOUT")
@@ -1955,7 +2028,8 @@ def _run_pipeline_impl(
         _print(c(f"→ 派发代码编写与实现任务给 {eng.upper()} (Tier: {tier})...", COLOR_BLUE + COLOR_BOLD))
         result = _stage_call("implementation", dispatch_task, eng, coder_prompt, engine=eng,
                              cwd=cwd, timeout=step_timeout, tier=tier, model=model, effort=effort, stream=stream,
-                             readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                             readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust,
+                             wait_for_capacity=not _has_capacity_fallback(coder_candidates[candidate_index + 1:], cache))
         success, out, err = result
         if not protection_check():
             return False
@@ -2100,18 +2174,21 @@ def _run_pipeline_impl(
         f"--- 代码改动 (git diff) ---\n{diff_for_review}"
     )
 
-    actual_reviewers = [r for r in reviewer_candidates if r != coder_engine and _dispatchable_reviewer(r, cache)]
+    def independent_of_coder(reviewer):
+        return independent_models(reviewer, coder_engine, author_tier=tier, author_model=model)
+
+    actual_reviewers = [r for r in reviewer_candidates if independent_of_coder(r) and _dispatchable_reviewer(r, cache)]
     if _plan is not None and _plan.workflow == "single":
         actual_reviewers = [coder_engine]
     elif not actual_reviewers and _plan is not None and _plan.cross_review_required:
         from makewand.config import get_active_providers
-        actual_reviewers = [r for r in get_active_providers() if r != coder_engine and _dispatchable_reviewer(r, cache)]
+        actual_reviewers = [r for r in get_active_providers() if independent_of_coder(r) and _dispatchable_reviewer(r, cache)]
     elif not actual_reviewers:
         if route_meta.get("single_tool_mode") or len(coder_candidates) <= 1:
             actual_reviewers = [coder_engine]
         else:
             # Never an engine the user disabled or one known to be unusable.
-            fallback_reviewers = [e for e in ("agy", "codex", "claude") if e != coder_engine and _engine_usable(e, cache)[0]]
+            fallback_reviewers = [e for e in ("agy", "codex", "claude") if independent_of_coder(e) and _engine_usable(e, cache)[0]]
             actual_reviewers = fallback_reviewers[:1] or [coder_engine]
 
     review_output = None
@@ -2133,14 +2210,15 @@ def _run_pipeline_impl(
             return
         if review_stand_ins is None:
             review_stand_ins = _review_stand_ins(reviewer_candidates, {coder_engine}, cache,
-                                                 coder_engine if allow_self_review else None)
+                                                 coder_engine if allow_self_review else None,
+                                                 independent_fn=independent_of_coder)
         stand_in = next((e for e in review_stand_ins if e not in review_ladder), None)
         if stand_in:
             _print(c(f"   ↪ 改由 {stand_in.upper()} 接替审查。", COLOR_CYAN))
             review_ladder.append(stand_in)
             appended_stand_ins.add(stand_in)
 
-    for r_eng in review_ladder:  # also reaches the stand-ins appended below
+    for review_index, r_eng in enumerate(review_ladder):  # also reaches the stand-ins appended below
         step_timeout = get_remaining_timeout(timeout)
         if step_timeout <= 0:
             break
@@ -2152,11 +2230,18 @@ def _run_pipeline_impl(
                      f"{reviewer_prompt_limit(r_eng)} 字节上限，只读到部分 diff 的裁决不能采纳。", COLOR_YELLOW))
             append_review_stand_in()
             continue
+        capacity_fallbacks = review_ladder[review_index + 1:]
+        if not single_tool_review:
+            capacity_fallbacks += [e for e in _review_stand_ins(
+                reviewer_candidates, {coder_engine}, cache,
+                coder_engine if allow_self_review else None, independent_fn=independent_of_coder)
+                if e not in review_ladder]
         rev_mode_str = "进行独立沙箱自审与边界复审 (单工具自审闭环)" if is_self_review else "进行独立跨模型红队审查 (Tier: deep, 只读隔离)"
         _print(c(f"→ 派发给 {r_eng.upper()} {rev_mode_str}...", COLOR_CYAN + COLOR_BOLD))
         res = _stage_call("review", dispatch_task, r_eng, curr_prompt, engine=r_eng,
                           cwd=cwd, timeout=step_timeout, tier="deep", effort=effort, stream=stream,
-                          readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                          readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust,
+                          wait_for_capacity=not _has_capacity_fallback(capacity_fallbacks, cache, curr_prompt))
         if _outcome is not None and not res[0]:
             _outcome.update(status=getattr(res, "status", "UNVERIFIED"), error=res[2])
 
@@ -2175,7 +2260,7 @@ def _run_pipeline_impl(
             _print(c(f"⚠ {r_eng.upper()} 审查未产生有效响应: {err}", COLOR_YELLOW))
             if getattr(res, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                 break
-            if r_eng in appended_stand_ins:
+            if r_eng in appended_stand_ins or getattr(res, "error_kind", None) == "concurrency_busy":
                 append_review_stand_in()
 
     # Structured verdict is authoritative; if missing/malformed, ask the same reviewer once for the verdict line only.
@@ -2234,7 +2319,9 @@ def _run_pipeline_impl(
             step_timeout = get_remaining_timeout(timeout)
             if coder_engine and step_timeout > 0:
                 _print(c(f"→ 由主力编码引擎 {coder_engine.upper()} 执行缺陷修复...", COLOR_YELLOW))
-                fix_result = _stage_call("repair", dispatch_task, coder_engine, fix_prompt, engine=coder_engine, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                fix_result = _stage_call("repair", dispatch_task, coder_engine, fix_prompt, engine=coder_engine, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust,
+                                         wait_for_capacity=not _has_capacity_fallback(
+                                             [e for e in coder_candidates if e != coder_engine], cache))
                 ok, _, _ = fix_result
                 if not protection_check():
                     return False
@@ -2245,13 +2332,15 @@ def _run_pipeline_impl(
                     actual_fix_engine = coder_engine
 
             if not fixed:
-                for alt_c in coder_candidates:
+                for fix_index, alt_c in enumerate(coder_candidates):
                     if alt_c != coder_engine:
                         step_timeout = get_remaining_timeout(timeout)
                         if step_timeout <= 0:
                             break
                         _print(c(f"→ 自动切换备用引擎 {alt_c.upper()} 执行修复...", COLOR_YELLOW))
-                        fix_result = _stage_call("repair", dispatch_task, alt_c, fix_prompt, engine=alt_c, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                        fix_result = _stage_call("repair", dispatch_task, alt_c, fix_prompt, engine=alt_c, cwd=cwd, timeout=step_timeout, tier=tier, effort=effort, stream=stream, readonly=False, repo_root=shadow_repo_root, repo_trust=repo_trust,
+                                                 wait_for_capacity=not _has_capacity_fallback(
+                                                     [e for e in coder_candidates[fix_index + 1:] if e != coder_engine], cache))
                         ok, _, _ = fix_result
                         if not protection_check():
                             return False
@@ -2388,7 +2477,9 @@ def _run_pipeline_impl(
             else:
                 # Strictly exclude BOTH coder_engine AND actual_fix_engine from reviewers to preserve cross-model independence
                 excluded_reviewers = {coder_engine, actual_fix_engine}
-                candidate_re_reviewers = [r for r in actual_reviewers if r not in excluded_reviewers]
+                candidate_re_reviewers = [r for r in actual_reviewers if r not in excluded_reviewers
+                                         and independent_of_coder(r)
+                                         and independent_models(r, actual_fix_engine, author_tier=tier)]
                 if not candidate_re_reviewers:
                     # Active-provider order (not set order, which varies run to run) and only
                     # engines the user enabled that are not known-unusable (limited,
@@ -2396,6 +2487,7 @@ def _run_pipeline_impl(
                     candidate_re_reviewers = [
                         e for e in dict.fromkeys(active_providers_list)
                         if e not in excluded_reviewers and _dispatchable_reviewer(e, cache)
+                        and independent_of_coder(e) and independent_models(e, actual_fix_engine, author_tier=tier)
                     ]
                     if not candidate_re_reviewers and (_plan is None or not _plan.cross_review_required):
                         candidate_re_reviewers = [coder_engine]
@@ -2416,14 +2508,15 @@ def _run_pipeline_impl(
                     return
                 if re_stand_ins is None:
                     re_stand_ins = _review_stand_ins(actual_reviewers, excluded_reviewers, cache,
-                                                     coder_engine if allow_self_review else None)
+                                                     coder_engine if allow_self_review else None,
+                                                     independent_fn=lambda e: independent_of_coder(e) and independent_models(e, actual_fix_engine, author_tier=tier))
                 stand_in = next((e for e in re_stand_ins if e not in re_review_ladder), None)
                 if stand_in:
                     _print(c(f"   ↪ 改由 {stand_in.upper()} 接替复审。", COLOR_CYAN))
                     re_review_ladder.append(stand_in)
                     appended_re_stand_ins.add(stand_in)
 
-            for alt_r in re_review_ladder:  # also reaches the stand-ins appended below
+            for review_index, alt_r in enumerate(re_review_ladder):  # also reaches the stand-ins appended below
                 step_timeout = get_remaining_timeout(timeout)
                 if step_timeout <= 0:
                     break
@@ -2435,9 +2528,17 @@ def _run_pipeline_impl(
                              f"{reviewer_prompt_limit(alt_r)} 字节上限，只读到部分 diff 的裁决不能采纳。", COLOR_YELLOW))
                     append_re_review_stand_in()
                     continue
+                capacity_fallbacks = re_review_ladder[review_index + 1:]
+                if not is_single_tool:
+                    capacity_fallbacks += [e for e in _review_stand_ins(
+                        actual_reviewers, excluded_reviewers, cache,
+                        coder_engine if allow_self_review else None,
+                        independent_fn=lambda e: independent_of_coder(e) and independent_models(e, actual_fix_engine, author_tier=tier))
+                        if e not in re_review_ladder]
                 rev_mode_str = "进行独立沙箱自审与边界复审 (单工具自审闭环)" if is_self_re_review else f"进行第 {current_fix_iter} 轮独立跨模型红队复审 (Tier: deep, 只读隔离)"
                 _print(c(f"→ 派发给 {alt_r.upper()} {rev_mode_str}...", COLOR_CYAN))
-                res = _stage_call("review", dispatch_task, alt_r, curr_re_prompt, engine=alt_r, cwd=cwd, timeout=step_timeout, tier="deep", effort=effort, stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust)
+                res = _stage_call("review", dispatch_task, alt_r, curr_re_prompt, engine=alt_r, cwd=cwd, timeout=step_timeout, tier="deep", effort=effort, stream=stream, readonly=True, repo_root=shadow_repo_root, repo_trust=repo_trust,
+                                  wait_for_capacity=not _has_capacity_fallback(capacity_fallbacks, cache, curr_re_prompt))
                 if isinstance(res, (tuple, list)) and len(res) == 3:
                     ok, out, re_err = res[0], res[1], res[2]
                 else:
@@ -2449,7 +2550,7 @@ def _run_pipeline_impl(
                 _print(c(f"⚠ {alt_r.upper()} 复审未产生有效响应: {re_err}", COLOR_YELLOW))
                 if getattr(res, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                     return fail_and_cleanup("复审结果未确定或预算已耗尽；已停止自动切换提供者。", res.status)
-                if alt_r in appended_re_stand_ins:
+                if alt_r in appended_re_stand_ins or getattr(res, "error_kind", None) == "concurrency_busy":
                     append_re_review_stand_in()
 
             if test_ok and re_output:
@@ -3023,8 +3124,8 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         if current_context().get("_deadline_monotonic", float("inf")) > time.monotonic():
             return False
         if output_json:
-            _print(json.dumps({"pass": False, "engine": None, "exit_code": EXIT_TIMEOUT,
-                               "error": "review task deadline expired"}))
+            _print_json({"pass": False, "engine": None, "exit_code": EXIT_TIMEOUT,
+                               "error": "review task deadline expired"})
         return True
     if timed_out():
         return EXIT_TIMEOUT
@@ -3035,13 +3136,13 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         from makewand.sandbox import is_bwrap_available
         if not is_bwrap_available() and os.environ.get("MAKEWAND_UNSAFE_HOST_EXEC") != "1":
             if output_json:
-                _print(json.dumps({
+                _print_json({
                     "pass": False,
                     "exit_code": EXIT_UNVERIFIED,
                     "engine": None,
                     "defects": ["当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断审查"],
                     "error": "Untrusted repository requires Bubblewrap sandbox"
-                }, ensure_ascii=False, indent=2))
+                })
             else:
                 _print(c("❌ [Makewand Untrusted Repo] 当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断审查。", COLOR_RED + COLOR_BOLD))
             return EXIT_UNVERIFIED
@@ -3050,8 +3151,8 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         refusal = forced_engine_refusal(forced, get_or_update_status())
         if refusal:
             if output_json:
-                _print(json.dumps({"pass": False, "exit_code": EXIT_UNVERIFIED, "engine": None, "defects": [refusal],
-                                   "error": forced_engine_error(forced, refusal)}, ensure_ascii=False, indent=2))
+                _print_json({"pass": False, "exit_code": EXIT_UNVERIFIED, "engine": None, "defects": [refusal],
+                                   "error": forced_engine_error(forced, refusal)})
             else:
                 for line in forced_engine_refusal_lines(forced, refusal):
                     _print(line)
@@ -3069,26 +3170,26 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         return EXIT_TIMEOUT
     if diff_err:
         if output_json:
-            _print(json.dumps({
+            _print_json({
                 "pass": False,
                 "exit_code": EXIT_UNVERIFIED,
                 "engine": None,
                 "defects": [f"Git diff 提取失败 ({diff_err})"],
                 "error": diff_err
-            }, ensure_ascii=False, indent=2))
+            })
         else:
             _print(c(f"❌ [Makewand Review] 无法提取当前工作区改动 ({diff_err})，阻断审查。", COLOR_RED + COLOR_BOLD))
         return EXIT_UNVERIFIED
 
     if not diff_out.strip():
         if output_json:
-            _print(json.dumps({
+            _print_json({
                 "pass": True,
                 "exit_code": EXIT_PASSED,
                 "engine": None,
                 "defects": [],
                 "message": "当前工作区没有检测到未提交的改动 (git diff 为空)"
-            }, ensure_ascii=False, indent=2))
+            })
         else:
             _print("当前工作区没有检测到未提交的改动 (git diff 为空)。")
         return EXIT_PASSED
@@ -3097,7 +3198,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
     review_cap = review_diff_max_bytes()
     if diff_bytes > review_cap:
         reason = _review_cap_exceeded(diff_bytes, review_cap)
-        _print(json.dumps({"pass": False, "engine": None, "exit_code": EXIT_UNVERIFIED, "error": reason}, ensure_ascii=False) if output_json else reason)
+        _print_json({"pass": False, "engine": None, "exit_code": EXIT_UNVERIFIED, "error": reason}) if output_json else _print(reason)
         return EXIT_UNVERIFIED
     cache = get_or_update_status()
 
@@ -3129,7 +3230,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
     attempted = []
     partial = []
     terminal_status = "UNVERIFIED"
-    for eng, banner, color in reviewer_ladder:
+    for review_index, (eng, banner, color) in enumerate(reviewer_ladder):
         usable, why = (True, "") if eng == forced else _engine_usable(eng, cache)
         if not usable:
             if not output_json:
@@ -3145,8 +3246,11 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         attempted.append(eng)
         if not output_json:
             _print(c(banner, color))
-        result = dispatch_task(eng, prompt, cwd=cwd, timeout=timeout, tier="deep", effort=effort,
-                               stream=stream and not output_json, readonly=True, repo_trust=repo_trust)
+        result = _stage_call("review", dispatch_task, eng, prompt, engine=eng,
+                             cwd=cwd, timeout=timeout, tier="deep", effort=effort,
+                             stream=stream and not output_json, readonly=True, repo_trust=repo_trust,
+                             wait_for_capacity=not _has_capacity_fallback(
+                                 [e for e, _, _ in reviewer_ladder[review_index + 1:]], cache, prompt))
         success, out, err = result
         if success and out and out.strip():
             review_res = out
@@ -3174,14 +3278,14 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         if partial:
             reason += f"；{'/'.join(e.upper() for e in partial)} 无法完整接收审查提示 ({dispatched_size(prompt)} 字节)，已跳过"
         if output_json:
-            _print(json.dumps({
+            _print_json({
                 "pass": False,
                 "exit_code": STATUS_CODES[terminal_status],
                 "engine": None,
                 "verdict_status": REVIEW_UNVERIFIED,
                 "defects": [reason],
                 "error": "No enabled and healthy review engine" if no_engine else "Independent review engine failed to produce valid output"
-            }, ensure_ascii=False, indent=2))
+            })
         else:
             _print(c(f"❌ [Makewand Quality Gate] {reason}，拒绝交付。", COLOR_RED + COLOR_BOLD))
         return STATUS_CODES[terminal_status]
@@ -3227,7 +3331,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             v_dict.update({"pass": False, "error": "review task deadline expired"})
         if exit_code == EXIT_UNVERIFIED:
             v_dict["error"] = verdict["reason"]
-        _print(json.dumps(v_dict, ensure_ascii=False, indent=2))
+        _print_json(v_dict)
         return exit_code
 
     if not stream:
@@ -3281,7 +3385,7 @@ def _review_saved_hybrid_impl(race_id: str, stream: bool = False, timeout: int =
         report.update({"error": "候选 M 受保护文件校验失败: " + str(failure),
                        "exit_code": STATUS_CODES.get(failure.status, EXIT_UNVERIFIED),
                        "race_id": race_id, "candidate": "M"})
-        _print(json.dumps(report, ensure_ascii=False, indent=2) if output_json else report["error"])
+        _print_json(report) if output_json else _print(report["error"])
         return report["exit_code"]
     if not hybrid or hybrid.get("test_passed") is not True:
         error = "候选 M 不存在或未通过本地测试"
@@ -3330,7 +3434,7 @@ def _review_saved_hybrid_impl(race_id: str, stream: bool = False, timeout: int =
     else:
         report["exit_code"] = EXIT_PASSED
     report.update({"race_id": race_id, "candidate": "M"})
-    _print(json.dumps(report, ensure_ascii=False, indent=2) if output_json else report.get("error") or report.get("message"))
+    _print_json(report) if output_json else _print(report.get("error") or report.get("message"))
     return report["exit_code"]
 
 
@@ -3517,7 +3621,9 @@ def _run_race_impl(
             if not why:
                 info = cache.get(name) if isinstance(cache, dict) else None
                 status = (info.get("status") if isinstance(info, dict) else None) or "unknown"
-                if name not in racers:
+                if name in NON_AGENTIC_CHAT_MODELS:
+                    why = "该引擎只支持聊天，不能生成竞速所需的代码改动"
+                elif name not in racers:
                     why = (f"竞速不会自动选用该引擎（可用 makewand run --workflow race --provider {name} "
                            "指定它为选手）")
                 elif status != "healthy":
@@ -3545,11 +3651,16 @@ def _run_race_impl(
     wt_a = session_dir / "agent_a"
     wt_b = session_dir / "agent_b"
     wt_baseline = session_dir / "baseline"
-    with stage("prepare", engine="race-host-manifest", readonly=True):
-        host_baseline_manifest = build_manifest(Path(cwd))
-
     saved_successfully = False
     try:
+        host_records = ManifestCache()
+        try:
+            with stage("prepare", engine="race-host-manifest", readonly=True):
+                host_baseline_manifest = build_manifest(
+                    Path(cwd), host=True, cache=host_records, budget=ManifestBudget(f"工作区 {cwd}"))
+        except OSError as exc:
+            _print(c(f"❌ [Makewand Race] 无法冻结宿主基线，已中止竞速: {exc}", COLOR_RED + COLOR_BOLD))
+            return EXIT_FAILED
         # Candidate copies are private (0700) and never contain .gitignore'd files.
         ensure_private_dir(CANDIDATES_DIR)
         ensure_private_dir(session_dir)
@@ -3567,7 +3678,8 @@ def _run_race_impl(
             protected.prepare_workspace(wt_b)
             protected.verify(cwd)
             with stage("prepare", engine="race-host-check", readonly=True):
-                if build_manifest(Path(cwd)) != host_baseline_manifest:
+                if build_manifest(Path(cwd), host=True, cache=host_records,
+                                  budget=ManifestBudget(f"工作区 {cwd}")) != host_baseline_manifest:
                     raise OSError("host workspace changed while freezing race baseline")
         except OSError as exc:
             _print(c(f"❌ [Makewand Race] 无法建立候选隔离副本，已中止竞速: {exc}", COLOR_RED + COLOR_BOLD))
@@ -3811,7 +3923,7 @@ def _run_race_impl(
                 review = _review_race_winner(
                     prompt, wta_side, wta_engine, (engine_a, engine_b), wta_diff, str(wta_path),
                     cache, remaining_timeout(), lease=_leases[2], effort=effort, repo_trust=repo_trust,
-                    cross_review_required=_cross_review_required)
+                    cross_review_required=_cross_review_required, winner_tier=tier)
             wta_reviewer = review["reviewer"]
             reviewer_label = wta_reviewer.upper() if wta_reviewer else "无可用复审引擎"
             judge_report = (f"[Winner-Take-All] 选手 {wta_side} ({wta_name}) 率先通过本地测试门禁，竞争选手已被取消。"
@@ -3873,7 +3985,7 @@ def _run_race_impl(
             # Never a judge that would receive only part of the two diffs; under cross
             # review preferably one whose provider differs from both contestants.
             judge_engine = _select_independent_race_judge(cache, (engine_a, engine_b), judge_prompt,
-                                                          _cross_review_required)
+                                                          _cross_review_required, contestant_tier=tier)
             judge_timeout = remaining_timeout()
             if oversized_diffs:
                 largest = max(dispatched_size(diff) for diff in (diff_a, diff_b))
@@ -3908,18 +4020,18 @@ def _run_race_impl(
             approval = "judge" if winner else None
             winner_engine = engine_a if winner == "A" else engine_b if winner == "B" else None
             if (winner and _cross_review_required and (eligible_a if winner == "A" else eligible_b)
-                    and judge_engine.lower() == winner_engine.lower()):
+                    and not independent_models(judge_engine, winner_engine, author_tier=tier)):
                 # The judge picked its own provider's candidate: under cross review that
                 # approval counts only after a read-only review by another provider.
-                _print(c(f"⚠ 裁判 {judge_engine.upper()} 与胜出选手 {winner} 属同一提供者，批准前须经其他提供者独立只读复审...",
+                _print(c(f"⚠ 裁判 {judge_engine.upper()} 与胜出选手 {winner} 的模型家族不独立，批准前须经独立家族模型只读复审...",
                          COLOR_YELLOW + COLOR_BOLD))
                 review = _review_race_winner(
                     prompt, winner, winner_engine, (engine_a, engine_b), diff_a if winner == "A" else diff_b,
                     str(wt_a if winner == "A" else wt_b), cache, remaining_timeout(), effort=effort,
-                    repo_trust=repo_trust, cross_review_required=True)
+                    repo_trust=repo_trust, cross_review_required=True, winner_tier=tier)
                 wta_reviewer = review["reviewer"]
                 reviewer_label = wta_reviewer.upper() if wta_reviewer else "无可用复审引擎"
-                review_report = (f"[独立复审] 裁判与胜出选手 {winner} 属同一提供者 ({judge_engine.upper()})，"
+                review_report = (f"[独立复审] 裁判与胜出选手 {winner} 的模型家族不独立 ({judge_engine.upper()})，"
                                  f"其他提供者独立只读复审 ({reviewer_label}) 结论: {review['status']}"
                                  + (f" — {review['reason']}" if review["reason"] else "")
                                  + (f"\n{review['report'].strip()}" if review["report"] else ""))

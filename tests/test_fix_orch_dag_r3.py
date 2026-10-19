@@ -49,8 +49,7 @@ class DagFixture(unittest.TestCase):
         self.root = Path(temp.name)
         self.candidates = self.root / "candidates"
         self.coded = []
-        for patcher in (patch.dict(os.environ, {"MAKEWAND_STRICT_NONCE": "1"}),
-                        patch.object(config, "CANDIDATES_DIR", self.candidates),
+        for patcher in (patch.object(config, "CANDIDATES_DIR", self.candidates),
                         patch.object(orch, "CANDIDATES_DIR", self.candidates)):
             patcher.start()
             self.addCleanup(patcher.stop)

@@ -11,10 +11,13 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/makewand/makewand/internal/proxyconfig"
 )
 
 // Config holds the application configuration.
 type Config struct {
+	Proxy proxyconfig.Defaults `json:"proxy,omitzero"`
 	// APIPolicy controls direct cloud API use and paid API fallback. Keys alone
 	// do not opt in; remote gateway policy belongs to that server.
 	APIPolicy string `json:"api_policy,omitempty"`

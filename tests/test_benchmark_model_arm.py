@@ -221,7 +221,7 @@ class BenchmarkModelArmTests(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", os.environ)
             self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", os.environ)
             self.assertEqual(os.environ["MAKEWAND_CALL_BUDGET_FILE"], self.environment["MAKEWAND_CALL_BUDGET_FILE"])
-            self.assertEqual(account_reference("codex"), "codex:" + hashlib.sha256(str(profile.resolve()).encode()).hexdigest()[:16])
+            self.assertEqual(account_reference("codex"), "codex:unknown:" + hashlib.sha256(str(profile.resolve()).encode()).hexdigest()[:32])
             self.assertEqual(os.environ["MAKEWAND_ENABLE_PROVIDERS"], "codex")
             return ExecutionResult(True, "done", None)
         with self.fixtures(), patch.object(orchestrator, "dispatch_task", side_effect=dispatch):

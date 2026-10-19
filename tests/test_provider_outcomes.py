@@ -52,6 +52,9 @@ class ProviderOutcomeTests(unittest.TestCase):
             stack.enter_context(patch("makewand.providers.aider.is_aider_available", return_value=True))
             stack.enter_context(patch("makewand.providers.aider.is_provider_enabled", return_value=True))
             stack.enter_context(patch("makewand.providers.aider.get_api_config", return_value={}))
+            # The process below is a fixture; host Muse services must not decide
+            # whether we reach its transport outcome. Guard tests live separately.
+            stack.enter_context(patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)))
             process = stack.enter_context(patch.object(runner, "run_subprocess", return_value=raw))
             api = stack.enter_context(patch("makewand.providers.api_client.call_api_chat", return_value=(True, "unexpected fallback", None)))
             yield getattr(module, "execute_" + engine + "_task"), process, api

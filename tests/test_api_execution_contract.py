@@ -70,7 +70,7 @@ class APIExecutionTests(unittest.TestCase):
     def test_known_refusal_retry_consumes_new_admission(self, transport):
         transport.side_effect = [refusal(), response()]
         result = call_api_chat("codex", "test", backoff_factor=0)
-        self.assertEqual(result.status, "PASSED")
+        self.assertEqual(result.status, "PASSED", result.error)
         self.assertEqual(len(self.attempts()), 2)
         self.assertEqual(transport.call_count, 2)
 
@@ -99,7 +99,7 @@ class APIExecutionTests(unittest.TestCase):
             mark_provider_invocation()  # A known refusal after an admitted CLI.
             return call_api_chat("codex", "review", cwd=self.temp.name, timeout=remaining)
         result = execute(self.request(readonly=True), after_cli)
-        self.assertEqual(result.status, "PASSED")
+        self.assertEqual(result.status, "PASSED", result.error)
         self.assertEqual(len(self.attempts()), 2)
         self.assertFalse((Path(self.temp.name) / "marker.txt").exists())
         self.assertTrue(all(item["readonly"] for item in self.attempts()))
@@ -155,7 +155,7 @@ class APIExecutionTests(unittest.TestCase):
         transport.side_effect = [refusal(), response()]
         with execution_context(lease_id=coder):
             result = execute(self.request(), lambda remaining: call_api_chat("codex", "test", timeout=remaining, backoff_factor=0))
-        self.assertEqual(result.status, "PASSED")
+        self.assertEqual(result.status, "PASSED", result.error)
         ledger = json.loads(self.ledger.read_text())
         self.assertEqual(len(ledger["attempts"]), 2)
         self.assertEqual(ledger["holds"][judge]["remaining"], 1)
@@ -200,3 +200,40 @@ class APIExecutionTests(unittest.TestCase):
         finally:
             release.set()
             self.assertTrue(finished.wait(2))
+
+
+class LayeredAPIExecutionTests(APIExecutionTests):
+    """Run the transport contract with default account/pool capacity one."""
+    def setUp(self):
+        super().setUp()
+        fixture = patch.dict(os.environ, MAKEWAND_LAYERED_BUDGET="1",
+            MAKEWAND_ACCOUNT_CONCURRENCY="1", MAKEWAND_POOL_CONCURRENCY="1",
+            MAKEWAND_PROJECT_DAILY_CALLS="100", MAKEWAND_MACHINE_DAILY_CALLS="100")
+        fixture.start()
+        self.addCleanup(fixture.stop)
+        context = execution_context(task_id="api-fixture")
+        context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+
+    @patch("urllib.request.urlopen")
+    def test_api_capacity_and_refusal_evidence_are_distinct(self, transport):
+        from makewand.execution_evidence import directory
+        subscription = call_budget.reserve("codex", "fast", task_id="api-fixture")
+        transport.side_effect = [refusal(), response()]
+        result = call_api_chat("codex", "test", backoff_factor=0)
+        self.assertEqual(result.status, "PASSED", result.error)
+        self.assertEqual(transport.call_count, 2)
+        attempts = self.attempts()
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(attempts[1]["result_status"], "FAILED")
+        # The outer result identifies the first admission; retry evidence is
+        # separate and must not overwrite that refused transport attempt.
+        self.assertEqual(result.attempt_id, attempts[1]["id"])
+        self.assertEqual(attempts[2]["result_status"], "PASSED")
+        final_evidence = json.loads((directory() / (attempts[2]["id"] + ".json")).read_text())
+        self.assertEqual(final_evidence["result_status"], "PASSED")
+        evidence = json.loads((directory() / (attempts[1]["id"] + ".json")).read_text())
+        self.assertEqual(evidence["result_status"], "FAILED")
+        self.assertTrue(evidence["outcome_known"])
+        self.assertEqual(evidence["source"], "api")
+        call_budget.complete(subscription, False, 0)

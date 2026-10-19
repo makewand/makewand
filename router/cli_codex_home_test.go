@@ -280,10 +280,32 @@ func TestWrapCodexHomeForeignSelectionErrorsFailClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.MkdirAll(filepath.Join(home, "a"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "target", "inner"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "target", "chosen"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "target", "inner"), filepath.Join(home, "a", "link")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	regular := filepath.Join(workspace, "file")
+	if err := os.WriteFile(regular, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "work-alias")
+	if err := os.Symlink(workspace, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
 	for _, selected := range []string{
-		filepath.Join(root, "missing-account"),
 		filepath.Join(workspace, "account"),
+		filepath.Join(home, "missing", "account"),
+		filepath.Join(alias, "missing", "account"),
 		home + "/a/link/../chosen",
+		regular,
 	} {
 		cmd := exec.Command("fixture")
 		cmd.Dir = workspace
@@ -292,6 +314,20 @@ func TestWrapCodexHomeForeignSelectionErrorsFailClosed(t *testing.T) {
 			t.Fatalf("unverified foreign account was left exposed: %q %v %v", selected, wrapped, err)
 		}
 	}
+	t.Run("missing outside writable mounts is skipped", func(t *testing.T) {
+		selected := filepath.Join(root, "missing-account", "nested")
+		cmd := exec.Command("fixture")
+		cmd.Dir = workspace
+		cmd.Env = []string{"HOME=" + home, "CODEX_HOME=" + selected}
+		wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cliAfterWait(wrapped)
+		if cliEnvValue(wrapped.Env, "CODEX_HOME") != "" || strings.Contains(strings.Join(wrapped.Args, " "), selected) {
+			t.Fatalf("missing foreign root exposed: %v", wrapped.Args)
+		}
+	})
 }
 
 func TestWrapCodexHomeRealSandboxSelectedSymlinkAndForeignIsolation(t *testing.T) {
@@ -434,5 +470,36 @@ func TestWrapCodexHomeReviewReadonlyTmpfsMountAndMultiAccountMasking(t *testing.
 	warnings = r4SimulateSandboxRun(t, wrapped, func() { readonlyFixWrite(t, priv, refreshed) })
 	if data, _ := os.ReadFile(authPath); string(data) != refreshed || len(warnings) != 0 {
 		t.Fatalf("a refresh made during the review was not merged into the host: %q %q", data, warnings)
+	}
+}
+
+func TestWrapClaudeHomeUsesSelectedAccountWithoutDefaultAccount(t *testing.T) {
+	oldLookup := cliBwrapLookup
+	t.Cleanup(func() { cliBwrapLookup = oldLookup })
+	cliBwrapLookup = func(string) (string, error) { return "/usr/bin/bwrap", nil }
+	root := t.TempDir()
+	home, workspace := filepath.Join(root, "home"), filepath.Join(root, "work")
+	selected, defaultAccount := filepath.Join(home, ".claude-other"), filepath.Join(home, ".claude")
+	for _, path := range []string{workspace, selected, defaultAccount} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("/usr/bin/true")
+	cmd.Dir = workspace
+	cmd.Env = []string{"HOME=" + home, "CLAUDE_CONFIG_DIR=" + selected}
+	wrapped, err := wrapCLICommandWithSandbox(context.Background(), "claude", cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(wrapped.Args, " ")
+	// The selected account is exposed as a private per-run copy, never bound
+	// writable from the host.
+	cliPrivateHomeSource(t, wrapped.Args, selected)
+	if strings.Contains(args, "--bind "+selected+" "+selected) || !strings.Contains(args, "--setenv CLAUDE_CONFIG_DIR "+selected) {
+		t.Fatalf("selected account missing or host-writable: %v", wrapped.Args)
+	}
+	if strings.Contains(args, "--bind "+defaultAccount+" "+defaultAccount) || !strings.Contains(args, "--tmpfs "+defaultAccount) {
+		t.Fatalf("default account was exposed: %v", wrapped.Args)
 	}
 }

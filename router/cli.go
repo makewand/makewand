@@ -22,7 +22,11 @@ import (
 
 	"github.com/makewand/makewand/execution"
 	"github.com/makewand/makewand/internal/processjob"
+	"github.com/makewand/makewand/internal/proxyconfig"
 )
+
+// Test seam for a transient ledger failure after a supervised worker starts.
+var cliRegisterJobWorker = (*execution.Attempt).RegisterJobWorker
 
 // Prompt delivery modes for custom command providers.
 // These match PromptModeStdin and PromptModeArg
@@ -162,7 +166,6 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 			args = append(args, "--model", modelID)
 		}
 		cmd := exec.CommandContext(ctx, binPath, args...)
-		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
 		return cmd
 	}
 	p.buildStreamCmd = func(ctx context.Context, prompt string) *exec.Cmd {
@@ -171,12 +174,10 @@ func NewGeminiCLI(binPath string) *CLIProvider {
 			args = append(args, "--model", modelID)
 		}
 		cmd := exec.CommandContext(ctx, binPath, args...)
-		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
 		return cmd
 	}
 	p.checkCmd = func(ctx context.Context) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, binPath, "--version")
-		cmd.Env = applyGeminiProxyPolicy(cmd.Environ())
 		return cmd
 	}
 	return p
@@ -395,6 +396,14 @@ func (c *CLIProvider) healthCheck() bool {
 	if cmd == nil {
 		return false
 	}
+	defaults, proxyErr := proxyconfig.Load()
+	if proxyErr != nil {
+		return false
+	}
+	cmd.Env = proxyconfig.Apply(cmd.Environ(), defaults)
+	if c.provider == "gemini" || c.provider == "agy" {
+		cmd.Env = applyGeminiProxyPolicy(cmd.Env)
+	}
 	setCLIProcessGroup(cmd)
 	capture := processjob.NewCapture(processjob.MaxOutputBytes, func() { killCLIProcess(cmd) })
 	cmd.Stdout, cmd.Stderr = capture.Stdout(), capture.Stderr()
@@ -545,6 +554,10 @@ func (c *CLIProvider) ChatStream(ctx context.Context, messages []Message, system
 }
 
 func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
+	lifecycle, _ := ctx.Value(providerLifecycleKey{}).(*execution.Attempt)
+	if err := initializeCLIEvidence(lifecycle, c.provider); err != nil {
+		return nil, err
+	}
 	var prompt string
 	if c.systemFlag != "" && system != "" {
 		prompt = buildCLIPrompt(messages, "")
@@ -577,7 +590,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 	if err != nil {
 		cancel()
 		cleanupWorkDir()
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errExecutionAdmission, err)
 	}
 	cmd = wrappedCmd
 	setCLIProcessGroup(cmd)
@@ -590,8 +603,20 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 	cmd.Stderr = capture.Stderr()
 
 	started := time.Now()
+	attempt, _ := ctx.Value(providerLifecycleKey{}).(*execution.Attempt)
+	if err := attempt.BeginLaunch(); err != nil {
+		// A failed fsync can follow a committed fence; no child has started.
+		err = errors.Join(err, attempt.LaunchFailed())
+		_ = stdoutPipe.Close()
+		_ = stdoutWriter.Close()
+		cancel()
+		cleanupWorkDir()
+		cliAfterWait(cmd)
+		return nil, err
+	}
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
+		err = errors.Join(err, attempt.LaunchFailed())
 		cliAfterWait(cmd) // nothing ran: the private home is removed at once
 		contextErr := ctx.Err()
 		_ = stdoutPipe.Close()
@@ -604,9 +629,22 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 	cliAfterStart(cmd)
+	if err := cliRegisterJobWorker(attempt, cmd.Process.Pid); err != nil {
+		killCLIProcess(cmd)
+		_ = cmd.Wait()
+		cliAfterWait(cmd)
+		cleanupProcess()
+		err = errors.Join(err, attempt.WorkerStopped())
+		_ = stdoutPipe.Close()
+		_ = stdoutWriter.Close()
+		cancel()
+		cleanupWorkDir()
+		return nil, err
+	}
 
 	ch := make(chan StreamChunk, 64)
 	go func() {
+		defer func() { _ = attempt.WorkerStopped() }()
 		defer cleanupProcess()
 		defer killCLIProcess(cmd)
 		defer cancel()
@@ -631,11 +669,17 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		go func() {
 			waitErr := cmd.Wait()
 			killCLIProcess(cmd)
+			cleanupProcess()
 			_ = stdoutWriter.Close()
 			// The outcome, and with it the terminal chunk, waits for the
 			// sandbox's credential write-back (bounded, see cliAfterWait):
 			// a refreshed token is on the host before the stream ends.
 			cliAfterWait(cmd)
+			recordCLIExit(attempt, cmd)
+			if c.parseStreamLine != nil {
+				recordCLIOutput(attempt, capture.StdoutBytes())
+			}
+			waitErr = errors.Join(waitErr, verifyDirectCLIAccount(cmd), attempt.WorkerStopped())
 			waitDone <- waitErr
 		}()
 
@@ -1097,11 +1141,15 @@ func (c *CLIProvider) chatAttempt(ctx context.Context, prompt, validationPrompt,
 }
 
 func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validationPrompt, scratchDir string) (string, *Usage, error) {
+	attempt, _ := ctx.Value(providerLifecycleKey{}).(*execution.Attempt)
+	if err := initializeCLIEvidence(attempt, c.provider); err != nil {
+		return "", nil, err
+	}
 	cmd := c.buildCmd(ctx, prompt)
 	applyCLIWorkDir(ctx, cmd, scratchDir)
 	wrappedCmd, err := wrapCLICommandWithSandbox(ctx, c.provider, cmd)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("%w: %w", errExecutionAdmission, err)
 	}
 	cmd = wrappedCmd
 	setCLIProcessGroup(cmd)
@@ -1111,8 +1159,14 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	cmd.Stderr = capture.Stderr()
 
 	start := time.Now()
+	if err := attempt.BeginLaunch(); err != nil {
+		err = errors.Join(err, attempt.LaunchFailed())
+		cliAfterWait(cmd)
+		return "", nil, err
+	}
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
+		err = errors.Join(err, attempt.LaunchFailed())
 		cliAfterWait(cmd) // nothing ran: the private home is removed at once
 		if contextErr := ctx.Err(); contextErr != nil {
 			return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, err, errors.Join(contextErr, err), time.Since(start))
@@ -1120,6 +1174,14 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 		return "", nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
 	cliAfterStart(cmd)
+	if err := cliRegisterJobWorker(attempt, cmd.Process.Pid); err != nil {
+		killCLIProcess(cmd)
+		_ = cmd.Wait()
+		cliAfterWait(cmd)
+		cleanupProcess()
+		return "", nil, errors.Join(err, attempt.WorkerStopped())
+	}
+	defer func() { _ = attempt.WorkerStopped() }()
 	defer cleanupProcess()
 	defer killCLIProcess(cmd)
 
@@ -1135,12 +1197,20 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 		killCLIProcess(cmd)
 		runErr = <-done
 	}
+	killCLIProcess(cmd)
+	cleanupProcess()
+	runErr = errors.Join(runErr, attempt.WorkerStopped())
 
 	duration := time.Since(start)
 	// The sandbox has exited: its credential write-back lands on the host
 	// before the attempt returns (bounded, see cliAfterWait), so the caller,
 	// a retry and the next run all see a refreshed token.
 	cliAfterWait(cmd)
+	runErr = errors.Join(runErr, verifyDirectCLIAccount(cmd))
+	recordCLIExit(attempt, cmd)
+	if c.jsonOutput && (c.provider != "codex" || !codexUsesReviewSubcommand(ctx)) {
+		recordCLIOutput(attempt, capture.StdoutBytes())
+	}
 
 	if capture.Exceeded() {
 		return "", nil, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
@@ -3122,72 +3192,9 @@ func stripANSI(s string) string {
 	return result.String()
 }
 
-// ensureNoProxy ensures NO_PROXY includes Google API hosts.
-func ensureNoProxy(env []string) []string {
-	const googleHosts = "googleapis.com,google.com,cloudcode-pa.googleapis.com"
-
-	for i, e := range env {
-		if strings.HasPrefix(e, "NO_PROXY=") || strings.HasPrefix(e, "no_proxy=") {
-			existing := e[len("NO_PROXY="):]
-			if !strings.Contains(existing, "googleapis.com") {
-				env[i] = e + "," + googleHosts
-			}
-			return env
-		}
-	}
-	// No NO_PROXY set — add it
-	return append(env, "NO_PROXY="+googleHosts, "no_proxy="+googleHosts)
-}
-
-// applyGeminiProxyPolicy decides whether Gemini CLI should bypass proxy.
-// Default behavior:
-//   - if any proxy env var is configured, respect it
-//   - otherwise, bypass proxy for Google hosts (historical behavior)
-//
-// Explicit overrides:
-//   - MAKEWAND_GEMINI_USE_PROXY=1   => always keep proxy env untouched
-//   - MAKEWAND_GEMINI_BYPASS_PROXY=1 => always append NO_PROXY Google hosts
+// applyGeminiProxyPolicy bypasses Google hosts only on explicit opt-in.
 func applyGeminiProxyPolicy(env []string) []string {
-	if envFlagTrue("MAKEWAND_GEMINI_USE_PROXY") {
-		return env
-	}
-	if envFlagTrue("MAKEWAND_GEMINI_BYPASS_PROXY") {
-		return ensureNoProxy(env)
-	}
-	if hasProxyEnv(env) {
-		return env
-	}
-	return ensureNoProxy(env)
-}
-
-func envFlagTrue(key string) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	switch v {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
-func hasProxyEnv(env []string) bool {
-	for _, e := range env {
-		switch {
-		case strings.HasPrefix(e, "HTTP_PROXY="):
-			return true
-		case strings.HasPrefix(e, "HTTPS_PROXY="):
-			return true
-		case strings.HasPrefix(e, "ALL_PROXY="):
-			return true
-		case strings.HasPrefix(e, "http_proxy="):
-			return true
-		case strings.HasPrefix(e, "https_proxy="):
-			return true
-		case strings.HasPrefix(e, "all_proxy="):
-			return true
-		}
-	}
-	return false
+	return proxyconfig.Gemini(env)
 }
 
 // filterEnv removes a given env var from the environment list.

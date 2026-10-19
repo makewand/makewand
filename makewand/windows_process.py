@@ -203,7 +203,7 @@ class WindowsJob:
 
 def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=False,
                            print_prefix="", pass_fds=(), *, output_limit, stream_queue_limit,
-                           separate_stderr=False):
+                           separate_stderr=False, extra_env=None):
     """run_subprocess on native Windows: both pipes are read concurrently by
     their own threads. Stream mode merges stderr into stdout unless
     `separate_stderr` is set: then stdout is displayed as it arrives, stderr
@@ -339,11 +339,15 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
         deadline = time.monotonic() + timeout
         job = WindowsJob()
         win_env = os.environ.copy()
+        win_env.update({str(k): str(v) for k, v in (extra_env or {}).items()})
         win_env["NoDefaultCurrentDirectoryInExePath"] = "1"
+        from makewand.execution_runtime import provider_process_lease
+        provider_process_lease("launch")
         proc = job.start(cmd, shell=isinstance(cmd, str), cwd=cwd, env=win_env,
                          stdin=subprocess.PIPE if input_text is not None else None,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
                          text=False, bufsize=0)
+        provider_process_lease("job_worker", proc.pid)
         if scope:
             scope.register_proc(proc)
         pending = {"stdout"}
@@ -416,6 +420,11 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
                 except subprocess.TimeoutExpired:
                     active_proc.kill()
                     active_proc.wait(timeout=.5)
+        from makewand.execution_runtime import provider_process_lease
+        if proc is None:
+            provider_process_lease("launch_failed")
+        elif proc.poll() is not None:
+            provider_process_lease("stopped")
         for thread in threads:
             thread.join(timeout=.5)
         for active_proc in (proc, display_proc):

@@ -5,6 +5,7 @@ Makewand CLI: Command-line interface and subcommand parsers.
 import os
 import sys
 import argparse
+import json
 import math
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import List, Optional, Dict, Any
 from makewand import __version__
 from makewand.command_contract import (
     PYTHON_COMMANDS, NATIVE_GO_COMMANDS, PYTHON_VALUE_FLAGS, PYTHON_BOOLEAN_FLAGS, SHARED_VALUE_FLAGS,
+    WORKER_QUERY_COMMANDS, WORKER_STATIC_ARGS,
 )
 from makewand.config import (
     c,
@@ -25,6 +27,7 @@ from makewand.config import (
     COLOR_RESET,
     normalize_tier,
     tier_to_go_mode,
+    API_ONLY_ENGINES,
 )
 from makewand.health import get_or_update_status
 from makewand.discovery import discover_available_models, export_routing_overrides
@@ -158,13 +161,17 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
                 "source": quota.get("source"),
                 "source_label": quota.get("source_label"),
                 "desc": quota.get("desc"),
+                "updated_at": quota.get("updated_at"),
+                "is_unlimited": quota.get("is_unlimited", False),
             },
         }
     from makewand.sandbox import resolve_trusted_bwrap
+    from makewand.proxy import proxy_status
     return {
         "engine": "python",
         "version": __version__,
         "api_policy": get_api_policy(),
+        "proxy": proxy_status(),
         "privacy_attestation": {
             "sandbox_available": bool(resolve_trusted_bwrap()),
             "local_only_supported": True,
@@ -220,6 +227,8 @@ def cmd_status(args):
 
     from makewand.config import get_api_policy
     policy = get_api_policy()
+    from makewand.proxy import proxy_status
+    print("代理来源: " + {"environment": "环境变量", "config_default": "配置默认值", "none": "无"}[proxy_status()["source"]])
     print("API 费用策略: " + ("allow_paid（允许云 API 按量计费）" if policy == "allow_paid" else "subscription_only（禁止 Makewand 云 API 调用）"))
     print(c("额度说明: 除标注“官方报告”外，下方额度条为本地调用计数估算或由健康状态推定，不是官方剩余配额；"
             "官方 5 小时/每周额度读取仅在 Go 组件 'makewand-server quota' 中实现。", COLOR_YELLOW))
@@ -318,7 +327,7 @@ def cmd_status(args):
 
             print(f"{badge} {mode_badge} {c(name, COLOR_BOLD)}")
             if pct is None:
-                print(f"      额度指示: 未探测  ({quota_desc})")
+                print(f"      额度指示: 未知  ({quota_desc})")
             else:
                 bar = format_quota_bar(pct, width=20)
                 print(f"      额度指示: {bar}  ({quota_desc})")
@@ -519,6 +528,12 @@ def cmd_models(args):
             refresh_agy_models_cache,
         )
         refresh_agy_models_cache(timeout=AGY_MODELS_REFRESH_TIMEOUT_SECONDS)
+    if getattr(args, "json", False):
+        from makewand.health import calculate_provider_quota
+        models = discover_available_models()
+        models["agy"]["quota"] = calculate_provider_quota("agy")
+        print(json.dumps(models, ensure_ascii=False, indent=2))
+        return
     print(c("\n============================================================", COLOR_BOLD))
     print(c("       Makewand 多模型生态与动态发现矩阵 (Model Discovery)", COLOR_BOLD + COLOR_CYAN))
     print(c("============================================================\n", COLOR_BOLD))
@@ -544,7 +559,13 @@ def cmd_models(args):
 
     print(c("1. Claude Code (Anthropic 订阅):", COLOR_BOLD + COLOR_BLUE))
     _model_lines("claude", "~/.claude 模型目录缓存 / ~/.claude.json")
-    print("   调用方式: 按档位传别名 (fable/sonnet/haiku)，具体版本由 Claude Code 解析。\n")
+    print("   调用方式: --tier fast/standard/deep 自动排名；--model opus 或完整模型 ID 显式指定。")
+    for tier, resolution in models["claude"].get("tier_selections", {}).items():
+        print(f"   {tier}: {resolution.get('selection_reason', resolution['model'])}")
+        for row in resolution.get("ranking", []):
+            if "opus" in row["model"]:
+                print(f"     Opus {row['model']}: {row['reason']} (score={row['score']})")
+    print()
 
     print(c("2. Codex CLI (OpenAI 订阅):", COLOR_BOLD + COLOR_CYAN))
     _model_lines("codex", "~/.codex 模型目录缓存 / config.toml")
@@ -552,7 +573,16 @@ def cmd_models(args):
 
     print(c("3. Antigravity (Google AI Pro):", COLOR_BOLD + COLOR_GREEN))
     _model_lines("agy", "~/.gemini/antigravity-cli/settings.json / 官方在线模型列表")
-    print("   调用方式: 自动读取 settings.json 与官方在线目录动态映射档位 (--tier fast/standard/deep)。\n")
+    print("   调用方式: 自动读取 settings.json 与目录缓存映射档位 (--tier fast/standard/deep)。")
+    for candidate in models["agy"].get("candidates", []):
+        verification = "调用 ID 已验证" if candidate["call_id_verified"] else "调用 ID 未验证"
+        eligibility = "可自动选择" if candidate["auto_select"] else "默认不选；可用 --model 显式指定"
+        print(f"     {candidate['model']}: 家族={candidate['model_family'] or '未知'} · {verification} · {eligibility}")
+        print(f"       来源: {candidate['source']} · 缓存时间: {candidate['cached_at'] or '未知'}")
+        print(f"       工具={candidate['tool']} · 账号={candidate['account_ref'] or '未知'} · 实际模型={candidate['actual_model'] or '未知'} · 额度池={candidate['pool_ref'] or '未知'}")
+    from makewand.health import calculate_provider_quota
+    quota = calculate_provider_quota("agy")
+    print(f"   {quota['desc']}\n")
 
     print(c("4. Muse Code (Meta 订阅):", COLOR_BOLD + COLOR_PURPLE))
     _model_lines("muse", "~/.local/share/muse/model-catalog / ~/.config/muse/settings.json")
@@ -1190,7 +1220,7 @@ def delegate_to_go_server(args_list: List[str]):
     """
     import subprocess
     bin_path = _find_go_binary()
-    if not bin_path and os.environ.get("MAKEWAND_DEV") == "1":
+    if not bin_path and os.environ.get("MAKEWAND_DEV") == "1" and os.environ.get(PROVIDER_WORKER_ENV) != "1":
         bin_path = _build_dev_go_binary()
 
     if bin_path:
@@ -1301,22 +1331,57 @@ def _plan_native_go_delegation(argv: List[str]) -> Optional[List[str]]:
 
 # Set by makewand in the environment of every provider CLI it launches.
 from makewand.sandbox import PROVIDER_WORKER_ENV  # noqa: E402
-# Read-only commands that never dispatch a model; allowed inside a provider worker.
-WORKER_SAFE_SUBCOMMANDS = frozenset({"status", "quota", "search", "repomap", "inspect", "candidates", "sessions"})
-# Go-native commands that never dispatch a model.
-GO_WORKER_SAFE_COMMANDS = frozenset({"quota", "usage", "state", "audit", "token", "user"})
+# Complete audited paths, shared with Go through command_contract.json.
+WORKER_SAFE_SUBCOMMANDS = frozenset(path for path, rule in WORKER_QUERY_COMMANDS.items() if rule["engine"] == "python")
+GO_WORKER_SAFE_COMMANDS = frozenset(path for path, rule in WORKER_QUERY_COMMANDS.items() if rule["engine"] == "go")
+
+
+def _worker_query_matches(argv: List[str], path: str, rule: Dict[str, Any]) -> bool:
+    words = path.split()
+    position = arguments = index = 0
+    literal = False
+    while index < len(argv):
+        arg = argv[index]
+        index += 1
+        if not literal and arg == "--":
+            literal = True
+            continue
+        if not literal and arg.startswith("-") and arg != "-":
+            flag, equals, _ = arg.partition("=")
+            attached = arg.startswith("-C") and len(arg) > 2
+            if attached:
+                flag = "-C"
+            if flag not in rule["flags"]:
+                return False
+            if rule["flags"][flag] and not equals and not attached:
+                if index >= len(argv):
+                    return False
+                index += 1
+            continue
+        if position < len(words):
+            if literal or arg != words[position]:
+                return False
+            position += 1
+        else:
+            arguments += 1
+    return position == len(words) and arguments <= rule["max_args"]
 
 
 def _provider_worker_refusal(command: Optional[str], argv: List[str]) -> Optional[str]:
-    """Error text when a provider CLI launched by makewand tries to dispatch models again."""
+    """Guard inherited-environment misuse, not deliberate marker removal.
+
+    Inspect literal argv before parsing/delegation: argparse accepts abbreviated
+    flags, and command-looking option values must never select a safe command.
+    """
     if os.environ.get(PROVIDER_WORKER_ENV) != "1":
         return None
-    if command in (WORKER_SAFE_SUBCOMMANDS | GO_WORKER_SAFE_COMMANDS) and not any(
-            a == "--probe" or a.startswith("--probe=") for a in argv):
+    if len(argv) == 1 and argv[0] in WORKER_STATIC_ARGS:
+        return None
+    if any(_worker_query_matches(argv, path, rule) for path, rule in WORKER_QUERY_COMMANDS.items()):
         return None
     shown = f"makewand {command}" if command else "makewand"
-    return (f"❌ makewand 正作为另一 makewand 任务派发的 AI 子进程运行，已拒绝递归调用 `{shown}`。"
-            "请直接完成当前分配的任务。")
+    return (f"❌ makewand 正作为另一 makewand 任务派发的 AI 子进程运行（MAKEWAND_PROVIDER_WORKER=1），已拒绝递归或未经审计的调用 `{shown}`。"
+            "仅允许白名单中的只读查询与参数；管理操作、探测、provider 启动及隐式写入均被禁止。请直接完成当前分配的任务。")
 
 
 def main():
@@ -1329,6 +1394,10 @@ def main():
 
 
 def _main():
+    refusal = _provider_worker_refusal(None, sys.argv[1:])
+    if refusal:
+        print(c(refusal, COLOR_RED), file=sys.stderr)
+        sys.exit(EXIT_USAGE_ERROR)
     original_cwd = os.getcwd()
     inherited_budget_file = os.environ.get("MAKEWAND_CALL_BUDGET_FILE")
     inherited_maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
@@ -1391,6 +1460,7 @@ def _main():
     # models
     p_models = subparsers.add_parser("models", help="Discover and list current models across all AI ecosystems", parents=[sub_common_parser])
     p_models.add_argument("--refresh", action="store_true", default=False, help="Refresh the agy model cache now (60s timeout, ignores back-off) before listing")
+    p_models.add_argument("--json", action="store_true", help="Show candidate provenance, model family, account and quota-pool metadata")
 
     # status
     p_status = subparsers.add_parser("status", help="Show health, quota indicators (local estimates), and reset times of all AIs", parents=[sub_common_parser])
@@ -1740,6 +1810,11 @@ def _main():
     if refusal:
         print(c(refusal, COLOR_RED), file=sys.stderr)
         sys.exit(EXIT_USAGE_ERROR)
+    if os.environ.get(PROVIDER_WORKER_ENV) == "1":
+        # Audited repository queries bypass config/credential loading, inherited
+        # budgets, daemon dispatch and observer initialization (all may write).
+        args.cwd = os.path.abspath(args.cwd or os.getcwd())
+        return {"search": cmd_search, "repomap": cmd_repomap}[args.subcommand](args)
     # Validate policy before discovery, daemon dispatch or orchestration.
     # Those paths may catch transport errors, so policy validity must already
     # be established before any provider can be started.
@@ -1794,13 +1869,20 @@ def _main():
             import uuid
             from makewand.config import CONFIG_DIR, ensure_config_dir
             ensure_config_dir()
-            explicit_budget = str(CONFIG_DIR / ("call-budget-" + uuid.uuid4().hex + ".json"))
+            from makewand.layered_budget import default_path
+            explicit_budget = default_path()
+            os.environ["MAKEWAND_LAYERED_BUDGET"] = "1"
         os.environ["MAKEWAND_MAX_MODEL_CALLS"] = str(args.max_model_calls)
     elif inherited_limit is not None:
         os.environ["MAKEWAND_MAX_MODEL_CALLS"] = str(inherited_limit)
     if parent_budget or explicit_budget:
+        os.environ["MAKEWAND_LAYERED_BUDGET"] = "1"
         args.call_budget_file = parent_budget or explicit_budget
         os.environ["MAKEWAND_CALL_BUDGET_FILE"] = args.call_budget_file
+
+    if args.call_budget_file:
+        from makewand.execution_runtime import initialize_cli_task
+        initialize_cli_task()
 
     # Honor --no-daemon flag
     if getattr(args, "no_daemon", False):
@@ -2049,7 +2131,7 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
         elif not ok:
             if err: sys.stderr.write(f"{err}\n")
             sys.exit(1)
-    elif args.subcommand in ("deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
+    elif args.subcommand in API_ONLY_ENGINES:
         from makewand.orchestrator import dispatch_task
         from makewand.workflow import remember_result
         ok, out, err = remember_result(dispatch_task(args.subcommand, args.prompt, cwd=args.cwd, timeout=args.timeout, tier=args.tier, model=args.model, effort=getattr(args, "effort", None), stream=args.stream, readonly=getattr(args, "readonly", False), repo_trust=getattr(args, "repo_trust", "trusted")))

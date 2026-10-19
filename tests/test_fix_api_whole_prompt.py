@@ -292,7 +292,7 @@ class LocalWholePromptTests(unittest.TestCase):
             self.assertEqual(code, 0, error)
         (repo / "tables.py").write_text("".join(f"ENTRY_{index:05d} = {index}\n" for index in range(2000)))
         with self.local_endpoint(), patch.object(orch, "get_or_update_status", return_value={"local": {"status": "healthy"}}), \
-                patch.dict(os.environ, {"MAKEWAND_STRICT_NONCE": "1"}), patch("makewand.usage.record_engine_usage"), \
+                patch("makewand.usage.record_engine_usage"), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             code = orch.run_review(cwd=str(repo), local_only=True, output_json=True, timeout=60)
         return code, out.getvalue()

@@ -13,6 +13,7 @@ from makewand.config import (
     COLOR_BOLD,
     COLOR_RED,
     COLOR_YELLOW,
+    API_ONLY_ENGINES,
 )
 from makewand.task_admission import classify_prompt_intent
 
@@ -33,8 +34,6 @@ _UNUSABLE_ENGINE_STATUSES = ("limited", "needs_auth", "error", "missing", "disab
 # (config.api_relay_available). An "error" verdict is not relayed: the CLI runs.
 _API_RELAY_STATUSES = ("limited", "needs_auth", "missing")
 _RACE_JUDGE_ORDER = ("agy", "codex", "claude", "grok", "muse", "local")
-# Engines that only have a cloud API (orchestrator.dispatch_task's api_engines).
-API_ONLY_ENGINES = frozenset({"deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"})
 
 
 def _failure_verdict_expired(info: Dict[str, Any]) -> bool:
@@ -199,10 +198,20 @@ def forced_engine_refusal(forced_engine: Optional[str], cache: Optional[Dict[str
     name = forced_engine_name(forced_engine)
     if name is None:
         return None
-    from makewand.config import api_relay_available, api_relay_blocked_note, is_provider_enabled
-    if name in API_ONLY_ENGINES and is_provider_enabled(name) and not api_relay_available(name):
+    from makewand.config import (ALL_SUPPORTED_PROVIDERS, api_relay_available, api_relay_blocked_note,
+                                has_subscription_configured, is_provider_enabled)
+    if name in ENGINES_WITHOUT_EXECUTOR:
+        return "该引擎尚无执行适配器，不能派发任务"
+    if name not in ALL_SUPPORTED_PROVIDERS and name != "ollama":
+        return f"未知引擎: {name}"
+    if not is_provider_enabled(name):
+        return _engine_usable(name, cache)[1]
+    if name in API_ONLY_ENGINES and not api_relay_available(name):
         # Nothing but its cloud API can run it (orchestrator.dispatch_task calls the API directly).
         return api_relay_blocked_note(name) or f"未配置 {name.upper()} API Key (设置环境变量即可激活)"
+    if name not in API_ONLY_ENGINES and name not in ("local", "ollama"):
+        if not (has_subscription_configured(name) or api_relay_available(name)):
+            return api_relay_blocked_note(name) or "未安装订阅 CLI，且未配置 API Key"
     cache = _without_expired_failures(cache)
     if _usable_or_api_relay(name, cache):
         return None
@@ -670,11 +679,22 @@ def select_optimal_engine_pair(
             available_reviewers = [primary_coder]
             single_tool_mode = True
 
+    from makewand.discovery import independent_models, model_candidate
+    candidates = {engine: model_candidate(engine, tier) for engine in available_coders}
+    review_candidates = {engine: model_candidate(engine, "deep") for engine in available_reviewers}
+    if not single_tool_mode:
+        rejected = [engine for engine in available_reviewers
+                    if not independent_models(engine, primary_coder, author_tier=tier)]
+        available_reviewers = [engine for engine in available_reviewers if engine not in rejected]
+        if rejected:
+            reasons.append("模型家族相同或未知，不能作为独立审查: " + ", ".join(rejected))
     meta_info = {
+        "candidates": candidates,
+        "review_candidates": review_candidates,
         "scores": scores,
         "reasons": reasons,
         "primary_coder": primary_coder,
-        "primary_reviewer": available_reviewers[0] if available_reviewers else primary_coder,
+        "primary_reviewer": available_reviewers[0] if available_reviewers else None,
         "single_tool_mode": single_tool_mode,
         "pacings": pacings
     }

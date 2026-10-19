@@ -1,0 +1,924 @@
+[
+  {
+    "argv": [
+      "--help"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "-h"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "--version"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "search",
+      "needle"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "-C",
+      "path with spaces",
+      "search",
+      "needle"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "--cwd=repomap",
+      "search",
+      "needle",
+      "--max-depth=2"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "search",
+      "--cwd",
+      "repomap",
+      "--max-results",
+      "3",
+      "needle"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "search",
+      "--",
+      "--probe"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "-Cpath with spaces",
+      "repomap",
+      "--json",
+      "--max-lines=5",
+      "--max-files",
+      "2"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "repomap",
+      "--cwd=search"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "help"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "completion",
+      "bash"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "completion",
+      "fish"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "completion",
+      "powershell"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "completion",
+      "zsh"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [
+      "completion",
+      "fish",
+      "--no-descriptions=false"
+    ],
+    "allowed": true
+  },
+  {
+    "argv": [],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "chat"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "new",
+      "x"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "serve"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "setup"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "doctor"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "run",
+      "x"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "review"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "race",
+      "x"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "ensemble",
+      "x"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "probe"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "status"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "quota"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "inspect"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "candidates"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "sessions"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "audit",
+      "summary"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "usage",
+      "summary"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "usage",
+      "events"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "usage",
+      "periods"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "usage",
+      "alerts"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "future-query"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "search",
+      "x",
+      "future-child"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "future-child"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "completion"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "completion",
+      "future-shell"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "help",
+      "state"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--",
+      "help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "sear",
+      "x"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repo",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--max-l=2"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "-C"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "help",
+      "state",
+      "backup",
+      "fake.tar.gz"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd=help",
+      "token",
+      "issue"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "completion",
+      "fish",
+      "--future-provider-start"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "completion",
+      "fish",
+      "--debug=false"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--daemon"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--no-daemon"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--max-model-calls=1"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--call-budget-file",
+      "fake.json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--provider=local"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--execute"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--debug"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--json",
+      "--help",
+      "--probe"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--probe",
+      "search",
+      "x"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "search",
+      "x",
+      "--probe=false"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "search",
+      "x",
+      "--prob"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "status",
+      "--pr"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "status",
+      "--probe=1"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "-C/tmp",
+      "quota",
+      "--probe"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "state"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "state",
+      "backup"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "state",
+      "backup",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "state",
+      "backup"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "state",
+      "backup",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "state",
+      "restore"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "state",
+      "restore",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "state",
+      "restore"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "state",
+      "restore",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "list"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "list",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "token",
+      "list"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "list",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "issue"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "issue",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "token",
+      "issue"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "issue",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "revoke"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "revoke",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "token",
+      "revoke"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "token",
+      "revoke",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "list"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "list",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "user",
+      "list"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "list",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "activate"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "activate",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "user",
+      "activate"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "activate",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "deactivate"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "deactivate",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "user",
+      "deactivate"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "deactivate",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "role"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "role",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "user",
+      "role"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "role",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "password"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "password",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "user",
+      "password"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "password",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "login"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "login",
+      "--help"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "--cwd",
+      "quota",
+      "user",
+      "login"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "user",
+      "login",
+      "--remote-url=http://invalid.fixture",
+      "--json"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "sta",
+      "backup",
+      "fake.tar.gz"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "tok",
+      "issue"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "us",
+      "role",
+      "fixture",
+      "admin"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--cwd=/tmp",
+      "--probe=true"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "completion",
+      "fish",
+      "--probe=false"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "__complete",
+      "chat",
+      ""
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "completion",
+      "powershell",
+      "future-child"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "search",
+      "x",
+      "--pro=true"
+    ],
+    "allowed": false
+  },
+  {
+    "argv": [
+      "repomap",
+      "--help",
+      "--provider-start=false"
+    ],
+    "allowed": false
+  }
+]

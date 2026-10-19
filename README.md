@@ -77,6 +77,16 @@ cd path/to/makewand
 
 供应商启停策略对 Go/Python 入口共同生效，禁用也阻止该工具的探测和额度读取。Claude、Gemini 和 OpenAI 的 API 参数按环境变量、`api_keys.json`、`config.json`、默认值的顺序读取；付费调用仍需显式启用 `allow_paid`。详见[共享配置契约](docs/EXECUTION_CONTRACT.md#shared-provider-configuration)。
 
+代理默认值对 Go/Python 的 provider CLI、沙箱和 API 路由共同生效。编辑 `~/.config/makewand/config.json`（或 `MAKEWAND_CONFIG_DIR/config.json`），保留其他配置，例如：
+
+```json
+{"proxy": {"default": "http://proxy.example:8080", "no_proxy": "localhost,127.0.0.1,.internal.example"}}
+```
+
+`MAKEWAND_DEFAULT_PROXY`、`MAKEWAND_DEFAULT_NO_PROXY` 分别覆盖这两个字段，空字符串可禁用相应默认值。仅当调用方完全没有 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 及其小写变量时，才补齐六个代理变量；已有变量（包括空值）原样保留。仅在补默认代理时，且调用方没有任一大小写 `NO_PROXY`，才补齐 `NO_PROXY`/`no_proxy`。没有配置默认代理时不加代理，也没有内置本机端口。离线沙箱不补默认代理。
+
+Gemini/agy 默认遵循代理，只有显式设置 `MAKEWAND_GEMINI_BYPASS_PROXY=1` 才向大小写 `NO_PROXY` 追加 Google 域名；兼容开关 `MAKEWAND_GEMINI_USE_PROXY=1` 优先于绕过开关。Google API 路由也遵循此规则。`makewand status`（含 `--json`）显示代理来源：环境变量、配置默认值或无；状态只显示来源，不输出代理 URL，避免泄露用户名密码。Go 入口的 `setup` 同样显示来源。默认值不会写入宿主环境或配置文件。
+
 `MAKEWAND_QUOTA_RESERVE_PERCENT` 设置官方剩余额度的保留阈值，默认 `8`（百分比）；例如仅对一次命令设置 `MAKEWAND_QUOTA_RESERVE_PERCENT=4 makewand ...`。只接受有限数值 `0`–`100`，低于阈值时阻止自动派发；`0` 也不会放行已耗尽额度。无效设置会显示警告并回退到 `8`，不会清除实际限流或认证失败；账号关联及官方数据有效期仍照常校验。显式设置时，Codex 精确的剩余百分比使用同一阈值；模糊的低额度警告只有新鲜、同账号官方证据确认足够时才放行，真实限流仍优先。该设置不增加订阅额度，也不启用付费 API。
 
 ---
@@ -212,6 +222,10 @@ makewand daemon start
 makewand status --daemon --json
 makewand daemon stop
 ```
+
+有界派发使用机器共享的 `call-budget.json`，任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，Asia/Shanghai 午夜重置。账号/订阅池默认并发 1，无可用回退时默认最多等 30 秒；busy 不计费，返回 FAILED（退出码 10），预算耗尽返回退出码 13。已结算记录保留 48 小时并自动清理，旧 lifetime 预算仍保留累计花费；活动记录和租约不清除。配置及恢复规则见 [预算与租约](docs/layered-call-admission.md)，账号绑定和缓存见 [quota 账号绑定](docs/quota-account-binding.md)。
+
+provider 子进程继承 `MAKEWAND_PROVIDER_WORKER=1` 后只允许 `search`、`repomap`、静态帮助/版本和 `completion <shell>`；`quota`、`status`、`route` 等管理命令也拒绝。完整参数白名单见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
 
 Daemon 为每次请求启动独立 Python worker，使用相同的 CLI 参数解析器，并保留调用目录、参数、标准输入和客户端环境快照。`MAKEWAND_API_POLICY` 等执行策略按请求生效；任务不会继承 daemon 启动时的旧策略。独立进程防止并发请求串目录或串输出，仓库写入仍受工作区锁、沙箱和交付校验约束。
 

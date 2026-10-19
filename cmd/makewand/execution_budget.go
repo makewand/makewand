@@ -1,20 +1,17 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 
 	"github.com/makewand/makewand/execution"
-	"github.com/makewand/makewand/internal/privatefile"
 	"github.com/spf13/cobra"
 )
 
-// Resolve one shared ledger before any Router is built. A maximum without a
-// filename gets one private task ledger, inherited by every child invocation.
+// Resolve the stable machine ledger before any Router is built. Task limits
+// live in their own scope and never overwrite the daily limits.
 func configureExecutionBudget(cmd *cobra.Command) error {
 	maximumText := os.Getenv("MAKEWAND_MAX_MODEL_CALLS")
 	inheritedMaximum := 0
@@ -48,29 +45,26 @@ func configureExecutionBudget(cmd *cobra.Command) error {
 		path = rootCallBudgetFileFlag
 	}
 	if maximum > 0 && path == "" {
-		file, err := os.CreateTemp("", "makewand-call-budget-*.json")
+		var err error
+		path, err = execution.DefaultBudgetPath()
 		if err != nil {
-			return fmt.Errorf("create model call budget: %w", err)
-		}
-		path = file.Name()
-		if err := privatefile.Tighten(file); err != nil {
-			_ = file.Close()
-			_ = os.Remove(path)
-			return fmt.Errorf("protect model call budget: %w", err)
-		}
-		encodeErr := json.NewEncoder(file).Encode(map[string]any{"schema": execution.Schema, "maximum": maximum, "attempts": []any{}})
-		if encodeErr == nil {
-			encodeErr = file.Sync()
-		}
-		closeErr := file.Close()
-		if encodeErr != nil || closeErr != nil {
-			_ = os.Remove(path)
-			return fmt.Errorf("initialize model call budget: %w", errors.Join(encodeErr, closeErr))
+			return err
 		}
 	}
+	if path != "" {
+		if err := os.Setenv("MAKEWAND_LAYERED_BUDGET", "1"); err != nil {
+			return err
+		}
+	}
+
 	_, cfg, err := execution.EnsureContext(execution.ContextWithConfig(cmd.Context(), execution.Config{LedgerPath: path, MaxCalls: maximum}))
 	if err != nil {
 		return err
+	}
+	if cfg.LedgerPath != "" {
+		if err := execution.InitializeBudget(cmd.Context(), cfg); err != nil {
+			return err
+		}
 	}
 	path = cfg.LedgerPath
 	if path != "" {

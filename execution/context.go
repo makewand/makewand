@@ -32,6 +32,9 @@ type stageKey struct{}
 
 func ContextWithConfig(ctx context.Context, config Config) context.Context {
 	if previous, ok := ctx.Value(configKey{}).(Config); ok {
+		if previous.TaskID != "" {
+			config.TaskID = previous.TaskID
+		}
 		if previous.enforcedLedger != "" {
 			config.enforcedLedger = previous.enforcedLedger
 			config.enforcedDirectory = previous.enforcedDirectory
@@ -99,6 +102,13 @@ func EnsureContext(ctx context.Context) (context.Context, Config, error) {
 	inheritedLedger := os.Getenv("MAKEWAND_CALL_BUDGET_FILE")
 	if cfg.LedgerPath == "" {
 		cfg.LedgerPath = inheritedLedger
+	}
+	if cfg.LedgerPath == "" && layeredEnabled(nil) {
+		var err error
+		cfg.LedgerPath, err = DefaultBudgetPath()
+		if err != nil {
+			return ctx, cfg, err
+		}
 	}
 	if cfg.EventsPath == "" {
 		cfg.EventsPath = os.Getenv("MAKEWAND_EXECUTION_EVENTS_FILE")

@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import time
+from unittest.mock import patch
 
 from makewand import git_helper, orchestrator as orch
 
@@ -38,6 +40,7 @@ PATTERN_SETS = [
     ["[[:bogus:]]"], ["[[:alpha:]x]"], ["[[:alpha]"], ["**/"], ["/"], ["!"], ["**/*.c", "!a/b.c"],
     ["lat?n.txt"], ["lat\udce9n.txt"], ["sp\\ ace"], ["[[:upper:]]*"], ["[[:xdigit:]][[:digit:]]"], ["x/**/z"],
     ["***/z"], ["x**z"], ["*/z"], ["[^a]b"], ["\\a"], ["a/b/"], ["x/**", "!x/z"], ["*", "!*/", "!*.md"],
+    ["**/" * 6 + "x/y"], ["**/" * 8 + "x/y"], ["*x" * 1100],
     ["docs/", "!docs/a.md"], ["build/*", "!build/x"], ["a/", "!a/b"], ["*.c\r"], ["# comment", "", "x.log"],
 ]
 
@@ -93,6 +96,19 @@ class FallbackMatchesGitTests(unittest.TestCase):
                 self.assertIs(path in git_check_ignore(lines, [path]), expected)
 
 
+class HostilePatternTests(unittest.TestCase):
+    def test_deep_starstar_and_long_star_patterns_are_bounded_without_recursion(self):
+        start = time.monotonic()
+        for count in (6, 8):
+            self.assertFalse(orch._gitignore_fallback_ignored('/'.join(['d'] * 30 + ['z']), ['**/' * count + 'x/y']))
+        self.assertTrue(orch._gitignore_fallback_ignored('x' * 1100, ['*x' * 1100]))
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_exhausted_budget_keeps_the_input_even_with_an_earlier_ignore_rule(self):
+        with patch.object(orch, '_WILDMATCH_MAX_WORK', 10):
+            self.assertFalse(orch._gitignore_fallback_ignored('x' * 30, ['*', '!' + '*x' * 30]))
+
+
 class FallbackInTheGateTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="makewand-gitignore-gate-")
@@ -107,6 +123,13 @@ class FallbackInTheGateTests(unittest.TestCase):
         changed = ["docs/a.md", "docs/sub/b.md", "tmp/x", "a/tmp/y", "notes.txt", "src/app.py"]
         kept = orch._filter_non_deliverable_test_changes(changed, str(self.plain))
         self.assertEqual(kept, ["docs/sub/b.md", "src/app.py"])
+
+    def test_non_utf8_gitignore_comments_never_use_the_windows_fsdecoder(self):
+        (self.plain / '.gitignore').write_bytes(b'# \xd6\xd0\xce\xc4\n*.log\n')
+        with patch('makewand.git_helper.run_git_cmd', return_value=(128, b'', b'')), \
+                patch('makewand.git_helper.tracked_paths', return_value=set()), \
+                patch.object(orch.os, 'fsdecode', side_effect=UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')):
+            self.assertEqual(orch._filter_non_deliverable_test_changes(['app.py', 'server.log'], str(self.plain)), ['app.py'])
 
     @unittest.skipIf(os.name == "nt", "file names are not bytes on Windows")
     def test_an_undecodable_name_matches_its_own_bytes(self):

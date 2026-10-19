@@ -89,7 +89,7 @@ func Tighten(file *os.File) error {
 		securityInfo |= windows.OWNER_SECURITY_INFORMATION
 		newOwner = user
 	}
-	reopened, _, callErr := reopenFile.Call(uintptr(handle), uintptr(access), uintptr(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE), 0)
+	reopened, _, callErr := reopenFile.Call(uintptr(handle), uintptr(access), uintptr(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE), 0)
 	if windows.Handle(reopened) == windows.InvalidHandle {
 		return fmt.Errorf("open fixed private file for security: %w", callErr)
 	}

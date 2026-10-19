@@ -93,7 +93,9 @@ class TestClaudeReadonlyFlags(unittest.TestCase):
         # the launch is audited and marked as a provider worker
         cmd = self._cmd(readonly=True, bwrap=False)
         self.assertEqual(cmd[0], "claude")
-        self.assertEqual(self.run_mock.call_args[1].get("extra_env"), {"MAKEWAND_PROVIDER_WORKER": "1"})
+        child_env = self.run_mock.call_args[1]["extra_env"]
+        self.assertEqual(child_env["MAKEWAND_PROVIDER_WORKER"], "1")
+        self.assertNotIn("CLAUDE_CONFIG_DIR", child_env)
         self._assert_readonly_flags(cmd)
         self.audit.assert_called_once()
         self.assertEqual(self.audit.call_args[0][3], "config-ack")

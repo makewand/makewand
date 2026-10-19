@@ -3,6 +3,7 @@ Local Self-Hosted Free Model Provider (Ollama / vLLM / LocalAI / llama.cpp).
 Completely free, 0 Token cost, 100% offline privacy.
 """
 
+from makewand.proxy import urlopen as proxy_urlopen
 import os
 import sys
 import json
@@ -38,7 +39,7 @@ def is_local_model_available(timeout: float = 2.0) -> Tuple[bool, str, List[str]
 
     try:
         req = urllib.request.Request(models_url, headers={"User-Agent": "makewand/3.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with proxy_urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode("utf-8"))
                 models = []
@@ -114,7 +115,7 @@ def unload_local_model(model_name: str) -> None:
             headers={"Content-Type": "application/json"},
             data=json.dumps({"model": model_name, "keep_alive": 0}).encode("utf-8")
         )
-        urllib.request.urlopen(req, timeout=4)
+        proxy_urlopen(req, timeout=4)
     except Exception:
         pass
 
@@ -205,7 +206,7 @@ def ollama_context_length(root: str, model: Optional[str], headers: Optional[Dic
         # "name" is the field older servers read.
         req = urllib.request.Request(f"{root}/api/show", data=json.dumps({"model": model, "name": model}).encode("utf-8"),
                                      headers=request_headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with proxy_urlopen(req, timeout=timeout) as resp:
             body = resp.read(OLLAMA_SHOW_MAX_BYTES + 1)
         if len(body) > OLLAMA_SHOW_MAX_BYTES:
             return None, None, f"响应超过 {OLLAMA_SHOW_MAX_BYTES} 字节"

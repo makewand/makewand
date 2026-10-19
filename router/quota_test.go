@@ -2,8 +2,10 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -155,13 +157,17 @@ func TestSnapshotConcurrentReads(t *testing.T) {
 }
 
 func TestCodexRateLimitsParsing(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "sessions")
+	writeQuotaTestAuth(t, filepath.Dir(dir), "fixture")
 	fp := filepath.Join(dir, "rollout-test.jsonl")
 	// Two rate_limits lines; the later one must win.
-	content := `{"timestamp":"2026-07-14T08:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":10.0,"window_minutes":300,"resets_at":1784585336},"secondary":{"used_percent":50.0,"window_minutes":10080},"plan_type":"pro"}}}
+	content := `{"account_id":"fixture","timestamp":"2026-07-14T08:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":10.0,"window_minutes":300,"resets_at":1784585336},"secondary":{"used_percent":50.0,"window_minutes":10080},"plan_type":"pro"}}}
 {"other":"line"}
-{"timestamp":"2026-07-14T09:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":22.0,"window_minutes":300,"resets_at":1784585336},"secondary":{"used_percent":84.0,"window_minutes":10080},"plan_type":"pro"}}}
+{"account_id":"fixture","timestamp":"2026-07-14T09:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":22.0,"window_minutes":300,"resets_at":1784585336},"secondary":{"used_percent":84.0,"window_minutes":10080},"plan_type":"pro"}}}
 `
+	content = strings.ReplaceAll(content, "2026-07-14T08:00:00Z", time.Now().Add(-time.Minute).Format(time.RFC3339))
+	content = strings.ReplaceAll(content, "2026-07-14T09:00:00Z", time.Now().Format(time.RFC3339))
+	content = strings.ReplaceAll(content, "1784585336", fmt.Sprint(time.Now().Add(time.Hour).Unix()))
 	if err := os.WriteFile(fp, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -182,11 +188,13 @@ func TestCodexRateLimitsParsing(t *testing.T) {
 }
 
 func TestCodexNestedRateLimitsFound(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "sessions")
+	writeQuotaTestAuth(t, filepath.Dir(dir), "fixture")
 	fp := filepath.Join(dir, "rollout-nested.jsonl")
 	// rate_limits buried deeper in the object graph.
-	content := `{"timestamp":"2026-07-14T09:00:00Z","a":{"b":{"rate_limits":{"secondary":{"used_percent":66.0,"window_minutes":10080}}}}}
+	content := `{"account_id":"fixture","timestamp":"2026-07-14T09:00:00Z","a":{"b":{"rate_limits":{"secondary":{"used_percent":66.0,"window_minutes":10080}}}}}
 `
+	content = strings.ReplaceAll(content, "2026-07-14T09:00:00Z", time.Now().Format(time.RFC3339))
 	if err := os.WriteFile(fp, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}

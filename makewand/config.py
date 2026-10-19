@@ -120,6 +120,11 @@ def _load_json_object(path: Path) -> dict:
 
 def _validate_provider_controls(value: dict) -> None:
     """Authorization fields accept only their declared types or whole-field null."""
+    proxy = value.get("proxy")
+    if proxy is not None and (not isinstance(proxy, dict) or any(
+            proxy.get(key) is not None and not isinstance(proxy[key], str)
+            for key in ("default", "no_proxy"))):
+        raise ConfigError("proxy must be an object with string default/no_proxy fields")
     enabled = value.get("enabled_providers")
     if enabled is not None and (not isinstance(enabled, dict)
                                 or any(not isinstance(name, str) or not isinstance(flag, bool)
@@ -370,6 +375,9 @@ ALL_SUPPORTED_PROVIDERS = [
     "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow", "local"
 ]
 
+# Providers with no subscription CLI; shared by routing, health and direct commands.
+API_ONLY_ENGINES = frozenset({"deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"})
+
 def get_all_supported_providers() -> list:
     """Returns copy of all supported provider names."""
     return list(ALL_SUPPORTED_PROVIDERS)
@@ -442,7 +450,7 @@ def has_subscription_configured(provider: str) -> bool:
     p = normalize_provider_name(provider)
     if not is_provider_enabled(p):
         return False
-    if p in ("local", "aider", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"):
+    if p in API_ONLY_ENGINES or p in ("local", "aider"):
         return False
     if p == "copilot":
         if shutil.which("copilot"):

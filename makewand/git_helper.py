@@ -117,10 +117,15 @@ def _fs_path(path):
 
 
 def _is_reparse_path(path):
+    return _is_reparse_api_path(_fs_path(path)) if os.name == "nt" else False
+
+
+def _is_reparse_api_path(path):
+    """Inspect an API path already converted by _fs_path exactly once."""
     if os.name != "nt":
         return False
     try:
-        return bool(getattr(_fs_path(path).lstat(), "st_file_attributes", 0) & 0x400)
+        return bool(getattr(path.lstat(), "st_file_attributes", 0) & 0x400)
     except FileNotFoundError:
         return False
 
@@ -585,7 +590,8 @@ def init_git_baseline(cwd: str, ephemeral: bool = False) -> Tuple[bool, Optional
         if code == 0 and cmd[1] == "init":
             # A config linked from init.templateDir must not receive makewand's identity.
             try:
-                _own_repository_file(_fs_path(git_dir), "config")
+                _own_repository_file(git_dir, "config")
+                _own_repository_directory(git_dir, "info")
             except OSError as exc:
                 code, err = 1, f"无法确保仓库配置为本仓库的普通文件: {exc}"
         if code != 0:
@@ -593,7 +599,7 @@ def init_git_baseline(cwd: str, ephemeral: bool = False) -> Tuple[bool, Optional
             return False, f"{label} 失败 (rc={code}): {(err or '').strip()[:200]}" + (f"；{cleanup_err}" if cleanup_err else "")
     if ephemeral:
         try:
-            write_repository_file(_fs_path(git_dir), EPHEMERAL_GIT_MARKER,
+            write_repository_file(git_dir, EPHEMERAL_GIT_MARKER,
                                   json.dumps({"pid": os.getpid(), "created": datetime.now().isoformat()}).encode("utf-8"))
         except OSError as exc:
             cleanup_err = _remove_git_dir(git_dir)
@@ -1099,7 +1105,8 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
             if cmd[1] == "init":
                 # A config linked from init.templateDir must not receive the copy's settings.
                 try:
-                    _own_repository_file(_fs_path(Path(target_dir) / ".git"), "config")
+                    _own_repository_file(Path(target_dir) / ".git", "config")
+                    _own_repository_directory(Path(target_dir) / ".git", "info")
                 except OSError as exc:
                     raise OSError(_printable(f"隔离副本基线建立失败 (无法确保仓库配置为本仓库的普通文件): {exc}")) from exc
         # Only force-add the exact safely enumerated files. A source file that was
@@ -2135,6 +2142,33 @@ def _open_metadata_directory(parent_fd: int, name: str) -> int:
     return os.open(name, _NOFOLLOW_DIR_FLAGS, dir_fd=parent_fd)
 
 
+def _unlink_repository_link(path: Path) -> None:
+    """Remove a metadata link itself, including a Windows directory junction."""
+    if _is_reparse_api_path(path) and path.is_dir() and not path.is_symlink():
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _own_repository_directory(git_dir: Union[str, Path], name: str) -> None:
+    """Detach a template-linked metadata directory before any later git command."""
+    if HOST_TRANSACTION_SUPPORTED:
+        fd = os.open(str(git_dir), _NOFOLLOW_DIR_FLAGS)
+        try:
+            child = _open_metadata_directory(fd, name)
+            os.close(child)
+        finally:
+            os.close(fd)
+        return
+    base = _fs_path(git_dir)
+    if base.is_symlink() or _is_reparse_api_path(base) or not base.is_dir():
+        raise OSError(errno.ENOTDIR, "repository metadata root must be a real directory")
+    target = base / name
+    if target.is_symlink() or _is_reparse_api_path(target):
+        _unlink_repository_link(target)
+    target.mkdir(exist_ok=True)
+
+
 def write_repository_file(git_dir: Union[str, Path], rel: str, data: bytes, mode: int = 0o644) -> None:
     """Writes data to rel below git_dir - a file of a repository's own metadata, such as
     info/exclude - as a regular file of its own, never through a link.
@@ -2150,18 +2184,18 @@ def write_repository_file(git_dir: Union[str, Path], rel: str, data: bytes, mode
         raise OSError(errno.EINVAL, _printable(f"invalid repository metadata path: {rel}"))
     if not HOST_TRANSACTION_SUPPORTED:
         # No directory handles (native Windows): the same rule by path.
-        base = Path(git_dir)
-        if base.is_symlink() or not base.is_dir():
+        base = _fs_path(git_dir)
+        if base.is_symlink() or _is_reparse_api_path(base) or not base.is_dir():
             raise OSError(errno.ENOTDIR, _printable(f"repository metadata directory is not a directory: {base}"))
         parent = base
         for part in parts[:-1]:
             parent = parent / part
-            if parent.is_symlink():
-                parent.unlink()
+            if parent.is_symlink() or _is_reparse_api_path(parent):
+                _unlink_repository_link(parent)
             parent.mkdir(exist_ok=True)
         target = parent / parts[-1]
-        if target.is_symlink() or (target.is_file() and target.stat().st_nlink > 1):
-            target.unlink()
+        if target.is_symlink() or _is_reparse_api_path(target) or (target.is_file() and target.stat().st_nlink > 1):
+            _unlink_repository_link(target)
         with open(target, "wb") as stream:
             stream.write(data)
         return
@@ -2193,7 +2227,7 @@ def _own_repository_file(git_dir: Union[str, Path], rel: str) -> None:
     copy of the content it led to, so that later writes (git config) stay in this
     repository instead of rewriting the shared file. Nothing happens to a regular file or
     a missing one."""
-    path = os.path.join(str(git_dir), *rel.split("/"))
+    path = _fs_path(Path(git_dir).joinpath(*rel.split("/")))
     try:
         info = os.lstat(path)
     except FileNotFoundError:

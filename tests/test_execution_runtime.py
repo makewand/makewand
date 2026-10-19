@@ -307,7 +307,7 @@ class ExecutionRuntimeTests(unittest.TestCase):
         self.assertFalse(self.budget.exists())
         self.assertEqual(os.environ["MAKEWAND_CALL_BUDGET_FILE"], str(self.budget))
 
-    def test_account_reference_binds_selected_root_without_reading_credentials(self):
+    def test_unknown_account_reference_is_explicit_directory_isolation(self):
         first = account_reference("codex")
         with patch.dict(os.environ, CODEX_HOME=str(self.root / "selected-account")):
             second = account_reference("codex")

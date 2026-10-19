@@ -13,9 +13,9 @@ import (
 	"github.com/makewand/makewand/internal/config"
 )
 
-// Exercise the actual native executable with fixtures only. A known CLI
-// rejection must retain its FAILED exit code after routing and headless output.
-func TestE2ENativeKnownProviderFailureExit10(t *testing.T) {
+// An arbitrary CLI exit cannot prove the remote outcome. Keep its charge
+// and stop automatic replay, even when its text resembles a quota refusal.
+func TestE2ENativeUnverifiedProviderFailureExit17(t *testing.T) {
 	if testing.Short() || runtime.GOOS == "windows" {
 		t.Skip("POSIX offline native CLI fixture")
 	}
@@ -41,11 +41,11 @@ func TestE2ENativeKnownProviderFailureExit10(t *testing.T) {
 			ledgerPath := filepath.Join(cfgDir, "ledger.json")
 			stdout, stderr, err := runMakewand(t, bin, cfgDir, "--print", "--timeout=5s", "--max-model-calls=10", "--call-budget-file="+ledgerPath, "explain this synthetic fixture")
 			var exitErr *exec.ExitError
-			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 10 {
-				t.Fatalf("native exit=%v, want 10; stdout=%s stderr=%s", err, stdout, stderr)
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 {
+				t.Fatalf("native exit=%v, want 17; stdout=%s stderr=%s", err, stdout, stderr)
 			}
 			if !strings.Contains(stderr, message) || strings.TrimSpace(stdout) != "" {
-				t.Fatalf("known refusal lost: stdout=%q stderr=%q", stdout, stderr)
+				t.Fatalf("CLI diagnostic lost: stdout=%q stderr=%q", stdout, stderr)
 			}
 			data, readErr := os.ReadFile(ledgerPath)
 			if readErr != nil {
@@ -57,12 +57,12 @@ func TestE2ENativeKnownProviderFailureExit10(t *testing.T) {
 					Known  bool   `json:"outcome_known"`
 				} `json:"attempts"`
 			}
-			if err := json.Unmarshal(data, &ledger); err != nil || len(ledger.Attempts) == 0 {
+			if err := json.Unmarshal(data, &ledger); err != nil || len(ledger.Attempts) != 1 {
 				t.Fatalf("missing accounted provider rejection: %s; %v", data, err)
 			}
 			for _, attempt := range ledger.Attempts {
-				if attempt.Status != "FAILED" || !attempt.Known {
-					t.Fatalf("known refusal accounting=%+v", attempt)
+				if attempt.Status != "UNKNOWN" || attempt.Known {
+					t.Fatalf("unknown outcome accounting=%+v", attempt)
 				}
 			}
 		})

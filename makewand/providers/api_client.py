@@ -4,6 +4,7 @@ Supports OpenAI-compatible APIs (OpenAI, xAI, DeepSeek, Ollama, vLLM, LocalAI),
 Anthropic Messages API, and Google Gemini API.
 """
 
+from makewand.proxy import urlopen as proxy_urlopen
 import os
 import sys
 import json
@@ -416,7 +417,7 @@ def _post_json(
 def _perform_request(req, per_read_timeout: float, stream: bool, print_prefix: str,
                      deadline: float, abort: "threading.Event", holder: List[Any],
                      partial: List[str]) -> Tuple[int, str, Optional[str]]:
-    with urllib.request.urlopen(req, timeout=per_read_timeout) as resp:
+    with proxy_urlopen(req, timeout=per_read_timeout) as resp:
         holder.append(resp)
         code = resp.status
         if stream:
@@ -517,12 +518,15 @@ def _make_http_request(
             parent = context.get("_request")
             request = ExecutionRequest(task_id=task_id(), stage=context.get("stage") or "api_retry",
                 engine=parent.engine if parent else "api", tier=parent.tier if parent else "standard",
+                account_ref=(parent.engine if parent else "api") + ":api:unknown",
                 model=parent.model if parent else None, readonly=parent.readonly if parent else False,
                 api_policy=parent.api_policy if parent else "allow_paid",
                 timeout_ms=max(1, int(remaining * 1000)))
             captured = []
 
             def invoke(effective):
+                from makewand.execution_evidence import api_transport
+                api_transport()
                 mark_provider_invocation()
                 raw = perform(min(remaining, effective) if effective is not None else remaining)
                 captured.append(raw)
@@ -538,6 +542,8 @@ def _make_http_request(
         # loss, deadline and incomplete response have unknown remote outcomes.
         if code not in (429, 500, 502, 503, 504) or getattr(error, "execution_status", None) != "FAILED" or attempt >= max_retries:
             return value
+        from makewand.execution_runtime import finish_provider_attempt
+        finish_provider_attempt()
         attempt += 1
         sleep_sec = backoff_factor * (2 ** (attempt - 1))
         if deadline - time.monotonic() <= sleep_sec:
@@ -865,6 +871,8 @@ def call_api_chat(*args, **kwargs):
         return ExecutionResult(False, "", "API timeout must be a finite positive number", status="INVALID_REQUEST")
 
     def invoke(remaining):
+        from makewand.execution_evidence import api_transport
+        api_transport()
         mark_provider_invocation()
         effective = dict(options)
         if remaining is not None:
@@ -875,8 +883,12 @@ def call_api_chat(*args, **kwargs):
         deadline = context.get("_deadline_monotonic")
         remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
         return invoke(remaining)
+    if parent is not None:
+        from makewand.execution_runtime import finish_provider_attempt
+        finish_provider_attempt()
     request = ExecutionRequest(task_id=task_id(), stage=context.get("stage") or "api",
         engine=options["provider"], tier=options["tier"], model=options["model"], readonly=bool(readonly),
+        account_ref=options["provider"] + ":api:unknown",
         repo_trust=req_trust,
         api_policy=parent.api_policy if parent else get_api_policy(), timeout_ms=max(1, int(timeout * 1000)),
         prompt=options["prompt"], cwd=options["cwd"])

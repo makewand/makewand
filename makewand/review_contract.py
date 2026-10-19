@@ -163,7 +163,7 @@ def _scan_verdict_entries_for_re(text: str, tag_re: re.Pattern) -> List[Dict[str
     return entries
 
 
-def _scan_verdict_lines(text: str, nonce: Optional[str] = None, allow_legacy: Optional[bool] = None) -> List[Dict[str, Any]]:
+def _scan_verdict_lines(text: str, nonce: Optional[str] = None, allow_legacy: bool = False) -> List[Dict[str, Any]]:
     """
     Collects every line-anchored MAKEWAND_VERDICT entry.
     Lines that carry extra prose after the JSON (typically an echo of the prompt template such as

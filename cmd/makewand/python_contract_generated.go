@@ -47,18 +47,20 @@ var pythonOrchestratorCmds = map[string]bool{
 }
 
 var nativeGoCommands = map[string]bool{
-	"audit":   true,
-	"chat":    true,
-	"doctor":  true,
-	"new":     true,
-	"preview": true,
-	"quota":   true,
-	"serve":   true,
-	"setup":   true,
-	"state":   true,
-	"token":   true,
-	"usage":   true,
-	"user":    true,
+	"audit":      true,
+	"chat":       true,
+	"completion": true,
+	"doctor":     true,
+	"help":       true,
+	"new":        true,
+	"preview":    true,
+	"quota":      true,
+	"serve":      true,
+	"setup":      true,
+	"state":      true,
+	"token":      true,
+	"usage":      true,
+	"user":       true,
 }
 
 var pythonGlobalValueFlags = map[string]bool{
@@ -92,4 +94,54 @@ var pythonGlobalBooleanFlags = map[string]bool{
 	"--allow-collision": true,
 	"--daemon":          true,
 	"--no-daemon":       true,
+}
+
+var providerWorkerStaticArgs = map[string]bool{
+	"--help":    true,
+	"--version": true,
+	"-h":        true,
+	"-v":        true,
+}
+
+var providerWorkerQueries = map[string]providerWorkerQuery{
+	"completion bash": {Engine: "go", MaxArgs: 0, Flags: map[string]bool{
+		"--help": false,
+		"-h":     false,
+	}},
+	"completion fish": {Engine: "go", MaxArgs: 0, Flags: map[string]bool{
+		"--help":            false,
+		"--no-descriptions": false,
+		"-h":                false,
+	}},
+	"completion powershell": {Engine: "go", MaxArgs: 0, Flags: map[string]bool{
+		"--help":            false,
+		"--no-descriptions": false,
+		"-h":                false,
+	}},
+	"completion zsh": {Engine: "go", MaxArgs: 0, Flags: map[string]bool{
+		"--help":            false,
+		"--no-descriptions": false,
+		"-h":                false,
+	}},
+	"help": {Engine: "go", MaxArgs: 0, Flags: map[string]bool{
+		"--help": false,
+		"-h":     false,
+	}},
+	"repomap": {Engine: "python", MaxArgs: 0, Flags: map[string]bool{
+		"--cwd":       true,
+		"--help":      false,
+		"--json":      false,
+		"--max-files": true,
+		"--max-lines": true,
+		"-C":          true,
+		"-h":          false,
+	}},
+	"search": {Engine: "python", MaxArgs: 1, Flags: map[string]bool{
+		"--cwd":         true,
+		"--help":        false,
+		"--max-depth":   true,
+		"--max-results": true,
+		"-C":            true,
+		"-h":            false,
+	}},
 }

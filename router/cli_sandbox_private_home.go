@@ -22,6 +22,8 @@ import (
 	"time"
 	"unicode/utf8"
 	"weak"
+
+	"github.com/makewand/makewand/execution"
 )
 
 // cliPrivateCredFile is a provider credential file copied into the per-run
@@ -232,6 +234,12 @@ type cliPrivateHome struct {
 	// agySettingsMounted records that sanitized agy settings were written
 	// and bound; an agy launch without them is refused.
 	agySettingsMounted bool
+	attempt            *execution.Attempt
+	binding            *credentialBinding
+	// Capture the selected private paths during preparation. Evidence must
+	// not follow a host login switch or guess another private metadata path.
+	evidenceRoot string
+	identityPath string
 }
 
 func newCLIPrivateHome(workspace string) (*cliPrivateHome, error) {
@@ -276,11 +284,21 @@ func (h *cliPrivateHome) cleanup() {
 // (hostPath = home/entry) inside the private sandbox HOME.
 func (h *cliPrivateHome) addProviderEntry(args []string, provider, home, entry, hostPath string, fi os.FileInfo, workspace string) ([]string, error) {
 	files, private := cliPrivateCredentialFiles[entry]
+	// A root/metadata entry can change shape after the admission recheck.
+	// Do not fall through to a raw host bind and skip the copy-time checks.
+	if private && !fi.IsDir() {
+		return args, errors.New("provider credential root is not a directory")
+	}
 	switch {
 	case fi.IsDir() && private:
 		privRoot := filepath.Join(h.home, filepath.FromSlash(entry))
 		if err := os.MkdirAll(privRoot, 0o700); err != nil {
 			return args, err
+		}
+		if entry == ".codex" && provider == "codex" {
+			h.evidenceRoot, h.identityPath = privRoot, filepath.Join(privRoot, "auth.json")
+		} else if entry == ".claude" && provider == "claude" {
+			h.evidenceRoot, h.identityPath = privRoot, filepath.Join(h.home, ".claude.json")
 		}
 		for _, f := range files {
 			if err := h.copyIn(hostPath, privRoot, f); err != nil {
@@ -295,11 +313,19 @@ func (h *cliPrivateHome) addProviderEntry(args []string, provider, home, entry, 
 		// it with the sanitized copy.
 		args = cliShieldProviderState(args, provider, hostPath, workspace, false, true)
 		return h.overlayAgySanitizedSettings(args, provider, entry, privRoot, hostPath)
-	case !fi.IsDir() && cliPrivateFileEntries[entry]:
-		if !h.homeBound {
-			return cliAppendRoBindIfNotPresent(args, hostPath), nil
+	case cliPrivateFileEntries[entry]:
+		if err := h.copyIn(home, h.home, cliPrivateCredFile{rel: entry}); err != nil {
+			return args, err
 		}
-		return args, h.copyIn(home, h.home, cliPrivateCredFile{rel: entry})
+		// Unavailable identity metadata is omitted, as in Python. Never
+		// bind a missing private copy or expose the raw host entry.
+		if _, err := os.Stat(filepath.Join(h.home, entry)); err != nil {
+			return args, nil
+		}
+		if !h.homeBound {
+			return append(args, "--ro-bind", filepath.Join(h.home, entry), hostPath), nil
+		}
+		return args, nil
 	default:
 		return cliAppendRoBindIfNotPresent(args, hostPath), nil
 	}
@@ -308,12 +334,32 @@ func (h *cliPrivateHome) addProviderEntry(args []string, provider, home, entry, 
 // addCodexHome prepares a private copy of an explicitly selected CODEX_HOME
 // and returns the host directory to bind at realCodexHome.
 func (h *cliPrivateHome) addCodexHome(realCodexHome string) (string, error) {
-	privCodex := filepath.Join(h.dir, "codex-home")
+	return h.addAccountHome("codex", realCodexHome)
+}
+
+func (h *cliPrivateHome) addAccountHome(provider, realCodexHome string) (string, error) {
+	privCodex := filepath.Join(h.dir, provider+"-home")
 	if err := os.Mkdir(privCodex, 0o700); err != nil {
 		return "", err
 	}
-	for _, f := range cliPrivateCodexFiles {
+	h.evidenceRoot = privCodex
+	h.identityPath = filepath.Join(privCodex, "auth.json")
+	files := cliPrivateCodexFiles
+	if provider == "claude" {
+		files = cliPrivateClaudeFiles
+		h.identityPath = filepath.Join(privCodex, ".claude.json")
+	}
+	for _, f := range files {
 		if err := h.copyIn(realCodexHome, privCodex, f); err != nil {
+			return "", err
+		}
+	}
+	if provider == "claude" {
+		hostRoot := realCodexHome
+		if userHome, _ := os.UserHomeDir(); canonicalQuotaRoot(realCodexHome) == canonicalQuotaRoot(filepath.Join(userHome, ".claude")) {
+			hostRoot = userHome
+		}
+		if err := h.copyIn(hostRoot, privCodex, cliPrivateCredFile{rel: ".claude.json"}); err != nil {
 			return "", err
 		}
 	}
@@ -339,6 +385,11 @@ func (h *cliPrivateHome) addAbsentProviderEntry(args []string, provider, entry, 
 		return args, nil
 	}
 	privRoot := filepath.Join(h.home, filepath.FromSlash(entry))
+	if entry == ".codex" && provider == "codex" {
+		h.evidenceRoot, h.identityPath = privRoot, filepath.Join(privRoot, "auth.json")
+	} else if entry == ".claude" && provider == "claude" {
+		h.evidenceRoot, h.identityPath = privRoot, filepath.Join(h.home, ".claude.json")
+	}
 	if !h.homeBound {
 		if !cliMountPointCreatable(args, hostPath) {
 			if sanitize {
@@ -419,16 +470,23 @@ func (h *cliPrivateHome) copyIn(hostRoot, privRoot string, f cliPrivateCredFile)
 	mode := os.FileMode(0o600)
 	existed := false
 	if fi, err := os.Stat(hostFile); err == nil { //nolint:gosec // G703: provider credential path under the user's home
-		if !fi.Mode().IsRegular() || fi.Size() > cliPrivateCredMaxBytes {
-			return nil // Not a credential file we manage; leave it out.
+		if fi.Size() > cliPrivateCredMaxBytes {
+			switch filepath.Base(hostFile) {
+			case ".claude.json", ".credentials.json", "auth.json":
+				return h.binding.verify(hostFile, nil, false)
+			}
+			return fmt.Errorf("provider credential file exceeds %d bytes", cliPrivateCredMaxBytes)
+		}
+		if !fi.Mode().IsRegular() {
+			return h.binding.verify(hostFile, nil, false)
 		}
 		real, err := filepath.EvalSymlinks(hostFile)
 		if err != nil {
-			return nil
+			return h.binding.verify(hostFile, nil, false)
 		}
 		data, err = cliReadRegularFile(real)
 		if err != nil {
-			return nil
+			return h.binding.verify(hostFile, nil, false)
 		}
 		canonical = real
 		existed = true
@@ -437,7 +495,7 @@ func (h *cliPrivateHome) copyIn(hostRoot, privRoot string, f cliPrivateCredFile)
 			mode = 0o600
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil
+		return h.binding.verify(hostFile, nil, false)
 	} else if f.writeBack {
 		// A missing token file may be created by a login inside the sandbox,
 		// also in a directory the host lacks; writeBack reports it but never
@@ -448,6 +506,9 @@ func (h *cliPrivateHome) copyIn(hostRoot, privRoot string, f cliPrivateCredFile)
 		}
 	}
 
+	if err := h.binding.verify(hostFile, data, existed); err != nil {
+		return err
+	}
 	if existed {
 		if err := os.MkdirAll(filepath.Dir(privFile), 0o700); err != nil {
 			return err
@@ -799,6 +860,7 @@ func (h *cliPrivateHome) watch(wrapped *exec.Cmd, statusRead, statusWrite *os.Fi
 		_, _ = io.Copy(io.Discard, statusRead)
 		_ = statusRead.Close()
 		if started {
+			h.collectEvidence()
 			warnings := h.writeBack()
 			if f := cliPrivateHomeWarnings.Load(); f != nil {
 				(*f)(h.dir, warnings)

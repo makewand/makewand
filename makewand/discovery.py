@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -393,11 +394,79 @@ def resolve_agy_model(
     return model, normalize_provider_effort("agy", eff, model=model)
 
 
+def _catalog_origin(path):
+    try:
+        cached_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+    except OSError:
+        cached_at = None
+    return {"source": str(path), "cached_at": cached_at}
+
+
+def _verified_model_ids(provider):
+    from makewand.execution_evidence import read_recent
+    return {row["actual_model"] for row in read_recent()
+            if row.get("engine") == provider and row.get("result_status") == "PASSED"
+            and row.get("outcome_known") is True and type(row.get("process_exit_code")) is int
+            and row["process_exit_code"] == 0
+            and row.get("source") in ("cli_json", "private_home+cli_json", "private_home")
+            and _valid_model_id(row.get("actual_model"))}
+
+
+def model_family(model):
+    """Underlying model lineage, independent of the CLI carrying it."""
+    value = (model or "").lower().split(" (", 1)[0]
+    for family, prefixes in (
+        ("claude", ("claude", "anthropic/", "opus", "sonnet", "haiku", "fable", "mythos")),
+        ("gpt", ("gpt", "openai/", "o1", "o3", "o4", "codex")),
+        ("gemini", ("gemini", "google/", "google-")),
+        ("grok", ("grok", "xai/")), ("muse", ("muse",)),
+        ("qwen", ("qwen",)), ("llama", ("llama",)), ("gemma", ("gemma",)),
+        ("deepseek", ("deepseek",)), ("glm", ("glm",)), ("kimi", ("kimi",)),
+    ):
+        if value.startswith(prefixes):
+            return family
+    return None
+
+
+def model_candidate(tool, tier="standard", model=None):
+    from makewand.account_identity import account_identity
+    resolution = get_provider_model_tier(tool, tier)
+    mid = model or resolution.get("full_id") or resolution["model"]
+    identity = account_identity(tool) if tool in ("claude", "codex") else None
+    return dict(tool=tool, model=mid, model_family=model_family(mid), actual_model=None,
+                account_ref=identity["account_ref"] if identity and identity["identity_known"] else None,
+                identity_known=bool(identity and identity["identity_known"]),
+                pool_ref=identity["pool_ref"] if identity else None,
+                source="explicit" if model else resolution["source"],
+                selection_reason="用户显式指定模型，覆盖档位排名" if model else resolution.get("selection_reason", f"tier={tier}: {mid}"))
+
+
+def _candidate_families(tool, tier, explicit_model=None):
+    if explicit_model:
+        return {model_family(explicit_model)}
+    # Auto pacing may change the tier before dispatch. Require independence
+    # from every possible tier rather than guessing one from the tool name.
+    tiers = ("fast", "standard", "deep") if not tier or tier == "auto" else (tier,)
+    resolutions = [get_provider_model_tier(tool, option) for option in tiers]
+    return {model_family(row.get("full_id") or row["model"]) for row in resolutions}
+
+
+def independent_models(reviewer, author, *, reviewer_tier="deep", author_tier="standard", author_model=None):
+    """Unknown lineage cannot establish cross-model independence."""
+    if reviewer == author:
+        return False
+    left = _candidate_families(reviewer, reviewer_tier)
+    right = _candidate_families(author, author_tier, author_model)
+    return None not in left and None not in right and left.isdisjoint(right)
+
+
 class DiscoveredAgyModels(tuple):
     """Container for discovered Antigravity / Gemini model catalog."""
 
-    def __new__(cls, models: List[Tuple[str, str]], configured_default: Optional[str], configured_effort: Optional[str]):
-        return super().__new__(cls, (models, configured_default, configured_effort))
+    def __new__(cls, models: List[Tuple[str, str]], configured_default: Optional[str], configured_effort: Optional[str], metadata=None):
+        result = super().__new__(cls, (models, configured_default, configured_effort))
+        result.metadata = metadata or {}
+        return result
 
     @property
     def models(self) -> List[Tuple[str, str]]:
@@ -439,6 +508,7 @@ def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
     """
     discovered_agy: List[Tuple[str, str]] = []
     seen = set()
+    metadata = {}
     configured_default = None
     configured_effort = None
 
@@ -475,11 +545,13 @@ def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
                                 if norm_slug and (norm_slug, desc) not in seen:
                                     seen.add((norm_slug, desc))
                                     discovered_agy.append((norm_slug, desc))
+                                    metadata[norm_slug] = _catalog_origin(cache_file)
                             elif isinstance(m, str):
                                 norm_slug = _agy_full_model_id(m)
                                 if norm_slug and (norm_slug, "") not in seen:
                                     seen.add((norm_slug, ""))
                                     discovered_agy.append((norm_slug, ""))
+                                    metadata[norm_slug] = _catalog_origin(cache_file)
                     elif isinstance(items, dict):
                         for k, v in items.items():
                             norm_slug = _agy_full_model_id(k)
@@ -488,6 +560,7 @@ def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
                                 if (norm_slug, desc) not in seen:
                                     seen.add((norm_slug, desc))
                                     discovered_agy.append((norm_slug, desc))
+                                    metadata[norm_slug] = _catalog_origin(cache_file)
                 except Exception:
                     pass
 
@@ -524,6 +597,7 @@ def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
                                     if norm_val and (norm_val, desc) not in seen:
                                         seen.add((norm_val, desc))
                                         discovered_agy.append((norm_val, desc))
+                                        metadata[norm_val] = _catalog_origin(s_path)
                 except Exception:
                     pass
 
@@ -547,18 +621,26 @@ def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
                     if norm_slug and (norm_slug, desc) not in seen:
                         seen.add((norm_slug, desc))
                         discovered_agy.append((norm_slug, desc))
+                        metadata[norm_slug] = _catalog_origin(agy_cache_file)
                 elif isinstance(m, str):
                     norm_slug = _agy_full_model_id(m)
                     if norm_slug and (norm_slug, "") not in seen:
                         seen.add((norm_slug, ""))
                         discovered_agy.append((norm_slug, ""))
+                        metadata[norm_slug] = _catalog_origin(agy_cache_file)
         except Exception:
             pass
 
-    # All discovered models are returned (including the claude-*/gpt-* models
-    # agy proxies); tier selection filters to native Gemini models itself
-    # (see get_provider_model_tier) so foreign models never hijack it.
-    return DiscoveredAgyModels(discovered_agy, configured_default, configured_effort)
+    # A catalog entry is not proof that a display name is an invocable ID.
+    # Keep the entire catalog; only execution observations verify an ID.
+    verified = _verified_model_ids("agy")
+    for slug, _ in discovered_agy:
+        metadata.setdefault(slug, {}).update(
+            call_id_verified=slug in verified,
+            verification_source="execution_evidence" if slug in verified else "unknown",
+            # Successful execution verifies an ID, not whether it costs credits.
+            auto_select=_is_native_agy_model(slug))
+    return DiscoveredAgyModels(discovered_agy, configured_default, configured_effort, metadata)
 
 
 def _is_native_agy_model(slug: str) -> bool:
@@ -607,7 +689,10 @@ def _claim_agy_refresh(marker: Path, state: str, retry: float) -> bool:
             fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             try:
-                age = time.time() - marker.stat().st_mtime
+                modified = marker.stat().st_mtime
+                # Observe the clock after stat: a concurrently published marker
+                # must not look future-dated merely because it followed our clock read.
+                age = time.time() - modified
             except OSError:
                 continue  # removed meanwhile: create it again
             try:
@@ -923,6 +1008,8 @@ def _tier_resolution(model, effort, *, is_dynamic, full_id=None, effort_source="
               "source": "detected" if is_dynamic else "builtin", "effort_source": effort_source}
     if full_id is not None:
         result["full_id"] = full_id.strip()
+    if not is_dynamic:
+        result["selection_reason"] = f"未检测到可选择目录，使用内置兜底 {model.strip()}；目录模型未参与排名"
     return result
 
 
@@ -1404,15 +1491,16 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
                 reverse=True
             )
             models["agy"]["source"] = "detected"
-        if agy_res.configured_default:
+        selectable = [item for item in agy_res.models if agy_res.metadata.get(item[0], {}).get("auto_select", _is_native_agy_model(item[0]))]
+        if agy_res.configured_default and (_is_native_agy_model(agy_res.configured_default) or agy_res.metadata.get(agy_res.configured_default, {}).get("auto_select")):
             models["agy"]["current_default"] = agy_res.configured_default
             models["agy"]["default_source"] = "detected"
-        elif found_agy:
+        elif selectable:
             _native_bases = []
             _seen_bases = set()
-            for _slug, _desc in agy_res.models:
+            for _slug, _desc in selectable:
                 _base, _suf = _split_agy_suffix(_slug)
-                if not _is_native_agy_model(_base) or _base in _seen_bases:
+                if _base in _seen_bases:
                     continue
                 _seen_bases.add(_base)
                 _native_bases.append((_base, _desc))
@@ -1437,6 +1525,25 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
     except Exception:
         pass
 
+    from makewand.account_identity import account_identity
+    for tool, entry in models.items():
+        identity = account_identity(tool) if tool in ("claude", "codex") else None
+        verified = _verified_model_ids(tool)
+        entry["candidates"] = []
+        for label in entry["available"]:
+            mid = label.split()[0]
+            origin = agy_res.metadata.get(mid, {}) if tool == "agy" and "agy_res" in locals() else {}
+            entry["candidates"].append(dict(
+                tool=tool, account_ref=identity["account_ref"] if identity and identity["identity_known"] else None,
+                identity_known=bool(identity and identity["identity_known"]),
+                pool_ref=identity["pool_ref"] if identity else None,
+                model=mid, model_family=model_family(mid), actual_model=None,
+                source=origin.get("source", entry["source"]), cached_at=origin.get("cached_at"),
+                call_id_verified=mid in verified,
+                verification_source="execution_evidence" if mid in verified else "unknown",
+                auto_select=origin.get("auto_select", tool != "agy" or _is_native_agy_model(mid))))
+    models["claude"]["tier_selections"] = {
+        tier: get_provider_model_tier("claude", tier) for tier in ("fast", "standard", "deep")}
     return models
 
 def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, Any]:
@@ -1491,8 +1598,13 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                             # preference never implies a model capability.
                             if efforts and effort not in efforts:
                                 effort = efforts[0] if tier == "fast" else efforts[-1]
-                            return _tier_resolution(alias, effort, is_dynamic=True, full_id=top_id,
-                                                    effort_source="detected" if efforts else "builtin")
+                            result = _tier_resolution(alias, effort, is_dynamic=True, full_id=top_id,
+                                                      effort_source="detected" if efforts else "builtin")
+                            result["selection_reason"] = f"tier={tier}: 按版本、家族和能力关键词评分，选择 {top_id} (score={ranked[0][0]})"
+                            result["ranking"] = [dict(model=mid, score=score, selected=mid == top_id,
+                                                      reason="本档位排名第一" if mid == top_id else f"本档位排名低于 {top_id}")
+                                                 for score, mid, _ in ranked]
+                            return result
         except Exception:
             pass
 
@@ -1609,8 +1721,12 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
     elif provider == "agy":
         agy_res = _discover_local_agy_models()
-        discovered_agy = agy_res.models
+        discovered_agy = [item for item in agy_res.models
+                          if agy_res.metadata.get(item[0], {}).get("auto_select", _is_native_agy_model(item[0]))]
         configured_default = agy_res.configured_default
+        if configured_default and not (_is_native_agy_model(configured_default) or
+                                      agy_res.metadata.get(configured_default, {}).get("auto_select")):
+            configured_default = None
         configured_effort = agy_res.configured_effort
 
         effort = configured_effort if (tier == "standard" and configured_effort) else ("max" if tier == "deep" else ("low" if tier == "fast" else "high"))

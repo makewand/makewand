@@ -92,6 +92,19 @@ def run_windows(cmd, **kwargs):
 
 
 class TestWindowsRunnerCapturesStderrApart(unittest.TestCase):
+    def test_windows_branch_preserves_worker_and_proxy_environment(self):
+        import json
+        extra = {"MAKEWAND_PROVIDER_WORKER": "1", "HTTP_PROXY": "http://fixture:8181",
+                 "HTTPS_PROXY": "http://fixture:8181", "ALL_PROXY": "http://fixture:8181"}
+        command = [sys.executable, "-I", "-c",
+                   "import os,json; print(json.dumps({k:os.getenv(k) for k in " + repr(list(extra)) + "}))"]
+        original = dict(os.environ)
+        with patch.object(base, "os", _WindowsOs()), patch.object(windows_process, "WindowsJob", FakeJob):
+            code, out, err, error = base.run_subprocess(command, timeout=30, extra_env=extra)
+        self.assertEqual((code, error), (0, None), err)
+        self.assertEqual(json.loads(out), extra)
+        self.assertEqual(dict(os.environ), original)
+
     def test_stream_mode_keeps_stderr_apart_when_asked(self):
         (code, out, err, error), shown = run_windows(cli_script("The fix is in bank.py.\n", "Warning: x\n"),
                                                      stream=True, separate_stderr=True, print_prefix="[AGY Live]")

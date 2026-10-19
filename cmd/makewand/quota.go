@@ -70,13 +70,20 @@ func quotaCmd() *cobra.Command {
 
 func printQuotaJSON(cmd *cobra.Command, snap *router.QuotaSnapshot) error {
 	type dim struct {
-		FiveHourPct *float64 `json:"five_hour_pct,omitempty"`
-		WeeklyPct   *float64 `json:"weekly_pct,omitempty"`
-		ScopedPct   *float64 `json:"scoped_pct,omitempty"`
-		Authed      bool     `json:"authed"`
-		HasData     bool     `json:"has_data"`
-		Band        string   `json:"band"`
-		ResetAt     string   `json:"reset_at,omitempty"`
+		FiveHourPct    *float64             `json:"five_hour_pct,omitempty"`
+		WeeklyPct      *float64             `json:"weekly_pct,omitempty"`
+		ThirtyDayPct   *float64             `json:"thirty_day_pct,omitempty"`
+		CredentialRoot string               `json:"credential_root,omitempty"`
+		AccountRef     string               `json:"account_ref,omitempty"`
+		IdentityKnown  bool                 `json:"identity_known"`
+		PoolRef        string               `json:"pool_ref,omitempty"`
+		SourceAt       time.Time            `json:"source_at"`
+		Windows        []router.QuotaWindow `json:"windows,omitempty"`
+		ScopedPct      *float64             `json:"scoped_pct,omitempty"`
+		Authed         bool                 `json:"authed"`
+		HasData        bool                 `json:"has_data"`
+		Band           string               `json:"band"`
+		ResetAt        string               `json:"reset_at,omitempty"`
 	}
 	pol := router.DefaultQuotaPolicy()
 	out := map[string]dim{}
@@ -86,13 +93,17 @@ func printQuotaJSON(cmd *cobra.Command, snap *router.QuotaSnapshot) error {
 			reset = q.ResetAt.Format(time.RFC3339)
 		}
 		out[q.Provider] = dim{
-			FiveHourPct: q.FiveHourPct,
-			WeeklyPct:   q.WeeklyPct,
-			ScopedPct:   q.ScopedPct,
-			Authed:      q.Authed,
-			HasData:     q.HasData,
-			Band:        bandLabel(pol.Band(q)),
-			ResetAt:     reset,
+			FiveHourPct:    q.FiveHourPct,
+			WeeklyPct:      q.WeeklyPct,
+			ThirtyDayPct:   q.ThirtyDayPct,
+			CredentialRoot: q.CredentialRoot, AccountRef: q.AccountRef,
+			IdentityKnown: q.IdentityKnown, PoolRef: q.PoolRef,
+			SourceAt: q.SourceAt, Windows: q.Windows,
+			ScopedPct: q.ScopedPct,
+			Authed:    q.Authed,
+			HasData:   q.HasData,
+			Band:      bandLabel(pol.Band(q)),
+			ResetAt:   reset,
 		}
 	}
 	enc := json.NewEncoder(cmd.OutOrStdout())
@@ -109,11 +120,18 @@ func printQuotaHuman(cmd *cobra.Command, snap *router.QuotaSnapshot, pol router.
 	}
 	for _, q := range all {
 		fmt.Fprintf(w, "── %s\n", q.Provider)
+		if q.AccountRef != "" {
+			if q.IdentityKnown {
+				fmt.Fprintf(w, "   account     %s\n", q.AccountRef)
+			} else {
+				fmt.Fprintln(w, "   account     unknown (credential directory isolated; shared pool unknown)")
+			}
+		}
 		if !q.HasData {
 			fmt.Fprintf(w, "   no quota data (source unavailable)\n")
 			continue
 		}
-		if q.FiveHourPct == nil && q.WeeklyPct == nil {
+		if q.FiveHourPct == nil && q.WeeklyPct == nil && q.ThirtyDayPct == nil && len(q.Windows) == 0 {
 			// agy: login-state only.
 			state := "signed in"
 			if !q.Authed {
@@ -126,7 +144,10 @@ func printQuotaHuman(cmd *cobra.Command, snap *router.QuotaSnapshot, pol router.
 			fmt.Fprintf(w, "   5h window   %s\n", pctStr(*q.FiveHourPct))
 		}
 		if q.WeeklyPct != nil {
-			fmt.Fprintf(w, "   weekly      %s%s\n", pctStr(*q.WeeklyPct), resetSuffix(q.ResetAt))
+			fmt.Fprintf(w, "   weekly      %s%s\n", pctStr(*q.WeeklyPct), resetSuffix(q.WeeklyResetAt))
+		}
+		if q.ThirtyDayPct != nil {
+			fmt.Fprintf(w, "   30 days     %s%s\n", pctStr(*q.ThirtyDayPct), resetSuffix(q.ThirtyDayResetAt))
 		}
 		if q.ScopedPct != nil {
 			fmt.Fprintf(w, "   top model   %s (per-model weekly cap, informational)\n", pctStr(*q.ScopedPct))

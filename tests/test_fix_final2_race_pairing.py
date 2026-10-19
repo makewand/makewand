@@ -105,7 +105,8 @@ class RacePairingTests(unittest.TestCase):
         self.assertIn("• claude: 健康状态为 needs_auth：login expired", log)
         self.assertIn("• muse: 已被用户禁用", log)  # disabled engines are listed as well
         self.assertIn("• local: 已被用户禁用", log)
-        self.assertIn("• deepseek: 竞速不会自动选用该引擎", log)
+        self.assertIn("• deepseek: 该引擎只支持聊天", log)
+        self.assertNotIn("--provider deepseek", log)
         self.assertNotIn("没有另一位可与它组成竞速的不同引擎", log)
         self.assertNotIn("• codex:", log)
 

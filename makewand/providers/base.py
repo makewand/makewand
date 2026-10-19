@@ -19,6 +19,39 @@ from typing import Callable, Optional, Tuple, Dict, List, Union
 
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024  # 10 MB output guardrail
 MAX_STREAM_QUEUE_BYTES = 256 * 1024
+
+
+class ProviderAPIRelay:
+    """One policy and route-reporting boundary for subscription API fallbacks."""
+
+    def __init__(self, provider, *, color, **request):
+        self.provider = provider
+        self.color = color
+        self.request = request
+
+    @property
+    def available(self):
+        from makewand.config import api_relay_available
+        return api_relay_available(self.provider)
+
+    def unavailable(self, reason, hint):
+        from makewand.config import api_relay_blocked_note
+        return f"{reason} ({api_relay_blocked_note(self.provider) or hint})"
+
+    def __call__(self, notice, *, cwd):
+        from makewand.config import c
+        from makewand.providers.api_client import call_api_chat
+        from makewand.usage import note_dispatch_route
+        from makewand.workflow import provider_outcome
+        if not self.available:
+            return False, None, self.unavailable("API 接力不可用", "未配置 API Key")
+        print(c(notice, self.color), file=sys.stderr)
+        note_dispatch_route("api")
+        # cwd may have been normalized during a CLI attempt before its quota
+        # refusal. Use the caller's current value, as the former closures did.
+        return provider_outcome(call_api_chat(provider=self.provider, cwd=cwd, **self.request))
+
+
 _STREAM_WRITER = (
     "import os\n"
     "while True:\n"
@@ -283,6 +316,7 @@ def run_subprocess(
     preexec_fn: Optional[Callable[[], None]] = None,
     extra_env: Optional[dict] = None,
     separate_stderr: bool = False,
+    evidence_protocol: bool = False,
 ) -> Tuple[int, str, str, Optional[str]]:
     """
     Executes a command with one deadline and a shared raw stdout/stderr byte limit.
@@ -300,11 +334,23 @@ def run_subprocess(
     stderr is a CapturedStderr (see stderr_captured_apart).
     Returns: (returncode, stdout, stderr, exception_or_timeout_msg)
     """
+    def observe(code, out):
+        from makewand.execution_runtime import current_context
+        evidence = current_context().get("_evidence")
+        if evidence is not None:
+            evidence["process_exit_code"] = code
+            if evidence_protocol:
+                from makewand.execution_evidence import protocol
+                protocol(evidence, out)
+                evidence["source"] = "private_home+cli_json" if "private_home" in evidence["source"] else "cli_json"
+
     if os.name == "nt":
         from makewand.windows_process import run_windows_subprocess
-        return run_windows_subprocess(cmd, timeout, cwd, input_text, stream, print_prefix, pass_fds,
+        result = run_windows_subprocess(cmd, timeout, cwd, input_text, stream, print_prefix, pass_fds,
                                       output_limit=MAX_OUTPUT_BYTES, stream_queue_limit=MAX_STREAM_QUEUE_BYTES,
-                                      separate_stderr=separate_stderr)
+                                      separate_stderr=separate_stderr, extra_env=extra_env)
+        observe(result[0], result[1])
+        return result
     scope = get_current_contestant_scope()
     merge_stderr = stream and not separate_stderr
     if scope and scope.cancel_event.is_set():
@@ -398,6 +444,7 @@ def run_subprocess(
         if not stream:  # Preserve the former text-mode universal-newline behavior.
             out = out.replace("\r\n", "\n").replace("\r", "\n")
             err = err.replace("\r\n", "\n").replace("\r", "\n")
+        observe(code, out)
         return code, out, CapturedStderr(err, not merge_stderr), error
 
     try:
@@ -416,6 +463,8 @@ def run_subprocess(
             safe_exe = safe_which(cmd[0], cwd=cwd)
             if safe_exe:
                 cmd = [safe_exe, *cmd[1:]]
+        from makewand.execution_runtime import provider_process_lease
+        provider_process_lease("launch")
         proc = subprocess.Popen(
             cmd,
             shell=isinstance(cmd, str),
@@ -428,6 +477,7 @@ def run_subprocess(
             start_new_session=True,
             **popen_kwargs
         )
+        provider_process_lease("worker", proc.pid)
         if scope:
             scope.register_proc(proc)
         selector = selectors.DefaultSelector()
@@ -525,6 +575,11 @@ def run_subprocess(
         if scope and proc is not None:
             scope.unregister_proc(proc)
         cleanup_group()
+        from makewand.execution_runtime import provider_process_lease
+        if proc is None:
+            provider_process_lease("launch_failed")
+        elif proc.poll() is not None:
+            provider_process_lease("stopped")
         cleanup_display()
         if selector is not None:
             selector.close()

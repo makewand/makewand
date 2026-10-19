@@ -31,10 +31,11 @@ type attemptLabels struct {
 
 // attemptIdentity identifies a single provider candidate in the pipeline.
 type attemptIdentity struct {
-	name       string
-	modelID    string
-	provider   Provider
-	isFallback bool
+	name                string
+	modelID             string
+	provider            Provider
+	isFallback          bool
+	hasCapacityFallback func() bool
 	// ticket is the circuit-breaker admission for this attempt, set once the
 	// attempt is admitted; its success is recorded against it.
 	ticket breakerTicket
@@ -126,6 +127,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
 	attemptCtx = ContextWithUsageMode(attemptCtx, ac.mode)
+	attemptCtx = execution.ContextWithCapacityFallback(attemptCtx, id.hasCapacityFallback)
 	// Inject this Router's price snapshot so a provider shared by several Routers
 	// prices from the calling Router's overrides, not whichever Router registered last.
 	attemptCtx = contextWithCostTable(attemptCtx, r.routingTables())
@@ -169,7 +171,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 
 	detail := ""
 	providerFailure := true
-	if errors.Is(chatErr, execution.ErrBudgetExhausted) || errors.Is(chatErr, errExecutionAccounting) {
+	if errors.Is(chatErr, execution.ErrBudgetExhausted) || errors.Is(chatErr, execution.ErrConcurrencyBusy) || errors.Is(chatErr, errExecutionAccounting) || errors.Is(chatErr, errExecutionAdmission) {
 		providerFailure = false
 		detail = "execution admission/accounting refused"
 	}
@@ -241,6 +243,24 @@ type fallbackCandidate struct {
 	modelID string
 }
 
+// hasCapacityFallback checks routing eligibility without reserving a call or
+// consuming a breaker ticket. Busy accounts must not delay another provider.
+func (r *Router) hasCapacityFallback(candidates []fallbackCandidate, resolve candidateResolver, current string) bool {
+	for _, candidate := range candidates {
+		if candidate.name == current {
+			continue
+		}
+		if blocked, _ := r.isCircuitOpen(candidate.name); blocked {
+			continue
+		}
+		provider, _, err := resolve(candidate.name, candidate.modelID)
+		if err == nil && provider != nil && r.untrustedRepoSafe(provider) && provider.IsAvailable() {
+			return true
+		}
+	}
+	return false
+}
+
 // iterateFallbackCandidates iterates over fallback candidates, resolves each using
 // the given resolver, checks circuit breaker and availability, and calls tryProvider.
 // Returns the first successful result or the accumulated first error.
@@ -249,7 +269,7 @@ func (r *Router) iterateFallbackCandidates(ac *attemptContext, candidates []fall
 	var spent Usage
 	var lastRoute RouteResult
 
-	for _, c := range candidates {
+	for candidateIndex, c := range candidates {
 		if callerErr := ac.ctx.Err(); callerErr != nil {
 			return "", spent, lastRoute, callerErr
 		}
@@ -310,10 +330,11 @@ func (r *Router) iterateFallbackCandidates(ac *attemptContext, candidates []fall
 		}
 
 		res := r.tryProvider(ac, attemptIdentity{
-			name:       c.name,
-			modelID:    modelID,
-			provider:   p,
-			isFallback: true,
+			name:                c.name,
+			modelID:             modelID,
+			provider:            p,
+			isFallback:          true,
+			hasCapacityFallback: func() bool { return r.hasCapacityFallback(candidates[candidateIndex+1:], resolve, c.name) },
 		})
 		if res.skipped {
 			if firstErr == nil {
@@ -356,10 +377,11 @@ func (r *Router) routeAndExecute(ac *attemptContext, result RouteResult, fallbac
 	}
 	// Try primary
 	primaryRes := r.tryProvider(ac, attemptIdentity{
-		name:       result.Actual,
-		modelID:    result.ModelID,
-		provider:   result.Provider,
-		isFallback: result.IsFallback,
+		name:                result.Actual,
+		modelID:             result.ModelID,
+		provider:            result.Provider,
+		isFallback:          result.IsFallback,
+		hasCapacityFallback: func() bool { return r.hasCapacityFallback(fallbacks, resolve, result.Actual) },
 	})
 	if !primaryRes.skipped && primaryRes.err == nil {
 		return primaryRes.content, primaryRes.usage, primaryRes.route, nil
@@ -434,7 +456,7 @@ func (r *Router) recordStreamAttemptSuccess(ac *attemptContext, id attemptIdenti
 func (r *Router) recordStreamAttemptError(ac *attemptContext, id attemptIdentity, start time.Time, streamErr error) {
 	detail := "stream terminated with error"
 	providerFailure := true
-	if errors.Is(streamErr, execution.ErrBudgetExhausted) || errors.Is(streamErr, errExecutionAccounting) {
+	if errors.Is(streamErr, execution.ErrBudgetExhausted) || errors.Is(streamErr, execution.ErrConcurrencyBusy) || errors.Is(streamErr, errExecutionAccounting) || errors.Is(streamErr, errExecutionAdmission) {
 		providerFailure = false
 		detail = "execution admission/accounting refused"
 	}
@@ -629,6 +651,7 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 	start := time.Now()
 	attemptCtx, attemptCancel := withProviderAttemptTimeoutFor(ac.ctx, ac.mode, ac.phase, id.name)
 	attemptCtx = ContextWithUsageMode(attemptCtx, ac.mode)
+	attemptCtx = execution.ContextWithCapacityFallback(attemptCtx, id.hasCapacityFallback)
 	// Inject this Router's price snapshot so a provider shared by several Routers
 	// prices from the calling Router's overrides, not whichever Router registered last.
 	attemptCtx = contextWithCostTable(attemptCtx, r.routingTables())
@@ -709,10 +732,11 @@ func (r *Router) routeAndExecuteStream(ac *attemptContext, result RouteResult, f
 	}
 	// Try primary
 	primaryRes := r.tryStreamProvider(ac, attemptIdentity{
-		name:       result.Actual,
-		modelID:    result.ModelID,
-		provider:   result.Provider,
-		isFallback: result.IsFallback,
+		name:                result.Actual,
+		modelID:             result.ModelID,
+		provider:            result.Provider,
+		isFallback:          result.IsFallback,
+		hasCapacityFallback: func() bool { return r.hasCapacityFallback(fallbacks, resolve, result.Actual) },
 	})
 	if !primaryRes.skipped && primaryRes.err == nil {
 		return primaryRes.ch, primaryRes.route, nil
@@ -726,7 +750,7 @@ func (r *Router) routeAndExecuteStream(ac *attemptContext, result RouteResult, f
 	}
 
 	// Try fallbacks
-	for _, c := range fallbacks {
+	for candidateIndex, c := range fallbacks {
 		if callerErr := ac.ctx.Err(); callerErr != nil {
 			return nil, result, callerErr
 		}
@@ -787,10 +811,11 @@ func (r *Router) routeAndExecuteStream(ac *attemptContext, result RouteResult, f
 		}
 
 		res := r.tryStreamProvider(ac, attemptIdentity{
-			name:       c.name,
-			modelID:    modelID,
-			provider:   p,
-			isFallback: true,
+			name:                c.name,
+			modelID:             modelID,
+			provider:            p,
+			isFallback:          true,
+			hasCapacityFallback: func() bool { return r.hasCapacityFallback(fallbacks[candidateIndex+1:], resolve, c.name) },
 		})
 		if res.skipped {
 			if firstErr == nil {

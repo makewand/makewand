@@ -732,8 +732,12 @@ func TestWrapCLICommandWithSandbox_RemoteOriginReadOnlyCredentials(t *testing.T)
 			t.Fatalf("host credential path %s bound into the sandbox: %v", args[i+1], args)
 		}
 	}
-	if !auditFixHasTriple(args, "--ro-bind", claudeJSON, claudeJSON) {
-		t.Fatalf("~/.claude.json must stay a read-only bind of the host file: %v", args)
+	privateMetadata := filepath.Join(filepath.Dir(filepath.Dir(priv)), ".claude.json")
+	if !auditFixHasTriple(args, "--ro-bind", privateMetadata, claudeJSON) || privateMetadata == claudeJSON {
+		t.Fatal("Claude identity metadata must be a read-only bind of the frozen private copy")
+	}
+	if raw, err := os.ReadFile(privateMetadata); err != nil || string(raw) != "{}" {
+		t.Fatalf("metadata snapshot missing: %v", err)
 	}
 
 	warnings := r4SimulateSandboxRun(t, wrapped, func() { readonlyFixWrite(t, priv, `{"claudeAiOauth":{}}`) })

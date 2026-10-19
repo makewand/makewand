@@ -706,56 +706,41 @@ class TestCliOptimizationsAndCircuitBreaker(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 _resolve_cli_prompt(args, required=True)
 
-    def test_low_quota_circuit_breaker_threshold(self):
+    def fake_bound_quota(self, provider, used):
+        from pathlib import Path
+        from makewand.account_identity import account_identity
         from makewand.health import _get_official_subscription_quota
-        # Simulate snapshot cache with 6% quota remaining (94% used)
-        snapshot_data = {
-            "providers": [
-                {
-                    "Provider": "codex",
-                    "HasData": True,
-                    "WeeklyPct": 94,
-                    "ResetAt": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-                }
-            ]
-        }
-        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
-            json.dump(snapshot_data, tf)
-            tf_path = tf.name
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / "selected"
+            root.mkdir()
+            if provider == "codex":
+                (root / "auth.json").write_text(json.dumps({"tokens": {"account_id": "optimization-fixture"}}))
+            else:
+                (root / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "optimization-fixture"}}))
+            with patch.dict(os.environ, HOME=str(home), CODEX_HOME=str(root), CLAUDE_CONFIG_DIR=str(root)):
+                identity = account_identity(provider)
+                now = datetime.now(timezone.utc)
+                snapshot = home / ".cache/makewand/quota-snapshot.json"
+                snapshot.parent.mkdir(parents=True)
+                snapshot.write_text(json.dumps({"version": 2, "taken_at": now.isoformat(), "providers": [{
+                    "Provider": provider, "HasData": True, "WeeklyPct": used,
+                    "AccountRef": identity["account_ref"], "IdentityKnown": True,
+                    "PoolRef": identity["pool_ref"], "CredentialRoot": identity["credential_root"],
+                    "SourceAt": now.isoformat(), "WeeklyResetAt": (now + timedelta(hours=1)).isoformat()}]}))
+                return _get_official_subscription_quota(provider)
 
-        try:
-            with patch("os.path.expanduser", return_value=tf_path):
-                q = _get_official_subscription_quota("codex")
-                self.assertIsNotNone(q)
-                self.assertEqual(q["percentage"], 6)
-                self.assertEqual(q["status"], "limited")  # <= 8% is limited
-        finally:
-            os.remove(tf_path)
+    def test_low_quota_circuit_breaker_threshold(self):
+        q = self.fake_bound_quota("codex", 94)
+        self.assertIsNotNone(q)
+        self.assertEqual(q["percentage"], 6)
+        self.assertEqual(q["status"], "limited")
 
     def test_safe_quota_above_circuit_breaker(self):
-        from makewand.health import _get_official_subscription_quota
-        snapshot_data = {
-            "providers": [
-                {
-                    "Provider": "claude",
-                    "HasData": True,
-                    "WeeklyPct": 85,
-                    "ResetAt": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-                }
-            ]
-        }
-        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
-            json.dump(snapshot_data, tf)
-            tf_path = tf.name
-
-        try:
-            with patch("os.path.expanduser", return_value=tf_path):
-                q = _get_official_subscription_quota("claude")
-                self.assertIsNotNone(q)
-                self.assertEqual(q["percentage"], 15)
-                self.assertEqual(q["status"], "warning")  # > 8% but < 25% is warning
-        finally:
-            os.remove(tf_path)
+        q = self.fake_bound_quota("claude", 85)
+        self.assertIsNotNone(q)
+        self.assertEqual(q["percentage"], 15)
+        self.assertEqual(q["status"], "warning")
 
     def test_status_json_contains_privacy_attestation(self):
         from makewand.cli import build_status_json

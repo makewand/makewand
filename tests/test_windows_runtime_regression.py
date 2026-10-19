@@ -6,6 +6,7 @@ except ImportError:
 
 import ctypes
 import json
+import ntpath
 import os
 import shutil
 import stat
@@ -18,6 +19,55 @@ from unittest import mock
 
 from makewand import config, git_helper, orchestrator, sandbox
 from makewand.artifact import workspace_snapshot
+
+
+@unittest.skipUnless(shutil.which("git"), "requires Git")
+class MetadataPathAdapterTests(unittest.TestCase):
+    def test_baseline_and_shadow_convert_metadata_paths_once(self):
+        # Model the API namespace on Linux without making pathlib choose its
+        # unavailable Windows implementation. Child paths retain the marker,
+        # just as a real Win32 API path retains its extended prefix.
+        class APIPath(type(Path())):
+            pass
+
+        def api_path(path):
+            if isinstance(path, APIPath):
+                raise ValueError("Windows filesystem operations require an ordinary local drive path")
+            return APIPath(path)
+
+        windows_os = mock.Mock(wraps=os)
+        windows_os.name = "nt"
+
+        def native_metadata(callback):
+            def call(git_dir, *args, **kwargs):
+                self.assertNotIsInstance(git_dir, APIPath)
+                with mock.patch.object(git_helper, "HOST_TRANSACTION_SUPPORTED", False), \
+                     mock.patch.object(git_helper, "os", windows_os):
+                    return callback(git_dir, *args, **kwargs)
+            return call
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            (source / "answer.py").write_bytes(b"answer = 42\n")
+            shadow = Path(temporary) / "shadow"
+            with mock.patch.object(git_helper, "_fs_path", side_effect=api_path), \
+                 mock.patch.object(git_helper, "_own_repository_file", native_metadata(git_helper._own_repository_file)), \
+                 mock.patch.object(git_helper, "_own_repository_directory", native_metadata(git_helper._own_repository_directory)), \
+                 mock.patch.object(git_helper, "write_repository_file", native_metadata(git_helper.write_repository_file)):
+                ok, error = git_helper.init_git_baseline(str(source), ephemeral=True)
+                self.assertTrue(ok, error)
+                git_helper.clone_isolated_worktree(str(source), shadow)
+            self.assertTrue((source / ".git" / git_helper.EPHEMERAL_GIT_MARKER).is_file())
+            self.assertTrue((shadow / ".git" / "info").is_dir())
+            self.assertEqual((shadow / "answer.py").read_bytes(), b"answer = 42\n")
+
+    def test_windows_home_ignores_home_variable(self):
+        # The Go/Python wire fixture must override USERPROFILE as well as HOME.
+        with mock.patch.dict(os.environ, {"HOME": r"C:\fixture", "USERPROFILE": r"C:\runner"}):
+            self.assertEqual(ntpath.expanduser("~/.cache/makewand"), r"C:\runner/.cache/makewand")
+            with mock.patch.dict(os.environ, {"USERPROFILE": os.environ["HOME"]}):
+                self.assertEqual(ntpath.expanduser("~/.cache/makewand"), r"C:\fixture/.cache/makewand")
 
 
 @unittest.skipUnless(shutil.which("git"), "requires Git")
@@ -53,6 +103,13 @@ class GitRuntimeRegressionTests(unittest.TestCase):
         self.git(["git", "add", "-A"])
         self.git(["git", "commit", "-qm", "binary baseline"])
         self.assertEqual(self.git(["git", "show", "HEAD:protected.bin"], binary=True), payload)
+
+    def test_non_utf8_gitignore_in_a_plain_workspace_does_not_need_fsdecode(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        (plain / ".gitignore").write_bytes(b"# \xd6\xd0\xce\xc4\n*.log\n")
+        self.assertEqual(orchestrator._filter_non_deliverable_test_changes(
+            ["app.py", "server.log"], str(plain)), ["app.py"])
 
     def test_text_pipe_preserves_non_utf8_bytes_without_reader_failure(self):
         code, output, error = git_helper.run_git_cmd(
@@ -233,6 +290,48 @@ class HostAuditRuntimeRegressionTests(unittest.TestCase):
         self.assertEqual(set(actual_accounts), expected_accounts, captured[0])
         record = json.loads((self.config_dir / sandbox.UNSAFE_HOST_EXEC_AUDIT_FILE).read_text(encoding="utf-8"))
         self.assertEqual(record["args"], ["中文"])
+
+
+@unittest.skipUnless(os.name == "nt", "requires native Windows junctions")
+class MetadataJunctionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="makewand-metadata-junction-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.shared = self.root / "shared"
+        self.shared.mkdir()
+        (self.shared / "keep").write_bytes(b"shared template\n")
+        self.git_dir = self.root / "repo.git"
+        self.git_dir.mkdir()
+
+    def junction(self, path):
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(path), str(self.shared)],
+                                capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(git_helper._is_reparse_path(path))
+
+    def test_junction_metadata_root_is_refused(self):
+        linked = self.root / "linked.git"
+        self.junction(linked)
+        with self.assertRaises(OSError):
+            git_helper.write_repository_file(linked, "marker", b"new")
+        self.assertEqual(list(self.shared.iterdir()), [self.shared / "keep"])
+
+    def test_junction_metadata_parent_is_replaced_without_writing_its_target(self):
+        info = self.git_dir / "info"
+        self.junction(info)
+        git_helper.write_repository_file(self.git_dir, "info/exclude", b"local/\n")
+        self.assertFalse(git_helper._is_reparse_path(info))
+        self.assertEqual((info / "exclude").read_bytes(), b"local/\n")
+        self.assertEqual(list(self.shared.iterdir()), [self.shared / "keep"])
+
+    def test_junction_at_metadata_file_becomes_a_regular_file(self):
+        marker = self.git_dir / "marker"
+        self.junction(marker)
+        git_helper.write_repository_file(self.git_dir, "marker", b"new")
+        self.assertFalse(git_helper._is_reparse_path(marker))
+        self.assertEqual(marker.read_bytes(), b"new")
+        self.assertEqual((self.shared / "keep").read_bytes(), b"shared template\n")
 
 
 if __name__ == "__main__":

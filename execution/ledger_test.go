@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,15 +22,53 @@ import (
 
 func readTestLedger(t *testing.T, path string) map[string]any {
 	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := readTestLedgerBytes(t, path)
 	var ledger map[string]any
 	if err := json.Unmarshal(data, &ledger); err != nil {
 		t.Fatal(err)
 	}
 	return ledger
+}
+
+// Windows race CI includes ACL and filesystem-filter latency in each ledger
+// transaction. Keep the same timing proportions without assuming sub-200ms IO.
+func capacityTestDuration(duration time.Duration) time.Duration {
+	if runtime.GOOS == "windows" {
+		return duration * 25
+	}
+	return duration
+}
+
+func readTestLedgerBytes(t *testing.T, path string) []byte {
+	t.Helper()
+	var data []byte
+	err := withLockedFile(t.Context(), path, nil, func(p *accountingPath) error {
+		var err error
+		data, err = readLedgerBytes(p)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// Fault injection and restoration must serialize with background settlement.
+func writeTestLedgerBytes(t *testing.T, path string, data []byte) {
+	t.Helper()
+	err := withLockedFile(t.Context(), path, nil, func(p *accountingPath) error {
+		file, err := openExecutionFile(p.root, p.name, os.O_WRONLY)
+		if err != nil {
+			return err
+		}
+		if err = file.Truncate(0); err == nil {
+			_, err = file.Write(data)
+		}
+		return errors.Join(err, file.Close())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestLedgerConcurrentHardLimitAndUnknownMeasurements(t *testing.T) {

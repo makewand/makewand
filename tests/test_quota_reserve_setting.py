@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from makewand import health
+from makewand.account_identity import account_identity
 
 
 class QuotaReserveSettingTests(unittest.TestCase):
@@ -24,6 +25,8 @@ class QuotaReserveSettingTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.codex = self.home / "selected-codex"
+        self.codex.mkdir()
+        (self.codex / "auth.json").write_text(json.dumps({"tokens": {"account_id": "reserve-fixture"}}))
         self.snapshot_path = self.home / ".cache/makewand/quota-snapshot.json"
         self.now = datetime.now(timezone.utc)
         env = patch.dict(os.environ, {"HOME": str(self.home), "CODEX_HOME": str(self.codex)})
@@ -42,9 +45,12 @@ class QuotaReserveSettingTests(unittest.TestCase):
 
     def snapshot(self, remaining, *, age=0, bound_home=None):
         self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"taken_at": (self.now - timedelta(seconds=age)).isoformat(), "providers": [{
+        identity = account_identity("codex", bound_home or self.codex)
+        data = {"version": 2, "taken_at": (self.now - timedelta(seconds=age)).isoformat(), "providers": [{
             "Provider": "codex", "HasData": True, "WeeklyPct": 100 - remaining,
-            "CodexHome": str(bound_home or self.codex),
+            "CredentialRoot": identity["credential_root"], "AccountRef": identity["account_ref"],
+            "IdentityKnown": identity["identity_known"], "PoolRef": identity["pool_ref"],
+            "SourceAt": (self.now - timedelta(seconds=age)).isoformat(),
             "ResetAt": (self.now + timedelta(hours=1)).isoformat(),
         }]}
         self.snapshot_path.write_text(json.dumps(data), encoding="utf-8")
@@ -173,16 +179,17 @@ class QuotaReserveSettingTests(unittest.TestCase):
             self.assertEqual(cache["codex"]["status"], "unknown")
             self.assertTrue(cache["codex"]["quota_reserve_gate"])
 
-    def test_stale_or_wrong_account_cannot_release_cached_buffer_limit(self):
+    def test_stale_or_wrong_account_invalidates_cached_buffer_limit(self):
         with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "4"}):
             for fields in ({"age": 901}, {"bound_home": self.home / "other-account"}):
                 with self.subTest(fields=fields):
                     self.snapshot(6, **fields)
                     cache = health._sanitize_cache(self.cached_limit(reserve_gate=True))
-                    self.assertEqual(cache["codex"]["status"], "limited")
+                    self.assertEqual(cache["codex"]["status"], "unknown")
                     quota = health.calculate_provider_quota("codex", cache["codex"])
-                    self.assertEqual(quota["status"], "limited")
-                    self.assertEqual(quota["source"], "status")
+                    self.assertEqual(quota["status"], "unknown")
+                    self.assertEqual(quota["source"], "unknown")
+                    self.assertIsNone(quota["percentage"])
 
     def test_auth_and_real_limits_are_not_cleared_by_positive_quota(self):
         self.snapshot(90)
@@ -211,14 +218,14 @@ class QuotaReserveSettingTests(unittest.TestCase):
                 self.assertTrue(parse_codex_quota("weekly limit: 6% left")[0])
             self.assertTrue(observed)
 
-    def test_explicit_codex_buffer_warning_can_recover_only_with_fresh_evidence(self):
+    def test_explicit_codex_buffer_warning_requires_current_account_evidence(self):
         from makewand.providers.codex import parse_codex_quota
         with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "4"}):
             limited, reason, reset = parse_codex_quota("weekly limit: 3% left")
             self.assertTrue(limited)
             cache = {"codex": {"status": "limited", "reason": reason,
                                "resets_at": reset, "updated_at": self.now.isoformat()}}
-            self.assertEqual(health._sanitize_cache(copy.deepcopy(cache))["codex"]["status"], "limited")
+            self.assertEqual(health._sanitize_cache(copy.deepcopy(cache))["codex"]["status"], "unknown")
             self.snapshot(6)
             restored = health._sanitize_cache(cache)
             self.assertEqual(restored["codex"]["status"], "unknown")

@@ -27,10 +27,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,9 +82,16 @@ const (
 // are *used* percentages in [0,100] (100 = pool exhausted). A nil pointer field
 // means that dimension is unknown for this provider.
 type ProviderQuota struct {
-	Provider    string
-	FiveHourPct *float64
-	WeeklyPct   *float64
+	Provider       string
+	CredentialRoot string
+	AccountRef     string
+	IdentityKnown  bool
+	// PoolRef is empty for unknown identities: directories are not quota pools.
+	PoolRef      string
+	Windows      []QuotaWindow
+	FiveHourPct  *float64
+	WeeklyPct    *float64
+	ThirtyDayPct *float64
 	// ScopedPct is the worst per-model weekly cap (e.g. Claude's Fable weekly
 	// limit), which can bind before the account-wide weekly cap.
 	ScopedPct *float64
@@ -96,11 +105,24 @@ type ProviderQuota struct {
 	// FiveHourResetAt / WeeklyResetAt are the per-window reset times, when known.
 	// The 429-feedback path seals only until the *soonest* future reset (see
 	// SoonestReset): a 5-hour cap must not seal a pool for the whole weekly window.
-	FiveHourResetAt time.Time
-	WeeklyResetAt   time.Time
-	// ResetAt is the window reset shown to users (weekly when known). Prefer
+	FiveHourResetAt  time.Time
+	WeeklyResetAt    time.Time
+	ThirtyDayResetAt time.Time
+	// ResetAt is the latest known shared-window reset. Prefer per-window fields
+	// for display and
 	// SoonestReset for sealing decisions.
 	ResetAt time.Time
+}
+
+// QuotaWindow separates shared pool limits from model-specific sublimits.
+type QuotaWindow struct {
+	PoolRef       string
+	Model         string
+	WindowKey     string
+	WindowMinutes int
+	UsedPercent   float64
+	SourceAt      time.Time
+	ResetAt       time.Time
 }
 
 // SoonestReset returns the earliest future window reset among the known windows,
@@ -110,7 +132,11 @@ type ProviderQuota struct {
 func (q ProviderQuota) SoonestReset() time.Time {
 	now := time.Now()
 	var soonest time.Time
-	for _, t := range []time.Time{q.FiveHourResetAt, q.WeeklyResetAt, q.ResetAt} {
+	resets := []time.Time{q.FiveHourResetAt, q.WeeklyResetAt, q.ThirtyDayResetAt, q.ResetAt}
+	for _, w := range q.Windows {
+		resets = append(resets, w.ResetAt)
+	}
+	for _, t := range resets {
 		if t.After(now) && (soonest.IsZero() || t.Before(soonest)) {
 			soonest = t
 		}
@@ -119,7 +145,7 @@ func (q ProviderQuota) SoonestReset() time.Time {
 }
 
 // EffectiveUsedPct returns the binding constraint for the *subscription pool*:
-// the higher of the account-wide 5-hour and weekly used-percentages. The pool
+// the highest account-wide window percentage, including the 30-day cap. The pool
 // that runs out first is the one that gates routing.
 //
 // ScopedPct (a per-model weekly cap, e.g. Claude's Fable-only limit) is
@@ -132,11 +158,19 @@ func (q ProviderQuota) SoonestReset() time.Time {
 func (q ProviderQuota) EffectiveUsedPct() (float64, bool) {
 	worst := 0.0
 	known := false
-	for _, p := range []*float64{q.FiveHourPct, q.WeeklyPct} {
+	for _, p := range []*float64{q.FiveHourPct, q.WeeklyPct, q.ThirtyDayPct} {
 		if p != nil {
 			known = true
 			if *p > worst {
 				worst = *p
+			}
+		}
+	}
+	for _, w := range q.Windows {
+		if w.Model == "" {
+			known = true
+			if w.UsedPercent > worst {
+				worst = w.UsedPercent
 			}
 		}
 	}
@@ -234,8 +268,9 @@ type QuotaSource interface {
 	Read(ctx context.Context) (ProviderQuota, error)
 }
 
-// QuotaSnapshotter maintains the latest QuotaSnapshot, refreshing it in the
-// background. Routing reads the last-known snapshot without blocking on I/O.
+// QuotaSnapshotter maintains the latest QuotaSnapshot in the background.
+// Snapshot checks the small local identity file so a changed login cannot
+// inherit another account's quota; it never fetches usage over the network.
 type QuotaSnapshotter struct {
 	sources         []QuotaSource
 	providerAllowed func(string) bool
@@ -350,7 +385,7 @@ func NewDefaultQuotaSnapshotter(interval time.Duration) *QuotaSnapshotter {
 
 // NewQuotaSnapshotter builds a snapshotter over the given sources. interval<=0
 // defaults to 120s. The snapshotter is inert until Start is called; Snapshot()
-// returns an empty (neutral) snapshot until the first refresh lands.
+// returns neutral identities until the first refresh lands.
 func NewQuotaSnapshotter(interval time.Duration, sources ...QuotaSource) *QuotaSnapshotter {
 	if interval <= 0 {
 		interval = 120 * time.Second
@@ -369,15 +404,27 @@ func (s *QuotaSnapshotter) Snapshot() *QuotaSnapshot {
 	if s == nil {
 		return &QuotaSnapshot{byProvider: map[string]ProviderQuota{}}
 	}
-	return s.current.Load()
+	current := s.current.Load()
+	selected := s.selectCachedQuotas(current.byProvider)
+	for _, src := range s.sources {
+		identity, _ := sourceQuotaIdentity(src)
+		if identity.AccountRef != "" {
+			name := strings.ToLower(src.Provider())
+			if _, exists := selected[name]; !exists {
+				selected[name] = identity
+			}
+		}
+	}
+	s.applySeals(selected)
+	return &QuotaSnapshot{byProvider: selected, takenAt: current.takenAt}
 }
 
 // LoadCache does a synchronous, network-free load of the shared on-disk quota
 // cache into the current snapshot. It lets a freshly constructed router serve
 // the last known headroom on its very first request without blocking startup on
-// any source I/O and without leaking a background goroutine. The last-good
-// values are adopted regardless of TTL — a slightly stale estimate beats a blank
-// snapshot — and the background loop (Start) supersedes them once it runs.
+// any usage-source I/O and without leaking a background goroutine. Account
+// sources accept only bound observations within 15 minutes and active windows;
+// they do not inherit unbound history or stale evidence.
 //
 // No-op when the snapshotter is nil, has no disk cache configured, or the cache
 // is missing/unreadable. Safe to call before Start.
@@ -388,8 +435,7 @@ func (s *QuotaSnapshotter) LoadCache() {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	if cached, takenAt, ok := loadQuotaCache(s.cachePath, 0); ok {
-		cached = s.filterCachedProviders(cached)
-		s.applySeals(cached)
+		cached = s.selectCachedQuotas(cached)
 		s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
 	}
 }
@@ -442,15 +488,17 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 	var diskPrev map[string]ProviderQuota
 	if s.cachePath != "" {
 		if cached, takenAt, ok := loadQuotaCache(s.cachePath, s.cacheTTL); ok {
-			cached = s.filterCachedProviders(cached)
-			s.applySeals(cached)
-			s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
-			return
+			cached = s.selectCachedQuotas(cached)
+			if len(cached) == len(s.sources) {
+				s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
+				return
+			}
 		}
 		diskPrev, _, _ = loadQuotaCache(s.cachePath, 0) // ignore TTL: last-good only
+		diskPrev = s.selectCachedQuotas(diskPrev)
 	}
 
-	prev := s.Snapshot()
+	prev := &QuotaSnapshot{byProvider: s.selectCachedQuotas(s.current.Load().byProvider)}
 	next := make(map[string]ProviderQuota, len(s.sources))
 
 	type result struct {
@@ -482,6 +530,16 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 	for i, src := range s.sources {
 		name := strings.ToLower(src.Provider())
 		r := results[i]
+		identity, requireAccount := sourceQuotaIdentity(src)
+		if requireAccount {
+			if !quotaMatches(r.q, identity) || !quotaEvidenceCurrent(r.q) {
+				r.q = identity
+			} else {
+				r.q = currentQuotaWindows(r.q)
+			}
+		} else if identity.AccountRef != "" && r.q.AccountRef != identity.AccountRef {
+			r.q = identity
+		}
 		if r.err != nil || !r.q.HasData {
 			// Keep last-good rather than dropping to neutral: a transient read
 			// failure shouldn't reopen a pool we just learned was exhausted, nor
@@ -500,6 +558,9 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 			continue
 		}
 		r.q.Provider = src.Provider()
+		if old, ok := diskPrev[name]; ok {
+			r.q = mergeQuotaObservations(old, r.q)
+		}
 		next[name] = r.q
 	}
 
@@ -510,10 +571,7 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 		storeQuotaCache(s.cachePath, next, takenAt)
 	}
 
-	// Apply active 429 seals: force the sealed provider to 100% until its window
-	// resets, overriding whatever the source reported.
-	s.applySeals(next)
-
+	// Keep raw observations immutable; Snapshot overlays account-bound seals.
 	s.current.Store(&QuotaSnapshot{byProvider: next, takenAt: takenAt})
 }
 
@@ -532,7 +590,7 @@ func loadQuotaCache(path string, ttl time.Duration) (map[string]ProviderQuota, t
 		return nil, time.Time{}, false
 	}
 	var d quotaDiskFormat
-	if err := json.Unmarshal(raw, &d); err != nil || d.Version != 1 {
+	if err := json.Unmarshal(raw, &d); err != nil || (d.Version != 1 && d.Version != 2) {
 		return nil, time.Time{}, false
 	}
 	if ttl > 0 && time.Since(d.TakenAt) > ttl {
@@ -540,7 +598,14 @@ func loadQuotaCache(path string, ttl time.Duration) (map[string]ProviderQuota, t
 	}
 	m := make(map[string]ProviderQuota, len(d.Providers))
 	for _, q := range d.Providers {
-		m[strings.ToLower(q.Provider)] = q
+		if d.Version == 1 {
+			// Legacy snapshots remain history, regardless of extra binding fields.
+			q.IdentityKnown, q.PoolRef = false, ""
+		}
+		key := quotaCacheKey(q)
+		if old, exists := m[key]; !exists || q.SourceAt.After(old.SourceAt) {
+			m[key] = q
+		}
 	}
 	return m, d.TakenAt, true
 }
@@ -548,20 +613,61 @@ func loadQuotaCache(path string, ttl time.Duration) (map[string]ProviderQuota, t
 // storeQuotaCache atomically writes the provider map to path. Best-effort:
 // errors (e.g. unwritable cache dir) are ignored — caching is an optimization.
 func storeQuotaCache(path string, m map[string]ProviderQuota, takenAt time.Time) {
-	providers := make([]ProviderQuota, 0, len(m))
-	for _, q := range m {
-		providers = append(providers, q)
+	if os.MkdirAll(filepath.Dir(path), 0o755) != nil {
+		return
 	}
-	sort.Slice(providers, func(i, j int) bool { return providers[i].Provider < providers[j].Provider })
-	b, err := json.MarshalIndent(quotaDiskFormat{Version: 1, TakenAt: takenAt, Providers: providers}, "", "  ")
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	locked := false
+	defer func() {
+		var unlockErr error
+		if locked {
+			unlockErr = unlockUserHandle(lock)
+		}
+		// Closing also releases the OS lock if explicit unlocking failed.
+		// Cache failures stay nonfatal, but a failed release must be visible.
+		if err := errors.Join(unlockErr, lock.Close()); err != nil {
+			log.Printf("makewand: release quota cache lock: %v", err)
+		}
+	}()
+	if lockUserHandle(lock, true) != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	locked = true
+	// Preserve other accounts (and legacy history), instead of provider-wide
+	// overwrite. Only a newer observation can replace the same account's data.
+	previous, _, _ := loadQuotaCache(path, 0)
+	if previous == nil {
+		previous = make(map[string]ProviderQuota)
+	}
+	for _, q := range m {
+		key := quotaCacheKey(q)
+		if old, exists := previous[key]; exists && quotaMatches(old, q) {
+			previous[key] = mergeQuotaObservations(old, q)
+		} else if !exists || !old.SourceAt.After(q.SourceAt) {
+			previous[key] = q
+		}
+	}
+	providers := make([]ProviderQuota, 0, len(previous))
+	for _, q := range previous {
+		providers = append(providers, q)
+	}
+	sort.Slice(providers, func(i, j int) bool { return quotaCacheKey(providers[i]) < quotaCacheKey(providers[j]) })
+	b, err := json.MarshalIndent(quotaDiskFormat{Version: 2, TakenAt: takenAt, Providers: providers}, "", "  ")
+	if err != nil {
+		return
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".quota-*.tmp")
+	if err != nil {
+		return
+	}
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	_, writeErr := tmpFile.Write(b)
+	closeErr := tmpFile.Close()
+	if writeErr != nil || closeErr != nil {
 		return
 	}
 	_ = os.Rename(tmp, path)
@@ -580,26 +686,17 @@ func (s *QuotaSnapshotter) MarkExhausted(provider string, until time.Time) {
 	if name == "" {
 		return
 	}
+	key := s.sealKey(name)
 	s.sealMu.Lock()
 	if until.IsZero() || !until.After(time.Now()) {
-		delete(s.seals, name)
+		delete(s.seals, key)
 	} else {
-		s.seals[name] = until
+		s.seals[key] = until
 	}
 	s.sealMu.Unlock()
 
-	// Reflect the seal into the current snapshot immediately. Hold refreshMu so a
-	// concurrent refresh() can't interleave its own read-modify-Store and clobber
-	// this update (or stamp it with a stale takenAt).
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
-	cur := s.Snapshot()
-	next := make(map[string]ProviderQuota, len(cur.byProvider))
-	for k, v := range cur.byProvider {
-		next[k] = v
-	}
-	s.applySeals(next)
-	s.current.Store(&QuotaSnapshot{byProvider: next, takenAt: cur.takenAt})
+	// Snapshot overlays seals at read time, without mutating raw observations or
+	// allowing a transient source failure to persist a seal into the disk cache.
 }
 
 // Sealed reports whether a provider currently has an active 429-feedback seal,
@@ -609,9 +706,10 @@ func (s *QuotaSnapshotter) Sealed(provider string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	name := strings.ToLower(strings.TrimSpace(provider))
+	key := s.sealKey(name)
 	s.sealMu.Lock()
 	defer s.sealMu.Unlock()
-	until, ok := s.seals[name]
+	until, ok := s.seals[key]
 	if !ok || !until.After(time.Now()) {
 		return time.Time{}, false
 	}
@@ -619,51 +717,99 @@ func (s *QuotaSnapshotter) Sealed(provider string) (time.Time, bool) {
 }
 
 func (s *QuotaSnapshotter) applySeals(m map[string]ProviderQuota) {
+	keys := make(map[string]string)
+	for _, src := range s.sources {
+		keys[s.sealKey(strings.ToLower(src.Provider()))] = strings.ToLower(src.Provider())
+	}
 	s.sealMu.Lock()
 	defer s.sealMu.Unlock()
 	now := time.Now()
-	for name, until := range s.seals {
+	for key, until := range s.seals {
 		if !until.After(now) {
-			delete(s.seals, name)
+			delete(s.seals, key)
+			continue
+		}
+		name, active := keys[key]
+		if !active {
 			continue
 		}
 		full := 100.0
 		q := m[name]
+		if strings.Contains(key, "|") && quotaCacheKey(q) != key {
+			continue
+		}
 		q.Provider = name
 		q.WeeklyPct = &full
 		q.HasData = true
 		q.ResetAt = until
+		q.WeeklyResetAt = until
+		if q.AccountRef != "" {
+			q.Windows = append(q.Windows, QuotaWindow{PoolRef: q.PoolRef, WindowMinutes: 0, UsedPercent: full, SourceAt: now, ResetAt: until})
+		}
 		m[name] = q
 	}
+}
+
+func (s *QuotaSnapshotter) sealKey(name string) string {
+	for _, src := range s.sources {
+		if strings.EqualFold(src.Provider(), name) {
+			if identity, _ := sourceQuotaIdentity(src); identity.AccountRef != "" {
+				return quotaCacheKey(identity)
+			}
+		}
+	}
+	return name
 }
 
 // --- Source: Claude (OAuth usage endpoint) ---
 
 type claudeQuotaSource struct {
-	credsPath string
-	endpoint  string
+	credsPath    string
+	endpoint     string
+	selectedHome bool
 }
 
 // NewClaudeQuotaSource reads Claude Pro/Max usage. credsPath empty →
 // ~/.claude/.credentials.json.
 func NewClaudeQuotaSource(credsPath string) QuotaSource {
+	selectedHome := credsPath == ""
 	if credsPath == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			credsPath = filepath.Join(home, ".claude", ".credentials.json")
+		root := os.Getenv("CLAUDE_CONFIG_DIR")
+		if root == "" {
+			home, _ := os.UserHomeDir()
+			root = filepath.Join(home, ".claude")
 		}
+		credsPath = filepath.Join(canonicalQuotaRoot(root), ".credentials.json")
 	}
 	return &claudeQuotaSource{
-		credsPath: credsPath,
-		endpoint:  "https://api.anthropic.com/api/oauth/usage",
+		credsPath:    credsPath,
+		selectedHome: selectedHome,
+		endpoint:     "https://api.anthropic.com/api/oauth/usage",
 	}
 }
 
 func (c *claudeQuotaSource) Provider() string { return "claude" }
 
-func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
-	q := ProviderQuota{Provider: "claude"}
+func (c *claudeQuotaSource) quotaIdentity() ProviderQuota {
+	if c.selectedHome {
+		return readQuotaIdentity("claude", selectedQuotaRoot("claude"))
+	}
+	return readQuotaIdentity("claude", filepath.Dir(c.credsPath))
+}
 
-	raw, err := os.ReadFile(c.credsPath)
+func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
+	q := c.quotaIdentity()
+	// Without a plain account identifier, do not read tokens or call an endpoint
+	// merely to turn unbound data into apparent quota evidence.
+	if !q.IdentityKnown {
+		return q, nil
+	}
+
+	credsPath := c.credsPath
+	if c.selectedHome {
+		credsPath = filepath.Join(q.CredentialRoot, ".credentials.json")
+	}
+	raw, err := os.ReadFile(credsPath)
 	if err != nil {
 		return q, err
 	}
@@ -697,10 +843,19 @@ func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 			Utilization *float64 `json:"utilization"`
 			ResetsAt    string   `json:"resets_at"`
 		} `json:"seven_day"`
+		SevenDayOpus struct {
+			Utilization *float64 `json:"utilization"`
+			ResetsAt    string   `json:"resets_at"`
+		} `json:"seven_day_opus"`
+		SevenDaySonnet struct {
+			Utilization *float64 `json:"utilization"`
+			ResetsAt    string   `json:"resets_at"`
+		} `json:"seven_day_sonnet"`
 		Limits []struct {
-			Kind    string   `json:"kind"`
-			Percent *float64 `json:"percent"`
-			Scope   *struct {
+			Kind     string   `json:"kind"`
+			Percent  *float64 `json:"percent"`
+			ResetsAt string   `json:"resets_at"`
+			Scope    *struct {
 				Model *struct {
 					DisplayName string `json:"display_name"`
 				} `json:"model"`
@@ -719,159 +874,232 @@ func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	q.FiveHourResetAt = parseTime(resp.FiveHour.ResetsAt)
 	q.WeeklyResetAt = parseTime(resp.SevenDay.ResetsAt)
 	q.ResetAt = q.WeeklyResetAt // weekly is the user-facing reset shown in `quota`
+	for _, w := range []struct {
+		pct   *float64
+		mins  int
+		reset time.Time
+	}{
+		{q.FiveHourPct, 300, q.FiveHourResetAt}, {q.WeeklyPct, 10080, q.WeeklyResetAt},
+	} {
+		if w.pct != nil {
+			q.Windows = append(q.Windows, QuotaWindow{PoolRef: q.PoolRef, WindowMinutes: w.mins, UsedPercent: *w.pct, SourceAt: q.SourceAt, ResetAt: w.reset})
+		}
+	}
+	for _, scoped := range []struct {
+		model string
+		pct   *float64
+		reset string
+	}{
+		{"opus", resp.SevenDayOpus.Utilization, resp.SevenDayOpus.ResetsAt},
+		{"sonnet", resp.SevenDaySonnet.Utilization, resp.SevenDaySonnet.ResetsAt},
+	} {
+		if scoped.pct != nil {
+			q.Windows = append(q.Windows, QuotaWindow{PoolRef: q.PoolRef, Model: scoped.model, WindowMinutes: 10080, UsedPercent: *scoped.pct, SourceAt: q.SourceAt, ResetAt: parseTime(scoped.reset)})
+		}
+	}
 	// Worst per-model weekly scoped cap.
 	for _, lim := range resp.Limits {
 		if lim.Kind == "weekly_scoped" && lim.Percent != nil {
+			// Unknown model scope must never become an account-wide cap.
+			model := "unknown"
+			if lim.Scope != nil && lim.Scope.Model != nil && lim.Scope.Model.DisplayName != "" {
+				model = lim.Scope.Model.DisplayName
+			}
+			reset := parseTime(lim.ResetsAt)
+			if lim.ResetsAt == "" {
+				reset = q.WeeklyResetAt
+			}
+			q.Windows = append(q.Windows, QuotaWindow{PoolRef: q.PoolRef, Model: model, WindowMinutes: 10080, UsedPercent: *lim.Percent, SourceAt: q.SourceAt, ResetAt: reset})
 			if q.ScopedPct == nil || *lim.Percent > *q.ScopedPct {
 				v := *lim.Percent
 				q.ScopedPct = &v
 			}
 		}
 	}
-	return q, nil
+	if !quotaMatches(q, c.quotaIdentity()) {
+		return c.quotaIdentity(), nil
+	}
+	return currentQuotaWindows(q), nil
 }
 
 // --- Source: Codex (session-log rate_limits) ---
 
 type codexQuotaSource struct {
-	sessionsDirs []string
+	sessionsDir  string
+	selectedHome bool
 }
 
-// NewCodexQuotaSource reads Codex Plus/Pro usage. sessionsDir empty →
-// discovers $CODEX_HOME/sessions, ~/.codex/sessions, and ~/.codex-2/sessions.
+// NewCodexQuotaSource follows exactly one selected CLI credential root.
+// It never scans default or alternate accounts in addition to CODEX_HOME.
 func NewCodexQuotaSource(sessionsDir string) QuotaSource {
-	var dirs []string
 	if sessionsDir != "" {
-		dirs = append(dirs, sessionsDir)
-	} else {
-		if ch := os.Getenv("CODEX_HOME"); ch != "" {
-			dirs = append(dirs, filepath.Join(ch, "sessions"))
-		}
-		if home, err := os.UserHomeDir(); err == nil {
-			for _, sub := range []string{".codex", ".codex-2"} {
-				p := filepath.Join(home, sub, "sessions")
-				found := false
-				for _, d := range dirs {
-					if d == p {
-						found = true
-						break
-					}
-				}
-				if !found {
-					dirs = append(dirs, p)
-				}
-			}
-		}
+		sessionsDir = canonicalQuotaRoot(sessionsDir)
 	}
-	return &codexQuotaSource{sessionsDirs: dirs}
+	return &codexQuotaSource{sessionsDir: sessionsDir, selectedHome: sessionsDir == ""}
 }
 
 func (c *codexQuotaSource) Provider() string { return "codex" }
+func (c *codexQuotaSource) quotaIdentity() ProviderQuota {
+	if c.selectedHome {
+		return readQuotaIdentity("codex", selectedQuotaRoot("codex"))
+	}
+	return readQuotaIdentity("codex", filepath.Dir(c.sessionsDir))
+}
 
 func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
-	q := ProviderQuota{Provider: "codex"}
-
-	files, err := recentJSONLFromDirs(c.sessionsDirs, 8)
+	q := c.quotaIdentity()
+	if !q.IdentityKnown {
+		return q, nil
+	}
+	sessionsDir := c.sessionsDir
+	if c.selectedHome {
+		sessionsDir = filepath.Join(q.CredentialRoot, "sessions")
+	}
+	files, err := recentJSONLFromDirs([]string{canonicalQuotaRoot(sessionsDir)}, 8)
 	if err != nil {
 		return q, err
 	}
+	windows := make(map[string]QuotaWindow)
 	for _, fp := range files {
 		if ctx.Err() != nil {
 			return q, ctx.Err()
 		}
-		rl, at := lastRateLimits(fp)
-		if rl == nil {
+		info, err := os.Stat(fp)
+		if err != nil {
 			continue
 		}
-		q.HasData = true
-		q.Authed = true
-		q.SourceAt = at
-		for _, w := range []*codexWindow{rl.Primary, rl.Secondary} {
-			if w == nil {
+		data, err := os.ReadFile(fp)
+		if err != nil {
+			continue
+		}
+		sessionRef := ""
+		for _, line := range strings.Split(string(data), "\n") {
+			var obj map[string]json.RawMessage
+			if json.Unmarshal([]byte(line), &obj) != nil {
 				continue
 			}
-			p := w.UsedPercent
-			reset := parseUnixOrTime(w.ResetsAt)
-			// Classify by window length: <=600min is the 5-hour window, the
-			// larger one is weekly. A missing window_minutes (0) is ambiguous, so
-			// fall back to filling whichever percentage isn't set yet.
-			mins := w.windowMinutes()
-			switch {
-			case mins > 0 && mins <= 600:
-				q.FiveHourPct = &p
-				q.FiveHourResetAt = reset
-			case mins >= 9000:
-				q.WeeklyPct = &p
-				q.WeeklyResetAt = reset
-			case q.FiveHourPct == nil:
-				q.FiveHourPct = &p
-				q.FiveHourResetAt = reset
-			default:
-				q.WeeklyPct = &p
-				q.WeeklyResetAt = reset
+			ref := codexEventAccountRef(obj)
+			var kind string
+			_ = json.Unmarshal(obj["type"], &kind)
+			if kind == "session_meta" {
+				sessionRef = ref
+				continue
+			}
+			if ref == "" {
+				ref = sessionRef
+			}
+			if ref != q.AccountRef {
+				continue
+			}
+			rl := findRateLimits(obj)
+			if rl == nil {
+				continue
+			}
+			var ts string
+			_ = json.Unmarshal(obj["timestamp"], &ts)
+			at := parseTime(ts)
+			// Missing timestamps are history; touching a file cannot renew an event.
+			if at.IsZero() || at.After(time.Now().Add(time.Minute)) || time.Since(at) > quotaObservationTTL {
+				continue
+			}
+			if info.ModTime().Before(at) {
+				at = info.ModTime()
+			}
+			model := rl.Model
+			if model == "" && rl.LimitID != "" && rl.LimitID != "codex" {
+				model = rl.LimitID
+			}
+			for slot, w := range []*codexWindow{rl.Primary, rl.Secondary} {
+				if w == nil || w.UsedPercent == nil || *w.UsedPercent < 0 || *w.UsedPercent > 100 {
+					continue
+				}
+				reset := parseUnixOrTime(w.ResetsAt)
+				if w.ResetsAt != nil && reset.IsZero() && w.ResetsAt != "" && w.ResetsAt != "0001-01-01T00:00:00Z" {
+					continue
+				}
+				if !reset.IsZero() && !reset.After(time.Now()) {
+					continue
+				}
+				minutes := w.windowMinutes()
+				key := model + "|" + strconv.Itoa(minutes)
+				if minutes == 0 {
+					key += "|unknown_" + strconv.Itoa(slot)
+				}
+				candidate := QuotaWindow{PoolRef: q.PoolRef, Model: model, WindowKey: key, WindowMinutes: minutes, UsedPercent: *w.UsedPercent, SourceAt: at, ResetAt: reset}
+				if previous, ok := windows[key]; !ok || !previous.SourceAt.After(at) {
+					windows[key] = candidate
+				}
 			}
 		}
-		q.ResetAt = q.WeeklyResetAt
-		if q.ResetAt.IsZero() {
-			q.ResetAt = q.FiveHourResetAt
-		}
-		return q, nil
 	}
-	return q, nil // no snapshot found — neutral, not an error
+	for _, w := range windows {
+		q.Windows = append(q.Windows, w)
+		if w.SourceAt.After(q.SourceAt) {
+			q.SourceAt = w.SourceAt
+		}
+	}
+	sort.Slice(q.Windows, func(i, j int) bool {
+		a, b := q.Windows[i], q.Windows[j]
+		if a.Model != b.Model {
+			return a.Model < b.Model
+		}
+		return a.WindowMinutes < b.WindowMinutes
+	})
+	q.Authed = true
+	q = mergeExecutionQuota(q)
+	q = currentQuotaWindows(q)
+	if !quotaMatches(q, c.quotaIdentity()) {
+		return c.quotaIdentity(), nil
+	}
+	return q, nil
+}
+
+func codexEventAccountRef(obj map[string]json.RawMessage) string {
+	var id, ref string
+	if raw, ok := obj["account_id"]; ok {
+		_ = json.Unmarshal(raw, &id)
+		if ref := quotaAccountRef("codex", id); ref != "" {
+			return ref
+		}
+		return "invalid"
+	}
+	if raw, ok := obj["account_ref"]; ok {
+		_ = json.Unmarshal(raw, &ref)
+		if strings.HasPrefix(ref, "codex:account:") {
+			return ref
+		}
+		return "invalid"
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(obj["payload"], &payload) == nil {
+		return codexEventAccountRef(payload)
+	}
+	return ""
 }
 
 type codexRateLimits struct {
 	Primary   *codexWindow `json:"primary"`
 	Secondary *codexWindow `json:"secondary"`
 	PlanType  string       `json:"plan_type"`
+	Model     string       `json:"model"`
+	LimitID   string       `json:"limit_id"`
 }
 
 type codexWindow struct {
-	UsedPercent   float64 `json:"used_percent"`
-	WindowMinutes int     `json:"window_minutes"`
-	ResetsAt      any     `json:"resets_at"`
+	UsedPercent        *float64 `json:"used_percent"`
+	WindowMinutes      int      `json:"window_minutes"`
+	LimitWindowMinutes int      `json:"limit_window_minutes"`
+	ResetsAt           any      `json:"resets_at"`
 }
 
 func (w *codexWindow) windowMinutes() int {
 	if w == nil {
 		return 0
 	}
-	return w.WindowMinutes
-}
-
-// lastRateLimits scans a codex session JSONL and returns the most recent
-// rate_limits object embedded anywhere in a line, plus its timestamp.
-func lastRateLimits(path string) (*codexRateLimits, time.Time) {
-	var best *codexRateLimits
-	var bestAt time.Time
-	// Session logs are line-delimited JSON; scan line by line for robustness.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, time.Time{}
+	if w.WindowMinutes > 0 {
+		return w.WindowMinutes
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.Contains(line, "\"rate_limits\"") {
-			continue
-		}
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			continue
-		}
-		rl := findRateLimits(obj)
-		if rl == nil {
-			continue
-		}
-		at := time.Time{}
-		if tsRaw, ok := obj["timestamp"]; ok {
-			var ts string
-			if json.Unmarshal(tsRaw, &ts) == nil {
-				at = parseTime(ts)
-			}
-		}
-		best = rl
-		bestAt = at
-	}
-	return best, bestAt
+	return w.LimitWindowMinutes
 }
 
 // findRateLimits recursively searches a decoded JSON object for a "rate_limits"
@@ -908,12 +1136,17 @@ func NewAgyQuotaSource(binPath string) QuotaSource {
 
 func (a *agyQuotaSource) Provider() string { return "gemini" }
 
+func (a *agyQuotaSource) quotaDirectoryIdentity() ProviderQuota {
+	home, _ := os.UserHomeDir()
+	return unknownQuotaIdentity("gemini", filepath.Join(home, ".gemini"))
+}
+
 // execsLocalCLI reports that reading agy quota spawns the local `agy` binary,
 // so this source is skipped in untrusted-repo mode (see localCLIQuotaSource).
 func (a *agyQuotaSource) execsLocalCLI() bool { return true }
 
 func (a *agyQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
-	q := ProviderQuota{Provider: "gemini"}
+	q := a.quotaDirectoryIdentity()
 	bin := a.binPath
 	if bin == "" {
 		p, err := exec.LookPath("agy")

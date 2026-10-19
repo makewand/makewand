@@ -344,6 +344,23 @@ class TestAgyModelCacheConcurrentRefresh(unittest.TestCase):
         print(",".join(slug for slug, _ in _discover_local_agy_models().models))
     """)
 
+    def test_marker_age_uses_time_after_metadata_observation(self):
+        from makewand.discovery import _claim_agy_refresh
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "catalog.attempt"
+            marker.write_text("catalog-state")
+            observed = time.time()
+            os.utime(marker, (observed, observed))
+            def clock():
+                # Another owner publishes its marker between reading the
+                # clock and stat. Its mtime must not be misread as a future
+                # stale marker and stolen while that owner refreshes.
+                os.utime(marker, (observed + .01, observed + .01))
+                return observed + .001
+            with patch("time.time", side_effect=clock):
+                self.assertFalse(_claim_agy_refresh(marker, "catalog-state", 60))
+            self.assertEqual(marker.read_text(), "catalog-state")
+
     def test_concurrent_lookups_run_agy_once_and_leave_no_marker(self):
         root = Path(tempfile.mkdtemp(prefix="mw-fix-agy-race-"))
         self.addCleanup(shutil.rmtree, root, True)

@@ -148,7 +148,9 @@ class TestAuditV31Fixes(unittest.TestCase):
                 called_cmd = mock_sub.call_args[0][0]
                 self.assertNotIn(long_prompt, called_cmd)
                 self.assertEqual(list(called_cmd[:1]), ["claude"])
-                self.assertEqual(mock_sub.call_args[1].get("extra_env"), {"MAKEWAND_PROVIDER_WORKER": "1"})
+                extra_env = mock_sub.call_args[1]["extra_env"]
+                self.assertEqual(extra_env["MAKEWAND_PROVIDER_WORKER"], "1")
+                self.assertNotIn("CLAUDE_CONFIG_DIR", extra_env)
                 self.assertEqual(mock_sub.call_args[1].get("input_text"), long_prompt)
 
             # 2. Codex
@@ -165,6 +167,7 @@ class TestAuditV31Fixes(unittest.TestCase):
 
             # 3. Muse
             with patch("makewand.health.load_status_cache", return_value={}), \
+                 patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
                  patch("makewand.sandbox.is_bwrap_available", return_value=False), \
                  patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
                  patch("makewand.providers.muse.run_subprocess") as mock_sub:
