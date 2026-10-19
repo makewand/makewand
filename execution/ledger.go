@@ -82,6 +82,11 @@ type Attempt struct {
 
 // withLockedFile uses the same sidecar byte lock as Python's filelock module.
 func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn func(*accountingPath) error) error {
+	leave, err := enterTransaction(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	p, _, err := accountingPathForIdentity(path, expected)
 	if err != nil {
 		return err
@@ -219,6 +224,30 @@ func saveLedger(path *accountingPath, data map[string]any) error {
 	return writeLedgerFile(path, data)
 }
 
+// shallowCopyObject copies a top-level ledger object (admitLease only assigns or
+// deletes its entries) and reports whether the key held a value at all.
+func shallowCopyObject(v any) (map[string]any, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, v != nil
+	}
+	out := make(map[string]any, len(m))
+	for k, x := range m {
+		out[k] = x
+	}
+	return out, true
+}
+
+// restoreObject puts back a value saved by shallowCopyObject.
+func restoreObject(data map[string]any, key string, saved map[string]any, existed bool) {
+	switch {
+	case !existed:
+		delete(data, key)
+	case saved != nil:
+		data[key] = saved
+	}
+}
+
 // writeLedgerFile atomically replaces the file with data. Evidence records use
 // it directly: they are not call-budget ledgers and must never be compacted.
 func writeLedgerFile(path *accountingPath, data map[string]any) error {
@@ -281,6 +310,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 		return nil, waitErr
 	}
 	attempt := &Attempt{ID: NewID(), TaskID: cfg.TaskID, config: cfg, metadata: metadata, started: time.Now(), spanID: NewID(), provider: true, startCommitted: !metadata.Pending}
+	hasLease := false
 	if cfg.LedgerPath != "" {
 		delay := 50 * time.Millisecond
 		wasBusy := false
@@ -364,25 +394,29 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 					occupied--
 				}
 				var keys []any
+				// Persist tightened scope limits/clock even on refused admission,
+				// but commit successful admission in one durable replacement.
+				refuse := func(reason error) error {
+					if err := saveLedger(path, data); err != nil {
+						return err
+					}
+					return reason
+				}
 				if data["scopes"] != nil {
 					keys, err = scopeKeys(data, cfg, time.Now())
 					if err != nil {
 						return err
 					}
-					if err := saveLedger(path, data); err != nil {
-						return err
-					}
 					if claimed != nil && !containsScope(claimed["scopes"], keys[0].([]any)) {
-						return fmt.Errorf("capacity hold belongs to another task")
+						return refuse(fmt.Errorf("capacity hold belongs to another task"))
 					}
 					available, err := scopeAvailable(data, keys, active, claimed)
 					if err != nil {
-						return err
+						return refuse(err)
 					}
 					if available <= 0 {
-						return ErrBudgetExhausted
+						return refuse(ErrBudgetExhausted)
 					}
-					scopeSpend(data, keys, 1)
 				} else {
 					used, _ := jsonInteger(data["archived_used"])
 					for _, raw := range attempts {
@@ -395,11 +429,21 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 					}
 				}
 				if data["scopes"] != nil {
+					// admitLease tightens lease_limits before it can refuse. A busy
+					// refusal must not persist this caller's lower cap for everyone
+					// else (Python does not either), so restore both maps first.
+					prevLimits, hadLimits := shallowCopyObject(data["lease_limits"])
+					prevLeases, hadLeases := shallowCopyObject(data["leases"])
 					lease, err := admitLease(data, metadata.Engine, cfg.AccountRef)
 					if err != nil {
-						return err
+						restoreObject(data, "lease_limits", prevLimits, hadLimits)
+						restoreObject(data, "leases", prevLeases, hadLeases)
+						return refuse(err)
 					}
+					// Busy admissions must never persist a spent call.
+					scopeSpend(data, keys, 1)
 					data["leases"].(map[string]any)[attempt.ID] = lease
+					hasLease = true
 				}
 				if claimed != nil {
 					remaining, _ := jsonInteger(claimed["remaining"])
@@ -459,7 +503,9 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 		}
 	}
 	attempt.leaseStop = make(chan struct{})
-	if cfg.LedgerPath != "" {
+	// Legacy ledgers have no account lease to renew. In particular, don't
+	// add a competing read transaction while a completion waits for its lock.
+	if hasLease {
 		go attempt.heartbeat()
 	}
 	attempt.emitBestEffort("start", Outcome{}, nil)

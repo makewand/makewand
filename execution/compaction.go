@@ -41,13 +41,15 @@ func compactLedger(data map[string]any) {
 	}
 	cutoff := now - ledgerRetention.Seconds()
 	leases, _ := data["leases"].(map[string]any)
-	kept := []any{}
 	archived, _ := jsonInteger(data["archived_used"])
 	attempts, ok := data["attempts"].([]any)
 	if !ok {
 		// Not a loaded call-budget ledger (those always carry attempts): leave it alone.
 		return
 	}
+	// Most transactions have no expired history. Reuse the decoded slice
+	// rather than allocating and copying it again on both read and save.
+	kept := attempts[:0]
 	for _, raw := range attempts {
 		entry := raw.(map[string]any)
 		settled := entry["status"] == "completed" || entry["status"] == "released"
@@ -72,6 +74,7 @@ func compactLedger(data map[string]any) {
 			kept = append(kept, entry)
 		}
 	}
+	clear(attempts[len(kept):])
 	data["attempts"] = kept
 	if scopes == nil || data["legacy_maximum"] != nil {
 		data["archived_used"] = json.Number(strconv.Itoa(archived))
@@ -82,16 +85,18 @@ func compactLedger(data map[string]any) {
 			delete(holds, key)
 		}
 	}
-	activeKeys := map[string]bool{}
-	for _, raw := range leases {
-		for _, key := range raw.(map[string]any)["keys"].([]any) {
-			activeKeys[key.(string)] = true
-		}
-	}
 	limits, _ := data["lease_limits"].(map[string]any)
-	for key := range limits {
-		if !activeKeys[key] {
-			delete(limits, key)
+	if len(limits) > 0 {
+		activeKeys := map[string]bool{}
+		for _, raw := range leases {
+			for _, key := range raw.(map[string]any)["keys"].([]any) {
+				activeKeys[key.(string)] = true
+			}
+		}
+		for key := range limits {
+			if !activeKeys[key] {
+				delete(limits, key)
+			}
 		}
 	}
 	if scopes == nil {

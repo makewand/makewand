@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/makewand/makewand/execution"
 	"github.com/makewand/makewand/internal/model"
 )
 
@@ -38,10 +39,6 @@ func (p *resourceCandidateProvider) Chat(ctx context.Context, _ []model.Message,
 			break
 		}
 	}
-	if p.wait {
-		<-ctx.Done()
-		return "", model.Usage{Provider: p.name}, ctx.Err()
-	}
 	if p.barrier != nil {
 		select {
 		case p.barrier.entered <- struct{}{}:
@@ -53,6 +50,10 @@ func (p *resourceCandidateProvider) Chat(ctx context.Context, _ []model.Message,
 		case <-ctx.Done():
 			return "", model.Usage{Provider: p.name}, ctx.Err()
 		}
+	}
+	if p.wait {
+		<-ctx.Done()
+		return "", model.Usage{Provider: p.name}, ctx.Err()
 	}
 	return "candidate output", model.Usage{Provider: p.name, Cost: p.cost}, nil
 }
@@ -232,13 +233,59 @@ func TestCandidateEnvironmentAndTimeout(t *testing.T) {
 	t.Setenv("MAKEWAND_CANDIDATE_CONCURRENCY", "1")
 	t.Setenv("MAKEWAND_CANDIDATE_TIMEOUT", "20ms")
 	t.Setenv("MAKEWAND_CANDIDATE_BUDGET_USD", "0")
-	r, calls, peak := candidateResourceRouter(t, 0, true, nil)
-	started := time.Now()
-	selection := RunCandidateSelection(context.Background(), r, nil, model.PhaseCode, nil, "", nil)
-	if time.Since(started) > time.Second || calls.Load() != 1 || peak.Load() != 1 || selection.Verified {
-		t.Fatal("timeout/count control failed")
+	options, err := candidateSelectionOptions(context.Background())
+	if err != nil || options.MaxCandidates != 1 || options.MaxConcurrent != 1 || options.Timeout != 20*time.Millisecond || options.MaxCostUSD != 0 {
+		t.Fatalf("environment options=%+v, err=%v", options, err)
 	}
+	t.Run("deadline", func(t *testing.T) {
+		r, calls, peak := candidateResourceRouter(t, 0, true, nil)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		finished := make(chan CandidateSelection, 1)
+		go func() { finished <- RunCandidateSelection(ctx, r, nil, model.PhaseCode, nil, "", nil) }()
+		var selection CandidateSelection
+		select {
+		case selection = <-finished:
+		case <-time.After(time.Second):
+			t.Fatal("candidate selection did not honor its configured timeout")
+		}
+		// Admission includes credential IO. A 20ms total budget may expire
+		// before Chat starts, especially on Windows with race instrumentation.
+		if calls.Load() > 1 || peak.Load() > 1 || selection.TotalCandidates != 1 || selection.Verified || selection.Status != execution.Timeout || (selection.Err != nil && !errors.Is(selection.Err, context.DeadlineExceeded)) {
+			t.Fatalf("deadline: calls/peak=%d/%d, status=%s, verified=%v, err=%v", calls.Load(), peak.Load(), selection.Status, selection.Verified, selection.Err)
+		}
+	})
+	t.Run("cancel-after-entry", func(t *testing.T) {
+		// Verify exactly one call and cancellation after entry independently
+		// of the admission IO fitting into a short wall-clock interval.
+		t.Setenv("MAKEWAND_CANDIDATE_TIMEOUT", "")
+		barrier := &candidateResourceBarrier{entered: make(chan struct{}, 3), release: make(chan struct{})}
+		r, calls, peak := candidateResourceRouter(t, 0, true, barrier)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		finished := make(chan CandidateSelection, 1)
+		go func() { finished <- RunCandidateSelection(ctx, r, nil, model.PhaseCode, nil, "", nil) }()
+		watchdog := time.NewTimer(time.Second)
+		defer watchdog.Stop()
+		select {
+		case <-barrier.entered:
+		case selection := <-finished:
+			t.Fatalf("selection ended before Chat: %+v", selection)
+		case <-watchdog.C:
+			t.Fatal("candidate did not enter Chat")
+		}
+		cancel()
+		select {
+		case selection := <-finished:
+			if calls.Load() != 1 || peak.Load() != 1 || selection.TotalCandidates != 1 || selection.Verified || selection.Status != execution.Cancelled || !errors.Is(selection.Err, context.Canceled) {
+				t.Fatalf("cancel: calls/peak=%d/%d, status=%s, verified=%v, err=%v", calls.Load(), peak.Load(), selection.Status, selection.Verified, selection.Err)
+			}
+		case <-watchdog.C:
+			t.Fatal("candidate did not stop after cancellation")
+		}
+	})
 	t.Setenv("MAKEWAND_CANDIDATE_BUDGET_USD", "NaN")
+	r, _, _ := candidateResourceRouter(t, 0, true, nil)
 	if result := RunCandidateSelection(context.Background(), r, nil, model.PhaseCode, nil, "", nil); result.Err == nil {
 		t.Fatal("invalid budget failed open")
 	}
