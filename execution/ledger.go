@@ -116,7 +116,7 @@ func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn f
 }
 
 func readLedger(path *accountingPath, maximum int) (map[string]any, error) {
-	file, err := openExecutionFile(path.root, path.name, os.O_RDONLY)
+	data, err := readLedgerBytes(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if maximum <= 0 && !layeredEnabled(nil) {
 			return nil, fmt.Errorf("new model call ledger requires a positive maximum")
@@ -131,21 +131,6 @@ func readLedger(path *accountingPath, maximum int) (map[string]any, error) {
 	}
 	if err != nil {
 		return nil, err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() > maximumLedgerBytes {
-		return nil, fmt.Errorf("model call ledger exceeds 16 MiB")
-	}
-	data, err := io.ReadAll(io.LimitReader(file, maximumLedgerBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maximumLedgerBytes {
-		return nil, fmt.Errorf("model call ledger exceeds 16 MiB")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
@@ -195,6 +180,31 @@ func readLedger(path *accountingPath, maximum int) (map[string]any, error) {
 	return ledger, nil
 }
 
+// Close the image before decoding or replacing it. Callers hold the sidecar
+// lock; a reader never needs to retain a handle across an atomic replacement.
+func readLedgerBytes(path *accountingPath) ([]byte, error) {
+	file, err := openExecutionFile(path.root, path.name, os.O_RDONLY)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maximumLedgerBytes {
+		return nil, fmt.Errorf("model call ledger exceeds 16 MiB")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maximumLedgerBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maximumLedgerBytes {
+		return nil, fmt.Errorf("model call ledger exceeds 16 MiB")
+	}
+	return data, nil
+}
+
 func jsonInteger(value any) (int, bool) {
 	n, ok := value.(json.Number)
 	if !ok {
@@ -220,12 +230,17 @@ func writeLedgerFile(path *accountingPath, data map[string]any) error {
 		return fmt.Errorf("model call ledger exceeds 16 MiB")
 	}
 	temp := ".call-budget-" + NewID()
-	file, err := path.root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	var file *os.File
+	err = retryAccountingIO(func() error {
+		var err error
+		file, err = path.root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		return err
+	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = path.root.Remove(temp) }()
-	if err := privatefile.Tighten(file); err != nil {
+	if err := retryAccountingIO(func() error { return privatefile.Tighten(file) }); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("protect model call ledger: %w", err)
 	}
@@ -239,7 +254,7 @@ func writeLedgerFile(path *accountingPath, data map[string]any) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	if err := path.root.Rename(temp, path.name); err != nil {
+	if err := retryAccountingIO(func() error { return path.root.Rename(temp, path.name) }); err != nil {
 		return err
 	}
 	return syncDirectory(path.root)

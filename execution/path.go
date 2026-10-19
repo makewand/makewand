@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/makewand/makewand/internal/privatefile"
 )
 
 // accountingPath pins the directory object, not its pathname. The sidecar lock,
@@ -146,6 +144,16 @@ func accountingPathForIdentity(path string, expected os.FileInfo) (*accountingPa
 // the opened object before any write or permission change; new leaves use
 // O_EXCL so a concurrent symlink cannot redirect creation.
 func openExecutionFile(root *os.Root, name string, flags int) (*os.File, error) {
+	var file *os.File
+	err := retryAccountingIO(func() error {
+		var err error
+		file, err = openExecutionFileOnce(root, name, flags)
+		return err
+	})
+	return file, err
+}
+
+func openExecutionFileOnce(root *os.Root, name string, flags int) (*os.File, error) {
 	if !accountingName(name) {
 		return nil, fmt.Errorf("invalid execution accounting file name")
 	}
@@ -177,7 +185,7 @@ func openExecutionFile(root *os.Root, name string, flags int) (*os.File, error) 
 		// Existing Python sidecars/ledgers may inherit Windows DACLs. Tighten
 		// validates owner and single-link identity on this fixed object before
 		// changing privacy, preserving the shared file/byte-lock protocol.
-		if err := privatefile.Tighten(file); err != nil {
+		if err := protectExecutionFile(file); err != nil {
 			_ = file.Close()
 			return nil, err
 		}

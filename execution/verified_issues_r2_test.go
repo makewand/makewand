@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -108,7 +109,7 @@ func TestVerifiedCapacityWaitAndRetryableRefusal(t *testing.T) {
 	path := layeredFixture(t)
 	t.Setenv("MAKEWAND_ACCOUNT_CONCURRENCY", "1")
 	t.Setenv("MAKEWAND_POOL_CONCURRENCY", "1")
-	t.Setenv("MAKEWAND_LEASE_WAIT_SECONDS", "0.2")
+	t.Setenv("MAKEWAND_LEASE_WAIT_SECONDS", strconv.FormatFloat(capacityTestDuration(200*time.Millisecond).Seconds(), 'f', -1, 64))
 	ctx := ContextWithConfig(context.Background(), Config{LedgerPath: path, TaskID: "capacity", MaxCalls: 10})
 	first, err := Reserve(ctx, Metadata{Engine: "agy"})
 	if err != nil {
@@ -124,7 +125,7 @@ func TestVerifiedCapacityWaitAndRetryableRefusal(t *testing.T) {
 	if second != nil || err == nil || errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("contention is not exhausted budget: %v", err)
 	}
-	if time.Since(started) < 150*time.Millisecond {
+	if time.Since(started) < capacityTestDuration(150*time.Millisecond) {
 		t.Fatal("capacity refusal did not wait")
 	}
 	if len(readTestLedger(t, path)["attempts"].([]any)) != 1 {

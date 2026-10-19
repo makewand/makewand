@@ -98,13 +98,8 @@ func TestR5StartFailureCannotRefundAlreadyCommittedReservation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	raw := readTestLedgerBytes(t, path)
+	writeTestLedgerBytes(t, path, []byte("{"))
 	err = a.Start()
 	stopped := false
 	select {
@@ -112,10 +107,7 @@ func TestR5StartFailureCannotRefundAlreadyCommittedReservation(t *testing.T) {
 		stopped = true
 	default:
 	}
-	//nolint:gosec // G703: restore the test-owned ledger returned by layeredFixture(t).
-	if restoreErr := os.WriteFile(path, raw, 0600); restoreErr != nil {
-		t.Fatal(restoreErr)
-	}
+	writeTestLedgerBytes(t, path, raw)
 	if err == nil || stopped {
 		t.Fatalf("failed no-op Start refunded a previously committed dispatch: %v, stopped=%v", err, stopped)
 	}
@@ -132,13 +124,8 @@ func TestR5FailedSettlementStopsHeartbeat(t *testing.T) {
 			}
 			// Also stop the old implementation's leaked goroutine on a red run.
 			t.Cleanup(func() { a.leaseStopOnce.Do(func() { close(a.leaseStop) }) })
-			raw, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
-				t.Fatal(err)
-			}
+			raw := readTestLedgerBytes(t, path)
+			writeTestLedgerBytes(t, path, []byte("{"))
 			if release {
 				err = a.ReleaseUnstarted()
 			} else {
@@ -150,10 +137,7 @@ func TestR5FailedSettlementStopsHeartbeat(t *testing.T) {
 				stopped = true
 			default:
 			}
-			//nolint:gosec // G703: restore the test-owned ledger returned by layeredFixture(t).
-			if restoreErr := os.WriteFile(path, raw, 0600); restoreErr != nil {
-				t.Fatal(restoreErr)
-			}
+			writeTestLedgerBytes(t, path, raw)
 			if err == nil || !stopped {
 				t.Fatalf("failed settlement kept its heartbeat: error=%v stopped=%v", err, stopped)
 			}
@@ -165,7 +149,7 @@ func TestR5FailedSettlementStopsHeartbeat(t *testing.T) {
 			}
 			// The owner remains alive: stopping heartbeat alone cannot reclaim
 			// this lease. Release must retry after the ledger becomes usable.
-			deadline := time.Now().Add(3 * time.Second)
+			deadline := time.Now().Add(capacityTestDuration(3 * time.Second))
 			for {
 				data := readTestLedger(t, path)
 				if data["attempts"].([]any)[0].(map[string]any)["status"] == "released" {
@@ -240,13 +224,8 @@ func TestR5CompletionRetryOwnsOutcomeMeasurements(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	raw := readTestLedgerBytes(t, path)
+	writeTestLedgerBytes(t, path, []byte("{"))
 	tokens := int64(42)
 	if err := a.Complete(Outcome{Status: Passed, Known: true, Tokens: &tokens}); err == nil {
 		t.Fatal("transient completion failure not exercised")
@@ -254,11 +233,8 @@ func TestR5CompletionRetryOwnsOutcomeMeasurements(t *testing.T) {
 	// Complete returned. The caller may reuse its usage storage while the
 	// background cleanup must settle the original outcome.
 	tokens = 999
-	//nolint:gosec // G703: restore the test-owned ledger returned by layeredFixture(t).
-	if err := os.WriteFile(path, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	until := time.Now().Add(3 * time.Second)
+	writeTestLedgerBytes(t, path, raw)
+	until := time.Now().Add(capacityTestDuration(3 * time.Second))
 	for {
 		entry := readTestLedger(t, path)["attempts"].([]any)[0].(map[string]any)
 		if entry["status"] == "completed" {
@@ -300,7 +276,7 @@ func TestR5ReleaseRetrySurvivesTemporaryMissingDirectory(t *testing.T) {
 	if err := os.Rename(moved, dir); err != nil {
 		t.Fatal(err)
 	}
-	until := time.Now().Add(3 * time.Second)
+	until := time.Now().Add(capacityTestDuration(3 * time.Second))
 	for readTestLedger(t, path)["attempts"].([]any)[0].(map[string]any)["status"] != "released" {
 		if time.Now().After(until) {
 			t.Fatal("cleanup abandoned a temporarily missing ledger directory")

@@ -22,14 +22,14 @@ func TestR4DefaultBusyWaitLeavesDeadlineForFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 	}()
-	waitCtx, cancel := context.WithTimeout(ctx, 240*time.Millisecond)
+	waitCtx, cancel := context.WithTimeout(ctx, capacityTestDuration(240*time.Millisecond))
 	defer cancel()
 	started := time.Now()
 	_, err = Reserve(waitCtx, Metadata{Engine: "codex"})
 	if !errors.Is(err, ErrConcurrencyBusy) || errors.Is(err, ErrBudgetExhausted) || waitCtx.Err() != nil {
 		t.Fatalf("busy wait consumed deadline or became terminal: %v, ctx=%v", err, waitCtx.Err())
 	}
-	if elapsed := time.Since(started); elapsed < 30*time.Millisecond || elapsed > 220*time.Millisecond {
+	if elapsed := time.Since(started); elapsed < capacityTestDuration(30*time.Millisecond) || elapsed > capacityTestDuration(220*time.Millisecond) {
 		t.Fatalf("unexpected bounded wait: %v", elapsed)
 	}
 	fallback, err := Reserve(waitCtx, Metadata{Engine: "grok"})

@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -42,8 +43,8 @@ func TestR3RealExhaustionWinsOverContendingLease(t *testing.T) {
 	t.Setenv("MAKEWAND_MACHINE_DAILY_CALLS", "2")
 	t.Setenv("MAKEWAND_ACCOUNT_CONCURRENCY", "1")
 	t.Setenv("MAKEWAND_POOL_CONCURRENCY", "1")
-	t.Setenv("MAKEWAND_LEASE_WAIT_SECONDS", "4")
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Setenv("MAKEWAND_LEASE_WAIT_SECONDS", strconv.FormatFloat(capacityTestDuration(4*time.Second).Seconds(), 'f', -1, 64))
+	ctx, cancel := context.WithTimeout(t.Context(), capacityTestDuration(5*time.Second))
 	defer cancel()
 	ctx = ContextWithConfig(ctx, Config{LedgerPath: path, TaskID: "holder", MaxCalls: 10})
 	first, err := Reserve(ctx, Metadata{Engine: "codex"})
@@ -82,7 +83,7 @@ func TestR3RealExhaustionWinsOverContendingLease(t *testing.T) {
 		if !errors.Is(err, ErrBudgetExhausted) {
 			t.Fatalf("real exhaustion was hidden by contention: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(capacityTestDuration(2 * time.Second)):
 		t.Fatal("real exhaustion waited for the lease cap")
 	}
 	if len(readTestLedger(t, path)["attempts"].([]any)) != 2 {
