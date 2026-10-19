@@ -92,6 +92,7 @@ func TestProxyTransport(t *testing.T) {
 		t.Fatal("legacy USE_PROXY precedence lost")
 	}
 	// Reporting no URL is deliberate: even malformed userinfo cannot leak.
+	//nolint:gosec // G101: deliberately fake URL userinfo tests that status never discloses credentials.
 	if got := Status(nil, Defaults{Default: "http://user:secret@proxy.example"}); len(got) != 1 || got["source"] != "config_default" {
 		t.Fatalf("unsafe status: %v", got)
 	}

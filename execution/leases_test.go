@@ -76,6 +76,7 @@ func TestMixedGoPythonProcessesCompeteForLastAccountSlot(t *testing.T) {
 	t.Setenv("MAKEWAND_MACHINE_DAILY_CALLS", "100")
 	var commands []*exec.Cmd
 	for range 4 {
+		//nolint:gosec // G204: re-execute this test binary with a fixed helper-test selector.
 		cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestLeaseProcessHelper$")
 		cmd.Env = append(os.Environ(), "MAKEWAND_LEASE_TEST_HELPER=1")
 		commands = append(commands, cmd, pythonCommand(t, `import os
@@ -295,7 +296,11 @@ b.reserve('agy', 'fast', task_id='python-api', account_ref='agy:api:fixture-key'
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer a.Complete(Outcome{Status: Unknown})
+				defer func() {
+					if err := a.Complete(Outcome{Status: Unknown}); err != nil {
+						t.Fatal(err)
+					}
+				}()
 				cmd := pythonCommand(t, `from makewand import call_budget as b
 for engine in ('agy', 'gemini', 'antigravity'):
  try: b.reserve(engine, 'fast', task_id='python-api', account_ref=engine+':api:fixture-key')

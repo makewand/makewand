@@ -72,12 +72,20 @@ func TestR6ConcurrencyLimitsIncreaseAfterQuiescence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer second.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := second.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	third, err := Reserve(ctx, Metadata{Engine: "codex"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer third.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := third.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 }
 
 func TestR6CompactionProtocolSharedWithPython(t *testing.T) {

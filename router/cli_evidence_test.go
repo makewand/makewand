@@ -297,7 +297,11 @@ func TestClaudeExplicitDefaultIdentityAndInvalidPrivateEvidence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer attempt.Complete(execution.Outcome{Status: execution.Unknown})
+			defer func() {
+				if err := attempt.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+					t.Fatal(err)
+				}
+			}()
 			if err := initializeCLIEvidence(attempt, "claude"); err != nil {
 				t.Fatal(err)
 			}
@@ -376,7 +380,11 @@ func TestPrivateEvidencePathsRemainBoundAfterPreparation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer attempt.Complete(execution.Outcome{Status: execution.Unknown})
+			defer func() {
+				if err := attempt.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+					t.Fatal(err)
+				}
+			}()
 			if err := initializeCLIEvidence(attempt, provider); err != nil {
 				t.Fatal(err)
 			}

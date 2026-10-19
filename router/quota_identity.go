@@ -127,7 +127,10 @@ func readQuotaIdentity(provider, root string) ProviderQuota {
 // Identity reads share the credential-copy byte cap. Unavailable metadata is
 // unknown, never an accounting failure that blocks another provider.
 func cliReadIdentityMetadata(path string) ([]byte, error) {
-	info, err := os.Stat(path)
+	// Use the credential mask walk's local-component, rooted inspection. It
+	// follows documented credential aliases without an unrestricted Stat, and
+	// rejects FIFOs before the reader can block while opening them.
+	_, info, err := cliInspectMaskTarget(cliCredentialMaskTarget{path})
 	if err != nil {
 		return nil, err
 	}

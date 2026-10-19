@@ -114,7 +114,11 @@ func TestVerifiedCapacityWaitAndRetryableRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := first.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	started := time.Now()
 	second, err := Reserve(ctx, Metadata{Engine: "agy"})
 	if second != nil || err == nil || errors.Is(err, ErrBudgetExhausted) {

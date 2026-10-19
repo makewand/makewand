@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 import pytest
 from makewand import config
@@ -79,7 +80,8 @@ def test_gemini_explicit_bypass(isolated_config, monkeypatch):
     assert before["NO_PROXY"] == "internal"
     monkeypatch.setenv("MAKEWAND_GEMINI_BYPASS_PROXY", "1")
     after = proxy_environment({}, provider="gemini")
-    assert "googleapis.com" in after["NO_PROXY"]
+    assert any(urlsplit("//" + host.strip()).hostname == "googleapis.com"
+               for host in after["NO_PROXY"].split(","))
     assert after["NO_PROXY"] == after["no_proxy"]
     monkeypatch.setenv("MAKEWAND_GEMINI_USE_PROXY", "1")
     assert proxy_environment({}, provider="gemini") == before

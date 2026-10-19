@@ -27,6 +27,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -619,11 +620,22 @@ func storeQuotaCache(path string, m map[string]ProviderQuota, takenAt time.Time)
 	if err != nil {
 		return
 	}
-	defer lock.Close()
+	locked := false
+	defer func() {
+		var unlockErr error
+		if locked {
+			unlockErr = unlockUserHandle(lock)
+		}
+		// Closing also releases the OS lock if explicit unlocking failed.
+		// Cache failures stay nonfatal, but a failed release must be visible.
+		if err := errors.Join(unlockErr, lock.Close()); err != nil {
+			log.Printf("makewand: release quota cache lock: %v", err)
+		}
+	}()
 	if lockUserHandle(lock, true) != nil {
 		return
 	}
-	defer unlockUserHandle(lock)
+	locked = true
 	// Preserve other accounts (and legacy history), instead of provider-wide
 	// overwrite. Only a newer observation can replace the same account's data.
 	previous, _, _ := loadQuotaCache(path, 0)

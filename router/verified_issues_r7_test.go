@@ -110,7 +110,11 @@ func TestR7ForeignRootENOTDIRAndEACCES(t *testing.T) {
 					if err := os.Mkdir(parent, 0000); err != nil {
 						t.Fatal(err)
 					}
-					defer os.Chmod(parent, 0700)
+					defer func() {
+						if err := os.Chmod(parent, 0700); err != nil {
+							t.Fatal(err)
+						}
+					}()
 					wantErr = syscall.EACCES
 				}
 				selected := parent + "/account"

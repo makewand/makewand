@@ -29,6 +29,7 @@ func Load() (Defaults, error) {
 		}
 		dir = filepath.Join(home, ".config", "makewand")
 	}
+	//nolint:gosec // G703: operator-selected local config directory, never a request-supplied path.
 	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if os.IsNotExist(err) {
 		return Defaults{}, nil

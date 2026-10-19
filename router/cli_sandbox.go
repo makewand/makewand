@@ -579,10 +579,6 @@ func cliConfiguredAccountHome(provider, variable string, env []string, workspace
 	return selected, real, nil
 }
 
-func cliCodexProtectedPaths(homes []string) []string {
-	return cliAccountProtectedPaths("codex", homes)
-}
-
 func cliAccountProtectedPaths(active string, homes []string) []string {
 	entries := append([]string(nil), cliSensitiveHomeEntries...)
 	for provider, credentials := range cliProviderCredentials {
@@ -1726,7 +1722,11 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 				// Join without Clean: a symlink must be followed before a later "..".
 				selectedForeign = workspace + string(filepath.Separator) + selectedForeign
 			}
-			if _, statErr := os.Stat(selectedForeign); statErr != nil {
+			resolvedForeign, statErr := cliRealPathMissing(selectedForeign)
+			if statErr == nil {
+				_, statErr = cliStatResolvedAccountPath(resolvedForeign)
+			}
+			if statErr != nil {
 				// A missing root beneath a writable bind can be populated with
 				// config or hooks for the next run. Only skip isolated roots.
 				if (errors.Is(statErr, os.ErrNotExist) || errors.Is(statErr, syscall.ENOTDIR) || errors.Is(statErr, syscall.EACCES)) && !cliForeignRootCreatable(selectedForeign, home, bwrapArgs) {
@@ -2065,7 +2065,7 @@ func cliForeignRootCreatable(path, home string, args []string) bool {
 	}
 	ancestor := resolvedPath
 	for {
-		if _, err := os.Stat(ancestor); err == nil {
+		if _, err := cliStatResolvedAccountPath(ancestor); err == nil {
 			break
 		} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) && !errors.Is(err, syscall.EACCES) {
 			return true
@@ -2125,8 +2125,13 @@ func cliRealPathMissing(path string) (string, error) {
 			continue
 		}
 		next := filepath.Join(resolved, part)
-		info, err := os.Lstat(next)
+		parent, local, err := cliAccountPathRoot(next)
 		if err != nil {
+			return "", err
+		}
+		info, err := parent.Lstat(local)
+		if err != nil {
+			_ = parent.Close()
 			if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) && !errors.Is(err, syscall.EACCES) {
 				return "", err
 			}
@@ -2134,14 +2139,17 @@ func cliRealPathMissing(path string) (string, error) {
 			continue
 		}
 		if info.Mode()&os.ModeSymlink == 0 {
+			_ = parent.Close()
 			resolved = next
 			continue
 		}
 		links++
 		if links > 255 {
+			_ = parent.Close()
 			return "", fmt.Errorf("too many symlinks in foreign account path")
 		}
-		target, err := os.Readlink(next)
+		target, err := parent.Readlink(local)
+		_ = parent.Close()
 		if err != nil {
 			return "", err
 		}
@@ -2153,4 +2161,30 @@ func cliRealPathMissing(path string) (string, error) {
 		pending = append(split(target), pending...)
 	}
 	return resolved, nil
+}
+
+// cliAccountPathRoot confines lookups to a local path under the volume root,
+// as cliResolveCodexDirectory and cliInspectMaskTarget do. Callers resolve
+// symlinks component by component before passing a path here; never Clean a
+// user path across a symlink followed by "..".
+func cliAccountPathRoot(path string) (*os.Root, string, error) {
+	if !filepath.IsAbs(path) {
+		return nil, "", errors.New("account lookup requires an absolute path")
+	}
+	anchor := filepath.VolumeName(path) + string(os.PathSeparator)
+	local, err := filepath.Rel(anchor, path)
+	if err != nil || !filepath.IsLocal(local) {
+		return nil, "", errors.New("account lookup requires a local path")
+	}
+	root, err := os.OpenRoot(anchor)
+	return root, local, err
+}
+
+func cliStatResolvedAccountPath(path string) (os.FileInfo, error) {
+	root, local, err := cliAccountPathRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.Stat(local)
 }

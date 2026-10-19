@@ -53,7 +53,11 @@ func TestR8AmbiguousAccountPathsRefusedBeforeSkip(t *testing.T) {
 					if err := os.Chmod(locked, 0000); err != nil {
 						t.Fatal(err)
 					}
-					defer os.Chmod(locked, 0700)
+					defer func() {
+						if err := os.Chmod(locked, 0700); err != nil {
+							t.Fatal(err)
+						}
+					}()
 					// Keep the configured spelling: filepath.Join would erase '..'.
 					selected := map[string]string{
 						"missing":      work + "/missing/../../outside/x",

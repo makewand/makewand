@@ -275,7 +275,11 @@ func TestR5StaleForeignAccountDirectoryDoesNotBlockGrok(t *testing.T) {
 					if err := os.Chmod(filepath.Dir(path), 0000); err != nil {
 						t.Fatal(err)
 					}
-					defer os.Chmod(filepath.Dir(path), 0700)
+					defer func() {
+						if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
+							t.Fatal(err)
+						}
+					}()
 				}
 				cmd := exec.Command("fixture")
 				cmd.Dir = work

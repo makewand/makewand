@@ -19,7 +19,11 @@ func TestAgyAdapterUsesCanonicalLeaseNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Complete(execution.Outcome{Status: execution.Unknown})
+	defer func() {
+		if err := a.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	if _, err := execution.Reserve(ctx, execution.Metadata{Engine: NewAgyCLI("fake-unused").Name()}); !errors.Is(err, execution.ErrConcurrencyBusy) {
 		t.Fatalf("actual adapter bypasses agy capacity: %v", err)
 	}
@@ -45,7 +49,11 @@ func TestNativeGeminiAPICompetesWithAgyAPILeaseBeforeTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Complete(execution.Outcome{Status: execution.Unknown})
+	defer func() {
+		if err := a.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	provider := NewGeminiWithBaseURL("fixture-key", "fixture-model", "https://fixture.invalid")
 	provider.chatClient = &http.Client{Transport: forbiddenAPILeaseTransport{t}}
 	provider.streamClient = provider.chatClient
@@ -59,7 +67,11 @@ func TestNativeGeminiAPICompetesWithAgyAPILeaseBeforeTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("API capacity occupied subscription: %v", err)
 	}
-	defer subscription.Complete(execution.Outcome{Status: execution.Unknown})
+	defer func() {
+		if err := subscription.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 }
 
 func TestBuiltinAPIAdmissionDoesNotBorrowSubscriptionIdentity(t *testing.T) {
@@ -71,7 +83,11 @@ func TestBuiltinAPIAdmissionDoesNotBorrowSubscriptionIdentity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer attempt.Complete(execution.Outcome{Status: execution.Unknown})
+			defer func() {
+				if err := attempt.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+					t.Fatal(err)
+				}
+			}()
 			_, cfg, err := execution.EnsureContext(admitted)
 			if err != nil {
 				t.Fatal(err)

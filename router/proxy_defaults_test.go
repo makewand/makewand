@@ -41,7 +41,10 @@ func TestAllCLIProvidersReceiveDefaultProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := filepath.Join(dir, "fake-cli")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\n/usr/bin/env\n"), 0700); err != nil {
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\n/usr/bin/env\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(fake, 0700); err != nil {
 		t.Fatal(err)
 	}
 	old := cliBwrapLookup

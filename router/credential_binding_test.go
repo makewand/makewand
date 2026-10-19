@@ -34,12 +34,20 @@ func TestLoginSwitchAfterAdmissionCannotLaunchOtherAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer full.Complete(execution.Outcome{Status: execution.Unknown})
+	defer func() {
+		if err := full.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	ctx, a, err := reserveProvider(ctx, NewCodexCLI("fake-unused"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Complete(execution.Outcome{Status: execution.Unknown})
+	defer func() {
+		if err := a.Complete(execution.Outcome{Status: execution.Unknown}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	if err := os.WriteFile(auth, []byte(`{"tokens":{"account_id":"B"}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -172,11 +180,12 @@ func TestCredentialCopyRejectsDeletedOrInvalidAdmittedFile(t *testing.T) {
 				if err := os.Remove(path); err != nil {
 					t.Fatal(err)
 				}
-				if mutation == "directory" {
+				switch mutation {
+				case "directory":
 					if err := os.Mkdir(path, 0o700); err != nil {
 						t.Fatal(err)
 					}
-				} else if mutation == "dangling-link" {
+				case "dangling-link":
 					if err := os.Symlink(filepath.Join(root, "missing"), path); err != nil {
 						t.Skipf("symlink unavailable: %v", err)
 					}

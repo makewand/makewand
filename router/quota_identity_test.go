@@ -339,6 +339,7 @@ func TestGoQuotaSnapshotPythonReader(t *testing.T) {
 sys.path.insert(0, os.getcwd())
 from makewand.health import _get_official_subscription_quota
 q = _get_official_subscription_quota("codex")
+assert q is not None, "Go quota snapshot was not found in the Python home directory"
 assert q["percentage"] == 30, q
 assert q["identity_known"] and q["pool_ref"], q
 assert {w["window_minutes"] for w in q["windows"]} == {300, 10080, 43200}, q
@@ -346,11 +347,12 @@ assert any(w["model"] == "model-only" for w in q["windows"]), q
 print(json.dumps(q))`)
 	cmd.Dir = ".."
 	for _, item := range os.Environ() {
-		if !strings.HasPrefix(item, "HOME=") && !strings.HasPrefix(item, "CODEX_HOME=") {
+		key, _, _ := strings.Cut(item, "=")
+		if !strings.EqualFold(key, "HOME") && !strings.EqualFold(key, "USERPROFILE") && !strings.EqualFold(key, "CODEX_HOME") {
 			cmd.Env = append(cmd.Env, item)
 		}
 	}
-	cmd.Env = append(cmd.Env, "HOME="+home, "CODEX_HOME="+root)
+	cmd.Env = append(cmd.Env, "HOME="+home, "USERPROFILE="+home, "CODEX_HOME="+root)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Python wire reader: %v %s", err, out)

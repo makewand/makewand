@@ -130,7 +130,11 @@ func TestR4BusyAttemptDeadlineDoesNotBecomeAccountingFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer holder.Complete(execution.Outcome{Status: execution.Passed, Known: true})
+	defer func() {
+		if err := holder.Complete(execution.Outcome{Status: execution.Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	liveAttempt, expire := context.WithCancel(caller)
 	defer expire()
 	var expiredOnBusy bool

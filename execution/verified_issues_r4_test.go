@@ -17,7 +17,11 @@ func TestR4DefaultBusyWaitLeavesDeadlineForFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer holder.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := holder.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	waitCtx, cancel := context.WithTimeout(ctx, 240*time.Millisecond)
 	defer cancel()
 	started := time.Now()
@@ -32,7 +36,11 @@ func TestR4DefaultBusyWaitLeavesDeadlineForFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fallback admission failed: %v", err)
 	}
-	defer fallback.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := fallback.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	if len(readTestLedger(t, path)["attempts"].([]any)) != 2 {
 		t.Fatal("busy admission was charged")
 	}
@@ -55,7 +63,11 @@ func TestR4CapacityFallbackInspectedOnlyAfterBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer holder.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := holder.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	if checks != 0 {
 		t.Fatal("successful admission probed fallbacks")
 	}

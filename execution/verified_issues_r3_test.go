@@ -50,7 +50,11 @@ func TestR3RealExhaustionWinsOverContendingLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := first.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	done := make(chan error, 1)
 	go func() {
 		waiter, err := Reserve(ContextWithConfig(ctx, Config{TaskID: "waiter"}), Metadata{Engine: "codex"})
@@ -68,7 +72,11 @@ func TestR3RealExhaustionWinsOverContendingLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer other.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := other.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrBudgetExhausted) {
@@ -94,7 +102,11 @@ func TestR3BusyDeadlineAndCancellation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer first.Complete(Outcome{Status: Passed, Known: true})
+			defer func() {
+				if err := first.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+					t.Fatal(err)
+				}
+			}()
 			waitCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 			defer cancel()
 			want := ErrConcurrencyBusy

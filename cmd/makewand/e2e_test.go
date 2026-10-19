@@ -411,6 +411,9 @@ func buildMakewandBinary(t *testing.T) string {
 
 	repoRoot := repoRoot(t)
 	bin := filepath.Join(t.TempDir(), "makewand")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-o", bin, "./cmd/makewand")
 	cmd.Dir = repoRoot
 	output, err := cmd.CombinedOutput()

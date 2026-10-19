@@ -1208,7 +1208,7 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	cliAfterWait(cmd)
 	runErr = errors.Join(runErr, verifyDirectCLIAccount(cmd))
 	recordCLIExit(attempt, cmd)
-	if c.jsonOutput && !(c.provider == "codex" && codexUsesReviewSubcommand(ctx)) {
+	if c.jsonOutput && (c.provider != "codex" || !codexUsesReviewSubcommand(ctx)) {
 		recordCLIOutput(attempt, capture.StdoutBytes())
 	}
 

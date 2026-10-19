@@ -657,7 +657,7 @@ func (a *Attempt) transition(release, beforeDispatch bool) error {
 			if e["id"] != a.ID {
 				continue
 			}
-			if e["status"] != "reserved" && !(release && beforeDispatch && e["status"] == "started") {
+			if e["status"] != "reserved" && (!release || !beforeDispatch || e["status"] != "started") {
 				if !release && e["status"] != "started" {
 					return fmt.Errorf("cannot start a released or settled reservation")
 				}

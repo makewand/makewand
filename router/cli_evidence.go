@@ -84,7 +84,7 @@ func collectCLIProtocol(e *execution.ProviderEvidence, raw []byte) {
 		}
 		var payloadKind string
 		_ = json.Unmarshal(payload["type"], &payloadKind)
-		if kind != "rate_limits.updated" && !(kind == "event_msg" && payloadKind == "token_count") {
+		if kind != "rate_limits.updated" && (kind != "event_msg" || payloadKind != "token_count") {
 			continue
 		}
 		var stamp string

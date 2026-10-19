@@ -54,7 +54,11 @@ func TestR5StartLockTimeoutStopsHeartbeatAndRefundsReservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed Start retained scope capacity: %v", err)
 	}
-	defer next.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := next.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 }
 
 func TestR5ReleaseUnstartedKeepsRunningHeartbeat(t *testing.T) {
@@ -64,7 +68,11 @@ func TestR5ReleaseUnstartedKeepsRunningHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := a.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	if err := a.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +93,11 @@ func TestR5StartFailureCannotRefundAlreadyCommittedReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Complete(Outcome{Status: Passed, Known: true})
+	defer func() {
+		if err := a.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -100,6 +112,7 @@ func TestR5StartFailureCannotRefundAlreadyCommittedReservation(t *testing.T) {
 		stopped = true
 	default:
 	}
+	//nolint:gosec // G703: restore the test-owned ledger returned by layeredFixture(t).
 	if restoreErr := os.WriteFile(path, raw, 0600); restoreErr != nil {
 		t.Fatal(restoreErr)
 	}
@@ -137,6 +150,7 @@ func TestR5FailedSettlementStopsHeartbeat(t *testing.T) {
 				stopped = true
 			default:
 			}
+			//nolint:gosec // G703: restore the test-owned ledger returned by layeredFixture(t).
 			if restoreErr := os.WriteFile(path, raw, 0600); restoreErr != nil {
 				t.Fatal(restoreErr)
 			}
@@ -171,7 +185,11 @@ func TestR5FailedSettlementStopsHeartbeat(t *testing.T) {
 			if err != nil {
 				t.Fatalf("release did not refund scope capacity: %v", err)
 			}
-			defer next.Complete(Outcome{Status: Passed, Known: true})
+			defer func() {
+				if err := next.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+					t.Fatal(err)
+				}
+			}()
 		})
 	}
 }
@@ -236,6 +254,7 @@ func TestR5CompletionRetryOwnsOutcomeMeasurements(t *testing.T) {
 	// Complete returned. The caller may reuse its usage storage while the
 	// background cleanup must settle the original outcome.
 	tokens = 999
+	//nolint:gosec // G703: restore the test-owned ledger returned by layeredFixture(t).
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}

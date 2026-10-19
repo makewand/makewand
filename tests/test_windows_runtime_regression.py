@@ -6,6 +6,7 @@ except ImportError:
 
 import ctypes
 import json
+import ntpath
 import os
 import shutil
 import stat
@@ -18,6 +19,55 @@ from unittest import mock
 
 from makewand import config, git_helper, orchestrator, sandbox
 from makewand.artifact import workspace_snapshot
+
+
+@unittest.skipUnless(shutil.which("git"), "requires Git")
+class MetadataPathAdapterTests(unittest.TestCase):
+    def test_baseline_and_shadow_convert_metadata_paths_once(self):
+        # Model the API namespace on Linux without making pathlib choose its
+        # unavailable Windows implementation. Child paths retain the marker,
+        # just as a real Win32 API path retains its extended prefix.
+        class APIPath(type(Path())):
+            pass
+
+        def api_path(path):
+            if isinstance(path, APIPath):
+                raise ValueError("Windows filesystem operations require an ordinary local drive path")
+            return APIPath(path)
+
+        windows_os = mock.Mock(wraps=os)
+        windows_os.name = "nt"
+
+        def native_metadata(callback):
+            def call(git_dir, *args, **kwargs):
+                self.assertNotIsInstance(git_dir, APIPath)
+                with mock.patch.object(git_helper, "HOST_TRANSACTION_SUPPORTED", False), \
+                     mock.patch.object(git_helper, "os", windows_os):
+                    return callback(git_dir, *args, **kwargs)
+            return call
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            (source / "answer.py").write_bytes(b"answer = 42\n")
+            shadow = Path(temporary) / "shadow"
+            with mock.patch.object(git_helper, "_fs_path", side_effect=api_path), \
+                 mock.patch.object(git_helper, "_own_repository_file", native_metadata(git_helper._own_repository_file)), \
+                 mock.patch.object(git_helper, "_own_repository_directory", native_metadata(git_helper._own_repository_directory)), \
+                 mock.patch.object(git_helper, "write_repository_file", native_metadata(git_helper.write_repository_file)):
+                ok, error = git_helper.init_git_baseline(str(source), ephemeral=True)
+                self.assertTrue(ok, error)
+                git_helper.clone_isolated_worktree(str(source), shadow)
+            self.assertTrue((source / ".git" / git_helper.EPHEMERAL_GIT_MARKER).is_file())
+            self.assertTrue((shadow / ".git" / "info").is_dir())
+            self.assertEqual((shadow / "answer.py").read_bytes(), b"answer = 42\n")
+
+    def test_windows_home_ignores_home_variable(self):
+        # The Go/Python wire fixture must override USERPROFILE as well as HOME.
+        with mock.patch.dict(os.environ, {"HOME": r"C:\fixture", "USERPROFILE": r"C:\runner"}):
+            self.assertEqual(ntpath.expanduser("~/.cache/makewand"), r"C:\runner/.cache/makewand")
+            with mock.patch.dict(os.environ, {"USERPROFILE": os.environ["HOME"]}):
+                self.assertEqual(ntpath.expanduser("~/.cache/makewand"), r"C:\fixture/.cache/makewand")
 
 
 @unittest.skipUnless(shutil.which("git"), "requires Git")

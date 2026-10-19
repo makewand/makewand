@@ -34,7 +34,11 @@ func TestR3RouterFallsBackAfterBusyAdmission(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer holder.Complete(execution.Outcome{Status: execution.Passed, Known: true})
+			defer func() {
+				if err := holder.Complete(execution.Outcome{Status: execution.Passed, Known: true}); err != nil {
+					t.Fatal(err)
+				}
+			}()
 			var primaryCalls, fallbackCalls atomic.Int32
 			primary := &dispatchBudgetProvider{name: "claude", calls: &primaryCalls}
 			fallback := &dispatchBudgetProvider{name: "gemini", calls: &fallbackCalls}
