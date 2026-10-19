@@ -225,9 +225,16 @@ func TestUserNetNamespaceChecksFailClosed_DepsNet(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			env := installFakeUserNet(t, tc.opts)
 			if tc.opts.uidMap == "-" {
-				old := userNetAttachTimeout
-				userNetAttachTimeout = 500 * time.Millisecond
-				t.Cleanup(func() { userNetAttachTimeout = old })
+				// Expire only namespace validation, after the child has published
+				// its PID and empty uid_map. A short attach timer would also race
+				// shell startup and could test the wrong failure path under load.
+				old := userNetOpenNamespaces
+				userNetOpenNamespaces = func(ctx context.Context, pid, sandboxPID int) (sandboxNamespaces, error) {
+					expired, cancel := context.WithDeadline(ctx, time.Time{})
+					defer cancel()
+					return old(expired, pid, sandboxPID)
+				}
+				t.Cleanup(func() { userNetOpenNamespaces = old })
 			}
 			launch, _, _ := runFakeUserNetLaunch(t, env)
 			if launch.attached || !strings.Contains(launch.failure, tc.want) {

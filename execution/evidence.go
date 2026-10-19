@@ -84,7 +84,7 @@ func (a *Attempt) saveEvidence() error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := a.evidenceWriteContext()
 	defer cancel()
 	return withLockedFile(ctx, path, directory, func(p *accountingPath) error {
 		var value map[string]any
@@ -93,6 +93,15 @@ func (a *Attempt) saveEvidence() error {
 		}
 		return writeLedgerFile(p, value)
 	})
+}
+
+func (a *Attempt) evidenceWriteContext() (context.Context, context.CancelFunc) {
+	if a.evidenceContext != nil {
+		return context.WithCancel(a.evidenceContext)
+	}
+	// Evidence is durable accounting, not best-effort telemetry. Use the ledger
+	// settlement budget and keep caller cancellation from erasing the outcome.
+	return context.WithTimeout(context.Background(), accountingWriteTimeout)
 }
 
 // ReadEvidence rejects non-regular and oversized records. Quota consumers must
