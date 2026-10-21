@@ -409,7 +409,7 @@ func TestCLIProvider_IsAvailable_RejectsNonzeroProbe(t *testing.T) {
 }
 
 func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
-	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 10 * time.Second})
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 30 * time.Second})
 
 	p := &CLIProvider{
 		name:     "hang-cli",
@@ -425,13 +425,15 @@ func TestCLIProvider_IsAvailable_FailsWhenProbeHangs(t *testing.T) {
 		t.Fatal("IsAvailable() = true, want false when probe hangs")
 	}
 	elapsed := time.Since(start)
-	if elapsed > cliAvailProbeTimeout+2*time.Second {
+	// Cut at the probe deadline, not after the fixture's 30 s sleep; slow
+	// runners need slack beyond the deadline itself.
+	if elapsed > cliAvailProbeTimeout+15*time.Second {
 		t.Fatalf("IsAvailable() took too long: %s", elapsed)
 	}
 }
 
 func TestCLIProvider_IsAvailable_SoftPassesTimeoutForGemini(t *testing.T) {
-	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 10 * time.Second})
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Sleep: 30 * time.Second})
 
 	p := &CLIProvider{
 		name:     "gemini-cli",
@@ -447,8 +449,36 @@ func TestCLIProvider_IsAvailable_SoftPassesTimeoutForGemini(t *testing.T) {
 		t.Fatal("IsAvailable() = false, want true for gemini probe timeout soft-pass")
 	}
 	elapsed := time.Since(start)
-	if elapsed > cliAvailProbeTimeout+2*time.Second {
+	// Cut at the probe deadline, not after the fixture's 30 s sleep; slow
+	// runners need slack beyond the deadline itself.
+	if elapsed > cliAvailProbeTimeout+15*time.Second {
 		t.Fatalf("IsAvailable() took too long: %s", elapsed)
+	}
+}
+
+func TestCLIProvider_IsAvailable_DeadlineBeforeStartFollowsTimeoutPolicy(t *testing.T) {
+	// On a slow Windows runner the probe deadline passed while the process was
+	// still being started; Start then failed and gemini was reported missing
+	// instead of soft-passing like a probe that started and stalled.
+	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{})
+	for _, tc := range []struct {
+		provider string
+		want     bool
+	}{{"gemini", true}, {"custom", false}} {
+		t.Run(tc.provider, func(t *testing.T) {
+			p := &CLIProvider{
+				name:     tc.provider + "-cli",
+				binPath:  script,
+				provider: tc.provider,
+				checkCmd: func(ctx context.Context) *exec.Cmd {
+					<-ctx.Done() // setup outlives the probe deadline
+					return exec.CommandContext(ctx, script)
+				},
+			}
+			if got := p.IsAvailable(); got != tc.want {
+				t.Fatalf("IsAvailable() = %t, want %t when the deadline passes before the probe starts", got, tc.want)
+			}
+		})
 	}
 }
 
