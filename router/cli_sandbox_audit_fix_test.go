@@ -318,6 +318,9 @@ func TestAuditFix_PrivateHomeWriteBackValidation(t *testing.T) {
 		}
 		return h, hostFile, filepath.Join(privRoot, "auth.json")
 	}
+	// gosec's call graph links every func(string) string to billedModelID's
+	// factory-model call, whose argument comes from routing.json.
+	// #nosec G703 -- path is a credential file this test created under t.TempDir().
 	read := func(path string) string { data, _ := os.ReadFile(path); return string(data) }
 
 	t.Run("changed", func(t *testing.T) {
