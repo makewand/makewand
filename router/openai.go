@@ -12,9 +12,13 @@ const openaiDefaultModel = "gpt-4o"
 
 // OpenAI implements the Provider interface for OpenAI's API.
 type OpenAI struct {
-	apiKey       string
-	baseURL      string
-	model        string
+	apiKey  string
+	baseURL string
+	model   string
+	// pinModel makes every call use model, whatever model routing requests: the
+	// instance serves a model a client named (Router.withOpenAIModel), which a
+	// routing.json model table for "openai" must not replace.
+	pinModel     bool
 	chatClient   *http.Client
 	streamClient *http.Client
 	instanceCostTable
@@ -35,6 +39,9 @@ func NewOpenAIWithBaseURL(apiKey, model, baseURL string) *OpenAI {
 	if !strings.HasSuffix(baseURL, "/chat/completions") {
 		baseURL += "/chat/completions"
 	}
+	// No model ID has surrounding whitespace, though a configured value can.
+	// Case is kept: an OpenAI-compatible endpoint may match it exactly.
+	model = strings.TrimSpace(model)
 	if model == "" {
 		model = openaiDefaultModel
 	}
@@ -59,17 +66,54 @@ func (o *OpenAI) SafeForUntrustedRepo() bool { return true }
 // configured one. Stream routes, which carry no usage, are then reported and
 // billed at the model actually called.
 func (o *OpenAI) ReportedModelID(requestedModelID string) string {
-	if requestedModelID != "" {
-		return requestedModelID
+	return o.callModel(requestedModelID)
+}
+
+// callModel returns the model a call sends upstream. A "-cli" model ID names a
+// subscription CLI's own default, never an API model: the codex route's table
+// entry is "codex-cli", priced at $0, and routing requests it when the codex
+// route is served by this API because no codex CLI is installed. Such a request
+// uses the configured model, as a call routing names no model for does.
+func (o *OpenAI) callModel(requested string) string {
+	if requested != "" && !o.pinModel && !strings.HasSuffix(requested, "-cli") {
+		return requested
 	}
 	return o.model
 }
 
 type openaiRequest struct {
-	Model     string          `json:"model"`
-	Messages  []openaiMessage `json:"messages"`
-	MaxTokens int             `json:"max_tokens,omitempty"`
-	Stream    bool            `json:"stream,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []openaiMessage `json:"messages"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+}
+
+// newOpenAIRequest builds a chat-completions request whose output is capped at
+// maxTokens. OpenAI's reasoning models refuse max_tokens with a 400 and take
+// max_completion_tokens, which also counts their hidden reasoning tokens, so
+// a call still bills at most maxTokens of output. Every other model keeps
+// max_tokens, the field OpenAI-compatible endpoints accept.
+func newOpenAIRequest(model string, messages []openaiMessage, maxTokens int, stream bool) openaiRequest {
+	req := openaiRequest{Model: model, Messages: messages, Stream: stream}
+	if isOpenAIReasoningModel(model) {
+		req.MaxCompletionTokens = maxTokens
+	} else {
+		req.MaxTokens = maxTokens
+	}
+	return req
+}
+
+// isOpenAIReasoningModel reports whether model names one of OpenAI's reasoning
+// models: the o-series, GPT-5 and codex-mini (an o4-mini).
+func isOpenAIReasoningModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range []string{"o1", "o3", "o4", "gpt-5", "codex-mini"} {
+		if strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 type openaiMessage struct {
@@ -104,10 +148,8 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, ma
 }
 
 func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
-	model := o.model
-	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
-		model = requested
-	}
+	requested, _ := ModelFromContext(ctx)
+	model := o.callModel(requested)
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})
@@ -119,13 +161,7 @@ func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system
 		msgs = append(msgs, openaiMessage(m))
 	}
 
-	reqBody := openaiRequest{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: maxTokens,
-	}
-
-	body, err := marshalProviderJSON("openai", reqBody)
+	body, err := marshalProviderJSON("openai", newOpenAIRequest(model, msgs, maxTokens, false))
 	if err != nil {
 		return "", Usage{}, err
 	}
@@ -179,10 +215,8 @@ func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system stri
 }
 
 func (o *OpenAI) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
-	model := o.model
-	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
-		model = requested
-	}
+	requested, _ := ModelFromContext(ctx)
+	model := o.callModel(requested)
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})
@@ -194,14 +228,7 @@ func (o *OpenAI) chatStreamUnaccounted(ctx context.Context, messages []Message, 
 		msgs = append(msgs, openaiMessage(m))
 	}
 
-	reqBody := openaiRequest{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: maxTokens,
-		Stream:    true,
-	}
-
-	body, err := marshalProviderJSON("openai", reqBody)
+	body, err := marshalProviderJSON("openai", newOpenAIRequest(model, msgs, maxTokens, true))
 	if err != nil {
 		return nil, err
 	}

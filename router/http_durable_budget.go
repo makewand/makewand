@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -130,8 +131,9 @@ func (r *Router) httpReservationUSD(floor float64, prepared *preparedHTTPChat) f
 }
 
 // httpPriceCeiling returns the highest input and output prices ($/MTok) among
-// the models this Router's API-access providers are billed at: every model
-// routing can call through them, as the provider reports it (apiBilledModels).
+// the models this Router's API-access providers, registered or factory-built
+// (billedProviderNames), are billed at: every model routing can call through
+// them, as the provider serving the call names it (apiBilledModels).
 // It takes no provider a client pinned: a pinned request falls back to the
 // other registered providers when its own is unavailable or fails
 // (RouteProvider, chatWithFallbackCandidates) - a client asking for
@@ -144,7 +146,7 @@ func (r *Router) httpReservationUSD(floor float64, prepared *preparedHTTPChat) f
 func (r *Router) httpPriceCeiling() (costEntry, bool) {
 	var ceiling costEntry
 	found := false
-	for _, name := range r.registeredProviderNames() {
+	for _, name := range r.billedProviderNames() {
 		if r.getAccessType(name) != AccessAPI {
 			continue
 		}
@@ -158,21 +160,31 @@ func (r *Router) httpPriceCeiling() (costEntry, bool) {
 	return ceiling, found && (ceiling.Input > 0 || ceiling.Output > 0)
 }
 
-// apiBilledModels returns the models requests routed to provider name are
-// billed at, as its provider reports them (see apiBilledModelID): each tier
-// model routing requests for it - from its own model table entry or, for an
-// "<name>-api" sibling, from the base provider's entry that candidate and
-// legacy routing resolve - plus the model the provider calls on its own
-// whenever routing requests none (no table entry of its own, as for openai or
-// a pinned "-api" sibling, or an empty tier). An empty ID is an unknown model.
-func (r *Router) apiBilledModels(name string) []string {
-	provider, _ := r.getProvider(name)
-	billed := func(requestedModelID string) string {
-		if provider == nil {
-			return requestedModelID
+// billedProviderNames returns the providers a request can be billed through:
+// the registered ones and those only a factory builds, which Power ensembles
+// and build phases resolve on demand, such as the codex route of an
+// API-key-only deployment, whose table routing.json can point at a model
+// pricier than any registered provider's.
+func (r *Router) billedProviderNames() []string {
+	names := r.registeredProviderNames()
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+	for name := range r.factories {
+		if r.isProviderAllowed(name) && !slices.Contains(names, name) {
+			names = append(names, name)
 		}
-		return reportedModelID(provider, requestedModelID)
 	}
+	return names
+}
+
+// apiBilledModels returns the models requests routed to provider name are
+// billed at (billedModelID): each tier model routing requests for it - from
+// its own model table entry or, for an "<name>-api" sibling, from the base
+// provider's entry that candidate and legacy routing resolve - plus the model
+// the provider calls on its own whenever routing requests none (no table
+// entry of its own, as for openai or a pinned "-api" sibling, or an empty
+// tier). An empty ID is an unknown model.
+func (r *Router) apiBilledModels(name string) []string {
 	tables := r.routingTables()
 	models, direct := tables.modelsFor(name)
 	if !direct {
@@ -185,12 +197,49 @@ func (r *Router) apiBilledModels(name string) []string {
 			callsOwnModel = true
 			continue
 		}
-		billedModels = append(billedModels, billed(models[tier]))
+		billedModels = append(billedModels, r.billedModelID(name, models[tier]))
 	}
 	if callsOwnModel {
-		billedModels = append(billedModels, billed(""))
+		billedModels = append(billedModels, r.billedModelID(name, ""))
 	}
 	return billedModels
+}
+
+// billedModelID returns the model a call routed to provider name, requesting
+// modelID, is billed at: the model the provider execution resolves for them
+// (resolveProvider) calls, found without building one. That is the instance
+// cached for them (on this Router or, for a per-request view, its root) or the
+// registered provider execution reuses, as it reports the model
+// (reportedModelID), or else the model resolution the provider's factory
+// declared (RegisterProviderFactoryWithModel). Failing those it is modelID,
+// unless that is a "-cli" placeholder: such an ID names a subscription CLI's
+// own default, no API model, so the model the route calls is unknown ("").
+// Building the provider instead could exec a CLI or reach the network.
+func (r *Router) billedModelID(name, modelID string) string {
+	key := providerKey{name: strings.ToLower(strings.TrimSpace(name)), modelID: modelID}
+	r.providerMu.Lock()
+	provider, found := r.providerCache[key]
+	if !found {
+		provider, found = r.reusedRegisteredLocked(key)
+	}
+	factoryModel := r.factoryModels[key.name]
+	root := r.cacheRoot
+	r.providerMu.Unlock()
+	if !found && root != nil {
+		root.providerMu.Lock()
+		provider, found = root.providerCache[key]
+		root.providerMu.Unlock()
+	}
+	switch {
+	case found:
+		return reportedModelID(provider, modelID)
+	case factoryModel != nil:
+		return strings.TrimSpace(factoryModel(modelID))
+	case strings.HasSuffix(modelID, "-cli"):
+		return ""
+	default:
+		return modelID
+	}
 }
 
 // errHTTPStreamReservationExceeded is reported to clients and audit logs when a

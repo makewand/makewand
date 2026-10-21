@@ -247,7 +247,9 @@ type HTTPHandlerOptions struct {
 //   - Automatic task classification from message content
 //   - Optional provider override via the model field (provider name from /v1/models)
 //   - Provider routing via the Router's strategy tables
-//   - GET /v1/models lists available providers
+//   - GET /v1/models lists available providers and, when the OpenAI API serves
+//     OpenAI-family names (no "codex" provider registered), the OpenAI models a
+//     client can name
 //   - Optional Bearer token / scoped-token authentication (HTTPHandlerOptions).
 //     Without BearerToken or Authorizer every endpoint is UNAUTHENTICATED.
 //
@@ -450,14 +452,6 @@ func (r *Router) handleResponses(w http.ResponseWriter, req *http.Request, opt H
 		usage   Usage
 		result  RouteResult
 	)
-	if prepared.RequestedModel != "" {
-		if !containsString(prepared.Router.registeredProviderNames(), prepared.RequestedModel) {
-			auditEvent.Status = http.StatusBadRequest
-			auditEvent.Error = fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", responsesReq.Model)
-			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", responsesReq.Model))
-			return
-		}
-	}
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
 	if err == nil {
 		// A transport that reported no usage is estimated as streams are.
@@ -652,14 +646,6 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request,
 		usage   Usage
 		result  RouteResult
 	)
-	if prepared.RequestedModel != "" {
-		if !containsString(prepared.Router.registeredProviderNames(), prepared.RequestedModel) {
-			auditEvent.Status = http.StatusBadRequest
-			auditEvent.Error = fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model)
-			writeHTTPError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", chatReq.Model))
-			return
-		}
-	}
 	content, usage, result, err = prepared.Router.chatForHTTP(ctx, prepared.RequestedModel, prepared.Task, prepared.Messages, prepared.System)
 	if err == nil {
 		// A transport that reported no usage is estimated as streams are.
@@ -771,14 +757,6 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		usage  Usage
 		err    error
 	)
-	if requestedModel != "" {
-		if !containsString(activeRouter.registeredProviderNames(), requestedModel) {
-			auditEvent.Status = http.StatusBadRequest
-			auditEvent.Error = fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", requestedModel)
-			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
-			return
-		}
-	}
 	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
 		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
@@ -932,14 +910,6 @@ func (r *Router) handleResponsesStream(w http.ResponseWriter, req *http.Request,
 		usage  Usage
 		err    error
 	)
-	if requestedModel != "" {
-		if !containsString(activeRouter.registeredProviderNames(), requestedModel) {
-			auditEvent.Status = http.StatusBadRequest
-			auditEvent.Error = fmt.Sprintf("unknown model %q; use GET /v1/models to discover supported provider names", requestedModel)
-			writeHTTPError(w, http.StatusBadRequest, "invalid_request", auditEvent.Error)
-			return
-		}
-	}
 	stream, result, usage, err = activeRouter.streamForHTTP(ctx, requestedModel, task, messages, system)
 	if err != nil {
 		applyHTTPUsage(grant, usage, result, auditEvent, usageEntry)
@@ -1253,7 +1223,7 @@ func (r *Router) prepareHTTPChat(chatReq httpChatRequest, grant *serverauth.Gran
 		}
 	}
 
-	requestedModel := resolveHTTPModelAlias(chatReq.Model)
+	requestedModel, upstreamModel := r.resolveHTTPModel(chatReq.Model)
 	if requestedModel != "" && !grant.AllowsProvider(requestedModel) {
 		return nil, &httpStatusError{
 			Status:  http.StatusForbidden,
@@ -1273,6 +1243,14 @@ func (r *Router) prepareHTTPChat(chatReq httpChatRequest, grant *serverauth.Gran
 	}
 	if err := grant.CheckCostBudgetAt(time.Now()); err != nil {
 		return nil, &httpStatusError{Status: http.StatusTooManyRequests, Code: "budget_exceeded", Message: err.Error()}
+	}
+	if requestedModel != "" && !containsString(activeRouter.registeredProviderNames(), requestedModel) {
+		return nil, unknownHTTPModelError(chatReq.Model)
+	}
+	if upstreamModel != "" {
+		if activeRouter, err = activeRouter.withOpenAIModel(upstreamModel); err != nil {
+			return nil, err
+		}
 	}
 
 	messages := make([]Message, 0, len(chatReq.Messages))
@@ -1379,6 +1357,17 @@ func (r *Router) handleListModelsWithGrant(w http.ResponseWriter, req *http.Requ
 			Object:  "model",
 			OwnedBy: "makewand",
 		})
+	}
+	// OpenAI model names a client can send, resolved as chat requests resolve
+	// them (deployment-wide), when this token can reach the provider serving them.
+	if openai, ok := r.openAIAliasProvider(); ok && containsString(avail, "openai") {
+		for _, model := range r.openAIAliasModels(openai) {
+			data = append(data, modelEntry{
+				ID:      model,
+				Object:  "model",
+				OwnedBy: "openai",
+			})
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

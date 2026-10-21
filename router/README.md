@@ -94,16 +94,58 @@ log.Fatal(http.ListenAndServe("127.0.0.1:8080", h))
 Endpoints:
 - `POST /v1/chat/completions` — Chat completions (`stream=true` supported)
 - `POST /v1/responses` — Responses API subset (`stream=true` supported)
-- `GET /v1/models` — List available providers
+- `GET /v1/models` — List available providers, plus the OpenAI models a client
+  can name when the OpenAI API serves them (see below)
 - `GET /health` — Health check
 
 The HTTP facade accepts a provider name from `/v1/models` in the `model` field
-to force a specific provider. It also accepts common alias families such as
-`gpt-*`, `o1*`, `o3*`, and `o4*` for Codex-backed routing, plus `claude*`,
-`gemini*`, and `codex*`. `max_tokens` and `temperature` are accepted but
-currently ignored for compatibility. `response_format` supports `json_object`
-and a pragmatic subset of `json_schema`; `tools` and `tool_choice` provide a
-basic function-calling compatibility layer. When wrapped by `makewand serve`,
+to force a specific provider. It also accepts alias families: `claude*` and
+`gemini*` select those providers, and `codex*`, `gpt-*`, `o1*`, `o3*` and
+`o4*` select the `codex` provider. An alias picks a provider, not a model; the
+provider calls its own model.
+
+When no `codex` provider is registered but the OpenAI API provider is
+(`"openai"`, a `NewOpenAI` instance), as in an API-key-only deployment such as
+the makewand Docker image, the OpenAI-family names select `"openai"` instead.
+A `gpt-*`, `o1*`, `o3*`, `o4*` or `codex-mini*` name is then sent upstream as
+the model and billed at that model's price, even when `routing.json` gives
+`openai` a model table; `codex` itself calls the configured model. The model
+must be the provider's configured model or have a price in the routing tables
+(`costs`, which `routing.json` can extend). Otherwise the request gets a 400,
+because its spend could not be budgeted. Names are matched trimmed and in any
+case, the configured model's too. A name with a price is called as its price
+entry spells it, in lower case, and a request naming the configured model
+calls it as configured when it has no price. Resolution uses the server's
+providers, not a token's allowlist, so such a token needs the `openai`
+provider. A token's allowed modes do not limit which priced model a client
+names; its cost budgets do. A `model` that nothing on the server serves gets
+the same 400 `unknown model` error whether or not the request streams.
+
+`NewOpenAI` calls Chat Completions. It caps the output of OpenAI's reasoning
+models (`o1*`, `o3*`, `o4*`, `gpt-5*`, `codex-mini*`) with
+`max_completion_tokens`, which they require and which also counts their hidden
+reasoning tokens, and every other model's with `max_tokens`, the field
+OpenAI-compatible endpoints accept. A model OpenAI serves only through the
+Responses API, such as `codex-mini-latest`, fails upstream even when priced. A
+stream's usage is estimated from the text it delivers, so the estimate leaves
+out a reasoning model's hidden reasoning tokens; a non-streamed reply reports
+the usage OpenAI bills.
+
+Each named model keeps its own provider health under `openai:<model>`. Its
+upstream errors, such as a 429 or a 404 for a model the account or endpoint
+lacks, open that model's circuit or rate-limit block only, and `openai` keeps
+serving every other request; the 503 the model's requests then get names
+`openai:<model>`. A named model is still refused while the `openai` route
+itself is blocked or its circuit is open. `GET /v1/models` lists the
+models a client can name with `owned_by: "openai"`: every priced OpenAI-family
+model, and the configured model when it is one, in lower case as names are
+matched. A configured model outside these families, such as an
+OpenAI-compatible endpoint's own, is reached as `openai`.
+
+`max_tokens` and `temperature` are accepted but currently ignored for
+compatibility. `response_format` supports `json_object` and a pragmatic
+subset of `json_schema`; `tools` and `tool_choice` provide a basic
+function-calling compatibility layer. When wrapped by `makewand serve`,
 each response also carries `X-Request-Id` for tracing and can be paired with
 the server-side usage ledger, admin APIs, embedded `/admin` console, and
 `/metrics` endpoint.
@@ -194,6 +236,32 @@ and shared with its per-request views, such as HTTP requests that carry a
 `mode` or a token provider allowlist. Each model therefore gets one provider,
 and one HTTP transport, reused across requests. Calling
 `RegisterProviderFactory` again for the same name clears that name's cache.
+
+A factory can serve a CLI provider's name through an API provider. makewand's
+`codex` factory returns `NewOpenAI` with the configured OpenAI model when no
+codex CLI is installed, and the caller should then give that name `AccessAPI`
+with `SetAccessType`. Routing still requests the name's table model, such as
+the codex table's `codex-cli`. A model ID ending in `-cli` names a CLI's own
+default, so `NewOpenAI` never sends one upstream and calls its configured model
+instead.
+
+The HTTP facade's scaled budget reservation
+(`HTTPHandlerOptions.ScaleBudgetReservation`) prices such a route before any
+request has built its provider, and it never builds one to find out, since a
+factory may run a CLI or reach the network. Declare the model the factory's
+provider calls with `RegisterProviderFactoryWithModel`, for example the
+`ReportedModelID` of the one instance the factory returns:
+
+```go
+codex := router.NewOpenAI(apiKey, model)
+r.RegisterProviderFactoryWithModel("codex", func(string) (router.Provider, error) {
+    return codex, nil
+}, codex.ReportedModelID)
+r.SetAccessType("codex", router.AccessAPI)
+```
+
+Without it, the reservation prices the model routing requests until a request
+has built the provider, and counts a `-cli` placeholder as an unpriced model.
 
 ### Untrusted Repositories (`RepoTrust`)
 

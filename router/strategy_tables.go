@@ -283,8 +283,11 @@ func (t *strategyTables) mergeOverrides(raw rawDefaults) error {
 	}
 
 	// Costs: field-level merge per model ID — a partial entry (e.g. only
-	// "input") keeps the other field's existing value.
-	for id, rc := range raw.Costs {
+	// "input") keeps the other field's existing value. Keys are stored the way
+	// costFor looks them up, so "O1" overrides o1 instead of adding a second,
+	// half-priced entry.
+	for rawID, rc := range raw.Costs {
+		id := priceKey(rawID)
 		entry := t.costs[id]
 		if rc.Input != nil {
 			entry.Input = *rc.Input
@@ -574,8 +577,31 @@ func (t *strategyTables) powerEnsembleFor(phase BuildPhase) (powerEnsemble, bool
 func (t *strategyTables) costFor(modelID string) (costEntry, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	e, ok := t.costs[modelID]
+	return t.costForLocked(modelID)
+}
+
+// costForLocked looks a model up by its price key: providers match model
+// names without regard to case (OPENAI_MODEL="O1" calls o1), so a capital or
+// padding must not bill a known model at the fallback rate.
+func (t *strategyTables) costForLocked(modelID string) (costEntry, bool) {
+	e, ok := t.costs[priceKey(modelID)]
 	return e, ok
+}
+
+// priceKey is the form every cost-table key is stored and looked up in.
+func priceKey(modelID string) string {
+	return strings.ToLower(strings.TrimSpace(modelID))
+}
+
+// pricedModels returns every model ID with a pricing entry, in no order.
+func (t *strategyTables) pricedModels() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	ids := make([]string, 0, len(t.costs))
+	for id := range t.costs {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // modelsFor returns the tier→model map for a provider. The returned map is a
@@ -663,7 +689,7 @@ func pricedDiscoveredModels(raw rawDefaults, t *strategyTables) rawDefaults {
 	costs := make(map[string]rawCost, len(raw.Costs))
 	for modelID, c := range raw.Costs {
 		if (c.Input != nil && c.Output != nil) || known(modelID) {
-			costs[modelID] = c
+			costs[priceKey(modelID)] = c
 		}
 	}
 	models := make(map[string]map[string]string, len(raw.Models))
@@ -673,7 +699,7 @@ func pricedDiscoveredModels(raw rawDefaults, t *strategyTables) rawDefaults {
 			if modelID == "" {
 				continue
 			}
-			if _, priced := costs[modelID]; !pricedProviders[prov] || priced || known(modelID) {
+			if _, priced := costs[priceKey(modelID)]; !pricedProviders[prov] || priced || known(modelID) {
 				kept[tier] = modelID
 			}
 		}
@@ -730,7 +756,7 @@ func (t *strategyTables) validateLocked() error {
 			if modelID == "" {
 				continue
 			}
-			if _, ok := t.costs[modelID]; !ok {
+			if _, ok := t.costForLocked(modelID); !ok {
 				return fmt.Errorf("modelTable[%s][%d]: model %q not in costTable", prov, tier, modelID)
 			}
 		}

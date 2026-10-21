@@ -129,7 +129,7 @@ func (cb *providerCircuitBreaker) ReleaseAdmission(provider string, ticket break
 
 func (r *Router) releaseBreakerAdmission(provider string, ticket breakerTicket) {
 	if r.breaker != nil {
-		r.breaker.ReleaseAdmission(provider, ticket)
+		r.breaker.ReleaseAdmission(r.healthKey(provider), ticket)
 	}
 }
 

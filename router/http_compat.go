@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -52,10 +54,127 @@ func resolveHTTPModelAlias(model string) string {
 		return "gemini"
 	case strings.HasPrefix(model, "codex"):
 		return "codex"
-	case strings.HasPrefix(model, "gpt-"), strings.HasPrefix(model, "o1"), strings.HasPrefix(model, "o3"), strings.HasPrefix(model, "o4"):
+	case isOpenAIModelName(model):
 		return "codex"
 	default:
 		return model
+	}
+}
+
+// isOpenAIModelName reports whether a lower-cased model field names an OpenAI
+// API model rather than the codex provider or its CLI.
+func isOpenAIModelName(model string) bool {
+	for _, prefix := range []string{"gpt-", "o1", "o3", "o4", "codex-mini"} {
+		if strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveHTTPModel maps a request's model field to the provider that serves it
+// and, when that provider is the OpenAI API serving a model the client named,
+// the model to call. OpenAI-family names select the codex provider. Without a
+// registered "codex" (an API-key-only deployment, where the model factory also
+// serves Power mode's codex route through the API) they select "openai"
+// instead, and a named OpenAI model is called as named; "codex" itself keeps
+// the configured model. Resolution uses the deployment's providers, not a
+// token's allowlist, so a name means the same provider for every client.
+func (r *Router) resolveHTTPModel(model string) (provider, upstreamModel string) {
+	provider = resolveHTTPModelAlias(model)
+	if provider != "codex" {
+		return provider, ""
+	}
+	if _, ok := r.openAIAliasProvider(); !ok {
+		return provider, ""
+	}
+	if name := strings.ToLower(strings.TrimSpace(model)); isOpenAIModelName(name) {
+		return "openai", name
+	}
+	return "openai", ""
+}
+
+// openAIAliasProvider returns the OpenAI API provider that serves OpenAI-family
+// model names: the registered "openai" when no "codex" is registered.
+func (r *Router) openAIAliasProvider() (*OpenAI, bool) {
+	names := r.registeredProviderNames()
+	if containsString(names, "codex") || !containsString(names, "openai") {
+		return nil, false
+	}
+	p, _ := r.getProvider("openai")
+	openai, ok := p.(*OpenAI)
+	return openai, ok
+}
+
+// openAIAliasModels lists the OpenAI models a client can name when openai
+// serves OpenAI-family names, in the form a request's model field resolves to
+// (resolveHTTPModel): each priced model a request naming it calls as named,
+// and the configured one. A configured model outside those families, such as
+// an OpenAI-compatible endpoint's own, is not listed; clients reach it as
+// "openai".
+func (r *Router) openAIAliasModels(openai *OpenAI) []string {
+	var models []string
+	for _, model := range append(r.routingTables().pricedModels(), strings.ToLower(strings.TrimSpace(openai.model))) {
+		if _, upstream := r.resolveHTTPModel(model); upstream == model && !slices.Contains(models, model) {
+			models = append(models, model)
+		}
+	}
+	slices.Sort(models)
+	return models
+}
+
+// withOpenAIModel returns a per-request view of r whose "openai" provider calls
+// model, so the upstream call, the route's model and every price derived from
+// it (usage, stream estimate, spend guard, reservation ceiling) name the model
+// the client asked for, whatever model a routing.json table assigns "openai".
+// The view shares r's concurrency permits, and r itself is never modified. Its
+// calls honor the openai route's open circuit and rate-limit block but record
+// their own outcomes under "openai:<model>": a model the client chose (one
+// OpenAI rate-limits on its own, or one the account or endpoint lacks) must not
+// close the route for every other request. A model other than the configured
+// one must have a price: the spend of a model the server cannot price could
+// not be budgeted. A request names the configured model as it names any model
+// (trimmed, in any case). A priced name is called as its price entry spells it,
+// and the configured model, when it has no price, as configured.
+func (r *Router) withOpenAIModel(model string) (*Router, error) {
+	p, _ := r.getProvider("openai")
+	base, ok := p.(*OpenAI)
+	if !ok {
+		return nil, unknownHTTPModelError(model)
+	}
+	if _, priced := r.routingTables().costFor(model); !priced {
+		if !strings.EqualFold(model, strings.TrimSpace(base.model)) {
+			return nil, &httpStatusError{
+				Status:  http.StatusBadRequest,
+				Code:    "invalid_request",
+				Message: fmt.Sprintf("model %q has no price on this server, so its spend cannot be budgeted; use GET /v1/models for the models it accepts", model),
+			}
+		}
+		model = strings.TrimSpace(base.model)
+	}
+	bound := &OpenAI{
+		apiKey:       base.apiKey,
+		baseURL:      base.baseURL,
+		model:        model,
+		pinModel:     true,
+		chatClient:   base.chatClient,
+		streamClient: base.streamClient,
+	}
+	view := r.cloneView()
+	if err := view.RegisterProvider("openai", bound, view.getAccessType("openai")); err != nil {
+		return nil, err
+	}
+	view.healthKeys = map[string]string{"openai": "openai:" + model}
+	return view, nil
+}
+
+// unknownHTTPModelError is the one error for a model field no provider serves,
+// streamed or not; it names the model as the client sent it.
+func unknownHTTPModelError(model string) *httpStatusError {
+	return &httpStatusError{
+		Status:  http.StatusBadRequest,
+		Code:    "invalid_request",
+		Message: fmt.Sprintf("unknown model %q; use GET /v1/models for the provider names and models this server accepts", model),
 	}
 }
 

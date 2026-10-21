@@ -256,15 +256,34 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 		})
 	}
 	if cfg.IsProviderEnabled("codex") {
-		_ = r.RegisterProviderFactory("codex", func(modelID string) (Provider, error) {
-			if cli := cfg.GetCLI("codex"); cli != nil {
+		switch cli := cfg.GetCLI("codex"); {
+		case cli != nil:
+			_ = r.RegisterProviderFactory("codex", func(string) (Provider, error) {
 				return NewCodexCLI(cli.BinPath), nil
-			}
-			if cfg.OpenAIAPIKey != "" {
-				return NewOpenAIWithBaseURL(cfg.OpenAIAPIKey, modelID, cfg.OpenAIBaseURL), nil
-			}
-			return nil, fmt.Errorf("codex not configured")
-		})
+			})
+		case cfg.OpenAIAPIKey != "":
+			// Without a codex CLI the codex route (Power generators and
+			// judges, pinned build phases) is an OpenAI API call. The codex
+			// table names only the CLI's own default, "codex-cli", which is no
+			// API model and is priced at $0, so the route calls the configured
+			// OpenAI model; the transport ignores that placeholder when routing
+			// passes it as the request model. One instance serves every model
+			// routing requests, so its ReportedModelID is the model budget
+			// reservations price the route at before any request builds it.
+			codex := NewOpenAIWithBaseURL(cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAIBaseURL)
+			_ = r.RegisterProviderFactoryWithModel("codex", func(string) (Provider, error) {
+				return codex, nil
+			}, codex.ReportedModelID)
+			// "codex" is never registered in this shape, so it would keep the
+			// zero access type (free), and spend a call does not report, such
+			// as a stream's, would go unestimated. codex_access describes the
+			// CLI, not this route.
+			r.SetAccessType("codex", AccessAPI)
+		default:
+			_ = r.RegisterProviderFactory("codex", func(string) (Provider, error) {
+				return nil, fmt.Errorf("codex not configured")
+			})
+		}
 	}
 	if cfg.IsProviderEnabled("gemini") {
 		_ = r.RegisterProviderFactory("gemini", func(modelID string) (Provider, error) {

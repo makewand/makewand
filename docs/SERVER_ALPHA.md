@@ -96,6 +96,91 @@ calls hold their slot until terminal completion or cancellation. Independent
 server processes have separate provider slots; persistent currency reservations
 still coordinate their monetary admission through SQLite.
 
+### Model Names in API-Key-Only Deployments
+
+Without a codex CLI, such as in the Docker image with only `OPENAI_API_KEY`,
+Power mode's `codex` generator and judge call the configured OpenAI model
+(`OPENAI_MODEL`, default `gpt-4o`) and are billed as API calls at that model's
+price; a scaled budget reservation (`MAKEWAND_SCALED_BUDGET_RESERVATION=1`)
+also prices the route at that model, not at the `codex-cli` placeholder of its
+model table. Clients can name OpenAI models as they would on the OpenAI API:
+`gpt-*`, `o1*`, `o3*`, `o4*` and `codex-mini*` names are sent upstream as named
+and billed at that model's price, even when `routing.json` sets `models` for
+`openai`. A named model must have a price in the routing tables (the built-in
+`costs` or `costs` in `routing.json`) or be `OPENAI_MODEL`. Otherwise the
+request gets a 400, because its spend could not be budgeted. Names are matched
+trimmed and in any case, `OPENAI_MODEL` too. A name with a price is called as
+its price entry spells it, in lower case, and naming an `OPENAI_MODEL` that has
+no price calls it as configured. `codex` calls `OPENAI_MODEL`, and `openai`
+names the provider. Names the server cannot serve get the same 400 error,
+streamed or not. With a codex CLI installed, these names keep selecting the
+codex CLI, which runs its own model. A token's allowed modes do not limit which
+priced model its client names, so bound spend with the token's cost budgets.
+
+makewand calls OpenAI's Chat Completions API. Reasoning models (`o1*`, `o3*`,
+`o4*`, `gpt-5*`, `codex-mini*`) get their output cap as
+`max_completion_tokens`, which they require and which also counts their hidden
+reasoning tokens; other models get `max_tokens`, which OpenAI-compatible
+endpoints accept. Models OpenAI offers only through the Responses API, such as
+`codex-mini-latest`, fail upstream even when priced. Streamed replies are
+billed from an estimate of the text they deliver, which leaves out a reasoning
+model's hidden reasoning tokens; non-streamed replies are billed at the usage
+OpenAI reports.
+
+A named model's upstream errors stay with that model. A 429 (OpenAI rate-limits
+each model separately) or repeated 404s (a model the account or an
+OpenAI-compatible endpoint lacks) block or open the circuit for that model
+only, so requests without a model, for `openai` and for other models are still
+served. The 503 the blocked model's requests get names it as `openai:<model>`.
+Named models are also refused while the `openai` route itself is blocked or
+its circuit is open.
+
+`GET /v1/models` lists `openai` and every OpenAI model a client can name: the
+priced OpenAI-family models, and `OPENAI_MODEL` when it is one, in lower case
+as names are matched. An
+`OPENAI_MODEL` outside these families, such as the model of an
+OpenAI-compatible endpoint, is reached as `openai`.
+
+### Remote Session Storage Limits
+
+`PUT /v1/sessions/<id>` is limited per account. An account is the user,
+organization and project identity of the token, which also namespaces its
+sessions; tokens without an identity, such as `--token`, share one account. By
+default an account stores at most 1,000 sessions and 256 MiB, and no save may
+leave less than 1 GiB free on the sessions disk, which holds `state.db` by
+default:
+
+| Limit | Default | Flag / environment | Refusal |
+|---|---|---|---|
+| Sessions per account | 1000 | `--sessions-per-owner` / `MAKEWAND_SERVER_SESSIONS_PER_OWNER` | 429 |
+| Bytes per account | 256 MiB | `--session-mib-per-owner` / `MAKEWAND_SERVER_SESSION_MIB_PER_OWNER` | 413 |
+| Free space on the sessions disk | 1024 MiB | `--session-min-free-mib` / `MAKEWAND_SERVER_SESSION_MIN_FREE_MIB` | 507 |
+
+`0` removes a limit. Without the session limit, the byte limit does not bound
+how many sessions an account keeps: empty sessions add no bytes but each is a
+file, so keep the session limit where accounts are not trusted. A refusal
+writes nothing and explains itself; remote clients show the message. A 507
+does not tell the client how much space the disk has; the audit log records
+the floor and the free space. Replacing a session counts only its size
+difference, and a save that adds neither a session nor bytes is always
+allowed, so an account over a lowered limit can still update or shrink its
+sessions. The free-space floor counts the whole payload, because a
+replacement is written before the old file is removed. A save checks it before
+it waits for any lock and again under its account's lock (below), against the
+space the account's earlier saves left, so an account's concurrent saves cannot
+take the disk below the floor together. Saves of different accounts are
+checked independently, so each can still overshoot the floor by its own
+payload. The floor is not enforced on platforms other than Linux, macOS,
+FreeBSD and Windows. A single request body remains capped at 4 MiB.
+
+Each account's usage is kept in `quota-<hash>.json` beside the sessions and
+reconciled with the session files on every save, so sessions removed by hand
+stop counting. An account's saves are serialized through its own
+`.quota-<hash>.lock`, also when only the free-space floor is set, so one
+account's slow saves never hold up another's.
+Sessions saved before the limits existed count from their next save. Every
+process that shares a sessions directory should use the same limits.
+
 ### Remote Session Recovery
 
 Session saves replace complete private files atomically. Cooperating writers hold
@@ -270,6 +355,9 @@ makewand serve \
   --registration-global-limit 30      # Sign-ups from all clients per window; 0 disables the global cap
   --registration-window 1h            # Window for both registration limits
   --registration-concurrency 2        # Shared login/registration password hashes
+  --sessions-per-owner 1000           # Remote sessions per account; 0 removes the limit
+  --session-mib-per-owner 256         # MiB of remote sessions per account; 0 removes the limit
+  --session-min-free-mib 1024         # Refuse session saves below this much free disk; 0 disables
   --state-db path/to/state.db         # SQLite state DB (users, tokens, usage)
   --data-dir path/to/dir              # Session/state directory (default ~/.config/makewand/server)
   --audit-log path/to/audit.jsonl     # JSONL audit log path
@@ -291,6 +379,9 @@ Flags take precedence over these variables.
 | `MAKEWAND_SERVER_USAGE_LOG` | no `--usage-log` | `1`/`true` writes `<data-dir>/usage.jsonl`; `0`/`false`/`off`/`disabled` turns the JSONL ledger off; any other value is a path. Unset: off when the state DB is enabled, otherwise `<data-dir>/usage.jsonl` |
 | `MAKEWAND_SERVER_ALERT_WEBHOOK` | no `--alert-webhook` | URL that receives budget alert webhooks |
 | `MAKEWAND_SERVER_ALERT_STATE` | no `--alert-state` | Path of the alert delivery state. Default `<data-dir>/alert_state.json` |
+| `MAKEWAND_SERVER_SESSIONS_PER_OWNER` | no `--sessions-per-owner` | Remote sessions each account may store. Default `1000`; `0` removes the limit |
+| `MAKEWAND_SERVER_SESSION_MIB_PER_OWNER` | no `--session-mib-per-owner` | MiB of remote sessions each account may store. Default `256`; `0` removes the limit |
+| `MAKEWAND_SERVER_SESSION_MIN_FREE_MIB` | no `--session-min-free-mib` | Refuse session saves that would leave less free space (MiB) on the sessions disk. Default `1024`; `0` disables |
 | `MAKEWAND_API_POLICY` | always | `allow_paid` lets the server use provider API keys (billed); anything else, including the default `subscription_only`, ignores them. Required for API-key-only hosts such as the Docker image |
 | `MAKEWAND_CONFIG_DIR` | always | makewand config directory (default `~/.config/makewand`); `--data-dir` defaults to `<config dir>/server` |
 

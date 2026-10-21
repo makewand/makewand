@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,9 @@ func serveCmd() *cobra.Command {
 		registrationGlobal   int
 		registrationWindow   time.Duration
 		registrationSlots    int
+		sessionsPerOwner     int
+		sessionMiBPerOwner   int64
+		sessionMinFreeMiB    int64
 	)
 
 	cmd := &cobra.Command{
@@ -88,6 +92,10 @@ func serveCmd() *cobra.Command {
 				return err
 			}
 			registrationLimits, err := serveRegistrationLimits(registrationPerIP, registrationGlobal, registrationWindow, registrationSlots)
+			if err != nil {
+				return err
+			}
+			sessionQuota, err := serveSessionQuota(cmd.Flags().Changed, sessionsPerOwner, sessionMiBPerOwner, sessionMinFreeMiB)
 			if err != nil {
 				return err
 			}
@@ -167,7 +175,7 @@ func serveCmd() *cobra.Command {
 			quotaCtx, cancelQuota := context.WithCancel(cmd.Context())
 			defer cancelQuota()
 			rtr.StartQuotaRefresh(quotaCtx)
-			sessions := remotesession.NewStore(filepath.Join(dataDir, "sessions"))
+			sessions := serveSessionStore(dataDir, sessionQuota)
 			loginLimiter := serverauth.NewLoginRateLimiter(5, 15*time.Minute, 15*time.Minute)
 			loginLimiter.SetTrustedProxies(trustedProxySet)
 			registrationLimiter := serverauth.NewRegistrationRateLimiterWithLimits(registrationLimits)
@@ -432,6 +440,7 @@ func serveCmd() *cobra.Command {
 
 			fmt.Printf("makewand server listening on %s\n", listenAddr)
 			fmt.Printf("Sessions directory: %s\n", filepath.Join(dataDir, "sessions"))
+			fmt.Printf("Session limits: %s\n", describeSessionQuota(sessionQuota))
 			if auditLogger != nil {
 				fmt.Printf("Audit log: %s\n", auditPath)
 			}
@@ -492,6 +501,9 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().IntVar(&registrationGlobal, "registration-global-limit", serverauth.DefaultRegistrationGlobal, "self-registrations allowed from all clients per --registration-window; reaching it logs a warning and an audit event; 0 disables the global cap (the per-address limit still applies)")
 	cmd.Flags().DurationVar(&registrationWindow, "registration-window", serverauth.DefaultRegistrationWindow, "fixed window for the self-registration limits")
 	cmd.Flags().IntVar(&registrationSlots, "registration-concurrency", serverauth.DefaultRegistrationConcurrency, "maximum concurrent password hashes shared by login and registration (excess requests get 503)")
+	cmd.Flags().IntVar(&sessionsPerOwner, "sessions-per-owner", remotesession.DefaultMaxSessionsPerOwner, "remote sessions each account may store (an account is a token's user/organization/project identity; tokens without one share an account); 0 removes the limit, and the byte limit does not bound how many empty sessions an account keeps (env MAKEWAND_SERVER_SESSIONS_PER_OWNER)")
+	cmd.Flags().Int64Var(&sessionMiBPerOwner, "session-mib-per-owner", remotesession.DefaultMaxBytesPerOwner>>20, "MiB of remote sessions each account may store; 0 removes the limit (env MAKEWAND_SERVER_SESSION_MIB_PER_OWNER)")
+	cmd.Flags().Int64Var(&sessionMinFreeMiB, "session-min-free-mib", remotesession.DefaultMinFreeBytes>>20, "refuse remote session saves that would leave less than this many MiB free on the sessions disk, which holds the state DB by default; 0 disables the floor (env MAKEWAND_SERVER_SESSION_MIN_FREE_MIB)")
 	cmd.Flags().BoolVar(&unsafeNoTLS, "unsafe-no-tls", false, "DANGER: allow plaintext listening on non-loopback addresses (only for testing behind a reverse proxy)")
 	return cmd
 }
@@ -527,6 +539,69 @@ func serveRegistrationLimits(perIP, global int, window time.Duration, concurrenc
 		limits.MaxGlobal = -1
 	}
 	return limits, nil
+}
+
+// serveSessionQuota resolves the remote session store limits: a flag given on
+// the command line, else its MAKEWAND_SERVER_* variable, else the default. 0
+// removes a limit; negative values are rejected.
+func serveSessionQuota(changed func(string) bool, perOwner int, mibPerOwner, minFreeMiB int64) (remotesession.Quota, error) {
+	if !changed("sessions-per-owner") {
+		if raw := strings.TrimSpace(os.Getenv("MAKEWAND_SERVER_SESSIONS_PER_OWNER")); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil {
+				return remotesession.Quota{}, fmt.Errorf("MAKEWAND_SERVER_SESSIONS_PER_OWNER must be a whole number, got %q", raw)
+			}
+			perOwner = value
+		}
+	}
+	if perOwner < 0 {
+		return remotesession.Quota{}, fmt.Errorf("--sessions-per-owner must be >= 0 (0 removes the limit)")
+	}
+	mibLimit := func(flag, env string, mib int64) (int64, error) {
+		if !changed(flag) {
+			if raw := strings.TrimSpace(os.Getenv(env)); raw != "" {
+				value, err := strconv.ParseInt(raw, 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("%s must be a whole number of MiB, got %q", env, raw)
+				}
+				mib = value
+			}
+		}
+		if mib < 0 || mib > math.MaxInt64>>20 {
+			return 0, fmt.Errorf("--%s must be between 0 and %d MiB (0 removes the limit)", flag, int64(math.MaxInt64>>20))
+		}
+		return mib << 20, nil
+	}
+	maxBytes, err := mibLimit("session-mib-per-owner", "MAKEWAND_SERVER_SESSION_MIB_PER_OWNER", mibPerOwner)
+	if err != nil {
+		return remotesession.Quota{}, err
+	}
+	minFree, err := mibLimit("session-min-free-mib", "MAKEWAND_SERVER_SESSION_MIN_FREE_MIB", minFreeMiB)
+	if err != nil {
+		return remotesession.Quota{}, err
+	}
+	return remotesession.Quota{MaxSessionsPerOwner: perOwner, MaxBytesPerOwner: maxBytes, MinFreeBytes: minFree}, nil
+}
+
+// serveSessionStore opens the remote session store under dataDir, enforcing
+// quota.
+func serveSessionStore(dataDir string, quota remotesession.Quota) *remotesession.Store {
+	return remotesession.NewStoreWithQuota(filepath.Join(dataDir, "sessions"), quota)
+}
+
+// describeSessionQuota is the startup line for the session store limits.
+func describeSessionQuota(q remotesession.Quota) string {
+	sessions, size, floor := "unlimited sessions", "unlimited size", "no free-space floor"
+	if q.MaxSessionsPerOwner > 0 {
+		sessions = fmt.Sprintf("%d sessions", q.MaxSessionsPerOwner)
+	}
+	if q.MaxBytesPerOwner > 0 {
+		size = fmt.Sprintf("%d MiB", q.MaxBytesPerOwner>>20)
+	}
+	if q.MinFreeBytes > 0 {
+		floor = fmt.Sprintf("saves keep %d MiB free on the disk", q.MinFreeBytes>>20)
+	}
+	return fmt.Sprintf("%s and %s per account; %s", sessions, size, floor)
 }
 
 // registrationGlobalLimitAlert reports the first global-cap rejection of each

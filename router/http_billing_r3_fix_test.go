@@ -16,10 +16,11 @@ import (
 
 // r3Upstream is a loopback fake of the OpenAI chat-completions, Anthropic
 // messages and Gemini generateContent APIs. A stream carries no usage and
-// sends unit, perEvent times per SSE event: the request's max_tokens units
+// sends unit, perEvent times per SSE event: the request's output cap in units
 // times overrun, plus extra, or total units when set. A non-streaming reply
 // returns reply and reports usage (1000 prompt and 2000 completion tokens)
-// unless noUsage is set.
+// unless noUsage is set. Like the OpenAI API, it refuses max_tokens for a
+// reasoning model (limit).
 type r3Upstream struct {
 	*httptest.Server
 	unit     string
@@ -46,29 +47,35 @@ func newR3Upstream(t *testing.T, unit string, perEvent, overrun int) *r3Upstream
 func (u *r3Upstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Model            string `json:"model"`
-		MaxTokens        int    `json:"max_tokens"`
 		Stream           bool   `json:"stream"`
 		GenerationConfig struct {
 			MaxOutputTokens int `json:"maxOutputTokens"`
 		} `json:"generationConfig"`
+		openAIChatLimits
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	api := "openai"
+	maxTokens, refused := req.limit(req.Model)
 	if strings.HasSuffix(r.URL.Path, "/messages") {
 		api = "anthropic"
 	} else if _, rest, ok := strings.Cut(r.URL.Path, "/models/"); ok {
 		api = "gemini"
 		req.Model, _, _ = strings.Cut(rest, ":")
 		req.Stream = strings.HasSuffix(rest, ":streamGenerateContent")
-		req.MaxTokens = req.GenerationConfig.MaxOutputTokens
+		maxTokens = req.GenerationConfig.MaxOutputTokens
 	}
 	u.mu.Lock()
 	u.models = append(u.models, req.Model)
-	u.maxTokens = append(u.maxTokens, req.MaxTokens)
+	u.maxTokens = append(u.maxTokens, maxTokens)
 	u.mu.Unlock()
+	if refused != "" {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, refused)
+		return
+	}
 	if !req.Stream {
 		text, _ := json.Marshal(u.reply)
 		switch api {
@@ -94,7 +101,7 @@ func (u *r3Upstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	total := req.MaxTokens*max(1, u.overrun) + u.extra
+	total := maxTokens*max(1, u.overrun) + u.extra
 	if u.total > 0 {
 		total = u.total
 	}

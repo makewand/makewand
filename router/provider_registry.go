@@ -9,6 +9,14 @@ import (
 // This is the config-free version used by the library API.
 type ProviderFactory func(modelID string) (Provider, error)
 
+// ProviderModelFunc names, without building a provider, the model a provider
+// its factory builds for modelID calls upstream: what that provider's
+// ReportedModelID(modelID) would return, such as an OpenAI provider's
+// configured model for a "-cli" placeholder; empty when unknown. Budget
+// reservations price routes no request has built yet through it, so it must
+// not exec a CLI, reach the network or block.
+type ProviderModelFunc func(modelID string) string
+
 // RegisterProviderFactory registers or overrides a provider factory on this
 // Router. Factories are strictly per-instance, so two Routers can build the
 // same provider name from different configurations without ever affecting one
@@ -16,7 +24,20 @@ type ProviderFactory func(modelID string) (Provider, error)
 // builds are cached per (name, model) on this Router and shared with its
 // per-request views (e.g. HTTP requests carrying a mode or a provider
 // allowlist); re-registering a factory invalidates that name's cache.
+//
+// The scaled budget reservation prices a route the factory has not built an
+// instance for yet at the model routing requests, which the instance may
+// replace; a "-cli" placeholder, which names no API model, counts as an
+// unknown model. RegisterProviderFactoryWithModel declares the model instead.
 func (r *Router) RegisterProviderFactory(name string, factory ProviderFactory) error {
+	return r.RegisterProviderFactoryWithModel(name, factory, nil)
+}
+
+// RegisterProviderFactoryWithModel is RegisterProviderFactory for a factory
+// whose providers' model is known without building one (see
+// ProviderModelFunc), so a factory-built API route is priced at the model it
+// calls before any request has built it. A nil model declares none.
+func (r *Router) RegisterProviderFactoryWithModel(name string, factory ProviderFactory, model ProviderModelFunc) error {
 	name = strings.TrimSpace(strings.ToLower(name))
 	if name == "" {
 		return fmt.Errorf("provider name is empty")
@@ -30,6 +51,14 @@ func (r *Router) RegisterProviderFactory(name string, factory ProviderFactory) e
 		r.factories = make(map[string]ProviderFactory)
 	}
 	r.factories[name] = factory
+	if model != nil {
+		if r.factoryModels == nil {
+			r.factoryModels = make(map[string]ProviderModelFunc)
+		}
+		r.factoryModels[name] = model
+	} else {
+		delete(r.factoryModels, name)
+	}
 	// Drop instances cached for this name so the new factory takes effect.
 	// Per-request views resolve factory-built providers through this Router's
 	// cache, so stale entries would otherwise outlive the re-registration.

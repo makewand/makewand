@@ -1,6 +1,7 @@
 package remotesession
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -121,12 +122,13 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 		// created by one owner is never reachable by another, even if they guess
 		// the workspace ID. When the grant carries no identity (single-user or
 		// no-auth mode, and legacy operator-issued full-access tokens), the key
-		// is unchanged and existing sessions continue to resolve.
-		storageKey := scopedWorkspaceKey(sessionOwnerKey(grant), workspaceID)
+		// is unchanged and existing sessions continue to resolve. The owner is
+		// also the unit of the store's per-owner quota.
+		owner := sessionOwnerKey(grant)
 
 		switch req.Method {
 		case http.MethodGet:
-			data, err := store.Load(storageKey)
+			data, err := store.LoadForOwner(owner, workspaceID)
 			if err != nil {
 				if err == ErrNotFound {
 					event.Status = http.StatusNotFound
@@ -157,16 +159,22 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 				http.Error(w, "session payload too large", http.StatusRequestEntityTooLarge)
 				return
 			}
-			if err := store.Save(storageKey, data); err != nil {
-				event.Status = http.StatusInternalServerError
+			if err := store.SaveForOwner(owner, workspaceID, data); err != nil {
+				status := http.StatusInternalServerError
 				event.Error = err.Error()
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				var quotaErr *QuotaError
+				if errors.As(err, &quotaErr) {
+					status = quotaStatus(quotaErr.Kind)
+					event.Error = quotaErr.detail()
+				}
+				event.Status = status
+				http.Error(w, err.Error(), status)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 			event.Status = http.StatusNoContent
 		case http.MethodDelete:
-			if err := store.Delete(storageKey); err != nil {
+			if err := store.DeleteForOwner(owner, workspaceID); err != nil {
 				event.Status = http.StatusInternalServerError
 				event.Error = err.Error()
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -181,6 +189,20 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+// quotaStatus maps a refused save to its HTTP status: 429 when the account
+// keeps too many sessions, 413 when this payload would exceed its bytes, and
+// 507 when the server's disk is at its free-space floor.
+func quotaStatus(kind QuotaKind) int {
+	switch kind {
+	case QuotaSessions:
+		return http.StatusTooManyRequests
+	case QuotaBytes:
+		return http.StatusRequestEntityTooLarge
+	default:
+		return http.StatusInsufficientStorage
+	}
 }
 
 // sessionOwnerKey derives a stable per-tenant namespace from the caller's

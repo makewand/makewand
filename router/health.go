@@ -8,11 +8,45 @@ import (
 	"time"
 )
 
+// healthKey returns the key provider's call outcomes are recorded under: the
+// name itself, or the key of a model a client named (Router.healthKeys).
+func (r *Router) healthKey(provider string) string {
+	if key, ok := r.healthKeys[provider]; ok {
+		return key
+	}
+	return provider
+}
+
+// blockedDetail is circuitOpenDetail for provider's refused calls, naming what
+// refuses them: the provider's own open circuit or rate-limit block or, for
+// the calls of a model a client named, that model's key. A block of one named
+// model is then never reported, to the client or in traces, as the provider's.
+func (r *Router) blockedDetail(provider string, remaining time.Duration) string {
+	if key := r.healthKey(provider); key != provider {
+		blocked, _ := r.quotaHardBlocked(provider)
+		if !blocked && r.breaker != nil {
+			blocked, _ = r.breaker.PeekOpen(provider)
+		}
+		if !blocked {
+			provider = key
+		}
+	}
+	return circuitOpenDetail(provider, remaining)
+}
+
+// isCircuitOpen reports whether an open circuit refuses provider's calls: the
+// provider's own or, when they are recorded under another key, that key's.
 func (r *Router) isCircuitOpen(provider string) (bool, time.Duration) {
 	if r.breaker == nil {
 		return false, 0
 	}
-	return r.breaker.PeekOpen(provider)
+	if open, remaining := r.breaker.PeekOpen(provider); open {
+		return true, remaining
+	}
+	if key := r.healthKey(provider); key != provider {
+		return r.breaker.PeekOpen(key)
+	}
+	return false, 0
 }
 
 func (r *Router) beforeProviderAttempt(provider string) (bool, time.Duration) {
@@ -30,32 +64,47 @@ func (r *Router) admitProviderAttempt(provider string) (bool, time.Duration, bre
 	if blocked, until := r.quotaHardBlocked(provider); blocked {
 		return false, time.Until(until), breakerTicket{}
 	}
+	key := r.healthKey(provider)
+	if key != provider {
+		if blocked, until := r.quotaHardBlocked(key); blocked {
+			return false, time.Until(until), breakerTicket{}
+		}
+	}
 	if r.breaker == nil {
 		return true, 0, breakerTicket{}
 	}
-	return r.breaker.Admit(provider)
+	if key != provider {
+		// Calls recorded under their own key still honor the provider's open
+		// circuit, but never take its half-open probe: only the provider's own
+		// calls can close it.
+		if open, remaining := r.breaker.PeekOpen(provider); open {
+			return false, remaining, breakerTicket{}
+		}
+	}
+	return r.breaker.Admit(key)
 }
 
 func (r *Router) recordProviderSuccess(provider string, ticket breakerTicket) {
 	if r.breaker == nil {
 		return
 	}
-	r.breaker.RecordAdmittedSuccess(provider, ticket)
+	r.breaker.RecordAdmittedSuccess(r.healthKey(provider), ticket)
 }
 
 func (r *Router) recordProviderFailureForErr(provider string, callErr error) (bool, time.Time) {
+	key := r.healthKey(provider)
 	// Feed confirmed quota/rate-limit errors back to the quota layer so the pool
 	// is sealed until its window resets, not just circuit-broken for a cooldown.
-	r.noteQuotaError(provider, callErr)
+	r.noteQuotaError(key, callErr)
 	if r.breaker == nil {
 		return false, time.Time{}
 	}
 	// Timeouts are usually transient provider saturation/outage signals.
 	// Trip the breaker immediately so subsequent requests route elsewhere.
 	if isTimeoutErr(callErr) {
-		return r.breaker.RecordFailureWeighted(provider, defaultCircuitFailureThreshold)
+		return r.breaker.RecordFailureWeighted(key, defaultCircuitFailureThreshold)
 	}
-	return r.breaker.RecordFailure(provider)
+	return r.breaker.RecordFailure(key)
 }
 
 func isTimeoutErr(err error) bool {

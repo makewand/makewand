@@ -41,19 +41,10 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 		return p, nil
 	}
 
-	// Reuse explicitly registered providers when they are model-agnostic, or
-	// when no factory exists to materialize model-specific instances.
-	if existing, ok := r.providers[providerName]; ok {
-		if _, isCLI := existing.(*CLIProvider); isCLI || modelID == "" {
-			r.providerCache[key] = existing
-			r.providerMu.Unlock()
-			return existing, nil
-		}
-		if _, hasFactory := r.getFactoryLocked(providerName); !hasFactory {
-			r.providerCache[key] = existing
-			r.providerMu.Unlock()
-			return existing, nil
-		}
+	if existing, ok := r.reusedRegisteredLocked(key); ok {
+		r.providerCache[key] = existing
+		r.providerMu.Unlock()
+		return existing, nil
 	}
 
 	factory, ok := r.getFactoryLocked(providerName)
@@ -82,6 +73,23 @@ func (r *Router) resolveProvider(providerName, modelID string) (Provider, error)
 	}
 	r.providerCache[key] = p
 	return p, nil
+}
+
+// reusedRegisteredLocked returns the registered provider resolveProvider
+// reuses for key: one that is model-agnostic (a CLI), asked for no model, or
+// has no factory to build a model-specific instance. Callers hold providerMu.
+func (r *Router) reusedRegisteredLocked(key providerKey) (Provider, bool) {
+	existing, ok := r.providers[key.name]
+	if !ok {
+		return nil, false
+	}
+	if _, isCLI := existing.(*CLIProvider); isCLI || key.modelID == "" {
+		return existing, true
+	}
+	if _, hasFactory := r.getFactoryLocked(key.name); !hasFactory {
+		return existing, true
+	}
+	return nil, false
 }
 
 // resolveFactoryInstance returns this Router's cached factory-built instance

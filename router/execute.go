@@ -108,7 +108,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 	// Circuit breaker pre-check
 	allow, remaining, ticket := r.admitProviderAttempt(id.name)
 	if !allow {
-		detail := circuitOpenDetail(id.name, remaining)
+		detail := r.blockedDetail(id.name, remaining)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.fallbackSkipped,
 			Task:       ac.taskLabel,
@@ -144,7 +144,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 		if actualModelID == "" && usage.Model != "" {
 			actualModelID = usage.Model
 		}
-		r.usage.Increment(id.name)
+		r.usage.Increment(r.healthKey(id.name))
 		r.recordProviderSuccess(id.name, id.ticket)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.attemptSuccess,
@@ -196,7 +196,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 	if !providerFailure {
 		return tryProviderResult{usage: usage, route: RouteResult{Provider: id.provider, ModelID: actualModelID, Requested: ac.requested, Actual: id.name, IsFallback: id.isFallback}, err: chatErr}
 	}
-	r.usage.RecordFailure(id.name)
+	r.usage.RecordFailure(r.healthKey(id.name))
 	if opened, until := r.recordProviderFailureForErr(id.name, chatErr); opened {
 		r.emitTrace(TraceEvent{
 			Event:    "circuit_opened",
@@ -204,7 +204,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 			Phase:    ac.phaseLabel,
 			Selected: id.name,
 			ModelID:  actualModelID,
-			Detail:   circuitOpenDetail(id.name, time.Until(until)),
+			Detail:   circuitOpenDetail(r.healthKey(id.name), time.Until(until)),
 		})
 	}
 	return tryProviderResult{usage: usage, route: RouteResult{Provider: id.provider, ModelID: actualModelID, Requested: ac.requested, Actual: id.name, IsFallback: id.isFallback}, err: chatErr}
@@ -438,7 +438,7 @@ type tryStreamResult struct {
 const streamForwardTimeout = 30 * time.Second
 
 func (r *Router) recordStreamAttemptSuccess(ac *attemptContext, id attemptIdentity, start time.Time) {
-	r.usage.Increment(id.name)
+	r.usage.Increment(r.healthKey(id.name))
 	r.recordProviderSuccess(id.name, id.ticket)
 	r.emitTrace(TraceEvent{
 		Event:      ac.labels.attemptSuccess,
@@ -481,7 +481,7 @@ func (r *Router) recordStreamAttemptError(ac *attemptContext, id attemptIdentity
 	if !providerFailure {
 		return
 	}
-	r.usage.RecordFailure(id.name)
+	r.usage.RecordFailure(r.healthKey(id.name))
 	if opened, until := r.recordProviderFailureForErr(id.name, streamErr); opened {
 		r.emitTrace(TraceEvent{
 			Event:    "circuit_opened",
@@ -489,7 +489,7 @@ func (r *Router) recordStreamAttemptError(ac *attemptContext, id attemptIdentity
 			Phase:    ac.phaseLabel,
 			Selected: id.name,
 			ModelID:  id.modelID,
-			Detail:   circuitOpenDetail(id.name, time.Until(until)),
+			Detail:   circuitOpenDetail(r.healthKey(id.name), time.Until(until)),
 		})
 	}
 }
@@ -631,7 +631,7 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 	// Circuit breaker pre-check
 	allow, remaining, ticket := r.admitProviderAttempt(id.name)
 	if !allow {
-		detail := circuitOpenDetail(id.name, remaining)
+		detail := r.blockedDetail(id.name, remaining)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.fallbackSkipped,
 			Task:       ac.taskLabel,

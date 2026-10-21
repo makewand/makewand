@@ -290,6 +290,10 @@ type Router struct {
 	// factories maps provider names to per-instance factories for dynamic
 	// model-specific construction (guarded by providerMu).
 	factories map[string]ProviderFactory
+	// factoryModels holds the model resolution a factory declared
+	// (RegisterProviderFactoryWithModel), by provider name (guarded by
+	// providerMu).
+	factoryModels map[string]ProviderModelFunc
 
 	// Access types for each provider
 	accessTypes map[string]AccessType
@@ -298,6 +302,13 @@ type Router struct {
 	usage *sessionUsage
 	// Per-provider circuit breaker for transient/outage isolation.
 	breaker *providerCircuitBreaker
+	// healthKeys maps a provider name to the key its calls' outcomes (breaker,
+	// rate-limit seal, success and failure counts) are recorded under, when that
+	// is not the name itself. Only a per-request view whose provider is bound to
+	// a model the client named sets it (withOpenAIModel), so that model's
+	// failures cannot close the provider for every other request. Read-only
+	// once the view is built.
+	healthKeys map[string]string
 
 	// Usage mode (guarded by modeMu)
 	modeMu  sync.RWMutex
@@ -670,6 +681,10 @@ func (r *Router) cloneView() *Router {
 	for name, factory := range r.factories {
 		factories[name] = factory
 	}
+	factoryModels := make(map[string]ProviderModelFunc, len(r.factoryModels))
+	for name, model := range r.factoryModels {
+		factoryModels[name] = model
+	}
 	r.providerMu.Unlock()
 
 	r.mu.Lock()
@@ -699,9 +714,11 @@ func (r *Router) cloneView() *Router {
 		providerAllowlist:  cloneStringSet(r.providerAllowlist),
 		providerCache:      providerCache,
 		factories:          factories,
+		factoryModels:      factoryModels,
 		accessTypes:        accessTypes,
 		usage:              r.usage,
 		breaker:            r.breaker,
+		healthKeys:         r.healthKeys,
 		quota:              r.quota,
 		quotaPolicy:        r.quotaPolicy,
 		executionAPIPolicy: r.executionAPIPolicy,
@@ -1182,7 +1199,7 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 				Phase:     buildPhaseName(phase),
 				Requested: name,
 				Selected:  name,
-				Detail:    circuitOpenDetail(name, remaining),
+				Detail:    r.blockedDetail(name, remaining),
 			})
 		} else {
 			p, modelID, resolveErr := r.tryBuildProvider(name, bs.Tier)
@@ -1316,7 +1333,9 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 		Error:     "no provider available for build phase",
 	})
 
-	return RouteResult{}, fmt.Errorf("no provider available for build phase (requested %s)", name)
+	// A client-named model's request names its own route ("openai:o1"), so a
+	// refusal of that model is not taken for an outage of the provider.
+	return RouteResult{}, fmt.Errorf("no provider available for build phase (requested %s)", r.healthKey(name))
 }
 
 // ChatWith sends a message to a specific provider for a build phase.

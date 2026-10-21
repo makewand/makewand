@@ -19,11 +19,22 @@ var ErrNotFound = errors.New("remote session not found")
 type Store struct {
 	dir     string
 	cleaned atomic.Bool
+	quota   Quota
+	// freeSpace reports the free bytes of dir's filesystem; nil uses the
+	// platform's. Tests inject it.
+	freeSpace func(dir string) (uint64, error)
 }
 
-// NewStore creates a file-backed session store rooted at dir.
+// NewStore creates a file-backed session store rooted at dir, without limits.
 func NewStore(dir string) *Store {
-	store := &Store{dir: dir}
+	return NewStoreWithQuota(dir, Quota{})
+}
+
+// NewStoreWithQuota creates a file-backed session store rooted at dir that
+// refuses saves beyond quota. Every process sharing dir should use the same
+// quota: owner accounting is kept only by stores with per-owner limits.
+func NewStoreWithQuota(dir string, quota Quota) *Store {
+	store := &Store{dir: dir, quota: quota}
 	// Construction cannot report storage errors. Try housekeeping without
 	// waiting for another process's active writer; Save retries and reports
 	// errors if this first attempt was unavailable.
@@ -130,9 +141,25 @@ func (s *Store) pathFor(workspaceID string) (string, error) {
 	return filepath.Join(s.dir, hex.EncodeToString(sum[:])+".json"), nil
 }
 
-// Load returns the stored session blob for workspaceID.
+// sessionPath names owner's session file for workspaceID. owner is the
+// caller's tenant namespace (sessionOwnerKey); the empty owner is the unscoped
+// namespace of single-user and identity-less tokens, keyed by the bare ID.
+func (s *Store) sessionPath(owner, workspaceID string) (string, error) {
+	if strings.TrimSpace(workspaceID) == "" {
+		return "", fmt.Errorf("workspace id is empty")
+	}
+	return s.pathFor(scopedWorkspaceKey(owner, workspaceID))
+}
+
+// Load returns the stored session blob for workspaceID in the unscoped
+// namespace.
 func (s *Store) Load(workspaceID string) ([]byte, error) {
-	path, err := s.pathFor(workspaceID)
+	return s.LoadForOwner("", workspaceID)
+}
+
+// LoadForOwner returns owner's stored session blob for workspaceID.
+func (s *Store) LoadForOwner(owner, workspaceID string) ([]byte, error) {
+	path, err := s.sessionPath(owner, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -146,9 +173,15 @@ func (s *Store) Load(workspaceID string) ([]byte, error) {
 	return data, nil
 }
 
-// Save writes a session blob for workspaceID.
+// Save writes a session blob for workspaceID in the unscoped namespace.
 func (s *Store) Save(workspaceID string, data []byte) error {
-	path, err := s.pathFor(workspaceID)
+	return s.SaveForOwner("", workspaceID, data)
+}
+
+// SaveForOwner writes owner's session blob for workspaceID. A save beyond the
+// store's Quota returns a *QuotaError and changes nothing.
+func (s *Store) SaveForOwner(owner, workspaceID string, data []byte) error {
+	path, err := s.sessionPath(owner, workspaceID)
 	if err != nil {
 		return err
 	}
@@ -159,6 +192,11 @@ func (s *Store) Save(workspaceID string, data []byte) error {
 	if err := s.cleanupIfIdle(); err != nil {
 		return err
 	}
+	// A disk already below the floor refuses the save before it waits for any
+	// lock.
+	if err := s.checkFreeSpace(len(data)); err != nil {
+		return err
+	}
 	lock, err := openStoreLock(filepath.Join(s.dir, ".session.lock"))
 	if err != nil {
 		return err
@@ -167,6 +205,41 @@ func (s *Store) Save(workspaceID string, data []byte) error {
 	if err := lockStoreHandle(lock, false); err != nil {
 		return err
 	}
+	if s.quota.perOwner() || s.quota.MinFreeBytes > 0 {
+		quotaLock, err := s.lockQuota(owner)
+		if err != nil {
+			return err
+		}
+		defer quotaLock.Close()
+		var ledger []byte
+		if s.quota.perOwner() {
+			if ledger, err = s.admitSave(owner, path, len(data)); err != nil {
+				return err
+			}
+		}
+		// The check above ran before the owner's earlier saves, which this lock
+		// waited for, had written, so concurrent saves all passed it against
+		// the same free space. Check again against the space they left,
+		// counting everything this save writes, its ledger included.
+		if err := s.checkFreeSpace(len(data) + len(ledger)); err != nil {
+			return err
+		}
+		if ledger != nil {
+			// Record before publishing: an interrupted save then leaves an
+			// entry the next load repairs, never a session missing from the
+			// ledger.
+			if err := s.writeLedger(owner, ledger); err != nil {
+				return err
+			}
+		}
+	}
+	return s.publish(data, path)
+}
+
+// publish atomically replaces destination, a file in the store root, with
+// data. Callers hold the shared store lock, so Cleanup cannot reap the
+// temporary file before it is renamed.
+func (s *Store) publish(data []byte, destination string) error {
 	f, err := os.CreateTemp(s.dir, "session-*.tmp")
 	if err != nil {
 		return err
@@ -189,8 +262,8 @@ func (s *Store) Save(workspaceID string, data []byte) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	// #nosec G703 -- source is created by CreateTemp in the trusted root; destination is the SHA-256 basename returned by pathFor in that same root.
-	if err := replaceSessionFile(s.dir, tmpName, path); err != nil {
+	// #nosec G703 -- source is created by CreateTemp in the trusted root; destination is a SHA-256 basename (pathFor, ledgerPath) in that same root.
+	if err := replaceSessionFile(s.dir, tmpName, destination); err != nil {
 		// #nosec G703 -- tmpName is returned by CreateTemp in the operator-configured storage root, not supplied by a client.
 		_ = os.Remove(tmpName)
 		return err
@@ -198,9 +271,16 @@ func (s *Store) Save(workspaceID string, data []byte) error {
 	return syncStoreDirectory(s.dir)
 }
 
-// Delete removes the stored session blob for workspaceID.
+// Delete removes the stored session blob for workspaceID in the unscoped
+// namespace.
 func (s *Store) Delete(workspaceID string) error {
-	path, err := s.pathFor(workspaceID)
+	return s.DeleteForOwner("", workspaceID)
+}
+
+// DeleteForOwner removes owner's stored session blob for workspaceID. The
+// owner's quota ledger drops the session when it is next loaded.
+func (s *Store) DeleteForOwner(owner, workspaceID string) error {
+	path, err := s.sessionPath(owner, workspaceID)
 	if err != nil {
 		return err
 	}
