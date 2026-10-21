@@ -657,10 +657,16 @@ func (s *QuotaSnapshotter) freshCachedRead(src QuotaSource, disk quotaDiskCache,
 
 // quotaDiskFormat is the on-disk cache schema.
 type quotaDiskFormat struct {
-	Version   int                  `json:"version"`
-	TakenAt   time.Time            `json:"taken_at"`
-	Providers []ProviderQuota      `json:"providers"`
-	Reads     map[string]quotaRead `json:"reads,omitempty"`
+	Version   int             `json:"version"`
+	TakenAt   time.Time       `json:"taken_at"`
+	Providers []ProviderQuota `json:"providers"`
+	// Reads (freshCachedRead) are missing from a cache that a binary from
+	// before them wrote, and that binary drops them when it rewrites the cache:
+	// it keeps only the fields it decodes, under the same version. A login
+	// without a read is read again at the next refresh, as every source was
+	// before reads, so such a binary costs reads but never serves a stale or
+	// foreign entry (TestQuotaCacheWithoutReadsIsReadThroughAndRewritten).
+	Reads map[string]quotaRead `json:"reads,omitempty"`
 }
 
 // quotaDiskCache is a decoded disk cache: its entries and source reads by
