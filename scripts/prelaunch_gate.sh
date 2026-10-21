@@ -13,7 +13,13 @@ echo "[prelaunch] test gate"
 bash ./scripts/test_gate.sh
 
 echo "[prelaunch] Python, dispatch, installation contracts"
-python3 -I scripts/test_python.py
+# pytest runs the modules of module-level tests that the unittest gate cannot
+# collect. python3 -I ignores the user site: install pytest into the interpreter.
+if ! python3 -I -c 'import pytest' >/dev/null 2>&1; then
+  echo "[prelaunch] pytest is not importable by python3 -I; install it with: python3 -m pip install pytest==9.0.2" >&2
+  exit 1
+fi
+python3 -I -m pytest -q -p no:cacheprovider tests
 bash dispatch/test.sh
 python3 -I scripts/test_installation.py
 python3 -I benchmarks/test_runner.py

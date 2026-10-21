@@ -20,8 +20,16 @@ all: test
 install:
 	./scripts/install.sh
 
+# pytest runs the whole suite, including the pytest-only modules unittest cannot
+# collect. Without pytest, the unittest gate runs and fails on those modules.
 test-py:
-	python3 -I scripts/test_python.py
+	@if python3 -I -c 'import pytest' >/dev/null 2>&1; then \
+		echo 'python3 -I -m pytest -q -p no:cacheprovider tests'; \
+		python3 -I -m pytest -q -p no:cacheprovider tests; \
+	else \
+		echo 'pytest is not importable by python3 -I; the unittest gate cannot run the pytest-only modules.' >&2; \
+		python3 -I scripts/test_python.py; \
+	fi
 
 test-go:
 	go test -count=1 ./...

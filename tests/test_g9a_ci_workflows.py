@@ -21,6 +21,8 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 CI = WORKFLOWS / "ci.yml"
 RELEASE = WORKFLOWS / "release.yml"
 NORMALIZE = WORKFLOWS / "normalize-release-metadata.yml"
+PYTEST_GATE = "python3 -I -m pytest -q -p no:cacheprovider tests"
+PYTEST_PIN = re.compile(r"pip install pytest==(\d+\.\d+\.\d+)\b")
 
 
 def _read(path):
@@ -48,6 +50,13 @@ def _job_blocks(text):
     if name:
         jobs[name] = "\n".join(buf)
     return jobs
+
+
+def _job_text(path, job):
+    """The job's block; for a call of a local reusable workflow, that workflow."""
+    block = _job_blocks(_read(path))[job]
+    reusable = re.search(r"(?m)^    uses: (\./\.github/workflows/\S+)\s*$", block)
+    return _read(ROOT / reusable[1]) if reusable else block
 
 
 def _step_run(text, step_name):
@@ -127,7 +136,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertLess(install, sysctl, "sysctl must run after bubblewrap is installed")
         self.assertLess(sysctl, diag, "diagnostic must run after the sysctl fix-up")
         self.assertLess(diag, gate, "diagnostic must run before the live sandbox gate")
-        for marker in ("scripts/test_gate.sh", "scripts/test_python.py"):
+        for marker in ("scripts/test_gate.sh", PYTEST_GATE):
             self.assertLess(sysctl, text.index(marker), f"{marker} uses bwrap; fix-up must precede it")
         diag_script = _step_run(text, "Diagnose bubblewrap sandbox")
         self.assertIn("::error", diag_script)
@@ -171,6 +180,21 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("./scripts/check_secrets.sh", text)
         self.assertIn("bash scripts/test_check_secrets.sh", text)
         self.assertIn("bash scripts/check_version.sh", text)
+
+    def test_python_gates_run_the_whole_suite_under_pinned_pytest(self):
+        # eng-1021-2: unittest discovery collected nothing from the modules of
+        # module-level pytest tests (416 cases) and still passed.
+        prelaunch = _read(ROOT / "scripts" / "prelaunch_gate.sh")
+        pins = set(PYTEST_PIN.findall(prelaunch))
+        self.assertIn(PYTEST_GATE, prelaunch)
+        for path, job in ((CI, "verify"), (RELEASE, "test")):
+            with self.subTest(workflow=path.name):
+                text = _job_text(path, job)
+                self.assertRegex(text, r"(?m)^        run: " + re.escape(PYTEST_GATE) + r"\s*$")
+                self.assertNotRegex(text, r"(?m)^\s*run: .*scripts/test_python\.py")
+                pins.update(PYTEST_PIN.findall(text))
+                self.assertRegex(text, PYTEST_PIN, "pytest must be pinned")
+        self.assertEqual(len(pins), 1, f"one pytest version everywhere, found {sorted(pins)}")
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

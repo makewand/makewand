@@ -252,6 +252,8 @@ Makewand 原生设计为不仅面向人类终端开发者，更作为所有 AI �
 
 ```bash
 make test
-# 或
-python3 -m unittest discover tests
+# 只跑 Python 测试（CI 的同一条命令；需要能被 python3 -I 导入的 pytest）
+python3 -I -m pytest -q -p no:cacheprovider tests
 ```
+
+部分测试模块只有模块级的 pytest 测试函数，unittest 收集不到：`python3 -m unittest discover tests` 会静默跳过它们；只依赖标准库的 `scripts/test_python.py` 遇到这类模块会列出并以失败退出，不会静默通过。

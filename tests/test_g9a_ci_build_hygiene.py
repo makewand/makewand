@@ -46,6 +46,13 @@ class MakefileTests(unittest.TestCase):
     def test_vuln_uses_go_mod_toolchain(self):
         self.assertIn(f"GOTOOLCHAIN={_go_toolchain()} govulncheck ./...", self._dry_run("vuln"))
 
+    def test_test_py_runs_the_pytest_suite_when_pytest_is_importable(self):
+        # eng-1021-2: the unittest gate alone never ran the pytest-only modules.
+        out = self._dry_run("test-py")
+        self.assertIn("python3 -I -c 'import pytest'", out)
+        self.assertIn("python3 -I -m pytest -q -p no:cacheprovider tests", out)
+        self.assertIn("python3 -I scripts/test_python.py", out)
+
     def test_test_target_runs_release_tooling_self_tests(self):
         out = self._dry_run("test")
         self.assertIn("bash scripts/test_check_secrets.sh", out)

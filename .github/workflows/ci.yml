@@ -139,10 +139,15 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python test dependencies
-        run: pip install pytest
+        # Pinned: a new pytest release must not turn CI or a release red
+        # without a code change. Bump it deliberately (also in prelaunch_gate.sh).
+        run: python3 -m pip install pytest==9.0.2
 
-      - name: Run Python unit tests
-        run: python3 -I scripts/test_python.py
+      - name: Run Python tests
+        # pytest runs every unittest case plus the module-level pytest tests
+        # that unittest discovery cannot collect (scripts/test_python.py fails
+        # rather than skip them).
+        run: python3 -I -m pytest -q -p no:cacheprovider tests
 
       - name: Dispatch regression tests
         run: bash dispatch/test.sh
