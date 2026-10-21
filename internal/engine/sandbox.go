@@ -240,17 +240,18 @@ func verificationPlanAllowsNetwork(plan ExecPlan) bool {
 	return false
 }
 
-// execVerification runs plan inside the bubblewrap sandbox. It also returns
-// the network the command had, for a dependency install whose registry turns
-// out to be unreachable.
+// execVerification runs plan inside the bubblewrap sandbox. A dependency plan
+// is split into a networked fetch that runs no project code and a
+// loopback-only build/install that may (execDependencyPlan); every other step
+// runs loopback-only. It also returns the network the command had, for a
+// dependency install whose registry turns out to be unreachable.
 func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
 	none := sandboxNetwork{kind: sandboxNetworkNone}
-	command, args := plan.Command, plan.Args
-	if err := validateCommandName(command); err != nil {
+	if err := validateCommandName(plan.Command); err != nil {
 		return nil, none, err
 	}
-	if _, ok := restrictedAllowedCommands[command]; !ok {
-		return nil, none, fmt.Errorf("command %q is blocked by execution policy", command)
+	if _, ok := restrictedAllowedCommands[plan.Command]; !ok {
+		return nil, none, fmt.Errorf("command %q is blocked by execution policy", plan.Command)
 	}
 
 	env, err := resolveVerifyExecEnvironment(p.unsafeHostAuth)
@@ -265,58 +266,390 @@ func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly 
 	if err != nil {
 		return nil, none, err
 	}
-	// The sandbox HOME lives inside the writable workspace so dependency
-	// installs can populate tool caches that network-isolated test steps reuse.
-	if err := os.MkdirAll(filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath)), 0o700); err != nil {
-		return nil, none, fmt.Errorf("create sandbox home: %w", err)
+	if err := p.prepareSandboxHome(projectDir); err != nil {
+		return nil, none, err
 	}
 
-	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, verificationPlanAllowsNetwork(plan), readOnly)
+	if verificationPlanUsesUserNetwork(plan) {
+		return p.execDependencyPlan(ctx, env, projectDir, plan, readOnly)
+	}
+	return p.execVerificationStep(ctx, env, projectDir, plan, readOnly, false)
+}
+
+// prepareSandboxHome creates the workspace-relative sandbox HOME and turns Go
+// telemetry off there. The sandbox HOME lives inside the writable workspace so
+// a dependency fetch can populate tool caches that network-isolated steps
+// reuse.
+func (p *Project) prepareSandboxHome(projectDir string) error {
+	home := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return fmt.Errorf("create sandbox home: %w", err)
+	}
+	return disableGoTelemetry(home)
+}
+
+// disableGoTelemetry writes the mode file `go telemetry off` writes (verified
+// against go1.27) into a sandbox HOME. In its default "local" mode a sandboxed
+// go command collects counters and can spawn an upload child that writes under
+// <home>/.config/go/telemetry after the step returns; such a late write races
+// t.TempDir's RemoveAll and reddens otherwise-green runs. "off" stops the
+// collection, so no telemetry or upload.token files are ever created.
+func disableGoTelemetry(sandboxHome string) error {
+	dir := filepath.Join(sandboxHome, ".config", "go", "telemetry")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mode"), []byte("off\n"), 0o600); err != nil {
+		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+	}
+	return nil
+}
+
+// execVerificationStep runs one verification command in the sandbox. A
+// networked step is a dependency fetch: it gets outbound user-mode network and
+// runs without the host module caches or workspace secrets (it executes no
+// project code). Every other step runs loopback-only, with the host caches
+// available (it may execute project code but has no network to exfiltrate
+// anything).
+func (p *Project) execVerificationStep(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, networked bool) (*ExecResult, sandboxNetwork, error) {
+	none := sandboxNetwork{kind: sandboxNetworkNone}
+	if networked {
+		return p.execNetworkedFetch(ctx, env, projectDir, plan, readOnly)
+	}
+	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false, false)
 	if err != nil {
-		return nil, none, fmt.Errorf("verification sandbox: %w", err)
+		return nil, none, err
+	}
+	result, err := p.execSandboxed(ctx, wrappedCmd, wrappedArgs, nil)
+	return result, none, err
+}
+
+// wrapSandboxStep builds the bwrap argv for one plan and applies the per-run
+// settings (acceptance isolation, plan environment) and the go toolchain
+// precondition. noHostModuleCache and maskWorkspaceSecrets harden a networked
+// fetch (see wrapVerificationCommand).
+func (p *Project) wrapSandboxStep(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, noHostModuleCache, maskWorkspaceSecrets bool) (string, []string, error) {
+	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(env.bwrapPath, projectDir, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan), readOnly, noHostModuleCache, maskWorkspaceSecrets)
+	if err != nil {
+		return "", nil, fmt.Errorf("verification sandbox: %w", err)
 	}
 	if acceptancePolicy(ctx) != nil {
 		// Local diagnostics must not introduce undeclared cache files into the
 		// execution tree later sealed by independent acceptance.
 		settings := []string{"--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTHONPYCACHEPREFIX", "/tmp/makewand-bytecode", "--setenv", "PYTEST_ADDOPTS", "-p no:cacheprovider", "--setenv", "CARGO_TARGET_DIR", filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "cargo-target")}
-		wrappedArgs = insertBeforeCommand(wrappedArgs, len(args), settings...)
+		wrappedArgs = insertBeforeCommand(wrappedArgs, len(plan.Args), settings...)
 	}
 	for _, setting := range plan.env {
 		if key, value, ok := strings.Cut(setting, "="); ok {
-			wrappedArgs = insertBeforeCommand(wrappedArgs, len(args), "--setenv", key, value)
+			wrappedArgs = insertBeforeCommand(wrappedArgs, len(plan.Args), "--setenv", key, value)
 		}
 	}
-	if command == "go" {
+	if plan.Command == "go" {
 		// The sandbox pins GOTOOLCHAIN=local; report an unsatisfiable go.mod
 		// requirement as an environment problem instead of letting it surface
 		// as a failed (candidate-attributed) test run.
-		if err := checkSandboxGoToolchain(projectDir, verifyHomeLayout(projectDir, sandboxPathEnv()).goVersion); err != nil {
-			return nil, none, err
+		if err := checkSandboxGoToolchain(projectDir, verifyHomeLayout(projectDir, sandboxPathEnv(), false).goVersion); err != nil {
+			return "", nil, err
 		}
 	}
-	if !verificationPlanUsesUserNetwork(plan) {
-		result, err := p.execSandboxed(ctx, wrappedCmd, wrappedArgs, nil)
-		return result, none, err
+	return wrappedCmd, wrappedArgs, nil
+}
+
+// execNetworkedFetch runs a dependency fetch with outbound user-mode network.
+// The fetch runs no project code, but is still built without the host module
+// caches or workspace secrets. When the network helper is absent or cannot
+// attach, the step runs loopback-only instead - and then with the host caches,
+// which a step without outbound network may read safely.
+func (p *Project) execNetworkedFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
+	none := sandboxNetwork{kind: sandboxNetworkNone}
+	networkedCmd, networkedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, true, true)
+	if err != nil {
+		return nil, none, err
 	}
-	offlineArgs := insertBeforeCommand(wrappedArgs, len(args), offlineDependencySettings()...)
-	userNet, network := prepareUserNetwork(wrappedArgs)
+	userNet, network := prepareUserNetwork(networkedArgs)
 	if userNet == nil {
-		result, err := p.execSandboxed(ctx, wrappedCmd, offlineArgs, nil)
-		return result, network, err
+		return p.execLoopbackFetch(ctx, env, projectDir, plan, readOnly, network)
 	}
 	defer userNet.release()
-	result, err := p.execSandboxed(ctx, wrappedCmd, insertBeforeCommand(wrappedArgs, len(args), userNet.bwrapArgs()...), userNet)
+	result, err := p.execSandboxed(ctx, networkedCmd, insertBeforeCommand(networkedArgs, len(plan.Args), userNet.bwrapArgs()...), userNet)
 	if err != nil || userNet.attached {
 		return result, network, err
 	}
 	// The helper is installed but could not be attached, so the sandbox was
-	// stopped instead of running the install without the network it was
-	// meant to have (execWithPolicyLaunch). Run the step again the way an
-	// install without the helper runs: an install that needs no download
-	// still succeeds, and one that does fails fast and reports the stage that
-	// could not be set up instead of advice to install the helper.
-	result, err = p.execSandboxed(ctx, wrappedCmd, offlineArgs, nil)
-	return result, userNet.network(), err
+	// stopped instead of running the fetch without the network it was meant to
+	// have (execWithPolicyLaunch). Run it again the way a fetch without the
+	// helper runs: one that needs no download still succeeds, and one that does
+	// fails fast and reports the stage that could not be set up.
+	return p.execLoopbackFetch(ctx, env, projectDir, plan, readOnly, userNet.network())
+}
+
+// execLoopbackFetch runs a dependency fetch loopback-only, with the host caches
+// available (no outbound network to exfiltrate them) and npm's registry
+// retries disabled so a needed download fails fast.
+func (p *Project) execLoopbackFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, network sandboxNetwork) (*ExecResult, sandboxNetwork, error) {
+	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false, false)
+	if err != nil {
+		return nil, network, err
+	}
+	offlineArgs := insertBeforeCommand(wrappedArgs, len(plan.Args), offlineDependencySettings()...)
+	result, err := p.execSandboxed(ctx, wrappedCmd, offlineArgs, nil)
+	return result, network, err
+}
+
+// execDependencyPlan runs a dependency plan as the owner's 2026-10-21 decision
+// requires: only downloading uses the network. A networked fetch that runs no
+// project code (pip download of wheels only, npm --ignore-scripts, cargo fetch,
+// go mod download/tidy) fills the sandbox's own caches; a loopback-only build
+// then installs from them, running any project code (setup.py, build.rs) with
+// no network. The failed step's result and the fetch's network are returned so
+// RunVerificationPlan can classify a registry outage; a dependency that cannot
+// be fetched without running code is reported as an environment limitation,
+// not a candidate failure.
+func (p *Project) execDependencyPlan(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
+	none := sandboxNetwork{kind: sandboxNetworkNone}
+	fetch, build, cleanup, err := p.planDependencyStages(plan, projectDir)
+	if err != nil {
+		return nil, none, err
+	}
+	defer cleanup()
+
+	var fetchResult *ExecResult
+	fetchNetwork := none
+	if fetch != nil {
+		fetchResult, fetchNetwork, err = p.execVerificationStep(ctx, env, projectDir, *fetch, readOnly, true)
+		if err != nil {
+			return fetchResult, fetchNetwork, err
+		}
+		if fetchResult != nil && fetchResult.ExitCode != 0 {
+			// A fetch that looks like a registry outage is classified by
+			// RunVerificationPlan's own connectivity check from the fetch's
+			// network. Otherwise, a distribution the fetch could not get without
+			// running code is an environment limitation of fetch-only
+			// networking, never the candidate's failure.
+			if !p.dependencyOutageSuspected(plan, fetchResult) {
+				if msg := p.unfetchableDependency(plan, fetchResult); msg != "" {
+					fetchResult.Note = msg
+					return fetchResult, fetchNetwork, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, msg)
+				}
+			}
+			return fetchResult, fetchNetwork, nil
+		}
+	}
+
+	if build == nil {
+		return fetchResult, fetchNetwork, nil
+	}
+
+	buildResult, _, err := p.execVerificationStep(ctx, env, projectDir, *build, readOnly, false)
+	if err != nil {
+		return buildResult, none, err
+	}
+	if buildResult != nil && buildResult.ExitCode != 0 {
+		// The build installed from the wheelhouse only; a distribution missing
+		// there is one the fetch could not get without running code (an
+		// environment limitation), while any other failure is the candidate's.
+		if msg := p.unfetchableDependency(plan, buildResult); msg != "" {
+			buildResult.Note = msg
+			return buildResult, none, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, msg)
+		}
+	}
+	return buildResult, none, nil
+}
+
+// planDependencyStages splits a dependency plan into a networked fetch that
+// runs no project code and a loopback-only build/install that may. fetch is
+// nil when the build runs loopback-only with nothing to fetch first; build is
+// nil when the fetch is the whole step (it runs no project code). cleanup
+// removes any sandbox-private wheelhouse the fetch downloads into.
+func (p *Project) planDependencyStages(plan ExecPlan, projectDir string) (fetch, build *ExecPlan, cleanup func(), err error) {
+	noop := func() {}
+	switch plan.Command {
+	case "npm", "pnpm", "yarn":
+		// install/ci fetch packages; --ignore-scripts keeps every lifecycle
+		// script from running, so the fetch executes no project code and needs
+		// no separate build step.
+		f := plan
+		f.Args = ensureArg(plan.Args, "--ignore-scripts")
+		return &f, nil, noop, nil
+	case "go":
+		// go mod tidy/download run no project code; the offline test step reuses
+		// the sandbox module cache they fill.
+		f := plan
+		return &f, nil, noop, nil
+	case "cargo":
+		fetch, build = cargoDependencyStages(plan)
+		return fetch, build, noop, nil
+	case "pip", "pip3":
+		return p.pipDependencyStages(plan, projectDir)
+	}
+	// Any other dependency command runs as a single networked fetch. Only pip
+	// and cargo build execute project code while installing, and both are split
+	// above; no other dependency plan makewand produces does, so there is
+	// nothing to run loopback-only. A step that does get the network is still
+	// confined to public destinations (sandbox_net.go).
+	f := plan
+	return &f, nil, noop, nil
+}
+
+// cargoDependencyStages splits a cargo dependency plan: `cargo fetch` is the
+// networked download; any build step (cargo build) fetches first, then builds
+// offline from the fetched crates (so build.rs never runs with the network).
+func cargoDependencyStages(plan ExecPlan) (fetch, build *ExecPlan) {
+	if len(plan.Args) > 0 && plan.Args[0] == "fetch" {
+		f := plan
+		return &f, nil
+	}
+	fetchPlan := ExecPlan{Kind: "deps", Detector: plan.Detector, Command: "cargo", Args: []string{"fetch"}}
+	if slices.Contains(plan.Args, "--locked") || slices.Contains(plan.Args, "--frozen") {
+		fetchPlan.Args = append(fetchPlan.Args, "--locked")
+	}
+	buildPlan := plan
+	buildPlan.Args = ensureArg(plan.Args, "--offline")
+	return &fetchPlan, &buildPlan
+}
+
+// pipDependencyStages splits a `pip install` into a `pip download` of wheels
+// only (no sdist builds, so no project code runs with the network) into a
+// sandbox-private wheelhouse, then an offline `pip install --no-index
+// --find-links <wheelhouse>` that builds any local project and installs from
+// what was fetched.
+func (p *Project) pipDependencyStages(plan ExecPlan, projectDir string) (fetch, build *ExecPlan, cleanup func(), err error) {
+	noop := func() {}
+	install, ok := p.parsePipInstall(plan.Args)
+	if !ok {
+		b := plan
+		return nil, &b, noop, nil
+	}
+	wheelhouse := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "makewand-wheelhouse")
+	if err := os.MkdirAll(wheelhouse, 0o700); err != nil {
+		return nil, nil, noop, fmt.Errorf("create dependency wheelhouse: %w", err)
+	}
+	cleanup = func() { _ = os.RemoveAll(wheelhouse) }
+	fetchPlan := ExecPlan{Kind: "deps", Detector: plan.Detector, Command: plan.Command, Args: p.pipDownloadArgs(install, plan.Args, wheelhouse)}
+	buildPlan := plan
+	buildPlan.Args = pipOfflineInstallArgs(plan.Args, wheelhouse)
+	return &fetchPlan, &buildPlan, cleanup, nil
+}
+
+// pipDownloadArgs builds the `pip download` command line for a parsed install:
+// wheels only (--only-binary=:all:) into the wheelhouse, for the requirement
+// and constraint files on the command line, the named requirements given
+// there, and - for each local project the install builds - its build-system
+// requires and its statically declared dependencies (what a setup.py computes
+// at build time cannot be known without running it).
+func (p *Project) pipDownloadArgs(install pipInstall, origArgs []string, wheelhouse string) []string {
+	args := []string{"download", "--only-binary=:all:", "--no-input", "--dest", wheelhouse}
+	for i := 0; i < len(origArgs); i++ {
+		opt, value, inline := strings.Cut(origArgs[i], "=")
+		canonical := ""
+		switch opt {
+		case "-r", "--requirement":
+			canonical = "-r"
+		case "-c", "--constraint":
+			canonical = "-c"
+		default:
+			continue
+		}
+		if !inline {
+			if i+1 >= len(origArgs) {
+				continue
+			}
+			value = origArgs[i+1]
+			i++
+		}
+		args = append(args, canonical, value)
+	}
+	for _, req := range install.requirements {
+		if req.source == "the pip command line" {
+			args = append(args, req.text)
+		}
+	}
+	for _, dir := range install.projects {
+		args = append(args, p.pipBuildSystemRequires(dir)...)
+		for _, dep := range p.pipStaticDependencies(dir) {
+			args = append(args, dep.text)
+		}
+	}
+	return args
+}
+
+// pipBuildSystemRequires returns the build-system requirements pip installs
+// into an isolated build environment for the local project in dir: the
+// pyproject.toml [build-system] requires, or the PEP 518 default
+// (setuptools and wheel) when a pyproject.toml has no [build-system] table or
+// the project builds from a setup.py. The offline install needs these wheels
+// in the wheelhouse to build the project without the network.
+func (p *Project) pipBuildSystemRequires(dir string) []string {
+	if content, err := p.ReadFile(filepath.Join(dir, "pyproject.toml")); err == nil {
+		doc := parseTOML(content)
+		if value, ok := doc.value("build-system", "requires"); ok {
+			return tomlStrings(value)
+		}
+		if doc.hasTable("build-system") {
+			return nil // pip reports a [build-system] without requires during the build
+		}
+		return []string{"setuptools>=40.8.0", "wheel"}
+	}
+	if _, err := p.ReadFile(filepath.Join(dir, "setup.py")); err == nil {
+		return []string{"setuptools>=40.8.0", "wheel"}
+	}
+	return nil
+}
+
+// pipOfflineInstallArgs turns a `pip install` command line into one that
+// installs from the wheelhouse only, keeping its other arguments (--user,
+// -e ., -r, --use-pep517). Build isolation then takes its build requirements
+// from the wheelhouse too.
+func pipOfflineInstallArgs(origArgs []string, wheelhouse string) []string {
+	out := make([]string, 0, len(origArgs)+3)
+	out = append(out, origArgs[0]) // "install"
+	out = append(out, "--no-index", "--find-links", wheelhouse)
+	return append(out, origArgs[1:]...)
+}
+
+// ensureArg appends flag to args unless it is already present.
+func ensureArg(args []string, flag string) []string {
+	if slices.Contains(args, flag) {
+		return args
+	}
+	return append(slices.Clone(args), flag)
+}
+
+// dependencyOutageSuspected reports whether a failed dependency step printed a
+// package manager diagnostic that a registry could not be reached. It only
+// raises the suspicion; RunVerificationPlan's own connectivity check decides
+// the verdict.
+func (p *Project) dependencyOutageSuspected(plan ExecPlan, result *ExecResult) bool {
+	return p.registryFailureEvidence(plan, result) != ""
+}
+
+// unfetchableDependency reports, for a failed pip step, that a required
+// distribution could not be obtained as a wheel: the networked fetch downloads
+// wheels only so no project code runs with the network, and the offline
+// install reads only what was fetched. A source-only (sdist) distribution, or
+// one pip would build from a repository, therefore cannot be installed. It is
+// an environment limitation of fetch-only networking, not the candidate's
+// failure. "" when no such distribution is reported.
+func (p *Project) unfetchableDependency(plan ExecPlan, result *ExecResult) string {
+	if plan.Command != "pip" && plan.Command != "pip3" {
+		return ""
+	}
+	if name := pipMissingDistribution(result); name != "" {
+		return "no installable wheel for " + name + "; makewand downloads wheels only so no project code runs while the network is available, so a source-only or repository-built dependency cannot be installed - provide it as a wheel or install the project's dependencies outside makewand"
+	}
+	return ""
+}
+
+// pipMissingDistribution returns the first requirement pip reported it could
+// not find a distribution for, from pip's own lines (a build backend's relayed
+// output cannot forge it). "".
+func pipMissingDistribution(result *ExecResult) string {
+	for _, line := range pipOwnLines(result) {
+		if m := pipMissingDistRe.FindStringSubmatch(line); m != nil {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 // execSandboxed launches a wrapped verification command (see
@@ -520,6 +853,10 @@ var (
 	// pipNoDistributionRe matches pip's verdict for a requirement whose index
 	// page offered no usable version.
 	pipNoDistributionRe = regexp.MustCompile(`^ERROR: (?:Could not find a version that satisfies the requirement|No matching distribution found for) `)
+	// pipMissingDistRe captures the requirement pip could not find a
+	// distribution for (under --only-binary, a source-only distribution reads
+	// as none available).
+	pipMissingDistRe = regexp.MustCompile(`^ERROR: (?:Could not find a version that satisfies the requirement|No matching distribution found for) (\S+)`)
 	// pipSubprocessHeaderRe matches the header of a subprocess failure box.
 	pipSubprocessHeaderRe = regexp.MustCompile(`^× (.+) did not run successfully\.$`)
 	// pipOwnSubprocessRe matches the subprocesses that are pip itself

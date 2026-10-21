@@ -52,11 +52,12 @@ func TestSetupPyOnlyInstallRedirectsEggInfo_R3(t *testing.T) {
 	cases := []struct {
 		name     string
 		manifest []ExtractedFile
-		want     string
+		pep517   bool
+		config   string
 	}{
-		{"setup.py only", []ExtractedFile{setupPy, editable}, "pip install --user -r requirements.txt --use-pep517 | " + redirected},
-		{"setup.py and pyproject.toml", []ExtractedFile{setupPy, editable, pyproject}, "pip install --user -r requirements.txt --use-pep517 | " + redirected},
-		{"requirements only", []ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}, "pip install --user -r requirements.txt | config: none"},
+		{"setup.py only", []ExtractedFile{setupPy, editable}, true, redirected},
+		{"setup.py and pyproject.toml", []ExtractedFile{setupPy, editable, pyproject}, true, redirected},
+		{"requirements only", []ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}, false, "config: none"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,8 +84,32 @@ func TestSetupPyOnlyInstallRedirectsEggInfo_R3(t *testing.T) {
 			if report.DepsError != "" || report.IntegrityError != "" {
 				t.Fatalf("DepsError=%q IntegrityError=%q", report.DepsError, report.IntegrityError)
 			}
-			if got := strings.TrimSpace(readLog(t, log)); got != tc.want {
-				t.Fatalf("pip step: %q, want %q", got, tc.want)
+			// The install is split into a networked wheel download and an
+			// offline install from the wheelhouse; both run with the egg-info
+			// redirect in the sandbox HOME, and only the install builds.
+			lines := strings.Split(strings.TrimSpace(readLog(t, log)), "\n")
+			var fetch, install string
+			for _, line := range lines {
+				cmd, _, _ := strings.Cut(line, " | ")
+				switch {
+				case strings.HasPrefix(cmd, "pip download "):
+					fetch = line
+				case strings.HasPrefix(cmd, "pip install "):
+					install = line
+				}
+			}
+			if fetch == "" || install == "" {
+				t.Fatalf("pip steps:\n%s\nwant a wheel download and an install", strings.Join(lines, "\n"))
+			}
+			if !strings.Contains(fetch, "--only-binary=:all:") || !strings.HasSuffix(fetch, "| "+tc.config) {
+				t.Fatalf("pip download step %q, want wheels only and %q", fetch, tc.config)
+			}
+			installCmd, _, _ := strings.Cut(install, " | ")
+			if !strings.Contains(installCmd, "--no-index") || !strings.Contains(installCmd, "--find-links") || !strings.HasSuffix(install, "| "+tc.config) {
+				t.Fatalf("pip install step %q, want an offline install and %q", install, tc.config)
+			}
+			if tc.pep517 != strings.Contains(installCmd, "--use-pep517") {
+				t.Fatalf("pip install step %q, --use-pep517 want %v", installCmd, tc.pep517)
 			}
 			if report.DepsPlan == nil || slicesContainString(report.DepsPlan.Args, "--use-pep517") {
 				t.Fatalf("reported DepsPlan = %+v, want the baseline plan", report.DepsPlan)
@@ -168,9 +193,12 @@ func TestSetupPyOnlySetuptoolsWritesNoEggInfoIntoWorkspace_R3(t *testing.T) {
 		{Path: "test_f.py", Content: "from fvlegacy import f\n\ndef test_f():\n    assert f() == 1\n"},
 		{Path: "pytest.ini", Content: "[pytest]\n"},
 	}
-	// pip runs this hook before the editable build; the fake pip refuses the
-	// legacy path, which would need the egg-info in the source tree.
-	const pip = "case \" $* \" in *\" --use-pep517 \"*) ;; *) echo 'legacy setup.py develop' >&2; exit 1 ;; esac\n" +
+	// The install is split into a wheel download (fetch-only) and an offline
+	// install; the download runs no build, and the install must go through PEP
+	// 517, so the fake pip passes `download` and refuses the legacy path (no
+	// --use-pep517), which would need the egg-info in the source tree.
+	const pip = "case \"$1\" in download) exit 0 ;; esac\n" +
+		"case \" $* \" in *\" --use-pep517 \"*) ;; *) echo 'legacy setup.py develop' >&2; exit 1 ;; esac\n" +
 		"exec /usr/bin/python3 -c 'import setuptools.build_meta as b; b.__legacy__.get_requires_for_build_editable()'\n"
 	for _, mode := range []string{"sandbox", "host"} {
 		t.Run(mode, func(t *testing.T) {

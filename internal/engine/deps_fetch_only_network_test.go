@@ -1,0 +1,355 @@
+//go:build linux
+
+package engine
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/makewand/makewand/internal/trustedbin"
+)
+
+// GEC-1021-1: the dependency step is split so only downloading uses the
+// network. A networked fetch runs no project code (pip downloads wheels only,
+// npm --ignore-scripts, cargo fetch, go mod tidy/download) and is built without
+// the host module caches or workspace secrets; the build/install that may run
+// project code (pip install -e ., cargo build) runs loopback-only from what was
+// fetched. eng-1021-4: a sandboxed go step leaves no telemetry files.
+
+func planWheelhouse(projectDir string) string {
+	return filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "makewand-wheelhouse")
+}
+
+// Each ecosystem's fetch/build command lines are constructed correctly, and the
+// step that may run project code is the loopback build, never the networked
+// fetch.
+func TestDependencyStagesSplit_GEC1021(t *testing.T) {
+	t.Run("npm ensures --ignore-scripts and needs no build", func(t *testing.T) {
+		project := newNeedProject(t, "package.json", `{"name":"x"}`)
+		for _, args := range [][]string{{"install"}, {"install", "--ignore-scripts", "--no-package-lock"}} {
+			fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "npm", Args: args}, project.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleanup()
+			if build != nil {
+				t.Fatalf("npm build stage = %+v, want none (lifecycle scripts never run)", build)
+			}
+			if fetch == nil || !slices.Contains(fetch.Args, "--ignore-scripts") {
+				t.Fatalf("npm fetch = %+v, want --ignore-scripts so no project code runs", fetch)
+			}
+		}
+	})
+
+	t.Run("go mod tidy is a fetch, no build", func(t *testing.T) {
+		project := newNeedProject(t, "go.mod", "module x\n\ngo 1.22\n")
+		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "go", Args: []string{"mod", "tidy"}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cleanup()
+		if build != nil || fetch == nil || !slices.Equal(fetch.Args, []string{"mod", "tidy"}) {
+			t.Fatalf("go stages fetch=%+v build=%+v, want a lone `go mod tidy` fetch", fetch, build)
+		}
+	})
+
+	t.Run("cargo build fetches then builds offline", func(t *testing.T) {
+		project := newNeedProject(t, "Cargo.toml", "[package]\nname=\"x\"\n")
+		for _, tc := range []struct {
+			in        []string
+			wantFetch []string
+			wantBuild []string
+		}{
+			{[]string{"build"}, []string{"fetch"}, []string{"build", "--offline"}},
+			{[]string{"build", "--locked"}, []string{"fetch", "--locked"}, []string{"build", "--locked", "--offline"}},
+		} {
+			fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "cargo", Args: tc.in}, project.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleanup()
+			if fetch == nil || fetch.Command != "cargo" || !slices.Equal(fetch.Args, tc.wantFetch) {
+				t.Fatalf("cargo %v fetch = %+v, want %v", tc.in, fetch, tc.wantFetch)
+			}
+			if build == nil || !slices.Equal(build.Args, tc.wantBuild) {
+				t.Fatalf("cargo %v build = %+v, want %v (offline)", tc.in, build, tc.wantBuild)
+			}
+		}
+		// A bare `cargo fetch` (the prefetch step) is the whole fetch.
+		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "cargo", Args: []string{"fetch"}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cleanup()
+		if build != nil || fetch == nil || !slices.Equal(fetch.Args, []string{"fetch"}) {
+			t.Fatalf("cargo fetch stages fetch=%+v build=%+v, want a lone fetch", fetch, build)
+		}
+	})
+
+	t.Run("pip -r downloads wheels then installs offline", func(t *testing.T) {
+		project := newNeedProject(t, "requirements.txt", "six==1.16.0\n")
+		wh := planWheelhouse(project.Path)
+		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		wantFetch := []string{"download", "--only-binary=:all:", "--no-input", "--dest", wh, "-r", "requirements.txt"}
+		if fetch == nil || !slices.Equal(fetch.Args, wantFetch) {
+			t.Fatalf("pip -r fetch = %+v, want %v (wheels only, no sdist builds)", fetch, wantFetch)
+		}
+		wantBuild := []string{"install", "--no-index", "--find-links", wh, "--user", "-r", "requirements.txt"}
+		if build == nil || !slices.Equal(build.Args, wantBuild) {
+			t.Fatalf("pip -r build = %+v, want %v (offline, from the wheelhouse)", build, wantBuild)
+		}
+	})
+
+	t.Run("pip -e . downloads build requires and static deps", func(t *testing.T) {
+		project := newNeedProject(t, "pyproject.toml",
+			"[build-system]\nrequires = [\"hatchling>=1\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"x\"\nversion = \"0\"\ndependencies = [\"requests>=2\"]\n")
+		wh := planWheelhouse(project.Path)
+		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-e", ".", "--use-pep517"}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		wantFetch := []string{"download", "--only-binary=:all:", "--no-input", "--dest", wh, "hatchling>=1", "requests>=2"}
+		if fetch == nil || !slices.Equal(fetch.Args, wantFetch) {
+			t.Fatalf("pip -e . fetch = %+v, want %v (build requires + static deps, wheels only)", fetch, wantFetch)
+		}
+		wantBuild := []string{"install", "--no-index", "--find-links", wh, "--user", "-e", ".", "--use-pep517"}
+		if build == nil || !slices.Equal(build.Args, wantBuild) {
+			t.Fatalf("pip -e . build = %+v, want %v (offline editable build)", build, wantBuild)
+		}
+		// The wheelhouse exists while the stages run and is removed by cleanup.
+		if _, err := os.Stat(wh); err != nil {
+			t.Fatalf("wheelhouse not created: %v", err)
+		}
+		cleanup()
+		if _, err := os.Stat(wh); !os.IsNotExist(err) {
+			t.Fatalf("wheelhouse not cleaned up: %v", err)
+		}
+	})
+
+	t.Run("pyproject without build-system falls back to setuptools+wheel", func(t *testing.T) {
+		project := newNeedProject(t, "pyproject.toml", "[project]\nname = \"x\"\nversion = \"0\"\n")
+		fetch, _, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-e", "."}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if fetch == nil || !slices.Contains(fetch.Args, "setuptools>=40.8.0") || !slices.Contains(fetch.Args, "wheel") {
+			t.Fatalf("pip -e . fetch = %+v, want the PEP 518 default build requires", fetch)
+		}
+	})
+}
+
+// A networked fetch is built without the host Go module cache: it downloads
+// into the sandbox's own cache instead of reading the host's (which can hold
+// private modules). A loopback step keeps the host cache (no network to
+// exfiltrate it).
+func TestNetworkedFetchLayoutOmitsHostModuleCache_GEC1021(t *testing.T) {
+	home, pathEnv := fakeToolchainHome(t)
+	download := filepath.Join(home, "gopath", "pkg", "mod", "cache", "download")
+	stubGoEnv(t, hostGoEnv{
+		GOROOT:     filepath.Join(home, "sdk", "go1.27"),
+		GOMODCACHE: filepath.Join(home, "gopath", "pkg", "mod"),
+		GOVERSION:  "go1.27.1",
+		GOPROXY:    "https://proxy.golang.org,direct",
+	}, nil)
+	workspace := filepath.Join(home, "dev", "proj")
+
+	loopback := buildSandboxHomeLayout(home, workspace, pathEnv, func(string) string { return "" }, false)
+	if !slices.Contains(roBinds(loopback.beforeWorkspace), download) {
+		t.Fatalf("loopback layout must bind the host module cache: %v", loopback.beforeWorkspace)
+	}
+	if proxy := envValue(loopback, "GOPROXY"); !strings.Contains(proxy, "file://") {
+		t.Fatalf("loopback GOPROXY = %q, want the host cache as a local proxy", proxy)
+	}
+
+	fetch := buildSandboxHomeLayout(home, workspace, pathEnv, func(string) string { return "" }, true)
+	if slices.Contains(roBinds(fetch.beforeWorkspace), download) {
+		t.Fatalf("networked fetch must not bind the host module cache: %v", fetch.beforeWorkspace)
+	}
+	if proxy := envValue(fetch, "GOPROXY"); strings.Contains(proxy, "file://") {
+		t.Fatalf("networked fetch GOPROXY = %q, want upstream only (no host cache)", proxy)
+	} else if proxy != "https://proxy.golang.org,direct" {
+		t.Fatalf("networked fetch GOPROXY = %q, want the host's upstream proxies", proxy)
+	}
+}
+
+// A networked fetch masks the workspace files isWorkspaceSecretPath marks, so a
+// fetch - even though it runs no project code - cannot read them.
+func TestNetworkedFetchMasksWorkspaceSecrets_GEC1021(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, filepath.Join(ws, ".env"), "SECRET_TOKEN=abc")
+	writeFile(t, filepath.Join(ws, "nested", ".env.local"), "K=v")
+	writeFile(t, filepath.Join(ws, ".ssh", "id_rsa"), "key")
+	writeFile(t, filepath.Join(ws, "main.go"), "package main\n")
+	writeFile(t, filepath.Join(ws, ".env.example"), "SECRET_TOKEN=")
+	// A large source tree must not exhaust the scan: only secret masks count
+	// toward the cap, not ordinary files.
+	for i := 0; i < maxSandboxSocketMasks+50; i++ {
+		writeFile(t, filepath.Join(ws, "src", "f"+strconv.Itoa(i)+".go"), "package src\n")
+	}
+
+	masks, err := sandboxWorkspaceSecretMasks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// --tmpfs takes two args, --ro-bind three.
+	masked := map[string]string{} // target -> source ("tmpfs" for a directory)
+	for i := 0; i < len(masks); {
+		switch masks[i] {
+		case "--tmpfs":
+			masked[masks[i+1]] = "tmpfs"
+			i += 2
+		case "--ro-bind":
+			masked[masks[i+2]] = masks[i+1]
+			i += 3
+		default:
+			i++
+		}
+	}
+	for _, secret := range []string{filepath.Join(ws, ".env"), filepath.Join(ws, "nested", ".env.local")} {
+		if masked[secret] != os.DevNull {
+			t.Fatalf("secret %s masked with %q, want %s", secret, masked[secret], os.DevNull)
+		}
+	}
+	if masked[filepath.Join(ws, ".ssh")] != "tmpfs" {
+		t.Fatalf(".ssh masked with %q, want a tmpfs", masked[filepath.Join(ws, ".ssh")])
+	}
+	if _, ok := masked[filepath.Join(ws, "main.go")]; ok {
+		t.Fatal("a non-secret source file must not be masked")
+	}
+	if _, ok := masked[filepath.Join(ws, ".env.example")]; ok {
+		t.Fatal(".env.example is not a secret and must not be masked")
+	}
+}
+
+// The classifier: pip reporting no installable distribution (a source-only
+// dependency the wheel-only fetch cannot get) is an environment limitation, not
+// a candidate failure, and is not mistaken for a registry outage.
+func TestUnfetchableDependencyClassification_GEC1021(t *testing.T) {
+	project := newNeedProject(t, "requirements.txt", "six\n")
+	plan := ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "-r", "requirements.txt"}}
+
+	sdistOnly := &ExecResult{ExitCode: 1, Stderr: "ERROR: Could not find a version that satisfies the requirement examplepkg (from versions: 1.0.0, 2.0.0)\nERROR: No matching distribution found for examplepkg"}
+	if msg := project.unfetchableDependency(plan, sdistOnly); msg == "" || !strings.Contains(msg, "examplepkg") || !strings.Contains(msg, "wheel") {
+		t.Fatalf("unfetchableDependency = %q, want a clear message naming examplepkg", msg)
+	}
+	if project.dependencyOutageSuspected(plan, sdistOnly) {
+		t.Fatal("a reachable index with no wheel must not be mistaken for a registry outage")
+	}
+
+	// A real outage prints a connection failure too: that stays an outage for
+	// RunVerificationPlan's connectivity check to confirm, not unfetchable.
+	outage := &ExecResult{ExitCode: 1, Stderr: pipIndexUnreachable}
+	if !project.dependencyOutageSuspected(plan, outage) {
+		t.Fatalf("an index connection failure should be suspected as an outage: %q", pipIndexUnreachable)
+	}
+
+	// A non-pip step never reports unfetchable (only pip fetches wheels).
+	if msg := project.unfetchableDependency(ExecPlan{Kind: "deps", Command: "go", Args: []string{"mod", "tidy"}}, sdistOnly); msg != "" {
+		t.Fatalf("go step unfetchableDependency = %q, want none", msg)
+	}
+}
+
+// Live: in the real sandbox, the dependency build/install runs loopback-only
+// while the fetch gets outbound network. A fake pip records, per subcommand,
+// whether it saw a default route; the download does, the install does not.
+func TestDependencyBuildStepRunsWithoutNetwork_GEC1021(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live sandbox test")
+	}
+	requireUserModeNetwork(t)
+
+	project, err := NewProject("fetch-only", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := filepath.Join(project.Path, "tools")
+	t.Setenv("PATH", tools+":/usr/bin:/bin")
+	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
+	}
+	// A fake pip that records, per subcommand, whether the sandbox had a default
+	// route (outbound network). It writes into the sandbox HOME, excluded from
+	// the workspace digest.
+	const pip = `log="$HOME/pip-net.log"
+net=no
+/bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
+echo "$1 net=$net" >> "$log"
+exit 0
+`
+	writeExecScript(t, filepath.Join(tools, "pip"), pip)
+	if err := project.WriteFiles([]ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}}); err != nil {
+		t.Fatalf("RunVerificationPlan: %v", err)
+	}
+	log := readLog(t, filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), "pip-net.log"))
+	lines := strings.Split(strings.TrimSpace(log), "\n")
+	var fetch, build string
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "download "):
+			fetch = line
+		case strings.HasPrefix(line, "install "):
+			build = line
+		}
+	}
+	if fetch != "download net=yes" {
+		t.Fatalf("fetch step: %q, want the download with outbound network\nlog:\n%s", fetch, log)
+	}
+	if build != "install net=no" {
+		t.Fatalf("build step: %q, want the install without network\nlog:\n%s", build, log)
+	}
+}
+
+// Live: a sandboxed go step leaves no telemetry counter or upload files, so
+// nothing can be written under the sandbox HOME after the step returns and race
+// t.TempDir cleanup (eng-1021-4). Only the mode file (off) remains.
+func TestSandboxedGoStepLeavesNoTelemetry_eng1021_4(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live sandbox test")
+	}
+	goSandboxForTest(t)
+	project := goForgeProject(t)
+	if _, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "tests", Command: "go", Args: []string{"test", "-json", "-count=1", "./..."}}); err != nil {
+		t.Fatalf("RunVerificationPlan: %v", err)
+	}
+	telemetry := filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), ".config", "go", "telemetry")
+	entries, err := os.ReadDir(telemetry)
+	if err != nil {
+		t.Fatalf("read sandbox telemetry dir: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != "mode" {
+			t.Fatalf("sandbox telemetry left %q behind; want telemetry off (only the mode file)", entry.Name())
+		}
+	}
+	mode, err := os.ReadFile(filepath.Join(telemetry, "mode"))
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(mode)), "off") {
+		t.Fatalf("telemetry mode = %q (err %v), want off", mode, err)
+	}
+}
+
+// requireUserModeNetwork skips when the user-mode network helper is not
+// available, since the networked-fetch distinction needs it.
+func requireUserModeNetwork(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "0")
+	t.Setenv("MAKEWAND_SANDBOX_MEMORY_MAX", "1G")
+	t.Setenv("MAKEWAND_TRUSTED_ACCEPTANCE_FILE", "")
+	if _, err := trustedbin.LookPath(userNetHelperName); err != nil {
+		t.Skipf("slirp4netns unavailable: %v", err)
+	}
+}

@@ -19,7 +19,7 @@ import (
 
 func mustWrapVerification(t *testing.T, bwrapPath, workspace, command string, args []string, allowNetwork bool, readOnly []string) (string, []string) {
 	t.Helper()
-	cmd, wrapped, err := wrapVerificationCommand(bwrapPath, workspace, command, args, allowNetwork, readOnly)
+	cmd, wrapped, err := wrapVerificationCommand(bwrapPath, workspace, command, args, allowNetwork, readOnly, false, false)
 	if err != nil {
 		t.Fatalf("wrapVerificationCommand: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestVerificationSandboxLiveSeccompActive(t *testing.T) {
 	}
 	workspace := t.TempDir()
 	p := &Project{Path: workspace}
-	command, args, err := wrapVerificationCommand(env.bwrapPath, workspace, "/bin/sh", []string{"-c", "grep '^Seccomp:' /proc/self/status"}, false, nil)
+	command, args, err := wrapVerificationCommand(env.bwrapPath, workspace, "/bin/sh", []string{"-c", "grep '^Seccomp:' /proc/self/status"}, false, nil, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestSocketMaskTruncationFailsClosed(t *testing.T) {
 		t.Fatalf("truncated scan not reported: %v", err)
 	}
 	fakeWorkingBwrap(t)
-	if _, _, err := wrapVerificationCommand("/usr/bin/bwrap", ws, "go", []string{"test"}, false, nil); !errors.Is(err, ErrSandboxSocketScan) {
+	if _, _, err := wrapVerificationCommand("/usr/bin/bwrap", ws, "go", []string{"test"}, false, nil, false, false); !errors.Is(err, ErrSandboxSocketScan) {
 		t.Fatalf("verification builder ignored truncation: %v", err)
 	}
 	fakePreviewSandbox(t)

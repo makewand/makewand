@@ -685,7 +685,10 @@ func registryProbeSelf() (string, error) {
 // dependency install gets. The executable is bound into the sandbox, which
 // hides HOME, /tmp and /mnt, where it may lie.
 func runRegistryProbeInSandbox(ctx context.Context, bwrapPath, dir, probe string, args []string) registryProbeRun {
-	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(bwrapPath, dir, probe, args, false, nil)
+	// The probe is a networked step running makewand's own code in an empty
+	// directory: no host module cache (a networked step never binds it), and no
+	// workspace secrets to mask.
+	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(bwrapPath, dir, probe, args, false, nil, true, false)
 	if err != nil {
 		return registryProbeRun{failure: "its sandbox could not be prepared: " + err.Error()}
 	}

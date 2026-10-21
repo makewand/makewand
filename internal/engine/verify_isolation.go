@@ -158,21 +158,32 @@ const sandboxHomeRelPath = ".makewand/sandbox-home"
 // network namespace, as it does for every verification step
 // (verificationPlanAllowsNetwork).
 //
+// A networked dependency fetch passes noHostModuleCache (keep the host module
+// caches out of the sandbox) and maskWorkspaceSecrets (shadow workspace files
+// isWorkspaceSecretPath marks with /dev/null), so the fetch - which runs no
+// project code - sees neither.
+//
 // The returned argv starts with `--seccomp 3` when the syscall filter applies
 // (see sandboxSeccompArgs); the launcher must supply it via
 // attachSandboxSeccomp. An incomplete workspace socket scan is an error.
-func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string) (string, []string, error) {
+func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string, noHostModuleCache, maskWorkspaceSecrets bool) (string, []string, error) {
 	workspacePath = filepath.Clean(workspacePath)
 	pathEnv := strings.TrimSpace(verifyGetenv("PATH"))
 	if pathEnv == "" {
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
 	sandboxHome := filepath.Join(workspacePath, filepath.FromSlash(sandboxHomeRelPath))
-	layout := verifyHomeLayout(workspacePath, pathEnv)
+	layout := verifyHomeLayout(workspacePath, pathEnv, noHostModuleCache)
 
 	socketMasks, err := sandboxWorkspaceSocketMasks(workspacePath)
 	if err != nil {
 		return "", nil, err
+	}
+	var secretMasks []string
+	if maskWorkspaceSecrets {
+		if secretMasks, err = sandboxWorkspaceSecretMasks(workspacePath); err != nil {
+			return "", nil, err
+		}
 	}
 
 	wrapped := append(sandboxSeccompArgs(),
@@ -205,6 +216,9 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	}
 	// Mask existing domain sockets in workspace with /dev/null (must come after readOnly binds to prevent shadowing)
 	wrapped = append(wrapped, socketMasks...)
+	// Shadow workspace secrets for a networked fetch (after the workspace bind
+	// so the bind cannot re-expose them).
+	wrapped = append(wrapped, secretMasks...)
 	wrapped = append(wrapped,
 		"--chdir", workspacePath,
 		"--clearenv",
@@ -230,11 +244,12 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 }
 
 // verifyHomeLayout resolves the sandbox HOME layout for a workspace from the
-// verification environment hooks.
-func verifyHomeLayout(workspacePath, pathEnv string) sandboxHomeLayout {
+// verification environment hooks. noHostModuleCache is threaded to
+// buildSandboxHomeLayout for a networked fetch.
+func verifyHomeLayout(workspacePath, pathEnv string, noHostModuleCache bool) sandboxHomeLayout {
 	home, err := verifyUserHome()
 	if err != nil {
 		return sandboxHomeLayout{}
 	}
-	return buildSandboxHomeLayout(home, workspacePath, pathEnv, verifyGetenv)
+	return buildSandboxHomeLayout(home, workspacePath, pathEnv, verifyGetenv, noHostModuleCache)
 }

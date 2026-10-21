@@ -217,7 +217,9 @@ func (l sandboxHomeLayout) setenvArgs() []string {
 
 // buildSandboxHomeLayout computes how the sandbox presents the host HOME for a
 // workspace. home is the host HOME, pathEnv the PATH the sandbox will use.
-func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string) string) sandboxHomeLayout {
+// noHostModuleCache withholds the host module caches from a networked
+// dependency fetch (see resolveSandboxToolchains).
+func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string) string, noHostModuleCache bool) sandboxHomeLayout {
 	var layout sandboxHomeLayout
 	home = strings.TrimSpace(home)
 	if home == "" || !filepath.IsAbs(home) {
@@ -229,7 +231,7 @@ func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string)
 		getenv = os.Getenv
 	}
 
-	roots, env, goVersion := resolveSandboxToolchains(home, workspace, pathEnv, getenv)
+	roots, env, goVersion := resolveSandboxToolchains(home, workspace, pathEnv, getenv, noHostModuleCache)
 	layout.env = env
 	layout.goVersion = goVersion
 
@@ -396,6 +398,65 @@ func sandboxWorkspaceSocketMasks(workspace string) ([]string, error) {
 	return out, nil
 }
 
+// ErrSandboxSecretScan reports that the workspace could not be fully scanned
+// for the secret files a networked fetch must not see. The fetch fails closed
+// rather than run with a secret left visible.
+var ErrSandboxSecretScan = errors.New("sandbox workspace secret scan incomplete")
+
+// sandboxWorkspaceSecretMasks returns bwrap arguments that shadow every
+// workspace file isWorkspaceSecretPath marks (.env, .ssh, .npmrc, ...), so a
+// networked dependency fetch cannot see them: a directory with an empty
+// tmpfs, a file with /dev/null. The fetch runs no project code, so this is
+// defence in depth; it also aligns the user-approved real-project path with
+// candidate-verification clones, which already omit these files (shouldIgnore).
+// An incomplete scan is an error wrapping ErrSandboxSecretScan: the fetch is
+// about to touch the network, so a secret left visible fails closed.
+func sandboxWorkspaceSecretMasks(workspace string) ([]string, error) {
+	var out []string
+	cleanWS := filepath.Clean(workspace)
+	count := 0
+	err := filepath.WalkDir(cleanWS, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if d != nil && d.IsDir() && path != cleanWS && errors.Is(err, fs.ErrPermission) && fsperm.UntraversableForeignDir(path) {
+				return filepath.SkipDir
+			}
+			return fmt.Errorf("%w: %s: %v", ErrSandboxSecretScan, path, err)
+		}
+		if path == cleanWS {
+			return nil
+		}
+		if shouldIgnoreSet[d.Name()] {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(cleanWS, path)
+		if relErr != nil {
+			return fmt.Errorf("%w: %s: %v", ErrSandboxSecretScan, path, relErr)
+		}
+		if !isWorkspaceSecretPath(rel) {
+			return nil
+		}
+		if count++; count > maxSandboxSocketMasks {
+			return fmt.Errorf("%w: more than %d secret paths under %s", ErrSandboxSecretScan, maxSandboxSocketMasks, cleanWS)
+		}
+		if d.IsDir() {
+			out = append(out, "--tmpfs", path)
+			return filepath.SkipDir
+		}
+		out = append(out, "--ro-bind", os.DevNull, path)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func isMaskedHostRoot(p string) bool {
 	p = filepath.Clean(p)
 	if p == "/" {
@@ -424,8 +485,10 @@ func isPathHiddenBySandbox(home, p string) bool {
 
 // resolveSandboxToolchains resolves the host toolchains the sandbox needs:
 // the read-only HOME subtrees to re-bind, extra environment, and the host Go
-// version.
-func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(string) string) ([]string, []string, string) {
+// version. noHostModuleCache keeps the host Go module cache out of a networked
+// dependency fetch (it can hold private modules, and the fetch downloads into
+// the sandbox's own cache, which the offline steps then reuse).
+func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(string) string, noHostModuleCache bool) ([]string, []string, string) {
 	candidates := map[string]struct{}{}
 	addRoot := func(root string) {
 		root = filepath.Clean(root)
@@ -477,6 +540,12 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 				addRoot(goroot)
 			}
 			goproxy, download := sandboxGoProxy(hostEnv)
+			if noHostModuleCache {
+				// A networked fetch downloads into the sandbox's own module
+				// cache; it must not read the host cache (private modules) over
+				// the network.
+				goproxy, download = sandboxGoProxyUpstream(hostEnv), ""
+			}
 			if download != "" && isPathHiddenBySandbox(home, download) {
 				addRoot(download)
 			}
@@ -645,11 +714,18 @@ func sandboxGoProxy(hostEnv hostGoEnv) (value, download string) {
 			proxies = append(proxies, "file://"+filepath.ToSlash(dir))
 		}
 	}
+	return strings.Join(append(proxies, sandboxGoProxyUpstream(hostEnv)), ","), download
+}
+
+// sandboxGoProxyUpstream returns the host's module proxies without any entry
+// that carries credentials, defaulting to proxy.golang.org and direct. It is
+// the GOPROXY of a networked fetch, which has no host module cache to read.
+func sandboxGoProxyUpstream(hostEnv hostGoEnv) string {
 	upstream := sanitizeGoProxyList(hostEnv.GOPROXY)
 	if upstream == "" {
 		upstream = "https://proxy.golang.org,direct"
 	}
-	return strings.Join(append(proxies, upstream), ","), download
+	return upstream
 }
 
 // goProxySpec is one entry of a GOPROXY list as the go command reads it

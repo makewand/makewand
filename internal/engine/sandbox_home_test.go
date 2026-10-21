@@ -125,7 +125,7 @@ func TestSandboxHomeLayout_RebindsToolchainsReadOnlyWithoutCredentials(t *testin
 	}, nil)
 	workspace := filepath.Join(home, "dev", "proj")
 
-	layout := buildSandboxHomeLayout(home, workspace, pathEnv, func(string) string { return "" })
+	layout := buildSandboxHomeLayout(home, workspace, pathEnv, func(string) string { return "" }, false)
 	if len(layout.beforeWorkspace) < 2 || layout.beforeWorkspace[0] != "--tmpfs" || layout.beforeWorkspace[1] != home {
 		t.Fatalf("layout must start by hiding HOME: %v", layout.beforeWorkspace)
 	}
@@ -206,7 +206,7 @@ func TestSandboxHomeLayout_WorkspaceIsHomeMasksEntriesByType(t *testing.T) {
 	writeFile(t, filepath.Join(home, ".claude", ".credentials.json"), "{}")
 	// .aws deliberately missing
 
-	layout := buildSandboxHomeLayout(home, home, "/usr/bin:/bin", func(string) string { return "" })
+	layout := buildSandboxHomeLayout(home, home, "/usr/bin:/bin", func(string) string { return "" }, false)
 	if len(layout.beforeWorkspace) != 0 {
 		t.Fatalf("HOME == workspace must not tmpfs HOME before the bind: %v", layout.beforeWorkspace)
 	}
@@ -230,7 +230,7 @@ func TestSandboxHomeLayout_WorkspaceIsHomeMasksEntriesByType(t *testing.T) {
 func TestSandboxHomeLayout_MissingHomeProducesNoMounts(t *testing.T) {
 	stubGoEnv(t, hostGoEnv{}, errors.New("no go"))
 	missing := filepath.Join(t.TempDir(), "gone")
-	layout := buildSandboxHomeLayout(missing, "/tmp/ws", "/usr/bin:/bin", func(string) string { return "" })
+	layout := buildSandboxHomeLayout(missing, "/tmp/ws", "/usr/bin:/bin", func(string) string { return "" }, false)
 	if len(layout.beforeWorkspace)+len(layout.afterWorkspace) != 0 {
 		t.Fatalf("a missing HOME must not produce mounts (bwrap cannot mkdir on the read-only root): %+v", layout)
 	}

@@ -80,11 +80,22 @@ checkpoint restoration restores the prior content and supported permissions.
 On Linux, every verification step uses Bubblewrap with its own network
 namespace. Bubblewrap enables loopback inside it for local test servers; host
 loopback, host abstract sockets and the host default route remain inaccessible.
-Dependency installs, and the `cargo fetch` that runs as a dependency step before
-the checks of a Cargo manifest that declares dependencies, also get outbound-only
-`slirp4netns` networking restricted to public destinations, or run loopback-only
-without it ([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)).
-A failed install is reported as `ErrDependencyNetworkUnavailable`, an environment
+A dependency step is split so only downloading uses the network (owner decision,
+2026-10-21): a fetch that runs no project code (`pip download --only-binary=:all:`
+of the requirements and the `pyproject.toml` build-system requires, `npm`/`cargo
+fetch`, `go mod download`/`tidy`) gets outbound-only `slirp4netns` networking
+restricted to public destinations — built without the host module caches and with
+workspace secrets masked — and fills the sandbox's own caches; the build/install
+that may run project code (`setup.py`, a PEP 517 backend, `build.rs`) runs
+loopback-only from what was fetched (`pip install --no-index --find-links`,
+including `-e .`; `cargo build --offline`). Without the network tools the fetch
+runs loopback-only, keeping the host caches
+([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)). A
+dependency the fetch cannot get without running code (a source-only sdist, a
+repository-built or dynamically-computed dependency) is reported as
+`ErrDependencyNetworkUnavailable` too, an environment limitation of fetch-only
+networking rather than a candidate failure.
+A failed fetch is reported as `ErrDependencyNetworkUnavailable`, an environment
 problem rather than a candidate failure, only when makewand confirms the outage:
 with network, its own connectivity check of the ecosystem's default registry
 (for go, the sandbox's `GOPROXY` and checksum database, walked as the go command
