@@ -9,6 +9,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 路由热路径不再反复解析登录身份文件：额度来源按身份文件的路径、设备号、inode、大小与修改时间（纳秒）复用上次读取，每次 Snapshot 对每个来源只取一次身份。长期使用的 `~/.claude.json` 有数百 KB，此前每个候选要读取解析约 4 次（本机每个候选约 12 ms，现约 0.4 ms）。修改不足 2 秒的身份文件每次重读；准入与记账仍每次重读。
+- Codex 额度来源与 Python 一致，只读每个会话日志最后 4 MiB 的完整行，只解码含 `rate_limits` 或 `session_meta` 的行，并在逐行扫描中检查超时；FIFO 等非普通文件被跳过，不会卡住额度刷新。
+- 用量与审计 CSV 导出（`makewand usage --csv`、`makewand audit --csv`、管理端 `?format=csv`）给以 `=`、`+`、`-`、`@`、制表符或回车开头的单元格（纯数字除外）加单引号前缀，客户端提供的值（如被拒绝的模型名 `=HYPERLINK(...)`）在电子表格中只按文本显示。
+- `makewand serve` 的持久预算：没有上限适用的请求不再写预留行，也不再为此在准入时占用 SQLite 写锁，其结果不确定的费用仍按预估结算；已结算的预留在过期一天后连同其 scope 行删除（每次用量写入最多删 256 条，旧库的积压分批清理），预留表不再随请求数无限增长。
+- `go test ./...` 不再连接公网和宿主 DNS 解析器：依赖安装网络实测中的 DNS 与公网出口检查、以及在沙箱中真实运行 `npm install`（会访问 npm 注册表）的构建流程子测试，只在设置 `MAKEWAND_TEST_LIVE_NETWORK=1` 时运行。
+- `--workflow single` 的帮助与文档如实说明：由写代码的同一引擎在单独的只读调用中自审，没有独立引擎审查。
+- 模型发现写出 `discovered.json` 时，Go 路由器要求定价的 provider（claude、gemini、openai）的档位只在模型有价目（同一文件的 costs，或包旁 `router/defaults.json` 的内置价目）时写出；Go 本就忽略的未定价条目（如 agy 的 `gemini-4-argon` 写进 gemini 档位）不再写出。
+- 内部清理：`NON_AGENTIC_CHAT_MODELS` 由 `API_ONLY_ENGINES` 推导；审查裁决读取函数不再接受 `allow_legacy` 参数，读取旧的无 nonce 格式只能不带 nonce。
 - 健康探测在慢主机上启动时就已超过 4 秒时限时（例如新二进制正被杀毒扫描），按与“启动后卡住”相同的超时策略处理：订阅 CLI 软放行、自定义探测仍判不可用。此前 Windows CI 上 gemini 会被误判为不可用。
 - 模型发现写出的 `discovered.json` 改为参考性输入：其中本构建无法定价的 API 模型条目被丢弃（该档位保留内置模型），合并或校验仍失败的整个文件被忽略；此前一个未定价的发现模型（如 agy 的 `gemini-4-argon` 写进 gemini 档位）会让 TUI、headless 与 serve 全部启动失败。用户自己的 `routing.json` 仍然严格校验。
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。
