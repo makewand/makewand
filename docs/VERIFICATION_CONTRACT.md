@@ -82,19 +82,22 @@ namespace. Bubblewrap enables loopback inside it for local test servers; host
 loopback, host abstract sockets and the host default route remain inaccessible.
 A dependency step is split so only downloading uses the network (owner decision,
 2026-10-21): a fetch that runs no project code (`pip download --only-binary=:all:`
-of the requirements and the `pyproject.toml` build-system requires, `npm`/`cargo
-fetch`, `go mod download`/`tidy`) gets outbound-only `slirp4netns` networking
-restricted to public destinations — built without the host module caches and with
-workspace secrets masked — and fills the sandbox's own caches; the build/install
-that may run project code (`setup.py`, a PEP 517 backend, `build.rs`) runs
-loopback-only from what was fetched (`pip install --no-index --find-links`,
-including `-e .`; `cargo build --offline`). Without the network tools the fetch
-runs loopback-only, keeping the host caches
+of the named index requirements parsed from the requirement and constraint files —
+never the files or a buildable target they name — and the `pyproject.toml`
+build-system requires, `npm`/`cargo fetch`, `go mod download`/`tidy`) gets
+outbound-only `slirp4netns` networking restricted to public destinations — built
+without the host module caches and with workspace secrets masked — and fills the
+sandbox's own caches; the build/install that may run project code (`setup.py`, a
+PEP 517 backend, `build.rs`) runs loopback-only from what was fetched (`pip install
+--no-index --find-links`, including `-e .`; `cargo build --offline`). Without the
+network tools the fetch runs loopback-only, keeping the host caches
 ([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)). A
-dependency the fetch cannot get without running code (a source-only sdist, a
-repository-built or dynamically-computed dependency) is reported as
-`ErrDependencyNetworkUnavailable` too, an environment limitation of fetch-only
-networking rather than a candidate failure.
+source-only distribution the fetch cannot get as a wheel is reported as
+`ErrDependencyNetworkUnavailable`, an environment limitation of fetch-only
+networking rather than a candidate failure; a dependency that only surfaces once
+project code runs in the loopback build (a repository-built or dynamically-computed
+one) is attributed to the candidate from the project's files, since build-step
+output can be forged.
 A failed fetch is reported as `ErrDependencyNetworkUnavailable`, an environment
 problem rather than a candidate failure, only when makewand confirms the outage:
 with network, its own connectivity check of the ecosystem's default registry

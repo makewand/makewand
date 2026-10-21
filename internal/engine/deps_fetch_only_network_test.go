@@ -99,9 +99,12 @@ func TestDependencyStagesSplit_GEC1021(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer cleanup()
-		wantFetch := []string{"download", "--only-binary=:all:", "--no-input", "--dest", wh, "-r", "requirements.txt"}
+		// The requirement file itself is never handed to the networked download
+		// (pip would build any local/sdist target it lists); its named index
+		// requirements are passed instead.
+		wantFetch := []string{"download", "--only-binary=:all:", "--no-input", "--dest", wh, "six==1.16.0"}
 		if fetch == nil || !slices.Equal(fetch.Args, wantFetch) {
-			t.Fatalf("pip -r fetch = %+v, want %v (wheels only, no sdist builds)", fetch, wantFetch)
+			t.Fatalf("pip -r fetch = %+v, want %v (named requirements, not the file)", fetch, wantFetch)
 		}
 		wantBuild := []string{"install", "--no-index", "--find-links", wh, "--user", "-r", "requirements.txt"}
 		if build == nil || !slices.Equal(build.Args, wantBuild) {
@@ -145,6 +148,105 @@ func TestDependencyStagesSplit_GEC1021(t *testing.T) {
 		defer cleanup()
 		if fetch == nil || !slices.Contains(fetch.Args, "setuptools>=40.8.0") || !slices.Contains(fetch.Args, "wheel") {
 			t.Fatalf("pip -e . fetch = %+v, want the PEP 518 default build requires", fetch)
+		}
+	})
+}
+
+// A buildable target in a requirement/constraint file, a build-system require
+// or a direct reference must never reach the networked `pip download`: pip
+// builds such a target to read its metadata even under --only-binary=:all:,
+// running project code while the network is available (GEC-1021-1). The raw
+// requirement/constraint file is never handed to the fetch, and the loopback
+// build keeps the original command line so the local project still installs.
+func TestNetworkedFetchExcludesBuildableTargets_GEC1021(t *testing.T) {
+	// The fetch must contain none of these: raw requirement/constraint files,
+	// local paths, archives, URLs, VCS or `name @ url` references.
+	forbidden := func(t *testing.T, fetch *ExecPlan) {
+		t.Helper()
+		for _, arg := range fetch.Args {
+			switch {
+			case arg == "-r" || arg == "-c" || arg == "--requirement" || arg == "--constraint",
+				strings.HasSuffix(arg, ".txt"),
+				arg == "." || arg == "-e" || strings.HasPrefix(arg, "./") || strings.HasPrefix(arg, "../"),
+				strings.Contains(arg, "://"), strings.Contains(arg, "@"),
+				strings.HasSuffix(arg, ".tar.gz") || strings.HasSuffix(arg, ".zip"):
+				t.Fatalf("networked fetch args must not include a buildable target or a requirement file, got %q in %v", arg, fetch.Args)
+			}
+		}
+	}
+
+	t.Run("requirements.txt mixing named requirements and buildable targets", func(t *testing.T) {
+		reqs := strings.Join([]string{
+			"flask==2.0",                         // named: fetched
+			".",                                  // local project: built loopback
+			"-e ./pkg",                           // local editable
+			"https://example.invalid/pkg.tar.gz", // URL
+			"./local.tar.gz",                     // local archive
+			"evilpkg @ file:///tmp/evil",         // direct reference
+		}, "\n")
+		project := newNeedProject(t, "requirements.txt", reqs+"\n")
+		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if fetch == nil || !slices.Contains(fetch.Args, "flask==2.0") {
+			t.Fatalf("fetch = %+v, want the named requirement flask==2.0", fetch)
+		}
+		forbidden(t, fetch)
+		// The offline build still receives the requirement file, so the local
+		// project is installed loopback-only from it.
+		if build == nil || !slices.Contains(build.Args, "-r") || !slices.Contains(build.Args, "requirements.txt") || !slices.Contains(build.Args, "--no-index") {
+			t.Fatalf("build = %+v, want the offline install to keep -r requirements.txt", build)
+		}
+	})
+
+	t.Run("constraint file is not handed to the fetch", func(t *testing.T) {
+		project := newNeedProject(t, "requirements.txt", "flask==2.0\n", "constraints.txt", ".\n")
+		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "-r", "requirements.txt", "-c", "constraints.txt"}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if fetch == nil {
+			t.Fatal("fetch = nil, want a download for flask==2.0")
+		}
+		forbidden(t, fetch)
+		if !slices.Contains(build.Args, "-c") || !slices.Contains(build.Args, "constraints.txt") {
+			t.Fatalf("build = %+v, want the offline install to keep -c constraints.txt", build)
+		}
+	})
+
+	t.Run("a malicious build-system require is not fetched", func(t *testing.T) {
+		project := newNeedProject(t, "pyproject.toml",
+			"[build-system]\nrequires = [\"evil @ file:///tmp/evil\", \"hatchling>=1\"]\nbuild-backend = \"hatchling.build\"\n")
+		fetch, _, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-e", "."}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if fetch == nil || !slices.Contains(fetch.Args, "hatchling>=1") {
+			t.Fatalf("fetch = %+v, want the named build requirement hatchling>=1", fetch)
+		}
+		forbidden(t, fetch)
+	})
+
+	t.Run("a local-only install runs no networked step", func(t *testing.T) {
+		// requirements.txt = `.` and a pyproject whose in-tree backend needs no
+		// index build requirement: nothing resolves from an index, so the fetch
+		// is skipped entirely and the backend can never run with the network.
+		project := newNeedProject(t, "requirements.txt", ".\n", "pyproject.toml",
+			"[build-system]\nrequires = []\nbackend-path = [\"_b\"]\nbuild-backend = \"b\"\n")
+		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}}, project.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if fetch != nil {
+			t.Fatalf("fetch = %+v, want no networked step when nothing resolves from an index", fetch)
+		}
+		if build == nil || !slices.Contains(build.Args, "--no-index") {
+			t.Fatalf("build = %+v, want an offline install", build)
 		}
 	})
 }

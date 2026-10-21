@@ -444,15 +444,15 @@ func (p *Project) execDependencyPlan(ctx context.Context, env verifyExecEnvironm
 	if err != nil {
 		return buildResult, none, err
 	}
-	if buildResult != nil && buildResult.ExitCode != 0 {
-		// The build installed from the wheelhouse only; a distribution missing
-		// there is one the fetch could not get without running code (an
-		// environment limitation), while any other failure is the candidate's.
-		if msg := p.unfetchableDependency(plan, buildResult); msg != "" {
-			buildResult.Note = msg
-			return buildResult, none, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, msg)
-		}
-	}
+	// The build runs project code (setup.py, PEP 517 backends) loopback-only, so
+	// its output cannot be trusted to classify the failure: a candidate can
+	// forge pip's own "No matching distribution" box. A genuinely unfetchable
+	// distribution is one the fetch - which runs no project code - already
+	// failed on and reported above; everything declared (named requirements,
+	// build-system requires, static dependencies) is fetched before the build,
+	// transitively, so the wheelhouse holds it. A build failure is therefore
+	// returned as a plain failure and classified by RunVerificationPlan's
+	// fact-based check (offlineRegistryNeed), which forged output cannot sway.
 	return buildResult, none, nil
 }
 
@@ -525,52 +525,51 @@ func (p *Project) pipDependencyStages(plan ExecPlan, projectDir string) (fetch, 
 		return nil, nil, noop, fmt.Errorf("create dependency wheelhouse: %w", err)
 	}
 	cleanup = func() { _ = os.RemoveAll(wheelhouse) }
-	fetchPlan := ExecPlan{Kind: "deps", Detector: plan.Detector, Command: plan.Command, Args: p.pipDownloadArgs(install, plan.Args, wheelhouse)}
 	buildPlan := plan
 	buildPlan.Args = pipOfflineInstallArgs(plan.Args, wheelhouse)
+	fetchArgs, hasTargets := p.pipDownloadArgs(install, wheelhouse)
+	if !hasTargets {
+		// Nothing the install resolves from a package index (for example `-e .`
+		// with no declared dependencies): there is nothing to download, so no
+		// networked step runs at all - the offline build installs the local
+		// project from source loopback-only.
+		return nil, &buildPlan, cleanup, nil
+	}
+	fetchPlan := ExecPlan{Kind: "deps", Detector: plan.Detector, Command: plan.Command, Args: fetchArgs}
 	return &fetchPlan, &buildPlan, cleanup, nil
 }
 
 // pipDownloadArgs builds the `pip download` command line for a parsed install:
-// wheels only (--only-binary=:all:) into the wheelhouse, for the requirement
-// and constraint files on the command line, the named requirements given
-// there, and - for each local project the install builds - its build-system
-// requires and its statically declared dependencies (what a setup.py computes
-// at build time cannot be known without running it).
-func (p *Project) pipDownloadArgs(install pipInstall, origArgs []string, wheelhouse string) []string {
-	args := []string{"download", "--only-binary=:all:", "--no-input", "--dest", wheelhouse}
-	for i := 0; i < len(origArgs); i++ {
-		opt, value, inline := strings.Cut(origArgs[i], "=")
-		canonical := ""
-		switch opt {
-		case "-r", "--requirement":
-			canonical = "-r"
-		case "-c", "--constraint":
-			canonical = "-c"
-		default:
-			continue
-		}
-		if !inline {
-			if i+1 >= len(origArgs) {
-				continue
+// wheels only (--only-binary=:all:) into the wheelhouse. It passes only the
+// named index requirements the install resolves - those from the command line
+// and from the requirement files makewand can read, and, for each local project
+// the install builds, its build-system requires and its statically declared
+// dependencies (what a setup.py computes at build time cannot be known without
+// running it). It never passes a requirement file (-r) or constraint file (-c),
+// nor any buildable target (a local project, an sdist, a VCS reference, a URL,
+// or a name @ url direct reference): pip builds such a target to read its
+// metadata even under --only-binary=:all: (confirmed on pip 24 and 26), which
+// would run project code while the network is available. The offline build
+// installs the local project from the wheelhouse instead, loopback-only.
+// hasTargets reports whether anything resolves from an index at all.
+func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string) (args []string, hasTargets bool) {
+	args = []string{"download", "--only-binary=:all:", "--no-input", "--dest", wheelhouse}
+	base := len(args)
+	add := func(texts ...string) {
+		for _, text := range texts {
+			if named, ok := pipNamedRequirementText(text); ok {
+				args = append(args, named)
 			}
-			value = origArgs[i+1]
-			i++
-		}
-		args = append(args, canonical, value)
-	}
-	for _, req := range install.requirements {
-		if req.source == "the pip command line" {
-			args = append(args, req.text)
 		}
 	}
+	add(install.downloadReqs...)
 	for _, dir := range install.projects {
-		args = append(args, p.pipBuildSystemRequires(dir)...)
+		add(p.pipBuildSystemRequires(dir)...)
 		for _, dep := range p.pipStaticDependencies(dir) {
-			args = append(args, dep.text)
+			add(dep.text)
 		}
 	}
-	return args
+	return args, len(args) > base
 }
 
 // pipBuildSystemRequires returns the build-system requirements pip installs
@@ -1956,6 +1955,10 @@ func (p *Project) npmMayOmitDevDependencies() bool {
 type pipInstall struct {
 	// requirements are the named requirements, resolved from the index.
 	requirements []pipRequirement
+	// downloadReqs is the text of every named index requirement (command line
+	// and readable requirement files), markers kept, for the networked
+	// `pip download`. A buildable target is never recorded here.
+	downloadReqs []string
 	// projects are the local project directories it builds (project-relative).
 	projects []string
 	// localCode is set when it builds a local project or source archive, or
@@ -2170,6 +2173,9 @@ func (p *Project) addPipTarget(install *pipInstall, target, source string) {
 	case strings.HasPrefix(target, ".") || strings.HasPrefix(target, "~") || strings.ContainsAny(target, "/\\") || pipArchiveRe.MatchString(target):
 		p.addPipLocal(install, target)
 	default:
+		if named, ok := pipNamedRequirementText(target); ok {
+			install.downloadReqs = append(install.downloadReqs, named)
+		}
 		if requirement, ok := parsePipRequirement(target); ok {
 			requirement.source = source
 			install.requirements = append(install.requirements, requirement)
@@ -2207,6 +2213,22 @@ func parsePipRequirement(text string) (pipRequirement, bool) {
 		return pipRequirement{}, false
 	}
 	return pipRequirement{name: normalizePipName(m[1]), text: text}, true
+}
+
+// pipNamedRequirementText returns the text of a requirement a `pip download`
+// resolves from a package index, keeping its version specifier, extras and
+// environment marker (pip evaluates markers itself and, under
+// --only-binary=:all:, fetches only wheels). It is what the networked fetch may
+// safely be handed. A direct reference (name @ url) is rejected: pip would
+// fetch and build it. Anything that is not a plain named requirement (an empty
+// or option token) is rejected too.
+func pipNamedRequirementText(text string) (string, bool) {
+	text = strings.Join(strings.Fields(text), " ")
+	m := pipRequirementRe.FindStringSubmatch(text)
+	if m == nil || strings.Contains(m[2], "@") {
+		return "", false
+	}
+	return text, true
 }
 
 // normalizePipName normalizes a Python project name (PEP 503).
