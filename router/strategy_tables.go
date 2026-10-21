@@ -578,6 +578,17 @@ func (t *strategyTables) costFor(modelID string) (costEntry, bool) {
 	return e, ok
 }
 
+// pricedModels returns every model ID with a pricing entry, in no order.
+func (t *strategyTables) pricedModels() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	ids := make([]string, 0, len(t.costs))
+	for id := range t.costs {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // modelsFor returns the tier→model map for a provider. The returned map is a
 // live snapshot member and must not be mutated; snapshots are copy-on-write,
 // so it is safe to read after the lock is released.

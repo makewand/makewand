@@ -256,15 +256,28 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 		})
 	}
 	if cfg.IsProviderEnabled("codex") {
-		_ = r.RegisterProviderFactory("codex", func(modelID string) (Provider, error) {
+		_ = r.RegisterProviderFactory("codex", func(string) (Provider, error) {
 			if cli := cfg.GetCLI("codex"); cli != nil {
 				return NewCodexCLI(cli.BinPath), nil
 			}
 			if cfg.OpenAIAPIKey != "" {
-				return NewOpenAIWithBaseURL(cfg.OpenAIAPIKey, modelID, cfg.OpenAIBaseURL), nil
+				// Without a codex CLI the codex route (Power generators and
+				// judges, pinned build phases) is an OpenAI API call. The codex
+				// table names only the CLI's own default, "codex-cli", which is
+				// no API model and is priced at $0, so call the configured
+				// OpenAI model; the transport ignores that placeholder when
+				// routing passes it as the request model.
+				return NewOpenAIWithBaseURL(cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAIBaseURL), nil
 			}
 			return nil, fmt.Errorf("codex not configured")
 		})
+		if cfg.GetCLI("codex") == nil && cfg.OpenAIAPIKey != "" {
+			// "codex" is never registered in this shape, so it would keep the
+			// zero access type (free), under which spend a call does not report
+			// (a stream's) is not estimated. codex_access describes the CLI and
+			// does not apply to this route.
+			r.SetAccessType("codex", AccessAPI)
+		}
 	}
 	if cfg.IsProviderEnabled("gemini") {
 		_ = r.RegisterProviderFactory("gemini", func(modelID string) (Provider, error) {

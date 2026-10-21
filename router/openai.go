@@ -59,8 +59,17 @@ func (o *OpenAI) SafeForUntrustedRepo() bool { return true }
 // configured one. Stream routes, which carry no usage, are then reported and
 // billed at the model actually called.
 func (o *OpenAI) ReportedModelID(requestedModelID string) string {
-	if requestedModelID != "" {
-		return requestedModelID
+	return o.callModel(requestedModelID)
+}
+
+// callModel returns the model a call sends upstream. A "-cli" model ID names a
+// subscription CLI's own default, never an API model: the codex route's table
+// entry is "codex-cli", priced at $0, and routing requests it when the codex
+// route is served by this API because no codex CLI is installed. Such a request
+// uses the configured model, as a call routing names no model for does.
+func (o *OpenAI) callModel(requested string) string {
+	if requested != "" && !strings.HasSuffix(requested, "-cli") {
+		return requested
 	}
 	return o.model
 }
@@ -104,10 +113,8 @@ func (o *OpenAI) Chat(ctx context.Context, messages []Message, system string, ma
 }
 
 func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (string, Usage, error) {
-	model := o.model
-	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
-		model = requested
-	}
+	requested, _ := ModelFromContext(ctx)
+	model := o.callModel(requested)
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})
@@ -179,10 +186,8 @@ func (o *OpenAI) ChatStream(ctx context.Context, messages []Message, system stri
 }
 
 func (o *OpenAI) chatStreamUnaccounted(ctx context.Context, messages []Message, system string, maxTokens int) (<-chan StreamChunk, error) {
-	model := o.model
-	if requested, ok := ModelFromContext(ctx); ok && requested != "" {
-		model = requested
-	}
+	requested, _ := ModelFromContext(ctx)
+	model := o.callModel(requested)
 	msgs := make([]openaiMessage, 0, len(messages)+1)
 	if system != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: system})

@@ -94,13 +94,30 @@ log.Fatal(http.ListenAndServe("127.0.0.1:8080", h))
 Endpoints:
 - `POST /v1/chat/completions` — Chat completions (`stream=true` supported)
 - `POST /v1/responses` — Responses API subset (`stream=true` supported)
-- `GET /v1/models` — List available providers
+- `GET /v1/models` — List available providers, plus the OpenAI models a client
+  can name when the OpenAI API serves them (see below)
 - `GET /health` — Health check
 
 The HTTP facade accepts a provider name from `/v1/models` in the `model` field
-to force a specific provider. It also accepts common alias families such as
-`gpt-*`, `o1*`, `o3*`, and `o4*` for Codex-backed routing, plus `claude*`,
-`gemini*`, and `codex*`. `max_tokens` and `temperature` are accepted but
+to force a specific provider. It also accepts alias families: `claude*` and
+`gemini*` select those providers, and `codex*`, `gpt-*`, `o1*`, `o3*` and
+`o4*` select the `codex` provider. An alias picks a provider, not a model; the
+provider calls its own model.
+
+When no `codex` provider is registered but the OpenAI API provider is
+(`"openai"`, a `NewOpenAI` instance), as in an API-key-only deployment such as
+the makewand Docker image, the OpenAI-family names select `"openai"` instead.
+A `gpt-*`, `o1*`, `o3*`, `o4*` or `codex-mini*` name is then sent upstream as
+the model and billed at that model's price; `codex` itself calls the
+configured model. The model must be the provider's configured model or have a
+price in the routing tables (`costs`, which `routing.json` can extend).
+Otherwise the request gets a 400, because its spend could not be budgeted.
+`GET /v1/models` lists these models with `owned_by: "openai"`. Resolution uses
+the server's providers, not a token's allowlist, so such a token needs the
+`openai` provider. A `model` that nothing on the server serves gets the same
+400 `unknown model` error whether or not the request streams.
+
+`max_tokens` and `temperature` are accepted but
 currently ignored for compatibility. `response_format` supports `json_object`
 and a pragmatic subset of `json_schema`; `tools` and `tool_choice` provide a
 basic function-calling compatibility layer. When wrapped by `makewand serve`,
@@ -194,6 +211,14 @@ and shared with its per-request views, such as HTTP requests that carry a
 `mode` or a token provider allowlist. Each model therefore gets one provider,
 and one HTTP transport, reused across requests. Calling
 `RegisterProviderFactory` again for the same name clears that name's cache.
+
+A factory can serve a CLI provider's name through an API provider. makewand's
+`codex` factory returns `NewOpenAI` with the configured OpenAI model when no
+codex CLI is installed, and the caller should then give that name `AccessAPI`
+with `SetAccessType`. Routing still requests the name's table model, such as
+the codex table's `codex-cli`. A model ID ending in `-cli` names a CLI's own
+default, so `NewOpenAI` never sends one upstream and calls its configured model
+instead.
 
 ### Untrusted Repositories (`RepoTrust`)
 
