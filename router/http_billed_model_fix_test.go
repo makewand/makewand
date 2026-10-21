@@ -20,8 +20,9 @@ import (
 // Anthropic messages APIs. Non-streaming replies report usage (1000 prompt and
 // 2000 completion tokens); streams carry none, like most gateways, and send
 // one-token words ("go "), wordsPerEvent per SSE event: exactly the request's
-// max_tokens of them, or overrun times as many for a provider that ignores its
-// output cap. dense streams CJK runes without spaces instead of words.
+// output cap of them, or overrun times as many for a provider that ignores its
+// output cap. dense streams CJK runes without spaces instead of words. Like the
+// OpenAI API, it refuses max_tokens for a reasoning model (limit).
 type billingUpstream struct {
 	*httptest.Server
 	wordsPerEvent int
@@ -43,18 +44,24 @@ func newBillingUpstream(t *testing.T, wordsPerEvent, overrun int, dense bool) *b
 
 func (u *billingUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Model     string `json:"model"`
-		MaxTokens int    `json:"max_tokens"`
-		Stream    bool   `json:"stream"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+		openAIChatLimits
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	maxTokens, refused := req.limit(req.Model)
 	u.mu.Lock()
 	u.models = append(u.models, req.Model)
-	u.maxTokens = append(u.maxTokens, req.MaxTokens)
+	u.maxTokens = append(u.maxTokens, maxTokens)
 	u.mu.Unlock()
+	if refused != "" {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, refused)
+		return
+	}
 	anthropic := strings.HasSuffix(r.URL.Path, "/messages")
 	if !req.Stream {
 		if anthropic {
@@ -65,7 +72,7 @@ func (u *billingUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	total := req.MaxTokens * max(1, u.overrun)
+	total := maxTokens * max(1, u.overrun)
 	for sent := 0; sent < total && r.Context().Err() == nil; sent += u.wordsPerEvent {
 		unit := "go "
 		if u.dense {

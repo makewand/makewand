@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -137,9 +138,109 @@ func TestHTTPNamedOpenAIModelIsBoundToTheRequestOnly(t *testing.T) {
 	}
 }
 
+// openAIChatLimits holds the output caps of a chat-completions request body.
+type openAIChatLimits struct {
+	MaxTokens           *int `json:"max_tokens"`
+	MaxCompletionTokens *int `json:"max_completion_tokens"`
+}
+
+// openAIRefusesMaxTokens is the OpenAI API's 400 body for max_tokens sent to
+// a reasoning model.
+const openAIRefusesMaxTokens = `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}`
+
+// limit reads the output cap as the OpenAI API does: o-series and GPT-5
+// models refuse max_tokens (refused is then the API's error body) and take
+// max_completion_tokens, which every model accepts.
+func (l openAIChatLimits) limit(model string) (limit int, refused string) {
+	model = strings.ToLower(model)
+	reasoning := strings.HasPrefix(model, "gpt-5") || len(model) > 1 && model[0] == 'o' && model[1] >= '0' && model[1] <= '9'
+	switch {
+	case reasoning && l.MaxTokens != nil:
+		return 0, openAIRefusesMaxTokens
+	case l.MaxCompletionTokens != nil:
+		return *l.MaxCompletionTokens, ""
+	case l.MaxTokens != nil:
+		return *l.MaxTokens, ""
+	}
+	return 0, ""
+}
+
+// OpenAI's reasoning models refuse max_tokens, so the transport caps their
+// output with max_completion_tokens: o1 and o3-mini, which GET /v1/models
+// lists, got a 400 from api.openai.com, streamed or not. Every other model,
+// including an OpenAI-compatible endpoint's own, keeps max_tokens.
+func TestOpenAICapsReasoningModelsWithMaxCompletionTokens(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []map[string]json.RawMessage
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		var body map[string]json.RawMessage
+		var req struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+			openAIChatLimits
+		}
+		if err != nil || json.Unmarshal(raw, &body) != nil || json.Unmarshal(raw, &req) != nil {
+			http.Error(w, "unreadable request", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		bodies = append(bodies, body)
+		mu.Unlock()
+		if _, refused := req.limit(req.Model); refused != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, refused)
+			return
+		}
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":20}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	const completion, legacy = "max_completion_tokens", "max_tokens"
+	messages := []Message{{Role: "user", Content: "explain lorem"}}
+	for model, field := range map[string]string{
+		"o1": completion, "o1-mini": completion, "o3": completion, "o3-mini": completion, "o4-mini": completion,
+		"gpt-5": completion, "gpt-5-mini": completion, "codex-mini-latest": completion,
+		"gpt-4o": legacy, "gpt-4o-mini": legacy, "gpt-4.1": legacy, "deepseek-chat": legacy,
+	} {
+		p := NewOpenAIWithBaseURL("k", model, upstream.URL+"/v1")
+		if _, _, err := p.Chat(context.Background(), messages, "be brief", 123); err != nil {
+			t.Fatalf("%s Chat: %v", model, err)
+		}
+		stream, err := p.ChatStream(context.Background(), messages, "be brief", 123)
+		if err != nil {
+			t.Fatalf("%s ChatStream: %v", model, err)
+		}
+		for chunk := range stream {
+			if chunk.Error != nil {
+				t.Fatalf("%s ChatStream: %v", model, chunk.Error)
+			}
+		}
+		other := map[string]string{completion: legacy, legacy: completion}[field]
+		mu.Lock()
+		sent := bodies
+		bodies = nil
+		mu.Unlock()
+		if len(sent) != 2 {
+			t.Fatalf("%s: %d upstream requests, want 2", model, len(sent))
+		}
+		for _, body := range sent {
+			if string(body[field]) != "123" || body[other] != nil {
+				t.Fatalf("%s: upstream got %s=%s and %s=%s, want only %s=123", model, field, body[field], other, body[other], field)
+			}
+		}
+	}
+}
+
 // namedModelUpstream is a loopback fake of the OpenAI chat-completions API: it
-// answers each model in rejects with that HTTP status, and any other model with
-// a short reply, streamed or not.
+// answers each model in rejects with that HTTP status, a reasoning model sent
+// max_tokens with the API's 400, and any other model with a short reply,
+// streamed or not.
 type namedModelUpstream struct {
 	*httptest.Server
 	mu      sync.Mutex
@@ -159,6 +260,7 @@ func (u *namedModelUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Model  string `json:"model"`
 		Stream bool   `json:"stream"`
+		openAIChatLimits
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -168,7 +270,11 @@ func (u *namedModelUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	u.models = append(u.models, req.Model)
 	status := u.rejects[req.Model]
 	u.mu.Unlock()
+	_, refused := req.limit(req.Model)
 	switch {
+	case refused != "":
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, refused)
 	case status != 0:
 		w.WriteHeader(status)
 		fmt.Fprintf(w, `{"error":{"message":"rejected %s"}}`, req.Model)
@@ -284,7 +390,8 @@ func TestHTTPNamedOpenAIModelHonorsTheOpenAIRoute(t *testing.T) {
 }
 
 // A routing.json model table for "openai" names the models the openai route
-// calls. A request naming a model still calls, reports and bills that model.
+// calls. A request naming a model still calls, reports and bills that model;
+// the upstream refuses a reasoning model's call that sends max_tokens.
 func TestHTTPNamedOpenAIModelIsCalledDespiteAnOpenAIModelTable(t *testing.T) {
 	dir := t.TempDir()
 	table := `{"models":{"openai":{"cheap":"gpt-4o-mini","mid":"gpt-4o-mini","premium":"gpt-4o-mini"}}}`
@@ -298,7 +405,7 @@ func TestHTTPNamedOpenAIModelIsCalledDespiteAnOpenAIModelTable(t *testing.T) {
 	}
 	usage := &usageRecorder{}
 	h := r.HTTPHandler(HTTPHandlerOptions{UsageLogger: usage})
-	for _, name := range []string{"o1", "gpt-4o"} {
+	for _, name := range []string{"o1", "o3-mini", "gpt-4o"} {
 		for _, stream := range []bool{false, true} {
 			rec := postFix16Chat(t, h, "", namedModelChat(name, stream))
 			if rec.Code != http.StatusOK {

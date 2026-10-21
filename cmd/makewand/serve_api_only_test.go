@@ -22,6 +22,9 @@ import (
 
 // apiOnlyUpstream is a loopback fake of the OpenAI chat-completions API. Plain
 // replies report 1000 prompt and 2000 completion tokens; streams report none.
+// As api.openai.com does, it answers a request that sends an o-series or GPT-5
+// model max_tokens with 400 unsupported_parameter: those models take only
+// max_completion_tokens.
 type apiOnlyUpstream struct {
 	*httptest.Server
 	mu      sync.Mutex
@@ -31,8 +34,9 @@ type apiOnlyUpstream struct {
 
 func (u *apiOnlyUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
+		Model     string          `json:"model"`
+		Stream    bool            `json:"stream"`
+		MaxTokens json.RawMessage `json:"max_tokens"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -42,6 +46,14 @@ func (u *apiOnlyUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	u.models = append(u.models, req.Model)
 	status := u.rejects[req.Model]
 	u.mu.Unlock()
+	model := strings.ToLower(req.Model)
+	reasoning := strings.HasPrefix(model, "gpt-5") || len(model) > 1 && model[0] == 'o' && model[1] >= '0' && model[1] <= '9'
+	if reasoning && req.MaxTokens != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}`)
+		return
+	}
 	if status != 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -185,7 +197,7 @@ func onlyUsageEntry(t *testing.T, usage *apiOnlyUsage) serverusage.Entry {
 // configured one) and record its price; it sent "codex-cli" upstream and
 // recorded $0, so Power requests bypassed token, org and project USD budgets.
 func TestServeAPIOnlyPowerRequestsCallAndBillTheOpenAIModel(t *testing.T) {
-	for _, configured := range []string{"", "gpt-4o-mini"} {
+	for _, configured := range []string{"", "gpt-4o-mini", "o3-mini"} {
 		h, upstream, usage := apiOnlyServe(t, configured)
 		want := configured
 		if want == "" {
@@ -214,11 +226,12 @@ func TestServeAPIOnlyPowerRequestsCallAndBillTheOpenAIModel(t *testing.T) {
 
 // go-server-1021-2: the documented OpenAI-family names returned 400 here,
 // because they resolved to the unregistered "codex". They must reach the
-// OpenAI API as named and be billed at the named model's price.
+// OpenAI API as named, in the form it accepts (o1 and o3-mini were sent
+// max_tokens, which the API refuses), and be billed at the named model's price.
 func TestServeAPIOnlyOpenAIModelNamesAreCalledAndBilledAsNamed(t *testing.T) {
 	h, upstream, usage := apiOnlyServe(t, "")
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
-		for _, name := range []string{"gpt-4o", "o1", "gpt-4o-mini"} {
+		for _, name := range []string{"gpt-4o", "o1", "o3-mini", "gpt-4o-mini"} {
 			for _, stream := range []bool{false, true} {
 				body := apiOnlyChat(name, "explain what a monad is", stream)
 				if path == "/v1/responses" {

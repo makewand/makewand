@@ -79,10 +79,38 @@ func (o *OpenAI) callModel(requested string) string {
 }
 
 type openaiRequest struct {
-	Model     string          `json:"model"`
-	Messages  []openaiMessage `json:"messages"`
-	MaxTokens int             `json:"max_tokens,omitempty"`
-	Stream    bool            `json:"stream,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []openaiMessage `json:"messages"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+}
+
+// newOpenAIRequest builds a chat-completions request whose output is capped at
+// maxTokens. OpenAI's reasoning models refuse max_tokens with a 400 and take
+// max_completion_tokens, which also counts their hidden reasoning tokens, so
+// a call still bills at most maxTokens of output. Every other model keeps
+// max_tokens, the field OpenAI-compatible endpoints accept.
+func newOpenAIRequest(model string, messages []openaiMessage, maxTokens int, stream bool) openaiRequest {
+	req := openaiRequest{Model: model, Messages: messages, Stream: stream}
+	if isOpenAIReasoningModel(model) {
+		req.MaxCompletionTokens = maxTokens
+	} else {
+		req.MaxTokens = maxTokens
+	}
+	return req
+}
+
+// isOpenAIReasoningModel reports whether model names one of OpenAI's reasoning
+// models: the o-series, GPT-5 and codex-mini (an o4-mini).
+func isOpenAIReasoningModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range []string{"o1", "o3", "o4", "gpt-5", "codex-mini"} {
+		if strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 type openaiMessage struct {
@@ -130,13 +158,7 @@ func (o *OpenAI) chatUnaccounted(ctx context.Context, messages []Message, system
 		msgs = append(msgs, openaiMessage(m))
 	}
 
-	reqBody := openaiRequest{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: maxTokens,
-	}
-
-	body, err := marshalProviderJSON("openai", reqBody)
+	body, err := marshalProviderJSON("openai", newOpenAIRequest(model, msgs, maxTokens, false))
 	if err != nil {
 		return "", Usage{}, err
 	}
@@ -203,14 +225,7 @@ func (o *OpenAI) chatStreamUnaccounted(ctx context.Context, messages []Message, 
 		msgs = append(msgs, openaiMessage(m))
 	}
 
-	reqBody := openaiRequest{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: maxTokens,
-		Stream:    true,
-	}
-
-	body, err := marshalProviderJSON("openai", reqBody)
+	body, err := marshalProviderJSON("openai", newOpenAIRequest(model, msgs, maxTokens, true))
 	if err != nil {
 		return nil, err
 	}
