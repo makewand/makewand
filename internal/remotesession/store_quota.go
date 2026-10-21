@@ -103,6 +103,10 @@ var errFreeSpaceUnsupported = errors.New("free space is not available on this pl
 // checkFreeSpace refuses a write of incoming bytes that would leave less than
 // MinFreeBytes free. A replacement writes its whole new image before the old
 // file is removed, so the full size counts here, unlike in the owner quota.
+// SaveForOwner checks before it takes any lock and again under the owner's
+// quota lock, so the owner's concurrent saves cannot all pass against the
+// same free space; concurrent saves by different owners still can, each
+// overshooting the floor by at most its own write.
 func (s *Store) checkFreeSpace(incoming int) error {
 	if s.quota.MinFreeBytes <= 0 {
 		return nil
@@ -144,17 +148,17 @@ func (s *Store) ledgerPath(owner string) string {
 	return filepath.Join(s.dir, "quota-"+ownerDigest(owner)+".json")
 }
 
-// quotaLockPath names the lock that serializes an owner's accounting. Like the
+// quotaLockPath names the lock that serializes an owner's saves. Like the
 // store lock, it is permanent.
 func (s *Store) quotaLockPath(owner string) string {
 	return filepath.Join(s.dir, ".quota-"+ownerDigest(owner)+".lock")
 }
 
-// lockQuota serializes owner's accounting across goroutines and processes. The
-// lock is per owner, as the ledger is, so one account's saves, held from the
-// ledger read until the session is published and synced, never queue another
-// account's. Lock order is the store lock, then this one; Cleanup takes only
-// the store lock.
+// lockQuota serializes owner's saves, their accounting and free-space check,
+// across goroutines and processes. The lock is per owner, as the ledger is, so
+// one account's saves, held from those checks until the session is published
+// and synced, never queue another account's. Lock order is the store lock,
+// then this one; Cleanup takes only the store lock.
 func (s *Store) lockQuota(owner string) (*os.File, error) {
 	lock, err := openStoreLock(s.quotaLockPath(owner))
 	if err != nil {
@@ -221,14 +225,36 @@ func isSessionFileName(name string) bool {
 	return err == nil && strings.ToLower(digest) == digest
 }
 
-// writeLedger atomically replaces an owner's ledger. The temporary file uses
-// the session temporary pattern, so Cleanup reaps it after a crash. Callers
-// hold the shared store lock and the quota lock.
-func (s *Store) writeLedger(owner string, ledger ownerLedger) error {
-	data, err := json.Marshal(ledger)
+// admitSave checks a save of size bytes as owner's session file path against
+// the owner's ledger (Quota.admit) and returns the ledger recording it,
+// encoded for writeLedger. Callers hold the quota lock.
+func (s *Store) admitSave(owner, path string, size int) ([]byte, error) {
+	ledger, err := s.loadLedger(owner)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	name := filepath.Base(path)
+	if _, listed := ledger.Sessions[name]; !listed {
+		// A session stored before accounting began (or by a store without
+		// per-owner limits) counts at its current size from its next save,
+		// so updating it never counts as a new session.
+		// #nosec G703 -- path comes from sessionPath, which hashes owner and workspace ID into a basename in the operator-configured storage root.
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+			ledger.Sessions[name] = info.Size()
+		}
+	}
+	if err := s.quota.admit(ledger, name, int64(size)); err != nil {
+		return nil, err
+	}
+	ledger.Sessions[name] = int64(size)
+	return json.Marshal(ledger)
+}
+
+// writeLedger atomically replaces an owner's ledger with data, an encoded
+// ownerLedger. The temporary file uses the session temporary pattern, so
+// Cleanup reaps it after a crash. Callers hold the shared store lock and the
+// quota lock.
+func (s *Store) writeLedger(owner string, data []byte) error {
 	return s.publish(data, s.ledgerPath(owner))
 }
 

@@ -192,6 +192,8 @@ func (s *Store) SaveForOwner(owner, workspaceID string, data []byte) error {
 	if err := s.cleanupIfIdle(); err != nil {
 		return err
 	}
+	// A disk already below the floor refuses the save before it waits for any
+	// lock.
 	if err := s.checkFreeSpace(len(data)); err != nil {
 		return err
 	}
@@ -203,34 +205,32 @@ func (s *Store) SaveForOwner(owner, workspaceID string, data []byte) error {
 	if err := lockStoreHandle(lock, false); err != nil {
 		return err
 	}
-	if s.quota.perOwner() {
+	if s.quota.perOwner() || s.quota.MinFreeBytes > 0 {
 		quotaLock, err := s.lockQuota(owner)
 		if err != nil {
 			return err
 		}
 		defer quotaLock.Close()
-		ledger, err := s.loadLedger(owner)
-		if err != nil {
-			return err
-		}
-		name := filepath.Base(path)
-		if _, listed := ledger.Sessions[name]; !listed {
-			// A session stored before accounting began (or by a store without
-			// per-owner limits) counts at its current size from its next save,
-			// so updating it never counts as a new session.
-			// #nosec G703 -- path comes from sessionPath, which hashes owner and workspace ID into a basename in the operator-configured storage root.
-			if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
-				ledger.Sessions[name] = info.Size()
+		var ledger []byte
+		if s.quota.perOwner() {
+			if ledger, err = s.admitSave(owner, path, len(data)); err != nil {
+				return err
 			}
 		}
-		if err := s.quota.admit(ledger, name, int64(len(data))); err != nil {
+		// The check above ran before the owner's earlier saves, which this lock
+		// waited for, had written, so concurrent saves all passed it against
+		// the same free space. Check again against the space they left,
+		// counting everything this save writes, its ledger included.
+		if err := s.checkFreeSpace(len(data) + len(ledger)); err != nil {
 			return err
 		}
-		// Record before publishing: an interrupted save then leaves an entry
-		// the next load repairs, never a session missing from the ledger.
-		ledger.Sessions[name] = int64(len(data))
-		if err := s.writeLedger(owner, ledger); err != nil {
-			return err
+		if ledger != nil {
+			// Record before publishing: an interrupted save then leaves an
+			// entry the next load repairs, never a session missing from the
+			// ledger.
+			if err := s.writeLedger(owner, ledger); err != nil {
+				return err
+			}
 		}
 	}
 	return s.publish(data, path)

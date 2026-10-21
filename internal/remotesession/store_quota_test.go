@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -199,6 +200,100 @@ func TestStoreQuotaFreeSpaceFloor(t *testing.T) {
 	freeErr = errors.New("statfs failed")
 	if err := store.Save("c", []byte("c")); err == nil || quotaKind(err) != 0 {
 		t.Fatalf("probe failure: %v, want a plain error", err)
+	}
+}
+
+// storeBytes is the size of the regular files in dir: the space a store has
+// taken on a disk that started empty.
+func storeBytes(dir string) (uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	var used uint64
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			continue // a temporary file renamed since the listing
+		}
+		if err != nil {
+			return 0, err
+		}
+		if info.Mode().IsRegular() {
+			used += uint64(info.Size()) //nolint:gosec // G115: file sizes are non-negative.
+		}
+	}
+	return used, nil
+}
+
+// One owner's concurrent saves cannot take the disk past the free-space floor
+// by more than one payload. Every save checked the floor before taking the
+// owner's lock, so all of them passed against the same free space and then
+// wrote one after another; each now checks it again under the lock, against
+// the space the saves before it used. The disk has room for three payloads
+// above the floor, and every save's first probe measures it before any save
+// may go on.
+func TestStoreQuotaFreeSpaceFloorHoldsForConcurrentSaves(t *testing.T) {
+	const (
+		payload = 4096
+		floor   = 1 << 20
+		saves   = 16
+	)
+	for name, quota := range map[string]Quota{
+		"floor only":       {MinFreeBytes: floor},
+		"with owner quota": {MinFreeBytes: floor, MaxSessionsPerOwner: DefaultMaxSessionsPerOwner, MaxBytesPerOwner: DefaultMaxBytesPerOwner},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			store := NewStoreWithQuota(dir, quota)
+			capacity := uint64(floor + 3*payload + payload/2)
+			var probes atomic.Int64
+			var firstProbes sync.WaitGroup
+			firstProbes.Add(saves)
+			store.freeSpace = func(string) (uint64, error) {
+				used, err := storeBytes(dir)
+				if probes.Add(1) <= saves {
+					firstProbes.Done()
+					firstProbes.Wait()
+				}
+				if err != nil || used > capacity {
+					return 0, err
+				}
+				return capacity - used, nil
+			}
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			admitted, refused := 0, 0
+			for i := range saves {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					err := store.SaveForOwner(quotaAlice, fmt.Sprintf("ws-%d", i), bytes.Repeat([]byte("s"), payload))
+					mu.Lock()
+					defer mu.Unlock()
+					switch {
+					case err == nil:
+						admitted++
+					case quotaKind(err) == QuotaFreeSpace:
+						refused++
+					default:
+						t.Error(err)
+					}
+				}()
+			}
+			wg.Wait()
+			used, err := storeBytes(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if used > capacity-floor+payload {
+				t.Fatalf("%d saves wrote %d bytes, %d past the floor", admitted, used, used-(capacity-floor))
+			}
+			if admitted != 3 || refused != saves-3 {
+				t.Fatalf("admitted %d and refused %d of %d, want the 3 that fit", admitted, refused, saves)
+			}
+			assertNoSessionTemps(t, dir)
+		})
 	}
 }
 
