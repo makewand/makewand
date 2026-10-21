@@ -410,7 +410,10 @@ func (c *CLIProvider) healthCheck() bool {
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	if err != nil {
 		cliAfterWait(cmd) // nothing ran: a private home is removed at once
-		return false
+		// The deadline can pass while a slow host is still starting the probe
+		// (a fresh binary being scanned): that is the same unknown availability
+		// as a probe that started and stalled.
+		return errors.Is(ctx.Err(), context.DeadlineExceeded) && c.softPassProbeTimeout()
 	}
 	cliAfterStart(cmd)
 	defer cleanupProcess()

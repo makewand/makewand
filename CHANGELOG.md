@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 健康探测在慢主机上启动时就已超过 4 秒时限时（例如新二进制正被杀毒扫描），按与“启动后卡住”相同的超时策略处理：订阅 CLI 软放行、自定义探测仍判不可用。此前 Windows CI 上 gemini 会被误判为不可用。
 - 有界派发改用 Go/Python 共享的机器账本 `call-budget.json`；任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按 Asia/Shanghai 午夜重置。已结算记录保留 48 小时，写入时清理；未结束记录、活动租约和预留所引用的计数保留，旧 lifetime 上限不因清理退款。详见 [预算与租约](docs/layered-call-admission.md)。
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。
 - quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。
