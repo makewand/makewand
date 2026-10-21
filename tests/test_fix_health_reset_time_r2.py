@@ -41,6 +41,13 @@ def _clock(moment):
     return moment.strftime("%H:%M")
 
 
+def _future_month_day(clock):
+    # A year-less "Oct 20, 8pm" is judged against the real clock: a fixed one
+    # turns from future to past on that day and the test starts failing.
+    moment = datetime.now() + timedelta(days=8)
+    return f"{moment:%b} {moment.day}, {clock}"
+
+
 class _IsolatedStatus(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="mw-fix-reset-r2-")
@@ -78,13 +85,13 @@ class TestOutOfRangeObservation(_IsolatedStatus):
             with self.subTest(updated_at=updated_at):
                 self.assertIsInstance(parse_reset_datetime("8pm", observed_at=updated_at), datetime)
                 self.assertGreaterEqual(pacing.parse_reset_time_to_seconds_left("8pm", updated_at=updated_at), 0.0)
-                self.assertIsInstance(is_reset_time_passed("Oct 20, 8pm", updated_at), bool)
+                self.assertIsInstance(is_reset_time_passed(_future_month_day("8pm"), updated_at), bool)
                 self.assertIsInstance(health._observed_longer_than(updated_at, 7200), bool)
 
     def test_record_engine_limit_still_saves_next_to_a_damaged_entry(self):
         self.write_status({"codex": {"status": "limited", "reason": "x", "resets_at": "8pm",
                                      "updated_at": "0001-01-01T00:00:00"}})
-        health.record_engine_limit("claude", "limit", "Oct 20, 8pm (Asia/Shanghai)")
+        health.record_engine_limit("claude", "limit", _future_month_day("8pm") + " (Asia/Shanghai)")
         disk = json.loads(self.status_file.read_text(encoding="utf-8"))
         self.assertEqual(disk["claude"]["status"], "limited")
         self.assertEqual(health.load_status_cache()["claude"]["status"], "limited")
