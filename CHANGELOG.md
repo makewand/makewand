@@ -11,7 +11,6 @@ All notable changes to this project are documented here. The format is based on
 
 - 健康探测在慢主机上启动时就已超过 4 秒时限时（例如新二进制正被杀毒扫描），按与“启动后卡住”相同的超时策略处理：订阅 CLI 软放行、自定义探测仍判不可用。此前 Windows CI 上 gemini 会被误判为不可用。
 - 模型发现写出的 `discovered.json` 改为参考性输入：其中本构建无法定价的 API 模型条目被丢弃（该档位保留内置模型），合并或校验仍失败的整个文件被忽略；此前一个未定价的发现模型（如 agy 的 `gemini-4-argon` 写进 gemini 档位）会让 TUI、headless 与 serve 全部启动失败。用户自己的 `routing.json` 仍然严格校验。
-- 有界派发改用 Go/Python 共享的机器账本 `call-budget.json`；任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按 Asia/Shanghai 午夜重置。已结算记录保留 48 小时，写入时清理；未结束记录、活动租约和预留所引用的计数保留，旧 lifetime 上限不因清理退款。详见 [预算与租约](docs/layered-call-admission.md)。
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。
 - quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。
 - provider worker 采用严格命令白名单，仅允许 `search`、`repomap`、静态 `help`、`completion <shell>` 和单独的帮助/版本参数；`quota`、`status`、`route`、`mark`、`outcome` 等管理命令均拒绝。详见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
@@ -21,7 +20,7 @@ All notable changes to this project are documented here. The format is based on
 - agy 从不花 G1 credits（#81）：两个沙箱的私有家目录里，agy 的两个设置文件（`~/.gemini/settings.json`、`~/.gemini/antigravity-cli/settings.json`）一律写成 `useG1Credits=false`；没有 bwrap 时，只有宿主这两个文件都证明 `useG1Credits` 为 false 才运行 agy，否则 fail-closed 并说明。
 - agy 在 makewand 沙箱中能执行命令（#82）：agy 每次 run_command 前要写 `~/.gemini/antigravity-cli/bin/agentapi`，两个沙箱此前把该目录只读挂载；现在它是 tmpfs，宿主自带的文件只读绑定回去，不向宿主写回任何内容。
 - 派活时限（#83）：provider 子命令（`makewand codex|claude|agy|grok|muse ...`）与 review、run、race、ensemble 未给 `--timeout` 时单次时限跟随 `--total-timeout`，两者都给取较小值，都不给时默认值不变（300 秒，ensemble 900 秒）。此前照抄 route 的建议（不带 `--timeout`）会让重活在 5 分钟时以退出码 16 结束。route 按任务类型与难度打印 `--timeout`/`--total-timeout`（review/test/research/doc 为 900/1800/5400 秒，implement 为 1200/3600/10800 秒），review 加 `--readonly`，`--json` 同样包含。守护进程跟随请求的期限（不再封顶 600 秒，安全上限 6 小时），拒绝长预算的旧守护进程改为独立运行；观察器只在任务自身的截止时间之后才判定挂起；交互会话重新标记为派发方；`--total-timeout` 为 0 或负数时明确报错。
-- 有界派发改用 Go/Python 共享的机器账本 `call-budget.json`；任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按 Asia/Shanghai 午夜重置。已结算记录保留 48 小时，写入时清理；未结束记录、活动租约和预留所引用的计数保留，旧 lifetime 上限不因清理退款。详见 [预算与租约](docs/layered-call-admission.md)。（#84）
+- 有界派发改用 Go/Python 共享的机器账本 `call-budget.json`；任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按本地时区午夜重置（`MAKEWAND_BUDGET_TIMEZONE` 可指定时区）。已结算记录保留 48 小时，写入时清理；未结束记录、活动租约和预留所引用的计数保留，旧 lifetime 上限不因清理退款。详见 [预算与租约](docs/layered-call-admission.md)。（#84）
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。（#84）
 - quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。（#84）
 - provider worker 采用严格命令白名单，仅允许 `search`、`repomap`、静态 `help`、`completion <shell>` 和单独的帮助/版本参数；`quota`、`status`、`route`、`mark`、`outcome` 等管理命令均拒绝。详见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。（#84）
