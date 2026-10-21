@@ -82,22 +82,32 @@ namespace. Bubblewrap enables loopback inside it for local test servers; host
 loopback, host abstract sockets and the host default route remain inaccessible.
 A dependency step is split so only downloading uses the network (owner decision,
 2026-10-21): a fetch that runs no project code (`pip download --only-binary=:all:`
-of the named index requirements parsed from the requirement and constraint files —
-never the files or a buildable target they name — and the `pyproject.toml`
-build-system requires, `npm`/`cargo fetch`, `go mod download`/`tidy`) gets
+of the strict PEP 508 **named** requirements only — never a requirement/constraint
+file, nor a buildable `file:`/path/sdist/VCS/URL or `name @ …` target it names,
+wherever it comes from, `[project] dependencies` and `[build-system] requires`
+included — plus the install's http(s) index options and a named-pins constraints
+file; `npm`/`cargo fetch`, `go mod download`/`tidy`) gets
 outbound-only `slirp4netns` networking restricted to public destinations — built
-without the host module caches and with workspace secrets masked — and fills the
-sandbox's own caches; the build/install that may run project code (`setup.py`, a
-PEP 517 backend, `build.rs`) runs loopback-only from what was fetched (`pip install
---no-index --find-links`, including `-e .`; `cargo build --offline`). Without the
-network tools the fetch runs loopback-only, keeping the host caches
+without the host module caches and with workspace secrets masked (the whole `.git`
+and workspace `.cargo`, `ProjectIgnoreDirs` subtrees, and more credential shapes) —
+and fills the sandbox's own caches; the build/install that may run project code
+(`setup.py`, a PEP 517 backend, `build.rs`) runs loopback-only from what was
+fetched (`pip install --no-index --find-links`, including `-e .`; `cargo build
+--offline`). `npm` sets `npm_config_ignore_scripts=true`, and when a dependency
+would run project code to fetch (a `file:`/`link:`/local or git dependency's
+`prepare`, which runs even under `--ignore-scripts` on some npm versions) the
+networked fetch is refused as an environment condition; `cargo fetch` additionally
+pins `RUSTC`, clears the rustc-wrapper variables, forces cargo's built-in
+credential provider and uses a private `CARGO_HOME`. Without the network tools the
+fetch runs loopback-only, keeping the host caches
 ([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)). A
 source-only distribution the fetch cannot get as a wheel is reported as
 `ErrDependencyNetworkUnavailable`, an environment limitation of fetch-only
-networking rather than a candidate failure; a dependency that only surfaces once
-project code runs in the loopback build (a repository-built or dynamically-computed
-one) is attributed to the candidate from the project's files, since build-step
-output can be forged.
+networking rather than a candidate failure; a requirement that does not exist on
+the default index at all (a code-free index fact check during the fetch) and a
+dependency that only surfaces once project code runs in the loopback build (a
+repository-built or dynamically-computed one, or a prefetched build that fails and
+forges pip's output) are attributed to the candidate.
 A failed fetch is reported as `ErrDependencyNetworkUnavailable`, an environment
 problem rather than a candidate failure, only when makewand confirms the outage:
 with network, its own connectivity check of the ecosystem's default registry

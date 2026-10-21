@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -167,6 +168,70 @@ var (
 // environment problem, never evidence about the candidate.
 var ErrDependencyNetworkUnavailable = errors.New("dependency install could not reach the network")
 
+// pypiProjectStatus is whether a project exists on the package index.
+type pypiProjectStatus int
+
+const (
+	// pypiProjectUnknown: the index could not be asked (network error, a
+	// response other than 200/404/410, or an unusable name).
+	pypiProjectUnknown pypiProjectStatus = iota
+	// pypiProjectAbsent: the index has no such project (404/410).
+	pypiProjectAbsent
+	// pypiProjectPresent: the index has the project (200), so it exists but may
+	// offer no wheel.
+	pypiProjectPresent
+)
+
+// pypiProjectExists is the fact check distinguishing a nonexistent requirement
+// (the candidate's own broken dependency) from one that exists only as a
+// source distribution the wheel-only fetch cannot use (an environment
+// limitation). A package variable so tests inject a verdict without network.
+var pypiProjectExists = checkPyPIProject
+
+// pypiSimpleBaseURL is the PyPI simple index, where a project's page is 200
+// when it exists and 404 when it does not. A package variable for tests.
+var pypiSimpleBaseURL = "https://pypi.org/simple/"
+
+// pipNormalizedNameRe matches a PEP 503 normalized project name.
+var pipNormalizedNameRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+
+// checkPyPIProject asks the PyPI simple index whether a (PEP 503 normalized)
+// project exists. The request is code-free - a HEAD for a fixed index path,
+// no interpreter or project input beyond the name pip itself reported - so it
+// can run during the networked step from the host. It honours proxy settings
+// and times out quickly; anything but a clear 200 or 404/410 is unknown, which
+// keeps the conservative environment verdict.
+func checkPyPIProject(name string) pypiProjectStatus {
+	if !pipNormalizedNameRe.MatchString(name) {
+		return pypiProjectUnknown
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), registryProbeRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, pypiSimpleBaseURL+name+"/", nil)
+	if err != nil {
+		return pypiProjectUnknown
+	}
+	req.Header.Set("User-Agent", "makewand-registry-check")
+	client := &http.Client{
+		Timeout:   registryProbeRequestTimeout,
+		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, TLSHandshakeTimeout: registryProbeRequestTimeout},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return pypiProjectUnknown
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	_ = resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNotFound, http.StatusGone:
+		return pypiProjectAbsent
+	case http.StatusOK:
+		return pypiProjectPresent
+	default:
+		return pypiProjectUnknown
+	}
+}
+
 // sandboxNetworkKind is the network a verification command ran with.
 type sandboxNetworkKind int
 
@@ -191,6 +256,12 @@ type sandboxNetwork struct {
 	// attach, when set (kind None), is why the installed helper could not be
 	// attached; it replaces detail and remedy.
 	attach *userNetFailure
+	// prefetched marks the loopback build/install stage of a split dependency
+	// plan: its declared dependencies were already downloaded by the networked
+	// fetch, so a failure here is the candidate's own (its project code ran) and
+	// is never reclassified as an environment outage from its output, whatever
+	// that output claims (dependencyRegistryError).
+	prefetched bool
 }
 
 // environmentNote ends every guidance message.
