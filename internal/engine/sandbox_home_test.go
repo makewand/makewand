@@ -25,9 +25,11 @@ func writeExec(t *testing.T, path string) {
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
+	//nolint:gosec // G703: a test helper writing test-controlled paths under t.TempDir.
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:gosec // G703: a test helper writing test-controlled paths under t.TempDir.
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
