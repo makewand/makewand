@@ -1288,16 +1288,6 @@ func cliAppendTmpfsIfNotPresent(args []string, target string) []string {
 	return append(args, "--tmpfs", target)
 }
 
-// cliReadOnlyRun reports whether a CLI run in ctx is a read-only session: a
-// review, whose workspace the sandbox mounts read-only, or a remote-origin
-// request (ContextWithRemoteOrigin). Such a session keeps an empty tmpfs HOME
-// with only the private provider directories bound, and an unrecognized exit
-// of it does not stop fallback (readOnlyExitError).
-func cliReadOnlyRun(ctx context.Context) bool {
-	task, ok := TaskFromContext(ctx)
-	return ok && task == TaskReview || RemoteOriginFromContext(ctx)
-}
-
 // wrapCLICommandWithSandbox wraps a CLI provider command with bubblewrap (bwrap).
 // It isolates the execution by mounting the workspace (read-write or read-only
 // for review tasks), masking host roots (/root, /mnt, /media, /srv), and masking
@@ -1397,7 +1387,7 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
 		isReview = true
 	}
-	readOnlyProvider := cliReadOnlyRun(ctx)
+	readOnlyProvider := isReview || RemoteOriginFromContext(ctx)
 
 	childEnv := cliWithProviderWorkerEnv(sanitizeCLIEnv(provider, cmd.Env))
 	home := cliEnvValue(childEnv, "HOME")

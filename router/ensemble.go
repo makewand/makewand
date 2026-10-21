@@ -32,14 +32,22 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 // EnsembleWithError preserves terminal admission and unknown-outcome errors
 // instead of allowing ChatBest to replay failed generators through fallback.
 func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) ([]EnsembleResult, error) {
+	results, _, err := r.ensemble(ctx, phase, messages, system, exclude...)
+	return results, err
+}
+
+// ensemble is EnsembleWithError. Its terminal error prefers an unknown
+// outcome; refused tells whether admission or accounting refused a generator
+// too, which that error then does not show.
+func (r *Router) ensemble(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) ([]EnsembleResult, bool, error) {
 	var err error
 	ctx, err = r.executionContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	pe, ok := r.routingTables().powerEnsembleFor(phase)
 	if !ok {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	excluded := make(map[string]bool, len(exclude))
@@ -92,7 +100,7 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 			Phase:  buildPhaseName(phase),
 			Detail: "no available generator provider",
 		})
-		return nil, nil
+		return nil, false, nil
 	}
 	r.emitTrace(TraceEvent{
 		Event:  "ensemble_start",
@@ -104,6 +112,7 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 	results := make([]EnsembleResult, len(slots))
 	var terminalMu sync.Mutex
 	var terminalErr error
+	refused := false
 	var wg sync.WaitGroup
 	for i, s := range slots {
 		wg.Add(1)
@@ -141,6 +150,7 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 					if terminalErr == nil || errors.Is(res.err, execution.ErrUnknownOutcome) {
 						terminalErr = res.err
 					}
+					refused = refused || !onlyUnknownOutcome(res.err)
 					terminalMu.Unlock()
 				}
 				modelID := res.route.ModelID
@@ -176,7 +186,7 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 		Phase:  buildPhaseName(phase),
 		Detail: fmt.Sprintf("success=%d/%d usable=%d", len(out), len(slots), usable),
 	})
-	return out, terminalErr
+	return out, refused, terminalErr
 }
 
 // judgeSelect asks the designated judge provider to pick the best result from an ensemble.
@@ -450,7 +460,7 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 		Detail: "mode=power",
 	})
 
-	attempts, ensembleErr := r.EnsembleWithError(ctx, phase, messages, system, exclude...)
+	attempts, refused, ensembleErr := r.ensemble(ctx, phase, messages, system, exclude...)
 	results := make([]EnsembleResult, 0, len(attempts))
 	for _, result := range attempts {
 		if strings.TrimSpace(result.Content) != "" {
@@ -459,8 +469,9 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	}
 	// A generator whose outcome is unknown is never replayed, but it does not
 	// discard the answers the others gave either: its attempt stays in the
-	// trace (ensemble_generator_error) and in the usage below.
-	if ensembleErr != nil && (len(results) == 0 || !onlyUnknownOutcome(ensembleErr)) {
+	// trace (ensemble_generator_error) and in the usage below. A generator
+	// refused by admission or accounting still ends the request.
+	if ensembleErr != nil && (len(results) == 0 || refused || !onlyUnknownOutcome(ensembleErr)) {
 		var total Usage
 		for _, attempt := range attempts {
 			total = accumulateAttemptUsage(total, attempt.Usage)

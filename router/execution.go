@@ -224,14 +224,28 @@ func (e *readOnlyUnknownError) Error() string {
 func (e *readOnlyUnknownError) Unwrap() error        { return e.err }
 func (e *readOnlyUnknownError) Is(target error) bool { return target == execution.ErrUnknownOutcome }
 
-// readOnlyExitError marks err, the error of a finished CLI run, as a read-only
-// run's unknown outcome when the run was read-only (cliReadOnlyRun) and its
-// exit says nothing the catalog recognizes: an ordinary exit (ErrorKindProvider)
-// or one that looks transient (ErrorKindNetwork). A refusal, a quota limit, a
-// timeout and a run without a complete exit result are left as they are.
-func readOnlyExitError(ctx context.Context, err error) error {
+// cliRunReadOnly reports whether a CLI run in ctx could not have written the
+// workspace: a review, which the sandbox runs on a read-only mount of it, or a
+// remote-origin request without a WorkDir of its own, which runs in a scratch
+// directory removed afterwards (and always in the sandbox). A run outside the
+// sandbox (sandboxed false: MAKEWAND_UNSAFE_HOST_EXEC) has no such mount, and
+// a remote-origin request with a WorkDir has it mounted writable.
+func cliRunReadOnly(ctx context.Context, sandboxed bool) bool {
+	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		return sandboxed
+	}
+	_, workDir := WorkDirFromContext(ctx)
+	return sandboxed && RemoteOriginFromContext(ctx) && !workDir
+}
+
+// readOnlyExitError marks err, the error of a finished read-only CLI run
+// (cliRunReadOnly), as such a run's unknown outcome when its exit says nothing
+// the catalog recognizes: an ordinary exit (ErrorKindProvider) or one that
+// looks transient (ErrorKindNetwork). A refusal, a quota limit, a timeout and
+// a run without a complete exit result are left as they are.
+func readOnlyExitError(err error) error {
 	var providerErr *ProviderError
-	if err == nil || !cliReadOnlyRun(ctx) || errors.Is(err, execution.ErrUnknownOutcome) ||
+	if err == nil || errors.Is(err, execution.ErrUnknownOutcome) ||
 		!errors.As(err, &providerErr) || providerErr.Op != "CLI" ||
 		(providerErr.Kind != ErrorKindProvider && providerErr.Kind != ErrorKindNetwork) {
 		return err
