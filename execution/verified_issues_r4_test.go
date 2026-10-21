@@ -75,8 +75,10 @@ func TestR4CapacityFallbackInspectedOnlyAfterBusy(t *testing.T) {
 	if _, err := Reserve(ctx, Metadata{Engine: "codex"}); !errors.Is(err, ErrConcurrencyBusy) {
 		t.Fatalf("busy admission: %v", err)
 	}
-	if checks != 1 || time.Since(started) > 100*time.Millisecond {
-		t.Fatalf("did not immediately use fallback: checks=%d", checks)
+	// "Immediately" means without the 10 s lease wait; a fixed 100 ms bound
+	// failed under -race on the Windows runner.
+	if elapsed := time.Since(started); checks != 1 || elapsed > 5*time.Second {
+		t.Fatalf("did not immediately use fallback: checks=%d after %s", checks, elapsed)
 	}
 	t.Setenv("MAKEWAND_MACHINE_DAILY_CALLS", "1")
 	if _, err := Reserve(ctx, Metadata{Engine: "codex"}); !errors.Is(err, ErrBudgetExhausted) {
