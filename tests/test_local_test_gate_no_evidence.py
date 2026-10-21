@@ -107,6 +107,33 @@ class PytestHiddenInSandboxTests(GateCase):
         self.assertIn("unittest", self.commands[2])
         self.assertFalse(any(cmd[0] == "pytest" and "--version" not in cmd for cmd in self.commands))
 
+    def test_host_pytest_script_the_sandbox_cannot_start_is_ruled_out(self):
+        # A pytest script in a host directory the sandbox does not bind: bwrap cannot
+        # exec it. The old gate called that a sandbox failure and never tried unittest.
+        host_script = {"pytest": "/home/alice/venv/bin/pytest"}
+
+        def respond(cmd):
+            if is_probe(cmd):
+                return 1, "", QUOTED, exited(1)
+            if is_script_probe(cmd):
+                return 1, "", "bwrap: execvp pytest: No such file or directory\n", exited(1)
+            return 0, "", "Ran 1 test in 0.001s\n\nOK\n", None
+        ok, details = self.gate(respond, which=host_script, host_pytest=False)
+        self.assertTrue(ok, details)
+        self.assertIn("unittest", self.commands[-1])
+        (self.root / "pytest.ini").write_text("[pytest]\n")
+        self.commands.clear()
+        details = self.assert_unverified(self.gate(respond, which=host_script, host_pytest=False))
+        self.assertIn("项目配置了 pytest", details)
+        self.assertEqual(len(self.commands), 2)
+
+    def test_sandbox_that_cannot_start_the_interpreter_is_still_an_infrastructure_failure(self):
+        def respond(cmd):
+            return 1, "", f"bwrap: execvp {cmd[0]}: No such file or directory\n", exited(1)
+        details = self.assert_unverified(self.gate(respond, which={"pytest": "/home/alice/venv/bin/pytest"}))
+        self.assertIn("沙箱容器基础设施故障", details)
+        self.assertEqual(len(self.commands), 1)
+
     def test_pytest_configuration_without_pytest_in_sandbox_runs_nothing(self):
         (self.root / "pytest.ini").write_text("[pytest]\n")
         details = self.assert_unverified(self.gate(lambda cmd: (1, "", QUOTED, exited(1))))
@@ -166,6 +193,62 @@ class NothingCollectedTests(GateCase):
                 return 1, "", "/usr/bin/python3: No module named pytest\n", exited(1)
             return 5, "", NO_TESTS_RAN, exited(5)
         self.assert_unverified(self.gate(respond))
+
+
+class NoEvidenceAfterRunTests(GateCase):
+    """A run that produced no evidence still goes through the checks after the suites."""
+
+    def nothing_collected(self, side_effect):
+        def respond(cmd):
+            if is_probe(cmd):
+                return 0, "", "", None
+            side_effect()
+            return 5, "\nno tests ran in 0.01s\n", "", exited(5)
+        return respond
+
+    def test_test_output_of_a_run_that_collected_nothing_is_removed(self):
+        # pytest writes the --junitxml report even when it collects nothing.
+        (self.root / "test_app.py").unlink()
+        (self.root / "pytest.ini").write_text("[pytest]\naddopts = --junitxml=report.xml\n")
+        report = self.root / "report.xml"
+        details = self.assert_unverified(self.gate(self.nothing_collected(lambda: report.write_text("<testsuites/>"))))
+        self.assertIn("exit 5", details)
+        self.assertFalse(report.exists())
+
+    def test_run_without_tests_that_changed_an_input_or_left_runnable_output_fails(self):
+        (self.root / "app.py").write_text("VALUE = 1\n")
+
+        def runnable_report():
+            (self.root / "junit.xml").write_text("<testsuites/>")
+            (self.root / "junit.xml").chmod(0o755)
+        cases = {"changed input": (lambda: (self.root / "app.py").write_text("VALUE = 2\n"), "测试修改了待交付输入"),
+                 "runnable output": (runnable_report, "可能作为代码执行")}
+        for label, (side_effect, reason) in cases.items():
+            with self.subTest(label):
+                ok, details = self.gate(self.nothing_collected(side_effect))
+                self.assertFalse(ok)
+                self.assertNotIsInstance(details, orch.LocalTestsUnavailable)
+                self.assertIn(reason, details)
+                self.assertIn("exit 5", details)
+                (self.root / "app.py").write_text("VALUE = 1\n")
+                (self.root / "junit.xml").unlink(missing_ok=True)
+
+    def test_failing_tests_stand_when_a_later_suite_ran_no_tests(self):
+        # The old gate returned the Go suite's "no tests" as UNVERIFIED and dropped the
+        # Python suite's failing test.
+        (self.root / "go.mod").write_text("module example.invalid/fixture\n")
+
+        def respond(cmd):
+            if is_probe(cmd):
+                return 0, "", "", None
+            if cmd[0] == "go":
+                return 0, "ok  \texample.invalid/fixture\t0.01s [no tests to run]\n", "", None
+            return 1, "F\nFAILED test_app.py::test_app - assert 1 == 2\n1 failed in 0.01s\n", "", exited(1)
+        ok, details = self.gate(respond, which={"go": "/usr/bin/go"})
+        self.assertFalse(ok)
+        self.assertNotIsInstance(details, orch.LocalTestsUnavailable)
+        self.assertIn("[Python Tests Failed (exit 1)]", details)
+        self.assertIn("Go 测试套件未发现任何有效测试用例", details)
 
 
 class PytestImportErrorTests(GateCase):

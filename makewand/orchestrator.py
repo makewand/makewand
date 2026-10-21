@@ -1059,6 +1059,35 @@ def _sandbox_infra_failure(code, stdout, stderr, err_category) -> Optional[str]:
     return infra_err
 
 
+def _suite_without_evidence(name, cmd, code, stdout, stderr, err_category) -> Optional[LocalTestsUnavailable]:
+    """Why a finished suite run is no test evidence (the sandbox failed, nothing was
+    collected or run, pytest is missing), or None when it is a result."""
+    output = (stdout + "\n" + stderr).strip()
+    if code != 0:
+        infra_err = _sandbox_infra_failure(code, stdout, stderr, err_category)
+        if infra_err:
+            return LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
+    if name == "Python":
+        if code == _NO_TESTS_EXIT:
+            if "unittest" in cmd:
+                return LocalTestsUnavailable(
+                    "沙箱内的 Python 无法导入 pytest，unittest 未发现可运行的测试用例 (exit 5)；"
+                    "pytest 风格的测试需要沙箱内可导入的 pytest，验收未执行")
+            return LocalTestsUnavailable("pytest 未收集到任何测试用例 (exit 5)，不能作为验收证据，验收未执行")
+        missing = _PYTEST_MISSING.search(output) if code != 0 else None
+        if missing:
+            return LocalTestsUnavailable(f"沙箱内无法导入 pytest（{missing.group(0)}），Python 测试无法运行，验收未执行")
+        if code == 0 and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", output) or "Exit:" in output):
+            return LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
+    # A package-level PASS also appears when every test was skipped. Require
+    # one verbose test/example PASS; dependencies with no tests are harmless.
+    if code == 0 and name == "Go" and not re.search(r"(?m)^--- PASS: \S+", stdout):
+        return LocalTestsUnavailable("Go 测试套件未发现任何有效测试用例，不能作为通过的验收证据")
+    if code == 0 and name == "Node" and re.search(r"\b(No tests found|0 passing)\b", output):
+        return LocalTestsUnavailable("Node 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
+    return None
+
+
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
     Deterministically detects and runs local unit test suites in cwd inside Bubblewrap sandbox.
@@ -1068,7 +1097,8 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     If no tests exist in project, returns (True, None).
     Tests that cannot run (no runner, nothing collected, sandbox failure) return
     LocalTestsUnavailable; a budget that runs out first returns LocalTestsTimedOut.
-    Neither is a test failure.
+    Neither is a test failure, but failing tests an earlier suite reported, or a run
+    that changed tested inputs or left test output that could run as code, still fail.
     Test output the run created is removed again (_discard_created_test_output), so
     that it is neither a change after the test nor part of the reviewed change.
     """
@@ -1170,8 +1200,9 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         """
         py_bin = sys.executable or "python3"
         # (probe, runner, lenient): a lenient probe rules its runner out only on pytest's
-        # own import error. `pytest --version` may load plugins and conftest.py, and a
-        # failure there is left for the real run to report.
+        # own import error, or when the sandbox cannot start the host's pytest script.
+        # `pytest --version` may load plugins and conftest.py, and a failure there is
+        # left for the real run to report.
         options = [([py_bin, "-B", "-c", "import pytest"], [py_bin, "-B", "-m", "pytest", *_PYTEST_ARGS], False)]
         if shutil.which("pytest"):
             options.append((["pytest", *_PYTEST_ARGS, "--version"], ["pytest", *_PYTEST_ARGS], True))
@@ -1183,6 +1214,10 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             if remaining_timeout() <= 0:
                 break
             infra_err = _sandbox_infra_failure(code, stdout, stderr, err_category)
+            if infra_err and lenient and infra_err.lstrip().startswith("bwrap: execvp "):
+                # The interpreter probe already ran in this sandbox, so the sandbox works:
+                # the script is outside what it binds.
+                continue
             if infra_err:
                 return None, LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
             if code == 0 or (lenient and not _PYTEST_MISSING.search(stdout + "\n" + stderr)):
@@ -1195,17 +1230,22 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
 
     failed = False      # a suite reported failing tests, or the run changed deliverable inputs
     timed_out = False   # the budget ran out before every suite produced a result
+    unavailable = None  # why a suite could not run or ran no tests (LocalTestsUnavailable)
     details = []
 
+    # A suite that produced no evidence stops the loop; the checks after it still remove
+    # the test output the run created and fail a run that changed tested inputs.
     for name, cmd, env in test_suites:
         if name == "Python":
-            cmd, unavailable = python_runner(env)
-            if isinstance(unavailable, LocalTestsTimedOut):
+            cmd, reason = python_runner(env)
+            if isinstance(reason, LocalTestsTimedOut):
                 timed_out = True
-                details.append(str(unavailable))
+                details.append(str(reason))
                 break
-            if unavailable is not None:
-                return False, unavailable
+            if reason is not None:
+                unavailable = reason
+                details.append(str(reason))
+                break
         step_timeout = remaining_timeout()
         if step_timeout <= 0:
             timed_out = True
@@ -1220,33 +1260,10 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             details.append(f"[{name} Tests Timed Out]: 本地测试总时间预算已耗尽，未取得测试结果")
             break
 
-        if code != 0:
-            infra_err = _sandbox_infra_failure(code, stdout, stderr, err_category)
-            if infra_err:
-                return False, LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
-
-        if name == "Python":
-            unittest_fallback = "unittest" in cmd
-            if code == _NO_TESTS_EXIT:
-                if unittest_fallback:
-                    return False, LocalTestsUnavailable(
-                        "沙箱内的 Python 无法导入 pytest，unittest 未发现可运行的测试用例 (exit 5)；"
-                        "pytest 风格的测试需要沙箱内可导入的 pytest，验收未执行")
-                return False, LocalTestsUnavailable("pytest 未收集到任何测试用例 (exit 5)，不能作为验收证据，验收未执行")
-            missing = _PYTEST_MISSING.search(output) if code != 0 else None
-            if missing:
-                return False, LocalTestsUnavailable(
-                    f"沙箱内无法导入 pytest（{missing.group(0)}），Python 测试无法运行，验收未执行")
-            if code == 0 and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", output) or "Exit:" in output):
-                return False, LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
-
-        # A package-level PASS also appears when every test was skipped. Require
-        # one verbose test/example PASS; dependencies with no tests are harmless.
-        if code == 0 and name == "Go" and not re.search(r"(?m)^--- PASS: \S+", stdout):
-            return False, LocalTestsUnavailable("Go 测试套件未发现任何有效测试用例，不能作为通过的验收证据")
-
-        if code == 0 and name == "Node" and re.search(r"\b(No tests found|0 passing)\b", stdout + "\n" + stderr):
-            return False, LocalTestsUnavailable("Node 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
+        unavailable = _suite_without_evidence(name, cmd, code, stdout, stderr, err_category)
+        if unavailable is not None:
+            details.append(str(unavailable))
+            break
 
         if code != 0:
             failed = True
@@ -1291,8 +1308,10 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
 
     report = "\n\n".join(details)
     if failed:
-        # Evidence of a failure stands even when a later suite ran out of time.
+        # Evidence of a failure stands even when a later suite ran out of time or could not run.
         return False, report
+    if unavailable is not None:
+        return False, unavailable
     if timed_out:
         return False, LocalTestsTimedOut(report)
     return True, report
