@@ -23,7 +23,10 @@ class LayeredBudgetTests(unittest.TestCase):
                          MAKEWAND_LAYERED_BUDGET="1", MAKEWAND_MAX_MODEL_CALLS="5",
                          MAKEWAND_PROJECT_DAILY_CALLS="10", MAKEWAND_MACHINE_DAILY_CALLS="10",
                          MAKEWAND_PROJECT_ROOT=self.tmp.name, MAKEWAND_TASK_ID="task-a",
-                         MAKEWAND_ACCOUNT_CONCURRENCY="100", MAKEWAND_POOL_CONCURRENCY="100")
+                         MAKEWAND_ACCOUNT_CONCURRENCY="100", MAKEWAND_POOL_CONCURRENCY="100",
+                         # The fixed timestamps below are Shanghai midnights; day buckets
+                         # follow the local zone unless this pins them (CI runs in UTC).
+                         MAKEWAND_BUDGET_TIMEZONE="Asia/Shanghai")
         env.start()
         self.addCleanup(env.stop)
 
