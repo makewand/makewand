@@ -3,8 +3,8 @@ package router
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +25,10 @@ type credentialFingerprint struct {
 type credentialBinding struct {
 	Root  string
 	Files map[string]credentialFingerprint
+	// IdentityKnown: the login names its account (codex account_id, Claude
+	// accountUuid) and is bound by it, so a refresh of its tokens is no account
+	// switch. Only a login without a known account is bound by token bytes.
+	IdentityKnown bool
 }
 
 // Fingerprints live only in this invocation; they are never ledger/evidence fields.
@@ -42,7 +46,9 @@ func readCredentialBinding(provider string) (*credentialBinding, error) {
 		paths = []string{filepath.Join(root, ".credentials.json"), identity}
 	}
 	b := &credentialBinding{Root: root, Files: map[string]credentialFingerprint{}}
-	for _, path := range paths {
+	raws := make([][]byte, len(paths))
+	exists := make([]bool, len(paths))
+	for i, path := range paths {
 		read := cliReadRegularFile
 		if filepath.Base(path) == ".claude.json" {
 			read = cliReadIdentityMetadata
@@ -50,32 +56,57 @@ func readCredentialBinding(provider string) (*credentialBinding, error) {
 		raw, err := read(path)
 		// Unavailable credentials are unknown, just like unavailable identity
 		// metadata. Copy-time verification still detects a later readable login.
-		f := fingerprintCredential(path, raw, err == nil)
-		b.Files[canonicalQuotaRoot(path)] = f
+		raws[i], exists[i] = raw, err == nil
+		if exists[i] && credentialAccountRef(path, raw) != "" {
+			b.IdentityKnown = true
+		}
+	}
+	for i, path := range paths {
+		b.Files[canonicalQuotaRoot(path)] = fingerprintCredential(path, raws[i], exists[i], b.IdentityKnown)
 	}
 	return b, nil
 }
-func fingerprintCredential(path string, raw []byte, exists bool) credentialFingerprint {
+
+// fingerprintCredential binds one credential file of a login. identityKnown
+// tells whether the login names its account (credentialBinding.IdentityKnown).
+func fingerprintCredential(path string, raw []byte, exists, identityKnown bool) credentialFingerprint {
 	f := credentialFingerprint{Exists: exists}
 	if !exists {
 		return f
 	}
-	if filepath.Base(path) == ".claude.json" {
-		// Only the login projection binds state; projects and counters change
-		// on normal Claude Code startup and must not invalidate admission.
-		var identity struct {
-			OAuthAccount struct {
-				AccountUUID string `json:"accountUuid"`
-			} `json:"oauthAccount"`
-		}
-		if json.Unmarshal(raw, &identity) == nil {
-			f.IdentityRef = quotaAccountRef("claude", identity.OAuthAccount.AccountUUID)
-		}
-	} else {
+	f.IdentityRef = credentialAccountRef(path, raw)
+	// Only the login projection of .claude.json binds state; projects and
+	// counters change on normal Claude Code startup and must not invalidate
+	// admission. Token bytes bind only a login without a known account.
+	if filepath.Base(path) != ".claude.json" && !identityKnown {
 		f.Sum = sha256.Sum256(raw)
 	}
 	return f
 }
+
+// credentialAccountRef is the account reference of the login file at path
+// (codex auth.json, Claude .claude.json; quotaAccountID), "" for none.
+func credentialAccountRef(path string, raw []byte) string {
+	switch filepath.Base(path) {
+	case "auth.json":
+		return quotaAccountRef("codex", quotaAccountID("codex", raw))
+	case ".claude.json":
+		return quotaAccountRef("claude", quotaAccountID("claude", raw))
+	}
+	return ""
+}
+
+// accountRef is the bound login's account reference as readQuotaIdentity
+// gives it: the account the login names, or its credential root's unknown one.
+func (b *credentialBinding) accountRef(provider string) string {
+	for _, f := range b.Files {
+		if f.IdentityRef != "" {
+			return f.IdentityRef
+		}
+	}
+	return unknownQuotaIdentity(provider, b.Root).AccountRef
+}
+
 func (b *credentialBinding) verify(path string, raw []byte, exists bool) error {
 	if b == nil {
 		return nil
@@ -88,7 +119,7 @@ func (b *credentialBinding) verify(path string, raw []byte, exists bool) error {
 		}
 		return nil
 	} // auxiliary caches do not establish a login
-	got := fingerprintCredential(path, raw, exists)
+	got := fingerprintCredential(path, raw, exists, b.IdentityKnown)
 	if got != expected {
 		return errors.New("selected login changed after admission; refusing account switch")
 	}
@@ -103,6 +134,23 @@ func bindCredentialAdmission(ctx context.Context, provider string) (context.Cont
 		return ctx, nil
 	}
 	return context.WithValue(ctx, credentialBindingKey{}, b), nil
+}
+
+// bindLeasedCredentials binds ctx to provider's login as it is once the attempt
+// holds its account lease: the lease holder it waited for may have refreshed
+// that login's tokens, and launch preparation compares against the current
+// ones. admitted is the login's account reference at admission
+// (readQuotaIdentity); another account now is a login switch during the wait,
+// refused before launch.
+func bindLeasedCredentials(ctx context.Context, provider, admitted string) (context.Context, error) {
+	ctx, err := bindCredentialAdmission(ctx, provider)
+	if err != nil {
+		return ctx, fmt.Errorf("%w: %w", errExecutionAccounting, err)
+	}
+	if b, _ := ctx.Value(credentialBindingKey{}).(*credentialBinding); b != nil && b.accountRef(provider) != admitted {
+		return ctx, fmt.Errorf("%w: selected login changed while waiting for its account lease; refusing account switch", errExecutionAdmission)
+	}
+	return ctx, nil
 }
 func verifyCredentialBinding(ctx context.Context, provider string) error {
 	b, _ := ctx.Value(credentialBindingKey{}).(*credentialBinding)

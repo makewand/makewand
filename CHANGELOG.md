@@ -87,6 +87,7 @@ All notable changes to this project are documented here. The format is based on
 ### Fixed
 
 - Go 路由：#84 起普通 CLI 退出一律算结果未知，回退停止，Power 模式丢弃已有回答。现按证据区分：CLI 自己打印、由消息目录识别的拒绝（未登录或凭据被拒，agy 拒绝参数）是结果已知的失败，照常回退并计入熔断（熔断后的半开探测失败也会回退，冷却时间逐次加倍）；只读运行（审查、`serve` 远端请求）的未识别退出仍记为未知，但可回退到下一个 provider；可写运行的未识别退出仍为未知并停止重派。Power 模式某个生成方或裁判结果未知时返回其他生成方的回答，未知尝试保留在 trace 与用量中。
+- Go 路由：凭据准入快照改在拿到账号租约之后拍摄；已知账号（codex `account_id`、Claude `accountUuid`）按账号比对，不再比对令牌字节，持有租约的运行刷新同一账号的令牌不再让排队的运行报 "selected login changed after admission"；等待期间换成其他账号仍拒绝，并在启动前释放预留。
 - agy：启动时的 glog 行 "not logged into Antigravity" 不再被误判为需要重新登录（此前 agy 任意一次失败后都会被停用 30 分钟）；深度档不再传 agy 不支持的 `--effort max`；参数被拒按"结果已知的失败"处理，审查会换下一个审查方。
 - 无沙箱的宿主路径改用环境变量传递 provider 标记，Windows 上不再依赖不存在的 `env` 命令。
 - 3.2.0 的说明中网络隔离开关应为 `MAKEWAND_SANDBOX_UNSHARE_NET=1`（并无 `MAKEWAND_DISABLE_UNSHARE_NET`）。

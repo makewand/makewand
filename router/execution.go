@@ -61,6 +61,9 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 	if inherited := takeProviderAttempt(ctx); inherited != nil {
 		return context.WithValue(ctx, providerLifecycleKey{}, inherited), inherited, nil
 	}
+	// A subscription login is bound once its account lease is held
+	// (bindLeasedCredentials); login is its account reference at admission.
+	subscription, login := false, ""
 	switch provider.(type) {
 	case *OpenAI, *Claude, *Gemini:
 		// API credentials do not identify the subscription login. Tag the
@@ -70,10 +73,7 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 		cfg.AccountRef = &account
 		ctx = execution.ContextWithConfig(ctx, cfg)
 	default:
-		ctx, err = bindCredentialAdmission(ctx, provider.Name())
-		if err != nil {
-			return ctx, nil, fmt.Errorf("%w: %w", errExecutionAccounting, err)
-		}
+		subscription = true
 		if provider.Name() == "codex" || provider.Name() == "claude" {
 			identity := readQuotaIdentity(provider.Name(), selectedQuotaRoot(provider.Name()))
 			if cfg.AccountRef != nil && identity.IdentityKnown && *cfg.AccountRef != identity.AccountRef {
@@ -83,9 +83,7 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 				cfg.AccountRef = &identity.AccountRef
 				ctx = execution.ContextWithConfig(ctx, cfg)
 			}
-		}
-		if err := verifyCredentialBinding(ctx, provider.Name()); err != nil {
-			return ctx, nil, err
+			login = identity.AccountRef
 		}
 	}
 	modelID, _ := ModelFromContext(ctx)
@@ -114,6 +112,16 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 			return ctx, nil, errors.Join(admissionErr, fmt.Errorf("%w: %w", errExecutionAccounting, releaseErr))
 		}
 		return ctx, nil, admissionErr
+	}
+	if subscription {
+		bound, err := bindLeasedCredentials(ctx, provider.Name(), login)
+		if err != nil {
+			if releaseErr := attempt.ReleaseUnstarted(); releaseErr != nil {
+				err = errors.Join(err, fmt.Errorf("%w: %w", errExecutionAccounting, releaseErr))
+			}
+			return ctx, nil, err
+		}
+		ctx = bound
 	}
 	// CLI account validation/copy happens before its launch boundary.
 	_, cli := provider.(*CLIProvider)

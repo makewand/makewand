@@ -154,9 +154,14 @@ all old processes are stopped before clearing uncertain leases; do not clear the
 merely because a heartbeat expired. Independently detached descendants that evade
 the tracked process group need stronger OS supervision for reliable recovery.
 
-Claude admission hashes `.credentials.json` but projects only
-`oauthAccount.accountUuid` (hashed reference plus existence) from `.claude.json`.
-Normal startup/project/cost state writes do not change that binding, even when
-account identity is unknown. Actual account/credential changes before transport
-invocation refuse launch and release call capacity; an invoked transport is never
+Go binds the selected login once the attempt holds its account lease, after any
+lease wait, so tokens a lease holder refreshed meanwhile are the ones bound. A
+login that names its account (codex `tokens.account_id`, Claude
+`oauthAccount.accountUuid`) is bound by that account: a token refresh of the same
+account, such as the lease holder's write-back, does not change the binding. Only
+a login without a known account is bound by the hashes of `auth.json` or
+`.credentials.json`. From `.claude.json` only the account (hashed reference plus
+existence) is projected, so normal startup/project/cost state writes do not change
+the binding. A switch to another account during the lease wait or before transport
+invocation refuses launch and releases call capacity; an invoked transport is never
 refunded. Direct-mode post-run account switches still produce UNKNOWN.
