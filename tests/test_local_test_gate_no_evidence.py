@@ -28,7 +28,7 @@ from makewand.workflow import last_result
 from test_g1_datasafety_pipeline import PipelineHarness, make_project
 
 QUOTED = ("Traceback (most recent call last):\n"
-          '  File "/home/user/.local/bin/pytest", line 5, in <module>\n'
+          '  File "/home/alice/.local/bin/pytest", line 5, in <module>\n'
           "    from pytest import console_main\n"
           "ModuleNotFoundError: No module named 'pytest'\n")
 NO_TESTS_RAN = ("\n----------------------------------------------------------------------\n"
@@ -100,7 +100,7 @@ class PytestHiddenInSandboxTests(GateCase):
             if is_probe(cmd) or is_script_probe(cmd):
                 return 1, "", QUOTED, exited(1)
             return 5, "", NO_TESTS_RAN, exited(5)
-        self.assert_unverified(self.gate(respond, which={"pytest": "/home/user/.local/bin/pytest"},
+        self.assert_unverified(self.gate(respond, which={"pytest": "/home/alice/.local/bin/pytest"},
                                          host_pytest=False))
         self.assertTrue(is_probe(self.commands[0]))
         self.assertTrue(is_script_probe(self.commands[1]))

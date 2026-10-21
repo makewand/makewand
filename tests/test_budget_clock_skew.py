@@ -26,7 +26,8 @@ from unittest.mock import patch
 from makewand import account_leases as leases
 from makewand import call_budget as b
 from makewand import layered_budget
-from makewand.execution_runtime import execution_context
+from makewand.execution_contract import ExecutionRequest
+from makewand.execution_runtime import execute, execution_context
 
 REPO = Path(__file__).resolve().parent.parent
 ACCOUNT = "codex:account:" + "a" * 32
@@ -182,6 +183,12 @@ class BudgetZoneTests(ClockSkewCase):
                     layered_budget.day_bucket(0)
                 with self.assertRaisesRegex(b.BudgetError, "MAKEWAND_BUDGET_TIMEZONE"):
                     b.reserve("fake", "fast", task_id="bad-zone")
+                # A configuration error, as in Go: not an exhausted budget, and nothing runs.
+                called = []
+                result = execute(ExecutionRequest(engine="fake", task_id="bad-zone", stage="provider"),
+                                 lambda timeout: called.append(timeout))
+                self.assertEqual((result.status, result.error_kind, called),
+                                 ("INTERNAL_ERROR", "budget_configuration", []))
 
     @unittest.skipUnless(hasattr(time, "tzset"), "time.tzset required")
     def test_unset_zone_follows_the_local_zone(self):

@@ -32,8 +32,12 @@ class BudgetCancelledError(BudgetError):
     """Admission was cancelled before a provider started."""
 
 
-class LeaseWaitConfigError(BudgetError):
+class BudgetConfigError(BudgetError):
     """Invalid admission configuration, not exhausted call capacity."""
+
+
+class LeaseWaitConfigError(BudgetConfigError):
+    """An invalid MAKEWAND_LEASE_WAIT_SECONDS."""
 
 
 _LEASE_WAIT_DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")

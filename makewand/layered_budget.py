@@ -52,12 +52,12 @@ def day_bucket(moment):
     name = os.environ.get(TIMEZONE_ENV, "").strip()
     if not name:
         return datetime.fromtimestamp(moment).strftime("%Y-%m-%d")
-    from makewand.call_budget import BudgetError
+    from makewand.call_budget import BudgetConfigError
     try:
         from zoneinfo import ZoneInfo
         zone = ZoneInfo(name)
     except (ValueError, KeyError, OSError) as error:  # ZoneInfoNotFoundError is a KeyError
-        raise BudgetError(f"{TIMEZONE_ENV} must name an IANA time zone such as Asia/Shanghai or UTC") from error
+        raise BudgetConfigError(f"{TIMEZONE_ENV} must name an IANA time zone such as Asia/Shanghai or UTC") from error
     return datetime.fromtimestamp(moment, zone).strftime("%Y-%m-%d")
 
 
