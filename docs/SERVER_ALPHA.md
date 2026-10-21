@@ -114,11 +114,12 @@ model.
 
 ### Remote Session Storage Limits
 
-`PUT /v1/sessions/<id>` is limited per account, the user, organization and
-project identity of the token that also namespaces its sessions; tokens
-without an identity, such as `--token`, share one account. By default an account stores at most
-1,000 sessions and 256 MiB, and no save may leave less than 1 GiB free on the
-sessions disk, which holds `state.db` by default:
+`PUT /v1/sessions/<id>` is limited per account. An account is the user,
+organization and project identity of the token, which also namespaces its
+sessions; tokens without an identity, such as `--token`, share one account. By
+default an account stores at most 1,000 sessions and 256 MiB, and no save may
+leave less than 1 GiB free on the sessions disk, which holds `state.db` by
+default:
 
 | Limit | Default | Flag / environment | Refusal |
 |---|---|---|---|
