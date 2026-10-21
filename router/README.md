@@ -117,10 +117,10 @@ the server's providers, not a token's allowlist, so such a token needs the
 `openai` provider. A `model` that nothing on the server serves gets the same
 400 `unknown model` error whether or not the request streams.
 
-`max_tokens` and `temperature` are accepted but
-currently ignored for compatibility. `response_format` supports `json_object`
-and a pragmatic subset of `json_schema`; `tools` and `tool_choice` provide a
-basic function-calling compatibility layer. When wrapped by `makewand serve`,
+`max_tokens` and `temperature` are accepted but currently ignored for
+compatibility. `response_format` supports `json_object` and a pragmatic
+subset of `json_schema`; `tools` and `tool_choice` provide a basic
+function-calling compatibility layer. When wrapped by `makewand serve`,
 each response also carries `X-Request-Id` for tracing and can be paired with
 the server-side usage ledger, admin APIs, embedded `/admin` console, and
 `/metrics` endpoint.
