@@ -177,7 +177,9 @@ func TestExecutionEvidenceFakeCLIUnknownAndStream(t *testing.T) {
 	}
 }
 
-func TestExecutionEvidenceUnavailableStopsLaunch(t *testing.T) {
+// A reservation that already crossed its launch boundary may have a running
+// provider: a failed record there still leaves the outcome unknown.
+func TestExecutionEvidenceUnavailableAfterStartStaysUnknown(t *testing.T) {
 	_, store := evidenceFixture(t)
 	blocked := filepath.Join(store, "file")
 	if err := os.WriteFile(blocked, []byte("x"), 0600); err != nil {
@@ -190,6 +192,60 @@ func TestExecutionEvidenceUnavailableStopsLaunch(t *testing.T) {
 	}
 	if err := initializeCLIEvidence(attempt, "codex"); !errors.Is(err, execution.ErrUnknownOutcome) {
 		t.Fatalf("evidence failure: %v", err)
+	}
+}
+
+// go-server-1021-6: with an unwritable evidence directory (a read-only cache,
+// a full disk) every CLI call used to fail before its launch with an unknown
+// outcome, which stops fallback: serve answered 503. The first record precedes
+// the launch, so its failure is degraded telemetry and the call runs normally.
+func TestExecutionEvidenceUnwritableBeforeLaunchIsDegradedTelemetry(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint("stream=", stream), func(t *testing.T) {
+			_, store := evidenceFixture(t)
+			blocked := filepath.Join(store, "file")
+			if err := os.WriteFile(blocked, []byte("x"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("MAKEWAND_EXECUTION_EVIDENCE_DIR", filepath.Join(blocked, "child"))
+			old := cliBwrapLookup
+			cliBwrapLookup = func(string) (string, error) { return "", exec.ErrNotFound }
+			defer func() { cliBwrapLookup = old }()
+			t.Setenv("MAKEWAND_CONFIG_DIR", os.Getenv("MAKEWAND_CONFIG_DIR"))
+			t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", os.Getenv("MAKEWAND_UNSAFE_HOST_EXEC"))
+			ack, err := cliTestWriteHostExecAck()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(ack)
+			ctx, ledger := budgetTestContext(t, 5)
+			bin := testfixture.WriteCLI(t, "codex", testfixture.Spec{Stdout: `{"type":"item.completed","item":{"type":"agent_message","text":"FIXTURE-ANSWER"}}` + "\n"})
+			provider := NewCodexCLI(bin)
+			messages := []Message{{Role: "user", Content: "fixture"}}
+			var content string
+			var callErr error
+			if stream {
+				ch, err := provider.ChatStream(ctx, messages, "", 100)
+				callErr = err
+				if ch != nil {
+					for chunk := range ch {
+						content += chunk.Content
+						if chunk.Error != nil {
+							callErr = chunk.Error
+						}
+					}
+				}
+			} else {
+				content, _, callErr = provider.Chat(ctx, messages, "", 100)
+			}
+			if callErr != nil || !strings.Contains(content, "FIXTURE-ANSWER") || stopExecutionReplay(callErr) {
+				t.Fatalf("degraded telemetry failed the call: content=%q err=%v", content, callErr)
+			}
+			attempts := budgetTestAttempts(t, ledger)
+			if len(attempts) != 1 || attempts[0]["status"] != "completed" || attempts[0]["result_status"] != "PASSED" || attempts[0]["outcome_known"] != true {
+				t.Fatalf("settlement lost the real outcome: %v", attempts)
+			}
+		})
 	}
 }
 

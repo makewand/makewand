@@ -1997,9 +1997,12 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
     # Private provider homes are gone by this point; consume their sanitized
     # observations only when bound to the selected actual account and pool.
     from makewand.execution_evidence import read_recent
-    for record in read_recent():
-        if (not identity or not identity["identity_known"] or record.get("engine") != provider
-                or record.get("identity_known") is not True or record.get("account_ref") != identity["account_ref"]
+    # This account's newest records only: other accounts' traffic cannot push them out.
+    records = (read_recent(engine=provider, account_ref=identity["account_ref"], pool_ref=identity["pool_ref"])
+               if identity and identity["identity_known"] else ())
+    for record in records:
+        if (record.get("engine") != provider or record.get("identity_known") is not True
+                or record.get("account_ref") != identity["account_ref"]
                 or record.get("pool_ref") != identity["pool_ref"]):
             continue
         for window in record.get("windows") or []:

@@ -6,8 +6,10 @@ module before anything from ``makewand`` is imported.  Importing it activates
 the isolation once per process:
 
 * ``HOME``, ``XDG_*``, ``MAKEWAND_CONFIG_DIR``, ``MAKEWAND_USAGE_FILE``,
-  ``MAKEWAND_ARTIFACTS_DIR`` and ``MAKEWAND_SHADOW_DIR`` point into a private
-  temporary root that is removed when the process exits;
+  ``MAKEWAND_ARTIFACTS_DIR``, ``MAKEWAND_SHADOW_DIR`` and
+  ``MAKEWAND_EXECUTION_EVIDENCE_DIR`` point into a private temporary root that
+  is removed when the process exits (provider evidence would otherwise default
+  to the user cache, which on Windows is ``LocalAppData``, not under ``HOME``);
 * the path constants of ``makewand.config`` (and copies of them already bound in
   other loaded ``makewand`` modules) are rewritten into that root;
 * provider credentials and policy switches (``*_API_KEY``, ``*_AUTH_TOKEN``,
@@ -402,6 +404,7 @@ def activate() -> SimpleNamespace:
         shadow_dir=home / ".local" / "state" / "makewand" / "shadow-worktrees",
         legacy_trio_cache=root / "legacy" / "trio_status.json",
         usage_file=root / "usage.json",
+        evidence_dir=root / "execution-evidence",
         bin_dir=root / "bin",
         stub_log=root / "stub_calls.log",
         network_log=root / "network_blocked.log",
@@ -434,6 +437,7 @@ def activate() -> SimpleNamespace:
             "XDG_RUNTIME_DIR": str(state.runtime_dir),
             "MAKEWAND_CONFIG_DIR": str(state.config_dir),
             "MAKEWAND_USAGE_FILE": str(state.usage_file),
+            "MAKEWAND_EXECUTION_EVIDENCE_DIR": str(state.evidence_dir),
             "MAKEWAND_ARTIFACTS_DIR": str(state.artifacts_dir),
             "MAKEWAND_SHADOW_DIR": str(state.shadow_dir),
             "LOCAL_MODEL_ENDPOINT": UNREACHABLE_LOCAL_ENDPOINT,

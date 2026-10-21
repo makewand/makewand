@@ -83,6 +83,9 @@ def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=
             raise BudgetError("model call maximum requires a shared ledger path")
         yield None, None
         return
+    if lock_deadline is not None and time.monotonic() >= lock_deadline:
+        # As Go's transaction gate: an already expired transaction does no I/O.
+        raise BudgetDeadlineError("execution deadline expired while acquiring the model call budget")
     with accounting_files.pin(value) as path:
         descriptor = path.open(path.lock_name, create=True, writable=True)
         path.lock_fd = descriptor
@@ -91,8 +94,6 @@ def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=
         lock_deadline = time.monotonic() + 5 if lock_deadline is None else lock_deadline
         try:
             while True:
-                if time.monotonic() >= lock_deadline:
-                    raise BudgetDeadlineError("execution deadline expired while acquiring the model call budget")
                 try:
                     filelock.flock(descriptor, filelock.LOCK_EX | filelock.LOCK_NB)
                     acquired = True
@@ -100,7 +101,11 @@ def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=
                 except OSError as error:
                     if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK) and getattr(error, "winerror", None) not in (33, 158):
                         raise
-                    time.sleep(min(.01, max(0, lock_deadline - time.monotonic())))
+                # The deadline bounds waiting for another holder, not this
+                # call's own I/O: a free lock is taken (as in Go's lockSidecar).
+                if time.monotonic() >= lock_deadline:
+                    raise BudgetDeadlineError("execution deadline expired while acquiring the model call budget")
+                time.sleep(min(.01, max(0, lock_deadline - time.monotonic())))
             path.assert_named(path.lock_name, descriptor)
             try:
                 ledger_fd = path.open(path.name)
@@ -260,7 +265,11 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
             budget_file=None, max_model_calls=None, deadline_monotonic=None, pending=False):
     try:
         deadline_monotonic = _admission_deadline() if deadline_monotonic is None else deadline_monotonic
-        with _ledger(budget_file, max_model_calls, deadline_monotonic) as (path, data):
+        # Admission without an execution deadline waits for the ledger like Go's
+        # Reserve. The fixed five-second lock budget bounds settlement; applied
+        # here it reported an expired deadline that no caller had set.
+        lock_deadline = math.inf if deadline_monotonic is None else deadline_monotonic
+        with _ledger(budget_file, max_model_calls, lock_deadline) as (path, data):
             _check_admission_cancelled()
             if data is None:
                 return None
@@ -311,24 +320,22 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
 
 def complete(attempt, success, seconds, *, result_status=None, outcome_known=True,
              tokens=None, monetary_cost=None, budget_file=None, max_model_calls=None):
+    """Settle the attempt. Returns whether its account lease is released (None without one)."""
     if attempt is None:
-        return
+        return None
     with _ledger(budget_file, max_model_calls) as (path, data):
         if data is None:
             raise BudgetError("model task reservation ledger disappeared")
         for entry in data["attempts"]:
             if entry["id"] == attempt:
-                if entry["status"] in ("completed", "released"):
-                    account_leases.settle(data, attempt)
-                    _save(path, data)
-                    return
-                entry.update(status="completed", success=bool(success), seconds=seconds,
-                             finished_at=time.time(), result_status=result_status,
-                             outcome_known=bool(outcome_known), tokens=tokens,
-                             monetary_cost=monetary_cost)
+                if entry["status"] not in ("completed", "released"):
+                    entry.update(status="completed", success=bool(success), seconds=seconds,
+                                 finished_at=time.time(), result_status=result_status,
+                                 outcome_known=bool(outcome_known), tokens=tokens,
+                                 monetary_cost=monetary_cost)
                 account_leases.settle(data, attempt)
                 _save(path, data)
-                return
+                return attempt not in data.get("leases", {})
         raise BudgetError("model task reservation disappeared")
 
 

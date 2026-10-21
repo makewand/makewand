@@ -135,12 +135,19 @@ class EvidenceTests(unittest.TestCase):
         quota = _get_official_subscription_quota("codex")
         self.assertTrue(quota is None or quota["percentage"] is None)
 
-    def test_write_failure_blocks_callback_and_after_launch_is_unknown(self):
+    def test_initial_write_failure_degrades_telemetry_and_after_launch_is_unknown(self):
+        # go-server-1021-6 parity: nothing has started when the first record
+        # fails (an unwritable directory, a full disk), so the call runs and
+        # keeps its real outcome; only its telemetry is missing.
         called = []
-        with patch.object(evidence, "save", side_effect=OSError("SECRET")):
-            result = execute(self.request(), lambda timeout: called.append(1))
-        self.assertEqual(result.status, "UNKNOWN")
-        self.assertEqual(called, [])
+        with patch.object(evidence, "save", side_effect=OSError("SECRET")) as save:
+            result = execute(self.request(), lambda timeout: called.append(1) or (True, "answer", None))
+        self.assertEqual(called, [1])
+        self.assertEqual((result.status, result.outcome_known), ("PASSED", True))
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(list(self.store.glob("*.json")), [])
+        attempt = json.loads((self.root / "budget.json").read_text())["attempts"][0]
+        self.assertEqual((attempt["status"], attempt["result_status"]), ("completed", "PASSED"))
         def callback(timeout):
             current_context()["_evidence"]["persistence_failed"] = True
             return True, "answer", None

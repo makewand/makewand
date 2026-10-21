@@ -164,13 +164,17 @@ func TestEvidenceFailureSettlesLeaseAndStopsHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A record exists, so a later failed write cannot be degraded telemetry.
+	if err := a.UpdateEvidence(func(*ProviderEvidence) {}); err != nil {
+		t.Fatal(err)
+	}
 	blocker := filepath.Join(t.TempDir(), "blocker")
 	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("MAKEWAND_EXECUTION_EVIDENCE_DIR", filepath.Join(blocker, "child"))
-	if err := a.UpdateEvidence(func(*ProviderEvidence) {}); err == nil {
-		t.Fatal("expected evidence error")
+	if err := a.UpdateEvidence(func(*ProviderEvidence) {}); err == nil || errors.Is(err, ErrEvidenceDegraded) {
+		t.Fatalf("expected evidence error: %v", err)
 	}
 	if err := a.Complete(Outcome{Status: Passed, Known: true}); err == nil {
 		t.Fatal("must report evidence error")

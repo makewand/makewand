@@ -3,10 +3,11 @@ package execution
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,10 @@ type ProviderEvidence struct {
 	OutcomeKnown    bool             `json:"outcome_known"`
 	ProcessExitCode *int             `json:"process_exit_code"`
 	Tokens          *int64           `json:"tokens"`
+	// Settled turns true only once the attempt's accounting is final: its
+	// ledger settled it and released its account lease, or it has no ledger.
+	// Retention prunes settled records only.
+	Settled bool `json:"settled"`
 }
 
 type EvidenceWindow struct {
@@ -39,6 +44,13 @@ type EvidenceWindow struct {
 	ResetAt     int64   `json:"reset_at_ms"`
 }
 
+// ErrEvidenceDegraded marks a first evidence write that failed before the
+// provider started. The call proceeds without a record: nothing on disk can
+// contradict its outcome, so it is degraded telemetry, not an unknown outcome.
+var ErrEvidenceDegraded = errors.New("provider evidence unavailable before launch; continuing without a record")
+
+var evidenceWarning sync.Once
+
 // EvidenceDirectory is shared with the Python runner. Every attempt owns one
 // atomic record; no bounded budget or optional telemetry switch is required.
 func EvidenceDirectory() (string, error) {
@@ -49,12 +61,20 @@ func EvidenceDirectory() (string, error) {
 	return filepath.Join(cache, "makewand", "execution-evidence"), err
 }
 
+// UpdateEvidence applies update and persists the record. Once a record exists
+// or the provider may have started, a failed write is kept and turns the
+// outcome UNKNOWN at completion. A failed first write before launch instead
+// degrades this attempt to no record at all (ErrEvidenceDegraded); later
+// updates are then no-ops.
 func (a *Attempt) UpdateEvidence(update func(*ProviderEvidence)) error {
 	if a == nil {
 		return nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.evidenceDegraded {
+		return nil
+	}
 	if a.evidence == nil {
 		a.evidence = &ProviderEvidence{Schema: 1, TaskID: a.TaskID, AttemptID: a.ID, Engine: a.metadata.Engine,
 			Source: "unavailable", ObservedAt: time.Now().UnixMilli(), Status: Unknown}
@@ -62,7 +82,20 @@ func (a *Attempt) UpdateEvidence(update func(*ProviderEvidence)) error {
 	update(a.evidence)
 	a.evidence.ObservedAt = time.Now().UnixMilli()
 	err := a.saveEvidence()
-	if err != nil {
+	switch {
+	case err == nil:
+		a.evidencePersisted = true
+	case !a.evidencePersisted && !a.startCommitted:
+		a.evidence, a.evidenceDegraded = nil, true
+		err = fmt.Errorf("%w: %w", ErrEvidenceDegraded, err)
+		if a.config.EventError != nil {
+			a.config.EventError(err)
+		} else {
+			evidenceWarning.Do(func() {
+				_, _ = fmt.Fprintln(os.Stderr, "warning: provider execution evidence unavailable; continuing without a record")
+			})
+		}
+	default:
 		a.evidenceError = err
 	}
 	return err
@@ -86,13 +119,36 @@ func (a *Attempt) saveEvidence() error {
 	}
 	ctx, cancel := a.evidenceWriteContext()
 	defer cancel()
-	return withLockedFile(ctx, path, directory, func(p *accountingPath) error {
+	err = withLockedFile(ctx, path, directory, func(p *accountingPath) error {
 		var value map[string]any
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return err
 		}
 		return writeLedgerFile(p, value)
 	})
+	if err == nil {
+		appendEvidenceIndex(filepath.Dir(path), directory, a.evidence)
+	}
+	return err
+}
+
+// settleEvidence marks the record settled and prunes the store when due. It
+// runs once the ledger settled the attempt and released its lease (or there
+// is no ledger). A record that cannot be marked stays open and is never pruned.
+func (a *Attempt) settleEvidence() {
+	if a.evidence == nil {
+		return
+	}
+	if !a.evidence.Settled {
+		a.evidence.Settled = true
+		if a.saveEvidence() != nil {
+			a.evidence.Settled = false
+			return
+		}
+	}
+	if dir, err := EvidenceDirectory(); err == nil {
+		_ = compactEvidence(dir, time.Now(), false)
+	}
 }
 
 func (a *Attempt) evidenceWriteContext() (context.Context, context.CancelFunc) {
@@ -107,24 +163,10 @@ func (a *Attempt) evidenceWriteContext() (context.Context, context.CancelFunc) {
 // ReadEvidence rejects non-regular and oversized records. Quota consumers must
 // additionally match account/pool and check each window's original timestamp.
 func ReadEvidence(path string) (ProviderEvidence, error) {
-	var value ProviderEvidence
 	p, err := openAccountingPath(path, false)
 	if err != nil {
-		return value, err
+		return ProviderEvidence{}, err
 	}
 	defer p.close()
-	file, err := openExecutionFile(p.root, p.name, os.O_RDONLY)
-	if err != nil {
-		return value, err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || info.Size() > 1<<20 {
-		return value, fmt.Errorf("invalid evidence file")
-	}
-	err = json.NewDecoder(io.LimitReader(file, 1<<20+1)).Decode(&value)
-	if err == nil && (value.Schema != 1 || !ValidIdentifier(value.AttemptID) || !ValidIdentifier(value.Engine)) {
-		err = fmt.Errorf("invalid provider evidence")
-	}
-	return value, err
+	return readEvidenceAt(p.root, p.name)
 }

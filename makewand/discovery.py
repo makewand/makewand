@@ -404,7 +404,7 @@ def _catalog_origin(path):
 
 def _verified_model_ids(provider):
     from makewand.execution_evidence import read_recent
-    return {row["actual_model"] for row in read_recent()
+    return {row["actual_model"] for row in read_recent(engine=provider)
             if row.get("engine") == provider and row.get("result_status") == "PASSED"
             and row.get("outcome_known") is True and type(row.get("process_exit_code")) is int
             and row["process_exit_code"] == 0

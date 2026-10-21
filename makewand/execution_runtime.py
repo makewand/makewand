@@ -52,7 +52,8 @@ def finish_provider_attempt():
     evidence = context.get("_evidence")
     if evidence is not None:
         from makewand import execution_evidence
-        evidence.update(result_status="FAILED", outcome_known=True)
+        # finish_transport has settled the ledger entry and released its lease.
+        evidence.update(result_status="FAILED", outcome_known=True, settled=True)
         execution_evidence.save(evidence)
     invocation.settled = True
 
@@ -263,9 +264,11 @@ def execute(request, callback):
         evidence = execution_evidence.new(request, attempt)
         execution_evidence.save(evidence)
     except (OSError, ValueError, RuntimeError):
-        call_budget.release_unstarted(reservation, budget_file=request.budget_file, max_model_calls=request.max_model_calls)
-        return _result(request, "UNKNOWN", error="provider evidence unavailable", attempt_id=attempt,
-                       error_kind="accounting", outcome_known=False)
+        # No record exists and nothing has started (an unwritable directory, a
+        # full disk): the call proceeds with degraded telemetry. Nothing on disk
+        # can contradict its outcome, so it is not an unknown one.
+        evidence = None
+        execution_evidence.warn_unavailable()
     with _request_scope(request, deadline, reservation, evidence, binding), _lease_heartbeat(reservation, request):
         with stage("provider", request.engine, request.readonly, attempt_id=attempt,
                    account_ref=request.account_ref) as span:
@@ -323,27 +326,35 @@ def execute(request, callback):
                 except (OSError, RuntimeError, ValueError):
                     result = _result(request, "UNKNOWN", error="account refusal accounting unavailable",
                                      attempt_id=attempt, error_kind="accounting", outcome_known=False)
+            recorded = False
             try:
-                if evidence.pop("persistence_failed", False):
-                    result = _result(request, "UNKNOWN", output=result.output, error="provider evidence incomplete",
-                        attempt_id=attempt, duration_ms=result.duration_ms, error_kind="accounting", outcome_known=False)
-                if result.tokens is None and evidence["tokens"] is not None:
-                    result = ExecutionResult.from_dict(dict(result.to_dict(), tokens=evidence["tokens"]))
-                if not current_context()["_provider_invocation"].settled:
-                    evidence.update(result_status=result.status, outcome_known=result.outcome_known, tokens=result.tokens)
-                    execution_evidence.save(evidence)
+                if evidence is not None:
+                    if evidence.pop("persistence_failed", False):
+                        result = _result(request, "UNKNOWN", output=result.output, error="provider evidence incomplete",
+                            attempt_id=attempt, duration_ms=result.duration_ms, error_kind="accounting", outcome_known=False)
+                    if result.tokens is None and evidence["tokens"] is not None:
+                        result = ExecutionResult.from_dict(dict(result.to_dict(), tokens=evidence["tokens"]))
+                    if not current_context()["_provider_invocation"].settled:
+                        # Without a ledger nothing else can still hold this attempt open.
+                        evidence.update(result_status=result.status, outcome_known=result.outcome_known,
+                                        tokens=result.tokens, settled=reservation is None)
+                        execution_evidence.save(evidence)
+                    recorded = True
             except (OSError, ValueError, RuntimeError):
                 result = _result(request, "UNKNOWN", output=result.output, error="provider evidence unavailable",
                     attempt_id=attempt, duration_ms=result.duration_ms, error_kind="accounting", outcome_known=False)
+            released = False
             try:
                 call_budget.release_unstarted(reservation, budget_file=request.budget_file, max_model_calls=request.max_model_calls)
-                call_budget.complete(reservation, result.success, result.duration_ms / 1000,
+                released = call_budget.complete(reservation, result.success, result.duration_ms / 1000,
                     result_status=result.status, outcome_known=result.outcome_known,
                     tokens=result.tokens, monetary_cost=result.monetary_cost,
-                    budget_file=request.budget_file, max_model_calls=request.max_model_calls)
+                    budget_file=request.budget_file, max_model_calls=request.max_model_calls) is not False
             except (call_budget.BudgetError, OSError, ValueError, TypeError, RuntimeError):
                 result = _result(request, "UNKNOWN", output=result.output, error="model call accounting unavailable",
                     attempt_id=attempt, duration_ms=result.duration_ms, error_kind="accounting", outcome_known=False)
+            if recorded:
+                execution_evidence.settle(evidence, ledger_settled=released)
             span.finish(result.status, error_kind=result.error_kind, artifact_digest=result.artifact_digest,
                 tokens=result.tokens, monetary_cost=result.monetary_cost)
     if interruption is not None:

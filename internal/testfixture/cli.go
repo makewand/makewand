@@ -1,4 +1,5 @@
-// Package testfixture supplies controlled, portable CLI children to Go tests.
+// Package testfixture supplies controlled, portable CLI children to Go tests,
+// and the TestMain isolation of the provider evidence those children record.
 // Production packages must not import it. Each fixture is the actual test
 // executable copied beside an explicit, parent-created JSON specification.
 package testfixture

@@ -17,6 +17,10 @@ All notable changes to this project are documented here. The format is based on
 - `--workflow single` 的帮助与文档如实说明：由写代码的同一引擎在单独的只读调用中自审，没有独立引擎审查。
 - 模型发现写出 `discovered.json` 时，Go 路由器要求定价的 provider（claude、gemini、openai）的档位只在模型有价目（同一文件的 costs，或包旁 `router/defaults.json` 的内置价目）时写出；Go 本就忽略的未定价条目（如 agy 的 `gemini-4-argon` 写进 gemini 档位）不再写出。
 - 内部清理：`NON_AGENTIC_CHAT_MODELS` 由 `API_ONLY_ENGINES` 推导；审查裁决读取函数不再接受 `allow_legacy` 参数，读取旧的无 nonce 格式只能不带 nonce。
+- 执行证据（用户缓存下的 `makewand/execution-evidence`）不再无限增长：已结算的记录（账本已结算该尝试并释放租约，或没有账本，记录中 `settled: true`）保留 48 小时，同一引擎、账号与额度池最多保留最新 256 条，记录与其 `.lock` 在该锁内一起删除；未结束的尝试、账本未结算或租约仍在的记录从不删除，旧版本写入且结果仍为 UNKNOWN 的记录也保留。清理在尝试结算后运行（每个目录每小时最多一次），从不在读取路径上运行。额度合并与模型发现改读追加式索引 `index.jsonl`，只取该账号（模型发现为该引擎）最新 64 条，不再列举并 stat 整个目录；每次尝试仍是一个 `<attempt_id>.json`，旧版本照常读取。Go 与 Python 规则相同（共享测试向量 `tests/testdata/evidence_retention_cases.json`）。详见 [执行证据](docs/provider-execution-evidence.md)。
+- CLI 启动前的首条证据写不进去（目录不可写、磁盘满）时按降级遥测处理：调用照常进行并保留真实结果，每个进程提示一次；此前 `makewand serve` 会因此返回 503，也不回退到其他 provider。CLI 可能已运行之后的证据写入失败仍记为 UNKNOWN。
+- 测试不再写入真实用户缓存的执行证据：Go 的 `execution`、`router`、`cmd/makewand`、`internal/tui` 测试的 TestMain 与 Python 的 `tests/_isolation.py` 改用临时证据目录，并清除从 shell 继承的账本与事件路径；各包的守护测试在隔离缺失时失败。
+- 原生 Windows 上两个不稳定测试改为确定性：账本锁的期限只限制等待其他持有者，空闲的锁即使打开文件已用完预算也照样取得（此前开始事件的 100 毫秒预算耗在 Windows 文件与 ACL I/O 上，多报一次记录失败），已过期的事务不做任何 I/O（Go 与 Python 一致）；Python 没有执行期限的准入像 Go 一样等待账本，不再在其他进程占用账本 5 秒后报告“执行期限已过”。
 - 健康探测在慢主机上启动时就已超过 4 秒时限时（例如新二进制正被杀毒扫描），按与“启动后卡住”相同的超时策略处理：订阅 CLI 软放行、自定义探测仍判不可用。此前 Windows CI 上 gemini 会被误判为不可用。
 - 模型发现写出的 `discovered.json` 改为参考性输入：其中本构建无法定价的 API 模型条目被丢弃（该档位保留内置模型），合并或校验仍失败的整个文件被忽略；此前一个未定价的发现模型（如 agy 的 `gemini-4-argon` 写进 gemini 档位）会让 TUI、headless 与 serve 全部启动失败。用户自己的 `routing.json` 仍然严格校验。
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。

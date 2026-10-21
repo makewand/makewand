@@ -78,6 +78,8 @@ type Attempt struct {
 	startCommitted    bool
 	evidence          *ProviderEvidence
 	evidenceError     error
+	evidencePersisted bool            // a record of this attempt exists on disk
+	evidenceDegraded  bool            // no record could be written before launch; the call continues without one
 	evidenceContext   context.Context // optional per-attempt context for driving evidence writes in tests
 	leaseStop         chan struct{}
 	leaseStopOnce     sync.Once
@@ -97,32 +99,72 @@ func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn f
 		return err
 	}
 	defer p.close()
-	f, err := openExecutionFile(p.root, p.name+".lock", os.O_CREATE|os.O_RDWR)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		locked, err := tryLock(f)
+	for range 8 {
+		f, err := lockSidecar(ctx, p)
 		if err != nil {
 			return err
 		}
+		if f == nil {
+			continue
+		}
+		defer f.Close()
+		defer func() { _ = unlock(f) }()
+		return fn(p)
+	}
+	return fmt.Errorf("execution accounting lock was replaced repeatedly")
+}
+
+// lockSidecar locks p's sidecar. ctx bounds waiting for another holder, not
+// this transaction's own I/O: an uncontended lock is taken even when opening
+// the files used up the budget (Windows ACL and scanner I/O can exceed a
+// short telemetry budget). A nil file means the sidecar was removed or
+// replaced while this caller waited (evidence pruning removes the sidecars of
+// records it deletes); the caller then opens the current one. Python's
+// writers make the same check (AccountingFiles.assert_named).
+func lockSidecar(ctx context.Context, p *accountingPath) (*os.File, error) {
+	f, err := openExecutionFile(p.root, p.name+".lock", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		return nil, err
+	}
+	return lockOpenedSidecar(ctx, p, f)
+}
+
+func lockOpenedSidecar(ctx context.Context, p *accountingPath, f *os.File) (*os.File, error) {
+	for {
+		locked, err := tryLock(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 		if locked {
 			break
+		}
+		if err := ctx.Err(); err != nil {
+			_ = f.Close()
+			return nil, err
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			_ = f.Close()
+			return nil, ctx.Err()
 		case <-timer.C:
 		}
 	}
-	defer func() { _ = unlock(f) }()
-	return fn(p)
+	held, err := f.Stat()
+	if err == nil {
+		var current os.FileInfo
+		if current, err = p.root.Lstat(p.name + ".lock"); err == nil && os.SameFile(held, current) {
+			return f, nil
+		}
+	}
+	_ = unlock(f)
+	_ = f.Close()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func readLedger(path *accountingPath, maximum int) (map[string]any, error) {
@@ -263,9 +305,14 @@ func writeLedgerFile(path *accountingPath, data map[string]any) error {
 	if len(encoded)+1 > maximumLedgerBytes {
 		return fmt.Errorf("model call ledger exceeds 16 MiB")
 	}
+	return replaceAccountingFile(path, append(encoded, '\n'))
+}
+
+// replaceAccountingFile publishes encoded as path's file in one atomic rename.
+func replaceAccountingFile(path *accountingPath, encoded []byte) error {
 	temp := ".call-budget-" + NewID()
 	var file *os.File
-	err = retryAccountingIO(func() error {
+	err := retryAccountingIO(func() error {
 		var err error
 		file, err = path.root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		return err
@@ -278,7 +325,7 @@ func writeLedgerFile(path *accountingPath, data map[string]any) error {
 		_ = file.Close()
 		return fmt.Errorf("protect model call ledger: %w", err)
 	}
-	if _, err = file.Write(append(encoded, '\n')); err == nil {
+	if _, err = file.Write(encoded); err == nil {
 		err = file.Sync()
 	}
 	closeErr := file.Close()
@@ -589,18 +636,21 @@ func (a *Attempt) complete(outcome Outcome) error {
 			outcome.Tokens = a.evidence.Tokens
 		}
 		a.evidence.Status, a.evidence.OutcomeKnown, a.evidence.Tokens = outcome.Status, outcome.Known, outcome.Tokens
+		// Without a ledger nothing else can still hold this attempt open.
+		a.evidence.Settled = a.config.LedgerPath == ""
 		evidenceErr = a.evidenceError
 		if evidenceErr == nil {
 			evidenceErr = a.saveEvidence()
 		}
 		if evidenceErr != nil {
 			outcome.Status, outcome.Known = Unknown, false
-			a.evidence.Status, a.evidence.OutcomeKnown = Unknown, false
+			a.evidence.Status, a.evidence.OutcomeKnown, a.evidence.Settled = Unknown, false, false
 			evidenceErr = fmt.Errorf("provider evidence unavailable: %w", evidenceErr)
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), accountingWriteTimeout)
 	defer cancel()
+	leased := false
 	if a.config.LedgerPath != "" {
 		if err := withLockedFile(ctx, a.config.LedgerPath, a.config.ledgerDirectory, func(path *accountingPath) error {
 			data, err := readLedger(path, a.config.MaxCalls)
@@ -613,6 +663,7 @@ func (a *Attempt) complete(outcome Outcome) error {
 					continue
 				}
 				if entry["status"] == "completed" || entry["status"] == "released" {
+					leased = leaseHeld(data, a.ID)
 					return nil
 				}
 				if entry["status"] == "reserved" {
@@ -631,6 +682,7 @@ func (a *Attempt) complete(outcome Outcome) error {
 				entry["tokens"] = outcome.Tokens
 				entry["monetary_cost"] = outcome.MonetaryCost
 				settleLease(data, a.ID)
+				leased = leaseHeld(data, a.ID)
 				return saveLedger(path, data)
 			}
 			return errReservationDisappeared
@@ -641,7 +693,18 @@ func (a *Attempt) complete(outcome Outcome) error {
 	duration := time.Since(a.started).Milliseconds()
 	a.emitBestEffort("end", outcome, &duration)
 	a.completed = true
+	if evidenceErr == nil && !leased {
+		a.settleEvidence()
+	}
 	return evidenceErr
+}
+
+// leaseHeld reports whether the ledger still holds attempt id's account lease
+// (a launch fence or a live worker outlived its completion).
+func leaseHeld(data map[string]any, id string) bool {
+	leases, _ := data["leases"].(map[string]any)
+	_, held := leases[id]
+	return held
 }
 
 // StopLease gives up renewal even when the ledger is temporarily unavailable.
