@@ -60,7 +60,9 @@ whether evidence was found) and never stand in for another account. A fresh cach
 therefore lets `makewand quota`, the TUI and `serve` start without reading any
 source, also when one source has no evidence (stock Codex logs, a missing agy, a
 Claude login that names no account); evidence such a source gains shows up at most
-10 minutes late.
+10 minutes late. The background refresh of a running TUI or `serve` reads again,
+at each tick, the sources with evidence that it read itself at the previous one;
+reads another process made since are served from the cache.
 
 Both readers reject observations older than 15 minutes and reset windows, even
 if another account just updated the cache file or a log was touched. Each

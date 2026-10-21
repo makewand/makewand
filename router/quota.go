@@ -290,6 +290,8 @@ type QuotaSnapshotter struct {
 	started atomic.Bool
 
 	refreshMu sync.Mutex // serializes refreshes; prevents overlapping fan-out
+	// readAt is when this snapshotter last read a source itself (refreshMu).
+	readAt time.Time
 	// seals holds provider→until overrides from the 429-feedback path. Never
 	// persisted to disk: a seal reflects a live 429 in this process, and a fresh
 	// process must not inherit one (window resets handle recovery anyway).
@@ -458,7 +460,7 @@ func (s *QuotaSnapshotter) Start(ctx context.Context) {
 	if !s.started.CompareAndSwap(false, true) {
 		return
 	}
-	s.refresh(ctx)
+	s.refresh(ctx, false)
 	go func() {
 		t := time.NewTicker(s.interval)
 		defer t.Stop()
@@ -467,7 +469,7 @@ func (s *QuotaSnapshotter) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				s.refresh(ctx)
+				s.refresh(ctx, true)
 			}
 		}
 	}()
@@ -479,18 +481,26 @@ func (s *QuotaSnapshotter) Refresh(ctx context.Context) *QuotaSnapshot {
 	if s == nil {
 		return &QuotaSnapshot{byProvider: map[string]ProviderQuota{}}
 	}
-	s.refresh(ctx)
+	s.refresh(ctx, false)
 	return s.Snapshot()
 }
 
-func (s *QuotaSnapshotter) refresh(ctx context.Context) {
+// refresh reads the sources; tick is set for the background loop's refresh.
+func (s *QuotaSnapshotter) refresh(ctx context.Context, tick bool) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 
 	// Read-through, per source: a login read recently enough (freshCachedRead)
 	// is served from the shared disk cache, and only the missing and stale
 	// sources are read. The whole cache, stale or not, also serves as the
-	// cross-process last-good baseline below.
+	// cross-process last-good baseline below. A tick reads again what this
+	// snapshotter read itself: stamped when its refresh ended, that read is
+	// less than one interval old at the next tick and would otherwise skip
+	// every other one. Reads another process made since are still served.
+	var ownReadsUntil time.Time
+	if tick {
+		ownReadsUntil = s.readAt
+	}
 	var disk quotaDiskCache
 	var diskPrev map[string]ProviderQuota
 	if s.cachePath != "" {
@@ -511,7 +521,7 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 	readAny := false
 	var wg sync.WaitGroup
 	for i, src := range s.sources {
-		if q, fresh := s.freshCachedRead(src, disk); fresh {
+		if q, fresh := s.freshCachedRead(src, disk, ownReadsUntil); fresh {
 			results[i] = result{q: q}
 			continue
 		}
@@ -535,6 +545,9 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 	wg.Wait()
 
 	takenAt := time.Now()
+	if readAny {
+		s.readAt = takenAt
+	}
 	reads := make(map[string]quotaRead)
 	for i, src := range s.sources {
 		name := strings.ToLower(src.Provider())
@@ -618,13 +631,14 @@ func quotaReadKey(src QuotaSource, identity ProviderQuota) string {
 // freshCachedRead returns the disk cache's entry for src's current login when
 // that login was read recently enough not to read it again: within the cache
 // TTL, or within quotaNoEvidenceTTL (at least the cache TTL) when that read
-// found no current evidence. A read of another account or credential root is
+// found no current evidence. A read with evidence made no later than
+// ownReadsUntil is read again. A read of another account or credential root is
 // keyed apart and never stands in for this login.
-func (s *QuotaSnapshotter) freshCachedRead(src QuotaSource, disk quotaDiskCache) (ProviderQuota, bool) {
+func (s *QuotaSnapshotter) freshCachedRead(src QuotaSource, disk quotaDiskCache, ownReadsUntil time.Time) (ProviderQuota, bool) {
 	identity, _ := sourceQuotaIdentity(src)
 	key := quotaReadKey(src, identity)
 	read, ok := disk.reads[key]
-	if !ok {
+	if !ok || !read.NoEvidence && !read.At.After(ownReadsUntil) {
 		return ProviderQuota{}, false
 	}
 	ttl := s.cacheTTL

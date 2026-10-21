@@ -145,3 +145,44 @@ func TestQuotaCachedReadOfAnotherAccountIsIgnored(t *testing.T) {
 		}
 	}
 }
+
+// The background loop reads again, at every tick, what the snapshotter read
+// itself: with the default cache TTL of one interval, its own read, stamped
+// when its refresh ended, would otherwise still be fresh at the next tick and
+// every other tick would read nothing. A read another process made since is
+// served from the cache, and a no-evidence read keeps its own TTL.
+func TestQuotaTickRereadsOwnReadsButServesOthers(t *testing.T) {
+	ctx := context.Background()
+	cache := filepath.Join(t.TempDir(), "snapshot.json")
+	claude := &boundCountingSource{name: "claude", account: "A", used: 40}
+	codex := &boundCountingSource{name: "codex", account: "C"}
+	s := NewQuotaSnapshotter(time.Hour, claude, codex).WithDiskCache(cache, 0)
+	s.refresh(ctx, false)
+	for tick := 1; tick <= 2; tick++ {
+		s.refresh(ctx, true)
+		if got := quotaReads(claude, codex); got[0] != int64(1+tick) || got[1] != 1 {
+			t.Fatalf("tick %d: reads claude=%d codex=%d, want claude read every tick and codex's no-evidence read reused", tick, got[0], got[1])
+		}
+	}
+	// A forced refresh still serves the fresh cache.
+	s.Refresh(ctx)
+	if got := quotaReads(claude, codex); got[0] != 3 {
+		t.Fatalf("forced refresh re-read a fresh source: claude reads=%d", got[0])
+	}
+
+	// Another process reads claude now; the next ticks serve its read.
+	other := &boundCountingSource{name: "claude", account: "A", used: 55}
+	NewQuotaSnapshotter(time.Hour, other).WithDiskCache(cache, time.Nanosecond).Refresh(ctx)
+	if other.reads.Load() != 1 {
+		t.Fatalf("other process reads = %d", other.reads.Load())
+	}
+	for range 2 {
+		s.refresh(ctx, true)
+	}
+	if got := quotaReads(claude, codex); got[0] != 3 || got[1] != 1 {
+		t.Fatalf("ticks re-read what another process just read: reads claude=%d codex=%d", got[0], got[1])
+	}
+	if q, _ := s.Snapshot().Get("claude"); q.WeeklyPct == nil || *q.WeeklyPct != 55 {
+		t.Fatalf("the other process's read was not served: %+v", q)
+	}
+}
