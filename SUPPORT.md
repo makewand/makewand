@@ -4,8 +4,9 @@
 
 | Version line | Status | Notes |
 | --- | --- | --- |
-| `v0.1.x` | Supported | Active development line |
-| `< v0.1.0` | Unsupported | No backports |
+| `master` (source install) | Supported | Has every fix; ships as v3.3.0 |
+| `v3.2.x` | Supported | Current release line; lacks the protections added after v3.2.0, see [SECURITY.md](SECURITY.md#release-status--发布状态) |
+| `< v3.2.0` | Unsupported | No backports |
 
 ## What support means
 
@@ -21,5 +22,5 @@ Always upgrade to the latest patch release in the active line.
 
 ## End of support
 
-When a new minor line is published (for example `v0.2.x`), previous minor lines
+When a new minor line is published (for example `v3.3.x`), previous minor lines
 may be marked unsupported.
