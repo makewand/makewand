@@ -517,6 +517,12 @@ func (p *Project) planDependencyStages(plan ExecPlan, projectDir string) (fetch,
 	case "cargo":
 		fetch, build = cargoDependencyStages(plan)
 		fetch.env = append(slices.Clone(fetch.env), cargoFetchEnv(projectDir)...)
+		if pin, _ := p.cargoFetchToolchain(projectDir); pin != "" {
+			// A toolchain the fetch cannot be pinned to refuses it with the
+			// network (networkFetchUnavailable); without the network the fetch
+			// runs as the build does, loopback-only.
+			fetch.env = append(fetch.env, "RUSTUP_TOOLCHAIN="+pin)
+		}
 		return fetch, build, noop, nil
 	case "pip", "pip3":
 		return p.pipDependencyStages(plan, projectDir)
@@ -552,9 +558,12 @@ func cargoDependencyStages(plan ExecPlan) (fetch, build *ExecPlan) {
 // 1.93): build.rustc, the rustc wrappers, and a registry credential provider.
 // The config files that could name them are masked for the fetch
 // (sandboxWorkspaceSecretMasks): every workspace .cargo/ directory and the
-// config files of the sandbox CARGO_HOME. These settings cover what is left:
+// config files of the sandbox CARGO_HOME. These settings cover what is left
+// (the rustup toolchain, which a workspace rust-toolchain file chooses, is
+// pinned separately: cargoFetchToolchain):
 //   - RUSTC is pinned to the rustc resolved from the sandbox PATH, so a config
-//     build.rustc is not consulted;
+//     build.rustc is not consulted (on a rustup host that is the rustc proxy,
+//     which follows the pinned toolchain);
 //   - the three rustc-wrapper variables are cleared: an empty value overrides
 //     a config rustc-wrapper or rustc-workspace-wrapper (verified on cargo
 //     1.93);
@@ -2034,21 +2043,30 @@ var npmPackageNameRe = regexp.MustCompile(`^(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A
 
 // networkFetchUnavailable returns, for a dependency plan whose networked fetch
 // would otherwise run project code (or fetch a dependency it cannot get from a
-// registry), why that cannot be done under fetch-only networking, or "". Only
-// npm is affected: pip and cargo are split so the networked stage builds
-// nothing, and go fetches no code. It applies only when outbound network is
-// actually available: without the user-mode network helper the fetch runs
-// loopback, so a prepare script cannot exfiltrate and the offline classifier
-// (offlineRegistryNeed) decides instead, as it did before this change.
+// registry), why that cannot be done under fetch-only networking, or "". npm
+// is affected by what the project depends on, cargo by the rustup toolchain
+// the workspace selects (cargoFetchToolchain); pip is split so the networked
+// stage builds nothing, and go fetches no code. It applies only when outbound
+// network is actually available: without the user-mode network helper the
+// fetch runs loopback, so code it runs cannot exfiltrate and the offline
+// classifier (offlineRegistryNeed) decides instead, as it did before this
+// change.
 func (p *Project) networkFetchUnavailable(plan ExecPlan) string {
+	if _, err := userNetLookPath(userNetHelperName); err != nil {
+		return "" // no outbound network: the fetch runs loopback, nothing to refuse
+	}
 	switch plan.Command {
 	case "npm", "pnpm", "yarn":
-		if _, err := userNetLookPath(userNetHelperName); err != nil {
-			return "" // no outbound network: the fetch runs loopback, nothing to refuse
-		}
 		if dep := p.npmNonRegistryDependency(); dep != "" {
 			return "the project depends on " + dep + ", which npm cannot fetch from a registry without running project code (a local-directory or git dependency runs its prepare script even under --ignore-scripts); makewand only lets a dependency download use the network, so install the project's dependencies outside makewand"
 		}
+	case "cargo":
+		projectDir, err := p.execWorkingDir()
+		if err != nil {
+			return ""
+		}
+		_, refusal := p.cargoFetchToolchain(projectDir)
+		return refusal
 	}
 	return ""
 }

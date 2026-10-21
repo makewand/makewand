@@ -634,10 +634,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	}
 
 	if resolved["cargo"] != "" || resolved["rustc"] != "" || resolved["rustup"] != "" {
-		rustupHome := strings.TrimSpace(getenv("RUSTUP_HOME"))
-		if rustupHome == "" {
-			rustupHome = filepath.Join(home, ".rustup")
-		}
+		rustupHome := hostRustupHome(home, getenv)
 		if info, err := os.Stat(rustupHome); err == nil && info.IsDir() {
 			if isPathHiddenBySandbox(home, rustupHome) {
 				addRoot(rustupHome)
@@ -649,6 +646,21 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	}
 
 	return pruneNestedRoots(candidates), env, goVersion
+}
+
+// hostRustupHome returns the rustup home the sandbox hands its rustup
+// proxies: RUSTUP_HOME, or ~/.rustup ("" without an absolute HOME). A
+// relative RUSTUP_HOME is ignored, like a relative PATH entry: inside the
+// sandbox it would resolve against the workspace, letting the project supply
+// rustup's settings and toolchains.
+func hostRustupHome(home string, getenv func(string) string) string {
+	if rustupHome := strings.TrimSpace(getenv("RUSTUP_HOME")); filepath.IsAbs(rustupHome) {
+		return filepath.Clean(rustupHome)
+	}
+	if !filepath.IsAbs(home) {
+		return ""
+	}
+	return filepath.Join(home, ".rustup")
 }
 
 // sandboxToolchainRoot picks the directory to re-bind for a toolchain binary
