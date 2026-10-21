@@ -397,7 +397,9 @@ func rawStubAs(t *testing.T, bin, name string) {
 	if runtime.GOOS == "windows" {
 		path += ".exe"
 	}
-	if err := os.Link(bin, path); err != nil {
+	// Windows refuses to delete any link to a running executable, and bin is
+	// this test binary, so t.TempDir could not clean up a hard link there.
+	if runtime.GOOS == "windows" || os.Link(bin, path) != nil {
 		data, err := os.ReadFile(bin)
 		if err != nil {
 			t.Fatal(err)
