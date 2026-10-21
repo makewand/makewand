@@ -534,17 +534,19 @@ func cargoDependencyStages(plan ExecPlan) (fetch, build *ExecPlan) {
 }
 
 // cargoFetchEnv hardens the networked `cargo fetch` against the executables a
-// workspace .cargo/config.toml can name and the fetch would otherwise run
-// (confirmed on cargo 1.93): build.rustc, build.rustc-wrapper, and a registry
-// credential-provider an attacker registry triggers with a 401. The whole
-// workspace .cargo/ is masked for the fetch (sandboxWorkspaceFetchMasks), and
-// these settings override any that survive in CARGO_HOME or elsewhere:
-//   - RUSTC is pinned to the trusted rustc resolved from the sandbox PATH, so a
-//     config build.rustc is not consulted;
-//   - the three rustc-wrapper variables are cleared, so a config rustc-wrapper
-//     cannot reintroduce one (an empty value overrides the config, verified);
-//   - the global credential provider is forced to cargo's built-in token
-//     provider, so no configured provider program runs;
+// cargo config can name and the fetch would otherwise run (confirmed on cargo
+// 1.93): build.rustc, the rustc wrappers, and a registry credential provider.
+// The config files that could name them are masked for the fetch
+// (sandboxWorkspaceSecretMasks): every workspace .cargo/ directory and the
+// config files of the sandbox CARGO_HOME. These settings cover what is left:
+//   - RUSTC is pinned to the rustc resolved from the sandbox PATH, so a config
+//     build.rustc is not consulted;
+//   - the three rustc-wrapper variables are cleared: an empty value overrides
+//     a config rustc-wrapper or rustc-workspace-wrapper (verified on cargo
+//     1.93);
+//   - the global credential providers default to cargo's built-in token
+//     provider. This alone does not stop a provider a config file names (it
+//     still runs, verified on cargo 1.93), which is why those files are masked;
 //   - CARGO_HOME is the sandbox's own, never the host ~/.cargo (its
 //     credentials and config), and is the same home the offline build reuses.
 func cargoFetchEnv(projectDir string) []string {

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/makewand/makewand/internal/fsperm"
@@ -412,13 +413,16 @@ var ErrSandboxSecretScan = errors.New("sandbox workspace secret scan incomplete"
 // directory (its config.toml can name executables cargo fetch would run; see
 // cargoFetchEnv). Unlike the socket scan it does descend ignored directories
 // (node_modules, vendor, ...), so a secret planted there is masked too. It
-// leaves makewand's own sandbox HOME alone: that is the fetch's writable HOME
-// and cache area (CARGO_HOME, the wheelhouse, module caches), not project
-// content. The fetch runs no project code, so this is defence in depth; it also
-// aligns the user-approved real-project path with candidate-verification
-// clones, which already omit these files (shouldIgnore). An incomplete scan is
-// an error wrapping ErrSandboxSecretScan: the fetch is about to touch the
-// network, so a secret left visible fails closed.
+// leaves makewand's own sandbox HOME alone, as the fetch's writable HOME and
+// cache area (CARGO_HOME, the wheelhouse, module caches), with one exception:
+// the cargo config files of its CARGO_HOME. makewand never writes them, a
+// loopback step running project code can, and a credential provider they name
+// still runs under cargoFetchEnv. The fetch runs no project code, so this is
+// defence in depth; it also aligns the user-approved real-project path with
+// candidate-verification clones, which already omit these files
+// (shouldIgnore). An incomplete scan is an error wrapping ErrSandboxSecretScan:
+// the fetch is about to touch the network, so a secret left visible fails
+// closed.
 func sandboxWorkspaceSecretMasks(workspace string) ([]string, error) {
 	var out []string
 	cleanWS := filepath.Clean(workspace)
@@ -472,6 +476,24 @@ func sandboxWorkspaceSecretMasks(workspace string) ([]string, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	for _, name := range []string{"config.toml", "config"} {
+		file := filepath.Join(sandboxHome, ".cargo", name)
+		info, err := os.Lstat(file)
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			continue // nothing to shadow, and bwrap never has to create a mount point
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %v", ErrSandboxSecretScan, file, err)
+		}
+		if err := mask(); err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			out = append(out, "--tmpfs", file)
+		} else {
+			out = append(out, "--ro-bind", os.DevNull, file)
+		}
 	}
 	return out, nil
 }

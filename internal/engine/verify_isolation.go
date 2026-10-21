@@ -159,9 +159,9 @@ const sandboxHomeRelPath = ".makewand/sandbox-home"
 // (verificationPlanAllowsNetwork).
 //
 // A networked dependency fetch passes noHostModuleCache (keep the host module
-// caches out of the sandbox) and maskWorkspaceSecrets (shadow workspace files
-// isWorkspaceSecretPath marks with /dev/null), so the fetch - which runs no
-// project code - sees neither.
+// caches out of the sandbox) and maskWorkspaceSecrets (shadow the workspace
+// secrets and cargo configs sandboxWorkspaceSecretMasks lists), so the fetch -
+// which runs no project code - sees neither.
 //
 // The returned argv starts with `--seccomp 3` when the syscall filter applies
 // (see sandboxSeccompArgs); the launcher must supply it via

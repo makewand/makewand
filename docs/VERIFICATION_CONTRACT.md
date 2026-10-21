@@ -97,8 +97,10 @@ fetched (`pip install --no-index --find-links`, including `-e .`; `cargo build
 would run project code to fetch (a `file:`/`link:`/local or git dependency's
 `prepare`, which runs even under `--ignore-scripts` on some npm versions) the
 networked fetch is refused as an environment condition; `cargo fetch` additionally
-pins `RUSTC`, clears the rustc-wrapper variables, forces cargo's built-in
-credential provider and uses a private `CARGO_HOME`. Without the network tools the
+masks the cargo config files of its private `CARGO_HOME` (a loopback step could
+write them), pins `RUSTC`, clears the rustc-wrapper variables, defaults the global
+credential providers to cargo's built-in one and uses that private `CARGO_HOME`.
+Without the network tools the
 fetch runs loopback-only, keeping the host caches
 ([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)). A
 source-only distribution the fetch cannot get as a wheel is reported as

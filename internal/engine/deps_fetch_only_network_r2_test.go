@@ -268,7 +268,7 @@ func TestNetworkedFetchMasksExtendedSecrets_GEC1021R2(t *testing.T) {
 	writeFile(t, filepath.Join(ws, "node_modules", "dep", ".env"), "SECRET=1")
 	writeFile(t, filepath.Join(ws, "main.go"), "package main\n")
 	// makewand's own sandbox HOME must stay writable for the fetch's caches.
-	writeFile(t, filepath.Join(ws, filepath.FromSlash(sandboxHomeRelPath), ".cargo", "config.toml"), "# cache\n")
+	writeFile(t, filepath.Join(ws, filepath.FromSlash(sandboxHomeRelPath), ".cargo", "registry", "cache", "x-1.0.0.crate"), "cache")
 	writeFile(t, filepath.Join(ws, filepath.FromSlash(sandboxHomeRelPath), "id_rsa"), "cachekey")
 
 	masks, err := sandboxWorkspaceSecretMasks(ws)
