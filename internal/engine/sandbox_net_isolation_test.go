@@ -86,7 +86,9 @@ func hostReachablePublicAddr() string {
 // host's own addresses (with a service listening on 0.0.0.0), other private,
 // CGNAT, link-local, multicast and reserved destinations, the slirp4netns
 // gateway and loopback are unreachable, even for a socket bound to the tap
-// device; DNS through 10.0.2.3 still answers and public egress works.
+// device. With MAKEWAND_TEST_LIVE_NETWORK=1 it also checks that DNS through
+// 10.0.2.3 still answers and public egress works, which contacts the host
+// resolver and public addresses.
 func TestDependencyInstallNetworkBlocksNonPublicDestinations_DepsNet(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live sandbox test")
@@ -134,8 +136,10 @@ func TestDependencyInstallNetworkBlocksNonPublicDestinations_DepsNet(t *testing.
 			hostV6 = nil
 		}
 	}
-	expectDNS := hostResolverAnswers()
-	public := hostReachablePublicAddr()
+	expectDNS, public := liveNetworkExpectations(hostResolverAnswers, hostReachablePublicAddr)
+	if !liveNetworkTests() {
+		t.Logf("DNS and public egress checks skipped: they reach the internet; set %s=1 to run them", liveNetworkTestsEnv)
+	}
 
 	project, err := NewProject("usernet-isolation-live", t.TempDir())
 	if err != nil {

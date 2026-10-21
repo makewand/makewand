@@ -28,6 +28,14 @@ Optional live probe (requires credentials/network):
 MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch
 ```
 
+`go test ./...` connects to nothing outside this host. Test steps that reach
+the internet (the dependency-install network's DNS and public egress checks, a
+real `npm install` against its registry) run only when asked:
+
+```bash
+MAKEWAND_TEST_LIVE_NETWORK=1 go test ./internal/engine -run 'DepsNet|TestFullBuildPipeline'
+```
+
 ## Commit and PR guidance
 
 - Keep commits focused and minimal.
