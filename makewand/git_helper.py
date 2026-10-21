@@ -82,7 +82,7 @@ STATUS_FLAGS = ("--ignore-submodules=dirty",)
 _CLONE_FLAGS = ("--no-checkout",)
 _SUBCOMMAND_FLAGS = {"diff": DIFF_FORMAT_FLAGS, "status": STATUS_FLAGS, "clone": _CLONE_FLAGS}
 # Command-scope configuration of every hardened git command. GIT_CONFIG_COUNT reaches each
-# git it starts, in a submodule too, so git never enters a nested repository on its own:
+# git it starts, in a submodule too, so none of these enters a nested repository on its own:
 # diff.ignoreSubmodules=dirty spares diff and status the `git status` they would run there
 # (a .gitmodules "ignore" overrides it, hence also STATUS_FLAGS and DIFF_FORMAT_FLAGS;
 # git add reads none of it, hence add_all), submodule.recurse=false keeps checkout, reset
@@ -1154,14 +1154,15 @@ def add_all(cwd: Union[str, Path], intent_to_add: bool = False) -> Tuple[int, st
 def dirty_submodule_paths(cwd: Union[str, Path]) -> List[str]:
     """Root-relative paths of the gitlinks git status once reported for their submodule's content.
 
-    No host git command enters a nested repository any more (_SUBMODULE_BARRIER, STATUS_FLAGS,
-    add_all), so every checked-out submodule that .gitmodules registers for a gitlink of the
-    index is asked itself, through run_git_cmd: with that repository's own attributes shield and
-    attribute source. It is dirty with a change or an untracked file, or with such a submodule of
-    its own that is dirty; the path reported is the gitlink of cwd's repository that contains it,
-    as git status reported it. A nested repository .gitmodules does not register is not asked,
-    and no submodule.<name>.ignore hides one. Raises OSError when git cannot read a status or a
-    registration.
+    Host git status and git add no longer run `git status` inside a nested repository
+    (_SUBMODULE_BARRIER, STATUS_FLAGS, add_all), so every checked-out submodule that .gitmodules
+    registers for a gitlink of the index is asked itself, through run_git_cmd: with that
+    repository's own attributes shield and attribute source. It is dirty with a change or an
+    untracked file, or with such a submodule of its own that is dirty; the path reported is the
+    gitlink of cwd's repository that contains it, as git status reported it. A nested repository
+    .gitmodules does not register is not asked, nor one outside the work tree or behind a
+    symlink, and no submodule.<name>.ignore hides one. Raises OSError when git cannot read a
+    status or a registration.
     """
     code, top, error = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=str(cwd))
     if code != 0 or not top.strip():
@@ -1181,6 +1182,7 @@ def _dirty_registered_gitlinks(repo: Path, visited: set) -> List[str]:
     for registered in _gitmodules_paths(repo):
         path = PurePosixPath(registered)
         rel = str(path)
+        # git never writes such a path to an index, but reads one from a planted index.
         if path.is_absolute() or ".." in path.parts or rel not in tracked or rel in dirty:
             continue
         directory = repo / rel
@@ -2009,7 +2011,9 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow", repo
                         if sc_code == 0 and sc_out.strip():
                             target_sub_commit = sc_out.strip()
                             run_git_cmd(["git", "fetch", str(src_sub.resolve()), target_sub_commit], cwd=str(dst_sub))
-                            co_code, _, co_err = run_git_cmd(["git", "checkout", target_sub_commit], cwd=str(dst_sub))
+                            # -q: the report of local changes after the switch runs `git status` inside
+                            # a nested submodule the shadow has just initialized (.gitmodules "ignore = none").
+                            co_code, _, co_err = run_git_cmd(["git", "checkout", "-q", target_sub_commit], cwd=str(dst_sub))
                             if co_code != 0:
                                 import sys
                                 print(c(_printable(f"❌ [Makewand Guard] 子模块 {sub_rel} 检出失败 ({co_err})，拒绝残缺快照。"), COLOR_RED), file=sys.stderr)
@@ -4227,8 +4231,11 @@ class HostWorkspaceTransaction:
         paths = sorted(rel for rel in indexed if rel in self.pre and rel not in self.tracked)
         if not paths:
             return None
-        # Literal pathspecs: a file named "[ab].txt" must not also match a.txt and b.txt.
-        code, _, err = run_git_cmd(["git", "--literal-pathspecs", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
+        # Literal pathspecs: a file named "[ab].txt" must not also match a.txt and b.txt. -f skips
+        # git rm's up-to-date check, which runs `git status` inside a staged nested repository
+        # (its own config and info/attributes: a filter) and refuses a path whose staged content
+        # differs from both HEAD and the file; --cached leaves the work tree alone either way.
+        code, _, err = run_git_cmd(["git", "--literal-pathspecs", "rm", "-r", "-q", "-f", "--cached", "--ignore-unmatch",
                                     "--pathspec-from-file=-", "--pathspec-file-nul"],
                                    cwd=self.root, input_data=b"\0".join(os.fsencode(p) for p in paths))
         if code != 0:

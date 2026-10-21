@@ -375,17 +375,23 @@ length would be resolved as a ref name, so a branch named like the SHA-1 id
 could hand a SHA-256 repository's attributes to a tree of its choosing. A config
 git cannot parse, or an object format git does not know, also fails closed.
 
-No host git command enters a nested repository, where a child git would run
-without `--attr-source` or the shield and read that repository's own config and
-`info/attributes` (and run a filter while hashing a tracked file). Diffs run
-`--submodule=short --ignore-submodules=dirty` and `git status` runs
+Apart from the commands listed below, no host git command starts a git inside a
+nested repository: a child git there reads that repository's own config and
+`info/attributes`, which the shield does not cover and an attribute source does
+not replace, and would run a filter while hashing a tracked file.
+Diffs run `--submodule=short --ignore-submodules=dirty` and `git status` runs
 `--ignore-submodules=dirty`: the option, unlike `diff.ignoreSubmodules`, outranks a
 `submodule.<name>.ignore` that `.gitmodules` (a work-tree file) sets. git still
 reports a submodule whose commit pointer moved. `git add` reads no such setting,
 so makewand's `git add -A` (`git_helper.add_all`, also for its private diff
 indexes) leaves gitlinks out and stages them with `git update-index`, which only
-reads each nested `HEAD`. Every command also carries command-scope configuration
-(`GIT_CONFIG_COUNT`, which git hands on to every git it starts):
+reads each nested `HEAD`. The host rollback unstages with `git rm --cached -f`:
+without `-f`, git rm's up-to-date check runs `git status` inside a staged nested
+repository (and refuses a path whose staged content differs from both `HEAD` and
+the file). The shadow copy checks each submodule out with `checkout -q`: reporting
+local changes after the switch runs `git status` in a nested submodule that
+`.gitmodules` marks `ignore = none`. Every command also carries command-scope
+configuration (`GIT_CONFIG_COUNT`, which git hands on to every git it starts):
 `diff.ignoreSubmodules=dirty`, `submodule.recurse=false` (a user's
 `submodule.recurse=true` made `checkout`, `reset --hard` and `read-tree` check a
 submodule's files out through its own filters), `fetch.recurseSubmodules=false`
@@ -393,6 +399,28 @@ and `push.recurseSubmodules=no`. A clone runs `--no-checkout`; the files are
 checked out afterwards in the new repository, with its own shield and attribute
 source, so neither an untrusted repository's `.gitattributes` nor a filter the
 user defines globally runs while cloning.
+
+These host git commands still start a git inside a nested repository; none of
+them can run a filter that a repository's own files define or select:
+
+- `git submodule status --recursive`, which makewand uses to list submodules,
+  starts `git describe` (up to four forms, naming the checked-out commit) and
+  `git submodule--helper status --recursive` inside each initialized submodule.
+  describe reads refs and objects; the helper compares commit pointers
+  (`diff-files --ignore-submodules=dirty` limited to the gitlinks).
+- The shadow copy's `git submodule update --init --recursive` clones each
+  submodule into a new repository of the copy and checks it out there. That
+  repository's config is the clone's own and its `info` comes from git's
+  templates, and the checkout inherits the empty-tree attribute source
+  (`--attr-source` exports `GIT_ATTR_SOURCE` to every git it starts), so no
+  `.gitattributes` selects a filter.
+- Transport with the user's submodules: the shadow copy fetches each submodule's
+  checked-out commit from it (`git upload-pack` runs there), and the shadow
+  delivery pushes each verified submodule commit to a new branch in it
+  (`git receive-pack` runs there). Neither reads attributes or updates a work
+  tree. A local transport hands neither `-c` nor `GIT_CONFIG_COUNT` settings on,
+  so a receive hook the user installed in the destination runs, as on any push
+  to it; the same holds for the push to the repository itself.
 
 Where makewand relied on `git status` to see changed content inside a submodule,
 it asks each submodule itself (`git_helper.dirty_submodule_paths`): every
@@ -404,8 +432,13 @@ candidate conflicts and change lists), the host transaction's task-start baselin
 and rollback verification, the shadow delivery's clean checks and the DAG
 staging copy's checkpoint and seal. Two observable differences: uncommitted
 changes inside a nested repository that `.gitmodules` does not register are no
-longer reported (a moved commit pointer still is), and `submodule.<name>.ignore`
-no longer hides a registered submodule's changes from these checks.
+longer reported (a moved commit pointer still is), and `submodule.<name>.ignore`,
+whether `.gitmodules` or the repository's own config sets it, no longer hides a
+registered submodule's changes from these checks. A submodule that builds or
+tests write untracked files into, which a repository may mark
+`ignore = untracked`, now counts as dirty: the isolation check picks the shadow
+copy, and the shadow delivery's clean checks and the DAG checkpoints refuse while
+it stays so.
 
 `git apply` cannot take an attribute source in work-tree mode (git segfaults) or
 outside a repository, so every apply runs with each configured filter driver
@@ -429,9 +462,6 @@ settings in an `include` or `includeIf` section): callers pass the working
 directory instead. `GIT_ATTR_SOURCE`, `GIT_CEILING_DIRECTORIES`,
 `GIT_DISCOVERY_ACROSS_FILESYSTEM` and `GIT_NAMESPACE` are removed from the
 inherited environment, like `GIT_DIR` and the other redirection variables.
-`git submodule status --recursive`, which makewand uses to list submodules, still
-starts `git submodule--helper status` inside each initialized submodule; that
-helper only compares commit pointers and hashes no file.
 
 Pre-existing files that are not backed up (dependency and cache directories,
 files over the backup limits) get a SHA-256 digest at task start, smallest first,

@@ -2,10 +2,11 @@
 
 Every fixture plants a filter driver whose commands append to a marker file outside the
 repositories (FilterFixture): a marker line means makewand ran the filter on the host.
-Covered: nested repositories and submodules (no host git command starts a command inside
-one, while a dirty registered submodule is still detected where it was before), the
-delivery patch check and the generated apply script, SHA-256 repositories, global options
-that would point git at another repository, and the inherited environment.
+Covered: nested repositories and submodules (no host git command runs `git status` inside
+one, the host rollback and the shadow copy's submodule checkout included, while a dirty
+registered submodule is still detected where it was before), the delivery patch check and
+the generated apply script, SHA-256 repositories, global options that would point git at
+another repository, and the inherited environment.
 """
 try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
     import _isolation
@@ -17,11 +18,13 @@ except ImportError:  # python3 -m unittest tests.<module>
     from tests.test_fix_git_attr_shield import PATCH, FilterFixture
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 import unittest
 from pathlib import Path
@@ -36,6 +39,18 @@ SHA1_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 SHA256_EMPTY_TREE = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
 UTF8_BOM = b"\xef\xbb\xbf"
 COMPLETED = subprocess.CompletedProcess([], 0, "", "")
+
+
+def write_gitlink_index(path, gitlinks):
+    """A version 2 index of gitlinks (path -> commit id) written byte by byte: git itself never
+    writes a path that is absolute or holds "..", but reads one from a planted index."""
+    body = b"DIRC" + struct.pack(">II", 2, len(gitlinks))
+    for name, oid in sorted(gitlinks.items()):
+        encoded = os.fsencode(name)
+        entry = (struct.pack(">10I", 0, 0, 0, 0, 0, 0, 0o160000, 0, 0, 0) + bytes.fromhex(oid)
+                 + struct.pack(">H", len(encoded)) + encoded)
+        body += entry + b"\0" * (8 - len(entry) % 8)
+    path.write_bytes(body + hashlib.sha1(body).digest())
 
 
 class NestedFixture(FilterFixture):
@@ -185,6 +200,65 @@ class NestedRepositoryTests(NestedFixture):
                 self.assertEqual(code, 0, error)
                 self.assertEqual(self.marker_lines(), [])
 
+    def test_host_rollback_never_enters_a_staged_nested_repository(self):
+        # The task turns the ignored, pre-existing scratch/ into a repository whose .git file
+        # names a git directory the rollback scan never descends into, commits the pre-existing
+        # file there, plants the filter and stages scratch/: git rm --cached, unstaging it, ran
+        # `git status` inside it, which hashed that file through the filter.
+        top = self.repository(self.root / "top", {"app.py": "print(1)\n", ".gitignore": "scratch/\n"})
+        (top / "scratch").mkdir()
+        (top / "scratch" / "out.txt").write_text("out\n")
+        txn = HostWorkspaceTransaction(str(top))
+        self.assertIsNone(txn.capture_pre_snapshot())
+        self.assertIsNone(txn.begin())
+        self.assertFalse(txn.initial_dirty)
+        git_dir = top / "scratch" / "inner" / ".git"
+        git_dir.parent.mkdir()
+        self.git(top / "scratch", "init", "-q", "--separate-git-dir", str(git_dir))
+        self.git(top / "scratch", "add", "out.txt")
+        self.git(top / "scratch", "commit", "-qm", "nested")
+        self.arm(top / "scratch", git_dir, name="out.txt")
+        self.git(top, "add", "-f", "scratch")
+        self.marker.unlink(missing_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            restored = txn.rollback("task failed")
+        self.assertEqual(self.marker_lines(), [])
+        self.assertTrue(restored)  # without -f, git rm also refused the staged gitlink
+        self.assertEqual(self.git(top, "ls-files", "--", "scratch"), "")
+        self.assertEqual((top / "scratch" / "out.txt").read_text(), "out\n")
+
+    def test_shadow_submodule_checkout_never_enters_a_nested_submodule(self):
+        # The shadow copy checks each submodule out at the user's commit. With "ignore = none" in
+        # the submodule's .gitmodules, that checkout reported local changes by running `git status`
+        # in the nested submodule the shadow had just initialized (the user's copy leaves it
+        # uninitialized, so makewand never visits it itself). The filter is planted right before.
+        nested = self.repository(self.root / "nested-origin", {"n.txt": "n\n"})
+        origin = self.repository(self.root / "origin", {"x.txt": "x\n"})
+        self.git(origin, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(nested), "nested")
+        self.git(origin, "config", "-f", ".gitmodules", "submodule.nested.ignore", "none")
+        self.git(origin, "add", "-A")
+        self.git(origin, "commit", "-qm", "nested")
+        top = self.repository(self.root / "top", {"app.py": "print(1)\n"})
+        self.git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "sub")
+        self.git(top, "commit", "-qm", "sub")
+        run_git_cmd = git_helper.run_git_cmd
+        armed = []
+
+        def arming(command, cwd=None, **kwargs):
+            if command[1:2] == ["checkout"] and cwd and Path(cwd).name == "sub" and not armed:
+                gitfile = Path(cwd, "nested", ".git").read_text().split(":", 1)[1].strip()
+                nested_git_dir = Path(cwd, "nested", gitfile).resolve()
+                armed.append(nested_git_dir)
+                self.arm(Path(cwd, "nested"), nested_git_dir, name="n.txt")
+            return run_git_cmd(command, cwd=cwd, **kwargs)
+
+        with patch.object(git_helper, "run_git_cmd", side_effect=arming):
+            result = git_helper.create_ephemeral_shadow_worktree(str(top))
+        self.assertIsNotNone(result[0])
+        self.addCleanup(result[2])
+        self.assertTrue(armed)
+        self.assertEqual(self.marker_lines(), [])
+
 
 class SubmoduleDirtinessTests(NestedFixture):
     """A dirty registered submodule is still detected wherever git status used to report it."""
@@ -234,6 +308,36 @@ class SubmoduleDirtinessTests(NestedFixture):
         self.assertEqual(git_helper.dirty_submodule_paths(str(top)), [])
         self.assertEqual(self.marker_lines(), [])
 
+    def test_a_registered_gitlink_behind_a_symlink_is_never_asked(self):
+        # git status takes a/sub for deleted once a is a symlink; makewand never runs git in
+        # the repository the link leads to, outside the work tree.
+        top = self.repository(self.root / "top", {"app.py": "print(1)\n"})
+        self.nested_repository(top / "a" / "sub")
+        (top / ".gitmodules").write_text('[submodule "s"]\n\tpath = a/sub\n\turl = ./a/sub\n')
+        self.git(top, "add", "-A")
+        self.git(top, "commit", "-qm", "sub")
+        elsewhere = self.root / "elsewhere"
+        (top / "a").rename(elsewhere)
+        (top / "a").symlink_to(elsewhere)
+        self.arm(elsewhere / "sub", elsewhere / "sub" / ".git")
+        self.assertEqual(git_helper.dirty_submodule_paths(str(top)), [])
+        self.assertFalse((elsewhere / "sub" / ".git" / "info" / "attributes.mw_gate").exists())
+        self.assertEqual(self.marker_lines(), [])
+
+    def test_a_registered_gitlink_outside_the_work_tree_is_never_asked(self):
+        # A planted index (git never writes one) lists gitlinks at "../outside" and at an
+        # absolute path, and .gitmodules registers both.
+        outside = self.nested_repository(self.root / "outside")
+        head = self.git(outside, "rev-parse", "HEAD").strip()
+        self.arm(outside, outside / ".git")
+        top = self.repository(self.root / "top", {"app.py": "print(1)\n"})
+        write_gitlink_index(top / ".git" / "index", {"../outside": head, str(outside): head})
+        (top / ".gitmodules").write_text(f'[submodule "up"]\n\tpath = ../outside\n'
+                                         f'[submodule "abs"]\n\tpath = {outside}\n')
+        self.assertEqual(git_helper.dirty_submodule_paths(str(top)), [])
+        self.assertFalse((outside / ".git" / "info" / "attributes.mw_gate").exists())
+        self.assertEqual(self.marker_lines(), [])
+
     def test_host_transaction_baseline_sees_a_dirty_submodule(self):
         top = self.committed_submodule()
         txn = HostWorkspaceTransaction(str(top))
@@ -271,6 +375,21 @@ class SubmoduleDirtinessTests(NestedFixture):
             with self.assertRaisesRegex(OSError, "未受控改动"):
                 staging.checkpoint("task-1")
         self.assertEqual(self.marker_lines(), [])
+
+    def test_dag_seal_refuses_a_registered_submodule_changed_after_the_checkpoint(self):
+        from makewand.task_dag import DagStaging
+        repo = self.repository(self.root / "repo", {"app.py": "print(1)\n"})
+        with patch.object(makewand_config, "CANDIDATES_DIR", self.root / "candidates"):
+            staging = DagStaging(str(repo))
+            self.addCleanup(staging.discard)
+            nested = self.nested_repository(staging.workspace / "sub")
+            (staging.workspace / ".gitmodules").write_text('[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n')
+            staging.checkpoint("task-1")
+            # Unstaging a file inside the submodule changes no file and no commit pointer: only
+            # the submodule's own status sees it, as git status entering it used to.
+            self.git(nested, "rm", "-q", "--cached", "x.txt")
+            with self.assertRaisesRegex(OSError, "DAG 暂存区与最后一次验收提交不一致，拒绝封存: .*sub"):
+                staging.seal("goal", 1)
 
 
 class ShadowDeliveryFixture(NestedFixture):
@@ -380,6 +499,26 @@ class ShadowDeliveryTests(ShadowDeliveryFixture):
         self.assertTrue(armed)
         self.assertIn("交付提交后工作区残留未审查改动", self.output)
         self.assertEqual(self.marker_lines(), [])
+
+    def test_post_delivery_check_still_refuses_a_registered_submodule_changed_during_export(self):
+        # A file unstaged inside the submodule while the patch is exported changes no file and no
+        # commit pointer: only the post-delivery check, asking the submodule itself, sees it.
+        nested = self.nested_repository(self.base / "sub")
+        (self.base / ".gitmodules").write_text('[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n')
+        self.git(self.base, "add", "-A")
+        self.git(self.base, "commit", "-qm", "submodule")
+        self.reset_shadow()
+        self.sub_baselines = {"sub": self.git(nested, "rev-parse", "HEAD").strip()}
+        changed = []
+
+        def intercept(command):
+            if command[1:3] == ["--no-replace-objects", "diff"] and command[-2] == self.baseline and not changed:
+                changed.append(command)
+                self.git(self.shadow / "sub", "rm", "-q", "--cached", "x.txt")
+
+        self.assertFalse(self.run_pipeline(lambda shadow: (shadow / "app.txt").write_text("APPROVED\n"), intercept))
+        self.assertTrue(changed)
+        self.assertRegex(self.output, r"影子工作区交付后存在未受控改动或脏文件 \(.*sub\)")
 
 
 class DeliveryApplyTests(ShadowDeliveryFixture):
