@@ -12,7 +12,9 @@ Use this checklist before shipping a release.
 - `govulncheck` **v1.9.0** (the version `.github/workflows/ci.yml` and the Makefile pin):
   `go install golang.org/x/vuln/cmd/govulncheck@v1.9.0`
 - `pytest` **9.0.2** (the version CI pins), importable by `python3 -I`: install
-  it into that interpreter or a venv (`python3 -m pip install pytest==9.0.2`);
+  it into that interpreter or a venv (`python3 -m pip install pytest==9.0.2`).
+  pytest 9 needs Python 3.10 or newer, so run the gate with 3.10+ even though
+  makewand itself supports 3.9;
   `-I` ignores the user site, so `pip install --user` is not enough.
 - `bubblewrap` (`bwrap`) for the sandbox tests. On Ubuntu 24.04, if
   `bwrap --unshare-net --ro-bind / / true` fails with

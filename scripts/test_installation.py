@@ -87,13 +87,16 @@ class InstallationTests(unittest.TestCase):
                 folder.mkdir(parents=True)
                 (folder / "makewand").write_text("#!/bin/sh\n", encoding="utf-8")
                 (folder / "makewand").chmod(0o755)
-            for path in (f"/usr/bin:{binaries}", f"{binaries}/:{older}", "~/.local/bin:/usr/bin"):
+            # A directory without makewand, not /usr/bin: a host may ship one there.
+            empty = root / "empty"
+            empty.mkdir()
+            for path in (f"{empty}:{binaries}", f"{binaries}/:{older}", f"~/.local/bin:{empty}"):
                 with self.subTest(path=path), patch.dict(os.environ, {"HOME": str(home), "PATH": path}):
                     self.assertIsNone(module.path_hint(binaries))
-            cases = ((binaries, "/usr/bin", "is not on your PATH", '  export PATH="$HOME/.local/bin:$PATH"'),
+            cases = ((binaries, str(empty), "is not on your PATH", '  export PATH="$HOME/.local/bin:$PATH"'),
                      (binaries, f"{older}:{binaries}", f"runs {older / 'makewand'}, found before {binaries}",
                       '  export PATH="$HOME/.local/bin:$PATH"'),
-                     (odd, "/usr/bin", "is not on your PATH", None))
+                     (odd, str(empty), "is not on your PATH", None))
             for target, path, problem, line in cases:
                 with self.subTest(target=target.name, path=path), patch.dict(os.environ, {"HOME": str(home), "PATH": path}):
                     hint = module.path_hint(target)
