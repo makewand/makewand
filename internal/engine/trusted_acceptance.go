@@ -237,7 +237,7 @@ func acceptancePolicy(ctx context.Context) *frozenTrustedAcceptance {
 // use a private tmpfs so a candidate cannot leave host-visible state for the next
 // case. No host-execution escape hatch can authorize this driver.
 func wrapTrustedAcceptanceCommand(bwrapPath, workspace string, policy *frozenTrustedAcceptance) (string, []string, error) {
-	command, args, err := wrapVerificationCommand(bwrapPath, workspace, policy.commandPath, policy.spec.Args, false, nil, false, false)
+	command, args, err := wrapVerificationCommand(bwrapPath, workspace, policy.commandPath, policy.spec.Args, false, nil, false)
 	if err != nil {
 		return "", nil, err
 	}

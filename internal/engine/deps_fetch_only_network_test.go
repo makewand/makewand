@@ -21,8 +21,29 @@ import (
 // project code (pip install -e ., cargo build) runs loopback-only from what was
 // fetched. eng-1021-4: a sandboxed go step leaves no telemetry files.
 
-func planWheelhouse(projectDir string) string {
-	return filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "makewand-wheelhouse")
+// fetchWheelhouse returns the wheelhouse a pip download plan writes to (its
+// --dest) and checks it sits under a fresh per-run fetch directory beside the
+// persistent sandbox HOME, never inside it (GEC-1021-1 round 4: host-side
+// writes move out of the loopback-writable sandbox HOME).
+func fetchWheelhouse(t *testing.T, projectDir string, fetch *ExecPlan) string {
+	t.Helper()
+	wh := ""
+	for i, a := range fetch.Args {
+		if a == "--dest" && i+1 < len(fetch.Args) {
+			wh = fetch.Args[i+1]
+		}
+	}
+	if wh == "" {
+		t.Fatalf("pip fetch has no --dest: %v", fetch.Args)
+	}
+	sandboxHome := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
+	if strings.HasPrefix(wh, sandboxHome+string(filepath.Separator)) {
+		t.Fatalf("wheelhouse %q is inside the persistent sandbox HOME %q, want a fresh per-run directory", wh, sandboxHome)
+	}
+	if !strings.Contains(wh, filepath.FromSlash(".makewand/fetch-")) {
+		t.Fatalf("wheelhouse %q is not under a fresh .makewand/fetch-* directory", wh)
+	}
+	return wh
 }
 
 // Each ecosystem's fetch/build command lines are constructed correctly, and the
@@ -93,12 +114,12 @@ func TestDependencyStagesSplit_GEC1021(t *testing.T) {
 
 	t.Run("pip -r downloads wheels then installs offline", func(t *testing.T) {
 		project := newNeedProject(t, "requirements.txt", "six==1.16.0\n")
-		wh := planWheelhouse(project.Path)
 		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}}, project.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer cleanup()
+		wh := fetchWheelhouse(t, project.Path, fetch)
 		// The requirement file itself is never handed to the networked download
 		// (pip would build any local/sdist target it lists); its named index
 		// requirements are passed instead.
@@ -115,12 +136,12 @@ func TestDependencyStagesSplit_GEC1021(t *testing.T) {
 	t.Run("pip -e . downloads build requires and static deps", func(t *testing.T) {
 		project := newNeedProject(t, "pyproject.toml",
 			"[build-system]\nrequires = [\"hatchling>=1\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"x\"\nversion = \"0\"\ndependencies = [\"requests>=2\"]\n")
-		wh := planWheelhouse(project.Path)
 		fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-e", ".", "--use-pep517"}}, project.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer cleanup()
+		wh := fetchWheelhouse(t, project.Path, fetch)
 		wantFetch := []string{"download", "--only-binary=:all:", "--no-input", "--dest", wh, "hatchling>=1", "requests>=2"}
 		if fetch == nil || !slices.Equal(fetch.Args, wantFetch) {
 			t.Fatalf("pip -e . fetch = %+v, want %v (build requires + static deps, wheels only)", fetch, wantFetch)
@@ -381,9 +402,10 @@ func TestDependencyBuildStepRunsWithoutNetwork_GEC1021(t *testing.T) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}
 	// A fake pip that records, per subcommand, whether the sandbox had a default
-	// route (outbound network). It writes into the sandbox HOME, excluded from
-	// the workspace digest.
-	const pip = `log="$HOME/pip-net.log"
+	// route (outbound network). It writes into the workspace root (cwd), which
+	// persists: the networked fetch's HOME is a fresh, ephemeral tmpfs (round 4),
+	// so a $HOME write would not survive the step.
+	const pip = `log="$PWD/makewand-net.log"
 net=no
 /bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
 echo "$1 net=$net" >> "$log"
@@ -396,7 +418,7 @@ exit 0
 	if _, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}}); err != nil {
 		t.Fatalf("RunVerificationPlan: %v", err)
 	}
-	log := readLog(t, filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), "pip-net.log"))
+	log := readLog(t, filepath.Join(project.Path, "makewand-net.log"))
 	lines := strings.Split(strings.TrimSpace(log), "\n")
 	var fetch, build string
 	for _, line := range lines {

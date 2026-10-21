@@ -489,7 +489,7 @@ home=; cmd=
 while [ $# -gt 0 ]; do
   case "$1" in
     --setenv) [ "$2" = HOME ] && home=$3; shift 3 ;;
-    --chdir|--tmpfs|--proc|--dev) shift 2 ;;
+    --chdir|--tmpfs|--proc|--dev|--dir) shift 2 ;;
     --bind|--ro-bind) shift 3 ;;
     --*) shift ;;
     *) cmd=$1; break ;;
@@ -593,8 +593,10 @@ func TestSandboxedSetuptoolsWritesNoEggInfoIntoWorkspace_FixN1R2(t *testing.T) {
 	if err := project.WriteFiles(files); err != nil {
 		t.Fatal(err)
 	}
-	// pip runs this hook in its build environment before the editable build.
-	writeExecScript(t, filepath.Join(tools, "pip"), "exec /usr/bin/python3 -c 'import setuptools.build_meta as b; b.get_requires_for_build_editable()'\n")
+	// pip runs this hook in its build environment before the editable build; the
+	// networked `pip download` builds nothing, so the fake runs setuptools only
+	// for the loopback install, as real pip does.
+	writeExecScript(t, filepath.Join(tools, "pip"), "[ \"$1\" = download ] && exit 0\nexec /usr/bin/python3 -c 'import setuptools.build_meta as b; b.get_requires_for_build_editable()'\n")
 	writeExecScript(t, filepath.Join(tools, "pytest"), "echo '1 passed'\n")
 	report := project.VerifyRestrictedWorkspace(context.Background(), files[1:2])
 	if report.IntegrityError != "" || report.DepsError != "" || !report.Isolated {

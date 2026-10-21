@@ -283,9 +283,11 @@ func TestCargoFetchWorkspaceToolchainLive_GEC1021R5(t *testing.T) {
 			t.Fatal(err)
 		}
 		tools := filepath.Join(project.Path, "tools")
-		home := filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath))
+		// The networked fetch runs with a fresh, ephemeral HOME, so the wrapper
+		// records to an absolute path in the workspace, which persists.
+		toolchainLog := filepath.Join(project.Path, "toolchain.log")
 		for _, name := range []string{"cargo", "rustc"} {
-			writeExecScript(t, filepath.Join(tools, name), `echo "`+name+` RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" >> "$HOME/toolchain.log"
+			writeExecScript(t, filepath.Join(tools, name), `echo "`+name+` RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" >> "`+toolchainLog+`"
 exec `+filepath.Join(filepath.Dir(cargo), name)+` "$@"
 `)
 		}
@@ -301,7 +303,7 @@ exit 1
 		}
 		writeProjectFiles(t, project.Path, files...)
 		t.Setenv("PATH", tools+":"+filepath.Dir(cargo)+":/usr/bin:/bin")
-		return project, filepath.Join(home, "toolchain.log")
+		return project, toolchainLog
 	}
 	fetch := ExecPlan{Kind: "deps", Detector: "Cargo.toml", Command: "cargo", Args: []string{"fetch"}}
 
@@ -737,7 +739,7 @@ func TestNpmMajorVersion_GEC1021R5(t *testing.T) {
 // fixtures/resolved-lock.json into the --prefix directory, or reports the
 // failure fixtures/allowgit or (offline) fixtures/notcached asks for; an
 // install records whether a package-lock.json is in place.
-const fakeNpmForLockTest = `log="$HOME/npm.log"
+const fakeNpmForLockTest = `log="$PWD/npm.log"
 net=no
 /bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
 echo "$* net=$net" >> "$log"
@@ -830,7 +832,7 @@ func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 			} else if err != nil || result == nil || result.ExitCode != 0 {
 				t.Fatalf("result = %+v, err = %v, want the fetch to succeed", result, err)
 			}
-			log := readLog(t, filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), "npm.log"))
+			log := readLog(t, filepath.Join(project.Path, "npm.log"))
 			rest := log
 			for _, want := range tc.log {
 				i := strings.Index(rest, want)
@@ -848,7 +850,7 @@ func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 			if tc.lockLeft != (err == nil) || tc.lockLeft && after != before {
 				t.Fatalf("package-lock.json after the fetch: %q (err %v), want it left as before: %v", after, err, tc.lockLeft)
 			}
-			matches, _ := filepath.Glob(filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), "makewand-npm-lock-*"))
+			matches, _ := filepath.Glob(filepath.Join(project.Path, ".makewand", "fetch-*"))
 			if len(matches) != 0 {
 				t.Fatalf("the lock resolution's scratch project was left behind: %v", matches)
 			}

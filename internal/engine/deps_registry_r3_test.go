@@ -326,7 +326,7 @@ while [ $# -gt 0 ]; do
     --block-fd) block=$2; shift 2 ;;
     --chdir) chdir=$2; shift 2 ;;
     --ro-bind-data|--setenv|--bind|--ro-bind) shift 3 ;;
-    --tmpfs|--proc|--dev|--seccomp) shift 2 ;;
+    --tmpfs|--proc|--dev|--seccomp|--dir) shift 2 ;;
     --*) shift ;;
     *) break ;;
   esac

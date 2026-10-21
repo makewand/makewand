@@ -758,9 +758,10 @@ func registryProbeSelf() (string, error) {
 // hides HOME, /tmp and /mnt, where it may lie.
 func runRegistryProbeInSandbox(ctx context.Context, bwrapPath, dir, probe string, args []string) registryProbeRun {
 	// The probe is a networked step running makewand's own code in an empty
-	// directory: no host module cache (a networked step never binds it), and no
-	// workspace secrets to mask.
-	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(bwrapPath, dir, probe, args, false, nil, true, false)
+	// directory: it is wrapped as a networked fetch (fresh HOME, no host module
+	// cache, secret masking - all moot in an empty dir) so it never binds the
+	// host caches or reads workspace config.
+	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(bwrapPath, dir, probe, args, false, nil, true)
 	if err != nil {
 		return registryProbeRun{failure: "its sandbox could not be prepared: " + err.Error()}
 	}

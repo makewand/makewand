@@ -281,11 +281,29 @@ func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly 
 // a dependency fetch can populate tool caches that network-isolated steps
 // reuse.
 func (p *Project) prepareSandboxHome(projectDir string) error {
-	home := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
-	if err := os.MkdirAll(home, 0o700); err != nil {
+	// A loopback step (running project code) can write anywhere in the
+	// workspace, so it could have replaced .makewand or sandbox-home with a
+	// symlink pointing outside the workspace that a host-side MkdirAll would
+	// follow. Create the HOME through an os.Root confined to the workspace and
+	// refuse a symlinked component: fail closed rather than write through it.
+	root, err := os.OpenRoot(projectDir)
+	if err != nil {
 		return fmt.Errorf("create sandbox home: %w", err)
 	}
-	return disableGoTelemetry(home)
+	defer root.Close()
+	for _, rel := range []string{".makewand", filepath.FromSlash(sandboxHomeRelPath)} {
+		info, err := root.Lstat(rel)
+		switch {
+		case err == nil && info.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("create sandbox home: refusing to use %s: it is a symlink", rel)
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			return fmt.Errorf("create sandbox home: %w", err)
+		}
+	}
+	if err := root.MkdirAll(filepath.FromSlash(sandboxHomeRelPath), 0o700); err != nil {
+		return fmt.Errorf("create sandbox home: %w", err)
+	}
+	return disableGoTelemetry(filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath)))
 }
 
 // disableGoTelemetry writes the mode file `go telemetry off` writes (verified
@@ -294,12 +312,27 @@ func (p *Project) prepareSandboxHome(projectDir string) error {
 // <home>/.config/go/telemetry after the step returns; such a late write races
 // t.TempDir's RemoveAll and reddens otherwise-green runs. "off" stops the
 // collection, so no telemetry or upload.token files are ever created.
+//
+// The write goes through an os.Root confined to sandboxHome, so a .config/go
+// component a loopback step replaced with a symlink pointing outside the
+// workspace is refused rather than followed (the caller has already verified
+// sandboxHome itself is not a symlink).
 func disableGoTelemetry(sandboxHome string) error {
-	dir := filepath.Join(sandboxHome, ".config", "go", "telemetry")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	root, err := os.OpenRoot(sandboxHome)
+	if err != nil {
 		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "mode"), []byte("off\n"), 0o600); err != nil {
+	defer root.Close()
+	dir := filepath.FromSlash(".config/go/telemetry")
+	if err := root.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+	}
+	f, err := root.OpenFile(filepath.Join(dir, "mode"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, "off\n"); err != nil {
 		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
 	}
 	return nil
@@ -316,7 +349,7 @@ func (p *Project) execVerificationStep(ctx context.Context, env verifyExecEnviro
 	if networked {
 		return p.execNetworkedFetch(ctx, env, projectDir, plan, readOnly)
 	}
-	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false, false)
+	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false)
 	if err != nil {
 		return nil, none, err
 	}
@@ -326,10 +359,10 @@ func (p *Project) execVerificationStep(ctx context.Context, env verifyExecEnviro
 
 // wrapSandboxStep builds the bwrap argv for one plan and applies the per-run
 // settings (acceptance isolation, plan environment) and the go toolchain
-// precondition. noHostModuleCache and maskWorkspaceSecrets harden a networked
-// fetch (see wrapVerificationCommand).
-func (p *Project) wrapSandboxStep(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, noHostModuleCache, maskWorkspaceSecrets bool) (string, []string, error) {
-	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(env.bwrapPath, projectDir, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan), readOnly, noHostModuleCache, maskWorkspaceSecrets)
+// precondition. networkedFetch hardens a networked fetch (see
+// wrapVerificationCommand).
+func (p *Project) wrapSandboxStep(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, networkedFetch bool) (string, []string, error) {
+	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(env.bwrapPath, projectDir, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan), readOnly, networkedFetch)
 	if err != nil {
 		return "", nil, fmt.Errorf("verification sandbox: %w", err)
 	}
@@ -362,7 +395,7 @@ func (p *Project) wrapSandboxStep(ctx context.Context, env verifyExecEnvironment
 // which a step without outbound network may read safely.
 func (p *Project) execNetworkedFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
 	none := sandboxNetwork{kind: sandboxNetworkNone}
-	networkedCmd, networkedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, true, true)
+	networkedCmd, networkedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, true)
 	if err != nil {
 		return nil, none, err
 	}
@@ -387,7 +420,7 @@ func (p *Project) execNetworkedFetch(ctx context.Context, env verifyExecEnvironm
 // available (no outbound network to exfiltrate them) and npm's registry
 // retries disabled so a needed download fails fast.
 func (p *Project) execLoopbackFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, network sandboxNetwork) (*ExecResult, sandboxNetwork, error) {
-	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false, false)
+	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false)
 	if err != nil {
 		return nil, network, err
 	}
@@ -519,12 +552,19 @@ func (p *Project) planDependencyStages(plan ExecPlan, projectDir string) (fetch,
 		// .npmrc in the sandbox HOME says.
 		f := plan
 		f.Args = ensureArg(plan.Args, "--ignore-scripts")
-		f.env = append(slices.Clone(plan.env), "npm_config_ignore_scripts=true", "npm_config_allow_git=none")
+		// The fetch runs with a fresh HOME, so point npm's cache at the
+		// persistent sandbox HOME: the two npm invocations execNpmFetch makes
+		// (lock resolution, then the real fetch) share what each downloads.
+		f.env = append(slices.Clone(plan.env), "npm_config_ignore_scripts=true", "npm_config_allow_git=none",
+			"npm_config_cache="+filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), ".npm"))
 		return &f, nil, noop, nil
 	case "go":
 		// go mod tidy/download run no project code; the offline test step reuses
-		// the sandbox module cache they fill.
+		// the sandbox module cache they fill. The fetch runs with a fresh HOME,
+		// so point GOMODCACHE at the persistent sandbox HOME's cache (the
+		// default location the offline step reads) rather than the fresh one.
 		f := plan
+		f.env = append(slices.Clone(plan.env), "GOMODCACHE="+filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "go", "pkg", "mod"))
 		return &f, nil, noop, nil
 	case "cargo":
 		fetch, build = cargoDependencyStages(plan)
@@ -611,13 +651,19 @@ func (p *Project) pipDependencyStages(plan ExecPlan, projectDir string) (fetch, 
 		b := plan
 		return nil, &b, noop, nil
 	}
-	home := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
-	wheelhouse := filepath.Join(home, "makewand-wheelhouse")
-	if err := os.MkdirAll(wheelhouse, 0o700); err != nil {
-		return nil, nil, noop, fmt.Errorf("create dependency wheelhouse: %w", err)
+	// The wheelhouse and the constraints file are host-side writes into a
+	// directory the sandboxed fetch can also write. Put them under a fresh,
+	// host-created per-run directory (newFetchScratch) rather than the
+	// persistent sandbox HOME, so no symlink an earlier loopback step planted is
+	// followed through.
+	scratch, cleanup, err := p.newFetchScratch(projectDir)
+	if err != nil {
+		return nil, nil, noop, err
 	}
-	constraints := filepath.Join(home, "makewand-fetch-constraints.txt")
-	cleanup = func() { _ = os.RemoveAll(wheelhouse); _ = os.Remove(constraints) }
+	wheelhouse, err := createFetchDir(scratch, "wheelhouse")
+	if err != nil {
+		return nil, nil, cleanup, fmt.Errorf("create dependency wheelhouse: %w", err)
+	}
 	buildPlan := plan
 	buildPlan.Args = pipOfflineInstallArgs(plan.Args, wheelhouse)
 	fetchArgs, hasTargets := p.pipDownloadArgs(install, wheelhouse)
@@ -631,7 +677,8 @@ func (p *Project) pipDependencyStages(plan ExecPlan, projectDir string) (fetch, 
 	// Pin the fetch to the install's constraints, sanitised to named pins only,
 	// so the wheels downloaded are the versions the offline install resolves.
 	if len(install.constraintPins) > 0 {
-		if err := os.WriteFile(constraints, []byte(strings.Join(install.constraintPins, "\n")+"\n"), 0o600); err != nil {
+		constraints, err := writeFetchFile(scratch, "constraints.txt", strings.Join(install.constraintPins, "\n")+"\n")
+		if err != nil {
 			return nil, nil, cleanup, fmt.Errorf("write sanitised pip constraints: %w", err)
 		}
 		fetchArgs = append(fetchArgs, "--constraint", constraints)
@@ -673,6 +720,11 @@ func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string) (args [
 		add(texts...)
 		optional, _ := p.pipOptionalDependencyTexts(project)
 		add(optional...)
+	}
+	for _, wheel := range install.wheels {
+		// A wheel runs no code; its Requires-Dist are read from METADATA
+		// (a zip read) and fetched so the offline install can resolve them.
+		add(p.pipWheelRequires(wheel.dir, wheel.extras)...)
 	}
 	if len(reqs) == 0 {
 		return nil, false
@@ -2197,6 +2249,10 @@ type pipInstall struct {
 	customIndex bool
 	// projects are the local projects it builds.
 	projects []pipLocalProject
+	// wheels are the local .whl targets it installs (project-relative) with the
+	// extras each selects. A wheel runs no code when installed, but its
+	// Requires-Dist must be fetched so the offline install can resolve them.
+	wheels []pipLocalProject
 	// localCode is set when it builds a local project or source archive, or
 	// reads requirements makewand cannot see: project code may run then.
 	localCode bool
@@ -2512,13 +2568,17 @@ func (p *Project) addPipTarget(install *pipInstall, target, source string) {
 
 // addPipLocal adds a local project directory or archive, with the extras a
 // trailing [...] selects (`.[dev]`, `./sub[a,b]`, as pip strips them). A wheel
-// runs no code when it is installed; anything else does.
+// runs no code when it is installed (its named Requires-Dist are read
+// statically and fetched, pipDownloadArgs); anything else does.
 func (p *Project) addPipLocal(install *pipInstall, path string) {
+	path, extras := splitPipExtras(path)
 	if strings.HasSuffix(strings.ToLower(path), ".whl") {
+		if rel, ok := p.pipLocalFile(path); ok {
+			install.wheels = append(install.wheels, pipLocalProject{dir: rel, extras: extras})
+		}
 		return
 	}
 	install.localCode = true
-	path, extras := splitPipExtras(path)
 	path = filepath.Clean(path)
 	if path != "." {
 		full, err := p.validatePath(path, false)
@@ -2530,6 +2590,21 @@ func (p *Project) addPipLocal(install *pipInstall, path string) {
 		}
 	}
 	install.projects = append(install.projects, pipLocalProject{dir: path, extras: extras})
+}
+
+// pipLocalFile validates a project-relative path to a regular file (a local
+// wheel) and returns it cleaned. A path outside the project, or not a regular
+// file, is not recorded.
+func (p *Project) pipLocalFile(path string) (string, bool) {
+	path = filepath.Clean(path)
+	full, err := p.validatePath(path, false)
+	if err != nil {
+		return "", false
+	}
+	if info, err := os.Stat(full); err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	return path, true
 }
 
 var (

@@ -23,7 +23,7 @@ home=
 while [ $# -gt 0 ]; do
   case "$1" in
     --setenv) [ "$2" = HOME ] && home=$3; shift 3 ;;
-    --chdir|--tmpfs|--proc|--dev|--seccomp) shift 2 ;;
+    --chdir|--tmpfs|--proc|--dev|--seccomp|--dir) shift 2 ;;
     --bind|--ro-bind) shift 3 ;;
     --*) shift ;;
     *) break ;;

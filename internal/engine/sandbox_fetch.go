@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -643,6 +645,80 @@ func npmMajorVersion() int {
 	return major
 }
 
+// newFetchScratch creates a fresh, host-owned private directory for a
+// dependency fetch's host-side artifacts (the pip wheelhouse and constraints
+// file, the npm lock-resolution tree). It is created through an os.Root
+// confined to the workspace - so a symlink a loopback step planted is never
+// followed out of the workspace - under a random name no earlier run could have
+// planted, beside the persistent sandbox HOME under .makewand (which project
+// scans and clones ignore). The sandboxed fetch binds the whole workspace, so
+// it writes into the returned directory by absolute path; cleanup removes it.
+func (p *Project) newFetchScratch(projectDir string) (dir string, cleanup func(), err error) {
+	root, err := os.OpenRoot(projectDir)
+	if err != nil {
+		return "", nil, err
+	}
+	defer root.Close()
+	if info, lerr := root.Lstat(".makewand"); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", nil, fmt.Errorf("create dependency fetch directory: refusing to use .makewand: it is a symlink")
+	}
+	if err := root.Mkdir(".makewand", 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", nil, fmt.Errorf("create dependency fetch directory: %w", err)
+	}
+	var rel string
+	for attempt := 0; ; attempt++ {
+		rel = filepath.Join(".makewand", "fetch-"+rand.Text())
+		err := root.Mkdir(rel, 0o700)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) || attempt >= 8 {
+			return "", nil, fmt.Errorf("create dependency fetch directory: %w", err)
+		}
+	}
+	cleanup = func() {
+		if r, err := os.OpenRoot(projectDir); err == nil {
+			_ = r.RemoveAll(rel)
+			_ = r.Close()
+		}
+	}
+	return filepath.Join(projectDir, rel), cleanup, nil
+}
+
+// createFetchDir makes a subdirectory of a fetch scratch directory through an
+// os.Root, so a symlink is never followed out of the scratch directory.
+func createFetchDir(scratch, name string) (string, error) {
+	root, err := os.OpenRoot(scratch)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	return filepath.Join(scratch, name), nil
+}
+
+// writeFetchFile writes a file into a fetch scratch directory through an
+// os.Root (O_EXCL, so an existing name is refused rather than a symlink
+// followed out of the scratch directory).
+func writeFetchFile(scratch, name, content string) (string, error) {
+	root, err := os.OpenRoot(scratch)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, content); err != nil {
+		return "", err
+	}
+	return filepath.Join(scratch, name), nil
+}
+
 // execNpmFetch runs an npm dependency fetch that has outbound network so that
 // npm downloads exactly the tree of a lockfile makewand has inspected. The
 // project's manifest and lockfiles are copied into a scratch project in the
@@ -674,11 +750,15 @@ func (p *Project) execNpmFetch(ctx context.Context, env verifyExecEnvironment, p
 		// lockfiles npmFetchUnavailable inspected are all it could install.
 		return p.execVerificationStep(ctx, env, projectDir, fetch, readOnly, true)
 	}
-	scratch, err := os.MkdirTemp(filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath)), "makewand-npm-lock-")
+	scratchRoot, scratchCleanup, err := p.newFetchScratch(projectDir)
 	if err != nil {
 		return nil, none, fmt.Errorf("create the npm lock resolution directory: %w", err)
 	}
-	defer os.RemoveAll(scratch)
+	defer scratchCleanup()
+	scratch, err := createFetchDir(scratchRoot, "npm-lock")
+	if err != nil {
+		return nil, none, fmt.Errorf("create the npm lock resolution directory: %w", err)
+	}
 	lockName := ""
 	for _, name := range npmProjectFiles {
 		data, err := p.readProjectFileLimit(name, maxNpmManifestBytes)
@@ -688,7 +768,7 @@ func (p *Project) execNpmFetch(ctx context.Context, env verifyExecEnvironment, p
 		case err != nil:
 			return refuse(nil, none, "makewand cannot read the project's "+name+" to inspect it before the networked npm fetch ("+err.Error()+"); "+npmRegistryOnlyRemedy)
 		}
-		if err := os.WriteFile(filepath.Join(scratch, name), data, 0o600); err != nil {
+		if _, err := writeFetchFile(scratch, name, string(data)); err != nil {
 			return nil, none, fmt.Errorf("copy %s for the npm lock resolution: %w", name, err)
 		}
 		if lockName == "" && (name == "npm-shrinkwrap.json" || name == "package-lock.json") {
@@ -826,4 +906,174 @@ func npmAllowRefusal(result *ExecResult) string {
 // npmNotCached reports whether npm stopped at a request --offline forbade.
 func npmNotCached(result *ExecResult) bool {
 	return slices.ContainsFunc(outputLines(result), npmNotCachedRe.MatchString)
+}
+
+// maxWheelMetadataBytes bounds the METADATA makewand reads from a local wheel.
+const maxWheelMetadataBytes = 4 << 20
+
+// pipExtraMarkerRe matches an `extra == "name"` comparison in a PEP 508
+// environment marker (single or double quotes).
+var pipExtraMarkerRe = regexp.MustCompile(`extra\s*==\s*(?:"([^"]*)"|'([^']*)')`)
+
+// pipWheelRequires returns the requirements a local wheel declares for the
+// selected extras, read from its METADATA (Requires-Dist) without running any
+// code. Each returned requirement carries its environment marker rewritten so
+// pip's own evaluation during the download picks exactly what installing the
+// wheel with these extras would (pipRewriteExtraMarker). The caller runs each
+// through the strict parser, which drops anything an index would not serve.
+func (p *Project) pipWheelRequires(relPath string, extras []string) []string {
+	metadata, err := p.readWheelMetadata(relPath)
+	if err != nil {
+		return nil
+	}
+	selected := map[string]bool{}
+	for _, extra := range extras {
+		selected[extra] = true
+	}
+	var reqs []string
+	for _, value := range wheelMetadataField(metadata, "Requires-Dist") {
+		if req, ok := pipRewriteExtraMarker(value, selected); ok {
+			reqs = append(reqs, req)
+		}
+	}
+	return reqs
+}
+
+// readWheelMetadata reads the top-level *.dist-info/METADATA of a project-local
+// wheel as a zip entry (no code runs). The wheel is opened through an os.Root
+// confined to the project.
+func (p *Project) readWheelMetadata(relPath string) (string, error) {
+	if _, err := p.validatePath(relPath, false); err != nil {
+		return "", err
+	}
+	root, err := os.OpenRoot(p.Path)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	f, err := root.Open(filepath.Clean(relPath))
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", relPath)
+	}
+	zr, err := zip.NewReader(f, info.Size())
+	if err != nil {
+		return "", err
+	}
+	for _, zf := range zr.File {
+		if !isWheelMetadataName(zf.Name) {
+			continue
+		}
+		rc, err := zf.Open()
+		if err != nil {
+			return "", err
+		}
+		data, err := io.ReadAll(io.LimitReader(rc, maxWheelMetadataBytes+1))
+		rc.Close()
+		if err != nil {
+			return "", err
+		}
+		if int64(len(data)) > maxWheelMetadataBytes {
+			return "", fmt.Errorf("%s METADATA is larger than %d bytes", relPath, maxWheelMetadataBytes)
+		}
+		return string(data), nil
+	}
+	return "", fmt.Errorf("%s has no dist-info METADATA", relPath)
+}
+
+// isWheelMetadataName reports whether a zip entry name is a wheel's top-level
+// <name>-<version>.dist-info/METADATA (zip names use forward slashes).
+func isWheelMetadataName(name string) bool {
+	dir, ok := strings.CutSuffix(name, "/METADATA")
+	return ok && !strings.Contains(dir, "/") && strings.HasSuffix(dir, ".dist-info")
+}
+
+// wheelMetadataField returns every value of a METADATA header (case-insensitive),
+// joining folded continuation lines. Only the header block (up to the first
+// blank line) is read; the long-description body that follows is ignored.
+func wheelMetadataField(metadata, field string) []string {
+	var values []string
+	var cur strings.Builder
+	has := false
+	flush := func() {
+		if has {
+			values = append(values, strings.TrimSpace(cur.String()))
+		}
+		cur.Reset()
+		has = false
+	}
+	prefix := strings.ToLower(field) + ":"
+	for _, line := range strings.Split(metadata, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			break
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if has {
+				cur.WriteString(" ")
+				cur.WriteString(strings.TrimSpace(line))
+			}
+			continue
+		}
+		flush()
+		if rest, ok := cutHeaderPrefix(line, prefix); ok {
+			cur.WriteString(strings.TrimSpace(rest))
+			has = true
+		}
+	}
+	flush()
+	return values
+}
+
+// cutHeaderPrefix returns the value after a case-insensitive header prefix.
+func cutHeaderPrefix(line, lowerPrefix string) (string, bool) {
+	if len(line) < len(lowerPrefix) || !strings.EqualFold(line[:len(lowerPrefix)], lowerPrefix) {
+		return "", false
+	}
+	return line[len(lowerPrefix):], true
+}
+
+// pipRewriteExtraMarker prepares a wheel's Requires-Dist value for the networked
+// `pip download`. A requirement with no environment marker, or a marker that
+// does not mention extras, is returned unchanged (pip evaluates any marker
+// itself). A marker that mentions extras is kept only when one of its extras is
+// selected; each `extra == "x"` comparison is then rewritten to a true or false
+// string literal so pip's own evaluation of the whole marker (the extra clauses
+// resolved, the rest - python_version, sys_platform - left to pip) matches
+// installing the wheel with these extras. A requirement whose only applicable
+// condition is an unselected extra is dropped.
+func pipRewriteExtraMarker(value string, selected map[string]bool) (string, bool) {
+	req, marker, hasMarker := strings.Cut(value, ";")
+	req = strings.TrimSpace(req)
+	if req == "" {
+		return "", false
+	}
+	if !hasMarker {
+		return req, true
+	}
+	marker = strings.TrimSpace(marker)
+	if !pipExtraMarkerRe.MatchString(marker) {
+		return value, true
+	}
+	anySelected := false
+	rewritten := pipExtraMarkerRe.ReplaceAllStringFunc(marker, func(m string) string {
+		sub := pipExtraMarkerRe.FindStringSubmatch(m)
+		name := normalizePipName(sub[1] + sub[2])
+		if selected[name] {
+			anySelected = true
+			return `"1" == "1"`
+		}
+		return `"1" == "0"`
+	})
+	if !anySelected {
+		return "", false
+	}
+	return req + " ; " + rewritten, true
 }

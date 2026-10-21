@@ -148,6 +148,49 @@ func RestrictedExecIsolationError(auth UnsafeHostExecAuthorization) error {
 // already ignore.
 const sandboxHomeRelPath = ".makewand/sandbox-home"
 
+// fetchSandboxHome is the HOME a networked dependency fetch runs with: a fresh,
+// empty directory created on the sandbox tmpfs /tmp, never the persistent
+// sandbox HOME an earlier loopback step (running project code) can write. It
+// defeats, for example, a git credential helper a loopback step wrote into the
+// persistent HOME's .gitconfig, which a later networked go or cargo-git fetch
+// would otherwise run on an HTTP 401 (GEC-1021-1, round 4).
+const fetchSandboxHome = "/tmp/makewand-fetch-home"
+
+// networkedFetchHomeArgs returns the bwrap --setenv arguments that keep a
+// networked dependency fetch from reading any tool config a loopback step could
+// have written. HOME is already the fresh fetchSandboxHome; these also pin the
+// XDG base directories inside it and neutralise the config-file locations git,
+// npm, pip and go consult outside HOME:
+//   - GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_NOSYSTEM=1: git reads no global
+//     (~/.gitconfig, XDG) or system config, so no credential helper runs;
+//     GIT_TERMINAL_PROMPT=0 keeps it from blocking on a prompt;
+//   - NPM_CONFIG_USERCONFIG and NPM_CONFIG_GLOBALCONFIG at distinct, absent
+//     paths inside the fresh HOME: npm reads no user or global .npmrc. They must
+//     be distinct and must not be /dev/null, which npm rejects as a double-load
+//     ("double-loading config ... as global, previously loaded as user") and as
+//     not a regular file;
+//   - PIP_CONFIG_FILE=/dev/null: pip reads no configuration file;
+//   - GOENV=off: the go command reads no env file.
+//
+// cargo's CARGO_HOME and go's GOMODCACHE are set per ecosystem (cargoFetchEnv,
+// planDependencyStages) to the persistent caches the offline steps reuse, and
+// cargo's config files are masked (sandboxWorkspaceSecretMasks), so they are
+// not repeated here.
+func networkedFetchHomeArgs() []string {
+	return []string{
+		"--setenv", "XDG_CONFIG_HOME", fetchSandboxHome + "/.config",
+		"--setenv", "XDG_CACHE_HOME", fetchSandboxHome + "/.cache",
+		"--setenv", "XDG_DATA_HOME", fetchSandboxHome + "/.local/share",
+		"--setenv", "GIT_CONFIG_GLOBAL", os.DevNull,
+		"--setenv", "GIT_CONFIG_NOSYSTEM", "1",
+		"--setenv", "GIT_TERMINAL_PROMPT", "0",
+		"--setenv", "NPM_CONFIG_USERCONFIG", fetchSandboxHome + "/.npmrc",
+		"--setenv", "NPM_CONFIG_GLOBALCONFIG", fetchSandboxHome + "/.npmrc-global",
+		"--setenv", "PIP_CONFIG_FILE", os.DevNull,
+		"--setenv", "GOENV", "off",
+	}
+}
+
 // wrapVerificationCommand wraps a verification command in bubblewrap. The
 // workspace is the only writable host path; everything else is read-only with
 // tmpfs /tmp, a cleared environment, and the host HOME hidden (only toolchain
@@ -158,29 +201,33 @@ const sandboxHomeRelPath = ".makewand/sandbox-home"
 // network namespace, as it does for every verification step
 // (verificationPlanAllowsNetwork).
 //
-// A networked dependency fetch passes noHostModuleCache (keep the host module
-// caches out of the sandbox) and maskWorkspaceSecrets (shadow the workspace
-// secrets and cargo configs sandboxWorkspaceSecretMasks lists), so the fetch -
-// which runs no project code - sees neither.
+// A networked dependency fetch (networkedFetch) runs no project code, but is
+// still hardened against config an earlier loopback step left in the workspace
+// or the persistent sandbox HOME: the host module caches are kept out of the
+// sandbox, the workspace secrets and cargo configs sandboxWorkspaceSecretMasks
+// lists are shadowed, and HOME is a fresh, empty tmpfs with every tool's
+// config-file location pointed at nothing (networkedFetchHomeArgs), so a git
+// credential helper or an npm/pip config a loopback step wrote is never read
+// while the fetch has the network.
 //
 // The returned argv starts with `--seccomp 3` when the syscall filter applies
 // (see sandboxSeccompArgs); the launcher must supply it via
 // attachSandboxSeccomp. An incomplete workspace socket scan is an error.
-func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string, noHostModuleCache, maskWorkspaceSecrets bool) (string, []string, error) {
+func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string, networkedFetch bool) (string, []string, error) {
 	workspacePath = filepath.Clean(workspacePath)
 	pathEnv := strings.TrimSpace(verifyGetenv("PATH"))
 	if pathEnv == "" {
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
 	sandboxHome := filepath.Join(workspacePath, filepath.FromSlash(sandboxHomeRelPath))
-	layout := verifyHomeLayout(workspacePath, pathEnv, noHostModuleCache)
+	layout := verifyHomeLayout(workspacePath, pathEnv, networkedFetch)
 
 	socketMasks, err := sandboxWorkspaceSocketMasks(workspacePath)
 	if err != nil {
 		return "", nil, err
 	}
 	var secretMasks []string
-	if maskWorkspaceSecrets {
+	if networkedFetch {
 		if secretMasks, err = sandboxWorkspaceSecretMasks(workspacePath); err != nil {
 			return "", nil, err
 		}
@@ -219,16 +266,32 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	// Shadow workspace secrets for a networked fetch (after the workspace bind
 	// so the bind cannot re-expose them).
 	wrapped = append(wrapped, secretMasks...)
+	// A networked fetch reads no config an earlier loopback step wrote: HOME is
+	// a fresh, empty directory on the sandbox tmpfs, not the persistent sandbox
+	// HOME. The caches it fills stay under the persistent HOME, reached through
+	// explicit variables the plan sets (GOMODCACHE, CARGO_HOME, npm_config_cache)
+	// or absolute paths (the wheelhouse), so the offline steps still read them.
+	homeDir := sandboxHome
+	if networkedFetch {
+		homeDir = fetchSandboxHome
+		wrapped = append(wrapped, "--dir", fetchSandboxHome)
+	}
 	wrapped = append(wrapped,
 		"--chdir", workspacePath,
 		"--clearenv",
 		"--setenv", "PATH", pathEnv,
-		"--setenv", "HOME", sandboxHome,
+		"--setenv", "HOME", homeDir,
 		"--setenv", "TMPDIR", "/tmp",
 		"--setenv", "NO_COLOR", "1",
 		"--setenv", "MAKEWAND_SANDBOX", "1",
 	)
 	wrapped = append(wrapped, layout.setenvArgs()...)
+	if networkedFetch {
+		// Point every tool's config-file location at nothing so none reads a
+		// file a loopback step could have written (after layout.setenvArgs so a
+		// fetch value wins over a layout default for the same key).
+		wrapped = append(wrapped, networkedFetchHomeArgs()...)
+	}
 	if !allowNetwork {
 		wrapped = append(wrapped, "--unshare-net")
 	}
@@ -245,7 +308,7 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 
 // verifyHomeLayout resolves the sandbox HOME layout for a workspace from the
 // verification environment hooks. noHostModuleCache is threaded to
-// buildSandboxHomeLayout for a networked fetch.
+// buildSandboxHomeLayout for a networked fetch (it is true exactly then).
 func verifyHomeLayout(workspacePath, pathEnv string, noHostModuleCache bool) sandboxHomeLayout {
 	home, err := verifyUserHome()
 	if err != nil {

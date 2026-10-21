@@ -220,7 +220,7 @@ func fakeCommandBwrap(pipOutput string) string {
 while [ $# -gt 0 ]; do
   case "$1" in
     --setenv|--bind|--ro-bind|--ro-bind-data|--bind-data) shift 3 ;;
-    --chdir|--tmpfs|--proc|--dev|--seccomp|--info-fd|--block-fd|--perms) shift 2 ;;
+    --chdir|--tmpfs|--proc|--dev|--seccomp|--info-fd|--block-fd|--perms|--dir) shift 2 ;;
     --*) shift ;;
     *) cmd=$1; break ;;
   esac
