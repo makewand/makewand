@@ -506,6 +506,14 @@ _PYTEST_MISSING = re.compile(r"No module named '?pytest'?(?![\w.])")
 _PYTEST_ARGS = ("-q", "-p", "no:cacheprovider", "-p", "no:langsmith", "-p", "no:django")
 
 
+def _test_evidence(ok, detail):
+    """A run_local_tests result as evidence: True passed, False failed, None none
+    (no suite, tests that could not run, a gate that ran out of time)."""
+    if (ok is True and detail is None) or getattr(detail, "execution_status", None) in LOCAL_TESTS_NO_EVIDENCE:
+        return None
+    return ok
+
+
 TRANSIENT_BYTECODE_DIRS = frozenset({"__pycache__", ".pytest_cache"})
 TRANSIENT_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 
@@ -3832,6 +3840,14 @@ def _run_race_impl(
         run_agent_a = _exec_racer_a
         run_agent_b = _exec_racer_b
 
+        def candidate_gate(path):
+            """(test_pass, detail) of one candidate: True passed, False failed, None no evidence."""
+            gate_timeout = remaining_timeout(60, generation=True)
+            if not gate_timeout:
+                return None, LocalTestsTimedOut("race generation time budget exhausted")
+            ok, detail = _stage_call("test", run_local_tests, str(path), timeout=gate_timeout)
+            return _test_evidence(ok, detail), detail
+
         try:
             high_load = os.getloadavg()[0] > 24.0
         except Exception:
@@ -3880,11 +3896,7 @@ def _run_race_impl(
                             except Exception:
                                 diff_c, diff_err_c = "", "failed to inspect diff"
                             if not diff_err_c and bool(diff_c.strip()) and dispatched_size(diff_c) <= review_cap:
-                                t_ok, t_detail = _stage_call("test", run_local_tests, str(wt_curr), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
-                                if t_ok is True and t_detail is None:
-                                    t_pass = None
-                                else:
-                                    t_pass = t_ok
+                                t_pass, t_detail = candidate_gate(wt_curr)
                                 if side == "A":
                                     gate_eval_a = (t_pass, t_detail)
                                 else:
@@ -3918,18 +3930,14 @@ def _run_race_impl(
         if gate_eval_a is not None:
             test_pass_a, test_detail_a = gate_eval_a
         elif res_a[1]:
-            test_pass_a, test_detail_a = _stage_call("test", run_local_tests, str(wt_a), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
-            if test_pass_a is True and test_detail_a is None:
-                test_pass_a = None
+            test_pass_a, test_detail_a = candidate_gate(wt_a)
         else:
             test_pass_a, test_detail_a = False, "候选执行未成功或已取消"
 
         if gate_eval_b is not None:
             test_pass_b, test_detail_b = gate_eval_b
         elif res_b[1]:
-            test_pass_b, test_detail_b = _stage_call("test", run_local_tests, str(wt_b), timeout=remaining_timeout(60, generation=True)) if remaining_timeout(60, generation=True) else (False, "race generation time budget exhausted")
-            if test_pass_b is True and test_detail_b is None:
-                test_pass_b = None
+            test_pass_b, test_detail_b = candidate_gate(wt_b)
         else:
             test_pass_b, test_detail_b = False, "候选执行未成功或已取消"
 
@@ -3963,10 +3971,13 @@ def _run_race_impl(
         _print(c("\n============================================================", COLOR_BOLD))
         _print(c("                Makewand 竞速赛况与性能指标", COLOR_BOLD + COLOR_GREEN))
         _print(c("============================================================\n", COLOR_BOLD))
-        def test_state(value):
-            return "通过" if value is True else "未验证 (无测试套件)" if value is None else "失败"
-        _print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={test_state(test_pass_a)}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节, 精简度={parsimony_a['summary']}")
-        _print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={test_state(test_pass_b)}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节, 精简度={parsimony_b['summary']}\n")
+        def test_state(value, detail):
+            if value is not None:
+                return "通过" if value else "失败"
+            return {"TIMEOUT": "未验证 (测试超时)", "UNVERIFIED": "未验证 (测试无法运行)"}.get(
+                getattr(detail, "execution_status", None), "未验证 (无测试套件)")
+        _print(f"选手 A [{res_a[0]}]: 状态={'✔ 成功' if res_a[1] else '❌ 失败'}, 单测={test_state(test_pass_a, test_detail_a)}, 耗时={res_a[3]}s, 代码Diff大小={len(diff_a)} 字节, 精简度={parsimony_a['summary']}")
+        _print(f"选手 B [{res_b[0]}]: 状态={'✔ 成功' if res_b[1] else '❌ 失败'}, 单测={test_state(test_pass_b, test_detail_b)}, 耗时={res_b[3]}s, 代码Diff大小={len(diff_b)} 字节, 精简度={parsimony_b['summary']}\n")
 
         # Determine winner eligibility with strict deterministic test gate
         eligible_a = res_a[1] and test_pass_a is True and not diff_err_a and bool(diff_a.strip())
@@ -4047,8 +4058,8 @@ def _run_race_impl(
                 f"请作为资深软件架构裁判，以客观中立的双盲评审视角对比以下两位候选方案对同一任务的实现，指出各自优势与缺陷，并评定胜出者：\n\n"
                 f"--- 原始任务 ---\n{prompt}\n\n"
                 f"--- 自动化测试与工程指标 ---\n"
-                f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={test_state(test_pass_a)}, 补丁精简度(Parsimony)={parsimony_a['summary']}\n"
-                f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={test_state(test_pass_b)}, 补丁精简度(Parsimony)={parsimony_b['summary']}\n\n"
+                f"• 候选方案 A: 运行状态={'正常' if res_a[1] else '失败'}, 本地单元测试={test_state(test_pass_a, test_detail_a)}, 补丁精简度(Parsimony)={parsimony_a['summary']}\n"
+                f"• 候选方案 B: 运行状态={'正常' if res_b[1] else '失败'}, 本地单元测试={test_state(test_pass_b, test_detail_b)}, 补丁精简度(Parsimony)={parsimony_b['summary']}\n\n"
                 f"【评审准则（Agentless 极简补丁偏好）】在两方案均通过单元测试且实现正确的前提下，优先奖励修改紧凑、聚焦、无多余大面积重构或无关格式修改的高精简度方案 (High Parsimony)。\n"
                 f"{judge_kibitzer}\n"
                 f"--- 候选方案 A 的代码实现 ---\n{fmt_diff_a}\n\n"
@@ -4244,7 +4255,13 @@ def _run_race_impl(
                 if status in racer_outcomes.values():
                     return STATUS_CODES[status]
         if test_pass_a is not True and test_pass_b is not True:
-            if test_pass_a is None or test_pass_b is None:
+            unproven = [detail for passed, detail in ((test_pass_a, test_detail_a), (test_pass_b, test_detail_b))
+                        if passed is None]
+            if any(getattr(detail, "execution_status", None) == "TIMEOUT" for detail in unproven):
+                from makewand.execution_contract import EXIT_TIMEOUT
+                _print(c("本地测试时间预算耗尽，没有候选获得本地测试通过证据 (TIMEOUT)。", COLOR_YELLOW))
+                return EXIT_TIMEOUT
+            if unproven:
                 _print(c("没有候选获得明确的本地测试通过证据，结论未验证 (UNVERIFIED)。", COLOR_YELLOW))
                 return EXIT_UNVERIFIED
             _print(c("❌ [Makewand Test Gate] 两套候选方案均未通过本地单元测试，拒绝交付。", COLOR_RED + COLOR_BOLD))

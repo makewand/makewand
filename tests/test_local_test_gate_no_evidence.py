@@ -1,10 +1,11 @@
 """Tests that could not run are UNVERIFIED, an exhausted gate budget is TIMEOUT.
 
-Neither is a failing test: no auto-fix round, no EXIT_FAILED. Covers pytest hidden
-in the sandbox (the host interpreter can still import it), nothing collected
-(exit 5) with a pytest configuration, pytest's import error with and without
-quotes, and the gate budget; a real failing test stays FAILED. The sandbox is
-replaced by host processes that run only the fixtures written here.
+Neither is a failing test: no auto-fix round, no EXIT_FAILED, in `run` and in
+`race`. Covers pytest hidden in the sandbox (the host interpreter can still import
+it), nothing collected (exit 5) with a pytest configuration, pytest's import error
+with and without quotes, and the gate budget; a real failing test stays FAILED, and
+such a run's test output is still removed. The sandbox is replaced by host
+processes that run only the fixtures written here.
 """
 try:
     import _isolation  # noqa: F401
@@ -13,16 +14,23 @@ except ImportError:
 
 import contextlib
 import importlib.util
+import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from makewand import orchestrator as orch
+import test_workflow_scheduling as scheduling
+from makewand import config, orchestrator as orch
+from makewand.candidate import CandidateManager
+from makewand.execution_contract import EXIT_FAILED, EXIT_TIMEOUT, EXIT_UNVERIFIED
+from makewand.execution_runtime import current_context
 from makewand.providers.base import ProcessExecutionError
 from makewand.workflow import last_result
 from test_g1_datasafety_pipeline import PipelineHarness, make_project
@@ -456,6 +464,79 @@ class PipelineNoEvidenceTests(PipelineHarness):
         self.assertFalse(result)
         self.assertEqual(last_result().status, "FAILED")
         self.assertIn("Tests Failing", self.output)
+
+
+class RaceNoEvidenceTests(unittest.TestCase):
+    """`makewand race` reads its three gates as run_pipeline does: a candidate whose tests
+    could not run or ran out of time has no evidence, and is no failing candidate."""
+    fixtures = scheduling.SchedulingTests.fixtures
+    FAILING = (False, "[Python Tests Failed (exit 1)]:\n1 failed")
+
+    def setUp(self):
+        scheduling.SchedulingTests.setUp(self)
+        for patcher in (patch("makewand.usage.record_engine_usage"),
+                        patch.object(config, "CANDIDATES_DIR", self.root / "candidates"),
+                        patch.object(orch, "CANDIDATES_DIR", self.root / "candidates")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def race(self, gate, serial, **kwargs):
+        """Race two candidates; ``gate`` plays run_local_tests. Above a load of 24 the
+        contestants run one after the other and both are tested afterwards; otherwise
+        each is tested as soon as it finishes (the Winner-Take-All gate)."""
+        output = io.StringIO()
+        load = 30 if serial else 0
+        with self.fixtures(), contextlib.redirect_stdout(output), \
+                patch.object(orch, "run_local_tests", side_effect=gate), \
+                patch.object(orch.os, "getloadavg", return_value=(load, load, load)):
+            code = orch.run_race("Implement value 2", cwd=str(self.repo), engine_a="claude",
+                                 engine_b="codex", **{"timeout": 60, **kwargs})
+        return code, output.getvalue()
+
+    def assert_no_evidence(self, result, code, label):
+        for serial in (True, False):
+            with self.subTest(serial=serial):
+                exit_code, output = self.race(lambda *_, **__: result, serial)
+                self.assertEqual(exit_code, code, output)
+                self.assertEqual(output.count(f"单测={label}"), 2, output)
+                self.assertNotIn("两套候选方案均未通过本地单元测试", output)
+                race = CandidateManager.get_race(re.search(r"Race ID: (rc_[0-9a-f]+)", output).group(1))
+                self.assertEqual([race["candidates"][side]["test_passed"] for side in "AB"], [None, None])
+
+    def test_tests_that_could_not_run_end_unverified(self):
+        self.assert_no_evidence((False, orch.LocalTestsUnavailable("pytest 未收集到任何测试用例 (exit 5)")),
+                                EXIT_UNVERIFIED, "未验证 (测试无法运行)")
+        self.assertEqual(last_result().status, "UNVERIFIED")
+
+    def test_gate_that_ran_out_of_time_ends_timeout(self):
+        self.assert_no_evidence((False, orch.LocalTestsTimedOut("本地测试总时间预算已耗尽")),
+                                EXIT_TIMEOUT, "未验证 (测试超时)")
+        self.assertEqual(last_result().status, "TIMEOUT")
+
+    def test_generation_budget_spent_before_a_gate_starts_is_timeout(self):
+        # Serial: both candidates are tested after both finished. A's gate fails and runs
+        # past the generation budget (the total minus the judge's reserve), so B's gate
+        # cannot start; the judge's reserve is left. The old race ended FAILED.
+        reserve, gates = 5, []
+
+        def first_gate_spends_the_generation_budget(cwd, **kwargs):
+            gates.append(cwd)
+            generation_end = current_context()["deadline_unix_ms"] / 1000 - reserve
+            time.sleep(max(0, generation_end - time.time()) + 0.3)
+            return self.FAILING
+        code, output = self.race(first_gate_spends_the_generation_budget, True, timeout=10,
+                                 judge_reserve_seconds=reserve)
+        self.assertEqual(len(gates), 1, output)  # B's gate could not start
+        self.assertEqual(code, EXIT_TIMEOUT, output)
+        self.assertIn("单测=失败", output)
+        self.assertIn("单测=未验证 (测试超时)", output)
+
+    def test_failing_tests_still_end_failed(self):
+        for serial in (True, False):
+            with self.subTest(serial=serial):
+                code, output = self.race(lambda *_, **__: self.FAILING, serial)
+                self.assertEqual(code, EXIT_FAILED, output)
+                self.assertIn("两套候选方案均未通过本地单元测试", output)
 
 
 if __name__ == "__main__":

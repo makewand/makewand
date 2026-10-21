@@ -184,13 +184,19 @@ executed local test evidence stops before review and delivery. Python's
 unittest fallback reporting zero tests is also unverified.
 The Python runner is chosen inside the sandbox, not by the host interpreter: a
 read-only probe there decides whether pytest can be imported (a user-site pytest
-the sandbox hides cannot), otherwise unittest runs. Tests that cannot run are
-`UNVERIFIED`, not failing tests: a pytest configuration without an importable
-pytest, pytest or unittest exit code 5 (nothing collected or run), zero executed
-tests, and pytest's own import error with or without quotes. A gate whose time
-budget runs out before every suite produced a result is `TIMEOUT` (exit 16),
-unless a suite already reported failing tests. Neither outcome starts an auto-fix
-round or ends as `FAILED`.
+the sandbox hides cannot, and a host `pytest` script the sandbox cannot start is
+ruled out), otherwise unittest runs. Tests that cannot run are `UNVERIFIED`, not
+failing tests: a pytest configuration without an importable pytest, pytest or
+unittest exit code 5 (nothing collected or run), zero executed tests, and
+pytest's own import error with or without quotes. A gate whose time budget runs
+out before every suite produced a result is `TIMEOUT` (exit 16). Neither outcome
+starts an auto-fix round or ends as `FAILED`, but failing tests an earlier suite
+reported, and a run that changed tested inputs or left test output that could run
+as code, still fail the gate; test output such a run created is removed as after
+any other run. In `race` such a candidate has no test evidence and cannot win:
+when no candidate passed its tests, the race ends `UNVERIFIED`, or `TIMEOUT` when
+a candidate's gate ran out of time or the generation budget was spent before it
+could start.
 Saved candidates require explicit generation, test and review passes for normal
 application. Missing SDK metadata remains unknown; it is never inferred from
 generation success. An explicit human `--force` decision remains supported.

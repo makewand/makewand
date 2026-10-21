@@ -111,7 +111,7 @@ All notable changes to this project are documented here. The format is based on
 - Python 测试关卡（CI、Release、`make prelaunch`，以及装有 pytest 时的 `make test-py`）改为 `python3 -I -m pytest -q -p no:cacheprovider tests`，pytest 固定为 9.0.2：原先的 unittest 发现收集不到只有模块级 pytest 测试的 10 个模块（96 个函数、416 个用例，多为 #83/#84 的回归测试），它们从未在任何关卡运行。只用标准库的 `scripts/test_python.py` 遇到 unittest 跑不到的 pytest 风格测试、没有测试的指名模块或一个测试也没收集到时以失败退出，不再静默通过。
 - 每次发布说明中的源码安装命令改为 `curl -fsSL https://makewand.org/install.sh | bash`：原先的 `curl …/scripts/install.sh | bash` 从管道读取时 `BASH_SOURCE[0]` 未设置，安装根变成 `/`，什么也装不上。`scripts/install.sh` 经管道、`bash -s` 或 `/dev/fd` 运行时先于任何工具检查退出，并给出这条命令。
 - `makewand route --not/--self` 同时按候选所带模型判断家族（与流水线判断审查独立性的 `discovery.model_family` 一致）：agy 代理的 `claude-opus-5-5-high`、`claude-sonnet-5-5-*` 属于 claude，`gpt-oss-120b` 属于 codex，`--not` 跳过它们、`--self` 把它们排到最后；跳过列表写明被跳过的模型。此前 `--not claude` 仍可能派 agy 上的 Claude 审查 Claude 的改动。
-- 本地测试关卡：Python 用 pytest 还是 unittest 改由沙箱内的只读探测决定，不再看宿主解释器；测试无法运行（配置了 pytest 但沙箱内无法导入、pytest/unittest 退出码 5、带或不带引号的 `No module named pytest`）结论为 UNVERIFIED，关卡时间预算耗尽为 TIMEOUT（已有测试套件报告失败时仍为失败），都不再当作测试失败触发自动修复并以 EXIT_FAILED 结束。
+- 本地测试关卡：Python 用 pytest 还是 unittest 改由沙箱内的只读探测决定，不再看宿主解释器（沙箱内启动不了的宿主 `pytest` 脚本也排除）；测试无法运行（配置了 pytest 但沙箱内无法导入、pytest/unittest 退出码 5、带或不带引号的 `No module named pytest`）结论为 UNVERIFIED，关卡时间预算耗尽为 TIMEOUT，`run` 与 `race` 都不再把它们当作测试失败触发自动修复或以 EXIT_FAILED 结束：`race` 中这样的候选不能胜出，没有候选通过测试时以 UNVERIFIED 结束，有候选的关卡超时（包括生成预算耗尽、关卡未能启动）则为 TIMEOUT。此前的测试套件已报告失败、或测试运行修改了待交付输入时仍为失败（原先后一个套件没有执行测试会掩盖前一个套件的失败）；这类运行生成的测试产物同样删除。
 - 调用账本时钟：系统时钟一度超前时写下的账本不再阻断派发和租约清理。日期回拨不再拒绝准入，继续计入已见过的最新一天（计数从不清零）；租约与预留到期、清理和账本时钟本身最多信任领先实际时间 300 秒的部分并在首次遇到时警告一次，下一次准入把更超前的租约到期时间改按刚续租处理，崩溃 worker 的租约在实际时间越过其到期后即可回收（仍需证明进程已退出）。Go 与 Python 同一规则。
 
 ## [3.2.0] - 2026-10-09
