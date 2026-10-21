@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const (
@@ -230,4 +232,85 @@ func TestStoreQuotaAdmitsExactlyTheLimitUnderConcurrency(t *testing.T) {
 		t.Fatalf("admitted %d and refused %d of 24, want 5 and 19", admitted, refused)
 	}
 	assertNoSessionTemps(t, dir)
+}
+
+// A save holds its owner's accounting lock from the ledger read until the
+// session is published and synced. The lock is per owner, so one account's
+// saves, however slow (a stuck fsync on a network disk), never stall another
+// account's; one store-wide lock queued every account behind them.
+func TestStoreQuotaLockIsPerOwner(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithQuota(dir, Quota{MaxSessionsPerOwner: 5})
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	held, err := store.lockQuota(quotaAlice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { held.Close() }) }
+	var wg sync.WaitGroup
+	t.Cleanup(func() { release(); wg.Wait() })
+	save := func(owner string) <-chan error {
+		done := make(chan error, 1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			done <- store.SaveForOwner(owner, "ws", []byte(owner))
+		}()
+		return done
+	}
+	alice, bob := save(quotaAlice), save(quotaBob)
+	select {
+	case err := <-bob:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("bob's save waited for alice's accounting lock")
+	}
+	select {
+	case err := <-alice:
+		t.Fatalf("alice's save ran while her accounting lock was held: %v", err)
+	default:
+	}
+	release()
+	if err := <-alice; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.LoadForOwner(quotaAlice, "ws"); err != nil || string(got) != quotaAlice {
+		t.Fatalf("alice's session = %q, %v", got, err)
+	}
+}
+
+// An unreadable ledger fails its owner's saves closed until it is removed, and
+// the error, which the client sees, names the file but not the server's data
+// directory. Other owners are unaffected.
+func TestStoreQuotaUnreadableLedgerFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithQuota(dir, Quota{MaxSessionsPerOwner: 5})
+	if err := store.SaveForOwner(quotaAlice, "a", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	ledger := store.ledgerPath(quotaAlice)
+	if err := os.WriteFile(ledger, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := store.SaveForOwner(quotaAlice, "b", []byte("b"))
+	if err == nil || quotaKind(err) != 0 || !strings.Contains(err.Error(), filepath.Base(ledger)) || strings.Contains(err.Error(), dir) {
+		t.Fatalf("err = %v, want a plain error naming %s without its directory", err, filepath.Base(ledger))
+	}
+	if _, err := store.LoadForOwner(quotaAlice, "b"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("session saved past an unreadable ledger: %v", err)
+	}
+	if err := store.SaveForOwner(quotaBob, "b", []byte("b")); err != nil {
+		t.Fatalf("other owner: %v", err)
+	}
+	if err := os.Remove(ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveForOwner(quotaAlice, "b", []byte("b")); err != nil {
+		t.Fatalf("save after the ledger was removed: %v", err)
+	}
 }

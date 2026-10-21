@@ -63,6 +63,8 @@ type QuotaError struct {
 	Usage int64
 }
 
+// Error is the message for the client, which sees its own account's usage but
+// not the state of the server's disk (see detail).
 func (e *QuotaError) Error() string {
 	switch e.Kind {
 	case QuotaSessions:
@@ -70,8 +72,17 @@ func (e *QuotaError) Error() string {
 	case QuotaBytes:
 		return fmt.Sprintf("session storage quota exceeded: saving would bring this account's sessions to %s of the %s it may store; delete sessions it no longer needs or save a smaller session", formatBytes(e.Usage), formatBytes(e.Limit))
 	default:
-		return fmt.Sprintf("session storage is full: the server keeps at least %s free on its data disk and has %s; ask the operator to free space", formatBytes(e.Limit), formatBytes(e.Usage))
+		return "session storage is full: the server keeps a free-space reserve on its data disk; ask the operator to free space"
 	}
+}
+
+// detail is Error with what only the operator sees, in the audit log: the
+// free-space floor and the free space that was left.
+func (e *QuotaError) detail() string {
+	if e.Kind != QuotaFreeSpace {
+		return e.Error()
+	}
+	return fmt.Sprintf("%s (floor %s, %s free)", e.Error(), formatBytes(e.Limit), formatBytes(e.Usage))
 }
 
 func formatBytes(n int64) string {
@@ -121,17 +132,31 @@ type ownerLedger struct {
 	Sessions map[string]int64 `json:"sessions"`
 }
 
+// ownerDigest names an owner's accounting files.
+func ownerDigest(owner string) string {
+	sum := sha256.Sum256([]byte(owner))
+	return hex.EncodeToString(sum[:])
+}
+
 // ledgerPath names an owner's ledger. Its "quota-" prefix cannot collide with
 // a session file, whose name is a bare hex digest.
 func (s *Store) ledgerPath(owner string) string {
-	sum := sha256.Sum256([]byte(owner))
-	return filepath.Join(s.dir, "quota-"+hex.EncodeToString(sum[:])+".json")
+	return filepath.Join(s.dir, "quota-"+ownerDigest(owner)+".json")
 }
 
-// lockQuota serializes owner accounting across goroutines and processes. Lock
-// order is the store lock, then this one; Cleanup takes only the store lock.
-func (s *Store) lockQuota() (*os.File, error) {
-	lock, err := openStoreLock(filepath.Join(s.dir, ".quota.lock"))
+// quotaLockPath names the lock that serializes an owner's accounting. Like the
+// store lock, it is permanent.
+func (s *Store) quotaLockPath(owner string) string {
+	return filepath.Join(s.dir, ".quota-"+ownerDigest(owner)+".lock")
+}
+
+// lockQuota serializes owner's accounting across goroutines and processes. The
+// lock is per owner, as the ledger is, so one account's saves, held from the
+// ledger read until the session is published and synced, never queue another
+// account's. Lock order is the store lock, then this one; Cleanup takes only
+// the store lock.
+func (s *Store) lockQuota(owner string) (*os.File, error) {
+	lock, err := openStoreLock(s.quotaLockPath(owner))
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +183,7 @@ func (s *Store) loadLedger(owner string) (ownerLedger, error) {
 		return ledger, err
 	}
 	if err := json.Unmarshal(data, &ledger); err != nil {
-		return ledger, fmt.Errorf("session quota ledger %s is unreadable; remove it to reset this owner's accounting: %w", path, err)
+		return ledger, fmt.Errorf("session quota ledger %s in the sessions directory is unreadable; remove it to reset this account's accounting: %w", filepath.Base(path), err)
 	}
 	if ledger.Sessions == nil {
 		ledger.Sessions = map[string]int64{}

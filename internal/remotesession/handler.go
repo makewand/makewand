@@ -161,12 +161,13 @@ func NewHandlerWithOptions(store *Store, opts HandlerOptions) http.Handler {
 			}
 			if err := store.SaveForOwner(owner, workspaceID, data); err != nil {
 				status := http.StatusInternalServerError
+				event.Error = err.Error()
 				var quotaErr *QuotaError
 				if errors.As(err, &quotaErr) {
 					status = quotaStatus(quotaErr.Kind)
+					event.Error = quotaErr.detail()
 				}
 				event.Status = status
-				event.Error = err.Error()
 				http.Error(w, err.Error(), status)
 				return
 			}

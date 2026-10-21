@@ -204,7 +204,7 @@ func (s *Store) SaveForOwner(owner, workspaceID string, data []byte) error {
 		return err
 	}
 	if s.quota.perOwner() {
-		quotaLock, err := s.lockQuota()
+		quotaLock, err := s.lockQuota(owner)
 		if err != nil {
 			return err
 		}

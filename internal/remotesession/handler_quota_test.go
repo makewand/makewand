@@ -46,6 +46,15 @@ func TestHandlerQuotaRefusalsAreClearAndPerOwner(t *testing.T) {
 
 	free = 1 << 20
 	expect(put(bob, "token-b", "ws-2", `{}`), http.StatusInsufficientStorage, "session storage is full")
+	// The client is not told the server's floor or free space; the audit log is.
+	rec := put(alice, "token-a", "ws-1", `{}`)
+	expect(rec, http.StatusInsufficientStorage, "session storage is full")
+	if strings.Contains(rec.Body.String(), "MiB") {
+		t.Fatalf("507 body reveals the server's disk: %q", rec.Body.String())
+	}
+	if last := audit.events[len(audit.events)-1]; last.Status != http.StatusInsufficientStorage || !strings.Contains(last.Error, "floor 1 MiB, 1 MiB free") {
+		t.Fatalf("audit event = %+v, want the floor and the free space", last)
+	}
 
 	// The client reports the server's message.
 	server := httptest.NewServer(alice)
