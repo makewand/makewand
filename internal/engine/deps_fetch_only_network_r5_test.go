@@ -442,6 +442,8 @@ func TestPipUnfetchedRemoteTargetInExtras_GEC1021R5(t *testing.T) {
 
 // pipWheelMaker writes a minimal pure-Python wheel for each name given after
 // the output directory.
+//
+//nolint:gosec // G101: a test script that writes a wheel's RECORD digests, not a credential.
 const pipWheelMaker = `import base64, hashlib, os, sys, zipfile
 out = sys.argv[1]
 os.makedirs(out, exist_ok=True)
