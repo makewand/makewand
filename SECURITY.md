@@ -172,6 +172,13 @@ session cap removed, the byte cap alone does not bound the number of empty
 sessions.
 没有 codex CLI 时，Power 模式的 `codex` 路线就是 OpenAI API：调用配置的 `OPENAI_MODEL`，按 API 花费计费并计入预算，不再记为免费的 `codex-cli` 调用。客户端指名的 OpenAI 模型（`gpt-*`、`o1*`、`o3*`、`o4*`、`codex-mini*`）只有在有价目或就是配置的模型时才提供，按比例放大的预留也覆盖它的价格，所以客户端无法选用预算无法计价的模型。令牌允许的模式不限制这种选择，由令牌的费用预算约束。流式请求按其输出文本的估算计费，不含 OpenAI 推理模型（o 系列、GPT-5）隐藏的推理 token，所以对这些模型的流式请求可能低于 OpenAI 的实际收费，差额不超过该次调用输出上限的价格。其上游错误只阻断或熔断该模型自己，不影响共享的 `openai` 路线，所以客户端选用的模型无法让其他客户端的请求失败。远端会话存储按账号限额（默认 1,000 个会话、256 MiB），并拒绝会让会话所在磁盘（默认也存放状态数据库）剩余空间低于 1 GiB 的保存，同一账号的并发保存逐个检查，单个账号无法写满磁盘、拖垮整个服务；去掉会话数上限后，仅靠字节上限无法限制空会话的数量。
 
+Usage and audit CSV exports (`makewand usage --csv`, `makewand audit --csv`,
+`GET /v1/admin/{usage,audit}/events?format=csv`) prefix a single quote to every
+cell that begins with `=`, `+`, `-`, `@`, a tab or a carriage return, plain
+numbers excepted, so a client-supplied value such as a rejected model name opens
+in a spreadsheet as text, not as a formula. The ledgers keep values as received.
+用量与审计的 CSV 导出（`makewand usage --csv`、`makewand audit --csv`、`GET /v1/admin/{usage,audit}/events?format=csv`）在以 `=`、`+`、`-`、`@`、制表符或回车开头的单元格（纯数字除外）前加单引号，客户端提供的值（例如被拒绝的模型名）在电子表格中按文本显示，不会作为公式执行；账本仍按收到的原值记录。
+
 Python candidate application uses fixed POSIX directory handles or native Windows
 handles for replacement and recovery. Native Windows execution requires explicit
 unsafe-host consent and cannot grant Strength 2; Windows Job Objects manage

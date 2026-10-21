@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/makewand/makewand/internal/csvsafe"
 )
 
 type Entry struct {
@@ -38,6 +40,11 @@ type Entry struct {
 	CompletionTokens int       `json:"completion_tokens,omitempty"`
 	CostUSD          float64   `json:"cost_usd,omitempty"`
 	Stream           bool      `json:"stream,omitempty"`
+
+	// UnreservedEstimateUSD is the admission estimate of a request that took no
+	// durable reservation because no budget cap applied to it. An uncertain
+	// outcome settles at it, as a reserved one settles at its reservation.
+	UnreservedEstimateUSD float64 `json:"-"`
 }
 
 type Filter struct {
@@ -399,7 +406,9 @@ func CurrentMonthFilter(filter Filter, now time.Time) Filter {
 	return filter
 }
 
-// WriteEntriesCSV renders usage entries as CSV.
+// WriteEntriesCSV renders usage entries as CSV. Cells a spreadsheet would
+// evaluate, such as a client-supplied model name "=HYPERLINK(...)", are written
+// as text (csvsafe.Cell).
 func WriteEntriesCSV(w io.Writer, entries []Entry) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write([]string{
@@ -423,7 +432,7 @@ func WriteEntriesCSV(w io.Writer, entries []Entry) error {
 		return err
 	}
 	for _, entry := range entries {
-		if err := cw.Write([]string{
+		if err := cw.Write(csvsafe.Record([]string{
 			entry.Timestamp.UTC().Format(time.RFC3339Nano),
 			entry.RequestID,
 			entry.TokenID,
@@ -440,7 +449,7 @@ func WriteEntriesCSV(w io.Writer, entries []Entry) error {
 			strconv.Itoa(entry.CompletionTokens),
 			strconv.FormatFloat(entry.CostUSD, 'f', 6, 64),
 			strconv.FormatBool(entry.Stream),
-		}); err != nil {
+		})); err != nil {
 			return err
 		}
 	}

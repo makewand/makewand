@@ -71,6 +71,13 @@ func (opt HTTPHandlerOptions) reserveDurableBudget(ctx context.Context, grant *s
 			add("org_month", orgID, month, org.MonthlyBudgetUSD)
 		}
 	}
+	if len(scopes) == 0 {
+		// No cap applies, so a reservation would enforce nothing, yet take the
+		// store's write lock and leave a row for every request. An uncertain
+		// outcome still settles at the estimate, as a reserved one does.
+		entry.UnreservedEstimateUSD = estimateUSD
+		return nil
+	}
 	// Correlation IDs can repeat and are client-controlled. Only this trusted,
 	// unpredictable identity owns the reservation and exactly-once settlement.
 	id := "account_" + rand.Text()
