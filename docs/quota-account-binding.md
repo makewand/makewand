@@ -27,9 +27,11 @@ one subscription pool across directories. Unknown identities use explicit
 Different unknown keys do **not** establish independent quota pools.
 
 Codex reads only the selected sessions directory, considering its eight newest
-JSONL files. A quota event must explicitly contain a matching `account_id` or
+JSONL files, and of each only the complete lines in its last 4 MiB, as the
+Python reader does; only lines that mention `rate_limits` or `session_meta` are
+decoded. A quota event must explicitly contain a matching `account_id` or
 `account_ref` at its root or payload, or inherit that binding from an earlier
-`session_meta` in the same file. An explicit conflicting or malformed identity
+`session_meta` in the same tail. An explicit conflicting or malformed identity
 cannot inherit session metadata. Logs without such metadata remain history:
 directory location alone does not prove which login produced an event.
 
@@ -48,8 +50,12 @@ erase the first account; refreshing a weekly window does not erase a still
 current short-window observation from another directory. Legacy entries can
 remain in the cache as history, but known-account sources reject unbound data.
 Go snapshot reads recheck the current plain identifier, so an in-process login
-change cannot inherit a prior account's quota or its exhaustion seal. Seals are
-account-bound, remain in memory, and never enter the raw disk observations.
+change cannot inherit a prior account's quota or its exhaustion seal. A quota
+source reads its identity file again only when the file's path, device, inode,
+size or modification time changed, or while it was modified less than 2 seconds
+before (a coarse filesystem clock could hide a second write); admission and
+accounting read it every time. Seals are account-bound, remain in memory, and
+never enter the raw disk observations.
 
 Go refreshes read the cache through per source. A source is read only when the
 cache holds no read of its current login (provider plus account reference)

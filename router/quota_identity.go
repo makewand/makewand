@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,7 +89,45 @@ func canonicalQuotaRoot(root string) string {
 	return root
 }
 
+// readQuotaIdentity reads the identity of provider's login under root anew, as
+// admission and accounting bind to it.
 func readQuotaIdentity(provider, root string) ProviderQuota {
+	var fresh *quotaIdentityMemo
+	return fresh.read(provider, root)
+}
+
+// quotaIdentityMemo remembers a quota source's last identity read. Routing asks
+// for a candidate's identity several times per request (Snapshot, Sealed), and
+// a long-used ~/.claude.json is hundreds of KB, so the file is read again only
+// once its stamp changes.
+type quotaIdentityMemo struct {
+	mu       sync.Mutex
+	stamp    quotaIdentityStamp
+	identity ProviderQuota
+}
+
+// quotaIdentityStamp identifies the identity file version a read saw:
+// rewriting or replacing the file changes its inode, size or modification time.
+type quotaIdentityStamp struct {
+	provider, root, path string
+	dev, ino             uint64
+	size, mtimeNanos     int64
+}
+
+// quotaIdentityRacyWindow: a file modified this shortly before it was
+// inspected can be modified again within the same tick of a coarse
+// filesystem clock (up to 2 s on some filesystems) and keep its stamp, so its
+// read is not reused.
+const quotaIdentityRacyWindow = 2 * time.Second
+
+// quotaIdentityFileRead is a test hook called with the path of every identity
+// file read.
+var quotaIdentityFileRead atomic.Pointer[func(path string)]
+
+// read returns the identity of provider's login under root: from the memo
+// while the identity file keeps the stamp of its last read, otherwise read
+// from the file. A nil memo always reads.
+func (m *quotaIdentityMemo) read(provider, root string) ProviderQuota {
 	root = canonicalQuotaRoot(root)
 	q := unknownQuotaIdentity(provider, root)
 	path := filepath.Join(root, "auth.json")
@@ -97,12 +137,38 @@ func readQuotaIdentity(provider, root string) ProviderQuota {
 			path = filepath.Join(home, ".claude.json")
 		}
 	}
-	raw, err := cliReadIdentityMetadata(path)
+	inspected := time.Now()
+	info, err := cliInspectIdentityMetadata(path)
+	if err != nil {
+		return q
+	}
+	dev, ino := quotaIdentityFileID(info)
+	stamp := quotaIdentityStamp{provider: provider, root: root, path: path, dev: dev, ino: ino, size: info.Size(), mtimeNanos: info.ModTime().UnixNano()}
+	reusable := m != nil && info.ModTime().Before(inspected.Add(-quotaIdentityRacyWindow))
+	if reusable {
+		m.mu.Lock()
+		identity, hit := m.identity, m.stamp == stamp
+		m.mu.Unlock()
+		if hit {
+			return identity
+		}
+	}
+	if hook := quotaIdentityFileRead.Load(); hook != nil {
+		(*hook)(path)
+	}
+	raw, err := cliReadRegularFile(path)
 	if err != nil {
 		return q
 	}
 	if ref := quotaAccountRef(provider, quotaAccountID(provider, raw)); ref != "" {
 		q.AccountRef, q.IdentityKnown, q.PoolRef = ref, true, ref+":subscription"
+	}
+	if reusable {
+		// The stamp predates the read: a change in between is read again
+		// next time, as its stamp differs.
+		m.mu.Lock()
+		m.stamp, m.identity = stamp, q
+		m.mu.Unlock()
 	}
 	return q
 }
@@ -132,6 +198,15 @@ func quotaAccountID(provider string, raw []byte) string {
 // Identity reads share the credential-copy byte cap. Unavailable metadata is
 // unknown, never an accounting failure that blocks another provider.
 func cliReadIdentityMetadata(path string) ([]byte, error) {
+	if _, err := cliInspectIdentityMetadata(path); err != nil {
+		return nil, err
+	}
+	return cliReadRegularFile(path)
+}
+
+// cliInspectIdentityMetadata returns the file info of the identity file at
+// path when it is a bounded regular file.
+func cliInspectIdentityMetadata(path string) (os.FileInfo, error) {
 	// Use the credential mask walk's local-component, rooted inspection. It
 	// follows documented credential aliases without an unrestricted Stat, and
 	// rejects FIFOs before the reader can block while opening them.
@@ -142,7 +217,7 @@ func cliReadIdentityMetadata(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() || info.Size() > cliPrivateCredMaxBytes {
 		return nil, fmt.Errorf("identity metadata is not a bounded regular file")
 	}
-	return cliReadRegularFile(path)
+	return info, nil
 }
 
 func quotaCacheKey(q ProviderQuota) string {
@@ -203,16 +278,36 @@ func quotaEvidenceCurrent(q ProviderQuota) bool {
 	return q.HasData
 }
 
+// quotaLogin is a quota source with its current login (sourceQuotaIdentity).
+type quotaLogin struct {
+	source         QuotaSource
+	name           string // lower-cased provider
+	identity       ProviderQuota
+	requireAccount bool
+}
+
+// logins reads the current login of every source once, for one Snapshot or
+// refresh.
+func (s *QuotaSnapshotter) logins() []quotaLogin {
+	sources := s.sources
+	logins := make([]quotaLogin, len(sources))
+	for i, src := range sources {
+		identity, requireAccount := sourceQuotaIdentity(src)
+		logins[i] = quotaLogin{source: src, name: strings.ToLower(src.Provider()), identity: identity, requireAccount: requireAccount}
+	}
+	return logins
+}
+
 // selectCachedQuotas projects the account-keyed cache onto the selected CLI
 // logins. Unbound/unknown/stale history is never used as current evidence.
-func (s *QuotaSnapshotter) selectCachedQuotas(cached map[string]ProviderQuota) map[string]ProviderQuota {
+func (s *QuotaSnapshotter) selectCachedQuotas(cached map[string]ProviderQuota, logins []quotaLogin) map[string]ProviderQuota {
 	selected := make(map[string]ProviderQuota)
-	for _, src := range s.sources {
-		name := strings.ToLower(src.Provider())
+	for _, login := range logins {
+		name := login.name
 		if s.providerAllowed != nil && !s.providerAllowed(name) {
 			continue
 		}
-		identity, requireAccount := sourceQuotaIdentity(src)
+		identity, requireAccount := login.identity, login.requireAccount
 		if identity.AccountRef != "" {
 			q, exists := cached[quotaCacheKey(identity)]
 			// In-memory snapshots are projected by provider already.

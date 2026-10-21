@@ -24,9 +24,12 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -269,8 +272,9 @@ type QuotaSource interface {
 }
 
 // QuotaSnapshotter maintains the latest QuotaSnapshot in the background.
-// Snapshot checks the small local identity file so a changed login cannot
-// inherit another account's quota; it never fetches usage over the network.
+// Snapshot checks each login's local identity file so a changed login cannot
+// inherit another account's quota, reading it again only when it changed; it
+// never fetches usage over the network.
 type QuotaSnapshotter struct {
 	sources         []QuotaSource
 	providerAllowed func(string) bool
@@ -410,17 +414,16 @@ func (s *QuotaSnapshotter) Snapshot() *QuotaSnapshot {
 		return &QuotaSnapshot{byProvider: map[string]ProviderQuota{}}
 	}
 	current := s.current.Load()
-	selected := s.selectCachedQuotas(current.byProvider)
-	for _, src := range s.sources {
-		identity, _ := sourceQuotaIdentity(src)
-		if identity.AccountRef != "" {
-			name := strings.ToLower(src.Provider())
-			if _, exists := selected[name]; !exists {
-				selected[name] = identity
+	logins := s.logins()
+	selected := s.selectCachedQuotas(current.byProvider, logins)
+	for _, login := range logins {
+		if login.identity.AccountRef != "" {
+			if _, exists := selected[login.name]; !exists {
+				selected[login.name] = login.identity
 			}
 		}
 	}
-	s.applySeals(selected)
+	s.applySeals(selected, logins)
 	return &QuotaSnapshot{byProvider: selected, takenAt: current.takenAt}
 }
 
@@ -440,7 +443,7 @@ func (s *QuotaSnapshotter) LoadCache() {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	if cached, takenAt, ok := loadQuotaCache(s.cachePath, 0); ok {
-		cached = s.selectCachedQuotas(cached)
+		cached = s.selectCachedQuotas(cached, s.logins())
 		s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
 	}
 }
@@ -501,14 +504,15 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context, tick bool) {
 	if tick {
 		ownReadsUntil = s.readAt
 	}
+	logins := s.logins()
 	var disk quotaDiskCache
 	var diskPrev map[string]ProviderQuota
 	if s.cachePath != "" {
 		disk, _ = readQuotaDiskCache(s.cachePath)
-		diskPrev = s.selectCachedQuotas(disk.entries)
+		diskPrev = s.selectCachedQuotas(disk.entries, logins)
 	}
 
-	prev := &QuotaSnapshot{byProvider: s.selectCachedQuotas(s.current.Load().byProvider)}
+	prev := &QuotaSnapshot{byProvider: s.selectCachedQuotas(s.current.Load().byProvider, logins)}
 	next := make(map[string]ProviderQuota, len(s.sources))
 
 	type result struct {
@@ -521,7 +525,7 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context, tick bool) {
 	readAny := false
 	var wg sync.WaitGroup
 	for i, src := range s.sources {
-		if q, fresh := s.freshCachedRead(src, disk, ownReadsUntil); fresh {
+		if q, fresh := s.freshCachedRead(logins[i], disk, ownReadsUntil); fresh {
 			results[i] = result{q: q}
 			continue
 		}
@@ -628,15 +632,15 @@ func quotaReadKey(src QuotaSource, identity ProviderQuota) string {
 	return strings.ToLower(src.Provider())
 }
 
-// freshCachedRead returns the disk cache's entry for src's current login when
-// that login was read recently enough not to read it again: within the cache
-// TTL, or within quotaNoEvidenceTTL (at least the cache TTL) when that read
-// found no current evidence. A read with evidence made no later than
+// freshCachedRead returns the disk cache's entry for a source's current login
+// when that login was read recently enough not to read it again: within the
+// cache TTL, or within quotaNoEvidenceTTL (at least the cache TTL) when that
+// read found no current evidence. A read with evidence made no later than
 // ownReadsUntil is read again. A read of another account or credential root is
 // keyed apart and never stands in for this login.
-func (s *QuotaSnapshotter) freshCachedRead(src QuotaSource, disk quotaDiskCache, ownReadsUntil time.Time) (ProviderQuota, bool) {
-	identity, _ := sourceQuotaIdentity(src)
-	key := quotaReadKey(src, identity)
+func (s *QuotaSnapshotter) freshCachedRead(login quotaLogin, disk quotaDiskCache, ownReadsUntil time.Time) (ProviderQuota, bool) {
+	identity := login.identity
+	key := quotaReadKey(login.source, identity)
 	read, ok := disk.reads[key]
 	if !ok || !read.NoEvidence && !read.At.After(ownReadsUntil) {
 		return ProviderQuota{}, false
@@ -828,10 +832,10 @@ func (s *QuotaSnapshotter) Sealed(provider string) (time.Time, bool) {
 	return until, true
 }
 
-func (s *QuotaSnapshotter) applySeals(m map[string]ProviderQuota) {
+func (s *QuotaSnapshotter) applySeals(m map[string]ProviderQuota, logins []quotaLogin) {
 	keys := make(map[string]string)
-	for _, src := range s.sources {
-		keys[s.sealKey(strings.ToLower(src.Provider()))] = strings.ToLower(src.Provider())
+	for _, login := range logins {
+		keys[sealKeyAmong(login.name, logins)] = login.name
 	}
 	s.sealMu.Lock()
 	defer s.sealMu.Unlock()
@@ -862,6 +866,9 @@ func (s *QuotaSnapshotter) applySeals(m map[string]ProviderQuota) {
 	}
 }
 
+// sealKey is the key a seal of provider name is held under: the cache key of
+// its source's current login, or the name for a source without identity
+// support.
 func (s *QuotaSnapshotter) sealKey(name string) string {
 	for _, src := range s.sources {
 		if strings.EqualFold(src.Provider(), name) {
@@ -873,12 +880,23 @@ func (s *QuotaSnapshotter) sealKey(name string) string {
 	return name
 }
 
+// sealKeyAmong is sealKey over logins already read.
+func sealKeyAmong(name string, logins []quotaLogin) string {
+	for _, login := range logins {
+		if strings.EqualFold(login.name, name) && login.identity.AccountRef != "" {
+			return quotaCacheKey(login.identity)
+		}
+	}
+	return name
+}
+
 // --- Source: Claude (OAuth usage endpoint) ---
 
 type claudeQuotaSource struct {
 	credsPath    string
 	endpoint     string
 	selectedHome bool
+	identity     quotaIdentityMemo
 }
 
 // NewClaudeQuotaSource reads Claude Pro/Max usage. credsPath empty →
@@ -904,9 +922,9 @@ func (c *claudeQuotaSource) Provider() string { return "claude" }
 
 func (c *claudeQuotaSource) quotaIdentity() ProviderQuota {
 	if c.selectedHome {
-		return readQuotaIdentity("claude", selectedQuotaRoot("claude"))
+		return c.identity.read("claude", selectedQuotaRoot("claude"))
 	}
-	return readQuotaIdentity("claude", filepath.Dir(c.credsPath))
+	return c.identity.read("claude", filepath.Dir(c.credsPath))
 }
 
 func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
@@ -1039,6 +1057,7 @@ func (c *claudeQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 type codexQuotaSource struct {
 	sessionsDir  string
 	selectedHome bool
+	identity     quotaIdentityMemo
 }
 
 // NewCodexQuotaSource follows exactly one selected CLI credential root.
@@ -1053,9 +1072,9 @@ func NewCodexQuotaSource(sessionsDir string) QuotaSource {
 func (c *codexQuotaSource) Provider() string { return "codex" }
 func (c *codexQuotaSource) quotaIdentity() ProviderQuota {
 	if c.selectedHome {
-		return readQuotaIdentity("codex", selectedQuotaRoot("codex"))
+		return c.identity.read("codex", selectedQuotaRoot("codex"))
 	}
-	return readQuotaIdentity("codex", filepath.Dir(c.sessionsDir))
+	return c.identity.read("codex", filepath.Dir(c.sessionsDir))
 }
 
 func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
@@ -1076,18 +1095,28 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 		if ctx.Err() != nil {
 			return q, ctx.Err()
 		}
-		info, err := os.Stat(fp)
-		if err != nil {
-			continue
-		}
-		data, err := os.ReadFile(fp)
+		data, info, err := readCodexSessionTail(fp)
 		if err != nil {
 			continue
 		}
 		sessionRef := ""
-		for _, line := range strings.Split(string(data), "\n") {
+		for len(data) > 0 {
+			if ctx.Err() != nil {
+				return q, ctx.Err()
+			}
+			line := data
+			if i := bytes.IndexByte(data, '\n'); i >= 0 {
+				line, data = data[:i], data[i+1:]
+			} else {
+				data = nil
+			}
+			// Only these lines can bind a session or carry a window: skip the
+			// rest of a session's transcript undecoded, as Python does.
+			if !bytes.Contains(line, []byte("rate_limits")) && !bytes.Contains(line, []byte("session_meta")) {
+				continue
+			}
 			var obj map[string]json.RawMessage
-			if json.Unmarshal([]byte(line), &obj) != nil {
+			if json.Unmarshal(line, &obj) != nil {
 				continue
 			}
 			ref := codexEventAccountRef(obj)
@@ -1164,6 +1193,48 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 		return c.quotaIdentity(), nil
 	}
 	return q, nil
+}
+
+// codexSessionTailBytes is how much of each session log the Codex source
+// reads: Python's reader (health.py) reads the same tail.
+const codexSessionTailBytes = 4 << 20
+
+// readCodexSessionTail returns the complete lines in the last
+// codexSessionTailBytes of the session log at path, and the log's file info.
+// The line the tail starts inside is dropped, as Python drops it.
+func readCodexSessionTail(path string) ([]byte, os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	// A FIFO would block the open itself; only a regular file is read.
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("session log %s is not a regular file", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = f.Close() }()
+	if info, err = f.Stat(); err != nil {
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("session log %s is not a regular file", path)
+	}
+	start := max(0, info.Size()-codexSessionTailBytes)
+	data, err := io.ReadAll(io.NewSectionReader(f, start, codexSessionTailBytes))
+	if err != nil {
+		return nil, nil, err
+	}
+	if start > 0 {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			data = data[i+1:]
+		} else {
+			data = nil
+		}
+	}
+	return data, info, nil
 }
 
 func codexEventAccountRef(obj map[string]json.RawMessage) string {
