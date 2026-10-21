@@ -402,7 +402,7 @@ func rawStubAs(t *testing.T, bin, name string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// #nosec G306 -- an executable copy of the test binary in a test directory.
+		// #nosec G306 G703 -- an executable copy of the test binary in a test-created temporary directory.
 		if err := os.WriteFile(path, data, 0o700); err != nil {
 			t.Fatal(err)
 		}

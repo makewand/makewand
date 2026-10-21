@@ -210,7 +210,7 @@ func TestReadOnlyCLIRefusalVerdictsMatchPython(t *testing.T) {
 			}
 			_, auth := expected["auth"]
 			kind := ErrorKindOf(catalogCLI(t, provider).formatExecutionError(true, nil, text, "", exit, nil, time.Second))
-			if (kind == ErrorKindAuth) != auth && !(auth && kind == ErrorKindConfig && provider == "agy") {
+			if (kind == ErrorKindAuth) != auth && (!auth || kind != ErrorKindConfig || provider != "agy") {
 				t.Errorf("%s: %s CLI refusal=%s, health.py finds %v in stderr %q", c.ID, provider, kind, expected, text)
 			}
 			if auth {
