@@ -75,6 +75,8 @@ cd path/to/makewand
 
 预编译 Release、Homebrew 和 Scoop 安装包含 Go CLI 与同版本 Python 引擎；运行时需要 Python 3.9+。手动解包时须将整个目录一起安装，保留二进制旁的 `lib/`。Homebrew/Scoop 会声明 Python 依赖。供应商 CLI 与项目测试工具需要单独安装；Makewand Python 引擎本身仅使用标准库。
 
+> **版本与安全加固**：v3.2.0 之后加入的保护（#75、#80–#85，例如 `bwrap` 只从 root 拥有的系统目录解析、宿主 provider 目录不再可写挂载、Homebrew 包装脚本不再写死 `PATH`）已在 `master` 源码中，随 v3.3.0 发布；目前的 v3.2.x 预编译包、Homebrew 与 Scoop 没有这些保护。v3.3.0 发布前需要它们时，请用上面的源码安装。详见 [SECURITY.md 发布状态](SECURITY.md#release-status--发布状态)。
+
 供应商启停策略对 Go/Python 入口共同生效，禁用也阻止该工具的探测和额度读取。Claude、Gemini 和 OpenAI 的 API 参数按环境变量、`api_keys.json`、`config.json`、默认值的顺序读取；付费调用仍需显式启用 `allow_paid`。详见[共享配置契约](docs/EXECUTION_CONTRACT.md#shared-provider-configuration)。
 
 代理默认值对 Go/Python 的 provider CLI、沙箱和 API 路由共同生效。编辑 `~/.config/makewand/config.json`（或 `MAKEWAND_CONFIG_DIR/config.json`），保留其他配置，例如：
