@@ -3,6 +3,7 @@
 Reservations count attempted Makewand dispatches, including failures. Vendor
 CLI internal turns and token usage remain separately measured or unknown.
 """
+import copy
 import json
 import math
 import errno
@@ -177,7 +178,7 @@ def _maximum(data, max_model_calls=None):
 
 
 def _active_holds(data):
-    now = max(time.time(), data.get("scopes", {}).get("clock", 0))
+    now = layered_budget.effective_clock(data)
     holds = data.get("holds", {})
     expired = [lease for lease, hold in holds.items() if hold["expires_at"] <= now]
     for lease in expired:
@@ -325,7 +326,7 @@ def reserve_capacity(count, owner, purpose="review", ttl_seconds=600):
     if (type(count) is not int or count <= 0 or not isinstance(owner, str) or not owner
             or not isinstance(purpose, str) or not purpose
             or isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
-            or not math.isfinite(ttl_seconds) or not 0 < ttl_seconds <= 86400):
+            or not math.isfinite(ttl_seconds) or not 0 < ttl_seconds <= layered_budget.MAX_HOLD_SECONDS):
         raise BudgetError("invalid model call capacity reservation")
     try:
         with _ledger(lock_deadline=_admission_deadline()) as (path, data):
@@ -350,6 +351,33 @@ def reserve_capacity(count, owner, purpose="review", ttl_seconds=600):
         raise
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
         raise BudgetError(f"cannot reserve model task capacity: {error}") from error
+
+
+def repair_clock(budget_file=None, apply=False):
+    """Report a budget clock or day bucket that leads real time; apply=True brings it back.
+
+    Runs under the shared ledger lock (layered_budget.repair_clock). Nothing is
+    written without apply. Returns the report, with the ledger path and zone.
+    """
+    value = budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()
+    report = {"path": str(value), "exists": os.path.exists(value), "layered": False, "applied": False,
+              "timezone": os.environ.get(layered_budget.TIMEZONE_ENV, "").strip() or "local"}
+    if not report["exists"]:
+        return report
+    try:
+        with _ledger(value) as (path, data):
+            if "scopes" not in data:
+                return report  # a lifetime ledger has no daily clock
+            report["layered"] = True
+            report.update(layered_budget.repair_clock(data if apply else copy.deepcopy(data)))
+            if apply and report["changed"]:
+                _save(path, data)
+                report["applied"] = True
+    except BudgetError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+        raise BudgetError(f"cannot read the model call budget ledger: {error}") from error
+    return report
 
 
 def release_capacity(lease_id):
@@ -422,7 +450,7 @@ def lease_update(attempt, action="heartbeat", pid=None, *, budget_file=None, max
         lease = data.get("leases", {}).get(attempt)
         if lease is None:
             return
-        now = max(time.time(), data.get("scopes", {}).get("clock", 0))
+        now = layered_budget.effective_clock(data)
         lease.update(heartbeat_at=now, expires_at=now + account_leases.TTL)
         if action == "launch":
             lease["launch_pending"] = True

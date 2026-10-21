@@ -9,8 +9,67 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
+
+// The budget clock rule shared with makewand/layered_budget.py: scopes.clock is
+// a ratchet against a clock that steps back, but it is trusted, and stored, at
+// most clockSkewSlack seconds ahead of real time, so a ledger written while the
+// clock was ahead cannot stall lease cleanup. Daily buckets use the local zone
+// or budgetTimezoneEnv (an IANA name).
+const (
+	clockSkewSlack    = 300.0
+	budgetTimezoneEnv = "MAKEWAND_BUDGET_TIMEZONE"
+)
+
+// ledgerNow is the wall clock of the budget rules; tests move it.
+var ledgerNow = time.Now
+
+var clockSkewWarning, daySkewWarning sync.Once
+
+// reportClockSkew and reportDaySkew warn once per process; tests replace them.
+var reportClockSkew = func(lead float64) {
+	clockSkewWarning.Do(func() {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: call budget clock is %.0fs ahead of real time; lease and hold expiry use at most %.0fs of it (repair: makewand budget clock --repair)\n", lead, clockSkewSlack)
+	})
+}
+var reportDaySkew = func(today, latest string) {
+	daySkewWarning.Do(func() {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: call budget day %s is ahead of today's bucket %s; counting into %s (repair: makewand budget clock --repair)\n", latest, today, latest)
+	})
+}
+
+// effectiveClock is real time, or the persisted clock when it is ahead, by at most clockSkewSlack.
+func effectiveClock(data map[string]any, now time.Time) float64 {
+	wall := float64(now.UnixNano()) / 1e9
+	scopes, _ := data["scopes"].(map[string]any)
+	if scopes == nil {
+		return wall
+	}
+	clock := ledgerNumber(scopes["clock"])
+	if clock > wall+clockSkewSlack {
+		reportClockSkew(clock - wall)
+		return wall + clockSkewSlack
+	}
+	return max(wall, clock)
+}
+
+// budgetDay is the daily bucket of now: the local date, or the date in
+// MAKEWAND_BUDGET_TIMEZONE. Python computes the same bucket.
+func budgetDay(now time.Time) (string, error) {
+	location := time.Local
+	if name := strings.TrimSpace(os.Getenv(budgetTimezoneEnv)); name != "" {
+		var err error
+		location, err = time.LoadLocation(name)
+		// "Local" is Go-only: Python's zoneinfo refuses it, so both refuse.
+		if err != nil || name == "Local" {
+			return "", fmt.Errorf("%s must name an IANA time zone such as Asia/Shanghai or UTC", budgetTimezoneEnv)
+		}
+	}
+	return now.In(location).Format("2006-01-02"), nil
+}
 
 // Each scope owns its limit and count. One locked atomic file replacement is
 // the commit point for all three, including workflow capacity holds.
@@ -153,13 +212,30 @@ func projectRef() (string, error) {
 }
 func scopeKeys(data map[string]any, cfg Config, now time.Time) ([]any, error) {
 	s := data["scopes"].(map[string]any)
-	day := now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")
-	if day < s["day"].(string) {
-		return nil, fmt.Errorf("budget clock moved back across an Asia/Shanghai day")
+	day, err := budgetDay(now)
+	if err != nil {
+		return nil, err
+	}
+	// A clock that moved back keeps counting into the latest bucket already seen:
+	// refusing would stop every dispatch, an earlier bucket would reset counts.
+	if latest := s["day"].(string); day < latest {
+		reportDaySkew(day, latest)
+		day = latest
 	}
 	s["day"] = day
-	old, _ := s["clock"].(json.Number).Float64()
-	s["clock"] = json.Number(strconv.FormatFloat(max(old, float64(now.UnixNano())/1e9), 'f', -1, 64))
+	// Persisting the capped clock heals a skewed ledger on its next admission.
+	clock := effectiveClock(data, now)
+	s["clock"] = json.Number(strconv.FormatFloat(clock, 'f', -1, 64))
+	// A lease dated past what this clock allows was written while the clock was
+	// ahead. Date it like a fresh heartbeat: a live owner renews it, a dead
+	// owner's lease expires one TTL from now instead of when real time catches up.
+	leases, _ := data["leases"].(map[string]any)
+	for _, raw := range leases {
+		lease := raw.(map[string]any)
+		if ledgerNumber(lease["expires_at"]) > clock+leaseTTL.Seconds() {
+			lease["expires_at"] = json.Number(strconv.FormatFloat(clock+leaseTTL.Seconds(), 'f', -1, 64))
+		}
+	}
 	project, err := projectRef()
 	if err != nil {
 		return nil, err
@@ -263,6 +339,6 @@ func scopeSpend(data map[string]any, raw any, delta int) {
 		c := s[pair[0].(string)].(map[string]any)[pair[1].(string)].(map[string]any)
 		n, _ := jsonInteger(c["used"])
 		c["used"] = json.Number(strconv.Itoa(n + delta))
-		c["last_used"] = max(float64(time.Now().UnixNano())/1e9, ledgerNumber(s["clock"]))
+		c["last_used"] = effectiveClock(data, ledgerNow())
 	}
 }

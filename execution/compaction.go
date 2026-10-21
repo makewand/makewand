@@ -34,11 +34,8 @@ func retentionNumber(value any) bool {
 // compactLedger runs under the ledger lock before encoding. It never removes
 // an unsettled attempt or any attempt with a remaining lifecycle lease.
 func compactLedger(data map[string]any) {
-	now := float64(time.Now().UnixNano()) / 1e9
+	now := effectiveClock(data, ledgerNow())
 	scopes, _ := data["scopes"].(map[string]any)
-	if scopes != nil {
-		now = max(now, ledgerNumber(scopes["clock"]))
-	}
 	cutoff := now - ledgerRetention.Seconds()
 	leases, _ := data["leases"].(map[string]any)
 	archived, _ := jsonInteger(data["archived_used"])

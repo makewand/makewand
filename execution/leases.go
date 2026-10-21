@@ -109,13 +109,11 @@ func validateLeases(data map[string]any) error {
 	}
 	return nil
 }
+
+// leaseClock dates lease expiry: a persisted clock far ahead of real time would
+// keep a dead owner's lease unexpired until real time caught up.
 func leaseClock(data map[string]any) float64 {
-	now := float64(time.Now().UnixNano()) / 1e9
-	if s, ok := data["scopes"].(map[string]any); ok {
-		n, _ := s["clock"].(json.Number).Float64()
-		now = max(now, n)
-	}
-	return now
+	return effectiveClock(data, ledgerNow())
 }
 func leaseWorkersAlive(l map[string]any) bool {
 	for _, raw := range l["workers"].([]any) {

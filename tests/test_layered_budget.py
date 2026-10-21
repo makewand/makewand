@@ -66,16 +66,22 @@ class LayeredBudgetTests(unittest.TestCase):
         self.assertEqual(self.data()["attempts"][-1]["result_status"], "UNKNOWN")
 
     def test_midnight_shanghai_and_day_rollback(self):
-        # 15:59:59 UTC, then 16:00 UTC: Shanghai midnight, regardless of TZ.
-        with patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="1", TZ="America/New_York"):
+        # 15:59:59 UTC, then 16:00 UTC: Shanghai midnight in the configured zone, regardless of TZ.
+        with patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="2", MAKEWAND_BUDGET_TIMEZONE="Asia/Shanghai",
+                        TZ="America/New_York"):
             with patch("time.time", return_value=1792079999):
                 b.reserve("fake", "fast")
             with patch("time.time", return_value=1792080000):
                 b.reserve("fake", "fast")
+            # Back across that midnight: admitted, counting into the later day, never reset.
             with patch("time.time", return_value=1792079999):
-                with self.assertRaisesRegex(b.BudgetError, "clock moved back"):
+                b.reserve("fake", "fast")
+                with self.assertRaisesRegex(b.BudgetError, "budget exhausted"):
                     b.reserve("fake", "fast")
-        self.assertEqual(len(self.data()["scopes"]["machine"]), 2)
+        scopes = self.data()["scopes"]
+        self.assertEqual(scopes["day"], "2026-10-16")
+        self.assertEqual({day: counter["used"] for day, counter in scopes["machine"].items()},
+                         {"2026-10-15": 1, "2026-10-16": 2})
 
     def test_review_hold_cannot_be_stolen_and_midnight_rechecks_daily(self):
         with execution_context(task_id="task-a"), patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="2"):

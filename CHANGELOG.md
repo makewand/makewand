@@ -61,6 +61,7 @@ All notable changes to this project are documented here. The format is based on
 - 使用账本按每次派发记录 `route`：claude、codex、agy、grok、muse 由适配器报告实际走订阅 CLI（`cli`）还是转用 API（`api`，包括 CLI 触发限额后再转用的），纯 API 引擎记为 `api`，直接命令（`makewand claude` 等）按同样规则记录；aider 的适配器尚不报告路线，只在配置不允许转用 API 时记为 `cli`，否则不记录（本地模型不记录）。经 API 完成的成功不会清除 CLI 的失败记录；配置了 API key 时，只有记为 `cli` 的成功才清除 needs_auth 记录。
 - Python SDK：`CandidateManager.apply_candidate` 返回 `ApplyResult`，仍可按 `(ok, files, message)` 解包，`status` 给出类型化结果（`PASSED`、`APPLY_CONFLICT`、`TIMEOUT`、`UNVERIFIED`、`UNKNOWN`、`FAILED`）。
 - 源码安装器完成后，若 `makewand` 命令找到的不是这次安装（安装目录，默认 `~/.local/bin`，不在 `PATH` 中，或 `PATH` 上更早的位置有另一个 makewand），打印要加入 shell 配置的确切 `export PATH=...` 行；官方安装脚本（makewand.org/install.sh）的最后一句随之改为先加 PATH 再运行 `makewand status`。
+- `makewand budget clock` 查看共享调用账本的时钟领先量、最新日期桶与超前写下的租约/预留到期时间（只读）；`--repair` 在账本锁内让它们回到实际时间（租约改为 30 秒后到期、预留最多 24 小时、日期桶回到今天，后面日期的计数同时计入今天，不退还已计次数），`--json` 输出机器可读结果；provider worker 中拒绝运行。新环境变量 `MAKEWAND_BUDGET_TIMEZONE`：每日计数桶的 IANA 时区，Go 与 Python 共用。
 
 ### Changed
 
@@ -83,6 +84,7 @@ All notable changes to this project are documented here. The format is based on
 - 文档：SECURITY.md 与 README 写明 v3.2.0 之后加入的保护（#75、#80–#85）在 `master` 源码中、随 v3.3.0 发布，v3.2.x 构建（Release 压缩包、Homebrew、Scoop）没有；支持版本表与“v3.1+”的说法相应更正。SECURITY.md 也写明候选的测试与自动修复轮次以 `.makewand/sandbox-home` 为 HOME，会写入其中。
 - CI/发布：Release 的 test 作业改为调用 CI 的 verify 作业（`workflow_call`），未经 CI 的标签也要通过 PR 必须通过的全部检查（gofmt、golangci-lint、shell 语法、契约与 trusted acceptance 等），标签须等于 `v` + `__version__`；govulncheck 固定为 v1.9.0（漏洞库仍实时获取）；网站部署后在同一个 3 分钟期限内核对 makewand.org、www.makewand.org、makewand.com、www.makewand.com 与 makewand.pages.dev 上的 install.sh；`make prelaunch` 改用 Go 的私有用户缓存（原为任何本机用户都能预先写入的 `/tmp/makewand-gocache`），并与 CI 一样运行全部三个离线基准脚本。
 - 文档：README、`makewand-orchestrator` 技能与网站文档补上 route/mark/outcome；PACKAGE_DISTRIBUTION（tap 与 bucket 已是 v3.2.0）、Cloudflare 部署手册（实际发布路径是 deploy-site.yml）、RELEASE_STRATEGY（Release 还等待原生 Windows 关卡）与 PRELAUNCH 按实际情况更正；GITHUB_HARDENING 区分已生效的分支保护与 `scripts/github_hardening.sh` 的目标基线，脚本中的 CodeQL 检查名更正为实际上报的 `Analyze (go)`，并把 Release 需要的 `native-windows / verify` 列入目标基线。
+- 行为变化：调用账本的每日计数桶改按本地时区午夜划分（原固定为 Asia/Shanghai；本地时区为上海时间的机器上已有账本含义不变）；设置 `MAKEWAND_BUDGET_TIMEZONE=Asia/Shanghai` 可保留原边界，无效时区名拒绝准入。
 
 ### Fixed
 
@@ -110,6 +112,7 @@ All notable changes to this project are documented here. The format is based on
 - 每次发布说明中的源码安装命令改为 `curl -fsSL https://makewand.org/install.sh | bash`：原先的 `curl …/scripts/install.sh | bash` 从管道读取时 `BASH_SOURCE[0]` 未设置，安装根变成 `/`，什么也装不上。`scripts/install.sh` 经管道、`bash -s` 或 `/dev/fd` 运行时先于任何工具检查退出，并给出这条命令。
 - `makewand route --not/--self` 同时按候选所带模型判断家族（与流水线判断审查独立性的 `discovery.model_family` 一致）：agy 代理的 `claude-opus-5-5-high`、`claude-sonnet-5-5-*` 属于 claude，`gpt-oss-120b` 属于 codex，`--not` 跳过它们、`--self` 把它们排到最后；跳过列表写明被跳过的模型。此前 `--not claude` 仍可能派 agy 上的 Claude 审查 Claude 的改动。
 - 本地测试关卡：Python 用 pytest 还是 unittest 改由沙箱内的只读探测决定，不再看宿主解释器；测试无法运行（配置了 pytest 但沙箱内无法导入、pytest/unittest 退出码 5、带或不带引号的 `No module named pytest`）结论为 UNVERIFIED，关卡时间预算耗尽为 TIMEOUT（已有测试套件报告失败时仍为失败），都不再当作测试失败触发自动修复并以 EXIT_FAILED 结束。
+- 调用账本时钟：系统时钟一度超前时写下的账本不再阻断派发和租约清理。日期回拨不再拒绝准入，继续计入已见过的最新一天（计数从不清零）；租约与预留到期、清理和账本时钟本身最多信任领先实际时间 300 秒的部分并在首次遇到时警告一次，下一次准入把更超前的租约到期时间改按刚续租处理，崩溃 worker 的租约在实际时间越过其到期后即可回收（仍需证明进程已退出）。Go 与 Python 同一规则。
 
 ## [3.2.0] - 2026-10-09
 

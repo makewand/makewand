@@ -18,9 +18,9 @@ otherwise the canonical invocation directory is the project identity.
 The three scope maps are stored separately **inside one transaction file**.
 A sidecar OS lock plus durable atomic replacement commits admission together.
 Limits can only tighten within the same scope; a task never rewrites a project
-or machine limit. Daily buckets use Asia/Shanghai midnight,
-and reject backward movement into a previously observed day. Backward clock
-movement within a day cannot reset counts or revive expired capacity holds.
+or machine limit. Daily buckets start at local midnight, and a clock that moves
+back keeps counting into the latest bucket (see
+[Daily buckets and the budget clock](#daily-buckets-and-the-budget-clock)).
 
 Reservations cross an explicit launch boundary. Unstarted reservations can be
 released; launched failures, cancellation, crashes and unknown outcomes remain
@@ -48,8 +48,45 @@ concurrency keys are removed. Lifetime ledgers retain `archived_used`, so prunin
 never refunds their cap, including after layered migration. Normal layered caps
 bound retained history over time; unprovable live leases can still occupy space.
 An already oversized/corrupt ledger still requires operator recovery with all
-workers stopped; do not delete a live ledger to bypass budgets or lease fences.
+workers stopped; do not delete a live ledger to bypass budgets or lease fences
+(a clock that was ahead needs only `makewand budget clock --repair`).
 Unknown project/worktree ownership is not inferred.
+
+## Daily buckets and the budget clock
+
+Daily buckets start at local midnight: the process's local time zone, or
+`MAKEWAND_BUDGET_TIMEZONE` (an IANA name such as `Asia/Shanghai` or `UTC`).
+Go and Python compute the same bucket; set the variable for every participating
+process when their local zones may differ. An invalid name refuses admission
+(Windows also needs a time zone database: `ZONEINFO` for Go, the `tzdata`
+package for Python). Buckets used to start at Asia/Shanghai midnight on every
+host; `MAKEWAND_BUDGET_TIMEZONE=Asia/Shanghai` keeps that boundary.
+
+A clock that moves back into an earlier day no longer refuses dispatch:
+admission keeps counting into the latest bucket already seen, so counts are never
+reset. The ledger's `scopes.clock` is a ratchet against a clock that steps back,
+trusted and stored at most 300 seconds ahead of real time. Lease and capacity
+hold expiry, compaction and the clock itself use that capped value, so a ledger
+written while the system clock was ahead (an RTC read in the wrong time zone, a
+VM snapshot, a manual date change) cannot stall lease cleanup: a lease admitted
+or renewed after the correction expires at most 300 seconds plus its 30-second
+TTL after real time, and the next admission re-dates a lease stored further
+ahead as if it had just renewed. A dead worker's lease is then reclaimable once
+real time passes that expiry; liveness evidence is still required, as below.
+Backward clock movement never resets counts, and the budget clock moves back only
+when it is more than 300 seconds ahead of real time. Each process warns once on
+stderr when it meets a clock or a day bucket ahead of real time.
+
+`makewand budget clock` shows the ledger's clock lead, its latest day bucket
+against today's, and how many leases and holds carry expiries written while the
+clock was ahead; it writes nothing. `makewand budget clock --repair` (`--json`
+for a machine-readable report, `--call-budget-file` for another ledger) clears
+the skew under the ledger lock, with workers running or not: the clock and the
+counters' timestamps return to real time, leases expire one TTL from now (live
+owners renew them), holds are capped at their 24-hour maximum, and the latest day
+moves back to today. Calls counted in a later day's bucket stay counted there and are
+added to today's bucket as well, so nothing is refunded. Provider workers cannot
+run it.
 
 ## Account and quota-pool concurrency
 

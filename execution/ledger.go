@@ -373,12 +373,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 						if !valid || remaining < 0 || !expiryOK || expiryErr != nil {
 							return fmt.Errorf("invalid budget hold capacity or expiry")
 						}
-						now := float64(time.Now().UnixNano()) / 1e9
-						if scopes, ok := data["scopes"].(map[string]any); ok {
-							clock, _ := scopes["clock"].(json.Number).Float64()
-							now = max(now, clock)
-						}
-						if expires <= now {
+						if expires <= effectiveClock(data, ledgerNow()) {
 							continue
 						}
 						active[id] = hold
@@ -408,7 +403,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 					return reason
 				}
 				if data["scopes"] != nil {
-					keys, err = scopeKeys(data, cfg, time.Now())
+					keys, err = scopeKeys(data, cfg, ledgerNow())
 					if err != nil {
 						return err
 					}
