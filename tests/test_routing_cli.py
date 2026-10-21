@@ -766,5 +766,16 @@ class RoutingCliTests(unittest.TestCase):
         self.assertIn("--refresh", models_help.stdout)
 
 
+class RoutingCommandDocsTests(unittest.TestCase):
+    def test_commands_are_documented_where_the_cli_is_listed(self):
+        # #81 added route, mark and outcome; mark and outcome were documented nowhere.
+        for path in (REPO_ROOT / "README.md", REPO_ROOT / "skills" / "makewand-orchestrator" / "SKILL.md",
+                     REPO_ROOT / "site" / "docs.html"):
+            text = path.read_text(encoding="utf-8")
+            for command in ("makewand route", "makewand mark", "makewand outcome"):
+                with self.subTest(doc=path.name, command=command):
+                    self.assertIn(command, text)
+
+
 if __name__ == "__main__":
     unittest.main()

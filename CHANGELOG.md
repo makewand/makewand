@@ -15,8 +15,19 @@ All notable changes to this project are documented here. The format is based on
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。
 - quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。
 - provider worker 采用严格命令白名单，仅允许 `search`、`repomap`、静态 `help`、`completion <shell>` 和单独的帮助/版本参数；`quota`、`status`、`route`、`mark`、`outcome` 等管理命令均拒绝。详见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
+自动派发与统一派发（#81–#85）：
 
-- Go/Python 统一支持 `proxy.default` / `proxy.no_proxy` 和 `MAKEWAND_DEFAULT_PROXY` / `MAKEWAND_DEFAULT_NO_PROXY`：缺少调用方代理变量时供所有 provider CLI 与 API 路由使用，不内置代理地址；Gemini 仅显式开关绕过代理，移除 muse guard 的固定端口，状态安全显示代理来源。
+- 新增 `makewand route`、`makewand mark`、`makewand outcome`（#81）：route 为子任务在完整的模型 × 推理深度目录中从够用的最便宜档位起选工具、模型与推理深度，跳过暂停中、`mark` 标记期内与官方周额度过线的工具，按 `outcome` 记录的成绩做 Thompson 采样排序，打印可照抄的派活命令，不调用模型；mark 记录一家工具额度受限到何时，outcome 记录一次派活的验收成绩。Go 入口把这三个命令交给 Python 引擎。用法见 README。
+- agy 从不花 G1 credits（#81）：两个沙箱的私有家目录里，agy 的两个设置文件（`~/.gemini/settings.json`、`~/.gemini/antigravity-cli/settings.json`）一律写成 `useG1Credits=false`；没有 bwrap 时，只有宿主这两个文件都证明 `useG1Credits` 为 false 才运行 agy，否则 fail-closed 并说明。
+- agy 在 makewand 沙箱中能执行命令（#82）：agy 每次 run_command 前要写 `~/.gemini/antigravity-cli/bin/agentapi`，两个沙箱此前把该目录只读挂载；现在它是 tmpfs，宿主自带的文件只读绑定回去，不向宿主写回任何内容。
+- 派活时限（#83）：provider 子命令（`makewand codex|claude|agy|grok|muse ...`）与 review、run、race、ensemble 未给 `--timeout` 时单次时限跟随 `--total-timeout`，两者都给取较小值，都不给时默认值不变（300 秒，ensemble 900 秒）。此前照抄 route 的建议（不带 `--timeout`）会让重活在 5 分钟时以退出码 16 结束。route 按任务类型与难度打印 `--timeout`/`--total-timeout`（review/test/research/doc 为 900/1800/5400 秒，implement 为 1200/3600/10800 秒），review 加 `--readonly`，`--json` 同样包含。守护进程跟随请求的期限（不再封顶 600 秒，安全上限 6 小时），拒绝长预算的旧守护进程改为独立运行；观察器只在任务自身的截止时间之后才判定挂起；交互会话重新标记为派发方；`--total-timeout` 为 0 或负数时明确报错。
+- 有界派发改用 Go/Python 共享的机器账本 `call-budget.json`；任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按 Asia/Shanghai 午夜重置。已结算记录保留 48 小时，写入时清理；未结束记录、活动租约和预留所引用的计数保留，旧 lifetime 上限不因清理退款。详见 [预算与租约](docs/layered-call-admission.md)。（#84）
+- 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。（#84）
+- quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。（#84）
+- provider worker 采用严格命令白名单，仅允许 `search`、`repomap`、静态 `help`、`completion <shell>` 和单独的帮助/版本参数；`quota`、`status`、`route`、`mark`、`outcome` 等管理命令均拒绝。详见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。（#84）
+- 其他账号的 `CODEX_HOME`/`CLAUDE_CONFIG_DIR` 在 provider 沙箱中被屏蔽：不存在的外部根目录只有在可证明位于所有可写挂载之外时才跳过，首段之后含 `..` 的值视为有歧义而拒绝（两引擎一致）；运行期间切换登录时结果记为 UNKNOWN，不记到错误的账号；无 bwrap 直接运行的 codex 保留用户的 `CODEX_HOME`（配置、技能、hooks），并在运行前后核对账号绑定（#84）。
+- Go/Python 统一支持 `proxy.default` / `proxy.no_proxy` 和 `MAKEWAND_DEFAULT_PROXY` / `MAKEWAND_DEFAULT_NO_PROXY`：缺少调用方代理变量时供所有 provider CLI 与 API 路由使用，不内置代理地址；Gemini 仅显式开关绕过代理，移除 muse guard 的固定端口，状态安全显示代理来源。（#84）
+- 执行证据写入改用账本结算的写入时限（5 秒，原为固定 1 秒）：证据是持久的记账，写入失败会把已结算的结果变成 UNKNOWN；CI 中依赖时间窗的测试改为事件驱动（#85）。
 
 ### Security
 
@@ -71,6 +82,7 @@ All notable changes to this project are documented here. The format is based on
 - 安装器只安装一份 `makewand-orchestrator` 技能；仍声明同名的旧 `trio-orchestrator` 副本会保持更新并提示删除。
 - 文档：SECURITY.md 与 README 写明 v3.2.0 之后加入的保护（#75、#80–#85）在 `master` 源码中、随 v3.3.0 发布，v3.2.x 构建（Release 压缩包、Homebrew、Scoop）没有；支持版本表与“v3.1+”的说法相应更正。SECURITY.md 也写明候选的测试与自动修复轮次以 `.makewand/sandbox-home` 为 HOME，会写入其中。
 - CI/发布：Release 的 test 作业改为调用 CI 的 verify 作业（`workflow_call`），未经 CI 的标签也要通过 PR 必须通过的全部检查（gofmt、golangci-lint、shell 语法、契约与 trusted acceptance 等），标签须等于 `v` + `__version__`；govulncheck 固定为 v1.9.0（漏洞库仍实时获取）；网站部署后在同一个 3 分钟期限内核对 makewand.org、www.makewand.org、makewand.com、www.makewand.com 与 makewand.pages.dev 上的 install.sh；`make prelaunch` 改用 Go 的私有用户缓存（原为任何本机用户都能预先写入的 `/tmp/makewand-gocache`），并与 CI 一样运行全部三个离线基准脚本。
+- 文档：README、`makewand-orchestrator` 技能与网站文档补上 route/mark/outcome；PACKAGE_DISTRIBUTION（tap 与 bucket 已是 v3.2.0）、Cloudflare 部署手册（实际发布路径是 deploy-site.yml）、RELEASE_STRATEGY（Release 还等待原生 Windows 关卡）与 PRELAUNCH 按实际情况更正；GITHUB_HARDENING 区分已生效的分支保护与 `scripts/github_hardening.sh` 的目标基线，脚本中的 CodeQL 检查名更正为实际上报的 `Analyze (go)`，并把 Release 需要的 `native-windows / verify` 列入目标基线。
 
 ### Fixed
 

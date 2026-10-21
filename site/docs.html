@@ -161,6 +161,7 @@
           <li><a href="#cli-race" class="sidebar-link">makewand race</a></li>
           <li><a href="#cli-observe" class="sidebar-link">makewand observe</a></li>
           <li><a href="#cli-serve" class="sidebar-link">makewand serve (网关)</a></li>
+          <li><a href="#cli-route" class="sidebar-link">makewand route / mark / outcome</a></li>
         </ul>
       </div>
 
@@ -282,6 +283,21 @@ makewand observe
         <div class="code-block">
 makewand serve --listen 127.0.0.1:8080 --enable-users
 # 访问 http://localhost:8080/admin；公网通过下方 HTTPS Tunnel 终止 TLS
+        </div>
+
+        <h3 class="docs-h3" id="cli-route">6. makewand route / mark / outcome · 自动派活选型</h3>
+        <p class="docs-p">
+          为子任务从完整的模型 × 推理深度目录中挑选工具，从够用的最便宜档位起选，打印可照抄的派活命令，不调用模型；跳过暂停中、额度标记期内与官方周额度过线的工具，并参考记录的验收成绩：
+        </p>
+        <div class="code-block">
+# 类型：review / implement / test / research / doc；难度：mechanical / normal / hard
+makewand route implement normal --self claude
+
+# 派活遇到 429 或额度用完：到期前 route 跳过该工具
+makewand mark codex 6h
+
+# 验收后记录成绩，route 据此调整之后的排序
+makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
         </div>
       </section>
 

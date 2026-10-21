@@ -182,7 +182,25 @@ makewand claude "编写测试用例"
 makewand muse "检查系统配置项"
 ```
 
-### 9. 统一模式定义与跨语言契约 (Unified Modes & Tiers Contract)
+### 9. 自动派活选型：route / mark / outcome
+
+```bash
+# 为子任务挑选工具、模型与推理深度，打印可照抄的派活命令（只读本地缓存与成绩账本，不调用模型）
+makewand route implement normal --self claude
+makewand route review hard --self claude --not codex --json
+
+# 派活遇到 429 或额度用完：标记该工具，到期前 route 跳过它
+makewand mark codex 6h --reason 429
+
+# 验收后记录成绩，route 据此调整之后的排序
+makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
+```
+
+`route <类型> <难度>` 的类型为 review、implement、test、research、doc，难度为 mechanical、normal、hard。它在完整的模型 × 推理深度目录中，从够用的最便宜档位（1–3）起选：跳过 `~/.config/mw-hub/policy`（或 `MW_HUB_POLICY`）里暂停中的工具、`mark` 标记期内的工具，以及官方周额度达到阈值的 codex/claude（默认 90%/85%），再按 `outcome` 记录的通过率用 Thompson 采样排序。`--self <工具>` 把与你同家的候选排在最后，`--not <工具>` 排除与它同家族的候选（审查时传实现方），`--tier N` 指定起始档，`--risk high` 从最强档起，`--simple` 只用精简三档表，`--json` 输出全部候选；验收不过时按输出末尾的提示升一档。派活命令自带的时限见下文“调用与资源预算”。
+
+`mark <工具> <时长>` 的时长为 d/h/m/s 组合（如 `6h`、`93h17m`、`2d`，最长 365 天），`--reason` 可选。`outcome <工具> <档> <类型> pass|fail` 可附 `--model`、`--effort`、`--seconds`、`--calls`。标记与成绩保存在 makewand 私有状态目录的 `routing/` 下（`MAKEWAND_ROUTING_DIR` 可改）。三个命令都不调用模型；在 provider worker（`MAKEWAND_PROVIDER_WORKER=1`）内被拒绝。
+
+### 10. 统一模式定义与跨语言契约 (Unified Modes & Tiers Contract)
 
 Makewand 在 Python（`orchestrator` / CLI / REPL）与 Go（`router` / TUI / 守护进程）之间保证双向无缝映射与透明别名支持：
 
@@ -217,7 +235,7 @@ Go 原生候选选择支持 1–3 的候选数与并发上限，以及 `MAKEWAND
 
 Go 工作区复制默认仅在 Linux 的源目录与临时目录位于同一 Btrfs/XFS 文件系统时尝试写时复制；reflink 不可用或尝试失败时完整回退到普通复制，普通复制错误会中止候选工作区创建。`MAKEWAND_WORKSPACE_REFLINK=0` 强制普通复制，`=1` 可在其他文件系统显式尝试。候选输入始终使用独立文件，不使用硬链接共享可写内容；实际性能取决于文件系统和文件大小。配置与 Windows 身份边界见[验证契约](docs/VERIFICATION_CONTRACT.md#go-candidate-resources-and-workspace-copies)。
 
-### 10. 可选 Unix daemon 派发
+### 11. 可选 Unix daemon 派发
 
 ```bash
 makewand daemon start

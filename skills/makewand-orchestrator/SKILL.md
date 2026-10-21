@@ -45,7 +45,16 @@ makewand 是本机的命令行调度器：把任务派给已登录的编码 CLI�
 
 不要只凭文字摘要判断成败。`review --json` 输出机器可读结果。`ensemble` 的 0 只表示至少有一个模型给出了意见，不代表结论一致。
 
-## route 派活命令的时限
+## route / mark / outcome：选派活工具
+
+`makewand route <review|implement|test|research|doc> <mechanical|normal|hard> --self <你>` 为子任务在完整模型目录里选工具、模型和推理深度，从够用的最便宜档位起选，打印可照抄的派活命令，不调用模型；审查加 `--not <实现方>`，高风险加 `--risk high`，验收不过按输出末尾的提示升一档。route 跳过暂停中、`mark` 标记期内和官方周额度过线的工具，并参考 `outcome` 记下的成绩。
+
+- 派活遇到 429 或额度用完：`makewand mark <工具> <剩余时长>`（如 `6h`、`2d`），到期前 route 跳过它。
+- 验收后记成绩：`makewand outcome <工具> <档> <类型> pass|fail --model <模型> --effort <推理深度>`。
+
+这三个命令在 provider worker（`MAKEWAND_PROVIDER_WORKER=1`）内被拒绝。
+
+### 派活命令的时限
 
 `makewand route <review|implement|test|research|doc> <mechanical|normal|hard> --self codex` 输出的候选命令自带 `--max-model-calls 1 --timeout N --total-timeout N`，review 任务还带 `--readonly`。照抄时保留这些参数；JSON 顶层及候选也提供 `timeout`、`total_timeout`、`readonly` 字段。
 
@@ -77,6 +86,9 @@ makewand 是本机的命令行调度器：把任务派给已登录的编码 CLI�
 
 ```bash
 makewand status                                    # 各订阅健康、额度与削峰状态
+makewand route implement normal --self <你>        # 选派活工具、模型和推理深度（不调用模型）
+makewand mark codex 6h                             # 记录 429/额度用完，到期前 route 跳过它
+makewand outcome codex 2 implement pass --model <模型> --effort <推理深度>   # 记录验收成绩
 makewand review --cwd <dir>                        # 只读审查当前未提交的改动
 makewand review --cwd <dir> --json                 # 同上，机器可读输出
 makewand run "<任务>" --cwd <dir>                  # 实现 → 测试 → 跨模型审查 → 自动修复

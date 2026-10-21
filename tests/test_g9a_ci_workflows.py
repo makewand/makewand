@@ -61,6 +61,28 @@ def _job_text(path, job):
     return _read(ROOT / reusable[1]) if reusable else block
 
 
+def _reported_check_names():
+    """Check names that pull-request workflows report, as branch protection sees them."""
+    names = set()
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        text = _read(path)
+        on_block = text.split("\non:", 1)[1].split("\npermissions:", 1)[0]
+        if not re.search(r"(?m)^  pull_request:", on_block):
+            continue
+        for job, block in _job_blocks(text).items():
+            named = re.search(r"(?m)^    name: (.+?)\s*$", block)
+            titles = [named[1].strip("'\"") if named else job]
+            languages = re.search(r"(?m)^        language: \[([^\]]*)\]", block)
+            if languages and "${{ matrix.language }}" in titles[0]:
+                titles = [titles[0].replace("${{ matrix.language }}", value.strip().strip("'\""))
+                          for value in languages[1].split(",")]
+            callee = re.search(r"(?m)^    uses: (\./\.github/workflows/\S+)\s*$", block)
+            if callee:
+                titles = [f"{title} / {inner}" for title in titles for inner in _job_blocks(_read(ROOT / callee[1]))]
+            names.update(titles)
+    return names
+
+
 def _step_run(text, step_name):
     """Return the dedented `run: |` script of the step called step_name."""
     lines = text.splitlines()
@@ -308,6 +330,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(notes.count("```") % 2, 0, "unbalanced code fences")
         self.assertNotIn("brew install", notes, "package managers are only advertised when published")
         self.assertIn("**Full Changelog**: https://github.com/acme/makewand/compare/v9.8.6...v9.8.7", notes)
+
+
+class GitHubHardeningTests(unittest.TestCase):
+    def test_required_checks_are_names_the_workflows_report(self):
+        # eng-1021-7: the script required "Analyze (Go)" while CodeQL reports
+        # "Analyze (go)"; a required check that never reports blocks every merge.
+        script = _read(ROOT / "scripts" / "github_hardening.sh")
+        contexts = json.loads(re.search(r'"contexts": (\[[^\]]*\])', script)[1])
+        reported = _reported_check_names()
+        self.assertTrue({"verify", "Analyze (go)", "native-windows / verify"} <= reported, reported)
+        self.assertIn("verify", contexts, "CI verify must stay required")
+        for context in contexts:
+            with self.subTest(context=context):
+                self.assertIn(context, reported)
 
 
 @unittest.skipUnless(shutil.which("bash"), "bash required")
