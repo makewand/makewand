@@ -3543,7 +3543,7 @@ def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
     from makewand.workflow import choose_workflow, judge_reserve, remember_result
     from makewand.execution_runtime import execution_context, task_id
     from makewand.execution_contract import ExecutionResult, STATUS_CODES
-    from makewand.call_budget import reserve_capacity, release_capacity, BudgetError
+    from makewand.call_budget import reserve_capacity, release_capacity, BudgetConfigError, BudgetError
     from makewand.telemetry import stage
     leases = []
     total = timeout if total_timeout is None else total_timeout
@@ -3584,6 +3584,13 @@ def run_race(prompt, cwd=None, timeout=300, repo_trust="trusted", engine_a=None,
                     task_id=task_id(), stage="workflow", engine="orchestrator"))
                 _print(c(str(error), COLOR_RED))
                 span.finish(status=result.status, error_kind="protected_files")
+                return result.exit_code
+            except BudgetConfigError as error:
+                # Invalid admission configuration (MAKEWAND_BUDGET_TIMEZONE), not a spent budget.
+                result = remember_result(ExecutionResult(False, None, str(error), status="INTERNAL_ERROR",
+                    task_id=task_id(), stage="workflow", engine="orchestrator"))
+                _print(c(str(error), COLOR_RED))
+                span.finish(status=result.status, error_kind="budget_configuration")
                 return result.exit_code
             except BudgetError as error:
                 result = remember_result(ExecutionResult(False, None, str(error), status="BUDGET_EXHAUSTED",

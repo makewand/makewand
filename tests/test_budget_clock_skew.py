@@ -23,11 +23,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import test_workflow_scheduling as scheduling
 from makewand import account_leases as leases
 from makewand import call_budget as b
-from makewand import layered_budget
-from makewand.execution_contract import ExecutionRequest
+from makewand import config, layered_budget, orchestrator as orch
+from makewand.execution_contract import EXIT_INTERNAL_ERROR, ExecutionRequest
 from makewand.execution_runtime import execute, execution_context
+from makewand.workflow import last_result
 
 REPO = Path(__file__).resolve().parent.parent
 ACCOUNT = "codex:account:" + "a" * 32
@@ -199,6 +201,40 @@ class BudgetZoneTests(ClockSkewCase):
                     self.assertEqual(layered_budget.day_bucket(1792080000), day)
         finally:
             time.tzset()
+
+    def test_utc_needs_no_time_zone_database(self):
+        # Go's LoadLocation resolves UTC without one; Windows without tzdata has none.
+        from zoneinfo import ZoneInfoNotFoundError
+        with patch("zoneinfo.ZoneInfo", side_effect=ZoneInfoNotFoundError("no time zone database")):
+            with patch.dict(os.environ, MAKEWAND_BUDGET_TIMEZONE="UTC"):
+                self.assertEqual(layered_budget.day_bucket(1792080000), "2026-10-15")
+            with patch.dict(os.environ, MAKEWAND_BUDGET_TIMEZONE="Asia/Shanghai"):
+                with self.assertRaises(b.BudgetConfigError):
+                    layered_budget.day_bucket(1792080000)
+
+
+class RaceBudgetZoneTests(unittest.TestCase):
+    """`makewand race` refuses an invalid zone as a configuration error, as `run` and Go do."""
+    fixtures = scheduling.SchedulingTests.fixtures
+
+    def setUp(self):
+        scheduling.SchedulingTests.setUp(self)
+        for patcher in (patch("makewand.usage.record_engine_usage"),
+                        patch.object(config, "CANDIDATES_DIR", self.root / "candidates"),
+                        patch.object(orch, "CANDIDATES_DIR", self.root / "candidates"),
+                        patch.dict(os.environ, MAKEWAND_LAYERED_BUDGET="1", MAKEWAND_BUDGET_TIMEZONE="Asia/Nowhere",
+                                   MAKEWAND_CALL_BUDGET_FILE=str(self.root / "calls.json"),
+                                   MAKEWAND_PROJECT_ROOT=str(self.repo))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_invalid_zone_is_an_internal_error_and_dispatches_nothing(self):
+        with self.fixtures(), contextlib.redirect_stderr(io.StringIO()):
+            code = orch.run_race("Implement value 2", cwd=str(self.repo), engine_a="claude",
+                                 engine_b="codex", timeout=60)
+        self.assertEqual(code, EXIT_INTERNAL_ERROR)  # was 13, BUDGET_EXHAUSTED
+        self.assertEqual(self.calls, [])
+        self.assertEqual(last_result().status, "INTERNAL_ERROR")
 
 
 class RepairTests(ClockSkewCase):

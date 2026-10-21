@@ -58,8 +58,9 @@ Daily buckets start at local midnight: the process's local time zone, or
 `MAKEWAND_BUDGET_TIMEZONE` (an IANA name such as `Asia/Shanghai` or `UTC`).
 Go and Python compute the same bucket; set the variable for every participating
 process when their local zones may differ. An invalid name refuses admission
-with `INTERNAL_ERROR` (exit 1) and charges nothing (Windows also needs a time
-zone database: `ZONEINFO` for Go, the `tzdata` package for Python). Buckets used to start at Asia/Shanghai midnight on every
+with `INTERNAL_ERROR` (exit 1) and charges nothing. On Windows every name other
+than `UTC` also needs a time zone database: `ZONEINFO` for Go, the `tzdata`
+package for Python. Buckets used to start at Asia/Shanghai midnight on every
 host; `MAKEWAND_BUDGET_TIMEZONE=Asia/Shanghai` keeps that boundary.
 
 A clock that moves back into an earlier day no longer refuses dispatch:

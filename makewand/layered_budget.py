@@ -15,7 +15,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from makewand.account_leases import TTL
@@ -52,6 +52,9 @@ def day_bucket(moment):
     name = os.environ.get(TIMEZONE_ENV, "").strip()
     if not name:
         return datetime.fromtimestamp(moment).strftime("%Y-%m-%d")
+    if name == "UTC":
+        # Go's LoadLocation needs no time zone database for UTC; zoneinfo does (Windows without tzdata).
+        return datetime.fromtimestamp(moment, timezone.utc).strftime("%Y-%m-%d")
     from makewand.call_budget import BudgetConfigError
     try:
         from zoneinfo import ZoneInfo
