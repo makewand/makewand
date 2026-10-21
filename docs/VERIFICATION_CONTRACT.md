@@ -89,7 +89,9 @@ included — plus the install's http(s) index options and a named-pins constrain
 file, and for a local project, `.[extra]` included, its build requires,
 dependencies and the optional-dependency groups its extras select, and for a
 local `.whl` target its `Requires-Dist` for the selected extras (read from the
-wheel's `METADATA`, a zip read that runs no code); `npm`
+wheel's `METADATA`, a zip read that runs no code; makewand decides each marker's
+`extra` comparisons in the contexts pip uses and leaves pip only the
+environment clauses, since pip cannot evaluate a comparison of two strings); `npm`
 installing a registry-only lockfile it resolved and inspected first; `cargo
 fetch` pinned to a named rustup toolchain; `go mod download`/`tidy`) gets
 outbound-only `slirp4netns` networking restricted to public destinations — built
@@ -98,8 +100,9 @@ and workspace `.cargo`, `ProjectIgnoreDirs` subtrees, and more credential shapes
 and with a fresh, empty HOME (`/tmp/makewand-fetch-home`, not the persistent
 sandbox HOME an earlier loopback step running project code can write) whose tool
 config-file locations are neutralised (`GIT_CONFIG_GLOBAL=/dev/null`,
-`GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, npm user/global config and
-`PIP_CONFIG_FILE` at `/dev/null`, `GOENV=off`), so no git credential helper or
+`GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, npm user/global config at two
+distinct, non-existent paths inside that HOME (npm refuses `/dev/null` there),
+`PIP_CONFIG_FILE=/dev/null`, `GOENV=off`), so no git credential helper or
 tool config a loopback step wrote runs with the network, while the caches the
 offline steps reuse stay under the persistent sandbox HOME through
 `GOMODCACHE`/`npm_config_cache`/`CARGO_HOME` or the wheelhouse's absolute path —
