@@ -396,14 +396,22 @@ func TestCLIProvider_IsAvailable_UsesHealthProbe(t *testing.T) {
 	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "probe", Stdout: "ok\n"})
 
 	p := NewClaudeCLI(script)
+	p.probeTimeout = completedProbeTimeout
 	if !p.IsAvailable() {
 		t.Fatal("IsAvailable() = false, want true for healthy probe")
 	}
 }
 
+// completedProbeTimeout is the probe deadline for tests whose probe must run
+// to completion: with the real 4 s deadline a slow Windows runner, still
+// starting the fixture, hit the deadline and got the timeout policy instead.
+const completedProbeTimeout = 30 * time.Second
+
 func TestCLIProvider_IsAvailable_RejectsNonzeroProbe(t *testing.T) {
 	script := testfixture.WriteCLI(t, "controlled-cli", testfixture.Spec{Mode: "probe", Stderr: "probe failed\n", ExitCode: 1})
-	if p := NewCodexCLI(script); p.IsAvailable() {
+	p := NewCodexCLI(script)
+	p.probeTimeout = completedProbeTimeout
+	if p.IsAvailable() {
 		t.Fatal("IsAvailable() = true, want false for a completed nonzero probe")
 	}
 }

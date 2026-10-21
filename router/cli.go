@@ -57,6 +57,10 @@ type CLIProvider struct {
 	// When set, Chat passes system via this flag and only user messages in -p.
 	systemFlag string
 
+	// probeTimeout overrides cliAvailProbeTimeout when non-zero (tests whose
+	// probe must complete on a slow runner).
+	probeTimeout time.Duration
+
 	mu            sync.Mutex
 	cachedAvail   bool
 	cachedAvailAt time.Time
@@ -389,7 +393,11 @@ func (c *CLIProvider) healthCheck() bool {
 		return true
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cliAvailProbeTimeout)
+	timeout := cliAvailProbeTimeout
+	if c.probeTimeout > 0 {
+		timeout = c.probeTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := c.checkCmd(ctx)
