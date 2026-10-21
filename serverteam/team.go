@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/makewand/makewand/internal/csvsafe"
 )
 
 type Organization struct {
@@ -283,7 +285,8 @@ func WriteBillingSummaryCSV(w io.Writer, summary BillingSummary) error {
 		return err
 	}
 	writeBucket := func(scopeType string, bucket BillingBucket) error {
-		return cw.Write([]string{
+		// Organization and project names are client-chosen: keep them text.
+		return cw.Write(csvsafe.Record([]string{
 			scopeType,
 			bucket.ID,
 			bucket.Name,
@@ -293,7 +296,7 @@ func WriteBillingSummaryCSV(w io.Writer, summary BillingSummary) error {
 			strconv.FormatFloat(bucket.UtilizationPercent, 'f', 2, 64),
 			strconv.Itoa(bucket.RequestCount),
 			strconv.FormatBool(bucket.OverBudget),
-		})
+		}))
 	}
 	for _, bucket := range summary.Organizations {
 		if err := writeBucket("organization", bucket); err != nil {
@@ -326,7 +329,7 @@ func WriteBudgetAlertsCSV(w io.Writer, alerts []BudgetAlert) error {
 		return err
 	}
 	for _, alert := range alerts {
-		if err := cw.Write([]string{
+		if err := cw.Write(csvsafe.Record([]string{
 			alert.ScopeType,
 			alert.ID,
 			alert.Name,
@@ -336,7 +339,7 @@ func WriteBudgetAlertsCSV(w io.Writer, alerts []BudgetAlert) error {
 			strconv.FormatFloat(alert.RemainingBudgetUSD, 'f', 6, 64),
 			strconv.FormatFloat(alert.UtilizationPercent, 'f', 2, 64),
 			strconv.Itoa(alert.RequestCount),
-		}); err != nil {
+		})); err != nil {
 			return err
 		}
 	}

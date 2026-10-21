@@ -11,7 +11,7 @@ All notable changes to this project are documented here. The format is based on
 
 - 路由热路径不再反复解析登录身份文件：额度来源按身份文件的路径、设备号、inode、大小与修改时间（纳秒）复用上次读取，每次 Snapshot 对每个来源只取一次身份。长期使用的 `~/.claude.json` 有数百 KB，此前每个候选要读取解析约 4 次（本机每个候选约 12 ms，现约 0.4 ms）。修改不足 2 秒的身份文件每次重读；准入与记账仍每次重读。
 - Codex 额度来源与 Python 一致，只读每个会话日志最后 4 MiB 的完整行，只解码含 `rate_limits` 或 `session_meta` 的行，并在逐行扫描中检查超时；FIFO 等非普通文件被跳过，不会卡住额度刷新。
-- 用量与审计 CSV 导出（`makewand usage --csv`、`makewand audit --csv`、管理端 `?format=csv`）给以 `=`、`+`、`-`、`@`、制表符或回车开头的单元格（纯数字除外）加单引号前缀，客户端提供的值（如被拒绝的模型名 `=HYPERLINK(...)`）在电子表格中只按文本显示。
+- 用量、审计与团队账单/预算告警 CSV 导出（`makewand usage --csv`、`makewand audit --csv`、管理端 `?format=csv`）给以 `=`、`+`、`-`、`@`、制表符或回车开头的单元格（纯数字除外）加单引号前缀，客户端提供的值（如被拒绝的模型名 `=HYPERLINK(...)`）在电子表格中只按文本显示。
 - `makewand serve` 的持久预算：没有上限适用的请求不再写预留行，也不再为此在准入时占用 SQLite 写锁，其结果不确定的费用仍按预估结算；已结算的预留在过期一天后连同其 scope 行删除（每次用量写入最多删 256 条，旧库的积压分批清理），预留表不再随请求数无限增长。
 - `go test ./...` 不再连接公网和宿主 DNS 解析器：依赖安装网络实测中的 DNS 与公网出口检查、以及在沙箱中真实运行 `npm install`（会访问 npm 注册表）的构建流程子测试，只在设置 `MAKEWAND_TEST_LIVE_NETWORK=1` 时运行。
 - `--workflow single` 的帮助与文档如实说明：由写代码的同一引擎在单独的只读调用中自审，没有独立引擎审查。
