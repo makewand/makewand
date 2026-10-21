@@ -13,26 +13,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _isolation  # noqa: F401
 
 import ast
-import re
 import unittest
+
+from makewand import health
 
 TESTS_DIR = Path(__file__).resolve().parent
 # Helpers that compare a reset string with the real clock unless given now=.
 CLOCK_READERS = {"is_reset_time_passed", "record_engine_limit", "parse_reset_time_to_seconds_left",
                  "parse_reset_datetime"}
 RESET_KEYS = {"resets_at", "reset_at"}
-# What health.parse_reset_datetime reads as a year-less date: "Oct 20", "20th of oct" (no year after it),
-# and codex's "10-04 10:40" / "10-04 8pm".
-_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
-_NO_YEAR = r"(?!\s*,?\s*\d{4})"
-_MONTH_DAY = re.compile(rf"\b{_MONTH}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?\b{_NO_YEAR}"
-                        rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTH}\b\.?{_NO_YEAR}", re.IGNORECASE)
-_NUMERIC_MONTH_DAY = re.compile(r"(?<![\w/:.-])\d{1,2}-\d{1,2}\s+\d{1,2}(?::\d{2}|\s*[ap]\.?m)", re.IGNORECASE)
 
 
 def _year_less_date(node):
-    return (isinstance(node, ast.Constant) and isinstance(node.value, str)
-            and bool(_MONTH_DAY.search(node.value) or _NUMERIC_MONTH_DAY.search(node.value)))
+    """A literal health.parse_reset_datetime resolves as a date without a year.
+
+    Uses the parser's own patterns, in its order, so the guard follows any
+    format the parser learns: "Oct 20", "20th of oct", codex's "10-04 10:40".
+    """
+    if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+        return False
+    if health._RESET_EPOCH_RE.search(node.value):
+        return False
+    _, text = health._reset_zone(node.value.strip())
+    if health._RESET_ISO_RE.search(text):
+        return False
+    named = health._RESET_NAMED_DATE_RE.search(text)
+    if named:
+        return not (named.group("year") or named.group("year2"))
+    numeric = health._RESET_NUMERIC_DATE_RE.search(text)
+    return bool(numeric) and health._first_clock(text, exclude=numeric.span()) is not None
 
 
 def fixed_reset_dates(source, filename="<test>"):
@@ -70,8 +79,10 @@ class FixedResetDateGuardTests(unittest.TestCase):
             'cache = dict(claude=live("limited", resets_at="20th of oct, 8pm"))',
             'is_reset_time_passed("4 Nov", "")',
             'record_engine_limit("codex", "limit", "10-04 8pm")',
+            'is_reset_time_passed("10-04, 10:40", "")',
+            'is_reset_time_passed("10:40 on 10-04 (Asia/Shanghai)", "")',
         ])
-        self.assertEqual(sorted(line for line, _ in fixed_reset_dates(source)), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(sorted(line for line, _ in fixed_reset_dates(source)), list(range(1, 10)))
 
     def test_scanner_leaves_clock_independent_uses_alone(self):
         source = "\n".join([
@@ -80,6 +91,10 @@ class FixedResetDateGuardTests(unittest.TestCase):
             'is_reset_time_passed("Sep 27th, 2026 10:58 AM")',
             'parse_reset_time_to_seconds_left("2026-09-28 07:53")',
             'is_reset_time_passed("4 Nov 2026, 8pm")',
+            'is_reset_time_passed("4 Nov. 2026, 8pm")',
+            'is_reset_time_passed("20th of Oct. 2026")',
+            'is_reset_time_passed("10-04")',
+            'is_reset_time_passed("Claude AI usage limit reached|1760000000")',
             'cache = dict(grok=live("limited", resets_at="in 3 hours"))',
             'parse_claude_quota("Weekly limit reached · resets Oct 20, 8pm (Asia/Shanghai)")',
             'health.record_engine_limit("claude", "limit", _future_month_day("8pm"))',
