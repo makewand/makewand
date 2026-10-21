@@ -388,8 +388,10 @@ indexes) leaves gitlinks out and stages them with `git update-index`, which only
 reads each nested `HEAD`. The host rollback unstages with `git rm --cached -f`:
 without `-f`, git rm's up-to-date check runs `git status` inside a staged nested
 repository (and refuses a path whose staged content differs from both `HEAD` and
-the file). The shadow copy checks each submodule out with `checkout -q`: reporting
-local changes after the switch runs `git status` in a nested submodule that
+the file). The shadow copy checks each submodule out with `checkout -q`, and the
+shadow delivery commits inside a submodule only when something is staged there:
+reporting local changes after the switch, like the status `git commit` prints
+when there is nothing to commit, runs `git status` in a nested submodule that
 `.gitmodules` marks `ignore = none`. Every command also carries command-scope
 configuration (`GIT_CONFIG_COUNT`, which git hands on to every git it starts):
 `diff.ignoreSubmodules=dirty`, `submodule.recurse=false` (a user's
@@ -459,7 +461,9 @@ repository, work tree, namespace, attribute source or set of git programs than
 the ones it shields for its working directory (`-C`, `--git-dir`, `--work-tree`,
 `--namespace`, `--bare`, `--attr-source`, `--exec-path`, `--config-env`, and `-c`
 settings in an `include` or `includeIf` section): callers pass the working
-directory instead. `GIT_ATTR_SOURCE`, `GIT_CEILING_DIRECTORIES`,
+directory instead. `GIT_CONFIG` (only `git config` reads it, in place of all other
+configuration, so the filter driver listing would miss the drivers `git apply`
+runs), `GIT_ATTR_SOURCE`, `GIT_CEILING_DIRECTORIES`,
 `GIT_DISCOVERY_ACROSS_FILESYSTEM` and `GIT_NAMESPACE` are removed from the
 inherited environment, like `GIT_DIR` and the other redirection variables.
 

@@ -2820,14 +2820,22 @@ def _run_pipeline_impl(
                                 a_sub_code, _, a_sub_err = add_all(dst_sub)
                                 if a_sub_code != 0:
                                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 暂存失败 ({a_sub_err})，拒绝交付。")
-                                c_sub_code, _, c_sub_err = run_git_cmd([
-                                    "git",
-                                    "-c", "user.name=Makewand",
-                                    "-c", "user.email=makewand@local",
-                                    "commit", "--no-verify", "-m", f"makewand: submodule {prompt[:50]}"
-                                ], cwd=str(dst_sub))
-                                if c_sub_code != 0:
-                                    return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 提交失败 ({c_sub_err})，拒绝交付。")
+                                # Only with something staged, as in step 2: with nothing to commit, git commit
+                                # prints a full status, which runs `git status` (and the filters it reads there)
+                                # in a nested submodule that .gitmodules marks "ignore = none".
+                                d_sub_code, d_sub_names, d_sub_err = run_git_cmd(["git", "diff", "--cached", "--name-only"],
+                                                                                 cwd=str(dst_sub))
+                                if d_sub_code != 0:
+                                    return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 暂存结果无法读取 ({d_sub_err})，拒绝交付。")
+                                if d_sub_names.strip():
+                                    c_sub_code, _, c_sub_err = run_git_cmd([
+                                        "git",
+                                        "-c", "user.name=Makewand",
+                                        "-c", "user.email=makewand@local",
+                                        "commit", "--no-verify", "-m", f"makewand: submodule {prompt[:50]}"
+                                    ], cwd=str(dst_sub))
+                                    if c_sub_code != 0:
+                                        return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 提交失败 ({c_sub_err})，拒绝交付。")
 
                             commit_code, sub_commit, sub_error = run_git_cmd(["git", "rev-parse", "HEAD"], cwd=str(dst_sub))
                             if commit_code:

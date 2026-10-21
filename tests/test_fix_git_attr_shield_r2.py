@@ -3,10 +3,10 @@
 Every fixture plants a filter driver whose commands append to a marker file outside the
 repositories (FilterFixture): a marker line means makewand ran the filter on the host.
 Covered: nested repositories and submodules (no host git command runs `git status` inside
-one, the host rollback and the shadow copy's submodule checkout included, while a dirty
-registered submodule is still detected where it was before), the delivery patch check and
-the generated apply script, SHA-256 repositories, global options that would point git at
-another repository, and the inherited environment.
+one, the host rollback, the shadow copy's submodule checkout and the shadow delivery's
+submodule commits included, while a dirty registered submodule is still detected where it
+was before), the delivery patch check and the generated apply script, SHA-256 repositories,
+global options that would point git at another repository, and the inherited environment.
 """
 try:  # 测试隔离必须先于 makewand 导入：临时 HOME/配置、AI CLI 桩、屏蔽本地模型端点
     import _isolation
@@ -478,6 +478,56 @@ class ShadowDeliveryTests(ShadowDeliveryFixture):
         self.run_pipeline(coder)
         self.assertEqual(self.marker_lines(), [])
 
+    def test_a_submodule_with_nothing_staged_gets_no_commit(self):
+        # The worker registers a repository "evil" whose index holds a change its work-tree file
+        # undoes: git status lists it and git add -A leaves nothing to commit, so `git commit`
+        # would print a full status, running `git status` in evil's gitlink n2, which
+        # evil/.gitmodules marks "ignore = none". n2 keeps an unchanged file racy under a planted
+        # filter: its own shielded status is clean and makewand never commits there.
+        def coder(shadow):
+            (shadow / "app.txt").write_text("APPROVED\n")
+            evil = self.nested_repository(shadow / "evil", {"f.txt": "f\n"})
+            n2 = self.nested_repository(evil / "n2")
+            (evil / ".gitmodules").write_text('[submodule "n2"]\n\tpath = n2\n\turl = ./n2\n\tignore = none\n')
+            self.git(evil, "add", "-A")
+            self.git(evil, "commit", "-qm", "n2")
+            (shadow / ".gitmodules").write_text('[submodule "evil"]\n\tpath = evil\n\turl = ./evil\n'
+                                                '[submodule "n2"]\n\tpath = evil/n2\n\turl = ./evil/n2\n')
+            self.arm(n2, n2 / ".git", dirty=False)
+            mtime = os.stat(n2 / "x.txt").st_mtime
+            os.utime(n2 / ".git" / "index", (mtime - 10, mtime - 10))
+            (evil / "f.txt").write_text("g\n")
+            self.git(evil, "add", "f.txt")
+            (evil / "f.txt").write_text("f\n")
+
+        commits = []
+        result = self.run_pipeline(coder, lambda command: commits.append(command) if "commit" in command else None)
+        self.assertEqual(self.marker_lines(), [])
+        self.assertEqual([command for command in commits if str(command[-1]).startswith("makewand: submodule")], [])
+        self.assertTrue(result, self.output)  # evil's commit stays as reviewed; nothing refuses it
+
+    def test_a_submodule_whose_staged_changes_cannot_be_read_refuses_the_delivery(self):
+        nested = self.nested_repository(self.base / "sub")
+        (self.base / ".gitmodules").write_text('[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n')
+        self.git(self.base, "add", "-A")
+        self.git(self.base, "commit", "-qm", "submodule")
+        self.reset_shadow()
+        self.sub_baselines = {"sub": self.git(nested, "rev-parse", "HEAD").strip()}
+        broken = []
+
+        def intercept(command):
+            if command[1:4] == ["diff", "--cached", "--name-only"] and not broken:
+                broken.append(command)  # the submodule's, before the delivery commit's
+                (self.shadow / "sub" / ".git" / "index").write_bytes(b"not an index")
+
+        def coder(shadow):
+            (shadow / "app.txt").write_text("APPROVED\n")
+            (shadow / "sub" / "x.txt").write_text("reviewed\n")
+
+        self.assertFalse(self.run_pipeline(coder, intercept))
+        self.assertTrue(broken)
+        self.assertIn("子模块 sub 暂存结果无法读取", self.output)
+
     def test_shadow_delivery_still_refuses_a_registered_submodule_left_dirty(self):
         # A registered submodule changed after the per-submodule commits: the clean
         # check after the delivery commit (git status, which no longer enters it) and
@@ -812,6 +862,18 @@ class EnvironmentTests(NestedFixture):
             code, _, error = git_helper.run_git_cmd(["git", "apply", "-"], cwd=str(repo), input_data=PATCH.encode())
         self.assertEqual(code, 0, error)
         self.assertEqual((repo / "f.txt").read_text(), "one\ntwo\n")
+
+    def test_an_inherited_git_config_hides_no_filter_driver(self):
+        # git config reads only $GIT_CONFIG, like --file; git apply reads the repository's
+        # configuration all the same. The driver listing must see what apply would run.
+        repo = self.repository(self.root / "repo", {"f.txt": "one\n", ".gitattributes": "*.txt filter=evil\n"})
+        self.plant_filter(repo / ".git" / "config")
+        with patch.dict(os.environ, {"GIT_CONFIG": os.devnull}):
+            code, _, error = git_helper.run_git_cmd(["git", "apply", "-"], cwd=str(repo), input_data=PATCH.encode())
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.marker_lines(), [])
+        self.assertEqual((repo / "f.txt").read_text(), "one\ntwo\n")
+        self.assertNotIn("GIT_CONFIG", git_helper._sanitize_git_env({"GIT_CONFIG": os.devnull}))
 
     def test_filter_drivers_are_listed_inside_the_shield(self):
         # One shield from the driver listing until git apply exits: info/attributes never

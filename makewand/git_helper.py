@@ -173,6 +173,10 @@ _DANGEROUS_GIT_ENVS = {
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_ASKPASS",
+    # git config reads only this file (like --file) and every other git command ignores it:
+    # the filter driver listing for git apply would miss the repository's own drivers, and
+    # makewand's own `git config` writes would land in the caller's file.
+    "GIT_CONFIG",
     # An attribute source of the caller's (git 2.55 also segfaults on a work-tree apply under
     # one), a repository discovery other than the one run_git_cmd reproduces by reading files,
     # and a namespace, like the global options _refuse_redirecting_options refuses.
