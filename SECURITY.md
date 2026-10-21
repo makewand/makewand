@@ -153,11 +153,14 @@ configured `OPENAI_MODEL` and is billed and budgeted as API spend, never as a
 free `codex-cli` call. A client-named OpenAI model (`gpt-*`, `o1*`, `o3*`,
 `o4*`, `codex-mini*`) is served only when it has a price or is the configured
 model, and a scaled reservation covers its price, so a client cannot choose a
-model whose spend the budgets cannot price. Remote session storage is capped per
-account (1,000 sessions and 256 MiB by default) and refuses saves that would
-leave less than 1 GiB free on the sessions disk, which holds the state database
-by default, so one account cannot fill the disk and take the server down for everyone.
-没有 codex CLI 时，Power 模式的 `codex` 路线就是 OpenAI API：调用配置的 `OPENAI_MODEL`，按 API 花费计费并计入预算，不再记为免费的 `codex-cli` 调用。客户端指名的 OpenAI 模型（`gpt-*`、`o1*`、`o3*`、`o4*`、`codex-mini*`）只有在有价目或就是配置的模型时才提供，按比例放大的预留也覆盖它的价格，所以客户端无法选用预算无法计价的模型。远端会话存储按账号限额（默认 1,000 个会话、256 MiB），并拒绝会让会话所在磁盘（默认也存放状态数据库）剩余空间低于 1 GiB 的保存，单个账号无法写满磁盘、拖垮整个服务。
+model whose spend the budgets cannot price. Its upstream errors block or open
+the circuit of that model only, never the shared `openai` route, so a client's
+choice of model cannot take the route down for other clients. Remote session
+storage is capped per account (1,000 sessions and 256 MiB by default) and
+refuses saves that would leave less than 1 GiB free on the sessions disk, which
+holds the state database by default, so one account cannot fill the disk and
+take the server down for everyone.
+没有 codex CLI 时，Power 模式的 `codex` 路线就是 OpenAI API：调用配置的 `OPENAI_MODEL`，按 API 花费计费并计入预算，不再记为免费的 `codex-cli` 调用。客户端指名的 OpenAI 模型（`gpt-*`、`o1*`、`o3*`、`o4*`、`codex-mini*`）只有在有价目或就是配置的模型时才提供，按比例放大的预留也覆盖它的价格，所以客户端无法选用预算无法计价的模型。其上游错误只阻断或熔断该模型自己，不影响共享的 `openai` 路线，所以客户端选用的模型无法让其他客户端的请求失败。远端会话存储按账号限额（默认 1,000 个会话、256 MiB），并拒绝会让会话所在磁盘（默认也存放状态数据库）剩余空间低于 1 GiB 的保存，单个账号无法写满磁盘、拖垮整个服务。
 
 Python candidate application uses fixed POSIX directory handles or native Windows
 handles for replacement and recovery. Native Windows execution requires explicit

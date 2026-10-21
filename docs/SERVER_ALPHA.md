@@ -103,14 +103,25 @@ Power mode's `codex` generator and judge call the configured OpenAI model
 (`OPENAI_MODEL`, default `gpt-4o`) and are billed as API calls at that model's
 price. Clients can name OpenAI models as they would on the OpenAI API:
 `gpt-*`, `o1*`, `o3*`, `o4*` and `codex-mini*` names are sent upstream as named
-and billed at that model's price. A named model must have a price in the
-routing tables (the built-in `costs` or `costs` in `routing.json`) or be
-`OPENAI_MODEL`. Otherwise the request gets a 400, because its spend could not
-be budgeted. `codex` calls `OPENAI_MODEL`, and `openai` names the provider.
-`GET /v1/models` lists `openai` and every OpenAI model a client can name. Names
-the server cannot serve get the same 400 error, streamed or not. With a codex
-CLI installed, these names keep selecting the codex CLI, which runs its own
-model.
+and billed at that model's price, even when `routing.json` sets `models` for
+`openai`. A named model must have a price in the routing tables (the built-in
+`costs` or `costs` in `routing.json`) or be `OPENAI_MODEL`. Otherwise the
+request gets a 400, because its spend could not be budgeted. `codex` calls
+`OPENAI_MODEL`, and `openai` names the provider. Names the server cannot serve
+get the same 400 error, streamed or not. With a codex CLI installed, these
+names keep selecting the codex CLI, which runs its own model.
+
+A named model's upstream errors stay with that model. A 429 (OpenAI rate-limits
+each model separately) or repeated 404s (a model the account or an
+OpenAI-compatible endpoint lacks) block or open the circuit for that model
+only, so requests without a model, for `openai` and for other models are still
+served. Named models are also refused while the `openai` route itself is
+blocked or its circuit is open.
+
+`GET /v1/models` lists `openai` and every OpenAI model a client can name: the
+priced OpenAI-family models, and `OPENAI_MODEL` when it is one. An
+`OPENAI_MODEL` outside these families, such as the model of an
+OpenAI-compatible endpoint, is reached as `openai`.
 
 ### Remote Session Storage Limits
 

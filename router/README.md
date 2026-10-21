@@ -108,14 +108,24 @@ When no `codex` provider is registered but the OpenAI API provider is
 (`"openai"`, a `NewOpenAI` instance), as in an API-key-only deployment such as
 the makewand Docker image, the OpenAI-family names select `"openai"` instead.
 A `gpt-*`, `o1*`, `o3*`, `o4*` or `codex-mini*` name is then sent upstream as
-the model and billed at that model's price; `codex` itself calls the
-configured model. The model must be the provider's configured model or have a
-price in the routing tables (`costs`, which `routing.json` can extend).
-Otherwise the request gets a 400, because its spend could not be budgeted.
-`GET /v1/models` lists these models with `owned_by: "openai"`. Resolution uses
-the server's providers, not a token's allowlist, so such a token needs the
-`openai` provider. A `model` that nothing on the server serves gets the same
-400 `unknown model` error whether or not the request streams.
+the model and billed at that model's price, even when `routing.json` gives
+`openai` a model table; `codex` itself calls the configured model. The model
+must be the provider's configured model or have a price in the routing tables
+(`costs`, which `routing.json` can extend). Otherwise the request gets a 400,
+because its spend could not be budgeted. Resolution uses the server's
+providers, not a token's allowlist, so such a token needs the `openai`
+provider. A `model` that nothing on the server serves gets the same 400
+`unknown model` error whether or not the request streams.
+
+Each named model keeps its own provider health under `openai:<model>`. Its
+upstream errors, such as a 429 or a 404 for a model the account or endpoint
+lacks, open that model's circuit or rate-limit block only, and `openai` keeps
+serving every other request. A named model is still refused while the `openai`
+route itself is blocked or its circuit is open. `GET /v1/models` lists the
+models a client can name with `owned_by: "openai"`: every priced OpenAI-family
+model, and the configured model when it is one. A configured model outside
+these families, such as an OpenAI-compatible endpoint's own, is reached as
+`openai`.
 
 `max_tokens` and `temperature` are accepted but currently ignored for
 compatibility. `response_format` supports `json_object` and a pragmatic

@@ -298,6 +298,13 @@ type Router struct {
 	usage *sessionUsage
 	// Per-provider circuit breaker for transient/outage isolation.
 	breaker *providerCircuitBreaker
+	// healthKeys maps a provider name to the key its calls' outcomes (breaker,
+	// rate-limit seal, success and failure counts) are recorded under, when that
+	// is not the name itself. Only a per-request view whose provider is bound to
+	// a model the client named sets it (withOpenAIModel), so that model's
+	// failures cannot close the provider for every other request. Read-only
+	// once the view is built.
+	healthKeys map[string]string
 
 	// Usage mode (guarded by modeMu)
 	modeMu  sync.RWMutex
@@ -702,6 +709,7 @@ func (r *Router) cloneView() *Router {
 		accessTypes:        accessTypes,
 		usage:              r.usage,
 		breaker:            r.breaker,
+		healthKeys:         r.healthKeys,
 		quota:              r.quota,
 		quotaPolicy:        r.quotaPolicy,
 		executionAPIPolicy: r.executionAPIPolicy,

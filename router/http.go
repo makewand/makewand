@@ -248,8 +248,8 @@ type HTTPHandlerOptions struct {
 //   - Optional provider override via the model field (provider name from /v1/models)
 //   - Provider routing via the Router's strategy tables
 //   - GET /v1/models lists available providers and, when the OpenAI API serves
-//     OpenAI-family names (no "codex" provider registered), the priced OpenAI
-//     models a client can name
+//     OpenAI-family names (no "codex" provider registered), the OpenAI models a
+//     client can name
 //   - Optional Bearer token / scoped-token authentication (HTTPHandlerOptions).
 //     Without BearerToken or Authorizer every endpoint is UNAUTHENTICATED.
 //

@@ -107,12 +107,14 @@ func (r *Router) openAIAliasProvider() (*OpenAI, bool) {
 }
 
 // openAIAliasModels lists the OpenAI models a client can name when openai
-// serves OpenAI-family names: its configured model and every OpenAI-family
-// model the server has a price for.
+// serves OpenAI-family names: each priced model, and the configured one, that a
+// request naming it sends upstream as named. A configured model outside those
+// families, such as an OpenAI-compatible endpoint's own, is not listed; clients
+// reach it as "openai".
 func (r *Router) openAIAliasModels(openai *OpenAI) []string {
-	models := []string{openai.model}
-	for _, model := range r.routingTables().pricedModels() {
-		if isOpenAIModelName(model) && model != openai.model {
+	var models []string
+	for _, model := range append(r.routingTables().pricedModels(), openai.model) {
+		if _, upstream := r.resolveHTTPModel(model); upstream == model && !slices.Contains(models, model) {
 			models = append(models, model)
 		}
 	}
@@ -123,8 +125,12 @@ func (r *Router) openAIAliasModels(openai *OpenAI) []string {
 // withOpenAIModel returns a per-request view of r whose "openai" provider calls
 // model, so the upstream call, the route's model and every price derived from
 // it (usage, stream estimate, spend guard, reservation ceiling) name the model
-// the client asked for. The view shares r's breakers, stats and concurrency
-// permits, and r itself is never modified. A model other than the configured
+// the client asked for, whatever model a routing.json table assigns "openai".
+// The view shares r's concurrency permits, and r itself is never modified. Its
+// calls honor the openai route's open circuit and rate-limit block but record
+// their own outcomes under "openai:<model>": a model the client chose (one
+// OpenAI rate-limits on its own, or one the account or endpoint lacks) must not
+// close the route for every other request. A model other than the configured
 // one must have a price: the spend of a model the server cannot price could
 // not be budgeted.
 func (r *Router) withOpenAIModel(model string) (*Router, error) {
@@ -133,10 +139,7 @@ func (r *Router) withOpenAIModel(model string) (*Router, error) {
 	if !ok {
 		return nil, unknownHTTPModelError(model)
 	}
-	if model == base.model {
-		return r, nil
-	}
-	if _, priced := r.routingTables().costFor(model); !priced {
+	if _, priced := r.routingTables().costFor(model); !priced && model != base.model {
 		return nil, &httpStatusError{
 			Status:  http.StatusBadRequest,
 			Code:    "invalid_request",
@@ -147,6 +150,7 @@ func (r *Router) withOpenAIModel(model string) (*Router, error) {
 		apiKey:       base.apiKey,
 		baseURL:      base.baseURL,
 		model:        model,
+		pinModel:     true,
 		chatClient:   base.chatClient,
 		streamClient: base.streamClient,
 	}
@@ -154,6 +158,7 @@ func (r *Router) withOpenAIModel(model string) (*Router, error) {
 	if err := view.RegisterProvider("openai", bound, view.getAccessType("openai")); err != nil {
 		return nil, err
 	}
+	view.healthKeys = map[string]string{"openai": "openai:" + model}
 	return view, nil
 }
 

@@ -12,9 +12,13 @@ const openaiDefaultModel = "gpt-4o"
 
 // OpenAI implements the Provider interface for OpenAI's API.
 type OpenAI struct {
-	apiKey       string
-	baseURL      string
-	model        string
+	apiKey  string
+	baseURL string
+	model   string
+	// pinModel makes every call use model, whatever model routing requests: the
+	// instance serves a model a client named (Router.withOpenAIModel), which a
+	// routing.json model table for "openai" must not replace.
+	pinModel     bool
 	chatClient   *http.Client
 	streamClient *http.Client
 	instanceCostTable
@@ -68,7 +72,7 @@ func (o *OpenAI) ReportedModelID(requestedModelID string) string {
 // route is served by this API because no codex CLI is installed. Such a request
 // uses the configured model, as a call routing names no model for does.
 func (o *OpenAI) callModel(requested string) string {
-	if requested != "" && !strings.HasSuffix(requested, "-cli") {
+	if requested != "" && !o.pinModel && !strings.HasSuffix(requested, "-cli") {
 		return requested
 	}
 	return o.model
