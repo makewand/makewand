@@ -210,7 +210,7 @@ func TestQuotaUnknownLegacyAndSymlinkIsolation(t *testing.T) {
 		t.Fatal("unbound session authorized current login")
 	}
 	cache := filepath.Join(t.TempDir(), "snapshot.json")
-	storeQuotaCache(cache, map[string]ProviderQuota{"codex": {Provider: "codex", HasData: true, SourceAt: time.Now(), WeeklyPct: fptr(1)}}, time.Now())
+	storeQuotaCache(cache, map[string]ProviderQuota{"codex": {Provider: "codex", HasData: true, SourceAt: time.Now(), WeeklyPct: fptr(1)}}, nil, time.Now())
 	s.WithDiskCache(cache, time.Hour).LoadCache()
 	q, _ = s.Snapshot().Get("codex")
 	if q.HasData {
@@ -229,7 +229,7 @@ func TestQuotaStaleCacheAndWindowExpiry(t *testing.T) {
 		{PoolRef: q.PoolRef, WindowMinutes: 43200, UsedPercent: 98, SourceAt: time.Now().Add(-time.Hour)},
 	}
 	cache := filepath.Join(t.TempDir(), "snapshot.json")
-	storeQuotaCache(cache, map[string]ProviderQuota{"codex": q}, time.Now())
+	storeQuotaCache(cache, map[string]ProviderQuota{"codex": q}, nil, time.Now())
 	s := NewQuotaSnapshotter(time.Hour, NewCodexQuotaSource(filepath.Join(root, "sessions"))).WithDiskCache(cache, time.Hour)
 	s.LoadCache()
 	got, _ := s.Snapshot().Get("codex")
@@ -237,7 +237,7 @@ func TestQuotaStaleCacheAndWindowExpiry(t *testing.T) {
 		t.Fatalf("expired windows survived: %+v", got)
 	}
 	q.SourceAt = time.Now().Add(-time.Hour)
-	storeQuotaCache(cache, map[string]ProviderQuota{"codex": q}, time.Now()) // newer timestamps must not be replaced
+	storeQuotaCache(cache, map[string]ProviderQuota{"codex": q}, nil, time.Now()) // newer timestamps must not be replaced
 	raw, _ := os.ReadFile(cache)
 	if !strings.Contains(string(raw), q.AccountRef) {
 		t.Fatal("account not persisted")
@@ -265,7 +265,7 @@ func TestQuotaCacheConcurrentAccounts(t *testing.T) {
 		go func(id string) {
 			defer wg.Done()
 			q := ProviderQuota{Provider: "codex", AccountRef: quotaAccountRef("codex", id), IdentityKnown: true, SourceAt: time.Now(), HasData: true}
-			storeQuotaCache(cache, map[string]ProviderQuota{"codex": q}, time.Now())
+			storeQuotaCache(cache, map[string]ProviderQuota{"codex": q}, nil, time.Now())
 		}(id)
 	}
 	wg.Wait()

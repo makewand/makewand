@@ -62,7 +62,7 @@ func TestCustomCLIRefusalSealsWithGenericPatterns_R4(t *testing.T) {
 		"[ERROR] usage limit reached\nexiting\n",
 		"\x1b[31m✖ Quota exceeded\x1b[0m\r\n",
 	} {
-		if err := formatCLIExecutionError("private", stderr, errR4Exit, nil, time.Second); !r4Sealed(err) {
+		if err := formatCLIExecutionError("private", "", stderr, errR4Exit, nil, time.Second); !r4Sealed(err) {
 			t.Errorf("custom CLI refusal %q classified as %v", stderr, err)
 		}
 		if !looksLikeQuotaExhaustion("private", stderr) {
@@ -83,7 +83,7 @@ func TestCustomCLIRefusalSealsWithGenericPatterns_R4(t *testing.T) {
 		"Added a rate limit to the login endpoint; resets at midnight",
 		"stream closed unexpectedly: Transport error (1007)",
 	} {
-		if err := formatCLIExecutionError("private", stderr, errR4Exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
+		if err := formatCLIExecutionError("private", "", stderr, errR4Exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
 			t.Errorf("custom CLI task content %q sealed the pool: %v", stderr, err)
 		}
 	}
@@ -115,7 +115,7 @@ func TestGeminiCLIRefusalsSealTheLegacyTransport_R4(t *testing.T) {
 	}
 	for _, stderr := range refusals {
 		// formatCLIExecutionError with the router name reads Gemini CLI's entry.
-		if err := formatCLIExecutionError("gemini", stderr, errR4Exit, nil, time.Second); !r4Sealed(err) {
+		if err := formatCLIExecutionError("gemini", "", stderr, errR4Exit, nil, time.Second); !r4Sealed(err) {
 			t.Errorf("gemini %q classified as %v", stderr, err)
 		}
 		script := testfixture.WriteCLI(t, "gemini", testfixture.Spec{Mode: "output", Stderr: stderr, ExitCode: 1})
@@ -138,7 +138,7 @@ func TestGeminiCLIRefusalsSealTheLegacyTransport_R4(t *testing.T) {
 		"{\n  \"error\": {\n    \"type\": \"FatalToolExecutionError\",\n    \"message\": \"429 passed\",\n    \"code\": 1\n  }\n}\n",
 		"The report looked like this:\n  {\n    \"code\": 429\n  }\n",
 	} {
-		if err := formatCLIExecutionError("gemini", stderr, errR4Exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
+		if err := formatCLIExecutionError("gemini", "", stderr, errR4Exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
 			t.Errorf("gemini task content %q sealed the pool: %v", stderr, err)
 		}
 	}

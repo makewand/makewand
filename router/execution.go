@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,12 @@ import (
 
 var errExecutionAccounting = errors.New("execution accounting failed")
 var errExecutionAdmission = errors.New("execution admission interrupted")
+
+// errLoginSwitch marks the refusal to launch a subscription CLI whose selected
+// login is no longer the one admitted for the call (bindLeasedCredentials,
+// credentialBinding.verify): a safety refusal, which is no provider failure
+// and which ends a Power request (requestRefusal).
+var errLoginSwitch = errors.New("refusing account switch")
 
 type providerAttemptKey struct{}
 type providerLifecycleKey struct{}
@@ -60,6 +67,9 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 	if inherited := takeProviderAttempt(ctx); inherited != nil {
 		return context.WithValue(ctx, providerLifecycleKey{}, inherited), inherited, nil
 	}
+	// A subscription login is bound once its account lease is held
+	// (bindLeasedCredentials); login is its account reference at admission.
+	subscription, login := false, ""
 	switch provider.(type) {
 	case *OpenAI, *Claude, *Gemini:
 		// API credentials do not identify the subscription login. Tag the
@@ -69,10 +79,7 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 		cfg.AccountRef = &account
 		ctx = execution.ContextWithConfig(ctx, cfg)
 	default:
-		ctx, err = bindCredentialAdmission(ctx, provider.Name())
-		if err != nil {
-			return ctx, nil, fmt.Errorf("%w: %w", errExecutionAccounting, err)
-		}
+		subscription = true
 		if provider.Name() == "codex" || provider.Name() == "claude" {
 			identity := readQuotaIdentity(provider.Name(), selectedQuotaRoot(provider.Name()))
 			if cfg.AccountRef != nil && identity.IdentityKnown && *cfg.AccountRef != identity.AccountRef {
@@ -82,9 +89,7 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 				cfg.AccountRef = &identity.AccountRef
 				ctx = execution.ContextWithConfig(ctx, cfg)
 			}
-		}
-		if err := verifyCredentialBinding(ctx, provider.Name()); err != nil {
-			return ctx, nil, err
+			login = identity.AccountRef
 		}
 	}
 	modelID, _ := ModelFromContext(ctx)
@@ -113,6 +118,16 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 			return ctx, nil, errors.Join(admissionErr, fmt.Errorf("%w: %w", errExecutionAccounting, releaseErr))
 		}
 		return ctx, nil, admissionErr
+	}
+	if subscription {
+		bound, err := bindLeasedCredentials(ctx, provider.Name(), login)
+		if err != nil {
+			if releaseErr := attempt.ReleaseUnstarted(); releaseErr != nil {
+				err = errors.Join(err, fmt.Errorf("%w: %w", errExecutionAccounting, releaseErr))
+			}
+			return ctx, nil, err
+		}
+		ctx = bound
 	}
 	// CLI account validation/copy happens before its launch boundary.
 	_, cli := provider.(*CLIProvider)
@@ -150,6 +165,8 @@ func providerOutcome(err error, usage Usage) execution.Outcome {
 			}
 			// An ordinary CLI exit only proves the local process stopped. It
 			// does not prove whether the upstream model finished the request.
+			// The CLI's own refusal of the invocation is no ordinary exit: it
+			// has its own kind (cliInvocationRefusal) and stays known.
 			if errors.As(err, &providerErr) && providerErr.Op == "CLI" && providerErr.Kind == ErrorKindProvider {
 				outcome.Status, outcome.Known = execution.Unknown, false
 			}
@@ -192,7 +209,84 @@ func completeProvider(attempt *execution.Attempt, usage Usage, callErr error) er
 }
 
 func stopExecutionReplay(err error) bool {
-	return errors.Is(err, execution.ErrUnknownOutcome) || errors.Is(err, errExecutionAccounting) || errors.Is(err, execution.ErrBudgetExhausted)
+	return replayStoppingUnknown(err) || errors.Is(err, errExecutionAccounting) || errors.Is(err, execution.ErrBudgetExhausted)
+}
+
+// requestRefusal reports whether err refused a call in a way that ends the
+// request, whatever its other calls produced: accounting failed, the call
+// budget is exhausted, or the selected login switched accounts after
+// admission (errLoginSwitch).
+func requestRefusal(err error) bool {
+	return errors.Is(err, errExecutionAccounting) || errors.Is(err, execution.ErrBudgetExhausted) || errors.Is(err, errLoginSwitch)
+}
+
+// onlyUnknownOutcome reports whether err stops replay only because a call's
+// outcome is unknown, not because a call was refused (requestRefusal).
+func onlyUnknownOutcome(err error) bool {
+	return errors.Is(err, execution.ErrUnknownOutcome) && !requestRefusal(err)
+}
+
+// readOnlyUnknownError is the unknown outcome of a CLI exit in a read-only run
+// (readOnlyExitError). It is UNKNOWN to accounting and to callers, but it does
+// not stop fallback: the run could not write the workspace, so no edit of the
+// next provider can stack on one of it.
+type readOnlyUnknownError struct{ err error }
+
+func (e *readOnlyUnknownError) Error() string {
+	return "model call outcome unknown (read-only run): " + e.err.Error()
+}
+func (e *readOnlyUnknownError) Unwrap() error        { return e.err }
+func (e *readOnlyUnknownError) Is(target error) bool { return target == execution.ErrUnknownOutcome }
+
+// cliRunReadOnly reports whether a CLI run in ctx could not have written the
+// workspace: a review, which the sandbox runs on a read-only mount of it, or a
+// remote-origin request without a WorkDir of its own, which runs in a scratch
+// directory removed afterwards (and always in the sandbox). A run outside the
+// sandbox (sandboxed false: MAKEWAND_UNSAFE_HOST_EXEC) has no such mount, and
+// a remote-origin request with a WorkDir has it mounted writable.
+func cliRunReadOnly(ctx context.Context, sandboxed bool) bool {
+	if task, ok := TaskFromContext(ctx); ok && task == TaskReview {
+		return sandboxed
+	}
+	_, workDir := WorkDirFromContext(ctx)
+	return sandboxed && RemoteOriginFromContext(ctx) && !workDir
+}
+
+// readOnlyExitError marks err, the error of a finished read-only CLI run
+// (cliRunReadOnly), as such a run's unknown outcome when its exit says nothing
+// the catalog recognizes: an ordinary exit (ErrorKindProvider) or one that
+// looks transient (ErrorKindNetwork). A refusal, a quota limit, a timeout and
+// a run without a complete exit result are left as they are.
+func readOnlyExitError(err error) error {
+	var providerErr *ProviderError
+	if err == nil || errors.Is(err, execution.ErrUnknownOutcome) ||
+		!errors.As(err, &providerErr) || providerErr.Op != "CLI" ||
+		(providerErr.Kind != ErrorKindProvider && providerErr.Kind != ErrorKindNetwork) {
+		return err
+	}
+	return &readOnlyUnknownError{err: err}
+}
+
+// replayStoppingUnknown reports whether err carries an unknown outcome that
+// stops automatic replay: errors.Is(err, execution.ErrUnknownOutcome) without
+// what a readOnlyUnknownError wraps.
+func replayStoppingUnknown(err error) bool {
+	for err != nil {
+		switch e := err.(type) {
+		case *readOnlyUnknownError:
+			return false
+		case interface{ Unwrap() []error }:
+			return slices.ContainsFunc(e.Unwrap(), replayStoppingUnknown)
+		}
+		if err == execution.ErrUnknownOutcome {
+			return true
+		}
+		if is, ok := err.(interface{ Is(error) bool }); ok && is.Is(execution.ErrUnknownOutcome) {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 // ChatProvider applies the same atomic admission used by Router to direct

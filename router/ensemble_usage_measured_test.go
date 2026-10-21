@@ -77,26 +77,34 @@ func TestChatBestPowerFailedPlusSuccessfulUsageMeasuredSemantics(t *testing.T) {
 	}
 }
 
-func TestChatBestPowerTerminalErrorKeepsUsageAndMeasuredSemantics(t *testing.T) {
+// A generator ending UNKNOWN keeps its spend in the usage, whether ChatBest
+// returns another generator's answer or, with no usable answer, the unknown
+// outcome itself.
+func TestChatBestPowerUnknownGeneratorKeepsUsageAndMeasuredSemantics(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		okUsage      Usage
+		okContent    string
 		wantMeasured bool
 	}{
-		{"all measured", measuredUsage(2, 20, 2), true},
-		{"one estimated", Usage{Cost: 2, InputTokens: 20, OutputTokens: 2}, false},
+		{"all measured", measuredUsage(2, 20, 2), "usable", true},
+		{"one estimated", Usage{Cost: 2, InputTokens: 20, OutputTokens: 2}, "usable", false},
+		{"no usable answer", measuredUsage(2, 20, 2), "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			failed := &spendThenFailProvider{
 				ensembleCaptureProvider: ensembleCaptureProvider{name: "gemini", available: true, usage: measuredUsage(1, 10, 1)},
 				err:                     &execution.UnknownOutcomeError{Err: errors.New("stream cut")},
 			}
-			ok := &ensembleCaptureProvider{name: "claude", available: true, content: "usable", usage: tc.okUsage}
+			ok := &ensembleCaptureProvider{name: "claude", available: true, content: tc.okContent, usage: tc.okUsage}
 			judge := &ensembleCaptureProvider{name: "codex", available: false}
 			r := powerReviewRouter(failed, ok, judge)
 
-			_, total, _, err := r.ChatBest(context.Background(), PhaseReview, []Message{{Role: "user", Content: "review"}}, "")
-			if !errors.Is(err, execution.ErrUnknownOutcome) {
+			out, total, _, err := r.ChatBest(context.Background(), PhaseReview, []Message{{Role: "user", Content: "review"}}, "")
+			if tc.okContent != "" && (err != nil || out != tc.okContent) {
+				t.Fatalf("out=%q err=%v, want the surviving answer", out, err)
+			}
+			if tc.okContent == "" && !errors.Is(err, execution.ErrUnknownOutcome) {
 				t.Fatalf("err = %v, want unknown outcome", err)
 			}
 			if total.Cost != 3 || total.InputTokens != 30 || total.OutputTokens != 3 {

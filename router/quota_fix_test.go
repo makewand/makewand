@@ -27,14 +27,14 @@ func TestCLIQuotaErrorClassifiedAsRateLimit(t *testing.T) {
 		{"gemini", "Error: You have exhausted your quota on this model."},
 	}
 	for _, tc := range quotaMsgs {
-		err := formatCLIExecutionError(tc.cli, tc.msg, errors.New("exit status 1"), nil, time.Second)
+		err := formatCLIExecutionError(tc.cli, "", tc.msg, errors.New("exit status 1"), nil, time.Second)
 		if got := ErrorKindOf(err); got != ErrorKindRateLimit {
 			t.Errorf("%s quota stderr %q → kind %q, want rate_limit", tc.cli, tc.msg, got)
 		}
 	}
 	// A generic failure must NOT be misclassified as a quota error.
 	for _, msg := range []string{"panic: nil pointer", "file not found", "connection refused"} {
-		err := formatCLIExecutionError("claude", msg, errors.New("exit status 1"), nil, time.Second)
+		err := formatCLIExecutionError("claude", "", msg, errors.New("exit status 1"), nil, time.Second)
 		if got := ErrorKindOf(err); got == ErrorKindRateLimit {
 			t.Errorf("non-quota stderr %q wrongly classified as rate_limit", msg)
 		}
@@ -53,7 +53,7 @@ func TestCLIQuotaErrorSealsPoolEndToEnd(t *testing.T) {
 	r := newTestRouterWithQuota(snap)
 
 	// Simulate the failure path with a realistic CLI quota error.
-	cliErr := formatCLIExecutionError("claude", "Claude usage limit reached", errors.New("exit status 1"), nil, time.Second)
+	cliErr := formatCLIExecutionError("claude", "", "Claude usage limit reached", errors.New("exit status 1"), nil, time.Second)
 	r.recordProviderFailureForErr("claude", cliErr)
 
 	// beforeProviderAttempt returns allow=false when the pool is sealed.

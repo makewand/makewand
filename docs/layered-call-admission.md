@@ -154,9 +154,19 @@ all old processes are stopped before clearing uncertain leases; do not clear the
 merely because a heartbeat expired. Independently detached descendants that evade
 the tracked process group need stronger OS supervision for reliable recovery.
 
-Claude admission hashes `.credentials.json` but projects only
-`oauthAccount.accountUuid` (hashed reference plus existence) from `.claude.json`.
-Normal startup/project/cost state writes do not change that binding, even when
-account identity is unknown. Actual account/credential changes before transport
-invocation refuse launch and release call capacity; an invoked transport is never
-refunded. Direct-mode post-run account switches still produce UNKNOWN.
+Go binds the selected login once the attempt holds its account lease, after any
+lease wait, so tokens a lease holder refreshed meanwhile are the ones bound, and
+compares it with the login admitted before the wait by account (codex
+`tokens.account_id`, Claude `oauthAccount.accountUuid`). From then on a token
+file that names its account, codex `auth.json` with `tokens.account_id`, may be
+refreshed by that account; any other token file is bound by its hash: Claude
+keeps its tokens in `.credentials.json` apart from the account in `.claude.json`,
+so a change of them cannot be proven the same account's, and neither can one of
+an `auth.json` without an account. From `.claude.json` only the account (hashed
+reference plus existence) is projected, so normal startup/project/cost state
+writes do not change the binding. The sandbox copies the login into its private
+home one file at a time and then reads it again before launch. A switch to
+another account during the lease wait or before transport invocation refuses
+launch and releases call capacity; the refusal is no provider failure, and it
+ends a Power request. An invoked transport is never refunded. Direct-mode
+post-run account switches still produce UNKNOWN.

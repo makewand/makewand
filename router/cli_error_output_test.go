@@ -86,7 +86,7 @@ func TestClaudeCLIExecutionErrorOutputClassification(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p := NewClaudeCLI("unused")
-			err := p.formatExecutionError(tt.stdout, tt.stderr, "", tt.runErr, tt.ctxErr, time.Second)
+			err := p.formatExecutionError(false, tt.stdout, tt.stderr, "", tt.runErr, tt.ctxErr, time.Second)
 			var perr *ProviderError
 			if !errors.As(err, &perr) || perr.Kind != tt.kind || perr.Message != tt.message || perr.StatusCode != tt.statusCode {
 				t.Fatalf("error = %#v, want kind=%s message=%q status=%d", err, tt.kind, tt.message, tt.statusCode)
@@ -97,11 +97,11 @@ func TestClaudeCLIExecutionErrorOutputClassification(t *testing.T) {
 		})
 	}
 	p := NewClaudeCLI("unused")
-	if err := p.formatExecutionError(quota, "", "", exec.ErrWaitDelay, nil, time.Second); !errors.Is(err, execution.ErrUnknownOutcome) {
+	if err := p.formatExecutionError(false, quota, "", "", exec.ErrWaitDelay, nil, time.Second); !errors.Is(err, execution.ErrUnknownOutcome) {
 		t.Fatalf("incomplete process output lost UNKNOWN priority: %v", err)
 	}
 	custom := NewCommandCLI("claude", "unused", nil, PromptModeArg)
-	if err := custom.formatExecutionError(quota, "", "", errors.New("exit status 1"), nil, time.Second); ErrorKindOf(err) != ErrorKindProvider || strings.Contains(err.Error(), "monthly spend limit") {
+	if err := custom.formatExecutionError(false, quota, "", "", errors.New("exit status 1"), nil, time.Second); ErrorKindOf(err) != ErrorKindProvider || strings.Contains(err.Error(), "monthly spend limit") {
 		t.Fatalf("custom provider interpreted a Claude-specific failure envelope: %v", err)
 	}
 }

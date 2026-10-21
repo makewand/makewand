@@ -209,12 +209,12 @@ func TestCodexTranscriptContentNeverSeals_QuotaHints(t *testing.T) {
 		if looksLikeQuotaExhaustion("codex", text) {
 			t.Errorf("codex transcript content read as codex's refusal: %q", text)
 		}
-		if err := formatCLIExecutionError("codex", text, exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
+		if err := formatCLIExecutionError("codex", "", text, exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
 			t.Errorf("codex transcript content sealed the pool: %v", err)
 		}
 	}
 	own := "[2026-10-12T08:00:00] codex\nWorking on it.\n[2026-10-12T08:00:05] ERROR: You’ve hit your usage limit. Try again at 8:00 PM."
-	if err := formatCLIExecutionError("codex", own, exit, nil, time.Second); ErrorKindOf(err) != ErrorKindRateLimit {
+	if err := formatCLIExecutionError("codex", "", own, exit, nil, time.Second); ErrorKindOf(err) != ErrorKindRateLimit {
 		t.Errorf("codex's own usage-limit event did not seal: %v", err)
 	}
 }
@@ -224,7 +224,7 @@ func TestCodexTranscriptContentNeverSeals_QuotaHints(t *testing.T) {
 func TestFormatCLIExecutionErrorSealsOnlyOnCLIRefusals_QuotaHints(t *testing.T) {
 	exit := errors.New("exit status 1")
 	for _, tc := range cliQuotaRefusals {
-		err := formatCLIExecutionError(tc.cli, tc.text, exit, nil, time.Second)
+		err := formatCLIExecutionError(tc.cli, "", tc.text, exit, nil, time.Second)
 		var perr *ProviderError
 		if !errors.As(err, &perr) || perr.Kind != ErrorKindRateLimit || perr.StatusCode != 429 || !perr.Retryable || perr.Provider != tc.cli {
 			t.Errorf("%s refusal %q classified as %v", tc.cli, tc.text, err)
@@ -232,7 +232,7 @@ func TestFormatCLIExecutionErrorSealsOnlyOnCLIRefusals_QuotaHints(t *testing.T) 
 	}
 	for _, text := range cliQuotaNoise {
 		for _, cli := range cliQuotaProviders {
-			if err := formatCLIExecutionError(cli, text, exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
+			if err := formatCLIExecutionError(cli, "", text, exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
 				t.Errorf("%s stderr noise %q sealed the pool: %v", cli, text, err)
 			}
 		}
@@ -240,14 +240,14 @@ func TestFormatCLIExecutionErrorSealsOnlyOnCLIRefusals_QuotaHints(t *testing.T) 
 	// A CLI the catalog does not know (a custom command) is read with the
 	// generic patterns, in the report it ends with only
 	// (TestCustomCLIRefusalSealsWithGenericPatterns_R4).
-	if err := formatCLIExecutionError("aider", "You've hit your limit · resets 8pm", exit, nil, time.Second); ErrorKindOf(err) != ErrorKindRateLimit {
+	if err := formatCLIExecutionError("aider", "", "You've hit your limit · resets 8pm", exit, nil, time.Second); ErrorKindOf(err) != ErrorKindRateLimit {
 		t.Errorf("an unknown CLI's refusal did not seal its pool: %v", err)
 	}
-	if err := formatCLIExecutionError("aider", "You've hit your limit · resets 8pm\nretrying\nError: build failed", exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
+	if err := formatCLIExecutionError("aider", "", "You've hit your limit · resets 8pm\nretrying\nError: build failed", exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
 		t.Errorf("an unknown CLI sealed on a line before its error report: %v", err)
 	}
 	// stderr is read as the CLI wrote it: an indented line is content.
-	if err := formatCLIExecutionError("claude", "    Rate limit exceeded", exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
+	if err := formatCLIExecutionError("claude", "", "    Rate limit exceeded", exit, nil, time.Second); ErrorKindOf(err) == ErrorKindRateLimit {
 		t.Errorf("an indented line sealed the pool: %v", err)
 	}
 }

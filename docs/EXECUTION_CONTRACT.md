@@ -26,7 +26,32 @@ tests exercise the same fixtures and share a real ledger across processes.
 baseline, artifact, test, review and apply checks in
 [VERIFICATION_CONTRACT.md](VERIFICATION_CONTRACT.md). `outcome_known` distinguishes
 a timeout before invocation from loss of a result after invocation. An unknown
-remote result must not trigger automatic provider fallback or replay.
+remote result must not trigger automatic provider fallback or replay, with one
+exception in the Go router: a read-only CLI run cannot have written the
+workspace, so an exit the message catalog does not recognize stays `UNKNOWN` in
+accounting while the router may try the next provider. Read-only runs are a
+review in the bubblewrap sandbox, which mounts the workspace read-only, and a
+remote-origin `serve` request without a WorkDir of its own, which runs in a
+scratch directory removed afterwards. A review run on the host
+(`MAKEWAND_UNSAFE_HOST_EXEC`) and a remote-origin request with a WorkDir have a
+writable workspace and are not read-only. A provider CLI's own refusal of the
+invocation, recognized by the shared message catalog
+(`makewand/cli_message_catalog.json`: a login refusal, or agy rejecting its
+arguments), is a known `FAILED` result and falls back like any other known
+failure. In a run that could have written the workspace, a refusal counts only
+when it is all the run shows: no answer on stdout, and nothing before the
+refusal on stderr but the CLI's own notices (agy's `notices` and
+`generic_notice` in the catalog). A login lost after the model started working
+reads the same, and a glog diagnostic (agy logs its tool and model calls as glog
+entries) or a status line before the refusal may show work, so such an exit
+stays `UNKNOWN` and stops replay. The raw comparison arm (`cmd/versus`) records
+its runs by the same rule. In Power mode an `UNKNOWN` generator or judge is
+never replayed, but it does not discard the answers the other generators
+produced: the surviving or first answer is returned, and the unknown attempt
+stays in the trace and the usage. A generator refused by accounting or the call
+budget still ends the request, and so does a generator or judge whose selected
+login switched to another account after admission: a safety refusal, not a
+provider failure.
 
 Provider-result `duration_ms` measures provider execution. Accounting and
 telemetry use bounded independent cleanup so cancellation cannot erase an

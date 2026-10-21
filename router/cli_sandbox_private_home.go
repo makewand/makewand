@@ -212,6 +212,11 @@ var cliPrivateHomeFinished atomic.Pointer[func(dir string)]
 // write-back after a sandbox exited, before cleanup.
 var cliPrivateHomeWarnings atomic.Pointer[func(dir string, warnings []string)]
 
+// cliPrivateHomeCopied is a test hook called once the credentials of a launch
+// have been copied into its private home, before the selected login is read
+// again for that launch.
+var cliPrivateHomeCopied atomic.Pointer[func()]
+
 type cliPrivateCred struct {
 	hostPath  string // canonical host path written back to
 	privPath  string

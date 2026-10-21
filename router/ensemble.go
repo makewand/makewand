@@ -32,14 +32,23 @@ func (r *Router) Ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 // EnsembleWithError preserves terminal admission and unknown-outcome errors
 // instead of allowing ChatBest to replay failed generators through fallback.
 func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) ([]EnsembleResult, error) {
+	results, _, err := r.ensemble(ctx, phase, messages, system, exclude...)
+	return results, err
+}
+
+// ensemble is EnsembleWithError. Its terminal error prefers an unknown
+// outcome, and shows every login switch too (ensembleTerminal); refused tells
+// whether a generator was refused in a way that ends the request
+// (requestRefusal), which an unknown outcome reported instead does not show.
+func (r *Router) ensemble(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) ([]EnsembleResult, bool, error) {
 	var err error
 	ctx, err = r.executionContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	pe, ok := r.routingTables().powerEnsembleFor(phase)
 	if !ok {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	excluded := make(map[string]bool, len(exclude))
@@ -92,7 +101,7 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 			Phase:  buildPhaseName(phase),
 			Detail: "no available generator provider",
 		})
-		return nil, nil
+		return nil, false, nil
 	}
 	r.emitTrace(TraceEvent{
 		Event:  "ensemble_start",
@@ -102,8 +111,7 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 
 	maxTokens := maxTokensForPhase(phase)
 	results := make([]EnsembleResult, len(slots))
-	var terminalMu sync.Mutex
-	var terminalErr error
+	terminal := make([]error, len(slots)) // a slot's ensembleTerminal error
 	var wg sync.WaitGroup
 	for i, s := range slots {
 		wg.Add(1)
@@ -136,12 +144,8 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 				provider: sl.p,
 			})
 			if res.err != nil || res.skipped {
-				if stopExecutionReplay(res.err) {
-					terminalMu.Lock()
-					if terminalErr == nil || errors.Is(res.err, execution.ErrUnknownOutcome) {
-						terminalErr = res.err
-					}
-					terminalMu.Unlock()
+				if ensembleTerminal(res.err) {
+					terminal[idx] = res.err
 				}
 				modelID := res.route.ModelID
 				if modelID == "" {
@@ -176,7 +180,37 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 		Phase:  buildPhaseName(phase),
 		Detail: fmt.Sprintf("success=%d/%d usable=%d", len(out), len(slots), usable),
 	})
-	return out, terminalErr
+	var terminalErr error
+	var switches []error
+	refused := false
+	for _, err := range terminal {
+		if err == nil {
+			continue
+		}
+		refused = refused || !onlyUnknownOutcome(err)
+		if errors.Is(err, errLoginSwitch) {
+			switches = append(switches, err)
+		} else if terminalErr == nil || errors.Is(err, execution.ErrUnknownOutcome) && !errors.Is(terminalErr, execution.ErrUnknownOutcome) {
+			terminalErr = err
+		}
+	}
+	// A login switch carries no execution status of its own: joined to the
+	// error, it never hides that error's status.
+	for _, err := range switches {
+		if terminalErr == nil {
+			terminalErr = err
+		} else {
+			terminalErr = errors.Join(terminalErr, err)
+		}
+	}
+	return out, refused, terminalErr
+}
+
+// ensembleTerminal reports whether err, a generator's or the judge's, must
+// reach the caller instead of only dropping that call: its outcome must not be
+// replayed (stopExecutionReplay), or its selected login switched accounts.
+func ensembleTerminal(err error) bool {
+	return stopExecutionReplay(err) || errors.Is(err, errLoginSwitch)
 }
 
 // judgeSelect asks the designated judge provider to pick the best result from an ensemble.
@@ -268,7 +302,7 @@ func (r *Router) judgeSelectForRequestWithError(ctx context.Context, phase Build
 	if judgeResult.err != nil || judgeResult.skipped {
 		winner := selectedWithoutJudgeUsage(results[0])
 		winner.Usage = judgeResult.usage
-		if stopExecutionReplay(judgeResult.err) {
+		if ensembleTerminal(judgeResult.err) {
 			return winner, judgeResult.err
 		}
 		return winner, nil
@@ -450,19 +484,32 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 		Detail: "mode=power",
 	})
 
-	attempts, ensembleErr := r.EnsembleWithError(ctx, phase, messages, system, exclude...)
-	if ensembleErr != nil {
+	attempts, refused, ensembleErr := r.ensemble(ctx, phase, messages, system, exclude...)
+	results := make([]EnsembleResult, 0, len(attempts))
+	for _, result := range attempts {
+		if strings.TrimSpace(result.Content) != "" {
+			results = append(results, result)
+		}
+	}
+	// A generator whose outcome is unknown is never replayed, but it does not
+	// discard the answers the others gave either: its attempt stays in the
+	// trace (ensemble_generator_error) and in the usage below. A generator
+	// refused by accounting or the call budget, or because its login switched
+	// to another account, still ends the request (requestRefusal).
+	if ensembleErr != nil && (len(results) == 0 || refused || !onlyUnknownOutcome(ensembleErr)) {
 		var total Usage
 		for _, attempt := range attempts {
 			total = accumulateAttemptUsage(total, attempt.Usage)
 		}
 		return "", total, RouteResult{}, ensembleErr
 	}
-	results := make([]EnsembleResult, 0, len(attempts))
-	for _, result := range attempts {
-		if strings.TrimSpace(result.Content) != "" {
-			results = append(results, result)
-		}
+	if ensembleErr != nil {
+		r.emitTrace(TraceEvent{
+			Event:  "chat_best_power_unknown_generator",
+			Phase:  buildPhaseName(phase),
+			Error:  ensembleErr.Error(),
+			Detail: fmt.Sprintf("not replayed; continuing with %d usable responses", len(results)),
+		})
 	}
 	if len(results) == 0 {
 		// No generator produced usable content — fall back to adaptive routing
@@ -495,8 +542,19 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	total = accumulateAttemptUsage(total, best.Usage)
 	total.Provider = best.Provider // winning generator
 	total.Model = best.ModelID
-	if judgeErr != nil {
+	if judgeErr != nil && !onlyUnknownOutcome(judgeErr) {
 		return "", total, RouteResult{}, judgeErr
+	}
+	if judgeErr != nil {
+		// A judge whose outcome is unknown picked no winner; best is the first
+		// candidate, as when the judge fails.
+		r.emitTrace(TraceEvent{
+			Event:    "chat_best_power_unknown_judge",
+			Phase:    buildPhaseName(phase),
+			Selected: best.Provider,
+			Error:    judgeErr.Error(),
+			Detail:   "not replayed; returning the first candidate",
+		})
 	}
 
 	r.emitTrace(TraceEvent{

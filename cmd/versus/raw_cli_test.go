@@ -54,6 +54,13 @@ func TestRawCLIChildStub(t *testing.T) {
 		}
 	}
 	switch os.Getenv("MAKEWAND_VERSUS_CHILD_MODE") {
+	case "login":
+		fmt.Fprintln(os.Stderr, "Error: Not logged in. Run `grok login`.")
+		os.Exit(1)
+	case "login-after-work":
+		fmt.Println("Edited the handler; running the tests next.")
+		fmt.Fprintln(os.Stderr, "Your session has expired. Run `grok login` to sign in again.")
+		os.Exit(1)
 	case "quota":
 		fmt.Fprintln(os.Stderr, "synthetic quota exceeded")
 		os.Exit(1)
@@ -378,6 +385,54 @@ func TestRawCLIEventRecorderFailureKeepsKnownOutcomeAndBudget(t *testing.T) {
 	attempts := readRawAttempts(t, ledger)
 	if r.err != nil || eventErrors.Load() != 2 || rawDispatchCount(t, state) != 1 || len(attempts) != 1 || attempts[0].Status != execution.Passed || !attempts[0].Known {
 		t.Fatalf("best-effort event failure changed execution or budget: error=%v recording_errors=%d attempts=%+v dispatches=%d", r.err, eventErrors.Load(), attempts, rawDispatchCount(t, state))
+	}
+}
+
+// rawStubAs puts the test executable on PATH as the CLI named name: the raw arm
+// names its provider after the command and reads that CLI's messages.
+func rawStubAs(t *testing.T, bin, name string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, name)
+	if runtime.GOOS == "windows" {
+		path += ".exe"
+	}
+	// Windows refuses to delete any link to a running executable, and bin is
+	// this test binary, so t.TempDir could not clean up a hard link there.
+	if runtime.GOOS == "windows" || os.Link(bin, path) != nil {
+		data, err := os.ReadFile(bin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// #nosec G306 G703 -- an executable copy of the test binary in a test-created temporary directory.
+		if err := os.WriteFile(path, data, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// The raw arm runs a vendor CLI in its working directory. Its login refusal is
+// a known FAILED only when it is all the CLI printed: after an answer the run
+// may have edited files, and the ledger keeps its outcome unknown.
+func TestRawCLILoginRefusalAfterWorkStaysUnknown(t *testing.T) {
+	for _, test := range []struct {
+		mode   string
+		status execution.Status
+		known  bool
+	}{{"login", execution.Failed, true}, {"login-after-work", execution.Unknown, false}} {
+		t.Run(test.mode, func(t *testing.T) {
+			bin, state, ledger, _ := setupRawStub(t, 3, test.mode)
+			rawStubAs(t, bin, "grok")
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			r := runCLIWithTimeout(ctx, "grok", "grok", rawStubArgs(), 30*time.Second)
+			attempts := readRawAttempts(t, ledger)
+			if r.err == nil || execution.ErrorStatus(r.err) != test.status || errors.Is(r.err, execution.ErrUnknownOutcome) == test.known ||
+				rawDispatchCount(t, state) != 1 || len(attempts) != 1 || attempts[0].Status != test.status || attempts[0].Known != test.known {
+				t.Fatalf("raw outcome=%v status=%s attempts=%+v dispatches=%d", r.err, execution.ErrorStatus(r.err), attempts, rawDispatchCount(t, state))
+			}
+		})
 	}
 }
 

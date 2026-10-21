@@ -595,6 +595,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		cleanupWorkDir()
 		return nil, fmt.Errorf("%w: %w", errExecutionAdmission, err)
 	}
+	readOnly := cliRunReadOnly(ctx, wrappedCmd != cmd)
 	cmd = wrappedCmd
 	setCLIProcessGroup(cmd)
 	// Let exec own the OS pipes so WaitDelay can bound inherited descriptors
@@ -627,7 +628,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 		cancel()
 		cleanupWorkDir()
 		if contextErr != nil {
-			return nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, err, errors.Join(contextErr, err), time.Since(started))
+			return nil, c.formatExecutionError(readOnly, capture.StdoutBytes(), capture.StderrString(), prompt, err, errors.Join(contextErr, err), time.Since(started))
 		}
 		return nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
@@ -787,7 +788,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 					waitErr = errors.New("CLI reported an error")
 				}
 			}
-			ch <- StreamChunk{Error: c.formatExecutionError(stdout, capture.StderrString(), prompt, waitErr, nil, duration)}
+			ch <- StreamChunk{Error: c.formatExecutionError(readOnly, stdout, capture.StderrString(), prompt, waitErr, nil, duration)}
 			return
 		}
 
@@ -1154,6 +1155,7 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 	if err != nil {
 		return "", nil, fmt.Errorf("%w: %w", errExecutionAdmission, err)
 	}
+	readOnly := cliRunReadOnly(ctx, wrappedCmd != cmd)
 	cmd = wrappedCmd
 	setCLIProcessGroup(cmd)
 
@@ -1172,7 +1174,7 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 		err = errors.Join(err, attempt.LaunchFailed())
 		cliAfterWait(cmd) // nothing ran: the private home is removed at once
 		if contextErr := ctx.Err(); contextErr != nil {
-			return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, err, errors.Join(contextErr, err), time.Since(start))
+			return "", nil, c.formatExecutionError(readOnly, capture.StdoutBytes(), capture.StderrString(), prompt, err, errors.Join(contextErr, err), time.Since(start))
 		}
 		return "", nil, newProviderError(c.provider, "CLI start", ErrorKindConfig, false, 0, err.Error(), err)
 	}
@@ -1219,12 +1221,12 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 		return "", nil, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
 	}
 	if runErr != nil {
-		return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, runErr, ctx.Err(), duration)
+		return "", nil, c.formatExecutionError(readOnly, capture.StdoutBytes(), capture.StderrString(), prompt, runErr, ctx.Err(), duration)
 	}
 
 	raw := capture.StdoutBytes()
 	if c.name == "claude-cli" && claudeCLIErrorMessage(raw) != "" {
-		return "", nil, c.formatExecutionError(raw, capture.StderrString(), prompt, errors.New("CLI reported an error"), ctx.Err(), duration)
+		return "", nil, c.formatExecutionError(readOnly, raw, capture.StderrString(), prompt, errors.New("CLI reported an error"), ctx.Err(), duration)
 	}
 
 	// Try structured JSON parsing when the CLI was invoked with a JSON output flag.
@@ -1407,8 +1409,12 @@ func formatCLIContextError(provider string, ctxErr error, duration time.Duration
 
 // ClassifyCLIExecutionError shares the single-process CLI outcome classification
 // with comparison tools that dispatch a raw vendor process without retries.
-func ClassifyCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
-	return formatCLIExecutionError(provider, stderr, runErr, ctxErr, duration)
+// stdout and stderr are what the process printed. The process is taken to be
+// one that could have written its working directory: the CLI's own refusal of
+// the invocation is a known failure only when nothing else it printed can show
+// work, and otherwise the outcome stays unknown.
+func ClassifyCLIExecutionError(provider, stdout, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+	return formatCLIExecutionError(provider, stdout, stderr, runErr, ctxErr, duration)
 }
 
 const claudeCLIErrorJSONLimit = 64 << 10
@@ -1495,13 +1501,19 @@ func claudeCLIErrorMessage(raw []byte) string {
 
 // formatExecutionError classifies a failed run of c's CLI. prompt is the
 // prompt as sent: codex echoes it into its transcript, and the echo is never
-// its own message.
-func (c *CLIProvider) formatExecutionError(stdout []byte, stderr, prompt string, runErr error, ctxErr error, duration time.Duration) error {
+// its own message. readOnly tells whether the run could not have written the
+// workspace (cliRunReadOnly).
+func (c *CLIProvider) formatExecutionError(readOnly bool, stdout []byte, stderr, prompt string, runErr error, ctxErr error, duration time.Duration) error {
 	if err := cliOutcomeError(c.provider, runErr, ctxErr, duration); err != nil {
 		return err
 	}
 	cli := c.messageCatalogName()
 	quota := cliQuotaRefusal(cli, stderr, prompt)
+	// A run that could have written the workspace is replayed elsewhere only on
+	// a refusal that is all it shows (cliInvocationRefusal): a login lost
+	// mid-run, after the model edited files, is in the same words as one refused
+	// at the start.
+	answered := cliAnswered(string(stdout))
 	if c.name == "claude-cli" {
 		message := claudeCLIErrorMessage(stdout)
 		if strings.TrimSpace(stderr) == "" {
@@ -1512,14 +1524,36 @@ func (c *CLIProvider) formatExecutionError(stdout []byte, stderr, prompt string,
 			stderr, quota = strings.TrimSpace(stderr)+"\n"+message, true
 		}
 	}
-	return cliFailureError(c.provider, stderr, quota, runErr)
+	var refusal cliRefusal
+	if readOnly || !answered {
+		refusal = cliInvocationRefusal(cli, stderr, prompt, !readOnly)
+	}
+	err := cliFailureError(c.provider, stderr, quota, refusal, runErr)
+	if readOnly {
+		return readOnlyExitError(err)
+	}
+	return err
 }
 
-func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+// formatCLIExecutionError classifies a failed run of provider's CLI from what
+// it printed (ClassifyCLIExecutionError). The run could have written its
+// working directory, so the CLI's own refusal counts only as it does in such a
+// routed run: when it is all the run shows.
+func formatCLIExecutionError(provider, stdout, stderr string, runErr error, ctxErr error, duration time.Duration) error {
 	if err := cliOutcomeError(provider, runErr, ctxErr, duration); err != nil {
 		return err
 	}
-	return cliFailureError(provider, stderr, looksLikeQuotaExhaustion(provider, stderr), runErr)
+	var refusal cliRefusal
+	if !cliAnswered(stdout) {
+		refusal = cliInvocationRefusal(cliCatalogName(provider), stderr, "", true)
+	}
+	return cliFailureError(provider, stderr, looksLikeQuotaExhaustion(provider, stderr), refusal, runErr)
+}
+
+// cliAnswered reports whether a CLI printed more than blank lines on stdout,
+// where its answer, or the report of work it did, goes.
+func cliAnswered(stdout string) bool {
+	return pyStrip(stripCLIANSI(stdout)) != ""
 }
 
 // cliOutcomeError is the error of a run that ended without a complete exit
@@ -1535,9 +1569,10 @@ func cliOutcomeError(provider string, runErr error, ctxErr error, duration time.
 	return nil
 }
 
-// cliFailureError is the error of a CLI that exited with a failure; quota
-// tells whether stderr carries the CLI's own quota or rate-limit refusal.
-func cliFailureError(provider, stderr string, quota bool, runErr error) error {
+// cliFailureError is the error of a CLI that exited with a failure, read from
+// its stderr. quota tells whether stderr carries the CLI's own quota or
+// rate-limit refusal, refusal its own refusal of the invocation.
+func cliFailureError(provider, stderr string, quota bool, refusal cliRefusal, runErr error) error {
 	errMsg := strings.TrimSpace(stderr)
 	if errMsg == "" {
 		errMsg = runErr.Error()
@@ -1550,6 +1585,14 @@ func cliFailureError(provider, stderr string, quota bool, runErr error) error {
 	// counts, read from stderr as the CLI wrote it (indentation included).
 	if quota {
 		return newProviderError(provider, "CLI", ErrorKindRateLimit, true, 429, errMsg, runErr)
+	}
+	// A CLI that refused the invocation itself (no login, arguments it rejects)
+	// did no model work: a known FAILED, as health.py reports it, which the
+	// router may replay on the next provider. A run whose outcome is unknown
+	// already (a login switch during it) stays unknown.
+	if refusal.kind != "" && !errors.Is(runErr, execution.ErrUnknownOutcome) {
+		err := newProviderError(provider, "CLI", refusal.kind, false, 0, refusal.line, runErr)
+		return &execution.StatusError{Status: execution.Failed, OutcomeKnown: true, Err: err}
 	}
 	base := newProviderError(provider, "CLI", ErrorKindProvider, false, 0, errMsg, runErr)
 	if looksTransient(errMsg) {
@@ -1602,6 +1645,115 @@ func cliQuotaRefusal(cli, stderr, prompt string) bool {
 	}
 	streams := cliStreams{stderr: stderr, apart: true}
 	return len(cliMessages.find(entry, quotaExhaustionKinds, streams, prompt)) > 0
+}
+
+// cliRefusalKinds are the catalog kinds of a CLI's refusal to run at all: a
+// login it requires or credentials it rejects ("auth").
+var cliRefusalKinds = []string{"auth"}
+
+// agy prints these notices on every start, before its silent keyring sign-in,
+// and they are moot once that sign-in succeeded (makewand/providers/agy.py
+// _AGY_AUTH_OK_RE and _AGY_STARTUP_AUTH_NOTICE_RE).
+var (
+	agyAuthSucceeded     = regexp.MustCompile(`(?i)authenticated (?:successfully|via )`)
+	agyStartupAuthNotice = regexp.MustCompile(`(?i)^(?:you are not logged into antigravity\.?|print mode: not authenticated, trying silent auth)$`)
+)
+
+// cliRefusal is a CLI's own refusal of the invocation: its kind ("" for none)
+// and the line that shows it.
+type cliRefusal struct {
+	kind ErrorKind
+	line string
+}
+
+// cliInvocationRefusal returns cli's own refusal of the invocation in stderr,
+// which shows that no model work was done. A rejection of its arguments (agy's
+// invalid_invocation) is ErrorKindConfig, a login refusal (a catalog "auth"
+// message) ErrorKindAuth: what makewand/providers/agy.py, grok.py and muse.py
+// read as a known failure. Only cli's own lines count, as for
+// cliQuotaRefusal; a CLI the catalog does not know refuses nothing. An
+// argument rejection counts only as the first line the CLI wrote itself
+// (firstOwnLine).
+//
+// A run that could have written the workspace (writable) refuses only when
+// the refusal is the first line that may show the CLI at work (firstWorkLine),
+// and the caller checks that stdout holds no answer either. The catalog's
+// login messages include those of a session that expires while the model
+// works, agy logs its tool and model calls as glog diagnostics, and a tool the
+// model ran can print an argument rejection of its own.
+func cliInvocationRefusal(cli, stderr, prompt string, writable bool) cliRefusal {
+	entry := cliMessages.providers[cli]
+	if entry == nil {
+		return cliRefusal{}
+	}
+	first := cliMessages.firstOwnLine
+	if writable {
+		first = cliMessages.firstWorkLine
+	}
+	// An argument rejection counts only as that first line (makewand/providers/
+	// agy.py _agy_invocation_rejection on _agy_user_facing); the same words
+	// further on (the answer, a tool's output) are task content.
+	if line := normalizeCLILine(first(entry, stderr)); line != "" && entry.invalidInvocation != nil && entry.invalidInvocation.MatchString(line) {
+		return cliRefusal{ErrorKindConfig, line}
+	}
+	if entry.kinds["auth"] == nil && entry.kinds["auth.marked"] == nil {
+		return cliRefusal{}
+	}
+	if cli == "agy" && agyAuthSucceeded.MatchString(stderr) {
+		var kept []string
+		for _, line := range pySplitLines(stderr) {
+			if !agyStartupAuthNotice.MatchString(normalizeCLILine(line)) {
+				kept = append(kept, line)
+			}
+		}
+		stderr = strings.Join(kept, "\n")
+	}
+	line, ok := cliMessages.find(entry, cliRefusalKinds, cliStreams{stderr: stderr, apart: true}, prompt)["auth"]
+	if !ok {
+		return cliRefusal{}
+	}
+	if writable {
+		work := cliStreams{stderr: first(entry, stderr), apart: true}
+		if _, ok := cliMessages.find(entry, cliRefusalKinds, work, prompt)["auth"]; !ok {
+			return cliRefusal{}
+		}
+	}
+	return cliRefusal{ErrorKindAuth, line}
+}
+
+// firstOwnLine is the first line the CLI of entry wrote itself in own, as
+// written: glog diagnostics, blank lines, its status lines and notices are not
+// such lines (makewand/providers/agy.py _agy_user_facing).
+func (c *cliMessageCatalog) firstOwnLine(entry *cliCatalogEntry, own string) string {
+	lines := pySplitLines(own)
+	skipped := c.glogEntryLines(lines, false)
+	for i, raw := range lines {
+		if skipped[i] || pyStrip(stripCLIANSI(raw)) == "" {
+			continue
+		}
+		if line := normalizeCLILine(raw); entry.notices != nil && entry.notices.MatchString(line) || entry.status != nil && entry.status.MatchString(line) {
+			continue
+		}
+		return raw
+	}
+	return ""
+}
+
+// firstWorkLine is the first line in own, as written, that may show the CLI of
+// entry at work: any but a blank line and one of its notices (agy's notices and
+// generic_notice: warnings about its flags, environment and credentials, none
+// of them the trace of a tool or model call). Unlike firstOwnLine it skips no
+// glog diagnostics, in which agy logs its tool and model calls, and no status
+// line, which agy prints about the background tasks of a root agent that
+// already ran.
+func (c *cliMessageCatalog) firstWorkLine(entry *cliCatalogEntry, own string) string {
+	for _, raw := range pySplitLines(own) {
+		if pyStrip(stripCLIANSI(raw)) == "" || entry.notices != nil && entry.notices.MatchString(normalizeCLILine(raw)) {
+			continue
+		}
+		return raw
+	}
+	return ""
 }
 
 // cliCatalogName is the catalog entry of a router provider or CLI name: the
@@ -1723,6 +1875,11 @@ type cliCatalogEntry struct {
 	kinds       map[string]*regexp.Regexp // "quota", "quota.marked", ...: one alternation each
 	own         *regexp.Regexp            // its names as it prints them in front of its lines
 	jsonReports bool                      // a JSON object it prints over several lines is one line
+	// notices: its own notices, generic ones included (agy's notices and
+	// generic_notice); status: its status lines (status_lines);
+	// invalidInvocation: its rejections of its arguments. nil when the catalog
+	// lists none.
+	notices, status, invalidInvocation *regexp.Regexp
 }
 
 // cliTranscript is codex exec's transcript structure (providers.codex.transcript).
@@ -1758,8 +1915,12 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 				FatalError    string   `json:"fatal_error"`
 				FatalAfter    string   `json:"fatal_after"`
 			} `json:"transcript"`
-			Kinds       map[string][]string `json:"kinds"`
-			JSONReports any                 `json:"json_reports"`
+			Kinds             map[string][]string `json:"kinds"`
+			JSONReports       any                 `json:"json_reports"`
+			Notices           []string            `json:"notices"`
+			GenericNotice     string              `json:"generic_notice"`
+			StatusLines       []string            `json:"status_lines"`
+			InvalidInvocation []string            `json:"invalid_invocation"`
 		} `json:"providers"`
 	}
 	if err := json.Unmarshal(data, &file); err != nil {
@@ -1826,6 +1987,21 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 			if len(patterns) > 0 {
 				entry.kinds[kind] = compile(prefix+"kinds."+kind, cliAlternation(patterns))
 			}
+		}
+		// makewand/providers/agy.py _agy_own_line(any_warning=True) and
+		// _agy_invocation_rejection read these lists.
+		notices := slices.Clone(spec.Notices)
+		if spec.GenericNotice != "" {
+			notices = append(notices, spec.GenericNotice)
+		}
+		if len(notices) > 0 {
+			entry.notices = compile(prefix+"notices", cliAlternation(notices))
+		}
+		if len(spec.StatusLines) > 0 {
+			entry.status = compile(prefix+"status_lines", cliAlternation(spec.StatusLines))
+		}
+		if len(spec.InvalidInvocation) > 0 {
+			entry.invalidInvocation = compile(prefix+"invalid_invocation", cliAlternation(spec.InvalidInvocation))
 		}
 		if t := spec.Transcript; t != nil {
 			entry.transcript = &cliTranscript{

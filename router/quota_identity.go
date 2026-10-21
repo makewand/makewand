@@ -101,8 +101,17 @@ func readQuotaIdentity(provider, root string) ProviderQuota {
 	if err != nil {
 		return q
 	}
-	// A whitelist projection: the decoder skips every secret field. No token
-	// value is decoded, retained in the identity, logged, hashed or serialized.
+	if ref := quotaAccountRef(provider, quotaAccountID(provider, raw)); ref != "" {
+		q.AccountRef, q.IdentityKnown, q.PoolRef = ref, true, ref+":subscription"
+	}
+	return q
+}
+
+// quotaAccountID is the plain account identifier in a login's metadata: codex
+// auth.json tokens.account_id, Claude .claude.json oauthAccount.accountUuid.
+// A whitelist projection: the decoder skips every secret field. No token
+// value is decoded, retained in the identity, logged, hashed or serialized.
+func quotaAccountID(provider string, raw []byte) string {
 	var data struct {
 		Tokens struct {
 			AccountID string `json:"account_id"`
@@ -112,16 +121,12 @@ func readQuotaIdentity(provider, root string) ProviderQuota {
 		} `json:"oauthAccount"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
-		return q
+		return ""
 	}
-	id := data.Tokens.AccountID
 	if provider == "claude" {
-		id = data.OAuthAccount.AccountUUID
+		return data.OAuthAccount.AccountUUID
 	}
-	if ref := quotaAccountRef(provider, id); ref != "" {
-		q.AccountRef, q.IdentityKnown, q.PoolRef = ref, true, ref+":subscription"
-	}
-	return q
+	return data.Tokens.AccountID
 }
 
 // Identity reads share the credential-copy byte cap. Unavailable metadata is
