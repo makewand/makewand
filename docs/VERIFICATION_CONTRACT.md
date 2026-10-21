@@ -367,11 +367,19 @@ directory: makewand reads the files git's repository discovery reads (a `.git`
 file, a `.git` directory or an implicit bare repository there or in a parent)
 and the `commondir` of each, whether `.git` is a file or a directory. A `.git`
 file or `commondir` git cannot read makes the command fail closed (`Cannot
-shield Git attributes`). `git apply` cannot take an attribute source in
-work-tree mode (git segfaults) or outside a repository, so every apply runs with
-each configured filter driver disabled by command-scope configuration; its index
-modes also read attributes from the empty tree. The API relay applies its diff
-blocks the same way, with a git binary from outside the workspace.
+shield Git attributes`). The shield walks upward from the command's directory, so
+a diff runs `--submodule=short --ignore-submodules=dirty`: git shows a submodule's
+committed pointer but never runs `git status` inside a nested repository to decide
+"-dirty", a child git spawns without `--attr-source` or the shield that would
+otherwise read that repository's own `commondir` config and `info/attributes` and
+run a filter while hashing a tracked file. Submodule content is reviewed by a
+separate per-repository diff, with the shield in force. `git apply` cannot take an
+attribute source in work-tree mode (git segfaults) or outside a repository, so
+every apply runs with each configured filter driver disabled by command-scope
+configuration; its index modes also read attributes from the empty tree. The API
+relay applies its diff blocks the same way, with a git binary from outside the
+workspace; that apply also carries `core.autocrlf=false`, so on a CRLF checkout
+configured `core.autocrlf=true` an LF diff block may not apply.
 
 Pre-existing files that are not backed up (dependency and cache directories,
 files over the backup limits) get a SHA-256 digest at task start, smallest first,

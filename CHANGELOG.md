@@ -71,7 +71,9 @@ All notable changes to this project are documented here. The format is based on
 2026-10-21 评估修复（Python 宿主侧 Git；详见 docs/VERIFICATION_CONTRACT.md）：
 
 - **属性屏蔽覆盖 commondir**：按 git 自身的仓库发现规则读取文件（`.git` 文件、`.git` 目录、隐式裸仓库及各自的 `commondir`，逐字节按 git 的格式解析），`.git` 是目录时也屏蔽 `commondir` 所指公共目录的 `info/attributes`；`.git` 文件或 `commondir` 无法读取时拒绝运行 git。此前植入的 clean/smudge filter 可在宿主审查 diff 时执行。
+- **审查 diff 不再进入嵌套仓库**：顶层 `git diff --submodule=short` 为给出 submodule 的 `-dirty` 后缀会在其中运行 `git status`，而该子进程读取嵌套仓库自身 `commondir` 的 config 与 `info/attributes`、哈希其跟踪文件时会在宿主执行 filter——这条下探路径既拿不到 `--attr-source` 也不经属性屏蔽（git 不带这两者 spawn 子进程），单靠向上走的屏蔽覆盖不到。现为 `DIFF_FORMAT_FLAGS` 增加 `--ignore-submodules=dirty`：submodule 的提交指针照常进入审查，脏工作树改由 `get_git_diff_status` 的分仓库递归（带屏蔽）单独审查。覆盖有无 `.gitmodules`、且嵌套仓库自带索引并同尺寸改写（迫使子进程必须哈希）的情形。
 - **`git apply` 不再执行 filter**：工作树模式的 apply 带任何属性来源都会使 git（2.55）段错误、在仓库外直接退出，因此每次 apply 都以命令级配置（`GIT_CONFIG_COUNT`）禁用全部已配置的 filter 驱动（含名称带 `=` 或为空的驱动），`--index`/`--cached`/`--3way` 另以空树为属性来源。API 中转的 diff 块改经 `run_git_cmd` 应用，获得安全配置参数、属性屏蔽、filter 禁用与工作区外的 git 二进制（不再经继承的 `PATH` 执行工作区内的 `git`）。
+- **影响提示**：API 中转 apply 经 `run_git_cmd` 后也带 `core.autocrlf=false`（交付按审查字节逐字节落盘的既有约束）；在 `core.autocrlf=true` 的 CRLF 检出（Git for Windows 默认）上，模型输出的 LF diff 块可能 `patch does not apply` 而被静默丢弃——仅在 `MAKEWAND_API_POLICY=allow_paid` 且模型给出 diff 块时触发。`_valid_git_head` 改用非阻塞 open + fstat（同 `_read_git_pointer`），避免 lstat 之后 HEAD 被并发换成 FIFO 时在 git 启动前永久阻塞。
 
 ### Added
 

@@ -11,8 +11,10 @@ except ImportError:  # python3 -m unittest tests.<module>
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -39,11 +41,14 @@ class FilterFixture(unittest.TestCase):
         self.filter_script.write_text(f'#!/bin/sh\nprintf "%s:%s\\n" "$1" "$2" >> {shlex.quote(str(self.marker))}\ncat\n')
         self.filter_script.chmod(0o755)
 
-    def git(self, cwd, *arguments):
-        """Fixture setup runs plain git, never makewand's hardened path."""
-        env = dict(os.environ, GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
-                   GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
-        return subprocess.run(["git", *arguments], cwd=str(cwd), env=env, check=True,
+    def git(self, cwd, *arguments, env=None):
+        """Fixture setup runs plain git, never makewand's hardened path.
+
+        ``env`` overlays GIT_DIR/GIT_WORK_TREE for a linked worktree's own commands.
+        """
+        full = dict(os.environ, GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
+                    GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid", **(env or {}))
+        return subprocess.run(["git", *arguments], cwd=str(cwd), env=full, check=True,
                               capture_output=True, text=True).stdout
 
     def plant_filter(self, config, name="evil", required=False):
@@ -126,6 +131,42 @@ class CommondirShieldTests(FilterFixture):
         self.assertIn("+changed", diff)
         self.assertEqual(self.marker_lines(), [])
 
+    def test_review_diff_never_runs_status_inside_a_nested_repository(self):
+        # The confirmed py-sec-1 end to end. --submodule=short alone makes the
+        # top-level review diff run `git status` inside a nested gitlink to decide
+        # "-dirty"; that child reads the nested repository's own commondir config
+        # and info/attributes and hashes a tracked file through the clean filter
+        # they select - a path neither --attr-source nor the shield reaches. The
+        # nested repository has its own index and the edit keeps the file size, so
+        # the child must hash it (a size change or no index would hide the path, as
+        # the fixture above does). --ignore-submodules=dirty stops the descent.
+        for gitmodules in (False, True):
+            with self.subTest(gitmodules=gitmodules):
+                self.marker.unlink(missing_ok=True)
+                top = self.repository(self.root / f"top-nested-{int(gitmodules)}", {"app.py": "print(1)\n"})
+                common = top / "c"
+                self.git(top, "init", "-q", "--bare", str(common))
+                sub = top / "sub"
+                sub.mkdir()
+                sub_env = {"GIT_DIR": str(self.linked_git_dir(sub, common)), "GIT_WORK_TREE": str(sub)}
+                self.git(sub, "config", "core.bare", "false", env=sub_env)
+                (sub / "x.txt").write_text("x\n")
+                self.git(sub, "add", "x.txt", env=sub_env)
+                self.git(sub, "commit", "-qm", "x", env=sub_env)
+                self.plant_filter(common / "config")  # after the commit, so setup runs no filter
+                self.plant_attributes(common)
+                (sub / "x.txt").write_text("y\n")  # same size: git cannot skip the hash on size
+                future = os.stat(sub / "x.txt").st_mtime + 3600
+                os.utime(sub / "x.txt", (future, future))  # newer than the index: git must re-hash
+                (top / "app.py").write_text("print(2)\n")
+                if gitmodules:
+                    (top / ".gitmodules").write_text('[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n')
+
+                diff, error = git_helper.get_git_diff_status(str(top))
+                self.assertIsNone(error)
+                self.assertIn("print(2)", diff)           # the top-level change is still reviewed
+                self.assertEqual(self.marker_lines(), [])  # the nested filter never ran on the host
+
     def test_implicit_bare_repository_with_a_work_tree_is_shielded(self):
         # git passes over an invalid .git directory and uses the directory itself.
         bare = self.committed_git_dir(self.root / "bare", {"a.txt": "a\n"})
@@ -182,6 +223,21 @@ class CommondirShieldTests(FilterFixture):
         head.unlink()
         os.mkfifo(head)
         self.assertFalse(git_helper._valid_git_head(head))  # never waits on the FIFO
+
+    def test_valid_head_never_blocks_on_a_fifo_swapped_in_after_the_lstat(self):
+        # A concurrent writer could replace HEAD with a FIFO between the lstat and
+        # the open; the open must not block (patching lstat forces exactly that race).
+        head = self.root / "HEAD"
+        os.mkfifo(head)
+        regular = os.stat_result((stat.S_IFREG | 0o644,) + (0,) * 9)
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(git_helper._valid_git_head(head)), daemon=True)
+        with patch.object(git_helper.os, "lstat", return_value=regular):
+            thread.start()
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "blocked on the FIFO (open lacked O_NONBLOCK)")
+        self.assertEqual(result, [False])
 
     def test_an_unreadable_commondir_refuses_to_start_git(self):
         repo = self.repository(self.root / "repo", {"f.txt": "one\n"})

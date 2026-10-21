@@ -60,9 +60,16 @@ SAFE_GIT_SECURITY_FLAGS = [
 # colour codes (color.ui=always), a/ b/ prefixes (diff.noprefix, diff.mnemonicPrefix,
 # diff.srcPrefix), submodule commits as "Subproject commit" lines that git apply
 # understands (diff.submodule=log) and git's own diff machinery (diff.external,
-# textconv drivers). An option the caller passes itself comes later and wins.
+# textconv drivers). --submodule=short pairs with --ignore-submodules=dirty so git
+# shows a submodule's committed pointer without running `git status` inside it to
+# decide "-dirty": that child reads the nested repository's own config and
+# info/attributes - which neither --attr-source nor the shield reaches, since git
+# spawns it without them - and would run a filter driver on the host. Submodule
+# content is reviewed separately (get_git_diff_status), with the shield in force.
+# An option the caller passes itself comes later and wins.
 DIFF_FORMAT_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-color", "--no-relative",
-                     "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short")
+                     "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short",
+                     "--ignore-submodules=dirty")
 # An exported patch applies with plain ``git apply`` whatever diff.context says.
 PATCH_EXPORT_FLAGS = ("--binary", "--full-index", "--unified=3")
 # The review diff (get_git_diff_status) shows three lines of context around every
@@ -298,7 +305,13 @@ def _valid_git_head(head: Path) -> bool:
             return os.fsencode(os.readlink(path)).startswith(b"refs/")
         if not stat.S_ISREG(mode):
             return False
-        with open(path, "rb") as handle:
+        # Open without blocking and confirm by fstat, like _read_git_pointer: a FIFO
+        # swapped in after the lstat must not hang makewand before git starts, where
+        # MAKEWAND_GIT_TIMEOUT could not cover the wait.
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
             data = handle.read(255)
     except OSError:
         return False
