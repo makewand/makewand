@@ -86,17 +86,28 @@ of the strict PEP 508 **named** requirements only — never a requirement/constr
 file, nor a buildable `file:`/path/sdist/VCS/URL or `name @ …` target it names,
 wherever it comes from, `[project] dependencies` and `[build-system] requires`
 included — plus the install's http(s) index options and a named-pins constraints
-file; `npm`/`cargo fetch`, `go mod download`/`tidy`) gets
+file, and for a local project, `.[extra]` included, its build requires,
+dependencies and the optional-dependency groups its extras select; `npm`
+installing a registry-only lockfile it resolved and inspected first; `cargo
+fetch` pinned to a named rustup toolchain; `go mod download`/`tidy`) gets
 outbound-only `slirp4netns` networking restricted to public destinations — built
 without the host module caches and with workspace secrets masked (the whole `.git`
 and workspace `.cargo`, `ProjectIgnoreDirs` subtrees, and more credential shapes) —
 and fills the sandbox's own caches; the build/install that may run project code
 (`setup.py`, a PEP 517 backend, `build.rs`) runs loopback-only from what was
 fetched (`pip install --no-index --find-links`, including `-e .`; `cargo build
---offline`). `npm` sets `npm_config_ignore_scripts=true`, and when a dependency
-would run project code to fetch (a `file:`/`link:`/local or git dependency's
-`prepare`, which runs even under `--ignore-scripts` on some npm versions) the
-networked fetch is refused as an environment condition; `cargo fetch` additionally
+--offline`). `npm` sets `npm_config_ignore_scripts=true` (and `npm_config_allow_git=none`),
+and a project that is an npm workspaces root or names anything but a registry
+package in `package.json`, its overrides, `package-lock.json`,
+`npm-shrinkwrap.json` or a v1 `yarn.lock` (a git, `file:`, local, link or URL
+source; npm before 12 runs a git, directory or workspace dependency's `prepare`
+even under `--ignore-scripts`) is refused as an environment condition; the
+transitive tree is resolved first with `npm install --package-lock-only` in a
+scratch copy (with the network on npm 12+, offline from the project's lockfile
+before that, where a missing lockfile is refused) and installed only once its
+lockfile passes the same check. `cargo fetch` sets `RUSTUP_TOOLCHAIN` to a named
+toolchain (never a path; a workspace toolchain file naming a `path` or an
+invalid channel is refused) and additionally
 masks the cargo config files of its private `CARGO_HOME` (a loopback step could
 write them), pins `RUSTC`, clears the rustc-wrapper variables, defaults the global
 credential providers to cargo's built-in one and uses that private `CARGO_HOME`.
@@ -126,7 +137,8 @@ the failure stays the candidate's and `ExecResult.Note` says why; verification
 appends it to `DepsError` or `QuickCheckError`. After a confirmed outage the TUI
 skips the tests instead of penalising the candidate or starting auto-fix.
 Installs keep the input-integrity check meaningful: npm without a lockfile runs
-with `--no-package-lock`; pip installs of a project with `pyproject.toml` or
+with `--no-package-lock` (the lockfile its networked fetch resolves is in place
+only while npm installs it, and removed afterwards); pip installs of a project with `pyproject.toml` or
 `setup.py` use `--use-pep517` and write `*.egg-info` outside the tree; a Cargo
 project with `Cargo.lock` runs every cargo step with `--locked`, reporting a
 stale lockfile as a candidate failure, and a `Cargo.lock` that cargo generates

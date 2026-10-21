@@ -540,6 +540,7 @@ func yarnLockNonRegistry(content string) string {
 		case line == "__metadata:":
 			return "" // a berry lockfile
 		case line == "", strings.HasPrefix(line, "#"):
+			// a blank line or a comment
 		case !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":"):
 			var specs []string
 			for _, spec := range strings.Split(strings.TrimSuffix(line, ":"), ",") {
