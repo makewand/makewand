@@ -911,28 +911,39 @@ func npmNotCached(result *ExecResult) bool {
 // maxWheelMetadataBytes bounds the METADATA makewand reads from a local wheel.
 const maxWheelMetadataBytes = 4 << 20
 
-// pipExtraMarkerRe matches an `extra == "name"` comparison in a PEP 508
-// environment marker (single or double quotes).
-var pipExtraMarkerRe = regexp.MustCompile(`extra\s*==\s*(?:"([^"]*)"|'([^']*)')`)
+// pipParenSpecifierRe matches a requirement whose version specifiers are in
+// parentheses, `name [extras] (specifiers)`: the PEP 508 form bdist_wheel and
+// poetry-core write into METADATA, which the strict parser does not take. The
+// specifiers must start with an operator, so a bare version cannot join the
+// name.
+var pipParenSpecifierRe = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._-]*\s*(?:\[[^\]]*\])?)\s*\(\s*([<>=!~][^()]*)\)$`)
 
 // pipWheelRequires returns the requirements a local wheel declares for the
 // selected extras, read from its METADATA (Requires-Dist) without running any
-// code. Each returned requirement carries its environment marker rewritten so
-// pip's own evaluation during the download picks exactly what installing the
-// wheel with these extras would (pipRewriteExtraMarker). The caller runs each
-// through the strict parser, which drops anything an index would not serve.
+// code, each in the form the networked `pip download` should get it
+// (pipWheelRequirement). The caller runs each through the strict parser, which
+// drops anything an index would not serve.
 func (p *Project) pipWheelRequires(relPath string, extras []string) []string {
 	metadata, err := p.readWheelMetadata(relPath)
 	if err != nil {
 		return nil
 	}
-	selected := map[string]bool{}
+	// pip installs a Requires-Dist whose marker holds with extra set to "" (the
+	// wheel itself) or to a selected extra the wheel declares; it ignores an
+	// extra the wheel does not declare, with a warning (pip 24 and 26).
+	declared := map[string]bool{}
+	for _, extra := range wheelMetadataField(metadata, "Provides-Extra") {
+		declared[normalizePipName(extra)] = true
+	}
+	contexts := []string{""}
 	for _, extra := range extras {
-		selected[extra] = true
+		if declared[extra] && !slices.Contains(contexts, extra) {
+			contexts = append(contexts, extra)
+		}
 	}
 	var reqs []string
 	for _, value := range wheelMetadataField(metadata, "Requires-Dist") {
-		if req, ok := pipRewriteExtraMarker(value, selected); ok {
+		if req, ok := pipWheelRequirement(value, contexts); ok && !slices.Contains(reqs, req) {
 			reqs = append(reqs, req)
 		}
 	}
@@ -1040,40 +1051,325 @@ func cutHeaderPrefix(line, lowerPrefix string) (string, bool) {
 	return line[len(lowerPrefix):], true
 }
 
-// pipRewriteExtraMarker prepares a wheel's Requires-Dist value for the networked
-// `pip download`. A requirement with no environment marker, or a marker that
-// does not mention extras, is returned unchanged (pip evaluates any marker
-// itself). A marker that mentions extras is kept only when one of its extras is
-// selected; each `extra == "x"` comparison is then rewritten to a true or false
-// string literal so pip's own evaluation of the whole marker (the extra clauses
-// resolved, the rest - python_version, sys_platform - left to pip) matches
-// installing the wheel with these extras. A requirement whose only applicable
-// condition is an unselected extra is dropped.
-func pipRewriteExtraMarker(value string, selected map[string]bool) (string, bool) {
+// pipWheelRequirement prepares a wheel's Requires-Dist value for the networked
+// `pip download`, which evaluates a command-line requirement's marker with no
+// extra selected. makewand therefore decides the marker's extra comparisons
+// itself, once per extra context (pipWheelRequires), and hands pip only what is
+// left: the requirement alone when the marker holds outright, its environment
+// clauses (python_version, sys_platform, ...) when they decide, nothing when it
+// never holds. The extra comparisons are never replaced by constant
+// comparisons: pip cannot evaluate a comparison of two strings (confirmed on
+// pip 24 and 26) and the whole download would fail. A marker with no extra
+// comparison, or one makewand cannot read, is kept as written for pip.
+func pipWheelRequirement(value string, contexts []string) (string, bool) {
 	req, marker, hasMarker := strings.Cut(value, ";")
 	req = strings.TrimSpace(req)
-	if req == "" {
-		return "", false
-	}
-	if !hasMarker {
-		return req, true
+	if m := pipParenSpecifierRe.FindStringSubmatch(req); m != nil {
+		req = strings.TrimSpace(m[1]) + strings.TrimSpace(m[2])
 	}
 	marker = strings.TrimSpace(marker)
-	if !pipExtraMarkerRe.MatchString(marker) {
-		return value, true
-	}
-	anySelected := false
-	rewritten := pipExtraMarkerRe.ReplaceAllStringFunc(marker, func(m string) string {
-		sub := pipExtraMarkerRe.FindStringSubmatch(m)
-		name := normalizePipName(sub[1] + sub[2])
-		if selected[name] {
-			anySelected = true
-			return `"1" == "1"`
-		}
-		return `"1" == "0"`
-	})
-	if !anySelected {
+	switch {
+	case req == "":
 		return "", false
+	case !hasMarker || marker == "":
+		return req, true
 	}
-	return req + " ; " + rewritten, true
+	expr, ok := parsePipMarker(marker)
+	if !ok || !expr.mentionsExtra() {
+		return req + " ; " + marker, true
+	}
+	var residuals []*pipMarker
+	seen := map[string]bool{}
+	for _, extra := range contexts {
+		residual, holds, ok := expr.withExtra(extra)
+		switch {
+		case !ok:
+			return req + " ; " + marker, true
+		case residual == nil && holds:
+			return req, true
+		case residual != nil && !seen[residual.String()]:
+			seen[residual.String()] = true
+			residuals = append(residuals, residual)
+		}
+	}
+	switch len(residuals) {
+	case 0:
+		return "", false
+	case 1:
+		return req + " ; " + residuals[0].String(), true
+	}
+	return req + " ; " + (&pipMarker{op: "or", terms: residuals}).String(), true
+}
+
+// pipMarker is a parsed PEP 508 environment marker: a comparison, or the "and"
+// or "or" of its terms.
+type pipMarker struct {
+	op       string // "and", "or", or the comparison operator
+	terms    []*pipMarker
+	lhs, rhs pipMarkerOperand
+}
+
+// pipMarkerOperand is a comparison operand: a variable, or a quoted string.
+type pipMarkerOperand struct {
+	text     string // as written, a string with its quotes
+	value    string // a string's content
+	variable bool
+}
+
+// maxPipMarkerDepth bounds the parenthesis nesting parsePipMarker accepts, so
+// a crafted METADATA cannot exhaust the stack.
+const maxPipMarkerDepth = 32
+
+// pipMarkerVariables are the marker variables packaging accepts, including
+// its legacy dotted spellings.
+var pipMarkerVariables = map[string]bool{
+	"python_version": true, "python_full_version": true, "os_name": true, "os.name": true,
+	"sys_platform": true, "sys.platform": true, "platform_release": true, "platform_system": true,
+	"platform_version": true, "platform.version": true, "platform_machine": true, "platform.machine": true,
+	"platform_python_implementation": true, "platform.python_implementation": true,
+	"python_implementation": true, "implementation_name": true, "implementation_version": true,
+	"extra": true,
+}
+
+// pipMarkerOperators are the comparison operators, longest first.
+var pipMarkerOperators = []string{"===", "==", "~=", "!=", "<=", ">=", "<", ">"}
+
+// parsePipMarker parses an environment marker as packaging does: "and" binds
+// tighter than "or", parentheses group, and a comparison sets a variable or a
+// quoted string against another with a version operator, in or not in.
+func parsePipMarker(text string) (*pipMarker, bool) {
+	tokens, ok := pipMarkerTokens(text)
+	if !ok {
+		return nil, false
+	}
+	parser := pipMarkerParser{tokens: tokens}
+	marker, ok := parser.or(0)
+	return marker, ok && parser.pos == len(tokens)
+}
+
+// pipMarkerTokens splits a marker into parentheses, quoted strings (PEP 508
+// has no escapes), operators, the keywords and, or, not and in, and variables.
+func pipMarkerTokens(text string) ([]string, bool) {
+	var tokens []string
+	for i := 0; i < len(text); {
+		c := text[i]
+		switch {
+		case c == ' ' || c == '\t':
+			i++
+		case c == '(' || c == ')':
+			tokens = append(tokens, text[i:i+1])
+			i++
+		case c == '"' || c == '\'':
+			end := strings.IndexByte(text[i+1:], c)
+			if end < 0 {
+				return nil, false
+			}
+			tokens = append(tokens, text[i:i+end+2])
+			i += end + 2
+		case strings.IndexByte("=!~<>", c) >= 0:
+			j := slices.IndexFunc(pipMarkerOperators, func(op string) bool { return strings.HasPrefix(text[i:], op) })
+			if j < 0 {
+				return nil, false
+			}
+			tokens = append(tokens, pipMarkerOperators[j])
+			i += len(pipMarkerOperators[j])
+		default:
+			j := i
+			for j < len(text) && (text[j] == '_' || text[j] == '.' || 'a' <= text[j] && text[j] <= 'z' || 'A' <= text[j] && text[j] <= 'Z' || '0' <= text[j] && text[j] <= '9') {
+				j++
+			}
+			switch word := text[i:j]; {
+			case pipMarkerVariables[word], word == "and", word == "or", word == "not", word == "in":
+				tokens = append(tokens, word)
+			default:
+				return nil, false
+			}
+			i = j
+		}
+	}
+	return tokens, true
+}
+
+// pipMarkerParser is a recursive-descent parser over pipMarkerTokens.
+type pipMarkerParser struct {
+	tokens []string
+	pos    int
+}
+
+// next consumes and returns the next token ("" at the end).
+func (p *pipMarkerParser) next() string {
+	if p.pos == len(p.tokens) {
+		return ""
+	}
+	p.pos++
+	return p.tokens[p.pos-1]
+}
+
+// or parses `and ("or" and)*`.
+func (p *pipMarkerParser) or(depth int) (*pipMarker, bool) {
+	return p.list("or", depth, p.and)
+}
+
+// and parses `atom ("and" atom)*`.
+func (p *pipMarkerParser) and(depth int) (*pipMarker, bool) {
+	return p.list("and", depth, p.atom)
+}
+
+// list parses `term (op term)*`.
+func (p *pipMarkerParser) list(op string, depth int, term func(int) (*pipMarker, bool)) (*pipMarker, bool) {
+	first, ok := term(depth)
+	if !ok {
+		return nil, false
+	}
+	terms := []*pipMarker{first}
+	for p.pos < len(p.tokens) && p.tokens[p.pos] == op {
+		p.pos++
+		next, ok := term(depth)
+		if !ok {
+			return nil, false
+		}
+		terms = append(terms, next)
+	}
+	if len(terms) == 1 {
+		return first, true
+	}
+	return &pipMarker{op: op, terms: terms}, true
+}
+
+// atom parses a parenthesized marker or a comparison.
+func (p *pipMarkerParser) atom(depth int) (*pipMarker, bool) {
+	if p.pos < len(p.tokens) && p.tokens[p.pos] == "(" {
+		if depth == maxPipMarkerDepth {
+			return nil, false
+		}
+		p.pos++
+		inner, ok := p.or(depth + 1)
+		if !ok || p.next() != ")" {
+			return nil, false
+		}
+		return inner, true
+	}
+	lhs, ok := p.operand()
+	if !ok {
+		return nil, false
+	}
+	op := p.next()
+	switch {
+	case op == "not":
+		if p.next() != "in" {
+			return nil, false
+		}
+		op = "not in"
+	case op != "in" && !slices.Contains(pipMarkerOperators, op):
+		return nil, false
+	}
+	rhs, ok := p.operand()
+	if !ok {
+		return nil, false
+	}
+	return &pipMarker{op: op, lhs: lhs, rhs: rhs}, true
+}
+
+// operand parses a variable or a quoted string.
+func (p *pipMarkerParser) operand() (pipMarkerOperand, bool) {
+	switch tok := p.next(); {
+	case pipMarkerVariables[tok]:
+		return pipMarkerOperand{text: tok, variable: true}, true
+	case tok != "" && (tok[0] == '"' || tok[0] == '\''):
+		return pipMarkerOperand{text: tok, value: tok[1 : len(tok)-1]}, true
+	}
+	return pipMarkerOperand{}, false
+}
+
+// isExtra reports whether the operand is the extra variable.
+func (o pipMarkerOperand) isExtra() bool {
+	return o.variable && o.text == "extra"
+}
+
+// mentionsExtra reports whether any comparison of the marker involves extra.
+func (m *pipMarker) mentionsExtra() bool {
+	if m.op == "and" || m.op == "or" {
+		return slices.ContainsFunc(m.terms, (*pipMarker).mentionsExtra)
+	}
+	return m.lhs.isExtra() || m.rhs.isExtra()
+}
+
+// withExtra decides the marker's extra comparisons for one extra context (a
+// normalized name, "" for none) and simplifies what is left. It returns the
+// residual marker, or nil and the marker's value when nothing else decides it.
+// ok is false for an extra comparison makewand does not decide: one against a
+// variable, or with an operator other than ==, !=, in and not in.
+func (m *pipMarker) withExtra(extra string) (residual *pipMarker, holds, ok bool) {
+	if m.op != "and" && m.op != "or" {
+		return m.compareExtra(extra)
+	}
+	// One false term decides an "and", one true term an "or".
+	decisive := m.op == "or"
+	decided := false
+	var rest []*pipMarker
+	for _, term := range m.terms {
+		residual, holds, ok := term.withExtra(extra)
+		switch {
+		case !ok:
+			return nil, false, false
+		case residual != nil:
+			rest = append(rest, residual)
+		case holds == decisive:
+			decided = true
+		}
+	}
+	switch {
+	case decided:
+		return nil, decisive, true
+	case len(rest) == 0:
+		return nil, !decisive, true
+	case len(rest) == 1:
+		return rest[0], false, true
+	}
+	return &pipMarker{op: m.op, terms: rest}, false, true
+}
+
+// compareExtra decides a comparison of extra with a string the way packaging
+// does, both names normalized (PEP 685); any other comparison is left to pip.
+// pip before 24.1 (packaging 21.3) compares the names as written: for ==, the
+// comparison wheels write, it then installs no more than was fetched.
+func (m *pipMarker) compareExtra(extra string) (*pipMarker, bool, bool) {
+	lhsExtra, rhsExtra := m.lhs.isExtra(), m.rhs.isExtra()
+	switch {
+	case !lhsExtra && !rhsExtra:
+		return m, false, true
+	case lhsExtra && m.rhs.variable, rhsExtra && m.lhs.variable:
+		return nil, false, false
+	}
+	lhs, rhs := extra, normalizePipName(m.rhs.value)
+	if rhsExtra {
+		lhs, rhs = normalizePipName(m.lhs.value), extra
+	}
+	switch m.op {
+	case "==":
+		return nil, lhs == rhs, true
+	case "!=":
+		return nil, lhs != rhs, true
+	case "in":
+		return nil, strings.Contains(rhs, lhs), true
+	case "not in":
+		return nil, !strings.Contains(rhs, lhs), true
+	}
+	return nil, false, false
+}
+
+// String writes the marker in PEP 508 syntax: comparisons as written, nested
+// "and"/"or" terms in parentheses.
+func (m *pipMarker) String() string {
+	if m.op != "and" && m.op != "or" {
+		return m.lhs.text + " " + m.op + " " + m.rhs.text
+	}
+	terms := make([]string, len(m.terms))
+	for i, term := range m.terms {
+		terms[i] = term.String()
+		if term.op == "and" || term.op == "or" {
+			terms[i] = "(" + terms[i] + ")"
+		}
+	}
+	return strings.Join(terms, " "+m.op+" ")
 }
