@@ -77,7 +77,7 @@ def path_hint(binaries):
     home = os.path.realpath(os.path.expanduser("~"))
     prefix, rest = ("$HOME", target[len(home):]) if target.startswith(home + os.sep) else ("", target)
     rest = re.sub(r'(["$`\\])', r"\\\1", rest)
-    if any(os.path.isabs(entry) and os.path.realpath(entry) == target for entry in entries):
+    if found and any(os.path.isabs(entry) and os.path.realpath(entry) == target for entry in entries):
         problem = f"`makewand` on your PATH runs {found}, found before {target}"
     else:
         problem = f"{target} is not on your PATH, so the shell cannot find this makewand"
