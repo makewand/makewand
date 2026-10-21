@@ -291,7 +291,7 @@ jobs:
             echo "Build from source instead (tracks master; needs the Go toolchain from go.mod and Python 3.9+):"
             echo
             echo "${FENCE}bash"
-            echo "curl -fsSL https://raw.githubusercontent.com/${REPO}/master/scripts/install.sh | bash"
+            echo "curl -fsSL https://makewand.org/install.sh | bash"
             echo "${FENCE}"
             echo
             echo "## Verify checksum signature (cosign keyless)"

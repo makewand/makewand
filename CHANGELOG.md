@@ -89,6 +89,7 @@ All notable changes to this project are documented here. The format is based on
 - `status --probe` 的帮助写明 agy 做真实调用的两种情形：额度限制尚未重置，或真实派发、此前的真实探活记录的登录/地区失败仍然有效。
 - TUI：因依赖无法下载而跳过测试时，进度步骤的说明按界面语言显示（中文为“已跳过（依赖无法下载）”）。
 - Python 测试关卡（CI、Release、`make prelaunch`，以及装有 pytest 时的 `make test-py`）改为 `python3 -I -m pytest -q -p no:cacheprovider tests`，pytest 固定为 9.0.2：原先的 unittest 发现收集不到只有模块级 pytest 测试的 10 个模块（96 个函数、416 个用例，多为 #83/#84 的回归测试），它们从未在任何关卡运行。只用标准库的 `scripts/test_python.py` 遇到 unittest 跑不到的 pytest 风格测试、没有测试的指名模块或一个测试也没收集到时以失败退出，不再静默通过。
+- 每次发布说明中的源码安装命令改为 `curl -fsSL https://makewand.org/install.sh | bash`：原先的 `curl …/scripts/install.sh | bash` 从管道读取时 `BASH_SOURCE[0]` 未设置，安装根变成 `/`，什么也装不上。`scripts/install.sh` 经管道、`bash -s` 或 `/dev/fd` 运行时先于任何工具检查退出，并给出这条命令。
 
 ## [3.2.0] - 2026-10-09
 

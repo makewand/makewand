@@ -51,6 +51,28 @@ def find_bash():
 
 
 class InstallationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "source installation requires POSIX")
+    def test_piped_source_script_fails_fast_with_the_official_installer(self):
+        # Release notes once said `curl .../scripts/install.sh | bash`: read from a
+        # pipe, BASH_SOURCE[0] is unset under `set -u`, the root became "/" and
+        # python3 failed on '//scripts/install_source.py'. Offline: the check runs
+        # before python3 or go are looked up.
+        script = (ROOT / "scripts" / "install.sh").read_bytes()
+        with tempfile.TemporaryDirectory(prefix="makewand-piped-") as directory:
+            temp = Path(directory)
+            env = dict(os.environ, LC_ALL="C", MAKEWAND_INSTALL_ROOT=str(temp / "installed"),
+                       MAKEWAND_BIN_DIR=str(temp / "bin"), MAKEWAND_SKILLS_DIR=str(temp / "skills"))
+            for name, command in (("pipe", [find_bash()]), ("pipe -s", [find_bash(), "-s"]),
+                                  ("/dev/stdin", [find_bash(), "/dev/stdin"])):
+                with self.subTest(invocation=name):
+                    result = subprocess.run(command, input=script, cwd=temp, env=env, capture_output=True)
+                    stderr = result.stderr.decode("utf-8", "replace")
+                    self.assertEqual(result.returncode, 1, stderr)
+                    self.assertIn("run it from a clone, not through a pipe", stderr)
+                    self.assertIn("curl -fsSL https://makewand.org/install.sh | bash", stderr)
+                    self.assertNotIn("install_source.py'", stderr)
+            self.assertEqual(sorted(path.name for path in temp.iterdir()), [], "nothing may be installed")
+
     def test_failed_upgrade_preserves_complete_previous_version(self):
         with tempfile.TemporaryDirectory(prefix="makewand-upgrade-") as directory:
             temp = Path(directory)

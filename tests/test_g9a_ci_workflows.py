@@ -257,7 +257,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             notes = (repo / "dist" / "release-notes.md").read_text(encoding="utf-8")
         install = notes.index("## Install (prebuilt")
         archive = notes.index("https://github.com/acme/makewand/releases/download/v9.8.7/")
-        source = notes.index("scripts/install.sh | bash")
+        # eng-1021-5: scripts/install.sh piped to bash has no checkout to install.
+        source = notes.index("curl -fsSL https://makewand.org/install.sh | bash")
+        self.assertNotIn("scripts/install.sh", notes)
         self.assertLess(install, archive)
         self.assertLess(archive, source, "the Go source installer must not be the primary install path")
         self.assertIn("makewand_v9.8.7_${PLATFORM}.tar.gz", notes)

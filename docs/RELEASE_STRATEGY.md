@@ -5,7 +5,7 @@
 | Option | What users run | Pros | Cons | Recommended now |
 | --- | --- | --- | --- | --- |
 | GitHub Release archives (prebuilt) | download `makewand_vX.Y.Z_<os>_<arch>` from the release, verify `checksums.txt`, extract | Native Go CLI + bundled Python engine, no Go toolchain needed | Need GitHub release discipline | **Yes** |
-| Source install script | `curl .../scripts/install.sh \| bash` | Always tracks `master` | Requires the go.mod Go toolchain + git | For contributors |
+| Source install script | `curl -fsSL https://makewand.org/install.sh \| bash` (clones `master`, then runs `scripts/install.sh` from the clone) | Always tracks `master` | Requires the go.mod Go toolchain + git | For contributors |
 | npm package as primary channel | `npx makewand` / `npm i -g` | Familiar JS developer UX | Wraps native binary, extra package/release complexity | Not yet |
 | Homebrew + Scoop (auto-generated manifests) | `brew install ...` / `scoop install ...` | Better native package manager UX | Requires tap/bucket repo maintenance | **Optional now** |
 
