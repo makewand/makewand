@@ -1409,8 +1409,12 @@ func formatCLIContextError(provider string, ctxErr error, duration time.Duration
 
 // ClassifyCLIExecutionError shares the single-process CLI outcome classification
 // with comparison tools that dispatch a raw vendor process without retries.
-func ClassifyCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
-	return formatCLIExecutionError(provider, stderr, runErr, ctxErr, duration)
+// stdout and stderr are what the process printed. The process is taken to be
+// one that could have written its working directory: the CLI's own refusal of
+// the invocation is a known failure only when nothing else it printed can show
+// work, and otherwise the outcome stays unknown.
+func ClassifyCLIExecutionError(provider, stdout, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+	return formatCLIExecutionError(provider, stdout, stderr, runErr, ctxErr, duration)
 }
 
 const claudeCLIErrorJSONLimit = 64 << 10
@@ -1506,10 +1510,10 @@ func (c *CLIProvider) formatExecutionError(readOnly bool, stdout []byte, stderr,
 	cli := c.messageCatalogName()
 	quota := cliQuotaRefusal(cli, stderr, prompt)
 	// A run that could have written the workspace is replayed elsewhere only on
-	// a refusal that is all it shows: no answer on stdout, and the refusal is
-	// the first line the CLI wrote. A login lost mid-run, after the model edited
-	// files, is in the same words as one refused at the start.
-	answered := pyStrip(stripCLIANSI(string(stdout))) != ""
+	// a refusal that is all it shows (cliInvocationRefusal): a login lost
+	// mid-run, after the model edited files, is in the same words as one refused
+	// at the start.
+	answered := cliAnswered(string(stdout))
 	if c.name == "claude-cli" {
 		message := claudeCLIErrorMessage(stdout)
 		if strings.TrimSpace(stderr) == "" {
@@ -1531,14 +1535,25 @@ func (c *CLIProvider) formatExecutionError(readOnly bool, stdout []byte, stderr,
 	return err
 }
 
-// formatCLIExecutionError classifies a failed CLI run from its stderr alone,
-// with a refusal counted wherever the catalog finds it.
-func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
+// formatCLIExecutionError classifies a failed run of provider's CLI from what
+// it printed (ClassifyCLIExecutionError). The run could have written its
+// working directory, so the CLI's own refusal counts only as it does in such a
+// routed run: when it is all the run shows.
+func formatCLIExecutionError(provider, stdout, stderr string, runErr error, ctxErr error, duration time.Duration) error {
 	if err := cliOutcomeError(provider, runErr, ctxErr, duration); err != nil {
 		return err
 	}
-	refusal := cliInvocationRefusal(cliCatalogName(provider), stderr, "", false)
+	var refusal cliRefusal
+	if !cliAnswered(stdout) {
+		refusal = cliInvocationRefusal(cliCatalogName(provider), stderr, "", true)
+	}
 	return cliFailureError(provider, stderr, looksLikeQuotaExhaustion(provider, stderr), refusal, runErr)
+}
+
+// cliAnswered reports whether a CLI printed more than blank lines on stdout,
+// where its answer, or the report of work it did, goes.
+func cliAnswered(stdout string) bool {
+	return pyStrip(stripCLIANSI(stdout)) != ""
 }
 
 // cliOutcomeError is the error of a run that ended without a complete exit
@@ -1657,15 +1672,28 @@ type cliRefusal struct {
 // message) ErrorKindAuth: what makewand/providers/agy.py, grok.py and muse.py
 // read as a known failure. Only cli's own lines count, as for
 // cliQuotaRefusal; a CLI the catalog does not know refuses nothing. An
-// argument rejection counts only as the first line the CLI wrote itself, and
-// with firstLine so does a login refusal: the catalog's login messages
-// include those of a session that expires while the model works.
-func cliInvocationRefusal(cli, stderr, prompt string, firstLine bool) cliRefusal {
+// argument rejection counts only as the first line the CLI wrote itself
+// (firstOwnLine).
+//
+// A run that could have written the workspace (writable) refuses only when
+// the refusal is the first line that may show the CLI at work (firstWorkLine),
+// and the caller checks that stdout holds no answer either. The catalog's
+// login messages include those of a session that expires while the model
+// works, agy logs its tool and model calls as glog diagnostics, and a tool the
+// model ran can print an argument rejection of its own.
+func cliInvocationRefusal(cli, stderr, prompt string, writable bool) cliRefusal {
 	entry := cliMessages.providers[cli]
 	if entry == nil {
 		return cliRefusal{}
 	}
-	if line, ok := cliMessages.invocationRejection(entry, stderr); ok {
+	first := cliMessages.firstOwnLine
+	if writable {
+		first = cliMessages.firstWorkLine
+	}
+	// An argument rejection counts only as that first line (makewand/providers/
+	// agy.py _agy_invocation_rejection on _agy_user_facing); the same words
+	// further on (the answer, a tool's output) are task content.
+	if line := normalizeCLILine(first(entry, stderr)); line != "" && entry.invalidInvocation != nil && entry.invalidInvocation.MatchString(line) {
 		return cliRefusal{ErrorKindConfig, line}
 	}
 	if entry.kinds["auth"] == nil && entry.kinds["auth.marked"] == nil {
@@ -1684,25 +1712,13 @@ func cliInvocationRefusal(cli, stderr, prompt string, firstLine bool) cliRefusal
 	if !ok {
 		return cliRefusal{}
 	}
-	if firstLine {
-		first := cliStreams{stderr: cliMessages.firstOwnLine(entry, stderr), apart: true}
-		if _, ok := cliMessages.find(entry, cliRefusalKinds, first, prompt)["auth"]; !ok {
+	if writable {
+		work := cliStreams{stderr: first(entry, stderr), apart: true}
+		if _, ok := cliMessages.find(entry, cliRefusalKinds, work, prompt)["auth"]; !ok {
 			return cliRefusal{}
 		}
 	}
 	return cliRefusal{ErrorKindAuth, line}
-}
-
-// invocationRejection returns entry's rejection of its arguments when that is
-// the first line the CLI wrote itself in own (makewand/providers/agy.py
-// _agy_invocation_rejection on _agy_user_facing); the same words further on
-// (the answer, a tool's output) are task content.
-func (c *cliMessageCatalog) invocationRejection(entry *cliCatalogEntry, own string) (string, bool) {
-	if entry.invalidInvocation == nil {
-		return "", false
-	}
-	line := normalizeCLILine(c.firstOwnLine(entry, own))
-	return line, line != "" && entry.invalidInvocation.MatchString(line)
 }
 
 // firstOwnLine is the first line the CLI of entry wrote itself in own, as
@@ -1715,7 +1731,24 @@ func (c *cliMessageCatalog) firstOwnLine(entry *cliCatalogEntry, own string) str
 		if skipped[i] || pyStrip(stripCLIANSI(raw)) == "" {
 			continue
 		}
-		if entry.notices != nil && entry.notices.MatchString(normalizeCLILine(raw)) {
+		if line := normalizeCLILine(raw); entry.notices != nil && entry.notices.MatchString(line) || entry.status != nil && entry.status.MatchString(line) {
+			continue
+		}
+		return raw
+	}
+	return ""
+}
+
+// firstWorkLine is the first line in own, as written, that may show the CLI of
+// entry at work: any but a blank line and one of its notices (agy's notices and
+// generic_notice: warnings about its flags, environment and credentials, none
+// of them the trace of a tool or model call). Unlike firstOwnLine it skips no
+// glog diagnostics, in which agy logs its tool and model calls, and no status
+// line, which agy prints about the background tasks of a root agent that
+// already ran.
+func (c *cliMessageCatalog) firstWorkLine(entry *cliCatalogEntry, own string) string {
+	for _, raw := range pySplitLines(own) {
+		if pyStrip(stripCLIANSI(raw)) == "" || entry.notices != nil && entry.notices.MatchString(normalizeCLILine(raw)) {
 			continue
 		}
 		return raw
@@ -1842,10 +1875,11 @@ type cliCatalogEntry struct {
 	kinds       map[string]*regexp.Regexp // "quota", "quota.marked", ...: one alternation each
 	own         *regexp.Regexp            // its names as it prints them in front of its lines
 	jsonReports bool                      // a JSON object it prints over several lines is one line
-	// notices: its own status lines and notices, generic ones included (agy's
-	// status_lines, notices and generic_notice); invalidInvocation: its
-	// rejections of its arguments. nil when the catalog lists none.
-	notices, invalidInvocation *regexp.Regexp
+	// notices: its own notices, generic ones included (agy's notices and
+	// generic_notice); status: its status lines (status_lines);
+	// invalidInvocation: its rejections of its arguments. nil when the catalog
+	// lists none.
+	notices, status, invalidInvocation *regexp.Regexp
 }
 
 // cliTranscript is codex exec's transcript structure (providers.codex.transcript).
@@ -1956,12 +1990,15 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 		}
 		// makewand/providers/agy.py _agy_own_line(any_warning=True) and
 		// _agy_invocation_rejection read these lists.
-		notices := slices.Concat(spec.StatusLines, spec.Notices)
+		notices := slices.Clone(spec.Notices)
 		if spec.GenericNotice != "" {
 			notices = append(notices, spec.GenericNotice)
 		}
 		if len(notices) > 0 {
 			entry.notices = compile(prefix+"notices", cliAlternation(notices))
+		}
+		if len(spec.StatusLines) > 0 {
+			entry.status = compile(prefix+"status_lines", cliAlternation(spec.StatusLines))
 		}
 		if len(spec.InvalidInvocation) > 0 {
 			entry.invalidInvocation = compile(prefix+"invalid_invocation", cliAlternation(spec.InvalidInvocation))

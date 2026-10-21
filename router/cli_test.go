@@ -607,7 +607,7 @@ func TestEstimateTokens_HandlesMultipleScripts(t *testing.T) {
 }
 
 func TestFormatCLIExecutionError_MarksTransientErrors(t *testing.T) {
-	err := formatCLIExecutionError("test", "stream closed unexpectedly", fmt.Errorf("exit 1"), nil, time.Second)
+	err := formatCLIExecutionError("test", "", "stream closed unexpectedly", fmt.Errorf("exit 1"), nil, time.Second)
 	var transient *TransientCLIError
 	if !errors.As(err, &transient) {
 		t.Fatalf("expected TransientCLIError for transient stderr, got %T: %v", err, err)
@@ -622,7 +622,7 @@ func TestFormatCLIExecutionError_MarksTransientErrors(t *testing.T) {
 }
 
 func TestFormatCLIExecutionError_NonTransientStaysPlain(t *testing.T) {
-	err := formatCLIExecutionError("test", "invalid_api_key", fmt.Errorf("exit 1"), nil, time.Second)
+	err := formatCLIExecutionError("test", "", "invalid_api_key", fmt.Errorf("exit 1"), nil, time.Second)
 	var transient *TransientCLIError
 	if errors.As(err, &transient) {
 		t.Fatalf("expected plain error for non-transient stderr, got TransientCLIError: %v", err)

@@ -162,7 +162,7 @@ func TestFormatCLIExecutionErrorQuotaVerdictsMatchPython(t *testing.T) {
 			expected := c.expected(provider, "stderr")
 			_, quota := expected["quota"]
 			_, rate := expected["rate"]
-			got := ErrorKindOf(formatCLIExecutionError(provider, string(*c.Text), exit, nil, time.Second)) == ErrorKindRateLimit
+			got := ErrorKindOf(formatCLIExecutionError(provider, "", string(*c.Text), exit, nil, time.Second)) == ErrorKindRateLimit
 			if got != (quota || rate) {
 				t.Errorf("%s: %s CLI sealed=%t, health.py finds %v in stderr %q", c.ID, provider, got, expected, *c.Text)
 			}
@@ -177,13 +177,15 @@ func TestFormatCLIExecutionErrorQuotaVerdictsMatchPython(t *testing.T) {
 	}
 }
 
-// A CLI failure that is no quota or rate refusal is the CLI's own login
-// refusal (ErrorKindAuth, a known failure) exactly when health.py finds an
-// auth message of that CLI in its stderr. agy's start-up notice is moot once
-// agy signed in silently (makewand/providers/agy.py classify_agy_failure), so
-// such agy cases are left out; agy's argument rejection (ErrorKindConfig) is
-// a refusal too.
-func TestFormatCLIExecutionErrorRefusalVerdictsMatchPython(t *testing.T) {
+// A failed read-only run that is no quota or rate refusal is the CLI's own
+// login refusal (ErrorKindAuth, a known failure) exactly when health.py finds
+// an auth message of that CLI in its stderr: a read-only run reads the catalog
+// as health.py does. agy's start-up notice is moot once agy signed in silently
+// (makewand/providers/agy.py classify_agy_failure), so such agy cases are left
+// out; agy's argument rejection (ErrorKindConfig) is a refusal too. A run that
+// could have written the workspace counts less
+// (TestCLIInvocationRefusalClassification).
+func TestReadOnlyCLIRefusalVerdictsMatchPython(t *testing.T) {
 	raw, err := os.ReadFile(goCLIMessageCatalogFile)
 	if err != nil {
 		raw, err = os.ReadFile(pythonCLIMessageCatalogFile)
@@ -207,7 +209,7 @@ func TestFormatCLIExecutionErrorRefusalVerdictsMatchPython(t *testing.T) {
 				continue
 			}
 			_, auth := expected["auth"]
-			kind := ErrorKindOf(formatCLIExecutionError(provider, text, exit, nil, time.Second))
+			kind := ErrorKindOf(catalogCLI(t, provider).formatExecutionError(true, nil, text, "", exit, nil, time.Second))
 			if (kind == ErrorKindAuth) != auth && !(auth && kind == ErrorKindConfig && provider == "agy") {
 				t.Errorf("%s: %s CLI refusal=%s, health.py finds %v in stderr %q", c.ID, provider, kind, expected, text)
 			}
@@ -219,4 +221,26 @@ func TestFormatCLIExecutionErrorRefusalVerdictsMatchPython(t *testing.T) {
 	if refused < 15 {
 		t.Fatalf("parity corpus too thin: %d login refusals", refused)
 	}
+}
+
+// catalogCLI is the router's CLI provider that reads the catalog entry of cli.
+func catalogCLI(t *testing.T, cli string) *CLIProvider {
+	t.Helper()
+	var c *CLIProvider
+	switch cli {
+	case "claude":
+		c = NewClaudeCLI("unused")
+	case "codex":
+		c = NewCodexCLI("unused")
+	case "gemini":
+		c = NewGeminiCLI("unused")
+	case "agy":
+		c = NewAgyCLI("unused")
+	default:
+		c = NewCommandCLI(cli, "unused", nil, PromptModeArg)
+	}
+	if got := c.messageCatalogName(); got != cli {
+		t.Fatalf("the CLI provider for %s reads the catalog entry of %s", cli, got)
+	}
+	return c
 }

@@ -22,6 +22,16 @@ import (
 // falls back; an unrecognized exit stays UNKNOWN, and stops replay only when
 // the run could have written the workspace.
 
+// agyStartup is what agy logs as it signs in silently from the keyring, and
+// agyProgress what it logs at work: glog entries for a tool and a model call.
+const (
+	agyStartup = "E1012 08:11:57.633062     188 errorreport.go:224] error getting token source: You are not logged into Antigravity.\n" +
+		"I1012 08:11:57.843790       1 printmode.go:403] Print mode: not authenticated, trying silent auth\n" +
+		"I1012 08:11:57.965555       1 auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)\n"
+	agyProgress = "I1012 08:12:03.120000       1 agent.go:512] tool call: edit_file router/cli.go\n" +
+		"I1012 08:12:09.441000       1 model.go:88] model call 3: gemini-3.1-pro\n"
+)
+
 // isolateCLITestHome keeps a fixture CLI named after a real provider away from
 // the developer's credentials (~/.grok and the like) and returns its HOME.
 func isolateCLITestHome(t *testing.T) string {
@@ -174,6 +184,10 @@ func TestCLILoginLostMidRunStopsWritableReplay(t *testing.T) {
 			Stdout: "Updated router/cli.go and router/cli_test.go; running the tests next.\n",
 			Stderr: "Error: rpc error: code = Unauthenticated desc = Request had invalid authentication credentials.\n",
 		}},
+		// agy's progress is glog on stderr, with no answer on stdout yet.
+		{"agy glog progress, then unauthenticated", "agy", testfixture.Spec{
+			Stderr: agyStartup + agyProgress + "Error: rpc error: code = Unauthenticated desc = Request had invalid authentication credentials.\n",
+		}},
 		{"grok answered, then its session expired", "grok", testfixture.Spec{
 			Stdout: "Edited the handler; tests next.\n",
 			Stderr: "Your session has expired. Run `grok login` to sign in again.\n",
@@ -217,6 +231,31 @@ func TestCLILoginLostMidRunStopsWritableReplay(t *testing.T) {
 				t.Fatalf("read-only login refusal accounting: %+v", attempts)
 			}
 		})
+	}
+}
+
+// agy's notices about its environment and credentials are no work: a writable
+// run that printed nothing else before its login refusal refused before it
+// dispatched, and falls back like any known failure.
+func TestCLIWritableAgyRefusalAfterNoticesFallsBack(t *testing.T) {
+	const notices = "Warning: Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.\n" +
+		"Warning: could not verify credentials (context deadline exceeded); continuing.\n"
+	spec := testfixture.Spec{Stderr: notices + "Error: rpc error: code = Unauthenticated desc = Request had invalid authentication credentials.\n"}
+	for _, streaming := range []bool{false, true} {
+		home := isolateCLITestHome(t)
+		ctx, ledger := budgetTestContext(t, 5)
+		ctx = ContextWithWorkDir(ctx, t.TempDir())
+		var fallbackCalls atomic.Int32
+		primary := failingCLI(t, home, "agy", spec)
+		r := fallbackRouter(primary, &dispatchBudgetProvider{name: "codex", calls: &fallbackCalls})
+		out, route, err := chatOrStream(ctx, r, TaskCode, streaming)
+		if err != nil || route.Actual != "codex" || !strings.HasPrefix(out, "synthetic") || fallbackCalls.Load() != 1 {
+			t.Fatalf("stream=%v: refusal after notices did not fall back: out=%q route=%+v err=%v fallback calls=%d", streaming, out, route, err, fallbackCalls.Load())
+		}
+		attempts := budgetTestAttempts(t, ledger)
+		if len(attempts) != 2 || attempts[0]["engine"] != primary.Name() || attempts[0]["result_status"] != "FAILED" || attempts[0]["outcome_known"] != true || attempts[1]["result_status"] != "PASSED" {
+			t.Fatalf("stream=%v: refusal after notices not recorded as a known failure: %+v", streaming, attempts)
+		}
 	}
 }
 
@@ -292,13 +331,18 @@ func TestCLIArgumentRejectionEndsFailed(t *testing.T) {
 // The provider's own refusals, as health.py's adapters read them: catalog
 // "auth" messages and agy's argument rejections (its first own line). A run
 // that could have written the workspace counts one only when it is all the
-// run shows: no answer on stdout, and the refusal is the CLI's first own line.
+// run shows: no answer on stdout, and nothing but agy's notices before the
+// refusal on stderr. A glog diagnostic (agy's tool and model calls, and its
+// sign-in too, which the catalog does not list as a notice) or a status line
+// about a root agent's background tasks may show work.
 func TestCLIInvocationRefusalClassification(t *testing.T) {
 	const keyringOK = "I1012 08:11:57.965555       1 auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)\n"
 	const startup = "E1012 08:11:57.633062     188 errorreport.go:224] error getting token source: You are not logged into Antigravity.\n" +
 		"I1012 08:11:57.843790       1 printmode.go:403] Print mode: not authenticated, trying silent auth\n"
 	const modeWarning = "warning: --mode plan is not supported in print mode; continuing in the default mode.\n"
 	const envWarning = "Warning: Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.\n"
+	const credentialsWarning = "Warning: could not verify credentials (context deadline exceeded); continuing.\n"
+	const statusLine = "root agent idle; waiting up to 29m10s for 1 background task(s)\n"
 	const rejection = `error: invalid model selection (--model "gemini-3.1-pro" --effort "max"): gemini-3.1-pro has no "max" effort (available: low, high)` + "\n"
 	const agyUnauthenticated = "Error: rpc error: code = Unauthenticated desc = Request had invalid authentication credentials.\n"
 	const grokExpired = "Your session has expired. Run `grok login` to sign in again.\n"
@@ -317,14 +361,10 @@ func TestCLIInvocationRefusalClassification(t *testing.T) {
 		{"grok expired session", grok, "", grokExpired, ErrorKindAuth, ErrorKindAuth},
 		{"muse login", muse, "", "not logged in: run /login to add an API key\n", ErrorKindAuth, ErrorKindAuth},
 		{"agy login", agy, "", "Error: You are not logged into Antigravity. Run `agy` to sign in.\n", ErrorKindAuth, ErrorKindAuth},
-		{"agy login after start-up notices", agy, "", startup + "Error: Authentication required. Please visit the URL to log in\n", ErrorKindAuth, ErrorKindAuth},
-		{"agy backend rejection after keyring", agy, "", keyringOK + "Error: UNAUTHENTICATED: Request had invalid authentication credentials.\n", ErrorKindAuth, ErrorKindAuth},
 		{"agy login after a notice", agy, "", envWarning + agyUnauthenticated, ErrorKindAuth, ErrorKindAuth},
+		{"agy login after notices only", agy, "", credentialsWarning + "\n" + modeWarning + "Error: Authentication required. Please visit the URL to log in\n", ErrorKindAuth, ErrorKindAuth},
 		{"login beside a blank answer", grok, "\n \x1b[0m\n", "Error: Not logged in. Run `grok login`.\n", ErrorKindAuth, ErrorKindAuth},
-		{"agy model rejection", agy, "", "\n" + keyringOK + rejection, ErrorKindConfig, ErrorKindConfig},
-		{"agy rejection after start-up notices", agy, "", startup + keyringOK + rejection, ErrorKindConfig, ErrorKindConfig},
-		{"agy rejection after mode warning", agy, "", keyringOK + modeWarning + rejection, ErrorKindConfig, ErrorKindConfig},
-		{"agy rejection after env warning", agy, "", envWarning + keyringOK + rejection, ErrorKindConfig, ErrorKindConfig},
+		{"agy rejection after notices only", agy, "", envWarning + modeWarning + rejection, ErrorKindConfig, ErrorKindConfig},
 		{"agy unknown flag", agy, "", "\nError: unknown flag: --effort\nUsage:\n  agy [flags]\n", ErrorKindConfig, ErrorKindConfig},
 		{"agy unknown flag CRLF", agy, "", "Error: unknown flag: --effort\r\nUsage:\r\n  agy [flags]\r\n", ErrorKindConfig, ErrorKindConfig},
 		{"agy unknown flag colored", agy, "", "\x1b[31mError:\x1b[0m unknown flag: --effort\n", ErrorKindConfig, ErrorKindConfig},
@@ -338,6 +378,21 @@ func TestCLIInvocationRefusalClassification(t *testing.T) {
 		{"agy login lost after a tool line", agy, "", "Running go test ./router/...\n" + agyUnauthenticated, ErrorKindAuth, ErrorKindProvider},
 		{"grok session expired after progress", grok, "", "Edited router/cli.go\n" + grokExpired, ErrorKindAuth, ErrorKindProvider},
 		{"grok session prose after an answer line", grok, "", "I made the change.\nSession expired. Run `grok login` again is what the docs say.\nerror: turn failed\n", ErrorKindAuth, ErrorKindProvider},
+		// agy logs its work as glog entries, and its start-up sign-in too: the
+		// catalog lists none of them as a notice, so a refusal after any of
+		// them may follow work. So may one after a status line, which reports
+		// the background tasks of a root agent that already ran.
+		{"agy login lost after glog progress", agy, "", startup + keyringOK + agyProgress + agyUnauthenticated, ErrorKindAuth, ErrorKindProvider},
+		{"agy login lost after glog progress only", agy, "", agyProgress + agyUnauthenticated, ErrorKindAuth, ErrorKindProvider},
+		{"agy login after start-up glog", agy, "", startup + "Error: Authentication required. Please visit the URL to log in\n", ErrorKindAuth, ErrorKindProvider},
+		{"agy backend rejection after keyring", agy, "", keyringOK + "Error: UNAUTHENTICATED: Request had invalid authentication credentials.\n", ErrorKindAuth, ErrorKindProvider},
+		{"agy login lost after a status line", agy, "", modeWarning + statusLine + agyUnauthenticated, ErrorKindAuth, ErrorKindProvider},
+		{"agy model rejection after keyring", agy, "", "\n" + keyringOK + rejection, ErrorKindConfig, ErrorKindProvider},
+		{"agy rejection after start-up glog", agy, "", startup + keyringOK + rejection, ErrorKindConfig, ErrorKindProvider},
+		{"agy rejection after keyring and mode warning", agy, "", keyringOK + modeWarning + rejection, ErrorKindConfig, ErrorKindProvider},
+		{"agy rejection after env warning and keyring", agy, "", envWarning + keyringOK + rejection, ErrorKindConfig, ErrorKindProvider},
+		{"agy rejection after a status line", agy, "", statusLine + rejection, ErrorKindConfig, ErrorKindProvider},
+		{"tool's argument rejection after glog progress", agy, "", agyProgress + "Error: unknown flag: --json\n", ErrorKindConfig, ErrorKindProvider},
 		// The same words as task content, or a moot notice, are no refusal.
 		{"tool output", agy, "", "Ran `tar -xzf a.tgz --strip`: tar: unknown option -- strip\nPartial changes written.\n", ErrorKindProvider, ErrorKindProvider},
 		{"later line", agy, "", "I edited cli.py.\nerror: unknown flag: --json (from the gh call)\n", ErrorKindProvider, ErrorKindProvider},
@@ -380,6 +435,38 @@ func TestCLIInvocationRefusalClassification(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// The raw comparison arm (cmd/versus) runs a vendor CLI in its working
+// directory: ClassifyCLIExecutionError counts the CLI's refusal only when it
+// is all the run printed, as in a writable routed run, and otherwise leaves
+// the outcome unknown to the ledger.
+func TestClassifyCLIExecutionErrorReadsAWritableRun(t *testing.T) {
+	const login = "Error: Not logged in. Run `grok login`.\n"
+	const unauthenticated = "Error: rpc error: code = Unauthenticated desc = Request had invalid authentication credentials.\n"
+	exit := errors.New("exit status 1")
+	for _, tt := range []struct {
+		name, cli, stdout, stderr string
+		kind                      ErrorKind
+	}{
+		{"refusal alone", "grok", "", login, ErrorKindAuth},
+		{"refusal beside a blank stdout", "grok", "\n \n", login, ErrorKindAuth},
+		{"answer, then refusal", "grok", "Edited the handler; running the tests next.\n", login, ErrorKindProvider},
+		{"progress, then refusal", "grok", "", "Edited router/cli.go\n" + login, ErrorKindProvider},
+		{"agy notices, then refusal", "agy", "", "Warning: Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.\n" + unauthenticated, ErrorKindAuth},
+		{"agy glog progress, then refusal", "agy", "", agyStartup + agyProgress + unauthenticated, ErrorKindProvider},
+		{"agy argument rejection", "agy", "", "Error: unknown flag: --effort\nUsage:\n  agy [flags]\n", ErrorKindConfig},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ClassifyCLIExecutionError(tt.cli, tt.stdout, tt.stderr, exit, nil, time.Second)
+			if kind := ErrorKindOf(err); kind != tt.kind {
+				t.Fatalf("kind = %s (%v), want %s", kind, err, tt.kind)
+			}
+			if outcome := providerOutcome(err, Usage{}); outcome.Known != (tt.kind != ErrorKindProvider) {
+				t.Fatalf("outcome %+v for %v", outcome, err)
+			}
+		})
 	}
 }
 

@@ -39,13 +39,17 @@ invocation, recognized by the shared message catalog
 (`makewand/cli_message_catalog.json`: a login refusal, or agy rejecting its
 arguments), is a known `FAILED` result and falls back like any other known
 failure. In a run that could have written the workspace, a refusal counts only
-when it is all the run shows: no answer on stdout, and the refusal is the first
-line the CLI wrote. A login lost after the model started working reads the same,
-so such an exit stays `UNKNOWN` and stops replay. In Power mode an `UNKNOWN`
-generator or judge is never replayed, but it does not discard the answers the
-other generators produced: the surviving or first answer is returned, and the
-unknown attempt stays in the trace and the usage. A generator refused by
-admission or accounting still ends the request.
+when it is all the run shows: no answer on stdout, and nothing before the
+refusal on stderr but the CLI's own notices (agy's `notices` and
+`generic_notice` in the catalog). A login lost after the model started working
+reads the same, and a glog diagnostic (agy logs its tool and model calls as glog
+entries) or a status line before the refusal may show work, so such an exit
+stays `UNKNOWN` and stops replay. The raw comparison arm (`cmd/versus`) records
+its runs by the same rule. In Power mode an `UNKNOWN` generator or judge is
+never replayed, but it does not discard the answers the other generators
+produced: the surviving or first answer is returned, and the unknown attempt
+stays in the trace and the usage. A generator refused by admission or
+accounting still ends the request.
 
 Provider-result `duration_ms` measures provider execution. Accounting and
 telemetry use bounded independent cleanup so cancellation cannot erase an

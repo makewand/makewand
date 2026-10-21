@@ -48,7 +48,7 @@ func (p *rawCLIProvider) Chat(ctx context.Context, _ []model.Message, _ string, 
 	cleanupProcess, startErr := processjob.Start(cmd)
 	if startErr != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
-			return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StderrString(), startErr, errors.Join(contextErr, startErr), time.Since(started))
+			return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StdoutString(), capture.StderrString(), startErr, errors.Join(contextErr, startErr), time.Since(started))
 		}
 		return "", usage, fmt.Errorf("start raw CLI: %w", startErr)
 	}
@@ -60,7 +60,7 @@ func (p *rawCLIProvider) Chat(ctx context.Context, _ []model.Message, _ string, 
 	}
 	if err := waitErr; err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
-			return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StderrString(), err, contextErr, time.Since(started))
+			return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StdoutString(), capture.StderrString(), err, contextErr, time.Since(started))
 		}
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
@@ -69,7 +69,7 @@ func (p *rawCLIProvider) Chat(ctx context.Context, _ []model.Message, _ string, 
 		if exitErr.ExitCode() < 0 {
 			return "", usage, &execution.UnknownOutcomeError{Err: fmt.Errorf("raw CLI terminated without an exit result: %w", err)}
 		}
-		return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StderrString(), err, nil, time.Since(started))
+		return "", usage, model.ClassifyCLIExecutionError(p.name, capture.StdoutString(), capture.StderrString(), err, nil, time.Since(started))
 	}
 	return capture.StdoutString(), usage, nil
 }
