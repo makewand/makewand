@@ -87,12 +87,22 @@ file, nor a buildable `file:`/path/sdist/VCS/URL or `name @ …` target it names
 wherever it comes from, `[project] dependencies` and `[build-system] requires`
 included — plus the install's http(s) index options and a named-pins constraints
 file, and for a local project, `.[extra]` included, its build requires,
-dependencies and the optional-dependency groups its extras select; `npm`
+dependencies and the optional-dependency groups its extras select, and for a
+local `.whl` target its `Requires-Dist` for the selected extras (read from the
+wheel's `METADATA`, a zip read that runs no code); `npm`
 installing a registry-only lockfile it resolved and inspected first; `cargo
 fetch` pinned to a named rustup toolchain; `go mod download`/`tidy`) gets
 outbound-only `slirp4netns` networking restricted to public destinations — built
-without the host module caches and with workspace secrets masked (the whole `.git`
-and workspace `.cargo`, `ProjectIgnoreDirs` subtrees, and more credential shapes) —
+without the host module caches, with workspace secrets masked (the whole `.git`
+and workspace `.cargo`, `ProjectIgnoreDirs` subtrees, and more credential shapes),
+and with a fresh, empty HOME (`/tmp/makewand-fetch-home`, not the persistent
+sandbox HOME an earlier loopback step running project code can write) whose tool
+config-file locations are neutralised (`GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, npm user/global config and
+`PIP_CONFIG_FILE` at `/dev/null`, `GOENV=off`), so no git credential helper or
+tool config a loopback step wrote runs with the network, while the caches the
+offline steps reuse stay under the persistent sandbox HOME through
+`GOMODCACHE`/`npm_config_cache`/`CARGO_HOME` or the wheelhouse's absolute path —
 and fills the sandbox's own caches; the build/install that may run project code
 (`setup.py`, a PEP 517 backend, `build.rs`) runs loopback-only from what was
 fetched (`pip install --no-index --find-links`, including `-e .`; `cargo build
@@ -111,6 +121,13 @@ invalid channel is refused) and additionally
 masks the cargo config files of its private `CARGO_HOME` (a loopback step could
 write them), pins `RUSTC`, clears the rustc-wrapper variables, defaults the global
 credential providers to cargo's built-in one and uses that private `CARGO_HOME`.
+The host-side writes into sandbox paths — the wheelhouse, the constraints file
+and the npm lock-resolution tree — are created under a fresh, host-owned per-run
+directory (`.makewand/fetch-<random>`) through an `os.Root` confined to the
+workspace, so a symlink a loopback step planted is never followed out of the
+workspace; `prepareSandboxHome` and the go-telemetry-off write go through an
+`os.Root` too and refuse (fail closed) a `.makewand`, `sandbox-home` or `.config`
+component replaced with a symlink.
 Without the network tools the
 fetch runs loopback-only, keeping the host caches
 ([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)). A
