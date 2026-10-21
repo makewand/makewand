@@ -472,11 +472,18 @@ func (t *strategyTables) loadUserOverrides(configDir string) error {
 
 	candidate := baseTables.copy()
 
-	// 1. Merge discovered.json first if present (lower priority than user routing.json)
+	// 1. Merge discovered.json first if present (lower priority than user routing.json).
+	// Model discovery writes it, so it is advisory: a model this build cannot
+	// price is dropped (its tier keeps the built-in model), and a file that
+	// still does not merge and validate is ignored. A discovered model without
+	// a price used to stop every Go entry point at startup.
 	if discErr == nil {
-		discRaw, err := decodeRawDefaults(discData)
-		if err == nil {
-			_ = candidate.mergeOverrides(discRaw)
+		if discRaw, err := decodeRawDefaults(discData); err == nil {
+			withDiscovered := candidate.copy()
+			if withDiscovered.mergeOverrides(pricedDiscoveredModels(discRaw, withDiscovered)) == nil &&
+				withDiscovered.validate() == nil {
+				candidate = withDiscovered
+			}
 		}
 	}
 
@@ -640,6 +647,33 @@ func parsePhaseStrict(s string) (BuildPhase, error) {
 	}
 }
 
+// pricedProviders are the providers whose every model must have a costs entry.
+var pricedProviders = map[string]bool{"claude": true, "gemini": true, "openai": true}
+
+// pricedDiscoveredModels returns raw without the model entries of priced
+// providers whose model has no price, in t or in raw itself.
+func pricedDiscoveredModels(raw rawDefaults, t *strategyTables) rawDefaults {
+	priced := func(modelID string) bool {
+		if c, ok := raw.Costs[modelID]; ok && c.Input != nil && c.Output != nil {
+			return true
+		}
+		_, ok := t.costFor(modelID)
+		return ok
+	}
+	models := make(map[string]map[string]string, len(raw.Models))
+	for prov, tiers := range raw.Models {
+		kept := make(map[string]string, len(tiers))
+		for tier, modelID := range tiers {
+			if !pricedProviders[prov] || modelID == "" || priced(modelID) {
+				kept[tier] = modelID
+			}
+		}
+		models[prov] = kept
+	}
+	raw.Models = models
+	return raw
+}
+
 // validate checks internal consistency of the strategy and cost tables.
 func (t *strategyTables) validate() error {
 	t.mu.RLock()
@@ -679,9 +713,8 @@ func (t *strategyTables) validateLocked() error {
 	}
 
 	// 3. Every model ID in models for API providers (claude, gemini, openai) must have a costs entry.
-	apiProviders := map[string]bool{"claude": true, "gemini": true, "openai": true}
 	for prov, tiers := range t.models {
-		if !apiProviders[prov] {
+		if !pricedProviders[prov] {
 			continue
 		}
 		for tier, modelID := range tiers {

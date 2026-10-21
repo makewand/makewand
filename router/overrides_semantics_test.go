@@ -196,3 +196,109 @@ func TestLoadUserOverrides_CLISubscriptionDiscoveredWithoutCostTableEntry(t *tes
 		t.Errorf("gpt-6-astra should not have an injected cost table entry")
 	}
 }
+
+// discoveredFromHost is the discovered.json Python model discovery wrote on a
+// real host (2026-10-19): agy's "gemini-4-argon" lands in the gemini tiers
+// without a price, which used to stop every Go entry point at startup.
+const discoveredFromHost = `{
+  "models": {
+    "claude": {"cheap": "claude-haiku-5-5", "mid": "claude-sonnet-5-5", "premium": "claude-fable-5-1"},
+    "codex": {"cheap": "gpt-6-luna", "mid": "gpt-6.1-sol", "premium": "gpt-6-astra"},
+    "gemini": {"cheap": "gemini-3.8-flash", "mid": "gemini-4-argon", "premium": "gemini-4-argon"},
+    "agy": {"cheap": "gemini-3.8-flash", "mid": "gemini-4-argon", "premium": "gemini-4-argon"},
+    "muse": {"cheap": "muse-spark-1.3", "mid": "muse-wonder-1.0-contributor", "premium": "muse-spark-1.3"},
+    "grok": {"cheap": "grok-4.6", "mid": "grok-4.7", "premium": "grok-4.7"},
+    "local": {"cheap": "qwen2.5-coder:7b", "mid": "qwen2.5-coder:7b", "premium": "qwen2.5-coder:7b"}
+  },
+  "costs": {}
+}`
+
+func TestNewRouterFromConfig_StartsWithUnpricedDiscoveredModel(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "discovered.json"), []byte(discoveredFromHost), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewRouterFromConfig(RouterConfig{ConfigDir: dir})
+	if err != nil {
+		t.Fatalf("NewRouterFromConfig with discovered.json from a real host: %v", err)
+	}
+	tables := r.routingTables()
+	// The unpriced tiers keep the built-in model; priced and CLI entries apply.
+	for _, tc := range []struct {
+		provider string
+		tier     ModelTier
+		want     string
+	}{
+		{"gemini", TierMid, testModelID("gemini", TierMid)},
+		{"gemini", TierPremium, testModelID("gemini", TierPremium)},
+		{"gemini", TierCheap, "gemini-3.8-flash"},
+		{"claude", TierPremium, "claude-fable-5-1"},
+		{"agy", TierMid, "gemini-4-argon"},
+		{"codex", TierPremium, "gpt-6-astra"},
+	} {
+		if got := tables.modelID(tc.provider, tc.tier); got != tc.want {
+			t.Errorf("%s/%v = %q, want %q", tc.provider, tc.tier, got, tc.want)
+		}
+	}
+	if _, ok := tables.costFor("gemini-4-argon"); ok {
+		t.Error("gemini-4-argon must not gain a cost entry")
+	}
+}
+
+func TestLoadUserOverrides_DiscoveredPricedInFileIsKept(t *testing.T) {
+	r := mustNewRouter(RouterConfig{})
+	dir := t.TempDir()
+	disc := `{"models": {"gemini": {"mid": "gemini-4-argon"}},
+		"costs": {"gemini-4-argon": {"input": 1.25, "output": 10}}}`
+	if err := os.WriteFile(filepath.Join(dir, "discovered.json"), []byte(disc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.LoadUserOverrides(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.routingTables().modelID("gemini", TierMid); got != "gemini-4-argon" {
+		t.Errorf("gemini/mid = %q, want the discovered model priced in the same file", got)
+	}
+}
+
+func TestLoadUserOverrides_InvalidDiscoveredIsIgnoredAndRoutingStillApplies(t *testing.T) {
+	for name, disc := range map[string]string{
+		"unknown tier":     `{"models": {"codex": {"ultra": "gpt-6-astra"}}}`,
+		"unknown provider": `{"models": {"codex": {"premium": "gpt-6-astra"}}, "strategies": {"fast": {"code": {"providers": ["nobody"]}}}}`,
+		"malformed":        `{"models": `,
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := mustNewRouter(RouterConfig{})
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "discovered.json"), []byte(disc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			user := `{"models": {"claude": {"mid": "claude-sonnet-5-5"}}}`
+			if err := os.WriteFile(filepath.Join(dir, "routing.json"), []byte(user), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.LoadUserOverrides(dir); err != nil {
+				t.Fatalf("an invalid discovered.json must not fail the load: %v", err)
+			}
+			if got := r.routingTables().modelID("claude", TierMid); got != "claude-sonnet-5-5" {
+				t.Errorf("routing.json not applied: claude/mid = %q", got)
+			}
+			if got := r.routingTables().modelID("codex", TierPremium); got == "gpt-6-astra" {
+				t.Error("an invalid discovered.json must be ignored as a whole")
+			}
+		})
+	}
+}
+
+func TestLoadUserOverrides_UnpricedModelInRoutingJSONStillFails(t *testing.T) {
+	r := mustNewRouter(RouterConfig{})
+	dir := t.TempDir()
+	user := `{"models": {"gemini": {"mid": "gemini-4-argon"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "routing.json"), []byte(user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := r.LoadUserOverrides(dir)
+	if err == nil || !strings.Contains(err.Error(), "routing.json") {
+		t.Fatalf("an unpriced model the user pinned must fail loudly, got %v", err)
+	}
+}
