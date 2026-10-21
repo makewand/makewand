@@ -302,3 +302,36 @@ func TestLoadUserOverrides_UnpricedModelInRoutingJSONStillFails(t *testing.T) {
 		t.Fatalf("an unpriced model the user pinned must fail loudly, got %v", err)
 	}
 }
+
+func TestLoadUserOverrides_DiscoveredPartialCostAndEmptyModelAreIgnored(t *testing.T) {
+	r := mustNewRouter(RouterConfig{})
+	dir := t.TempDir()
+	// A dropped model's half price must not survive as an entry with the
+	// other rate at $0, and an empty model ID must not blank the tier.
+	disc := `{"models": {"gemini": {"mid": "gemini-4-argon", "premium": ""}},
+		"costs": {"gemini-4-argon": {"input": 1.25}}}`
+	if err := os.WriteFile(filepath.Join(dir, "discovered.json"), []byte(disc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.LoadUserOverrides(dir); err != nil {
+		t.Fatal(err)
+	}
+	tables := r.routingTables()
+	if _, ok := tables.costFor("gemini-4-argon"); ok {
+		t.Error("a partial discovered price for an unpriced model must be dropped")
+	}
+	if got := tables.modelID("gemini", TierMid); got != testModelID("gemini", TierMid) {
+		t.Errorf("gemini/mid = %q, want the built-in model", got)
+	}
+	if got := tables.modelID("gemini", TierPremium); got != testModelID("gemini", TierPremium) {
+		t.Errorf("gemini/premium = %q, want the built-in model, not an empty tier", got)
+	}
+	// routing.json pinning that model therefore still fails as unpriced.
+	user := `{"models": {"gemini": {"mid": "gemini-4-argon"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "routing.json"), []byte(user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.LoadUserOverrides(dir); err == nil || !strings.Contains(err.Error(), "routing.json") {
+		t.Fatalf("routing.json pinning a model with only a discovered half price must fail, got %v", err)
+	}
+}

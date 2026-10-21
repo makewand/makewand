@@ -650,27 +650,36 @@ func parsePhaseStrict(s string) (BuildPhase, error) {
 // pricedProviders are the providers whose every model must have a costs entry.
 var pricedProviders = map[string]bool{"claude": true, "gemini": true, "openai": true}
 
-// pricedDiscoveredModels returns raw without the model entries of priced
-// providers whose model has no price, in t or in raw itself.
+// pricedDiscoveredModels returns raw without what discovery cannot back:
+// model entries that are empty or, for priced providers, have no price in t
+// or in raw itself (those tiers keep their built-in model), and partial cost
+// entries for models t does not price yet, which would otherwise leave a
+// model "priced" with one rate at $0.
 func pricedDiscoveredModels(raw rawDefaults, t *strategyTables) rawDefaults {
-	priced := func(modelID string) bool {
-		if c, ok := raw.Costs[modelID]; ok && c.Input != nil && c.Output != nil {
-			return true
-		}
+	known := func(modelID string) bool {
 		_, ok := t.costFor(modelID)
 		return ok
+	}
+	costs := make(map[string]rawCost, len(raw.Costs))
+	for modelID, c := range raw.Costs {
+		if (c.Input != nil && c.Output != nil) || known(modelID) {
+			costs[modelID] = c
+		}
 	}
 	models := make(map[string]map[string]string, len(raw.Models))
 	for prov, tiers := range raw.Models {
 		kept := make(map[string]string, len(tiers))
 		for tier, modelID := range tiers {
-			if !pricedProviders[prov] || modelID == "" || priced(modelID) {
+			if modelID == "" {
+				continue
+			}
+			if _, priced := costs[modelID]; !pricedProviders[prov] || priced || known(modelID) {
 				kept[tier] = modelID
 			}
 		}
 		models[prov] = kept
 	}
-	raw.Models = models
+	raw.Models, raw.Costs = models, costs
 	return raw
 }
 
