@@ -519,8 +519,10 @@ func (b *budgetReservations) take() []float64 {
 // codex table's "codex-cli" placeholder, at $0: it covered gpt-4o-mini where
 // routing.json points openai at it, and nothing, leaving only the floor, for a
 // token scoped to claude (a subscription CLI) and codex. Each request calls o1
-// once; the reservation must cover that call and a call of o1 at the least
-// output a Power request may ask for.
+// once, and each reservation must be at least what a deployment whose openai
+// route itself calls o1 reserves for it. That holds for the first request too,
+// before any request has built the codex provider, because the model factory
+// declares the model the codex route calls.
 func TestServeAPIOnlyReservationCoversTheModelTheCodexRouteCalls(t *testing.T) {
 	const scopedToken = "fixture-scoped-token" //nolint:gosec // G101: a test fixture, not a credential.
 	authz, err := serverauth.NewAuthorizer(serverauth.Config{Tokens: []serverauth.TokenRule{{
@@ -529,7 +531,38 @@ func TestServeAPIOnlyReservationCoversTheModelTheCodexRouteCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fullOutputCall := router.EstimateCost("o1", 0, router.MaxTokensForTask(router.TaskCode))
+	type request struct {
+		prompt string
+		stream bool
+	}
+	var requests []request
+	for _, prompt := range []string{"write a function that adds two numbers", "fix the bug in this function"} {
+		requests = append(requests, request{prompt, false}, request{prompt, true})
+	}
+	scaled := func(d apiOnlyDeployment, reservations *budgetReservations) apiOnlyDeployment {
+		d.options.BudgetReservationUSD = 0.0001
+		d.options.ScaleBudgetReservation = true
+		d.options.BudgetReserver = reservations
+		return d
+	}
+	powerChat := func(req request) map[string]any {
+		body := apiOnlyChat("", req.prompt, req.stream)
+		body["mode"] = "power"
+		return body
+	}
+	atO1 := map[request]float64{}
+	reference := &budgetReservations{}
+	ref, _, _ := apiOnlyServeWith(t, scaled(apiOnlyDeployment{openAIModel: "o1"}, reference))
+	for _, req := range requests {
+		if rec := apiOnlyPost(t, ref, "/v1/chat/completions", powerChat(req)); rec.Code != http.StatusOK {
+			t.Fatalf("reference %+v: status %d body %s", req, rec.Code, rec.Body.String())
+		}
+		reserved := reference.take()
+		if len(reserved) != 1 {
+			t.Fatalf("reference %+v: reservations %v, want one", req, reserved)
+		}
+		atO1[req] = reserved[0]
+	}
 	for _, tc := range []struct {
 		name       string
 		deployment apiOnlyDeployment
@@ -540,27 +573,19 @@ func TestServeAPIOnlyReservationCoversTheModelTheCodexRouteCalls(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reservations := &budgetReservations{}
-			deployment := tc.deployment
-			deployment.options.BudgetReservationUSD = 0.0001
-			deployment.options.ScaleBudgetReservation = true
-			deployment.options.BudgetReserver = reservations
-			h, upstream, usage := apiOnlyServeWith(t, deployment)
-			for _, prompt := range []string{"write a function that adds two numbers", "fix the bug in this function"} {
-				for _, stream := range []bool{false, true} {
-					body := apiOnlyChat("", prompt, stream)
-					body["mode"] = "power"
-					rec := apiOnlyPostAs(t, h, tc.token, "/v1/chat/completions", body)
-					if rec.Code != http.StatusOK {
-						t.Fatalf("%q stream=%t: status %d body %s", prompt, stream, rec.Code, rec.Body.String())
-					}
-					if models := upstream.take(); !slices.Equal(models, []string{"o1"}) {
-						t.Fatalf("%q stream=%t: upstream models %q, want [o1]", prompt, stream, models)
-					}
-					spent := onlyUsageEntry(t, usage).CostUSD
-					reserved := reservations.take()
-					if len(reserved) != 1 || reserved[0] < spent || reserved[0] < fullOutputCall {
-						t.Fatalf("%q stream=%t: reserved $%v for a request that spent $%v; one o1 call can spend $%v", prompt, stream, reserved, spent, fullOutputCall)
-					}
+			h, upstream, usage := apiOnlyServeWith(t, scaled(tc.deployment, reservations))
+			for _, req := range requests {
+				rec := apiOnlyPostAs(t, h, tc.token, "/v1/chat/completions", powerChat(req))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("%+v: status %d body %s", req, rec.Code, rec.Body.String())
+				}
+				if models := upstream.take(); !slices.Equal(models, []string{"o1"}) {
+					t.Fatalf("%+v: upstream models %q, want [o1]", req, models)
+				}
+				spent := onlyUsageEntry(t, usage).CostUSD
+				reserved := reservations.take()
+				if len(reserved) != 1 || reserved[0] < spent || reserved[0] < atO1[req] {
+					t.Fatalf("%+v: reserved $%v for a request that spent $%v; where openai calls o1 the request reserves $%v", req, reserved, spent, atO1[req])
 				}
 			}
 		})
