@@ -18,6 +18,8 @@ All notable changes to this project are documented here. The format is based on
 
 ### Security
 
+- Go 工具链指令升级到 `1.26.10`（含 GO-2026-6809：crypto/x509 不再信任被攻破的中间证书）；Docker 构建镜像同步。
+
 修复 2026-10-10 安全审计的全部未闭环项（Python 与 Go 两个引擎）：
 
 - **启动器完整性**：`bwrap`、`systemd-run`、`prlimit` 只从 root 拥有、不可写的系统目录解析，不再经 `$PATH`（仓库内的 `.venv/bin`、`node_modules/.bin` 无法再冒充 bwrap）。
