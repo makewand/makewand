@@ -37,8 +37,9 @@ func (r *Router) EnsembleWithError(ctx context.Context, phase BuildPhase, messag
 }
 
 // ensemble is EnsembleWithError. Its terminal error prefers an unknown
-// outcome; refused tells whether admission or accounting refused a generator
-// too, which that error then does not show.
+// outcome, and shows every login switch too (ensembleTerminal); refused tells
+// whether a generator was refused in a way that ends the request
+// (requestRefusal), which an unknown outcome reported instead does not show.
 func (r *Router) ensemble(ctx context.Context, phase BuildPhase, messages []Message, system string, exclude ...string) ([]EnsembleResult, bool, error) {
 	var err error
 	ctx, err = r.executionContext(ctx)
@@ -110,9 +111,7 @@ func (r *Router) ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 
 	maxTokens := maxTokensForPhase(phase)
 	results := make([]EnsembleResult, len(slots))
-	var terminalMu sync.Mutex
-	var terminalErr error
-	refused := false
+	terminal := make([]error, len(slots)) // a slot's ensembleTerminal error
 	var wg sync.WaitGroup
 	for i, s := range slots {
 		wg.Add(1)
@@ -145,13 +144,8 @@ func (r *Router) ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 				provider: sl.p,
 			})
 			if res.err != nil || res.skipped {
-				if stopExecutionReplay(res.err) {
-					terminalMu.Lock()
-					if terminalErr == nil || errors.Is(res.err, execution.ErrUnknownOutcome) {
-						terminalErr = res.err
-					}
-					refused = refused || !onlyUnknownOutcome(res.err)
-					terminalMu.Unlock()
+				if ensembleTerminal(res.err) {
+					terminal[idx] = res.err
 				}
 				modelID := res.route.ModelID
 				if modelID == "" {
@@ -186,7 +180,37 @@ func (r *Router) ensemble(ctx context.Context, phase BuildPhase, messages []Mess
 		Phase:  buildPhaseName(phase),
 		Detail: fmt.Sprintf("success=%d/%d usable=%d", len(out), len(slots), usable),
 	})
+	var terminalErr error
+	var switches []error
+	refused := false
+	for _, err := range terminal {
+		if err == nil {
+			continue
+		}
+		refused = refused || !onlyUnknownOutcome(err)
+		if errors.Is(err, errLoginSwitch) {
+			switches = append(switches, err)
+		} else if terminalErr == nil || errors.Is(err, execution.ErrUnknownOutcome) && !errors.Is(terminalErr, execution.ErrUnknownOutcome) {
+			terminalErr = err
+		}
+	}
+	// A login switch carries no execution status of its own: joined to the
+	// error, it never hides that error's status.
+	for _, err := range switches {
+		if terminalErr == nil {
+			terminalErr = err
+		} else {
+			terminalErr = errors.Join(terminalErr, err)
+		}
+	}
 	return out, refused, terminalErr
+}
+
+// ensembleTerminal reports whether err, a generator's or the judge's, must
+// reach the caller instead of only dropping that call: its outcome must not be
+// replayed (stopExecutionReplay), or its selected login switched accounts.
+func ensembleTerminal(err error) bool {
+	return stopExecutionReplay(err) || errors.Is(err, errLoginSwitch)
 }
 
 // judgeSelect asks the designated judge provider to pick the best result from an ensemble.
@@ -278,7 +302,7 @@ func (r *Router) judgeSelectForRequestWithError(ctx context.Context, phase Build
 	if judgeResult.err != nil || judgeResult.skipped {
 		winner := selectedWithoutJudgeUsage(results[0])
 		winner.Usage = judgeResult.usage
-		if stopExecutionReplay(judgeResult.err) {
+		if ensembleTerminal(judgeResult.err) {
 			return winner, judgeResult.err
 		}
 		return winner, nil
@@ -470,7 +494,8 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	// A generator whose outcome is unknown is never replayed, but it does not
 	// discard the answers the others gave either: its attempt stays in the
 	// trace (ensemble_generator_error) and in the usage below. A generator
-	// refused by admission or accounting still ends the request.
+	// refused by accounting or the call budget, or because its login switched
+	// to another account, still ends the request (requestRefusal).
 	if ensembleErr != nil && (len(results) == 0 || refused || !onlyUnknownOutcome(ensembleErr)) {
 		var total Usage
 		for _, attempt := range attempts {

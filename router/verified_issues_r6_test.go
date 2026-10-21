@@ -67,13 +67,14 @@ func TestR6ClaudeBindingIgnoresStateButRejectsLoginChanges(t *testing.T) {
 	if err := verifyCredentialBinding(ctx, "claude"); err == nil {
 		t.Fatal("account change accepted")
 	}
-	// A known account is bound by its accountUuid: refreshed tokens of the same
-	// account are no login change (TestR8ReadableTokenChangeStillRefused keeps
-	// the byte comparison for a login without a known account).
+	// Claude keeps its tokens apart from its accountUuid, so a known account
+	// does not tell whose tokens .credentials.json holds: they stay bound by
+	// their bytes (a refresh by the lease holder a call waited for precedes the
+	// binding: TestLeaseWaitSameAccountRefreshIsNoAccountSwitch).
 	write(state, raw)
 	write(credentials, `{"fixture":"changed"}`)
-	if err := verifyCredentialBinding(ctx, "claude"); err != nil {
-		t.Fatalf("same-account token refresh refused: %v", err)
+	if err := verifyCredentialBinding(ctx, "claude"); err == nil {
+		t.Fatal("credential change accepted")
 	}
 	if err := os.Remove(credentials); err != nil {
 		t.Fatal(err)

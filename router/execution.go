@@ -17,6 +17,12 @@ import (
 var errExecutionAccounting = errors.New("execution accounting failed")
 var errExecutionAdmission = errors.New("execution admission interrupted")
 
+// errLoginSwitch marks the refusal to launch a subscription CLI whose selected
+// login is no longer the one admitted for the call (bindLeasedCredentials,
+// credentialBinding.verify): a safety refusal, which is no provider failure
+// and which ends a Power request (requestRefusal).
+var errLoginSwitch = errors.New("refusing account switch")
+
 type providerAttemptKey struct{}
 type providerLifecycleKey struct{}
 type providerAttemptSlot struct {
@@ -206,10 +212,18 @@ func stopExecutionReplay(err error) bool {
 	return replayStoppingUnknown(err) || errors.Is(err, errExecutionAccounting) || errors.Is(err, execution.ErrBudgetExhausted)
 }
 
+// requestRefusal reports whether err refused a call in a way that ends the
+// request, whatever its other calls produced: accounting failed, the call
+// budget is exhausted, or the selected login switched accounts after
+// admission (errLoginSwitch).
+func requestRefusal(err error) bool {
+	return errors.Is(err, errExecutionAccounting) || errors.Is(err, execution.ErrBudgetExhausted) || errors.Is(err, errLoginSwitch)
+}
+
 // onlyUnknownOutcome reports whether err stops replay only because a call's
-// outcome is unknown, not because admission or accounting refused a call.
+// outcome is unknown, not because a call was refused (requestRefusal).
 func onlyUnknownOutcome(err error) bool {
-	return errors.Is(err, execution.ErrUnknownOutcome) && !errors.Is(err, errExecutionAccounting) && !errors.Is(err, execution.ErrBudgetExhausted)
+	return errors.Is(err, execution.ErrUnknownOutcome) && !requestRefusal(err)
 }
 
 // readOnlyUnknownError is the unknown outcome of a CLI exit in a read-only run

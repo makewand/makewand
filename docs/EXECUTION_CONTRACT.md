@@ -48,8 +48,10 @@ stays `UNKNOWN` and stops replay. The raw comparison arm (`cmd/versus`) records
 its runs by the same rule. In Power mode an `UNKNOWN` generator or judge is
 never replayed, but it does not discard the answers the other generators
 produced: the surviving or first answer is returned, and the unknown attempt
-stays in the trace and the usage. A generator refused by admission or
-accounting still ends the request.
+stays in the trace and the usage. A generator refused by accounting or the call
+budget still ends the request, and so does a generator or judge whose selected
+login switched to another account after admission: a safety refusal, not a
+provider failure.
 
 Provider-result `duration_ms` measures provider execution. Accounting and
 telemetry use bounded independent cleanup so cancellation cannot erase an

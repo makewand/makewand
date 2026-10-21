@@ -1701,6 +1701,17 @@ func wrapCLICommandWithSandbox(ctx context.Context, provider string, cmd *exec.C
 			"--setenv", accountVariable, realCodexHome)
 		bwrapArgs = cliShieldProviderState(bwrapArgs, p, realCodexHome, workspace, false, true)
 	}
+	// The login was copied one file after another, and Claude keeps its tokens
+	// apart from its account: once the copy is complete, read both again, so a
+	// switch that landed on the host while the copy ran is refused before launch.
+	if privHome != nil {
+		if hook := cliPrivateHomeCopied.Load(); hook != nil {
+			(*hook)()
+		}
+	}
+	if err := verifyCredentialBinding(ctx, p); err != nil {
+		return nil, err
+	}
 	// Selected-account mounting and foreign-account masking are independent.
 	for _, foreign := range []struct{ provider, variable string }{
 		{"codex", "CODEX_HOME"}, {"claude", "CLAUDE_CONFIG_DIR"},

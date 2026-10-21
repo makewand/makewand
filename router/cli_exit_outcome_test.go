@@ -521,38 +521,117 @@ func TestChatBestPowerUnknownGeneratorReturnsOtherGeneratorsAnswer(t *testing.T)
 	}
 }
 
-// The ensemble reports an unknown outcome in preference to a refusal, but a
-// generator refused by accounting still ends ChatBest, whatever the other
-// generators produced: no judge picks among the survivors.
-func TestChatBestPowerAccountingRefusalBesideUnknownGeneratorEndsRequest(t *testing.T) {
-	isolateCLITestHome(t)
+// failingProvider is a provider named name whose calls fail with err.
+func failingProvider(name string, err error) *spendThenFailProvider {
+	return &spendThenFailProvider{ensembleCaptureProvider: ensembleCaptureProvider{name: name, available: true}, err: err}
+}
+
+// fourGeneratorPowerRouter is a Power router whose code phase runs the
+// generators claude and codex, which answer, then grok and muse, judged by
+// judge.
+func fourGeneratorPowerRouter(t *testing.T, grok, muse Provider, judge *ensembleCaptureProvider) *Router {
+	t.Helper()
 	configDir := t.TempDir()
 	overrides := `{"models":{"grok":{"cheap":"grok-x","mid":"grok-x","premium":"grok-x"},"muse":{"cheap":"muse-x","mid":"muse-x","premium":"muse-x"}},` +
 		`"power_ensemble":{"code":{"generators":["claude","codex","grok","muse"],"judge":"gemini"}}}`
 	if err := os.WriteFile(filepath.Join(configDir, "routing.json"), []byte(overrides), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	failing := func(name string, err error) Provider {
-		return &spendThenFailProvider{ensembleCaptureProvider: ensembleCaptureProvider{name: name, available: true}, err: err}
-	}
-	judge := &ensembleCaptureProvider{name: "gemini", available: true, content: "WINNER: 1"}
 	providers := map[string]ProviderEntry{
 		"claude": {Provider: &ensembleCaptureProvider{name: "claude", available: true, content: "claude answer"}, Access: AccessSubscription},
 		"codex":  {Provider: &ensembleCaptureProvider{name: "codex", available: true, content: "codex answer"}, Access: AccessSubscription},
-		"grok":   {Provider: failing("grok", fmt.Errorf("%w: synthetic ledger write failure", errExecutionAccounting)), Access: AccessSubscription},
-		"muse":   {Provider: failing("muse", newProviderError("muse", "CLI", ErrorKindProvider, false, 0, "muse CLI exited 1", nil)), Access: AccessSubscription},
+		"grok":   {Provider: grok, Access: AccessSubscription},
+		"muse":   {Provider: muse, Access: AccessSubscription},
 		"gemini": {Provider: judge, Access: AccessSubscription},
 	}
 	r, err := NewRouterFromConfig(RouterConfig{Providers: providers, UsageMode: "power", ConfigDir: configDir})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return r
+}
+
+// The ensemble reports an unknown outcome in preference to a refusal, but a
+// generator refused by accounting still ends ChatBest, whatever the other
+// generators produced: no judge picks among the survivors.
+func TestChatBestPowerAccountingRefusalBesideUnknownGeneratorEndsRequest(t *testing.T) {
+	isolateCLITestHome(t)
+	judge := &ensembleCaptureProvider{name: "gemini", available: true, content: "WINNER: 1"}
+	r := fourGeneratorPowerRouter(t,
+		failingProvider("grok", fmt.Errorf("%w: synthetic ledger write failure", errExecutionAccounting)),
+		failingProvider("muse", newProviderError("muse", "CLI", ErrorKindProvider, false, 0, "muse CLI exited 1", nil)),
+		judge)
 	out, _, _, err := r.ChatBest(context.Background(), PhaseCode, []Message{{Role: "user", Content: "implement it"}}, "")
 	judge.mu.Lock()
 	judged := judge.calls
 	judge.mu.Unlock()
 	if err == nil || out != "" || judged != 0 {
 		t.Fatalf("ChatBest = %q err=%v judge calls=%d, want the request ended by the refusal", out, err, judged)
+	}
+}
+
+// leaseWaitSwitchRefusal is the refusal of a codex call whose selected login
+// switched to another account while the call waited for its account lease.
+func leaseWaitSwitchRefusal(t *testing.T) error {
+	t.Helper()
+	login := leaseWaitSetup(t, "codex", true)
+	login.write(t, "A", "token-a")
+	_, attempt, _, err := reserveAfterLeaseWait(t, login, func() { login.write(t, "B", "token-b") })
+	if err == nil {
+		_ = attempt.Complete(execution.Outcome{Status: execution.Unknown})
+		t.Fatal("login switch during the lease wait admitted")
+	}
+	return err
+}
+
+// A generator whose selected login switched to another account while it
+// waited for its account lease is refused for safety, which is no provider
+// failure: the refusal ends the Power request, whatever the other generators
+// produced, and no judge picks among them. Beside a generator ending UNKNOWN
+// the request reports both, with the unknown outcome's status.
+func TestChatBestPowerGeneratorLoginSwitchEndsRequest(t *testing.T) {
+	refusal := leaseWaitSwitchRefusal(t)
+	for _, unknownBeside := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unknown beside=%v", unknownBeside), func(t *testing.T) {
+			isolateCLITestHome(t)
+			var muse Provider = &ensembleCaptureProvider{name: "muse", available: true, content: "muse answer"}
+			if unknownBeside {
+				muse = failingProvider("muse", newProviderError("muse", "CLI", ErrorKindProvider, false, 0, "muse CLI exited 1", nil))
+			}
+			judge := &ensembleCaptureProvider{name: "gemini", available: true, content: "WINNER: 1"}
+			r := fourGeneratorPowerRouter(t, failingProvider("grok", refusal), muse, judge)
+			out, _, _, err := r.ChatBest(context.Background(), PhaseCode, []Message{{Role: "user", Content: "implement it"}}, "")
+			judge.mu.Lock()
+			judged := judge.calls
+			judge.mu.Unlock()
+			if out != "" || judged != 0 || !errors.Is(err, errLoginSwitch) || !errors.Is(err, errExecutionAdmission) {
+				t.Fatalf("ChatBest = %q err=%v judge calls=%d, want the request ended by the login switch", out, err, judged)
+			}
+			if unknownBeside && (!errors.Is(err, execution.ErrUnknownOutcome) || execution.ErrorStatus(err) != execution.Unknown) {
+				t.Fatalf("err=%v status=%s, want the unknown outcome reported with the switch", err, execution.ErrorStatus(err))
+			}
+			if failures := r.usage.FailureCount("grok"); failures != 0 {
+				t.Fatalf("login switch counted as %d provider failure(s)", failures)
+			}
+		})
+	}
+}
+
+// The judge's selected login switching accounts while it waited for its
+// account lease ends the request with that refusal too, instead of returning
+// the first candidate as for a judge that failed.
+func TestChatBestPowerJudgeLoginSwitchEndsRequest(t *testing.T) {
+	refusal := leaseWaitSwitchRefusal(t)
+	isolateCLITestHome(t)
+	first := &ensembleCaptureProvider{name: "claude", available: true, content: "claude answer"}
+	second := &ensembleCaptureProvider{name: "codex", available: true, content: "codex answer"}
+	r := powerReviewRouter(failingProvider("gemini", refusal), first, second)
+	out, _, _, err := r.ChatBest(context.Background(), PhaseCode, []Message{{Role: "user", Content: "implement it"}}, "")
+	if out != "" || !errors.Is(err, errLoginSwitch) || !errors.Is(err, errExecutionAdmission) {
+		t.Fatalf("ChatBest = %q err=%v, want the request ended by the judge's login switch", out, err)
+	}
+	if failures := r.usage.FailureCount("gemini"); failures != 0 {
+		t.Fatalf("login switch counted as %d provider failure(s)", failures)
 	}
 }
 
