@@ -182,6 +182,15 @@ Missing detected Go/npm/Cargo test tools or malformed Node test configuration
 produce `UNVERIFIED`; they are never silently skipped. A pipeline without
 executed local test evidence stops before review and delivery. Python's
 unittest fallback reporting zero tests is also unverified.
+The Python runner is chosen inside the sandbox, not by the host interpreter: a
+read-only probe there decides whether pytest can be imported (a user-site pytest
+the sandbox hides cannot), otherwise unittest runs. Tests that cannot run are
+`UNVERIFIED`, not failing tests: a pytest configuration without an importable
+pytest, pytest or unittest exit code 5 (nothing collected or run), zero executed
+tests, and pytest's own import error with or without quotes. A gate whose time
+budget runs out before every suite produced a result is `TIMEOUT` (exit 16),
+unless a suite already reported failing tests. Neither outcome starts an auto-fix
+round or ends as `FAILED`.
 Saved candidates require explicit generation, test and review passes for normal
 application. Missing SDK metadata remains unknown; it is never inferred from
 generation success. An explicit human `--force` decision remains supported.

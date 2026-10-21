@@ -491,6 +491,21 @@ class LocalTestsUnavailable(str):
     execution_status = "UNVERIFIED"
 
 
+class LocalTestsTimedOut(LocalTestsUnavailable):
+    """The gate's time budget ran out before the tests produced a result."""
+    execution_status = "TIMEOUT"
+
+
+# Gate results that carry no test evidence: never auto-fixed, never reported as failing tests.
+LOCAL_TESTS_NO_EVIDENCE = ("UNVERIFIED", "TIMEOUT")
+# pytest (no tests collected) and unittest on Python 3.12+ (no tests ran) both exit 5.
+_NO_TESTS_EXIT = 5
+# Python's import error for pytest itself: unquoted from `python -m pytest`, quoted in a
+# ModuleNotFoundError traceback (pytest scripts, test modules importing pytest).
+_PYTEST_MISSING = re.compile(r"No module named '?pytest'?(?![\w.])")
+_PYTEST_ARGS = ("-q", "-p", "no:cacheprovider", "-p", "no:langsmith", "-p", "no:django")
+
+
 TRANSIENT_BYTECODE_DIRS = frozenset({"__pycache__", ".pytest_cache"})
 TRANSIENT_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 
@@ -1024,13 +1039,36 @@ def _filter_non_deliverable_test_changes(paths: List[str], cwd: str) -> List[str
     return [p for p in candidates if p.replace("\\", "/") in tracked or not _gitignore_rules_ignore(p, rules)]
 
 
+def _sandbox_infra_failure(code, stdout, stderr, err_category) -> Optional[str]:
+    """The sandbox itself failed (bwrap missing, refused or erroring), not the command it ran."""
+    out = (stdout + "\n" + stderr).strip()
+    if code == 0 or not (
+        err_category in ("SandboxUnavailable", "SandboxConfigError")
+        or (stderr and stderr.strip().startswith("bwrap:"))
+        or (out and out.strip().startswith("bwrap:"))
+    ):
+        return None
+    if stderr and stderr.strip().startswith("bwrap:"):
+        infra_err = stderr
+    elif out and out.strip().startswith("bwrap:"):
+        infra_err = out
+    else:
+        infra_err = stderr or out
+    if err_category == "SandboxUnavailable" and "Bubblewrap 沙箱不可用" not in infra_err:
+        infra_err = f"Bubblewrap 沙箱不可用: {infra_err}"
+    return infra_err
+
+
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
     Deterministically detects and runs local unit test suites in cwd inside Bubblewrap sandbox.
     Supports composite / multi-stack projects (Python, Go, Node, Rust).
-    All suites and fallback commands share one wall-clock deadline.
+    All suites, runner probes and fallback commands share one wall-clock deadline.
     Returns (passed: bool, details: Optional[str]).
     If no tests exist in project, returns (True, None).
+    Tests that cannot run (no runner, nothing collected, sandbox failure) return
+    LocalTestsUnavailable; a budget that runs out first returns LocalTestsTimedOut.
+    Neither is a test failure.
     Test output the run created is removed again (_discard_created_test_output), so
     that it is neither a change after the test nor part of the reviewed change.
     """
@@ -1056,7 +1094,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         _print(c(f"⚠️ [Fast Syntax Gate] 语法预检执行提示: {e}", COLOR_YELLOW), file=sys.stderr)
 
     if remaining_timeout() <= 0:
-        return False, "本地测试总时间预算已耗尽"
+        return False, LocalTestsTimedOut("本地测试总时间预算已耗尽，未启动本地测试")
 
     test_suites = []
     py_env = {"PYTHONPATH": cwd + os.pathsep + os.environ.get("PYTHONPATH", ""), "PYTHONDONTWRITEBYTECODE": "1"}
@@ -1074,17 +1112,10 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         except (ImportError, OSError, ValueError):
             pass
     if pytest_config or py_tests:
-        py_bin = sys.executable or "python3"
-        test_target = []  # Respect pytest configuration and collect root-level tests too.
-        try:
-            import pytest
-            py_cmd = [py_bin, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:langsmith", "-p", "no:django"] + test_target
-        except ImportError:
-            if shutil.which("pytest"):
-                py_cmd = ["pytest", "-q", "-p", "no:cacheprovider", "-p", "no:langsmith", "-p", "no:django"] + test_target
-            else:
-                py_cmd = [py_bin, "-B", "-m", "unittest", "discover", "-q"]
-        test_suites.append(("Python", py_cmd, py_env))
+        # The runner is chosen inside the sandbox right before the suite runs
+        # (python_runner): the host interpreter can import packages, such as a
+        # user-site pytest, that the sandbox hides.
+        test_suites.append(("Python", None, py_env))
 
     # 2. Go test suites
     if (p / "go.mod").exists():
@@ -1128,54 +1159,86 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     except OSError:
         held_dirs = None
 
-    all_passed = True
+    def sandboxed(cmd, env, step_timeout, readonly=False):
+        return run_in_sandbox(cmd=cmd, workspace=cwd, timeout=step_timeout, allow_network=False,
+                              readonly=readonly, is_provider=False, extra_env=env)
+
+    def python_runner(env):
+        """Choose pytest or unittest from what the sandboxed interpreter can import.
+
+        Returns (cmd, None), or (None, reason) when the Python suite cannot run.
+        """
+        py_bin = sys.executable or "python3"
+        # (probe, runner, lenient): a lenient probe rules its runner out only on pytest's
+        # own import error. `pytest --version` may load plugins and conftest.py, and a
+        # failure there is left for the real run to report.
+        options = [([py_bin, "-B", "-c", "import pytest"], [py_bin, "-B", "-m", "pytest", *_PYTEST_ARGS], False)]
+        if shutil.which("pytest"):
+            options.append((["pytest", *_PYTEST_ARGS, "--version"], ["pytest", *_PYTEST_ARGS], True))
+        for probe, runner, lenient in options:
+            step_timeout = remaining_timeout()
+            if step_timeout <= 0:
+                break
+            code, stdout, stderr, err_category = sandboxed(probe, env, step_timeout, readonly=True)
+            if remaining_timeout() <= 0:
+                break
+            infra_err = _sandbox_infra_failure(code, stdout, stderr, err_category)
+            if infra_err:
+                return None, LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
+            if code == 0 or (lenient and not _PYTEST_MISSING.search(stdout + "\n" + stderr)):
+                return runner, None
+        if remaining_timeout() <= 0:
+            return None, LocalTestsTimedOut("本地测试总时间预算已耗尽，未能在沙箱内确认 Python 测试运行器")
+        if pytest_config:
+            return None, LocalTestsUnavailable("项目配置了 pytest，但沙箱内的 Python 无法导入 pytest，测试无法运行，验收未执行")
+        return [py_bin, "-B", "-m", "unittest", "discover", "-q"], None
+
+    failed = False      # a suite reported failing tests, or the run changed deliverable inputs
+    timed_out = False   # the budget ran out before every suite produced a result
     details = []
 
     for name, cmd, env in test_suites:
+        if name == "Python":
+            cmd, unavailable = python_runner(env)
+            if isinstance(unavailable, LocalTestsTimedOut):
+                timed_out = True
+                details.append(str(unavailable))
+                break
+            if unavailable is not None:
+                return False, unavailable
         step_timeout = remaining_timeout()
         if step_timeout <= 0:
-            all_passed = False
+            timed_out = True
             details.append("本地测试总时间预算已耗尽，未启动剩余测试套件")
             break
-        code, stdout, stderr, err_category = run_in_sandbox(
-            cmd=cmd,
-            workspace=cwd,
-            timeout=step_timeout,
-            allow_network=False,
-            readonly=False,
-            is_provider=False,
-            extra_env=env
-        )
-        if code != 0:
-            output = (stdout + "\n" + stderr).strip()
-            # If pytest failed because pytest is not installed in the target sandbox python, fallback to unittest!
-            if name == "Python" and "No module named pytest" in output:
-                step_timeout = remaining_timeout()
-                if step_timeout <= 0:
-                    all_passed = False
-                    details.append("本地测试总时间预算已耗尽，未启动 unittest 回退")
-                    break
-                py_bin = sys.executable or "python3"
-                fallback_cmd = [py_bin, "-B", "-m", "unittest", "discover", "-q"]
-                cmd = fallback_cmd
-                code, stdout, stderr, err_category = run_in_sandbox(
-                    cmd=fallback_cmd,
-                    workspace=cwd,
-                    timeout=step_timeout,
-                    allow_network=False,
-                    readonly=False,
-                    is_provider=False,
-                    extra_env=env
-                )
-                output = (stdout + "\n" + stderr).strip()
+        code, stdout, stderr, err_category = sandboxed(cmd, env, step_timeout)
+        output = (stdout + "\n" + stderr).strip()
 
         if remaining_timeout() <= 0:
-            all_passed = False
-            details.append(f"[{name} Tests Failed]: 本地测试总时间预算已耗尽")
+            # A result that arrives after the budget is neither a pass nor a tested failure.
+            timed_out = True
+            details.append(f"[{name} Tests Timed Out]: 本地测试总时间预算已耗尽，未取得测试结果")
             break
 
-        if code == 0 and name == "Python" and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", stdout + "\n" + stderr) or "Exit:" in (stdout + "\n" + stderr)):
-            return False, LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
+        if code != 0:
+            infra_err = _sandbox_infra_failure(code, stdout, stderr, err_category)
+            if infra_err:
+                return False, LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
+
+        if name == "Python":
+            unittest_fallback = "unittest" in cmd
+            if code == _NO_TESTS_EXIT:
+                if unittest_fallback:
+                    return False, LocalTestsUnavailable(
+                        "沙箱内的 Python 无法导入 pytest，unittest 未发现可运行的测试用例 (exit 5)；"
+                        "pytest 风格的测试需要沙箱内可导入的 pytest，验收未执行")
+                return False, LocalTestsUnavailable("pytest 未收集到任何测试用例 (exit 5)，不能作为验收证据，验收未执行")
+            missing = _PYTEST_MISSING.search(output) if code != 0 else None
+            if missing:
+                return False, LocalTestsUnavailable(
+                    f"沙箱内无法导入 pytest（{missing.group(0)}），Python 测试无法运行，验收未执行")
+            if code == 0 and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", output) or "Exit:" in output):
+                return False, LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
 
         # A package-level PASS also appears when every test was skipped. Require
         # one verbose test/example PASS; dependencies with no tests are harmless.
@@ -1186,23 +1249,7 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
             return False, LocalTestsUnavailable("Node 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
 
         if code != 0:
-            out = output
-            if (
-                err_category in ("SandboxUnavailable", "SandboxConfigError")
-                or (stderr and stderr.strip().startswith("bwrap:"))
-                or (out and out.strip().startswith("bwrap:"))
-            ):
-                if stderr and stderr.strip().startswith("bwrap:"):
-                    infra_err = stderr
-                elif out and out.strip().startswith("bwrap:"):
-                    infra_err = out
-                else:
-                    infra_err = stderr or out
-                if err_category == "SandboxUnavailable" and "Bubblewrap 沙箱不可用" not in infra_err:
-                    infra_err = f"Bubblewrap 沙箱不可用: {infra_err}"
-                return False, LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
-
-            all_passed = False
+            failed = True
             # Protect LLM context from giant test failure dumps via folded truncation
             try:
                 from makewand.aci import truncate_output_folded
@@ -1230,22 +1277,25 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
         shown = ", ".join(discarded[:20]) + (f" 等 {len(discarded)} 个" if len(discarded) > 20 else "")
         _print(c(f"🧹 [Makewand Test Gate] 已移除本次测试运行生成的测试产物（不纳入审查与交付）: {shown}", COLOR_CYAN))
     if changed:
-        all_passed = False
+        failed = True
         details.append("测试修改了待交付输入，必须重新生成并验证: " + _printable(", ".join(changed[:20])))
     # Test output the run created that could run as code is neither removed nor a tested
     # input above, but it is a new deliverable file nobody reviewed: name it here.
     refused = [(rel, why) for rel, why in refused if rel not in changed]
     if refused:
-        all_passed = False
+        failed = True
         details.append("测试运行新建的以下测试产物可能作为代码执行（或不是普通文件），不会被自动移除，"
                        "也不能不经审查交付，必须删除或改写测试后重新验证: "
                        + _printable(", ".join(f"{rel}（{why}）" for rel, why in refused[:20])
                                     + (f" 等 {len(refused)} 个" if len(refused) > 20 else "")))
 
-    if all_passed:
-        return True, "\n\n".join(details)
-    else:
-        return False, "\n\n".join(details)
+    report = "\n\n".join(details)
+    if failed:
+        # Evidence of a failure stands even when a later suite ran out of time.
+        return False, report
+    if timed_out:
+        return False, LocalTestsTimedOut(report)
+    return True, report
 
 
 
@@ -1384,8 +1434,11 @@ def _stage_call(name, callback, *args, engine=None, wait_for_capacity=None, **kw
         with execution_context(wait_for_capacity=wait_for_capacity):
             result = callback(*args, **kwargs)
         status = getattr(result, "status", None)
-        if name == "test" and isinstance(result, tuple) and len(result) == 2 and result[0] is True and result[1] is None:
-            status = "UNVERIFIED"
+        if name == "test" and isinstance(result, tuple) and len(result) == 2:
+            if result[0] is True and result[1] is None:
+                status = "UNVERIFIED"
+            elif getattr(result[1], "execution_status", None) in LOCAL_TESTS_NO_EVIDENCE:
+                status = result[1].execution_status
         if status is None:
             ok = result[0] if isinstance(result, tuple) else result == 0 if type(result) is int else result is None or bool(result)
             status = "PASSED" if ok else "FAILED"
@@ -2100,8 +2153,11 @@ def _run_pipeline_impl(
     test_ok, test_err = _stage_call("test", run_local_tests, cwd, timeout=get_remaining_timeout(60))
     if not protection_check():
         return False
-    if getattr(test_err, "execution_status", None) == "UNVERIFIED" or (test_ok and test_err is None):
-        return fail_and_cleanup(str(test_err or "未发现可执行的本地测试，验收未验证"), "UNVERIFIED")
+    gate_status = getattr(test_err, "execution_status", None)
+    if gate_status in LOCAL_TESTS_NO_EVIDENCE or (test_ok and test_err is None):
+        # Tests that could not run, or ran out of time, are no evidence either way:
+        # neither delivered nor sent to auto-fix as failing tests.
+        return fail_and_cleanup(str(test_err or "未发现可执行的本地测试，验收未验证"), gate_status or "UNVERIFIED")
     try:
         # Test output the run created is gone already (run_local_tests); any other
         # change since tested_inputs fails the stage, with the gate's own finding kept.
@@ -2365,8 +2421,9 @@ def _run_pipeline_impl(
             test_ok, test_err = _stage_call("test", run_local_tests, cwd, timeout=get_remaining_timeout(60))
             if not protection_check():
                 return False
-            if getattr(test_err, "execution_status", None) == "UNVERIFIED" or (test_ok and test_err is None):
-                return fail_and_cleanup(str(test_err or "修复后未发现可执行的本地测试，验收未验证"), "UNVERIFIED")
+            gate_status = getattr(test_err, "execution_status", None)
+            if gate_status in LOCAL_TESTS_NO_EVIDENCE or (test_ok and test_err is None):
+                return fail_and_cleanup(str(test_err or "修复后未发现可执行的本地测试，验收未验证"), gate_status or "UNVERIFIED")
 
             # Check 1: Regression failure detection
             if pre_fix_test_ok and not test_ok:

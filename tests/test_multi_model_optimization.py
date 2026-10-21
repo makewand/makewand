@@ -157,15 +157,17 @@ class TestMultiFrameworkCompositeTestGate(unittest.TestCase):
 
             with patch("shutil.which", side_effect=lambda x: "/bin/" + x), \
                  patch("makewand.sandbox.run_in_sandbox") as mock_sandbox:
-                # First suite (Python) succeeds, second suite (Go) fails
+                # The in-sandbox pytest probe passes, the Python suite succeeds and
+                # the Go suite fails
                 mock_sandbox.side_effect = [
+                    (0, "", "", None),
                     (0, "Python test pass", "", None),
                     (1, "", "Go compile error", None)
                 ]
                 passed, details = run_local_tests(tmp_dir)
                 self.assertFalse(passed)
                 self.assertIn("Go Tests Failed", details)
-                self.assertEqual(mock_sandbox.call_count, 2)
+                self.assertEqual(mock_sandbox.call_count, 3)
 
 
 class TestCandidateLockingAndAtomicReplace(unittest.TestCase):
