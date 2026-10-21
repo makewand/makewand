@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +20,7 @@ import (
 	"github.com/makewand/makewand/internal/model"
 	"github.com/makewand/makewand/internal/testfixture"
 	"github.com/makewand/makewand/router"
+	"github.com/makewand/makewand/serverauth"
 	"github.com/makewand/makewand/serverusage"
 )
 
@@ -112,12 +116,37 @@ func (l *apiOnlyUsage) take() []serverusage.Entry {
 // Docker shape, which has no subscription CLI.
 func apiOnlyServe(t *testing.T, openAIModel string) (http.Handler, *apiOnlyUpstream, *apiOnlyUsage) {
 	t.Helper()
+	return apiOnlyServeWith(t, apiOnlyDeployment{openAIModel: openAIModel})
+}
+
+// apiOnlyDeployment varies the deployment apiOnlyServeWith builds.
+type apiOnlyDeployment struct {
+	openAIModel string
+	// routing is the config directory's routing.json, when set.
+	routing string
+	// claudeCLI configures a claude CLI, which is registered as installed
+	// but never answers: its binary is missing.
+	claudeCLI bool
+	// options are the facade's options; UsageLogger is always the recorder.
+	options router.HTTPHandlerOptions
+}
+
+// apiOnlyServeWith is apiOnlyServe for the deployment d.
+func apiOnlyServeWith(t *testing.T, d apiOnlyDeployment) (http.Handler, *apiOnlyUpstream, *apiOnlyUsage) {
+	t.Helper()
 	testfixture.ClearProviderEnv(t)
-	for _, key := range []string{"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "MAKEWAND_CONFIG_DIR"} {
+	for _, key := range []string{"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
 		t.Setenv(key, t.TempDir())
 	}
+	configDir := t.TempDir()
+	t.Setenv("MAKEWAND_CONFIG_DIR", configDir)
 	t.Setenv("MAKEWAND_API_POLICY", config.APIPolicyAllowPaid)
 	t.Setenv("MAKEWAND_ENABLE_PROVIDERS", "")
+	if d.routing != "" {
+		if err := os.WriteFile(filepath.Join(configDir, "routing.json"), []byte(d.routing), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	upstream := &apiOnlyUpstream{}
 	upstream.Server = httptest.NewServer(upstream)
 	t.Cleanup(upstream.Close)
@@ -125,16 +154,27 @@ func apiOnlyServe(t *testing.T, openAIModel string) (http.Handler, *apiOnlyUpstr
 	cfg := config.DefaultConfig()
 	cfg.OpenAIAPIKey = "fixture-openai-key"
 	cfg.OpenAIBaseURL = upstream.URL + "/v1"
-	cfg.OpenAIModel = openAIModel
+	cfg.OpenAIModel = d.openAIModel
+	if d.claudeCLI {
+		cfg.CLIs = []config.CLITool{{Name: "claude", BinPath: filepath.Join(t.TempDir(), "claude")}}
+	}
 	rtr, err := serveRouter(cfg, model.RepoTrustTrusted)
 	if err != nil {
 		t.Fatal(err)
 	}
 	usage := &apiOnlyUsage{}
-	return rtr.HTTPHandler(router.HTTPHandlerOptions{UsageLogger: usage}), upstream, usage
+	options := d.options
+	options.UsageLogger = usage
+	return rtr.HTTPHandler(options), upstream, usage
 }
 
 func apiOnlyPost(t *testing.T, h http.Handler, path string, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	return apiOnlyPostAs(t, h, "", path, body)
+}
+
+// apiOnlyPostAs is apiOnlyPost with the bearer token, when one is given.
+func apiOnlyPostAs(t *testing.T, h http.Handler, token, path string, body map[string]any) *httptest.ResponseRecorder {
 	t.Helper()
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -142,9 +182,35 @@ func apiOnlyPost(t *testing.T, h http.Handler, path string, body map[string]any)
 	}
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+// apiOnlyModelIDs returns the model IDs GET /v1/models lists.
+func apiOnlyModelIDs(t *testing.T, h http.Handler) []string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/models: status %d body %s", rec.Code, rec.Body.String())
+	}
+	var list struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, entry := range list.Data {
+		ids = append(ids, entry.ID)
+	}
+	return ids
 }
 
 func apiOnlyChat(model, prompt string, stream bool) map[string]any {
@@ -346,23 +412,7 @@ func TestServeAPIOnlyModelErrorsMatchForStreamedAndPlainRequests(t *testing.T) {
 func TestServeAPIOnlyListsTheOpenAIModelsItAccepts(t *testing.T) {
 	for _, configured := range []string{"", "gpt-4o-mini", "gpt-4.1-nano", "deepseek-chat", "chatgpt-4o-latest"} {
 		h, upstream, _ := apiOnlyServe(t, configured)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("configured=%q: status %d body %s", configured, rec.Code, rec.Body.String())
-		}
-		var list struct {
-			Data []struct {
-				ID string `json:"id"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
-			t.Fatal(err)
-		}
-		var ids []string
-		for _, entry := range list.Data {
-			ids = append(ids, entry.ID)
-		}
+		ids := apiOnlyModelIDs(t, h)
 		for _, want := range []string{"openai", "gpt-4o", "gpt-4o-mini", "o1", "o3-mini"} {
 			if !slices.Contains(ids, want) {
 				t.Fatalf("configured=%q: models %q are missing %q", configured, ids, want)
@@ -386,9 +436,85 @@ func TestServeAPIOnlyListsTheOpenAIModelsItAccepts(t *testing.T) {
 		if want == "" {
 			want = "gpt-4o"
 		}
-		rec = apiOnlyPost(t, h, "/v1/chat/completions", apiOnlyChat("openai", "explain what a monad is", false))
+		rec := apiOnlyPost(t, h, "/v1/chat/completions", apiOnlyChat("openai", "explain what a monad is", false))
 		if models := upstream.take(); rec.Code != http.StatusOK || len(models) != 1 || models[0] != want {
 			t.Fatalf("configured=%q: openai got %d and called %q, want the configured model", configured, rec.Code, models)
 		}
+	}
+}
+
+// budgetReservations is a BudgetReserver that admits every reservation and
+// records its estimate, in USD.
+type budgetReservations struct {
+	mu        sync.Mutex
+	estimates []float64
+}
+
+func (b *budgetReservations) ReserveBudget(_ context.Context, reservation serverusage.BudgetReservation) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.estimates = append(b.estimates, float64(reservation.EstimateMicroUSD)/1e6)
+	return nil
+}
+
+func (b *budgetReservations) take() []float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	estimates := b.estimates
+	b.estimates = nil
+	return estimates
+}
+
+// The scaled budget reservation (MAKEWAND_SCALED_BUDGET_RESERVATION=1) covers
+// the model a Power request's codex route calls. Without a codex CLI the model
+// factory serves that route with OPENAI_MODEL, but the reservation priced the
+// codex table's "codex-cli" placeholder, at $0: it covered gpt-4o-mini where
+// routing.json points openai at it, and nothing, leaving only the floor, for a
+// token scoped to claude (a subscription CLI) and codex. Each request calls o1
+// once; the reservation must cover that call and a call of o1 at the least
+// output a Power request may ask for.
+func TestServeAPIOnlyReservationCoversTheModelTheCodexRouteCalls(t *testing.T) {
+	const scopedToken = "fixture-scoped-token" //nolint:gosec // G101: a test fixture, not a credential.
+	authz, err := serverauth.NewAuthorizer(serverauth.Config{Tokens: []serverauth.TokenRule{{
+		ID: "scoped", Token: scopedToken, Scopes: []string{serverauth.ScopeChatInvoke}, AllowedProviders: []string{"claude", "codex"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullOutputCall := router.EstimateCost("o1", 0, router.MaxTokensForTask(router.TaskCode))
+	for _, tc := range []struct {
+		name       string
+		deployment apiOnlyDeployment
+		token      string
+	}{
+		{"openai pinned to a cheaper model", apiOnlyDeployment{openAIModel: "o1", routing: `{"models":{"openai":{"cheap":"gpt-4o-mini","mid":"gpt-4o-mini","premium":"gpt-4o-mini"}}}`}, ""},
+		{"token scoped to claude and codex", apiOnlyDeployment{openAIModel: "o1", claudeCLI: true, options: router.HTTPHandlerOptions{Authorizer: authz}}, scopedToken},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reservations := &budgetReservations{}
+			deployment := tc.deployment
+			deployment.options.BudgetReservationUSD = 0.0001
+			deployment.options.ScaleBudgetReservation = true
+			deployment.options.BudgetReserver = reservations
+			h, upstream, usage := apiOnlyServeWith(t, deployment)
+			for _, prompt := range []string{"write a function that adds two numbers", "fix the bug in this function"} {
+				for _, stream := range []bool{false, true} {
+					body := apiOnlyChat("", prompt, stream)
+					body["mode"] = "power"
+					rec := apiOnlyPostAs(t, h, tc.token, "/v1/chat/completions", body)
+					if rec.Code != http.StatusOK {
+						t.Fatalf("%q stream=%t: status %d body %s", prompt, stream, rec.Code, rec.Body.String())
+					}
+					if models := upstream.take(); !slices.Equal(models, []string{"o1"}) {
+						t.Fatalf("%q stream=%t: upstream models %q, want [o1]", prompt, stream, models)
+					}
+					spent := onlyUsageEntry(t, usage).CostUSD
+					reserved := reservations.take()
+					if len(reserved) != 1 || reserved[0] < spent || reserved[0] < fullOutputCall {
+						t.Fatalf("%q stream=%t: reserved $%v for a request that spent $%v; one o1 call can spend $%v", prompt, stream, reserved, spent, fullOutputCall)
+					}
+				}
+			}
+		})
 	}
 }

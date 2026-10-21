@@ -499,24 +499,49 @@ func TestHTTPNamedOpenAIModelIsCalledDespiteAnOpenAIModelTable(t *testing.T) {
 	}
 }
 
-// The scaled reservation ceiling covers a route only a factory builds, such as
-// an API-key-only deployment's codex route: Power ensembles reach it, and
-// routing.json can point its table at a model pricier than any registered
-// provider's. The ceiling counted registered providers only.
-func TestHTTPPriceCeilingCoversFactoryBuiltAPIRoutes(t *testing.T) {
+// factoryCeilingRouter registers openai at gpt-4o-mini and, as an API route
+// only a factory builds, a codex route whose OpenAI provider calls model. It
+// counts the providers the factory builds.
+func factoryCeilingRouter(t *testing.T, model string, declareModel bool) (*Router, *atomic.Int32) {
+	t.Helper()
 	r := mustNewRouter(RouterConfig{Providers: map[string]ProviderEntry{
 		"openai": {Provider: NewOpenAIWithBaseURL("k", "gpt-4o-mini", "http://127.0.0.1:1/v1"), Access: AccessAPI},
 	}})
-	if err := r.RegisterProviderFactory("codex", func(string) (Provider, error) {
-		return NewOpenAIWithBaseURL("k", "gpt-4o-mini", "http://127.0.0.1:1/v1"), nil
-	}); err != nil {
+	codex := NewOpenAIWithBaseURL("k", model, "http://127.0.0.1:1/v1")
+	built := &atomic.Int32{}
+	factory := func(string) (Provider, error) {
+		built.Add(1)
+		return codex, nil
+	}
+	var resolution ProviderModelFunc
+	if declareModel {
+		resolution = codex.ReportedModelID
+	}
+	if err := r.RegisterProviderFactoryWithModel("codex", factory, resolution); err != nil {
 		t.Fatal(err)
 	}
 	r.SetAccessType("codex", AccessAPI)
-	// The codex table's codex-cli placeholder calls the configured model.
-	if got, _ := r.httpPriceCeiling(); got != tablePrice(t, "gpt-4o-mini") {
-		t.Fatalf("ceiling = %+v, want gpt-4o-mini's price", got)
+	return r, built
+}
+
+// The scaled reservation ceiling covers a route only a factory builds, such as
+// an API-key-only deployment's codex route, which Power ensembles reach, at
+// the model its provider calls. The codex table names "codex-cli", which the
+// OpenAI provider serving the route replaces with its configured model, but
+// the ceiling priced the placeholder, at $0: it looked the route's provider
+// up among the registered ones only. It now resolves the route as execution
+// does, through the factory's model resolution, and builds no provider, since
+// a factory may exec a CLI or reach the network.
+func TestHTTPPriceCeilingPricesFactoryBuiltRoutesAtTheModelTheyCall(t *testing.T) {
+	r, built := factoryCeilingRouter(t, "o3-mini", true)
+	if got, _ := r.httpPriceCeiling(); got != tablePrice(t, "o3-mini") {
+		t.Fatalf("ceiling = %+v, want o3-mini's price for the codex route", got)
 	}
+	// A token's view counts the route as the deployment does.
+	if got, _ := r.cloneWithProviderAllowlist([]string{"claude", "codex"}).httpPriceCeiling(); got != tablePrice(t, "o3-mini") {
+		t.Fatalf("claude+codex token ceiling = %+v, want o3-mini's price", got)
+	}
+	// A codex table naming an API model makes the provider call it.
 	dir := t.TempDir()
 	table := `{"models":{"codex":{"cheap":"o1","mid":"o1","premium":"o1"}}}`
 	if err := os.WriteFile(filepath.Join(dir, "routing.json"), []byte(table), 0o600); err != nil {
@@ -528,7 +553,10 @@ func TestHTTPPriceCeilingCoversFactoryBuiltAPIRoutes(t *testing.T) {
 	if got, _ := r.httpPriceCeiling(); got != tablePrice(t, "o1") {
 		t.Fatalf("ceiling = %+v, want o1's price for the codex route", got)
 	}
-	// Neither a route served without API access nor one a token may not use
+	if n := built.Load(); n != 0 {
+		t.Fatalf("pricing built the codex provider %d times", n)
+	}
+	// Neither a route a token may not use nor one served without API access
 	// is counted.
 	if got, _ := r.cloneWithProviderAllowlist([]string{"openai"}).httpPriceCeiling(); got != tablePrice(t, "gpt-4o-mini") {
 		t.Fatalf("openai-only ceiling = %+v, want gpt-4o-mini's price", got)
@@ -536,5 +564,46 @@ func TestHTTPPriceCeilingCoversFactoryBuiltAPIRoutes(t *testing.T) {
 	r.SetAccessType("codex", AccessSubscription)
 	if got, _ := r.httpPriceCeiling(); got != tablePrice(t, "gpt-4o-mini") {
 		t.Fatalf("ceiling with a subscription codex route = %+v, want gpt-4o-mini's price", got)
+	}
+}
+
+// A factory that declares no model resolution is priced at the model routing
+// requests, which its provider may replace: a "-cli" placeholder, naming no
+// API model, counts as an unknown model, not at its $0 entry. Once a request
+// has built the provider, its cached instance names the model it calls, also
+// to a per-request view made before.
+func TestHTTPPriceCeilingWithoutAFactoryModelResolution(t *testing.T) {
+	r, built := factoryCeilingRouter(t, "o1", false)
+	if got, _ := r.httpPriceCeiling(); got != unpricedFallbackCost() {
+		t.Fatalf("ceiling = %+v, want the unpriced fallback rate for codex-cli", got)
+	}
+	if n := built.Load(); n != 0 {
+		t.Fatalf("pricing built the codex provider %d times", n)
+	}
+	view := r.cloneWithMode(ModePower)
+	if _, err := r.cloneWithMode(ModePower).resolveProvider("codex", "codex-cli"); err != nil {
+		t.Fatal(err)
+	}
+	for name, router := range map[string]*Router{"router": r, "earlier view": view} {
+		if got, _ := router.httpPriceCeiling(); got != tablePrice(t, "o1") {
+			t.Fatalf("%s ceiling after the codex route was built = %+v, want o1's price", name, got)
+		}
+	}
+	if n := built.Load(); n != 1 {
+		t.Fatalf("codex provider built %d times, want once by execution", n)
+	}
+}
+
+// Registering a factory again without a model resolution drops the one its
+// name had, which described the factory replaced.
+func TestRegisterProviderFactoryDropsTheReplacedModelResolution(t *testing.T) {
+	r, _ := factoryCeilingRouter(t, "o3-mini", true)
+	if err := r.RegisterProviderFactory("codex", func(string) (Provider, error) {
+		return NewOpenAIWithBaseURL("k", "gpt-4o-mini", "http://127.0.0.1:1/v1"), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.billedModelID("codex", "codex-cli"); got != "" {
+		t.Fatalf("codex-cli is billed as %q after the factory was replaced, want an unknown model", got)
 	}
 }

@@ -290,6 +290,10 @@ type Router struct {
 	// factories maps provider names to per-instance factories for dynamic
 	// model-specific construction (guarded by providerMu).
 	factories map[string]ProviderFactory
+	// factoryModels holds the model resolution a factory declared
+	// (RegisterProviderFactoryWithModel), by provider name (guarded by
+	// providerMu).
+	factoryModels map[string]ProviderModelFunc
 
 	// Access types for each provider
 	accessTypes map[string]AccessType
@@ -677,6 +681,10 @@ func (r *Router) cloneView() *Router {
 	for name, factory := range r.factories {
 		factories[name] = factory
 	}
+	factoryModels := make(map[string]ProviderModelFunc, len(r.factoryModels))
+	for name, model := range r.factoryModels {
+		factoryModels[name] = model
+	}
 	r.providerMu.Unlock()
 
 	r.mu.Lock()
@@ -706,6 +714,7 @@ func (r *Router) cloneView() *Router {
 		providerAllowlist:  cloneStringSet(r.providerAllowlist),
 		providerCache:      providerCache,
 		factories:          factories,
+		factoryModels:      factoryModels,
 		accessTypes:        accessTypes,
 		usage:              r.usage,
 		breaker:            r.breaker,

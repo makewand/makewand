@@ -35,6 +35,7 @@ type (
 
 	TransientCLIError = router.TransientCLIError
 	ProviderFactory   = router.ProviderFactory
+	ProviderModelFunc = router.ProviderModelFunc
 	SSEEventHandler   = router.SSEEventHandler
 
 	RepoTrust = router.RepoTrust
