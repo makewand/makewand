@@ -39,6 +39,9 @@ func NewOpenAIWithBaseURL(apiKey, model, baseURL string) *OpenAI {
 	if !strings.HasSuffix(baseURL, "/chat/completions") {
 		baseURL += "/chat/completions"
 	}
+	// No model ID has surrounding whitespace, though a configured value can.
+	// Case is kept: an OpenAI-compatible endpoint may match it exactly.
+	model = strings.TrimSpace(model)
 	if model == "" {
 		model = openaiDefaultModel
 	}

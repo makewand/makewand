@@ -443,6 +443,54 @@ func TestServeAPIOnlyListsTheOpenAIModelsItAccepts(t *testing.T) {
 	}
 }
 
+// OPENAI_MODEL is matched as a request's model field is: trimmed, and without
+// regard to case. The server sent the configured model upstream with its
+// whitespace, and refused and did not list its own configured model when that
+// had no price and was spelled with capitals. It is called as configured,
+// trimmed, by "openai" and by its name, which is listed once, in the form
+// requests resolve to; a priced name is still called as its price entry names
+// it.
+func TestServeAPIOnlyConfiguredModelIsMatchedAsRequestedModelsAre(t *testing.T) {
+	const prompt = "explain what a monad is"
+	for _, tc := range []struct{ configured, listed, called, namedCalls string }{
+		{" GPT-4o ", "gpt-4o", "GPT-4o", "gpt-4o"},
+		{" GPT-Fixture-Custom ", "gpt-fixture-custom", "GPT-Fixture-Custom", "GPT-Fixture-Custom"},
+	} {
+		t.Run(tc.configured, func(t *testing.T) {
+			h, upstream, usage := apiOnlyServe(t, tc.configured)
+			var listed []string
+			for _, id := range apiOnlyModelIDs(t, h) {
+				if strings.EqualFold(strings.TrimSpace(id), strings.TrimSpace(tc.configured)) {
+					listed = append(listed, id)
+				}
+			}
+			if !slices.Equal(listed, []string{tc.listed}) {
+				t.Errorf("/v1/models lists it as %q, want once as %q", listed, tc.listed)
+			}
+			rec := apiOnlyPost(t, h, "/v1/chat/completions", apiOnlyChat("openai", prompt, false))
+			if models := upstream.take(); rec.Code != http.StatusOK || !slices.Equal(models, []string{tc.called}) {
+				t.Errorf("openai got %d and called %q, want [%s]", rec.Code, models, tc.called)
+			}
+			for _, name := range []string{tc.listed, tc.configured, strings.ToUpper(tc.listed)} {
+				for _, stream := range []bool{false, true} {
+					rec := apiOnlyPost(t, h, "/v1/chat/completions", apiOnlyChat(name, prompt, stream))
+					if rec.Code != http.StatusOK {
+						t.Fatalf("%q stream=%t: status %d body %s", name, stream, rec.Code, rec.Body.String())
+					}
+					if models := upstream.take(); !slices.Equal(models, []string{tc.namedCalls}) {
+						t.Fatalf("%q stream=%t called %q, want [%s]", name, stream, models, tc.namedCalls)
+					}
+				}
+			}
+			for _, entry := range usage.take() {
+				if entry.CostUSD <= 0 {
+					t.Fatalf("usage %+v is not billed", entry)
+				}
+			}
+		})
+	}
+}
+
 // budgetReservations is a BudgetReserver that admits every reservation and
 // records its estimate, in USD.
 type budgetReservations struct {

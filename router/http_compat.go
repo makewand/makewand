@@ -107,13 +107,14 @@ func (r *Router) openAIAliasProvider() (*OpenAI, bool) {
 }
 
 // openAIAliasModels lists the OpenAI models a client can name when openai
-// serves OpenAI-family names: each priced model, and the configured one, that a
-// request naming it sends upstream as named. A configured model outside those
-// families, such as an OpenAI-compatible endpoint's own, is not listed; clients
-// reach it as "openai".
+// serves OpenAI-family names, in the form a request's model field resolves to
+// (resolveHTTPModel): each priced model a request naming it calls as named,
+// and the configured one. A configured model outside those families, such as
+// an OpenAI-compatible endpoint's own, is not listed; clients reach it as
+// "openai".
 func (r *Router) openAIAliasModels(openai *OpenAI) []string {
 	var models []string
-	for _, model := range append(r.routingTables().pricedModels(), openai.model) {
+	for _, model := range append(r.routingTables().pricedModels(), strings.ToLower(strings.TrimSpace(openai.model))) {
 		if _, upstream := r.resolveHTTPModel(model); upstream == model && !slices.Contains(models, model) {
 			models = append(models, model)
 		}
@@ -132,19 +133,23 @@ func (r *Router) openAIAliasModels(openai *OpenAI) []string {
 // OpenAI rate-limits on its own, or one the account or endpoint lacks) must not
 // close the route for every other request. A model other than the configured
 // one must have a price: the spend of a model the server cannot price could
-// not be budgeted.
+// not be budgeted. The configured model, which a request names as it names
+// any model (trimmed, in any case), is called as configured.
 func (r *Router) withOpenAIModel(model string) (*Router, error) {
 	p, _ := r.getProvider("openai")
 	base, ok := p.(*OpenAI)
 	if !ok {
 		return nil, unknownHTTPModelError(model)
 	}
-	if _, priced := r.routingTables().costFor(model); !priced && model != base.model {
-		return nil, &httpStatusError{
-			Status:  http.StatusBadRequest,
-			Code:    "invalid_request",
-			Message: fmt.Sprintf("model %q has no price on this server, so its spend cannot be budgeted; use GET /v1/models for the models it accepts", model),
+	if _, priced := r.routingTables().costFor(model); !priced {
+		if !strings.EqualFold(model, strings.TrimSpace(base.model)) {
+			return nil, &httpStatusError{
+				Status:  http.StatusBadRequest,
+				Code:    "invalid_request",
+				Message: fmt.Sprintf("model %q has no price on this server, so its spend cannot be budgeted; use GET /v1/models for the models it accepts", model),
+			}
 		}
+		model = strings.TrimSpace(base.model)
 	}
 	bound := &OpenAI{
 		apiKey:       base.apiKey,
