@@ -7,6 +7,11 @@ on:
   pull_request:
     branches:
       - master
+  # The Release workflow runs this verify job as its test job, so a tag is held
+  # to every check a pull request must pass. Branch protection requires the
+  # check named "verify": keep the job here rather than moving it into another
+  # reusable workflow, which would rename the check to "<caller> / verify".
+  workflow_call:
 
 permissions:
   contents: read
@@ -34,8 +39,17 @@ jobs:
         run: bash scripts/test_check_secrets.sh
 
       - name: Version consistency
+        # A tag (the Release workflow's call) must also equal "v" +
+        # makewand.__version__: v3.0.1/v3.0.2 were tagged while __version__
+        # still said 3.0.0.
         shell: bash
-        run: bash scripts/check_version.sh
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            bash scripts/check_version.sh --tag "${GITHUB_REF_NAME}"
+          else
+            bash scripts/check_version.sh
+          fi
 
       - name: Check shell script syntax
         shell: bash
@@ -139,10 +153,15 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python test dependencies
-        run: pip install pytest
+        # Pinned: a new pytest release must not turn CI or a release red
+        # without a code change. Bump it deliberately (also in prelaunch_gate.sh).
+        run: python3 -m pip install pytest==9.0.2
 
-      - name: Run Python unit tests
-        run: python3 -I scripts/test_python.py
+      - name: Run Python tests
+        # pytest runs every unittest case plus the module-level pytest tests
+        # that unittest discovery cannot collect (scripts/test_python.py fails
+        # rather than skip them).
+        run: python3 -I -m pytest -q -p no:cacheprovider tests
 
       - name: Dispatch regression tests
         run: bash dispatch/test.sh
@@ -169,10 +188,12 @@ jobs:
         # Fail CI on any known vulnerability reachable from our code. The Go
         # toolchain is selected from go.mod (go-version-file above), so bumping
         # the `go` directive to a patched release is what clears stdlib CVEs.
+        # The scanner is pinned (its vulnerability database is fetched live);
+        # keep the version in sync with GOVULNCHECK_VERSION in the Makefile.
         shell: bash
         run: |
           set -euo pipefail
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           "$(go env GOPATH)/bin/govulncheck" ./...
 
       - name: Run golangci-lint

@@ -51,6 +51,66 @@ def find_bash():
 
 
 class InstallationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "source installation requires POSIX")
+    def test_piped_source_script_fails_fast_with_the_official_installer(self):
+        # Release notes once said `curl .../scripts/install.sh | bash`: read from a
+        # pipe, BASH_SOURCE[0] is unset under `set -u`, the root became "/" and
+        # python3 failed on '//scripts/install_source.py'. Offline: the check runs
+        # before python3 or go are looked up.
+        script = (ROOT / "scripts" / "install.sh").read_bytes()
+        with tempfile.TemporaryDirectory(prefix="makewand-piped-") as directory:
+            temp = Path(directory)
+            env = dict(os.environ, LC_ALL="C", MAKEWAND_INSTALL_ROOT=str(temp / "installed"),
+                       MAKEWAND_BIN_DIR=str(temp / "bin"), MAKEWAND_SKILLS_DIR=str(temp / "skills"))
+            for name, command in (("pipe", [find_bash()]), ("pipe -s", [find_bash(), "-s"]),
+                                  ("/dev/stdin", [find_bash(), "/dev/stdin"])):
+                with self.subTest(invocation=name):
+                    result = subprocess.run(command, input=script, cwd=temp, env=env, capture_output=True)
+                    stderr = result.stderr.decode("utf-8", "replace")
+                    self.assertEqual(result.returncode, 1, stderr)
+                    self.assertIn("run it from a clone, not through a pipe", stderr)
+                    self.assertIn("curl -fsSL https://makewand.org/install.sh | bash", stderr)
+                    self.assertNotIn("install_source.py'", stderr)
+            self.assertEqual(sorted(path.name for path in temp.iterdir()), [], "nothing may be installed")
+
+    @unittest.skipIf(os.name == "nt", "source installation requires POSIX")
+    def test_path_hint_prints_an_exact_export_line_only_when_needed(self):
+        # The installer ended with "Run makewand status" even when ~/.local/bin
+        # was not on PATH (macOS zsh, a fresh Linux account).
+        module = installer_module()
+        with tempfile.TemporaryDirectory(prefix="makewand-path-hint-") as directory:
+            root = Path(directory).resolve()
+            home, older = root / "home", root / "older"
+            binaries = home / ".local" / "bin"
+            odd = root / 'odd "dir" $HOME `x` \\ end'
+            for folder in (binaries, odd, older):
+                folder.mkdir(parents=True)
+                (folder / "makewand").write_text("#!/bin/sh\n", encoding="utf-8")
+                (folder / "makewand").chmod(0o755)
+            # A directory without makewand, not /usr/bin: a host may ship one there.
+            empty = root / "empty"
+            empty.mkdir()
+            for path in (f"{empty}:{binaries}", f"{binaries}/:{older}"):
+                with self.subTest(path=path), patch.dict(os.environ, {"HOME": str(home), "PATH": path}):
+                    self.assertIsNone(module.path_hint(binaries))
+            # zsh does not expand a literal ~ in PATH, so that entry does not count.
+            cases = ((binaries, str(empty), "is not on your PATH", '  export PATH="$HOME/.local/bin:$PATH"'),
+                     (binaries, f"~/.local/bin:{empty}", "is not on your PATH", '  export PATH="$HOME/.local/bin:$PATH"'),
+                     (binaries, f"{older}:{binaries}", f"runs {older / 'makewand'}, found before {binaries}",
+                      '  export PATH="$HOME/.local/bin:$PATH"'),
+                     (odd, str(empty), "is not on your PATH", None))
+            for target, path, problem, line in cases:
+                with self.subTest(target=target.name, path=path), patch.dict(os.environ, {"HOME": str(home), "PATH": path}):
+                    hint = module.path_hint(target)
+                    self.assertIn(problem, hint)
+                    export = hint.splitlines()[-1]
+                    if line:
+                        self.assertEqual(export, line)
+                    # Run by a shell, the printed line puts exactly that directory first.
+                    probe = subprocess.run([find_bash(), "-c", export.strip() + '; printf "%s" "${PATH%%:*}"'],
+                                           env={"HOME": str(home), "PATH": "/usr/bin"}, capture_output=True, text=True)
+                    self.assertEqual(probe.stdout, str(target), probe.stderr)
+
     def test_failed_upgrade_preserves_complete_previous_version(self):
         with tempfile.TemporaryDirectory(prefix="makewand-upgrade-") as directory:
             temp = Path(directory)
@@ -191,8 +251,15 @@ class InstallationTests(unittest.TestCase):
                        MAKEWAND_INSTALL_ROOT=str(app), MAKEWAND_SOURCE_DIR=str(app), MAKEWAND_BIN_DIR=str(binaries),
                        MAKEWAND_SKILLS_DIR=str(temp / "skills"), MAKEWAND_CONFIG_DIR=str(temp / "config"),
                        PYTHONPATH=str(hostile))
-            subprocess.run([find_bash(), str(ROOT / "site" / "install.sh")], cwd=hostile, env=env,
-                           check=True, capture_output=True, text=True)
+            installed = subprocess.run([find_bash(), str(ROOT / "site" / "install.sh")], cwd=hostile, env=env,
+                                       check=True, capture_output=True, text=True)
+            # The bin directory is not on this PATH: say how to add it before
+            # telling the user to run makewand.
+            self.assertIn(f"Note: {binaries.resolve()} is not on your PATH", installed.stdout)
+            self.assertIn("  export PATH=", installed.stdout)
+            self.assertTrue(installed.stdout.rstrip().endswith(
+                "Add the PATH line above to your shell profile, open a new shell, then run makewand status "
+                "to inspect available providers."), installed.stdout)
             self.assertFalse((binaries / "makewand").is_symlink())
             self.assertEqual(before, hashlib.sha256((app / "bin" / "makewand").read_bytes()).hexdigest())
             for args in (("--version",), ("--help",), ("review", "--repo-trust", "untrusted", "--help"),

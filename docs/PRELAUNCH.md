@@ -9,7 +9,13 @@ Use this checklist before shipping a release.
   pinned toolchain is downloaded on first use.
 - `golangci-lint` **v2.12.2** (the version pinned in `.github/workflows/ci.yml`):
   `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2`
-- `govulncheck`: `go install golang.org/x/vuln/cmd/govulncheck@latest`
+- `govulncheck` **v1.9.0** (the version `.github/workflows/ci.yml` and the Makefile pin):
+  `go install golang.org/x/vuln/cmd/govulncheck@v1.9.0`
+- `pytest` **9.0.2** (the version CI pins), importable by `python3 -I`: install
+  it into that interpreter or a venv (`python3 -m pip install pytest==9.0.2`).
+  pytest 9 needs Python 3.10 or newer, so run the gate with 3.10+ even though
+  makewand itself supports 3.9;
+  `-I` ignores the user site, so `pip install --user` is not enough.
 - `bubblewrap` (`bwrap`) for the sandbox tests. On Ubuntu 24.04, if
   `bwrap --unshare-net --ro-bind / / true` fails with
   `loopback: Failed RTM_NEWADDR: Operation not permitted`, AppArmor restricts
@@ -29,25 +35,33 @@ make prelaunch
 1. `./scripts/check_secrets.sh` — built-in credential / private-address / home-path
    rules plus your private patterns from `~/.config/makewand/forbidden_*.txt`
 2. `make test-scripts` — `scripts/test_check_secrets.sh` (scanner regression
-   corpus) and `scripts/check_version.sh` (README, site, welcome card, CHANGELOG
-   and Go default agree with `makewand.__version__`)
+   corpus), `scripts/check_version.sh` (README, site, welcome card, CHANGELOG
+   and Go default agree with `makewand.__version__`) and the shared command and
+   execution contract checks
 3. `make check-shell` — `bash -n` on `scripts/*.sh`, `site/install.sh`, `dispatch/*`
 4. `make fmt-check` — `gofmt -l` on tracked Go files
 5. `make lint` — `golangci-lint run ./...` under the go.mod toolchain
 6. `bash ./scripts/prelaunch_gate.sh`:
    - `bash ./scripts/test_gate.sh` (all `go list ./...` packages, E2E first, then `go vet ./...`)
-   - Python unit tests, dispatch regression tests, installer/release-bundle
-     contract, offline benchmark harness
-   - `go vet ./...`, `go build -trimpath -o build/makewand ./cmd/makewand`
+   - the whole Python suite under pytest (`python3 -I -m pytest -q -p no:cacheprovider tests`,
+     which also runs the module-level pytest tests that `scripts/test_python.py`
+     cannot collect), dispatch regression tests, installer/release-bundle
+     contract, and the three offline benchmark scripts CI runs
+   - `go vet ./...`, `go build -trimpath -o build/makewand ./cmd/makewand`,
+     `build/makewand --version`
    - `build/makewand doctor --strict --modes fast,balanced,power`
      (`MAKEWAND_DOCTOR_MODES` overrides the modes)
 7. `make race` — `scripts/test_race.sh` (race detector on every package)
 8. `make vuln` — `govulncheck ./...` under the go.mod toolchain
 
-These cover every check of the CI `verify` job; `doctor --strict` is the
-operator-only addition. CI additionally *requires* the live bubblewrap sandbox
-test instead of skipping it when `bwrap` is unusable — reproduce that on Linux
-with `MAKEWAND_REQUIRE_BWRAP=1 make prelaunch`. Individual targets (`make lint`,
+These cover every check of the CI `verify` job (which the Release workflow
+also runs on the tag); `doctor --strict` is the operator-only addition. Unless
+`GOCACHE` is set, the gate exports Go's private per-user cache
+(`go env GOCACHE`) so the Python tests that build Go reuse it.
+
+CI additionally *requires* the live bubblewrap sandbox test instead of skipping
+it when `bwrap` is unusable — reproduce that on Linux with
+`MAKEWAND_REQUIRE_BWRAP=1 make prelaunch`. Individual targets (`make lint`,
 `make vuln`, `make fmt-check`, `make test-scripts`, ...) can be run on their own
 before pushing.
 

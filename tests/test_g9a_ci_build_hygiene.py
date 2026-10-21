@@ -46,6 +46,13 @@ class MakefileTests(unittest.TestCase):
     def test_vuln_uses_go_mod_toolchain(self):
         self.assertIn(f"GOTOOLCHAIN={_go_toolchain()} govulncheck ./...", self._dry_run("vuln"))
 
+    def test_test_py_runs_the_pytest_suite_when_pytest_is_importable(self):
+        # eng-1021-2: the unittest gate alone never ran the pytest-only modules.
+        out = self._dry_run("test-py")
+        self.assertIn("python3 -I -c 'import pytest'", out)
+        self.assertIn("python3 -I -m pytest -q -p no:cacheprovider tests", out)
+        self.assertIn("python3 -I scripts/test_python.py", out)
+
     def test_test_target_runs_release_tooling_self_tests(self):
         out = self._dry_run("test")
         self.assertIn("bash scripts/test_check_secrets.sh", out)
@@ -68,6 +75,26 @@ class MakefileTests(unittest.TestCase):
                 self.assertIn(mention, docs)
         # The old checklist promised a vet scope that `make prelaunch` never ran.
         self.assertNotIn("go vet ./cmd/... ./internal/... ./router", docs)
+
+    def test_prelaunch_runs_every_ci_benchmark_and_python_check(self):
+        # docs/PRELAUNCH.md promises every CI verify check; the gate ran one of
+        # the three offline benchmark scripts.
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        gate = (ROOT / "scripts" / "prelaunch_gate.sh").read_text(encoding="utf-8")
+        harness = ci.split("- name: Offline benchmark harness", 1)[1].split("- name:", 1)[0]
+        commands = re.findall(r"python3 -I benchmarks/\S+\.py", harness)
+        self.assertEqual(len(commands), 3)
+        for command in (*commands, "python3 -I -m pytest -q -p no:cacheprovider tests",
+                        "bash dispatch/test.sh", "python3 -I scripts/test_installation.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, gate)
+
+    def test_prelaunch_uses_a_private_go_build_cache(self):
+        # A fixed /tmp/makewand-gocache is shared with every local user, who
+        # could plant build results there before the gate runs.
+        gate = (ROOT / "scripts" / "prelaunch_gate.sh").read_text(encoding="utf-8")
+        self.assertNotRegex(gate, r"GOCACHE=[\"']?/tmp")
+        self.assertIn('GOCACHE="$(go env GOCACHE)"', gate)
 
 
 class RepositoryHygieneTests(unittest.TestCase):

@@ -10,116 +10,13 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    # A hung test must not hold the release for the 6h default.
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Secret scan and tag/version consistency
-        # The tag must equal "v" + makewand.__version__ and every hardcoded copy
-        # (README, site, welcome card, CHANGELOG) must agree before anything is
-        # built: v3.0.1/v3.0.2 were tagged while __version__ still said 3.0.0.
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./scripts/check_secrets.sh
-          bash scripts/check_version.sh --tag "${GITHUB_REF_NAME}"
-
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      - name: Install E2E dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y expect bubblewrap ripgrep
-          rg --version
-
-      - name: Allow unprivileged user namespaces for bubblewrap
-        # Ubuntu 24.04 runners ship kernel.apparmor_restrict_unprivileged_userns=1,
-        # which strips all capabilities inside bwrap's user namespace, so
-        # `bwrap --unshare-net` fails with "loopback: Failed RTM_NEWADDR: Operation
-        # not permitted". That failed the test job of every 3.x tag, so the release
-        # job never ran. Relax it for this ephemeral runner; `|| true` tolerates
-        # images without the sysctl, and the diagnostic below still hard-fails.
-        shell: bash
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-
-      - name: Diagnose bubblewrap sandbox
-        shell: bash
-        run: |
-          set -uo pipefail
-          # First the minimal network-namespace check, then the exact probe the
-          # product uses (internal/engine/verify_isolation.go).
-          if out="$(bwrap --unshare-net --ro-bind / / true 2>&1)" \
-            && out="$(bwrap --ro-bind / / --unshare-pid --unshare-net true 2>&1)"; then
-            echo "bubblewrap OK: $(bwrap --version)"
-            exit 0
-          fi
-          echo "::error title=bubblewrap sandbox unavailable::bwrap network-namespace probe failed: ${out}. A release cannot ship without the live sandbox gate (MAKEWAND_REQUIRE_BWRAP=1). 'Operation not permitted' on RTM_NEWADDR/loopback means unprivileged user namespaces are capability-restricted (AppArmor kernel.apparmor_restrict_unprivileged_userns=1)."
-          echo "--- runner diagnostics ---"
-          bwrap --version || true
-          uname -a || true
-          for k in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces; do
-            sysctl "$k" 2>/dev/null || echo "$k: (not present)"
-          done
-          exit 1
-
-      - name: Live sandbox smoke (bubblewrap required, not cached)
-        # A release must never ship without the security-critical bwrap isolation
-        # path validated. MAKEWAND_REQUIRE_BWRAP=1 makes an unavailable sandbox a
-        # hard failure; -count=1 defeats the test cache. The release job depends on
-        # this job, so a broken sandbox blocks the release.
-        env:
-          MAKEWAND_REQUIRE_BWRAP: "1"
-        run: go test ./internal/engine -run '^TestEvaluateCandidateFiles_LiveBwrapIsolation$' -count=1 -v
-
-      - name: Run tests
-        run: bash ./scripts/test_gate.sh
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Python test dependencies
-        run: pip install pytest
-
-      - name: Run Python unit tests
-        run: python3 -I scripts/test_python.py
-
-      - name: Dispatch regression tests
-        run: bash dispatch/test.sh
-
-      - name: Offline benchmark harness
-        run: |
-          python3 -I benchmarks/test_runner.py
-          python3 -I benchmarks/test_deep_config_acceptance_v4.py
-          python3 -I benchmarks/test_analyze_results.py
-
-      - name: Installer and unpacked release contract
-        run: python3 -I scripts/test_installation.py
-
-      - name: Run race tests
-        run: bash ./scripts/test_race.sh
-
-      - name: Run vet
-        run: go vet ./...
-
-      - name: Run govulncheck
-        # Gate the release independently of CI: a tag build must re-prove there
-        # are no reachable known vulnerabilities before any artifact is built.
-        # The release job below `needs: test`, so a hit here blocks the release.
-        shell: bash
-        run: |
-          set -euo pipefail
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
+    # CI's verify job (ci.yml) on the tag's commit: a tag that never passed CI
+    # cannot skip a check a pull request must pass (gofmt, lint, shell syntax,
+    # contracts, the trusted acceptance run...). On a tag, its version step
+    # also requires the tag to equal "v" + makewand.__version__.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
 
   package-smoke:
     strategy:
@@ -291,7 +188,7 @@ jobs:
             echo "Build from source instead (tracks master; needs the Go toolchain from go.mod and Python 3.9+):"
             echo
             echo "${FENCE}bash"
-            echo "curl -fsSL https://raw.githubusercontent.com/${REPO}/master/scripts/install.sh | bash"
+            echo "curl -fsSL https://makewand.org/install.sh | bash"
             echo "${FENCE}"
             echo
             echo "## Verify checksum signature (cosign keyless)"

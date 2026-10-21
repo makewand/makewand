@@ -15,8 +15,19 @@ All notable changes to this project are documented here. The format is based on
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。
 - quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。
 - provider worker 采用严格命令白名单，仅允许 `search`、`repomap`、静态 `help`、`completion <shell>` 和单独的帮助/版本参数；`quota`、`status`、`route`、`mark`、`outcome` 等管理命令均拒绝。详见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
+自动派发与统一派发（#81–#85）：
 
-- Go/Python 统一支持 `proxy.default` / `proxy.no_proxy` 和 `MAKEWAND_DEFAULT_PROXY` / `MAKEWAND_DEFAULT_NO_PROXY`：缺少调用方代理变量时供所有 provider CLI 与 API 路由使用，不内置代理地址；Gemini 仅显式开关绕过代理，移除 muse guard 的固定端口，状态安全显示代理来源。
+- 新增 `makewand route`、`makewand mark`、`makewand outcome`（#81）：route 为子任务在完整的模型 × 推理深度目录中从够用的最便宜档位起选工具、模型与推理深度，跳过暂停中、`mark` 标记期内与官方周额度过线的工具，按 `outcome` 记录的成绩做 Thompson 采样排序，打印可照抄的派活命令，不调用模型；mark 记录一家工具额度受限到何时，outcome 记录一次派活的验收成绩。Go 入口把这三个命令交给 Python 引擎。用法见 README。
+- agy 从不花 G1 credits（#81）：两个沙箱的私有家目录里，agy 的两个设置文件（`~/.gemini/settings.json`、`~/.gemini/antigravity-cli/settings.json`）一律写成 `useG1Credits=false`；没有 bwrap 时，只有宿主这两个文件都证明 `useG1Credits` 为 false 才运行 agy，否则 fail-closed 并说明。
+- agy 在 makewand 沙箱中能执行命令（#82）：agy 每次 run_command 前要写 `~/.gemini/antigravity-cli/bin/agentapi`，两个沙箱此前把该目录只读挂载；现在它是 tmpfs，宿主自带的文件只读绑定回去，不向宿主写回任何内容。
+- 派活时限（#83）：provider 子命令（`makewand codex|claude|agy|grok|muse ...`）与 review、run、race、ensemble 未给 `--timeout` 时单次时限跟随 `--total-timeout`，两者都给取较小值，都不给时默认值不变（300 秒，ensemble 900 秒）。此前照抄 route 的建议（不带 `--timeout`）会让重活在 5 分钟时以退出码 16 结束。route 按任务类型与难度打印 `--timeout`/`--total-timeout`（review/test/research/doc 为 900/1800/5400 秒，implement 为 1200/3600/10800 秒），review 加 `--readonly`，`--json` 同样包含。守护进程跟随请求的期限（不再封顶 600 秒，安全上限 6 小时），拒绝长预算的旧守护进程改为独立运行；观察器只在任务自身的截止时间之后才判定挂起；交互会话重新标记为派发方；`--total-timeout` 为 0 或负数时明确报错。
+- 有界派发改用 Go/Python 共享的机器账本 `call-budget.json`；任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按 Asia/Shanghai 午夜重置。已结算记录保留 48 小时，写入时清理；未结束记录、活动租约和预留所引用的计数保留，旧 lifetime 上限不因清理退款。详见 [预算与租约](docs/layered-call-admission.md)。（#84）
+- 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。（#84）
+- quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。（#84）
+- provider worker 采用严格命令白名单，仅允许 `search`、`repomap`、静态 `help`、`completion <shell>` 和单独的帮助/版本参数；`quota`、`status`、`route`、`mark`、`outcome` 等管理命令均拒绝。详见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。（#84）
+- 其他账号的 `CODEX_HOME`/`CLAUDE_CONFIG_DIR` 在 provider 沙箱中被屏蔽：不存在的外部根目录只有在可证明位于所有可写挂载之外时才跳过，首段之后含 `..` 的值视为有歧义而拒绝（两引擎一致）；运行期间切换登录时结果记为 UNKNOWN，不记到错误的账号；无 bwrap 直接运行的 codex 保留用户的 `CODEX_HOME`（配置、技能、hooks），并在运行前后核对账号绑定（#84）。
+- Go/Python 统一支持 `proxy.default` / `proxy.no_proxy` 和 `MAKEWAND_DEFAULT_PROXY` / `MAKEWAND_DEFAULT_NO_PROXY`：缺少调用方代理变量时供所有 provider CLI 与 API 路由使用，不内置代理地址；Gemini 仅显式开关绕过代理，移除 muse guard 的固定端口，状态安全显示代理来源。（#84）
+- 执行证据写入改用账本结算的写入时限（5 秒，原为固定 1 秒）：证据是持久的记账，写入失败会把已结算的结果变成 UNKNOWN；CI 中依赖时间窗的测试改为事件驱动（#85）。
 
 ### Security
 
@@ -49,6 +60,7 @@ All notable changes to this project are documented here. The format is based on
 - Go SDK `ExecResult.Note`：makewand 自己的说明（例如输出疑似注册表故障但未被确认的原因），也附在候选验证的 `DepsError`/`QuickCheckError` 之后。
 - 使用账本按每次派发记录 `route`：claude、codex、agy、grok、muse 由适配器报告实际走订阅 CLI（`cli`）还是转用 API（`api`，包括 CLI 触发限额后再转用的），纯 API 引擎记为 `api`，直接命令（`makewand claude` 等）按同样规则记录；aider 的适配器尚不报告路线，只在配置不允许转用 API 时记为 `cli`，否则不记录（本地模型不记录）。经 API 完成的成功不会清除 CLI 的失败记录；配置了 API key 时，只有记为 `cli` 的成功才清除 needs_auth 记录。
 - Python SDK：`CandidateManager.apply_candidate` 返回 `ApplyResult`，仍可按 `(ok, files, message)` 解包，`status` 给出类型化结果（`PASSED`、`APPLY_CONFLICT`、`TIMEOUT`、`UNVERIFIED`、`UNKNOWN`、`FAILED`）。
+- 源码安装器完成后，若 `makewand` 命令找到的不是这次安装（安装目录，默认 `~/.local/bin`，不在 `PATH` 中，或 `PATH` 上更早的位置有另一个 makewand），打印要加入 shell 配置的确切 `export PATH=...` 行；官方安装脚本（makewand.org/install.sh）的最后一句随之改为先加 PATH 再运行 `makewand status`。
 
 ### Changed
 
@@ -68,6 +80,9 @@ All notable changes to this project are documented here. The format is based on
 - 限额与登录判定只依据各 CLI 自己的消息（上述目录）：两引擎读取相同的输出流与行，跳过 glog、代码块、缩进行、codex 的提示回显与转发的命令输出；流式模式（含原生 Windows）把 stderr 与回答分开捕获。Go 只读 stderr 末尾 8192 行/1 MiB；目录中没有的自定义 CLI 使用通用锚定模式，`token limit exceeded` 之类的措辞也可能把它封停 30 分钟。
 - 依赖安装：没有锁文件的 npm 加 `--no-package-lock`；含 `pyproject.toml` 或 `setup.py` 的 pip 安装加 `--use-pep517`，egg-info 写到工作树外；有 `Cargo.lock` 时所有 cargo 步骤带 `--locked`，没有时删除 cargo 生成的 `Cargo.lock`；声明了依赖的 Rust 项目先 `cargo fetch`。TUI 在依赖无法下载时跳过测试，不扣分、不自动修复。
 - 安装器只安装一份 `makewand-orchestrator` 技能；仍声明同名的旧 `trio-orchestrator` 副本会保持更新并提示删除。
+- 文档：SECURITY.md 与 README 写明 v3.2.0 之后加入的保护（#75、#80–#85）在 `master` 源码中、随 v3.3.0 发布，v3.2.x 构建（Release 压缩包、Homebrew、Scoop）没有；支持版本表与“v3.1+”的说法相应更正。SECURITY.md 也写明候选的测试与自动修复轮次以 `.makewand/sandbox-home` 为 HOME，会写入其中。
+- CI/发布：Release 的 test 作业改为调用 CI 的 verify 作业（`workflow_call`），未经 CI 的标签也要通过 PR 必须通过的全部检查（gofmt、golangci-lint、shell 语法、契约与 trusted acceptance 等），标签须等于 `v` + `__version__`；govulncheck 固定为 v1.9.0（漏洞库仍实时获取）；网站部署后在同一个 3 分钟期限内核对 makewand.org、www.makewand.org、makewand.com、www.makewand.com 与 makewand.pages.dev 上的 install.sh；`make prelaunch` 改用 Go 的私有用户缓存（原为任何本机用户都能预先写入的 `/tmp/makewand-gocache`），并与 CI 一样运行全部三个离线基准脚本。
+- 文档：README、`makewand-orchestrator` 技能与网站文档补上 route/mark/outcome；PACKAGE_DISTRIBUTION（tap 与 bucket 已是 v3.2.0）、Cloudflare 部署手册（实际发布路径是 deploy-site.yml）、RELEASE_STRATEGY（Release 还等待原生 Windows 关卡）与 PRELAUNCH 按实际情况更正；GITHUB_HARDENING 区分已生效的分支保护与 `scripts/github_hardening.sh` 的目标基线，脚本中的 CodeQL 检查名更正为实际上报的 `Analyze (go)`，并把 Release 需要的 `native-windows / verify` 列入目标基线。
 
 ### Fixed
 
@@ -88,6 +103,8 @@ All notable changes to this project are documented here. The format is based on
 - 复审 diff 上限、提示完整性上限与本地模型的上下文窗口统一按实际派发的文本计量（`review_contract.dispatched_size`：无法解码的文件名字节按其 4 字节的 `\xNN` 转义计算），此前三处的计法各不相同。
 - `status --probe` 的帮助写明 agy 做真实调用的两种情形：额度限制尚未重置，或真实派发、此前的真实探活记录的登录/地区失败仍然有效。
 - TUI：因依赖无法下载而跳过测试时，进度步骤的说明按界面语言显示（中文为“已跳过（依赖无法下载）”）。
+- Python 测试关卡（CI、Release、`make prelaunch`，以及装有 pytest 时的 `make test-py`）改为 `python3 -I -m pytest -q -p no:cacheprovider tests`，pytest 固定为 9.0.2：原先的 unittest 发现收集不到只有模块级 pytest 测试的 10 个模块（96 个函数、416 个用例，多为 #83/#84 的回归测试），它们从未在任何关卡运行。只用标准库的 `scripts/test_python.py` 遇到 unittest 跑不到的 pytest 风格测试、没有测试的指名模块或一个测试也没收集到时以失败退出，不再静默通过。
+- 每次发布说明中的源码安装命令改为 `curl -fsSL https://makewand.org/install.sh | bash`：原先的 `curl …/scripts/install.sh | bash` 从管道读取时 `BASH_SOURCE[0]` 未设置，安装根变成 `/`，什么也装不上。`scripts/install.sh` 经管道、`bash -s` 或 `/dev/fd` 运行时先于任何工具检查退出，并给出这条命令。
 
 ## [3.2.0] - 2026-10-09
 

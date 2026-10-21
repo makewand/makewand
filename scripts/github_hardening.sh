@@ -141,7 +141,8 @@ cat >"${payload}" <<JSON
     "strict": true,
     "contexts": [
       "verify",
-      "Analyze (Go)"
+      "Analyze (go)",
+      "native-windows / verify"
     ]
   },
   "enforce_admins": true,

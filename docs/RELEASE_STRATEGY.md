@@ -5,7 +5,7 @@
 | Option | What users run | Pros | Cons | Recommended now |
 | --- | --- | --- | --- | --- |
 | GitHub Release archives (prebuilt) | download `makewand_vX.Y.Z_<os>_<arch>` from the release, verify `checksums.txt`, extract | Native Go CLI + bundled Python engine, no Go toolchain needed | Need GitHub release discipline | **Yes** |
-| Source install script | `curl .../scripts/install.sh \| bash` | Always tracks `master` | Requires the go.mod Go toolchain + git | For contributors |
+| Source install script | `curl -fsSL https://makewand.org/install.sh \| bash` (clones `master`, then runs `scripts/install.sh` from the clone) | Always tracks `master` | Requires the go.mod Go toolchain + git | For contributors |
 | npm package as primary channel | `npx makewand` / `npm i -g` | Familiar JS developer UX | Wraps native binary, extra package/release complexity | Not yet |
 | Homebrew + Scoop (auto-generated manifests) | `brew install ...` / `scoop install ...` | Better native package manager UX | Requires tap/bucket repo maintenance | **Optional now** |
 
@@ -28,11 +28,20 @@
 - Security static analysis:
   - [codeql.yml](../.github/workflows/codeql.yml)
 - Tag-triggered GitHub release workflow:
-  - [release.yml](../.github/workflows/release.yml)
+  - [release.yml](../.github/workflows/release.yml): its `test` job calls
+    [ci.yml](../.github/workflows/ci.yml) (`workflow_call`), and publication
+    also waits for `package-smoke` and the native Windows gate
+  - [native-windows.yml](../.github/workflows/native-windows.yml) (reusable;
+    also run on every push and pull request by
+    [architecture.yml](../.github/workflows/architecture.yml))
+- Website deployment (`site/`, including the `install.sh` one-liner):
+  - [deploy-site.yml](../.github/workflows/deploy-site.yml), see
+    [CLOUDFLARE_WEBSITE_DEPLOYMENT.md](CLOUDFLARE_WEBSITE_DEPLOYMENT.md)
 - Dependency update automation:
   - [dependabot.yml](../.github/dependabot.yml)
-- Installer script:
-  - [install.sh](../scripts/install.sh)
+- Installer scripts:
+  - [site/install.sh](../site/install.sh) (served as `https://makewand.org/install.sh`)
+    clones `master` and runs [scripts/install.sh](../scripts/install.sh)
 - Security policy:
   - [SECURITY.md](../SECURITY.md)
 - Support policy:
@@ -54,14 +63,20 @@
    `CHANGELOG.md`; `bash scripts/check_version.sh --tag vX.Y.Z` must pass.
 2. Run `make prelaunch` (see [PRELAUNCH.md](PRELAUNCH.md)).
 3. (Recommended) run live probe: `MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch`.
-4. Confirm the CI run for the release commit is green. Branch protection on
-   `master` requires the `verify` check but does not enforce it for admins and
-   does not require pull requests, so a red CI does **not** block a direct push —
-   check it by hand (`gh run list --workflow CI -L 5`).
+4. Confirm the CI run for the release commit is green, and the
+   `native-windows / verify` check of the Architecture runtime workflow too.
+   Branch protection on `master` requires only the `verify` check, does not
+   enforce it for admins and does not require pull requests, so a red CI does
+   **not** block a direct push, and nothing requires the native Windows gate
+   that Release needs — check both by hand (`gh run list --workflow CI -L 5`,
+   `gh run list --workflow "Architecture runtime" -L 5`).
 5. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-6. Watch the Release workflow (`gh run watch`). Its `test` job re-runs the secret
-   scan, the tag/version check and the bubblewrap sandbox gate; `release` only
-   runs after `test` and `package-smoke` pass.
+6. Watch the Release workflow (`gh run watch`). Its `test` job is CI's `verify`
+   job run on the tag's commit, which also requires the tag to equal
+   `v` + `makewand.__version__`; `package-smoke` runs the unpacked bundle on
+   Linux, macOS and Windows; `native-windows` runs the same-commit native
+   Windows gate (all Windows Go packages under `-race`, up to 75 minutes).
+   `release` only runs after all three pass.
 7. Verify the GitHub release has all archives, `checksums.txt`, the cosign
    signature/certificate and the provenance attestation, and that the Homebrew
    tap and Scoop bucket were bumped (`PACKAGE_REPO_TOKEN` must be configured).

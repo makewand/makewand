@@ -57,6 +57,36 @@ def atomic_link(target, destination):
         temporary.unlink(missing_ok=True)
 
 
+def path_hint(binaries):
+    """Guidance with the exact export line unless `makewand` on PATH is this install.
+
+    A fresh macOS zsh, or a Linux account whose ~/.local/bin did not exist at
+    login, would otherwise answer the next `makewand status` with "command not
+    found"; an older makewand earlier on PATH would answer for this one.
+    """
+    target = os.path.realpath(binaries)
+    # A literal ~ in a PATH entry is expanded by bash but not by zsh (or
+    # which()), so such an entry counts as missing: an extra export line is
+    # harmless, a missing one leaves zsh users with "command not found".
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    found = shutil.which("makewand", path=os.pathsep.join(entries))
+    try:
+        if found and os.path.samefile(found, os.path.join(target, "makewand")):
+            return None
+    except OSError:
+        pass
+    home = os.path.realpath(os.path.expanduser("~"))
+    prefix, rest = ("$HOME", target[len(home):]) if target.startswith(home + os.sep) else ("", target)
+    rest = re.sub(r'(["$`\\])', r"\\\1", rest)
+    if found and any(os.path.isabs(entry) and os.path.realpath(entry) == target for entry in entries):
+        problem = f"`makewand` on your PATH runs {found}, found before {target}"
+    else:
+        problem = f"{target} is not on your PATH, so the shell cannot find this makewand"
+    return (f"Note: {problem}. Add this line to your shell profile (~/.zshrc, ~/.bashrc, ...) "
+            f"and open a new shell:\n"
+            f'  export PATH="{prefix}{rest}:$PATH"')
+
+
 def _files(directory, exclude=True, strict=True):
     if directory.is_symlink():
         raise OSError(f"source directory must not be a symlink: {directory}")
@@ -256,6 +286,9 @@ def _install_locked(source, root, binaries):
         except OSError as error:
             print(f"Installed engines; optional alias/skill integration failed: {error}", file=sys.stderr)
         print(f"Installed Makewand {version} in {destination}; current switched atomically.")
+        hint = path_hint(binaries)
+        if hint:
+            print(hint)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

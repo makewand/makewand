@@ -22,19 +22,16 @@
 - `assets/favicon.svg`：高清矢量星轨魔杖 Logo
 - `_headers` 与 `_redirects`：Cloudflare 边缘安全响应头与路由重定向规则
 
-### 方式 A：GitHub 自动集成部署（最推荐，一次配置永久免维护）
+### 方式 A：GitHub Actions 自动部署（当前实际使用）
 
-1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com/)。
-2. 左侧导航栏进入 **Compute (Workers) > Workers & Pages**，点击 **Create** > **Pages** > **Connect to Git**。
-3. 选择 GitHub 仓库 `makewand/makewand`：
-   - **Project Name**：`makewand`
-   - **Production branch**：`master`
-   - **Framework preset**：`None`（纯静态）
-   - **Build command**：（留空）
-   - **Build output directory**：`site`
-4. 点击 **Save and Deploy**。
-   - 几秒内即可生成官方 Pages 域名：`https://makewand.pages.dev`。
-   - 后续任何推送至 GitHub `master` 分支的提交，Cloudflare 均会自动秒级构建更新。
+仓库的 [`.github/workflows/deploy-site.yml`](../.github/workflows/deploy-site.yml) 负责发布：`master` 上任何改动 `site/**`（或该工作流本身）的推送都会触发，也可在 Actions 页面手动运行（`workflow_dispatch`）。
+
+1. 用 `npx wrangler@<固定版本> pages deploy site --project-name=makewand --branch=master` 把 `site/` 发布到 Cloudflare Pages 项目 `makewand`。
+2. 发布后在同一个 3 分钟期限内核对 `makewand.org`、`www.makewand.org`、`makewand.com`、`www.makewand.com` 与 `makewand.pages.dev` 上的 `install.sh` 与仓库中的 `site/install.sh` 逐字节一致（`curl -L` 跟随重定向，`.com` 采用下文的 301 方案时同样通过），任何一个仍不一致即失败。
+
+前置条件：在仓库 Secrets 中配置 `CLOUDFLARE_API_TOKEN`（权限 Pages: Edit）与 `CLOUDFLARE_ACCOUNT_ID`；未配置时工作流只打印提示、不发布。Pages 项目 `makewand` 的生产分支为 `master`，自定义域名见第二部分。
+
+> 若该 Pages 项目同时启用了 Cloudflare 控制台的 **Connect to Git** 集成，同一提交会被部署两次；以 `deploy-site.yml` 为准，不必再开启。
 
 ---
 

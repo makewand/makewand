@@ -71,9 +71,11 @@ flowchart TD
 cd path/to/makewand
 ./scripts/install.sh
 ```
-源码安装需要 Git、Python 3.9+ 和 `go.mod` 指定的 Go 工具链。安装器冻结 Go/Python 构建输入，在独立版本目录中编译、检查版本及公共命令，然后原子切换 `current` 与 `~/.local/bin/makewand`。失败保留原安装，并保留 `previous` 供回退；同时建立兼容的 `trio` 软链接。
+源码安装需要 Git、Python 3.9+ 和 `go.mod` 指定的 Go 工具链。安装器冻结 Go/Python 构建输入，在独立版本目录中编译、检查版本及公共命令，然后原子切换 `current` 与 `~/.local/bin/makewand`。失败保留原安装，并保留 `previous` 供回退；同时建立兼容的 `trio` 软链接。安装目录（默认 `~/.local/bin`，可用 `MAKEWAND_BIN_DIR` 指定）不在 `PATH` 中，或 `PATH` 上更早的位置有另一个 `makewand` 时，安装器最后会打印需要加入 shell 配置（如 `~/.zshrc`、`~/.bashrc`）的 `export PATH=...` 行，加入后打开新终端即可。
 
 预编译 Release、Homebrew 和 Scoop 安装包含 Go CLI 与同版本 Python 引擎；运行时需要 Python 3.9+。手动解包时须将整个目录一起安装，保留二进制旁的 `lib/`。Homebrew/Scoop 会声明 Python 依赖。供应商 CLI 与项目测试工具需要单独安装；Makewand Python 引擎本身仅使用标准库。
+
+> **版本与安全加固**：v3.2.0 之后加入的保护（#75、#80–#85，例如 `bwrap` 只从 root 拥有的系统目录解析、宿主 provider 目录不再可写挂载、Homebrew 包装脚本不再写死 `PATH`）已在 `master` 源码中，随 v3.3.0 发布；目前的 v3.2.x 预编译包、Homebrew 与 Scoop 没有这些保护。v3.3.0 发布前需要它们时，请用上面的源码安装。详见 [SECURITY.md 发布状态](SECURITY.md#release-status--发布状态)。
 
 供应商启停策略对 Go/Python 入口共同生效，禁用也阻止该工具的探测和额度读取。Claude、Gemini 和 OpenAI 的 API 参数按环境变量、`api_keys.json`、`config.json`、默认值的顺序读取；付费调用仍需显式启用 `allow_paid`。详见[共享配置契约](docs/EXECUTION_CONTRACT.md#shared-provider-configuration)。
 
@@ -180,7 +182,25 @@ makewand claude "编写测试用例"
 makewand muse "检查系统配置项"
 ```
 
-### 9. 统一模式定义与跨语言契约 (Unified Modes & Tiers Contract)
+### 9. 自动派活选型：route / mark / outcome
+
+```bash
+# 为子任务挑选工具、模型与推理深度，打印可照抄的派活命令（只读本地缓存与成绩账本，不调用模型）
+makewand route implement normal --self claude
+makewand route review hard --self claude --not codex --json
+
+# 派活遇到 429 或额度用完：标记该工具，到期前 route 跳过它
+makewand mark codex 6h --reason 429
+
+# 验收后记录成绩，route 据此调整之后的排序
+makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
+```
+
+`route <类型> <难度>` 的类型为 review、implement、test、research、doc，难度为 mechanical、normal、hard。它在完整的模型 × 推理深度目录中，从够用的最便宜档位（1–3）起选：跳过 `~/.config/mw-hub/policy`（或 `MW_HUB_POLICY`）里暂停中的工具、`mark` 标记期内的工具，以及官方周额度达到阈值的 codex/claude（默认 90%/85%），再按 `outcome` 记录的通过率用 Thompson 采样排序。`--self <工具>` 把与你同家的候选排在最后，`--not <工具>` 排除与它同家族的候选（审查时传实现方），`--tier N` 指定起始档，`--risk high` 从最强档起，`--simple` 只用精简三档表，`--json` 输出全部候选；验收不过时按输出末尾的提示升一档。派活命令自带的时限见下文“调用与资源预算”。
+
+`mark <工具> <时长>` 的时长为 d/h/m/s 组合（如 `6h`、`93h17m`、`2d`，最长 365 天），`--reason` 可选。`outcome <工具> <档> <类型> pass|fail` 可附 `--model`、`--effort`、`--seconds`、`--calls`。标记与成绩保存在 makewand 私有状态目录的 `routing/` 下（`MAKEWAND_ROUTING_DIR` 可改）。三个命令都不调用模型；在 provider worker（`MAKEWAND_PROVIDER_WORKER=1`）内被拒绝。
+
+### 10. 统一模式定义与跨语言契约 (Unified Modes & Tiers Contract)
 
 Makewand 在 Python（`orchestrator` / CLI / REPL）与 Go（`router` / TUI / 守护进程）之间保证双向无缝映射与透明别名支持：
 
@@ -215,7 +235,7 @@ Go 原生候选选择支持 1–3 的候选数与并发上限，以及 `MAKEWAND
 
 Go 工作区复制默认仅在 Linux 的源目录与临时目录位于同一 Btrfs/XFS 文件系统时尝试写时复制；reflink 不可用或尝试失败时完整回退到普通复制，普通复制错误会中止候选工作区创建。`MAKEWAND_WORKSPACE_REFLINK=0` 强制普通复制，`=1` 可在其他文件系统显式尝试。候选输入始终使用独立文件，不使用硬链接共享可写内容；实际性能取决于文件系统和文件大小。配置与 Windows 身份边界见[验证契约](docs/VERIFICATION_CONTRACT.md#go-candidate-resources-and-workspace-copies)。
 
-### 10. 可选 Unix daemon 派发
+### 11. 可选 Unix daemon 派发
 
 ```bash
 makewand daemon start
@@ -252,6 +272,8 @@ Makewand 原生设计为不仅面向人类终端开发者，更作为所有 AI �
 
 ```bash
 make test
-# 或
-python3 -m unittest discover tests
+# 只跑 Python 测试（CI 的同一条命令；需要能被 python3 -I 导入的 pytest）
+python3 -I -m pytest -q -p no:cacheprovider tests
 ```
+
+部分测试模块只有模块级的 pytest 测试函数，unittest 收集不到：`python3 -m unittest discover tests` 会静默跳过它们；只依赖标准库的 `scripts/test_python.py` 遇到这类模块会列出并以失败退出，不会静默通过。

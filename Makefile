@@ -12,6 +12,8 @@ GOTOOLCHAIN_PIN ?= $(if $(GO_MOD_TOOLCHAIN),$(GO_MOD_TOOLCHAIN),go$(GO_MOD_VERSI
 # Keep in sync with the golangci-lint-action `version:` pin in .github/workflows/ci.yml.
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT ?= golangci-lint
+# Keep in sync with the govulncheck install pin in .github/workflows/ci.yml.
+GOVULNCHECK_VERSION ?= v1.9.0
 GOVULNCHECK ?= govulncheck
 SHELL_SCRIPTS := scripts/*.sh site/install.sh dispatch/*.sh dispatch/ai-dispatch
 
@@ -20,8 +22,16 @@ all: test
 install:
 	./scripts/install.sh
 
+# pytest runs the whole suite, including the pytest-only modules unittest cannot
+# collect. Without pytest, the unittest gate runs and fails on those modules.
 test-py:
-	python3 -I scripts/test_python.py
+	@if python3 -I -c 'import pytest' >/dev/null 2>&1; then \
+		echo 'python3 -I -m pytest -q -p no:cacheprovider tests'; \
+		python3 -I -m pytest -q -p no:cacheprovider tests; \
+	else \
+		echo 'pytest is not importable by python3 -I; the unittest gate cannot run the pytest-only modules.' >&2; \
+		python3 -I scripts/test_python.py; \
+	fi
 
 test-go:
 	go test -count=1 ./...
@@ -83,9 +93,12 @@ lint:
 
 vuln:
 	@command -v $(GOVULNCHECK) >/dev/null 2>&1 || { \
-		echo "govulncheck not found. Install it with:" >&2; \
-		echo "  go install golang.org/x/vuln/cmd/govulncheck@latest" >&2; \
+		echo "govulncheck not found. Install the version CI pins:" >&2; \
+		echo "  go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)" >&2; \
 		exit 1; }
+	@have="$$(go version -m "$$(command -v $(GOVULNCHECK))" 2>/dev/null | awk '$$1 == "mod" { print $$3; exit }')"; \
+	if [ "$${have}" != "$(GOVULNCHECK_VERSION)" ]; then \
+		echo "warning: govulncheck $${have:-unknown} differs from CI pin $(GOVULNCHECK_VERSION); results may differ" >&2; fi
 	GOTOOLCHAIN=$(GOTOOLCHAIN_PIN) $(GOVULNCHECK) ./...
 
 race:

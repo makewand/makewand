@@ -21,6 +21,10 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 CI = WORKFLOWS / "ci.yml"
 RELEASE = WORKFLOWS / "release.yml"
 NORMALIZE = WORKFLOWS / "normalize-release-metadata.yml"
+DEPLOY = WORKFLOWS / "deploy-site.yml"
+PYTEST_GATE = "python3 -I -m pytest -q -p no:cacheprovider tests"
+PYTEST_PIN = re.compile(r"pip install pytest==(\d+\.\d+\.\d+)\b")
+GOVULNCHECK_PIN = re.compile(r"golang\.org/x/vuln/cmd/govulncheck@([\w.$()-]+)")
 
 
 def _read(path):
@@ -48,6 +52,35 @@ def _job_blocks(text):
     if name:
         jobs[name] = "\n".join(buf)
     return jobs
+
+
+def _job_text(path, job):
+    """The job's block; for a call of a local reusable workflow, that workflow."""
+    block = _job_blocks(_read(path))[job]
+    reusable = re.search(r"(?m)^    uses: (\./\.github/workflows/\S+)\s*$", block)
+    return _read(ROOT / reusable[1]) if reusable else block
+
+
+def _reported_check_names():
+    """Check names that pull-request workflows report, as branch protection sees them."""
+    names = set()
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        text = _read(path)
+        on_block = text.split("\non:", 1)[1].split("\npermissions:", 1)[0]
+        if not re.search(r"(?m)^  pull_request:", on_block):
+            continue
+        for job, block in _job_blocks(text).items():
+            named = re.search(r"(?m)^    name: (.+?)\s*$", block)
+            titles = [named[1].strip("'\"") if named else job]
+            languages = re.search(r"(?m)^        language: \[([^\]]*)\]", block)
+            if languages and "${{ matrix.language }}" in titles[0]:
+                titles = [titles[0].replace("${{ matrix.language }}", value.strip().strip("'\""))
+                          for value in languages[1].split(",")]
+            callee = re.search(r"(?m)^    uses: (\./\.github/workflows/\S+)\s*$", block)
+            if callee:
+                titles = [f"{title} / {inner}" for title in titles for inner in _job_blocks(_read(ROOT / callee[1]))]
+            names.update(titles)
+    return names
 
 
 def _step_run(text, step_name):
@@ -118,8 +151,7 @@ class WorkflowStructureTests(unittest.TestCase):
             with self.subTest(workflow=path.name):
                 self.assertIsInstance(yaml.safe_load(_read(path)), dict)
 
-    def _assert_userns_fixup_precedes_sandbox(self, path):
-        text = _read(path)
+    def _assert_userns_fixup_precedes_sandbox(self, text):
         install = text.index("apt-get install -y expect bubblewrap")
         sysctl = text.index("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true")
         diag = text.index("bwrap --unshare-net --ro-bind / / true")
@@ -127,7 +159,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertLess(install, sysctl, "sysctl must run after bubblewrap is installed")
         self.assertLess(sysctl, diag, "diagnostic must run after the sysctl fix-up")
         self.assertLess(diag, gate, "diagnostic must run before the live sandbox gate")
-        for marker in ("scripts/test_gate.sh", "scripts/test_python.py"):
+        for marker in ("scripts/test_gate.sh", PYTEST_GATE):
             self.assertLess(sysctl, text.index(marker), f"{marker} uses bwrap; fix-up must precede it")
         diag_script = _step_run(text, "Diagnose bubblewrap sandbox")
         self.assertIn("::error", diag_script)
@@ -135,10 +167,10 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertRegex(diag_script, r"(?m)^exit 1\s*$")
 
     def test_ci_relaxes_userns_restriction_before_bwrap(self):
-        self._assert_userns_fixup_precedes_sandbox(CI)
+        self._assert_userns_fixup_precedes_sandbox(_read(CI))
 
     def test_release_relaxes_userns_restriction_before_bwrap(self):
-        self._assert_userns_fixup_precedes_sandbox(RELEASE)
+        self._assert_userns_fixup_precedes_sandbox(_job_text(RELEASE, "test"))
 
     @unittest.skipUnless(shutil.which("bash"), "bash required")
     def test_bwrap_diagnostic_fails_readably_when_bwrap_is_broken(self):
@@ -160,9 +192,9 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("RTM_NEWADDR", result.stdout)
 
     def test_hard_bwrap_gate_is_kept(self):
-        for path in (CI, RELEASE):
+        for path, job in ((CI, "verify"), (RELEASE, "test")):
             with self.subTest(workflow=path.name):
-                text = _read(path)
+                text = _job_text(path, job)
                 self.assertIn('MAKEWAND_REQUIRE_BWRAP: "1"', text)
                 self.assertIn("TestEvaluateCandidateFiles_LiveBwrapIsolation", text)
 
@@ -171,6 +203,33 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("./scripts/check_secrets.sh", text)
         self.assertIn("bash scripts/test_check_secrets.sh", text)
         self.assertIn("bash scripts/check_version.sh", text)
+
+    def test_python_gates_run_the_whole_suite_under_pinned_pytest(self):
+        # eng-1021-2: unittest discovery collected nothing from the modules of
+        # module-level pytest tests (416 cases) and still passed.
+        prelaunch = _read(ROOT / "scripts" / "prelaunch_gate.sh")
+        pins = set(PYTEST_PIN.findall(prelaunch))
+        self.assertIn(PYTEST_GATE, prelaunch)
+        for path, job in ((CI, "verify"), (RELEASE, "test")):
+            with self.subTest(workflow=path.name):
+                text = _job_text(path, job)
+                self.assertRegex(text, r"(?m)^        run: " + re.escape(PYTEST_GATE) + r"\s*$")
+                self.assertNotRegex(text, r"(?m)^\s*run: .*scripts/test_python\.py")
+                pins.update(PYTEST_PIN.findall(text))
+                self.assertRegex(text, PYTEST_PIN, "pytest must be pinned")
+        self.assertEqual(len(pins), 1, f"one pytest version everywhere, found {sorted(pins)}")
+
+    def test_govulncheck_is_pinned_to_one_version(self):
+        # eng-1021-8: govulncheck@latest could turn CI or a release red without
+        # a code change (the vulnerability database itself stays live).
+        make_pin = re.search(r"(?m)^GOVULNCHECK_VERSION \?= (v\d+\.\d+\.\d+)\s*$", _read(ROOT / "Makefile"))
+        self.assertIsNotNone(make_pin, "the Makefile must pin GOVULNCHECK_VERSION")
+        found = {}
+        for path in (*sorted(WORKFLOWS.glob("*.yml")), ROOT / "Makefile", ROOT / "docs" / "PRELAUNCH.md"):
+            for version in GOVULNCHECK_PIN.findall(_read(path)):
+                found.setdefault(version, []).append(path.name)
+        found.pop("$(GOVULNCHECK_VERSION)", None)
+        self.assertEqual(set(found), {make_pin[1]}, found)
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -200,9 +259,37 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     self.assertNotIn(": write", block)
 
     def test_release_requires_tag_to_match_source_version(self):
-        test_job = _job_blocks(_read(RELEASE))["test"]
+        test_job = _job_text(RELEASE, "test")
         self.assertIn('bash scripts/check_version.sh --tag "${GITHUB_REF_NAME}"', test_job)
         self.assertIn("./scripts/check_secrets.sh", test_job)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash required")
+    def test_version_step_checks_the_tag_only_on_a_tag(self):
+        script = _step_run(_read(CI), "Version consistency")
+        version = re.search(r'__version__ = "([^"]+)"', _read(ROOT / "makewand" / "__init__.py"))[1]
+        for ref_type, ref_name, expected in (("branch", "master", 0), ("tag", f"v{version}", 0),
+                                             ("tag", "v0.0.0-not-the-source-version", 1)):
+            with self.subTest(ref_type=ref_type, ref_name=ref_name):
+                env = dict(os.environ, GITHUB_REF_TYPE=ref_type, GITHUB_REF_NAME=ref_name)
+                result = subprocess.run(["bash", "-c", script], cwd=ROOT, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_release_test_job_is_ci_verify(self):
+        # eng-1021-8: the Release test job had drifted to a subset of CI verify
+        # (no gofmt, lint, shell syntax, contracts or trusted acceptance run).
+        caller = _job_blocks(_read(RELEASE))["test"]
+        self.assertRegex(caller, r"(?m)^    uses: \./\.github/workflows/ci\.yml\s*$")
+        self.assertIn("    permissions:\n      contents: read", caller)
+        self.assertNotIn("secrets:", caller)
+        ci = _read(CI)
+        on_block = ci.split("\non:", 1)[1].split("\npermissions:", 1)[0]
+        self.assertRegex(on_block, r"(?m)^  workflow_call:\s*$")
+        self.assertNotIn("required: true", on_block)
+        # Branch protection requires the check named "verify": it must stay a
+        # plain job of ci.yml, not a call that GitHub would name "x / verify".
+        self.assertEqual(list(_job_blocks(ci)), ["verify"])
+        self.assertNotRegex(_job_blocks(ci)["verify"], r"(?m)^    uses:")
+        self.assertNotRegex(ci, r"\$\{\{\s*secrets\.", "a called workflow does not receive the caller's secrets")
 
     def test_binaries_report_bare_semver_like_source_installs(self):
         build = _step_run(_read(RELEASE), "Build release artifacts")
@@ -233,7 +320,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             notes = (repo / "dist" / "release-notes.md").read_text(encoding="utf-8")
         install = notes.index("## Install (prebuilt")
         archive = notes.index("https://github.com/acme/makewand/releases/download/v9.8.7/")
-        source = notes.index("scripts/install.sh | bash")
+        # eng-1021-5: scripts/install.sh piped to bash has no checkout to install.
+        source = notes.index("curl -fsSL https://makewand.org/install.sh | bash")
+        self.assertNotIn("scripts/install.sh", notes)
         self.assertLess(install, archive)
         self.assertLess(archive, source, "the Go source installer must not be the primary install path")
         self.assertIn("makewand_v9.8.7_${PLATFORM}.tar.gz", notes)
@@ -241,6 +330,69 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(notes.count("```") % 2, 0, "unbalanced code fences")
         self.assertNotIn("brew install", notes, "package managers are only advertised when published")
         self.assertIn("**Full Changelog**: https://github.com/acme/makewand/compare/v9.8.6...v9.8.7", notes)
+
+
+class GitHubHardeningTests(unittest.TestCase):
+    def test_required_checks_are_names_the_workflows_report(self):
+        # eng-1021-7: the script required "Analyze (Go)" while CodeQL reports
+        # "Analyze (go)"; a required check that never reports blocks every merge.
+        script = _read(ROOT / "scripts" / "github_hardening.sh")
+        contexts = json.loads(re.search(r'"contexts": (\[[^\]]*\])', script)[1])
+        reported = _reported_check_names()
+        self.assertTrue({"verify", "Analyze (go)", "native-windows / verify"} <= reported, reported)
+        self.assertIn("verify", contexts, "CI verify must stay required")
+        for context in contexts:
+            with self.subTest(context=context):
+                self.assertIn(context, reported)
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash required")
+class DeploySiteWorkflowTests(unittest.TestCase):
+    """eng-1021-8: the deploy checked only makewand.org and makewand.com."""
+
+    HOSTS = {"makewand.org", "www.makewand.org", "makewand.com", "www.makewand.com", "makewand.pages.dev"}
+
+    def check(self, stale=()):
+        script = _step_run(_read(DEPLOY), "Check the served installer")
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "site").mkdir()
+            shutil.copy2(ROOT / "site" / "install.sh", work / "site" / "install.sh")
+            tools = work / "tools"
+            tools.mkdir()
+            log = work / "requests.log"
+            # `curl [options] URL -o FILE`: a stale host serves other bytes.
+            (tools / "curl").write_text(
+                "#!/bin/sh\n"
+                'url=; out=\n'
+                'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+                f'echo "$url" >> "{log}"\n'
+                'host="${url#https://}"; host="${host%%/*}"\n'
+                f'case " {" ".join(stale)} " in *" $host "*) echo stale > "$out" ;; *) cp site/install.sh "$out" ;; esac\n',
+                encoding="utf-8")
+            (tools / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for tool in tools.iterdir():
+                tool.chmod(0o755)
+            env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ.get('PATH', '')}")
+            # Actions runs a `run:` script that names no shell as `bash -e {0}`.
+            result = subprocess.run(["bash", "-e", "-c", script], cwd=work, env=env, capture_output=True, text=True)
+            requested = [line.split("/")[2] for line in log.read_text(encoding="utf-8").splitlines()]
+        return result, requested
+
+    def test_every_served_hostname_is_checked(self):
+        # One stalled host must not outlast the shared deadline: every request is bounded.
+        self.assertIn("--max-time", _step_run(_read(DEPLOY), "Check the served installer"))
+        result, requested = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sorted(requested), sorted(self.HOSTS))
+
+    def test_one_stale_hostname_fails_the_deploy_within_one_deadline(self):
+        result, requested = self.check(stale=("www.makewand.com",))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("www.makewand.com", result.stdout.split("::error::", 1)[1])
+        self.assertEqual(set(requested), self.HOSTS)
+        self.assertEqual(requested.count("www.makewand.com"), 18, "retried until the shared deadline")
+        self.assertEqual(requested.count("makewand.org"), 1, "a current host is not fetched again")
 
 
 class NativeWindowsWorkflowTests(unittest.TestCase):

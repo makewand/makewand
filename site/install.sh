@@ -32,4 +32,10 @@ else:
         json.dump({"enabled_providers": {"local": False}}, config, indent=2)
         config.write("\n")
 PY
-echo 'Installation complete. Run makewand status to inspect available providers.'
+# Unless `makewand` already finds this install, the installer printed the
+# export line for the directory it installed into.
+if [ "$(command -v makewand 2>/dev/null || true)" -ef "${MAKEWAND_BIN_DIR:-$HOME/.local/bin}/makewand" ]; then
+    echo 'Installation complete. Run makewand status to inspect available providers.'
+else
+    echo 'Installation complete. Add the PATH line above to your shell profile, open a new shell, then run makewand status to inspect available providers.'
+fi
