@@ -500,10 +500,68 @@ class LocalTestsTimedOut(LocalTestsUnavailable):
 LOCAL_TESTS_NO_EVIDENCE = ("UNVERIFIED", "TIMEOUT")
 # pytest (no tests collected) and unittest on Python 3.12+ (no tests ran) both exit 5.
 _NO_TESTS_EXIT = 5
-# Python's import error for pytest itself: unquoted from `python -m pytest`, quoted in a
-# ModuleNotFoundError traceback (pytest scripts, test modules importing pytest).
-_PYTEST_MISSING = re.compile(r"No module named '?pytest'?(?![\w.])")
+# The exception line of Python's import error for pytest itself, quoted in a traceback
+# (a pytest script, a test module that imports pytest) or unquoted (older Pythons).
+_PYTEST_IMPORT_ERROR = re.compile(r"(?:ModuleNotFoundError|ImportError): No module named '?pytest'?")
+# The same error as `python -m pytest` reports it: "<python>: No module named pytest".
+_PYTEST_MODULE_MISSING = re.compile(r".*: No module named pytest")
 _PYTEST_ARGS = ("-q", "-p", "no:cacheprovider", "-p", "no:langsmith", "-p", "no:django")
+# The first line of a script as the kernel reads it: "#!", an absolute interpreter path
+# and at most one argument.
+_SHEBANG = re.compile(rb"#![ \t]*(/[^ \t\n\0]+)(?:[ \t]+([^ \t\n\0]+))?[ \t]*\n")
+_PYTHON_NAME = re.compile(r"(?:python|pypy)[0-9.]*")
+
+
+def _pytest_import_error(cmd, stdout, stderr) -> Optional[str]:
+    """pytest's own import error when that is why a Python suite ran no test, else None.
+
+    pytest reports a session on stdout, with or without its header. One that cannot
+    import itself never starts: stdout stays empty and the import error is the last
+    line of stderr. Under unittest it is the loader's failure to import a test module
+    that imports pytest, and only when nothing else failed. A test that fails is a
+    failing test whatever it prints, the words of this error included.
+    """
+    if "unittest" not in cmd:
+        lines = stderr.strip().splitlines()
+        last = lines[-1].strip() if lines else ""
+        if stdout.strip() or not (_PYTEST_IMPORT_ERROR.fullmatch(last) or _PYTEST_MODULE_MISSING.fullmatch(last)):
+            return None
+        return last
+    found = None
+    # unittest reports each failure on stderr under an "ERROR: test (id)" or "FAIL: test (id)" header.
+    for block in re.split(r"(?m)^(?=(?:ERROR|FAIL): )", stderr)[1:]:
+        header = block.split("\n", 1)[0]
+        error = next((line.rstrip() for line in block.splitlines() if _PYTEST_IMPORT_ERROR.fullmatch(line.rstrip())), None)
+        if not header.startswith("ERROR: ") or "unittest.loader._FailedTest" not in header or error is None:
+            return None
+        found = found or error
+    return found
+
+
+def _script_python(script) -> Optional[List[str]]:
+    """The Python interpreter the #! line of a console script starts, as a command, or None.
+
+    The runner probe appends `-B -c "import pytest"` to it, so only a Python interpreter
+    qualifies (a shell would run ImageMagick's `import`), with no argument but Python's
+    own flags, and only a line the kernel would run (no CR, no relative path).
+    """
+    try:
+        if not os.path.isfile(script):
+            return None
+        with open(script, "rb") as stream:
+            match = _SHEBANG.fullmatch(stream.readline(512))
+    except OSError:
+        return None
+    if not match:
+        return None
+    interpreter, argument = (part.decode("utf-8", "surrogateescape") if part else None for part in match.groups())
+    if os.path.basename(interpreter) == "env":
+        return [interpreter, argument] if argument and _PYTHON_NAME.fullmatch(argument) else None
+    if not _PYTHON_NAME.fullmatch(os.path.basename(interpreter)):
+        return None
+    if argument is None:
+        return [interpreter]
+    return [interpreter, argument] if re.fullmatch(r"-[A-Za-z]+", argument) else None
 
 
 def _test_evidence(ok, detail):
@@ -1082,9 +1140,9 @@ def _suite_without_evidence(name, cmd, code, stdout, stderr, err_category) -> Op
                     "沙箱内的 Python 无法导入 pytest，unittest 未发现可运行的测试用例 (exit 5)；"
                     "pytest 风格的测试需要沙箱内可导入的 pytest，验收未执行")
             return LocalTestsUnavailable("pytest 未收集到任何测试用例 (exit 5)，不能作为验收证据，验收未执行")
-        missing = _PYTEST_MISSING.search(output) if code != 0 else None
+        missing = _pytest_import_error(cmd, stdout, stderr) if code != 0 else None
         if missing:
-            return LocalTestsUnavailable(f"沙箱内无法导入 pytest（{missing.group(0)}），Python 测试无法运行，验收未执行")
+            return LocalTestsUnavailable(f"沙箱内无法导入 pytest（{missing}），Python 测试无法运行，验收未执行")
         if code == 0 and (re.search(r"\b(collected 0 items|no tests ran|Ran 0 tests?|0 passed)\b", output) or "Exit:" in output):
             return LocalTestsUnavailable("Python 测试套件未执行任何有效测试用例，不能作为通过的验收证据")
     # A package-level PASS also appears when every test was skipped. Require
@@ -1204,31 +1262,34 @@ def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     def python_runner(env):
         """Choose pytest or unittest from what the sandboxed interpreter can import.
 
-        Returns (cmd, None), or (None, reason) when the Python suite cannot run.
+        Returns (cmd, None), or (None, reason) when the Python suite cannot run. A probe
+        only imports pytest (`python -c "import pytest"`), so it loads no plugin and no
+        conftest.py; without bubblewrap, under the unsafe host opt-in, it runs on the
+        host like the tests themselves.
         """
         py_bin = sys.executable or "python3"
-        # (probe, runner, lenient): a lenient probe rules its runner out only on pytest's
-        # own import error, or when the sandbox cannot start the host's pytest script.
-        # `pytest --version` may load plugins and conftest.py, and a failure there is
-        # left for the real run to report.
-        options = [([py_bin, "-B", "-c", "import pytest"], [py_bin, "-B", "-m", "pytest", *_PYTEST_ARGS], False)]
-        if shutil.which("pytest"):
-            options.append((["pytest", *_PYTEST_ARGS, "--version"], ["pytest", *_PYTEST_ARGS], True))
-        for probe, runner, lenient in options:
+        # (interpreter, runner): this interpreter, then the one a host pytest script names.
+        options = [([py_bin], [py_bin, "-B", "-m", "pytest", *_PYTEST_ARGS])]
+        script = shutil.which("pytest")
+        script_python = _script_python(script) if script else None
+        if script_python:
+            options.append((script_python, ["pytest", *_PYTEST_ARGS]))
+        for index, (interpreter, runner) in enumerate(options):
             step_timeout = remaining_timeout()
             if step_timeout <= 0:
                 break
-            code, stdout, stderr, err_category = sandboxed(probe, env, step_timeout, readonly=True)
+            code, stdout, stderr, err_category = sandboxed([*interpreter, "-B", "-c", "import pytest"], env,
+                                                           step_timeout, readonly=True)
             if remaining_timeout() <= 0:
                 break
             infra_err = _sandbox_infra_failure(code, stdout, stderr, err_category)
-            if infra_err and lenient and infra_err.lstrip().startswith("bwrap: execvp "):
-                # The interpreter probe already ran in this sandbox, so the sandbox works:
-                # the script is outside what it binds.
+            if infra_err and index and infra_err.lstrip().startswith("bwrap: execvp "):
+                # The first probe already ran in this sandbox, so the sandbox works: the
+                # script's interpreter is outside what it binds.
                 continue
             if infra_err:
                 return None, LocalTestsUnavailable(f"沙箱容器基础设施故障，本地测试阻断: {infra_err}")
-            if code == 0 or (lenient and not _PYTEST_MISSING.search(stdout + "\n" + stderr)):
+            if code == 0:
                 return runner, None
         if remaining_timeout() <= 0:
             return None, LocalTestsTimedOut("本地测试总时间预算已耗尽，未能在沙箱内确认 Python 测试运行器")

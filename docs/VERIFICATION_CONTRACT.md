@@ -183,12 +183,22 @@ produce `UNVERIFIED`; they are never silently skipped. A pipeline without
 executed local test evidence stops before review and delivery. Python's
 unittest fallback reporting zero tests is also unverified.
 The Python runner is chosen inside the sandbox, not by the host interpreter: a
-read-only probe there decides whether pytest can be imported (a user-site pytest
-the sandbox hides cannot, and a host `pytest` script the sandbox cannot start is
-ruled out), otherwise unittest runs. Tests that cannot run are `UNVERIFIED`, not
+read-only probe there, `python -B -c "import pytest"`, decides whether pytest can
+be imported, first with the interpreter of the run, then with the Python
+interpreter that the first line of a host `pytest` script names (a user-site
+pytest the sandbox hides cannot be imported, and a script whose interpreter the
+sandbox cannot start, or whose first line names no Python interpreter, is ruled
+out); otherwise unittest runs. The probe only imports pytest, so it loads no
+pytest plugin and no `conftest.py`. Without bubblewrap, under the unsafe host
+opt-in (`MAKEWAND_UNSAFE_HOST_EXEC=1` with the recorded acknowledgment), it runs
+on the host like the tests themselves. Tests that cannot run are `UNVERIFIED`, not
 failing tests: a pytest configuration without an importable pytest, pytest or
 unittest exit code 5 (nothing collected or run), zero executed tests, and
-pytest's own import error with or without quotes. A gate whose time budget runs
+pytest's own import error, with or without quotes, when pytest never started a
+session (nothing on stdout, where pytest reports even without its header, and
+the import error as the last line of stderr) or when unittest's only failures are
+test modules that could not import pytest. A test that ran and failed is a
+failing test, whatever it prints. A gate whose time budget runs
 out before every suite produced a result is `TIMEOUT` (exit 16). Neither outcome
 starts an auto-fix round or ends as `FAILED`, but failing tests an earlier suite
 reported, and a run that changed tested inputs or left test output that could run
