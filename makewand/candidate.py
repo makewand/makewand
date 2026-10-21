@@ -27,6 +27,7 @@ from makewand.config import (
 )
 from makewand.git_helper import (
     run_git_cmd,
+    dirty_submodule_paths,
     get_git_diff,
     _read_workspace_diff,
     WorkspaceLock,
@@ -1392,6 +1393,9 @@ def get_candidate_files_changed(candidate_dir: Path, baseline_commit: Optional[s
                 else:
                     changes[path] = "M"
 
+    # git status no longer enters a submodule: each registered one is asked itself.
+    for path in dirty_submodule_paths(candidate_dir):
+        changes.setdefault(path, "M")
     return changes
 
 def workspace_dirty_files(base_cwd: Union[str, Path]) -> set:

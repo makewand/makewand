@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import makewand.orchestrator as orch
-from makewand.git_helper import ShadowWorktreeResult, run_git_cmd
+from makewand.git_helper import ShadowWorktreeResult, add_all, run_git_cmd
 import makewand.config as makewand_config
 from makewand.delivery import capture_delivery_baseline, delivery_shell_guard
 
@@ -114,6 +114,13 @@ class DeliveryBindingTests(unittest.TestCase):
                     return result
             return run_git_cmd(command, **kwargs)
 
+        def add_intercept(cwd, **kwargs):  # the delivery's git add -A (git_helper.add_all)
+            if intercept:
+                result = intercept(["git", "add", "-A"], dict(kwargs, cwd=cwd))
+                if result is not None:
+                    return result
+            return add_all(cwd, **kwargs)
+
         with contextlib.ExitStack() as stack:
             for name, value in [
                 ("check_load_backpressure", True),
@@ -133,6 +140,7 @@ class DeliveryBindingTests(unittest.TestCase):
                     stack.enter_context(patch.object(orch, name, return_value=value))
             stack.enter_context(patch.object(orch, "dispatch_task", side_effect=dispatch))
             stack.enter_context(patch.object(orch, "run_git_cmd", side_effect=git_intercept))
+            stack.enter_context(patch.object(orch, "add_all", side_effect=add_intercept))
             stack.enter_context(patch("makewand.memory.format_memory_hints_for_prompt", return_value=""))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             return orch.run_pipeline("Implement update", cwd=str(self.base), force_code=True, auto_fix=False,

@@ -1,7 +1,8 @@
-"""Standalone, read-only destination checks for exported Git deliveries.
+"""Standalone destination checks for exported Git deliveries.
 
 The same standard-library implementation runs at export and inside the generated
-script. Git administration is excluded from the content scan; repository marker
+script, which also applies the exported patches through it (apply_delivery_patch,
+with no filter driver). Git administration is excluded from the content scan; repository marker
 identities, HEAD commits and symbolic refs are bound separately. This is a
 preflight/postimage check, not a lock against external editors or a transaction.
 """
@@ -237,12 +238,60 @@ def _git_command(path):
             "-C", path, "--work-tree=" + path]
 
 
+# Settings that leave a filter driver no command to run and make git not insist on it.
+_DISABLED_FILTER_DRIVER = (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))
+
+
+def _apply_environment(path, timeout=None):
+    """_git_environment() with every filter driver the destination's configuration defines
+    disabled (GIT_CONFIG_COUNT/KEY/VALUE, which also carry a driver name holding "=").
+
+    git apply cannot take an attribute source in work-tree mode, so whatever .gitattributes
+    or info/attributes selects, no driver has a command left to run. The drivers are listed
+    with the very command and environment of the apply, as git_helper.run_git_cmd lists them
+    for makewand's own applies (this module runs standalone in the generated script). A
+    process writing the destination's configuration at that moment can still add a driver
+    between the listing and git's own read. Raises OSError when git cannot list it.
+    """
+    env = _git_environment()
+    listing = subprocess.run(_git_command(path) + ["config", "--null", "--name-only", "--get-regexp", r"^filter\."],
+                             env=env, capture_output=True, timeout=timeout)
+    if listing.returncode not in (0, 1):  # 1: no filter setting at all
+        raise OSError("Cannot list Git filter drivers: " + _shown(os.fsdecode(listing.stderr).strip()))
+    names = {}
+    for key in listing.stdout.split(b"\0") if listing.returncode == 0 else ():
+        name, dot, _ = key[len(b"filter."):].rpartition(b".")
+        if key.startswith(b"filter.") and dot:
+            names[os.fsdecode(name)] = None
+    settings = [(f"filter.{name}.{variable}", value) for name in names for variable, value in _DISABLED_FILTER_DRIVER]
+    env["GIT_CONFIG_COUNT"] = str(len(settings))
+    for index, (key, value) in enumerate(settings):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
+
+
+def _apply_patch(path, arguments, timeout=None, **output):
+    """git apply in the destination path, with no filter driver (_apply_environment)."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    env = _apply_environment(path, timeout)
+    remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
+    return subprocess.run(_git_command(path) + ["apply", *arguments], env=env, timeout=remaining, **output)
+
+
 def check_delivery_patch(path, patch, timeout=MAX_SECONDS):
-    result = subprocess.run(_git_command(path) + ["apply", "--check", "--binary", os.fspath(patch)],
-                            env=_git_environment(), capture_output=True, timeout=timeout)
+    result = _apply_patch(path, ["--check", "--binary", os.fspath(patch)], timeout=timeout, capture_output=True)
     if result.returncode:
         raise OSError("exported patch does not match the frozen destination baseline "
                       f"(exit {result.returncode}): " + _shown(os.fsdecode(result.stderr).strip()))
+
+
+def apply_delivery_patch(path, arguments):
+    """The generated script's ``git apply`` (``delivery_check apply <root> <options...>``):
+    git's own messages reach the user and its exit status ends the helper."""
+    result = _apply_patch(path, list(arguments))
+    if result.returncode:
+        raise SystemExit(result.returncode)
 
 
 def _git_state(path, budget):
@@ -771,6 +820,8 @@ def delivery_shell_rollback_guard(frozen, changes, state_argument):
 
 def _run_shared_delivery(binding, arguments):
     operation = arguments[0]
+    if operation == "apply":
+        return apply_delivery_patch(arguments[1], arguments[2:])
     frozen = binding["baseline"]
     if operation == "preflight":
         return check_delivery_state(frozen)

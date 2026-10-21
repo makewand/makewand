@@ -367,19 +367,71 @@ directory: makewand reads the files git's repository discovery reads (a `.git`
 file, a `.git` directory or an implicit bare repository there or in a parent)
 and the `commondir` of each, whether `.git` is a file or a directory. A `.git`
 file or `commondir` git cannot read makes the command fail closed (`Cannot
-shield Git attributes`). The shield walks upward from the command's directory, so
-a diff runs `--submodule=short --ignore-submodules=dirty`: git shows a submodule's
-committed pointer but never runs `git status` inside a nested repository to decide
-"-dirty", a child git spawns without `--attr-source` or the shield that would
-otherwise read that repository's own `commondir` config and `info/attributes` and
-run a filter while hashing a tracked file. Submodule content is reviewed by a
-separate per-repository diff, with the shield in force. `git apply` cannot take an
-attribute source in work-tree mode (git segfaults) or outside a repository, so
-every apply runs with each configured filter driver disabled by command-scope
-configuration; its index modes also read attributes from the empty tree. The API
-relay applies its diff blocks the same way, with a git binary from outside the
-workspace; that apply also carries `core.autocrlf=false`, so on a CRLF checkout
-configured `core.autocrlf=true` an LF diff block may not apply.
+shield Git attributes`). The empty tree is named by the full object id of the
+repository's own object format (SHA-1 or SHA-256), read from
+`extensions.objectFormat` in the common directory's `config` exactly as git's
+repository-format check reads it (no include is followed); a hex id of the other
+length would be resolved as a ref name, so a branch named like the SHA-1 id
+could hand a SHA-256 repository's attributes to a tree of its choosing. A config
+git cannot parse, or an object format git does not know, also fails closed.
+
+No host git command enters a nested repository, where a child git would run
+without `--attr-source` or the shield and read that repository's own config and
+`info/attributes` (and run a filter while hashing a tracked file). Diffs run
+`--submodule=short --ignore-submodules=dirty` and `git status` runs
+`--ignore-submodules=dirty`: the option, unlike `diff.ignoreSubmodules`, outranks a
+`submodule.<name>.ignore` that `.gitmodules` (a work-tree file) sets. git still
+reports a submodule whose commit pointer moved. `git add` reads no such setting,
+so makewand's `git add -A` (`git_helper.add_all`, also for its private diff
+indexes) leaves gitlinks out and stages them with `git update-index`, which only
+reads each nested `HEAD`. Every command also carries command-scope configuration
+(`GIT_CONFIG_COUNT`, which git hands on to every git it starts):
+`diff.ignoreSubmodules=dirty`, `submodule.recurse=false` (a user's
+`submodule.recurse=true` made `checkout`, `reset --hard` and `read-tree` check a
+submodule's files out through its own filters), `fetch.recurseSubmodules=false`
+and `push.recurseSubmodules=no`. A clone runs `--no-checkout`; the files are
+checked out afterwards in the new repository, with its own shield and attribute
+source, so neither an untrusted repository's `.gitattributes` nor a filter the
+user defines globally runs while cloning.
+
+Where makewand relied on `git status` to see changed content inside a submodule,
+it asks each submodule itself (`git_helper.dirty_submodule_paths`): every
+checked-out submodule that `.gitmodules` registers for a gitlink of the index,
+recursively through the submodules each of them registers, gets its own shielded
+`git status`, and a dirty one is reported as the gitlink git status reported. This
+covers the working-tree isolation check, the dirty-file lists (syntax gate,
+candidate conflicts and change lists), the host transaction's task-start baseline
+and rollback verification, the shadow delivery's clean checks and the DAG
+staging copy's checkpoint and seal. Two observable differences: uncommitted
+changes inside a nested repository that `.gitmodules` does not register are no
+longer reported (a moved commit pointer still is), and `submodule.<name>.ignore`
+no longer hides a registered submodule's changes from these checks.
+
+`git apply` cannot take an attribute source in work-tree mode (git segfaults) or
+outside a repository, so every apply runs with each configured filter driver
+disabled by command-scope configuration; its index modes also read attributes
+from the empty tree. makewand lists the drivers right before git starts, with the
+shield already in place; a process that writes the repository's configuration at
+that very moment can still add a driver between the listing and git's own read,
+since git has no setting that disables every filter driver whatever its name. The
+delivery patch check and the generated `apply_delivery.sh` apply the same way:
+the script's applies run through its private helper, which lists the
+destination's drivers with the command and environment of the apply. The API
+relay applies its diff blocks through `run_git_cmd`, with a git binary from
+outside the workspace; that apply also carries `core.autocrlf=false`, so on a CRLF
+checkout configured `core.autocrlf=true` an LF diff block may not apply.
+
+`run_git_cmd` refuses a global option that would point git at another
+repository, work tree, namespace, attribute source or set of git programs than
+the ones it shields for its working directory (`-C`, `--git-dir`, `--work-tree`,
+`--namespace`, `--bare`, `--attr-source`, `--exec-path`, `--config-env`, and `-c`
+settings in an `include` or `includeIf` section): callers pass the working
+directory instead. `GIT_ATTR_SOURCE`, `GIT_CEILING_DIRECTORIES`,
+`GIT_DISCOVERY_ACROSS_FILESYSTEM` and `GIT_NAMESPACE` are removed from the
+inherited environment, like `GIT_DIR` and the other redirection variables.
+`git submodule status --recursive`, which makewand uses to list submodules, still
+starts `git submodule--helper status` inside each initialized submodule; that
+helper only compares commit pointers and hashes no file.
 
 Pre-existing files that are not backed up (dependency and cache directories,
 files over the backup limits) get a SHA-256 digest at task start, smallest first,

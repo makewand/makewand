@@ -39,6 +39,8 @@ from makewand.config import (
     ensure_private_dir,
 )
 from makewand.git_helper import (
+    add_all,
+    dirty_submodule_paths,
     ensure_git_worktree,
     HostWorkspaceTransaction,
     PipelineWorkspaceGuard,
@@ -2815,7 +2817,7 @@ def _run_pipeline_impl(
                         if dst_sub.exists():
                             _, s_out, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=str(dst_sub))
                             if s_out.strip():
-                                a_sub_code, _, a_sub_err = run_git_cmd(["git", "add", "-A"], cwd=str(dst_sub))
+                                a_sub_code, _, a_sub_err = add_all(dst_sub)
                                 if a_sub_code != 0:
                                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 子模块 {sub_rel} 暂存失败 ({a_sub_err})，拒绝交付。")
                                 c_sub_code, _, c_sub_err = run_git_cmd([
@@ -2868,7 +2870,7 @@ def _run_pipeline_impl(
                                     submodule_pushes.append((str(dst_sub), str(src_sub.resolve()), sub_commit))
 
                 # 1. Stage changes and verify staging success
-                add_code, _, add_err = run_git_cmd(["git", "add", "-A"], cwd=worktree_root)
+                add_code, _, add_err = add_all(worktree_root)
                 if add_code != 0:
                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子分支代码暂存失败 ({add_err})，拒绝交付。")
 
@@ -2885,8 +2887,9 @@ def _run_pipeline_impl(
                         return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子分支代码提交失败 ({c_err})，拒绝交付。")
 
                 # Verify that working tree is 100% clean and matches the committed state
+                # git status no longer enters a submodule: each registered one is asked itself.
                 clean_code, clean_check, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=worktree_root)
-                if clean_code != 0 or (clean_check and clean_check.strip()):
+                if clean_code != 0 or (clean_check and clean_check.strip()) or dirty_submodule_paths(worktree_root):
                     return fail_and_cleanup("❌ [Makewand Quality Gate] 交付提交后工作区残留未审查改动，拒绝交付未验证内容。")
 
                 # 3. Verify that the task produced actual net changes compared to baseline
@@ -2919,6 +2922,8 @@ def _run_pipeline_impl(
 
                 # 5. Post-delivery integrity check: shadow worktree must be 100% clean
                 dirty_code, dirty_check, _ = run_git_cmd(["git", "status", "--porcelain"], cwd=worktree_root)
+                if dirty_code == 0 and not dirty_check.strip():
+                    dirty_check = " ".join(dirty_submodule_paths(worktree_root))
                 if dirty_code != 0 or dirty_check.strip():
                     return fail_and_cleanup(f"❌ [Makewand Quality Gate] 影子工作区交付后存在未受控改动或脏文件 ({dirty_check.strip()[:120]})，阻断交付。")
 
@@ -2992,7 +2997,8 @@ def _run_pipeline_impl(
                         "set -euo pipefail",
                         'for MAKEWAND_GIT_ENV in "${!GIT_@}"; do unset "$MAKEWAND_GIT_ENV"; done',
                         "export GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null",
-                        'delivery_git() { local MAKEWAND_DELIVERY_ROOT="$1"; shift; git --no-replace-objects -c core.fsmonitor= -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.autocrlf=false -c core.pager=cat -C "$MAKEWAND_DELIVERY_ROOT" --work-tree="$MAKEWAND_DELIVERY_ROOT" "$@"; }',
+                        "# git apply runs in the private helper, with every filter driver the destination defines disabled.",
+                        'delivery_apply() { delivery_check apply "$@"; }',
                         f'REPO_ROOT={_shell_quote(repo_apply_root)}',
                         'echo "============================================================"',
                         'echo "      📦 [Makewand Delivery Applier] 开始应用代码改动"',
@@ -3020,9 +3026,9 @@ def _run_pipeline_impl(
                         script_lines.append(f'SUB_SHA_{idx}={sub_sha}')
                         if sp.get("sha256"):
                             script_lines.append(f'if [ "$(sha256sum "$SUB_PATCH_{idx}" | cut -d" " -f1)" != "$SUB_SHA_{idx}" ]; then echo "❌ 子模块补丁校验和不匹配 ($SUB_REL_{idx})，拒绝应用" >&2; exit 1; fi')
-                        script_lines.append(f'delivery_git "$REPO_ROOT/$SUB_REL_{idx}" apply --check --binary "$SUB_PATCH_{idx}"')
+                        script_lines.append(f'delivery_apply "$REPO_ROOT/$SUB_REL_{idx}" --check --binary "$SUB_PATCH_{idx}"')
 
-                    script_lines.append('delivery_git "$REPO_ROOT" apply --check --binary "$MAIN_PATCH"')
+                    script_lines.append('delivery_apply "$REPO_ROOT" --check --binary "$MAIN_PATCH"')
                     script_lines.append('echo "✔ 预检通过，未检测到补丁冲突。"')
                     script_lines.append("")
                     script_lines.append("# 2. Apply checked patches and verify their postimages; reverse on error")
@@ -3038,7 +3044,7 @@ def _run_pipeline_impl(
                     script_lines.append('        echo "  → 正在回滚主仓库改动..." >&2')
                     script_lines.append('        if delivery_check rollback "" "$DELIVERY_STATE_DIR/main.json"')
                     script_lines.append('        then')
-                    script_lines.append('          if ! delivery_git "$REPO_ROOT" apply --reverse --binary "$MAIN_PATCH"; then')
+                    script_lines.append('          if ! delivery_apply "$REPO_ROOT" --reverse --binary "$MAIN_PATCH"; then')
                     script_lines.append('            echo "  ❌ 主仓库回滚失败！" >&2')
                     script_lines.append('            ROLLBACK_FAILED=1')
                     script_lines.append('          fi')
@@ -3064,7 +3070,7 @@ def _run_pipeline_impl(
                         script_lines.append('                continue')
                         script_lines.append('            fi ;;')
                     script_lines.append('        esac')
-                    script_lines.append('        if ! delivery_git "$REPO_ROOT/$sub_rel" apply --reverse --binary "$sub_patch"; then')
+                    script_lines.append('        if ! delivery_apply "$REPO_ROOT/$sub_rel" --reverse --binary "$sub_patch"; then')
                     script_lines.append('            echo "  ❌ 子模块 ($sub_rel) 回滚失败！" >&2')
                     script_lines.append('            ROLLBACK_FAILED=1')
                     script_lines.append('        fi')
@@ -3081,12 +3087,12 @@ def _run_pipeline_impl(
 
                     for idx, sp in enumerate(sub_patches):
                         script_lines.append(f'printf "→ 应用子模块改动: %s...\\n" "$SUB_REL_{idx}"')
-                        script_lines.append(f'delivery_git "$REPO_ROOT/$SUB_REL_{idx}" apply --binary "$SUB_PATCH_{idx}"')
+                        script_lines.append(f'delivery_apply "$REPO_ROOT/$SUB_REL_{idx}" --binary "$SUB_PATCH_{idx}"')
                         script_lines.append(f'APPLIED_SUB_INDICES+=({idx})')
                         script_lines.append(f'delivery_check checkpoint {_shell_quote(sp["rel_path"])} "$DELIVERY_STATE_DIR/sub_{idx}.json"')
 
                     script_lines.append('printf "→ 应用主仓库改动...\\n"')
-                    script_lines.append('delivery_git "$REPO_ROOT" apply --binary "$MAIN_PATCH"')
+                    script_lines.append('delivery_apply "$REPO_ROOT" --binary "$MAIN_PATCH"')
                     script_lines.append('MAIN_APPLIED=1')
                     script_lines.append('delivery_check checkpoint "" "$DELIVERY_STATE_DIR/main.json"')
                     if protected.paths:

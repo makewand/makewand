@@ -306,9 +306,12 @@ class ApplyFilterTests(FilterFixture):
                 self.assertEqual((repo / "f.txt").read_text(), "one\ntwo\n")
 
     def test_apply_refuses_when_the_filter_configuration_cannot_be_listed(self):
+        # A broken config itself is refused earlier (its object format cannot be read);
+        # git follows an include only when it lists the configuration.
         repo = self.committed_attributes_repository(self.root / "repo")
+        (repo / ".git" / "broken.cfg").write_text("[broken\n")
         with (repo / ".git" / "config").open("a") as config:
-            config.write("[broken\n")
+            config.write("[include]\n\tpath = broken.cfg\n")
         code, _, error = git_helper.run_git_cmd(["git", "apply", "-"], cwd=str(repo), input_data=PATCH.encode())
         self.assertNotEqual(code, 0)
         self.assertIn("Cannot list Git filter drivers", os.fsdecode(error))
