@@ -72,7 +72,9 @@ def _admission_deadline():
 
 
 @contextmanager
-def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None):
+def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=True):
+    """Lock, read and validate the ledger. Without migrate, opening it writes nothing:
+    a lifetime ledger is not converted and a tighter maximum is not persisted."""
     value = budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE")
     if not value and layered_budget.enabled():
         value = layered_budget.default_path()
@@ -117,14 +119,14 @@ def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None):
                 data = json.loads(raw.decode("utf-8"), parse_constant=_reject_nonfinite_json)
             _validate(data)
             ledger_compaction.compact(data)
-            if layered_budget.enabled() and "scopes" not in data:
+            if migrate and layered_budget.enabled() and "scopes" not in data:
                 legacy = data["maximum"]
                 layered_budget.initialize(data)
                 data["legacy_maximum"] = legacy
                 data["legacy_used"] = _charged(data)
                 _save(path, data)
             maximum = data["maximum"] if "scopes" in data else _maximum(data, max_model_calls)
-            if maximum < data["maximum"]:
+            if migrate and maximum < data["maximum"]:
                 data["maximum"] = maximum
                 _save(path, data)
             yield path, data
@@ -369,7 +371,7 @@ def repair_clock(budget_file=None, apply=False):
     if not report["exists"]:
         return report
     try:
-        with _ledger(value) as (path, data):
+        with _ledger(value, migrate=False) as (path, data):
             if "scopes" not in data:
                 return report  # a lifetime ledger has no daily clock
             report["layered"] = True

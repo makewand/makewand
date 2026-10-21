@@ -270,13 +270,14 @@ class RepairTests(ClockSkewCase):
         self.assertFalse(b.repair_clock(apply=True)["exists"])
         self.assertFalse(self.path.exists())
         self.path.write_text(json.dumps({"schema": 1, "maximum": 5, "attempts": []}))
-        for key in ("MAKEWAND_LAYERED_BUDGET", "MAKEWAND_MACHINE_DAILY_CALLS",
-                    "MAKEWAND_PROJECT_DAILY_CALLS", "MAKEWAND_MAX_MODEL_CALLS"):
-            os.environ.pop(key)  # restored by setUp's patch
         before = self.path.read_bytes()
-        report = b.repair_clock(apply=True)
-        self.assertEqual((report["exists"], report["layered"], report["applied"]), (True, False, False))
-        self.assertEqual(self.path.read_bytes(), before)
+        # Even with layered admission enabled (as --call-budget-file sets it), the
+        # repair neither converts a lifetime ledger nor persists a tighter maximum.
+        os.environ["MAKEWAND_MAX_MODEL_CALLS"] = "3"
+        for apply in (False, True):
+            report = b.repair_clock(apply=apply)
+            self.assertEqual((report["exists"], report["layered"], report["applied"]), (True, False, False))
+            self.assertEqual(self.path.read_bytes(), before)
 
 
 class BudgetCommandTests(ClockSkewCase):
