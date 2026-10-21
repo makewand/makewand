@@ -496,3 +496,43 @@ func TestHTTPNamedOpenAIModelIsCalledDespiteAnOpenAIModelTable(t *testing.T) {
 		t.Fatalf("openai called %q, want the table's gpt-4o-mini", models)
 	}
 }
+
+// The scaled reservation ceiling covers a route only a factory builds, such as
+// an API-key-only deployment's codex route: Power ensembles reach it, and
+// routing.json can point its table at a model pricier than any registered
+// provider's. The ceiling counted registered providers only.
+func TestHTTPPriceCeilingCoversFactoryBuiltAPIRoutes(t *testing.T) {
+	r := mustNewRouter(RouterConfig{Providers: map[string]ProviderEntry{
+		"openai": {Provider: NewOpenAIWithBaseURL("k", "gpt-4o-mini", "http://127.0.0.1:1/v1"), Access: AccessAPI},
+	}})
+	if err := r.RegisterProviderFactory("codex", func(string) (Provider, error) {
+		return NewOpenAIWithBaseURL("k", "gpt-4o-mini", "http://127.0.0.1:1/v1"), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.SetAccessType("codex", AccessAPI)
+	// The codex table's codex-cli placeholder calls the configured model.
+	if got, _ := r.httpPriceCeiling(); got != tablePrice(t, "gpt-4o-mini") {
+		t.Fatalf("ceiling = %+v, want gpt-4o-mini's price", got)
+	}
+	dir := t.TempDir()
+	table := `{"models":{"codex":{"cheap":"o1","mid":"o1","premium":"o1"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "routing.json"), []byte(table), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.LoadUserOverrides(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.httpPriceCeiling(); got != tablePrice(t, "o1") {
+		t.Fatalf("ceiling = %+v, want o1's price for the codex route", got)
+	}
+	// Neither a route served without API access nor one a token may not use
+	// is counted.
+	if got, _ := r.cloneWithProviderAllowlist([]string{"openai"}).httpPriceCeiling(); got != tablePrice(t, "gpt-4o-mini") {
+		t.Fatalf("openai-only ceiling = %+v, want gpt-4o-mini's price", got)
+	}
+	r.SetAccessType("codex", AccessSubscription)
+	if got, _ := r.httpPriceCeiling(); got != tablePrice(t, "gpt-4o-mini") {
+		t.Fatalf("ceiling with a subscription codex route = %+v, want gpt-4o-mini's price", got)
+	}
+}

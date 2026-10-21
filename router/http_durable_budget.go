@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -130,8 +131,9 @@ func (r *Router) httpReservationUSD(floor float64, prepared *preparedHTTPChat) f
 }
 
 // httpPriceCeiling returns the highest input and output prices ($/MTok) among
-// the models this Router's API-access providers are billed at: every model
-// routing can call through them, as the provider reports it (apiBilledModels).
+// the models this Router's API-access providers, registered or factory-built
+// (billedProviderNames), are billed at: every model routing can call through
+// them, as the provider reports it (apiBilledModels).
 // It takes no provider a client pinned: a pinned request falls back to the
 // other registered providers when its own is unavailable or fails
 // (RouteProvider, chatWithFallbackCandidates) - a client asking for
@@ -144,7 +146,7 @@ func (r *Router) httpReservationUSD(floor float64, prepared *preparedHTTPChat) f
 func (r *Router) httpPriceCeiling() (costEntry, bool) {
 	var ceiling costEntry
 	found := false
-	for _, name := range r.registeredProviderNames() {
+	for _, name := range r.billedProviderNames() {
 		if r.getAccessType(name) != AccessAPI {
 			continue
 		}
@@ -156,6 +158,23 @@ func (r *Router) httpPriceCeiling() (costEntry, bool) {
 		}
 	}
 	return ceiling, found && (ceiling.Input > 0 || ceiling.Output > 0)
+}
+
+// billedProviderNames returns the providers a request can be billed through:
+// the registered ones and those only a factory builds, which Power ensembles
+// and build phases resolve on demand, such as the codex route of an
+// API-key-only deployment, whose table routing.json can point at a model
+// pricier than any registered provider's.
+func (r *Router) billedProviderNames() []string {
+	names := r.registeredProviderNames()
+	r.providerMu.Lock()
+	defer r.providerMu.Unlock()
+	for name := range r.factories {
+		if r.isProviderAllowed(name) && !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // apiBilledModels returns the models requests routed to provider name are
