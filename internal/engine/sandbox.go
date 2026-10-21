@@ -414,13 +414,22 @@ func (p *Project) execDependencyPlan(ctx context.Context, env verifyExecEnvironm
 	defer cleanup()
 
 	// A dependency that cannot be fetched without running project code (an npm
-	// local-directory or git dependency, whose `prepare` runs even under
-	// --ignore-scripts on some npm versions) must not run with the network at
-	// all. It is an environment limitation of fetch-only networking, not the
-	// candidate's failure.
+	// local-directory, workspace or git dependency, whose `prepare` runs even
+	// under --ignore-scripts before npm 12; a rustup toolchain chosen by path)
+	// must not run with the network at all. It is an environment limitation of
+	// fetch-only networking, not the candidate's failure.
 	if reason := p.networkFetchUnavailable(plan); reason != "" {
 		result := &ExecResult{ExitCode: 1, Note: reason}
 		return result, none, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, reason)
+	}
+
+	if fetch != nil && plan.Command == "npm" {
+		if _, err := userNetLookPath(userNetHelperName); err == nil {
+			// With the network, npm resolves only through a lockfile makewand
+			// has inspected (execNpmFetch); without it the fetch runs
+			// loopback below, as before.
+			return p.execNpmFetch(ctx, env, projectDir, *fetch, readOnly)
+		}
 	}
 
 	var fetchResult *ExecResult
@@ -500,14 +509,17 @@ func (p *Project) planDependencyStages(plan ExecPlan, projectDir string) (fetch,
 	case "npm", "pnpm", "yarn":
 		// install/ci fetch packages; --ignore-scripts keeps lifecycle scripts
 		// from running, and npm_config_ignore_scripts=true closes the config a
-		// workspace .npmrc could set. A local-directory or git dependency still
-		// runs its `prepare` under --ignore-scripts on some npm versions
-		// (GHSA-wr8v-3jqh-9x36), so execDependencyPlan refuses the networked
-		// fetch outright when the manifest or lockfile names a non-registry
-		// dependency (npmFetchUnavailable); here the fetch is registry-only.
+		// workspace .npmrc could set. A local-directory, workspace or git
+		// dependency still runs its `prepare` under --ignore-scripts before npm
+		// 12 (confirmed on npm 10.8.2; GHSA-wr8v-3jqh-9x36), so with the network
+		// execDependencyPlan refuses a project that names one
+		// (npmFetchUnavailable) and resolves the rest through a lockfile it
+		// inspects first (execNpmFetch). npm_config_allow_git=none makes npm 12
+		// refuse a git dependency anywhere in the tree, whatever a user
+		// .npmrc in the sandbox HOME says.
 		f := plan
 		f.Args = ensureArg(plan.Args, "--ignore-scripts")
-		f.env = append(slices.Clone(plan.env), "npm_config_ignore_scripts=true")
+		f.env = append(slices.Clone(plan.env), "npm_config_ignore_scripts=true", "npm_config_allow_git=none")
 		return &f, nil, noop, nil
 	case "go":
 		// go mod tidy/download run no project code; the offline test step reuses
@@ -2054,22 +2066,23 @@ var npmPackageNameRe = regexp.MustCompile(`^(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A
 // networkFetchUnavailable returns, for a dependency plan whose networked fetch
 // would otherwise run project code (or fetch a dependency it cannot get from a
 // registry), why that cannot be done under fetch-only networking, or "". npm
-// is affected by what the project depends on, cargo by the rustup toolchain
-// the workspace selects (cargoFetchToolchain); pip is split so the networked
-// stage builds nothing, and go fetches no code. It applies only when outbound
-// network is actually available: without the user-mode network helper the
-// fetch runs loopback, so code it runs cannot exfiltrate and the offline
-// classifier (offlineRegistryNeed) decides instead, as it did before this
-// change.
+// is affected by what the project depends on (npmFetchUnavailable), cargo by
+// the rustup toolchain the workspace selects (cargoFetchToolchain); pnpm and
+// yarn, which makewand's dependency plans never run, are refused outright.
+// pip is split so the networked stage builds nothing, and go fetches no code.
+// It applies only when outbound network is actually available: without the
+// user-mode network helper the fetch runs loopback, so code it runs cannot
+// exfiltrate and the offline classifier (offlineRegistryNeed) decides instead,
+// as it did before this change.
 func (p *Project) networkFetchUnavailable(plan ExecPlan) string {
 	if _, err := userNetLookPath(userNetHelperName); err != nil {
 		return "" // no outbound network: the fetch runs loopback, nothing to refuse
 	}
 	switch plan.Command {
-	case "npm", "pnpm", "yarn":
-		if dep := p.npmNonRegistryDependency(); dep != "" {
-			return "the project depends on " + dep + ", which npm cannot fetch from a registry without running project code (a local-directory or git dependency runs its prepare script even under --ignore-scripts); makewand only lets a dependency download use the network, so install the project's dependencies outside makewand"
-		}
+	case "npm":
+		return p.npmFetchUnavailable(plan)
+	case "pnpm", "yarn":
+		return "makewand fetches JavaScript dependencies with the network only through npm, whose fetch it has checked to run no project code, and never runs " + plan.Command + " as a dependency step; install the project's dependencies outside makewand"
 	case "cargo":
 		projectDir, err := p.execWorkingDir()
 		if err != nil {
@@ -2079,131 +2092,6 @@ func (p *Project) networkFetchUnavailable(plan ExecPlan) string {
 		return refusal
 	}
 	return ""
-}
-
-// npmNonRegistryDependency returns a dependency npm would fetch by running
-// project code - a local path/directory (file:/link:/./) or a git repository
-// (git+/git:/github:/gitlab:/bitbucket:/user'/repo shorthand), whose prepare
-// script runs even under --ignore-scripts - or a workspace link outside a real
-// workspaces setup (unfetchable), as "name (spec)", from package.json or the
-// lockfile in use, or "". A plain http(s) tarball is not flagged: npm extracts
-// it without running a prepare script (pacote's remote fetcher runs none), so
-// it is a download, not code execution.
-func (p *Project) npmNonRegistryDependency() string {
-	if content, err := p.ReadFile("package.json"); err == nil {
-		var manifest map[string]json.RawMessage
-		if json.Unmarshal([]byte(content), &manifest) == nil {
-			hasWorkspaces := len(manifest["workspaces"]) > 0 || p.npmHasWorkspaceConfig()
-			for _, field := range []string{"dependencies", "devDependencies", "optionalDependencies", "peerDependencies"} {
-				var specs map[string]string
-				if json.Unmarshal(manifest[field], &specs) != nil {
-					continue
-				}
-				for _, name := range slices.Sorted(maps.Keys(specs)) {
-					if npmSpecRunsCodeOnFetch(specs[name], hasWorkspaces) {
-						return name + " (" + field + ": " + specs[name] + ")"
-					}
-				}
-			}
-		}
-	}
-	return p.npmLockfileNonRegistry()
-}
-
-// npmHasWorkspaceConfig reports whether a workspaces setup is declared outside
-// package.json (pnpm-workspace.yaml), so a workspace: dependency links in place
-// and fetches nothing.
-func (p *Project) npmHasWorkspaceConfig() bool {
-	_, err := p.ReadFile("pnpm-workspace.yaml")
-	return err == nil
-}
-
-// npmSpecRunsCodeOnFetch reports whether npm fetching a package.json dependency
-// spec runs project code (a local directory or git repository, whose prepare
-// script runs even under --ignore-scripts), or cannot fetch it from a registry
-// at all (a workspace: link without a workspaces setup). A version, range,
-// tag, npm: alias, or plain http(s) tarball returns false (a registry resolve
-// or a scriptless download).
-func npmSpecRunsCodeOnFetch(spec string, hasWorkspaces bool) bool {
-	spec = strings.TrimSpace(spec)
-	switch {
-	case spec == "", strings.HasPrefix(spec, "npm:"):
-		return false
-	case strings.HasPrefix(spec, "workspace:"):
-		return !hasWorkspaces
-	case strings.HasPrefix(spec, "http://"), strings.HasPrefix(spec, "https://"):
-		return false // a tarball URL: extracted, no prepare script runs
-	case strings.HasPrefix(spec, "file:"), strings.HasPrefix(spec, "link:"):
-		return true
-	case strings.HasPrefix(spec, "git+"), strings.HasPrefix(spec, "git:"), strings.HasPrefix(spec, "git@"):
-		return true
-	case strings.HasPrefix(spec, "github:"), strings.HasPrefix(spec, "gitlab:"), strings.HasPrefix(spec, "bitbucket:"), strings.HasPrefix(spec, "gist:"):
-		return true
-	case strings.HasPrefix(spec, "."), strings.HasPrefix(spec, "~"), strings.HasPrefix(spec, "/"):
-		return true // a local path
-	}
-	// A "user/repo" GitHub shorthand (optionally with a #committish, which may
-	// itself be "semver:..."): a slash, and no scheme before the committish.
-	base, _, _ := strings.Cut(spec, "#")
-	return strings.Contains(base, "/") && !strings.Contains(base, ":")
-}
-
-// npmLockfileNonRegistry scans package-lock.json / npm-shrinkwrap.json for a
-// package resolved from a non-registry source (a git repository, a local
-// directory link, or a file: path), transitive ones included, and returns it
-// as "name (spec)" or "". It reads the lockfile structurally, so a false
-// "resolved" string in a dependency's own field cannot forge a registry source.
-func (p *Project) npmLockfileNonRegistry() string {
-	for _, name := range []string{"package-lock.json", "npm-shrinkwrap.json"} {
-		content, err := p.ReadFile(name)
-		if err != nil {
-			continue
-		}
-		var lock struct {
-			Packages map[string]struct {
-				Resolved string `json:"resolved"`
-				Link     bool   `json:"link"`
-			} `json:"packages"`
-			Dependencies map[string]struct {
-				Version  string `json:"version"`
-				Resolved string `json:"resolved"`
-			} `json:"dependencies"`
-		}
-		if json.Unmarshal([]byte(content), &lock) != nil {
-			continue
-		}
-		for path, pkg := range lock.Packages { // lockfile v2/v3
-			if path == "" {
-				continue // the root project itself
-			}
-			if pkg.Link || npmNonRegistrySource(pkg.Resolved) {
-				return npmLockPackageName(path) + " (" + name + ")"
-			}
-		}
-		for dep, pkg := range lock.Dependencies { // lockfile v1
-			if npmNonRegistrySource(pkg.Resolved) || npmNonRegistrySource(pkg.Version) {
-				return dep + " (" + name + ")"
-			}
-		}
-	}
-	return ""
-}
-
-// npmNonRegistrySource reports whether a lockfile resolved/version value names
-// a git repository or a file: path (npm runs project code preparing those).
-func npmNonRegistrySource(value string) bool {
-	value = strings.TrimSpace(value)
-	return strings.HasPrefix(value, "git+") || strings.HasPrefix(value, "git:") ||
-		strings.HasPrefix(value, "file:") || strings.HasPrefix(value, "ssh:")
-}
-
-// npmLockPackageName returns the package name from a lockfile v2/v3 package
-// path such as "node_modules/@scope/pkg" or "node_modules/a/node_modules/b".
-func npmLockPackageName(path string) string {
-	if i := strings.LastIndex(path, "node_modules/"); i >= 0 {
-		return path[i+len("node_modules/"):]
-	}
-	return path
 }
 
 // npmRegistryNeed returns a registry dependency that package.json declares and

@@ -350,6 +350,7 @@ cd "$chdir" && exec "$@"
 func installRunningUserNet(t *testing.T) string {
 	t.Helper()
 	fakeWorkingBwrap(t)
+	stubNpmVersion(t, npmNetworkedLockMajor) // see installFakeUserNet
 	swapSeccompVars(t, "linux", false, nil)
 	dir := t.TempDir()
 	log := filepath.Join(dir, "launches.log")

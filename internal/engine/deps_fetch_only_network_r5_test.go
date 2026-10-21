@@ -555,3 +555,418 @@ func TestPipEditableExtrasInstallOffline_GEC1021R5(t *testing.T) {
 	run(project.Path, pip, build.Args...)
 	run(work, filepath.Join(work, "venv", "bin", "python"), "-I", "-c", "import proj, rundep, devdep, testdep")
 }
+
+// registryLeftPadLock is a lockfile (v3) that takes its one package from the
+// npm registry.
+const registryLeftPadLock = `{
+  "name": "x",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {"name": "x", "dependencies": {"left-pad": "^1.3.0"}},
+    "node_modules/left-pad": {"version": "1.3.0", "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz", "integrity": "sha512-x"}
+  }
+}
+`
+
+// stubNpmVersion makes the networked npm fetch see an npm of this major
+// version.
+func stubNpmVersion(t *testing.T, major int) {
+	t.Helper()
+	old := npmVersionProbe
+	npmVersionProbe = func() int { return major }
+	t.Cleanup(func() { npmVersionProbe = old })
+}
+
+// Only a registry spec is fetched from the registry: npm-package-arg reads
+// "~1.2.3" as a range, but https://github.com/user/repo as a git dependency
+// (the round-2 check took every https spec for a scriptless tarball), and
+// ssh:, sourcehut: and a local tarball name are not registry specs either.
+func TestNpmNonRegistrySpec_GEC1021R5(t *testing.T) {
+	for _, tc := range []struct {
+		spec string
+		want bool
+	}{
+		{"~4.17.21", false}, // a tilde range, not a home-relative path
+		{"", false},
+		{"*", false},
+		{">=1.0.0 <2 || ^3", false},
+		{"next", false},
+		{"npm:@scope/pkg@^1", false},
+		{"NPM:left-pad", false},
+		{"https://github.com/user/repo", true},
+		{"https://gitlab.com/user/repo", true},
+		{"ssh://git@github.com/user/repo", true},
+		{"git@github.com:user/repo.git", true},
+		{"sourcehut:~user/repo", true},
+		{"gist:abc123", true},
+		{"~/local", true},
+		{"pkg.tgz", true},
+		{"pkg-1.0.0.tar.gz", true},
+		{"C:dep", true},
+		{"npm:github:user/repo", true},
+		{"npm:git+https://h.example/r.git", true},
+		{"npm:left-pad@file:../x", true},
+		{"npm:a@npm:b@1", true}, // nested aliases are not supported
+	} {
+		if got := npmNonRegistrySpec(tc.spec, false); got != tc.want {
+			t.Errorf("npmNonRegistrySpec(%q) = %v, want %v", tc.spec, got, tc.want)
+		}
+	}
+}
+
+// The static check reads package.json (a workspaces root, every dependency and
+// override spec) and every entry of the lockfiles npm follows: package-lock.json
+// and npm-shrinkwrap.json of any lockfileVersion, and a v1 yarn.lock (npm
+// 10.8.2 ran a git dependency's prepare when only a yarn.lock named it).
+func TestNpmNonRegistryDependencyStatic_GEC1021R5(t *testing.T) {
+	lock := func(entries string) string {
+		return `{"lockfileVersion": 3, "packages": {"": {"name": "x"}, ` + entries + `}}`
+	}
+	const manifest = `{"name":"x","dependencies":{"left-pad":"^1.3.0"}}`
+	for _, tc := range []struct {
+		name  string
+		files []string
+		want  string // a substring of the reason; "" for none
+	}{
+		{"tilde range", []string{"package.json", `{"name":"x","dependencies":{"lodash":"~4.17.21"}}`}, ""},
+		{"https GitHub repository", []string{"package.json", `{"name":"x","dependencies":{"dep":"https://github.com/user/repo"}}`}, "dep (dependencies: https://github.com/user/repo)"},
+		{"workspaces root", []string{"package.json", `{"name":"x","workspaces":["packages/*"]}`}, "workspaces root"},
+		{"yarn-style workspaces object", []string{"package.json", `{"name":"x","workspaces":{"packages":["p/*"]}}`}, "workspaces root"},
+		{"empty workspaces", []string{"package.json", `{"name":"x","workspaces":[]}`}, ""},
+		{"override with a git repository", []string{"package.json", `{"name":"x","overrides":{"a":{"b":"github:user/repo"},"c":"$c"}}`}, "b: github:user/repo"},
+		{"registry overrides", []string{"package.json", `{"name":"x","overrides":{"a":"1.0.0","b":{".":"^2","c":"$c"}}}`}, ""},
+		{"registry lockfile", []string{"package.json", manifest, "package-lock.json", registryLeftPadLock}, ""},
+		{"scoped, aliased and mirrored registry tarballs", []string{"package.json", manifest, "package-lock.json", lock(
+			`"node_modules/@s/p": {"version": "2.0.0", "resolved": "https://registry.npmjs.org/@s/p/-/p-2.0.0.tgz"},` +
+				`"node_modules/pad": {"name": "left-pad", "version": "1.3.0", "resolved": "https://registry.npmmirror.com/left-pad/-/left-pad-1.3.0.tgz"},` +
+				`"node_modules/b": {"version": "1.0.0", "resolved": "https://corp.example/artifactory/api/npm/npm/b/-/b-1.0.0.tgz"},` +
+				`"node_modules/bundled": {"version": "1.0.0", "inBundle": true}`)}, ""},
+		{"git entry", []string{"package.json", manifest, "package-lock.json", lock(`"node_modules/a": {"version": "1.0.0", "resolved": "git+ssh://git@github.com/u/r.git#0123"}`)}, "a from git+ssh://"},
+		{"file entry", []string{"package.json", manifest, "package-lock.json", lock(`"node_modules/a": {"version": "1.0.0", "resolved": "file:../a.tgz"}`)}, "a from file:../a.tgz"},
+		{"tarball outside the registry", []string{"package.json", manifest, "package-lock.json", lock(`"node_modules/a": {"version": "1.0.0", "resolved": "https://evil.example/a.tgz"}`)}, "a from the URL https://evil.example/a.tgz"},
+		{"tarball of another version", []string{"package.json", manifest, "package-lock.json", lock(`"node_modules/a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-6.6.6.tgz"}`)}, "a from the URL"},
+		{"link to a workspace", []string{"package.json", manifest, "package-lock.json", lock(`"node_modules/w": {"resolved": "packages/w", "link": true}`)}, "w as a link to packages/w"},
+		{"local package", []string{"package.json", manifest, "package-lock.json", lock(`"../dirdep": {"version": "1.0.0"}`)}, "the local package ../dirdep"},
+		{"v1 git version", []string{"package.json", manifest, "npm-shrinkwrap.json", `{"lockfileVersion": 1, "dependencies": {"a": {"version": "github:u/r#0123"}}}`}, "npm-shrinkwrap.json takes a from github:u/r#0123"},
+		{"v1 nested URL", []string{"package.json", manifest, "package-lock.json", `{"lockfileVersion": 1, "dependencies": {"a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz", "dependencies": {"b": {"version": "1.0.0", "resolved": "https://evil.example/b.tgz"}}}}}`}, "b from the URL"},
+		{"v1 registry alias", []string{"package.json", manifest, "package-lock.json", `{"lockfileVersion": 1, "dependencies": {"pad": {"version": "npm:left-pad@1.3.0", "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"}}}`}, ""},
+		{"yarn.lock resolving a range to git", []string{"package.json", `{"name":"x","dependencies":{"gitdep":"^1.0.0"}}`, "yarn.lock",
+			"# yarn lockfile v1\n\n\ngitdep@^1.0.0:\n  version \"1.0.0\"\n  resolved \"git+file:///tmp/gitdep#0123\"\n"}, "yarn.lock, whose resolutions npm follows without a package lock, takes gitdep from git+file:///tmp/gitdep#0123"},
+		{"yarn.lock registry entries", []string{"package.json", manifest, "yarn.lock",
+			"# yarn lockfile v1\n\n\n\"@babel/code-frame@^7.0.0\", \"@babel/code-frame@^7.10.4\":\n  version \"7.12.13\"\n  resolved \"https://registry.yarnpkg.com/@babel/code-frame/-/code-frame-7.12.13.tgz#dcfc826beef65e75c50e21d3837d7d95798dd658\"\n  dependencies:\n    version \"^1.0.0\"\n\npad@npm:left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e\"\n"}, ""},
+		{"yarn.lock file dependency", []string{"package.json", manifest, "yarn.lock", "# yarn lockfile v1\n\n\n\"dep@file:../dep\":\n  version \"1.0.0\"\n"}, "dep (dep@file:../dep)"},
+		{"berry yarn.lock is ignored, as npm ignores it", []string{"package.json", manifest, "yarn.lock",
+			"__metadata:\n  version: 6\n\n\"gitdep@npm:^1.0.0\":\n  version: 1.0.0\n  resolution: \"gitdep@git+file:///tmp/gitdep#commit=0123\"\n"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := newNeedProject(t, tc.files...).npmNonRegistryDependency()
+			if tc.want == "" && got != "" || tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("npmNonRegistryDependency = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	t.Run("unreadable lockfiles are errors", func(t *testing.T) {
+		for _, data := range []string{`{`, `{"packages": {"node_modules/a": {"version": 1}}}`, `{"dependencies": {"a": "1.0.0"}}`} {
+			if _, err := npmLockfileNonRegistry([]byte(data)); err == nil {
+				t.Errorf("npmLockfileNonRegistry(%s) = nil error, want one", data)
+			}
+		}
+	})
+}
+
+// The npm version is read from the package.json of the npm install the
+// sandbox PATH's bin/npm links into, without running anything.
+func TestNpmMajorVersion_GEC1021R5(t *testing.T) {
+	install := func(t *testing.T, pkg string) string {
+		t.Helper()
+		prefix := t.TempDir()
+		cli := filepath.Join(prefix, "lib", "node_modules", "npm", "bin", "npm-cli.js")
+		writeExecScript(t, cli, "exit 0\n")
+		writeFile(t, filepath.Join(prefix, "lib", "node_modules", "npm", "package.json"), pkg)
+		if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../lib/node_modules/npm/bin/npm-cli.js", filepath.Join(prefix, "bin", "npm")); err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(prefix, "bin")
+	}
+	for _, tc := range []struct {
+		name string
+		pkg  string
+		want int
+	}{
+		{"npm 12", `{"name":"npm","version":"12.2.0"}`, 12},
+		{"npm 10", `{"name":"npm","version":"10.8.2"}`, 10},
+		{"not npm's package.json", `{"name":"evil","version":"99.0.0"}`, 0},
+		{"unreadable version", `{"name":"npm","version":"x"}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := install(t, tc.pkg)
+			swapVerifyIsolationVars(t)
+			verifyGetenv = func(key string) string {
+				if key == "PATH" {
+					return bin + ":/nonexistent"
+				}
+				return ""
+			}
+			if got := npmMajorVersion(); got != tc.want {
+				t.Fatalf("npmMajorVersion = %d, want %d", got, tc.want)
+			}
+		})
+	}
+	t.Run("a wrapper script is no install", func(t *testing.T) {
+		bin := t.TempDir()
+		writeExecScript(t, filepath.Join(bin, "npm"), "exit 0\n")
+		swapVerifyIsolationVars(t)
+		verifyGetenv = func(key string) string {
+			if key == "PATH" {
+				return bin
+			}
+			return ""
+		}
+		if got := npmMajorVersion(); got != 0 {
+			t.Fatalf("npmMajorVersion = %d, want 0", got)
+		}
+	})
+}
+
+// fakeNpmForLockTest records every npm run (its arguments and whether the
+// sandbox had a default route) in $HOME/npm.log. A lock resolution copies
+// fixtures/resolved-lock.json into the --prefix directory, or reports the
+// failure fixtures/allowgit or (offline) fixtures/notcached asks for; an
+// install records whether a package-lock.json is in place.
+const fakeNpmForLockTest = `log="$HOME/npm.log"
+net=no
+/bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
+echo "$* net=$net" >> "$log"
+prefix=; lockonly=; offline=; prev=
+for a in "$@"; do
+  [ "$prev" = "--prefix" ] && prefix=$a
+  case "$a" in --package-lock-only) lockonly=1 ;; --offline) offline=1 ;; esac
+  prev=$a
+done
+fx="$PWD/fixtures"
+if [ -n "$lockonly" ]; then
+  if [ -f "$fx/allowgit" ]; then
+    printf 'npm error code EALLOWGIT\nnpm error Fetching packages of type "git" have been disabled\nnpm error Refusing to fetch "gitdep@git+https://example.invalid/r.git"\n' >&2
+    exit 1
+  fi
+  if [ -n "$offline" ] && [ -f "$fx/notcached" ]; then
+    printf 'npm error code ENOTCACHED\nnpm error request to https://registry.npmjs.org/is-odd failed: cache mode is only-if-cached but no cached response is available.\n' >&2
+    exit 1
+  fi
+  [ -f "$fx/resolved-lock.json" ] && /bin/cp "$fx/resolved-lock.json" "$prefix/package-lock.json"
+  exit 0
+fi
+[ -f package-lock.json ] && echo "install saw $(/bin/grep -c resolved package-lock.json) resolved" >> "$log"
+exit 0
+`
+
+// Live, in the real sandbox with slirp4netns and a fake npm: a networked npm
+// fetch first resolves the tree into a lockfile in a scratch project (with
+// the network for npm 12 or later, offline from the project's lockfile
+// before it), refuses one that takes a package from anywhere but the
+// registry, and otherwise installs with exactly that lockfile in place,
+// restoring the project's own lockfile when the plan writes none.
+func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live sandbox test")
+	}
+	gitLock := `{"lockfileVersion": 3, "packages": {"": {"name": "x"}, "node_modules/gitdep": {"version": "1.0.0", "resolved": "git+ssh://git@github.com/u/r.git#0123"}}}`
+	for _, tc := range []struct {
+		name     string
+		major    int
+		files    []string // project files; fixtures/ steer the fake npm
+		args     []string
+		refused  string   // a substring of the refusal; "" when the fetch runs
+		log      []string // substrings of the npm log, in order
+		absent   []string // substrings the npm log must not hold
+		lockLeft bool     // a package-lock.json remains in the project
+	}{
+		{name: "npm 12 resolves with the network, then installs the inspected lockfile",
+			major: 12, files: []string{"fixtures/resolved-lock.json", registryLeftPadLock},
+			args: []string{"install", "--ignore-scripts", "--no-package-lock"},
+			log:  []string{"install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix ", " net=yes", "install --ignore-scripts net=yes", "install saw 1 resolved"}},
+		{name: "a resolved git dependency is refused before the install",
+			major: 12, files: []string{"fixtures/resolved-lock.json", gitLock},
+			args: []string{"install", "--ignore-scripts", "--no-package-lock"}, refused: "gitdep from git+ssh://",
+			log: []string{"--package-lock-only"}, absent: []string{"install --ignore-scripts"}},
+		{name: "npm refusing a git dependency is reported",
+			major: 12, files: []string{"fixtures/allowgit", ""},
+			args: []string{"install", "--ignore-scripts"}, refused: "npm refused to fetch gitdep@git+https://example.invalid/r.git, a git dependency",
+			absent: []string{"install --ignore-scripts"}},
+		{name: "npm before 12 without a lockfile is refused before npm runs",
+			major: 10, args: []string{"install", "--ignore-scripts"}, refused: "no package-lock.json",
+			absent: []string{"install"}},
+		{name: "npm before 12 resolves offline from the project's lockfile",
+			major: 10, files: []string{"package-lock.json", registryLeftPadLock},
+			args: []string{"install", "--ignore-scripts"},
+			log:  []string{"--package-lock-only --ignore-scripts --no-audit --no-fund --prefix ", " --offline net=no", "install --ignore-scripts net=yes", "install saw 1 resolved"}, lockLeft: true},
+		{name: "npm before 12 with a stale lockfile is refused",
+			major: 10, files: []string{"package-lock.json", registryLeftPadLock, "fixtures/notcached", ""},
+			args: []string{"install", "--ignore-scripts"}, refused: "does not hold every dependency",
+			log: []string{"--offline net=no"}, absent: []string{"install --ignore-scripts net"}, lockLeft: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := sandboxDepsProject(t)
+			requireUserModeNetwork(t)
+			stubNpmVersion(t, tc.major)
+			tools := filepath.Join(project.Path, "tools")
+			t.Setenv("PATH", tools+":/usr/bin:/bin")
+			if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+				t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
+			}
+			writeExecScript(t, filepath.Join(tools, "npm"), fakeNpmForLockTest)
+			writeProjectFiles(t, project.Path, append([]string{"package.json", `{"name":"x","dependencies":{"left-pad":"^1.3.0"}}`}, tc.files...)...)
+			before, _ := project.ReadFile("package-lock.json")
+
+			result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "npm", Args: tc.args})
+			if tc.refused != "" {
+				if !errorIsDepNetworkUnavailable(err) || !strings.Contains(noteOf(result), tc.refused) {
+					t.Fatalf("err = %v, note = %q, want a refusal naming %q", err, noteOf(result), tc.refused)
+				}
+			} else if err != nil || result == nil || result.ExitCode != 0 {
+				t.Fatalf("result = %+v, err = %v, want the fetch to succeed", result, err)
+			}
+			log := readLog(t, filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), "npm.log"))
+			rest := log
+			for _, want := range tc.log {
+				i := strings.Index(rest, want)
+				if i < 0 {
+					t.Fatalf("npm log lacks %q (in order); log:\n%s", want, log)
+				}
+				rest = rest[i+len(want):]
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(log, absent) {
+					t.Fatalf("npm log must not hold %q; log:\n%s", absent, log)
+				}
+			}
+			after, err := project.ReadFile("package-lock.json")
+			if tc.lockLeft != (err == nil) || tc.lockLeft && after != before {
+				t.Fatalf("package-lock.json after the fetch: %q (err %v), want it left as before: %v", after, err, tc.lockLeft)
+			}
+			matches, _ := filepath.Glob(filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), "makewand-npm-lock-*"))
+			if len(matches) != 0 {
+				t.Fatalf("the lock resolution's scratch project was left behind: %v", matches)
+			}
+		})
+	}
+}
+
+// Live, with this host's real npm in the real sandbox and slirp4netns: the two
+// npm stages accept makewand's command lines, and a verification-style install
+// (--no-package-lock) leaves no lockfile behind. The project has no
+// dependencies and audit, fund and update checks are off, so nothing is
+// downloaded.
+func TestNpmFetchRealNpmLive_GEC1021R5(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live sandbox test")
+	}
+	npm, err := exec.LookPath("npm")
+	if err != nil {
+		t.Skip("no npm on PATH")
+	}
+	project := sandboxDepsProject(t)
+	requireUserModeNetwork(t)
+	t.Setenv("PATH", filepath.Dir(npm)+":/usr/bin:/bin")
+	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
+	}
+	writeProjectFiles(t, project.Path, "package.json", `{"name":"x","version":"1.0.0"}`)
+	plan := ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install", "--ignore-scripts", "--no-package-lock"},
+		env: []string{"npm_config_audit=false", "npm_config_fund=false", "npm_config_update_notifier=false"}}
+	result, err := project.RunVerificationPlan(context.Background(), plan)
+	if err != nil || result == nil || result.ExitCode != 0 {
+		t.Fatalf("result = %+v, err = %v, want the npm %d fetch to succeed", result, err, npmMajorVersion())
+	}
+	if _, err := project.ReadFile("package-lock.json"); err == nil {
+		t.Fatal("a --no-package-lock fetch must leave no package-lock.json behind")
+	}
+}
+
+// Live, with an npm before 12 on this host (npm 10.8.2 at /usr/bin) in the real
+// sandbox with slirp4netns: two projects whose package.json names no git or
+// local dependency still made the networked `npm install --ignore-scripts` run
+// project code - a yarn.lock that resolves a registry range to a git
+// repository (npm follows it without a package lock) and a workspaces root
+// (npm runs each workspace's prepare). Both are now refused before npm runs.
+// The git repository is a bare one in the workspace (the fetch masks only
+// directories named .git), so nothing is fetched from the network.
+func TestNpmPrepareVectorsRefusedLive_GEC1021R5(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live sandbox test")
+	}
+	const npmBin = "/usr/bin/npm"
+	if _, err := os.Stat(npmBin); err != nil {
+		t.Skip("no npm at /usr/bin")
+	}
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git on PATH")
+	}
+	open := func(t *testing.T) (*Project, string, string) {
+		t.Helper()
+		project := sandboxDepsProject(t)
+		requireUserModeNetwork(t)
+		t.Setenv("PATH", "/usr/bin:/bin")
+		if major := npmMajorVersion(); major == 0 || major >= npmNetworkedLockMajor {
+			t.Skipf("%s is npm %d, not an npm before %d", npmBin, major, npmNetworkedLockMajor)
+		}
+		if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+			t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
+		}
+		marker := filepath.Join(project.Path, "PREPARED")
+		return project, marker, `"scripts":{"prepare":"echo ran >> ` + marker + `"}`
+	}
+	gitRun := func(t *testing.T, dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command(git, args...)
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1"}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	plan := ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install", "--ignore-scripts"},
+		env: []string{"npm_config_audit=false", "npm_config_fund=false", "npm_config_update_notifier=false"}}
+
+	t.Run("yarn.lock resolving a range to git", func(t *testing.T) {
+		project, marker, scripts := open(t)
+		src := t.TempDir()
+		writeFile(t, filepath.Join(src, "package.json"), `{"name":"gitdep","version":"1.0.0",`+scripts+`}`)
+		gitRun(t, src, "init", "-q")
+		gitRun(t, src, "add", "package.json")
+		gitRun(t, src, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-qm", "init")
+		bare := filepath.Join(project.Path, "gitdep.git")
+		gitRun(t, src, "clone", "-q", "--bare", src, bare)
+		sha := gitRun(t, bare, "rev-parse", "HEAD")
+		writeProjectFiles(t, project.Path,
+			"package.json", `{"name":"x","version":"1.0.0","dependencies":{"gitdep":"^1.0.0"}}`,
+			"yarn.lock", "# yarn lockfile v1\n\n\ngitdep@^1.0.0:\n  version \"1.0.0\"\n  resolved \"git+file://"+bare+"#"+sha+"\"\n")
+		_, err := project.RunVerificationPlan(context.Background(), plan)
+		if data, _ := os.ReadFile(marker); len(data) > 0 {
+			t.Fatalf("the git dependency's prepare ran during the networked fetch (err %v)", err)
+		}
+		if !errorIsDepNetworkUnavailable(err) || !strings.Contains(err.Error(), "yarn.lock") {
+			t.Fatalf("err = %v, want the fetch refused for the yarn.lock git resolution", err)
+		}
+	})
+	t.Run("workspaces root", func(t *testing.T) {
+		project, marker, scripts := open(t)
+		writeProjectFiles(t, project.Path,
+			"package.json", `{"name":"x","version":"1.0.0","workspaces":["packages/*"]}`,
+			"packages/a/package.json", `{"name":"a","version":"1.0.0",`+scripts+`}`)
+		_, err := project.RunVerificationPlan(context.Background(), plan)
+		if data, _ := os.ReadFile(marker); len(data) > 0 {
+			t.Fatalf("the workspace's prepare ran during the networked fetch (err %v)", err)
+		}
+		if !errorIsDepNetworkUnavailable(err) || !strings.Contains(err.Error(), "workspaces root") {
+			t.Fatalf("err = %v, want the fetch refused for the workspaces root", err)
+		}
+	})
+}

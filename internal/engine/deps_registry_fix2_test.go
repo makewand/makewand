@@ -305,6 +305,7 @@ type heldBwrapEnv struct {
 func installHeldBwrap(t *testing.T, okWhenOffline bool, slirpBody string) heldBwrapEnv {
 	t.Helper()
 	fakeWorkingBwrap(t)
+	stubNpmVersion(t, npmNetworkedLockMajor) // see installFakeUserNet
 	swapSeccompVars(t, "linux", false, nil)
 	dir := t.TempDir()
 	env := heldBwrapEnv{log: filepath.Join(dir, "launches.log")}

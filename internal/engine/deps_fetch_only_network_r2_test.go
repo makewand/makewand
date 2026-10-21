@@ -141,9 +141,13 @@ func TestPipFetchCarriesIndexOptionsAndConstraints_GEC1021R2(t *testing.T) {
 	}
 }
 
-// npm classification (unit): a local-directory or git dependency runs code on
-// fetch; a plain http(s) tarball, registry spec or workspace link in a real
-// workspaces setup does not.
+// npm classification (unit): only a registry spec (a version, range, tag or an
+// npm: alias of one) is fetched from the registry. Round 5 (D2R3) widened the
+// refusal to every other source, http(s) tarballs included, as the round-2
+// decision lists them: an https URL can be a git dependency to npm
+// (https://github.com/user/repo), and none of them is a registry download. A
+// workspace link in a real workspaces setup is still not refused here (npm
+// rejects the protocol without fetching anything).
 func TestNpmSpecRunsCodeOnFetch_GEC1021R2(t *testing.T) {
 	for _, tc := range []struct {
 		spec string
@@ -154,8 +158,8 @@ func TestNpmSpecRunsCodeOnFetch_GEC1021R2(t *testing.T) {
 		{"1.2.3", false, false},
 		{"latest", false, false},
 		{"npm:left-pad@1.3.0", false, false},
-		{"https://example.com/p.tgz", false, false},
-		{"http://example.com/p.tgz", false, false},
+		{"https://example.com/p.tgz", false, true},
+		{"http://example.com/p.tgz", false, true},
 		{"file:../dep", false, true},
 		{"link:../dep", false, true},
 		{"git+https://example.com/r.git", false, true},
@@ -169,8 +173,8 @@ func TestNpmSpecRunsCodeOnFetch_GEC1021R2(t *testing.T) {
 		{"workspace:*", false, true},
 		{"workspace:*", true, false},
 	} {
-		if got := npmSpecRunsCodeOnFetch(tc.spec, tc.ws); got != tc.want {
-			t.Errorf("npmSpecRunsCodeOnFetch(%q, ws=%v) = %v, want %v", tc.spec, tc.ws, got, tc.want)
+		if got := npmNonRegistrySpec(tc.spec, tc.ws); got != tc.want {
+			t.Errorf("npmNonRegistrySpec(%q, ws=%v) = %v, want %v", tc.spec, tc.ws, got, tc.want)
 		}
 	}
 }
@@ -184,9 +188,16 @@ func TestNpmNonRegistryDependency_GEC1021R2(t *testing.T) {
 		}
 	})
 	t.Run("registry-only tree", func(t *testing.T) {
-		p := newNeedProject(t, "package.json", `{"name":"x","dependencies":{"left-pad":"^1.3.0","tar":"https://host/tar.tgz"}}`)
+		p := newNeedProject(t, "package.json", `{"name":"x","dependencies":{"left-pad":"^1.3.0"}}`)
 		if got := p.npmNonRegistryDependency(); got != "" {
-			t.Fatalf("npmNonRegistryDependency = %q, want none (registry + tarball)", got)
+			t.Fatalf("npmNonRegistryDependency = %q, want none (registry only)", got)
+		}
+	})
+	t.Run("http(s) tarball", func(t *testing.T) {
+		// Refused since round 5: not a registry download (see above).
+		p := newNeedProject(t, "package.json", `{"name":"x","dependencies":{"left-pad":"^1.3.0","tar":"https://host/tar.tgz"}}`)
+		if got := p.npmNonRegistryDependency(); !strings.Contains(got, "tar") {
+			t.Fatalf("npmNonRegistryDependency = %q, want the tarball dependency", got)
 		}
 	})
 	t.Run("transitive git dependency in the lockfile", func(t *testing.T) {
@@ -397,11 +408,16 @@ func TestNpmNonRegistryFetchRefused_GEC1021R2(t *testing.T) {
 	})
 	t.Run("registry-only tree runs", func(t *testing.T) {
 		env := installFakeUserNet(t, fakeUserNetOptions{})
+		stubNpmVersion(t, 10)
 		project, err := NewProject("npm-reg", t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
 		writeFile(t, filepath.Join(project.Path, "package.json"), `{"name":"x","dependencies":{"left-pad":"^1.3.0"}}`)
+		// Since round 5 a networked npm fetch installs only from a lockfile
+		// makewand has inspected, and before npm 12 that must be the project's
+		// own (TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5).
+		writeFile(t, filepath.Join(project.Path, "package-lock.json"), registryLeftPadLock)
 		if _, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install"}}); errorIsDepNetworkUnavailable(err) {
 			t.Fatalf("a registry-only tree must not be refused: %v", err)
 		}
