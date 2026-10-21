@@ -1786,6 +1786,22 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 resolve_model_and_effort = get_provider_model_tier
 
 
+# Providers of the Go router whose every model must be priced (pricedProviders
+# in router/strategy_tables.go): it ignores their discovered tiers without one.
+GO_PRICED_PROVIDERS = frozenset({"claude", "gemini", "openai"})
+
+
+def _go_default_priced_models() -> frozenset:
+    """Model IDs the Go router's built-in table prices, read from router/defaults.json
+    beside the package (a source checkout or an install); empty when it is absent."""
+    path = Path(__file__).resolve().parent.parent / "router" / "defaults.json"
+    try:
+        costs = json.loads(path.read_text(encoding="utf-8")).get("costs")
+    except (OSError, ValueError, AttributeError):
+        return frozenset()
+    return frozenset(costs) if isinstance(costs, dict) else frozenset()
+
+
 def export_routing_overrides(config_dir: Optional[Path] = None, target_filename: str = "discovered.json") -> Optional[Path]:
     """
     Exports dynamically detected models to Go router's <config_dir>/discovered.json.
@@ -1867,6 +1883,20 @@ def export_routing_overrides(config_dir: Optional[Path] = None, target_filename:
             if isinstance(inp, (int, float)) and isinstance(out, (int, float)) and inp >= 0 and out >= 0:
                 filtered_costs[mid] = c_val
     costs_map = filtered_costs
+
+    # A priced provider's tier is exported only with a priced model: in these costs or
+    # in the Go defaults. The Go router drops any other (pricedDiscoveredModels), so it
+    # would only be noise, such as an agy model in the gemini tiers.
+    priced = set(costs_map) | _go_default_priced_models()
+    for prov in GO_PRICED_PROVIDERS:
+        tiers = models_map.get(prov)
+        if not isinstance(tiers, dict):
+            continue
+        kept = {tier: model for tier, model in tiers.items() if isinstance(model, str) and model in priced}
+        if len(kept) != len(tiers):
+            logger.debug("discovered.json: %s tiers without a price left to the Go defaults: %s",
+                         prov, sorted(set(tiers) - set(kept)))
+        models_map[prov] = kept
 
     # 4. Construct payload strictly conforming to rawDefaults
     payload: Dict[str, Any] = {
