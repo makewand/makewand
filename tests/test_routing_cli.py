@@ -214,6 +214,25 @@ class RoutingCliTests(unittest.TestCase):
         self.assertEqual(payload["skipped"],
                          [{"provider": "claude", "reason": "与 claude 同属 anthropic 家族"}])
 
+    def test_route_not_and_self_cover_agy_proxied_models(self):
+        # The owner's review rule: an agy-proxied Claude model must not review Claude's work.
+        result = self.run_cli("route", "review", "hard", "--not", "claude", "--self", "claude", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("跳过：claude（与 claude 同属 anthropic 家族）；"
+                      "agy（claude-opus-5-5-high 属于 claude 模型家族，与 claude 同家族）", result.stdout)
+        self.assertNotIn("claude-opus", "\n".join(line for line in result.stdout.splitlines()
+                                                  if CANDIDATE_LINE.match(line)))
+        payload = self.route_json("review", "hard", "--not", "claude", quota={})
+        self.assertEqual([item["candidate_id"] for item in payload["candidates"]
+                          if item["model"].startswith("claude-")], [])
+        self.assertIn({"provider": "agy", "reason": "claude-opus-5-5-high 属于 claude 模型家族，与 claude 同家族"},
+                      payload["skipped"])
+        demoted = self.route_json("review", "hard", "--self", "claude", quota={})
+        flags = [item["is_self"] for item in demoted["candidates"]]
+        self.assertEqual(flags, sorted(flags))
+        self.assertTrue(next(item for item in demoted["candidates"]
+                             if item["candidate_id"] == "agy/claude-opus-5-5-high/high")["is_self"])
+
     # ---------- route 的 --json ----------
 
     def test_route_json_structure(self):

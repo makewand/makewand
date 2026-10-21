@@ -118,6 +118,17 @@ PROVIDER_FAMILIES = {
     "muse": "meta",
 }
 
+# Provider → the lineage of its own models, as discovery.model_family names it.
+# agy also carries other vendors' models (claude-*, gpt-oss); route --not/--self
+# compare a candidate's model with this so such a row counts as that vendor's.
+PROVIDER_MODEL_FAMILIES = {
+    "codex": "gpt",
+    "claude": "claude",
+    "agy": "gemini",
+    "grok": "grok",
+    "muse": "muse",
+}
+
 _DIFFICULTY_TIER = {"mechanical": 1, "normal": 2, "hard": 3}
 # Pressed-down map for test/doc when the difficulty is not hard.
 _PRESSED_TIER = {"mechanical": 1, "normal": 1}
