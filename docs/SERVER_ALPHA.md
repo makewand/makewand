@@ -109,12 +109,13 @@ and billed at that model's price, even when `routing.json` sets `models` for
 `openai`. A named model must have a price in the routing tables (the built-in
 `costs` or `costs` in `routing.json`) or be `OPENAI_MODEL`. Otherwise the
 request gets a 400, because its spend could not be budgeted. Names are matched
-trimmed and in any case, `OPENAI_MODEL` too, and naming `OPENAI_MODEL` calls it
-as configured. `codex` calls `OPENAI_MODEL`, and `openai` names the provider.
-Names the server cannot serve get the same 400 error, streamed or not. With a
-codex CLI installed, these names keep selecting the codex CLI, which runs its
-own model. A token's allowed modes do not limit which priced model its client
-names, so bound spend with the token's cost budgets.
+trimmed and in any case, `OPENAI_MODEL` too. A name with a price is called as
+its price entry spells it, in lower case, and naming an `OPENAI_MODEL` that has
+no price calls it as configured. `codex` calls `OPENAI_MODEL`, and `openai`
+names the provider. Names the server cannot serve get the same 400 error,
+streamed or not. With a codex CLI installed, these names keep selecting the
+codex CLI, which runs its own model. A token's allowed modes do not limit which
+priced model its client names, so bound spend with the token's cost budgets.
 
 makewand calls OpenAI's Chat Completions API. Reasoning models (`o1*`, `o3*`,
 `o4*`, `gpt-5*`, `codex-mini*`) get their output cap as

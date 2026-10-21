@@ -113,8 +113,9 @@ the model and billed at that model's price, even when `routing.json` gives
 must be the provider's configured model or have a price in the routing tables
 (`costs`, which `routing.json` can extend). Otherwise the request gets a 400,
 because its spend could not be budgeted. Names are matched trimmed and in any
-case, the configured model's too, and a request naming the configured model
-calls it as configured. Resolution uses the server's
+case, the configured model's too. A name with a price is called as its price
+entry spells it, in lower case, and a request naming the configured model
+calls it as configured when it has no price. Resolution uses the server's
 providers, not a token's allowlist, so such a token needs the `openai`
 provider. A token's allowed modes do not limit which priced model a client
 names; its cost budgets do. A `model` that nothing on the server serves gets

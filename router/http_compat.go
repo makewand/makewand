@@ -133,8 +133,9 @@ func (r *Router) openAIAliasModels(openai *OpenAI) []string {
 // OpenAI rate-limits on its own, or one the account or endpoint lacks) must not
 // close the route for every other request. A model other than the configured
 // one must have a price: the spend of a model the server cannot price could
-// not be budgeted. The configured model, which a request names as it names
-// any model (trimmed, in any case), is called as configured.
+// not be budgeted. A request names the configured model as it names any model
+// (trimmed, in any case). A priced name is called as its price entry spells it,
+// and the configured model, when it has no price, as configured.
 func (r *Router) withOpenAIModel(model string) (*Router, error) {
 	p, _ := r.getProvider("openai")
 	base, ok := p.(*OpenAI)
