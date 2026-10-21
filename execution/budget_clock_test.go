@@ -88,12 +88,98 @@ func TestBudgetBackwardDayKeepsCountingIntoTheLatestBucket(t *testing.T) {
 	if len(*days) == 0 {
 		t.Fatal("backward day was not reported")
 	}
-	// Counts are never reset: the latest bucket keeps its limit.
-	if err := reserve("after-3"); err != nil {
-		t.Fatal(err)
+	// The finding's sequence: calls charged into tomorrow's bucket were made today,
+	// so 1 + 2 reach today's cap of 3 (a fourth call used to be admitted).
+	if err := reserve("after-3"); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("daily cap exceeded after a backward day: %v", err)
 	}
-	if err := reserve("after-4"); !errors.Is(err, ErrBudgetExhausted) {
-		t.Fatalf("latest bucket limit not enforced: %v", err)
+}
+
+// admitAt runs the layered admission check of Reserve against data at now and
+// charges the call; tests use it to move the clock without heartbeat goroutines.
+func admitAt(data map[string]any, task string, now time.Time) error {
+	keys, err := scopeKeys(data, Config{TaskID: task, MaxCalls: 100}, now)
+	if err != nil {
+		return err
+	}
+	available, err := scopeAvailable(data, keys, nil, nil, now)
+	if err != nil {
+		return err
+	}
+	if available <= 0 {
+		return ErrBudgetExhausted
+	}
+	scopeSpend(data, keys, 1)
+	return nil
+}
+
+func TestBudgetBackwardDayCapCountsEveryBucketFromTodayToTheLatest(t *testing.T) {
+	layeredFixture(t)
+	t.Setenv(budgetTimezoneEnv, "UTC")
+	_, _ = recordSkewReports(t)
+	noon := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	for _, scope := range []string{"MAKEWAND_MACHINE_DAILY_CALLS", "MAKEWAND_PROJECT_DAILY_CALLS"} {
+		t.Setenv("MAKEWAND_MACHINE_DAILY_CALLS", "100")
+		t.Setenv("MAKEWAND_PROJECT_DAILY_CALLS", "100")
+		t.Setenv(scope, "3")
+		data := map[string]any{"attempts": []any{}}
+		if err := initializeScopes(data); err != nil {
+			t.Fatal(err)
+		}
+		// One call today; the clock briefly reads tomorrow (a capacity check writes the
+		// latest day then), and real time again.
+		if err := admitAt(data, "before", noon); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := scopeKeys(data, Config{TaskID: "check", MaxCalls: 100}, noon.AddDate(0, 0, 1)); err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range []string{"after-1", "after-2"} {
+			if err := admitAt(data, task, noon.Add(time.Minute)); err != nil {
+				t.Fatalf("%s: backward day refused dispatch: %v", scope, err)
+			}
+		}
+		if err := admitAt(data, "after-3", noon.Add(time.Minute)); !errors.Is(err, ErrBudgetExhausted) {
+			t.Fatalf("%s: a fourth call was admitted today: %v", scope, err)
+		}
+		// On the real next day those two calls count again (conservative): one call is left.
+		next := noon.AddDate(0, 0, 1).Add(time.Minute)
+		if err := admitAt(data, "next-day", next); err != nil {
+			t.Fatalf("%s: %v", scope, err)
+		}
+		if err := admitAt(data, "next-day-2", next); !errors.Is(err, ErrBudgetExhausted) {
+			t.Fatalf("%s: next day's cap exceeded: %v", scope, err)
+		}
+	}
+}
+
+func testCounter(maximum, used int) map[string]any {
+	return map[string]any{"maximum": json.Number(strconv.Itoa(maximum)), "used": json.Number(strconv.Itoa(used))}
+}
+
+func TestBudgetBackwardDayCapCountsHoldsOnEveryBucketFromToday(t *testing.T) {
+	layeredFixture(t)
+	t.Setenv(budgetTimezoneEnv, "UTC")
+	noon := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	today, tomorrow := "2026-10-15", "2026-10-16"
+	data := map[string]any{"attempts": []any{}, "scopes": map[string]any{
+		"tasks":    map[string]any{"t": testCounter(100, 0)},
+		"projects": map[string]any{"p:" + today: testCounter(100, 1), "p:" + tomorrow: testCounter(100, 0)},
+		"machine":  map[string]any{today: testCounter(3, 1), tomorrow: testCounter(3, 0)},
+		"day":      tomorrow, "clock": json.Number("0"),
+	}}
+	keys := []any{[]any{"tasks", "t"}, []any{"projects", "p:" + tomorrow}, []any{"machine", tomorrow}}
+	// A hold made today, before the clock jumped, still occupies today's capacity.
+	hold := map[string]any{"remaining": json.Number("1"), "scopes": []any{[]any{"tasks", "t"}, []any{"projects", "p:" + today}, []any{"machine", today}}}
+	for _, c := range []struct {
+		now   time.Time
+		claim map[string]any
+		want  int
+	}{{noon.Add(time.Minute), nil, 1}, {noon.Add(time.Minute), hold, 2}, {noon.AddDate(0, 0, 1), nil, 3}} {
+		got, err := scopeAvailable(data, keys, map[string]any{"h": hold}, c.claim, c.now)
+		if err != nil || got != c.want {
+			t.Fatalf("at %v (claim %v): %d %v, want %d", c.now, c.claim != nil, got, err, c.want)
+		}
 	}
 }
 
@@ -196,6 +282,296 @@ func TestBudgetLeadingClockDoesNotExpireAFreshHold(t *testing.T) {
 	compactLedger(data)
 	if _, kept := data["holds"].(map[string]any)["review"]; !kept {
 		t.Fatal("a hold with ten minutes left was expired by the skewed clock")
+	}
+}
+
+func TestBudgetRedateHoldKeepsItsDuration(t *testing.T) {
+	clock := 1792065600.0
+	for _, c := range []struct {
+		name                     string
+		dated                    bool
+		created, expires         float64
+		wantCreated, wantExpires float64
+	}{
+		{"dated ahead", true, clock + 7200, clock + 7800, clock, clock + 600},
+		{"dated at the clock", true, clock, clock + 600, clock, clock + 600},
+		{"dated before", true, clock - 60, clock + 540, clock - 60, clock + 540},
+		// Written before holds carried created_at: as long as the longest hold.
+		{"undated within a day", false, 0, clock + 7200, 0, clock + 7200},
+		{"undated beyond a day", false, 0, clock + 3*86400, 0, clock + 86400},
+	} {
+		hold := map[string]any{"remaining": json.Number("1"), "expires_at": json.Number(strconv.FormatFloat(c.expires, 'f', -1, 64))}
+		if c.dated {
+			hold["created_at"] = json.Number(strconv.FormatFloat(c.created, 'f', -1, 64))
+		}
+		expires := redateHold(hold, c.expires, clock)
+		if expires != c.wantExpires || ledgerNumber(hold["expires_at"]) != c.wantExpires || ledgerNumber(hold["created_at"]) != c.wantCreated {
+			t.Fatalf("%s: %v %v", c.name, expires, hold)
+		}
+		if _, dated := hold["created_at"]; dated != c.dated {
+			t.Fatalf("%s: created_at added or removed: %v", c.name, hold)
+		}
+	}
+}
+
+func TestBudgetHoldWrittenAheadStopsBlockingAfterItsDurationAndTheSlack(t *testing.T) {
+	path := layeredFixture(t)
+	t.Setenv(budgetTimezoneEnv, "UTC")
+	t.Setenv("MAKEWAND_MACHINE_DAILY_CALLS", "1")
+	t.Setenv("MAKEWAND_ACCOUNT_CONCURRENCY", "1")
+	t.Setenv("MAKEWAND_POOL_CONCURRENCY", "1")
+	_, _ = recordSkewReports(t)
+	start := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	now := start
+	fixLedgerNow(t, &now)
+	// A one-call hold made by a process whose clock read two hours ahead, and a live
+	// lease on the account: a call the hold no longer blocks is refused as busy, so
+	// no admission here starts a heartbeat.
+	editTestLedger(t, path, func(data map[string]any) {
+		keys, err := scopeKeys(data, Config{TaskID: "holder", MaxCalls: 10}, start.Add(2*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data["holds"] = map[string]any{"review": map[string]any{"remaining": json.Number("1"), "scopes": keys,
+			"created_at": seconds(start.Add(2 * time.Hour)), "expires_at": seconds(start.Add(2*time.Hour + 10*time.Minute))}}
+		data["leases"] = map[string]any{"live": map[string]any{"keys": leaseKeys("codex", nil), "owner": leaseProcessRef(os.Getpid()),
+			"workers": []any{}, "launch_pending": false, "expires_at": seconds(start.Add(leaseTTL))}}
+	})
+	reserve := func() error {
+		ctx := ContextWithConfig(t.Context(), Config{LedgerPath: path, MaxCalls: 10, TaskID: "other"})
+		_, err := Reserve(ctx, Metadata{Engine: "codex"})
+		return err
+	}
+	if err := reserve(); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("the hold did not block: %v", err)
+	}
+	// Re-dated like a lease: created at the effective clock, at most the slack ahead.
+	hold := readTestLedger(t, path)["holds"].(map[string]any)["review"].(map[string]any)
+	wall := float64(start.UnixNano()) / 1e9
+	if hold["created_at"] != wall+clockSkewSlack || hold["expires_at"] != wall+clockSkewSlack+600 {
+		t.Fatalf("hold written two hours ahead was not re-dated keeping its duration: %v", hold)
+	}
+	now = start.Add(10 * time.Minute)
+	if err := reserve(); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("re-dated hold expired early: %v", err)
+	}
+	now = start.Add(time.Duration(clockSkewSlack)*time.Second + 10*time.Minute + time.Second)
+	if err := reserve(); !errors.Is(err, ErrConcurrencyBusy) {
+		t.Fatalf("hold written two hours ahead still blocks after its ten minutes and the slack: %v", err)
+	}
+}
+
+// Go and Python accept and refuse the same hold creation times. A missing one is a
+// hold written before holds were dated; one after the expiry is merely expired.
+func TestBudgetHoldCreationTimeValidationMatchesPython(t *testing.T) {
+	cases := []struct {
+		field string
+		valid bool
+	}{
+		{"", true}, {`, "created_at": 1792065600.5`, true}, {`, "created_at": 1792069200`, true},
+		{`, "created_at": -1`, false}, {`, "created_at": "1792065600"`, false},
+		{`, "created_at": null`, false}, {`, "created_at": true`, false},
+	}
+	var ledgers []string
+	for _, c := range cases {
+		ledgers = append(ledgers, `{"schema": 1, "maximum": 3, "attempts": [], "holds": {"x": {"remaining": 1, "expires_at": 1792066200`+c.field+`}}}`)
+	}
+	encoded, err := json.Marshal(ledgers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := pythonCommand(t, `import json
+from makewand import call_budget
+def valid(text):
+    try:
+        call_budget._validate(json.loads(text))
+    except call_budget.BudgetError:
+        return False
+    return True
+print("VALID " + json.dumps([valid(text) for text in json.loads(sys.argv[2])]))`, string(encoded)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("python: %v %s", err, output)
+	}
+	text, found := strings.CutPrefix(strings.TrimSpace(string(output)), "VALID ")
+	var python []bool
+	if !found || json.Unmarshal([]byte(text), &python) != nil || len(python) != len(cases) {
+		t.Fatalf("no validity line in %s", output)
+	}
+	for i, c := range cases {
+		decoder := json.NewDecoder(strings.NewReader(ledgers[i]))
+		decoder.UseNumber()
+		var data map[string]any
+		if err := decoder.Decode(&data); err != nil {
+			t.Fatal(err)
+		}
+		if goValid := validateRetention(data) == nil; goValid != c.valid || python[i] != c.valid {
+			t.Fatalf("created_at%q: Go valid %v, Python valid %v, want %v", c.field, goValid, python[i], c.valid)
+		}
+	}
+}
+
+// pythonBudgetLedger runs Python budget code against the ledger at path and
+// returns its last output line.
+func pythonBudgetLedger(t *testing.T, path, code string) string {
+	t.Helper()
+	output, err := pythonCommand(t, code, path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("python: %v %s", err, output)
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	return lines[len(lines)-1]
+}
+
+func TestBudgetRepairedFutureDayHoldStillHoldsForGo(t *testing.T) {
+	path := layeredFixture(t)
+	t.Setenv(budgetTimezoneEnv, "UTC")
+	t.Setenv("MAKEWAND_MACHINE_DAILY_CALLS", "1")
+	t.Setenv("MAKEWAND_CALL_BUDGET_FILE", path)
+	t.Setenv("MAKEWAND_MAX_MODEL_CALLS", "100") // Python refuses an empty value
+	t.Setenv("MAKEWAND_EXECUTION_EVENTS_FILE", "")
+	t.Setenv("MAKEWAND_CALL_BUDGET_LEASE_ID", "")
+	// Python makes a one-call hold while the clock reads tomorrow; the operator repairs
+	// the ledger. The finding: repair left the hold in tomorrow's bucket, so today's
+	// capacity looked free and the holder's own call was later refused.
+	lease := pythonBudgetLedger(t, path, `import time
+from unittest.mock import patch
+from makewand import call_budget as b
+from makewand.execution_runtime import execution_context
+real = time.time()
+with patch("time.time", return_value=real + 86400), execution_context(task_id="holder"):
+    hold = b.reserve_capacity(1, "review")
+b.repair_clock(apply=True)
+print(hold)`)
+	other := ContextWithConfig(t.Context(), Config{LedgerPath: path, MaxCalls: 10, TaskID: "other"})
+	if _, err := Reserve(other, Metadata{Engine: "fake"}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("another task took the held call: %v", err)
+	}
+	holder := ContextWithConfig(t.Context(), Config{LedgerPath: path, MaxCalls: 10, TaskID: "holder", LeaseID: lease})
+	attempt, err := Reserve(holder, Metadata{Engine: "fake", Stage: "review"})
+	if err != nil {
+		t.Fatalf("the holder could not claim its call: %v", err)
+	}
+	if err := attempt.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBudgetPythonHoldUnderThePermittedLeadIsClaimableFromGo(t *testing.T) {
+	path := layeredFixture(t)
+	t.Setenv(budgetTimezoneEnv, "UTC")
+	t.Setenv("MAKEWAND_CALL_BUDGET_FILE", path)
+	t.Setenv("MAKEWAND_MAX_MODEL_CALLS", "100") // Python refuses an empty value
+	t.Setenv("MAKEWAND_EXECUTION_EVENTS_FILE", "")
+	t.Setenv("MAKEWAND_CALL_BUDGET_LEASE_ID", "")
+	// A 60-second hold made while the ledger clock leads by the permitted 300 seconds.
+	// Dated from wall time, the compaction of its own save used to delete it.
+	lease := pythonBudgetLedger(t, path, `import json, time
+from pathlib import Path
+from makewand import call_budget as b
+from makewand.execution_runtime import execution_context
+b.complete(b.reserve("fake", "fast", task_id="seed"), True, 0)
+ledger = Path(sys.argv[2])
+data = json.loads(ledger.read_text())
+data["scopes"]["clock"] = time.time() + 300
+ledger.write_text(json.dumps(data))
+with execution_context(task_id="holder"):
+    print(b.reserve_capacity(1, "review", ttl_seconds=60))`)
+	holder := ContextWithConfig(t.Context(), Config{LedgerPath: path, MaxCalls: 10, TaskID: "holder", LeaseID: lease})
+	attempt, err := Reserve(holder, Metadata{Engine: "fake", Stage: "review"})
+	if err != nil {
+		t.Fatalf("Go could not claim the fresh hold: %v", err)
+	}
+	if err := attempt.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The day-cap check and hold re-dating agree with makewand/layered_budget.py on one ledger.
+func TestBudgetDayCapAndHoldRedatingMatchPython(t *testing.T) {
+	t.Setenv(budgetTimezoneEnv, "UTC")
+	const fixture = `{"attempts": [], "scopes": {
+ "tasks": {"t": {"maximum": 100, "used": 0}},
+ "projects": {"p:2026-10-14": {"maximum": 100, "used": 7}, "p:2026-10-15": {"maximum": 100, "used": 1},
+              "p:2026-10-16": {"maximum": 4, "used": 1}, "q:2026-10-15": {"maximum": 100, "used": 50}},
+ "machine": {"2026-10-14": {"maximum": 3, "used": 3}, "2026-10-15": {"maximum": 6, "used": 1},
+             "2026-10-16": {"maximum": 5, "used": 1}},
+ "day": "2026-10-16", "clock": 1792152000},
+ "holds": {
+ "today": {"remaining": 1, "created_at": 1792065600, "expires_at": 1792066200.25,
+           "scopes": [["tasks", "t"], ["projects", "p:2026-10-15"], ["machine", "2026-10-15"]]},
+ "latest": {"remaining": 2, "created_at": 1792152000.5, "expires_at": 1792152600.75,
+            "scopes": [["tasks", "t"], ["projects", "p:2026-10-16"], ["machine", "2026-10-16"]]},
+ "undated": {"remaining": 1, "expires_at": 1792411200.125, "scopes": null}}}`
+	moments := []int64{1791979200, 1792065600, 1792108799, 1792108800, 1792152000}
+	clocks := []float64{1791979200, 1792065600.5, 1792152300}
+	keys := []any{[]any{"tasks", "t"}, []any{"projects", "p:2026-10-16"}, []any{"machine", "2026-10-16"}}
+	python := `import copy, json
+from makewand import layered_budget
+data = json.loads(sys.argv[2])
+moments, clocks, keys = json.loads(sys.argv[3]), json.loads(sys.argv[4]), json.loads(sys.argv[5])
+available = [[layered_budget.available(data, keys, data["holds"], data["holds"].get(claim), now=now)
+              for claim in ("", "today", "latest")] for now in moments]
+redated = {}
+for name, hold in data["holds"].items():
+    for clock in clocks:
+        copied = copy.deepcopy(hold)
+        layered_budget.redate_hold(copied, clock)
+        redated.setdefault(name, []).append([copied.get("created_at"), copied["expires_at"]])
+print("PARITY " + json.dumps({"available": available, "redated": redated}))`
+	encode := func(v any) string {
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(encoded)
+	}
+	output, err := pythonCommand(t, python, fixture, encode(moments), encode(clocks), encode(keys)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("python: %v %s", err, output)
+	}
+	text, found := strings.CutPrefix(strings.TrimSpace(string(output)), "PARITY ")
+	if !found {
+		t.Fatalf("no parity line in %s", output)
+	}
+	var want struct {
+		Available [][]int                 `json:"available"`
+		Redated   map[string][][]*float64 `json:"redated"`
+	}
+	if err := json.Unmarshal([]byte(text), &want); err != nil {
+		t.Fatal(err)
+	}
+	decode := func() map[string]any {
+		decoder := json.NewDecoder(strings.NewReader(fixture))
+		decoder.UseNumber()
+		var data map[string]any
+		if err := decoder.Decode(&data); err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	data := decode()
+	holds := data["holds"].(map[string]any)
+	for i, moment := range moments {
+		for j, claim := range []string{"", "today", "latest"} {
+			claimed, _ := holds[claim].(map[string]any)
+			got, err := scopeAvailable(data, keys, holds, claimed, time.Unix(moment, 0))
+			python := want.Available[i][j]
+			// Go refuses outright when holds exceed a cap; Python then leaves nothing either.
+			if agree := err == nil && got == python || errors.Is(err, ErrBudgetExhausted) && python <= 0; !agree {
+				t.Fatalf("at %d, claim %q: Go %d %v, Python %d", moment, claim, got, err, python)
+			}
+		}
+	}
+	for name := range holds {
+		for k, clock := range clocks {
+			hold := decode()["holds"].(map[string]any)[name].(map[string]any)
+			redateHold(hold, ledgerNumber(hold["expires_at"]), clock)
+			pair := want.Redated[name][k]
+			_, dated := hold["created_at"]
+			if dated != (pair[0] != nil) || dated && ledgerNumber(hold["created_at"]) != *pair[0] || ledgerNumber(hold["expires_at"]) != *pair[1] {
+				t.Fatalf("hold %s at %v: Go %v, Python %v", name, clock, hold, pair)
+			}
+		}
 	}
 }
 

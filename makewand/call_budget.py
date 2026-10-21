@@ -164,6 +164,11 @@ def _validate(data):
                 or (isinstance(hold["expires_at"], int) and abs(hold["expires_at"]) > 9223372036854775807)
                 or not math.isfinite(hold["expires_at"])):
             raise BudgetError("invalid model call capacity hold")
+        created = hold.get("created_at", 0)  # absent in holds written before they were dated
+        if (isinstance(created, bool) or not isinstance(created, (int, float))
+                or (isinstance(created, int) and created > 9223372036854775807)
+                or not math.isfinite(created) or created < 0):
+            raise BudgetError("invalid model call capacity hold creation time")
 
     if "scopes" in data:
         layered_budget.validate(data)
@@ -349,8 +354,11 @@ def reserve_capacity(count, owner, purpose="review", ttl_seconds=600):
             if count > available:
                 raise BudgetError(f"insufficient model task capacity ({available} available; {count} required)")
             lease = uuid.uuid4().hex
-            data.setdefault("holds", {})[lease] = dict(owner=owner, purpose=purpose,
-                remaining=count, expires_at=time.time() + ttl_seconds, scopes=keys)
+            # Dated from the clock that compaction expires holds by: from wall time, a
+            # ledger clock within its permitted lead cut a hold short, even at this save.
+            created = layered_budget.effective_clock(data)
+            data.setdefault("holds", {})[lease] = dict(owner=owner, purpose=purpose, remaining=count,
+                created_at=created, expires_at=created + ttl_seconds, scopes=keys)
             _save(path, data)
             return lease
     except BudgetError:

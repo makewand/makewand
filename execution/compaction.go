@@ -160,6 +160,10 @@ func validateRetention(data map[string]any) error {
 			if !valid || remaining < 0 || !checkTime(hold["expires_at"]) {
 				return fmt.Errorf("invalid budget hold capacity or expiry")
 			}
+			// Absent in holds written before they were dated.
+			if created, dated := hold["created_at"]; dated && !checkTime(created) {
+				return fmt.Errorf("invalid budget hold creation time")
+			}
 		}
 	}
 	if scopes, ok := data["scopes"].(map[string]any); ok {

@@ -61,7 +61,7 @@ All notable changes to this project are documented here. The format is based on
 - 使用账本按每次派发记录 `route`：claude、codex、agy、grok、muse 由适配器报告实际走订阅 CLI（`cli`）还是转用 API（`api`，包括 CLI 触发限额后再转用的），纯 API 引擎记为 `api`，直接命令（`makewand claude` 等）按同样规则记录；aider 的适配器尚不报告路线，只在配置不允许转用 API 时记为 `cli`，否则不记录（本地模型不记录）。经 API 完成的成功不会清除 CLI 的失败记录；配置了 API key 时，只有记为 `cli` 的成功才清除 needs_auth 记录。
 - Python SDK：`CandidateManager.apply_candidate` 返回 `ApplyResult`，仍可按 `(ok, files, message)` 解包，`status` 给出类型化结果（`PASSED`、`APPLY_CONFLICT`、`TIMEOUT`、`UNVERIFIED`、`UNKNOWN`、`FAILED`）。
 - 源码安装器完成后，若 `makewand` 命令找到的不是这次安装（安装目录，默认 `~/.local/bin`，不在 `PATH` 中，或 `PATH` 上更早的位置有另一个 makewand），打印要加入 shell 配置的确切 `export PATH=...` 行；官方安装脚本（makewand.org/install.sh）的最后一句随之改为先加 PATH 再运行 `makewand status`。
-- `makewand budget clock` 查看共享调用账本的时钟领先量、最新日期桶与超前写下的租约/预留到期时间（只读）；`--repair` 在账本锁内让它们回到实际时间（租约改为 30 秒后到期、预留最多 24 小时、日期桶回到今天，后面日期的计数同时计入今天，不退还已计次数），`--json` 输出机器可读结果；provider worker 中拒绝运行。新环境变量 `MAKEWAND_BUDGET_TIMEZONE`：每日计数桶的 IANA 时区，Go 与 Python 共用。
+- `makewand budget clock` 查看共享调用账本的时钟领先量、最新日期桶与时钟超前时写下的租约/预留（只读）；`--repair` 在账本锁内让它们回到实际时间（租约改为 30 秒后到期；超前创建的预留按各自的领先量移回、时长不变，没有创建时间的旧预留最多 24 小时；日期桶回到今天，后面日期的计数同时计入今天，那些日期桶里的预留随之改计入今天；不退还已计次数），`--json` 输出机器可读结果；provider worker 中拒绝运行。新环境变量 `MAKEWAND_BUDGET_TIMEZONE`：每日计数桶的 IANA 时区，Go 与 Python 共用。
 
 ### Changed
 
@@ -112,7 +112,7 @@ All notable changes to this project are documented here. The format is based on
 - 每次发布说明中的源码安装命令改为 `curl -fsSL https://makewand.org/install.sh | bash`：原先的 `curl …/scripts/install.sh | bash` 从管道读取时 `BASH_SOURCE[0]` 未设置，安装根变成 `/`，什么也装不上。`scripts/install.sh` 经管道、`bash -s` 或 `/dev/fd` 运行时先于任何工具检查退出，并给出这条命令。
 - `makewand route --not/--self` 同时按候选所带模型判断家族（与流水线判断审查独立性的 `discovery.model_family` 一致）：agy 代理的 `claude-opus-5-5-high`、`claude-sonnet-5-5-*` 属于 claude，`gpt-oss-120b` 属于 codex，`--not` 跳过它们、`--self` 把它们排到最后；跳过列表写明被跳过的模型。此前 `--not claude` 仍可能派 agy 上的 Claude 审查 Claude 的改动。
 - 本地测试关卡：Python 用 pytest 还是 unittest 改由沙箱内的只读探测决定，不再看宿主解释器（沙箱内启动不了的宿主 `pytest` 脚本也排除）；测试无法运行（配置了 pytest 但沙箱内无法导入、pytest/unittest 退出码 5、带或不带引号的 `No module named pytest`）结论为 UNVERIFIED，关卡时间预算耗尽为 TIMEOUT，`run` 与 `race` 都不再把它们当作测试失败触发自动修复或以 EXIT_FAILED 结束：`race` 中这样的候选不能胜出，没有候选通过测试时以 UNVERIFIED 结束，有候选的关卡超时（包括生成预算耗尽、关卡未能启动）则为 TIMEOUT。此前的测试套件已报告失败、或测试运行修改了待交付输入时仍为失败（原先后一个套件没有执行测试会掩盖前一个套件的失败）；这类运行生成的测试产物同样删除。
-- 调用账本时钟：系统时钟一度超前时写下的账本不再阻断派发和租约清理。日期回拨不再拒绝准入，继续计入已见过的最新一天（计数从不清零）；租约与预留到期、清理和账本时钟本身最多信任领先实际时间 300 秒的部分并在首次遇到时警告一次，下一次准入把更超前的租约到期时间改按刚续租处理，崩溃 worker 的租约在实际时间越过其到期后即可回收（仍需证明进程已退出）。Go 与 Python 同一规则。
+- 调用账本时钟：系统时钟一度超前时写下的账本不再阻断派发和租约清理。日期回拨不再拒绝准入，继续计入已见过的最新一天（计数从不清零）；在实际日期到达那一天之前，项目与机器的每日上限按从今天到那一天的各日期桶（含预留）合计检查，回拨前后当天的调用合计不超过上限（这些调用到那一天会再计一次，偏保守）。租约与预留到期、清理和账本时钟本身最多信任领先实际时间 300 秒的部分并在首次遇到时警告一次，下一次准入把更超前的租约到期时间改按刚续租处理，崩溃 worker 的租约在实际时间越过其到期后即可回收（仍需证明进程已退出）。预留按同一账本时钟计时并记录创建时间（原按墙钟，账本时钟在允许的领先范围内时，新预留会在自身保存时就被清理），超前创建的预留在下一次准入时保持原时长改从当前账本时钟算起。Go 与 Python 同一规则。
 
 ## [3.2.0] - 2026-10-09
 

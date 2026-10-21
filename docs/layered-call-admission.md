@@ -65,7 +65,12 @@ host; `MAKEWAND_BUDGET_TIMEZONE=Asia/Shanghai` keeps that boundary.
 
 A clock that moves back into an earlier day no longer refuses dispatch:
 admission keeps counting into the latest bucket already seen, so counts are never
-reset. The ledger's `scopes.clock` is a ratchet against a clock that steps back,
+reset. Until the real day reaches that bucket, the project and machine caps count
+every bucket from today up to it, holds included, because the calls charged
+there while the clock was ahead were made today. Those calls count again on the
+day of that later bucket, which is conservative.
+
+The ledger's `scopes.clock` is a ratchet against a clock that steps back,
 trusted and stored at most 300 seconds ahead of real time. Lease and capacity
 hold expiry, compaction and the clock itself use that capped value, so a ledger
 written while the system clock was ahead (an RTC read in the wrong time zone, a
@@ -74,20 +79,30 @@ or renewed after the correction expires at most 300 seconds plus its 30-second
 TTL after real time, and the next admission re-dates a lease stored further
 ahead as if it had just renewed. A dead worker's lease is then reclaimable once
 real time passes that expiry; liveness evidence is still required, as below.
+A capacity hold is dated from the same capped clock, so a clock within its
+permitted lead cannot expire a new hold early, and admission re-dates a hold
+created ahead of that clock to it, keeping its duration, as if it had just been
+made: a ten-minute hold written two hours ahead reserves capacity for at most ten
+minutes plus the 300 seconds after the admission that re-dates it, not for two
+hours and ten minutes. A hold written before holds carried a creation time counts
+as a 24-hour hold. Lifetime ledgers have no budget clock; their holds keep the
+dates the system clock gave them.
 Backward clock movement never resets counts, and the budget clock moves back only
 when it is more than 300 seconds ahead of real time. Each process warns once on
 stderr when it meets a clock or a day bucket ahead of real time.
 
 `makewand budget clock` shows the ledger's clock lead, its latest day bucket
-against today's, and how many leases and holds carry expiries written while the
-clock was ahead; it writes nothing. `makewand budget clock --repair` (`--json`
+against today's, and how many leases and holds were dated while the clock was
+ahead; it writes nothing. `makewand budget clock --repair` (`--json`
 for a machine-readable report, `--call-budget-file` for another ledger) clears
 the skew under the ledger lock, with workers running or not: the clock and the
 counters' timestamps return to real time, leases expire one TTL from now (live
-owners renew them), holds are capped at their 24-hour maximum, and the latest day
-moves back to today. Calls counted in a later day's bucket stay counted there and are
-added to today's bucket as well, so nothing is refunded. Provider workers cannot
-run it.
+owners renew them), every hold dated in the future moves back by its own lead,
+keeping its duration (one without a creation time is capped at 24 hours), and the
+latest day moves back to today. Calls counted in a later day's bucket stay counted
+there and are added to today's bucket as well, so nothing is refunded; holds
+counted in a later day's buckets move to today's, so they still reserve today's
+capacity for their owner. Provider workers cannot run it.
 
 ## Account and quota-pool concurrency
 

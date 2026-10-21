@@ -245,7 +245,7 @@ makewand status --daemon --json
 makewand daemon stop
 ```
 
-有界派发使用机器共享的 `call-budget.json`，任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按本地时区午夜重置（`MAKEWAND_BUDGET_TIMEZONE` 可固定为某个 IANA 时区，如 `Asia/Shanghai`；Go 与 Python 算出同一天）。时钟回拨不拒绝派发、不清零计数，继续计入已见过的最新一天；系统时钟一度超前时写下的账本不会卡住租约清理，`makewand budget clock` 查看、`makewand budget clock --repair` 让账本时钟回到实际时间（不退还已计次数）。账号/订阅池默认并发 1，无可用回退时默认最多等 30 秒；busy 不计费，返回 FAILED（退出码 10），预算耗尽返回退出码 13。已结算记录保留 48 小时并自动清理，旧 lifetime 预算仍保留累计花费；活动记录和租约不清除。配置及恢复规则见 [预算与租约](docs/layered-call-admission.md)，账号绑定和缓存见 [quota 账号绑定](docs/quota-account-binding.md)。
+有界派发使用机器共享的 `call-budget.json`，任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按本地时区午夜重置（`MAKEWAND_BUDGET_TIMEZONE` 可固定为某个 IANA 时区，如 `Asia/Shanghai`；Go 与 Python 算出同一天）。时钟回拨不拒绝派发、不清零计数，继续计入已见过的最新一天，在实际日期到达那一天之前，项目与机器的每日上限按从今天到那一天的各日期桶合计检查；系统时钟一度超前时写下的账本不会卡住租约清理，也不会让预留多占名额（预留按账本时钟计时，超前创建的预留保持原时长改按当前时钟计算），`makewand budget clock` 查看、`makewand budget clock --repair` 让账本时钟回到实际时间（不退还已计次数，后面日期的预留随计数改计入今天）。账号/订阅池默认并发 1，无可用回退时默认最多等 30 秒；busy 不计费，返回 FAILED（退出码 10），预算耗尽返回退出码 13。已结算记录保留 48 小时并自动清理，旧 lifetime 预算仍保留累计花费；活动记录和租约不清除。配置及恢复规则见 [预算与租约](docs/layered-call-admission.md)，账号绑定和缓存见 [quota 账号绑定](docs/quota-account-binding.md)。
 
 provider 子进程继承 `MAKEWAND_PROVIDER_WORKER=1` 后只允许 `search`、`repomap`、静态帮助/版本和 `completion <shell>`；`quota`、`status`、`route` 等管理命令也拒绝。完整参数白名单见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
 

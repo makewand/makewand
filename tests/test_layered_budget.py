@@ -67,13 +67,14 @@ class LayeredBudgetTests(unittest.TestCase):
 
     def test_midnight_shanghai_and_day_rollback(self):
         # 15:59:59 UTC, then 16:00 UTC: Shanghai midnight in the configured zone, regardless of TZ.
-        with patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="2", MAKEWAND_BUDGET_TIMEZONE="Asia/Shanghai",
+        with patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="3", MAKEWAND_BUDGET_TIMEZONE="Asia/Shanghai",
                         TZ="America/New_York"):
             with patch("time.time", return_value=1792079999):
                 b.reserve("fake", "fast")
             with patch("time.time", return_value=1792080000):
                 b.reserve("fake", "fast")
-            # Back across that midnight: admitted, counting into the later day, never reset.
+            # Back across that midnight: admitted, counting into the later day, never reset;
+            # the earlier day's cap counts both days' calls.
             with patch("time.time", return_value=1792079999):
                 b.reserve("fake", "fast")
                 with self.assertRaisesRegex(b.BudgetError, "budget exhausted"):

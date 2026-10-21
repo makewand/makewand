@@ -57,11 +57,13 @@ def _report_lines(report, repair):
             if report["carried_buckets"]:
                 moved += (f"，后面日期的 {report['carried_buckets']} 个计数桶同时计入今天"
                           "（已计的调用次数不退还）")
+            if report["moved_holds"]:
+                moved += f"，{report['moved_holds']} 个预留随之改计入今天"
             done.append(moved)
         if report["skewed_leases"]:
             done.append(f"租约改为最多 {TTL} 秒后到期（仍在运行的进程会继续续租）")
         if report["skewed_holds"]:
-            done.append(f"预留改为最多 {layered_budget.MAX_HOLD_SECONDS // 3600} 小时后到期")
+            done.append("预留按各自的领先量移回实际时间，时长不变")
         return lines + ["已修复：" + "；".join(done or ["领先实际时间的时间戳回到实际时间"])]
     if report["skewed"]:
         return lines + ["派活不受阻；运行 makewand budget clock --repair 让时钟回到实际时间（不退还已计的调用次数）"]

@@ -351,6 +351,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 					}
 				}
 				attempts := data["attempts"].([]any)
+				now := ledgerNow()
 				held := 0
 				var claimed map[string]any
 				active := map[string]any{}
@@ -373,7 +374,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 						if !valid || remaining < 0 || !expiryOK || expiryErr != nil {
 							return fmt.Errorf("invalid budget hold capacity or expiry")
 						}
-						if expires <= effectiveClock(data, ledgerNow()) {
+						if expires <= effectiveClock(data, now) {
 							continue
 						}
 						active[id] = hold
@@ -403,14 +404,14 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 					return reason
 				}
 				if data["scopes"] != nil {
-					keys, err = scopeKeys(data, cfg, ledgerNow())
+					keys, err = scopeKeys(data, cfg, now)
 					if err != nil {
 						return err
 					}
 					if claimed != nil && !containsScope(claimed["scopes"], keys[0].([]any)) {
 						return refuse(fmt.Errorf("capacity hold belongs to another task"))
 					}
-					available, err := scopeAvailable(data, keys, active, claimed)
+					available, err := scopeAvailable(data, keys, active, claimed, now)
 					if err != nil {
 						return refuse(err)
 					}

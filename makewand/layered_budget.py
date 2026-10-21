@@ -5,10 +5,12 @@ remain lifetime caps; they are never silently reset or weakened on migration.
 
 Clock rule, shared with execution/layered.go: daily buckets use the local zone,
 or MAKEWAND_BUDGET_TIMEZONE (an IANA name). A day that moves back keeps counting
-into the latest bucket already seen. scopes.clock is a ratchet against a clock
-that steps back, but it is trusted, and stored, at most CLOCK_SLACK seconds ahead
-of real time, so a ledger written while the clock was ahead cannot stall lease
-cleanup.
+into the latest bucket already seen, and until the real day reaches it the daily
+caps count every bucket from today to that one. scopes.clock is a ratchet against
+a clock that steps back, but it is trusted, and stored, at most CLOCK_SLACK
+seconds ahead of real time, so a ledger written while the clock was ahead cannot
+stall lease cleanup. Capacity holds are dated from that clock, and one created
+ahead of it is re-dated to it, keeping its duration.
 """
 import hashlib
 import math
@@ -24,7 +26,7 @@ DEFAULT_MACHINE = 1000
 DEFAULT_PROJECT = 200
 CLOCK_SLACK = 300
 TIMEZONE_ENV = "MAKEWAND_BUDGET_TIMEZONE"
-# reserve_capacity refuses longer holds, so a later expiry can only come from a skewed clock.
+# reserve_capacity refuses longer holds; a hold without created_at counts as this long.
 MAX_HOLD_SECONDS = 86400
 _REPAIR_HINT = "repair: makewand budget clock --repair"
 _warned = set()
@@ -45,6 +47,27 @@ def effective_clock(data, now=None):
                             f"lease and hold expiry use at most {CLOCK_SLACK}s of it")
         return now + CLOCK_SLACK
     return max(now, clock)
+
+
+def _hold_dates(hold):
+    """(created, duration) of a capacity hold. One written before holds carried
+    created_at counts as the longest a hold can be."""
+    if "created_at" in hold:
+        return hold["created_at"], hold["expires_at"] - hold["created_at"]
+    return hold["expires_at"] - MAX_HOLD_SECONDS, MAX_HOLD_SECONDS
+
+
+def redate_hold(hold, clock):
+    """Re-date a hold created after `clock` to it, keeping its duration, as scopes()
+    re-dates a lease: one made while the clock was ahead then lasts as long as asked
+    from real time, not until real time catches up. Returns whether it moved."""
+    created, duration = _hold_dates(hold)
+    if created <= clock:
+        return False
+    hold["expires_at"] = clock + duration
+    if "created_at" in hold:
+        hold["created_at"] = clock
+    return True
 
 
 def day_bucket(moment):
@@ -148,8 +171,12 @@ def scopes(data, task, maximum):
     # A lease dated past what this clock allows was written while the clock was
     # ahead. Date it like a fresh heartbeat: a live owner renews it, a dead
     # owner's lease expires one TTL from now instead of when real time catches up.
+    # A hold created after this clock keeps its duration from it. Callers persist
+    # both even when they refuse the call.
     for lease in data.get("leases", {}).values():
         lease["expires_at"] = min(lease["expires_at"], s["clock"] + TTL)
+    for hold in data.get("holds", {}).values():
+        redate_hold(hold, s["clock"])
     task = task or os.environ.get("MAKEWAND_TASK_ID") or "legacy-task"
     project = project_ref()
     keys = [("tasks", task), ("projects", project + ":" + day), ("machine", day)]
@@ -164,15 +191,32 @@ def scopes(data, task, maximum):
     return [[group, key] for group, key in keys]
 
 
-def available(data, keys, holds, claim=None):
-    from makewand.call_budget import BudgetError
+def _day_span(s, group, key, today):
+    """The buckets one scope's cap counts. While the real day is earlier than the
+    latest bucket (the clock moved back), the calls charged into the later buckets
+    were made today: a daily scope counts every bucket from today to the latest."""
+    if group == "tasks" or today >= s["day"]:
+        return [key]
+    prefix = key.rpartition(":")[0]
+    return [key] + [k for k in s[group] if k != key and k.rpartition(":")[0] == prefix
+                    and today <= k.rpartition(":")[2] <= s["day"]]
+
+
+def _occupies(entry, references):
+    return any(reference in (entry.get("scopes") or []) for reference in references)
+
+
+def available(data, keys, holds, claim=None, now=None):
+    s = data["scopes"]
+    today = day_bucket(time.time() if now is None else now)
     result = []
     for group, key in keys:
-        counter = data["scopes"][group][key]
-        held = sum(h["remaining"] for h in holds.values() if [group, key] in h.get("scopes", []))
-        if claim is not None and [group, key] in claim.get("scopes", []):
+        span = [[group, k] for k in _day_span(s, group, key, today)]
+        held = sum(h["remaining"] for h in holds.values() if _occupies(h, span))
+        if claim is not None and _occupies(claim, span):
             held -= 1
-        result.append(counter["maximum"] - counter["used"] - held)
+        counters = [s[group][k] for _, k in span]
+        result.append(min(c["maximum"] for c in counters) - sum(c["used"] for c in counters) - held)
     if data.get("legacy_maximum") is not None:
         legacy_used = data.get("legacy_used", 0)
         result = [value - legacy_used for value in result]
@@ -191,8 +235,10 @@ def repair_clock(data, now=None):
     """Bring a persisted clock and day that lead real time back to it; report what changed.
 
     Counts are never lowered: calls counted in a later day's bucket stay there and are
-    charged to today's bucket as well, so moving the day back cannot reset a limit.
-    Live lease owners renew within seconds; a dead owner's lease expires one TTL from now.
+    charged to today's bucket as well, so moving the day back cannot reset a limit;
+    holds counted there move to today's buckets with them. Live lease owners renew
+    within seconds; a dead owner's lease expires one TTL from now. A hold dated in the
+    future moves back by its lead, keeping its duration.
     """
     now = time.time() if now is None else now
     s = data["scopes"]
@@ -201,10 +247,10 @@ def repair_clock(data, now=None):
     holds = list(data.get("holds", {}).values())
     report = {
         "clock_lead_seconds": max(0.0, s["clock"] - now), "day": s["day"], "today": today,
-        # No writer that follows the clock rule leaves expiries this far ahead.
+        # No writer that follows the clock rule leaves these this far ahead.
         "skewed_leases": sum(lease["expires_at"] > now + CLOCK_SLACK + TTL for lease in leases),
-        "skewed_holds": sum(hold["expires_at"] > now + MAX_HOLD_SECONDS for hold in holds),
-        "carried_buckets": 0, "changed": False,
+        "skewed_holds": sum(_hold_dates(hold)[0] > now + CLOCK_SLACK for hold in holds),
+        "carried_buckets": 0, "moved_holds": 0, "changed": False,
     }
     report["skewed"] = bool(report["clock_lead_seconds"] > CLOCK_SLACK or s["day"] > today
                             or report["skewed_leases"] or report["skewed_holds"])
@@ -222,17 +268,27 @@ def repair_clock(data, now=None):
         clamp(lease, "expires_at", now + TTL)
         clamp(lease, "heartbeat_at", now)
     for hold in holds:
-        clamp(hold, "expires_at", now + MAX_HOLD_SECONDS)
+        if redate_hold(hold, now):
+            report["changed"] = True
     if s["day"] > today:
+        moved = {}
         for group, today_key in (("machine", lambda key: today),
                                  ("projects", lambda key: key.rpartition(":")[0] + ":" + today)):
             for key, counter in list(s[group].items()):
                 if key.rpartition(":")[2] > today:
-                    target = s[group].setdefault(today_key(key), {"maximum": counter["maximum"], "used": 0})
+                    moved[group, key] = today_key(key)
+                    target = s[group].setdefault(moved[group, key], {"maximum": counter["maximum"], "used": 0})
                     target["used"] += counter["used"]
                     target["maximum"] = min(target["maximum"], counter["maximum"])
                     target["last_used"] = now
                     report["carried_buckets"] += 1
+        # Admission counts a hold in the buckets it names: left in a later day's, it
+        # would reserve nothing today and another call could take its capacity.
+        for hold in holds:
+            references = hold.get("scopes") or []
+            if any(tuple(reference) in moved for reference in references):
+                hold["scopes"] = [[group, moved.get((group, key), key)] for group, key in references]
+                report["moved_holds"] += 1
         s["day"] = today
         report["changed"] = True
     return report
