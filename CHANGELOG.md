@@ -68,6 +68,10 @@ All notable changes to this project are documented here. The format is based on
 - **测试不再改动源码树**：设置 `MAKEWAND_TEST_ISOLATION_ROOT`（测试环境）时，宿主事务、流水线、竞速、DAG（含单任务）与 `apply` 一律拒绝以 makewand 源码树、其子目录或上级目录为工作区（单一定义 `git_helper.harness_source_tree_conflict`）；测试只能连接自身绑定的回环端口，代理变量被清除，pytest 结束时列出被拦截的连接。
 - **不经模板链接写仓库元数据**：makewand 建立的隔离副本（竞速、DAG 暂存区）与临时基线仓库在 `git init` 之后先把从 `init.templateDir` 复制来的 `config` 链接换成本仓库的普通文件，再写入 makewand 的 `user.name`/`user.email`（DAG 还有 `core.excludesFile`）；DAG 暂存区的 `info/exclude` 与临时仓库标记总写成新的普通文件，从不写穿符号链接或硬链接，makewand 自己不再改写共享的模板文件。`.git/info/attributes.mw_gate` 不经链接打开，那里有链接时 makewand 的 git 命令 fail-closed（`Cannot shield Git attributes`）。`info` 目录本身是链接时也先换成本仓库的空目录，属性屏蔽锁与临时文件不会写入共享模板；原生 Windows 的重解析点（含 junction）同样拒绝作为元数据根目录，并在子路径处替换。`git init` 自身仍会经链接写入其 core 设置，见 docs/VERIFICATION_CONTRACT.md。
 
+2026-10-21 评估修复（Python 宿主侧 Git；详见 docs/VERIFICATION_CONTRACT.md）：
+
+- **属性屏蔽覆盖 commondir**：按 git 自身的仓库发现规则读取文件（`.git` 文件、`.git` 目录、隐式裸仓库及各自的 `commondir`，逐字节按 git 的格式解析），`.git` 是目录时也屏蔽 `commondir` 所指公共目录的 `info/attributes`；`.git` 文件或 `commondir` 无法读取时拒绝运行 git。此前植入的 clean/smudge filter 可在宿主审查 diff 时执行。
+
 ### Added
 
 - 递归保护：makewand 启动的 provider CLI 带 `MAKEWAND_PROVIDER_WORKER=1`，在其中仅允许 search、repomap、静态帮助/版本和 completion，管理命令也被拒绝。

@@ -233,59 +233,139 @@ def resolve_safe_git_binary(cwd: Optional[Union[str, Path]] = None) -> str:
     return _RESOLVED_GIT_BINARY
 
 
+# git refuses a .git file larger than this (read_gitfile_gently); commondir holds a path.
+_GIT_POINTER_MAX_BYTES = 1 << 20
+_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _read_git_pointer(path: Path) -> bytes:
+    """A .git file or commondir, read as git reads it; OSError where git's read fails too."""
+    descriptor = os.open(_fs_path(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+                         | getattr(os, "O_CLOEXEC", 0))
+    with os.fdopen(descriptor, "rb") as handle:
+        # git cannot read a directory and would wait forever on a FIFO.
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        data = handle.read(_GIT_POINTER_MAX_BYTES + 1)
+    if len(data) > _GIT_POINTER_MAX_BYTES:
+        raise OSError(errno.EFBIG, "file too large", str(path))
+    return data
+
+
+def _gitfile_target(dot_git: Path) -> Optional[Path]:
+    """The git directory a ``.git`` file names, parsed exactly as git parses it; None when git rejects the file."""
+    data = _read_git_pointer(dot_git)
+    if not data.startswith(b"gitdir: "):
+        return None
+    data = data.rstrip(b"\r\n")
+    if len(data) < 9:
+        return None
+    target = os.fsdecode(data[8:].split(b"\0", 1)[0])
+    return Path(os.path.realpath(os.path.join(dot_git.parent, target)))
+
+
+def _git_common_dir(git_dir: Path) -> Path:
+    """The directory git reads config and info/attributes from for ``git_dir``.
+
+    git honours a ``commondir`` file in any git directory, not only in a linked
+    worktree's: its content names the common directory, relative to ``git_dir``
+    unless absolute, with trailing line ends dropped and nothing after a NUL. A
+    commondir git cannot read makes git die, and makes this raise.
+    """
+    pointer = git_dir / "commondir"
+    if not os.path.lexists(_fs_path(pointer)):
+        return git_dir
+    data = _read_git_pointer(pointer)
+    if not data:
+        raise OSError(errno.EINVAL, "empty commondir", str(pointer))
+    target = os.fsdecode(data.rstrip(b"\r\n").split(b"\0", 1)[0])
+    return Path(os.path.realpath(os.path.join(git_dir, target)))
+
+
+def _valid_git_head(head: Path) -> bool:
+    """git's validate_headref: a symbolic ref into refs/, as file content or symlink, or an object id."""
+    path = _fs_path(head)
+    try:
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode):
+            return os.fsencode(os.readlink(path)).startswith(b"refs/")
+        if not stat.S_ISREG(mode):
+            return False
+        with open(path, "rb") as handle:
+            data = handle.read(255)
+    except OSError:
+        return False
+    if data.startswith(b"ref:") and data[4:].lstrip(b" \t\n\r").startswith(b"refs/"):
+        return True
+    return len(data) >= 40 and all(byte in _HEX_DIGITS for byte in data[:40])
+
+
+def _git_metadata_dirs(cwd: Optional[Union[str, Path]]) -> List[Path]:
+    """Every git directory and common directory git may use for a command run in ``cwd``.
+
+    Mirrors git's discovery by reading files, never by running git with the
+    repository's configuration: at ``cwd`` and then each parent, a ``.git`` file
+    names the repository (git uses it or refuses to run), a valid ``.git``
+    directory is the repository, and otherwise the directory itself may be an
+    implicit bare repository; each with the common directory its ``commondir``
+    names. A candidate git would pass over may be listed, one git would use never
+    is missed. Raises OSError where git itself cannot read the layout (a .git file
+    or commondir it cannot read): the caller refuses to run git.
+    """
+    start = Path(os.path.realpath(cwd if cwd else os.getcwd()))
+    found: List[Path] = []
+    for level in (start, *start.parents):
+        dot_git = level / ".git"
+        try:
+            mode = os.stat(_fs_path(dot_git)).st_mode
+        except OSError:
+            mode = 0  # git treats every stat failure as no .git at this level
+        if stat.S_ISREG(mode):
+            target = _gitfile_target(dot_git)
+            if target is not None:
+                found += [target, _git_common_dir(target)]
+            return found
+        candidates = [level]
+        if stat.S_ISDIR(mode):
+            found.append(dot_git)
+            candidates.insert(0, dot_git)
+        for git_dir in candidates:
+            if _valid_git_head(git_dir / "HEAD"):
+                common_dir = _git_common_dir(git_dir)
+                found += [git_dir, common_dir]
+                if all(os.access(_fs_path(common_dir / name), os.X_OK) for name in ("objects", "refs")):
+                    return found
+    return found
+
+
 def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path]:
+    """The info/attributes files to shield for a git command run in ``cwd``.
+
+    --attr-source does not override them. Raises OSError when the repository
+    layout cannot be read; run_git_cmd then refuses the command.
+    """
     paths: List[Path] = []
     seen_dirs = set()
-    try:
-        p = Path(cwd).resolve() if cwd else Path.cwd().resolve()
-        for cur in [p] + list(p.parents):
-            gp = cur / ".git"
-            git_dirs: List[Path] = []
-            if _fs_path(gp).is_dir():
-                git_dirs.append(gp)
-            elif _fs_path(gp).is_file():
-                try:
-                    txt = _fs_path(gp).read_text(encoding="utf-8").strip()
-                    if txt.startswith("gitdir:"):
-                        gd = Path(txt[7:].strip())
-                        if not gd.is_absolute():
-                            gd = (gp.parent / gd).resolve()
-                        git_dirs.append(gd)
-                        commondir_file = gd / "commondir"
-                        if _fs_path(commondir_file).exists():
-                            cd_txt = _fs_path(commondir_file).read_text(encoding="utf-8").strip()
-                            cd_path = Path(cd_txt)
-                            if not cd_path.is_absolute():
-                                cd_path = (gd / cd_path).resolve()
-                            git_dirs.append(cd_path)
-                except Exception:
-                    pass
-            for gdir in git_dirs:
-                try:
-                    resolved_dir = gdir.resolve()
-                except Exception:
-                    resolved_dir = gdir
-                if resolved_dir not in seen_dirs:
-                    seen_dirs.add(resolved_dir)
-                    info_dir = _fs_path(resolved_dir / "info")
-                    ia = info_dir / "attributes"
-                    gate_file = info_dir / "attributes.mw_gate"
-                    needs_shield = False
-                    if ia.exists() or gate_file.exists():
-                        needs_shield = True
-                    elif info_dir.is_dir():
-                        try:
-                            if any(info_dir.glob("attributes.*shield_*")):
-                                needs_shield = True
-                        except Exception:
-                            pass
-                    if needs_shield:
-                        paths.append(ia)
-            if _fs_path(gp).exists():
-                break
-    except Exception:
-        pass
+    for gdir in _git_metadata_dirs(cwd):
+        try:
+            resolved_dir = gdir.resolve()
+        except (OSError, RuntimeError):
+            resolved_dir = gdir
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+        info_dir = _fs_path(resolved_dir / "info")
+        ia = info_dir / "attributes"
+        gate_file = info_dir / "attributes.mw_gate"
+        try:
+            needs_shield = (ia.exists() or gate_file.exists()
+                            or (info_dir.is_dir() and any(info_dir.glob("attributes.*shield_*"))))
+        except OSError:
+            needs_shield = False  # a file makewand cannot look up, git cannot read either
+        if needs_shield:
+            paths.append(ia)
     return paths
+
 
 def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout=None):
     shielded_infos: List[Tuple[Any, ...]] = []
@@ -345,9 +425,13 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             if _diff_index.get() is not None:
                 git_env["GIT_INDEX_FILE"] = _diff_index.get()
 
-            # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees.
-            # Use deterministic sorting and attributes.lock file locking to avoid multi-session collisions.
-            ia_targets = sorted(_get_git_info_attributes_paths(cwd), key=lambda p: str(p.resolve()))
+            # S01: Temporarily shield info/attributes in every git and common directory git may use
+            # (any layout, commondir included). Use deterministic sorting and attributes.lock file
+            # locking to avoid multi-session collisions.
+            try:
+                ia_targets = sorted(_get_git_info_attributes_paths(cwd), key=lambda p: str(p.resolve()))
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise OSError(f"Cannot shield Git attributes: {exc}") from exc
             for ia_target in ia_targets:
                 info_dir = ia_target.parent
                 try:

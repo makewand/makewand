@@ -359,6 +359,16 @@ submodule format, `diff.context`) and carry three context lines; rollback uses
 literal pathspecs.
 Undecodable path bytes are shown as `\xNN` in messages and artifacts.
 
+Host-side git commands other than `git apply` that run in a repository read
+attributes from the empty tree (`--attr-source`), so no `.gitattributes` in the
+work tree or index selects a filter, diff or merge driver, and each runs with
+`info/attributes` moved aside in every git directory and common directory git
+may use for its working directory: makewand reads the files git's repository
+discovery reads (a `.git` file, a `.git` directory or an implicit bare
+repository there or in a parent) and the `commondir` of each, whether `.git` is
+a file or a directory. A `.git` file or `commondir` git cannot read makes the
+command fail closed (`Cannot shield Git attributes`).
+
 Pre-existing files that are not backed up (dependency and cache directories,
 files over the backup limits) get a SHA-256 digest at task start, smallest first,
 within `MAKEWAND_FINGERPRINT_FILE_LIMIT` (default 64 MiB per file),
