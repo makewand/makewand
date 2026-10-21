@@ -176,3 +176,47 @@ func TestFormatCLIExecutionErrorQuotaVerdictsMatchPython(t *testing.T) {
 		t.Fatalf("parity corpus too thin: %d verdicts, %d sealing", checked, sealed)
 	}
 }
+
+// A CLI failure that is no quota or rate refusal is the CLI's own login
+// refusal (ErrorKindAuth, a known failure) exactly when health.py finds an
+// auth message of that CLI in its stderr. agy's start-up notice is moot once
+// agy signed in silently (makewand/providers/agy.py classify_agy_failure), so
+// such agy cases are left out; agy's argument rejection (ErrorKindConfig) is
+// a refusal too.
+func TestFormatCLIExecutionErrorRefusalVerdictsMatchPython(t *testing.T) {
+	raw, err := os.ReadFile(goCLIMessageCatalogFile)
+	if err != nil {
+		raw, err = os.ReadFile(pythonCLIMessageCatalogFile)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers := catalogProviders(t, raw)
+	exit := errors.New("exit status 1")
+	refused := 0
+	for _, c := range loadCLIParityCorpus(t).Cases {
+		if c.Text == nil || c.Prompt != nil {
+			continue
+		}
+		text := string(*c.Text)
+		for _, provider := range providers {
+			expected := c.expected(provider, "stderr")
+			_, quota := expected["quota"]
+			_, rate := expected["rate"]
+			if quota || rate || provider == "agy" && agyAuthSucceeded.MatchString(text) {
+				continue
+			}
+			_, auth := expected["auth"]
+			kind := ErrorKindOf(formatCLIExecutionError(provider, text, exit, nil, time.Second))
+			if (kind == ErrorKindAuth) != auth && !(auth && kind == ErrorKindConfig && provider == "agy") {
+				t.Errorf("%s: %s CLI refusal=%s, health.py finds %v in stderr %q", c.ID, provider, kind, expected, text)
+			}
+			if auth {
+				refused++
+			}
+		}
+	}
+	if refused < 15 {
+		t.Fatalf("parity corpus too thin: %d login refusals", refused)
+	}
+}

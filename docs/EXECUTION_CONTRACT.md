@@ -26,7 +26,17 @@ tests exercise the same fixtures and share a real ledger across processes.
 baseline, artifact, test, review and apply checks in
 [VERIFICATION_CONTRACT.md](VERIFICATION_CONTRACT.md). `outcome_known` distinguishes
 a timeout before invocation from loss of a result after invocation. An unknown
-remote result must not trigger automatic provider fallback or replay.
+remote result must not trigger automatic provider fallback or replay, with one
+exception in the Go router: a read-only CLI run (a review, or a remote-origin
+`serve` request) cannot have written the workspace, so an exit the message
+catalog does not recognize stays `UNKNOWN` in accounting while the router may try
+the next provider. A provider CLI's own refusal of the invocation, recognized by
+the shared message catalog (`makewand/cli_message_catalog.json`: a login refusal,
+or agy rejecting its arguments), is a known `FAILED` result and falls back like
+any other known failure. In Power mode an `UNKNOWN` generator or judge is never
+replayed, but it does not discard the answers the other generators produced: the
+surviving or first answer is returned, and the unknown attempt stays in the trace
+and the usage.
 
 Provider-result `duration_ms` measures provider execution. Accounting and
 telemetry use bounded independent cleanup so cancellation cannot erase an

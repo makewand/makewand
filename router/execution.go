@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -150,6 +151,8 @@ func providerOutcome(err error, usage Usage) execution.Outcome {
 			}
 			// An ordinary CLI exit only proves the local process stopped. It
 			// does not prove whether the upstream model finished the request.
+			// The CLI's own refusal of the invocation is no ordinary exit: it
+			// has its own kind (cliInvocationRefusal) and stays known.
 			if errors.As(err, &providerErr) && providerErr.Op == "CLI" && providerErr.Kind == ErrorKindProvider {
 				outcome.Status, outcome.Known = execution.Unknown, false
 			}
@@ -192,7 +195,62 @@ func completeProvider(attempt *execution.Attempt, usage Usage, callErr error) er
 }
 
 func stopExecutionReplay(err error) bool {
-	return errors.Is(err, execution.ErrUnknownOutcome) || errors.Is(err, errExecutionAccounting) || errors.Is(err, execution.ErrBudgetExhausted)
+	return replayStoppingUnknown(err) || errors.Is(err, errExecutionAccounting) || errors.Is(err, execution.ErrBudgetExhausted)
+}
+
+// onlyUnknownOutcome reports whether err stops replay only because a call's
+// outcome is unknown, not because admission or accounting refused a call.
+func onlyUnknownOutcome(err error) bool {
+	return errors.Is(err, execution.ErrUnknownOutcome) && !errors.Is(err, errExecutionAccounting) && !errors.Is(err, execution.ErrBudgetExhausted)
+}
+
+// readOnlyUnknownError is the unknown outcome of a CLI exit in a read-only run
+// (readOnlyExitError). It is UNKNOWN to accounting and to callers, but it does
+// not stop fallback: the run could not write the workspace, so no edit of the
+// next provider can stack on one of it.
+type readOnlyUnknownError struct{ err error }
+
+func (e *readOnlyUnknownError) Error() string {
+	return "model call outcome unknown (read-only run): " + e.err.Error()
+}
+func (e *readOnlyUnknownError) Unwrap() error        { return e.err }
+func (e *readOnlyUnknownError) Is(target error) bool { return target == execution.ErrUnknownOutcome }
+
+// readOnlyExitError marks err, the error of a finished CLI run, as a read-only
+// run's unknown outcome when the run was read-only (cliReadOnlyRun) and its
+// exit says nothing the catalog recognizes: an ordinary exit (ErrorKindProvider)
+// or one that looks transient (ErrorKindNetwork). A refusal, a quota limit, a
+// timeout and a run without a complete exit result are left as they are.
+func readOnlyExitError(ctx context.Context, err error) error {
+	var providerErr *ProviderError
+	if err == nil || !cliReadOnlyRun(ctx) || errors.Is(err, execution.ErrUnknownOutcome) ||
+		!errors.As(err, &providerErr) || providerErr.Op != "CLI" ||
+		(providerErr.Kind != ErrorKindProvider && providerErr.Kind != ErrorKindNetwork) {
+		return err
+	}
+	return &readOnlyUnknownError{err: err}
+}
+
+// replayStoppingUnknown reports whether err carries an unknown outcome that
+// stops automatic replay: errors.Is(err, execution.ErrUnknownOutcome) without
+// what a readOnlyUnknownError wraps.
+func replayStoppingUnknown(err error) bool {
+	for err != nil {
+		switch e := err.(type) {
+		case *readOnlyUnknownError:
+			return false
+		case interface{ Unwrap() []error }:
+			return slices.ContainsFunc(e.Unwrap(), replayStoppingUnknown)
+		}
+		if err == execution.ErrUnknownOutcome {
+			return true
+		}
+		if is, ok := err.(interface{ Is(error) bool }); ok && is.Is(execution.ErrUnknownOutcome) {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 // ChatProvider applies the same atomic admission used by Router to direct

@@ -451,18 +451,29 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	})
 
 	attempts, ensembleErr := r.EnsembleWithError(ctx, phase, messages, system, exclude...)
-	if ensembleErr != nil {
+	results := make([]EnsembleResult, 0, len(attempts))
+	for _, result := range attempts {
+		if strings.TrimSpace(result.Content) != "" {
+			results = append(results, result)
+		}
+	}
+	// A generator whose outcome is unknown is never replayed, but it does not
+	// discard the answers the others gave either: its attempt stays in the
+	// trace (ensemble_generator_error) and in the usage below.
+	if ensembleErr != nil && (len(results) == 0 || !onlyUnknownOutcome(ensembleErr)) {
 		var total Usage
 		for _, attempt := range attempts {
 			total = accumulateAttemptUsage(total, attempt.Usage)
 		}
 		return "", total, RouteResult{}, ensembleErr
 	}
-	results := make([]EnsembleResult, 0, len(attempts))
-	for _, result := range attempts {
-		if strings.TrimSpace(result.Content) != "" {
-			results = append(results, result)
-		}
+	if ensembleErr != nil {
+		r.emitTrace(TraceEvent{
+			Event:  "chat_best_power_unknown_generator",
+			Phase:  buildPhaseName(phase),
+			Error:  ensembleErr.Error(),
+			Detail: fmt.Sprintf("not replayed; continuing with %d usable responses", len(results)),
+		})
 	}
 	if len(results) == 0 {
 		// No generator produced usable content — fall back to adaptive routing
@@ -495,8 +506,19 @@ func (r *Router) ChatBest(ctx context.Context, phase BuildPhase, messages []Mess
 	total = accumulateAttemptUsage(total, best.Usage)
 	total.Provider = best.Provider // winning generator
 	total.Model = best.ModelID
-	if judgeErr != nil {
+	if judgeErr != nil && !onlyUnknownOutcome(judgeErr) {
 		return "", total, RouteResult{}, judgeErr
+	}
+	if judgeErr != nil {
+		// A judge whose outcome is unknown picked no winner; best is the first
+		// candidate, as when the judge fails.
+		r.emitTrace(TraceEvent{
+			Event:    "chat_best_power_unknown_judge",
+			Phase:    buildPhaseName(phase),
+			Selected: best.Provider,
+			Error:    judgeErr.Error(),
+			Detail:   "not replayed; returning the first candidate",
+		})
 	}
 
 	r.emitTrace(TraceEvent{

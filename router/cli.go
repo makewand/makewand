@@ -787,7 +787,7 @@ func (c *CLIProvider) chatStreamUnaccounted(ctx context.Context, messages []Mess
 					waitErr = errors.New("CLI reported an error")
 				}
 			}
-			ch <- StreamChunk{Error: c.formatExecutionError(stdout, capture.StderrString(), prompt, waitErr, nil, duration)}
+			ch <- StreamChunk{Error: readOnlyExitError(ctx, c.formatExecutionError(stdout, capture.StderrString(), prompt, waitErr, nil, duration))}
 			return
 		}
 
@@ -1219,12 +1219,12 @@ func (c *CLIProvider) chatReservedAttempt(ctx context.Context, prompt, validatio
 		return "", nil, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
 	}
 	if runErr != nil {
-		return "", nil, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, runErr, ctx.Err(), duration)
+		return "", nil, readOnlyExitError(ctx, c.formatExecutionError(capture.StdoutBytes(), capture.StderrString(), prompt, runErr, ctx.Err(), duration))
 	}
 
 	raw := capture.StdoutBytes()
 	if c.name == "claude-cli" && claudeCLIErrorMessage(raw) != "" {
-		return "", nil, c.formatExecutionError(raw, capture.StderrString(), prompt, errors.New("CLI reported an error"), ctx.Err(), duration)
+		return "", nil, readOnlyExitError(ctx, c.formatExecutionError(raw, capture.StderrString(), prompt, errors.New("CLI reported an error"), ctx.Err(), duration))
 	}
 
 	// Try structured JSON parsing when the CLI was invoked with a JSON output flag.
@@ -1512,14 +1512,14 @@ func (c *CLIProvider) formatExecutionError(stdout []byte, stderr, prompt string,
 			stderr, quota = strings.TrimSpace(stderr)+"\n"+message, true
 		}
 	}
-	return cliFailureError(c.provider, stderr, quota, runErr)
+	return cliFailureError(c.provider, cli, stderr, prompt, quota, runErr)
 }
 
 func formatCLIExecutionError(provider, stderr string, runErr error, ctxErr error, duration time.Duration) error {
 	if err := cliOutcomeError(provider, runErr, ctxErr, duration); err != nil {
 		return err
 	}
-	return cliFailureError(provider, stderr, looksLikeQuotaExhaustion(provider, stderr), runErr)
+	return cliFailureError(provider, cliCatalogName(provider), stderr, "", looksLikeQuotaExhaustion(provider, stderr), runErr)
 }
 
 // cliOutcomeError is the error of a run that ended without a complete exit
@@ -1535,9 +1535,10 @@ func cliOutcomeError(provider string, runErr error, ctxErr error, duration time.
 	return nil
 }
 
-// cliFailureError is the error of a CLI that exited with a failure; quota
-// tells whether stderr carries the CLI's own quota or rate-limit refusal.
-func cliFailureError(provider, stderr string, quota bool, runErr error) error {
+// cliFailureError is the error of a CLI that exited with a failure, read from
+// stderr as cli (its catalog entry) wrote it; prompt is the prompt as sent.
+// quota tells whether stderr carries the CLI's own quota or rate-limit refusal.
+func cliFailureError(provider, cli, stderr, prompt string, quota bool, runErr error) error {
 	errMsg := strings.TrimSpace(stderr)
 	if errMsg == "" {
 		errMsg = runErr.Error()
@@ -1550,6 +1551,15 @@ func cliFailureError(provider, stderr string, quota bool, runErr error) error {
 	// counts, read from stderr as the CLI wrote it (indentation included).
 	if quota {
 		return newProviderError(provider, "CLI", ErrorKindRateLimit, true, 429, errMsg, runErr)
+	}
+	// A CLI that refused the invocation itself (no login, arguments it rejects)
+	// did no model work: a known failure, which the router may replay on the
+	// next provider. A run whose outcome is unknown already (a login switch
+	// during it) stays unknown.
+	if !errors.Is(runErr, execution.ErrUnknownOutcome) {
+		if kind, line := cliInvocationRefusal(cli, stderr, prompt); kind != "" {
+			return newProviderError(provider, "CLI", kind, false, 0, line, runErr)
+		}
 	}
 	base := newProviderError(provider, "CLI", ErrorKindProvider, false, 0, errMsg, runErr)
 	if looksTransient(errMsg) {
@@ -1602,6 +1612,75 @@ func cliQuotaRefusal(cli, stderr, prompt string) bool {
 	}
 	streams := cliStreams{stderr: stderr, apart: true}
 	return len(cliMessages.find(entry, quotaExhaustionKinds, streams, prompt)) > 0
+}
+
+// cliRefusalKinds are the catalog kinds of a CLI's refusal to run at all: a
+// login it requires or credentials it rejects ("auth").
+var cliRefusalKinds = []string{"auth"}
+
+// agy prints these notices on every start, before its silent keyring sign-in,
+// and they are moot once that sign-in succeeded (makewand/providers/agy.py
+// _AGY_AUTH_OK_RE and _AGY_STARTUP_AUTH_NOTICE_RE).
+var (
+	agyAuthSucceeded     = regexp.MustCompile(`(?i)authenticated (?:successfully|via )`)
+	agyStartupAuthNotice = regexp.MustCompile(`(?i)^(?:you are not logged into antigravity\.?|print mode: not authenticated, trying silent auth)$`)
+)
+
+// cliInvocationRefusal returns the kind of cli's own refusal of the invocation
+// in stderr, which shows that no model work was done, and the line that shows
+// it; "" when there is none. A rejection of its arguments (agy's
+// invalid_invocation) is ErrorKindConfig, a login refusal (a catalog "auth"
+// message) ErrorKindAuth: what makewand/providers/agy.py, grok.py and muse.py
+// read as a known failure. Only cli's own lines count, as for
+// cliQuotaRefusal; a CLI the catalog does not know refuses nothing.
+func cliInvocationRefusal(cli, stderr, prompt string) (ErrorKind, string) {
+	entry := cliMessages.providers[cli]
+	if entry == nil {
+		return "", ""
+	}
+	if line, ok := cliMessages.invocationRejection(entry, stderr); ok {
+		return ErrorKindConfig, line
+	}
+	if entry.kinds["auth"] == nil && entry.kinds["auth.marked"] == nil {
+		return "", ""
+	}
+	if cli == "agy" && agyAuthSucceeded.MatchString(stderr) {
+		var kept []string
+		for _, line := range pySplitLines(stderr) {
+			if !agyStartupAuthNotice.MatchString(normalizeCLILine(line)) {
+				kept = append(kept, line)
+			}
+		}
+		stderr = strings.Join(kept, "\n")
+	}
+	if line, ok := cliMessages.find(entry, cliRefusalKinds, cliStreams{stderr: stderr, apart: true}, prompt)["auth"]; ok {
+		return ErrorKindAuth, line
+	}
+	return "", ""
+}
+
+// invocationRejection returns entry's rejection of its arguments when that is
+// the first line the CLI wrote itself in own (makewand/providers/agy.py
+// _agy_invocation_rejection on _agy_user_facing): glog diagnostics, status
+// lines and notices are not such lines, and the same words further on (the
+// answer, a tool's output) are task content.
+func (c *cliMessageCatalog) invocationRejection(entry *cliCatalogEntry, own string) (string, bool) {
+	if entry.invalidInvocation == nil {
+		return "", false
+	}
+	lines := pySplitLines(own)
+	skipped := c.glogEntryLines(lines, false)
+	for i, raw := range lines {
+		if skipped[i] || pyStrip(stripCLIANSI(raw)) == "" {
+			continue
+		}
+		line := normalizeCLILine(raw)
+		if entry.notices != nil && entry.notices.MatchString(line) {
+			continue
+		}
+		return line, entry.invalidInvocation.MatchString(line)
+	}
+	return "", false
 }
 
 // cliCatalogName is the catalog entry of a router provider or CLI name: the
@@ -1723,6 +1802,10 @@ type cliCatalogEntry struct {
 	kinds       map[string]*regexp.Regexp // "quota", "quota.marked", ...: one alternation each
 	own         *regexp.Regexp            // its names as it prints them in front of its lines
 	jsonReports bool                      // a JSON object it prints over several lines is one line
+	// notices: its own status lines and notices, generic ones included (agy's
+	// status_lines, notices and generic_notice); invalidInvocation: its
+	// rejections of its arguments. nil when the catalog lists none.
+	notices, invalidInvocation *regexp.Regexp
 }
 
 // cliTranscript is codex exec's transcript structure (providers.codex.transcript).
@@ -1758,8 +1841,12 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 				FatalError    string   `json:"fatal_error"`
 				FatalAfter    string   `json:"fatal_after"`
 			} `json:"transcript"`
-			Kinds       map[string][]string `json:"kinds"`
-			JSONReports any                 `json:"json_reports"`
+			Kinds             map[string][]string `json:"kinds"`
+			JSONReports       any                 `json:"json_reports"`
+			Notices           []string            `json:"notices"`
+			GenericNotice     string              `json:"generic_notice"`
+			StatusLines       []string            `json:"status_lines"`
+			InvalidInvocation []string            `json:"invalid_invocation"`
 		} `json:"providers"`
 	}
 	if err := json.Unmarshal(data, &file); err != nil {
@@ -1826,6 +1913,18 @@ func loadCLIMessageCatalog(data []byte) (*cliMessageCatalog, error) {
 			if len(patterns) > 0 {
 				entry.kinds[kind] = compile(prefix+"kinds."+kind, cliAlternation(patterns))
 			}
+		}
+		// makewand/providers/agy.py _agy_own_line(any_warning=True) and
+		// _agy_invocation_rejection read these lists.
+		notices := slices.Concat(spec.StatusLines, spec.Notices)
+		if spec.GenericNotice != "" {
+			notices = append(notices, spec.GenericNotice)
+		}
+		if len(notices) > 0 {
+			entry.notices = compile(prefix+"notices", cliAlternation(notices))
+		}
+		if len(spec.InvalidInvocation) > 0 {
+			entry.invalidInvocation = compile(prefix+"invalid_invocation", cliAlternation(spec.InvalidInvocation))
 		}
 		if t := spec.Transcript; t != nil {
 			entry.transcript = &cliTranscript{
