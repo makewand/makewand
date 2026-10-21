@@ -101,17 +101,20 @@ still coordinate their monetary admission through SQLite.
 Without a codex CLI, such as in the Docker image with only `OPENAI_API_KEY`,
 Power mode's `codex` generator and judge call the configured OpenAI model
 (`OPENAI_MODEL`, default `gpt-4o`) and are billed as API calls at that model's
-price. Clients can name OpenAI models as they would on the OpenAI API:
+price; a scaled budget reservation (`MAKEWAND_SCALED_BUDGET_RESERVATION=1`)
+also prices the route at that model, not at the `codex-cli` placeholder of its
+model table. Clients can name OpenAI models as they would on the OpenAI API:
 `gpt-*`, `o1*`, `o3*`, `o4*` and `codex-mini*` names are sent upstream as named
 and billed at that model's price, even when `routing.json` sets `models` for
 `openai`. A named model must have a price in the routing tables (the built-in
 `costs` or `costs` in `routing.json`) or be `OPENAI_MODEL`. Otherwise the
-request gets a 400, because its spend could not be budgeted. `codex` calls
-`OPENAI_MODEL`, and `openai` names the provider. Names the server cannot serve
-get the same 400 error, streamed or not. With a codex CLI installed, these
-names keep selecting the codex CLI, which runs its own model. A token's
-allowed modes do not limit which priced model its client names, so bound
-spend with the token's cost budgets.
+request gets a 400, because its spend could not be budgeted. Names are matched
+trimmed and in any case, `OPENAI_MODEL` too, and naming `OPENAI_MODEL` calls it
+as configured. `codex` calls `OPENAI_MODEL`, and `openai` names the provider.
+Names the server cannot serve get the same 400 error, streamed or not. With a
+codex CLI installed, these names keep selecting the codex CLI, which runs its
+own model. A token's allowed modes do not limit which priced model its client
+names, so bound spend with the token's cost budgets.
 
 makewand calls OpenAI's Chat Completions API. Reasoning models (`o1*`, `o3*`,
 `o4*`, `gpt-5*`, `codex-mini*`) get their output cap as
@@ -132,7 +135,8 @@ Named models are also refused while the `openai` route itself is blocked or
 its circuit is open.
 
 `GET /v1/models` lists `openai` and every OpenAI model a client can name: the
-priced OpenAI-family models, and `OPENAI_MODEL` when it is one. An
+priced OpenAI-family models, and `OPENAI_MODEL` when it is one, in lower case
+as names are matched. An
 `OPENAI_MODEL` outside these families, such as the model of an
 OpenAI-compatible endpoint, is reached as `openai`.
 
@@ -160,14 +164,19 @@ the floor and the free space. Replacing a session counts only its size
 difference, and a save that adds neither a session nor bytes is always
 allowed, so an account over a lowered limit can still update or shrink its
 sessions. The free-space floor counts the whole payload, because a
-replacement is written before the old file is removed. It is not enforced on
-platforms other than Linux, macOS, FreeBSD and Windows. A single request body
-remains capped at 4 MiB.
+replacement is written before the old file is removed. A save checks it before
+it waits for any lock and again under its account's lock (below), against the
+space the account's earlier saves left, so an account's concurrent saves cannot
+take the disk below the floor together. Saves of different accounts are
+checked independently, so each can still overshoot the floor by its own
+payload. The floor is not enforced on platforms other than Linux, macOS,
+FreeBSD and Windows. A single request body remains capped at 4 MiB.
 
 Each account's usage is kept in `quota-<hash>.json` beside the sessions and
 reconciled with the session files on every save, so sessions removed by hand
 stop counting. An account's saves are serialized through its own
-`.quota-<hash>.lock`, so one account's slow saves never hold up another's.
+`.quota-<hash>.lock`, also when only the free-space floor is set, so one
+account's slow saves never hold up another's.
 Sessions saved before the limits existed count from their next save. Every
 process that shares a sessions directory should use the same limits.
 

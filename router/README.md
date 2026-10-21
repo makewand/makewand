@@ -112,7 +112,9 @@ the model and billed at that model's price, even when `routing.json` gives
 `openai` a model table; `codex` itself calls the configured model. The model
 must be the provider's configured model or have a price in the routing tables
 (`costs`, which `routing.json` can extend). Otherwise the request gets a 400,
-because its spend could not be budgeted. Resolution uses the server's
+because its spend could not be budgeted. Names are matched trimmed and in any
+case, the configured model's too, and a request naming the configured model
+calls it as configured. Resolution uses the server's
 providers, not a token's allowlist, so such a token needs the `openai`
 provider. A token's allowed modes do not limit which priced model a client
 names; its cost budgets do. A `model` that nothing on the server serves gets
@@ -135,9 +137,9 @@ serving every other request; the 503 the model's requests then get names
 `openai:<model>`. A named model is still refused while the `openai` route
 itself is blocked or its circuit is open. `GET /v1/models` lists the
 models a client can name with `owned_by: "openai"`: every priced OpenAI-family
-model, and the configured model when it is one. A configured model outside
-these families, such as an OpenAI-compatible endpoint's own, is reached as
-`openai`.
+model, and the configured model when it is one, in lower case as names are
+matched. A configured model outside these families, such as an
+OpenAI-compatible endpoint's own, is reached as `openai`.
 
 `max_tokens` and `temperature` are accepted but currently ignored for
 compatibility. `response_format` supports `json_object` and a pragmatic
@@ -241,6 +243,24 @@ with `SetAccessType`. Routing still requests the name's table model, such as
 the codex table's `codex-cli`. A model ID ending in `-cli` names a CLI's own
 default, so `NewOpenAI` never sends one upstream and calls its configured model
 instead.
+
+The HTTP facade's scaled budget reservation
+(`HTTPHandlerOptions.ScaleBudgetReservation`) prices such a route before any
+request has built its provider, and it never builds one to find out, since a
+factory may run a CLI or reach the network. Declare the model the factory's
+provider calls with `RegisterProviderFactoryWithModel`, for example the
+`ReportedModelID` of the one instance the factory returns:
+
+```go
+codex := router.NewOpenAI(apiKey, model)
+r.RegisterProviderFactoryWithModel("codex", func(string) (router.Provider, error) {
+    return codex, nil
+}, codex.ReportedModelID)
+r.SetAccessType("codex", router.AccessAPI)
+```
+
+Without it, the reservation prices the model routing requests until a request
+has built the provider, and counts a `-cli` placeholder as an unpriced model.
 
 ### Untrusted Repositories (`RepoTrust`)
 
