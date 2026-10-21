@@ -9,7 +9,8 @@ Use this checklist before shipping a release.
   pinned toolchain is downloaded on first use.
 - `golangci-lint` **v2.12.2** (the version pinned in `.github/workflows/ci.yml`):
   `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2`
-- `govulncheck`: `go install golang.org/x/vuln/cmd/govulncheck@latest`
+- `govulncheck` **v1.9.0** (the version `.github/workflows/ci.yml` and the Makefile pin):
+  `go install golang.org/x/vuln/cmd/govulncheck@v1.9.0`
 - `bubblewrap` (`bwrap`) for the sandbox tests. On Ubuntu 24.04, if
   `bwrap --unshare-net --ro-bind / / true` fails with
   `loopback: Failed RTM_NEWADDR: Operation not permitted`, AppArmor restricts

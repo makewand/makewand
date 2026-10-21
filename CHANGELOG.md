@@ -69,6 +69,7 @@ All notable changes to this project are documented here. The format is based on
 - 依赖安装：没有锁文件的 npm 加 `--no-package-lock`；含 `pyproject.toml` 或 `setup.py` 的 pip 安装加 `--use-pep517`，egg-info 写到工作树外；有 `Cargo.lock` 时所有 cargo 步骤带 `--locked`，没有时删除 cargo 生成的 `Cargo.lock`；声明了依赖的 Rust 项目先 `cargo fetch`。TUI 在依赖无法下载时跳过测试，不扣分、不自动修复。
 - 安装器只安装一份 `makewand-orchestrator` 技能；仍声明同名的旧 `trio-orchestrator` 副本会保持更新并提示删除。
 - 文档：SECURITY.md 与 README 写明 v3.2.0 之后加入的保护（#75、#80–#85）在 `master` 源码中、随 v3.3.0 发布，v3.2.x 构建（Release 压缩包、Homebrew、Scoop）没有；支持版本表与“v3.1+”的说法相应更正。SECURITY.md 也写明候选的测试与自动修复轮次以 `.makewand/sandbox-home` 为 HOME，会写入其中。
+- CI/发布：Release 的 test 作业改为调用 CI 的 verify 作业（`workflow_call`），未经 CI 的标签也要通过 PR 必须通过的全部检查（gofmt、golangci-lint、shell 语法、契约与 trusted acceptance 等），标签须等于 `v` + `__version__`；govulncheck 固定为 v1.9.0（漏洞库仍实时获取）；网站部署后在同一个 3 分钟期限内核对 makewand.org、www.makewand.org、makewand.com、www.makewand.com 与 makewand.pages.dev 上的 install.sh；`make prelaunch` 改用 Go 的私有用户缓存（原为任何本机用户都能预先写入的 `/tmp/makewand-gocache`），并与 CI 一样运行全部三个离线基准脚本。
 
 ### Fixed
 
