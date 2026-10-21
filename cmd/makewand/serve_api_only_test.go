@@ -452,9 +452,12 @@ func TestServeAPIOnlyListsTheOpenAIModelsItAccepts(t *testing.T) {
 // it.
 func TestServeAPIOnlyConfiguredModelIsMatchedAsRequestedModelsAre(t *testing.T) {
 	const prompt = "explain what a monad is"
-	for _, tc := range []struct{ configured, listed, called, namedCalls string }{
-		{" GPT-4o ", "gpt-4o", "GPT-4o", "gpt-4o"},
-		{" GPT-Fixture-Custom ", "gpt-fixture-custom", "GPT-Fixture-Custom", "GPT-Fixture-Custom"},
+	for _, tc := range []struct {
+		configured, listed, called, namedCalls string
+		priced                                 bool
+	}{
+		{" GPT-4o ", "gpt-4o", "GPT-4o", "gpt-4o", true},
+		{" GPT-Fixture-Custom ", "gpt-fixture-custom", "GPT-Fixture-Custom", "GPT-Fixture-Custom", false},
 	} {
 		t.Run(tc.configured, func(t *testing.T) {
 			h, upstream, usage := apiOnlyServe(t, tc.configured)
@@ -485,6 +488,11 @@ func TestServeAPIOnlyConfiguredModelIsMatchedAsRequestedModelsAre(t *testing.T) 
 			for _, entry := range usage.take() {
 				if entry.CostUSD <= 0 {
 					t.Fatalf("usage %+v is not billed", entry)
+				}
+				// A priced model spelled with capitals is billed at its price,
+				// not at the fallback rate for unknown models.
+				if want := router.EstimateCost(tc.listed, entry.PromptTokens, entry.CompletionTokens); tc.priced && math.Abs(entry.CostUSD-want) > 1e-12 {
+					t.Fatalf("usage %+v cost %.9f, want %s's price %.9f", entry, entry.CostUSD, tc.listed, want)
 				}
 			}
 		})

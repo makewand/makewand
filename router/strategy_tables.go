@@ -574,8 +574,22 @@ func (t *strategyTables) powerEnsembleFor(phase BuildPhase) (powerEnsemble, bool
 func (t *strategyTables) costFor(modelID string) (costEntry, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	e, ok := t.costs[modelID]
-	return e, ok
+	return t.costForLocked(modelID)
+}
+
+// costForLocked looks a model up exactly, then trimmed and lower-cased:
+// providers match model names without regard to case (OPENAI_MODEL="O1"
+// calls o1) and the price table spells them in lower case, so a capital or
+// padding must not bill a known model at the fallback rate.
+func (t *strategyTables) costForLocked(modelID string) (costEntry, bool) {
+	if e, ok := t.costs[modelID]; ok {
+		return e, true
+	}
+	if normalized := strings.ToLower(strings.TrimSpace(modelID)); normalized != modelID {
+		e, ok := t.costs[normalized]
+		return e, ok
+	}
+	return costEntry{}, false
 }
 
 // pricedModels returns every model ID with a pricing entry, in no order.
@@ -741,7 +755,7 @@ func (t *strategyTables) validateLocked() error {
 			if modelID == "" {
 				continue
 			}
-			if _, ok := t.costs[modelID]; !ok {
+			if _, ok := t.costForLocked(modelID); !ok {
 				return fmt.Errorf("modelTable[%s][%d]: model %q not in costTable", prov, tier, modelID)
 			}
 		}
