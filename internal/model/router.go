@@ -273,9 +273,9 @@ func NewRouterWithTrust(cfg *config.Config, trust RepoTrust) (*Router, error) {
 		})
 		if cfg.GetCLI("codex") == nil && cfg.OpenAIAPIKey != "" {
 			// "codex" is never registered in this shape, so it would keep the
-			// zero access type (free), under which spend a call does not report
-			// (a stream's) is not estimated. codex_access describes the CLI and
-			// does not apply to this route.
+			// zero access type (free), and spend a call does not report, such
+			// as a stream's, would go unestimated. codex_access describes the
+			// CLI, not this route.
 			r.SetAccessType("codex", AccessAPI)
 		}
 	}

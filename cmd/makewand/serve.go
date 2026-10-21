@@ -175,7 +175,7 @@ func serveCmd() *cobra.Command {
 			quotaCtx, cancelQuota := context.WithCancel(cmd.Context())
 			defer cancelQuota()
 			rtr.StartQuotaRefresh(quotaCtx)
-			sessions := remotesession.NewStoreWithQuota(filepath.Join(dataDir, "sessions"), sessionQuota)
+			sessions := serveSessionStore(dataDir, sessionQuota)
 			loginLimiter := serverauth.NewLoginRateLimiter(5, 15*time.Minute, 15*time.Minute)
 			loginLimiter.SetTrustedProxies(trustedProxySet)
 			registrationLimiter := serverauth.NewRegistrationRateLimiterWithLimits(registrationLimits)
@@ -581,6 +581,12 @@ func serveSessionQuota(changed func(string) bool, perOwner int, mibPerOwner, min
 		return remotesession.Quota{}, err
 	}
 	return remotesession.Quota{MaxSessionsPerOwner: perOwner, MaxBytesPerOwner: maxBytes, MinFreeBytes: minFree}, nil
+}
+
+// serveSessionStore opens the remote session store under dataDir, enforcing
+// quota.
+func serveSessionStore(dataDir string, quota remotesession.Quota) *remotesession.Store {
+	return remotesession.NewStoreWithQuota(filepath.Join(dataDir, "sessions"), quota)
 }
 
 // describeSessionQuota is the startup line for the session store limits.
