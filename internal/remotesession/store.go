@@ -218,6 +218,7 @@ func (s *Store) SaveForOwner(owner, workspaceID string, data []byte) error {
 			// A session stored before accounting began (or by a store without
 			// per-owner limits) counts at its current size from its next save,
 			// so updating it never counts as a new session.
+			// #nosec G703 -- path comes from sessionPath, which hashes owner and workspace ID into a basename in the operator-configured storage root.
 			if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
 				ledger.Sessions[name] = info.Size()
 			}

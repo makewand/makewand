@@ -146,6 +146,8 @@ type openAIChatLimits struct {
 
 // openAIRefusesMaxTokens is the OpenAI API's 400 body for max_tokens sent to
 // a reasoning model.
+//
+//nolint:gosec // G101: an API error body, not a credential.
 const openAIRefusesMaxTokens = `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}`
 
 // limit reads the output cap as the OpenAI API does: o-series and GPT-5

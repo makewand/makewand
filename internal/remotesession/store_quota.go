@@ -193,6 +193,7 @@ func (s *Store) loadLedger(owner string) (ownerLedger, error) {
 			delete(ledger.Sessions, name)
 			continue
 		}
+		// #nosec G703 -- name passed isSessionFileName (a lowercase sha256 hex basename) and is joined to the operator-configured storage root.
 		info, err := os.Lstat(filepath.Join(s.dir, name))
 		if os.IsNotExist(err) {
 			delete(ledger.Sessions, name)
