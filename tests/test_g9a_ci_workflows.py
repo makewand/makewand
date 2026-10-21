@@ -361,12 +361,14 @@ class DeploySiteWorkflowTests(unittest.TestCase):
             tools = work / "tools"
             tools.mkdir()
             log = work / "requests.log"
-            # `curl -fsSL URL -o FILE`: a stale host serves other bytes.
+            # `curl [options] URL -o FILE`: a stale host serves other bytes.
             (tools / "curl").write_text(
                 "#!/bin/sh\n"
-                f'echo "$2" >> "{log}"\n'
-                'host="${2#https://}"; host="${host%%/*}"\n'
-                f'case " {" ".join(stale)} " in *" $host "*) echo stale > "$4" ;; *) cp site/install.sh "$4" ;; esac\n',
+                'url=; out=\n'
+                'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+                f'echo "$url" >> "{log}"\n'
+                'host="${url#https://}"; host="${host%%/*}"\n'
+                f'case " {" ".join(stale)} " in *" $host "*) echo stale > "$out" ;; *) cp site/install.sh "$out" ;; esac\n',
                 encoding="utf-8")
             (tools / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             for tool in tools.iterdir():
@@ -378,6 +380,8 @@ class DeploySiteWorkflowTests(unittest.TestCase):
         return result, requested
 
     def test_every_served_hostname_is_checked(self):
+        # One stalled host must not outlast the shared deadline: every request is bounded.
+        self.assertIn("--max-time", _step_run(_read(DEPLOY), "Check the served installer"))
         result, requested = self.check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(sorted(requested), sorted(self.HOSTS))

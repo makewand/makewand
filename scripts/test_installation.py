@@ -90,10 +90,12 @@ class InstallationTests(unittest.TestCase):
             # A directory without makewand, not /usr/bin: a host may ship one there.
             empty = root / "empty"
             empty.mkdir()
-            for path in (f"{empty}:{binaries}", f"{binaries}/:{older}", f"~/.local/bin:{empty}"):
+            for path in (f"{empty}:{binaries}", f"{binaries}/:{older}"):
                 with self.subTest(path=path), patch.dict(os.environ, {"HOME": str(home), "PATH": path}):
                     self.assertIsNone(module.path_hint(binaries))
+            # zsh does not expand a literal ~ in PATH, so that entry does not count.
             cases = ((binaries, str(empty), "is not on your PATH", '  export PATH="$HOME/.local/bin:$PATH"'),
+                     (binaries, f"~/.local/bin:{empty}", "is not on your PATH", '  export PATH="$HOME/.local/bin:$PATH"'),
                      (binaries, f"{older}:{binaries}", f"runs {older / 'makewand'}, found before {binaries}",
                       '  export PATH="$HOME/.local/bin:$PATH"'),
                      (odd, str(empty), "is not on your PATH", None))

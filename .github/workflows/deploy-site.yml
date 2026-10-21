@@ -46,7 +46,7 @@ jobs:
           for attempt in $(seq 1 18); do
             stale=""
             for domain in $pending; do
-              if curl -fsSL "https://$domain/install.sh" -o served.sh && cmp -s served.sh site/install.sh; then
+              if curl -fsSL --connect-timeout 5 --max-time 15 "https://$domain/install.sh" -o served.sh && cmp -s served.sh site/install.sh; then
                 echo "$domain serves the current install.sh"
               else
                 stale="$stale $domain"

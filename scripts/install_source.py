@@ -65,9 +65,10 @@ def path_hint(binaries):
     found"; an older makewand earlier on PATH would answer for this one.
     """
     target = os.path.realpath(binaries)
-    # bash expands a leading ~ in PATH entries when it searches; which() does not.
-    entries = [os.path.expanduser(entry) if entry.startswith("~") else entry
-               for entry in os.environ.get("PATH", "").split(os.pathsep)]
+    # A literal ~ in a PATH entry is expanded by bash but not by zsh (or
+    # which()), so such an entry counts as missing: an extra export line is
+    # harmless, a missing one leaves zsh users with "command not found".
+    entries = os.environ.get("PATH", "").split(os.pathsep)
     found = shutil.which("makewand", path=os.pathsep.join(entries))
     try:
         if found and os.path.samefile(found, os.path.join(target, "makewand")):

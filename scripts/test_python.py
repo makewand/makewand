@@ -41,8 +41,8 @@ def pytest_only_tests(module):
         if name.startswith("test") and inspect.isfunction(value):
             found.append(name)
         elif (name.startswith("Test") and inspect.isclass(value)
-              and not issubclass(value, unittest.TestCase) and "__init__" not in vars(value)
-              and any(attr.startswith("test") and callable(member) for attr, member in vars(value).items())):
+              and not issubclass(value, unittest.TestCase) and value.__init__ is object.__init__
+              and any(attr.startswith("test") and callable(getattr(value, attr, None)) for attr in dir(value))):
             found.append(name)
     return found
 

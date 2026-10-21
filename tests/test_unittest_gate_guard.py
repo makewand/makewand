@@ -42,6 +42,14 @@ PYTEST_CLASS = """
         def test_method(self):
             assert True
 """
+PYTEST_INHERITED = """
+    class _Checks:
+        def test_inherited(self):
+            assert True
+
+    class TestInherited(_Checks):
+        pass
+"""
 MIXED = """
     import unittest
 
@@ -93,6 +101,11 @@ class UnittestGateGuardTests(unittest.TestCase):
     def test_discovery_fails_for_a_pytest_style_class(self):
         result = self.run_gate(self.tree(test_plain=PLAIN, test_class=PYTEST_CLASS))
         self.assert_refused(result, "test_class: 1 pytest-style test(s)", "TestThing")
+
+    def test_discovery_fails_for_a_class_that_only_inherits_its_tests(self):
+        # pytest collects test methods a Test* class inherits; vars() alone missed them.
+        result = self.run_gate(self.tree(test_plain=PLAIN, test_inherited=PYTEST_INHERITED))
+        self.assert_refused(result, "test_inherited: 1 pytest-style test(s)", "TestInherited")
 
     def test_named_module_without_unittest_tests_fails(self):
         result = self.run_gate(self.tree(test_functions=PYTEST_FUNCTIONS), "test_functions")
