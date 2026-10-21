@@ -103,13 +103,15 @@ credential providers to cargo's built-in one and uses that private `CARGO_HOME`.
 Without the network tools the
 fetch runs loopback-only, keeping the host caches
 ([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)). A
-source-only distribution the fetch cannot get as a wheel is reported as
+source-only distribution the fetch cannot get as a wheel, and a declared VCS or URL
+dependency the fetch never gets (once the loopback install fails; decided from the
+project's declarations, never from its output), are reported as
 `ErrDependencyNetworkUnavailable`, an environment limitation of fetch-only
 networking rather than a candidate failure; a requirement that does not exist on
 the default index at all (a code-free index fact check during the fetch) and a
 dependency that only surfaces once project code runs in the loopback build (a
-repository-built or dynamically-computed one, or a prefetched build that fails and
-forges pip's output) are attributed to the candidate.
+dynamically-computed one, or a prefetched build that fails and forges pip's
+output) are attributed to the candidate.
 A failed fetch is reported as `ErrDependencyNetworkUnavailable`, an environment
 problem rather than a candidate failure, only when makewand confirms the outage:
 with network, its own connectivity check of the ecosystem's default registry

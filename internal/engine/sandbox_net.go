@@ -257,10 +257,11 @@ type sandboxNetwork struct {
 	// attached; it replaces detail and remedy.
 	attach *userNetFailure
 	// prefetched marks the loopback build/install stage of a split dependency
-	// plan: its declared dependencies were already downloaded by the networked
-	// fetch, so a failure here is the candidate's own (its project code ran) and
-	// is never reclassified as an environment outage from its output, whatever
-	// that output claims (dependencyRegistryError).
+	// plan: its dependencies declared by name were already downloaded by the
+	// networked fetch, so a failure here is the candidate's own (its project
+	// code ran) and is never reclassified as an environment outage from its
+	// output, whatever that output claims (dependencyRegistryError). A declared
+	// VCS or URL dependency is reported before this (execDependencyPlan).
 	prefetched bool
 }
 

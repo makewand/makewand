@@ -460,6 +460,9 @@ func (p *Project) execDependencyPlan(ctx context.Context, env verifyExecEnvironm
 		return fetchResult, fetchNetwork, nil
 	}
 
+	// Read before the build runs project code that could rewrite the
+	// declarations (see below).
+	unfetched := p.pipUnfetchedRemoteTarget(plan)
 	buildResult, _, err := p.execVerificationStep(ctx, env, projectDir, *build, readOnly, false)
 	if err != nil {
 		return buildResult, none, err
@@ -467,11 +470,22 @@ func (p *Project) execDependencyPlan(ctx context.Context, env verifyExecEnvironm
 	// The build runs project code (setup.py, PEP 517 backends, build.rs)
 	// loopback-only, so its output cannot be trusted to classify the failure: a
 	// candidate can forge pip's own "No matching distribution" box. Everything
-	// declared (named requirements, build-system requires, static dependencies)
-	// was fetched into the wheelhouse before the build, which installs with
-	// --no-index, so a build failure is the candidate's own. It is marked
-	// prefetched so RunVerificationPlan never reclassifies it as an environment
-	// outage from the build's output or from the now-stale offlineRegistryNeed.
+	// declared as a named requirement (requirements, build-system requires,
+	// static dependencies) was fetched into the wheelhouse before the build,
+	// which installs with --no-index, so a build failure is the candidate's
+	// own. It is marked prefetched so RunVerificationPlan never reclassifies it
+	// as an environment outage from the build's output or from the now-stale
+	// offlineRegistryNeed.
+	//
+	// The one exception rests on what the project declared before the build,
+	// not on output: a declared VCS or URL dependency was never fetched, so the
+	// offline install cannot obtain it, which the owner's decision makes an
+	// environment limitation of fetch-only networking.
+	if unfetched != "" && buildResult != nil && buildResult.ExitCode != 0 {
+		msg := "the dependency " + unfetched + " is a VCS or URL reference, which makewand never downloads while the network is available (pip may build such a reference to read its metadata, running its code), so the offline install cannot obtain it - depend on a release from a package index, or install the project's dependencies outside makewand"
+		buildResult.Note = msg
+		return buildResult, none, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, msg)
+	}
 	return buildResult, sandboxNetwork{kind: sandboxNetworkNone, prefetched: true}, nil
 }
 
@@ -630,9 +644,11 @@ func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string) (args [
 	add(install.downloadReqs...)
 	for _, dir := range install.projects {
 		add(p.pipBuildSystemRequires(dir)...)
-		for _, dep := range p.pipStaticDependencies(dir) {
-			add(dep.text)
-		}
+		// The declared texts, markers kept: pipStaticDependencies drops a
+		// requirement with a marker, which the offline install still needs
+		// whenever the marker holds.
+		texts, _ := p.pipStaticDependencyTexts(dir)
+		add(texts...)
 	}
 	if len(reqs) == 0 {
 		return nil, false
@@ -730,6 +746,44 @@ func (p *Project) pipProjectAbsent(plan ExecPlan, name string) bool {
 		return false
 	}
 	return pypiProjectExists(normalizePipName(m[1])) == pypiProjectAbsent
+}
+
+// pipUnfetchedRemoteTarget returns the first requirement a pip install plan
+// declares that only a download from a location the project names could
+// provide (pipRemoteReference), with where it is declared: on the command
+// line, in a requirement file, or in the [project] dependencies or the
+// [build-system] requires of an isolated build of a local project it builds.
+// The networked fetch never gets such a reference (pip may build it to read
+// its metadata), so the offline install cannot obtain it. It reads only what
+// the project declares, never output. "" when there is none.
+func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
+	if plan.Command != "pip" && plan.Command != "pip3" {
+		return ""
+	}
+	install, ok := p.parsePipInstall(plan.Args)
+	if !ok {
+		return ""
+	}
+	if len(install.remoteTargets) > 0 {
+		return install.remoteTargets[0]
+	}
+	for _, dir := range install.projects {
+		texts, manifest := p.pipStaticDependencyTexts(dir)
+		for _, text := range texts {
+			if pipRemoteReference(text) {
+				return text + " (dependencies in " + manifest + ")"
+			}
+		}
+		if install.noIsolation {
+			continue // pip installs no build requirements then
+		}
+		for _, text := range p.pipBuildSystemRequires(dir) {
+			if pipRemoteReference(text) {
+				return text + " (build requirement for " + manifest + ")"
+			}
+		}
+	}
+	return ""
 }
 
 // pipMissingDistribution returns the first requirement pip reported it could
@@ -2216,6 +2270,11 @@ type pipInstall struct {
 	// so the fetch and the offline install pick the same versions. A buildable
 	// constraint target is never recorded.
 	constraintPins []string
+	// remoteTargets are the command-line and requirement-file targets only a
+	// download from a location the project names could provide
+	// (pipRemoteReference), each with where it is declared. The networked
+	// fetch never gets them, so the offline install cannot obtain them.
+	remoteTargets []string
 	// customIndex is set when the install points pip at an index other than the
 	// default PyPI (a command-line or requirement-file --index-url/--find-links,
 	// or pip configuration): a nonexistent-project fact check then cannot run.
@@ -2362,6 +2421,8 @@ func (p *Project) addPipArguments(install *pipInstall, args []string, source, di
 		case "-e", "--editable":
 			if !strings.Contains(value, "://") && !pipVCSRe.MatchString(value) {
 				p.addPipLocal(install, value)
+			} else if pipRemoteReference(value) {
+				install.remoteTargets = append(install.remoteTargets, "-e "+value+" ("+source+")")
 			}
 		case "--no-index":
 			install.otherSources = true
@@ -2496,6 +2557,9 @@ func pipRequirementLines(content string) []string {
 // project or archive, or a URL (a download the project names itself, not a
 // registry's).
 func (p *Project) addPipTarget(install *pipInstall, target, source string) {
+	if pipRemoteReference(target) {
+		install.remoteTargets = append(install.remoteTargets, target+" ("+source+")")
+	}
 	switch {
 	case strings.HasPrefix(target, "file:"):
 		p.addPipLocal(install, strings.TrimPrefix(strings.TrimPrefix(target, "file:"), "//"))
@@ -2579,6 +2643,25 @@ func pipNamedRequirementText(text string) (string, bool) {
 	return text, true
 }
 
+// pipRemoteReference reports whether a requirement is one only a download
+// from a location the project names could provide: a VCS reference or a URL,
+// directly or as a name @ url direct reference, other than a local file: one.
+func pipRemoteReference(text string) bool {
+	text = strings.TrimSpace(text)
+	if pipDirectReferenceRe.MatchString(text) {
+		_, text, _ = strings.Cut(text, "@")
+		text = strings.TrimSpace(text)
+	}
+	vcs := pipVCSRe.MatchString(text)
+	if vcs {
+		_, text, _ = strings.Cut(text, "+")
+	}
+	if strings.HasPrefix(strings.ToLower(text), "file:") {
+		return false
+	}
+	return vcs || strings.Contains(text, "://")
+}
+
 // normalizePipName normalizes a Python project name (PEP 503).
 func normalizePipName(name string) string {
 	return strings.ToLower(pipNameSeparatorsRe.ReplaceAllString(name, "-"))
@@ -2624,29 +2707,38 @@ func (p *Project) pipBuildRequirementNeed(install pipInstall, dir string) string
 
 // pipStaticDependencies returns the dependencies the pyproject.toml of the
 // local project in dir declares statically ([project] dependencies that are
-// not dynamic). Those a setup.py computes are unknown.
+// not dynamic) and that certainly apply (no marker). Those a setup.py computes
+// are unknown.
 func (p *Project) pipStaticDependencies(dir string) []pipRequirement {
-	manifest := filepath.Join(dir, "pyproject.toml")
-	content, err := p.ReadFile(manifest)
-	if err != nil {
-		return nil
-	}
-	doc := parseTOML(content)
-	if dynamic, ok := doc.value("project", "dynamic"); ok && slices.Contains(tomlStrings(dynamic), "dependencies") {
-		return nil
-	}
-	value, ok := doc.value("project", "dependencies")
-	if !ok {
-		return nil
-	}
+	texts, manifest := p.pipStaticDependencyTexts(dir)
 	var requirements []pipRequirement
-	for _, text := range tomlStrings(value) {
+	for _, text := range texts {
 		if requirement, ok := parsePipRequirement(text); ok {
 			requirement.source = "dependencies in " + manifest
 			requirements = append(requirements, requirement)
 		}
 	}
 	return requirements
+}
+
+// pipStaticDependencyTexts returns the [project] dependencies the
+// pyproject.toml of the local project in dir declares statically, as written,
+// and the manifest's path.
+func (p *Project) pipStaticDependencyTexts(dir string) ([]string, string) {
+	manifest := filepath.Join(dir, "pyproject.toml")
+	content, err := p.ReadFile(manifest)
+	if err != nil {
+		return nil, manifest
+	}
+	doc := parseTOML(content)
+	if dynamic, ok := doc.value("project", "dynamic"); ok && slices.Contains(tomlStrings(dynamic), "dependencies") {
+		return nil, manifest
+	}
+	value, ok := doc.value("project", "dependencies")
+	if !ok {
+		return nil, manifest
+	}
+	return tomlStrings(value), manifest
 }
 
 // pipInstalledDistributions returns the normalized names of the distributions
