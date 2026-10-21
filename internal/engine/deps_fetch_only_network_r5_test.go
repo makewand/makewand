@@ -348,3 +348,210 @@ exit 1
 		}
 	})
 }
+
+// pipExtrasProject is a pyproject.toml with build requirements, dependencies
+// and optional-dependency groups, two of which reference each other through
+// the project's own name (a cycle).
+const pipExtrasProject = "[build-system]\nrequires = [\"builddep\"]\nbuild-backend = \"backend\"\nbackend-path = [\"_backend\"]\n\n" +
+	"[project]\nname = \"Proj\"\nversion = \"0.1\"\ndependencies = [\"rundep\"]\n\n" +
+	"[project.optional-dependencies]\nDev = [\"devdep\", \"proj[test]\"]\n" +
+	"test = [\"testdep ; python_version >= '3'\", \"proj[dev]\", \"proj\"]\n" +
+	"docs = [\"docdep\"]\n"
+
+// A local project with extras - `.[dev]`, `-e .[dev]` or `./sub[docs]`, on the
+// command line or in a requirements file - hands the networked fetch its build
+// requirements, its dependencies and the optional-dependency groups the extras
+// select, following self-references (once each, so a cycle ends) and never
+// passing the project's own name to the index.
+func TestPipLocalProjectExtrasReachFetch_GEC1021R5(t *testing.T) {
+	selected := []string{"builddep", "rundep", "devdep", "testdep ; python_version >= '3'"}
+	for _, tc := range []struct {
+		name   string
+		files  []string
+		args   []string
+		want   []string
+		forbid []string
+	}{
+		{"-e .[dev] on the command line", []string{"pyproject.toml", pipExtrasProject},
+			[]string{"install", "--user", "-e", ".[dev]"}, selected, []string{"docdep"}},
+		{".[DEV] normalizes the extra", []string{"pyproject.toml", pipExtrasProject},
+			[]string{"install", ".[DEV]"}, selected, []string{"docdep"}},
+		{".[dev] in a requirements file", []string{"pyproject.toml", pipExtrasProject, "requirements.txt", ".[dev]\n"},
+			[]string{"install", "-r", "requirements.txt"}, selected, []string{"docdep"}},
+		{"-e .[dev] in a requirements file", []string{"pyproject.toml", pipExtrasProject, "requirements.txt", "-e .[dev]\n"},
+			[]string{"install", "-r", "requirements.txt"}, selected, []string{"docdep"}},
+		{"./sub[docs] in a requirements file", []string{"sub/pyproject.toml", pipExtrasProject, "requirements.txt", "./sub[docs]\n"},
+			[]string{"install", "-r", "requirements.txt"}, []string{"builddep", "rundep", "docdep"}, []string{"devdep"}},
+		{"no extras selects no group", []string{"pyproject.toml", pipExtrasProject},
+			[]string{"install", "-e", "."}, []string{"builddep", "rundep"}, []string{"devdep", "docdep"}},
+		{"a self-reference's marker is joined to its group's", []string{"pyproject.toml",
+			"[project]\nname = \"proj\"\nversion = \"0\"\n[project.optional-dependencies]\ndev = [\"proj[win] ; sys_platform == 'win32'\"]\nwin = [\"winonly\", \"both ; python_version > '3'\"]\n"},
+			[]string{"install", "-e", ".[dev]"},
+			[]string{"winonly ; sys_platform == 'win32'", "both ; (python_version > '3') and (sys_platform == 'win32')"}, []string{"winonly"}},
+		{"an unconditional reference after a conditional one", []string{"pyproject.toml",
+			"[project]\nname = \"proj\"\nversion = \"0\"\n[project.optional-dependencies]\ndev = [\"proj[win] ; sys_platform == 'win32'\", \"proj[win]\"]\nwin = [\"winonly\"]\n"},
+			[]string{"install", "-e", ".[dev]"}, []string{"winonly ; sys_platform == 'win32'", "winonly"}, nil},
+		{"inline optional-dependencies table", []string{"pyproject.toml",
+			"[project]\nname = \"proj\"\nversion = \"0\"\noptional-dependencies = { dev = [\"devdep\"] }\n"},
+			[]string{"install", "-e", ".[dev]"}, []string{"devdep"}, nil},
+		{"dynamic optional dependencies are unknown", []string{"pyproject.toml",
+			"[project]\nname = \"proj\"\nversion = \"0\"\ndynamic = [\"optional-dependencies\"]\n[project.optional-dependencies]\ndev = [\"devdep\"]\n"},
+			[]string{"install", "-e", ".[dev]"}, []string{"setuptools>=40.8.0"}, []string{"devdep"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := newNeedProject(t, tc.files...)
+			fetch, _, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: tc.args}, project.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			if fetch == nil {
+				t.Fatalf("fetch = nil, want a download of %q", tc.want)
+			}
+			for _, want := range tc.want {
+				if !slices.Contains(fetch.Args, want) {
+					t.Errorf("fetch = %q, want %q", fetch.Args, want)
+				}
+			}
+			for _, forbid := range append(tc.forbid, "proj", "Proj", "proj[test]", "proj[dev]") {
+				if slices.Contains(fetch.Args, forbid) {
+					t.Errorf("fetch = %q must not carry %q", fetch.Args, forbid)
+				}
+			}
+			forbidBuildableFetchTargets(t, fetch)
+		})
+	}
+}
+
+// A VCS or URL requirement in an optional-dependency group the extras select
+// is a declared remote dependency the fetch never gets (an environment verdict
+// when the offline install then fails); an unselected group does not count.
+func TestPipUnfetchedRemoteTargetInExtras_GEC1021R5(t *testing.T) {
+	project := newNeedProject(t, "pyproject.toml",
+		"[project]\nname = \"proj\"\nversion = \"0\"\ndependencies = [\"six\"]\n[project.optional-dependencies]\ndev = [\"proj[vcs]\"]\nvcs = [\"pkg @ git+https://h.example/r.git\"]\n")
+	if got, want := project.pipUnfetchedRemoteTarget(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "-e", ".[dev]"}}),
+		"pkg @ git+https://h.example/r.git (optional dependencies in pyproject.toml)"; got != want {
+		t.Fatalf("pipUnfetchedRemoteTarget = %q, want %q", got, want)
+	}
+	if got := project.pipUnfetchedRemoteTarget(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "-e", "."}}); got != "" {
+		t.Fatalf("pipUnfetchedRemoteTarget without extras = %q, want none", got)
+	}
+}
+
+// pipWheelMaker writes a minimal pure-Python wheel for each name given after
+// the output directory.
+const pipWheelMaker = `import base64, hashlib, os, sys, zipfile
+out = sys.argv[1]
+os.makedirs(out, exist_ok=True)
+for name in sys.argv[2:]:
+    dist = name + "-1.0"
+    files = {
+        name + "/__init__.py": "",
+        dist + ".dist-info/METADATA": "Metadata-Version: 2.1\nName: " + name + "\nVersion: 1.0\n",
+        dist + ".dist-info/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    record = []
+    with zipfile.ZipFile(os.path.join(out, dist + "-py3-none-any.whl"), "w") as z:
+        for path, data in files.items():
+            b = data.encode()
+            z.writestr(path, b)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
+            record.append(path + ",sha256=" + digest + "," + str(len(b)))
+        record.append(dist + ".dist-info/RECORD,,")
+        z.writestr(dist + ".dist-info/RECORD", "\n".join(record) + "\n")
+`
+
+// pipExtrasBackend is an in-tree PEP 517/660 backend for pipExtrasProject: its
+// wheel metadata declares the same dependencies and extras.
+const pipExtrasBackend = `import base64, hashlib, os, zipfile
+DIST = "proj-0.1"
+METADATA = """Metadata-Version: 2.1
+Name: proj
+Version: 0.1
+Requires-Dist: rundep
+Provides-Extra: dev
+Requires-Dist: devdep; extra == "dev"
+Requires-Dist: proj[test]; extra == "dev"
+Provides-Extra: test
+Requires-Dist: testdep; python_version >= "3" and extra == "test"
+Requires-Dist: proj[dev]; extra == "test"
+Provides-Extra: docs
+Requires-Dist: docdep; extra == "docs"
+"""
+WHEEL = "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+
+def _wheel(directory, files):
+    files[DIST + ".dist-info/METADATA"] = METADATA
+    files[DIST + ".dist-info/WHEEL"] = WHEEL
+    name = DIST + "-py3-none-any.whl"
+    record = []
+    with zipfile.ZipFile(os.path.join(directory, name), "w") as z:
+        for path, data in files.items():
+            b = data.encode()
+            z.writestr(path, b)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
+            record.append(path + ",sha256=" + digest + "," + str(len(b)))
+        record.append(DIST + ".dist-info/RECORD,,")
+        z.writestr(DIST + ".dist-info/RECORD", "\n".join(record) + "\n")
+    return name
+
+def get_requires_for_build_wheel(config_settings=None):
+    return []
+
+def get_requires_for_build_editable(config_settings=None):
+    return []
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    return _wheel(wheel_directory, {"proj/__init__.py": ""})
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return _wheel(wheel_directory, {"proj.pth": root + "\n"})
+`
+
+// Live, with this host's python3 and pip: the offline install of `-e .[dev]`
+// succeeds from the wheelhouse the fetch stage fills, because the fetch now
+// carries the project's build requirement, its dependency and both groups the
+// extra selects (dev, and test through the self-referencing cycle). The fetch
+// is pointed at a local directory of wheels instead of an index, so nothing
+// touches the network; the offline install runs exactly as the build stage
+// does, in a throwaway virtualenv.
+func TestPipEditableExtrasInstallOffline_GEC1021R5(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live pip test")
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3 on PATH")
+	}
+	work := t.TempDir()
+	env := []string{"PATH=" + filepath.Join(work, "venv", "bin") + ":/usr/bin:/bin", "HOME=" + filepath.Join(work, "home"),
+		"PIP_CONFIG_FILE=/dev/null", "PIP_DISABLE_PIP_VERSION_CHECK=1", "PIP_NO_INPUT=1", "PIP_NO_CACHE_DIR=1", "PYTHONNOUSERSITE=1"}
+	run := func(dir, name string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(name, args...)
+		cmd.Dir, cmd.Env = dir, env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, out)
+		}
+	}
+	if out, err := exec.Command(python, "-m", "venv", filepath.Join(work, "venv")).CombinedOutput(); err != nil {
+		t.Skipf("python3 cannot create a virtualenv: %v\n%s", err, out)
+	}
+	index := filepath.Join(work, "index")
+	run(work, filepath.Join(work, "venv", "bin", "python"), "-I", "-c", pipWheelMaker, index, "builddep", "rundep", "devdep", "testdep", "docdep")
+
+	project := newNeedProject(t, "pyproject.toml", pipExtrasProject, "_backend/backend.py", pipExtrasBackend, "proj/__init__.py", "")
+	fetch, build, cleanup, err := project.planDependencyStages(ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "-e", ".[dev]"}}, project.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if fetch == nil {
+		t.Fatal("fetch = nil: the networked download receives nothing for the local project with extras")
+	}
+	pip := filepath.Join(work, "venv", "bin", "pip")
+	run(project.Path, pip, append(slices.Clone(fetch.Args), "--no-index", "--find-links", index)...)
+	run(project.Path, pip, build.Args...)
+	run(work, filepath.Join(work, "venv", "bin", "python"), "-I", "-c", "import proj, rundep, devdep, testdep")
+}

@@ -632,9 +632,10 @@ func (p *Project) pipDependencyStages(plan ExecPlan, projectDir string) (fetch, 
 // wheels only (--only-binary=:all:) into the wheelhouse. It passes only the
 // named index requirements the install resolves - those from the command line
 // and from the requirement files makewand can read, and, for each local project
-// the install builds, its build-system requires and its statically declared
-// dependencies (what a setup.py computes at build time cannot be known without
-// running it). It never passes a requirement file (-r) or constraint file (-c),
+// the install builds, its build-system requires, its statically declared
+// dependencies and the optional-dependency groups its extras select (what a
+// setup.py computes at build time cannot be known without running it). It
+// never passes a requirement file (-r) or constraint file (-c),
 // nor any buildable target (a local project, an sdist, a VCS reference, a URL,
 // or a name @ url direct reference): pip builds such a target to read its
 // metadata even under --only-binary=:all: (confirmed on pip 24 and 26), which
@@ -651,13 +652,15 @@ func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string) (args [
 		}
 	}
 	add(install.downloadReqs...)
-	for _, dir := range install.projects {
-		add(p.pipBuildSystemRequires(dir)...)
+	for _, project := range install.projects {
+		add(p.pipBuildSystemRequires(project.dir)...)
 		// The declared texts, markers kept: pipStaticDependencies drops a
 		// requirement with a marker, which the offline install still needs
 		// whenever the marker holds.
-		texts, _ := p.pipStaticDependencyTexts(dir)
+		texts, _ := p.pipStaticDependencyTexts(project.dir)
 		add(texts...)
+		optional, _ := p.pipOptionalDependencyTexts(project)
+		add(optional...)
 	}
 	if len(reqs) == 0 {
 		return nil, false
@@ -760,8 +763,9 @@ func (p *Project) pipProjectAbsent(plan ExecPlan, name string) bool {
 // pipUnfetchedRemoteTarget returns the first requirement a pip install plan
 // declares that only a download from a location the project names could
 // provide (pipRemoteReference), with where it is declared: on the command
-// line, in a requirement file, or in the [project] dependencies or the
-// [build-system] requires of an isolated build of a local project it builds.
+// line, in a requirement file, or in the [project] dependencies, the
+// optional-dependency groups its extras select or the [build-system] requires
+// of an isolated build of a local project it builds.
 // The networked fetch never gets such a reference (pip may build it to read
 // its metadata), so the offline install cannot obtain it. It reads only what
 // the project declares, never output. "" when there is none.
@@ -776,17 +780,23 @@ func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
 	if len(install.remoteTargets) > 0 {
 		return install.remoteTargets[0]
 	}
-	for _, dir := range install.projects {
-		texts, manifest := p.pipStaticDependencyTexts(dir)
+	for _, project := range install.projects {
+		texts, manifest := p.pipStaticDependencyTexts(project.dir)
 		for _, text := range texts {
 			if pipRemoteReference(text) {
 				return text + " (dependencies in " + manifest + ")"
 			}
 		}
+		optional, _ := p.pipOptionalDependencyTexts(project)
+		for _, text := range optional {
+			if pipRemoteReference(text) {
+				return text + " (optional dependencies in " + manifest + ")"
+			}
+		}
 		if install.noIsolation {
 			continue // pip installs no build requirements then
 		}
-		for _, text := range p.pipBuildSystemRequires(dir) {
+		for _, text := range p.pipBuildSystemRequires(project.dir) {
 			if pipRemoteReference(text) {
 				return text + " (build requirement for " + manifest + ")"
 			}
@@ -2297,8 +2307,8 @@ type pipInstall struct {
 	// default PyPI (a command-line or requirement-file --index-url/--find-links,
 	// or pip configuration): a nonexistent-project fact check then cannot run.
 	customIndex bool
-	// projects are the local project directories it builds (project-relative).
-	projects []string
+	// projects are the local projects it builds.
+	projects []pipLocalProject
 	// localCode is set when it builds a local project or source archive, or
 	// reads requirements makewand cannot see: project code may run then.
 	localCode bool
@@ -2316,6 +2326,14 @@ type pipInstall struct {
 // requirement as written, and where it is declared.
 type pipRequirement struct {
 	name, text, source string
+}
+
+// pipLocalProject is a local project directory a pip install builds
+// (project-relative) and the extras it selects, normalized: `.[dev]`,
+// `-e ./sub[a,b]`.
+type pipLocalProject struct {
+	dir    string
+	extras []string
 }
 
 // pipOptionsWithValue are the pip install options that take a value.
@@ -2377,14 +2395,16 @@ func (p *Project) pipRegistryNeed(plan ExecPlan, evidence string) string {
 	case install.otherSources || p.pipConfigMayAvoidIndex():
 		return ""
 	}
-	for _, dir := range install.projects {
-		if need := p.pipBuildRequirementNeed(install, dir); need != "" {
+	for _, project := range install.projects {
+		if need := p.pipBuildRequirementNeed(install, project.dir); need != "" {
 			return need
 		}
 	}
 	requirements := install.requirements
-	for _, dir := range install.projects {
-		requirements = append(requirements, p.pipStaticDependencies(dir)...)
+	for _, project := range install.projects {
+		requirements = append(requirements, p.pipStaticDependencies(project.dir)...)
+		optional, manifest := p.pipOptionalDependencyTexts(project)
+		requirements = append(requirements, pipRequirementsOf(optional, "optional dependencies in "+manifest)...)
 	}
 	if len(requirements) == 0 {
 		return ""
@@ -2602,13 +2622,15 @@ func (p *Project) addPipTarget(install *pipInstall, target, source string) {
 	}
 }
 
-// addPipLocal adds a local project directory or archive. A wheel runs no code
-// when it is installed; anything else does.
+// addPipLocal adds a local project directory or archive, with the extras a
+// trailing [...] selects (`.[dev]`, `./sub[a,b]`, as pip strips them). A wheel
+// runs no code when it is installed; anything else does.
 func (p *Project) addPipLocal(install *pipInstall, path string) {
 	if strings.HasSuffix(strings.ToLower(path), ".whl") {
 		return
 	}
 	install.localCode = true
+	path, extras := splitPipExtras(path)
 	path = filepath.Clean(path)
 	if path != "." {
 		full, err := p.validatePath(path, false)
@@ -2619,7 +2641,36 @@ func (p *Project) addPipLocal(install *pipInstall, path string) {
 			return
 		}
 	}
-	install.projects = append(install.projects, path)
+	install.projects = append(install.projects, pipLocalProject{dir: path, extras: extras})
+}
+
+var (
+	// pipExtrasSuffixRe matches the extras suffix pip's _strip_extras splits
+	// off a local project path.
+	pipExtrasSuffixRe = regexp.MustCompile(`^(.+)\[([^\]]+)\]$`)
+	// pipExtraNameRe matches an extra's name (PEP 508).
+	pipExtraNameRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`)
+)
+
+// splitPipExtras splits a local project path into the path and its extras,
+// normalized (PEP 685).
+func splitPipExtras(path string) (string, []string) {
+	m := pipExtrasSuffixRe.FindStringSubmatch(path)
+	if m == nil {
+		return path, nil
+	}
+	return m[1], pipExtraNames(m[2])
+}
+
+// pipExtraNames returns the valid extras of a comma-separated list, normalized.
+func pipExtraNames(list string) []string {
+	var extras []string
+	for _, extra := range strings.Split(list, ",") {
+		if extra = strings.TrimSpace(extra); pipExtraNameRe.MatchString(extra) {
+			extras = append(extras, normalizePipName(extra))
+		}
+	}
+	return extras
 }
 
 // parsePipRequirement parses a requirement that pip resolves from the index.
@@ -2729,10 +2780,16 @@ func (p *Project) pipBuildRequirementNeed(install pipInstall, dir string) string
 // are unknown.
 func (p *Project) pipStaticDependencies(dir string) []pipRequirement {
 	texts, manifest := p.pipStaticDependencyTexts(dir)
+	return pipRequirementsOf(texts, "dependencies in "+manifest)
+}
+
+// pipRequirementsOf parses the requirements among texts that certainly apply
+// (parsePipRequirement), declared in source.
+func pipRequirementsOf(texts []string, source string) []pipRequirement {
 	var requirements []pipRequirement
 	for _, text := range texts {
 		if requirement, ok := parsePipRequirement(text); ok {
-			requirement.source = "dependencies in " + manifest
+			requirement.source = source
 			requirements = append(requirements, requirement)
 		}
 	}
@@ -2757,6 +2814,98 @@ func (p *Project) pipStaticDependencyTexts(dir string) ([]string, string) {
 		return nil, manifest
 	}
 	return tomlStrings(value), manifest
+}
+
+// pipOptionalDependencyTexts returns the [project.optional-dependencies]
+// requirements the extras of a local project select in its pyproject.toml, as
+// written, and the manifest's path. A self-reference - the project's own name
+// with extras, such as "proj[test]" - is the local project, not an index
+// requirement: it is never returned, the groups it names are, and its
+// environment marker is joined to theirs. Each group is expanded once (twice
+// when an unconditional reference follows a conditional one), which also
+// stops a cycle of self-references. Dynamic optional dependencies, or those a
+// setup.py computes, are unknown.
+func (p *Project) pipOptionalDependencyTexts(project pipLocalProject) ([]string, string) {
+	manifest := filepath.Join(project.dir, "pyproject.toml")
+	if len(project.extras) == 0 {
+		return nil, manifest
+	}
+	content, err := p.ReadFile(manifest)
+	if err != nil {
+		return nil, manifest
+	}
+	doc := parseTOML(content)
+	if dynamic, ok := doc.value("project", "dynamic"); ok && slices.Contains(tomlStrings(dynamic), "optional-dependencies") {
+		return nil, manifest
+	}
+	groups := map[string][]string{}
+	for _, entry := range doc.entries {
+		key := entry.key
+		if table := tomlKey(entry.table); table != "" {
+			key = table + "." + key
+		}
+		if group, ok := strings.CutPrefix(key, "project.optional-dependencies."); ok {
+			groups[normalizePipName(group)] = tomlStrings(entry.value)
+		} else if key == "project.optional-dependencies" {
+			for group, value := range tomlInlineTable(entry.value) {
+				groups[normalizePipName(group)] = tomlStrings(value)
+			}
+		}
+	}
+	self := ""
+	if name, ok := doc.value("project", "name"); ok {
+		self = normalizePipName(firstTOMLString(name))
+	}
+
+	type visit struct{ group, marker string }
+	var queue []visit
+	for _, extra := range project.extras {
+		queue = append(queue, visit{group: extra})
+	}
+	expanded := map[string]bool{} // group -> expanded unconditionally
+	seen := map[string]bool{}
+	var texts []string
+	for len(queue) > 0 {
+		v := queue[0]
+		queue = queue[1:]
+		if unconditional, done := expanded[v.group]; done && (unconditional || v.marker != "") {
+			continue
+		}
+		expanded[v.group] = v.marker == ""
+		for _, text := range groups[v.group] {
+			text = strings.Join(strings.Fields(text), " ")
+			head, marker, _ := strings.Cut(text, ";")
+			if m := pipRequirementRe.FindStringSubmatch(strings.TrimSpace(head)); m != nil && self != "" && normalizePipName(m[1]) == self {
+				if rest := strings.TrimSpace(m[2]); strings.HasPrefix(rest, "[") {
+					if end := strings.IndexByte(rest, ']'); end > 0 {
+						for _, extra := range pipExtraNames(rest[1:end]) {
+							queue = append(queue, visit{group: extra, marker: pipAndMarkers(v.marker, strings.TrimSpace(marker))})
+						}
+					}
+				}
+				continue
+			}
+			if v.marker != "" {
+				text = strings.TrimSpace(head) + " ; " + pipAndMarkers(strings.TrimSpace(marker), v.marker)
+			}
+			if !seen[text] {
+				seen[text] = true
+				texts = append(texts, text)
+			}
+		}
+	}
+	return texts, manifest
+}
+
+// pipAndMarkers joins two environment markers with "and" ("" is always true).
+func pipAndMarkers(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	}
+	return "(" + a + ") and (" + b + ")"
 }
 
 // pipInstalledDistributions returns the normalized names of the distributions
