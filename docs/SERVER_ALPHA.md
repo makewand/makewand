@@ -109,14 +109,27 @@ and billed at that model's price, even when `routing.json` sets `models` for
 request gets a 400, because its spend could not be budgeted. `codex` calls
 `OPENAI_MODEL`, and `openai` names the provider. Names the server cannot serve
 get the same 400 error, streamed or not. With a codex CLI installed, these
-names keep selecting the codex CLI, which runs its own model.
+names keep selecting the codex CLI, which runs its own model. A token's
+allowed modes do not limit which priced model its client names, so bound
+spend with the token's cost budgets.
+
+makewand calls OpenAI's Chat Completions API. Reasoning models (`o1*`, `o3*`,
+`o4*`, `gpt-5*`, `codex-mini*`) get their output cap as
+`max_completion_tokens`, which they require and which also counts their hidden
+reasoning tokens; other models get `max_tokens`, which OpenAI-compatible
+endpoints accept. Models OpenAI offers only through the Responses API, such as
+`codex-mini-latest`, fail upstream even when priced. Streamed replies are
+billed from an estimate of the text they deliver, which leaves out a reasoning
+model's hidden reasoning tokens; non-streamed replies are billed at the usage
+OpenAI reports.
 
 A named model's upstream errors stay with that model. A 429 (OpenAI rate-limits
 each model separately) or repeated 404s (a model the account or an
 OpenAI-compatible endpoint lacks) block or open the circuit for that model
 only, so requests without a model, for `openai` and for other models are still
-served. Named models are also refused while the `openai` route itself is
-blocked or its circuit is open.
+served. The 503 the blocked model's requests get names it as `openai:<model>`.
+Named models are also refused while the `openai` route itself is blocked or
+its circuit is open.
 
 `GET /v1/models` lists `openai` and every OpenAI model a client can name: the
 priced OpenAI-family models, and `OPENAI_MODEL` when it is one. An
@@ -138,8 +151,12 @@ default:
 | Bytes per account | 256 MiB | `--session-mib-per-owner` / `MAKEWAND_SERVER_SESSION_MIB_PER_OWNER` | 413 |
 | Free space on the sessions disk | 1024 MiB | `--session-min-free-mib` / `MAKEWAND_SERVER_SESSION_MIN_FREE_MIB` | 507 |
 
-`0` removes a limit. A refusal writes nothing and explains itself; remote
-clients show the message. Replacing a session counts only its size
+`0` removes a limit. Without the session limit, the byte limit does not bound
+how many sessions an account keeps: empty sessions add no bytes but each is a
+file, so keep the session limit where accounts are not trusted. A refusal
+writes nothing and explains itself; remote clients show the message. A 507
+does not tell the client how much space the disk has; the audit log records
+the floor and the free space. Replacing a session counts only its size
 difference, and a save that adds neither a session nor bytes is always
 allowed, so an account over a lowered limit can still update or shrink its
 sessions. The free-space floor counts the whole payload, because a
@@ -149,9 +166,10 @@ remains capped at 4 MiB.
 
 Each account's usage is kept in `quota-<hash>.json` beside the sessions and
 reconciled with the session files on every save, so sessions removed by hand
-stop counting. Sessions saved before the limits existed count from their next
-save. Every process that shares a sessions directory should use the same
-limits.
+stop counting. An account's saves are serialized through its own
+`.quota-<hash>.lock`, so one account's slow saves never hold up another's.
+Sessions saved before the limits existed count from their next save. Every
+process that shares a sessions directory should use the same limits.
 
 ### Remote Session Recovery
 

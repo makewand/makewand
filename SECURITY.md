@@ -135,8 +135,9 @@ records every unmeasured cost with `cost_estimated=1`; an estimate never exceeds
 the call's `max_tokens` unless the text provably does, and a reply that reports
 only part of its usage keeps its reported cost. With
 `MAKEWAND_SCALED_BUDGET_RESERVATION=1` each request reserves at the highest price
-of any registered API model and a stream is stopped once a lower bound of its
-streamed tokens passes what the reservation covers, so a reply within
+of any API model routing can call, including a route built on demand such as an
+API-key-only deployment's `codex` route, and a stream is stopped once a lower
+bound of its streamed tokens passes what the reservation covers, so a reply within
 `max_tokens` is not cut, apart from a few pathological ones (long runs of one
 letter or emoji, `../` repeated on cl100k). The bound is calibrated on eleven
 published vocabularies (o200k_base, cl100k_base, Llama 3.1, Qwen 2.5/3,
@@ -146,21 +147,27 @@ reservation before the cut, in real tokens: ordinary words and emoji close to 1�
 CJK text about 4×, floods of one repeated character more (on GPT-4o: digits
 about 3×, `●` 16×, `▍` about 32×, rare Unicode whitespace up to about 96×; other
 vocabularies higher); alternating whitespace such as `" \n"` is never cut.
-`makewand serve` 按 provider 实际调用的模型为流式 API 调用计价，没有价目的 API 模型按每百万 token $3/$15 的保守价计费，所有未测得的费用记为 `cost_estimated=1`；估算不超过该次调用的 `max_tokens`，除非文本可证明更长；只报告部分 usage 的回复保留其报告的费用。设置 `MAKEWAND_SCALED_BUDGET_RESERVATION=1` 时，每个请求按任一已注册 API 模型的最高价预留，流式输出的 token 下界超过预留覆盖量时即停止，所以 `max_tokens` 之内的回复不会被截断，少数异常回复除外（同一字母或 emoji 的长串、cl100k 上重复的 `../`）。该下界按 11 个公开词表（o200k_base、cl100k_base、Llama 3.1、Qwen 2.5/3、DeepSeek-V3、Gemma 2/3、Mistral Nemo、GLM-4.5、Grok-1）校准，未覆盖当前的 Claude 词表。因此忽略 `max_tokens` 的上游在被截断前可能超出预留，按真实 token 计：普通单词与 emoji 接近 1 倍，CJK 文本约 4 倍，单个重复字符的洪流更多（GPT-4o 上数字约 3 倍、`●` 16 倍、`▍` 约 32 倍、少见的 Unicode 空白最多约 96 倍；其他词表更高）；交替的空白（如 `" \n"`）永远不会被截断。
+`makewand serve` 按 provider 实际调用的模型为流式 API 调用计价，没有价目的 API 模型按每百万 token $3/$15 的保守价计费，所有未测得的费用记为 `cost_estimated=1`；估算不超过该次调用的 `max_tokens`，除非文本可证明更长；只报告部分 usage 的回复保留其报告的费用。设置 `MAKEWAND_SCALED_BUDGET_RESERVATION=1` 时，每个请求按路由可调用的任一 API 模型（包括按需构建的路线，如只配 API key 部署的 `codex` 路线）的最高价预留，流式输出的 token 下界超过预留覆盖量时即停止，所以 `max_tokens` 之内的回复不会被截断，少数异常回复除外（同一字母或 emoji 的长串、cl100k 上重复的 `../`）。该下界按 11 个公开词表（o200k_base、cl100k_base、Llama 3.1、Qwen 2.5/3、DeepSeek-V3、Gemma 2/3、Mistral Nemo、GLM-4.5、Grok-1）校准，未覆盖当前的 Claude 词表。因此忽略 `max_tokens` 的上游在被截断前可能超出预留，按真实 token 计：普通单词与 emoji 接近 1 倍，CJK 文本约 4 倍，单个重复字符的洪流更多（GPT-4o 上数字约 3 倍、`●` 16 倍、`▍` 约 32 倍、少见的 Unicode 空白最多约 96 倍；其他词表更高）；交替的空白（如 `" \n"`）永远不会被截断。
 
 Without a codex CLI, Power mode's `codex` route is the OpenAI API: it calls the
 configured `OPENAI_MODEL` and is billed and budgeted as API spend, never as a
 free `codex-cli` call. A client-named OpenAI model (`gpt-*`, `o1*`, `o3*`,
 `o4*`, `codex-mini*`) is served only when it has a price or is the configured
 model, and a scaled reservation covers its price, so a client cannot choose a
-model whose spend the budgets cannot price. Its upstream errors block or open
-the circuit of that model only, never the shared `openai` route, so a client's
-choice of model cannot take the route down for other clients. Remote session
-storage is capped per account (1,000 sessions and 256 MiB by default) and
-refuses saves that would leave less than 1 GiB free on the sessions disk, which
-holds the state database by default, so one account cannot fill the disk and
-take the server down for everyone.
-没有 codex CLI 时，Power 模式的 `codex` 路线就是 OpenAI API：调用配置的 `OPENAI_MODEL`，按 API 花费计费并计入预算，不再记为免费的 `codex-cli` 调用。客户端指名的 OpenAI 模型（`gpt-*`、`o1*`、`o3*`、`o4*`、`codex-mini*`）只有在有价目或就是配置的模型时才提供，按比例放大的预留也覆盖它的价格，所以客户端无法选用预算无法计价的模型。其上游错误只阻断或熔断该模型自己，不影响共享的 `openai` 路线，所以客户端选用的模型无法让其他客户端的请求失败。远端会话存储按账号限额（默认 1,000 个会话、256 MiB），并拒绝会让会话所在磁盘（默认也存放状态数据库）剩余空间低于 1 GiB 的保存，单个账号无法写满磁盘、拖垮整个服务。
+model whose spend the budgets cannot price. A token's allowed modes do not
+narrow that choice; its cost budgets bound it. A stream is billed from an
+estimate of the text it delivers, which leaves out the hidden reasoning tokens
+of OpenAI's reasoning models (o-series, GPT-5), so a streamed request to one
+of them can be billed below OpenAI's charge, by at most the price of the call's
+output cap. Its upstream errors block or open the circuit of that model only,
+never the shared `openai` route, so a client's choice of model cannot take the
+route down for other clients. Remote session storage is capped per account
+(1,000 sessions and 256 MiB by default) and refuses saves that would leave less
+than 1 GiB free on the sessions disk, which holds the state database by
+default, so one account cannot fill the disk and take the server down for
+everyone; with the session cap removed, the byte cap alone does not bound the
+number of empty sessions.
+没有 codex CLI 时，Power 模式的 `codex` 路线就是 OpenAI API：调用配置的 `OPENAI_MODEL`，按 API 花费计费并计入预算，不再记为免费的 `codex-cli` 调用。客户端指名的 OpenAI 模型（`gpt-*`、`o1*`、`o3*`、`o4*`、`codex-mini*`）只有在有价目或就是配置的模型时才提供，按比例放大的预留也覆盖它的价格，所以客户端无法选用预算无法计价的模型。令牌允许的模式不限制这种选择，由令牌的费用预算约束。流式请求按其输出文本的估算计费，不含 OpenAI 推理模型（o 系列、GPT-5）隐藏的推理 token，所以对这些模型的流式请求可能低于 OpenAI 的实际收费，差额不超过该次调用输出上限的价格。其上游错误只阻断或熔断该模型自己，不影响共享的 `openai` 路线，所以客户端选用的模型无法让其他客户端的请求失败。远端会话存储按账号限额（默认 1,000 个会话、256 MiB），并拒绝会让会话所在磁盘（默认也存放状态数据库）剩余空间低于 1 GiB 的保存，单个账号无法写满磁盘、拖垮整个服务；去掉会话数上限后，仅靠字节上限无法限制空会话的数量。
 
 Python candidate application uses fixed POSIX directory handles or native Windows
 handles for replacement and recovery. Native Windows execution requires explicit

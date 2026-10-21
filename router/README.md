@@ -114,14 +114,26 @@ must be the provider's configured model or have a price in the routing tables
 (`costs`, which `routing.json` can extend). Otherwise the request gets a 400,
 because its spend could not be budgeted. Resolution uses the server's
 providers, not a token's allowlist, so such a token needs the `openai`
-provider. A `model` that nothing on the server serves gets the same 400
-`unknown model` error whether or not the request streams.
+provider. A token's allowed modes do not limit which priced model a client
+names; its cost budgets do. A `model` that nothing on the server serves gets
+the same 400 `unknown model` error whether or not the request streams.
+
+`NewOpenAI` calls Chat Completions. It caps the output of OpenAI's reasoning
+models (`o1*`, `o3*`, `o4*`, `gpt-5*`, `codex-mini*`) with
+`max_completion_tokens`, which they require and which also counts their hidden
+reasoning tokens, and every other model's with `max_tokens`, the field
+OpenAI-compatible endpoints accept. A model OpenAI serves only through the
+Responses API, such as `codex-mini-latest`, fails upstream even when priced. A
+stream's usage is estimated from the text it delivers, so the estimate leaves
+out a reasoning model's hidden reasoning tokens; a non-streamed reply reports
+the usage OpenAI bills.
 
 Each named model keeps its own provider health under `openai:<model>`. Its
 upstream errors, such as a 429 or a 404 for a model the account or endpoint
 lacks, open that model's circuit or rate-limit block only, and `openai` keeps
-serving every other request. A named model is still refused while the `openai`
-route itself is blocked or its circuit is open. `GET /v1/models` lists the
+serving every other request; the 503 the model's requests then get names
+`openai:<model>`. A named model is still refused while the `openai` route
+itself is blocked or its circuit is open. `GET /v1/models` lists the
 models a client can name with `owned_by: "openai"`: every priced OpenAI-family
 model, and the configured model when it is one. A configured model outside
 these families, such as an OpenAI-compatible endpoint's own, is reached as
