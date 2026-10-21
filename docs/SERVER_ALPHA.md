@@ -96,6 +96,51 @@ calls hold their slot until terminal completion or cancellation. Independent
 server processes have separate provider slots; persistent currency reservations
 still coordinate their monetary admission through SQLite.
 
+### Model Names in API-Key-Only Deployments
+
+Without a codex CLI, such as in the Docker image with only `OPENAI_API_KEY`,
+Power mode's `codex` generator and judge call the configured OpenAI model
+(`OPENAI_MODEL`, default `gpt-4o`) and are billed as API calls at that model's
+price. Clients can name OpenAI models as they would on the OpenAI API:
+`gpt-*`, `o1*`, `o3*`, `o4*` and `codex-mini*` names are sent upstream as named
+and billed at that model's price. A named model must have a price in the
+routing tables (the built-in `costs` or `costs` in `routing.json`) or be
+`OPENAI_MODEL`. Otherwise the request gets a 400, because its spend could not
+be budgeted. `codex` calls `OPENAI_MODEL`, and `openai` names the provider.
+`GET /v1/models` lists `openai` and every OpenAI model a client can name. Names
+the server cannot serve get the same 400 error, streamed or not. With a codex
+CLI installed, these names keep selecting the codex CLI, which runs its own
+model.
+
+### Remote Session Storage Limits
+
+`PUT /v1/sessions/<id>` is limited per account, the user, organization and
+project identity of the token that also namespaces its sessions; tokens
+without an identity, such as `--token`, share one account. By default an account stores at most
+1,000 sessions and 256 MiB, and no save may leave less than 1 GiB free on the
+sessions disk, which holds `state.db` by default:
+
+| Limit | Default | Flag / environment | Refusal |
+|---|---|---|---|
+| Sessions per account | 1000 | `--sessions-per-owner` / `MAKEWAND_SERVER_SESSIONS_PER_OWNER` | 429 |
+| Bytes per account | 256 MiB | `--session-mib-per-owner` / `MAKEWAND_SERVER_SESSION_MIB_PER_OWNER` | 413 |
+| Free space on the sessions disk | 1024 MiB | `--session-min-free-mib` / `MAKEWAND_SERVER_SESSION_MIN_FREE_MIB` | 507 |
+
+`0` removes a limit. A refusal writes nothing and explains itself; remote
+clients show the message. Replacing a session counts only its size
+difference, and a save that adds neither a session nor bytes is always
+allowed, so an account over a lowered limit can still update or shrink its
+sessions. The free-space floor counts the whole payload, because a
+replacement is written before the old file is removed. It is not enforced on
+platforms other than Linux, macOS, FreeBSD and Windows. A single request body
+remains capped at 4 MiB.
+
+Each account's usage is kept in `quota-<hash>.json` beside the sessions and
+reconciled with the session files on every save, so sessions removed by hand
+stop counting. Sessions saved before the limits existed count from their next
+save. Every process that shares a sessions directory should use the same
+limits.
+
 ### Remote Session Recovery
 
 Session saves replace complete private files atomically. Cooperating writers hold
@@ -270,6 +315,9 @@ makewand serve \
   --registration-global-limit 30      # Sign-ups from all clients per window; 0 disables the global cap
   --registration-window 1h            # Window for both registration limits
   --registration-concurrency 2        # Shared login/registration password hashes
+  --sessions-per-owner 1000           # Remote sessions per account; 0 removes the limit
+  --session-mib-per-owner 256         # MiB of remote sessions per account; 0 removes the limit
+  --session-min-free-mib 1024         # Refuse session saves below this much free disk; 0 disables
   --state-db path/to/state.db         # SQLite state DB (users, tokens, usage)
   --data-dir path/to/dir              # Session/state directory (default ~/.config/makewand/server)
   --audit-log path/to/audit.jsonl     # JSONL audit log path
@@ -291,6 +339,9 @@ Flags take precedence over these variables.
 | `MAKEWAND_SERVER_USAGE_LOG` | no `--usage-log` | `1`/`true` writes `<data-dir>/usage.jsonl`; `0`/`false`/`off`/`disabled` turns the JSONL ledger off; any other value is a path. Unset: off when the state DB is enabled, otherwise `<data-dir>/usage.jsonl` |
 | `MAKEWAND_SERVER_ALERT_WEBHOOK` | no `--alert-webhook` | URL that receives budget alert webhooks |
 | `MAKEWAND_SERVER_ALERT_STATE` | no `--alert-state` | Path of the alert delivery state. Default `<data-dir>/alert_state.json` |
+| `MAKEWAND_SERVER_SESSIONS_PER_OWNER` | no `--sessions-per-owner` | Remote sessions each account may store. Default `1000`; `0` removes the limit |
+| `MAKEWAND_SERVER_SESSION_MIB_PER_OWNER` | no `--session-mib-per-owner` | MiB of remote sessions each account may store. Default `256`; `0` removes the limit |
+| `MAKEWAND_SERVER_SESSION_MIN_FREE_MIB` | no `--session-min-free-mib` | Refuse session saves that would leave less free space (MiB) on the sessions disk. Default `1024`; `0` disables |
 | `MAKEWAND_API_POLICY` | always | `allow_paid` lets the server use provider API keys (billed); anything else, including the default `subscription_only`, ignores them. Required for API-key-only hosts such as the Docker image |
 | `MAKEWAND_CONFIG_DIR` | always | makewand config directory (default `~/.config/makewand`); `--data-dir` defaults to `<config dir>/server` |
 

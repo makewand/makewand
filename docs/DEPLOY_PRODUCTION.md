@@ -79,6 +79,14 @@ MAKEWAND_SERVER_AUDIT_LOG=1
 Without `allow_paid`, `serve` stops with `no usable AI models: provider API keys
 are set, but api_policy is "subscription_only" ...`.
 
+With only `OPENAI_API_KEY`, clients can send OpenAI model names such as
+`gpt-4o` or `o1`; each one is called as named and billed at its price, and
+`GET /v1/models` lists them. Power mode calls `OPENAI_MODEL` (default `gpt-4o`).
+See [Model Names in API-Key-Only Deployments](SERVER_ALPHA.md#model-names-in-api-key-only-deployments).
+Remote session storage is limited per account and keeps 1 GiB free on the data
+volume by default; see
+[Remote Session Storage Limits](SERVER_ALPHA.md#remote-session-storage-limits).
+
 ## Backup and Restore
 
 Use `makewand state backup`, which snapshots the live `state.db` with

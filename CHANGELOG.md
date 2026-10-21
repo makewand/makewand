@@ -41,6 +41,12 @@ All notable changes to this project are documented here. The format is based on
 - **应用与审查完整性**：候选应用改用 `renameat2` 交换/不覆盖，并发保存不再被覆盖；审查的 diff 原样传入并与交付绑定 sha256；AST 合并拒绝冲突的 import 绑定；交付指纹覆盖 `.makewand_*` 与依赖目录；任务产生的 `__pycache__`/`.pyc` 不再进入交付补丁。
 - **计费与服务端**：组合调用计入失败尝试的花费；可选开启 `MAKEWAND_SCALED_BUDGET_RESERVATION=1`，让 HTTP 预算预留按定价、输出上限和扇出放大，并在流式输出超出预留时停止（默认仍为固定预留）；SSE 事件总量有上限；SQLite 默认 `synchronous=FULL` 与 `_txlock=immediate`。
 
+2026-10-21 评估修复（`makewand serve`；详见 docs/SERVER_ALPHA.md 与 router/README.md）：
+
+- **只配 API key 的部署中 Power 模式不再绕过预算**：未安装 codex CLI 时，codex 路线（Power 的生成方与裁判）改为调用配置的 `OPENAI_MODEL`（默认 `gpt-4o`），按 API 访问类型计价与估算；OpenAI transport 从不把 `codex-cli` 这类 `-cli` 占位模型发往上游。此前 Docker 镜像形态下每个 Power 代码/修复请求都把 `codex-cli` 发往上游并记为 $0，绕过 token、组织与项目的美元预算。
+- **OpenAI 模型名在只配 API key 的部署中可用**：注册了 `openai` 而没有 `codex` 时，`gpt-*`、`o1*`、`o3*`、`o4*`、`codex-mini*` 由 OpenAI API 按指名的模型调用并按其价格计费（须有价目或就是 `OPENAI_MODEL`，否则 400，因为其花费无法纳入预算），`codex` 调用 `OPENAI_MODEL`；此前一律 400。`GET /v1/models` 同时列出可发送的模型；流式与非流式请求对未知模型返回相同的错误文本。
+- **远端会话存储限额**：每个账号默认最多 1000 个会话、256 MiB（超出分别返回 429、413），保存后会话所在磁盘剩余空间将低于 1 GiB 时返回 507，单个 `sessions:write` 令牌不能再写满状态数据库所在的磁盘。替换会话只计大小差。新增 `--sessions-per-owner`、`--session-mib-per-owner`、`--session-min-free-mib` 与对应的 `MAKEWAND_SERVER_*` 环境变量，0 表示不限。
+
 2026-10-12 P1 修复批次（Python 与 Go 两个引擎；行为细节与残余风险见 SECURITY.md、docs/VERIFICATION_CONTRACT.md 与 docs/EXECUTION_CONTRACT.md）：
 
 - **凭据回写只合并同账号的令牌刷新**：两引擎使用同一套规则和共享测试向量（`_credential_writeback_merge` / `cliMergeCredential`），以宿主文档为基础只拷入令牌刷新字段。登出、换账号或重定向（删除/清空令牌，改动邮箱、API key、端点、认证方式、账号 ID 等受保护字段）、JWT 换成他人账号或不透明令牌、更换 Google refresh token、时间倒退、令牌类型除大小写外的变化、非严格 JSON（含孤立的 UTF-16 代理转义）都整份拒绝，并提示一次（指明文件和字段，不显示值）。muse 只有 OAuth 登录记录中的 `api_key` 视为其自行铸造、可单独写回，保存或粘贴的 key 受保护；`flow_auth.json` 只拷入。写回在宿主文件旁的 `.<文件名>.makewand-lock` 上取 `flock`（最多等 10 秒；两引擎都不经符号链接打开该锁文件，Windows 上也不经重解析点，无法打开时不加锁、只靠复核）并在重命名前复核宿主文件；副本被删除/替换/超过 4 MiB/不可读、沙箱内新建登录（含宿主缺少整个 provider 目录）都会提示，不再静默跳过。Go 的审查与远端（`makewand serve`）会话也使用私有副本并经同一合并写回；`Chat` 与流式调用（包括因取消或超过期限而结束的）都等写回完成才结束（最多 15 秒），Router 的流式调用另预留 1 秒的进程退出/管道收尾时间（总等待上限 16 秒），尝试超时后的回退要等超时的流结束才开始；API provider 的流式调用不等待。不透明令牌无法离线绑定账号、JWT 签名不校验、登出无法防止等残余风险见 SECURITY.md。

@@ -148,6 +148,17 @@ about 3×, `●` 16×, `▍` about 32×, rare Unicode whitespace up to about 96�
 vocabularies higher); alternating whitespace such as `" \n"` is never cut.
 `makewand serve` 按 provider 实际调用的模型为流式 API 调用计价，没有价目的 API 模型按每百万 token $3/$15 的保守价计费，所有未测得的费用记为 `cost_estimated=1`；估算不超过该次调用的 `max_tokens`，除非文本可证明更长；只报告部分 usage 的回复保留其报告的费用。设置 `MAKEWAND_SCALED_BUDGET_RESERVATION=1` 时，每个请求按任一已注册 API 模型的最高价预留，流式输出的 token 下界超过预留覆盖量时即停止，所以 `max_tokens` 之内的回复不会被截断，少数异常回复除外（同一字母或 emoji 的长串、cl100k 上重复的 `../`）。该下界按 11 个公开词表（o200k_base、cl100k_base、Llama 3.1、Qwen 2.5/3、DeepSeek-V3、Gemma 2/3、Mistral Nemo、GLM-4.5、Grok-1）校准，未覆盖当前的 Claude 词表。因此忽略 `max_tokens` 的上游在被截断前可能超出预留，按真实 token 计：普通单词与 emoji 接近 1 倍，CJK 文本约 4 倍，单个重复字符的洪流更多（GPT-4o 上数字约 3 倍、`●` 16 倍、`▍` 约 32 倍、少见的 Unicode 空白最多约 96 倍；其他词表更高）；交替的空白（如 `" \n"`）永远不会被截断。
 
+Without a codex CLI, Power mode's `codex` route is the OpenAI API: it calls the
+configured `OPENAI_MODEL` and is billed and budgeted as API spend, never as a
+free `codex-cli` call. A client-named OpenAI model (`gpt-*`, `o1*`, `o3*`,
+`o4*`, `codex-mini*`) is served only when it has a price or is the configured
+model, and a scaled reservation covers its price, so a client cannot choose a
+model whose spend the budgets cannot price. Remote session storage is capped per
+account (1,000 sessions and 256 MiB by default) and refuses saves that would
+leave less than 1 GiB free on the sessions disk, which holds the state database
+by default, so one account cannot fill the disk and take the server down for everyone.
+没有 codex CLI 时，Power 模式的 `codex` 路线就是 OpenAI API：调用配置的 `OPENAI_MODEL`，按 API 花费计费并计入预算，不再记为免费的 `codex-cli` 调用。客户端指名的 OpenAI 模型（`gpt-*`、`o1*`、`o3*`、`o4*`、`codex-mini*`）只有在有价目或就是配置的模型时才提供，按比例放大的预留也覆盖它的价格，所以客户端无法选用预算无法计价的模型。远端会话存储按账号限额（默认 1,000 个会话、256 MiB），并拒绝会让会话所在磁盘（默认也存放状态数据库）剩余空间低于 1 GiB 的保存，单个账号无法写满磁盘、拖垮整个服务。
+
 Python candidate application uses fixed POSIX directory handles or native Windows
 handles for replacement and recovery. Native Windows execution requires explicit
 unsafe-host consent and cannot grant Strength 2; Windows Job Objects manage
