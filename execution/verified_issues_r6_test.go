@@ -11,14 +11,16 @@ import (
 func TestR6LedgerCompactsLongRunningHistory(t *testing.T) {
 	path := layeredFixture(t)
 	base := time.Now()
+	var now time.Time
+	// Fourteen days pass in real time; the compactor follows the budget clock.
+	fixLedgerNow(t, &now)
 	for day := 0; day < 14; day++ {
+		now = base.Add(time.Duration(day) * 24 * time.Hour)
 		err := withLockedFile(t.Context(), path, nil, func(p *accountingPath) error {
 			data, err := readLedger(p, 100)
 			if err != nil {
 				return err
 			}
-			now := base.Add(time.Duration(day) * 24 * time.Hour)
-			// The compactor follows the ledger's monotonic accounting clock.
 			keys, err := scopeKeys(data, Config{TaskID: fmt.Sprintf("day-%d", day), MaxCalls: 100}, now)
 			if err != nil {
 				return err
@@ -94,7 +96,7 @@ func TestR6CompactionProtocolSharedWithPython(t *testing.T) {
 	// Python then reads and rewrites that state without losing current counts.
 	seed := `import json,time
 from pathlib import Path
-base=time.time()+20*86400
+base=time.time()
 day='2099-01-14'
 s={'tasks':{},'projects':{},'machine':{},'clock':base,'day':day}
 d={'schema':1,'maximum':100,'scopes':s,'attempts':[]}

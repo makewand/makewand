@@ -250,7 +250,7 @@ def execute(request, callback):
             error_kind="deadline", outcome_known=True)
     except call_budget.ConcurrencyBusyError as error:
         return _result(request, "FAILED", error=str(error), error_kind="concurrency_busy", outcome_known=True)
-    except call_budget.LeaseWaitConfigError as error:
+    except call_budget.BudgetConfigError as error:
         return _result(request, "INTERNAL_ERROR", error=str(error), error_kind="budget_configuration", outcome_known=True)
     except call_budget.BudgetError as error:
         return _result(request, "BUDGET_EXHAUSTED", error=str(error), error_kind="budget_admission")

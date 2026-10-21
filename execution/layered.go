@@ -9,8 +9,95 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
+
+// The budget clock rule shared with makewand/layered_budget.py: scopes.clock is
+// a ratchet against a clock that steps back, but it is trusted, and stored, at
+// most clockSkewSlack seconds ahead of real time, so a ledger written while the
+// clock was ahead cannot stall lease cleanup. Capacity holds are dated from that
+// clock, and one created ahead of it is re-dated to it, keeping its duration.
+// Daily buckets use the local zone or budgetTimezoneEnv (an IANA name); while
+// the real day is earlier than the latest bucket, the daily caps count every
+// bucket from today to that one.
+const (
+	clockSkewSlack    = 300.0
+	budgetTimezoneEnv = "MAKEWAND_BUDGET_TIMEZONE"
+	// maxHoldSeconds is the longest hold Python's reserve_capacity makes; a hold
+	// without created_at counts as this long.
+	maxHoldSeconds = 86400.0
+)
+
+// ledgerNow is the wall clock of the budget rules; tests move it.
+var ledgerNow = time.Now
+
+var clockSkewWarning, daySkewWarning sync.Once
+
+// reportClockSkew and reportDaySkew warn once per process; tests replace them.
+var reportClockSkew = func(lead float64) {
+	clockSkewWarning.Do(func() {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: call budget clock is %.0fs ahead of real time; lease and hold expiry use at most %.0fs of it (repair: makewand budget clock --repair)\n", lead, clockSkewSlack)
+	})
+}
+var reportDaySkew = func(today, latest string) {
+	daySkewWarning.Do(func() {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: call budget day %s is ahead of today's bucket %s; counting into %s (repair: makewand budget clock --repair)\n", latest, today, latest)
+	})
+}
+
+// effectiveClock is real time, or the persisted clock when it is ahead, by at most clockSkewSlack.
+func effectiveClock(data map[string]any, now time.Time) float64 {
+	wall := float64(now.UnixNano()) / 1e9
+	scopes, _ := data["scopes"].(map[string]any)
+	if scopes == nil {
+		return wall
+	}
+	clock := ledgerNumber(scopes["clock"])
+	if clock > wall+clockSkewSlack {
+		reportClockSkew(clock - wall)
+		return wall + clockSkewSlack
+	}
+	return max(wall, clock)
+}
+
+// redateHold re-dates a capacity hold created after clock to it, keeping its
+// duration, as scopeKeys re-dates a lease: one made while the clock was ahead
+// then lasts as long as asked from real time, not until real time catches up.
+// It returns the hold's expiry.
+func redateHold(hold map[string]any, expires, clock float64) float64 {
+	created, duration := expires-maxHoldSeconds, maxHoldSeconds
+	raw, dated := hold["created_at"]
+	if dated {
+		created = ledgerNumber(raw)
+		duration = expires - created
+	}
+	if created <= clock {
+		return expires
+	}
+	expires = clock + duration
+	hold["expires_at"] = json.Number(strconv.FormatFloat(expires, 'f', -1, 64))
+	if dated {
+		hold["created_at"] = json.Number(strconv.FormatFloat(clock, 'f', -1, 64))
+	}
+	return expires
+}
+
+// budgetDay is the daily bucket of now: the local date, or the date in
+// MAKEWAND_BUDGET_TIMEZONE. Python computes the same bucket.
+func budgetDay(now time.Time) (string, error) {
+	location := time.Local
+	if name := strings.TrimSpace(os.Getenv(budgetTimezoneEnv)); name != "" {
+		var err error
+		location, err = time.LoadLocation(name)
+		// "Local" is Go-only: Python's zoneinfo refuses it, so both refuse.
+		if err != nil || name == "Local" {
+			return "", fmt.Errorf("%s must name an IANA time zone such as Asia/Shanghai or UTC", budgetTimezoneEnv)
+		}
+	}
+	return now.In(location).Format("2006-01-02"), nil
+}
 
 // Each scope owns its limit and count. One locked atomic file replacement is
 // the commit point for all three, including workflow capacity holds.
@@ -153,13 +240,37 @@ func projectRef() (string, error) {
 }
 func scopeKeys(data map[string]any, cfg Config, now time.Time) ([]any, error) {
 	s := data["scopes"].(map[string]any)
-	day := now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")
-	if day < s["day"].(string) {
-		return nil, fmt.Errorf("budget clock moved back across an Asia/Shanghai day")
+	day, err := budgetDay(now)
+	if err != nil {
+		return nil, err
+	}
+	// A clock that moved back keeps counting into the latest bucket already seen:
+	// refusing would stop every dispatch, an earlier bucket would reset counts.
+	if latest := s["day"].(string); day < latest {
+		reportDaySkew(day, latest)
+		day = latest
 	}
 	s["day"] = day
-	old, _ := s["clock"].(json.Number).Float64()
-	s["clock"] = json.Number(strconv.FormatFloat(max(old, float64(now.UnixNano())/1e9), 'f', -1, 64))
+	// Persisting the capped clock heals a skewed ledger on its next admission.
+	clock := effectiveClock(data, now)
+	s["clock"] = json.Number(strconv.FormatFloat(clock, 'f', -1, 64))
+	// A lease dated past what this clock allows was written while the clock was
+	// ahead. Date it like a fresh heartbeat: a live owner renews it, a dead
+	// owner's lease expires one TTL from now instead of when real time catches up.
+	// A hold created after this clock keeps its duration from it. Reserve
+	// persists both even when it refuses the call.
+	leases, _ := data["leases"].(map[string]any)
+	for _, raw := range leases {
+		lease := raw.(map[string]any)
+		if ledgerNumber(lease["expires_at"]) > clock+leaseTTL.Seconds() {
+			lease["expires_at"] = json.Number(strconv.FormatFloat(clock+leaseTTL.Seconds(), 'f', -1, 64))
+		}
+	}
+	holds, _ := data["holds"].(map[string]any)
+	for _, raw := range holds {
+		hold := raw.(map[string]any)
+		redateHold(hold, ledgerNumber(hold["expires_at"]), clock)
+	}
 	project, err := projectRef()
 	if err != nil {
 		return nil, err
@@ -207,18 +318,63 @@ func containsScope(raw any, pair []any) bool {
 	}
 	return false
 }
-func scopeAvailable(data map[string]any, keys []any, holds map[string]any, claim map[string]any) (int, error) {
-	available := int(^uint(0) >> 1)
+
+// daySpan lists the buckets one scope's cap counts. While the real day is
+// earlier than the latest bucket (the clock moved back), the calls charged into
+// the later buckets were made today: a daily scope counts every bucket from
+// today to the latest.
+func daySpan(counters map[string]any, group, key, today, latest string) []string {
+	span := []string{key}
+	if group == "tasks" || today >= latest {
+		return span
+	}
+	prefix := key[:strings.LastIndex(key, ":")+1]
+	for k := range counters {
+		cut := strings.LastIndex(k, ":") + 1
+		if k != key && k[:cut] == prefix && k[cut:] >= today && k[cut:] <= latest {
+			span = append(span, k)
+		}
+	}
+	return span
+}
+func containsAnyScope(raw any, group string, span []string) bool {
+	for _, key := range span {
+		if containsScope(raw, []any{group, key}) {
+			return true
+		}
+	}
+	return false
+}
+func scopeAvailable(data map[string]any, keys []any, holds map[string]any, claim map[string]any, now time.Time) (int, error) {
+	available := math.MaxInt
 	s := data["scopes"].(map[string]any)
+	today, err := budgetDay(now)
+	if err != nil {
+		return 0, err
+	}
+	latest, _ := s["day"].(string)
 	for _, raw := range keys {
 		pair := raw.([]any)
-		c := s[pair[0].(string)].(map[string]any)[pair[1].(string)].(map[string]any)
-		limit, _ := jsonInteger(c["maximum"])
-		used, _ := jsonInteger(c["used"])
+		group := pair[0].(string)
+		counters := s[group].(map[string]any)
+		span := daySpan(counters, group, pair[1].(string), today, latest)
+		limit, used := math.MaxInt, 0
+		for _, key := range span {
+			c := counters[key].(map[string]any)
+			m, _ := jsonInteger(c["maximum"])
+			u, _ := jsonInteger(c["used"])
+			limit = min(limit, m)
+			// A sum past MaxInt must not wrap around into free capacity.
+			if u > math.MaxInt-used {
+				used = math.MaxInt
+			} else {
+				used += u
+			}
+		}
 		held := 0
 		for _, raw := range holds {
 			h := raw.(map[string]any)
-			if containsScope(h["scopes"], pair) {
+			if containsAnyScope(h["scopes"], group, span) {
 				n, _ := jsonInteger(h["remaining"])
 				if n > limit-held {
 					return 0, ErrBudgetExhausted
@@ -226,7 +382,7 @@ func scopeAvailable(data map[string]any, keys []any, holds map[string]any, claim
 				held += n
 			}
 		}
-		if claim != nil && containsScope(claim["scopes"], pair) {
+		if claim != nil && containsAnyScope(claim["scopes"], group, span) {
 			held--
 		}
 		available = min(available, limit-used-held)
@@ -263,6 +419,6 @@ func scopeSpend(data map[string]any, raw any, delta int) {
 		c := s[pair[0].(string)].(map[string]any)[pair[1].(string)].(map[string]any)
 		n, _ := jsonInteger(c["used"])
 		c["used"] = json.Number(strconv.Itoa(n + delta))
-		c["last_used"] = max(float64(time.Now().UnixNano())/1e9, ledgerNumber(s["clock"]))
+		c["last_used"] = effectiveClock(data, ledgerNow())
 	}
 }

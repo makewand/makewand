@@ -19,6 +19,7 @@ func layeredFixture(t *testing.T) string {
 	t.Setenv("MAKEWAND_PROJECT_ROOT", t.TempDir())
 	t.Setenv("MAKEWAND_CALL_BUDGET_FILE", "")
 	t.Setenv("MAKEWAND_MAX_MODEL_CALLS", "")
+	t.Setenv("MAKEWAND_BUDGET_TIMEZONE", "")
 	return filepath.Join(t.TempDir(), "calls.json")
 }
 func TestLayeredIndependentTaskLimits(t *testing.T) {
@@ -131,6 +132,8 @@ func TestLayeredBusyRefusalDoesNotLowerSharedLeaseLimit(t *testing.T) {
 
 func TestLayeredShanghaiDayAndClockRollback(t *testing.T) {
 	layeredFixture(t)
+	t.Setenv("MAKEWAND_BUDGET_TIMEZONE", "Asia/Shanghai")
+	_, days := recordSkewReports(t)
 	data := map[string]any{}
 	if err := initializeScopes(data); err != nil {
 		t.Fatal(err)
@@ -148,8 +151,13 @@ func TestLayeredShanghaiDayAndClockRollback(t *testing.T) {
 	if a[2].([]any)[1] == b[2].([]any)[1] {
 		t.Fatal("Shanghai midnight did not change daily scope")
 	}
-	if _, err := scopeKeys(data, cfg, before); err == nil {
-		t.Fatal("backward day admitted")
+	// Back across that midnight: admitted, still counting into the later day.
+	c, err := scopeKeys(data, cfg, before)
+	if err != nil {
+		t.Fatalf("backward day refused: %v", err)
+	}
+	if c[2].([]any)[1] != b[2].([]any)[1] || c[1].([]any)[1] != b[1].([]any)[1] || len(*days) != 1 {
+		t.Fatalf("backward day reopened an earlier bucket: %v %v", c, *days)
 	}
 }
 

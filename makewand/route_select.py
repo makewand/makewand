@@ -8,10 +8,12 @@
 - policy 的 PAUSED 里还没到期的；
 - 账本里还没过期的额度标记；
 - codex / claude 的官方周额度达到策略阈值；
-- ``not_tool`` 的同家族候选。
+- ``not_tool`` 的同家族候选：provider 同家族，或所带模型属于该工具的模型家族
+  （按 discovery.model_family；agy 代理的 claude-* 属于 claude，gpt-oss 属于 codex）。
 
 可用候选按目录顺序各采样一次 Beta(alpha, beta)，采样值大的排前面。
-``is_self`` 的整体排在所有非 self 之后。采样值相同则保持目录顺序。
+``is_self`` 的整体排在所有非 self 之后，模型家族同 ``self_tool`` 的也算 self。
+采样值相同则保持目录顺序。
 
 ``full=True`` 时候选来自完整目录（``candidates(tier, full=True)``），
 Thompson 采样用候选级统计（provider/model/effort/task_type）。
@@ -33,8 +35,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Optional, Sequence, Union
 
+from makewand.discovery import model_family
 from makewand.outcome_ledger import OutcomeLedger
-from makewand.routing_catalog import candidates, escalate, family, starting_tier
+from makewand.routing_catalog import PROVIDER_MODEL_FAMILIES, candidates, escalate, family, starting_tier
 
 __all__ = [
     "DEFAULT_CLAUDE_MAX_WEEKLY",
@@ -301,6 +304,8 @@ def select(
 
     skipped = []
     seen_skipped = set()
+    # provider → 因模型家族跳过的模型（只跳过这些组合，这家其余模型照常参选）。
+    family_models = {}
     available = []
     for index, row in enumerate(rows):
         reason = (
@@ -309,14 +314,22 @@ def select(
             or _quota_reason(row.provider, quota, policy)
             or _family_reason(row.provider, not_tool)
         )
-        if reason:
+        model = None if reason else _same_model_family(row, not_tool)
+        if reason or model:
             # 完整目录里同一 provider 有多个模型×推理深度组合：跳过原因
             # 按 provider 只记第一条，顺序保持目录里第一次出现的顺序。
             if row.provider not in seen_skipped:
                 seen_skipped.add(row.provider)
                 skipped.append((row.provider, reason))
+            if model and model not in family_models.setdefault(row.provider, []):
+                family_models[row.provider].append(model)
             continue
         available.append((index, row))
+    # 按 provider 计的原因同一家所有组合都一样；按模型家族跳过的列出具体模型。
+    skipped = [
+        (provider, reason or _model_family_reason(family_models[provider], not_tool))
+        for provider, reason in skipped
+    ]
 
     # 一次读出账本快照批量算统计，避免每个候选都全量读 outcomes.jsonl。
     batch_requests = [
@@ -342,7 +355,7 @@ def select(
         alpha = _positive_param(stats.alpha)
         beta = _positive_param(stats.beta)
         score = float(rng.betavariate(alpha, beta))
-        is_self = _is_self(row.provider, self_tool)
+        is_self = _is_self(row, self_tool)
         # Cheapest adequate first (owner, 2026-10-16): within a tier the catalog lists cheaper
         # candidates first, so the sample is weighted down linearly with catalog position.
         # Without outcomes cheaper candidates are tried more often; a costlier one that keeps
@@ -498,11 +511,47 @@ def _family_reason(provider: str, not_tool: Optional[str]) -> Optional[str]:
     return f"与 {name.strip().lower()} 同属 {blocked} 家族"
 
 
-def _is_self(provider: str, self_tool: Optional[str]) -> bool:
+def _row_model(row) -> Optional[str]:
+    """候选实际调用的模型：完整目录的 model，精简表取 ``--model`` 参数。"""
+    model = getattr(row, "model", None)
+    if isinstance(model, str) and model:
+        return model
+    args = tuple(getattr(row, "args", ()) or ())
+    for index, arg in enumerate(args):
+        if arg == "--model" and index + 1 < len(args):
+            return args[index + 1]
+        if isinstance(arg, str) and arg.startswith("--model="):
+            return arg[len("--model="):]
+    return None
+
+
+def _same_model_family(row, tool: Optional[str]) -> Optional[str]:
+    """候选所带模型属于 ``tool`` 自家模型的家族时返回该模型，否则 None。
+
+    provider 只说明经哪个 CLI 调用：agy 上的 claude-opus-* 仍是 claude 家族，
+    gpt-oss 仍是 codex（gpt）家族，与 orchestrator 判断审查独立性的口径一致。
+    """
+    if not tool or not isinstance(tool, str):
+        return None
+    lineage = PROVIDER_MODEL_FAMILIES.get(tool.strip().lower())
+    model = _row_model(row)
+    if lineage is None or not model or model_family(model) != lineage:
+        return None
+    return model
+
+
+def _model_family_reason(models: Sequence[str], not_tool: str) -> str:
+    name = not_tool.strip().lower()
+    return f"{'、'.join(models)} 属于 {PROVIDER_MODEL_FAMILIES[name]} 模型家族，与 {name} 同家族"
+
+
+def _is_self(row, self_tool: Optional[str]) -> bool:
     if not self_tool or not isinstance(self_tool, str):
         return False
     name = self_tool.strip().lower()
-    return bool(name) and provider.strip().lower() == name
+    if not name:
+        return False
+    return row.provider.strip().lower() == name or _same_model_family(row, name) is not None
 
 
 def _positive_param(value) -> float:

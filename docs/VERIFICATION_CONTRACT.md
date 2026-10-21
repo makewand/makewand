@@ -182,6 +182,31 @@ Missing detected Go/npm/Cargo test tools or malformed Node test configuration
 produce `UNVERIFIED`; they are never silently skipped. A pipeline without
 executed local test evidence stops before review and delivery. Python's
 unittest fallback reporting zero tests is also unverified.
+The Python runner is chosen inside the sandbox, not by the host interpreter: a
+read-only probe there, `python -B -c "import pytest"`, decides whether pytest can
+be imported, first with the interpreter of the run, then with the Python
+interpreter that the first line of a host `pytest` script names (a user-site
+pytest the sandbox hides cannot be imported, and a script whose interpreter the
+sandbox cannot start, or whose first line names no Python interpreter, is ruled
+out); otherwise unittest runs. The probe only imports pytest, so it loads no
+pytest plugin and no `conftest.py`. Without bubblewrap, under the unsafe host
+opt-in (`MAKEWAND_UNSAFE_HOST_EXEC=1` with the recorded acknowledgment), it runs
+on the host like the tests themselves. Tests that cannot run are `UNVERIFIED`, not
+failing tests: a pytest configuration without an importable pytest, pytest or
+unittest exit code 5 (nothing collected or run), zero executed tests, and
+pytest's own import error, with or without quotes, when pytest never started a
+session (nothing on stdout, where pytest reports even without its header, and
+the import error as the last line of stderr) or when unittest's only failures are
+test modules that could not import pytest. A test that ran and failed is a
+failing test, whatever it prints. A gate whose time budget runs
+out before every suite produced a result is `TIMEOUT` (exit 16). Neither outcome
+starts an auto-fix round or ends as `FAILED`, but failing tests an earlier suite
+reported, and a run that changed tested inputs or left test output that could run
+as code, still fail the gate; test output such a run created is removed as after
+any other run. In `race` such a candidate has no test evidence and cannot win:
+when no candidate passed its tests, the race ends `UNVERIFIED`, or `TIMEOUT` when
+a candidate's gate ran out of time or the generation budget was spent before it
+could start.
 Saved candidates require explicit generation, test and review passes for normal
 application. Missing SDK metadata remains unknown; it is never inferred from
 generation success. An explicit human `--force` decision remains supported.

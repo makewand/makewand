@@ -3,6 +3,7 @@
 Reservations count attempted Makewand dispatches, including failures. Vendor
 CLI internal turns and token usage remain separately measured or unknown.
 """
+import copy
 import json
 import math
 import errno
@@ -31,8 +32,12 @@ class BudgetCancelledError(BudgetError):
     """Admission was cancelled before a provider started."""
 
 
-class LeaseWaitConfigError(BudgetError):
+class BudgetConfigError(BudgetError):
     """Invalid admission configuration, not exhausted call capacity."""
+
+
+class LeaseWaitConfigError(BudgetConfigError):
+    """An invalid MAKEWAND_LEASE_WAIT_SECONDS."""
 
 
 _LEASE_WAIT_DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
@@ -67,7 +72,9 @@ def _admission_deadline():
 
 
 @contextmanager
-def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None):
+def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=True):
+    """Lock, read and validate the ledger. Without migrate, opening it writes nothing:
+    a lifetime ledger is not converted and a tighter maximum is not persisted."""
     value = budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE")
     if not value and layered_budget.enabled():
         value = layered_budget.default_path()
@@ -112,14 +119,14 @@ def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None):
                 data = json.loads(raw.decode("utf-8"), parse_constant=_reject_nonfinite_json)
             _validate(data)
             ledger_compaction.compact(data)
-            if layered_budget.enabled() and "scopes" not in data:
+            if migrate and layered_budget.enabled() and "scopes" not in data:
                 legacy = data["maximum"]
                 layered_budget.initialize(data)
                 data["legacy_maximum"] = legacy
                 data["legacy_used"] = _charged(data)
                 _save(path, data)
             maximum = data["maximum"] if "scopes" in data else _maximum(data, max_model_calls)
-            if maximum < data["maximum"]:
+            if migrate and maximum < data["maximum"]:
                 data["maximum"] = maximum
                 _save(path, data)
             yield path, data
@@ -157,6 +164,11 @@ def _validate(data):
                 or (isinstance(hold["expires_at"], int) and abs(hold["expires_at"]) > 9223372036854775807)
                 or not math.isfinite(hold["expires_at"])):
             raise BudgetError("invalid model call capacity hold")
+        created = hold.get("created_at", 0)  # absent in holds written before they were dated
+        if (isinstance(created, bool) or not isinstance(created, (int, float))
+                or (isinstance(created, int) and created > 9223372036854775807)
+                or not math.isfinite(created) or created < 0):
+            raise BudgetError("invalid model call capacity hold creation time")
 
     if "scopes" in data:
         layered_budget.validate(data)
@@ -177,7 +189,7 @@ def _maximum(data, max_model_calls=None):
 
 
 def _active_holds(data):
-    now = max(time.time(), data.get("scopes", {}).get("clock", 0))
+    now = layered_budget.effective_clock(data)
     holds = data.get("holds", {})
     expired = [lease for lease, hold in holds.items() if hold["expires_at"] <= now]
     for lease in expired:
@@ -325,7 +337,7 @@ def reserve_capacity(count, owner, purpose="review", ttl_seconds=600):
     if (type(count) is not int or count <= 0 or not isinstance(owner, str) or not owner
             or not isinstance(purpose, str) or not purpose
             or isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
-            or not math.isfinite(ttl_seconds) or not 0 < ttl_seconds <= 86400):
+            or not math.isfinite(ttl_seconds) or not 0 < ttl_seconds <= layered_budget.MAX_HOLD_SECONDS):
         raise BudgetError("invalid model call capacity reservation")
     try:
         with _ledger(lock_deadline=_admission_deadline()) as (path, data):
@@ -342,14 +354,44 @@ def reserve_capacity(count, owner, purpose="review", ttl_seconds=600):
             if count > available:
                 raise BudgetError(f"insufficient model task capacity ({available} available; {count} required)")
             lease = uuid.uuid4().hex
-            data.setdefault("holds", {})[lease] = dict(owner=owner, purpose=purpose,
-                remaining=count, expires_at=time.time() + ttl_seconds, scopes=keys)
+            # Dated from the clock that compaction expires holds by: from wall time, a
+            # ledger clock within its permitted lead cut a hold short, even at this save.
+            created = layered_budget.effective_clock(data)
+            data.setdefault("holds", {})[lease] = dict(owner=owner, purpose=purpose, remaining=count,
+                created_at=created, expires_at=created + ttl_seconds, scopes=keys)
             _save(path, data)
             return lease
     except BudgetError:
         raise
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
         raise BudgetError(f"cannot reserve model task capacity: {error}") from error
+
+
+def repair_clock(budget_file=None, apply=False):
+    """Report a budget clock or day bucket that leads real time; apply=True brings it back.
+
+    Runs under the shared ledger lock (layered_budget.repair_clock). Nothing is
+    written without apply. Returns the report, with the ledger path and zone.
+    """
+    value = budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()
+    report = {"path": str(value), "exists": os.path.exists(value), "layered": False, "applied": False,
+              "timezone": os.environ.get(layered_budget.TIMEZONE_ENV, "").strip() or "local"}
+    if not report["exists"]:
+        return report
+    try:
+        with _ledger(value, migrate=False) as (path, data):
+            if "scopes" not in data:
+                return report  # a lifetime ledger has no daily clock
+            report["layered"] = True
+            report.update(layered_budget.repair_clock(data if apply else copy.deepcopy(data)))
+            if apply and report["changed"]:
+                _save(path, data)
+                report["applied"] = True
+    except BudgetError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+        raise BudgetError(f"cannot read the model call budget ledger: {error}") from error
+    return report
 
 
 def release_capacity(lease_id):
@@ -422,7 +464,7 @@ def lease_update(attempt, action="heartbeat", pid=None, *, budget_file=None, max
         lease = data.get("leases", {}).get(attempt)
         if lease is None:
             return
-        now = max(time.time(), data.get("scopes", {}).get("clock", 0))
+        now = layered_budget.effective_clock(data)
         lease.update(heartbeat_at=now, expires_at=now + account_leases.TTL)
         if action == "launch":
             lease["launch_pending"] = True

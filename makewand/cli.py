@@ -1666,8 +1666,8 @@ def _main():
     p_route.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
     p_route.add_argument("difficulty", metavar="DIFFICULTY", help="难度：mechanical, normal, hard")
     p_route.add_argument("--tier", dest="route_tier", type=int, default=None, metavar="N", help="直接指定档位（1, 2, 3），覆盖按难度推算的起始档")
-    p_route.add_argument("--self", dest="self_tool", default=None, metavar="T", help="你自己是哪家工具（codex, claude, agy, grok, muse），同家候选排最后")
-    p_route.add_argument("--not", dest="not_tool", default=None, metavar="T", help="排除与该工具同家族的候选")
+    p_route.add_argument("--self", dest="self_tool", default=None, metavar="T", help="你自己是哪家工具（codex, claude, agy, grok, muse），同家候选排最后（含 agy 代理的同家族模型）")
+    p_route.add_argument("--not", dest="not_tool", default=None, metavar="T", help="排除与该工具同家族的候选（含 agy 代理的同家族模型，如 claude-*、gpt-oss）")
     p_route.add_argument("--simple", action="store_true", default=False, help="只用精简三档表，不展开全部模型和推理深度")
     p_route.add_argument("--legacy", action="store_true", default=False, help="完整目录里把旧版本模型也纳入排序（与 --simple 一起用时无效）")
     p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
@@ -1685,6 +1685,11 @@ def _main():
     p_outcome.add_argument("--seconds", type=float, default=None, help="这次派活耗时秒数（可选）")
     p_outcome.add_argument("--calls", type=int, default=None, help="这次派活的模型调用次数（可选）")
     p_outcome.add_argument("--model", default=None, metavar="M", help="记入账本的模型名，供候选级统计（可选）")
+
+    p_budget = subparsers.add_parser("budget", allow_abbrev=False, help="查看或修复共享调用账本 call-budget.json 领先实际时间的时钟（不调用模型）", parents=[sub_common_parser])
+    p_budget.add_argument("budget_action", metavar="ACTION", choices=["clock"], help="clock：账本时钟与日期桶")
+    p_budget.add_argument("--repair", action="store_true", default=False, help="让领先实际时间的时钟与日期桶回到实际时间（持账本锁，不退还已计的调用次数）")
+    p_budget.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
 
     from makewand.config import get_all_supported_providers
     all_supported = get_all_supported_providers()
@@ -1994,6 +1999,9 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "outcome":
         from makewand.route_cli import cmd_outcome
         cmd_outcome(args)
+    elif args.subcommand == "budget":
+        from makewand.budget_cli import cmd_budget
+        cmd_budget(args)
     elif args.subcommand == "daemon":
         cmd_daemon(args)
     elif args.subcommand == "sessions":

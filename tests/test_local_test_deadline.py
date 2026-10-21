@@ -52,9 +52,10 @@ class LocalTestDeadlineTests(unittest.TestCase):
             return 0, output, "", None
         ok, details, run = self.invoke(execute, composite=True)
         self.assertTrue(ok)
-        self.assertEqual(run.call_count, 2)
-        self.assertAlmostEqual(timeouts[0], 1)
-        self.assertAlmostEqual(timeouts[1], .7)
+        # The in-sandbox pytest probe, the Python suite and the Go suite share one deadline.
+        self.assertEqual(run.call_count, 3)
+        for got, expected in zip(timeouts, (1, .7, .4)):
+            self.assertAlmostEqual(got, expected)
         self.assertIn("Python Tests Passed", details)
         self.assertIn("Go Tests Passed", details)
 
@@ -68,9 +69,11 @@ class LocalTestDeadlineTests(unittest.TestCase):
             return 0, "passed", "", None
         ok, details, run = self.invoke(execute, composite=True)
         self.assertFalse(ok)
+        # Probe, then the Python suite with only the remaining .3 s; Go never starts.
         self.assertEqual(run.call_count, 2)
         self.assertAlmostEqual(timeouts[1], .3)
         self.assertIn("总时间预算已耗尽", details)
+        self.assertEqual(details.execution_status, "TIMEOUT")
 
     def test_late_success_cannot_pass_or_start_the_next_suite(self):
         def execute(**kwargs):
@@ -80,30 +83,36 @@ class LocalTestDeadlineTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(run.call_count, 1)
         self.assertIn("总时间预算已耗尽", details)
+        self.assertEqual(details.execution_status, "TIMEOUT")
 
-    def test_pytest_fallback_shares_budget_and_disables_bytecode(self):
+    def test_runner_probe_shares_budget_and_disables_bytecode(self):
         commands, timeouts = [], []
         def execute(**kwargs):
             commands.append(kwargs["cmd"])
             timeouts.append(kwargs["timeout"])
             self.clock += .6 if len(commands) == 1 else .1
-            return (1, "", "No module named pytest", None) if len(commands) == 1 else (0, "ok", "", None)
+            if len(commands) == 1:
+                return 1, "", "ModuleNotFoundError: No module named 'pytest'", None
+            return 0, "ok", "", None
         ok, details, run = self.invoke(execute)
         self.assertTrue(ok)
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(commands[0][-2:], ["-c", "import pytest"])
+        self.assertTrue(run.call_args_list[0].kwargs["readonly"])
         self.assertAlmostEqual(timeouts[1], .4)
         self.assertIn("unittest", commands[1])
         self.assertTrue(all("-B" in command for command in commands))
         self.assertIn("unittest", details)
 
-    def test_expired_pytest_never_starts_fallback(self):
+    def test_expired_runner_probe_starts_no_runner(self):
         def execute(**kwargs):
             self.clock += 1.1
             return 1, "", "No module named pytest", None
         ok, details, run = self.invoke(execute)
         self.assertFalse(ok)
         self.assertEqual(run.call_count, 1)
-        self.assertIn("未启动 unittest 回退", details)
+        self.assertEqual(details.execution_status, "TIMEOUT")
+        self.assertIn("总时间预算已耗尽", details)
 
     def test_static_precheck_consumes_the_same_budget(self):
         def precheck(*args):
@@ -114,6 +123,7 @@ class LocalTestDeadlineTests(unittest.TestCase):
         self.assertFalse(ok)
         run.assert_not_called()
         self.assertIn("总时间预算已耗尽", details)
+        self.assertEqual(details.execution_status, "TIMEOUT")
 
     def test_short_positive_budget_is_preserved(self):
         ok, _, run = self.invoke(lambda **kwargs: (0, "", "", None), timeout=.25)
@@ -141,10 +151,11 @@ class LocalTestDeadlineTests(unittest.TestCase):
         before = workspace_snapshot(self.root)
         def execute(**kwargs):
             command = kwargs["cmd"]
-            # Force the deterministic unittest fallback; execute only this
-            # authored fixture with the actual interpreter and a cleared env.
-            if "pytest" in command:
-                return 1, "", "No module named pytest", None
+            # Force the deterministic unittest fallback (pytest not importable in the
+            # sandbox); execute only this authored fixture with the actual interpreter
+            # and a cleared env.
+            if any("pytest" in part for part in command):
+                return 1, "", "ModuleNotFoundError: No module named 'pytest'", None
             process = subprocess.run(command, cwd=kwargs["workspace"], env={"PATH": os.environ["PATH"]},
                                      capture_output=True, text=True, timeout=kwargs["timeout"])
             return process.returncode, process.stdout, process.stderr, None

@@ -1988,7 +1988,7 @@ class CandidateManager:
             cand_a, cand_b = candidates["A"], candidates["B"]
             from makewand.merger import semantic_merge_candidate_worktrees
             from makewand.git_helper import clone_isolated_worktree
-            from makewand.orchestrator import run_local_tests, compute_patch_parsimony
+            from makewand.orchestrator import LOCAL_TESTS_NO_EVIDENCE, run_local_tests, compute_patch_parsimony
             race_dir = config.CANDIDATES_DIR / r_id
             cand_m_dir = race_dir / ("candidate_M_" + uuid.uuid4().hex)
             # A failed safe clone is an error. Never fall back to an unrestricted
@@ -2033,7 +2033,7 @@ class CandidateManager:
             tests_available = _hybrid_tests_available(base_path)
             test_evidence_available = (
                 tests_available and test_detail is not None
-                and getattr(test_detail, "execution_status", None) != "UNVERIFIED"
+                and getattr(test_detail, "execution_status", None) not in LOCAL_TESTS_NO_EVIDENCE
             )
             tests_passed = test_ok if test_evidence_available else None
             if (build_manifest(cand_m_dir, project_files=scoped) != sealed_manifest

@@ -2,7 +2,6 @@
 import os
 import math
 import sys
-import time
 from pathlib import Path
 
 TTL = 30
@@ -97,9 +96,10 @@ def admission(data, engine, account):
     wanted = keys(engine, account)
     engine = wanted[0][:-len(":provider")]
     from makewand.call_budget import ConcurrencyBusyError
-    from makewand.layered_budget import positive
+    from makewand.layered_budget import effective_clock, positive
     leases = data.setdefault("leases", {})
-    now = max(time.time(), data.get("scopes", {}).get("clock", 0))
+    # A persisted clock far ahead of real time would keep a dead owner's lease unexpired.
+    now = effective_clock(data)
     completed = {entry["id"] for entry in data.get("attempts", []) if entry.get("status") == "completed"}
     for identifier, lease in list(leases.items()):
         owner_alive = alive(lease["owner"])

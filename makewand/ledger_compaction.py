@@ -1,12 +1,13 @@
 """Shared ledger retention policy (mirrored in execution/compaction.go)."""
 import math
-import time
+
+from makewand.layered_budget import effective_clock
 
 RETENTION_SECONDS = 2 * 86400
 
 
 def compact(data):
-    now = max(time.time(), data.get("scopes", {}).get("clock", 0))
+    now = effective_clock(data)
     cutoff = now - RETENTION_SECONDS
     leases = data.get("leases", {})
     kept = []

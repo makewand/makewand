@@ -23,7 +23,10 @@ class LayeredBudgetTests(unittest.TestCase):
                          MAKEWAND_LAYERED_BUDGET="1", MAKEWAND_MAX_MODEL_CALLS="5",
                          MAKEWAND_PROJECT_DAILY_CALLS="10", MAKEWAND_MACHINE_DAILY_CALLS="10",
                          MAKEWAND_PROJECT_ROOT=self.tmp.name, MAKEWAND_TASK_ID="task-a",
-                         MAKEWAND_ACCOUNT_CONCURRENCY="100", MAKEWAND_POOL_CONCURRENCY="100")
+                         MAKEWAND_ACCOUNT_CONCURRENCY="100", MAKEWAND_POOL_CONCURRENCY="100",
+                         # The fixed timestamps below are Shanghai midnights; day buckets
+                         # follow the local zone unless this pins them (CI runs in UTC).
+                         MAKEWAND_BUDGET_TIMEZONE="Asia/Shanghai")
         env.start()
         self.addCleanup(env.stop)
 
@@ -66,16 +69,23 @@ class LayeredBudgetTests(unittest.TestCase):
         self.assertEqual(self.data()["attempts"][-1]["result_status"], "UNKNOWN")
 
     def test_midnight_shanghai_and_day_rollback(self):
-        # 15:59:59 UTC, then 16:00 UTC: Shanghai midnight, regardless of TZ.
-        with patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="1", TZ="America/New_York"):
+        # 15:59:59 UTC, then 16:00 UTC: Shanghai midnight in the configured zone, regardless of TZ.
+        with patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="3", MAKEWAND_BUDGET_TIMEZONE="Asia/Shanghai",
+                        TZ="America/New_York"):
             with patch("time.time", return_value=1792079999):
                 b.reserve("fake", "fast")
             with patch("time.time", return_value=1792080000):
                 b.reserve("fake", "fast")
+            # Back across that midnight: admitted, counting into the later day, never reset;
+            # the earlier day's cap counts both days' calls.
             with patch("time.time", return_value=1792079999):
-                with self.assertRaisesRegex(b.BudgetError, "clock moved back"):
+                b.reserve("fake", "fast")
+                with self.assertRaisesRegex(b.BudgetError, "budget exhausted"):
                     b.reserve("fake", "fast")
-        self.assertEqual(len(self.data()["scopes"]["machine"]), 2)
+        scopes = self.data()["scopes"]
+        self.assertEqual(scopes["day"], "2026-10-16")
+        self.assertEqual({day: counter["used"] for day, counter in scopes["machine"].items()},
+                         {"2026-10-15": 1, "2026-10-16": 2})
 
     def test_review_hold_cannot_be_stolen_and_midnight_rechecks_daily(self):
         with execution_context(task_id="task-a"), patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="2"):

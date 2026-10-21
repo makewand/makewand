@@ -130,6 +130,8 @@ makewand run "修复解析器" --protect tests/test_parser.py
 
 `--protect` 可重复指定相对路径，也适用于 `race` 和 `apply`。成功的受保护流水线提供带校验的 `apply_delivery.sh`；候选应用的 `--force` 不能绕过文件保护。详见 [执行约定](docs/EXECUTION_CONTRACT.md#protected-task-files)。
 
+本地测试在沙箱内运行，Python 用 pytest 还是 unittest 由沙箱内能否导入 pytest 决定（宿主解释器能导入、沙箱里看不到的用户级 pytest 不算）：只读探测 `python -B -c "import pytest"` 先用运行测试的解释器，再用宿主 `pytest` 脚本首行指定的 Python 解释器，只导入 pytest，不加载 pytest 插件和 `conftest.py`；没有 bubblewrap、经宿主执行授权（`MAKEWAND_UNSAFE_HOST_EXEC=1` 加已记录的确认）时，探测与测试本身一样在宿主上运行。测试无法运行——项目配置了 pytest 但沙箱内导入不了、pytest 或 unittest 以退出码 5 结束（没有收集到或执行任何测试）、pytest 根本没有启动（标准输出为空，标准错误最后一行是 pytest 自身的导入错误）或 unittest 失败的只是导入不了 pytest 的测试模块——时结论为未验证（退出码 11）；测试总时间预算先耗尽时为超时（退出码 16）。两者都不算测试失败，不进入自动修复；但此前已有测试套件报告失败、或测试运行修改了待交付输入时，仍按失败处理；测试实际运行并失败时也一律按失败处理，无论它输出了什么。`race` 中测试无法运行或超时的候选没有测试证据、不能胜出：没有候选通过测试时，比赛以未验证（退出码 11）结束，有候选的测试关卡超时则为超时（退出码 16）。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#python-pipeline-and-race-candidates)。
+
 宿主模式下，审查 diff 之外的改动——新建或改动被忽略的文件、二进制或可执行产物、`.env*`/`.envrc`/`*.pth`/`sitecustomize.py`、子模块或嵌套仓库中的文件、本检出（及其子模块）私有 hooks 目录中的新 hook——会阻止交付并回滚（退出码 11）；新 hook 移入 `rejected_*/quarantine/git-hooks/` 并附 `mv` 恢复命令，链接工作树等共享的 hooks 目录只报告。测试运行在工具默认位置生成的测试产物会被删除，不进入审查与交付。没有备份的既有文件（依赖与缓存目录、超过备份上限的文件）在任务开始时计算 SHA-256 摘要与抽样指纹，上限为 `MAKEWAND_FINGERPRINT_FILE_LIMIT`（单文件，默认 64 MiB）、`MAKEWAND_FINGERPRINT_TOTAL_LIMIT`（总量，默认 512 MiB）与 `MAKEWAND_FINGERPRINT_SECONDS`（默认 20 秒），交付核查与回滚核验同样受这些上限约束；内容无法确认的文件按“无法确认”阻断，并提示应调高哪个上限。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#python-host-mode-delivery)。
 
 `makewand plan "<目标>"` 把目标拆成 DAG 子任务。多阶段 DAG 在一份私有暂存副本中逐阶段执行，累积结果作为候选 `dg_…` 的 `A` 只交付一次：工作区安全时自动应用，否则给出确切的 `makewand apply` 命令；只读子任务审查此前的累积改动，其写入一律丢弃。原生 Windows 上多阶段 DAG 拒绝执行（请用 WSL2）。暂存区绑定的清单受 `MAKEWAND_WORKSPACE_SNAPSHOT_MAX_FILES`、`MAKEWAND_WORKSPACE_SNAPSHOT_MAX_BYTES`、`MAKEWAND_WORKSPACE_SNAPSHOT_TIMEOUT_SECS`（默认 100,000 个文件、512 MiB、每份 10 秒）约束，超限的仓库在复制任何内容之前即被拒绝（未验证，退出码 11），并提示超出的上限；未跟踪且被 gitignore 的文件（数据、日志等）不计入。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#multi-stage-dag-delivery)。
@@ -223,7 +225,7 @@ MAKEWAND_CANDIDATES=1 MAKEWAND_CANDIDATE_CONCURRENCY=1 makewand new
 
 `run`、`review`、`race`、`ensemble` 以及直接派活命令（`codex`、`claude`、`agy`、`grok`、`muse`、`local`、`aider` 及直接 API 命令）未指定 `--timeout` 时继承 `--total-timeout`；两者都未指定时为 300 秒（ensemble 为 900 秒），均指定时取较小值。
 
-`makewand route <类型> <难度> --self codex` 输出的每条派活命令包含 `--max-model-calls 1 --timeout N --total-timeout N`；review 任务还包含 `--readonly`。按 mechanical / normal / hard，implement 的 N 为 1200 / 3600 / 10800 秒，其余 review / test / research / doc 为 900 / 1800 / 5400 秒。时限按难度和实际档位中较高者选取，route 的 `--total-timeout` 可覆盖该值，升档提示保留此覆盖。JSON 顶层及每个候选包含 `timeout`、`total_timeout`、`readonly` 字段，候选的 `command` 可直接照抄。
+`makewand route <类型> <难度> --self codex` 输出的每条派活命令包含 `--max-model-calls 1 --timeout N --total-timeout N`；`--not <工具>` 排除同家族候选、`--self <工具>` 把同家族候选排到最后，家族同时按 provider 和所带模型判断（agy 代理的 `claude-*` 属于 claude，`gpt-oss` 属于 codex），跳过列表写明被跳过的模型；review 任务还包含 `--readonly`。按 mechanical / normal / hard，implement 的 N 为 1200 / 3600 / 10800 秒，其余 review / test / research / doc 为 900 / 1800 / 5400 秒。时限按难度和实际档位中较高者选取，route 的 `--total-timeout` 可覆盖该值，升档提示保留此覆盖。JSON 顶层及每个候选包含 `timeout`、`total_timeout`、`readonly` 字段，候选的 `command` 可直接照抄。
 
 Go 原生调用、Python 流水线、直接工具命令、比赛裁判及真实模型探活共享调用账本，失败和裁决补问也占一次。`--call-budget-file` 让多个进程共享上限；只指定 `--max-model-calls` 时，入口创建本次任务的独立账本。账本的最大值只能降低，已开始的调用不退还额度。发送后无法确定结果时返回 `UNKNOWN`，停止自动切换提供者或重派；Go 路由的只读 CLI 运行（bubblewrap 沙箱内以只读方式挂载工作区的审查，以及未指定 WorkDir、在临时目录中运行的 `serve` 远端请求）不会写工作区，其无法识别的退出仍记为 `UNKNOWN`，但可切换到下一个提供者；宿主机上运行的审查（`MAKEWAND_UNSAFE_HOST_EXEC`）和指定了 WorkDir 的远端请求不算只读。provider CLI 自己打印、由共享消息目录识别的拒绝（未登录或凭据被拒、agy 拒绝参数）是结果已知的失败，照常切换；可能写入工作区的运行只有在 stdout 没有回答、且 stderr 上拒绝之前只有 agy 自己的提示行时才算拒绝；运行途中登录失效的输出与开头的拒绝相同，glog 诊断（agy 用它记录工具与模型调用）或状态行之后的拒绝可能发生在工作之后，这些都仍为 `UNKNOWN` 并停止重派。Power 模式中某个生成方或裁判的登录在准入后被切换到其他账号时，请求以该拒绝结束。统计单位是 Makewand 派发尝试，无法限制供应商 CLI 内部工具轮次或代替 Token/费用计量。
 
@@ -243,7 +245,7 @@ makewand status --daemon --json
 makewand daemon stop
 ```
 
-有界派发使用机器共享的 `call-budget.json`，任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，Asia/Shanghai 午夜重置。账号/订阅池默认并发 1，无可用回退时默认最多等 30 秒；busy 不计费，返回 FAILED（退出码 10），预算耗尽返回退出码 13。已结算记录保留 48 小时并自动清理，旧 lifetime 预算仍保留累计花费；活动记录和租约不清除。配置及恢复规则见 [预算与租约](docs/layered-call-admission.md)，账号绑定和缓存见 [quota 账号绑定](docs/quota-account-binding.md)。
+有界派发使用机器共享的 `call-budget.json`，任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按本地时区午夜重置（`MAKEWAND_BUDGET_TIMEZONE` 可固定为某个 IANA 时区，如 `Asia/Shanghai`；Go 与 Python 算出同一天）。时钟回拨不拒绝派发、不清零计数，继续计入已见过的最新一天，在实际日期到达那一天之前，项目与机器的每日上限按从今天到那一天的各日期桶合计检查；系统时钟一度超前时写下的账本不会卡住租约清理，也不会让预留多占名额（预留按账本时钟计时，超前创建的预留保持原时长改按当前时钟计算），`makewand budget clock` 查看、`makewand budget clock --repair` 让账本时钟回到实际时间（不退还已计次数，后面日期的预留随计数改计入今天）。账号/订阅池默认并发 1，无可用回退时默认最多等 30 秒；busy 不计费，返回 FAILED（退出码 10），预算耗尽返回退出码 13。已结算记录保留 48 小时并自动清理，旧 lifetime 预算仍保留累计花费；活动记录和租约不清除。配置及恢复规则见 [预算与租约](docs/layered-call-admission.md)，账号绑定和缓存见 [quota 账号绑定](docs/quota-account-binding.md)。
 
 provider 子进程继承 `MAKEWAND_PROVIDER_WORKER=1` 后只允许 `search`、`repomap`、静态帮助/版本和 `completion <shell>`；`quota`、`status`、`route` 等管理命令也拒绝。完整参数白名单见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
 

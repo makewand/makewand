@@ -6,6 +6,7 @@ var pythonOrchestratorCmds = map[string]bool{
 	"agy":         true,
 	"aider":       true,
 	"apply":       true,
+	"budget":      true,
 	"candidates":  true,
 	"claude":      true,
 	"clean":       true,
