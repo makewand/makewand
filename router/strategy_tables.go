@@ -283,8 +283,11 @@ func (t *strategyTables) mergeOverrides(raw rawDefaults) error {
 	}
 
 	// Costs: field-level merge per model ID — a partial entry (e.g. only
-	// "input") keeps the other field's existing value.
-	for id, rc := range raw.Costs {
+	// "input") keeps the other field's existing value. Keys are stored the way
+	// costFor looks them up, so "O1" overrides o1 instead of adding a second,
+	// half-priced entry.
+	for rawID, rc := range raw.Costs {
+		id := priceKey(rawID)
 		entry := t.costs[id]
 		if rc.Input != nil {
 			entry.Input = *rc.Input
@@ -577,19 +580,17 @@ func (t *strategyTables) costFor(modelID string) (costEntry, bool) {
 	return t.costForLocked(modelID)
 }
 
-// costForLocked looks a model up exactly, then trimmed and lower-cased:
-// providers match model names without regard to case (OPENAI_MODEL="O1"
-// calls o1) and the price table spells them in lower case, so a capital or
+// costForLocked looks a model up by its price key: providers match model
+// names without regard to case (OPENAI_MODEL="O1" calls o1), so a capital or
 // padding must not bill a known model at the fallback rate.
 func (t *strategyTables) costForLocked(modelID string) (costEntry, bool) {
-	if e, ok := t.costs[modelID]; ok {
-		return e, true
-	}
-	if normalized := strings.ToLower(strings.TrimSpace(modelID)); normalized != modelID {
-		e, ok := t.costs[normalized]
-		return e, ok
-	}
-	return costEntry{}, false
+	e, ok := t.costs[priceKey(modelID)]
+	return e, ok
+}
+
+// priceKey is the form every cost-table key is stored and looked up in.
+func priceKey(modelID string) string {
+	return strings.ToLower(strings.TrimSpace(modelID))
 }
 
 // pricedModels returns every model ID with a pricing entry, in no order.
@@ -688,7 +689,7 @@ func pricedDiscoveredModels(raw rawDefaults, t *strategyTables) rawDefaults {
 	costs := make(map[string]rawCost, len(raw.Costs))
 	for modelID, c := range raw.Costs {
 		if (c.Input != nil && c.Output != nil) || known(modelID) {
-			costs[modelID] = c
+			costs[priceKey(modelID)] = c
 		}
 	}
 	models := make(map[string]map[string]string, len(raw.Models))
@@ -698,7 +699,7 @@ func pricedDiscoveredModels(raw rawDefaults, t *strategyTables) rawDefaults {
 			if modelID == "" {
 				continue
 			}
-			if _, priced := costs[modelID]; !pricedProviders[prov] || priced || known(modelID) {
+			if _, priced := costs[priceKey(modelID)]; !pricedProviders[prov] || priced || known(modelID) {
 				kept[tier] = modelID
 			}
 		}
