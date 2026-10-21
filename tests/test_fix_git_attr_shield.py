@@ -1,4 +1,4 @@
-"""Host-side git never runs a clean/smudge filter that a repository delivers (py-sec-1).
+"""Host-side git never runs a clean/smudge filter that a repository delivers (py-sec-1..3).
 
 Every fixture plants a filter driver whose commands append to a marker file outside
 the repositories: a marker line means makewand ran the filter on the host.
@@ -18,6 +18,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from makewand import git_helper
+from makewand.providers.api_client import apply_agentic_code_output
+
+PATCH = ("--- a/f.txt\n"
+         "+++ b/f.txt\n"
+         "@@ -1 +1,2 @@\n"
+         " one\n"
+         "+two\n")
 
 
 @unittest.skipIf(os.name == "nt", "fixtures use POSIX shell filters and executable scripts")
@@ -206,6 +213,92 @@ class CommondirShieldTests(FilterFixture):
                         commondir.rmdir()
                     else:
                         commondir.unlink()
+
+
+class ApplyFilterTests(FilterFixture):
+    """py-sec-2: no git apply runs a filter, whichever attribute selects it."""
+
+    def committed_attributes_repository(self, path, attributes="*.txt filter=evil", name="evil", required=False):
+        # Committed before the driver exists, so the fixture itself runs no filter.
+        repo = self.repository(path, {"f.txt": "one\n", ".gitattributes": attributes + "\n"})
+        self.plant_filter(repo / ".git" / "config", name=name, required=required)
+        return repo
+
+    def test_run_git_cmd_apply_never_runs_a_committed_attributes_filter(self):
+        repo = self.committed_attributes_repository(self.root / "repo", required=True)
+        for options in ((*git_helper.PATCH_APPLY_FLAGS,), ("--check",), ("--index",), ("--3way",)):
+            with self.subTest(options=options):
+                self.git(repo, "-c", "filter.evil.clean=cat", "-c", "filter.evil.smudge=cat", "reset", "-q", "--hard")
+                self.marker.unlink(missing_ok=True)
+                code, _, error = git_helper.run_git_cmd(["git", "apply", *options, "-"], cwd=str(repo),
+                                                        input_data=PATCH.encode())
+                self.assertEqual(code, 0, error)
+                self.assertEqual(self.marker_lines(), [])
+                expected = "one\n" if options == ("--check",) else "one\ntwo\n"
+                self.assertEqual((repo / "f.txt").read_text(), expected)
+
+    def test_apply_disables_drivers_whose_names_c_cannot_carry(self):
+        for index, name in enumerate(("a=b.c", "")):
+            with self.subTest(driver=name):
+                self.marker.unlink(missing_ok=True)
+                repo = self.committed_attributes_repository(self.root / f"repo{index}",
+                                                            attributes=f"*.txt filter={name}", name=name)
+                code, _, error = git_helper.run_git_cmd(["git", "apply", "-"], cwd=str(repo),
+                                                        input_data=PATCH.encode())
+                self.assertEqual(code, 0, error)
+                self.assertEqual(self.marker_lines(), [])
+                self.assertEqual((repo / "f.txt").read_text(), "one\ntwo\n")
+
+    def test_apply_refuses_when_the_filter_configuration_cannot_be_listed(self):
+        repo = self.committed_attributes_repository(self.root / "repo")
+        with (repo / ".git" / "config").open("a") as config:
+            config.write("[broken\n")
+        code, _, error = git_helper.run_git_cmd(["git", "apply", "-"], cwd=str(repo), input_data=PATCH.encode())
+        self.assertNotEqual(code, 0)
+        self.assertIn("Cannot list Git filter drivers", os.fsdecode(error))
+        self.assertEqual((repo / "f.txt").read_text(), "one\n")
+        self.assertEqual(self.marker_lines(), [])
+
+    def test_apply_outside_a_repository_still_applies(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=str(outside), capture_output=True).returncode == 0:
+            self.skipTest("the temporary directory is inside a git repository")
+        (outside / "f.txt").write_text("one\n")
+        code, _, error = git_helper.run_git_cmd(["git", "apply", "-"], cwd=str(outside), input_data=PATCH.encode())
+        self.assertEqual(code, 0, error)
+        self.assertEqual((outside / "f.txt").read_text(), "one\ntwo\n")
+        (outside / "f.txt").write_text("one\n")
+        self.assertEqual(apply_agentic_code_output(f"```diff\n{PATCH}```\n", str(outside)), ["f.txt"])
+        self.assertEqual((outside / "f.txt").read_text(), "one\ntwo\n")
+
+
+class ApiClientApplyTests(FilterFixture):
+    """py-sec-2/py-sec-3: the API relay's diff blocks go through the hardened git path."""
+
+    def test_api_apply_never_runs_a_committed_attributes_filter(self):
+        repo = self.repository(self.root / "repo", {"f.txt": "one\n", ".gitattributes": "*.txt filter=evil\n"})
+        self.plant_filter(repo / ".git" / "config")
+        modified = apply_agentic_code_output(f"```diff\n{PATCH}```\n", str(repo))
+        self.assertEqual(modified, ["f.txt"])
+        self.assertEqual((repo / "f.txt").read_text(), "one\ntwo\n")
+        self.assertEqual(self.marker_lines(), [])
+
+    def test_api_apply_never_executes_a_workspace_git_found_on_path(self):
+        repo = self.repository(self.root / "repo", {"f.txt": "one\n"})
+        planted = repo / "git"
+        planted.write_text(f"#!/bin/sh\necho planted-git >> {shlex.quote(str(self.marker))}\nexit 0\n")
+        planted.chmod(0o755)
+        for entry in (str(repo), "."):
+            with self.subTest(path_entry=entry):
+                self.marker.unlink(missing_ok=True)
+                (repo / "f.txt").write_text("one\n")
+                path = entry + os.pathsep + os.environ.get("PATH", "")
+                with patch.dict(os.environ, {"PATH": path}), patch.object(git_helper, "_RESOLVED_GIT_BINARY", None):
+                    modified = apply_agentic_code_output(f"```diff\n{PATCH}```\n", str(repo))
+                self.assertEqual(self.marker_lines(), [])
+                self.assertEqual(modified, ["f.txt"])
+                self.assertEqual((repo / "f.txt").read_text(), "one\ntwo\n")
 
 
 if __name__ == "__main__":

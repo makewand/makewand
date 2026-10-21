@@ -73,6 +73,13 @@ REVIEW_DIFF_FLAGS = ("--unified=3",)
 # Applying the user's own changes reproduces them byte for byte: apply.whitespace=fix
 # would rewrite them and apply.whitespace=error would refuse them.
 PATCH_APPLY_FLAGS = ("--binary", "--whitespace=nowarn")
+# Attributes read from the empty tree: no .gitattributes in the work tree or index
+# selects a filter, diff or merge driver (info/attributes is shielded separately).
+_EMPTY_TREE_ATTR_SOURCE = "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+# git apply modes that work through the index, the only ones that accept an attribute source.
+_APPLY_INDEX_OPTIONS = frozenset({"--index", "--cached", "--3way", "-3"})
+# Settings that leave a filter driver no command to run and make git not insist on it.
+_DISABLED_FILTER_DRIVER = (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))
 # Global git options whose value is a separate argument (``git -C dir diff``).
 _GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
 
@@ -367,6 +374,32 @@ def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path
     return paths
 
 
+def _disabled_filter_drivers(cwd, timeout) -> Dict[str, str]:
+    """Command-scope configuration disabling every filter driver git's configuration defines for ``cwd``.
+
+    Given as GIT_CONFIG_COUNT/KEY/VALUE because ``-c`` cannot carry a driver name
+    containing ``=``; an empty name is a driver too (``filter=``). Raises OSError
+    when git cannot list the configuration; the caller refuses the command.
+    """
+    code, listing, error = run_git_cmd(["git", "config", "--null", "--name-only", "--get-regexp", r"^filter\."],
+                                       cwd=cwd, binary=True, timeout=timeout)
+    if code == 1:  # no filter setting at all
+        return {}
+    if code != 0:
+        raise OSError(f"Cannot list Git filter drivers: {os.fsdecode(error).strip()}")
+    names: Dict[str, None] = {}
+    for key in listing.split(b"\0"):
+        name, dot, _ = key[len(b"filter."):].rpartition(b".")
+        if key.startswith(b"filter.") and dot:
+            names[os.fsdecode(name)] = None
+    settings = [(f"filter.{name}.{variable}", value) for name in names for variable, value in _DISABLED_FILTER_DRIVER]
+    config = {"GIT_CONFIG_COUNT": str(len(settings))} if settings else {}
+    for index, (key, value) in enumerate(settings):
+        config[f"GIT_CONFIG_KEY_{index}"] = key
+        config[f"GIT_CONFIG_VALUE_{index}"] = value
+    return config
+
+
 def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout=None):
     shielded_infos: List[Tuple[Any, ...]] = []
     if timeout is None:
@@ -397,14 +430,24 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
 
         process_cwd = filesystem_path(cwd) if cwd is not None else None
         safe_git = resolve_safe_git_binary(cwd=process_cwd)
+        command_config: Dict[str, str] = {}
         if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "git" and safe:
-            subcmd = cmd[1] if len(cmd) > 1 else ""
-            extra_global = ["--no-pager"]
-            if subcmd not in ["apply", "clone"]:
-                extra_global.append("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904")
-            exec_cmd = [safe_git] + extra_global + SAFE_GIT_SECURITY_FLAGS + cmd[1:]
             sub_index = _git_subcommand_index(cmd)
-            if sub_index is not None and cmd[sub_index] == "diff":
+            subcommand = cmd[sub_index] if sub_index is not None else None
+            extra_global = ["--no-pager"]
+            if subcommand == "apply":
+                # git (2.55) segfaults on worktree-mode apply, --check included, under
+                # any attribute source: it reads the preimage through convert_to_git
+                # without an index. Outside a repository --attr-source makes every
+                # apply die. Only the index modes take one; every apply runs with each
+                # configured filter driver disabled, whichever attribute selects it.
+                if _APPLY_INDEX_OPTIONS.intersection(cmd[sub_index + 1:]):
+                    extra_global.append(_EMPTY_TREE_ATTR_SOURCE)
+                command_config = _disabled_filter_drivers(cwd, timeout)
+            elif cmd[1:2] != ["clone"]:
+                extra_global.append(_EMPTY_TREE_ATTR_SOURCE)
+            exec_cmd = [safe_git] + extra_global + SAFE_GIT_SECURITY_FLAGS + cmd[1:]
+            if subcommand == "diff":
                 # Also after global options (``git --no-replace-objects diff``).
                 position = len(exec_cmd) - len(cmd) + sub_index + 1
                 exec_cmd[position:position] = [flag for flag in DIFF_FORMAT_FLAGS if flag not in cmd]
@@ -422,6 +465,7 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             process_cwd = windows_git_directory(cwd)
         git_env = _sanitize_git_env() if safe else os.environ.copy()
         if safe:
+            git_env.update(command_config)
             if _diff_index.get() is not None:
                 git_env["GIT_INDEX_FILE"] = _diff_index.get()
 

@@ -71,6 +71,7 @@ All notable changes to this project are documented here. The format is based on
 2026-10-21 评估修复（Python 宿主侧 Git；详见 docs/VERIFICATION_CONTRACT.md）：
 
 - **属性屏蔽覆盖 commondir**：按 git 自身的仓库发现规则读取文件（`.git` 文件、`.git` 目录、隐式裸仓库及各自的 `commondir`，逐字节按 git 的格式解析），`.git` 是目录时也屏蔽 `commondir` 所指公共目录的 `info/attributes`；`.git` 文件或 `commondir` 无法读取时拒绝运行 git。此前植入的 clean/smudge filter 可在宿主审查 diff 时执行。
+- **`git apply` 不再执行 filter**：工作树模式的 apply 带任何属性来源都会使 git（2.55）段错误、在仓库外直接退出，因此每次 apply 都以命令级配置（`GIT_CONFIG_COUNT`）禁用全部已配置的 filter 驱动（含名称带 `=` 或为空的驱动），`--index`/`--cached`/`--3way` 另以空树为属性来源。API 中转的 diff 块改经 `run_git_cmd` 应用，获得安全配置参数、属性屏蔽、filter 禁用与工作区外的 git 二进制（不再经继承的 `PATH` 执行工作区内的 `git`）。
 
 ### Added
 
