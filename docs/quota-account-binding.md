@@ -51,6 +51,17 @@ Go snapshot reads recheck the current plain identifier, so an in-process login
 change cannot inherit a prior account's quota or its exhaustion seal. Seals are
 account-bound, remain in memory, and never enter the raw disk observations.
 
+Go refreshes read the cache through per source. A source is read only when the
+cache holds no read of its current login (provider plus account reference)
+within the cache TTL, the refresh interval by default, or within 10 minutes when
+that read found no current account-bound evidence; the other sources are served
+from the cache. The reads are recorded in the snapshot's `reads` map (time, and
+whether evidence was found) and never stand in for another account. A fresh cache
+therefore lets `makewand quota`, the TUI and `serve` start without reading any
+source, also when one source has no evidence (stock Codex logs, a missing agy, a
+Claude login that names no account); evidence such a source gains shows up at most
+10 minutes late.
+
 Both readers reject observations older than 15 minutes and reset windows, even
 if another account just updated the cache file or a log was touched. Each
 window keeps its own observation time. Version 1 snapshots are never current

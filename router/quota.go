@@ -359,6 +359,9 @@ func (s *QuotaSnapshotter) repoTrustLevel() RepoTrust {
 
 // WithDiskCache enables a shared disk cache at path with the given freshness TTL.
 // Returns the receiver for chaining. ttl<=0 defaults to the refresh interval.
+// A refresh reads only the sources whose current login was not read within ttl
+// (within quotaNoEvidenceTTL when that read found no current evidence) and
+// serves the others from the cache.
 func (s *QuotaSnapshotter) WithDiskCache(path string, ttl time.Duration) *QuotaSnapshotter {
 	if ttl <= 0 {
 		ttl = s.interval
@@ -441,7 +444,8 @@ func (s *QuotaSnapshotter) LoadCache() {
 }
 
 // Start launches the background refresh loop and blocks for the first refresh so
-// callers immediately see local sources (codex). It returns after the initial
+// callers immediately see local sources (codex); with a fresh disk cache that
+// refresh reads no source (WithDiskCache). It returns after the initial
 // refresh; the loop stops when ctx is cancelled.
 //
 // Start is idempotent: repeated calls are a no-op (they neither refresh again
@@ -483,32 +487,34 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 
-	// Read-through: adopt a fresh on-disk snapshot instead of hitting the sources.
-	// A stale cache still serves as the cross-process last-good baseline below.
+	// Read-through, per source: a login read recently enough (freshCachedRead)
+	// is served from the shared disk cache, and only the missing and stale
+	// sources are read. The whole cache, stale or not, also serves as the
+	// cross-process last-good baseline below.
+	var disk quotaDiskCache
 	var diskPrev map[string]ProviderQuota
 	if s.cachePath != "" {
-		if cached, takenAt, ok := loadQuotaCache(s.cachePath, s.cacheTTL); ok {
-			cached = s.selectCachedQuotas(cached)
-			if len(cached) == len(s.sources) {
-				s.current.Store(&QuotaSnapshot{byProvider: cached, takenAt: takenAt})
-				return
-			}
-		}
-		diskPrev, _, _ = loadQuotaCache(s.cachePath, 0) // ignore TTL: last-good only
-		diskPrev = s.selectCachedQuotas(diskPrev)
+		disk, _ = readQuotaDiskCache(s.cachePath)
+		diskPrev = s.selectCachedQuotas(disk.entries)
 	}
 
 	prev := &QuotaSnapshot{byProvider: s.selectCachedQuotas(s.current.Load().byProvider)}
 	next := make(map[string]ProviderQuota, len(s.sources))
 
 	type result struct {
-		q   ProviderQuota
-		err error
+		q    ProviderQuota
+		err  error
+		read bool // read now, not served from the disk cache
 	}
 	results := make([]result, len(s.sources))
 	untrusted := s.repoTrustLevel() == RepoTrustUntrusted
+	readAny := false
 	var wg sync.WaitGroup
 	for i, src := range s.sources {
+		if q, fresh := s.freshCachedRead(src, disk); fresh {
+			results[i] = result{q: q}
+			continue
+		}
 		// Untrusted repo mode: never exec a local CLI (e.g. `agy models`) just to
 		// probe quota. Mark the source as skipped so the merge below keeps last-good
 		// or neutral for it, without launching the subprocess.
@@ -516,17 +522,20 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 			results[i] = result{q: ProviderQuota{Provider: src.Provider()}, err: errUntrustedRepoSkipProbe}
 			continue
 		}
+		readAny = true
 		wg.Add(1)
 		go func(i int, src QuotaSource) {
 			defer wg.Done()
 			rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			defer cancel()
 			q, err := src.Read(rctx)
-			results[i] = result{q: q, err: err}
+			results[i] = result{q: q, err: err, read: true}
 		}(i, src)
 	}
 	wg.Wait()
 
+	takenAt := time.Now()
+	reads := make(map[string]quotaRead)
 	for i, src := range s.sources {
 		name := strings.ToLower(src.Provider())
 		r := results[i]
@@ -539,6 +548,9 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 			}
 		} else if identity.AccountRef != "" && r.q.AccountRef != identity.AccountRef {
 			r.q = identity
+		}
+		if r.read {
+			reads[quotaReadKey(src, identity)] = quotaRead{At: takenAt, NoEvidence: r.err == nil && !r.q.HasData}
 		}
 		if r.err != nil || !r.q.HasData {
 			// Keep last-good rather than dropping to neutral: a transient read
@@ -564,55 +576,124 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context) {
 		next[name] = r.q
 	}
 
+	if s.cachePath != "" && !readAny {
+		// Every source was served from the cache: there is nothing new to store.
+		s.current.Store(&QuotaSnapshot{byProvider: next, takenAt: disk.takenAt})
+		return
+	}
 	// Write-through: persist the raw source data (pre-seal) so other processes
 	// can reuse it. Seals stay in-memory only.
-	takenAt := time.Now()
 	if s.cachePath != "" {
-		storeQuotaCache(s.cachePath, next, takenAt)
+		storeQuotaCache(s.cachePath, next, reads, takenAt)
 	}
 
 	// Keep raw observations immutable; Snapshot overlays account-bound seals.
 	s.current.Store(&QuotaSnapshot{byProvider: next, takenAt: takenAt})
 }
 
-// quotaDiskFormat is the on-disk cache schema.
-type quotaDiskFormat struct {
-	Version   int             `json:"version"`
-	TakenAt   time.Time       `json:"taken_at"`
-	Providers []ProviderQuota `json:"providers"`
+// quotaNoEvidenceTTL is how long a source read that found no current
+// account-bound evidence is reused before the source is read again. A source
+// that rarely or never has any (stock Codex logs carry no account id, agy may be
+// missing, a Claude login may name no account) would otherwise be read by every
+// refresh; evidence it gains meanwhile shows up at most this late.
+const quotaNoEvidenceTTL = 10 * time.Minute
+
+// quotaRead records when the snapshotter last read a source for one login and
+// whether that read found no current evidence. Reads are keyed like the cache
+// entries (quotaReadKey).
+type quotaRead struct {
+	At         time.Time `json:"at"`
+	NoEvidence bool      `json:"no_evidence,omitempty"`
 }
 
-// loadQuotaCache returns the cached provider map and its timestamp when the cache
-// file exists and is younger than ttl.
-func loadQuotaCache(path string, ttl time.Duration) (map[string]ProviderQuota, time.Time, bool) {
+// quotaReadKey is the cache key of src's current login: that of its identity,
+// or of the provider for a source without identity support.
+func quotaReadKey(src QuotaSource, identity ProviderQuota) string {
+	if identity.AccountRef != "" {
+		return quotaCacheKey(identity)
+	}
+	return strings.ToLower(src.Provider())
+}
+
+// freshCachedRead returns the disk cache's entry for src's current login when
+// that login was read recently enough not to read it again: within the cache
+// TTL, or within quotaNoEvidenceTTL (at least the cache TTL) when that read
+// found no current evidence. A read of another account or credential root is
+// keyed apart and never stands in for this login.
+func (s *QuotaSnapshotter) freshCachedRead(src QuotaSource, disk quotaDiskCache) (ProviderQuota, bool) {
+	identity, _ := sourceQuotaIdentity(src)
+	key := quotaReadKey(src, identity)
+	read, ok := disk.reads[key]
+	if !ok {
+		return ProviderQuota{}, false
+	}
+	ttl := s.cacheTTL
+	if read.NoEvidence {
+		ttl = max(ttl, quotaNoEvidenceTTL)
+	}
+	if age := time.Since(read.At); age > ttl || age < -time.Minute {
+		return ProviderQuota{}, false
+	}
+	q, ok := disk.entries[key]
+	if !ok {
+		q = identity
+	}
+	return q, true
+}
+
+// quotaDiskFormat is the on-disk cache schema.
+type quotaDiskFormat struct {
+	Version   int                  `json:"version"`
+	TakenAt   time.Time            `json:"taken_at"`
+	Providers []ProviderQuota      `json:"providers"`
+	Reads     map[string]quotaRead `json:"reads,omitempty"`
+}
+
+// quotaDiskCache is a decoded disk cache: its entries and source reads by
+// cache key, and when it was last written.
+type quotaDiskCache struct {
+	entries map[string]ProviderQuota
+	reads   map[string]quotaRead
+	takenAt time.Time
+}
+
+func readQuotaDiskCache(path string) (quotaDiskCache, bool) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, time.Time{}, false
+		return quotaDiskCache{}, false
 	}
 	var d quotaDiskFormat
 	if err := json.Unmarshal(raw, &d); err != nil || (d.Version != 1 && d.Version != 2) {
-		return nil, time.Time{}, false
+		return quotaDiskCache{}, false
 	}
-	if ttl > 0 && time.Since(d.TakenAt) > ttl {
-		return nil, time.Time{}, false
-	}
-	m := make(map[string]ProviderQuota, len(d.Providers))
+	c := quotaDiskCache{entries: make(map[string]ProviderQuota, len(d.Providers)), reads: d.Reads, takenAt: d.TakenAt}
 	for _, q := range d.Providers {
 		if d.Version == 1 {
 			// Legacy snapshots remain history, regardless of extra binding fields.
 			q.IdentityKnown, q.PoolRef = false, ""
 		}
 		key := quotaCacheKey(q)
-		if old, exists := m[key]; !exists || q.SourceAt.After(old.SourceAt) {
-			m[key] = q
+		if old, exists := c.entries[key]; !exists || q.SourceAt.After(old.SourceAt) {
+			c.entries[key] = q
 		}
 	}
-	return m, d.TakenAt, true
+	return c, true
 }
 
-// storeQuotaCache atomically writes the provider map to path. Best-effort:
-// errors (e.g. unwritable cache dir) are ignored — caching is an optimization.
-func storeQuotaCache(path string, m map[string]ProviderQuota, takenAt time.Time) {
+// loadQuotaCache returns the cached provider map and its timestamp when the cache
+// file exists and is younger than ttl.
+func loadQuotaCache(path string, ttl time.Duration) (map[string]ProviderQuota, time.Time, bool) {
+	c, ok := readQuotaDiskCache(path)
+	if !ok || (ttl > 0 && time.Since(c.takenAt) > ttl) {
+		return nil, time.Time{}, false
+	}
+	return c.entries, c.takenAt, true
+}
+
+// storeQuotaCache atomically writes the provider map, with the source reads
+// behind it, to path. Best-effort: errors (e.g. unwritable cache dir) are
+// ignored — caching is an optimization.
+func storeQuotaCache(path string, m map[string]ProviderQuota, reads map[string]quotaRead, takenAt time.Time) {
 	if os.MkdirAll(filepath.Dir(path), 0o755) != nil {
 		return
 	}
@@ -637,8 +718,10 @@ func storeQuotaCache(path string, m map[string]ProviderQuota, takenAt time.Time)
 	}
 	locked = true
 	// Preserve other accounts (and legacy history), instead of provider-wide
-	// overwrite. Only a newer observation can replace the same account's data.
-	previous, _, _ := loadQuotaCache(path, 0)
+	// overwrite. Only a newer observation can replace the same account's data,
+	// and only a newer read the record of a login's last read.
+	cached, _ := readQuotaDiskCache(path)
+	previous := cached.entries
 	if previous == nil {
 		previous = make(map[string]ProviderQuota)
 	}
@@ -650,12 +733,21 @@ func storeQuotaCache(path string, m map[string]ProviderQuota, takenAt time.Time)
 			previous[key] = q
 		}
 	}
+	merged := make(map[string]quotaRead, len(cached.reads)+len(reads))
+	for key, read := range cached.reads {
+		merged[key] = read
+	}
+	for key, read := range reads {
+		if old, exists := merged[key]; !exists || read.At.After(old.At) {
+			merged[key] = read
+		}
+	}
 	providers := make([]ProviderQuota, 0, len(previous))
 	for _, q := range previous {
 		providers = append(providers, q)
 	}
 	sort.Slice(providers, func(i, j int) bool { return quotaCacheKey(providers[i]) < quotaCacheKey(providers[j]) })
-	b, err := json.MarshalIndent(quotaDiskFormat{Version: 2, TakenAt: takenAt, Providers: providers}, "", "  ")
+	b, err := json.MarshalIndent(quotaDiskFormat{Version: 2, TakenAt: takenAt, Providers: providers, Reads: merged}, "", "  ")
 	if err != nil {
 		return
 	}
