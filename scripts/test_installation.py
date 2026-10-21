@@ -73,6 +73,39 @@ class InstallationTests(unittest.TestCase):
                     self.assertNotIn("install_source.py'", stderr)
             self.assertEqual(sorted(path.name for path in temp.iterdir()), [], "nothing may be installed")
 
+    @unittest.skipIf(os.name == "nt", "source installation requires POSIX")
+    def test_path_hint_prints_an_exact_export_line_only_when_needed(self):
+        # The installer ended with "Run makewand status" even when ~/.local/bin
+        # was not on PATH (macOS zsh, a fresh Linux account).
+        module = installer_module()
+        with tempfile.TemporaryDirectory(prefix="makewand-path-hint-") as directory:
+            root = Path(directory).resolve()
+            home, older = root / "home", root / "older"
+            binaries = home / ".local" / "bin"
+            odd = root / 'odd "dir" $HOME `x` \\ end'
+            for folder in (binaries, odd, older):
+                folder.mkdir(parents=True)
+                (folder / "makewand").write_text("#!/bin/sh\n", encoding="utf-8")
+                (folder / "makewand").chmod(0o755)
+            for path in (f"/usr/bin:{binaries}", f"{binaries}/:{older}", "~/.local/bin:/usr/bin"):
+                with self.subTest(path=path), patch.dict(os.environ, {"HOME": str(home), "PATH": path}):
+                    self.assertIsNone(module.path_hint(binaries))
+            cases = ((binaries, "/usr/bin", "is not on your PATH", '  export PATH="$HOME/.local/bin:$PATH"'),
+                     (binaries, f"{older}:{binaries}", f"runs {older / 'makewand'}, found before {binaries}",
+                      '  export PATH="$HOME/.local/bin:$PATH"'),
+                     (odd, "/usr/bin", "is not on your PATH", None))
+            for target, path, problem, line in cases:
+                with self.subTest(target=target.name, path=path), patch.dict(os.environ, {"HOME": str(home), "PATH": path}):
+                    hint = module.path_hint(target)
+                    self.assertIn(problem, hint)
+                    export = hint.splitlines()[-1]
+                    if line:
+                        self.assertEqual(export, line)
+                    # Run by a shell, the printed line puts exactly that directory first.
+                    probe = subprocess.run([find_bash(), "-c", export.strip() + '; printf "%s" "${PATH%%:*}"'],
+                                           env={"HOME": str(home), "PATH": "/usr/bin"}, capture_output=True, text=True)
+                    self.assertEqual(probe.stdout, str(target), probe.stderr)
+
     def test_failed_upgrade_preserves_complete_previous_version(self):
         with tempfile.TemporaryDirectory(prefix="makewand-upgrade-") as directory:
             temp = Path(directory)
@@ -213,8 +246,15 @@ class InstallationTests(unittest.TestCase):
                        MAKEWAND_INSTALL_ROOT=str(app), MAKEWAND_SOURCE_DIR=str(app), MAKEWAND_BIN_DIR=str(binaries),
                        MAKEWAND_SKILLS_DIR=str(temp / "skills"), MAKEWAND_CONFIG_DIR=str(temp / "config"),
                        PYTHONPATH=str(hostile))
-            subprocess.run([find_bash(), str(ROOT / "site" / "install.sh")], cwd=hostile, env=env,
-                           check=True, capture_output=True, text=True)
+            installed = subprocess.run([find_bash(), str(ROOT / "site" / "install.sh")], cwd=hostile, env=env,
+                                       check=True, capture_output=True, text=True)
+            # The bin directory is not on this PATH: say how to add it before
+            # telling the user to run makewand.
+            self.assertIn(f"Note: {binaries.resolve()} is not on your PATH", installed.stdout)
+            self.assertIn("  export PATH=", installed.stdout)
+            self.assertTrue(installed.stdout.rstrip().endswith(
+                "Add the PATH line above to your shell profile, open a new shell, then run makewand status "
+                "to inspect available providers."), installed.stdout)
             self.assertFalse((binaries / "makewand").is_symlink())
             self.assertEqual(before, hashlib.sha256((app / "bin" / "makewand").read_bytes()).hexdigest())
             for args in (("--version",), ("--help",), ("review", "--repo-trust", "untrusted", "--help"),
