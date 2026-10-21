@@ -17,6 +17,23 @@ func (r *Router) healthKey(provider string) string {
 	return provider
 }
 
+// blockedDetail is circuitOpenDetail for provider's refused calls, naming what
+// refuses them: the provider's own open circuit or rate-limit block or, for
+// the calls of a model a client named, that model's key. A block of one named
+// model is then never reported, to the client or in traces, as the provider's.
+func (r *Router) blockedDetail(provider string, remaining time.Duration) string {
+	if key := r.healthKey(provider); key != provider {
+		blocked, _ := r.quotaHardBlocked(provider)
+		if !blocked && r.breaker != nil {
+			blocked, _ = r.breaker.PeekOpen(provider)
+		}
+		if !blocked {
+			provider = key
+		}
+	}
+	return circuitOpenDetail(provider, remaining)
+}
+
 // isCircuitOpen reports whether an open circuit refuses provider's calls: the
 // provider's own or, when they are recorded under another key, that key's.
 func (r *Router) isCircuitOpen(provider string) (bool, time.Duration) {

@@ -342,6 +342,72 @@ func TestHTTPNamedOpenAIModelRecordsItsOwnOutcomes(t *testing.T) {
 	}
 }
 
+// A request refused because its named model's own route is blocked says so,
+// to the client and in skip traces: an o1-only 429 was reported as "circuit
+// open for openai", an outage of a route that kept serving. A refusal because
+// the openai route itself is blocked still names openai.
+func TestHTTPNamedOpenAIModelRefusalsNameTheBlockedRoute(t *testing.T) {
+	traced := func(r *Router) func() []string {
+		var mu sync.Mutex
+		var details []string
+		r.SetTraceSink(TraceSinkFunc(func(e TraceEvent) {
+			if strings.HasPrefix(e.Detail, "circuit open for ") {
+				mu.Lock()
+				details = append(details, e.Detail)
+				mu.Unlock()
+			}
+		}))
+		return func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			taken := details
+			details = nil
+			return taken
+		}
+	}
+	for _, tc := range []struct{ status, failures int }{
+		{http.StatusNotFound, defaultCircuitFailureThreshold}, // o1's circuit opens
+		{http.StatusTooManyRequests, 1},                       // o1 is rate-limit blocked
+	} {
+		r := namedModelRouter(newNamedModelUpstream(t, map[string]int{"o1": tc.status}), NewQuotaSnapshotter(time.Hour))
+		take := traced(r)
+		h := r.HTTPHandler(HTTPHandlerOptions{})
+		for range tc.failures {
+			postFix16Chat(t, h, "", namedModelChat("o1", false))
+		}
+		take()
+		for _, stream := range []bool{false, true} {
+			rec := postFix16Chat(t, h, "", namedModelChat("o1", stream))
+			if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "openai:o1") {
+				t.Fatalf("upstream %d: o1 stream=%t: status %d body %s, want 503 naming openai:o1", tc.status, stream, rec.Code, rec.Body.String())
+			}
+		}
+		details := take()
+		if len(details) == 0 {
+			t.Fatalf("upstream %d: no skip traced", tc.status)
+		}
+		for _, detail := range details {
+			if !strings.HasPrefix(detail, "circuit open for openai:o1 ") {
+				t.Fatalf("upstream %d: skip detail %q, want o1's own route", tc.status, detail)
+			}
+		}
+	}
+
+	r := namedModelRouter(newNamedModelUpstream(t, map[string]int{"gpt-4o": http.StatusServiceUnavailable}), nil)
+	take := traced(r)
+	h := r.HTTPHandler(HTTPHandlerOptions{})
+	for range defaultCircuitFailureThreshold {
+		postFix16Chat(t, h, "", namedModelChat("openai", false))
+	}
+	take()
+	if rec := postFix16Chat(t, h, "", namedModelChat("o1", false)); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("o1 with openai's circuit open: status %d body %s", rec.Code, rec.Body.String())
+	}
+	if details := take(); len(details) == 0 || !strings.HasPrefix(details[0], "circuit open for openai (") {
+		t.Fatalf("skip details %q, want openai's own circuit", details)
+	}
+}
+
 // A named model's calls honor the openai route's rate-limit block and open
 // circuit, so a provider-wide failure seen by the route stops them too, but
 // never take the route's half-open probe: only the route's own calls, which

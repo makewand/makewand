@@ -1190,7 +1190,7 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 				Phase:     buildPhaseName(phase),
 				Requested: name,
 				Selected:  name,
-				Detail:    circuitOpenDetail(name, remaining),
+				Detail:    r.blockedDetail(name, remaining),
 			})
 		} else {
 			p, modelID, resolveErr := r.tryBuildProvider(name, bs.Tier)
@@ -1324,7 +1324,9 @@ func (r *Router) RouteProvider(name string, phase BuildPhase, exclude ...string)
 		Error:     "no provider available for build phase",
 	})
 
-	return RouteResult{}, fmt.Errorf("no provider available for build phase (requested %s)", name)
+	// A client-named model's request names its own route ("openai:o1"), so a
+	// refusal of that model is not taken for an outage of the provider.
+	return RouteResult{}, fmt.Errorf("no provider available for build phase (requested %s)", r.healthKey(name))
 }
 
 // ChatWith sends a message to a specific provider for a build phase.

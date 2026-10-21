@@ -108,7 +108,7 @@ func (r *Router) tryProvider(ac *attemptContext, id attemptIdentity) tryProvider
 	// Circuit breaker pre-check
 	allow, remaining, ticket := r.admitProviderAttempt(id.name)
 	if !allow {
-		detail := circuitOpenDetail(id.name, remaining)
+		detail := r.blockedDetail(id.name, remaining)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.fallbackSkipped,
 			Task:       ac.taskLabel,
@@ -631,7 +631,7 @@ func (r *Router) tryStreamProvider(ac *attemptContext, id attemptIdentity) trySt
 	// Circuit breaker pre-check
 	allow, remaining, ticket := r.admitProviderAttempt(id.name)
 	if !allow {
-		detail := circuitOpenDetail(id.name, remaining)
+		detail := r.blockedDetail(id.name, remaining)
 		r.emitTrace(TraceEvent{
 			Event:      ac.labels.fallbackSkipped,
 			Task:       ac.taskLabel,
