@@ -181,6 +181,7 @@ func TestQuotaIdentityRewriteRestoringSizeAndMtimeIsReadAgain(t *testing.T) {
 	old := time.Now().Add(-time.Hour).Truncate(time.Second)
 	write := func(account string) {
 		t.Helper()
+		// #nosec G703 -- path is the auth.json this test created under t.TempDir().
 		if err := os.WriteFile(path, []byte(`{"tokens":{"account_id":"`+account+`"}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}

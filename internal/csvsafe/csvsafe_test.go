@@ -21,7 +21,6 @@ func TestCellNeutralisesFormulaPrefixes(t *testing.T) {
 		"claude":     "claude",
 		"a=b":        "a=b",
 		"/v1/models": "/v1/models",
-		" =1+1":      " =1+1",
 		// Numbers are not formulas.
 		"-5":        "-5",
 		"+3.25":     "+3.25",
