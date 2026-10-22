@@ -99,30 +99,38 @@ func readQuotaIdentity(provider, root string) ProviderQuota {
 // quotaIdentityMemo remembers a quota source's last identity read. Routing asks
 // for a candidate's identity several times per request (Snapshot, Sealed), and
 // a long-used ~/.claude.json is hundreds of KB, so the file is read again only
-// once its stamp changes.
+// once its stamp changes. Where file info carries no change time (Windows),
+// the file is read every time.
 type quotaIdentityMemo struct {
 	mu       sync.Mutex
 	stamp    quotaIdentityStamp
 	identity ProviderQuota
 }
 
-// quotaIdentityStamp identifies the identity file version a read saw:
-// rewriting or replacing the file changes its inode, size or modification time.
+// quotaIdentityStamp identifies the identity file version a read saw. Writing
+// the file, restoring its modification time and replacing it with a new inode,
+// whatever its number, each move its change time (ctime), which no user can
+// set.
 type quotaIdentityStamp struct {
 	provider, root, path string
 	dev, ino             uint64
 	size, mtimeNanos     int64
+	changeTimeNanos      int64
 }
 
-// quotaIdentityRacyWindow: a file modified this shortly before it was
-// inspected can be modified again within the same tick of a coarse
-// filesystem clock (up to 2 s on some filesystems) and keep its stamp, so its
-// read is not reused.
+// quotaIdentityRacyWindow: a file modified or changed this shortly before it
+// was inspected can change again within the same tick of a coarse filesystem
+// clock (up to 2 s on some filesystems) and keep its stamp, so its read is not
+// reused.
 const quotaIdentityRacyWindow = 2 * time.Second
 
 // quotaIdentityFileRead is a test hook called with the path of every identity
 // file read.
 var quotaIdentityFileRead atomic.Pointer[func(path string)]
+
+// quotaIdentityClock is a test hook that replaces time.Now as the time
+// identity files are inspected at.
+var quotaIdentityClock atomic.Pointer[func() time.Time]
 
 // read returns the identity of provider's login under root: from the memo
 // while the identity file keeps the stamp of its last read, otherwise read
@@ -138,13 +146,17 @@ func (m *quotaIdentityMemo) read(provider, root string) ProviderQuota {
 		}
 	}
 	inspected := time.Now()
+	if clock := quotaIdentityClock.Load(); clock != nil {
+		inspected = (*clock)()
+	}
 	info, err := cliInspectIdentityMetadata(path)
 	if err != nil {
 		return q
 	}
-	dev, ino := quotaIdentityFileID(info)
-	stamp := quotaIdentityStamp{provider: provider, root: root, path: path, dev: dev, ino: ino, size: info.Size(), mtimeNanos: info.ModTime().UnixNano()}
-	reusable := m != nil && info.ModTime().Before(inspected.Add(-quotaIdentityRacyWindow))
+	dev, ino, changed, versioned := quotaIdentityFileVersion(info)
+	stamp := quotaIdentityStamp{provider: provider, root: root, path: path, dev: dev, ino: ino, size: info.Size(), mtimeNanos: info.ModTime().UnixNano(), changeTimeNanos: changed.UnixNano()}
+	settled := inspected.Add(-quotaIdentityRacyWindow)
+	reusable := m != nil && versioned && info.ModTime().Before(settled) && changed.Before(settled)
 	if reusable {
 		m.mu.Lock()
 		identity, hit := m.identity, m.stamp == stamp
