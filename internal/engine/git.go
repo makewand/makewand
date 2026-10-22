@@ -89,7 +89,31 @@ var safeGitFlags = []string{
 	"-c", "commit.gpgsign=false",
 }
 
-const safeGitAttrSource = "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+// emptyTreeOIDs is the empty tree of each object format. Attributes are read from it
+// (--attr-source), so no .gitattributes in the work tree or index selects a filter.
+var emptyTreeOIDs = map[string]string{
+	"sha1":   "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+	"sha256": "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+}
+
+// gitAttrSource is --attr-source naming the empty tree in the repository's own object
+// format: git resolves a hex string of another length as a ref name, and a branch named
+// like the SHA-1 id would hand a SHA-256 repository's attributes to that branch's tree.
+// A format git cannot report refuses the command.
+func (p *Project) gitAttrSource(ctx context.Context) (string, error) {
+	args := append([]string{"--no-pager"}, safeGitFlags...)
+	args = append(args, "rev-parse", "--show-object-format")
+	result, err := p.Exec(ctx, "git", args...)
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse: %w", err)
+	}
+	format := strings.TrimSpace(result.Stdout)
+	oid, ok := emptyTreeOIDs[format]
+	if result.ExitCode != 0 || !ok {
+		return "", fmt.Errorf("read the repository's object format (%q): %s", format, strings.TrimSpace(result.Stderr))
+	}
+	return "--attr-source=" + oid, nil
+}
 
 // shieldGitAttributes temporarily masks any info/attributes files across primary
 // and linked worktrees to prevent host clean/smudge filters from executing.
@@ -280,8 +304,12 @@ func (p *Project) GitCommit(ctx context.Context, message string) error {
 		return fmt.Errorf("shield git attributes: %w", err)
 	}
 	defer cleanup()
+	attrSource, err := p.gitAttrSource(ctx)
+	if err != nil {
+		return err
+	}
 
-	addArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	addArgs := append([]string{"--no-pager", attrSource}, safeGitFlags...)
 	addArgs = append(addArgs, "add", "-A")
 	addResult, err := p.Exec(ctx, "git", addArgs...)
 	if err != nil {
@@ -291,7 +319,7 @@ func (p *Project) GitCommit(ctx context.Context, message string) error {
 		return fmt.Errorf("git add failed: %s", addResult.Stderr)
 	}
 
-	commitArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	commitArgs := append([]string{"--no-pager", attrSource}, safeGitFlags...)
 	commitArgs = append(commitArgs, "commit", "-m", message)
 	result, err := p.Exec(ctx, "git", commitArgs...)
 	if err != nil {
@@ -311,8 +339,12 @@ func (p *Project) GitStatus(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("shield git attributes: %w", err)
 	}
 	defer cleanup()
+	attrSource, err := p.gitAttrSource(ctx)
+	if err != nil {
+		return "", err
+	}
 
-	statusArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	statusArgs := append([]string{"--no-pager", attrSource}, safeGitFlags...)
 	statusArgs = append(statusArgs, "status", "--short")
 	result, err := p.Exec(ctx, "git", statusArgs...)
 	if err != nil {
@@ -328,8 +360,12 @@ func (p *Project) GitDiff(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("shield git attributes: %w", err)
 	}
 	defer cleanup()
+	attrSource, err := p.gitAttrSource(ctx)
+	if err != nil {
+		return "", err
+	}
 
-	diffArgs := append([]string{"--no-pager", safeGitAttrSource}, safeGitFlags...)
+	diffArgs := append([]string{"--no-pager", attrSource}, safeGitFlags...)
 	diffArgs = append(diffArgs, "diff", "--no-ext-diff", "--no-textconv")
 	result, err := p.Exec(ctx, "git", diffArgs...)
 	if err != nil {
