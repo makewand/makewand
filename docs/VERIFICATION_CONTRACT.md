@@ -384,8 +384,15 @@ Diffs run `--submodule=short --ignore-submodules=dirty` and `git status` runs
 `submodule.<name>.ignore` that `.gitmodules` (a work-tree file) sets. git still
 reports a submodule whose commit pointer moved. `git add` reads no such setting,
 so makewand's `git add -A` (`git_helper.add_all`, also for its private diff
-indexes) leaves gitlinks out and stages them with `git update-index`, which only
-reads each nested `HEAD`. The host rollback unstages with `git rm --cached -f`:
+indexes) marks each gitlink of the index assume-unchanged for the add, which then
+never looks at it, unmarks it right after, and stages it with `git update-index`,
+which only reads each nested `HEAD`; a gitlink below a symlinked directory is
+dropped from the index unread, as `git add -A` drops it. Exclude pathspecs are not
+used: `git add` refuses them once a directory above a gitlink is ignored or a
+symlink. A gitlink the user marked assume-unchanged or skip-worktree is left
+alone, as `git add -A` leaves it. A makewand process killed between the marking
+and the unmarking leaves the gitlinks marked; `git update-index
+--no-assume-unchanged <path>` clears them. The host rollback unstages with `git rm --cached -f`:
 without `-f`, git rm's up-to-date check runs `git status` inside a staged nested
 repository (and refuses a path whose staged content differs from both `HEAD` and
 the file). The shadow copy checks each submodule out with `checkout -q`, and the
@@ -440,7 +447,20 @@ registered submodule's changes from these checks. A submodule that builds or
 tests write untracked files into, which a repository may mark
 `ignore = untracked`, now counts as dirty: the isolation check picks the shadow
 copy, and the shadow delivery's clean checks and the DAG checkpoints refuse while
-it stays so.
+it stays so. `.gitmodules` is read with `git config -z`, so a submodule name or
+path may hold any whitespace, quotes or non-ASCII characters. A registered
+submodule below a symlinked directory or a junction is never asked (git status
+takes it for deleted), and `git submodule status` refuses such a registration, so
+the review diff and the shadow copy fail closed on it.
+
+The auto-fix loop's capture and restore of dirty files
+(`orchestrator.capture_dirty_files` / `restore_dirty_files`) reads plain
+`git status` and is deliberately not given this per-submodule check: a submodule
+whose only change is content inside it (no moved commit pointer) is neither
+captured before an auto-fix attempt nor removed by the restore after a failed
+one. Before, the restore deleted such a submodule's directory when the capture had
+missed it; its content is now left as the attempt left it, and the review diff,
+which reads each submodule's own diff, still shows it.
 
 `git apply` cannot take an attribute source in work-tree mode (git segfaults) or
 outside a repository, so every apply runs with each configured filter driver

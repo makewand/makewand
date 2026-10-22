@@ -1092,15 +1092,16 @@ def get_submodule_paths(repo_dir: str) -> List[str]:
 def _gitmodules_paths(repo_dir: Union[str, Path]) -> List[str]:
     """The submodule paths repo_dir/.gitmodules registers, as written there (git config --file,
     which follows no include). Raises OSError when git cannot read the file."""
-    code, out, error = run_git_cmd(["git", "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
-                                   cwd=str(repo_dir))
+    # -z: a record is "key\nvalue\0", and a submodule name or path may hold any whitespace.
+    code, out, error = run_git_cmd(["git", "config", "-z", "--file", ".gitmodules", "--get-regexp",
+                                    r"^submodule\..*\.path$"], cwd=str(repo_dir), binary=True)
     if code not in (0, 1):
-        raise OSError(f"Cannot read Git submodule configuration: {error}")
+        raise OSError(f"Cannot read Git submodule configuration: {_text(error)}")
     paths = []
-    for line in out.splitlines() if code == 0 else ():
-        parts = line.strip().split(None, 1)
-        if len(parts) == 2:
-            paths.append(parts[1].strip())
+    for record in out.split(b"\0") if code == 0 else ():
+        _, newline, value = record.partition(b"\n")
+        if newline and value:
+            paths.append(os.fsdecode(value))
     return paths
 
 
@@ -1109,19 +1110,39 @@ def _text(output: Union[str, bytes]) -> str:
     return output.decode("utf-8", "surrogateescape") if isinstance(output, bytes) else output
 
 
-def _index_gitlinks(cwd: Union[str, Path]) -> Tuple[int, List[bytes], str]:
-    """(code, root-relative paths of the gitlinks in the index git uses in cwd, error): the
-    private diff index inside _read_workspace_diff."""
-    code, listing, error = run_git_cmd(["git", "ls-files", "-z", "--stage", "--full-name", "--", ":(top)"],
+def _index_gitlink_entries(cwd: Union[str, Path]) -> Tuple[int, Dict[bytes, bool], str]:
+    """(code, {root-relative path: flagged} of the gitlinks in the index git uses in cwd, error),
+    flagged when the entry is marked assume-unchanged or skip-worktree: the private diff index
+    inside _read_workspace_diff."""
+    code, listing, error = run_git_cmd(["git", "ls-files", "-z", "-v", "--stage", "--full-name", "--", ":(top)"],
                                        cwd=str(cwd), binary=True)
     if code != 0:
-        return code, [], _text(error)
-    gitlinks: Dict[bytes, None] = {}
+        return code, {}, _text(error)
+    gitlinks: Dict[bytes, bool] = {}
     for record in listing.split(b"\0"):
         meta, tab, name = record.partition(b"\t")
-        if tab and meta.startswith(b"160000 "):
-            gitlinks[name] = None
-    return 0, list(gitlinks), ""
+        tag, _, stage = meta.partition(b" ")
+        if tab and stage.startswith(b"160000 "):
+            # ls-files -v: a lower-case tag is assume-unchanged, S skip-worktree.
+            gitlinks[name] = gitlinks.get(name, False) or tag.islower() or tag.upper() == b"S"
+    return 0, gitlinks, ""
+
+
+def _index_gitlinks(cwd: Union[str, Path]) -> Tuple[int, List[bytes], str]:
+    """(code, root-relative paths of the gitlinks in the index git uses in cwd, error)."""
+    code, gitlinks, error = _index_gitlink_entries(cwd)
+    return code, list(gitlinks), error
+
+
+def _behind_symlink(root: Union[str, Path], name: bytes) -> bool:
+    """Whether a directory above root-relative name is a symlink or a junction, checked from
+    the top down so that no check follows one."""
+    parts = PurePosixPath(os.fsdecode(name)).parts[:-1]
+    for depth in range(1, len(parts) + 1):
+        parent = Path(root, *parts[:depth])
+        if os.path.islink(parent) or _is_reparse_path(parent):
+            return True
+    return False
 
 
 def add_all(cwd: Union[str, Path], intent_to_add: bool = False) -> Tuple[int, str, str]:
@@ -1131,27 +1152,56 @@ def add_all(cwd: Union[str, Path], intent_to_add: bool = False) -> Tuple[int, st
     For a gitlink whose submodule HEAD matches the index, git add -A runs ``git status`` in the
     nested repository to learn whether it is dirty: a child that reads that repository's own
     config and info/attributes and can run a filter driver on the host, and that no setting
-    keeps away (git add reads no diff.ignoreSubmodules). Gitlinks are left out of the add and,
-    unless intent_to_add, brought up to date by ``git update-index``, which reads only each
-    nested HEAD: a moved HEAD is staged, a removed path drops out and a path that is now a file
-    is staged as one, as git add -A would. A diff index keeps them as they are: git diff
-    compares a gitlink with its nested HEAD itself.
+    keeps away (git add reads no diff.ignoreSubmodules). So the gitlinks are marked
+    assume-unchanged for the add, which then never looks at them, and unmarked after it.
+    Exclude pathspecs would do the same, but git add refuses them once a directory above a
+    gitlink is ignored or a symlink, where plain git add -A succeeds.
+
+    Unless intent_to_add, the gitlinks are then brought up to date by ``git update-index``,
+    which reads only each nested HEAD: a moved HEAD is staged, a removed path drops out and a
+    path that is now a file is staged as one, as git add -A would; one behind a symlink is
+    dropped without being looked at, as git add -A drops it. A diff index keeps them as they
+    are: git diff compares a gitlink with its nested HEAD itself. A gitlink the user marked
+    assume-unchanged or skip-worktree is left alone, as git add -A leaves it.
     """
     add = ["git", "add", "-A"] + (["--intent-to-add"] if intent_to_add else [])
-    code, gitlinks, error = _index_gitlinks(cwd)
+    code, entries, error = _index_gitlink_entries(cwd)
     if code != 0:
         return code, "", error
+    gitlinks = [name for name, flagged in entries.items() if not flagged]
     if not gitlinks:
         return run_git_cmd(add, cwd=str(cwd))
-    specs = b"".join(spec + b"\0" for spec in (b":(top)", *(b":(exclude,top,literal)" + name for name in gitlinks)))
-    code, out, error = run_git_cmd(add + ["--pathspec-from-file=-", "--pathspec-file-nul"], cwd=str(cwd),
-                                   input_data=specs)
+    # update-index takes paths, not pathspecs: from the top of the work tree.
+    code, top, error = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=str(cwd))
+    if code != 0:
+        return code, "", error
+    root = top.rstrip("\n")
+
+    def update_index(options, names):
+        if not names:
+            return 0, b"", b""
+        return run_git_cmd(["git", "update-index", *options, "-z", "--stdin"], cwd=root,
+                           input_data=b"".join(name + b"\0" for name in names))
+
+    code, out, error = update_index(["--assume-unchanged"], gitlinks)
+    if code != 0:
+        return code, _text(out), _text(error)
+    present: List[bytes] = []
+    try:
+        code, out, error = run_git_cmd(add, cwd=str(cwd))
+    finally:
+        # The add may have replaced a gitlink (a directory above it is now a file or a link).
+        list_code, after, list_error = _index_gitlink_entries(root)
+        if list_code == 0:
+            present = [name for name in gitlinks if name in after]
+            list_code, list_out, list_error = update_index(["--no-assume-unchanged"], present)
+        if list_code != 0 and code == 0:
+            code, out, error = list_code, "", list_error
     if code == 0 and not intent_to_add:
-        # update-index takes paths, not pathspecs: from the top of the work tree.
-        code, top, error = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=str(cwd))
+        behind = [name for name in present if _behind_symlink(root, name)]
+        code, out, error = update_index(["--force-remove"], behind)
         if code == 0:
-            code, out, error = run_git_cmd(["git", "update-index", "--remove", "-z", "--stdin"],
-                                           cwd=top.rstrip("\n"), input_data=b"".join(name + b"\0" for name in gitlinks))
+            code, out, error = update_index(["--remove"], [name for name in present if name not in behind])
     return code, _text(out), _text(error)
 
 
@@ -1191,8 +1241,8 @@ def _dirty_registered_gitlinks(repo: Path, visited: set) -> List[str]:
             continue
         directory = repo / rel
         real = os.path.realpath(directory)
-        if (real in visited or not (directory / ".git").exists()
-                or any(os.path.islink(repo / "/".join(path.parts[:depth])) for depth in range(1, len(path.parts) + 1))):
+        if (real in visited or os.path.islink(directory) or _is_reparse_path(directory)
+                or _behind_symlink(repo, os.fsencode(rel)) or not (directory / ".git").exists()):
             continue  # not checked out, or behind a symlink: git status never looked inside either
         visited.add(real)
         code, out, error = run_git_cmd(["git", "status", "--porcelain", "-z", "--untracked-files=normal"],

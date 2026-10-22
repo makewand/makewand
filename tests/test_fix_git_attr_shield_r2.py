@@ -802,15 +802,20 @@ class GlobalOptionTests(NestedFixture):
                 self.assertEqual(git_helper._git_subcommand_index(command), index)
 
     def test_apply_cannot_be_pointed_at_another_repository(self):
-        target = self.repository(self.root / "target", {"f.txt": "one\n", ".gitattributes": "*.txt filter=evil\n"})
+        # The filter is selected by target's info/attributes, which --attr-source does not
+        # override and which a shield of cwd's repository never reaches. Without --index, git
+        # 2.55 crashes on "--attr-source=<oid> -C <dir> apply" before reading the patch.
+        target = self.repository(self.root / "target", {"f.txt": "one\n"})
         self.plant_filter(target / ".git" / "config")
+        self.plant_attributes(target / ".git")
         other = self.root / "other"
         other.mkdir()
-        code, _, error = git_helper.run_git_cmd(["git", "-C", str(target), "apply", "-"], cwd=str(other),
-                                                input_data=PATCH.encode())
-        self.assertNotEqual(code, 0)
-        self.assertEqual((target / "f.txt").read_text(), "one\n")
-        self.assertEqual(self.marker_lines(), [])
+        for command in (["git", "-C", str(target), "apply", "--index", "-"], ["git", "-C", str(target), "apply", "-"]):
+            with self.subTest(command=command):
+                code, _, error = git_helper.run_git_cmd(command, cwd=str(other), input_data=PATCH.encode())
+                self.assertNotEqual(code, 0)
+                self.assertEqual((target / "f.txt").read_text(), "one\n")
+                self.assertEqual(self.marker_lines(), [])
 
     def test_a_clone_never_checks_out_and_takes_no_attribute_source(self):
         for command in (["git", "clone", "--shared", "a", "b"], ["git", "-c", "protocol.file.allow=always", "clone", "a", "b"]):
