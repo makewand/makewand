@@ -80,69 +80,62 @@ checkpoint restoration restores the prior content and supported permissions.
 On Linux, every verification step uses Bubblewrap with its own network
 namespace. Bubblewrap enables loopback inside it for local test servers; host
 loopback, host abstract sockets and the host default route remain inaccessible.
-A dependency step is split so only downloading uses the network (owner decision,
-2026-10-21): a fetch that runs no project code (`pip download --only-binary=:all:`
-of the strict PEP 508 **named** requirements only — never a requirement/constraint
-file, nor a buildable `file:`/path/sdist/VCS/URL or `name @ …` target it names,
-wherever it comes from, `[project] dependencies` and `[build-system] requires`
-included — plus the install's http(s) index options and a named-pins constraints
-file, and for a local project, `.[extra]` included, its build requires,
-dependencies and the optional-dependency groups its extras select, and for a
-local `.whl` target its `Requires-Dist` for the selected extras (read from the
-wheel's `METADATA`, a zip read that runs no code; makewand decides each marker's
-`extra` comparisons in the contexts pip uses and leaves pip only the
-environment clauses, since pip cannot evaluate a comparison of two strings); `npm`
-installing a registry-only lockfile it resolved and inspected first; `cargo
-fetch` pinned to a named rustup toolchain; `go mod download`/`tidy`) gets
-outbound-only `slirp4netns` networking restricted to public destinations — built
-without the host module caches, with workspace secrets masked (the whole `.git`
-and workspace `.cargo`, `ProjectIgnoreDirs` subtrees, and more credential shapes),
-and with a fresh, empty HOME (`/tmp/makewand-fetch-home`, not the persistent
-sandbox HOME an earlier loopback step running project code can write) whose tool
+A dependency step is split so only downloading uses the network and no
+project-controlled code runs while a step has it (owner decision, 2026-10-21).
+The fetch — `pip download --only-binary=:all:` of strict PEP 508 **named**
+requirements (never a requirement/constraint file itself, nor a buildable
+`file:`/path/sdist/VCS/URL or `name @ …` target, wherever it is declared), with
+the install's http(s) index options and those of the pip configuration it would
+read (the project's `pip.conf`/`pip.ini`, the sandbox HOME's, site-wide and the
+trusted pip's site file; a configured index is never replaced by PyPI, a source
+the fetch cannot be given refuses it) and a constraints file of named pins
+(nested `-c`/`-r` followed); `npm ci --ignore-scripts` of a registry-only
+lockfile resolved and inspected first, only for `npm ci`/`npm install` without
+package arguments; `cargo fetch` pinned to a named rustup toolchain; `go mod
+download`/`tidy` — runs in a fresh, private fetch directory outside the
+workspace and its sandbox HOME (`$XDG_CACHE_HOME/makewand/dep-fetch`), with the
+workspace path covered by an empty tmpfs. The host copies in, through `os.Root`
+handles and refusing symlinks and non-regular files, only what the fetch reads:
+`package.json` and the lockfile; every `Cargo.toml`/`Cargo.lock` with empty
+stubs at the target paths cargo needs; `go.mod`/`go.sum`/`go.work` (and those of
+local replacement modules inside the workspace) with, for `go mod tidy`,
+import-only stubs of the Go files (build constraints, package clause, import
+paths, no code); the wheels of a local `find-links` directory. The fetch runs
+the package manager resolved on the host outside the workspace (no symlink hop
+or `#!` interpreter inside it), with a `PATH` of directories outside the
+workspace only, gets outbound-only `slirp4netns` networking restricted to public
+destinations, a fresh, empty HOME (`/tmp/makewand-fetch-home`) whose tool
 config-file locations are neutralised (`GIT_CONFIG_GLOBAL=/dev/null`,
 `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, npm user/global config at two
-distinct, non-existent paths inside that HOME (npm refuses `/dev/null` there),
-`PIP_CONFIG_FILE=/dev/null`, `GOENV=off`), so no git credential helper or
-tool config a loopback step wrote runs with the network, while the caches the
-offline steps reuse stay under the persistent sandbox HOME through
-`GOMODCACHE`/`npm_config_cache`/`CARGO_HOME` or the wheelhouse's absolute path —
-and fills the sandbox's own caches; the build/install that may run project code
-(`setup.py`, a PEP 517 backend, `build.rs`) runs loopback-only from what was
-fetched (`pip install --no-index --find-links`, including `-e .`; `cargo build
---offline`). `npm` sets `npm_config_ignore_scripts=true` (and `npm_config_allow_git=none`),
-and a project that is an npm workspaces root or names anything but a registry
-package in `package.json`, its overrides, `package-lock.json`,
-`npm-shrinkwrap.json` or a v1 `yarn.lock` (a git, `file:`, local, link or URL
-source; npm before 12 runs a git, directory or workspace dependency's `prepare`
-even under `--ignore-scripts`) is refused as an environment condition; the
-transitive tree is resolved first with `npm install --package-lock-only` in a
-scratch copy (with the network on npm 12+, offline from the project's lockfile
-before that, where a missing lockfile is refused) and installed only once its
-lockfile passes the same check. `cargo fetch` sets `RUSTUP_TOOLCHAIN` to a named
-toolchain (never a path; a workspace toolchain file naming a `path` or an
-invalid channel is refused) and additionally
-masks the cargo config files of its private `CARGO_HOME` (a loopback step could
-write them), pins `RUSTC`, clears the rustc-wrapper variables, defaults the global
-credential providers to cargo's built-in one and uses that private `CARGO_HOME`.
-The host-side writes into sandbox paths — the wheelhouse, the constraints file
-and the npm lock-resolution tree — are created under a fresh, host-owned per-run
-directory (`.makewand/fetch-<random>`) through an `os.Root` confined to the
-workspace, so a symlink a loopback step planted is never followed out of the
-workspace; `prepareSandboxHome` and the go-telemetry-off write go through an
-`os.Root` too and refuse (fail closed) a `.makewand`, `sandbox-home` or `.config`
-component replaced with a symlink.
-Without the network tools the
-fetch runs loopback-only, keeping the host caches
-([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)). A
-source-only distribution the fetch cannot get as a wheel, and a declared VCS or URL
-dependency the fetch never gets (once the loopback install fails; decided from the
-project's declarations, never from its output), are reported as
-`ErrDependencyNetworkUnavailable`, an environment limitation of fetch-only
-networking rather than a candidate failure; a requirement that does not exist on
-the default index at all (a code-free index fact check during the fetch) and a
-dependency that only surfaces once project code runs in the loopback build (a
-dynamically-computed one, or a prefetched build that fails and forges pip's
-output) are attributed to the candidate.
+distinct, non-existent paths, `PIP_CONFIG_FILE=/dev/null`, `GOENV=off`) and no
+host module cache, and writes only the fetch directory and the shared,
+host-owned caches (`GOMODCACHE` with `cache/vcs`, cargo's `CARGO_HOME`, npm's
+cache), which every later loopback step binds read-only (the go module cache as
+the first local `GOPROXY` entry, `CARGO_HOME` for cargo). The build/install that
+may run project code (`setup.py`, a PEP 517 backend, `build.rs`) then runs
+loopback-only in the workspace from what was fetched (`pip install --no-index
+--find-links <wheelhouse>`, including `-e .`; `cargo build --offline`), and the
+host puts the files the fetch produced that belong in the workspace there through
+the workspace's `os.Root` handle (`go.mod`/`go.sum` after `tidy`, `Cargo.lock`,
+the resolved `package-lock.json`, `node_modules` copied with its links
+recreated, never followed). Every host-side write into a sandbox path (the
+sandbox HOME, its go-telemetry `mode` file, the setuptools `egg_base`
+configuration, the fetch directory) goes through the `os.Root` handle the path
+was checked through, never a path reopened afterwards. Without the network
+tools, or when the network cannot be attached, the plan runs unsplit and
+loopback-only, as installs did before #80
+([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)).
+A failed pip fetch is reported as `ErrDependencyNetworkUnavailable`, an
+environment limitation of fetch-only networking, only when the index the fetch
+used shows releases matching the specifier and none of them offers a wheel the
+interpreter can install (makewand reads the index's PEP 691/503 page from a
+probe with the same user-mode network, running no code, and applies PEP 440); a
+project or version the index lacks, a matching release with a usable wheel, or
+an index without a usable answer is the candidate's failure. So is a failure of
+the loopback build, unless a declared VCS or URL dependency whose environment
+marker holds (evaluated before the build, for the fetch's interpreter) was never
+fetched; a dependency that only surfaces once project code runs, or output the
+build forges, is attributed to the candidate.
 A failed fetch is reported as `ErrDependencyNetworkUnavailable`, an environment
 problem rather than a candidate failure, only when makewand confirms the outage:
 with network, its own connectivity check of the ecosystem's default registry
@@ -157,8 +150,8 @@ the failure stays the candidate's and `ExecResult.Note` says why; verification
 appends it to `DepsError` or `QuickCheckError`. After a confirmed outage the TUI
 skips the tests instead of penalising the candidate or starting auto-fix.
 Installs keep the input-integrity check meaningful: npm without a lockfile runs
-with `--no-package-lock` (the lockfile its networked fetch resolves is in place
-only while npm installs it, and removed afterwards); pip installs of a project with `pyproject.toml` or
+with `--no-package-lock` (the lockfile its networked fetch resolves stays in
+the fetch directory and never reaches the workspace); pip installs of a project with `pyproject.toml` or
 `setup.py` use `--use-pep517` and write `*.egg-info` outside the tree; a Cargo
 project with `Cargo.lock` runs every cargo step with `--locked`, reporting a
 stale lockfile as a candidate failure, and a `Cargo.lock` that cargo generates
