@@ -22,6 +22,8 @@ func TestWriteEventsCSVNeutralisesFormulaCells(t *testing.T) {
 		RequestedModel: formula,
 		Error:          "-1+1",
 		WorkspaceID:    "\r=1",
+		ActorUserID:    "\n=1+1",
+		TargetRole:     "－1+1",
 		CostUSD:        0.25,
 	}}); err != nil {
 		t.Fatal(err)
@@ -42,6 +44,8 @@ func TestWriteEventsCSVNeutralisesFormulaCells(t *testing.T) {
 		"requested_model": "'" + formula,
 		"error":           "'-1+1",
 		"workspace_id":    "'\r=1",
+		"actor_user_id":   "'\n=1+1",
+		"target_role":     "'－1+1",
 		"status":          "400",
 		"cost_usd":        "0.250000",
 	} {

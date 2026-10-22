@@ -2,17 +2,24 @@
 // cells as formulas (CSV injection).
 package csvsafe
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
-// formulaPrefixes are the leading characters that make Excel, LibreOffice or
-// Google Sheets evaluate a cell, or strip whitespace and then evaluate it.
-const formulaPrefixes = "=+-@\t\r"
+// formulaPrefixes are the first characters that make Excel, LibreOffice or
+// Google Sheets evaluate a cell, or strip whitespace and then evaluate it,
+// including the full-width forms ＝ ＋ － ＠, which some read as = + - @
+// (OWASP, CSV injection).
+const formulaPrefixes = "=+-@\t\r\n＝＋－＠"
 
-// Cell returns v as a cell a spreadsheet shows as text: a value that begins
-// with =, +, -, @, a tab or a carriage return gets a leading single quote.
-// A plain decimal number such as -5 or 0.25 is not a formula and is kept.
+// Cell returns v as a cell a spreadsheet shows as text: a value whose first
+// character is =, +, -, @, a tab, a carriage return, a line feed or one of
+// the full-width ＝ ＋ － ＠ gets a leading single quote. A plain ASCII decimal
+// number such as -5 or 0.25 is not a formula and is kept.
 func Cell(v string) string {
-	if v == "" || !strings.ContainsRune(formulaPrefixes, rune(v[0])) || plainNumber(v) {
+	first, _ := utf8.DecodeRuneInString(v)
+	if v == "" || !strings.ContainsRune(formulaPrefixes, first) || plainNumber(v) {
 		return v
 	}
 	return "'" + v
@@ -27,7 +34,7 @@ func Record(cells []string) []string {
 	return out
 }
 
-// plainNumber reports whether v is an optionally signed decimal number.
+// plainNumber reports whether v is an optionally signed ASCII decimal number.
 func plainNumber(v string) bool {
 	if v[0] == '-' || v[0] == '+' {
 		v = v[1:]
