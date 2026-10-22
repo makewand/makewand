@@ -9,10 +9,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-- 路由热路径不再反复解析登录身份文件：额度来源按身份文件的路径、设备号、inode、大小与修改时间（纳秒）复用上次读取，每次 Snapshot 对每个来源只取一次身份。长期使用的 `~/.claude.json` 有数百 KB，此前每个候选要读取解析约 4 次（本机每个候选约 12 ms，现约 0.4 ms）。修改不足 2 秒的身份文件每次重读；准入与记账仍每次重读。
-- Codex 额度来源与 Python 一致，只读每个会话日志最后 4 MiB 的完整行，只解码含 `rate_limits` 或 `session_meta` 的行，并在逐行扫描中检查超时；FIFO 等非普通文件被跳过，不会卡住额度刷新。
-- 用量、审计与团队账单/预算告警 CSV 导出（`makewand usage --csv`、`makewand audit --csv`、管理端 `?format=csv`）给以 `=`、`+`、`-`、`@`、制表符或回车开头的单元格（纯数字除外）加单引号前缀，客户端提供的值（如被拒绝的模型名 `=HYPERLINK(...)`）在电子表格中只按文本显示。
-- `makewand serve` 的持久预算：没有上限适用的请求不再写预留行，也不再为此在准入时占用 SQLite 写锁，其结果不确定的费用仍按预估结算；已结算的预留在过期一天后连同其 scope 行删除（每次用量写入最多删 256 条，旧库的积压分批清理），预留表不再随请求数无限增长。
+- 路由热路径不再反复解析登录身份文件：在 Linux、macOS 与 BSD 上，额度来源按身份文件的路径、设备号、inode、大小、修改时间与状态变更时间（ctime，纳秒）复用上次读取，每次 Snapshot 对每个来源只取一次身份。长期使用的 `~/.claude.json` 有数百 KB，此前每个候选要读取解析约 4 次（本机每个候选约 12 ms，现约 0.4 ms）。用户无法设置 ctime，所以大小不变、恢复了修改时间的改写，以及复用 inode 号的新文件都会被重新读取；修改或变更不足 2 秒的身份文件每次重读。Windows 的文件信息没有变更时间，不复用，每次重读；准入与记账仍每次重读。
+- Codex 额度来源（Go 与 Python 一致）只读每个会话日志最后 4 MiB 的完整行，外加日志第一行（Codex 在此写会话的 `session_meta`，限 64 KiB 内的完整行），所以转录超过 4 MiB 的长会话里不带账号 ID 的近期事件仍按该 `session_meta` 绑定账号；只解码含 `rate_limits` 或 `session_meta` 的行，并在逐行扫描中检查超时。只有普通文件参与“最新 8 个日志”的选取：FIFO 等非普通文件从不打开，也不会挤掉真正的日志（此前 Python 读取器遇到 FIFO 会一直阻塞）。
+- 用量、审计与团队账单/预算告警 CSV 导出（`makewand usage --csv`、`makewand audit --csv`、管理端 `?format=csv`）给以 `=`、`+`、`-`、`@`、制表符、回车、换行或全角 `＝`、`＋`、`－`、`＠` 开头的单元格（纯 ASCII 十进制数字除外）加单引号前缀，客户端提供的值（如被拒绝的模型名 `=HYPERLINK(...)`）在电子表格中只按文本显示。
+- `makewand serve` 的持久预算：已结算的预留在过期一天后连同其 scope 行删除（每次用量写入最多删 256 条，旧库的积压分批清理），预留表不再随请求数无限增长。没有上限适用的请求仍照常预留，重复的用量回调凭预留 ID 只结算一次；预留删除后才到达的重复回调找不到预留，这次用量写入返回错误并整体回滚，不会重复记账或扣费。
 - `go test ./...` 不再连接公网和宿主 DNS 解析器：依赖安装网络实测中的 DNS 与公网出口检查、以及在沙箱中真实运行 `npm install`（会访问 npm 注册表）的构建流程子测试，只在设置 `MAKEWAND_TEST_LIVE_NETWORK=1` 时运行。
 - `--workflow single` 的帮助与文档如实说明：由写代码的同一引擎在单独的只读调用中自审，没有独立引擎审查。
 - 模型发现写出 `discovered.json` 时，Go 路由器要求定价的 provider（claude、gemini、openai）的档位只在模型有价目（同一文件的 costs，或包旁 `router/defaults.json` 的内置价目）时写出；Go 本就忽略的未定价条目（如 agy 的 `gemini-4-argon` 写进 gemini 档位）不再写出。
