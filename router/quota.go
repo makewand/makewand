@@ -1095,7 +1095,7 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 		if ctx.Err() != nil {
 			return q, ctx.Err()
 		}
-		data, info, err := readCodexSessionTail(fp)
+		data, info, err := readCodexSessionLines(fp)
 		if err != nil {
 			continue
 		}
@@ -1195,14 +1195,21 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	return q, nil
 }
 
-// codexSessionTailBytes is how much of each session log the Codex source
-// reads: Python's reader (health.py) reads the same tail.
+// codexSessionTailBytes is how much of the end of each session log the Codex
+// source reads: Python's reader (health.py) reads the same tail.
 const codexSessionTailBytes = 4 << 20
 
-// readCodexSessionTail returns the complete lines in the last
-// codexSessionTailBytes of the session log at path, and the log's file info.
-// The line the tail starts inside is dropped, as Python drops it.
-func readCodexSessionTail(path string) ([]byte, os.FileInfo, error) {
+// codexSessionHeadBytes caps the first line of a session log that is read with
+// a tail leaving it out: the session_meta Codex writes there binds the tail's
+// events that name no account of their own. Python uses the same cap.
+const codexSessionHeadBytes = 64 << 10
+
+// readCodexSessionLines returns the complete lines in the last
+// codexSessionTailBytes of the session log at path, preceded by the log's
+// first line when the tail leaves it out and it is complete within
+// codexSessionHeadBytes, and the log's file info. The line the tail starts
+// inside is dropped, as Python drops it.
+func readCodexSessionLines(path string) ([]byte, os.FileInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, err
@@ -1227,12 +1234,21 @@ func readCodexSessionTail(path string) ([]byte, os.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if start > 0 {
-		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-			data = data[i+1:]
-		} else {
-			data = nil
-		}
+	if start == 0 {
+		return data, info, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		data = data[i+1:]
+	} else {
+		data = nil
+	}
+	head, err := io.ReadAll(io.NewSectionReader(f, 0, codexSessionHeadBytes))
+	if err != nil {
+		return nil, nil, err
+	}
+	// The tail starts past the first line's end, so the two never overlap.
+	if i := bytes.IndexByte(head, '\n'); i >= 0 {
+		data = append(head[:i+1:i+1], data...)
 	}
 	return data, info, nil
 }

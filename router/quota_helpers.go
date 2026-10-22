@@ -43,8 +43,8 @@ func httpGetJSON(ctx context.Context, url string, headers map[string]string) ([]
 	return body, nil
 }
 
-// recentJSONLFromDirs returns up to `limit` .jsonl files across multiple directories (recursively),
-// newest mtime first. Non-existent or unreadable directories are skipped gracefully.
+// recentJSONLFromDirs returns up to `limit` regular .jsonl files across multiple directories
+// (recursively), newest mtime first. Non-existent or unreadable directories are skipped gracefully.
 func recentJSONLFromDirs(dirs []string, limit int) ([]string, error) {
 	type entry struct {
 		path string
@@ -65,8 +65,11 @@ func recentJSONLFromDirs(dirs []string, limit int) ([]string, error) {
 			if d.IsDir() || filepath.Ext(path) != ".jsonl" {
 				return nil
 			}
-			info, err := d.Info()
-			if err != nil {
+			// A FIFO or another special file is never read, so it must not
+			// displace a log from the newest. A symlinked log is followed, as
+			// its read and Python's reader follow it.
+			info, err := os.Stat(path)
+			if err != nil || !info.Mode().IsRegular() {
 				return nil
 			}
 			entries = append(entries, entry{path: path, mod: info.ModTime()})

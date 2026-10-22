@@ -6,6 +6,7 @@ import os
 import re
 import json
 import math
+import stat
 import warnings
 from makewand import filelock as fcntl
 import uuid
@@ -1923,9 +1924,13 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
         if sessions.is_dir():
             for path in sessions.rglob("*.jsonl"):
                 try:
-                    paths.append((path.stat().st_mtime, path))
+                    status = path.stat()
                 except OSError:
-                    pass
+                    continue
+                # Only regular files compete for the newest eight: opening a
+                # FIFO would block, and no other kind of file holds a log.
+                if stat.S_ISREG(status.st_mode):
+                    paths.append((status.st_mtime, path))
         for modified, path in sorted(paths, reverse=True)[:8]:
             try:
                 with path.open("rb") as stream:
@@ -1935,6 +1940,15 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                     if start:
                         stream.readline()
                     lines = stream.read(4 * 1024 * 1024).splitlines()
+                    if start:
+                        # The tail leaves out the first line, where Codex writes
+                        # the session_meta that binds tail events naming no
+                        # account. It is read when complete within 64 KiB, as Go
+                        # reads it.
+                        stream.seek(0)
+                        first, newline, _ = stream.read(64 * 1024).partition(b"\n")
+                        if newline:
+                            lines.insert(0, first)
                 session_ref = None
                 for line in lines:
                     if b"rate_limits" not in line and b"session_meta" not in line:

@@ -44,7 +44,7 @@ func TestCodexSessionTailReadsAtMostTheLast4MiB_GR5(t *testing.T) {
 	if err := os.WriteFile(small, []byte("{\"a\":1}\n{\"b\":2}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	data, _, err := readCodexSessionTail(small)
+	data, _, err := readCodexSessionLines(small)
 	if err != nil || string(data) != "{\"a\":1}\n{\"b\":2}" {
 		t.Fatalf("small log = %q, %v; want it whole", data, err)
 	}
@@ -55,16 +55,20 @@ func TestCodexSessionTailReadsAtMostTheLast4MiB_GR5(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, info, err := readCodexSessionTail(large)
+	data, info, err := readCodexSessionLines(large)
 	if err != nil || info == nil {
 		t.Fatal(err)
 	}
-	if len(data) == 0 || len(data) > codexSessionTailBytes {
-		t.Fatalf("read %d bytes of a %d-byte log, want at most %d", len(data), len(raw), codexSessionTailBytes)
+	// The log's first line, then its last complete lines: never the line the
+	// tail starts inside, always through the end of the log.
+	tail, found := bytes.CutPrefix(data, []byte("{\"first\":true}\n"))
+	if !found {
+		t.Fatalf("lines do not start with the log's first line")
 	}
-	// The tail holds the log's last complete lines: never the line it starts
-	// inside, always through the end of the log.
-	if !bytes.HasSuffix(raw, data) || raw[len(raw)-len(data)-1] != '\n' || !bytes.HasSuffix(data, []byte("{\"last\":true}\n")) {
+	if len(tail) == 0 || len(tail) > codexSessionTailBytes {
+		t.Fatalf("read %d tail bytes of a %d-byte log, want at most %d", len(tail), len(raw), codexSessionTailBytes)
+	}
+	if !bytes.HasSuffix(raw, tail) || raw[len(raw)-len(tail)-1] != '\n' || !bytes.HasSuffix(tail, []byte("{\"last\":true}\n")) {
 		t.Fatalf("tail is not the last complete lines of the log")
 	}
 }
@@ -75,8 +79,9 @@ func TestCodexQuotaReadsOnlyTheTailOfLargeLogs_GR5(t *testing.T) {
 	root := t.TempDir()
 	writeQuotaTestAuth(t, root, "A")
 	now := time.Now()
-	// A newer observation of the same window, beyond the last 4 MiB, is not read.
-	head := quotaTestEvent("A", 99, 300, now, "")
+	// A newer observation of the same window, beyond the last 4 MiB and past
+	// the log's first line, is not read.
+	head := "{\"type\":\"turn_context\"}\n" + quotaTestEvent("A", 99, 300, now, "")
 	meta := "{\"type\":\"session_meta\",\"payload\":{\"account_id\":\"A\"}}\n"
 	unbound, _ := json.Marshal(map[string]any{"timestamp": now.Add(-time.Minute).Format(time.RFC3339Nano),
 		"payload": map[string]any{"rate_limits": map[string]any{"secondary": map[string]any{
@@ -101,6 +106,50 @@ func TestCodexQuotaReadsOnlyTheTailOfLargeLogs_GR5(t *testing.T) {
 	t.Logf("read two 24 MiB logs in %s", elapsed)
 	if elapsed > 3*time.Second {
 		t.Fatalf("reading two 24 MiB logs took %s", elapsed)
+	}
+}
+
+// Codex writes a session's session_meta as its log's first line. A session
+// whose transcript runs past the 4 MiB tail still binds the tail's events that
+// name no account to that line, which is read when complete within 64 KiB.
+func TestCodexQuotaBindsTheTailToTheFirstLineSessionMeta(t *testing.T) {
+	t.Setenv("MAKEWAND_EXECUTION_EVIDENCE_DIR", t.TempDir())
+	now := time.Now()
+	unbound, _ := json.Marshal(map[string]any{"timestamp": now.Add(-time.Minute).Format(time.RFC3339Nano),
+		"payload": map[string]any{"rate_limits": map[string]any{"primary": map[string]any{
+			"used_percent": 45, "window_minutes": 10080, "resets_at": now.Add(time.Hour).Unix()}}}})
+	sessionMeta := func(account string, instructions int) string {
+		raw, _ := json.Marshal(map[string]any{"timestamp": now.Add(-time.Hour).Format(time.RFC3339Nano), "type": "session_meta",
+			"payload": map[string]any{"account_id": account, "base_instructions": map[string]string{"text": strings.Repeat("i", instructions)}}})
+		return string(raw) + "\n"
+	}
+	for _, tc := range []struct {
+		name   string
+		first  string
+		weekly float64 // 0: no current evidence
+	}{
+		// Codex's own session_meta lines are 20 to 23 KB.
+		{"this account's session_meta", sessionMeta("A", 22<<10), 45},
+		{"another account's session_meta", sessionMeta("B", 22<<10), 0},
+		{"a first line past 64 KiB", sessionMeta("A", 64<<10), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeQuotaTestAuth(t, root, "A")
+			sessions := filepath.Join(root, "sessions")
+			// More than 4 MiB of transcript follows the first line.
+			writeLargeCodexLog(t, filepath.Join(sessions, "rollout.jsonl"), tc.first, string(unbound)+"\n", len(tc.first)+codexSessionTailBytes+(1<<20))
+			q, err := NewCodexQuotaSource(sessions).Read(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tc.weekly == 0 && (q.HasData || q.WeeklyPct != nil):
+				t.Fatalf("weekly window = %s, want no evidence", pctString(q.WeeklyPct))
+			case tc.weekly != 0 && (q.WeeklyPct == nil || *q.WeeklyPct != tc.weekly):
+				t.Fatalf("weekly window = %s, want %v bound by the first line's session_meta", pctString(q.WeeklyPct), tc.weekly)
+			}
+		})
 	}
 }
 
