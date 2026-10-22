@@ -209,6 +209,8 @@ func (s *SQLiteStore) ReserveBudget(ctx context.Context, request BudgetReservati
 // reservation is kept: while it is, settling it again is a no-op and its ID
 // cannot be reserved again. Only pending and expired reservations hold budget
 // (seedBudgetAccount, logAndSettle), so later it is deleted with its scopes.
+// A settlement repeated after that finds no reservation: it returns an error
+// and its transaction rolls back, so it records and charges nothing.
 const settledReservationRetention = 24 * time.Hour
 
 // pruneSettledBatch bounds the settled reservations one usage transaction
@@ -260,7 +262,8 @@ func entryScopes(entry Entry) []BudgetScope {
 }
 
 // logAndSettle records usage and releases a durable reservation atomically.
-// Repeating the callback cannot duplicate either the usage or the charge.
+// Repeating the callback cannot duplicate either the usage or the charge; a
+// repeat that arrives once the settled reservation is pruned is refused.
 func (s *SQLiteStore) logAndSettle(entry Entry) error {
 	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
@@ -275,7 +278,7 @@ func (s *SQLiteStore) logAndSettle(entry Entry) error {
 	if err = pruneSettledReservations(ctx, conn, time.Now()); err != nil {
 		return err
 	}
-	estimate := MicroUSD(entry.UnreservedEstimateUSD)
+	var estimate int64
 	if entry.ReservationID != "" {
 		if math.IsNaN(entry.CostUSD) || math.IsInf(entry.CostUSD, 0) || entry.CostUSD < 0 {
 			return fmt.Errorf("invalid settlement cost")
@@ -285,6 +288,9 @@ func (s *SQLiteStore) logAndSettle(entry Entry) error {
 		}
 		var state string
 		if err = conn.QueryRowContext(ctx, `SELECT state,estimate_micro_usd FROM budget_reservations WHERE request_id=?`, entry.ReservationID).Scan(&state, &estimate); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("settle reservation: not reserved, or settled and pruned a day after it expired: %w", err)
+			}
 			return fmt.Errorf("settle reservation: %w", err)
 		}
 		if state == "settled" {

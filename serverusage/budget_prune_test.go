@@ -3,6 +3,7 @@ package serverusage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -145,27 +146,52 @@ func TestSettledReservationBacklogDrainsInBatches(t *testing.T) {
 	}
 }
 
-// A request no cap applies to takes no reservation (go-server-1021-5); its
-// uncertain outcome still settles at the admission estimate.
-func TestUnreservedUncertainCostSettlesAtTheEstimate(t *testing.T) {
+// A settled reservation is pruned a day after it expires. A settlement repeated
+// after that finds no reservation: it is refused, and its transaction rolls
+// back, so it records no second usage row and charges nothing again.
+func TestRepeatedSettlementAfterPruneIsRefusedAndChargesNothing(t *testing.T) {
 	store, db := openBudgetTestStore(t)
 	now := time.Now().UTC()
-	if err := store.Log(Entry{Timestamp: now, RequestID: "uncertain", TokenID: "t", UncertainCost: true, CostUSD: .002, UnreservedEstimateUSD: .01}); err != nil {
+	month := now.Format("2006-01")
+	scopes := []BudgetScope{{Kind: "token_month", ID: "t", Period: month, LimitMicroUSD: 1_000_000_000}}
+	if err := store.ReserveBudget(context.Background(), BudgetReservation{ID: "late", EstimateMicroUSD: 10_000, ExpiresAt: now.Add(-settledReservationRetention - time.Hour), Scopes: scopes}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Log(Entry{Timestamp: now, RequestID: "measured", TokenID: "t", CostUSD: .002, UnreservedEstimateUSD: .01}); err != nil {
+	entry := Entry{Timestamp: now, ReservationID: "late", TokenID: "t", CostUSD: .001}
+	if err := store.Log(entry); err != nil {
 		t.Fatal(err)
 	}
-	for id, want := range map[string]float64{"uncertain": .01, "measured": .002} {
-		entries, err := store.Load(Filter{RequestID: id})
-		if err != nil || len(entries) != 1 || entries[0].CostUSD != want {
-			t.Fatalf("%s: entries=%+v err=%v, want cost %v", id, entries, err, want)
+	charged := func() (settled, reserved int64) {
+		t.Helper()
+		if err := db.QueryRow(`SELECT settled_micro_usd,reserved_micro_usd FROM budget_accounts WHERE kind='token_month' AND scope_id='t' AND period=?`, month).Scan(&settled, &reserved); err != nil {
+			t.Fatal(err)
 		}
-		if id == "uncertain" && !entries[0].EstimatedCost {
-			t.Fatal("the uncertain cost is not labelled estimated")
+		return settled, reserved
+	}
+	refused := func(usageRows int) {
+		t.Helper()
+		if err := store.Log(entry); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("a settlement repeated after pruning = %v, want it refused", err)
 		}
+		if got := countRows(t, db, countUsage); got != usageRows {
+			t.Fatalf("usage entries = %d, want %d", got, usageRows)
+		}
+		if settled, reserved := charged(); settled != 1000 || reserved != 0 {
+			t.Fatalf("token account settled=%d reserved=%d, want 1000 and 0", settled, reserved)
+		}
+	}
+	// The repeat prunes the settled reservation in its own transaction, finds
+	// none, and rolls back, prune included.
+	refused(1)
+	if got := countRows(t, db, countReservations); got != 1 {
+		t.Fatalf("reservations = %d, want the rolled-back prune undone", got)
+	}
+	// Another usage write prunes it for good; a repeat is still refused.
+	if err := store.Log(Entry{Timestamp: now, RequestID: "next"}); err != nil {
+		t.Fatal(err)
 	}
 	if got := countRows(t, db, countReservations); got != 0 {
-		t.Fatalf("budget_reservations rows = %d, want none", got)
+		t.Fatalf("reservations = %d, want the settled one pruned", got)
 	}
+	refused(2)
 }

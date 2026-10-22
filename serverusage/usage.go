@@ -40,11 +40,6 @@ type Entry struct {
 	CompletionTokens int       `json:"completion_tokens,omitempty"`
 	CostUSD          float64   `json:"cost_usd,omitempty"`
 	Stream           bool      `json:"stream,omitempty"`
-
-	// UnreservedEstimateUSD is the admission estimate of a request that took no
-	// durable reservation because no budget cap applied to it. An uncertain
-	// outcome settles at it, as a reserved one settles at its reservation.
-	UnreservedEstimateUSD float64 `json:"-"`
 }
 
 type Filter struct {
