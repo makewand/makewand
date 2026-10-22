@@ -38,26 +38,31 @@ func TestNetworkedFetchFreshHomeNeutralizesGitCredentialHelper_GEC1021R6(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools := filepath.Join(project.Path, "tools")
-	t.Setenv("PATH", tools+":/usr/bin:/bin")
+	tools := outsideTools(t)
 	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}
 	// A loopback step wrote a git credential helper into the persistent sandbox
 	// HOME; a later networked go/cargo-git fetch would run it on an HTTP 401.
+	// The helper would leave its marker in the shared dependency cache, which a
+	// fetch can write.
 	sandboxHome := filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath))
 	if err := os.MkdirAll(sandboxHome, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	marker := filepath.Join(project.Path, "helper-ran")
+	marker := fetchLogPath(t, "helper-ran")
 	gitconfig := "[credential]\n\thelper = \"!sh -c 'touch " + marker + "'\"\n"
 	if err := os.WriteFile(filepath.Join(sandboxHome, ".gitconfig"), []byte(gitconfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project.Path, "go.mod"), []byte("module example.com/x\n\ngo 1.21\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// A fake `go mod download` that triggers a git credential lookup (reading
 	// the sandbox's git config) and records its HOME and config-file variables.
 	// The probe path (`go env`) does nothing, so it leaves no marker.
-	const fakeGo = `if [ "$1" = mod ]; then
+	envLog := fetchLogPath(t, "fetch-env")
+	fakeGo := `if [ "$1" = mod ]; then
   printf 'protocol=https\nhost=example.com\n\n' | git credential fill >/dev/null 2>&1 || true
   {
     echo "HOME=$HOME"
@@ -66,7 +71,7 @@ func TestNetworkedFetchFreshHomeNeutralizesGitCredentialHelper_GEC1021R6(t *test
     echo "PIP_CONFIG_FILE=$PIP_CONFIG_FILE"
     echo "GOENV=$GOENV"
     echo "NPM_CONFIG_USERCONFIG=$NPM_CONFIG_USERCONFIG"
-  } > "$PWD/fetch-env.txt"
+  } > "` + envLog + `"
 fi
 exit 0
 `
@@ -77,7 +82,7 @@ exit 0
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("the git credential helper ran during the networked fetch; HOME was not fresh")
 	}
-	env := readLog(t, filepath.Join(project.Path, "fetch-env.txt"))
+	env := readLog(t, envLog)
 	for _, want := range []string{
 		"HOME=" + fetchSandboxHome,
 		"GIT_CONFIG_GLOBAL=" + os.DevNull,
@@ -108,7 +113,7 @@ func TestNetworkedFetchHomeArgs_GEC1021R6(t *testing.T) {
 		}
 		return "", false
 	}
-	_, fetchArgs, err := wrapVerificationCommand(bwrap, ws, "go", []string{"mod", "download"}, true, nil, true)
+	_, fetchArgs, err := wrapFetchCommand(bwrap, fetchSpec{workspace: ws, dir: t.TempDir(), pathEnv: "/usr/bin:/bin"}, "go", []string{"mod", "download"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +136,7 @@ func TestNetworkedFetchHomeArgs_GEC1021R6(t *testing.T) {
 		t.Fatal("networked fetch does not create its fresh HOME directory")
 	}
 
-	_, loopArgs, err := wrapVerificationCommand(bwrap, ws, "go", []string{"test"}, false, nil, false)
+	_, loopArgs, err := wrapVerificationCommand(bwrap, ws, "go", []string{"test"}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +176,12 @@ func TestDisableGoTelemetryRefusesSymlink_GEC1021R6(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(home, ".config")); err != nil {
 		t.Fatal(err)
 	}
-	if err := disableGoTelemetry(home); err == nil {
+	root, err := os.OpenRoot(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := disableGoTelemetry(root); err == nil {
 		t.Fatal("disableGoTelemetry followed the .config symlink; want a refusal")
 	}
 	if _, err := os.Stat(filepath.Join(outside, "go", "telemetry", "mode")); err == nil {
@@ -179,46 +189,9 @@ func TestDisableGoTelemetryRefusesSymlink_GEC1021R6(t *testing.T) {
 	}
 }
 
-// Item 2: the fetch scratch directory refuses a symlinked .makewand, and a
-// host-side write into it never follows a symlink out of it.
-func TestFetchScratchRefusesSymlinks_GEC1021R6(t *testing.T) {
-	t.Run("symlinked .makewand", func(t *testing.T) {
-		ws := t.TempDir()
-		outside := t.TempDir()
-		if err := os.Symlink(outside, filepath.Join(ws, ".makewand")); err != nil {
-			t.Fatal(err)
-		}
-		p := &Project{Path: ws}
-		if _, _, err := p.newFetchScratch(ws); err == nil {
-			t.Fatal("newFetchScratch used a symlinked .makewand; want a refusal")
-		}
-		if entries, _ := os.ReadDir(outside); len(entries) != 0 {
-			t.Fatalf("created the fetch directory through the symlink into %s: %v", outside, entries)
-		}
-	})
-
-	t.Run("escaping symlink in the scratch directory", func(t *testing.T) {
-		scratch := t.TempDir()
-		outside := t.TempDir()
-		victim := filepath.Join(outside, "victim.txt")
-		if err := os.WriteFile(victim, []byte("original"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(victim, filepath.Join(scratch, "evil")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := writeFetchFile(scratch, "evil", "overwritten"); err == nil {
-			t.Fatal("writeFetchFile wrote through the escaping symlink; want a refusal")
-		}
-		if data, _ := os.ReadFile(victim); string(data) != "original" {
-			t.Fatalf("victim file overwritten through the symlink: %q", data)
-		}
-	})
-}
-
-// Item 2: the host-side writes (wheelhouse, constraints file) land under a
-// fresh per-run directory, never inside the loopback-writable persistent
-// sandbox HOME. Fails on the base, which writes them inside it.
+// Item 2 (round 7): the host-side writes of a fetch (wheelhouse, constraints
+// file) land in a fresh fetch directory outside the workspace, so nothing a
+// loopback step planted in the workspace or the sandbox HOME is followed.
 func TestFetchArtifactsOutsideSandboxHome_GEC1021R6(t *testing.T) {
 	project := newNeedProject(t, "requirements.txt", "flask==2.0\n", "constraints.txt", "flask==2.0\n")
 	fetch, _, cleanup, err := project.planDependencyStages(
@@ -227,14 +200,13 @@ func TestFetchArtifactsOutsideSandboxHome_GEC1021R6(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	sandboxHome := filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath))
 	for i, a := range fetch.Args {
 		if (a == "--dest" || a == "--constraint") && i+1 < len(fetch.Args) {
-			if strings.HasPrefix(fetch.Args[i+1], sandboxHome+string(filepath.Separator)) {
-				t.Fatalf("%s %q is inside the persistent sandbox HOME; want a fresh per-run directory", a, fetch.Args[i+1])
+			if pathWithin(project.Path, fetch.Args[i+1]) {
+				t.Fatalf("%s %q is inside the workspace; want the fetch directory", a, fetch.Args[i+1])
 			}
-			if !strings.Contains(fetch.Args[i+1], filepath.FromSlash(".makewand/fetch-")) {
-				t.Fatalf("%s %q is not under a fresh .makewand/fetch-* directory", a, fetch.Args[i+1])
+			if !pathWithin(fetch.stage.dir.path, fetch.Args[i+1]) {
+				t.Fatalf("%s %q is not in the fetch directory %s", a, fetch.Args[i+1], fetch.stage.dir.path)
 			}
 		}
 	}

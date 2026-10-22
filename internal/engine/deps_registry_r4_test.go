@@ -65,7 +65,7 @@ func TestRegistryCheckThatCannotRunConfirmsNothing_R4(t *testing.T) {
 		t.Fatalf("result = %+v, err = %v, want the failed install as a plain result", result, err)
 	}
 	lines := strings.Split(strings.TrimSpace(readLog(t, launches)), "\n")
-	if len(lines) != 3 || !strings.HasPrefix(lines[0], "launch info=3 chdir="+project.Path+" ") {
+	if len(lines) != 3 || !isFetchDirLaunch(t, lines[0], "npm") {
 		t.Fatalf("launches:\n%s\nwant the install, then the check twice", strings.Join(lines, "\n"))
 	}
 }

@@ -544,17 +544,10 @@ func TestSandboxedPipInstallRedirectsEggInfo_FixN1R2(t *testing.T) {
 			if report.DepsError != "" || report.IntegrityError != "" {
 				t.Fatalf("DepsError=%q IntegrityError=%q", report.DepsError, report.IntegrityError)
 			}
-			// The dependency step is split into a networked wheel download and
-			// an offline install; both run with the same sandbox HOME, so both
-			// see the egg-info redirect (it only matters for the install).
-			lines := strings.Split(strings.TrimSpace(readLog(t, log)), "\n")
-			if len(lines) != 2 {
-				t.Fatalf("pip steps logged %d lines, want a download and an install:\n%s", len(lines), strings.Join(lines, "\n"))
-			}
-			for _, line := range lines {
-				if line != tc.want {
-					t.Fatalf("pip step saw %q, want %q", line, tc.want)
-				}
+			// Without the user-mode network helper nothing can download, so the
+			// install runs as one loopback step (no fetch is split off).
+			if got := strings.TrimSpace(readLog(t, log)); got != tc.want {
+				t.Fatalf("pip step saw %q, want %q", got, tc.want)
 			}
 			if _, err := os.Lstat(filepath.Join(project.Path, filepath.FromSlash(sandboxHomeRelPath), ".pydistutils.cfg")); !os.IsNotExist(err) {
 				t.Fatalf("distutils configuration left behind after the install: %v", err)
@@ -580,8 +573,7 @@ func TestSandboxedSetuptoolsWritesNoEggInfoIntoWorkspace_FixN1R2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools := filepath.Join(project.Path, "tools")
-	t.Setenv("PATH", tools+":/usr/bin:/bin")
+	tools := outsideTools(t) // a fetch never runs a workspace executable
 	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}

@@ -149,18 +149,15 @@ func RestrictedExecIsolationError(auth UnsafeHostExecAuthorization) error {
 const sandboxHomeRelPath = ".makewand/sandbox-home"
 
 // fetchSandboxHome is the HOME a networked dependency fetch runs with: a fresh,
-// empty directory created on the sandbox tmpfs /tmp, never the persistent
-// sandbox HOME an earlier loopback step (running project code) can write. It
-// defeats, for example, a git credential helper a loopback step wrote into the
-// persistent HOME's .gitconfig, which a later networked go or cargo-git fetch
-// would otherwise run on an HTTP 401 (GEC-1021-1, round 4).
+// empty directory created on the sandbox tmpfs /tmp. The fetch sees no part
+// of the workspace, the persistent sandbox HOME included (wrapFetchCommand).
 const fetchSandboxHome = "/tmp/makewand-fetch-home"
 
 // networkedFetchHomeArgs returns the bwrap --setenv arguments that keep a
-// networked dependency fetch from reading any tool config a loopback step could
-// have written. HOME is already the fresh fetchSandboxHome; these also pin the
-// XDG base directories inside it and neutralise the config-file locations git,
-// npm, pip and go consult outside HOME:
+// networked dependency fetch from reading any tool configuration: HOME is
+// already the fresh fetchSandboxHome; these also pin the XDG base directories
+// inside it and neutralise the config-file locations git, npm, pip and go
+// consult outside HOME:
 //   - GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_NOSYSTEM=1: git reads no global
 //     (~/.gitconfig, XDG) or system config, so no credential helper runs;
 //     GIT_TERMINAL_PROMPT=0 keeps it from blocking on a prompt;
@@ -169,13 +166,10 @@ const fetchSandboxHome = "/tmp/makewand-fetch-home"
 //     be distinct and must not be /dev/null, which npm rejects as a double-load
 //     ("double-loading config ... as global, previously loaded as user") and as
 //     not a regular file;
-//   - PIP_CONFIG_FILE=/dev/null: pip reads no configuration file;
+//   - PIP_CONFIG_FILE=/dev/null: pip reads no configuration file (the package
+//     sources pip configuration names are forwarded as options instead,
+//     pipFetchSourceArgs);
 //   - GOENV=off: the go command reads no env file.
-//
-// cargo's CARGO_HOME and go's GOMODCACHE are set per ecosystem (cargoFetchEnv,
-// planDependencyStages) to the persistent caches the offline steps reuse, and
-// cargo's config files are masked (sandboxWorkspaceSecretMasks), so they are
-// not repeated here.
 func networkedFetchHomeArgs() []string {
 	return []string{
 		"--setenv", "XDG_CONFIG_HOME", fetchSandboxHome + "/.config",
@@ -191,46 +185,33 @@ func networkedFetchHomeArgs() []string {
 	}
 }
 
-// wrapVerificationCommand wraps a verification command in bubblewrap. The
-// workspace is the only writable host path; everything else is read-only with
-// tmpfs /tmp, a cleared environment, and the host HOME hidden (only toolchain
-// directories are re-bound read-only, see sandbox_home.go). readOnly lists
-// workspace paths (protected paths such as .git, CI definitions and
-// verification scripts) that are re-bound read-only on top of the writable
-// workspace. When allowNetwork is false the sandbox additionally unshares the
-// network namespace, as it does for every verification step
-// (verificationPlanAllowsNetwork).
-//
-// A networked dependency fetch (networkedFetch) runs no project code, but is
-// still hardened against config an earlier loopback step left in the workspace
-// or the persistent sandbox HOME: the host module caches are kept out of the
-// sandbox, the workspace secrets and cargo configs sandboxWorkspaceSecretMasks
-// lists are shadowed, and HOME is a fresh, empty tmpfs with every tool's
-// config-file location pointed at nothing (networkedFetchHomeArgs), so a git
-// credential helper or an npm/pip config a loopback step wrote is never read
-// while the fetch has the network.
+// wrapVerificationCommand wraps a loopback verification command in
+// bubblewrap. The workspace is the only writable host path; everything else is
+// read-only with tmpfs /tmp, a cleared environment, and the host HOME hidden
+// (only toolchain directories are re-bound read-only, see sandbox_home.go).
+// readOnly lists paths re-bound read-only on top of the writable workspace:
+// protected workspace paths (such as .git, CI definitions and verification
+// scripts) and the shared dependency caches outside it. When allowNetwork is
+// false the sandbox additionally unshares the network namespace, as it does
+// for every verification step (verificationPlanAllowsNetwork). A networked
+// dependency fetch is wrapped by wrapFetchCommand instead and sees no part of
+// the workspace.
 //
 // The returned argv starts with `--seccomp 3` when the syscall filter applies
 // (see sandboxSeccompArgs); the launcher must supply it via
 // attachSandboxSeccomp. An incomplete workspace socket scan is an error.
-func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string, networkedFetch bool) (string, []string, error) {
+func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []string, allowNetwork bool, readOnly []string) (string, []string, error) {
 	workspacePath = filepath.Clean(workspacePath)
 	pathEnv := strings.TrimSpace(verifyGetenv("PATH"))
 	if pathEnv == "" {
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
 	sandboxHome := filepath.Join(workspacePath, filepath.FromSlash(sandboxHomeRelPath))
-	layout := verifyHomeLayout(workspacePath, pathEnv, networkedFetch)
+	layout := verifyHomeLayout(workspacePath, pathEnv, false)
 
 	socketMasks, err := sandboxWorkspaceSocketMasks(workspacePath)
 	if err != nil {
 		return "", nil, err
-	}
-	var secretMasks []string
-	if networkedFetch {
-		if secretMasks, err = sandboxWorkspaceSecretMasks(workspacePath); err != nil {
-			return "", nil, err
-		}
 	}
 
 	wrapped := append(sandboxSeccompArgs(),
@@ -263,35 +244,16 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 	}
 	// Mask existing domain sockets in workspace with /dev/null (must come after readOnly binds to prevent shadowing)
 	wrapped = append(wrapped, socketMasks...)
-	// Shadow workspace secrets for a networked fetch (after the workspace bind
-	// so the bind cannot re-expose them).
-	wrapped = append(wrapped, secretMasks...)
-	// A networked fetch reads no config an earlier loopback step wrote: HOME is
-	// a fresh, empty directory on the sandbox tmpfs, not the persistent sandbox
-	// HOME. The caches it fills stay under the persistent HOME, reached through
-	// explicit variables the plan sets (GOMODCACHE, CARGO_HOME, npm_config_cache)
-	// or absolute paths (the wheelhouse), so the offline steps still read them.
-	homeDir := sandboxHome
-	if networkedFetch {
-		homeDir = fetchSandboxHome
-		wrapped = append(wrapped, "--dir", fetchSandboxHome)
-	}
 	wrapped = append(wrapped,
 		"--chdir", workspacePath,
 		"--clearenv",
 		"--setenv", "PATH", pathEnv,
-		"--setenv", "HOME", homeDir,
+		"--setenv", "HOME", sandboxHome,
 		"--setenv", "TMPDIR", "/tmp",
 		"--setenv", "NO_COLOR", "1",
 		"--setenv", "MAKEWAND_SANDBOX", "1",
 	)
 	wrapped = append(wrapped, layout.setenvArgs()...)
-	if networkedFetch {
-		// Point every tool's config-file location at nothing so none reads a
-		// file a loopback step could have written (after layout.setenvArgs so a
-		// fetch value wins over a layout default for the same key).
-		wrapped = append(wrapped, networkedFetchHomeArgs()...)
-	}
 	if !allowNetwork {
 		wrapped = append(wrapped, "--unshare-net")
 	}

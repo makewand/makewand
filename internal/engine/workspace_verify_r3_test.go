@@ -52,12 +52,11 @@ func TestSetupPyOnlyInstallRedirectsEggInfo_R3(t *testing.T) {
 	cases := []struct {
 		name     string
 		manifest []ExtractedFile
-		pep517   bool
-		config   string
+		want     string
 	}{
-		{"setup.py only", []ExtractedFile{setupPy, editable}, true, redirected},
-		{"setup.py and pyproject.toml", []ExtractedFile{setupPy, editable, pyproject}, true, redirected},
-		{"requirements only", []ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}, false, "config: none"},
+		{"setup.py only", []ExtractedFile{setupPy, editable}, "pip install --user -r requirements.txt --use-pep517 | " + redirected},
+		{"setup.py and pyproject.toml", []ExtractedFile{setupPy, editable, pyproject}, "pip install --user -r requirements.txt --use-pep517 | " + redirected},
+		{"requirements only", []ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}, "pip install --user -r requirements.txt | config: none"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -84,32 +83,10 @@ func TestSetupPyOnlyInstallRedirectsEggInfo_R3(t *testing.T) {
 			if report.DepsError != "" || report.IntegrityError != "" {
 				t.Fatalf("DepsError=%q IntegrityError=%q", report.DepsError, report.IntegrityError)
 			}
-			// The install is split into a networked wheel download and an
-			// offline install from the wheelhouse; both run with the egg-info
-			// redirect in the sandbox HOME, and only the install builds.
-			lines := strings.Split(strings.TrimSpace(readLog(t, log)), "\n")
-			var fetch, install string
-			for _, line := range lines {
-				cmd, _, _ := strings.Cut(line, " | ")
-				switch {
-				case strings.HasPrefix(cmd, "pip download "):
-					fetch = line
-				case strings.HasPrefix(cmd, "pip install "):
-					install = line
-				}
-			}
-			if fetch == "" || install == "" {
-				t.Fatalf("pip steps:\n%s\nwant a wheel download and an install", strings.Join(lines, "\n"))
-			}
-			if !strings.Contains(fetch, "--only-binary=:all:") || !strings.HasSuffix(fetch, "| "+tc.config) {
-				t.Fatalf("pip download step %q, want wheels only and %q", fetch, tc.config)
-			}
-			installCmd, _, _ := strings.Cut(install, " | ")
-			if !strings.Contains(installCmd, "--no-index") || !strings.Contains(installCmd, "--find-links") || !strings.HasSuffix(install, "| "+tc.config) {
-				t.Fatalf("pip install step %q, want an offline install and %q", install, tc.config)
-			}
-			if tc.pep517 != strings.Contains(installCmd, "--use-pep517") {
-				t.Fatalf("pip install step %q, --use-pep517 want %v", installCmd, tc.pep517)
+			// Without the user-mode network helper nothing can download, so the
+			// install runs as one loopback step (no fetch is split off).
+			if got := strings.TrimSpace(readLog(t, log)); got != tc.want {
+				t.Fatalf("pip step: %q, want %q", got, tc.want)
 			}
 			if report.DepsPlan == nil || slicesContainString(report.DepsPlan.Args, "--use-pep517") {
 				t.Fatalf("reported DepsPlan = %+v, want the baseline plan", report.DepsPlan)

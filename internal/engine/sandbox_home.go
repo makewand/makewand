@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/makewand/makewand/internal/fsperm"
@@ -399,133 +398,6 @@ func sandboxWorkspaceSocketMasks(workspace string) ([]string, error) {
 	return out, nil
 }
 
-// ErrSandboxSecretScan reports that the workspace could not be fully scanned
-// for the secret files a networked fetch must not see. The fetch fails closed
-// rather than run with a secret left visible.
-var ErrSandboxSecretScan = errors.New("sandbox workspace secret scan incomplete")
-
-// sandboxWorkspaceSecretMasks returns bwrap arguments that shadow the workspace
-// files and directories a networked dependency fetch must not see: a directory
-// with an empty tmpfs, a file with /dev/null. It masks, beyond the files
-// isWorkspaceSecretPath marks (.env, .ssh, .npmrc, ...), the extra credential
-// shapes isFetchSecretPath adds, the whole workspace .git directory (its config
-// can carry token-bearing remote URLs), and the whole workspace .cargo
-// directory (its config.toml can name executables cargo fetch would run; see
-// cargoFetchEnv). Unlike the socket scan it does descend ignored directories
-// (node_modules, vendor, ...), so a secret planted there is masked too. It
-// leaves makewand's own sandbox HOME alone, as the fetch's writable HOME and
-// cache area (CARGO_HOME, the wheelhouse, module caches), with one exception:
-// the cargo config files of its CARGO_HOME. makewand never writes them, a
-// loopback step running project code can, and a credential provider they name
-// still runs under cargoFetchEnv. The fetch runs no project code, so this is
-// defence in depth; it also aligns the user-approved real-project path with
-// candidate-verification clones, which already omit these files
-// (shouldIgnore). An incomplete scan is an error wrapping ErrSandboxSecretScan:
-// the fetch is about to touch the network, so a secret left visible fails
-// closed.
-func sandboxWorkspaceSecretMasks(workspace string) ([]string, error) {
-	var out []string
-	cleanWS := filepath.Clean(workspace)
-	sandboxHome := filepath.Join(cleanWS, filepath.FromSlash(sandboxHomeRelPath))
-	count := 0
-	mask := func() error {
-		if count++; count > maxSandboxSocketMasks {
-			return fmt.Errorf("%w: more than %d secret paths under %s", ErrSandboxSecretScan, maxSandboxSocketMasks, cleanWS)
-		}
-		return nil
-	}
-	err := filepath.WalkDir(cleanWS, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			if d != nil && d.IsDir() && path != cleanWS && errors.Is(err, fs.ErrPermission) && fsperm.UntraversableForeignDir(path) {
-				return filepath.SkipDir
-			}
-			return fmt.Errorf("%w: %s: %v", ErrSandboxSecretScan, path, err)
-		}
-		if path == cleanWS {
-			return nil
-		}
-		if path == sandboxHome {
-			return filepath.SkipDir // the fetch's own HOME/caches, never masked
-		}
-		if d.IsDir() && (d.Name() == ".git" || d.Name() == ".cargo") {
-			if err := mask(); err != nil {
-				return err
-			}
-			out = append(out, "--tmpfs", path)
-			return filepath.SkipDir
-		}
-		rel, relErr := filepath.Rel(cleanWS, path)
-		if relErr != nil {
-			return fmt.Errorf("%w: %s: %v", ErrSandboxSecretScan, path, relErr)
-		}
-		if !isFetchSecretPath(rel) {
-			return nil
-		}
-		if err := mask(); err != nil {
-			return err
-		}
-		if d.IsDir() {
-			out = append(out, "--tmpfs", path)
-			return filepath.SkipDir
-		}
-		out = append(out, "--ro-bind", os.DevNull, path)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	for _, name := range []string{"config.toml", "config"} {
-		file := filepath.Join(sandboxHome, ".cargo", name)
-		info, err := os.Lstat(file)
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			continue // nothing to shadow, and bwrap never has to create a mount point
-		}
-		if err != nil {
-			return nil, fmt.Errorf("%w: %s: %v", ErrSandboxSecretScan, file, err)
-		}
-		if err := mask(); err != nil {
-			return nil, err
-		}
-		if info.IsDir() {
-			out = append(out, "--tmpfs", file)
-		} else {
-			out = append(out, "--ro-bind", os.DevNull, file)
-		}
-	}
-	return out, nil
-}
-
-// isFetchSecretPath reports whether a workspace-relative path is a secret a
-// networked dependency fetch must not see. It is the isWorkspaceSecretPath set
-// (used by other code paths, left unchanged) widened for the fetch with more
-// credential shapes: .envrc, private keys (*.pem/*.key/*.p12/*.pfx,
-// id_rsa*/id_ed25519*/id_ecdsa*), credentials.json, service-account JSON, and
-// Terraform *.tfvars. The whole .git and .cargo directories are masked by the
-// walker, not here.
-func isFetchSecretPath(path string) bool {
-	if isWorkspaceSecretPath(path) {
-		return true
-	}
-	base := strings.ToLower(filepath.Base(filepath.ToSlash(filepath.Clean(path))))
-	switch {
-	case base == ".envrc", base == "credentials.json":
-		return true
-	case strings.HasSuffix(base, ".pem"), strings.HasSuffix(base, ".key"),
-		strings.HasSuffix(base, ".p12"), strings.HasSuffix(base, ".pfx"),
-		strings.HasSuffix(base, ".tfvars"):
-		return true
-	case strings.HasPrefix(base, "id_rsa"), strings.HasPrefix(base, "id_ed25519"),
-		strings.HasPrefix(base, "id_ecdsa"):
-		return true
-	case strings.Contains(base, "service-account") && strings.HasSuffix(base, ".json"):
-		return true
-	}
-	return false
-}
-
 func isMaskedHostRoot(p string) bool {
 	p = filepath.Clean(p)
 	if p == "/" {
@@ -556,7 +428,7 @@ func isPathHiddenBySandbox(home, p string) bool {
 // the read-only HOME subtrees to re-bind, extra environment, and the host Go
 // version. noHostModuleCache keeps the host Go module cache out of a networked
 // dependency fetch (it can hold private modules, and the fetch downloads into
-// the sandbox's own cache, which the offline steps then reuse).
+// the shared fetch module cache, which the offline steps then read).
 func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(string) string, noHostModuleCache bool) ([]string, []string, string) {
 	candidates := map[string]struct{}{}
 	addRoot := func(root string) {
@@ -610,7 +482,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 			}
 			goproxy, download := sandboxGoProxy(hostEnv)
 			if noHostModuleCache {
-				// A networked fetch downloads into the sandbox's own module
+				// A networked fetch downloads into the shared fetch module
 				// cache; it must not read the host cache (private modules) over
 				// the network.
 				goproxy, download = sandboxGoProxyUpstream(hostEnv), ""

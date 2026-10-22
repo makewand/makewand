@@ -80,8 +80,7 @@ exit 1
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			project := sandboxDepsProject(t)
-			tools := filepath.Join(project.Path, "tools")
-			t.Setenv("PATH", tools+":/usr/bin:/bin")
+			tools := outsideTools(t) // a fetch never runs a workspace executable
 			if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 				t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 			}
@@ -108,8 +107,7 @@ func TestRemoteDependencyAddedByBuildStaysCandidate_GEC1021R4(t *testing.T) {
 		t.Skip("live sandbox test")
 	}
 	project := sandboxDepsProject(t)
-	tools := filepath.Join(project.Path, "tools")
-	t.Setenv("PATH", tools+":/usr/bin:/bin")
+	tools := outsideTools(t) // a fetch never runs a workspace executable
 	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}

@@ -315,7 +315,8 @@ func TestRegistryCheckTimeoutIsUnreachable_R3(t *testing.T) {
 // fakeRunningBwrap emulates bwrap for the registry check: it logs each launch
 // (whether it got the user-mode network, its working directory and command),
 // holds a user-network launch until it is released, and then runs the
-// command from that directory - except npm, which fails like an install whose
+// command from that directory - except npm (the bare name, or the trusted
+// executable a networked fetch runs), which fails like an install whose
 // registry did not answer.
 func fakeRunningBwrap(logPath string) string {
 	return fmt.Sprintf(`log=%q
@@ -337,10 +338,10 @@ if [ -n "$info" ]; then
   eval "exec $info>&-"
   eval "read -r unblocked <&$block"
 fi
-if [ "$1" = npm ]; then
+case "$1" in npm|*/npm)
   printf '%%s\n' 'npm error code ENOTFOUND' 'npm error network request to https://registry.npmjs.org/left-pad failed, reason: getaddrinfo ENOTFOUND registry.npmjs.org' >&2
-  exit 1
-fi
+  exit 1 ;;
+esac
 cd "$chdir" && exec "$@"
 `, logPath)
 }
@@ -402,7 +403,7 @@ func TestRegistryCheckRunsInFreshUserModeSandbox_R3(t *testing.T) {
 				}
 			}
 			lines := strings.Split(strings.TrimSpace(readLog(t, launches)), "\n")
-			if len(lines) != 2 || lines[0] != "launch info=3 chdir="+project.Path+" cmd=npm" {
+			if len(lines) != 2 || !isFetchDirLaunch(t, lines[0], "npm") {
 				t.Fatalf("launches:\n%s\nwant the install, then the check", strings.Join(lines, "\n"))
 			}
 			checkDir, ok := strings.CutPrefix(lines[1], "launch info=3 chdir=")
@@ -422,4 +423,22 @@ func TestRegistryCheckRunsInFreshUserModeSandbox_R3(t *testing.T) {
 			}
 		})
 	}
+}
+
+// isFetchDirLaunch reports whether a fakeRunningBwrap launch line is a
+// networked fetch of command: with the user-mode network, in a fetch directory
+// of the dependency fetch area (never the project), running command by name
+// or as a trusted executable.
+func isFetchDirLaunch(t *testing.T, line, command string) bool {
+	t.Helper()
+	rest, ok := strings.CutPrefix(line, "launch info=3 chdir=")
+	if !ok {
+		return false
+	}
+	dir, cmd, ok := strings.Cut(rest, " cmd=")
+	base, err := depFetchBaseDir()
+	if !ok || err != nil {
+		return false
+	}
+	return pathWithin(filepath.Join(base, "runs"), dir) && (cmd == command || filepath.Base(cmd) == command)
 }

@@ -228,9 +228,7 @@ func goSandboxForTest(t *testing.T) {
 	// The host-side go probes (go env, go mod edit) run with this HOME; turn
 	// telemetry off there too so a late counter write cannot race t.TempDir
 	// cleanup (the product disables it in the sandbox HOME).
-	if err := disableGoTelemetry(home); err != nil {
-		t.Fatal(err)
-	}
+	disableGoTelemetryAt(t, home)
 	t.Setenv("PATH", filepath.Dir(realGo)+":/usr/bin:/bin")
 	t.Setenv("GOMODCACHE", filepath.Join(t.TempDir(), "modcache"))
 	t.Setenv("GOPATH", filepath.Join(t.TempDir(), "gopath"))

@@ -54,6 +54,12 @@ type ExecPlan struct {
 	// env holds KEY=VALUE settings added to the command's environment. Only
 	// verification's own adaptations of a plan set it.
 	env []string
+	// binds are host paths outside the workspace bound read-only into a
+	// loopback step (the wheelhouse of a pip install's offline build).
+	binds []string
+	// stage is the manifest-only fetch directory of the networked stage of a
+	// split dependency plan (planDependencyStages).
+	stage *fetchStage
 }
 
 // DisplayCommand renders a shell-like command summary for user confirmation.
@@ -241,10 +247,11 @@ func verificationPlanAllowsNetwork(plan ExecPlan) bool {
 }
 
 // execVerification runs plan inside the bubblewrap sandbox. A dependency plan
-// is split into a networked fetch that runs no project code and a
-// loopback-only build/install that may (execDependencyPlan); every other step
-// runs loopback-only. It also returns the network the command had, for a
-// dependency install whose registry turns out to be unreachable.
+// is split into a networked fetch that runs no project code and sees no part
+// of the workspace, and a loopback-only build/install that may run project
+// code (execDependencyPlan); every other step runs loopback-only. It also
+// returns the network the command had, for a dependency install whose
+// registry turns out to be unreachable.
 func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
 	none := sandboxNetwork{kind: sandboxNetworkNone}
 	if err := validateCommandName(plan.Command); err != nil {
@@ -273,61 +280,99 @@ func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly 
 	if verificationPlanUsesUserNetwork(plan) {
 		return p.execDependencyPlan(ctx, env, projectDir, plan, readOnly)
 	}
-	return p.execVerificationStep(ctx, env, projectDir, plan, readOnly, false)
+	result, err := p.execLoopbackStep(ctx, env, projectDir, plan, readOnly, false)
+	return result, none, err
 }
 
-// prepareSandboxHome creates the workspace-relative sandbox HOME and turns Go
-// telemetry off there. The sandbox HOME lives inside the writable workspace so
-// a dependency fetch can populate tool caches that network-isolated steps
-// reuse.
+// prepareSandboxHome creates the workspace-relative sandbox HOME of the
+// loopback steps and turns Go telemetry off there.
 func (p *Project) prepareSandboxHome(projectDir string) error {
-	// A loopback step (running project code) can write anywhere in the
-	// workspace, so it could have replaced .makewand or sandbox-home with a
-	// symlink pointing outside the workspace that a host-side MkdirAll would
-	// follow. Create the HOME through an os.Root confined to the workspace and
-	// refuse a symlinked component: fail closed rather than write through it.
-	root, err := os.OpenRoot(projectDir)
+	home, err := openSandboxHome(projectDir)
 	if err != nil {
-		return fmt.Errorf("create sandbox home: %w", err)
+		return err
 	}
-	defer root.Close()
-	for _, rel := range []string{".makewand", filepath.FromSlash(sandboxHomeRelPath)} {
-		info, err := root.Lstat(rel)
-		switch {
-		case err == nil && info.Mode()&os.ModeSymlink != 0:
-			return fmt.Errorf("create sandbox home: refusing to use %s: it is a symlink", rel)
-		case err != nil && !errors.Is(err, os.ErrNotExist):
-			return fmt.Errorf("create sandbox home: %w", err)
+	defer home.Close()
+	return disableGoTelemetry(home)
+}
+
+// openSandboxHome creates the sandbox HOME inside the workspace and returns
+// an os.Root handle of it, through which every host-side write into it goes.
+// A loopback step (running project code) can write anywhere in the
+// workspace, so .makewand or sandbox-home may have been replaced with a
+// symlink: each component is created and opened through handles confined to
+// the directory above it, and a symlink is refused rather than followed. The
+// handle is never traded for a path that would be reopened.
+func openSandboxHome(projectDir string) (*os.Root, error) {
+	dir, err := os.OpenRoot(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("create sandbox home: %w", err)
+	}
+	for _, name := range strings.Split(sandboxHomeRelPath, "/") {
+		if err := mkdirNoSymlink(dir, name, 0o700); err != nil {
+			_ = dir.Close()
+			return nil, fmt.Errorf("create sandbox home: %w", err)
 		}
+		next, err := openDirNoSymlink(dir, name)
+		_ = dir.Close()
+		if err != nil {
+			return nil, fmt.Errorf("create sandbox home: %w", err)
+		}
+		dir = next
 	}
-	if err := root.MkdirAll(filepath.FromSlash(sandboxHomeRelPath), 0o700); err != nil {
-		return fmt.Errorf("create sandbox home: %w", err)
+	return dir, nil
+}
+
+// openDirNoSymlink opens the directory name directly below root as a root of
+// its own. A symlink there is refused, and so is a directory replaced between
+// the check and the open.
+func openDirNoSymlink(root *os.Root, name string) (*os.Root, error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
 	}
-	return disableGoTelemetry(filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath)))
+	if !info.IsDir() {
+		return nil, fmt.Errorf("refusing to use %s: it is not a directory", name)
+	}
+	sub, err := root.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := sub.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		_ = sub.Close()
+		return nil, fmt.Errorf("refusing to use %s: it changed while makewand opened it", name)
+	}
+	return sub, nil
 }
 
 // disableGoTelemetry writes the mode file `go telemetry off` writes (verified
-// against go1.27) into a sandbox HOME. In its default "local" mode a sandboxed
-// go command collects counters and can spawn an upload child that writes under
-// <home>/.config/go/telemetry after the step returns; such a late write races
-// t.TempDir's RemoveAll and reddens otherwise-green runs. "off" stops the
-// collection, so no telemetry or upload.token files are ever created.
-//
-// The write goes through an os.Root confined to sandboxHome, so a .config/go
-// component a loopback step replaced with a symlink pointing outside the
-// workspace is refused rather than followed (the caller has already verified
-// sandboxHome itself is not a symlink).
-func disableGoTelemetry(sandboxHome string) error {
-	root, err := os.OpenRoot(sandboxHome)
-	if err != nil {
-		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+// against go1.27) into a sandbox HOME, through its os.Root handle. In its
+// default "local" mode a sandboxed go command collects counters and can spawn
+// an upload child that writes under <home>/.config/go/telemetry after the
+// step returns; such a late write races t.TempDir's RemoveAll and reddens
+// otherwise-green runs. "off" stops the collection, so no telemetry or
+// upload.token files are ever created. A .config/go/telemetry component a
+// loopback step replaced with a symlink is refused rather than followed.
+func disableGoTelemetry(home *os.Root) error {
+	dir := home
+	for _, name := range []string{".config", "go", "telemetry"} {
+		if err := mkdirNoSymlink(dir, name, 0o700); err != nil {
+			return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+		}
+		next, err := openDirNoSymlink(dir, name)
+		if dir != home {
+			_ = dir.Close()
+		}
+		if err != nil {
+			return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+		}
+		dir = next
 	}
-	defer root.Close()
-	dir := filepath.FromSlash(".config/go/telemetry")
-	if err := root.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+	defer dir.Close()
+	if info, err := dir.Lstat("mode"); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("disable go telemetry for the sandbox: refusing to write mode: it is not a regular file")
 	}
-	f, err := root.OpenFile(filepath.Join(dir, "mode"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := dir.OpenFile("mode", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
 	}
@@ -336,403 +381,6 @@ func disableGoTelemetry(sandboxHome string) error {
 		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
 	}
 	return nil
-}
-
-// execVerificationStep runs one verification command in the sandbox. A
-// networked step is a dependency fetch: it gets outbound user-mode network and
-// runs without the host module caches or workspace secrets (it executes no
-// project code). Every other step runs loopback-only, with the host caches
-// available (it may execute project code but has no network to exfiltrate
-// anything).
-func (p *Project) execVerificationStep(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, networked bool) (*ExecResult, sandboxNetwork, error) {
-	none := sandboxNetwork{kind: sandboxNetworkNone}
-	if networked {
-		return p.execNetworkedFetch(ctx, env, projectDir, plan, readOnly)
-	}
-	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false)
-	if err != nil {
-		return nil, none, err
-	}
-	result, err := p.execSandboxed(ctx, wrappedCmd, wrappedArgs, nil)
-	return result, none, err
-}
-
-// wrapSandboxStep builds the bwrap argv for one plan and applies the per-run
-// settings (acceptance isolation, plan environment) and the go toolchain
-// precondition. networkedFetch hardens a networked fetch (see
-// wrapVerificationCommand).
-func (p *Project) wrapSandboxStep(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, networkedFetch bool) (string, []string, error) {
-	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(env.bwrapPath, projectDir, plan.Command, plan.Args, verificationPlanAllowsNetwork(plan), readOnly, networkedFetch)
-	if err != nil {
-		return "", nil, fmt.Errorf("verification sandbox: %w", err)
-	}
-	if acceptancePolicy(ctx) != nil {
-		// Local diagnostics must not introduce undeclared cache files into the
-		// execution tree later sealed by independent acceptance.
-		settings := []string{"--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTHONPYCACHEPREFIX", "/tmp/makewand-bytecode", "--setenv", "PYTEST_ADDOPTS", "-p no:cacheprovider", "--setenv", "CARGO_TARGET_DIR", filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "cargo-target")}
-		wrappedArgs = insertBeforeCommand(wrappedArgs, len(plan.Args), settings...)
-	}
-	for _, setting := range plan.env {
-		if key, value, ok := strings.Cut(setting, "="); ok {
-			wrappedArgs = insertBeforeCommand(wrappedArgs, len(plan.Args), "--setenv", key, value)
-		}
-	}
-	if plan.Command == "go" {
-		// The sandbox pins GOTOOLCHAIN=local; report an unsatisfiable go.mod
-		// requirement as an environment problem instead of letting it surface
-		// as a failed (candidate-attributed) test run.
-		if err := checkSandboxGoToolchain(projectDir, verifyHomeLayout(projectDir, sandboxPathEnv(), false).goVersion); err != nil {
-			return "", nil, err
-		}
-	}
-	return wrappedCmd, wrappedArgs, nil
-}
-
-// execNetworkedFetch runs a dependency fetch with outbound user-mode network.
-// The fetch runs no project code, but is still built without the host module
-// caches or workspace secrets. When the network helper is absent or cannot
-// attach, the step runs loopback-only instead - and then with the host caches,
-// which a step without outbound network may read safely.
-func (p *Project) execNetworkedFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
-	none := sandboxNetwork{kind: sandboxNetworkNone}
-	networkedCmd, networkedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, true)
-	if err != nil {
-		return nil, none, err
-	}
-	userNet, network := prepareUserNetwork(networkedArgs)
-	if userNet == nil {
-		return p.execLoopbackFetch(ctx, env, projectDir, plan, readOnly, network)
-	}
-	defer userNet.release()
-	result, err := p.execSandboxed(ctx, networkedCmd, insertBeforeCommand(networkedArgs, len(plan.Args), userNet.bwrapArgs()...), userNet)
-	if err != nil || userNet.attached {
-		return result, network, err
-	}
-	// The helper is installed but could not be attached, so the sandbox was
-	// stopped instead of running the fetch without the network it was meant to
-	// have (execWithPolicyLaunch). Run it again the way a fetch without the
-	// helper runs: one that needs no download still succeeds, and one that does
-	// fails fast and reports the stage that could not be set up.
-	return p.execLoopbackFetch(ctx, env, projectDir, plan, readOnly, userNet.network())
-}
-
-// execLoopbackFetch runs a dependency fetch loopback-only, with the host caches
-// available (no outbound network to exfiltrate them) and npm's registry
-// retries disabled so a needed download fails fast.
-func (p *Project) execLoopbackFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, network sandboxNetwork) (*ExecResult, sandboxNetwork, error) {
-	wrappedCmd, wrappedArgs, err := p.wrapSandboxStep(ctx, env, projectDir, plan, readOnly, false)
-	if err != nil {
-		return nil, network, err
-	}
-	offlineArgs := insertBeforeCommand(wrappedArgs, len(plan.Args), offlineDependencySettings()...)
-	result, err := p.execSandboxed(ctx, wrappedCmd, offlineArgs, nil)
-	return result, network, err
-}
-
-// execDependencyPlan runs a dependency plan as the owner's 2026-10-21 decision
-// requires: only downloading uses the network. A networked fetch that runs no
-// project code (pip download of wheels only, npm --ignore-scripts, cargo fetch,
-// go mod download/tidy) fills the sandbox's own caches; a loopback-only build
-// then installs from them, running any project code (setup.py, build.rs) with
-// no network. The failed step's result and the fetch's network are returned so
-// RunVerificationPlan can classify a registry outage; a dependency that cannot
-// be fetched without running code is reported as an environment limitation,
-// not a candidate failure.
-func (p *Project) execDependencyPlan(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
-	none := sandboxNetwork{kind: sandboxNetworkNone}
-	fetch, build, cleanup, err := p.planDependencyStages(plan, projectDir)
-	if err != nil {
-		return nil, none, err
-	}
-	defer cleanup()
-
-	// A dependency that cannot be fetched without running project code (an npm
-	// local-directory, workspace or git dependency, whose `prepare` runs even
-	// under --ignore-scripts before npm 12; a rustup toolchain chosen by path)
-	// must not run with the network at all. It is an environment limitation of
-	// fetch-only networking, not the candidate's failure.
-	if reason := p.networkFetchUnavailable(plan); reason != "" {
-		result := &ExecResult{ExitCode: 1, Note: reason}
-		return result, none, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, reason)
-	}
-
-	if fetch != nil && plan.Command == "npm" {
-		if _, err := userNetLookPath(userNetHelperName); err == nil {
-			// With the network, npm resolves only through a lockfile makewand
-			// has inspected (execNpmFetch); without it the fetch runs
-			// loopback below, as before.
-			return p.execNpmFetch(ctx, env, projectDir, *fetch, readOnly)
-		}
-	}
-
-	var fetchResult *ExecResult
-	fetchNetwork := none
-	if fetch != nil {
-		fetchResult, fetchNetwork, err = p.execVerificationStep(ctx, env, projectDir, *fetch, readOnly, true)
-		if err != nil {
-			return fetchResult, fetchNetwork, err
-		}
-		if fetchResult != nil && fetchResult.ExitCode != 0 {
-			// A fetch that looks like a registry outage is classified by
-			// RunVerificationPlan's own connectivity check from the fetch's
-			// network. The fetch runs no project code, so its output is pip's
-			// own and can be trusted here.
-			if !p.dependencyOutageSuspected(plan, fetchResult) {
-				if name := pipMissingDistribution(fetchResult); name != "" {
-					// A requirement the default index does not have at all is the
-					// candidate's own broken dependency; one that exists only as a
-					// source distribution is an environment limitation of
-					// fetch-only networking (makewand downloads wheels only). When
-					// the index is custom or the check cannot run, stay
-					// conservative and call it environment.
-					if p.pipProjectAbsent(plan, name) {
-						fetchResult.Note = "the requirement " + name + " does not exist on the package index, so this is the candidate's own broken dependency"
-						return fetchResult, fetchNetwork, nil
-					}
-					msg := p.unfetchableDependency(plan, fetchResult)
-					fetchResult.Note = msg
-					return fetchResult, fetchNetwork, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, msg)
-				}
-			}
-			return fetchResult, fetchNetwork, nil
-		}
-	}
-
-	if build == nil {
-		return fetchResult, fetchNetwork, nil
-	}
-
-	// Read before the build runs project code that could rewrite the
-	// declarations (see below).
-	unfetched := p.pipUnfetchedRemoteTarget(plan)
-	buildResult, _, err := p.execVerificationStep(ctx, env, projectDir, *build, readOnly, false)
-	if err != nil {
-		return buildResult, none, err
-	}
-	// The build runs project code (setup.py, PEP 517 backends, build.rs)
-	// loopback-only, so its output cannot be trusted to classify the failure: a
-	// candidate can forge pip's own "No matching distribution" box. Everything
-	// declared as a named requirement (requirements, build-system requires,
-	// static dependencies) was fetched into the wheelhouse before the build,
-	// which installs with --no-index, so a build failure is the candidate's
-	// own. It is marked prefetched so RunVerificationPlan never reclassifies it
-	// as an environment outage from the build's output or from the now-stale
-	// offlineRegistryNeed.
-	//
-	// The one exception rests on what the project declared before the build,
-	// not on output: a declared VCS or URL dependency was never fetched, so the
-	// offline install cannot obtain it, which the owner's decision makes an
-	// environment limitation of fetch-only networking.
-	if unfetched != "" && buildResult != nil && buildResult.ExitCode != 0 {
-		msg := "the dependency " + unfetched + " is a VCS or URL reference, which makewand never downloads while the network is available (pip may build such a reference to read its metadata, running its code), so the offline install cannot obtain it - depend on a release from a package index, or install the project's dependencies outside makewand"
-		buildResult.Note = msg
-		return buildResult, none, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, msg)
-	}
-	return buildResult, sandboxNetwork{kind: sandboxNetworkNone, prefetched: true}, nil
-}
-
-// planDependencyStages splits a dependency plan into a networked fetch that
-// runs no project code and a loopback-only build/install that may. fetch is
-// nil when the build runs loopback-only with nothing to fetch first; build is
-// nil when the fetch is the whole step (it runs no project code). cleanup
-// removes any sandbox-private wheelhouse the fetch downloads into.
-func (p *Project) planDependencyStages(plan ExecPlan, projectDir string) (fetch, build *ExecPlan, cleanup func(), err error) {
-	noop := func() {}
-	switch plan.Command {
-	case "npm", "pnpm", "yarn":
-		// install/ci fetch packages; --ignore-scripts keeps lifecycle scripts
-		// from running, and npm_config_ignore_scripts=true closes the config a
-		// workspace .npmrc could set. A local-directory, workspace or git
-		// dependency still runs its `prepare` under --ignore-scripts before npm
-		// 12 (confirmed on npm 10.8.2; GHSA-wr8v-3jqh-9x36), so with the network
-		// execDependencyPlan refuses a project that names one
-		// (npmFetchUnavailable) and resolves the rest through a lockfile it
-		// inspects first (execNpmFetch). npm_config_allow_git=none makes npm 12
-		// refuse a git dependency anywhere in the tree, whatever a user
-		// .npmrc in the sandbox HOME says.
-		f := plan
-		f.Args = ensureArg(plan.Args, "--ignore-scripts")
-		// The fetch runs with a fresh HOME, so point npm's cache at the
-		// persistent sandbox HOME: the two npm invocations execNpmFetch makes
-		// (lock resolution, then the real fetch) share what each downloads.
-		f.env = append(slices.Clone(plan.env), "npm_config_ignore_scripts=true", "npm_config_allow_git=none",
-			"npm_config_cache="+filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), ".npm"))
-		return &f, nil, noop, nil
-	case "go":
-		// go mod tidy/download run no project code; the offline test step reuses
-		// the sandbox module cache they fill. The fetch runs with a fresh HOME,
-		// so point GOMODCACHE at the persistent sandbox HOME's cache (the
-		// default location the offline step reads) rather than the fresh one.
-		f := plan
-		f.env = append(slices.Clone(plan.env), "GOMODCACHE="+filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "go", "pkg", "mod"))
-		return &f, nil, noop, nil
-	case "cargo":
-		fetch, build = cargoDependencyStages(plan)
-		fetch.env = append(slices.Clone(fetch.env), cargoFetchEnv(projectDir)...)
-		if pin, _ := p.cargoFetchToolchain(projectDir); pin != "" {
-			// A toolchain the fetch cannot be pinned to refuses it with the
-			// network (networkFetchUnavailable); without the network the fetch
-			// runs as the build does, loopback-only.
-			fetch.env = append(fetch.env, "RUSTUP_TOOLCHAIN="+pin)
-		}
-		return fetch, build, noop, nil
-	case "pip", "pip3":
-		return p.pipDependencyStages(plan, projectDir)
-	}
-	// Any other dependency command runs as a single networked fetch. Only pip
-	// and cargo build execute project code while installing, and both are split
-	// above; no other dependency plan makewand produces does, so there is
-	// nothing to run loopback-only. A step that does get the network is still
-	// confined to public destinations (sandbox_net.go).
-	f := plan
-	return &f, nil, noop, nil
-}
-
-// cargoDependencyStages splits a cargo dependency plan: `cargo fetch` is the
-// networked download; any build step (cargo build) fetches first, then builds
-// offline from the fetched crates (so build.rs never runs with the network).
-func cargoDependencyStages(plan ExecPlan) (fetch, build *ExecPlan) {
-	if len(plan.Args) > 0 && plan.Args[0] == "fetch" {
-		f := plan
-		return &f, nil
-	}
-	fetchPlan := ExecPlan{Kind: "deps", Detector: plan.Detector, Command: "cargo", Args: []string{"fetch"}}
-	if slices.Contains(plan.Args, "--locked") || slices.Contains(plan.Args, "--frozen") {
-		fetchPlan.Args = append(fetchPlan.Args, "--locked")
-	}
-	buildPlan := plan
-	buildPlan.Args = ensureArg(plan.Args, "--offline")
-	return &fetchPlan, &buildPlan
-}
-
-// cargoFetchEnv hardens the networked `cargo fetch` against the executables a
-// cargo config can name and the fetch would otherwise run (confirmed on cargo
-// 1.93): build.rustc, the rustc wrappers, and a registry credential provider.
-// The config files that could name them are masked for the fetch
-// (sandboxWorkspaceSecretMasks): every workspace .cargo/ directory and the
-// config files of the sandbox CARGO_HOME. These settings cover what is left
-// (the rustup toolchain, which a workspace rust-toolchain file chooses, is
-// pinned separately: cargoFetchToolchain):
-//   - RUSTC is pinned to the rustc resolved from the sandbox PATH, so a config
-//     build.rustc is not consulted (on a rustup host that is the rustc proxy,
-//     which follows the pinned toolchain);
-//   - the three rustc-wrapper variables are cleared: an empty value overrides
-//     a config rustc-wrapper or rustc-workspace-wrapper (verified on cargo
-//     1.93);
-//   - the global credential providers default to cargo's built-in token
-//     provider. This alone does not stop a provider a config file names (it
-//     still runs, verified on cargo 1.93), which is why those files are masked;
-//   - CARGO_HOME is the sandbox's own, never the host ~/.cargo (its
-//     credentials and config), and is the same home the offline build reuses.
-func cargoFetchEnv(projectDir string) []string {
-	home := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
-	env := []string{
-		"RUSTC_WRAPPER=",
-		"RUSTC_WORKSPACE_WRAPPER=",
-		"CARGO_BUILD_RUSTC_WRAPPER=",
-		"CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token",
-		"CARGO_HOME=" + filepath.Join(home, ".cargo"),
-	}
-	if rustc := lookPathIn("rustc", sandboxPathEnv()); rustc != "" {
-		env = append(env, "RUSTC="+rustc)
-	}
-	return env
-}
-
-// pipDependencyStages splits a `pip install` into a `pip download` of wheels
-// only (no sdist builds, so no project code runs with the network) into a
-// sandbox-private wheelhouse, then an offline `pip install --no-index
-// --find-links <wheelhouse>` that builds any local project and installs from
-// what was fetched.
-func (p *Project) pipDependencyStages(plan ExecPlan, projectDir string) (fetch, build *ExecPlan, cleanup func(), err error) {
-	noop := func() {}
-	install, ok := p.parsePipInstall(plan.Args)
-	if !ok {
-		b := plan
-		return nil, &b, noop, nil
-	}
-	// The wheelhouse and the constraints file are host-side writes into a
-	// directory the sandboxed fetch can also write. Put them under a fresh,
-	// host-created per-run directory (newFetchScratch) rather than the
-	// persistent sandbox HOME, so no symlink an earlier loopback step planted is
-	// followed through.
-	scratch, cleanup, err := p.newFetchScratch(projectDir)
-	if err != nil {
-		return nil, nil, noop, err
-	}
-	wheelhouse, err := createFetchDir(scratch, "wheelhouse")
-	if err != nil {
-		return nil, nil, cleanup, fmt.Errorf("create dependency wheelhouse: %w", err)
-	}
-	buildPlan := plan
-	buildPlan.Args = pipOfflineInstallArgs(plan.Args, wheelhouse)
-	fetchArgs, hasTargets := p.pipDownloadArgs(install, wheelhouse)
-	if !hasTargets {
-		// Nothing the install resolves from a package index (for example `-e .`
-		// with no declared dependencies): there is nothing to download, so no
-		// networked step runs at all - the offline build installs the local
-		// project from source loopback-only.
-		return nil, &buildPlan, cleanup, nil
-	}
-	// Pin the fetch to the install's constraints, sanitised to named pins only,
-	// so the wheels downloaded are the versions the offline install resolves.
-	if len(install.constraintPins) > 0 {
-		constraints, err := writeFetchFile(scratch, "constraints.txt", strings.Join(install.constraintPins, "\n")+"\n")
-		if err != nil {
-			return nil, nil, cleanup, fmt.Errorf("write sanitised pip constraints: %w", err)
-		}
-		fetchArgs = append(fetchArgs, "--constraint", constraints)
-	}
-	fetchPlan := ExecPlan{Kind: "deps", Detector: plan.Detector, Command: plan.Command, Args: fetchArgs}
-	return &fetchPlan, &buildPlan, cleanup, nil
-}
-
-// pipDownloadArgs builds the `pip download` command line for a parsed install:
-// wheels only (--only-binary=:all:) into the wheelhouse. It passes only the
-// named index requirements the install resolves - those from the command line
-// and from the requirement files makewand can read, and, for each local project
-// the install builds, its build-system requires, its statically declared
-// dependencies and the optional-dependency groups its extras select (what a
-// setup.py computes at build time cannot be known without running it). It
-// never passes a requirement file (-r) or constraint file (-c),
-// nor any buildable target (a local project, an sdist, a VCS reference, a URL,
-// or a name @ url direct reference): pip builds such a target to read its
-// metadata even under --only-binary=:all: (confirmed on pip 24 and 26), which
-// would run project code while the network is available. The offline build
-// installs the local project from the wheelhouse instead, loopback-only.
-// hasTargets reports whether anything resolves from an index at all.
-func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string) (args []string, hasTargets bool) {
-	var reqs []string
-	add := func(texts ...string) {
-		for _, text := range texts {
-			if named, ok := pipNamedRequirementText(text); ok {
-				reqs = append(reqs, named)
-			}
-		}
-	}
-	add(install.downloadReqs...)
-	for _, project := range install.projects {
-		add(p.pipBuildSystemRequires(project.dir)...)
-		// The declared texts, markers kept: pipStaticDependencies drops a
-		// requirement with a marker, which the offline install still needs
-		// whenever the marker holds.
-		texts, _ := p.pipStaticDependencyTexts(project.dir)
-		add(texts...)
-		optional, _ := p.pipOptionalDependencyTexts(project)
-		add(optional...)
-	}
-	for _, wheel := range install.wheels {
-		// A wheel runs no code; its Requires-Dist are read from METADATA
-		// (a zip read) and fetched so the offline install can resolve them.
-		add(p.pipWheelRequires(wheel.dir, wheel.extras)...)
-	}
-	if len(reqs) == 0 {
-		return nil, false
-	}
-	args = []string{"download", "--only-binary=:all:", "--no-input", "--dest", wheelhouse}
-	args = append(args, install.indexArgs...) // sanitised http(s) indexes only
-	args = append(args, reqs...)
-	return args, true
 }
 
 // pipBuildSystemRequires returns the build-system requirements pip installs
@@ -802,37 +450,18 @@ func (p *Project) unfetchableDependency(plan ExecPlan, result *ExecResult) strin
 	return ""
 }
 
-// pipProjectAbsent reports whether the requirement name the fetch could not
-// find does not exist on the package index at all (a candidate's own broken
-// dependency), as opposed to existing only as a source distribution the
-// wheel-only fetch cannot use (an environment limitation). It answers only
-// when the fetch used the default PyPI index, with a code-free fact check of
-// the index (pypiProjectExists); a custom index, or a check that cannot run,
-// leaves the conservative environment verdict.
-func (p *Project) pipProjectAbsent(plan ExecPlan, name string) bool {
-	if plan.Command != "pip" && plan.Command != "pip3" {
-		return false
-	}
-	install, ok := p.parsePipInstall(plan.Args)
-	if !ok || install.customIndex || p.pipConfigMayAvoidIndex() || p.pipConfigSetsIndex() {
-		return false
-	}
-	m := pipRequirementRe.FindStringSubmatch(name)
-	if m == nil {
-		return false
-	}
-	return pypiProjectExists(normalizePipName(m[1])) == pypiProjectAbsent
-}
-
 // pipUnfetchedRemoteTarget returns the first requirement a pip install plan
 // declares that only a download from a location the project names could
 // provide (pipRemoteReference), with where it is declared: on the command
 // line, in a requirement file, or in the [project] dependencies, the
 // optional-dependency groups its extras select or the [build-system] requires
-// of an isolated build of a local project it builds.
-// The networked fetch never gets such a reference (pip may build it to read
-// its metadata), so the offline install cannot obtain it. It reads only what
-// the project declares, never output. "" when there is none.
+// of an isolated build of a local project it builds. The networked fetch never
+// gets such a reference (pip may build it to read its metadata), so the
+// offline install cannot obtain it. It reads only what the project declares,
+// never output, and evaluates a reference's environment marker for the fetch's
+// interpreter first: a reference whose marker does not hold, or cannot be
+// evaluated, is not counted, so it never earns the environment verdict unless
+// it certainly applies. "" when there is none.
 func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
 	if plan.Command != "pip" && plan.Command != "pip3" {
 		return ""
@@ -841,19 +470,36 @@ func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
 	if !ok {
 		return ""
 	}
-	if len(install.remoteTargets) > 0 {
-		return install.remoteTargets[0]
+	var env pipMarkerEnv
+	loaded := false
+	applies := func(text string) bool {
+		if !strings.Contains(text, ";") {
+			return true
+		}
+		if !loaded {
+			if projectDir, err := p.execWorkingDir(); err == nil {
+				env = pipMarkerEnvironment(pipFetchInterpreter(projectDir))
+			}
+			loaded = true
+		}
+		holds, known := pipRequirementApplies(text, env)
+		return known && holds
+	}
+	for _, target := range install.remoteTargets {
+		if applies(target.requirement) {
+			return target.display + " (" + target.source + ")"
+		}
 	}
 	for _, project := range install.projects {
 		texts, manifest := p.pipStaticDependencyTexts(project.dir)
 		for _, text := range texts {
-			if pipRemoteReference(text) {
+			if pipRemoteReference(text) && applies(text) {
 				return text + " (dependencies in " + manifest + ")"
 			}
 		}
 		optional, _ := p.pipOptionalDependencyTexts(project)
 		for _, text := range optional {
-			if pipRemoteReference(text) {
+			if pipRemoteReference(text) && applies(text) {
 				return text + " (optional dependencies in " + manifest + ")"
 			}
 		}
@@ -861,7 +507,7 @@ func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
 			continue // pip installs no build requirements then
 		}
 		for _, text := range p.pipBuildSystemRequires(project.dir) {
-			if pipRemoteReference(text) {
+			if pipRemoteReference(text) && applies(text) {
 				return text + " (build requirement for " + manifest + ")"
 			}
 		}
@@ -1578,6 +1224,12 @@ func newGoOfflineFacts(projectDir string, hostEnv hostGoEnv, sum string) *goOffl
 		noSumDB:      goNoSumDBPatterns(hostEnv),
 	}
 	f.caches = []string{f.sandboxCache}
+	// The module cache the networked fetches fill is the first local GOPROXY
+	// entry of every loopback step (loopbackFetchCache).
+	if area, err := openDepFetchArea(projectDir); err == nil {
+		f.caches = append(f.caches, filepath.Join(area.cacheDir(fetchCacheGo), "cache", "download"))
+		area.close()
+	}
 	_, hostCache := sandboxGoProxy(hostEnv)
 	if hostCache != "" {
 		f.caches = append(f.caches, hostCache)
@@ -2118,10 +1770,11 @@ var npmPackageNameRe = regexp.MustCompile(`^(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A
 // networkFetchUnavailable returns, for a dependency plan whose networked fetch
 // would otherwise run project code (or fetch a dependency it cannot get from a
 // registry), why that cannot be done under fetch-only networking, or "". npm
-// is affected by what the project depends on (npmFetchUnavailable), cargo by
-// the rustup toolchain the workspace selects (cargoFetchToolchain); pnpm and
-// yarn, which makewand's dependency plans never run, are refused outright.
-// pip is split so the networked stage builds nothing, and go fetches no code.
+// is affected by its command line and what the project depends on
+// (npmFetchUnavailable), cargo by the rustup toolchain the workspace selects
+// (cargoFetchToolchain), go by its subcommand (the fetch directory holds no
+// source); pnpm and yarn, which makewand's dependency plans never run, are
+// refused outright. pip is split so the networked stage builds nothing.
 // It applies only when outbound network is actually available: without the
 // user-mode network helper the fetch runs loopback, so code it runs cannot
 // exfiltrate and the offline classifier (offlineRegistryNeed) decides instead,
@@ -2142,6 +1795,12 @@ func (p *Project) networkFetchUnavailable(plan ExecPlan) string {
 		}
 		_, refusal := p.cargoFetchToolchain(projectDir)
 		return refusal
+	case "go":
+		// The networked go fetch sees only go.mod, go.sum and import stubs, so it
+		// runs only the subcommands that need nothing else.
+		if len(plan.Args) < 2 || plan.Args[0] != "mod" || (plan.Args[1] != "download" && plan.Args[1] != "tidy") {
+			return "makewand runs only `go mod download` or `go mod tidy` as a networked go dependency fetch, which sees the module files and no source; install the project's dependencies outside makewand"
+		}
 	}
 	return ""
 }
@@ -2228,25 +1887,19 @@ type pipInstall struct {
 	// and readable requirement files), markers kept, for the networked
 	// `pip download`. A buildable target is never recorded here.
 	downloadReqs []string
-	// indexArgs are the install's index options, sanitised to http(s) URLs (and
-	// bare trusted hosts), for the networked `pip download` so it resolves from
-	// the same indexes the install would. A non-http(s) index is dropped here
-	// and sets otherSources instead.
-	indexArgs []string
+	// sources are the package sources the command line and the requirement
+	// files name (pipFetchSourceArgs adds pip configuration).
+	sources pipSourceOptions
 	// constraintPins are the named version pins of the install's constraint
-	// files (-c), for a sanitised constraints file the fetch resolves against,
-	// so the fetch and the offline install pick the same versions. A buildable
-	// constraint target is never recorded.
+	// files (-c, nested ones included), for a sanitised constraints file the
+	// fetch resolves against, so the fetch and the offline install pick the
+	// same versions. A buildable constraint target is never recorded.
 	constraintPins []string
 	// remoteTargets are the command-line and requirement-file targets only a
 	// download from a location the project names could provide
 	// (pipRemoteReference), each with where it is declared. The networked
 	// fetch never gets them, so the offline install cannot obtain them.
-	remoteTargets []string
-	// customIndex is set when the install points pip at an index other than the
-	// default PyPI (a command-line or requirement-file --index-url/--find-links,
-	// or pip configuration): a nonexistent-project fact check then cannot run.
-	customIndex bool
+	remoteTargets []pipDeclared
 	// projects are the local projects it builds.
 	projects []pipLocalProject
 	// wheels are the local .whl targets it installs (project-relative) with the
@@ -2264,6 +1917,32 @@ type pipInstall struct {
 	noPEP517     bool // --no-use-pep517
 	// read holds the requirement files read so far.
 	read map[string]bool
+}
+
+// pipDeclared is a requirement as declared: how a message shows it, the
+// requirement text whose marker decides whether it applies, and where it is
+// declared.
+type pipDeclared struct {
+	display, requirement, source string
+}
+
+// pipSourceOptions are the package source options of a pip install: its
+// index, extra indexes, trusted hosts, find-links locations (each with the
+// directory a relative local one resolves against) and --no-index. index and
+// extra may hold any URL or path; pipFetchSourceArgs decides what the fetch
+// can be given.
+type pipSourceOptions struct {
+	index     string
+	extra     []string
+	trusted   []string
+	findLinks []pipFindLinks
+	noIndex   bool
+}
+
+// pipFindLinks is a find-links location and the directory a relative local
+// path resolves against first (a requirement file's directory).
+type pipFindLinks struct {
+	value, base string
 }
 
 // pipRequirement is a named requirement: its normalized project name, the
@@ -2404,31 +2083,27 @@ func (p *Project) addPipArguments(install *pipInstall, args []string, source, di
 			if !strings.Contains(value, "://") && !pipVCSRe.MatchString(value) {
 				p.addPipLocal(install, value)
 			} else if pipRemoteReference(value) {
-				install.remoteTargets = append(install.remoteTargets, "-e "+value+" ("+source+")")
+				install.remoteTargets = append(install.remoteTargets, pipDeclared{display: "-e " + value, requirement: value, source: source})
 			}
 		case "--no-index":
 			install.otherSources = true
-			install.customIndex = true
+			install.sources.noIndex = true
 		case "-f", "--find-links":
 			install.otherSources = true
-			install.customIndex = true
-			if pipHTTPURL(value) {
-				install.indexArgs = append(install.indexArgs, "--find-links", value)
-			}
-		case "-i", "--index-url", "--extra-index-url":
-			install.customIndex = true
-			if pipHTTPURL(value) {
-				name := option
-				if name == "-i" {
-					name = "--index-url"
-				}
-				install.indexArgs = append(install.indexArgs, name, value)
-			} else {
+			install.sources.findLinks = append(install.sources.findLinks, pipFindLinks{value: value, base: dir})
+		case "-i", "--index-url":
+			if !pipHTTPURL(value) {
 				install.otherSources = true
 			}
+			install.sources.index = value
+		case "--extra-index-url":
+			if !pipHTTPURL(value) {
+				install.otherSources = true
+			}
+			install.sources.extra = append(install.sources.extra, value)
 		case "--trusted-host":
 			if pipTrustedHost(value) {
-				install.indexArgs = append(install.indexArgs, "--trusted-host", value)
+				install.sources.trusted = append(install.sources.trusted, value)
 			}
 		case "--no-build-isolation":
 			install.noIsolation = true
@@ -2473,8 +2148,11 @@ func (p *Project) addPipRequirementsFile(install *pipInstall, file string, depth
 // records its named version pins for the sanitised constraints file the
 // networked fetch resolves against. A constraint file may name a buildable
 // target (a path, URL or VCS reference) too; those are never recorded, so the
-// fetch never builds one. A file makewand cannot read leaves no pins (the
-// offline install still reads the real file loopback-only).
+// fetch never builds one. Like pip it follows a nested -c (constraints) and -r
+// (requirements, as pip reads a -r inside a constraints file) and honours the
+// index options a constraint file sets, up to the same depth as requirement
+// files. A file makewand cannot read leaves no pins (the offline install
+// still reads the real file loopback-only).
 func (p *Project) addPipConstraintsFile(install *pipInstall, file string, depth int) {
 	file = filepath.Clean(file)
 	if install.read[file] {
@@ -2490,7 +2168,10 @@ func (p *Project) addPipConstraintsFile(install *pipInstall, file string, depth 
 	}
 	for _, line := range pipRequirementLines(content) {
 		if strings.HasPrefix(line, "-") {
-			continue // options in a constraint file are not fetch targets
+			if fields := strings.Fields(line); len(fields) > 0 && !pipEditableOption(fields[0]) {
+				p.addPipArguments(install, fields, file, filepath.Dir(file), depth)
+			}
+			continue
 		}
 		if loc := pipTrailingOptionsRe.FindStringIndex(line); loc != nil {
 			line = strings.TrimSpace(line[:loc[0]])
@@ -2499,6 +2180,12 @@ func (p *Project) addPipConstraintsFile(install *pipInstall, file string, depth 
 			install.constraintPins = append(install.constraintPins, named)
 		}
 	}
+}
+
+// pipEditableOption reports whether a requirement-file option is -e, which
+// pip refuses in a constraints file.
+func pipEditableOption(option string) bool {
+	return option == "-e" || option == "--editable" || strings.HasPrefix(option, "-e") || strings.HasPrefix(option, "--editable=")
 }
 
 // pipHTTPURL reports whether value is an http(s) URL (the only index source a
@@ -2540,7 +2227,7 @@ func pipRequirementLines(content string) []string {
 // registry's).
 func (p *Project) addPipTarget(install *pipInstall, target, source string) {
 	if pipRemoteReference(target) {
-		install.remoteTargets = append(install.remoteTargets, target+" ("+source+")")
+		install.remoteTargets = append(install.remoteTargets, pipDeclared{display: target, requirement: target, source: source})
 	}
 	switch {
 	case strings.HasPrefix(target, "file:"):
@@ -3011,21 +2698,6 @@ func (p *Project) pipConfigMayAvoidIndex() bool {
 	return avoids
 }
 
-// pipConfigSetsIndex reports whether a pip configuration file names any index
-// or find-links at all, http(s) ones included: the fetch then did not use only
-// the default PyPI index, so a nonexistent-project fact check against PyPI
-// would be unsound.
-func (p *Project) pipConfigSetsIndex() bool {
-	set := false
-	p.pipConfigKeyValues(func(key, _ string) {
-		switch key {
-		case "index-url", "extra-index-url", "find-links":
-			set = true
-		}
-	})
-	return set
-}
-
 // cargoDependency is a dependency a Cargo.toml declares.
 type cargoDependency struct {
 	name     string // the dependency's key in the manifest
@@ -3100,12 +2772,25 @@ func (p *Project) cargoRegistryNeed(plan ExecPlan) string {
 	if err != nil {
 		return ""
 	}
-	cache := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), ".cargo", "registry", "cache")
+	// The cargo steps read the shared cargo cache the fetches fill
+	// (loopbackFetchCache), or the sandbox HOME's own without one.
+	caches := []string{filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), ".cargo", "registry", "cache")}
+	if area, err := openDepFetchArea(projectDir); err == nil {
+		caches = append(caches, filepath.Join(area.cacheDir(fetchCacheCargo), "registry", "cache"))
+		area.close()
+	}
 	for _, pkg := range wanted {
 		if !pkg.fromRegistry() || !cargoCrateFileRe.MatchString(pkg.name) || !cargoCrateFileRe.MatchString(pkg.version) {
 			continue
 		}
-		if matches, _ := filepath.Glob(filepath.Join(cache, "*", pkg.name+"-"+pkg.version+".crate")); len(matches) == 0 {
+		cached := false
+		for _, cache := range caches {
+			if matches, _ := filepath.Glob(filepath.Join(cache, "*", pkg.name+"-"+pkg.version+".crate")); len(matches) > 0 {
+				cached = true
+				break
+			}
+		}
+		if !cached {
 			return pkg.name + " " + pkg.version + " (Cargo.lock; not in the sandbox's cargo cache)"
 		}
 	}

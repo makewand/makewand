@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -282,10 +283,11 @@ func TestCargoFetchWorkspaceToolchainLive_GEC1021R5(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tools := filepath.Join(project.Path, "tools")
-		// The networked fetch runs with a fresh, ephemeral HOME, so the wrapper
-		// records to an absolute path in the workspace, which persists.
-		toolchainLog := filepath.Join(project.Path, "toolchain.log")
+		// The wrappers live outside the workspace (a fetch never runs a
+		// workspace executable) and record to the shared dependency cache, the
+		// only place a networked fetch writes that outlives it.
+		tools := filepath.Join(os.Getenv("HOME"), "tools-"+rand.Text()) // the test's HOME, re-bound read-only
+		toolchainLog := fetchLogPath(t, "toolchain")
 		for _, name := range []string{"cargo", "rustc"} {
 			writeExecScript(t, filepath.Join(tools, name), `echo "`+name+` RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" >> "`+toolchainLog+`"
 exec `+filepath.Join(filepath.Dir(cargo), name)+` "$@"
@@ -578,7 +580,7 @@ const registryLeftPadLock = `{
 func stubNpmVersion(t *testing.T, major int) {
 	t.Helper()
 	old := npmVersionProbe
-	npmVersionProbe = func() int { return major }
+	npmVersionProbe = func(string) int { return major }
 	t.Cleanup(func() { npmVersionProbe = old })
 }
 
@@ -680,7 +682,7 @@ func TestNpmNonRegistryDependencyStatic_GEC1021R5(t *testing.T) {
 }
 
 // The npm version is read from the package.json of the npm install the
-// sandbox PATH's bin/npm links into, without running anything.
+// trusted bin/npm a fetch runs links into, without running anything.
 func TestNpmMajorVersion_GEC1021R5(t *testing.T) {
 	install := func(t *testing.T, pkg string) string {
 		t.Helper()
@@ -708,14 +710,7 @@ func TestNpmMajorVersion_GEC1021R5(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := install(t, tc.pkg)
-			swapVerifyIsolationVars(t)
-			verifyGetenv = func(key string) string {
-				if key == "PATH" {
-					return bin + ":/nonexistent"
-				}
-				return ""
-			}
-			if got := npmMajorVersion(); got != tc.want {
+			if got := npmMajorVersion(filepath.Join(bin, "npm")); got != tc.want {
 				t.Fatalf("npmMajorVersion = %d, want %d", got, tc.want)
 			}
 		})
@@ -723,35 +718,32 @@ func TestNpmMajorVersion_GEC1021R5(t *testing.T) {
 	t.Run("a wrapper script is no install", func(t *testing.T) {
 		bin := t.TempDir()
 		writeExecScript(t, filepath.Join(bin, "npm"), "exit 0\n")
-		swapVerifyIsolationVars(t)
-		verifyGetenv = func(key string) string {
-			if key == "PATH" {
-				return bin
-			}
-			return ""
+		if got := npmMajorVersion(filepath.Join(bin, "npm")); got != 0 {
+			t.Fatalf("npmMajorVersion = %d, want 0", got)
 		}
-		if got := npmMajorVersion(); got != 0 {
+	})
+	t.Run("a bare name is no install", func(t *testing.T) {
+		if got := npmMajorVersion("npm"); got != 0 {
 			t.Fatalf("npmMajorVersion = %d, want 0", got)
 		}
 	})
 }
 
 // fakeNpmForLockTest records every npm run (its arguments and whether the
-// sandbox had a default route) in $HOME/npm.log. A lock resolution copies
-// fixtures/resolved-lock.json into the --prefix directory, or reports the
-// failure fixtures/allowgit or (offline) fixtures/notcached asks for; an
-// install records whether a package-lock.json is in place.
-const fakeNpmForLockTest = `log="$PWD/npm.log"
+// sandbox had a default route) in $FAKE_NPM_LOG. A lock resolution copies the
+// fixture resolved-lock.json (beside the fake npm, outside the workspace) into
+// the fetch directory, or reports the failure the fixture allowgit or
+// (offline) notcached asks for; an install records whether a package-lock.json
+// is in place and installs left-pad into node_modules.
+const fakeNpmForLockTest = `log="$FAKE_NPM_LOG"
 net=no
 /bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
 echo "$* net=$net" >> "$log"
-prefix=; lockonly=; offline=; prev=
+lockonly=; offline=
 for a in "$@"; do
-  [ "$prev" = "--prefix" ] && prefix=$a
   case "$a" in --package-lock-only) lockonly=1 ;; --offline) offline=1 ;; esac
-  prev=$a
 done
-fx="$PWD/fixtures"
+fx="$(/usr/bin/dirname "$0")/fixtures"
 if [ -n "$lockonly" ]; then
   if [ -f "$fx/allowgit" ]; then
     printf 'npm error code EALLOWGIT\nnpm error Fetching packages of type "git" have been disabled\nnpm error Refusing to fetch "gitdep@git+https://example.invalid/r.git"\n' >&2
@@ -761,19 +753,21 @@ if [ -n "$lockonly" ]; then
     printf 'npm error code ENOTCACHED\nnpm error request to https://registry.npmjs.org/is-odd failed: cache mode is only-if-cached but no cached response is available.\n' >&2
     exit 1
   fi
-  [ -f "$fx/resolved-lock.json" ] && /bin/cp "$fx/resolved-lock.json" "$prefix/package-lock.json"
+  [ -f "$fx/resolved-lock.json" ] && /bin/cp "$fx/resolved-lock.json" package-lock.json
   exit 0
 fi
 [ -f package-lock.json ] && echo "install saw $(/bin/grep -c resolved package-lock.json) resolved" >> "$log"
+/bin/mkdir -p node_modules/left-pad && echo '{"name":"left-pad","version":"1.3.0"}' > node_modules/left-pad/package.json
 exit 0
 `
 
-// Live, in the real sandbox with slirp4netns and a fake npm: a networked npm
-// fetch first resolves the tree into a lockfile in a scratch project (with
-// the network for npm 12 or later, offline from the project's lockfile
-// before it), refuses one that takes a package from anywhere but the
-// registry, and otherwise installs with exactly that lockfile in place,
-// restoring the project's own lockfile when the plan writes none.
+// Live, in the real sandbox with slirp4netns and a fake npm outside the
+// workspace: a networked npm fetch first resolves the tree into a lockfile in
+// its fetch directory (with the network for npm 12 or later, offline from the
+// project's lockfile before it), refuses one that takes a package from
+// anywhere but the registry, and otherwise runs `npm ci` of exactly that
+// lockfile; the host then puts node_modules into the workspace, and the
+// lockfile too unless the plan writes none.
 func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live sandbox test")
@@ -782,7 +776,8 @@ func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		major    int
-		files    []string // project files; fixtures/ steer the fake npm
+		files    []string // project files
+		fixtures []string // files beside the fake npm that steer it
 		args     []string
 		refused  string   // a substring of the refusal; "" when the fetch runs
 		log      []string // substrings of the npm log, in order
@@ -790,43 +785,48 @@ func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 		lockLeft bool     // a package-lock.json remains in the project
 	}{
 		{name: "npm 12 resolves with the network, then installs the inspected lockfile",
-			major: 12, files: []string{"fixtures/resolved-lock.json", registryLeftPadLock},
+			major: 12, fixtures: []string{"resolved-lock.json", registryLeftPadLock},
 			args: []string{"install", "--ignore-scripts", "--no-package-lock"},
-			log:  []string{"install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix ", " net=yes", "install --ignore-scripts net=yes", "install saw 1 resolved"}},
+			log:  []string{"install --package-lock-only --ignore-scripts --no-audit --no-fund net=yes", "ci --ignore-scripts --no-audit --no-fund net=yes", "install saw 1 resolved"}},
 		{name: "a resolved git dependency is refused before the install",
-			major: 12, files: []string{"fixtures/resolved-lock.json", gitLock},
+			major: 12, fixtures: []string{"resolved-lock.json", gitLock},
 			args: []string{"install", "--ignore-scripts", "--no-package-lock"}, refused: "gitdep from git+ssh://",
-			log: []string{"--package-lock-only"}, absent: []string{"install --ignore-scripts"}},
+			log: []string{"--package-lock-only"}, absent: []string{"ci "}},
 		{name: "npm refusing a git dependency is reported",
-			major: 12, files: []string{"fixtures/allowgit", ""},
+			major: 12, fixtures: []string{"allowgit", ""},
 			args: []string{"install", "--ignore-scripts"}, refused: "npm refused to fetch gitdep@git+https://example.invalid/r.git, a git dependency",
-			absent: []string{"install --ignore-scripts"}},
+			absent: []string{"ci "}},
 		{name: "npm before 12 without a lockfile is refused before npm runs",
 			major: 10, args: []string{"install", "--ignore-scripts"}, refused: "no package-lock.json",
-			absent: []string{"install"}},
+			absent: []string{"install", "ci "}},
 		{name: "npm before 12 resolves offline from the project's lockfile",
 			major: 10, files: []string{"package-lock.json", registryLeftPadLock},
 			args: []string{"install", "--ignore-scripts"},
-			log:  []string{"--package-lock-only --ignore-scripts --no-audit --no-fund --prefix ", " --offline net=no", "install --ignore-scripts net=yes", "install saw 1 resolved"}, lockLeft: true},
+			log:  []string{"--package-lock-only --ignore-scripts --no-audit --no-fund --offline net=no", "ci --ignore-scripts --no-audit --no-fund net=yes", "install saw 1 resolved"}, lockLeft: true},
+		{name: "npm ci resolves nothing",
+			major: 10, files: []string{"package-lock.json", registryLeftPadLock},
+			args: []string{"ci"},
+			log:  []string{"ci --ignore-scripts --no-audit --no-fund net=yes", "install saw 1 resolved"}, absent: []string{"--package-lock-only"}, lockLeft: true},
 		{name: "npm before 12 with a stale lockfile is refused",
-			major: 10, files: []string{"package-lock.json", registryLeftPadLock, "fixtures/notcached", ""},
+			major: 10, files: []string{"package-lock.json", registryLeftPadLock}, fixtures: []string{"notcached", ""},
 			args: []string{"install", "--ignore-scripts"}, refused: "does not hold every dependency",
-			log: []string{"--offline net=no"}, absent: []string{"install --ignore-scripts net"}, lockLeft: true},
+			log: []string{"--offline net=no"}, absent: []string{"ci "}, lockLeft: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			project := sandboxDepsProject(t)
 			requireUserModeNetwork(t)
 			stubNpmVersion(t, tc.major)
-			tools := filepath.Join(project.Path, "tools")
-			t.Setenv("PATH", tools+":/usr/bin:/bin")
+			tools := outsideTools(t)
 			if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 				t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 			}
 			writeExecScript(t, filepath.Join(tools, "npm"), fakeNpmForLockTest)
+			writeProjectFiles(t, filepath.Join(tools, "fixtures"), append([]string{".keep", ""}, tc.fixtures...)...)
 			writeProjectFiles(t, project.Path, append([]string{"package.json", `{"name":"x","dependencies":{"left-pad":"^1.3.0"}}`}, tc.files...)...)
 			before, _ := project.ReadFile("package-lock.json")
+			npmLog := fetchLogPath(t, "npm")
 
-			result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "npm", Args: tc.args})
+			result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "npm", Args: tc.args, env: []string{"FAKE_NPM_LOG=" + npmLog}})
 			if tc.refused != "" {
 				if !errorIsDepNetworkUnavailable(err) || !strings.Contains(noteOf(result), tc.refused) {
 					t.Fatalf("err = %v, note = %q, want a refusal naming %q", err, noteOf(result), tc.refused)
@@ -834,7 +834,7 @@ func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 			} else if err != nil || result == nil || result.ExitCode != 0 {
 				t.Fatalf("result = %+v, err = %v, want the fetch to succeed", result, err)
 			}
-			log := readLog(t, filepath.Join(project.Path, "npm.log"))
+			log := readLog(t, npmLog)
 			rest := log
 			for _, want := range tc.log {
 				i := strings.Index(rest, want)
@@ -852,9 +852,9 @@ func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 			if tc.lockLeft != (err == nil) || tc.lockLeft && after != before {
 				t.Fatalf("package-lock.json after the fetch: %q (err %v), want it left as before: %v", after, err, tc.lockLeft)
 			}
-			matches, _ := filepath.Glob(filepath.Join(project.Path, ".makewand", "fetch-*"))
-			if len(matches) != 0 {
-				t.Fatalf("the lock resolution's scratch project was left behind: %v", matches)
+			_, installed := project.ReadFile(filepath.Join("node_modules", "left-pad", "package.json"))
+			if (tc.refused == "") != (installed == nil) {
+				t.Fatalf("node_modules/left-pad in the project: %v, want it placed exactly when the fetch ran", installed == nil)
 			}
 		})
 	}
@@ -884,7 +884,7 @@ func TestNpmFetchRealNpmLive_GEC1021R5(t *testing.T) {
 		env: []string{"npm_config_audit=false", "npm_config_fund=false", "npm_config_update_notifier=false"}}
 	result, err := project.RunVerificationPlan(context.Background(), plan)
 	if err != nil || result == nil || result.ExitCode != 0 {
-		t.Fatalf("result = %+v, err = %v, want the npm %d fetch to succeed", result, err, npmMajorVersion())
+		t.Fatalf("result = %+v, err = %v, want the npm %d fetch to succeed", result, err, npmMajorVersion(npm))
 	}
 	if _, err := project.ReadFile("package-lock.json"); err == nil {
 		t.Fatal("a --no-package-lock fetch must leave no package-lock.json behind")
@@ -916,7 +916,7 @@ func TestNpmPrepareVectorsRefusedLive_GEC1021R5(t *testing.T) {
 		project := sandboxDepsProject(t)
 		requireUserModeNetwork(t)
 		t.Setenv("PATH", "/usr/bin:/bin")
-		if major := npmMajorVersion(); major == 0 || major >= npmNetworkedLockMajor {
+		if major := npmMajorVersion(npmBin); major == 0 || major >= npmNetworkedLockMajor {
 			t.Skipf("%s is npm %d, not an npm before %d", npmBin, major, npmNetworkedLockMajor)
 		}
 		if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {

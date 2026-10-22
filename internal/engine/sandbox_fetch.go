@@ -2,9 +2,7 @@ package engine
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -226,12 +223,6 @@ const npmNetworkedLockMajor = 12
 // and inspects for an npm fetch.
 const maxNpmManifestBytes = 64 << 20
 
-// npmProjectFiles are what npm resolves a project's dependencies from: the
-// manifest and the lockfiles it follows (npm-shrinkwrap.json before
-// package-lock.json, and yarn.lock, whose resolutions npm 7+ follows when it
-// has no package lock).
-var npmProjectFiles = []string{"package.json", "npm-shrinkwrap.json", "package-lock.json", "yarn.lock"}
-
 var (
 	// npmAllowCodeRe matches npm 12's error code for a dependency its
 	// allow-git/allow-remote/allow-file/allow-directory setting refuses.
@@ -243,12 +234,20 @@ var (
 )
 
 // npmFetchUnavailable returns why an npm dependency plan cannot fetch with the
-// network, read from the project's files before anything runs, or "": a
-// subcommand other than install or ci, or a project npm would take some
-// dependency for from anywhere but the registry (npmNonRegistryDependency).
+// network, read from its command line and the project's files before anything
+// runs, or "": a subcommand other than install or ci; any package argument (a
+// local path, a tarball, a git spec or a registry name, which npm would
+// install without the lockfile makewand inspects) or an option that is not
+// one npmNetworkedOption accepts; or a project npm would take some dependency
+// for from anywhere but the registry (npmNonRegistryDependency).
 func (p *Project) npmFetchUnavailable(plan ExecPlan) string {
-	if len(plan.Args) == 0 || (plan.Args[0] != "install" && plan.Args[0] != "i" && plan.Args[0] != "ci") {
+	if len(plan.Args) == 0 || !slices.Contains([]string{"install", "i", "ci", "clean-install"}, plan.Args[0]) {
 		return "makewand runs only `npm install` or `npm ci` as a networked dependency fetch; install the project's dependencies outside makewand"
+	}
+	for _, arg := range plan.Args[1:] {
+		if !npmNetworkedOption(arg) {
+			return "makewand runs a networked npm fetch only as `npm ci` or `npm install` without package arguments, from a lockfile it has inspected, and the command line holds " + truncateForNote(arg) + " (a package argument - a local path, tarball or git spec - would be installed without that lockfile); install the project's dependencies outside makewand"
+		}
 	}
 	if reason := p.npmNonRegistryDependency(); reason != "" {
 		return reason + "; " + npmRegistryOnlyRemedy
@@ -614,20 +613,19 @@ func (p *Project) readProjectFileLimit(relPath string, limit int64) ([]byte, err
 // npm version without installing one.
 var npmVersionProbe = npmMajorVersion
 
-// npmMajorVersion returns the major version of the npm the sandbox runs - the
-// first npm on the sandbox PATH, whose install (the npm package that bin/npm
-// links into, as npm installs itself) records it in its package.json - or 0
+// npmMajorVersion returns the major version of the npm a networked fetch runs
+// (npm, resolved by fetchToolPath) - its install, the npm package that bin/npm
+// links into as npm installs itself, records it in its package.json - or 0
 // when that cannot be told. It runs nothing.
-func npmMajorVersion() int {
-	bin := lookPathIn("npm", sandboxPathEnv())
-	if bin == "" {
+func npmMajorVersion(npm string) int {
+	if !filepath.IsAbs(npm) {
 		return 0
 	}
-	cli, err := filepath.EvalSymlinks(bin)
+	cli, err := filepath.EvalSymlinks(npm)
 	if err != nil {
 		return 0
 	}
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(filepath.Dir(cli)), "package.json")) //nolint:gosec // G304: the npm install the sandbox PATH resolves
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(filepath.Dir(cli)), "package.json")) //nolint:gosec // G304: the trusted npm install a fetch runs
 	if err != nil {
 		return 0
 	}
@@ -645,239 +643,192 @@ func npmMajorVersion() int {
 	return major
 }
 
-// newFetchScratch creates a fresh, host-owned private directory for a
-// dependency fetch's host-side artifacts (the pip wheelhouse and constraints
-// file, the npm lock-resolution tree). It is created through an os.Root
-// confined to the workspace - so a symlink a loopback step planted is never
-// followed out of the workspace - under a random name no earlier run could have
-// planted, beside the persistent sandbox HOME under .makewand (which project
-// scans and clones ignore). The sandboxed fetch binds the whole workspace, so
-// it writes into the returned directory by absolute path; cleanup removes it.
-func (p *Project) newFetchScratch(projectDir string) (dir string, cleanup func(), err error) {
-	root, err := os.OpenRoot(projectDir)
-	if err != nil {
-		return "", nil, err
-	}
-	defer root.Close()
-	if info, lerr := root.Lstat(".makewand"); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-		return "", nil, fmt.Errorf("create dependency fetch directory: refusing to use .makewand: it is a symlink")
-	}
-	if err := root.Mkdir(".makewand", 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", nil, fmt.Errorf("create dependency fetch directory: %w", err)
-	}
-	var rel string
-	for attempt := 0; ; attempt++ {
-		rel = filepath.Join(".makewand", "fetch-"+rand.Text())
-		err := root.Mkdir(rel, 0o700)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, os.ErrExist) || attempt >= 8 {
-			return "", nil, fmt.Errorf("create dependency fetch directory: %w", err)
-		}
-	}
-	cleanup = func() {
-		if r, err := os.OpenRoot(projectDir); err == nil {
-			_ = r.RemoveAll(rel)
-			_ = r.Close()
-		}
-	}
-	return filepath.Join(projectDir, rel), cleanup, nil
-}
-
-// createFetchDir makes a subdirectory of a fetch scratch directory through an
-// os.Root, so a symlink is never followed out of the scratch directory.
-func createFetchDir(scratch, name string) (string, error) {
-	root, err := os.OpenRoot(scratch)
-	if err != nil {
-		return "", err
-	}
-	defer root.Close()
-	if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", err
-	}
-	return filepath.Join(scratch, name), nil
-}
-
-// writeFetchFile writes a file into a fetch scratch directory through an
-// os.Root (O_EXCL, so an existing name is refused rather than a symlink
-// followed out of the scratch directory).
-func writeFetchFile(scratch, name, content string) (string, error) {
-	root, err := os.OpenRoot(scratch)
-	if err != nil {
-		return "", err
-	}
-	defer root.Close()
-	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := io.WriteString(f, content); err != nil {
-		return "", err
-	}
-	return filepath.Join(scratch, name), nil
-}
-
-// execNpmFetch runs an npm dependency fetch that has outbound network so that
-// npm downloads exactly the tree of a lockfile makewand has inspected. The
-// project's manifest and lockfiles are copied into a scratch project in the
-// sandbox HOME, where `npm install --package-lock-only --ignore-scripts`
-// resolves the full tree, transitive dependencies included, without
+// execNpmFetch runs an npm dependency plan that has outbound network so that
+// npm downloads exactly the tree of a lockfile makewand has inspected, in a
+// manifest-only fetch directory that sees no part of the workspace: the
+// project's package.json and its lockfile (npm-shrinkwrap.json before
+// package-lock.json) are copied in, `npm install --package-lock-only
+// --ignore-scripts` resolves the full tree into the lockfile there without
 // installing or running anything (confirmed on npm 10.8.2 and 12.2.0 with
 // direct and transitive git+file:// dependencies, a file: directory, a
-// workspaces root and a yarn.lock resolving to git). npm 12 or later resolves
-// with the network; earlier versions resolve offline, from the project's own
-// lockfile, which must hold every dependency, since they run the prepare
-// script of a hosted git dependency pinned to a commit while resolving it.
-// The lockfile the resolution writes is inspected (npmLockfileNonRegistry)
-// and, when it takes every package from the registry, put in place for the
-// real fetch. A fetch that would not have left a lockfile behind
-// (--no-package-lock, or a failed install) restores the project's own.
-func (p *Project) execNpmFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, fetch ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
+// workspaces root and a yarn.lock resolving to git), the lockfile is inspected
+// (npmLockfileNonRegistry), and `npm ci --ignore-scripts` installs exactly it,
+// with the shared npm cache. npm 12 or later resolves with the network;
+// earlier versions resolve offline, from the project's own lockfile, which
+// must hold every dependency, since they run the prepare script of a hosted
+// git dependency pinned to a commit while resolving it. `npm ci` resolves
+// nothing, so its lockfile is only inspected. The host then puts the
+// node_modules the install produced into the workspace, and, for an install
+// that writes a lockfile, the resolved lockfile (placeFetchTree,
+// writeBackWorkspaceFile).
+func (p *Project) execNpmFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
 	none := sandboxNetwork{kind: sandboxNetworkNone}
-	refuse := func(result *ExecResult, network sandboxNetwork, reason string) (*ExecResult, sandboxNetwork, error) {
-		if result == nil {
-			result = &ExecResult{ExitCode: 1}
-		}
-		result.Note = reason
-		return result, network, fmt.Errorf("%w (%s)", ErrDependencyNetworkUnavailable, reason)
-	}
 	const oldNpm = "the npm in use (before 12) can run a git dependency's prepare script while it resolves dependencies with the network, even under --ignore-scripts; "
 
-	if _, err := p.readProjectFileLimit("package.json", maxNpmManifestBytes); errors.Is(err, fs.ErrNotExist) {
-		// No manifest: npm has nothing of the project's to resolve, and the
-		// lockfiles npmFetchUnavailable inspected are all it could install.
-		return p.execVerificationStep(ctx, env, projectDir, fetch, readOnly, true)
-	}
-	scratchRoot, scratchCleanup, err := p.newFetchScratch(projectDir)
+	area, err := openDepFetchArea(projectDir)
 	if err != nil {
-		return nil, none, fmt.Errorf("create the npm lock resolution directory: %w", err)
+		return refuseFetch(nil, none, "makewand cannot prepare the networked npm fetch outside the project ("+err.Error()+"); install the project's dependencies outside makewand")
 	}
-	defer scratchCleanup()
-	scratch, err := createFetchDir(scratchRoot, "npm-lock")
+	defer area.close()
+	dir, err := area.newFetchDir()
 	if err != nil {
-		return nil, none, fmt.Errorf("create the npm lock resolution directory: %w", err)
+		return nil, none, err
 	}
-	lockName := ""
-	for _, name := range npmProjectFiles {
-		data, err := p.readProjectFileLimit(name, maxNpmManifestBytes)
+	defer dir.remove()
+	ws, err := os.OpenRoot(projectDir)
+	if err != nil {
+		return nil, none, err
+	}
+	defer ws.Close()
+
+	hasManifest, lockName := false, ""
+	for _, name := range []string{"package.json", "npm-shrinkwrap.json", "package-lock.json"} {
+		if name == "package-lock.json" && lockName != "" {
+			break // npm reads no package-lock.json beside a shrinkwrap
+		}
+		err := copyIntoFetchDir(ws, name, dir, maxNpmManifestBytes)
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
 			continue
 		case err != nil:
-			return refuse(nil, none, "makewand cannot read the project's "+name+" to inspect it before the networked npm fetch ("+err.Error()+"); "+npmRegistryOnlyRemedy)
-		}
-		if _, err := writeFetchFile(scratch, name, string(data)); err != nil {
-			return nil, none, fmt.Errorf("copy %s for the npm lock resolution: %w", name, err)
-		}
-		if lockName == "" && (name == "npm-shrinkwrap.json" || name == "package-lock.json") {
+			return refuseFetch(nil, none, "makewand cannot copy the project's "+name+" for the networked npm fetch ("+err.Error()+"); "+npmRegistryOnlyRemedy)
+		case name == "package.json":
+			hasManifest = true
+		default:
 			lockName = name
 		}
 	}
-	networked := npmVersionProbe() >= npmNetworkedLockMajor
-	if !networked && lockName == "" {
-		return refuse(nil, none, "the project has no package-lock.json, and "+oldNpm+"commit a lockfile (npm install --package-lock-only) or use npm 12 or later; "+npmRegistryOnlyRemedy)
-	}
 
-	resolve := fetch
-	resolve.Args = []string{"install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", scratch}
-	if !networked {
-		resolve.Args = append(resolve.Args, "--offline")
+	npm := fetchToolPath("npm", projectDir)
+	settings := append(slices.Clone(plan.env), "npm_config_ignore_scripts=true", "npm_config_allow_git=none",
+		"npm_config_cache="+area.cacheDir(fetchCacheNpm), "npm_config_update_notifier=false")
+	spec := fetchSpec{workspace: projectDir, dir: dir.path, cache: area.cache, pathEnv: fetchPathEnv(projectDir), env: settings}
+	ci := plan.Args[0] == "ci" || plan.Args[0] == "clean-install"
+	keepLock := !ci && !slices.Contains(plan.Args, "--no-package-lock") && !slices.Contains(plan.Args, "--package-lock=false")
+
+	if hasManifest && !ci {
+		networked := npmVersionProbe(npm) >= npmNetworkedLockMajor
+		if !networked && lockName == "" {
+			return refuseFetch(nil, none, "the project has no package-lock.json, and "+oldNpm+"commit a lockfile (npm install --package-lock-only) or use npm 12 or later; "+npmRegistryOnlyRemedy)
+		}
+		resolve := []string{"install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"}
+		if !networked {
+			resolve = append(resolve, "--offline")
+		}
+		result, network, attached, err := p.execFetchCommand(ctx, env, spec, npm, resolve, networked)
+		if !attached && err == nil {
+			return p.npmFetchFallback(ctx, env, projectDir, plan, readOnly, network)
+		}
+		if err != nil {
+			return result, network, err
+		}
+		if result != nil && result.ExitCode != 0 {
+			// The resolution runs no project code, so npm's report is its own.
+			if reason := npmAllowRefusal(result); reason != "" {
+				return refuseFetch(result, network, reason+"; "+npmRegistryOnlyRemedy)
+			}
+			if !networked && npmNotCached(result) {
+				return refuseFetch(result, network, "the project's "+lockName+" does not hold every dependency, so npm would resolve the rest with the network, and "+oldNpm+"update the lockfile (npm install --package-lock-only) or use npm 12 or later; "+npmRegistryOnlyRemedy)
+			}
+			return result, network, nil // a failed fetch: the outage check or the candidate
+		}
+		if lockName == "" {
+			lockName = "package-lock.json"
+		}
 	}
-	result, network, err := p.execVerificationStep(ctx, env, projectDir, resolve, readOnly, networked)
-	if err != nil {
+	var lock []byte
+	if lockName != "" {
+		if lock, err = dir.readFile(lockName, maxNpmManifestBytes); err != nil {
+			return refuseFetch(nil, none, "npm left no "+lockName+" makewand could inspect ("+err.Error()+"); "+npmRegistryOnlyRemedy)
+		}
+		dep, err := npmLockfileNonRegistry(lock)
+		if err != nil {
+			return refuseFetch(nil, none, "makewand cannot inspect the "+lockName+" npm resolved ("+err.Error()+"); "+npmRegistryOnlyRemedy)
+		}
+		if dep != "" {
+			return refuseFetch(nil, none, "the project's dependencies take "+dep+" instead of the registry, which npm before 12 prepares by running its scripts even under --ignore-scripts when it is a git repository or a directory; "+npmRegistryOnlyRemedy)
+		}
+	}
+	install := npmInstallArgs(plan.Args, hasManifest)
+	result, network, attached, err := p.execFetchCommand(ctx, env, spec, npm, install, true)
+	if !attached && err == nil {
+		return p.npmFetchFallback(ctx, env, projectDir, plan, readOnly, network)
+	}
+	if err != nil || result == nil {
 		return result, network, err
 	}
-	if result != nil && result.ExitCode != 0 {
-		// The resolution runs no project code, so npm's report is its own.
+	if result.ExitCode != 0 {
 		if reason := npmAllowRefusal(result); reason != "" {
-			return refuse(result, network, reason+"; "+npmRegistryOnlyRemedy)
+			return refuseFetch(result, network, reason+"; "+npmRegistryOnlyRemedy)
 		}
-		if !networked && npmNotCached(result) {
-			return refuse(result, network, "the project's "+lockName+" does not hold every dependency, so npm would resolve the rest with the network, and "+oldNpm+"update the lockfile (npm install --package-lock-only) or use npm 12 or later; "+npmRegistryOnlyRemedy)
-		}
-		return result, network, nil // a failed fetch: the outage check or the candidate
+		return result, network, nil
 	}
-	if lockName == "" {
-		lockName = "package-lock.json"
+	if err := placeFetchTree(dir, ws, "node_modules"); err != nil {
+		return result, network, err
 	}
-	lock, err := readNpmLockfile(filepath.Join(scratch, lockName))
-	if err != nil {
-		return refuse(result, network, "npm resolved the dependencies but left no "+lockName+" makewand could inspect ("+err.Error()+"); "+npmRegistryOnlyRemedy)
-	}
-	dep, err := npmLockfileNonRegistry(lock)
-	if err != nil {
-		return refuse(result, network, "makewand cannot inspect the "+lockName+" npm resolved ("+err.Error()+"); "+npmRegistryOnlyRemedy)
-	}
-	if dep != "" {
-		return refuse(result, network, "the project's dependencies take "+dep+" instead of the registry, which npm before 12 prepares by running its scripts even under --ignore-scripts when it is a git repository or a directory; "+npmRegistryOnlyRemedy)
-	}
-	restore, err := p.placeNpmLockfile(lockName, lock)
-	if err != nil {
-		return nil, none, fmt.Errorf("put the inspected %s in place for the npm fetch: %w", lockName, err)
-	}
-	install := fetch
-	install.Args = slices.DeleteFunc(slices.Clone(fetch.Args), func(arg string) bool { return arg == "--no-package-lock" })
-	result, network, err = p.execVerificationStep(ctx, env, projectDir, install, readOnly, true)
-	if err != nil || result == nil || result.ExitCode != 0 || slices.Contains(fetch.Args, "--no-package-lock") {
-		restore()
-	}
-	if err == nil && result != nil && result.ExitCode != 0 {
-		if reason := npmAllowRefusal(result); reason != "" {
-			return refuse(result, network, reason+"; "+npmRegistryOnlyRemedy)
+	if keepLock && lock != nil {
+		if err := writeBackWorkspaceFile(ws, lockName, lock); err != nil {
+			return result, network, fmt.Errorf("put the %s npm resolved into the project: %w", lockName, err)
 		}
 	}
+	return result, network, nil
+}
+
+// npmFetchFallback runs an npm plan whose user-mode network could not be set
+// up the way a dependency step without outbound network runs: as planned,
+// loopback-only in the workspace, which explains the stage that failed if a
+// download was needed.
+func (p *Project) npmFetchFallback(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, network sandboxNetwork) (*ExecResult, sandboxNetwork, error) {
+	result, err := p.execLoopbackStep(ctx, env, projectDir, plan, readOnly, true)
 	return result, network, err
 }
 
-// readNpmLockfile reads the lockfile the lock resolution wrote.
-func readNpmLockfile(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
+// npmInstallArgs is the networked install of an npm plan: `npm ci` of the
+// inspected lockfile (npm install with neither manifest nor lockfile keeps its
+// own subcommand), without scripts, audit or funding requests, keeping the
+// plan's options that choose what to install (npmNetworkedOption) but none
+// that would change the lockfile.
+func npmInstallArgs(planArgs []string, hasManifest bool) []string {
+	sub := "ci"
+	if !hasManifest {
+		sub = planArgs[0]
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxNpmManifestBytes {
-		return nil, fmt.Errorf("%s is not a regular file of at most %d bytes", filepath.Base(path), maxNpmManifestBytes)
+	args := []string{sub, "--ignore-scripts", "--no-audit", "--no-fund"}
+	for _, arg := range planArgs[1:] {
+		switch {
+		case slices.Contains(args, arg), arg == "--no-package-lock", strings.HasPrefix(arg, "--package-lock="),
+			arg == "--no-save", strings.HasPrefix(arg, "--save="):
+			continue
+		}
+		args = append(args, arg)
 	}
-	return os.ReadFile(path) //nolint:gosec // G304: in the lock resolution's own scratch directory
+	return args
 }
 
-// placeNpmLockfile writes the inspected lockfile into the project for the
-// real fetch, unless the project's own one already says the same, and
-// returns what restores the project's previous lockfile.
-func (p *Project) placeNpmLockfile(name string, lock []byte) (func(), error) {
-	before, err := p.readProjectFileLimit(name, maxNpmManifestBytes)
-	existed := err == nil
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-	if existed && npmLockfilesEqual(before, lock) {
-		return func() {}, nil
-	}
-	mode := fs.FileMode(0o644)
-	if err := p.writeFileMode(name, string(lock), &mode); err != nil {
-		return nil, err
-	}
-	return func() {
-		if existed {
-			_ = p.writeFileMode(name, string(before), nil)
-			return
-		}
-		if root, err := os.OpenRoot(p.Path); err == nil {
-			_ = root.Remove(name)
-			_ = root.Close()
-		}
-	}, nil
+// npmNetworkedFlags are the npm options without a value a networked fetch
+// accepts: they choose what to install or how npm reports, never what to fetch
+// from where.
+var npmNetworkedFlags = map[string]bool{
+	"--ignore-scripts": true, "--no-audit": true, "--no-fund": true, "--no-package-lock": true, "--no-save": true,
+	"--production": true, "--no-optional": true, "--legacy-peer-deps": true, "--strict-peer-deps": true,
+	"--prefer-offline": true, "--prefer-online": true, "--no-progress": true, "--no-color": true,
+	"--silent": true, "--quiet": true, "--verbose": true, "-s": true, "-q": true, "-d": true,
 }
 
-// npmLockfilesEqual reports whether two lockfiles hold the same JSON.
-func npmLockfilesEqual(a, b []byte) bool {
-	if bytes.Equal(a, b) {
+// npmNetworkedValueOptions are the npm options a networked fetch accepts as
+// --key=value.
+var npmNetworkedValueOptions = map[string]bool{
+	"--omit": true, "--include": true, "--loglevel": true, "--audit": true, "--fund": true,
+	"--package-lock": true, "--save": true, "--progress": true, "--color": true, "--ignore-scripts": true,
+}
+
+// npmNetworkedOption reports whether a networked npm fetch accepts arg.
+func npmNetworkedOption(arg string) bool {
+	if npmNetworkedFlags[arg] {
 		return true
 	}
-	var x, y any
-	return json.Unmarshal(a, &x) == nil && json.Unmarshal(b, &y) == nil && reflect.DeepEqual(x, y)
+	key, _, ok := strings.Cut(arg, "=")
+	return ok && npmNetworkedValueOptions[key]
 }
 
 // npmAllowRefusal returns, from npm's own report, why npm refused a dependency

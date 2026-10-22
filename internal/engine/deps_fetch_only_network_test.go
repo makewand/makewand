@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -22,9 +21,9 @@ import (
 // fetched. eng-1021-4: a sandboxed go step leaves no telemetry files.
 
 // fetchWheelhouse returns the wheelhouse a pip download plan writes to (its
-// --dest) and checks it sits under a fresh per-run fetch directory beside the
-// persistent sandbox HOME, never inside it (GEC-1021-1 round 4: host-side
-// writes move out of the loopback-writable sandbox HOME).
+// --dest) and checks it sits in the fetch's own directory outside the
+// workspace, never in it or in the persistent sandbox HOME (GEC-1021-1 round
+// 7: a networked fetch sees no part of the workspace).
 func fetchWheelhouse(t *testing.T, projectDir string, fetch *ExecPlan) string {
 	t.Helper()
 	wh := ""
@@ -36,12 +35,11 @@ func fetchWheelhouse(t *testing.T, projectDir string, fetch *ExecPlan) string {
 	if wh == "" {
 		t.Fatalf("pip fetch has no --dest: %v", fetch.Args)
 	}
-	sandboxHome := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
-	if strings.HasPrefix(wh, sandboxHome+string(filepath.Separator)) {
-		t.Fatalf("wheelhouse %q is inside the persistent sandbox HOME %q, want a fresh per-run directory", wh, sandboxHome)
+	if pathWithin(projectDir, wh) {
+		t.Fatalf("wheelhouse %q is inside the workspace %q, want the fetch directory", wh, projectDir)
 	}
-	if !strings.Contains(wh, filepath.FromSlash(".makewand/fetch-")) {
-		t.Fatalf("wheelhouse %q is not under a fresh .makewand/fetch-* directory", wh)
+	if fetch.stage == nil || wh != fetch.stage.dir.abs("wheelhouse") {
+		t.Fatalf("wheelhouse %q is not in the fetch's own directory", wh)
 	}
 	return wh
 }
@@ -306,55 +304,6 @@ func TestNetworkedFetchLayoutOmitsHostModuleCache_GEC1021(t *testing.T) {
 	}
 }
 
-// A networked fetch masks the workspace files isWorkspaceSecretPath marks, so a
-// fetch - even though it runs no project code - cannot read them.
-func TestNetworkedFetchMasksWorkspaceSecrets_GEC1021(t *testing.T) {
-	ws := t.TempDir()
-	writeFile(t, filepath.Join(ws, ".env"), "SECRET_TOKEN=abc")
-	writeFile(t, filepath.Join(ws, "nested", ".env.local"), "K=v")
-	writeFile(t, filepath.Join(ws, ".ssh", "id_rsa"), "key")
-	writeFile(t, filepath.Join(ws, "main.go"), "package main\n")
-	writeFile(t, filepath.Join(ws, ".env.example"), "SECRET_TOKEN=")
-	// A large source tree must not exhaust the scan: only secret masks count
-	// toward the cap, not ordinary files.
-	for i := 0; i < maxSandboxSocketMasks+50; i++ {
-		writeFile(t, filepath.Join(ws, "src", "f"+strconv.Itoa(i)+".go"), "package src\n")
-	}
-
-	masks, err := sandboxWorkspaceSecretMasks(ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// --tmpfs takes two args, --ro-bind three.
-	masked := map[string]string{} // target -> source ("tmpfs" for a directory)
-	for i := 0; i < len(masks); {
-		switch masks[i] {
-		case "--tmpfs":
-			masked[masks[i+1]] = "tmpfs"
-			i += 2
-		case "--ro-bind":
-			masked[masks[i+2]] = masks[i+1]
-			i += 3
-		default:
-			i++
-		}
-	}
-	for _, secret := range []string{filepath.Join(ws, ".env"), filepath.Join(ws, "nested", ".env.local")} {
-		if masked[secret] != os.DevNull {
-			t.Fatalf("secret %s masked with %q, want %s", secret, masked[secret], os.DevNull)
-		}
-	}
-	if masked[filepath.Join(ws, ".ssh")] != "tmpfs" {
-		t.Fatalf(".ssh masked with %q, want a tmpfs", masked[filepath.Join(ws, ".ssh")])
-	}
-	if _, ok := masked[filepath.Join(ws, "main.go")]; ok {
-		t.Fatal("a non-secret source file must not be masked")
-	}
-	if _, ok := masked[filepath.Join(ws, ".env.example")]; ok {
-		t.Fatal(".env.example is not a secret and must not be masked")
-	}
-}
-
 // The classifier: pip reporting no installable distribution (a source-only
 // dependency the wheel-only fetch cannot get) is an environment limitation, not
 // a candidate failure, and is not mistaken for a registry outage.
@@ -384,8 +333,10 @@ func TestUnfetchableDependencyClassification_GEC1021(t *testing.T) {
 }
 
 // Live: in the real sandbox, the dependency build/install runs loopback-only
-// while the fetch gets outbound network. A fake pip records, per subcommand,
-// whether it saw a default route; the download does, the install does not.
+// while the fetch gets outbound network. A fake pip (outside the workspace)
+// reports, per subcommand, whether it saw a default route (outbound network):
+// the download does, the install does not. Each run fails at the step it
+// observes, so that step's output is the result.
 func TestDependencyBuildStepRunsWithoutNetwork_GEC1021(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live sandbox test")
@@ -396,44 +347,28 @@ func TestDependencyBuildStepRunsWithoutNetwork_GEC1021(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools := filepath.Join(project.Path, "tools")
-	t.Setenv("PATH", tools+":/usr/bin:/bin")
+	tools := outsideTools(t)
 	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}
-	// A fake pip that records, per subcommand, whether the sandbox had a default
-	// route (outbound network). It writes into the workspace root (cwd), which
-	// persists: the networked fetch's HOME is a fresh, ephemeral tmpfs (round 4),
-	// so a $HOME write would not survive the step.
-	const pip = `log="$PWD/makewand-net.log"
-net=no
-/bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
-echo "$1 net=$net" >> "$log"
-exit 0
-`
-	writeExecScript(t, filepath.Join(tools, "pip"), pip)
 	if err := project.WriteFiles([]ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}}); err != nil {
-		t.Fatalf("RunVerificationPlan: %v", err)
-	}
-	log := readLog(t, filepath.Join(project.Path, "makewand-net.log"))
-	lines := strings.Split(strings.TrimSpace(log), "\n")
-	var fetch, build string
-	for _, line := range lines {
-		switch {
-		case strings.HasPrefix(line, "download "):
-			fetch = line
-		case strings.HasPrefix(line, "install "):
-			build = line
+	for _, step := range []string{"download", "install"} {
+		pip := `net=no
+/bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
+[ "$1" = ` + step + ` ] && { echo "$1 net=$net"; exit 1; }
+exit 0
+`
+		writeExecScript(t, filepath.Join(tools, "pip"), pip)
+		result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}})
+		if err != nil || result == nil {
+			t.Fatalf("RunVerificationPlan (%s): %+v, %v", step, result, err)
 		}
-	}
-	if fetch != "download net=yes" {
-		t.Fatalf("fetch step: %q, want the download with outbound network\nlog:\n%s", fetch, log)
-	}
-	if build != "install net=no" {
-		t.Fatalf("build step: %q, want the install without network\nlog:\n%s", build, log)
+		want := map[string]string{"download": "download net=yes", "install": "install net=no"}[step]
+		if got := strings.TrimSpace(result.Stdout); got != want {
+			t.Fatalf("%s step: %q, want %q", step, got, want)
+		}
 	}
 }
 

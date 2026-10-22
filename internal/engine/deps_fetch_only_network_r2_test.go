@@ -82,8 +82,11 @@ func TestPipPyprojectBuildableTargetsExcluded_GEC1021R2(t *testing.T) {
 }
 
 // The fetch resolves from the same indexes and version pins the install would:
-// http(s) index options pass through (a non-http one is dropped), and a
-// constraint file is reduced to its named pins in a sanitised file.
+// http(s) index options pass through, and a constraint file is reduced to its
+// named pins in a sanitised file in the fetch directory. Round 5: a package
+// source the fetch cannot be given (a non-http(s) index, a local find-links
+// directory outside the project) refuses the networked fetch rather than
+// silently falling back to PyPI (TestPipPrivateSourcesNeverReplacedByPyPI_GEC1021R7).
 func TestPipFetchCarriesIndexOptionsAndConstraints_GEC1021R2(t *testing.T) {
 	project := newNeedProject(t,
 		"requirements.txt", "flask==2.0\n",
@@ -94,8 +97,6 @@ func TestPipFetchCarriesIndexOptionsAndConstraints_GEC1021R2(t *testing.T) {
 		"--extra-index-url", "https://extra.example/",
 		"--trusted-host", "mirror.example",
 		"--find-links", "https://fl.example/wheels/",
-		"--find-links", "/local/wheels",
-		"--index-url", "file:///opt/pypi",
 	}}
 	fetch, _, cleanup, err := project.planDependencyStages(plan, project.Path)
 	if err != nil {
@@ -116,13 +117,13 @@ func TestPipFetchCarriesIndexOptionsAndConstraints_GEC1021R2(t *testing.T) {
 			t.Fatalf("fetch args %q, want %q", joined, want)
 		}
 	}
-	if strings.Contains(joined, "/local/wheels") || strings.Contains(joined, "file:///opt/pypi") {
-		t.Fatalf("fetch args %q must drop non-http(s) index sources", joined)
-	}
 	// The sanitised constraints file holds the named pins only, never a path.
 	ci := slices.Index(fetch.Args, "--constraint")
 	if ci < 0 || ci+1 >= len(fetch.Args) {
 		t.Fatalf("fetch args %v, want a --constraint file", fetch.Args)
+	}
+	if pathWithin(project.Path, fetch.Args[ci+1]) {
+		t.Fatalf("constraints file %s lies in the project; want the fetch directory", fetch.Args[ci+1])
 	}
 	content, err := os.ReadFile(fetch.Args[ci+1])
 	if err != nil {
@@ -130,9 +131,6 @@ func TestPipFetchCarriesIndexOptionsAndConstraints_GEC1021R2(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "flask==2.0") || !strings.Contains(string(content), "itsdangerous==2.1.2") {
 		t.Fatalf("constraints = %q, want the named pins", content)
-	}
-	if strings.Contains(string(content), ".\n") && !strings.Contains(string(content), "==") {
-		t.Fatalf("constraints = %q, want no buildable targets", content)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(content)), "\n") {
 		if line == "." || strings.HasPrefix(line, "./") {
@@ -262,100 +260,57 @@ func TestCargoFetchEnvHardened_GEC1021R2(t *testing.T) {
 	}
 }
 
-// The fetch's masks cover more than isWorkspaceSecretPath: the whole .git and
-// .cargo directories, secrets inside ignored directories, and the extra
-// credential shapes; makewand's own sandbox HOME is left writable.
-func TestNetworkedFetchMasksExtendedSecrets_GEC1021R2(t *testing.T) {
-	ws := t.TempDir()
-	writeFile(t, filepath.Join(ws, ".git", "config"), "[remote]\n  url = https://x:token@h/r.git\n")
-	writeFile(t, filepath.Join(ws, ".cargo", "config.toml"), "[build]\nrustc = \"../evil.sh\"\n")
-	writeFile(t, filepath.Join(ws, ".envrc"), "export AWS_SECRET=1")
-	writeFile(t, filepath.Join(ws, "deploy", "tls.pem"), "key")
-	writeFile(t, filepath.Join(ws, "deploy", "server.key"), "key")
-	writeFile(t, filepath.Join(ws, ".ssh2", "id_ed25519"), "key")
-	writeFile(t, filepath.Join(ws, "gcp-service-account.json"), "{}")
-	writeFile(t, filepath.Join(ws, "prod.tfvars"), "secret=1")
-	writeFile(t, filepath.Join(ws, "credentials.json"), "{}")
-	writeFile(t, filepath.Join(ws, "node_modules", "dep", ".env"), "SECRET=1")
-	writeFile(t, filepath.Join(ws, "main.go"), "package main\n")
-	// makewand's own sandbox HOME must stay writable for the fetch's caches.
-	writeFile(t, filepath.Join(ws, filepath.FromSlash(sandboxHomeRelPath), ".cargo", "registry", "cache", "x-1.0.0.crate"), "cache")
-	writeFile(t, filepath.Join(ws, filepath.FromSlash(sandboxHomeRelPath), "id_rsa"), "cachekey")
-
-	masks, err := sandboxWorkspaceSecretMasks(ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	masked := map[string]string{}
-	for i := 0; i < len(masks); {
-		switch masks[i] {
-		case "--tmpfs":
-			masked[masks[i+1]] = "tmpfs"
-			i += 2
-		case "--ro-bind":
-			masked[masks[i+2]] = masks[i+1]
-			i += 3
-		default:
-			i++
-		}
-	}
-	wantTmpfs := []string{filepath.Join(ws, ".git"), filepath.Join(ws, ".cargo")}
-	for _, dir := range wantTmpfs {
-		if masked[dir] != "tmpfs" {
-			t.Errorf("%s masked with %q, want a tmpfs", dir, masked[dir])
-		}
-	}
-	wantDevNull := []string{
-		filepath.Join(ws, ".envrc"),
-		filepath.Join(ws, "deploy", "tls.pem"),
-		filepath.Join(ws, "deploy", "server.key"),
-		filepath.Join(ws, ".ssh2", "id_ed25519"),
-		filepath.Join(ws, "gcp-service-account.json"),
-		filepath.Join(ws, "prod.tfvars"),
-		filepath.Join(ws, "credentials.json"),
-		filepath.Join(ws, "node_modules", "dep", ".env"),
-	}
-	for _, f := range wantDevNull {
-		if masked[f] != os.DevNull {
-			t.Errorf("%s masked with %q, want %s", f, masked[f], os.DevNull)
-		}
-	}
-	if _, ok := masked[filepath.Join(ws, "main.go")]; ok {
-		t.Error("a non-secret source file must not be masked")
-	}
-	// The sandbox HOME is skipped wholesale, so its cache files are untouched.
-	sandboxHome := filepath.Join(ws, filepath.FromSlash(sandboxHomeRelPath))
-	for target := range masked {
-		if strings.HasPrefix(target, sandboxHome+string(filepath.Separator)) {
-			t.Errorf("the sandbox HOME must not be masked, got %s", target)
-		}
-	}
-}
-
-// Classification: a pip requirement that does not exist on the default index is
-// the candidate's own broken dependency (a candidate failure), while one that
-// exists only as a source distribution, or a custom index that cannot be fact
-// checked, stays a conservative environment verdict.
+// Classification (round 5): a requirement pip found no distribution for is
+// the candidate's own broken dependency unless the index shows matching
+// releases that are all sdist-only here. A project the index lacks, a version
+// no release matches, a matching release with a wheel, or an index that does
+// not answer are candidate failures; the index the fetch used is the one
+// asked, never PyPI in its place.
 func TestNonexistentPipRequirementIsCandidateFailure_GEC1021R2(t *testing.T) {
+	env := pipMarkerEnv{"python_version": "3.12", "python_full_version": "3.12.3", "implementation_name": "cpython", "sys_platform": "linux", "platform_machine": "x86_64"}
+	files := func(names ...string) []pipIndexFile {
+		var out []pipIndexFile
+		for _, name := range names {
+			out = append(out, pipIndexFile{name: name})
+		}
+		return out
+	}
 	for _, tc := range []struct {
-		name       string
-		status     pypiProjectStatus
-		args       []string
-		wantAbsent bool
+		name    string
+		req     string
+		sources pipFetchSources
+		answer  pipIndexAnswer
+		files   []pipIndexFile
+		want    pipReleaseVerdict
+		asked   string
 	}{
-		{"absent on default index", pypiProjectAbsent, []string{"install", "-r", "requirements.txt"}, true},
-		{"present but sdist-only", pypiProjectPresent, []string{"install", "-r", "requirements.txt"}, false},
-		{"unknown stays environment", pypiProjectUnknown, []string{"install", "-r", "requirements.txt"}, false},
-		{"custom index is not fact checked", pypiProjectAbsent, []string{"install", "-i", "https://mirror.example/simple/", "-r", "requirements.txt"}, false},
+		{"absent on the default index", "boguspkg==1.0", pipFetchSources{}, pipIndexNotFound, nil, pipReleaseNone, "https://pypi.org/simple/boguspkg/"},
+		{"no release matches", "requests==999999", pipFetchSources{}, pipIndexListed, files("requests-2.32.3-py3-none-any.whl", "requests-2.32.3.tar.gz"), pipReleaseNone, "https://pypi.org/simple/requests/"},
+		{"sdist-only matching release", "oldpkg>=1", pipFetchSources{}, pipIndexListed, files("oldpkg-1.0.tar.gz", "oldpkg-0.9-py3-none-any.whl"), pipReleaseSdistOnly, ""},
+		{"wheel for another platform only", "natpkg==2.0", pipFetchSources{}, pipIndexListed, files("natpkg-2.0-cp312-cp312-win_amd64.whl", "natpkg-2.0.tar.gz"), pipReleaseSdistOnly, ""},
+		{"a matching wheel exists", "goodpkg>=1", pipFetchSources{}, pipIndexListed, files("goodpkg-1.1-py3-none-any.whl", "goodpkg-1.1.tar.gz"), pipReleaseInstallable, ""},
+		{"unknown answer is not an environment verdict", "pkg", pipFetchSources{}, pipIndexUnknown, nil, pipReleaseUnknown, ""},
+		{"the private index is asked", "internal==1.0", pipFetchSources{index: "https://pypi.corp.example/simple"}, pipIndexListed, files("internal-1.0.tar.gz"), pipReleaseSdistOnly, "https://pypi.corp.example/simple/internal/"},
+		{"no index: local wheels only", "pkg", pipFetchSources{noIndex: true}, pipIndexListed, nil, pipReleaseNone, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			project := newNeedProject(t, "requirements.txt", "boguspkg\n")
-			old := pypiProjectExists
-			pypiProjectExists = func(string) pypiProjectStatus { return tc.status }
-			t.Cleanup(func() { pypiProjectExists = old })
-			plan := ExecPlan{Kind: "deps", Command: "pip", Args: tc.args}
-			if got := project.pipProjectAbsent(plan, "boguspkg==1.0"); got != tc.wantAbsent {
-				t.Fatalf("pipProjectAbsent = %v, want %v", got, tc.wantAbsent)
+			project := newNeedProject(t, "requirements.txt", tc.req+"\n")
+			var asked []string
+			old := pipIndexFiles
+			pipIndexFiles = func(_ context.Context, _ verifyExecEnvironment, page string) ([]pipIndexFile, pipIndexAnswer) {
+				asked = append(asked, page)
+				return tc.files, tc.answer
+			}
+			t.Cleanup(func() { pipIndexFiles = old })
+			got, why := project.pipReleaseCheck(context.Background(), verifyExecEnvironment{}, tc.sources, tc.req, env)
+			if got != tc.want {
+				t.Fatalf("pipReleaseCheck(%q) = %v (%s), want %v", tc.req, got, why, tc.want)
+			}
+			if tc.asked != "" && !slices.Contains(asked, tc.asked) {
+				t.Fatalf("asked %v, want %s", asked, tc.asked)
+			}
+			if tc.want != pipReleaseSdistOnly && why == "" {
+				t.Fatal("a candidate verdict needs a note saying why")
 			}
 		})
 	}
@@ -436,8 +391,7 @@ func TestForgedBuildOutputStaysCandidateFailure_GEC1021R2(t *testing.T) {
 		t.Skip("live sandbox test")
 	}
 	project := sandboxDepsProject(t)
-	tools := filepath.Join(project.Path, "tools")
-	t.Setenv("PATH", tools+":/usr/bin:/bin")
+	tools := outsideTools(t)
 	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}
@@ -473,9 +427,7 @@ func sandboxDepsProject(t *testing.T) *Project {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	if err := disableGoTelemetry(home); err != nil {
-		t.Fatal(err)
-	}
+	disableGoTelemetryAt(t, home)
 	unsetProxyEnv(t)
 	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "0")
 	t.Setenv("MAKEWAND_SANDBOX_MEMORY_MAX", "2G")

@@ -344,6 +344,7 @@ func writeProjectFiles(t *testing.T, dir string, files ...string) {
 
 func newNeedProject(t *testing.T, files ...string) *Project {
 	t.Helper()
+	isolateFetchArea(t)
 	project, err := NewProject("r4-need", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
