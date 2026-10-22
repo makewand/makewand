@@ -476,10 +476,10 @@ func pipWheelCompatible(filename string, env pipMarkerEnv) bool {
 		return false
 	}
 	abiOK := func(py, abi string) bool {
-		switch {
-		case abi == "none":
+		switch abi {
+		case "none":
 			return pyOK(py) || isAbi3Python(py, impl, major, minor)
-		case abi == "abi3":
+		case "abi3":
 			return isAbi3Python(py, impl, major, minor)
 		}
 		return impl != "" && pyOK(py) && strings.HasPrefix(abi, impl+strconv.Itoa(major)+strconv.Itoa(minor))

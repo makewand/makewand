@@ -35,6 +35,7 @@ func outsideTools(t *testing.T) string {
 		t.Fatalf("outsideTools needs the test's own HOME, got %q", home)
 	}
 	tools := filepath.Join(home, "tools")
+	//nolint:gosec // G703: a test helper creating a directory under the test's own HOME.
 	if err := os.MkdirAll(tools, 0o755); err != nil {
 		t.Fatal(err)
 	}

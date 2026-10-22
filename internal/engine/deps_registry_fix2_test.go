@@ -19,6 +19,7 @@ import (
 
 func writeExecScript(t *testing.T, path, body string) {
 	t.Helper()
+	//nolint:gosec // G703: a test helper writing test-controlled paths under t.TempDir.
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
