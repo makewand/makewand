@@ -233,7 +233,7 @@ func TestGoFetchSources_GEC1021R7(t *testing.T) {
 	}
 
 	old := goModParse
-	goModParse = func(_ string, data []byte) (*goModFile, error) {
+	goModParse = func(_, _ string, data []byte) (*goModFile, error) {
 		mod := &goModFile{}
 		for _, line := range strings.Split(string(data), "\n") {
 			if f := strings.Fields(line); len(f) == 4 && f[0] == "replace" && f[2] == "=>" {

@@ -59,10 +59,10 @@ func TestRegistryProbeChains_R4(t *testing.T) {
 		{url: srv.URL + "/gone/supported", decides: true, fallback: &registryEndpoint{url: closedURL}},
 	}
 	old := registryCheckEndpoints
-	registryCheckEndpoints = func(string) []registryEndpoint { return endpoints }
+	registryCheckEndpoints = func(string, string) []registryEndpoint { return endpoints }
 	t.Cleanup(func() { registryCheckEndpoints = old })
 
-	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go")
+	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", "")
 	if !check.done || len(check.unreachable) != 1 || !strings.HasPrefix(check.unreachable[0], "127.0.0.1 (") || !strings.Contains(check.unreachable[0], "connection refused") {
 		t.Fatalf("check = %+v, want only the chain ending at the closed port unreachable", check)
 	}
@@ -225,7 +225,7 @@ func fakeGoOnPath(t *testing.T, env hostGoEnv) {
 	writeExecScript(t, filepath.Join(dir, "go"), "exit 1\n")
 	t.Setenv("PATH", dir)
 	old := sandboxGoEnvProbe
-	sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return env, nil }
+	sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) { return env, nil }
 	t.Cleanup(func() { sandboxGoEnvProbe = old })
 }
 
@@ -293,7 +293,7 @@ func TestGoRegistryEndpoints_R4(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeGoOnPath(t, tc.env)
 			var got [][]string
-			for _, endpoint := range defaultRegistryEndpoints("go") {
+			for _, endpoint := range defaultRegistryEndpoints("go", "") {
 				got = append(got, endpoint.chain())
 			}
 			if !slices.EqualFunc(got, tc.want, slices.Equal[[]string]) {
@@ -302,7 +302,7 @@ func TestGoRegistryEndpoints_R4(t *testing.T) {
 		})
 	}
 	for command, want := range map[string]string{"npm": "https://registry.npmjs.org/", "pip3": "https://pypi.org/simple/", "cargo": "https://index.crates.io/config.json"} {
-		if got := defaultRegistryEndpoints(command); len(got) == 0 || got[0].url != want || got[0].fallback != nil {
+		if got := defaultRegistryEndpoints(command, ""); len(got) == 0 || got[0].url != want || got[0].fallback != nil {
 			t.Errorf("%s: %+v, want %q first", command, got, want)
 		}
 	}

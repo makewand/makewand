@@ -84,7 +84,7 @@ func TestRegistryCheckNeedsNoPython_R4(t *testing.T) {
 	project := newHostDepsProject(t)
 	fakeToolPrinting(t, "go", `go: rsc.io/quote@v1.5.2: Get "https://`+proxyAddr+`/rsc.io/quote/@v/v1.5.2.zip": dial tcp `+proxyAddr+`: connect: connection refused`, 1)
 	oldProbe := sandboxGoEnvProbe
-	sandboxGoEnvProbe = func(string) (hostGoEnv, error) {
+	sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) {
 		return hostGoEnv{GOPROXY: "https://" + proxyAddr + ",direct", GOSUMDB: "off"}, nil
 	}
 	t.Cleanup(func() { sandboxGoEnvProbe = oldProbe })
@@ -150,7 +150,7 @@ func TestGoChecksumDatabaseThroughModuleProxy_R4(t *testing.T) {
 			project := newHostDepsProject(t)
 			fakeToolPrinting(t, "go", `go: rsc.io/quote@v1.5.2: Get "https://`+proxy+`/rsc.io/quote/@v/v1.5.2.zip": dial tcp `+proxy+`: i/o timeout`, 1)
 			oldProbe := sandboxGoEnvProbe
-			sandboxGoEnvProbe = func(string) (hostGoEnv, error) {
+			sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) {
 				return hostGoEnv{GOPROXY: "https://" + proxy + ",direct", GOSUMDB: sumdb + "+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8"}, nil
 			}
 			t.Cleanup(func() { sandboxGoEnvProbe = oldProbe })

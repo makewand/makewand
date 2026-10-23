@@ -22,7 +22,7 @@ func stubRegistryCheck(t *testing.T, check registryCheck) *[]string {
 	t.Helper()
 	var commands []string
 	old := checkRegistry
-	checkRegistry = func(_ context.Context, _ verifyExecEnvironment, command string) registryCheck {
+	checkRegistry = func(_ context.Context, _ verifyExecEnvironment, command, _ string) registryCheck {
 		commands = append(commands, command)
 		return check
 	}
@@ -207,7 +207,7 @@ func TestForgedRegistryOutageIsCandidateFailure_R3(t *testing.T) {
 			header, urls := registryCheckLog(t, log)
 			want := tc.urls
 			if want == nil {
-				want = firstChainURLs(registryCheckEndpoints(tc.command))
+				want = firstChainURLs(registryCheckEndpoints(tc.command, ""))
 			}
 			if !slices.Equal(urls, want) {
 				t.Fatalf("connectivity check asked %q, want the default registry %q (%s)", urls, want, header)

@@ -399,8 +399,14 @@ func copyFetchTreeFile(src *os.Root, from string, dst *os.Root, to string, perm 
 // included) or reaches into it through a symlink. A workspace .venv/bin or
 // node_modules/.bin therefore never supplies a fetch command.
 func fetchPathEnv(workspace string) string {
+	return pathOutsideWorkspace(workspace, sandboxPathEnv())
+}
+
+// pathOutsideWorkspace must be used for both resolving and executing host
+// probes: an env shebang or wrapper's child otherwise sees a different PATH.
+func pathOutsideWorkspace(workspace, pathEnv string) string {
 	var kept []string
-	for _, dir := range filepath.SplitList(sandboxPathEnv()) {
+	for _, dir := range filepath.SplitList(pathEnv) {
 		if dir == "" || !filepath.IsAbs(dir) || insideWorkspace(workspace, dir) {
 			continue
 		}
@@ -414,6 +420,15 @@ func fetchPathEnv(workspace string) string {
 func insideWorkspace(workspace, path string) bool {
 	if workspace == "" {
 		return false
+	}
+	var err error
+	workspace, err = filepath.Abs(workspace)
+	if err != nil {
+		return true // no reliable boundary: refuse the executable
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return true
 	}
 	if pathWithin(filepath.Clean(workspace), filepath.Clean(path)) {
 		return true
@@ -473,6 +488,9 @@ func trustedFetchExecutable(bin, workspace, pathEnv string) bool {
 		interpreter := scriptInterpreterAny(bin, pathEnv)
 		if interpreter == "" {
 			return true
+		}
+		if !filepath.IsAbs(interpreter) {
+			return false
 		}
 		bin = interpreter
 	}

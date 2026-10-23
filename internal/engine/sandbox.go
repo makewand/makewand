@@ -606,7 +606,7 @@ func (p *Project) dependencyRegistryError(ctx context.Context, env verifyExecEnv
 		}
 		return "", unavailable(network.guidance())
 	}
-	check := checkRegistry(ctx, env, plan.Command)
+	check := checkRegistry(ctx, env, plan.Command, p.Path)
 	switch {
 	case check.done && len(check.unreachable) > 0:
 		return "", unavailable(network.unreachableGuidance(check.unreachable))
@@ -969,7 +969,7 @@ var goModParse = parseGoModWithGoCommand
 // the workspace: a copy of the file is parsed from the root directory with
 // GOTOOLCHAIN=local, so the file can neither switch toolchains nor make the
 // go command fetch anything (go mod edit resolves no version).
-func parseGoModWithGoCommand(goBin string, data []byte) (*goModFile, error) {
+func parseGoModWithGoCommand(goBin, pathEnv string, data []byte) (*goModFile, error) {
 	dir, err := os.MkdirTemp("", "makewand-gomod-*")
 	if err != nil {
 		return nil, err
@@ -984,7 +984,7 @@ func parseGoModWithGoCommand(goBin string, data []byte) (*goModFile, error) {
 	//nolint:gosec // G204: goBin is the host toolchain resolved from the sandbox PATH; fixed argv, no shell.
 	cmd := exec.CommandContext(ctx, goBin, "mod", "edit", "-json", file)
 	cmd.Dir = string(filepath.Separator)
-	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("go mod edit: %w", err)
@@ -1047,15 +1047,16 @@ func (p *Project) goRegistryNeed(plan ExecPlan) string {
 	if err != nil {
 		return ""
 	}
-	goBin := lookPathIn("go", sandboxPathEnv())
-	if goBin == "" {
+	pathEnv := fetchPathEnv(projectDir)
+	goBin := trustedToolPath("go", projectDir, pathEnv)
+	if !filepath.IsAbs(goBin) {
 		return ""
 	}
-	mod, err := goModParse(goBin, []byte(data))
+	mod, err := goModParse(goBin, pathEnv, []byte(data))
 	if err != nil || !goImportPathOK(mod.Module.Path) {
 		return ""
 	}
-	hostEnv, err := sandboxGoEnvProbe(goBin)
+	hostEnv, err := sandboxGoEnvProbe(goBin, pathEnv)
 	if err != nil {
 		hostEnv = hostGoEnv{} // the sandbox then leaves the go command its defaults
 	}

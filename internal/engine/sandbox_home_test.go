@@ -39,7 +39,7 @@ func stubGoEnv(t *testing.T, env hostGoEnv, err error) {
 	t.Helper()
 	old := sandboxGoEnvProbe
 	t.Cleanup(func() { sandboxGoEnvProbe = old })
-	sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return env, err }
+	sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) { return env, err }
 }
 
 // roBinds returns the sources of every --ro-bind in args.

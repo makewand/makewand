@@ -635,11 +635,12 @@ func (p *Project) goLocalReplacements(projectDir, module string, gomod []byte) (
 	if !strings.Contains(string(gomod), "replace") {
 		return nil, nil
 	}
-	goBin := fetchToolPath("go", projectDir)
+	pathEnv := fetchPathEnv(projectDir)
+	goBin := trustedToolPath("go", projectDir, pathEnv)
 	if !filepath.IsAbs(goBin) {
 		return nil, nil // no go command: the fetch fails as a missing tool does
 	}
-	mod, err := goModParse(goBin, gomod)
+	mod, err := goModParse(goBin, pathEnv, gomod)
 	if err != nil {
 		return nil, nil // the go command reports the broken go.mod itself
 	}

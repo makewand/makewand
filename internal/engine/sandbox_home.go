@@ -159,8 +159,10 @@ var sandboxGoEnvProbe = probeHostGoEnv
 // probeHostGoEnv runs `go env` for the host toolchain. It never runs inside
 // the (untrusted) workspace - a go.mod there could request a toolchain switch -
 // and pins GOTOOLCHAIN=local so the probe itself can never download anything.
-func probeHostGoEnv(goBin string) (hostGoEnv, error) {
-	key := goBin + "\x00" + os.Getenv("HOME") + "\x00" + os.Getenv("GOMODCACHE") + "\x00" + os.Getenv("GOPATH") + "\x00" + os.Getenv("GOPROXY") + "\x00" + os.Getenv("GOROOT")
+// pathEnv is exactly the workspace-filtered PATH used to validate goBin and
+// its interpreters; both execution and caching must retain that boundary.
+func probeHostGoEnv(goBin, pathEnv string) (hostGoEnv, error) {
+	key := goBin + "\x00" + pathEnv + "\x00" + os.Getenv("HOME") + "\x00" + os.Getenv("GOMODCACHE") + "\x00" + os.Getenv("GOPATH") + "\x00" + os.Getenv("GOPROXY") + "\x00" + os.Getenv("GOROOT")
 	hostGoEnvMu.Lock()
 	if cached, ok := hostGoEnvCache[key]; ok {
 		hostGoEnvMu.Unlock()
@@ -174,7 +176,7 @@ func probeHostGoEnv(goBin string) (hostGoEnv, error) {
 	cmd := exec.CommandContext(ctx, goBin, "env", "-json",
 		"GOROOT", "GOMODCACHE", "GOVERSION", "GOPROXY", "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOSUMDB", "GOINSECURE")
 	cmd.Dir = string(filepath.Separator)
-	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
 	out, err := cmd.Output()
 	if err != nil {
 		return hostGoEnv{}, fmt.Errorf("go env: %w", err)
@@ -430,6 +432,7 @@ func isPathHiddenBySandbox(home, p string) bool {
 // dependency fetch (it can hold private modules, and the fetch downloads into
 // the shared fetch module cache, which the offline steps then read).
 func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(string) string, noHostModuleCache bool) ([]string, []string, string) {
+	probePath := pathOutsideWorkspace(workspace, pathEnv)
 	candidates := map[string]struct{}{}
 	addRoot := func(root string) {
 		root = filepath.Clean(root)
@@ -449,7 +452,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	for _, name := range sandboxToolchainCommands {
 		bin := lookPathIn(name, pathEnv)
 		if name == "go" {
-			bin = trustedToolPath(name, workspace, pathEnv)
+			bin = trustedToolPath(name, workspace, probePath)
 			if !filepath.IsAbs(bin) {
 				continue
 			}
@@ -481,7 +484,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 		if goroot := strings.TrimSpace(getenv("GOROOT")); goroot != "" {
 			env = append(env, "GOROOT", goroot)
 		}
-		if hostEnv, err := sandboxGoEnvProbe(goBin); err == nil {
+		if hostEnv, err := sandboxGoEnvProbe(goBin, probePath); err == nil {
 			goVersion = strings.TrimSpace(hostEnv.GOVERSION)
 			if goroot := strings.TrimSpace(hostEnv.GOROOT); goroot != "" && filepath.IsAbs(goroot) && isPathHiddenBySandbox(home, goroot) {
 				addRoot(goroot)

@@ -100,7 +100,7 @@ func fakeGoParsingOnPath(t *testing.T, env hostGoEnv) {
 	writeExecScript(t, filepath.Join(dir, "go"), fmt.Sprintf("exec %q \"$@\"\n", realGo))
 	t.Setenv("PATH", dir)
 	old := sandboxGoEnvProbe
-	sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return env, nil }
+	sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) { return env, nil }
 	t.Cleanup(func() { sandboxGoEnvProbe = old })
 }
 

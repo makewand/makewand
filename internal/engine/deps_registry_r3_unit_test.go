@@ -90,10 +90,10 @@ func TestRegistryCheckScriptAgainstLocalServers_R3(t *testing.T) {
 	t.Setenv("SSL_CERT_FILE", ca)
 	urls := []string{trusted.URL + "/", trusted.URL + "/missing", closedURL, untrusted.URL + "/"}
 	old := registryCheckEndpoints
-	registryCheckEndpoints = func(string) []registryEndpoint { return registryEndpoints(urls...) }
+	registryCheckEndpoints = func(string, string) []registryEndpoint { return registryEndpoints(urls...) }
 	t.Cleanup(func() { registryCheckEndpoints = old })
 
-	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "npm")
+	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "npm", "")
 	if !check.done || len(check.unreachable) != 2 {
 		t.Fatalf("check = %+v, want the closed port and the untrusted server unreachable", check)
 	}
@@ -147,10 +147,10 @@ func TestRegistryCheckFromRealSandboxLive_R3(t *testing.T) {
 		}
 	}
 	old := registryCheckEndpoints
-	registryCheckEndpoints = func(string) []registryEndpoint { return registryEndpoints("https://10.255.255.1/") }
+	registryCheckEndpoints = func(string, string) []registryEndpoint { return registryEndpoints("https://10.255.255.1/") }
 	t.Cleanup(func() { registryCheckEndpoints = old })
 	start := time.Now()
-	check := checkRegistryReachable(context.Background(), env, "npm")
+	check := checkRegistryReachable(context.Background(), env, "npm", "")
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("check took %s", elapsed)
 	}

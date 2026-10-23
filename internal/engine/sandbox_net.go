@@ -626,8 +626,8 @@ type registryProbeRun struct {
 // candidate code nor project configuration can influence the result, and no
 // interpreter has to be installed. A check that cannot run (its sandbox could
 // not get the user-mode network, for example) is tried once more.
-func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, command string) registryCheck {
-	endpoints := registryCheckEndpoints(command)
+func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, command, workspace string) registryCheck {
+	endpoints := registryCheckEndpoints(command, workspace)
 	if len(endpoints) == 0 {
 		return registryCheck{failure: "it does not know the registry of " + command}
 	}
@@ -824,14 +824,14 @@ func parseRegistryCheck(run registryProbeRun, endpoints []registryEndpoint, time
 // defaultRegistryEndpoints returns the endpoints of the default registry that
 // a dependency install of command's ecosystem needs (index and downloads), or
 // nil for a command whose outages makewand does not recognize.
-func defaultRegistryEndpoints(command string) []registryEndpoint {
+func defaultRegistryEndpoints(command, workspace string) []registryEndpoint {
 	switch command {
 	case "npm":
 		return registryEndpoints("https://registry.npmjs.org/")
 	case "pip", "pip3":
 		return registryEndpoints("https://pypi.org/simple/", "https://files.pythonhosted.org/")
 	case "go":
-		return goRegistryEndpoints()
+		return goRegistryEndpoints(workspace)
 	case "cargo":
 		return registryEndpoints("https://index.crates.io/config.json", "https://static.crates.io/")
 	}
@@ -843,10 +843,11 @@ func defaultRegistryEndpoints(command string) []registryEndpoint {
 // go command reaches it (goSumDBEndpoint). Both follow the host's GOPROXY,
 // GOSUMDB, GONOSUMDB and GOPRIVATE, which makewand passes into the sandbox (a
 // project cannot set them); by default proxy.golang.org and sum.golang.org.
-func goRegistryEndpoints() []registryEndpoint {
+func goRegistryEndpoints(workspace string) []registryEndpoint {
 	var hostEnv hostGoEnv
-	if goBin := lookPathIn("go", sandboxPathEnv()); goBin != "" {
-		if probed, err := sandboxGoEnvProbe(goBin); err == nil {
+	pathEnv := fetchPathEnv(workspace)
+	if goBin := trustedToolPath("go", workspace, pathEnv); filepath.IsAbs(goBin) {
+		if probed, err := sandboxGoEnvProbe(goBin, pathEnv); err == nil {
 			hostEnv = probed
 		}
 	}
