@@ -130,6 +130,14 @@ removed too, and the index is rewritten from the remaining records, keeping
 lines appended meanwhile. Go and Python apply the same rules
 (`tests/testdata/evidence_retention_cases.json`).
 
+Each record write first syncs a `<attempt>.json.pending` marker, then publishes
+and syncs the record before removing that marker. Readers ignore marked records
+and retention keeps them, including a settled PASSED version whose rename
+succeeded but directory sync failed. A first write that failed after publication
+returns UNKNOWN instead of degrading to missing telemetry; Python also refuses
+to launch the provider in that case. A later successful write removes the marker.
+An orphan marker older than retention is removed only under its record lock.
+
 Test binaries that can record evidence (Go `execution`, `router`,
 `cmd/makewand`, `internal/tui`; Python through `tests/_isolation.py`) point
 `MAKEWAND_EXECUTION_EVIDENCE_DIR` at a private temporary directory, so test

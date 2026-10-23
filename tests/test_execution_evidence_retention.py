@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 from makewand import call_budget, filelock
 from makewand import execution_evidence as evidence
-from makewand.accounting_files import pin
+from makewand.accounting_files import AccountingFiles, pin
 from makewand.execution_contract import ExecutionRequest
 from makewand.execution_runtime import current_context, execute, mark_provider_invocation
 from makewand.ledger_compaction import RETENTION_SECONDS
@@ -250,6 +250,68 @@ class SettlementTests(unittest.TestCase):
         self.assertEqual(rows[0]["result_status"], "UNKNOWN")
         self.assertFalse(rows[0]["outcome_known"])
         self.assertEqual(self.record(result)["result_status"], "UNKNOWN")
+
+    def assert_pending_retained(self, result):
+        path = self.store / (result.attempt_id + ".json")
+        self.assertTrue(path.with_suffix(".json.pending").exists())
+        self.assertEqual(list(evidence.read_recent()), [])
+        evidence.compact(force=True, now=time.time() + 49 * 3600)
+        self.assertTrue(path.exists(), "retention deleted a record with uncertain publication")
+
+    def test_first_record_rename_then_sync_failure_never_launches_or_degrades(self):
+        replace = AccountingFiles.replace
+
+        def fail_after_replace(files, name, fd):
+            replace(files, name, fd)
+            if files.path.parent == self.store:
+                raise OSError("directory sync failed after record rename")
+
+        called = []
+        with patch.object(AccountingFiles, "replace", fail_after_replace):
+            result = execute(self.request(), lambda timeout: called.append(timeout))
+        self.assertEqual(called, [], "provider launched despite an uncertain first record")
+        self.assertEqual(result.status, "UNKNOWN")
+        self.assertFalse(result.outcome_known)
+        self.assert_pending_retained(result)
+        record = self.record(result)
+        record.update(result_status="UNKNOWN", outcome_known=False, settled=True)
+        evidence.save(record)
+        self.assertFalse((self.store / (result.attempt_id + ".json.pending")).exists())
+        self.assertEqual(list(evidence.read_recent())[0]["result_status"], "UNKNOWN")
+
+    def test_published_passed_record_is_ignored_if_sync_and_correction_fail(self):
+        ledger = self.root / "budget.json"
+        replace = AccountingFiles.replace
+        failed = False
+
+        def fail_final_and_correction(files, name, fd):
+            nonlocal failed
+            if files.path.parent == self.store and failed:
+                raise OSError("corrective record cannot be published")
+            replace(files, name, fd)
+            if files.path.parent == self.store:
+                record = json.loads(files.path.read_text())
+                if record.get("settled") and record.get("result_status") == "PASSED":
+                    failed = True
+                    raise OSError("settled record directory sync failed")
+
+        def callback(timeout):
+            mark_provider_invocation()
+            return True, "ok", None
+
+        with patch.dict(os.environ, {"MAKEWAND_CALL_BUDGET_FILE": str(ledger), "MAKEWAND_MAX_MODEL_CALLS": "5"}), \
+                patch.object(AccountingFiles, "replace", fail_final_and_correction):
+            result = execute(self.request(), callback)
+        self.assertTrue(failed, "test never reached the post-rename failure")
+        self.assertEqual(result.status, "UNKNOWN")
+        self.assertFalse(result.outcome_known)
+        rows = json.loads(ledger.read_text())["attempts"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "completed")
+        self.assertEqual(rows[0]["result_status"], "UNKNOWN")
+        self.assertFalse(rows[0]["outcome_known"])
+        self.assertEqual(self.record(result)["result_status"], "PASSED", "fault must leave the stale published version")
+        self.assert_pending_retained(result)
 
     def test_held_lease_or_failed_settlement_keeps_the_record_open(self):
         with patch.dict(os.environ, {"MAKEWAND_CALL_BUDGET_FILE": str(self.root / "budget.json"), "MAKEWAND_MAX_MODEL_CALLS": "5"}):

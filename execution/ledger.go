@@ -36,6 +36,15 @@ const maximumLedgerBytes = 16 << 20
 // lock budget, including Windows ACL/filter I/O before the lock is acquired.
 const accountingWriteTimeout = 5 * time.Second
 
+// An atomic rename can succeed before the directory sync fails. Callers must
+// not infer that a failed first write left no published state.
+type accountingPublishedError struct{ err error }
+
+func (e *accountingPublishedError) Error() string { return e.err.Error() }
+func (e *accountingPublishedError) Unwrap() error { return e.err }
+
+var accountingSyncDirectory = func(path *accountingPath) error { return syncDirectory(path.root) }
+
 type UnknownOutcomeError struct{ Err error }
 
 func (e *UnknownOutcomeError) Error() string {
@@ -352,7 +361,10 @@ func replaceAccountingFile(path *accountingPath, encoded []byte) error {
 	if err := retryAccountingIO(func() error { return path.root.Rename(temp, path.name) }); err != nil {
 		return err
 	}
-	return syncDirectory(path.root)
+	if err := accountingSyncDirectory(path); err != nil {
+		return &accountingPublishedError{err}
+	}
+	return nil
 }
 
 // Reserve permanently counts a dispatch before it starts. Failed, canceled, or
@@ -666,7 +678,14 @@ func (a *Attempt) complete(outcome Outcome) error {
 	if err != nil {
 		return errors.Join(evidenceErr, err)
 	}
-	if evidenceErr == nil && !leased {
+	if evidenceErr != nil && !leased && a.evidence != nil {
+		// A recovered store may close an earlier incomplete write, while the
+		// caller and ledger conservatively keep UNKNOWN.
+		a.evidence.Status, a.evidence.OutcomeKnown, a.evidence.Settled = Unknown, false, true
+		if a.saveEvidence() != nil {
+			a.evidence.Settled = false
+		}
+	} else if evidenceErr == nil && !leased {
 		if err := a.settleEvidence(); err != nil {
 			evidenceErr = fmt.Errorf("provider evidence settlement unavailable: %w", err)
 			a.evidenceError = evidenceErr

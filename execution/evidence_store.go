@@ -207,6 +207,9 @@ func listEvidenceDirectory(root *os.Root) ([]string, error) {
 // readEvidenceAt reads one record from the pinned evidence directory.
 func readEvidenceAt(root *os.Root, name string) (ProviderEvidence, error) {
 	var value ProviderEvidence
+	if evidencePending(root, name) {
+		return value, fmt.Errorf("evidence write has not committed")
+	}
 	file, err := openExecutionFile(root, name, os.O_RDONLY)
 	if err != nil {
 		return value, err
@@ -220,7 +223,15 @@ func readEvidenceAt(root *os.Root, name string) (ProviderEvidence, error) {
 	if err == nil && (value.Schema != 1 || !ValidIdentifier(value.AttemptID) || !ValidIdentifier(value.Engine)) {
 		err = fmt.Errorf("invalid provider evidence")
 	}
+	if err == nil && evidencePending(root, name) {
+		err = fmt.Errorf("evidence write has not committed")
+	}
 	return value, err
+}
+
+func evidencePending(root *os.Root, name string) bool {
+	_, err := root.Lstat(name + ".pending")
+	return !errors.Is(err, os.ErrNotExist)
 }
 
 type evidenceIndexState struct {
@@ -399,6 +410,9 @@ func pruneEvidence(root *os.Root, now time.Time) ([]evidenceScanRecord, map[stri
 		if !managed {
 			continue
 		}
+		if evidencePending(root, name) {
+			record.settled = false
+		}
 		record.indexed = evidenceFileID(strings.TrimSuffix(name, ".json"))
 		records = append(records, record)
 	}
@@ -420,17 +434,21 @@ func pruneEvidence(root *os.Root, now time.Time) ([]evidenceScanRecord, map[stri
 	}
 	for _, name := range listing {
 		temporary := strings.HasPrefix(name, evidenceTempPrefix)
-		if !temporary && (!strings.HasSuffix(name, ".json.lock") || present[strings.TrimSuffix(name, ".lock")]) {
+		pending := strings.HasSuffix(name, ".json.pending") && !present[strings.TrimSuffix(name, ".pending")]
+		if !temporary && !pending && (!strings.HasSuffix(name, ".json.lock") || present[strings.TrimSuffix(name, ".lock")]) {
 			continue
 		}
 		info, err := root.Lstat(name)
 		if err != nil || !info.Mode().IsRegular() || accountingReparse(info) || !info.ModTime().Before(cutoff) {
 			continue
 		}
-		if temporary {
+		switch {
+		case temporary:
 			// A writer removes its own temporary; this one outlived its writer.
 			_ = root.Remove(name)
-		} else {
+		case pending:
+			removeEvidencePending(root, name)
+		default:
 			removeEvidenceSidecar(root, name)
 		}
 	}
@@ -459,6 +477,9 @@ func removeEvidenceRecord(root *os.Root, record evidenceScanRecord) bool {
 		return false
 	}
 	defer func() { _ = unlock(lock) }()
+	if evidencePending(root, record.name) {
+		return false
+	}
 	current, err := root.Lstat(record.name)
 	if err != nil || !os.SameFile(current, record.info) || !current.ModTime().Equal(record.info.ModTime()) || current.Size() != record.info.Size() {
 		return false
@@ -468,6 +489,23 @@ func removeEvidenceRecord(root *os.Root, record evidenceScanRecord) bool {
 	}
 	_ = retryAccountingIO(func() error { return root.Remove(record.name + ".lock") })
 	return true
+}
+
+func removeEvidencePending(root *os.Root, name string) {
+	record := strings.TrimSuffix(name, ".pending")
+	lock, err := openExecutionFile(root, record+".lock", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		return
+	}
+	defer lock.Close()
+	if locked, err := tryLock(lock); err != nil || !locked {
+		return
+	}
+	defer func() { _ = unlock(lock) }()
+	if _, err := root.Lstat(record); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	_ = retryAccountingIO(func() error { return root.Remove(name) })
 }
 
 // removeEvidenceSidecar deletes a sidecar whose record is gone, unless a

@@ -82,6 +82,10 @@ func (a *Attempt) UpdateEvidence(update func(*ProviderEvidence)) error {
 	update(a.evidence)
 	a.evidence.ObservedAt = time.Now().UnixMilli()
 	err := a.saveEvidence()
+	var published *accountingPublishedError
+	if errors.As(err, &published) {
+		a.evidencePersisted = true
+	}
 	switch {
 	case err == nil:
 		a.evidencePersisted = true
@@ -124,12 +128,35 @@ func (a *Attempt) saveEvidence() error {
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return err
 		}
-		return writeLedgerFile(p, value)
+		return writeEvidenceRecord(p, value)
 	})
 	if err == nil {
 		appendEvidenceIndex(filepath.Dir(path), directory, a.evidence)
 	}
 	return err
+}
+
+// Keep a durable pending marker across record publication. Readers and
+// retention ignore an uncertain version even if its final rename succeeded.
+// Marker cleanup is optional once the record itself is durably committed.
+func writeEvidenceRecord(p *accountingPath, value map[string]any) error {
+	marker, err := openExecutionFile(p.root, p.name+".pending", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		return err
+	}
+	defer marker.Close()
+	if err := marker.Sync(); err != nil {
+		return err
+	}
+	if err := syncDirectory(p.root); err != nil {
+		return err
+	}
+	if err := writeLedgerFile(p, value); err != nil {
+		return err
+	}
+	_ = retryAccountingIO(func() error { return p.root.Remove(p.name + ".pending") })
+	_ = syncDirectory(p.root)
+	return nil
 }
 
 // settleEvidence marks the record settled and prunes the store when due. It

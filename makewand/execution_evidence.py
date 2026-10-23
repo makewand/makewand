@@ -22,6 +22,7 @@ from pathlib import Path
 
 from makewand.account_identity import account_identity, event_account_ref
 from makewand.execution_contract import identifier
+from makewand.accounting_files import PublishedWriteError
 
 INDEX = "index.jsonl"
 COMPACTION_LOCK = "compact.lock"
@@ -85,22 +86,57 @@ def _lock(fd, deadline):
 
 def save(evidence):
     from makewand.accounting_files import pin
-    from makewand import filelock
     identifier(evidence["attempt_id"], "attempt_id")
     evidence["observed_at_ms"] = int(time.time() * 1000)
     encoded = json.dumps(evidence, allow_nan=False, separators=(",", ":")).encode()
-    with pin(directory() / (evidence["attempt_id"] + ".json")) as files:
+    published = False
+    try:
+        with pin(directory() / (evidence["attempt_id"] + ".json")) as files:
+            _publish_record(files, encoded)
+            published = True
+            _append_index(files, evidence)
+    except PublishedWriteError:
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        if published:
+            raise PublishedWriteError(error) from error
+        raise
+
+
+def _publish_record(files, encoded):
+    from makewand import filelock
+    published = False
+    try:
         fd = files.open(files.lock_name, create=True, writable=True)
         try:
             if not _lock(fd, time.monotonic() + 1):
                 raise OSError("provider evidence lock unavailable")
             try:
-                files.save(encoded, fd)
+                pending = files.open(files.name + ".pending", create=True, writable=True, delete=True)
+                try:
+                    os.fsync(pending)
+                    if os.name != "nt":
+                        os.fsync(files.parent)
+                    files.save(encoded, fd)
+                    published = True
+                    try:
+                        files.cleanup(files.name + ".pending", pending)
+                        if os.name != "nt":
+                            os.fsync(files.parent)
+                    except (OSError, ValueError):
+                        pass  # record committed; a leftover marker only retains it
+                finally:
+                    os.close(pending)
             finally:
                 filelock.flock(fd, filelock.LOCK_UN)
         finally:
             os.close(fd)
-        _append_index(files, evidence)
+    except PublishedWriteError:
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        if published:
+            raise PublishedWriteError(error) from error
+        raise
 
 
 def warn_unavailable():
@@ -348,13 +384,28 @@ def _read_bytes(files, name, limit):
 
 def _read_record(files, name):
     try:
+        if _pending(files, name):
+            return None
         raw = _read_bytes(files, name, RECORD_MAX + 1)
         if len(raw) > RECORD_MAX:
             return None
         value = json.loads(raw)
+        if _pending(files, name):
+            return None
     except (OSError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) and value.get("schema") == 1 else None
+
+
+def _pending(files, name):
+    try:
+        fd = files.open(name + ".pending", delete=True)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    os.close(fd)
+    return True
 
 
 def _parse_entry(line):
@@ -520,6 +571,8 @@ def _remove_locked(files, name, under_lock):
 
 def _remove_record(files, name, scanned):
     def unchanged_removed():
+        if _pending(files, name):
+            return False
         fd = files.open(name, delete=True)
         try:
             if not _same(os.fstat(fd), scanned):
@@ -583,7 +636,7 @@ def _prune(files, now):
         except (OSError, ValueError):
             continue
         if managed is not None:
-            records.append(dict(name=name, stat=st, group=managed[0], settled=managed[1],
+            records.append(dict(name=name, stat=st, group=managed[0], settled=managed[1] and not _pending(files, name),
                                 indexed=_file_id(name[:-len(".json")])))
     records.sort(key=lambda record: (record["stat"].st_mtime_ns, record["name"]))
     newer, deleted = {}, set()
@@ -596,16 +649,39 @@ def _prune(files, now):
             deleted.add(record["name"])
     for name in names:
         temporary = name.startswith(TEMP_PREFIX)
-        if not temporary and (not name.endswith(".json.lock") or name[:-len(".lock")] in present):
+        pending = name.endswith(".json.pending") and name[:-len(".pending")] not in present
+        if not temporary and not pending and (not name.endswith(".json.lock") or name[:-len(".lock")] in present):
             continue
         st = _lstat(files, name)
         if st is None or st.st_mtime_ns >= cutoff:
             continue
         if temporary:
             _remove_temporary(files, name)  # it outlived the writer that removes its own
+        elif pending:
+            _remove_orphan_pending(files, name)
         else:
             _remove_sidecar(files, name)
     return records, deleted
+
+
+def _remove_orphan_pending(files, name):
+    from makewand import filelock
+    record = name[:-len(".pending")]
+    fd = files.open(record + ".lock", create=True, writable=True)
+    try:
+        if not _lock(fd, time.monotonic()):
+            return
+        try:
+            try:
+                probe = files.open(record, delete=True)
+            except FileNotFoundError:
+                _remove_temporary(files, name)
+            else:
+                os.close(probe)
+        finally:
+            filelock.flock(fd, filelock.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _index_image(records, deleted, appended, now):

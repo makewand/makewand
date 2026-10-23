@@ -260,9 +260,13 @@ def execute(request, callback):
     from makewand.telemetry import stage
     interruption = None
     from makewand import execution_evidence
+    publication_failed = False
     try:
         evidence = execution_evidence.new(request, attempt)
         execution_evidence.save(evidence)
+    except execution_evidence.PublishedWriteError:
+        publication_failed = True
+        evidence["persistence_failed"] = True
     except (OSError, ValueError, RuntimeError):
         # No record exists and nothing has started (an unwritable directory, a
         # full disk): the call proceeds with degraded telemetry. Nothing on disk
@@ -274,7 +278,10 @@ def execute(request, callback):
                    account_ref=request.account_ref) as span:
             started = time.monotonic()
             remaining = max(0, deadline - started) if deadline is not None else None
-            if remaining is not None and remaining <= 0:
+            if publication_failed:
+                result = _result(request, "UNKNOWN", error="provider evidence publication incomplete before launch",
+                    attempt_id=attempt, error_kind="accounting", outcome_known=False)
+            elif remaining is not None and remaining <= 0:
                 result = _result(request, "TIMEOUT", error="execution deadline expired before provider invocation",
                     attempt_id=attempt, error_kind="deadline", outcome_known=True)
             else:

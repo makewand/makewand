@@ -14,6 +14,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+class PublishedWriteError(OSError):
+    """A failed atomic save whose new file was already published."""
+
+    def __init__(self, cause):
+        super().__init__(str(cause))
+
+
 def _leaf_name(name):
     if not isinstance(name, str) or not name or name in (".", "..") or any(c in name for c in "/\0"):
         raise ValueError("Accounting file names must be single path components")
@@ -221,6 +228,16 @@ class AccountingFiles:
             self.assert_named(self.lock_name, lock_fd)
             self.replace(name, fd)
             published = True
+        except (OSError, ValueError, RuntimeError) as error:
+            try:
+                self.assert_named(self.name, fd)
+            except (OSError, ValueError):
+                pass
+            else:
+                published = True
+            if published:
+                raise PublishedWriteError(error) from error
+            raise
         finally:
             try:
                 if not published:
@@ -229,7 +246,12 @@ class AccountingFiles:
                     except FileNotFoundError:
                         pass
             finally:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    if published:
+                        raise PublishedWriteError(error) from error
+                    raise
 
 
 @contextmanager
