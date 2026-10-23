@@ -163,10 +163,10 @@ func TestHostRustupHomeIgnoresRelative_GEC1021R5(t *testing.T) {
 			return ""
 		}
 	}
-	if got := hostRustupHome("/home/u", env("rel/rustup")); got != "/home/u/.rustup" {
+	if got := hostRustupHome("/home/alice", env("rel/rustup")); got != "/home/alice/.rustup" {
 		t.Fatalf("relative RUSTUP_HOME: %q, want the HOME default", got)
 	}
-	if got := hostRustupHome("/home/u", env("/opt/rustup/")); got != "/opt/rustup" {
+	if got := hostRustupHome("/home/alice", env("/opt/rustup/")); got != "/opt/rustup" {
 		t.Fatalf("absolute RUSTUP_HOME: %q", got)
 	}
 	if got := hostRustupHome("", env("")); got != "" {
