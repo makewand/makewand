@@ -184,6 +184,14 @@ Your blog is ready! Open index.html in a browser to see it.`
 
 	// Step 5: InstallDeps detects package.json
 	t.Run("InstallDeps", func(t *testing.T) {
+		if plan, err := proj.DetectInstallPlan(); err != nil || plan == nil || plan.Command != "npm" {
+			t.Fatalf("install plan = %+v, %v; want npm for package.json", plan, err)
+		}
+		// A dependency install has the user-mode network: a real npm contacts
+		// its registry even with nothing to install.
+		if !liveNetworkTests() {
+			t.Skipf("running npm install reaches the npm registry; set %s=1 to run it", liveNetworkTestsEnv)
+		}
 		ctx := context.Background()
 		result, err := proj.InstallDeps(ctx)
 		// npm install may fail (no npm or broken package.json in test) but

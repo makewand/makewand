@@ -224,8 +224,9 @@ a cloud reviewer.
 Unknown risk defaults to a cross-provider pipeline. Prompt keywords alone never
 prove low risk. Trusted callers may provide a complete bounded scope with no
 sensitive interfaces or external effects. An explicit low-risk single workflow
-uses one coder and a separate read-only review call, possibly through the same
-provider. It retains the local tests, complete diff and artifact binding.
+uses one coder, which also reviews its change in a separate read-only call: no
+independent engine reviews it. It retains the local tests, complete diff and
+artifact binding.
 High-risk work requires distinct-provider review; a high-risk single request is
 invalid. Race contestants must be distinct; unless one is named
 (`run --workflow race --provider X` names contestant A), the race pairs any two

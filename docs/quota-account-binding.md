@@ -27,9 +27,15 @@ one subscription pool across directories. Unknown identities use explicit
 Different unknown keys do **not** establish independent quota pools.
 
 Codex reads only the selected sessions directory, considering its eight newest
-JSONL files. A quota event must explicitly contain a matching `account_id` or
-`account_ref` at its root or payload, or inherit that binding from an earlier
-`session_meta` in the same file. An explicit conflicting or malformed identity
+regular JSONL files (a FIFO or other special file is never opened and does not
+count among them), and of each only the complete lines in its last 4 MiB plus
+the log's first line, where Codex writes the session's `session_meta`, when
+that line is complete within 64 KiB. The Python reader does the same; only
+lines that mention `rate_limits` or `session_meta` are decoded. A quota event
+must explicitly contain a matching `account_id` or `account_ref` at its root or
+payload, or inherit that binding from an earlier `session_meta` among the lines
+read, so a session whose transcript runs past the 4 MiB tail still binds its
+recent events to its first line. An explicit conflicting or malformed identity
 cannot inherit session metadata. Logs without such metadata remain history:
 directory location alone does not prove which login produced an event.
 
@@ -48,8 +54,16 @@ erase the first account; refreshing a weekly window does not erase a still
 current short-window observation from another directory. Legacy entries can
 remain in the cache as history, but known-account sources reject unbound data.
 Go snapshot reads recheck the current plain identifier, so an in-process login
-change cannot inherit a prior account's quota or its exhaustion seal. Seals are
-account-bound, remain in memory, and never enter the raw disk observations.
+change cannot inherit a prior account's quota or its exhaustion seal. On Linux,
+macOS and the BSDs a quota source reads its identity file again only when the
+file's path, device, inode, size, modification time or change time (ctime)
+changed, or while it was modified or changed less than 2 seconds before (a
+coarse filesystem clock could hide a second write). A rewrite that keeps the
+size and restores the modification time, or a new file that reuses the inode
+number, still moves the change time, which no user can set. Where file
+information has no change time, as on Windows, the source reads the file every
+time, as admission and accounting do everywhere. Seals are account-bound,
+remain in memory, and never enter the raw disk observations.
 
 Go refreshes read the cache through per source. A source is read only when the
 cache holds no read of its current login (provider plus account reference)

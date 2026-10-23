@@ -205,6 +205,32 @@ func (s *SQLiteStore) ReserveBudget(ctx context.Context, request BudgetReservati
 	return err
 }
 
+// settledReservationRetention is how long past its expiry a settled
+// reservation is kept: while it is, settling it again is a no-op and its ID
+// cannot be reserved again. Only pending and expired reservations hold budget
+// (seedBudgetAccount, logAndSettle), so later it is deleted with its scopes.
+// A settlement repeated after that finds no reservation: it returns an error
+// and its transaction rolls back, so it records and charges nothing.
+const settledReservationRetention = 24 * time.Hour
+
+// pruneSettledBatch bounds the settled reservations one usage transaction
+// deletes, so a backlog from before pruning drains without a long write lock.
+const pruneSettledBatch = 256
+
+// pruneSettledReservations deletes settled reservations, with their scopes,
+// whose expiry is settledReservationRetention past at now. Both statements
+// select the same batch: the transaction holds the write lock.
+func pruneSettledReservations(ctx context.Context, conn *sql.Conn, now time.Time) error {
+	cutoff := now.Add(-settledReservationRetention).UTC().Format(sinceBoundaryLayout)
+	if _, err := conn.ExecContext(ctx, `DELETE FROM budget_reservation_scopes WHERE request_id IN (SELECT request_id FROM budget_reservations WHERE state='settled' AND expires_at<? ORDER BY expires_at, request_id LIMIT ?)`, cutoff, pruneSettledBatch); err != nil {
+		return fmt.Errorf("prune settled reservation scopes: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM budget_reservations WHERE request_id IN (SELECT request_id FROM budget_reservations WHERE state='settled' AND expires_at<? ORDER BY expires_at, request_id LIMIT ?)`, cutoff, pruneSettledBatch); err != nil {
+		return fmt.Errorf("prune settled reservations: %w", err)
+	}
+	return nil
+}
+
 // seedBudgetAccount scans the ledger only on the first admission to a scope.
 // Thereafter materialized integer totals are maintained in usage transactions,
 // avoiding an O(number of historical requests) scan on every request.
@@ -236,7 +262,8 @@ func entryScopes(entry Entry) []BudgetScope {
 }
 
 // logAndSettle records usage and releases a durable reservation atomically.
-// Repeating the callback cannot duplicate either the usage or the charge.
+// Repeating the callback cannot duplicate either the usage or the charge; a
+// repeat that arrives once the settled reservation is pruned is refused.
 func (s *SQLiteStore) logAndSettle(entry Entry) error {
 	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
@@ -248,6 +275,9 @@ func (s *SQLiteStore) logAndSettle(entry Entry) error {
 		return fmt.Errorf("settle transaction: %w", err)
 	}
 	defer func() { _, _ = conn.ExecContext(context.Background(), `ROLLBACK`) }()
+	if err = pruneSettledReservations(ctx, conn, time.Now()); err != nil {
+		return err
+	}
 	var estimate int64
 	if entry.ReservationID != "" {
 		if math.IsNaN(entry.CostUSD) || math.IsInf(entry.CostUSD, 0) || entry.CostUSD < 0 {
@@ -258,6 +288,9 @@ func (s *SQLiteStore) logAndSettle(entry Entry) error {
 		}
 		var state string
 		if err = conn.QueryRowContext(ctx, `SELECT state,estimate_micro_usd FROM budget_reservations WHERE request_id=?`, entry.ReservationID).Scan(&state, &estimate); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("settle reservation: not reserved, or settled and pruned a day after it expired: %w", err)
+			}
 			return fmt.Errorf("settle reservation: %w", err)
 		}
 		if state == "settled" {

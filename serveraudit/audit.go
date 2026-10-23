@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/makewand/makewand/internal/csvsafe"
 )
 
 // Event is one server-side audit record for an HTTP or session request.
@@ -234,7 +236,9 @@ func SortedStringTotals(m map[string]float64) []string {
 	return keys
 }
 
-// WriteEventsCSV renders audit events as CSV.
+// WriteEventsCSV renders audit events as CSV. Cells a spreadsheet would
+// evaluate, such as a client-supplied model name "=HYPERLINK(...)", are written
+// as text (csvsafe.Cell).
 func WriteEventsCSV(w io.Writer, events []Event) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write([]string{
@@ -268,7 +272,7 @@ func WriteEventsCSV(w io.Writer, events []Event) error {
 		return err
 	}
 	for _, evt := range events {
-		if err := cw.Write([]string{
+		if err := cw.Write(csvsafe.Record([]string{
 			evt.Timestamp.UTC().Format(time.RFC3339Nano),
 			evt.RequestID,
 			evt.Kind,
@@ -295,7 +299,7 @@ func WriteEventsCSV(w io.Writer, events []Event) error {
 			evt.TargetTokenID,
 			evt.TargetRole,
 			optionalBool(evt.TargetActive),
-		}); err != nil {
+		})); err != nil {
 			return err
 		}
 	}

@@ -163,29 +163,23 @@ def _scan_verdict_entries_for_re(text: str, tag_re: re.Pattern) -> List[Dict[str
     return entries
 
 
-def _scan_verdict_lines(text: str, nonce: Optional[str] = None, allow_legacy: bool = False) -> List[Dict[str, Any]]:
+def _scan_verdict_lines(text: str, nonce: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Collects every line-anchored MAKEWAND_VERDICT entry.
     Lines that carry extra prose after the JSON (typically an echo of the prompt template such as
     '... (若无严重缺陷)') are ignored instead of being trusted.
 
     With a nonce only ``MAKEWAND_VERDICT_<nonce>`` lines count: an un-nonced line could be a
-    verdict echoed from the reviewed content. No setting changes that; only a caller that
-    reads the legacy format on purpose passes ``allow_legacy=True``.
+    verdict echoed from the reviewed content. No setting or argument changes that.
     """
     if not text:
         return []
-    tag_re = _build_verdict_tag_re(nonce)
-    entries = _scan_verdict_entries_for_re(text, tag_re)
-    if nonce and not entries and allow_legacy:
-        entries = _scan_verdict_entries_for_re(text, _VERDICT_TAG_RE)
-    return entries
+    return _scan_verdict_entries_for_re(text, _build_verdict_tag_re(nonce))
 
 
 def evaluate_review_verdict(
     review_text: Optional[str],
     nonce: Optional[str] = None,
-    allow_legacy: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Single source of truth for review gating. Only the structured MAKEWAND_VERDICT line decides;
@@ -199,7 +193,7 @@ def evaluate_review_verdict(
     tag = f"MAKEWAND_VERDICT_{nonce}" if nonce else "MAKEWAND_VERDICT"
     if not review_text or not str(review_text).strip():
         return {"status": REVIEW_UNVERIFIED, "pass": False, "defects": [], "reason": "审查输出为空"}
-    entries = _scan_verdict_lines(str(review_text), nonce=nonce, allow_legacy=allow_legacy)
+    entries = _scan_verdict_lines(str(review_text), nonce=nonce)
     if not entries:
         return {"status": REVIEW_UNVERIFIED, "pass": False, "defects": [], "reason": f"缺少 {tag} 结构化裁决行"}
     errors = [e["error"] for e in entries if e["error"]]
@@ -225,7 +219,6 @@ def evaluate_review_verdict(
 def extract_verdict_json(
     text: str,
     nonce: Optional[str] = None,
-    allow_legacy: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Backward-compatible view of the structured verdict.
@@ -234,9 +227,9 @@ def extract_verdict_json(
     """
     if not text:
         return None
-    if not _scan_verdict_lines(text, nonce=nonce, allow_legacy=allow_legacy):
+    if not _scan_verdict_lines(text, nonce=nonce):
         return None
-    verdict = evaluate_review_verdict(text, nonce=nonce, allow_legacy=allow_legacy)
+    verdict = evaluate_review_verdict(text, nonce=nonce)
     if verdict["status"] == REVIEW_UNVERIFIED:
         return {"pass": False, "defects": [verdict["reason"]], "parse_error": True}
     return {"pass": verdict["pass"], "defects": list(verdict["defects"])}
@@ -245,13 +238,12 @@ def extract_verdict_json(
 def is_review_passed(
     review_text: str,
     nonce: Optional[str] = None,
-    allow_legacy: Optional[bool] = None,
 ) -> bool:
     """
     True if and only if the review carries exactly one well-formed, uncontradicted
     MAKEWAND_VERDICT with pass=true and no defects. Free-text approval never passes (Fail-Closed).
     """
-    return evaluate_review_verdict(review_text, nonce=nonce, allow_legacy=allow_legacy)["status"] == REVIEW_PASSED
+    return evaluate_review_verdict(review_text, nonce=nonce)["status"] == REVIEW_PASSED
 
 
 def canonical_verdict_line(verdict: Dict[str, Any], nonce: Optional[str] = None) -> str:

@@ -55,14 +55,20 @@ cap:
   not yet strongly consistent with each other.
 - **SQLite reservations persist and serialize across processes.** The trusted
   server reserves integer micro-USD before dispatch for token day/month and
-  organization/project month scopes. Integer account totals and usage settlement
-  update in one transaction, avoiding repeated history scans. A duplicate usage
-  callback does not charge twice. Confirmed cancellation before consumption
-  refunds its reservation; an interrupted/unknown call conservatively keeps its
-  reservation after restart. `--budget-reservation` still estimates one call:
-  actual cost above that estimate can exceed the remaining money cap, and unknown
-  provider cost cannot establish a monetary hard cap. JSONL-only deployments
-  retain their documented process-local budget behavior.
+  organization/project month scopes. A request no cap applies to reserves too:
+  its reservation is what lets a repeated usage callback settle once. Integer
+  account totals and usage settlement update in one transaction, avoiding
+  repeated history scans. A duplicate usage callback does not charge twice.
+  Confirmed cancellation before consumption refunds its reservation; an
+  interrupted/unknown call conservatively keeps its reservation after restart.
+  A settled reservation is deleted with its scopes a day after it expires;
+  pending and expired ones, which still hold budget, stay. A duplicate callback
+  that arrives after that deletion finds no reservation: the usage write
+  returns an error and its transaction rolls back, so it records and charges
+  nothing. `--budget-reservation` still estimates one call: actual cost above
+  that estimate can exceed the remaining money cap, and unknown provider cost
+  cannot establish a monetary hard cap. JSONL-only deployments retain their
+  documented process-local budget behavior.
 - **Usage-write failures are surfaced, and optionally fatal.** A failed usage
   write always logs a warning (`usage accounting write failed`) so the loss is
   visible. With `--strict-accounting`, a non-streaming request whose usage cannot
@@ -228,9 +234,13 @@ recovery tests do not establish a hardware or power-loss durability guarantee.
 - `/v1/admin/usage/events` returns 100 events by default, accepts `limit` up to
   1,000 and a non-negative `offset`, and includes `pagination` metadata in JSON.
   CSV preserves its columns and follows the same pagination; `X-Total-Count`
-  reports the matching event count. Tenant and user scope restrictions also
-  constrain the count. Callers exporting a complete history must request
-  subsequent pages. Offset pages and counts can shift when new events arrive.
+  reports the matching event count. In usage and audit CSV, a cell that begins
+  with `=`, `+`, `-`, `@`, a tab, a carriage return, a line feed, or a
+  full-width `＝`, `＋`, `－` or `＠`, other than a plain ASCII number, is
+  prefixed with a single quote so spreadsheets show it as text.
+  Tenant and user scope restrictions also constrain the count. Callers
+  exporting a complete history must request subsequent pages. Offset pages and
+  counts can shift when new events arrive.
   A fixed `until` excludes newer timestamps, but late writes for older requests
   can still change earlier pages.
 - `/health` is a process liveness check. `/ready` uses a two-second context to

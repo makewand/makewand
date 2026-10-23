@@ -26,7 +26,9 @@ RELIABILITY_GOOD_RATE = 0.8
 RELIABILITY_BAD_RATE = 0.2
 RELIABILITY_MIN_FACTOR = 0.5
 ENGINES_WITHOUT_EXECUTOR = frozenset({"cursor", "copilot"})
-NON_AGENTIC_CHAT_MODELS = frozenset({"local", "ollama", "deepseek", "qwen", "glm", "kimi", "openrouter", "siliconflow"})
+# Engines that only chat, with no agent to edit files: the local model and
+# every engine without a subscription CLI.
+NON_AGENTIC_CHAT_MODELS = frozenset({"local", "ollama"}) | API_ONLY_ENGINES
 
 _UNUSABLE_ENGINE_STATUSES = ("limited", "needs_auth", "error", "missing", "disabled")
 # Statuses whose work the provider adapters relay to the provider's cloud API

@@ -1440,7 +1440,7 @@ def _main():
     for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
         options.add_argument("--workflow", choices=["auto", "single", "pipeline", "race"],
                              default="auto" if default is None else default,
-                             help="Verification workflow; single still runs independent read-only review")
+                             help="Verification workflow; single reviews with the coding engine itself in a separate read-only call, not an independent review")
         options.add_argument("--risk", choices=["auto", "low", "high"],
                              default="auto" if default is None else default,
                              help="Unknown risk requires cross-provider review; high cannot use single")

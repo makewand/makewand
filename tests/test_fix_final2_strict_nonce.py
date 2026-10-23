@@ -6,8 +6,8 @@ MAKEWAND_ALLOW_LEGACY_VERDICT=1, which no user documentation offers), and
 parse_nonced_race_verdict fell back to it: production behaviour depended on a
 test variable, and race tests passed only because their fake judges answered
 with a bare 'MAKEWAND_RACE_VERDICT:' line. The exemption is gone; fake reviewers
-answer with the nonce their prompt asks for (tests/_verdicts.py), and only a
-caller that reads the legacy format on purpose passes allow_legacy=True.
+answer with the nonce their prompt asks for (tests/_verdicts.py), and the legacy
+format is read only without a nonce.
 """
 import sys
 from pathlib import Path

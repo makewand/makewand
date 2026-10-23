@@ -354,13 +354,11 @@ class LegacyVerdictPolicyTests(unittest.TestCase):
                     review_line.replace("VERDICT:", "VERDICT_0a1b2c3d:"), nonce="0a1b2c3d")["status"],
                     review_contract.REVIEW_PASSED)
 
-    def test_only_an_explicit_caller_reads_the_legacy_format(self):
+    def test_only_a_reading_without_a_nonce_takes_the_legacy_format(self):
         from makewand import review_contract
         review_line = 'MAKEWAND_VERDICT: {"pass": true, "defects": []}'
-        self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d", allow_legacy=True)["status"],
+        self.assertEqual(review_contract.evaluate_review_verdict(review_line)["status"],
                          review_contract.REVIEW_PASSED)
-        self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d", allow_legacy=False)["status"],
-                         review_contract.REVIEW_UNVERIFIED)
         self.assertEqual(review_contract.evaluate_review_verdict(review_line, nonce="0a1b2c3d")["status"],
                          review_contract.REVIEW_UNVERIFIED)
 

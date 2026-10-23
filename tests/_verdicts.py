@@ -10,7 +10,8 @@ nonce, ``nonced_result(result, prompt)`` does so for a whole (ok, text, error)
 result, and ``answer_with_nonce(fake)`` for every answer of a fake dispatch_task
 or provider adapter (a function, one canned result, or a list of canned results
 as for ``side_effect``). A test of the legacy un-nonced format passes canned text
-unchanged and asks for the legacy reading explicitly (``allow_legacy=True``).
+unchanged and reads it without a nonce: no argument lets an un-nonced line count
+when a nonce is expected.
 """
 
 import re

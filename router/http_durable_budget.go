@@ -73,6 +73,8 @@ func (opt HTTPHandlerOptions) reserveDurableBudget(ctx context.Context, grant *s
 	}
 	// Correlation IDs can repeat and are client-controlled. Only this trusted,
 	// unpredictable identity owns the reservation and exactly-once settlement.
+	// A request no cap applies to reserves too: without the ID, a usage
+	// callback repeated after an ambiguous commit would be recorded twice.
 	id := "account_" + rand.Text()
 	err := opt.BudgetReserver.ReserveBudget(ctx, serverusage.BudgetReservation{ID: id, EstimateMicroUSD: serverusage.MicroUSD(estimateUSD), ExpiresAt: now.Add(15 * time.Minute), Scopes: scopes})
 	if err == nil {
