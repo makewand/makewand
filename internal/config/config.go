@@ -300,6 +300,10 @@ type LoadOptions struct {
 	// probing local CLIs is both unnecessary and unsafe. The trusted default
 	// (Load) leaves detection on when the execution policy is valid.
 	SkipCLIDetection bool
+
+	// cliProbeTimeout lets tests that need a completed probe tolerate slow
+	// instrumented child startup. Zero keeps the production five-second bound.
+	cliProbeTimeout time.Duration
 }
 
 // Load reads the config from disk, returning defaults if not found. It performs
@@ -339,7 +343,7 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	// never exec a local CLI (its `--version` probe) inside an untrusted working
 	// directory; only direct API providers are used in that mode.
 	if !opts.SkipCLIDetection {
-		cfg.CLIs = detectEnabledCLIs(cfg)
+		cfg.CLIs = detectEnabledCLIs(cfg, opts.cliProbeTimeout)
 	}
 	cfg.APIPolicy = NormalizeAPIPolicy(cfg.APIPolicy)
 	cfg.UsageMode = NormalizeUsageMode(cfg.UsageMode)
@@ -619,7 +623,10 @@ func (c *Config) GetCLI(name string) *CLITool {
 
 // detectEnabledCLIs probes enabled subscription CLI tools, skipping disabled
 // providers before PATH lookup or execution of their version commands.
-func detectEnabledCLIs(cfg *Config) []CLITool {
+func detectEnabledCLIs(cfg *Config, timeout time.Duration) []CLITool {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	type probe struct {
 		name    string
 		bin     string
@@ -644,7 +651,7 @@ func detectEnabledCLIs(cfg *Config) []CLITool {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		out, err := exec.CommandContext(ctx, binPath, p.verArgs...).Output()
 		cancel()
 

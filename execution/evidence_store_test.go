@@ -585,10 +585,10 @@ func TestLockedFileReopensASidecarReplacedWhileWaiting(t *testing.T) {
 	if err := os.WriteFile(path+".lock", nil, 0o600); err != nil {
 		t.Skipf("cannot recreate a sidecar that is still open: %v", err)
 	}
-	if f, err := lockOpenedSidecar(t.Context(), p, stale); f != nil || err != nil {
+	if f, err := lockOpenedSidecar(t.Context(), p, stale, true); f != nil || err != nil {
 		t.Fatalf("lock of a replaced sidecar was kept: %v %v", f, err)
 	}
-	err = withLockedFile(t.Context(), path, nil, func(*accountingPath) error {
+	err = withEvidenceLockedFile(t.Context(), path, nil, func(*accountingPath) error {
 		current, err := openExecutionFile(p.root, p.name+".lock", os.O_RDWR)
 		if err != nil {
 			return err

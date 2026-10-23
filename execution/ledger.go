@@ -88,7 +88,18 @@ type Attempt struct {
 }
 
 // withLockedFile uses the same sidecar byte lock as Python's filelock module.
+// Ledger, event and index sidecars are stable: retention never removes them.
 func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn func(*accountingPath) error) error {
+	return withAccountingFileLock(ctx, path, expected, false, fn)
+}
+
+// Evidence record sidecars can disappear during retention. Recheck their
+// identity after taking the lock, and reopen a sidecar removed while waiting.
+func withEvidenceLockedFile(ctx context.Context, path string, expected os.FileInfo, fn func(*accountingPath) error) error {
+	return withAccountingFileLock(ctx, path, expected, true, fn)
+}
+
+func withAccountingFileLock(ctx context.Context, path string, expected os.FileInfo, replaceable bool, fn func(*accountingPath) error) error {
 	leave, err := enterTransaction(ctx, path)
 	if err != nil {
 		return err
@@ -100,7 +111,7 @@ func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn f
 	}
 	defer p.close()
 	for range 8 {
-		f, err := lockSidecar(ctx, p)
+		f, err := lockSidecar(ctx, p, replaceable)
 		if err != nil {
 			return err
 		}
@@ -118,18 +129,18 @@ func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn f
 // this transaction's own I/O: an uncontended lock is taken even when opening
 // the files used up the budget (Windows ACL and scanner I/O can exceed a
 // short telemetry budget). A nil file means the sidecar was removed or
-// replaced while this caller waited (evidence pruning removes the sidecars of
-// records it deletes); the caller then opens the current one. Python's
-// writers make the same check (AccountingFiles.assert_named).
-func lockSidecar(ctx context.Context, p *accountingPath) (*os.File, error) {
+// replaced while this caller waited; the caller then opens the current one.
+// Only evidence records need that extra metadata I/O under the lock. Keeping
+// it off the shared ledger path preserves admission throughput on Windows.
+func lockSidecar(ctx context.Context, p *accountingPath, replaceable bool) (*os.File, error) {
 	f, err := openExecutionFile(p.root, p.name+".lock", os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return nil, err
 	}
-	return lockOpenedSidecar(ctx, p, f)
+	return lockOpenedSidecar(ctx, p, f, replaceable)
 }
 
-func lockOpenedSidecar(ctx context.Context, p *accountingPath, f *os.File) (*os.File, error) {
+func lockOpenedSidecar(ctx context.Context, p *accountingPath, f *os.File, replaceable bool) (*os.File, error) {
 	for {
 		locked, err := tryLock(f)
 		if err != nil {
@@ -151,6 +162,9 @@ func lockOpenedSidecar(ctx context.Context, p *accountingPath, f *os.File) (*os.
 			return nil, ctx.Err()
 		case <-timer.C:
 		}
+	}
+	if !replaceable {
+		return f, nil
 	}
 	held, err := f.Stat()
 	if err == nil {

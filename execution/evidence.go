@@ -119,7 +119,7 @@ func (a *Attempt) saveEvidence() error {
 	}
 	ctx, cancel := a.evidenceWriteContext()
 	defer cancel()
-	err = withLockedFile(ctx, path, directory, func(p *accountingPath) error {
+	err = withEvidenceLockedFile(ctx, path, directory, func(p *accountingPath) error {
 		var value map[string]any
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return err
