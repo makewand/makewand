@@ -36,6 +36,15 @@ const maximumLedgerBytes = 16 << 20
 // lock budget, including Windows ACL/filter I/O before the lock is acquired.
 const accountingWriteTimeout = 5 * time.Second
 
+// An atomic rename can succeed before the directory sync fails. Callers must
+// not infer that a failed first write left no published state.
+type accountingPublishedError struct{ err error }
+
+func (e *accountingPublishedError) Error() string { return e.err.Error() }
+func (e *accountingPublishedError) Unwrap() error { return e.err }
+
+var accountingSyncDirectory = func(path *accountingPath) error { return syncDirectory(path.root) }
+
 type UnknownOutcomeError struct{ Err error }
 
 func (e *UnknownOutcomeError) Error() string {
@@ -78,6 +87,8 @@ type Attempt struct {
 	startCommitted    bool
 	evidence          *ProviderEvidence
 	evidenceError     error
+	evidencePersisted bool            // a record of this attempt exists on disk
+	evidenceDegraded  bool            // no record could be written before launch; the call continues without one
 	evidenceContext   context.Context // optional per-attempt context for driving evidence writes in tests
 	leaseStop         chan struct{}
 	leaseStopOnce     sync.Once
@@ -86,7 +97,18 @@ type Attempt struct {
 }
 
 // withLockedFile uses the same sidecar byte lock as Python's filelock module.
+// Ledger, event and index sidecars are stable: retention never removes them.
 func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn func(*accountingPath) error) error {
+	return withAccountingFileLock(ctx, path, expected, false, fn)
+}
+
+// Evidence record sidecars can disappear during retention. Recheck their
+// identity after taking the lock, and reopen a sidecar removed while waiting.
+func withEvidenceLockedFile(ctx context.Context, path string, expected os.FileInfo, fn func(*accountingPath) error) error {
+	return withAccountingFileLock(ctx, path, expected, true, fn)
+}
+
+func withAccountingFileLock(ctx context.Context, path string, expected os.FileInfo, replaceable bool, fn func(*accountingPath) error) error {
 	leave, err := enterTransaction(ctx, path)
 	if err != nil {
 		return err
@@ -97,32 +119,75 @@ func withLockedFile(ctx context.Context, path string, expected os.FileInfo, fn f
 		return err
 	}
 	defer p.close()
-	f, err := openExecutionFile(p.root, p.name+".lock", os.O_CREATE|os.O_RDWR)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		locked, err := tryLock(f)
+	for range 8 {
+		f, err := lockSidecar(ctx, p, replaceable)
 		if err != nil {
 			return err
 		}
+		if f == nil {
+			continue
+		}
+		defer f.Close()
+		defer func() { _ = unlock(f) }()
+		return fn(p)
+	}
+	return fmt.Errorf("execution accounting lock was replaced repeatedly")
+}
+
+// lockSidecar locks p's sidecar. ctx bounds waiting for another holder, not
+// this transaction's own I/O: an uncontended lock is taken even when opening
+// the files used up the budget (Windows ACL and scanner I/O can exceed a
+// short telemetry budget). A nil file means the sidecar was removed or
+// replaced while this caller waited; the caller then opens the current one.
+// Only evidence records need that extra metadata I/O under the lock. Keeping
+// it off the shared ledger path preserves admission throughput on Windows.
+func lockSidecar(ctx context.Context, p *accountingPath, replaceable bool) (*os.File, error) {
+	f, err := openExecutionFile(p.root, p.name+".lock", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		return nil, err
+	}
+	return lockOpenedSidecar(ctx, p, f, replaceable)
+}
+
+func lockOpenedSidecar(ctx context.Context, p *accountingPath, f *os.File, replaceable bool) (*os.File, error) {
+	for {
+		locked, err := tryLock(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 		if locked {
 			break
+		}
+		if err := ctx.Err(); err != nil {
+			_ = f.Close()
+			return nil, err
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			_ = f.Close()
+			return nil, ctx.Err()
 		case <-timer.C:
 		}
 	}
-	defer func() { _ = unlock(f) }()
-	return fn(p)
+	if !replaceable {
+		return f, nil
+	}
+	held, err := f.Stat()
+	if err == nil {
+		var current os.FileInfo
+		if current, err = p.root.Lstat(p.name + ".lock"); err == nil && os.SameFile(held, current) {
+			return f, nil
+		}
+	}
+	_ = unlock(f)
+	_ = f.Close()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func readLedger(path *accountingPath, maximum int) (map[string]any, error) {
@@ -263,9 +328,14 @@ func writeLedgerFile(path *accountingPath, data map[string]any) error {
 	if len(encoded)+1 > maximumLedgerBytes {
 		return fmt.Errorf("model call ledger exceeds 16 MiB")
 	}
+	return replaceAccountingFile(path, append(encoded, '\n'))
+}
+
+// replaceAccountingFile publishes encoded as path's file in one atomic rename.
+func replaceAccountingFile(path *accountingPath, encoded []byte) error {
 	temp := ".call-budget-" + NewID()
 	var file *os.File
-	err = retryAccountingIO(func() error {
+	err := retryAccountingIO(func() error {
 		var err error
 		file, err = path.root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		return err
@@ -278,7 +348,7 @@ func writeLedgerFile(path *accountingPath, data map[string]any) error {
 		_ = file.Close()
 		return fmt.Errorf("protect model call ledger: %w", err)
 	}
-	if _, err = file.Write(append(encoded, '\n')); err == nil {
+	if _, err = file.Write(encoded); err == nil {
 		err = file.Sync()
 	}
 	closeErr := file.Close()
@@ -291,7 +361,10 @@ func writeLedgerFile(path *accountingPath, data map[string]any) error {
 	if err := retryAccountingIO(func() error { return path.root.Rename(temp, path.name) }); err != nil {
 		return err
 	}
-	return syncDirectory(path.root)
+	if err := accountingSyncDirectory(path); err != nil {
+		return &accountingPublishedError{err}
+	}
+	return nil
 }
 
 // Reserve permanently counts a dispatch before it starts. Failed, canceled, or
@@ -589,18 +662,67 @@ func (a *Attempt) complete(outcome Outcome) error {
 			outcome.Tokens = a.evidence.Tokens
 		}
 		a.evidence.Status, a.evidence.OutcomeKnown, a.evidence.Tokens = outcome.Status, outcome.Known, outcome.Tokens
+		// Without a ledger nothing else can still hold this attempt open.
+		a.evidence.Settled = a.config.LedgerPath == ""
+		if !a.evidence.Settled {
+			// A terminal success is published only after ledger settlement.
+			// If the final marker cannot even be created, the older record
+			// must still be UNKNOWN for readers of this and older releases.
+			a.evidence.Status, a.evidence.OutcomeKnown = Unknown, false
+		}
 		evidenceErr = a.evidenceError
 		if evidenceErr == nil {
 			evidenceErr = a.saveEvidence()
 		}
 		if evidenceErr != nil {
 			outcome.Status, outcome.Known = Unknown, false
-			a.evidence.Status, a.evidence.OutcomeKnown = Unknown, false
+			a.evidence.Status, a.evidence.OutcomeKnown, a.evidence.Settled = Unknown, false, false
 			evidenceErr = fmt.Errorf("provider evidence unavailable: %w", evidenceErr)
 		}
 	}
+	leased, err := a.settleLedger(outcome, evidenceErr)
+	if err != nil {
+		return errors.Join(evidenceErr, err)
+	}
+	if evidenceErr != nil && !leased && a.evidence != nil {
+		// A recovered store may close an earlier incomplete write, while the
+		// caller and ledger conservatively keep UNKNOWN.
+		a.evidence.Status, a.evidence.OutcomeKnown, a.evidence.Settled = Unknown, false, true
+		if a.saveEvidence() != nil {
+			a.evidence.Settled = false
+		}
+	} else if evidenceErr == nil && !leased {
+		if a.evidence != nil {
+			a.evidence.Status, a.evidence.OutcomeKnown = outcome.Status, outcome.Known
+		}
+		if err := a.settleEvidence(); err != nil {
+			evidenceErr = fmt.Errorf("provider evidence settlement unavailable: %w", err)
+			a.evidenceError = evidenceErr
+			outcome.Status, outcome.Known = Unknown, false
+			a.evidence.Status, a.evidence.OutcomeKnown = Unknown, false
+			// The lease has been released. If storage recovered, publish the
+			// conservative final outcome as settled; otherwise keep it open.
+			a.evidence.Settled = true
+			if a.saveEvidence() != nil {
+				a.evidence.Settled = false
+			}
+			if _, err := a.settleLedger(outcome, evidenceErr); err != nil {
+				return errors.Join(evidenceErr, err)
+			}
+		}
+	}
+	duration := time.Since(a.started).Milliseconds()
+	a.emitBestEffort("end", outcome, &duration)
+	a.completed = true
+	return evidenceErr
+}
+
+// settleLedger can downgrade an already settled outcome after a final record
+// write fails. It never charges or refunds an already completed attempt again.
+func (a *Attempt) settleLedger(outcome Outcome, evidenceErr error) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), accountingWriteTimeout)
 	defer cancel()
+	leased := false
 	if a.config.LedgerPath != "" {
 		if err := withLockedFile(ctx, a.config.LedgerPath, a.config.ledgerDirectory, func(path *accountingPath) error {
 			data, err := readLedger(path, a.config.MaxCalls)
@@ -613,6 +735,11 @@ func (a *Attempt) complete(outcome Outcome) error {
 					continue
 				}
 				if entry["status"] == "completed" || entry["status"] == "released" {
+					leased = leaseHeld(data, a.ID)
+					if evidenceErr != nil {
+						entry["success"], entry["result_status"], entry["outcome_known"] = false, Unknown, false
+						return saveLedger(path, data)
+					}
 					return nil
 				}
 				if entry["status"] == "reserved" {
@@ -631,17 +758,23 @@ func (a *Attempt) complete(outcome Outcome) error {
 				entry["tokens"] = outcome.Tokens
 				entry["monetary_cost"] = outcome.MonetaryCost
 				settleLease(data, a.ID)
+				leased = leaseHeld(data, a.ID)
 				return saveLedger(path, data)
 			}
 			return errReservationDisappeared
 		}); err != nil {
-			return errors.Join(evidenceErr, err)
+			return false, err
 		}
 	}
-	duration := time.Since(a.started).Milliseconds()
-	a.emitBestEffort("end", outcome, &duration)
-	a.completed = true
-	return evidenceErr
+	return leased, nil
+}
+
+// leaseHeld reports whether the ledger still holds attempt id's account lease
+// (a launch fence or a live worker outlived its completion).
+func leaseHeld(data map[string]any, id string) bool {
+	leases, _ := data["leases"].(map[string]any)
+	_, held := leases[id]
+	return held
 }
 
 // StopLease gives up renewal even when the ledger is temporarily unavailable.

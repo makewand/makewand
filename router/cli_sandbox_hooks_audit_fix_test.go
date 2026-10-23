@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/makewand/makewand/internal/testfixture"
 )
 
 // cliTestPrivateHomeBase holds the private provider homes created by tests so
@@ -33,6 +35,12 @@ func cliTestPrivateHomeBaseDir() string {
 }
 
 func TestMain(m *testing.M) {
+	// Fake CLI dispatches record provider evidence; keep it out of the user cache.
+	cleanupEvidence, err := testfixture.IsolateExecutionEvidence()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "execution evidence isolation:", err)
+		os.Exit(1)
+	}
 	cliTestExtraBinds = cliTestFixtureBinds
 	cliTestEnvAllowed = cliTestFixtureEnvAllowed
 	cliPrivateHomeBaseDir = cliTestPrivateHomeBaseDir
@@ -53,7 +61,6 @@ func TestMain(m *testing.M) {
 		if runtime.GOOS != "windows" {
 			cliBwrapLookup = func(string) (string, error) { return "", exec.ErrNotFound }
 		}
-		var err error
 		if ackDir, err = cliTestWriteHostExecAck(); err != nil {
 			fmt.Fprintln(os.Stderr, "host-exec ack fixture:", err)
 			os.Exit(1)
@@ -66,6 +73,7 @@ func TestMain(m *testing.M) {
 	if ackDir != "" {
 		_ = os.RemoveAll(ackDir)
 	}
+	cleanupEvidence()
 	os.Exit(code)
 }
 

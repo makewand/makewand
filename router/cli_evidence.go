@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -230,6 +230,10 @@ func recordCLIOutput(attempt *execution.Attempt, raw []byte) {
 	})
 }
 
+// The first record precedes the launch. When it cannot be written
+// (ErrEvidenceDegraded: an unwritable directory or a full disk) the CLI has
+// not started, so the call continues without evidence instead of failing with
+// an unknown outcome. Any other failure leaves the outcome unknown.
 func initializeCLIEvidence(attempt *execution.Attempt, provider string) error {
 	err := attempt.UpdateEvidence(func(e *execution.ProviderEvidence) {
 		if provider != "codex" && provider != "claude" {
@@ -239,7 +243,7 @@ func initializeCLIEvidence(attempt *execution.Attempt, provider string) error {
 		e.AccountRef, e.IdentityKnown, e.PoolRef = identity.AccountRef, identity.IdentityKnown, identity.PoolRef
 		e.Source = "selected_login"
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, execution.ErrEvidenceDegraded) {
 		return &execution.UnknownOutcomeError{Err: err}
 	}
 	return nil
@@ -249,37 +253,12 @@ func mergeExecutionQuota(q ProviderQuota) ProviderQuota {
 	if !q.IdentityKnown {
 		return q
 	}
-	dir, err := execution.EvidenceDirectory()
-	if err != nil {
-		return q
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return q
-	}
-	// A bounded newest-first history prevents an old completed dispatch from
-	// hiding a newer observation made by an interrupted one.
-	type evidenceFile struct {
-		path string
-		at   time.Time
-	}
-	var files []evidenceFile
-	for _, entry := range entries {
-		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		info, err := entry.Info()
-		if err == nil {
-			files = append(files, evidenceFile{filepath.Join(dir, entry.Name()), info.ModTime()})
-		}
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].at.After(files[j].at) })
-	if len(files) > 64 {
-		files = files[:64]
-	}
-	for _, file := range files {
-		record, err := execution.ReadEvidence(file.path)
-		if err != nil || record.Engine != q.Provider || !record.IdentityKnown || record.AccountRef != q.AccountRef || record.PoolRef != q.PoolRef {
+	// The newest records of this account and pool: an old completed dispatch
+	// cannot hide a newer observation made by an interrupted one, and other
+	// accounts' traffic cannot push this account's records out of the window.
+	records := execution.RecentEvidence(execution.EvidenceFilter{Engine: q.Provider, AccountRef: q.AccountRef, PoolRef: q.PoolRef}, 64)
+	for _, record := range records {
+		if record.Engine != q.Provider || !record.IdentityKnown || record.AccountRef != q.AccountRef || record.PoolRef != q.PoolRef {
 			continue
 		}
 		next := q

@@ -6,8 +6,8 @@ The Go and Python runners keep one atomic JSON record per provider attempt in
 Go's platform convention: XDG_CACHE_HOME or ~/.cache on Linux, ~/Library/Caches
 on macOS, and LocalAppData on Windows. Files are private (0600 / private Windows
 ACL) and use the existing pinned-directory accounting writers and sidecar locks.
-Records are retained until the operator removes them; there is no automatic
-retention policy yet.
+Retention, the read index and test isolation are described in
+[Retention and reads](#retention-and-reads).
 
 The attempt ID is the same ID used by the P0 call ledger and provider events.
 The ledger's `account_ref` and `model` remain **admission/request** metadata;
@@ -54,6 +54,9 @@ The record contains only these projected fields:
 - `process_exit_code`: nullable local process exit code, independent of the
   upstream result. `result_status`, `outcome_known`: runner classification.
   `tokens`: nullable measured usage; no token usage is inferred from text.
+- `settled`: `false` until the attempt's accounting is final, then `true`: the
+  call ledger settled the attempt and released its account lease, or the
+  attempt has no ledger. Records written before this field existed omit it.
 
 A durable initial UNKNOWN record precedes execution. Before deleting a private
 home, the runner extracts only the selected root's bounded regular JSONL files
@@ -75,16 +78,72 @@ transport attempts cannot borrow a subscription login identity.
 P0 quota readers in both runtimes also consume these records. They require an
 exact known account + pool match, retain the existing 15-minute TTL, reject
 future observations and expired windows, and merge each window independently.
-They inspect the newest 64 records; older evidence remains available for audit
-but may no longer contribute to live quota selection. An UNKNOWN attempt may
-still contain a valid quota observation; its result is never promoted to known
-on that basis.
+They inspect the newest 64 records of that account and pool, so other
+accounts' traffic cannot push them out (model verification reads the newest 64
+records of the engine). An UNKNOWN attempt may still contain a valid quota
+observation; its result is never promoted to known on that basis.
 
 Timeout, cancellation, termination, and generic nonzero model-process exits
 remain unknown and stop automatic replay. Explicit quota refusals retain their
-existing known-rejection handling. Failure to persist evidence blocks a launch
-or stops delivery/replay after a launch. A host process killed before cleanup can
-leave only the initial UNKNOWN record: this is deliberately insufficient to
-claim completion. Evidence is local CLI telemetry, not an independently signed
-provider billing receipt. Live provider format compatibility remains unverified;
-tests use fake CLIs and static samples only.
+existing known-rejection handling. The first record is written before the
+launch: when it cannot be written (an unwritable directory, a full disk) nothing
+has started and nothing on disk could contradict the outcome, so the call
+proceeds without a record and keeps its real outcome (degraded telemetry,
+reported once per process; `makewand serve` no longer answers 503 for it). Once
+a record exists or the provider may have started, a
+failed write still makes the outcome UNKNOWN and stops delivery/replay. A host
+process killed before cleanup can leave only the initial UNKNOWN record: this is
+deliberately insufficient to claim completion. Evidence is local CLI telemetry,
+not an independently signed provider billing receipt. Live provider format
+compatibility remains unverified; tests use fake CLIs and static samples only.
+
+## Retention and reads
+
+Each save also appends one line to `index.jsonl` in the same directory
+(`attempt_id`, `engine`, `account_ref`, `pool_ref`; lock `index.jsonl.lock`).
+Readers (Go quota merging, Python `read_recent` for quota binding and model
+discovery) follow the index from its end and open only the records they return
+or reject, at most the last 1 MiB of index; they never list or stat the whole
+directory. Records stay one `<attempt_id>.json` file each, so older binaries,
+which list the directory, still read what newer ones write. A directory that no
+runner of this release has written to yet has no index and is scanned as
+before; a record that an older binary adds after the index exists becomes
+visible to index readers at the next compaction.
+
+Compaction runs after an attempt settles, at most once an hour per directory
+(the index header records the time), and never on a read path. Go and Python
+share a stable `compact.lock` across the due check, pruning and publication;
+the index lock is held only while publishing, so appends can continue during
+the scan. A failed final `settled` record write returns UNKNOWN and downgrades
+the ledger outcome without charging or refunding the attempt again. It deletes a
+record and its `.lock` sidecar, under that sidecar's lock, when the record is
+settled and either older than the call ledger's 48-hour retention or beyond the
+newest 256 settled records of its engine, account and pool. It never deletes an
+open record (`settled: false`), which covers running and interrupted attempts
+and any attempt whose ledger entry is unsettled or whose lease is still held,
+nor a record that is locked or changed since the scan. A record written before
+the `settled` field existed counts as settled only when its outcome is other
+than UNKNOWN; such UNKNOWN records, possibly interrupted attempts that a
+ledger still holds, are kept and can be deleted by hand. Sidecars and
+temporary files left without their record for longer than the retention are
+removed too, and the index is rewritten from the remaining records, keeping
+lines appended meanwhile. Go and Python apply the same rules
+(`tests/testdata/evidence_retention_cases.json`).
+
+Each record write first syncs a `<attempt>.json.pending` marker, then publishes
+and syncs the record before removing that marker. Readers ignore marked records
+and retention keeps them, including a settled PASSED version whose rename
+succeeded but directory sync failed. A first write that failed after publication
+returns UNKNOWN instead of degrading to missing telemetry; Python also refuses
+to launch the provider in that case. A later successful write removes the marker.
+An orphan marker older than retention is removed only under its record lock.
+Before ledger settlement writers keep the record UNKNOWN, then publish the
+terminal outcome with `settled: true`. Readers treat any explicit
+`settled: false` success as UNKNOWN too. If final marker creation itself fails,
+the older record therefore cannot verify a model, even when storage also
+prevents a corrective write. Legacy records without that field remain readable.
+
+Test binaries that can record evidence (Go `execution`, `router`,
+`cmd/makewand`, `internal/tui`; Python through `tests/_isolation.py`) point
+`MAKEWAND_EXECUTION_EVIDENCE_DIR` at a private temporary directory, so test
+runs never write the user's cache; a guard test in each fails otherwise.

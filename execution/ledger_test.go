@@ -291,10 +291,9 @@ func TestLedgerProcessHelper(t *testing.T) {
 		maxReserve = max(maxReserve, reserveElapsed)
 		if errors.Is(err, ErrBudgetExhausted) {
 			exhausted++
-			// All competing fixture attempts yield equally, including rejections;
-			// the test asserts shared accounting, rather than hot-loop throughput.
-			time.Sleep(5 * time.Millisecond)
-			continue
+			// These started calls are never refunded. Once the shared hard
+			// cap is exhausted, this worker has finished its competition.
+			break
 		}
 		if err != nil {
 			t.Fatalf("worker reserve step=%d elapsed=%v workflow_elapsed=%v context=%v: %v", step, reserveElapsed, time.Since(workerStarted), admissionCtx.Err(), err)
@@ -350,6 +349,7 @@ for step in range(20):
   if not str(error).startswith('model task budget exhausted ('):
    raise RuntimeError(f'worker reserve step={step} elapsed={time.monotonic()-reserve_started:.6f} workflow_elapsed={time.monotonic()-started:.6f} deadline_remaining={deadline-time.monotonic():.6f}') from error
   exhausted+=1
+  break
  else:
   reserve_elapsed=time.monotonic()-reserve_started
   admitted+=1
@@ -363,7 +363,7 @@ for step in range(20):
  time.sleep(.005)
 print('mixed-ledger-worker '+json.dumps(dict(operations=20,admitted=admitted,exhausted=exhausted,max_reserve_seconds=max_reserve,max_complete_seconds=max_complete,workflow_elapsed_seconds=time.monotonic()-started)),flush=True)
 `
-	// This bounds initialization plus 160 competing ledger operations. It is
+	// This bounds initialization plus the competing ledger operations. It is
 	// a fixture guard, not a model-call deadline or a throughput requirement.
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -414,7 +414,7 @@ print('mixed-ledger-worker '+json.dumps(dict(operations=20,admitted=admitted,exh
 		}
 	}
 	stopReady()
-	// The 160 operations share an actual caller deadline starting after all
+	// The competing operations share an actual caller deadline starting after all
 	// eight workers are ready; this is separate from the 30s initialization
 	// and 2min outer process guards. No worker is serialized by the fixture.
 	admissionDeadline := time.Now().Add(30 * time.Second)
@@ -434,6 +434,25 @@ print('mixed-ledger-worker '+json.dumps(dict(operations=20,admitted=admitted,exh
 	}
 	if ctx.Err() != nil {
 		t.Fatalf("mixed-language workload depended on the fixture guard: %v", ctx.Err())
+	}
+	// Settling the calls must not reopen a hard-limit slot in either runtime.
+	// Repeated exhausted layered admissions durably update their clock; stop
+	// each competitor at its first refusal instead of forcing ~149 serialized
+	// refusal writes into a 30s Windows race-instrumented throughput assertion.
+	finalCtx, stopFinal := context.WithTimeout(t.Context(), 30*time.Second)
+	defer stopFinal()
+	if _, err := Reserve(finalCtx, Metadata{Engine: "go-synthetic", Tier: "standard"}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("Go admitted after all competitors settled: %v", err)
+	}
+	if out, err := pythonCommand(t, `import time
+from makewand import call_budget as b
+try:
+ b.reserve('python-synthetic','standard',deadline_monotonic=time.monotonic()+30)
+except b.BudgetError as error:
+ if not str(error).startswith('model task budget exhausted ('): raise
+else:
+ raise AssertionError('Python admitted after all competitors settled')`).CombinedOutput(); err != nil {
+		t.Fatalf("Python final hard-limit check: %v %s", err, out)
 	}
 	ledger := readTestLedger(t, path)
 	if attempts := ledger["attempts"].([]any); len(attempts) != 13 {

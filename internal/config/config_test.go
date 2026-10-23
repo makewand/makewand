@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoad_EnvOverridesWhenConfigMissing(t *testing.T) {
@@ -298,7 +299,9 @@ func TestLoadWithOptions_SkipCLIDetection(t *testing.T) {
 		t.Setenv("PATH", binDir)
 		_ = os.Remove(sentinel)
 
-		cfg, err := Load()
+		// This asserts trusted detection, with enough time for a Windows race
+		// binary to start under a scanner; production Load keeps its 5 s bound.
+		cfg, err := LoadWithOptions(LoadOptions{cliProbeTimeout: 30 * time.Second})
 		if err != nil {
 			t.Fatalf("Load() error: %v", err)
 		}

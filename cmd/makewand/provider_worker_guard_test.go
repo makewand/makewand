@@ -4,21 +4,31 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/makewand/makewand/internal/testfixture"
 	"github.com/spf13/cobra"
 )
 
 // TestMain drops a parent provider-worker marker. The guard itself is covered
 // by TestRefuseProviderWorkerDispatch; leaving MAKEWAND_PROVIDER_WORKER=1 set
-// makes every in-process command refuse to start.
+// makes every in-process command refuse to start. Fixture dispatches record
+// provider evidence, which stays out of the user cache.
 func TestMain(m *testing.M) {
 	_ = os.Unsetenv("MAKEWAND_PROVIDER_WORKER")
-	os.Exit(m.Run())
+	cleanupEvidence, err := testfixture.IsolateExecutionEvidence()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "execution evidence isolation:", err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	cleanupEvidence()
+	os.Exit(code)
 }
 
 func TestProviderWorkerSharedPolicy(t *testing.T) {

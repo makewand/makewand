@@ -17,6 +17,10 @@ All notable changes to this project are documented here. The format is based on
 - `--workflow single` 的帮助与文档如实说明：由写代码的同一引擎在单独的只读调用中自审，没有独立引擎审查。
 - 模型发现写出 `discovered.json` 时，Go 路由器要求定价的 provider（claude、gemini、openai）的档位只在模型有价目（同一文件的 costs，或包旁 `router/defaults.json` 的内置价目）时写出；Go 本就忽略的未定价条目（如 agy 的 `gemini-4-argon` 写进 gemini 档位）不再写出。
 - 内部清理：`NON_AGENTIC_CHAT_MODELS` 由 `API_ONLY_ENGINES` 推导；审查裁决读取函数不再接受 `allow_legacy` 参数，读取旧的无 nonce 格式只能不带 nonce。
+- 执行证据（用户缓存下的 `makewand/execution-evidence`）不再无限增长：已结算的记录（账本已结算该尝试并释放租约，或没有账本，记录中 `settled: true`）保留 48 小时，同一引擎、账号与额度池最多保留最新 256 条，记录与其 `.lock` 在该锁内一起删除；未结束的尝试、账本未结算或租约仍在的记录从不删除，旧版本写入且结果仍为 UNKNOWN 的记录也保留。清理在尝试结算后运行（每个目录每小时最多一次），从不在读取路径上运行。额度合并与模型发现改读追加式索引 `index.jsonl`，只取该账号（模型发现为该引擎）最新 64 条，不再列举并 stat 整个目录；每次尝试仍是一个 `<attempt_id>.json`，旧版本照常读取。Go 与 Python 规则相同（共享测试向量 `tests/testdata/evidence_retention_cases.json`）。详见 [执行证据](docs/provider-execution-evidence.md)。
+- CLI 启动前的首条证据在发布前写不进去（目录不可写、磁盘满）时按降级遥测处理：调用照常进行并保留真实结果，每个进程提示一次；此前 `makewand serve` 会因此返回 503，也不回退到其他 provider。CLI 可能已运行之后的证据写入失败仍记为 UNKNOWN。
+- 测试不再写入真实用户缓存的执行证据：Go 的 `execution`、`router`、`cmd/makewand`、`internal/tui` 测试的 TestMain 与 Python 的 `tests/_isolation.py` 改用临时证据目录，并清除从 shell 继承的账本与事件路径；各包的守护测试在隔离缺失时失败。
+- 原生 Windows 上两个不稳定测试改为确定性：账本锁的期限只限制等待其他持有者，空闲的锁即使打开文件已用完预算也照样取得（此前开始事件的 100 毫秒预算耗在 Windows 文件与 ACL I/O 上，多报一次记录失败），已过期的事务不做任何 I/O（Go 与 Python 一致）；Python 没有执行期限的准入像 Go 一样等待账本，不再在其他进程占用账本 5 秒后报告“执行期限已过”。
 - 健康探测在慢主机上启动时就已超过 4 秒时限时（例如新二进制正被杀毒扫描），按与“启动后卡住”相同的超时策略处理：订阅 CLI 软放行、自定义探测仍判不可用。此前 Windows CI 上 gemini 会被误判为不可用。
 - 模型发现写出的 `discovered.json` 改为参考性输入：其中本构建无法定价的 API 模型条目被丢弃（该档位保留内置模型），合并或校验仍失败的整个文件被忽略；此前一个未定价的发现模型（如 agy 的 `gemini-4-argon` 写进 gemini 档位）会让 TUI、headless 与 serve 全部启动失败。用户自己的 `routing.json` 仍然严格校验。
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。
@@ -100,6 +104,8 @@ All notable changes to this project are documented here. The format is based on
 - 行为变化：调用账本的每日计数桶改按本地时区午夜划分（原固定为 Asia/Shanghai；本地时区为上海时间的机器上已有账本含义不变）；设置 `MAKEWAND_BUDGET_TIMEZONE=Asia/Shanghai` 可保留原边界，无效时区名拒绝准入。
 
 ### Fixed
+
+- 证据写入同步 pending 标记，账本结算前保持 UNKNOWN，最终才发布 `settled: true` 的结果；读取不会把显式未结算的 PASSED 当作已验证模型。重命名后同步失败、最终标记创建失败和纠正写入失败均不会留下可采信的错误成功记录。
 
 - Go 路由：#84 起普通 CLI 退出一律算结果未知，回退停止，Power 模式丢弃已有回答。现按证据区分：CLI 自己打印、由消息目录识别的拒绝（未登录或凭据被拒，agy 拒绝参数）是结果已知的失败（状态 FAILED，退出码 10），照常回退并计入熔断（熔断后的半开探测失败也会回退，冷却时间逐次加倍）；可能写入工作区的运行只有在 stdout 没有回答、且 stderr 上拒绝之前只有 agy 自己的提示行（消息目录的 notices 与 generic_notice）时才算拒绝：glog 诊断（agy 的工具与模型调用，以及启动时的静默登录）或状态行之后的拒绝可能发生在工作之后，运行途中登录失效同样仍为未知并停止重派。`cmd/versus` 的原始 CLI 对比按同一规则记账，`router.ClassifyCLIExecutionError` 为此增加 stdout 参数。只读运行（沙箱内的审查、未指定 WorkDir 的 `serve` 远端请求）的未识别退出仍记为未知，但可回退到下一个 provider；宿主机上的审查、指定了 WorkDir 的远端请求以及其他可写运行的未识别退出仍为未知并停止重派。Power 模式某个生成方或裁判结果未知时返回其他生成方的回答，未知尝试保留在 trace 与用量中；有生成方被预算或记账拒绝，或某个生成方或裁判的登录在准入后被切换到其他账号（安全拒绝，不计为 provider 故障）时，仍结束请求。
 - Go 路由：凭据准入快照改在拿到账号租约之后拍摄，并按账号（codex `account_id`、Claude `accountUuid`）与准入时比对，持有租约的运行刷新同一账号的令牌不再让排队的运行报 "selected login changed after admission"；等待期间换成其他账号仍拒绝，并在启动前释放预留。快照之后，codex 的令牌与 `account_id` 同在 `auth.json` 中，同账号刷新照常放行；Claude 的令牌（`.credentials.json`）与 `accountUuid`（`.claude.json`）分开存放，无法证明属于同一账号，令牌有变即拒绝启动；凭据拷入私有 HOME 之后、启动之前再读一次账号与令牌，拷贝期间发生的切换同样拒绝。
