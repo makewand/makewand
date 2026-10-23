@@ -722,3 +722,9 @@ visibility. External editors do not join the writer lock. The crash tests cover
 process termination and restart; they do not certify hardware power-loss or
 network-filesystem durability. Windows flushes file data and journal headers
 without claiming POSIX directory-fsync semantics.
+
+### Host Git executable and three-way merge defaults
+
+The executable resolver excludes the full enclosing workspace, including a parent repository when the caller starts in a subdirectory or nested repository. A cached executable and symlink target receive the same check. A repository cannot place `bin/git` on PATH above the current subdirectory and have the API relay execute it.
+
+Three-way apply also overrides `merge.default`. Git lets user-defined drivers shadow names such as `text` and `binary`, so the filter/merge configuration is listed and a name outside all configured driver names is selected. Git then uses its internal text merge, preserving normal conflicts and nonconflicting combinations without a repository shell command. The standalone delivery environment follows the same rule. See Git's primary implementation, [find_ll_merge_driver](https://github.com/git/git/blob/master/merge-ll.c).

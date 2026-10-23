@@ -254,7 +254,7 @@ def _apply_environment(path, timeout=None):
     between the listing and git's own read. Raises OSError when git cannot list it.
     """
     env = _git_environment()
-    listing = subprocess.run(_git_command(path) + ["config", "--null", "--name-only", "--get-regexp", r"^filter\."],
+    listing = subprocess.run(_git_command(path) + ["config", "--null", "--name-only", "--get-regexp", r"^(filter|merge)\."],
                              env=env, capture_output=True, timeout=timeout)
     if listing.returncode not in (0, 1):  # 1: no filter setting at all
         raise OSError("Cannot list Git filter drivers: " + _shown(os.fsdecode(listing.stderr).strip()))
@@ -264,6 +264,16 @@ def _apply_environment(path, timeout=None):
         if key.startswith(b"filter.") and dot:
             names[os.fsdecode(name)] = None
     settings = [(f"filter.{name}.{variable}", value) for name in names for variable, value in _DISABLED_FILTER_DRIVER]
+    merge_names = set()
+    for key in listing.stdout.split(b"\0") if listing.returncode == 0 else ():
+        name, dot, _ = key[len(b"merge."):].rpartition(b".")
+        if key.startswith(b"merge.") and dot:
+            merge_names.add(os.fsdecode(name))
+    for index in range(len(merge_names) + 1):
+        default = "makewand_builtin_text_" + str(index)
+        if default not in merge_names:
+            break
+    settings.append(("merge.default", default))
     env["GIT_CONFIG_COUNT"] = str(len(settings))
     for index, (key, value) in enumerate(settings):
         env[f"GIT_CONFIG_KEY_{index}"] = key

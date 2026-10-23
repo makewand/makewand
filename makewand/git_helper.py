@@ -230,81 +230,57 @@ def _sanitize_git_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 _RESOLVED_GIT_BINARY: Optional[str] = None
 
 
+def _git_workspace_root(cwd: Optional[Union[str, Path]]) -> Path:
+    """Exclude the whole enclosing workspace, including parent/nested repositories."""
+    start = Path(cwd if cwd is not None else os.getcwd()).resolve()
+    boundary = start
+    refused = set(_refused_init_roots())
+    for level in (start, *start.parents):
+        if level in refused:
+            break
+        bare = all((level / name).is_dir() for name in ("objects", "refs")) and _valid_git_head(level / "HEAD")
+        if _is_git_marker(level / ".git") or bare:
+            boundary = level
+    return boundary
+
+
 def resolve_safe_git_binary(cwd: Optional[Union[str, Path]] = None) -> str:
-    """Resolve the git binary securely, rejecting cwd or relative paths to prevent binary hijacking."""
+    """Resolve git outside the entire workspace; never execute one of its paths."""
     global _RESOLVED_GIT_BINARY
+    workspace = _git_workspace_root(cwd)
+
+    def inside(path):
+        candidate = Path(path).resolve()
+        try:
+            return os.path.commonpath((os.path.normcase(str(workspace)),
+                                       os.path.normcase(str(candidate)))) == os.path.normcase(str(workspace))
+        except ValueError:  # different Windows volumes
+            return False
+
     if _RESOLVED_GIT_BINARY:
-        if cwd is not None:
-            cwd_resolved = Path(cwd).resolve()
-            bin_path = Path(_RESOLVED_GIT_BINARY).resolve()
-            if os.name == "nt":
-                cwd_s = os.path.normcase(str(cwd_resolved))
-                bin_s = os.path.normcase(str(bin_path))
-                if bin_s == cwd_s or bin_s.startswith(cwd_s + os.sep):
-                    raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
-            else:
-                try:
-                    if bin_path.is_relative_to(cwd_resolved):
-                        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
-                except (ValueError, RuntimeError):
-                    pass
+        if inside(_RESOLVED_GIT_BINARY):
+            raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
         return _RESOLVED_GIT_BINARY
 
-    path_entries = os.environ.get("PATH", "").split(os.pathsep)
     clean_entries = []
-    cwd_resolved = Path(cwd).resolve() if cwd else None
-    for entry in path_entries:
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry or not os.path.isabs(entry):
             continue
         try:
-            entry_p = Path(entry).resolve()
-            if cwd_resolved:
-                if os.name == "nt":
-                    cwd_s = os.path.normcase(str(cwd_resolved))
-                    entry_s = os.path.normcase(str(entry_p))
-                    if entry_s == cwd_s or entry_s.startswith(cwd_s + os.sep):
-                        continue
-                else:
-                    if entry_p.is_relative_to(cwd_resolved):
-                        continue
-        except (ValueError, RuntimeError):
+            if inside(entry):
+                continue
+        except (OSError, ValueError, RuntimeError):
             continue
         clean_entries.append(entry)
-
-    clean_path = os.pathsep.join(clean_entries)
-    found = shutil.which("git", path=clean_path)
+    found = shutil.which("git", path=os.pathsep.join(clean_entries))
     if not found:
-        if cwd_resolved:
-            raw_found = shutil.which("git")
-            if raw_found:
-                raw_path = Path(raw_found).resolve()
-                if os.name == "nt":
-                    cwd_s = os.path.normcase(str(cwd_resolved))
-                    raw_s = os.path.normcase(str(raw_path))
-                    if raw_s == cwd_s or raw_s.startswith(cwd_s + os.sep):
-                        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
-                else:
-                    try:
-                        if raw_path.is_relative_to(cwd_resolved):
-                            raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
-                    except (ValueError, RuntimeError):
-                        pass
+        raw_found = shutil.which("git")
+        if raw_found and inside(raw_found):
+            raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
         raise FileNotFoundError("Safe git binary not found in PATH")
-
     found_path = Path(found).resolve()
-    if cwd_resolved:
-        if os.name == "nt":
-            cwd_s = os.path.normcase(str(cwd_resolved))
-            found_s = os.path.normcase(str(found_path))
-            if found_s == cwd_s or found_s.startswith(cwd_s + os.sep):
-                raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
-        else:
-            try:
-                if found_path.is_relative_to(cwd_resolved):
-                    raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
-            except (ValueError, RuntimeError):
-                pass
-
+    if inside(found_path):
+        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
     _RESOLVED_GIT_BINARY = str(found_path)
     return _RESOLVED_GIT_BINARY
 
@@ -659,12 +635,12 @@ def _disabled_filter_drivers(git_command: List[str], cwd, env: Dict[str, str], t
     configuration; the caller refuses the command.
     """
     try:
-        listing = subprocess.run([*git_command, "config", "--null", "--name-only", "--get-regexp", r"^filter\."],
+        listing = subprocess.run([*git_command, "config", "--null", "--name-only", "--get-regexp", r"^(filter|merge)\."],
                                  cwd=cwd, env=env, capture_output=True, timeout=timeout)
     except subprocess.SubprocessError as exc:
         raise OSError(f"Cannot list Git filter drivers: {exc}") from exc
-    if listing.returncode == 1:  # no filter setting at all
-        return []
+    if listing.returncode == 1:  # no filter or merge setting at all
+        return _filter_driver_settings(b"")
     if listing.returncode != 0:
         raise OSError(f"Cannot list Git filter drivers: {os.fsdecode(listing.stderr).strip()}")
     return _filter_driver_settings(listing.stdout)
@@ -672,14 +648,27 @@ def _disabled_filter_drivers(git_command: List[str], cwd, env: Dict[str, str], t
 
 def _filter_driver_settings(listing: bytes) -> List[Tuple[str, str]]:
     """The settings disabling each driver a NUL-separated ``git config --name-only`` listing of
-    filter.* keys names; an empty name is a driver too (``filter=``). delivery.py, which runs
-    standalone in the generated delivery script, builds the same."""
+    filter/merge keys names; an empty filter name is a driver too (``filter=``).
+    The default merge name is chosen outside all configured driver names so it
+    selects Git's built-in text merge. delivery.py builds the same standalone."""
     names: Dict[str, None] = {}
     for key in listing.split(b"\0"):
         name, dot, _ = key[len(b"filter."):].rpartition(b".")
         if key.startswith(b"filter.") and dot:
             names[os.fsdecode(name)] = None
-    return [(f"filter.{name}.{variable}", value) for name in names for variable, value in _DISABLED_FILTER_DRIVER]
+    settings = [(f"filter.{name}.{variable}", value) for name in names for variable, value in _DISABLED_FILTER_DRIVER]
+    merge_names = set()
+    for key in listing.split(b"\0"):
+        name, dot, _ = key[len(b"merge."):].rpartition(b".")
+        if key.startswith(b"merge.") and dot:
+            merge_names.add(os.fsdecode(name))
+    # User drivers shadow even "text" and "binary". An unconfigured name
+    # falls back to Git's built-in text merge (merge-ll.c:find_ll_merge_driver).
+    for index in range(len(merge_names) + 1):
+        default = "makewand_builtin_text_" + str(index)
+        if default not in merge_names:
+            break
+    return settings + [("merge.default", default)]
 
 
 def _config_environment(settings: List[Tuple[str, str]]) -> Dict[str, str]:
