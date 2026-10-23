@@ -861,8 +861,8 @@ func TestNpmFetchResolvesThroughInspectedLockfile_GEC1021R5(t *testing.T) {
 }
 
 // Live, with this host's real npm in the real sandbox and slirp4netns: the two
-// npm stages accept makewand's command lines, and a verification-style install
-// (--no-package-lock) leaves no lockfile behind. The project has no
+// npm stages accept makewand's command lines. A manifest-only install needs
+// npm 12; older npm requires an inspected lockfile. The project has no
 // dependencies and audit, fund and update checks are off, so nothing is
 // downloaded.
 func TestNpmFetchRealNpmLive_GEC1021R5(t *testing.T) {
@@ -873,21 +873,39 @@ func TestNpmFetchRealNpmLive_GEC1021R5(t *testing.T) {
 	if err != nil {
 		t.Skip("no npm on PATH")
 	}
-	project := sandboxDepsProject(t)
-	requireUserModeNetwork(t)
-	t.Setenv("PATH", filepath.Dir(npm)+":/usr/bin:/bin")
-	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
-		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
-	}
-	writeProjectFiles(t, project.Path, "package.json", `{"name":"x","version":"1.0.0"}`)
-	plan := ExecPlan{Kind: "deps", Command: "npm", Args: []string{"install", "--ignore-scripts", "--no-package-lock"},
-		env: []string{"npm_config_audit=false", "npm_config_fund=false", "npm_config_update_notifier=false"}}
-	result, err := project.RunVerificationPlan(context.Background(), plan)
-	if err != nil || result == nil || result.ExitCode != 0 {
-		t.Fatalf("result = %+v, err = %v, want the npm %d fetch to succeed", result, err, npmMajorVersion(npm))
-	}
-	if _, err := project.ReadFile("package-lock.json"); err == nil {
-		t.Fatal("a --no-package-lock fetch must leave no package-lock.json behind")
+	version := npmMajorVersion(npm)
+	for _, locked := range []bool{false, true} {
+		name := "manifest-only"
+		if locked {
+			name = "inspected-lockfile"
+		}
+		t.Run(name, func(t *testing.T) {
+			project := sandboxDepsProject(t)
+			requireUserModeNetwork(t)
+			t.Setenv("PATH", filepath.Dir(npm)+":/usr/bin:/bin")
+			if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+				t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
+			}
+			writeProjectFiles(t, project.Path, "package.json", `{"name":"x","version":"1.0.0"}`)
+			args := []string{"install", "--ignore-scripts", "--no-package-lock"}
+			if locked {
+				writeProjectFiles(t, project.Path, "package-lock.json", `{"name":"x","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"x","version":"1.0.0"}}}`)
+				args = []string{"ci", "--ignore-scripts"}
+			}
+			plan := ExecPlan{Kind: "deps", Command: "npm", Args: args,
+				env: []string{"npm_config_audit=false", "npm_config_fund=false", "npm_config_update_notifier=false"}}
+			result, err := project.RunVerificationPlan(context.Background(), plan)
+			if !locked && version < 12 {
+				if err == nil || result == nil || result.ExitCode == 0 || !strings.Contains(result.Note, "commit a lockfile") {
+					t.Fatalf("result = %+v, err = %v, want npm %d without a lockfile refused before fetching", result, err, version)
+				}
+			} else if err != nil || result == nil || result.ExitCode != 0 {
+				t.Fatalf("result = %+v, err = %v, want the npm %d fetch to succeed", result, err, version)
+			}
+			if _, err := project.ReadFile("package-lock.json"); !locked && err == nil {
+				t.Fatal("a --no-package-lock fetch must leave no package-lock.json behind")
+			}
+		})
 	}
 }
 
