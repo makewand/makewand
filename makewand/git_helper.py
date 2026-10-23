@@ -228,6 +228,9 @@ def _sanitize_git_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 
 
 _RESOLVED_GIT_BINARY: Optional[str] = None
+# A throw-away Git repository may inspect a different, untrusted work tree.
+# Keep that tree excluded for every subprocess, including cached resolutions.
+_git_binary_exclusions = ContextVar("makewand_git_binary_exclusions", default=())
 
 
 def _git_workspace_root(cwd: Optional[Union[str, Path]]) -> Path:
@@ -247,15 +250,18 @@ def _git_workspace_root(cwd: Optional[Union[str, Path]]) -> Path:
 def resolve_safe_git_binary(cwd: Optional[Union[str, Path]] = None) -> str:
     """Resolve git outside the entire workspace; never execute one of its paths."""
     global _RESOLVED_GIT_BINARY
-    workspace = _git_workspace_root(cwd)
+    workspaces = (_git_workspace_root(cwd), *_git_binary_exclusions.get())
 
     def inside(path):
         candidate = Path(path).resolve()
-        try:
-            return os.path.commonpath((os.path.normcase(str(workspace)),
-                                       os.path.normcase(str(candidate)))) == os.path.normcase(str(workspace))
-        except ValueError:  # different Windows volumes
-            return False
+        for workspace in workspaces:
+            try:
+                if os.path.commonpath((os.path.normcase(str(workspace)),
+                                       os.path.normcase(str(candidate)))) == os.path.normcase(str(workspace)):
+                    return True
+            except ValueError:  # different Windows volumes
+                continue
+        return False
 
     if _RESOLVED_GIT_BINARY:
         if inside(_RESOLVED_GIT_BINARY):
@@ -1471,8 +1477,11 @@ def list_workspace_ignored_paths(src_dir: Union[str, Path]) -> Optional[set]:
 def _probe_listing(src: Path, listing: List[str]) -> Tuple[int, Any, Any]:
     """``git <listing>`` (bytes) for the plain directory src through a throw-away repository
     outside it whose core.worktree is src. The probe is the cwd, never --git-dir/--work-tree:
-    run_git_cmd shields and neutralises the repository its cwd names."""
+    run_git_cmd shields and neutralises the repository its cwd names. Executable
+    resolution must also exclude src, even though the commands run outside it."""
+    workspace = _git_workspace_root(src)
     probe = tempfile.mkdtemp(prefix="makewand-ignore-probe-")
+    token = _git_binary_exclusions.set((*_git_binary_exclusions.get(), workspace))
     try:
         code, out, err = run_git_cmd(["git", "init", "-q"], cwd=probe)
         if code == 0:
@@ -1481,6 +1490,7 @@ def _probe_listing(src: Path, listing: List[str]) -> Tuple[int, Any, Any]:
             code, out, err = run_git_cmd(["git", *listing], cwd=probe, binary=True)
         return code, out, err
     finally:
+        _git_binary_exclusions.reset(token)
         shutil.rmtree(probe, ignore_errors=True)
 
 
