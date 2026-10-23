@@ -137,6 +137,11 @@ succeeded but directory sync failed. A first write that failed after publication
 returns UNKNOWN instead of degrading to missing telemetry; Python also refuses
 to launch the provider in that case. A later successful write removes the marker.
 An orphan marker older than retention is removed only under its record lock.
+Before ledger settlement writers keep the record UNKNOWN, then publish the
+terminal outcome with `settled: true`. Readers treat any explicit
+`settled: false` success as UNKNOWN too. If final marker creation itself fails,
+the older record therefore cannot verify a model, even when storage also
+prevents a corrective write. Legacy records without that field remain readable.
 
 Test binaries that can record evidence (Go `execution`, `router`,
 `cmd/makewand`, `internal/tui`; Python through `tests/_isolation.py`) point

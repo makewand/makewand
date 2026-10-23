@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -151,5 +152,80 @@ func TestEvidenceOrphanPendingCleanupHonorsRecordLock(t *testing.T) {
 	}
 	if _, err := root.Stat(name + ".pending"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan marker was not collected: %v", err)
+	}
+}
+
+func TestEvidenceFinalMarkerCreationFailureNeverLeavesTrustedSuccess(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("fixture needs POSIX owner directory permissions")
+	}
+	dir := t.TempDir()
+	t.Setenv("MAKEWAND_EXECUTION_EVIDENCE_DIR", dir)
+	ledger := layeredFixture(t)
+	a := evidenceAttempt(t, ContextWithConfig(t.Context(), Config{LedgerPath: ledger, TaskID: "no-marker", MaxCalls: 5}), fixtureAccount)
+	previous := accountingSyncDirectory
+	revoked := false
+	accountingSyncDirectory = func(path *accountingPath) error {
+		if err := previous(path); err != nil {
+			return err
+		}
+		if filepath.Join(path.root.Name(), path.name) == ledger && !revoked {
+			revoked = true
+			return os.Chmod(dir, 0o500)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		accountingSyncDirectory = previous
+		_ = os.Chmod(dir, 0o700)
+	})
+	if err := a.complete(Outcome{Status: Passed, Known: true}); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("final marker failure not reported: %v", err)
+	}
+	if !revoked {
+		t.Fatal("test never revoked record-directory writes")
+	}
+	path := filepath.Join(dir, a.ID+".json")
+	if _, err := os.Stat(path + ".pending"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("test must fail before marker creation: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored ProviderEvidence
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != Unknown || stored.OutcomeKnown || stored.Settled {
+		t.Fatalf("unwritable final store left a success even for older readers: %+v", stored)
+	}
+	rows := readTestLedger(t, ledger)["attempts"].([]any)
+	if len(rows) != 1 || rows[0].(map[string]any)["result_status"] != "UNKNOWN" {
+		t.Fatalf("failed final marker changed accounting: %v", rows)
+	}
+}
+
+func TestEvidenceReadersRequireCompletionForNewSuccessRecords(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MAKEWAND_EXECUTION_EVIDENCE_DIR", dir)
+	path := filepath.Join(dir, "uncommitted.json")
+	writeAged(t, path, []byte(`{"schema":1,"attempt_id":"uncommitted","engine":"codex","source":"cli_json","actual_model":"gpt-offline-fixture","process_exit_code":0,"settled":false,"result_status":"PASSED","outcome_known":true}`), time.Now())
+	record, err := ReadEvidence(path)
+	if err != nil || record.Status != Unknown || record.OutcomeKnown {
+		t.Fatalf("Go trusted an uncommitted success: %+v %v", record, err)
+	}
+	if out, err := pythonCommand(t, `from makewand import execution_evidence as e
+from makewand.discovery import _verified_model_ids
+row = list(e.read_recent())[0]
+assert row['result_status'] == 'UNKNOWN' and row['outcome_known'] is False
+assert not _verified_model_ids('codex')`).CombinedOutput(); err != nil {
+		t.Fatalf("Python trusted Go's uncommitted record: %v %s", err, out)
+	}
+	// Schema-1 records predating the completion field keep their compatibility.
+	writeAged(t, path, []byte(`{"schema":1,"attempt_id":"uncommitted","engine":"codex","result_status":"PASSED","outcome_known":true}`), time.Now())
+	record, err = ReadEvidence(path)
+	if err != nil || record.Status != Passed || !record.OutcomeKnown {
+		t.Fatalf("legacy success compatibility lost: %+v %v", record, err)
 	}
 }

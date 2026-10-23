@@ -219,7 +219,17 @@ func readEvidenceAt(root *os.Root, name string) (ProviderEvidence, error) {
 	if err != nil || info.Size() > evidenceRecordMax {
 		return value, fmt.Errorf("invalid evidence file")
 	}
-	err = json.NewDecoder(io.LimitReader(file, evidenceRecordMax+1)).Decode(&value)
+	wire := struct {
+		*ProviderEvidence
+		Completion json.RawMessage `json:"settled"`
+	}{ProviderEvidence: &value}
+	err = json.NewDecoder(io.LimitReader(file, evidenceRecordMax+1)).Decode(&wire)
+	if err == nil && wire.Completion != nil {
+		err = json.Unmarshal(wire.Completion, &value.Settled)
+		if err == nil && !value.Settled {
+			value.Status, value.OutcomeKnown = Unknown, false
+		}
+	}
 	if err == nil && (value.Schema != 1 || !ValidIdentifier(value.AttemptID) || !ValidIdentifier(value.Engine)) {
 		err = fmt.Errorf("invalid provider evidence")
 	}

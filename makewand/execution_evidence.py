@@ -394,7 +394,11 @@ def _read_record(files, name):
             return None
     except (OSError, ValueError, RecursionError):
         return None
-    return value if isinstance(value, dict) and value.get("schema") == 1 else None
+    if not isinstance(value, dict) or value.get("schema") != 1:
+        return None
+    if "settled" in value and value["settled"] is not True:
+        value.update(result_status="UNKNOWN", outcome_known=False)
+    return value
 
 
 def _pending(files, name):

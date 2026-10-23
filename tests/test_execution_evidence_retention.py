@@ -313,6 +313,57 @@ class SettlementTests(unittest.TestCase):
         self.assertEqual(self.record(result)["result_status"], "PASSED", "fault must leave the stale published version")
         self.assert_pending_retained(result)
 
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
+                     "fixture needs POSIX owner directory permissions")
+    def test_final_marker_cannot_be_created_and_correction_also_fails(self):
+        from makewand.discovery import _verified_model_ids
+        ledger = self.root / "budget.json"
+        complete = call_budget.complete
+        revoked = False
+
+        def settle_then_revoke(*args, **kwargs):
+            nonlocal revoked
+            result = complete(*args, **kwargs)
+            if kwargs.get("result_status") == "PASSED":
+                self.store.chmod(0o500)
+                revoked = True
+            return result
+
+        def callback(timeout):
+            mark_provider_invocation()
+            current_context()["_evidence"].update(actual_model="gpt-offline-fixture", source="cli_json", process_exit_code=0)
+            return True, "ok", None
+
+        try:
+            with patch.dict(os.environ, {"MAKEWAND_CALL_BUDGET_FILE": str(ledger), "MAKEWAND_MAX_MODEL_CALLS": "5"}), \
+                    patch.object(call_budget, "complete", side_effect=settle_then_revoke):
+                result = execute(self.request(), callback)
+            self.assertTrue(revoked)
+            self.assertEqual(result.status, "UNKNOWN")
+            self.assertFalse(result.outcome_known)
+            self.assertFalse((self.store / (result.attempt_id + ".json.pending")).exists())
+            row = self.record(result)
+            self.assertEqual(row["result_status"], "UNKNOWN", "older readers must not see a success either")
+            self.assertFalse(row["settled"])
+            self.assertEqual(_verified_model_ids("offline-fixture"), set())
+            rows = json.loads(ledger.read_text())["attempts"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["result_status"], "UNKNOWN")
+        finally:
+            self.store.chmod(0o700)
+
+    def test_success_from_an_open_record_is_not_verified_until_committed(self):
+        from makewand.discovery import _verified_model_ids
+        row = evidence.new(self.request(), "intermediate")
+        row.update(result_status="PASSED", outcome_known=True, settled=False,
+                   actual_model="gpt-offline-fixture", source="cli_json", process_exit_code=0)
+        evidence.save(row)
+        self.assertEqual(list(evidence.read_recent())[0]["result_status"], "UNKNOWN")
+        self.assertEqual(_verified_model_ids("offline-fixture"), set())
+        row["settled"] = True
+        evidence.save(row)
+        self.assertEqual(_verified_model_ids("offline-fixture"), {"gpt-offline-fixture"})
+
     def test_held_lease_or_failed_settlement_keeps_the_record_open(self):
         with patch.dict(os.environ, {"MAKEWAND_CALL_BUDGET_FILE": str(self.root / "budget.json"), "MAKEWAND_MAX_MODEL_CALLS": "5"}):
             with patch.object(call_budget, "complete", return_value=False):

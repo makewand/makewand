@@ -343,7 +343,8 @@ def execute(request, callback):
                         result = ExecutionResult.from_dict(dict(result.to_dict(), tokens=evidence["tokens"]))
                     if not current_context()["_provider_invocation"].settled:
                         # Without a ledger nothing else can still hold this attempt open.
-                        evidence.update(result_status=result.status, outcome_known=result.outcome_known,
+                        evidence.update(result_status=result.status if reservation is None else "UNKNOWN",
+                                        outcome_known=result.outcome_known if reservation is None else False,
                                         tokens=result.tokens, settled=reservation is None)
                         execution_evidence.save(evidence)
                     recorded = True
@@ -362,6 +363,8 @@ def execute(request, callback):
                     attempt_id=attempt, duration_ms=result.duration_ms, error_kind="accounting", outcome_known=False)
             if recorded:
                 try:
+                    if released:
+                        evidence.update(result_status=result.status, outcome_known=result.outcome_known)
                     execution_evidence.settle(evidence, ledger_settled=released)
                 except (OSError, ValueError, RuntimeError):
                     result = _result(request, "UNKNOWN", output=result.output, error="provider evidence settlement unavailable",

@@ -664,6 +664,12 @@ func (a *Attempt) complete(outcome Outcome) error {
 		a.evidence.Status, a.evidence.OutcomeKnown, a.evidence.Tokens = outcome.Status, outcome.Known, outcome.Tokens
 		// Without a ledger nothing else can still hold this attempt open.
 		a.evidence.Settled = a.config.LedgerPath == ""
+		if !a.evidence.Settled {
+			// A terminal success is published only after ledger settlement.
+			// If the final marker cannot even be created, the older record
+			// must still be UNKNOWN for readers of this and older releases.
+			a.evidence.Status, a.evidence.OutcomeKnown = Unknown, false
+		}
 		evidenceErr = a.evidenceError
 		if evidenceErr == nil {
 			evidenceErr = a.saveEvidence()
@@ -686,6 +692,9 @@ func (a *Attempt) complete(outcome Outcome) error {
 			a.evidence.Settled = false
 		}
 	} else if evidenceErr == nil && !leased {
+		if a.evidence != nil {
+			a.evidence.Status, a.evidence.OutcomeKnown = outcome.Status, outcome.Known
+		}
 		if err := a.settleEvidence(); err != nil {
 			evidenceErr = fmt.Errorf("provider evidence settlement unavailable: %w", err)
 			a.evidenceError = evidenceErr
