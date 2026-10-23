@@ -797,7 +797,8 @@ func npmInstallArgs(planArgs []string, hasManifest bool) []string {
 	for _, arg := range planArgs[1:] {
 		switch {
 		case slices.Contains(args, arg), arg == "--no-package-lock", strings.HasPrefix(arg, "--package-lock="),
-			arg == "--no-save", strings.HasPrefix(arg, "--save="):
+			arg == "--no-save", strings.HasPrefix(arg, "--save="), strings.HasPrefix(arg, "--ignore-scripts="),
+			arg == "--no-ignore-scripts":
 			continue
 		}
 		args = append(args, arg)
@@ -828,6 +829,9 @@ func npmNetworkedOption(arg string) bool {
 		return true
 	}
 	key, _, ok := strings.Cut(arg, "=")
+	if key == "--ignore-scripts" {
+		return arg == "--ignore-scripts=true"
+	}
 	return ok && npmNetworkedValueOptions[key]
 }
 

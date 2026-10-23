@@ -355,12 +355,12 @@ func TestDependencyBuildStepRunsWithoutNetwork_GEC1021(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, step := range []string{"download", "install"} {
-		pip := `net=no
-/bin/grep -q '	00000000	' /proc/net/route 2>/dev/null && net=yes
-[ "$1" = ` + step + ` ] && { echo "$1 net=$net"; exit 1; }
-exit 0
+		pip := `net = 'yes' if '\t00000000\t' in Path('/proc/net/route').read_text() else 'no'
+if sys.argv[1] == '` + step + `':
+    print(sys.argv[1] + ' net=' + net)
+    raise SystemExit(1)
 `
-		writeExecScript(t, filepath.Join(tools, "pip"), pip)
+		writePipFixture(t, filepath.Join(tools, "pip"), pip)
 		result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}})
 		if err != nil || result == nil {
 			t.Fatalf("RunVerificationPlan (%s): %+v, %v", step, result, err)

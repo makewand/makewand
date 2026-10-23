@@ -589,7 +589,7 @@ func TestSandboxedSetuptoolsWritesNoEggInfoIntoWorkspace_FixN1R2(t *testing.T) {
 	// pip runs this hook in its build environment before the editable build; the
 	// networked `pip download` builds nothing, so the fake runs setuptools only
 	// for the loopback install, as real pip does.
-	writeExecScript(t, filepath.Join(tools, "pip"), "[ \"$1\" = download ] && exit 0\nexec /usr/bin/python3 -c 'import setuptools.build_meta as b; b.get_requires_for_build_editable()'\n")
+	writePipFixture(t, filepath.Join(tools, "pip"), "if sys.argv[1] == 'download':\n    raise SystemExit(0)\nimport setuptools.build_meta as b\nb.get_requires_for_build_editable()\n")
 	writeExecScript(t, filepath.Join(tools, "pytest"), "echo '1 passed'\n")
 	report := project.VerifyRestrictedWorkspace(context.Background(), files[1:2])
 	if report.IntegrityError != "" || report.DepsError != "" || !report.Isolated {

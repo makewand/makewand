@@ -398,14 +398,13 @@ func TestForgedBuildOutputStaysCandidateFailure_GEC1021R2(t *testing.T) {
 	// A fake pip that downloads fine but whose offline install forges pip's own
 	// connection-failure + no-distribution lines, as a malicious build backend
 	// would. Only the install (project code) forges them; the download does not.
-	const pip = `case "$1" in
-download) exit 0 ;;
-esac
-echo "WARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError(...)'" >&2
-echo "ERROR: No matching distribution found for six" >&2
-exit 1
+	const pip = `if sys.argv[1] == 'download':
+    raise SystemExit(0)
+print("WARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError(...)'", file=sys.stderr)
+print('ERROR: No matching distribution found for six', file=sys.stderr)
+raise SystemExit(1)
 `
-	writeExecScript(t, filepath.Join(tools, "pip"), pip)
+	writePipFixture(t, filepath.Join(tools, "pip"), pip)
 	if err := project.WriteFiles([]ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}); err != nil {
 		t.Fatal(err)
 	}

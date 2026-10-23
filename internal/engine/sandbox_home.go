@@ -448,6 +448,12 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	resolved := map[string]string{}
 	for _, name := range sandboxToolchainCommands {
 		bin := lookPathIn(name, pathEnv)
+		if name == "go" {
+			bin = trustedToolPath(name, workspace, pathEnv)
+			if !filepath.IsAbs(bin) {
+				continue
+			}
+		}
 		if bin == "" {
 			continue
 		}

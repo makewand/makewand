@@ -56,11 +56,10 @@ func TestDeclaredRemoteDependencyIsEnvironment_GEC1021R4(t *testing.T) {
 	// A fake pip whose download succeeds (the named requirements) and whose
 	// offline install fails, as real pip does when it cannot clone or download
 	// the excluded dependency without network.
-	const pip = `case "$1" in
-download) exit 0 ;;
-esac
-echo "ERROR: could not obtain a dependency" >&2
-exit 1
+	const pip = `if sys.argv[1] == 'download':
+    raise SystemExit(0)
+print('ERROR: could not obtain a dependency', file=sys.stderr)
+raise SystemExit(1)
 `
 	for _, tc := range []struct {
 		name  string
@@ -84,7 +83,7 @@ exit 1
 			if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 				t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 			}
-			writeExecScript(t, filepath.Join(tools, "pip"), pip)
+			writePipFixture(t, filepath.Join(tools, "pip"), pip)
 			if err := project.WriteFiles(tc.files); err != nil {
 				t.Fatal(err)
 			}
@@ -111,13 +110,13 @@ func TestRemoteDependencyAddedByBuildStaysCandidate_GEC1021R4(t *testing.T) {
 	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}
-	const pip = `case "$1" in
-download) exit 0 ;;
-esac
-echo "git+https://example.invalid/r.git#egg=r" >> requirements.txt
-exit 1
+	const pip = `if sys.argv[1] == 'download':
+    raise SystemExit(0)
+with open('requirements.txt', 'a') as f:
+    f.write('git+https://example.invalid/r.git#egg=r\n')
+raise SystemExit(1)
 `
-	writeExecScript(t, filepath.Join(tools, "pip"), pip)
+	writePipFixture(t, filepath.Join(tools, "pip"), pip)
 	if err := project.WriteFiles([]ExtractedFile{{Path: "requirements.txt", Content: "six==1.16.0\n"}}); err != nil {
 		t.Fatal(err)
 	}

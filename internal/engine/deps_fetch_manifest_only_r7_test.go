@@ -267,10 +267,9 @@ func TestWorkspaceExecutableNeverRunsTheFetch_GEC1021R7(t *testing.T) {
 	writeExecScript(t, filepath.Join(venv, "pip"), `echo "WORKSPACE-PIP ran: $*"
 exit 1
 `)
-	writeExecScript(t, filepath.Join(tools, "pip"), `case "$1" in
-download) echo "TRUSTED-PIP download PATH=$PATH"; exit 1 ;;
-esac
-exit 0
+	writePipFixture(t, filepath.Join(tools, "pip"), `if sys.argv[1] == 'download':
+    print('TRUSTED-PIP download PATH=' + os.environ['PATH'])
+    raise SystemExit(1)
 `)
 	writeProjectFiles(t, project.Path, "requirements.txt", "six==1.16.0\n")
 	result, _ := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "pip", Args: []string{"install", "--user", "-r", "requirements.txt"}})
@@ -547,11 +546,10 @@ func TestFalseMarkerRemoteDependencyStaysCandidate_GEC1021R7(t *testing.T) {
 	requireUserModeNetwork(t)
 	tools := outsideTools(t)
 	liveSandbox(t)
-	writeExecScript(t, filepath.Join(tools, "pip"), `case "$1" in
-download) exit 0 ;;
-esac
-echo "error: the build backend failed for its own reason" >&2
-exit 1
+	writePipFixture(t, filepath.Join(tools, "pip"), `if sys.argv[1] == 'download':
+    raise SystemExit(0)
+print('error: the build backend failed for its own reason', file=sys.stderr)
+raise SystemExit(1)
 `)
 	writeProjectFiles(t, project.Path, "pyproject.toml",
 		"[project]\nname = \"x\"\nversion = \"0\"\ndependencies = [\"six\", 'bait @ https://example.invalid/x.whl ; python_version < \"2\"']\n")

@@ -221,7 +221,7 @@ func (p *Project) execDependencyPlan(ctx context.Context, env verifyExecEnvironm
 // sandbox, with the trusted executable for the plan's command.
 func (p *Project) execStageFetch(ctx context.Context, env verifyExecEnvironment, projectDir string, fetch ExecPlan) (*ExecResult, sandboxNetwork, bool, error) {
 	if fetch.Command == "go" {
-		if err := checkSandboxGoToolchain(projectDir, verifyHomeLayout(projectDir, sandboxPathEnv(), true).goVersion); err != nil {
+		if err := checkSandboxGoToolchain(projectDir, verifyHomeLayout(projectDir, fetchPathEnv(projectDir), true).goVersion); err != nil {
 			return nil, sandboxNetwork{kind: sandboxNetworkNone}, true, err
 		}
 	}
@@ -232,7 +232,22 @@ func (p *Project) execStageFetch(ctx context.Context, env verifyExecEnvironment,
 		pathEnv:   fetchPathEnv(projectDir),
 		env:       fetch.env,
 	}
-	return p.execFetchCommand(ctx, env, spec, fetchToolPath(fetch.Command, projectDir), fetch.Args, true)
+	command, args := fetchToolPath(fetch.Command, projectDir), fetch.Args
+	guard := ""
+	if fetch.Command == "pip" || fetch.Command == "pip3" {
+		var why string
+		command, args, guard, why = guardedPipFetch(projectDir, fetch.Command, fetch.Args)
+		if why != "" {
+			result, network, err := refuseFetch(nil, sandboxNetwork{kind: sandboxNetworkNone}, why)
+			return result, network, true, err
+		}
+	}
+	result, network, attached, err := p.execFetchCommand(ctx, env, spec, command, args, true)
+	if err == nil && attached && result != nil && result.ExitCode != 0 && guard != "" &&
+		(strings.Contains(result.Stdout, guard) || strings.Contains(result.Stderr, guard)) {
+		result, network, err = refuseFetch(result, network, "pip dependency metadata requires a child process or the kernel execution guard could not be installed; makewand refuses to run build metadata while downloading, so install this dependency outside makewand or use index wheels with static metadata")
+	}
+	return result, network, attached, err
 }
 
 // classifyFailedFetch decides what a failed networked fetch means. A fetch

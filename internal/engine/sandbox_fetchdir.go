@@ -436,7 +436,16 @@ func insideWorkspace(workspace, path string) bool {
 // missing tool does.
 func fetchToolPath(name, workspace string) string {
 	pathEnv := fetchPathEnv(workspace)
+	return trustedToolPath(name, workspace, pathEnv)
+}
+
+// trustedToolPath also serves host-side probes, which must never execute a
+// workspace tool even when the subsequent sandbox command is loopback-only.
+func trustedToolPath(name, workspace, pathEnv string) string {
 	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" || !filepath.IsAbs(dir) || insideWorkspace(workspace, dir) {
+			continue
+		}
 		candidate := lookPathIn(name, dir)
 		if candidate == "" || !trustedFetchExecutable(candidate, workspace, pathEnv) {
 			continue
@@ -450,19 +459,24 @@ func fetchToolPath(name, workspace string) string {
 // workspace: no hop of its symlink chain lies there, nor the interpreter its
 // #! line names.
 func trustedFetchExecutable(bin, workspace, pathEnv string) bool {
-	for _, hop := range symlinkChain(bin) {
-		if insideWorkspace(workspace, hop) {
+	seen := map[string]bool{}
+	for range 16 {
+		if seen[bin] {
 			return false
 		}
-	}
-	if interpreter := scriptInterpreterAny(bin, pathEnv); interpreter != "" {
-		for _, hop := range symlinkChain(interpreter) {
+		seen[bin] = true
+		for _, hop := range symlinkChain(bin) {
 			if insideWorkspace(workspace, hop) {
 				return false
 			}
 		}
+		interpreter := scriptInterpreterAny(bin, pathEnv)
+		if interpreter == "" {
+			return true
+		}
+		bin = interpreter
 	}
-	return true
+	return false
 }
 
 // scriptInterpreterAny returns the absolute interpreter the #! line of script
