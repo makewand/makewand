@@ -111,7 +111,11 @@ before; a record that an older binary adds after the index exists becomes
 visible to index readers at the next compaction.
 
 Compaction runs after an attempt settles, at most once an hour per directory
-(the index header records the time), and never on a read path. It deletes a
+(the index header records the time), and never on a read path. Go and Python
+share a stable `compact.lock` across the due check, pruning and publication;
+the index lock is held only while publishing, so appends can continue during
+the scan. A failed final `settled` record write returns UNKNOWN and downgrades
+the ledger outcome without charging or refunding the attempt again. It deletes a
 record and its `.lock` sidecar, under that sidecar's lock, when the record is
 settled and either older than the call ledger's 48-hour retention or beyond the
 newest 256 settled records of its engine, account and pool. It never deletes an

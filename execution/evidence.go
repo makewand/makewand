@@ -135,20 +135,21 @@ func (a *Attempt) saveEvidence() error {
 // settleEvidence marks the record settled and prunes the store when due. It
 // runs once the ledger settled the attempt and released its lease (or there
 // is no ledger). A record that cannot be marked stays open and is never pruned.
-func (a *Attempt) settleEvidence() {
+func (a *Attempt) settleEvidence() error {
 	if a.evidence == nil {
-		return
+		return nil
 	}
 	if !a.evidence.Settled {
 		a.evidence.Settled = true
-		if a.saveEvidence() != nil {
+		if err := a.saveEvidence(); err != nil {
 			a.evidence.Settled = false
-			return
+			return err
 		}
 	}
 	if dir, err := EvidenceDirectory(); err == nil {
 		_ = compactEvidence(dir, time.Now(), false)
 	}
+	return nil
 }
 
 func (a *Attempt) evidenceWriteContext() (context.Context, context.CancelFunc) {

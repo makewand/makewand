@@ -461,6 +461,107 @@ func TestEvidenceSettlesOnlyAfterTheLedgerReleasesTheAttempt(t *testing.T) {
 	})
 }
 
+// A terminal PASSED record can be saved before the ledger releases its lease.
+// Failure of the subsequent settled=true write must still reach the caller.
+type failedSettledSuccessContext struct {
+	context.Context
+	attempt *Attempt
+	done    <-chan struct{}
+}
+
+func (c failedSettledSuccessContext) Done() <-chan struct{} {
+	if c.Err() != nil {
+		return c.done
+	}
+	return nil
+}
+
+func (c failedSettledSuccessContext) Err() error {
+	if e := c.attempt.evidence; e != nil && e.Settled && e.Status == Passed {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func TestEvidenceFinalSettlementFailureDowngradesWithoutRefund(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MAKEWAND_EXECUTION_EVIDENCE_DIR", dir)
+	path := layeredFixture(t)
+	a := evidenceAttempt(t, ContextWithConfig(t.Context(), Config{LedgerPath: path, TaskID: "final-write", MaxCalls: 5}), fixtureAccount)
+	done := make(chan struct{})
+	close(done)
+	a.evidenceContext = failedSettledSuccessContext{Context: context.Background(), attempt: a, done: done}
+	if err := a.complete(Outcome{Status: Passed, Known: true}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("final record failure was swallowed: %v", err)
+	}
+	data := readTestLedger(t, path)
+	entries := data["attempts"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("settlement changed the attempt count: %v", entries)
+	}
+	entry := entries[0].(map[string]any)
+	if entry["status"] != "completed" || entry["result_status"] != "UNKNOWN" || entry["outcome_known"] != false {
+		t.Fatalf("final record failure did not preserve a charged UNKNOWN: %v", entry)
+	}
+	if used := data["scopes"].(map[string]any)["tasks"].(map[string]any)["final-write"].(map[string]any)["used"]; used != float64(1) {
+		t.Fatalf("final record failure changed the charge: %v", used)
+	}
+	if e := evidenceRecordAt(t, dir, a.ID); e.Status != Unknown || e.OutcomeKnown {
+		t.Fatalf("recovered storage did not publish UNKNOWN: %+v", e)
+	}
+}
+
+// Both runtimes must acquire the same stable compaction lock before pruning.
+// Holding it leaves the index free but prevents a second directory scan.
+func TestEvidenceCompactionLockIsSharedWithPython(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MAKEWAND_EXECUTION_EVIDENCE_DIR", dir)
+	old := agedSettledRecord(t, dir, "old-shared-compaction", 49*time.Hour)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	lock, err := openExecutionFile(root, evidenceCompactionLock, os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	locked, err := tryLock(lock)
+	if err != nil || !locked {
+		t.Fatalf("hold compaction lock: %v %v", locked, err)
+	}
+	defer func() { _ = unlock(lock) }()
+	if err := compactEvidence(dir, time.Now(), true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Fatalf("Go pruned while another compactor held the lock: %v", err)
+	}
+	if out, err := pythonCommand(t, "from makewand import execution_evidence as e; e.compact(force=True)").CombinedOutput(); err != nil {
+		t.Fatalf("Python compaction: %v %s", err, out)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Fatalf("Python pruned while Go held the compaction lock: %v", err)
+	}
+	if err := unlock(lock); err != nil {
+		t.Fatal(err)
+	}
+	if err := compactEvidence(dir, time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unlocked compaction did not prune: %v", err)
+	}
+	deferred := agedSettledRecord(t, dir, "next-hour", 49*time.Hour)
+	if out, err := pythonCommand(t, "from makewand import execution_evidence as e; e.compact()").CombinedOutput(); err != nil {
+		t.Fatalf("Python hourly check: %v %s", err, out)
+	}
+	if _, err := os.Stat(deferred); err != nil {
+		t.Fatalf("another runtime pruned twice within one hour: %v", err)
+	}
+}
+
 // go-server-1021-6: a first record that cannot be written before the launch
 // (an unwritable directory, a full disk) is degraded telemetry. The call keeps
 // its real outcome and nothing is written.

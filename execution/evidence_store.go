@@ -26,6 +26,7 @@ import (
 // pool exceed evidenceKeepPerAccount, and rewrites the index.
 const (
 	evidenceIndexName      = "index.jsonl"
+	evidenceCompactionLock = "compact.lock"
 	evidenceKeepPerAccount = 256
 	evidenceCompactEvery   = time.Hour
 	evidenceIndexWindow    = 1 << 20
@@ -314,6 +315,22 @@ func compactEvidence(dir string, now time.Time, force bool) error {
 		return fmt.Errorf("execution evidence directory changed")
 	}
 	start, err := readEvidenceIndexState(p.root)
+	if err != nil || !force && !start.due(now) {
+		return err
+	}
+	// Only one Go/Python compactor may check the timestamp and prune. Keep
+	// the index lock free while scanning so evidence appends can proceed.
+	lock, err := openExecutionFile(p.root, evidenceCompactionLock, os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	locked, err := tryLock(lock)
+	if err != nil || !locked {
+		return err
+	}
+	defer func() { _ = unlock(lock) }()
+	start, err = readEvidenceIndexState(p.root)
 	if err != nil || !force && !start.due(now) {
 		return err
 	}

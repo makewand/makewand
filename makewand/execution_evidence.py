@@ -24,6 +24,7 @@ from makewand.account_identity import account_identity, event_account_ref
 from makewand.execution_contract import identifier
 
 INDEX = "index.jsonl"
+COMPACTION_LOCK = "compact.lock"
 KEEP_PER_ACCOUNT = 256
 COMPACT_EVERY_MS = 3600 * 1000
 INDEX_WINDOW = 1024 * 1024
@@ -126,7 +127,7 @@ def settle(evidence, ledger_settled=True):
             save(evidence)
         except (OSError, ValueError, RuntimeError):
             evidence["settled"] = False
-            return
+            raise
     compact()
 
 
@@ -647,34 +648,54 @@ def compact(force=False, now=None):
             start = _index_state(files)
             if not force and not _due(start, now):
                 return
-            records, deleted = _prune(files, now)
-            lock = files.open(files.lock_name, create=True, writable=True)
+            # A stable lock shared with Go covers the due check and pruning.
+            # The index lock stays free while the directory is scanned.
+            compactor = files.open(COMPACTION_LOCK, create=True, writable=True)
             try:
-                if not _lock(lock, time.monotonic() + 1):
+                if not _lock(compactor, time.monotonic()):
                     return
                 try:
-                    files.assert_named(files.lock_name, lock)
-                    current = _index_state(files)
-                    if not force and not _due(current, now):
-                        return  # another runner compacted meanwhile
-                    appended = b""
-                    if current is not None:
-                        offset = 0
-                        if start is not None:
-                            if start["identity"] != current["identity"]:
-                                return  # another runner replaced it
-                            offset = start["size"]
-                        fd = files.open(INDEX, delete=True)
-                        with os.fdopen(fd, "rb") as stream:
-                            stream.seek(offset)
-                            appended = stream.read(max(0, current["size"] - offset))
-                    files.save(_index_image(records, deleted, appended, now), lock)
+                    files.assert_named(COMPACTION_LOCK, compactor)
+                    _compact_locked(files, now, force)
                 finally:
-                    filelock.flock(lock, filelock.LOCK_UN)
+                    filelock.flock(compactor, filelock.LOCK_UN)
             finally:
-                os.close(lock)
+                os.close(compactor)
     except (OSError, ValueError, RuntimeError):
         pass
+
+
+def _compact_locked(files, now, force):
+    from makewand import filelock
+    start = _index_state(files)
+    if not force and not _due(start, now):
+        return
+    records, deleted = _prune(files, now)
+    lock = files.open(files.lock_name, create=True, writable=True)
+    try:
+        if not _lock(lock, time.monotonic() + 1):
+            return
+        try:
+            files.assert_named(files.lock_name, lock)
+            current = _index_state(files)
+            if not force and not _due(current, now):
+                return
+            appended = b""
+            if current is not None:
+                offset = 0
+                if start is not None:
+                    if start["identity"] != current["identity"]:
+                        return
+                    offset = start["size"]
+                fd = files.open(INDEX, delete=True)
+                with os.fdopen(fd, "rb") as stream:
+                    stream.seek(offset)
+                    appended = stream.read(max(0, current["size"] - offset))
+            files.save(_index_image(records, deleted, appended, now), lock)
+        finally:
+            filelock.flock(lock, filelock.LOCK_UN)
+    finally:
+        os.close(lock)
 
 
 def api_transport():

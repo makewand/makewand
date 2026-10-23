@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from makewand import accounting_files, call_budget, filelock
+from makewand.providers.base import contestant_scope
 
 
 class FakeClock:
@@ -122,6 +123,38 @@ class LedgerLockWaitTests(unittest.TestCase):
         with patch.object(call_budget, "time", clock.module()), self.held_ledger_lock():
             with self.assertRaises(call_budget.BudgetDeadlineError):
                 self.reserve(deadline_monotonic=clock.now + 5)
+
+    def test_cancelled_admission_exits_while_another_process_holds_the_lock(self):
+        ready, done = threading.Event(), threading.Event()
+        outcome = {}
+
+        def admit():
+            with contestant_scope("cancel-lock-wait") as scope:
+                outcome["scope"] = scope
+                ready.set()
+                try:
+                    self.reserve()
+                except call_budget.BudgetError as error:
+                    outcome["error"] = error
+                finally:
+                    done.set()
+
+        with self.held_ledger_lock():
+            worker = threading.Thread(target=admit)
+            worker.start()
+            self.assertTrue(ready.wait(10))
+            outcome["scope"].cancel_event.set()
+            exited_while_locked = done.wait(5)
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(exited_while_locked, "cancellation waited for the ledger holder")
+        self.assertIsInstance(outcome.get("error"), call_budget.BudgetCancelledError)
+
+    def test_cancelled_contestant_can_still_settle_its_accounting(self):
+        attempt = self.reserve()
+        with contestant_scope("cancelled-settlement") as scope:
+            scope.cancel_event.set()
+            call_budget.complete(attempt, True, 0, budget_file=str(self.ledger), max_model_calls=4)
 
     def test_an_expired_deadline_starts_no_io(self):
         with self.assertRaises(call_budget.BudgetDeadlineError):

@@ -354,7 +354,24 @@ def execute(request, callback):
                 result = _result(request, "UNKNOWN", output=result.output, error="model call accounting unavailable",
                     attempt_id=attempt, duration_ms=result.duration_ms, error_kind="accounting", outcome_known=False)
             if recorded:
-                execution_evidence.settle(evidence, ledger_settled=released)
+                try:
+                    execution_evidence.settle(evidence, ledger_settled=released)
+                except (OSError, ValueError, RuntimeError):
+                    result = _result(request, "UNKNOWN", output=result.output, error="provider evidence settlement unavailable",
+                        attempt_id=attempt, duration_ms=result.duration_ms, error_kind="accounting", outcome_known=False)
+                    # Accounting already released the lease: only downgrade
+                    # its outcome, retaining its charge and finish timestamp.
+                    try:
+                        call_budget.complete(reservation, False, result.duration_ms / 1000,
+                            result_status="UNKNOWN", outcome_known=False, evidence_failed=True,
+                            budget_file=request.budget_file, max_model_calls=request.max_model_calls)
+                    except (call_budget.BudgetError, OSError, ValueError, TypeError, RuntimeError):
+                        pass
+                    evidence.update(result_status="UNKNOWN", outcome_known=False, settled=released)
+                    try:
+                        execution_evidence.save(evidence)
+                    except (OSError, ValueError, RuntimeError):
+                        evidence["settled"] = False
             span.finish(result.status, error_kind=result.error_kind, artifact_digest=result.artifact_digest,
                 tokens=result.tokens, monetary_cost=result.monetary_cost)
     if interruption is not None:

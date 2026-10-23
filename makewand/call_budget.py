@@ -72,7 +72,7 @@ def _admission_deadline():
 
 
 @contextmanager
-def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=True):
+def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=True, admission=False):
     """Lock, read and validate the ledger. Without migrate, opening it writes nothing:
     a lifetime ledger is not converted and a tighter maximum is not persisted."""
     value = budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE")
@@ -94,6 +94,8 @@ def _ledger(budget_file=None, max_model_calls=None, lock_deadline=None, migrate=
         lock_deadline = time.monotonic() + 5 if lock_deadline is None else lock_deadline
         try:
             while True:
+                if admission:
+                    _check_admission_cancelled()
                 try:
                     filelock.flock(descriptor, filelock.LOCK_EX | filelock.LOCK_NB)
                     acquired = True
@@ -269,7 +271,7 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
         # Reserve. The fixed five-second lock budget bounds settlement; applied
         # here it reported an expired deadline that no caller had set.
         lock_deadline = math.inf if deadline_monotonic is None else deadline_monotonic
-        with _ledger(budget_file, max_model_calls, lock_deadline) as (path, data):
+        with _ledger(budget_file, max_model_calls, lock_deadline, admission=True) as (path, data):
             _check_admission_cancelled()
             if data is None:
                 return None
@@ -319,7 +321,8 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
 
 
 def complete(attempt, success, seconds, *, result_status=None, outcome_known=True,
-             tokens=None, monetary_cost=None, budget_file=None, max_model_calls=None):
+             tokens=None, monetary_cost=None, budget_file=None, max_model_calls=None,
+             evidence_failed=False):
     """Settle the attempt. Returns whether its account lease is released (None without one)."""
     if attempt is None:
         return None
@@ -333,6 +336,11 @@ def complete(attempt, success, seconds, *, result_status=None, outcome_known=Tru
                                  finished_at=time.time(), result_status=result_status,
                                  outcome_known=bool(outcome_known), tokens=tokens,
                                  monetary_cost=monetary_cost)
+                if evidence_failed:
+                    # Final evidence can fail after accounting released the
+                    # lease. Downgrade the outcome without charging/refunding
+                    # again or changing the original settlement timestamp.
+                    entry.update(success=False, result_status="UNKNOWN", outcome_known=False)
                 account_leases.settle(data, attempt)
                 _save(path, data)
                 return attempt not in data.get("leases", {})

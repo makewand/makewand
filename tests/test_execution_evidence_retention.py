@@ -22,7 +22,7 @@ from makewand import call_budget, filelock
 from makewand import execution_evidence as evidence
 from makewand.accounting_files import pin
 from makewand.execution_contract import ExecutionRequest
-from makewand.execution_runtime import current_context, execute
+from makewand.execution_runtime import current_context, execute, mark_provider_invocation
 from makewand.ledger_compaction import RETENTION_SECONDS
 
 TESTS = Path(__file__).resolve().parent
@@ -225,6 +225,31 @@ class SettlementTests(unittest.TestCase):
     def test_ledger_settles_before_the_record(self):
         with patch.dict(os.environ, {"MAKEWAND_CALL_BUDGET_FILE": str(self.root / "budget.json"), "MAKEWAND_MAX_MODEL_CALLS": "5"}):
             self.assertTrue(self.record(self.run_attempt())["settled"])
+
+    def test_failed_settled_record_is_unknown_and_keeps_the_original_charge(self):
+        ledger = self.root / "budget.json"
+        save = evidence.save
+
+        def fail_settled_success(record):
+            if record.get("settled") and record.get("result_status") == "PASSED":
+                raise OSError("final settlement record unavailable")
+            save(record)
+
+        def callback(timeout):
+            mark_provider_invocation()
+            return True, "ok", None
+
+        with patch.dict(os.environ, {"MAKEWAND_CALL_BUDGET_FILE": str(ledger), "MAKEWAND_MAX_MODEL_CALLS": "5"}), \
+                patch.object(evidence, "save", side_effect=fail_settled_success):
+            result = execute(self.request(), callback)
+        self.assertEqual(result.status, "UNKNOWN")
+        self.assertFalse(result.outcome_known)
+        rows = json.loads(ledger.read_text())["attempts"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "completed")
+        self.assertEqual(rows[0]["result_status"], "UNKNOWN")
+        self.assertFalse(rows[0]["outcome_known"])
+        self.assertEqual(self.record(result)["result_status"], "UNKNOWN")
 
     def test_held_lease_or_failed_settlement_keeps_the_record_open(self):
         with patch.dict(os.environ, {"MAKEWAND_CALL_BUDGET_FILE": str(self.root / "budget.json"), "MAKEWAND_MAX_MODEL_CALLS": "5"}):

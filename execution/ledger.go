@@ -662,6 +662,36 @@ func (a *Attempt) complete(outcome Outcome) error {
 			evidenceErr = fmt.Errorf("provider evidence unavailable: %w", evidenceErr)
 		}
 	}
+	leased, err := a.settleLedger(outcome, evidenceErr)
+	if err != nil {
+		return errors.Join(evidenceErr, err)
+	}
+	if evidenceErr == nil && !leased {
+		if err := a.settleEvidence(); err != nil {
+			evidenceErr = fmt.Errorf("provider evidence settlement unavailable: %w", err)
+			a.evidenceError = evidenceErr
+			outcome.Status, outcome.Known = Unknown, false
+			a.evidence.Status, a.evidence.OutcomeKnown = Unknown, false
+			// The lease has been released. If storage recovered, publish the
+			// conservative final outcome as settled; otherwise keep it open.
+			a.evidence.Settled = true
+			if a.saveEvidence() != nil {
+				a.evidence.Settled = false
+			}
+			if _, err := a.settleLedger(outcome, evidenceErr); err != nil {
+				return errors.Join(evidenceErr, err)
+			}
+		}
+	}
+	duration := time.Since(a.started).Milliseconds()
+	a.emitBestEffort("end", outcome, &duration)
+	a.completed = true
+	return evidenceErr
+}
+
+// settleLedger can downgrade an already settled outcome after a final record
+// write fails. It never charges or refunds an already completed attempt again.
+func (a *Attempt) settleLedger(outcome Outcome, evidenceErr error) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), accountingWriteTimeout)
 	defer cancel()
 	leased := false
@@ -678,6 +708,10 @@ func (a *Attempt) complete(outcome Outcome) error {
 				}
 				if entry["status"] == "completed" || entry["status"] == "released" {
 					leased = leaseHeld(data, a.ID)
+					if evidenceErr != nil {
+						entry["success"], entry["result_status"], entry["outcome_known"] = false, Unknown, false
+						return saveLedger(path, data)
+					}
 					return nil
 				}
 				if entry["status"] == "reserved" {
@@ -701,16 +735,10 @@ func (a *Attempt) complete(outcome Outcome) error {
 			}
 			return errReservationDisappeared
 		}); err != nil {
-			return errors.Join(evidenceErr, err)
+			return false, err
 		}
 	}
-	duration := time.Since(a.started).Milliseconds()
-	a.emitBestEffort("end", outcome, &duration)
-	a.completed = true
-	if evidenceErr == nil && !leased {
-		a.settleEvidence()
-	}
-	return evidenceErr
+	return leased, nil
 }
 
 // leaseHeld reports whether the ledger still holds attempt id's account lease
