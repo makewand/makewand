@@ -710,7 +710,9 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                     cmd = shlex.split(cmd)
 
         process_cwd = filesystem_path(cwd) if cwd is not None else None
-        safe_git = resolve_safe_git_binary(cwd=process_cwd)
+        # The resolver walks logical workspace paths. process_cwd is already
+        # an extended Win32 API path and must never be converted a second time.
+        safe_git = resolve_safe_git_binary(cwd=cwd)
         hardened = isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "git" and safe
         sub_index = _git_subcommand_index(cmd) if hardened else None
         subcommand = cmd[sub_index] if sub_index is not None else None
