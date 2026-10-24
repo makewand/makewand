@@ -170,6 +170,8 @@ func TestStandaloneRegistryAndIndexProbesKeepWorkspaceBoundary(t *testing.T) {
 	t.Setenv("PATH", strings.Join([]string{filepath.Join(workspace, "bin"), filepath.Join(outside, "trusted"), "/usr/bin", "/bin"}, ":"))
 	verifyGetenv = os.Getenv
 	sandboxGoEnvProbe = probeHostGoEnv
+	previousLookup := userNetLookPath
+	t.Cleanup(func() { userNetLookPath = previousLookup })
 	userNetLookPath = func(string) (string, error) { return "", exec.ErrNotFound }
 	// No network or candidate process can start. The defect happens in host
 	// layout preparation, before this deliberately unavailable sandbox.
