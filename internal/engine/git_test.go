@@ -286,3 +286,49 @@ func TestGitInit_PreservesExistingGitignore(t *testing.T) {
 		t.Fatalf("second GitInit mutated complete .gitignore: got %q, want %q", afterContent, beforeContent)
 	}
 }
+
+func TestGitCommit_SHA256RepositoryTakesItsOwnEmptyTree(t *testing.T) {
+	// A branch named like the SHA-1 empty tree carries a .gitattributes selecting a filter:
+	// the SHA-1 id, a ref name in a SHA-256 repository, would read attributes from its tree.
+	p, err := NewProject("git-sha256", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(t.TempDir(), "marker")
+	git := func(args ...string) {
+		t.Helper()
+		r, err := p.Exec(context.Background(), "git", args...)
+		if err != nil || r.ExitCode != 0 {
+			t.Fatalf("setup git %v: %v %+v", args, err, r)
+		}
+	}
+	git("init", "--object-format=sha256")
+	git("config", "user.name", "Audit Fixture")
+	git("config", "user.email", "fixture@example.invalid")
+	if err := p.WriteFile(".gitattributes", "* filter=audit\n"); err != nil {
+		t.Fatal(err)
+	}
+	git("add", ".gitattributes")
+	git("commit", "-m", "attributes")
+	git("branch", "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+	git("rm", "-q", ".gitattributes")
+	git("commit", "-m", "no attributes")
+	git("config", "filter.audit.clean", "cat; printf filter-ran >> "+markerPath)
+	git("config", "filter.audit.smudge", "cat; printf filter-ran >> "+markerPath)
+	if err := p.WriteFile("payload.txt", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := p.GitCommit(context.Background(), "test commit"); err != nil {
+		t.Fatalf("GitCommit failed: %v", err)
+	}
+	if _, err := p.GitDiff(context.Background()); err != nil {
+		t.Fatalf("GitDiff failed: %v", err)
+	}
+	if status, err := p.GitStatus(context.Background()); err != nil || status != "" {
+		t.Fatalf("GitStatus = %q, %v", status, err)
+	}
+	if _, err := os.Stat(markerPath); err == nil {
+		t.Fatal("the filter of a branch named like the SHA-1 empty tree ran on the host")
+	}
+}

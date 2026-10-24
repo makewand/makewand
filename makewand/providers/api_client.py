@@ -99,17 +99,14 @@ def apply_agentic_code_output(output: str, cwd: str, repo_trust: str = "trusted"
     # 1. First, check for unified diff blocks and apply via git apply if possible
     diff_blocks = re.findall(r"```(?:diff|patch)?\s*\n(--- [^\n]+\n\+\+\+ [^\n]+\n[\s\S]*?)```", output)
     if diff_blocks:
+        # The hardened git path: a git binary outside the workspace, the safe
+        # configuration flags, the attributes shield and disabled filter drivers.
+        from makewand.git_helper import run_git_cmd
         for diff_text in diff_blocks:
             try:
-                import subprocess
-                p = subprocess.run(
-                    ["git", "apply", "--whitespace=nowarn", "-"],
-                    input=diff_text.encode("utf-8"),
-                    cwd=clean_cwd,
-                    capture_output=True,
-                    timeout=5
-                )
-                if p.returncode == 0:
+                code, _, _ = run_git_cmd(["git", "apply", "--whitespace=nowarn", "-"],
+                                         cwd=clean_cwd, input_data=diff_text.encode("utf-8"))
+                if code == 0:
                     for line in diff_text.splitlines():
                         if line.startswith("+++ b/"):
                             rel = _is_safe_rel_path(line[6:].strip())

@@ -359,6 +359,134 @@ submodule format, `diff.context`) and carry three context lines; rollback uses
 literal pathspecs.
 Undecodable path bytes are shown as `\xNN` in messages and artifacts.
 
+Host-side git commands that run in a repository read attributes from the empty
+tree (`--attr-source`), so no `.gitattributes` in the work tree or index selects
+a filter, diff or merge driver, and each runs with `info/attributes` moved aside
+in every git directory and common directory git may use for its working
+directory: makewand reads the files git's repository discovery reads (a `.git`
+file, a `.git` directory or an implicit bare repository there or in a parent)
+and the `commondir` of each, whether `.git` is a file or a directory. A `.git`
+file or `commondir` git cannot read makes the command fail closed (`Cannot
+shield Git attributes`). The empty tree is named by the full object id of the
+repository's own object format (SHA-1 or SHA-256), read from
+`extensions.objectFormat` in the common directory's `config` exactly as git's
+repository-format check reads it (no include is followed); a hex id of the other
+length would be resolved as a ref name, so a branch named like the SHA-1 id
+could hand a SHA-256 repository's attributes to a tree of its choosing. A config
+git cannot parse, or an object format git does not know, also fails closed.
+
+Apart from the commands listed below, no host git command starts a git inside a
+nested repository: a child git there reads that repository's own config and
+`info/attributes`, which the shield does not cover and an attribute source does
+not replace, and would run a filter while hashing a tracked file.
+Diffs run `--submodule=short --ignore-submodules=dirty` and `git status` runs
+`--ignore-submodules=dirty`: the option, unlike `diff.ignoreSubmodules`, outranks a
+`submodule.<name>.ignore` that `.gitmodules` (a work-tree file) sets. git still
+reports a submodule whose commit pointer moved. `git add` reads no such setting,
+so makewand's `git add -A` (`git_helper.add_all`, also for its private diff
+indexes) marks each gitlink of the index assume-unchanged for the add, which then
+never looks at it, unmarks it right after, and stages it with `git update-index`,
+which only reads each nested `HEAD`; a gitlink below a symlinked directory is
+dropped from the index unread, as `git add -A` drops it. Exclude pathspecs are not
+used: `git add` refuses them once a directory above a gitlink is ignored or a
+symlink. A gitlink the user marked assume-unchanged or skip-worktree is left
+alone, as `git add -A` leaves it. A makewand process killed between the marking
+and the unmarking leaves the gitlinks marked; `git update-index
+--no-assume-unchanged <path>` clears them. The host rollback unstages with `git rm --cached -f`:
+without `-f`, git rm's up-to-date check runs `git status` inside a staged nested
+repository (and refuses a path whose staged content differs from both `HEAD` and
+the file). The shadow copy checks each submodule out with `checkout -q`, and the
+shadow delivery commits inside a submodule only when something is staged there:
+reporting local changes after the switch, like the status `git commit` prints
+when there is nothing to commit, runs `git status` in a nested submodule that
+`.gitmodules` marks `ignore = none`. Every command also carries command-scope
+configuration (`GIT_CONFIG_COUNT`, which git hands on to every git it starts):
+`diff.ignoreSubmodules=dirty`, `submodule.recurse=false` (a user's
+`submodule.recurse=true` made `checkout`, `reset --hard` and `read-tree` check a
+submodule's files out through its own filters), `fetch.recurseSubmodules=false`
+and `push.recurseSubmodules=no`. A clone runs `--no-checkout`; the files are
+checked out afterwards in the new repository, with its own shield and attribute
+source, so neither an untrusted repository's `.gitattributes` nor a filter the
+user defines globally runs while cloning.
+
+These host git commands still start a git inside a nested repository; none of
+them can run a filter that a repository's own files define or select:
+
+- `git submodule status --recursive`, which makewand uses to list submodules,
+  starts `git describe` (up to four forms, naming the checked-out commit) and
+  `git submodule--helper status --recursive` inside each initialized submodule.
+  describe reads refs and objects; the helper compares commit pointers
+  (`diff-files --ignore-submodules=dirty` limited to the gitlinks).
+- The shadow copy's `git submodule update --init --recursive` clones each
+  submodule into a new repository of the copy and checks it out there. That
+  repository's config is the clone's own and its `info` comes from git's
+  templates, and the checkout inherits the empty-tree attribute source
+  (`--attr-source` exports `GIT_ATTR_SOURCE` to every git it starts), so no
+  `.gitattributes` selects a filter.
+- Transport with the user's submodules: the shadow copy fetches each submodule's
+  checked-out commit from it (`git upload-pack` runs there), and the shadow
+  delivery pushes each verified submodule commit to a new branch in it
+  (`git receive-pack` runs there). Neither reads attributes or updates a work
+  tree. A local transport hands neither `-c` nor `GIT_CONFIG_COUNT` settings on,
+  so a receive hook the user installed in the destination runs, as on any push
+  to it; the same holds for the push to the repository itself.
+
+Where makewand relied on `git status` to see changed content inside a submodule,
+it asks each submodule itself (`git_helper.dirty_submodule_paths`): every
+checked-out submodule that `.gitmodules` registers for a gitlink of the index,
+recursively through the submodules each of them registers, gets its own shielded
+`git status`, and a dirty one is reported as the gitlink git status reported. This
+covers the working-tree isolation check, the dirty-file lists (syntax gate,
+candidate conflicts and change lists), the host transaction's task-start baseline
+and rollback verification, the shadow delivery's clean checks and the DAG
+staging copy's checkpoint and seal. Two observable differences: uncommitted
+changes inside a nested repository that `.gitmodules` does not register are no
+longer reported (a moved commit pointer still is), and `submodule.<name>.ignore`,
+whether `.gitmodules` or the repository's own config sets it, no longer hides a
+registered submodule's changes from these checks. A submodule that builds or
+tests write untracked files into, which a repository may mark
+`ignore = untracked`, now counts as dirty: the isolation check picks the shadow
+copy, and the shadow delivery's clean checks and the DAG checkpoints refuse while
+it stays so. `.gitmodules` is read with `git config -z`, so a submodule name or
+path may hold any whitespace, quotes or non-ASCII characters. A registered
+submodule below a symlinked directory or a junction is never asked (git status
+takes it for deleted), and `git submodule status` refuses such a registration, so
+the review diff and the shadow copy fail closed on it.
+
+The auto-fix loop's capture and restore of dirty files
+(`orchestrator.capture_dirty_files` / `restore_dirty_files`) reads plain
+`git status` and is deliberately not given this per-submodule check: a submodule
+whose only change is content inside it (no moved commit pointer) is neither
+captured before an auto-fix attempt nor removed by the restore after a failed
+one. Before, the restore deleted such a submodule's directory when the capture had
+missed it; its content is now left as the attempt left it, and the review diff,
+which reads each submodule's own diff, still shows it.
+
+`git apply` cannot take an attribute source in work-tree mode (git segfaults) or
+outside a repository, so every apply runs with each configured filter driver
+disabled by command-scope configuration; its index modes also read attributes
+from the empty tree. makewand lists the drivers right before git starts, with the
+shield already in place; a process that writes the repository's configuration at
+that very moment can still add a driver between the listing and git's own read,
+since git has no setting that disables every filter driver whatever its name. The
+delivery patch check and the generated `apply_delivery.sh` apply the same way:
+the script's applies run through its private helper, which lists the
+destination's drivers with the command and environment of the apply. The API
+relay applies its diff blocks through `run_git_cmd`, with a git binary from
+outside the workspace; that apply also carries `core.autocrlf=false`, so on a CRLF
+checkout configured `core.autocrlf=true` an LF diff block may not apply.
+
+`run_git_cmd` refuses a global option that would point git at another
+repository, work tree, namespace, attribute source or set of git programs than
+the ones it shields for its working directory (`-C`, `--git-dir`, `--work-tree`,
+`--namespace`, `--bare`, `--attr-source`, `--exec-path`, `--config-env`, and `-c`
+settings in an `include` or `includeIf` section): callers pass the working
+directory instead. `GIT_CONFIG` (only `git config` reads it, in place of all other
+configuration, so the filter driver listing would miss the drivers `git apply`
+runs), `GIT_ATTR_SOURCE`, `GIT_CEILING_DIRECTORIES`,
+`GIT_DISCOVERY_ACROSS_FILESYSTEM` and `GIT_NAMESPACE` are removed from the
+inherited environment, like `GIT_DIR` and the other redirection variables.
+
 Pre-existing files that are not backed up (dependency and cache directories,
 files over the backup limits) get a SHA-256 digest at task start, smallest first,
 within `MAKEWAND_FINGERPRINT_FILE_LIMIT` (default 64 MiB per file),
@@ -594,3 +722,11 @@ visibility. External editors do not join the writer lock. The crash tests cover
 process termination and restart; they do not certify hardware power-loss or
 network-filesystem durability. Windows flushes file data and journal headers
 without claiming POSIX directory-fsync semantics.
+
+### Host Git executable and three-way merge defaults
+
+The executable resolver excludes the full enclosing workspace, including a parent repository when the caller starts in a subdirectory or nested repository. A cached executable and symlink target receive the same check. A repository cannot place `bin/git` on PATH above the current subdirectory and have the API relay execute it.
+
+Three-way apply also overrides `merge.default`. Git lets user-defined drivers shadow names such as `text` and `binary`, so the filter/merge configuration is listed and a name outside all configured driver names is selected. Git then uses its internal text merge, preserving normal conflicts and nonconflicting combinations without a repository shell command. The standalone delivery environment follows the same rule. See Git's primary implementation, [find_ll_merge_driver](https://github.com/git/git/blob/master/merge-ll.c).
+
+A plain-directory ignore probe uses a temporary repository outside the workspace. Its executable resolver retains the original workspace exclusion for every probe command as well as the temporary repository boundary, including cached executables and symlink targets. Changing the cache between probe commands cannot execute the workspace Git.

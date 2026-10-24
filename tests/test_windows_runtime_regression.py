@@ -23,6 +23,27 @@ from makewand.artifact import workspace_snapshot
 
 @unittest.skipUnless(shutil.which("git"), "requires Git")
 class MetadataPathAdapterTests(unittest.TestCase):
+    def test_git_resolution_receives_logical_workspace_before_api_conversion(self):
+        class APIPath(type(Path())):
+            pass
+
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("requires Git")
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run([git, "init", "-q", str(repo)], check=True, capture_output=True)
+
+            def resolve(cwd=None):
+                self.assertNotIsInstance(cwd, APIPath)
+                self.assertEqual(Path(cwd), repo)
+                return git
+
+            with mock.patch.object(git_helper, "filesystem_path", side_effect=lambda path: APIPath(path)), \
+                 mock.patch.object(git_helper, "resolve_safe_git_binary", side_effect=resolve):
+                code, _, error = git_helper.run_git_cmd(["git", "status", "--short"], cwd=repo)
+            self.assertEqual(code, 0, error)
+
     def test_baseline_and_shadow_convert_metadata_paths_once(self):
         # Model the API namespace on Linux without making pathlib choose its
         # unavailable Windows implementation. Child paths retain the marker,

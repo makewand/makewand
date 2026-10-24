@@ -981,7 +981,7 @@ class UserGitConfigTests(HostDeliveryCase):
             command = run.call_args[0][0]
         position = command.index("diff")
         for flag in ("--no-ext-diff", "--no-textconv", "--no-color", "--no-relative",
-                     "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short"):
+                     "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--ignore-submodules=dirty"):
             self.assertIn(flag, command[position + 1:])
         self.assertEqual(command[-3:], ["--binary", "A", "B"])  # the caller's own options come last and win
 

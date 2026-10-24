@@ -17,7 +17,7 @@ import fnmatch
 import itertools
 from contextvars import ContextVar
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, Dict, Any, Callable, List, NamedTuple, Tuple, Union
 import makewand.config as config
 from makewand.config import c, COLOR_YELLOW, COLOR_RED, ensure_private_dir
@@ -60,9 +60,37 @@ SAFE_GIT_SECURITY_FLAGS = [
 # colour codes (color.ui=always), a/ b/ prefixes (diff.noprefix, diff.mnemonicPrefix,
 # diff.srcPrefix), submodule commits as "Subproject commit" lines that git apply
 # understands (diff.submodule=log) and git's own diff machinery (diff.external,
-# textconv drivers). An option the caller passes itself comes later and wins.
+# textconv drivers). --submodule=short pairs with --ignore-submodules=dirty so git
+# shows a submodule's committed pointer without running `git status` inside it to
+# decide "-dirty": that child reads the nested repository's own config and
+# info/attributes - which neither --attr-source nor the shield reaches, since git
+# spawns it without them - and would run a filter driver on the host. Submodule
+# content is reviewed separately (get_git_diff_status), with the shield in force.
+# An option the caller passes itself comes later and wins.
 DIFF_FORMAT_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-color", "--no-relative",
-                     "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short")
+                     "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short",
+                     "--ignore-submodules=dirty")
+# git status never enters a nested repository either (see DIFF_FORMAT_FLAGS): unlike
+# diff.ignoreSubmodules (_SUBMODULE_BARRIER), the option outranks a submodule.<name>.ignore
+# that .gitmodules, a work-tree file, sets. dirty_submodule_paths asks each registered
+# submodule itself.
+STATUS_FLAGS = ("--ignore-submodules=dirty",)
+# A clone never checks files out: its new repository takes its object format and refs from
+# the source, so no attribute source can be named for it in advance, and the source's
+# .gitattributes would select a filter the user defines globally. Callers check the files
+# out afterwards, through run_git_cmd.
+_CLONE_FLAGS = ("--no-checkout",)
+_SUBCOMMAND_FLAGS = {"diff": DIFF_FORMAT_FLAGS, "status": STATUS_FLAGS, "clone": _CLONE_FLAGS}
+# Command-scope configuration of every hardened git command. GIT_CONFIG_COUNT reaches each
+# git it starts, in a submodule too, so none of these enters a nested repository on its own:
+# diff.ignoreSubmodules=dirty spares diff and status the `git status` they would run there
+# (a .gitmodules "ignore" overrides it, hence also STATUS_FLAGS and DIFF_FORMAT_FLAGS;
+# git add reads none of it, hence add_all), submodule.recurse=false keeps checkout, reset
+# and read-tree out of a submodule, where they would check files out through its own filters,
+# and fetch and push do not recurse. makewand visits registered submodules itself, each
+# through run_git_cmd (get_git_diff_status, dirty_submodule_paths).
+_SUBMODULE_BARRIER = (("diff.ignoreSubmodules", "dirty"), ("submodule.recurse", "false"),
+                      ("fetch.recurseSubmodules", "false"), ("push.recurseSubmodules", "no"))
 # An exported patch applies with plain ``git apply`` whatever diff.context says.
 PATCH_EXPORT_FLAGS = ("--binary", "--full-index", "--unified=3")
 # The review diff (get_git_diff_status) shows three lines of context around every
@@ -73,8 +101,27 @@ REVIEW_DIFF_FLAGS = ("--unified=3",)
 # Applying the user's own changes reproduces them byte for byte: apply.whitespace=fix
 # would rewrite them and apply.whitespace=error would refuse them.
 PATCH_APPLY_FLAGS = ("--binary", "--whitespace=nowarn")
-# Global git options whose value is a separate argument (``git -C dir diff``).
-_GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+# The empty tree of each object format. Attributes are read from it (--attr-source): no
+# .gitattributes in the work tree or index selects a filter, diff or merge driver
+# (info/attributes is shielded separately). Always the full id of the repository's own
+# format: git resolves a hex string of another length as a ref name, and a branch named
+# like the SHA-1 id would hand a SHA-256 repository's attributes to its tree.
+_EMPTY_TREE_OIDS = {"sha1": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                    "sha256": "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"}
+# git apply modes that work through the index, the only ones that accept an attribute source.
+_APPLY_INDEX_OPTIONS = frozenset({"--index", "--cached", "--3way", "-3"})
+# Settings that leave a filter driver no command to run and make git not insist on it.
+_DISABLED_FILTER_DRIVER = (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))
+# Global git options whose value is a separate argument (``git -C dir diff``), as git.c reads them.
+_GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                                            "--config-env", "--shallow-file", "--attr-source"})
+# Global options that would make git use another repository, work tree, namespace, attribute
+# source or set of git programs than the ones run_git_cmd shields for its cwd: a caller passes
+# cwd instead. --config-env and include/includeIf settings would load configuration the filter
+# driver listing does not read in the same way.
+_REDIRECTING_GLOBAL_OPTIONS = frozenset({"-C", "--git-dir", "--work-tree", "--namespace", "--bare",
+                                         "--attr-source", "--exec-path", "--config-env"})
+_INCLUDE_SECTIONS = frozenset({"include", "includeif"})
 
 
 def _git_subcommand_index(cmd: List[str]) -> Optional[int]:
@@ -89,6 +136,24 @@ def _git_subcommand_index(cmd: List[str]) -> Optional[int]:
         else:
             return index
     return None
+
+
+def _refuse_redirecting_options(cmd: List[str], sub_index: Optional[int]) -> None:
+    """Raises ValueError for a global option (before the subcommand) in _REDIRECTING_GLOBAL_OPTIONS,
+    or a ``-c`` setting in an include or includeIf section (any case, as git compares them)."""
+    end = len(cmd) if sub_index is None else sub_index
+    index = 1
+    while index < end:
+        argument = str(cmd[index])
+        if argument.split("=", 1)[0] in _REDIRECTING_GLOBAL_OPTIONS:
+            raise ValueError(f"Refusing git option {argument!r}: run_git_cmd shields the repository of its cwd; "
+                             "pass cwd instead")
+        if argument == "-c" and index + 1 < end:
+            setting = str(cmd[index + 1])
+            if setting.split("=", 1)[0].strip().split(".", 1)[0].lower() in _INCLUDE_SECTIONS:
+                raise ValueError(f"Refusing git option -c {setting!r}: run_git_cmd lists the configuration of "
+                                 "its cwd; pass cwd instead")
+        index += 2 if argument in _GIT_GLOBAL_OPTIONS_WITH_VALUE else 1
 
 
 _DANGEROUS_GIT_ENVS = {
@@ -108,6 +173,17 @@ _DANGEROUS_GIT_ENVS = {
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_ASKPASS",
+    # git config reads only this file (like --file) and every other git command ignores it:
+    # the filter driver listing for git apply would miss the repository's own drivers, and
+    # makewand's own `git config` writes would land in the caller's file.
+    "GIT_CONFIG",
+    # An attribute source of the caller's (git 2.55 also segfaults on a work-tree apply under
+    # one), a repository discovery other than the one run_git_cmd reproduces by reading files,
+    # and a namespace, like the global options _refuse_redirecting_options refuses.
+    "GIT_ATTR_SOURCE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
 }
 
 
@@ -152,140 +228,464 @@ def _sanitize_git_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 
 
 _RESOLVED_GIT_BINARY: Optional[str] = None
+# A throw-away Git repository may inspect a different, untrusted work tree.
+# Keep that tree excluded for every subprocess, including cached resolutions.
+_git_binary_exclusions = ContextVar("makewand_git_binary_exclusions", default=())
+
+
+def _git_workspace_root(cwd: Optional[Union[str, Path]]) -> Path:
+    """Exclude the whole enclosing workspace, including parent/nested repositories."""
+    start = Path(cwd if cwd is not None else os.getcwd()).resolve()
+    boundary = start
+    refused = set(_refused_init_roots())
+    for level in (start, *start.parents):
+        if level in refused:
+            break
+        bare = all((level / name).is_dir() for name in ("objects", "refs")) and _valid_git_head(level / "HEAD")
+        if _is_git_marker(level / ".git") or bare:
+            boundary = level
+    return boundary
 
 
 def resolve_safe_git_binary(cwd: Optional[Union[str, Path]] = None) -> str:
-    """Resolve the git binary securely, rejecting cwd or relative paths to prevent binary hijacking."""
+    """Resolve git outside the entire workspace; never execute one of its paths."""
     global _RESOLVED_GIT_BINARY
+    workspaces = (_git_workspace_root(cwd), *_git_binary_exclusions.get())
+
+    def inside(path):
+        candidate = Path(path).resolve()
+        for workspace in workspaces:
+            try:
+                if os.path.commonpath((os.path.normcase(str(workspace)),
+                                       os.path.normcase(str(candidate)))) == os.path.normcase(str(workspace)):
+                    return True
+            except ValueError:  # different Windows volumes
+                continue
+        return False
+
     if _RESOLVED_GIT_BINARY:
-        if cwd is not None:
-            cwd_resolved = Path(cwd).resolve()
-            bin_path = Path(_RESOLVED_GIT_BINARY).resolve()
-            if os.name == "nt":
-                cwd_s = os.path.normcase(str(cwd_resolved))
-                bin_s = os.path.normcase(str(bin_path))
-                if bin_s == cwd_s or bin_s.startswith(cwd_s + os.sep):
-                    raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
-            else:
-                try:
-                    if bin_path.is_relative_to(cwd_resolved):
-                        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
-                except (ValueError, RuntimeError):
-                    pass
+        if inside(_RESOLVED_GIT_BINARY):
+            raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {_RESOLVED_GIT_BINARY}")
         return _RESOLVED_GIT_BINARY
 
-    path_entries = os.environ.get("PATH", "").split(os.pathsep)
     clean_entries = []
-    cwd_resolved = Path(cwd).resolve() if cwd else None
-    for entry in path_entries:
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry or not os.path.isabs(entry):
             continue
         try:
-            entry_p = Path(entry).resolve()
-            if cwd_resolved:
-                if os.name == "nt":
-                    cwd_s = os.path.normcase(str(cwd_resolved))
-                    entry_s = os.path.normcase(str(entry_p))
-                    if entry_s == cwd_s or entry_s.startswith(cwd_s + os.sep):
-                        continue
-                else:
-                    if entry_p.is_relative_to(cwd_resolved):
-                        continue
-        except (ValueError, RuntimeError):
+            if inside(entry):
+                continue
+        except (OSError, ValueError, RuntimeError):
             continue
         clean_entries.append(entry)
-
-    clean_path = os.pathsep.join(clean_entries)
-    found = shutil.which("git", path=clean_path)
+    found = shutil.which("git", path=os.pathsep.join(clean_entries))
     if not found:
-        if cwd_resolved:
-            raw_found = shutil.which("git")
-            if raw_found:
-                raw_path = Path(raw_found).resolve()
-                if os.name == "nt":
-                    cwd_s = os.path.normcase(str(cwd_resolved))
-                    raw_s = os.path.normcase(str(raw_path))
-                    if raw_s == cwd_s or raw_s.startswith(cwd_s + os.sep):
-                        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
-                else:
-                    try:
-                        if raw_path.is_relative_to(cwd_resolved):
-                            raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
-                    except (ValueError, RuntimeError):
-                        pass
+        raw_found = shutil.which("git")
+        if raw_found and inside(raw_found):
+            raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {raw_found}")
         raise FileNotFoundError("Safe git binary not found in PATH")
-
     found_path = Path(found).resolve()
-    if cwd_resolved:
-        if os.name == "nt":
-            cwd_s = os.path.normcase(str(cwd_resolved))
-            found_s = os.path.normcase(str(found_path))
-            if found_s == cwd_s or found_s.startswith(cwd_s + os.sep):
-                raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
-        else:
-            try:
-                if found_path.is_relative_to(cwd_resolved):
-                    raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
-            except (ValueError, RuntimeError):
-                pass
-
+    if inside(found_path):
+        raise PermissionError(f"Refusing to execute git binary found inside workspace cwd: {found}")
     _RESOLVED_GIT_BINARY = str(found_path)
     return _RESOLVED_GIT_BINARY
 
 
+# git refuses a .git file larger than this (read_gitfile_gently); commondir holds a path.
+_GIT_POINTER_MAX_BYTES = 1 << 20
+# A repository configuration makewand reads for its object format; larger ones are refused.
+_GIT_CONFIG_MAX_BYTES = 16 << 20
+_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _read_git_pointer(path: Path, limit: int = _GIT_POINTER_MAX_BYTES) -> bytes:
+    """A .git file, commondir or config, read as git reads it; OSError where git's read fails too."""
+    descriptor = os.open(_fs_path(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+                         | getattr(os, "O_CLOEXEC", 0))
+    with os.fdopen(descriptor, "rb") as handle:
+        # git cannot read a directory and would wait forever on a FIFO.
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise OSError(errno.EFBIG, "file too large", str(path))
+    return data
+
+
+def _gitfile_target(dot_git: Path) -> Optional[Path]:
+    """The git directory a ``.git`` file names, parsed exactly as git parses it; None when git rejects the file."""
+    data = _read_git_pointer(dot_git)
+    if not data.startswith(b"gitdir: "):
+        return None
+    data = data.rstrip(b"\r\n")
+    if len(data) < 9:
+        return None
+    target = os.fsdecode(data[8:].split(b"\0", 1)[0])
+    return Path(os.path.realpath(os.path.join(dot_git.parent, target)))
+
+
+def _git_common_dir(git_dir: Path) -> Path:
+    """The directory git reads config and info/attributes from for ``git_dir``.
+
+    git honours a ``commondir`` file in any git directory, not only in a linked
+    worktree's: its content names the common directory, relative to ``git_dir``
+    unless absolute, with trailing line ends dropped and nothing after a NUL. A
+    commondir git cannot read makes git die, and makes this raise.
+    """
+    pointer = git_dir / "commondir"
+    if not os.path.lexists(_fs_path(pointer)):
+        return git_dir
+    data = _read_git_pointer(pointer)
+    if not data:
+        raise OSError(errno.EINVAL, "empty commondir", str(pointer))
+    target = os.fsdecode(data.rstrip(b"\r\n").split(b"\0", 1)[0])
+    return Path(os.path.realpath(os.path.join(git_dir, target)))
+
+
+def _valid_git_head(head: Path) -> bool:
+    """git's validate_headref: a symbolic ref into refs/, as file content or symlink, or an object id."""
+    path = _fs_path(head)
+    try:
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode):
+            return os.fsencode(os.readlink(path)).startswith(b"refs/")
+        if not stat.S_ISREG(mode):
+            return False
+        # Open without blocking and confirm by fstat, like _read_git_pointer: a FIFO
+        # swapped in after the lstat must not hang makewand before git starts, where
+        # MAKEWAND_GIT_TIMEOUT could not cover the wait.
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            data = handle.read(255)
+    except OSError:
+        return False
+    if data.startswith(b"ref:") and data[4:].lstrip(b" \t\n\r").startswith(b"refs/"):
+        return True
+    return len(data) >= 40 and all(byte in _HEX_DIGITS for byte in data[:40])
+
+
+def _git_discovery(cwd: Optional[Union[str, Path]]) -> Tuple[List[Path], Optional[Path]]:
+    """(every git directory and common directory git may use for a command run in ``cwd``,
+    the common directory of the repository git uses there, None outside one).
+
+    Mirrors git's discovery by reading files, never by running git with the
+    repository's configuration: at ``cwd`` and then each parent, a ``.git`` file
+    names the repository (git uses it or refuses to run), a valid ``.git``
+    directory is the repository, and otherwise the directory itself may be an
+    implicit bare repository; each with the common directory its ``commondir``
+    names. A candidate git would pass over may be listed, one git would use never
+    is missed. Raises OSError where git itself cannot read the layout (a .git file
+    or commondir it cannot read): the caller refuses to run git.
+    """
+    start = Path(os.path.realpath(cwd if cwd else os.getcwd()))
+    found: List[Path] = []
+    for level in (start, *start.parents):
+        dot_git = level / ".git"
+        try:
+            mode = os.stat(_fs_path(dot_git)).st_mode
+        except OSError:
+            mode = 0  # git treats every stat failure as no .git at this level
+        if stat.S_ISREG(mode):
+            target = _gitfile_target(dot_git)
+            if target is None:
+                return found, None
+            common_dir = _git_common_dir(target)
+            return found + [target, common_dir], common_dir
+        candidates = [level]
+        if stat.S_ISDIR(mode):
+            found.append(dot_git)
+            candidates.insert(0, dot_git)
+        for git_dir in candidates:
+            if _valid_git_head(git_dir / "HEAD"):
+                common_dir = _git_common_dir(git_dir)
+                found += [git_dir, common_dir]
+                if all(os.access(_fs_path(common_dir / name), os.X_OK) for name in ("objects", "refs")):
+                    return found, common_dir
+    return found, None
+
+
+def _git_metadata_dirs(cwd: Optional[Union[str, Path]]) -> List[Path]:
+    """Every git directory and common directory git may use for a command run in ``cwd`` (_git_discovery)."""
+    return _git_discovery(cwd)[0]
+
+
+# git's own ctype (git-compat-util.h): only these four bytes are space.
+_GIT_SPACE = frozenset(b" \t\n\r")
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _git_config_entries(data: bytes) -> List[Tuple[bytes, Optional[bytes]]]:
+    """(name, value) of each entry of a git config file, as git's parser reads it (config.c,
+    git_parse_source): section and key lower-cased, a quoted subsection kept as written, value
+    None for a key without "=". Raises ValueError where git reports a bad config line."""
+    position = 0
+    at_end = False
+
+    def char() -> int:  # get_next_char: CRLF reads as LF, the end of the file as a final LF
+        nonlocal position, at_end
+        if position >= len(data):
+            at_end = True
+            return 0x0A
+        byte = data[position]
+        position += 1
+        if byte == 0x0D and data[position:position + 1] == b"\n":
+            position += 1
+            return 0x0A
+        return byte
+
+    def is_alpha(byte: int) -> bool:
+        return 0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A
+
+    def is_key(byte: int) -> bool:
+        return is_alpha(byte) or 0x30 <= byte <= 0x39 or byte == 0x2D
+
+    def lower(byte: int) -> int:
+        return byte | 0x20 if 0x41 <= byte <= 0x5A else byte
+
+    def section() -> bytes:  # get_base_var and get_extended_base_var
+        name = bytearray()
+        while True:
+            byte = char()
+            if at_end:
+                raise ValueError("unterminated section header")
+            if byte == 0x5D:  # ]
+                return bytes(name)
+            if byte in _GIT_SPACE:
+                break
+            if not (is_key(byte) or byte == 0x2E):
+                raise ValueError("bad section name")
+            name.append(lower(byte))
+        while byte in _GIT_SPACE:
+            if byte == 0x0A:
+                raise ValueError("incomplete section header")
+            byte = char()
+        if byte != 0x22:  # "
+            raise ValueError("bad section header")
+        name.append(0x2E)
+        while True:
+            byte = char()
+            if byte == 0x0A:
+                raise ValueError("incomplete section header")
+            if byte == 0x22:
+                break
+            if byte == 0x5C:  # \
+                byte = char()
+                if byte == 0x0A:
+                    raise ValueError("incomplete section header")
+            name.append(byte)
+        if char() != 0x5D:
+            raise ValueError("bad section header")
+        return bytes(name)
+
+    def value() -> bytes:  # parse_value
+        quoted = comment = False
+        trim = 0
+        result = bytearray()
+        while True:
+            byte = char()
+            if byte == 0x0A:
+                if quoted:
+                    raise ValueError("unterminated quote")
+                return bytes(result[:trim] if trim else result)
+            if comment:
+                continue
+            if byte in _GIT_SPACE and not quoted:
+                trim = trim or len(result)
+                if result:
+                    result.append(byte)
+                continue
+            if not quoted and byte in (0x23, 0x3B):  # # ;
+                comment = True
+                continue
+            trim = 0
+            if byte == 0x5C:
+                byte = {0x0A: None, 0x74: 0x09, 0x62: 0x08, 0x6E: 0x0A, 0x5C: 0x5C, 0x22: 0x22}.get(char(), -1)
+                if byte == -1:
+                    raise ValueError("bad escape")
+                if byte is not None:
+                    result.append(byte)
+                continue
+            if byte == 0x22:
+                quoted = not quoted
+                continue
+            result.append(byte)
+
+    entries: List[Tuple[bytes, Optional[bytes]]] = []
+    prefix = b""
+    bom: Optional[int] = 0
+    comment = False
+    while True:
+        byte = char()
+        if bom is not None and bom < len(_UTF8_BOM):
+            if not at_end and byte == _UTF8_BOM[bom]:
+                bom += 1
+                continue
+            if bom:
+                raise ValueError("partial byte order mark")
+            bom = None
+        if byte == 0x0A:
+            if at_end:
+                return entries
+            comment = False
+            continue
+        if comment or byte in _GIT_SPACE:
+            continue
+        if byte in (0x23, 0x3B):
+            comment = True
+            continue
+        if byte == 0x5B:  # [
+            name = section()
+            if not name:
+                raise ValueError("empty section name")
+            prefix = name + b"."
+            continue
+        if not is_alpha(byte):
+            raise ValueError("bad key")
+        key = bytearray([lower(byte)])
+        while True:  # get_value
+            byte = char()
+            if at_end or not is_key(byte):
+                break
+            key.append(lower(byte))
+        while byte in (0x20, 0x09):
+            byte = char()
+        if byte == 0x0A:
+            entries.append((prefix + bytes(key), None))
+        elif byte == 0x3D:  # =
+            entries.append((prefix + bytes(key), value()))
+        else:
+            raise ValueError("bad key")
+
+
+def _object_format(common_dir: Path) -> str:
+    """The object format of the repository whose common directory is ``common_dir``.
+
+    Read as git's repository-format check reads it: extensions.objectFormat of the
+    common directory's config (no include is followed), sha1 without one. Raises
+    OSError where git refuses the repository: a config it cannot read or parse, or
+    a value that names no object format (a NUL ends it, as git's C string does).
+    """
+    config_file = common_dir / "config"
+    try:
+        data = _read_git_pointer(config_file, _GIT_CONFIG_MAX_BYTES)
+    except FileNotFoundError:
+        return "sha1"
+    try:
+        values = [entry for name, entry in _git_config_entries(data) if name == b"extensions.objectformat"]
+    except ValueError as exc:
+        raise OSError(errno.EINVAL, f"bad config ({exc})", str(config_file)) from None
+    formats = [entry.split(b"\0", 1)[0].decode("ascii", "replace") if entry is not None else None for entry in values]
+    if any(name not in _EMPTY_TREE_OIDS for name in formats):
+        raise OSError(errno.EINVAL, "extensions.objectFormat names no object format", str(config_file))
+    return formats[-1] if formats else "sha1"
+
+
+def _empty_tree(common_dir: Optional[Path]) -> str:
+    """The empty tree's id in the repository of ``common_dir`` (SHA-1 outside a repository)."""
+    return _EMPTY_TREE_OIDS[_object_format(common_dir) if common_dir is not None else "sha1"]
+
+
+def empty_tree_oid(cwd: Optional[Union[str, Path]]) -> str:
+    """The empty tree's object id in the repository git uses for a command run in ``cwd``.
+
+    Read from files (_git_discovery, _object_format), never by running git; raises
+    OSError where git cannot read that repository either.
+    """
+    return _empty_tree(_git_discovery(cwd)[1])
+
+
 def _get_git_info_attributes_paths(cwd: Optional[Union[str, Path]]) -> List[Path]:
+    """The info/attributes files to shield for a git command run in ``cwd``.
+
+    --attr-source does not override them. Raises OSError when the repository
+    layout cannot be read; run_git_cmd then refuses the command.
+    """
+    return _attributes_to_shield(_git_metadata_dirs(cwd))
+
+
+def _attributes_to_shield(metadata_dirs: List[Path]) -> List[Path]:
+    """The info/attributes file of each of metadata_dirs (_git_discovery) there is to shield."""
     paths: List[Path] = []
     seen_dirs = set()
-    try:
-        p = Path(cwd).resolve() if cwd else Path.cwd().resolve()
-        for cur in [p] + list(p.parents):
-            gp = cur / ".git"
-            git_dirs: List[Path] = []
-            if _fs_path(gp).is_dir():
-                git_dirs.append(gp)
-            elif _fs_path(gp).is_file():
-                try:
-                    txt = _fs_path(gp).read_text(encoding="utf-8").strip()
-                    if txt.startswith("gitdir:"):
-                        gd = Path(txt[7:].strip())
-                        if not gd.is_absolute():
-                            gd = (gp.parent / gd).resolve()
-                        git_dirs.append(gd)
-                        commondir_file = gd / "commondir"
-                        if _fs_path(commondir_file).exists():
-                            cd_txt = _fs_path(commondir_file).read_text(encoding="utf-8").strip()
-                            cd_path = Path(cd_txt)
-                            if not cd_path.is_absolute():
-                                cd_path = (gd / cd_path).resolve()
-                            git_dirs.append(cd_path)
-                except Exception:
-                    pass
-            for gdir in git_dirs:
-                try:
-                    resolved_dir = gdir.resolve()
-                except Exception:
-                    resolved_dir = gdir
-                if resolved_dir not in seen_dirs:
-                    seen_dirs.add(resolved_dir)
-                    info_dir = _fs_path(resolved_dir / "info")
-                    ia = info_dir / "attributes"
-                    gate_file = info_dir / "attributes.mw_gate"
-                    needs_shield = False
-                    if ia.exists() or gate_file.exists():
-                        needs_shield = True
-                    elif info_dir.is_dir():
-                        try:
-                            if any(info_dir.glob("attributes.*shield_*")):
-                                needs_shield = True
-                        except Exception:
-                            pass
-                    if needs_shield:
-                        paths.append(ia)
-            if _fs_path(gp).exists():
-                break
-    except Exception:
-        pass
+    for gdir in metadata_dirs:
+        try:
+            resolved_dir = gdir.resolve()
+        except (OSError, RuntimeError):
+            resolved_dir = gdir
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+        info_dir = _fs_path(resolved_dir / "info")
+        ia = info_dir / "attributes"
+        gate_file = info_dir / "attributes.mw_gate"
+        try:
+            needs_shield = (ia.exists() or gate_file.exists()
+                            or (info_dir.is_dir() and any(info_dir.glob("attributes.*shield_*"))))
+        except OSError:
+            needs_shield = False  # a file makewand cannot look up, git cannot read either
+        if needs_shield:
+            paths.append(ia)
     return paths
+
+
+def _disabled_filter_drivers(git_command: List[str], cwd, env: Dict[str, str], timeout) -> List[Tuple[str, str]]:
+    """Command-scope settings disabling every filter driver git's configuration defines for a
+    command that starts with git_command (git and its global options) in cwd with env.
+
+    run_git_cmd lists them with the attributes shield already in place, right before git
+    starts. A process that writes the repository's configuration at that very moment can still
+    add a driver between this listing and git's own read: git has no setting that disables
+    every filter driver whatever its name. Raises OSError when git cannot list the
+    configuration; the caller refuses the command.
+    """
+    try:
+        listing = subprocess.run([*git_command, "config", "--null", "--name-only", "--get-regexp", r"^(filter|merge)\."],
+                                 cwd=cwd, env=env, capture_output=True, timeout=timeout)
+    except subprocess.SubprocessError as exc:
+        raise OSError(f"Cannot list Git filter drivers: {exc}") from exc
+    if listing.returncode == 1:  # no filter or merge setting at all
+        return _filter_driver_settings(b"")
+    if listing.returncode != 0:
+        raise OSError(f"Cannot list Git filter drivers: {os.fsdecode(listing.stderr).strip()}")
+    return _filter_driver_settings(listing.stdout)
+
+
+def _filter_driver_settings(listing: bytes) -> List[Tuple[str, str]]:
+    """The settings disabling each driver a NUL-separated ``git config --name-only`` listing of
+    filter/merge keys names; an empty filter name is a driver too (``filter=``).
+    The default merge name is chosen outside all configured driver names so it
+    selects Git's built-in text merge. delivery.py builds the same standalone."""
+    names: Dict[str, None] = {}
+    for key in listing.split(b"\0"):
+        name, dot, _ = key[len(b"filter."):].rpartition(b".")
+        if key.startswith(b"filter.") and dot:
+            names[os.fsdecode(name)] = None
+    settings = [(f"filter.{name}.{variable}", value) for name in names for variable, value in _DISABLED_FILTER_DRIVER]
+    merge_names = set()
+    for key in listing.split(b"\0"):
+        name, dot, _ = key[len(b"merge."):].rpartition(b".")
+        if key.startswith(b"merge.") and dot:
+            merge_names.add(os.fsdecode(name))
+    # User drivers shadow even "text" and "binary". An unconfigured name
+    # falls back to Git's built-in text merge (merge-ll.c:find_ll_merge_driver).
+    for index in range(len(merge_names) + 1):
+        default = "makewand_builtin_text_" + str(index)
+        if default not in merge_names:
+            break
+    return settings + [("merge.default", default)]
+
+
+def _config_environment(settings: List[Tuple[str, str]]) -> Dict[str, str]:
+    """GIT_CONFIG_COUNT/KEY/VALUE for settings: unlike ``-c``, they carry a key holding ``=``
+    (a driver named "a=b"), and git hands them on to every git it starts."""
+    environment = {"GIT_CONFIG_COUNT": str(len(settings))}
+    for index, (key, value) in enumerate(settings):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
 
 def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout=None):
     shielded_infos: List[Tuple[Any, ...]] = []
@@ -316,18 +716,42 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                     cmd = shlex.split(cmd)
 
         process_cwd = filesystem_path(cwd) if cwd is not None else None
-        safe_git = resolve_safe_git_binary(cwd=process_cwd)
-        if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "git" and safe:
-            subcmd = cmd[1] if len(cmd) > 1 else ""
+        # The resolver walks logical workspace paths. process_cwd is already
+        # an extended Win32 API path and must never be converted a second time.
+        safe_git = resolve_safe_git_binary(cwd=cwd)
+        hardened = isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "git" and safe
+        sub_index = _git_subcommand_index(cmd) if hardened else None
+        subcommand = cmd[sub_index] if sub_index is not None else None
+        if hardened:
+            _refuse_redirecting_options(cmd, sub_index)
+        if safe:
+            # S01: one discovery, by reading files, names every git and common directory whose
+            # info/attributes is shielded (any layout, commondir included) and the object format
+            # of the repository git uses, which the empty-tree attribute source must match.
+            try:
+                metadata_dirs, common_dir = _git_discovery(cwd)
+                ia_targets = sorted(_attributes_to_shield(metadata_dirs), key=lambda p: str(p.resolve()))
+                attr_source = "--attr-source=" + _empty_tree(common_dir) if hardened else ""
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise OSError(f"Cannot shield Git attributes: {exc}") from exc
+        if hardened:
             extra_global = ["--no-pager"]
-            if subcmd not in ["apply", "clone"]:
-                extra_global.append("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+            if subcommand == "apply":
+                # git (2.55) segfaults on worktree-mode apply, --check included, under
+                # any attribute source: it reads the preimage through convert_to_git
+                # without an index. Outside a repository --attr-source makes every
+                # apply die. Only the index modes take one; every apply runs with each
+                # configured filter driver disabled, whichever attribute selects it.
+                if _APPLY_INDEX_OPTIONS.intersection(cmd[sub_index + 1:]):
+                    extra_global.append(attr_source)
+            elif subcommand != "clone":
+                extra_global.append(attr_source)
             exec_cmd = [safe_git] + extra_global + SAFE_GIT_SECURITY_FLAGS + cmd[1:]
-            sub_index = _git_subcommand_index(cmd)
-            if sub_index is not None and cmd[sub_index] == "diff":
+            subcommand_flags = _SUBCOMMAND_FLAGS.get(subcommand, ())
+            if subcommand_flags:
                 # Also after global options (``git --no-replace-objects diff``).
                 position = len(exec_cmd) - len(cmd) + sub_index + 1
-                exec_cmd[position:position] = [flag for flag in DIFF_FORMAT_FLAGS if flag not in cmd]
+                exec_cmd[position:position] = [flag for flag in subcommand_flags if flag not in cmd]
             use_shell = False
         elif not use_shell:
             exec_cmd = cmd
@@ -345,9 +769,8 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
             if _diff_index.get() is not None:
                 git_env["GIT_INDEX_FILE"] = _diff_index.get()
 
-            # S01: Temporarily shield .git/info/attributes across both primary and linked worktrees.
-            # Use deterministic sorting and attributes.lock file locking to avoid multi-session collisions.
-            ia_targets = sorted(_get_git_info_attributes_paths(cwd), key=lambda p: str(p.resolve()))
+            # Shield in a deterministic order, with attributes.mw_gate file locks so that
+            # concurrent sessions do not collide.
             for ia_target in ia_targets:
                 info_dir = ia_target.parent
                 try:
@@ -428,6 +851,13 @@ def run_git_cmd(cmd, cwd=None, input_data=None, binary=False, safe=True, timeout
                         lock_handle.close()
                     except Exception:
                         pass
+            if hardened:
+                settings = list(_SUBMODULE_BARRIER)
+                if subcommand == "apply":
+                    # Listed under the shield, in the same context and as late as possible.
+                    settings += _disabled_filter_drivers([safe_git, "--no-pager", *SAFE_GIT_SECURITY_FLAGS,
+                                                          *cmd[1:sub_index]], process_cwd, git_env, timeout)
+                git_env.update(_config_environment(settings))
 
         # Git emits UTF-8 text independently of the Windows ANSI code page.
         # Preserve undecodable bytes rather than crashing a pipe reader; binary
@@ -604,11 +1034,11 @@ def init_git_baseline(cwd: str, ephemeral: bool = False) -> Tuple[bool, Optional
         except OSError as exc:
             cleanup_err = _remove_git_dir(git_dir)
             return False, f"无法写入临时仓库标记: {exc}" + (f"；{cleanup_err}" if cleanup_err else "")
-    for cmd, label in [
-        (["git", "add", "-A"], "git add -A"),
-        (["git", "commit", "-q", "--no-verify", "-m", EPHEMERAL_BASELINE_SUBJECT, "--allow-empty"], "git commit"),
-    ]:
-        code, _, err = run_git_cmd(cmd, cwd=str(resolved))
+    for label, step in (("git add -A", lambda: add_all(str(resolved))),
+                        ("git commit", lambda: run_git_cmd(["git", "commit", "-q", "--no-verify", "-m",
+                                                            EPHEMERAL_BASELINE_SUBJECT, "--allow-empty"],
+                                                           cwd=str(resolved)))):
+        code, _, err = step()
         if code != 0:
             cleanup_err = _remove_git_dir(git_dir)
             return False, (f"{label} 失败 (rc={code})，无法建立完整基线: {(err or '').strip()[:300]}"
@@ -638,19 +1068,8 @@ def get_submodule_paths(repo_dir: str) -> List[str]:
     if not gitmodules.exists():
         return []
 
-    paths = []
     # 1. Read .gitmodules paths via git config (preserves spaces in path values)
-    code, out, error = run_git_cmd(["git", "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], cwd=str(r_path))
-    if code not in (0, 1):
-        raise OSError(f"Cannot read Git submodule configuration: {error}")
-    if code == 0 and out:
-        for line in out.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                paths.append(parts[1].strip())
+    paths = _gitmodules_paths(r_path)
 
     # 2. Also parse git submodule status --recursive with regex to capture nested submodules
     st_code, st_out, error = run_git_cmd(["git", "submodule", "status", "--recursive"], cwd=str(r_path))
@@ -665,6 +1084,173 @@ def get_submodule_paths(repo_dir: str) -> List[str]:
 
     # Sort descending by directory depth so nested submodules appear first
     return sorted(list(dict.fromkeys(paths)), key=lambda s: len(Path(s).parts), reverse=True)
+
+
+def _gitmodules_paths(repo_dir: Union[str, Path]) -> List[str]:
+    """The submodule paths repo_dir/.gitmodules registers, as written there (git config --file,
+    which follows no include). Raises OSError when git cannot read the file."""
+    # -z: a record is "key\nvalue\0", and a submodule name or path may hold any whitespace.
+    code, out, error = run_git_cmd(["git", "config", "-z", "--file", ".gitmodules", "--get-regexp",
+                                    r"^submodule\..*\.path$"], cwd=str(repo_dir), binary=True)
+    if code not in (0, 1):
+        raise OSError(f"Cannot read Git submodule configuration: {_text(error)}")
+    paths = []
+    for record in out.split(b"\0") if code == 0 else ():
+        _, newline, value = record.partition(b"\n")
+        if newline and value:
+            paths.append(os.fsdecode(value))
+    return paths
+
+
+def _text(output: Union[str, bytes]) -> str:
+    """run_git_cmd output as its text mode decodes it (a bytes input_data makes it bytes)."""
+    return output.decode("utf-8", "surrogateescape") if isinstance(output, bytes) else output
+
+
+def _index_gitlink_entries(cwd: Union[str, Path]) -> Tuple[int, Dict[bytes, bool], str]:
+    """(code, {root-relative path: flagged} of the gitlinks in the index git uses in cwd, error),
+    flagged when the entry is marked assume-unchanged or skip-worktree: the private diff index
+    inside _read_workspace_diff."""
+    code, listing, error = run_git_cmd(["git", "ls-files", "-z", "-v", "--stage", "--full-name", "--", ":(top)"],
+                                       cwd=str(cwd), binary=True)
+    if code != 0:
+        return code, {}, _text(error)
+    gitlinks: Dict[bytes, bool] = {}
+    for record in listing.split(b"\0"):
+        meta, tab, name = record.partition(b"\t")
+        tag, _, stage = meta.partition(b" ")
+        if tab and stage.startswith(b"160000 "):
+            # ls-files -v: a lower-case tag is assume-unchanged, S skip-worktree.
+            gitlinks[name] = gitlinks.get(name, False) or tag.islower() or tag.upper() == b"S"
+    return 0, gitlinks, ""
+
+
+def _index_gitlinks(cwd: Union[str, Path]) -> Tuple[int, List[bytes], str]:
+    """(code, root-relative paths of the gitlinks in the index git uses in cwd, error)."""
+    code, gitlinks, error = _index_gitlink_entries(cwd)
+    return code, list(gitlinks), error
+
+
+def _behind_symlink(root: Union[str, Path], name: bytes) -> bool:
+    """Whether a directory above root-relative name is a symlink or a junction, checked from
+    the top down so that no check follows one."""
+    parts = PurePosixPath(os.fsdecode(name)).parts[:-1]
+    for depth in range(1, len(parts) + 1):
+        parent = Path(root, *parts[:depth])
+        if os.path.islink(parent) or _is_reparse_path(parent):
+            return True
+    return False
+
+
+def add_all(cwd: Union[str, Path], intent_to_add: bool = False) -> Tuple[int, str, str]:
+    """``git add -A`` (``--intent-to-add`` for a diff index) that never starts a command inside a
+    nested repository; returns (code, stdout, stderr) like run_git_cmd.
+
+    For a gitlink whose submodule HEAD matches the index, git add -A runs ``git status`` in the
+    nested repository to learn whether it is dirty: a child that reads that repository's own
+    config and info/attributes and can run a filter driver on the host, and that no setting
+    keeps away (git add reads no diff.ignoreSubmodules). So the gitlinks are marked
+    assume-unchanged for the add, which then never looks at them, and unmarked after it.
+    Exclude pathspecs would do the same, but git add refuses them once a directory above a
+    gitlink is ignored or a symlink, where plain git add -A succeeds.
+
+    Unless intent_to_add, the gitlinks are then brought up to date by ``git update-index``,
+    which reads only each nested HEAD: a moved HEAD is staged, a removed path drops out and a
+    path that is now a file is staged as one, as git add -A would; one behind a symlink is
+    dropped without being looked at, as git add -A drops it. A diff index keeps them as they
+    are: git diff compares a gitlink with its nested HEAD itself. A gitlink the user marked
+    assume-unchanged or skip-worktree is left alone, as git add -A leaves it.
+    """
+    add = ["git", "add", "-A"] + (["--intent-to-add"] if intent_to_add else [])
+    code, entries, error = _index_gitlink_entries(cwd)
+    if code != 0:
+        return code, "", error
+    gitlinks = [name for name, flagged in entries.items() if not flagged]
+    if not gitlinks:
+        return run_git_cmd(add, cwd=str(cwd))
+    # update-index takes paths, not pathspecs: from the top of the work tree.
+    code, top, error = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=str(cwd))
+    if code != 0:
+        return code, "", error
+    root = top.rstrip("\n")
+
+    def update_index(options, names):
+        if not names:
+            return 0, b"", b""
+        return run_git_cmd(["git", "update-index", *options, "-z", "--stdin"], cwd=root,
+                           input_data=b"".join(name + b"\0" for name in names))
+
+    code, out, error = update_index(["--assume-unchanged"], gitlinks)
+    if code != 0:
+        return code, _text(out), _text(error)
+    present: List[bytes] = []
+    try:
+        code, out, error = run_git_cmd(add, cwd=str(cwd))
+    finally:
+        # The add may have replaced a gitlink (a directory above it is now a file or a link).
+        list_code, after, list_error = _index_gitlink_entries(root)
+        if list_code == 0:
+            present = [name for name in gitlinks if name in after]
+            list_code, list_out, list_error = update_index(["--no-assume-unchanged"], present)
+        if list_code != 0 and code == 0:
+            code, out, error = list_code, "", list_error
+    if code == 0 and not intent_to_add:
+        behind = [name for name in present if _behind_symlink(root, name)]
+        code, out, error = update_index(["--force-remove"], behind)
+        if code == 0:
+            code, out, error = update_index(["--remove"], [name for name in present if name not in behind])
+    return code, _text(out), _text(error)
+
+
+def dirty_submodule_paths(cwd: Union[str, Path]) -> List[str]:
+    """Root-relative paths of the gitlinks git status once reported for their submodule's content.
+
+    Host git status and git add no longer run `git status` inside a nested repository
+    (_SUBMODULE_BARRIER, STATUS_FLAGS, add_all), so every checked-out submodule that .gitmodules
+    registers for a gitlink of the index is asked itself, through run_git_cmd: with that
+    repository's own attributes shield and attribute source. It is dirty with a change or an
+    untracked file, or with such a submodule of its own that is dirty; the path reported is the
+    gitlink of cwd's repository that contains it, as git status reported it. A nested repository
+    .gitmodules does not register is not asked, nor one outside the work tree or behind a
+    symlink, and no submodule.<name>.ignore hides one. Raises OSError when git cannot read a
+    status or a registration.
+    """
+    code, top, error = run_git_cmd(["git", "rev-parse", "--show-toplevel"], cwd=str(cwd))
+    if code != 0 or not top.strip():
+        raise OSError(_printable(f"Cannot find the Git work tree of {cwd}: {(error or '').strip()[:200]}"))
+    return sorted(_dirty_registered_gitlinks(Path(top.rstrip("\n")), set()))
+
+
+def _dirty_registered_gitlinks(repo: Path, visited: set) -> List[str]:
+    """dirty_submodule_paths for the repository at repo, its paths relative to repo."""
+    if not (repo / ".gitmodules").is_file():
+        return []
+    code, gitlinks, error = _index_gitlinks(repo)
+    if code != 0:
+        raise OSError(_printable(f"Cannot list the Git index of {repo}: {error.strip()[:200]}"))
+    tracked = {os.fsdecode(name) for name in gitlinks}
+    dirty = []
+    for registered in _gitmodules_paths(repo):
+        path = PurePosixPath(registered)
+        rel = str(path)
+        # git never writes such a path to an index, but reads one from a planted index.
+        if path.is_absolute() or ".." in path.parts or rel not in tracked or rel in dirty:
+            continue
+        directory = repo / rel
+        real = os.path.realpath(directory)
+        if (real in visited or os.path.islink(directory) or _is_reparse_path(directory)
+                or _behind_symlink(repo, os.fsencode(rel)) or not (directory / ".git").exists()):
+            continue  # not checked out, or behind a symlink: git status never looked inside either
+        visited.add(real)
+        code, out, error = run_git_cmd(["git", "status", "--porcelain", "-z", "--untracked-files=normal"],
+                                       cwd=str(directory), binary=True)
+        if code != 0:
+            raise OSError(_printable(f"Cannot read the Git status of submodule {directory}: "
+                                     f"{_text(error).strip()[:200]}"))
+        if out.strip(b"\0") or _dirty_registered_gitlinks(directory, visited):
+            dirty.append(rel)
+    return dirty
+
 
 def _resolve_diff_head(cwd):
     code, head, error = run_git_cmd(["git", "rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
@@ -710,17 +1296,14 @@ def _read_workspace_diff(cwd, base_rev=None, arguments=(), binary=False):
                 code, _, error = run_git_cmd(seed, cwd=cwd)
                 if code != 0:
                     return empty, _printable(f"git read-tree failed with exit code {code}: {error.strip()}")
-                add = ["git", "add", "-A"]
-                if ref:
-                    add.append("--intent-to-add")
-                code, _, error = run_git_cmd(add, cwd=cwd)
+                code, _, error = add_all(cwd, intent_to_add=bool(ref))
                 if code != 0:
                     return empty, _printable(f"git add failed with exit code {code}: {error.strip()}")
                 command = ["git", "diff", *arguments]
                 if ref:
                     command.append(ref)
                 else:
-                    command.extend(["--cached", "4b825dc642cb6eb9a060e54bf8d69288fbee4904"])
+                    command.extend(["--cached", empty_tree_oid(cwd)])
                 code, output, error = run_git_cmd(command, cwd=cwd, binary=binary)
                 if code != 0:
                     if isinstance(error, bytes):
@@ -795,16 +1378,22 @@ def get_git_diff(cwd: str, base_rev: Optional[str] = None, sub_baselines: Option
 
 def git_status_paths(cwd: Union[str, Path]) -> Optional[List[str]]:
     """The paths `git status` reports in cwd (modified, staged, deleted, untracked - each
-    untracked file on its own), in git's order; None when git status cannot run there
-    (outside a work tree). The one parser of the user's dirty files: NUL-separated entries
-    are never quoted (core.quotePath) and, without rename pairs (--no-renames: a rename is
-    its deletion and its addition), each one is "XY <path>"; names are taken byte-exact
-    (os.fsdecode), spaces and undecodable bytes included."""
+    untracked file on its own), in git's order, then each registered submodule with changed
+    content (dirty_submodule_paths); None when git status cannot run there (outside a work
+    tree) or cannot read such a submodule. The one parser of the user's dirty files:
+    NUL-separated entries are never quoted (core.quotePath) and, without rename pairs
+    (--no-renames: a rename is its deletion and its addition), each one is "XY <path>";
+    names are taken byte-exact (os.fsdecode), spaces and undecodable bytes included."""
     code, out, _ = run_git_cmd(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
                                cwd=str(cwd), binary=True)
     if code != 0 or out is None:
         return None
-    return list(dict.fromkeys(os.fsdecode(token[3:]) for token in out.split(b"\0") if len(token) > 3))
+    paths = list(dict.fromkeys(os.fsdecode(token[3:]) for token in out.split(b"\0") if len(token) > 3))
+    try:
+        submodules = dirty_submodule_paths(cwd)
+    except OSError:
+        return None  # git status, which used to enter them, failed there too
+    return paths + [path for path in submodules if path not in paths]
 
 
 def get_dirty_files(cwd: Optional[Union[str, Path]] = None) -> List[str]:
@@ -860,16 +1449,7 @@ def list_workspace_copy_paths(src_dir: Union[str, Path]) -> List[str]:
     if find_git_root(src):
         code, out, err = run_git_cmd(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=str(src), binary=True)
     else:
-        probe = tempfile.mkdtemp(prefix="makewand-ignore-probe-")
-        try:
-            code, _, err = run_git_cmd(["git", "init", "-q", probe])
-            if code == 0:
-                code, out, err = run_git_cmd([
-                    "git", f"--git-dir={os.path.join(probe, '.git')}", f"--work-tree={src}",
-                    "ls-files", "-z", "--others", "--exclude-standard",
-                ], cwd=str(src), binary=True)
-        finally:
-            shutil.rmtree(probe, ignore_errors=True)
+        code, out, err = _probe_listing(src, ["ls-files", "-z", "--others", "--exclude-standard"])
     if code != 0:
         detail = os.fsdecode(err).strip() if isinstance(err, bytes) else str(err or "").strip()
         raise OSError(_printable(f"无法按 .gitignore 规则枚举工作区文件 (rc={code}): {detail[:200]}"))
@@ -888,17 +1468,30 @@ def list_workspace_ignored_paths(src_dir: Union[str, Path]) -> Optional[set]:
     if find_git_root(src):
         code, out, _ = run_git_cmd(["git", *listing], cwd=str(src), binary=True)
     else:
-        probe = tempfile.mkdtemp(prefix="makewand-ignore-probe-")
-        try:
-            code, _, _ = run_git_cmd(["git", "init", "-q", probe])
-            if code == 0:
-                code, out, _ = run_git_cmd(["git", f"--git-dir={os.path.join(probe, '.git')}", f"--work-tree={src}",
-                                            *listing], cwd=str(src), binary=True)
-        finally:
-            shutil.rmtree(probe, ignore_errors=True)
+        code, out, _ = _probe_listing(src, listing)
     if code != 0:
         return None
     return {os.fsdecode(name) for name in out.split(b"\0") if name}
+
+
+def _probe_listing(src: Path, listing: List[str]) -> Tuple[int, Any, Any]:
+    """``git <listing>`` (bytes) for the plain directory src through a throw-away repository
+    outside it whose core.worktree is src. The probe is the cwd, never --git-dir/--work-tree:
+    run_git_cmd shields and neutralises the repository its cwd names. Executable
+    resolution must also exclude src, even though the commands run outside it."""
+    workspace = _git_workspace_root(src)
+    probe = tempfile.mkdtemp(prefix="makewand-ignore-probe-")
+    token = _git_binary_exclusions.set((*_git_binary_exclusions.get(), workspace))
+    try:
+        code, out, err = run_git_cmd(["git", "init", "-q"], cwd=probe)
+        if code == 0:
+            code, out, err = run_git_cmd(["git", "config", "core.worktree", str(src)], cwd=probe)
+        if code == 0:
+            code, out, err = run_git_cmd(["git", *listing], cwd=probe, binary=True)
+        return code, out, err
+    finally:
+        _git_binary_exclusions.reset(token)
+        shutil.rmtree(probe, ignore_errors=True)
 
 
 _REFLINK_SUPPORTED: Optional[bool] = None
@@ -1099,7 +1692,7 @@ def clone_isolated_worktree(src_dir: str, target_dir: Path):
                     ["git", "config", "user.name", "Makewand"],
                     ["git", "config", "user.email", "makewand@local"],
                     ["git", "add", "-A"]):
-            code, _, err = run_git_cmd(cmd, cwd=str(target_dir))
+            code, _, err = add_all(target_dir) if cmd[1] == "add" else run_git_cmd(cmd, cwd=str(target_dir))
             if code != 0:
                 raise OSError(_printable(f"隔离副本基线建立失败 ({' '.join(cmd[1:3])}, rc={code}): {(err or '').strip()[:200]}"))
             if cmd[1] == "init":
@@ -1250,7 +1843,8 @@ def check_working_tree_isolation(target_dir: str):
                                                        cwd=str(target_path))
             if code != 0:
                 return False, _printable(f"无法读取工作区 {target_dir} 的 git 状态 (rc={code}: {(status_err or '').strip()[:120]})，按不安全处理")
-            if status_out and status_out.strip():
+            # git status no longer enters a submodule: a registered one is asked itself.
+            if (status_out and status_out.strip()) or dirty_submodule_paths(target_path):
                 return False, _printable(f"工作区 {target_dir} 存在未提交的代码修改 (Dirty Working Tree)")
     except Exception as exc:
         return False, _printable(f"工作区隔离检查异常 ({exc})，按不安全处理")
@@ -1440,6 +2034,8 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow", repo
                 shutil.rmtree(worktree_dir, ignore_errors=True)
 
             co_target = repo_head_hash if repo_head_hash else "HEAD"
+            # The clone checked nothing out (_CLONE_FLAGS): this checkout writes every file,
+            # with the clone's own attributes shield and empty-tree attribute source.
             co_code, _, co_err = run_git_cmd(["git", "checkout", "-q", "-b", branch_name, co_target], cwd=str(worktree_dir))
             if co_code != 0:
                 print(c(_printable(f"❌ [Makewand Guard] 影子分支检出失败 (rc={co_code}: {(co_err or '').strip()[:160]})，拒绝残缺快照。"), COLOR_RED), file=sys.stderr)
@@ -1470,7 +2066,9 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow", repo
                         if sc_code == 0 and sc_out.strip():
                             target_sub_commit = sc_out.strip()
                             run_git_cmd(["git", "fetch", str(src_sub.resolve()), target_sub_commit], cwd=str(dst_sub))
-                            co_code, _, co_err = run_git_cmd(["git", "checkout", target_sub_commit], cwd=str(dst_sub))
+                            # -q: the report of local changes after the switch runs `git status` inside
+                            # a nested submodule the shadow has just initialized (.gitmodules "ignore = none").
+                            co_code, _, co_err = run_git_cmd(["git", "checkout", "-q", target_sub_commit], cwd=str(dst_sub))
                             if co_code != 0:
                                 import sys
                                 print(c(_printable(f"❌ [Makewand Guard] 子模块 {sub_rel} 检出失败 ({co_err})，拒绝残缺快照。"), COLOR_RED), file=sys.stderr)
@@ -1554,7 +2152,7 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow", repo
                         sanitize_shadow_symlinks(dst_sub, src_sub)
 
                         # 4. Commit submodule dirty baseline inside dst_sub for all submodules
-                        a_sub_code, _, a_sub_err = run_git_cmd(["git", "add", "-A"], cwd=str(dst_sub))
+                        a_sub_code, _, a_sub_err = add_all(dst_sub)
                         if a_sub_code != 0:
                             import sys
                             print(c(_printable(f"❌ [Makewand Guard] 子模块 {sub_rel} 暂存失败 ({a_sub_err})，拒绝残缺快照。"), COLOR_RED), file=sys.stderr)
@@ -1664,7 +2262,7 @@ def create_ephemeral_shadow_worktree(base_dir: str, prefix: str = "shadow", repo
                 return None, None, None
 
             # 3. Stage and record baseline snapshot without modifying shared .git/config
-            add_code, _, _ = run_git_cmd(["git", "add", "-A"], cwd=str(worktree_dir))
+            add_code, _, _ = add_all(worktree_dir)
             if add_code != 0:
                 cleanup()
                 return None, None, None
@@ -1910,7 +2508,6 @@ class WorkspaceLock:
 # files from private backups, and reports success only after verification.
 # ---------------------------------------------------------------------------
 
-EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 # Pure dependency and regenerable cache directories: contents are skipped from file backup
 PURE_DEPENDENCY_OR_CACHE_DIRS = frozenset({
     "node_modules", "venv", ".venv", ".tox", "__pycache__", ".mypy_cache", ".pytest_cache",
@@ -2834,11 +3431,11 @@ def _export_workspace_patch(repo: str, base: Optional[str], target: Path,
                     return False, False, f"git read-tree 失败 (rc={code}): {err.strip()[:160]}"
                 missing = "补丁未包含新建的未跟踪文件"
                 if include_untracked:
-                    add_code, _, add_err = run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=repo)
+                    add_code, _, add_err = add_all(repo, intent_to_add=True)
                     missing = (f"git add 失败 (rc={add_code}: {add_err.strip()[:160]})，新建的未跟踪文件可能不在补丁中"
                                if add_code != 0 else None)
                 code, _, err = run_git_cmd(["git", "diff", *PATCH_EXPORT_FLAGS, f"--output={target}",
-                                            base or EMPTY_TREE_HASH], cwd=repo)
+                                            base or empty_tree_oid(repo)], cwd=repo)
                 if code != 0:
                     return False, False, f"git diff 失败 (rc={code}): {err.strip()[:160]}"
                 return True, missing is None, missing
@@ -3247,6 +3844,13 @@ class HostWorkspaceTransaction:
             if xy[:1] in (b"R", b"C") and index < len(tokens):
                 self.dirty_tracked.add(os.fsdecode(tokens[index]))
                 index += 1
+        try:
+            submodules = dirty_submodule_paths(self.root)
+        except OSError as exc:
+            return f"无法读取子模块的 git 状态，无法确认任务前基线，已在派发任何模型前中止: {exc}"
+        for path in submodules:  # git status reported each as a modified gitlink
+            self.initial_dirty = True
+            self.dirty_tracked.add(path)
         code, head, err = run_git_cmd(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=self.root)
         if code == 0 and head.strip():
             self.baseline_commit = head.strip()
@@ -3682,8 +4286,11 @@ class HostWorkspaceTransaction:
         paths = sorted(rel for rel in indexed if rel in self.pre and rel not in self.tracked)
         if not paths:
             return None
-        # Literal pathspecs: a file named "[ab].txt" must not also match a.txt and b.txt.
-        code, _, err = run_git_cmd(["git", "--literal-pathspecs", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
+        # Literal pathspecs: a file named "[ab].txt" must not also match a.txt and b.txt. -f skips
+        # git rm's up-to-date check, which runs `git status` inside a staged nested repository
+        # (its own config and info/attributes: a filter) and refuses a path whose staged content
+        # differs from both HEAD and the file; --cached leaves the work tree alone either way.
+        code, _, err = run_git_cmd(["git", "--literal-pathspecs", "rm", "-r", "-q", "-f", "--cached", "--ignore-unmatch",
                                     "--pathspec-from-file=-", "--pathspec-file-nul"],
                                    cwd=self.root, input_data=b"\0".join(os.fsencode(p) for p in paths))
         if code != 0:
@@ -3948,7 +4555,12 @@ class HostWorkspaceTransaction:
                 problems.append(f"无法核验 git 状态 (rc={code})")
             else:
                 # An untracked nested repository is listed as its directory ("tools/lib/").
-                dirty = sorted({os.fsdecode(t[3:]).rstrip("/") for t in status_out.split(b"\0") if len(t) > 3})
+                dirty_paths = {os.fsdecode(t[3:]).rstrip("/") for t in status_out.split(b"\0") if len(t) > 3}
+                try:
+                    dirty_paths.update(dirty_submodule_paths(root))
+                except OSError as exc:
+                    problems.append(f"无法核验子模块的 git 状态: {exc}")
+                dirty = sorted(dirty_paths)
                 expected = self.dirty_tracked | {rel for rel in self.pre if rel not in self.tracked}
                 unexpected = [p for p in dirty if p not in expected]
                 if unexpected:
@@ -4342,7 +4954,7 @@ class HostWorkspaceTransaction:
         self._finish(not problems, problems, notes, rollback=False)
 
     def _save_nongit_delivery(self, problems: List[str], notes: List[str]) -> None:
-        code, _, err = run_git_cmd(["git", "add", "-A", "--intent-to-add"], cwd=self.root)
+        code, _, err = add_all(self.root, intent_to_add=True)
         if code == 0:
             code, patch_bytes, err = run_git_cmd(["git", "diff", *PATCH_EXPORT_FLAGS, self.baseline_commit], cwd=self.root, binary=True)
         if code != 0:

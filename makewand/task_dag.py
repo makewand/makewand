@@ -556,10 +556,10 @@ class DagStaging:
     def checkpoint(self, task_id: str) -> None:
         """Commit a passed code stage inside the private copy without changing its content."""
         from makewand.artifact import workspace_snapshot
-        from makewand.git_helper import run_git_cmd
+        from makewand.git_helper import add_all, dirty_submodule_paths, run_git_cmd
         root = str(self.workspace)
         verified = workspace_snapshot(root)
-        code, _, error = run_git_cmd(["git", "add", "-A"], cwd=root)
+        code, _, error = add_all(root)
         if code:
             raise OSError(f"无法暂存阶段 {task_id} 的结果: {error}")
         unsupported = self._unsupported_entries("HEAD")
@@ -572,6 +572,8 @@ class DagStaging:
             if code:
                 raise OSError(f"无法提交阶段 {task_id} 的结果: {error}")
         code, status, error = run_git_cmd(["git", "status", "--porcelain"], cwd=root)
+        if code == 0 and not status.strip():
+            status = " ".join(dirty_submodule_paths(root))  # git status no longer enters a submodule
         if code or status.strip():
             raise OSError(f"阶段 {task_id} 提交后暂存区仍有未受控改动: {(status or error).strip()[:200]}")
         if workspace_snapshot(root) != verified:
@@ -767,7 +769,7 @@ class DagStaging:
         save_race re-checks the content manifest and freezes the application plan.
         """
         from makewand.candidate import CandidateManager
-        from makewand.git_helper import get_git_diff_status, run_git_cmd
+        from makewand.git_helper import dirty_submodule_paths, get_git_diff_status, run_git_cmd
         if not self.unchanged_since_last_checkpoint():
             raise OSError("DAG 暂存区内容与最后一次验收结果不一致，拒绝封存")
         # An interrupted or failed stage may leave HEAD or the index elsewhere;
@@ -776,6 +778,8 @@ class DagStaging:
         if code:
             raise OSError(f"无法恢复 DAG 暂存区的验收提交: {error}")
         code, status, error = run_git_cmd(["git", "status", "--porcelain"], cwd=str(self.workspace))
+        if code == 0 and not status.strip():
+            status = " ".join(dirty_submodule_paths(self.workspace))  # git status no longer enters a submodule
         if code or status.strip() or not self.unchanged_since_last_checkpoint() or self._content_drift(self.head_commit):
             raise OSError(f"DAG 暂存区与最后一次验收提交不一致，拒绝封存: {(status or error).strip()[:200]}")
         unsupported = self._unsupported_entries(self.base_commit)
