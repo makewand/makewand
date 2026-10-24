@@ -66,6 +66,7 @@ var nativeGoCommands = map[string]bool{
 
 var pythonGlobalValueFlags = map[string]bool{
 	"--call-budget-file":      true,
+	"--caller":                true,
 	"--cwd":                   true,
 	"--effort":                true,
 	"--file":                  true,
@@ -74,6 +75,7 @@ var pythonGlobalValueFlags = map[string]bool{
 	"--prompt-file":           true,
 	"--protect":               true,
 	"--reasoning-effort":      true,
+	"--request-id":            true,
 	"--risk":                  true,
 	"--total-timeout":         true,
 	"--workflow":              true,
@@ -85,9 +87,11 @@ var pythonGlobalValueFlags = map[string]bool{
 var sharedGlobalValueFlags = map[string]bool{
 	"--approval":         true,
 	"--call-budget-file": true,
+	"--caller":           true,
 	"--cwd":              true,
 	"--max-model-calls":  true,
 	"--repo-trust":       true,
+	"--request-id":       true,
 	"-C":                 true,
 }
 

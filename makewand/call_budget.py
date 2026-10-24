@@ -409,6 +409,50 @@ def repair_clock(budget_file=None, apply=False):
     return report
 
 
+def request_budget(request_id, maximum=None, budget_file=None):
+    """Inspect or explicitly amend one request's cap, never refund spent calls.
+
+    Raising a cap is an operator action after user approval, not admission.
+    It cannot change machine/project caps or replace inherited task identity.
+    """
+    from makewand.execution_contract import identifier
+    identifier(request_id, "request_id")
+    inherited = os.environ.get("MAKEWAND_TASK_ID")
+    if inherited and inherited != request_id:
+        raise BudgetError("cannot amend a different inherited request")
+    if maximum is not None and (type(maximum) is not int or not 0 < maximum <= 9223372036854775807):
+        raise BudgetError("request maximum must be a positive integer")
+    inherited_limit = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
+    if maximum is not None and inherited_limit is not None:
+        try:
+            if maximum > int(inherited_limit):
+                raise BudgetError("cannot raise an inherited request maximum")
+        except ValueError as error:
+            raise BudgetError("invalid inherited request maximum") from error
+    value = budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()
+    if not os.path.exists(value):
+        raise BudgetError("request budget does not exist; no calls have been admitted")
+    try:
+        with _ledger(value, migrate=False) as (path, data):
+            counter = data.get("scopes", {}).get("tasks", {}).get(request_id)
+            if counter is None:
+                raise BudgetError("request ID is not present in the shared ledger")
+            before = counter["maximum"]
+            if maximum is not None:
+                counter["maximum"] = maximum
+                _save(path, data)
+            reserved = sum(hold["remaining"] for hold in _active_holds(data).values()
+                           if ["tasks", request_id] in hold.get("scopes", []))
+            return {"request_id": request_id, "maximum": counter["maximum"], "previous_maximum": before,
+                    "used": counter["used"], "reserved": reserved,
+                    "remaining": max(0, counter["maximum"] - counter["used"] - reserved),
+                    "applied": maximum is not None, "path": str(value)}
+    except BudgetError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+        raise BudgetError(f"cannot read request budget: {error}") from error
+
+
 def release_capacity(lease_id):
     if lease_id is None:
         return

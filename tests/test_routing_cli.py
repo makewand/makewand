@@ -49,6 +49,100 @@ class RoutingCliTests(unittest.TestCase):
     def routing_dir(self) -> Path:
         return self.state_home / "makewand" / "routing"
 
+    def test_request_context_survives_route_commands(self):
+        payload = self.route_json("review", "normal", "--simple", "--request-id", "user-42",
+                                  "--caller", "codex", "--max-model-calls", "5", quota={})
+        self.assertEqual(payload["budget"], 5)
+        self.assertTrue(payload["candidates"])
+        for candidate in payload["candidates"]:
+            self.assertIn("--request-id user-42", candidate["command"])
+            self.assertIn("--caller codex", candidate["command"])
+            self.assertIn("--max-model-calls 5", candidate["command"])
+
+    def test_review_rejection_is_a_valid_review_and_has_separate_metadata(self):
+        result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
+                              "--seconds", "12.5", "--calls", "1", "--request-id", "review-42",
+                              "--caller", "agy", "--candidate-hash", "a" * 64)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        row = rows[-1]
+        self.assertTrue(row["passed"])
+        self.assertTrue(row["review_validated"])
+        self.assertFalse(row["candidate_approved"])
+        self.assertEqual((row["seconds"], row["calls"], row["caller"], row["request_id"]), (12.5, 1, "agy", "review-42"))
+
+    def test_recorded_request_failure_cools_route_without_affecting_other_requests(self):
+        recorded = self.run_cli("outcome", "codex", "3", "review", "fail", "--failure-kind", "unknown",
+                                "--request-id", "blocked-42", "--seconds", "1", "--calls", "1")
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        blocked = self.route_json("review", "hard", "--simple", "--request-id", "blocked-42", quota={})
+        self.assertNotIn("codex", [c["provider"] for c in blocked["candidates"]])
+        self.assertTrue(any("retry-approved" in s["reason"] for s in blocked["skipped"] if s["provider"] == "codex"))
+        other = self.route_json("review", "hard", "--simple", "--request-id", "other-42", quota={})
+        self.assertIn("codex", [c["provider"] for c in other["candidates"]])
+        approved = self.route_json("review", "hard", "--simple", "--request-id", "blocked-42", "--retry-approved", quota={})
+        self.assertIn("codex", [c["provider"] for c in approved["candidates"]])
+
+    def test_inherited_request_cannot_be_replaced(self):
+        result = self.run_cli("route", "review", "hard", "--request-id", "escape", "--json",
+                              extra_env={"MAKEWAND_TASK_ID": "parent"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot replace", result.stderr)
+
+    def test_route_rejects_invalid_utf8_request_history(self):
+        recorded = self.run_cli("outcome", "codex", "3", "review", "fail", "--failure-kind", "unknown",
+                                "--request-id", "corrupt-42", "--seconds", "1", "--calls", "1")
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        history = self.routing_dir / "outcomes.jsonl"
+        history.write_bytes(history.read_bytes().replace(b'"codex"', b'"cod\xffx"'))
+        result = self.run_cli("route", "review", "hard", "--simple", "--request-id", "corrupt-42", "--json", quota={})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("utf-8", result.stderr)
+
+    def test_empty_request_id_cannot_silently_start_a_new_budget(self):
+        result = self.run_cli("route", "review", "normal", "--request-id", "", "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid request_id", result.stderr)
+
+    def test_option_shaped_identifier_is_preserved_as_a_value(self):
+        payload = self.route_json("review", "normal", "--simple", "--request-id=-user-42", quota={})
+        self.assertTrue(payload["candidates"])
+        self.assertTrue(all("--request-id=-user-42" in c["command"] for c in payload["candidates"]))
+
+    def test_escalation_hint_keeps_the_shared_request_budget(self):
+        import shlex
+        result = self.run_cli("route", "review", "normal", "--tier", "1", "--simple",
+                              "--request-id", "escalate-42", "--caller", "codex", "--max-model-calls", "5", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hint = next(line.split("：", 1)[1] for line in result.stdout.splitlines() if line.startswith("验收不过就升一档："))
+        follow = self.run_cli(*shlex.split(hint)[1:], "--json", quota={})
+        self.assertEqual(follow.returncode, 0, follow.stderr)
+        payload = json.loads(follow.stdout)
+        self.assertEqual(payload["budget"], 5)
+        for candidate in payload["candidates"]:
+            self.assertIn("--request-id escalate-42", candidate["command"])
+            self.assertIn("--caller codex", candidate["command"])
+
+    def test_custom_ledger_path_survives_candidates_and_escalation(self):
+        import shlex
+        ledger = str(self.base / "a space" / "calls.json")
+        result = self.run_cli("route", "review", "normal", "--tier", "1", "--simple",
+                              "--request-id", "custom-42", "--max-model-calls", "5", "--call-budget-file", ledger, quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hint = next(line.split("：", 1)[1] for line in result.stdout.splitlines() if line.startswith("验收不过就升一档："))
+        follow = self.run_cli(*shlex.split(hint)[1:], "--json", quota={})
+        self.assertEqual(follow.returncode, 0, follow.stderr)
+        for candidate in json.loads(follow.stdout)["candidates"]:
+            args = shlex.split(candidate["command"])
+            self.assertEqual(args[args.index("--call-budget-file") + 1], ledger)
+
+    def test_unverified_review_cannot_be_recorded_as_valid(self):
+        result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "unverified",
+                              "--seconds", "1", "--calls", "1")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot validate", result.stderr)
+
     def run_cli(self, *args, quota=None, policy=None, worker=False, extra_env=None):
         env = dict(os.environ)
         env.update({

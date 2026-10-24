@@ -9,6 +9,16 @@ import (
 	"github.com/makewand/makewand/internal/engine"
 )
 
+func TestDelegationPreservesOptionShapedRequestID(t *testing.T) {
+	plan, err := planPythonDelegation([]string{"--request-id=-user-42", "route", "review", "normal", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil || !strings.Contains(strings.Join(plan.args, " "), "--request-id=-user-42") {
+		t.Fatalf("delegation split an option-shaped request value: %+v", plan)
+	}
+}
+
 // go-engine-tui-cmd#5: persistent flags written before a Python subcommand
 // used to hide the subcommand, so `makewand --approval safe status` or
 // `makewand --repo-trust untrusted run "x"` became a chat prompt sent to a
