@@ -26,6 +26,9 @@ func (p *Project) pipDependencyStages(plan ExecPlan, ws *os.Root, stage *fetchSt
 		b := plan
 		return nil, &b, nil
 	}
+	if install.refusal != "" {
+		return nil, nil, &fetchRefusal{reason: install.refusal}
+	}
 	if err := stage.dir.mkdirAll("wheelhouse"); err != nil {
 		return nil, nil, err
 	}
@@ -33,7 +36,7 @@ func (p *Project) pipDependencyStages(plan ExecPlan, ws *os.Root, stage *fetchSt
 	buildPlan := plan
 	buildPlan.Args = pipOfflineInstallArgs(plan.Args, wheelhouse)
 	buildPlan.binds = []string{wheelhouse}
-	sources, sourceArgs, err := p.pipFetchSourceArgs(install, ws, stage.dir)
+	sources, sourceArgs, err := p.pipFetchSourceArgs(install, ws, stage.dir, plan.Command)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -76,6 +79,9 @@ func (p *Project) pipDependencyStages(plan ExecPlan, ws *os.Root, stage *fetchSt
 // project from the wheelhouse instead, loopback-only. hasTargets reports
 // whether anything resolves from an index at all.
 func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string, sourceArgs []string) (args []string, hasTargets bool, err error) {
+	if install.refusal != "" {
+		return nil, false, &fetchRefusal{reason: install.refusal}
+	}
 	var reqs []string
 	add := func(texts ...string) {
 		for _, text := range texts {
@@ -151,8 +157,8 @@ const (
 // copy. A configured index is used, never silently replaced by PyPI: an index
 // or find-links location the fetch cannot be given (not http(s), or a
 // directory outside the workspace) refuses the networked fetch.
-func (p *Project) pipFetchSourceArgs(install pipInstall, ws *os.Root, dir *fetchDir) (pipFetchSources, []string, error) {
-	cfg, err := p.pipConfigSources()
+func (p *Project) pipFetchSourceArgs(install pipInstall, ws *os.Root, dir *fetchDir, command ...string) (pipFetchSources, []string, error) {
+	cfg, err := p.pipConfigSources(command...)
 	if err != nil {
 		return pipFetchSources{}, nil, err
 	}
@@ -312,9 +318,9 @@ func copyWheelDir(ws *os.Root, rel string, dst *fetchDir, total *int64) (int, er
 // (both read statically, never run), the trusted pip's site configuration,
 // and the project's, each overriding the ones before it; within a file the
 // [install] section overrides [global].
-func (p *Project) pipConfigSources() (pipSourceOptions, error) {
+func (p *Project) pipConfigSources(command ...string) (pipSourceOptions, error) {
 	var cfg pipSourceOptions
-	contents, err := p.pipConfigFileContents()
+	contents, err := p.pipConfigFileContents(command...)
 	if err != nil {
 		return cfg, err
 	}
@@ -354,7 +360,7 @@ var pipHostConfigFiles = []string{"/etc/xdg/pip/pip.conf", "/etc/pip.conf"}
 // pipConfigFileContents returns the contents of the pip configuration files
 // pipConfigSources reads, lowest precedence first. Files in the workspace are
 // read through its os.Root handle and never through a symlink.
-func (p *Project) pipConfigFileContents() ([]string, error) {
+func (p *Project) pipConfigFileContents(command ...string) ([]string, error) {
 	var contents []string
 	add := func(data []byte, err error) error {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -386,7 +392,7 @@ func (p *Project) pipConfigFileContents() ([]string, error) {
 			return nil, err
 		}
 	}
-	if python := pipFetchInterpreter(projectDir); python != "" {
+	if python := pipFetchInterpreter(projectDir, command...); python != "" {
 		site := filepath.Join(filepath.Dir(filepath.Dir(python)), "pip.conf")
 		if err := add(os.ReadFile(site)); err != nil { //nolint:gosec // G304: the trusted pip's own site configuration
 			return nil, err
@@ -444,9 +450,13 @@ func pipConfigValues(content string) map[string]string {
 
 // pipFetchInterpreter returns the Python interpreter of the pip the fetch
 // runs (fetchToolPath), or of the fetch PATH's python3, or "".
-func pipFetchInterpreter(projectDir string) string {
+func pipFetchInterpreter(projectDir string, command ...string) string {
 	pathEnv := fetchPathEnv(projectDir)
-	for _, name := range []string{"pip", "pip3"} {
+	candidates := []string{"pip", "pip3"}
+	if len(command) > 0 && (command[0] == "pip" || command[0] == "pip3") {
+		candidates = []string{command[0]}
+	}
+	for _, name := range candidates {
 		if bin := fetchToolPath(name, projectDir); filepath.IsAbs(bin) {
 			if python := scriptInterpreterAny(bin, pathEnv); filepath.IsAbs(python) {
 				return python

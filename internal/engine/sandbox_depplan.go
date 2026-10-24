@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -268,7 +269,7 @@ func (p *Project) classifyFailedFetch(ctx context.Context, env verifyExecEnviron
 	}
 	var markerEnv pipMarkerEnv
 	if projectDir, err := p.execWorkingDir(); err == nil {
-		markerEnv = pipMarkerEnvironment(pipFetchInterpreter(projectDir))
+		markerEnv = pipMarkerEnvironment(pipFetchInterpreter(projectDir, plan.Command))
 	}
 	verdict, why := p.pipReleaseCheck(ctx, env, fetch.stage.pip, name, markerEnv)
 	if verdict != pipReleaseSdistOnly {
@@ -606,6 +607,7 @@ func (p *Project) goFetchSources(ws *os.Root, projectDir string, dir *fetchDir, 
 	for _, rep := range workReplacements {
 		workOverrides[rep.Old.Path+"\x00"+rep.Old.Version] = true
 	}
+	addGoWorkspaceSelectedOverrides(ws, projectDir, modules, workOverrides)
 	seen := map[string]bool{}
 	for len(modules) > 0 {
 		module := filepath.Clean(filepath.FromSlash(modules[0]))
@@ -668,13 +670,208 @@ func (p *Project) goLocalReplacements(projectDir, module string, gomod []byte, w
 	if len(workOverrides) > 0 {
 		overrides = workOverrides[0]
 	}
+	var cloned map[string]bool
+	suppressUnversioned := func(path string) {
+		if cloned == nil {
+			cloned = maps.Clone(overrides)
+			if cloned == nil {
+				cloned = map[string]bool{}
+			}
+		}
+		cloned["\x00unversioned\x00"+path] = true
+	}
+	if overrides == nil || !overrides["\x01selected"] {
+		reqVer := map[string]string{}
+		for _, req := range mod.Require {
+			if cur := reqVer[req.Path]; cur == "" || goSemverCompare(req.Version, cur) > 0 {
+				reqVer[req.Path] = req.Version
+			}
+		}
+		for path, ver := range reqVer {
+			if overrides[path+"\x00"+ver] {
+				suppressUnversioned(path)
+			}
+		}
+		for _, rep := range mod.Replace {
+			if rep.Old.Version != "" && reqVer[rep.Old.Path] == rep.Old.Version {
+				suppressUnversioned(rep.Old.Path)
+			}
+		}
+	} else {
+		for _, rep := range mod.Replace {
+			if rep.Old.Version != "" && overrides["\x02"+rep.Old.Path+"\x00"+rep.Old.Version] {
+				suppressUnversioned(rep.Old.Path)
+			}
+		}
+	}
+	if cloned != nil {
+		overrides = cloned
+	}
 	return goReplacementDirectories(projectDir, module, "go.mod", mod.Replace, overrides)
+}
+
+func addGoWorkspaceSelectedOverrides(ws *os.Root, projectDir string, candidates []string, workOverrides map[string]bool) {
+	workOverrides["\x01selected"] = true
+	hasModReplace := false
+	seen := map[string]bool{}
+	var gomods [][]byte
+	for _, raw := range candidates {
+		module := filepath.Clean(filepath.FromSlash(raw))
+		if seen[module] || filepath.IsAbs(module) || module == ".." || strings.HasPrefix(module, ".."+string(filepath.Separator)) {
+			continue
+		}
+		seen[module] = true
+		data, err := readRegularNoFollow(ws, filepath.Join(module, "go.mod"), maxFetchManifestBytes)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), "replace") {
+			hasModReplace = true
+		}
+		gomods = append(gomods, data)
+	}
+	if !hasModReplace {
+		return
+	}
+	pathEnv := fetchPathEnv(projectDir)
+	goBin := trustedToolPath("go", projectDir, pathEnv)
+	if !filepath.IsAbs(goBin) {
+		return
+	}
+	selected := map[string]string{}
+	for _, data := range gomods {
+		mod, err := goModParse(goBin, pathEnv, data)
+		if err != nil {
+			continue
+		}
+		for _, req := range mod.Require {
+			if cur := selected[req.Path]; cur == "" || goSemverCompare(req.Version, cur) > 0 {
+				selected[req.Path] = req.Version
+			}
+		}
+	}
+	for path, ver := range selected {
+		if ver == "" {
+			continue
+		}
+		workOverrides["\x02"+path+"\x00"+ver] = true
+		if workOverrides[path+"\x00"+ver] {
+			workOverrides["\x00unversioned\x00"+path] = true
+		}
+	}
+}
+
+func goSemverCompare(v, w string) int {
+	pv, ok1 := parseGoSemver(v)
+	pw, ok2 := parseGoSemver(w)
+	if !ok1 || !ok2 {
+		return strings.Compare(v, w)
+	}
+	for i := range 3 {
+		if c := compareDecimal(pv.nums[i], pw.nums[i]); c != 0 {
+			return c
+		}
+	}
+	return compareSemverPrerelease(pv.pre, pw.pre)
+}
+
+type goSemverParts struct {
+	nums [3]string
+	pre  string
+}
+
+func parseGoSemver(v string) (p goSemverParts, ok bool) {
+	if !strings.HasPrefix(v, "v") {
+		return p, false
+	}
+	v = v[1:]
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		p.pre = v[i+1:]
+		v = v[:i]
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return p, false
+	}
+	for i, part := range parts {
+		if part == "" {
+			return p, false
+		}
+		for j := 0; j < len(part); j++ {
+			if part[j] < '0' || part[j] > '9' {
+				return p, false
+			}
+		}
+		p.nums[i] = part
+	}
+	return p, true
+}
+
+func compareDecimal(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(a, b)
+}
+
+func compareSemverPrerelease(a, b string) int {
+	switch {
+	case a == b:
+		return 0
+	case a == "":
+		return 1
+	case b == "":
+		return -1
+	}
+	ap := strings.Split(a, ".")
+	bp := strings.Split(b, ".")
+	for i := 0; i < len(ap) && i < len(bp); i++ {
+		if ap[i] == bp[i] {
+			continue
+		}
+		an, bn := isDecimal(ap[i]), isDecimal(bp[i])
+		if an != bn {
+			if an {
+				return -1
+			}
+			return 1
+		}
+		if an {
+			return compareDecimal(ap[i], bp[i])
+		}
+		return strings.Compare(ap[i], bp[i])
+	}
+	if len(ap) < len(bp) {
+		return -1
+	}
+	return 1
+}
+
+func isDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func goReplacementDirectories(projectDir, module, manifest string, replacements []goModReplacement, overrides map[string]bool) ([]string, error) {
 	var dirs []string
 	for _, rep := range replacements {
-		if overrides[rep.Old.Path+"\x00"] || overrides[rep.Old.Path+"\x00"+rep.Old.Version] {
+		if overrides[rep.Old.Path+"\x00"] || overrides[rep.Old.Path+"\x00"+rep.Old.Version] ||
+			(rep.Old.Version == "" && overrides["\x00unversioned\x00"+rep.Old.Path]) {
 			continue
 		}
 		if rep.New.Version != "" {

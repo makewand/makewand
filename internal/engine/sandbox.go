@@ -478,7 +478,7 @@ func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
 		}
 		if !loaded {
 			if projectDir, err := p.execWorkingDir(); err == nil {
-				env = pipMarkerEnvironment(pipFetchInterpreter(projectDir))
+				env = pipMarkerEnvironment(pipFetchInterpreter(projectDir, plan.Command))
 			}
 			loaded = true
 		}
@@ -1956,7 +1956,10 @@ type pipInstall struct {
 	noIsolation  bool // --no-build-isolation
 	pep517       bool // --use-pep517
 	noPEP517     bool // --no-use-pep517
-	// read holds the requirement files read so far.
+	// refusal explains why an input requirement or constraint file could not
+	// be inspected within regular-file and nesting limits.
+	refusal string
+	// read holds the requirement and constraint files read so far.
 	read map[string]bool
 }
 
@@ -2164,16 +2167,20 @@ func (p *Project) addPipArguments(install *pipInstall, args []string, source, di
 // hold anything.
 func (p *Project) addPipRequirementsFile(install *pipInstall, file string, depth int) {
 	file = filepath.Clean(file)
-	if install.read[file] {
+	key := "r:" + file
+	if install.read[key] {
 		return
 	}
 	if install.read == nil {
 		install.read = map[string]bool{}
 	}
-	install.read[file] = true
+	install.read[key] = true
 	content, err := p.ReadFile(file)
 	if err != nil || depth > 8 {
 		install.localCode = true
+		if install.refusal == "" {
+			install.refusal = "makewand cannot inspect the pip requirement file " + truncateForNote(file) + " within its regular-file and nesting limits; refusing the networked fetch rather than downloading with incomplete package sources or requirements"
+		}
 		return
 	}
 	for _, line := range pipRequirementLines(content) {
@@ -2195,19 +2202,22 @@ func (p *Project) addPipRequirementsFile(install *pipInstall, file string, depth
 // fetch never builds one. Like pip it follows a nested -c (constraints) and -r
 // (requirements, as pip reads a -r inside a constraints file) and honours the
 // index options a constraint file sets, up to the same depth as requirement
-// files. A file makewand cannot read leaves no pins (the offline install
-// still reads the real file loopback-only).
+// files. A file makewand cannot read refuses the networked fetch.
 func (p *Project) addPipConstraintsFile(install *pipInstall, file string, depth int) {
 	file = filepath.Clean(file)
-	if install.read[file] {
+	key := "c:" + file
+	if install.read[key] {
 		return
 	}
 	if install.read == nil {
 		install.read = map[string]bool{}
 	}
-	install.read[file] = true
+	install.read[key] = true
 	content, err := p.ReadFile(file)
 	if err != nil || depth > 8 {
+		if install.refusal == "" {
+			install.refusal = "makewand cannot inspect the pip constraint file " + truncateForNote(file) + " within its regular-file and nesting limits; refusing the networked fetch rather than downloading with incomplete package sources or constraints"
+		}
 		return
 	}
 	for _, line := range pipRequirementLines(content) {
