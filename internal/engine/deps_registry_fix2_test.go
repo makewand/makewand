@@ -19,6 +19,7 @@ import (
 
 func writeExecScript(t *testing.T, path, body string) {
 	t.Helper()
+	//nolint:gosec // G703: a test helper writing test-controlled paths under t.TempDir.
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +306,7 @@ type heldBwrapEnv struct {
 func installHeldBwrap(t *testing.T, okWhenOffline bool, slirpBody string) heldBwrapEnv {
 	t.Helper()
 	fakeWorkingBwrap(t)
+	stubNpmVersion(t, npmNetworkedLockMajor) // see installFakeUserNet
 	swapSeccompVars(t, "linux", false, nil)
 	dir := t.TempDir()
 	env := heldBwrapEnv{log: filepath.Join(dir, "launches.log")}
@@ -488,7 +490,7 @@ home=; cmd=
 while [ $# -gt 0 ]; do
   case "$1" in
     --setenv) [ "$2" = HOME ] && home=$3; shift 3 ;;
-    --chdir|--tmpfs|--proc|--dev) shift 2 ;;
+    --chdir|--tmpfs|--proc|--dev|--dir) shift 2 ;;
     --bind|--ro-bind) shift 3 ;;
     --*) shift ;;
     *) cmd=$1; break ;;
@@ -543,6 +545,8 @@ func TestSandboxedPipInstallRedirectsEggInfo_FixN1R2(t *testing.T) {
 			if report.DepsError != "" || report.IntegrityError != "" {
 				t.Fatalf("DepsError=%q IntegrityError=%q", report.DepsError, report.IntegrityError)
 			}
+			// Without the user-mode network helper nothing can download, so the
+			// install runs as one loopback step (no fetch is split off).
 			if got := strings.TrimSpace(readLog(t, log)); got != tc.want {
 				t.Fatalf("pip step saw %q, want %q", got, tc.want)
 			}
@@ -570,8 +574,7 @@ func TestSandboxedSetuptoolsWritesNoEggInfoIntoWorkspace_FixN1R2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools := filepath.Join(project.Path, "tools")
-	t.Setenv("PATH", tools+":/usr/bin:/bin")
+	tools := outsideTools(t) // a fetch never runs a workspace executable
 	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
 		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
 	}
@@ -583,8 +586,10 @@ func TestSandboxedSetuptoolsWritesNoEggInfoIntoWorkspace_FixN1R2(t *testing.T) {
 	if err := project.WriteFiles(files); err != nil {
 		t.Fatal(err)
 	}
-	// pip runs this hook in its build environment before the editable build.
-	writeExecScript(t, filepath.Join(tools, "pip"), "exec /usr/bin/python3 -c 'import setuptools.build_meta as b; b.get_requires_for_build_editable()'\n")
+	// pip runs this hook in its build environment before the editable build; the
+	// networked `pip download` builds nothing, so the fake runs setuptools only
+	// for the loopback install, as real pip does.
+	writePipFixture(t, filepath.Join(tools, "pip"), "if sys.argv[1] == 'download':\n    raise SystemExit(0)\nimport setuptools.build_meta as b\nb.get_requires_for_build_editable()\n")
 	writeExecScript(t, filepath.Join(tools, "pytest"), "echo '1 passed'\n")
 	report := project.VerifyRestrictedWorkspace(context.Background(), files[1:2])
 	if report.IntegrityError != "" || report.DepsError != "" || !report.Isolated {

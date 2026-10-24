@@ -1537,24 +1537,33 @@ func (p *Project) redirectSetuptoolsEggInfo(plan ExecPlan, isolated bool) (ExecP
 	if err != nil {
 		return plan, nil, err
 	}
-	home := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return plan, nil, fmt.Errorf("create sandbox home: %w", err)
+	// Written through the sandbox HOME's own os.Root handle (openSandboxHome),
+	// which the cleanup uses too: a symlink a loopback step planted is never
+	// followed, and the HOME is never reopened by path.
+	home, err := openSandboxHome(projectDir)
+	if err != nil {
+		return plan, nil, err
 	}
-	config := filepath.Join(home, ".pydistutils.cfg")
-	f, err := os.OpenFile(config, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	const config = ".pydistutils.cfg"
+	f, err := home.OpenFile(config, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, fs.ErrExist) {
+		_ = home.Close()
 		return plan, keep, nil // leave a configuration that is already there alone
 	}
 	if err != nil {
+		_ = home.Close()
 		return plan, nil, fmt.Errorf("configure setuptools for the sandbox: %w", err)
 	}
 	_, writeErr := f.WriteString("[egg_info]\negg_base = /tmp\n")
 	if err := errors.Join(writeErr, f.Close()); err != nil {
-		_ = os.Remove(config)
+		_ = home.Remove(config)
+		_ = home.Close()
 		return plan, nil, fmt.Errorf("configure setuptools for the sandbox: %w", err)
 	}
-	return plan, func() { _ = os.Remove(config) }, nil
+	return plan, func() {
+		_ = home.Remove(config)
+		_ = home.Close()
+	}, nil
 }
 
 // cargoLockfile reports whether the Cargo workspace under verification has a

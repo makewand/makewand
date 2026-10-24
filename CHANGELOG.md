@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 依赖取回兼容性：Cargo 的 examples/tests/benches 隐式目标也只复制空 stub；pip 从 requirements、pyproject 和 wheel 读取的括号版本要求统一规范化，配置存在却无法安全读取时拒绝联网取回，避免换用默认 PyPI；Go workspace 的 use/replace 由可信工具离线解析，保留工作区内替换及其优先级，拒绝外部替换，无法解析时只在回环步骤报告错误。
 - 路由热路径不再反复解析登录身份文件：在 Linux、macOS 与 BSD 上，额度来源按身份文件的路径、设备号、inode、大小、修改时间与状态变更时间（ctime，纳秒）复用上次读取，每次 Snapshot 对每个来源只取一次身份。长期使用的 `~/.claude.json` 有数百 KB，此前每个候选要读取解析约 4 次（本机每个候选约 12 ms，现约 0.4 ms）。用户无法设置 ctime，所以大小不变、恢复了修改时间的改写，以及复用 inode 号的新文件都会被重新读取；修改或变更不足 2 秒的身份文件每次重读。Windows 的文件信息没有变更时间，不复用，每次重读；准入与记账仍每次重读。
 - Codex 额度来源（Go 与 Python 一致）只读每个会话日志最后 4 MiB 的完整行，外加日志第一行（Codex 在此写会话的 `session_meta`，限 64 KiB 内的完整行），所以转录超过 4 MiB 的长会话里不带账号 ID 的近期事件仍按该 `session_meta` 绑定账号；只解码含 `rate_limits` 或 `session_meta` 的行，并在逐行扫描中检查超时。只有普通文件参与“最新 8 个日志”的选取：FIFO 等非普通文件从不打开，也不会挤掉真正的日志（此前 Python 读取器遇到 FIFO 会一直阻塞）。
 - 用量、审计与团队账单/预算告警 CSV 导出（`makewand usage --csv`、`makewand audit --csv`、管理端 `?format=csv`）给以 `=`、`+`、`-`、`@`、制表符、回车、换行或全角 `＝`、`＋`、`－`、`＠` 开头的单元格（纯 ASCII 十进制数字除外）加单引号前缀，客户端提供的值（如被拒绝的模型名 `=HYPERLINK(...)`）在电子表格中只按文本显示。
@@ -23,6 +24,7 @@ All notable changes to this project are documented here. The format is based on
 - 原生 Windows 上两个不稳定测试改为确定性：账本锁的期限只限制等待其他持有者，空闲的锁即使打开文件已用完预算也照样取得（此前开始事件的 100 毫秒预算耗在 Windows 文件与 ACL I/O 上，多报一次记录失败），已过期的事务不做任何 I/O（Go 与 Python 一致）；Python 没有执行期限的准入像 Go 一样等待账本，不再在其他进程占用账本 5 秒后报告“执行期限已过”。
 - 健康探测在慢主机上启动时就已超过 4 秒时限时（例如新二进制正被杀毒扫描），按与“启动后卡住”相同的超时策略处理：订阅 CLI 软放行、自定义探测仍判不可用。此前 Windows CI 上 gemini 会被误判为不可用。
 - 模型发现写出的 `discovered.json` 改为参考性输入：其中本构建无法定价的 API 模型条目被丢弃（该档位保留内置模型），合并或校验仍失败的整个文件被忽略；此前一个未定价的发现模型（如 agy 的 `gemini-4-argon` 写进 gemini 档位）会让 TUI、headless 与 serve 全部启动失败。用户自己的 `routing.json` 仍然严格校验。
+- 有界派发改用 Go/Python 共享的机器账本 `call-budget.json`；任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按 Asia/Shanghai 午夜重置。已结算记录保留 48 小时，写入时清理；未结束记录、活动租约和预留所引用的计数保留，旧 lifetime 上限不因清理退款。详见 [预算与租约](docs/layered-call-admission.md)。
 - 账号与订阅池默认并发 1，provider 默认并发 64；无可用回退时最多等待 30 秒（`MAKEWAND_LEASE_WAIT_SECONDS`）。busy 不启动 provider、不计费、不降低可靠性，返回 FAILED/退出码 10；真实预算耗尽返回退出码 13。某并发键没有活动租约后可重新配置并发上限。
 - quota cache v2 按账号及订阅池绑定；未知账号不作为独立池。Claude 登录绑定仅投影 `.claude.json` 的账号 ID，正常项目历史/计数写入不使绑定失效；启动前账号校验拒绝不计费。Python Codex 使用 `codex exec --json` 提取协议证据。
 - provider worker 采用严格命令白名单，仅允许 `search`、`repomap`、静态 `help`、`completion <shell>` 和单独的帮助/版本参数；`quota`、`status`、`route`、`mark`、`outcome` 等管理命令均拒绝。详见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
@@ -80,6 +82,10 @@ All notable changes to this project are documented here. The format is based on
 - **SHA-256 仓库**：空树属性来源（及无 HEAD 时的 diff 基准）按仓库自身对象格式取完整 id——从公共目录 `config` 的 `extensions.objectFormat` 按 git 的仓库格式检查读取（不跟随 include）。此前 SHA-256 仓库中每条带属性来源的命令都报 `bad --attr-source`，而名为 SHA-1 空树 id 的分支可把属性来源换成攻击者的树并执行 filter。git 无法解析的 config 或未知格式 fail-closed。
 - **全局选项与环境**：`run_git_cmd` 按 git 的规则定位子命令，拒绝 `-C`、`--git-dir`、`--work-tree`、`--namespace`、`--bare`、`--attr-source`、`--exec-path`、`--config-env` 与 `include`/`includeIf` 段的 `-c`（调用方改传 cwd；非 git 目录的 ignore 探测改为以探测仓库为 cwd、`core.worktree` 指向目标）；克隆判定改用解析出的子命令。继承环境中的 `GIT_CONFIG`（只有 `git config` 读它、且只读它，filter 驱动列表因而漏掉 apply 照常运行的仓库驱动）、`GIT_ATTR_SOURCE`（曾使工作树模式 apply 段错误）、`GIT_CEILING_DIRECTORIES`、`GIT_DISCOVERY_ACROSS_FILESYSTEM`、`GIT_NAMESPACE` 被清除。apply 的 filter 驱动改在属性屏蔽就位后、git 启动前列出；同一时刻并发改写仓库 config 加入驱动的残余窗口见 docs/VERIFICATION_CONTRACT.md。
 - **被忽略或经符号链接的目录下的 gitlink**（交叉审查第五轮）：`add_all` 此前以排除 pathspec 把 gitlink 排除在 `git add -A` 之外，而 gitlink 的上级目录被 `.gitignore` 忽略（如 `vendor/`、dotfiles 仓库的 `*`）时 git add 以退出码 1 拒绝，上级目录是符号链接时以 128 拒绝，使审查 diff、影子副本、影子交付、DAG 检查点与基线暂存全部失败。现改为 add 期间临时标记 assume-unchanged，暂存结果与普通 `git add -A` 一致：符号链接之后的 gitlink 不经读取直接移出索引；用户自己标为 assume-unchanged 或 skip-worktree 的 gitlink 保持不动。`.gitmodules` 改以 `git config -z` 读取，名称或路径含空白、引号、非 ASCII 字符的已注册 submodule 不再被脏检查漏掉（此前名为 `my lib` 的脏 submodule 使隔离检查判为干净、任务在用户未提交改动上原地运行）；submodule 路径经 junction 时同样不进入。自动修复的脏文件捕获与恢复不再看到仅有内部内容改动的 submodule（见 docs/VERIFICATION_CONTRACT.md）。Go engine 的 `GitCommit`/`GitStatus`/`GitDiff` 也按仓库对象格式取空树属性来源（`git rev-parse --show-object-format`），不再在 SHA-256 仓库中把 SHA-1 id 当作引用名解析。
+2026-10-21 修复批次（Go 引擎 `internal/engine`；行为细节与取舍见 SECURITY.md 与 docs/VERIFICATION_CONTRACT.md）：
+
+- **依赖步骤只有下载走网络，且联网取回看不到工作区（GEC-1021-1，PR #91；第七轮改为结构性设计）**：候选验证的依赖步骤拆成两段。联网的“取回”只做不执行项目代码的下载——严格 PEP 508 具名需求的 `pip download --only-binary=:all:`（需求/约束文件与 `pyproject.toml` 由 makewand 静态解析，跟随嵌套的 `-r`/`-c`；含本地项目的 build requires、静态依赖与 extras 选中的可选依赖组，以及本地 `.whl` 的 `Requires-Dist`；绝不传 URL、VCS、路径或 `name @` 目标）；只在不带包参数的 `npm ci`/`npm install` 下进行、只安装 makewand 解析并检查过的纯注册表锁文件的 `npm ci --ignore-scripts`（`allow-git=none`）；固定到具名 rustup 工具链的 `cargo fetch`；`go mod download`/`tidy`。取回在宿主为每次取回新建、位于工作区与沙箱 HOME 之外的私有目录（`$XDG_CACHE_HOME/makewand/dep-fetch` 下，`0700`）中运行，工作区路径被空 tmpfs 覆盖；宿主只经 `os.Root` 句柄把清单与锁文件以普通文件复制进去（cargo 另加空的目标占位文件，go tidy 另加只含 import 的 Go 占位文件，pip 只复制本地 find-links 目录里的 wheel），拒绝符号链接与非普通文件。取回只运行在宿主上解析到工作区之外的可信工具，`PATH` 只含工作区之外的目录；下载落在宿主自有的共享缓存（`GOMODCACHE` 含 `cache/vcs`、cargo `CARGO_HOME`、npm 缓存），取回读写、之后每个回环步骤只读，回环步骤运行的项目代码因此无法给之后的联网取回留下任何东西。随后的构建/安装一律只在回环网络下从取回物进行（`pip install --no-index --find-links <wheelhouse>`，含 `-e .`；`cargo build --offline`），`go.mod`/`go.sum`、`Cargo.lock`、解析出的锁文件与 `node_modules` 由宿主在取回后经工作区的 `os.Root` 句柄放入。宿主对沙箱路径的写入（沙箱 HOME、Go telemetry 的 `mode` 文件、setuptools 的 `egg_base` 配置、取回目录）一律经检查时所用的句柄进行，不再按路径重新打开。pip 配置（项目的 `pip.conf`/`pip.ini`、沙箱 HOME 的、全局的与可信 pip 的 site 配置）和需求文件中的私有索引、trusted host 与本地 find-links 照样交给取回；取回无法接收的来源会拒绝联网取回，绝不悄悄换成 PyPI。判定：pip 取回失败只在所用索引（由同样用户态网络中的探针读取 PEP 691/503 页面、不运行代码、按 PEP 440 匹配）显示匹配的发布都只有源码分发时才算环境问题，不存在的项目或版本（如 `requests==999999`）算候选失败；声明的 VCS/URL 依赖只在其 marker 对解释器成立时，才在回环安装失败后判为环境问题；回环构建的其他失败一律算候选。没有 slirp4netns（或其网络无法接入）时整个计划不拆分、仅回环运行；非安全宿主选项保留不分阶段的行为。前几轮的工作区密钥屏蔽、工作区内的 `.makewand/fetch-*` 目录与只问项目是否存在的索引检查随之移除。详见 SECURITY.md 与 docs/VERIFICATION_CONTRACT.md。
+- **沙箱 go 步骤关闭遥测（eng-1021-4）**：任何沙箱 go 步骤前，向沙箱 HOME 写入 `go telemetry off` 的 mode 文件（`<home>/.config/go/telemetry/mode`=`off`），默认 `local` 模式下 go 会在步骤返回后异步写计数/`upload.token`、与 `t.TempDir` 清理竞争而偶发使无关运行变红的问题随之消除；`goSandboxForTest` 的宿主探测 HOME 同样关闭遥测。
 
 ### Added
 
@@ -118,10 +124,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- 依赖取回复审修复：独立注册表/pip 索引探测始终携带原工作区边界；shebang 检查区分原生程序与无法解析的脚本并校验 env 启动器及解释器，拒绝不支持的 env 选项/赋值；extras 保留重复条件分支并有界处理循环；npm 锁解析保留 legacy-peer-deps 等依赖选择参数。
+
 - 证据写入同步 pending 标记，账本结算前保持 UNKNOWN，最终才发布 `settled: true` 的结果；读取不会把显式未结算的 PASSED 当作已验证模型。重命名后同步失败、最终标记创建失败和纠正写入失败均不会留下可采信的错误成功记录。
 - 普通非 Git 目录的忽略规则探测在外部临时仓库运行时，Git 可执行路径仍排除原工作区；每个子命令重新校验缓存与符号链接，防止工作区内假 Git 在宿主执行。
 
 - 宿主 Git 从仓库子目录启动时也排除整个工作区内的可执行文件；三方应用覆盖自定义 `merge.default`，保持 Git 内置文本合并和冲突行为，不执行仓库的默认合并驱动。
+- 宿主 Go 环境探测和 go.mod 解析统一用排除工作区的 PATH 校验及执行，避免 env 包装器再从原 PATH 运行工作区解释器；缓存绑定 PATH，离线依赖与注册表探测同样保留工作区边界。
 
 - Go 路由：#84 起普通 CLI 退出一律算结果未知，回退停止，Power 模式丢弃已有回答。现按证据区分：CLI 自己打印、由消息目录识别的拒绝（未登录或凭据被拒，agy 拒绝参数）是结果已知的失败（状态 FAILED，退出码 10），照常回退并计入熔断（熔断后的半开探测失败也会回退，冷却时间逐次加倍）；可能写入工作区的运行只有在 stdout 没有回答、且 stderr 上拒绝之前只有 agy 自己的提示行（消息目录的 notices 与 generic_notice）时才算拒绝：glog 诊断（agy 的工具与模型调用，以及启动时的静默登录）或状态行之后的拒绝可能发生在工作之后，运行途中登录失效同样仍为未知并停止重派。`cmd/versus` 的原始 CLI 对比按同一规则记账，`router.ClassifyCLIExecutionError` 为此增加 stdout 参数。只读运行（沙箱内的审查、未指定 WorkDir 的 `serve` 远端请求）的未识别退出仍记为未知，但可回退到下一个 provider；宿主机上的审查、指定了 WorkDir 的远端请求以及其他可写运行的未识别退出仍为未知并停止重派。Power 模式某个生成方或裁判结果未知时返回其他生成方的回答，未知尝试保留在 trace 与用量中；有生成方被预算或记账拒绝，或某个生成方或裁判的登录在准入后被切换到其他账号（安全拒绝，不计为 provider 故障）时，仍结束请求。
 - Go 路由：凭据准入快照改在拿到账号租约之后拍摄，并按账号（codex `account_id`、Claude `accountUuid`）与准入时比对，持有租约的运行刷新同一账号的令牌不再让排队的运行报 "selected login changed after admission"；等待期间换成其他账号仍拒绝，并在启动前释放预留。快照之后，codex 的令牌与 `account_id` 同在 `auth.json` 中，同账号刷新照常放行；Claude 的令牌（`.credentials.json`）与 `accountUuid`（`.claude.json`）分开存放，无法证明属于同一账号，令牌有变即拒绝启动；凭据拷入私有 HOME 之后、启动之前再读一次账号与令牌，拷贝期间发生的切换同样拒绝。

@@ -100,7 +100,7 @@ func TestGoForgeryInDotMakewandIsCandidateFailure_Final2(t *testing.T) {
 			project := newHostDepsProject(t, files...)
 			fakeToolPrinting(t, "go", tc.stderr, 1)
 			oldProbe := sandboxGoEnvProbe
-			sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return hostGoEnv{GOPROXY: "https://" + down}, nil }
+			sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) { return hostGoEnv{GOPROXY: "https://" + down}, nil }
 			t.Cleanup(func() { sandboxGoEnvProbe = oldProbe })
 			result, err := project.RunRestrictedPlan(context.Background(), ExecPlan{Kind: "deps", Command: "go", Args: []string{"mod", "tidy"}})
 			if errors.Is(err, ErrDependencyNetworkUnavailable) || err != nil {

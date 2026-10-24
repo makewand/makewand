@@ -399,7 +399,10 @@ class ExecutionRuntimeTests(unittest.TestCase):
             filelock.flock(descriptor, filelock.LOCK_EX)
             started = time.monotonic()
             result = execute(self.request(), lambda timeout: (True, "accepted", None))
-            self.assertLess(time.monotonic() - started, .5)
+            # Telemetry gives up on the lock after 0.1 s per event; an unbounded
+            # wait would never return while the lock is held. 0.5 s also had to
+            # cover the ledger I/O and failed on a loaded host.
+            self.assertLess(time.monotonic() - started, 5)
         finally:
             filelock.flock(descriptor, filelock.LOCK_UN)
             os.close(descriptor)

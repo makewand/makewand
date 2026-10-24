@@ -65,7 +65,7 @@ func TestRegistryCheckThatCannotRunConfirmsNothing_R4(t *testing.T) {
 		t.Fatalf("result = %+v, err = %v, want the failed install as a plain result", result, err)
 	}
 	lines := strings.Split(strings.TrimSpace(readLog(t, launches)), "\n")
-	if len(lines) != 3 || !strings.HasPrefix(lines[0], "launch info=3 chdir="+project.Path+" ") {
+	if len(lines) != 3 || !isFetchDirLaunch(t, lines[0], "npm") {
 		t.Fatalf("launches:\n%s\nwant the install, then the check twice", strings.Join(lines, "\n"))
 	}
 }
@@ -84,7 +84,7 @@ func TestRegistryCheckNeedsNoPython_R4(t *testing.T) {
 	project := newHostDepsProject(t)
 	fakeToolPrinting(t, "go", `go: rsc.io/quote@v1.5.2: Get "https://`+proxyAddr+`/rsc.io/quote/@v/v1.5.2.zip": dial tcp `+proxyAddr+`: connect: connection refused`, 1)
 	oldProbe := sandboxGoEnvProbe
-	sandboxGoEnvProbe = func(string) (hostGoEnv, error) {
+	sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) {
 		return hostGoEnv{GOPROXY: "https://" + proxyAddr + ",direct", GOSUMDB: "off"}, nil
 	}
 	t.Cleanup(func() { sandboxGoEnvProbe = oldProbe })
@@ -150,7 +150,7 @@ func TestGoChecksumDatabaseThroughModuleProxy_R4(t *testing.T) {
 			project := newHostDepsProject(t)
 			fakeToolPrinting(t, "go", `go: rsc.io/quote@v1.5.2: Get "https://`+proxy+`/rsc.io/quote/@v/v1.5.2.zip": dial tcp `+proxy+`: i/o timeout`, 1)
 			oldProbe := sandboxGoEnvProbe
-			sandboxGoEnvProbe = func(string) (hostGoEnv, error) {
+			sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) {
 				return hostGoEnv{GOPROXY: "https://" + proxy + ",direct", GOSUMDB: sumdb + "+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8"}, nil
 			}
 			t.Cleanup(func() { sandboxGoEnvProbe = oldProbe })
@@ -220,7 +220,7 @@ func fakeCommandBwrap(pipOutput string) string {
 while [ $# -gt 0 ]; do
   case "$1" in
     --setenv|--bind|--ro-bind|--ro-bind-data|--bind-data) shift 3 ;;
-    --chdir|--tmpfs|--proc|--dev|--seccomp|--info-fd|--block-fd|--perms) shift 2 ;;
+    --chdir|--tmpfs|--proc|--dev|--seccomp|--info-fd|--block-fd|--perms|--dir) shift 2 ;;
     --*) shift ;;
     *) cmd=$1; break ;;
   esac

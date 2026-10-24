@@ -439,6 +439,10 @@ type fakeUserNetEnv struct {
 func installFakeUserNet(t *testing.T, opts fakeUserNetOptions) fakeUserNetEnv {
 	t.Helper()
 	fakeWorkingBwrap(t)
+	// The fake sandbox runs no npm: a networked npm fetch takes npm 12's path,
+	// whose first networked step (the lock resolution) fails or succeeds as
+	// the install did, whatever npm this host has.
+	stubNpmVersion(t, npmNetworkedLockMajor)
 	swapSeccompVars(t, "linux", opts.seccomp, nil)
 	dir := t.TempDir()
 	env := fakeUserNetEnv{

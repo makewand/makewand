@@ -309,7 +309,7 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 		return nil, err
 	}
 	if policy.spec.Command == "go" {
-		if err := checkSandboxGoToolchain(p.Path, verifyHomeLayout(p.Path, sandboxPathEnv()).goVersion); err != nil {
+		if err := checkSandboxGoToolchain(p.Path, verifyHomeLayout(p.Path, sandboxPathEnv(), false).goVersion); err != nil {
 			return nil, err
 		}
 	}

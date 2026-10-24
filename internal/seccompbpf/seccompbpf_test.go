@@ -113,3 +113,30 @@ func TestNewFilterPipe(t *testing.T) {
 		t.Fatalf("pipe content mismatch: %v", err)
 	}
 }
+
+func TestExecGuardDeniesBothExecutionSyscallsAndPreservesDownloads(t *testing.T) {
+	for _, tc := range []struct {
+		arch                string
+		audit               uint32
+		exec                []uint32
+		read, write, socket uint32
+	}{
+		{"amd64", 0xc000003e, []uint32{59, 322}, 0, 1, 41},
+		{"arm64", 0xc00000b7, []uint32{221, 281}, 63, 64, 198},
+	} {
+		prog := decode(t, generatePolicy(tc.arch, true))
+		for _, nr := range tc.exec {
+			if got := run(t, prog, tc.audit, nr); got != 0x00050001 {
+				t.Fatalf("%s execution syscall %d not denied: %#x", tc.arch, nr, got)
+			}
+		}
+		for _, nr := range []uint32{tc.read, tc.write, tc.socket} {
+			if got := run(t, prog, tc.audit, nr); got != 0x7fff0000 {
+				t.Fatalf("%s download syscall %d denied: %#x", tc.arch, nr, got)
+			}
+		}
+		if got := run(t, prog, 0x40000003, tc.exec[0]); got != 0x00050001 {
+			t.Fatal("foreign ABI execution was allowed")
+		}
+	}
+}

@@ -159,8 +159,10 @@ var sandboxGoEnvProbe = probeHostGoEnv
 // probeHostGoEnv runs `go env` for the host toolchain. It never runs inside
 // the (untrusted) workspace - a go.mod there could request a toolchain switch -
 // and pins GOTOOLCHAIN=local so the probe itself can never download anything.
-func probeHostGoEnv(goBin string) (hostGoEnv, error) {
-	key := goBin + "\x00" + os.Getenv("HOME") + "\x00" + os.Getenv("GOMODCACHE") + "\x00" + os.Getenv("GOPATH") + "\x00" + os.Getenv("GOPROXY") + "\x00" + os.Getenv("GOROOT")
+// pathEnv is exactly the workspace-filtered PATH used to validate goBin and
+// its interpreters; both execution and caching must retain that boundary.
+func probeHostGoEnv(goBin, pathEnv string) (hostGoEnv, error) {
+	key := goBin + "\x00" + pathEnv + "\x00" + os.Getenv("HOME") + "\x00" + os.Getenv("GOMODCACHE") + "\x00" + os.Getenv("GOPATH") + "\x00" + os.Getenv("GOPROXY") + "\x00" + os.Getenv("GOROOT")
 	hostGoEnvMu.Lock()
 	if cached, ok := hostGoEnvCache[key]; ok {
 		hostGoEnvMu.Unlock()
@@ -174,7 +176,7 @@ func probeHostGoEnv(goBin string) (hostGoEnv, error) {
 	cmd := exec.CommandContext(ctx, goBin, "env", "-json",
 		"GOROOT", "GOMODCACHE", "GOVERSION", "GOPROXY", "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOSUMDB", "GOINSECURE")
 	cmd.Dir = string(filepath.Separator)
-	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
 	out, err := cmd.Output()
 	if err != nil {
 		return hostGoEnv{}, fmt.Errorf("go env: %w", err)
@@ -217,7 +219,9 @@ func (l sandboxHomeLayout) setenvArgs() []string {
 
 // buildSandboxHomeLayout computes how the sandbox presents the host HOME for a
 // workspace. home is the host HOME, pathEnv the PATH the sandbox will use.
-func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string) string) sandboxHomeLayout {
+// noHostModuleCache withholds the host module caches from a networked
+// dependency fetch (see resolveSandboxToolchains).
+func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string) string, noHostModuleCache bool) sandboxHomeLayout {
 	var layout sandboxHomeLayout
 	home = strings.TrimSpace(home)
 	if home == "" || !filepath.IsAbs(home) {
@@ -229,7 +233,7 @@ func buildSandboxHomeLayout(home, workspace, pathEnv string, getenv func(string)
 		getenv = os.Getenv
 	}
 
-	roots, env, goVersion := resolveSandboxToolchains(home, workspace, pathEnv, getenv)
+	roots, env, goVersion := resolveSandboxToolchains(home, workspace, pathEnv, getenv, noHostModuleCache)
 	layout.env = env
 	layout.goVersion = goVersion
 
@@ -424,8 +428,11 @@ func isPathHiddenBySandbox(home, p string) bool {
 
 // resolveSandboxToolchains resolves the host toolchains the sandbox needs:
 // the read-only HOME subtrees to re-bind, extra environment, and the host Go
-// version.
-func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(string) string) ([]string, []string, string) {
+// version. noHostModuleCache keeps the host Go module cache out of a networked
+// dependency fetch (it can hold private modules, and the fetch downloads into
+// the shared fetch module cache, which the offline steps then read).
+func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(string) string, noHostModuleCache bool) ([]string, []string, string) {
+	probePath := pathOutsideWorkspace(workspace, pathEnv)
 	candidates := map[string]struct{}{}
 	addRoot := func(root string) {
 		root = filepath.Clean(root)
@@ -444,6 +451,12 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	resolved := map[string]string{}
 	for _, name := range sandboxToolchainCommands {
 		bin := lookPathIn(name, pathEnv)
+		if name == "go" {
+			bin = trustedToolPath(name, workspace, probePath)
+			if !filepath.IsAbs(bin) {
+				continue
+			}
+		}
 		if bin == "" {
 			continue
 		}
@@ -471,12 +484,18 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 		if goroot := strings.TrimSpace(getenv("GOROOT")); goroot != "" {
 			env = append(env, "GOROOT", goroot)
 		}
-		if hostEnv, err := sandboxGoEnvProbe(goBin); err == nil {
+		if hostEnv, err := sandboxGoEnvProbe(goBin, probePath); err == nil {
 			goVersion = strings.TrimSpace(hostEnv.GOVERSION)
 			if goroot := strings.TrimSpace(hostEnv.GOROOT); goroot != "" && filepath.IsAbs(goroot) && isPathHiddenBySandbox(home, goroot) {
 				addRoot(goroot)
 			}
 			goproxy, download := sandboxGoProxy(hostEnv)
+			if noHostModuleCache {
+				// A networked fetch downloads into the shared fetch module
+				// cache; it must not read the host cache (private modules) over
+				// the network.
+				goproxy, download = sandboxGoProxyUpstream(hostEnv), ""
+			}
 			if download != "" && isPathHiddenBySandbox(home, download) {
 				addRoot(download)
 			}
@@ -496,10 +515,7 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	}
 
 	if resolved["cargo"] != "" || resolved["rustc"] != "" || resolved["rustup"] != "" {
-		rustupHome := strings.TrimSpace(getenv("RUSTUP_HOME"))
-		if rustupHome == "" {
-			rustupHome = filepath.Join(home, ".rustup")
-		}
+		rustupHome := hostRustupHome(home, getenv)
 		if info, err := os.Stat(rustupHome); err == nil && info.IsDir() {
 			if isPathHiddenBySandbox(home, rustupHome) {
 				addRoot(rustupHome)
@@ -511,6 +527,21 @@ func resolveSandboxToolchains(home, workspace, pathEnv string, getenv func(strin
 	}
 
 	return pruneNestedRoots(candidates), env, goVersion
+}
+
+// hostRustupHome returns the rustup home the sandbox hands its rustup
+// proxies: RUSTUP_HOME, or ~/.rustup ("" without an absolute HOME). A
+// relative RUSTUP_HOME is ignored, like a relative PATH entry: inside the
+// sandbox it would resolve against the workspace, letting the project supply
+// rustup's settings and toolchains.
+func hostRustupHome(home string, getenv func(string) string) string {
+	if rustupHome := strings.TrimSpace(getenv("RUSTUP_HOME")); filepath.IsAbs(rustupHome) {
+		return filepath.Clean(rustupHome)
+	}
+	if !filepath.IsAbs(home) {
+		return ""
+	}
+	return filepath.Join(home, ".rustup")
 }
 
 // sandboxToolchainRoot picks the directory to re-bind for a toolchain binary
@@ -645,11 +676,18 @@ func sandboxGoProxy(hostEnv hostGoEnv) (value, download string) {
 			proxies = append(proxies, "file://"+filepath.ToSlash(dir))
 		}
 	}
+	return strings.Join(append(proxies, sandboxGoProxyUpstream(hostEnv)), ","), download
+}
+
+// sandboxGoProxyUpstream returns the host's module proxies without any entry
+// that carries credentials, defaulting to proxy.golang.org and direct. It is
+// the GOPROXY of a networked fetch, which has no host module cache to read.
+func sandboxGoProxyUpstream(hostEnv hostGoEnv) string {
 	upstream := sanitizeGoProxyList(hostEnv.GOPROXY)
 	if upstream == "" {
 		upstream = "https://proxy.golang.org,direct"
 	}
-	return strings.Join(append(proxies, upstream), ","), download
+	return upstream
 }
 
 // goProxySpec is one entry of a GOPROXY list as the go command reads it
