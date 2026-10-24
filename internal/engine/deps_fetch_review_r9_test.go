@@ -72,6 +72,11 @@ fi
 				t.Errorf("local replacements = %v, %v", dirs, err)
 			}
 		}},
+		{"workspace replacement parser", func(t *testing.T) {
+			if _, err := parseGoWorkWithGoCommand(goBin, fetchPathEnv(workspace), []byte("go 1.26.10\nuse .\n")); err != nil {
+				t.Fatal(err)
+			}
+		}},
 		{"offline need parser", func(*testing.T) {
 			_ = project.goRegistryNeed(ExecPlan{Command: "go", Args: []string{"mod", "tidy"}})
 		}},

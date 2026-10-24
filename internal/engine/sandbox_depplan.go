@@ -36,6 +36,8 @@ type fetchRefusal struct{ reason string }
 
 func (r *fetchRefusal) Error() string { return r.reason }
 
+var errUnparsedGoWork = errors.New("go.work could not be parsed before fetching")
+
 // refuseFetch reports a refused networked fetch: a result carrying the reason
 // and an error wrapping ErrDependencyNetworkUnavailable.
 func refuseFetch(result *ExecResult, network sandboxNetwork, reason string) (*ExecResult, sandboxNetwork, error) {
@@ -347,6 +349,13 @@ func (p *Project) planDependencyStages(plan ExecPlan, projectDir string) (fetch,
 	switch plan.Command {
 	case "go":
 		fetch, err = p.goDependencyStages(plan, projectDir, ws, stage)
+		if errors.Is(err, errUnparsedGoWork) {
+			// Never network an incompletely inspected workspace. Let the
+			// ordinary loopback step report its own syntax/runtime failure,
+			// rather than labelling malformed candidate input an outage.
+			b := plan
+			fetch, build, err = nil, &b, nil
+		}
 	case "cargo":
 		fetch, build, err = p.cargoDependencyStages(plan, projectDir, ws, stage)
 	case "pip", "pip3":
@@ -440,7 +449,7 @@ var cargoFetchSkipDirs = map[string]bool{"target": true, "node_modules": true, "
 // cargoFetchSources copies every Cargo.toml and Cargo.lock of the workspace
 // into the fetch directory, with an empty stub file at each target path cargo
 // needs to load the manifests (src/lib.rs, src/main.rs, src/bin/*, a build
-// script, explicit [lib], [[bin]], [[example]], [[test]] and [[bench]] paths)
+// script, explicit target paths and inferred examples, tests and benches)
 // where the workspace has one - never its contents. Hidden directories, target,
 // node_modules and vendor are not searched.
 func cargoFetchSources(ws *os.Root, dir *fetchDir) error {
@@ -494,15 +503,25 @@ func cargoTargetStubs(ws *os.Root, dir *fetchDir, manifestDir, manifest string) 
 			}
 		}
 	}
-	if entries, err := fs.ReadDir(ws.FS(), filepath.ToSlash(filepath.Join(manifestDir, "src", "bin"))); err == nil {
+	for _, targetDir := range []string{"src/bin", "examples", "tests", "benches"} {
+		entries, err := fs.ReadDir(ws.FS(), filepath.ToSlash(filepath.Join(manifestDir, targetDir)))
+		if err != nil {
+			continue
+		}
+		if len(entries) > maxFetchManifests {
+			return &fetchRefusal{reason: "too many Cargo targets for the bounded manifest-only fetch"}
+		}
 		for _, entry := range entries {
 			switch {
 			case entry.Type().IsRegular() && strings.HasSuffix(entry.Name(), ".rs"):
-				candidates = append(candidates, "src/bin/"+entry.Name())
+				candidates = append(candidates, targetDir+"/"+entry.Name())
 			case entry.IsDir():
-				candidates = append(candidates, "src/bin/"+entry.Name()+"/main.rs")
+				candidates = append(candidates, targetDir+"/"+entry.Name()+"/main.rs")
 			}
 		}
+	}
+	if len(candidates) > maxFetchManifests {
+		return &fetchRefusal{reason: "too many Cargo targets for the bounded manifest-only fetch"}
 	}
 	for _, candidate := range candidates {
 		rel := filepath.Clean(filepath.Join(manifestDir, filepath.FromSlash(candidate)))
@@ -551,17 +570,41 @@ func (p *Project) goDependencyStages(plan ExecPlan, projectDir string, ws *os.Ro
 // the networked fetch.
 func (p *Project) goFetchSources(ws *os.Root, projectDir string, dir *fetchDir, tidy bool) error {
 	modules := []string{"."}
+	var workReplacements []goModReplacement
 	if data, err := readRegularNoFollow(ws, "go.work", maxFetchManifestBytes); err == nil {
 		if err := dir.writeFile("go.work", data, 0o600); err != nil {
 			return err
 		}
-		modules = append(modules, goWorkUses(string(data))...)
+		pathEnv := fetchPathEnv(projectDir)
+		goBin := trustedToolPath("go", projectDir, pathEnv)
+		if !filepath.IsAbs(goBin) {
+			return &fetchRefusal{reason: "a trusted Go toolchain is needed to read go.work before the networked fetch"}
+		}
+		work, err := parseGoWorkWithGoCommand(goBin, pathEnv, data)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errUnparsedGoWork, err)
+		}
+		for _, use := range work.Use {
+			modules = append(modules, use.DiskPath)
+		}
+		workReplacements = work.Replace
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return &fetchRefusal{reason: "makewand cannot read go.work for the manifest-only fetch: " + err.Error()}
 	}
 	// Only the main modules' replace directives apply (the go command ignores
 	// those of other modules): the module and the ones go.work uses.
 	main := map[string]bool{}
 	for _, module := range modules {
 		main[filepath.Clean(filepath.FromSlash(module))] = true
+	}
+	workDirs, err := goReplacementDirectories(projectDir, ".", "go.work", workReplacements, nil)
+	if err != nil {
+		return err
+	}
+	modules = append(modules, workDirs...)
+	workOverrides := map[string]bool{}
+	for _, rep := range workReplacements {
+		workOverrides[rep.Old.Path+"\x00"+rep.Old.Version] = true
 	}
 	seen := map[string]bool{}
 	for len(modules) > 0 {
@@ -590,7 +633,7 @@ func (p *Project) goFetchSources(ws *os.Root, projectDir string, dir *fetchDir, 
 			}
 		}
 		if main[module] {
-			replacements, err := p.goLocalReplacements(projectDir, module, gomod)
+			replacements, err := p.goLocalReplacements(projectDir, module, gomod, workOverrides)
 			if err != nil {
 				return err
 			}
@@ -605,33 +648,10 @@ func (p *Project) goFetchSources(ws *os.Root, projectDir string, dir *fetchDir, 
 	return nil
 }
 
-// goWorkUses returns the directories a go.work file's use directives name.
-func goWorkUses(content string) []string {
-	var uses []string
-	inBlock := false
-	for _, line := range strings.Split(content, "\n") {
-		if i := strings.Index(line, "//"); i >= 0 {
-			line = line[:i]
-		}
-		fields := strings.Fields(line)
-		switch {
-		case inBlock && len(fields) > 0 && fields[0] == ")":
-			inBlock = false
-		case inBlock && len(fields) > 0:
-			uses = append(uses, strings.Trim(fields[0], "\"`"))
-		case len(fields) >= 2 && fields[0] == "use" && fields[1] == "(":
-			inBlock = true
-		case len(fields) >= 2 && fields[0] == "use":
-			uses = append(uses, strings.Trim(fields[1], "\"`"))
-		}
-	}
-	return uses
-}
-
 // goLocalReplacements returns the workspace-relative directories the replace
 // directives of a module's go.mod point to. One outside the workspace is a
-// *fetchRefusal.
-func (p *Project) goLocalReplacements(projectDir, module string, gomod []byte) ([]string, error) {
+// *fetchRefusal. Workspace replacements override matching module replacements.
+func (p *Project) goLocalReplacements(projectDir, module string, gomod []byte, workOverrides ...map[string]bool) ([]string, error) {
 	if !strings.Contains(string(gomod), "replace") {
 		return nil, nil
 	}
@@ -644,8 +664,19 @@ func (p *Project) goLocalReplacements(projectDir, module string, gomod []byte) (
 	if err != nil {
 		return nil, nil // the go command reports the broken go.mod itself
 	}
+	var overrides map[string]bool
+	if len(workOverrides) > 0 {
+		overrides = workOverrides[0]
+	}
+	return goReplacementDirectories(projectDir, module, "go.mod", mod.Replace, overrides)
+}
+
+func goReplacementDirectories(projectDir, module, manifest string, replacements []goModReplacement, overrides map[string]bool) ([]string, error) {
 	var dirs []string
-	for _, rep := range mod.Replace {
+	for _, rep := range replacements {
+		if overrides[rep.Old.Path+"\x00"] || overrides[rep.Old.Path+"\x00"+rep.Old.Version] {
+			continue
+		}
 		if rep.New.Version != "" {
 			continue
 		}
@@ -655,7 +686,7 @@ func (p *Project) goLocalReplacements(projectDir, module string, gomod []byte) (
 		}
 		rel, err := filepath.Rel(projectDir, filepath.Clean(target))
 		if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return nil, &fetchRefusal{reason: "go.mod replaces " + truncateForNote(rep.Old.Path) + " with the directory " + truncateForNote(rep.New.Path) + ", which lies outside the project and so outside what the networked go fetch sees; install the project's dependencies outside makewand"}
+			return nil, &fetchRefusal{reason: manifest + " replaces " + truncateForNote(rep.Old.Path) + " with the directory " + truncateForNote(rep.New.Path) + ", which lies outside the project and so outside what the networked go fetch sees; install the project's dependencies outside makewand"}
 		}
 		dirs = append(dirs, rel)
 	}

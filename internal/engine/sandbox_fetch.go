@@ -1027,9 +1027,7 @@ func cutHeaderPrefix(line, lowerPrefix string) (string, bool) {
 func pipWheelRequirement(value string, contexts []string) (string, bool) {
 	req, marker, hasMarker := strings.Cut(value, ";")
 	req = strings.TrimSpace(req)
-	if m := pipParenSpecifierRe.FindStringSubmatch(req); m != nil {
-		req = strings.TrimSpace(m[1]) + strings.TrimSpace(m[2])
-	}
+	req = normalizePipRequirementParens(req)
 	marker = strings.TrimSpace(marker)
 	switch {
 	case req == "":

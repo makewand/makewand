@@ -152,7 +152,10 @@ const (
 // or find-links location the fetch cannot be given (not http(s), or a
 // directory outside the workspace) refuses the networked fetch.
 func (p *Project) pipFetchSourceArgs(install pipInstall, ws *os.Root, dir *fetchDir) (pipFetchSources, []string, error) {
-	cfg := p.pipConfigSources()
+	cfg, err := p.pipConfigSources()
+	if err != nil {
+		return pipFetchSources{}, nil, err
+	}
 	opts := install.sources
 	if opts.index == "" {
 		opts.index = cfg.index
@@ -309,9 +312,13 @@ func copyWheelDir(ws *os.Root, rel string, dst *fetchDir, total *int64) (int, er
 // (both read statically, never run), the trusted pip's site configuration,
 // and the project's, each overriding the ones before it; within a file the
 // [install] section overrides [global].
-func (p *Project) pipConfigSources() pipSourceOptions {
+func (p *Project) pipConfigSources() (pipSourceOptions, error) {
 	var cfg pipSourceOptions
-	for _, content := range p.pipConfigFileContents() {
+	contents, err := p.pipConfigFileContents()
+	if err != nil {
+		return cfg, err
+	}
+	for _, content := range contents {
 		values := pipConfigValues(content)
 		if v, ok := values["index-url"]; ok {
 			cfg.index = strings.TrimSpace(v)
@@ -337,7 +344,7 @@ func (p *Project) pipConfigSources() pipSourceOptions {
 			}
 		}
 	}
-	return cfg
+	return cfg, nil
 }
 
 // pipHostConfigFiles are the site-wide pip configuration files, lowest
@@ -347,40 +354,50 @@ var pipHostConfigFiles = []string{"/etc/xdg/pip/pip.conf", "/etc/pip.conf"}
 // pipConfigFileContents returns the contents of the pip configuration files
 // pipConfigSources reads, lowest precedence first. Files in the workspace are
 // read through its os.Root handle and never through a symlink.
-func (p *Project) pipConfigFileContents() []string {
+func (p *Project) pipConfigFileContents() ([]string, error) {
 	var contents []string
+	add := func(data []byte, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil || len(data) > maxReadFileSize {
+			return &fetchRefusal{reason: "makewand cannot read a pip configuration within its regular-file limits; refusing the networked fetch rather than changing its package sources"}
+		}
+		contents = append(contents, string(data))
+		return nil
+	}
 	for _, file := range pipHostConfigFiles {
-		if data, err := os.ReadFile(file); err == nil { //nolint:gosec // G304: fixed pip configuration paths
-			contents = append(contents, string(data))
+		if err := add(os.ReadFile(file)); err != nil { //nolint:gosec // G304: fixed pip configuration paths
+			return nil, err
 		}
 	}
 	projectDir, err := p.execWorkingDir()
 	if err != nil {
-		return contents
+		return nil, &fetchRefusal{reason: "makewand cannot inspect the project's pip configuration: " + err.Error()}
 	}
 	ws, err := os.OpenRoot(projectDir)
 	if err != nil {
-		return contents
+		return nil, &fetchRefusal{reason: "makewand cannot inspect the project's pip configuration: " + err.Error()}
 	}
 	defer ws.Close()
 	home := filepath.FromSlash(sandboxHomeRelPath)
 	for _, rel := range []string{filepath.Join(home, ".pip", "pip.conf"), filepath.Join(home, ".config", "pip", "pip.conf")} {
-		if data, err := readRegularNoFollow(ws, rel, maxReadFileSize); err == nil {
-			contents = append(contents, string(data))
+		if err := add(readRegularNoFollow(ws, rel, maxReadFileSize)); err != nil {
+			return nil, err
 		}
 	}
 	if python := pipFetchInterpreter(projectDir); python != "" {
 		site := filepath.Join(filepath.Dir(filepath.Dir(python)), "pip.conf")
-		if data, err := os.ReadFile(site); err == nil { //nolint:gosec // G304: the trusted pip's own site configuration
-			contents = append(contents, string(data))
+		if err := add(os.ReadFile(site)); err != nil { //nolint:gosec // G304: the trusted pip's own site configuration
+			return nil, err
 		}
 	}
 	for _, rel := range []string{"pip.conf", "pip.ini"} {
-		if data, err := readRegularNoFollow(ws, rel, maxReadFileSize); err == nil {
-			contents = append(contents, string(data))
+		if err := add(readRegularNoFollow(ws, rel, maxReadFileSize)); err != nil {
+			return nil, err
 		}
 	}
-	return contents
+	return contents, nil
 }
 
 // pipConfigValues reads a pip configuration file (configparser syntax: [section]

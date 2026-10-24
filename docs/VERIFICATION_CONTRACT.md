@@ -87,18 +87,24 @@ requirements (never a requirement/constraint file itself, nor a buildable
 `file:`/path/sdist/VCS/URL or `name @ …` target, wherever it is declared), with
 the install's http(s) index options and those of the pip configuration it would
 read (the project's `pip.conf`/`pip.ini`, the sandbox HOME's, site-wide and the
-trusted pip's site file; a configured index is never replaced by PyPI, a source
-the fetch cannot be given refuses it) and a constraints file of named pins
+trusted pip's site file; a configured index is never replaced by PyPI, and an
+unsupported source or unreadable configuration stops the fetch) and a constraints file of named pins
 (nested `-c`/`-r` followed); `npm ci --ignore-scripts` of a registry-only
 lockfile resolved and inspected first, only for `npm ci`/`npm install` without
 package arguments; `cargo fetch` pinned to a named rustup toolchain; `go mod
 download`/`tidy` — runs in a fresh, private fetch directory outside the
 workspace and its sandbox HOME (`$XDG_CACHE_HOME/makewand/dep-fetch`), with the
-workspace path covered by an empty tmpfs. The host copies in, through `os.Root`
+workspace path covered by an empty tmpfs. Pip normalizes parenthesized named
+version requirements from every source. Go workspace directives are parsed
+offline with the trusted toolchain; an unparsed workspace runs only in the
+loopback step so it can report its own error without a networked fetch.
+The host copies in, through `os.Root`
 handles and refusing symlinks and non-regular files, only what the fetch reads:
 `package.json` and the lockfile; every `Cargo.toml`/`Cargo.lock` with empty
-stubs at the target paths cargo needs; `go.mod`/`go.sum`/`go.work` (and those of
-local replacement modules inside the workspace) with, for `go mod tidy`,
+stubs at the target paths cargo needs, including inferred example/test/bench
+targets; `go.mod`/`go.sum`/`go.work` (and those of local replacement modules inside
+the workspace, including workspace replacements and their precedence) with,
+for `go mod tidy`,
 import-only stubs of the Go files (build constraints, package clause, import
 paths, no code); the wheels of a local `find-links` directory. The fetch runs
 the package manager resolved on the host outside the workspace (no symlink hop

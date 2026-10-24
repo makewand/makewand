@@ -952,7 +952,7 @@ type goModFile struct {
 	Go      string
 	Require []goModVersion
 	Exclude []goModVersion
-	Replace []struct{ Old, New goModVersion }
+	Replace []goModReplacement
 	Tool    []struct{ Path string }
 	Ignore  []struct{ Path string }
 }
@@ -961,6 +961,13 @@ type goModFile struct {
 // without a version is a local directory.
 type goModVersion struct {
 	Path, Version string
+}
+
+type goModReplacement = struct{ Old, New goModVersion }
+
+type goWorkFile struct {
+	Use     []struct{ DiskPath string }
+	Replace []goModReplacement
 }
 
 // goModParse parses go.mod content with the host go toolchain goBin (the one
@@ -997,6 +1004,36 @@ func parseGoModWithGoCommand(goBin, pathEnv string, data []byte) (*goModFile, er
 		return nil, fmt.Errorf("parse go mod edit output: %w", err)
 	}
 	return &mod, nil
+}
+
+// parseGoWorkWithGoCommand reads use and replace directives using the same
+// trusted tool/PATH and offline, out-of-workspace parsing as go.mod. Work
+// edit resolves no versions and cannot switch toolchains or run project code.
+func parseGoWorkWithGoCommand(goBin, pathEnv string, data []byte) (*goWorkFile, error) {
+	dir, err := os.MkdirTemp("", "makewand-gowork-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	file := filepath.Join(dir, "go.work")
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	//nolint:gosec // G204: validated host toolchain/PATH, fixed edit-only argv, no shell.
+	cmd := exec.CommandContext(ctx, goBin, "work", "edit", "-json", file)
+	cmd.Dir = string(filepath.Separator)
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("go work edit: %w", err)
+	}
+	var work goWorkFile
+	if err := json.Unmarshal(out, &work); err != nil {
+		return nil, fmt.Errorf("parse go work edit output: %w", err)
+	}
+	return &work, nil
 }
 
 // goRegistryNeed returns a module that the go plan - `go mod tidy`, or `go
@@ -2335,6 +2372,7 @@ func pipExtraNames(list string) []string {
 // (name @ url) does not count.
 func parsePipRequirement(text string) (pipRequirement, bool) {
 	text = strings.Join(strings.Fields(text), " ")
+	text = normalizePipRequirementParens(text)
 	m := pipRequirementRe.FindStringSubmatch(text)
 	if m == nil || strings.ContainsAny(m[2], ";@") {
 		return pipRequirement{}, false
@@ -2356,6 +2394,7 @@ func parsePipRequirement(text string) (pipRequirement, bool) {
 // smuggle a URL), and any '@' anywhere rejects a direct reference outright.
 func pipNamedRequirementText(text string) (string, bool) {
 	text = strings.Join(strings.Fields(text), " ")
+	text = normalizePipRequirementParens(text)
 	if text == "" || strings.Contains(text, "@") {
 		return "", false
 	}
@@ -2367,6 +2406,22 @@ func pipNamedRequirementText(text string) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+// Parenthesized PEP 508 specifiers are valid in every requirement source.
+// Only the name/specifier head is normalized; strict validation still rejects
+// paths, URLs, direct references and malformed trailing text.
+func normalizePipRequirementParens(text string) string {
+	head, marker, hasMarker := strings.Cut(text, ";")
+	m := pipParenSpecifierRe.FindStringSubmatch(strings.TrimSpace(head))
+	if m == nil {
+		return text
+	}
+	normalized := strings.TrimSpace(m[1]) + strings.TrimSpace(m[2])
+	if hasMarker {
+		normalized += " ; " + strings.TrimSpace(marker)
+	}
+	return normalized
 }
 
 // pipRemoteReference reports whether a requirement is one only a download
