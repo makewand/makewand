@@ -406,10 +406,14 @@ class OutcomeLedger:
             os.close(fd)
         return dict(row)
 
-    def _read_rows(self) -> List[Dict[str, Any]]:
+    def _read_rows(self, *, strict=False) -> List[Dict[str, Any]]:
         try:
             stream = open(self.outcomes_path, "r", encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return []
         except OSError:
+            if strict:
+                raise
             # Missing or unreadable (e.g. read-only state dir): empty ledger.
             return []
         rows: List[Dict[str, Any]] = []
@@ -417,6 +421,8 @@ class OutcomeLedger:
             try:
                 filelock.flock(stream.fileno(), filelock.LOCK_SH)
             except OSError:
+                if strict:
+                    raise
                 pass
             try:
                 for line in stream:
@@ -426,10 +432,14 @@ class OutcomeLedger:
                     try:
                         parsed = json.loads(text)
                     except ValueError:
+                        if strict:
+                            raise ValueError("cannot verify request cooldowns from corrupt outcome history") from None
                         continue
                     row = _validate_row(parsed)
                     if row is not None:
                         rows.append(row)
+                    elif strict:
+                        raise ValueError("cannot verify request cooldowns from invalid outcome metadata")
             finally:
                 try:
                     filelock.flock(stream.fileno(), filelock.LOCK_UN)
@@ -453,11 +463,17 @@ class OutcomeLedger:
         identifier(request_id, "request_id")
         moment = time.time() if now is None else _coerce_ts(now)
         latest = {}
-        for row in self.records():
-            if row.get("request_id") == request_id and row["ts"] <= moment:
-                old = latest.get(row["provider"])
-                if old is None or old["ts"] <= row["ts"]:
-                    latest[row["provider"]] = row
+        rows = sorted((row for row in self._read_rows(strict=True)
+                       if row.get("request_id") == request_id and row["ts"] <= moment), key=lambda row: row["ts"])
+        for row in rows:
+            provider = row["provider"]
+            if row["passed"]:
+                latest.pop(provider, None)
+            elif row.get("failure_kind") in ("unknown", "timeout"):
+                latest[provider] = row
+            elif latest.get(provider, {}).get("failure_kind") not in ("unknown", "timeout"):
+                if row.get("failure_kind") in ("startup", "auth", "quota"):
+                    latest[provider] = row
         blocked = {}
         for provider, row in latest.items():
             kind = row.get("failure_kind")

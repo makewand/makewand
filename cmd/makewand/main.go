@@ -164,7 +164,11 @@ scan:
 					if name == "--call-budget-file" && strings.TrimSpace(value) == "" {
 						return nil, fmt.Errorf("--call-budget-file requires a nonempty path")
 					}
-					globals = append(globals, name, value)
+					if strings.HasPrefix(value, "-") {
+						globals = append(globals, name+"="+value)
+					} else {
+						globals = append(globals, name, value)
+					}
 					matched = true
 					break
 				}

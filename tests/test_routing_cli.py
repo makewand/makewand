@@ -99,6 +99,33 @@ class RoutingCliTests(unittest.TestCase):
         self.assertTrue(payload["candidates"])
         self.assertTrue(all("--request-id=-user-42" in c["command"] for c in payload["candidates"]))
 
+    def test_escalation_hint_keeps_the_shared_request_budget(self):
+        import shlex
+        result = self.run_cli("route", "review", "normal", "--tier", "1", "--simple",
+                              "--request-id", "escalate-42", "--caller", "codex", "--max-model-calls", "5", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hint = next(line.split("：", 1)[1] for line in result.stdout.splitlines() if line.startswith("验收不过就升一档："))
+        follow = self.run_cli(*shlex.split(hint)[1:], "--json", quota={})
+        self.assertEqual(follow.returncode, 0, follow.stderr)
+        payload = json.loads(follow.stdout)
+        self.assertEqual(payload["budget"], 5)
+        for candidate in payload["candidates"]:
+            self.assertIn("--request-id escalate-42", candidate["command"])
+            self.assertIn("--caller codex", candidate["command"])
+
+    def test_custom_ledger_path_survives_candidates_and_escalation(self):
+        import shlex
+        ledger = str(self.base / "a space" / "calls.json")
+        result = self.run_cli("route", "review", "normal", "--tier", "1", "--simple",
+                              "--request-id", "custom-42", "--max-model-calls", "5", "--call-budget-file", ledger, quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hint = next(line.split("：", 1)[1] for line in result.stdout.splitlines() if line.startswith("验收不过就升一档："))
+        follow = self.run_cli(*shlex.split(hint)[1:], "--json", quota={})
+        self.assertEqual(follow.returncode, 0, follow.stderr)
+        for candidate in json.loads(follow.stdout)["candidates"]:
+            args = shlex.split(candidate["command"])
+            self.assertEqual(args[args.index("--call-budget-file") + 1], ledger)
+
     def test_unverified_review_cannot_be_recorded_as_valid(self):
         result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "unverified",
                               "--seconds", "1", "--calls", "1")

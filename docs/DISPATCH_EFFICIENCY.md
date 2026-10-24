@@ -18,7 +18,8 @@ makewand route review hard --risk high --self codex --not claude \
 ```
 
 The example excludes the named family; choose the actual implementation family.
-With a request ID, route's candidate commands carry that ID, caller and total cap.
+With a request ID, route's candidate commands and escalation hints carry that ID,
+caller, total cap and ledger path (including custom paths).
 Using `--request-id` without an explicit cap defaults to 3. An integration using
 only the legacy task-ID environment keeps its existing defaults; set both the ID
 and `MAKEWAND_MAX_MODEL_CALLS` to establish a bounded user request. `--max-model-calls` is the
@@ -72,6 +73,8 @@ for five minutes. Recorded unknown/timeouts require explicit `route
 --retry-approved` after user approval rather than expiring automatically. That
 option does not bypass global pauses, quota marks or shared budgets. Other
 requests remain unaffected. Successful work can supersede an earlier failure;
+later failures cannot clear an unresolved unknown/timeout. Unreadable or corrupt
+request history stops routing rather than pretending there were no failures.
 candidate rejection and verification failures do not trigger operational cooling.
 This is routing feedback from recorded outcomes, not a replacement for admission
 or a blanket ban on explicitly requested direct CLI calls.

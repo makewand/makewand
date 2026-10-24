@@ -66,6 +66,28 @@ class OutcomeLedgerTests(unittest.TestCase):
                            candidate_approved=False, request_id="one")
         self.assertNotIn("grok", self.ledger.request_cooldowns("one", now=now + 1))
 
+    def test_request_history_read_error_cannot_be_an_empty_history(self):
+        self.ledger.record("codex", 3, "review", False, request_id="one", failure_kind="unknown")
+        with patch("builtins.open", side_effect=PermissionError("unreadable")):
+            with self.assertRaises(PermissionError):
+                self.ledger.request_cooldowns("one")
+
+    def test_request_history_corruption_does_not_erase_unknown(self):
+        self.ledger.record("codex", 3, "review", False, request_id="one", failure_kind="unknown")
+        with self.ledger.outcomes_path.open("a") as stream:
+            stream.write('{"broken":\n')
+        self.assertEqual(len(list(self.ledger.records())), 1)  # legacy statistics remain tolerant
+        with self.assertRaisesRegex(ValueError, "corrupt"):
+            self.ledger.request_cooldowns("one")
+
+    def test_unknown_restriction_survives_all_later_failures(self):
+        for kind in ("startup", "auth", "quota", "verification", "invalid_output"):
+            with self.subTest(kind=kind):
+                request = "request-" + kind
+                self.ledger.record("codex", 3, "review", False, ts=100, request_id=request, failure_kind="unknown")
+                self.ledger.record("codex", 3, "review", False, ts=101, request_id=request, failure_kind=kind)
+                self.assertIn("retry-approved", self.ledger.request_cooldowns(request, now=10000).get("codex", ""))
+
     def test_invalid_details_cannot_poison_routing_history(self):
         for details in ({"candidate_hash": "not-a-hash"}, {"caller": "secret contents"},
                         {"request_id": "space is invalid"}, {"failure_kind": "unknown"},
