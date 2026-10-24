@@ -497,7 +497,10 @@ func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
 				return text + " (dependencies in " + manifest + ")"
 			}
 		}
-		optional, _ := p.pipOptionalDependencyTexts(project)
+		optional, _, err := p.pipOptionalDependencyTexts(project)
+		if err != nil {
+			return ""
+		}
 		for _, text := range optional {
 			if pipRemoteReference(text) && applies(text) {
 				return text + " (optional dependencies in " + manifest + ")"
@@ -2027,7 +2030,10 @@ func (p *Project) pipRegistryNeed(plan ExecPlan, evidence string) string {
 	requirements := install.requirements
 	for _, project := range install.projects {
 		requirements = append(requirements, p.pipStaticDependencies(project.dir)...)
-		optional, manifest := p.pipOptionalDependencyTexts(project)
+		optional, manifest, err := p.pipOptionalDependencyTexts(project)
+		if err != nil {
+			return ""
+		}
 		requirements = append(requirements, pipRequirementsOf(optional, "optional dependencies in "+manifest)...)
 	}
 	if len(requirements) == 0 {
@@ -2472,22 +2478,22 @@ func (p *Project) pipStaticDependencyTexts(dir string) ([]string, string) {
 // written, and the manifest's path. A self-reference - the project's own name
 // with extras, such as "proj[test]" - is the local project, not an index
 // requirement: it is never returned, the groups it names are, and its
-// environment marker is joined to theirs. Each group is expanded once (twice
-// when an unconditional reference follows a conditional one), which also
-// stops a cycle of self-references. Dynamic optional dependencies, or those a
+// environment marker is joined to theirs. Distinct conditions are retained;
+// ancestor paths stop cycles and bounded expansion refuses excessive graphs.
+// Dynamic optional dependencies, or those a
 // setup.py computes, are unknown.
-func (p *Project) pipOptionalDependencyTexts(project pipLocalProject) ([]string, string) {
+func (p *Project) pipOptionalDependencyTexts(project pipLocalProject) ([]string, string, error) {
 	manifest := filepath.Join(project.dir, "pyproject.toml")
 	if len(project.extras) == 0 {
-		return nil, manifest
+		return nil, manifest, nil
 	}
 	content, err := p.ReadFile(manifest)
 	if err != nil {
-		return nil, manifest
+		return nil, manifest, nil
 	}
 	doc := parseTOML(content)
 	if dynamic, ok := doc.value("project", "dynamic"); ok && slices.Contains(tomlStrings(dynamic), "optional-dependencies") {
-		return nil, manifest
+		return nil, manifest, nil
 	}
 	groups := map[string][]string{}
 	for _, entry := range doc.entries {
@@ -2508,29 +2514,70 @@ func (p *Project) pipOptionalDependencyTexts(project pipLocalProject) ([]string,
 		self = normalizePipName(firstTOMLString(name))
 	}
 
-	type visit struct{ group, marker string }
-	var queue []visit
-	for _, extra := range project.extras {
-		queue = append(queue, visit{group: extra})
+	type visit struct {
+		group, marker string
+		ancestors     []string
 	}
-	expanded := map[string]bool{} // group -> expanded unconditionally
+	const maxVisits, maxRequirements, maxMarkerBytes = 1024, 16384, 1 << 20
+	limit := &fetchRefusal{reason: "the optional dependencies in " + manifest +
+		" exceed makewand's bounded static expansion; simplify the extras graph or install dependencies outside makewand"}
+	var queue []visit
+	queued := map[string]bool{}
+	markerBytes := 0
+	enqueue := func(v visit) error {
+		// A cycle adds conjunctions and cannot enable anything the earlier,
+		// weaker prefix of this path did not already select.
+		if slices.Contains(v.ancestors, v.group) {
+			return nil
+		}
+		key := v.group + "\x00" + v.marker
+		if queued[key] {
+			return nil
+		}
+		if len(queued) >= maxVisits || len(v.marker) > 64<<10 ||
+			len(key) > maxMarkerBytes-markerBytes {
+			return limit
+		}
+		markerBytes += len(key)
+		queued[key] = true
+		queue = append(queue, v)
+		return nil
+	}
+	for _, extra := range project.extras {
+		if err := enqueue(visit{group: extra}); err != nil {
+			return nil, manifest, err
+		}
+	}
+	unconditional := map[string]bool{}
 	seen := map[string]bool{}
 	var texts []string
+	requirements, textBytes := 0, 0
 	for len(queue) > 0 {
 		v := queue[0]
 		queue = queue[1:]
-		if unconditional, done := expanded[v.group]; done && (unconditional || v.marker != "") {
+		if unconditional[v.group] && v.marker != "" {
 			continue
 		}
-		expanded[v.group] = v.marker == ""
+		if v.marker == "" {
+			unconditional[v.group] = true
+		}
+		ancestors := append(slices.Clone(v.ancestors), v.group)
 		for _, text := range groups[v.group] {
+			requirements++
+			if requirements > maxRequirements {
+				return nil, manifest, limit
+			}
 			text = strings.Join(strings.Fields(text), " ")
 			head, marker, _ := strings.Cut(text, ";")
-			if m := pipRequirementRe.FindStringSubmatch(strings.TrimSpace(head)); m != nil && self != "" && normalizePipName(m[1]) == self {
+			if m := pipRequirementRe.FindStringSubmatch(strings.TrimSpace(head)); m != nil &&
+				self != "" && normalizePipName(m[1]) == self {
 				if rest := strings.TrimSpace(m[2]); strings.HasPrefix(rest, "[") {
 					if end := strings.IndexByte(rest, ']'); end > 0 {
 						for _, extra := range pipExtraNames(rest[1:end]) {
-							queue = append(queue, visit{group: extra, marker: pipAndMarkers(v.marker, strings.TrimSpace(marker))})
+							next := visit{group: extra, marker: pipAndMarkers(v.marker, strings.TrimSpace(marker)), ancestors: ancestors}
+							if err := enqueue(next); err != nil {
+								return nil, manifest, err
+							}
 						}
 					}
 				}
@@ -2540,12 +2587,16 @@ func (p *Project) pipOptionalDependencyTexts(project pipLocalProject) ([]string,
 				text = strings.TrimSpace(head) + " ; " + pipAndMarkers(strings.TrimSpace(marker), v.marker)
 			}
 			if !seen[text] {
+				if len(text) > 64<<10 || len(text) > maxMarkerBytes-textBytes {
+					return nil, manifest, limit
+				}
+				textBytes += len(text)
 				seen[text] = true
 				texts = append(texts, text)
 			}
 		}
 	}
-	return texts, manifest
+	return texts, manifest, nil
 }
 
 // pipAndMarkers joins two environment markers with "and" ("" is always true).

@@ -62,7 +62,7 @@ func TestRegistryProbeChains_R4(t *testing.T) {
 	registryCheckEndpoints = func(string, string) []registryEndpoint { return endpoints }
 	t.Cleanup(func() { registryCheckEndpoints = old })
 
-	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", "")
+	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", t.TempDir())
 	if !check.done || len(check.unreachable) != 1 || !strings.HasPrefix(check.unreachable[0], "127.0.0.1 (") || !strings.Contains(check.unreachable[0], "connection refused") {
 		t.Fatalf("check = %+v, want only the chain ending at the closed port unreachable", check)
 	}

@@ -83,7 +83,7 @@ func TestRegistryProbeMovesPastPipeEntry_Final(t *testing.T) {
 	up := goProxyTLSServers(t, handler)[0]
 	down := closedAddr(t)
 	fakeGoOnPath(t, hostGoEnv{GOPROXY: "https://" + down + "|https://" + up})
-	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", "")
+	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", t.TempDir())
 	if !check.done || len(check.unreachable) != 0 || !slices.Equal(check.reached, []string{"127.0.0.1"}) {
 		t.Fatalf("check = %+v, want the proxy behind the '|' entry reached", check)
 	}
@@ -112,7 +112,7 @@ func TestRegistryProbeFollowsRedirectsLikeGo_Final(t *testing.T) {
 		{"https://" + srv + "/downgrade", "redirected from secure URL"},
 	} {
 		fakeGoOnPath(t, hostGoEnv{GOPROXY: tc.proxy + ",direct"})
-		check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", "")
+		check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", t.TempDir())
 		switch {
 		case !check.done:
 			t.Fatalf("%s: check did not run: %+v", tc.proxy, check)
@@ -166,7 +166,7 @@ func TestRegistryProbeTreatsOtherSupportAnswersLikeGo_Final(t *testing.T) {
 		{"https://" + addrs[0] + "|https://" + addrs[1], nil},
 	} {
 		fakeGoOnPath(t, hostGoEnv{GOPROXY: tc.goproxy})
-		check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", "")
+		check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", t.TempDir())
 		if !check.done || !slices.Equal(check.unreachable, tc.unreachable) {
 			t.Fatalf("GOPROXY=%s: check = %+v, want unreachable %q", tc.goproxy, check, tc.unreachable)
 		}

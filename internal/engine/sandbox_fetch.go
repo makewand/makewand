@@ -711,7 +711,7 @@ func (p *Project) execNpmFetch(ctx context.Context, env verifyExecEnvironment, p
 		if !networked && lockName == "" {
 			return refuseFetch(nil, none, "the project has no package-lock.json, and "+oldNpm+"commit a lockfile (npm install --package-lock-only) or use npm 12 or later; "+npmRegistryOnlyRemedy)
 		}
-		resolve := []string{"install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"}
+		resolve := npmResolutionArgs(plan.Args)
 		if !networked {
 			resolve = append(resolve, "--offline")
 		}
@@ -781,6 +781,14 @@ func (p *Project) execNpmFetch(ctx context.Context, env verifyExecEnvironment, p
 func (p *Project) npmFetchFallback(ctx context.Context, env verifyExecEnvironment, projectDir string, plan ExecPlan, readOnly []string, network sandboxNetwork) (*ExecResult, sandboxNetwork, error) {
 	result, err := p.execLoopbackStep(ctx, env, projectDir, plan, readOnly, true)
 	return result, network, err
+}
+
+// npmResolutionArgs preserves the same dependency-selection options as the
+// eventual install. Only its private lockfile-writing mode is forced.
+func npmResolutionArgs(planArgs []string) []string {
+	install := npmInstallArgs(planArgs, true)
+	args := append([]string{"install", "--package-lock-only"}, install[1:]...)
+	return append(args, "--package-lock=true")
 }
 
 // npmInstallArgs is the networked install of an npm plan: `npm ci` of the

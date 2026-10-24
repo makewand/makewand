@@ -635,7 +635,7 @@ func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, comm
 	attempts := 0
 	for attempts < registryCheckAttempts && ctx.Err() == nil {
 		attempts++
-		if check = runRegistryCheck(ctx, env, endpoints); check.done {
+		if check = runRegistryCheck(ctx, env, endpoints, workspace); check.done {
 			return check
 		}
 	}
@@ -646,7 +646,7 @@ func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, comm
 }
 
 // runRegistryCheck runs the probe once for endpoints.
-func runRegistryCheck(ctx context.Context, env verifyExecEnvironment, endpoints []registryEndpoint) registryCheck {
+func runRegistryCheck(ctx context.Context, env verifyExecEnvironment, endpoints []registryEndpoint, workspace string) registryCheck {
 	probe, err := registryProbeExecutable()
 	if err != nil {
 		return registryCheck{failure: err.Error()}
@@ -666,7 +666,7 @@ func runRegistryCheck(ctx context.Context, env verifyExecEnvironment, endpoints 
 	if env.mode == verifyExecUnsafeHost {
 		run = runRegistryProbeOnHost(checkCtx, dir, probe, args)
 	} else {
-		run = runRegistryProbeInSandbox(checkCtx, env.bwrapPath, dir, probe, args)
+		run = runRegistryProbeInSandbox(checkCtx, env.bwrapPath, dir, probe, workspace, args)
 	}
 	if run.failure != "" || ctx.Err() != nil {
 		return registryCheck{failure: run.failure}
@@ -693,15 +693,22 @@ func registryProbeSelf() (string, error) {
 }
 
 // runRegistryProbeInSandbox runs the probe in a fresh verification sandbox
-// whose workspace is the empty directory dir, with the user-mode network a
-// dependency install gets. The executable is bound into the sandbox, which
+// from the empty directory dir, retaining the original workspace exclusion,
+// with the user-mode network a dependency install gets. The executable is bound, which
 // hides HOME, /tmp and /mnt, where it may lie.
-func runRegistryProbeInSandbox(ctx context.Context, bwrapPath, dir, probe string, args []string) registryProbeRun {
+func runRegistryProbeInSandbox(ctx context.Context, bwrapPath, dir, probe, workspace string, args []string) registryProbeRun {
+	if workspace == "" {
+		return registryProbeRun{failure: "the original workspace boundary is unavailable"}
+	}
+	workspace, err := filepath.Abs(workspace)
+	if err != nil {
+		return registryProbeRun{failure: "the original workspace boundary cannot be resolved: " + err.Error()}
+	}
 	// The probe is a networked step running makewand's own code in an empty
 	// directory: it is wrapped as a networked fetch (a fresh HOME, no host
 	// module cache, no workspace) so it never binds the host caches or reads
 	// any project configuration.
-	wrappedCmd, wrappedArgs, err := wrapFetchCommand(bwrapPath, fetchSpec{dir: dir, readOnly: []string{probe}, pathEnv: sandboxPathEnv()}, probe, args)
+	wrappedCmd, wrappedArgs, err := wrapFetchCommand(bwrapPath, fetchSpec{workspace: workspace, dir: dir, readOnly: []string{probe}, pathEnv: fetchPathEnv(workspace)}, probe, args)
 	if err != nil {
 		return registryProbeRun{failure: "its sandbox could not be prepared: " + err.Error()}
 	}

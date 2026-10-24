@@ -474,55 +474,98 @@ func trustedToolPath(name, workspace, pathEnv string) string {
 // workspace: no hop of its symlink chain lies there, nor the interpreter its
 // #! line names.
 func trustedFetchExecutable(bin, workspace, pathEnv string) bool {
-	seen := map[string]bool{}
-	for range 16 {
-		if seen[bin] {
+	active, checked := map[string]bool{}, map[string]bool{}
+	remaining := 64
+	var check func(string, int) bool
+	check = func(bin string, depth int) bool {
+		if !filepath.IsAbs(bin) || depth >= 16 || active[bin] || remaining == 0 {
 			return false
 		}
-		seen[bin] = true
+		if checked[bin] {
+			return true
+		}
+		remaining--
+		active[bin] = true
+		defer delete(active, bin)
 		for _, hop := range symlinkChain(bin) {
 			if insideWorkspace(workspace, hop) {
 				return false
 			}
 		}
-		interpreter := scriptInterpreterAny(bin, pathEnv)
-		if interpreter == "" {
-			return true
-		}
-		if !filepath.IsAbs(interpreter) {
+		interpreters, known := scriptInterpreters(bin, pathEnv)
+		if !known {
 			return false
 		}
-		bin = interpreter
+		for _, interpreter := range interpreters {
+			if !check(interpreter, depth+1) {
+				return false
+			}
+		}
+		checked[bin] = true
+		return true
 	}
-	return false
+	return check(bin, 0)
 }
 
-// scriptInterpreterAny returns the absolute interpreter the #! line of script
-// names (through env too), or "".
+// scriptInterpreterAny returns the selected interpreter (through env too),
+// or "" for native files or unsupported shebangs. Trust decisions must use
+// scriptInterpreters' explicit known result.
 func scriptInterpreterAny(script, pathEnv string) string {
-	f, err := os.Open(script) //nolint:gosec // G304: an executable resolved from the sandbox PATH
-	if err != nil {
+	interpreters, known := scriptInterpreters(script, pathEnv)
+	if !known || len(interpreters) == 0 {
 		return ""
+	}
+	return interpreters[len(interpreters)-1]
+}
+
+// scriptInterpreters returns every executable a shebang selects, including
+// env itself. An empty known list means a native executable. Unknown or
+// unsupported shebangs are never trusted. env supports only its bare-command
+// form here: options, assignments and quoting must not be guessed on the host.
+func scriptInterpreters(script, pathEnv string) ([]string, bool) {
+	info, err := os.Stat(script) //nolint:gosec // executable resolved from the sandbox PATH
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, false
+	}
+	f, err := os.Open(script) //nolint:gosec // executable resolved from the sandbox PATH
+	if err != nil {
+		return nil, false
 	}
 	defer f.Close()
 	head := make([]byte, 256)
 	n, _ := io.ReadFull(f, head)
-	line, _, _ := strings.Cut(string(head[:n]), "\n")
+	line, _, complete := strings.Cut(string(head[:n]), "\n")
 	interpreter, ok := strings.CutPrefix(line, "#!")
+	if !ok {
+		return nil, true
+	}
 	fields := strings.Fields(interpreter)
-	if !ok || len(fields) == 0 {
-		return ""
+	if len(fields) == 0 || !filepath.IsAbs(fields[0]) || (n == len(head) && !complete) {
+		return nil, false
 	}
 	exe := fields[0]
 	if filepath.Base(exe) == "env" {
-		for _, arg := range fields[1:] {
-			if !strings.HasPrefix(arg, "-") {
-				return lookPathIn(arg, pathEnv)
-			}
+		if len(fields) != 2 || strings.HasPrefix(fields[1], "-") ||
+			strings.ContainsAny(fields[1], "=\"'\\") || strings.ContainsRune(fields[1], 96) {
+			return nil, false
 		}
-		return ""
+		command := fields[1]
+		if !filepath.IsAbs(command) {
+			if strings.ContainsAny(command, "/\\") {
+				return nil, false
+			}
+			command = lookPathIn(command, pathEnv)
+		}
+		if command == "" {
+			return nil, false
+		}
+		return []string{exe, command}, true
 	}
-	return exe
+	if len(fields) > 2 || (len(fields) == 2 && (!strings.HasPrefix(fields[1], "-") ||
+		strings.ContainsAny(fields[1], "/\\=\"'") || strings.ContainsRune(fields[1], 96))) {
+		return nil, false
+	}
+	return []string{exe}, true
 }
 
 // fetchSpec is the sandbox of one networked fetch command.

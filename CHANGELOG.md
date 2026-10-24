@@ -123,6 +123,8 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- 依赖取回复审修复：独立注册表/pip 索引探测始终携带原工作区边界；shebang 检查区分原生程序与无法解析的脚本并校验 env 启动器及解释器，拒绝不支持的 env 选项/赋值；extras 保留重复条件分支并有界处理循环；npm 锁解析保留 legacy-peer-deps 等依赖选择参数。
+
 - 证据写入同步 pending 标记，账本结算前保持 UNKNOWN，最终才发布 `settled: true` 的结果；读取不会把显式未结算的 PASSED 当作已验证模型。重命名后同步失败、最终标记创建失败和纠正写入失败均不会留下可采信的错误成功记录。
 - 普通非 Git 目录的忽略规则探测在外部临时仓库运行时，Git 可执行路径仍排除原工作区；每个子命令重新校验缓存与符号链接，防止工作区内假 Git 在宿主执行。
 

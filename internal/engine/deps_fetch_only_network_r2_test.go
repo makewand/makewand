@@ -297,7 +297,7 @@ func TestNonexistentPipRequirementIsCandidateFailure_GEC1021R2(t *testing.T) {
 			project := newNeedProject(t, "requirements.txt", tc.req+"\n")
 			var asked []string
 			old := pipIndexFiles
-			pipIndexFiles = func(_ context.Context, _ verifyExecEnvironment, page string) ([]pipIndexFile, pipIndexAnswer) {
+			pipIndexFiles = func(_ context.Context, _ verifyExecEnvironment, page, _ string) ([]pipIndexFile, pipIndexAnswer) {
 				asked = append(asked, page)
 				return tc.files, tc.answer
 			}

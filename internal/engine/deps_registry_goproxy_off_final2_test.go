@@ -316,7 +316,7 @@ func TestGoSumDBOffAfterPipeFailureEndToEnd_Final2(t *testing.T) {
 	proxied := refuseNonLocalRequests(t)
 	goproxy := "https://" + up + "|https://" + down + "|off"
 	fakeGoOnPath(t, hostGoEnv{GOPROXY: goproxy})
-	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", "")
+	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "go", t.TempDir())
 	if !check.done || !slices.Equal(check.reached, []string{"127.0.0.1"}) || len(check.unreachable) != 1 ||
 		!strings.HasPrefix(check.unreachable[0], "127.0.0.1 (") || !strings.Contains(check.unreachable[0], down) {
 		t.Fatalf("check = %+v, want the modules reached and the database unavailable through %s", check, down)

@@ -60,7 +60,7 @@ var pipIndexFiles = lookupPipIndexFiles
 
 // lookupPipIndexFiles runs the probe for pageURL in a fresh sandbox with the
 // user-mode network, from an empty directory.
-func lookupPipIndexFiles(ctx context.Context, env verifyExecEnvironment, pageURL string) ([]pipIndexFile, pipIndexAnswer) {
+func lookupPipIndexFiles(ctx context.Context, env verifyExecEnvironment, pageURL, workspace string) ([]pipIndexFile, pipIndexAnswer) {
 	if env.mode != verifyExecIsolated {
 		return nil, pipIndexUnknown
 	}
@@ -75,7 +75,7 @@ func lookupPipIndexFiles(ctx context.Context, env verifyExecEnvironment, pageURL
 	defer os.RemoveAll(dir)
 	checkCtx, cancel := context.WithTimeout(ctx, registryCheckTimeout)
 	defer cancel()
-	run := runRegistryProbeInSandbox(checkCtx, env.bwrapPath, dir, probe, []string{pipIndexProbeArg, pageURL})
+	run := runRegistryProbeInSandbox(checkCtx, env.bwrapPath, dir, probe, workspace, []string{pipIndexProbeArg, pageURL})
 	if run.failure != "" {
 		return nil, pipIndexUnknown
 	}
@@ -284,7 +284,7 @@ func (p *Project) pipReleaseCheck(ctx context.Context, env verifyExecEnvironment
 	listed := false
 	for _, index := range sources.indexes() {
 		page := strings.TrimSuffix(index, "/") + "/" + name + "/"
-		found, answer := pipIndexFiles(ctx, env, page)
+		found, answer := pipIndexFiles(ctx, env, page, p.Path)
 		switch answer {
 		case pipIndexUnknown:
 			return pipReleaseUnknown, "makewand could not ask the package index " + truncateForNote(redactURL(index)) + " which releases of " + name + " exist, so it cannot attribute the missing distribution " + truncateForNote(requirement) + " to fetch-only networking"

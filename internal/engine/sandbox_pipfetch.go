@@ -38,7 +38,10 @@ func (p *Project) pipDependencyStages(plan ExecPlan, ws *os.Root, stage *fetchSt
 		return nil, nil, err
 	}
 	stage.pip = sources
-	fetchArgs, hasTargets := p.pipDownloadArgs(install, wheelhouse, sourceArgs)
+	fetchArgs, hasTargets, err := p.pipDownloadArgs(install, wheelhouse, sourceArgs)
+	if err != nil {
+		return nil, nil, err
+	}
 	if !hasTargets {
 		// Nothing the install resolves from a package index (for example `-e .`
 		// with no declared dependencies): there is nothing to download, so no
@@ -72,7 +75,7 @@ func (p *Project) pipDependencyStages(plan ExecPlan, ws *os.Root, stage *fetchSt
 // code while the network is available. The offline build installs the local
 // project from the wheelhouse instead, loopback-only. hasTargets reports
 // whether anything resolves from an index at all.
-func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string, sourceArgs []string) (args []string, hasTargets bool) {
+func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string, sourceArgs []string) (args []string, hasTargets bool, err error) {
 	var reqs []string
 	add := func(texts ...string) {
 		for _, text := range texts {
@@ -89,7 +92,10 @@ func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string, sourceA
 		// whenever the marker holds.
 		texts, _ := p.pipStaticDependencyTexts(project.dir)
 		add(texts...)
-		optional, _ := p.pipOptionalDependencyTexts(project)
+		optional, _, err := p.pipOptionalDependencyTexts(project)
+		if err != nil {
+			return nil, false, err
+		}
 		add(optional...)
 	}
 	for _, wheel := range install.wheels {
@@ -98,12 +104,12 @@ func (p *Project) pipDownloadArgs(install pipInstall, wheelhouse string, sourceA
 		add(p.pipWheelRequires(wheel.dir, wheel.extras)...)
 	}
 	if len(reqs) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	args = []string{"download", "--only-binary=:all:", "--no-input", "--dest", wheelhouse}
 	args = append(args, sourceArgs...)
 	args = append(args, reqs...)
-	return args, true
+	return args, true, nil
 }
 
 // pipFetchSources are the package sources a pip fetch used, for asking its

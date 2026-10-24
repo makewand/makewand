@@ -93,7 +93,7 @@ func TestRegistryCheckScriptAgainstLocalServers_R3(t *testing.T) {
 	registryCheckEndpoints = func(string, string) []registryEndpoint { return registryEndpoints(urls...) }
 	t.Cleanup(func() { registryCheckEndpoints = old })
 
-	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "npm", "")
+	check := checkRegistryReachable(context.Background(), verifyExecEnvironment{mode: verifyExecUnsafeHost}, "npm", t.TempDir())
 	if !check.done || len(check.unreachable) != 2 {
 		t.Fatalf("check = %+v, want the closed port and the untrusted server unreachable", check)
 	}
@@ -150,7 +150,7 @@ func TestRegistryCheckFromRealSandboxLive_R3(t *testing.T) {
 	registryCheckEndpoints = func(string, string) []registryEndpoint { return registryEndpoints("https://10.255.255.1/") }
 	t.Cleanup(func() { registryCheckEndpoints = old })
 	start := time.Now()
-	check := checkRegistryReachable(context.Background(), env, "npm", "")
+	check := checkRegistryReachable(context.Background(), env, "npm", t.TempDir())
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("check took %s", elapsed)
 	}
