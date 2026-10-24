@@ -408,7 +408,7 @@ class OutcomeLedger:
 
     def _read_rows(self, *, strict=False) -> List[Dict[str, Any]]:
         try:
-            stream = open(self.outcomes_path, "r", encoding="utf-8", errors="replace")
+            stream = open(self.outcomes_path, "r", encoding="utf-8", errors="strict" if strict else "replace")
         except FileNotFoundError:
             return []
         except OSError:

@@ -80,6 +80,19 @@ class OutcomeLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "corrupt"):
             self.ledger.request_cooldowns("one")
 
+    def test_invalid_utf8_cannot_remove_request_retry_restrictions(self):
+        for kind in ("unknown", "timeout"):
+            with self.subTest(kind=kind):
+                ledger = OutcomeLedger(self.base / kind)
+                ledger.record("codex", 3, "review", False, request_id="one", failure_kind=kind)
+                payload = ledger.outcomes_path.read_bytes()
+                ledger.outcomes_path.write_bytes(payload.replace(b'"codex"', b'"cod\xffx"'))
+                # Legacy quality statistics tolerate damaged text; request
+                # restrictions must fail closed instead of renaming a provider.
+                self.assertEqual(len(list(ledger.records())), 1)
+                with self.assertRaises(UnicodeDecodeError):
+                    ledger.request_cooldowns("one")
+
     def test_unknown_restriction_survives_all_later_failures(self):
         for kind in ("startup", "auth", "quota", "verification", "invalid_output"):
             with self.subTest(kind=kind):

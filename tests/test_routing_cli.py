@@ -89,6 +89,17 @@ class RoutingCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("cannot replace", result.stderr)
 
+    def test_route_rejects_invalid_utf8_request_history(self):
+        recorded = self.run_cli("outcome", "codex", "3", "review", "fail", "--failure-kind", "unknown",
+                                "--request-id", "corrupt-42", "--seconds", "1", "--calls", "1")
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        history = self.routing_dir / "outcomes.jsonl"
+        history.write_bytes(history.read_bytes().replace(b'"codex"', b'"cod\xffx"'))
+        result = self.run_cli("route", "review", "hard", "--simple", "--request-id", "corrupt-42", "--json", quota={})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("utf-8", result.stderr)
+
     def test_empty_request_id_cannot_silently_start_a_new_budget(self):
         result = self.run_cli("route", "review", "normal", "--request-id", "", "--json")
         self.assertEqual(result.returncode, 2)
