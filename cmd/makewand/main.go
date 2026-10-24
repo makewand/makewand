@@ -36,6 +36,8 @@ var (
 	repoTrustFlag          string
 	rootApprovalFlag       string
 	rootMaxModelCallsFlag  int
+	rootRequestIDFlag      string
+	rootCallerFlag         string
 	rootCallBudgetFileFlag string
 
 	// resolvedRepoTrust holds the repository trust level parsed once by the root
@@ -524,6 +526,8 @@ Flags:
 	rootCmd.PersistentFlags().StringVar(&repoTrustFlag, "repo-trust", "trusted", "repository trust level: trusted (default) or untrusted (only direct API providers, fail closed)")
 	rootCmd.PersistentFlags().StringVar(&rootApprovalFlag, "approval", "", "approval mode for this run: manual, safe, or autopilot (default: configured value; persist with `makewand setup --approval ...`; autopilot auto-applies only with configured independent Strength-2 acceptance, otherwise still asks)")
 	rootCmd.PersistentFlags().IntVar(&rootMaxModelCallsFlag, "max-model-calls", 0, "maximum attempted model dispatches shared by Go and Python (failed and canceled calls count)")
+	rootCmd.PersistentFlags().StringVar(&rootRequestIDFlag, "request-id", "", "stable user-request ID across CLI calls (default total cap 3)")
+	rootCmd.PersistentFlags().StringVar(&rootCallerFlag, "caller", "", "initiating tool: claude, codex, agy, grok, muse, human, automation")
 	rootCmd.PersistentFlags().StringVar(&rootCallBudgetFileFlag, "call-budget-file", "", "persistent process-safe model call budget ledger")
 	rootCmd.Flags().StringVar(&rootModeFlag, "mode", "", "usage mode: fast, balanced, power")
 	rootCmd.Flags().StringVar(&rootModeFlag, "tier", "", "alias for --mode: fast, balanced (standard), power (deep)")

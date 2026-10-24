@@ -13,6 +13,37 @@ import (
 // Resolve the stable machine ledger before any Router is built. Task limits
 // live in their own scope and never overwrite the daily limits.
 func configureExecutionBudget(cmd *cobra.Command) error {
+	requestID := os.Getenv("MAKEWAND_TASK_ID")
+	explicitRequest := cmd.Flags().Changed("request-id") || cmd.InheritedFlags().Changed("request-id")
+	if explicitRequest {
+		if !execution.ValidIdentifier(rootRequestIDFlag) {
+			return fmt.Errorf("--request-id must be a valid nonempty identifier")
+		}
+		if requestID != "" && requestID != rootRequestIDFlag {
+			return fmt.Errorf("--request-id cannot replace an inherited user request")
+		}
+		requestID = rootRequestIDFlag
+		if err := os.Setenv("MAKEWAND_TASK_ID", requestID); err != nil {
+			return err
+		}
+	}
+	if requestID != "" && !execution.ValidIdentifier(requestID) {
+		return fmt.Errorf("invalid inherited user request ID")
+	}
+	caller := os.Getenv("MAKEWAND_CALLER")
+	if cmd.Flags().Changed("caller") || cmd.InheritedFlags().Changed("caller") {
+		caller = rootCallerFlag
+	}
+	if caller != "" {
+		switch caller {
+		case "claude", "codex", "agy", "grok", "muse", "human", "automation":
+		default:
+			return fmt.Errorf("invalid initiating caller")
+		}
+		if err := os.Setenv("MAKEWAND_CALLER", caller); err != nil {
+			return err
+		}
+	}
 	maximumText := os.Getenv("MAKEWAND_MAX_MODEL_CALLS")
 	inheritedMaximum := 0
 	if maximumText != "" {
@@ -24,6 +55,9 @@ func configureExecutionBudget(cmd *cobra.Command) error {
 	}
 	if cmd.Flags().Changed("max-model-calls") || cmd.InheritedFlags().Changed("max-model-calls") {
 		maximumText = strconv.Itoa(rootMaxModelCallsFlag)
+	}
+	if explicitRequest && maximumText == "" {
+		maximumText = "3"
 	}
 	maximum := 0
 	if maximumText != "" {

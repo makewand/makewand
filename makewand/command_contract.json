@@ -77,7 +77,9 @@
     "--judge-reserve-seconds",
     "--protect",
     "--effort",
-    "--reasoning-effort"
+    "--reasoning-effort",
+    "--request-id",
+    "--caller"
   ],
   "shared_value_flags": [
     "-C",
@@ -85,7 +87,9 @@
     "--repo-trust",
     "--approval",
     "--max-model-calls",
-    "--call-budget-file"
+    "--call-budget-file",
+    "--request-id",
+    "--caller"
   ],
   "python_boolean_flags": [
     "--daemon",

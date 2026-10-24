@@ -86,6 +86,52 @@ func TestNativeBudgetFlagsInitializePrivateSharedLedger(t *testing.T) {
 	}
 }
 
+func TestNativeStableRequestSharesDefaultCapAcrossCommands(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "calls.json")
+	for _, name := range []string{"MAKEWAND_TASK_ID", "MAKEWAND_MAX_MODEL_CALLS", "MAKEWAND_CALLER"} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("MAKEWAND_CALL_BUDGET_FILE", path)
+	t.Setenv("MAKEWAND_LAYERED_BUDGET", "1")
+	for index := 0; index < 4; index++ {
+		cmd := newRootCmd()
+		cmd.SetArgs([]string{"--request-id", "shared-user-request", "--caller", "codex"})
+		cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+			ctx := execution.ContextWithConfig(cmd.Context(), execution.Config{LedgerPath: path, MaxCalls: 3, TaskID: os.Getenv("MAKEWAND_TASK_ID")})
+			attempt, err := execution.Reserve(ctx, execution.Metadata{Engine: "synthetic", Tier: "standard", Stage: "review"})
+			if err != nil {
+				return err
+			}
+			return attempt.Complete(execution.Outcome{Status: execution.Passed, Known: true})
+		}
+		err := cmd.Execute()
+		if index < 3 && err != nil {
+			t.Fatal(err)
+		}
+		if index == 3 && !errors.Is(err, execution.ErrBudgetExhausted) {
+			t.Fatalf("fourth independent command escaped shared cap: %v", err)
+		}
+	}
+	if os.Getenv("MAKEWAND_MAX_MODEL_CALLS") != "3" || os.Getenv("MAKEWAND_CALLER") != "codex" {
+		t.Fatal("request metadata was not preserved")
+	}
+}
+
+func TestLegacyInheritedTaskDoesNotAcquireNewRequestDefault(t *testing.T) {
+	t.Setenv("MAKEWAND_TASK_ID", "legacy-service-task")
+	t.Setenv("MAKEWAND_MAX_MODEL_CALLS", "")
+	t.Setenv("MAKEWAND_CALL_BUDGET_FILE", filepath.Join(t.TempDir(), "calls.json"))
+	cmd := newRootCmd()
+	cmd.SetArgs(nil)
+	cmd.RunE = func(*cobra.Command, []string) error { return nil }
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("MAKEWAND_MAX_MODEL_CALLS") != "" {
+		t.Fatal("legacy service inherited a new three-call cap")
+	}
+}
+
 func TestNativeChildCannotReplaceInheritedBudgetOrRaiseMaximum(t *testing.T) {
 	t.Setenv("MAKEWAND_LAYERED_BUDGET", "")
 	path := filepath.Join(t.TempDir(), "parent.json")

@@ -20,6 +20,25 @@ EXIT_LEDGER_ERROR = 1
 
 
 def cmd_budget(args) -> None:
+    if args.budget_action == "request":
+        try:
+            if getattr(args, "repair", False):
+                raise call_budget.BudgetError("--repair is only for budget clock")
+            request_id = getattr(args, "request_id", None)
+            if not request_id:
+                raise call_budget.BudgetError("budget request requires --request-id")
+            report = call_budget.request_budget(request_id, maximum=getattr(args, "set_limit", None))
+        except (call_budget.BudgetError, ValueError) as error:
+            print(f"错误：{error}", file=sys.stderr)
+            raise SystemExit(EXIT_LEDGER_ERROR)
+        if getattr(args, "json", False):
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(f"请求 {report['request_id']}：已用 {report['used']} / {report['maximum']}，剩余 {report['remaining']}（不退还已计调用）")
+        return
+    if getattr(args, "set_limit", None) is not None:
+        print("错误：--set-limit 仅用于 budget request", file=sys.stderr)
+        raise SystemExit(EXIT_LEDGER_ERROR)
     repair = bool(getattr(args, "repair", False))
     try:
         report = call_budget.repair_clock(apply=repair)

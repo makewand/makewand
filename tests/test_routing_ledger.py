@@ -45,6 +45,34 @@ def _mode(path: Path) -> int:
 
 
 class OutcomeLedgerTests(unittest.TestCase):
+    def test_valid_review_of_rejected_code_improves_reviewer_statistics(self):
+        now = 1_700_000_000.0
+        self.ledger.record("codex", 3, "review", True, seconds=4, calls=1, ts=now,
+                           review_validated=True, candidate_approved=False,
+                           request_id="user-42", caller="agy", candidate_hash="b" * 64)
+        stats = self.ledger.stats("codex", 3, "review", now=now)
+        self.assertEqual((stats.alpha, stats.beta, stats.avg_seconds, stats.avg_calls), (2, 1, 4, 1))
+        self.assertFalse(next(self.ledger.records())["candidate_approved"])
+
+    def test_cooldown_uses_failure_kind_not_candidate_verdict(self):
+        now = 1_700_000_000.0
+        self.ledger.record("codex", 3, "review", False, ts=now, failure_kind="startup", request_id="one")
+        self.assertIn("codex", self.ledger.request_cooldowns("one", now=now + 299))
+        self.assertNotIn("codex", self.ledger.request_cooldowns("one", now=now + 301))
+        self.ledger.record("agy", 3, "review", False, ts=now, failure_kind="unknown", request_id="one")
+        self.assertIn("agy", self.ledger.request_cooldowns("one", now=now + 3600))
+        self.assertEqual(self.ledger.request_cooldowns("other", now=now + 1), {})
+        self.ledger.record("grok", 3, "review", True, ts=now, review_validated=True,
+                           candidate_approved=False, request_id="one")
+        self.assertNotIn("grok", self.ledger.request_cooldowns("one", now=now + 1))
+
+    def test_invalid_details_cannot_poison_routing_history(self):
+        for details in ({"candidate_hash": "not-a-hash"}, {"caller": "secret contents"},
+                        {"request_id": "space is invalid"}, {"failure_kind": "unknown"},
+                        {"review_validated": False}):
+            with self.subTest(details=details), self.assertRaises(ValueError):
+                self.ledger.record("codex", 3, "review", True, **details)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="mw-routing-ledger-")
         self.addCleanup(self._tmp.cleanup)
