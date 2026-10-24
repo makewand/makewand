@@ -463,8 +463,10 @@ class OutcomeLedger:
         identifier(request_id, "request_id")
         moment = time.time() if now is None else _coerce_ts(now)
         latest = {}
-        rows = sorted((row for row in self._read_rows(strict=True)
-                       if row.get("request_id") == request_id and row["ts"] <= moment), key=lambda row: row["ts"])
+        # The append lock orders operational observations even when the wall
+        # clock steps backward. Future-dated failures still require approval;
+        # accepted work appended afterward may supersede them with a lower ts.
+        rows = (row for row in self._read_rows(strict=True) if row.get("request_id") == request_id)
         for row in rows:
             provider = row["provider"]
             if row["passed"]:

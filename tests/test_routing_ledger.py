@@ -88,6 +88,18 @@ class OutcomeLedgerTests(unittest.TestCase):
                 self.ledger.record("codex", 3, "review", False, ts=101, request_id=request, failure_kind=kind)
                 self.assertIn("retry-approved", self.ledger.request_cooldowns(request, now=10000).get("codex", ""))
 
+    def test_clock_rollback_cannot_remove_retry_approval_boundary(self):
+        for kind in ("unknown", "timeout"):
+            with self.subTest(kind=kind):
+                request = "clock-" + kind
+                self.ledger.record("codex", 3, "review", False, ts=2000, request_id=request, failure_kind=kind)
+                self.assertIn("retry-approved", self.ledger.request_cooldowns(request, now=1000).get("codex", ""))
+                # Accepted work recorded after rollback must also be able to
+                # supersede the restriction despite its lower wall timestamp.
+                self.ledger.record("codex", 3, "review", True, ts=1001, request_id=request,
+                                   review_validated=True, candidate_approved=False)
+                self.assertNotIn("codex", self.ledger.request_cooldowns(request, now=1002))
+
     def test_invalid_details_cannot_poison_routing_history(self):
         for details in ({"candidate_hash": "not-a-hash"}, {"caller": "secret contents"},
                         {"request_id": "space is invalid"}, {"failure_kind": "unknown"},

@@ -75,6 +75,9 @@ option does not bypass global pauses, quota marks or shared budgets. Other
 requests remain unaffected. Successful work can supersede an earlier failure;
 later failures cannot clear an unresolved unknown/timeout. Unreadable or corrupt
 request history stops routing rather than pretending there were no failures.
+Operational state follows append order across clock rollback; future timestamps
+never remove UNKNOWN/timeout restrictions. Timed cooling is conservative when the
+wall clock moves backward.
 candidate rejection and verification failures do not trigger operational cooling.
 This is routing feedback from recorded outcomes, not a replacement for admission
 or a blanket ban on explicitly requested direct CLI calls.
