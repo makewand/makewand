@@ -12,6 +12,7 @@ import subprocess
 import threading
 import select
 from typing import Dict, Any, List, Optional, Tuple
+from makewand import __version__
 
 class MCPClient:
     """
@@ -193,7 +194,7 @@ class MCPClient:
             },
             "clientInfo": {
                 "name": "makewand",
-                "version": "3.2.0"
+                "version": __version__
             }
         }
 

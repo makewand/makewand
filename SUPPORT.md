@@ -4,8 +4,9 @@
 
 | Version line | Status | Notes |
 | --- | --- | --- |
-| `master` (source install) | Supported | Has every fix; ships as v3.3.0 |
-| `v3.2.x` | Supported | Current release line; lacks the protections added after v3.2.0, see [SECURITY.md](SECURITY.md#release-status--发布状态) |
+| `master` (source install) | Supported | Has every fix and security protection |
+| `v3.3.x` | Supported | Current release line; includes all protections described in [SECURITY.md](SECURITY.md#release-status--发布状态) |
+| `v3.2.x` | Unsupported | Lacks the protections added after v3.2.0, see [SECURITY.md](SECURITY.md#release-status--发布状态); upgrade to v3.3.0 |
 | `< v3.2.0` | Unsupported | No backports |
 
 ## What support means

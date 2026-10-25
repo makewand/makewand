@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -278,9 +279,6 @@ func (p *Project) runTrustedAcceptance(ctx context.Context, policy *frozenTruste
 	defer cancel()
 	for _, test := range policy.spec.Cases {
 		result, err := p.runTrustedAcceptanceCase(ctx, env.bwrapPath, policy, test.Stdin)
-		if isBwrapSetupFailure(result) {
-			return nil, fmt.Sprintf("trusted acceptance sandbox could not start: %s", firstLine(result.Stderr)), true, false
-		}
 		if err != nil {
 			if isStartedCommandUnknownOutcome(err) {
 				return nil, fmt.Sprintf("trusted acceptance case %q did not complete: %v", test.Name, err), false, true
@@ -333,16 +331,32 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	if err != nil {
 		return nil, err
 	}
+	infoR, infoW, err := os.Pipe()
+	if err != nil {
+		closeSeccomp()
+		return nil, err
+	}
+	infoFD := 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, infoW)
+	cmd.Args = append([]string{command}, insertBeforeCommand(args, len(policy.spec.Args), "--info-fd", strconv.Itoa(infoFD))...)
 	started := time.Now()
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	closeSeccomp()
+	_ = infoW.Close()
 	if err != nil {
+		_ = infoR.Close()
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, errors.Join(contextErr, err)
 		}
 		return nil, err
 	}
 	defer cleanupProcess()
+	infoDone := make(chan bool, 1)
+	go func() {
+		pid, infoErr := readSandboxChildPID(ctx, infoR)
+		_ = infoR.Close()
+		infoDone <- (infoErr == nil && pid > 0)
+	}()
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -356,21 +370,25 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	// Even a normally exiting leader must not leave writers or descendants
 	// alive. bwrap's PID namespace also reaps candidate descendants on exit.
 	killProcessGroup(cmd)
+	childStarted := <-infoDone
 	stdoutDropped, stderrDropped := capture.DroppedBytes()
 	result := &ExecResult{Stdout: capture.StdoutString(), Stderr: capture.StderrString(), Duration: time.Since(started), StdoutDroppedBytes: stdoutDropped, StderrDroppedBytes: stderrDropped}
+	if !childStarted && isBwrapSetupFailure(result) {
+		return result, fmt.Errorf("trusted acceptance sandbox could not start: %s", firstLine(result.Stderr))
+	}
 	if capture.Exceeded() {
 		result.ExitCode = -1
-		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("trusted acceptance output exceeded its combined %d-byte limit", policy.spec.MaxOutputBytes), Started: true}
+		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("trusted acceptance output exceeded its combined %d-byte limit", policy.spec.MaxOutputBytes), Started: childStarted}
 	}
 	if err := ctx.Err(); err != nil {
 		result.ExitCode = -1
-		return result, &commandUnknownOutcomeError{Err: err, Started: true}
+		return result, &commandUnknownOutcomeError{Err: err, Started: childStarted}
 	}
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(waitErr, &exitErr) {
 			result.ExitCode = -1
-			return result, &commandUnknownOutcomeError{Err: waitErr, Started: true}
+			return result, &commandUnknownOutcomeError{Err: waitErr, Started: childStarted}
 		}
 		result.ExitCode = exitErr.ExitCode()
 	}

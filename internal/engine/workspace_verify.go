@@ -1657,6 +1657,9 @@ func (p *Project) prefetchDependencies(ctx context.Context, files []ExtractedFil
 	if err != nil {
 		report.QuickCheckError = err.Error()
 		report.EnvironmentError = isEnvironmentExecError(err)
+		if isStartedCommandUnknownOutcome(err) {
+			report.ExecutionIncomplete = true
+		}
 		return false
 	}
 	if result != nil && result.ExitCode != 0 {

@@ -218,6 +218,65 @@ func TestE2_TrustedAcceptanceHangAndFloodAttributedToCandidate(t *testing.T) {
 			t.Fatalf("flooding acceptance candidate must have rank 0 and be attributable: %+v", report)
 		}
 	})
+
+	t.Run("trusted acceptance candidate printing bwrap prefix on stderr with exit 1 is candidate failure, not environment error", func(t *testing.T) {
+		report, err := project.EvaluateCandidateFiles(ctx, []ExtractedFile{
+			{Path: "app.py", Content: "import sys\nsys.stderr.write('bwrap: forged sandbox setup failure\\n')\nsys.exit(1)\n"},
+		})
+		if err != nil {
+			t.Fatalf("EvaluateCandidateFiles err = %v", err)
+		}
+		if report.Passed || report.EnvironmentError {
+			t.Fatalf("forged bwrap stderr must be candidate failure, not EnvironmentError: %+v", report)
+		}
+		if !ShouldRecordCandidateQuality(CandidateAttempt{Provider: "claude", Content: "x", Verification: report}) {
+			t.Fatalf("forged bwrap stderr candidate failure must record provider quality penalty")
+		}
+	})
+}
+
+func TestE2_CargoPrefetchStartedTimeoutSetsExecutionIncomplete(t *testing.T) {
+	if testing.Short() {
+		t.Skip("sandbox verification test")
+	}
+	t.Setenv("MAKEWAND_UNSAFE_HOST_EXEC", "0")
+	if !VerificationIsolationActive(UnsafeHostExecAuthorization{}) {
+		t.Skipf("bubblewrap isolation unavailable: %v", RestrictedExecIsolationError(UnsafeHostExecAuthorization{}))
+	}
+	dir := t.TempDir()
+	fakeCargo := filepath.Join(dir, "cargo")
+	writeExecScript(t, fakeCargo, "sleep 5\n")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldLookPath := userNetLookPath
+	userNetLookPath = func(string) (string, error) { return "", fmt.Errorf("no slirp4netns") }
+	t.Cleanup(func() { userNetLookPath = oldLookPath })
+
+	projDir := t.TempDir()
+	project, err := NewProject("e2-cargo-prefetch", projDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []ExtractedFile{
+		{Path: "Cargo.toml", Content: "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1.0\"\n"},
+		{Path: "src/lib.rs", Content: "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"},
+	}
+	if err := project.WriteFiles(files); err != nil {
+		t.Fatal(err)
+	}
+	if err := project.ScanFiles(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var report CandidateVerification
+	ok := project.prefetchDependencies(ctx, files, verificationContract{tests: &ExecPlan{Kind: "tests", Command: "cargo", Args: []string{"test"}}}, false, &report)
+	if ok {
+		t.Fatalf("expected prefetchDependencies to fail on timeout")
+	}
+	if report.EnvironmentError || !report.ExecutionIncomplete {
+		t.Fatalf("expected ExecutionIncomplete=true and EnvironmentError=false for timed-out cargo prefetch, got %+v", report)
+	}
 }
 
 func TestE2_RunCandidateSelectionRanksHonestFailureAboveIncompleteAndPenalizesQuality(t *testing.T) {
