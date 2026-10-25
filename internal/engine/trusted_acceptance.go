@@ -331,31 +331,34 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	if err != nil {
 		return nil, err
 	}
-	infoR, infoW, err := os.Pipe()
+	statusR, statusW, err := os.Pipe()
 	if err != nil {
 		closeSeccomp()
 		return nil, err
 	}
-	infoFD := 3 + len(cmd.ExtraFiles)
-	cmd.ExtraFiles = append(cmd.ExtraFiles, infoW)
-	cmd.Args = append([]string{command}, insertBeforeCommand(args, len(policy.spec.Args), "--info-fd", strconv.Itoa(infoFD))...)
+	statusFD := 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, statusW)
+	cmd.Args = append([]string{command}, insertBeforeCommand(args, len(policy.spec.Args), "--json-status-fd", strconv.Itoa(statusFD))...)
 	started := time.Now()
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	closeSeccomp()
-	_ = infoW.Close()
+	_ = statusW.Close()
 	if err != nil {
-		_ = infoR.Close()
+		_ = statusR.Close()
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, errors.Join(contextErr, err)
 		}
 		return nil, err
 	}
 	defer cleanupProcess()
-	infoDone := make(chan bool, 1)
+	type bwrapStatus struct {
+		started bool
+		exited  bool
+	}
+	statusDone := make(chan bwrapStatus, 1)
 	go func() {
-		pid, infoErr := readSandboxChildPID(ctx, infoR)
-		_ = infoR.Close()
-		infoDone <- (infoErr == nil && pid > 0)
+		childStarted, childExited := readBwrapStatusFD(statusR)
+		statusDone <- bwrapStatus{started: childStarted, exited: childExited}
 	}()
 	done := make(chan struct{})
 	go func() {
@@ -370,29 +373,52 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	// Even a normally exiting leader must not leave writers or descendants
 	// alive. bwrap's PID namespace also reaps candidate descendants on exit.
 	killProcessGroup(cmd)
-	childStarted := <-infoDone
+	status := <-statusDone
 	stdoutDropped, stderrDropped := capture.DroppedBytes()
 	result := &ExecResult{Stdout: capture.StdoutString(), Stderr: capture.StderrString(), Duration: time.Since(started), StdoutDroppedBytes: stdoutDropped, StderrDroppedBytes: stderrDropped}
-	if !childStarted && isBwrapSetupFailure(result) {
-		return result, fmt.Errorf("trusted acceptance sandbox could not start: %s", firstLine(result.Stderr))
-	}
 	if capture.Exceeded() {
 		result.ExitCode = -1
-		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("trusted acceptance output exceeded its combined %d-byte limit", policy.spec.MaxOutputBytes), Started: childStarted}
+		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("trusted acceptance output exceeded its combined %d-byte limit", policy.spec.MaxOutputBytes), Started: status.started}
 	}
 	if err := ctx.Err(); err != nil {
 		result.ExitCode = -1
-		return result, &commandUnknownOutcomeError{Err: err, Started: childStarted}
+		return result, &commandUnknownOutcomeError{Err: err, Started: status.started}
 	}
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(waitErr, &exitErr) {
 			result.ExitCode = -1
-			return result, &commandUnknownOutcomeError{Err: waitErr, Started: childStarted}
+			return result, &commandUnknownOutcomeError{Err: waitErr, Started: status.started}
 		}
 		result.ExitCode = exitErr.ExitCode()
 	}
+	if !status.exited && isBwrapSetupFailure(result) {
+		return result, fmt.Errorf("trusted acceptance sandbox could not start: %s", firstLine(result.Stderr))
+	}
 	return result, nil
+}
+
+type bwrapStatusEntry struct {
+	ChildPID int  `json:"child-pid"`
+	ExitCode *int `json:"exit-code"`
+}
+
+func readBwrapStatusFD(r *os.File) (childStarted, childExited bool) {
+	defer func() { _ = r.Close() }()
+	dec := json.NewDecoder(io.LimitReader(r, 4096))
+	for {
+		var entry bwrapStatusEntry
+		if err := dec.Decode(&entry); err != nil {
+			break
+		}
+		if entry.ChildPID > 0 {
+			childStarted = true
+		}
+		if entry.ExitCode != nil {
+			childExited = true
+		}
+	}
+	return childStarted, childExited
 }
 
 func (p *Project) applyTrustedAcceptance(ctx context.Context, report *CandidateVerification, before, baseline string, files []ExtractedFile) {

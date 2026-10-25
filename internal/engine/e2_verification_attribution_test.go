@@ -233,6 +233,38 @@ func TestE2_TrustedAcceptanceHangAndFloodAttributedToCandidate(t *testing.T) {
 			t.Fatalf("forged bwrap stderr candidate failure must record provider quality penalty")
 		}
 	})
+
+	t.Run("genuine trusted acceptance bwrap setup failure is environment error, not candidate failure", func(t *testing.T) {
+		frozen, err := freezeTrustedAcceptance(TrustedAcceptanceSpec{
+			Schema:         1,
+			Command:        "python3",
+			Args:           []string{"-I", "app.py"},
+			Timeout:        "2s",
+			MaxOutputBytes: 4096,
+			Cases: []TrustedAcceptanceCase{
+				{Name: "double", Stdin: "2\n", Stdout: "4\n", Stderr: "", ExitCode: 0},
+			},
+		}, "/proc/nonexistent/oracle.json")
+		if err != nil {
+			t.Fatalf("freezeTrustedAcceptance err = %v", err)
+		}
+		badCtx := context.WithValue(context.Background(), trustedAcceptanceKey{}, trustedAcceptanceContext{frozen: frozen})
+		report, err := project.EvaluateCandidateFiles(badCtx, []ExtractedFile{
+			{Path: "app.py", Content: "import sys\nprint(int(sys.stdin.read()) * 2)\n"},
+		})
+		if err != nil {
+			t.Fatalf("EvaluateCandidateFiles err = %v", err)
+		}
+		if report.Passed || !report.EnvironmentError || report.ExecutionIncomplete {
+			t.Fatalf("genuine bwrap setup failure must set EnvironmentError=true and ExecutionIncomplete=false: %+v", report)
+		}
+		if !strings.Contains(report.AcceptanceError, "trusted acceptance sandbox could not start: bwrap:") {
+			t.Fatalf("AcceptanceError = %q, want 'trusted acceptance sandbox could not start: bwrap:'", report.AcceptanceError)
+		}
+		if ShouldRecordCandidateQuality(CandidateAttempt{Provider: "claude", Content: "x", Verification: report}) {
+			t.Fatalf("genuine bwrap setup failure must not penalize provider quality")
+		}
+	})
 }
 
 func TestE2_CargoPrefetchStartedTimeoutSetsExecutionIncomplete(t *testing.T) {
