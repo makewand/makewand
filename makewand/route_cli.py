@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -154,9 +155,25 @@ def _execution_options(task_type, difficulty, tier=1, total_timeout=None) -> dic
     return {"timeout": timeout, "total_timeout": timeout, "readonly": task_type == "review"}
 
 
+def _request_arguments(execution_options, *, include_maximum=False):
+    parts = []
+    request_id = execution_options.get("request_id")
+    if request_id:
+        parts += ["--request-id=" + request_id] if request_id.startswith("-") else ["--request-id", request_id]
+        if include_maximum:
+            parts += ["--max-model-calls", str(execution_options["request_budget"])]
+    if execution_options.get("caller"):
+        parts += ["--caller", execution_options["caller"]]
+    if execution_options.get("budget_file"):
+        parts += ["--call-budget-file", shlex.quote(execution_options["budget_file"])]
+    return parts
+
+
 def _command_for(candidate, execution_options) -> str:
     parts = ["makewand", candidate.provider, *candidate.args,
-             "-C", "<目录>", "-f", "<子任务文件>", "--max-model-calls", "1"]
+             "-C", "<目录>", "-f", "<子任务文件>", "--max-model-calls",
+             str(execution_options.get("request_budget", 1))]
+    parts += _request_arguments(execution_options)
     parts += ["--timeout", str(math.ceil(execution_options["timeout"])),
               "--total-timeout", str(execution_options["total_timeout"])]
     if execution_options["readonly"]:
@@ -204,19 +221,30 @@ def cmd_route(args) -> None:
         quota_reader=_quota_reader_from_env(),
         full=not simple,
         include_legacy=bool(getattr(args, "legacy", False)) and not simple,
+        request_id=getattr(args, "request_id", None),
+        retry_approved=bool(getattr(args, "retry_approved", False)),
     )
     try:
         try:
             result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
         except PermissionError:
+            if getattr(args, "request_id", None):
+                raise ValueError("cannot verify request routing history; restore readable state before dispatch")
             # Read-only state directory: fall back to an empty ledger and still
             # produce a normal route answer instead of a traceback.
             with tempfile.TemporaryDirectory(prefix="makewand-route-empty-") as empty:
                 result = select(task_type, difficulty, ledger=OutcomeLedger(Path(empty) / "routing"), **options)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         _fail(f"错误：{error}")
     budget = int(getattr(policy, "request_budget", 3) or 3)
     execution_options = _execution_options(task_type, difficulty, result.tier, getattr(args, "total_timeout", None))
+    if getattr(args, "request_id", None):
+        budget = int(os.environ.get("MAKEWAND_MAX_MODEL_CALLS") or budget)
+        execution_options.update(request_id=args.request_id, request_budget=budget)
+        if getattr(args, "call_budget_file", None):
+            execution_options["budget_file"] = args.call_budget_file
+    if getattr(args, "caller", None):
+        execution_options["caller"] = args.caller
 
     if getattr(args, "json", False):
         payload = {
@@ -274,6 +302,9 @@ def cmd_route(args) -> None:
             escalate_cmd += " --simple"
         elif bool(getattr(args, "legacy", False)):
             escalate_cmd += " --legacy"
+        request_arguments = _request_arguments(execution_options, include_maximum=True)
+        if request_arguments:
+            escalate_cmd += " " + " ".join(request_arguments)
         lines.append(f"验收不过就升一档：{escalate_cmd}")
     lines.append(
         "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
@@ -318,9 +349,20 @@ def cmd_outcome(args) -> None:
         model = getattr(args, "model", None)
         effort = getattr(args, "effort", None)
         passed = args.result == "pass"
+        details = {}
+        verdict = getattr(args, "candidate_verdict", None)
+        if verdict is not None:
+            if seconds is None or calls is None:
+                raise ValueError("--candidate-verdict requires measured --seconds and actual --calls")
+            details.update(review_validated=passed, candidate_approved={"pass": True, "fail": False, "unverified": None}[verdict])
+        for name in ("caller", "request_id", "candidate_hash", "failure_kind"):
+            value = getattr(args, name, None)
+            if value is not None:
+                details[name] = value
         OutcomeLedger().record(
             provider, tier, task_type, passed,
             seconds=seconds, calls=calls, model=model, effort=effort,
+            **details,
         )
     except ValueError as error:
         _fail(f"错误：{error}")

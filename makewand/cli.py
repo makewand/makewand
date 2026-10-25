@@ -1421,6 +1421,8 @@ def _main():
     common_parser.add_argument("--no-daemon", action="store_true", default=False, help="Bypass resident daemon and run standalone")
     common_parser.add_argument("--allow-collision", action="store_true", default=False, help="Bypass cross-session collision warning and force execution")
     common_parser.add_argument("--max-model-calls", type=int, default=None, help="Maximum attempted Makewand model tasks, including retries and reviewers")
+    common_parser.add_argument("--request-id", default=None, help="Stable user-request ID shared by every CLI call; defaults to a total cap of 3")
+    common_parser.add_argument("--caller", choices=["claude", "codex", "agy", "grok", "muse", "human", "automation"], default=None, help="Tool initiating this user request (metadata only)")
     common_parser.add_argument("--call-budget-file", default=None, help="Shared admission ledger for model task budgets")
     common_parser.add_argument("--protect", dest="global_protected_paths", action="append", default=None, metavar="PATH", help="Preserve a task-relative file; repeat for multiple files")
     common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=None, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
@@ -1433,6 +1435,8 @@ def _main():
     sub_common_parser.add_argument("--no-daemon", action="store_true", default=argparse.SUPPRESS, help="Bypass resident daemon and run standalone")
     sub_common_parser.add_argument("--allow-collision", action="store_true", default=argparse.SUPPRESS, help="Bypass cross-session collision warning and force execution")
     sub_common_parser.add_argument("--max-model-calls", type=int, default=argparse.SUPPRESS, help="Maximum attempted Makewand model tasks")
+    sub_common_parser.add_argument("--request-id", default=argparse.SUPPRESS, help="Stable shared user-request ID")
+    sub_common_parser.add_argument("--caller", choices=["claude", "codex", "agy", "grok", "muse", "human", "automation"], default=argparse.SUPPRESS, help="Initiating tool (metadata only)")
     sub_common_parser.add_argument("--call-budget-file", default=argparse.SUPPRESS, help="Shared model task admission ledger")
     sub_common_parser.add_argument("--protect", dest="protected_paths", action="append", default=None, metavar="PATH", help="Preserve file content and permissions; repeat for multiple files")
     sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
@@ -1671,6 +1675,7 @@ def _main():
     p_route.add_argument("--simple", action="store_true", default=False, help="只用精简三档表，不展开全部模型和推理深度")
     p_route.add_argument("--legacy", action="store_true", default=False, help="完整目录里把旧版本模型也纳入排序（与 --simple 一起用时无效）")
     p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
+    p_route.add_argument("--retry-approved", action="store_true", help="用户已批准重试，忽略本请求记录的操作失败冷却；不绕过额度、预算或暂停")
 
     p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前不再派活", parents=[sub_common_parser])
     p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
@@ -1681,13 +1686,17 @@ def _main():
     p_outcome.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
     p_outcome.add_argument("outcome_tier", metavar="TIER", type=int, help="档位（1, 2, 3）")
     p_outcome.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
-    p_outcome.add_argument("result", choices=["pass", "fail"], help="验收结果：pass 或 fail")
+    p_outcome.add_argument("result", choices=["pass", "fail"], help="受委派工作是否通过验收；review 按审查有效性记，代码裁决用 --candidate-verdict")
     p_outcome.add_argument("--seconds", type=float, default=None, help="这次派活耗时秒数（可选）")
     p_outcome.add_argument("--calls", type=int, default=None, help="这次派活的模型调用次数（可选）")
     p_outcome.add_argument("--model", default=None, metavar="M", help="记入账本的模型名，供候选级统计（可选）")
+    p_outcome.add_argument("--candidate-verdict", choices=["pass", "fail", "unverified"], help="代码裁决，独立于审查工作是否有效；仅 review 可用")
+    p_outcome.add_argument("--candidate-hash", help="完整候选差异的 SHA256")
+    p_outcome.add_argument("--failure-kind", choices=["startup", "auth", "quota", "timeout", "unknown", "invalid_output", "verification"], help="失败类别；候选被有效审查拒绝时不要把工具记 fail")
 
     p_budget = subparsers.add_parser("budget", allow_abbrev=False, help="查看或修复共享调用账本 call-budget.json 领先实际时间的时钟（不调用模型）", parents=[sub_common_parser])
-    p_budget.add_argument("budget_action", metavar="ACTION", choices=["clock"], help="clock：账本时钟与日期桶")
+    p_budget.add_argument("budget_action", metavar="ACTION", choices=["clock", "request"], help="clock：账本时钟；request：请求总调用上限与已用计数")
+    p_budget.add_argument("--set-limit", type=int, help="用户已批准的新请求总上限；保留 ID 与已用计数，不能自动提高")
     p_budget.add_argument("--repair", action="store_true", default=False, help="让领先实际时间的时钟与日期桶回到实际时间（持账本锁，不退还已计的调用次数）")
     p_budget.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
 
@@ -1857,6 +1866,25 @@ def _main():
         args.tier = normalize_tier(args.tier)
 
     try:
+        inherited_request = os.environ.get("MAKEWAND_TASK_ID") or None
+        explicit_request = args.request_id is not None
+        request_id = args.request_id if args.request_id is not None else inherited_request
+        if request_id is not None:
+            from makewand.execution_contract import identifier
+            identifier(request_id, "request_id")
+        if args.request_id is not None and inherited_request is not None and args.request_id != inherited_request:
+            raise ValueError("--request-id cannot replace an inherited user request")
+        if args.request_id is not None:
+            os.environ["MAKEWAND_TASK_ID"] = args.request_id
+        args.request_id = request_id
+        args.caller = args.caller or os.environ.get("MAKEWAND_CALLER") or None
+        if args.caller is not None:
+            from makewand.outcome_ledger import CALLERS
+            if args.caller not in CALLERS:
+                raise ValueError("invalid MAKEWAND_CALLER")
+            os.environ["MAKEWAND_CALLER"] = args.caller
+        if explicit_request and args.max_model_calls is None and inherited_maximum is None:
+            args.max_model_calls = 3
         inherited_limit = int(inherited_maximum) if inherited_maximum is not None else None
         if inherited_limit is not None and inherited_limit <= 0:
             raise ValueError("MAKEWAND_MAX_MODEL_CALLS must be positive")

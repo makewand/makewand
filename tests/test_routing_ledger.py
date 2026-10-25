@@ -45,6 +45,81 @@ def _mode(path: Path) -> int:
 
 
 class OutcomeLedgerTests(unittest.TestCase):
+    def test_valid_review_of_rejected_code_improves_reviewer_statistics(self):
+        now = 1_700_000_000.0
+        self.ledger.record("codex", 3, "review", True, seconds=4, calls=1, ts=now,
+                           review_validated=True, candidate_approved=False,
+                           request_id="user-42", caller="agy", candidate_hash="b" * 64)
+        stats = self.ledger.stats("codex", 3, "review", now=now)
+        self.assertEqual((stats.alpha, stats.beta, stats.avg_seconds, stats.avg_calls), (2, 1, 4, 1))
+        self.assertFalse(next(self.ledger.records())["candidate_approved"])
+
+    def test_cooldown_uses_failure_kind_not_candidate_verdict(self):
+        now = 1_700_000_000.0
+        self.ledger.record("codex", 3, "review", False, ts=now, failure_kind="startup", request_id="one")
+        self.assertIn("codex", self.ledger.request_cooldowns("one", now=now + 299))
+        self.assertNotIn("codex", self.ledger.request_cooldowns("one", now=now + 301))
+        self.ledger.record("agy", 3, "review", False, ts=now, failure_kind="unknown", request_id="one")
+        self.assertIn("agy", self.ledger.request_cooldowns("one", now=now + 3600))
+        self.assertEqual(self.ledger.request_cooldowns("other", now=now + 1), {})
+        self.ledger.record("grok", 3, "review", True, ts=now, review_validated=True,
+                           candidate_approved=False, request_id="one")
+        self.assertNotIn("grok", self.ledger.request_cooldowns("one", now=now + 1))
+
+    def test_request_history_read_error_cannot_be_an_empty_history(self):
+        self.ledger.record("codex", 3, "review", False, request_id="one", failure_kind="unknown")
+        with patch("builtins.open", side_effect=PermissionError("unreadable")):
+            with self.assertRaises(PermissionError):
+                self.ledger.request_cooldowns("one")
+
+    def test_request_history_corruption_does_not_erase_unknown(self):
+        self.ledger.record("codex", 3, "review", False, request_id="one", failure_kind="unknown")
+        with self.ledger.outcomes_path.open("a") as stream:
+            stream.write('{"broken":\n')
+        self.assertEqual(len(list(self.ledger.records())), 1)  # legacy statistics remain tolerant
+        with self.assertRaisesRegex(ValueError, "corrupt"):
+            self.ledger.request_cooldowns("one")
+
+    def test_invalid_utf8_cannot_remove_request_retry_restrictions(self):
+        for kind in ("unknown", "timeout"):
+            with self.subTest(kind=kind):
+                ledger = OutcomeLedger(self.base / kind)
+                ledger.record("codex", 3, "review", False, request_id="one", failure_kind=kind)
+                payload = ledger.outcomes_path.read_bytes()
+                ledger.outcomes_path.write_bytes(payload.replace(b'"codex"', b'"cod\xffx"'))
+                # Legacy quality statistics tolerate damaged text; request
+                # restrictions must fail closed instead of renaming a provider.
+                self.assertEqual(len(list(ledger.records())), 1)
+                with self.assertRaises(UnicodeDecodeError):
+                    ledger.request_cooldowns("one")
+
+    def test_unknown_restriction_survives_all_later_failures(self):
+        for kind in ("startup", "auth", "quota", "verification", "invalid_output"):
+            with self.subTest(kind=kind):
+                request = "request-" + kind
+                self.ledger.record("codex", 3, "review", False, ts=100, request_id=request, failure_kind="unknown")
+                self.ledger.record("codex", 3, "review", False, ts=101, request_id=request, failure_kind=kind)
+                self.assertIn("retry-approved", self.ledger.request_cooldowns(request, now=10000).get("codex", ""))
+
+    def test_clock_rollback_cannot_remove_retry_approval_boundary(self):
+        for kind in ("unknown", "timeout"):
+            with self.subTest(kind=kind):
+                request = "clock-" + kind
+                self.ledger.record("codex", 3, "review", False, ts=2000, request_id=request, failure_kind=kind)
+                self.assertIn("retry-approved", self.ledger.request_cooldowns(request, now=1000).get("codex", ""))
+                # Accepted work recorded after rollback must also be able to
+                # supersede the restriction despite its lower wall timestamp.
+                self.ledger.record("codex", 3, "review", True, ts=1001, request_id=request,
+                                   review_validated=True, candidate_approved=False)
+                self.assertNotIn("codex", self.ledger.request_cooldowns(request, now=1002))
+
+    def test_invalid_details_cannot_poison_routing_history(self):
+        for details in ({"candidate_hash": "not-a-hash"}, {"caller": "secret contents"},
+                        {"request_id": "space is invalid"}, {"failure_kind": "unknown"},
+                        {"review_validated": False}):
+            with self.subTest(details=details), self.assertRaises(ValueError):
+                self.ledger.record("codex", 3, "review", True, **details)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="mw-routing-ledger-")
         self.addCleanup(self._tmp.cleanup)

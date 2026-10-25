@@ -15,6 +15,23 @@ from makewand.execution_runtime import execute, execution_context
 
 
 class LayeredBudgetTests(unittest.TestCase):
+    def test_request_limit_amendment_preserves_spent_calls_and_other_caps(self):
+        for _ in range(3):
+            attempt = b.reserve("fake", "fast", task_id="task-a", max_model_calls=5)
+            b.complete(attempt, True, 0)
+        old = self.data()
+        report = b.request_budget("task-a", maximum=4)
+        self.assertEqual((report["used"], report["maximum"], report["remaining"]), (3, 4, 1))
+        with self.assertRaises(b.BudgetError):
+            b.request_budget("task-a", maximum=7)
+        with patch.dict(os.environ, MAKEWAND_MAX_MODEL_CALLS="7"):
+            report = b.request_budget("task-a", maximum=7)
+        new = self.data()
+        self.assertEqual((report["used"], report["remaining"]), (3, 4))
+        for group in ("projects", "machine"):
+            self.assertEqual(new["scopes"][group], old["scopes"][group])
+        self.assertEqual(new["attempts"], old["attempts"])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

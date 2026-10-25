@@ -262,6 +262,8 @@ def select(
     full: bool = False,
     include_legacy: bool = False,
     discovered: Optional[Mapping] = None,
+    request_id: Optional[str] = None,
+    retry_approved: bool = False,
 ) -> RouteResult:
     """选择这一档要派的候选。
 
@@ -296,9 +298,11 @@ def select(
         if isinstance(name, str) and name.strip():
             marks[name.strip().lower()] = mark
 
+    request_blocks = ledger.request_cooldowns(request_id, now=moment) if request_id and not retry_approved else {}
+
     blocked_early = []
     for row in rows:
-        if _pause_reason(policy, row.provider, moment) or _mark_reason(marks.get(row.provider), moment):
+        if _pause_reason(policy, row.provider, moment) or _mark_reason(marks.get(row.provider), moment) or row.provider in request_blocks:
             blocked_early.append(row.provider)
     quota = _read_quota(rows, blocked_early, quota_reader)
 
@@ -311,6 +315,7 @@ def select(
         reason = (
             _pause_reason(policy, row.provider, moment)
             or _mark_reason(marks.get(row.provider), moment)
+            or request_blocks.get(row.provider)
             or _quota_reason(row.provider, quota, policy)
             or _family_reason(row.provider, not_tool)
         )

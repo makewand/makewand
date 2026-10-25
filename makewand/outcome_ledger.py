@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -44,6 +45,42 @@ _PRIOR_ALPHA = 1.0
 _PRIOR_BETA = 1.0
 _SECONDS_PER_DAY = 86400.0
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+FAILURE_KINDS = frozenset(("startup", "auth", "quota", "timeout", "unknown", "invalid_output", "verification"))
+CALLERS = frozenset(("claude", "codex", "agy", "grok", "muse", "human", "automation"))
+
+
+def _outcome_details(row):
+    """Validate bounded metadata; candidate approval never becomes tool quality."""
+    details = {}
+    if "review_validated" in row:
+        value = row["review_validated"]
+        if row["task_type"] != "review" or type(value) is not bool or value != row["passed"]:
+            raise ValueError("review_validated must equal the review work's pass/fail result")
+        details["review_validated"] = value
+    if "candidate_approved" in row:
+        value = row["candidate_approved"]
+        if row["task_type"] != "review" or value is not None and type(value) is not bool:
+            raise ValueError("candidate_approved is only a review verdict (true/false/null)")
+        if row.get("review_validated") is True and value is None:
+            raise ValueError("an unverified candidate verdict cannot validate a review")
+        details["candidate_approved"] = value
+    for field in ("caller", "request_id", "candidate_hash", "failure_kind"):
+        if field not in row:
+            continue
+        value = row[field]
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"invalid {field}")
+        if field == "caller" and value not in CALLERS:
+            raise ValueError("invalid caller")
+        if field == "request_id":
+            from makewand.execution_contract import identifier
+            identifier(value, field)
+        if field == "candidate_hash" and not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("candidate_hash must be a lowercase SHA256")
+        if field == "failure_kind" and (value not in FAILURE_KINDS or row["passed"]):
+            raise ValueError("failure_kind requires a failed work result and a known category")
+        details[field] = value
+    return details
 
 
 def _coerce_ts(value: Any, name: str = "ts") -> float:
@@ -165,6 +202,10 @@ def _validate_row(row: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(row["effort"], str) or not row["effort"].strip():
             return None
         normalized["effort"] = row["effort"].strip().lower()
+    try:
+        normalized.update(_outcome_details(row))
+    except (TypeError, ValueError):
+        return None
     return normalized
 
 
@@ -288,6 +329,7 @@ class OutcomeLedger:
         ts: Any = None,
         model: Any = None,
         effort: Any = None,
+        **details,
     ) -> Dict[str, Any]:
         """追加一条成绩记录。ts 可注入（epoch 秒或 datetime），默认真实时钟。
 
@@ -314,6 +356,9 @@ class OutcomeLedger:
             row["model"] = model_text
         if effort_text is not None:
             row["effort"] = effort_text
+        if set(details) - {"review_validated", "candidate_approved", "caller", "request_id", "candidate_hash", "failure_kind"}:
+            raise TypeError("unsupported outcome metadata")
+        row.update(_outcome_details(dict(row, **details)))
         payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
         self._ensure_dir()
         if not _O_NOFOLLOW and os.path.islink(self.outcomes_path):
@@ -361,10 +406,14 @@ class OutcomeLedger:
             os.close(fd)
         return dict(row)
 
-    def _read_rows(self) -> List[Dict[str, Any]]:
+    def _read_rows(self, *, strict=False) -> List[Dict[str, Any]]:
         try:
-            stream = open(self.outcomes_path, "r", encoding="utf-8", errors="replace")
+            stream = open(self.outcomes_path, "r", encoding="utf-8", errors="strict" if strict else "replace")
+        except FileNotFoundError:
+            return []
         except OSError:
+            if strict:
+                raise
             # Missing or unreadable (e.g. read-only state dir): empty ledger.
             return []
         rows: List[Dict[str, Any]] = []
@@ -372,6 +421,8 @@ class OutcomeLedger:
             try:
                 filelock.flock(stream.fileno(), filelock.LOCK_SH)
             except OSError:
+                if strict:
+                    raise
                 pass
             try:
                 for line in stream:
@@ -381,10 +432,14 @@ class OutcomeLedger:
                     try:
                         parsed = json.loads(text)
                     except ValueError:
+                        if strict:
+                            raise ValueError("cannot verify request cooldowns from corrupt outcome history") from None
                         continue
                     row = _validate_row(parsed)
                     if row is not None:
                         rows.append(row)
+                    elif strict:
+                        raise ValueError("cannot verify request cooldowns from invalid outcome metadata")
             finally:
                 try:
                     filelock.flock(stream.fileno(), filelock.LOCK_UN)
@@ -395,6 +450,40 @@ class OutcomeLedger:
     def records(self) -> Iterator[Dict[str, Any]]:
         """产出账本中的有效记录（坏行跳过）；锁内快照读完即释放锁。"""
         return iter(self._read_rows())
+
+    def request_cooldowns(self, request_id, now=None):
+        """Only recorded operational failures cool a provider in this request.
+
+        Unknown outcomes/timeouts need explicit retry approval, not a timer.
+        A candidate rejection is never an operational provider failure.
+        """
+        if not request_id:
+            return {}
+        from makewand.execution_contract import identifier
+        identifier(request_id, "request_id")
+        moment = time.time() if now is None else _coerce_ts(now)
+        latest = {}
+        # The append lock orders operational observations even when the wall
+        # clock steps backward. Future-dated failures still require approval;
+        # accepted work appended afterward may supersede them with a lower ts.
+        rows = (row for row in self._read_rows(strict=True) if row.get("request_id") == request_id)
+        for row in rows:
+            provider = row["provider"]
+            if row["passed"]:
+                latest.pop(provider, None)
+            elif row.get("failure_kind") in ("unknown", "timeout"):
+                latest[provider] = row
+            elif latest.get(provider, {}).get("failure_kind") not in ("unknown", "timeout"):
+                if row.get("failure_kind") in ("startup", "auth", "quota"):
+                    latest[provider] = row
+        blocked = {}
+        for provider, row in latest.items():
+            kind = row.get("failure_kind")
+            if not row["passed"] and kind in ("unknown", "timeout"):
+                blocked[provider] = f"本请求上次结果为 {kind}；需用户批准后使用 --retry-approved"
+            elif not row["passed"] and kind in ("startup", "auth", "quota") and moment < row["ts"] + 300:
+                blocked[provider] = f"本请求上次 {kind} 失败；冷却 5 分钟"
+        return blocked
 
     def stats(
         self,
