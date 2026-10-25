@@ -228,7 +228,7 @@ func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*Exec
 	}
 	if guardErr := guard.enforce(); guardErr != nil {
 		if err != nil {
-			return result, fmt.Errorf("%w; %v", guardErr, err)
+			return result, fmt.Errorf("%w; %w", guardErr, err)
 		}
 		return result, guardErr
 	}
@@ -535,7 +535,7 @@ func pipMissingDistribution(result *ExecResult) string {
 // an error.
 func (p *Project) execSandboxed(ctx context.Context, wrappedCmd string, wrappedArgs []string, userNet *userNetLaunch) (*ExecResult, error) {
 	result, err := p.execWithPolicyLaunch(ctx, wrappedCmd, wrappedArgs, isolatedExecPolicy(), userNet)
-	if err == nil && isBwrapSetupFailure(result) {
+	if isBwrapSetupFailure(result) {
 		// bubblewrap itself failed before the command started; this is a
 		// sandbox/environment problem, not a failing project command, so it
 		// must not reach auto-fix or quality statistics as a test failure.
@@ -1842,6 +1842,9 @@ func (p *Project) networkFetchUnavailable(plan ExecPlan) string {
 		if len(plan.Args) < 2 || plan.Args[0] != "mod" || (plan.Args[1] != "download" && plan.Args[1] != "tidy") {
 			return "makewand runs only `go mod download` or `go mod tidy` as a networked go dependency fetch, which sees the module files and no source; install the project's dependencies outside makewand"
 		}
+	case "pip", "pip3":
+	default:
+		return "makewand runs only npm, pip, go or cargo as a networked dependency fetch, and never runs " + plan.Command + " as a dependency step; install the project's dependencies outside makewand"
 	}
 	return ""
 }
@@ -3589,6 +3592,38 @@ func restrictedExecContext(ctx context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(ctx, RestrictedPlanTimeout)
 }
 
+// commandUnknownOutcomeError wraps an execution failure where the command outcome
+// is unknown (timeout/cancellation, output limit exceeded, WaitDelay expiry, or
+// non-ExitError wait failure). Started records whether the command actually began
+// executing before the failure occurred.
+type commandUnknownOutcomeError struct {
+	Err     error
+	Started bool
+}
+
+func (e *commandUnknownOutcomeError) Error() string {
+	if e == nil || e.Err == nil {
+		return execution.ErrUnknownOutcome.Error()
+	}
+	return fmt.Sprintf("%s: %v", execution.ErrUnknownOutcome, e.Err)
+}
+
+func (e *commandUnknownOutcomeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *commandUnknownOutcomeError) Is(target error) bool {
+	return target == execution.ErrUnknownOutcome
+}
+
+func isStartedCommandUnknownOutcome(err error) bool {
+	var startedErr *commandUnknownOutcomeError
+	return errors.As(err, &startedErr) && startedErr.Started
+}
+
 func (p *Project) execWithPolicy(ctx context.Context, command string, args []string, policy execPolicy) (*ExecResult, error) {
 	return p.execWithPolicyLaunch(ctx, command, args, policy, nil)
 }
@@ -3665,7 +3700,7 @@ func (p *Project) execWithPolicyLaunch(ctx context.Context, command string, args
 	}
 	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
-			return nil, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, errors.Join(contextErr, err))}
+			return nil, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, errors.Join(contextErr, err)), Started: false}
 		}
 		return nil, fmt.Errorf("exec %s: %w", command, err)
 	}
@@ -3710,17 +3745,18 @@ func (p *Project) execWithPolicyLaunch(ctx context.Context, command string, args
 		StdoutDroppedBytes: stdoutDropped,
 		StderrDroppedBytes: stderrDropped,
 	}
+	started := userNet == nil || userNet.attached
 	if capture.Exceeded() {
 		result.ExitCode = -1
-		return result, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
+		return result, &commandUnknownOutcomeError{Err: processjob.OutputLimitError(), Started: started}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		result.ExitCode = -1
-		return result, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, ctxErr)}
+		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, ctxErr), Started: started}
 	}
 	if errors.Is(err, exec.ErrWaitDelay) {
 		result.ExitCode = -1
-		return result, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s inherited output pipes did not close: %w", command, err)}
+		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s inherited output pipes did not close: %w", command, err), Started: started}
 	}
 
 	if err != nil {
@@ -3728,7 +3764,8 @@ func (p *Project) execWithPolicyLaunch(ctx context.Context, command string, args
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		} else {
-			return result, fmt.Errorf("exec %s: %w", command, err)
+			result.ExitCode = -1
+			return result, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s: %w", command, err), Started: started}
 		}
 	}
 

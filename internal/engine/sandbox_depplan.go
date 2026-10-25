@@ -362,11 +362,7 @@ func (p *Project) planDependencyStages(plan ExecPlan, projectDir string) (fetch,
 	case "pip", "pip3":
 		fetch, build, err = p.pipDependencyStages(plan, ws, stage)
 	default:
-		// Any other dependency command (no plan makewand detects) runs as a
-		// networked command in the empty fetch directory: it sees no file of
-		// the project, so it cannot run one.
-		f := plan
-		fetch = &f
+		err = &fetchRefusal{reason: "makewand runs only npm, pip, go or cargo as a networked dependency fetch, and never runs " + plan.Command + " as a dependency step; install the project's dependencies outside makewand"}
 	}
 	if err != nil {
 		cleanup()
@@ -452,10 +448,46 @@ var cargoFetchSkipDirs = map[string]bool{"target": true, "node_modules": true, "
 // needs to load the manifests (src/lib.rs, src/main.rs, src/bin/*, a build
 // script, explicit target paths and inferred examples, tests and benches)
 // where the workspace has one - never its contents. Hidden directories, target,
-// node_modules and vendor are not searched.
+// node_modules and vendor are not searched by the directory walk, while
+// workspace members and local path dependencies explicitly declared in a
+// copied Cargo.toml are still included within the manifest bounds.
 func cargoFetchSources(ws *os.Root, dir *fetchDir) error {
-	manifests := 0
-	return fs.WalkDir(ws.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+	copied := map[string]bool{}
+	var queue []string
+	copyManifestOrLock := func(rel string) error {
+		rel = filepath.Clean(rel)
+		if copied[rel] {
+			return nil
+		}
+		first, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
+		if first == ".git" || first == ".makewand" {
+			return nil
+		}
+		if len(copied) >= maxFetchManifests {
+			return fmt.Errorf("the project holds more than %d Cargo manifests", maxFetchManifests)
+		}
+		data, err := readRegularNoFollow(ws, rel, maxFetchManifestBytes)
+		if err != nil {
+			return err
+		}
+		if err := dir.writeFile(rel, data, 0o600); err != nil {
+			return err
+		}
+		copied[rel] = true
+		if filepath.Base(rel) == "Cargo.toml" {
+			manifestDir := filepath.Dir(rel)
+			if err := cargoTargetStubs(ws, dir, manifestDir, string(data)); err != nil {
+				return err
+			}
+			declared, err := cargoDeclaredManifests(ws, manifestDir, string(data))
+			if err != nil {
+				return err
+			}
+			queue = append(queue, declared...)
+		}
+		return nil
+	}
+	err := fs.WalkDir(ws.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if path == "." {
 				return err
@@ -472,22 +504,97 @@ func cargoFetchSources(ws *os.Root, dir *fetchDir) error {
 		if name != "Cargo.toml" && name != "Cargo.lock" || !d.Type().IsRegular() {
 			return nil
 		}
-		if manifests++; manifests > maxFetchManifests {
-			return fmt.Errorf("the project holds more than %d Cargo manifests", maxFetchManifests)
+		return copyManifestOrLock(filepath.FromSlash(path))
+	})
+	if err != nil {
+		return err
+	}
+	for len(queue) > 0 {
+		rel := queue[0]
+		queue = queue[1:]
+		if copied[rel] {
+			continue
 		}
-		rel := filepath.FromSlash(path)
-		data, err := readRegularNoFollow(ws, rel, maxFetchManifestBytes)
-		if err != nil {
+		if err := copyManifestOrLock(rel); err != nil {
 			return err
 		}
-		if err := dir.writeFile(rel, data, 0o600); err != nil {
-			return err
+		lockRel := filepath.Join(filepath.Dir(rel), "Cargo.lock")
+		if !copied[lockRel] {
+			if info, err := ws.Lstat(lockRel); err == nil && info.Mode().IsRegular() {
+				if err := copyManifestOrLock(lockRel); err != nil {
+					return err
+				}
+			}
 		}
-		if name == "Cargo.toml" {
-			return cargoTargetStubs(ws, dir, filepath.Dir(rel), string(data))
+	}
+	return nil
+}
+
+// cargoDeclaredManifests returns the workspace-relative Cargo.toml paths that
+// manifest explicitly names as workspace members or path dependencies.
+func cargoDeclaredManifests(ws *os.Root, manifestDir, manifest string) ([]string, error) {
+	doc := parseTOML(manifest)
+	var out []string
+	addMemberPattern := func(raw string) error {
+		if raw == "" {
+			return nil
+		}
+		relPattern := filepath.Clean(filepath.Join(manifestDir, filepath.FromSlash(raw)))
+		if filepath.IsAbs(relPattern) || relPattern == ".." || strings.HasPrefix(relPattern, ".."+string(filepath.Separator)) {
+			return &fetchRefusal{reason: "a Cargo workspace member (" + truncateForNote(raw) + ") points outside the workspace, which makewand cannot include in the isolated dependency fetch; install the project's dependencies outside makewand"}
+		}
+		if strings.ContainsAny(raw, "*?[") {
+			matches, err := fs.Glob(ws.FS(), filepath.ToSlash(filepath.Join(relPattern, "Cargo.toml")))
+			if err != nil {
+				return &fetchRefusal{reason: "a Cargo workspace member pattern (" + truncateForNote(raw) + ") could not be expanded for the isolated dependency fetch; install the project's dependencies outside makewand"}
+			}
+			if len(matches) > maxFetchManifests {
+				return fmt.Errorf("the project holds more than %d Cargo manifests", maxFetchManifests)
+			}
+			for _, m := range matches {
+				out = append(out, filepath.FromSlash(m))
+			}
+			return nil
+		}
+		cand := filepath.Join(relPattern, "Cargo.toml")
+		if _, err := ws.Lstat(cand); err == nil {
+			out = append(out, cand)
 		}
 		return nil
-	})
+	}
+	addPathDep := func(raw string) {
+		if raw == "" {
+			return
+		}
+		relDir := filepath.Clean(filepath.Join(manifestDir, filepath.FromSlash(raw)))
+		if filepath.IsAbs(relDir) || relDir == ".." || strings.HasPrefix(relDir, ".."+string(filepath.Separator)) {
+			return
+		}
+		cand := filepath.Join(relDir, "Cargo.toml")
+		if _, err := ws.Lstat(cand); err == nil {
+			out = append(out, cand)
+		}
+	}
+	for _, entry := range doc.entries {
+		full := entry.fullKey()
+		switch {
+		case full == "workspace.members" || full == "workspace.default-members":
+			for _, member := range tomlStrings(entry.value) {
+				if err := addMemberPattern(member); err != nil {
+					return nil, err
+				}
+			}
+		case entry.table != "lib" && entry.table != "bin" && entry.table != "example" && entry.table != "test" && entry.table != "bench":
+			if entry.key == "path" || strings.HasSuffix(entry.key, ".path") {
+				addPathDep(firstTOMLString(entry.value))
+			} else if fields := tomlInlineTable(entry.value); len(fields) > 0 {
+				if rawPath, ok := fields["path"]; ok {
+					addPathDep(firstTOMLString(rawPath))
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // cargoTargetStubs writes the empty stub files of one manifest's targets.

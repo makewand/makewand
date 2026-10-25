@@ -5,7 +5,8 @@
 Candidate verification reports local diagnostic results. It does not treat output
 from candidate-controlled code as an independent acceptance certificate.
 
-- **Strength 0:** a check failed, isolation was unavailable, an expected baseline
+- **Strength 0:** a check failed, timed out or exceeded the output limit after
+  starting (`ExecutionIncomplete`), isolation was unavailable, an expected baseline
   Go test was missing, or verification changed the input files or permissions.
 - **Strength 1:** the local checks completed successfully. Human approval is
   required before applying the candidate, including when baseline tests ran.
@@ -169,6 +170,18 @@ The Go build wizard requires an explicit review approval. Review errors and
 unresolved defects stop acceptance. One available provider performs a separate
 review call rather than bypassing review, and review-generated fixes are reviewed
 again. Passing checks or a review does not assert freedom from all defects.
+
+Once a dependency, build, test, quick-check or trusted-acceptance process has
+started inside its isolated sandbox (and after any `slirp4netns` attachment completes),
+a command timeout (`context.DeadlineExceeded`/`context.Canceled`), `WaitDelay`
+expiry (`exec.ErrWaitDelay`), output-cap overflow (`ErrOutputLimitExceeded`) or
+non-`ExitError` `Wait()` failure is recorded as `ExecutionIncomplete` (Strength 0,
+candidate failure) rather than `EnvironmentError`. Pre-start host or sandbox setup
+failures (missing runtime binary, bubblewrap namespace setup error, pre-exec
+`slirp4netns` attachment failure) remain `EnvironmentError`. Unrecognized caller-supplied
+dependency commands are refused before network access rather than executed unsplit with
+outbound network, and explicitly declared Cargo workspace members or path dependencies
+under dot-prefixed directories are included within the manifest cap.
 
 ## Go candidate resources and workspace copies
 

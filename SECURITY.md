@@ -7,8 +7,8 @@ makewand 的 AI 编码流程分两个阶段，二者的**信任边界不同**。
 
 ### Release status / 发布状态
 
-This document describes the source on `master`. The protections added after v3.2.0 (#75, #80–#85) are in source on `master` and ship in v3.3.0; v3.2.x builds (release archives, Homebrew and Scoop) do not have them. Among them: `bwrap`, `systemd-run` and `prlimit` resolved only from root-owned system directories (v3.2.0 resolves `bwrap` through `$PATH`); the host provider directory never bound writable (v3.2.0 binds it writable for writable sessions); required seccomp, and a memory cap (plus a task cap in the Python launcher) where a systemd user scope is available; fail-closed workspace scans; the recorded acknowledgement also for read-only reviews without bubblewrap; outbound-only networks for dependency installs; verdicts that count only with the task's nonce; the provider-worker command whitelist; and a Homebrew wrapper that no longer freezes `PATH`. Until v3.3.0 is released, install from source to get them: `curl -fsSL https://makewand.org/install.sh | bash`. Every change is listed under [Unreleased] in [CHANGELOG.md](CHANGELOG.md).
-本文描述 `master` 上的源码。v3.2.0 之后加入的保护（#75、#80–#85）已在 `master` 源码中，随 v3.3.0 发布；v3.2.x 构建（Release 压缩包、Homebrew 与 Scoop）没有这些保护。其中包括：`bwrap`、`systemd-run`、`prlimit` 只从 root 拥有的系统目录解析（v3.2.0 经 `$PATH` 解析 `bwrap`）；宿主 provider 目录不再可写挂载（v3.2.0 在可写会话中可写挂载它）；强制 seccomp，以及有 systemd 用户 scope 时的内存上限（Python 启动器另有进程数上限）；工作区扫描不完整时 fail-closed；没有 bubblewrap 时只读审查也需已记录的确认；依赖安装只出不进的网络；只认带本任务 nonce 的裁决；provider worker 命令白名单；以及不再写死 `PATH` 的 Homebrew 包装脚本。v3.3.0 发布前，需要这些保护请从源码安装：`curl -fsSL https://makewand.org/install.sh | bash`。全部变更见 [CHANGELOG.md](CHANGELOG.md) 的 [Unreleased]。
+This document describes `v3.3.0` and `master`. The protections added after v3.2.0 (#75, #80–#85, #91, #100) ship in v3.3.0; v3.2.x builds (release archives, Homebrew and Scoop) do not have them. Among them: `bwrap`, `systemd-run` and `prlimit` resolved only from root-owned system directories (v3.2.0 resolves `bwrap` through `$PATH`); the host provider directory never bound writable (v3.2.0 binds it writable for writable sessions); required seccomp, and a memory cap (plus a task cap in the Python launcher) where a systemd user scope is available; fail-closed workspace scans; the recorded acknowledgement also for read-only reviews without bubblewrap; outbound-only networks for dependency fetches only (with workspace isolation and a kernel execution guard for pip fetches); post-start verification timeouts, wait-delay expiry and output-cap floods attributed to the candidate (`ExecutionIncomplete`) instead of masking failure as `EnvironmentError`; verdicts that count only with the task's nonce; the provider-worker command whitelist; and a Homebrew wrapper that no longer freezes `PATH`. Every change is listed under `[3.3.0]` in [CHANGELOG.md](CHANGELOG.md).
+本文描述 `v3.3.0` 与 `master`。v3.2.0 之后加入的保护（#75、#80–#85、#91、#100）随 v3.3.0 发布；v3.2.x 构建（Release 压缩包、Homebrew 与 Scoop）没有这些保护。其中包括：`bwrap`、`systemd-run`、`prlimit` 只从 root 拥有的系统目录解析（v3.2.0 经 `$PATH` 解析 `bwrap`）；宿主 provider 目录不再可写挂载（v3.2.0 在可写会话中可写挂载它）；强制 seccomp，以及有 systemd 用户 scope 时的内存上限（Python 启动器另有进程数上限）；工作区扫描不完整时 fail-closed；没有 bubblewrap 时只读审查也需已记录的确认；依赖安装仅取回阶段使用只出不进的网络（隔离工作区，pip 取回附加内核禁 `execve` 守卫）；启动后的验证超时、等待延迟超期与输出爆表归因于候选（`ExecutionIncomplete`），不再被当作 `EnvironmentError` 掩盖；只认带本任务 nonce 的裁决；provider worker 命令白名单；以及不再写死 `PATH` 的 Homebrew 包装脚本。全部变更见 [CHANGELOG.md](CHANGELOG.md) 的 `[3.3.0]`。
 
 ### Verification / preview is sandboxed / 验证与预览是沙箱隔离的
 
@@ -204,11 +204,12 @@ Python 候选应用支持 POSIX 和原生 Windows 固定句柄。Windows 执行�
 
 | Version | Supported | Notes |
 | --- | --- | --- |
-| `master` (source install) | Yes | Has every protection this document describes; ships as v3.3.0 |
-| `v3.2.x` | Yes | Lacks the protections added after v3.2.0 ([Release status](#release-status--发布状态)), which ship in v3.3.0 |
+| `master` (source install) | Yes | Has every protection this document describes |
+| `v3.3.x` | Yes | Has every protection this document describes |
+| `v3.2.x` | No | Lacks the protections added after v3.2.0 ([Release status](#release-status--发布状态)); upgrade to v3.3.0 |
 | `< v3.2.0` | No | |
 
-v3.2.x 缺少 v3.2.0 之后加入的保护（见[发布状态](#release-status--发布状态)），这些保护随 v3.3.0 发布；`master` 源码安装已包含本文描述的全部保护。
+v3.3.x 与 `master` 源码安装包含本文描述的全部保护；v3.2.x 缺少 v3.2.0 之后加入的保护（见[发布状态](#release-status--发布状态)），请升级至 v3.3.0。
 
 ## Reporting a Vulnerability
 

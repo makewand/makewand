@@ -3,7 +3,6 @@
 package engine
 
 import (
-	"context"
 	"net"
 	"os"
 	"strconv"
@@ -254,7 +253,7 @@ print("ok")
 	}
 	args := []string{"-c", script, port, port6, strings.Join(hostIPAddrs(true), ","), strings.Join(hostV6, ","), public, map[bool]string{false: "0", true: "1"}[expectDNS], expectFilter}
 	start := time.Now()
-	result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "python3", Args: args})
+	result, err := runFetchNetworkProbeForTest(t, project, "python3", args)
 	if err != nil || result == nil || result.ExitCode != 0 {
 		out := ""
 		if result != nil {
