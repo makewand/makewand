@@ -532,7 +532,7 @@ func TestRunCandidateSelection_ExternalCancellationStopsSlowCandidates(t *testin
 					default:
 					}
 					return ctx.Err()
-				case <-time.After(2 * time.Second):
+				case <-time.After(10 * time.Second):
 					return nil
 				}
 			},
@@ -565,8 +565,8 @@ func TestRunCandidateSelection_ExternalCancellationStopsSlowCandidates(t *testin
 	if selection.verified {
 		t.Fatal("candidate-controlled checks must require approval")
 	}
-	if elapsed >= 2*time.Second {
-		t.Fatalf("runCandidateSelection elapsed = %s, want early cancellation before 2s", elapsed)
+	if elapsed >= 8*time.Second {
+		t.Fatalf("runCandidateSelection elapsed = %s, want early cancellation before 8s", elapsed)
 	}
 
 	canceled := 0

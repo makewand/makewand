@@ -21,7 +21,8 @@ for page in (root / "site" / "docs.html", root / "site" / "index.html", root / "
         if not line.startswith("makewand "):
             continue
         args = shlex.split(line)
-        result = subprocess.run([binary, *args[1:], "--help"], capture_output=True, text=True)
+        result = subprocess.run([binary, *args[1:], "--help"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
         if result.returncode:
             raise SystemExit(f"{page.name}: invalid example {line!r}: {result.stderr}")
         options = re.findall(r"(?<!\w)--[\w-]+", result.stdout)

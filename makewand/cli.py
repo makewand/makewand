@@ -1385,6 +1385,12 @@ def _provider_worker_refusal(command: Optional[str], argv: List[str]) -> Optiona
 
 
 def main():
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     from makewand.config import ConfigError
     try:
         return _main()
